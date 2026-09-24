@@ -94,8 +94,15 @@ pub const DEFAULT_RUN_DEADLINE: Duration = Duration::from_secs(21600);
 /// A value that is not a positive whole number reads as unset: the CRD holds it
 /// to 600 or more, so anything else is not a setting anyone made.
 pub fn run_deadline_of(platformstack: Option<&Value>) -> Duration {
-    platformstack
-        .and_then(|ps| ps.pointer("/spec/backup/activeDeadlineSeconds"))
+    run_deadline_of_spec_backup(platformstack.and_then(|ps| ps.pointer("/spec/backup")))
+}
+
+/// [`run_deadline_of`] for a caller that holds `spec.backup` alone, as
+/// `apprafter backup prune` does: `activeDeadlineSeconds`, else
+/// [`DEFAULT_RUN_DEADLINE`]. Pure.
+pub fn run_deadline_of_spec_backup(spec_backup: Option<&Value>) -> Duration {
+    spec_backup
+        .and_then(|b| b.get("activeDeadlineSeconds"))
         .and_then(Value::as_u64)
         .filter(|secs| *secs > 0)
         .map(Duration::from_secs)
@@ -1348,6 +1355,16 @@ mod tests {
             );
         }
         assert_eq!(run_deadline_of(None), DEFAULT_RUN_DEADLINE);
+        // The same answer from `spec.backup` alone.
+        assert_eq!(
+            run_deadline_of_spec_backup(Some(&set["spec"]["backup"])),
+            Duration::from_secs(43200)
+        );
+        assert_eq!(
+            run_deadline_of_spec_backup(Some(&json!({"enabled": true}))),
+            DEFAULT_RUN_DEADLINE
+        );
+        assert_eq!(run_deadline_of_spec_backup(None), DEFAULT_RUN_DEADLINE);
     }
 
     /// A pod whose container the kubelet cannot configure — here, because

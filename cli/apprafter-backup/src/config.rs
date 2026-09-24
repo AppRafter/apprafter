@@ -93,6 +93,14 @@ pub struct RunnerConfig {
     /// ([`Self::helper_keep_alive`]). `None` when the variable is absent — a
     /// Job template older than it.
     pub deadline: Option<Duration>,
+    /// The BACKUP Job's deadline, whichever Job this is:
+    /// `APPRAFTER_BACKUP_RUN_DEADLINE_SECONDS`, which the chart renders into
+    /// both CronJobs from the backup Job's `activeDeadlineSeconds`. In the
+    /// backup Job it is [`Self::deadline`]; in the check Job `deadline` is
+    /// the check's own. A prune waits it out before it sweeps a run with no
+    /// manifest ([`Self::prune_run_deadline`]). `None` when the variable is
+    /// absent — a Job template older than it.
+    pub backup_run_deadline: Option<Duration>,
     /// The staging volume's size limit in bytes: `spec.backup.stagingSizeLimit`,
     /// which the chart renders into the volume's `sizeLimit` and, from the
     /// same value, into `APPRAFTER_BACKUP_STAGING_SIZE_LIMIT`. The runner
@@ -153,10 +161,8 @@ impl RunnerConfig {
             .filter(|s| !s.is_empty())
             .cloned();
 
-        let deadline = match e.get("APPRAFTER_BACKUP_DEADLINE_SECONDS") {
-            None => None,
-            Some(v) => Some(parse_deadline(v)?),
-        };
+        let deadline = optional_deadline(e, "APPRAFTER_BACKUP_DEADLINE_SECONDS")?;
+        let backup_run_deadline = optional_deadline(e, "APPRAFTER_BACKUP_RUN_DEADLINE_SECONDS")?;
 
         let staging_limit = e
             .get("APPRAFTER_BACKUP_STAGING_SIZE_LIMIT")
@@ -191,6 +197,7 @@ impl RunnerConfig {
             retention,
             failure_webhook,
             deadline,
+            backup_run_deadline,
             staging_limit,
             check_depth,
         })
@@ -200,6 +207,15 @@ impl RunnerConfig {
     pub fn from_env() -> Result<Self> {
         let map: BTreeMap<String, String> = std::env::vars().collect();
         Self::from_env_map(&map)
+    }
+
+    /// The backup run deadline a prune in either Job waits out before it
+    /// sweeps a run with no manifest
+    /// ([`backup_core::prune::unfinished_run_window`]):
+    /// [`Self::backup_run_deadline`], else the chart's default.
+    pub fn prune_run_deadline(&self) -> Duration {
+        self.backup_run_deadline
+            .unwrap_or(backup_core::helper_pod::DEFAULT_RUN_DEADLINE)
     }
 
     /// How long this run's helper pods keep themselves alive: the rule the
@@ -227,16 +243,22 @@ fn require(e: &BTreeMap<String, String>, key: &str) -> Result<String> {
         .ok_or_else(|| CliError::Other(format!("missing required env: {key}")))
 }
 
-/// `APPRAFTER_BACKUP_DEADLINE_SECONDS`: whole seconds, above zero. The chart
-/// renders the Job's `activeDeadlineSeconds` here, which its schema already
-/// holds to ten minutes or more; anything unreadable is a broken render, and a
-/// precondition error says so rather than running with no deadline at all.
-fn parse_deadline(value: &str) -> Result<Duration> {
+/// The deadline in `key`, `None` when the variable is absent ([`parse_deadline`]).
+fn optional_deadline(e: &BTreeMap<String, String>, key: &str) -> Result<Option<Duration>> {
+    e.get(key).map(|v| parse_deadline(v, key)).transpose()
+}
+
+/// `APPRAFTER_BACKUP_DEADLINE_SECONDS` and
+/// `APPRAFTER_BACKUP_RUN_DEADLINE_SECONDS` (`key`): whole seconds, above zero.
+/// The chart renders a Job's `activeDeadlineSeconds` here, which its schema
+/// already holds to ten minutes or more; anything unreadable is a broken
+/// render, and a precondition error says so rather than running with no
+/// deadline at all.
+fn parse_deadline(value: &str, key: &str) -> Result<Duration> {
     match value.parse::<u64>() {
         Ok(secs) if secs > 0 => Ok(Duration::from_secs(secs)),
         _ => Err(CliError::Other(format!(
-            "env APPRAFTER_BACKUP_DEADLINE_SECONDS={value:?} is not a whole number of seconds \
-             above zero"
+            "env {key}={value:?} is not a whole number of seconds above zero"
         ))),
     }
 }
@@ -401,6 +423,46 @@ mod tests {
             assert!(
                 err.to_string()
                     .contains("APPRAFTER_BACKUP_DEADLINE_SECONDS"),
+                "{err}"
+            );
+        }
+    }
+
+    /// The backup Job's deadline reaches the check Job too, where
+    /// `APPRAFTER_BACKUP_DEADLINE_SECONDS` is the check's own: the prune after
+    /// the check waits it out before it sweeps a run with no manifest.
+    #[test]
+    fn the_prune_waits_out_the_backup_jobs_deadline_not_its_own_jobs() {
+        let base = [
+            ("APPRAFTER_BACKUP_REPO", "s3:x"),
+            ("APPRAFTER_CLUSTER_ID", "c"),
+            ("RESTIC_PASSWORD", "p"),
+            // The check Job's own deadline.
+            ("APPRAFTER_BACKUP_DEADLINE_SECONDS", "43200"),
+        ];
+        let mut pairs = base.to_vec();
+        pairs.push(("APPRAFTER_BACKUP_RUN_DEADLINE_SECONDS", "2700"));
+        let c = RunnerConfig::from_env_map(&map(&pairs)).unwrap();
+        assert_eq!(c.backup_run_deadline, Some(Duration::from_secs(2700)));
+        assert_eq!(c.prune_run_deadline(), Duration::from_secs(2700));
+
+        // A Job template older than the variable: the chart's default.
+        let c = RunnerConfig::from_env_map(&map(&base)).unwrap();
+        assert_eq!(c.backup_run_deadline, None);
+        assert_eq!(
+            c.prune_run_deadline(),
+            backup_core::helper_pod::DEFAULT_RUN_DEADLINE
+        );
+
+        for bad in ["", "0", "6h", "abc"] {
+            let mut pairs = base.to_vec();
+            pairs.push(("APPRAFTER_BACKUP_RUN_DEADLINE_SECONDS", bad));
+            let err = RunnerConfig::from_env_map(&map(&pairs))
+                .err()
+                .unwrap_or_else(|| panic!("{bad:?} must be refused"));
+            assert!(
+                err.to_string()
+                    .contains("env APPRAFTER_BACKUP_RUN_DEADLINE_SECONDS="),
                 "{err}"
             );
         }

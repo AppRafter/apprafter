@@ -395,12 +395,16 @@ mod tests {
                     forgot_snapshots: 3,
                     forgot_runs: 2,
                     kept_runs: 7,
+                    unfinished_runs: 0,
                 }),
                 "pruned",
                 "forgot 3 snapshot(s) of 2 run(s)",
             ),
             (
-                PruneRecord::Done(O::NothingToPrune { kept_runs: 4 }),
+                PruneRecord::Done(O::NothingToPrune {
+                    kept_runs: 4,
+                    unfinished_runs: 0,
+                }),
                 "nothing-to-prune",
                 "all 4 run(s)",
             ),

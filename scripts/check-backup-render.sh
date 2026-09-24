@@ -38,6 +38,13 @@
 #      runner as `check`.
 #   2. backup enabled, both knobs set: each CronJob carries its own value, and
 #      the runner's env follows the backup one.
+#   2b. both runners carry the BACKUP Job's deadline as
+#      APPRAFTER_BACKUP_RUN_DEADLINE_SECONDS — in the check Job too, where
+#      APPRAFTER_BACKUP_DEADLINE_SECONDS is the check's own. The prune after
+#      the check waits it out before it sweeps a run with no manifest: a
+#      backup still dumping when the check starts holds no restic lock, so
+#      the check passes beside it, and with the check's deadline in its place
+#      the prune would delete that backup's claim snapshots under it.
 #   3. a deadline under ten minutes is refused by values.schema.json.
 #   4. the chart's default deadline is the one the runner and the CLI fall back
 #      to (backup-core's DEFAULT_RUN_DEADLINE).
@@ -184,6 +191,18 @@ assert_runner_stops_cleanly() {
     echo "  ok: $label — $name: runner env deadline $want, 90 s termination grace"
 }
 
+# `$1` label, `$2` rendered manifests, `$3` the backup Job's deadline in
+# seconds: both runners carry it as APPRAFTER_BACKUP_RUN_DEADLINE_SECONDS.
+assert_prune_waits_out_the_backup_deadline() {
+    local label="$1" rendered="$2" want="$3" name got
+    for name in apprafter-backup apprafter-backup-check; do
+        got="$(env_value "$rendered" "$name" APPRAFTER_BACKUP_RUN_DEADLINE_SECONDS)"
+        [[ "$got" == "$want" ]] \
+            || fail "$label: $name runner env APPRAFTER_BACKUP_RUN_DEADLINE_SECONDS is '${got:-absent}', want '$want' (the BACKUP Job's activeDeadlineSeconds, which a prune waits out before it sweeps a run a backup may still be writing)"
+    done
+    echo "  ok: $label — both runners' prune waits out the backup deadline, $want"
+}
+
 # `$1` label, `$2` rendered manifests: the check Job runs the runner binary
 # (the image's entrypoint) in its check mode, with no shell in between — the
 # mode that checks, prunes after a passing check under `enforce: check`, and
@@ -209,6 +228,7 @@ assert_cronjob "defaults" "$workdir/defaults.yaml" apprafter-backup-check 21600
 assert_runner_stops_cleanly "defaults" "$workdir/defaults.yaml" apprafter-backup 21600
 assert_runner_stops_cleanly "defaults" "$workdir/defaults.yaml" apprafter-backup-check 21600
 assert_check_runs_the_runner "defaults" "$workdir/defaults.yaml"
+assert_prune_waits_out_the_backup_deadline "defaults" "$workdir/defaults.yaml" 21600
 
 # 2. Both knobs set, to values that tell them apart.
 helm template platform "$chart" --values "$enabled" \
@@ -221,6 +241,7 @@ assert_cronjob "knobs set" "$workdir/set.yaml" apprafter-backup-check 43200
 assert_runner_stops_cleanly "knobs set" "$workdir/set.yaml" apprafter-backup 2700
 assert_runner_stops_cleanly "knobs set" "$workdir/set.yaml" apprafter-backup-check 43200
 assert_check_runs_the_runner "knobs set" "$workdir/set.yaml"
+assert_prune_waits_out_the_backup_deadline "knobs set" "$workdir/set.yaml" 2700
 
 # 3. The ten-minute floor: a unit mistake is refused at install, not shipped
 #    as a deadline that stops every run.

@@ -5233,7 +5233,20 @@ pub fn run_backup_prune(
         }
     };
 
-    let outcome = run_prune(&runner, &repo, &pass, &policy, &cluster_uid)?;
+    // A run with no manifest is left alone while a backup may still be
+    // writing it: the scheduled backup, or a `backup create` into the same
+    // repository, is not stopped by this command. How long that is follows
+    // the cluster's backup deadline — the default six hours with no cluster.
+    let run_deadline = backup_core::helper_pod::run_deadline_of_spec_backup(spec_backup);
+    let outcome = run_prune(
+        &runner,
+        &repo,
+        &pass,
+        &policy,
+        &cluster_uid,
+        chrono::Utc::now(),
+        run_deadline,
+    )?;
     refuse_an_unenforced_prune(&repo, &outcome, credential_file.is_some())?;
 
     print!("{}", prune_summary(&repo, &policy, &outcome));
@@ -10347,6 +10360,7 @@ mod tests {
                 forgot_snapshots: 4,
                 forgot_runs: 3,
                 kept_runs: 6,
+                unfinished_runs: 1,
             },
         );
         assert!(s.contains("s3:https://h/b"), "{s}");
@@ -10356,6 +10370,10 @@ mod tests {
         );
         assert!(s.contains("forgot 4 snapshot(s) of 3 run(s)"), "{s}");
         assert!(s.contains("6 run(s) kept"), "{s}");
+        assert!(
+            s.contains("1 unfinished run(s) left alone, as a backup may still be writing them"),
+            "{s}"
+        );
     }
 
     /// The cluster's own scoped key is what `backup prune` falls back to with
@@ -10375,7 +10393,10 @@ mod tests {
         // Only NotPermitted stops the command before the stamp.
         assert!(refuse_an_unenforced_prune(
             "s3:x",
-            &backup_core::prune::PruneOutcome::NothingToPrune { kept_runs: 2 },
+            &backup_core::prune::PruneOutcome::NothingToPrune {
+                kept_runs: 2,
+                unfinished_runs: 0
+            },
             false
         )
         .is_ok());

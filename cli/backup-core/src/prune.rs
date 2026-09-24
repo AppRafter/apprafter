@@ -15,7 +15,8 @@
 //! deleting whole run-sets: it applies the keep policy to one REPRESENTATIVE
 //! per run (the manifest-bearing snapshot) and forgets every member of a run
 //! whose representative is not kept. An interrupted sequential run (no manifest
-//! member at all — an ORPHAN) is swept entirely.
+//! member at all — an ORPHAN) is swept entirely, once it is old enough that no
+//! backup can still be writing it ([`unfinished_run_window`]).
 //!
 //! [`plan_prune`] is the pure, deterministic JUDGMENT (what to forget);
 //! [`run_prune`] is the thin impure executor that derives the snapshot metadata
@@ -23,11 +24,51 @@
 //! id set, checks that it is gone, and only then runs `restic prune`.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use cli_core::{CliError, Result};
 use serde_json::Value;
 
 use crate::restic::{restic_forget_argv, restic_prune_argv, restic_snapshots_argv};
+
+/// How long past a run's newest snapshot, beyond the backup deadline, a run
+/// with no manifest is still left alone ([`unfinished_run_window`]): the pod's
+/// 90 s grace period after the deadline, and room for two nodes' clocks to
+/// disagree.
+pub const UNFINISHED_RUN_MARGIN: Duration = Duration::from_secs(3600);
+
+/// How long after its newest snapshot was written — the end of that
+/// snapshot's `restic backup` ([`SnapshotMeta::ended`]), or its start when
+/// restic did not record the end — a run with no manifest may still be
+/// being written, given the cluster's backup run deadline
+/// (`spec.backup.activeDeadlineSeconds`): that deadline, never less than six
+/// hours ([`crate::helper_pod::helper_keep_alive`]), plus
+/// [`UNFINISHED_RUN_MARGIN`].
+///
+/// A sequential run writes one snapshot per claim, hours before the commit
+/// snapshot that makes it complete, and holds no restic lock while it stages
+/// the next claim. Nothing stops a prune from starting in that time — the
+/// weekly check's, `apprafter backup prune`, a backup Job's under `enforce:
+/// cluster` beside a `backup create` — and a run with no manifest looks the
+/// same whether it died or is still going. Swept as an orphan, the run's
+/// claims are deleted under it, and the backup then writes its commit
+/// snapshot and succeeds without them.
+///
+/// The window is what makes the two tell apart:
+///
+/// * A scheduled run is stopped by its Job's deadline, which counts from the
+///   Job's start — before the run's first snapshot, so before its newest. A
+///   run whose newest snapshot is older than the deadline (plus the grace
+///   period) has ended.
+/// * The six-hour floor covers a run started before the deadline was lowered
+///   (under the default six hours, or anything shorter), and `apprafter backup
+///   create`, which has no Job deadline: each claim's dump runs in a helper
+///   pod that lives the same `max(deadline, 6h)` ([`crate::helper_pod`]), so
+///   its next snapshot starts within that of the last one's end.
+pub fn unfinished_run_window(run_deadline: Duration) -> Duration {
+    crate::helper_pod::helper_keep_alive(run_deadline).saturating_add(UNFINISHED_RUN_MARGIN)
+}
 
 /// Metadata for one restic snapshot (as [`run_prune`] derives from
 /// `restic snapshots --json`).
@@ -36,8 +77,14 @@ pub struct SnapshotMeta {
     pub id: String,
     /// The shared `run-<id>` tag (== the backup tag).
     pub run_tag: String,
-    /// RFC-3339; lexicographically sortable.
+    /// RFC-3339; lexicographically sortable. When its `restic backup`
+    /// started: what the keep policy buckets on.
     pub time: String,
+    /// When its `restic backup` ended (`summary.backup_end`, restic 0.17+),
+    /// RFC-3339; `None` from an older restic. A large claim's upload lies
+    /// between `time` and this, and a run is alive until it
+    /// ([`unfinished_run_window`]).
+    pub ended: Option<String>,
     /// True iff this snapshot carries `manifest.json` (the run representative).
     pub is_manifest: bool,
     /// Every tag restic reports for this snapshot — what
@@ -72,14 +119,21 @@ pub struct PrunePlan {
     pub forget_runs: usize,
     /// How many of this cluster's runs the keep policy keeps.
     pub kept_runs: usize,
+    /// Runs with no manifest that a backup may still be writing
+    /// ([`unfinished_run_window`]): left alone, whatever the policy.
+    pub unfinished_runs: usize,
 }
 
 /// A run: its representative (if any) plus every member snapshot id.
 struct Run {
-    /// The manifest-bearing snapshot, if the run has one. `None` ⇒ orphan.
+    /// The manifest-bearing snapshot, if the run has one. `None` ⇒ the run
+    /// is unfinished: an orphan, or still being written.
     representative: Option<SnapshotMeta>,
     /// Every snapshot id in the run (representative + members).
     ids: Vec<String>,
+    /// The newest start or end of a member that parses: the run's last sign
+    /// of life.
+    newest: Option<DateTime<Utc>>,
 }
 
 /// Decide which snapshot ids to forget, format-aware (spec §Retention M-r3-1b).
@@ -102,9 +156,13 @@ struct Run {
 ///
 /// 1. Group the remaining snapshots by `run_tag`.
 /// 2. Each group's REPRESENTATIVE is its `is_manifest == true` member. A group
-///    with NO manifest member is an ORPHAN (an interrupted sequential run) →
-///    ALL its snapshot ids are forgotten. (A monolithic run is a single
-///    snapshot with `is_manifest == true` → it is its own representative.)
+///    with NO manifest member is UNFINISHED: a sequential run that died before
+///    its commit snapshot, or one a backup is still writing. While its newest
+///    snapshot is younger than [`unfinished_run_window`] of `run_deadline`
+///    (at `now`) it is left alone and counted in `unfinished_runs`; older,
+///    it is an ORPHAN → ALL its snapshot ids are forgotten. (A monolithic run
+///    is a single snapshot with `is_manifest == true` → it is its own
+///    representative.)
 /// 3. Apply the keep policy to the set of representatives by `time`: keep the
 ///    newest representative per distinct calendar day up to `keep_daily`, per
 ///    distinct ISO week up to `keep_weekly`, per distinct calendar month up to
@@ -117,6 +175,8 @@ pub fn plan_prune(
     snapshots: &[SnapshotMeta],
     policy: &RetentionPolicy,
     this_cluster_uid: &str,
+    now: DateTime<Utc>,
+    run_deadline: Duration,
 ) -> PrunePlan {
     // 0. Another cluster's snapshots are never ours to forget (E3).
     let snapshots: Vec<&SnapshotMeta> = snapshots
@@ -131,8 +191,15 @@ pub fn plan_prune(
         let run = runs.entry(s.run_tag.clone()).or_insert_with(|| Run {
             representative: None,
             ids: Vec::new(),
+            newest: None,
         });
         run.ids.push(s.id.clone());
+        for seen in std::iter::once(&s.time).chain(&s.ended) {
+            if let Ok(t) = DateTime::parse_from_rfc3339(seen) {
+                let t = t.with_timezone(&Utc);
+                run.newest = Some(run.newest.map_or(t, |n| n.max(t)));
+            }
+        }
         if s.is_manifest {
             // If (pathologically) more than one member claims to be the
             // manifest, the newest by time wins as the representative — its
@@ -146,12 +213,16 @@ pub fn plan_prune(
 
     let mut forget_ids: Vec<String> = Vec::new();
     let mut forget_runs = 0;
+    let mut unfinished_runs = 0;
+    let window = unfinished_run_window(run_deadline);
 
-    // 2. Orphans (no manifest member) → forget the whole set.
+    // 2. No manifest member: left alone while a backup may still be writing
+    //    the run, an orphan to forget whole once none can be.
     // Collect the representatives of complete runs for the keep policy.
     let mut representatives: Vec<(&SnapshotMeta, &Vec<String>)> = Vec::new();
     for run in runs.values() {
         match &run.representative {
+            None if may_still_be_written(run.newest, now, window) => unfinished_runs += 1,
             None => {
                 forget_ids.extend(run.ids.iter().cloned());
                 forget_runs += 1;
@@ -182,6 +253,26 @@ pub fn plan_prune(
         forget_ids,
         forget_runs,
         kept_runs,
+        unfinished_runs,
+    }
+}
+
+/// May a backup still be writing a run with no manifest, whose newest
+/// snapshot is `newest`, at `now`? Until `window` has passed since that
+/// snapshot ([`unfinished_run_window`]) — and always when no member's time
+/// parses, since then nothing shows the run has ended.
+fn may_still_be_written(
+    newest: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    window: Duration,
+) -> bool {
+    let Some(newest) = newest else {
+        return true;
+    };
+    match chrono::TimeDelta::from_std(window) {
+        Ok(window) => now.signed_duration_since(newest) < window,
+        // A window past chrono's range (hundreds of millennia) never ends.
+        Err(_) => true,
     }
 }
 
@@ -273,14 +364,22 @@ fn parse_date(time: &str) -> Option<(i32, u32, u32)> {
 /// What [`run_prune`] did to the repository.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PruneOutcome {
-    /// Every run of this cluster is inside the keep policy: nothing was
-    /// forgotten, and restic was not asked to delete anything.
-    NothingToPrune { kept_runs: usize },
+    /// Every complete run of this cluster is inside the keep policy: nothing
+    /// was forgotten, and restic was not asked to delete anything.
+    NothingToPrune {
+        kept_runs: usize,
+        /// Runs a backup may still be writing, left alone
+        /// ([`PrunePlan::unfinished_runs`]).
+        unfinished_runs: usize,
+    },
     /// Snapshots forgotten, and the data only they referred to removed.
     Pruned {
         forgot_snapshots: usize,
         forgot_runs: usize,
         kept_runs: usize,
+        /// Runs a backup may still be writing, left alone
+        /// ([`PrunePlan::unfinished_runs`]).
+        unfinished_runs: usize,
     },
     /// The credential may not delete snapshots: the store refused the first
     /// delete, the snapshot is still listed, and NOTHING was deleted or
@@ -302,17 +401,23 @@ impl PruneOutcome {
     /// One sentence on what happened, for a status record or a terminal.
     pub fn describe(&self) -> String {
         match self {
-            PruneOutcome::NothingToPrune { kept_runs } => format!(
+            PruneOutcome::NothingToPrune {
+                kept_runs,
+                unfinished_runs,
+            } => format!(
                 "nothing to prune: all {kept_runs} run(s) of this cluster are inside the keep \
-                 policy"
+                 policy{}",
+                left_alone(*unfinished_runs)
             ),
             PruneOutcome::Pruned {
                 forgot_snapshots,
                 forgot_runs,
                 kept_runs,
+                unfinished_runs,
             } => format!(
                 "forgot {forgot_snapshots} snapshot(s) of {forgot_runs} run(s) and pruned the \
-                 data only they used; {kept_runs} run(s) kept"
+                 data only they used; {kept_runs} run(s) kept{}",
+                left_alone(*unfinished_runs)
             ),
             PruneOutcome::NotPermitted {
                 snapshot,
@@ -328,6 +433,18 @@ impl PruneOutcome {
             ),
         }
     }
+}
+
+/// The clause [`PruneOutcome::describe`] adds for runs a backup may still be
+/// writing: empty when there are none.
+fn left_alone(unfinished_runs: usize) -> String {
+    if unfinished_runs == 0 {
+        return String::new();
+    }
+    format!(
+        "; {unfinished_runs} unfinished run(s) left alone, as a backup may still be writing \
+         them"
+    )
 }
 
 /// restic's eight-character short form of a snapshot id.
@@ -374,19 +491,27 @@ fn first_line(stderr: &str) -> &str {
 /// restic for — and legacy snapshots carry no matchable tag at all), so the
 /// narrowing happens in [`plan_prune`], which is where the delete decision is
 /// made and therefore the only place that can be complete.
+///
+/// `now` and `run_deadline` (the cluster's backup run deadline,
+/// `spec.backup.activeDeadlineSeconds`) decide which runs with no manifest a
+/// backup may still be writing ([`unfinished_run_window`]); those are left
+/// alone.
 pub fn run_prune(
     r: &dyn crate::ResticRunner,
     repo: &str,
     pass: &str,
     policy: &RetentionPolicy,
     this_cluster_uid: &str,
+    now: DateTime<Utc>,
+    run_deadline: Duration,
 ) -> Result<PruneOutcome> {
     let json = r.run_stdout(&restic_snapshots_argv(repo), pass)?;
     let snapshots = parse_snapshots(&json)?;
-    let plan = plan_prune(&snapshots, policy, this_cluster_uid);
+    let plan = plan_prune(&snapshots, policy, this_cluster_uid, now, run_deadline);
     let Some((probe, rest)) = plan.forget_ids.split_first() else {
         return Ok(PruneOutcome::NothingToPrune {
             kept_runs: plan.kept_runs,
+            unfinished_runs: plan.unfinished_runs,
         });
     };
 
@@ -435,6 +560,7 @@ pub fn run_prune(
         forgot_snapshots: plan.forget_ids.len(),
         forgot_runs: plan.forget_runs,
         kept_runs: plan.kept_runs,
+        unfinished_runs: plan.unfinished_runs,
     })
 }
 
@@ -460,6 +586,7 @@ fn parse_snapshots(json: &str) -> Result<Vec<SnapshotMeta>> {
         id: String,
         run_tag: String,
         time: String,
+        ended: Option<String>,
         paths: Vec<String>,
         tags: Vec<String>,
     }
@@ -502,10 +629,15 @@ fn parse_snapshots(json: &str) -> Result<Vec<SnapshotMeta>> {
                     .collect()
             })
             .unwrap_or_default();
+        let ended = s
+            .pointer("/summary/backup_end")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         raws.push(Raw {
             id,
             run_tag,
             time,
+            ended,
             paths,
             tags,
         });
@@ -528,6 +660,7 @@ fn parse_snapshots(json: &str) -> Result<Vec<SnapshotMeta>> {
                 id: r.id,
                 run_tag: r.run_tag,
                 time: r.time,
+                ended: r.ended,
                 tags: r.tags,
             }
         })
@@ -541,20 +674,33 @@ fn parse_snapshots(json: &str) -> Result<Vec<SnapshotMeta>> {
 /// per-claim snapshot under `<staging>/claim-<i>`, and the sequential commit
 /// (manifest) snapshot under `<staging>/commit`. So the robust rule is:
 ///
-/// * A snapshot ALONE in its run_tag group is a monolithic run → representative.
+/// * A per-claim (`claim-<i>`) snapshot is never a representative. Even ALONE
+///   in its group it is not a monolithic run: a sequential run of one claim
+///   still ends with its commit snapshot, so a lone claim snapshot is the
+///   first of a run that has not finished — still being written, or dead.
+///   Counted as complete, it took its day's keep slot from a run that was.
+/// * Any other snapshot ALONE in its run_tag group is a monolithic run →
+///   representative, whatever its path.
 /// * In a MULTI-snapshot group, the representative is the one whose path is the
-///   commit/manifest dir (basename `commit`); the per-claim (`claim-<i>`)
-///   snapshots are not.
-///
-/// `alone == true` short-circuits to the monolithic case regardless of path.
+///   commit/manifest dir (basename `commit`).
 fn derive_manifest(paths: &[String], alone: bool) -> bool {
-    if alone {
-        return true;
+    let base = |p: &String| -> String {
+        p.trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or(p)
+            .to_string()
+    };
+    if paths.iter().any(|p| is_claim_dir(&base(p))) {
+        return false;
     }
-    paths.iter().any(|p| {
-        let base = p.trim_end_matches('/').rsplit('/').next().unwrap_or(p);
-        base == "commit"
-    })
+    alone || paths.iter().any(|p| base(p) == "commit")
+}
+
+/// Is `base` a per-claim staging directory the engine writes: `claim-<i>`?
+fn is_claim_dir(base: &str) -> bool {
+    base.strip_prefix("claim-")
+        .is_some_and(|i| !i.is_empty() && i.bytes().all(|b| b.is_ascii_digit()))
 }
 
 #[cfg(test)]
@@ -564,6 +710,19 @@ mod tests {
     /// This cluster's `kube-system` UID, and a co-tenant's.
     const MINE: &str = "11111111-2222-3333-4444-555555555555";
     const THEIRS: &str = "99999999-8888-7777-6666-555555555555";
+
+    /// The chart's default backup deadline.
+    const SIX_HOURS: Duration = crate::helper_pod::DEFAULT_RUN_DEADLINE;
+
+    fn at(t: &str) -> DateTime<Utc> {
+        t.parse().unwrap()
+    }
+
+    /// Long after every run of the older listings below: no backup can still
+    /// be writing any of them.
+    fn later() -> DateTime<Utc> {
+        at("2026-09-27T12:00:00Z")
+    }
 
     /// Build a sequential run: `claims` per-claim snapshots (is_manifest:false)
     /// plus 1 manifest/commit snapshot (is_manifest:true), all sharing `tag`,
@@ -582,6 +741,7 @@ mod tests {
                 run_tag: run_tag.clone(),
                 time: time.clone(),
                 is_manifest: false,
+                ended: None,
                 tags: vec![run_tag.clone()],
             });
         }
@@ -590,6 +750,7 @@ mod tests {
             run_tag: run_tag.clone(),
             time,
             is_manifest: true,
+            ended: None,
             tags: vec![run_tag],
         });
         out
@@ -608,6 +769,7 @@ mod tests {
             run_tag: run_tag.clone(),
             time,
             is_manifest: true,
+            ended: None,
             tags: vec![run_tag],
         }]
     }
@@ -625,6 +787,7 @@ mod tests {
             run_tag: run_tag.clone(),
             time,
             is_manifest: true,
+            ended: None,
             tags: vec![run_tag],
         }]
     }
@@ -642,7 +805,7 @@ mod tests {
             keep_weekly: 0,
             keep_monthly: 0,
         };
-        let plan = plan_prune(&snaps, &policy, MINE);
+        let plan = plan_prune(&snaps, &policy, MINE, later(), SIX_HOURS);
         // The OLDEST run's ALL THREE snapshot ids are forgotten.
         let mut expected = vec![
             "run-a-claim-0".to_string(),
@@ -681,7 +844,7 @@ mod tests {
             keep_weekly: 0,
             keep_monthly: 0,
         };
-        let plan = plan_prune(&snaps, &policy, MINE);
+        let plan = plan_prune(&snaps, &policy, MINE, later(), SIX_HOURS);
         assert_eq!(plan.forget_ids, vec!["m-a-mono".to_string()]);
     }
 
@@ -696,6 +859,7 @@ mod tests {
                 run_tag: run_tag.clone(),
                 time: "2026-07-12T03:00:00Z".into(),
                 is_manifest: false,
+                ended: None,
                 tags: vec![run_tag.clone()],
             },
             SnapshotMeta {
@@ -703,14 +867,209 @@ mod tests {
                 run_tag: run_tag.clone(),
                 time: "2026-07-12T03:00:00Z".into(),
                 is_manifest: false,
+                ended: None,
                 tags: vec![run_tag],
             },
         ];
         // Even a generous policy sweeps the orphan (no representative to keep).
-        let plan = plan_prune(&snaps, &RetentionPolicy::default(), MINE);
+        let plan = plan_prune(
+            &snaps,
+            &RetentionPolicy::default(),
+            MINE,
+            later(),
+            SIX_HOURS,
+        );
         assert_eq!(
             plan.forget_ids,
             vec!["orphan-0".to_string(), "orphan-1".to_string()]
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // A run with no manifest that a backup may still be writing.
+    // -----------------------------------------------------------------------
+
+    /// A sequential run's claim snapshots, as `restic snapshots --json` lists
+    /// them — each at its own time, under one run tag that started at
+    /// `start` — with no commit snapshot yet.
+    fn claims_only(label: &str, start: &str, times: &[&str]) -> Vec<SnapshotMeta> {
+        let run_tag = format!("{MINE}-{start}");
+        times
+            .iter()
+            .enumerate()
+            .map(|(i, t)| SnapshotMeta {
+                id: format!("{label}-claim-{i}"),
+                run_tag: run_tag.clone(),
+                time: t.to_string(),
+                is_manifest: false,
+                ended: None,
+                tags: vec![run_tag.clone()],
+            })
+            .collect()
+    }
+
+    /// The reported failure: the Sunday 03:00 sequential backup is still
+    /// dumping at 06:00, when the weekly check prunes. Its two claim
+    /// snapshots have no commit snapshot yet — and must not be swept as an
+    /// orphan, whatever the policy.
+    #[test]
+    fn a_run_a_backup_is_still_writing_is_left_alone() {
+        let mut snaps = seq_run("sat", "2026-09-26", 1);
+        snaps.extend(claims_only(
+            "sun",
+            "2026-09-27T03:00:00Z",
+            &["2026-09-27T03:40:00Z", "2026-09-27T04:30:00Z"],
+        ));
+        let plan = plan_prune(
+            &snaps,
+            &RetentionPolicy::default(),
+            MINE,
+            at("2026-09-27T06:00:00Z"),
+            SIX_HOURS,
+        );
+        assert_eq!(
+            plan,
+            PrunePlan {
+                forget_ids: vec![],
+                forget_runs: 0,
+                kept_runs: 1,
+                unfinished_runs: 1,
+            }
+        );
+    }
+
+    /// The window runs from the run's NEWEST snapshot: the backup deadline,
+    /// never less than six hours, plus an hour. At the window a run is an
+    /// orphan and is swept as before; a second earlier it is left alone.
+    #[test]
+    fn a_run_with_no_manifest_is_an_orphan_once_its_newest_snapshot_is_past_the_window() {
+        let snaps = claims_only(
+            "dead",
+            "2026-09-27T03:00:00Z",
+            &["2026-09-27T03:40:00Z", "2026-09-27T04:30:00Z"],
+        );
+        let newest = at("2026-09-27T04:30:00Z");
+        let seconds = |s: u64| chrono::TimeDelta::seconds(s as i64);
+        for (deadline, window) in [
+            // The default: six hours, plus the hour.
+            (SIX_HOURS, 7 * 3600),
+            // A deadline lowered for a frequent schedule keeps the floor.
+            (Duration::from_secs(600), 7 * 3600),
+            // A longer one moves the window with it.
+            (Duration::from_secs(12 * 3600), 13 * 3600),
+        ] {
+            assert_eq!(unfinished_run_window(deadline).as_secs(), window);
+            let spared = plan_prune(
+                &snaps,
+                &RetentionPolicy::default(),
+                MINE,
+                newest + seconds(window - 1),
+                deadline,
+            );
+            assert!(spared.forget_ids.is_empty(), "{deadline:?}: {spared:?}");
+            assert_eq!(spared.unfinished_runs, 1, "{deadline:?}");
+            let swept = plan_prune(
+                &snaps,
+                &RetentionPolicy::default(),
+                MINE,
+                newest + seconds(window),
+                deadline,
+            );
+            assert_eq!(
+                swept.forget_ids,
+                vec!["dead-claim-0".to_string(), "dead-claim-1".to_string()],
+                "{deadline:?}"
+            );
+            assert_eq!((swept.forget_runs, swept.unfinished_runs), (1, 0));
+        }
+    }
+
+    /// A snapshot's `time` is when its `restic backup` STARTED; restic 0.17+
+    /// also records when it ended (`summary.backup_end`), and a large claim's
+    /// upload lies between the two. The run was alive until the end, so the
+    /// window counts from there. The times are in the form restic 0.18.1
+    /// writes them: nanoseconds and the host's offset.
+    #[test]
+    fn a_run_is_alive_until_its_newest_snapshot_ended_not_until_it_started() {
+        let json = format!(
+            r#"[
+              {{"id":"big-c0","time":"2026-09-26T23:00:00.109384903+01:00",
+                "tags":["{MINE}-2026-09-26T21:55:00+00:00"],"paths":["/staging/b/claim-0"],
+                "summary":{{"backup_start":"2026-09-26T23:00:00.109384903+01:00",
+                            "backup_end":"2026-09-27T00:30:00.161944354+01:00"}}}},
+              {{"id":"big-c1","time":"2026-09-26T23:10:00.5+01:00",
+                "tags":["{MINE}-2026-09-26T21:55:00+00:00"],"paths":["/staging/b/claim-1"]}}
+            ]"#
+        );
+        let snaps = parse_snapshots(&json).unwrap();
+        // 23:00+01:00 is 22:00Z: eight hours before Sunday 06:00Z, past the
+        // seven-hour window; the upload ended at 23:30Z, six and a half.
+        let plan = plan_prune(
+            &snaps,
+            &RetentionPolicy::default(),
+            MINE,
+            at("2026-09-27T06:00:00Z"),
+            SIX_HOURS,
+        );
+        assert!(plan.forget_ids.is_empty(), "{plan:?}");
+        assert_eq!(plan.unfinished_runs, 1);
+        // Once seven hours have passed since the end, it is an orphan.
+        let plan = plan_prune(
+            &snaps,
+            &RetentionPolicy::default(),
+            MINE,
+            at("2026-09-27T06:30:01Z"),
+            SIX_HOURS,
+        );
+        assert_eq!(plan.forget_ids, vec!["big-c0", "big-c1"]);
+    }
+
+    /// A run whose snapshots carry no time that parses cannot be shown to
+    /// have ended, so it is not deleted.
+    #[test]
+    fn a_run_with_no_manifest_and_no_readable_time_is_left_alone() {
+        let snaps = claims_only("odd", "2026-07-12T03:00:00Z", &["", "yesterday"]);
+        let plan = plan_prune(
+            &snaps,
+            &RetentionPolicy::default(),
+            MINE,
+            later(),
+            SIX_HOURS,
+        );
+        assert!(plan.forget_ids.is_empty(), "{plan:?}");
+        assert_eq!(plan.unfinished_runs, 1);
+    }
+
+    /// With ONE claim snapshot so far, an unfinished sequential run used to
+    /// pass for a complete monolithic run ("alone in its group"), and as the
+    /// newest "run" of the day it took the day's keep slot from the run that
+    /// had completed: that one was forgotten.
+    #[test]
+    fn a_first_claim_snapshot_alone_does_not_take_a_complete_runs_slot() {
+        let json = format!(
+            r#"[
+              {{"id":"done","time":"2026-09-27T01:00:00Z",
+                "tags":["{MINE}-2026-09-27T01:00:00Z"],"paths":["/staging/x/data"]}},
+              {{"id":"going-claim-0","time":"2026-09-27T02:10:00Z",
+                "tags":["{MINE}-2026-09-27T02:00:00Z"],"paths":["/staging/y/claim-0"]}}
+            ]"#
+        );
+        let snaps = parse_snapshots(&json).unwrap();
+        let plan = plan_prune(
+            &snaps,
+            &KEEP_ONE_DAY,
+            MINE,
+            at("2026-09-27T02:30:00Z"),
+            SIX_HOURS,
+        );
+        assert_eq!(
+            plan,
+            PrunePlan {
+                forget_ids: vec![],
+                forget_runs: 0,
+                kept_runs: 1,
+                unfinished_runs: 1,
+            }
         );
     }
 
@@ -725,7 +1084,7 @@ mod tests {
 
     #[test]
     fn empty_input_is_a_no_op() {
-        let plan = plan_prune(&[], &RetentionPolicy::default(), MINE);
+        let plan = plan_prune(&[], &RetentionPolicy::default(), MINE, later(), SIX_HOURS);
         assert!(plan.forget_ids.is_empty());
     }
 
@@ -742,7 +1101,7 @@ mod tests {
             keep_weekly: 1,
             keep_monthly: 0,
         };
-        let plan = plan_prune(&snaps, &policy, MINE);
+        let plan = plan_prune(&snaps, &policy, MINE, later(), SIX_HOURS);
         assert_eq!(plan.forget_ids, vec!["w-old-mono".to_string()]);
 
         // Now a monthly bucket rescues an older run in a different month.
@@ -754,7 +1113,7 @@ mod tests {
             keep_weekly: 0,
             keep_monthly: 2,
         };
-        let plan = plan_prune(&snaps, &policy, MINE);
+        let plan = plan_prune(&snaps, &policy, MINE, later(), SIX_HOURS);
         // daily keeps newest (July); monthly keeps newest-per-month for 2 months
         // → both months kept → nothing forgotten.
         assert!(
@@ -776,7 +1135,7 @@ mod tests {
             keep_weekly: 0,
             keep_monthly: 0,
         };
-        let plan = plan_prune(&snaps, &policy, MINE);
+        let plan = plan_prune(&snaps, &policy, MINE, later(), SIX_HOURS);
         let mut expected = vec![
             "m-a-mono".to_string(),
             "s-b-claim-0".to_string(),
@@ -794,6 +1153,28 @@ mod tests {
         // A monolithic run (alone in its group) is a representative even under
         // the `.../data` staging path.
         assert!(derive_manifest(&["/stage/data".into()], true));
+    }
+
+    /// A sequential run's per-claim snapshot is never its run's
+    /// representative, not even as the only snapshot so far: a sequential
+    /// run of one claim still ends with a commit snapshot.
+    #[test]
+    fn derive_manifest_a_lone_claim_snapshot_is_not_a_representative() {
+        assert!(!derive_manifest(&["/stage/claim-0".into()], true));
+        assert!(!derive_manifest(
+            &["/tmp/apprafter-backup-x/claim-12/".into()],
+            true
+        ));
+        // Only the per-claim directory the engine writes: a monolithic run
+        // staged anywhere else stays its own representative.
+        for monolithic in [
+            "/stage/data",
+            "/stage/claim-",
+            "/stage/claim-x",
+            "/claims-0",
+        ] {
+            assert!(derive_manifest(&[monolithic.into()], true), "{monolithic}");
+        }
     }
 
     #[test]
@@ -853,7 +1234,7 @@ mod tests {
             keep_weekly: 0,
             keep_monthly: 0,
         };
-        let plan = plan_prune(&snaps, &policy, MINE);
+        let plan = plan_prune(&snaps, &policy, MINE, later(), SIX_HOURS);
         assert!(
             plan.forget_ids.is_empty(),
             "a co-tenant's snapshots are not ours to delete, and our own single \
@@ -883,7 +1264,7 @@ mod tests {
             keep_weekly: 0,
             keep_monthly: 0,
         };
-        let plan = plan_prune(&snaps, &policy, MINE);
+        let plan = plan_prune(&snaps, &policy, MINE, later(), SIX_HOURS);
         let mut expected = vec![
             "t-a-mono".to_string(),
             "t-b-claim-0".to_string(),
@@ -910,7 +1291,7 @@ mod tests {
             keep_weekly: 0,
             keep_monthly: 0,
         };
-        let plan = plan_prune(&snaps, &policy, MINE);
+        let plan = plan_prune(&snaps, &policy, MINE, later(), SIX_HOURS);
         assert!(
             plan.forget_ids.is_empty(),
             "our only run must keep the daily slot: {:?}",
@@ -930,7 +1311,7 @@ mod tests {
             keep_weekly: 0,
             keep_monthly: 0,
         };
-        let plan = plan_prune(&snaps, &policy, MINE);
+        let plan = plan_prune(&snaps, &policy, MINE, later(), SIX_HOURS);
         assert_eq!(
             plan.forget_ids,
             vec!["l-old-legacy".to_string()],
@@ -1074,13 +1455,15 @@ mod tests {
     #[test]
     fn run_prune_forgets_only_our_ids_from_a_shared_repository_then_prunes() {
         let r = FakeRepo::new(&shared_listing(), Deletes::Allowed);
-        let outcome = run_prune(&r, "s3:repo", "pw", &KEEP_ONE_DAY, MINE).expect("prune runs");
+        let outcome = run_prune(&r, "s3:repo", "pw", &KEEP_ONE_DAY, MINE, later(), SIX_HOURS)
+            .expect("prune runs");
         assert_eq!(
             outcome,
             PruneOutcome::Pruned {
                 forgot_snapshots: 3,
                 forgot_runs: 2,
-                kept_runs: 1
+                kept_runs: 1,
+                unfinished_runs: 0
             }
         );
         assert_eq!(r.left(), vec!["theirs-old", "mine-new"]);
@@ -1113,7 +1496,8 @@ mod tests {
     #[test]
     fn a_key_that_may_not_delete_prunes_nothing_and_says_so() {
         let r = FakeRepo::new(&shared_listing(), Deletes::Denied);
-        let outcome = run_prune(&r, "s3:repo", "pw", &KEEP_ONE_DAY, MINE).expect("not an error");
+        let outcome = run_prune(&r, "s3:repo", "pw", &KEEP_ONE_DAY, MINE, later(), SIX_HOURS)
+            .expect("not an error");
         let PruneOutcome::NotPermitted {
             snapshot,
             restic_said,
@@ -1139,7 +1523,8 @@ mod tests {
     #[test]
     fn a_delete_that_failed_otherwise_is_an_error_and_prunes_nothing() {
         let r = FakeRepo::new(&shared_listing(), Deletes::TimesOut);
-        let err = run_prune(&r, "s3:repo", "pw", &KEEP_ONE_DAY, MINE).unwrap_err();
+        let err =
+            run_prune(&r, "s3:repo", "pw", &KEEP_ONE_DAY, MINE, later(), SIX_HOURS).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("still in the repository"), "{msg}");
         assert!(msg.contains("i/o timeout"), "{msg}");
@@ -1151,7 +1536,8 @@ mod tests {
     #[test]
     fn a_forget_that_left_snapshots_behind_is_never_followed_by_a_prune() {
         let r = FakeRepo::new(&shared_listing(), Deletes::FirstOnly);
-        let err = run_prune(&r, "s3:repo", "pw", &KEEP_ONE_DAY, MINE).unwrap_err();
+        let err =
+            run_prune(&r, "s3:repo", "pw", &KEEP_ONE_DAY, MINE, later(), SIX_HOURS).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("removed 1 of the 3"), "{msg}");
         assert!(msg.contains("not pruned"), "{msg}");
@@ -1170,8 +1556,15 @@ mod tests {
             keep_weekly: 0,
             keep_monthly: 0,
         };
-        let outcome = run_prune(&r, "s3:repo", "pw", &policy, MINE).expect("prune runs");
-        assert_eq!(outcome, PruneOutcome::NothingToPrune { kept_runs: 0 });
+        let outcome =
+            run_prune(&r, "s3:repo", "pw", &policy, MINE, later(), SIX_HOURS).expect("prune runs");
+        assert_eq!(
+            outcome,
+            PruneOutcome::NothingToPrune {
+                kept_runs: 0,
+                unfinished_runs: 0
+            }
+        );
         assert_eq!(
             r.verbs(),
             vec!["snapshots"],
@@ -1179,11 +1572,73 @@ mod tests {
         );
     }
 
+    /// The reported failure, end to end: last night's complete sequential
+    /// run and tonight's, still being written — two claim snapshots, no
+    /// commit yet — when the weekly check prunes at 06:00. Nothing may be
+    /// forgotten, and restic is not asked to delete anything.
+    #[test]
+    fn run_prune_leaves_a_run_a_backup_is_still_writing_in_the_repository() {
+        let listing = format!(
+            r#"[
+              {{"id":"done-c0","time":"2026-09-26T03:10:00Z",
+                "tags":["{MINE}-2026-09-26T03:00:00Z"],"paths":["/s/claim-0"]}},
+              {{"id":"done-cm","time":"2026-09-26T03:20:00Z",
+                "tags":["{MINE}-2026-09-26T03:00:00Z"],"paths":["/s/commit"]}},
+              {{"id":"going-c0","time":"2026-09-27T03:40:00Z",
+                "tags":["{MINE}-2026-09-27T03:00:00Z"],"paths":["/s/claim-0"]}},
+              {{"id":"going-c1","time":"2026-09-27T04:30:00Z",
+                "tags":["{MINE}-2026-09-27T03:00:00Z"],"paths":["/s/claim-1"]}}
+            ]"#
+        );
+        let r = FakeRepo::new(&listing, Deletes::Allowed);
+        let outcome = run_prune(
+            &r,
+            "s3:repo",
+            "pw",
+            &RetentionPolicy::default(),
+            MINE,
+            at("2026-09-27T06:00:00Z"),
+            SIX_HOURS,
+        )
+        .expect("prune runs");
+        assert_eq!(
+            outcome,
+            PruneOutcome::NothingToPrune {
+                kept_runs: 1,
+                unfinished_runs: 1
+            }
+        );
+        assert_eq!(r.left(), vec!["done-c0", "done-cm", "going-c0", "going-c1"]);
+        assert_eq!(r.verbs(), vec!["snapshots"]);
+        let said = outcome.describe();
+        assert!(
+            said.ends_with(
+                "; 1 unfinished run(s) left alone, as a backup may still be writing them"
+            ),
+            "{said}"
+        );
+    }
+
     #[test]
     fn nothing_past_the_policy_is_nothing_to_prune() {
         let r = FakeRepo::new(&shared_listing(), Deletes::Allowed);
-        let outcome = run_prune(&r, "s3:repo", "pw", &RetentionPolicy::default(), MINE).unwrap();
-        assert_eq!(outcome, PruneOutcome::NothingToPrune { kept_runs: 3 });
+        let outcome = run_prune(
+            &r,
+            "s3:repo",
+            "pw",
+            &RetentionPolicy::default(),
+            MINE,
+            later(),
+            SIX_HOURS,
+        )
+        .unwrap();
+        assert_eq!(
+            outcome,
+            PruneOutcome::NothingToPrune {
+                kept_runs: 3,
+                unfinished_runs: 0
+            }
+        );
         assert_eq!(r.verbs(), vec!["snapshots"]);
     }
 }

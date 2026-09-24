@@ -47,7 +47,10 @@ That last snapshot is the run's **representative**. It is what retention
 actually applies its keep numbers to, and a run that has one is a run that
 completed. Identification is by staging path: a snapshot alone in its tag group
 is a monolithic run and is its own representative; in a multi-snapshot group the
-representative is the one staged under `commit`.
+representative is the one staged under `commit`. A claim snapshot — staged under
+`claim-<n>` — is never a representative, even alone: a sequential run of one
+claim still ends with its commit snapshot, so a lone claim snapshot is a run
+that has not finished.
 
 Two consequences follow, and they are the two that surprise people:
 
@@ -55,11 +58,20 @@ Two consequences follow, and they are the two that surprise people:
   snapshot sharing its tag is forgotten with it. A sequential run can therefore
   never rotate apart into a surviving manifest with missing claim data, or into
   claim snapshots no manifest refers to.
-- **An interrupted run is swept regardless of policy.** A tag group with *no*
-  representative — a sequential run that died before it wrote its commit point —
-  is an orphan, and all of its snapshots are forgotten on the next prune no
-  matter how generous the keep numbers are. This is deliberate: a run with no
-  manifest is one a restore ignores anyway.
+- **An interrupted run is swept regardless of policy — once no backup can
+  still be writing it.** A tag group with *no* representative is either a
+  sequential run that died before it wrote its commit point, or one a backup is
+  writing right now: its claim snapshots land one by one, hours before its
+  commit point, and nothing stops a prune from starting in between — the weekly
+  check's above all, since a backup holds no repository lock while it dumps a
+  claim. So such a group is left alone until the backup deadline
+  (`spec.backup.activeDeadlineSeconds`, taken as six hours when it is shorter)
+  plus an hour has passed since its newest snapshot finished uploading: every
+  scheduled run has ended by then, and a prune that left one alone says
+  `unfinished run(s) left alone`. After that it is an orphan, and all of its
+  snapshots are forgotten on the next prune no matter how generous the keep
+  numbers are. This is deliberate: a run with no manifest is one a restore
+  ignores anyway.
 
 ## Why the keep numbers are not restic's keep flags
 
@@ -452,10 +464,14 @@ that is `Forbid`, not the deadline.
 
 **The two schedules bound each other.** `restic check`, and the `forget` and
 `prune` after it, hold the repository's exclusive lock, and neither Job waits
-for a lock (no `--retry-lock`): a check that starts while a backup is running
-fails on the backup's lock, and a backup that starts while a check or its prune
-is running fails on theirs. The check Job's time is the check's and, under
-`enforce: check`, the prune's together. For the
+for a lock (no `--retry-lock`). A backup holds a lock only while one of its own
+restic commands runs, above all `restic backup` uploading what it has staged;
+while it dumps a database or archives a volume it holds none. So a check that
+starts while a backup is uploading fails on the backup's lock, and one that
+starts while the backup is dumping passes and holds the exclusive lock, and the
+backup then fails on it at its next upload. A backup that starts while a check
+or its prune is running fails on theirs. The check Job's time is the check's
+and, under `enforce: check`, the prune's together. For the
 same reason `apprafter backup run` starts nothing while a backup or check Job
 has not finished (`apprafter::backup::job_active`). So on top of
 its own interval, each deadline has a second ceiling:
@@ -468,10 +484,15 @@ its own interval, each deadline has a second ceiling:
 Under the default schedules — the backup at 03:00 every day, the check at
 06:00 on Sundays — those gaps are three hours and twenty-one. The six-hour
 backup default is longer than the first: a Sunday backup still running at
-06:00, slow or stuck, makes that week's check fail on its lock (the check Job
-retries for about ten minutes, then fails), and the next week's check runs as
-usual. If Sunday backups take longer than three hours, move the check later —
-`apprafter backup set check 12:00` — rather than living with a failed check.
+06:00, slow or stuck, costs that week's check or that backup. Uploading at
+06:00, it makes the check fail on its lock (the check Job retries for about ten
+minutes, then fails); dumping, it lets the check pass, and fails on the check's
+lock when it next uploads (the backup Job retries too, each attempt a new run
+from the start). Under `enforce: check` the prune after that check leaves the
+backup's unfinished run alone ([what retention counts](#what-retention-counts)).
+The next week's check runs as usual. If Sunday backups take longer than three
+hours, move the check later — `apprafter backup set check 12:00` — rather than
+living with a failed check or backup.
 The check's six hours end by Sunday noon, well clear of Monday's backup; when
 you raise `checkActiveDeadlineSeconds` for `checkReadData: true` on a
 repository that takes long to download, keep it under the twenty-one hours, or
@@ -631,7 +652,7 @@ carries with the growth since the check before.
 | Status | Reason | What happened |
 | --- | --- | --- |
 | `True` | `Pruned` | The prune after the latest check (or backup, under `enforce: cluster`) forgot the snapshots past the keep policy and removed the data only they used. |
-| `True` | `NothingToPrune` | The prune ran, and every run is inside the keep policy. |
+| `True` | `NothingToPrune` | The prune ran, and every finished run is inside the keep policy. |
 | `False` | `PruneNotPermitted` | The cluster's S3 key may not delete: the prune stopped at the first refused delete and nothing was deleted. Prune from outside the cluster with the full credentials. |
 | `False` | `PruneFailed` | The prune failed; the message quotes why. |
 | `False` | `CheckFailed` | The latest check did not pass, and a check that does not pass never prunes. `BackupHealthy` says why. |

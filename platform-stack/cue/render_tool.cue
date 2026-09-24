@@ -401,8 +401,9 @@ _backupTemplate: """
 	{{- if .Values.backup.enabled }}
 	{{- $b := .Values.backup }}
 	{{- /* ONE value per Job deadline, read once: the backup Job's
-	     activeDeadlineSeconds and the runner's APPRAFTER_BACKUP_DEADLINE_SECONDS
-	     must never disagree, so both are this variable. */}}
+	     activeDeadlineSeconds, its runner's APPRAFTER_BACKUP_DEADLINE_SECONDS
+	     and both runners' APPRAFTER_BACKUP_RUN_DEADLINE_SECONDS must never
+	     disagree, so all three are this variable. */}}
 	{{- $deadline := $b.activeDeadlineSeconds | default 21600 | int }}
 	{{- /* ONE value for the staging volume's size, read once: the emptyDir's
 	     sizeLimit, which the kubelet evicts on, and the runner's
@@ -548,6 +549,12 @@ _backupTemplate: """
 	            # The Job's own deadline, so the runner can say it was stopped
 	            # by it and keep its helper pods alive exactly that long.
 	            - name: APPRAFTER_BACKUP_DEADLINE_SECONDS
+	              value: {{ $deadline | quote }}
+	            # The backup Job's deadline, in both Jobs: a prune leaves a run
+	            # with no manifest alone until its newest snapshot is older than
+	            # this (never less than six hours) plus an hour, since a backup
+	            # may still be writing it. Here it is the same value as above.
+	            - name: APPRAFTER_BACKUP_RUN_DEADLINE_SECONDS
 	              value: {{ $deadline | quote }}
 	            - name: RESTIC_PASSWORD
 	              valueFrom:
@@ -741,6 +748,14 @@ _backupTemplate: """
 	            # stopped there.
 	            - name: APPRAFTER_BACKUP_DEADLINE_SECONDS
 	              value: {{ $b.checkActiveDeadlineSeconds | default 21600 | int | quote }}
+	            # The BACKUP Job's deadline, which the prune after the check
+	            # waits out: a backup still dumping when the check starts holds
+	            # no restic lock, so the check passes beside it, and the run it
+	            # is writing — claim snapshots, no commit snapshot yet — is left
+	            # alone until its newest snapshot is older than this (never less
+	            # than six hours) plus an hour.
+	            - name: APPRAFTER_BACKUP_RUN_DEADLINE_SECONDS
+	              value: {{ $deadline | quote }}
 	            - name: RESTIC_PASSWORD
 	              valueFrom:
 	                secretKeyRef:

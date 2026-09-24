@@ -798,6 +798,7 @@ mod tests {
             depth: &depth,
             enforce: crate::config::Enforce::Check,
             retention: &retention,
+            backup_run_deadline: backup_core::helper_pod::DEFAULT_RUN_DEADLINE,
         };
         let mut at_prune = None;
         crate::check::run_check(
@@ -808,7 +809,7 @@ mod tests {
                 at_prune = Some(stop_record(&check, "stopped", "t"));
                 Ok("11111111-2222-3333-4444-555555555555".into())
             },
-            &|| "t".into(),
+            &chrono::Utc::now,
             &mut |v| records.push(v),
         );
         let (data, phase) = at_prune.expect("the prune began");

@@ -441,7 +441,11 @@ package platformstack
 	// the runner as APPRAFTER_BACKUP_DEADLINE_SECONDS: it records a run
 	// stopped at the deadline (lastFailure, the failure webhook) in the pod's
 	// 90 s grace period, and keeps each helper pod — and so each single
-	// claim's dump — alive exactly this long.
+	// claim's dump — alive exactly this long. It also reaches BOTH runners
+	// as APPRAFTER_BACKUP_RUN_DEADLINE_SECONDS: a prune leaves a run with no
+	// manifest alone until its newest snapshot is older than this (never
+	// less than six hours) plus an hour, because a backup may still be
+	// writing it.
 	//
 	// The CronJob is `concurrencyPolicy: Forbid`, so without a deadline one
 	// run that never ends suppresses every later scheduled run, silently.
@@ -451,12 +455,16 @@ package platformstack
 	// backup that is expected to succeed, which it would otherwise kill:
 	// six hours leaves the nightly default's next slot eighteen hours clear.
 	// It must ALSO stay below the time from a backup's start to the next
-	// check's start: the check takes restic's exclusive lock and neither Job
-	// retries a lock, so a backup still running when the check starts fails
-	// that check. Under the default schedules that gap is three hours
+	// check's start: the check (and the prune after it) takes restic's
+	// exclusive lock, and neither Job retries a lock. A backup holds a lock
+	// only while a restic command of its own runs — not while it dumps a
+	// claim — so a backup still running when the check starts costs one of
+	// the two: the check fails on the lock of a backup that is uploading,
+	// and a backup that is dumping fails on the check's lock at its next
+	// upload. Under the default schedules that gap is three hours
 	// (03:00 → Sunday 06:00), shorter than this default — a Sunday backup
-	// past three hours costs that week's check; move the check later if
-	// backups take that long.
+	// past three hours costs that week's check or that backup; move the
+	// check later if backups take that long.
 	// With a schedule more frequent than the deadline, a stuck run still
 	// costs the slots that fall while it is active: `Forbid` starts none of
 	// them, and when the run ends (no `startingDeadlineSeconds` is set) the

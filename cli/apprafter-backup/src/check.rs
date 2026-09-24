@@ -17,6 +17,11 @@
 //!    — the first delete is refused and nothing more is asked of the store.
 //!    Neither that nor a prune that fails fails the check: the check passed,
 //!    and retention is reported on its own (the `BackupRetention` condition).
+//!    A backup may still be running: while it dumps a claim it holds no
+//!    restic lock, so the check passes beside it. The prune leaves the run it
+//!    is writing alone — a run with no manifest whose newest snapshot is
+//!    younger than the BACKUP Job's deadline (at least six hours) plus an
+//!    hour ([`backup_core::prune::unfinished_run_window`]).
 //! 3. The repository's size and counts (`restic stats --mode raw-data`), so
 //!    that a repository nothing prunes is seen growing. Best-effort.
 //!
@@ -24,6 +29,9 @@
 //! nothing in the cluster does: the check Job then checks and measures only.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use chrono::{DateTime, Utc};
 
 use backup_core::prune::{run_prune, RetentionPolicy};
 use backup_core::restic::{
@@ -33,7 +41,7 @@ use backup_core::restic::{
 use backup_core::ResticRunner;
 use cli_core::Result;
 
-use crate::config::Enforce;
+use crate::config::{Enforce, RunnerConfig};
 use crate::status::{check_record, prune_record, stats_record, CheckResult, PruneRecord};
 
 /// The step a check run is in: what a stop records its failure against.
@@ -71,6 +79,27 @@ pub struct CheckPlan<'a> {
     pub depth: &'a CheckDepth,
     pub enforce: Enforce,
     pub retention: &'a RetentionPolicy,
+    /// The BACKUP Job's deadline, not this Job's: the prune leaves a run with
+    /// no manifest alone while a backup may still be writing it
+    /// ([`backup_core::prune::unfinished_run_window`]). A backup that is still
+    /// dumping when the check starts holds no restic lock, so the check passes
+    /// and the prune runs beside it.
+    pub backup_run_deadline: Duration,
+}
+
+impl<'a> CheckPlan<'a> {
+    /// The plan the check Job's configuration asks for.
+    pub fn of(cfg: &'a RunnerConfig) -> Self {
+        CheckPlan {
+            repo: &cfg.repo,
+            passphrase: &cfg.passphrase,
+            depth: &cfg.check_depth,
+            enforce: cfg.enforce,
+            retention: &cfg.retention,
+            // Not `cfg.deadline`: in this Job that is the check's own.
+            backup_run_deadline: cfg.prune_run_deadline(),
+        }
+    }
 }
 
 /// What the check run did.
@@ -112,13 +141,14 @@ impl CheckRun {
 /// `cluster_uid` reads this cluster's `kube-system` UID, which scopes the
 /// prune to its own snapshots; it is called only when a prune is due.
 /// `record` receives each step's status fields as soon as they are known,
-/// and `now` gives the time each is recorded at.
+/// and `now` gives the time each is recorded at, and the time the prune
+/// measures a run's age against.
 pub fn run_check(
     r: &dyn ResticRunner,
     plan: &CheckPlan,
     phase: &PhaseCell,
     cluster_uid: &mut dyn FnMut() -> Result<String>,
-    now: &dyn Fn() -> String,
+    now: &dyn Fn() -> DateTime<Utc>,
     record: &mut dyn FnMut(serde_json::Value),
 ) -> CheckRun {
     phase.set(CheckPhase::Check);
@@ -140,7 +170,7 @@ pub fn run_check(
             CheckResult::Failed(e.to_string())
         }
     };
-    record(check_record(&check, &now()));
+    record(check_record(&check, &now().to_rfc3339()));
     if check != CheckResult::Passed {
         return CheckRun {
             check,
@@ -151,14 +181,23 @@ pub fn run_check(
 
     let prune = if plan.enforce == Enforce::Check {
         phase.set(CheckPhase::Prune);
-        let outcome = cluster_uid()
-            .and_then(|uid| run_prune(r, plan.repo, plan.passphrase, plan.retention, &uid));
+        let outcome = cluster_uid().and_then(|uid| {
+            run_prune(
+                r,
+                plan.repo,
+                plan.passphrase,
+                plan.retention,
+                &uid,
+                now(),
+                plan.backup_run_deadline,
+            )
+        });
         let pruned = match outcome {
             Ok(o) => PruneRecord::Done(o),
             Err(e) => PruneRecord::Failed(e.to_string()),
         };
         eprintln!("prune: {}", pruned.detail());
-        record(prune_record(&pruned, "check", &now()));
+        record(prune_record(&pruned, "check", &now().to_rfc3339()));
         Some(pruned)
     } else {
         eprintln!(
@@ -192,7 +231,7 @@ pub fn run_check(
             s.snapshots.map_or("?".to_string(), |n| n.to_string()),
             s.blob_count.map_or("?".to_string(), |n| n.to_string())
         );
-        record(stats_record(s, plan.repo, &now()));
+        record(stats_record(s, plan.repo, &now().to_rfc3339()));
     }
     CheckRun {
         check,
@@ -210,6 +249,14 @@ mod tests {
     use std::cell::RefCell;
 
     const MINE: &str = "11111111-2222-3333-4444-555555555555";
+
+    /// The chart's default backup deadline.
+    const SIX_HOURS: Duration = backup_core::helper_pod::DEFAULT_RUN_DEADLINE;
+
+    /// The default check slot after the runs below: Sunday 06:00.
+    fn sunday_six() -> DateTime<Utc> {
+        "2026-09-27T06:00:00Z".parse().unwrap()
+    }
 
     /// A repository restic is run against, with the answers the test sets.
     struct FakeRepo {
@@ -307,6 +354,15 @@ mod tests {
     }
 
     fn run(r: &FakeRepo, enforce: Enforce, depth: CheckDepth) -> Run {
+        run_with_deadline(r, enforce, depth, SIX_HOURS)
+    }
+
+    fn run_with_deadline(
+        r: &FakeRepo,
+        enforce: Enforce,
+        depth: CheckDepth,
+        backup_run_deadline: Duration,
+    ) -> Run {
         let retention = RetentionPolicy {
             keep_daily: 1,
             keep_weekly: 0,
@@ -318,6 +374,7 @@ mod tests {
             depth: &depth,
             enforce,
             retention: &retention,
+            backup_run_deadline,
         };
         let mut records = Vec::new();
         let mut uid_reads = 0;
@@ -329,7 +386,7 @@ mod tests {
                 uid_reads += 1;
                 Ok(MINE.to_string())
             },
-            &|| "t".to_string(),
+            &sunday_six,
             &mut |v| records.push(v),
         );
         Run {
@@ -349,7 +406,8 @@ mod tests {
             Some(PruneRecord::Done(PruneOutcome::Pruned {
                 forgot_snapshots: 2,
                 forgot_runs: 2,
-                kept_runs: 1
+                kept_runs: 1,
+                unfinished_runs: 0
             }))
         );
         assert_eq!(
@@ -376,6 +434,161 @@ mod tests {
         assert_eq!(got.records[2]["repoBlobs"], "12");
         assert_eq!(got.run.exit_code(), 0);
         assert_eq!(got.run.failure(), None);
+    }
+
+    /// A repository listing: `(id, time, run start, staged path)` per
+    /// snapshot, all this cluster's.
+    fn listing(snaps: &[(&str, &str, &str, &str)]) -> Vec<serde_json::Value> {
+        snaps
+            .iter()
+            .map(|(id, time, start, path)| {
+                serde_json::json!({
+                    "id": id,
+                    "time": time,
+                    "tags": [format!("{MINE}-{start}")],
+                    "paths": [path],
+                })
+            })
+            .collect()
+    }
+
+    /// The Sunday 03:00 sequential backup is still dumping when the check
+    /// starts at 06:00. It holds no restic lock while it dumps, so the check
+    /// passes and the prune runs beside it: the two claim snapshots it has
+    /// written so far, with no commit snapshot yet, must not be swept as an
+    /// orphan.
+    #[test]
+    fn the_prune_after_the_check_leaves_a_backup_still_being_written_alone() {
+        let r = FakeRepo {
+            snapshots: RefCell::new(listing(&[
+                (
+                    "sat-c0",
+                    "2026-09-26T03:10:00Z",
+                    "2026-09-26T03:00:00Z",
+                    "/staging/a/claim-0",
+                ),
+                (
+                    "sat-cm",
+                    "2026-09-26T03:20:00Z",
+                    "2026-09-26T03:00:00Z",
+                    "/staging/a/commit",
+                ),
+                (
+                    "sun-c0",
+                    "2026-09-27T03:40:00Z",
+                    "2026-09-27T03:00:00Z",
+                    "/staging/b/claim-0",
+                ),
+                (
+                    "sun-c1",
+                    "2026-09-27T04:30:00Z",
+                    "2026-09-27T03:00:00Z",
+                    "/staging/b/claim-1",
+                ),
+            ])),
+            ..FakeRepo::new()
+        };
+        let got = run(&r, Enforce::Check, CheckDepth::Structure);
+        assert_eq!(
+            got.run.prune,
+            Some(PruneRecord::Done(PruneOutcome::NothingToPrune {
+                kept_runs: 1,
+                unfinished_runs: 1
+            }))
+        );
+        assert_eq!(r.snapshots.borrow().len(), 4, "nothing forgotten");
+        assert!(
+            !r.verbs().contains(&"forget".to_string()),
+            "{:?}",
+            r.verbs()
+        );
+        assert!(!r.verbs().contains(&"prune".to_string()), "{:?}", r.verbs());
+        assert_eq!(got.records[1]["lastPruneResult"], "nothing-to-prune");
+        let detail = got.records[1]["lastPruneDetail"].as_str().unwrap();
+        assert!(
+            detail.contains("1 unfinished run(s) left alone"),
+            "{detail}"
+        );
+    }
+
+    /// The window the prune waits is the BACKUP Job's deadline the plan
+    /// carries: a run with no manifest whose newest snapshot is eight hours
+    /// old is an orphan under the default six hours, and may still be
+    /// running under twelve.
+    #[test]
+    fn the_prune_waits_out_the_backup_deadline_it_is_given() {
+        let snaps = || {
+            RefCell::new(listing(&[
+                (
+                    "done",
+                    "2026-09-26T03:00:00Z",
+                    "2026-09-26T03:00:00Z",
+                    "/staging/a/data",
+                ),
+                (
+                    "late-c0",
+                    "2026-09-26T21:00:00Z",
+                    "2026-09-26T20:00:00Z",
+                    "/staging/b/claim-0",
+                ),
+                (
+                    "late-c1",
+                    "2026-09-26T22:00:00Z",
+                    "2026-09-26T20:00:00Z",
+                    "/staging/b/claim-1",
+                ),
+            ]))
+        };
+        let r = FakeRepo {
+            snapshots: snaps(),
+            ..FakeRepo::new()
+        };
+        let got = run_with_deadline(&r, Enforce::Check, CheckDepth::Structure, SIX_HOURS);
+        assert_eq!(
+            got.run.prune,
+            Some(PruneRecord::Done(PruneOutcome::Pruned {
+                forgot_snapshots: 2,
+                forgot_runs: 1,
+                kept_runs: 1,
+                unfinished_runs: 0
+            }))
+        );
+        let r = FakeRepo {
+            snapshots: snaps(),
+            ..FakeRepo::new()
+        };
+        let twelve_hours = Duration::from_secs(12 * 3600);
+        let got = run_with_deadline(&r, Enforce::Check, CheckDepth::Structure, twelve_hours);
+        assert_eq!(
+            got.run.prune,
+            Some(PruneRecord::Done(PruneOutcome::NothingToPrune {
+                kept_runs: 1,
+                unfinished_runs: 1
+            }))
+        );
+        assert_eq!(r.snapshots.borrow().len(), 3);
+    }
+
+    /// In the check Job, `APPRAFTER_BACKUP_DEADLINE_SECONDS` is the check's
+    /// own deadline; the prune waits out the backup's.
+    #[test]
+    fn the_check_jobs_plan_carries_the_backup_jobs_deadline() {
+        let env: std::collections::BTreeMap<String, String> = [
+            ("APPRAFTER_BACKUP_REPO", "s3:x"),
+            ("APPRAFTER_CLUSTER_ID", "c"),
+            ("RESTIC_PASSWORD", "p"),
+            ("APPRAFTER_BACKUP_ENFORCE", "check"),
+            ("APPRAFTER_BACKUP_DEADLINE_SECONDS", "43200"),
+            ("APPRAFTER_BACKUP_RUN_DEADLINE_SECONDS", "2700"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let cfg = RunnerConfig::from_env_map(&env).unwrap();
+        let plan = CheckPlan::of(&cfg);
+        assert_eq!(plan.backup_run_deadline, Duration::from_secs(2700));
+        assert_eq!(plan.enforce, Enforce::Check);
+        assert_eq!(plan.repo, "s3:x");
     }
 
     /// The rule the owner set: a check that did not pass never prunes.
@@ -465,6 +678,7 @@ mod tests {
             depth: &depth,
             enforce: Enforce::Check,
             retention: &retention,
+            backup_run_deadline: SIX_HOURS,
         };
         let mut records = Vec::new();
         let got = run_check(
@@ -476,7 +690,7 @@ mod tests {
                     "namespaces \"kube-system\" is forbidden".into(),
                 ))
             },
-            &|| "t".to_string(),
+            &sunday_six,
             &mut |v| records.push(v),
         );
         assert_eq!(got.check, CheckResult::Passed);
@@ -512,6 +726,7 @@ mod tests {
             depth: &depth,
             enforce: Enforce::Check,
             retention: &retention,
+            backup_run_deadline: SIX_HOURS,
         };
         let seen = RefCell::new(Vec::new());
         run_check(
@@ -522,7 +737,7 @@ mod tests {
                 seen.borrow_mut().push(phase.get());
                 Ok(MINE.to_string())
             },
-            &|| "t".to_string(),
+            &sunday_six,
             &mut |_| seen.borrow_mut().push(phase.get()),
         );
         assert_eq!(

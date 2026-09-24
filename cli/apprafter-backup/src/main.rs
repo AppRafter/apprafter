@@ -311,13 +311,7 @@ fn check(
     phase: &PhaseCell,
     claim: &OutcomeClaim,
 ) -> i32 {
-    let plan = CheckPlan {
-        repo: &cfg.repo,
-        passphrase: &cfg.passphrase,
-        depth: &cfg.check_depth,
-        enforce: cfg.enforce,
-        retention: &cfg.retention,
-    };
+    let plan = CheckPlan::of(cfg);
     let mut record = |data: serde_json::Value| {
         if let Err(e) = rt.block_on(write_status_data(client, &data)) {
             eprintln!("warning: status ConfigMap write failed (non-fatal): {e}");
@@ -330,7 +324,7 @@ fn check(
         // The same identity read the backup makes (E1): the prune forgets
         // this cluster's snapshots only.
         &mut || backup_core::engine::read_cluster_uid(k),
-        &|| chrono::Utc::now().to_rfc3339(),
+        &chrono::Utc::now,
         &mut record,
     );
     if !claim.claim() {
@@ -457,7 +451,18 @@ fn do_backup(
     //    deleted — `run_prune` stops at the first refused delete — and the
     //    record says `not-permitted`.
     if cfg.enforce == Enforce::Cluster {
-        match run_prune(r, &cfg.repo, &cfg.passphrase, &cfg.retention, &cluster_uid) {
+        // This run's own snapshots are complete by now. A run with no
+        // manifest that another backup may still be writing — `apprafter
+        // backup create` into the same repository — is left alone.
+        match run_prune(
+            r,
+            &cfg.repo,
+            &cfg.passphrase,
+            &cfg.retention,
+            &cluster_uid,
+            chrono::Utc::now(),
+            cfg.prune_run_deadline(),
+        ) {
             Ok(outcome @ PruneOutcome::NotPermitted { .. }) => {
                 let error = format!(
                     "retention.enforce is cluster, and the prune after this backup was {}. \
