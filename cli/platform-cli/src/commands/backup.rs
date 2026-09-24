@@ -4333,12 +4333,18 @@ where
     let mut out: Vec<String> = passed_over
         .iter()
         .map(|run| {
+            // The untagged snapshots are one run with an empty tag, as the
+            // prune counts them.
+            let of_run = if run.tag.is_empty() {
+                "with no tag".to_string()
+            } else {
+                format!("of run {}", short_tag(&run.tag, tz))
+            };
             format!(
-                "  ⚠ a newer backup run did not finish: {} snapshot(s) of run {}, the last \
+                "  ⚠ a newer backup run did not finish: {} snapshot(s) {of_run}, the last \
                  written {}. None carries manifest.json — the run was interrupted before its \
                  last snapshot, or is still being written.",
                 run.snapshots,
-                short_tag(&run.tag, tz),
                 format_timestamp_with_zone(&run.newest, tz, zone_label)
             )
         })
@@ -9295,6 +9301,21 @@ mod tests {
     #[test]
     fn nothing_passed_over_prints_nothing() {
         assert!(passed_over_lines(&[], "x", &chrono::Utc, None).is_empty());
+    }
+
+    /// The untagged snapshots are one run with an empty tag, as the prune
+    /// counts them; the line says they carry no tag rather than naming a run
+    /// called "".
+    #[test]
+    fn passed_over_untagged_snapshots_are_said_to_carry_no_tag() {
+        let passed = [UnfinishedRun {
+            tag: String::new(),
+            snapshots: 2,
+            newest: "2026-09-24T03:00:02Z".into(),
+        }];
+        let text = passed_over_lines(&passed, "donec", &chrono::Utc, Some("UTC")).join("\n");
+        assert!(text.contains("2 snapshot(s) with no tag,"), "{text}");
+        assert!(!text.contains("of run ,"), "{text}");
     }
 
     // ------------------------------------------------------------------

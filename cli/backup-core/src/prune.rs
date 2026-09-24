@@ -576,7 +576,10 @@ fn listed_ids(
 
 /// Parse `restic snapshots --json` (an array of snapshot objects) into
 /// [`SnapshotMeta`], deriving `run_tag` + `is_manifest` (see [`derive_manifest`]).
-fn parse_snapshots(json: &str) -> Result<Vec<SnapshotMeta>> {
+///
+/// `pub(crate)` for one reader outside this module: the test that holds
+/// [`crate::restore`]'s `latest` to this grouping.
+pub(crate) fn parse_snapshots(json: &str) -> Result<Vec<SnapshotMeta>> {
     let value: Value = serde_json::from_str(json)
         .map_err(|e| CliError::Other(format!("parse restic snapshots JSON: {e}")))?;
     let arr = value.as_array().cloned().unwrap_or_default();

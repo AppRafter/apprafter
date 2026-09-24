@@ -77,7 +77,8 @@ pub struct RunSnapshots {
 /// newest backup is the one being restored.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnfinishedRun {
-    /// The run tag its snapshots share.
+    /// The run tag its snapshots share: their first tag, and empty for the
+    /// untagged snapshots, which the prune counts as one run.
     pub tag: String,
     /// How many snapshots it holds.
     pub snapshots: usize,
@@ -113,7 +114,8 @@ pub struct LatestSnapshot {
 ///
 /// `requested` is the snapshot the user asked to restore: `latest`, or an id /
 /// short-id prefix. The commit point is that snapshot; its siblings are every
-/// other snapshot sharing at least one tag with it.
+/// other snapshot sharing its run tag — its FIRST tag, the key the prune
+/// groups by ([`run_tag_of`]).
 ///
 /// # `latest` in a SHARED repository (E2)
 ///
@@ -191,21 +193,15 @@ pub fn resolve_run_snapshots(
     };
 
     let commit_id = id_of(commit);
-    let commit_tags = crate::cluster::snapshot_tags(commit);
+    let run_tag = run_tag_of(commit);
 
     // An untagged snapshot cannot be grouped, and must not silently drag in
     // every other untagged snapshot in the repository.
     let mut claims: Vec<(Option<DateTime<Utc>>, String)> = Vec::new();
-    if !commit_tags.is_empty() {
+    if !run_tag.is_empty() {
         for s in &snaps {
             let id = id_of(s);
-            if id == commit_id {
-                continue;
-            }
-            if crate::cluster::snapshot_tags(s)
-                .iter()
-                .any(|t| commit_tags.contains(t))
-            {
+            if id != commit_id && run_tag_of(s) == run_tag {
                 claims.push((instant_of(s), id));
             }
         }
@@ -298,6 +294,45 @@ fn paths_of(s: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// A snapshot's run tag: its FIRST tag, or `""` when it has none.
+///
+/// This is the key the prune groups runs by
+/// ([`crate::prune::parse_snapshots`]), so `latest`, a snapshot named by id
+/// and the prune agree on what one run is. Every AppRafter writer passes one
+/// `--tag`, the run tag; a tag an operator adds later (`restic tag --add`)
+/// comes after it and joins no runs together. The untagged snapshots — none
+/// of them written by AppRafter — are one group, `""`, as the prune has them.
+fn run_tag_of(s: &Value) -> String {
+    crate::cluster::snapshot_tags(s)
+        .into_iter()
+        .next()
+        .unwrap_or_default()
+}
+
+/// How many snapshots of a whole listing each run holds — which says, with
+/// a snapshot's paths, whether it completes its run.
+///
+/// Counted over the WHOLE listing, before any cluster filter, exactly as the
+/// prune counts.
+struct RunSizes(std::collections::HashMap<String, usize>);
+
+impl RunSizes {
+    fn of(snaps: &[Value]) -> Self {
+        let mut size: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for s in snaps {
+            *size.entry(run_tag_of(s)).or_default() += 1;
+        }
+        Self(size)
+    }
+
+    /// Does `s` complete its run — carry its `manifest.json`? The prune's
+    /// rule ([`crate::prune::derive_manifest`]) over the prune's grouping.
+    fn completes(&self, s: &Value) -> bool {
+        let alone = self.0.get(&run_tag_of(s)).copied().unwrap_or(0) <= 1;
+        crate::prune::derive_manifest(&paths_of(s), alone)
+    }
+}
+
 /// `latest` as [`choose_latest`] resolves it.
 struct Latest<'a> {
     commit: &'a Value,
@@ -309,11 +344,10 @@ struct Latest<'a> {
 /// cannot drift apart — and the unfinished runs of the pool newer than it.
 ///
 /// Which snapshot completes its run is the prune's rule
-/// ([`crate::prune::derive_manifest`]), applied to the run as
-/// [`resolve_run_snapshots`] groups it: the snapshots sharing a tag, an
-/// untagged snapshot being a run of its own. A snapshot that completes
-/// nothing, in a run where nothing else does either, belongs to an
-/// [`UnfinishedRun`].
+/// ([`crate::prune::derive_manifest`]) over the prune's grouping
+/// ([`RunSizes`], [`run_tag_of`]): the snapshots sharing a first tag, the
+/// untagged ones being one group. A snapshot that completes nothing, in a
+/// run where nothing else does either, belongs to an [`UnfinishedRun`].
 ///
 /// "Newest" is by the clock, never by the time string ([`instant_of`]).
 fn choose_latest<'a>(
@@ -322,22 +356,9 @@ fn choose_latest<'a>(
 ) -> Result<Latest<'a>, String> {
     let pool = latest_pool(snaps, this_cluster_uid)?;
 
-    // How many snapshots of the whole listing carry each tag: a snapshot is
-    // alone in its run when none of its tags is carried by another.
-    let mut carried: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for s in snaps {
-        for t in crate::cluster::snapshot_tags(s) {
-            *carried.entry(t).or_default() += 1;
-        }
-    }
-    let completes = |s: &Value| {
-        let alone = crate::cluster::snapshot_tags(s)
-            .iter()
-            .all(|t| carried.get(t).copied().unwrap_or(0) <= 1);
-        crate::prune::derive_manifest(&paths_of(s), alone)
-    };
-
-    let (complete, rest): (Vec<&Value>, Vec<&Value>) = pool.into_iter().partition(|s| completes(s));
+    let runs = RunSizes::of(snaps);
+    let (complete, rest): (Vec<&Value>, Vec<&Value>) =
+        pool.into_iter().partition(|s| runs.completes(s));
     let commit = complete.iter().copied().max_by_key(|s| instant_of(s));
 
     // The other snapshots, by run. A complete run's own per-claim snapshots
@@ -349,18 +370,9 @@ fn choose_latest<'a>(
     let mut unfinished: std::collections::BTreeMap<String, (UnfinishedRun, Option<DateTime<Utc>>)> =
         std::collections::BTreeMap::new();
     for s in rest {
-        let tag = crate::cluster::snapshot_tags(s)
-            .first()
-            .cloned()
-            .unwrap_or_default();
-        // An untagged snapshot is a run of its own.
-        let key = if tag.is_empty() {
-            id_of(s)
-        } else {
-            tag.clone()
-        };
+        let tag = run_tag_of(s);
         let at = instant_of(s);
-        let (run, newest_at) = unfinished.entry(key).or_insert_with(|| {
+        let (run, newest_at) = unfinished.entry(tag.clone()).or_insert_with(|| {
             (
                 UnfinishedRun {
                     tag,
@@ -641,10 +653,12 @@ mod tests {
     #[test]
     fn an_untagged_snapshot_groups_with_nothing() {
         // Without a tag there is no run to reconstruct, and guessing would
-        // merge unrelated backups.
+        // merge unrelated backups. (Which untagged snapshot completes a run
+        // is the prune's rule — they are one group, and only a `commit` one
+        // completes it; see the tests on the prune's grouping below.)
         let untagged = r#"[
           {"id":"u1","short_id":"u1","time":"2026-09-02T10:00:00Z","tags":[],"paths":["/a"]},
-          {"id":"u2","short_id":"u2","time":"2026-09-02T10:00:01Z","tags":[],"paths":["/b"]}
+          {"id":"u2","short_id":"u2","time":"2026-09-02T10:00:01Z","tags":[],"paths":["/b/commit"]}
         ]"#;
         let r = resolve_run_snapshots(untagged, "latest", Some(MINE)).unwrap();
         assert_eq!(r.commit, "u2");
@@ -1154,6 +1168,103 @@ mod tests {
             );
             let r = resolve_run_snapshots(&listing, "latest", Some(MINE)).unwrap();
             assert_eq!(r.commit, "good", "bad time: {bad:?}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // A run is what the prune calls one: the snapshots sharing a FIRST tag.
+    // -----------------------------------------------------------------------
+
+    /// FIRES: the prune puts every untagged snapshot in one group, `""`, in
+    /// which only a `commit` snapshot completes the run — so it sweeps these
+    /// two as an orphan. `latest` counted each untagged snapshot as a run of
+    /// its own, complete, and chose the newer one: a snapshot the prune
+    /// would delete, and one with no manifest to restore.
+    #[test]
+    fn untagged_snapshots_are_one_run_as_the_prune_groups_them() {
+        let done = format!("{MINE}-2026-09-23T03:00:00Z");
+        let listing = format!(
+            r#"[
+              {{"id":"mono","time":"2026-09-23T03:00:00Z","tags":["{done}"],"paths":["/s/a/data"]}},
+              {{"id":"u1","time":"2026-09-24T03:00:01Z","tags":[],"paths":["/x/data"]}},
+              {{"id":"u2","time":"2026-09-24T03:00:02Z","paths":["/y/data"]}}
+            ]"#
+        );
+        let r = resolve_run_snapshots(&listing, "latest", Some(MINE)).unwrap();
+        assert_eq!(r.commit, "mono");
+        assert_eq!(
+            r.passed_over,
+            vec![UnfinishedRun {
+                tag: String::new(),
+                snapshots: 2,
+                newest: "2026-09-24T03:00:02Z".into(),
+            }],
+            "the untagged snapshots are ONE unfinished run, as the prune has them"
+        );
+    }
+
+    /// FIRES: a tag an operator adds later (`restic tag --add keep`) comes
+    /// after the run tag. The prune groups by the run tag alone, so these
+    /// are two complete monolithic runs. Counting every tag made `keep` join
+    /// them into one run with no commit snapshot — nothing complete — and
+    /// the restore of either run dragged the other one in as a "claim".
+    #[test]
+    fn a_tag_added_later_does_not_merge_two_runs() {
+        let listing = format!(
+            r#"[
+              {{"id":"one","time":"2026-09-23T03:00:00Z",
+                "tags":["{MINE}-2026-09-23T03:00:00Z","keep"],"paths":["/s/a/data"]}},
+              {{"id":"two","time":"2026-09-24T03:00:00Z",
+                "tags":["{MINE}-2026-09-24T03:00:00Z","keep"],"paths":["/s/b/data"]}}
+            ]"#
+        );
+        let r = resolve_run_snapshots(&listing, "latest", Some(MINE)).unwrap();
+        assert_eq!(r.commit, "two");
+        assert!(r.claims.is_empty(), "{:?}", r.claims);
+        let one = resolve_run_snapshots(&listing, "one", Some(MINE)).unwrap();
+        assert!(one.claims.is_empty(), "{:?}", one.claims);
+    }
+
+    /// The claim this module makes — "by the rule the prune plans with" —
+    /// checked against the prune itself: for every snapshot of every shape
+    /// above, `latest`'s answer to "does it complete its run?" is the
+    /// prune's `is_manifest`.
+    #[test]
+    fn latest_and_the_prune_agree_on_which_snapshots_complete_a_run() {
+        let shapes = [
+            seq_listing().to_string(),
+            interrupted_listing(),
+            shared_listing(),
+            format!(
+                r#"[
+                  {{"id":"u1","time":"2026-09-24T03:00:01Z","tags":[],"paths":["/x/data"]}},
+                  {{"id":"u2","time":"2026-09-24T03:00:02Z","paths":["/y/data"]}},
+                  {{"id":"u3","time":"2026-09-24T03:00:03Z","tags":[],"paths":["/z/commit"]}},
+                  {{"id":"k1","time":"2026-09-23T03:00:00Z",
+                    "tags":["{MINE}-2026-09-23T03:00:00Z","keep"],"paths":["/s/a/data"]}},
+                  {{"id":"k2","time":"2026-09-24T03:00:00Z",
+                    "tags":["{MINE}-2026-09-24T03:00:00Z","keep"],"paths":["/s/b/data"]}},
+                  {{"id":"lone","time":"2026-09-25T03:00:00Z",
+                    "tags":["{MINE}-2026-09-25T03:00:00Z"],"paths":["/s/c/claim-0"]}}
+                ]"#
+            ),
+            r#"[{"id":"solo","time":"2026-09-24T03:00:00Z","tags":[],"paths":["/s/data"]}]"#
+                .to_string(),
+        ];
+        for listing in &shapes {
+            let snaps = parse_snapshot_list(listing).unwrap();
+            let runs = RunSizes::of(&snaps);
+            let prune = crate::prune::parse_snapshots(listing).unwrap();
+            assert_eq!(prune.len(), snaps.len());
+            for s in &snaps {
+                let id = id_of(s);
+                let meta = prune.iter().find(|m| m.id == id).unwrap();
+                assert_eq!(
+                    runs.completes(s),
+                    meta.is_manifest,
+                    "snapshot {id} of {listing}"
+                );
+            }
         }
     }
 
