@@ -38,8 +38,9 @@
 //!   of the two ever records ([`OutcomeClaim`]).
 //! * the staging volume holding more than its size limit → the run is
 //!   stopped the same way, by the runner itself, and recorded as a `Failure`
-//!   that names the limit ([`apprafter_backup::staging`]), exit **1**. The
-//!   check run too.
+//!   that names the limit ([`apprafter_backup::staging`]), exit **3**
+//!   ([`staging::EXIT_OVER_LIMIT`]): the Job's `podFailurePolicy` fails the
+//!   Job on it rather than retry into the same limit. The check run too.
 //!
 //! # `apprafter-backup check` — the weekly check Job
 //!
@@ -225,7 +226,9 @@ fn run(mode: Mode) -> i32 {
     //     the limit, instead of being evicted late and recorded, if at all,
     //     as stopped by Kubernetes. See `staging`. The check Job mounts the
     //     same volume for restic's cache and temporary files, and is watched
-    //     the same way.
+    //     the same way. The exit code is the overrun's own, which the Job's
+    //     podFailurePolicy fails the Job on: another attempt would meet the
+    //     same limit.
     if let Some(limit) = cfg.staging_limit {
         let ctx = stop_ctx.clone();
         let claim = claim.clone();
@@ -241,8 +244,8 @@ fn run(mode: Mode) -> i32 {
                 Mode::Backup => staging::overrun_message(used, limit, staging_mode),
                 Mode::Check => staging::check_overrun_message(used, limit),
             };
-            let outcome = stop::stop_run_with(&ctx, error, libc::SIGTERM).await;
-            std::process::exit(outcome.exit_code());
+            stop::stop_run_with(&ctx, error, libc::SIGTERM).await;
+            std::process::exit(staging::EXIT_OVER_LIMIT);
         });
     }
 

@@ -1628,7 +1628,7 @@
           "env": null,
           "required": false,
           "possible_values": [],
-          "help": "How long to wait for the Job before handing back control, in minutes. A timeout does not cancel the backup"
+          "help": "How long to wait for the Job before handing back control, in minutes. A timeout does not cancel the backup. It exits non-zero when an attempt of the Job has failed by then, with that attempt's reason"
         }
       ],
       "positionals": []

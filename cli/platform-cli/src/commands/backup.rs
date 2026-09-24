@@ -2736,7 +2736,12 @@ fn wait_step(
 /// A timeout is NOT a failure of the backup: the Job keeps running in the
 /// cluster, and saying otherwise would send an operator to clean up after a
 /// backup that is still in progress. The message says so and hands over the
-/// two commands that follow it.
+/// two commands that follow it. It exits 0 only while no attempt of the Job
+/// has failed: once one has, the timeout is an error that says why the last
+/// one failed ([`job_pod::timed_out_failing`]), because a Job whose attempts
+/// fail has taken no backup, and each attempt can take many minutes to fail.
+/// Each failed attempt is also said as soon as it is seen, with its reason
+/// ([`job_pod::failed_attempt_note`]).
 ///
 /// A pod no node takes is different: it is not a backup in progress. Once it
 /// has been unschedulable for [`grace_for`] its reason ([`job_pod::UNSCHEDULABLE_GRACE`]
@@ -2754,6 +2759,7 @@ fn wait_for_backup_job(name: &str, timeout_minutes: u64, kubeconfig: &Path) -> R
     let mut last_note = std::time::Instant::now();
     let mut clock = UnschedulableClock::default();
     let mut noted_stopping = false;
+    let mut noted_failures: u64 = 0;
 
     println!(
         "  waiting for it to finish (up to {timeout_minutes}m; Ctrl-C is safe — the Job \
@@ -2805,6 +2811,32 @@ fn wait_for_backup_job(name: &str, timeout_minutes: u64, kubeconfig: &Path) -> R
             &mut noted_stopping,
             matches!(step, WaitStep::RoomReturning { .. }),
         );
+        // A failed attempt of a Job that has not finished: said once, with
+        // its reason. A finished Job reports its own ending below.
+        let failures = unfinished_failures(job.as_ref(), &step);
+        let why = match &job {
+            Some(j)
+                if failures > 0
+                    && (failures > noted_failures || matches!(step, WaitStep::TimedOut(_))) =>
+            {
+                failed_attempt_reason(j, &pods, kubeconfig)
+            }
+            _ => None,
+        };
+        if failures > noted_failures {
+            if let Some(j) = &job {
+                let attempts = j
+                    .pointer("/spec/backoffLimit")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(6)
+                    + 1;
+                println!(
+                    "{}",
+                    job_pod::failed_attempt_note(failures, attempts, why.as_deref())
+                );
+            }
+            noted_failures = failures;
+        }
         match step {
             WaitStep::Succeeded => {
                 println!(
@@ -2876,7 +2908,7 @@ fn wait_for_backup_job(name: &str, timeout_minutes: u64, kubeconfig: &Path) -> R
                     "{}",
                     job_pod::timeout_note(&pod, timeout_minutes, PLATFORMSTACK_NAMESPACE, name)
                 );
-                return Ok(());
+                return timed_out(name, timeout_minutes, failures, why.as_deref());
             }
             WaitStep::Wait(pod, unschedulable_for) => {
                 // A new streak of "cannot be scheduled" is said at once, not
@@ -2900,6 +2932,53 @@ fn wait_for_backup_job(name: &str, timeout_minutes: u64, kubeconfig: &Path) -> R
         }
         thread::sleep(JOB_POLL_INTERVAL);
     }
+}
+
+/// How many attempts of `job` have failed while it has not finished: its
+/// `status.failed` on a step that goes on waiting or ends the wait at the
+/// timeout, and 0 on any other, where the Job's own ending (or its pod no
+/// node takes) is the report. Pure.
+fn unfinished_failures(job: Option<&Value>, step: &WaitStep) -> u64 {
+    match (job, step) {
+        (Some(j), WaitStep::Wait(..) | WaitStep::RoomReturning { .. } | WaitStep::TimedOut(_)) => j
+            .pointer("/status/failed")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// How the wait ends at its `--timeout`: `Ok` while no attempt has failed,
+/// an error naming the last one's reason once `failures` have
+/// ([`job_pod::timed_out_failing`]). Pure.
+fn timed_out(name: &str, timeout_minutes: u64, failures: u64, why: Option<&str>) -> Result<()> {
+    if failures == 0 {
+        return Ok(());
+    }
+    Err(CliError::Other(job_pod::timed_out_failing(
+        name,
+        timeout_minutes,
+        failures,
+        why,
+    )))
+}
+
+/// Why the newest failed attempt of `job` failed: the runner's own
+/// `lastError` when it recorded one during that attempt
+/// ([`job_pod::runner_error_during`]), else what its pod says
+/// ([`job_pod::last_failed_attempt`]). Best-effort: a status ConfigMap that
+/// cannot be read leaves the pod's reason.
+fn failed_attempt_reason(job: &Value, pods: &[Value], kubeconfig: &Path) -> Option<String> {
+    let record = kubectl_get_json(
+        "configmap",
+        Some("apprafter-backup-status"),
+        Some(PLATFORMSTACK_NAMESPACE),
+        kubeconfig,
+    )
+    .ok()
+    .flatten();
+    job_pod::runner_error_during(job, pods, record.as_ref())
+        .or_else(|| job_pod::last_failed_attempt(job, pods))
 }
 
 /// `Xm Ys`, or `Ys` under a minute. Pure.
@@ -13280,6 +13359,57 @@ mod tests {
                 None
             )
         );
+    }
+
+    /// A timeout reached while the Job retries is an error that says why its
+    /// last attempt failed: that Job has taken no backup. The finding: an
+    /// over-limit staging failed every attempt, `backup run` said only
+    /// "retrying after N failed attempts" and, at its timeout, exited 0.
+    /// A timeout with no attempt failed stays a plain note: that backup is
+    /// only slow.
+    #[test]
+    fn a_timeout_after_failed_attempts_is_an_error_and_a_slow_backup_is_not() {
+        let t0 = std::time::Instant::now();
+        let s = Duration::from_secs;
+        let mut retrying = unfinished_job("j", "job-1", None);
+        retrying["status"] = json!({"failed": 2, "startTime": "2026-09-23T14:39:47Z"});
+        let mut clock = UnschedulableClock::default();
+        let step = wait_step(Some(&retrying), &[], &[], &mut clock, t0, s(3600), s(3600));
+        assert!(
+            matches!(step, WaitStep::TimedOut(JobPod::Retrying { failed: 2, .. })),
+            "{step:?}"
+        );
+        let failures = unfinished_failures(Some(&retrying), &step);
+        assert_eq!(failures, 2);
+        let err = timed_out("j", 60, failures, Some("the staging volume held 318Mi"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("backup Job j has taken no backup"), "{err}");
+        assert!(err.contains("2 failed attempts"), "{err}");
+        assert!(err.contains("the staging volume held 318Mi"), "{err}");
+
+        // A third attempt running when the wait ends: two have failed, and
+        // none has succeeded.
+        let mut third = retrying.clone();
+        third["status"]["active"] = json!(1);
+        let step = wait_step(Some(&third), &[], &[], &mut clock, t0, s(3600), s(3600));
+        assert!(matches!(step, WaitStep::TimedOut(_)), "{step:?}");
+        assert!(timed_out("j", 60, unfinished_failures(Some(&third), &step), None).is_err());
+
+        // Slow, with nothing failed: the wait ends quietly, as it always has.
+        let slow = unfinished_job("j", "job-1", None);
+        let step = wait_step(Some(&slow), &[], &[], &mut clock, t0, s(3600), s(3600));
+        assert!(matches!(step, WaitStep::TimedOut(_)), "{step:?}");
+        assert_eq!(unfinished_failures(Some(&slow), &step), 0);
+        assert!(timed_out("j", 60, 0, None).is_ok());
+
+        // A finished Job reports its own ending, not its attempts.
+        let mut failed = retrying;
+        failed["status"]["conditions"] =
+            json!([{"type": "Failed", "status": "True", "reason": "PodFailurePolicy"}]);
+        let step = wait_step(Some(&failed), &[], &[], &mut clock, t0, s(0), s(3600));
+        assert!(matches!(step, WaitStep::Failed(_)), "{step:?}");
+        assert_eq!(unfinished_failures(Some(&failed), &step), 0);
     }
 
     /// A node under memory pressure: the kubelet taints it, and keeps the

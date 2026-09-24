@@ -75,6 +75,11 @@
 #      reads: the chart and the runner spell each name in a different
 #      language, and a name misspelt on either side is a setting that reaches
 #      nothing — the runner falls back to its default without a word.
+#  10. both CronJobs fail their Job at once on the runner's staging-overrun
+#      exit code (EXIT_OVER_LIMIT in cli/apprafter-backup/src/staging.rs),
+#      through a podFailurePolicy FailJob rule for their own container:
+#      another attempt would stage into the same limit, and without the rule
+#      the Job made 7 of them.
 #
 # Usage: bash scripts/check-backup-render.sh
 # Exit 0 = every assertion held.
@@ -332,6 +337,29 @@ assert_staging_limit() {
     echo "  ok: $label — $name: staging sizeLimit and the runner's own limit are both $want"
 }
 
+# The runner's exit code for a staging overrun, from its source: the chart's
+# rule must name this number, and two literals in two languages are kept one
+# number only by reading both.
+overrun_exit="$(sed -nE 's/^pub const EXIT_OVER_LIMIT: i32 = ([0-9]+);$/\1/p' \
+    cli/apprafter-backup/src/staging.rs)"
+[[ -n "$overrun_exit" ]] \
+    || fail "no EXIT_OVER_LIMIT in cli/apprafter-backup/src/staging.rs; the podFailurePolicy check below needs the runner's overrun exit code"
+
+# `$1` label, `$2` rendered manifests, `$3` CronJob name: its Job fails at
+# once when the runner exits with the overrun code — a podFailurePolicy rule
+# `FailJob` on exactly that code, for that CronJob's own container (a rule
+# naming another container never matches) — and no rule of it does anything
+# else to any other exit, which the Job keeps retrying.
+assert_fails_fast_on_overrun() {
+    local label="$1" rendered="$2" name="$3" container rules
+    container="$(container_value "$rendered" "$name" '.name')"
+    rules="$(NAME="$name" "${YQ[@]}" -o=json -I=0 'select(.kind == "CronJob" and .metadata.name == strenv(NAME))
+        | .spec.jobTemplate.spec.podFailurePolicy.rules // []' "$rendered")"
+    [[ "$rules" == "[{\"action\":\"FailJob\",\"onExitCodes\":{\"containerName\":\"$container\",\"operator\":\"In\",\"values\":[$overrun_exit]}}]" ]] \
+        || fail "$label: CronJob '$name' podFailurePolicy rules are '${rules}', want exactly one FailJob rule on container '$container' exit code $overrun_exit (the runner's staging overrun); without it the Job retries into the same limit"
+    echo "  ok: $label — $name: exit $overrun_exit (staging overrun) fails the Job at once"
+}
+
 echo "==> backup CronJob resources and restic settings, chart $version"
 
 for rendered in "$workdir/defaults.yaml" "$workdir/set.yaml"; do
@@ -346,6 +374,7 @@ for rendered in "$workdir/defaults.yaml" "$workdir/set.yaml"; do
         TMPDIR=/staging RESTIC_CACHE_DIR=/staging/restic-cache
     for name in apprafter-backup apprafter-backup-check; do
         assert_staging_on_the_volume "$label" "$rendered" "$name"
+        assert_fails_fast_on_overrun "$label" "$rendered" "$name"
     done
 done
 for name in apprafter-backup apprafter-backup-check; do
@@ -452,5 +481,6 @@ echo "  ok: the runner reads each of the $count APPRAFTER_* variables the CronJo
 
 echo "PASS: both backup CronJobs carry a Job deadline, stop cleanly at it, and"
 echo "      carry the measured resources and restic settings; both keep what"
-echo "      restic writes on the limited staging volume; the check Job runs the"
-echo "      runner with the retention mode and depth it is configured with."
+echo "      restic writes on the limited staging volume and fail at once when it"
+echo "      overruns; the check Job runs the runner with the retention mode and"
+echo "      depth it is configured with."

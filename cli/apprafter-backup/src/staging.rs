@@ -30,6 +30,16 @@
 //! restic's cache and temporary files for the check and the prune after it,
 //! and an overrun is recorded against the step it stopped
 //! ([`check_overrun_message`]).
+//!
+//! # Exit code
+//!
+//! A run stopped this way exits [`EXIT_OVER_LIMIT`], not the 1 of any other
+//! failure. The next attempt stages the same claims into the same limit, so
+//! a retry cannot succeed: it dumps the databases and volumes again, holds
+//! the node's disk and memory again, and posts the failure webhook again,
+//! up to the Job's backoff limit — measured on kind, 7 attempts and 12
+//! minutes against a 300Mi limit. Both Jobs carry a `podFailurePolicy` rule
+//! that fails the Job on this exit code, so the first overrun ends it.
 
 use std::collections::HashSet;
 use std::os::unix::fs::MetadataExt;
@@ -44,6 +54,12 @@ use cli_core::quantity::humanise_bytes;
 /// seconds), so the runner is the one that stops an overrun, and a walk of
 /// the volume — a few dump files and restic's cache — costs next to nothing.
 pub const POLL: Duration = Duration::from_secs(2);
+
+/// The exit code of a run stopped because its staging volume outgrew its
+/// limit. The chart's `podFailurePolicy` on both Jobs fails the Job on it
+/// (`FailJob`), so no attempt follows: see the module docs. Asserted against
+/// the rendered chart by `scripts/check-backup-render.sh`.
+pub const EXIT_OVER_LIMIT: i32 = 3;
 
 /// Bytes the volume at `root` uses, counted the way the kubelet counts an
 /// `emptyDir` against its `sizeLimit`: every entry's allocated blocks (512
@@ -300,5 +316,14 @@ mod tests {
         );
         assert!(!m.contains("staging-mode"), "{m}");
         assert!(!m.contains("claim"), "{m}");
+    }
+
+    /// The overrun's exit code is its own: a plain failure (1) is retried by
+    /// the Job and must stay so, a precondition error is 2, and a code above
+    /// 128 reads as a signal.
+    #[test]
+    fn the_overrun_exits_with_a_code_of_its_own() {
+        assert!(![0, 1, 2].contains(&EXIT_OVER_LIMIT));
+        assert!((3..128).contains(&EXIT_OVER_LIMIT));
     }
 }

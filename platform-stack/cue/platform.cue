@@ -511,7 +511,9 @@ package platformstack
 
 	// `emptyDir.sizeLimit` for the staging volume of both Jobs: the
 	// backup's dumps, and restic's cache and temporary files in each.
-	// Overrun is a hard fail whose error suggests raising this or
+	// The runner stops a run whose volume outgrows it, and the Job fails
+	// at once (a podFailurePolicy on the runner's exit code 3) instead of
+	// retrying into the same limit; the error suggests raising this or
 	// switching to `sequential`.
 	stagingSizeLimit: string | *"10Gi"
 

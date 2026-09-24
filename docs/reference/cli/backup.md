@@ -204,7 +204,7 @@ Usage: apprafter backup run [OPTIONS]
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
 | `--no-wait` | flag | — | no | Return as soon as the Job is created instead of waiting for it to finish. The Job runs either way |
-| `--timeout` | — | `60` | no | How long to wait for the Job before handing back control, in minutes. A timeout does not cancel the backup |
+| `--timeout` | — | `60` | no | How long to wait for the Job before handing back control, in minutes. A timeout does not cancel the backup. It exits non-zero when an attempt of the Job has failed by then, with that attempt's reason |
 
 Examples:
 

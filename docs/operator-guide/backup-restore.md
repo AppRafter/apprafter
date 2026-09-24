@@ -377,6 +377,12 @@ for two minutes, or a condition of the node such as memory pressure keeps it off
 for ten, the command deletes the Job, prints the scheduler's reason and exits
 non-zero: [the backup runner's pod cannot be scheduled](#runner-unschedulable).
 
+An attempt that fails is retried by the Job, and the command prints each failed
+attempt with its reason, in the runner's own words when it recorded them. When
+the timeout ends the wait after an attempt has failed, the command exits
+non-zero with the last attempt's reason: a Job whose attempts fail has taken no
+backup yet, however long it goes on retrying.
+
 One run at a time. While a backup Job or a check Job has not finished, whether
 it is `Running`, `Pending` or retrying, `backup run` starts nothing, `--no-wait`
 included. It prints what that Job is doing and exits non-zero with
@@ -690,17 +696,17 @@ a Job stuck this way waits, and holds the schedule, until the node has room.
 
 ### The staging volume outgrew its limit {#staging-over-limit}
 
-`apprafter backup run` retries the Job and then fails it, and `apprafter backup
+`apprafter backup run` fails at the first attempt, and `apprafter backup
 status` shows why in the runner's `lastError`:
 
 ```text
 Jobs:
-  Last backup Job: apprafter-backup-manual-20260923-215827 — Failed: BackoffLimitExceeded: Job has reached the specified backoff limit (2026-09-23 22:58:27 Europe/Lisbon)
+  Last backup Job: apprafter-backup-manual-20260924-002517 — Failed: PodFailurePolicy: Container runner for pod apprafter-system/apprafter-backup-manual-20260924-002517-x775g failed with exit code 3 matching FailJob rule at index 0 (2026-09-24 01:25:18 Europe/Lisbon)
   …
 Runner status:
-  lastSuccess:    never
-  lastFailure:    2026-09-23 23:10:41 Europe/Lisbon
-  lastError:      the staging volume held 318Mi, more than its limit of 300Mi (spec.backup.stagingSizeLimit), so the run was stopped before Kubernetes evicts its pod. …
+  lastSuccess:    2026-09-24 01:24:53 Europe/Lisbon
+  lastFailure:    2026-09-24 01:25:27 Europe/Lisbon
+  lastError:      the staging volume held 23Mi, more than its limit of 8.0Mi (spec.backup.stagingSizeLimit), so the run was stopped before Kubernetes evicts its pod. …
 ```
 
 A backup first writes what it captures, each database's dump, each volume's
@@ -708,9 +714,9 @@ archive and each Dragonfly snapshot, to a volume of the runner's pod, and
 restic keeps its temporary files and its cache for the run on the same volume.
 The volume is limited to `spec.backup.stagingSizeLimit` of the PlatformStack,
 10Gi by default, and lives on the node's disk. The runner measures it every
-two seconds and stops the run once it holds more. Each attempt of the Job meets
-the same limit, so the Job fails after its last attempt; the failure webhook
-fires with the same message.
+two seconds and stops the run once it holds more, with an exit code of its
+own, 3, on which the Job fails at once: another attempt would dump the same
+data into the same limit. The failure webhook fires with the same message.
 
 The weekly check Job has a volume of the same size for restic's cache and the
 pack files a prune rewrites, and is stopped the same way. Its message is

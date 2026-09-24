@@ -828,6 +828,72 @@ pub(crate) fn last_failed_attempt(job: &Value, pods: &[Value]) -> Option<String>
     })
 }
 
+/// The runner's own words for the newest failed attempt of `job`: the
+/// `lastError` of its status ConfigMap (`status_cm`), when the runner wrote
+/// it during that attempt, that is when its `lastFailure` is no earlier than
+/// the attempt's pod was created. The runner records a failed run before it
+/// exits, so for most failures this says what went wrong where the pod says
+/// only `Error (exit 1)`. `None` when the record is older — an earlier
+/// attempt's, an earlier Job's — or there is none: an attempt that was
+/// killed (`OOMKilled`, `Evicted`) records nothing, and its pod says why.
+/// With no failed pod to date the attempt by, the Job's start is used.
+pub(crate) fn runner_error_during(
+    job: &Value,
+    pods: &[Value],
+    status_cm: Option<&Value>,
+) -> Option<String> {
+    let at = |v: &Value, ptr: &str| {
+        v.pointer(ptr)
+            .and_then(Value::as_str)
+            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+    };
+    let attempt_began = pods
+        .iter()
+        .filter(|p| owned_by(p, job))
+        .filter(|p| p.pointer("/status/phase").and_then(Value::as_str) == Some("Failed"))
+        .filter_map(|p| at(p, "/metadata/creationTimestamp"))
+        .max()
+        .or_else(|| at(job, "/status/startTime"))
+        .or_else(|| at(job, "/metadata/creationTimestamp"))?;
+    let data = status_cm?.get("data")?;
+    if at(data, "/lastFailure")? < attempt_began {
+        return None;
+    }
+    let error = data.get("lastError").and_then(Value::as_str)?.trim();
+    (!error.is_empty()).then(|| error.to_string())
+}
+
+/// The line `backup run` prints when it sees that attempt `failed` (of at
+/// most `attempts`) of its Job has failed, with `why` from
+/// [`runner_error_during`] or [`last_failed_attempt`]. Printed once for each
+/// attempt: `… retrying` alone does not say why, and the next attempt may
+/// fail the same way.
+pub(crate) fn failed_attempt_note(failed: u64, attempts: u64, why: Option<&str>) -> String {
+    format!(
+        "  … attempt {failed} of at most {attempts} failed: {}",
+        why.unwrap_or("no reason was recorded")
+    )
+}
+
+/// The error `backup run` ends with when its `--timeout` runs out after
+/// `failed` attempts of the Job have failed and none has succeeded. The Job
+/// is left to go on, as on any timeout, but the command does not exit 0: no
+/// backup has been taken, and a script that reads the exit code must not
+/// take a Job whose attempts fail for one that is only slow.
+pub(crate) fn timed_out_failing(
+    name: &str,
+    timeout_minutes: u64,
+    failed: u64,
+    why: Option<&str>,
+) -> String {
+    format!(
+        "backup Job {name} has taken no backup: {} before the wait ended at {timeout_minutes}m, \
+         the last one: {}",
+        failed_attempts(failed),
+        why.unwrap_or("no reason was recorded")
+    )
+}
+
 /// The pods, as `namespace/name`, that are placed on a node and being
 /// deleted: the room they hold is given back when they are gone, and the
 /// scheduler then tries an unschedulable pod again. Sorted.
@@ -1753,6 +1819,83 @@ mod tests {
         assert_eq!(
             last_failed_attempt(&job(), &[foreign, unschedulable_pod()]),
             None
+        );
+    }
+
+    /// The runner's `lastError` is quoted for the attempt it was written
+    /// during, and for no other: not an earlier attempt's, not an earlier
+    /// Job's, not one the kernel or the kubelet killed before it could write.
+    #[test]
+    fn the_runners_own_words_are_quoted_for_the_attempt_that_wrote_them() {
+        let failed_at = |created: &str| {
+            let mut p = running_pod();
+            p["metadata"]["creationTimestamp"] = json!(created);
+            p["status"] = json!({"phase": "Failed", "containerStatuses": [{
+                "name": "runner", "state": {"terminated": {"reason": "Error", "exitCode": 1}}
+            }]});
+            p
+        };
+        let record = |at: &str, error: &str| {
+            json!({"data": {"lastFailure": at, "lastError": error,
+                            "lastSuccess": "2026-09-22T03:10:00+00:00"}})
+        };
+        let bucket = "restic backup failed (exit 1): Fatal: unable to open config file: \
+                      The specified bucket does not exist.";
+        let first = failed_at("2026-09-23T14:39:47Z");
+        // Written 11 s into the attempt, with the runner's own precision.
+        let cm = record("2026-09-23T14:39:58.412057339+00:00", bucket);
+        assert_eq!(
+            runner_error_during(&job(), std::slice::from_ref(&first), Some(&cm)).as_deref(),
+            Some(bucket)
+        );
+        // The next attempt failed too, and was killed before it could write:
+        // the first attempt's words are not its reason.
+        let second = failed_at("2026-09-23T14:40:20Z");
+        assert_eq!(
+            runner_error_during(&job(), &[first.clone(), second], Some(&cm)),
+            None
+        );
+        // A record from before this Job: an earlier run's.
+        let old = record("2026-09-22T03:04:00+00:00", "an earlier run's error");
+        assert_eq!(
+            runner_error_during(&job(), std::slice::from_ref(&first), Some(&old)),
+            None
+        );
+        // No failed pod left to date the attempt by: the Job's start does.
+        assert_eq!(
+            runner_error_during(&job(), &[], Some(&cm)).as_deref(),
+            Some(bucket)
+        );
+        assert_eq!(runner_error_during(&job(), &[], Some(&old)), None);
+        // Nothing recorded, or no record at all.
+        let empty = record("2026-09-23T14:39:58+00:00", "  ");
+        assert_eq!(
+            runner_error_during(&job(), std::slice::from_ref(&first), Some(&empty)),
+            None
+        );
+        assert_eq!(runner_error_during(&job(), &[first], None), None);
+    }
+
+    #[test]
+    fn a_failed_attempt_and_a_timeout_after_failures_say_why() {
+        assert_eq!(
+            failed_attempt_note(2, 7, Some("the staging volume held 318Mi")),
+            "  … attempt 2 of at most 7 failed: the staging volume held 318Mi"
+        );
+        assert_eq!(
+            failed_attempt_note(1, 7, None),
+            "  … attempt 1 of at most 7 failed: no reason was recorded"
+        );
+        let e = timed_out_failing(
+            "apprafter-backup-manual-x",
+            60,
+            3,
+            Some("OOMKilled (exit 137)"),
+        );
+        assert_eq!(
+            e,
+            "backup Job apprafter-backup-manual-x has taken no backup: 3 failed attempts before \
+             the wait ended at 60m, the last one: OOMKilled (exit 137)"
         );
     }
 

@@ -272,7 +272,7 @@ runner, no larger minimum machine. Instead:
    The backup Job now stages on the staging volume, and both Jobs keep
    restic's cache and temporary files there; the runner stops a run whose
    volume outgrows the limit with an error that names the limit and what to
-   change.
+   change, and the Job fails at once instead of retrying into the same limit.
 2. **A backup that cannot run is reported, not masked.** `apprafter backup
    run` stops waiting on a pod no node has room for and says so with the
    scheduler's reason, `apprafter backup status` shows such a Job as

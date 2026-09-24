@@ -1843,7 +1843,9 @@ pub enum BackupAction {
         #[arg(long, default_value_t = false)]
         no_wait: bool,
         /// How long to wait for the Job before handing back control, in
-        /// minutes. A timeout does not cancel the backup.
+        /// minutes. A timeout does not cancel the backup. It exits non-zero
+        /// when an attempt of the Job has failed by then, with that
+        /// attempt's reason.
         #[arg(long, default_value_t = crate::commands::backup::DEFAULT_BACKUP_JOB_TIMEOUT_MINUTES)]
         timeout: u64,
     },

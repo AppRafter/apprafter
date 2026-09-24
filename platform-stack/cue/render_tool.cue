@@ -529,6 +529,20 @@ _backupTemplate: """
 	      # good backup: see #BackupValues.activeDeadlineSeconds. `backup run`
 	      # copies this jobTemplate, so a manual run carries it too.
 	      activeDeadlineSeconds: {{ $deadline }}
+	      # A run whose staging volume outgrew stagingSizeLimit exits 3, the
+	      # runner's own code for it (EXIT_OVER_LIMIT). Another attempt would
+	      # stage the same claims into the same limit, after dumping every
+	      # database and volume again and posting the failure webhook again,
+	      # so that exit fails the Job at once instead of after its backoff
+	      # limit: on kind, 7 attempts took 12 minutes against a 300Mi limit.
+	      # Every other failure is retried as before.
+	      podFailurePolicy:
+	        rules:
+	        - action: FailJob
+	          onExitCodes:
+	            containerName: runner
+	            operator: In
+	            values: [3]
 	      template:
 	        metadata:
 	          labels:
@@ -719,6 +733,15 @@ _backupTemplate: """
 	      # The same umbrella as the backup Job's. A stuck check also holds
 	      # restic's EXCLUSIVE lock, which fails every backup until it ends.
 	      activeDeadlineSeconds: {{ $b.checkActiveDeadlineSeconds | default 21600 | int }}
+	      # The backup Job's rule, for the check's own use of the staging
+	      # volume below: a retry meets the same limit.
+	      podFailurePolicy:
+	        rules:
+	        - action: FailJob
+	          onExitCodes:
+	            containerName: check
+	            operator: In
+	            values: [3]
 	      template:
 	        metadata:
 	          labels:
