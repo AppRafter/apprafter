@@ -966,6 +966,17 @@ fn restore_artifact_tree(
     let run =
         backup_core::restore::resolve_run_snapshots(&listing, requested_snapshot, this_cluster_uid)
             .map_err(CliError::Other)?;
+    // `latest` is the newest COMPLETE run. A newer one that did not finish is
+    // named, so the operator knows the newest backup is not what is replayed.
+    let zone = crate::commands::backup::readers_zone();
+    for line in crate::commands::backup::passed_over_lines(
+        &run.passed_over,
+        &format!("{}, which this restore replays", short_id(&run.commit)),
+        &chrono::Local,
+        zone.as_deref(),
+    ) {
+        println!("{line}");
+    }
 
     restic.restore_snapshot(&run.commit, restore_root)?;
     let dd = find_data_dir(restore_root)?;
@@ -990,6 +1001,11 @@ fn restore_artifact_tree(
         }
     }
     Ok(dd)
+}
+
+/// The eight-character short form restic prints for a snapshot id.
+fn short_id(id: &str) -> &str {
+    id.get(..8).unwrap_or(id)
 }
 
 /// Locate the `data/` directory inside the restic restore target.
@@ -5255,11 +5271,17 @@ mod tests {
 
     /// A sequential run's listing: two per-claim snapshots and the commit
     /// point, sharing one run tag (the only thing that groups them).
+    ///
+    /// The paths are the ones the writer gives each snapshot: they are what
+    /// says which snapshot completes the run, and so what `latest` resolves.
     fn sequential_listing() -> &'static str {
         r#"[
-          {"id":"claimA","short_id":"claimA","time":"2026-09-02T19:11:29Z","tags":["platform-run-1"]},
-          {"id":"claimB","short_id":"claimB","time":"2026-09-02T19:11:30Z","tags":["platform-run-1"]},
-          {"id":"commit","short_id":"commit","time":"2026-09-02T19:11:31Z","tags":["platform-run-1"]}
+          {"id":"claimA","short_id":"claimA","time":"2026-09-02T19:11:29Z","tags":["platform-run-1"],
+           "paths":["/tmp/apprafter-backup-x/claim-0"]},
+          {"id":"claimB","short_id":"claimB","time":"2026-09-02T19:11:30Z","tags":["platform-run-1"],
+           "paths":["/tmp/apprafter-backup-x/claim-1"]},
+          {"id":"commit","short_id":"commit","time":"2026-09-02T19:11:31Z","tags":["platform-run-1"],
+           "paths":["/tmp/apprafter-backup-x/commit"]}
         ]"#
     }
 
@@ -5310,6 +5332,42 @@ mod tests {
                 "claimB".to_string()
             ],
             "the commit point is restored first, then every claim snapshot of the run"
+        );
+    }
+
+    /// A restore with no `--snapshot` right after a sequential backup died
+    /// between its claims. `latest` used to be the dead run's newest claim
+    /// snapshot, which carries no manifest, so the restore failed — the
+    /// disaster-recovery restore, at the moment it is needed. It replays the
+    /// newest COMPLETE run, and fetches none of the dead run's snapshots.
+    #[test]
+    fn restore_artifact_tree_replays_the_newest_complete_run_after_an_interrupted_one() {
+        let root = tempfile::tempdir().unwrap();
+        let listing = r#"[
+          {"id":"claimA","time":"2026-09-02T19:11:29Z","tags":["platform-run-1"],
+           "paths":["/tmp/apprafter-backup-x/claim-0"]},
+          {"id":"commit","time":"2026-09-02T19:11:31Z","tags":["platform-run-1"],
+           "paths":["/tmp/apprafter-backup-x/commit"]},
+          {"id":"deadA","time":"2026-09-03T19:11:29Z","tags":["platform-run-2"],
+           "paths":["/tmp/apprafter-backup-y/claim-0"]},
+          {"id":"deadB","time":"2026-09-03T19:11:30Z","tags":["platform-run-2"],
+           "paths":["/tmp/apprafter-backup-y/claim-1"]}
+        ]"#;
+        let restic = FakeRestic::new(listing)
+            .with_tree("commit", &[("staging/data/manifest.json", "{}")])
+            .with_tree("claimA", &[("claim-0/data/pg/demo/db.dump", "PGDUMP-A")]);
+
+        let dd =
+            restore_artifact_tree(&restic, "latest", root.path(), Some(TEST_CLUSTER_UID)).unwrap();
+
+        assert_eq!(
+            *restic.restored.borrow(),
+            vec!["commit".to_string(), "claimA".to_string()],
+            "the complete run, and nothing of the unfinished one"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dd.join("pg/demo/db.dump")).unwrap(),
+            "PGDUMP-A"
         );
     }
 

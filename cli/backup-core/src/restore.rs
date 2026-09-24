@@ -60,6 +60,38 @@ pub struct RunSnapshots {
     /// The per-claim snapshots of the same run, oldest first. Empty for a
     /// monolithic backup.
     pub claims: Vec<String>,
+    /// For `latest`: the runs NEWER than this one that it passed over because
+    /// they never completed ([`UnfinishedRun`]). Always empty for a snapshot
+    /// named by id.
+    pub passed_over: Vec<UnfinishedRun>,
+}
+
+/// A backup run no snapshot of which carries `manifest.json`: a sequential run
+/// stopped before its commit snapshot (a SIGINT, a kill, a Job's deadline), or
+/// one a backup is still writing — from the repository alone the two look the
+/// same.
+///
+/// `latest` never resolves to one ([`resolve_run_snapshots`]), and reports the
+/// ones newer than the run it chose, so an operator is not left believing the
+/// newest backup is the one being restored.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnfinishedRun {
+    /// The run tag its snapshots share.
+    pub tag: String,
+    /// How many snapshots it holds.
+    pub snapshots: usize,
+    /// The newest of their times, as restic reports it (RFC 3339).
+    pub newest: String,
+}
+
+/// What `latest` means for a caller that wants one snapshot rather than a
+/// whole run ([`resolve_latest_snapshot`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LatestSnapshot {
+    /// The snapshot carrying the newest complete run's `manifest.json`.
+    pub id: String,
+    /// The unfinished runs newer than it, as in [`RunSnapshots::passed_over`].
+    pub passed_over: Vec<UnfinishedRun>,
 }
 
 /// Group a `restic snapshots --json` listing into the run the caller asked for.
@@ -111,6 +143,22 @@ pub struct RunSnapshots {
 /// repository inspected with no target). `latest` then falls back to the
 /// single-cluster / refuse-if-ambiguous rule, which is the safe half.
 ///
+/// # `latest` is the newest COMPLETE run
+///
+/// Inside that pool, `latest` is the newest snapshot that completes its run —
+/// the one carrying `manifest.json`, by the rule the prune plans with
+/// ([`crate::prune::derive_manifest`]). It used to be the newest snapshot of
+/// any kind, and after a sequential backup was stopped between its claims
+/// (a SIGINT, a kill, a Job's deadline) that was a per-claim snapshot of a run
+/// with no manifest: `backup show` then said the repository held something
+/// other than a backup, and a restore with no `--snapshot` failed on the
+/// missing manifest until a newer complete run landed — so the restore right
+/// after a backup died, the one disaster recovery needs, was the one that
+/// could not run. The prune already treats such a run as unfinished and never
+/// as a run to keep; `latest` now agrees with it. The unfinished runs newer
+/// than the one chosen are returned in [`RunSnapshots::passed_over`], so the
+/// caller says so rather than skipping them silently.
+///
 /// An EXPLICIT snapshot id is always honoured, whatever cluster it belongs to:
 /// naming an id is the operator saying which run they mean, and it is the
 /// escape hatch the refusal above points at.
@@ -121,13 +169,14 @@ pub fn resolve_run_snapshots(
 ) -> Result<RunSnapshots, String> {
     let snaps = parse_snapshot_list(snapshots_json)?;
 
-    // `latest` is restic's own spelling for "newest by time", which is exactly
-    // what the sequential writer makes the commit point: it is written LAST —
-    // but only ever within ONE cluster's snapshots (E2).
-    let commit = if requested == "latest" {
-        choose_latest(&snaps, this_cluster_uid)?
+    // `latest` is the newest snapshot that completes its run — which is what
+    // the sequential writer makes the commit point: it is written LAST — and
+    // only ever within ONE cluster's snapshots (E2).
+    let (commit, passed_over) = if requested == "latest" {
+        let latest = choose_latest(&snaps, this_cluster_uid)?;
+        (latest.commit, latest.passed_over)
     } else {
-        snaps
+        let named = snaps
             .iter()
             .find(|s| {
                 let id = id_of(s);
@@ -135,7 +184,8 @@ pub fn resolve_run_snapshots(
                     || id.starts_with(requested)
                     || s.get("short_id").and_then(Value::as_str) == Some(requested)
             })
-            .ok_or_else(|| format!("no snapshot matching `{requested}` in this repository"))?
+            .ok_or_else(|| format!("no snapshot matching `{requested}` in this repository"))?;
+        (named, Vec::new())
     };
 
     let commit_id = id_of(commit);
@@ -163,6 +213,7 @@ pub fn resolve_run_snapshots(
     Ok(RunSnapshots {
         commit: commit_id,
         claims: claims.into_iter().map(|(_, id)| id).collect(),
+        passed_over,
     })
 }
 
@@ -177,9 +228,13 @@ pub fn resolve_run_snapshots(
 pub fn resolve_latest_snapshot(
     snapshots_json: &str,
     this_cluster_uid: Option<&str>,
-) -> Result<String, String> {
+) -> Result<LatestSnapshot, String> {
     let snaps = parse_snapshot_list(snapshots_json)?;
-    Ok(id_of(choose_latest(&snaps, this_cluster_uid)?))
+    let latest = choose_latest(&snaps, this_cluster_uid)?;
+    Ok(LatestSnapshot {
+        id: id_of(latest.commit),
+        passed_over: latest.passed_over,
+    })
 }
 
 /// Parse `restic snapshots --json` into a non-empty snapshot list.
@@ -209,16 +264,109 @@ fn time_of(s: &Value) -> String {
         .to_string()
 }
 
-/// The newest snapshot of [`latest_pool`] — THE definition of `latest` here,
-/// in one place so `restore` and `backup show` cannot drift apart.
+/// A snapshot's `paths`, as restic reports them.
+fn paths_of(s: &Value) -> Vec<String> {
+    s.get("paths")
+        .and_then(Value::as_array)
+        .map(|p| {
+            p.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `latest` as [`choose_latest`] resolves it.
+struct Latest<'a> {
+    commit: &'a Value,
+    passed_over: Vec<UnfinishedRun>,
+}
+
+/// The newest snapshot of [`latest_pool`] that completes its run — THE
+/// definition of `latest` here, in one place so `restore` and `backup show`
+/// cannot drift apart — and the unfinished runs of the pool newer than it.
+///
+/// Which snapshot completes its run is the prune's rule
+/// ([`crate::prune::derive_manifest`]), applied to the run as
+/// [`resolve_run_snapshots`] groups it: the snapshots sharing a tag, an
+/// untagged snapshot being a run of its own. A snapshot that completes
+/// nothing, in a run where nothing else does either, belongs to an
+/// [`UnfinishedRun`].
 fn choose_latest<'a>(
     snaps: &'a [Value],
     this_cluster_uid: Option<&str>,
-) -> Result<&'a Value, String> {
-    latest_pool(snaps, this_cluster_uid)?
-        .into_iter()
-        .max_by_key(|s| time_of(s))
-        .ok_or_else(|| "no snapshots to choose from".to_string())
+) -> Result<Latest<'a>, String> {
+    let pool = latest_pool(snaps, this_cluster_uid)?;
+
+    // How many snapshots of the whole listing carry each tag: a snapshot is
+    // alone in its run when none of its tags is carried by another.
+    let mut carried: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for s in snaps {
+        for t in crate::cluster::snapshot_tags(s) {
+            *carried.entry(t).or_default() += 1;
+        }
+    }
+    let completes = |s: &Value| {
+        let alone = crate::cluster::snapshot_tags(s)
+            .iter()
+            .all(|t| carried.get(t).copied().unwrap_or(0) <= 1);
+        crate::prune::derive_manifest(&paths_of(s), alone)
+    };
+
+    let (complete, rest): (Vec<&Value>, Vec<&Value>) = pool.into_iter().partition(|s| completes(s));
+    let commit = complete.iter().copied().max_by_key(|s| time_of(s));
+
+    // The other snapshots, by run. A complete run's own per-claim snapshots
+    // are among them, but all are older than its commit — written last — so
+    // none is newer than the run `latest` chose, which is all that is
+    // reported; and with no complete run there are none.
+    let mut unfinished: std::collections::BTreeMap<String, UnfinishedRun> =
+        std::collections::BTreeMap::new();
+    for s in rest {
+        let tag = crate::cluster::snapshot_tags(s)
+            .first()
+            .cloned()
+            .unwrap_or_default();
+        // An untagged snapshot is a run of its own.
+        let key = if tag.is_empty() {
+            id_of(s)
+        } else {
+            tag.clone()
+        };
+        let run = unfinished.entry(key).or_insert_with(|| UnfinishedRun {
+            tag,
+            snapshots: 0,
+            newest: String::new(),
+        });
+        run.snapshots += 1;
+        run.newest = run.newest.clone().max(time_of(s));
+    }
+
+    let Some(commit) = commit else {
+        let newest = unfinished.values().map(|r| r.newest.as_str()).max();
+        return Err(format!(
+            "no complete backup run to choose: {} run(s) here, and none has the snapshot that \
+             completes it, the one carrying manifest.json{} — each was interrupted before its \
+             last snapshot, or is still being written. A sequential backup writes that \
+             snapshot last. Wait for a backup in progress to finish, or take one \
+             (`apprafter backup run`); `apprafter backup list` shows what the repository holds.",
+            unfinished.len(),
+            newest
+                .map(|t| format!(" (the newest written at {t})"))
+                .unwrap_or_default(),
+        ));
+    };
+    let chosen = time_of(commit);
+    let mut passed_over: Vec<UnfinishedRun> = unfinished
+        .into_values()
+        .filter(|r| r.newest > chosen)
+        .collect();
+    passed_over.sort_by(|a, b| b.newest.cmp(&a.newest));
+    Ok(Latest {
+        commit,
+        passed_over,
+    })
 }
 
 /// The snapshots `latest` is allowed to choose between — see
@@ -426,10 +574,14 @@ mod tests {
     fn a_different_run_is_never_dragged_in() {
         // THE isolation rule: two runs in one repository must not blend, or a
         // restore would load another backup's data over this one's.
+        //
+        // The newer run is a sequential one, spelled with the paths the writer
+        // gives it: a two-snapshot run whose paths name neither a claim nor
+        // the commit completes nothing, and `latest` never picks such a run.
         let two_runs = r#"[
-          {"id":"old1","short_id":"old1","time":"2026-09-01T10:00:00Z","tags":["platform-run-0"],"paths":["/a"]},
-          {"id":"new1","short_id":"new1","time":"2026-09-02T10:00:00Z","tags":["platform-run-1"],"paths":["/b"]},
-          {"id":"new2","short_id":"new2","time":"2026-09-02T10:00:01Z","tags":["platform-run-1"],"paths":["/c"]}
+          {"id":"old1","short_id":"old1","time":"2026-09-01T10:00:00Z","tags":["platform-run-0"],"paths":["/a/data"]},
+          {"id":"new1","short_id":"new1","time":"2026-09-02T10:00:00Z","tags":["platform-run-1"],"paths":["/b/claim-0"]},
+          {"id":"new2","short_id":"new2","time":"2026-09-02T10:00:01Z","tags":["platform-run-1"],"paths":["/b/commit"]}
         ]"#;
         let r = resolve_run_snapshots(two_runs, "latest", Some(MINE)).unwrap();
         assert_eq!(r.commit, "new2");
@@ -554,7 +706,9 @@ mod tests {
     /// restore, so a foreign answer here becomes a foreign restore.
     #[test]
     fn resolve_latest_snapshot_stays_inside_this_clusters_history() {
-        let id = resolve_latest_snapshot(&shared_listing(), Some(MINE)).unwrap();
+        let id = resolve_latest_snapshot(&shared_listing(), Some(MINE))
+            .unwrap()
+            .id;
         assert_eq!(id, "mine1", "the newest in the repository is theirs");
     }
 
@@ -563,7 +717,9 @@ mod tests {
     /// returns the oldest snapshot.
     #[test]
     fn resolve_latest_snapshot_from_the_other_side_resolves_to_that_cluster() {
-        let id = resolve_latest_snapshot(&shared_listing(), Some(THEIRS)).unwrap();
+        let id = resolve_latest_snapshot(&shared_listing(), Some(THEIRS))
+            .unwrap()
+            .id;
         assert_eq!(id, "theirs1");
     }
 
@@ -573,7 +729,7 @@ mod tests {
     #[test]
     fn show_and_restore_resolve_latest_to_the_same_snapshot() {
         for uid in [Some(MINE), Some(THEIRS), None] {
-            let shown = resolve_latest_snapshot(&shared_listing(), uid);
+            let shown = resolve_latest_snapshot(&shared_listing(), uid).map(|l| l.id);
             let restored =
                 resolve_run_snapshots(&shared_listing(), "latest", uid).map(|r| r.commit);
             assert_eq!(shown, restored, "uid={uid:?}");
@@ -649,6 +805,165 @@ mod tests {
             r.commit, "old",
             "legacy stays selectable; the foreign run is still excluded"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // `latest` is the newest COMPLETE run: an unfinished one is passed over.
+    // -----------------------------------------------------------------------
+
+    /// A complete sequential run, then a NEWER one stopped after two of its
+    /// claims — the shape a SIGINT, a kill or a deadline leaves: per-claim
+    /// snapshots and no commit snapshot, so no `manifest.json` anywhere in it.
+    fn interrupted_listing() -> String {
+        let done = format!("{MINE}-2026-09-23T03:00:00Z");
+        let cut = format!("{MINE}-2026-09-24T03:00:00Z");
+        format!(
+            r#"[
+              {{"id":"d-claim0","short_id":"d-claim0","time":"2026-09-23T03:00:01Z",
+                "tags":["{done}"],"paths":["/staging/apprafter-backup-a/claim-0"]}},
+              {{"id":"d-claim1","short_id":"d-claim1","time":"2026-09-23T03:00:02Z",
+                "tags":["{done}"],"paths":["/staging/apprafter-backup-a/claim-1"]}},
+              {{"id":"d-commit","short_id":"d-commit","time":"2026-09-23T03:00:03Z",
+                "tags":["{done}"],"paths":["/staging/apprafter-backup-a/commit"]}},
+              {{"id":"c-claim0","short_id":"c-claim0","time":"2026-09-24T03:00:01Z",
+                "tags":["{cut}"],"paths":["/tmp/apprafter-backup-b/claim-0"]}},
+              {{"id":"c-claim1","short_id":"c-claim1","time":"2026-09-24T03:00:02Z",
+                "tags":["{cut}"],"paths":["/tmp/apprafter-backup-b/claim-1"]}}
+            ]"#
+        )
+    }
+
+    /// FIRES: the newest snapshot belongs to a run that never wrote its commit
+    /// snapshot. `latest` used to resolve to it, so `backup show` said the
+    /// repository "holds something else" and a restore with no `--snapshot`
+    /// found no manifest — until a newer complete run landed, which is the
+    /// worst time to be told that: right after a backup died.
+    #[test]
+    fn latest_is_the_newest_complete_run_not_a_newer_unfinished_one() {
+        let r = resolve_run_snapshots(&interrupted_listing(), "latest", Some(MINE)).unwrap();
+        assert_eq!(r.commit, "d-commit", "the unfinished run has no manifest");
+        assert_eq!(
+            r.claims,
+            vec!["d-claim0", "d-claim1"],
+            "and the complete run's own claims come with it, not the unfinished run's"
+        );
+        let id = resolve_latest_snapshot(&interrupted_listing(), Some(MINE))
+            .unwrap()
+            .id;
+        assert_eq!(id, "d-commit", "`backup show` resolves the same run");
+    }
+
+    /// …and the run it passed over is reported, not skipped in silence: the
+    /// operator has to know the newest backup is not the one being restored.
+    /// Only the unfinished run — the complete run's own claim snapshots are
+    /// not "unfinished" merely for carrying no manifest themselves.
+    #[test]
+    fn latest_reports_the_newer_unfinished_run_it_passed_over() {
+        let cut = UnfinishedRun {
+            tag: format!("{MINE}-2026-09-24T03:00:00Z"),
+            snapshots: 2,
+            newest: "2026-09-24T03:00:02Z".into(),
+        };
+        let r = resolve_run_snapshots(&interrupted_listing(), "latest", Some(MINE)).unwrap();
+        assert_eq!(r.passed_over, vec![cut.clone()]);
+        let shown = resolve_latest_snapshot(&interrupted_listing(), Some(MINE)).unwrap();
+        assert_eq!(
+            shown.passed_over,
+            vec![cut],
+            "show and restore say the same"
+        );
+    }
+
+    /// An unfinished run OLDER than the one chosen is not news: `latest` did
+    /// not pass over it, and a note about last week's dead run on every
+    /// restore is a note nobody reads.
+    #[test]
+    fn an_older_unfinished_run_is_not_reported() {
+        let dead = format!("{MINE}-2026-09-20T03:00:00Z");
+        let done = format!("{MINE}-2026-09-23T03:00:00Z");
+        let listing = format!(
+            r#"[
+              {{"id":"x-claim0","time":"2026-09-20T03:00:01Z","tags":["{dead}"],
+                "paths":["/s/a/claim-0"]}},
+              {{"id":"mono","time":"2026-09-23T03:00:00Z","tags":["{done}"],
+                "paths":["/s/b/data"]}}
+            ]"#
+        );
+        let r = resolve_run_snapshots(&listing, "latest", Some(MINE)).unwrap();
+        assert_eq!(r.commit, "mono");
+        assert!(r.passed_over.is_empty(), "{:?}", r.passed_over);
+    }
+
+    /// A sequential run of ONE claim stopped before its commit is a lone
+    /// `claim-0` snapshot. Alone in its run it still completes nothing — the
+    /// prune's rule — so a monolithic run before it stays `latest`.
+    #[test]
+    fn a_lone_claim_snapshot_is_not_a_complete_run() {
+        let done = format!("{MINE}-2026-09-23T03:00:00Z");
+        let cut = format!("{MINE}-2026-09-24T03:00:00Z");
+        let listing = format!(
+            r#"[
+              {{"id":"mono","time":"2026-09-23T03:00:00Z","tags":["{done}"],
+                "paths":["/s/a/data"]}},
+              {{"id":"lone","time":"2026-09-24T03:00:01Z","tags":["{cut}"],
+                "paths":["/s/b/claim-0"]}}
+            ]"#
+        );
+        let r = resolve_run_snapshots(&listing, "latest", Some(MINE)).unwrap();
+        assert_eq!(r.commit, "mono");
+        assert_eq!(r.passed_over.len(), 1);
+        assert_eq!(r.passed_over[0].snapshots, 1);
+    }
+
+    /// The rule is the prune's, whole: in a run of several snapshots only the
+    /// one under `commit` completes it, so a run whose paths name neither a
+    /// claim nor the commit completes nothing, and the older run is `latest`.
+    #[test]
+    fn a_run_of_several_snapshots_with_no_commit_path_completes_nothing() {
+        let done = format!("{MINE}-2026-09-23T03:00:00Z");
+        let odd = format!("{MINE}-2026-09-24T03:00:00Z");
+        let listing = format!(
+            r#"[
+              {{"id":"mono","time":"2026-09-23T03:00:00Z","tags":["{done}"],"paths":["/s/a/data"]}},
+              {{"id":"odd1","time":"2026-09-24T03:00:01Z","tags":["{odd}"],"paths":["/s/b/data"]}},
+              {{"id":"odd2","time":"2026-09-24T03:00:02Z","tags":["{odd}"],"paths":["/s/c/data"]}}
+            ]"#
+        );
+        let r = resolve_run_snapshots(&listing, "latest", Some(MINE)).unwrap();
+        assert_eq!(r.commit, "mono");
+        assert_eq!(r.passed_over.len(), 1, "{:?}", r.passed_over);
+    }
+
+    /// Nothing complete at all — a first backup that died — is an error that
+    /// says what the repository holds and what to do, not "no manifest".
+    #[test]
+    fn latest_with_no_complete_run_says_every_run_is_unfinished() {
+        let cut = format!("{MINE}-2026-09-24T03:00:00Z");
+        let listing = format!(
+            r#"[
+              {{"id":"c0","time":"2026-09-24T03:00:01Z","tags":["{cut}"],"paths":["/s/claim-0"]}},
+              {{"id":"c1","time":"2026-09-24T03:00:02Z","tags":["{cut}"],"paths":["/s/claim-1"]}}
+            ]"#
+        );
+        for err in [
+            resolve_run_snapshots(&listing, "latest", Some(MINE)).unwrap_err(),
+            resolve_latest_snapshot(&listing, Some(MINE)).unwrap_err(),
+        ] {
+            assert!(err.contains("no complete backup run"), "{err}");
+            assert!(err.contains("1 run(s)"), "{err}");
+            assert!(err.contains("manifest.json"), "{err}");
+            assert!(err.contains("2026-09-24T03:00:02Z"), "{err}");
+            assert!(err.contains("still being written"), "{err}");
+        }
+    }
+
+    /// A snapshot named by id is honoured as it always was, and `latest`'s
+    /// note does not follow it: nothing was passed over.
+    #[test]
+    fn a_named_snapshot_passes_nothing_over() {
+        let r = resolve_run_snapshots(&interrupted_listing(), "d-commit", Some(MINE)).unwrap();
+        assert_eq!(r.commit, "d-commit");
+        assert!(r.passed_over.is_empty());
     }
 
     use super::*;

@@ -66,7 +66,7 @@ use backup_core::prune::{run_prune, RetentionPolicy};
 use backup_core::restic::{
     restic_check_argv, restic_dump_argv, restic_ls_argv, restic_stats_argv, restic_unlock_argv,
 };
-use backup_core::restore::resolve_latest_snapshot;
+use backup_core::restore::{resolve_latest_snapshot, UnfinishedRun};
 use backup_core::{KubeExec, ResticRunner, StagingMode, SubprocessRestic};
 use base64::Engine as _;
 use cli_core::diagnose::{classify_restic, ResticFailure};
@@ -4117,6 +4117,10 @@ fn backup_set_patch(key: &str, value: &str) -> Result<Value> {
 /// default now resolves through [`resolve_latest_snapshot`] — the same rule
 /// `restore` uses, deliberately the same function — so `show` and `restore`
 /// cannot disagree about which snapshot `latest` is.
+///
+/// That rule also makes `latest` the newest COMPLETE run: a newer sequential
+/// run stopped before its commit snapshot has no manifest to show, and is
+/// named above the contents instead ([`passed_over_lines`]).
 pub fn run_backup_show(
     snapshot: Option<&str>,
     repo_override: Option<&str>,
@@ -4161,7 +4165,7 @@ pub fn run_backup_show(
         Some(_) => None,
         None => Some(runner.run_stdout(&restic_snapshots_argv(&repo), &pass)?),
     };
-    let id = snapshot_to_show(snapshot, listing.as_deref(), this_uid.as_deref())?;
+    let (id, passed_over) = snapshot_to_show(snapshot, listing.as_deref(), this_uid.as_deref())?;
     let id = id.as_str();
     let inside = read_snapshot_insides(&runner, &repo, &pass, id)?;
 
@@ -4171,6 +4175,15 @@ pub fn run_backup_show(
     let (resolved_id, time) = snapshot_identity(&runner, &repo, &pass, id);
     let size = repo_stats(&runner, &repo, &pass, Some(id)).map(|s| s.total_size);
 
+    let zone = readers_zone();
+    for line in passed_over_lines(
+        &passed_over,
+        &format!("{resolved_id}, shown below"),
+        &chrono::Local,
+        zone.as_deref(),
+    ) {
+        println!("{line}");
+    }
     print!(
         "{}",
         format_snapshot_contents(
@@ -4187,7 +4200,8 @@ pub fn run_backup_show(
 }
 
 /// Which snapshot `backup show` inspects: the one the operator named, or —
-/// for the default — `latest` resolved inside THIS cluster's history. Pure.
+/// for the default — `latest` resolved inside THIS cluster's history, with
+/// the unfinished runs newer than it that `latest` passed over. Pure.
 ///
 /// The seam exists so the default is pinned by a test rather than by a walk
 /// against a shared repository, which is the one shape that shows the defect
@@ -4197,16 +4211,55 @@ fn snapshot_to_show(
     requested: Option<&str>,
     listing: Option<&str>,
     this_cluster_uid: Option<&str>,
-) -> Result<String> {
+) -> Result<(String, Vec<UnfinishedRun>)> {
     if let Some(id) = requested {
-        return Ok(id.to_string());
+        return Ok((id.to_string(), Vec::new()));
     }
     let listing = listing.ok_or_else(|| {
         CliError::Other(
             "internal: `backup show` needs the repository listing to resolve `latest`".into(),
         )
     })?;
-    resolve_latest_snapshot(listing, this_cluster_uid).map_err(CliError::Other)
+    let latest = resolve_latest_snapshot(listing, this_cluster_uid).map_err(CliError::Other)?;
+    Ok((latest.id, latest.passed_over))
+}
+
+/// What `backup show` and `restore` say when `latest` passed over newer runs
+/// that did not finish: the newest backup is not the one being shown or
+/// restored, and an operator in the middle of a recovery must not have to
+/// find that out from `backup list`. Empty — and silent — when nothing was
+/// passed over. `chosen` names the run `latest` resolved to, and what
+/// happens to it. Pure.
+pub(crate) fn passed_over_lines<Tz>(
+    passed_over: &[UnfinishedRun],
+    chosen: &str,
+    tz: &Tz,
+    zone_label: Option<&str>,
+) -> Vec<String>
+where
+    Tz: chrono::TimeZone,
+    Tz::Offset: std::fmt::Display,
+{
+    if passed_over.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = passed_over
+        .iter()
+        .map(|run| {
+            format!(
+                "  ⚠ a newer backup run did not finish: {} snapshot(s) of run {}, the last \
+                 written {}. None carries manifest.json — the run was interrupted before its \
+                 last snapshot, or is still being written.",
+                run.snapshots,
+                short_tag(&run.tag, tz),
+                format_timestamp_with_zone(&run.newest, tz, zone_label)
+            )
+        })
+        .collect();
+    out.push(format!(
+        "  `latest` is the newest COMPLETE run: snapshot {chosen}."
+    ));
+    out
 }
 
 /// The short id and timestamp restic itself reports for a snapshot.
@@ -4338,7 +4391,7 @@ pub fn run_backup_set(key: &str, value: &str) -> Result<()> {
 /// timestamp's own date; this only answers "what do we call that zone".
 /// `None` when neither source gives an IANA name, which prints an
 /// unlabelled time rather than a wrong label.
-fn readers_zone() -> Option<String> {
+pub(crate) fn readers_zone() -> Option<String> {
     resolve_time_zone(
         None,
         std::env::var("TZ").ok().as_deref(),
@@ -9005,7 +9058,8 @@ mod tests {
     /// foreign restore.
     #[test]
     fn show_defaults_to_this_clusters_latest_not_the_repositorys() {
-        let id = snapshot_to_show(None, Some(&shared_show_listing()), Some(OFFLINE_UID)).unwrap();
+        let (id, _) =
+            snapshot_to_show(None, Some(&shared_show_listing()), Some(OFFLINE_UID)).unwrap();
         assert_eq!(
             id, "mine1",
             "the newest snapshot in the repository is theirs"
@@ -9020,12 +9074,12 @@ mod tests {
     fn show_honours_a_named_snapshot_without_reading_the_repository() {
         assert_eq!(
             snapshot_to_show(Some("theirs1"), None, Some(OFFLINE_UID)).unwrap(),
-            "theirs1"
+            ("theirs1".to_string(), Vec::new())
         );
         // …including with no identity at all.
         assert_eq!(
             snapshot_to_show(Some("abc123"), None, None).unwrap(),
-            "abc123"
+            ("abc123".to_string(), Vec::new())
         );
     }
 
@@ -9039,6 +9093,54 @@ mod tests {
             .to_string();
         assert!(err.contains("different clusters"), "{err}");
         assert!(err.contains("apprafter backup show <id>"), "{err}");
+    }
+
+    /// A complete sequential run, then a newer one a SIGINT stopped after its
+    /// first claim: no commit snapshot, so no `manifest.json` in it.
+    fn interrupted_show_listing() -> String {
+        let done = format!("{OFFLINE_UID}-2026-09-23T03:00:00Z");
+        let cut = format!("{OFFLINE_UID}-2026-09-24T03:00:00Z");
+        format!(
+            r#"[
+              {{"id":"done0","short_id":"done0","time":"2026-09-23T03:00:01Z",
+                "tags":["{done}"],"paths":["/staging/a/claim-0"]}},
+              {{"id":"donec","short_id":"donec","time":"2026-09-23T03:00:02Z",
+                "tags":["{done}"],"paths":["/staging/a/commit"]}},
+              {{"id":"cut0","short_id":"cut0","time":"2026-09-24T03:00:01Z",
+                "tags":["{cut}"],"paths":["/tmp/b/claim-0"]}}
+            ]"#
+        )
+    }
+
+    /// FIRES: after a sequential backup died between its claims, `backup
+    /// show` resolved `latest` to the dead run's claim snapshot and said the
+    /// repository "holds something else". It shows the newest complete run,
+    /// and says which newer run it passed over.
+    #[test]
+    fn show_defaults_to_the_newest_complete_run_and_names_the_one_it_passed_over() {
+        let (id, passed) =
+            snapshot_to_show(None, Some(&interrupted_show_listing()), Some(OFFLINE_UID)).unwrap();
+        assert_eq!(id, "donec");
+        assert_eq!(passed.len(), 1, "{passed:?}");
+
+        let lines = passed_over_lines(&passed, "donec, shown below", &chrono::Utc, Some("UTC"));
+        let text = lines.join("\n");
+        assert!(text.contains("did not finish"), "{text}");
+        assert!(text.contains("1 snapshot(s)"), "{text}");
+        assert!(
+            text.contains(&format!("{}…", &OFFLINE_UID[..8])),
+            "the run is named by its tag, shortened as `backup list` does: {text}"
+        );
+        assert!(text.contains("2026-09-24 03:00:01 UTC"), "{text}");
+        assert!(text.contains("manifest.json"), "{text}");
+        assert!(text.contains("still being written"), "{text}");
+        assert!(text.contains("snapshot donec, shown below"), "{text}");
+    }
+
+    /// DOES NOT FIRE: with nothing passed over, not a word.
+    #[test]
+    fn nothing_passed_over_prints_nothing() {
+        assert!(passed_over_lines(&[], "x", &chrono::Utc, None).is_empty());
     }
 
     // ------------------------------------------------------------------

@@ -683,7 +683,11 @@ fn parse_snapshots(json: &str) -> Result<Vec<SnapshotMeta>> {
 ///   representative, whatever its path.
 /// * In a MULTI-snapshot group, the representative is the one whose path is the
 ///   commit/manifest dir (basename `commit`).
-fn derive_manifest(paths: &[String], alone: bool) -> bool {
+///
+/// Also THE rule for which run `latest` means
+/// ([`crate::restore::resolve_run_snapshots`]): a run the prune would sweep as
+/// an orphan is not one a restore may pick.
+pub(crate) fn derive_manifest(paths: &[String], alone: bool) -> bool {
     let base = |p: &String| -> String {
         p.trim_end_matches('/')
             .rsplit('/')

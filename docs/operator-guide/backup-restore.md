@@ -105,6 +105,13 @@ is the mechanism.
 what you read before deciding what to restore, so it has to be looking at the
 snapshot a restore would replay.
 
+For both, the latest run is the latest **complete** one. A sequential backup
+writes the snapshot that carries `manifest.json` last, so a run stopped between
+its claims (a Ctrl-C, a killed process, a Job's deadline) holds claim snapshots
+and no manifest; a run still being written looks the same. `backup show` and a
+`restore` without `--snapshot` pass over such a run, name it above their output,
+and use the newest run that finished.
+
 ```text
 apprafter backup create [--repo <path>] [--passphrase <value>] \
                         [--namespace <ns> ...] [--select] \
