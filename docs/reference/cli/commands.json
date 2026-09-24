@@ -1232,7 +1232,7 @@
           "env": null,
           "required": false,
           "possible_values": [],
-          "help": "The weekly repository-integrity check: `off` to disable it, or `HH:MM` for its Sunday run time. Default: three hours after `--at`, so it never starts in the same minute as a backup. The check is metadata-only; it does not re-download the data"
+          "help": "The weekly repository-integrity check: `off` to disable it, or `HH:MM` for its Sunday run time. Default: three hours after `--at`, so it never starts in the same minute as a backup. Besides the repository's structure, the check re-downloads and verifies a random 10% of the data each week; `apprafter backup set check-depth` changes that (`structure` reads no data, `full` reads all of it)"
         },
         {
           "id": "cluster_name",

@@ -2027,8 +2027,10 @@ pub enum BackupAction {
         /// The weekly repository-integrity check: `off` to disable it,
         /// or `HH:MM` for its Sunday run time. Default: three hours
         /// after `--at`, so it never starts in the same minute as a
-        /// backup. The check is metadata-only; it does not re-download
-        /// the data.
+        /// backup. Besides the repository's structure, the check
+        /// re-downloads and verifies a random 10% of the data each week;
+        /// `apprafter backup set check-depth` changes that (`structure`
+        /// reads no data, `full` reads all of it).
         #[arg(long, value_name = "off|time")]
         check: Option<String>,
         /// URL the runner POSTs a JSON failure report to when a
@@ -2059,6 +2061,43 @@ pub enum BackupAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `backup enable --check` says how much of the data the weekly check
+    /// reads, and it is the platform chart's own default. The help used to
+    /// call the check "metadata-only; it does not re-download the data" for
+    /// a check that reads a random tenth of it every week.
+    #[test]
+    fn backup_enable_check_help_states_the_charts_default_depth() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let enable = cmd
+            .find_subcommand("backup")
+            .and_then(|b| b.find_subcommand("enable"))
+            .expect("`backup enable` is a subcommand");
+        let help = enable
+            .get_arguments()
+            .find(|a| a.get_id() == "check")
+            .and_then(|a| a.get_long_help().or_else(|| a.get_help()))
+            .map(|h| h.to_string())
+            .expect("`--check` has help");
+        let cue = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../platform-stack/cue/platform.cue"),
+        )
+        .expect("platform.cue");
+        let default = cue
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("checkReadDataSubset: string | *\""))
+            .and_then(|rest| rest.split_once('"'))
+            .map(|(d, _)| d.to_string())
+            .expect("the chart declares checkReadDataSubset's default");
+        assert!(
+            help.contains(&format!("{default} of")),
+            "the help must state the default depth, {default}: {help}"
+        );
+        assert!(!help.contains("metadata-only"), "{help}");
+        assert!(help.contains("check-depth"), "and how to change it: {help}");
+    }
 
     #[test]
     fn parses_target_cert_import() {
