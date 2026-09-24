@@ -394,8 +394,8 @@ a backup a few minutes late loses nothing, and one stopped and retried loses
 only its time.
 
 **The helper pods keep the default.** The runner's helper pods (the
-`pg_dump`, volume and NATS pods in the application namespaces) request no
-memory. They never compete for room, removing one frees none, so the scheduler
+`pg_dump` and volume pods in the application namespaces, and the NATS pod
+beside its server) request no memory. They never compete for room, removing one frees none, so the scheduler
 would not choose one to preempt, and as BestEffort pods they are already the
 first the kernel kills. The CLI also creates helper pods for a restore, on
 clusters where backup may be off and the class does not exist; a pod that names
