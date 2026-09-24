@@ -562,6 +562,14 @@ The condition is absent while backup is disabled. It is never `True` on no
 evidence: a cluster whose objects could not be read, or whose first backup has
 not finished, is `Unknown`.
 
+The operator that writes this condition, and `BackupRetention` below, ships
+with platform 0.2.80. An older operator writes neither, and it does not remove
+them either: after a rollback below 0.2.80 they stay on the stack exactly as
+the newer operator last wrote them, re-evaluated by nothing. So on a platform
+older than 0.2.80, `apprafter status` says the operator does not report on
+backups rather than reading them, and `apprafter backup status` falls back to
+the runner's own record.
+
 Four rules keep it from raising false alarms, and from going quiet:
 
 - A pod that is waiting to be placed, or is placed with its container not yet

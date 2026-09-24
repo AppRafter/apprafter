@@ -260,6 +260,30 @@ pub(crate) fn condition_polarity(type_: &str) -> Option<ConditionPolarity> {
     }
 }
 
+/// The first platform release whose operator writes `BackupHealthy` and
+/// `BackupRetention` (operator v0.2.52; the compatibility record is checked
+/// by a test).
+pub(crate) const BACKUP_CONDITIONS_SINCE: &str = "0.2.80";
+
+/// The platform version the stack runs, when it is older than
+/// [`BACKUP_CONDITIONS_SINCE`]: its operator writes neither backup
+/// condition, so one on the stack was left there by a newer operator before
+/// a rollback. The older operator carries it forward untouched in every
+/// status write (it copies `status.conditions` and upserts only its own
+/// types), and nothing re-evaluates it: read as current, the last `True`
+/// would say "healthy" over a runner that no longer runs.
+///
+/// `None` when the version is newer, or does not parse (a branch, an unset
+/// field): that proves nothing, and the condition is read.
+fn backup_conditions_predate(json: &Value) -> Option<&str> {
+    let current = json
+        .pointer("/status/currentVersion")
+        .and_then(Value::as_str)?;
+    let version = semver::Version::parse(current.trim_start_matches('v')).ok()?;
+    let since = semver::Version::parse(BACKUP_CONDITIONS_SINCE).ok()?;
+    (version < since).then_some(current)
+}
+
 /// Where a reader whose backup cannot run for lack of room is sent: the
 /// backup guide's troubleshooting entry, the same one `backup status` and
 /// `backup run` print. A test resolves it against the committed page.
@@ -309,7 +333,8 @@ pub(crate) fn backup_retention_lines(json: &Value, now: DateTime<Utc>) -> Vec<St
         .pointer("/spec/backup/enabled")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    if !enabled {
+    // An operator older than the condition: the runs line names it once.
+    if !enabled || backup_conditions_predate(json).is_some() {
         return Vec::new();
     }
     let conditions = json.pointer("/status/conditions").and_then(Value::as_array);
@@ -420,6 +445,16 @@ fn backup_runs_lines(json: &Value, now: DateTime<Utc>) -> Vec<String> {
         .pointer("/status/conditions")
         .and_then(Value::as_array)
         .and_then(|cs| cs.iter().find(|c| c["type"] == "BackupHealthy"));
+    if enabled {
+        if let (Some(version), Some(_)) = (backup_conditions_predate(json), condition) {
+            return vec![cli_core::style::warn(&format!(
+                "Backups: enabled, but this cluster's operator (platform {version}) does not \
+                 report whether they run — `apprafter backup status` shows the last Jobs. The \
+                 backup conditions on the stack were left by a newer release and are not \
+                 current."
+            ))];
+        }
+    }
     let Some(c) = condition else {
         return if enabled {
             vec![cli_core::style::warn(
@@ -1848,6 +1883,130 @@ mod tests {
         );
         off["spec"]["backup"]["enabled"] = json!(false);
         assert!(backup_retention_lines(&off, frozen_now()).is_empty());
+    }
+
+    /// Found by review: after a rollback below the release whose operator
+    /// writes these conditions, the older operator carries them forward
+    /// untouched — it copies `status.conditions` and upserts only its own
+    /// types — so the last `True` stayed on the stack, re-evaluated by
+    /// nothing, and this printed "Backups: healthy" over a runner that no
+    /// longer ran.
+    #[test]
+    fn backup_conditions_left_by_a_newer_operator_are_not_read_as_current() {
+        let mut stack = with_retention(
+            Some(backup_condition(
+                "True",
+                "Succeeded",
+                "the last backup, Job apprafter-backup-29312340, succeeded at 2026-09-23T03:01:02Z",
+            )),
+            Some(retention_condition(
+                "True",
+                "Pruned",
+                "forgot 2 snapshot(s)",
+            )),
+        );
+        stack["status"]["currentVersion"] = json!("0.2.79");
+        let lines = backup_health_lines(&stack, frozen_now());
+        let text = lines.join("\n");
+        assert_eq!(lines.len(), 1, "{text}");
+        assert!(!text.contains("healthy"), "{text}");
+        assert!(!text.contains("Retention: enforced"), "{text}");
+        assert!(text.contains("does not report"), "{text}");
+        assert!(text.contains("platform 0.2.79"), "{text}");
+        assert!(text.contains("not current"), "{text}");
+        assert!(text.contains("`apprafter backup status`"), "{text}");
+        // `backup status` reads the retention verdict through this too, and
+        // falls back to the runner's own record when it is empty.
+        assert!(backup_retention_lines(&stack, frozen_now()).is_empty());
+
+        // From the release that writes them on, they are read as they are.
+        for version in [BACKUP_CONDITIONS_SINCE, "0.2.81", "0.3.0", "v0.2.80"] {
+            stack["status"]["currentVersion"] = json!(version);
+            let lines = backup_health_lines(&stack, frozen_now());
+            assert!(
+                lines[0].starts_with("Backups: healthy"),
+                "{version}: {lines:?}"
+            );
+            assert!(
+                lines[1].starts_with("Retention: enforced"),
+                "{version}: {lines:?}"
+            );
+        }
+        // A version that does not parse proves nothing either way: the
+        // condition is read rather than hidden.
+        for version in [json!("main"), json!(""), Value::Null] {
+            stack["status"]["currentVersion"] = version.clone();
+            let lines = backup_health_lines(&stack, frozen_now());
+            assert!(
+                lines[0].starts_with("Backups: healthy"),
+                "{version}: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_old_release_with_no_condition_and_backups_off_says_the_usual() {
+        let mut off = with_backup(false, None);
+        off["status"]["currentVersion"] = json!("0.2.60");
+        assert_eq!(
+            backup_health_lines(&off, frozen_now()),
+            vec!["Backups: not enabled.".to_string()]
+        );
+        let mut on = with_backup(true, None);
+        on["status"]["currentVersion"] = json!("0.2.60");
+        let text = backup_health_lines(&on, frozen_now()).join("\n");
+        assert!(text.contains("does not report"), "{text}");
+        assert!(!text.contains("not current"), "nothing was left: {text}");
+    }
+
+    /// [`BACKUP_CONDITIONS_SINCE`] names a release the chart's history
+    /// records, and every release before it runs an older operator — which
+    /// is what makes "older than this" mean "cannot have written them".
+    #[test]
+    fn the_first_release_that_reports_backups_is_recorded_and_every_older_one_runs_an_older_operator(
+    ) {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../platform-stack/cue/compatibility.cue");
+        let src =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let mut records: Vec<(semver::Version, semver::Version)> = Vec::new();
+        let mut open: Option<semver::Version> = None;
+        for line in src.lines() {
+            if let Some(v) = line
+                .strip_prefix("compatibility: \"")
+                .and_then(|r| r.split_once("\": {"))
+                .and_then(|(v, _)| semver::Version::parse(v).ok())
+            {
+                open = Some(v);
+            } else if let Some(op) = line
+                .strip_prefix("\toperatorVersion: \"")
+                .and_then(|r| r.split_once('"'))
+                .and_then(|(v, _)| semver::Version::parse(v.trim_start_matches('v')).ok())
+            {
+                if let Some(v) = open.take() {
+                    records.push((v, op));
+                }
+            }
+        }
+        assert!(
+            records.len() > 100,
+            "only {} records parsed out of {} — the record shape changed, and an empty list \
+             would have passed",
+            records.len(),
+            path.display()
+        );
+        let since = semver::Version::parse(BACKUP_CONDITIONS_SINCE).unwrap();
+        let (_, first_op) = records
+            .iter()
+            .find(|(v, _)| *v == since)
+            .unwrap_or_else(|| panic!("no compatibility record for {since}"));
+        for (v, op) in records.iter().filter(|(v, _)| *v < since) {
+            assert!(
+                op < first_op,
+                "platform {v} runs operator {op}, not older than the {first_op} that {since} \
+                 introduced the backup conditions with"
+            );
+        }
     }
 
     #[test]
