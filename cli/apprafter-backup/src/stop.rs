@@ -227,6 +227,30 @@ impl OutcomeClaim {
     pub fn claim(&self) -> bool {
         !self.0.swap(true, Ordering::SeqCst)
     }
+
+    /// Whether the outcome has been claimed, without claiming it.
+    pub fn is_claimed(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+
+    /// `record`, made to write nothing once the outcome is claimed. For the
+    /// check run, which records each step as it ends rather than one outcome
+    /// at the end: a stop claims the outcome before it signals restic, and
+    /// then records the step it stopped, with its reason. What the run would
+    /// record after that is only what the stop did to it (restic's `context
+    /// canceled`, a restic start refused), and written last it replaced the
+    /// reason: on kind, a staging overrun during the prune was recorded as
+    /// `restic forget failed … context canceled`.
+    pub fn unless_claimed<'a>(
+        &'a self,
+        mut record: impl FnMut(serde_json::Value) + 'a,
+    ) -> impl FnMut(serde_json::Value) + 'a {
+        move |data| {
+            if !self.is_claimed() {
+                record(data)
+            }
+        }
+    }
 }
 
 /// `6h`, `90m`, `45s`, `5h59m50s`: a duration as `apprafter backup set
@@ -909,6 +933,30 @@ mod tests {
         let other = claim.clone();
         assert!(claim.claim());
         assert!(!other.claim());
+        assert!(!claim.claim());
+    }
+
+    /// A step the check run records goes through until a stop claims the
+    /// outcome, and none after it: the stop's record of the step it stopped
+    /// is the last word.
+    #[test]
+    fn a_step_recorded_after_the_stop_has_claimed_is_not_written() {
+        let claim = OutcomeClaim::default();
+        let stop = claim.clone();
+        let mut written = Vec::new();
+        {
+            let mut record = claim.unless_claimed(|v| written.push(v));
+            record(serde_json::json!({"lastCheckResult": "passed"}));
+            assert!(!claim.is_claimed(), "recording does not claim");
+            assert!(stop.claim(), "the stop claims first");
+            record(serde_json::json!({"lastPruneResult": "failed",
+                "lastPruneError": "restic forget failed: context canceled"}));
+        }
+        assert_eq!(
+            written,
+            vec![serde_json::json!({"lastCheckResult": "passed"})]
+        );
+        // The run's own claim at its end then fails, as before.
         assert!(!claim.claim());
     }
 

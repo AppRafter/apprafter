@@ -25,6 +25,11 @@
 //! `lastError` and the failure webhook given [`overrun_message`], which names
 //! the limit and what to change. The kubelet's eviction stays as the
 //! backstop.
+//!
+//! The check Job mounts the same volume with the same limit: there it holds
+//! restic's cache and temporary files for the check and the prune after it,
+//! and an overrun is recorded against the step it stopped
+//! ([`check_overrun_message`]).
 
 use std::collections::HashSet;
 use std::os::unix::fs::MetadataExt;
@@ -115,6 +120,22 @@ pub fn overrun_message(used: u64, limit: u64, mode: StagingMode) -> String {
          so the run was stopped before Kubernetes evicts its pod. The volume holds the dumps \
          of the claims being backed up and restic's cache for the run. {way_out}, and check \
          that the node's disk has that much room",
+        humanise_bytes(saturating_i64(used)),
+        humanise_bytes(saturating_i64(limit)),
+    )
+}
+
+/// [`overrun_message`] for the check Job, whose volume holds no dumps:
+/// restic's cache for the check and the prune after it (the repository's
+/// index and its tree packs) and the pack files a prune repacks.
+pub fn check_overrun_message(used: u64, limit: u64) -> String {
+    format!(
+        "the staging volume held {}, more than its limit of {} (spec.backup.stagingSizeLimit), \
+         so the run was stopped before Kubernetes evicts its pod. In the check Job the volume \
+         holds restic's cache for the check and the prune after it, which grows with the \
+         repository's index and trees rather than with its data, and the pack files a prune \
+         rewrites. Raise spec.backup.stagingSizeLimit on the PlatformStack, and check that \
+         the node's disk has that much room",
         humanise_bytes(saturating_i64(used)),
         humanise_bytes(saturating_i64(limit)),
     )
@@ -262,5 +283,22 @@ mod tests {
         assert!(s.contains("largest claim alone does not fit"), "{s}");
         // A sequential run is not told to switch to what it already is.
         assert!(!s.contains("staging-mode sequential"), "{s}");
+    }
+
+    /// The check Job stages no claims: its message is about restic's cache,
+    /// and does not send anyone to a staging mode the check does not have.
+    #[test]
+    fn the_check_jobs_message_names_the_cache_and_the_limit() {
+        let mi = 1024 * 1024;
+        let m = check_overrun_message(320 * mi, 300 * mi);
+        assert!(m.contains("held 320Mi"), "{m}");
+        assert!(m.contains("limit of 300Mi"), "{m}");
+        assert!(m.contains("spec.backup.stagingSizeLimit"), "{m}");
+        assert!(
+            m.contains("restic's cache for the check and the prune"),
+            "{m}"
+        );
+        assert!(!m.contains("staging-mode"), "{m}");
+        assert!(!m.contains("claim"), "{m}");
     }
 }

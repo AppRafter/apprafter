@@ -712,6 +712,12 @@ two seconds and stops the run once it holds more. Each attempt of the Job meets
 the same limit, so the Job fails after its last attempt; the failure webhook
 fires with the same message.
 
+The weekly check Job has a volume of the same size for restic's cache and the
+pack files a prune rewrites, and is stopped the same way. Its message is
+recorded against the step it stopped, and `apprafter backup status` shows it
+under `last check` or `last prune`. The same `spec.backup.stagingSizeLimit`
+raises both.
+
 To fix it, stage one claim at a time, so that only the largest has to fit:
 
 ```sh

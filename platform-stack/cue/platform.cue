@@ -509,9 +509,10 @@ package platformstack
 	// as `APPRAFTER_BACKUP_STAGING_MODE`.
 	stagingMode: "monolithic" | "sequential" | *"monolithic"
 
-	// `emptyDir.sizeLimit` for the staging volume. Overrun is a hard
-	// fail whose error suggests raising this or switching to
-	// `sequential`.
+	// `emptyDir.sizeLimit` for the staging volume of both Jobs: the
+	// backup's dumps, and restic's cache and temporary files in each.
+	// Overrun is a hard fail whose error suggests raising this or
+	// switching to `sequential`.
 	stagingSizeLimit: string | *"10Gi"
 
 	// Retention policy: who prunes, and what is kept. `keep*` are

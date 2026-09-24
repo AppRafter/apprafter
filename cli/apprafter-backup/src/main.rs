@@ -38,7 +38,8 @@
 //!   of the two ever records ([`OutcomeClaim`]).
 //! * the staging volume holding more than its size limit → the run is
 //!   stopped the same way, by the runner itself, and recorded as a `Failure`
-//!   that names the limit ([`apprafter_backup::staging`]), exit **1**.
+//!   that names the limit ([`apprafter_backup::staging`]), exit **1**. The
+//!   check run too.
 //!
 //! # `apprafter-backup check` — the weekly check Job
 //!
@@ -217,31 +218,36 @@ fn run(mode: Mode) -> i32 {
         ),
     }
 
-    if mode == Mode::Check {
-        return check(&k, &r, &cfg, &client, &rt, &phase, &claim);
-    }
-
     // 2c. The staging volume's size limit. The run stages under TMPDIR, which
     //     the chart sets to the staging volume, so that directory is the
     //     volume the limit applies to. Measured here every few seconds: a run
     //     that outgrows it is stopped and recorded with a message that names
     //     the limit, instead of being evicted late and recorded, if at all,
-    //     as stopped by Kubernetes. See `staging`.
+    //     as stopped by Kubernetes. See `staging`. The check Job mounts the
+    //     same volume for restic's cache and temporary files, and is watched
+    //     the same way.
     if let Some(limit) = cfg.staging_limit {
         let ctx = stop_ctx.clone();
         let claim = claim.clone();
         let root = std::env::temp_dir();
-        let mode = cfg.staging_mode;
+        let staging_mode = cfg.staging_mode;
         rt.spawn(async move {
             let used = staging::wait_for_overrun(root, limit, staging::POLL).await;
             if !claim.claim() {
                 // The run is already ending, and records its own outcome.
                 return;
             }
-            let error = staging::overrun_message(used, limit, mode);
+            let error = match mode {
+                Mode::Backup => staging::overrun_message(used, limit, staging_mode),
+                Mode::Check => staging::check_overrun_message(used, limit),
+            };
             let outcome = stop::stop_run_with(&ctx, error, libc::SIGTERM).await;
             std::process::exit(outcome.exit_code());
         });
+    }
+
+    if mode == Mode::Check {
+        return check(&k, &r, &cfg, &client, &rt, &phase, &claim);
     }
 
     // 3. The backup itself, wrapped so ANY error becomes a Failure outcome
@@ -312,11 +318,13 @@ fn check(
     claim: &OutcomeClaim,
 ) -> i32 {
     let plan = CheckPlan::of(cfg);
-    let mut record = |data: serde_json::Value| {
+    // Nothing more once a stop has claimed the outcome: it records the step
+    // it stopped, with its reason (`OutcomeClaim::unless_claimed`).
+    let mut record = claim.unless_claimed(|data: serde_json::Value| {
         if let Err(e) = rt.block_on(write_status_data(client, &data)) {
             eprintln!("warning: status ConfigMap write failed (non-fatal): {e}");
         }
-    };
+    });
     let run = run_check(
         r,
         &plan,

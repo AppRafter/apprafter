@@ -56,13 +56,15 @@
 #      sizes its concurrency by the node's CPU count, and a 32-CPU node took a
 #      first backup to 695 MiB. Both slow restic's progress output to one line
 #      a minute (the runner holds all of restic's output in memory until
-#      restic exits) and give restic a cache directory it can write (HOME is
-#      / for the image's user). The backup's runner also stages under the
-#      staging volume (TMPDIR is its mountPath, so stagingSizeLimit bounds the
-#      dumps) and keeps restic's cache there for the run.
-#   7. the staging volume's sizeLimit and the limit the runner checks the
-#      volume against (APPRAFTER_BACKUP_STAGING_SIZE_LIMIT) are one value,
-#      defaulted and set.
+#      restic exits, and copies what check and prune print into the log) and
+#      give restic a cache directory it can write (HOME is / for the image's
+#      user). Both keep what restic writes to disk on the staging volume:
+#      TMPDIR is its mountPath and restic's cache is under it, so
+#      stagingSizeLimit bounds the backup's dumps and both Jobs' cache and
+#      temporary files, which in /tmp no limit counted.
+#   7. in both CronJobs, the staging volume's sizeLimit and the limit the
+#      runner checks the volume against (APPRAFTER_BACKUP_STAGING_SIZE_LIMIT)
+#      are one value, defaulted and set.
 #   8. retention (WI-389): both CronJobs get APPRAFTER_BACKUP_ENFORCE, `check`
 #      when nothing sets it (the check Job prunes after a passing check) and
 #      an explicit `operator` kept as it is, with the keep counts on both;
@@ -294,38 +296,40 @@ assert_env() {
     echo "  ok: $label — $name env: $*"
 }
 
-# `$1` label, `$2` rendered manifests: the runner stages, and keeps restic's
-# cache, on the staging volume, the volume the size limit applies to.
+# `$1` label, `$2` rendered manifests, `$3` CronJob name: its runner writes
+# to disk only on the staging volume, the volume the size limit applies to.
+# TMPDIR is where the backup stages its dumps and where restic makes its
+# temporary pack files (a prune's too); the cache is restic's own.
 assert_staging_on_the_volume() {
-    local label="$1" rendered="$2" mount tmpdir cache
-    mount="$(container_value "$rendered" apprafter-backup '.volumeMounts[] | select(.name == "staging") | .mountPath')"
-    [[ -n "$mount" ]] || fail "$label: the runner does not mount the staging volume"
-    tmpdir="$(env_value "$rendered" apprafter-backup TMPDIR)"
+    local label="$1" rendered="$2" name="$3" mount tmpdir cache
+    mount="$(container_value "$rendered" "$name" '.volumeMounts[] | select(.name == "staging") | .mountPath')"
+    [[ -n "$mount" ]] || fail "$label: the $name runner does not mount the staging volume"
+    tmpdir="$(env_value "$rendered" "$name" TMPDIR)"
     [[ "$tmpdir" == "$mount" ]] \
-        || fail "$label: runner TMPDIR is '${tmpdir:-absent}', but the staging volume is mounted at '$mount'; the runner stages under TMPDIR, so the dumps would land outside the volume stagingSizeLimit bounds"
-    cache="$(env_value "$rendered" apprafter-backup RESTIC_CACHE_DIR)"
+        || fail "$label: $name runner TMPDIR is '${tmpdir:-absent}', but the staging volume is mounted at '$mount'; what the runner and restic write under TMPDIR would land outside the volume stagingSizeLimit bounds"
+    cache="$(env_value "$rendered" "$name" RESTIC_CACHE_DIR)"
     [[ "$cache" == "$mount"/* ]] \
-        || fail "$label: runner RESTIC_CACHE_DIR is '${cache:-absent}', not under the staging volume '$mount'"
-    echo "  ok: $label — runner stages under $mount (TMPDIR) and keeps restic's cache at $cache"
+        || fail "$label: $name runner RESTIC_CACHE_DIR is '${cache:-absent}', not under the staging volume '$mount'"
+    echo "  ok: $label — $name writes under $mount (TMPDIR) and keeps restic's cache at $cache"
 }
 
-# `$1` label, `$2` rendered manifests, `$3` expected size: the staging
-# volume's sizeLimit and the limit the runner checks the volume against are
-# the same value. The kubelet evicts on the first, from a usage figure up to a
-# minute old and with two seconds' notice; the runner stops the run on the
-# second and says why. Two different numbers would leave one of them never
-# reached.
+# `$1` label, `$2` rendered manifests, `$3` CronJob name, `$4` expected size:
+# the staging volume's sizeLimit and the limit the runner checks the volume
+# against are the same value. The kubelet evicts on the first, from a usage
+# figure up to a minute old and with two seconds' notice; the runner stops
+# the run on the second and says why. Two different numbers would leave one
+# of them never reached.
 assert_staging_limit() {
-    local label="$1" rendered="$2" want="$3" volume env
-    volume="$("${YQ[@]}" -r 'select(.kind == "CronJob" and .metadata.name == "apprafter-backup")
+    local label="$1" rendered="$2" name="$3" want="$4" volume env
+    volume="$(NAME="$name" "${YQ[@]}" -r 'select(.kind == "CronJob" and .metadata.name == strenv(NAME))
         | .spec.jobTemplate.spec.template.spec.volumes[] | select(.name == "staging")
         | .emptyDir.sizeLimit // ""' "$rendered")"
-    env="$(env_value "$rendered" apprafter-backup APPRAFTER_BACKUP_STAGING_SIZE_LIMIT)"
+    env="$(env_value "$rendered" "$name" APPRAFTER_BACKUP_STAGING_SIZE_LIMIT)"
     [[ "$volume" == "$want" ]] \
-        || fail "$label: the staging volume's sizeLimit is '${volume:-absent}', want '$want'"
+        || fail "$label: the $name staging volume's sizeLimit is '${volume:-absent}', want '$want'"
     [[ "$env" == "$want" ]] \
-        || fail "$label: runner env APPRAFTER_BACKUP_STAGING_SIZE_LIMIT is '${env:-absent}', but the staging volume's sizeLimit is '$volume'"
-    echo "  ok: $label — staging sizeLimit and the runner's own limit are both $want"
+        || fail "$label: $name runner env APPRAFTER_BACKUP_STAGING_SIZE_LIMIT is '${env:-absent}', but the staging volume's sizeLimit is '$volume'"
+    echo "  ok: $label — $name: staging sizeLimit and the runner's own limit are both $want"
 }
 
 echo "==> backup CronJob resources and restic settings, chart $version"
@@ -339,11 +343,15 @@ for rendered in "$workdir/defaults.yaml" "$workdir/set.yaml"; do
         GOMAXPROCS=2 GOMEMLIMIT=96MiB RESTIC_PROGRESS_FPS=0.0167
     assert_env "$label" "$rendered" apprafter-backup-check \
         GOMAXPROCS=2 GOMEMLIMIT=96MiB RESTIC_PROGRESS_FPS=0.0167 \
-        RESTIC_CACHE_DIR=/tmp/restic-cache
-    assert_staging_on_the_volume "$label" "$rendered"
+        TMPDIR=/staging RESTIC_CACHE_DIR=/staging/restic-cache
+    for name in apprafter-backup apprafter-backup-check; do
+        assert_staging_on_the_volume "$label" "$rendered" "$name"
+    done
 done
-assert_staging_limit "defaults" "$workdir/defaults.yaml" 10Gi
-assert_staging_limit "knobs set" "$workdir/set.yaml" 3Gi
+for name in apprafter-backup apprafter-backup-check; do
+    assert_staging_limit "defaults" "$workdir/defaults.yaml" "$name" 10Gi
+    assert_staging_limit "knobs set" "$workdir/set.yaml" "$name" 3Gi
+done
 
 echo "==> retention and the check Job's settings (WI-389), chart $version"
 
@@ -443,5 +451,6 @@ done <<<"$names"
 echo "  ok: the runner reads each of the $count APPRAFTER_* variables the CronJobs render"
 
 echo "PASS: both backup CronJobs carry a Job deadline, stop cleanly at it, and"
-echo "      carry the measured resources and restic settings; the check Job runs"
-echo "      the runner with the retention mode and depth it is configured with."
+echo "      carry the measured resources and restic settings; both keep what"
+echo "      restic writes on the limited staging volume; the check Job runs the"
+echo "      runner with the retention mode and depth it is configured with."

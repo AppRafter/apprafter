@@ -407,7 +407,8 @@ _backupTemplate: """
 	{{- $deadline := $b.activeDeadlineSeconds | default 21600 | int }}
 	{{- /* ONE value for the staging volume's size, read once: the emptyDir's
 	     sizeLimit, which the kubelet evicts on, and the runner's
-	     APPRAFTER_BACKUP_STAGING_SIZE_LIMIT, which it stops a run on first. */}}
+	     APPRAFTER_BACKUP_STAGING_SIZE_LIMIT, which it stops a run on first.
+	     Both Jobs mount the volume, and both read this one value. */}}
 	{{- $stagingLimit := $b.stagingSizeLimit | default "10Gi" }}
 	---
 	apiVersion: v1
@@ -824,20 +825,37 @@ _backupTemplate: """
 	            # is once a minute.
 	            - name: RESTIC_PROGRESS_FPS
 	              value: "0.0167"
+	            # What restic writes to disk goes on the staging volume below,
+	            # with the backup's limit: its cache, and the pack files a prune
+	            # rewrites, which restic makes under TMPDIR. Both used to sit in
+	            # /tmp in the container's writable layer, where no limit counted
+	            # them and a failed pod kept them. The runner measures the volume
+	            # as it does the backup's, and stops a run that outgrows it.
+	            - name: TMPDIR
+	              value: /staging
+	            - name: APPRAFTER_BACKUP_STAGING_SIZE_LIMIT
+	              value: {{ $stagingLimit | quote }}
 	            # Without it the unlock looked for $HOME/.cache, HOME is / for
 	            # this user, and every check log opened with `unable to open
 	            # cache: mkdir /.cache: permission denied`. The check itself
-	            # still uses a temporary cache of its own, now made inside this
-	            # directory rather than beside it in /tmp, and removes it when it
-	            # ends; the prune and the figures after it use this one.
+	            # uses a temporary cache of its own, made inside this directory,
+	            # and removes it when it ends; the prune and the figures after it
+	            # use this one, which goes with the pod.
 	            - name: RESTIC_CACHE_DIR
-	              value: /tmp/restic-cache
+	              value: /staging/restic-cache
 	            resources:
 	              requests:
 	                cpu: 100m
 	                memory: 128Mi
 	              limits:
 	                memory: 384Mi
+	            volumeMounts:
+	            - name: staging
+	              mountPath: /staging
+	          volumes:
+	          - name: staging
+	            emptyDir:
+	              sizeLimit: {{ $stagingLimit | quote }}
 	{{- end }}
 	{{- if .Capabilities.APIVersions.Has "cilium.io/v2" }}
 	---
