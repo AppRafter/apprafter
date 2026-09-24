@@ -633,6 +633,16 @@ holds](../how-it-works/node-reservations-and-swap.md#what-a-4-gb-node-holds)).
 The scheduled backup is the same Job with the same requests, so it cannot
 start either.
 
+The runner's pods also have a priority below every other pod's (the
+`apprafter-backup-runner` priority class), so a full node always gives room to
+something else first. Any other pod waiting for room is placed before a waiting
+runner, and a pod that needs room a running backup holds preempts it. The
+runner then records `run was stopped by Kubernetes (SIGTERM) … its pod was
+deleted or evicted` as its `lastError`, and the Job's next pod waits for room
+like any other. On a node this full, an application rolling out can therefore
+stop a backup; the backup runs again once the rollout is done and the room is
+back.
+
 Check how much room is left:
 
 ```sh
@@ -662,6 +672,13 @@ the scheduler's text says what keeps the pod off.
     ```sh
     kubectl -n apprafter-system get pods -l apprafter.io/backup-runner=true
     kubectl -n apprafter-system get events --field-selector reason=FailedScheduling
+    ```
+
+    A runner that another pod preempted has a `Preempted` event naming that
+    pod:
+
+    ```sh
+    kubectl -n apprafter-system get events --field-selector reason=Preempted
     ```
 
 To fix it, free enough requested memory for the runner's 128Mi, or move to a
@@ -703,7 +720,10 @@ platform chart older than 0.2.80 sets no deadline on the backup Job, so there
 a Job stuck this way waits, and holds the schedule, until the node has room or
 the Job is deleted. For such a Job `apprafter backup status` says it has no
 deadline and prints the command that deletes it; once it is gone, the next
-scheduled backup starts.
+scheduled backup starts. Delete it before upgrading such a cluster to 0.2.80
+or later: a pod keeps the priority it was created with, so a runner from the
+older chart competes with the platform's pods as an equal, and can take the
+room a platform pod restarting during the upgrade has just given back.
 
 ### The staging volume outgrew its limit {#staging-over-limit}
 

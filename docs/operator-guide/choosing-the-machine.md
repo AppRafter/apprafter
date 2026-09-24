@@ -76,6 +76,11 @@ give in its `SCHEDULABLE` column. [The backup runner's pod cannot be
 scheduled](backup-restore.md#runner-unschedulable) is the recipe for that
 state.
 
+When room is short, the backup is what gives way, never the platform or your
+applications: every other pod waiting for room is placed before it, and a pod
+that needs the room a running backup holds stops that backup, which runs again
+once there is room.
+
 A further backend instance does not fit on the node at all, whether or not a
 backup is running. An ephemeral `needs.redis` class runs a second Dragonfly
 instance and `needs.jetstream` a NATS server, and each asks for more memory

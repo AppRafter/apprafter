@@ -554,6 +554,14 @@ placed. In each of those the runner's record is not updated and the failure
 webhook does not fire, so `lastSuccess` goes on showing the last run that got
 through.
 
+The runner's pods have a priority below every other pod's, so on a node short
+of room they wait behind any other pod, and a pod that needs the room of a
+running runner preempts it. A preempted runner is stopped the way its deadline
+stops it: it records the stop in `lastError`, deletes its helper pods and has
+restic remove its lock, and the Job tries again once there is room ([the
+backup runner's pod cannot be
+scheduled](../operator-guide/backup-restore.md#runner-unschedulable)).
+
 So the operator also watches the backup from outside the runner. It reads the
 `apprafter-backup` and `apprafter-backup-check` CronJobs, their Jobs and the
 runner pods in `apprafter-system`, and keeps its verdict in the `BackupHealthy`

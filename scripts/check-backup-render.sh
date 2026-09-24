@@ -85,6 +85,18 @@
 #      through a podFailurePolicy FailJob rule for their own container:
 #      another attempt would stage into the same limit, and without the rule
 #      the Job made 7 of them.
+#  11. both CronJobs' pods name the runner's PriorityClass, and the render
+#      carries that class (WI-386): below the default priority 0, so any other
+#      pod is placed before a waiting runner and may preempt a running one
+#      that holds the room it needs; `preemptionPolicy: Never`, so a runner
+#      preempts nothing; not the cluster default; no lower than -10, the
+#      cluster autoscaler's default expendable cutoff, below which a waiting
+#      runner would never make it add a node; and in an earlier sync wave than
+#      either CronJob, since a pod that names a class that does not exist yet
+#      is refused. A render with backup off carries no such class. Before it,
+#      every runner had priority 0 like the platform's own pods, and on a
+#      nearly full node a waiting runner took the room a restarting Argo CD
+#      controller had just freed.
 #
 # Usage: bash scripts/check-backup-render.sh
 # Exit 0 = every assertion held.
@@ -387,6 +399,64 @@ for name in apprafter-backup apprafter-backup-check; do
     assert_staging_limit "knobs set" "$workdir/set.yaml" "$name" 3Gi
 done
 
+echo "==> the runner's scheduling priority (WI-386), chart $version"
+
+# 11. The runner's PriorityClass.
+RUNNER_PRIORITY_CLASS=apprafter-backup-runner
+
+# `$1` rendered manifests, `$2` a yq path: that value of the runner's class.
+priority_class() {
+    PC="$RUNNER_PRIORITY_CLASS" "${YQ[@]}" -r "select(.kind == \"PriorityClass\" and .metadata.name == strenv(PC))$2" "$1"
+}
+
+# `$1` label, `$2` rendered manifests: both runners' pods name the class, and
+# the render carries exactly one such class, with the properties item 11 of
+# the header lists.
+assert_runner_priority() {
+    local label="$1" rendered="$2" name got count value policy default wave cronwave
+    count="$(priority_class "$rendered" ' | .metadata.name' | grep -c . || true)"
+    [[ "$count" == 1 ]] \
+        || fail "$label: the render carries $count PriorityClass '$RUNNER_PRIORITY_CLASS', want exactly 1: the runners' pods name it, and a pod naming a class that does not exist is refused at creation"
+    value="$(priority_class "$rendered" ' | .value')"
+    [[ "$value" =~ ^-?[0-9]+$ ]] \
+        || fail "$label: PriorityClass '$RUNNER_PRIORITY_CLASS' value is '${value:-absent}', not an integer"
+    (( value < 0 )) \
+        || fail "$label: PriorityClass '$RUNNER_PRIORITY_CLASS' value is $value; it must be below 0, the priority of every platform and application pod, or a waiting runner competes with them as an equal and the oldest waiting pod wins the room"
+    (( value >= -10 )) \
+        || fail "$label: PriorityClass '$RUNNER_PRIORITY_CLASS' value is $value; below -10 the cluster autoscaler treats a pod as expendable and adds no node for a runner that waits for room"
+    policy="$(priority_class "$rendered" ' | .preemptionPolicy // ""')"
+    [[ "$policy" == Never ]] \
+        || fail "$label: PriorityClass '$RUNNER_PRIORITY_CLASS' preemptionPolicy is '${policy:-absent}', want Never: a backup runner must never preempt a pod"
+    default="$(priority_class "$rendered" ' | .globalDefault // false')"
+    [[ "$default" == false ]] \
+        || fail "$label: PriorityClass '$RUNNER_PRIORITY_CLASS' is globalDefault; every pod that names no class would take the runner's priority"
+    wave="$(priority_class "$rendered" ' | .metadata.annotations["argocd.argoproj.io/sync-wave"] // "0"')"
+    [[ "$wave" =~ ^-?[0-9]+$ ]] \
+        || fail "$label: PriorityClass '$RUNNER_PRIORITY_CLASS' sync-wave is '$wave', not an integer"
+    for name in apprafter-backup apprafter-backup-check; do
+        got="$(NAME="$name" "${YQ[@]}" -r 'select(.kind == "CronJob" and .metadata.name == strenv(NAME))
+            | .spec.jobTemplate.spec.template.spec.priorityClassName // ""' "$rendered")"
+        [[ "$got" == "$RUNNER_PRIORITY_CLASS" ]] \
+            || fail "$label: CronJob '$name' pods name priorityClassName '${got:-absent}', want '$RUNNER_PRIORITY_CLASS'; without it the runner has priority 0 and takes room a platform pod is waiting for"
+        cronwave="$(NAME="$name" "${YQ[@]}" -r 'select(.kind == "CronJob" and .metadata.name == strenv(NAME))
+            | .metadata.annotations["argocd.argoproj.io/sync-wave"] // "0"' "$rendered")"
+        (( wave < cronwave )) \
+            || fail "$label: PriorityClass '$RUNNER_PRIORITY_CLASS' is in sync wave $wave and CronJob '$name' in $cronwave; the class must come first, or a Job started in between has its pod refused"
+    done
+    echo "  ok: $label — both runners' pods name $RUNNER_PRIORITY_CLASS: value $value, preemptionPolicy Never, not the default, wave $wave before the CronJobs"
+}
+
+for rendered in "$workdir/defaults.yaml" "$workdir/set.yaml"; do
+    label="defaults"
+    [[ "$rendered" == "$workdir/set.yaml" ]] && label="knobs set"
+    assert_runner_priority "$label" "$rendered"
+done
+helm template platform "$chart" >"$workdir/backup-off.yaml"
+off="$(priority_class "$workdir/backup-off.yaml" ' | .metadata.name' | grep -c . || true)"
+[[ "$off" == 0 ]] \
+    || fail "backup off: the render carries PriorityClass '$RUNNER_PRIORITY_CLASS'; with backup off the chart emits no backup resource"
+echo "  ok: backup off — no $RUNNER_PRIORITY_CLASS in the render"
+
 echo "==> retention and the check Job's settings (WI-389), chart $version"
 
 # 8. Retention. Unset, both Jobs are told `check`: the check Job prunes after
@@ -487,5 +557,6 @@ echo "  ok: the runner reads each of the $count APPRAFTER_* variables the CronJo
 echo "PASS: both backup CronJobs carry a Job deadline, stop cleanly at it, and"
 echo "      carry the measured resources and restic settings; both keep what"
 echo "      restic writes on the limited staging volume and fail at once when it"
-echo "      overruns; the check Job runs the runner with the retention mode and"
-echo "      depth it is configured with."
+echo "      overruns; both runners' pods yield to every other pod; the check Job"
+echo "      runs the runner with the retention mode and depth it is configured"
+echo "      with."

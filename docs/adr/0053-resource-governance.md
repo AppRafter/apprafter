@@ -17,8 +17,10 @@ end. The rest of the decision stands.
 
 **Amended 2026-09-24** — the runner's memory was measured again against a real
 bucket, where it was higher than against the local store of the first
-measurement, and restic now uploads in smaller pack files; see [the
-amendment](#amendment-the-backup-runner-in-the-tier-1-budget-2026-09-23).
+measurement, and restic now uploads in smaller pack files; and the runner's
+pods get a PriorityClass below the default, so they give way to every other
+pod. Decision 2 still holds for what it decided; see [the second
+amendment](#amendment-the-backup-runner-gives-way-2026-09-24).
 
 ADR for subphase 2.16d (`plan.md` §2.16d). Records the resource-governance
 model — pod QoS strategy, node reservations, and what is deferred — since
@@ -101,6 +103,12 @@ killer selects victims by `oom_score_adj`, which the kubelet derives from
 process the kernel kills under live memory pressure. Guaranteed QoS already
 gives the backends the lowest `oom_score_adj`; a PriorityClass would add a
 knob that does not address the incident.
+
+> **Amended 2026-09-24.** The platform now has one PriorityClass: the backup
+> runner's, *below* the default. It is about the scheduling order, which is what
+> this section says priority governs; it protects no backend, and the OOM
+> killer's choice stays QoS-derived. See [the
+> amendment](#amendment-the-backup-runner-gives-way-2026-09-24).
 
 ### 3. Node reservations (kube/system-reserved, eviction-hard, OOMScoreAdjust)
 
@@ -298,7 +306,8 @@ runner, no larger minimum machine. Instead:
    measured. The limit is 1.9 times the largest run measured, and without the
    memory settings a backup into that repository peaked at 280 MiB and passed
    under it. A run above its request uses memory no other pod was promised,
-   and under node memory pressure it is among the first the kubelet evicts.
+   and under node memory pressure it is the first the kubelet evicts (see the
+   [second amendment](#amendment-the-backup-runner-gives-way-2026-09-24)).
 
    The same measurement found the staging volume unused: the runner staged in
    the container's writable layer, where `stagingSizeLimit` bounded nothing.
@@ -332,6 +341,77 @@ scheduled](../operator-guide/backup-restore.md#runner-unschedulable).
 The numbers the chart ships are asserted by `scripts/check-backup-render.sh`,
 so a change to them is a change to this budget.
 
+## Amendment — the backup runner gives way (2026-09-24) {#amendment-the-backup-runner-gives-way-2026-09-24}
+
+A test upgrade of a ~4GB cluster from platform 0.2.79 to 0.2.80 found the
+runner in the way of the platform itself. A runner that had waited for room
+since before the upgrade was placed the moment Argo CD stopped its application
+controller for a rollout, in the room that pod had just given back, and the
+new application controller then waited for the whole backup. Only the pods in
+`kube-system` had a priority; the runner and every AppRafter, Argo CD, backend
+and application pod had the default, 0. Among pods of one priority the
+scheduler places the one that has waited longest, and a pod may preempt only
+pods of a *lower* priority, so the application controller had no way past the
+runner.
+
+**Decision.** The platform chart renders one PriorityClass with the backup
+resources, `apprafter-backup-runner`: value **-1**, `preemptionPolicy: Never`,
+not the global default. The pods of the backup and check Jobs name it, and so
+do those of `apprafter backup run`, which copies the backup's Job template.
+
+- **Any other pod is placed before a waiting runner.** Of two pods waiting for
+  the same room, the one with the higher priority is placed first.
+- **A pod that needs the room of a running runner preempts it.** The scheduler
+  deletes the runner's pod with its 90-second grace period; the runner records
+  the failure as it does at its deadline (`run was stopped by Kubernetes
+  (SIGTERM)`), deletes its helper pods and passes the signal on to restic,
+  which removes its lock; and the Job retries it, the retry waiting for room
+  like any runner. The preempted attempt counts against the Job's backoff
+  limit, and the Job's deadline still bounds the whole run.
+- **A runner never preempts anything** (`Never`). Nothing is below it.
+- **Under node memory pressure** the kubelet evicts the pods that use more than
+  they request, lowest priority first, so a runner above its request goes
+  before any other pod above its own. The kernel's OOM killer still chooses by
+  QoS class (Decision 2).
+
+Measured on kind with the rendered objects and the real runner image, on a
+node left 64Mi short of the runner's request:
+
+| Sequence | Runner at priority 0, as before | Runner at -1 |
+| --- | --- | --- |
+| A runner waits; a platform pod created 20 seconds later waits too; room for one of them appears | the runner is placed, and the platform pod waits for the whole run (`No preemption victims found for incoming pod`) | the platform pod is placed; the runner goes on waiting |
+| A runner waits alone; room appears and it is placed; then a platform pod that needs that room is created (the test upgrade's sequence) | the platform pod waits for the whole run | the runner is preempted and the platform pod placed within a second; the runner recorded the stop; the Job's next pod waits for room |
+
+**Why -1 and not lower.** The Kubernetes cluster autoscaler treats a pod below
+-10 (its default `expendable-pods-priority-cutoff`) as expendable and adds no
+node for it. On a tier that scales, a runner waiting for room should still get
+a node. Every value below 0 gives the same order against the platform's pods.
+
+**Why the runner, and not a class above the default for the platform.** A class
+for the platform would have to be given to every component, and it would let
+platform pods preempt applications. The runner is the one pod that can wait:
+a backup a few minutes late loses nothing, and one stopped and retried loses
+only its time.
+
+**The helper pods keep the default.** The runner's helper pods (the
+`pg_dump`, volume and NATS pods in the application namespaces) request no
+memory. They never compete for room, removing one frees none, so the scheduler
+would not choose one to preempt, and as BestEffort pods they are already the
+first the kernel kills. The CLI also creates helper pods for a restore, on
+clusters where backup may be off and the class does not exist; a pod that names
+a missing class is refused.
+
+**Rollout.** The class is in sync wave -30, before anything that can start a
+runner, since a pod naming a class that does not exist yet is refused at
+creation. A class's value and preemption policy cannot be changed in place: a
+different value needs a new name. Priority is resolved when a pod is created,
+so a runner pod left from 0.2.79 keeps priority 0; the 0.2.80 compatibility
+note tells a cluster whose runner is stuck `Pending` to delete that Job before
+it upgrades.
+
+`scripts/check-backup-render.sh` asserts the class, its properties and that both
+Jobs' pods name it.
+
 ## Owner
 
 Andrey Ryahovskiy.
@@ -348,6 +428,8 @@ Andrey Ryahovskiy.
   budget).
 - If the supported Tier-1 minimum node changes: re-run the baseline walk and
   re-check the D2 budget-close.
+- If the platform's own pods ever get a PriorityClass: keep the backup
+  runner's below every one of them.
 - If restic moves a minor version, or a repository's index grows past the
   1.5 million blobs it was measured at: re-measure the backup runner's peak.
   Its request and limit are sized from restic 0.18.1, whose memory grows with

@@ -345,6 +345,7 @@ _gatewayTemplate: """
 
 // `_backupTemplate` — emits the opt-in off-site scheduled-backup
 // component (2.6d-4): a ServiceAccount + scoped ClusterRole/-Binding, a
+// PriorityClass below the default for both Jobs' pods (WI-386), a
 // nightly backup CronJob, a weekly check CronJob (`restic check`, then
 // the prune under `retention.enforce: check`), and a
 // CiliumNetworkPolicy pinning the runner pods' egress. The WHOLE block
@@ -390,6 +391,7 @@ _backupTemplate: """
 	     Rendered by `cue cmd render`. Do not edit.
 	     Off-site scheduled backup (2.6d-4): opt-in, default-off. Emitted only when
 	     .Values.backup.enabled. ServiceAccount + scoped ClusterRole/-Binding, a
+	     PriorityClass below the default that both Jobs' pods name, a
 	     nightly backup CronJob and a weekly check CronJob (both the runner
 	     binary; the check also prunes under retention.enforce: check), and a
 	     CiliumNetworkPolicy fixing the runner pods' egress (DNS +
@@ -502,6 +504,38 @@ _backupTemplate: """
 	  name: apprafter-backup
 	  namespace: apprafter-system
 	---
+	# The runner's scheduling priority (WI-386), below every other pod's. Every
+	# pod outside kube-system has the default priority 0, and among pods of one
+	# priority the scheduler places the one that has waited longest first. On a
+	# nearly full node a runner that waited for room took the room a restarting
+	# Argo CD application controller had just freed, and that platform pod waited
+	# for the whole backup. Below the default, any other pod is placed before a
+	# waiting runner, and one that needs a running runner's room preempts it: the
+	# runner records the failure as it does at its deadline, deletes its helper
+	# pods and passes the signal on to restic, which removes its lock, and the Job
+	# retries it once there is room. `Never`: a runner never preempts a pod
+	# itself. -1 and not lower: the Kubernetes cluster autoscaler adds no node for
+	# a pod below -10 (its default expendable-pods-priority-cutoff), and on a tier
+	# that scales, a runner waiting for room should still get a node. Both Jobs'
+	# pods name it, and so does a `backup run` Job, which copies the backup's
+	# jobTemplate. Wave -30, the namespaces' wave: a pod naming a class that does
+	# not exist yet is refused at creation, so the class is in place before
+	# anything that can start a runner. `value` and `preemptionPolicy` cannot be
+	# changed on an existing class: a different value needs a different name.
+	apiVersion: scheduling.k8s.io/v1
+	kind: PriorityClass
+	metadata:
+	  name: apprafter-backup-runner
+	  annotations:
+	    argocd.argoproj.io/sync-wave: "-30"
+	  labels:
+	    apprafter.io/managed-by: apprafter
+	    apprafter.io/source: platform-stack
+	value: -1
+	preemptionPolicy: Never
+	globalDefault: false
+	description: "AppRafter's off-site backup runner: placed after every pod of the default priority, preempted by one that needs its room, never preempting."
+	---
 	apiVersion: batch/v1
 	kind: CronJob
 	metadata:
@@ -549,6 +583,8 @@ _backupTemplate: """
 	            apprafter.io/backup-runner: "true"
 	        spec:
 	          serviceAccountName: apprafter-backup
+	          # Below every other pod: see the PriorityClass above.
+	          priorityClassName: apprafter-backup-runner
 	          restartPolicy: Never
 	          # At the deadline Kubernetes sends the runner SIGTERM, and the
 	          # runner records the failure (lastFailure, the failure webhook)
@@ -768,6 +804,9 @@ _backupTemplate: """
 	            apprafter.io/backup-runner: "true"
 	        spec:
 	          serviceAccountName: apprafter-backup
+	          # The backup runner's priority, for the same reason: a check waits
+	          # behind any other pod, and yields its room to one that needs it.
+	          priorityClassName: apprafter-backup-runner
 	          restartPolicy: Never
 	          # The runner records a check it is stopped in (lastCheck,
 	          # lastCheckError) or the prune after it, and the failure webhook,
