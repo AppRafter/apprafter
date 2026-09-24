@@ -442,9 +442,11 @@ pub(crate) fn status_outcome(state: &JobPod) -> Option<String> {
 /// scheduled, or `None` for any other state.
 ///
 /// A Job the CronJob started holds the schedule while it waits. The CronJob
-/// is `concurrencyPolicy: Forbid`, so no later scheduled backup starts until
-/// this one runs or its deadline stops it. A chart that sets no deadline
-/// holds the schedule until the Job is deleted. A manual Job has no owner and
+/// is `concurrencyPolicy: Forbid`, so no later scheduled run starts until
+/// this one runs or its deadline stops it. A Job with no deadline — every Job
+/// of a chart before 0.2.80 — holds the schedule until it is deleted, and
+/// that line says so and gives the command ([`deadline_of`]); it used to
+/// promise a deadline the Job did not have. A manual Job has no owner and
 /// holds nothing. Only the first kind gets that line.
 ///
 /// What it says depends on the scheduler's reason ([`Unplaced`]): only a lack
@@ -453,13 +455,14 @@ pub(crate) fn status_hint(job: &Value, state: &JobPod) -> Option<String> {
     let JobPod::Unschedulable { message, .. } = state else {
         return None;
     };
-    let scheduled = job
+    let scheduled_by = job
         .pointer("/metadata/ownerReferences")
         .and_then(Value::as_array)
-        .is_some_and(|refs| {
+        .and_then(|refs| {
             refs.iter()
-                .any(|r| r.get("kind").and_then(Value::as_str) == Some("CronJob"))
-        });
+                .find(|r| r.get("kind").and_then(Value::as_str) == Some("CronJob"))
+        })
+        .map(|r| r.get("name").and_then(Value::as_str).unwrap_or(""));
     let mut out = match unplaced(message) {
         Unplaced::NoRoom => {
             let mut room = match runner_requests(job) {
@@ -482,16 +485,49 @@ pub(crate) fn status_hint(job: &Value, state: &JobPod) -> Option<String> {
                             the pod until they change.\n"
             .to_string(),
     };
-    if scheduled {
-        out.push_str(
-            "    Until this Job runs or its deadline stops it, the schedule starts no other \
-             backup.\n",
-        );
+    if let Some(cronjob) = scheduled_by {
+        let what = if cronjob == super::CHECK_CRONJOB_NAME {
+            "check"
+        } else {
+            "backup"
+        };
+        match deadline_of(job) {
+            Some(_) => out.push_str(&format!(
+                "    Until this Job runs or its deadline stops it, the schedule starts no other \
+                 {what}.\n"
+            )),
+            None => out.push_str(&format!(
+                "    This Job has no deadline (activeDeadlineSeconds), so nothing stops it: until \
+                 it runs or is deleted, the schedule starts no other {what}. To clear it:\n      \
+                 {}\n",
+                delete_command(
+                    job.pointer("/metadata/namespace")
+                        .and_then(Value::as_str)
+                        .unwrap_or(super::PLATFORMSTACK_NAMESPACE),
+                    job.pointer("/metadata/name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("<job>")
+                )
+            )),
+        }
     }
     out.push_str(&format!(
         "    What to check and change: {RUNNER_UNSCHEDULABLE_DOC}\n"
     ));
     Some(out)
+}
+
+/// The command that deletes a Job, as every hint here spells it — so a
+/// report can tell whether a hint it prints already gave it.
+pub(crate) fn delete_command(namespace: &str, name: &str) -> String {
+    format!("kubectl -n {namespace} delete job {name}")
+}
+
+/// A Job's `spec.activeDeadlineSeconds`, or `None` when it has none — as no
+/// Job of a chart before 0.2.80 has. Pure.
+pub(crate) fn deadline_of(job: &Value) -> Option<u64> {
+    job.pointer("/spec/activeDeadlineSeconds")
+        .and_then(Value::as_u64)
 }
 
 /// A progress line for `backup run` while it waits: what the pod is doing,
@@ -1384,6 +1420,41 @@ mod tests {
             status_hint(&scheduled, &JobPod::NotStarted { reason: None }),
             None
         );
+    }
+
+    /// FIRES (live walk): a scheduled Job from a chart that set no
+    /// `activeDeadlineSeconds` (0.2.79 and earlier) was told "Until this Job
+    /// runs or its deadline stops it" — it has no deadline, nothing stops
+    /// it, and it holds the schedule until someone deletes it. Say so, and
+    /// give the command.
+    #[test]
+    fn a_scheduled_job_with_no_deadline_is_said_to_wait_until_deleted() {
+        let mut stuck = job();
+        stuck["metadata"]["name"] = json!("apprafter-backup-29312345");
+        stuck["metadata"]["namespace"] = json!("apprafter-system");
+        stuck["metadata"]["ownerReferences"] =
+            json!([{"kind": "CronJob", "name": "apprafter-backup", "uid": "cj"}]);
+        let h = status_hint(&stuck, &unsched("a")).unwrap();
+        assert!(!h.contains("its deadline stops it"), "{h}");
+        assert!(h.contains("no deadline"), "{h}");
+        assert!(h.contains("until it runs or is deleted"), "{h}");
+        assert!(h.contains("schedule starts no other backup"), "{h}");
+        assert!(
+            h.contains("kubectl -n apprafter-system delete job apprafter-backup-29312345"),
+            "{h}"
+        );
+
+        // DOES NOT FIRE: with a deadline, the deadline is what ends it.
+        stuck["spec"] = json!({"activeDeadlineSeconds": 21600});
+        let h = status_hint(&stuck, &unsched("a")).unwrap();
+        assert!(h.contains("its deadline stops it"), "{h}");
+        assert!(!h.contains("no deadline"), "{h}");
+
+        // The check CronJob's Job holds the CHECK schedule, not the backup's.
+        stuck["metadata"]["ownerReferences"] =
+            json!([{"kind": "CronJob", "name": "apprafter-backup-check", "uid": "cj"}]);
+        let h = status_hint(&stuck, &unsched("a")).unwrap();
+        assert!(h.contains("schedule starts no other check"), "{h}");
     }
 
     #[test]

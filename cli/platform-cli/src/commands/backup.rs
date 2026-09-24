@@ -2489,6 +2489,8 @@ struct ActiveJob {
     pod: JobPod,
     /// The lines `backup status` prints under it ([`job_pod::status_hint`]).
     hint: Option<String>,
+    /// Its `activeDeadlineSeconds`; `None` for a Job of a chart that set none.
+    deadline: Option<u64>,
 }
 
 /// The reason of `job`'s condition of type `kind` when it is True.
@@ -2540,6 +2542,7 @@ fn active_runner_jobs(jobs: &[Value], pods: &[Value]) -> Vec<ActiveJob> {
             ActiveJob {
                 name: job_metadata_name(j).to_string(),
                 hint: job_pod::status_hint(j, &pod),
+                deadline: job_pod::deadline_of(j),
                 state,
                 pod,
             }
@@ -2557,8 +2560,8 @@ fn active_runner_jobs(jobs: &[Value], pods: &[Value]) -> Vec<ActiveJob> {
 /// runner, the second would not even be scheduled, and `backup run` would
 /// give up on it and report the scheduled backup as unable to start while
 /// that was the one running. A Job no node takes, or whose container cannot
-/// start, may hold on until its deadline, so for those the report also says
-/// how to clear it.
+/// start, may hold on until its deadline — or, with no deadline, until it is
+/// deleted — so for those the report also says how to clear it, once.
 fn refusal(jobs: &[Value], pods: &[Value]) -> Option<(String, CliError)> {
     let active = active_runner_jobs(jobs, pods);
     let first = active.first()?;
@@ -2568,15 +2571,24 @@ fn refusal(jobs: &[Value], pods: &[Value]) -> Option<(String, CliError)> {
         if let Some(hint) = &a.hint {
             out.push_str(hint);
         }
+        let clear = job_pod::delete_command(PLATFORMSTACK_NAMESPACE, &a.name);
+        let hint_clears_it = a.hint.as_deref().is_some_and(|h| h.contains(&clear));
         if matches!(
             a.pod,
             JobPod::Unschedulable { .. } | JobPod::NotStarted { reason: Some(_) }
-        ) {
-            out.push_str(&format!(
-                "    It may hold on until its deadline stops it. To start a new run sooner, \
-                 delete it first:\n      kubectl -n {PLATFORMSTACK_NAMESPACE} delete job {}\n",
-                a.name
-            ));
+        ) && !hint_clears_it
+        {
+            let why = match a.deadline {
+                Some(_) => {
+                    "It may hold on until its deadline stops it. To start a new run sooner, \
+                     delete it first:"
+                }
+                None => {
+                    "It has no deadline, so nothing stops it: it holds on until it runs or is \
+                     deleted. To start a new run, delete it first:"
+                }
+            };
+            out.push_str(&format!("    {why}\n      {clear}\n"));
         }
     }
     out.push_str(&format!(
@@ -14284,6 +14296,47 @@ mod tests {
         assert!(report.contains("`apprafter top`"), "{report}");
         assert!(
             report.contains("kubectl -n apprafter-system delete job apprafter-backup-29312345"),
+            "{report}"
+        );
+    }
+
+    /// FIRES (live walk): a Job with no `activeDeadlineSeconds` — every Job
+    /// of a chart before 0.2.80 — was said to "hold on until its deadline
+    /// stops it". It has none: it holds on until it is deleted. The report
+    /// says that, and gives the command once, whether the hint above it
+    /// already did (a scheduled Job) or not (one `backup run` made).
+    #[test]
+    fn backup_run_says_a_job_with_no_deadline_holds_on_until_it_is_deleted() {
+        let delete = "kubectl -n apprafter-system delete job";
+        for (name, owner) in [
+            ("apprafter-backup-29312345", Some("CronJob")),
+            ("apprafter-backup-manual-x", None),
+        ] {
+            let stuck = unfinished_job(name, "bk", owner);
+            assert!(job_pod::deadline_of(&stuck).is_none());
+            let (report, _) = refusal(std::slice::from_ref(&stuck), &[pending_pod("bk", "bk-pod")])
+                .expect("refused");
+            assert!(!report.contains("until its deadline"), "{report}");
+            assert!(report.contains("no deadline"), "{report}");
+            assert_eq!(
+                report.matches(&format!("{delete} {name}")).count(),
+                1,
+                "{report}"
+            );
+        }
+
+        // DOES NOT FIRE: a Job with a deadline is ended by it.
+        let mut stuck = unfinished_job("apprafter-backup-29312345", "bk", Some("CronJob"));
+        stuck["spec"]["activeDeadlineSeconds"] = json!(21600);
+        let (report, _) =
+            refusal(std::slice::from_ref(&stuck), &[pending_pod("bk", "bk-pod")]).expect("refused");
+        assert!(report.contains("until its deadline stops it"), "{report}");
+        assert!(!report.contains("no deadline"), "{report}");
+        assert_eq!(
+            report
+                .matches(&format!("{delete} apprafter-backup-29312345"))
+                .count(),
+            1,
             "{report}"
         );
     }

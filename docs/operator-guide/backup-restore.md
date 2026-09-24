@@ -397,7 +397,8 @@ included. It prints what that Job is doing and exits non-zero with
 backups need the same helper pods, and a backup and a check each fail on the
 other's repository lock. Wait until `apprafter backup status` shows the Job
 finished, then run it again. A Job that cannot start may hold on until its
-deadline, so for one of those the command also prints how to delete it.
+deadline, or until it is deleted if it has none, so for one of those the
+command also prints how to delete it.
 
 A suspended schedule (`backup disable`) does not block a manual run: taking one
 last backup after turning the schedule off is a normal thing to want.
@@ -699,7 +700,10 @@ node. Because the runner never started, it records nothing itself: `lastError`
 is not written and the failure webhook does not fire. What shows the problem
 is the `Last backup Job:` line and a `lastSuccess` that stops moving. A
 platform chart older than 0.2.80 sets no deadline on the backup Job, so there
-a Job stuck this way waits, and holds the schedule, until the node has room.
+a Job stuck this way waits, and holds the schedule, until the node has room or
+the Job is deleted. For such a Job `apprafter backup status` says it has no
+deadline and prints the command that deletes it; once it is gone, the next
+scheduled backup starts.
 
 ### The staging volume outgrew its limit {#staging-over-limit}
 
