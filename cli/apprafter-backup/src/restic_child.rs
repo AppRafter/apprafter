@@ -25,9 +25,22 @@
 //! still signal: it waits for the exit with `waitid(WNOWAIT)`, which leaves
 //! the child a zombie whose pid stays reserved, removes it from the live set
 //! under the same lock the stop signals under, and only then reaps it.
+//!
+//! # What reaches the pod's log
+//!
+//! restic's output is read from pipes, so on its own none of it reaches the
+//! pod's log: the runner keeps it for the caller, which parses stdout and
+//! quotes stderr in a failure. For the two commands an operator waits on,
+//! `check` and `prune` ([`LOGGED_VERBS`]), each line restic prints is also
+//! written to the runner's stderr as soon as restic prints it. A check with
+//! `checkReadData` can run for hours, and without a terminal restic prints
+//! its progress only as those lines (`[12:00] 41.18%  7 / 17 packs`, once a
+//! minute with the chart's `RESTIC_PROGRESS_FPS`): kept in the pipe until
+//! restic exited, they told nobody anything while it ran. The other commands
+//! print JSON the runner reads, or a line or two it reports itself.
 
 use std::collections::BTreeSet;
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
@@ -83,13 +96,25 @@ impl LiveResticChildren {
     }
 }
 
+/// The restic commands whose output also goes to the pod's log, line by line
+/// as restic prints it (see the module docs).
+pub const LOGGED_VERBS: &[&str] = &["check", "prune"];
+
+/// Where the lines of a [`LOGGED_VERBS`] command are written: the runner's
+/// stderr. One lock for both of restic's pipes, so their lines never
+/// interleave mid-line.
+type LogSink = Arc<Mutex<Box<dyn Write + Send>>>;
+
 /// The in-cluster runner's [`ResticRunner`]: restic run as a child the stop
 /// can signal (see the module docs). Otherwise it behaves as
 /// `backup_core::SubprocessRestic`: `RESTIC_PASSWORD` in the environment,
 /// never on argv; stdout captured; a failure classified by `restic_error`.
+/// What a [`LOGGED_VERBS`] command prints is captured the same way, and
+/// written to the log as well.
 pub struct ForwardingRestic {
     program: PathBuf,
     live: LiveResticChildren,
+    log: LogSink,
 }
 
 impl ForwardingRestic {
@@ -98,7 +123,14 @@ impl ForwardingRestic {
         Self {
             program: program.into(),
             live: LiveResticChildren::default(),
+            log: Arc::new(Mutex::new(Box::new(std::io::stderr()))),
         }
+    }
+
+    /// Write what the [`LOGGED_VERBS`] print to `sink` instead of stderr.
+    pub fn logging_to(mut self, sink: impl Write + Send + 'static) -> Self {
+        self.log = Arc::new(Mutex::new(Box::new(sink)));
+        self
     }
 
     /// The children this runner has running — a handle that stays current.
@@ -133,9 +165,11 @@ impl ForwardingRestic {
         let pid = child.id();
 
         // Both pipes are read to the end on their own threads, so a full pipe
-        // never blocks restic.
-        let stdout = read_to_end_on_a_thread(child.stdout.take());
-        let stderr = read_to_end_on_a_thread(child.stderr.take());
+        // never blocks restic; a logged command's lines are written to the
+        // log as they are read.
+        let log = LOGGED_VERBS.contains(&verb).then(|| Arc::clone(&self.log));
+        let stdout = read_to_end_on_a_thread(child.stdout.take(), log.clone());
+        let stderr = read_to_end_on_a_thread(child.stderr.take(), log);
 
         let exited = wait_for_exit_unreaped(pid);
         self.live.lock().pids.remove(&pid);
@@ -152,14 +186,39 @@ impl ForwardingRestic {
     }
 }
 
-/// Read `pipe` to its end on a thread of its own.
+/// Read `pipe` to its end on a thread of its own. With a `log`, each line is
+/// also written there as soon as it has been read, ending in a newline even
+/// when restic's last line had none.
 fn read_to_end_on_a_thread<R: Read + Send + 'static>(
     pipe: Option<R>,
+    log: Option<LogSink>,
 ) -> std::thread::JoinHandle<Vec<u8>> {
     std::thread::spawn(move || {
         let mut bytes = Vec::new();
-        if let Some(mut pipe) = pipe {
+        let Some(mut pipe) = pipe else {
+            return bytes;
+        };
+        let Some(log) = log else {
             let _ = pipe.read_to_end(&mut bytes);
+            return bytes;
+        };
+        let mut lines = BufReader::new(pipe);
+        loop {
+            let start = bytes.len();
+            match lines.read_until(b'\n', &mut bytes) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let line = &bytes[start..];
+                    let mut out = log.lock().unwrap_or_else(|p| p.into_inner());
+                    // The log is best-effort: a write that fails loses a
+                    // line of it, never the output the caller reads.
+                    let _ = out.write_all(line);
+                    if !line.ends_with(b"\n") {
+                        let _ = out.write_all(b"\n");
+                    }
+                    let _ = out.flush();
+                }
+            }
         }
         bytes
     })
@@ -348,7 +407,7 @@ mod tests {
     }
 
     /// Output larger than a pipe's buffer does not block restic: both pipes
-    /// are read while it runs.
+    /// are read while it runs, whether or not they are also logged.
     #[test]
     fn a_restic_that_writes_a_lot_is_read_while_it_runs() {
         let dir = tempfile::tempdir().unwrap();
@@ -358,10 +417,165 @@ mod tests {
              i=0; while [ $i -lt 20000 ]; do echo \"status line $i\"; \
              echo \"stderr line $i\" >&2; i=$((i+1)); done",
         );
-        let out = ForwardingRestic::new(&bin)
-            .run_stdout(&args(&["backup"]), "pw")
-            .unwrap();
-        assert!(out.ends_with("status line 19999\n"));
+        for verb in ["backup", "check"] {
+            let log = SharedLog::default();
+            let out = ForwardingRestic::new(&bin)
+                .logging_to(log.clone())
+                .run_stdout(&args(&[verb]), "pw")
+                .unwrap();
+            assert!(out.ends_with("status line 19999\n"), "{verb}");
+            let logged = if verb == "check" { 40000 } else { 0 };
+            assert_eq!(log.text().lines().count(), logged, "{verb}");
+        }
+    }
+
+    /// Everything written to a test's log.
+    #[derive(Clone, Default)]
+    struct SharedLog(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl SharedLog {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    /// A check's lines reach the log while restic is still running — one
+    /// that reads every pack runs for hours, and its progress lines are the
+    /// only sign of where it is — and the caller still gets its output
+    /// unchanged.
+    #[test]
+    fn a_checks_lines_reach_the_log_while_restic_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let (printed, go) = (dir.path().join("printed"), dir.path().join("go"));
+        let bin = fake_restic(
+            dir.path(),
+            &format!(
+                "[ \"$1\" = __probe ] && exit 0\n\
+                 echo 'read all data'\n\
+                 echo '[1:00] 41.18%  7 / 17 packs'\n\
+                 echo 'pack 5e1f is slow to read' >&2\n\
+                 touch {printed}\n\
+                 while [ ! -e {go} ]; do sleep 0.02; done\n\
+                 printf 'no errors were found'",
+                printed = printed.display(),
+                go = go.display()
+            ),
+        );
+        let log = SharedLog::default();
+        let r = ForwardingRestic::new(&bin).logging_to(log.clone());
+        let live = r.live_children();
+        let run = std::thread::spawn(move || {
+            r.run_stdout(&args(&["check", "--repo", "r", "--read-data"]), "pw")
+        });
+        wait_for(&printed);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !(log.text().contains("[1:00] 41.18%  7 / 17 packs\n")
+            && log.text().contains("pack 5e1f is slow to read\n"))
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the check's lines were not logged while it ran: {:?}",
+                log.text()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(live.running(), 1, "restic had already exited");
+
+        std::fs::write(&go, "").unwrap();
+        let out = run.join().unwrap().unwrap();
+        assert_eq!(
+            out,
+            "read all data\n[1:00] 41.18%  7 / 17 packs\nno errors were found"
+        );
+        // restic's last line had no newline; the log's does.
+        assert!(
+            log.text().ends_with("no errors were found\n"),
+            "{:?}",
+            log.text()
+        );
+        assert_eq!(log.text().lines().count(), 4, "{:?}", log.text());
+    }
+
+    /// A check that fails says why in the log as well as in its error.
+    #[test]
+    fn a_failing_checks_words_reach_the_log_and_its_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_restic(
+            dir.path(),
+            "[ \"$1\" = __probe ] && exit 0\n\
+             echo 'check snapshots, trees and blobs'\n\
+             echo 'error for tree 4a2b: blob 9c1d not found' >&2\n\
+             echo 'Fatal: repository contains errors' >&2\nexit 1",
+        );
+        let log = SharedLog::default();
+        let err = ForwardingRestic::new(&bin)
+            .logging_to(log.clone())
+            .run(&args(&["check", "--repo", "r"]), "pw")
+            .unwrap_err();
+        assert!(
+            matches!(&err, CliError::Restic { verb, exit: Some(1), .. } if verb == "check"),
+            "{err:?}"
+        );
+        assert!(
+            err.to_string().contains("repository contains errors"),
+            "{err}"
+        );
+        for line in [
+            "check snapshots, trees and blobs\n",
+            "error for tree 4a2b: blob 9c1d not found\n",
+            "Fatal: repository contains errors\n",
+        ] {
+            assert!(
+                log.text().contains(line),
+                "{line:?} not in {:?}",
+                log.text()
+            );
+        }
+    }
+
+    /// `check` and `prune` are logged; the commands whose output the runner
+    /// reads itself (JSON, or a refusal it reports) are not.
+    #[test]
+    fn only_check_and_prune_are_logged() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_restic(
+            dir.path(),
+            "[ \"$1\" = __probe ] && exit 0\n\
+             echo \"out of $1\"\necho \"err of $1\" >&2",
+        );
+        let log = SharedLog::default();
+        let r = ForwardingRestic::new(&bin).logging_to(log.clone());
+        for verb in ["backup", "snapshots", "stats", "forget", "unlock", "init"] {
+            let out = r.run_capture(&args(&[verb, "--repo", "r"]), "pw").unwrap();
+            assert_eq!(out.stdout, format!("out of {verb}\n"));
+            assert_eq!(out.stderr, format!("err of {verb}\n"));
+        }
+        assert_eq!(
+            log.text(),
+            "",
+            "a command the runner reads itself was logged"
+        );
+        for verb in ["check", "prune"] {
+            r.run(&args(&[verb, "--repo", "r"]), "pw").unwrap();
+            for line in [format!("out of {verb}\n"), format!("err of {verb}\n")] {
+                assert!(
+                    log.text().contains(&line),
+                    "{line:?} not in {:?}",
+                    log.text()
+                );
+            }
+        }
+        assert_eq!(log.text().lines().count(), 4, "{:?}", log.text());
     }
 
     /// The stop's signal reaches a running restic, which then cleans up and

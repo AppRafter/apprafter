@@ -818,8 +818,10 @@ _backupTemplate: """
 	            - name: GOMEMLIMIT
 	              value: "96MiB"
 	            # Without a terminal restic prints no periodic progress; with
-	            # this, a long check (checkReadData) logs where it is once a
-	            # minute.
+	            # this it prints a line a minute. The runner copies each line
+	            # `restic check` and `restic prune` print into this pod's log as
+	            # restic prints it, so a long check (checkReadData) says where it
+	            # is once a minute.
 	            - name: RESTIC_PROGRESS_FPS
 	              value: "0.0167"
 	            # Without it the unlock looked for $HOME/.cache, HOME is / for
