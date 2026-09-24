@@ -82,10 +82,12 @@ pub struct SnapshotMeta {
     pub id: String,
     /// The shared `run-<id>` tag (== the backup tag).
     pub run_tag: String,
-    /// When its `restic backup` started: what the keep policy buckets on.
-    /// RFC 3339 with the WRITER's offset — `…Z` from the runner, the
-    /// workstation's own from `backup create` — so NOT sortable as a string:
-    /// compared and bucketed as an instant ([`snapshot_instant`]).
+    /// When its `restic backup` started. RFC 3339 with the WRITER's offset
+    /// — `…Z` from the runner, the workstation's own from `backup create` —
+    /// so NOT sortable as a string: compared as an instant
+    /// ([`snapshot_instant`]). The keep policy files a run by the start its
+    /// tag carries, and by this only when the tag carries none
+    /// ([`run_instant`]).
     pub time: String,
     /// When its `restic backup` ended (`summary.backup_end`, restic 0.17+),
     /// RFC 3339, the same way; `None` from an older restic. A large claim's
@@ -134,13 +136,16 @@ impl Default for RetentionPolicy {
 /// # Why the schedule's zone, and not UTC
 ///
 /// A daily CronJob in zone Z starts one run per calendar day OF Z, every day
-/// of the year. Counted in Z, `keepDaily: 7` is therefore always the last
-/// seven scheduled runs, the weekly bucket is Z's Monday to Sunday and the
-/// monthly one Z's month. Counted in any other zone, UTC included, the day
-/// boundary falls at a different hour of Z's clock, and moves by an hour
-/// when Z changes to or from summer time: a schedule within an hour of that
-/// boundary then puts two runs in one counted day and none in the next, and
-/// `keepDaily` forgets one of the two. A nightly `--at 01:30 --timezone
+/// of the year, and a run is filed under its start ([`run_instant`]).
+/// Counted in Z, `keepDaily: 7` is therefore the last seven scheduled runs
+/// as long as each run starts on the day it was scheduled for (a runner
+/// that waits past midnight for a node starts on the next), the weekly
+/// bucket is Z's Monday to Sunday and the monthly one Z's month. Counted in
+/// any other zone, UTC included, the day boundary falls at a different hour
+/// of Z's clock, and moves by an hour when Z changes to or from summer time:
+/// a schedule within an hour of that boundary then puts two runs in one
+/// counted day and none in the next, and `keepDaily` forgets one of the
+/// two. A nightly `--at 01:30 --timezone
 /// Europe/Berlin` runs at 00:30 UTC on the Sunday of the spring change and
 /// at 23:30 UTC the same day for Monday, so a UTC count throws Sunday's run
 /// away. The writer's own offset is no zone at all: the runner writes UTC
@@ -218,13 +223,15 @@ struct Run {
 ///    it is an ORPHAN → ALL its snapshot ids are forgotten. (A monolithic run
 ///    is a single snapshot with `is_manifest == true` → it is its own
 ///    representative.)
-/// 3. Apply the keep policy to the set of representatives by `time`, read as
-///    an instant ([`snapshot_instant`]) and placed in the policy's zone
-///    ([`RetentionPolicy::zone`]): keep the newest representative per
-///    distinct calendar day up to `keep_daily`, per distinct ISO week up to
-///    `keep_weekly`, per distinct calendar month up to `keep_monthly`. A
-///    representative kept by ANY of the three is kept (union). One whose
-///    time does not parse belongs to no day, week or month, and is kept.
+/// 3. Apply the keep policy to the set of representatives by their run's
+///    start ([`run_instant`]: the start the run tag carries, else the
+///    representative's `time`), read as an instant and placed in the
+///    policy's zone ([`RetentionPolicy::zone`]): keep the newest
+///    representative per distinct calendar day up to `keep_daily`, per
+///    distinct ISO week up to `keep_weekly`, per distinct calendar month up
+///    to `keep_monthly`. A representative kept by ANY of the three is kept
+///    (union). One with no instant belongs to no day, week or month, and is
+///    kept.
 /// 4. For every representative NOT kept → forget ALL its group's snapshot ids.
 /// 5. Representatives that ARE kept → keep all their group's members.
 ///
@@ -260,7 +267,8 @@ pub fn plan_prune(
         if s.is_manifest {
             // If (pathologically) more than one member claims to be the
             // manifest, the newest by the clock wins as the representative —
-            // its `time` is what the keep policy buckets on. A tie is broken
+            // its `time` is what the keep policy falls back on when the run
+            // tag carries no start ([`run_instant`]). A tie is broken
             // by id, as in the keep policy's walk, so the choice does not
             // depend on the order restic lists in.
             match &run.representative {
@@ -345,19 +353,51 @@ fn newest_first(a: &SnapshotMeta, b: &SnapshotMeta) -> std::cmp::Ordering {
         .then_with(|| a.id.cmp(&b.id))
 }
 
+/// The instant the keep policy files a run under: when the run STARTED,
+/// which its run tag carries ([`crate::cluster::tag_run_start`]) — else,
+/// for a tag with no start in it (every tag written before cluster
+/// identity), its representative's own time.
+///
+/// Not the representative's time first. That is when the commit snapshot's
+/// `restic backup` began, and a sequential run writes its commit snapshot
+/// only after the last claim is dumped, hours after the run started. Filed
+/// by it, a nightly run that starts at 22:00 and commits at 00:10 is the
+/// next day's, beside that day's own run, and `keepDaily` forgets one of
+/// the two.
+fn run_instant(rep: &SnapshotMeta) -> Option<DateTime<Utc>> {
+    crate::cluster::tag_run_start(&rep.run_tag).or_else(|| snapshot_instant(&rep.time))
+}
+
+/// The keep policy's walk order: newest first by [`run_instant`], the one
+/// the runs' days are counted by, a run with none after every one that has
+/// one, and a tie broken as [`newest_first`] breaks it.
+///
+/// It has to be the same instant. The walk keeps the first run of each day
+/// it meets and stops once it has kept `keep` days: walked by another time,
+/// a run that started on Monday and committed on Tuesday came before
+/// Tuesday's own, took the one day `keepDaily: 1` allows, and Tuesday's run
+/// was forgotten.
+fn newest_run_first(a: &SnapshotMeta, b: &SnapshotMeta) -> std::cmp::Ordering {
+    run_instant(b)
+        .cmp(&run_instant(a))
+        .then_with(|| newest_first(a, b))
+}
+
 /// Return the set of representative ids kept by the union of the three buckets.
 ///
-/// A representative's day is the date its `time`, read as an instant, falls
-/// on in the policy's zone ([`RetentionPolicy::zone`]) — not the date its
-/// writer's clock showed. For each bucket kind, walk the representatives
-/// newest-first and keep the newest one per distinct period (day / ISO week /
-/// month) until `keep_*` distinct periods have been kept. A representative
-/// kept by ANY bucket is kept.
+/// A run's day is the date its start ([`run_instant`]) falls on in the
+/// policy's zone ([`RetentionPolicy::zone`]) — not the date its writer's
+/// clock showed, and not the day its commit snapshot was written. For each
+/// bucket kind, walk the runs newest-first by that start
+/// ([`newest_run_first`]) and keep the newest one per distinct period (day /
+/// ISO week / month) until `keep_*` distinct periods have been kept. A
+/// representative kept by ANY bucket is kept.
 ///
-/// So is one whose time does not parse. It has no day, week or month to be
-/// counted in, and restic always writes a time, so it is not a run this
-/// planner understands: it is kept for someone to look at rather than
-/// deleted, and it takes no period's slot from a run that has one.
+/// So is one with no instant at all: no start in its tag and a time that
+/// does not parse. It has no day, week or month to be counted in, and
+/// restic always writes a time, so it is not a run this planner
+/// understands: it is kept for someone to look at rather than deleted, and
+/// it takes no period's slot from a run that has one.
 fn select_kept(
     representatives: &[(&SnapshotMeta, &Vec<String>)],
     policy: &RetentionPolicy,
@@ -365,12 +405,12 @@ fn select_kept(
     use std::collections::HashSet;
 
     let mut reps: Vec<&SnapshotMeta> = representatives.iter().map(|(r, _)| *r).collect();
-    reps.sort_by(|a, b| newest_first(a, b));
+    reps.sort_by(|a, b| newest_run_first(a, b));
 
     let mut kept: HashSet<String> = HashSet::new();
     let mut dated: Vec<(&str, NaiveDate)> = Vec::with_capacity(reps.len());
     for rep in reps {
-        match snapshot_instant(&rep.time) {
+        match run_instant(rep) {
             Some(at) => dated.push((&rep.id, at.with_timezone(&policy.zone).date_naive())),
             None => {
                 kept.insert(rep.id.clone());
@@ -1487,6 +1527,100 @@ mod tests {
         assert_eq!((plan.forget_runs, plan.kept_runs), (2, 3), "{plan:?}");
         let none = keep_days(0, Tz::UTC);
         assert_eq!(forgotten(&snaps, &none), vec!["mon", "tue", "wed"]);
+    }
+
+    /// A run as the engine writes it: a claim snapshot at its `start`, and
+    /// the commit snapshot, begun at `commit`, all under the real run tag,
+    /// which carries the start ([`crate::cluster::run_tag`]).
+    fn run_started(label: &str, start: &str, commit: &str) -> Vec<SnapshotMeta> {
+        let run_tag = crate::cluster::run_tag(MINE, start, &[]);
+        let member = |id: String, time: &str, is_manifest: bool| SnapshotMeta {
+            id,
+            run_tag: run_tag.clone(),
+            time: time.to_string(),
+            is_manifest,
+            ended: None,
+            tags: vec![run_tag.clone()],
+        };
+        vec![
+            member(format!("{label}-claim"), start, false),
+            member(label.to_string(), commit, true),
+        ]
+    }
+
+    /// A nightly run started at 22:00 in Berlin whose commit snapshot began
+    /// after midnight is Tuesday's run, not Wednesday's. Filed by the commit
+    /// snapshot's time, Tuesday's and Wednesday's runs shared Wednesday and
+    /// `keepDaily: 7` forgot one of the last four runs.
+    #[test]
+    fn a_run_is_filed_under_the_day_it_started_not_the_day_it_committed() {
+        let snaps: Vec<SnapshotMeta> = [
+            ("mon", "2026-09-14T20:00:00.5Z", "2026-09-14T21:50:00Z"),
+            ("tue", "2026-09-15T20:00:00.5Z", "2026-09-15T22:10:00Z"),
+            ("wed", "2026-09-16T20:00:00.5Z", "2026-09-16T21:55:00Z"),
+            ("thu", "2026-09-17T20:00:00.5Z", "2026-09-17T21:40:00Z"),
+        ]
+        .iter()
+        .flat_map(|(label, start, commit)| run_started(label, start, commit))
+        .collect();
+        assert_eq!(
+            forgotten(&snaps, &keep_days(7, berlin())),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            forgotten(&snaps, &keep_days(3, berlin())),
+            vec!["mon", "mon-claim"]
+        );
+    }
+
+    /// The walk is newest-first by the same start the days are counted by.
+    /// Monday's run started at 23:00 in Berlin and committed at 02:00 on
+    /// Tuesday; a manual run started at 00:30 on Tuesday and committed at
+    /// 01:00. Walked by commit time, Monday's run came first, took the one
+    /// day `keepDaily: 1` allows, and the newest day's run was forgotten.
+    #[test]
+    fn the_run_that_started_last_is_the_newest() {
+        let mut snaps = run_started("mon", "2026-09-14T21:00:00Z", "2026-09-15T00:00:00Z");
+        snaps.extend(run_started(
+            "tue-manual",
+            "2026-09-14T22:30:00Z",
+            "2026-09-14T23:00:00Z",
+        ));
+        assert_eq!(
+            forgotten(&snaps, &keep_days(1, berlin())),
+            vec!["mon", "mon-claim"]
+        );
+    }
+
+    /// A tag with no start in it — every one written before cluster
+    /// identity — leaves the representative's own time to file the run by;
+    /// and a representative whose time does not parse is filed by its tag's
+    /// start rather than kept regardless.
+    #[test]
+    fn a_run_with_no_start_in_its_tag_is_filed_by_its_time_and_the_reverse() {
+        let legacy = |label: &str, start: &str, time: &str| {
+            let run_tag = format!("platform-{start}");
+            SnapshotMeta {
+                id: label.to_string(),
+                run_tag: run_tag.clone(),
+                time: time.to_string(),
+                is_manifest: true,
+                ended: None,
+                tags: vec![run_tag],
+            }
+        };
+        let snaps = vec![
+            legacy("mon", "2026-09-14T20:00:00Z", "2026-09-14T22:10:00Z"),
+            legacy("tue", "2026-09-15T20:00:00Z", "2026-09-15T21:00:00Z"),
+        ];
+        assert_eq!(forgotten(&snaps, &keep_days(1, berlin())), vec!["mon"]);
+
+        let mut snaps = run_started("mon", "2026-09-14T20:00:00Z", "");
+        snaps.extend(run_started("tue", "2026-09-15T20:00:00Z", "yesterday"));
+        assert_eq!(
+            forgotten(&snaps, &keep_days(1, berlin())),
+            vec!["mon", "mon-claim"]
+        );
     }
 
     #[test]

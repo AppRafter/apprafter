@@ -97,7 +97,14 @@ not a sequence. The defaults are **7 / 4 / 6**. Note that the buckets count
 daily budget, and the older of the two is kept only if some other bucket rescues
 it.
 
-"Newest" is by the clock, and the days, weeks and months are those of
+A run is placed by when it **started**, the time in its tag, not by when its
+representative was written. A sequential run writes its commit snapshot after
+the last claim is dumped, which can be hours later and past midnight; the run
+still counts for the day it started, so it does not push the next day's run out
+of keep-daily. A tag written before tags carried a cluster identity holds no
+start that can be read, and such a run is placed by its representative's time.
+
+"Newest" is by that start, and the days, weeks and months are those of
 `spec.backup.timeZone`, the zone the backup schedules run in — UTC when none is
 set. restic records each snapshot's time in its writer's offset: the in-cluster
 runner writes UTC, and `apprafter backup create` on a workstation writes that
@@ -105,10 +112,13 @@ machine's local time, so one repository holds both. Every time is read as an
 instant before it is compared or given a day; compared as text, a run taken at
 `04:00+01:00` would pass for newer than one taken at `03:30Z`, half an hour
 later, and a run's day would depend on who took it. The schedule's zone is the
-one a daily schedule makes exactly one run a day in, including on the days the
-clocks change; counted in UTC, a schedule within an hour of midnight UTC puts
-two runs on one day when the clocks change, and keep-daily drops one of them. A representative whose
-time does not parse belongs to no day and is always kept.
+one a daily schedule makes one run a day in, including on the days the clocks
+change, as long as each run starts on the day it was scheduled for: a runner
+that waits past midnight for room on a node starts, and counts, on the next
+day. Counted in UTC, a schedule within an hour of midnight UTC puts two runs on
+one day when the clocks change, and keep-daily drops one of them. A run with
+neither a start nor a time that can be read belongs to no day and is always
+kept.
 
 The runner pins a stable restic host rather than letting the ephemeral pod name
 become one: `spec.backup.clusterName` when the cluster has been named, and the
