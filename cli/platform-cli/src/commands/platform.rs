@@ -657,19 +657,45 @@ pub(crate) fn unhealthy_condition_rows(json: &Value) -> Vec<ConditionRow> {
 /// which is where a cluster spends nearly all of its life: a field that
 /// renders "available: the version you are already running" teaches the
 /// reader to skip it on the one day it says something.
+///
+/// The two are compared as semver, as the operator's `UpgradeAvailable`
+/// compares them. Only a NEWER channel release is an upgrade. An older one
+/// is what a cluster sees when its running version was yanked after it was
+/// installed — the resolver skips yanked releases — and the line says that
+/// when `YankedVersion` does; it used to read "upgrade available" for a
+/// downgrade. A version that does not parse is named and not judged.
 pub(crate) fn version_summary_line(json: &Value) -> String {
     let status = json.get("status").cloned().unwrap_or(Value::Null);
     let current = status
         .pointer("/currentVersion")
         .and_then(Value::as_str)
         .unwrap_or("(unset)");
-    let available = status.pointer("/availableVersion").and_then(Value::as_str);
+    let available = status
+        .pointer("/availableVersion")
+        .and_then(Value::as_str)
+        .filter(|a| *a != current && *a != "(unset)");
+    let yanked = condition_rows(&status)
+        .iter()
+        .any(|row| row.type_ == "YankedVersion" && row.status == "True");
+    let semver = |v: &str| semver::Version::parse(v.trim_start_matches('v')).ok();
 
-    match available {
-        Some(available) if available != current && available != "(unset)" => {
+    let Some(available) = available else {
+        return format!("Platform: {current}");
+    };
+    match (semver(current), semver(available)) {
+        (Some(c), Some(a)) if a > c => {
             format!("Platform: {current} — upgrade available: {available}")
         }
-        _ => format!("Platform: {current}"),
+        (Some(c), Some(a)) if a == c => format!("Platform: {current}"),
+        (Some(_), Some(_)) if yanked => format!(
+            "Platform: {current} — yanked; the channel's newest release that is not yanked, \
+             {available}, is older than this one, so there is no upgrade to take"
+        ),
+        (Some(_), Some(_)) => format!(
+            "Platform: {current} — no upgrade: the channel's newest release, {available}, is \
+             older than this one"
+        ),
+        _ => format!("Platform: {current} — the channel's newest release: {available}"),
     }
 }
 
@@ -2066,6 +2092,74 @@ mod tests {
             !line.contains("upgrade"),
             "steady state must not advertise an upgrade: {line}"
         );
+    }
+
+    /// FIRES (live walk, P5): a channel whose newest release is OLDER than
+    /// the running one is no upgrade. The line used to compare the strings,
+    /// so `0.2.80` with `availableVersion: 0.2.79` advertised a downgrade as
+    /// "upgrade available", beside an `UpgradeAvailable=False/UpToDate`.
+    #[test]
+    fn version_summary_line_does_not_call_an_older_release_an_upgrade() {
+        let stack = json!({ "status": {
+            "currentVersion": "0.2.80", "availableVersion": "0.2.79",
+            "conditions": [{ "type": "YankedVersion", "status": "False", "reason": "NotYanked",
+                             "message": "currentVersion is not marked yanked" }]
+        }});
+        let line = version_summary_line(&stack);
+        assert!(!line.contains("upgrade available"), "{line}");
+        assert!(line.contains("no upgrade"), "{line}");
+        assert!(line.contains("0.2.79"), "{line}");
+        assert!(line.contains("older than this one"), "{line}");
+        assert!(
+            !line.contains("yanked"),
+            "nothing says this one is yanked: {line}"
+        );
+    }
+
+    /// Where an older channel release comes from in the field: the running
+    /// version was yanked after it was installed, and the resolver skips
+    /// yanked versions. The line says so when the operator's condition does.
+    #[test]
+    fn version_summary_line_says_the_running_version_is_yanked() {
+        let stack = json!({ "status": {
+            "currentVersion": "0.2.80", "availableVersion": "0.2.79",
+            "conditions": [{ "type": "YankedVersion", "status": "True", "reason": "Yanked",
+                             "message": "currentVersion 0.2.80 is yanked: the CRD does not apply" }]
+        }});
+        let line = version_summary_line(&stack);
+        assert!(line.contains("0.2.80 — yanked"), "{line}");
+        assert!(line.contains("not yanked, 0.2.79"), "{line}");
+        assert!(!line.contains("upgrade available"), "{line}");
+    }
+
+    /// Semver, not string order: `0.2.100` is newer than `0.2.99`, and a
+    /// leading `v` on one side is the same version.
+    #[test]
+    fn version_summary_line_compares_by_semver() {
+        let newer = json!({
+            "status": { "currentVersion": "0.2.99", "availableVersion": "0.2.100" }
+        });
+        assert!(
+            version_summary_line(&newer).contains("upgrade available: 0.2.100"),
+            "{}",
+            version_summary_line(&newer)
+        );
+        let same = json!({
+            "status": { "currentVersion": "v0.2.80", "availableVersion": "0.2.80" }
+        });
+        assert_eq!(version_summary_line(&same), "Platform: v0.2.80");
+    }
+
+    /// A version that does not parse is neither an upgrade nor a downgrade:
+    /// the line names what the channel offers and claims nothing about it.
+    #[test]
+    fn version_summary_line_claims_nothing_about_a_version_it_cannot_read() {
+        let stack = json!({
+            "status": { "currentVersion": "0.2.80", "availableVersion": "next" }
+        });
+        let line = version_summary_line(&stack);
+        assert!(!line.contains("upgrade"), "{line}");
+        assert!(line.contains("next"), "{line}");
     }
 
     #[test]
