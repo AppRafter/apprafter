@@ -12,10 +12,10 @@ pub fn restic_init_argv(repo: &str) -> Vec<String> {
 /// `restic backup` argv: snapshot the staging dir into the repo, tagged.
 /// `--json` is included so the caller can parse the structured summary line.
 ///
-/// `host`: when `Some(h)`, passes `--host h` so `restic forget` groups
-/// snapshots by a fixed, stable host rather than the pod/machine name — a
-/// requirement for retention policies (spec §Retention M-r3-1a). Pass `None`
-/// for local-pull / CLI paths where the machine's own hostname is correct.
+/// `host`: when `Some(h)`, passes `--host h`, so the snapshot carries a
+/// fixed, stable host — the cluster's name — rather than the pod or machine
+/// name (spec §Retention M-r3-1a). `None` leaves restic to use the machine's
+/// hostname.
 pub fn restic_backup_argv(
     repo: &str,
     staging_dir: &str,
@@ -283,11 +283,11 @@ mod tests {
     }
 
     #[test]
-    fn backup_argv_omits_host_when_none_for_local_pull() {
+    fn backup_argv_omits_host_when_none() {
         let a = restic_backup_argv("/local/repo", "/stage", "tag", None);
         assert!(
             !a.iter().any(|x| x == "--host"),
-            "local-pull must NOT set --host (uses machine hostname): {a:?}"
+            "no host given, no --host (restic uses the machine's hostname): {a:?}"
         );
     }
 

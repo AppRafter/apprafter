@@ -82,14 +82,21 @@ pub struct BackupOpts {
     pub staging_mode: StagingMode,
     /// Fixed `--host` passed to every `restic backup` invocation for this run.
     ///
-    /// When `Some(h)`, restic groups snapshots under `h` so `restic forget`
-    /// retention policies apply across runs (spec §Retention M-r3-1a). Set to
-    /// `Some("apprafter-backup")` in the in-cluster runner (where the pod name
-    /// is ephemeral). Leave as `None` for the CLI local-pull path, which keeps
-    /// the machine's own hostname as the group (correct for a per-operator
-    /// station grouping).
+    /// The cluster's human name: `spec.backup.clusterName`, else
+    /// [`DEFAULT_BACKUP_HOST`] — what `backup list` shows in its CLUSTER
+    /// column. The in-cluster runner and `apprafter backup create` both pass
+    /// it, so one cluster's snapshots read as one cluster whoever took them.
+    /// `None` leaves restic to stamp the machine's hostname, which is never
+    /// a cluster's name: a pod's is ephemeral, and a workstation's names the
+    /// wrong thing.
     pub backup_host: Option<String>,
 }
+
+/// The restic `--host` of a cluster's backups when `spec.backup.clusterName`
+/// names nothing: the fixed host every cluster wrote before `clusterName`
+/// existed, which the chart also renders as the default. Shared by the
+/// in-cluster runner and `apprafter backup create`.
+pub const DEFAULT_BACKUP_HOST: &str = "apprafter-backup";
 
 // ---------------------------------------------------------------------------
 // Engine

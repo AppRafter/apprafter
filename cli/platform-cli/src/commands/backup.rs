@@ -2053,6 +2053,8 @@ pub fn run_backup(
     // scheduled runner does — otherwise it lands as an unidentified snapshot in
     // a pool two clusters draw from.
     let cluster_uid = read_cluster_uid(kc.path())?;
+    // The name its snapshots carry, as the scheduled runner's do.
+    let backup_host = cluster_backup_host(spec_backup_from_cluster(Some(kc.path()))?.as_ref());
 
     let pg_image = pg_helper_image(first_cnpg_image(&ns_set, kc.path()).as_deref());
     let platform_version = read_platform_version(kc.path())?;
@@ -2075,6 +2077,7 @@ pub fn run_backup(
         staging.path(),
         pg_image,
         staging_mode,
+        backup_host,
     )?;
 
     let r = RefusingAfterInterrupt(SubprocessRestic);
@@ -2116,14 +2119,28 @@ impl<R: ResticRunner> ResticRunner for RefusingAfterInterrupt<R> {
     }
 }
 
+/// The restic `--host` a backup of this cluster carries: the
+/// `spec.backup.clusterName` the runner is given, else the runner's own
+/// default ([`backup_core::engine::DEFAULT_BACKUP_HOST`]). Pure.
+///
+/// `backup list` shows the host as the snapshot's CLUSTER. `backup create`
+/// used to pass none, so restic stamped the workstation's hostname, and a
+/// cluster's own snapshots listed under two names — the runner's and the
+/// laptop's — depending on who took them.
+fn cluster_backup_host(spec_backup: Option<&Value>) -> String {
+    spec_backup
+        .and_then(|s| s.pointer("/clusterName"))
+        .and_then(Value::as_str)
+        .filter(|n| !n.is_empty())
+        .unwrap_or(backup_core::engine::DEFAULT_BACKUP_HOST)
+        .to_string()
+}
+
 /// Assemble the [`BackupOpts`] the CLI local-pull path hands to the engine.
 ///
 /// Extracted from [`run_backup`] and called from both there and the tests.
-/// INVARIANT: `backup_host` is `None`. The CLI pull keeps the operator
-/// workstation's own hostname as the restic group, which is what makes
-/// per-station grouping work; only the in-cluster runner pins
-/// `Some("apprafter-backup")` because its pod name is ephemeral (spec
-/// §Retention M-r3-1a).
+/// INVARIANT: `backup_host` is the cluster's name ([`cluster_backup_host`]),
+/// the one the scheduled runner stamps — never the workstation's hostname.
 ///
 /// The one cluster read is the helper pods' keep-alive
 /// ([`backup_core::engine::read_helper_keep_alive`]). An interactive backup
@@ -2147,6 +2164,7 @@ fn local_pull_backup_opts(
     staging_root: &Path,
     pg_image: String,
     staging_mode: StagingMode,
+    backup_host: String,
 ) -> Result<BackupOpts> {
     Ok(BackupOpts {
         repo: repo.to_string(),
@@ -2161,7 +2179,7 @@ fn local_pull_backup_opts(
         pg_image,
         helper_keep_alive: backup_core::engine::read_helper_keep_alive(k)?,
         staging_mode,
-        backup_host: None,
+        backup_host: Some(backup_host),
     })
 }
 
@@ -10652,6 +10670,41 @@ mod tests {
         assert_eq!(last_prune_annotation(Some(&json!({"metadata": {}}))), None);
     }
 
+    /// The restic host a CLI backup stamps is the one the runner stamps for
+    /// the same cluster: `spec.backup.clusterName`, else the runner's fixed
+    /// default — the chart renders `clusterName | default "apprafter-backup"`
+    /// and the runner falls back to the same constant.
+    #[test]
+    fn a_cli_backup_is_hosted_under_the_name_the_runner_uses() {
+        assert_eq!(
+            cluster_backup_host(Some(&json!({"clusterName": "prod-eu"}))),
+            "prod-eu"
+        );
+        for unnamed in [None, Some(json!({})), Some(json!({"clusterName": ""}))] {
+            assert_eq!(
+                cluster_backup_host(unnamed.as_ref()),
+                "apprafter-backup",
+                "{unnamed:?}"
+            );
+        }
+        let chart = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../platform-stack/cue/render_tool.cue"),
+        )
+        .expect("render_tool.cue");
+        let rendered = chart
+            .lines()
+            .skip_while(|l| !l.contains("name: APPRAFTER_BACKUP_HOST"))
+            .nth(1)
+            .expect("the chart renders APPRAFTER_BACKUP_HOST");
+        assert!(
+            rendered.contains(&format!(
+                "clusterName | default \"{}\"",
+                backup_core::engine::DEFAULT_BACKUP_HOST
+            )),
+            "the chart's default host is not the CLI's: {rendered}"
+        );
+    }
+
     /// The cluster the prune resolved: its configured repository and UID.
     const CLUSTER_REPO: &str = "s3:https://fsn1.example/bk/cluster";
     const OTHER_UID: &str = "22222222-3333-4444-5555-666666666666";
@@ -11151,6 +11204,7 @@ mod tests {
             Path::new("/staging"),
             "postgres:18-alpine".into(),
             StagingMode::Sequential,
+            "prod-eu".into(),
         )
         .unwrap()
     }
@@ -11192,11 +11246,17 @@ mod tests {
         }
     }
 
+    /// FIRES (live walk): `backup create --repo <the cluster's repository>`
+    /// passed no `--host`, so restic stamped the workstation's hostname and
+    /// `backup list` showed "nixos" in the CLUSTER column beside the
+    /// runner's snapshots of the same cluster. The local pull is a backup
+    /// of the cluster, and carries the cluster's name as the runner does.
+    ///
+    /// (The old contract here was "keep the station's hostname as the
+    /// restic group, for retention". Retention no longer groups by host: the
+    /// prune plans by run tag and cluster UID and forgets by snapshot id.)
     #[test]
-    fn the_local_pull_keeps_the_operator_stations_hostname_as_the_restic_group() {
-        // spec §Retention M-r3-1a: only the in-cluster runner pins a fixed
-        // host (its pod name is ephemeral). Pinning it here would merge every
-        // operator's snapshots into one retention group.
+    fn the_local_pull_carries_the_clusters_name_as_its_restic_host() {
         let opts = local_pull_backup_opts(
             &SizingKube::with_deadline(43200),
             "s3:https://h/b",
@@ -11209,9 +11269,10 @@ mod tests {
             Path::new("/staging"),
             "postgres:18-alpine".into(),
             StagingMode::Sequential,
+            "prod-eu".into(),
         )
         .unwrap();
-        assert_eq!(opts.backup_host, None);
+        assert_eq!(opts.backup_host.as_deref(), Some("prod-eu"));
         assert!(opts.is_subset, "--select must reach the tag decoration");
         assert_eq!(opts.repo, "s3:https://h/b");
         assert_eq!(opts.cluster_id, "prod-cluster");

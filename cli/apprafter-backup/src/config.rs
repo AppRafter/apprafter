@@ -13,8 +13,9 @@ use cli_core::{CliError, Result};
 /// The restic `--host` a run uses when the cluster carries no
 /// `spec.backup.clusterName`. Fixed rather than the pod name, which is
 /// ephemeral (spec §Retention M-r3-1a), and unchanged from what every
-/// pre-`clusterName` cluster has been writing.
-pub const DEFAULT_BACKUP_HOST: &str = "apprafter-backup";
+/// pre-`clusterName` cluster has been writing. Defined in the engine,
+/// because `apprafter backup create` stamps the same one.
+pub use backup_core::engine::DEFAULT_BACKUP_HOST;
 
 /// Who enforces retention: `spec.backup.retention.enforce`, which the chart
 /// renders into `APPRAFTER_BACKUP_ENFORCE` for both CronJobs.
