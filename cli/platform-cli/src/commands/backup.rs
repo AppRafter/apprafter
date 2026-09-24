@@ -2225,11 +2225,68 @@ fn backup_summary_report(
 /// The CronJob the platform chart deploys for scheduled backup.
 pub(crate) const BACKUP_CRONJOB_NAME: &str = "apprafter-backup";
 
+/// The CronJob the platform chart deploys for the weekly repository check.
+pub(crate) const CHECK_CRONJOB_NAME: &str = "apprafter-backup-check";
+
+/// Name prefix of the Jobs `backup run` creates ([`manual_job_name`]).
+const MANUAL_JOB_PREFIX: &str = "apprafter-backup-manual-";
+
 /// Name for a manually triggered backup Job: the CronJob's name, `manual`,
 /// and a UTC stamp, which is what makes two runs in the same minute
 /// distinguishable and any run identifiable in `kubectl get jobs`.
 fn manual_job_name(stamp: &str) -> String {
-    format!("{BACKUP_CRONJOB_NAME}-manual-{stamp}")
+    format!("{MANUAL_JOB_PREFIX}{stamp}")
+}
+
+/// Which of the two runners a Job is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RunnerJob {
+    /// A backup: the backup CronJob's, or one `backup run` created.
+    Backup,
+    /// A repository check: the check CronJob's.
+    Check,
+}
+
+/// Is `job` a backup or check runner, and which? `None` for any other Job.
+/// Pure.
+///
+/// The operator's `BackupHealthy` rule, exactly (`Run::owns` in the
+/// platform-stack controller's `backup_health.rs`), so the CLI and the
+/// cluster's status count the same Jobs:
+///
+/// * A Job with a CronJob owner is that CronJob's: `apprafter-backup` or
+///   `apprafter-backup-check`, whatever the Job is called. The Job controller
+///   sets the owner on every scheduled Job, and `kubectl create job
+///   --from=cronjob/<name> <any-name>` sets it too.
+/// * A Job with no owner is a backup only when `backup run` created it: its
+///   name and its `apprafter.io/manual` label ([`job_from_cronjob`] leaves the
+///   owner off on purpose, so the Job outlives its CronJob).
+///
+/// It used to be the name prefix `apprafter-backup`, while the operator used
+/// the owner. A Job made the usual Kubernetes way under another name was
+/// counted by the operator and invisible here: `backup status` printed
+/// "Last backup Job: none" beside it, and `backup run` started a second
+/// runner next to it.
+pub(crate) fn runner_job(job: &Value) -> Option<RunnerJob> {
+    let cronjob_owner = job
+        .pointer("/metadata/ownerReferences")
+        .and_then(Value::as_array)
+        .and_then(|refs| {
+            refs.iter()
+                .find(|r| r.get("kind").and_then(Value::as_str) == Some("CronJob"))
+        })
+        .map(|r| r.get("name").and_then(Value::as_str).unwrap_or(""));
+    match cronjob_owner {
+        Some(BACKUP_CRONJOB_NAME) => Some(RunnerJob::Backup),
+        Some(CHECK_CRONJOB_NAME) => Some(RunnerJob::Check),
+        Some(_) => None,
+        None => (job_metadata_name(job).starts_with(MANUAL_JOB_PREFIX)
+            && job
+                .pointer("/metadata/labels/apprafter.io~1manual")
+                .and_then(Value::as_str)
+                == Some("true"))
+        .then_some(RunnerJob::Backup),
+    }
 }
 
 /// Build a Job manifest from a CronJob's `spec.jobTemplate`.
@@ -2433,9 +2490,9 @@ fn true_condition_reason(job: &Value, kind: &str) -> Option<String> {
         })
 }
 
-/// The backup and check Jobs (names beginning `apprafter-backup`) that have
-/// not finished, newest first: no `Complete` or `Failed` condition, nothing
-/// succeeded, and not being deleted. Pure.
+/// The backup and check Jobs ([`runner_job`]) that have not finished, newest
+/// first: no `Complete` or `Failed` condition, nothing succeeded, and not
+/// being deleted. Pure.
 ///
 /// A Job the Job controller has begun to fail (`FailureTarget`) counts: its
 /// runner is still stopping, and holds its room and its repository lock
@@ -2443,7 +2500,7 @@ fn true_condition_reason(job: &Value, kind: &str) -> Option<String> {
 fn active_runner_jobs(jobs: &[Value], pods: &[Value]) -> Vec<ActiveJob> {
     let mut active: Vec<&Value> = jobs
         .iter()
-        .filter(|j| job_metadata_name(j).starts_with("apprafter-backup"))
+        .filter(|j| runner_job(j).is_some())
         .filter(|j| j.pointer("/metadata/deletionTimestamp").is_none())
         .filter(|j| job_run_outcome(j) == JobOutcome::Running)
         .filter(|j| {
@@ -6514,9 +6571,10 @@ fn job_outcome(j: &serde_json::Value) -> &'static str {
 /// * `apprafter-backup`       — the scheduled backup CronJob.
 /// * `apprafter-backup-check` — the weekly check CronJob.
 ///
-/// Jobs are selected by their `.metadata.name` prefix `apprafter-backup` (both
-/// CronJob-spawned Jobs share that prefix). For each of the two flavours (with
-/// and without `-check`) the most-recent Job (by `.status.startTime`) is shown.
+/// Jobs are told apart by [`runner_job`] — the CronJob that owns them, or the
+/// marks `backup run` leaves on its own — as the operator's `BackupHealthy`
+/// tells them apart. For each of the two the most-recent Job (by
+/// `.status.startTime`) is shown.
 ///
 /// `pods` is any listing that holds those Jobs' pods (the caller reads
 /// `apprafter-system`'s). It is what tells an unfinished Job whose runner
@@ -6606,18 +6664,14 @@ where
     }
 
     // --- Job outcomes ---
-    // Partition into backup Jobs (name prefix `apprafter-backup` but NOT
-    // `apprafter-backup-check`) and check Jobs (prefix `apprafter-backup-check`).
+    // Partition into backup Jobs and check Jobs by what runs them.
     let backup_jobs: Vec<&serde_json::Value> = jobs
         .iter()
-        .filter(|j| {
-            let n = job_metadata_name(j);
-            n.starts_with("apprafter-backup") && !n.contains("check")
-        })
+        .filter(|j| runner_job(j) == Some(RunnerJob::Backup))
         .collect();
     let check_jobs: Vec<&serde_json::Value> = jobs
         .iter()
-        .filter(|j| job_metadata_name(j).contains("apprafter-backup-check"))
+        .filter(|j| runner_job(j) == Some(RunnerJob::Check))
         .collect();
 
     // A Job line that says only WHETHER it succeeded leaves the question the
@@ -6868,18 +6922,19 @@ fn last_prune_annotation(ps: Option<&Value>) -> Option<String> {
         .map(str::to_string)
 }
 
-/// The Jobs `backup status` reports on: `.items[]` of a Jobs listing, narrowed
-/// to the `apprafter-backup` name prefix.
+/// The Jobs `backup status` and `backup run` report on: `.items[]` of a Jobs
+/// listing, narrowed to the backup and check runners ([`runner_job`]).
 ///
 /// Pure — extracted from [`run_backup_status`] and called from both there and
-/// the tests. INVARIANT: the prefix filter is applied here, so an unrelated
-/// Job in `apprafter-system` never gets reported as somebody's backup.
+/// the tests. INVARIANT: the filter is applied here, so an unrelated Job in
+/// `apprafter-system` never gets reported as somebody's backup, and a runner
+/// Job is found whatever it is called.
 fn backup_jobs_of(jobs_list: Option<&Value>) -> Vec<Value> {
     jobs_list
         .map(items_of)
         .unwrap_or_default()
         .into_iter()
-        .filter(|j| job_metadata_name(j).starts_with("apprafter-backup"))
+        .filter(|j| runner_job(j).is_some())
         .collect()
 }
 
@@ -6903,7 +6958,7 @@ pub fn run_backup_status() -> Result<()> {
     let spec_backup = ps.as_ref().and_then(|p| p.pointer("/spec/backup")).cloned();
     let last_prune = last_prune_annotation(ps.as_ref());
 
-    // 2. List Jobs in apprafter-system and filter by name prefix.
+    // 2. List Jobs in apprafter-system and keep the runners.
     let jobs_list = kubectl_get_json("jobs", None, Some(PLATFORMSTACK_NAMESPACE), kc.path())?;
     let jobs = backup_jobs_of(jobs_list.as_ref());
 
@@ -8411,7 +8466,8 @@ mod tests {
         // backup is current.
         let spec = json!({"enabled": true, "bucket": "s3:x", "schedule": "0 3 * * *"});
         let job = json!({
-            "metadata": {"name": "apprafter-backup-manual-20260910-221128"},
+            "metadata": {"name": "apprafter-backup-manual-20260910-221128",
+                         "labels": {"apprafter.io/manual": "true"}},
             "status": {"startTime": "2026-09-10T22:11:28Z", "succeeded": 1}
         });
         let s = format_backup_status(
@@ -8569,7 +8625,7 @@ mod tests {
     #[test]
     fn status_reports_job_outcome() {
         let job = json!({
-            "metadata": {"name": "apprafter-backup-28900000"},
+            "metadata": {"name": "apprafter-backup-28900000", "ownerReferences": owned_by(BACKUP_CRONJOB_NAME)},
             "status": {"succeeded": 1}
         });
         let spec = json!({"enabled": true, "bucket": "s3:x"});
@@ -8592,7 +8648,7 @@ mod tests {
         // Job's condition says why — and that is the difference between
         // "raise the deadline" and "read the log".
         let job = json!({
-            "metadata": {"name": "apprafter-backup-28900000"},
+            "metadata": {"name": "apprafter-backup-28900000", "ownerReferences": owned_by(BACKUP_CRONJOB_NAME)},
             "status": {
                 "startTime": "2026-07-17T03:00:00Z",
                 "failed": 1,
@@ -8838,11 +8894,11 @@ mod tests {
     #[test]
     fn status_picks_most_recent_job_by_start_time() {
         let job_old = json!({
-            "metadata": {"name": "apprafter-backup-28800000"},
+            "metadata": {"name": "apprafter-backup-28800000", "ownerReferences": owned_by(BACKUP_CRONJOB_NAME)},
             "status": {"startTime": "2026-07-16T03:00:00Z", "failed": 1}
         });
         let job_new = json!({
-            "metadata": {"name": "apprafter-backup-28900000"},
+            "metadata": {"name": "apprafter-backup-28900000", "ownerReferences": owned_by(BACKUP_CRONJOB_NAME)},
             "status": {"startTime": "2026-07-17T03:00:00Z", "succeeded": 1}
         });
         let spec = json!({"enabled": true, "bucket": "s3:x"});
@@ -10602,29 +10658,130 @@ mod tests {
         }
     }
 
+    /// The `ownerReferences` the Job controller — or `kubectl create job
+    /// --from=cronjob/<cronjob>` — puts on a Job it makes from `cronjob`.
+    fn owned_by(cronjob: &str) -> Value {
+        json!([{
+            "apiVersion": "batch/v1", "kind": "CronJob", "name": cronjob,
+            "uid": format!("{cronjob}-uid"), "controller": true, "blockOwnerDeletion": true
+        }])
+    }
+
     #[test]
     fn status_reports_only_apprafter_backup_jobs() {
         let list = json!({"items": [
-            {"metadata": {"name": "apprafter-backup-1"}},
-            {"metadata": {"name": "apprafter-backup-check-1"}},
+            {"metadata": {"name": "apprafter-backup-1", "ownerReferences": owned_by(BACKUP_CRONJOB_NAME)}},
+            {"metadata": {"name": "apprafter-backup-check-1",
+                          "ownerReferences": owned_by(CHECK_CRONJOB_NAME)}},
+            // `kubectl create job --from=cronjob/apprafter-backup <any-name>`.
+            {"metadata": {"name": "walk-from-014903", "ownerReferences": owned_by(BACKUP_CRONJOB_NAME)}},
+            {"metadata": {"name": "apprafter-backup-manual-20260923-030000",
+                          "labels": {"apprafter.io/manual": "true"}}},
             {"metadata": {"name": "some-other-job"}},
+            // The name alone makes nothing a backup: a lookalike with no
+            // owner and no mark, and another CronJob's Job.
+            {"metadata": {"name": "apprafter-backup-lookalike"}},
+            {"metadata": {"name": "apprafter-backup-7", "ownerReferences": owned_by("nightly-report")}},
         ]});
         let jobs = backup_jobs_of(Some(&list));
         let names: Vec<&str> = jobs.iter().map(job_metadata_name).collect();
         assert_eq!(
             names,
-            vec!["apprafter-backup-1", "apprafter-backup-check-1"]
+            vec![
+                "apprafter-backup-1",
+                "apprafter-backup-check-1",
+                "walk-from-014903",
+                "apprafter-backup-manual-20260923-030000"
+            ]
         );
         // No Jobs listing at all (or no items) is "none", not a failure.
         assert!(backup_jobs_of(None).is_empty());
         assert!(backup_jobs_of(Some(&json!({}))).is_empty());
     }
 
+    /// Which runner a Job is, by the operator's rule (`Run::owns`): the
+    /// CronJob that owns it, else the name and label of `backup run`'s own.
+    #[test]
+    fn a_runner_job_is_told_by_its_owner_not_its_name() {
+        let job = |meta: Value| json!({ "metadata": meta });
+        let cases = [
+            (
+                json!({"name": "x", "ownerReferences": owned_by(BACKUP_CRONJOB_NAME)}),
+                Some(RunnerJob::Backup),
+            ),
+            (
+                json!({"name": "apprafter-backup-y", "ownerReferences": owned_by(CHECK_CRONJOB_NAME)}),
+                Some(RunnerJob::Check),
+            ),
+            (
+                json!({"name": "apprafter-backup-check-z", "ownerReferences": owned_by("other")}),
+                None,
+            ),
+            (
+                json!({"name": "apprafter-backup-manual-1", "labels": {"apprafter.io/manual": "true"}}),
+                Some(RunnerJob::Backup),
+            ),
+            // The mark without the name, and the name without the mark.
+            (
+                json!({"name": "mine", "labels": {"apprafter.io/manual": "true"}}),
+                None,
+            ),
+            (json!({"name": "apprafter-backup-manual-2"}), None),
+            (json!({"name": "apprafter-backup-check-3"}), None),
+        ];
+        for (meta, want) in cases {
+            assert_eq!(runner_job(&job(meta.clone())), want, "{meta}");
+        }
+    }
+
+    /// FIRES (P4 of the live walk): a scheduled-style Job made the usual
+    /// Kubernetes way under another name. The operator counted it; `backup
+    /// status` printed "Last backup Job: none" beside it.
+    #[test]
+    fn status_shows_a_job_made_from_the_cronjob_under_any_name() {
+        let spec = json!({"enabled": true, "bucket": "s3:x"});
+        let job = json!({
+            "metadata": {"name": "walk-from-014903", "ownerReferences": owned_by(BACKUP_CRONJOB_NAME)},
+            "status": {"startTime": "2026-09-23T01:49:03Z", "succeeded": 1}
+        });
+        let s = format_backup_status(
+            Some(&spec),
+            std::slice::from_ref(&job),
+            &[],
+            None,
+            None,
+            &tokyo(),
+            Some("Asia/Tokyo"),
+        );
+        assert!(
+            s.contains("Last backup Job: walk-from-014903 — Succeeded"),
+            "{s}"
+        );
+        assert!(s.contains("Last check Job:  none"), "{s}");
+    }
+
+    /// FIRES: `backup run` beside such a Job would have started a second
+    /// runner. It refuses, naming the Job.
+    #[test]
+    fn backup_run_refuses_beside_a_job_made_from_the_cronjob_under_any_name() {
+        let mut job = unfinished_job("walk-from-014903", "job-1", Some("CronJob"));
+        job["metadata"]["ownerReferences"] = owned_by(BACKUP_CRONJOB_NAME);
+        let (report, err) = refusal(&[job], &[]).expect("a runner that has not finished");
+        assert!(
+            report.contains("walk-from-014903 has not finished"),
+            "{report}"
+        );
+        assert!(
+            matches!(err, CliError::BackupJobActive { ref job } if job == "walk-from-014903"),
+            "{err:?}"
+        );
+    }
+
     #[test]
     fn a_job_that_has_started_but_not_finished_is_neither_succeeded_nor_failed() {
         let spec = json!({"enabled": true, "bucket": "s3:x"});
         let running = json!({
-            "metadata": {"name": "apprafter-backup-running"},
+            "metadata": {"name": "apprafter-backup-running", "ownerReferences": owned_by(BACKUP_CRONJOB_NAME)},
             "status": {"active": 1}
         });
         let s = format_backup_status(
@@ -10639,7 +10796,10 @@ mod tests {
         assert!(s.contains("Running"), "{s}");
 
         // A Job with no counters at all must not be reported as a success.
-        let bare = json!({"metadata": {"name": "apprafter-backup-bare"}, "status": {}});
+        let bare = json!({
+            "metadata": {"name": "apprafter-backup-bare", "ownerReferences": owned_by(BACKUP_CRONJOB_NAME)},
+            "status": {}
+        });
         let s = format_backup_status(
             Some(&spec),
             std::slice::from_ref(&bare),
@@ -13091,13 +13251,13 @@ mod tests {
     #[test]
     fn status_check_job_is_separated_from_backup_job() {
         let backup_job = json!({
-            "metadata": {"name": "apprafter-backup-28900000"},
+            "metadata": {"name": "apprafter-backup-28900000", "ownerReferences": owned_by(BACKUP_CRONJOB_NAME)},
             "status": {"succeeded": 1}
         });
         // A finished Job carries its condition. Counts alone (`failed: 1`,
         // nothing active) are a Job between an attempt and its retry.
         let check_job = json!({
-            "metadata": {"name": "apprafter-backup-check-28900000"},
+            "metadata": {"name": "apprafter-backup-check-28900000", "ownerReferences": owned_by(CHECK_CRONJOB_NAME)},
             "status": {"failed": 7, "conditions": [
                 {"type": "Failed", "status": "True", "reason": "BackoffLimitExceeded"}
             ]}
@@ -13136,9 +13296,18 @@ mod tests {
             }}]}}},
             "status": {"active": 1, "startTime": "2026-09-23T14:39:47Z"}
         });
-        if let Some(kind) = owner_kind {
-            j["metadata"]["ownerReferences"] =
-                json!([{"kind": kind, "name": "apprafter-backup", "uid": "cj-uid"}]);
+        let cronjob = if name.starts_with(CHECK_CRONJOB_NAME) {
+            CHECK_CRONJOB_NAME
+        } else {
+            BACKUP_CRONJOB_NAME
+        };
+        match owner_kind {
+            Some(kind) => {
+                j["metadata"]["ownerReferences"] =
+                    json!([{"kind": kind, "name": cronjob, "uid": "cj-uid"}]);
+            }
+            // `backup run`'s own Job: no owner, and its mark.
+            None => j["metadata"]["labels"] = json!({"apprafter.io/manual": "true"}),
         }
         j
     }
