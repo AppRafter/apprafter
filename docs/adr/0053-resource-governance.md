@@ -15,6 +15,11 @@ the runner's 256Mi request found no room. The runner now requests a measured
 amendment](#amendment-the-backup-runner-in-the-tier-1-budget-2026-09-23) at the
 end. The rest of the decision stands.
 
+**Amended 2026-09-24** — the runner's memory was measured again against a real
+bucket, where it was higher than against the local store of the first
+measurement, and restic now uploads in smaller pack files; see [the
+amendment](#amendment-the-backup-runner-in-the-tier-1-budget-2026-09-23).
+
 ADR for subphase 2.16d (`plan.md` §2.16d). Records the resource-governance
 model — pod QoS strategy, node reservations, and what is deferred — since
 2.16e (recommendation-based right-sizing) builds on it. Ships as a
@@ -254,18 +259,46 @@ runner, no larger minimum machine. Instead:
    thousand, not with the size of the data, which only adds page cache the
    limit reclaims. The chart therefore pins restic to two CPUs
    (`GOMAXPROCS=2`) and has its garbage collector keep the heap near 96 MiB
-   (`GOMEMLIMIT=96MiB`). With those, a first backup of a 2 GB database peaked
-   at about 100 MiB of anonymous memory; a first backup of about 470 MB of
-   PostgreSQL, a persistent Dragonfly instance and a volume at 98 MiB, and the
-   later runs of the same data at 64 MiB; the weekly check at 137 MiB on a
-   repository of 1.51 million blobs; and the largest run measured, a first
-   backup into that repository followed by the in-Job prune, at 200 MiB. The
-   backup and check Jobs request **128Mi** of memory and 100m of CPU, and are
-   limited to **384Mi**. The request covers a typical run; the limit is 1.9
-   times the largest run measured, and without the two settings a backup into
-   that repository peaked at 280 MiB and passed under it. A run above its
-   request uses memory no other pod was promised, and under node memory
-   pressure it is among the first the kubelet evicts.
+   (`GOMEMLIMIT=96MiB`).
+
+   The first measurement of those settings ran on kind against a MinIO on the
+   same machine, and it was low. On the ~4GB machine itself, against Hetzner
+   Object Storage, a first backup of a 403 MB database peaked at 155 MiB. The
+   difference is the link, not the data. restic uploads the repository in pack
+   files, 16 MiB by default, and up to five at once; its S3 backend asks the S3
+   library for each pack's MD5 and gives it a reader the library cannot
+   rewind, so the library reads each pack whole into memory before it sends
+   it. Against a store on the same machine each upload ends before the next
+   pack is full; against a real bucket all five are in flight. Measured again
+   with restic 0.18.1 held to two CPUs, on the same data each time, a first
+   backup of 400 MB of incompressible data peaked at 107 MiB of anonymous
+   memory against a local MinIO, at 164 MiB against that MinIO behind a 3 MB/s
+   link and 161 MiB behind a 20 MB/s one, and at 171 MiB against Hetzner
+   Object Storage; a first backup of 2 GB there at 175 MiB. Compressible data
+   was lower but not low (123 MiB against Hetzner), since its packs still wait
+   for the link. One upload at a time (`s3.connections=1`) held it to 98 MiB at
+   less than half the upload speed; the smallest pack restic makes, 4 MiB, to
+   100 MiB, at the same upload speed behind either link and 16 % slower against
+   Hetzner from a host where each request's round trip, not the link, was the
+   limit. The chart sets that pack size (`RESTIC_PACK_SIZE=4`); an existing
+   repository keeps its larger packs, and new data takes about three times as
+   many objects (83 instead of 25 for 400 MB).
+
+   With the three settings, against Hetzner Object Storage, a first backup of
+   400 MB peaked at 100 MiB of anonymous memory and one of 2 GB at 107 MiB
+   (111 MiB behind a 20 MB/s link); a later run that uploaded 40 MB at 93 MiB,
+   one with nothing new at 47 MiB, and compressible data at 94 MiB. From the
+   kind measurement, where the link did not count: the weekly check at
+   137 MiB on a repository of 1.51 million blobs, and the largest run
+   measured, a first backup into that repository followed by the in-Job
+   prune, at 200 MiB. The backup and check Jobs request **128Mi** of memory
+   and 100m of CPU, and are limited to **384Mi**. The request covers a first
+   backup of 2 GB into a real bucket, with the runner's own 2 MiB, by about
+   15 MiB, and every later run by more; no first backup larger than 2 GB was
+   measured. The limit is 1.9 times the largest run measured, and without the
+   memory settings a backup into that repository peaked at 280 MiB and passed
+   under it. A run above its request uses memory no other pod was promised,
+   and under node memory pressure it is among the first the kubelet evicts.
 
    The same measurement found the staging volume unused: the runner staged in
    the container's writable layer, where `stagingSizeLimit` bounded nothing.

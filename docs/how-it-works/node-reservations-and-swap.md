@@ -137,10 +137,14 @@ scheduler cannot place, with the scheduler's reason, and `apprafter top` shows
 what is left in its `SCHEDULABLE` column. The recipe is [the backup runner's
 pod cannot be scheduled](../operator-guide/backup-restore.md#runner-unschedulable).
 
-The runner's 128Mi is measured, not guessed: restic's memory follows the size
-of the repository's index and the CPUs it is allowed, not the size of the
-data, so the platform holds restic to two CPUs and a 96 MiB heap target, and
-limits the runner to 384Mi. The decision and the measurements are in [ADR
+The runner's 128Mi is measured, not guessed. restic's memory follows the size
+of the repository's index, the CPUs it is allowed, and how fast the bucket
+takes the data, not the size of the data. restic uploads the data in pack
+files and holds each one in memory until the bucket has it, up to five at a
+time, so the platform makes those files 4 MiB instead of restic's 16 MiB. It
+also holds restic to two CPUs and a 96 MiB heap target, and limits the runner
+to 384Mi. With those settings a first backup of 2 GB into a real bucket peaked
+at about 110 MiB. The decision and the measurements are in [ADR
 0053](../adr/0053-resource-governance.md#amendment-the-backup-runner-in-the-tier-1-budget-2026-09-23).
 
 ## A rollout releases before it asks

@@ -52,13 +52,18 @@
 #      carry the limit sized from the same measurement, with no CPU limit
 #      (WI-386): 128Mi requested, 384Mi limit, 100m CPU requested.
 #   6. both CronJobs give restic the settings those numbers were measured
-#      with: GOMAXPROCS "2" and GOMEMLIMIT "96MiB". Without GOMAXPROCS restic
-#      sizes its concurrency by the node's CPU count, and a 32-CPU node took a
-#      first backup to 695 MiB. Both slow restic's progress output to one line
-#      a minute (the runner holds all of restic's output in memory until
-#      restic exits, and copies what check and prune print into the log) and
-#      give restic a cache directory it can write (HOME is / for the image's
-#      user). Both keep what restic writes to disk on the staging volume:
+#      with: GOMAXPROCS "2", GOMEMLIMIT "96MiB" and RESTIC_PACK_SIZE "4".
+#      Without GOMAXPROCS restic sizes its concurrency by the node's CPU
+#      count, and a 32-CPU node took a first backup to 695 MiB. Without the
+#      pack size, every upload in flight holds a whole 16 MiB pack in memory
+#      (restic asks its S3 library for an MD5, which buffers the pack), and
+#      on a link slower than restic fills packs all five are in flight: a
+#      first backup of 400 MB into Hetzner Object Storage peaked at 171 MiB
+#      against 100 MiB with 4 MiB packs. Both slow restic's progress output
+#      to one line a minute (the runner holds all of restic's output in
+#      memory until restic exits, and copies what check and prune print into
+#      the log) and give restic a cache directory it can write (HOME is / for
+#      the image's user). Both keep what restic writes to disk on the staging volume:
 #      TMPDIR is its mountPath and restic's cache is under it, so
 #      stagingSizeLimit bounds the backup's dumps and both Jobs' cache and
 #      temporary files, which in /tmp no limit counted.
@@ -283,7 +288,7 @@ assert_resources() {
         want="${pair#*=}"
         got="$(container_value "$rendered" "$name" ".resources.${pair%%=*}")"
         [[ "$got" == "$want" ]] \
-            || fail "$label: CronJob '$name' resources.${pair%%=*} is '${got:-absent}', want '${want:-absent}' (WI-386 measured a typical run at about 100 MiB of anonymous memory with the restic settings below, and sized the limit from the largest run measured, 200 MiB)"
+            || fail "$label: CronJob '$name' resources.${pair%%=*} is '${got:-absent}', want '${want:-absent}' (WI-386 measured a first backup into real S3 at about 100 MiB of anonymous memory with the restic settings below, and sized the limit from the largest run measured, 200 MiB)"
     done
     echo "  ok: $label — $name: requests cpu 100m, memory 128Mi; limit memory 384Mi; no CPU limit"
 }
@@ -368,9 +373,9 @@ for rendered in "$workdir/defaults.yaml" "$workdir/set.yaml"; do
     assert_resources "$label" "$rendered" apprafter-backup
     assert_resources "$label" "$rendered" apprafter-backup-check
     assert_env "$label" "$rendered" apprafter-backup \
-        GOMAXPROCS=2 GOMEMLIMIT=96MiB RESTIC_PROGRESS_FPS=0.0167
+        GOMAXPROCS=2 GOMEMLIMIT=96MiB RESTIC_PACK_SIZE=4 RESTIC_PROGRESS_FPS=0.0167
     assert_env "$label" "$rendered" apprafter-backup-check \
-        GOMAXPROCS=2 GOMEMLIMIT=96MiB RESTIC_PROGRESS_FPS=0.0167 \
+        GOMAXPROCS=2 GOMEMLIMIT=96MiB RESTIC_PACK_SIZE=4 RESTIC_PROGRESS_FPS=0.0167 \
         TMPDIR=/staging RESTIC_CACHE_DIR=/staging/restic-cache
     for name in apprafter-backup apprafter-backup-check; do
         assert_staging_on_the_volume "$label" "$rendered" "$name"

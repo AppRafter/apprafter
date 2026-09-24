@@ -643,6 +643,22 @@ _backupTemplate: """
 	              value: "2"
 	            - name: GOMEMLIMIT
 	              value: "96MiB"
+	            # restic's S3 backend asks its S3 library to send each pack file's
+	            # MD5 and hands it a reader it cannot rewind, so the library reads
+	            # the whole pack into memory before it sends it, and restic sends
+	            # up to five packs at once. When the bucket takes data more slowly
+	            # than restic fills packs, all five are in flight: with the default
+	            # 16 MiB packs, a first backup peaked at 171 MiB of anonymous memory
+	            # against Hetzner Object Storage and at 107 MiB against a local
+	            # MinIO, on the same data, and at 164 MiB against that MinIO behind
+	            # a 3 MB/s link (WI-386). 4 MiB, restic's smallest, bounds the
+	            # buffers at a quarter: 100 MiB against Hetzner, at the same upload
+	            # speed behind a 3 or a 20 MB/s link, and 16 % slower where the
+	            # round trip of each request and not the link was the limit. A
+	            # repository keeps the packs it has; new data takes about three
+	            # times as many objects (83 instead of 25 for 400 MB).
+	            - name: RESTIC_PACK_SIZE
+	              value: "4"
 	            # `restic backup --json` prints a progress line 60 times a second
 	            # even without a terminal, and the runner holds all of restic's
 	            # output in memory until restic exits: about 36 MiB for each hour
@@ -677,20 +693,24 @@ _backupTemplate: """
 	            # the same number either way.
 	            - name: RESTIC_CACHE_DIR
 	              value: /staging/restic-cache
-	            # Measured (WI-386) with the settings above: a first backup of a
-	            # 2 GB database peaked at about 100 MiB of anonymous memory, a
-	            # first backup of 470 MB of PostgreSQL, a persistent Dragonfly
-	            # instance and a volume at 98 MiB, and the later runs of that
-	            # data at 64 MiB; the kernel adds a few MiB. The data adds page
-	            # cache, which the limit reclaims, not restic heap. The request is
-	            # what the scheduler must find free on the node, so it covers the
-	            # typical run: a 4 GB node running the platform and one
-	            # application with needs.pg and a persistent needs.redis has room
-	            # for it. The limit is 1.9 times the largest run measured, a
-	            # first backup into a repository of 1.51M blobs followed by the
-	            # prune (200 MiB); without GOMEMLIMIT a backup into that
-	            # repository peaked at 280 MiB and passed under this limit, and
-	            # was killed under 256Mi.
+	            # Measured (WI-386) with the settings above, against Hetzner Object
+	            # Storage on two CPUs: a first backup of 400 MB of incompressible
+	            # data peaked at 100 MiB of anonymous memory and one of 2 GB at
+	            # 107 MiB (111 MiB behind a 20 MB/s link); a later run with 40 MB
+	            # new at 93 MiB and one with nothing new at 47 MiB. The runner adds
+	            # 2 MiB and the kernel a few, so a first backup of 2 GB leaves
+	            # about 15 MiB of the request.
+	            # The data adds page cache, which the limit reclaims, not restic
+	            # heap. The request is what the scheduler must find free on the
+	            # node, so it covers a first backup: a 4 GB node running the
+	            # platform and one application with needs.pg and a persistent
+	            # needs.redis has room for it. On a real 4 GB machine, before the
+	            # pack size above, a first backup of a 403 MB database peaked at
+	            # 155 MiB. The limit is 1.9 times the largest run measured, a first
+	            # backup into a repository of 1.51M blobs followed by the prune
+	            # (200 MiB, on kind); without GOMEMLIMIT a backup into that
+	            # repository peaked at 280 MiB and passed under this limit, and was
+	            # killed under 256Mi.
 	            resources:
 	              requests:
 	                cpu: 100m
@@ -832,8 +852,9 @@ _backupTemplate: """
 	            - name: APPRAFTER_BACKUP_FAILURE_WEBHOOK
 	              value: {{ $b.failureWebhook | quote }}
 	            {{- end }}
-	            # The backup runner's restic settings, for the same reasons.
-	            # Measured (WI-386) with them: a check peaked at 43-51 MiB of
+	            # The backup runner's restic settings, for the same reasons: the
+	            # prune after the check uploads the packs it rewrites, as a backup
+	            # does. Measured (WI-386) with them: a check peaked at 43-51 MiB of
 	            # anonymous memory on a small repository and at 137 MiB on one of
 	            # 1.51M blobs, and a prune about as much as a backup (180 MiB at
 	            # 6.6k blobs, 304 MiB at 1.51M without GOMEMLIMIT).
@@ -841,6 +862,8 @@ _backupTemplate: """
 	              value: "2"
 	            - name: GOMEMLIMIT
 	              value: "96MiB"
+	            - name: RESTIC_PACK_SIZE
+	              value: "4"
 	            # Without a terminal restic prints no periodic progress; with
 	            # this it prints a line a minute. The runner copies each line
 	            # `restic check` and `restic prune` print into this pod's log as
