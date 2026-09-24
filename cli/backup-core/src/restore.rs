@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! 2.6d restore: ordered step-decision state machine (pure, unit-testable).
 
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,7 +81,8 @@ pub struct UnfinishedRun {
     pub tag: String,
     /// How many snapshots it holds.
     pub snapshots: usize,
-    /// The newest of their times, as restic reports it (RFC 3339).
+    /// The newest of their times, as restic reports it (RFC 3339, with the
+    /// writer's own UTC offset). "Newest" is by the clock, not the string.
     pub newest: String,
 }
 
@@ -193,7 +195,7 @@ pub fn resolve_run_snapshots(
 
     // An untagged snapshot cannot be grouped, and must not silently drag in
     // every other untagged snapshot in the repository.
-    let mut claims: Vec<(String, String)> = Vec::new();
+    let mut claims: Vec<(Option<DateTime<Utc>>, String)> = Vec::new();
     if !commit_tags.is_empty() {
         for s in &snaps {
             let id = id_of(s);
@@ -204,10 +206,12 @@ pub fn resolve_run_snapshots(
                 .iter()
                 .any(|t| commit_tags.contains(t))
             {
-                claims.push((time_of(s), id));
+                claims.push((instant_of(s), id));
             }
         }
     }
+    // Oldest first by the clock: the strings of one run need not order as
+    // its instants do (a run across the autumn clock change).
     claims.sort();
 
     Ok(RunSnapshots {
@@ -255,13 +259,30 @@ fn id_of(s: &Value) -> String {
         .to_string()
 }
 
-/// A snapshot's RFC-3339 time, or the empty string — which sorts first, so an
-/// undated snapshot never wins a `max_by_key`.
+/// A snapshot's time as restic reports it, or the empty string. For display
+/// only: compare [`instant_of`].
 fn time_of(s: &Value) -> String {
     s.get("time")
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string()
+}
+
+/// A snapshot's time as an instant, which is what every comparison here uses.
+///
+/// restic records the time with the WRITER's UTC offset: the in-cluster
+/// runner writes `…Z`, a `backup create` on a workstation writes its local
+/// offset (`…+01:00`), and one repository can hold both. Their strings do not
+/// order as their instants do — `2026-09-24T04:00:03+01:00` is half an hour
+/// BEFORE `2026-09-24T03:30:00Z` — so comparing them picked the older run as
+/// `latest` and hid a newer unfinished one.
+///
+/// `None` — no time, or one that does not parse — orders before every
+/// instant, so such a snapshot never wins a `max_by_key`.
+fn instant_of(s: &Value) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(s.get("time").and_then(Value::as_str)?)
+        .ok()
+        .map(|t| t.with_timezone(&Utc))
 }
 
 /// A snapshot's `paths`, as restic reports them.
@@ -293,6 +314,8 @@ struct Latest<'a> {
 /// untagged snapshot being a run of its own. A snapshot that completes
 /// nothing, in a run where nothing else does either, belongs to an
 /// [`UnfinishedRun`].
+///
+/// "Newest" is by the clock, never by the time string ([`instant_of`]).
 fn choose_latest<'a>(
     snaps: &'a [Value],
     this_cluster_uid: Option<&str>,
@@ -315,13 +338,15 @@ fn choose_latest<'a>(
     };
 
     let (complete, rest): (Vec<&Value>, Vec<&Value>) = pool.into_iter().partition(|s| completes(s));
-    let commit = complete.iter().copied().max_by_key(|s| time_of(s));
+    let commit = complete.iter().copied().max_by_key(|s| instant_of(s));
 
     // The other snapshots, by run. A complete run's own per-claim snapshots
     // are among them, but all are older than its commit — written last — so
     // none is newer than the run `latest` chose, which is all that is
     // reported; and with no complete run there are none.
-    let mut unfinished: std::collections::BTreeMap<String, UnfinishedRun> =
+    //
+    // Each run carries its newest INSTANT beside the string it displays.
+    let mut unfinished: std::collections::BTreeMap<String, (UnfinishedRun, Option<DateTime<Utc>>)> =
         std::collections::BTreeMap::new();
     for s in rest {
         let tag = crate::cluster::snapshot_tags(s)
@@ -334,17 +359,29 @@ fn choose_latest<'a>(
         } else {
             tag.clone()
         };
-        let run = unfinished.entry(key).or_insert_with(|| UnfinishedRun {
-            tag,
-            snapshots: 0,
-            newest: String::new(),
+        let at = instant_of(s);
+        let (run, newest_at) = unfinished.entry(key).or_insert_with(|| {
+            (
+                UnfinishedRun {
+                    tag,
+                    snapshots: 0,
+                    newest: time_of(s),
+                },
+                at,
+            )
         });
         run.snapshots += 1;
-        run.newest = run.newest.clone().max(time_of(s));
+        if at > *newest_at {
+            *newest_at = at;
+            run.newest = time_of(s);
+        }
     }
 
     let Some(commit) = commit else {
-        let newest = unfinished.values().map(|r| r.newest.as_str()).max();
+        let newest = unfinished
+            .values()
+            .max_by_key(|(_, at)| *at)
+            .map(|(r, _)| r.newest.as_str());
         return Err(format!(
             "no complete backup run to choose: {} run(s) here, and none has the snapshot that \
              completes it, the one carrying manifest.json{} — each was interrupted before its \
@@ -357,15 +394,15 @@ fn choose_latest<'a>(
                 .unwrap_or_default(),
         ));
     };
-    let chosen = time_of(commit);
-    let mut passed_over: Vec<UnfinishedRun> = unfinished
+    let chosen = instant_of(commit);
+    let mut passed_over: Vec<(UnfinishedRun, Option<DateTime<Utc>>)> = unfinished
         .into_values()
-        .filter(|r| r.newest > chosen)
+        .filter(|(_, at)| *at > chosen)
         .collect();
-    passed_over.sort_by(|a, b| b.newest.cmp(&a.newest));
+    passed_over.sort_by(|(_, a), (_, b)| b.cmp(a));
     Ok(Latest {
         commit,
-        passed_over,
+        passed_over: passed_over.into_iter().map(|(r, _)| r).collect(),
     })
 }
 
@@ -964,6 +1001,160 @@ mod tests {
         let r = resolve_run_snapshots(&interrupted_listing(), "d-commit", Some(MINE)).unwrap();
         assert_eq!(r.commit, "d-commit");
         assert!(r.passed_over.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Times are instants: restic keeps the WRITER's UTC offset.
+    // -----------------------------------------------------------------------
+
+    /// One repository, two writers. The in-cluster runner writes `…Z`; a
+    /// `backup create` from a workstation an hour east of UTC writes
+    /// `…+01:00` — the offset restic recorded in the field. The CLI's run
+    /// here committed at `04:00:03.1+01:00`, which is 03:00:03.1 UTC: half
+    /// an hour BEFORE the runner's 03:30 run, and the later string.
+    fn cli_run(tag_time: &str) -> String {
+        let tag = format!("{MINE}-{tag_time}");
+        format!(
+            r#"{{"id":"cli-claim0","time":"2026-09-24T04:00:01.1+01:00","tags":["{tag}"],
+                 "paths":["/tmp/apprafter-backup-c/claim-0"]}},
+               {{"id":"cli-commit","time":"2026-09-24T04:00:03.1+01:00","tags":["{tag}"],
+                 "paths":["/tmp/apprafter-backup-c/commit"]}}"#
+        )
+    }
+
+    /// FIRES: the newest complete run is the runner's, by the clock. Compared
+    /// as strings, `2026-09-24T04…` beat `2026-09-24T03…`, and `latest`
+    /// restored the CLI's older run.
+    #[test]
+    fn latest_orders_runs_by_instant_not_by_the_writers_offset() {
+        let listing = format!(
+            r#"[
+              {{"id":"runner-mono","time":"2026-09-24T03:30:00.1Z",
+                "tags":["{MINE}-2026-09-24T03:30:00Z"],"paths":["/staging/apprafter-backup-r/data"]}},
+              {}
+            ]"#,
+            cli_run("2026-09-24T03:00:00Z")
+        );
+        let r = resolve_run_snapshots(&listing, "latest", Some(MINE)).unwrap();
+        assert_eq!(r.commit, "runner-mono", "03:30Z is after 04:00:03+01:00");
+        assert!(r.claims.is_empty(), "{:?}", r.claims);
+        assert!(r.passed_over.is_empty(), "{:?}", r.passed_over);
+        let shown = resolve_latest_snapshot(&listing, Some(MINE)).unwrap();
+        assert_eq!(
+            shown.id, "runner-mono",
+            "`backup show` resolves the same run"
+        );
+    }
+
+    /// FIRES: a runner run cut at 03:30Z is newer than the CLI run `latest`
+    /// chose, and has to be named. Compared as strings it was "older" and
+    /// silently dropped; and two passed-over runs are listed newest first by
+    /// the clock, not by the string.
+    #[test]
+    fn a_newer_unfinished_run_is_reported_whatever_offset_either_writer_used() {
+        let listing = format!(
+            r#"[
+              {}
+              ,{{"id":"r-claim0","time":"2026-09-24T03:30:00.1Z",
+                "tags":["{MINE}-2026-09-24T03:29:00Z"],"paths":["/staging/apprafter-backup-r/claim-0"]}}
+              ,{{"id":"k-claim0","time":"2026-09-24T04:20:00+01:00",
+                "tags":["{MINE}-2026-09-24T03:19:00Z"],"paths":["/tmp/apprafter-backup-k/claim-0"]}}
+            ]"#,
+            cli_run("2026-09-24T03:00:00Z")
+        );
+        let r = resolve_run_snapshots(&listing, "latest", Some(MINE)).unwrap();
+        assert_eq!(r.commit, "cli-commit");
+        let newest: Vec<&str> = r.passed_over.iter().map(|u| u.newest.as_str()).collect();
+        assert_eq!(
+            newest,
+            vec!["2026-09-24T03:30:00.1Z", "2026-09-24T04:20:00+01:00"],
+            "both are newer than 03:00:03Z, and 03:30Z is newer than 03:20Z"
+        );
+        let shown = resolve_latest_snapshot(&listing, Some(MINE)).unwrap();
+        assert_eq!(
+            shown.passed_over, r.passed_over,
+            "show and restore say the same"
+        );
+    }
+
+    /// The autumn clock change inside one run: `claim-0` at 02:59:50 CEST is
+    /// 00:59:50 UTC, `claim-1` at 02:00:10 CET is 01:00:10 UTC. The claims
+    /// come oldest first by the clock, and an unfinished run's newest time is
+    /// the later instant, whatever its string says.
+    fn across_the_clock_change(done: &str, run: &str, last: &str) -> String {
+        format!(
+            r#"{{"id":"{run}-claim0","time":"2026-10-25T02:59:50+02:00","tags":["{done}"],
+                 "paths":["/tmp/apprafter-backup-{run}/claim-0"]}},
+               {{"id":"{run}-claim1","time":"2026-10-25T02:00:10+01:00","tags":["{done}"],
+                 "paths":["/tmp/apprafter-backup-{run}/claim-1"]}}{last}"#
+        )
+    }
+
+    #[test]
+    fn a_runs_claims_come_oldest_first_by_the_clock() {
+        let tag = format!("{MINE}-2026-10-25T00:59:00Z");
+        let commit = format!(
+            r#",{{"id":"x-commit","time":"2026-10-25T02:00:20+01:00","tags":["{tag}"],
+                  "paths":["/tmp/apprafter-backup-x/commit"]}}"#
+        );
+        let listing = format!("[{}]", across_the_clock_change(&tag, "x", &commit));
+        let r = resolve_run_snapshots(&listing, "latest", Some(MINE)).unwrap();
+        assert_eq!(r.commit, "x-commit");
+        assert_eq!(r.claims, vec!["x-claim0", "x-claim1"]);
+    }
+
+    #[test]
+    fn an_unfinished_runs_newest_time_is_the_later_instant() {
+        let tag = format!("{MINE}-2026-10-25T00:59:00Z");
+        let listing = format!(
+            r#"[
+              {{"id":"mono","time":"2026-10-24T03:00:00Z","tags":["{MINE}-2026-10-24T03:00:00Z"],
+                "paths":["/s/a/data"]}},
+              {}
+            ]"#,
+            across_the_clock_change(&tag, "y", "")
+        );
+        let r = resolve_run_snapshots(&listing, "latest", Some(MINE)).unwrap();
+        assert_eq!(r.commit, "mono");
+        assert_eq!(r.passed_over.len(), 1, "{:?}", r.passed_over);
+        assert_eq!(r.passed_over[0].newest, "2026-10-25T02:00:10+01:00");
+    }
+
+    /// With nothing complete, the error names the newest unfinished run's
+    /// time by the clock too.
+    #[test]
+    fn the_no_complete_run_error_names_the_newest_time_by_the_clock() {
+        let listing = format!(
+            r#"[
+              {{"id":"r-claim0","time":"2026-09-24T03:30:00.1Z",
+                "tags":["{MINE}-2026-09-24T03:29:00Z"],"paths":["/s/r/claim-0"]}},
+              {{"id":"k-claim0","time":"2026-09-24T04:20:00+01:00",
+                "tags":["{MINE}-2026-09-24T03:19:00Z"],"paths":["/s/k/claim-0"]}}
+            ]"#
+        );
+        let err = resolve_run_snapshots(&listing, "latest", Some(MINE)).unwrap_err();
+        assert!(
+            err.contains("the newest written at 2026-09-24T03:30:00.1Z"),
+            "{err}"
+        );
+    }
+
+    /// A snapshot whose time does not parse is older than every one that
+    /// does — as a missing time always was. As a string, `yesterday` sorted
+    /// after every date and won.
+    #[test]
+    fn a_time_that_does_not_parse_never_wins_latest() {
+        for bad in [r#""time":"yesterday","#, ""] {
+            let listing = format!(
+                r#"[
+                  {{"id":"good","time":"2026-09-24T03:00:00Z",
+                    "tags":["{MINE}-2026-09-24T03:00:00Z"],"paths":["/s/a/data"]}},
+                  {{"id":"bad",{bad}"tags":["{MINE}-2026-09-25T03:00:00Z"],"paths":["/s/b/data"]}}
+                ]"#
+            );
+            let r = resolve_run_snapshots(&listing, "latest", Some(MINE)).unwrap();
+            assert_eq!(r.commit, "good", "bad time: {bad:?}");
+        }
     }
 
     use super::*;
