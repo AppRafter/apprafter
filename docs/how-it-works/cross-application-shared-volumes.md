@@ -147,8 +147,8 @@ snapshots, the container image store and the logs — and that is reported on it
 own: `NodeDiskPressure` on the `PlatformStack` singleton, `True` with reason
 `NodeFilesystemNearlyFull` once the node's root filesystem drops below **15%**
 free, `False` with `SufficientSpace` above it. It exists on every cluster,
-including one with no SharedVolume at all, and every `apprafter` command prints
-a banner while it is `True`.
+including one with no SharedVolume at all, and every `apprafter` command that
+reaches beyond your machine prints a banner while it is `True`.
 
 The same sampler stamps `status.capacity`, with the same `scope` field, on an
 owned disk's `ResourceClaim` — that is what `apprafter app status` shows in its

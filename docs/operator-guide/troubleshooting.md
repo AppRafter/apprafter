@@ -458,11 +458,14 @@ The public-domain path has several moving parts; work outward:
 
 Full runbook: [connect a domain](connect-a-domain.md).
 
-### Every command prints `Node disk: …` {#node-disk}
+### Commands print `Node disk: …` {#node-disk}
 
 The node's root filesystem has less than **15% free**, and the platform says
-so above every `apprafter` command until it does not. The banner carries the
-figure and what shares that filesystem:
+so above every `apprafter` command that reaches beyond your machine until it
+does not. `--help`, `--version` and the commands that only work with local
+files, such as `completion`, `target list` and `app validate`, neither print
+it nor read the cluster to find out. The banner carries the figure and what
+shares that filesystem:
 
 ```text
 warn: Node disk: the node's filesystem is 88% full (12% free). Every workload

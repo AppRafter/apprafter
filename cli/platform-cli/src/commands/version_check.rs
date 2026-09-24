@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! npm-style "newer CLI available" check. Track B.1.79.
 //!
-//! Runs at the start of every `apprafter` invocation. Caches
-//! the latest-release lookup in `~/.cache/apprafter/version-
+//! Runs before every command that reaches beyond this machine
+//! ([`crate::startup`]); never for `--help`, `--version` or a
+//! local-only command such as `completion`. Caches the
+//! latest-release lookup in `~/.cache/apprafter/version-
 //! check.json` with a 6-hour TTL — busy operators don't pay
 //! for a GitHub API round-trip on every shell command. The
 //! warning prints once per shell session (cache hit on

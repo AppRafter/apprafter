@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! "Your node is nearly out of disk" banner. 2.22d / D8.
 //!
-//! Runs at the start of every `apprafter` invocation, on the model of
-//! [`super::version_check`], because the thing it warns about is not
-//! specific to any one command: the node's root filesystem carries every
-//! local-path volume, the database's data directory, snapshot files, the
-//! container image store and the logs. When it fills, everything on that
-//! node stops writing at once, and the operator finds out from whichever
-//! symptom happens to surface first.
+//! Runs before every command that reaches beyond this machine
+//! ([`crate::startup`]), on the model of [`super::version_check`], because
+//! the thing it warns about is not specific to any one command: the node's
+//! root filesystem carries every local-path volume, the database's data
+//! directory, snapshot files, the container image store and the logs. When
+//! it fills, everything on that node stops writing at once, and the operator
+//! finds out from whichever symptom happens to surface first.
 //!
 //! # Why a banner and not a status line
 //!
