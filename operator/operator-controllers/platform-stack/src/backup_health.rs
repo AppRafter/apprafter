@@ -16,6 +16,10 @@
 //!   container goes, so nothing is written;
 //! - the kubelet evicts it, for node memory pressure or for staging past the
 //!   `/staging` emptyDir's `sizeLimit`;
+//! - the scheduler preempts it for a pod that needs its room. The runner's
+//!   priority is below every other pod's (ADR 0053), so any pod can. The
+//!   runner does record this stop, but its pod is gone within seconds, and
+//!   a condition that skipped a pod being deleted read `True` meanwhile;
 //! - the Job's deadline passes while the pod was never placed;
 //! - the Job controller cannot create the pod at all (a quota, a
 //!   LimitRange, an admission webhook), which only its events record;
@@ -55,10 +59,22 @@
 //! at all. An attempt that has failed is trouble at once, and stays the
 //! verdict while the Job's next pod waits or runs: nothing will undo it. That
 //! holds for a runner killed (`OOMKilled`) or evicted, which records nothing,
-//! and for one that exited non-zero (`RunnerFailed`, `RepositoryCheckFailed`
+//! for one that exited non-zero (`RunnerFailed`, `RepositoryCheckFailed`
 //! for the check), which has recorded the failure and posted its webhook
-//! while the Job's own ending may be hours away. A retry that succeeds
-//! completes the Job, and that clears it.
+//! while the Job's own ending may be hours away, and for one stopped from
+//! outside while its Job ran — preempted (`RunnerPreempted`), drained or
+//! deleted (`RunnerStopped`) — which the Job counts as a failed attempt and
+//! the runner records as one. A retry that succeeds completes the Job, and
+//! that clears it.
+//!
+//! A pod stopped from outside is gone within seconds of its runner exiting,
+//! often before any read sees it. The attempt is still known from the Job's
+//! count of failed pods — every failed pod of a Job that has not ended is
+//! kept, so a counted failure with no pod left was deleted — together with
+//! the runner's record of a failure in the Job's life, or with what this
+//! condition said about the Job while the pod was there. The condition's own
+//! earlier words are also what keeps "preempted" once the pod that said so
+//! is gone.
 //!
 //! Messages are built from the objects' own timestamps, never from "how long
 //! ago", so re-reading unchanged objects gives a byte-identical condition and
@@ -135,6 +151,17 @@ pub const REASON_UNSCHEDULABLE: &str = "RunnerUnschedulable";
 pub const REASON_NOT_STARTED: &str = "RunnerNotStarted";
 pub const REASON_OOM_KILLED: &str = "RunnerOOMKilled";
 pub const REASON_EVICTED: &str = "RunnerEvicted";
+/// An attempt was preempted: the scheduler stopped the runner's pod to make
+/// room for a pod of higher priority, which with the runner's priority below
+/// every other pod's is any pod. The runner records the stop and posts its
+/// failure webhook, the attempt counts against the Job's backoff limit, and
+/// the Job's next pod waits for room. Reported at once, while the Job
+/// retries, and kept when the Job ends.
+pub const REASON_PREEMPTED: &str = "RunnerPreempted";
+/// An attempt was stopped from outside for another reason, or for one no
+/// longer known: a node drain, a deletion, the taint manager. Reported and
+/// kept like [`REASON_PREEMPTED`].
+pub const REASON_STOPPED: &str = "RunnerStopped";
 /// An attempt of a backup ran and failed on its own: the runner exited
 /// non-zero, and recorded why. Reported at once, while the Job retries, and
 /// kept when its deadline ends the Job before its backoff limit does.
@@ -572,7 +599,7 @@ fn assess_run(
     let mut recheck_at: Option<DateTime<Utc>> = None;
     let mut trouble: Option<(Outcome, &Value)> = None;
     for job in jobs.iter().filter(|j| ending(j).is_none()) {
-        let (found, at) = unfinished_trouble(run, job, observed, now);
+        let (found, at) = unfinished_trouble(run, job, observed, prior, now);
         recheck_at = earliest(recheck_at, at);
         if trouble.is_none() {
             trouble = found.map(|o| (o, *job));
@@ -666,6 +693,7 @@ fn unfinished_trouble(
     run: Run,
     job: &Value,
     observed: &Observed,
+    prior: Option<&PlatformStackCondition>,
     now: DateTime<Utc>,
 ) -> (Option<Outcome>, Option<DateTime<Utc>>) {
     let owned: Vec<&Value> = observed.pods.iter().filter(|p| owned_by(p, job)).collect();
@@ -676,7 +704,7 @@ fn unfinished_trouble(
     } else {
         String::new()
     };
-    let earlier = failed_attempt(run, job, observed, now);
+    let earlier = failed_attempt(run, job, observed, prior, now);
 
     let live = owned
         .iter()
@@ -880,23 +908,27 @@ impl FailedAttempt {
     }
 }
 
-/// The newest attempt of `job` that failed on its own, as trouble now,
-/// whatever the Job's next attempt is doing.
+/// The newest failed attempt of `job`, as trouble now, whatever the Job's
+/// next attempt is doing.
 ///
 /// A runner killed at its limit or evicted records nothing, and the same
 /// data meets the same limit on the retry. A runner that exited non-zero has
 /// recorded why and posted the failure webhook — and the Job's own ending
 /// can be ten minutes away (seven attempts, 10 s to 320 s apart) or, for
 /// attempts that fail slowly, the six-hour deadline. Reading `True` meanwhile
-/// would contradict the runner's own record. A retry that succeeds completes
-/// the Job, and that is what clears it.
+/// would contradict the runner's own record. So would reading it for a runner
+/// stopped from outside: preempted, drained or deleted, it records the stop
+/// and posts the webhook too, and the Job counts it against its backoff
+/// limit. A retry that succeeds completes the Job, and that is what clears
+/// it.
 fn failed_attempt(
     run: Run,
     job: &Value,
     observed: &Observed,
+    prior: Option<&PlatformStackCondition>,
     now: DateTime<Utc>,
 ) -> Option<FailedAttempt> {
-    let pod = last_failed_attempt(job, &observed.pods)?;
+    let newest = newest_failed_attempt(run, job, observed, prior, now)?;
     // The Job's own count lags its pods by a sync; the failed pods it still
     // has are the floor.
     let failed = failed_attempts(job, &observed.pods).max(1);
@@ -912,7 +944,22 @@ fn failed_attempt(
         " It was the last attempt the Job makes."
     };
     let prefix = format!("{} Job {}: its {attempt}", run.noun(), name(job));
-    let (reason, what, alone) = match attempt_cause(pod) {
+    // The attempt's own record, written before its container exited: up to
+    // its end, or up to now for one still stopping or already gone.
+    let until = match newest {
+        Newest::Pod(pod) => finished_at(pod).unwrap_or(now),
+        Newest::Gone(_) => now,
+    };
+    let recorded = run
+        .record_keys()
+        .and_then(|keys| runner_record(job, Some(until), observed.runner_status.as_ref(), keys))
+        .map(|e| format!(" The runner recorded: {e}"))
+        .unwrap_or_default();
+    let cause = match newest {
+        Newest::Pod(pod) => attempt_cause(pod),
+        Newest::Gone(stop) => stop.cause(),
+    };
+    let (reason, what, alone) = match cause {
         Cause::OomKilled(what) => {
             let alone = format!("{prefix} {what}; a killed runner records nothing itself.{next}");
             (REASON_OOM_KILLED, what, alone)
@@ -921,27 +968,18 @@ fn failed_attempt(
             let alone = format!("{prefix} {what}; an evicted runner records nothing itself.{next}");
             (REASON_EVICTED, what, alone)
         }
+        // The quote last: restic's words, and the runner's, end without a
+        // full stop.
+        Cause::Preempted(what) => {
+            let alone = format!("{prefix} {what}.{next}{recorded}");
+            (REASON_PREEMPTED, what, alone)
+        }
+        Cause::Stopped(what) => {
+            let alone = format!("{prefix} {what}.{next}{recorded}");
+            (REASON_STOPPED, what, alone)
+        }
         Cause::Exited(what) | Cause::Unknown(what) => {
-            // The attempt's own record: written before its container exited.
-            let until = pod
-                .pointer("/status/containerStatuses")
-                .and_then(Value::as_array)
-                .and_then(|cs| {
-                    cs.iter()
-                        .find_map(|c| c.pointer("/state/terminated/finishedAt"))
-                })
-                .and_then(Value::as_str)
-                .and_then(parse_time)
-                .unwrap_or(now);
-            let recorded = run
-                .record_keys()
-                .and_then(|keys| {
-                    runner_record(job, Some(until), observed.runner_status.as_ref(), keys)
-                })
-                .map(|e| format!(" The runner recorded: {e}"))
-                .unwrap_or_default();
             let means = what_a_failure_means(run);
-            // The quote last: restic's words end without a full stop.
             let alone = format!("{prefix} {what}.{means}{next}{recorded}");
             (ran_and_failed(run), what, alone)
         }
@@ -953,15 +991,204 @@ fn failed_attempt(
     })
 }
 
-/// The newest pod of `job` that failed on its own. A pod being deleted — a
-/// node drain, `kubectl delete`, the Job controller stopping it at the
-/// deadline — was stopped from outside, and its exit code is the signal's.
+/// Where the newest failed attempt of a Job is known from.
+#[derive(Clone, Copy)]
+enum Newest<'a> {
+    /// A pod the Job still has.
+    Pod(&'a Value),
+    /// An attempt the Job counts as failed whose pod is gone: stopped from
+    /// outside.
+    Gone(Stop),
+}
+
+/// What stopped an attempt whose pod is gone, as far as it is still known.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stop {
+    /// This condition said so while the pod was there.
+    Preempted,
+    /// Something outside the Job: which, is no longer known, or was not a
+    /// preemption.
+    Outside,
+}
+
+/// What an attempt whose pod is gone did, in the words a message uses. Both
+/// are also how [`seen_stopped`] recognises them in the condition later.
+const GONE_PREEMPTED: &str = "was preempted, and its pod is gone";
+const GONE_STOPPED: &str = "was stopped from outside before it finished, and its pod is gone: the \
+                            scheduler preempted it, a node drain evicted it, or it was deleted";
+
+impl Stop {
+    fn cause(self) -> Cause {
+        match self {
+            Stop::Preempted => Cause::Preempted(GONE_PREEMPTED.to_string()),
+            Stop::Outside => Cause::Stopped(GONE_STOPPED.to_string()),
+        }
+    }
+}
+
+/// The newest failed attempt of an unfinished `job`: the newest pod of it
+/// that failed or was stopped ([`is_failed_attempt`]), or an attempt the Job
+/// counts whose pod is gone, whichever is newer.
+///
+/// A pod stopped from outside is gone within seconds of its runner exiting,
+/// and a read may never see it: the operator restarting, or busy with
+/// another read, for those seconds — during an upgrade its own new pod can
+/// be the preemptor. The Job still counts it. A counted failure with no pod
+/// is claimed only with more evidence, since a pod the runner label does
+/// not select is counted too: the runner's record of a failure inside the
+/// Job's life, or this condition having said the Job's attempt was stopped
+/// (which is also the only thing left that can say it was a preemption).
+fn newest_failed_attempt<'a>(
+    run: Run,
+    job: &Value,
+    observed: &'a Observed,
+    prior: Option<&PlatformStackCondition>,
+    now: DateTime<Utc>,
+) -> Option<Newest<'a>> {
+    let pod = observed
+        .pods
+        .iter()
+        .filter(|p| owned_by(p, job))
+        .filter(|p| is_failed_attempt(p, job, false))
+        .max_by_key(|p| time_at(p, "/metadata/creationTimestamp"));
+    if gone_attempts(job, &observed.pods) == 0 {
+        return pod.map(Newest::Pod);
+    }
+    let recorded_at = run.record_keys().and_then(|keys| {
+        recorded_failure(job, Some(now), observed.runner_status.as_ref(), keys).map(|(at, _)| at)
+    });
+    let seen = seen_stopped(run, job, prior);
+    if recorded_at.is_none() && seen.is_none() {
+        return pod.map(Newest::Pod);
+    }
+    let gone = Newest::Gone(seen.unwrap_or(Stop::Outside));
+    match pod {
+        None => Some(gone),
+        // A pod still stopping is the newest attempt. One that has ended is
+        // older than a failure the runner recorded after its end: that
+        // record is a later attempt's.
+        Some(p) => match (finished_at(p), recorded_at) {
+            (Some(end), Some(at)) if at > end => Some(gone),
+            _ => Some(Newest::Pod(p)),
+        },
+    }
+}
+
+/// Is `pod` a failed attempt of `job`?
+///
+/// A pod that failed on its own is. So is one marked as disrupted
+/// (`DisruptionTarget`): the scheduler preempting it, an eviction through
+/// the API (a node drain), the taint manager, the kubelet — never the Job
+/// controller. A pod being deleted without that mark is, while the Job runs:
+/// the Job counts it as failed at once and starts another. It is not once
+/// the Job has `ended`, whose controller deletes the pods it still has at
+/// its deadline or backoff limit, nor while the Job is suspended, which
+/// deletes them too; its exit code is then the signal's.
+fn is_failed_attempt(pod: &Value, job: &Value, ended: bool) -> bool {
+    if str_at(pod, "/status/phase") == Some("Succeeded") {
+        return false;
+    }
+    // The mark alone is not enough: the disruption controller clears one
+    // left on a pod that was never deleted.
+    if disrupted(pod).is_some() && (deleting(pod) || str_at(pod, "/status/phase") == Some("Failed"))
+    {
+        return true;
+    }
+    if deleting(pod) {
+        return !ended && job.pointer("/spec/suspend").and_then(Value::as_bool) != Some(true);
+    }
+    str_at(pod, "/status/phase") == Some("Failed")
+}
+
+/// The newest failed attempt of a Job that has ended ([`is_failed_attempt`]).
 fn last_failed_attempt<'a>(job: &Value, pods: &'a [Value]) -> Option<&'a Value> {
     pods.iter()
         .filter(|p| owned_by(p, job))
-        .filter(|p| str_at(p, "/status/phase") == Some("Failed"))
-        .filter(|p| p.pointer("/metadata/deletionTimestamp").is_none())
+        .filter(|p| is_failed_attempt(p, job, true))
         .max_by_key(|p| time_at(p, "/metadata/creationTimestamp"))
+}
+
+fn deleting(pod: &Value) -> bool {
+    pod.pointer("/metadata/deletionTimestamp").is_some()
+}
+
+/// The pod's `DisruptionTarget` condition, when it is `True`.
+fn disrupted(pod: &Value) -> Option<&Value> {
+    pod_condition(pod, "DisruptionTarget")
+        .filter(|c| c.get("status").and_then(Value::as_str) == Some("True"))
+}
+
+fn disruption_reason(pod: &Value) -> Option<&str> {
+    disrupted(pod).and_then(|c| c.get("reason").and_then(Value::as_str))
+}
+
+/// When the pod's container ended, if it has.
+fn finished_at(pod: &Value) -> Option<DateTime<Utc>> {
+    pod.pointer("/status/containerStatuses")
+        .and_then(Value::as_array)
+        .and_then(|cs| {
+            cs.iter()
+                .find_map(|c| c.pointer("/state/terminated/finishedAt"))
+        })
+        .and_then(Value::as_str)
+        .and_then(parse_time)
+}
+
+/// How many attempts `job` counts as failed whose pods are gone. The Job
+/// controller keeps every failed pod of a Job, so a counted failure with no
+/// pod left was deleted: stopped from outside, or after the Job ended.
+/// Counted: `status.failed`, and the pods it has listed in
+/// `uncountedTerminatedPods` before it adds them there — in that step the
+/// pod can already be gone. Still there: the pods it counts as failed, the
+/// failed ones and those being deleted.
+fn gone_attempts(job: &Value, pods: &[Value]) -> u64 {
+    let still = pods
+        .iter()
+        .filter(|p| owned_by(p, job))
+        .filter(|p| str_at(p, "/status/phase") == Some("Failed") || counted_as_it_stops(p))
+        .count() as u64;
+    counted_failures(job).saturating_sub(still)
+}
+
+/// A pod being deleted that has not succeeded: the Job controller counts it
+/// as failed at once.
+fn counted_as_it_stops(pod: &Value) -> bool {
+    deleting(pod) && str_at(pod, "/status/phase") != Some("Succeeded")
+}
+
+fn counted_failures(job: &Value) -> u64 {
+    let failed = job
+        .pointer("/status/failed")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let uncounted = job
+        .pointer("/status/uncountedTerminatedPods/failed")
+        .and_then(Value::as_array)
+        .map_or(0, |a| a.len() as u64);
+    failed + uncounted
+}
+
+/// Did this condition, as it stands, say that an attempt of `job` was
+/// stopped from outside, and was it a preemption? Its own words are the
+/// only record of that once the pod is gone. Only the run's own part counts
+/// (not the other run named after `Also failing`), and only what it said
+/// about this Job.
+fn seen_stopped(run: Run, job: &Value, prior: Option<&PlatformStackCondition>) -> Option<Stop> {
+    let prior = prior.filter(|p| p.status == "False")?;
+    let own = own_part(prior.message.as_deref()?);
+    let job_name = name(job);
+    let about = own.strip_prefix(format!("{} Job {job_name}:", run.noun()).as_str())?;
+    if about.contains(format!(" was preempted (pod {job_name}").as_str())
+        || about.contains(GONE_PREEMPTED)
+    {
+        Some(Stop::Preempted)
+    } else if about.contains(format!(" was stopped from outside (pod {job_name}").as_str())
+        || about.contains(GONE_STOPPED)
+    {
+        Some(Stop::Outside)
+    } else {
+        None
+    }
 }
 
 /// The reason for attempts that ran and failed on their own: for a backup
@@ -993,20 +1220,16 @@ fn counts_no_pod(job: &Value) -> bool {
         .all(|p| job.pointer(p).and_then(Value::as_u64).unwrap_or(0) == 0)
 }
 
-/// How many attempts of `job` have failed: the Job's own count, or the
-/// failed pods it still has when that is more (the count is updated a sync
-/// after the pod ends).
+/// How many attempts of `job` have failed: the Job's own count, or the pods
+/// it counts as failed that it still has when that is more (the count is
+/// updated a sync after the pod ends, or starts being deleted).
 fn failed_attempts(job: &Value, pods: &[Value]) -> u64 {
-    let counted = job
-        .pointer("/status/failed")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
     let seen = pods
         .iter()
         .filter(|p| owned_by(p, job))
-        .filter(|p| str_at(p, "/status/phase") == Some("Failed"))
+        .filter(|p| str_at(p, "/status/phase") == Some("Failed") || counted_as_it_stops(p))
         .count() as u64;
-    counted.max(seen)
+    counted_failures(job).max(seen)
 }
 
 /// The sentence an unfinished scheduled Job's trouble ends with. Once the
@@ -1037,7 +1260,6 @@ fn failed_job(
     let when = at.unwrap_or("an unrecorded time");
     let failed_at = at.and_then(parse_time);
 
-    let cause = last_failed_attempt(job, &observed.pods).map(attempt_cause);
     let recorded = run
         .record_keys()
         .and_then(|keys| runner_record(job, failed_at, observed.runner_status.as_ref(), keys));
@@ -1045,6 +1267,12 @@ fn failed_job(
         .as_deref()
         .map(|e| format!(" The runner recorded: {e}"))
         .unwrap_or_default();
+    // Why the last failed attempt ended: its pod, or, once that is gone,
+    // what this condition said about it while it was there.
+    let seen = seen_stopped(run, job, prior);
+    let cause = last_failed_attempt(job, &observed.pods)
+        .map(attempt_cause)
+        .or_else(|| seen.map(Stop::cause));
 
     let (reason, message) = match job_reason {
         "DeadlineExceeded" => {
@@ -1077,16 +1305,23 @@ fn failed_job(
             // wrong way. Slow failing attempts outlast the deadline before the
             // backoff limit — seven one-hour checks with `--read-data` do.
             let (reason, evidence) = match &cause {
+                // Stopped, the pod gone, and its next pod never started: both
+                // said, the second in the words the condition used for it
+                // (which name the stop as well).
+                Some(c @ (Cause::Preempted(_) | Cause::Stopped(_))) if before.is_some() => (
+                    c.reason(run),
+                    format!(
+                        " Its last pod never started: {}{recorded_text}",
+                        before.unwrap_or_default()
+                    ),
+                ),
                 Some(c) => {
-                    let (reason, means) = match c {
-                        Cause::OomKilled(_) => (REASON_OOM_KILLED, ""),
-                        Cause::Evicted(_) => (REASON_EVICTED, ""),
-                        Cause::Exited(_) | Cause::Unknown(_) => {
-                            (ran_and_failed(run), what_a_failure_means(run))
-                        }
+                    let means = match c {
+                        Cause::Exited(_) | Cause::Unknown(_) => what_a_failure_means(run),
+                        _ => "",
                     };
                     (
-                        reason,
+                        c.reason(run),
                         format!(
                             " Its last failed attempt {}.{means}{recorded_text}",
                             c.describe()
@@ -1131,13 +1366,20 @@ fn failed_job(
                 Run::Backup => (REASON_BACKOFF_LIMIT, ""),
                 Run::Check => (REASON_CHECK_FAILED, what_a_failure_means(run)),
             };
+            // At the backoff limit the Job has no pod left to stop, so a
+            // counted failure with no pod was stopped from outside. With the
+            // runner's record of a failure in the Job's life, that is the
+            // last attempt's story even on a first read.
+            let cause = cause.or_else(|| {
+                (gone_attempts(job, &observed.pods) > 0 && recorded.is_some())
+                    .then(|| Stop::Outside.cause())
+            });
             let (reason, last) = match &cause {
-                Some(Cause::OomKilled(w)) => (REASON_OOM_KILLED, format!(" The last one {w}.")),
-                Some(Cause::Evicted(w)) => (REASON_EVICTED, format!(" The last one {w}.")),
-                Some(c) => (
+                Some(c @ (Cause::Exited(_) | Cause::Unknown(_))) => (
                     ran_and_failed,
                     format!(" The last one {}.{what_it_means}", c.describe()),
                 ),
+                Some(c) => (c.reason(run), format!(" The last one {}.", c.describe())),
                 None => (ran_and_failed, String::new()),
             };
             (
@@ -1192,8 +1434,18 @@ fn runner_record(
     job: &Value,
     failed_at: Option<DateTime<Utc>>,
     record: Option<&Value>,
-    (time_key, error_key): (&str, &str),
+    keys: (&str, &str),
 ) -> Option<String> {
+    recorded_failure(job, failed_at, record, keys).map(|(_, quoted)| quoted)
+}
+
+/// [`runner_record`], with when the runner recorded it.
+fn recorded_failure(
+    job: &Value,
+    failed_at: Option<DateTime<Utc>>,
+    record: Option<&Value>,
+    (time_key, error_key): (&str, &str),
+) -> Option<(DateTime<Utc>, String)> {
     let record = record?;
     let started = time_at(job, "/status/startTime")
         .or_else(|| time_at(job, "/metadata/creationTimestamp"))?;
@@ -1218,7 +1470,7 @@ fn runner_record(
     if quoted.len() < error.len() {
         quoted.push('…');
     }
-    Some(quoted)
+    Some((last_failure, quoted))
 }
 
 /// Why one attempt's pod ended.
@@ -1227,6 +1479,11 @@ enum Cause {
     OomKilled(String),
     /// Evicted by the kubelet. Carries the sentence tail.
     Evicted(String),
+    /// Preempted by the scheduler. Carries the sentence tail.
+    Preempted(String),
+    /// Stopped from outside another way: drained, deleted. Carries the
+    /// sentence tail.
+    Stopped(String),
     /// Exited on its own with this code.
     Exited(String),
     /// Failed without a readable reason.
@@ -1236,25 +1493,55 @@ enum Cause {
 impl Cause {
     fn describe(&self) -> &str {
         match self {
-            Cause::OomKilled(s) | Cause::Evicted(s) | Cause::Exited(s) | Cause::Unknown(s) => s,
+            Cause::OomKilled(s)
+            | Cause::Evicted(s)
+            | Cause::Preempted(s)
+            | Cause::Stopped(s)
+            | Cause::Exited(s)
+            | Cause::Unknown(s) => s,
+        }
+    }
+
+    /// The reason an attempt that ended this way gives the condition.
+    fn reason(&self, run: Run) -> &'static str {
+        match self {
+            Cause::OomKilled(_) => REASON_OOM_KILLED,
+            Cause::Evicted(_) => REASON_EVICTED,
+            Cause::Preempted(_) => REASON_PREEMPTED,
+            Cause::Stopped(_) => REASON_STOPPED,
+            Cause::Exited(_) | Cause::Unknown(_) => ran_and_failed(run),
         }
     }
 }
 
+/// The scheduler's `DisruptionTarget` reason on the pod it preempts.
+const PREEMPTION_BY_SCHEDULER: &str = "PreemptionByScheduler";
+
 fn attempt_cause(pod: &Value) -> Cause {
     let pod_name = name(pod);
+    let disruption = disruption_reason(pod);
+    let disruption_said = || {
+        disrupted(pod).and_then(|c| {
+            reason_with_message(
+                c.get("reason").and_then(Value::as_str).unwrap_or(""),
+                c.get("message").and_then(Value::as_str).unwrap_or(""),
+            )
+        })
+    };
+    if disruption == Some(PREEMPTION_BY_SCHEDULER) {
+        let said = disrupted(pod)
+            .and_then(|c| c.get("message").and_then(Value::as_str))
+            .map(|m| m.trim().trim_end_matches('.'))
+            .filter(|m| !m.is_empty())
+            .unwrap_or("the scheduler gave no reason");
+        return Cause::Preempted(format!("was preempted (pod {pod_name}): {said}"));
+    }
     let evicted = str_at(pod, "/status/reason") == Some("Evicted")
-        || pod_condition(pod, "DisruptionTarget").is_some_and(|c| {
-            c.get("status").and_then(Value::as_str) == Some("True")
-                && c.get("reason").and_then(Value::as_str) == Some("TerminationByKubelet")
-        });
+        || disruption == Some("TerminationByKubelet");
     if evicted {
         let why = str_at(pod, "/status/message")
             .filter(|m| !m.is_empty())
-            .or_else(|| {
-                pod_condition(pod, "DisruptionTarget")
-                    .and_then(|c| c.get("message").and_then(Value::as_str))
-            })
+            .or_else(|| disrupted(pod).and_then(|c| c.get("message").and_then(Value::as_str)))
             .unwrap_or("the kubelet gave no reason");
         return Cause::Evicted(format!(
             "was evicted (pod {pod_name}): {}",
@@ -1273,21 +1560,31 @@ fn attempt_cause(pod: &Value) -> Cause {
     )
     .map(|w| format!(": {w}"))
     .unwrap_or_default();
-    let Some(t) = terminated else {
-        return Cause::Unknown(format!("failed (pod {pod_name}){pod_said}"));
-    };
-    let reason = t.get("reason").and_then(Value::as_str).unwrap_or("");
-    let finished = t
-        .get("finishedAt")
+    let finished = terminated
+        .and_then(|t| t.get("finishedAt"))
         .and_then(Value::as_str)
         .map(|f| format!(", at {f}"))
         .unwrap_or_default();
-    if reason == "OOMKilled" {
+    if terminated
+        .and_then(|t| t.get("reason"))
+        .and_then(Value::as_str)
+        == Some("OOMKilled")
+    {
         let limit = memory_limit(pod)
             .map(|l| format!(" at its {l} memory limit"))
             .unwrap_or_default();
         return Cause::OomKilled(format!("was OOMKilled{limit} (pod {pod_name}{finished})"));
     }
+    // Stopped from outside: its exit code, if it has one yet, is the
+    // signal's, and the mark (when there is one) says who sent it.
+    if deleting(pod) || disruption.is_some() {
+        let said = disruption_said().unwrap_or_else(|| "its pod was deleted".to_string());
+        return Cause::Stopped(format!("was stopped from outside (pod {pod_name}): {said}"));
+    }
+    let Some(t) = terminated else {
+        return Cause::Unknown(format!("failed (pod {pod_name}){pod_said}"));
+    };
+    let reason = t.get("reason").and_then(Value::as_str).unwrap_or("");
     match t.get("exitCode").and_then(Value::as_i64) {
         Some(code) => {
             let named = if reason.is_empty() || reason == "Error" {
@@ -2120,10 +2417,14 @@ mod tests {
         assert_eq!((status, reason), ("True", REASON_SUCCEEDED));
     }
 
-    /// A pod being deleted — a node drain, `kubectl delete` — was stopped from
-    /// outside. Its exit code is the signal's, not the runner failing.
+    /// A pod deleted while its Job still runs — a node drain, `kubectl
+    /// delete` — was stopped from outside, and the Job counts it as a failed
+    /// attempt. The runner records the stop and posts its failure webhook, so
+    /// the condition says so at once, as it does for an attempt that exits
+    /// non-zero. (It used to read `True` here, and that rule silently covered
+    /// preemption too once the runner's priority invited it.)
     #[test]
-    fn an_attempt_stopped_by_a_deletion_is_not_a_failure_of_its_own() {
+    fn an_attempt_stopped_by_a_deletion_is_a_failure_at_once() {
         let done = backup_job(
             "apprafter-backup-29310900",
             "2026-09-22T03:00:00Z",
@@ -2131,19 +2432,590 @@ mod tests {
         );
         let mut j = backup_job("apprafter-backup-29312340", "2026-09-23T03:00:00Z", vec![]);
         j["status"]["active"] = json!(1);
-        let mut drained = exited(
+        j["status"]["failed"] = json!(1);
+        let mut deleted = exited(
             pod(&j, "aaaaa", "2026-09-23T03:00:00Z"),
-            143,
+            1,
             "2026-09-23T03:00:30Z",
         );
-        drained["metadata"]["deletionTimestamp"] = json!("2026-09-23T03:00:25Z");
+        deleted["metadata"]["deletionTimestamp"] = json!("2026-09-23T03:01:55Z");
         let retry = running(
             pod(&j, "bbbbb", "2026-09-23T03:00:45Z"),
             "2026-09-23T03:00:46Z",
         );
-        let (status, _, message) =
-            cond_of(&run(&observed(vec![done, j], vec![drained, retry]), &[]));
+        let mut o = observed(vec![done, j], vec![deleted, retry]);
+        o.runner_status = Some(json!({
+            "lastFailure": "2026-09-23T03:00:26+00:00",
+            "lastError": SIGTERM_RECORD,
+        }));
+        let (status, reason, message) = cond_of(&run(&o, &[]));
+        assert_eq!((status, reason), ("False", REASON_STOPPED), "{message}");
+        for needle in [
+            "backup Job apprafter-backup-29312340: its attempt 1 of at most 7 was stopped from \
+             outside (pod apprafter-backup-29312340-aaaaa): its pod was deleted.",
+            "The Job retries until its backoff limit.",
+            "The runner recorded: run was stopped by Kubernetes (SIGTERM)",
+        ] {
+            assert!(message.contains(needle), "missing {needle:?} in {message}");
+        }
+    }
+
+    /// A drain evicts through the API, and the pod says so: the reason is
+    /// quoted, and it is not mistaken for the kubelet's own eviction.
+    #[test]
+    fn an_attempt_a_node_drain_stopped_names_the_drain() {
+        let mut j = backup_job("apprafter-backup-29312340", "2026-09-23T03:00:00Z", vec![]);
+        j["status"]["active"] = json!(1);
+        let drained = disrupted(
+            running(
+                pod(&j, "aaaaa", "2026-09-23T03:00:00Z"),
+                "2026-09-23T03:00:05Z",
+            ),
+            "EvictionByEvictionAPI",
+            "Eviction API: evicting",
+            "2026-09-23T03:10:00Z",
+        );
+        let (status, reason, message) = cond_of(&run(&observed(vec![j], vec![drained]), &[]));
+        assert_eq!((status, reason), ("False", REASON_STOPPED), "{message}");
+        assert!(
+            message.contains(
+                "was stopped from outside (pod apprafter-backup-29312340-aaaaa): \
+                 EvictionByEvictionAPI: Eviction API: evicting"
+            ),
+            "{message}"
+        );
+    }
+
+    /// A suspended Job stops its own pods; that is not an attempt that failed.
+    #[test]
+    fn a_suspended_jobs_own_deletions_are_not_attempts_that_failed() {
+        let done = backup_job(
+            "apprafter-backup-29310900",
+            "2026-09-22T03:00:00Z",
+            complete("2026-09-22T03:01:00Z"),
+        );
+        let mut j = backup_job("apprafter-backup-29312340", "2026-09-23T03:00:00Z", vec![]);
+        j["spec"]["suspend"] = json!(true);
+        let mut stopping = exited(
+            pod(&j, "aaaaa", "2026-09-23T03:00:00Z"),
+            143,
+            "2026-09-23T03:00:30Z",
+        );
+        stopping["metadata"]["deletionTimestamp"] = json!("2026-09-23T03:01:55Z");
+        let (status, _, message) = cond_of(&run(&observed(vec![done, j], vec![stopping]), &[]));
         assert_eq!(status, "True", "{message}");
+    }
+
+    /// A disruption mark on a pod that was never deleted is stale — the
+    /// scheduler marked it and then did not delete it, and the disruption
+    /// controller clears such a mark — so the running runner is not a stop.
+    #[test]
+    fn a_stale_disruption_mark_on_a_running_pod_is_not_a_stop() {
+        let done = backup_job(
+            "apprafter-backup-29310900",
+            "2026-09-22T03:00:00Z",
+            complete("2026-09-22T03:01:00Z"),
+        );
+        let mut j = backup_job("apprafter-backup-29312340", "2026-09-23T03:00:00Z", vec![]);
+        j["status"]["active"] = json!(1);
+        let mut marked = preempted_at(
+            pod(&j, "aaaaa", "2026-09-23T03:00:00Z"),
+            "2026-09-23T03:00:05Z",
+            "2026-09-23T03:10:00Z",
+        );
+        marked["metadata"]
+            .as_object_mut()
+            .unwrap()
+            .remove("deletionTimestamp");
+        let (status, _, message) = cond_of(&run(&observed(vec![done, j], vec![marked]), &[]));
+        assert_eq!(status, "True", "{message}");
+    }
+
+    /// A pod the Job counts because it is being deleted is still there, not
+    /// gone. Attempt 1 is drained and takes its grace to stop; the Job's
+    /// replacement is killed at its limit meanwhile; and attempt 1's runner
+    /// records its stop after that. Its record must not turn the kill into a
+    /// stop whose pod is gone.
+    #[test]
+    fn a_pod_still_stopping_is_not_counted_as_gone() {
+        let mut j = backup_job("apprafter-backup-29312340", "2026-09-23T03:00:00Z", vec![]);
+        j["status"]["failed"] = json!(2);
+        let drained = disrupted(
+            running(
+                pod(&j, "aaaaa", "2026-09-23T03:00:00Z"),
+                "2026-09-23T03:00:02Z",
+            ),
+            "EvictionByEvictionAPI",
+            "Eviction API: evicting",
+            "2026-09-23T03:00:05Z",
+        );
+        let killed = oom_killed(
+            pod(&j, "bbbbb", "2026-09-23T03:00:15Z"),
+            "2026-09-23T03:00:40Z",
+        );
+        let mut o = observed(vec![j], vec![drained, killed]);
+        o.runner_status = Some(sigterm_record("2026-09-23T03:00:45+00:00"));
+        let (_, reason, message) = cond_of(&run(&o, &[]));
+        assert_eq!(reason, REASON_OOM_KILLED, "{message}");
+        assert!(!message.contains("is gone"), "{message}");
+    }
+
+    /// The Job counts a pod being deleted as failed a sync later; the pods
+    /// it still has already say so.
+    #[test]
+    fn the_attempt_count_includes_a_pod_that_is_still_stopping() {
+        let mut j = backup_job("apprafter-backup-29312340", "2026-09-23T03:00:00Z", vec![]);
+        j["status"]["active"] = json!(1);
+        let killed = oom_killed(
+            pod(&j, "aaaaa", "2026-09-23T03:00:00Z"),
+            "2026-09-23T03:05:00Z",
+        );
+        let victim = preempted_at(
+            pod(&j, "bbbbb", "2026-09-23T03:05:15Z"),
+            "2026-09-23T03:05:20Z",
+            "2026-09-23T03:20:00Z",
+        );
+        let (_, reason, message) = cond_of(&run(&observed(vec![j], vec![killed, victim]), &[]));
+        assert_eq!(reason, REASON_PREEMPTED, "{message}");
+        assert!(
+            message.contains("its attempt 2 of at most 7 was preempted (pod"),
+            "{message}"
+        );
+    }
+
+    // -- a runner preempted for a pod of higher priority ----------------------
+
+    /// What the runner records when Kubernetes stops it, as kind recorded it.
+    const SIGTERM_RECORD: &str = "run was stopped by Kubernetes (SIGTERM) after 11s, before its \
+                                  deadline of 6h: its pod was deleted or evicted, or this was a \
+                                  retry of a failed attempt and the deadline counts from the \
+                                  Job's first one";
+    const PREEMPTING: &str = "default-scheduler: preempting to accommodate a higher priority pod";
+    const NEVER: &str = "0/1 nodes are available: 1 Insufficient memory. no new claims to \
+                         deallocate, preemption: not eligible due to preemptionPolicy=Never.";
+
+    /// `p` with a `DisruptionTarget` condition and a deletion under way with
+    /// the chart's 90 s grace, the way the scheduler and a drain leave it.
+    fn disrupted(mut p: Value, reason: &str, message: &str, at: &str) -> Value {
+        let at_t = parse_time(at).unwrap();
+        p["metadata"]["deletionTimestamp"] = json!((at_t + Duration::seconds(90))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string());
+        p["metadata"]["deletionGracePeriodSeconds"] = json!(90);
+        let conds = p["status"]["conditions"]
+            .as_array_mut()
+            .expect("a placed pod has conditions");
+        conds.insert(
+            0,
+            json!({ "type": "DisruptionTarget", "status": "True", "reason": reason,
+                    "message": message, "lastTransitionTime": at }),
+        );
+        p
+    }
+
+    /// A running runner the scheduler preempts at `at`, as kind recorded it:
+    /// still `Running`, its deletion under way.
+    fn preempted_at(p: Value, started: &str, at: &str) -> Value {
+        disrupted(running(p, started), "PreemptionByScheduler", PREEMPTING, at)
+    }
+
+    /// The Job's next pod: never eligible to preempt, so it waits for room.
+    fn waiting_for_room(p: Value, since: &str) -> Value {
+        let mut p = unschedulable(p, since);
+        p["status"]["conditions"][0]["message"] = json!(NEVER);
+        p
+    }
+
+    fn sigterm_record(at: &str) -> Value {
+        json!({ "lastSuccess": "2026-09-22T03:01:00+00:00",
+                "lastFailure": at, "lastError": SIGTERM_RECORD })
+    }
+
+    /// Found by review (WI-386): with the runner at a priority below every
+    /// other pod's, any pod that needs its room preempts it. The runner
+    /// recorded the stop and posted its failure webhook within a second, and
+    /// the stack read `True` throughout: while the preempted pod stopped
+    /// (being deleted, it was skipped), once it was gone (no pod to read),
+    /// and for the next pod's ten-minute grace. Replayed here from the kind
+    /// capture, each read taking the condition the one before it wrote.
+    #[test]
+    fn a_preempted_runner_is_a_failure_at_once_and_stays_one_while_the_job_retries() {
+        let done = backup_job(
+            "apprafter-backup-29310900",
+            "2026-09-22T03:00:00Z",
+            complete("2026-09-22T03:01:00Z"),
+        );
+        let name = "apprafter-backup-29312340";
+        let mut j = backup_job(name, "2026-09-23T03:00:00Z", vec![]);
+        j["status"]["active"] = json!(1);
+        let victim = preempted_at(
+            pod(&j, "pqww9", "2026-09-23T03:00:00Z"),
+            "2026-09-23T03:00:10Z",
+            "2026-09-23T03:00:22Z",
+        );
+        let at = |t: &str| parse_time(t).unwrap();
+
+        // The pod is stopping; the runner has recorded the stop.
+        let mut o = observed(vec![done.clone(), j.clone()], vec![victim]);
+        o.runner_status = Some(sigterm_record("2026-09-23T03:00:22.095+00:00"));
+        let stopping = assess(true, Ok(&o), &[], at("2026-09-23T03:00:22Z"));
+        let (status, reason, message) = cond_of(&stopping);
+        assert_eq!((status, reason), ("False", REASON_PREEMPTED), "{message}");
+        for needle in [
+            "backup Job apprafter-backup-29312340: its attempt 1 of at most 7 was preempted (pod \
+             apprafter-backup-29312340-pqww9): default-scheduler: preempting to accommodate a \
+             higher priority pod.",
+            "The Job retries until its backoff limit.",
+            "The runner recorded: run was stopped by Kubernetes (SIGTERM)",
+        ] {
+            assert!(message.contains(needle), "missing {needle:?} in {message}");
+        }
+
+        // The pod is gone; the Job counts it.
+        j["status"] = json!({ "startTime": "2026-09-23T03:00:00Z", "failed": 1 });
+        let mut o = observed(vec![done.clone(), j.clone()], vec![]);
+        o.runner_status = Some(sigterm_record("2026-09-23T03:00:22.095+00:00"));
+        let gone = assess(
+            true,
+            Ok(&o),
+            &as_prior(&stopping),
+            at("2026-09-23T03:00:25Z"),
+        );
+        let (status, reason, message) = cond_of(&gone);
+        assert_eq!((status, reason), ("False", REASON_PREEMPTED), "{message}");
+        assert!(
+            message.contains(
+                "its attempt 1 of at most 7 was preempted, and its pod is gone. The Job retries"
+            ),
+            "{message}"
+        );
+
+        // The next pod waits for room, inside its grace.
+        j["status"]["active"] = json!(1);
+        let next = waiting_for_room(
+            pod(&j, "7ccmm", "2026-09-23T03:00:32Z"),
+            "2026-09-23T03:00:32Z",
+        );
+        let mut o = observed(vec![done.clone(), j.clone()], vec![next]);
+        o.runner_status = Some(sigterm_record("2026-09-23T03:00:22.095+00:00"));
+        let waiting = assess(true, Ok(&o), &as_prior(&gone), at("2026-09-23T03:05:00Z"));
+        assert_eq!(waiting.verdict, gone.verdict);
+        assert!(waiting.recheck_after.is_some());
+
+        // Past the grace, the pod that cannot be placed is the news, and the
+        // preemption before it is still said.
+        let past = assess(
+            true,
+            Ok(&o),
+            &as_prior(&waiting),
+            at("2026-09-23T03:11:00Z"),
+        );
+        let (status, reason, message) = cond_of(&past);
+        assert_eq!(
+            (status, reason),
+            ("False", REASON_UNSCHEDULABLE),
+            "{message}"
+        );
+        for needle in [
+            "its pod apprafter-backup-29312340-7ccmm has not been scheduled since \
+             2026-09-23T03:00:32Z",
+            "preemptionPolicy=Never",
+            "Its attempt 1 of at most 7 was preempted, and its pod is gone.",
+        ] {
+            assert!(message.contains(needle), "missing {needle:?} in {message}");
+        }
+        // And re-read, the same bytes.
+        let again = assess(true, Ok(&o), &as_prior(&past), at("2026-09-23T03:12:00Z"));
+        assert_eq!(again.verdict, past.verdict);
+    }
+
+    /// The operator may not read the cluster while the preempted pod stops:
+    /// it is gone within seconds, and the preemptor can be the operator's own
+    /// new pod during an upgrade. The Job's count and the runner's record
+    /// still say an attempt was stopped; what stopped it is no longer known.
+    #[test]
+    fn a_stop_the_operator_never_saw_is_read_from_the_count_and_the_runners_record() {
+        let done = backup_job(
+            "apprafter-backup-29310900",
+            "2026-09-22T03:00:00Z",
+            complete("2026-09-22T03:01:00Z"),
+        );
+        let mut j = backup_job("apprafter-backup-29312340", "2026-09-23T03:00:00Z", vec![]);
+        j["status"]["active"] = json!(1);
+        j["status"]["failed"] = json!(1);
+        let next = waiting_for_room(
+            pod(&j, "7ccmm", "2026-09-23T03:00:32Z"),
+            "2026-09-23T03:00:32Z",
+        );
+        let mut o = observed(vec![done, j], vec![next]);
+        o.runner_status = Some(sigterm_record("2026-09-23T03:00:22.095+00:00"));
+        let a = assess(
+            true,
+            Ok(&o),
+            &[],
+            parse_time("2026-09-23T03:02:00Z").unwrap(),
+        );
+        let (status, reason, message) = cond_of(&a);
+        assert_eq!((status, reason), ("False", REASON_STOPPED), "{message}");
+        for needle in [
+            "its attempt 1 of at most 7 was stopped from outside before it finished, and its pod \
+             is gone: the scheduler preempted it, a node drain evicted it, or it was deleted.",
+            "The runner recorded: run was stopped by Kubernetes (SIGTERM)",
+        ] {
+            assert!(message.contains(needle), "missing {needle:?} in {message}");
+        }
+        // Re-read with what it wrote: the same bytes.
+        let again = assess(
+            true,
+            Ok(&o),
+            &as_prior(&a),
+            parse_time("2026-09-23T03:03:00Z").unwrap(),
+        );
+        assert_eq!(again.verdict, a.verdict);
+    }
+
+    /// Without the runner's record of it or the condition having seen it, a
+    /// counted failure with no pod is not claimed as a stop: a pod the
+    /// runner label does not select is counted too.
+    #[test]
+    fn a_counted_failure_with_no_record_and_nothing_seen_is_not_called_a_stop() {
+        let done = backup_job(
+            "apprafter-backup-29310900",
+            "2026-09-22T03:00:00Z",
+            complete("2026-09-22T03:01:00Z"),
+        );
+        let mut j = backup_job("apprafter-backup-29312340", "2026-09-23T03:00:00Z", vec![]);
+        j["status"]["failed"] = json!(1);
+        let mut o = observed(vec![done, j], vec![]);
+        // Yesterday's failure: outside this Job's life.
+        o.runner_status = Some(sigterm_record("2026-09-22T03:00:22+00:00"));
+        let (status, _, message) = cond_of(&run(&o, &[]));
+        assert_eq!(status, "True", "{message}");
+    }
+
+    /// The pod is gone and the Job controller has not counted it yet: it has
+    /// only listed it in `uncountedTerminatedPods`. That is a count too.
+    #[test]
+    fn a_stop_not_yet_counted_but_listed_as_uncounted_is_still_a_stop() {
+        let mut j = backup_job("apprafter-backup-29312340", "2026-09-23T03:00:00Z", vec![]);
+        j["status"]["uncountedTerminatedPods"] = json!({ "failed": ["pqww9-uid"] });
+        let mut o = observed(vec![j], vec![]);
+        o.runner_status = Some(sigterm_record("2026-09-23T03:00:22+00:00"));
+        let (status, reason, message) = cond_of(&run(&o, &[]));
+        assert_eq!((status, reason), ("False", REASON_STOPPED), "{message}");
+    }
+
+    /// Attempt 1 was killed at its limit and its pod is still there; attempt
+    /// 2 was stopped later and its pod is gone. The runner's record of the
+    /// stop is newer than the kill, so the stop is the newest attempt.
+    #[test]
+    fn a_newer_stop_whose_pod_is_gone_outranks_an_older_failure_still_there() {
+        let mut j = backup_job("apprafter-backup-29312340", "2026-09-23T03:00:00Z", vec![]);
+        j["status"]["failed"] = json!(2);
+        j["status"]["active"] = json!(1);
+        let killed = oom_killed(
+            pod(&j, "aaaaa", "2026-09-23T03:00:00Z"),
+            "2026-09-23T03:05:00Z",
+        );
+        let third = running(
+            pod(&j, "ccccc", "2026-09-23T03:30:00Z"),
+            "2026-09-23T03:30:01Z",
+        );
+        let mut o = observed(vec![j.clone()], vec![killed.clone(), third.clone()]);
+        o.runner_status = Some(sigterm_record("2026-09-23T03:20:00+00:00"));
+        let (_, reason, message) = cond_of(&run(&o, &[]));
+        assert_eq!(reason, REASON_STOPPED, "{message}");
+        assert!(
+            message.contains("its attempt 2 of at most 7 was stopped"),
+            "{message}"
+        );
+
+        // A record from before the kill ended is not a later attempt's.
+        let mut o = observed(vec![j], vec![killed, third]);
+        o.runner_status = Some(sigterm_record("2026-09-23T03:04:00+00:00"));
+        let (_, reason, message) = cond_of(&run(&o, &[]));
+        assert_eq!(reason, REASON_OOM_KILLED, "{message}");
+    }
+
+    /// A check the scheduler preempts says nothing about the repository.
+    #[test]
+    fn a_preempted_check_is_a_preemption_not_a_damaged_repository() {
+        let good = backup_job(
+            "apprafter-backup-29312340",
+            "2026-09-23T03:00:00Z",
+            complete("2026-09-23T03:01:00Z"),
+        );
+        let mut check = job(
+            CHECK_CRONJOB,
+            "apprafter-backup-check-29310000",
+            "2026-09-23T06:00:00Z",
+            vec![],
+        );
+        check["status"]["active"] = json!(1);
+        let victim = preempted_at(
+            pod(&check, "aaaaa", "2026-09-23T06:00:00Z"),
+            "2026-09-23T06:00:10Z",
+            "2026-09-23T06:10:00Z",
+        );
+        let mut o = observed(vec![good, check], vec![victim]);
+        o.cronjobs.push(cronjob(CHECK_CRONJOB));
+        let a = assess(
+            true,
+            Ok(&o),
+            &[],
+            parse_time("2026-09-23T06:10:01Z").unwrap(),
+        );
+        let (status, reason, message) = cond_of(&a);
+        assert_eq!((status, reason), ("False", REASON_PREEMPTED), "{message}");
+        assert!(
+            message.starts_with("repository check Job apprafter-backup-check-29310000:"),
+            "{message}"
+        );
+        assert!(!message.contains("damaged"), "{message}");
+    }
+
+    /// Every attempt preempted until the backoff limit: the Job's ending
+    /// keeps the reason its attempts had, as it does for a kill or an
+    /// eviction, instead of a bare `BackoffLimitExceeded` with no pod left to
+    /// say why.
+    #[test]
+    fn a_job_that_gave_up_after_preemptions_keeps_the_reason() {
+        let name = "apprafter-backup-29312340";
+        let mut j = backup_job(name, "2026-09-23T03:00:00Z", vec![]);
+        j["status"]["failed"] = json!(6);
+        let victim = preempted_at(
+            pod(&j, "ggggg", "2026-09-23T03:30:00Z"),
+            "2026-09-23T03:30:05Z",
+            "2026-09-23T03:40:00Z",
+        );
+        let record = sigterm_record("2026-09-23T03:40:00.1+00:00");
+        let mut o = observed(vec![j.clone()], vec![victim]);
+        o.runner_status = Some(record.clone());
+        let retrying = assess(
+            true,
+            Ok(&o),
+            &[],
+            parse_time("2026-09-23T03:40:01Z").unwrap(),
+        );
+        assert_eq!(cond_of(&retrying).1, REASON_PREEMPTED);
+
+        j["status"]["failed"] = json!(7);
+        j["status"]["conditions"] = json!(failed(
+            "BackoffLimitExceeded",
+            "Job has reached the specified backoff limit",
+            "2026-09-23T03:40:03Z"
+        ));
+        let mut o = observed(vec![j.clone()], vec![]);
+        o.runner_status = Some(record.clone());
+        let ended = assess(true, Ok(&o), &as_prior(&retrying), now());
+        let (status, reason, message) = cond_of(&ended);
+        assert_eq!((status, reason), ("False", REASON_PREEMPTED), "{message}");
+        for needle in [
+            "failed at 2026-09-23T03:40:03Z after 7 failed attempts (BackoffLimitExceeded). The \
+             last one was preempted, and its pod is gone.",
+            "The runner recorded: run was stopped by Kubernetes (SIGTERM)",
+        ] {
+            assert!(message.contains(needle), "missing {needle:?} in {message}");
+        }
+        assert!(!message.contains("retries"), "{message}");
+        let again = assess(true, Ok(&o), &as_prior(&ended), now());
+        assert_eq!(again.verdict, ended.verdict);
+
+        // Read for the first time after the end: the count and the record
+        // still say the attempts were stopped.
+        let first_look = run(&o, &[]);
+        let (_, reason, message) = cond_of(&first_look);
+        assert_eq!(reason, REASON_STOPPED, "{message}");
+        assert!(
+            message.contains("The last one was stopped from outside before it finished"),
+            "{message}"
+        );
+
+        // With neither, it stays the bare ending it always was.
+        let o = observed(vec![j], vec![]);
+        assert_eq!(cond_of(&run(&o, &[])).1, REASON_BACKOFF_LIMIT);
+    }
+
+    /// The last attempt is still stopping when the Job gives up: the pod says
+    /// it was preempted, and a finished Job reads that too.
+    #[test]
+    fn a_finished_job_reads_a_preempted_pod_that_is_still_stopping() {
+        let mut j = backup_job(
+            "apprafter-backup-29312340",
+            "2026-09-23T03:00:00Z",
+            failed(
+                "BackoffLimitExceeded",
+                "Job has reached the specified backoff limit",
+                "2026-09-23T03:40:01Z",
+            ),
+        );
+        j["status"]["failed"] = json!(7);
+        let victim = preempted_at(
+            pod(&j, "ggggg", "2026-09-23T03:30:00Z"),
+            "2026-09-23T03:30:05Z",
+            "2026-09-23T03:40:00Z",
+        );
+        let (_, reason, message) = cond_of(&run(&observed(vec![j], vec![victim]), &[]));
+        assert_eq!(reason, REASON_PREEMPTED, "{message}");
+        assert!(
+            message.contains("The last one was preempted (pod apprafter-backup-29312340-ggggg)"),
+            "{message}"
+        );
+    }
+
+    /// Preempted, then the next pod never placed until the deadline: the
+    /// attempts' reason is kept, and what the scheduler said about the pod
+    /// that never started is still quoted.
+    #[test]
+    fn a_deadline_after_a_preemption_keeps_the_preemption() {
+        let mut j = backup_job("apprafter-backup-29312340", "2026-09-23T03:00:00Z", vec![]);
+        j["status"]["failed"] = json!(1);
+        j["status"]["active"] = json!(1);
+        let next = waiting_for_room(
+            pod(&j, "7ccmm", "2026-09-23T03:00:32Z"),
+            "2026-09-23T03:00:32Z",
+        );
+        let prior = vec![PlatformStackCondition {
+            type_: COND_BACKUP_HEALTHY.to_string(),
+            status: "False".to_string(),
+            reason: Some(REASON_PREEMPTED.to_string()),
+            message: Some(
+                "backup Job apprafter-backup-29312340: its attempt 1 of at most 7 was preempted, \
+                 and its pod is gone. The Job retries until its backoff limit."
+                    .to_string(),
+            ),
+            last_transition_time: "2026-09-23T03:00:22+00:00".to_string(),
+        }];
+        let o = observed(vec![j.clone()], vec![next]);
+        let waiting = assess(
+            true,
+            Ok(&o),
+            &prior,
+            parse_time("2026-09-23T04:00:00Z").unwrap(),
+        );
+        assert_eq!(cond_of(&waiting).1, REASON_UNSCHEDULABLE);
+
+        let mut ended = j;
+        ended["status"]["conditions"] = json!(failed(
+            "DeadlineExceeded",
+            "Job was active longer than specified deadline",
+            "2026-09-23T09:00:02Z"
+        ));
+        let o = observed(vec![ended], vec![]);
+        let after = assess(true, Ok(&o), &as_prior(&waiting), now());
+        let (status, reason, message) = cond_of(&after);
+        assert_eq!((status, reason), ("False", REASON_PREEMPTED), "{message}");
+        for needle in [
+            "DeadlineExceeded, active longer than its 6h deadline.",
+            "Its last pod never started: its pod apprafter-backup-29312340-7ccmm has not been \
+             scheduled",
+            "Its attempt 1 of at most 7 was preempted, and its pod is gone.",
+        ] {
+            assert!(message.contains(needle), "missing {needle:?} in {message}");
+        }
+        assert!(!message.contains("no later scheduled"), "{message}");
+        let again = assess(true, Ok(&o), &as_prior(&after), now());
+        assert_eq!(again.verdict, after.verdict);
     }
 
     #[test]

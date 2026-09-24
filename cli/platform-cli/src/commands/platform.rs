@@ -548,6 +548,24 @@ fn backup_next_step(reason: &str, now: DateTime<Utc>) -> Option<NextStep> {
              backup set staging-mode sequential` stages one namespace at a time.",
             BACKUP_HEALTH_DOC,
         ),
+        // A pod of higher priority needed the runner's room: any pod, since
+        // the runner's priority is below every other. The Job's next pod
+        // waits for room, so the way out is the node's room, as for a
+        // runner that cannot be scheduled.
+        "RunnerPreempted" => (
+            "`apprafter top` shows how much of the node is requested, and by what: another pod \
+             needed the runner's room. `apprafter backup status` shows the Job and the runner's \
+             record of the stop; the Job retries once there is room, and a retry that succeeds \
+             clears this.",
+            BACKUP_UNSCHEDULABLE_DOC,
+        ),
+        // A drain, a deletion, or a stop whose cause is gone with its pod.
+        "RunnerStopped" => (
+            "`apprafter backup status` shows the Job and the runner's own record of the stop \
+             (`lastError`). The Job retries; a retry that succeeds clears this, and `apprafter \
+             backup run` starts one once the Job has ended.",
+            BACKUP_HEALTH_DOC,
+        ),
         // Reported while the Job retries: the runner has recorded why, and
         // posted its failure webhook, for this attempt.
         "RunnerFailed" => (
@@ -1698,6 +1716,27 @@ mod tests {
             text.contains("`apprafter backup set staging-mode sequential`"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn a_preempted_runner_is_sent_to_the_nodes_room() {
+        // As the operator writes it (WI-386). The next pod waits for room,
+        // so the advice is the capacity one, and the page is the entry that
+        // explains the runner's priority.
+        let stack = with_backup(
+            true,
+            Some(backup_condition(
+                "False",
+                "RunnerPreempted",
+                "backup Job apprafter-backup-e: its attempt 1 of at most 7 was preempted (pod \
+                 apprafter-backup-e-pqww9): default-scheduler: preempting to accommodate a higher \
+                 priority pod. The Job retries until its backoff limit.",
+            )),
+        );
+        let text = backup_health_lines(&stack, frozen_now()).join("\n");
+        assert!(text.contains("FAILING since"), "{text}");
+        assert!(text.contains("`apprafter top`"), "{text}");
+        assert!(text.contains(BACKUP_UNSCHEDULABLE_DOC), "{text}");
     }
 
     #[test]

@@ -641,7 +641,8 @@ runner then records `run was stopped by Kubernetes (SIGTERM) … its pod was
 deleted or evicted` as its `lastError`, and the Job's next pod waits for room
 like any other. On a node this full, an application rolling out can therefore
 stop a backup; the backup runs again once the rollout is done and the room is
-back.
+back. `apprafter status` reports the stopped attempt at once, as
+`RunnerPreempted` on its `Backups:` line, until a run succeeds.
 
 Check how much room is left:
 

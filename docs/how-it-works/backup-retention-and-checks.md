@@ -561,7 +561,10 @@ running runner preempts it. A preempted runner is stopped the way its deadline
 stops it: it records the stop in `lastError`, deletes its helper pods and has
 restic remove its lock, and the Job tries again once there is room ([the
 backup runner's pod cannot be
-scheduled](../operator-guide/backup-restore.md#runner-unschedulable)).
+scheduled](../operator-guide/backup-restore.md#runner-unschedulable)). The
+preempted pod is gone within seconds of the runner exiting; the operator
+reports the stop at once, as `RunnerPreempted` below, and goes on reporting
+it after the pod is gone.
 
 So the operator also watches the backup from outside the runner. It reads the
 `apprafter-backup` and `apprafter-backup-check` CronJobs, their Jobs and the
@@ -578,9 +581,11 @@ the operator's six-hour upstream check.
 | `False` | `RunnerNotStarted` | The pod has not started for ten minutes for another reason: its image cannot be pulled, a Secret it reads is missing, or the scheduler has not yet tried to place it. Or the Job has had no pod at all for ten minutes, because a quota, a LimitRange or an admission webhook refused it; the Job's `FailedCreate` events say which. |
 | `False` | `RunnerOOMKilled` | An attempt was killed at the runner's memory limit. The Job retries, but the same data meets the same limit, so this is reported at once rather than after the last attempt. |
 | `False` | `RunnerEvicted` | The kubelet evicted an attempt: memory pressure on the node, or the staging directory grown past its size limit. The message quotes the kubelet. |
+| `False` | `RunnerPreempted` | The scheduler preempted an attempt: a pod that needed the runner's room stopped it, and with the runner's priority below every other pod's that can be any pod. The attempt counts against the Job's backoff limit, and the Job's next pod waits for room, so on a node where other pods keep needing that room every attempt can go this way. Reported at once, while the Job retries, and still reported once the preempted pod is gone. While the pod is there the message quotes the scheduler, and it quotes the runner's record of the stop once the runner has written it. |
+| `False` | `RunnerStopped` | An attempt was stopped from outside another way: a node drain evicted it, or its pod was deleted. The message quotes what the pod said about it. An attempt whose pod was already gone when the operator first looked is reported here too, from the Job's count of failed attempts and the runner's record of the stop, since what stopped it is no longer known. |
 | `False` | `RunnerFailed` | An attempt of a backup ran and failed: the runner exited non-zero, and the message quotes the error it recorded. Reported at once, while the Job retries, because the runner has already recorded the failure and posted its webhook; a retry that succeeds returns the condition to `True`. |
-| `False` | `DeadlineExceeded` | The Job was stopped by its deadline before any attempt failed on its own. The message says what the runner recorded, or that it recorded nothing, and, for a pod that was never placed, what the scheduler said before the deadline. A Job whose attempts had already failed keeps the reason they had (`RunnerFailed`, `RunnerOOMKilled`, `RunnerEvicted` or `RepositoryCheckFailed`), and its message says the deadline ended it. |
-| `False` | `BackoffLimitExceeded` | Every attempt of a backup failed. The message says how the last one ended and quotes the runner's `lastError` when it wrote one. |
+| `False` | `DeadlineExceeded` | The Job was stopped by its deadline before any attempt failed on its own. The message says what the runner recorded, or that it recorded nothing, and, for a pod that was never placed, what the scheduler said before the deadline. A Job whose attempts had already failed keeps the reason they had (`RunnerFailed`, `RunnerOOMKilled`, `RunnerEvicted`, `RunnerPreempted`, `RunnerStopped` or `RepositoryCheckFailed`), and its message says the deadline ended it. |
+| `False` | `BackoffLimitExceeded` | Every attempt of a backup failed. The message says how the last one ended and quotes the runner's `lastError` when it wrote one. A Job whose last attempt was killed, evicted, preempted or stopped keeps that reason instead. |
 | `False` | `RepositoryCheckFailed` | An attempt of the weekly check ran and failed: `restic check` did not pass, because it found the repository damaged or could not read it. Reported at once, while the Job retries. The message quotes what the runner recorded, `apprafter backup status` shows it under `last check`, the check pod's log has all of it, and `apprafter backup check` runs the same check from your machine. |
 | `False` | `Failed` | The Job failed for another reason, which the message quotes. |
 | `False` | `ScheduleSuspended` | The CronJob is suspended, so no scheduled backup starts. |
@@ -609,14 +614,20 @@ Four rules keep it from raising false alarms, and from going quiet:
   that restarts is not ready for a few minutes. A pod the scheduler is making
   room for by preemption does not count at all. The ten minutes are for the
   pod the Job is waiting on, never for an attempt that has already failed: a
-  runner killed at its memory limit or evicted counts at once, and stays the
-  verdict while the Job's next pod waits for room or starts.
+  runner killed at its memory limit, evicted or preempted counts at once, and
+  stays the verdict while the Job's next pod waits for room or starts.
 - An attempt that runs and fails turns the condition `False` at once. The
   runner has already recorded the error and posted its failure webhook, and
   the Job's own ending can be far off: seven attempts by default, and an hour
   each for a check that reads every pack. A retry that succeeds completes the
-  Job and returns the condition to `True`. A pod stopped from outside, by a
-  node drain or a deletion, is not an attempt that failed.
+  Job and returns the condition to `True`. A pod stopped from outside while
+  its Job runs, by the scheduler's preemption, a node drain or a deletion, is
+  an attempt that failed too: the Job counts it against its backoff limit, and
+  the runner records the stop and posts its failure webhook. Its pod is gone
+  within seconds, so the operator also reads such an attempt from the Job's
+  count of failed attempts together with the runner's record, or with what the
+  condition said while the pod was there. The pods a Job stops itself, at its
+  deadline or while it is suspended, are not attempts that failed.
 - The newest finished run decides, whether the schedule started it or
   `apprafter backup run` did, so a later successful run returns the condition
   to `True`. An unfinished run in trouble counts before any finished one,

@@ -367,7 +367,13 @@ do those of `apprafter backup run`, which copies the backup's Job template.
   (SIGTERM)`), deletes its helper pods and passes the signal on to restic,
   which removes its lock; and the Job retries it, the retry waiting for room
   like any runner. The preempted attempt counts against the Job's backoff
-  limit, and the Job's deadline still bounds the whole run.
+  limit, and the Job's deadline still bounds the whole run. The cluster
+  status reports the preempted attempt at once (`BackupHealthy` `False`,
+  `RunnerPreempted`), as it reports a runner killed at its limit, and keeps
+  reporting it after the pod is gone, so a node whose other pods keep taking
+  the runner's room shows failing backups rather than healthy ones (Decision
+  2 of the first amendment). The same holds for a runner a node drain or a
+  deletion stops (`RunnerStopped`).
 - **A runner never preempts anything** (`Never`). Nothing is below it.
 - **Under node memory pressure** the kubelet evicts the pods that use more than
   they request, lowest priority first, so a runner above its request goes
