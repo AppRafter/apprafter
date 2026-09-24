@@ -339,9 +339,10 @@ pub(crate) fn backup_retention_lines(json: &Value, now: DateTime<Utc>) -> Vec<St
     if !message.is_empty() {
         lines.push(cli_core::style::warn(&format!("  {message}")));
     }
-    let next = retention_next_step(reason).unwrap_or(
-        "`apprafter backup status` shows the runner's record of its last check and prune.",
-    );
+    let next = retention_next_step(reason, now).unwrap_or_else(|| {
+        "`apprafter backup status` shows the runner's record of its last check and prune."
+            .to_string()
+    });
     lines.push(format!("  Next: {next}"));
     lines.push(format!(
         "  What it means and what to change: {BACKUP_RETENTION_DOC}"
@@ -352,7 +353,7 @@ pub(crate) fn backup_retention_lines(json: &Value, now: DateTime<Utc>) -> Vec<St
 /// What to run next for each `BackupRetention` reason the operator writes
 /// that is not `True`. Every reason is named, so a new one is a decision
 /// here (a test reads the reasons out of the operator's source).
-fn retention_next_step(reason: &str) -> Option<&'static str> {
+fn retention_next_step(reason: &str, now: DateTime<Utc>) -> Option<String> {
     Some(match reason {
         "PruneNotPermitted" => {
             "prune from outside the cluster with the operator's full credentials: `apprafter \
@@ -378,16 +379,35 @@ fn retention_next_step(reason: &str) -> Option<&'static str> {
              the same prune from this machine."
         }
         "NoCheckYet" | "NoPruneYet" => {
-            "`apprafter backup status` shows the schedule. `kubectl -n apprafter-system create \
-             job --from=cronjob/apprafter-backup-check apprafter-backup-check-now` runs the \
-             check, and the prune after it, now."
+            return Some(format!(
+                "`apprafter backup status` shows the schedule. {} runs the check, and the prune \
+                 after it, now.",
+                run_check_now(now)
+            ))
         }
         "RecordUnreadable" => {
             "the operator could not read the runner's record, and its log says why; `apprafter \
              backup status` reads it with your own credentials."
         }
         _ => return None,
-    })
+    }
+    .to_string())
+}
+
+/// The command that starts the weekly check Job now, as a code span.
+///
+/// The Job gets a name of its own each time, stamped as `apprafter backup
+/// run` stamps a manual backup. `kubectl create job --from=cronjob/…` makes
+/// the CronJob its owner, and the CronJob keeps up to three failed Jobs: a
+/// fixed name made the second run of the same advice fail with
+/// `AlreadyExists` whenever the first had failed, which is when it is needed
+/// again.
+fn run_check_now(now: DateTime<Utc>) -> String {
+    format!(
+        "`kubectl -n apprafter-system create job --from=cronjob/apprafter-backup-check \
+         apprafter-backup-check-now-{}`",
+        now.format("%Y%m%d-%H%M%S")
+    )
 }
 
 /// The runs half of the backup section, from `BackupHealthy`.
@@ -420,7 +440,7 @@ fn backup_condition_lines(
     c: &Value,
     label: &str,
     now: DateTime<Utc>,
-    next_step: fn(&str) -> Option<(&'static str, &'static str)>,
+    next_step: fn(&str, DateTime<Utc>) -> Option<NextStep>,
 ) -> Vec<String> {
     let field = |k: &str| c.get(k).and_then(Value::as_str).unwrap_or("");
     let (status, reason, message) = (field("status"), field("reason"), field("message"));
@@ -446,8 +466,8 @@ fn backup_condition_lines(
     }
     // A reason this build has never heard of still gets a next step: the
     // one command that shows every backup Job.
-    let (next, doc) = next_step(reason).unwrap_or((
-        "`apprafter backup status` shows the Jobs and the runner's own record.",
+    let (next, doc) = next_step(reason, now).unwrap_or((
+        "`apprafter backup status` shows the Jobs and the runner's own record.".to_string(),
         BACKUP_HEALTH_DOC,
     ));
     lines.push(format!("  Next: {next}"));
@@ -456,11 +476,14 @@ fn backup_condition_lines(
     lines
 }
 
+/// What to run next, and the page that explains it.
+type NextStep = (String, &'static str);
+
 /// What to run next for each `BackupHealthy` reason the operator writes,
 /// and the page that explains it. Every reason is named, so a new one is a
 /// decision here rather than a silent fall-through to the generic advice
 /// (a test reads the reasons out of the operator's source).
-fn backup_next_step(reason: &str) -> Option<(&'static str, &'static str)> {
+fn backup_next_step(reason: &str, now: DateTime<Utc>) -> Option<NextStep> {
     let step = match reason {
         "RunnerUnschedulable" => (
             "`apprafter backup status` shows the Job and its pod; `apprafter top` shows how \
@@ -515,13 +538,17 @@ fn backup_next_step(reason: &str) -> Option<(&'static str, &'static str)> {
         ),
         // Only a later check Job clears it, and the schedule is weekly: say
         // how to run one now instead of leaving the reader to wait a week.
-        "RepositoryCheckFailed" => (
-            "`apprafter backup check` runs the same check from this machine and prints \
-             restic's own output; `apprafter backup status` shows the check Job. Only a check \
-             that passes in the cluster clears this: `kubectl -n apprafter-system create job \
-             --from=cronjob/apprafter-backup-check apprafter-backup-check-rerun` runs one now.",
-            BACKUP_HEALTH_DOC,
-        ),
+        "RepositoryCheckFailed" => {
+            return Some((
+                format!(
+                    "`apprafter backup check` runs the same check from this machine and prints \
+                     restic's own output; `apprafter backup status` shows the check Job. Only a \
+                     check that passes in the cluster clears this: {} runs one now.",
+                    run_check_now(now)
+                ),
+                BACKUP_HEALTH_DOC,
+            ))
+        }
         "ScheduleSuspended" => (
             "resume the CronJob the message names: `kubectl -n apprafter-system patch cronjob \
              <name> --type merge -p '{\"spec\":{\"suspend\":false}}'`.",
@@ -544,7 +571,7 @@ fn backup_next_step(reason: &str) -> Option<(&'static str, &'static str)> {
         ),
         _ => return None,
     };
-    Some(step)
+    Some((step.0.to_string(), step.1))
 }
 
 /// Every condition on the stack, as rows. Shared by the full table
@@ -1508,6 +1535,56 @@ mod tests {
         assert!(text.contains(BACKUP_HEALTH_DOC), "{text}");
     }
 
+    /// The `kubectl create job` line printed to run the check now, and the
+    /// Job name in it.
+    fn printed_check_job(text: &str) -> String {
+        let at = text
+            .find("--from=cronjob/apprafter-backup-check ")
+            .unwrap_or_else(|| panic!("no create-job line in {text}"));
+        let rest = &text[at + "--from=cronjob/apprafter-backup-check ".len()..];
+        rest.split('`').next().unwrap().trim().to_string()
+    }
+
+    /// Found by review: the advice printed one fixed Job name. The Job it
+    /// creates is owned by the CronJob, which keeps up to three failed ones,
+    /// so a rerun that failed again stays — and the same command then fails
+    /// with AlreadyExists, exactly when the reader needs to run it again.
+    #[test]
+    fn the_command_that_runs_the_check_now_names_a_new_job_each_time() {
+        let later = frozen_now() + chrono::Duration::seconds(1);
+        let failed = |now| {
+            let stack = with_backup(
+                true,
+                Some(backup_condition(
+                    "False",
+                    "RepositoryCheckFailed",
+                    "repository check Job x: failed",
+                )),
+            );
+            printed_check_job(&backup_health_lines(&stack, now).join("\n"))
+        };
+        let not_yet = |now| {
+            let stack = with_retention(
+                Some(backup_condition("True", "Succeeded", "ok")),
+                Some(retention_condition("Unknown", "NoCheckYet", "why")),
+            );
+            printed_check_job(&backup_health_lines(&stack, now).join("\n"))
+        };
+        for name in [failed(frozen_now()), not_yet(frozen_now())] {
+            assert!(name.starts_with("apprafter-backup-check-"), "{name}");
+            // A Job name is a DNS-1123 label, and its pods' `job-name` label
+            // value must fit in 63 characters.
+            assert!(name.len() <= 63, "{name}");
+            assert!(
+                name.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+                "{name}"
+            );
+        }
+        assert_ne!(failed(frozen_now()), failed(later));
+        assert_ne!(not_yet(frozen_now()), not_yet(later));
+    }
+
     #[test]
     fn a_job_with_no_pod_is_sent_to_its_events() {
         // As the kind proof printed it. `backup status` shows such a Job as
@@ -1587,7 +1664,7 @@ mod tests {
         );
         for reason in reasons.iter().filter(|r| *r != "Succeeded") {
             assert!(
-                backup_next_step(reason).is_some(),
+                backup_next_step(reason, frozen_now()).is_some(),
                 "the operator writes BackupHealthy reason `{reason}` and this build gives \
                  it no next step of its own"
             );
@@ -1796,7 +1873,7 @@ mod tests {
             .filter(|r| !matches!(r.as_str(), "Pruned" | "NothingToPrune"))
         {
             assert!(
-                retention_next_step(reason).is_some(),
+                retention_next_step(reason, frozen_now()).is_some(),
                 "the operator writes BackupRetention reason `{reason}` and this build gives it \
                  no next step of its own"
             );
