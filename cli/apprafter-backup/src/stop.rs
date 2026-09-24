@@ -17,11 +17,12 @@
 //!      apply and waiting out the one under way, so that the main thread,
 //!      still running until that exec fails, cannot leave a pod behind the
 //!      list;
-//!    - passes the signal on to a restic it has running (`restic backup`, the
-//!      prune's `restic forget --prune`) and gives it a moment to remove its
-//!      repository lock and exit ([`crate::restic_child`]). Otherwise restic
-//!      would be SIGKILLed with the runner and leave the lock for 30 minutes —
-//!      an exclusive one, when it was pruning;
+//!    - passes the signal on to a restic it has running (`restic backup`,
+//!      the check Job's `restic check`, or the prune's `restic forget` or
+//!      `restic prune`) and gives it a moment to remove its repository lock
+//!      and exit ([`crate::restic_child`]). Otherwise restic would be
+//!      SIGKILLed with the runner and leave the lock for 30 minutes — an
+//!      exclusive one, when it was checking or pruning;
 //! 2. records the failure in the status ConfigMap (`lastFailure`, `lastError`);
 //! 3. posts the failure webhook;
 //! 4. exits 1.
