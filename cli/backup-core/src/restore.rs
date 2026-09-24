@@ -354,7 +354,7 @@ fn choose_latest<'a>(
     snaps: &'a [Value],
     this_cluster_uid: Option<&str>,
 ) -> Result<Latest<'a>, String> {
-    let pool = latest_pool(snaps, this_cluster_uid)?;
+    let (pool, drawn_from) = latest_pool(snaps, this_cluster_uid)?;
 
     let runs = RunSizes::of(snaps);
     let (complete, rest): (Vec<&Value>, Vec<&Value>) =
@@ -394,16 +394,13 @@ fn choose_latest<'a>(
             .values()
             .max_by_key(|(_, at)| *at)
             .map(|(r, _)| r.newest.as_str());
-        return Err(format!(
-            "no complete backup run to choose: {} run(s) here, and none has the snapshot that \
-             completes it, the one carrying manifest.json{} — each was interrupted before its \
-             last snapshot, or is still being written. A sequential backup writes that \
-             snapshot last. Wait for a backup in progress to finish, or take one \
-             (`apprafter backup run`); `apprafter backup list` shows what the repository holds.",
+        // Every complete snapshot is outside the pool: another cluster's.
+        let elsewhere = snaps.iter().filter(|s| runs.completes(s)).count();
+        return Err(no_complete_run(
+            drawn_from,
             unfinished.len(),
-            newest
-                .map(|t| format!(" (the newest written at {t})"))
-                .unwrap_or_default(),
+            newest,
+            elsewhere,
         ));
     };
     let chosen = instant_of(commit);
@@ -418,8 +415,58 @@ fn choose_latest<'a>(
     })
 }
 
-/// The snapshots `latest` is allowed to choose between — see
-/// [`resolve_run_snapshots`] for the rule and why each branch exists.
+/// Whose snapshots [`latest_pool`] drew `latest`'s candidates from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DrawnFrom {
+    /// This cluster's own, with the legacy ones: every other snapshot in the
+    /// repository is another cluster's.
+    ThisCluster,
+    /// Every snapshot in the repository: no cluster to ask, or none of this
+    /// cluster's in a repository of at most one other.
+    Repository,
+}
+
+/// The error for a pool with no complete run in it.
+///
+/// It says whose runs it counted — "here" read as the whole repository when
+/// it meant only this cluster's — and, when another cluster's complete run
+/// IS in the repository, the way to reach it on purpose: the escape hatch
+/// the multi-cluster refusal in [`latest_pool`] gives. It offers none when
+/// there is nothing complete to name.
+fn no_complete_run(
+    drawn_from: DrawnFrom,
+    runs: usize,
+    newest: Option<&str>,
+    complete_elsewhere: usize,
+) -> String {
+    let (whose, listing) = match drawn_from {
+        DrawnFrom::ThisCluster => ("this cluster's", "`apprafter backup list`"),
+        DrawnFrom::Repository => ("the repository's", "`apprafter backup list --all-clusters`"),
+    };
+    let mut err = format!(
+        "no complete backup run to choose: {whose} snapshots form {runs} run(s), and none has \
+         the snapshot that completes it, the one carrying manifest.json{} — each was \
+         interrupted before its last snapshot, or is still being written. A sequential backup \
+         writes that snapshot last. Wait for a backup in progress to finish, or take one \
+         (`apprafter backup run`); {listing} shows them.",
+        newest
+            .map(|t| format!(" (the newest written at {t})"))
+            .unwrap_or_default(),
+    );
+    if complete_elsewhere > 0 {
+        err.push_str(&format!(
+            " The repository does hold {complete_elsewhere} complete run(s) of other clusters, \
+             which `latest` never picks for this one: `apprafter backup list --all-clusters` \
+             shows every snapshot with the cluster it belongs to; to use one of them on \
+             purpose, name it — `--snapshot <id>` for a restore, `apprafter backup show <id>` \
+             to look inside it first."
+        ));
+    }
+    err
+}
+
+/// The snapshots `latest` is allowed to choose between, and whose they are
+/// — see [`resolve_run_snapshots`] for the rule and why each branch exists.
 ///
 /// Separated out so the DECISION (which cluster's history is `latest` drawn
 /// from) is a single readable function rather than a condition threaded
@@ -427,7 +474,7 @@ fn choose_latest<'a>(
 fn latest_pool<'a>(
     snaps: &'a [Value],
     this_cluster_uid: Option<&str>,
-) -> Result<Vec<&'a Value>, String> {
+) -> Result<(Vec<&'a Value>, DrawnFrom), String> {
     if let Some(uid) = this_cluster_uid {
         // A pool of ONLY legacy snapshots is not a history of our own.
         //
@@ -454,12 +501,13 @@ fn latest_pool<'a>(
             )
         });
         if have_our_own {
-            return Ok(snaps
+            let ours = snaps
                 .iter()
                 .filter(|s| {
                     crate::cluster::owned_by_this_cluster(&crate::cluster::snapshot_tags(s), uid)
                 })
-                .collect());
+                .collect();
+            return Ok((ours, DrawnFrom::ThisCluster));
         }
     }
 
@@ -479,7 +527,7 @@ fn latest_pool<'a>(
             others.join(", ")
         ));
     }
-    Ok(snaps.iter().collect())
+    Ok((snaps.iter().collect(), DrawnFrom::Repository))
 }
 
 /// Decide the ordered restore steps for a mode + `--data-only`.
@@ -1001,10 +1049,79 @@ mod tests {
             resolve_latest_snapshot(&listing, Some(MINE)).unwrap_err(),
         ] {
             assert!(err.contains("no complete backup run"), "{err}");
-            assert!(err.contains("1 run(s)"), "{err}");
+            assert!(
+                err.contains("this cluster's snapshots form 1 run(s)"),
+                "{err}"
+            );
             assert!(err.contains("manifest.json"), "{err}");
             assert!(err.contains("2026-09-24T03:00:02Z"), "{err}");
             assert!(err.contains("still being written"), "{err}");
+            assert!(err.contains("`apprafter backup list` shows them"), "{err}");
+            // Nothing complete anywhere: no run to name instead.
+            assert!(!err.contains("--all-clusters"), "{err}");
+            assert!(!err.contains("--snapshot"), "{err}");
+        }
+    }
+
+    /// FIRES: this cluster's only run is unfinished and ANOTHER cluster's
+    /// complete run is in the repository. `latest` rightly does not pick
+    /// theirs (E2), but the error said "1 run(s) here" — which reads as the
+    /// whole repository — and gave no way to reach the run that exists.
+    /// It now says whose runs it counted, and gives the refusal's escape
+    /// hatch: list every cluster's snapshots, then name one.
+    #[test]
+    fn with_no_complete_run_of_its_own_the_error_names_the_other_clusters_ones() {
+        let listing = format!(
+            r#"[
+              {{"id":"theirs","time":"2026-09-23T03:00:00Z",
+                "tags":["{THEIRS}-2026-09-23T03:00:00Z"],"paths":["/s/t/data"]}},
+              {{"id":"c0","time":"2026-09-24T03:00:01Z",
+                "tags":["{MINE}-2026-09-24T03:00:00Z"],"paths":["/s/claim-0"]}}
+            ]"#
+        );
+        for err in [
+            resolve_run_snapshots(&listing, "latest", Some(MINE)).unwrap_err(),
+            resolve_latest_snapshot(&listing, Some(MINE)).unwrap_err(),
+        ] {
+            assert!(
+                err.contains("this cluster's snapshots form 1 run(s)"),
+                "{err}"
+            );
+            assert!(!err.contains(" here"), "{err}");
+            assert!(err.contains("1 complete run(s) of other clusters"), "{err}");
+            assert!(
+                err.contains("`apprafter backup list --all-clusters`"),
+                "{err}"
+            );
+            assert!(err.contains("`--snapshot <id>` for a restore"), "{err}");
+            assert!(err.contains("`apprafter backup show <id>`"), "{err}");
+        }
+    }
+
+    /// With no cluster to ask (or none of this cluster's snapshots in a
+    /// one-cluster repository), `latest` looked at the whole repository,
+    /// and the error says that — and points at the listing that shows it.
+    #[test]
+    fn with_no_cluster_to_ask_the_error_counts_the_repositorys_runs() {
+        let listing = format!(
+            r#"[
+              {{"id":"c0","time":"2026-09-24T03:00:01Z",
+                "tags":["{MINE}-2026-09-24T03:00:00Z"],"paths":["/s/claim-0"]}}
+            ]"#
+        );
+        let fresh = "abcdabcd-0000-0000-0000-abcdabcdabcd";
+        for uid in [None, Some(fresh)] {
+            let err = resolve_latest_snapshot(&listing, uid).unwrap_err();
+            assert!(
+                err.contains("the repository's snapshots form 1 run(s)"),
+                "{err}"
+            );
+            assert!(!err.contains("this cluster"), "{err}");
+            assert!(
+                err.contains("`apprafter backup list --all-clusters` shows them"),
+                "{err}"
+            );
+            assert!(!err.contains("--snapshot"), "{err}");
         }
     }
 
