@@ -13,13 +13,13 @@ Tier 3+ multi-node clusters can benefit from node autoscaling. Two mainstream to
 
 Karpenter on AWS is a first-class deployment. Karpenter on Hetzner requires Cluster API + a Karpenter-CAPI provider — transitively depends on CAPI infrastructure being available.
 
-CAPI is positioned as a Turnkey Phase 5+ concern (see ADR 0016 and ADR 0023). It is not part of OSS core in v1.
+CAPI is positioned as a Turnkey Phase 5+ concern (see ADR 0016 and ADR 0023). It is not part of the source-available core in v1.
 
 ## Decision
 
 ### Not shipped in v1
 
-Karpenter is **not** part of v1 OSS core. cluster-autoscaler is also not part of v1.
+Karpenter is **not** part of the v1 source-available core. cluster-autoscaler is also not part of v1.
 
 ### Phase 6.2 — AWS native
 
@@ -27,7 +27,7 @@ When Phase 6.2 (AWS provider) is implemented, Karpenter is included standalone a
 
 ### Phase 5+ — Hetzner via CAPI
 
-When CAPI infrastructure becomes part of the platform (during Turnkey work in Phase 5+), Karpenter on Hetzner becomes available as an opt-in for OSS Tier 2+ clusters. The exact subphase is added when CAPI is ready, not pre-scheduled.
+When CAPI infrastructure becomes part of the platform (during Turnkey work in Phase 5+), Karpenter on Hetzner becomes available as an opt-in for self-hosted Tier 2+ clusters. The exact subphase is added when CAPI is ready, not pre-scheduled.
 
 ### Managed offering
 
@@ -46,7 +46,7 @@ Tier 3 bare metal cannot be autoscaled at Karpenter speeds (Hetzner Robot server
 
 ### Suggestions advisor — managed-side feature
 
-A separate "you should scale up" advisor service is **not** shipped in OSS. OSS users either use Karpenter (when available) or manage capacity manually. The advisor is a managed-side feature, leveraging observability data (VictoriaMetrics + ClickHouse logs) plus potential LLM analytics. Phase 4+ managed work, recorded in the marketing strategy's open questions.
+A separate "you should scale up" advisor service is **not** shipped in the source-available core. Self-hosted users either use Karpenter (when available) or manage capacity manually. The advisor is a managed-side feature, leveraging observability data (VictoriaMetrics + ClickHouse logs) plus potential LLM analytics. Phase 4+ managed work, recorded in the marketing strategy's open questions.
 
 ## Rationale
 
@@ -74,13 +74,13 @@ cluster-autoscaler's only advantage is wider provider support. With Hetzner need
 ## Consequences
 
 **Positive:**
-- v1 OSS doesn't carry autoscaling code complexity.
+- The v1 source-available core doesn't carry autoscaling code complexity.
 - Phase 6.2 AWS gets a high-quality autoscaler natively.
 - Managed offering has clear differentiator: customers get Karpenter-by-default without configuring it.
 - Bare metal autoscaling design constraint is recorded explicitly, preventing accidental degradation.
 
 **Negative:**
-- T2 OSS users have no autoscaling in early v1 (must manually scale via `platform-cli scale`).
+- T2 self-hosted users have no autoscaling in early v1 (must manually scale via `platform-cli scale`).
 - Karpenter advisor in managed is a separate engineering effort.
 
 **Trade-offs:**
@@ -88,7 +88,7 @@ cluster-autoscaler's only advantage is wider provider support. With Hetzner need
 
 ## Risk
 
-- T2 OSS user demand for autoscaling before CAPI is ready — manual `platform-cli scale` workaround works but is friction. Mitigation: document workaround clearly; consider lightweight scale automation if demand emerges.
+- T2 self-hosted user demand for autoscaling before CAPI is ready — manual `platform-cli scale` workaround works but is friction. Mitigation: document workaround clearly; consider lightweight scale automation if demand emerges.
 - Karpenter project changes course (e.g. AWS reduces investment). Mitigation: Karpenter is CNCF Sandbox with multi-vendor contribution; reasonable durability expected.
 
 ## Owner
@@ -97,7 +97,7 @@ Core platform team; AWS native in Phase 6.2, Hetzner via CAPI when CAPI lands in
 
 ## Re-evaluation triggers
 
-- T2 OSS demand for autoscaling becomes high before CAPI work (could trigger interim manual-scale automation).
+- T2 self-hosted demand for autoscaling becomes high before CAPI work (could trigger interim manual-scale automation).
 - Karpenter project loses momentum (would trigger reconsideration of cluster-autoscaler or custom solution).
 - Bare metal slow autoscaling research completes — informs whether a separate primitive is needed or Karpenter-style works.
 

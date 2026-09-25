@@ -60,13 +60,13 @@ The two attacker models are answered primarily by the design above. On top of th
 - **Secrets out of reach.** Under `strictMode`, vault-injector places secrets in process memory only, so they never appear in the PodSpec, a ConfigMap, a Kubernetes Secret, or the API surface a read tool could traverse. The agent physically cannot read them.
 - **Scope-gating the verbs.** RBAC roles for the MCP agent are distinct from human roles; destructive verbs are absent from the default agent role; blast radius is bounded to a single tenant.
 
-A basic destructive-attempt alert (an ordinary audit event raised when admission or `MigrationPlan` rejects a destructive operation from an agent token) is part of the open-source minimum at near-zero marginal cost; advanced behavioural anomaly detection (recon-pattern detection, unusual-egress detection, behavioural baselining) is a managed-plan premium add-on, since it requires an observability stack to operate.
+A basic destructive-attempt alert (an ordinary audit event raised when admission or `MigrationPlan` rejects a destructive operation from an agent token) is part of the source-available minimum at near-zero marginal cost; advanced behavioural anomaly detection (recon-pattern detection, unusual-egress detection, behavioural baselining) is a managed-plan premium add-on, since it requires an observability stack to operate.
 
 The full CVE-mapped operational checklist — every attack class mapped to "already covered by construction / residual gap / control / how to verify", with the verified CVE catalogue and the OWASP / MITRE ATLAS / NIST cross-references — is maintained internally and is not reproduced here. This ADR cements the model; that internal checklist is the living operational companion, revisited on each new MCP CVE.
 
-### Relationship to deployment mode and the open-core split
+### Relationship to deployment mode and the core/managed split
 
-The agentic-safety model is independent of the hardware-tier axis (T1 Solo through T4 Regulated, per ADR 0022, which describes the compute substrate only) and of the managed-plan axis (Hosted Services, Managed Operations, Turnkey Cloud, plus a reserved Enterprise plan, per ADR 0034, which describes the operational relationship only). The `strictMode` and `confidential` switches that bound an agent's reach (ADR 0033) are selected independently on the Tenant CRD and are orthogonal to both axes. In Hosted Services (the launch plan), the customer cluster connects via the outbound `apprafter-agent` (ADR 0031): it dials out to the hosted bus, there is no inbound listener and no firewall change, AppRafter holds no customer cluster credentials and no kubeconfigs and makes no reverse-direction calls into the customer Kubernetes API, and the hosted MCP server reaches the cluster only by proxying through that outbound agent. The structural guarantees in this ADR therefore hold whether the MCP server runs hosted or self-hosted. The platform is fully functional as open source; the managed plans add premium quality-of-life and operations (centralised review, advanced anomaly detection, richer token-rotation policies), never a structural dependency — a customer can always leave with the entire cluster intact, cancellation being a registration revocation rather than a migration.
+The agentic-safety model is independent of the hardware-tier axis (T1 Solo through T4 Regulated, per ADR 0022, which describes the compute substrate only) and of the managed-plan axis (Hosted Services, Managed Operations, Turnkey Cloud, plus a reserved Enterprise plan, per ADR 0034, which describes the operational relationship only). The `strictMode` and `confidential` switches that bound an agent's reach (ADR 0033) are selected independently on the Tenant CRD and are orthogonal to both axes. In Hosted Services (the launch plan), the customer cluster connects via the outbound `apprafter-agent` (ADR 0031): it dials out to the hosted bus, there is no inbound listener and no firewall change, AppRafter holds no customer cluster credentials and no kubeconfigs and makes no reverse-direction calls into the customer Kubernetes API, and the hosted MCP server reaches the cluster only by proxying through that outbound agent. The structural guarantees in this ADR therefore hold whether the MCP server runs hosted or self-hosted. The platform is fully functional as source-available software; the managed plans add premium quality-of-life and operations (centralised review, advanced anomaly detection, richer token-rotation policies), never a structural dependency — a customer can always leave with the entire cluster intact, cancellation being a registration revocation rather than a migration.
 
 ## Consequences
 
@@ -86,7 +86,7 @@ The agentic-safety model is independent of the hardware-tier axis (T1 Solo throu
 
 **Neutral:**
 
-- Advanced behavioural anomaly detection is deferred to the managed plans, so open-source self-hosters get the structural guarantees plus the basic destructive-attempt alert, but not behavioural baselining. The structural controls do the heavy lifting; anomaly detection is a defence-in-depth layer, not the primary control.
+- Advanced behavioural anomaly detection is deferred to the managed plans, so self-hosters get the structural guarantees plus the basic destructive-attempt alert, but not behavioural baselining. The structural controls do the heavy lifting; anomaly detection is a defence-in-depth layer, not the primary control.
 
 ## Alternatives considered
 
@@ -115,7 +115,7 @@ Core platform team. Andrey Ryahovskiy (`remryahirev@gmail.com`) convenes reviews
 - A material update to OWASP Top-10 for Agentic Applications, MITRE ATLAS, or NIST AI agent guidance shifts the consensus on a control.
 - Customer demand for third-party MCP servers reaches a level where the built-in-only stance imposes a real cost; would reconsider an audited, signed, scope-gated extension mechanism rather than open plug-in.
 - The multi-tenant hosted MCP authentication design is worked through; would land its own ADR and may amend the credential model here.
-- Behavioural anomaly detection moves from managed-premium toward an open-source baseline as its operational cost drops.
+- Behavioural anomaly detection moves from managed-premium toward a source-available baseline as its operational cost drops.
 
 ## References
 
@@ -124,7 +124,7 @@ Core platform team. Andrey Ryahovskiy (`remryahirev@gmail.com`) convenes reviews
 - ADR 0027 — MigrationPlan unification with scope discriminator (one gate across application and platform scope; core-resource coverage).
 - ADR 0031 — `apprafter-agent` ↔ hosted-bus protocol (outbound connection model; hosted MCP reaches the cluster only via the agent; no held credentials).
 - ADR 0033 — Tenant security configuration (`strictMode` / `confidential` switches that bound agent reach and exfiltration).
-- ADR 0034 — Managed offering model and terminology (hardware-tier vs managed-plan axes; open-core split).
+- ADR 0034 — Managed offering model and terminology (hardware-tier vs managed-plan axes; core/managed split).
 - ADR 0035 — Minimal data exposure (metadata-only constraint; the read-surface design here is its agentic instance).
 - ADR 0022 — Tier model clarification (hardware-tier axis: T1 Solo through T4 Regulated).
 - An internal, CVE-mapped operational security checklist is the operational companion this ADR cements; it is maintained separately and revisited on each new MCP CVE.

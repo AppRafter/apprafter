@@ -101,10 +101,16 @@ describe('hero section pieces', () => {
     // overwrote the CMS-built image, so the site silently said
     // "Open source" again. The fallbacks are the copy of record whenever
     // the CMS is unreachable, so the claim is pinned across all of them.
+    // The abbreviation makes the same claim: a standalone "OSS" token
+    // (case-sensitive, on word boundaries) once named the self-hosted
+    // platform in the comparison and roadmap copy, so it is rejected too.
     const dir = join(ROOT, 'src/data/fallback');
     const offenders = readdirSync(dir)
       .filter((f) => f.endsWith('.json'))
-      .filter((f) => /open[- ]source/i.test(readFileSync(join(dir, f), 'utf8')));
+      .filter((f) => {
+        const copy = readFileSync(join(dir, f), 'utf8');
+        return /open[- ]source/i.test(copy) || /\bOSS\b/.test(copy);
+      });
     expect(offenders).toEqual([]);
   });
 

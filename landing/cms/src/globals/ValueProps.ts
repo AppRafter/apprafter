@@ -49,7 +49,7 @@ export const ValueProps: GlobalConfig = {
           options: [
             { label: 'Grid (single manifest)', value: 'grid' },
             { label: 'Bars (scaling tiers)', value: 'bars' },
-            { label: 'Lock (open source)', value: 'lock' },
+            { label: 'Lock (no vendor lock-in)', value: 'lock' },
           ],
         },
       ],

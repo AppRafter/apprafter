@@ -5,7 +5,7 @@
 
 **An opinionated, vertically integrated Platform-as-a-Service on Kubernetes.**
 
-**One `Application` manifest, designed to run unchanged from a €5 VDS to multi-node production — an open-source core, with an optional managed cloud on top.**
+**One `Application` manifest, designed to run unchanged from a €5 VDS to multi-node production — a source-available core, with an optional managed cloud on top.**
 
 [![License: FSL-1.1-Apache-2.0](https://img.shields.io/badge/license-FSL--1.1--Apache--2.0-blue.svg)](./LICENSE)
 [![Plugins: MIT](https://img.shields.io/badge/plugins-MIT-green.svg)](./LICENSE-MIT)
@@ -28,11 +28,11 @@ The platform is deliberately **opinionated** — one proven component per slot (
 
 ## Two products, one platform
 
-AppRafter is an open-source platform first, with a managed cloud as a second product built **on top of** the same core — not a premium fork of it.
+AppRafter is a source-available platform first, with a managed cloud as a second product built **on top of** the same core — not a premium fork of it.
 
-### 1. Open-source core — self-host
+### 1. Source-available core — self-host
 
-Everything required to run the platform is open source and free to run on your own hardware or in your own cloud: the Rust operator and its CRDs, the `apprafter` CLI, the developer portal, the platform services, and observability. The managed cloud adds only a thin convenience layer on top — a self-hosted cluster is **fully functional without it**.
+Everything required to run the platform is source-available or openly licensed and free to run on your own hardware or in your own cloud: the Rust operator and its CRDs, the `apprafter` CLI, the developer portal, the platform services, and observability. The managed cloud adds only a thin convenience layer on top — a self-hosted cluster is **fully functional without it**.
 
 Shipped today is the single-node **Tier 1** control plane: `apprafter` provisions a Hetzner VDS, bootstraps the cluster (Cilium, upstream Gateway API, the AppRafter operator, Argo CD, cert-manager), and the operator reconciles your `Application`s through GitOps. Multi-node tiers and the `needs`-based platform services (Postgres, Redis, and more) are landing per `plan.md`.
 
@@ -44,7 +44,7 @@ For teams who would rather not run the ops themselves, a managed cloud is in dev
 
 Two properties follow directly from that architecture:
 
-- **Anti-vendor-lock by design.** Because the cluster will be a standalone open-source install on your own infrastructure, canceling the subscription leaves it running by design — you lose only the hosted convenience layer, with no migration required.
+- **Anti-vendor-lock by design.** Because the cluster will be a standalone source-available install on your own infrastructure, canceling the subscription leaves it running by design — you lose only the hosted convenience layer, with no migration required.
 - **Minimal Data Exposure.** The managed services are designed to see only metadata — manifests applied, status and audit events — never the data in your databases or your secret values.
 
 The managed cloud is planned at three levels of increasing scope — **Hosted Services** (the launch plan) → **Managed Operations** → **Turnkey Cloud** — billed per cluster. A waitlist opens at launch.
@@ -142,7 +142,7 @@ Three setup paths (Nix flake, Dev Container, manual via `mise`) are documented i
 
 ## License
 
-AppRafter is **open core**:
+AppRafter's core is **source-available**; its plugins and documentation are openly licensed:
 
 - **Platform core** (`cli/`, `operator/`, `schemas/`, `manifests/`) — **FSL-1.1-Apache-2.0**: the Functional Source License, which auto-converts to **Apache 2.0** two years after each release. It permits any use — personal, internal business, and commercial workloads — **except offering AppRafter itself as a managed service to third parties**. Once a release reaches its two-year conversion date, that restriction lifts.
 - **Plugins** (`providers/*`, `backstage-plugins/*`, community SDKs) — **MIT** from day one.

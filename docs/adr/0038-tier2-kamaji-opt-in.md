@@ -8,7 +8,7 @@ Accepted (2026-05-29).
 
 ADR 0023 established Kamaji as AppRafter's single hard multi-tenancy mechanism and set its per-tier availability: structurally impossible on hardware T1 (single node), and **default on, opt-out** from hardware T2 upward, with each AppRafter `Tenant` mapping to a Kamaji `TenantControlPlane`. That default-on framing was reasonable when T2 was reasoned about as the entry point for hosting-provider and multi-organisation scenarios, where hard isolation by structure is the point.
 
-The managed launch speedrun (`speedrun-plan.md` §5.7) pulls the hardware T2 substrate forward into the open-source core so that a customer can register either a single-node (T1) or an HA (T2) cluster at launch. In doing so it re-examined what hardware T2 needs to be *at launch* and found a mismatch with the ADR 0023 default:
+The managed launch speedrun (`speedrun-plan.md` §5.7) pulls the hardware T2 substrate forward into the source-available core so that a customer can register either a single-node (T1) or an HA (T2) cluster at launch. In doing so it re-examined what hardware T2 needs to be *at launch* and found a mismatch with the ADR 0023 default:
 
 - The launch hardware T2 customer segment is dominated by single-organisation teams — solo developers growing into a small team, and small teams running one organisation's workloads — not managed service providers or multi-organisation operators. For a single organisation, hard multi-tenancy is not required: standard Kubernetes namespaces, the default-deny `NetworkPolicy`, workload identity, and the Capsule policy layer already separate that organisation's environments and teams adequately.
 
@@ -36,7 +36,7 @@ The speedrun's T2 substrate is therefore an HA cluster only: a 3-node k3s contro
 
 This decision concerns the **hardware tier** axis only. It does not touch the **managed plan** axis (Hosted Services, Managed Operations, Turnkey Cloud, with Enterprise reserved as TBD): a hardware T2 cluster attached to Hosted Services is the launch shape, and its multi-tenancy posture is governed by this flag regardless of plan. It is likewise independent of the ADR 0033 security switches `strictMode` and `confidential`, which are selected on the `Tenant` CRD and remain orthogonal to both the hardware tier and the managed plan; turning hard multi-tenancy off by default on T2 neither implies nor precludes either switch.
 
-The open-core split (ADR 0034) holds: the default HA-only T2 cluster is a complete open-source install, and enabling `multitenancy: true` adds a capability rather than a structural dependency. A cluster can move between the two postures through configuration; cancelling a managed subscription is still a registration revocation, not a migration.
+The core/managed split (ADR 0034) holds: the default HA-only T2 cluster is a complete source-available install, and enabling `multitenancy: true` adds a capability rather than a structural dependency. A cluster can move between the two postures through configuration; cancelling a managed subscription is still a registration revocation, not a migration.
 
 ## Consequences
 
@@ -70,7 +70,7 @@ Rejected for launch. Kamaji's control plane is a substrate-level installation (a
 
 ## Owner
 
-Core platform team. Andrey Ryahovskiy (`remryahirev@gmail.com`) convenes reviews and approves amendments. The Kamaji opt-in lands in the post-launch backlog (`speedrun-plan.md` §6 item 4); the default HA-only T2 substrate is in the open-source core at launch.
+Core platform team. Andrey Ryahovskiy (`remryahirev@gmail.com`) convenes reviews and approves amendments. The Kamaji opt-in lands in the post-launch backlog (`speedrun-plan.md` §6 item 4); the default HA-only T2 substrate is in the source-available core at launch.
 
 ## Re-evaluation
 
@@ -84,11 +84,11 @@ Otherwise no scheduled re-evaluation.
 
 ## References
 
-- `speedrun-plan.md` §5.7 (this deviation: hardware T2 = HA substrate only, Kamaji opt-in via `PlatformStack.spec.values.multitenancy: true`, default off; spec §4.1 update required), §2.1 / §2.3 (T2 substrate pulled into the open-source core; Kamaji + `Tenant` CRD deferred to the post-launch backlog with the MSP / multi-organisation trigger), §6 item 4 (Kamaji + `Tenant` CRD opt-in post-launch ordering).
+- `speedrun-plan.md` §5.7 (this deviation: hardware T2 = HA substrate only, Kamaji opt-in via `PlatformStack.spec.values.multitenancy: true`, default off; spec §4.1 update required), §2.1 / §2.3 (T2 substrate pulled into the source-available core; Kamaji + `Tenant` CRD deferred to the post-launch backlog with the MSP / multi-organisation trigger), §6 item 4 (Kamaji + `Tenant` CRD opt-in post-launch ordering).
 - ADR 0023 — Kamaji as the single hard multi-tenancy mechanism; Capsule as policy layer (**amended**: the hardware T2 entry moves from "Kamaji default, opt-out" to "Kamaji opt-in, default off"; the mechanism is unchanged).
 - ADR 0022 — hardware tier model (substrate only; HA and hard multi-tenancy are orthogonal layers, not tier-defining).
 - ADR 0033 — tenant security configuration (`strictMode` / `confidential` switches; orthogonal to both the hardware tier and this multi-tenancy default).
-- ADR 0034 — managed offering model and canonical terminology (hardware tier vs managed plan; open-core split; this decision concerns the hardware-tier axis only).
+- ADR 0034 — managed offering model and canonical terminology (hardware tier vs managed plan; core/managed split; this decision concerns the hardware-tier axis only).
 - ADR 0005 — kine+NATS over etcd (the launch T2 substrate keeps etcd for HA storage; orthogonal to this decision).
 - ADR 0026 — PlatformStack CRD (the `spec.values.multitenancy` control surface this opt-in uses).
 - `spec.md` §4.1 (Compute Substrate, per-tier multi-tenancy column — update required), §3.9 (`Tenant` CRD), §1.8 (solo-tier adoption and migration pathway), §5 (technology-stack table), Appendix C.

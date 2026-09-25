@@ -207,7 +207,7 @@ cluster stays an ordinary AppRafter install on your own infrastructure.
 
 | Phase | Status | Feature | Documentation |
 |---|---|---|---|
-| — | ◆ | Open core with no exit cost — cancelling a hosted plan leaves the cluster running, with no migration to perform | [License](license.md) |
+| — | ◆ | Source-available core with no exit cost — cancelling a hosted plan leaves the cluster running, with no migration to perform | [License](license.md) |
 | — | ◇ | Minimal data exposure — the hosted side sees manifests, status and audit events, never the data your applications hold | — |
 | — | ◇ | A short, published list of sub-processors | — |
 | — | ◆ | Independent ownership — the roadmap is set by the people running the platform | — |

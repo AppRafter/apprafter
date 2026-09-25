@@ -56,7 +56,7 @@
     {
       "label": "Exit when you stop paying",
       "selfHtml": "<span class=\"faint\">n/a</span>",
-      "managedHtml": "Your cluster keeps running. OSS takes over management. UI/Backstage you can self-host (we ship the tooling). You only lose the thin cloud-native premium layer — AI insights, cross-cluster aggregator, smart bill analysis.",
+      "managedHtml": "Your cluster keeps running. The self-hosted platform takes over management. UI/Backstage you can self-host (we ship the tooling). You only lose the thin cloud-native premium layer — AI insights, cross-cluster aggregator, smart bill analysis.",
       "turnkeyHtml": "Cross-cluster MigrationPlan tooling (<a class=\"phase-ref\" href=\"/#roadmap-phase-federation\">Phase 8</a>) for orchestrated migration."
     }
   ],

@@ -14,7 +14,7 @@ Deploying a customer application from a **private** repository needs two distinc
 
 Three defects follow. **(1)** The CLI creates raw resources that bypass the admission webhook and the operator — they are not gated, and in particular a credential change is not classified as a potentially-destructive operation the way every other change is (the MCP security checklist already flags that the destructive-op gate must be actor-agnostic and must not be bypassable by raw resource creation). **(2)** Credential material sits as a plaintext Kubernetes Secret, which is incompatible with the SealedSecrets posture that is the Tier-1 default (plan item 2.11) and with ADR 0024 Layer 2 (secrets accessed via workload identity, never `kubectl get secret`; tokens must not be scavenge-able). **(3)** The registry pull-secret is missing, so any application whose image lives in a private registry simply does not start.
 
-This is **not** a managed-only concern. The open-source self-host path with a private repo hits all three defects immediately; the managed Hosted Services launch needs exactly the same flow. The decision is taken OSS-first.
+This is **not** a managed-only concern. The self-host path with a private repo hits all three defects immediately; the managed Hosted Services launch needs exactly the same flow. The decision is taken self-hosting-first.
 
 ### The GitHub credential reality shaping the design
 
@@ -128,7 +128,7 @@ Rejected. A CRD is not a Secret; material in `spec` is plaintext-at-rest with we
 
 ### GitHub App as the canonical credential
 
-Rejected for this scope. `ghcr.io` does not accept App installation tokens, so the registry half stays unsolved; and the problem is OSS-first with no managed yet. A GitHub App may return as a **managed-era** refinement for the git half, paired with a machine-user PAT for the registry half.
+Rejected for this scope. `ghcr.io` does not accept App installation tokens, so the registry half stays unsolved; and the problem is self-hosting-first with no managed yet. A GitHub App may return as a **managed-era** refinement for the git half, paired with a machine-user PAT for the registry half.
 
 ### CLI performs API-ping validation
 

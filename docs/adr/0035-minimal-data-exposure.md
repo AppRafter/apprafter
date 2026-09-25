@@ -36,7 +36,7 @@ The constraint is realised feature by feature. Each managed feature is designed 
 
 ### Design rule
 
-**Every managed feature must answer one question before it ships: "what crosses from the customer cluster to us?" If the answer includes customer data, the feature is redesigned until the answer is metadata only.** This rule is applied at design time, not as an after-the-fact audit. A feature whose value genuinely requires customer-data contents to cross the boundary is not built in the managed layer; it is either redesigned to operate on metadata, performed entirely customer-side (the hosted layer only orchestrating, as with backup), or left to the open-source core that runs inside the customer's own cluster.
+**Every managed feature must answer one question before it ships: "what crosses from the customer cluster to us?" If the answer includes customer data, the feature is redesigned until the answer is metadata only.** This rule is applied at design time, not as an after-the-fact audit. A feature whose value genuinely requires customer-data contents to cross the boundary is not built in the managed layer; it is either redesigned to operate on metadata, performed entirely customer-side (the hosted layer only orchestrating, as with backup), or left to the source-available core that runs inside the customer's own cluster.
 
 This rule is the operational complement to ADR 0034's connection model: the agent provides no path for AppRafter to pull customer data, and this rule prevents any managed feature from pushing customer data through the channel that does exist. Where a customer wants strong technical guarantees beyond this architectural boundary — protection against host-access adversaries, including AppRafter staff in plans where AppRafter operates the host — the `confidential` switch of ADR 0033 is the orthogonal mechanism; this ADR's constraint and that switch are independent and complementary.
 
@@ -58,7 +58,7 @@ The architectural point underlying all three is the same: the metadata-only boun
 - **Feature design gains a single, testable gate.** The "what crosses to us?" question gives every managed feature a clear pass/fail check, preventing scope creep into customer-data ingestion one feature at a time.
 - **The boundary is auditable, not merely promised.** AppRafter's operations audit captures what the hosted layer receives, so customers can verify the metadata-only claim against records rather than trusting it.
 - **Some otherwise-simple feature designs cost more.** Implementations that would be trivial if customer data could flow to the hosted side (centralised log search over raw contents, server-side analysis of record-level data) must instead be built on metadata, performed customer-side with the hosted layer orchestrating, or declined. This raises the engineering cost of those features and constrains their shape.
-- **Customer-side responsibility is explicit.** Data-path operations (backup bytes, log contents, the data plane itself) remain the customer's; the hosted layer coordinates but does not custody them. This is consistent with ADR 0034's responsibility split and the open-core principle that everything required to run the cluster lives in the customer's own cluster.
+- **Customer-side responsibility is explicit.** Data-path operations (backup bytes, log contents, the data plane itself) remain the customer's; the hosted layer coordinates but does not custody them. This is consistent with ADR 0034's responsibility split and the core/managed split principle that everything required to run the cluster lives in the customer's own cluster.
 - **Optional sub-processors stay narrow.** Where an AI provider participates, it receives only aggregated and structural metadata under customer opt-in, keeping the sub-processor relationship correspondingly limited in scope.
 
 ## Alternatives considered
@@ -91,7 +91,7 @@ Rejected. The value of the constraint is that it holds universally; a customer s
 
 ## Owner
 
-Core platform team. Andrey Ryahovskiy (`remryahirev@gmail.com`) convenes reviews and approves amendments. The constraint binds the managed-services track; the open-source core, which runs entirely in the customer's cluster, is unaffected because it does not cross the boundary.
+Core platform team. Andrey Ryahovskiy (`remryahirev@gmail.com`) convenes reviews and approves amendments. The constraint binds the managed-services track; the source-available core, which runs entirely in the customer's cluster, is unaffected because it does not cross the boundary.
 
 ## Re-evaluation
 

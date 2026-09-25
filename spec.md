@@ -965,7 +965,7 @@ Leader election via Lease (10s renew / 30s expiry, holder identity from `POD_NAM
 
 Enforces cross-field invariants the OpenAPI v3 CRD schema can't express — `image` non-empty (via `base.image` or every `environments[*].image`), env names DNS-1123, env keys `^[A-Z_][A-Z0-9_]*$`. CUE schemas stay free of half-measure regex stubs and remain the design-time view; runtime enforcement layers as **CRD OpenAPI v3 → admission webhook**. TLS cert is auto-rotated via cert-manager; `caBundle` is synced onto the `ValidatingWebhookConfiguration` via the `cert-manager.io/inject-ca-from` annotation.
 
-**`apprafter-agent` — managed-plan connectivity (optional).** When a cluster is attached to a managed plan (ADR 0034), an `apprafter-agent` opens an **outbound** connection from the customer cluster to the hosted bus (gRPC streaming over HTTP/2 + TLS; see ADR 0031). It ships from the open-source operator workspace — so the cluster stays fully functional without it — has no inbound listener, and exposes only AppRafter-CRD operations and metadata, never raw Kubernetes access or customer data (ADR 0035). It is absent on self-host-only clusters.
+**`apprafter-agent` — managed-plan connectivity (optional).** When a cluster is attached to a managed plan (ADR 0034), an `apprafter-agent` opens an **outbound** connection from the customer cluster to the hosted bus (gRPC streaming over HTTP/2 + TLS; see ADR 0031). It ships from the source-available operator workspace — so the cluster stays fully functional without it — has no inbound listener, and exposes only AppRafter-CRD operations and metadata, never raw Kubernetes access or customer data (ADR 0035). It is absent on self-host-only clusters.
 
 **Why custom over Crossplane:** see design rationale in §8.
 
@@ -1290,7 +1290,7 @@ See ADR 0024 for the full rationale and per-layer detail.
 
 ## 6. Roadmap
 
-> **Managed-launch sequencing.** The ledger below is the open-source roadmap. The Hosted Services managed launch (ADR 0034) re-orders which items ship first — pulling a Tier 2 HA substrate (embedded etcd), a condensed MigrationPlan primitive, `needs.pg` / `needs.redis` / `needs.disk`, and selected Phase 4 items (ExternalSurface, HTTPRoute auto-gen, external-dns, backups, a Hubble + OTel subset) into the launch scope, while deferring others (the full six platform services, kine + NATS, Kamaji hard multi-tenancy, AccessGrant/OIDC) to a prioritised post-launch backlog. The managed track itself (hosted scaffolding, `apprafter-agent`, MCP server, billing) is product-2 work outside this ledger. See `speedrun-plan.md` for the launch sequencing; the milestone boxes here flip only on actual phase closure.
+> **Managed-launch sequencing.** The ledger below is the source-available roadmap. The Hosted Services managed launch (ADR 0034) re-orders which items ship first — pulling a Tier 2 HA substrate (embedded etcd), a condensed MigrationPlan primitive, `needs.pg` / `needs.redis` / `needs.disk`, and selected Phase 4 items (ExternalSurface, HTTPRoute auto-gen, external-dns, backups, a Hubble + OTel subset) into the launch scope, while deferring others (the full six platform services, kine + NATS, Kamaji hard multi-tenancy, AccessGrant/OIDC) to a prioritised post-launch backlog. The managed track itself (hosted scaffolding, `apprafter-agent`, MCP server, billing) is product-2 work outside this ledger. See `speedrun-plan.md` for the launch sequencing; the milestone boxes here flip only on actual phase closure.
 
 ### Milestone M0 — Architecture (current)
 
@@ -1396,7 +1396,7 @@ Subsequent to M1 delivery, ADRs 0025–0029 reframe `cluster-bootstrap` as a min
 - [ ] Kata containers as default runtime
 - [ ] MSP scenarios + multi-customer Kamaji scaling (Tenant CRD already covers single-instance multi-customer from M3)
 - [ ] Migration path Tier 2 → Tier 3 (data + workloads)
-- [ ] (When CAPI bring-up complete for Turnkey foundation) Karpenter on Hetzner becomes opt-in for OSS Tier 2+ clusters
+- [ ] (When CAPI bring-up complete for Turnkey foundation) Karpenter on Hetzner becomes opt-in for self-hosted Tier 2+ clusters
 
 ### Milestone M6 — Tier 4 (regulated)
 
@@ -1596,7 +1596,7 @@ wrote a manifest the admission webhook rejects.
 - Hetzner Cloud, Hetzner Robot, and AWS cover the target audience (solo founders + small business in EU, regulated workloads on AWS) for v1.
 - The earlier hybrid native-SDK + OpenTofu-shim approach (see superseded ADR 0011) introduced two state models, two error models, and two reconciliation paths — a leak of abstraction that compounds maintenance cost without proportional benefit.
 - The `cli-providers::Provider` trait is preserved as a generic extension point. Adding a fourth native cloud is straightforward when concrete demand materialises. This is **not** "we cannot add clouds", it is "we don't add them speculatively".
-- Crossplane was considered as an alternative but disqualified by its bootstrap problem (it requires an existing management cluster to provision the first VPS — incompatible with Tier 1 single-VDS bootstrap from CLI). Cluster API may be adopted at Phase 5+ for Turnkey customer hosting, but it is a Turnkey concern, not an OSS core dependency.
+- Crossplane was considered as an alternative but disqualified by its bootstrap problem (it requires an existing management cluster to provision the first VPS — incompatible with Tier 1 single-VDS bootstrap from CLI). Cluster API may be adopted at Phase 5+ for Turnkey customer hosting, but it is a Turnkey concern, not a dependency of the source-available core.
 - See ADR 0016 for full rationale and re-evaluation triggers.
 
 ### Why dual-stack networking everywhere
@@ -1884,4 +1884,4 @@ The matrix below describes default behaviours and opt-in availability of platfor
 
 The matrix is a living document; new features added in future phases are recorded here as defaults are established. Application-level fields (`needs.*`, `expose.*`, `confidential`, etc.) are not part of this matrix — they are described in §3 Core Concepts.
 
-**Managed plans.** The `Managed Ops` and `Turnkey` columns are managed **plans**, a separate axis from the hardware tier (per ADR 0034). The launch managed plan is **Hosted Services**, in which AppRafter hosts only the management/UX layer while the customer's cluster stays a standard open-source install on the customer's own infrastructure; its feature behaviour is that of the customer's underlying hardware tier (T1/T2), so it is not a separate column. `Managed Operations` and `Turnkey Cloud` are post-launch plans. See ADR 0034 (managed-plan model), ADR 0035 (Minimal Data Exposure), and ADR 0037 (managed control-plane infrastructure).
+**Managed plans.** The `Managed Ops` and `Turnkey` columns are managed **plans**, a separate axis from the hardware tier (per ADR 0034). The launch managed plan is **Hosted Services**, in which AppRafter hosts only the management/UX layer while the customer's cluster stays a standard source-available install on the customer's own infrastructure; its feature behaviour is that of the customer's underlying hardware tier (T1/T2), so it is not a separate column. `Managed Operations` and `Turnkey Cloud` are post-launch plans. See ADR 0034 (managed-plan model), ADR 0035 (Minimal Data Exposure), and ADR 0037 (managed control-plane infrastructure).

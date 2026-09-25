@@ -35,7 +35,7 @@ Cozystack's deployment baseline is bare metal. AppRafter Tier 1 is a single VDS 
 
 Cozystack uses Apache 2.0. AppRafter uses FSL-1.1-Apache-2.0 (auto-converts to Apache 2.0 2 years after each release; see ADR 0032 for the post-M1 base-license migration from FSL-1.1-MIT to FSL-1.1-Apache-2.0).
 
-Plain Apache 2.0 (without the FSL wrap) exposes the project to traction-without-revenue risk — cloud vendors can rebrand and offer the platform as their managed product with no contribution back. The FSL wrap provides a 2-year commercial-use protection window per release while preserving full OSS access for individuals and on-prem deployments; after that window each release converts to vanilla Apache 2.0.
+Plain Apache 2.0 (without the FSL wrap) exposes the project to traction-without-revenue risk — cloud vendors can rebrand and offer the platform as their managed product with no contribution back. The FSL wrap provides a 2-year commercial-use protection window per release while preserving full use rights for individuals and on-prem deployments; after that window each release converts to vanilla Apache 2.0.
 
 ### API surface
 
