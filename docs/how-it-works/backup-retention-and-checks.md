@@ -124,8 +124,9 @@ The runner pins a stable restic host rather than letting the ephemeral pod name
 become one: `spec.backup.clusterName` when the cluster has been named, and the
 fixed `apprafter-backup` when it has not. It changes nothing about retention —
 grouping is by tag alone — but it is what the CLUSTER column of a listing shows.
-A local `apprafter backup create` pulled to your own machine passes no host and
-uses the machine's own.
+A local `apprafter backup create` pulled to your own machine passes the same
+host, so its snapshots list under the cluster's name rather than the
+machine's.
 
 ### Forget, look, then prune {#forget-look-then-prune}
 
@@ -239,9 +240,10 @@ A key that may delete prunes. The scoped key recommended for the cluster (Put,
 Get and List on the repository, Delete only under `locks/`) may not: the store
 refuses the first delete, the prune stops there, and **nothing is deleted** — the
 bucket is left exactly as it was. The runner records the prune as
-`not-permitted`, the check still counts as passed, and `apprafter status` and
-`apprafter backup status` say that retention is not enforced, with the
-repository's size and how much it grew since the week before
+`not-permitted`, the check still counts as passed, `apprafter backup status`
+says that retention is not enforced, with the repository's size and how much it
+grew since the week before, and `apprafter status` says so too until
+`apprafter backup prune` runs from outside
 ([whether retention is enforced](#whether-retention-is-enforced)). That is the
 scoped key doing its job — a compromised cluster cannot erase history, so it
 cannot prune it either — and the pruning then belongs where the full
@@ -254,8 +256,10 @@ not delete: this mode promises a prune after every backup. The backup itself is
 taken first, and the failure names its snapshot.
 
 **`operator`.** Nothing in the cluster deletes a snapshot. The repository grows
-until you run `apprafter backup prune`, and `apprafter status` says so, with
-the repository's size.
+until you run `apprafter backup prune`, and `apprafter backup status` says so,
+with the repository's size. `apprafter status` does not mention a mode you
+chose, as long as you prune: see [whether retention is
+enforced](#whether-retention-is-enforced).
 
 A `PlatformStack` that sets `enforce` keeps it. One that never set it runs the
 platform's default, which was `operator` before platform-stack 0.2.80 and is
@@ -380,8 +384,8 @@ record and a backup's never overwrite each other:
 
 `apprafter backup status` prints them as a `Repository` block — the last check
 (with the first lines of restic's output when it failed), the last prune, the
-size and the growth since the check before — followed by the operator's verdict
-on retention. The most recent check Job is still on its `Last check Job:` line,
+size and the growth since the check before — followed, when retention is not
+enforced, by the operator's verdict on it. The most recent check Job is still on its `Last check Job:` line,
 as `Succeeded`, `Failed`, or, for a Job that has not finished, what it is doing.
 
 A check that did not pass also turns the `BackupHealthy` condition `False` with
@@ -602,10 +606,15 @@ it after the pod is gone.
 So the operator also watches the backup from outside the runner. It reads the
 `apprafter-backup` and `apprafter-backup-check` CronJobs, their Jobs and the
 runner pods in `apprafter-system`, and keeps its verdict in the `BackupHealthy`
-condition of `PlatformStack/default`. `apprafter status` and `apprafter
-platform status` print it as a `Backups:` line, with the time the failure began
-and what to run next. The condition moves when those objects change, not on
-the operator's six-hour upstream check.
+condition of `PlatformStack/default`. `apprafter status` prints it as one
+`Backups:` line: working, with how long ago the last backup ran; failing, for
+how long and why in a few words, naming the weekly check when it is the check
+that fails; or not known to be working, and why. `apprafter platform status`
+lists it as a row of its conditions table, and when it is not `True`,
+`apprafter backup status` gives it in full, with the operator's message, the
+time the failure began and what to run next.
+The condition moves when those objects change, not on the operator's six-hour
+upstream check.
 
 | Status | Reason | What happened |
 | --- | --- | --- |
@@ -635,8 +644,9 @@ with platform 0.2.80. An older operator writes neither, and it does not remove
 them either: after a rollback below 0.2.80 they stay on the stack exactly as
 the newer operator last wrote them, re-evaluated by nothing. So on a platform
 older than 0.2.80, `apprafter status` says the operator does not report on
-backups rather than reading them, and `apprafter backup status` falls back to
-the runner's own record.
+backups rather than reading them, `apprafter platform status` marks both rows
+of its table `NOT CURRENT`, and `apprafter backup status` falls back to the
+runner's own record.
 
 Four rules keep it from raising false alarms, and from going quiet:
 
@@ -694,8 +704,23 @@ repository is another, and it gets a condition of its own, `BackupRetention`,
 beside `BackupHealthy` on `PlatformStack/default`. Folded into
 `BackupHealthy`, the recommended scoped key — which can never prune — would be
 a permanent failure, and a real one would hide behind it. `apprafter status`
-prints it under the `Backups:` line as `Retention:`, and
-`apprafter backup status` after its `Repository` block.
+prints a `Retention:` line under `Backups:` only when retention is not enforced,
+or cannot be judged, and that needs you:
+
+- `PruneFailed`, `CheckOff`, and `CheckFailed` or `RecordUnreadable` unless the
+  `Backups:` line already names the same cause (the failed check, or backup
+  objects the operator could not read);
+- `PruneNotPermitted` and `EnforcedOutsideCluster`, where pruning belongs to
+  `apprafter backup prune` run from outside the cluster, when its
+  `apprafter.io/last-prune` stamp is missing or more than eight days old — the
+  weekly check's period plus a day;
+- `NoCheckYet` and `NoPruneYet`, nothing to judge yet, once that has lasted
+  more than eight days.
+
+It stays quiet while retention is enforced, and in the cases above while they
+are within those eight days. `apprafter backup status` gives every verdict but
+an enforced one in full, after its `Repository` block, which already shows the
+prune that ran.
 
 It is built from the runner's record (the table
 [above](#where-the-check-result-shows-up)): the last check, the prune recorded

@@ -7123,6 +7123,10 @@ where
         _ => out.push_str("  size:        not measured yet (the weekly check measures it)\n"),
     }
 
+    // The operator's verdict says only what is NOT enforced: an enforced
+    // one is the `last prune` line above, and repeating it here was the
+    // same fact twice (WI-394).
+    let reported = stack.is_some_and(crate::commands::platform::operator_reports_retention);
     let verdict = stack
         .map(|s| crate::commands::platform::backup_retention_lines(s, now))
         .unwrap_or_default();
@@ -7132,7 +7136,7 @@ where
             out.push_str(&line);
             out.push('\n');
         }
-    } else if get("lastPruneResult") == Some("not-permitted") {
+    } else if !reported && get("lastPruneResult") == Some("not-permitted") {
         out.push_str(&format!(
             "\n{}\n  Next: `apprafter backup prune --credential-file <full-credentials.env>` \
              prunes with the operator's full credentials.\n",
@@ -7233,6 +7237,19 @@ pub fn run_backup_status() -> Result<()> {
             zone.as_deref(),
         )
     );
+    // The operator's verdict on the runs, when it is not `True`: since when,
+    // its own message and what to run next. `apprafter status` only says
+    // that something is wrong and sends the reader here (WI-394).
+    if let Some(stack) = ps.as_ref() {
+        let verdict =
+            crate::commands::platform::backup_runs_detail_lines(stack, chrono::Utc::now());
+        if !verdict.is_empty() {
+            println!();
+            for line in verdict {
+                println!("{line}");
+            }
+        }
+    }
     // The repository and retention (WI-389), for an enabled schedule.
     if spec_backup
         .as_ref()
@@ -9164,6 +9181,44 @@ mod tests {
             1,
             "one verdict, not two: {s}"
         );
+    }
+
+    /// WI-394: an enforced verdict repeated the `last prune` line above it
+    /// word for word. It says nothing now — and the runner's own record is
+    /// not read in its place, since the operator did report.
+    #[test]
+    fn repository_status_adds_no_retention_line_when_retention_is_enforced() {
+        let stack = json!({
+            "spec": {"backup": {"enabled": true}},
+            "status": {"conditions": [{
+                "type": "BackupRetention", "status": "True", "reason": "Pruned",
+                "message": "the prune after the weekly check at t: forgot 14 snapshot(s)",
+                "lastTransitionTime": "2026-09-20T06:00:41Z"}]},
+        });
+        let s = format_repository_status(
+            Some(&json!({
+                "lastCheck": "2026-09-20T06:00:30+00:00", "lastCheckResult": "passed",
+                "lastPrune": "2026-09-20T06:00:41+00:00", "lastPruneResult": "pruned",
+                "lastPruneBy": "check",
+                "lastPruneDetail": "forgot 14 snapshot(s) of 14 run(s)",
+            })),
+            Some(&stack),
+            &tokyo(),
+            Some("Asia/Tokyo"),
+            now_utc(),
+        );
+        assert!(s.contains("forgot 14 snapshot(s) of 14 run(s)"), "{s}");
+        assert!(!s.contains("Retention:"), "{s}");
+        // A record that disagrees is the operator's to judge, not this
+        // fallback's: with a verdict on the stack the fallback stays silent.
+        let s = format_repository_status(
+            Some(&scoped_record()),
+            Some(&stack),
+            &tokyo(),
+            Some("Asia/Tokyo"),
+            now_utc(),
+        );
+        assert!(!s.contains("Retention:"), "{s}");
     }
 
     #[test]

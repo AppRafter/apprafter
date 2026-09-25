@@ -26,10 +26,13 @@ By default (`enforce: check`) the weekly check Job prunes, after a check that
 passed, as far as the cluster's S3 key may delete. With a key that may delete,
 that is all there is to it. With the scoped key [recommended
 below](#who-prunes-and-what-the-clusters-key-may-delete), the prune is refused
-at its first delete and **nothing is deleted**; `apprafter status` and
-`apprafter backup status` then say `Retention: NOT ENFORCED — PruneNotPermitted`,
-with the repository's size and its growth since the week before. That is the
-signal to prune from outside the cluster, with full credentials:
+at its first delete and **nothing is deleted**; `apprafter backup status`
+gives the verdict in full (`PruneNotPermitted`), with the repository's size and
+its growth since the week before. That is the signal to prune from outside the
+cluster, with full credentials. Until `apprafter backup prune` has run against
+the cluster, and again whenever it has not run for more than eight days,
+`apprafter status` says `Retention: NOT ENFORCED — the cluster's S3 key may not
+delete, …`; pruning on a weekly cadence keeps it quiet:
 
 ```text
 apprafter backup prune [--repo s3:…] \
@@ -200,7 +203,9 @@ cadence — parking the in-cluster check means nothing verifies the repository
 until you do.
 
 > **Where check failures surface.** A check that does not pass turns
-> `apprafter status` red (`RepositoryCheckFailed`), and `apprafter backup status`
+> `apprafter status` red (`Backups: FAILING for <how long> — the weekly
+> repository check failed`), and `apprafter backup status` names it
+> (`RepositoryCheckFailed`) and
 > shows it under `last check` with the first lines of restic's output; the
 > failed Job's pod log has all of it, and `apprafter backup check` runs the same
 > check with full credentials. A check that does not pass never prunes
@@ -290,8 +295,9 @@ repository prefix, plus Delete only on `locks/*`.** The backup Job does
 `restic backup` only; the weekly check Job checks, and its prune is refused at
 the first delete — it **cannot** delete `data/`, `index/`, or `snapshots/`
 objects, so a cluster compromise (ransomware) cannot erase the backup history.
-Nothing is deleted, and `apprafter status` says retention is not enforced, with
-the repository's growth: run `apprafter backup prune` with your **full**
+Nothing is deleted, `apprafter status` says retention is not enforced until
+you prune from outside, and `apprafter backup status` shows the repository's
+growth: run `apprafter backup prune` with your **full**
 credentials ([Retention and prune](#retention-and-prune), above). A minimal
 bucket/IAM policy shape:
 
@@ -326,9 +332,11 @@ exclusive lock every night. With a scoped key every backup fails at the prune
 the same trade-off and the same compensating controls.
 
 **`enforce: operator`.** Nothing in the cluster prunes, whatever the key may
-do. Retention is `apprafter backup prune` on your cadence, and `apprafter
+do. Retention is `apprafter backup prune` on your cadence. `apprafter backup
 status` says `not enforced in the cluster, by choice`, with the repository's
-size.
+size; `apprafter status` does not mention it while `apprafter backup prune` has
+run in the last eight days, and says retention is not enforced when it has
+not.
 
 > **Upgrading from before platform-stack 0.2.80.** The default was `operator`
 > until then. A cluster whose `spec.backup.retention.enforce` is set keeps what

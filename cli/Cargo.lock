@@ -238,7 +238,7 @@ dependencies = [
 
 [[package]]
 name = "apprafter"
-version = "0.2.77"
+version = "0.2.78"
 dependencies = [
  "age",
  "arboard",
@@ -273,7 +273,7 @@ dependencies = [
 
 [[package]]
 name = "apprafter-backup"
-version = "0.2.77"
+version = "0.2.78"
 dependencies = [
  "backup-core",
  "chrono",
@@ -431,7 +431,7 @@ dependencies = [
 
 [[package]]
 name = "backup-core"
-version = "0.2.77"
+version = "0.2.78"
 dependencies = [
  "aes-gcm 0.11.1",
  "base64 0.23.1",
@@ -679,7 +679,7 @@ checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 
 [[package]]
 name = "cli-core"
-version = "0.2.77"
+version = "0.2.78"
 dependencies = [
  "age",
  "chrono",
@@ -697,7 +697,7 @@ dependencies = [
 
 [[package]]
 name = "cli-providers"
-version = "0.2.77"
+version = "0.2.78"
 dependencies = [
  "aes-gcm 0.11.1",
  "backup-core",
@@ -722,7 +722,7 @@ dependencies = [
 
 [[package]]
 name = "cli-state"
-version = "0.2.77"
+version = "0.2.78"
 dependencies = [
  "cli-core",
  "serde",
@@ -1149,7 +1149,7 @@ dependencies = [
 
 [[package]]
 name = "docsgen"
-version = "0.2.77"
+version = "0.2.78"
 dependencies = [
  "apprafter",
  "clap",

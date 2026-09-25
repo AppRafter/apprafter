@@ -248,13 +248,13 @@ pub(crate) fn condition_polarity(type_: &str) -> Option<ConditionPolarity> {
         // Gets its own section, which names the plans rather than just
         // asserting that some exist.
         "MigrationPending" => Some(ConditionPolarity::ReportedElsewhere),
-        // Positive (`True` is healthy), but with its own section
-        // ([`backup_health_lines`]) that says since when and what to run
-        // next, so the one-row table version would be a vaguer copy of it.
+        // Positive (`True` is healthy), but `apprafter status` gives backups
+        // a line of its own ([`backup_summary_lines`]) that says it in plain
+        // words and points to `backup status`, so a table row would be a
+        // second copy of the same fact.
         "BackupHealthy" => Some(ConditionPolarity::ReportedElsewhere),
-        // Retention, printed under `Backups:` by the same section
-        // ([`backup_retention_lines`]), which knows that `False` for a
-        // scoped key is a warning to act on, not a failing backup.
+        // Retention, on a line of its own under Backups when it needs the
+        // reader, which knows when a `False` is a choice and when it is not.
         "BackupRetention" => Some(ConditionPolarity::ReportedElsewhere),
         _ => None,
     }
@@ -294,46 +294,341 @@ pub(crate) const BACKUP_UNSCHEDULABLE_DOC: &str =
 pub(crate) const BACKUP_HEALTH_DOC: &str =
     "https://docs.apprafter.dev/how-it-works/backup-retention-and-checks/#when-a-backup-cannot-run";
 
-/// The backup section of `apprafter status` and `apprafter platform status`,
-/// from the operator's `BackupHealthy` condition.
+/// Where every backup detail is: the one command the short lines below
+/// point to.
+const BACKUP_DETAIL_COMMAND: &str = "`apprafter backup status`";
+
+/// How long retention may go unjudged, or unenforced from outside the
+/// cluster, before `apprafter status` says so: the weekly check's period
+/// plus a day. Within it, a first check still to come, or an
+/// `apprafter backup prune` on a weekly cadence, is not a problem.
+const RETENTION_GRACE_DAYS: i64 = 8;
+
+/// The backup line of `apprafter status`, from the operator's
+/// `BackupHealthy` and `BackupRetention` conditions (WI-394).
 ///
-/// The condition is built from the backup CronJobs, their Jobs and pods, so
-/// it sees what the runner's own record cannot: a pod no node has room for,
-/// a runner killed at its memory limit or evicted, a Job stopped by its
-/// deadline before its pod ever started. A backup that cannot run must not
-/// look healthy here, so anything but `True` is loud and names the next
-/// command, and a cluster that enabled backups on an operator too old to
-/// report on them says so instead of saying nothing.
+/// Short on purpose. When backups run and retention is enforced this is one
+/// line — working, and how long ago the last backup ran when the runner's
+/// record says (`last_success` reads its `lastSuccess`, and is only called
+/// for that line). Everything else, the operator's own message, since when,
+/// what to run next, is `apprafter backup status`'s job
+/// ([`backup_runs_detail_lines`], [`backup_retention_lines`]).
 ///
-/// The operator's second backup condition, `BackupRetention`, follows
-/// ([`backup_retention_lines`]): it is kept apart from `BackupHealthy` so
-/// that one never hides the other, and this section prints both for the
-/// same reason.
-pub(crate) fn backup_health_lines(json: &Value, now: DateTime<Utc>) -> Vec<String> {
-    let mut lines = backup_runs_lines(json, now);
-    lines.extend(backup_retention_lines(json, now));
+/// What stays here is that something is wrong. The conditions are built from
+/// the backup CronJobs, their Jobs and pods, so they see what the runner's
+/// own record cannot: a pod no node has room for, a runner killed at its
+/// memory limit, a Job stopped by its deadline before its pod started. A
+/// backup that cannot run, or retention that nothing enforces, still reads
+/// as a problem, in plain words, on a line of its own that points at the
+/// detail: a limit may be documented, never masked (WI-386). A cluster that
+/// enabled backups on an operator too old to report on them says so too.
+pub(crate) fn backup_summary_lines(
+    json: &Value,
+    last_success: impl FnOnce() -> Option<String>,
+    now: DateTime<Utc>,
+) -> Vec<String> {
+    let enabled = json
+        .pointer("/spec/backup/enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !enabled {
+        return vec!["Backups: not enabled.".to_string()];
+    }
+    let condition = |type_: &str| {
+        json.pointer("/status/conditions")
+            .and_then(Value::as_array)
+            .and_then(|cs| cs.iter().find(|c| c["type"] == type_))
+    };
+    let health = condition("BackupHealthy");
+    if let Some(version) = backup_conditions_predate(json) {
+        let left = if health.is_some() {
+            ", and the conditions left on the stack are not current"
+        } else {
+            ""
+        };
+        return vec![cli_core::style::warn(&format!(
+            "Backups: not reported — the operator of platform {version} does not report on \
+             them{left}. See {BACKUP_DETAIL_COMMAND}."
+        ))];
+    }
+    let Some(health) = health else {
+        return vec![cli_core::style::warn(&format!(
+            "Backups: not reported — this cluster's operator does not report on them. See \
+             {BACKUP_DETAIL_COMMAND}."
+        ))];
+    };
+    let text = |c: &Value, k: &str| c.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    let (status, reason) = (text(health, "status"), text(health, "reason"));
+    let words = backup_reason_in_words(&reason, is_check_verdict(&text(health, "message")))
+        .unwrap_or_else(|| reason.clone());
+    let mut lines = vec![match status.as_str() {
+        "True" => match last_success().and_then(|t| relative_to(&t, now)) {
+            Some(ago) => format!("Backups: working — last backup {ago}."),
+            None => "Backups: working.".to_string(),
+        },
+        "False" => {
+            let span = health
+                .get("lastTransitionTime")
+                .and_then(Value::as_str)
+                .and_then(|t| for_how_long(t, now))
+                .map(|d| format!(" {d}"))
+                .unwrap_or_default();
+            cli_core::style::warn(&format!(
+                "Backups: FAILING{span} — {words}. See {BACKUP_DETAIL_COMMAND}."
+            ))
+        }
+        _ => cli_core::style::warn(&format!(
+            "Backups: not known to be working — {words}. See {BACKUP_DETAIL_COMMAND}."
+        )),
+    }];
+    if let Some(retention) = condition("BackupRetention") {
+        let last_prune = json
+            .pointer("/metadata/annotations/apprafter.io~1last-prune")
+            .and_then(Value::as_str);
+        if let Some(line) = retention_summary_line(retention, &reason, last_prune, now) {
+            lines.push(cli_core::style::warn(&format!(
+                "{line}. See {BACKUP_DETAIL_COMMAND}."
+            )));
+        }
+    }
     lines
+}
+
+/// The `Retention:` line of `apprafter status`, without its pointer, or
+/// `None` when there is nothing the reader needs to do. `health_reason` is
+/// the `BackupHealthy` reason, so one cause is not said twice; `last_prune`
+/// is the `apprafter.io/last-prune` stamp, the record of a prune run from
+/// outside the cluster.
+fn retention_summary_line(
+    retention: &Value,
+    health_reason: &str,
+    last_prune: Option<&str>,
+    now: DateTime<Utc>,
+) -> Option<String> {
+    let text = |k: &str| retention.get(k).and_then(Value::as_str).unwrap_or("");
+    let (status, reason) = (text("status"), text("reason"));
+    if status == "True" {
+        return None;
+    }
+    let headline = if status == "False" {
+        "Retention: NOT ENFORCED"
+    } else {
+        "Retention: not known"
+    };
+    // A prune run from outside the cluster enforces retention there; the
+    // stamp says when it last ran against this cluster's own repository.
+    let external = |why: &str| -> Option<String> {
+        let ago = last_prune.and_then(|t| age_days(t, now));
+        match ago {
+            Some(days) if days <= RETENTION_GRACE_DAYS => None,
+            Some(_) => Some(format!(
+                "{headline} — {why}, and `apprafter backup prune` last ran {}",
+                relative_to(last_prune.unwrap_or_default(), now).unwrap_or_default()
+            )),
+            None => Some(format!(
+                "{headline} — {why}, and `apprafter backup prune` has not run, so the \
+                 repository keeps growing"
+            )),
+        }
+    };
+    // Nothing to judge yet: normal right after enabling or upgrading, for as
+    // long as the weekly check takes to come round.
+    let pending = |what: &str| -> Option<String> {
+        let since = text("lastTransitionTime");
+        match age_days(since, now) {
+            Some(days) if days <= RETENTION_GRACE_DAYS => None,
+            _ => Some(format!(
+                "Retention: not known{} — {what}",
+                for_how_long(since, now)
+                    .map(|d| format!(" {d}"))
+                    .unwrap_or_default()
+            )),
+        }
+    };
+    match retention_class(reason) {
+        Some(RetentionClass::Enforced) => None,
+        Some(RetentionClass::External(why)) => external(why),
+        Some(RetentionClass::Pending(what)) => pending(what),
+        // One cause, said once: the Backups line names the failed check, or
+        // the unreadable objects both verdicts are built from.
+        Some(RetentionClass::Problem(_))
+            if (reason == "CheckFailed" && health_reason == "RepositoryCheckFailed")
+                || (reason == "RecordUnreadable" && health_reason == "StateUnreadable") =>
+        {
+            None
+        }
+        Some(RetentionClass::Problem(words)) => Some(format!("{headline} — {words}")),
+        None => Some(format!("{headline} — {reason}")),
+    }
+}
+
+/// How `apprafter status` treats a `BackupRetention` reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetentionClass {
+    /// Enforced: nothing to say.
+    Enforced,
+    /// Enforced, if at all, by `apprafter backup prune` from outside the
+    /// cluster; quiet while its stamp is recent, and why otherwise.
+    External(&'static str),
+    /// Nothing to judge yet; quiet for [`RETENTION_GRACE_DAYS`], and what
+    /// is missing after that.
+    Pending(&'static str),
+    /// Not enforced: a line of its own, in these words.
+    Problem(&'static str),
+}
+
+/// Each `BackupRetention` reason the operator writes, for `apprafter
+/// status`. Every reason is named (a test reads them out of the operator's
+/// source).
+fn retention_class(reason: &str) -> Option<RetentionClass> {
+    use RetentionClass::{Enforced, External, Pending, Problem};
+    Some(match reason {
+        "Pruned" | "NothingToPrune" => Enforced,
+        // `enforce: operator`: a choice, as long as someone makes it.
+        "EnforcedOutsideCluster" => External("nothing in the cluster prunes, by choice"),
+        // The scoped key ADR 0050 recommends: pruning belongs outside.
+        "PruneNotPermitted" => External("the cluster's S3 key may not delete"),
+        "NoCheckYet" => Pending("no weekly check has recorded a result"),
+        "NoPruneYet" => Pending("no prune is recorded after the last check"),
+        "PruneFailed" => Problem("the last prune failed"),
+        "CheckFailed" => {
+            Problem("the weekly check did not pass, and only a check that passes prunes")
+        }
+        "CheckOff" => Problem("the weekly check is off, and the prune runs after it"),
+        "RecordUnreadable" => Problem(
+            "the operator cannot read the backup runner's record, or does not understand it",
+        ),
+        _ => return None,
+    })
+}
+
+/// "3 hours ago", "just now": how long ago an RFC3339 time was, or `None`
+/// when it does not parse. A time slightly ahead of this machine's clock
+/// (the runner's node runs its own) reads as "just now", not "in 2 minutes".
+fn relative_to(raw: &str, now: DateTime<Utc>) -> Option<String> {
+    let at = DateTime::parse_from_rfc3339(raw).ok()?.with_timezone(&Utc);
+    Some(cli_core::timefmt::humanise_relative(
+        now.signed_duration_since(at).max(chrono::Duration::zero()),
+    ))
+}
+
+/// Whole days since an RFC3339 time; `None` when it does not parse.
+fn age_days(raw: &str, now: DateTime<Utc>) -> Option<i64> {
+    let at = DateTime::parse_from_rfc3339(raw).ok()?.with_timezone(&Utc);
+    Some(now.signed_duration_since(at).num_days())
+}
+
+/// "for 3 hours" since an RFC3339 time; "just now" for a moment ago; `None`
+/// when it does not parse or lies in the future.
+fn for_how_long(raw: &str, now: DateTime<Utc>) -> Option<String> {
+    let at = DateTime::parse_from_rfc3339(raw).ok()?.with_timezone(&Utc);
+    let ago = cli_core::timefmt::humanise_relative(now.signed_duration_since(at));
+    match ago.strip_suffix(" ago") {
+        Some(span) => Some(format!("for {span}")),
+        None if ago == "just now" => Some(ago),
+        None => None,
+    }
+}
+
+/// Whether a `BackupHealthy` verdict is about the weekly check rather than
+/// the backups: the operator names the run it judges first, as
+/// `repository check Job <name>` or the check's CronJob.
+fn is_check_verdict(message: &str) -> bool {
+    message.starts_with("repository check ")
+        || message.starts_with("CronJob apprafter-system/apprafter-backup-check ")
+}
+
+/// Each `BackupHealthy` reason the operator writes, in the few words
+/// `apprafter status` has room for, about the backups or the weekly check.
+/// Every reason is named (a test reads them out of the operator's source),
+/// so a new one is a decision here rather than its bare CamelCase name on a
+/// reader's screen.
+fn backup_reason_in_words(reason: &str, check: bool) -> Option<String> {
+    let (runner, job, schedule) = if check {
+        (
+            "the weekly check's runner",
+            "the weekly check Job",
+            "the weekly check's schedule",
+        )
+    } else {
+        ("the backup runner", "a backup Job", "the backup schedule")
+    };
+    Some(match reason {
+        "RunnerUnschedulable" => format!("no node has room for {runner}"),
+        "RunnerNotStarted" => format!("{runner}'s pod has not started"),
+        "RunnerOOMKilled" => format!("{runner} was killed at its memory limit"),
+        "RunnerEvicted" => format!("{runner} was evicted"),
+        "RunnerPreempted" => format!("{runner} had to give its room to another pod"),
+        "RunnerStopped" => format!("{runner} was stopped from outside"),
+        "RunnerFailed" => "the last backup attempt failed".to_string(),
+        "DeadlineExceeded" => format!("{job} ran into its deadline"),
+        "BackoffLimitExceeded" => format!("{job} failed every attempt"),
+        "Failed" => format!("{job} failed"),
+        "RepositoryCheckFailed" => "the weekly repository check failed".to_string(),
+        "ScheduleSuspended" => format!("{schedule} is suspended"),
+        "NoRunYet" => "no backup has run yet".to_string(),
+        "ScheduleNotDeployed" => "the backup schedule is not deployed yet".to_string(),
+        "StateUnreadable" => "the operator cannot read the backup Jobs".to_string(),
+        _ => return None,
+    })
+}
+
+/// Whether the stack's operator reports on retention: backups on, a
+/// `BackupRetention` condition, and a platform not older than the release
+/// that writes it. `apprafter backup status` falls back to the runner's own
+/// record when it does not.
+pub(crate) fn operator_reports_retention(json: &Value) -> bool {
+    json.pointer("/spec/backup/enabled")
+        .and_then(Value::as_bool)
+        == Some(true)
+        && backup_conditions_predate(json).is_none()
+        && json
+            .pointer("/status/conditions")
+            .and_then(Value::as_array)
+            .is_some_and(|cs| cs.iter().any(|c| c["type"] == "BackupRetention"))
+}
+
+/// The backup rows of the full conditions table `apprafter platform status`
+/// prints, marked when they are not current. After a rollback below
+/// [`BACKUP_CONDITIONS_SINCE`] the older operator carries both conditions
+/// forward untouched, so a row reading `True` would say "healthy" over a
+/// runner nothing re-evaluates.
+fn mark_backup_rows_not_current(rows: &mut [ConditionRow], json: &Value) {
+    let Some(version) = backup_conditions_predate(json) else {
+        return;
+    };
+    for row in rows
+        .iter_mut()
+        .filter(|r| matches!(r.type_.as_str(), "BackupHealthy" | "BackupRetention"))
+    {
+        row.message = format!(
+            "NOT CURRENT: left by a newer release; the operator of platform {version} does not \
+             report on backups. It last said: {}",
+            row.message
+        );
+    }
 }
 
 /// Where retention, and each reason it is not enforced, is explained.
 pub(crate) const BACKUP_RETENTION_DOC: &str =
     "https://docs.apprafter.dev/how-it-works/backup-retention-and-checks/#who-runs-the-prune";
 
-/// The retention half of the backup section, from the operator's
-/// `BackupRetention` condition: one quiet line when a prune ran after the
-/// latest check; otherwise what is not enforced, since when, the operator's
-/// message (with the repository's size and growth) and what to run next.
+/// The operator's retention verdict for `apprafter backup status`, from its
+/// `BackupRetention` condition: what is not enforced, since when, the
+/// operator's message (with the repository's size and growth) and what to
+/// run next. Nothing when retention is enforced: the repository block above
+/// it already shows the prune that ran.
 ///
 /// Nothing while backups are off, and nothing from an operator that does
-/// not write the condition: every operator that reports `BackupHealthy`
-/// reports this too (they shipped together), and one that reports neither
-/// has already been named by the line above.
+/// not write the condition ([`operator_reports_retention`]); `backup status`
+/// then reads the runner's own record instead.
 pub(crate) fn backup_retention_lines(json: &Value, now: DateTime<Utc>) -> Vec<String> {
     let enabled = json
         .pointer("/spec/backup/enabled")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    // An operator older than the condition: the runs line names it once.
+    // An operator older than the condition: `backup status` reads the
+    // runner's own record instead.
     if !enabled || backup_conditions_predate(json).is_some() {
         return Vec::new();
     }
@@ -345,7 +640,7 @@ pub(crate) fn backup_retention_lines(json: &Value, now: DateTime<Utc>) -> Vec<St
     let field = |k: &str| c.get(k).and_then(Value::as_str).unwrap_or("");
     let (status, reason, message) = (field("status"), field("reason"), field("message"));
     if status == "True" {
-        return vec![format!("Retention: enforced — {message}")];
+        return Vec::new();
     }
     let since = c
         .get("lastTransitionTime")
@@ -365,7 +660,7 @@ pub(crate) fn backup_retention_lines(json: &Value, now: DateTime<Utc>) -> Vec<St
         lines.push(cli_core::style::warn(&format!("  {message}")));
     }
     let next = retention_next_step(reason, now).unwrap_or_else(|| {
-        "`apprafter backup status` shows the runner's record of its last check and prune."
+        "the Repository block above shows the runner's record of its last check and prune."
             .to_string()
     });
     lines.push(format!("  Next: {next}"));
@@ -391,7 +686,7 @@ fn retention_next_step(reason: &str, now: DateTime<Utc>) -> Option<String> {
              cadence; or `apprafter backup set enforce check` to prune after the weekly check."
         }
         "CheckFailed" => {
-            "`apprafter backup status` shows why the check failed (`last check`), and \
+            "`last check` in the Repository block above shows why the check failed, and \
              `apprafter backup check` runs it from this machine. A check that does not pass \
              never prunes; retention resumes after one that does."
         }
@@ -400,19 +695,19 @@ fn retention_next_step(reason: &str, now: DateTime<Utc>) -> Option<String> {
              back on; `apprafter backup prune` prunes from outside the cluster meanwhile."
         }
         "PruneFailed" => {
-            "`apprafter backup status` shows the prune's error; `apprafter backup prune` runs \
-             the same prune from this machine."
+            "`last prune` in the Repository block above shows the prune's error; `apprafter \
+             backup prune` runs the same prune from this machine."
         }
         "NoCheckYet" | "NoPruneYet" => {
             return Some(format!(
-                "`apprafter backup status` shows the schedule. {} runs the check, and the prune \
-                 after it, now.",
+                "The `check:` line at the top shows the schedule. {} runs the check, and the \
+                 prune after it, now.",
                 run_check_now(now)
             ))
         }
         "RecordUnreadable" => {
-            "the operator could not read the runner's record, and its log says why; `apprafter \
-             backup status` reads it with your own credentials."
+            "the operator could not read the runner's record, and its log says why; the \
+             Repository block above reads it with your own credentials."
         }
         _ => return None,
     }
@@ -435,42 +730,34 @@ fn run_check_now(now: DateTime<Utc>) -> String {
     )
 }
 
-/// The runs half of the backup section, from `BackupHealthy`.
-fn backup_runs_lines(json: &Value, now: DateTime<Utc>) -> Vec<String> {
+/// The operator's verdict on the backup runs, for `apprafter backup status`,
+/// from its `BackupHealthy` condition: since when it has not been working,
+/// the operator's own message (the Job, the pod, the cause), what to run next
+/// and the page that explains it. `apprafter status` says only that it is
+/// failing and points here ([`backup_summary_lines`]).
+///
+/// Nothing while it is `True` (the Jobs above it say the last one
+/// succeeded), while backups are off, and from an operator that does not
+/// write the condition or left it behind before a rollback: `backup status`
+/// reads the Jobs itself, so it has no verdict to borrow.
+pub(crate) fn backup_runs_detail_lines(json: &Value, now: DateTime<Utc>) -> Vec<String> {
     let enabled = json
         .pointer("/spec/backup/enabled")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let condition = json
-        .pointer("/status/conditions")
-        .and_then(Value::as_array)
-        .and_then(|cs| cs.iter().find(|c| c["type"] == "BackupHealthy"));
-    if enabled {
-        if let (Some(version), Some(_)) = (backup_conditions_predate(json), condition) {
-            return vec![cli_core::style::warn(&format!(
-                "Backups: enabled, but this cluster's operator (platform {version}) does not \
-                 report whether they run — `apprafter backup status` shows the last Jobs. The \
-                 backup conditions on the stack were left by a newer release and are not \
-                 current."
-            ))];
-        }
+    if !enabled || backup_conditions_predate(json).is_some() {
+        return Vec::new();
     }
-    let Some(c) = condition else {
-        return if enabled {
-            vec![cli_core::style::warn(
-                "Backups: enabled, but this cluster's operator does not report whether they \
-                 run — `apprafter backup status` shows the last Jobs.",
-            )]
-        } else {
-            vec!["Backups: not enabled.".to_string()]
-        };
-    };
-    backup_condition_lines(c, "Backups", now, backup_next_step)
+    json.pointer("/status/conditions")
+        .and_then(Value::as_array)
+        .and_then(|cs| cs.iter().find(|c| c["type"] == "BackupHealthy"))
+        .map(|c| backup_condition_lines(c, "Backups", now, backup_next_step))
+        .unwrap_or_default()
 }
 
-/// One backup condition as lines: a single quiet line when it is `True`;
-/// otherwise a loud headline (with since when, for `False`), the operator's
-/// own message, what to run next and the page that explains it.
+/// One backup condition as lines: nothing when it is `True`; otherwise a
+/// loud headline (with since when, for `False`), the operator's own message,
+/// what to run next and the page that explains it.
 fn backup_condition_lines(
     c: &Value,
     label: &str,
@@ -480,7 +767,7 @@ fn backup_condition_lines(
     let field = |k: &str| c.get(k).and_then(Value::as_str).unwrap_or("");
     let (status, reason, message) = (field("status"), field("reason"), field("message"));
     if status == "True" {
-        return vec![format!("{label}: healthy — {message}")];
+        return Vec::new();
     }
     let mut lines = if status == "False" {
         let since = c
@@ -502,7 +789,7 @@ fn backup_condition_lines(
     // A reason this build has never heard of still gets a next step: the
     // one command that shows every backup Job.
     let (next, doc) = next_step(reason, now).unwrap_or((
-        "`apprafter backup status` shows the Jobs and the runner's own record.".to_string(),
+        "the Jobs and the runner's own record above say what happened.".to_string(),
         BACKUP_HEALTH_DOC,
     ));
     lines.push(format!("  Next: {next}"));
@@ -519,33 +806,35 @@ type NextStep = (String, &'static str);
 /// decision here rather than a silent fall-through to the generic advice
 /// (a test reads the reasons out of the operator's source).
 fn backup_next_step(reason: &str, now: DateTime<Utc>) -> Option<NextStep> {
+    // Printed by `apprafter backup status` only, below its Jobs and Runner
+    // status sections and above its Repository block: the steps point at
+    // those, and name only the commands that go further (WI-394).
     let step = match reason {
         "RunnerUnschedulable" => (
-            "`apprafter backup status` shows the Job and its pod; `apprafter top` shows how \
-             much of the node is requested, and by what.",
+            "`apprafter top` shows how much of the node is requested, and by what; the Job \
+             line above says what the runner's pod asks for.",
             BACKUP_UNSCHEDULABLE_DOC,
         ),
-        // `backup status` reads the Job's pod, so for a Job the controller
+        // The Job line reads the Job's pod, so for a Job the controller
         // could not create a pod for it has nothing to say but `Unknown`
         // (seen on kind): the FailedCreate events are the only record.
         "RunnerNotStarted" => (
-            "`apprafter backup status` shows the Job and why its pod has not started. A Job \
-             with no pod at all shows as Unknown there; `kubectl -n apprafter-system describe \
-             job <name>` prints the FailedCreate events that say why.",
+            "the Job line above says why its pod has not started. A Job with no pod at all \
+             shows as Unknown there; `kubectl -n apprafter-system describe job <name>` prints \
+             the FailedCreate events that say why.",
             BACKUP_HEALTH_DOC,
         ),
         "RunnerOOMKilled" => (
-            "`apprafter backup status` shows the Job and its attempts; `apprafter top` shows \
-             the node's memory.",
+            "`apprafter top` shows the node's memory; the Job line above shows its attempts.",
             BACKUP_HEALTH_DOC,
         ),
         // The kubelet evicts for two unrelated reasons, and the message
         // quotes which: node memory pressure, or staging grown past the
         // `/staging` volume's size limit.
         "RunnerEvicted" => (
-            "`apprafter backup status` shows the Job and its attempts. For memory pressure, \
-             `apprafter top` shows the node's memory; for the staging size limit, `apprafter \
-             backup set staging-mode sequential` stages one namespace at a time.",
+            "for memory pressure, `apprafter top` shows the node's memory; for the staging size \
+             limit, `apprafter backup set staging-mode sequential` stages one namespace at a \
+             time.",
             BACKUP_HEALTH_DOC,
         ),
         // A pod of higher priority needed the runner's room: any pod, since
@@ -554,24 +843,24 @@ fn backup_next_step(reason: &str, now: DateTime<Utc>) -> Option<NextStep> {
         // runner that cannot be scheduled.
         "RunnerPreempted" => (
             "`apprafter top` shows how much of the node is requested, and by what: another pod \
-             needed the runner's room. `apprafter backup status` shows the Job and the runner's \
-             record of the stop; the Job retries once there is room, and a retry that succeeds \
-             clears this.",
+             needed the runner's room. The Job retries once there is room, and a retry that \
+             succeeds clears this; `lastError` under Runner status above is the runner's record \
+             of the stop.",
             BACKUP_UNSCHEDULABLE_DOC,
         ),
         // A drain, a deletion, or a stop whose cause is gone with its pod.
         "RunnerStopped" => (
-            "`apprafter backup status` shows the Job and the runner's own record of the stop \
-             (`lastError`). The Job retries; a retry that succeeds clears this, and `apprafter \
-             backup run` starts one once the Job has ended.",
+            "`lastError` under Runner status above is the runner's own record of the stop. The \
+             Job retries; a retry that succeeds clears this, and `apprafter backup run` starts \
+             one once the Job has ended.",
             BACKUP_HEALTH_DOC,
         ),
         // Reported while the Job retries: the runner has recorded why, and
         // posted its failure webhook, for this attempt.
         "RunnerFailed" => (
-            "`apprafter backup status` shows the Job and the runner's own record of the error \
-             (`lastError`). A retry that succeeds clears this; `apprafter backup run` starts one \
-             once the Job has ended.",
+            "`lastError` under Runner status above is the runner's own record of the error. A \
+             retry that succeeds clears this; `apprafter backup run` starts one once the Job has \
+             ended.",
             BACKUP_HEALTH_DOC,
         ),
         // Only a Job no attempt of which failed on its own ends with this
@@ -579,14 +868,13 @@ fn backup_next_step(reason: &str, now: DateTime<Utc>) -> Option<NextStep> {
         // is a runner that never started or one that ran out of time; the
         // message says which.
         "DeadlineExceeded" => (
-            "`apprafter backup status` shows the Job and the runner's own record. A runner that \
-             never started needs room on the node (`apprafter top` shows it); one that ran out \
-             of time needs a longer deadline (`apprafter backup set deadline`, or `set \
-             check-deadline` for the check).",
+            "a runner that never started needs room on the node (`apprafter top` shows it); one \
+             that ran out of time needs a longer deadline (`apprafter backup set deadline`, or \
+             `set check-deadline` for the check).",
             BACKUP_HEALTH_DOC,
         ),
         "BackoffLimitExceeded" | "Failed" => (
-            "`apprafter backup status` shows the Jobs and the runner's own record.",
+            "the Jobs and the runner's own record above say how it ended.",
             BACKUP_HEALTH_DOC,
         ),
         // Only a later check Job clears it, and the schedule is weekly: say
@@ -595,8 +883,8 @@ fn backup_next_step(reason: &str, now: DateTime<Utc>) -> Option<NextStep> {
             return Some((
                 format!(
                     "`apprafter backup check` runs the same check from this machine and prints \
-                     restic's own output; `apprafter backup status` shows the check Job. Only a \
-                     check that passes in the cluster clears this: {} runs one now.",
+                     restic's own output; `last check` in the Repository block below quotes it. \
+                     Only a check that passes in the cluster clears this: {} runs one now.",
                     run_check_now(now)
                 ),
                 BACKUP_HEALTH_DOC,
@@ -608,18 +896,17 @@ fn backup_next_step(reason: &str, now: DateTime<Utc>) -> Option<NextStep> {
             BACKUP_HEALTH_DOC,
         ),
         "NoRunYet" => (
-            "`apprafter backup run` takes a backup now instead of waiting for the schedule; \
-             `apprafter backup status` shows the schedule.",
+            "`apprafter backup run` takes a backup now instead of waiting for the schedule above.",
             BACKUP_HEALTH_DOC,
         ),
         "ScheduleNotDeployed" => (
             "wait for the platform to sync the backup schedule (`apprafter status` shows the \
-             platform's sync), then `apprafter backup status`.",
+             platform's sync), then run this command again.",
             BACKUP_HEALTH_DOC,
         ),
         "StateUnreadable" => (
-            "the operator could not read the backup Jobs, and its log says why; `apprafter \
-             backup status` reads them with your own credentials.",
+            "the operator could not read the backup Jobs, and its log says why; the Jobs above \
+             are read with your own credentials.",
             BACKUP_HEALTH_DOC,
         ),
         _ => return None,
@@ -785,20 +1072,16 @@ fn print_status(json: &Value, now: DateTime<Utc>) {
     // an operator reading it wants to see a condition sitting at
     // `True` as much as one that is not. `apprafter status` takes the
     // filtered view (`unhealthy_condition_rows`) off the same rows.
-    let conditions: Vec<ConditionRow> = condition_rows(&status);
+    // Backups are two of these rows and nothing more: the detail, and what
+    // to run next, is `apprafter backup status` (WI-394).
+    let mut conditions: Vec<ConditionRow> = condition_rows(&status);
+    mark_backup_rows_not_current(&mut conditions, json);
 
     if conditions.is_empty() {
         println!("Conditions: (none)");
     } else {
         println!("Conditions:");
         println!("{}", render_conditions_table(&conditions));
-    }
-    println!();
-
-    // The backup verdict again, in words: the table row above has no room
-    // for since when or for what to run next.
-    for line in backup_health_lines(json, now) {
-        println!("{line}");
     }
     println!();
 
@@ -1446,7 +1729,13 @@ mod tests {
 
     use chrono::TimeZone;
 
-    // ---- WI-386: the backup section ----
+    // ---- WI-386 / WI-394: backups in `status` (short) and `backup status` (detail) ----
+
+    /// The day the backup conditions' test times are on, at noon UTC:
+    /// `frozen_now()` predates them by four months.
+    fn sep23_noon() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 9, 23, 12, 0, 0).unwrap()
+    }
 
     fn with_backup(enabled: bool, condition: Option<Value>) -> Value {
         let mut conditions = vec![json!({ "type": "Ready", "status": "True" })];
@@ -1476,7 +1765,7 @@ mod tests {
                 UNSCHEDULABLE_MESSAGE,
             )),
         );
-        let lines = backup_health_lines(&stack, frozen_now());
+        let lines = backup_runs_detail_lines(&stack, frozen_now());
         let text = lines.join("\n");
         // What failed and since when.
         assert!(
@@ -1487,7 +1776,7 @@ mod tests {
         assert!(text.contains("Insufficient memory"), "{text}");
         assert!(text.contains("apprafter-backup-29312340"), "{text}");
         // What to run next, and where the fix is described.
-        assert!(text.contains("`apprafter backup status`"), "{text}");
+        assert!(text.contains("the Job line above"), "{text}");
         assert!(text.contains("`apprafter top`"), "{text}");
         assert!(
             lines
@@ -1507,7 +1796,7 @@ mod tests {
                 "backup Job x: its attempt 1 of at most 7 was OOMKilled at its 384Mi memory limit",
             )),
         );
-        let text = backup_health_lines(&stack, frozen_now()).join("\n");
+        let text = backup_runs_detail_lines(&stack, frozen_now()).join("\n");
         assert!(text.contains("OOMKilled at its 384Mi"), "{text}");
         assert!(text.contains("`apprafter top`"), "{text}");
         assert!(text.contains(BACKUP_HEALTH_DOC), "{text}");
@@ -1523,9 +1812,8 @@ mod tests {
                 "backup Job x: failed",
             )),
         );
-        let text = backup_health_lines(&stack, frozen_now()).join("\n");
+        let text = backup_runs_detail_lines(&stack, frozen_now()).join("\n");
         assert!(text.contains("FAILING"), "{text}");
-        assert!(text.contains("`apprafter backup status`"), "{text}");
         // Found by review: this advice named only room on the node, while a
         // runner that ran and was too slow needs a longer deadline instead.
         assert!(text.contains("`apprafter top`"), "{text}");
@@ -1546,32 +1834,50 @@ mod tests {
                  unable to open repository: 503 Slow Down",
             )),
         );
-        let text = backup_health_lines(&stack, frozen_now()).join("\n");
+        let text = backup_runs_detail_lines(&stack, frozen_now()).join("\n");
         assert!(text.contains("FAILING since"), "{text}");
         assert!(text.contains("503 Slow Down"), "{text}");
         assert!(
-            text.contains("`apprafter backup status` shows the Job and the runner's own record"),
+            text.contains("`lastError` under Runner status above is the runner's own record"),
             "{text}"
         );
-        assert!(text.contains("`lastError`"), "{text}");
     }
 
     #[test]
-    fn a_backup_not_known_to_work_is_never_rendered_as_healthy() {
-        for reason in ["NoRunYet", "StateUnreadable", "ScheduleNotDeployed"] {
+    fn a_backup_not_known_to_work_is_never_rendered_as_working() {
+        for (reason, words) in [
+            ("NoRunYet", "no backup has run yet"),
+            (
+                "StateUnreadable",
+                "the operator cannot read the backup Jobs",
+            ),
+            (
+                "ScheduleNotDeployed",
+                "the backup schedule is not deployed yet",
+            ),
+        ] {
             let stack = with_backup(true, Some(backup_condition("Unknown", reason, "why")));
-            let text = backup_health_lines(&stack, frozen_now()).join("\n");
-            assert!(text.contains("not known to be working"), "{reason}: {text}");
-            assert!(!text.contains("healthy"), "{reason}: {text}");
+            let summary = backup_summary_lines(&stack, || None, frozen_now());
+            assert_eq!(summary.len(), 1, "{reason}: {summary:?}");
             assert!(
-                text.contains("`apprafter backup status`"),
-                "{reason}: {text}"
+                summary[0].contains(&format!("Backups: not known to be working — {words}.")),
+                "{reason}: {summary:?}"
             );
+            assert!(
+                summary[0].ends_with("See `apprafter backup status`."),
+                "{reason}: {summary:?}"
+            );
+            // The detail, with the next step, is `backup status`'s.
+            let text = backup_runs_detail_lines(&stack, frozen_now()).join("\n");
+            assert!(text.contains("not known to be working"), "{reason}: {text}");
+            assert!(text.contains("Next:"), "{reason}: {text}");
         }
     }
 
+    /// WI-394, the owner's words: `apprafter status` says only that backups
+    /// are configured and working, and how long ago the last one ran.
     #[test]
-    fn a_healthy_backup_is_one_quiet_line() {
+    fn a_working_backup_is_one_short_line_with_the_age_of_the_last_backup() {
         let stack = with_backup(
             true,
             Some(backup_condition(
@@ -1580,25 +1886,129 @@ mod tests {
                 "the last backup, Job apprafter-backup-29312340, succeeded at 2026-09-23T03:01:02Z",
             )),
         );
-        let lines = backup_health_lines(&stack, frozen_now());
-        assert_eq!(lines.len(), 1, "{lines:?}");
-        assert!(lines[0].starts_with("Backups: healthy"), "{lines:?}");
-        assert!(lines[0].contains("apprafter-backup-29312340"), "{lines:?}");
+        // sep23_noon() is 2026-09-23T12:00:00Z.
+        let lines = backup_summary_lines(
+            &stack,
+            || Some("2026-09-23T02:02:13+00:00".to_string()),
+            sep23_noon(),
+        );
+        assert_eq!(
+            lines,
+            vec!["Backups: working — last backup 10 hours ago.".to_string()]
+        );
+        // No record to date it: still one line, and still working.
+        assert_eq!(
+            backup_summary_lines(&stack, || None, sep23_noon()),
+            vec!["Backups: working.".to_string()]
+        );
+        assert_eq!(
+            backup_summary_lines(&stack, || Some("not a time".to_string()), sep23_noon()),
+            vec!["Backups: working.".to_string()]
+        );
+        // The operator's message is `backup status`'s detail, not this line's.
+        assert!(!lines[0].contains("apprafter-backup-29312340"), "{lines:?}");
+        // And `backup status` adds nothing for a verdict that is `True`: its
+        // Jobs section already says the last one succeeded.
+        assert!(backup_runs_detail_lines(&stack, sep23_noon()).is_empty());
     }
 
     #[test]
     fn enabled_backups_with_no_condition_do_not_read_as_fine() {
         // An operator from before the condition existed. Silence here would
         // be read as "nothing wrong".
-        let text = backup_health_lines(&with_backup(true, None), frozen_now()).join("\n");
-        assert!(text.contains("does not report"), "{text}");
-        assert!(text.contains("`apprafter backup status`"), "{text}");
+        let lines = backup_summary_lines(&with_backup(true, None), || None, frozen_now());
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("does not report"), "{lines:?}");
+        assert!(lines[0].contains("`apprafter backup status`"), "{lines:?}");
+        assert!(backup_runs_detail_lines(&with_backup(true, None), frozen_now()).is_empty());
     }
 
     #[test]
     fn a_cluster_without_backups_says_so_in_one_line() {
-        let lines = backup_health_lines(&with_backup(false, None), frozen_now());
+        let lines = backup_summary_lines(
+            &with_backup(false, None),
+            || Some("2026-09-23T02:02:13+00:00".to_string()),
+            frozen_now(),
+        );
         assert_eq!(lines, vec!["Backups: not enabled.".to_string()]);
+    }
+
+    /// A failure still reads as one — briefly, in plain words, and pointing
+    /// at the detail — or the summary would mask exactly what WI-386 was
+    /// about: a backup that silently never ran.
+    #[test]
+    fn a_failing_backup_is_one_loud_line_that_names_the_cause_in_words() {
+        let stack = with_backup(
+            true,
+            Some(backup_condition(
+                "False",
+                "RunnerUnschedulable",
+                UNSCHEDULABLE_MESSAGE,
+            )),
+        );
+        // The condition turned False at 03:10:05, about 9 hours before.
+        let lines = backup_summary_lines(
+            &stack,
+            || Some("2026-09-22T02:02:13Z".to_string()),
+            sep23_noon(),
+        );
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains(
+                "Backups: FAILING for 9 hours — no node has room for the backup runner. See \
+                 `apprafter backup status`."
+            ),
+            "{lines:?}"
+        );
+        // The operator's message and the next steps stay in `backup status`.
+        assert!(!lines[0].contains("Insufficient memory"), "{lines:?}");
+        assert!(!lines[0].contains("Next:"), "{lines:?}");
+        assert!(!lines[0].contains("last backup"), "{lines:?}");
+    }
+
+    #[test]
+    fn a_failure_with_no_transition_time_still_reads_as_failing() {
+        let mut condition = backup_condition("False", "RunnerFailed", "m");
+        condition
+            .as_object_mut()
+            .unwrap()
+            .remove("lastTransitionTime");
+        let lines =
+            backup_summary_lines(&with_backup(true, Some(condition)), || None, sep23_noon());
+        assert!(
+            lines[0].contains(
+                "Backups: FAILING — the last backup attempt failed. See `apprafter backup status`."
+            ),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_reason_this_build_does_not_know_is_named_as_it_is_in_the_summary() {
+        let stack = with_backup(true, Some(backup_condition("False", "SomethingNew", "why")));
+        let lines = backup_summary_lines(&stack, || None, frozen_now());
+        assert!(lines[0].contains("FAILING"), "{lines:?}");
+        assert!(lines[0].contains("— SomethingNew."), "{lines:?}");
+    }
+
+    #[test]
+    fn how_long_reads_as_a_span_not_as_a_moment() {
+        let now = sep23_noon();
+        assert_eq!(
+            for_how_long("2026-09-23T09:00:00Z", now).as_deref(),
+            Some("for 3 hours")
+        );
+        assert_eq!(
+            for_how_long("2026-09-20T12:00:00Z", now).as_deref(),
+            Some("for 3 days")
+        );
+        assert_eq!(
+            for_how_long("2026-09-23T11:59:50Z", now).as_deref(),
+            Some("just now")
+        );
+        // A clock ahead of this one, or a time that does not parse: no span.
+        assert_eq!(for_how_long("2026-09-23T13:00:00Z", now), None);
+        assert_eq!(for_how_long("yesterday", now), None);
     }
 
     #[test]
@@ -1612,7 +2022,7 @@ mod tests {
                  2026-09-21T06:12:00Z after 7 failed attempts (BackoffLimitExceeded).",
             )),
         );
-        let text = backup_health_lines(&stack, frozen_now()).join("\n");
+        let text = backup_runs_detail_lines(&stack, frozen_now()).join("\n");
         assert!(text.contains("FAILING since"), "{text}");
         assert!(text.contains("`apprafter backup check`"), "{text}");
         // The schedule is weekly, so the way to clear it now is named.
@@ -1649,14 +2059,14 @@ mod tests {
                     "repository check Job x: failed",
                 )),
             );
-            printed_check_job(&backup_health_lines(&stack, now).join("\n"))
+            printed_check_job(&backup_runs_detail_lines(&stack, now).join("\n"))
         };
         let not_yet = |now| {
             let stack = with_retention(
                 Some(backup_condition("True", "Succeeded", "ok")),
                 Some(retention_condition("Unknown", "NoCheckYet", "why")),
             );
-            printed_check_job(&backup_health_lines(&stack, now).join("\n"))
+            printed_check_job(&backup_retention_lines(&stack, now).join("\n"))
         };
         for name in [failed(frozen_now()), not_yet(frozen_now())] {
             assert!(name.starts_with("apprafter-backup-check-"), "{name}");
@@ -1686,7 +2096,7 @@ mod tests {
                  2026-09-23T22:09:00Z: the Job controller has not created one.",
             )),
         );
-        let text = backup_health_lines(&stack, frozen_now()).join("\n");
+        let text = backup_runs_detail_lines(&stack, frozen_now()).join("\n");
         assert!(text.contains("FAILING since"), "{text}");
         assert!(
             text.contains("`kubectl -n apprafter-system describe job <name>`"),
@@ -1709,7 +2119,7 @@ mod tests {
                  of EmptyDir volume \"staging\" exceeds the limit \"16Mi\".",
             )),
         );
-        let text = backup_health_lines(&stack, frozen_now()).join("\n");
+        let text = backup_runs_detail_lines(&stack, frozen_now()).join("\n");
         assert!(text.contains("exceeds the limit"), "{text}");
         assert!(text.contains("`apprafter top`"), "{text}");
         assert!(
@@ -1733,7 +2143,7 @@ mod tests {
                  priority pod. The Job retries until its backoff limit.",
             )),
         );
-        let text = backup_health_lines(&stack, frozen_now()).join("\n");
+        let text = backup_runs_detail_lines(&stack, frozen_now()).join("\n");
         assert!(text.contains("FAILING since"), "{text}");
         assert!(text.contains("`apprafter top`"), "{text}");
         assert!(text.contains(BACKUP_UNSCHEDULABLE_DOC), "{text}");
@@ -1742,9 +2152,12 @@ mod tests {
     #[test]
     fn a_reason_this_build_does_not_know_still_gets_a_next_step() {
         let stack = with_backup(true, Some(backup_condition("False", "SomethingNew", "why")));
-        let text = backup_health_lines(&stack, frozen_now()).join("\n");
+        let text = backup_runs_detail_lines(&stack, frozen_now()).join("\n");
         assert!(text.contains("FAILING since"), "{text}");
-        assert!(text.contains("Next: `apprafter backup status`"), "{text}");
+        assert!(
+            text.contains("Next: the Jobs and the runner's own record above say what happened."),
+            "{text}"
+        );
         assert!(text.contains(BACKUP_HEALTH_DOC), "{text}");
     }
 
@@ -1776,6 +2189,12 @@ mod tests {
                 backup_next_step(reason, frozen_now()).is_some(),
                 "the operator writes BackupHealthy reason `{reason}` and this build gives \
                  it no next step of its own"
+            );
+            // And `apprafter status` names it in words, not in CamelCase.
+            assert!(
+                backup_reason_in_words(reason, false).is_some(),
+                "the operator writes BackupHealthy reason `{reason}` and `apprafter status` \
+                 has no words for it"
             );
         }
     }
@@ -1864,14 +2283,48 @@ mod tests {
                 NOT_PERMITTED_MESSAGE,
             )),
         );
-        let lines = backup_health_lines(&stack, frozen_now());
-        let text = lines.join("\n");
-        assert!(lines[0].starts_with("Backups: healthy"), "{text}");
+        // `apprafter status`, before anyone prunes from outside: two short
+        // lines, and the second is the warning.
+        let summary = backup_summary_lines(&stack, || None, sep23_noon());
+        assert_eq!(summary.len(), 2, "{summary:?}");
+        assert_eq!(summary[0], "Backups: working.");
         assert!(
-            lines[1].contains("Retention: NOT ENFORCED since 2026-09-20 06:00 UTC"),
+            summary[1].contains(
+                "Retention: NOT ENFORCED — the cluster's S3 key may not delete, and `apprafter \
+                 backup prune` has not run, so the repository keeps growing. See `apprafter \
+                 backup status`."
+            ),
+            "{summary:?}"
+        );
+        assert!(!summary[1].contains("+155.1 MiB"), "{summary:?}");
+        // The recommended setup once it is followed: the operator prunes from
+        // outside on a weekly cadence, and `apprafter status` stays quiet.
+        let mut pruned = stack.clone();
+        pruned["metadata"] = json!({ "annotations": {
+            "apprafter.io/last-prune": "2026-09-19T08:00:00Z" } });
+        assert_eq!(
+            backup_summary_lines(&pruned, || None, sep23_noon()),
+            vec!["Backups: working.".to_string()]
+        );
+        // A prune that stopped happening is said, with when it last ran.
+        pruned["metadata"]["annotations"]["apprafter.io/last-prune"] =
+            json!("2026-09-01T08:00:00Z");
+        let summary = backup_summary_lines(&pruned, || None, sep23_noon());
+        assert!(
+            summary[1].contains(
+                "Retention: NOT ENFORCED — the cluster's S3 key may not delete, and `apprafter \
+                 backup prune` last ran 22 days ago."
+            ),
+            "{summary:?}"
+        );
+        // `apprafter backup status`: the whole verdict.
+        let lines = backup_retention_lines(&stack, frozen_now());
+        let text = lines.join("\n");
+        assert!(
+            lines[0].contains("Retention: NOT ENFORCED since 2026-09-20 06:00 UTC"),
             "{text}"
         );
-        assert!(lines[1].contains("PruneNotPermitted"), "{text}");
+        assert!(lines[0].contains("PruneNotPermitted"), "{text}");
         assert!(text.contains("+155.1 MiB"), "the growth is shown: {text}");
         assert!(
             text.contains("`apprafter backup prune --credential-file <full-credentials.env>`"),
@@ -1886,7 +2339,7 @@ mod tests {
     }
 
     #[test]
-    fn enforced_retention_is_one_quiet_line() {
+    fn enforced_retention_adds_nothing_anywhere() {
         let stack = with_retention(
             Some(backup_condition("True", "Succeeded", "ok")),
             Some(retention_condition(
@@ -1895,12 +2348,248 @@ mod tests {
                 "the prune after the weekly check at t: forgot 2 snapshot(s)",
             )),
         );
-        let lines = backup_health_lines(&stack, frozen_now());
-        assert_eq!(lines.len(), 2, "{lines:?}");
+        // `apprafter status`: the one Backups line, and no Retention line.
+        assert_eq!(
+            backup_summary_lines(&stack, || None, frozen_now()),
+            vec!["Backups: working.".to_string()]
+        );
+        // `backup status`: its repository block already shows the prune.
+        assert!(backup_retention_lines(&stack, frozen_now()).is_empty());
+    }
+
+    #[test]
+    fn every_retention_problem_reads_as_one_short_line() {
+        for (status, reason, line) in [
+            (
+                "False",
+                "PruneFailed",
+                "Retention: NOT ENFORCED — the last prune failed.",
+            ),
+            (
+                "False",
+                "CheckOff",
+                "Retention: NOT ENFORCED — the weekly check is off, and the prune runs after it.",
+            ),
+            (
+                "False",
+                "CheckFailed",
+                "Retention: NOT ENFORCED — the weekly check did not pass, and only a check that \
+                 passes prunes.",
+            ),
+            (
+                "Unknown",
+                "RecordUnreadable",
+                "Retention: not known — the operator cannot read the backup runner's record, or \
+                 does not understand it.",
+            ),
+            (
+                "False",
+                "SomethingNew",
+                "Retention: NOT ENFORCED — SomethingNew.",
+            ),
+        ] {
+            let stack = with_retention(
+                Some(backup_condition("True", "Succeeded", "ok")),
+                Some(retention_condition(
+                    status,
+                    reason,
+                    "the operator's long message",
+                )),
+            );
+            let lines = backup_summary_lines(&stack, || None, frozen_now());
+            assert_eq!(lines.len(), 2, "{reason}: {lines:?}");
+            assert!(
+                lines[1].contains(&format!("{line} See `apprafter backup status`.")),
+                "{reason}: {lines:?}"
+            );
+            assert!(
+                !lines[1].contains("the operator's long message"),
+                "{reason}: {lines:?}"
+            );
+        }
+    }
+
+    /// A check that did not pass is said once: the Backups line names it,
+    /// and retention waits on that same check.
+    #[test]
+    fn a_failed_check_is_not_said_twice() {
+        let stack = with_retention(
+            Some(backup_condition("False", "RepositoryCheckFailed", "m")),
+            Some(retention_condition("False", "CheckFailed", "m")),
+        );
+        let lines = backup_summary_lines(&stack, || None, sep23_noon());
+        assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(
-            lines[1].starts_with("Retention: enforced — the prune after"),
+            lines[0].contains("the weekly repository check failed"),
             "{lines:?}"
         );
+    }
+
+    /// The operator builds both verdicts from one read; when it fails, the
+    /// Backups line says so once.
+    #[test]
+    fn unreadable_backup_objects_are_not_said_twice() {
+        let stack = with_retention(
+            Some(backup_condition("Unknown", "StateUnreadable", "m")),
+            Some(retention_condition("Unknown", "RecordUnreadable", "m")),
+        );
+        let lines = backup_summary_lines(&stack, || None, sep23_noon());
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains("cannot read the backup Jobs"),
+            "{lines:?}"
+        );
+    }
+
+    /// Found by review: a check that never records, because its CronJob is
+    /// gone or the runner cannot write its record, left retention "not known
+    /// yet" for good while `apprafter status` said nothing.
+    #[test]
+    fn retention_not_judged_for_longer_than_a_week_is_said() {
+        // The fixture's transition is 2026-09-20 06:00:41: three days before
+        // sep23_noon() is the first week after enabling, and quiet.
+        for (reason, what) in [
+            ("NoCheckYet", "no weekly check has recorded a result"),
+            ("NoPruneYet", "no prune is recorded after the last check"),
+        ] {
+            let stack = with_retention(
+                Some(backup_condition("True", "Succeeded", "ok")),
+                Some(retention_condition("Unknown", reason, "why")),
+            );
+            assert_eq!(
+                backup_summary_lines(&stack, || None, sep23_noon()).len(),
+                1,
+                "{reason}"
+            );
+            let a_month_on = Utc.with_ymd_and_hms(2026, 10, 20, 12, 0, 0).unwrap();
+            let lines = backup_summary_lines(&stack, || None, a_month_on);
+            assert_eq!(lines.len(), 2, "{reason}: {lines:?}");
+            assert!(
+                lines[1].contains(&format!(
+                    "Retention: not known for 1 month — {what}. See `apprafter backup status`."
+                )),
+                "{reason}: {lines:?}"
+            );
+            // No time to measure from: not assumed recent.
+            let mut untimed = stack.clone();
+            untimed["status"]["conditions"][2]
+                .as_object_mut()
+                .unwrap()
+                .remove("lastTransitionTime");
+            let lines = backup_summary_lines(&untimed, || None, sep23_noon());
+            assert_eq!(lines.len(), 2, "{reason}: {lines:?}");
+            assert!(
+                lines[1].contains(&format!("Retention: not known — {what}.")),
+                "{reason}: {lines:?}"
+            );
+        }
+    }
+
+    /// Found by review: the operator gives the weekly check's troubles the
+    /// same reasons as the backups', so a suspended check read "the backup
+    /// schedule is suspended" while the nightly backups ran.
+    #[test]
+    fn the_weekly_checks_troubles_are_not_called_the_backups() {
+        for (reason, message, words) in [
+            (
+                "ScheduleSuspended",
+                "CronJob apprafter-system/apprafter-backup-check is suspended: no scheduled \
+                 repository check runs until its spec.suspend is cleared",
+                "the weekly check's schedule is suspended",
+            ),
+            (
+                "ScheduleSuspended",
+                "CronJob apprafter-system/apprafter-backup is suspended: no scheduled backup \
+                 runs until its spec.suspend is cleared",
+                "the backup schedule is suspended",
+            ),
+            (
+                "DeadlineExceeded",
+                "repository check Job apprafter-backup-check-29310000: failed at \
+                 2026-09-21T06:12:00Z (DeadlineExceeded)",
+                "the weekly check Job ran into its deadline",
+            ),
+            (
+                "RunnerUnschedulable",
+                "repository check Job apprafter-backup-check-29310000: its pod has not been \
+                 scheduled",
+                "no node has room for the weekly check's runner",
+            ),
+            (
+                "Failed",
+                "backup Job apprafter-backup-29312340: failed",
+                "a backup Job failed",
+            ),
+        ] {
+            let stack = with_backup(true, Some(backup_condition("False", reason, message)));
+            let lines = backup_summary_lines(&stack, || None, sep23_noon());
+            assert!(
+                lines[0].contains(&format!("— {words}. See")),
+                "{reason}: {lines:?}"
+            );
+        }
+    }
+
+    /// The runner stamps `lastSuccess` with its node's clock; one a little
+    /// ahead of this machine's must not read "last backup in 2 minutes".
+    #[test]
+    fn a_last_backup_ahead_of_this_clock_reads_as_just_now() {
+        let stack = with_backup(true, Some(backup_condition("True", "Succeeded", "ok")));
+        assert_eq!(
+            backup_summary_lines(
+                &stack,
+                || Some("2026-09-23T12:02:00Z".to_string()),
+                sep23_noon()
+            ),
+            vec!["Backups: working — last backup just now.".to_string()]
+        );
+    }
+
+    /// WI-394: the next steps are printed inside `apprafter backup status`
+    /// only, so none may send the reader to the command they are reading.
+    #[test]
+    fn no_next_step_sends_the_reader_to_the_command_they_are_reading() {
+        let reasons = |file: &str| -> Vec<String> {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../operator/operator-controllers/platform-stack/src")
+                .join(file);
+            std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+                .lines()
+                .filter_map(|l| l.trim().strip_prefix("pub const REASON_"))
+                .filter_map(|l| l.split_once("= \""))
+                .filter_map(|(_, rest)| rest.split_once('"'))
+                .map(|(name, _)| name.to_string())
+                .collect()
+        };
+        for reason in reasons("backup_health.rs") {
+            if let Some((next, _)) = backup_next_step(&reason, frozen_now()) {
+                assert!(
+                    !next.contains("`apprafter backup status`"),
+                    "{reason}: {next}"
+                );
+            }
+        }
+        for reason in reasons("backup_retention.rs") {
+            if let Some(next) = retention_next_step(&reason, frozen_now()) {
+                assert!(
+                    !next.contains("`apprafter backup status`"),
+                    "{reason}: {next}"
+                );
+            }
+        }
+        // And the fallbacks, for a reason this build does not know.
+        let unknown = with_retention(
+            Some(backup_condition("False", "SomethingNew", "m")),
+            Some(retention_condition("False", "SomethingElse", "m")),
+        );
+        let text = [
+            backup_runs_detail_lines(&unknown, frozen_now()),
+            backup_retention_lines(&unknown, frozen_now()),
+        ]
+        .concat()
+        .join("\n");
+        assert!(!text.contains("`apprafter backup status`"), "{text}");
     }
 
     /// The explicit opt-out is stated as a choice, not as a failure.
@@ -1914,7 +2603,25 @@ mod tests {
                 "spec.backup.retention.enforce is operator",
             )),
         );
-        let text = backup_health_lines(&stack, frozen_now()).join("\n");
+        // A choice, and not a problem while it is made: quiet in
+        // `apprafter status` for as long as `apprafter backup prune` runs.
+        let mut pruned = stack.clone();
+        pruned["metadata"] = json!({ "annotations": {
+            "apprafter.io/last-prune": "2026-09-22T08:00:00Z" } });
+        assert_eq!(
+            backup_summary_lines(&pruned, || None, sep23_noon()),
+            vec!["Backups: working.".to_string()]
+        );
+        // Chosen, and then never done: nothing prunes, and that is said.
+        let summary = backup_summary_lines(&stack, || None, sep23_noon());
+        assert!(
+            summary[1].contains(
+                "Retention: NOT ENFORCED — nothing in the cluster prunes, by choice, and \
+                 `apprafter backup prune` has not run, so the repository keeps growing."
+            ),
+            "{summary:?}"
+        );
+        let text = backup_retention_lines(&stack, frozen_now()).join("\n");
         assert!(
             text.contains("not enforced in the cluster, by choice"),
             "{text}"
@@ -1933,23 +2640,39 @@ mod tests {
                 Some(backup_condition("True", "Succeeded", "ok")),
                 Some(retention_condition("Unknown", reason, "why")),
             );
-            let text = backup_health_lines(&stack, frozen_now()).join("\n");
+            let text = backup_retention_lines(&stack, frozen_now()).join("\n");
             assert!(
                 text.contains("Retention: not known yet"),
                 "{reason}: {text}"
             );
             assert!(!text.contains("Retention: enforced"), "{reason}: {text}");
         }
+        // Before the first weekly check is the normal state after enabling
+        // or upgrading, so `apprafter status` waits for it quietly; a record
+        // the operator cannot read is a problem, and says so.
+        for (reason, lines) in [
+            ("NoCheckYet", 1),
+            ("NoPruneYet", 1),
+            ("RecordUnreadable", 2),
+        ] {
+            let stack = with_retention(
+                Some(backup_condition("True", "Succeeded", "ok")),
+                Some(retention_condition("Unknown", reason, "why")),
+            );
+            let summary = backup_summary_lines(&stack, || None, frozen_now());
+            assert_eq!(summary.len(), lines, "{reason}: {summary:?}");
+        }
     }
 
     #[test]
     fn an_operator_that_does_not_report_retention_is_named_once() {
         // An operator that reports neither condition is named once, by the
-        // runs line; the retention half adds nothing to it.
+        // Backups line; retention adds nothing to it.
         let neither = with_retention(None, None);
-        let lines = backup_health_lines(&neither, frozen_now());
+        let lines = backup_summary_lines(&neither, || None, frozen_now());
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].contains("does not report"), "{lines:?}");
+        assert!(!operator_reports_retention(&neither));
         // Backups off: nothing about retention, even with a stale condition.
         let mut off = with_retention(
             None,
@@ -1980,40 +2703,62 @@ mod tests {
             )),
         );
         stack["status"]["currentVersion"] = json!("0.2.79");
-        let lines = backup_health_lines(&stack, frozen_now());
+        let lines = backup_summary_lines(
+            &stack,
+            || Some("2026-09-23T02:02:13Z".to_string()),
+            frozen_now(),
+        );
         let text = lines.join("\n");
         assert_eq!(lines.len(), 1, "{text}");
-        assert!(!text.contains("healthy"), "{text}");
-        assert!(!text.contains("Retention: enforced"), "{text}");
+        assert!(!text.contains("working"), "{text}");
+        assert!(!text.contains("Retention"), "{text}");
         assert!(text.contains("does not report"), "{text}");
         assert!(text.contains("platform 0.2.79"), "{text}");
         assert!(text.contains("not current"), "{text}");
         assert!(text.contains("`apprafter backup status`"), "{text}");
-        // `backup status` reads the retention verdict through this too, and
-        // falls back to the runner's own record when it is empty.
+        // `backup status` reads both verdicts through these, and falls back
+        // to the Jobs and the runner's own record when they are empty.
         assert!(backup_retention_lines(&stack, frozen_now()).is_empty());
+        assert!(backup_runs_detail_lines(&stack, frozen_now()).is_empty());
+        assert!(!operator_reports_retention(&stack));
+        // `platform status` keeps the two table rows, and says they are not
+        // current rather than letting a `True` read as healthy.
+        let mut rows = condition_rows(&stack["status"]);
+        mark_backup_rows_not_current(&mut rows, &stack);
+        for row in rows.iter().filter(|r| r.type_.starts_with("Backup")) {
+            assert!(row.message.starts_with("NOT CURRENT"), "{row:?}");
+            assert!(row.message.contains("platform 0.2.79"), "{row:?}");
+        }
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r.message.starts_with("NOT CURRENT"))
+                .count(),
+            2
+        );
 
         // From the release that writes them on, they are read as they are.
         for version in [BACKUP_CONDITIONS_SINCE, "0.2.81", "0.3.0", "v0.2.80"] {
             stack["status"]["currentVersion"] = json!(version);
-            let lines = backup_health_lines(&stack, frozen_now());
-            assert!(
-                lines[0].starts_with("Backups: healthy"),
-                "{version}: {lines:?}"
+            assert_eq!(
+                backup_summary_lines(&stack, || None, frozen_now()),
+                vec!["Backups: working.".to_string()],
+                "{version}"
             );
+            let mut rows = condition_rows(&stack["status"]);
+            mark_backup_rows_not_current(&mut rows, &stack);
             assert!(
-                lines[1].starts_with("Retention: enforced"),
-                "{version}: {lines:?}"
+                rows.iter().all(|r| !r.message.starts_with("NOT CURRENT")),
+                "{version}: {rows:?}"
             );
         }
         // A version that does not parse proves nothing either way: the
         // condition is read rather than hidden.
         for version in [json!("main"), json!(""), Value::Null] {
             stack["status"]["currentVersion"] = version.clone();
-            let lines = backup_health_lines(&stack, frozen_now());
-            assert!(
-                lines[0].starts_with("Backups: healthy"),
-                "{version}: {lines:?}"
+            assert_eq!(
+                backup_summary_lines(&stack, || None, frozen_now()),
+                vec!["Backups: working.".to_string()],
+                "{version}"
             );
         }
     }
@@ -2023,12 +2768,12 @@ mod tests {
         let mut off = with_backup(false, None);
         off["status"]["currentVersion"] = json!("0.2.60");
         assert_eq!(
-            backup_health_lines(&off, frozen_now()),
+            backup_summary_lines(&off, || None, frozen_now()),
             vec!["Backups: not enabled.".to_string()]
         );
         let mut on = with_backup(true, None);
         on["status"]["currentVersion"] = json!("0.2.60");
-        let text = backup_health_lines(&on, frozen_now()).join("\n");
+        let text = backup_summary_lines(&on, || None, frozen_now()).join("\n");
         assert!(text.contains("does not report"), "{text}");
         assert!(!text.contains("not current"), "nothing was left: {text}");
     }
@@ -2109,6 +2854,15 @@ mod tests {
                 retention_next_step(reason, frozen_now()).is_some(),
                 "the operator writes BackupRetention reason `{reason}` and this build gives it \
                  no next step of its own"
+            );
+        }
+        // `apprafter status` decides for every reason, enforced ones
+        // included, whether it is quiet or a line of its own.
+        for reason in &reasons {
+            assert!(
+                retention_class(reason).is_some(),
+                "the operator writes BackupRetention reason `{reason}` and `apprafter status` \
+                 has not decided whether it is quiet"
             );
         }
     }
