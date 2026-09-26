@@ -41,6 +41,17 @@ Everything from before ATM is frozen in `docs/changelog/history.md` — 237 sect
 already-shipped work, kept because `release-cli.yml` still reads it for tags cut before
 the switch.
 
+## cli v0.2.78 — 2026-09-26
+
+### Added
+
+- `nix develop` now provides restic, which the CLI's local backup verbs (`backup create/list/show/check/prune`, `restore`, `export`) run. It is nixpkgs' restic (0.18.1), on the same minor the in-cluster backup runner asserts at build time; the dev shell reads that minor from `cli/apprafter-backup/Dockerfile` and raises an evaluation warning when a `flake.lock` update would move restic off it. (WI-395)
+
+### Changed
+
+- Backup detail now lives in one place, `apprafter backup status`. `apprafter status` says in one line that backups are working and how long ago the last one ran (`Backups: working — last backup 10 hours ago.`), instead of repeating the operator's full messages. A problem still gets a short line of its own in plain words, pointing to `apprafter backup status`: `Backups: FAILING for 3 hours — no node has room for the backup runner.` (naming the weekly check when it is the check that fails), or `Retention: NOT ENFORCED — …`. Enforced retention adds no line, and neither does retention pruned from outside the cluster (the scoped S3 key, or `enforce: operator`) while `apprafter backup prune` has run in the last eight days, nor a first weekly check still to come within eight days — past that, each is said. `apprafter platform status` no longer prints a separate Backups/Retention block under its conditions table: the `BackupHealthy` and `BackupRetention` rows are the whole report, marked `NOT CURRENT` when an older operator left them behind after a rollback. `apprafter backup status` now shows why backups are failing, since when and what to run next — pointing at its own Jobs, runner and repository sections — and no longer repeats an enforced retention verdict its Repository block already shows. (WI-394)
+- The README, the specification, the feature status page and the ADRs now describe AppRafter's core as source-available rather than open source: it is licensed FSL-1.1-Apache-2.0, and each release converts to Apache 2.0 two years after it ships. The plugins (MIT) and the documentation (CC-BY-4.0) remain openly licensed. Nothing about the licence itself changed. (WI-396)
+
 ## platform-stack 0.2.80 / operator v0.2.52 / argocd-cue-cmp 0.1.29 / cli v0.2.77 — 2026-09-24
 
 ### Upgrade notes
