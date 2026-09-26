@@ -416,7 +416,7 @@ field, so a later `enable` re-uses the same bucket, credential, and retention.
 apprafter backup status
 ```
 
-`status` reads three sources and reconciles them into one view:
+`status` reads these and reconciles them into one view:
 
 - the resolved `PlatformStack.spec.backup` (bucket, schedule, enforce mode,
   retention, …);
@@ -431,8 +431,11 @@ apprafter backup status
   successful backup run" — the core backup question — stays reliably
   answerable;
 - the `apprafter.io/last-prune` annotation stamped on `PlatformStack` by the
-  operator-side `backup prune`, and the operator's verdict on whether retention
-  is enforced ([what each answer
+  operator-side `backup prune`, and the operator's two verdicts from the same
+  `PlatformStack`: whether backups run — given in full, with what to run next,
+  when they do not ([what each answer
+  means](../how-it-works/backup-retention-and-checks.md#when-a-backup-cannot-run))
+  — and whether retention is enforced ([what each answer
   means](../how-it-works/backup-retention-and-checks.md#whether-retention-is-enforced)).
 
 ## What a backup captures
@@ -641,8 +644,10 @@ runner then records `run was stopped by Kubernetes (SIGTERM) … its pod was
 deleted or evicted` as its `lastError`, and the Job's next pod waits for room
 like any other. On a node this full, an application rolling out can therefore
 stop a backup; the backup runs again once the rollout is done and the room is
-back. `apprafter status` reports the stopped attempt at once, as
-`RunnerPreempted` on its `Backups:` line, until a run succeeds.
+back. `apprafter status` reports the stopped attempt at once on its `Backups:`
+line (`FAILING for <how long> — the backup runner had to give its room to
+another pod`), and
+`apprafter backup status` names it `RunnerPreempted`, until a run succeeds.
 
 Check how much room is left:
 

@@ -8,7 +8,7 @@ The gRPC-streaming-on-launch decision (gRPC streaming over HTTP/2 with TLS, Rust
 
 ## Context
 
-AppRafter's managed offering comprises three managed plans (ADR 0034): Hosted Services, Managed Operations, and Turnkey Cloud. The launch managed plan is Hosted Services (`speedrun-plan.md` §0.5): we host the Backstage portal, Account UI, MCP server, and supporting infrastructure on our side; customer clusters live on the customer's own infrastructure and remain fully autonomous open-source installs. The two sides communicate via a long-lived connection initiated from the customer cluster.
+AppRafter's managed offering comprises three managed plans (ADR 0034): Hosted Services, Managed Operations, and Turnkey Cloud. The launch managed plan is Hosted Services (`speedrun-plan.md` §0.5): we host the Backstage portal, Account UI, MCP server, and supporting infrastructure on our side; customer clusters live on the customer's own infrastructure and remain fully autonomous source-available installs. The two sides communicate via a long-lived connection initiated from the customer cluster.
 
 This communication channel — designated `apprafter-agent` ↔ hosted-bus — has the following requirements:
 
@@ -18,7 +18,7 @@ This communication channel — designated `apprafter-agent` ↔ hosted-bus — h
 - **Strong authentication and authorization.** Each agent carries a customer-scoped registration token (issued during cluster registration, revocable from the Account UI). All operations are auditable to a (customer, cluster, session) tuple.
 - **Resource-frugal in the customer cluster.** Tier 1 substrate is a single `cpx22` (4 GB RAM, 2 vCPU) on Hetzner; the agent should consume a small fraction of those resources, leaving the substrate available for the customer's own workloads.
 - **Type-safe across language boundaries.** Customer-side runtime and hosted-side runtime are different. Manual JSON schema synchronization across two stacks is error-prone in API evolution; the project's experience with schema drift has already motivated CUE adoption for configuration (ADR 0029). A similar discipline applies to the agent protocol.
-- **Compatible with a future transition to NATS-backed control plane.** ADR 0028 and the kine+NATS deferred item (`plan.md` 3.2, `speedrun-plan.md` §2.3 bucket C) describe a path where the audit log becomes replayable via JetStream. The launch protocol must not preclude a migration to NATS-based transport, but should not force NATS infrastructure on day one when it is not yet in the OSS-core scope.
+- **Compatible with a future transition to NATS-backed control plane.** ADR 0028 and the kine+NATS deferred item (`plan.md` 3.2, `speedrun-plan.md` §2.3 bucket C) describe a path where the audit log becomes replayable via JetStream. The launch protocol must not preclude a migration to NATS-based transport, but should not force NATS infrastructure on day one when it is not yet in the source-available core's scope.
 
 Three protocol candidates were evaluated: WebSocket, gRPC streaming, and a NATS client. Agent-side runtime candidates were Rust (matching the existing `apprafter` operator) and OneBun/TypeScript (matching the host-side stack).
 
@@ -75,7 +75,7 @@ Connection lifecycle:
 2. Agent calls `Register(RegistrationToken)`; receives `AgentIdentity`.
 3. Agent opens `StreamEvents` (writes events upstream, reads acknowledgments) and `ReceiveCommands` (reads commands downstream) concurrently, both gated by the identity.
 4. On unexpected disconnect: agent retries with exponential backoff (jittered, capped at ~60s). Hosted side caches last-known status per agent to absorb gaps shorter than a configurable threshold.
-5. On token revocation (customer cancels managed subscription): hosted side closes streams with a specific gRPC status code; agent stops retrying and the customer's cluster continues running OSS-only.
+5. On token revocation (customer cancels managed subscription): hosted side closes streams with a specific gRPC status code; agent stops retrying and the customer's cluster continues running on the source-available core alone.
 
 Heartbeat is implicit in the HTTP/2 stream lifecycle (keepalive frames). No application-level heartbeat is needed for liveness detection on the launch protocol; observability of the connection state can be added later if metrics show it is needed.
 
@@ -95,7 +95,7 @@ A NATS-based agent would be a natural fit if NATS were already in the substrate.
 - Customer side has no NATS server in scope — running a NATS client requires the JetStream account/stream provisioning that `needs.jetstream` (`plan.md` 2.5, bucket D in the speedrun) would normally handle, but `needs.jetstream` is dropped for launch.
 - The NATS pub/sub semantic is awkward for request-response patterns that the MCP layer needs (`scale_app` returns a result; `delete_app` waits for MigrationPlan approval). Synthesizing request-response on top of pub/sub is possible but is more machinery than gRPC's native RPC semantics.
 
-A migration from gRPC to NATS becomes possible (and attractive) once kine+NATS lands as control plane storage and JetStream is part of the OSS-core substrate. The migration cost is approximately 1–1.5 weeks of full-time work to swap the transport layer; the proto schema and most application logic carry over.
+A migration from gRPC to NATS becomes possible (and attractive) once kine+NATS lands as control plane storage and JetStream is part of the source-available core's substrate. The migration cost is approximately 1–1.5 weeks of full-time work to swap the transport layer; the proto schema and most application logic carry over.
 
 ### OneBun agent in customer cluster
 
@@ -131,15 +131,15 @@ A secondary consideration is operational simplicity in the customer cluster: the
 
 **Secondary risk:** `@grpc/grpc-js` is a Node-native library; while it works on Bun today, future Bun versions could regress compatibility. Mitigation: pin a known-good combination during launch preparation; consider migrating to a Bun-native gRPC implementation if one matures (e.g., `connect-es` over HTTP/2 directly, which Bun supports natively). The fallback is to run the hosted gRPC server on Node.js compatibility mode inside Bun, which Bun supports.
 
-**Tertiary risk:** agent supply-chain compromise. Mitigation: agent binaries are signed with `cosign` (per the OSS-core release pipeline); customer's `apprafter cluster register` command verifies the signature before deploying the agent. Customer can revoke the registration token at any time; revocation cuts the channel immediately.
+**Tertiary risk:** agent supply-chain compromise. Mitigation: agent binaries are signed with `cosign` (per the source-available core's release pipeline); customer's `apprafter cluster register` command verifies the signature before deploying the agent. Customer can revoke the registration token at any time; revocation cuts the channel immediately.
 
 ## Owner
 
-Core platform team. The agent and the hosted-bus server are co-owned during initial implementation; on stabilization, the agent ships as part of the OSS `apprafter` operator release and the hosted-bus server ships as part of the managed-services repository.
+Core platform team. The agent and the hosted-bus server are co-owned during initial implementation; on stabilization, the agent ships as part of the source-available `apprafter` operator release and the hosted-bus server ships as part of the managed-services repository.
 
 ## Re-evaluation triggers
 
-- **NATS-backed control plane lands in OSS-core.** When `plan.md` 3.2 (kine+NATS migration) ships and JetStream becomes part of the substrate, re-evaluate switching the agent ↔ host transport from gRPC to NATS. Expected to coincide with prioritizing the replayable-audit-log capability.
+- **NATS-backed control plane lands in the source-available core.** When `plan.md` 3.2 (kine+NATS migration) ships and JetStream becomes part of the substrate, re-evaluate switching the agent ↔ host transport from gRPC to NATS. Expected to coincide with prioritizing the replayable-audit-log capability.
 - **Bun-native gRPC implementation matures.** If a first-class Bun gRPC library appears (e.g., via WebTransport or HTTP/2 native bindings), evaluate dropping `@grpc/grpc-js`. The proto schema is unaffected; only the host-side client/server library changes.
 - **OneBun resource footprint shrinks dramatically.** If Bun's runtime overhead drops below ~30 MB resident in a hardened production build, reconsider OneBun for the agent — type sharing convenience would then outweigh the resource cost.
 - **Schema evolution pain.** If protobuf's evolution model proves too restrictive in practice (e.g., field deprecation cycles cause two-week development blocks), re-evaluate. The most likely fallback is `bufbuild` tooling additions rather than a protocol change.

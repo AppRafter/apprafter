@@ -41,6 +41,28 @@
       let
         pkgs = nixpkgs.legacyPackages.${system};
 
+        # restic comes from nixpkgs (0.18.1 on nixos-26.05), unlike cue: the
+        # CLI's local backup verbs run it against the same repositories the
+        # in-cluster runner writes, so what matters is that both are on one
+        # MINOR, and the runner's Dockerfile already asserts that minor at
+        # build time (`ARG RESTIC_MINOR=`). It is read from there, not written
+        # a second time, and the dev shell warns when a lock update moves
+        # nixpkgs' restic to another minor.
+        resticMinor =
+          let
+            prefix = "ARG RESTIC_MINOR=";
+            lines = pkgs.lib.splitString "\n" (builtins.readFile ./cli/apprafter-backup/Dockerfile);
+            arg = pkgs.lib.findFirst (pkgs.lib.hasPrefix prefix) null lines;
+          in
+          if arg == null then null else pkgs.lib.removePrefix prefix arg;
+        resticWarning =
+          if resticMinor == null then
+            "flake.nix: no `ARG RESTIC_MINOR=` in cli/apprafter-backup/Dockerfile, so the dev shell's restic ${pkgs.restic.version} is checked against nothing."
+          else if pkgs.lib.versions.majorMinor pkgs.restic.version != resticMinor then
+            "flake.nix: nixpkgs ships restic ${pkgs.restic.version}, but the backup runner asserts ${resticMinor}.x (cli/apprafter-backup/Dockerfile RESTIC_MINOR): the CLI and the runner would work one repository with different restic minors."
+          else
+            null;
+
         # CUE is pinned to the SAME version every other place in this repo pins
         # it — the setup-cue inputs in .github/workflows, the CMP sidecar's
         # Dockerfile ARG, and .devcontainer/post-create.sh.
@@ -87,7 +109,7 @@
         };
       in
       {
-        devShells.default = pkgs.mkShell {
+        devShells.default = pkgs.lib.warnIf (resticWarning != null) resticWarning (pkgs.mkShell {
           name = "apprafter";
 
           packages = with pkgs; [
@@ -143,6 +165,11 @@
             jq
             git
 
+            # Backups: `apprafter backup create/list/show/check/prune`,
+            # `restore` and `export` run restic locally. Held to the runner's
+            # minor by `resticWarning` above.
+            restic
+
             # Documentation site. ONE python env — `nix shell
             # nixpkgs#python3Packages.mkdocs-material` ships no `mkdocs`
             # binary, and adding `python3Packages.mkdocs` alongside it
@@ -185,7 +212,7 @@
             echo "  just e2e-up      # local k3d cluster"
             echo
           '';
-        };
+        });
 
         # Exposed so `scripts/cue` can reach the pinned binary WITHOUT
         # `nix develop`, whose shellHook prints a banner onto stdout and would

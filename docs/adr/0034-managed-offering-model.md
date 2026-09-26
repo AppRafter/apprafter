@@ -6,7 +6,7 @@ Accepted (2026-05-29).
 
 ## Context
 
-AppRafter ships as an open-source platform that a customer can run end-to-end on their own infrastructure. On top of that platform we are building a managed offering. Two questions had accumulated enough decisions across design discussions to warrant cementing:
+AppRafter ships as a source-available platform that a customer can run end-to-end on their own infrastructure. On top of that platform we are building a managed offering. Two questions had accumulated enough decisions across design discussions to warrant cementing:
 
 1. **What, architecturally, does "managed" mean for AppRafter?** A managed cloud typically operates the customer's control plane on the provider's account, which couples the customer's continuity to the provider. AppRafter's positioning is the opposite: the platform must remain fully functional and autonomous on the customer's own infrastructure, and the managed layer must be a removable convenience rather than a structural dependency.
 
@@ -16,7 +16,7 @@ AppRafter ships as an open-source platform that a customer can run end-to-end on
 
 These two axes are independent: a customer on any hardware tier can choose any managed plan their hardware supports, and the security switches from ADR 0033 (`strictMode`, `confidential`) are independent of both.
 
-The launch shape is fixed by the managed launch speedrun (`speedrun-plan.md` §0.5): the first and only managed plan at launch is the lightest one, in which AppRafter hosts the management/UX surface and the customer's cluster stays entirely on the customer's own infrastructure. Hardware T1 and T2 are both in the open-source core at launch; the heavier managed plans are post-launch.
+The launch shape is fixed by the managed launch speedrun (`speedrun-plan.md` §0.5): the first and only managed plan at launch is the lightest one, in which AppRafter hosts the management/UX surface and the customer's cluster stays entirely on the customer's own infrastructure. Hardware T1 and T2 are both in the source-available core at launch; the heavier managed plans are post-launch.
 
 This ADR cements the managed offering model and fixes the canonical terminology. It does not introduce new schema; it names and reconciles decisions already in flight.
 
@@ -30,7 +30,7 @@ The managed offering separates a **hosted management/UX layer** from a **custome
 
 - **The customer owns and runs the cluster**: the Kubernetes control plane, the AppRafter operator and CRDs, control-plane storage, all workloads, and all data live on the customer's own infrastructure and remain fully autonomous.
 
-The cluster is a standard open-source AppRafter install. The hosted layer is a management convenience layered on top, never a runtime dependency of the cluster. Cancelling the managed subscription means revoking the cluster's registration: the hosted services disconnect and the open-source cluster keeps running unchanged, serving traffic without interruption. Unlike a hyperscaler managed-Kubernetes offering, where the control plane is operated by the provider, the AppRafter customer cluster stays autonomous and survives the end of the relationship without migration.
+The cluster is a standard source-available AppRafter install. The hosted layer is a management convenience layered on top, never a runtime dependency of the cluster. Cancelling the managed subscription means revoking the cluster's registration: the hosted services disconnect and the self-hosted cluster keeps running unchanged, serving traffic without interruption. Unlike a hyperscaler managed-Kubernetes offering, where the control plane is operated by the provider, the AppRafter customer cluster stays autonomous and survives the end of the relationship without migration.
 
 ### Connection model: outbound agent, no credentials held
 
@@ -74,15 +74,15 @@ Under all three plans, the customer's cluster, applications, manifests, and data
 
 ### Launch scope
 
-**Hosted Services is the launch managed plan.** Hardware tiers T1 and T2 are both in the open-source core at launch (`speedrun-plan.md` §0.5), so a customer can register a single-node (T1) or HA (T2) cluster and attach Hosted Services to it. **Managed Operations** and **Turnkey Cloud** are post-launch and activate on validated customer demand. The **Enterprise** plan is reserved (TBD) and is not part of the launch surface.
+**Hosted Services is the launch managed plan.** Hardware tiers T1 and T2 are both in the source-available core at launch (`speedrun-plan.md` §0.5), so a customer can register a single-node (T1) or HA (T2) cluster and attach Hosted Services to it. **Managed Operations** and **Turnkey Cloud** are post-launch and activate on validated customer demand. The **Enterprise** plan is reserved (TBD) and is not part of the launch surface.
 
 ### Reconciliation with ADR 0033 deployment modes
 
-ADR 0033 references two cluster deployment modes, **Turnkey** and **Managed Ops**, alongside a **Sovereign** (open-source / customer-managed) pattern, used there to reason about where the KMS and attestation verifier belong. Those modes map onto the managed plans of this ADR as follows:
+ADR 0033 references two cluster deployment modes, **Turnkey** and **Managed Ops**, alongside a **Sovereign** (self-hosted / customer-managed) pattern, used there to reason about where the KMS and attestation verifier belong. Those modes map onto the managed plans of this ADR as follows:
 
 | ADR 0033 deployment mode | Managed plan (this ADR) | Who has host-level access to the nodes |
 |---|---|---|
-| Sovereign | open-source self-host, or **Hosted Services** | the customer (AppRafter has none) |
+| Sovereign | source-available self-host, or **Hosted Services** | the customer (AppRafter has none) |
 | Managed Ops | **Managed Operations** | the customer's operators |
 | Turnkey | **Turnkey Cloud** | AppRafter |
 
@@ -90,14 +90,14 @@ Hosted Services sits on the Sovereign side of ADR 0033's host-access reasoning: 
 
 The two security switches defined in ADR 0033 — `strictMode` and `confidential` — are **orthogonal to both the hardware tier and the managed plan**. A customer selects them on the Tenant CRD independently; they do not define, and are not implied by, any tier or plan. The host-access reasoning in ADR 0033 (where to place KMS/verifier) keys off the deployment mode, which is what the managed plan determines, but the switches themselves remain a separate axis.
 
-### Open-core split principle
+### Core/managed split principle
 
-**The platform is fully functional as open source; the managed plans add premium quality-of-life and operations, never a structural dependency — a customer can always leave with the entire cluster intact.** Everything a cluster needs in order to *run* is in the open-source core; the managed plans add conveniences that *improve* operation without *blocking* it, plus capabilities that only exist in a cross-cluster or hosted context. The anti-vendor-lock guarantee is structural, not a promise: because the cluster is a standard open-source install, ending the managed relationship is a registration revocation, not a migration.
+**The platform is fully functional as source-available software; the managed plans add premium quality-of-life and operations, never a structural dependency — a customer can always leave with the entire cluster intact.** Everything a cluster needs in order to *run* is in the source-available core; the managed plans add conveniences that *improve* operation without *blocking* it, plus capabilities that only exist in a cross-cluster or hosted context. The anti-vendor-lock guarantee is structural, not a promise: because the cluster is a standard source-available install, ending the managed relationship is a registration revocation, not a migration.
 
 ## Consequences
 
 - **Easier to position and reason about.** "Hardware tier" and "managed plan" are unambiguous; specs, schema, UI, and onboarding can use them without re-explaining which axis is meant. ADR 0033's deployment modes now have an explicit mapping to the customer-facing plan names.
-- **Strong, structural anti-lock story.** Cancellation cannot strand a customer: the open-source cluster keeps running. This is a property of the architecture, available from launch, and it holds across all three managed plans (with Turnkey Cloud additionally requiring an infrastructure move, since AppRafter owns the account there).
+- **Strong, structural anti-lock story.** Cancellation cannot strand a customer: the cluster, a standard source-available install, keeps running. This is a property of the architecture, available from launch, and it holds across all three managed plans (with Turnkey Cloud additionally requiring an infrastructure move, since AppRafter owns the account there).
 - **Minimal data and credential surface.** Holding no customer credentials and receiving only metadata reduces AppRafter's compliance scope and removes a class of credential-theft blast radius. ADR 0035 formalises this.
 - **Clear launch boundary.** Hosted Services on hardware T1/T2 is a complete launchable product; the heavier plans are explicitly deferred with demand triggers rather than half-built.
 - **Higher first-contact onboarding load.** A customer must understand two axes and complete a multi-step onboarding (provision their own cluster, then register it). This is the cost of keeping the cluster customer-owned; it is mitigated by CLI orchestration and an Account UI walkthrough (`speedrun-plan.md` §7.6).
@@ -132,7 +132,7 @@ Rejected. The collision was the source of repeated confusion across documents an
 
 ## Owner
 
-Core platform team. Andrey Ryahovskiy (`remryahirev@gmail.com`) convenes reviews and approves amendments. The managed plans land in the managed-services track; the agent and open-source cluster remain in the open-source core.
+Core platform team. Andrey Ryahovskiy (`remryahirev@gmail.com`) convenes reviews and approves amendments. The managed plans land in the managed-services track; the agent and self-hosted cluster remain in the source-available core.
 
 ## Re-evaluation
 
@@ -140,12 +140,12 @@ Re-evaluate when:
 
 - The second managed plan (Managed Operations) is scheduled to ship — confirm the responsibility split and the ADR 0033 mode mapping against implementation reality.
 - Turnkey Cloud planning opens — the infrastructure-provider relationship introduces obligations (provider-account abuse handling, VAT, DPA chain) that this ADR records only at the structural level.
-- The Enterprise plan is defined — fill in the TBD row and reconcile with any contract-driven deviations from the open-core split.
-- A measurable signal contradicts the open-core split — for example, demand for a capability that the principle would place in the open-source core but that proves to require hosted-only infrastructure to deliver.
+- The Enterprise plan is defined — fill in the TBD row and reconcile with any contract-driven deviations from the core/managed split.
+- A measurable signal contradicts the core/managed split — for example, demand for a capability that the principle would place in the source-available core but that proves to require hosted-only infrastructure to deliver.
 
 ## References
 
-- `speedrun-plan.md` §0.5 (Hosted Services as the launch managed plan; T1/T2 in the open-source core at launch), §3.1–3.2 (hosted scaffolding and `apprafter-agent` registration), §3.2a (offboarding = revoke registration), §7.6 (onboarding journey and mitigations).
+- `speedrun-plan.md` §0.5 (Hosted Services as the launch managed plan; T1/T2 in the source-available core at launch), §3.1–3.2 (hosted scaffolding and `apprafter-agent` registration), §3.2a (offboarding = revoke registration), §7.6 (onboarding journey and mitigations).
 - ADR 0022 — hardware tier model (T1/T2/T3/T4 substrate; features orthogonal to tier).
 - ADR 0023 — Kamaji multi-tenancy and Plane A/B separation (hard multi-tenancy is an orthogonal, opt-in layer, not a plan).
 - ADR 0030 — CLI target store and credential resolution chain (`auth` stub reserved for the managed Account; per-target credentials never leave the operator's machine).

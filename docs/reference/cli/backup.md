@@ -26,7 +26,7 @@ Subcommands:
 - [`apprafter backup run`](#apprafter-backup-run) — Run the cluster's scheduled backup NOW, without waiting for its next window.
 - [`apprafter backup set`](#apprafter-backup-set) — Change ONE field of a configured backup, leaving the rest alone.
 - [`apprafter backup show`](#apprafter-backup-show) — Show what a snapshot contains: cluster, platform version, size, namespaces, and a count of the resources it captured broken down by kind (and, for claims, by backend).
-- [`apprafter backup status`](#apprafter-backup-status) — Show the current backup configuration, last Job outcomes, runner status, and last prune time (reads PlatformStack.spec.backup + Jobs + the apprafter-backup-status ConfigMap)
+- [`apprafter backup status`](#apprafter-backup-status) — Show the backup configuration, the last Jobs, the runner's record and the repository, and, when backups fail or retention is not enforced, the operator's verdict with what to run next (reads PlatformStack spec.backup and its conditions, the Jobs, and the apprafter-backup-status ConfigMap).
 - [`apprafter backup unlock`](#apprafter-backup-unlock) — Remove STALE locks from an S3-backed restic repository (`restic unlock`; live locks are never touched).
 
 ## `apprafter backup check`
@@ -268,7 +268,7 @@ apprafter backup show <snapshot-id>
 
 ## `apprafter backup status`
 
-Show the current backup configuration, last Job outcomes, runner status, and last prune time (reads PlatformStack.spec.backup + Jobs + the apprafter-backup-status ConfigMap)
+Show the backup configuration, the last Jobs, the runner's record and the repository, and, when backups fail or retention is not enforced, the operator's verdict with what to run next (reads PlatformStack spec.backup and its conditions, the Jobs, and the apprafter-backup-status ConfigMap). `apprafter status` only says whether backups work; the detail is here
 
 ```text
 Usage: apprafter backup status

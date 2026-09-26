@@ -21,8 +21,9 @@ nix develop
 
 You get Rust + Bun + CUE + kubectl + k9s + helm + argocd + talosctl
 + k3d + cosign + syft + trivy + grype + just + lefthook + age + sops
-+ jq + git, all from the same `nixpkgs` revision recorded in
-`flake.lock`.
++ jq + git + restic, all from the same `nixpkgs` revision recorded in
+`flake.lock`. restic is on the minor the in-cluster backup runner uses,
+and the shell warns when a `flake.lock` update would move it off.
 
 ## Path B — VS Code Dev Container
 
@@ -46,6 +47,7 @@ from upstream:
 | lefthook   | <https://lefthook.dev/>                               |
 | cosign     | <https://docs.sigstore.dev/cosign/installation/>      |
 | age, sops  | distro packages                                       |
+| restic 0.18 | <https://restic.readthedocs.io/en/stable/020_installation.html> (the CLI's backup verbs) |
 | (optional) | k9s, argocd CLI, talosctl, syft, trivy, grype         |
 
 Then:

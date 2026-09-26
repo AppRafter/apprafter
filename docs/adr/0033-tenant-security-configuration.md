@@ -41,7 +41,7 @@ Tenant security configuration declares two orthogonal switches and a universal c
 
 **Cost profile:** near-zero marginal cost. Admission policies and vault-injector are already in the platform stack; this switch toggles enforcement. No additional compute, no per-tenant infrastructure.
 
-**Default:** ON in Turnkey Cloud; opt-in in OSS deployments. Tenant CRD declares `defaults.strictMode.enabled: true | false` and `defaults.strictMode.allowOptOut: true | false` to control per-Application override permissions.
+**Default:** ON in Turnkey Cloud; opt-in in self-hosted deployments. Tenant CRD declares `defaults.strictMode.enabled: true | false` and `defaults.strictMode.allowOptOut: true | false` to control per-Application override permissions.
 
 **Pricing:** included in base tier with high probability. Final decision deferred pending operational cost validation but the architectural assumption is "free at base".
 
@@ -124,11 +124,11 @@ The patterns reference two cluster deployment modes (reconciled with the managed
 
 | Pattern name | strictMode | confidential | Deployment mode | KMS / verifier placement | Setup workflow |
 |---|---|---|---|---|---|
-| **Strict Isolation** | on | off | any | n/a | AppRafter pre-configures (Turnkey/Managed Ops); OSS user toggles in Tenant CRD |
+| **Strict Isolation** | on | off | any | n/a | AppRafter pre-configures (Turnkey/Managed Ops); self-hosted user toggles in Tenant CRD |
 | **Turnkey — Confidential** | on | on | Turnkey | KMS and verifier anywhere except AppRafter (AWS KMS + Intel Trust Authority is the v1 default; customer-self-hosted is also valid) | AppRafter sets up URLs and federation credentials |
 | **Managed Ops — Confidential** | on | on | Managed Ops with broad customer infra access | KMS and verifier anywhere outside the customer's Hetzner — AppRafter-hosted on AppRafter's own infra is the natural choice; third-party (AWS KMS in a separately-owned customer account, Intel Trust Authority) also valid | AppRafter deploys KMS/verifier on its own dogfooded infrastructure using the same tooling shipped for Sovereign pattern |
-| **Sovereign** | on | on | OSS / customer-managed cluster | Customer-deployed OpenBao + customer-deployed Trustee on customer-owned infrastructure | AppRafter ships `platform-cli sovereign-stack deploy`; customer runs it on their own infra |
-| **OSS — flexible** | any | any | OSS | Customer-chosen, any combination | Customer configures Tenant CRD directly; architecturally identical to any pattern above |
+| **Sovereign** | on | on | Self-hosted / customer-managed cluster | Customer-deployed OpenBao + customer-deployed Trustee on customer-owned infrastructure | AppRafter ships `platform-cli sovereign-stack deploy`; customer runs it on their own infra |
+| **Self-hosted — flexible** | any | any | Self-hosted | Customer-chosen, any combination | Customer configures Tenant CRD directly; architecturally identical to any pattern above |
 
 The cluster does not distinguish patterns at runtime — they differ only in deployment mode and in *who deployed and operates the URLs*. From the runtime's perspective, all confidential patterns are "`confidential: enabled` + here are the endpoints".
 
@@ -139,13 +139,13 @@ The shortcut for choosing a pattern is to identify who has host-level access to 
 - **Turnkey** → AppRafter has host access. KMS goes outside AppRafter.
 - **Managed Ops, narrow customer access** (CTO holds Hetzner creds, devops have only kubectl through the TCP) → effectively Turnkey-shaped: customer holds host access for compliance reasons, but the practical threat to workloads is still tenant-internal. Strict Isolation typically covers this; the customer has built a Turnkey-equivalent for themselves at the access-carving level.
 - **Managed Ops, broad customer access** (devops have Hetzner-level access to the underlying infrastructure, common in small teams or organisations running AWS-refugee-style "give devops everything" patterns) → customer's own devops are the host-access threat. KMS belongs outside customer's infrastructure. AppRafter-hosted KMS is the natural choice since AppRafter has the dogfooded infrastructure and (by Managed Ops definition) does not have host access to customer nodes. Particularly relevant for credential-compromise scenarios where the worry is not malicious devops but stolen tokens or attacker-obtained admin access.
-- **OSS / Sovereign** → customer controls everything. Customer decides their own host-access topology and places KMS/verifier accordingly.
+- **Self-hosted / Sovereign** → customer controls everything. Customer decides their own host-access topology and places KMS/verifier accordingly.
 
 The principle: **KMS and verifier endpoints belong with parties who do not hold host-level credentials to the cluster's nodes.** The architecture supports placement anywhere; deployment mode determines what "anywhere" rules out.
 
 ### Consequences of this decomposition
 
-- **OSS users can achieve full confidential guarantees** by configuring Tenant CRD against any KMS/verifier they choose. No Turnkey-only confidential feature exists.
+- **Self-hosted users can achieve full confidential guarantees** by configuring Tenant CRD against any KMS/verifier they choose. No Turnkey-only confidential feature exists.
 - **Pattern migration** is configuration, not migration. Customer changes URLs in Tenant CRD; existing Applications re-attest on next reschedule.
 - **New KMS or verifier vendors** integrate as additional `type:` discriminators with corresponding protocol adapters. They do not create new patterns.
 - **Managed Ops — Confidential is architecturally a Sovereign deployment** operated by AppRafter on AppRafter-owned dogfooded infrastructure, not a separate component stack. Same tooling, different operator.
@@ -224,7 +224,7 @@ Enforcement happens in a per-Tenant admission webhook checking the subject's rol
 
 S3-compatible bucket is the first supported sink for audit export.
 
-- NATS JetStream → S3 bridge runs in the cluster (operated by AppRafter for Turnkey deployments, by customer for OSS).
+- NATS JetStream → S3 bridge runs in the cluster (operated by AppRafter for Turnkey deployments, by customer for self-hosted ones).
 - Bucket and credentials declared in Tenant CRD `security.audit.sink`.
 - Exported events: Application CR mutations, AccessGrant operations, OpenBao secret accesses, attestation events, kata-agent policy violations, role-scoped admission denials.
 - Available at any combination of switch values. Customer with neither switch on can still configure audit export.
@@ -272,7 +272,7 @@ In Turnkey, AppRafter holds host access → KMS belongs outside AppRafter. In Ma
 
 The principle is **"KMS and verifier endpoints belong with parties who do not hold host-level credentials to the cluster's nodes."** Applied per deployment mode, this generates appropriate placement guidance without requiring a new pattern per scenario.
 
-The earlier "third-party only" framing was a special case of this principle for Turnkey, not a universal rule. AppRafter-hosted KMS is wrong in Turnkey (AppRafter is the adversary), correct in Managed Ops Case B (AppRafter is not the adversary), and unavailable in OSS (AppRafter has no infra in the picture).
+The earlier "third-party only" framing was a special case of this principle for Turnkey, not a universal rule. AppRafter-hosted KMS is wrong in Turnkey (AppRafter is the adversary), correct in Managed Ops Case B (AppRafter is not the adversary), and unavailable in self-hosted deployments (AppRafter has no infra in the picture).
 
 ### Why credential-compromise is part of the threat model
 
@@ -290,7 +290,7 @@ Audit export is a reporting feature, not a security boundary. The infrastructure
 
 **Positive:**
 - Schema reflects actual architectural decisions, not operational packaging.
-- OSS users can achieve any deployment pattern; no Turnkey-only confidential features.
+- Self-hosted users can achieve any deployment pattern; no Turnkey-only confidential features.
 - Pattern migration is configuration, not architectural change.
 - Pricing aligns with cost: free where marginal cost is zero, paid where hardware and support are real.
 - New KMS/verifier vendors integrate as protocol adapters, not new ADRs.
@@ -306,7 +306,7 @@ Audit export is a reporting feature, not a security boundary. The infrastructure
 
 **Trade-offs:**
 - Engineering complexity vs verifiable security positioning. Confidential pricing funds the engineering.
-- OSS users get full feature parity with Turnkey on the security axis. Intentional — Turnkey's value is operational convenience, not security exclusivity.
+- Self-hosted users get full feature parity with Turnkey on the security axis. Intentional — Turnkey's value is operational convenience, not security exclusivity.
 - AppRafter takes on operational responsibility for KMS+verifier in the Managed Ops — Confidential pattern. This is a meaningful new obligation (uptime, key custody, audit) but aligned with what we already operate for dogfood. Pricing for that pattern must account for it.
 
 ## Risk

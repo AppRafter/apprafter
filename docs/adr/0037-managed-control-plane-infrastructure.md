@@ -6,7 +6,7 @@ Accepted (2026-05-29).
 
 ## Context
 
-ADR 0034 cemented the managed offering model: AppRafter hosts a management/UX layer (the Backstage portal, the Account UI, the hosted MCP endpoint, and the cross-cluster aggregator) while each customer's cluster stays a fully autonomous open-source install on the customer's own infrastructure. That ADR fixed *what* the hosted layer is and *how* it connects to customer clusters (the outbound `apprafter-agent`, ADR 0031). It deliberately left open *where and how the hosted layer itself runs* — which substrate, which domain, how it is backed up, and how it is recovered if it fails.
+ADR 0034 cemented the managed offering model: AppRafter hosts a management/UX layer (the Backstage portal, the Account UI, the hosted MCP endpoint, and the cross-cluster aggregator) while each customer's cluster stays a fully autonomous source-available install on the customer's own infrastructure. That ADR fixed *what* the hosted layer is and *how* it connects to customer clusters (the outbound `apprafter-agent`, ADR 0031). It deliberately left open *where and how the hosted layer itself runs* — which substrate, which domain, how it is backed up, and how it is recovered if it fails.
 
 That gap matters because the hosted layer is a control surface for paying customers. Its properties have direct consequences:
 
@@ -23,15 +23,15 @@ Three concrete decisions had accumulated enough discussion across the launch pla
 
 The trust boundary established in ADR 0034 carries into this ADR. AppRafter holds **no customer Hetzner credentials and no customer cluster credentials** (ADR 0034; the `auth` slot reserved for the managed Account in ADR 0030 governs the operator's own login, not held customer tokens). This narrows but does not eliminate the security obligation on the hosted layer: it still holds customer **metadata** — account records, cluster registrations, billing data, audit events, and the registration tokens that authenticate agents — so host security of the managed control plane remains a first-class concern.
 
-This ADR cements the hosting, domain, backup/DR, and recovery decisions for the managed control plane itself. It does not change the connection model, the open-core split, or the terminology, all of which are fixed in ADR 0034 and reused verbatim here.
+This ADR cements the hosting, domain, backup/DR, and recovery decisions for the managed control plane itself. It does not change the connection model, the core/managed split, or the terminology, all of which are fixed in ADR 0034 and reused verbatim here.
 
 ## Decision
 
 ### Hosting: dogfooded on AppRafter's own hardware-tier-2 substrate
 
-The managed control plane — the Account UI backend, the hosted Backstage portal, the hosted MCP endpoint, and the agent bus that terminates the `apprafter-agent` connections — runs **on the AppRafter Platform, on AppRafter's own Hetzner hardware tier-2 substrate**. The hosted layer is operated as standard AppRafter `Application` workloads on a cluster that AppRafter provisions and owns through the same open-source platform shipped to customers. The public statement of this is "AppRafter Cloud runs on AppRafter Platform".
+The managed control plane — the Account UI backend, the hosted Backstage portal, the hosted MCP endpoint, and the agent bus that terminates the `apprafter-agent` connections — runs **on the AppRafter Platform, on AppRafter's own Hetzner hardware tier-2 substrate**. The hosted layer is operated as standard AppRafter `Application` workloads on a cluster that AppRafter provisions and owns through the same source-available platform shipped to customers. The public statement of this is "AppRafter Cloud runs on AppRafter Platform".
 
-Hardware tier-2 (T2 — Team, per ADR 0022 / ADR 0034) is the substrate because it is the HA-capable open-source-core substrate at launch (`speedrun-plan.md` §0.5): a multi-node cluster rather than a single node, so the hosted layer does not have a single-VDS failure domain. The choice is the **hardware tier** axis only; it does not imply or require any particular managed plan, and the `strictMode` / `confidential` security switches (ADR 0033) remain orthogonal and are selected independently on the Tenant CRD if used.
+Hardware tier-2 (T2 — Team, per ADR 0022 / ADR 0034) is the substrate because it is the HA-capable substrate in the source-available core at launch (`speedrun-plan.md` §0.5): a multi-node cluster rather than a single node, so the hosted layer does not have a single-VDS failure domain. The choice is the **hardware tier** axis only; it does not imply or require any particular managed plan, and the `strictMode` / `confidential` security switches (ADR 0033) remain orthogonal and are selected independently on the Tenant CRD if used.
 
 This is dogfooding in the precise sense of ADR 0033's wording: AppRafter Cloud is an AppRafter deployment that AppRafter operates on its own infrastructure, using the same tooling shipped to customers. It is not a separate component stack.
 
@@ -47,7 +47,7 @@ Because AppRafter holds no customer infrastructure credentials, the KMS/verifier
 
 ### Backup and DR for the control plane itself: external-S3 backups
 
-The managed control plane's own state is backed up using the **external-S3 backup mechanism** — the same mechanism the open-source platform ships for customer clusters (`plan.md` item 4.12). Because the hosted layer is dogfooded, its backups are not a bespoke pipeline: AppRafter Cloud is backed up the way any AppRafter cluster is, to an external S3-compatible target outside the hosted cluster's own failure domain. This keeps the recovery path for AppRafter Cloud built from the same primitives customers use and tested by the same code path.
+The managed control plane's own state is backed up using the **external-S3 backup mechanism** — the same mechanism the source-available platform ships for customer clusters (`plan.md` item 4.12). Because the hosted layer is dogfooded, its backups are not a bespoke pipeline: AppRafter Cloud is backed up the way any AppRafter cluster is, to an external S3-compatible target outside the hosted cluster's own failure domain. This keeps the recovery path for AppRafter Cloud built from the same primitives customers use and tested by the same code path.
 
 ### Out-of-band rescue cluster for platform-wide outages
 
@@ -93,7 +93,7 @@ Rejected for launch. Running AppRafter Cloud on a third-party managed cloud woul
 
 ### Single-node (hardware tier-1) substrate for the hosted layer
 
-Rejected. The hosted layer is a control surface for paying customers; a single-VDS failure domain is an inappropriate availability posture for it. Hardware tier-2 is the HA-capable open-source-core substrate at launch and is the minimum reasonable substrate for AppRafter Cloud.
+Rejected. The hosted layer is a control surface for paying customers; a single-VDS failure domain is an inappropriate availability posture for it. Hardware tier-2 is the HA-capable substrate in the source-available core at launch and is the minimum reasonable substrate for AppRafter Cloud.
 
 ### Bespoke backup/DR pipeline for the control plane
 
@@ -117,7 +117,7 @@ Rejected. The asymmetric cost of a destructive control-plane regression — born
 
 ## Owner
 
-Core platform team. Andrey Ryahovskiy (`remryahirev@gmail.com`) convenes reviews and approves amendments. The managed control plane and the rescue-cluster runbook land in the managed-services track; the platform that hosts the dogfood, the external-S3 backup mechanism, and the `apprafter-agent` remain in the open-source core.
+Core platform team. Andrey Ryahovskiy (`remryahirev@gmail.com`) convenes reviews and approves amendments. The managed control plane and the rescue-cluster runbook land in the managed-services track; the platform that hosts the dogfood, the external-S3 backup mechanism, and the `apprafter-agent` remain in the source-available core.
 
 ## Re-evaluation
 
@@ -130,7 +130,7 @@ Re-evaluate when:
 
 ## References
 
-- `speedrun-plan.md` §5.5 (managed control plane infrastructure decisions — dogfooding host, domain, backup/DR, rescue cluster), §0.5 (Hosted Services as the launch managed plan; hardware T1/T2 in the open-source core at launch), §3.4 (hosted MCP endpoint), §3.6 (customer application subdomain delegation, distinct from the managed domain), §7.6 (onboarding journey). This ADR is self-contained; the cited sections record durable context, not a dependency on temporary strategy documents.
+- `speedrun-plan.md` §5.5 (managed control plane infrastructure decisions — dogfooding host, domain, backup/DR, rescue cluster), §0.5 (Hosted Services as the launch managed plan; hardware T1/T2 in the source-available core at launch), §3.4 (hosted MCP endpoint), §3.6 (customer application subdomain delegation, distinct from the managed domain), §7.6 (onboarding journey). This ADR is self-contained; the cited sections record durable context, not a dependency on temporary strategy documents.
 - `plan.md` item 4.12 (external-S3 backup mechanism reused for the control plane's own backups).
 - ADR 0022 — hardware tier model (T1–T4 substrate; features orthogonal to tier).
 - ADR 0030 — CLI target store and credential resolution chain (the `auth` slot reserved for the managed Account governs the operator's own login; per-target credentials never leave the operator's machine).

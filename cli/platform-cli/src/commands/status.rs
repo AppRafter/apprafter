@@ -50,7 +50,7 @@ use crate::commands::k8s_helpers::{
 };
 use crate::commands::migration::pending_plan_rows;
 use crate::commands::platform::{
-    backup_health_lines, render_conditions_table, unhealthy_condition_rows, version_summary_line,
+    backup_summary_lines, render_conditions_table, unhealthy_condition_rows, version_summary_line,
     PLATFORMSTACK_NAME, PLATFORMSTACK_NAMESPACE,
 };
 use crate::commands::state_paths::resolve_state_paths;
@@ -128,12 +128,14 @@ pub fn run() -> Result<()> {
     }
     let now = chrono::Utc::now();
 
-    // Backups get their own section, off the same PlatformStack read: a
-    // backup that cannot run is the failure nobody notices until the day
-    // they need the backup, so it is never folded into the condition table.
+    // Backups get their own line, off the same PlatformStack read: a backup
+    // that cannot run is the failure nobody notices until the day they need
+    // the backup, so it is never folded into the condition table. One line
+    // when all is well; the detail is `apprafter backup status` (WI-394).
     if let Ok(Some(json)) = &stack {
         println!();
-        for line in backup_health_lines(json, now) {
+        let last_success = || runner_last_success(json, kc.path());
+        for line in backup_summary_lines(json, last_success, now) {
             println!("{line}");
         }
     }
@@ -253,6 +255,32 @@ pub(crate) fn pending_plan_lines(plans: std::result::Result<&[Value], &CliError>
     );
     lines.push("  run `apprafter migration approve <name>` to let one through".to_string());
     lines
+}
+
+/// The runner's record of its last successful backup (`lastSuccess` in the
+/// `apprafter-backup-status` ConfigMap), for "last backup 3 hours ago".
+///
+/// Read only for the "working" line, and best-effort: the age is a courtesy
+/// on a line that stands without it, so a failed read leaves it out rather
+/// than failing `apprafter status`.
+fn runner_last_success(stack: &Value, kubeconfig: &std::path::Path) -> Option<String> {
+    stack
+        .pointer("/spec/backup/enabled")
+        .and_then(Value::as_bool)
+        .filter(|on| *on)?;
+    let cm = kubectl_get_json(
+        "configmap",
+        Some("apprafter-backup-status"),
+        Some(PLATFORMSTACK_NAMESPACE),
+        kubeconfig,
+    )
+    .ok()
+    .flatten()?;
+    cm.pointer("/data/lastSuccess")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
 }
 
 #[cfg(test)]
