@@ -534,6 +534,182 @@ detect_host_gateway_ip() {
 }
 
 # ---------------------------------------------------------------
+# ECR Public images and the month-end quota
+#
+# cluster-bootstrap installs Argo CD from the upstream argo-cd chart, whose
+# Redis image is public.ecr.aws/docker/library/redis:<tag>. ECR Public serves
+# anonymous pulls 500 GB a month, "limited by source IP". GitHub-hosted runners
+# share egress IPs with other tenants, and in the last days of a month some of
+# those IPs have spent the quota: every anonymous GET then answers 429
+# "toomanyrequests: Data limit exceeded", argocd-redis never starts and helm's
+# --wait times out. That failed one walk on 2026-08-31 and three on 2026-09-30,
+# and none on the 1st of any month. bootstrap_with_retry's retry cannot help:
+# it runs on the same IP, and the quota lasts until the month changes.
+#
+# So the walks put the SAME image into each node's containerd before
+# bootstrap, under its ECR name, from a registry without that quota:
+# mirror.gcr.io (Google's cache of Docker Hub), then Docker Hub itself. Both
+# serve the Docker Official Images that ECR Public's docker/library mirrors;
+# the index digest of redis:7.4.1-alpine is identical on all three. The chart
+# sets imagePullPolicy IfNotPresent, so the kubelet uses that copy and never
+# asks ECR. Chart, values and image reference stay the product's own; only
+# where the bytes come from changes. e2e/mvp.sh (the real-Hetzner nightly)
+# does not seed, so the genuine anonymous ECR pull keeps its test.
+#
+# Both value sets that install the chart are covered: the loader's, which
+# cluster-bootstrap installs, and the platform-stack component's, which Argo
+# CD re-syncs itself to afterwards. One window stays open by design: on a PR
+# that bumps the argo-cd chart, Argo CD re-syncs to the PUBLISHED platform-stack
+# chart, which still pins the old version until the bump is released, so that
+# version's Redis is pulled from ECR there.
+#
+# A containerd registry mirror (hosts.toml) cannot do this: containerd appends
+# the repository path to the mirror host, and mirror.gcr.io has no
+# docker/library/ path (404). The seed is best effort, so a regression in it
+# is quiet in a walk; scripts/check-ecr-seed.sh is where it fails: it runs
+# these functions, asks the seed sources and ECR itself, and checks the pull
+# policy.
+# ---------------------------------------------------------------
+
+# argocd_charts_rendered
+#   Render the Argo CD chart with each value set that installs it, and print
+#   both renders: the loader's (`_loaderValues.argocd`, the export
+#   cli/cli-providers/build.rs compiles into the CLI) and the platform-stack
+#   component's (`_components.argocd`). Needs helm, the pinned cue and the
+#   network (the chart repository). Returns non-zero when either fails.
+argocd_charts_rendered() {
+    local cue_dir="${REPO_ROOT}/platform-stack/cue" cue="${REPO_ROOT}/scripts/cue"
+    local repo chart pair values_expr version_expr values version
+    repo="$(cd "$cue_dir" && "$cue" export -e '_components.argocd.source.repoURL' --out text ./...)" || return 1
+    chart="$(cd "$cue_dir" && "$cue" export -e '_components.argocd.source.chart' --out text ./...)" || return 1
+    for pair in _loaderValues.argocd.values:_loaderValues.argocd.chartVersion \
+        _components.argocd.values:_components.argocd.version; do
+        values_expr="${pair%%:*}"
+        version_expr="${pair#*:}"
+        values="$(cd "$cue_dir" && "$cue" export -e "$values_expr" --out yaml ./...)" || return 1
+        version="$(cd "$cue_dir" && "$cue" export -e "$version_expr" --out text ./...)" || return 1
+        printf '%s\n' "$values" \
+            | helm template argocd "$chart" --repo "$repo" --version "$version" --namespace argocd -f - \
+            || return 1
+        printf -- '---\n'
+    done
+}
+
+# ecr_public_images_in
+#   Read rendered manifests on stdin and print, one per line, every ECR Public
+#   image (public.ecr.aws or ecr-public.aws.com; argo-helm moved to the latter
+#   after 7.7.7) they name. Returns 1 when the manifests name no image at all:
+#   the Argo CD chart always renders its own, so an empty list means the
+#   extraction broke, and that must not read as "nothing to seed".
+ecr_public_images_in() {
+    local images
+    images="$(sed -nE "s/^[[:space:]]*(-[[:space:]]+)?image:[[:space:]]*[\"']?([^\"'[:space:]]+).*/\\2/p" | sort -u)"
+    [ -n "$images" ] || return 1
+    printf '%s\n' "$images" | { grep -E '^(public\.ecr\.aws|ecr-public\.aws\.com)/' || true; }
+}
+
+# ecr_public_images_rendered
+#   Every ECR Public image the Argo CD chart renders, one per line. Returns
+#   non-zero when the chart cannot be rendered or no image could be read.
+ecr_public_images_rendered() {
+    local rendered
+    rendered="$(argocd_charts_rendered)" || return 1
+    printf '%s\n' "$rendered" | ecr_public_images_in
+}
+
+# ecr_public_seed_sources <image>
+#   The registries holding the same content as an ECR Public docker/library
+#   image, best first: <ecr-host>/docker/library/<name>:<tag> becomes
+#   mirror.gcr.io/library/<name>:<tag>, then docker.io/library/<name>:<tag>.
+#   Prints nothing and returns 1 for any other ECR Public path, since only
+#   the Docker Official Images have a copy elsewhere, and for a digest-pinned
+#   reference: CRI stores a `name:tag@digest` pull under `name@digest`, which
+#   the `ctr images tag` below would not find.
+ecr_public_seed_sources() {
+    local image="$1" rest
+    case "$image" in
+        *@*) return 1 ;;
+        public.ecr.aws/docker/library/*) rest="${image#public.ecr.aws/docker/library/}" ;;
+        ecr-public.aws.com/docker/library/*) rest="${image#ecr-public.aws.com/docker/library/}" ;;
+        *) return 1 ;;
+    esac
+    printf 'mirror.gcr.io/library/%s\ndocker.io/library/%s\n' "$rest" "$rest"
+}
+
+# _in_cluster_node <node> <command...>
+#   Run a command inside a cluster node's container, with the engine that runs
+#   it. kind and k3d both name the container after the node.
+_in_cluster_node() {
+    local node="$1"
+    shift
+    if [ "$(cluster_runtime)" = "kind" ] && _kind_uses_podman; then
+        podman exec "$node" "$@"
+    else
+        docker exec "$node" "$@"
+    fi
+}
+
+# _seed_warn <message>
+#   A seed WARN on stderr and, under GitHub Actions, also a ::warning::
+#   annotation, so a degraded seed shows on the summary of a walk that
+#   otherwise goes green.
+_seed_warn() {
+    printf '  WARN: %s\n' "$1" >&2
+    if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+        printf '::warning title=ECR Public seed::%s\n' "$1"
+    fi
+}
+
+# seed_ecr_public_images
+#   Put every ECR Public image the Argo CD chart renders into each node's
+#   containerd, under its ECR name, from ecr_public_seed_sources. Best effort
+#   and loud: one line per image and node, and every failure is a WARN that
+#   leaves the node to pull from ECR Public as before. It never fails harder
+#   than not seeding, and it is safe to run again. Requires $KUBECONFIG
+#   exported.
+seed_ecr_public_images() {
+    local images nodes image node source sources seeded inspect digest
+    if ! images="$(ecr_public_images_rendered)"; then
+        _seed_warn "could not render the Argo CD chart or read its images; nodes pull ECR Public images from ECR Public"
+        return 0
+    fi
+    if [ -z "$images" ]; then
+        printf '  the Argo CD chart renders no ECR Public image; nothing to seed\n'
+        return 0
+    fi
+    nodes="$(kubectl get nodes -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)" || nodes=""
+    if [ -z "$nodes" ]; then
+        _seed_warn "no cluster node listed; nodes pull ECR Public images from ECR Public"
+        return 0
+    fi
+    for image in $images; do
+        if ! sources="$(ecr_public_seed_sources "$image")"; then
+            _seed_warn "${image} is digest-pinned or not a docker/library image, so it is not seeded; nodes pull it from ECR Public"
+            continue
+        fi
+        for node in $nodes; do
+            seeded=""
+            for source in $sources; do
+                # The last step asks the CRI, which is what the kubelet asks:
+                # a ctr tag the CRI image service does not see would seed nothing.
+                if _in_cluster_node "$node" crictl pull "$source" >/dev/null \
+                    && _in_cluster_node "$node" ctr -n k8s.io images tag --force "$source" "$image" >/dev/null \
+                    && inspect="$(_in_cluster_node "$node" crictl inspecti -o json "$image")"; then
+                    digest="$(printf '%s' "$inspect" \
+                        | jq -r '[.status.repoDigests[]? | select(contains("@")) | sub("^[^@]*@"; "")] | first // empty' \
+                            2>/dev/null)" || digest=""
+                    printf '  seeded %s on %s from %s (%s)\n' "$image" "$node" "$source" "${digest:-digest unknown}"
+                    seeded=1
+                    break
+                fi
+                printf '  could not seed %s on %s from %s; trying the next source\n' "$image" "$node" "$source" >&2
+            done
+            [ -n "$seeded" ] || _seed_warn "could not seed ${image} on ${node}; it pulls from ECR Public"
+        done
+    done
+}
+
+# ---------------------------------------------------------------
 # bootstrap_with_retry
 #   Runs `apprafter cluster-bootstrap` with APPRAFTER_BOOTSTRAP_SKIP_CILIUM
 #   so it leaves the cluster's default CNI in place (see k3d_up for why). That
@@ -543,6 +719,7 @@ detect_host_gateway_ip() {
 # ---------------------------------------------------------------
 bootstrap_with_retry() {
     export APPRAFTER_BOOTSTRAP_SKIP_CILIUM=1
+    seed_ecr_public_images
     # cluster-bootstrap is idempotent (helm upgrade --install + SSA),
     # so a plain re-run is the safety net — do NOT `helm uninstall`
     # anything (that orphans argocd-server, so the next install fails
@@ -551,6 +728,7 @@ bootstrap_with_retry() {
     apprafter cluster-bootstrap || {
         printf '  cluster-bootstrap failed; retrying once (idempotent)\n' >&2
         sleep 15
+        seed_ecr_public_images
         apprafter cluster-bootstrap
     }
 }
@@ -571,9 +749,11 @@ bootstrap_with_cilium() {
     # Defensive: a prior bootstrap_with_retry in the same shell would have
     # exported the skip flag — unset it so Cilium installs.
     unset APPRAFTER_BOOTSTRAP_SKIP_CILIUM
+    seed_ecr_public_images
     apprafter cluster-bootstrap || {
         printf '  cluster-bootstrap (Cilium-on) failed; retrying once (idempotent)\n' >&2
         sleep 20
+        seed_ecr_public_images
         apprafter cluster-bootstrap
     }
 }

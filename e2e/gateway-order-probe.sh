@@ -163,6 +163,9 @@ printf '  APPRAFTER_CONFIG_DIR=%s\n' "$APPRAFTER_CONFIG_DIR"
 
 BOOTSTRAP_RC=0
 unset APPRAFTER_BOOTSTRAP_SKIP_CILIUM
+# This probe calls cluster-bootstrap directly instead of through
+# bootstrap_with_cilium, so it seeds Argo CD's ECR Public image itself.
+seed_ecr_public_images
 ( cd "${REPO_ROOT}/cli" && cargo run --quiet --bin apprafter -- cluster-bootstrap ) \
     || BOOTSTRAP_RC=$?
 printf '\n  cluster-bootstrap exit code: %s\n' "$BOOTSTRAP_RC"

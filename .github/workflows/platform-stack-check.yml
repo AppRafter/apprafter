@@ -49,6 +49,9 @@ on:
       - 'scripts/check-gateway-render.sh'
       - 'scripts/check-component-enablement.sh'
       - 'scripts/check-component-claim-templates.sh'
+      - 'scripts/check-ecr-seed.sh'
+      # check-ecr-seed.sh runs the walks' seed functions from e2e/lib.sh.
+      - 'e2e/lib.sh'
       - 'scripts/check-backup-render.sh'
       # check-backup-render.sh also reads the runner's source: the default
       # deadline, and the name of every variable the CronJobs render, which
@@ -69,6 +72,8 @@ on:
       - 'scripts/check-gateway-render.sh'
       - 'scripts/check-component-enablement.sh'
       - 'scripts/check-component-claim-templates.sh'
+      - 'scripts/check-ecr-seed.sh'
+      - 'e2e/lib.sh'
       - 'scripts/check-backup-render.sh'
       - 'cli/apprafter-backup/src/**'
       - 'cli/backup-core/src/helper_pod.rs'
@@ -218,6 +223,18 @@ jobs:
         # component's own chart, which no other step here does, so it needs
         # the network.
         run: bash scripts/check-component-claim-templates.sh
+
+      - name: Argo CD's ECR Public images can be seeded (month-end quota)
+        # The kind walks seed every ECR Public image the loader's Argo CD
+        # chart renders from mirror.gcr.io or Docker Hub, because GitHub's
+        # shared runner IPs spend ECR Public's anonymous quota by month end.
+        # That seed only warns when it cannot seed an image, so this is where
+        # a chart or values bump that defeats it fails: an image it cannot
+        # place, a tag no source or ECR itself serves, a pull policy that
+        # bypasses the seeded copy. It renders the chart and sends anonymous
+        # HEADs, so it needs the network, and it reads the render with the yq
+        # installed above.
+        run: bash scripts/check-ecr-seed.sh
 
       - name: Backup CronJob deadline assertions (a stuck run cannot block the schedule)
         # Both backup CronJobs are concurrencyPolicy: Forbid, so one run that
