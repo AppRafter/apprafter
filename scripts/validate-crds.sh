@@ -255,6 +255,51 @@ else
     exit 1
 fi
 
+# WI-400. `status.conditions` is a list-map keyed by `type`, so the
+# `ReconcileStalled` condition has its own field manager beside
+# `platform-controller`'s. crdgen's unit test reads the markers in the
+# committed YAML; this proves the apiserver merges by key. A second manager's
+# apply ADDS its condition instead of replacing the list, and its empty apply
+# removes ONLY its own. With the list atomic, the second apply replaces
+# `Ready`, and nothing in the CRD itself is invalid, so every other gate passes.
+echo "==> regression: PlatformStack status.conditions merge by type across field managers (WI-400)"
+ps_status_apply() { # field-manager conditions-json-array
+    printf '{"apiVersion":"apprafter.io/v1alpha1","kind":"PlatformStack","metadata":{"name":"crd-validate-tz","namespace":"crd-validate"},"status":{"conditions":%s}}' "$2" |
+        kubectl --context "$CTX" apply --server-side --subresource=status \
+            --field-manager="$1" --force-conflicts -f - >/dev/null 2>/tmp/crd-cond-err.txt || {
+        echo "==> REGRESSION: the status apply under field manager $1 was REJECTED" >&2
+        cat /tmp/crd-cond-err.txt >&2
+        exit 1
+    }
+}
+ps_conditions() {
+    kubectl --context "$CTX" -n crd-validate get platformstack crd-validate-tz \
+        -o jsonpath='{range .status.conditions[*]}{.type}={.status} {end}' 2>/dev/null || true
+}
+ps_status_apply platform-controller \
+    '[{"type":"Ready","status":"True","reason":"Healthy","message":"m","lastTransitionTime":"2026-10-02T00:00:00Z"}]'
+ps_status_apply apprafter-reconcile-deadline \
+    '[{"type":"ReconcileStalled","status":"True","reason":"ReconcileTimedOut","message":"m","lastTransitionTime":"2026-10-02T00:00:00Z"}]'
+_conds=$(ps_conditions)
+if [ "$_conds" = "Ready=True ReconcileStalled=True " ]; then
+    echo "    OK: a second field manager's condition sits beside the first"
+else
+    echo "==> REGRESSION: read back '${_conds}', want 'Ready=True ReconcileStalled=True '." >&2
+    echo "    The list is not merged by type, so the stall manager's apply replaced" >&2
+    echo "    platform-controller's conditions (schemas/crdmeta statusSchemaPatches)." >&2
+    exit 1
+fi
+ps_status_apply apprafter-reconcile-deadline '[]'
+_conds=$(ps_conditions)
+if [ "$_conds" = "Ready=True " ]; then
+    echo "    OK: an empty apply removes only that manager's own condition"
+else
+    echo "==> REGRESSION: after the stall manager's empty apply, read back '${_conds}'," >&2
+    echo "    want 'Ready=True '." >&2
+    exit 1
+fi
+rm -f /tmp/crd-cond-err.txt
+
 # 2.28 / ADR 0065 §1. `spec.base.probes` is FULLY STRUCTURAL, so an
 # undeclared key is PRUNED: the apiserver answers 200, stores what it knows
 # and silently drops the rest. For a probe that failure is the expensive kind
