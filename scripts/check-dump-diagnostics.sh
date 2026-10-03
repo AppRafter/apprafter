@@ -260,11 +260,13 @@ check "B: no scratch file is left behind outside the artifact" dir_empty "$WORK/
 
 # ---- F: reconcile-deadline hits come first ------------------------------------
 # deadline_section <console> — the lines between the deadline header and the
-# first per-pod log header.
+# first per-pod log header. Empty when no per-pod header follows it, i.e. when
+# the hits were printed after the tails.
 deadline_section() {
     awk '/^--- reconcile deadline hits \(whole walk\) ---$/ {on = 1; next}
-         /^=== logs apprafter-system\// {on = 0}
-         on' "$1"
+         on && /^=== logs apprafter-system\// {closed = 1; exit}
+         on {buf = buf $0 ORS}
+         END {if (closed) printf "%s", buf}' "$1"
 }
 section_has() { deadline_section "$1" | grep -F -- "$2" >/dev/null; }
 check "F: a deadline hit 2600 lines back is printed before the per-pod logs" \
