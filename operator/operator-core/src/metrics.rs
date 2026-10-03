@@ -5,7 +5,7 @@
 //!   - apprafter_reconcile_total{kind,namespace,result} — every
 //!     reconcile call increments one of {ok, error}.
 //!   - apprafter_reconcile_duration_seconds{kind} — histogram of
-//!     wall-time per reconcile.
+//!     wall-time per reconcile, bucketed by [`RECONCILE_DURATION_BUCKETS`].
 //!   - apprafter_reconcile_errors_total{kind} — error-only counter
 //!     for quick "errors per minute" alerts.
 //!   - apprafter_reconcile_timeouts_total{kind} — reconciles abandoned
@@ -65,6 +65,34 @@
 
 use prometheus::{histogram_opts, opts, CounterVec, Encoder, HistogramVec, Registry, TextEncoder};
 
+/// Upper bounds, in seconds, of `apprafter_reconcile_duration_seconds`
+/// (WI-400).
+///
+/// prometheus' `DEFAULT_BUCKETS` come first, unchanged, so every existing
+/// `le` series keeps its meaning. They stop at 10s. A reconcile cut at its
+/// deadline still observes, because its timer is dropped with the cut future
+/// and a `HistogramTimer` records on drop. On the defaults alone every cut
+/// therefore landed in `+Inf`, beside any pass slower than 10s.
+///
+/// One boundary is added at each reconcile deadline: 60s (SharedVolume), 90s
+/// (SourceCredential), 120s (Application, the ResourceClaim scheduler and
+/// provisioner, SharedDatabase, PlatformStack, the RetainedClaim GC) and 190s
+/// (MigrationPlan). Then 30s, and 300s, just past the client's 295s read
+/// timeout. Six of those controllers time their pass on this histogram today
+/// (Application, the scheduler, the provisioner's claim, SharedVolume and
+/// SharedDatabase controllers, SourceCredential). PlatformStack, the GC and
+/// MigrationPlan record no duration, and their deadlines are boundaries all
+/// the same, so a timer added to them later needs no new bucket.
+///
+/// A cut observes its deadline plus the moment the runtime took to drop it,
+/// so it lands in the bucket above that deadline, and the bucket at the
+/// deadline holds the slow passes that still finished. The exact number of
+/// cuts is `apprafter_reconcile_timeouts_total`.
+pub const RECONCILE_DURATION_BUCKETS: [f64; 17] = [
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 90.0, 120.0, 190.0,
+    300.0,
+];
+
 pub struct Metrics {
     pub registry: Registry,
     pub reconcile_total: CounterVec,
@@ -103,7 +131,8 @@ impl Metrics {
         let reconcile_duration = HistogramVec::new(
             histogram_opts!(
                 "apprafter_reconcile_duration_seconds",
-                "Reconcile call duration by kind"
+                "Reconcile call duration by kind",
+                RECONCILE_DURATION_BUCKETS.to_vec()
             ),
             &["kind"],
         )
@@ -372,5 +401,31 @@ mod tests {
         );
         // Its own family: a timeout is not hidden inside the error counter.
         assert!(!body.contains("apprafter_reconcile_errors_total"), "{body}");
+    }
+
+    /// WI-400: a pass cut at its deadline still observes (its timer is
+    /// dropped with the cut future, and a `HistogramTimer` records on drop),
+    /// so the deadlines must be bucket boundaries, or every cut lands in
+    /// `+Inf` beside any pass slower than 10s. The default buckets come first
+    /// and unchanged, so no existing `le` series changes meaning.
+    #[test]
+    fn reconcile_duration_buckets_keep_the_defaults_and_file_a_cut_pass_above_its_deadline() {
+        assert_eq!(
+            &RECONCILE_DURATION_BUCKETS[..prometheus::DEFAULT_BUCKETS.len()],
+            &prometheus::DEFAULT_BUCKETS[..]
+        );
+        let m = Metrics::new();
+        // A pass cut at 120s observes its deadline plus the moment it took
+        // the runtime to drop it.
+        m.reconcile_duration
+            .with_label_values(&["Application"])
+            .observe(120.004);
+        let body = String::from_utf8(m.encode()).unwrap();
+        for (le, count) in [("10", 0), ("120", 0), ("190", 1), ("+Inf", 1)] {
+            let line = format!(
+                "apprafter_reconcile_duration_seconds_bucket{{kind=\"Application\",le=\"{le}\"}} {count}"
+            );
+            assert!(body.contains(&line), "missing `{line}` in:\n{body}");
+        }
     }
 }
