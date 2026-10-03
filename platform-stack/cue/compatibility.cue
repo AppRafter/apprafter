@@ -1934,6 +1934,21 @@ compatibility: "0.2.74": {
 	]
 }
 
+compatibility: "0.2.81": {
+	change:          "requires-restart"
+	operatorVersion: "v0.2.53"
+	notes: """
+		IN PREPARATION. Operator and admission webhook v0.2.53 give every
+		controller a reconcile deadline, and an interrupted persistent-Redis
+		reattach no longer flushes the data it was recovering. The operator
+		and webhook pods restart on the upgrade. This paragraph is replaced
+		by the full notes before the release is published.
+		"""
+	references: [
+		"docs/adr/0042-needs-redis-dragonfly.md",
+	]
+}
+
 compatibility: "0.2.80": {
 	change:          "requires-restart"
 	operatorVersion: "v0.2.52"
