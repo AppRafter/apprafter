@@ -125,6 +125,12 @@ pub enum ReconcileError {
     /// `ReconcileError::MissingUid`.
     #[error("SourceCredential {0} has no metadata.uid; cannot own a MigrationPlan")]
     MissingUid(String),
+
+    /// The reconcile ran past [`RECONCILE_DEADLINE`] and was abandoned
+    /// (WI-400). Raised by the `operator_core::deadline::within` wrapper at
+    /// the `Controller::run` call, never by `reconcile` itself.
+    #[error(transparent)]
+    TimedOut(#[from] operator_core::deadline::ReconcileTimedOut),
 }
 
 /// Per-controller reconcile context.
@@ -132,6 +138,36 @@ pub struct Context {
     pub client: Client,
     pub metrics: Arc<Metrics>,
 }
+
+/// How long one SourceCredential reconcile may run before it is abandoned
+/// (WI-400). kube-runtime holds every later trigger for a credential while a
+/// reconcile of it is in flight — including the `.owns(plans)` trigger that
+/// consumes an approved MigrationPlan — and nothing else bounds a pass: the
+/// kube client's 295s read timeout bounds one call at a time.
+///
+/// The worst legitimate pass is the two validity halves, each capped at
+/// `validity::HALF_PROBE_BUDGET` (30s) and run one after the other, so 60s,
+/// plus about ten kube calls and one SSA per `repoPrefix` (finalizer, plan
+/// LIST, two material GETs, the derived Secrets, the status write, the plan
+/// delete), each milliseconds. 90s leaves 30s for those. The deadline holds
+/// ONLY because of that budget: the probes sit between the derived-Secret
+/// writes and the status write, and unbudgeted they cost N representatives
+/// x 10s, so any fixed deadline below that cut EVERY pass before its status
+/// write — frozen conditions, no `lastAppliedSpec` stamp, an approved plan
+/// never consumed. The `const` assertion below keeps the two in step.
+///
+/// A cut is safe to retry on every arm: on the pause arm a plan created
+/// without its paused status is found again by label and, phase-less, counts
+/// as blocking (`NoOp` -> `Pause { create: false }`); on the render arm every
+/// write is a forced SSA or a 404-tolerant delete in derive -> stamp ->
+/// delete order. Expiry writes nothing (see [`error_policy`]).
+pub const RECONCILE_DEADLINE: Duration = Duration::from_secs(90);
+
+// Both probe budgets plus 30s of kube calls must fit inside the deadline.
+const _: () = assert!(
+    2 * validity::HALF_PROBE_BUDGET.as_secs() + 30 <= RECONCILE_DEADLINE.as_secs(),
+    "RECONCILE_DEADLINE no longer covers both validity probe budgets"
+);
 
 /// Spawn the SourceCredential Controller. Watches
 /// `apprafter.io/v1alpha1` `SourceCredential` resources cluster-wide.
@@ -148,7 +184,11 @@ pub async fn run(client: Client, metrics: Arc<Metrics>) -> Result<(), ReconcileE
 
     Controller::new(creds, watcher::Config::default())
         .owns(plans, watcher::Config::default())
-        .run(reconcile, error_policy, context)
+        .run(
+            |cred, ctx| operator_core::deadline::within(RECONCILE_DEADLINE, reconcile(cred, ctx)),
+            error_policy,
+            context,
+        )
         .for_each(|res| async move {
             match res {
                 Ok((obj_ref, _action)) => info!(?obj_ref, "sourcecredential step ok"),
@@ -460,7 +500,25 @@ pub fn error_policy(
 ) -> Action {
     let name = cred.name_any();
     let namespace = cred.namespace().unwrap_or_default();
-    warn!(%name, %namespace, %err, "sourcecredential reconcile error");
+    if let ReconcileError::TimedOut(timed_out) = err {
+        // Abandoned at RECONCILE_DEADLINE. Nothing is written for it and
+        // nothing may be: `patch_status` is a forced single-manager apply, so
+        // a status built here would PRUNE every field it left out (covered
+        // lists, `lastValidated`, the `lastAppliedSpec` baseline the
+        // migration gate reads). This WARN — inside kube-runtime's
+        // `reconciling object{object.ref=…}` span — the timeout counter and
+        // the retry are the whole surface.
+        warn!(
+            %name, %namespace, after_secs = timed_out.after.as_secs(),
+            "sourcecredential reconcile abandoned at its deadline"
+        );
+        ctx.metrics
+            .reconcile_timeouts
+            .with_label_values(&[KIND])
+            .inc();
+    } else {
+        warn!(%name, %namespace, %err, "sourcecredential reconcile error");
+    }
     ctx.metrics
         .reconcile_total
         .with_label_values(&[KIND, &namespace, "error"])
@@ -2516,6 +2574,92 @@ mod tests {
         assert_eq!(
             format!("{action:?}"),
             format!("{:?}", Action::requeue(Duration::from_secs(30)))
+        );
+    }
+
+    /// WI-400: a pass whose apiserver accepts every request and never answers
+    /// is abandoned at exactly `RECONCILE_DEADLINE`. Before, only the client's
+    /// 295s read timeout bounded each call, and kube-runtime held every later
+    /// trigger for the credential the whole time.
+    #[tokio::test(start_paused = true)]
+    async fn a_reconcile_whose_apiserver_never_answers_is_abandoned_at_the_deadline() {
+        let ctx = context(operator_core::testing::stalled_client());
+
+        let started = tokio::time::Instant::now();
+        let err = operator_core::deadline::within(
+            RECONCILE_DEADLINE,
+            reconcile(Arc::new(live_cred()), ctx.clone()),
+        )
+        .await
+        .expect_err("an abandoned reconcile is an error, not a success");
+
+        assert_eq!(started.elapsed(), Duration::from_secs(90));
+        assert!(
+            matches!(err, ReconcileError::TimedOut(t) if t.after == RECONCILE_DEADLINE),
+            "{err:?}"
+        );
+        assert_eq!(err.to_string(), "reconcile did not finish within 90s");
+    }
+
+    /// A timeout is counted on `apprafter_reconcile_timeouts_total{kind}` —
+    /// the one signal that tells "abandoned at the deadline" apart from "the
+    /// apiserver said no" — AND on the two error counters existing alerts
+    /// read, and it is retried like any other error. No other error moves
+    /// the timeout counter.
+    #[tokio::test]
+    async fn error_policy_counts_a_timeout_on_its_own_counter_and_as_an_error() {
+        let ctx = context(operator_core::testing::stalled_client());
+        let cred = Arc::new(live_cred());
+        let timed_out = ReconcileError::from(operator_core::deadline::ReconcileTimedOut {
+            after: RECONCILE_DEADLINE,
+        });
+
+        let action = error_policy(cred.clone(), &timed_out, ctx.clone());
+        assert_eq!(
+            ctx.metrics
+                .reconcile_timeouts
+                .with_label_values(&[KIND])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            ctx.metrics
+                .reconcile_errors
+                .with_label_values(&[KIND])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            ctx.metrics
+                .reconcile_total
+                .with_label_values(&[KIND, "apprafter-system", "error"])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            format!("{action:?}"),
+            format!("{:?}", Action::requeue(Duration::from_secs(30)))
+        );
+
+        error_policy(
+            cred,
+            &ReconcileError::MissingUid("acme".into()),
+            ctx.clone(),
+        );
+        assert_eq!(
+            ctx.metrics
+                .reconcile_timeouts
+                .with_label_values(&[KIND])
+                .get(),
+            1.0,
+            "only a timeout is counted as one"
+        );
+        assert_eq!(
+            ctx.metrics
+                .reconcile_errors
+                .with_label_values(&[KIND])
+                .get(),
+            2.0
         );
     }
 
