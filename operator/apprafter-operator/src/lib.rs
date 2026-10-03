@@ -51,6 +51,50 @@ const _: () = assert!(
     "the Application controller's RECONCILE_DEADLINE must be shorter than CLIENT_READ_TIMEOUT"
 );
 
+// WI-400: the same holds for every other controller's deadline, one assert
+// each. `tests/reconcile_deadline_coverage_test.rs` fails when a controller
+// has a deadline without its assert here.
+const _: () = assert!(
+    operator_controllers_migration::reconcile::RECONCILE_DEADLINE.as_secs()
+        < CLIENT_READ_TIMEOUT.as_secs(),
+    "the MigrationPlan controller's RECONCILE_DEADLINE must be shorter than CLIENT_READ_TIMEOUT"
+);
+const _: () = assert!(
+    operator_controllers_platform_stack::reconcile::RECONCILE_DEADLINE.as_secs()
+        < CLIENT_READ_TIMEOUT.as_secs(),
+    "the PlatformStack controller's RECONCILE_DEADLINE must be shorter than CLIENT_READ_TIMEOUT"
+);
+const _: () = assert!(
+    operator_controllers_resourceclaim_provisioner::reconcile::RECONCILE_DEADLINE.as_secs()
+        < CLIENT_READ_TIMEOUT.as_secs(),
+    "the ResourceClaim provisioner's RECONCILE_DEADLINE must be shorter than CLIENT_READ_TIMEOUT"
+);
+const _: () = assert!(
+    operator_controllers_resourceclaim_provisioner::gc::RECONCILE_DEADLINE.as_secs()
+        < CLIENT_READ_TIMEOUT.as_secs(),
+    "the RetainedClaim GC's RECONCILE_DEADLINE must be shorter than CLIENT_READ_TIMEOUT"
+);
+const _: () = assert!(
+    operator_controllers_resourceclaim_provisioner::shared_database::RECONCILE_DEADLINE.as_secs()
+        < CLIENT_READ_TIMEOUT.as_secs(),
+    "the SharedDatabase controller's RECONCILE_DEADLINE must be shorter than CLIENT_READ_TIMEOUT"
+);
+const _: () = assert!(
+    operator_controllers_resourceclaim_provisioner::shared_volume::RECONCILE_DEADLINE.as_secs()
+        < CLIENT_READ_TIMEOUT.as_secs(),
+    "the SharedVolume controller's RECONCILE_DEADLINE must be shorter than CLIENT_READ_TIMEOUT"
+);
+const _: () = assert!(
+    operator_controllers_resourceclaim_scheduler::RECONCILE_DEADLINE.as_secs()
+        < CLIENT_READ_TIMEOUT.as_secs(),
+    "the ResourceClaim scheduler's RECONCILE_DEADLINE must be shorter than CLIENT_READ_TIMEOUT"
+);
+const _: () = assert!(
+    operator_controllers_sourcecredential::RECONCILE_DEADLINE.as_secs()
+        < CLIENT_READ_TIMEOUT.as_secs(),
+    "the SourceCredential controller's RECONCILE_DEADLINE must be shorter than CLIENT_READ_TIMEOUT"
+);
+
 /// Put back the two kube-client defaults that kube 4.0 moved, so the
 /// operator talks to the apiserver exactly as it did on kube 0.95.
 ///
