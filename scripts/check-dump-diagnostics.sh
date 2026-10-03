@@ -23,8 +23,10 @@
 #     or fewer, or does not say how many lines it left out;
 #   - the previous instance of a restarted container is not collected, or
 #     one is asked for a container that never restarted;
-#   - an ANSI colour code reaches the console;
-#   - a call leaves a scratch file behind;
+#   - an ANSI colour code reaches the console or a file;
+#   - a call with APPRAFTER_E2E_DIAG_DIR set does not write its own fresh
+#     subdirectory holding the WHOLE logs, every event and the objects, or
+#     a call without it leaves a scratch file behind;
 #   - an apiserver that answers nothing makes the function fail: most walks
 #     call it bare from their EXIT trap under errexit, where a failure would
 #     skip the teardown.
@@ -122,6 +124,10 @@ case "${args[*]}" in
     'logs pg-1'*) printf 'pg-1: database system is shut down\n' >"$out" ;;
     'get events -A --sort-by=.lastTimestamp')
         for i in $(seq 1 100); do printf 'demo  %ds  Normal  Event-%d  pod/web  message\n' "$i" "$i"; done >"$out" ;;
+    'api-resources --api-group=apprafter.io -o name')
+        printf 'applications.apprafter.io\nresourceclaims.apprafter.io\n' >"$out" ;;
+    'get applications.apprafter.io -A -o yaml')
+        printf 'apiVersion: v1\nitems:\n- kind: Application\n  metadata:\n    name: web\n    namespace: demo\nkind: List\n' >"$out" ;;
 esac
 if [ "$tail" -ge 0 ]; then tail -n "$tail" "$out"; else cat "$out"; fi
 exit "$rc"
@@ -205,6 +211,33 @@ check "A: the console says what it left out" \
     has "$C" '... 1000 earlier line(s) omitted here; set APPRAFTER_E2E_DIAG_DIR to keep the whole log'
 check "A: the webhook log is on the console" has "$C" 'webhook ready'
 check "A: no scratch file is left behind" dir_empty "$WORK/a.tmp"
+
+# ---- B: APPRAFTER_E2E_DIAG_DIR, called twice (two clusters, two runs) -------
+DIAG="$WORK/diag"
+run_dump b1 APPRAFTER_E2E_DIAG_DIR="$DIAG"
+run_dump b2 APPRAFTER_E2E_DIAG_DIR="$DIAG"
+mapfile -t subdirs < <(find "$DIAG" -mindepth 1 -maxdepth 1 -type d -name 'kind-apprafter-redis-walk-*' | sort)
+check "B: each call writes its own <context>-<time>-XXXXXX subdirectory" test "${#subdirs[@]}" -eq 2
+B="${subdirs[0]:-$DIAG/missing}"
+OPLOG="$B/apprafter-system/$OP.operator.log"
+check "B: exits 0" rc_is b1 0
+check "B: the whole operator log is in the artifact (3000 lines)" count_is "$OPLOG" '.' 3000
+check "B: ... from the walk's first line" has "$OPLOG" 'FIRST-LINE-OF-THE-WALK'
+check "B: ... ANSI-free" no_escape "$OPLOG"
+check "B: the restarted operator's previous instance is in the artifact" \
+    has "$B/apprafter-system/$OP.operator.previous.log" 'panicked: the previous operator instance'
+check "B: the webhook log is in the artifact" has "$B/apprafter-system/$WH.admission-webhook.log" 'webhook ready'
+refute "B: no previous-instance file for the webhook, which never restarted" \
+    test -e "$B/apprafter-system/$WH.admission-webhook.previous.log"
+check "B: the console points at the whole log in the artifact" \
+    has "$WORK/b1.console" "... 1000 earlier line(s) omitted here; the whole log is apprafter-system/$OP.operator.log in the e2e-diagnostics artifact"
+check "B: every event is in the artifact (100 lines)" count_is "$B/events.txt" 'Event-' 100
+check "B: the not-Ready pod's whole log is in the artifact" has "$B/pods/cnpg-system/pg-1.log" 'database system is shut down'
+check "B: every apprafter.io kind is dumped as YAML" has "$B/objects/applications.apprafter.io.yaml" 'name: web'
+check "B: ... resourceclaims too" test -e "$B/objects/resourceclaims.apprafter.io.yaml"
+check "B: ... and the Argo CD Applications" test -e "$B/objects/applications.argoproj.io.yaml"
+check "B: context.txt records the log window" has "$B/context.txt" "log window: $WANT_WINDOW"
+check "B: no scratch file is left behind outside the artifact" dir_empty "$WORK/b1.tmp"
 
 # ---- C: START_NS unusable -> the whole log, never a tail ---------------------
 run_dump c START_NS=not-a-number

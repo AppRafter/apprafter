@@ -1037,6 +1037,26 @@ _diag_control_plane_logs() {
     done
 }
 
+# _diag_artifact_dir — create and print this call's own subdirectory of
+#   APPRAFTER_E2E_DIAG_DIR: "<kube-context>-<UTC time>-XXXXXX". One per
+#   call, so the two clusters of a backup walk and the two runs of the
+#   gateway job never overwrite each other. Prints nothing when the
+#   variable is unset, or (with a warning) when the directory cannot be
+#   made; the dump then goes to the console only.
+_diag_artifact_dir() {
+    local base="${APPRAFTER_E2E_DIAG_DIR:-}" ctx dir
+    [ -n "$base" ] || return 0
+    ctx="$(kubectl config current-context 2>/dev/null)" || ctx=''
+    ctx="${ctx//[!A-Za-z0-9._-]/_}"
+    [ -n "$ctx" ] || ctx=cluster
+    if ! mkdir -p "$base" 2>/dev/null \
+        || ! dir="$(mktemp -d "${base}/${ctx}-$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX" 2>/dev/null)"; then
+        printf 'WARN: cannot create a diagnostics directory under %s; the dump goes to the console only\n' "$base" >&2
+        return 0
+    fi
+    printf '%s\n' "$dir"
+}
+
 # ---------------------------------------------------------------
 # dump_diagnostics
 #   Best-effort cluster-state dump for CI debugging. Call this on
@@ -1056,14 +1076,35 @@ _diag_control_plane_logs() {
 #   nightly, 2026-10-02) those began 30s after the stalled Application
 #   was created: steady-state requeue lines had pushed every line about
 #   it out of the window. scripts/check-dump-diagnostics.sh guards this.
+#
+#   APPRAFTER_E2E_DIAG_DIR — when set, each call ALSO writes a fresh
+#   subdirectory of it (see _diag_artifact_dir) holding what the console
+#   has to cut: the whole control-plane logs, the whole logs of every
+#   not-Ready pod, every event, and every apprafter.io and Argo CD
+#   object as YAML. The e2e workflows set it and upload it as the run's
+#   `e2e-diagnostics-*` artifact when the job fails.
 # ---------------------------------------------------------------
 dump_diagnostics() {
     command -v kubectl >/dev/null 2>&1 || return 0
     [ -n "${KUBECONFIG:-}" ] || return 0
-    local window work=''
+    local window out='' work='' res
     window="$(_diag_log_window)"
-    work="$(mktemp -d 2>/dev/null)" || work=''
+    out="$(_diag_artifact_dir)" || out=''
+    if [ -n "$out" ]; then
+        work="$out"
+    else
+        work="$(mktemp -d 2>/dev/null)" || work=''
+    fi
     printf '\n----- cluster diagnostics (failure) -----\n' >&2
+    if [ -n "$out" ]; then
+        printf 'whole logs, events and objects: %s (the e2e-diagnostics artifact)\n' "$out" >&2
+        {
+            printf 'walk: %s\n' "$0"
+            printf 'kube context: %s\n' "$(kubectl config current-context 2>/dev/null || true)"
+            printf 'log window: %s\n' "$window"
+            printf 'dumped at: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        } >"$out/context.txt" 2>/dev/null || true
+    fi
     kubectl get nodes -o wide >&2 2>&1 || true
     printf '\n--- pods (all namespaces) ---\n' >&2
     kubectl get pods -A -o wide >&2 2>&1 || true
@@ -1087,6 +1128,12 @@ dump_diagnostics() {
             kubectl -n "$ns" logs "$pod" --all-containers --tail=60 >&2 2>&1 || true
             printf '\n--- logs %s/%s (previous instance) ---\n' "$ns" "$pod" >&2
             kubectl -n "$ns" logs "$pod" --all-containers --previous --tail=60 >&2 2>&1 || true
+            if [ -n "$out" ] && mkdir -p "$out/pods/$ns" 2>/dev/null; then
+                kubectl -n "$ns" logs "$pod" --all-containers --prefix "$window" 2>&1 \
+                    | _diag_strip_ansi >"$out/pods/$ns/$pod.log" || true
+                kubectl -n "$ns" logs "$pod" --all-containers --prefix --previous "$window" 2>&1 \
+                    | _diag_strip_ansi >"$out/pods/$ns/$pod.previous.log" || true
+            fi
         done || true
     # apprafter-system control-plane logs ALWAYS — the operator and
     # admission-webhook run 1/1 Ready, so the not-Ready loop above skips
@@ -1094,7 +1141,7 @@ dump_diagnostics() {
     # `.status.phase`) leaves its only trace in the operator log. Dump
     # the full control-plane regardless of Ready state.
     if [ -n "$work" ]; then
-        _diag_control_plane_logs "$work" "$window" ''
+        _diag_control_plane_logs "$work" "$window" "$out"
     else
         printf '\n--- apprafter-system control-plane logs: no scratch directory (mktemp -d failed), skipped ---\n' >&2
     fi
@@ -1133,7 +1180,13 @@ dump_diagnostics() {
             >&2 2>&1 || true
     done
     printf '\n--- recent events ---\n' >&2
-    kubectl get events -A --sort-by=.lastTimestamp 2>/dev/null | tail -60 >&2 || true
+    if [ -n "$out" ]; then
+        kubectl get events -A --sort-by=.lastTimestamp >"$out/events.txt" 2>&1 || true
+        tail -60 "$out/events.txt" >&2 || true
+        printf '(the last 60; every event is in events.txt in the artifact)\n' >&2
+    else
+        kubectl get events -A --sort-by=.lastTimestamp 2>/dev/null | tail -60 >&2 || true
+    fi
     printf '\n--- helm releases ---\n' >&2
     (command -v helm >/dev/null 2>&1 && helm list -A >&2 2>&1) || true
     # Argo CD Applications + why each is not Synced/Healthy — the
@@ -1147,8 +1200,16 @@ dump_diagnostics() {
 'sync={.status.sync.status} health={.status.health.status}{"\n"}conditions={range .status.conditions[*]}[{.type}: {.message}]{end}{"\n"}op={.status.operationState.phase}: {.status.operationState.message}{"\n"}' \
             >&2 2>&1 || true
     done
+    # Every apprafter.io object and every Argo CD Application in full: the
+    # console above carries only the fields a wait loop usually needs.
+    if [ -n "$out" ] && mkdir -p "$out/objects" 2>/dev/null; then
+        for res in $(kubectl api-resources --api-group=apprafter.io -o name 2>/dev/null || true) \
+            applications.argoproj.io; do
+            kubectl get "$res" -A -o yaml >"$out/objects/${res}.yaml" 2>&1 || true
+        done
+    fi
     printf '%s\n' '----- end diagnostics -----' >&2
-    if [ -n "$work" ]; then
+    if [ -n "$work" ] && [ -z "$out" ]; then
         rm -rf "$work"
     fi
     return 0

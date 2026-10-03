@@ -236,6 +236,25 @@ database. Phase 3 wakes it from inside the pod and waits for
 `payload_migrations` to appear, otherwise the "CMS database" fingerprint
 would cover nothing but the walk's own seed rows.
 
+## Failure diagnostics
+
+A walk that fails calls `dump_diagnostics` (`e2e/lib.sh`) from its exit
+trap, before the cluster is torn down. The operator and admission-webhook
+logs it prints cover the whole walk: every container of every pod of the
+two deployments, read from the walk's start (`--since-time`), plus the
+previous instance of any container that restarted. The console shows the
+last 2000 lines of each, with ANSI colour codes removed.
+
+| Var                                | Default | Purpose                                                                                                                                                                                                                                       |
+| ---------------------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `APPRAFTER_E2E_DIAG_DIR`           | unset   | When set, each dump also writes a new `<kube-context>-<UTC time>-XXXXXX/` directory here: the whole control-plane logs, the whole logs of every not-Ready pod, `events.txt`, and every `apprafter.io` object and Argo CD Application as YAML. |
+| `APPRAFTER_E2E_DIAG_CONSOLE_LINES` | `2000`  | Lines of each control-plane log printed to the console.                                                                                                                                                                                       |
+
+The e2e workflows set `APPRAFTER_E2E_DIAG_DIR` and, when the job fails,
+upload it as the `e2e-diagnostics-<job>-<attempt>` artifact, kept for 14
+days. `scripts/check-dump-diagnostics.sh` runs `dump_diagnostics` against a
+stub `kubectl`.
+
 ## Nightly CI
 
 `.github/workflows/nightly.yml` runs this script every night at
