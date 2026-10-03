@@ -45,3 +45,6 @@ http  = { workspace = true }
 # task is idle — so a hang costs no wall time and the moment a bound fires is
 # exact.
 tokio = { workspace = true, features = ["test-util"] }
+# `operator_core::testing::stalled_client()`: an apiserver that takes every
+# request and never answers, for the reconcile-deadline tests (WI-400).
+operator-core = { path = "../../operator-core", features = ["testing"] }

@@ -236,11 +236,12 @@ pub enum Error {
     CheckInterval(String),
     #[error(transparent)]
     UpstreamTimedOut(#[from] UpstreamTimedOut),
+    #[error(transparent)]
+    TimedOut(#[from] operator_core::deadline::ReconcileTimedOut),
 }
 
 struct Context {
     client: Client,
-    #[allow(dead_code)]
     metrics: Arc<Metrics>,
     app_api_resource: ApiResource,
     /// TTL cache for the kubelet Summary sample behind `NodeDiskPressure`
@@ -304,6 +305,43 @@ impl Upstream for OciRegistry {
         fetch_path_max_change_class(upstream, from_version, to_version).await
     }
 }
+
+/// The `kind` label this controller's metrics carry.
+const KIND: &str = "PlatformStack";
+
+/// How long one PlatformStack reconcile may run before it is abandoned
+/// (WI-400). The controller watches a singleton, so a reconcile that never
+/// returns stalls EVERY trigger it has: the stack, the parent Application and
+/// the backup CronJobs, Jobs and runner pods all map to `PlatformStack/default`,
+/// and kube-runtime holds them behind the running one (GOTCHA-51).
+///
+/// The legitimate worst case is bounded from the inside: the two registry
+/// questions (`OCI_OPERATION_BUDGET`, 20s each), the backup reads
+/// (`BACKUP_READ_BUDGET`, 10s), the node sample (`NODE_SAMPLE_BUDGET`, 10s),
+/// four decorative calls (`DECORATIVE_CALL_BUDGET`, 5s each) and a
+/// MigrationPlan create behind its admission webhook (10s) come to 90s, beside
+/// about a dozen apiserver calls that take milliseconds. 120s leaves room and
+/// stays under the client's 295s socket read timeout, so this — not a socket —
+/// is the real bound.
+///
+/// What is left for it to cut is an apiserver call that does not answer, and
+/// against such an apiserver no status write could land either. Every hang the
+/// status CAN outlive — the registry, the backup reads, the node proxy, the
+/// anchor and the Events — has its own bound and becomes the condition that
+/// says so (`UpstreamReachable=False`, `BackupHealthy=Unknown`), so the
+/// deadline never re-creates the v0.2.12 wedge of frozen conditions with a
+/// stale `UpstreamReachable=True`. A cut writes no status; `error_policy`
+/// reports it as a Warning Event on the stack, a WARN and
+/// `apprafter_reconcile_timeouts_total{kind="PlatformStack"}`, and requeues it
+/// in 60s.
+///
+/// A KNOWN GAP, not an accepted limit: a cut is therefore not visible in
+/// `status.conditions` or in `apprafter platform status`. Closing it needs
+/// `status.conditions` to become an SSA listMap keyed by `type` (so a
+/// dedicated field manager can own a `ReconcileStalled` condition without
+/// re-asserting the others), or the CLI to surface the `ReconcileTimedOut`
+/// Event. It is a follow-up work item to WI-400.
+pub const RECONCILE_DEADLINE: Duration = Duration::from_secs(120);
 
 pub async fn run(client: Client, metrics: Arc<Metrics>) -> Result<(), Error> {
     let stacks: Api<PlatformStack> = Api::namespaced(client.clone(), SINGLETON_NAMESPACE);
@@ -395,7 +433,11 @@ pub async fn run(client: Client, metrics: Arc<Metrics>) -> Result<(), Error> {
                 }
             },
         )
-        .run(reconcile, error_policy, ctx)
+        .run(
+            |obj, ctx| operator_core::deadline::within(RECONCILE_DEADLINE, reconcile(obj, ctx)),
+            error_policy,
+            ctx,
+        )
         .for_each(|res| async move {
             match res {
                 Ok((obj, action)) => {
@@ -2208,9 +2250,57 @@ fn parse_check_interval(s: &str) -> Duration {
 /// not a slow poll.
 const MAX_CHECK_INTERVAL_SECS: u64 = 86_400;
 
-fn error_policy(_: Arc<PlatformStack>, err: &Error, _: Arc<Context>) -> Action {
-    warn!(error = %err, "PlatformController reconcile failed");
+fn error_policy(stack: Arc<PlatformStack>, err: &Error, ctx: Arc<Context>) -> Action {
+    ctx.metrics
+        .reconcile_errors
+        .with_label_values(&[KIND])
+        .inc();
+    match err {
+        Error::TimedOut(timed_out) => {
+            ctx.metrics
+                .reconcile_timeouts
+                .with_label_values(&[KIND])
+                .inc();
+            warn!(
+                error = %err,
+                deadline_secs = timed_out.after.as_secs(),
+                "PlatformController reconcile abandoned at its deadline; PlatformStack/default \
+                 keeps the status of the last reconcile that finished"
+            );
+            publish_deadline_event(&ctx, &stack, *timed_out);
+        }
+        _ => warn!(error = %err, "PlatformController reconcile failed"),
+    }
     Action::requeue(Duration::from_secs(60))
+}
+
+/// Report a reconcile cut at `RECONCILE_DEADLINE` as a Warning Event on
+/// `PlatformStack/default` (`kubectl describe platformstack default`).
+///
+/// Not the status: `status.conditions` is an ATOMIC list that
+/// `platform-controller` writes whole, so no write can add one condition
+/// without re-asserting — and, from a stale read, pruning — the rest; and the
+/// pass that would have written it is the one that did not finish.
+/// `error_policy` is synchronous, so the publish runs on a task of its own,
+/// bounded like every other Event here.
+fn publish_deadline_event(
+    ctx: &Context,
+    stack: &PlatformStack,
+    timed_out: operator_core::deadline::ReconcileTimedOut,
+) {
+    let recorder = build_recorder(ctx, stack);
+    let ev = KubeEvent {
+        type_: EventType::Warning,
+        reason: "ReconcileTimedOut".into(),
+        note: Some(format!(
+            "the reconcile did not finish within {}s and was abandoned; the status shown is \
+             from the last reconcile that finished, and the next attempt starts within 60s",
+            timed_out.after.as_secs()
+        )),
+        action: "Reconcile".into(),
+        secondary: None,
+    };
+    tokio::spawn(async move { publish_bounded(&recorder, ev).await });
 }
 
 /// In-memory marker the reconcile body sets when a destructive
@@ -5087,5 +5177,125 @@ mod bounded_reconcile_tests {
             "True"
         );
         assert_every_condition_carried(&patch);
+    }
+
+    /// WI-400 / GOTCHA-51: an apiserver that takes a request and never
+    /// answers held this singleton's reconcile — and every trigger queued
+    /// behind it — for good. Under `RECONCILE_DEADLINE` the reconcile is
+    /// abandoned at exactly the deadline and comes back as the controller's
+    /// own error, which `error_policy` counts and requeues.
+    #[tokio::test(start_paused = true)]
+    async fn a_reconcile_the_apiserver_never_answers_is_abandoned_at_its_deadline() {
+        let stack: Arc<PlatformStack> =
+            Arc::new(serde_json::from_value(stack_on("0.2.80", "0.2.80")).expect("stack"));
+        let ctx = context(
+            operator_core::testing::stalled_client(),
+            Arc::new(NoRegistry),
+        );
+        let started = tokio::time::Instant::now();
+        let err = operator_core::deadline::within(
+            RECONCILE_DEADLINE,
+            reconcile(stack.clone(), ctx.clone()),
+        )
+        .await
+        .expect_err("a reconcile that never finishes is cut");
+        assert_eq!(started.elapsed(), RECONCILE_DEADLINE);
+        assert!(
+            matches!(
+                err,
+                Error::TimedOut(operator_core::deadline::ReconcileTimedOut { after })
+                    if after == RECONCILE_DEADLINE
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            error_policy(stack, &err, ctx.clone()),
+            Action::requeue(Duration::from_secs(60))
+        );
+        assert_eq!(
+            ctx.metrics
+                .reconcile_timeouts
+                .with_label_values(&["PlatformStack"])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            ctx.metrics
+                .reconcile_errors
+                .with_label_values(&["PlatformStack"])
+                .get(),
+            1.0
+        );
+    }
+
+    /// Any other failure is counted as an error, not as a timeout.
+    #[tokio::test]
+    async fn an_ordinary_failure_is_not_counted_as_a_timeout() {
+        let stack: Arc<PlatformStack> =
+            Arc::new(serde_json::from_value(stack_on("0.2.80", "0.2.80")).expect("stack"));
+        let (client, _) = scripted(cluster(stack_on("0.2.80", "0.2.80"), json!({})));
+        let ctx = context(client, Arc::new(NoRegistry));
+        let err = Error::CheckInterval("9x".into());
+        assert_eq!(
+            error_policy(stack, &err, ctx.clone()),
+            Action::requeue(Duration::from_secs(60))
+        );
+        assert_eq!(
+            ctx.metrics
+                .reconcile_timeouts
+                .with_label_values(&["PlatformStack"])
+                .get(),
+            0.0
+        );
+        assert_eq!(
+            ctx.metrics
+                .reconcile_errors
+                .with_label_values(&["PlatformStack"])
+                .get(),
+            1.0
+        );
+    }
+
+    /// A cut reconcile writes no status — `status.conditions` is an atomic
+    /// list written whole by `platform-controller`, and the pass that would
+    /// have written it did not finish — so the cut is reported where a
+    /// reader of `kubectl describe platformstack default` sees it: a Warning
+    /// Event on the stack.
+    #[tokio::test(start_paused = true)]
+    async fn an_abandoned_reconcile_is_reported_as_a_warning_event_on_the_stack() {
+        let stack = stack_on("0.2.80", "0.2.80");
+        let parent = parent_on(&stack, "0.2.80");
+        let mut cluster = cluster(stack, parent);
+        cluster.silent.push(("GET", PARENT.to_string()));
+        let (client, state) = scripted(cluster);
+        let ctx = context(client, Arc::new(NoRegistry));
+        let err = operator_core::deadline::within(
+            RECONCILE_DEADLINE,
+            reconcile(the_stack(&state), ctx.clone()),
+        )
+        .await
+        .expect_err("a reconcile that never finishes is cut");
+        error_policy(the_stack(&state), &err, ctx);
+        let event = tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let found = calls(&state).into_iter().find(|c| c.is("POST", EVENTS));
+                if let Some(event) = found {
+                    return event;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the Event is published");
+        assert_eq!(event.body["type"], "Warning");
+        assert_eq!(event.body["reason"], "ReconcileTimedOut");
+        assert_eq!(event.body["regarding"]["kind"], "PlatformStack");
+        assert_eq!(event.body["regarding"]["name"], "default");
+        let note = event.body["note"].as_str().unwrap();
+        assert!(note.contains("did not finish within 120s"), "{note}");
+        assert!(
+            !calls(&state).iter().any(|c| c.is("PATCH", STATUS)),
+            "a cut reconcile writes no status"
+        );
     }
 }
