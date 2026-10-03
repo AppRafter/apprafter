@@ -136,7 +136,8 @@ Three verdicts, mapped conservatively on purpose:
   gave a verdict. A network failure can never be reported as a bad credential.
   The condition message separates "nothing to probe yet", "probed and could
   not reach the host" and "the probe budget ran out" in words, and the last
-  one says how many representatives went unanswered.
+  one says how many representatives went unanswered, or that the Application
+  list itself did not return in time.
 
 Across several representatives an explicit rejection wins over any success, so
 one bad prefix is not hidden by a good one — and a rejection that arrived
