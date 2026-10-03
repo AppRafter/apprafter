@@ -664,6 +664,92 @@ pub fn used_dbnums(
     used
 }
 
+/// The object a `FLUSHDB` is being run for — the one holder of `(instance,
+/// dbnum)` that is allowed to exist (WI-402).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DbnumOwner<'a> {
+    /// An owned redis `ResourceClaim`. Its own `RetainedClaim` (same
+    /// `claimRef`) counts as itself: that snapshot IS this claim's data.
+    Claim { namespace: &'a str, name: &'a str },
+    /// A shared cache's `SharedDatabase`.
+    Shared { namespace: &'a str, name: &'a str },
+}
+
+/// Everything OTHER than `me` that holds `(instance, dbnum)` right now, named
+/// for a log line or an error — empty means `me` holds it exclusively (WI-402).
+///
+/// The allocator's reserved set ([`used_dbnums`]) is computed from one LIST
+/// before the allocation is written. That is not enough to make a `FLUSHDB`
+/// safe: a reconcile dropped mid-request (a deadline, a lost leader) can
+/// leave its allocation write in flight, and the apiserver may commit it
+/// AFTER the next allocator's LIST — two holders of one `$N`, and whichever
+/// flushes second wipes the other. So every `FLUSHDB` re-reads the three
+/// sources fresh and runs only when this returns nothing.
+///
+/// Holders are a live or deleting `ResourceClaim` (`status.instance`/`dbnum`),
+/// a `RetainedClaim` snapshot (`spec.instance`/`dbnum`) and a `SharedDatabase`
+/// (`status.instance`/`dbnum`). `me` is excluded, and so is a `Claim`'s own
+/// snapshot; nothing else is.
+pub fn other_dbnum_holders(
+    live: &[ResourceClaim],
+    retained: &[RetainedClaim],
+    shared: &[SharedDatabase],
+    instance: &str,
+    dbnum: u16,
+    me: DbnumOwner<'_>,
+) -> Vec<String> {
+    let mut holders = Vec::new();
+    for c in live {
+        let Some(st) = c.status.as_ref() else {
+            continue;
+        };
+        if st.instance.as_deref() != Some(instance) || st.dbnum != Some(dbnum) {
+            continue;
+        }
+        let namespace = c.metadata.namespace.as_deref().unwrap_or_default();
+        let name = c.metadata.name.as_deref().unwrap_or_default();
+        if me == (DbnumOwner::Claim { namespace, name }) {
+            continue;
+        }
+        holders.push(format!("ResourceClaim {namespace}/{name}"));
+    }
+    for r in retained {
+        if r.spec.instance.as_deref() != Some(instance) || r.spec.dbnum != Some(dbnum) {
+            continue;
+        }
+        let owner = &r.spec.claim_ref;
+        if me
+            == (DbnumOwner::Claim {
+                namespace: &owner.namespace,
+                name: &owner.name,
+            })
+        {
+            continue;
+        }
+        holders.push(format!(
+            "RetainedClaim {} (of {}/{})",
+            r.metadata.name.as_deref().unwrap_or_default(),
+            owner.namespace,
+            owner.name
+        ));
+    }
+    for s in shared {
+        let Some(st) = s.status.as_ref() else {
+            continue;
+        };
+        if st.instance.as_deref() != Some(instance) || st.dbnum != Some(i64::from(dbnum)) {
+            continue;
+        }
+        let namespace = s.metadata.namespace.as_deref().unwrap_or_default();
+        let name = s.metadata.name.as_deref().unwrap_or_default();
+        if me == (DbnumOwner::Shared { namespace, name }) {
+            continue;
+        }
+        holders.push(format!("SharedDatabase {namespace}/{name}"));
+    }
+    holders
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1083,6 +1169,114 @@ mod tests {
         ];
         let used = used_dbnums(&[], &[], &shared, "platform-redis-ephemeral-000");
         assert!(used.is_empty(), "got {used:?}");
+    }
+
+    // --- other_dbnum_holders() (WI-402: the check before every FLUSHDB) ---
+
+    const INST: &str = "platform-redis-ephemeral-000";
+
+    fn claim_in(ns: &str, name: &str, instance: &str, dbnum: u16) -> ResourceClaim {
+        let mut c = claim_with_alloc(name, Some(instance), Some(dbnum));
+        c.metadata.namespace = Some(ns.into());
+        c
+    }
+
+    fn shared_in(ns: &str, name: &str, instance: &str, dbnum: i64) -> SharedDatabase {
+        let mut sd = shared_with_alloc(name, instance, dbnum);
+        sd.metadata.namespace = Some(ns.into());
+        sd
+    }
+
+    const ME: DbnumOwner<'static> = DbnumOwner::Claim {
+        namespace: "demo",
+        name: "web-redis",
+    };
+
+    #[test]
+    fn nobody_else_on_the_dbnum_means_exclusive() {
+        let live = vec![
+            claim_in("demo", "web-redis", INST, 7),
+            claim_in("demo", "other", INST, 3),
+            claim_in("other-ns", "far", "platform-redis-ephemeral-001", 7),
+        ];
+        let shared = vec![shared_in("demo", "orders", INST, 4)];
+        let retained = vec![retained_with_alloc("ret", INST, 5)];
+        assert!(other_dbnum_holders(&live, &retained, &shared, INST, 7, ME).is_empty());
+    }
+
+    #[test]
+    fn a_different_claim_on_the_same_dbnum_is_named() {
+        // The late commit: another claim's allocation landed on our number.
+        let live = vec![
+            claim_in("demo", "web-redis", INST, 7),
+            claim_in("shop", "cart-redis", INST, 7),
+        ];
+        assert_eq!(
+            other_dbnum_holders(&live, &[], &[], INST, 7, ME),
+            vec!["ResourceClaim shop/cart-redis".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_claim_of_the_same_name_in_another_namespace_is_another_holder() {
+        let live = vec![claim_in("shop", "web-redis", INST, 7)];
+        assert_eq!(
+            other_dbnum_holders(&live, &[], &[], INST, 7, ME),
+            vec!["ResourceClaim shop/web-redis".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_shared_database_on_the_same_dbnum_blocks_a_claim() {
+        let shared = vec![shared_in("demo", "orders", INST, 7)];
+        assert_eq!(
+            other_dbnum_holders(&[], &[], &shared, INST, 7, ME),
+            vec!["SharedDatabase demo/orders".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_claims_own_snapshot_is_itself_but_anothers_is_not() {
+        // `retained_with_alloc` names its claimRef after the snapshot, in
+        // namespace `demo`.
+        let own = retained_with_alloc("web-redis", INST, 7);
+        assert!(other_dbnum_holders(&[], &[own], &[], INST, 7, ME).is_empty());
+        let foreign = retained_with_alloc("gone-redis", INST, 7);
+        assert_eq!(
+            other_dbnum_holders(&[], &[foreign], &[], INST, 7, ME),
+            vec!["RetainedClaim gone-redis (of demo/gone-redis)".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_shared_database_excludes_only_itself() {
+        let me = DbnumOwner::Shared {
+            namespace: "demo",
+            name: "orders",
+        };
+        let shared = vec![
+            shared_in("demo", "orders", INST, 7),
+            shared_in("demo", "sessions", INST, 7),
+        ];
+        // A claim and a snapshot that merely share the SharedDatabase's name
+        // are still other holders: only the Claim variant owns snapshots.
+        let live = vec![claim_in("demo", "orders", INST, 7)];
+        let retained = vec![retained_with_alloc("orders", INST, 7)];
+        assert_eq!(
+            other_dbnum_holders(&live, &retained, &shared, INST, 7, me),
+            vec![
+                "ResourceClaim demo/orders".to_string(),
+                "RetainedClaim orders (of demo/orders)".to_string(),
+                "SharedDatabase demo/sessions".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_claim_without_status_holds_nothing() {
+        let mut c = claim_in("shop", "new-redis", INST, 7);
+        c.status = None;
+        assert!(other_dbnum_holders(&[c], &[], &[], INST, 7, ME).is_empty());
     }
 
     // --- resolve_allocation() (ADR 0042 §8 reattach vs fresh) ---
