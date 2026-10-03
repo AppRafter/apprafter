@@ -44,9 +44,10 @@ use crate::compatibility::{
 use crate::desired::{build as build_desired, DesiredSource};
 use crate::oci::{channel_matches, tags_in_channel, Channel};
 use crate::status::{
-    append_version_history, condition, upsert_condition, COND_MIGRATION_PENDING,
-    COND_NODE_DISK_PRESSURE, COND_READY, COND_SYNCED, COND_UNAUTHORIZED_SOURCE_MODIFICATION,
-    COND_UPGRADE_AVAILABLE, COND_UPSTREAM_REACHABLE, COND_YANKED_VERSION,
+    append_version_history, condition, platform_controller_view, upsert_condition,
+    without_reconcile_stalled, COND_MIGRATION_PENDING, COND_NODE_DISK_PRESSURE, COND_READY,
+    COND_SYNCED, COND_UNAUTHORIZED_SOURCE_MODIFICATION, COND_UPGRADE_AVAILABLE,
+    COND_UPSTREAM_REACHABLE, COND_YANKED_VERSION,
 };
 use crate::{FIELD_MANAGER, SINGLETON_NAME, SINGLETON_NAMESPACE};
 
@@ -373,18 +374,45 @@ const KIND: &str = "PlatformStack";
 /// anchor and the Events — has its own bound and becomes the condition that
 /// says so (`UpstreamReachable=False`, `BackupHealthy=Unknown`), so the
 /// deadline never re-creates the v0.2.12 wedge of frozen conditions with a
-/// stale `UpstreamReachable=True`. A cut writes no status; `error_policy`
-/// reports it as a Warning Event on the stack, a WARN and
-/// `apprafter_reconcile_timeouts_total{kind="PlatformStack"}`, and requeues it
-/// in 60s.
+/// stale `UpstreamReachable=True`.
 ///
-/// A KNOWN GAP, not an accepted limit: a cut is therefore not visible in
-/// `status.conditions` or in `apprafter platform status`. Closing it needs
-/// `status.conditions` to become an SSA listMap keyed by `type` (so a
-/// dedicated field manager can own a `ReconcileStalled` condition without
-/// re-asserting the others), or the CLI to surface the `ReconcileTimedOut`
-/// Event. It is a follow-up work item to WI-400.
+/// A cut is reported on the stack itself: [`reconcile_with_deadline`] sets
+/// `ReconcileStalled=True` under a field manager of its own (`crate::stall`),
+/// which `apprafter platform status` shows, and the first reconcile that
+/// finishes removes it. Every other condition keeps the value of the last
+/// reconcile that finished. `error_policy` adds a Warning Event on the stack,
+/// a WARN and `apprafter_reconcile_timeouts_total{kind="PlatformStack"}`, and
+/// requeues the stack in 60s.
 pub const RECONCILE_DEADLINE: Duration = Duration::from_secs(120);
+
+/// One reconcile under [`RECONCILE_DEADLINE`], with the outcome kept in the
+/// stack's `ReconcileStalled` condition (WI-400, `crate::stall`): set when
+/// the pass is cut, removed after a pass that finishes. A pass that fails for
+/// any other reason changes neither: it neither stalled nor proved the stall
+/// over.
+///
+/// Both writes come after the pass, under their own budget
+/// (`stall::STALL_WRITE_BUDGET`), so a pass holds its slot for at most
+/// `RECONCILE_DEADLINE + STALL_WRITE_BUDGET`. The clear acts on the stack
+/// this pass read: a `ReconcileStalled` that lands after the read is removed
+/// by the next pass, which that write itself starts through the stack's
+/// watch.
+async fn reconcile_with_deadline(
+    stack: Arc<PlatformStack>,
+    ctx: Arc<Context>,
+) -> Result<Action, Error> {
+    let outcome =
+        operator_core::deadline::within(RECONCILE_DEADLINE, reconcile(stack.clone(), ctx.clone()))
+            .await;
+    match &outcome {
+        Err(Error::TimedOut(timed_out)) => {
+            crate::stall::mark(&ctx.client, &stack, timed_out.after).await
+        }
+        Ok(_) => crate::stall::clear(&ctx.client, &stack).await,
+        Err(_) => {}
+    }
+    outcome
+}
 
 pub async fn run(client: Client, metrics: Arc<Metrics>) -> Result<(), Error> {
     let stacks: Api<PlatformStack> = Api::namespaced(client.clone(), SINGLETON_NAMESPACE);
@@ -477,11 +505,7 @@ pub async fn run(client: Client, metrics: Arc<Metrics>) -> Result<(), Error> {
                 }
             },
         )
-        .run(
-            |obj, ctx| operator_core::deadline::within(RECONCILE_DEADLINE, reconcile(obj, ctx)),
-            error_policy,
-            ctx,
-        )
+        .run(reconcile_with_deadline, error_policy, ctx)
         .for_each(|res| async move {
             match res {
                 Ok((obj, action)) => {
@@ -2266,8 +2290,28 @@ async fn write_status_if_changed(
     include_version_history: bool,
 ) -> Result<(), Error> {
     let prior = stack.status.clone().unwrap_or_default();
-    if prior == new_status {
+    // Compared as `platform-controller` applies it (WI-400): the stall
+    // manager's `ReconcileStalled` alone is no reason to write; a duplicate
+    // condition type read back is, once, so the write drops it; and so is an
+    // ownership of `status.conditions` that only this manager's own apply
+    // puts right (`stall::controller_must_reapply`).
+    let prior_view = without_reconcile_stalled(&prior);
+    let unchanged = prior_view == platform_controller_view(&new_status);
+    if unchanged && !crate::stall::controller_must_reapply(stack) {
         return Ok(());
+    }
+    // A list this manager owns WHOLE (last written under the atomic CRD), or
+    // one carrying a condition nobody holds that this write leaves out, is
+    // first re-applied as it was read: that apply takes every condition by
+    // key. Applied straight away, the new status would NOT remove a
+    // condition it leaves out (a `BackupHealthy` that backups being turned
+    // off retire): it would stay, owned by nobody, and nothing would ever
+    // remove it (`stall::controller_must_adopt_first`).
+    if crate::stall::controller_must_adopt_first(stack, &new_status) {
+        write_status(stack, ctx, prior_view, false).await?;
+        if unchanged {
+            return Ok(());
+        }
     }
     write_status(stack, ctx, new_status, include_version_history).await
 }
@@ -2282,7 +2326,11 @@ fn build_status_patch(
     // append-only field is preserved across racy reconciles.
     // Walk-fix #7 v0.1.121 → v0.1.122. See
     // `write_status_if_changed` docstring for the rationale.
-    let mut status_value = serde_json::to_value(new_status)
+    //
+    // Serialized through `platform_controller_view` (WI-400): never
+    // `ReconcileStalled`, which has its own field manager, and never a
+    // second condition of one `type`, which the list-map apply refuses.
+    let mut status_value = serde_json::to_value(platform_controller_view(new_status))
         .expect("PlatformStackStatus is always serializable to JSON");
     if !include_version_history {
         if let Value::Object(map) = &mut status_value {
@@ -2360,12 +2408,13 @@ fn error_policy(stack: Arc<PlatformStack>, err: &Error, ctx: Arc<Context>) -> Ac
 /// Report a reconcile cut at `RECONCILE_DEADLINE` as a Warning Event on
 /// `PlatformStack/default` (`kubectl describe platformstack default`).
 ///
-/// Not the status: `status.conditions` is an ATOMIC list that
-/// `platform-controller` writes whole, so no write can add one condition
-/// without re-asserting — and, from a stale read, pruning — the rest; and the
-/// pass that would have written it is the one that did not finish.
-/// `error_policy` is synchronous, so the publish runs on a task of its own,
-/// bounded like every other Event here.
+/// Beside `ReconcileStalled`, which [`reconcile_with_deadline`] sets on the
+/// status: the condition says the stack is stalled NOW and goes when a pass
+/// finishes, while the Event stays in `kubectl get events` as the record of
+/// each cut. It is the only report of a cut whose condition could not be
+/// written, or must not be: while a rollback serves the atomic CRD
+/// (`crate::stall`). `error_policy` is synchronous, so the publish runs on a
+/// task of its own, bounded like every other Event here.
 fn publish_deadline_event(
     ctx: &Context,
     stack: &PlatformStack,
@@ -4625,6 +4674,8 @@ mod bounded_reconcile_tests {
         "/apis/apprafter.io/v1alpha1/namespaces/apprafter-system/platformstacks/default/status";
     const PLANS: &str = "/apis/apprafter.io/v1alpha1/namespaces/apprafter-system/migrationplans";
     const EVENTS: &str = "/apis/events.k8s.io/v1/namespaces/apprafter-system/events";
+    const CRD: &str =
+        "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/platformstacks.apprafter.io";
 
     #[derive(Clone, Debug)]
     struct Call {
@@ -4653,6 +4704,16 @@ mod bounded_reconcile_tests {
         /// `(method, path)` pairs the apiserver accepts and never answers.
         silent: Vec<(&'static str, String)>,
         calls: Vec<Call>,
+        /// Status applies merge `status.conditions` by `type`, with the
+        /// ownership kept in `metadata.managedFields`, as on a cluster whose
+        /// CRD makes the list a list-map (WI-400): see
+        /// [`apply_status_list_map`]. Off, a status write replaces the
+        /// status whole.
+        list_map: bool,
+        /// The PlatformStack CRD the apiserver serves makes
+        /// `status.conditions` a list-map ([`served_crd`]). Set with
+        /// `list_map`; off, it is the atomic list a rollback serves.
+        crd_list_map: bool,
     }
 
     type Shared = Arc<Mutex<Cluster>>;
@@ -4726,13 +4787,135 @@ mod bounded_reconcile_tests {
                 not_found()
             }
             ("GET", STATUS) => ok(cluster.stack.clone()),
+            ("PATCH", STATUS) if cluster.list_map => apply_status_list_map(cluster, call),
             ("PATCH", STATUS) => {
                 cluster.stack["status"] = call.body["status"].clone();
                 ok(cluster.stack.clone())
             }
             ("POST", EVENTS) => (201, call.body.clone()),
+            ("GET", CRD) => ok(served_crd(cluster.crd_list_map)),
             _ => panic!("unscripted request: {} {}", call.method, call.uri),
         }
+    }
+
+    /// The PlatformStack CRD as the apiserver serves it, cut down to what
+    /// `stall` reads: `status.conditions` in `v1alpha1`, a list-map keyed by
+    /// `type` or the atomic list of the CRD before WI-400.
+    fn served_crd(list_map: bool) -> Value {
+        let mut conditions = json!({ "type": "array",
+                                     "items": { "type": "object", "required": ["type"] } });
+        if list_map {
+            conditions["x-kubernetes-list-type"] = json!("map");
+            conditions["x-kubernetes-list-map-keys"] = json!(["type"]);
+        }
+        json!({
+            "apiVersion": "apiextensions.k8s.io/v1", "kind": "CustomResourceDefinition",
+            "metadata": { "name": "platformstacks.apprafter.io" },
+            "spec": {
+                "group": "apprafter.io", "scope": "Namespaced",
+                "names": { "kind": "PlatformStack", "plural": "platformstacks" },
+                "versions": [{
+                    "name": "v1alpha1", "served": true, "storage": true,
+                    "schema": { "openAPIV3Schema": { "type": "object", "properties": {
+                        "status": { "type": "object",
+                                    "properties": { "conditions": conditions } } } } },
+                }],
+            },
+        })
+    }
+
+    /// A status apply as the apiserver merges it once `status.conditions` is
+    /// a list-map keyed by `type` (WI-400), following what kind measured
+    /// (`e2e/platformstack-listmap-upgrade-proof.sh`): a manager owns, by
+    /// `type`, the conditions it sent; an entry it stops sending goes unless
+    /// another manager owns it by key; an ownership of the whole list left
+    /// from the atomic list (`f:conditions: {}`) is replaced by one by key,
+    /// and an entry that apply leaves out stays, owned by nobody; a pair of
+    /// one `type` already on the object becomes one entry; a list that names
+    /// one `type` twice is refused. The rest of the status is
+    /// `platform-controller`'s, and its apply replaces it.
+    fn apply_status_list_map(cluster: &mut Cluster, call: &Call) -> (u16, Value) {
+        let manager = call
+            .uri
+            .split(['?', '&'])
+            .find_map(|p| p.strip_prefix("fieldManager="))
+            .expect("an apply names its field manager")
+            .to_string();
+        let type_of = |c: &Value| c["type"].as_str().unwrap_or_default().to_string();
+        let key = |t: &str| format!(r#"k:{{"type":"{t}"}}"#);
+        let sent = call.body["status"]["conditions"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let mut sent_types: Vec<String> = Vec::new();
+        for t in sent.iter().map(type_of) {
+            if sent_types.contains(&t) {
+                return (
+                    422,
+                    json!({ "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                            "reason": "Invalid", "code": 422,
+                            "message": format!(
+                                ".status.conditions: duplicate entries for key [type=\"{t}\"]") }),
+                );
+            }
+            sent_types.push(t);
+        }
+        let fields = cluster.stack["metadata"]["managedFields"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let (mine, others): (Vec<Value>, Vec<Value>) = fields
+            .into_iter()
+            .partition(|e| e["subresource"] == "status" && e["manager"] == manager.as_str());
+        let owns = |e: &Value, t: &str| {
+            e["subresource"] == "status"
+                && e["fieldsV1"]["f:status"]["f:conditions"]
+                    .get(key(t))
+                    .is_some()
+        };
+        let mut conditions = cluster.stack["status"]["conditions"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        conditions.retain(|c| {
+            let t = type_of(c);
+            let let_go = mine.iter().any(|e| owns(e, &t)) && !sent_types.contains(&t);
+            !let_go || others.iter().any(|e| owns(e, &t))
+        });
+        for c in sent {
+            match conditions
+                .iter_mut()
+                .find(|have| type_of(have) == type_of(&c))
+            {
+                Some(have) => *have = c,
+                None => conditions.push(c),
+            }
+        }
+        let mut seen: Vec<String> = Vec::new();
+        conditions.retain(|c| {
+            let t = type_of(c);
+            let first = !seen.contains(&t);
+            seen.push(t);
+            first
+        });
+        if manager == FIELD_MANAGER {
+            cluster.stack["status"] = call.body["status"].clone();
+        }
+        cluster.stack["status"]["conditions"] = json!(conditions);
+        let mut fields = others;
+        if !sent_types.is_empty() {
+            let owned: serde_json::Map<String, Value> = sent_types
+                .iter()
+                .map(|t| (key(t), json!({ ".": {} })))
+                .collect();
+            fields.push(json!({
+                "manager": manager, "operation": "Apply", "subresource": "status",
+                "apiVersion": "apprafter.io/v1alpha1", "fieldsType": "FieldsV1",
+                "fieldsV1": { "f:status": { "f:conditions": owned } },
+            }));
+        }
+        cluster.stack["metadata"]["managedFields"] = json!(fields);
+        ok(cluster.stack.clone())
     }
 
     fn scripted(cluster: Cluster) -> (Client, Shared) {
@@ -4855,6 +5038,8 @@ mod bounded_reconcile_tests {
             anchor: None,
             silent: vec![],
             calls: vec![],
+            list_map: false,
+            crd_list_map: false,
         }
     }
 
@@ -5341,11 +5526,10 @@ mod bounded_reconcile_tests {
         );
     }
 
-    /// A cut reconcile writes no status — `status.conditions` is an atomic
-    /// list written whole by `platform-controller`, and the pass that would
-    /// have written it did not finish — so the cut is reported where a
-    /// reader of `kubectl describe platformstack default` sees it: a Warning
-    /// Event on the stack.
+    /// `error_policy` reports a cut as a Warning Event on the stack, the
+    /// record `kubectl describe platformstack default` keeps after the
+    /// `ReconcileStalled` condition is gone, and writes no status itself:
+    /// the condition is `reconcile_with_deadline`'s (see `stall_tests`).
     #[tokio::test(start_paused = true)]
     async fn an_abandoned_reconcile_is_reported_as_a_warning_event_on_the_stack() {
         let stack = stack_on("0.2.80", "0.2.80");
@@ -5380,7 +5564,7 @@ mod bounded_reconcile_tests {
         assert!(note.contains("did not finish within 120s"), "{note}");
         assert!(
             !calls(&state).iter().any(|c| c.is("PATCH", STATUS)),
-            "a cut reconcile writes no status"
+            "error_policy writes no status"
         );
     }
 
@@ -5656,5 +5840,648 @@ mod bounded_reconcile_tests {
             history_versions(&state.lock().unwrap().stack["status"]),
             vec!["0.2.79".to_string(), "0.2.80".to_string()]
         );
+    }
+
+    /// `ReconcileStalled` on the stack's status, under its own field manager
+    /// (WI-400): set by `reconcile_with_deadline` when a pass is cut, removed
+    /// after a pass that finishes, never sent by `platform-controller`, and
+    /// written only while the served CRD makes the list a list-map and the
+    /// ownership on the stack is one whose transitions kind measured. Run
+    /// against the scripted apiserver's list-map model
+    /// ([`apply_status_list_map`]).
+    mod stall_tests {
+        use super::*;
+        use crate::stall::{STALL_FIELD_MANAGER, STALL_WRITE_BUDGET};
+
+        const STALL_QUERY: &str = "fieldManager=apprafter-reconcile-deadline";
+        const CONTROLLER_QUERY: &str = "fieldManager=platform-controller";
+        const STALLED: &str = "ReconcileStalled";
+
+        /// Every condition `stack_on` carries.
+        const SETTLED: [&str; 7] = [
+            "Ready",
+            "Synced",
+            "UpstreamReachable",
+            "YankedVersion",
+            "MigrationPending",
+            "UpgradeAvailable",
+            "UnauthorizedSourceModification",
+        ];
+
+        fn by_key(types: &[&str]) -> Value {
+            Value::Object(
+                types
+                    .iter()
+                    .map(|t| (format!(r#"k:{{"type":"{t}"}}"#), json!({ ".": {} })))
+                    .collect(),
+            )
+        }
+
+        fn status_entry(manager: &str, conditions: Value) -> Value {
+            json!({ "manager": manager, "operation": "Apply", "subresource": "status",
+                    "apiVersion": "apprafter.io/v1alpha1", "fieldsType": "FieldsV1",
+                    "fieldsV1": { "f:status": { "f:conditions": conditions } } })
+        }
+
+        /// `stack_on`, as written under the list-map CRD:
+        /// `platform-controller` owns each of its conditions by key.
+        fn listed_stack_on(version: &str, pin: &str) -> Value {
+            let mut stack = stack_on(version, pin);
+            stack["metadata"]["managedFields"] =
+                json!([status_entry(FIELD_MANAGER, by_key(&SETTLED))]);
+            stack
+        }
+
+        fn listed(stack: Value, parent: Value) -> Cluster {
+            let mut cluster = cluster(stack, parent);
+            cluster.list_map = true;
+            cluster.crd_list_map = true;
+            cluster
+        }
+
+        fn stalled() -> Value {
+            prior_condition(STALLED, "True", "ReconcileTimedOut")
+        }
+
+        /// `ReconcileStalled` added to `stack`, owned by key by `owners`;
+        /// with none, it is one nobody's apply holds any more.
+        fn with_stall(mut stack: Value, owners: &[&str]) -> Value {
+            stack["status"]["conditions"]
+                .as_array_mut()
+                .expect("conditions")
+                .push(stalled());
+            if !stack["metadata"]["managedFields"].is_array() {
+                stack["metadata"]["managedFields"] = json!([]);
+            }
+            for owner in owners {
+                stack["metadata"]["managedFields"]
+                    .as_array_mut()
+                    .expect("managedFields")
+                    .push(status_entry(owner, by_key(&[STALLED])));
+            }
+            stack
+        }
+
+        /// What `platform-controller` owns of the conditions, replaced.
+        fn controller_owns(state: &Shared, conditions: Value) {
+            let mut cluster = state.lock().unwrap();
+            let entry = cluster.stack["metadata"]["managedFields"]
+                .as_array_mut()
+                .expect("managedFields")
+                .iter_mut()
+                .find(|e| e["manager"] == FIELD_MANAGER && e["subresource"] == "status")
+                .expect("platform-controller's status entry");
+            entry["fieldsV1"]["f:status"]["f:conditions"] = conditions;
+        }
+
+        fn status_writes(state: &Shared) -> Vec<Call> {
+            calls(state)
+                .into_iter()
+                .filter(|c| c.is("PATCH", STATUS))
+                .collect()
+        }
+
+        fn condition_types(write: &Call) -> Vec<String> {
+            write.body["status"]["conditions"]
+                .as_array()
+                .map(|cs| {
+                    cs.iter()
+                        .map(|c| c["type"].as_str().unwrap_or_default().to_string())
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+
+        fn stored_types(state: &Shared) -> Vec<String> {
+            state.lock().unwrap().stack["status"]["conditions"]
+                .as_array()
+                .map(|cs| {
+                    cs.iter()
+                        .map(|c| c["type"].as_str().unwrap_or_default().to_string())
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+
+        /// A stack the controller has written once, under the list-map
+        /// model, and the context to run more passes on it.
+        async fn settled() -> (Shared, Arc<Context>) {
+            let stack = listed_stack_on("0.2.80", "0.2.80");
+            let parent = parent_on(&stack, "0.2.80");
+            let (client, state) = scripted(listed(stack, parent));
+            let ctx = context(client, Arc::new(NoRegistry));
+            reconcile(the_stack(&state), ctx.clone())
+                .await
+                .expect("the settling pass");
+            (state, ctx)
+        }
+
+        /// `ReconcileStalled` put on the stored stack, owned by `owners`.
+        fn stall_into(state: &Shared, owners: &[&str]) {
+            let mut cluster = state.lock().unwrap();
+            let stack = cluster.stack.take();
+            cluster.stack = with_stall(stack, owners);
+        }
+
+        /// A cut pass sets `ReconcileStalled=True` in one apply under its own
+        /// field manager, carrying that condition and nothing else of the
+        /// status, so it can neither re-assert nor prune what
+        /// `platform-controller` owns.
+        #[tokio::test(start_paused = true)]
+        async fn a_cut_pass_sets_reconcile_stalled_under_its_own_field_manager() {
+            let stack = listed_stack_on("0.2.80", "0.2.80");
+            let parent = parent_on(&stack, "0.2.80");
+            let mut cluster = listed(stack, parent);
+            cluster.silent.push(("GET", PARENT.to_string()));
+            let (client, state) = scripted(cluster);
+            let ctx = context(client, Arc::new(NoRegistry));
+            let started = tokio::time::Instant::now();
+            let err = reconcile_with_deadline(the_stack(&state), ctx)
+                .await
+                .expect_err("a reconcile that never finishes is cut");
+            assert!(matches!(err, Error::TimedOut(_)), "{err:?}");
+            assert_eq!(
+                started.elapsed(),
+                RECONCILE_DEADLINE,
+                "the stall write is answered at once"
+            );
+            let writes = status_writes(&state);
+            assert_eq!(writes.len(), 1, "{writes:#?}");
+            let write = &writes[0];
+            assert!(
+                write.uri.contains(STALL_QUERY) && write.uri.contains("force=true"),
+                "{}",
+                write.uri
+            );
+            assert_eq!(write.body["kind"], "PlatformStack");
+            assert_eq!(write.body["metadata"]["name"], "default");
+            assert_eq!(
+                write.body["status"].as_object().map(|s| s.len()),
+                Some(1),
+                "the status carries the conditions alone: {:#}",
+                write.body
+            );
+            assert_eq!(condition_types(write), vec![STALLED]);
+            let written = &write.body["status"]["conditions"][0];
+            assert_eq!(written["status"], "True");
+            assert_eq!(written["reason"], "ReconcileTimedOut");
+            let message = written["message"].as_str().expect("message");
+            assert!(message.contains("did not finish within 120s"), "{message}");
+            let mut kept: Vec<&str> = SETTLED.to_vec();
+            kept.push(STALLED);
+            assert_eq!(
+                stored_types(&state),
+                kept,
+                "every condition stays beside it"
+            );
+        }
+
+        /// An apiserver that answers nothing does not answer the stall write
+        /// either. That write has its own budget, so the pass gives its slot
+        /// back at `RECONCILE_DEADLINE + STALL_WRITE_BUDGET`, not never.
+        #[tokio::test(start_paused = true)]
+        async fn the_stall_write_has_its_own_budget() {
+            let stack: Arc<PlatformStack> = Arc::new(
+                serde_json::from_value(listed_stack_on("0.2.80", "0.2.80")).expect("stack"),
+            );
+            let ctx = context(
+                operator_core::testing::stalled_client(),
+                Arc::new(NoRegistry),
+            );
+            let started = tokio::time::Instant::now();
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(3600),
+                reconcile_with_deadline(stack, ctx),
+            )
+            .await
+            .expect("a stall write the apiserver never answers is given up at its budget");
+            assert!(matches!(outcome, Err(Error::TimedOut(_))), "{outcome:?}");
+            assert_eq!(started.elapsed(), RECONCILE_DEADLINE + STALL_WRITE_BUDGET);
+        }
+
+        /// A cut on a stack whose conditions `platform-controller` still
+        /// owns whole (last written while the list was atomic: the first
+        /// passes after the upgrade) sets `ReconcileStalled` beside them and
+        /// leaves that ownership to `platform-controller`'s next apply.
+        /// Measured on kind: the apply adds the condition and keeps every
+        /// other one, and the condition survives `platform-controller`'s
+        /// first apply by key.
+        #[tokio::test(start_paused = true)]
+        async fn a_cut_on_a_list_the_controller_owns_whole_is_set_beside_it() {
+            let mut stack = stack_on("0.2.80", "0.2.80");
+            stack["metadata"]["managedFields"] = json!([status_entry(FIELD_MANAGER, json!({}))]);
+            let parent = parent_on(&stack, "0.2.80");
+            let mut cluster = listed(stack, parent);
+            cluster.silent.push(("GET", PARENT.to_string()));
+            let (client, state) = scripted(cluster);
+            let ctx = context(client, Arc::new(NoRegistry));
+            let err = reconcile_with_deadline(the_stack(&state), ctx)
+                .await
+                .expect_err("a reconcile that never finishes is cut");
+            assert!(matches!(err, Error::TimedOut(_)), "{err:?}");
+            let writes = status_writes(&state);
+            assert_eq!(writes.len(), 1, "{writes:#?}");
+            assert!(writes[0].uri.contains(STALL_QUERY), "{}", writes[0].uri);
+            assert_eq!(condition_types(&writes[0]), vec![STALLED]);
+            let mut kept: Vec<&str> = SETTLED.to_vec();
+            kept.push(STALLED);
+            assert_eq!(
+                stored_types(&state),
+                kept,
+                "every condition stays beside it"
+            );
+            assert!(crate::stall::controller_owns_list_whole(&the_stack(&state)));
+        }
+
+        /// After a rollback while stalled and a re-upgrade, both managers own
+        /// the list whole, and the `ReconcileStalled` the older operator
+        /// carried is on the stack. A cut writes nothing then: the stall
+        /// manager's first step there, letting go of its whole-list
+        /// ownership, was not measured in that state, and the condition on
+        /// the stack already says it is stalled. `platform-controller`'s
+        /// next apply ends the state.
+        #[tokio::test(start_paused = true)]
+        async fn a_cut_writes_nothing_while_both_managers_own_a_carried_stall_whole() {
+            let mut stack = with_stall(stack_on("0.2.80", "0.2.80"), &[]);
+            stack["metadata"]["managedFields"] = json!([
+                status_entry(FIELD_MANAGER, json!({})),
+                status_entry(STALL_FIELD_MANAGER, json!({})),
+            ]);
+            let parent = parent_on(&stack, "0.2.80");
+            let mut cluster = listed(stack, parent);
+            cluster.silent.push(("GET", PARENT.to_string()));
+            let (client, state) = scripted(cluster);
+            let ctx = context(client, Arc::new(NoRegistry));
+            let err = reconcile_with_deadline(the_stack(&state), ctx)
+                .await
+                .expect_err("a reconcile that never finishes is cut");
+            assert!(matches!(err, Error::TimedOut(_)), "{err:?}");
+            assert!(status_writes(&state).is_empty(), "{:#?}", calls(&state));
+            assert!(stored_types(&state).contains(&STALLED.to_string()));
+        }
+
+        /// A rollback re-applies the atomic CRD while this operator can
+        /// still hold the lease, and the CRD switch leaves every by-key
+        /// `managedFields` entry in place. On the atomic list an apply of
+        /// `[ReconcileStalled]` replaces every other condition (measured on
+        /// kind), so neither a cut nor a pass that finishes writes anything
+        /// under the stall manager: both read the served CRD first.
+        #[tokio::test(start_paused = true)]
+        async fn nothing_is_written_while_the_served_crd_is_atomic() {
+            let (state, ctx) = settled().await;
+            {
+                let mut cluster = state.lock().unwrap();
+                cluster.list_map = false;
+                cluster.crd_list_map = false;
+                cluster.silent.push(("GET", PARENT.to_string()));
+            }
+            let before = calls(&state).len();
+            let err = reconcile_with_deadline(the_stack(&state), ctx.clone())
+                .await
+                .expect_err("a reconcile that never finishes is cut");
+            assert!(matches!(err, Error::TimedOut(_)), "{err:?}");
+            let cut = calls(&state)[before..].to_vec();
+            assert!(
+                cut.iter().any(|c| c.is("GET", CRD)),
+                "mark reads the CRD: {cut:#?}"
+            );
+            assert!(
+                !cut.iter().any(|c| c.is("PATCH", STATUS)),
+                "mark writes nothing: {cut:#?}"
+            );
+
+            state.lock().unwrap().silent.clear();
+            stall_into(&state, &[STALL_FIELD_MANAGER]);
+            let before = calls(&state).len();
+            reconcile_with_deadline(the_stack(&state), ctx)
+                .await
+                .expect("the pass finishes");
+            let finished = calls(&state)[before..].to_vec();
+            assert!(
+                finished.iter().any(|c| c.is("GET", CRD)),
+                "clear reads the CRD: {finished:#?}"
+            );
+            assert!(
+                !finished.iter().any(|c| c.is("PATCH", STATUS)),
+                "clear writes nothing: {finished:#?}"
+            );
+            assert!(stored_types(&state).contains(&STALLED.to_string()));
+        }
+
+        /// A pass that finishes removes `ReconcileStalled` with one empty
+        /// apply under the stall manager, and every other condition stays.
+        #[tokio::test]
+        async fn a_pass_that_finishes_removes_reconcile_stalled_and_nothing_else() {
+            let (state, ctx) = settled().await;
+            let kept = stored_types(&state);
+            stall_into(&state, &[STALL_FIELD_MANAGER]);
+            let before = status_writes(&state).len();
+            reconcile_with_deadline(the_stack(&state), ctx)
+                .await
+                .expect("the pass finishes");
+            let writes = status_writes(&state)[before..].to_vec();
+            assert_eq!(writes.len(), 1, "{writes:#?}");
+            assert!(
+                writes[0].uri.contains(STALL_QUERY) && writes[0].uri.contains("force=true"),
+                "{}",
+                writes[0].uri
+            );
+            assert_eq!(writes[0].body["status"], json!({ "conditions": [] }));
+            assert_eq!(stored_types(&state), kept);
+        }
+
+        /// One nobody owns any more — what a rollback while stalled leaves
+        /// behind — is adopted as it is, then let go, and goes.
+        #[tokio::test]
+        async fn a_reconcile_stalled_nobody_owns_is_adopted_then_let_go() {
+            let (state, ctx) = settled().await;
+            let kept = stored_types(&state);
+            stall_into(&state, &[]);
+            let before = status_writes(&state).len();
+            reconcile_with_deadline(the_stack(&state), ctx)
+                .await
+                .expect("the pass finishes");
+            let writes = status_writes(&state)[before..].to_vec();
+            assert_eq!(writes.len(), 3, "let go, adopt, let go: {writes:#?}");
+            assert!(writes.iter().all(|w| w.uri.contains(STALL_QUERY)));
+            assert_eq!(writes[0].body["status"], json!({ "conditions": [] }));
+            assert_eq!(
+                writes[1].body["status"],
+                json!({ "conditions": [stalled()] })
+            );
+            assert_eq!(writes[2].body["status"], json!({ "conditions": [] }));
+            assert_eq!(stored_types(&state), kept);
+        }
+
+        /// One another manager owns stays, after a single empty apply: an
+        /// adopt beside that owner would remove nothing, and repeated on
+        /// every pass would be a write loop.
+        #[tokio::test]
+        async fn a_reconcile_stalled_another_manager_holds_is_left_in_place() {
+            let (state, ctx) = settled().await;
+            stall_into(&state, &["kubectl-edit"]);
+            let before = status_writes(&state).len();
+            reconcile_with_deadline(the_stack(&state), ctx)
+                .await
+                .expect("the pass finishes");
+            let writes = status_writes(&state)[before..].to_vec();
+            assert_eq!(writes.len(), 1, "{writes:#?}");
+            assert_eq!(writes[0].body["status"], json!({ "conditions": [] }));
+            assert!(stored_types(&state).contains(&STALLED.to_string()));
+        }
+
+        /// A pass that fails for another reason neither set the stall nor
+        /// proved it over: no write under the stall manager.
+        #[tokio::test]
+        async fn a_pass_that_fails_otherwise_leaves_reconcile_stalled_alone() {
+            let stack = with_stall(listed_stack_on("0.2.80", "0.2.80"), &[STALL_FIELD_MANAGER]);
+            let (client, state) = scripted(listed(stack, Value::Null));
+            let ctx = context(client, Arc::new(NoRegistry));
+            let err = reconcile_with_deadline(the_stack(&state), ctx)
+                .await
+                .expect_err("a parent Application that does not parse fails the pass");
+            assert!(!matches!(err, Error::TimedOut(_)), "{err:?}");
+            assert!(
+                status_writes(&state)
+                    .iter()
+                    .all(|c| !c.uri.contains(STALL_QUERY)),
+                "{:#?}",
+                calls(&state)
+            );
+        }
+
+        /// A settled stack is re-applied once when `platform-controller`
+        /// owns its conditions whole (a stack last written while the list
+        /// was atomic) or co-owns `ReconcileStalled` (an older operator
+        /// copied it into its apply): only its own apply puts either right,
+        /// and after it the stall manager can write.
+        #[tokio::test]
+        async fn a_settled_stack_whose_conditions_are_not_owned_by_key_is_reapplied_once() {
+            let mut with_stall_key: Vec<&str> = SETTLED.to_vec();
+            with_stall_key.push(STALLED);
+            for owned in [json!({}), by_key(&with_stall_key)] {
+                let (state, ctx) = settled().await;
+                controller_owns(&state, owned.clone());
+                let before = status_writes(&state).len();
+                reconcile(the_stack(&state), ctx.clone())
+                    .await
+                    .expect("the re-applying pass");
+                let writes = status_writes(&state)[before..].to_vec();
+                assert_eq!(writes.len(), 1, "{owned}: {writes:#?}");
+                assert!(
+                    writes[0].uri.contains(CONTROLLER_QUERY),
+                    "{}",
+                    writes[0].uri
+                );
+                assert!(!condition_types(&writes[0]).contains(&STALLED.to_string()));
+                assert!(
+                    crate::stall::controller_owns_conditions_by_key(&the_stack(&state)),
+                    "{owned}"
+                );
+                reconcile(the_stack(&state), ctx)
+                    .await
+                    .expect("a settled pass");
+                assert_eq!(status_writes(&state).len(), before + 1, "{owned}: once");
+            }
+        }
+
+        /// The live upgrade end to end: a stall on a stack whose conditions
+        /// `platform-controller` still owns whole stays through the pass that
+        /// re-applies them (that pass read the old ownership), and goes with
+        /// the next one.
+        #[tokio::test]
+        async fn a_stall_on_a_list_owned_whole_goes_once_the_controller_has_reapplied() {
+            let (state, ctx) = settled().await;
+            controller_owns(&state, json!({}));
+            stall_into(&state, &[STALL_FIELD_MANAGER]);
+            let before = status_writes(&state).len();
+            reconcile_with_deadline(the_stack(&state), ctx.clone())
+                .await
+                .expect("the re-applying pass");
+            let first = status_writes(&state)[before..].to_vec();
+            assert_eq!(first.len(), 1, "{first:#?}");
+            assert!(first[0].uri.contains(CONTROLLER_QUERY), "{}", first[0].uri);
+            assert!(stored_types(&state).contains(&STALLED.to_string()));
+            reconcile_with_deadline(the_stack(&state), ctx.clone())
+                .await
+                .expect("the next pass");
+            let second = status_writes(&state)[before + 1..].to_vec();
+            assert_eq!(second.len(), 1, "{second:#?}");
+            assert!(second[0].uri.contains(STALL_QUERY), "{}", second[0].uri);
+            assert!(!stored_types(&state).contains(&STALLED.to_string()));
+            reconcile_with_deadline(the_stack(&state), ctx)
+                .await
+                .expect("a settled pass");
+            assert_eq!(status_writes(&state).len(), before + 2);
+        }
+
+        /// `platform-controller` clones the status it read, `ReconcileStalled`
+        /// included, and must not send it: co-owning it would keep it on the
+        /// stack after the stall manager lets it go.
+        #[tokio::test]
+        async fn the_controllers_status_write_never_carries_reconcile_stalled() {
+            let mut stack = with_stall(listed_stack_on("0.2.80", "0.2.80"), &[STALL_FIELD_MANAGER]);
+            stack["status"]["lastUpstreamCheck"] = Value::Null;
+            let parent = parent_on(&stack, "0.2.80");
+            let (client, state) = scripted(listed(stack, parent));
+            let upstream = Arc::new(Published {
+                latest: "0.2.81",
+                class: ChangeClass::Safe,
+            });
+            reconcile(the_stack(&state), context(client, upstream))
+                .await
+                .expect("the reconcile succeeds");
+            let patch = status_patch(&calls(&state));
+            assert!(
+                !condition_types(&patch).contains(&STALLED.to_string()),
+                "{:#}",
+                patch.body
+            );
+            assert_every_condition_carried(&patch);
+            assert!(stored_types(&state).contains(&STALLED.to_string()));
+        }
+
+        /// A settled stack is not rewritten, and the stall manager's
+        /// condition appearing on it is no reason to rewrite it either.
+        #[tokio::test]
+        async fn reconcile_stalled_alone_is_no_reason_for_the_controller_to_write() {
+            let (state, ctx) = settled().await;
+            let settled_writes = status_writes(&state).len();
+            reconcile(the_stack(&state), ctx.clone())
+                .await
+                .expect("a settled pass");
+            assert_eq!(status_writes(&state).len(), settled_writes);
+            stall_into(&state, &[STALL_FIELD_MANAGER]);
+            reconcile(the_stack(&state), ctx)
+                .await
+                .expect("a pass that reads the stall");
+            assert_eq!(
+                status_writes(&state).len(),
+                settled_writes,
+                "ReconcileStalled alone is no reason to write"
+            );
+        }
+
+        /// A duplicate condition type read back (possible on a stack written
+        /// while the list was atomic) is written away, once, by a pass that
+        /// would otherwise write nothing: the list-map apply that carried it
+        /// would be refused on every pass.
+        #[tokio::test]
+        async fn a_duplicate_condition_type_is_written_away() {
+            let (state, ctx) = settled().await;
+            state.lock().unwrap().stack["status"]["conditions"]
+                .as_array_mut()
+                .expect("conditions")
+                .push(prior_condition("Ready", "False", "Degraded"));
+            let before = status_writes(&state).len();
+            reconcile(the_stack(&state), ctx.clone())
+                .await
+                .expect("the reconcile succeeds");
+            let writes = status_writes(&state)[before..].to_vec();
+            assert_eq!(writes.len(), 1, "{writes:#?}");
+            let types = condition_types(&writes[0]);
+            assert_eq!(
+                types.iter().filter(|t| *t == "Ready").count(),
+                1,
+                "{types:?}"
+            );
+            assert_every_condition_carried(&writes[0]);
+            let ready = stored_types(&state)
+                .into_iter()
+                .filter(|t| t == "Ready")
+                .count();
+            assert_eq!(ready, 1);
+            reconcile(the_stack(&state), ctx)
+                .await
+                .expect("a settled pass");
+            assert_eq!(status_writes(&state).len(), before + 1, "once");
+        }
+
+        /// The first write after the upgrade, on a list `platform-controller`
+        /// owns whole, can be one that retires a condition: here
+        /// `BackupHealthy`, with backups off. Applied straight from the
+        /// whole-list ownership, that apply would keep it, owned by nobody
+        /// (measured on kind), and every later pass would re-apply in vain.
+        /// The list is first re-applied as it was read, which takes it by
+        /// key, and the write after it removes the condition.
+        #[tokio::test]
+        async fn a_condition_retired_by_the_first_write_after_the_upgrade_is_removed() {
+            let mut stack = stack_on("0.2.80", "0.2.80");
+            stack["status"]["conditions"]
+                .as_array_mut()
+                .expect("conditions")
+                .push(prior_condition("BackupHealthy", "True", "Succeeded"));
+            stack["metadata"]["managedFields"] = json!([status_entry(FIELD_MANAGER, json!({}))]);
+            assert!(stack["spec"]["backup"].is_null(), "backups are off");
+            let parent = parent_on(&stack, "0.2.80");
+            let (client, state) = scripted(listed(stack, parent));
+            let ctx = context(client, Arc::new(NoRegistry));
+            reconcile(the_stack(&state), ctx.clone())
+                .await
+                .expect("the first pass after the upgrade");
+            let writes = status_writes(&state);
+            assert_eq!(writes.len(), 2, "{writes:#?}");
+            assert!(
+                writes.iter().all(|w| w.uri.contains(CONTROLLER_QUERY)),
+                "{writes:#?}"
+            );
+            let backup = "BackupHealthy".to_string();
+            assert!(
+                condition_types(&writes[0]).contains(&backup),
+                "the list as read"
+            );
+            assert!(!condition_types(&writes[1]).contains(&backup));
+            let stored = stored_types(&state);
+            assert!(!stored.contains(&backup), "{stored:?}");
+            for t in SETTLED {
+                assert!(stored.contains(&t.to_string()), "{t}: {stored:?}");
+            }
+            reconcile(the_stack(&state), ctx)
+                .await
+                .expect("a settled pass");
+            assert_eq!(
+                status_writes(&state).len(),
+                2,
+                "the next pass writes nothing"
+            );
+        }
+
+        /// An older operator still running under the list-map CRD (between
+        /// the CRD's sync wave and its own pod's replacement) applies by key
+        /// from its whole-list ownership, so a condition it left out stays,
+        /// owned by nobody, while `platform-controller` owns the rest by key.
+        /// The first write that leaves it out too re-applies the status as
+        /// read first, which adopts it, and the write after it removes it.
+        #[tokio::test]
+        async fn a_condition_nobody_holds_is_adopted_before_the_write_that_retires_it() {
+            let mut stack = listed_stack_on("0.2.80", "0.2.80");
+            stack["status"]["conditions"]
+                .as_array_mut()
+                .expect("conditions")
+                .push(prior_condition("BackupHealthy", "True", "Succeeded"));
+            let parent = parent_on(&stack, "0.2.80");
+            let (client, state) = scripted(listed(stack, parent));
+            let ctx = context(client, Arc::new(NoRegistry));
+            reconcile(the_stack(&state), ctx.clone())
+                .await
+                .expect("the pass");
+            let writes = status_writes(&state);
+            assert_eq!(writes.len(), 2, "{writes:#?}");
+            let backup = "BackupHealthy".to_string();
+            assert!(
+                condition_types(&writes[0]).contains(&backup),
+                "the list as read"
+            );
+            assert!(!condition_types(&writes[1]).contains(&backup));
+            assert!(!stored_types(&state).contains(&backup));
+            reconcile(the_stack(&state), ctx)
+                .await
+                .expect("a settled pass");
+            assert_eq!(
+                status_writes(&state).len(),
+                2,
+                "the next pass writes nothing"
+            );
+        }
     }
 }
