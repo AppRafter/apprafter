@@ -188,8 +188,9 @@ pre-commit:
     - name: version-coherence
       glob: "{operator/charts/**,platform-stack/**,argocd-cue-cmp/**,cli/Cargo.toml}"
       run: ./scripts/check-version-coherence.sh
-    # The remaining `just lint` script gates. All offline, all under a second,
-    # all glob-scoped, so they cost nothing on a commit that cannot break them.
+    # The remaining `just lint` script gates. All offline, all a few seconds at
+    # most, all glob-scoped, so they cost nothing on a commit that cannot break
+    # them.
     #
     # What is deliberately NOT here: `just lint` also runs `cargo fmt`,
     # `cargo clippy` and the docsgen property tests across two workspaces.
