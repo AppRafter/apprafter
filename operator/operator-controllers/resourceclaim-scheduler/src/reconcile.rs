@@ -124,6 +124,15 @@ pub async fn reconcile(
 }
 
 /// Error policy: increment error metrics and requeue after 30 seconds.
+///
+/// A pass abandoned at [`crate::RECONCILE_DEADLINE`] is also counted on
+/// `apprafter_reconcile_timeouts_total` (WI-400). Its `kind="ResourceClaim"`
+/// series is shared with the provisioner's claim controller, so the counter
+/// alone cannot say which of the two was cut; the WARN message tells them
+/// apart ("resourceclaim reconcile error" here, "resourceclaim provisioner
+/// reconcile error" there). Nothing is written to the claim on any error
+/// path, a timeout included: the claim keeps the `Scheduled` condition its
+/// last committed status apply recorded.
 pub fn error_policy(claim: Arc<ResourceClaim>, err: &ReconcileError, ctx: Arc<Context>) -> Action {
     let name = claim.name_any();
     let namespace = claim.namespace().unwrap_or_default();
@@ -136,6 +145,12 @@ pub fn error_policy(claim: Arc<ResourceClaim>, err: &ReconcileError, ctx: Arc<Co
         .reconcile_errors
         .with_label_values(&[KIND])
         .inc();
+    if matches!(err, ReconcileError::TimedOut(_)) {
+        ctx.metrics
+            .reconcile_timeouts
+            .with_label_values(&[KIND])
+            .inc();
+    }
     Action::requeue(Duration::from_secs(30))
 }
 
@@ -1016,6 +1031,81 @@ mod tests {
         assert!(
             log.lock().expect("log").is_empty(),
             "the error path must not talk to the apiserver"
+        );
+    }
+
+    /// A pass abandoned at its deadline (WI-400) is counted where an alert can
+    /// see it — `apprafter_reconcile_timeouts_total` — on top of the two
+    /// counters every error lands on, and is retried on the same 30s cadence.
+    /// It must write NOTHING: no status (an apply under
+    /// `resourceclaim-scheduler` that omits `provider` prunes it) and no
+    /// Event. The claim keeps the conditions it had.
+    #[tokio::test]
+    async fn error_policy_counts_a_timed_out_reconcile_on_the_timeout_counter() {
+        let (client, log) = scripted_apiserver(|_| apiserver_unavailable());
+        let ctx = context(client);
+        let err = ReconcileError::from(operator_core::deadline::ReconcileTimedOut {
+            after: crate::RECONCILE_DEADLINE,
+        });
+
+        let action = error_policy(live_claim("pg", &[]), &err, ctx.clone());
+
+        assert_eq!(
+            ctx.metrics
+                .reconcile_timeouts
+                .with_label_values(&[KIND])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            ctx.metrics
+                .reconcile_errors
+                .with_label_values(&[KIND])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            ctx.metrics
+                .reconcile_total
+                .with_label_values(&[KIND, "landing", "error"])
+                .get(),
+            1.0
+        );
+        assert_eq!(action, Action::requeue(Duration::from_secs(30)));
+        assert!(
+            log.lock().expect("log").is_empty(),
+            "a timeout must write nothing — no status, no Event"
+        );
+    }
+
+    /// The timeout counter means "a pass was cut", not "a pass failed": an
+    /// apiserver that ANSWERS with an error is an ordinary error and must not
+    /// move it, or the alert built on it fires on every etcd blip.
+    #[tokio::test]
+    async fn error_policy_does_not_count_an_answered_apiserver_error_as_a_timeout() {
+        let (client, _log) = scripted_apiserver(|_| apiserver_unavailable());
+        let ctx = context(client);
+        let err = ReconcileError::Kube(kube::Error::Api(
+            kube::core::Status::failure("etcdserver: request timed out", "InternalError")
+                .with_code(500)
+                .boxed(),
+        ));
+
+        error_policy(live_claim("pg", &[]), &err, ctx.clone());
+
+        assert_eq!(
+            ctx.metrics
+                .reconcile_timeouts
+                .with_label_values(&[KIND])
+                .get(),
+            0.0
+        );
+        assert_eq!(
+            ctx.metrics
+                .reconcile_errors
+                .with_label_values(&[KIND])
+                .get(),
+            1.0
         );
     }
 }
