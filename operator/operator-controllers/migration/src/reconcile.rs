@@ -29,7 +29,7 @@ use thiserror::Error;
 use tracing::{info, warn};
 
 use operator_core::{
-    ExecutedStep, MigrationError, MigrationPlan, MigrationPlanStatus, MigrationStrategy,
+    ExecutedStep, Metrics, MigrationError, MigrationPlan, MigrationPlanStatus, MigrationStrategy,
     StepOutcome,
 };
 
@@ -42,6 +42,10 @@ use crate::strategy::{
 /// (`apprafter-operator` for Application status,
 /// `platform-controller` for PlatformStack status).
 pub const FIELD_MANAGER: &str = "migration-controller";
+
+/// This controller's `kind` label on the shared reconcile metrics. It counts
+/// one series, `apprafter_reconcile_timeouts_total` (WI-400).
+const KIND: &str = "MigrationPlan";
 
 const RECONCILE_REQUEUE_AFTER_PROGRESS: Duration = Duration::from_secs(1);
 const ERROR_REQUEUE_AFTER: Duration = Duration::from_secs(15);
@@ -84,7 +88,7 @@ pub enum Error {
 /// between `strategy.reject` and the `rejectedAt` seal re-runs a reject that
 /// short-circuits once the pin matches the snapshot — the same exposure a
 /// crash at that point already has. A timeout writes nothing: `error_policy`
-/// warns and requeues after `ERROR_REQUEUE_AFTER`.
+/// warns, counts it and requeues after `ERROR_REQUEUE_AFTER`.
 pub const RECONCILE_DEADLINE: Duration = Duration::from_secs(190);
 
 /// Reconciler context. Holds the kube client + both strategies
@@ -93,6 +97,9 @@ pub const RECONCILE_DEADLINE: Duration = Duration::from_secs(190);
 /// only an `Arc<Client>` and a static `ApiResource`.
 pub struct Context {
     pub client: Client,
+    /// The operator's shared metrics. This controller counts only a pass
+    /// abandoned at [`RECONCILE_DEADLINE`].
+    pub metrics: Arc<Metrics>,
     pub application_strategy: ApplicationMigrationStrategy,
     pub platform_strategy: PlatformMigrationStrategy,
     pub sourcecredential_strategy: SourceCredentialMigrationStrategy,
@@ -101,9 +108,10 @@ pub struct Context {
 /// Spawn the controller. Returns when the underlying watcher
 /// stream ends — under normal operation that means the leader
 /// lease was lost and the process is about to exit.
-pub async fn run(client: Client) -> Result<(), Error> {
+pub async fn run(client: Client, metrics: Arc<Metrics>) -> Result<(), Error> {
     let ctx = Arc::new(Context {
         client: client.clone(),
+        metrics,
         application_strategy: ApplicationMigrationStrategy,
         platform_strategy: PlatformMigrationStrategy::new(client.clone()),
         sourcecredential_strategy: SourceCredentialMigrationStrategy,
@@ -137,8 +145,18 @@ async fn reconcile_with_deadline(
     operator_core::deadline::within(RECONCILE_DEADLINE, reconcile(plan, ctx)).await
 }
 
-fn error_policy(_obj: Arc<MigrationPlan>, err: &Error, _ctx: Arc<Context>) -> Action {
+/// Warn, count a pass abandoned at [`RECONCILE_DEADLINE`] on
+/// `apprafter_reconcile_timeouts_total{kind="MigrationPlan"}`, and retry after
+/// [`ERROR_REQUEUE_AFTER`]. Only the timeout is counted: this controller
+/// records no other reconcile metric, before WI-400 or after it.
+fn error_policy(_obj: Arc<MigrationPlan>, err: &Error, ctx: Arc<Context>) -> Action {
     warn!(error = %err, "MigrationController error_policy fired");
+    if matches!(err, Error::TimedOut(_)) {
+        ctx.metrics
+            .reconcile_timeouts
+            .with_label_values(&[KIND])
+            .inc();
+    }
     Action::requeue(ERROR_REQUEUE_AFTER)
 }
 
@@ -600,16 +618,18 @@ mod tests {
         let client = operator_core::testing::stalled_client();
         Arc::new(Context {
             client: client.clone(),
+            metrics: Arc::new(operator_core::Metrics::new()),
             application_strategy: ApplicationMigrationStrategy,
             platform_strategy: PlatformMigrationStrategy::new(client),
             sourcecredential_strategy: SourceCredentialMigrationStrategy,
         })
     }
 
-    /// The WARN line is the only report of a cut pass (this controller has no
-    /// metrics and `MigrationPlanStatus` has no condition to carry it), so the
-    /// timeout must read as a timeout, with its bound — not as "kube API
-    /// error", which sends an operator after RBAC or the network.
+    /// The log is the only record of a cut pass that names the plan
+    /// (`MigrationPlanStatus` has no condition to carry it, and the metric
+    /// only counts it), so the timeout must read as a timeout, with its bound
+    /// — not as "kube API error", which sends an operator after RBAC or the
+    /// network.
     #[test]
     fn a_timed_out_migration_pass_names_the_deadline_it_ran_past() {
         let shown = Error::from(operator_core::deadline::ReconcileTimedOut {
@@ -667,6 +687,54 @@ mod tests {
         assert!(
             matches!(outcome, Err(Error::TimedOut(_))),
             "expected Error::TimedOut, got {outcome:?}"
+        );
+    }
+
+    /// A pass abandoned at the deadline is counted on
+    /// `apprafter_reconcile_timeouts_total{kind="MigrationPlan"}`, beside its
+    /// WARN line, so a walk or an alert sees it without reading the log
+    /// (WI-400). `stalled_client()` spawns its buffer task, hence the runtime.
+    #[tokio::test]
+    async fn error_policy_counts_a_timed_out_pass_on_the_timeout_counter() {
+        let ctx = stalled_context();
+        let plan = Arc::new(build_plan("application", vec![step(1)], Some("approved")));
+        let err = Error::from(operator_core::deadline::ReconcileTimedOut {
+            after: RECONCILE_DEADLINE,
+        });
+
+        let action = error_policy(plan, &err, ctx.clone());
+
+        assert_eq!(
+            ctx.metrics
+                .reconcile_timeouts
+                .with_label_values(&[KIND])
+                .get(),
+            1.0
+        );
+        assert_eq!(action, Action::requeue(ERROR_REQUEUE_AFTER));
+    }
+
+    /// Only a timeout is counted: any other error leaves the series at zero,
+    /// which is what the metric promises on a healthy operator.
+    #[tokio::test]
+    async fn error_policy_counts_no_other_error_as_a_timeout() {
+        let ctx = stalled_context();
+        let plan = Arc::new(build_plan("application", vec![step(1)], Some("approved")));
+
+        for err in [
+            Error::UnknownPhase("paused".into()),
+            Error::MissingField("executedSteps".into()),
+        ] {
+            let action = error_policy(plan.clone(), &err, ctx.clone());
+            assert_eq!(action, Action::requeue(ERROR_REQUEUE_AFTER), "{err}");
+        }
+
+        assert_eq!(
+            ctx.metrics
+                .reconcile_timeouts
+                .with_label_values(&[KIND])
+                .get(),
+            0.0
         );
     }
 
