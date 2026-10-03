@@ -39,3 +39,18 @@ fn the_claim_controller_runs_the_deadline_wrapper() {
         "the bare claim reconcile is wired into a Controller"
     );
 }
+
+#[test]
+fn the_shared_volume_controller_runs_the_deadline_wrapper() {
+    let src = lib_src_compact();
+    assert!(
+        src.contains(
+            ".run(shared_volume::reconcile_shared_volume_with_deadline,shared_volume::error_policy_sv,"
+        ),
+        "the SharedVolume Controller must run shared_volume::reconcile_shared_volume_with_deadline"
+    );
+    assert!(
+        !src.contains(".run(shared_volume::reconcile_shared_volume,"),
+        "the bare SharedVolume reconcile is wired into a Controller"
+    );
+}

@@ -411,7 +411,7 @@ pub async fn run(
             shared_volume::shared_volume_refs_in_store(&claim, &sv_store).into_iter()
         })
         .run(
-            shared_volume::reconcile_shared_volume,
+            shared_volume::reconcile_shared_volume_with_deadline,
             shared_volume::error_policy_sv,
             ctx,
         )

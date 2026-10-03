@@ -424,6 +424,46 @@ fn apply_params() -> PatchParams {
 // Async reconcile + error_policy
 // ---------------------------------------------------------------------------
 
+/// How long one SharedVolume pass may run before it is abandoned (WI-400,
+/// GOTCHA-51).
+///
+/// Short on purpose. This controller runs at `concurrency(1)`, so while one
+/// pass is in flight kube-runtime holds every SharedVolume's triggers, and
+/// `status.refCount`, the figure the `volume rm` guard reads, freezes for
+/// all of them. A healthy pass is about six apiserver round trips and
+/// sub-second. The worst first pass: three writes (the finalizer add, the
+/// PVC apply and the status write) at a slow-but-healthy 10s each, the
+/// admission webhook included; the provider and claim LISTs fast; the
+/// capacity sample at `CAPACITY_SAMPLE_BUDGET` (10s) and the Event at
+/// `CAPACITY_EVENT_BOUND` (5s). That comes to about 45s, and a steady-state
+/// pass skips the finalizer write. 60s also ends an accepted-and-never-
+/// answered request about 5x sooner than the client's 295s read timeout.
+pub const RECONCILE_DEADLINE: Duration = Duration::from_secs(60);
+
+/// [`reconcile_shared_volume`] under [`RECONCILE_DEADLINE`] — what
+/// [`crate::run`] hands kube-runtime, never the unbounded reconcile.
+///
+/// A timed-out pass writes nothing to the SharedVolume's status — under
+/// [`crate::FIELD_MANAGER`] a partial body would prune `refCount`, `pvcRef`,
+/// `capacity` and both conditions. It reaches [`error_policy_sv`], which
+/// warns, counts `apprafter_reconcile_timeouts_total{kind="SharedVolume"}`
+/// and backs off, and it leaves a `ReconcileTimedOut` Warning Event on the
+/// volume.
+pub async fn reconcile_shared_volume_with_deadline(
+    sv: Arc<SharedVolume>,
+    ctx: Arc<Context>,
+) -> Result<Action, ReconcileError> {
+    let outcome = operator_core::deadline::within(
+        RECONCILE_DEADLINE,
+        reconcile_shared_volume(sv.clone(), ctx.clone()),
+    )
+    .await;
+    if let Err(ReconcileError::TimedOut(timed_out)) = &outcome {
+        crate::deadline_event::publish(&ctx.client, sv.object_ref(&()), KIND, *timed_out).await;
+    }
+    outcome
+}
+
 /// Reconcile a single `SharedVolume`:
 ///
 /// 1. On delete (`deletion_timestamp` set) → delete the backing PVC
@@ -721,7 +761,11 @@ pub async fn reconcile_shared_volume(
 }
 
 /// Error policy for the SharedVolume controller: increment error metrics
-/// and requeue after 30 seconds (mirrors the ResourceClaim provisioner).
+/// and requeue after 30 seconds (mirrors the ResourceClaim provisioner) — or,
+/// for a pass abandoned at [`RECONCILE_DEADLINE`], count the timeout and back
+/// off by one deadline, so a volume that stalls on every pass cannot hold the
+/// controller's only slot most of the time. A watch event still runs it at
+/// once.
 pub fn error_policy_sv(sv: Arc<SharedVolume>, err: &ReconcileError, ctx: Arc<Context>) -> Action {
     let name = sv.name_any();
     let namespace = sv.namespace().unwrap_or_default();
@@ -734,6 +778,13 @@ pub fn error_policy_sv(sv: Arc<SharedVolume>, err: &ReconcileError, ctx: Arc<Con
         .reconcile_errors
         .with_label_values(&[KIND])
         .inc();
+    if let ReconcileError::TimedOut(timed_out) = err {
+        ctx.metrics
+            .reconcile_timeouts
+            .with_label_values(&[KIND])
+            .inc();
+        return Action::requeue(timed_out.after);
+    }
     Action::requeue(Duration::from_secs(30))
 }
 
@@ -1619,5 +1670,91 @@ mod deadline_tests {
             .expect("the CapacityWarning rides the write");
         assert_eq!(warning["status"], json!("True"));
         assert_eq!(warning["reason"], json!("VolumeNearlyFull"));
+    }
+
+    /// A pass that never returns is abandoned at the deadline; every request
+    /// hangs here, the Event publish included.
+    #[tokio::test(start_paused = true)]
+    async fn a_volume_pass_that_never_returns_is_abandoned_at_the_deadline() {
+        let ctx = context(operator_core::testing::stalled_client());
+
+        let started = tokio::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            RECONCILE_DEADLINE * 2,
+            reconcile_shared_volume_with_deadline(volume(), ctx),
+        )
+        .await
+        .expect("the deadline must end the pass");
+
+        match outcome {
+            Err(ReconcileError::TimedOut(t)) => assert_eq!(t.after, RECONCILE_DEADLINE),
+            other => panic!("expected TimedOut, got {other:?}"),
+        }
+        assert_eq!(
+            started.elapsed(),
+            RECONCILE_DEADLINE + crate::deadline_event::PUBLISH_BOUND
+        );
+    }
+
+    /// The timeout path writes nothing to the volume's status: a body without
+    /// `refCount` would prune the figure `volume rm` reads. The pass is cut on
+    /// its PVC apply; the only request after the cut is the Event.
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_volume_pass_writes_no_status() {
+        let (client, log) = apiserver(provisioning(
+            Reply::Never,
+            created_event(),
+            ok(volume_object()),
+        ));
+
+        let outcome = tokio::time::timeout(
+            RECONCILE_DEADLINE * 2,
+            reconcile_shared_volume_with_deadline(volume(), context(client)),
+        )
+        .await
+        .expect("the deadline must end the pass");
+        assert!(
+            matches!(outcome, Err(ReconcileError::TimedOut(_))),
+            "{outcome:?}"
+        );
+
+        let log = log.lock().expect("log").clone();
+        assert!(
+            !log.iter().any(|c| c.path.ends_with("/status")),
+            "a timed-out pass must not touch status: {log:#?}"
+        );
+        let methods: Vec<&str> = log.iter().map(|c| c.method.as_str()).collect();
+        assert_eq!(methods, vec!["GET", "PATCH", "POST"], "{log:#?}");
+        assert_eq!(log[2].body["reason"], json!("ReconcileTimedOut"));
+        assert_eq!(log[2].body["regarding"]["kind"], json!("SharedVolume"));
+    }
+
+    #[tokio::test]
+    async fn error_policy_sv_counts_a_timeout_and_backs_off_one_deadline() {
+        let ctx = context(operator_core::testing::stalled_client());
+        let timed_out = ReconcileError::TimedOut(operator_core::deadline::ReconcileTimedOut {
+            after: RECONCILE_DEADLINE,
+        });
+
+        assert_eq!(
+            error_policy_sv(volume(), &timed_out, ctx.clone()),
+            Action::requeue(RECONCILE_DEADLINE)
+        );
+        let timeouts = || {
+            ctx.metrics
+                .reconcile_timeouts
+                .with_label_values(&[KIND])
+                .get()
+        };
+        assert_eq!(timeouts(), 1.0);
+        assert_eq!(
+            error_policy_sv(
+                volume(),
+                &ReconcileError::Provisioning("x".into()),
+                ctx.clone()
+            ),
+            Action::requeue(Duration::from_secs(30))
+        );
+        assert_eq!(timeouts(), 1.0, "only a timeout counts as one");
     }
 }
