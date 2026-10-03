@@ -1022,9 +1022,14 @@ async fn provision_dragonfly(
     //
     //    (a) Own-status idempotency: if THIS claim already holds an
     //        allocation on this instance (a re-reconcile after the status
-    //        landed but before the ACL/Secret steps finished), keep it. No
-    //        committed data exists yet (the claim is not `ready`), so the
-    //        recycle-safety FLUSHDB below is harmless.
+    //        landed but before the ACL/Secret steps finished), keep it. The
+    //        claim is not `ready`, but that does NOT mean the `$N` is empty:
+    //        a persistent REATTACH checkpoints the retained `$N` it is
+    //        recovering, and any failure before the terminal status write
+    //        (admin password GET, ACL SETUSER, connection Secret apply) lands
+    //        the retry here. Flushing then wipes the very data the reattach
+    //        exists to recover (WI-402). So the retry flushes only when the
+    //        checkpoint is NOT a reattach in flight — see `skip_flush` below.
     //    (b) Otherwise resolve via `resolve_allocation` (ADR 0042 §8): if a
     //        `RetainedClaim` snapshot for THIS claim is still within grace
     //        (deleted + re-created), REATTACH to its original (instance,
@@ -1049,7 +1054,21 @@ async fn provision_dragonfly(
     let rc_api: Api<RetainedClaim> = Api::namespaced(ctx.client.clone(), RETAINED_CLAIM_NAMESPACE);
 
     let (dbnum, skip_flush, reattached) = match existing_alloc {
-        Some(n) => (n, false, false),
+        // A checkpointed reattach is still in flight iff THIS claim's own
+        // snapshot still names the checkpoint's exact (instance, dbnum): the
+        // provisioner deletes that snapshot only after the terminal status
+        // write below. Only a PERSISTENT reattach skips the flush — an
+        // ephemeral instance retains nothing (`resolve_allocation`'s
+        // `skip_flush = persistent`) — and a fresh allocation has no such
+        // snapshot and is flushed as before (recycle-safety, ADR 0042 §3).
+        // A GET error propagates: an unknown answer must not become a
+        // FLUSHDB.
+        Some(n) => {
+            let own_snapshot = rc_api.get_opt(&object_name).await?.is_some_and(|rc| {
+                rc.spec.instance.as_deref() == Some(instance.as_str()) && rc.spec.dbnum == Some(n)
+            });
+            (n, persistent && own_snapshot, own_snapshot)
+        }
         None => {
             // List live claims AND retained snapshots so the used-set
             // reserves both (Fix #2a) and we can detect a reattach.

@@ -70,6 +70,8 @@ pub mod cnpg;
 pub mod disk;
 pub mod dragonfly;
 #[cfg(test)]
+mod dragonfly_alloc_tests;
+#[cfg(test)]
 mod fake_apiserver;
 pub mod gc;
 pub mod grace;
