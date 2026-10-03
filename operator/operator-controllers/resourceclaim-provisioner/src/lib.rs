@@ -67,6 +67,7 @@ use operator_core::{Metrics, ResourceClaim, SharedDatabase, SharedVolume};
 
 pub mod acl_reconcile;
 pub mod cnpg;
+mod deadline_event;
 pub mod disk;
 pub mod dragonfly;
 #[cfg(test)]
@@ -361,7 +362,11 @@ pub async fn run(
     // the net under both (WI-402).
     let claim_drive = Controller::new(claims, watcher::Config::default())
         .with_config(ControllerConfig::default().concurrency(1))
-        .run(reconcile::reconcile, reconcile::error_policy, ctx.clone())
+        .run(
+            reconcile::reconcile_with_deadline,
+            reconcile::error_policy,
+            ctx.clone(),
+        )
         .for_each(|res| async move {
             match res {
                 Ok((obj_ref, _)) => info!(claim = %obj_ref.name, "provisioned"),

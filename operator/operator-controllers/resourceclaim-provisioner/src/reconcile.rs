@@ -405,6 +405,68 @@ impl Backend {
 // Public reconcile + error_policy
 // ---------------------------------------------------------------------------
 
+/// How long one claim pass may run before it is abandoned (WI-400,
+/// GOTCHA-51).
+///
+/// The claim controller runs at `concurrency(1)`, which the dbnum allocator
+/// needs, so kube-runtime holds EVERY claim's triggers while one pass is in
+/// flight. Without a deadline one hung apiserver read froze provisioning,
+/// finalizer release and the 60s ready refresh cluster-wide for up to the
+/// client's 295s per-read timeout, and for longer when the read kept
+/// trickling.
+///
+/// No pass waits in-reconcile, because every wait is a requeue. The slowest
+/// legitimate passes are these. `provision_nats` with every NATS bound hit
+/// takes about 25s, plus 10s per capture delete. A disk provision whose
+/// volume sample runs to `PROVISION_SAMPLE_BOUND` takes 20s. An owned CNPG
+/// provision behind a Postgres server that is slow but answering is the
+/// worst: its extension probe makes one call per declared extension, each
+/// capped at `pg_client::CALL_TIMEOUT` (45s), so 45s × declared extensions
+/// on top of a handful of apiserver round trips. 120s holds two extensions
+/// at that cap. A third at the cap is cut, and the cut is safe: the terminal
+/// status write comes after the probe, so the claim simply stays unready and
+/// the next pass re-applies every object with a fresh role password. 120s
+/// also ends an accepted-and-never-answered request about 2.5x sooner than
+/// the read timeout. The decorative reads cannot reach it: see
+/// `READY_REFRESH_BUDGET` and `PROVISION_SAMPLE_BOUND`.
+pub const RECONCILE_DEADLINE: Duration = Duration::from_secs(120);
+
+/// [`reconcile`] under [`RECONCILE_DEADLINE`] — what [`crate::run`] hands
+/// kube-runtime, never the unbounded reconcile.
+///
+/// A timed-out pass writes NOTHING to the claim. The provisioner owns the
+/// claim's status under [`FIELD_MANAGER`] with full-body SSA, so a
+/// `Ready=False` body would prune `instance`/`dbnum`/`connectionSecretRef`
+/// (freeing a `$N` whose ACL user is still pinned to it), and `ready=false`
+/// on a live claim would make it provision again — a `FLUSHDB` on a
+/// Dragonfly tenant, a password rotation under a running app. What it does
+/// instead:
+///
+/// - the error reaches [`error_policy`], which warns, counts
+///   `apprafter_reconcile_timeouts_total{kind="ResourceClaim"}` and backs off;
+/// - a Warning Event with reason `ReconcileTimedOut` lands on the claim;
+/// - the ACL resync loop is poked, because a pass cut after its terminal
+///   status committed never reached its own `acl_dirty.notify_one()` — a
+///   bare poke is always safe, the loop re-derives from a fresh LIST.
+///
+/// Dropping the pass also drops any `Context::dbnum_alloc` guard it held,
+/// while a checkpoint write it sent may still commit. What covers that is the
+/// re-read of every `$N` holder before each `FLUSHDB` (WI-402), not this
+/// wrapper.
+pub async fn reconcile_with_deadline(
+    claim: Arc<ResourceClaim>,
+    ctx: Arc<Context>,
+) -> Result<Action, ReconcileError> {
+    let outcome =
+        operator_core::deadline::within(RECONCILE_DEADLINE, reconcile(claim.clone(), ctx.clone()))
+            .await;
+    if let Err(ReconcileError::TimedOut(timed_out)) = &outcome {
+        ctx.acl_dirty.notify_one();
+        crate::deadline_event::publish(&ctx.client, claim.object_ref(&()), KIND, *timed_out).await;
+    }
+    outcome
+}
+
 /// Reconcile a single `ResourceClaim`:
 ///
 /// 1. On delete (`deletion_timestamp` set) → snapshot the claim into an
@@ -829,7 +891,15 @@ pub(crate) async fn ensure_dragonfly_instance(
     })
 }
 
-/// Error policy: increment error metrics and requeue after 30 seconds.
+/// Error policy: increment error metrics and requeue after 30 seconds — or,
+/// for a pass abandoned at [`RECONCILE_DEADLINE`], count the timeout and back
+/// off by one deadline.
+///
+/// The longer backoff is for the single slot (`concurrency(1)`): a claim
+/// that stalls on every pass would otherwise hold it 120s out of every 150s,
+/// starving every other claim; one deadline of backoff halves that. It only
+/// sets the fallback requeue — a watch event for the claim still runs it at
+/// once.
 pub fn error_policy(claim: Arc<ResourceClaim>, err: &ReconcileError, ctx: Arc<Context>) -> Action {
     let name = claim.name_any();
     let namespace = claim.namespace().unwrap_or_default();
@@ -842,6 +912,13 @@ pub fn error_policy(claim: Arc<ResourceClaim>, err: &ReconcileError, ctx: Arc<Co
         .reconcile_errors
         .with_label_values(&[KIND])
         .inc();
+    if let ReconcileError::TimedOut(timed_out) = err {
+        ctx.metrics
+            .reconcile_timeouts
+            .with_label_values(&[KIND])
+            .inc();
+        return Action::requeue(timed_out.after);
+    }
     Action::requeue(Duration::from_secs(30))
 }
 
@@ -6658,6 +6735,148 @@ mod deadline_tests {
             calls_to(&log, "PATCH", shared_status).len(),
             1,
             "the terminal status write landed"
+        );
+    }
+
+    /// What an apiserver hands back from an Event create.
+    fn created_event() -> Reply {
+        Reply::Json(
+            201,
+            json!({
+                "apiVersion": "events.k8s.io/v1", "kind": "Event",
+                "metadata": { "name": "web-disk.1", "namespace": "apps" },
+            }),
+        )
+    }
+
+    /// A pass that never returns is abandoned at the deadline and comes back
+    /// as the controller's own `TimedOut` error. Every request hangs here,
+    /// the Event publish included, so the wrapper returns one publish bound
+    /// later, and no later.
+    #[tokio::test(start_paused = true)]
+    async fn a_claim_pass_that_never_returns_is_abandoned_at_the_deadline() {
+        let ctx = context(operator_core::testing::stalled_client());
+        let claim: Arc<ResourceClaim> = Arc::new(
+            serde_json::from_value(json!({
+                "apiVersion": "apprafter.io/v1alpha1", "kind": "ResourceClaim",
+                "metadata": { "name": "web-pg", "namespace": "apps", "uid": "u-3" },
+                "spec": { "type": "pg", "selector": {} },
+            }))
+            .expect("claim fixture"),
+        );
+
+        let started = tokio::time::Instant::now();
+        let outcome =
+            tokio::time::timeout(RECONCILE_DEADLINE * 2, reconcile_with_deadline(claim, ctx))
+                .await
+                .expect("the deadline must end the pass");
+
+        match outcome {
+            Err(ReconcileError::TimedOut(t)) => assert_eq!(t.after, RECONCILE_DEADLINE),
+            other => panic!("expected TimedOut, got {other:?}"),
+        }
+        assert_eq!(
+            started.elapsed(),
+            RECONCILE_DEADLINE + crate::deadline_event::PUBLISH_BOUND
+        );
+    }
+
+    /// THE property of the timeout path: it writes nothing to the claim's
+    /// status. The pass is cut mid-provision (PVC apply sent, never
+    /// answered), and the only request after the cut is the Warning Event.
+    /// A `Ready=False` here, under the provisioner's field manager, would
+    /// prune the allocation a Dragonfly claim checkpointed and make a live
+    /// claim provision again.
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_claim_pass_writes_no_status() {
+        let (client, log) = apiserver(vec![
+            route("GET", PROVIDERS, provider_list(disk_provider())),
+            route(
+                "PATCH",
+                format!(
+                    "/api/v1/namespaces/apps/persistentvolumeclaims/{}",
+                    disk_pvc()
+                ),
+                Reply::Never,
+            ),
+            route(
+                "POST",
+                "/apis/events.k8s.io/v1/namespaces/apps/events",
+                created_event(),
+            ),
+        ]);
+
+        let outcome = tokio::time::timeout(
+            RECONCILE_DEADLINE * 2,
+            reconcile_with_deadline(disk_claim(json!({})), context(client)),
+        )
+        .await
+        .expect("the deadline must end the pass");
+        assert!(
+            matches!(outcome, Err(ReconcileError::TimedOut(_))),
+            "{outcome:?}"
+        );
+
+        let log = log.lock().expect("log").clone();
+        assert!(
+            !log.iter().any(|c| c.path.ends_with("/status")),
+            "a timed-out pass must not touch status: {log:#?}"
+        );
+        let methods: Vec<&str> = log.iter().map(|c| c.method.as_str()).collect();
+        assert_eq!(methods, vec!["GET", "PATCH", "POST"], "{log:#?}");
+        assert_eq!(log[2].body["reason"], json!("ReconcileTimedOut"));
+        assert_eq!(log[2].body["regarding"]["name"], json!("web-disk"));
+    }
+
+    /// A cut can land after a terminal status committed but before the pass
+    /// reached `acl_dirty.notify_one()`, which would leave the ACL file a
+    /// full resync tick behind. The wrapper pokes the loop on every timeout.
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_claim_pass_pokes_the_acl_resync() {
+        let ctx = context(operator_core::testing::stalled_client());
+        let outcome = tokio::time::timeout(
+            RECONCILE_DEADLINE * 2,
+            reconcile_with_deadline(disk_claim(json!({})), ctx.clone()),
+        )
+        .await
+        .expect("the deadline must end the pass");
+        assert!(matches!(outcome, Err(ReconcileError::TimedOut(_))));
+
+        tokio::time::timeout(Duration::from_millis(1), ctx.acl_dirty.notified())
+            .await
+            .expect("the timeout path stores a wake-up for the ACL resync loop");
+    }
+
+    #[tokio::test]
+    async fn error_policy_counts_a_timeout_and_backs_off_one_deadline() {
+        let ctx = context(operator_core::testing::stalled_client());
+        let claim = disk_claim(json!({}));
+        let timed_out = ReconcileError::TimedOut(operator_core::deadline::ReconcileTimedOut {
+            after: RECONCILE_DEADLINE,
+        });
+
+        let action = error_policy(claim.clone(), &timed_out, ctx.clone());
+        assert_eq!(action, Action::requeue(RECONCILE_DEADLINE));
+        let timeouts = || {
+            ctx.metrics
+                .reconcile_timeouts
+                .with_label_values(&[KIND])
+                .get()
+        };
+        assert_eq!(timeouts(), 1.0);
+
+        let other = ReconcileError::Provisioning("refused".into());
+        assert_eq!(
+            error_policy(claim, &other, ctx.clone()),
+            Action::requeue(Duration::from_secs(30))
+        );
+        assert_eq!(timeouts(), 1.0, "only a timeout counts as one");
+        assert_eq!(
+            ctx.metrics
+                .reconcile_errors
+                .with_label_values(&[KIND])
+                .get(),
+            2.0
         );
     }
 }
