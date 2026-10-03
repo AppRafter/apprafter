@@ -384,7 +384,13 @@ pub async fn reconcile(
     let mut conditions: Vec<SourceCredentialCondition> = Vec::new();
     let mut covered_prefixes: Vec<String> = Vec::new();
     let mut covered_hosts: Vec<String> = Vec::new();
-    let mut last_validated: Option<String> = None;
+    // Only a concluded verdict stamps a new time (`validity_outcome`), and
+    // `patch_status` is a forced single-manager apply that PRUNES a field it
+    // leaves out. So start from the last stamp: an inconclusive pass —
+    // restricted egress, nothing to probe yet, a half out of its probe
+    // budget — must neither move nor erase it.
+    let mut last_validated: Option<String> =
+        cred.status.as_ref().and_then(|s| s.last_validated.clone());
     let mut pending = false;
     let pp = PatchParams::apply(FIELD_MANAGER).force();
 
@@ -2718,11 +2724,25 @@ mod tests {
     where
         F: FnMut(&Call) -> (u16, Value) + Send + 'static,
     {
+        stalling_apiserver(|_| false, respond)
+    }
+
+    /// [`scripted_apiserver`], except that a request `stall` picks is logged
+    /// and then never answered — the apiserver took it and went quiet, which
+    /// is what a stalled kine/etcd write looks like from the client. The
+    /// write may or may not have landed; the controller cannot know.
+    pub(crate) fn stalling_apiserver<S, F>(stall: S, respond: F) -> (Client, Arc<Mutex<Vec<Call>>>)
+    where
+        S: Fn(&Call) -> bool + Send + Sync + 'static,
+        F: FnMut(&Call) -> (u16, Value) + Send + 'static,
+    {
         let log = Arc::new(Mutex::new(Vec::<Call>::new()));
         let sink = log.clone();
+        let stall = Arc::new(stall);
         let respond = Arc::new(Mutex::new(respond));
         let service = tower::service_fn(move |req: http::Request<Body>| {
             let sink = sink.clone();
+            let stall = stall.clone();
             let respond = respond.clone();
             async move {
                 let method = req.method().to_string();
@@ -2733,6 +2753,10 @@ mod tests {
                     uri,
                     body: serde_json::from_slice(&bytes).unwrap_or(Value::Null),
                 };
+                if stall(&call) {
+                    sink.lock().expect("log").push(call);
+                    return std::future::pending().await;
+                }
                 let (code, payload) = (respond.lock().expect("responder"))(&call);
                 sink.lock().expect("log").push(call);
                 Ok::<_, std::convert::Infallible>(
@@ -3866,6 +3890,41 @@ mod tests {
         assert!(
             position_of(&calls, "PATCH", "/secrets/").is_some(),
             "derivation must still happen: {calls:#?}"
+        );
+    }
+
+    // ---------------- WI-400: what a deadline cut leaves behind ----------------
+
+    /// A pass whose probes conclude nothing carries the last proven
+    /// `lastValidated` forward. Here both representative lists hang, so each
+    /// half runs out of its budget and reports `Unverified`, which stamps no
+    /// new time. `patch_status` is a forced single-manager apply, so a status
+    /// that OMITTED the field would PRUNE it: a half out of time — like
+    /// restricted egress, or a cluster with nothing to probe yet — would
+    /// erase the only record of when the credential was last actually proven.
+    #[tokio::test(start_paused = true)]
+    async fn a_pass_that_concludes_nothing_carries_last_validated_forward() {
+        let (client, log) = stalling_apiserver(
+            |call| call.method == "GET" && call.uri.contains("/applications"),
+            happy_path,
+        );
+        let mut cred = live_cred();
+        cred.status = Some(SourceCredentialStatus {
+            last_validated: Some("2026-07-01T00:00:00+00:00".to_string()),
+            ..SourceCredentialStatus::default()
+        });
+
+        reconcile(Arc::new(cred), context(client))
+            .await
+            .expect("a pass whose halves ran out of budget still completes");
+
+        let calls = calls_of(&log);
+        let status = call_at(&calls, "PATCH", "/sourcecredentials/acme/status");
+        assert_eq!(
+            status.body.pointer("/status/lastValidated"),
+            Some(&json!("2026-07-01T00:00:00+00:00")),
+            "an inconclusive pass must neither move nor prune lastValidated: {}",
+            status.body
         );
     }
 }
