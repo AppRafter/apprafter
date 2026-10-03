@@ -774,6 +774,11 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
     let allow_target_bump = pin_set || spec.auto_upgrade;
 
     let mut migration_pending: Option<MigrationPendingState> = None;
+    // The `completed` plan whose approval this pass's bump rides on. The GC
+    // below must keep it until a pass sees the parent on the new version:
+    // deleted before the bump lands, a cut or failed pass loses the approval
+    // for good (the next pass finds no plan and gates the transition anew).
+    let mut authorising_plan: Option<String> = None;
     let target_for_patch = if target_changed && allow_target_bump {
         // Track B.1.78: gate destructive transitions behind a
         // MigrationPlan. Deterministic plan name per
@@ -804,6 +809,7 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
                     plan = %plan_name,
                     "platform MigrationPlan completed — proceeding with bump"
                 );
+                authorising_plan = Some(plan_name.clone());
                 desired.target_revision.clone()
             } else {
                 // Pending / approved / executing / failed /
@@ -1008,12 +1014,18 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
     // 26-28 all lingered). Runs unconditionally — not only inside the
     // gating branch — so the last completed plan is dropped once the
     // upgrade settles. Best-effort: a failure is logged, never fatal.
+    //
+    // The two names it keeps never coexist: `migration_pending` is the gate
+    // of a held transition, `authorising_plan` the completed plan of the one
+    // being bumped this pass (WI-400). The latter is collected by the first
+    // pass that finds the parent already on the new version.
     {
         let plan_api: Api<MigrationPlan> =
             Api::namespaced(ctx.client.clone(), MIGRATION_PLAN_NAMESPACE);
         let keep = migration_pending
             .as_ref()
             .and_then(|m| m.plan_name.as_deref())
+            .or(authorising_plan.as_deref())
             .unwrap_or("");
         match plan_api.list(&ListParams::default()).await {
             Ok(list) => {
@@ -5296,6 +5308,95 @@ mod bounded_reconcile_tests {
         assert!(
             !calls(&state).iter().any(|c| c.is("PATCH", STATUS)),
             "a cut reconcile writes no status"
+        );
+    }
+
+    /// A platform MigrationPlan for `from -> to`, approved and executed.
+    fn completed_plan(from: &str, to: &str) -> Value {
+        let name = synthesize_platform_plan_name(from, to);
+        let plan = build_platform_migration_plan_cr(
+            &name,
+            from,
+            to,
+            ChangeClass::Breaking,
+            Some(to),
+            None,
+        );
+        let mut plan = serde_json::to_value(plan).expect("plan");
+        plan["status"] = json!({ "phase": "completed" });
+        plan
+    }
+
+    /// WI-400 cancellation hazard: an approved upgrade's plan reaches
+    /// `completed` and the reconcile takes the bump. The plan GC used to run
+    /// with nothing to keep and DELETE that plan before the parent was
+    /// patched, so a reconcile cut in between — a hang on the anchor, an
+    /// Event or the patch itself, now cut at `RECONCILE_DEADLINE` — left the
+    /// parent on the old version and the approval gone: the next pass found
+    /// no plan, classified the transition again and gated it behind a fresh
+    /// `pending-approval` plan. The operator's approval was lost, and no
+    /// reconcile could bring it back.
+    #[tokio::test(start_paused = true)]
+    async fn a_reconcile_cut_before_the_bump_keeps_the_approval_that_authorises_it() {
+        let stack = stack_on("0.2.79", "0.2.80");
+        let parent = parent_on(&stack, "0.2.79");
+        let mut cluster = cluster(stack, parent);
+        cluster.plans.push(completed_plan("0.2.79", "0.2.80"));
+        cluster.silent.push(("PATCH", PARENT.to_string()));
+        let (client, state) = scripted(cluster);
+        let ctx = context(client, Arc::new(NoRegistry));
+
+        let err = operator_core::deadline::within(
+            RECONCILE_DEADLINE,
+            reconcile(the_stack(&state), ctx.clone()),
+        )
+        .await
+        .expect_err("the bump never answers, so the reconcile is cut");
+        assert!(matches!(err, Error::TimedOut(_)), "{err:?}");
+        let first = calls(&state);
+        assert!(
+            first.iter().any(|c| c.is("PATCH", PARENT)),
+            "the cut fell on the bump: {first:#?}"
+        );
+        assert!(
+            !first.iter().any(|c| c.method == "DELETE"),
+            "the approving plan survives the cut: {first:#?}"
+        );
+
+        // The apiserver answers again: the next pass makes the approved bump.
+        state.lock().unwrap().silent.clear();
+        reconcile(the_stack(&state), ctx)
+            .await
+            .expect("the next reconcile succeeds");
+        let bump = calls(&state)
+            .into_iter()
+            .rev()
+            .find(|c| c.is("PATCH", PARENT))
+            .expect("the bump");
+        assert_eq!(bump.body["spec"]["source"]["targetRevision"], "0.2.80");
+        assert!(
+            !calls(&state).iter().any(|c| c.is("POST", PLANS)),
+            "no second gate for an approved transition"
+        );
+    }
+
+    /// The approving plan is kept only while it still authorises something:
+    /// once the parent is on the new version the GC collects it, as before.
+    #[tokio::test]
+    async fn the_approving_plan_is_collected_once_the_bump_has_landed() {
+        let stack = stack_on("0.2.80", "0.2.80");
+        let parent = parent_on(&stack, "0.2.80");
+        let mut cluster = cluster(stack, parent);
+        cluster.plans.push(completed_plan("0.2.79", "0.2.80"));
+        let (client, state) = scripted(cluster);
+        reconcile(the_stack(&state), context(client, Arc::new(NoRegistry)))
+            .await
+            .expect("the reconcile succeeds");
+        let deleted = format!("{PLANS}/platform-0-2-79-to-0-2-80");
+        assert!(
+            calls(&state).iter().any(|c| c.is("DELETE", &deleted)),
+            "{:#?}",
+            calls(&state)
         );
     }
 }
