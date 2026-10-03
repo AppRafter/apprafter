@@ -206,6 +206,30 @@ pub struct Context {
     /// a fresh LIST, and `ListParams::default()` sends no resourceVersion, so
     /// that LIST is a quorum read which observes any committed prior write.
     pub acl_dirty: Arc<tokio::sync::Notify>,
+    /// One Dragonfly `$N` allocation at a time, across the claim controller
+    /// AND the SharedDatabase controller (WI-402).
+    ///
+    /// Allocation is LIST → pick the lowest free number → record it, and is
+    /// not atomic. `concurrency(1)` serializes it within ONE controller only;
+    /// since 2.29 the SharedDatabase controller allocates from the same pool
+    /// instances concurrently (`tokio::join!` in [`run`]), so both could LIST
+    /// before either recorded and take the same number. Both controllers share
+    /// this `Context`, so this lock is the one place both pass through. Each
+    /// holds it from its allocation LIST until its allocation checkpoint is
+    /// answered — from then on a fresh LIST sees the number — and never across
+    /// Redis I/O.
+    ///
+    /// It is NOT a guarantee on its own. Dropping a reconcile future (a
+    /// deadline, a lost leader) releases the guard at once while the dropped
+    /// checkpoint may still commit on the apiserver after the next allocator's
+    /// LIST. The safety net for that is the re-read of every holder that each
+    /// allocator runs AFTER its own checkpoint is committed and BEFORE it
+    /// flushes or pins anything (`reconcile::dbnum_holders_besides`): of two
+    /// allocators that raced, the later re-read always sees the other's
+    /// committed number. This lock only makes the race rare.
+    ///
+    /// Waiting for it counts against the waiting reconcile's own deadline.
+    pub dbnum_alloc: tokio::sync::Mutex<()>,
 }
 
 impl Context {
@@ -234,6 +258,7 @@ impl Context {
             capacity: Arc::new(CapacityCache::new()),
             backend_metrics: Arc::new(operator_core::promscrape::MetricsCache::new()),
             acl_dirty,
+            dbnum_alloc: tokio::sync::Mutex::new(()),
         }
     }
 }
@@ -323,9 +348,17 @@ pub async fn run(
     // so both pick the same number → two tenants pinned to one logical DB
     // (isolation breach). One in-flight reconcile at a time makes each claim's
     // allocation visible (a fresh apiserver list) before the next claim
-    // allocates. Leader election already guarantees a single active
-    // controller, so this fully serializes allocation. Throughput is a
-    // non-issue at claim volumes.
+    // allocates.
+    //
+    // That serializes CLAIM allocations only. The SharedDatabase controller
+    // (controller 3, 2.29) allocates from the same pool instances in its own
+    // Runner, concurrently under the `join!` below — so the two share
+    // `Context::dbnum_alloc`, which is what actually orders allocations across
+    // both. And neither serializes against a reconcile that was DROPPED with
+    // its checkpoint still in flight: that write can commit after the next
+    // allocator's LIST. The re-read every allocator runs after committing its
+    // number and before flushing it (`reconcile::dbnum_holders_besides`) is
+    // the net under both (WI-402).
     let claim_drive = Controller::new(claims, watcher::Config::default())
         .with_config(ControllerConfig::default().concurrency(1))
         .run(reconcile::reconcile, reconcile::error_policy, ctx.clone())

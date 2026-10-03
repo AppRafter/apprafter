@@ -1071,6 +1071,12 @@ async fn provision_dragonfly(
     let object_name = cnpg::k8s_name(ns, name);
     let rc_api: Api<RetainedClaim> = Api::namespaced(ctx.client.clone(), RETAINED_CLAIM_NAMESPACE);
 
+    // WI-402: allocate under the pool-wide lock the SharedDatabase
+    // controller also takes (see `Context::dbnum_alloc`), held until the
+    // checkpoint below is answered — from then on a fresh LIST sees our
+    // number. Taken on the `existing_alloc` path too: it re-sends the same
+    // checkpoint, and one rule is easier to keep than two.
+    let alloc_guard = ctx.dbnum_alloc.lock().await;
     let (dbnum, skip_flush, reattached) = match existing_alloc {
         // A checkpointed reattach is still in flight iff THIS claim's own
         // snapshot still names the checkpoint's exact (instance, dbnum): the
@@ -1159,6 +1165,9 @@ async fn provision_dragonfly(
     //    status apply (step 6) re-sends instance+dbnum so SSA does not prune
     //    this checkpoint (2.6 Fix #1).
     patch_allocation(&ctx.client, ns, name, &instance, dbnum).await?;
+    // Released before any Redis I/O: a slow instance must not stall every
+    // other allocator in the cluster.
+    drop(alloc_guard);
 
     // 4. Drive the per-claim `$N` ACL user imperatively (it is runtime
     //    state, not declarable on the CR). Read the instance admin
@@ -2971,6 +2980,15 @@ async fn read_admin_password(
 /// `resourceVersion`), never a cache: a stale read here does not look stale,
 /// it looks like "nobody else", and the next command wipes a keyspace. An
 /// apiserver error propagates — an unknown answer is never a "go".
+///
+/// It is the safety net under allocation only because every allocator COMMITS
+/// its number (the claim's checkpoint, the shared database's `AwaitingKeyspace`
+/// status) before it calls this, and calls this before it flushes or pins
+/// anything. Of two allocators that took one number, the later re-read then
+/// always sees the other's committed write, whatever the allocation lock
+/// (`Context::dbnum_alloc`) did: that lock is released when a reconcile future
+/// is dropped while its checkpoint may still commit, and only a read taken
+/// after the fact can see such a write.
 pub(crate) async fn dbnum_holders_besides(
     client: &Client,
     instance: &str,

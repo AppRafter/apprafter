@@ -903,6 +903,10 @@ async fn reconcile_redis(
     let dbnum = match existing {
         Some(n) => n,
         None => {
+            // WI-402: under the pool-wide lock the claim controller also takes
+            // (see `Context::dbnum_alloc`), from this LIST until the
+            // checkpoint below is answered — the end of this arm.
+            let _alloc_guard = ctx.dbnum_alloc.lock().await;
             let live: Vec<ResourceClaim> = Api::<ResourceClaim>::all(ctx.client.clone())
                 .list(&Default::default())
                 .await?

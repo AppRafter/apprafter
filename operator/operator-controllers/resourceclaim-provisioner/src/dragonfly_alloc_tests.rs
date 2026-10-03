@@ -793,3 +793,149 @@ async fn the_gc_still_flushes_a_dbnum_only_its_snapshot_holds() {
         vec![(dragonfly::instance_addr(EPHEMERAL, DF_NS), 6)]
     );
 }
+
+// ---- (3) one allocator at a time, across the claim and SharedDatabase controllers ----
+
+/// `ACL SETUSER` never answers — parks a claim reconcile AFTER its
+/// allocation, so a test can look at the lock while it sits there.
+#[derive(Default)]
+struct HangingSetuser(FakeRedis);
+
+#[async_trait]
+impl RedisAdmin for HangingSetuser {
+    async fn acl_setuser(
+        &self,
+        _a: &str,
+        _p: &str,
+        _args: &[String],
+    ) -> Result<(), RedisAdminError> {
+        std::future::pending::<()>().await;
+        unreachable!("pending() never resolves")
+    }
+    async fn acl_deluser(&self, a: &str, p: &str, u: &str) -> Result<(), RedisAdminError> {
+        self.0.acl_deluser(a, p, u).await
+    }
+    async fn flushdb(&self, a: &str, p: &str, n: u16) -> Result<(), RedisAdminError> {
+        self.0.flushdb(a, p, n).await
+    }
+    async fn dbsize(&self, a: &str, p: &str, n: u16) -> Result<i64, RedisAdminError> {
+        self.0.dbsize(a, p, n).await
+    }
+}
+
+fn allocation_listed(api: &FakeApiserver) -> bool {
+    api.calls()
+        .iter()
+        .any(|c| c.is_cluster_list("resourceclaims"))
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_claim_does_not_list_for_an_allocation_while_another_allocator_holds_the_lock() {
+    let api = api();
+    api.put_claim(claim("web-redis", false, None));
+    let ctx = ctx(&api, Arc::new(FakeRedis::default()));
+    let held = ctx.dbnum_alloc.lock().await;
+    let stored: ResourceClaim = serde_json::from_value(api.claim(NS, "web-redis")).unwrap();
+    let run = tokio::spawn(reconcile::reconcile(Arc::new(stored), ctx.clone()));
+
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    assert!(
+        !allocation_listed(&api),
+        "allocated while another allocator held the lock"
+    );
+    drop(held);
+    run.await
+        .unwrap()
+        .expect("provisions once the lock is free");
+    assert!(allocation_listed(&api));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_shared_database_does_not_list_for_an_allocation_while_another_allocator_holds_the_lock()
+{
+    let api = api();
+    api.put_shared(shared_cache("orders", json!({})));
+    let ctx = ctx(&api, Arc::new(FakeRedis::default()));
+    let held = ctx.dbnum_alloc.lock().await;
+    let stored: operator_core::SharedDatabase =
+        serde_json::from_value(api.shared(NS, "orders")).unwrap();
+    let run = tokio::spawn(crate::shared_database::reconcile_shared_database(
+        Arc::new(stored),
+        ctx.clone(),
+    ));
+
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    assert!(
+        !allocation_listed(&api),
+        "allocated while another allocator held the lock"
+    );
+    drop(held);
+    run.await
+        .unwrap()
+        .expect("provisions once the lock is free");
+    assert!(allocation_listed(&api));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_claim_holds_the_lock_through_its_checkpoint_and_releases_it_before_redis() {
+    let api = api();
+    api.put_claim(claim("web-redis", false, None)).delay(|c| {
+        c.is_status_patch("resourceclaims", "web-redis")
+            .then_some(std::time::Duration::from_secs(10))
+    });
+    let ctx = ctx(&api, Arc::new(HangingSetuser::default()));
+    let stored: ResourceClaim = serde_json::from_value(api.claim(NS, "web-redis")).unwrap();
+    let run = tokio::spawn(reconcile::reconcile(Arc::new(stored), ctx.clone()));
+
+    // t=5s: the checkpoint PATCH is still unanswered.
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    assert!(
+        ctx.dbnum_alloc.try_lock().is_err(),
+        "the lock was released before the checkpoint was answered"
+    );
+    // t=15s: checkpoint answered, FLUSHDB done, SETUSER parked forever.
+    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+    assert!(!run.is_finished());
+    assert!(
+        ctx.dbnum_alloc.try_lock().is_ok(),
+        "the lock is held across Redis I/O, stalling every other allocator"
+    );
+    run.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_shared_database_holds_the_lock_through_its_checkpoint_and_releases_it_before_redis() {
+    let api = api();
+    api.put_shared(shared_cache("orders", json!({})))
+        .delay(|c| {
+            c.is_status_patch("shareddatabases", "orders")
+                .then_some(std::time::Duration::from_secs(10))
+        });
+    let redis = Arc::new(FakeRedis::default());
+    let ctx = ctx(&api, redis.clone());
+    let stored: operator_core::SharedDatabase =
+        serde_json::from_value(api.shared(NS, "orders")).unwrap();
+    let run = tokio::spawn(crate::shared_database::reconcile_shared_database(
+        Arc::new(stored),
+        ctx.clone(),
+    ));
+
+    // t=5s: the checkpoint write is still unanswered — until it is, another
+    // allocator's LIST may not see this number.
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    assert!(flushed(&redis).is_empty());
+    assert!(
+        ctx.dbnum_alloc.try_lock().is_err(),
+        "the lock was released before the checkpoint was answered"
+    );
+    // t=15s: checkpoint answered, check and FLUSHDB done, the terminal write
+    // in flight — none of which needs the lock.
+    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+    assert_eq!(flushed(&redis).len(), 1);
+    assert!(!run.is_finished());
+    assert!(
+        ctx.dbnum_alloc.try_lock().is_ok(),
+        "the lock is held past the checkpoint, stalling every other allocator"
+    );
+    run.await.unwrap().expect("provisions");
+}
