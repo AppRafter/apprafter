@@ -48,7 +48,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use kube::api::{Api, ApiResource, DynamicObject, Patch, PatchParams};
 use kube::core::GroupVersionKind;
 use kube::runtime::controller::Action;
@@ -1089,7 +1089,18 @@ async fn drop_backing(
                         // per-database and cannot reach them from `postgres`.
                         // Returning `false` holds the finalizer so the next
                         // pass tries again.
-                        info!(%name, %ns, error = %e, "groups not droppable yet — the database is still there");
+                        //
+                        // With the session bounds (WI-400) a lock held past
+                        // `lock_timeout`, or a `DROP OWNED` that runs past
+                        // `statement_timeout`, is cancelled by the server
+                        // rather than waited out. That is "not yet" too, for
+                        // another reason, and `kind` says which: `statement`
+                        // for the refusal above, `lock_timeout` /
+                        // `statement_timeout` for a bound.
+                        info!(
+                            %name, %ns, error = %e, kind = e.kind(),
+                            "the shared database's groups are not dropped yet — holding the finalizer to try again"
+                        );
                         return Ok(false);
                     }
                     info!(%name, %ns, "dropped the shared database's groups");
@@ -1730,6 +1741,50 @@ pub async fn bind_redis_consumer(
     Ok(Action::requeue(Duration::from_secs(300)))
 }
 
+/// How long a consumer claim's delete keeps retrying a revoke that the server
+/// cancelled on a LOCK, before [`revoke_consumer`] falls back to its
+/// best-effort release (WI-400).
+///
+/// The admin sessions carry `lock_timeout` (`pg_client::SESSION_OPTIONS`), so
+/// a revoke that meets a lock is cancelled after 10s instead of waiting it
+/// out. Releasing the finalizer then — the best-effort rule for every other
+/// failure — would leave the consumer's LOGIN role on the server for good,
+/// while a lock wait is the one failure that says the server is up and the
+/// revoke will most likely go through on a later try. So the claim keeps its
+/// finalizer and the revoke runs again every [`REVOKE_LOCK_RETRY`]. Bounded,
+/// because a lock that is never released (a forgotten prepared transaction,
+/// say) must not hold a delete forever: past this the revoke gives up exactly
+/// as it always did, with a WARN naming the role.
+pub const REVOKE_LOCK_PATIENCE: Duration = Duration::from_secs(300);
+
+/// How soon a revoke the server cancelled on a lock is tried again.
+pub const REVOKE_LOCK_RETRY: Duration = Duration::from_secs(15);
+
+/// What [`revoke_consumer`] tells the claim's delete to do with its finalizer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Revocation {
+    /// The credential is gone, or the revoke was given up on (logged at
+    /// WARN with what to drop by hand): release the finalizer.
+    Settled,
+    /// The server cancelled the revoke on a lock, within
+    /// [`REVOKE_LOCK_PATIENCE`] of the delete: keep the finalizer and come
+    /// back in [`REVOKE_LOCK_RETRY`].
+    RetryAfterLock,
+}
+
+/// Whether a revoke that met a lock may still hold `claim`'s delete: only
+/// within [`REVOKE_LOCK_PATIENCE`] of its `deletionTimestamp`. A timestamp
+/// ahead of `now` (clock skew) counts as within.
+pub fn revoke_may_wait(claim: &ResourceClaim, now: DateTime<Utc>) -> bool {
+    let Some(deleting_since) = claim.metadata.deletion_timestamp.as_ref() else {
+        return false;
+    };
+    let waited = now - operator_core::k8s_time::from_time(deleting_since);
+    waited
+        .to_std()
+        .map_or(true, |waited| waited < REVOKE_LOCK_PATIENCE)
+}
+
 /// Revoke ONE consumer's credential when its claim is deleted (ADR 0066 §6).
 ///
 /// Drops that consumer's role or ACL user and nothing else. The shared
@@ -1748,19 +1803,28 @@ pub async fn bind_redis_consumer(
 ///
 /// It is not silent, though: a failure is logged at WARN with the role named,
 /// which is what an operator needs in order to drop it by hand.
-pub async fn revoke_consumer(ctx: &Arc<Context>, claim: &Arc<ResourceClaim>, ns: &str, name: &str) {
+///
+/// One failure is not given up on: a Postgres revoke the server cancelled on
+/// a lock returns [`Revocation::RetryAfterLock`] for up to
+/// [`REVOKE_LOCK_PATIENCE`], and the claim keeps its finalizer meanwhile.
+pub async fn revoke_consumer(
+    ctx: &Arc<Context>,
+    claim: &Arc<ResourceClaim>,
+    ns: &str,
+    name: &str,
+) -> Revocation {
     let Some(shared_name) = claim.spec.shared_ref.as_deref() else {
-        return;
+        return Revocation::Settled;
     };
     let sd_api: Api<SharedDatabase> = Api::namespaced(ctx.client.clone(), ns);
     let sd = match sd_api.get_opt(shared_name).await {
         Ok(Some(sd)) => sd,
         // The database is gone too — its own delete drops the groups, and a
         // consumer role inside a dropped database goes with `DROP OWNED`.
-        Ok(None) => return,
+        Ok(None) => return Revocation::Settled,
         Err(e) => {
             warn!(%name, %ns, error = %e, "could not read the shared database to revoke a consumer");
-            return;
+            return Revocation::Settled;
         }
     };
 
@@ -1771,7 +1835,7 @@ pub async fn revoke_consumer(ctx: &Arc<Context>, claim: &Arc<ResourceClaim>, ns:
         Ok(l) => l.items,
         Err(e) => {
             warn!(%name, %ns, error = %e, "could not list providers to revoke a consumer");
-            return;
+            return Revocation::Settled;
         }
     };
     let candidates: Vec<Candidate> = providers.iter().map(Candidate::from_provider).collect();
@@ -1784,7 +1848,7 @@ pub async fn revoke_consumer(ctx: &Arc<Context>, claim: &Arc<ResourceClaim>, ns:
     match sd.spec.type_.as_str() {
         "pg" => {
             let Some(database) = sd.status.as_ref().and_then(|s| s.database.clone()) else {
-                return;
+                return Revocation::Settled;
             };
             let cluster = cfg
                 .pointer("/cluster")
@@ -1802,25 +1866,41 @@ pub async fn revoke_consumer(ctx: &Arc<Context>, claim: &Arc<ResourceClaim>, ns:
                 crate::acl_reconcile::read_secret_key(ctx, &cnpg_ns, &pw_secret, "password").await
             else {
                 warn!(%name, %ns, %role, "platform role secret unreadable; consumer role NOT dropped");
-                return;
+                return Revocation::Settled;
             };
             // Connected to the SHARED database, not to `postgres`: `DROP
             // OWNED BY` is per-database, and running it elsewhere would drop
             // the role while leaving whatever it owns here behind.
             let dsn = cnpg::dsn(cnpg::PLATFORM_ROLE, &pw, &database, &cluster, &cnpg_ns);
-            if let Err(e) = ctx
+            match ctx
                 .pg
                 .execute_all(&dsn, &shared_pg::unbind_consumer(&role))
                 .await
             {
-                warn!(%name, %ns, %role, error = %e, "consumer role NOT dropped — drop it by hand");
-            } else {
-                info!(%name, %ns, %role, "revoked the consumer's role");
+                Ok(()) => info!(%name, %ns, %role, "revoked the consumer's role"),
+                // The server is up and the role is merely locked: holding the
+                // finalizer for another try beats leaving a LOGIN behind.
+                Err(
+                    e @ PgAdminError::ServerCancelled {
+                        bound: ServerBound::Lock,
+                        ..
+                    },
+                ) if revoke_may_wait(claim, Utc::now()) => {
+                    warn!(
+                        %name, %ns, %role, error = %e,
+                        retry_secs = REVOKE_LOCK_RETRY.as_secs(),
+                        "consumer role is locked — holding the claim's finalizer to try again"
+                    );
+                    return Revocation::RetryAfterLock;
+                }
+                Err(e) => {
+                    warn!(%name, %ns, %role, error = %e, kind = e.kind(), "consumer role NOT dropped — drop it by hand");
+                }
             }
         }
         "redis" => {
             let Some(instance) = sd.status.as_ref().and_then(|s| s.instance.clone()) else {
-                return;
+                return Revocation::Settled;
             };
             let df_ns = cfg
                 .pointer("/namespace")
@@ -1838,7 +1918,7 @@ pub async fn revoke_consumer(ctx: &Arc<Context>, claim: &Arc<ResourceClaim>, ns:
             .await
             else {
                 warn!(%name, %ns, %user, "instance admin secret unreadable; ACL user NOT dropped");
-                return;
+                return Revocation::Settled;
             };
             // DELUSER only. NOT flushdb — the keyspace belongs to the shared
             // database and its other consumers are still using it. That one
@@ -1852,6 +1932,7 @@ pub async fn revoke_consumer(ctx: &Arc<Context>, claim: &Arc<ResourceClaim>, ns:
         }
         _ => {}
     }
+    Revocation::Settled
 }
 
 /// Read one `data` key off a Secret object, base64-decoded.
@@ -2697,5 +2778,168 @@ mod reconcile_pg_tests {
             ready["message"],
             "waiting for CNPG to create shd_apps_orders in platform-postgres"
         );
+    }
+
+    // --- a consumer revoke that meets a lock (WI-400) ---
+
+    const CLAIM_PATH: &str = "/apis/apprafter.io/v1alpha1/namespaces/apps/resourceclaims/web";
+
+    /// `apps/web`, a pg consumer of `orders`, deleted `ago`, still holding
+    /// the provisioner finalizer.
+    fn deleted_consumer(ago: Duration) -> Arc<ResourceClaim> {
+        let mut claim = ResourceClaim::new(
+            "web",
+            operator_core::ResourceClaimSpec {
+                type_: "pg".into(),
+                shared_ref: Some("orders".into()),
+                ..Default::default()
+            },
+        );
+        claim.metadata.namespace = Some("apps".into());
+        claim.metadata.finalizers = Some(vec![crate::PROVISIONER_FINALIZER.into()]);
+        let since = Utc::now() - chrono::TimeDelta::from_std(ago).expect("a small duration");
+        claim.metadata.deletion_timestamp = Some(operator_core::k8s_time::time(since));
+        Arc::new(claim)
+    }
+
+    /// Every request a consumer's delete makes, up to the finalizer patch.
+    fn revoke_routes() -> Vec<Route> {
+        vec![
+            route(
+                "GET",
+                "/apis/apprafter.io/v1alpha1/namespaces/apps/shareddatabases/orders",
+                Reply::Json(
+                    200,
+                    json!({
+                        "apiVersion": "apprafter.io/v1alpha1", "kind": "SharedDatabase",
+                        "metadata": { "name": "orders", "namespace": "apps" },
+                        "spec": { "type": "pg" },
+                        "status": { "ready": true, "database": "shd_apps_orders" },
+                    }),
+                ),
+            ),
+            route(
+                "GET",
+                "/apis/apprafter.io/v1alpha1/serviceproviders",
+                Reply::Json(
+                    200,
+                    json!({
+                        "apiVersion": "apprafter.io/v1alpha1", "kind": "ServiceProviderList",
+                        "metadata": { "resourceVersion": "1" },
+                        "items": [{
+                            "apiVersion": "apprafter.io/v1alpha1", "kind": "ServiceProvider",
+                            "metadata": { "name": "pg-shared", "namespace": "apprafter-system" },
+                            "spec": { "type": "pg", "backend": "cloudnative-pg" },
+                        }],
+                    }),
+                ),
+            ),
+            route(
+                "GET",
+                "/api/v1/namespaces/cnpg-system/secrets/platform-postgres-apprafter-admin",
+                Reply::Json(
+                    200,
+                    json!({
+                        "apiVersion": "v1", "kind": "Secret",
+                        "metadata": { "name": "platform-postgres-apprafter-admin", "namespace": "cnpg-system" },
+                        "data": { "password": "cHc=" },
+                    }),
+                ),
+            ),
+            route(
+                "PATCH",
+                CLAIM_PATH,
+                Reply::Json(
+                    200,
+                    json!({
+                        "apiVersion": "apprafter.io/v1alpha1", "kind": "ResourceClaim",
+                        "metadata": { "name": "web", "namespace": "apps" },
+                        "spec": { "type": "pg", "selector": {} },
+                    }),
+                ),
+            ),
+        ]
+    }
+
+    /// Run the claim controller's reconcile on `claim` once, with `pg`
+    /// answering the revoke; return the action and the finalizer patches.
+    async fn delete_consumer(
+        claim: Arc<ResourceClaim>,
+        pg: Vec<Result<(), PgAdminError>>,
+    ) -> (Action, Vec<crate::route_apiserver::Call>) {
+        let (client, log) = apiserver(revoke_routes());
+        let mut ctx = Context::new(client, Arc::new(Metrics::new()));
+        ctx.pg = Arc::new(ScriptedPg(Mutex::new(pg.into())));
+        let action = crate::reconcile::reconcile(claim, Arc::new(ctx))
+            .await
+            .expect("a consumer's delete never fails on its revoke");
+        (action, calls_to(&log, "PATCH", CLAIM_PATH))
+    }
+
+    #[tokio::test]
+    async fn a_revoke_that_meets_a_lock_keeps_the_claims_finalizer() {
+        let (action, finalizer_patches) = delete_consumer(
+            deleted_consumer(Duration::from_secs(30)),
+            vec![Err(lock_timeout(0))],
+        )
+        .await;
+
+        assert_eq!(action, Action::requeue(REVOKE_LOCK_RETRY));
+        assert!(
+            finalizer_patches.is_empty(),
+            "the finalizer must stay while the role is locked: {finalizer_patches:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lock_held_past_the_patience_is_given_up_on_as_before() {
+        let (action, finalizer_patches) = delete_consumer(
+            deleted_consumer(REVOKE_LOCK_PATIENCE + Duration::from_secs(60)),
+            vec![Err(lock_timeout(0))],
+        )
+        .await;
+
+        assert_eq!(action, Action::await_change());
+        assert_eq!(finalizer_patches.len(), 1, "{finalizer_patches:?}");
+        assert_eq!(
+            finalizer_patches[0].body["metadata"]["finalizers"],
+            json!([])
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_server_still_releases_the_finalizer() {
+        // The designed best-effort rule, unchanged: a server that is down
+        // must not hold an application's delete.
+        let (action, finalizer_patches) = delete_consumer(
+            deleted_consumer(Duration::from_secs(30)),
+            vec![Err(unreachable())],
+        )
+        .await;
+
+        assert_eq!(action, Action::await_change());
+        assert_eq!(finalizer_patches.len(), 1, "{finalizer_patches:?}");
+    }
+
+    #[test]
+    fn the_lock_patience_is_measured_from_the_delete() {
+        let now = Utc::now();
+        let claim = |ago: i64| {
+            let mut c = ResourceClaim::new("web", Default::default());
+            c.metadata.deletion_timestamp = Some(operator_core::k8s_time::time(
+                now - chrono::TimeDelta::seconds(ago),
+            ));
+            c
+        };
+        assert!(revoke_may_wait(&claim(0), now));
+        assert!(revoke_may_wait(&claim(299), now));
+        assert!(!revoke_may_wait(&claim(300), now));
+        // A delete stamped ahead of this clock (skew) is still within.
+        assert!(revoke_may_wait(&claim(-5), now));
+        // A claim that is not being deleted has nothing to wait for.
+        assert!(!revoke_may_wait(
+            &ResourceClaim::new("web", Default::default()),
+            now
+        ));
     }
 }

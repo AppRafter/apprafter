@@ -62,9 +62,10 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// lock held past `lock_timeout` cancels the statement. The SharedDatabase's
 /// own `drop_groups` loses nothing by that, because it holds its finalizer
 /// and retries on any failure. A consumer claim's `revoke_consumer` is
-/// best-effort and releases the claim's finalizer on any failure, so a lock
-/// wait there leaves the consumer's LOGIN role on the server, logged at WARN
-/// with the role named.
+/// best-effort and releases the claim's finalizer on any failure, which on a
+/// lock wait would leave the consumer's LOGIN role on the server; so a
+/// [`ServerBound::Lock`] cancellation there holds the finalizer and retries
+/// instead, for up to `shared_database::REVOKE_LOCK_PATIENCE`.
 pub const SESSION_OPTIONS: &str = "-c lock_timeout=10s -c statement_timeout=30s";
 
 /// The bound on one whole [`PgAdmin`] call — DNS, dial, startup, every
@@ -139,6 +140,29 @@ pub enum PgAdminError {
     /// The connection task ended before the work did.
     #[error("postgres connection to {host} closed early")]
     ConnectionLost { host: String },
+}
+
+impl PgAdminError {
+    /// A stable one-word name for the failure, for a log field: which of the
+    /// bounds fired, or that none did. A delete path that retries on any
+    /// failure logs it, so "the database is still there" and "a lock was held
+    /// past `lock_timeout`" are not one line.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Connect { .. } => "connect",
+            Self::Statement { .. } => "statement",
+            Self::ServerCancelled {
+                bound: ServerBound::Lock,
+                ..
+            } => "lock_timeout",
+            Self::ServerCancelled {
+                bound: ServerBound::Statement,
+                ..
+            } => "statement_timeout",
+            Self::TimedOut { .. } => "call_timeout",
+            Self::ConnectionLost { .. } => "connection_lost",
+        }
+    }
 }
 
 /// The imperative Postgres operations a shared database needs.
@@ -886,5 +910,46 @@ mod tests {
             .await
             .expect("the connection must close when its call is dropped")
             .expect("the server task reports the close");
+    }
+
+    #[tokio::test]
+    async fn every_failure_names_its_kind() {
+        // Through the real client wherever a real failure can be produced.
+        let closed_port = {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            listener.local_addr().expect("addr").port()
+        };
+        let refused = format!("postgresql://role:pw@127.0.0.1:{closed_port}/db");
+        let err = PgClient
+            .execute_all(&refused, &statements(1))
+            .await
+            .expect_err("nothing listens on a closed port");
+        assert_eq!(err.kind(), "connect", "{err:?}");
+
+        for (code, kind) in [
+            ("55P03", "lock_timeout"),
+            ("57014", "statement_timeout"),
+            ("2BP01", "statement"),
+        ] {
+            let (dsn, _seen) = scripted_server(Script::FailQuery {
+                fail_at: 0,
+                code,
+                message: "refused",
+            })
+            .await;
+            let err = PgClient
+                .execute_all(&dsn, &statements(1))
+                .await
+                .expect_err("statement #0 fails");
+            assert_eq!(err.kind(), kind, "{err:?}");
+        }
+
+        let timed_out = PgAdminError::TimedOut {
+            host: "h".into(),
+            after: CALL_TIMEOUT,
+        };
+        assert_eq!(timed_out.kind(), "call_timeout");
+        let lost = PgAdminError::ConnectionLost { host: "h".into() };
+        assert_eq!(lost.kind(), "connection_lost");
     }
 }

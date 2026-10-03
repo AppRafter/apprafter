@@ -407,7 +407,14 @@ pub async fn reconcile(
             // would be false: the Secret cascades out of the cluster while
             // the login it held keeps working against the shared data.
             if claim.spec.shared_ref.is_some() {
-                crate::shared_database::revoke_consumer(&ctx, &claim, &ns, &name).await;
+                // WI-400: a revoke the server cancelled on a lock keeps the
+                // finalizer for another try; releasing it would leave the
+                // consumer's login behind (`REVOKE_LOCK_PATIENCE`).
+                if crate::shared_database::revoke_consumer(&ctx, &claim, &ns, &name).await
+                    == crate::shared_database::Revocation::RetryAfterLock
+                {
+                    return Ok(Action::requeue(crate::shared_database::REVOKE_LOCK_RETRY));
+                }
                 info!(
                     %name, %ns,
                     "shared-database consumer deleted — credential revoked, no RetainedClaim snapshot"
