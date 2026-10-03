@@ -95,6 +95,22 @@ fn build_recorder(ctx: &Context, stack: &PlatformStack) -> ObjectRecorder {
     ObjectRecorder::new(ctx.client.clone(), reporter, reference)
 }
 
+/// Publish one audit Event, best-effort and bounded by
+/// `DECORATIVE_CALL_BUDGET`: an Event that fails or never answers is logged
+/// and skipped, never a reason to hold the reconcile.
+async fn publish_bounded(recorder: &ObjectRecorder, ev: KubeEvent) {
+    let reason = ev.reason.clone();
+    match tokio::time::timeout(DECORATIVE_CALL_BUDGET, recorder.publish(ev)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!(reason = %reason, error = %e, "failed to publish event (continuing)"),
+        Err(_) => warn!(
+            reason = %reason,
+            budget_secs = DECORATIVE_CALL_BUDGET.as_secs(),
+            "event publish did not answer in time (continuing)"
+        ),
+    }
+}
+
 /// Static ObjectReference for the parent platform Application.
 /// Used as the `secondary` (Kubernetes `related`) field on
 /// events so operators can correlate `kubectl describe
@@ -163,6 +179,27 @@ const RECHECK_REQUESTED_ANNOTATION: &str = "apprafter.io/recheck-requested";
 /// enforced, a transition held rather than bumped blind — and still writes
 /// its status.
 const OCI_OPERATION_BUDGET: Duration = Duration::from_secs(20);
+
+/// How long the backup objects' reads may take together (WI-400): three
+/// namespaced LISTs and one GET, milliseconds each on a healthy apiserver. On
+/// expiry the reads have FAILED, and that is the verdict the condition
+/// already gives a failed read: `BackupHealthy=Unknown` (`StateUnreadable`).
+const BACKUP_READ_BUDGET: Duration = Duration::from_secs(10);
+
+/// How long the `NodeDiskPressure` sample may take (WI-400): a Node LIST and
+/// the kubelet Summary through the apiserver's node proxy. The proxy is a
+/// long-running request that the apiserver's own 60s limit does not cover,
+/// and the kubelet answers slowest exactly when its node is short of disk. On
+/// expiry there is no sample and the condition is left as it was — the
+/// existing answer to "we could not look".
+const NODE_SAMPLE_BUDGET: Duration = Duration::from_secs(10);
+
+/// How long each decorative call may take (WI-400): the ADR 0048 anchor
+/// lookup, the anchor's annotation patch, and each audit Event. The anchor-403
+/// fix made these tolerate an ERROR; a call that never answers froze the
+/// reconcile before its status write all the same. On expiry each is skipped
+/// exactly as when it fails.
+const DECORATIVE_CALL_BUDGET: Duration = Duration::from_secs(5);
 
 /// The registry did not finish one question within `OCI_OPERATION_BUDGET`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -826,25 +863,42 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
                     // swallows both None and Err to None.
                     let anchor_api: Api<ConfigMap> =
                         Api::namespaced(ctx.client.clone(), MIGRATION_PLAN_NAMESPACE);
-                    let anchor_get = anchor_api.get_opt(PLATFORM_MIGRATION_ANCHOR).await;
-                    match &anchor_get {
-                        Ok(Some(_)) => debug!(
-                            anchor = PLATFORM_MIGRATION_ANCHOR,
-                            "anchoring MigrationPlan to ConfigMap ownerRef"
-                        ),
-                        Ok(None) => warn!(
-                            anchor = PLATFORM_MIGRATION_ANCHOR,
-                            namespace = MIGRATION_PLAN_NAMESPACE,
-                            "anchor ConfigMap absent — creating MigrationPlan un-owned (off the Argo tree)"
-                        ),
-                        Err(e) => warn!(
-                            anchor = PLATFORM_MIGRATION_ANCHOR,
-                            namespace = MIGRATION_PLAN_NAMESPACE,
-                            error = %e,
-                            "anchor ConfigMap lookup failed (e.g. configmaps RBAC) — creating MigrationPlan un-owned; detection/status NOT blocked"
-                        ),
-                    }
-                    let anchor_uid = anchor_uid_from_get(anchor_get);
+                    let anchor_uid = match tokio::time::timeout(
+                        DECORATIVE_CALL_BUDGET,
+                        anchor_api.get_opt(PLATFORM_MIGRATION_ANCHOR),
+                    )
+                    .await
+                    {
+                        Ok(anchor_get) => {
+                            match &anchor_get {
+                                Ok(Some(_)) => debug!(
+                                    anchor = PLATFORM_MIGRATION_ANCHOR,
+                                    "anchoring MigrationPlan to ConfigMap ownerRef"
+                                ),
+                                Ok(None) => warn!(
+                                    anchor = PLATFORM_MIGRATION_ANCHOR,
+                                    namespace = MIGRATION_PLAN_NAMESPACE,
+                                    "anchor ConfigMap absent — creating MigrationPlan un-owned (off the Argo tree)"
+                                ),
+                                Err(e) => warn!(
+                                    anchor = PLATFORM_MIGRATION_ANCHOR,
+                                    namespace = MIGRATION_PLAN_NAMESPACE,
+                                    error = %e,
+                                    "anchor ConfigMap lookup failed (e.g. configmaps RBAC) — creating MigrationPlan un-owned; detection/status NOT blocked"
+                                ),
+                            }
+                            anchor_uid_from_get(anchor_get)
+                        }
+                        Err(_) => {
+                            warn!(
+                                anchor = PLATFORM_MIGRATION_ANCHOR,
+                                namespace = MIGRATION_PLAN_NAMESPACE,
+                                budget_secs = DECORATIVE_CALL_BUDGET.as_secs(),
+                                "anchor ConfigMap lookup did not answer in time — creating MigrationPlan un-owned; detection/status NOT blocked"
+                            );
+                            None
+                        }
+                    };
                     create_platform_migration_plan(
                         &plan_api,
                         &plan_name,
@@ -942,8 +996,21 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
     // App, by contrast, never affects the top-level app's own tile).
     // SSA with our own field manager survives Argo syncs + causes no
     // OutOfSync. Best-effort: the tile signal is a nicety, never fatal.
-    if let Err(e) = reconcile_anchor_health(&ctx, &pending_upgrade).await {
-        warn!(error = %e, "failed to reconcile anchor ConfigMap pending-upgrade annotation (continuing)");
+    match tokio::time::timeout(
+        DECORATIVE_CALL_BUDGET,
+        reconcile_anchor_health(&ctx, &pending_upgrade),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!(
+            error = %e,
+            "failed to reconcile anchor ConfigMap pending-upgrade annotation (continuing)"
+        ),
+        Err(_) => warn!(
+            budget_secs = DECORATIVE_CALL_BUDGET.as_secs(),
+            "anchor ConfigMap pending-upgrade annotation did not answer in time (continuing)"
+        ),
     }
 
     // Detect foreign writer BEFORE patching — so we know whether
@@ -1009,9 +1076,7 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
                 action: "ForceRevert".into(),
                 secondary: Some(parent_object_reference()),
             };
-            if let Err(e) = recorder.publish(ev).await {
-                warn!(error = %e, "failed to publish ForeignFieldManager event (continuing)");
-            }
+            publish_bounded(&recorder, ev).await;
         }
         patch_application(&apps, &patch_payload, &pending_upgrade).await?;
         if foreign_writer.is_some() {
@@ -1029,9 +1094,7 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
                 action: "Reconciled".into(),
                 secondary: Some(parent_object_reference()),
             };
-            if let Err(e) = recorder.publish(ev).await {
-                warn!(error = %e, "failed to publish SourceReverted event (continuing)");
-            }
+            publish_bounded(&recorder, ev).await;
         }
     }
 
@@ -1223,7 +1286,22 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
     // missing node or a parse failure leaves the condition untouched rather
     // than flipping it to a false negative. A decorative read must never
     // fail a reconcile — the ADR 0048 anchor-403 lesson.
-    if let Some(fraction) = sample_node_free_fraction(&ctx.client, &ctx.capacity).await {
+    let fraction = match tokio::time::timeout(
+        NODE_SAMPLE_BUDGET,
+        sample_node_free_fraction(&ctx.client, &ctx.capacity),
+    )
+    .await
+    {
+        Ok(fraction) => fraction,
+        Err(_) => {
+            warn!(
+                budget_secs = NODE_SAMPLE_BUDGET.as_secs(),
+                "node disk sample did not answer in time; NodeDiskPressure left as it was"
+            );
+            None
+        }
+    };
+    if let Some(fraction) = fraction {
         let (status, reason, message) = node_disk_pressure_verdict(fraction);
         let cond = condition(
             COND_NODE_DISK_PRESSURE,
@@ -1356,7 +1434,18 @@ async fn assess_backup_health(
 ) -> Option<Duration> {
     let enabled = spec.backup.as_ref().is_some_and(|b| b.enabled);
     let observed = if enabled {
-        crate::backup_health::observe(&ctx.client).await
+        match tokio::time::timeout(
+            BACKUP_READ_BUDGET,
+            crate::backup_health::observe(&ctx.client),
+        )
+        .await
+        {
+            Ok(observed) => observed,
+            Err(_) => Err(format!(
+                "the apiserver did not answer within {}s",
+                BACKUP_READ_BUDGET.as_secs()
+            )),
+        }
     } else {
         // Disabled: `assess` returns `Absent` without looking at this.
         Ok(crate::backup_health::Observed::default())
@@ -4352,7 +4441,7 @@ mod bounded_reconcile_tests {
     use operator_core::Metrics;
     use serde_json::{json, Value};
 
-    use super::test_upstreams::{Published, SilentRegistry};
+    use super::test_upstreams::{NoRegistry, Published, SilentRegistry};
     use super::*;
 
     const NS: &str = "/namespaces/apprafter-system";
@@ -4817,6 +4906,186 @@ mod bounded_reconcile_tests {
             "{reachable:#}"
         );
         assert_eq!(patch.body["status"]["currentVersion"], "0.2.80");
+        assert_every_condition_carried(&patch);
+    }
+
+    /// `BackupHealthy` reads the backup objects (WI-386). A read the
+    /// apiserver never answers is itself the verdict, `Unknown`, and it is
+    /// written beside every other condition — the ADR 0048 anchor-403 lesson
+    /// made these reads tolerate ERRORS; this makes them tolerate a HANG.
+    #[tokio::test(start_paused = true)]
+    async fn a_backup_read_that_never_answers_is_unknown_and_the_status_is_written() {
+        let mut stack = stack_on("0.2.80", "0.2.80");
+        stack["spec"]["backup"] = json!({
+            "enabled": true, "schedule": "0 3 * * *",
+            "bucket": "s3:https://s3.example/bucket",
+            "credentialRef": { "name": "apprafter-backup-s3" },
+            "stagingMode": "monolithic", "checkSchedule": "",
+        });
+        let parent = parent_on(&stack, "0.2.80");
+        let mut cluster = cluster(stack, parent);
+        cluster
+            .silent
+            .push(("GET", format!("/apis/batch/v1{NS}/cronjobs")));
+        let (client, state) = scripted(cluster);
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(
+            HUNG,
+            reconcile(the_stack(&state), context(client, Arc::new(NoRegistry))),
+        )
+        .await
+        .expect("the reconcile finished on its own")
+        .expect("the reconcile succeeds");
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_secs(10),
+            "the backup reads' budget"
+        );
+        let patch = status_patch(&calls(&state));
+        let backup = written_condition(&patch, crate::status::COND_BACKUP_HEALTHY);
+        assert_eq!(backup["status"], "Unknown");
+        assert_eq!(backup["reason"], crate::backup_health::REASON_UNREADABLE);
+        assert!(
+            backup["message"]
+                .as_str()
+                .unwrap()
+                .contains("the apiserver did not answer within 10s"),
+            "{backup:#}"
+        );
+        assert_every_condition_carried(&patch);
+    }
+
+    /// `NodeDiskPressure` samples the kubelet through the apiserver's node
+    /// proxy — a long-running request the apiserver's own 60s limit does not
+    /// cover, and slowest exactly when the node is short of disk. A sample
+    /// that never answers leaves the condition as it was, and the status is
+    /// still written.
+    ///
+    /// The stack starts WITH a `NodeDiskPressure=True` from an earlier
+    /// sample: "left as it was" has to be told apart from "pruned". The
+    /// status write is an SSA apply under `platform-controller`, so a write
+    /// that left the condition out would remove it from the cluster —
+    /// exactly when the node is short of disk.
+    #[tokio::test(start_paused = true)]
+    async fn a_node_sample_that_never_answers_leaves_its_condition_and_the_status_is_written() {
+        let mut stack = stack_on("0.2.80", "0.2.80");
+        let earlier_sample =
+            prior_condition("NodeDiskPressure", "True", "NodeFilesystemNearlyFull");
+        stack["status"]["conditions"]
+            .as_array_mut()
+            .unwrap()
+            .push(earlier_sample.clone());
+        let parent = parent_on(&stack, "0.2.80");
+        let mut cluster = cluster(stack, parent);
+        cluster.silent.push(("GET", "/api/v1/nodes".to_string()));
+        let (client, state) = scripted(cluster);
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(
+            HUNG,
+            reconcile(the_stack(&state), context(client, Arc::new(NoRegistry))),
+        )
+        .await
+        .expect("the reconcile finished on its own")
+        .expect("the reconcile succeeds");
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_secs(10),
+            "the node sample's budget"
+        );
+        let patch = status_patch(&calls(&state));
+        assert_eq!(
+            written_condition(&patch, COND_NODE_DISK_PRESSURE),
+            &earlier_sample,
+            "no sample, so the earlier verdict is carried unchanged — status, reason, \
+             message and lastTransitionTime"
+        );
+        assert_every_condition_carried(&patch);
+    }
+
+    /// The anchor ConfigMap is an Argo-tree nicety (ADR 0048). Its lookup
+    /// and its annotation patch never answering must not stop the gate it
+    /// decorates: the plan is created un-owned, exactly as when the anchor is
+    /// unreadable, and the status says the upgrade is pending.
+    #[tokio::test(start_paused = true)]
+    async fn an_anchor_that_never_answers_neither_blocks_the_gate_nor_the_status() {
+        let stack = stack_on("0.2.80", "0.2.81");
+        let parent = parent_on(&stack, "0.2.80");
+        let mut cluster = cluster(stack, parent);
+        cluster.anchor = Some(json!({
+            "apiVersion": "v1", "kind": "ConfigMap",
+            "metadata": { "name": "platform-migration-anchor",
+                          "namespace": "apprafter-system", "uid": "anchor-uid" },
+        }));
+        cluster.silent.push(("GET", ANCHOR.to_string()));
+        let (client, state) = scripted(cluster);
+        let upstream = Arc::new(Published {
+            latest: "0.2.81",
+            class: ChangeClass::Breaking,
+        });
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(
+            HUNG,
+            reconcile(the_stack(&state), context(client, upstream)),
+        )
+        .await
+        .expect("the reconcile finished on its own")
+        .expect("the reconcile succeeds");
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_secs(10),
+            "two anchor calls, each on its own budget"
+        );
+        let calls = calls(&state);
+        let plan = calls
+            .iter()
+            .find(|c| c.is("POST", PLANS))
+            .expect("the gate is created");
+        assert!(
+            plan.body["metadata"]["ownerReferences"].is_null(),
+            "un-owned, as when the anchor is unreadable: {:#}",
+            plan.body
+        );
+        let patch = status_patch(&calls);
+        assert_eq!(
+            written_condition(&patch, "MigrationPending")["status"],
+            "True"
+        );
+        assert_every_condition_carried(&patch);
+    }
+
+    /// The audit Events of a foreign-writer revert are best-effort. An Events
+    /// API that never answers does not hold the status — which carries the
+    /// same finding as `UnauthorizedSourceModification=True`.
+    #[tokio::test(start_paused = true)]
+    async fn an_events_api_that_never_answers_does_not_hold_the_status() {
+        let stack = stack_on("0.2.80", "0.2.80");
+        let mut parent = parent_on(&stack, "0.2.80");
+        parent["metadata"]["managedFields"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({ "manager": "kubectl-edit", "operation": "Update",
+                          "fieldsV1": { "f:spec": { "f:source": { "f:targetRevision": {} } } } }));
+        let mut cluster = cluster(stack, parent);
+        cluster.silent.push(("POST", EVENTS.to_string()));
+        let (client, state) = scripted(cluster);
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(
+            HUNG,
+            reconcile(the_stack(&state), context(client, Arc::new(NoRegistry))),
+        )
+        .await
+        .expect("the reconcile finished on its own")
+        .expect("the reconcile succeeds");
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_secs(10),
+            "two audit Events, each on its own budget"
+        );
+        let patch = status_patch(&calls(&state));
+        assert_eq!(
+            written_condition(&patch, "UnauthorizedSourceModification")["status"],
+            "True"
+        );
         assert_every_condition_carried(&patch);
     }
 }
