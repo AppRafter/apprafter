@@ -74,6 +74,8 @@ use crate::commands::helper_interrupt::refuse_if_interrupted;
 /// abandoned (`deadline_event::REASON` there; a test below reads it).
 pub(crate) const REASON: &str = "ReconcileTimedOut";
 
+/// `regarding.kind` of a claim's Events.
+pub(crate) const CLAIM_KIND: &str = "ResourceClaim";
 /// `regarding.kind` of a SharedVolume's Events.
 pub(crate) const SHARED_VOLUME_KIND: &str = "SharedVolume";
 /// `regarding.kind` of a SharedDatabase's Events.

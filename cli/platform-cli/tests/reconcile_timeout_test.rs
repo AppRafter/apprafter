@@ -39,6 +39,14 @@ const DATABASE_GET: &str =
 const CLAIMS: &str = "get resourceclaim.apprafter.io -n apps -o json";
 const DATABASE_EVENTS: &str = "get events.events.k8s.io -n apps --field-selector \
      reason=ReconcileTimedOut,regarding.kind=SharedDatabase,regarding.name=orders -o json";
+const APP_REGISTRATIONS: &str =
+    "get application.argoproj.io -l apprafter.io/application=web -n argocd -o json";
+/// `app status` reads the claims with their `managedFields`, so that a
+/// claim's `Reconcile:` block goes quiet once the controller whose pass was
+/// cut has written its status since (owner override O2).
+const APP_CLAIMS: &str = "get resourceclaim.apprafter.io --show-managed-fields -n apps -o json";
+const APP_CLAIM_EVENTS: &str = "get events.events.k8s.io -n apps --field-selector \
+     reason=ReconcileTimedOut,regarding.kind=ResourceClaim -o json";
 
 struct Sandbox {
     dir: TempDir,
@@ -375,4 +383,118 @@ fn db_status_is_quiet_once_the_provisioner_has_written_the_status_since() {
     assert!(stdout.contains("  Bound apps:   0"), "{stdout}");
     let calls = sandbox.kubectl_calls();
     assert_eq!(calls, [DATABASE_GET, CLAIMS, DATABASE_EVENTS], "{calls:#?}");
+}
+
+/// One registration of `web` that deploys the AppRafter Application `web`
+/// into `apps`.
+fn web_registration() -> Value {
+    json!({ "items": [{
+        "apiVersion": "argoproj.io/v1alpha1", "kind": "Application",
+        "metadata": {
+            "name": "web", "namespace": "argocd",
+            "labels": { "apprafter.io/application": "web" }
+        },
+        "spec": { "destination": { "namespace": "apps" } },
+        "status": {
+            "sync": { "status": "Synced" }, "health": { "status": "Healthy" },
+            "resources": [{ "group": "apprafter.io", "version": "v1alpha1",
+                            "kind": "Application", "name": "web", "namespace": "apps" }]
+        }
+    }]})
+}
+
+/// `web`'s claim `web-pg`, as the claims LIST returns it.
+fn web_claim() -> Value {
+    let mut claim = object(
+        "ResourceClaim",
+        "web-pg",
+        json!({ "provider": "cnpg", "ready": true, "connectionSecretRef": "web-pg-conn" }),
+    );
+    claim["metadata"]["ownerReferences"] = json!([{ "kind": "Application", "name": "web" }]);
+    claim
+}
+
+#[test]
+fn app_status_names_an_abandoned_claim_pass_under_the_claims_table() {
+    // One registration of `web` that deploys the AppRafter Application
+    // `web` into `apps`. Every read this test does not answer (the inner
+    // Application, pods, services) fails as NotFound, and `app status`
+    // carries on past it, as it does on a cluster.
+    let sandbox = Sandbox::new(&[
+        (APP_REGISTRATIONS, Reply::Json(web_registration())),
+        (APP_CLAIMS, Reply::Json(json!({ "items": [web_claim()] }))),
+        (
+            APP_CLAIM_EVENTS,
+            Reply::Json(abandoned(
+                "ResourceClaim",
+                "web-pg",
+                Duration::minutes(3),
+                120,
+            )),
+        ),
+    ]);
+    let (ok, stdout, stderr) = sandbox.run(&["app", "status", "web"]);
+    assert!(ok, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stdout.contains(
+            "  web-pg — Reconcile:\n    last timed out 3 minutes ago (did not finish within \
+             120s)\n    the operator retries on its own\n"
+        ),
+        "{stdout}"
+    );
+    let calls = sandbox.kubectl_calls();
+    let at = |args: &str| calls.iter().position(|c| c == args);
+    assert!(
+        at(APP_CLAIMS).is_some() && at(APP_CLAIMS) < at(APP_CLAIM_EVENTS),
+        "the claims, then their Events: {calls:#?}"
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|c| c.contains("events.events.k8s.io"))
+            .count(),
+        1,
+        "one Event LIST for the whole claims table: {calls:#?}"
+    );
+}
+
+#[test]
+fn app_status_is_quiet_once_the_provisioner_has_written_the_claims_status_since() {
+    // A status write under the provisioner's own field manager after the
+    // Event: a later pass got through. kubectl returns `managedFields` only
+    // under `--show-managed-fields`, which `APP_CLAIMS` asks for; a plain
+    // read would see none, and keep the block until the Event expired.
+    let mut recovered = web_claim();
+    recovered["metadata"]["managedFields"] = json!([{
+        "manager": "resourceclaim-provisioner", "operation": "Apply",
+        "apiVersion": "apprafter.io/v1alpha1", "subresource": "status",
+        "time": (Utc::now() - Duration::minutes(1)).to_rfc3339_opts(SecondsFormat::Secs, true),
+        "fieldsType": "FieldsV1", "fieldsV1": { "f:status": {} }
+    }]);
+    let sandbox = Sandbox::new(&[
+        (APP_REGISTRATIONS, Reply::Json(web_registration())),
+        (APP_CLAIMS, Reply::Json(json!({ "items": [recovered] }))),
+        (
+            APP_CLAIM_EVENTS,
+            Reply::Json(abandoned(
+                "ResourceClaim",
+                "web-pg",
+                Duration::minutes(3),
+                120,
+            )),
+        ),
+    ]);
+    let (ok, stdout, stderr) = sandbox.run(&["app", "status", "web"]);
+    assert!(ok, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(!stdout.contains("Reconcile"), "{stdout}");
+    assert!(
+        stdout.contains("  web-pg "),
+        "the claims table itself: {stdout}"
+    );
+    let calls = sandbox.kubectl_calls();
+    let at = |args: &str| calls.iter().position(|c| c == args);
+    assert!(
+        at(APP_CLAIMS).is_some() && at(APP_CLAIMS) < at(APP_CLAIM_EVENTS),
+        "the claims, then their Events: {calls:#?}"
+    );
 }
