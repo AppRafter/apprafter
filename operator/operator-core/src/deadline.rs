@@ -83,6 +83,15 @@ pub async fn within<T, E: From<ReconcileTimedOut>>(
 mod tests {
     use super::*;
 
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use futures::StreamExt;
+    use k8s_openapi::api::core::v1::ConfigMap;
+    use kube::api::ObjectMeta;
+    use kube::runtime::controller::{Action, Config};
+    use kube::runtime::reflector::{self, ObjectRef};
+    use kube::runtime::{applier, watcher};
     use tokio::time::Instant;
 
     /// A controller error shaped like the ones in `operator-controllers`.
@@ -161,5 +170,91 @@ mod tests {
     fn the_timeout_reads_through_a_controller_error_unchanged() {
         let err = TestError::from(ReconcileTimedOut { after: DEADLINE });
         assert_eq!(err.to_string(), "reconcile did not finish within 120s");
+    }
+
+    /// GOTCHA-51 end to end, through kube-runtime's own `applier` (the loop
+    /// `Controller::run` drives): the first reconcile of an object hangs, and
+    /// a second trigger for the SAME object arrives while it does. kube-runtime
+    /// holds that trigger for as long as the hang lasts. With the deadline,
+    /// `error_policy` sees the timeout at the deadline and the held trigger
+    /// runs at that same instant — not after the policy's requeue.
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_reconcile_reaches_error_policy_and_releases_the_held_trigger() {
+        let (store, mut writer) = reflector::store::<ConfigMap>();
+        let web = ConfigMap {
+            metadata: ObjectMeta {
+                name: Some("web".into()),
+                namespace: Some("demo".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // `InitDone` swaps the init buffer INTO the store, so it goes first.
+        writer.apply_watcher_event(&watcher::Event::InitDone);
+        writer.apply_watcher_event(&watcher::Event::Apply(web.clone()));
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let reconciled_at = Arc::new(Mutex::new(Vec::<Duration>::new()));
+        let policy_saw = Arc::new(Mutex::new(Vec::<(Duration, String)>::new()));
+        let t0 = Instant::now();
+
+        let (queue_tx, queue_rx) = futures::channel::mpsc::unbounded::<ObjectRef<ConfigMap>>();
+        let applier = applier(
+            {
+                let calls = calls.clone();
+                let reconciled_at = reconciled_at.clone();
+                move |_obj: Arc<ConfigMap>, _ctx: Arc<()>| {
+                    let first = calls.fetch_add(1, Ordering::SeqCst) == 0;
+                    let reconciled_at = reconciled_at.clone();
+                    Box::pin(within(DEADLINE, async move {
+                        if first {
+                            // The stall: a request the apiserver accepted
+                            // and never answered.
+                            std::future::pending::<()>().await;
+                        }
+                        reconciled_at.lock().unwrap().push(t0.elapsed());
+                        Ok::<_, TestError>(Action::await_change())
+                    }))
+                }
+            },
+            {
+                let policy_saw = policy_saw.clone();
+                move |_obj: Arc<ConfigMap>, err: &TestError, _ctx: Arc<()>| {
+                    policy_saw
+                        .lock()
+                        .unwrap()
+                        .push((t0.elapsed(), err.to_string()));
+                    // A requeue far beyond the test window, so the only way
+                    // the second reconcile can run is the held trigger.
+                    Action::requeue(Duration::from_secs(3600))
+                }
+            },
+            Arc::new(()),
+            store,
+            queue_rx.map(Ok::<_, std::convert::Infallible>),
+            Config::default(),
+        );
+        let driven = tokio::spawn(applier.for_each(|_| async {}));
+
+        queue_tx.unbounded_send(ObjectRef::from_obj(&web)).unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        // A sibling's progress re-fires the owner while it is still stuck.
+        queue_tx.unbounded_send(ObjectRef::from_obj(&web)).unwrap();
+        tokio::time::sleep(DEADLINE * 2).await;
+
+        assert_eq!(
+            *policy_saw.lock().unwrap(),
+            vec![(DEADLINE, "reconcile did not finish within 120s".to_string())],
+            "error_policy must see the timeout, at the deadline"
+        );
+        assert_eq!(
+            *reconciled_at.lock().unwrap(),
+            vec![DEADLINE],
+            "the held trigger must run the moment the hung reconcile is abandoned"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        drop(queue_tx);
+        driven.abort();
     }
 }

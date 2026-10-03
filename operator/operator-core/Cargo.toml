@@ -41,3 +41,7 @@ tower = { workspace = true }
 # to the next timer whenever every task is idle — so a request that never
 # answers costs no wall time, and the moment the loop gives up is exact.
 tokio = { workspace = true, features = ["test-util"] }
+# `deadline.rs` drives kube-runtime's public `applier` (the loop
+# `Controller::run` runs) from an in-memory queue, which is a `futures`
+# channel and stream.
+futures = { workspace = true }
