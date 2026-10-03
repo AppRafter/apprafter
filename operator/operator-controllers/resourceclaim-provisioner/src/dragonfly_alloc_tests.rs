@@ -518,3 +518,278 @@ async fn an_ephemeral_reattach_onto_a_held_dbnum_cancels_its_snapshot_and_alloca
     );
     assert_eq!(api.claim(NS, "web-redis")["status"]["dbnum"], 0);
 }
+
+// ---- (2b) the shared cache commits its number first, then checks, then flushes ----
+
+fn shared_cache(name: &str, status: Value) -> Value {
+    json!({
+        "apiVersion": "apprafter.io/v1alpha1", "kind": "SharedDatabase",
+        "metadata": {
+            "name": name, "namespace": NS,
+            "finalizers": [crate::shared_database::SD_FINALIZER],
+        },
+        "spec": { "type": "redis" },
+        "status": status,
+    })
+}
+
+/// The status of a shared cache whose allocation pass stopped after its
+/// checkpoint: `$dbnum` recorded, not yet checked or flushed.
+fn checkpointed(dbnum: u16) -> Value {
+    json!({
+        "ready": false, "refCount": 0, "instance": EPHEMERAL, "dbnum": dbnum,
+        "conditions": [{
+            "type": "Ready", "status": "False", "reason": "AwaitingKeyspace",
+            "message": format!("allocated ${dbnum}"),
+            "lastTransitionTime": "2026-10-01T00:00:00Z",
+        }],
+    })
+}
+
+async fn reconcile_shared_stored(
+    api: &FakeApiserver,
+    name: &str,
+    redis: Arc<dyn RedisAdmin>,
+) -> Result<Action, ReconcileError> {
+    let stored: operator_core::SharedDatabase =
+        serde_json::from_value(api.shared(NS, name)).expect("shared database");
+    crate::shared_database::reconcile_shared_database(Arc::new(stored), ctx(api, redis)).await
+}
+
+/// `Ready` reason of the stored shared cache.
+fn shared_reason(api: &FakeApiserver, name: &str) -> String {
+    api.shared(NS, name)["status"]["conditions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|c| c["type"] == "Ready")
+        .and_then(|c| c["reason"].as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+#[tokio::test]
+async fn a_late_committed_claim_on_a_shared_caches_fresh_dbnum_blocks_its_flush() {
+    // The claim's checkpoint lands after the shared cache's allocation LIST —
+    // here, the moment the shared cache's own checkpoint is written.
+    let api = api();
+    api.put_shared(shared_cache("orders", json!({})))
+        .commit_late(
+            |c| c.is_status_patch("shareddatabases", "orders"),
+            claim("cart-redis", false, Some((EPHEMERAL, 0))),
+        );
+    let redis = Arc::new(FakeRedis::default());
+    let err = reconcile_shared_stored(&api, "orders", redis.clone())
+        .await
+        .expect_err("a shared $N must not be provisioned");
+    assert!(
+        err.to_string().contains("ResourceClaim apps/cart-redis"),
+        "{err}"
+    );
+    assert!(flushed(&redis).is_empty(), "flushed a $N a claim holds");
+    assert_eq!(api.shared(NS, "orders")["status"]["dbnum"], Value::Null);
+    assert_eq!(shared_reason(&api, "orders"), "AwaitingKeyspace");
+
+    reconcile_shared_stored(&api, "orders", redis.clone())
+        .await
+        .expect("provisions on another $N");
+    assert_eq!(
+        flushed(&redis),
+        vec![(dragonfly::instance_addr(EPHEMERAL, DF_NS), 1)]
+    );
+    assert_eq!(api.shared(NS, "orders")["status"]["dbnum"], 1);
+    assert_eq!(api.shared(NS, "orders")["status"]["ready"], true);
+}
+
+#[tokio::test]
+async fn a_shared_caches_checkpoint_that_commits_after_a_claim_provisioned_its_dbnum_moves_off_it()
+{
+    // The shared cache's checkpoint write was in flight when its reconcile
+    // was dropped. A claim allocated meanwhile: neither its LIST nor its
+    // re-read could see the uncommitted write, so it flushed $0 and went
+    // ready. Then the write committed. The shared cache's next pass must not
+    // treat $0 as its own.
+    let api = api();
+    api.put_shared(shared_cache("orders", json!({})))
+        .put_claim(claim("web-redis", false, None));
+    let redis = Arc::new(FakeRedis::default());
+    reconcile_stored(&api, "web-redis", redis.clone())
+        .await
+        .expect("the claim provisions on $0");
+    api.put_shared(shared_cache("orders", checkpointed(0)));
+
+    let err = reconcile_shared_stored(&api, "orders", redis.clone())
+        .await
+        .expect_err("a shared $N must not be provisioned");
+    assert!(
+        err.to_string().contains("ResourceClaim apps/web-redis"),
+        "{err}"
+    );
+    assert_eq!(api.shared(NS, "orders")["status"]["dbnum"], Value::Null);
+    reconcile_shared_stored(&api, "orders", redis.clone())
+        .await
+        .expect("provisions on another $N");
+    let addr = dragonfly::instance_addr(EPHEMERAL, DF_NS);
+    assert_eq!(
+        flushed(&redis),
+        vec![(addr.clone(), 0), (addr, 1)],
+        "the shared cache flushed the claim's $0"
+    );
+    assert_eq!(api.shared(NS, "orders")["status"]["dbnum"], 1);
+    assert_eq!(api.claim(NS, "web-redis")["status"]["dbnum"], 0);
+    assert_eq!(api.claim(NS, "web-redis")["status"]["ready"], true);
+}
+
+#[tokio::test]
+async fn a_shared_cache_with_its_dbnum_to_itself_is_flushed_and_recorded() {
+    let api = api();
+    api.put_shared(shared_cache("orders", json!({})));
+    let redis = Arc::new(FakeRedis::default());
+    reconcile_shared_stored(&api, "orders", redis.clone())
+        .await
+        .expect("provisions");
+    assert_eq!(
+        flushed(&redis),
+        vec![(dragonfly::instance_addr(EPHEMERAL, DF_NS), 0)]
+    );
+    assert_eq!(api.shared(NS, "orders")["status"]["dbnum"], 0);
+    assert_eq!(shared_reason(&api, "orders"), "Provisioned");
+}
+
+#[tokio::test]
+async fn a_shared_caches_unfinished_allocation_is_checked_and_flushed_on_the_retry() {
+    // The previous pass checkpointed $2 and stopped (the flush failed, the
+    // pass was cut). $2 is not proven this database's own until it is
+    // checked, and not safe for a consumer until it is flushed.
+    let api = api();
+    api.put_shared(shared_cache("orders", checkpointed(2)));
+    let redis = Arc::new(FakeRedis::default());
+    reconcile_shared_stored(&api, "orders", redis.clone())
+        .await
+        .expect("provisions");
+    assert_eq!(
+        flushed(&redis),
+        vec![(dragonfly::instance_addr(EPHEMERAL, DF_NS), 2)]
+    );
+    assert_eq!(api.shared(NS, "orders")["status"]["ready"], true);
+}
+
+#[tokio::test]
+async fn a_provisioned_shared_cache_that_went_not_ready_is_never_flushed_again() {
+    // `ready=false` with the backing carried forward is a provisioned cache
+    // that lost its provider for a while, not an unfinished allocation.
+    let api = api();
+    api.put_shared(shared_cache(
+        "orders",
+        json!({
+            "ready": false, "refCount": 1, "instance": EPHEMERAL, "dbnum": 3,
+            "conditions": [{
+                "type": "Ready", "status": "False", "reason": "NoProvider",
+                "lastTransitionTime": "2026-10-01T00:00:00Z",
+            }],
+        }),
+    ));
+    let redis = Arc::new(FakeRedis::default());
+    reconcile_shared_stored(&api, "orders", redis.clone())
+        .await
+        .expect("provisions");
+    assert!(flushed(&redis).is_empty(), "flushed a serving cache's data");
+    assert_eq!(api.shared(NS, "orders")["status"]["dbnum"], 3);
+    assert_eq!(api.shared(NS, "orders")["status"]["ready"], true);
+}
+
+#[tokio::test]
+async fn an_unfinished_allocation_is_released_rather_than_carried_under_another_reason() {
+    // A pass that stops before the allocation (here: no provider) writes a
+    // status of its own. Carrying an unchecked, unflushed $2 forward under
+    // `NoProvider` would make the next pass read it as provisioned.
+    let api = FakeApiserver::new();
+    api.put_shared(shared_cache("orders", checkpointed(2)));
+    reconcile_shared_stored(&api, "orders", Arc::new(FakeRedis::default()))
+        .await
+        .expect("waits for a provider");
+    assert_eq!(shared_reason(&api, "orders"), "NoProvider");
+    assert_eq!(api.shared(NS, "orders")["status"]["dbnum"], Value::Null);
+}
+
+// ---- (2c) deletes and the grace GC skip the flush instead of wiping a co-holder ----
+
+fn deleted_shared_cache(dbnum: u16) -> Value {
+    let mut sd = shared_cache(
+        "orders",
+        json!({ "ready": true, "instance": EPHEMERAL, "dbnum": dbnum }),
+    );
+    sd["metadata"]["deletionTimestamp"] = json!("2026-10-01T00:00:00Z");
+    sd
+}
+
+#[tokio::test]
+async fn deleting_a_shared_cache_does_not_flush_a_dbnum_a_claim_also_holds() {
+    let api = api();
+    api.put_shared(deleted_shared_cache(5)).put_claim(claim(
+        "cart-redis",
+        false,
+        Some((EPHEMERAL, 5)),
+    ));
+    let redis = Arc::new(FakeRedis::default());
+    reconcile_shared_stored(&api, "orders", redis.clone())
+        .await
+        .expect("the delete still completes");
+    assert!(flushed(&redis).is_empty(), "flushed cart-redis's keyspace");
+    assert_eq!(
+        api.shared(NS, "orders")["metadata"]["finalizers"],
+        json!([]),
+        "a conflict must not wedge the delete"
+    );
+}
+
+#[tokio::test]
+async fn deleting_a_shared_cache_that_holds_its_dbnum_alone_flushes_it() {
+    let api = api();
+    api.put_shared(deleted_shared_cache(5));
+    let redis = Arc::new(FakeRedis::default());
+    reconcile_shared_stored(&api, "orders", redis.clone())
+        .await
+        .expect("the delete completes");
+    assert_eq!(
+        flushed(&redis),
+        vec![(dragonfly::instance_addr(EPHEMERAL, DF_NS), 5)]
+    );
+}
+
+#[tokio::test]
+async fn the_gc_does_not_flush_a_dbnum_a_shared_database_now_holds() {
+    // gone-redis was deleted for good; its expired snapshot still names $6,
+    // which a shared cache now holds.
+    let api = api();
+    api.put_retained(retained("gone-redis", EPHEMERAL, 6, EXPIRED))
+        .put_shared(shared_on("orders", EPHEMERAL, 6));
+    let redis = Arc::new(FakeRedis::default());
+    gc_stored(&api, "gone-redis", redis.clone())
+        .await
+        .expect("gc pass");
+    assert!(
+        flushed(&redis).is_empty(),
+        "the GC flushed a shared cache's keyspace"
+    );
+    assert_eq!(
+        redis.deluser_calls.lock().unwrap().len(),
+        1,
+        "the dead user is still revoked"
+    );
+    assert!(api.retained(&cnpg::k8s_name(NS, "gone-redis")).is_none());
+}
+
+#[tokio::test]
+async fn the_gc_still_flushes_a_dbnum_only_its_snapshot_holds() {
+    let api = api();
+    api.put_retained(retained("gone-redis", EPHEMERAL, 6, EXPIRED));
+    let redis = Arc::new(FakeRedis::default());
+    gc_stored(&api, "gone-redis", redis.clone())
+        .await
+        .expect("gc pass");
+    assert_eq!(
+        flushed(&redis),
+        vec![(dragonfly::instance_addr(EPHEMERAL, DF_NS), 6)]
+    );
+}

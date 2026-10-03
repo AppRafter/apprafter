@@ -75,7 +75,7 @@ const KIND: &str = "SharedDatabase";
 /// cascade. Without it a `SharedDatabase` vanishes and the backing database
 /// survives with nothing left pointing at it — an orphan holding real data
 /// that no longer appears in any inventory.
-const SD_FINALIZER: &str = "apprafter.io/shareddatabase-cleanup";
+pub(crate) const SD_FINALIZER: &str = "apprafter.io/shareddatabase-cleanup";
 
 /// `Ready=False` reason while the shared Postgres cluster is not yet
 /// answering. Distinct from a provisioning failure: it clears by itself.
@@ -895,6 +895,11 @@ async fn reconcile_redis(
             _ => None,
         });
 
+    // WI-402: an allocation a previous pass checkpointed and did not finish
+    // still owes its check and its flush.
+    let unfinished = existing.is_some() && allocation_unfinished(prior);
+    let ref_count = current_ref_count(&ctx.client, ns, name).await?;
+
     let dbnum = match existing {
         Some(n) => n,
         None => {
@@ -926,41 +931,106 @@ async fn reconcile_redis(
                     ),
                     prior,
                 );
-                write_status(
-                    ctx,
-                    sd,
-                    ns,
-                    name,
-                    false,
-                    None,
-                    current_ref_count(&ctx.client, ns, name).await?,
-                    cond,
-                    None,
-                )
-                .await?;
+                write_status(ctx, sd, ns, name, false, None, ref_count, cond, None).await?;
                 return Ok(Action::requeue(Duration::from_secs(120)));
             };
-            // Recycle-safety (ADR 0042 §3): a reused `$N` must start empty, or
-            // the first consumer of this shared cache reads a departed
-            // tenant's keys. Only on a FRESH allocation — flushing an existing
-            // one would wipe the data this database exists to hold.
-            let addr = crate::dragonfly::instance_addr(&pool.instance, &pool.df_ns);
-            let admin_pw = crate::acl_reconcile::read_secret_key(
+            // WI-402: record the number BEFORE checking and flushing it — the
+            // order the claim path keeps. Another allocator's LIST or re-read
+            // can only see a number that is committed, so a database that
+            // flushed first and wrote its number last could be overtaken by a
+            // claim that saw neither, and both would end up ready on one
+            // keyspace. Not ready, and under a reason that marks the number
+            // as still owing its check and flush.
+            let cond = ready_condition(
+                "False",
+                crate::reconcile::REASON_AWAITING_KEYSPACE,
+                &format!(
+                    "allocated ${n} on {} ({}); checking that nothing else holds it, then \
+                     flushing it, before first use",
+                    pool.instance, pool.df_ns
+                ),
+                prior,
+            );
+            write_status(
                 ctx,
-                &pool.df_ns,
-                &crate::dragonfly::admin_secret_name(&pool.instance),
-                "password",
+                sd,
+                ns,
+                name,
+                false,
+                Some(&Backing::redis(&pool.instance, i64::from(n))),
+                ref_count,
+                cond,
+                None,
             )
             .await?;
-            ctx.redis
-                .flushdb(&addr, &admin_pw, n)
-                .await
-                .map_err(|e| ReconcileError::Provisioning(format!("flushdb ${n}: {e}")))?;
             n
         }
     };
 
-    let ref_count = current_ref_count(&ctx.client, ns, name).await?;
+    if existing.is_none() || unfinished {
+        // WI-402: re-read every holder now that this number is committed. The
+        // LIST above is a snapshot; a claim reconcile dropped mid-checkpoint
+        // can commit onto the same number after it, and flushing then wipes
+        // that claim's keyspace.
+        let others = crate::reconcile::dbnum_holders_besides(
+            &ctx.client,
+            &pool.instance,
+            dbnum,
+            crate::dragonfly::DbnumOwner::Shared {
+                namespace: ns,
+                name,
+            },
+        )
+        .await?;
+        if !others.is_empty() {
+            // Never provisioned and no consumer bound, so the number holds
+            // nothing of this database's own: let it go. `Backing::default()`
+            // is deliberate — an apply without `instance`/`dbnum` prunes this
+            // database's checkpoint, and the next pass allocates afresh.
+            let message = format!(
+                "dragonfly {} ${dbnum} is also held by {}; this database had not used it \
+                 yet, so it released it and takes another number on its next attempt",
+                pool.instance,
+                others.join(", ")
+            );
+            let cond = ready_condition(
+                "False",
+                crate::reconcile::REASON_AWAITING_KEYSPACE,
+                &message,
+                prior,
+            );
+            write_status(
+                ctx,
+                sd,
+                ns,
+                name,
+                false,
+                Some(&Backing::default()),
+                ref_count,
+                cond,
+                None,
+            )
+            .await?;
+            return Err(ReconcileError::Provisioning(message));
+        }
+        // Recycle-safety (ADR 0042 §3): a reused `$N` must start empty, or
+        // the first consumer of this shared cache reads a departed tenant's
+        // keys. Only while the allocation is unfinished — flushing a
+        // provisioned one would wipe the data this database exists to hold.
+        let addr = crate::dragonfly::instance_addr(&pool.instance, &pool.df_ns);
+        let admin_pw = crate::acl_reconcile::read_secret_key(
+            ctx,
+            &pool.df_ns,
+            &crate::dragonfly::admin_secret_name(&pool.instance),
+            "password",
+        )
+        .await?;
+        ctx.redis
+            .flushdb(&addr, &admin_pw, dbnum)
+            .await
+            .map_err(|e| ReconcileError::Provisioning(format!("flushdb ${dbnum}: {e}")))?;
+    }
+
     let cond = ready_condition(
         "True",
         "Provisioned",
@@ -1137,7 +1207,29 @@ async fn drop_backing(
             .await
             {
                 Ok(admin_pw) => {
-                    if let Err(e) = ctx.redis.flushdb(&addr, &admin_pw, dbnum).await {
+                    // WI-402: flush only a keyspace this database still holds
+                    // alone. Another holder means an allocation race already
+                    // put a second tenant here; flushing would wipe THEIR
+                    // data, while leaving it changes nothing they could not
+                    // already read. So skip the flush, say so, and let the
+                    // delete finish — holding the finalizer would wedge the
+                    // object on a conflict no retry resolves.
+                    let others = crate::reconcile::dbnum_holders_besides(
+                        &ctx.client,
+                        &instance,
+                        dbnum,
+                        crate::dragonfly::DbnumOwner::Shared {
+                            namespace: ns,
+                            name,
+                        },
+                    )
+                    .await?;
+                    if !others.is_empty() {
+                        warn!(
+                            %name, %ns, %instance, dbnum, holders = %others.join(", "),
+                            "the shared keyspace is also held elsewhere — NOT flushing it"
+                        );
+                    } else if let Err(e) = ctx.redis.flushdb(&addr, &admin_pw, dbnum).await {
                         warn!(%name, %ns, error = %e, "could not flush the shared keyspace");
                     } else {
                         info!(%name, %ns, %instance, dbnum, "flushed the shared keyspace");
@@ -1342,11 +1434,37 @@ fn backing_of(sd: &SharedDatabase) -> Backing {
     let Some(st) = sd.status.as_ref() else {
         return Backing::default();
     };
+    // WI-402: except an UNFINISHED redis allocation. Carried forward under
+    // another reason it would read as provisioned, and the next pass would
+    // skip the check and the flush that number still owes. It holds nothing
+    // — no consumer binds a database that is not ready — so releasing it
+    // costs a fresh allocation and nothing else.
+    if allocation_unfinished(st.conditions.as_deref().unwrap_or_default()) {
+        return Backing {
+            database: st.database.clone(),
+            ..Default::default()
+        };
+    }
     Backing {
         database: st.database.clone(),
         instance: st.instance.clone(),
         dbnum: st.dbnum,
     }
+}
+
+/// Whether the `$N` this database records comes from an allocation that has
+/// not finished — checkpointed under `reconcile::REASON_AWAITING_KEYSPACE`,
+/// not yet checked or flushed (WI-402). A database that released a number it
+/// found someone else holding carries the same reason but records no number,
+/// so for it the answer changes nothing. Keyed on that reason and nothing
+/// broader: `ready=false` alone also describes a provisioned database that
+/// lost its provider for a while, whose data must never be flushed.
+fn allocation_unfinished(prior: &[SharedDatabaseCondition]) -> bool {
+    prior.iter().any(|c| {
+        c.type_ == COND_READY
+            && c.status == "False"
+            && c.reason.as_deref() == Some(crate::reconcile::REASON_AWAITING_KEYSPACE)
+    })
 }
 
 /// The `ExtensionUnavailable` condition already on the object, carried
