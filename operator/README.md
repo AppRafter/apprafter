@@ -80,7 +80,7 @@ Controller, and serves three HTTP routes:
 | ----------- | ------------------------------------------------ |
 | `/healthz`  | Liveness probe — returns 200 OK with body `ok`.   |
 | `/readyz`   | Readiness probe — returns 200 OK with body `ready`. |
-| `/metrics`  | Prometheus text format — three `apprafter_reconcile_*` metrics. |
+| `/metrics`  | Prometheus text format — the `apprafter_*` families in `operator-core/src/metrics.rs`, among them `apprafter_reconcile_timeouts_total{kind}` (reconciles abandoned at their deadline; zero when healthy). |
 
 Run locally against your current kubeconfig:
 

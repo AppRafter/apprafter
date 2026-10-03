@@ -1,13 +1,19 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Prometheus metrics for the AppRafter operator.
 //!
-//! Four signal-grade metrics:
+//! Signal-grade metrics:
 //!   - apprafter_reconcile_total{kind,namespace,result} — every
 //!     reconcile call increments one of {ok, error}.
 //!   - apprafter_reconcile_duration_seconds{kind} — histogram of
 //!     wall-time per reconcile.
 //!   - apprafter_reconcile_errors_total{kind} — error-only counter
 //!     for quick "errors per minute" alerts.
+//!   - apprafter_reconcile_timeouts_total{kind} — reconciles abandoned
+//!     at their deadline (`deadline::within`, WI-400). A controller with
+//!     a `Metrics` handle increments it from its `error_policy` on its
+//!     `TimedOut` variant. Zero on a healthy operator, so a walk can
+//!     assert it stays zero (GOTCHA-51: a stalled reconcile used to
+//!     leave no trace at all).
 //!   - apprafter_claim_unmatched_total{kind,namespace,reason} —
 //!     ResourceClaims with no matching ServiceProvider.
 //!   - apprafter_claim_gc_total{result,namespace} — RetainedClaim
@@ -64,6 +70,7 @@ pub struct Metrics {
     pub reconcile_total: CounterVec,
     pub reconcile_duration: HistogramVec,
     pub reconcile_errors: CounterVec,
+    pub reconcile_timeouts: CounterVec,
     pub claim_unmatched_total: CounterVec,
     pub claim_provisioned_total: CounterVec,
     pub claim_gc_total: CounterVec,
@@ -106,6 +113,15 @@ impl Metrics {
             opts!(
                 "apprafter_reconcile_errors_total",
                 "Reconcile error counter by kind"
+            ),
+            &["kind"],
+        )
+        .expect("CounterVec must build with a non-empty name");
+
+        let reconcile_timeouts = CounterVec::new(
+            opts!(
+                "apprafter_reconcile_timeouts_total",
+                "Reconciles abandoned at their deadline, by kind"
             ),
             &["kind"],
         )
@@ -193,6 +209,9 @@ impl Metrics {
             .register(Box::new(reconcile_errors.clone()))
             .expect("reconcile_errors registers cleanly");
         registry
+            .register(Box::new(reconcile_timeouts.clone()))
+            .expect("reconcile_timeouts registers cleanly");
+        registry
             .register(Box::new(claim_unmatched_total.clone()))
             .expect("claim_unmatched_total registers cleanly");
         registry
@@ -222,6 +241,7 @@ impl Metrics {
             reconcile_total,
             reconcile_duration,
             reconcile_errors,
+            reconcile_timeouts,
             claim_unmatched_total,
             claim_provisioned_total,
             claim_gc_total,
@@ -263,6 +283,9 @@ mod tests {
             .with_label_values(&["Application"])
             .observe(0.0);
         m.reconcile_errors.with_label_values(&["Application"]).inc();
+        m.reconcile_timeouts
+            .with_label_values(&["Application"])
+            .inc();
         m.claim_unmatched_total
             .with_label_values(&["ResourceClaim", "demo", "no_matching_provider"])
             .inc();
@@ -292,6 +315,10 @@ mod tests {
             "{body}"
         );
         assert!(body.contains("apprafter_reconcile_errors_total"), "{body}");
+        assert!(
+            body.contains("apprafter_reconcile_timeouts_total"),
+            "{body}"
+        );
         assert!(body.contains("apprafter_claim_unmatched_total"), "{body}");
         assert!(body.contains("apprafter_claim_provisioned_total"), "{body}");
         assert!(body.contains("apprafter_claim_gc_total"), "{body}");
@@ -330,5 +357,20 @@ mod tests {
             body.contains("apprafter_reconcile_errors_total{kind=\"Application\"}"),
             "{body}"
         );
+    }
+
+    #[test]
+    fn reconcile_timeouts_counter_is_its_own_family_by_kind() {
+        let m = Metrics::new();
+        m.reconcile_timeouts
+            .with_label_values(&["Application"])
+            .inc();
+        let body = String::from_utf8(m.encode()).unwrap();
+        assert!(
+            body.contains("apprafter_reconcile_timeouts_total{kind=\"Application\"} 1"),
+            "{body}"
+        );
+        // Its own family: a timeout is not hidden inside the error counter.
+        assert!(!body.contains("apprafter_reconcile_errors_total"), "{body}");
     }
 }
