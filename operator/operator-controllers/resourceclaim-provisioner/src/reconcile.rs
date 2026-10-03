@@ -102,6 +102,46 @@ pub(crate) const REASON_DBNUM_CONFLICT: &str = "DbnumConflict";
 /// claim's provisioner pass (HTTP 409 Conflict).
 const ROLE_RMW_RETRIES: usize = 5;
 
+/// How long the decorative refresh on a READY claim's 60s gate may run, as a
+/// whole (WI-400).
+///
+/// The refresh — the database-size scrape, the kubelet volume sample, the
+/// jetstream inventory — is best-effort by contract: every step swallows its
+/// own failure. Its proxied reads carry their own bounds
+/// (`operator_core::promscrape::SCRAPE_TIMEOUT` and
+/// `operator_core::capacity::FETCH_TIMEOUT`, 15s each), but the plain apiserver
+/// reads around them (the Node LIST, the CNPG `Cluster` GET) are bounded only
+/// by the client's 295s per-read timeout. Without this budget one of those
+/// would run the pass into the 120s reconcile deadline, which would turn "skip
+/// the figure this tick" into a timed-out reconcile, a Warning Event and a
+/// backoff on a claim that is fine.
+///
+/// 40s, so that the inner bounds fire first. A never-measured disk claim on a
+/// hung kubelet samples twice, two Node LISTs and two fetches at
+/// `FETCH_TIMEOUT`, before its own "disk usage has never been measured"
+/// warning, which names the node. A pg size miss re-scrapes once, two scrapes
+/// at `SCRAPE_TIMEOUT`. Each comes to just over 30s, so a 30s budget would cut
+/// them on every pass and replace that warning with this one. 40s is a third
+/// of the deadline. Healthy, the refresh costs milliseconds, because both
+/// proxied reads are TTL-cached. A cut costs nothing durable: the size,
+/// capacity and inventory writes it can interrupt use their own field managers
+/// and are idempotent, and a cut stream sweep resumes next tick.
+const READY_REFRESH_BUDGET: Duration = Duration::from_secs(40);
+
+/// How long `provision_disk` and `provision_shared_disk` wait for the
+/// best-effort volume sample (WI-400).
+///
+/// The sample runs BEFORE the terminal status write. Without a bound, a hung
+/// Node LIST held that write for up to the client's 295s read timeout, and
+/// under the 120s reconcile deadline it would cut the write entirely, leaving
+/// the claim unready on every pass for want of a decorative figure.
+///
+/// 20s, above `operator_core::capacity::FETCH_TIMEOUT` (15s): a hung kubelet is
+/// ended by that bound first, with a warning naming the node, so this one
+/// fires only for a hung Node LIST. A healthy sample is a Node LIST plus one
+/// cached Summary.
+const PROVISION_SAMPLE_BOUND: Duration = Duration::from_secs(20);
+
 // ---------------------------------------------------------------------------
 // NATS / jetstream (2.5d, ADR 0061)
 // ---------------------------------------------------------------------------
@@ -468,15 +508,27 @@ pub async fn reconcile(
         // is the only place a size figure can be kept current. Best-effort
         // and deadbanded — see `refresh_claim_size`.
         if status_json.pointer("/ready").and_then(Value::as_bool) == Some(true) {
-            refresh_claim_size(ctx.as_ref(), &claim, &ns, &name).await;
-            // 2.5f (ADR 0061 §5/§7): this gate is where "the provisioner
-            // resync that already lists the account's streams" actually
-            // is. A ready claim never provisions again, so a detector
-            // living only in `provision_nats` would look exactly once —
-            // at the moment a claim goes live, before there is anything
-            // to find. Best-effort; it never fails the reconcile.
-            if claim.spec.type_ == "jetstream" {
-                refresh_jetstream_claim(&ctx, &claim, &ns, &name).await;
+            let refresh = async {
+                refresh_claim_size(ctx.as_ref(), &claim, &ns, &name).await;
+                // 2.5f (ADR 0061 §5/§7): this gate is where "the provisioner
+                // resync that already lists the account's streams" actually
+                // is. A ready claim never provisions again, so a detector
+                // living only in `provision_nats` would look exactly once —
+                // at the moment a claim goes live, before there is anything
+                // to find. Best-effort; it never fails the reconcile.
+                if claim.spec.type_ == "jetstream" {
+                    refresh_jetstream_claim(&ctx, &claim, &ns, &name).await;
+                }
+            };
+            // WI-400: bounded as a whole — see `READY_REFRESH_BUDGET`.
+            if tokio::time::timeout(READY_REFRESH_BUDGET, refresh)
+                .await
+                .is_err()
+            {
+                warn!(
+                    %name, %ns, budget_secs = READY_REFRESH_BUDGET.as_secs(),
+                    "ready-claim refresh did not finish within its budget — skipped this tick"
+                );
             }
         }
         info!(%name, %ns, "not yet Scheduled (or already ready) — waiting for scheduler");
@@ -1454,7 +1506,7 @@ async fn provision_disk(
     // makes a fraction meaningful — unlike a tenant slice of a shared
     // backend. Best-effort: an unreadable kubelet leaves capacity absent
     // rather than failing a provision that otherwise succeeded.
-    let capacity = sample_claim_volume(ctx, &pvc_name).await;
+    let capacity = sample_claim_volume_bounded(ctx, &pvc_name).await;
     patch_status(
         &ctx.client,
         ns,
@@ -1580,7 +1632,7 @@ async fn provision_shared_disk(
         &format!("bound SharedVolume {sv_name} PVC {pvc_ref}"),
         &prior,
     );
-    let capacity = sample_claim_volume(ctx, &pvc_ref).await;
+    let capacity = sample_claim_volume_bounded(ctx, &pvc_ref).await;
     patch_status(
         &ctx.client,
         ns,
@@ -4141,6 +4193,25 @@ async fn sample_claim_volume(ctx: &Context, pvc_name: &str) -> Option<VolumeSamp
     sample_claim_volume_detailed(ctx, pvc_name).await.ok()
 }
 
+/// [`sample_claim_volume`] given at most [`PROVISION_SAMPLE_BOUND`] (WI-400).
+///
+/// For the provisioning paths, where the sample precedes the terminal status
+/// write: a read that does not answer costs the provision its figure, never
+/// its write. `None` here means exactly what any other failed sample means:
+/// the field is omitted from the apply.
+async fn sample_claim_volume_bounded(ctx: &Context, pvc_name: &str) -> Option<VolumeSample> {
+    match tokio::time::timeout(PROVISION_SAMPLE_BOUND, sample_claim_volume(ctx, pvc_name)).await {
+        Ok(sample) => sample,
+        Err(_) => {
+            warn!(
+                %pvc_name, bound_secs = PROVISION_SAMPLE_BOUND.as_secs(),
+                "volume sample did not finish within its bound — writing status without it"
+            );
+            None
+        }
+    }
+}
+
 /// As [`sample_claim_volume`], but naming the stage that produced nothing.
 ///
 /// Three stages can each yield nothing and they mean different things: no
@@ -6271,5 +6342,322 @@ mod tests {
             "ForeignSubjectCapture"
         );
         assert_eq!(body["status"]["conditions"][0]["status"], "True");
+    }
+}
+
+/// WI-400: the bounds on the claim reconcile's decorative I/O, driven
+/// through the scripted apiserver (`crate::route_apiserver`) on a paused clock.
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+    use crate::route_apiserver::{apiserver, calls_to, route, Reply, Route};
+    use operator_core::capacity::FETCH_TIMEOUT;
+    use operator_core::Metrics;
+
+    /// Longer than any bound under test, so a bound that stops cutting fails
+    /// the test instead of hanging it.
+    const OUTER_GUARD: Duration = Duration::from_secs(600);
+
+    const PROVIDERS: &str = "/apis/apprafter.io/v1alpha1/serviceproviders";
+    const NODES: &str = "/api/v1/nodes";
+    const SUMMARY: &str = "/api/v1/nodes/n1/proxy/stats/summary";
+    const DISK_STATUS: &str =
+        "/apis/apprafter.io/v1alpha1/namespaces/apps/resourceclaims/web-disk/status";
+
+    fn context(client: Client) -> Arc<Context> {
+        Arc::new(Context::new(client, Arc::new(Metrics::new())))
+    }
+
+    fn ok(body: Value) -> Reply {
+        Reply::Json(200, body)
+    }
+
+    fn not_found() -> Reply {
+        Reply::Json(
+            404,
+            json!({
+                "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                "reason": "NotFound", "code": 404, "message": "not found",
+            }),
+        )
+    }
+
+    /// One schedulable node, `n1`.
+    fn node_list() -> Reply {
+        ok(json!({
+            "apiVersion": "v1", "kind": "NodeList", "metadata": {},
+            "items": [{ "apiVersion": "v1", "kind": "Node", "metadata": { "name": "n1" } }],
+        }))
+    }
+
+    fn provider_list(provider: Value) -> Reply {
+        ok(json!({
+            "apiVersion": "apprafter.io/v1alpha1", "kind": "ServiceProviderList",
+            "metadata": {}, "items": [provider],
+        }))
+    }
+
+    fn disk_provider() -> Value {
+        json!({
+            "apiVersion": "apprafter.io/v1alpha1", "kind": "ServiceProvider",
+            "metadata": { "name": "disk-local", "namespace": "apprafter-system" },
+            "spec": { "type": "disk", "backend": "disk" },
+        })
+    }
+
+    /// The backing PVC (and RetainedClaim) name of claim `apps/web-disk`.
+    fn disk_pvc() -> String {
+        cnpg::k8s_name("apps", "web-disk")
+    }
+
+    fn scheduled() -> Value {
+        json!({
+            "type": "Scheduled", "status": "True",
+            "lastTransitionTime": "2026-10-01T00:00:00Z",
+        })
+    }
+
+    /// A disk claim the scheduler matched to `disk-local`, `status` merged in.
+    fn disk_claim(status: Value) -> Arc<ResourceClaim> {
+        let mut st = json!({ "provider": "disk-local", "conditions": [scheduled()] });
+        if let (Some(base), Some(extra)) = (st.as_object_mut(), status.as_object()) {
+            for (k, v) in extra {
+                base.insert(k.clone(), v.clone());
+            }
+        }
+        Arc::new(
+            serde_json::from_value(json!({
+                "apiVersion": "apprafter.io/v1alpha1", "kind": "ResourceClaim",
+                "metadata": {
+                    "name": "web-disk", "namespace": "apps", "uid": "u-1",
+                    "finalizers": [PROVISIONER_FINALIZER],
+                },
+                "spec": { "type": "disk", "selector": {}, "size": "1Gi" },
+                "status": st,
+            }))
+            .expect("claim fixture"),
+        )
+    }
+
+    /// A READY disk claim that has never been measured.
+    fn ready_disk_claim() -> Arc<ResourceClaim> {
+        disk_claim(json!({ "ready": true, "volumeClaimRef": disk_pvc() }))
+    }
+
+    /// The bare object an apiserver hands back from a claim write.
+    fn claim_object(name: &str, type_: &str) -> Value {
+        json!({
+            "apiVersion": "apprafter.io/v1alpha1", "kind": "ResourceClaim",
+            "metadata": { "name": name, "namespace": "apps" },
+            "spec": { "type": type_, "selector": {} },
+        })
+    }
+
+    /// Every request a disk provision makes, the volume sample's Node LIST
+    /// and kubelet Summary answered by `nodes` and `summary`.
+    fn disk_provision(nodes: Reply, summary: Reply) -> Vec<Route> {
+        vec![
+            route("GET", PROVIDERS, provider_list(disk_provider())),
+            route(
+                "PATCH",
+                format!(
+                    "/api/v1/namespaces/apps/persistentvolumeclaims/{}",
+                    disk_pvc()
+                ),
+                ok(json!({
+                    "apiVersion": "v1", "kind": "PersistentVolumeClaim",
+                    "metadata": { "name": disk_pvc(), "namespace": "apps" },
+                })),
+            ),
+            route("GET", NODES, nodes),
+            route("GET", SUMMARY, summary),
+            route("PATCH", DISK_STATUS, ok(claim_object("web-disk", "disk"))),
+            route(
+                "DELETE",
+                format!(
+                    "/apis/apprafter.io/v1alpha1/namespaces/apprafter-system/retainedclaims/{}",
+                    disk_pvc()
+                ),
+                not_found(),
+            ),
+        ]
+    }
+
+    /// A READY disk claim refreshes its capacity on the 60s gate. The Node
+    /// LIST is a plain apiserver read, which nothing below the gate bounds
+    /// but the client's 295s read timeout. Hung, the gate gives up at its
+    /// budget and the pass returns the gate's own requeue, instead of running
+    /// into the reconcile deadline.
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_node_list_on_a_ready_claim_costs_the_tick_not_the_pass() {
+        let (client, log) = apiserver(vec![route("GET", NODES, Reply::Never)]);
+
+        let started = tokio::time::Instant::now();
+        let outcome =
+            tokio::time::timeout(OUTER_GUARD, reconcile(ready_disk_claim(), context(client)))
+                .await
+                .expect("the ready gate must not hang");
+
+        assert_eq!(
+            outcome.expect("the gate never fails"),
+            Action::requeue(Duration::from_secs(60))
+        );
+        assert_eq!(started.elapsed(), READY_REFRESH_BUDGET);
+        let methods: Vec<String> = log
+            .lock()
+            .expect("log")
+            .iter()
+            .map(|c| c.method.clone())
+            .collect();
+        assert_eq!(methods, vec!["GET"], "the refresh wrote nothing");
+    }
+
+    /// A hung KUBELET on the same gate is pg-bounds' to end. A never-measured
+    /// claim samples twice, the second time for the reason, and each fetch
+    /// gives up at `FETCH_TIMEOUT`. The budget leaves room for both, so the
+    /// refresh ends through its own "disk usage has never been measured"
+    /// warning, which names the node, and not through the budget's generic one.
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_kubelet_on_a_never_measured_claim_reaches_its_own_warning_first() {
+        let (client, log) = apiserver(vec![
+            route("GET", NODES, node_list()),
+            route("GET", SUMMARY, Reply::Never),
+        ]);
+
+        let started = tokio::time::Instant::now();
+        let outcome =
+            tokio::time::timeout(OUTER_GUARD, reconcile(ready_disk_claim(), context(client)))
+                .await
+                .expect("the ready gate must not hang");
+
+        assert_eq!(
+            outcome.expect("the gate never fails"),
+            Action::requeue(Duration::from_secs(60))
+        );
+        assert_eq!(started.elapsed(), FETCH_TIMEOUT * 2);
+        assert_eq!(
+            calls_to(&log, "GET", SUMMARY).len(),
+            2,
+            "sampled, then sampled again for the reason"
+        );
+        assert!(calls_to(&log, "PATCH", DISK_STATUS).is_empty());
+    }
+
+    /// The disk arm samples its volume BEFORE its terminal status write. A
+    /// Node LIST that never answers is cut at `PROVISION_SAMPLE_BOUND`, and
+    /// the write lands without a capacity figure.
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_node_list_does_not_hold_the_disk_claims_terminal_write() {
+        let (client, log) = apiserver(disk_provision(Reply::Never, Reply::Never));
+
+        let started = tokio::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            OUTER_GUARD,
+            reconcile(disk_claim(json!({})), context(client)),
+        )
+        .await
+        .expect("a hung sample must not hold the provision");
+
+        assert_eq!(
+            outcome.expect("provisioned"),
+            Action::requeue(Duration::from_secs(300))
+        );
+        assert_eq!(started.elapsed(), PROVISION_SAMPLE_BOUND);
+        let writes = calls_to(&log, "PATCH", DISK_STATUS);
+        assert_eq!(writes.len(), 1, "the terminal status write landed once");
+        let status = &writes[0].body["status"];
+        assert_eq!(status["ready"], json!(true));
+        assert_eq!(status["volumeClaimRef"], json!(disk_pvc()));
+        assert!(
+            status.get("capacity").is_none(),
+            "no figure was sampled, so none is claimed: {status}"
+        );
+    }
+
+    /// A hung kubelet on the same path ends at its OWN bound, `FETCH_TIMEOUT`,
+    /// whose warning names the node, before `PROVISION_SAMPLE_BOUND` would.
+    /// The outer bound is there for the Node LIST.
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_kubelet_on_a_disk_provision_gives_up_at_its_own_fetch_timeout() {
+        let (client, log) = apiserver(disk_provision(node_list(), Reply::Never));
+
+        let started = tokio::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            OUTER_GUARD,
+            reconcile(disk_claim(json!({})), context(client)),
+        )
+        .await
+        .expect("a hung kubelet must not hold the provision");
+
+        assert_eq!(
+            outcome.expect("provisioned"),
+            Action::requeue(Duration::from_secs(300))
+        );
+        assert_eq!(started.elapsed(), FETCH_TIMEOUT);
+        assert_eq!(calls_to(&log, "PATCH", DISK_STATUS).len(), 1);
+    }
+
+    /// The same bound on the `shared-disk` bind arm, which also samples before
+    /// its terminal write.
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_node_list_does_not_hold_a_shared_disk_bind() {
+        let shared_status =
+            "/apis/apprafter.io/v1alpha1/namespaces/apps/resourceclaims/web-shared/status";
+        let (client, log) = apiserver(vec![
+            route(
+                "GET",
+                PROVIDERS,
+                provider_list(json!({
+                    "apiVersion": "apprafter.io/v1alpha1", "kind": "ServiceProvider",
+                    "metadata": { "name": "shared-local", "namespace": "apprafter-system" },
+                    "spec": { "type": "shared-disk", "backend": "shared-disk" },
+                })),
+            ),
+            route(
+                "GET",
+                "/apis/apprafter.io/v1alpha1/namespaces/apps/sharedvolumes/data",
+                ok(json!({
+                    "apiVersion": "apprafter.io/v1alpha1", "kind": "SharedVolume",
+                    "metadata": { "name": "data", "namespace": "apps" },
+                    "spec": { "size": "1Gi" },
+                    "status": { "ready": true, "pvcRef": "sv-apps-data" },
+                })),
+            ),
+            route("GET", NODES, Reply::Never),
+            route(
+                "PATCH",
+                shared_status,
+                ok(claim_object("web-shared", "shared-disk")),
+            ),
+        ]);
+        let claim: Arc<ResourceClaim> = Arc::new(
+            serde_json::from_value(json!({
+                "apiVersion": "apprafter.io/v1alpha1", "kind": "ResourceClaim",
+                "metadata": {
+                    "name": "web-shared", "namespace": "apps", "uid": "u-2",
+                    "finalizers": [PROVISIONER_FINALIZER],
+                    "labels": { "apprafter.io/shared-volume": "data" },
+                },
+                "spec": { "type": "shared-disk", "selector": {} },
+                "status": { "provider": "shared-local", "conditions": [scheduled()] },
+            }))
+            .expect("claim fixture"),
+        );
+
+        let started = tokio::time::Instant::now();
+        let outcome = tokio::time::timeout(OUTER_GUARD, reconcile(claim, context(client)))
+            .await
+            .expect("a hung sample must not hold the bind");
+
+        assert_eq!(
+            outcome.expect("bound"),
+            Action::requeue(Duration::from_secs(300))
+        );
+        assert_eq!(started.elapsed(), PROVISION_SAMPLE_BOUND);
+        assert_eq!(
+            calls_to(&log, "PATCH", shared_status).len(),
+            1,
+            "the terminal status write landed"
+        );
     }
 }
