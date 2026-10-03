@@ -31,9 +31,12 @@ use crate::{Context, ReconcileError, FIELD_MANAGER, KIND};
 const COND_SCHEDULED: &str = "Scheduled";
 
 /// Reporter identity stamped onto every Kubernetes Event this controller
-/// publishes.  Visible in `kubectl describe resourceclaim <name>` under
-/// the Events section.
-const EVENT_REPORTER_CONTROLLER: &str = "apprafter-resourceclaim-scheduler";
+/// publishes — the `NoMatchingServiceProvider` Event here and the
+/// `ReconcileTimedOut` Event of a pass cut at its deadline
+/// ([`crate::reconcile_with_deadline`]).  Visible in `kubectl describe
+/// resourceclaim <name>` under the Events section, and distinct from the
+/// provisioner's, so a reader can tell which controller's pass was cut.
+pub(crate) const EVENT_REPORTER_CONTROLLER: &str = "apprafter-resourceclaim-scheduler";
 
 // ---------------------------------------------------------------------------
 // Public reconcile + error_policy
@@ -130,9 +133,10 @@ pub async fn reconcile(
 /// series is shared with the provisioner's claim controller, so the counter
 /// alone cannot say which of the two was cut; the WARN message tells them
 /// apart ("resourceclaim reconcile error" here, "resourceclaim provisioner
-/// reconcile error" there). Nothing is written to the claim on any error
-/// path, a timeout included: the claim keeps the `Scheduled` condition its
-/// last committed status apply recorded.
+/// reconcile error" there). Nothing is written to the claim's status on any
+/// error path, a timeout included: the claim keeps the `Scheduled` condition
+/// its last committed status apply recorded. A timeout's Warning Event is
+/// published by [`crate::reconcile_with_deadline`], not here.
 pub fn error_policy(claim: Arc<ResourceClaim>, err: &ReconcileError, ctx: Arc<Context>) -> Action {
     let name = claim.name_any();
     let namespace = claim.namespace().unwrap_or_default();
@@ -619,9 +623,20 @@ mod tests {
 
     /// A `Client` that answers from `respond`, plus the ordered log of every
     /// request it was asked to serve.
-    fn scripted_apiserver<F>(respond: F) -> (Client, Arc<Mutex<Vec<Call>>>)
+    fn scripted_apiserver<F>(mut respond: F) -> (Client, Arc<Mutex<Vec<Call>>>)
     where
         F: FnMut(&Call) -> (u16, Value) + Send + 'static,
+    {
+        stalling_apiserver(move |call| Some(respond(call)))
+    }
+
+    /// [`scripted_apiserver`], except that a request `respond` maps to `None`
+    /// is logged and then never answered — the GOTCHA-51 stall, for one
+    /// request only, while the rest of the script still answers. On a paused
+    /// clock the wait costs no wall time.
+    fn stalling_apiserver<F>(respond: F) -> (Client, Arc<Mutex<Vec<Call>>>)
+    where
+        F: FnMut(&Call) -> Option<(u16, Value)> + Send + 'static,
     {
         let log = Arc::new(Mutex::new(Vec::<Call>::new()));
         let sink = log.clone();
@@ -638,8 +653,11 @@ mod tests {
                     uri,
                     body: serde_json::from_slice(&bytes).unwrap_or(Value::Null),
                 };
-                let (code, payload) = (respond.lock().expect("responder"))(&call);
+                let reply = (respond.lock().expect("responder"))(&call);
                 sink.lock().expect("log").push(call);
+                let Some((code, payload)) = reply else {
+                    return std::future::pending().await;
+                };
                 Ok::<_, std::convert::Infallible>(
                     http::Response::builder()
                         .status(code)
@@ -1037,9 +1055,11 @@ mod tests {
     /// A pass abandoned at its deadline (WI-400) is counted where an alert can
     /// see it — `apprafter_reconcile_timeouts_total` — on top of the two
     /// counters every error lands on, and is retried on the same 30s cadence.
-    /// It must write NOTHING: no status (an apply under
+    /// `error_policy` must write NOTHING: no status (an apply under
     /// `resourceclaim-scheduler` that omits `provider` prunes it) and no
-    /// Event. The claim keeps the conditions it had.
+    /// Event — the one `ReconcileTimedOut` Event is the wrapper's, so a
+    /// second one here would double it. The claim keeps the conditions it
+    /// had.
     #[tokio::test]
     async fn error_policy_counts_a_timed_out_reconcile_on_the_timeout_counter() {
         let (client, log) = scripted_apiserver(|_| apiserver_unavailable());
@@ -1106,6 +1126,141 @@ mod tests {
                 .with_label_values(&[KIND])
                 .get(),
             1.0
+        );
+    }
+
+    // ---- WI-400: the ReconcileTimedOut Event (override O3) ----
+
+    /// What an apiserver hands back from an Event create.
+    fn created_event() -> (u16, Value) {
+        (
+            201,
+            json!({ "apiVersion": "events.k8s.io/v1", "kind": "Event" }),
+        )
+    }
+
+    /// A pass cut at its deadline says so on the claim: exactly one Warning
+    /// Event with reason `ReconcileTimedOut`, regarding the claim (with its
+    /// uid), carrying `ReconcileTimedOut`'s own words and THIS controller as
+    /// its reporter, so `apprafter app status` can tell a scheduler cut from
+    /// a provisioner one. The ServiceProvider LIST is accepted and never
+    /// answered; the Event POST is the only request after the cut, and it
+    /// is answered at once, so the wrapper returns at the deadline itself.
+    #[tokio::test(start_paused = true)]
+    async fn a_cut_pass_leaves_one_reconcile_timed_out_warning_event_on_the_claim() {
+        let (client, log) = stalling_apiserver(|call| match call.method.as_str() {
+            "GET" => None,
+            "POST" => Some(created_event()),
+            _ => Some(apiserver_unavailable()),
+        });
+        let started = tokio::time::Instant::now();
+
+        let outcome = tokio::time::timeout(
+            crate::RECONCILE_DEADLINE * 2,
+            crate::reconcile_with_deadline(live_claim("pg", &[]), context(client)),
+        )
+        .await
+        .expect("the deadline must end the pass");
+
+        match outcome {
+            Err(ReconcileError::TimedOut(t)) => assert_eq!(t.after, crate::RECONCILE_DEADLINE),
+            other => panic!("expected ReconcileError::TimedOut, got {other:?}"),
+        }
+        assert_eq!(started.elapsed(), crate::RECONCILE_DEADLINE);
+
+        let calls = log.lock().expect("log").clone();
+        assert_eq!(
+            calls.iter().map(|c| c.method.as_str()).collect::<Vec<_>>(),
+            vec!["GET", "POST"],
+            "the cut LIST, then the Event, and nothing else — no status: {calls:?}"
+        );
+        let event = &calls[1];
+        assert!(
+            event
+                .uri
+                .starts_with("/apis/events.k8s.io/v1/namespaces/landing/events"),
+            "the Event must be written in the claim's namespace: {}",
+            event.uri
+        );
+        let body = &event.body;
+        assert_eq!(body["type"], json!("Warning"));
+        assert_eq!(body["reason"], json!(operator_core::deadline_event::REASON));
+        assert_eq!(body["reason"], json!("ReconcileTimedOut"));
+        assert_eq!(body["action"], json!("Reconcile"));
+        assert_eq!(
+            body["regarding"]["apiVersion"],
+            json!("apprafter.io/v1alpha1")
+        );
+        assert_eq!(body["regarding"]["kind"], json!("ResourceClaim"));
+        assert_eq!(body["regarding"]["name"], json!("demo-web-pg"));
+        assert_eq!(body["regarding"]["namespace"], json!("landing"));
+        assert_eq!(
+            body["regarding"]["uid"],
+            json!("11111111-2222-3333-4444-555555555555")
+        );
+        assert_eq!(
+            body["reportingController"],
+            json!("apprafter-resourceclaim-scheduler")
+        );
+        assert_eq!(
+            body["reportingController"],
+            json!(EVENT_REPORTER_CONTROLLER)
+        );
+        assert_eq!(
+            body["note"],
+            json!(
+                "ResourceClaim reconcile did not finish within 120s: the controller abandoned \
+                 this pass and will retry it; nothing was written to this object's status"
+            )
+        );
+    }
+
+    /// A pass that finishes publishes no `ReconcileTimedOut` Event: a
+    /// matched claim is one LIST and one status patch, exactly as without
+    /// the wrapper.
+    #[tokio::test(start_paused = true)]
+    async fn a_pass_that_finishes_publishes_no_timeout_event() {
+        let (client, log) = scripted_apiserver(|call| match call.method.as_str() {
+            "GET" => provider_list(vec![provider_json(
+                "pg-integrated",
+                "pg",
+                &[("tier", "shared")],
+            )]),
+            "PATCH" => patched_claim(),
+            _ => created_event(),
+        });
+
+        crate::reconcile_with_deadline(live_claim("pg", &[("tier", "shared")]), context(client))
+            .await
+            .expect("a matched claim reconciles cleanly");
+
+        let calls = log.lock().expect("log").clone();
+        assert_eq!(
+            calls.iter().map(|c| c.method.as_str()).collect::<Vec<_>>(),
+            vec!["GET", "PATCH"],
+            "a finished pass publishes nothing: {calls:?}"
+        );
+    }
+
+    /// Nor does a pass that fails on an ANSWER: an apiserver that says 500
+    /// is an ordinary error, reported by `error_policy`, not a cut pass.
+    #[tokio::test(start_paused = true)]
+    async fn a_pass_that_fails_on_an_answer_publishes_no_timeout_event() {
+        let (client, log) = scripted_apiserver(|call| match call.method.as_str() {
+            "POST" => created_event(),
+            _ => apiserver_unavailable(),
+        });
+
+        let err = crate::reconcile_with_deadline(live_claim("pg", &[]), context(client))
+            .await
+            .expect_err("a failed provider list fails the pass");
+        assert!(matches!(err, ReconcileError::Kube(_)), "{err}");
+
+        let calls = log.lock().expect("log").clone();
+        assert_eq!(
+            calls.iter().map(|c| c.method.as_str()).collect::<Vec<_>>(),
+            vec!["GET"],
+            "an answered error publishes nothing: {calls:?}"
         );
     }
 }

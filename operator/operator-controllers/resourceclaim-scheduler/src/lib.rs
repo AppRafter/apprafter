@@ -10,7 +10,7 @@ use futures::StreamExt;
 use kube::api::Api;
 use kube::runtime::controller::{Action, Controller};
 use kube::runtime::watcher;
-use kube::Client;
+use kube::{Client, Resource};
 use thiserror::Error;
 use tracing::{info, warn};
 
@@ -62,19 +62,45 @@ pub enum ReconcileError {
 /// this controller (the watch has no predicate). A stale no-match body that
 /// prunes `status.provider` errs in the reaper's safe direction, because an
 /// unresolved claim vetoes reaping (`resourceclaim-provisioner`'s
-/// `reaper::is_intent_for`). The timeout itself writes nothing to the claim:
-/// `error_policy` warns, counts it and requeues.
+/// `reaper::is_intent_for`). The timeout itself writes nothing to the claim's
+/// status: [`reconcile_with_deadline`] leaves a `ReconcileTimedOut` Warning
+/// Event on it, and `error_policy` warns, counts it and requeues.
 pub const RECONCILE_DEADLINE: Duration = Duration::from_secs(120);
 
 /// [`reconcile::reconcile`], abandoned once it runs past
 /// [`RECONCILE_DEADLINE`]. This — never the unbounded reconcile — is what
 /// [`run`] hands kube-runtime, which holds every later trigger for a claim
 /// while a pass for it is in flight (WI-400).
+///
+/// A cut pass leaves the same `ReconcileTimedOut` Warning Event on the claim
+/// that the provisioner's controllers leave on theirs
+/// (`operator_core::deadline_event`), reported as
+/// `apprafter-resourceclaim-scheduler`: a reader of the claim's Events sees a
+/// scheduling stall too, and the reporter tells it from a provisioning one.
+/// It writes nothing to the claim's status: an apply under
+/// `resourceclaim-scheduler` that omits `provider` would prune it. The publish
+/// is bounded, so the wrapper returns at most `deadline_event::PUBLISH_BOUND`
+/// after the deadline.
 pub async fn reconcile_with_deadline(
     claim: Arc<ResourceClaim>,
     ctx: Arc<Context>,
 ) -> Result<Action, ReconcileError> {
-    operator_core::deadline::within(RECONCILE_DEADLINE, reconcile::reconcile(claim, ctx)).await
+    let outcome = operator_core::deadline::within(
+        RECONCILE_DEADLINE,
+        reconcile::reconcile(claim.clone(), ctx.clone()),
+    )
+    .await;
+    if let Err(ReconcileError::TimedOut(timed_out)) = &outcome {
+        operator_core::deadline_event::publish(
+            &ctx.client,
+            reconcile::EVENT_REPORTER_CONTROLLER,
+            claim.object_ref(&()),
+            KIND,
+            *timed_out,
+        )
+        .await;
+    }
+    outcome
 }
 
 /// Spawn the ResourceClaim scheduler Controller.
@@ -159,10 +185,11 @@ mod tests {
     use operator_core::ResourceClaimSpec;
 
     /// The same rule once more, for the error a deadline produces: the WARN
-    /// line is the only place a timed-out claim is reported (nothing is
-    /// written to the claim), so it has to say that the reconcile was cut and
-    /// after how long — not "kube api error", which would send an operator
-    /// after RBAC or the network.
+    /// line is the one place the operator log reports a timed-out claim
+    /// (nothing is written to its status; the claim gets only a Warning
+    /// Event), so it has to say that the reconcile was cut and after how long
+    /// — not "kube api error", which would send an operator after RBAC or the
+    /// network.
     #[test]
     fn a_timed_out_reconcile_names_the_deadline_it_ran_past() {
         let shown = ReconcileError::from(ReconcileTimedOut {
@@ -192,7 +219,9 @@ mod tests {
     /// timeout, or forever above the socket. The deadline-bounded reconcile
     /// gives up at exactly [`RECONCILE_DEADLINE`] and returns the timeout as
     /// this controller's own error, so `error_policy` sees it and kube-runtime
-    /// releases the held triggers.
+    /// releases the held triggers. Every request hangs here, the
+    /// `ReconcileTimedOut` Event publish included, so the wrapper returns one
+    /// publish bound after the deadline, and no later.
     #[tokio::test(start_paused = true)]
     async fn a_reconcile_whose_apiserver_never_answers_is_abandoned_at_the_deadline() {
         let ctx = Arc::new(Context {
@@ -210,7 +239,10 @@ mod tests {
         .await
         .expect("the deadline must cut a reconcile whose apiserver never answers");
 
-        assert_eq!(started.elapsed(), RECONCILE_DEADLINE);
+        assert_eq!(
+            started.elapsed(),
+            RECONCILE_DEADLINE + operator_core::deadline_event::PUBLISH_BOUND
+        );
         match outcome {
             Err(ReconcileError::TimedOut(timed_out)) => {
                 assert_eq!(timed_out.after, RECONCILE_DEADLINE)
