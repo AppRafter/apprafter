@@ -42,3 +42,7 @@ async-trait  = { workspace = true }
 # reconcile actually APPLIES, which is what decides whether it is a rollout.
 tower = { workspace = true }
 http  = { workspace = true }
+# WI-400: `operator_core::testing::stalled_client()` — a client whose every
+# request stays pending forever — builds the Context the deadline tests run
+# against. Dev-only: the feature never reaches the shipped operator.
+operator-core = { path = "../../operator-core", features = ["testing"] }

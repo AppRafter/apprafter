@@ -174,6 +174,14 @@ pub enum ReconcileError {
     /// surface it rather than emit an owner-less plan.
     #[error("Application {0} has no metadata.uid; cannot own a MigrationPlan")]
     MissingUid(String),
+
+    /// WI-400: the reconcile ran past its deadline and was abandoned at its
+    /// next `.await` (see [`operator_core::deadline::within`]). Without one,
+    /// a call that never answers holds this Application, and every trigger
+    /// kube-runtime queues behind it, until the client's 295s read timeout,
+    /// with nothing in status, Events or the log.
+    #[error(transparent)]
+    TimedOut(#[from] operator_core::deadline::ReconcileTimedOut),
 }
 
 /// Spawn the Application Controller. Watches `apprafter.io/v1alpha1`
@@ -1239,14 +1247,15 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
     Ok(Action::requeue(Duration::from_secs(60)))
 }
 
-/// Error policy — logs the error, increments the error counters,
-/// and requeues with a fixed 30s delay. Phase 1.9c will distinguish
-/// transient vs terminal errors and wire up exponential backoff.
 /// Classify a reconcile error into a low-cardinality reason (2.22h / D16).
 ///
 /// Low-cardinality on purpose: the reason is the DEDUP KEY, so anything
 /// derived from the message would make every tick a new problem and turn the
 /// surface into the firehose it exists to replace.
+///
+/// Every variant is named, with no `_` arm: a catch-all is how a new variant
+/// gets filed as `ReconcileFailed` without anyone deciding it should be, and
+/// with the variants listed the compiler asks instead.
 pub(crate) fn reconcile_problem_reason(err: &ReconcileError) -> &'static str {
     match err {
         ReconcileError::Kube(kube::Error::Api(e)) => match e.code {
@@ -1256,7 +1265,12 @@ pub(crate) fn reconcile_problem_reason(err: &ReconcileError) -> &'static str {
             422 => "ReconcileInvalid",
             _ => "ReconcileFailed",
         },
-        _ => "ReconcileFailed",
+        // WI-400: a stall, not a failure the apiserver reported, and
+        // `app status` must be able to tell the two apart.
+        ReconcileError::TimedOut(_) => "ReconcileTimedOut",
+        ReconcileError::Kube(_) | ReconcileError::Serde(_) | ReconcileError::MissingUid(_) => {
+            "ReconcileFailed"
+        }
     }
 }
 
@@ -1324,6 +1338,16 @@ async fn flush_problems(ctx: &Context, app: &Application) {
     }
 }
 
+/// Error policy — logs the error, records it in the problem ledger that the
+/// next reconcile flushes onto `status.recentProblems`, increments the error
+/// counters (and `apprafter_reconcile_timeouts_total` when the reconcile was
+/// abandoned at its deadline, [`ReconcileError::TimedOut`]), and requeues
+/// with a fixed 30s delay.
+///
+/// It writes nothing to the apiserver: it is synchronous and cannot. The only
+/// status write a failure leads to is that flush, under
+/// [`PROBLEM_FIELD_MANAGER`], which owns `recentProblems` and nothing else, so
+/// it cannot prune a field this controller's own status apply owns.
 pub fn error_policy(app: Arc<Application>, err: &ReconcileError, ctx: Arc<Context>) -> Action {
     let name = app.name_any();
     let namespace = app.namespace().unwrap_or_default();
@@ -1347,6 +1371,12 @@ pub fn error_policy(app: Arc<Application>, err: &ReconcileError, ctx: Arc<Contex
         .reconcile_errors
         .with_label_values(&[KIND])
         .inc();
+    if matches!(err, ReconcileError::TimedOut(_)) {
+        ctx.metrics
+            .reconcile_timeouts
+            .with_label_values(&[KIND])
+            .inc();
+    }
     Action::requeue(Duration::from_secs(30))
 }
 
@@ -8894,5 +8924,170 @@ mod image_reconcile_tests {
         assert_eq!(kept(running(IMAGE, "web", IMAGE)), None);
         assert_eq!(kept(running(IMAGE, "sidecar", &at_digest('a'))), None);
         assert_eq!(running_digest_for(None, IMAGE), None);
+    }
+}
+
+/// WI-400: a reconcile abandoned at its deadline, from the classifier through
+/// `error_policy` to the ledger that `status.recentProblems` is flushed from.
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+
+    use std::sync::atomic::AtomicBool;
+
+    use oci_resolve::{HttpReq, HttpResp, OciResolveError, RegistryHttp};
+    use operator_core::deadline::ReconcileTimedOut;
+    use operator_core::problems::{ProblemLedger, ProblemTuning};
+
+    /// A registry that, like the apiserver under it, never answers.
+    struct StalledRegistry;
+
+    #[async_trait::async_trait]
+    impl RegistryHttp for StalledRegistry {
+        async fn send(&self, _req: HttpReq<'_>) -> Result<HttpResp, OciResolveError> {
+            std::future::pending().await
+        }
+    }
+
+    /// The Context `run` builds, over `client` and a registry that never
+    /// answers. Call it inside a tokio runtime: kube's client spawns its
+    /// request buffer as a task.
+    fn context_over(client: Client) -> Arc<Context> {
+        Arc::new(Context {
+            client,
+            metrics: Arc::new(Metrics::new()),
+            oci_http: Arc::new(StalledRegistry),
+            cilium_available: false,
+            gateway_api_available: false,
+            vpa_available: Arc::new(AtomicBool::new(false)),
+            in_place_resize_supported: true,
+            problems: Arc::new(ProblemLedger::new()),
+            problem_tuning: ProblemTuning::default(),
+        })
+    }
+
+    /// Every remote this reconcile can reach accepts the request and never
+    /// answers.
+    fn stalled_context() -> Arc<Context> {
+        context_over(operator_core::testing::stalled_client())
+    }
+
+    /// The JSON of a plain Application `shop/web`: no needs, no env, no
+    /// public route.
+    fn web_json() -> Value {
+        json!({
+            "apiVersion": "apprafter.io/v1alpha1",
+            "kind": "Application",
+            "metadata": {
+                "name": "web",
+                "namespace": "shop",
+                "uid": "5b0e2a52-7f55-4a4b-9d1c-3c1e3c6f1a01",
+                "generation": 1,
+                "resourceVersion": "7",
+            },
+            "spec": { "base": { "image": "ghcr.io/acme/web:1.0" } },
+        })
+    }
+
+    fn web() -> Arc<Application> {
+        Arc::new(serde_json::from_value(web_json()).expect("a valid Application"))
+    }
+
+    fn timed_out() -> ReconcileError {
+        ReconcileError::from(ReconcileTimedOut {
+            after: Duration::from_secs(120),
+        })
+    }
+
+    fn api_error(code: u16) -> ReconcileError {
+        ReconcileError::Kube(kube::Error::Api(
+            kube::core::Status::failure("scripted", "Scripted")
+                .with_code(code)
+                .boxed(),
+        ))
+    }
+
+    #[test]
+    fn a_timed_out_reconcile_is_its_own_problem_reason() {
+        // Before WI-400 the `_` arm filed anything new as `ReconcileFailed`;
+        // a stall must read as a stall in `app status`, not as a failure the
+        // apiserver reported.
+        assert_eq!(reconcile_problem_reason(&timed_out()), "ReconcileTimedOut");
+    }
+
+    /// `apprafter_reconcile_timeouts_total{kind="Application"}`.
+    fn timeouts(ctx: &Context) -> f64 {
+        ctx.metrics
+            .reconcile_timeouts
+            .with_label_values(&[KIND])
+            .get()
+    }
+
+    /// `apprafter_reconcile_errors_total{kind="Application"}`.
+    fn errors(ctx: &Context) -> f64 {
+        ctx.metrics
+            .reconcile_errors
+            .with_label_values(&[KIND])
+            .get()
+    }
+
+    #[test]
+    fn the_existing_problem_reasons_are_unchanged() {
+        for (code, reason) in [
+            (401, "ReconcileForbidden"),
+            (403, "ReconcileForbidden"),
+            (404, "ReconcileNotFound"),
+            (409, "ReconcileConflict"),
+            (422, "ReconcileInvalid"),
+            (500, "ReconcileFailed"),
+        ] {
+            assert_eq!(
+                reconcile_problem_reason(&api_error(code)),
+                reason,
+                "HTTP {code}"
+            );
+        }
+        let serde = serde_json::from_str::<Value>("{").expect_err("not JSON");
+        assert_eq!(
+            reconcile_problem_reason(&ReconcileError::Serde(serde)),
+            "ReconcileFailed"
+        );
+        assert_eq!(
+            reconcile_problem_reason(&ReconcileError::MissingUid("web".into())),
+            "ReconcileFailed"
+        );
+    }
+
+    #[tokio::test]
+    async fn error_policy_records_a_timeout_as_a_problem_that_names_the_deadline() {
+        let ctx = stalled_context();
+
+        let action = error_policy(web(), &timed_out(), ctx.clone());
+
+        assert_eq!(action, Action::requeue(Duration::from_secs(30)));
+        let rows = ctx.problems.snapshot("shop", "web");
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].reason, "ReconcileTimedOut");
+        assert!(
+            rows[0].message.contains("within 120s"),
+            "the problem must name the deadline: {:?}",
+            rows[0].message
+        );
+        assert_eq!(timeouts(&ctx), 1.0);
+        assert_eq!(errors(&ctx), 1.0, "a timeout is still an error");
+    }
+
+    #[tokio::test]
+    async fn error_policy_counts_only_a_timeout_as_a_timeout() {
+        let ctx = stalled_context();
+
+        error_policy(web(), &api_error(500), ctx.clone());
+
+        assert_eq!(timeouts(&ctx), 0.0);
+        assert_eq!(errors(&ctx), 1.0);
+        assert_eq!(
+            ctx.problems.snapshot("shop", "web")[0].reason,
+            "ReconcileFailed"
+        );
     }
 }
