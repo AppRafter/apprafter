@@ -122,6 +122,13 @@ fn clamp_requeue(raw: Duration) -> Duration {
     raw.max(MIN_REQUEUE).min(MAX_REQUEUE)
 }
 
+/// Re-check interval while a live claim is still re-attaching to an expired
+/// persistent snapshot (WI-402, [`reattach_in_progress`]). Nothing about the
+/// claim wakes this controller — it watches `RetainedClaim`s only — so this
+/// poll is how the snapshot is eventually deleted if the provisioner's own
+/// cancel after its terminal write was itself cut short.
+const REATTACH_PENDING_REQUEUE: Duration = Duration::from_secs(60);
+
 /// Requeue between Phase 2 polls while waiting for CNPG to drop the
 /// `ensure: absent` role (2.4f Fix B2). CNPG drops the DB then the role
 /// over a few reconcile passes; we poll the Cluster `status` until the
@@ -241,6 +248,27 @@ pub async fn reconcile(
     let claim_api: Api<ResourceClaim> =
         Api::namespaced(ctx.client.clone(), &rc.spec.claim_ref.namespace);
     match claim_api.get_opt(&rc.spec.claim_ref.name).await? {
+        Some(c) if claim_is_live(&c) && reattach_in_progress(&rc, &c) => {
+            // WI-402: a re-created claim has not finished re-attaching to
+            // this snapshot's allocation. The snapshot is the provisioner's
+            // only record that the claim's `$N` holds RETAINED data — its next
+            // pass reads it to decide "do not FLUSHDB". Deleting it here,
+            // because grace ran out while the reattach kept failing (or before
+            // its first checkpoint landed), would turn that pass into a flush
+            // of the data being recovered. Keep it; the provisioner cancels it
+            // after its terminal write, and the arm below deletes it once the
+            // claim is ready.
+            info!(
+                retained = %rc_name, claim = %rc.spec.claim_ref.name,
+                "live ResourceClaim is still re-attaching to this snapshot's allocation — \
+                 keeping the snapshot until the reattach completes"
+            );
+            ctx.metrics
+                .claim_gc_total
+                .with_label_values(&["reattach-pending", &rc_ns])
+                .inc();
+            return Ok(Action::requeue(REATTACH_PENDING_REQUEUE));
+        }
         Some(c) if claim_is_live(&c) => {
             info!(
                 retained = %rc_name, claim = %rc.spec.claim_ref.name,
@@ -1321,6 +1349,49 @@ pub fn dragonfly_flushdb_is_safe(
     })
 }
 
+/// True iff this dragonfly snapshot is still load-bearing for a live claim
+/// that has not finished re-attaching to it (WI-402), so the GC must keep it
+/// however long ago its grace ran out.
+///
+/// The provisioner can tell "this `$N` holds RETAINED data, skip FLUSHDB"
+/// from "this `$N` was freshly allocated, flush it" only by this snapshot
+/// still existing — on a retry after its allocation checkpoint, and on the
+/// pass that found the snapshot but has not written that checkpoint yet. So
+/// the snapshot is load-bearing while the claim
+///   - is not `ready` (the provisioner cancels the snapshot itself right after
+///     its terminal status write), and
+///   - holds the snapshot's exact `(instance, dbnum)` (checkpointed, mid
+///     reattach) or no allocation at all (not checkpointed yet).
+///
+/// `false` for a ready claim, for one that holds a different allocation (it
+/// allocated elsewhere, so the snapshot is stale), for a snapshot that names
+/// no allocation, and for any snapshot not on a PERSISTENT dragonfly instance:
+/// an ephemeral instance retains nothing, a reattach there flushes anyway, and
+/// nothing depends on its snapshot surviving.
+///
+/// A `true` costs a snapshot kept past grace — still reserving its `$N`,
+/// still holding its data, re-checked every [`REATTACH_PENDING_REQUEUE`] —
+/// never a flush.
+pub fn reattach_in_progress(rc: &RetainedClaim, claim: &ResourceClaim) -> bool {
+    if gc_backend(&rc.spec.backend) != GcBackend::Dragonfly {
+        return false;
+    }
+    let (Some(instance), Some(dbnum)) = (rc.spec.instance.as_deref(), rc.spec.dbnum) else {
+        return false;
+    };
+    if dragonfly::class_of_instance(instance) != Some(dragonfly::PoolClass::Persistent) {
+        return false;
+    }
+    let status = claim.status.as_ref();
+    if status.and_then(|s| s.ready) == Some(true) {
+        return false;
+    }
+    match status.and_then(|s| s.instance.as_deref().zip(s.dbnum)) {
+        None => true,
+        Some((i, n)) => i == instance && n == dbnum,
+    }
+}
+
 /// True iff the fetched `ResourceClaim` is LIVE — present with no
 /// `deletion_timestamp` (Phase 2.4f Fix A live-guard).
 ///
@@ -1467,6 +1538,82 @@ mod tests {
         let mut claim = ResourceClaim::new("demo-web-pg", ResourceClaimSpec::default());
         claim.metadata.deletion_timestamp = Some(operator_core::k8s_time::time(Utc::now()));
         assert!(!claim_is_live(&claim));
+    }
+
+    // --- reattach_in_progress() (WI-402: the snapshot outlives a failing reattach) ---
+
+    const PERSISTENT_000: &str = "platform-redis-persistent-000";
+
+    fn claim_holding(alloc: Option<(&str, u16)>, ready: Option<bool>) -> ResourceClaim {
+        let mut c = ResourceClaim::new("web-redis", ResourceClaimSpec::default());
+        c.metadata.namespace = Some("demo".into());
+        c.status = Some(operator_core::ResourceClaimStatus {
+            instance: alloc.map(|(i, _)| i.to_string()),
+            dbnum: alloc.map(|(_, n)| n),
+            ready,
+            ..Default::default()
+        });
+        c
+    }
+
+    fn persistent_snapshot(dbnum: u16) -> RetainedClaim {
+        dragonfly_snapshot(
+            Some(PERSISTENT_000),
+            Some(dbnum),
+            Some("claim_demo_web-redis_redis"),
+        )
+    }
+
+    #[test]
+    fn a_not_ready_claim_on_the_snapshots_allocation_is_mid_reattach() {
+        let rc = persistent_snapshot(7);
+        let on_it = Some((PERSISTENT_000, 7));
+        assert!(reattach_in_progress(&rc, &claim_holding(on_it, None)));
+        assert!(reattach_in_progress(
+            &rc,
+            &claim_holding(on_it, Some(false))
+        ));
+    }
+
+    #[test]
+    fn a_not_ready_claim_with_no_allocation_yet_may_be_about_to_reattach() {
+        let rc = persistent_snapshot(7);
+        assert!(reattach_in_progress(&rc, &claim_holding(None, None)));
+        let mut bare = claim_holding(None, None);
+        bare.status = None;
+        assert!(reattach_in_progress(&rc, &bare));
+    }
+
+    #[test]
+    fn a_ready_claim_has_finished_its_reattach() {
+        let ready = claim_holding(Some((PERSISTENT_000, 7)), Some(true));
+        assert!(!reattach_in_progress(&persistent_snapshot(7), &ready));
+    }
+
+    #[test]
+    fn a_claim_that_allocated_elsewhere_is_not_reattaching_to_this_snapshot() {
+        let rc = persistent_snapshot(7);
+        for elsewhere in [
+            (PERSISTENT_000, 3),
+            ("platform-redis-persistent-001", 7),
+            ("platform-redis-ephemeral-000", 7),
+        ] {
+            let c = claim_holding(Some(elsewhere), None);
+            assert!(!reattach_in_progress(&rc, &c), "{elsewhere:?}");
+        }
+    }
+
+    #[test]
+    fn only_a_persistent_dragonfly_snapshot_with_an_allocation_is_load_bearing() {
+        let waiting = claim_holding(None, None);
+        let user = Some("claim_demo_web-redis_redis");
+        let ephemeral = dragonfly_snapshot(Some("platform-redis-ephemeral-000"), Some(7), user);
+        assert!(!reattach_in_progress(&ephemeral, &waiting));
+        let never_provisioned = dragonfly_snapshot(Some(""), Some(0), user);
+        assert!(!reattach_in_progress(&never_provisioned, &waiting));
+        let mut cnpg = persistent_snapshot(7);
+        cnpg.spec.backend = "cloudnative-pg".into();
+        assert!(!reattach_in_progress(&cnpg, &waiting));
     }
 
     // --- role_is_dropped() (2.4f Fix B2 drop-confirmation) ---

@@ -1057,7 +1057,9 @@ async fn provision_dragonfly(
         // A checkpointed reattach is still in flight iff THIS claim's own
         // snapshot still names the checkpoint's exact (instance, dbnum): the
         // provisioner deletes that snapshot only after the terminal status
-        // write below. Only a PERSISTENT reattach skips the flush — an
+        // write below, and the GC keeps a persistent one while this claim is
+        // mid-reattach (`gc::reattach_in_progress`), so it outlives every
+        // failed pass. Only a PERSISTENT reattach skips the flush — an
         // ephemeral instance retains nothing (`resolve_allocation`'s
         // `skip_flush = persistent`) — and a fresh allocation has no such
         // snapshot and is flushed as before (recycle-safety, ADR 0042 §3).

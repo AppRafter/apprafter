@@ -220,3 +220,107 @@ async fn a_snapshot_on_another_dbnum_does_not_mark_the_checkpoint_as_a_reattach(
         vec![(dragonfly::instance_addr(PERSISTENT, DF_NS), 7)]
     );
 }
+
+// ---- (1b) the snapshot is the marker, so the GC must not take it mid-reattach ----
+
+/// A grace deadline that has already passed.
+const EXPIRED: &str = "2026-01-01T00:00:00Z";
+
+/// Run the RetainedClaim GC over `claim_name`'s snapshot as stored.
+async fn gc_stored(
+    api: &FakeApiserver,
+    claim_name: &str,
+    redis: Arc<dyn RedisAdmin>,
+) -> Result<Action, ReconcileError> {
+    let rc: operator_core::RetainedClaim = serde_json::from_value(
+        api.retained(&cnpg::k8s_name(NS, claim_name))
+            .expect("snapshot present"),
+    )
+    .expect("snapshot");
+    crate::gc::reconcile(Arc::new(rc), ctx(api, redis)).await
+}
+
+#[tokio::test]
+async fn a_reattach_still_failing_when_grace_runs_out_keeps_its_retained_data() {
+    // Re-created on the last day of grace; the reattach keeps failing past
+    // `retainUntil`, so the GC visits the snapshot while the claim is live
+    // but not ready.
+    let api = api();
+    api.put_claim(claim("web-redis", true, None))
+        .put_retained(retained("web-redis", PERSISTENT, 7, EXPIRED));
+    let pass1 = Arc::new(RefusingSetuser::default());
+    reconcile_stored(&api, "web-redis", pass1.clone())
+        .await
+        .expect_err("pass 1 must fail at SETUSER");
+
+    gc_stored(&api, "web-redis", Arc::new(FakeRedis::default()))
+        .await
+        .expect("gc pass");
+    assert!(
+        api.retained(&cnpg::k8s_name(NS, "web-redis")).is_some(),
+        "the GC deleted the snapshot of a reattach still in flight"
+    );
+
+    let pass2 = Arc::new(FakeRedis::default());
+    reconcile_stored(&api, "web-redis", pass2.clone())
+        .await
+        .expect("pass 2 provisions");
+    assert_eq!(
+        flushed(&pass2),
+        Vec::<(String, u16)>::new(),
+        "the retry flushed the recovered $7"
+    );
+}
+
+#[tokio::test]
+async fn a_recreated_claim_that_has_not_checkpointed_yet_keeps_its_expired_snapshot() {
+    // The window before the first checkpoint: the provisioner has LISTed and
+    // found the snapshot, its checkpoint PATCH has not landed, and the GC
+    // looks now. The claim holds no allocation at all — which must not read
+    // as "not re-attaching".
+    let api = api();
+    api.put_claim(claim("web-redis", true, None))
+        .put_retained(retained("web-redis", PERSISTENT, 7, EXPIRED));
+    gc_stored(&api, "web-redis", Arc::new(FakeRedis::default()))
+        .await
+        .expect("gc pass");
+    assert!(
+        api.retained(&cnpg::k8s_name(NS, "web-redis")).is_some(),
+        "the GC deleted the snapshot a not-yet-checkpointed reattach is about to use"
+    );
+
+    let redis = Arc::new(FakeRedis::default());
+    reconcile_stored(&api, "web-redis", redis.clone())
+        .await
+        .expect("provisions");
+    assert_eq!(flushed(&redis), Vec::<(String, u16)>::new());
+    assert_eq!(api.claim(NS, "web-redis")["status"]["dbnum"], 7);
+}
+
+#[tokio::test]
+async fn the_gc_still_deletes_the_stale_snapshot_of_a_ready_claim() {
+    // The pre-WI-402 live-guard, unchanged for a claim that finished: its
+    // snapshot is stale, and the GC (not only the provisioner) removes it.
+    let api = api();
+    let mut ready = claim("web-redis", true, Some((PERSISTENT, 7)));
+    ready["status"]["ready"] = json!(true);
+    api.put_claim(ready)
+        .put_retained(retained("web-redis", PERSISTENT, 7, EXPIRED));
+    gc_stored(&api, "web-redis", Arc::new(FakeRedis::default()))
+        .await
+        .expect("gc pass");
+    assert!(api.retained(&cnpg::k8s_name(NS, "web-redis")).is_none());
+}
+
+#[tokio::test]
+async fn the_gc_still_deletes_an_expired_ephemeral_snapshot_of_a_claim_not_yet_ready() {
+    // An ephemeral snapshot retains nothing, so it is never load-bearing: the
+    // live-guard deletes it once grace has passed, ready or not, as before.
+    let api = api();
+    api.put_claim(claim("web-redis", false, None))
+        .put_retained(retained("web-redis", EPHEMERAL, 4, EXPIRED));
+    gc_stored(&api, "web-redis", Arc::new(FakeRedis::default()))
+        .await
+        .expect("gc pass");
+    assert!(api.retained(&cnpg::k8s_name(NS, "web-redis")).is_none());
+}
