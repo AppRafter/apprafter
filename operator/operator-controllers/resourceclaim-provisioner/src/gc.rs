@@ -129,6 +129,39 @@ fn clamp_requeue(raw: Duration) -> Duration {
 /// finalizes promptly without a tight busy-loop.
 const ROLE_DROP_REQUEUE: Duration = Duration::from_secs(15);
 
+/// How long one GC pass may run before it is abandoned (WI-400).
+///
+/// Every client in a pass other than kube is already bounded: Redis at 1s to
+/// connect and 500ms per reply, NATS at 5s to connect and 2s per request. The
+/// slowest legitimate pass is the NATS arm — one DELETE per declared stream
+/// and consumer, a stream sweep that costs about 7s per stream against a
+/// server that went dark mid-sweep, then `reconcile_accounts_secret`'s Secret
+/// GETs and one PUT — and 120s covers a sweep of about a dozen streams in that
+/// state. The CNPG, disk and Dragonfly arms are five to eight round trips.
+/// The CNPG role drop is never waited for in-pass: it is polled across passes
+/// at `ROLE_DROP_REQUEUE`.
+///
+/// Abandoning a pass is safe at every point. The phase is recomputed from live
+/// state on every pass, each step is idempotent and 404-tolerant, and the
+/// live-guard runs first on every pass and fails closed. Streams a cut sweep
+/// already deleted stay deleted, and the accounts Secret PUT is
+/// resourceVersion-guarded. A `RetainedClaim` has no status subresource, so a
+/// timeout cannot prune anything: `error_policy` warns, counts it and
+/// requeues. The GC runs at the default, unbounded concurrency, so a stuck
+/// pass holds only its own snapshot.
+pub const RECONCILE_DEADLINE: Duration = Duration::from_secs(120);
+
+/// [`reconcile`], abandoned once it runs past [`RECONCILE_DEADLINE`]. This —
+/// never the unbounded reconcile — is what [`run`] hands kube-runtime, which
+/// holds every later trigger for a snapshot while a pass for it is in flight
+/// (WI-400).
+pub async fn reconcile_with_deadline(
+    rc: Arc<RetainedClaim>,
+    ctx: Arc<Context>,
+) -> Result<Action, ReconcileError> {
+    operator_core::deadline::within(RECONCILE_DEADLINE, reconcile(rc, ctx)).await
+}
+
 /// Spawn the RetainedClaim GC Controller (7th controller).
 pub async fn run(
     client: Client,
@@ -139,7 +172,7 @@ pub async fn run(
     let ctx = Arc::new(Context::with_acl_dirty(client, metrics, acl_dirty));
     info!("RetainedClaimGC starting");
     Controller::new(retained, watcher::Config::default())
-        .run(reconcile, error_policy, ctx)
+        .run(reconcile_with_deadline, error_policy, ctx)
         .for_each(|res| async move {
             match res {
                 Ok((obj_ref, _)) => info!(retained = %obj_ref.name, "gc reconciled"),
@@ -2129,5 +2162,89 @@ mod tests {
             "web-redis",
             "demo",
         ));
+    }
+
+    // ---- WI-400: the reconcile deadline ----
+
+    /// A pg snapshot whose grace has long elapsed, so a pass gets past the
+    /// clock check and makes its first apiserver call: the live-guard GET of
+    /// the original claim.
+    fn expired_pg_snapshot() -> Arc<RetainedClaim> {
+        let mut rc = RetainedClaim::new(
+            "claim-apps-web-pg",
+            operator_core::RetainedClaimSpec {
+                claim_ref: operator_core::retainedclaim::ClaimRef {
+                    name: "web-pg".into(),
+                    namespace: "apps".into(),
+                },
+                provider: "pg-integrated".into(),
+                backend: "cloudnative-pg".into(),
+                retain_until: "2020-01-01T00:00:00+00:00".into(),
+                ..Default::default()
+            },
+        );
+        rc.metadata.namespace = Some("apprafter-system".into());
+        Arc::new(rc)
+    }
+
+    /// The crate's error type is shared by all four controllers here, and the
+    /// WARN line is the only report of a cut GC pass (a `RetainedClaim` has no
+    /// status), so the timeout has to read as a timeout, with its bound.
+    #[test]
+    fn a_timed_out_gc_pass_names_the_deadline_it_ran_past() {
+        let shown = ReconcileError::from(operator_core::deadline::ReconcileTimedOut {
+            after: RECONCILE_DEADLINE,
+        })
+        .to_string();
+        assert_eq!(shown, "reconcile did not finish within 120s");
+    }
+
+    /// The WI-400 hang, on this controller: the live-guard GET is accepted and
+    /// never answered. Unbounded, the pass — and every later trigger for the
+    /// snapshot — waits for the client's 295s read timeout, or forever above
+    /// the socket. Bounded, it gives up at exactly [`RECONCILE_DEADLINE`] with
+    /// this crate's own error, and nothing destructive ran: the live-guard
+    /// fails closed.
+    #[tokio::test(start_paused = true)]
+    async fn a_gc_pass_whose_apiserver_never_answers_is_abandoned_at_the_deadline() {
+        let ctx = Arc::new(Context::new(
+            operator_core::testing::stalled_client(),
+            Arc::new(Metrics::new()),
+        ));
+        let started = tokio::time::Instant::now();
+
+        // Bounded from outside as well, so a pass that is no longer cut fails
+        // this test instead of hanging it.
+        let outcome = tokio::time::timeout(
+            RECONCILE_DEADLINE * 2,
+            reconcile_with_deadline(expired_pg_snapshot(), ctx),
+        )
+        .await
+        .expect("the deadline must cut a GC pass whose apiserver never answers");
+
+        assert_eq!(started.elapsed(), RECONCILE_DEADLINE);
+        match outcome {
+            Err(ReconcileError::TimedOut(timed_out)) => {
+                assert_eq!(timed_out.after, RECONCILE_DEADLINE)
+            }
+            other => panic!("expected ReconcileError::TimedOut, got {other:?}"),
+        }
+    }
+
+    /// The deadline only exists if `run` hands kube-runtime the BOUNDED
+    /// reconcile; a `Controller` needs a live watch, so the run site is read
+    /// instead. The needle is assembled with `concat!` so this test's own
+    /// text can never satisfy it.
+    #[test]
+    fn the_gc_controller_runs_the_deadline_bounded_reconcile() {
+        let production = include_str!("gc.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("gc.rs has production code above its test module");
+        let wired = concat!(".run(reconcile_with_", "deadline, error_policy, ctx)");
+        assert!(
+            production.contains(wired),
+            "gc::run() must drive reconcile_with_deadline, not the unbounded gc::reconcile"
+        );
     }
 }

@@ -273,6 +273,13 @@ pub enum ReconcileError {
     /// content of this variant.
     #[error("nats storage budget: {0}")]
     NatsStorageBudget(String),
+    /// A pass ran past its controller's reconcile deadline and was abandoned
+    /// (WI-400). One variant for the whole crate, like the type itself: each
+    /// of the four controllers here wires its own deadline at its
+    /// `Controller::run` site, and `error_policy` tells a cut pass from a
+    /// failed one by this variant.
+    #[error(transparent)]
+    TimedOut(#[from] operator_core::deadline::ReconcileTimedOut),
 }
 
 /// Spawn the ResourceClaim provisioner Controller.

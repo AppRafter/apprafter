@@ -49,3 +49,9 @@ tokio-postgres = "0.7"
 # Dev-only — no admission-webhook dependency in the production build; both
 # crates already depend only on operator-core, so this adds no cycle.
 admission-webhook = { path = "../../admission-webhook" }
+# WI-400: the deadline tests run a reconcile against
+# `operator_core::testing::stalled_client()` — an apiserver that accepts every
+# request and never answers — on a paused clock (`test-util`), so a 120s
+# deadline elapses in no wall time and the moment it fires is exact.
+operator-core = { path = "../../operator-core", features = ["testing"] }
+tokio         = { workspace = true, features = ["test-util"] }
