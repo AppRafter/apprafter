@@ -64,6 +64,7 @@ use operator_core::{
 };
 
 use crate::cnpg::{self, k8s_name, pg_identifier};
+use crate::pg_client::{PgAdminError, ServerBound};
 use crate::shared_pg::{self, shared_group};
 use crate::{Context, ReconcileError, FIELD_MANAGER};
 
@@ -83,6 +84,21 @@ const REASON_AWAITING_CLUSTER: &str = "AwaitingCluster";
 /// `Ready=False` reason while CNPG has not yet reported the `Database` CR
 /// reconciled.
 const REASON_AWAITING_DATABASE: &str = "AwaitingDatabase";
+
+/// `Ready` reason when the server cancelled one of this pass's statements on
+/// the session's `lock_timeout` ([`ServerBound::Lock`]): another transaction
+/// holds a lock the statement needs. `Awaiting…` because it clears by itself
+/// when that transaction ends — the Argo CD health script reads an
+/// `Awaiting` prefix on `Ready=False` as Progressing, anything else as
+/// Degraded. See [`server_cancelled_condition`] for why it can also sit
+/// beside `True`.
+const REASON_AWAITING_LOCK: &str = "AwaitingLock";
+
+/// `Ready` reason when the server cancelled one of this pass's statements on
+/// the session's `statement_timeout` ([`ServerBound::Statement`]): the
+/// statement ran past the bound on its own, which may repeat on every pass —
+/// so, deliberately, not an `Awaiting…` reason.
+const REASON_STATEMENT_TIMED_OUT: &str = "StatementTimedOut";
 
 /// `Ready=False` reason on a delete held open by live consumers.
 const REASON_IN_USE: &str = "InUse";
@@ -650,6 +666,23 @@ async fn reconcile_pg(
     );
     let groups = shared_pg::create_groups(ns, name, cnpg::PLATFORM_ROLE);
     if let Err(e) = ctx.pg.execute_all(&admin_dsn, &groups).await {
+        // A server that cancelled a statement ANSWERED, and one that timed
+        // out may still be serving its consumers: "not answering yet" below
+        // would be false of the first, and its `ready=false` and dropped
+        // `ExtensionUnavailable` wrong for both on a database that is serving.
+        if let Some(action) = report_unfinished_call(
+            ctx,
+            sd,
+            prior,
+            &database,
+            &cluster,
+            "creating the groups",
+            &e,
+        )
+        .await?
+        {
+            return Ok(action);
+        }
         // Not a hard error: a cluster still starting is the common case on a
         // fresh install, and the reason says so rather than surfacing a dial
         // failure as a provisioning fault.
@@ -712,6 +745,25 @@ async fn reconcile_pg(
         .execute_all(&db_dsn, &shared_pg::grant_reader(ns, name, &database))
         .await
     {
+        // Two failures here are NOT "CNPG has not created it yet", and saying
+        // so would be false: a statement the server cancelled on one of the
+        // session's bounds — the routine one is `GRANT SELECT ON ALL TABLES`
+        // queued behind a consumer's migration — and a call that got no
+        // answer at all. On a database that is already serving, neither may
+        // take `Ready` away from it or prune its status.
+        if let Some(action) = report_unfinished_call(
+            ctx,
+            sd,
+            prior,
+            &database,
+            &cluster,
+            "granting the reader group",
+            &e,
+        )
+        .await?
+        {
+            return Ok(action);
+        }
         warn!(%name, %ns, error = %e, "shared database not ready for reader grants yet");
         let cond = ready_condition(
             "False",
@@ -1088,6 +1140,172 @@ async fn drop_backing(
         _ => {}
     }
     Ok(true)
+}
+
+/// Whether this object records `database` as provisioned.
+///
+/// `status.database` is written by exactly one path — the pg arm's
+/// `Provisioned` write — and every other write carries it forward
+/// ([`backing_of`]), so a recorded name means CNPG created the database and
+/// a pass completed against it. Deliberately NOT `status.ready`: a single
+/// transient failure (a refused dial) writes `ready=false`, and a rule keyed
+/// on it would keep a database that is serving at `Ready=False` for as long
+/// as the passes after it kept meeting a lock.
+fn is_provisioned(sd: &SharedDatabase, database: &str) -> bool {
+    sd.status.as_ref().and_then(|s| s.database.as_deref()) == Some(database)
+}
+
+/// What a `SharedDatabase` reports when the server cancelled `step` on one of
+/// the session's bounds ([`PgAdminError::ServerCancelled`]). Returns
+/// `(ready, Ready condition)`.
+///
+/// The server ANSWERED, so the two reasons the surrounding arms use are both
+/// false here: the cluster is not "not answering" ([`REASON_AWAITING_CLUSTER`])
+/// and CNPG is not "creating" a database that is already there
+/// ([`REASON_AWAITING_DATABASE`]). The reason names the bound instead:
+/// [`REASON_AWAITING_LOCK`] or [`REASON_STATEMENT_TIMED_OUT`].
+///
+/// A provisioned database ([`is_provisioned`]) reads `Ready=True`, whatever
+/// the pass before said: the server just answered, inside that database or
+/// beside it. Consumer binds gate on `status.ready` (`bind_pg_consumer`), and
+/// the usual cause is a tenant's own migration holding a lock the reader
+/// grants need — so a `Ready=False` would refuse every new consumer claim for
+/// as long as that migration runs, over a database that is up and serving
+/// the consumers it already has. What this pass could not re-assert was in
+/// place as of the last pass that completed it, and every statement is
+/// idempotent; the same judgement `ExtensionUnavailable` makes beside a
+/// `Ready=True`. The reason and message still change, so the condition says
+/// what happened rather than "Provisioned".
+///
+/// A database never provisioned stays `Ready=False`, with the accurate reason.
+pub fn server_cancelled_condition(
+    sd: &SharedDatabase,
+    database: &str,
+    step: &str,
+    bound: ServerBound,
+    err: &PgAdminError,
+    prior: &[SharedDatabaseCondition],
+) -> (bool, SharedDatabaseCondition) {
+    let (reason, what) = match bound {
+        ServerBound::Lock => (
+            REASON_AWAITING_LOCK,
+            "waited on a lock past the session's lock_timeout — another transaction, usually a \
+             consumer's migration, holds a lock it needs",
+        ),
+        ServerBound::Statement => (
+            REASON_STATEMENT_TIMED_OUT,
+            "ran past the session's statement_timeout",
+        ),
+    };
+    if is_provisioned(sd, database) {
+        let message = format!(
+            "{database} is provisioned and serving; {step} {what} ({err}). Retried every 30s; \
+             existing bindings are unaffected."
+        );
+        (true, ready_condition("True", reason, &message, prior))
+    } else {
+        let message = format!("{step} {what} ({err}). Retried every 30s.");
+        (false, ready_condition("False", reason, &message, prior))
+    }
+}
+
+/// What a `SharedDatabase` reports when a call made while `step` got no
+/// answer at all within `pg_client::CALL_TIMEOUT`
+/// ([`PgAdminError::TimedOut`]). Returns `(ready, Ready condition)`.
+///
+/// The reason is [`REASON_AWAITING_CLUSTER`]: what is missing is an answer
+/// from the cluster, not a database CNPG has yet to create
+/// ([`REASON_AWAITING_DATABASE`] would be false in the grants arm).
+///
+/// Unlike a refused dial — the designed `AwaitingCluster` path, which writes
+/// `Ready=False` — a timeout NEVER MOVES `Ready`. A provisioned database
+/// ([`is_provisioned`], the rule [`server_cancelled_condition`] uses) that is
+/// `Ready` stays `Ready=True`: consumer binds gate on it, so a `False` would
+/// refuse every new consumer claim over one silence that says nothing about
+/// whether the database is serving the consumers it already has. Anything
+/// that is not `Ready` stays `False`, because the silence is no evidence that
+/// it serves either — which is also why this rule, unlike the cancelled one,
+/// looks at the `ready` the object already has.
+pub fn call_timed_out_condition(
+    sd: &SharedDatabase,
+    database: &str,
+    cluster: &str,
+    step: &str,
+    err: &PgAdminError,
+    prior: &[SharedDatabaseCondition],
+) -> (bool, SharedDatabaseCondition) {
+    let was_ready = sd.status.as_ref().and_then(|s| s.ready) == Some(true);
+    if was_ready && is_provisioned(sd, database) {
+        let message = format!(
+            "{database} is provisioned; the shared PostgreSQL cluster {cluster} did not answer \
+             while {step} ({err}). Retried every 20s; existing bindings are unaffected."
+        );
+        (
+            true,
+            ready_condition("True", REASON_AWAITING_CLUSTER, &message, prior),
+        )
+    } else {
+        let message = format!(
+            "the shared PostgreSQL cluster {cluster} did not answer while {step} ({err}). \
+             Retried every 20s."
+        );
+        (
+            false,
+            ready_condition("False", REASON_AWAITING_CLUSTER, &message, prior),
+        )
+    }
+}
+
+/// Report a pg call that the server CANCELLED on one of the session's bounds,
+/// or that got NO ANSWER within the call bound, and return the action. `None`
+/// for any other failure, which the calling arm's own designed reason covers.
+///
+/// Both are kept off the designed arms because each would say something false
+/// there — `AwaitingCluster`'s "not answering yet" of a server that answered,
+/// `AwaitingDatabase`'s "waiting for CNPG to create" of a database that
+/// exists — and because those arms write `ready=false` and drop
+/// `ExtensionUnavailable`, which a bound firing must never do to a database
+/// that is serving. This write carries the backing (`None`, see
+/// [`write_status`]) and the `ExtensionUnavailable` finding forward: the pass
+/// learned nothing that contradicts either, and an omitted condition is a
+/// PRUNED one under SSA — which the extension probe's own carry-forward could
+/// not restore later, since it carries only what the object still has.
+async fn report_unfinished_call(
+    ctx: &Arc<Context>,
+    sd: &SharedDatabase,
+    prior: &[SharedDatabaseCondition],
+    database: &str,
+    cluster: &str,
+    step: &str,
+    err: &PgAdminError,
+) -> Result<Option<Action>, ReconcileError> {
+    let (ready, cond, retry) = match err {
+        PgAdminError::ServerCancelled { bound, .. } => {
+            let (ready, cond) = server_cancelled_condition(sd, database, step, *bound, err, prior);
+            (ready, cond, Duration::from_secs(30))
+        }
+        PgAdminError::TimedOut { .. } => {
+            let (ready, cond) = call_timed_out_condition(sd, database, cluster, step, err, prior);
+            (ready, cond, Duration::from_secs(20))
+        }
+        _ => return Ok(None),
+    };
+    let ns = sd.namespace().unwrap_or_default();
+    let name = sd.name_any();
+    warn!(%name, %ns, %step, error = %err, "a shared-database statement did not complete");
+    write_status(
+        ctx,
+        sd,
+        &ns,
+        &name,
+        ready,
+        None,
+        current_ref_count(&ctx.client, &ns, &name).await?,
+        cond,
+        extension_condition_of(prior),
+    )
+    .await?;
+    Ok(Some(Action::requeue(retry)))
 }
 
 /// Which backing a status write carries: the caller's override, or — when
@@ -2038,5 +2256,446 @@ mod tests {
     #[test]
     fn no_extension_condition_when_nothing_is_missing() {
         assert!(extension_unavailable_condition(&[], &[]).is_none());
+    }
+}
+
+/// The pg arm's failure reasons, driven through the real reconcile against a
+/// scripted apiserver and a scripted `PgAdmin` (WI-400). The server-side
+/// bounds `PgClient` now carries make "the server cancelled a statement" an
+/// everyday outcome, and these pin what each kind of failure says on the
+/// object — and that the designed reasons are unchanged.
+#[cfg(test)]
+mod reconcile_pg_tests {
+    use super::*;
+
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
+    use operator_core::{Metrics, SharedDatabaseSpec, SharedDatabaseStatus};
+
+    use crate::pg_client::{PgAdmin, PgAdminError, ServerBound, CALL_TIMEOUT};
+    use crate::route_apiserver::{apiserver, calls_to, route, Reply, Route};
+
+    const STATUS_PATH: &str =
+        "/apis/apprafter.io/v1alpha1/namespaces/apps/shareddatabases/orders/status";
+    const HOST: &str = "platform-postgres-rw.cnpg-system.svc:5432";
+    const T0: &str = "2026-09-01T00:00:00+00:00";
+
+    /// A `PgAdmin` that answers each `execute_all` from a queue, in call
+    /// order: the groups batch first, then the reader grants.
+    struct ScriptedPg(Mutex<VecDeque<Result<(), PgAdminError>>>);
+
+    #[async_trait]
+    impl PgAdmin for ScriptedPg {
+        async fn execute_all(&self, _dsn: &str, _s: &[String]) -> Result<(), PgAdminError> {
+            self.0
+                .lock()
+                .expect("script")
+                .pop_front()
+                .expect("an execute_all the test did not script")
+        }
+        async fn extension_available(&self, _dsn: &str, _e: &str) -> Result<bool, PgAdminError> {
+            Ok(true)
+        }
+    }
+
+    fn lock_timeout(index: usize) -> PgAdminError {
+        PgAdminError::ServerCancelled {
+            index,
+            total: 7,
+            host: HOST.into(),
+            bound: ServerBound::Lock,
+            cause: "canceling statement due to lock timeout".into(),
+        }
+    }
+
+    fn statement_timeout(index: usize) -> PgAdminError {
+        PgAdminError::ServerCancelled {
+            index,
+            total: 7,
+            host: HOST.into(),
+            bound: ServerBound::Statement,
+            cause: "canceling statement due to statement timeout".into(),
+        }
+    }
+
+    fn unreachable() -> PgAdminError {
+        PgAdminError::ConnectionLost { host: HOST.into() }
+    }
+
+    fn cond(type_: &str, status: &str, reason: &str, message: &str) -> SharedDatabaseCondition {
+        SharedDatabaseCondition {
+            type_: type_.into(),
+            status: status.into(),
+            last_transition_time: T0.into(),
+            reason: Some(reason.into()),
+            message: Some(message.into()),
+        }
+    }
+
+    /// `apps/orders`, type pg, finalizer already on, with `status`.
+    fn shared_db(status: Option<SharedDatabaseStatus>) -> Arc<SharedDatabase> {
+        let mut sd = SharedDatabase::new(
+            "orders",
+            SharedDatabaseSpec {
+                type_: "pg".into(),
+                ..Default::default()
+            },
+        );
+        sd.metadata.namespace = Some("apps".into());
+        sd.metadata.finalizers = Some(vec![SD_FINALIZER.into()]);
+        sd.status = status;
+        Arc::new(sd)
+    }
+
+    /// Ready and serving, with an extension warning a pass that does not
+    /// re-probe must carry forward.
+    fn serving() -> SharedDatabaseStatus {
+        SharedDatabaseStatus {
+            ready: Some(true),
+            ref_count: Some(2),
+            database: Some("shd_apps_orders".into()),
+            instance: Some("platform-postgres".into()),
+            dbnum: None,
+            conditions: Some(vec![
+                cond(
+                    COND_READY,
+                    "True",
+                    "Provisioned",
+                    "shd_apps_orders in platform-postgres",
+                ),
+                cond(
+                    COND_EXTENSION_UNAVAILABLE,
+                    "True",
+                    "NotInOperandImage",
+                    "the running PostgreSQL image does not provide: vector",
+                ),
+            ]),
+        }
+    }
+
+    /// Provisioned, but the last pass met a refused dial and wrote the
+    /// designed `AwaitingCluster` with `ready=false`.
+    fn after_a_transient_failure() -> SharedDatabaseStatus {
+        SharedDatabaseStatus {
+            ready: Some(false),
+            conditions: Some(vec![cond(
+                COND_READY,
+                "False",
+                REASON_AWAITING_CLUSTER,
+                "the shared PostgreSQL cluster platform-postgres is not answering yet",
+            )]),
+            ..serving()
+        }
+    }
+
+    fn silent() -> PgAdminError {
+        PgAdminError::TimedOut {
+            host: HOST.into(),
+            after: CALL_TIMEOUT,
+        }
+    }
+
+    fn extension_warning_of(status: &Value) -> Option<&Value> {
+        status["conditions"]
+            .as_array()
+            .expect("conditions")
+            .iter()
+            .find(|c| c["type"] == COND_EXTENSION_UNAVAILABLE)
+    }
+
+    /// Every apiserver request the pg arm makes up to its status write.
+    fn pg_arm_routes() -> Vec<Route> {
+        let cluster = json!({
+            "apiVersion": "postgresql.cnpg.io/v1", "kind": "Cluster",
+            "metadata": { "name": "platform-postgres", "namespace": "cnpg-system", "resourceVersion": "7" },
+            "spec": { "instances": 1 },
+        });
+        let cluster_path =
+            "/apis/postgresql.cnpg.io/v1/namespaces/cnpg-system/clusters/platform-postgres";
+        vec![
+            route(
+                "GET",
+                "/apis/apprafter.io/v1alpha1/serviceproviders",
+                Reply::Json(
+                    200,
+                    json!({
+                        "apiVersion": "apprafter.io/v1alpha1", "kind": "ServiceProviderList",
+                        "metadata": { "resourceVersion": "1" },
+                        "items": [{
+                            "apiVersion": "apprafter.io/v1alpha1", "kind": "ServiceProvider",
+                            "metadata": { "name": "pg-shared", "namespace": "apprafter-system" },
+                            "spec": { "type": "pg", "backend": "cloudnative-pg" },
+                        }],
+                    }),
+                ),
+            ),
+            route("PATCH", cluster_path, Reply::Json(200, cluster.clone())),
+            route("GET", cluster_path, Reply::Json(200, cluster.clone())),
+            route("PUT", cluster_path, Reply::Json(200, cluster)),
+            route(
+                "GET",
+                "/api/v1/namespaces/cnpg-system/secrets/platform-postgres-apprafter-admin",
+                Reply::Json(
+                    200,
+                    json!({
+                        "apiVersion": "v1", "kind": "Secret",
+                        "metadata": { "name": "platform-postgres-apprafter-admin", "namespace": "cnpg-system" },
+                        "data": { "password": "cHc=" },
+                    }),
+                ),
+            ),
+            route(
+                "PATCH",
+                "/apis/postgresql.cnpg.io/v1/namespaces/cnpg-system/databases/shd-apps-orders",
+                Reply::Json(
+                    200,
+                    json!({
+                        "apiVersion": "postgresql.cnpg.io/v1", "kind": "Database",
+                        "metadata": { "name": "shd-apps-orders", "namespace": "cnpg-system" },
+                        "spec": {},
+                    }),
+                ),
+            ),
+            route(
+                "GET",
+                "/apis/apprafter.io/v1alpha1/namespaces/apps/resourceclaims",
+                Reply::Json(
+                    200,
+                    json!({
+                        "apiVersion": "apprafter.io/v1alpha1", "kind": "ResourceClaimList",
+                        "metadata": { "resourceVersion": "1" }, "items": [],
+                    }),
+                ),
+            ),
+            route(
+                "PATCH",
+                STATUS_PATH,
+                Reply::Json(
+                    200,
+                    json!({
+                        "apiVersion": "apprafter.io/v1alpha1", "kind": "SharedDatabase",
+                        "metadata": { "name": "orders", "namespace": "apps" },
+                        "spec": { "type": "pg" },
+                    }),
+                ),
+            ),
+        ]
+    }
+
+    /// Reconcile `sd` once with `pg` answering the SQL; return the action and
+    /// the `status` of the one status write.
+    async fn reconcile_once(
+        sd: Arc<SharedDatabase>,
+        pg: Vec<Result<(), PgAdminError>>,
+    ) -> (Action, Value) {
+        let (client, log) = apiserver(pg_arm_routes());
+        let mut ctx = Context::new(client, Arc::new(Metrics::new()));
+        ctx.pg = Arc::new(ScriptedPg(Mutex::new(pg.into())));
+        let action = reconcile_shared_database(sd, Arc::new(ctx))
+            .await
+            .expect("every pg failure here is reported on the object, not returned");
+        let writes = calls_to(&log, "PATCH", STATUS_PATH);
+        assert_eq!(writes.len(), 1, "exactly one status write: {writes:?}");
+        (action, writes[0].body["status"].clone())
+    }
+
+    fn ready_of(status: &Value) -> &Value {
+        status["conditions"]
+            .as_array()
+            .expect("conditions")
+            .iter()
+            .find(|c| c["type"] == COND_READY)
+            .expect("a Ready condition")
+    }
+
+    #[tokio::test]
+    async fn a_lock_timeout_on_a_serving_database_keeps_it_ready_and_says_why() {
+        let (action, status) = reconcile_once(
+            shared_db(Some(serving())),
+            vec![Ok(()), Err(lock_timeout(3))],
+        )
+        .await;
+
+        assert_eq!(action, Action::requeue(Duration::from_secs(30)));
+        // Ready stays: consumer binds gate on it, and the database is serving.
+        assert_eq!(status["ready"], json!(true));
+        // Nothing is pruned: the backing and the extension finding ride along.
+        assert_eq!(status["database"], json!("shd_apps_orders"));
+        assert_eq!(status["instance"], json!("platform-postgres"));
+        assert_eq!(
+            extension_warning_of(&status).map(|c| c["status"].clone()),
+            Some(json!("True"))
+        );
+        let ready = ready_of(&status);
+        assert_eq!(ready["status"], "True");
+        assert_eq!(ready["reason"], "AwaitingLock");
+        // Same (type, status) → the transition time is kept, so the write is
+        // not a fresh change on every pass.
+        assert_eq!(ready["lastTransitionTime"], T0);
+        let message = ready["message"].as_str().expect("message");
+        assert!(message.contains("lock timeout"), "{message}");
+        assert!(message.contains("granting the reader group"), "{message}");
+        assert!(!message.contains("waiting for CNPG to create"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_lock_wait_after_a_transient_failure_still_reads_the_database_as_serving() {
+        // One refused dial wrote ready=false. The lock waits that follow are
+        // the server ANSWERING inside a database it has: they must not keep
+        // the database unready for the length of a tenant's migration.
+        let (_, status) = reconcile_once(
+            shared_db(Some(after_a_transient_failure())),
+            vec![Ok(()), Err(lock_timeout(3))],
+        )
+        .await;
+
+        assert_eq!(status["ready"], json!(true));
+        let ready = ready_of(&status);
+        assert_eq!(ready["status"], "True");
+        assert_eq!(ready["reason"], "AwaitingLock");
+    }
+
+    #[tokio::test]
+    async fn a_lock_timeout_before_the_first_ready_is_not_cnpg_creating_the_database() {
+        let (action, status) =
+            reconcile_once(shared_db(None), vec![Ok(()), Err(lock_timeout(3))]).await;
+
+        assert_eq!(action, Action::requeue(Duration::from_secs(30)));
+        assert_eq!(status["ready"], json!(false));
+        let ready = ready_of(&status);
+        assert_eq!(ready["status"], "False");
+        // `Awaiting…`: it clears when the lock holder commits, and the Argo CD
+        // health script reads that prefix as Progressing, not Degraded.
+        assert_eq!(ready["reason"], "AwaitingLock");
+        let message = ready["message"].as_str().expect("message");
+        assert!(!message.contains("waiting for CNPG to create"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_server_cancelled_group_batch_is_not_an_unanswering_cluster() {
+        let (action, status) = reconcile_once(shared_db(None), vec![Err(lock_timeout(1))]).await;
+
+        assert_eq!(action, Action::requeue(Duration::from_secs(30)));
+        let ready = ready_of(&status);
+        assert_eq!(ready["reason"], "AwaitingLock");
+        let message = ready["message"].as_str().expect("message");
+        assert!(message.contains("creating the groups"), "{message}");
+        assert!(!message.contains("not answering"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_statement_timeout_is_not_reported_as_a_lock_wait() {
+        // A statement that runs past statement_timeout on its own may do so on
+        // every pass: it gets a reason that is NOT `Awaiting…`, so a database
+        // that never comes up this way reads Degraded and asks for a person.
+        let (_, never_ready) =
+            reconcile_once(shared_db(None), vec![Ok(()), Err(statement_timeout(3))]).await;
+        let ready = ready_of(&never_ready);
+        assert_eq!(ready["status"], "False");
+        assert_eq!(ready["reason"], "StatementTimedOut");
+
+        // …and a serving database still keeps Ready.
+        let (_, serving_db) = reconcile_once(
+            shared_db(Some(serving())),
+            vec![Ok(()), Err(statement_timeout(3))],
+        )
+        .await;
+        assert_eq!(serving_db["ready"], json!(true));
+        assert_eq!(ready_of(&serving_db)["reason"], "StatementTimedOut");
+    }
+
+    #[tokio::test]
+    async fn a_silent_server_during_the_grants_keeps_a_serving_database_and_prunes_nothing() {
+        let (action, status) =
+            reconcile_once(shared_db(Some(serving())), vec![Ok(()), Err(silent())]).await;
+
+        assert_eq!(action, Action::requeue(Duration::from_secs(20)));
+        // A timeout never moves Ready, and never prunes: the backing and the
+        // extension finding ride the write exactly as the object had them.
+        assert_eq!(status["ready"], json!(true));
+        assert_eq!(status["database"], json!("shd_apps_orders"));
+        assert_eq!(status["instance"], json!("platform-postgres"));
+        let warning = extension_warning_of(&status).expect("ExtensionUnavailable is carried");
+        assert_eq!(warning["status"], "True");
+        assert_eq!(warning["reason"], "NotInOperandImage");
+        let ready = ready_of(&status);
+        assert_eq!(ready["status"], "True");
+        assert_eq!(ready["reason"], REASON_AWAITING_CLUSTER);
+        assert_eq!(ready["lastTransitionTime"], T0);
+        let message = ready["message"].as_str().expect("message");
+        assert!(message.contains("did not answer"), "{message}");
+        assert!(message.contains("granting the reader group"), "{message}");
+        assert!(!message.contains("waiting for CNPG to create"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_silent_server_while_creating_the_groups_prunes_nothing_either() {
+        let (action, status) =
+            reconcile_once(shared_db(Some(serving())), vec![Err(silent())]).await;
+
+        assert_eq!(action, Action::requeue(Duration::from_secs(20)));
+        assert_eq!(status["ready"], json!(true));
+        assert_eq!(status["database"], json!("shd_apps_orders"));
+        assert_eq!(
+            extension_warning_of(&status).map(|c| c["status"].clone()),
+            Some(json!("True"))
+        );
+        let ready = ready_of(&status);
+        assert_eq!(ready["reason"], REASON_AWAITING_CLUSTER);
+        let message = ready["message"].as_str().expect("message");
+        assert!(message.contains("creating the groups"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_silent_server_never_makes_a_database_ready() {
+        // The silence is no evidence either way: a database that was not
+        // Ready stays not Ready, with the same transition time.
+        let (_, status) = reconcile_once(
+            shared_db(Some(after_a_transient_failure())),
+            vec![Err(silent())],
+        )
+        .await;
+
+        assert_eq!(status["ready"], json!(false));
+        assert_eq!(status["database"], json!("shd_apps_orders"));
+        let ready = ready_of(&status);
+        assert_eq!(ready["status"], "False");
+        assert_eq!(ready["reason"], REASON_AWAITING_CLUSTER);
+        assert_eq!(ready["lastTransitionTime"], T0);
+        let message = ready["message"].as_str().expect("message");
+        assert!(message.contains("did not answer"), "{message}");
+    }
+
+    // --- the designed reasons, unchanged ---
+
+    #[tokio::test]
+    async fn an_unreachable_cluster_is_still_awaiting_cluster() {
+        let (action, status) = reconcile_once(shared_db(None), vec![Err(unreachable())]).await;
+
+        assert_eq!(action, Action::requeue(Duration::from_secs(20)));
+        assert_eq!(status["ready"], json!(false));
+        let ready = ready_of(&status);
+        assert_eq!(ready["reason"], REASON_AWAITING_CLUSTER);
+        assert_eq!(
+            ready["message"],
+            "the shared PostgreSQL cluster platform-postgres is not answering yet"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_database_cnpg_has_not_created_is_still_awaiting_database() {
+        let (action, status) =
+            reconcile_once(shared_db(None), vec![Ok(()), Err(unreachable())]).await;
+
+        assert_eq!(action, Action::requeue(Duration::from_secs(20)));
+        assert_eq!(status["ready"], json!(false));
+        let ready = ready_of(&status);
+        assert_eq!(ready["reason"], REASON_AWAITING_DATABASE);
+        assert_eq!(
+            ready["message"],
+            "waiting for CNPG to create shd_apps_orders in platform-postgres"
+        );
     }
 }

@@ -2238,6 +2238,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-postgres",
+ "tower",
  "tracing",
 ]
 

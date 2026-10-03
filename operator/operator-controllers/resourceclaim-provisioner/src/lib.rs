@@ -82,6 +82,9 @@ pub mod shared_database;
 pub mod shared_pg;
 pub mod shared_volume;
 
+#[cfg(test)]
+mod route_apiserver;
+
 use nats_client::{NatsAdmin, NatsClient};
 use operator_core::capacity::CapacityCache;
 use pg_client::{PgAdmin, PgClient};

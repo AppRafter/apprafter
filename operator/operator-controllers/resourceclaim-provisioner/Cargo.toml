@@ -59,3 +59,7 @@ operator-core = { path = "../../operator-core", features = ["testing"] }
 # already reach this crate through tokio-postgres; they are named so the
 # tests do not depend on that.
 tokio         = { workspace = true, features = ["test-util", "net", "io-util"] }
+# WI-400: `src/route_apiserver.rs` answers a reconcile's requests from a route
+# table through a `tower::service_fn` — `kube::Client` is a thin wrapper over
+# a `tower::Service`, so the real client runs with no cluster.
+tower = { workspace = true }
