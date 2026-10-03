@@ -79,6 +79,24 @@ const DEFAULT_DISK_STORAGE_CLASS: &str = "local-path";
 /// referenced `SharedVolume` is absent or not yet `status.ready` (2.6c).
 const REASON_AWAITING_SHARED_VOLUME: &str = "AwaitingSharedVolume";
 
+/// `Ready=False` reason while a dragonfly claim or shared cache is waiting for
+/// a `$N` of its own (WI-402). Self-clearing — the `Awaiting` prefix the Argo
+/// CD health scripts read as Progressing. A shared cache carries it from its
+/// allocation checkpoint until it has checked and flushed that number; a claim
+/// or shared cache carries it after releasing a number it found someone else
+/// holding (named in the message), until its next pass allocates another.
+pub(crate) const REASON_AWAITING_KEYSPACE: &str = "AwaitingKeyspace";
+
+/// `Ready=False` reason when a persistent reattach finds the `$N` that holds
+/// its retained data also held by something else (WI-402) — a claim, a
+/// retention snapshot or a shared database, named in the message. The
+/// allocator reserves every holder it can see, so this follows a write it
+/// could not see: a reconcile dropped mid-request whose allocation committed
+/// late. The claim keeps its number, since that number IS its retained data,
+/// and stays not ready until a person resolves the overlap; nothing is flushed
+/// and no ACL user is created on it.
+pub(crate) const REASON_DBNUM_CONFLICT: &str = "DbnumConflict";
+
 /// How many times to retry the read-modify-write of the shared Cluster's
 /// unkeyed `spec.managed.roles` list when the GET→replace races another
 /// claim's provisioner pass (HTTP 409 Conflict).
@@ -1158,6 +1176,78 @@ async fn provision_dragonfly(
     let user = dragonfly::acl_user(ns, name);
     let claim_pw = generate_password();
 
+    // WI-402: the last read before this pass touches the keyspace. One LIST
+    // before the checkpoint does not make this `$N` ours — a reconcile
+    // dropped mid-request can commit its own checkpoint onto the same number
+    // after that LIST — so re-read every holder now, on BOTH branches: a
+    // FLUSHDB would wipe the other holder's data, and an ACL user pinned to
+    // their `$N` would read it.
+    let others = dbnum_holders_besides(
+        &ctx.client,
+        &instance,
+        dbnum,
+        dragonfly::DbnumOwner::Claim {
+            namespace: ns,
+            name,
+        },
+    )
+    .await?;
+    if !others.is_empty() {
+        // Which of two holders gives way. A number this pass was about to
+        // FLUSHDB holds nothing of this claim's own yet, so it lets go: the
+        // status apply below leaves `instance`/`dbnum` out, which prunes the
+        // checkpoint, and the next pass allocates around the other holder.
+        // Without that, two claims checkpointed on one number would each
+        // refuse forever. An ephemeral reattach also cancels its own
+        // snapshot, which retains nothing and would otherwise send the next
+        // pass straight back to this number. A persistent reattach
+        // (`skip_flush`) is the one holder that may not move — its number IS
+        // the retained data — so it re-sends its checkpoint (nothing is
+        // pruned) and refuses until a person resolves the overlap.
+        let (reason, allocation, outcome) = if skip_flush {
+            (
+                REASON_DBNUM_CONFLICT,
+                Some((instance.as_str(), dbnum)),
+                "it holds the data this claim is re-attaching to, so the claim keeps it \
+                 and stays not ready; nothing was flushed and no ACL user was created on it",
+            )
+        } else {
+            if reattached {
+                if let Err(e) = rc_api.delete(&object_name, &DeleteParams::default()).await {
+                    if !matches!(&e, kube::Error::Api(ae) if ae.code == 404) {
+                        return Err(e.into());
+                    }
+                }
+            }
+            (
+                REASON_AWAITING_KEYSPACE,
+                None,
+                "this claim had not used it yet, so it released it and takes another \
+                 number on its next attempt",
+            )
+        };
+        let message = format!(
+            "dragonfly {instance} ${dbnum} is also held by {}; {outcome}",
+            others.join(", ")
+        );
+        let prior: Vec<ResourceClaimCondition> = claim
+            .status
+            .as_ref()
+            .and_then(|s| s.conditions.clone())
+            .unwrap_or_default();
+        patch_status(
+            &ctx.client,
+            ns,
+            name,
+            ready_condition("False", reason, &message, &prior),
+            ClaimStatusFields {
+                allocation,
+                ..Default::default()
+            },
+        )
+        .await?;
+        return Err(ReconcileError::Provisioning(message));
+    }
     if skip_flush {
         info!(
             %name, %ns, %instance, dbnum,
@@ -2871,6 +2961,37 @@ async fn read_admin_password(
     admin_secret_name: &str,
 ) -> Result<String, ReconcileError> {
     crate::acl_reconcile::read_secret_key(ctx, df_ns, admin_secret_name, "password").await
+}
+
+/// Everything other than `me` holding `(instance, dbnum)`, read FRESH from
+/// the apiserver right before a `FLUSHDB` (WI-402). Empty = `me` holds it
+/// exclusively.
+///
+/// Fresh means three quorum LISTs (`ListParams::default()` sends no
+/// `resourceVersion`), never a cache: a stale read here does not look stale,
+/// it looks like "nobody else", and the next command wipes a keyspace. An
+/// apiserver error propagates — an unknown answer is never a "go".
+pub(crate) async fn dbnum_holders_besides(
+    client: &Client,
+    instance: &str,
+    dbnum: u16,
+    me: dragonfly::DbnumOwner<'_>,
+) -> Result<Vec<String>, ReconcileError> {
+    let live = Api::<ResourceClaim>::all(client.clone())
+        .list(&Default::default())
+        .await?
+        .items;
+    let retained = Api::<RetainedClaim>::namespaced(client.clone(), RETAINED_CLAIM_NAMESPACE)
+        .list(&Default::default())
+        .await?
+        .items;
+    let shared = Api::<operator_core::SharedDatabase>::all(client.clone())
+        .list(&Default::default())
+        .await?
+        .items;
+    Ok(dragonfly::other_dbnum_holders(
+        &live, &retained, &shared, instance, dbnum, me,
+    ))
 }
 
 /// SSA-patch ONLY the dragonfly allocation fields (`status.instance` /

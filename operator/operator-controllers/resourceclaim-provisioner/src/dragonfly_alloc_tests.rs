@@ -324,3 +324,197 @@ async fn the_gc_still_deletes_an_expired_ephemeral_snapshot_of_a_claim_not_yet_r
         .expect("gc pass");
     assert!(api.retained(&cnpg::k8s_name(NS, "web-redis")).is_none());
 }
+
+// ---- (2) every FLUSHDB re-checks that nobody else holds the $N ----
+
+/// A ready shared cache holding `$dbnum` on `instance`.
+fn shared_on(name: &str, instance: &str, dbnum: u16) -> Value {
+    json!({
+        "apiVersion": "apprafter.io/v1alpha1", "kind": "SharedDatabase",
+        "metadata": { "name": name, "namespace": NS },
+        "spec": { "type": "redis" },
+        "status": { "ready": true, "instance": instance, "dbnum": dbnum },
+    })
+}
+
+/// `(reason, message)` of the stored claim's `Ready` condition.
+fn ready_reason(api: &FakeApiserver, name: &str) -> (String, String) {
+    let claim = api.claim(NS, name);
+    let ready = claim["status"]["conditions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|c| c["type"] == "Ready")
+        .cloned()
+        .unwrap_or(Value::Null);
+    (
+        ready["reason"].as_str().unwrap_or_default().to_string(),
+        ready["message"].as_str().unwrap_or_default().to_string(),
+    )
+}
+
+#[tokio::test]
+async fn a_late_committed_allocation_on_the_same_dbnum_blocks_the_flush_and_moves_the_claim() {
+    // cart-redis's reconcile was dropped mid-checkpoint; its write commits
+    // after web-redis's allocation LIST, onto the same $0.
+    let api = api();
+    api.put_claim(claim("web-redis", false, None)).commit_late(
+        |c| c.is_status_patch("resourceclaims", "web-redis"),
+        claim("cart-redis", false, Some((EPHEMERAL, 0))),
+    );
+    let redis = Arc::new(FakeRedis::default());
+    let err = reconcile_stored(&api, "web-redis", redis.clone())
+        .await
+        .expect_err("a shared $N must not be provisioned");
+    let msg = err.to_string();
+    assert!(matches!(err, ReconcileError::Provisioning(_)), "{msg}");
+    assert!(msg.contains("ResourceClaim apps/cart-redis"), "{msg}");
+    assert!(
+        flushed(&redis).is_empty(),
+        "flushed a $N another claim holds"
+    );
+    assert!(
+        redis.setuser_calls.lock().unwrap().is_empty(),
+        "no ACL user on it either"
+    );
+    // The number held nothing of web-redis's own yet, so it lets go of it —
+    // and says so on the claim, where `app status` shows it. Self-clearing,
+    // so an `Awaiting` reason.
+    let status = api.claim(NS, "web-redis")["status"].clone();
+    assert_eq!(status["dbnum"], Value::Null, "the checkpoint is released");
+    assert_eq!(status["instance"], Value::Null);
+    assert_eq!(status["ready"], false);
+    let (reason, message) = ready_reason(&api, "web-redis");
+    assert_eq!(reason, "AwaitingKeyspace");
+    assert!(
+        message.contains("ResourceClaim apps/cart-redis"),
+        "{message}"
+    );
+
+    // The next pass allocates around the other holder.
+    let retry = Arc::new(FakeRedis::default());
+    reconcile_stored(&api, "web-redis", retry.clone())
+        .await
+        .expect("provisions on another $N");
+    assert_eq!(
+        flushed(&retry),
+        vec![(dragonfly::instance_addr(EPHEMERAL, DF_NS), 1)]
+    );
+    assert_eq!(api.claim(NS, "web-redis")["status"]["dbnum"], 1);
+    assert_eq!(api.claim(NS, "cart-redis")["status"]["dbnum"], 0);
+}
+
+#[tokio::test]
+async fn two_fresh_checkpoints_on_one_dbnum_end_with_one_holder_each() {
+    // Two late commits left web-redis and cart-redis both checkpointed on
+    // $0, neither ready. Whichever checks first lets go; the other provisions
+    // $0; the first then takes $1. Nothing flushes $0 after its holder is
+    // ready.
+    let api = api();
+    api.put_claim(claim("web-redis", false, Some((EPHEMERAL, 0))))
+        .put_claim(claim("cart-redis", false, Some((EPHEMERAL, 0))));
+    let redis = Arc::new(FakeRedis::default());
+    for _round in 0..3 {
+        for name in ["web-redis", "cart-redis"] {
+            // A pass may refuse; a ready claim's pass provisions nothing.
+            let _ = reconcile_stored(&api, name, redis.clone()).await;
+        }
+    }
+    let addr = dragonfly::instance_addr(EPHEMERAL, DF_NS);
+    for (name, dbnum) in [("cart-redis", 0), ("web-redis", 1)] {
+        let status = api.claim(NS, name)["status"].clone();
+        assert_eq!(status["ready"], true, "{name}");
+        assert_eq!(status["dbnum"], dbnum, "{name}");
+    }
+    assert_eq!(
+        flushed(&redis),
+        vec![(addr.clone(), 0), (addr, 1)],
+        "each $N is flushed once, before its holder is ready"
+    );
+}
+
+#[tokio::test]
+async fn a_fresh_checkpoint_on_a_dbnum_a_snapshot_reserves_moves_off_it() {
+    // gone-redis's snapshot reserves $5 for its grace; a late commit put
+    // web-redis's fresh checkpoint on it anyway. Waiting would hold
+    // web-redis back until the snapshot's GC; moving costs nothing.
+    let api = api();
+    api.put_claim(claim("web-redis", false, Some((EPHEMERAL, 5))))
+        .put_retained(retained("gone-redis", EPHEMERAL, 5, IN_GRACE));
+    let redis = Arc::new(FakeRedis::default());
+    let err = reconcile_stored(&api, "web-redis", redis.clone())
+        .await
+        .expect_err("a reserved $N must not be provisioned");
+    assert!(
+        err.to_string()
+            .contains("RetainedClaim claim-apps-gone-redis (of apps/gone-redis)"),
+        "{err}"
+    );
+    reconcile_stored(&api, "web-redis", redis.clone())
+        .await
+        .expect("provisions on a free $N");
+    assert_eq!(
+        flushed(&redis),
+        vec![(dragonfly::instance_addr(EPHEMERAL, DF_NS), 0)]
+    );
+    assert!(api.retained(&cnpg::k8s_name(NS, "gone-redis")).is_some());
+}
+
+#[tokio::test]
+async fn a_persistent_reattach_onto_a_dbnum_someone_else_holds_keeps_it_and_refuses() {
+    // No FLUSHDB on this branch, but an ACL user pinned to $7 would read the
+    // other holder's keys just the same. And $7 is the retained data, so this
+    // claim is the one holder that must not move off it.
+    let api = api();
+    api.put_claim(claim("web-redis", true, None))
+        .put_retained(retained("web-redis", PERSISTENT, 7, IN_GRACE))
+        .put_shared(shared_on("orders", PERSISTENT, 7));
+    let redis = Arc::new(FakeRedis::default());
+    for _pass in 0..2 {
+        let err = reconcile_stored(&api, "web-redis", redis.clone())
+            .await
+            .expect_err("a shared $N must not be provisioned");
+        assert!(
+            err.to_string().contains("SharedDatabase apps/orders"),
+            "{err}"
+        );
+    }
+    assert!(redis.setuser_calls.lock().unwrap().is_empty());
+    assert!(flushed(&redis).is_empty());
+    let status = api.claim(NS, "web-redis")["status"].clone();
+    assert_eq!(
+        status["instance"], PERSISTENT,
+        "the reattach keeps its number"
+    );
+    assert_eq!(status["dbnum"], 7);
+    // Not self-clearing: a person has to resolve it.
+    let (reason, message) = ready_reason(&api, "web-redis");
+    assert_eq!(reason, "DbnumConflict");
+    assert!(message.contains("SharedDatabase apps/orders"), "{message}");
+    assert!(api.retained(&cnpg::k8s_name(NS, "web-redis")).is_some());
+}
+
+#[tokio::test]
+async fn an_ephemeral_reattach_onto_a_held_dbnum_cancels_its_snapshot_and_allocates_fresh() {
+    // An ephemeral snapshot retains nothing, so its number is not worth
+    // waiting for. Keeping the snapshot would send every later pass straight
+    // back to the same reattach and the same refusal.
+    let api = api();
+    api.put_claim(claim("web-redis", false, None))
+        .put_retained(retained("web-redis", EPHEMERAL, 4, IN_GRACE))
+        .put_shared(shared_on("orders", EPHEMERAL, 4));
+    let redis = Arc::new(FakeRedis::default());
+    reconcile_stored(&api, "web-redis", redis.clone())
+        .await
+        .expect_err("a shared $N must not be provisioned");
+    assert!(flushed(&redis).is_empty());
+    assert!(api.retained(&cnpg::k8s_name(NS, "web-redis")).is_none());
+    reconcile_stored(&api, "web-redis", redis.clone())
+        .await
+        .expect("provisions on a free $N");
+    assert_eq!(
+        flushed(&redis),
+        vec![(dragonfly::instance_addr(EPHEMERAL, DF_NS), 0)]
+    );
+    assert_eq!(api.claim(NS, "web-redis")["status"]["dbnum"], 0);
+}
