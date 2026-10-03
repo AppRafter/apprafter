@@ -21,6 +21,8 @@ pub mod serviceprovider;
 pub mod shareddatabase;
 pub mod sharedvolume;
 pub mod sourcecredential;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 
 pub use application::{
     image_repo, AppResources, Application, ApplicationBaseSpec, ApplicationCondition,
