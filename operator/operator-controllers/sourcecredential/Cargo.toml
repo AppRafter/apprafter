@@ -63,3 +63,6 @@ http  = { workspace = true }
 # next timer whenever nothing can run — a peer that never answers costs no
 # wall time, and the moment a probe or a pass gives up is exact.
 tokio = { workspace = true, features = ["net", "io-util", "test-util"] }
+# `operator_core::testing::stalled_client()` — a kube `Client` whose every
+# request stays pending forever — for the half-budget and deadline tests.
+operator-core = { path = "../../operator-core", features = ["testing"] }
