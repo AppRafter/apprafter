@@ -54,4 +54,8 @@ admission-webhook = { path = "../../admission-webhook" }
 # request and never answers — on a paused clock (`test-util`), so a 120s
 # deadline elapses in no wall time and the moment it fires is exact.
 operator-core = { path = "../../operator-core", features = ["testing"] }
-tokio         = { workspace = true, features = ["test-util"] }
+# `net` + `io-util` (WI-400, pg_client's bound tests): the scripted PostgreSQL
+# server those tests run is a `TcpListener` the real `PgClient` dials. Both
+# already reach this crate through tokio-postgres; they are named so the
+# tests do not depend on that.
+tokio         = { workspace = true, features = ["test-util", "net", "io-util"] }
