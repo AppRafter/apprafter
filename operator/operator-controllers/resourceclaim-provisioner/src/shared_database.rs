@@ -455,7 +455,14 @@ pub async fn reconcile_shared_database_with_deadline(
     )
     .await;
     if let Err(ReconcileError::TimedOut(timed_out)) = &outcome {
-        crate::deadline_event::publish(&ctx.client, sd.object_ref(&()), KIND, *timed_out).await;
+        operator_core::deadline_event::publish(
+            &ctx.client,
+            crate::REPORTER_CONTROLLER,
+            sd.object_ref(&()),
+            KIND,
+            *timed_out,
+        )
+        .await;
     }
     outcome
 }
@@ -3204,7 +3211,7 @@ mod deadline_tests {
         }
         assert_eq!(
             started.elapsed(),
-            RECONCILE_DEADLINE + crate::deadline_event::PUBLISH_BOUND
+            RECONCILE_DEADLINE + operator_core::deadline_event::PUBLISH_BOUND
         );
     }
 
@@ -3306,6 +3313,10 @@ mod deadline_tests {
         assert_eq!(last.path, EVENTS);
         assert_eq!(last.body["reason"], json!("ReconcileTimedOut"));
         assert_eq!(last.body["regarding"]["kind"], json!("SharedDatabase"));
+        assert_eq!(
+            last.body["reportingController"],
+            json!("apprafter-resourceclaim-provisioner")
+        );
     }
 
     #[tokio::test]

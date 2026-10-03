@@ -508,7 +508,14 @@ pub async fn reconcile_shared_volume_with_deadline(
         note_unsettled(&ctx, &sv.namespace().unwrap_or_default(), &sv.name_any());
     }
     if let Err(ReconcileError::TimedOut(timed_out)) = &outcome {
-        crate::deadline_event::publish(&ctx.client, sv.object_ref(&()), KIND, *timed_out).await;
+        operator_core::deadline_event::publish(
+            &ctx.client,
+            crate::REPORTER_CONTROLLER,
+            sv.object_ref(&()),
+            KIND,
+            *timed_out,
+        )
+        .await;
     }
     outcome
 }
@@ -1751,7 +1758,7 @@ mod deadline_tests {
         }
         assert_eq!(
             started.elapsed(),
-            RECONCILE_DEADLINE + crate::deadline_event::PUBLISH_BOUND
+            RECONCILE_DEADLINE + operator_core::deadline_event::PUBLISH_BOUND
         );
     }
 
@@ -1786,6 +1793,10 @@ mod deadline_tests {
         assert_eq!(methods, vec!["GET", "PATCH", "POST"], "{log:#?}");
         assert_eq!(log[2].body["reason"], json!("ReconcileTimedOut"));
         assert_eq!(log[2].body["regarding"]["kind"], json!("SharedVolume"));
+        assert_eq!(
+            log[2].body["reportingController"],
+            json!("apprafter-resourceclaim-provisioner")
+        );
     }
 
     #[tokio::test]

@@ -67,7 +67,6 @@ use operator_core::{Metrics, ResourceClaim, SharedDatabase, SharedVolume};
 
 pub mod acl_reconcile;
 pub mod cnpg;
-mod deadline_event;
 pub mod disk;
 pub mod dragonfly;
 #[cfg(test)]
@@ -96,6 +95,13 @@ use pg_client::{PgAdmin, PgClient};
 use redis_client::{RedisAdmin, RedisClient};
 
 pub(crate) const KIND: &str = "ResourceClaim";
+
+/// The `reportingController` of the `ReconcileTimedOut` Warning Event a
+/// deadline-cut pass of any controller in this crate leaves on its object
+/// (`operator_core::deadline_event`) — the same one the claim's and the
+/// SharedVolume's own Events carry, and distinct from the scheduler's, so a
+/// reader can tell which controller's pass was cut.
+pub(crate) const REPORTER_CONTROLLER: &str = "apprafter-resourceclaim-provisioner";
 
 /// SSA field manager for everything this controller owns
 /// (`status.ready` / `status.connectionSecretRef` / the `Ready`

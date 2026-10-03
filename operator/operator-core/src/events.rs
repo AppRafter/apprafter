@@ -52,23 +52,24 @@ impl ObjectRecorder {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use kube::client::Body;
     use kube::runtime::events::EventType;
     use serde_json::{json, Value};
     use std::sync::{Arc, Mutex};
 
+    /// One request, as the apiserver saw it.
     #[derive(Clone, Debug)]
-    struct Call {
-        method: String,
-        uri: String,
-        body: Value,
+    pub(crate) struct Call {
+        pub(crate) method: String,
+        pub(crate) uri: String,
+        pub(crate) body: Value,
     }
 
     /// A `Client` that answers every request 201 with the posted body and
-    /// logs what it was asked.
-    fn recording_apiserver() -> (Client, Arc<Mutex<Vec<Call>>>) {
+    /// logs what it was asked. `deadline_event`'s tests use it too.
+    pub(crate) fn recording_apiserver() -> (Client, Arc<Mutex<Vec<Call>>>) {
         let log = Arc::new(Mutex::new(Vec::<Call>::new()));
         let sink = log.clone();
         let service = tower::service_fn(move |req: http::Request<Body>| {

@@ -462,7 +462,14 @@ pub async fn reconcile_with_deadline(
             .await;
     if let Err(ReconcileError::TimedOut(timed_out)) = &outcome {
         ctx.acl_dirty.notify_one();
-        crate::deadline_event::publish(&ctx.client, claim.object_ref(&()), KIND, *timed_out).await;
+        operator_core::deadline_event::publish(
+            &ctx.client,
+            crate::REPORTER_CONTROLLER,
+            claim.object_ref(&()),
+            KIND,
+            *timed_out,
+        )
+        .await;
     }
     outcome
 }
@@ -6777,7 +6784,7 @@ mod deadline_tests {
         }
         assert_eq!(
             started.elapsed(),
-            RECONCILE_DEADLINE + crate::deadline_event::PUBLISH_BOUND
+            RECONCILE_DEADLINE + operator_core::deadline_event::PUBLISH_BOUND
         );
     }
 
@@ -6826,6 +6833,10 @@ mod deadline_tests {
         assert_eq!(methods, vec!["GET", "PATCH", "POST"], "{log:#?}");
         assert_eq!(log[2].body["reason"], json!("ReconcileTimedOut"));
         assert_eq!(log[2].body["regarding"]["name"], json!("web-disk"));
+        assert_eq!(
+            log[2].body["reportingController"],
+            json!("apprafter-resourceclaim-provisioner")
+        );
     }
 
     /// A cut can land after a terminal status committed but before the pass
