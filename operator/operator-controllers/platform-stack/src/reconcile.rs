@@ -252,6 +252,49 @@ struct Context {
     /// Where published versions are read from: [`OciRegistry`] in
     /// production. See [`Upstream`].
     upstream: Arc<dyn Upstream>,
+    /// Bumps that landed on the parent and are not yet in a status write
+    /// (WI-400). See [`Context::note_bump`].
+    unrecorded_bumps: std::sync::Mutex<Vec<PlatformStackVersionHistoryEntry>>,
+}
+
+impl Context {
+    /// Remember a bump the moment the parent patch carrying it has landed,
+    /// until a status write records it in `versionHistory`.
+    ///
+    /// WI-400: the history entry is decided from the LIVE parent — a pass
+    /// appends it only when it is the one that moves `targetRevision`. A pass
+    /// cut (or failed) between the bump and its status write lost the entry
+    /// for good, because the next pass already finds the parent on the new
+    /// version. Held here, it rides the next status write instead. In memory
+    /// only: an operator restart in that window still loses it, as a crash
+    /// there always has.
+    fn note_bump(&self, entry: PlatformStackVersionHistoryEntry) {
+        let mut bumps = self
+            .unrecorded_bumps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        bumps.push(entry);
+        if bumps.len() > crate::status::VERSION_HISTORY_CAP {
+            let drop = bumps.len() - crate::status::VERSION_HISTORY_CAP;
+            bumps.drain(0..drop);
+        }
+    }
+
+    /// The bumps not yet recorded, oldest first.
+    fn unrecorded_bumps(&self) -> Vec<PlatformStackVersionHistoryEntry> {
+        self.unrecorded_bumps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Drop `recorded` once a status write carrying them has succeeded.
+    fn forget_bumps(&self, recorded: &[PlatformStackVersionHistoryEntry]) {
+        self.unrecorded_bumps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|e| !recorded.contains(e));
+    }
 }
 
 /// The two questions the reconcile asks the published chart repository.
@@ -367,6 +410,7 @@ pub async fn run(client: Client, metrics: Arc<Metrics>) -> Result<(), Error> {
         app_api_resource,
         capacity: operator_core::capacity::CapacityCache::new(),
         upstream: Arc::new(OciRegistry),
+        unrecorded_bumps: std::sync::Mutex::new(Vec::new()),
     });
 
     info!(
@@ -1148,6 +1192,13 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
             publish_bounded(&recorder, ev).await;
         }
         patch_application(&apps, &patch_payload, &pending_upgrade).await?;
+        if target_for_patch != current_target {
+            ctx.note_bump(PlatformStackVersionHistoryEntry {
+                version: target_for_patch.clone(),
+                applied_at: now.to_rfc3339(),
+                outcome: "succeeded".into(),
+            });
+        }
         if foreign_writer.is_some() {
             // The COMPLETION record: reached only once the
             // revert has landed (`?` above returns on a failed
@@ -1455,25 +1506,30 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
             .map_or(0, |v| v.len()),
         "PlatformController bump decision"
     );
-    if appended_history {
-        append_version_history(
-            &mut new_status,
-            PlatformStackVersionHistoryEntry {
-                version: target_for_patch.clone(),
-                applied_at: now.to_rfc3339(),
-                outcome: "succeeded".into(),
-            },
-        );
+    // This pass's bump (noted when its patch landed) and any an earlier pass
+    // landed but was cut before writing (WI-400), oldest first. An entry
+    // already in the status is not appended twice.
+    let unrecorded = ctx.unrecorded_bumps();
+    for entry in &unrecorded {
+        let recorded = new_status
+            .version_history
+            .as_ref()
+            .is_some_and(|h| h.contains(entry));
+        if !recorded {
+            append_version_history(&mut new_status, entry.clone());
+        }
     }
 
     new_status.current_version = Some(target_for_patch.clone());
     new_status.target_version = Some(target_for_patch);
     info!(
         include_version_history = appended_history,
+        unrecorded_bumps = unrecorded.len(),
         new_history_len = new_status.version_history.as_ref().map_or(0, |v| v.len()),
         "PlatformController writing status"
     );
     write_status_if_changed(&stack, &ctx, new_status, appended_history).await?;
+    ctx.forget_bumps(&unrecorded);
     Ok(Action::requeue(sooner(
         parse_check_interval(&spec.source.check_interval),
         backup_recheck,
@@ -4041,6 +4097,7 @@ mod backup_reconcile_tests {
             }),
             capacity: operator_core::capacity::CapacityCache::new(),
             upstream: Arc::new(super::test_upstreams::NoRegistry),
+            unrecorded_bumps: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -4728,6 +4785,7 @@ mod bounded_reconcile_tests {
             }),
             capacity: operator_core::capacity::CapacityCache::new(),
             upstream,
+            unrecorded_bumps: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -5537,6 +5595,66 @@ mod bounded_reconcile_tests {
         assert!(
             note.contains("is force-reapplying desired state (target=0.2.80)"),
             "{note}"
+        );
+    }
+
+    fn history_versions(status: &Value) -> Vec<String> {
+        status["versionHistory"]
+            .as_array()
+            .expect("versionHistory")
+            .iter()
+            .map(|e| e["version"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    /// WI-400 cancellation hazard: the `versionHistory` entry for a bump was
+    /// appended only by the pass that made it, and that pass decides from the
+    /// LIVE parent. A pass cut after the bump landed but before its status
+    /// write lost the entry for good: the next pass finds the parent already
+    /// on the new version and has nothing to append.
+    #[tokio::test(start_paused = true)]
+    async fn a_bump_cut_before_its_status_write_is_still_recorded_in_the_history() {
+        let stack = stack_on("0.2.79", "0.2.80");
+        let parent = parent_on(&stack, "0.2.79");
+        let mut cluster = cluster(stack, parent);
+        cluster.plans.push(completed_plan("0.2.79", "0.2.80"));
+        cluster.silent.push(("GET", STATUS.to_string()));
+        let (client, state) = scripted(cluster);
+        let ctx = context(client, Arc::new(NoRegistry));
+
+        let err = operator_core::deadline::within(
+            RECONCILE_DEADLINE,
+            reconcile(the_stack(&state), ctx.clone()),
+        )
+        .await
+        .expect_err("the status write never answers, so the reconcile is cut");
+        assert!(matches!(err, Error::TimedOut(_)), "{err:?}");
+        assert_eq!(
+            state.lock().unwrap().parent["spec"]["source"]["targetRevision"],
+            "0.2.80",
+            "the bump landed"
+        );
+        assert!(!calls(&state).iter().any(|c| c.is("PATCH", STATUS)));
+
+        // The apiserver answers again: the next pass records the bump.
+        state.lock().unwrap().silent.clear();
+        reconcile(the_stack(&state), ctx.clone())
+            .await
+            .expect("the next reconcile succeeds");
+        let patch = status_patch(&calls(&state));
+        assert_eq!(
+            history_versions(&patch.body["status"]),
+            vec!["0.2.79".to_string(), "0.2.80".to_string()]
+        );
+        assert_eq!(patch.body["status"]["currentVersion"], "0.2.80");
+
+        // And only once.
+        reconcile(the_stack(&state), ctx)
+            .await
+            .expect("a settled reconcile succeeds");
+        assert_eq!(
+            history_versions(&state.lock().unwrap().stack["status"]),
+            vec!["0.2.79".to_string(), "0.2.80".to_string()]
         );
     }
 }
