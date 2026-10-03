@@ -76,6 +76,8 @@ pub(crate) const REASON: &str = "ReconcileTimedOut";
 
 /// `regarding.kind` of a SharedVolume's Events.
 pub(crate) const SHARED_VOLUME_KIND: &str = "SharedVolume";
+/// `regarding.kind` of a SharedDatabase's Events.
+pub(crate) const SHARED_DATABASE_KIND: &str = "SharedDatabase";
 
 /// The group every kind above belongs to, matched on `regarding.apiVersion`.
 /// A kind alone is not unique: Kubernetes 1.32+ serves a DRA

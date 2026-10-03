@@ -34,6 +34,11 @@ enum Reply {
 const VOLUME_GET: &str = "get sharedvolume.apprafter.io --show-managed-fields data -n apps -o json";
 const VOLUME_EVENTS: &str = "get events.events.k8s.io -n apps --field-selector \
      reason=ReconcileTimedOut,regarding.kind=SharedVolume,regarding.name=data -o json";
+const DATABASE_GET: &str =
+    "get shareddatabase.apprafter.io --show-managed-fields orders -n apps -o json";
+const CLAIMS: &str = "get resourceclaim.apprafter.io -n apps -o json";
+const DATABASE_EVENTS: &str = "get events.events.k8s.io -n apps --field-selector \
+     reason=ReconcileTimedOut,regarding.kind=SharedDatabase,regarding.name=orders -o json";
 
 struct Sandbox {
     dir: TempDir,
@@ -299,4 +304,75 @@ fn a_reader_who_may_not_list_events_gets_the_volume_and_no_warning() {
     assert!(!stdout.contains("Reconcile"), "{stdout}");
     assert!(stdout.contains("  Ref count:   2"), "{stdout}");
     assert!(stderr.trim().is_empty(), "{stderr}");
+}
+
+#[test]
+fn db_status_names_an_abandoned_pass() {
+    let database = object(
+        "SharedDatabase",
+        "orders",
+        json!({ "ready": true, "refCount": 0, "database": "shd_apps_orders" }),
+    );
+    let sandbox = Sandbox::new(&[
+        (DATABASE_GET, Reply::Json(database)),
+        (CLAIMS, Reply::Json(json!({ "items": [] }))),
+        (
+            DATABASE_EVENTS,
+            Reply::Json(abandoned(
+                "SharedDatabase",
+                "orders",
+                Duration::minutes(2),
+                120,
+            )),
+        ),
+    ]);
+    let (ok, stdout, stderr) = sandbox.run(&["db", "status", "orders", "-n", "apps"]);
+    assert!(ok, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stdout.contains(
+            "  Reconcile:    last timed out 2 minutes ago (did not finish within 120s); the \
+             operator retries on its own"
+        ),
+        "{stdout}"
+    );
+    let calls = sandbox.kubectl_calls();
+    assert_eq!(calls, [DATABASE_GET, CLAIMS, DATABASE_EVENTS], "{calls:#?}");
+}
+
+#[test]
+fn db_status_is_quiet_once_the_provisioner_has_written_the_status_since() {
+    // A status write under the provisioner's own field manager after the
+    // Event: a later pass got through. kubectl returns `managedFields` only
+    // under `--show-managed-fields`, which `DATABASE_GET` asks for; a plain
+    // read would see none, and keep the line until the Event expired.
+    let mut recovered = object(
+        "SharedDatabase",
+        "orders",
+        json!({ "ready": true, "refCount": 0, "database": "shd_apps_orders" }),
+    );
+    recovered["metadata"]["managedFields"] = json!([{
+        "manager": "resourceclaim-provisioner", "operation": "Apply",
+        "apiVersion": "apprafter.io/v1alpha1", "subresource": "status",
+        "time": (Utc::now() - Duration::minutes(1)).to_rfc3339_opts(SecondsFormat::Secs, true),
+        "fieldsType": "FieldsV1", "fieldsV1": { "f:status": {} }
+    }]);
+    let sandbox = Sandbox::new(&[
+        (DATABASE_GET, Reply::Json(recovered)),
+        (CLAIMS, Reply::Json(json!({ "items": [] }))),
+        (
+            DATABASE_EVENTS,
+            Reply::Json(abandoned(
+                "SharedDatabase",
+                "orders",
+                Duration::minutes(2),
+                120,
+            )),
+        ),
+    ]);
+    let (ok, stdout, stderr) = sandbox.run(&["db", "status", "orders", "-n", "apps"]);
+    assert!(ok, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(!stdout.contains("Reconcile"), "{stdout}");
+    assert!(stdout.contains("  Bound apps:   0"), "{stdout}");
+    let calls = sandbox.kubectl_calls();
+    assert_eq!(calls, [DATABASE_GET, CLAIMS, DATABASE_EVENTS], "{calls:#?}");
 }
