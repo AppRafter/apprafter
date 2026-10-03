@@ -53,7 +53,7 @@ use kube::api::{Api, ApiResource, DynamicObject, Patch, PatchParams};
 use kube::core::GroupVersionKind;
 use kube::runtime::controller::Action;
 use kube::runtime::reflector::{ObjectRef, Store};
-use kube::{Client, ResourceExt};
+use kube::{Client, Resource as _, ResourceExt};
 use serde_json::{json, Value};
 use tracing::{info, warn};
 
@@ -400,6 +400,65 @@ fn apply_params() -> PatchParams {
 // ---------------------------------------------------------------------------
 // Async reconcile
 // ---------------------------------------------------------------------------
+
+/// How long one SharedDatabase pass may run before it is abandoned (WI-400,
+/// GOTCHA-51).
+///
+/// This controller runs at `concurrency(1)`, so while one pass is in flight
+/// kube-runtime holds every SharedDatabase's triggers: the first binds of
+/// every consumer of a not-yet-ready database wait, and deletes sit in
+/// Terminating with no stated reason. A healthy pass is about 15 apiserver
+/// round trips and a few milliseconds of SQL.
+///
+/// 120s is safe ONLY because the Postgres client carries bounds of its own:
+/// `pg_client::CONNECT_TIMEOUT` (10s), a server-side `lock_timeout` (10s) and
+/// `statement_timeout` (30s) on every admin session, and
+/// `pg_client::CALL_TIMEOUT` (45s) per call. Dropping a statement's future
+/// does not stop the statement: the backend keeps waiting on its lock after
+/// the socket closes (measured: a `GRANT SELECT ON ALL TABLES` behind a
+/// consumer's open `ALTER TABLE`), so a deadline alone would leak one backend
+/// per retry on the shared cluster. With those bounds, a lock wait ends
+/// server-side within 10s and lands in a designed arm (`AwaitingLock`,
+/// `StatementTimedOut`, `AwaitingCluster`).
+///
+/// What this deadline does NOT dominate: a pg pass makes its Postgres calls
+/// in sequence (the groups batch, the reader grants, then one probe per
+/// declared extension), each capped at `CALL_TIMEOUT`. A server that is slow
+/// but answering on every one therefore costs up to 45s × (2 + declared
+/// extensions), plus the apiserver round trips: past 120s as soon as one
+/// extension is declared. A cut there is safe. Every statement is
+/// existence-guarded and idempotent, so the next pass simply runs them again;
+/// nothing is written to status; and a cut delete keeps its finalizer,
+/// because releasing it is the delete's last step.
+pub const RECONCILE_DEADLINE: Duration = Duration::from_secs(120);
+
+/// [`reconcile_shared_database`] under [`RECONCILE_DEADLINE`] — what
+/// [`crate::run`] hands kube-runtime, never the unbounded reconcile.
+///
+/// A timed-out pass writes nothing to the SharedDatabase's status: a body
+/// under [`FIELD_MANAGER`] missing `database`/`instance`/`dbnum` would prune
+/// the backing, and `Ready=False` would refuse every new consumer of a
+/// database that is serving. A cut delete keeps its finalizer — the release
+/// is the pass's last step. The pass reaches [`error_policy_sd`], which warns,
+/// counts `apprafter_reconcile_timeouts_total{kind="SharedDatabase"}` and
+/// backs off, and it leaves a `ReconcileTimedOut` Warning Event on the object.
+/// A cut also drops the `Context::dbnum_alloc` guard a redis allocation held;
+/// the re-read of every `$N` holder before each `FLUSHDB` (WI-402) covers a
+/// status write that commits after the cut.
+pub async fn reconcile_shared_database_with_deadline(
+    sd: Arc<SharedDatabase>,
+    ctx: Arc<Context>,
+) -> Result<Action, ReconcileError> {
+    let outcome = operator_core::deadline::within(
+        RECONCILE_DEADLINE,
+        reconcile_shared_database(sd.clone(), ctx.clone()),
+    )
+    .await;
+    if let Err(ReconcileError::TimedOut(timed_out)) = &outcome {
+        crate::deadline_event::publish(&ctx.client, sd.object_ref(&()), KIND, *timed_out).await;
+    }
+    outcome
+}
 
 /// Reconcile one `SharedDatabase`.
 ///
@@ -1501,6 +1560,11 @@ fn previously_missing(prior: &[SharedDatabaseCondition]) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Error policy for the SharedDatabase controller: warn, count, and requeue
+/// after 30 seconds — or, for a pass abandoned at [`RECONCILE_DEADLINE`],
+/// count the timeout and back off by one deadline, so a database that stalls
+/// on every pass cannot hold the controller's only slot most of the time. A
+/// watch event still runs it at once.
 pub fn error_policy_sd(sd: Arc<SharedDatabase>, err: &ReconcileError, ctx: Arc<Context>) -> Action {
     let name = sd.name_any();
     let namespace = sd.namespace().unwrap_or_default();
@@ -1513,6 +1577,13 @@ pub fn error_policy_sd(sd: Arc<SharedDatabase>, err: &ReconcileError, ctx: Arc<C
         .reconcile_errors
         .with_label_values(&[KIND])
         .inc();
+    if let ReconcileError::TimedOut(timed_out) = err {
+        ctx.metrics
+            .reconcile_timeouts
+            .with_label_values(&[KIND])
+            .inc();
+        return Action::requeue(timed_out.after);
+    }
     Action::requeue(Duration::from_secs(30))
 }
 
@@ -3063,5 +3134,206 @@ mod reconcile_pg_tests {
             &ResourceClaim::new("web", Default::default()),
             now
         ));
+    }
+}
+
+/// WI-400: the SharedDatabase deadline, driven through the scripted
+/// apiserver (`crate::route_apiserver`) on a paused clock.
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+    use crate::pg_client::{PgAdmin, PgAdminError};
+    use crate::route_apiserver::{apiserver, route, Reply};
+    use operator_core::{Metrics, SharedDatabaseSpec, SharedDatabaseStatus};
+
+    const EVENTS: &str = "/apis/events.k8s.io/v1/namespaces/apps/events";
+
+    fn context(client: Client) -> Arc<Context> {
+        Arc::new(Context::new(client, Arc::new(Metrics::new())))
+    }
+
+    fn ok(body: Value) -> Reply {
+        Reply::Json(200, body)
+    }
+
+    /// A pg SharedDatabase `apps/orders`, finalizer in place.
+    fn database() -> SharedDatabase {
+        let mut sd = SharedDatabase::new(
+            "orders",
+            SharedDatabaseSpec {
+                type_: "pg".into(),
+                ..Default::default()
+            },
+        );
+        sd.metadata.namespace = Some("apps".into());
+        sd.metadata.uid = Some("u-sd".into());
+        sd.metadata.finalizers = Some(vec![SD_FINALIZER.into()]);
+        sd
+    }
+
+    /// A `PgAdmin` whose every call never returns: what a statement waiting
+    /// on a lock looked like before the Postgres client had server-side
+    /// timeouts, and still the shape of any hang this deadline exists for.
+    struct HangingPg;
+
+    #[async_trait::async_trait]
+    impl PgAdmin for HangingPg {
+        async fn execute_all(&self, _dsn: &str, _s: &[String]) -> Result<(), PgAdminError> {
+            std::future::pending().await
+        }
+        async fn extension_available(&self, _dsn: &str, _e: &str) -> Result<bool, PgAdminError> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_database_pass_that_never_returns_is_abandoned_at_the_deadline() {
+        let ctx = context(operator_core::testing::stalled_client());
+
+        let started = tokio::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            RECONCILE_DEADLINE * 2,
+            reconcile_shared_database_with_deadline(Arc::new(database()), ctx),
+        )
+        .await
+        .expect("the deadline must end the pass");
+
+        match outcome {
+            Err(ReconcileError::TimedOut(t)) => assert_eq!(t.after, RECONCILE_DEADLINE),
+            other => panic!("expected TimedOut, got {other:?}"),
+        }
+        assert_eq!(
+            started.elapsed(),
+            RECONCILE_DEADLINE + crate::deadline_event::PUBLISH_BOUND
+        );
+    }
+
+    /// A delete cut inside Postgres (`drop_groups` never returning) keeps
+    /// its finalizer and writes no status: the only request after the cut is
+    /// the Warning Event. The database stays in Terminating and is retried,
+    /// which is the safe direction for the one path in 2.29 that destroys
+    /// data.
+    #[tokio::test(start_paused = true)]
+    async fn a_delete_cut_inside_postgres_keeps_its_finalizer_and_writes_no_status() {
+        let (client, log) = apiserver(vec![
+            route(
+                "GET",
+                "/apis/apprafter.io/v1alpha1/namespaces/apps/resourceclaims",
+                ok(json!({
+                    "apiVersion": "apprafter.io/v1alpha1", "kind": "ResourceClaimList",
+                    "metadata": {}, "items": [],
+                })),
+            ),
+            route(
+                "GET",
+                "/apis/apprafter.io/v1alpha1/serviceproviders",
+                ok(json!({
+                    "apiVersion": "apprafter.io/v1alpha1", "kind": "ServiceProviderList",
+                    "metadata": {}, "items": [],
+                })),
+            ),
+            route(
+                "GET",
+                "/apis/postgresql.cnpg.io/v1/namespaces/cnpg-system/databases/shd-apps-orders",
+                Reply::Json(
+                    404,
+                    json!({
+                        "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                        "reason": "NotFound", "code": 404, "message": "not found",
+                    }),
+                ),
+            ),
+            route(
+                "GET",
+                "/api/v1/namespaces/cnpg-system/secrets/platform-postgres-apprafter-admin",
+                ok(json!({
+                    "apiVersion": "v1", "kind": "Secret",
+                    "metadata": {
+                        "name": "platform-postgres-apprafter-admin",
+                        "namespace": "cnpg-system",
+                    },
+                    "data": { "password": "cHc=" },
+                })),
+            ),
+            route(
+                "POST",
+                EVENTS,
+                Reply::Json(
+                    201,
+                    json!({
+                        "apiVersion": "events.k8s.io/v1", "kind": "Event",
+                        "metadata": { "name": "orders.1", "namespace": "apps" },
+                    }),
+                ),
+            ),
+        ]);
+        let mut ctx = Context::new(client, Arc::new(Metrics::new()));
+        ctx.pg = Arc::new(HangingPg);
+        let mut sd = database();
+        sd.metadata.deletion_timestamp =
+            Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                "2026-10-01T00:00:00Z".parse().expect("timestamp"),
+            ));
+        sd.status = Some(SharedDatabaseStatus {
+            database: Some("shd_apps_orders".into()),
+            ..Default::default()
+        });
+
+        let outcome = tokio::time::timeout(
+            RECONCILE_DEADLINE * 2,
+            reconcile_shared_database_with_deadline(Arc::new(sd), Arc::new(ctx)),
+        )
+        .await
+        .expect("the deadline must end the pass");
+        assert!(
+            matches!(outcome, Err(ReconcileError::TimedOut(_))),
+            "{outcome:?}"
+        );
+
+        let log = log.lock().expect("log").clone();
+        assert!(
+            log.iter().any(|c| c
+                .path
+                .ends_with("/secrets/platform-postgres-apprafter-admin")),
+            "the pass reached the Postgres step before it hung: {log:#?}"
+        );
+        assert!(
+            !log.iter().any(|c| c.method == "PATCH"),
+            "neither a status write nor a finalizer release: {log:#?}"
+        );
+        let last = log.last().expect("requests were made");
+        assert_eq!(last.method, "POST", "{log:#?}");
+        assert_eq!(last.path, EVENTS);
+        assert_eq!(last.body["reason"], json!("ReconcileTimedOut"));
+        assert_eq!(last.body["regarding"]["kind"], json!("SharedDatabase"));
+    }
+
+    #[tokio::test]
+    async fn error_policy_sd_counts_a_timeout_and_backs_off_one_deadline() {
+        let ctx = context(operator_core::testing::stalled_client());
+        let timed_out = ReconcileError::TimedOut(operator_core::deadline::ReconcileTimedOut {
+            after: RECONCILE_DEADLINE,
+        });
+
+        assert_eq!(
+            error_policy_sd(Arc::new(database()), &timed_out, ctx.clone()),
+            Action::requeue(RECONCILE_DEADLINE)
+        );
+        let timeouts = || {
+            ctx.metrics
+                .reconcile_timeouts
+                .with_label_values(&[KIND])
+                .get()
+        };
+        assert_eq!(timeouts(), 1.0);
+        assert_eq!(
+            error_policy_sd(
+                Arc::new(database()),
+                &ReconcileError::Provisioning("x".into()),
+                ctx.clone()
+            ),
+            Action::requeue(Duration::from_secs(30))
+        );
+        assert_eq!(timeouts(), 1.0, "only a timeout counts as one");
     }
 }

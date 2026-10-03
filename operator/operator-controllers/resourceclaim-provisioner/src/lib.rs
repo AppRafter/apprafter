@@ -454,7 +454,7 @@ pub async fn run(
             shared_database::shared_database_refs_in_store(&claim, &sd_store).into_iter()
         })
         .run(
-            shared_database::reconcile_shared_database,
+            shared_database::reconcile_shared_database_with_deadline,
             shared_database::error_policy_sd,
             sd_ctx,
         )

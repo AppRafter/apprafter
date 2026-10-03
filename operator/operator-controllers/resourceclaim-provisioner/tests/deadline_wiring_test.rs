@@ -54,3 +54,18 @@ fn the_shared_volume_controller_runs_the_deadline_wrapper() {
         "the bare SharedVolume reconcile is wired into a Controller"
     );
 }
+
+#[test]
+fn the_shared_database_controller_runs_the_deadline_wrapper() {
+    let src = lib_src_compact();
+    assert!(
+        src.contains(
+            ".run(shared_database::reconcile_shared_database_with_deadline,shared_database::error_policy_sd,"
+        ),
+        "the SharedDatabase Controller must run shared_database::reconcile_shared_database_with_deadline"
+    );
+    assert!(
+        !src.contains(".run(shared_database::reconcile_shared_database,"),
+        "the bare SharedDatabase reconcile is wired into a Controller"
+    );
+}
