@@ -864,13 +864,6 @@ WRAP
 }
 
 # ---------------------------------------------------------------
-# dump_diagnostics
-#   Best-effort cluster-state dump for CI debugging. Call this on
-#   failure BEFORE tearing the cluster down — otherwise the evidence
-#   (stuck pods, events, helm-hook state) is destroyed with it.
-#   No-op + never fails if KUBECONFIG/kubectl are unavailable.
-# ---------------------------------------------------------------
-# ---------------------------------------------------------------
 # apply_branch_operator_rbac
 #
 # In APPRAFTER_E2E_LOCAL_OPERATOR mode the walks swap the operator IMAGE but
@@ -930,9 +923,146 @@ apply_branch_operator_rbac() {
     printf '  branch operator RBAC applied (ClusterRole/Binding, Role/Binding, SA)\n'
 }
 
+# ---------------------------------------------------------------
+# dump_diagnostics helpers (_diag_*). Internal; see dump_diagnostics.
+# ---------------------------------------------------------------
+
+# _diag_strip_ansi — drop ANSI colour sequences. The operator and the
+# webhook colour their logs with no TTY attached, and a downloaded job
+# log renders every code as literal `^[[2m` text: about a third of the
+# bytes of each operator line.
+_diag_strip_ansi() {
+    sed $'s/\033\\[[0-9;]*[A-Za-z]//g'
+}
+
+# _diag_log_window — the one `kubectl logs` argument that selects THIS
+# walk: --since-time=<walk start minus 60s>, in RFC3339. The slack absorbs
+# clock skew against a remote node (the Hetzner walks); kind and k3d nodes
+# read this host's clock. When START_NS is not a number, or `date` cannot
+# convert it (BSD date has no `-d @`), the window is the whole container
+# log (--tail=-1) — never a tail.
+_diag_log_window() {
+    local start_s stamp=''
+    case "${START_NS:-}" in
+        '' | *[!0-9]*) printf '%s\n' '--tail=-1'; return 0 ;;
+    esac
+    start_s=$(( START_NS / 1000000000 - 60 ))
+    stamp="$(date -u -d "@${start_s}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" || stamp=''
+    if [ -n "$stamp" ]; then
+        printf -- '--since-time=%s\n' "$stamp"
+    else
+        printf '%s\n' '--tail=-1'
+    fi
+}
+
+# _diag_fetch_log <ns> <pod> <container> <previous: true|false> <window> <file>
+#   One container's log, ANSI-stripped, into <file>. kubectl's own error
+#   (a container still waiting, an apiserver gone) lands in the file as
+#   well, so a section that looks empty still says why.
+_diag_fetch_log() {
+    kubectl -n "$1" logs "$2" -c "$3" --previous="$4" "$5" 2>&1 \
+        | _diag_strip_ansi >"$6" || true
+}
+
+# _diag_print_log <file> <title> <artifact dir, or empty>
+#   The last APPRAFTER_E2E_DIAG_CONSOLE_LINES (default 2000) lines of
+#   <file> to stderr, saying how many lines were left out and where the
+#   whole log is.
+_diag_print_log() {
+    local file="$1" title="$2" out="$3" keep total
+    keep="${APPRAFTER_E2E_DIAG_CONSOLE_LINES:-2000}"
+    case "$keep" in '' | *[!0-9]*) keep=2000 ;; esac
+    total="$(wc -l <"$file" 2>/dev/null | tr -d ' ')" || total=0
+    case "$total" in '' | *[!0-9]*) total=0 ;; esac
+    printf '\n=== %s (%s line(s)) ===\n' "$title" "$total" >&2
+    if [ "$total" -gt "$keep" ]; then
+        if [ -n "$out" ]; then
+            printf '... %s earlier line(s) omitted here; the whole log is %s in the e2e-diagnostics artifact\n' \
+                "$(( total - keep ))" "${file#"$out"/}" >&2
+        else
+            printf '... %s earlier line(s) omitted here; set APPRAFTER_E2E_DIAG_DIR to keep the whole log\n' \
+                "$(( total - keep ))" >&2
+        fi
+    fi
+    tail -n "$keep" "$file" >&2 || true
+}
+
+# _diag_control_plane_logs <dir> <window> <artifact dir, or empty>
+#   Fetch the log of every container of every pod of the operator and the
+#   webhook deployments into <dir>/apprafter-system/ — and the previous
+#   instance of each container that restarted — then print each one's
+#   tail. Pods, not `deploy/<name>`: `kubectl logs deploy/x` reads ONE pod,
+#   which during a rollout may be the wrong one. The resourceclaim
+#   scheduler, provisioner and GC are tasks inside the operator binary,
+#   not deployments of their own.
+_diag_control_plane_logs() {
+    local dir="$1/apprafter-system" window="$2" out="$3" dep sel pod ctr restarts f i
+    local -a logs=() titles=()
+    mkdir -p "$dir" 2>/dev/null || return 0
+    for dep in apprafter-operator admission-webhook; do
+        # $k and $v are go-template variables, not shell ones.
+        # shellcheck disable=SC2016
+        sel="$(kubectl -n apprafter-system get deploy "$dep" \
+            -o go-template='{{range $k, $v := .spec.selector.matchLabels}}{{$k}}={{$v}},{{end}}' \
+            2>/dev/null)" || continue
+        sel="${sel%,}"
+        [ -n "$sel" ] || continue
+        for pod in $(kubectl -n apprafter-system get pods -l "$sel" \
+            -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true); do
+            while read -r ctr restarts; do
+                [ -n "$ctr" ] || continue
+                case "$restarts" in '' | *[!0-9]*) restarts=0 ;; esac
+                if [ "$restarts" -gt 0 ]; then
+                    f="$dir/${pod}.${ctr}.previous.log"
+                    _diag_fetch_log apprafter-system "$pod" "$ctr" true "$window" "$f"
+                    logs+=("$f")
+                    titles+=("logs apprafter-system/${pod} [${ctr}] PREVIOUS instance (restarted ${restarts}x)")
+                fi
+                f="$dir/${pod}.${ctr}.log"
+                _diag_fetch_log apprafter-system "$pod" "$ctr" false "$window" "$f"
+                logs+=("$f")
+                titles+=("logs apprafter-system/${pod} [${ctr}]")
+            done < <(kubectl -n apprafter-system get pod "$pod" \
+                -o jsonpath='{range .status.containerStatuses[*]}{.name}{" "}{.restartCount}{"\n"}{end}' \
+                2>/dev/null || true)
+        done
+    done
+    printf '\n--- apprafter-system control-plane logs (%s) ---\n' "$window" >&2
+    if [ "${#logs[@]}" -eq 0 ]; then
+        printf '(no operator or webhook pod found)\n' >&2
+        return 0
+    fi
+    for i in "${!logs[@]}"; do
+        _diag_print_log "${logs[$i]}" "${titles[$i]}" "$out"
+    done
+}
+
+# ---------------------------------------------------------------
+# dump_diagnostics
+#   Best-effort cluster-state dump for CI debugging. Call this on
+#   failure BEFORE tearing the cluster down — otherwise the evidence
+#   (stuck pods, events, helm-hook state) is destroyed with it.
+#   No-op + never fails if KUBECONFIG/kubectl are unavailable, and
+#   never fails under the caller's `set -euo pipefail` either: most
+#   walks call it bare from their EXIT trap, where one failing command
+#   would skip the teardown.
+#
+#   The operator and webhook logs cover the WHOLE walk: every
+#   container of every pod of the two deployments, read --since-time
+#   the walk started (START_NS), plus the previous instance of every
+#   container that restarted. The console shows the last
+#   APPRAFTER_E2E_DIAG_CONSOLE_LINES (default 2000) lines of each.
+#   It used to show the last 120, and on run 37001547817 (needs-redis
+#   nightly, 2026-10-02) those began 30s after the stalled Application
+#   was created: steady-state requeue lines had pushed every line about
+#   it out of the window. scripts/check-dump-diagnostics.sh guards this.
+# ---------------------------------------------------------------
 dump_diagnostics() {
     command -v kubectl >/dev/null 2>&1 || return 0
     [ -n "${KUBECONFIG:-}" ] || return 0
+    local window work=''
+    window="$(_diag_log_window)"
+    work="$(mktemp -d 2>/dev/null)" || work=''
     printf '\n----- cluster diagnostics (failure) -----\n' >&2
     kubectl get nodes -o wide >&2 2>&1 || true
     printf '\n--- pods (all namespaces) ---\n' >&2
@@ -942,6 +1072,10 @@ dump_diagnostics() {
     # fully-ready (e.g. a crash-looping `0/1 Running` cilium-agent —
     # READY ratio r[1] != r[2]). For each, dump describe + current and
     # previous-instance container logs (the crash reason lives there).
+    # The trailing `|| true` is load-bearing: with the apiserver gone the
+    # `kubectl get` fails, pipefail fails the pipe, and errexit used to end
+    # the walk's EXIT trap right here — no teardown, and the walk's own
+    # exit code replaced by 1.
     kubectl get pods -A --no-headers 2>/dev/null \
         | awk '{split($3, r, "/");
                 if ($4 != "Running" && $4 != "Completed") print $1, $2;
@@ -953,18 +1087,17 @@ dump_diagnostics() {
             kubectl -n "$ns" logs "$pod" --all-containers --tail=60 >&2 2>&1 || true
             printf '\n--- logs %s/%s (previous instance) ---\n' "$ns" "$pod" >&2
             kubectl -n "$ns" logs "$pod" --all-containers --previous --tail=60 >&2 2>&1 || true
-        done
+        done || true
     # apprafter-system control-plane logs ALWAYS — the operator and
     # admission-webhook run 1/1 Ready, so the not-Ready loop above skips
     # them, yet a reconcile that errors before writing any status (empty
     # `.status.phase`) leaves its only trace in the operator log. Dump
     # the full control-plane regardless of Ready state.
-    printf '\n--- apprafter-system control-plane logs ---\n' >&2
-    for dep in apprafter-operator admission-webhook resourceclaim-provisioner resourceclaim-scheduler; do
-        kubectl -n apprafter-system get deploy "$dep" >/dev/null 2>&1 || continue
-        printf '\n=== logs deploy/%s (tail 120) ===\n' "$dep" >&2
-        kubectl -n apprafter-system logs "deploy/$dep" --all-containers --tail=120 >&2 2>&1 || true
-    done
+    if [ -n "$work" ]; then
+        _diag_control_plane_logs "$work" "$window" ''
+    else
+        printf '\n--- apprafter-system control-plane logs: no scratch directory (mktemp -d failed), skipped ---\n' >&2
+    fi
     # Application + ResourceClaim CRs in the workload namespace — the
     # full status (phase, conditions) that the wait-loop only sampled.
     printf '\n--- Application + ResourceClaim CRs (all namespaces) ---\n' >&2
@@ -1015,4 +1148,8 @@ dump_diagnostics() {
             >&2 2>&1 || true
     done
     printf '%s\n' '----- end diagnostics -----' >&2
+    if [ -n "$work" ]; then
+        rm -rf "$work"
+    fi
+    return 0
 }
