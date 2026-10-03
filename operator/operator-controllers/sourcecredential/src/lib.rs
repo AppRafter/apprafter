@@ -3927,4 +3927,200 @@ mod tests {
             status.body
         );
     }
+
+    /// The livelock guard. The validity probes run AFTER the derived Secrets
+    /// are written and BEFORE the status write, so a pass whose probes outlast
+    /// `RECONCILE_DEADLINE` never reaches its status: conditions and covered
+    /// lists freeze, `lastAppliedSpec` is never stamped (the migration gate
+    /// never arms) and an approved plan is never consumed — on every pass,
+    /// forever. Forty repos and forty images on a host that never answers
+    /// were 400s + 240s of probing; with each half held to its budget the
+    /// pass still writes its status — both `*Valid` conditions `Unknown`,
+    /// saying the budget ran out, and the baseline stamped — inside the
+    /// deadline.
+    #[tokio::test(start_paused = true)]
+    async fn a_pass_whose_every_probe_stalls_still_writes_its_status_before_the_deadline() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        // Bound and never accepted: the handshake completes into the backlog
+        // and nothing ever writes back.
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback port");
+        let addr = silent.local_addr().expect("loopback address");
+        let argo: Vec<Value> = (0..40)
+            .map(|i| {
+                json!({
+                    "apiVersion": "argoproj.io/v1alpha1",
+                    "kind": "Application",
+                    "metadata": { "name": format!("argo-{i}"), "namespace": "argocd" },
+                    "spec": { "source": { "repoURL": format!("http://{addr}/acme/repo-{i}") } },
+                })
+            })
+            .collect();
+        let apps: Vec<Value> = (0..40)
+            .map(|i| {
+                json!({
+                    "apiVersion": "apprafter.io/v1alpha1",
+                    "kind": "Application",
+                    "metadata": { "name": format!("app-{i}"), "namespace": "landing" },
+                    "spec": { "base": { "image": format!("{addr}/acme/app-{i}:v1") } },
+                })
+            })
+            .collect();
+        let (client, log) = scripted_apiserver(move |call| {
+            if call.method == "GET" && call.uri.contains("argoproj.io/v1alpha1/applications") {
+                return list_of("argoproj.io/v1alpha1", "ApplicationList", argo.clone());
+            }
+            if call.method == "GET" && call.uri.contains("apprafter.io/v1alpha1/applications") {
+                return list_of("apprafter.io/v1alpha1", "ApplicationList", apps.clone());
+            }
+            happy_path(call)
+        });
+        let repo_prefix = format!("http://{addr}/acme/");
+        let host = format!("{addr}/acme/");
+        let mut cred = live_cred();
+        cred.spec = sc_spec(&[repo_prefix.as_str()], &[host.as_str()]);
+        let spec = cred.spec.clone();
+
+        let started = tokio::time::Instant::now();
+        let action = operator_core::deadline::within(
+            RECONCILE_DEADLINE,
+            reconcile(Arc::new(cred), context(client)),
+        )
+        .await
+        .expect("bounded probes leave the pass room to write its status");
+        let took = started.elapsed();
+        drop(silent);
+
+        assert!(
+            took <= validity::HALF_PROBE_BUDGET * 2,
+            "the probes ran {took:?}"
+        );
+        assert_eq!(
+            format!("{action:?}"),
+            format!("{:?}", Action::requeue(Duration::from_secs(60)))
+        );
+        let calls = calls_of(&log);
+        let status = call_at(&calls, "PATCH", "/sourcecredentials/acme/status");
+        let conditions = status
+            .body
+            .pointer("/status/conditions")
+            .and_then(Value::as_array)
+            .expect("conditions");
+        for type_ in [COND_GIT_VALID, COND_REGISTRY_VALID] {
+            let cond = conditions
+                .iter()
+                .find(|c| c.get("type").and_then(Value::as_str) == Some(type_))
+                .unwrap_or_else(|| panic!("no {type_} condition: {conditions:#?}"));
+            assert_eq!(
+                cond.get("status").and_then(Value::as_str),
+                Some("Unknown"),
+                "{cond}"
+            );
+            assert!(
+                cond.get("message")
+                    .and_then(Value::as_str)
+                    .is_some_and(|m| m.contains("probe budget")),
+                "{cond}"
+            );
+        }
+        assert_eq!(
+            status.body.pointer("/status/lastAppliedSpec"),
+            Some(&serde_json::to_value(&spec).expect("spec json")),
+            "the migration baseline must be stamped: {}",
+            status.body
+        );
+    }
+
+    /// A deadline cut on the PAUSE arm, after the gating plan's SSA landed but
+    /// while the paused-status write hung. The next pass must find that plan
+    /// by label, treat it — phase-less, nobody has approved it — as the gate
+    /// for this very change, and write the paused status naming it: no
+    /// second plan, no delete, no derivation. A second plan would split the
+    /// operator's approval across two objects; a derive would hand the
+    /// narrowed coverage out before anyone approved it.
+    #[tokio::test(start_paused = true)]
+    async fn a_pause_cut_after_the_plan_landed_re_pauses_on_that_same_plan() {
+        let narrowed = || {
+            let mut cred = live_cred();
+            cred.status = Some(SourceCredentialStatus {
+                last_applied_spec: Some(sc_spec(
+                    &["github.com/acme/", "github.com/acme-labs/"],
+                    &["ghcr.io/acme/"],
+                )),
+                ..SourceCredentialStatus::default()
+            });
+            cred
+        };
+
+        // Pass 1: the plan SSA is answered, the paused-status write never is.
+        let (client, log) = stalling_apiserver(
+            |call| call.method == "PATCH" && call.uri.contains("/sourcecredentials/acme/status"),
+            happy_path,
+        );
+        let err = operator_core::deadline::within(
+            RECONCILE_DEADLINE,
+            reconcile(Arc::new(narrowed()), context(client)),
+        )
+        .await
+        .expect_err("a pass whose status write never returns is abandoned");
+        assert!(matches!(err, ReconcileError::TimedOut(_)), "{err:?}");
+        let calls = calls_of(&log);
+        let created = call_at(&calls, "PATCH", "/migrationplans/").body.clone();
+        let plan_name = created
+            .pointer("/metadata/name")
+            .and_then(Value::as_str)
+            .expect("the plan has a name")
+            .to_string();
+        assert!(
+            position_of(&calls, "PATCH", "/secrets/").is_none(),
+            "the cut pass must not have derived anything: {calls:#?}"
+        );
+
+        // Pass 2: the plan pass 1 created is what the LIST now returns.
+        let (client, log) = scripted_apiserver(move |call| {
+            if call.method == "GET" && call.uri.contains("/migrationplans") {
+                return list_of(
+                    "apprafter.io/v1alpha1",
+                    "MigrationPlanList",
+                    vec![created.clone()],
+                );
+            }
+            happy_path(call)
+        });
+        reconcile(Arc::new(narrowed()), context(client))
+            .await
+            .expect("re-pausing is not an error");
+
+        let calls = calls_of(&log);
+        assert!(
+            position_of(&calls, "PATCH", "/migrationplans/").is_none(),
+            "the plan pass 1 created already gates — a second one splits the approval: {calls:#?}"
+        );
+        assert!(
+            position_of(&calls, "DELETE", "/migrationplans/").is_none(),
+            "the gating plan must not be deleted out from under the operator: {calls:#?}"
+        );
+        assert!(
+            position_of(&calls, "PATCH", "/secrets/").is_none(),
+            "a paused credential derives nothing: {calls:#?}"
+        );
+        let status = call_at(&calls, "PATCH", "/sourcecredentials/acme/status");
+        assert_eq!(
+            status.body.pointer("/status/phase").and_then(Value::as_str),
+            Some(PHASE_AWAITING_MIGRATION_APPROVAL)
+        );
+        let conditions = status
+            .body
+            .pointer("/status/conditions")
+            .and_then(Value::as_array)
+            .expect("conditions");
+        assert!(
+            conditions.iter().any(|c| c
+                .get("message")
+                .and_then(Value::as_str)
+                .is_some_and(|m| m.contains(&plan_name))),
+            "the paused status must name the plan pass 1 created ({plan_name}): {conditions:#?}"
+        );
+    }
 }
