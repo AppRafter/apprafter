@@ -286,6 +286,7 @@ fn runner_last_success(stack: &Value, kubeconfig: &std::path::Path) -> Option<St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::platform::RECONCILE_STALLED_SINCE;
     use serde_json::json;
 
     fn state() -> State {
@@ -391,6 +392,67 @@ mod tests {
         let rendered = lines.join("\n");
         assert!(rendered.contains("YankedVersion"), "{rendered}");
         assert!(rendered.contains("not healthy"), "{rendered}");
+    }
+
+    /// A stack whose `Synced` is healthy, with a `ReconcileStalled`
+    /// condition of `stall`'s status (none when `None`), running `current`.
+    fn stack_with_stall(current: &str, stall: Option<&str>) -> Value {
+        let mut conditions =
+            vec![json!({ "type": "Synced", "status": "True", "reason": "Ok", "message": "" })];
+        if let Some(status) = stall {
+            conditions.push(json!({
+                "type": "ReconcileStalled", "status": status, "reason": "ReconcileTimedOut",
+                "message": "the last reconcile did not finish within 120s and was abandoned; \
+                            the other conditions are from the last reconcile that finished"
+            }));
+        }
+        json!({ "status": {
+            "currentVersion": current, "availableVersion": current,
+            "conditions": conditions,
+        }})
+    }
+
+    /// WI-400, as `apprafter status` prints it. `platform.rs` classifies
+    /// the condition and marks one an older release carried forward; these
+    /// pin what of that reaches the reader through [`platform_lines`].
+    #[test]
+    fn a_stalled_platform_reconcile_reaches_the_reader() {
+        let stack = stack_with_stall(RECONCILE_STALLED_SINCE, Some("True"));
+        let rendered = platform_lines(PlatformRead::Found(&stack)).join("\n");
+        assert!(
+            rendered.contains("1 condition(s) not healthy"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("ReconcileStalled"), "{rendered}");
+        assert!(rendered.contains("ReconcileTimedOut"), "{rendered}");
+        assert!(!rendered.contains("NOT CURRENT"), "{rendered}");
+    }
+
+    #[test]
+    fn a_platform_that_is_not_stalled_keeps_its_one_line() {
+        // An operator older than WI-400 writes no such condition, a pass that
+        // finishes removes it, and a `False` (a hand edit) is no stall either.
+        for (current, stall) in [
+            (RECONCILE_STALLED_SINCE, None),
+            (RECONCILE_STALLED_SINCE, Some("False")),
+            ("0.2.80", None),
+        ] {
+            let stack = stack_with_stall(current, stall);
+            let lines = platform_lines(PlatformRead::Found(&stack));
+            assert_eq!(lines.len(), 1, "{current} {stall:?}: {lines:?}");
+        }
+    }
+
+    #[test]
+    fn a_stall_an_older_release_carried_forward_is_marked_not_current() {
+        // 0.2.80 is published, and older than any `RECONCILE_STALLED_SINCE`.
+        let stack = stack_with_stall("0.2.80", Some("True"));
+        let rendered = platform_lines(PlatformRead::Found(&stack)).join("\n");
+        assert!(
+            rendered.contains("1 condition(s) not healthy"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("NOT CURRENT"), "{rendered}");
     }
 
     #[test]
