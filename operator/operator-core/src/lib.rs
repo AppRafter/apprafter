@@ -3,6 +3,7 @@
 
 pub mod application;
 pub mod capacity;
+pub mod deadline;
 pub mod events;
 pub mod k8s_time;
 pub mod leader;
