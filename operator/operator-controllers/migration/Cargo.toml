@@ -26,3 +26,11 @@ chrono       = { workspace = true }
 serde        = { workspace = true }
 serde_json   = { workspace = true }
 async-trait  = { workspace = true }
+
+[dev-dependencies]
+# WI-400: the deadline tests run a reconcile against
+# `operator_core::testing::stalled_client()` — an apiserver that accepts every
+# request and never answers — on a paused clock (`test-util`), so the 190s
+# deadline elapses in no wall time and the moment it fires is exact.
+operator-core = { path = "../../operator-core", features = ["testing"] }
+tokio         = { workspace = true, features = ["test-util"] }

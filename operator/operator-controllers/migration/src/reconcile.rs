@@ -58,7 +58,34 @@ pub enum Error {
     UnknownScope(String),
     #[error("unknown phase {0:?} — webhook should have rejected this")]
     UnknownPhase(String),
+    /// The pass ran past [`RECONCILE_DEADLINE`] and was abandoned (WI-400).
+    #[error(transparent)]
+    TimedOut(#[from] operator_core::deadline::ReconcileTimedOut),
 }
+
+/// How long one MigrationPlan pass may run before it is abandoned (WI-400).
+///
+/// A pass makes at most three sequential apiserver calls — the rejected arm of
+/// a platform-scope plan reads `PlatformStack/default`, writes its `spec.pin`
+/// back, then seals `status.rejectedAt`; every other arm makes one status
+/// write or none — and a responsive apiserver answers or rejects each of them
+/// within its own 60s request timeout. Three of those plus 10s of headroom is
+/// 190s, so the deadline fires only once a call has outlived anything an
+/// apiserver would allow it, and well before the client's 295s read timeout
+/// would end even one stalled call.
+///
+/// `execute_step` is a no-op for every scope today. A real step runner must
+/// not run inline under this deadline — drive it as a Job and poll it — or a
+/// step longer than the deadline is cut at the same point on every attempt
+/// and never completes.
+///
+/// Abandoning a pass is safe. `status.executedSteps` is the progress marker,
+/// so a cut between a step and its record re-runs only that step, and a cut
+/// between `strategy.reject` and the `rejectedAt` seal re-runs a reject that
+/// short-circuits once the pin matches the snapshot — the same exposure a
+/// crash at that point already has. A timeout writes nothing: `error_policy`
+/// warns and requeues after `ERROR_REQUEUE_AFTER`.
+pub const RECONCILE_DEADLINE: Duration = Duration::from_secs(190);
 
 /// Reconciler context. Holds the kube client + both strategies
 /// pre-built — the per-call dispatch picks one by inspecting
@@ -88,7 +115,7 @@ pub async fn run(client: Client) -> Result<(), Error> {
         kube::runtime::watcher::Config::default().any_semantic(),
     )
     .shutdown_on_signal()
-    .run(reconcile, error_policy, ctx)
+    .run(reconcile_with_deadline, error_policy, ctx)
     .for_each(|res| async move {
         match res {
             Ok((obj, _)) => info!(plan = %obj.name, "migration reconcile completed"),
@@ -97,6 +124,17 @@ pub async fn run(client: Client) -> Result<(), Error> {
     })
     .await;
     Ok(())
+}
+
+/// [`reconcile`], abandoned once it runs past [`RECONCILE_DEADLINE`]. This —
+/// never the unbounded reconcile — is what [`run`] hands kube-runtime, which
+/// holds every later trigger for a plan while a pass for it is in flight
+/// (WI-400).
+async fn reconcile_with_deadline(
+    plan: Arc<MigrationPlan>,
+    ctx: Arc<Context>,
+) -> Result<Action, Error> {
+    operator_core::deadline::within(RECONCILE_DEADLINE, reconcile(plan, ctx)).await
 }
 
 fn error_policy(_obj: Arc<MigrationPlan>, err: &Error, _ctx: Arc<Context>) -> Action {
@@ -551,6 +589,101 @@ mod tests {
         assert!(
             !sealed,
             "freshly-rejected plan without rejectedAt marker must NOT be considered sealed"
+        );
+    }
+
+    // ---- WI-400: the reconcile deadline ----
+
+    /// The controller's context over an apiserver that accepts every request
+    /// and never answers.
+    fn stalled_context() -> Arc<Context> {
+        let client = operator_core::testing::stalled_client();
+        Arc::new(Context {
+            client: client.clone(),
+            application_strategy: ApplicationMigrationStrategy,
+            platform_strategy: PlatformMigrationStrategy::new(client),
+            sourcecredential_strategy: SourceCredentialMigrationStrategy,
+        })
+    }
+
+    /// The WARN line is the only report of a cut pass (this controller has no
+    /// metrics and `MigrationPlanStatus` has no condition to carry it), so the
+    /// timeout must read as a timeout, with its bound — not as "kube API
+    /// error", which sends an operator after RBAC or the network.
+    #[test]
+    fn a_timed_out_migration_pass_names_the_deadline_it_ran_past() {
+        let shown = Error::from(operator_core::deadline::ReconcileTimedOut {
+            after: RECONCILE_DEADLINE,
+        })
+        .to_string();
+        assert_eq!(shown, "reconcile did not finish within 190s");
+    }
+
+    /// The WI-400 hang on the FSM's own write: the `approved → executing`
+    /// status apply is accepted and never answered. Unbounded, the plan sits
+    /// at `approved` — and every later trigger for it is held — until the
+    /// client's 295s read timeout, or forever above the socket. Bounded, the
+    /// pass gives up at exactly [`RECONCILE_DEADLINE`] with this controller's
+    /// own error.
+    #[tokio::test(start_paused = true)]
+    async fn an_approved_plan_whose_status_write_never_answers_is_abandoned_at_the_deadline() {
+        let plan = Arc::new(build_plan("application", vec![step(1)], Some("approved")));
+        let started = tokio::time::Instant::now();
+
+        // Bounded from outside as well, so a pass that is no longer cut fails
+        // this test instead of hanging it.
+        let outcome = tokio::time::timeout(
+            RECONCILE_DEADLINE * 2,
+            reconcile_with_deadline(plan, stalled_context()),
+        )
+        .await
+        .expect("the deadline must cut a pass whose status write never answers");
+
+        assert_eq!(started.elapsed(), RECONCILE_DEADLINE);
+        match outcome {
+            Err(Error::TimedOut(timed_out)) => assert_eq!(timed_out.after, RECONCILE_DEADLINE),
+            other => panic!("expected Error::TimedOut, got {other:?}"),
+        }
+    }
+
+    /// The same bound covers the strategy, which is where a future real step
+    /// runner would hang: a rejected platform-scope plan reads
+    /// `PlatformStack/default` before it can revert the pin, and that read is
+    /// accepted and never answered.
+    #[tokio::test(start_paused = true)]
+    async fn a_rejected_plan_whose_pin_read_never_answers_is_abandoned_at_the_deadline() {
+        let mut plan = build_plan("platform", vec![], Some("rejected"));
+        plan.spec.previous_spec_snapshot = Some(json!({ "pin": "0.2.70" }));
+        let started = tokio::time::Instant::now();
+
+        let outcome = tokio::time::timeout(
+            RECONCILE_DEADLINE * 2,
+            reconcile_with_deadline(Arc::new(plan), stalled_context()),
+        )
+        .await
+        .expect("the deadline must cut a pass whose strategy never answers");
+
+        assert_eq!(started.elapsed(), RECONCILE_DEADLINE);
+        assert!(
+            matches!(outcome, Err(Error::TimedOut(_))),
+            "expected Error::TimedOut, got {outcome:?}"
+        );
+    }
+
+    /// The deadline only exists if `run` hands kube-runtime the BOUNDED
+    /// reconcile; a `Controller` needs a live watch, so the run site is read
+    /// instead. The needle is assembled with `concat!` so this test's own
+    /// text can never satisfy it.
+    #[test]
+    fn the_migration_controller_runs_the_deadline_bounded_reconcile() {
+        let production = include_str!("reconcile.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("reconcile.rs has production code above its test module");
+        let wired = concat!(".run(reconcile_with_", "deadline, error_policy, ctx)");
+        assert!(
+            production.contains(wired),
+            "run() must drive reconcile_with_deadline, not the unbounded reconcile"
         );
     }
 }
