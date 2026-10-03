@@ -173,6 +173,61 @@ struct Context {
     /// so a node's kubelet is hit at most once per TTL per controller rather
     /// than once per reconcile.
     capacity: operator_core::capacity::CapacityCache,
+    /// Where published versions are read from: [`OciRegistry`] in
+    /// production. See [`Upstream`].
+    upstream: Arc<dyn Upstream>,
+}
+
+/// The two questions the reconcile asks the published chart repository.
+///
+/// A SEAM, and only one: production has exactly one implementation,
+/// [`OciRegistry`]. It exists so a whole reconcile can be driven against an
+/// upstream that never answers (WI-400). A real socket cannot stand in for
+/// that once the registry client has its own connect and read bounds — they
+/// fire first, so a test on a silent socket would pass with the reconcile's
+/// whole-operation budget removed.
+#[async_trait::async_trait]
+trait Upstream: Send + Sync {
+    /// The channel-latest; see [`resolve_channel_latest`].
+    async fn channel_latest(
+        &self,
+        upstream: &str,
+        channel: Channel,
+        channel_label: &str,
+    ) -> Result<(String, bool, Option<CompatibilityDoc>), Error>;
+
+    /// The most destructive change class between two versions; see
+    /// [`fetch_path_max_change_class`].
+    async fn path_max_change_class(
+        &self,
+        upstream: &str,
+        from_version: &str,
+        to_version: &str,
+    ) -> Result<ChangeClass, CompatError>;
+}
+
+/// The OCI registry named by `spec.source.upstream`.
+struct OciRegistry;
+
+#[async_trait::async_trait]
+impl Upstream for OciRegistry {
+    async fn channel_latest(
+        &self,
+        upstream: &str,
+        channel: Channel,
+        channel_label: &str,
+    ) -> Result<(String, bool, Option<CompatibilityDoc>), Error> {
+        resolve_channel_latest(upstream, channel, channel_label).await
+    }
+
+    async fn path_max_change_class(
+        &self,
+        upstream: &str,
+        from_version: &str,
+        to_version: &str,
+    ) -> Result<ChangeClass, CompatError> {
+        fetch_path_max_change_class(upstream, from_version, to_version).await
+    }
 }
 
 pub async fn run(client: Client, metrics: Arc<Metrics>) -> Result<(), Error> {
@@ -198,6 +253,7 @@ pub async fn run(client: Client, metrics: Arc<Metrics>) -> Result<(), Error> {
         metrics,
         app_api_resource,
         capacity: operator_core::capacity::CapacityCache::new(),
+        upstream: Arc::new(OciRegistry),
     });
 
     info!(
@@ -465,7 +521,11 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
     // propagates.
     let mut upstream_poll_error: Option<String> = None;
     let (channel_latest_str, did_poll_oci, compat_doc) = if should_poll_oci {
-        match resolve_channel_latest(&spec.source.upstream, channel, &spec.channel).await {
+        match ctx
+            .upstream
+            .channel_latest(&spec.source.upstream, channel, &spec.channel)
+            .await
+        {
             Ok(resolved) => resolved,
             Err(e) => {
                 let msg = e.to_string();
@@ -664,12 +724,14 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
             // status with UpstreamReachable=False, then requeues) and
             // the pin applies once the upstream recovers and the
             // transition can be classified.
-            match fetch_path_max_change_class(
-                &spec.source.upstream,
-                &current_target,
-                &desired.target_revision,
-            )
-            .await
+            match ctx
+                .upstream
+                .path_max_change_class(
+                    &spec.source.upstream,
+                    &current_target,
+                    &desired.target_revision,
+                )
+                .await
             {
                 Err(e) => {
                     warn!(
@@ -3723,6 +3785,7 @@ mod backup_reconcile_tests {
                 kind: "Application".into(),
             }),
             capacity: operator_core::capacity::CapacityCache::new(),
+            upstream: Arc::new(super::test_upstreams::NoRegistry),
         })
     }
 
@@ -4137,5 +4200,423 @@ mod backup_reconcile_tests {
             patch.body
         );
         assert_everything_else_carried(patch);
+    }
+}
+
+/// Stand-ins for the published chart repository, for the whole-reconcile
+/// tests. None of them touches the network.
+#[cfg(test)]
+mod test_upstreams {
+    use super::*;
+
+    /// Fails the test if the reconcile asks the registry anything. For
+    /// fixtures whose `lastUpstreamCheck` is fresh: a request there would
+    /// otherwise go to ghcr.io.
+    pub(super) struct NoRegistry;
+
+    #[async_trait::async_trait]
+    impl Upstream for NoRegistry {
+        async fn channel_latest(
+            &self,
+            upstream: &str,
+            _: Channel,
+            _: &str,
+        ) -> Result<(String, bool, Option<CompatibilityDoc>), Error> {
+            panic!("this test does not reach the registry, but the reconcile asked {upstream} for the channel-latest")
+        }
+
+        async fn path_max_change_class(
+            &self,
+            upstream: &str,
+            from_version: &str,
+            to_version: &str,
+        ) -> Result<ChangeClass, CompatError> {
+            panic!(
+                "this test does not reach the registry, but the reconcile asked {upstream} \
+                 to classify {from_version} -> {to_version}"
+            )
+        }
+    }
+
+    /// A registry that answers at once: `latest` is the channel-latest and
+    /// every transition classifies as `class`.
+    pub(super) struct Published {
+        pub(super) latest: &'static str,
+        pub(super) class: ChangeClass,
+    }
+
+    #[async_trait::async_trait]
+    impl Upstream for Published {
+        async fn channel_latest(
+            &self,
+            _: &str,
+            _: Channel,
+            _: &str,
+        ) -> Result<(String, bool, Option<CompatibilityDoc>), Error> {
+            Ok((self.latest.to_string(), true, None))
+        }
+
+        async fn path_max_change_class(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<ChangeClass, CompatError> {
+            Ok(self.class)
+        }
+    }
+}
+
+/// Whole reconciles against an apiserver and a registry that may never
+/// answer (WI-400). The apiserver is scripted and MUTABLE between passes, so
+/// a test can cut one reconcile mid-flight and then run the one that
+/// follows it against what the first left behind.
+#[cfg(test)]
+mod bounded_reconcile_tests {
+    use std::sync::{Arc, Mutex};
+
+    use kube::client::Body;
+    use operator_core::Metrics;
+    use serde_json::{json, Value};
+
+    use super::test_upstreams::Published;
+    use super::*;
+
+    const NS: &str = "/namespaces/apprafter-system";
+    const PARENT: &str = "/apis/argoproj.io/v1alpha1/namespaces/argocd/applications/platform";
+    const ANCHOR: &str = "/api/v1/namespaces/apprafter-system/configmaps/platform-migration-anchor";
+    const STATUS: &str =
+        "/apis/apprafter.io/v1alpha1/namespaces/apprafter-system/platformstacks/default/status";
+    const PLANS: &str = "/apis/apprafter.io/v1alpha1/namespaces/apprafter-system/migrationplans";
+    const EVENTS: &str = "/apis/events.k8s.io/v1/namespaces/apprafter-system/events";
+
+    #[derive(Clone, Debug)]
+    struct Call {
+        method: String,
+        uri: String,
+        body: Value,
+    }
+
+    impl Call {
+        fn path(&self) -> &str {
+            self.uri.split('?').next().unwrap_or("")
+        }
+
+        fn is(&self, method: &str, path: &str) -> bool {
+            self.method == method && self.path() == path
+        }
+    }
+
+    /// What the scripted apiserver holds. Writes land in it, so the next
+    /// pass reads what the last one left.
+    struct Cluster {
+        stack: Value,
+        parent: Value,
+        plans: Vec<Value>,
+        anchor: Option<Value>,
+        /// `(method, path)` pairs the apiserver accepts and never answers.
+        silent: Vec<(&'static str, String)>,
+        calls: Vec<Call>,
+    }
+
+    type Shared = Arc<Mutex<Cluster>>;
+
+    fn ok(body: Value) -> (u16, Value) {
+        (200, body)
+    }
+
+    fn not_found() -> (u16, Value) {
+        (
+            404,
+            json!({ "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                    "reason": "NotFound", "code": 404, "message": "not found" }),
+        )
+    }
+
+    fn list(kind: &str, api_version: &str, items: &[Value]) -> (u16, Value) {
+        ok(json!({ "apiVersion": api_version, "kind": kind,
+                   "metadata": { "resourceVersion": "1" }, "items": items }))
+    }
+
+    fn respond(cluster: &mut Cluster, call: &Call) -> (u16, Value) {
+        let path = call.path().to_string();
+        let plan_name = path.strip_prefix(&format!("{PLANS}/")).map(str::to_string);
+        match (call.method.as_str(), path.as_str()) {
+            ("GET", PARENT) => ok(cluster.parent.clone()),
+            ("PATCH", PARENT) => {
+                let source = &call.body["spec"]["source"];
+                cluster.parent["spec"]["source"]["targetRevision"] =
+                    source["targetRevision"].clone();
+                cluster.parent["spec"]["source"]["helm"] = source["helm"].clone();
+                ok(cluster.parent.clone())
+            }
+            ("GET", PLANS) => list("MigrationPlanList", "apprafter.io/v1alpha1", &cluster.plans),
+            ("POST", PLANS) => {
+                cluster.plans.push(call.body.clone());
+                (201, call.body.clone())
+            }
+            ("GET", _) if plan_name.is_some() => {
+                let name = plan_name.unwrap();
+                match cluster.plans.iter().find(|p| p["metadata"]["name"] == name) {
+                    Some(plan) => ok(plan.clone()),
+                    None => not_found(),
+                }
+            }
+            ("DELETE", _) if plan_name.is_some() => {
+                let name = plan_name.unwrap();
+                cluster.plans.retain(|p| p["metadata"]["name"] != name);
+                ok(
+                    json!({ "kind": "Status", "apiVersion": "v1", "status": "Success",
+                           "metadata": {} }),
+                )
+            }
+            ("GET", ANCHOR) => match &cluster.anchor {
+                Some(anchor) => ok(anchor.clone()),
+                None => not_found(),
+            },
+            ("PATCH", ANCHOR) => ok(cluster
+                .anchor
+                .clone()
+                .expect("only an existing anchor is patched")),
+            ("GET", "/api/v1/nodes") => list("NodeList", "v1", &[]),
+            ("GET", p) if p == format!("/apis/batch/v1{NS}/cronjobs") => {
+                list("CronJobList", "batch/v1", &[])
+            }
+            ("GET", p) if p == format!("/apis/batch/v1{NS}/jobs") => {
+                list("JobList", "batch/v1", &[])
+            }
+            ("GET", p) if p == format!("/api/v1{NS}/pods") => list("PodList", "v1", &[]),
+            ("GET", p) if p == format!("/api/v1{NS}/configmaps/apprafter-backup-status") => {
+                not_found()
+            }
+            ("GET", STATUS) => ok(cluster.stack.clone()),
+            ("PATCH", STATUS) => {
+                cluster.stack["status"] = call.body["status"].clone();
+                ok(cluster.stack.clone())
+            }
+            ("POST", EVENTS) => (201, call.body.clone()),
+            _ => panic!("unscripted request: {} {}", call.method, call.uri),
+        }
+    }
+
+    fn scripted(cluster: Cluster) -> (Client, Shared) {
+        let shared: Shared = Arc::new(Mutex::new(cluster));
+        let state = shared.clone();
+        let service = tower::service_fn(move |req: http::Request<Body>| {
+            let state = state.clone();
+            async move {
+                let method = req.method().to_string();
+                let uri = req.uri().to_string();
+                let bytes = req.into_body().collect_bytes().await.expect("request body");
+                let call = Call {
+                    method,
+                    uri,
+                    body: serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+                };
+                let answer = {
+                    let mut cluster = state.lock().expect("cluster");
+                    cluster.calls.push(call.clone());
+                    let silent = cluster
+                        .silent
+                        .iter()
+                        .any(|(m, p)| *m == call.method && p.as_str() == call.path());
+                    (!silent).then(|| respond(&mut cluster, &call))
+                };
+                let Some((code, payload)) = answer else {
+                    std::future::pending::<()>().await;
+                    unreachable!("a silent request is never answered");
+                };
+                Ok::<_, std::convert::Infallible>(
+                    http::Response::builder()
+                        .status(code)
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&payload).expect("payload")))
+                        .expect("response"),
+                )
+            }
+        });
+        (Client::new(service, "apprafter-system"), shared)
+    }
+
+    fn context(client: Client, upstream: Arc<dyn Upstream>) -> Arc<Context> {
+        Arc::new(Context {
+            client,
+            metrics: Arc::new(Metrics::new()),
+            app_api_resource: ApiResource::from_gvk(&GroupVersionKind {
+                group: "argoproj.io".into(),
+                version: "v1alpha1".into(),
+                kind: "Application".into(),
+            }),
+            capacity: operator_core::capacity::CapacityCache::new(),
+            upstream,
+        })
+    }
+
+    fn prior_condition(type_: &str, status: &str, reason: &str) -> Value {
+        json!({ "type": type_, "status": status, "reason": reason, "message": "m",
+                "lastTransitionTime": "2026-09-01T00:00:00+00:00" })
+    }
+
+    /// `PlatformStack/default` settled on `version`, pinned to `pin`,
+    /// polled a moment ago (so no registry request unless a test clears
+    /// `lastUpstreamCheck`), with every condition a settled cluster carries.
+    fn stack_on(version: &str, pin: &str) -> Value {
+        json!({
+            "apiVersion": "apprafter.io/v1alpha1", "kind": "PlatformStack",
+            "metadata": { "name": "default", "namespace": "apprafter-system", "generation": 3,
+                          "uid": "ps-uid" },
+            "spec": {
+                "channel": "stable", "pin": pin,
+                "source": { "upstream": "oci://ghcr.io/apprafter/platform-stack",
+                            "repoURL": "oci://ghcr.io/apprafter/platform-stack",
+                            "checkInterval": "6h" },
+                "values": { "tier": 1 },
+            },
+            "status": {
+                "currentVersion": version, "targetVersion": version,
+                "availableVersion": pin, "lastUpstreamCheck": Utc::now().to_rfc3339(),
+                "versionHistory": [{ "version": version,
+                                     "appliedAt": "2026-09-20T00:00:00+00:00",
+                                     "outcome": "succeeded" }],
+                "conditions": [
+                    prior_condition("Ready", "True", "Healthy"),
+                    prior_condition("Synced", "True", "Reconciled"),
+                    prior_condition("UpstreamReachable", "True", "Reachable"),
+                    prior_condition("YankedVersion", "False", "NotYanked"),
+                    prior_condition("MigrationPending", "False", "Clean"),
+                    prior_condition("UpgradeAvailable", "False", "UpToDate"),
+                    prior_condition("UnauthorizedSourceModification", "False", "Clean"),
+                ],
+            },
+        })
+    }
+
+    /// The root Application on `target`, synced, healthy, its source owned
+    /// by `platform-controller`.
+    fn parent_on(stack: &Value, target: &str) -> Value {
+        let spec: PlatformStack = serde_json::from_value(stack.clone()).expect("stack");
+        let desired = build_desired(&spec.spec, target);
+        json!({
+            "apiVersion": "argoproj.io/v1alpha1", "kind": "Application",
+            "metadata": {
+                "name": "platform", "namespace": "argocd",
+                "managedFields": [{ "manager": "platform-controller", "operation": "Apply",
+                                    "fieldsV1": { "f:spec": { "f:source": { "f:targetRevision": {} } } } }],
+            },
+            "spec": { "source": { "targetRevision": target,
+                                  "helm": { "valuesObject": desired.helm_values } } },
+            "status": { "sync": { "status": "Synced" }, "health": { "status": "Healthy" },
+                        "operationState": { "phase": "Succeeded" } },
+        })
+    }
+
+    fn cluster(stack: Value, parent: Value) -> Cluster {
+        Cluster {
+            stack,
+            parent,
+            plans: vec![],
+            anchor: None,
+            silent: vec![],
+            calls: vec![],
+        }
+    }
+
+    fn the_stack(state: &Shared) -> Arc<PlatformStack> {
+        let stack = state.lock().unwrap().stack.clone();
+        Arc::new(serde_json::from_value(stack).expect("stack"))
+    }
+
+    fn calls(state: &Shared) -> Vec<Call> {
+        state.lock().unwrap().calls.clone()
+    }
+
+    /// The one status patch the reconcile sent.
+    fn status_patch(calls: &[Call]) -> Call {
+        let patches: Vec<&Call> = calls.iter().filter(|c| c.is("PATCH", STATUS)).collect();
+        assert_eq!(patches.len(), 1, "one status write: {calls:#?}");
+        patches[0].clone()
+    }
+
+    fn written_condition<'a>(patch: &'a Call, type_: &str) -> &'a Value {
+        patch.body["status"]["conditions"]
+            .as_array()
+            .expect("the patch carries the conditions")
+            .iter()
+            .find(|c| c["type"] == type_)
+            .unwrap_or_else(|| panic!("{type_} must ride the write: {:#}", patch.body))
+    }
+
+    /// Every condition rides the write, under the controller's own SSA
+    /// identity: a write that left one out would prune it.
+    fn assert_every_condition_carried(patch: &Call) {
+        for t in [
+            "Ready",
+            "Synced",
+            "UpstreamReachable",
+            "YankedVersion",
+            "MigrationPending",
+            "UpgradeAvailable",
+            "UnauthorizedSourceModification",
+        ] {
+            written_condition(patch, t);
+        }
+        assert!(
+            patch.uri.contains("fieldManager=platform-controller")
+                && patch.uri.contains("force=true"),
+            "{}",
+            patch.uri
+        );
+    }
+
+    /// The channel-latest comes from the upstream behind `ctx.upstream`.
+    #[tokio::test]
+    async fn the_channel_latest_is_read_through_the_upstream() {
+        let mut stack = stack_on("0.2.80", "0.2.80");
+        stack["status"]["lastUpstreamCheck"] = Value::Null;
+        let parent = parent_on(&stack, "0.2.80");
+        let (client, state) = scripted(cluster(stack, parent));
+        let upstream = Arc::new(Published {
+            latest: "0.2.81",
+            class: ChangeClass::Safe,
+        });
+        reconcile(the_stack(&state), context(client, upstream))
+            .await
+            .expect("the reconcile succeeds");
+        let patch = status_patch(&calls(&state));
+        assert_eq!(patch.body["status"]["availableVersion"], "0.2.81");
+        assert_eq!(
+            written_condition(&patch, "UpstreamReachable")["status"],
+            "True"
+        );
+        assert_every_condition_carried(&patch);
+    }
+
+    /// A transition is classified through `ctx.upstream` too: a breaking one
+    /// is gated behind a MigrationPlan instead of deployed.
+    #[tokio::test]
+    async fn a_transition_is_classified_through_the_upstream() {
+        let stack = stack_on("0.2.80", "0.2.81");
+        let parent = parent_on(&stack, "0.2.80");
+        let (client, state) = scripted(cluster(stack, parent));
+        let upstream = Arc::new(Published {
+            latest: "0.2.81",
+            class: ChangeClass::Breaking,
+        });
+        reconcile(the_stack(&state), context(client, upstream))
+            .await
+            .expect("the reconcile succeeds");
+        let calls = calls(&state);
+        assert!(
+            calls.iter().any(|c| c.is("POST", PLANS)
+                && c.body["metadata"]["name"] == "platform-0-2-80-to-0-2-81"),
+            "{calls:#?}"
+        );
+        let patch = status_patch(&calls);
+        assert_eq!(
+            written_condition(&patch, "MigrationPending")["status"],
+            "True"
+        );
+        assert_eq!(patch.body["status"]["currentVersion"], "0.2.80");
+        assert_every_condition_carried(&patch);
     }
 }
