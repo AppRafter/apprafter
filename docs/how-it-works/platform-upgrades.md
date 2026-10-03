@@ -72,10 +72,10 @@ reconcile that finishes removes it.
 Nothing else is written for the abandoned reconcile: the versions, the history
 and every other condition are from the last reconcile that finished. Each
 abandoned reconcile also leaves a `ReconcileTimedOut` Warning Event on the
-stack, which `kubectl describe platformstack default` keeps after the condition
-is gone. An approval already given for an upgrade is kept until the controller
-has moved the platform's root Application to the new version, so an abandoned
-reconcile cannot cost it.
+stack, which `kubectl -n apprafter-system describe platformstack default` keeps
+after the condition is gone. An approval already given for an upgrade is kept
+until the controller has moved the platform's root Application to the new
+version, so an abandoned reconcile cannot cost it.
 
 A registry that does not answer is not a stall. Every question the controller
 asks the registry has its own bound of 20 seconds, and an unanswered one reads
