@@ -73,7 +73,20 @@ pub fn parse_labelled_gauge(text: &str, metric: &str, label: &str, value: &str) 
     None
 }
 
-/// Best-effort GET of a pod's HTTP endpoint through the apiserver pod-proxy.
+/// How long one pod-proxy scrape may take before it is given up on.
+///
+/// The client's own read timeout (295s) is no bound here: it resets on every
+/// read, and the apiserver exempts the `proxy` subresource from its 60s
+/// request timeout because a proxied request is long-running by nature. A
+/// stalled exporter could therefore hold a reconcile for minutes — and on the
+/// claim provisioner, which runs one reconcile at a time, every other claim
+/// with it. 15s is generous for a body the exporter renders in milliseconds,
+/// and short enough to stay well inside the reconcile deadline even when
+/// [`MetricsCache::body_for_pod`] misses and the caller re-scrapes once.
+pub const SCRAPE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Best-effort GET of a pod's HTTP endpoint through the apiserver pod-proxy,
+/// bounded by [`SCRAPE_TIMEOUT`].
 ///
 /// `None` on any failure — an unreachable pod, a non-2xx, a body that is not
 /// UTF-8. This is a decorative read: it must never fail the reconcile that
@@ -97,10 +110,13 @@ pub async fn scrape_pod(
     let req = http::Request::get(&url)
         .body(Vec::new())
         .map_err(|e| format!("building the pod-proxy request: {e}"))?;
-    client
-        .request_text(req)
-        .await
-        .map_err(|e| format!("GET {url}: {e}"))
+    match tokio::time::timeout(SCRAPE_TIMEOUT, client.request_text(req)).await {
+        Ok(answered) => answered.map_err(|e| format!("GET {url}: {e}")),
+        Err(_elapsed) => Err(format!(
+            "GET {url}: no answer within {}s",
+            SCRAPE_TIMEOUT.as_secs()
+        )),
+    }
 }
 
 /// The apiserver path that proxies to `pod`'s HTTP endpoint.
@@ -596,6 +612,46 @@ cnpg_collector_up 1
             ttl: std::time::Duration::ZERO,
         };
         cache.store(cache_key("cnpg-system", "pg-1"), "stale".to_string());
+        assert_eq!(cache.cached_fresh(&cache_key("cnpg-system", "pg-1")), None);
+    }
+
+    // -----------------------------------------------------------------
+    // the scrape bound (WI-400)
+    // -----------------------------------------------------------------
+
+    #[tokio::test(start_paused = true)]
+    async fn a_scrape_that_never_answers_is_given_up_on_at_the_bound() {
+        // Every request accepted and never answered: an exporter, or the
+        // apiserver's proxy to it, gone quiet.
+        let client = crate::testing::stalled_client();
+        let started = tokio::time::Instant::now();
+        // Bounded from outside as well, so a missing bound fails the test
+        // rather than hanging it.
+        let got = tokio::time::timeout(
+            SCRAPE_TIMEOUT * 2,
+            scrape_pod(&client, "cnpg-system", "pg-1", 9187, "/metrics"),
+        )
+        .await
+        .expect("scrape_pod must give up on its own");
+        let err = got.expect_err("nothing answered");
+        assert!(err.contains("no answer within 15s"), "{err}");
+        assert!(err.contains("/pods/pg-1:9187/proxy/metrics"), "{err}");
+        assert_eq!(started.elapsed(), SCRAPE_TIMEOUT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_scrape_is_not_cached() {
+        // The cache's no-failure rule holds for a timeout too: the next tick
+        // must try again rather than inherit the stall.
+        let client = crate::testing::stalled_client();
+        let cache = MetricsCache::new();
+        let got = tokio::time::timeout(
+            SCRAPE_TIMEOUT * 2,
+            cache.body_for_pod(&client, "cnpg-system", "pg-1", 9187, "/metrics"),
+        )
+        .await
+        .expect("body_for_pod must give up on its own");
+        assert!(got.is_err(), "{got:?}");
         assert_eq!(cache.cached_fresh(&cache_key("cnpg-system", "pg-1")), None);
     }
 }

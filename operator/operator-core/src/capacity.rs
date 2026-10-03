@@ -40,7 +40,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Node-free fraction below which a `CapacityWarning` fires. 0.15 ⇒ warn
 /// when the node filesystem is more than 85% full.
@@ -51,6 +51,16 @@ pub const DEFAULT_NODE_FREE_THRESHOLD: f64 = 0.15;
 /// node's kubelet is hit at most once per TTL across all reconciles in the
 /// window — keeping the per-reconcile poll cheap.
 const CACHE_TTL: Duration = Duration::from_secs(30);
+
+/// How long one kubelet Summary fetch may take before it is given up on.
+///
+/// The client's read timeout (295s) does not bound it: that timer resets on
+/// every read, and the apiserver exempts the `nodes/proxy` subresource from
+/// its 60s request timeout. A wedged kubelet would otherwise hold the caller
+/// for minutes — the claim provisioner's disk path samples BEFORE its terminal
+/// status write, and on a miss it samples twice. 15s is far above a healthy
+/// kubelet's milliseconds and keeps both samples inside the reconcile deadline.
+pub const FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 
 // ---------------------------------------------------------------------------
 // Pure parsers + predicates (unit-tested without a cluster)
@@ -278,7 +288,8 @@ impl CapacityCache {
     }
 
     /// Best-effort raw fetch of the kubelet Summary API through the
-    /// apiserver node-proxy subresource. Any failure ⇒ `None` (logged).
+    /// apiserver node-proxy subresource, bounded by [`FETCH_TIMEOUT`]. Any
+    /// failure ⇒ `None` (logged).
     async fn fetch(client: &kube::Client, node: &str) -> Option<Value> {
         let path = node_summary_path(node);
         let req = match http::Request::get(&path).body(Vec::new()) {
@@ -288,12 +299,22 @@ impl CapacityCache {
                 return None;
             }
         };
-        match client.request::<Value>(req).await {
-            Ok(v) => Some(v),
-            Err(e) => {
+        match tokio::time::timeout(FETCH_TIMEOUT, client.request::<Value>(req)).await {
+            Ok(Ok(v)) => Some(v),
+            Ok(Err(e)) => {
                 // RBAC denial / kubelet unreachable / non-JSON body all land
                 // here — capacity is decorative, so swallow and continue.
                 debug!(%node, error = %e, "capacity: kubelet Summary fetch failed (continuing without capacity)");
+                None
+            }
+            Err(_elapsed) => {
+                // WARN, unlike the line above: an answer that never comes is
+                // a wedged kubelet or proxy, which nothing else reports.
+                warn!(
+                    %node,
+                    after_secs = FETCH_TIMEOUT.as_secs(),
+                    "capacity: kubelet Summary fetch did not answer in time (continuing without capacity)"
+                );
                 None
             }
         }
@@ -655,5 +676,27 @@ mod tests {
         let cache = CapacityCache::new();
         cache.store("node-a", json!({ "node": {} }));
         assert!(cache.cached_fresh("node-a", Duration::ZERO).is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // the fetch bound (WI-400)
+    // -----------------------------------------------------------------
+
+    #[tokio::test(start_paused = true)]
+    async fn a_kubelet_that_never_answers_is_given_up_on_at_the_bound() {
+        // Every request accepted and never answered: a kubelet, or the
+        // apiserver's proxy to it, gone quiet.
+        let client = crate::testing::stalled_client();
+        let cache = CapacityCache::new();
+        let started = tokio::time::Instant::now();
+        // Bounded from outside as well, so a missing bound fails the test
+        // rather than hanging it.
+        let got = tokio::time::timeout(FETCH_TIMEOUT * 2, cache.summary_for_node(&client, "n1"))
+            .await
+            .expect("summary_for_node must give up on its own");
+        assert_eq!(got, None);
+        assert_eq!(started.elapsed(), FETCH_TIMEOUT);
+        // …and the stall is not remembered: the next reconcile asks again.
+        assert_eq!(cache.cached_fresh("n1", CACHE_TTL), None);
     }
 }
