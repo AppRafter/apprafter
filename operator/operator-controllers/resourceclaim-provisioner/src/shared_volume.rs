@@ -79,6 +79,11 @@ const SV_PVC_FINALIZER: &str = "apprafter.io/sharedvolume-pvc-cleanup";
 /// is carried forward ([`carried_capacity`]), never dropped.
 pub const CAPACITY_SAMPLE_BUDGET: Duration = Duration::from_secs(10);
 
+/// How long the edge-triggered `CapacityWarning` Event publish may take
+/// (WI-400). It runs before the terminal status write (step 8 of
+/// [`reconcile_shared_volume`]), so it must not be able to hold that write.
+const CAPACITY_EVENT_BOUND: Duration = Duration::from_secs(5);
+
 /// StorageClass the SharedVolume backend falls back to when the matched
 /// `shared-disk` ServiceProvider config omits `/storageClass`.
 const DEFAULT_STORAGE_CLASS: &str = "local-path";
@@ -627,31 +632,27 @@ pub async fn reconcile_shared_volume(
         }
     };
 
-    // 7. Write the terminal status — ready / pvcRef / refCount / capacity /
-    //    BOTH the `Ready` and (when sampled or carried) the `CapacityWarning`
-    //    conditions, under our own field manager (never `.spec`). SSA
-    //    REPLACES the manager's field-set, so both conditions ride one body.
+    // 7. Build the terminal conditions: `Ready`, plus the `CapacityWarning`
+    //    step 6 sampled or carried. Step 9 writes them.
     let ready_cond = ready_condition(
         "True",
         "Provisioned",
         &format!("provisioned PVC {pvc_name} (class {storage_class})"),
         &prior,
     );
-    patch_shared_volume_status_with_conditions(
-        &ctx.client,
-        &ns,
-        &name,
-        true,
-        Some(&pvc_name),
-        ref_count,
-        sv_capacity,
-        ready_cond,
-        capacity_cond,
-    )
-    .await?;
 
     // 8. Edge-triggered Warning Event on an OK→warning transition only
     //    (anti-spam). Best-effort: a publish failure is logged, not fatal.
+    //
+    //    Sent BEFORE the status write below, and bounded (WI-400). The edge
+    //    is read from the condition the object carries, and the write below
+    //    is what records the crossing — so with the Event after the write, a
+    //    pass cut between the two (the reconcile deadline, or a crash) lost
+    //    the Event for good: the next pass reads `was_warning = true`. In
+    //    this order a cut before the write repeats the Event next pass
+    //    instead; a duplicate Warning is the cheaper failure. A carried
+    //    sample (step 6) takes `now_warning` from the same condition as
+    //    `was_warning`, so it never sends one.
     let was_warning = was_capacity_warning(&prior);
     if should_emit_event(was_warning, now_warning) {
         let pct_used = sv_capacity
@@ -674,10 +675,34 @@ pub async fn reconcile_shared_volume(
             action: "Provision".into(),
             secondary: None,
         };
-        if let Err(e) = recorder.publish(ev).await {
-            warn!(%name, %ns, error = %e, "failed to publish CapacityWarning event (continuing)");
+        match tokio::time::timeout(CAPACITY_EVENT_BOUND, recorder.publish(ev)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                warn!(%name, %ns, error = %e, "failed to publish CapacityWarning event (continuing)")
+            }
+            Err(_) => warn!(
+                %name, %ns, bound_secs = CAPACITY_EVENT_BOUND.as_secs(),
+                "CapacityWarning event publish did not answer within its bound (continuing)"
+            ),
         }
     }
+
+    // 9. Write the terminal status — ready / pvcRef / refCount / capacity /
+    //    BOTH the `Ready` and (when sampled or carried) the `CapacityWarning`
+    //    conditions, under our own field manager (never `.spec`). SSA
+    //    REPLACES the manager's field-set, so both conditions ride one body.
+    patch_shared_volume_status_with_conditions(
+        &ctx.client,
+        &ns,
+        &name,
+        true,
+        Some(&pvc_name),
+        ref_count,
+        sv_capacity,
+        ready_cond,
+        capacity_cond,
+    )
+    .await?;
 
     // SharedVolume provisioning is deliberately counted under the shared
     // `claim_provisioned_total` metric with the synthetic `shared-disk`
@@ -1399,5 +1424,200 @@ mod capacity_budget_tests {
         // A second miss in a row carries the same message, not a longer one.
         let again = carried_capacity_condition(std::slice::from_ref(&first)).expect("carried");
         assert_eq!(again, first);
+    }
+}
+
+/// WI-400: the order and the bound of the SharedVolume reconcile's
+/// edge-triggered Event, and its deadline, driven through the scripted
+/// apiserver (`crate::route_apiserver`) on a paused clock.
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+    use crate::route_apiserver::{apiserver, calls_to, route, Reply, Route};
+    use operator_core::{Metrics, SharedVolumeSpec};
+
+    /// Longer than any bound under test, so a bound that stops cutting fails
+    /// the test instead of hanging it.
+    const OUTER_GUARD: Duration = Duration::from_secs(600);
+
+    const PROVIDERS: &str = "/apis/apprafter.io/v1alpha1/serviceproviders";
+    const PVC: &str = "/api/v1/namespaces/apps/persistentvolumeclaims/sv-apps-data";
+    const CLAIMS: &str = "/apis/apprafter.io/v1alpha1/namespaces/apps/resourceclaims";
+    const NODES: &str = "/api/v1/nodes";
+    const SUMMARY: &str = "/api/v1/nodes/n1/proxy/stats/summary";
+    const EVENTS: &str = "/apis/events.k8s.io/v1/namespaces/apps/events";
+    const STATUS: &str = "/apis/apprafter.io/v1alpha1/namespaces/apps/sharedvolumes/data/status";
+
+    fn context(client: Client) -> Arc<Context> {
+        Arc::new(Context::new(client, Arc::new(Metrics::new())))
+    }
+
+    fn ok(body: Value) -> Reply {
+        Reply::Json(200, body)
+    }
+
+    /// SharedVolume `apps/data`, finalizer already in place, never sampled.
+    fn volume() -> Arc<SharedVolume> {
+        let mut sv = SharedVolume::new(
+            "data",
+            SharedVolumeSpec {
+                size: "1Gi".into(),
+                class: None,
+            },
+        );
+        sv.metadata.namespace = Some("apps".into());
+        sv.metadata.uid = Some("u-sv".into());
+        sv.metadata.finalizers = Some(vec![SV_PVC_FINALIZER.into()]);
+        Arc::new(sv)
+    }
+
+    /// The bare object an apiserver hands back from a SharedVolume write.
+    fn volume_object() -> Value {
+        json!({
+            "apiVersion": "apprafter.io/v1alpha1", "kind": "SharedVolume",
+            "metadata": { "name": "data", "namespace": "apps" },
+            "spec": { "size": "1Gi" },
+        })
+    }
+
+    /// What an apiserver hands back from an Event create.
+    fn created_event() -> Reply {
+        Reply::Json(
+            201,
+            json!({
+                "apiVersion": "events.k8s.io/v1", "kind": "Event",
+                "metadata": { "name": "data.1", "namespace": "apps" },
+            }),
+        )
+    }
+
+    fn pvc_applied() -> Reply {
+        ok(json!({
+            "apiVersion": "v1", "kind": "PersistentVolumeClaim",
+            "metadata": { "name": "sv-apps-data", "namespace": "apps" },
+        }))
+    }
+
+    /// A kubelet Summary reporting the backing PVC at 95% of its capacity.
+    fn nearly_full_summary() -> Reply {
+        ok(json!({
+            "node": { "nodeName": "n1", "fs": { "capacityBytes": 100_000, "availableBytes": 50_000 } },
+            "pods": [{ "volume": [{
+                "name": "data", "pvcRef": { "name": "sv-apps-data", "namespace": "apps" },
+                "usedBytes": 950, "capacityBytes": 1000,
+            }] }],
+        }))
+    }
+
+    /// Every request a provisioning pass makes; the PVC apply, the Event
+    /// publish and the status write answer as given.
+    fn provisioning(pvc: Reply, event: Reply, status: Reply) -> Vec<Route> {
+        vec![
+            route(
+                "GET",
+                PROVIDERS,
+                ok(json!({
+                    "apiVersion": "apprafter.io/v1alpha1", "kind": "ServiceProviderList",
+                    "metadata": {},
+                    "items": [{
+                        "apiVersion": "apprafter.io/v1alpha1", "kind": "ServiceProvider",
+                        "metadata": { "name": "shared-local", "namespace": "apprafter-system" },
+                        "spec": { "type": "shared-disk", "backend": "shared-disk" },
+                    }],
+                })),
+            ),
+            route("PATCH", PVC, pvc),
+            route(
+                "GET",
+                CLAIMS,
+                ok(json!({
+                    "apiVersion": "apprafter.io/v1alpha1", "kind": "ResourceClaimList",
+                    "metadata": {}, "items": [],
+                })),
+            ),
+            route(
+                "GET",
+                NODES,
+                ok(json!({
+                    "apiVersion": "v1", "kind": "NodeList", "metadata": {},
+                    "items": [{ "apiVersion": "v1", "kind": "Node", "metadata": { "name": "n1" } }],
+                })),
+            ),
+            route("GET", SUMMARY, nearly_full_summary()),
+            route("POST", EVENTS, event),
+            route("PATCH", STATUS, status),
+        ]
+    }
+
+    /// The edge-triggered Event goes out BEFORE the status write that
+    /// records the crossing. Here that write never answers, so this is the
+    /// pass a deadline would cut, and the Event has still been sent. In the
+    /// old order (write, then Event) it never was, and the next pass, reading
+    /// `CapacityWarning=True` back, never sent it either.
+    #[tokio::test(start_paused = true)]
+    async fn the_capacity_warning_event_is_sent_before_the_status_write() {
+        let (client, log) = apiserver(provisioning(pvc_applied(), created_event(), Reply::Never));
+
+        let cut = tokio::time::timeout(
+            Duration::from_secs(60),
+            reconcile_shared_volume(volume(), context(client)),
+        )
+        .await;
+        assert!(
+            cut.is_err(),
+            "the status write never answers, so the pass is cut"
+        );
+
+        let log = log.lock().expect("log").clone();
+        let event_at = log
+            .iter()
+            .position(|c| c.method == "POST" && c.path == EVENTS)
+            .expect("the CapacityWarning Event was sent before the cut");
+        assert_eq!(log[event_at].body["reason"], json!("CapacityWarning"));
+        let status_at = log
+            .iter()
+            .position(|c| c.method == "PATCH" && c.path == STATUS)
+            .expect("the status write was attempted");
+        assert!(
+            event_at < status_at,
+            "Event first, then the write: {log:#?}"
+        );
+    }
+
+    /// The Event cannot hold the status write either: a publish that never
+    /// answers is abandoned at its bound, and the write follows, carrying the
+    /// warning.
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_event_publish_does_not_hold_the_status_write() {
+        let (client, log) = apiserver(provisioning(
+            pvc_applied(),
+            Reply::Never,
+            ok(volume_object()),
+        ));
+
+        let started = tokio::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            OUTER_GUARD,
+            reconcile_shared_volume(volume(), context(client)),
+        )
+        .await
+        .expect("a hung Event publish must not hold the pass");
+
+        assert_eq!(
+            outcome.expect("provisioned"),
+            Action::requeue(Duration::from_secs(300))
+        );
+        assert_eq!(started.elapsed(), CAPACITY_EVENT_BOUND);
+        let writes = calls_to(&log, "PATCH", STATUS);
+        assert_eq!(writes.len(), 1, "{writes:?}");
+        let warning = writes[0].body["status"]["conditions"]
+            .as_array()
+            .expect("conditions")
+            .iter()
+            .find(|c| c["type"] == COND_CAPACITY_WARNING)
+            .cloned()
+            .expect("the CapacityWarning rides the write");
+        assert_eq!(warning["status"], json!("True"));
+        assert_eq!(warning["reason"], json!("VolumeNearlyFull"));
     }
 }
