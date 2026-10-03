@@ -149,6 +149,42 @@ const MIN_OCI_POLL_INTERVAL_SECS: i64 = 60;
 /// `spec.source.checkInterval` (default 6h).
 const RECHECK_REQUESTED_ANNOTATION: &str = "apprafter.io/recheck-requested";
 
+/// How long one question to the registry may take as a whole (WI-400):
+/// resolving the channel-latest — the `:<channel>` pull, or the paginated
+/// listing plus a pull when it falls back — or classifying a transition (one
+/// pull). Healthy ghcr answers either in 0.5–3 s.
+///
+/// The registry client's own bounds (`oci::REGISTRY_CONNECT_TIMEOUT`,
+/// `oci::REGISTRY_READ_TIMEOUT`) stop a peer that goes SILENT. This stops one
+/// that keeps answering too slowly ever to finish: up to `MAX_PAGES` listing
+/// requests, or a blob dribbled out a few bytes per read. On expiry the
+/// question fails like any registry error, so the reconcile takes its
+/// existing degrade paths — `UpstreamReachable=False`, the pin still
+/// enforced, a transition held rather than bumped blind — and still writes
+/// its status.
+const OCI_OPERATION_BUDGET: Duration = Duration::from_secs(20);
+
+/// The registry did not finish one question within `OCI_OPERATION_BUDGET`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("the OCI upstream did not finish {operation} within {}s", .after.as_secs())]
+pub struct UpstreamTimedOut {
+    pub operation: &'static str,
+    pub after: Duration,
+}
+
+/// Ask the registry one question under `OCI_OPERATION_BUDGET`.
+async fn within_oci_budget<T>(
+    operation: &'static str,
+    question: impl std::future::Future<Output = T>,
+) -> Result<T, UpstreamTimedOut> {
+    tokio::time::timeout(OCI_OPERATION_BUDGET, question)
+        .await
+        .map_err(|_| UpstreamTimedOut {
+            operation,
+            after: OCI_OPERATION_BUDGET,
+        })
+}
+
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("kube-rs error: {0}")]
@@ -161,6 +197,8 @@ pub enum Error {
     Serde(#[from] serde_json::Error),
     #[error("unparseable check interval {0:?}")]
     CheckInterval(String),
+    #[error(transparent)]
+    UpstreamTimedOut(#[from] UpstreamTimedOut),
 }
 
 struct Context {
@@ -521,11 +559,17 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
     // propagates.
     let mut upstream_poll_error: Option<String> = None;
     let (channel_latest_str, did_poll_oci, compat_doc) = if should_poll_oci {
-        match ctx
-            .upstream
-            .channel_latest(&spec.source.upstream, channel, &spec.channel)
-            .await
+        let resolved = match within_oci_budget(
+            "resolving the channel-latest",
+            ctx.upstream
+                .channel_latest(&spec.source.upstream, channel, &spec.channel),
+        )
+        .await
         {
+            Ok(answer) => answer,
+            Err(timed_out) => Err(Error::from(timed_out)),
+        };
+        match resolved {
             Ok(resolved) => resolved,
             Err(e) => {
                 let msg = e.to_string();
@@ -724,15 +768,20 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
             // status with UpstreamReachable=False, then requeues) and
             // the pin applies once the upstream recovers and the
             // transition can be classified.
-            match ctx
-                .upstream
-                .path_max_change_class(
+            let classified = match within_oci_budget(
+                "classifying the transition",
+                ctx.upstream.path_max_change_class(
                     &spec.source.upstream,
                     &current_target,
                     &desired.target_revision,
-                )
-                .await
+                ),
+            )
+            .await
             {
+                Ok(answer) => answer.map_err(|e| e.to_string()),
+                Err(timed_out) => Err(timed_out.to_string()),
+            };
+            match classified {
                 Err(e) => {
                     warn!(
                         error = %e,
@@ -740,7 +789,7 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
                         to = %desired.target_revision,
                         "cannot classify transition (upstream unreachable); holding current target"
                     );
-                    upstream_poll_error.get_or_insert(e.to_string());
+                    upstream_poll_error.get_or_insert(e);
                     current_target.clone()
                 }
                 Ok(class)
@@ -4238,6 +4287,30 @@ mod test_upstreams {
         }
     }
 
+    /// A registry that takes every request and never answers.
+    pub(super) struct SilentRegistry;
+
+    #[async_trait::async_trait]
+    impl Upstream for SilentRegistry {
+        async fn channel_latest(
+            &self,
+            _: &str,
+            _: Channel,
+            _: &str,
+        ) -> Result<(String, bool, Option<CompatibilityDoc>), Error> {
+            std::future::pending().await
+        }
+
+        async fn path_max_change_class(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<ChangeClass, CompatError> {
+            std::future::pending().await
+        }
+    }
+
     /// A registry that answers at once: `latest` is the channel-latest and
     /// every transition classifies as `class`.
     pub(super) struct Published {
@@ -4279,7 +4352,7 @@ mod bounded_reconcile_tests {
     use operator_core::Metrics;
     use serde_json::{json, Value};
 
-    use super::test_upstreams::Published;
+    use super::test_upstreams::{Published, SilentRegistry};
     use super::*;
 
     const NS: &str = "/namespaces/apprafter-system";
@@ -4615,6 +4688,133 @@ mod bounded_reconcile_tests {
         assert_eq!(
             written_condition(&patch, "MigrationPending")["status"],
             "True"
+        );
+        assert_eq!(patch.body["status"]["currentVersion"], "0.2.80");
+        assert_every_condition_carried(&patch);
+    }
+
+    /// Far past every budget inside a reconcile: a reconcile still running at
+    /// this point is hung, not slow.
+    const HUNG: Duration = Duration::from_secs(600);
+
+    /// WI-400: a registry that takes the connection and never answers. The
+    /// poll is the reconcile's FIRST `.await`, so without a bound nothing
+    /// after it ran — no parent read, no status — and every condition froze
+    /// at its last value, `UpstreamReachable=True` included: the v0.2.12
+    /// wedge by a different road. Bounded, the poll fails like any registry
+    /// error and the reconcile degrades: the pin is still enforced and the
+    /// status says the upstream is unreachable.
+    #[tokio::test(start_paused = true)]
+    async fn a_registry_that_never_answers_the_poll_degrades_instead_of_freezing() {
+        let mut stack = stack_on("0.2.80", "0.2.80");
+        stack["status"]["lastUpstreamCheck"] = Value::Null;
+        let parent = parent_on(&stack, "0.2.80");
+        let (client, state) = scripted(cluster(stack, parent));
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(
+            HUNG,
+            reconcile(the_stack(&state), context(client, Arc::new(SilentRegistry))),
+        )
+        .await
+        .expect("the reconcile finished on its own")
+        .expect("a registry that never answers degrades, it does not fail the reconcile");
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_secs(20),
+            "the poll's budget"
+        );
+        let patch = status_patch(&calls(&state));
+        let reachable = written_condition(&patch, "UpstreamReachable");
+        assert_eq!(reachable["status"], "False");
+        assert_eq!(reachable["reason"], "PollFailed");
+        assert!(
+            reachable["message"]
+                .as_str()
+                .unwrap()
+                .contains("did not finish resolving the channel-latest within 20s"),
+            "{reachable:#}"
+        );
+        assert_eq!(
+            patch.body["status"]["availableVersion"], "0.2.80",
+            "kept, not cleared"
+        );
+        assert!(
+            patch.body["status"]["lastUpstreamCheck"].is_null(),
+            "a failed poll does not count as a check: {:#}",
+            patch.body
+        );
+        assert_every_condition_carried(&patch);
+    }
+
+    /// The same silent registry while the parent is mid-sync: the in-flight
+    /// early return writes the degraded verdict too.
+    #[tokio::test(start_paused = true)]
+    async fn a_registry_that_never_answers_mid_upgrade_still_reaches_the_status() {
+        let mut stack = stack_on("0.2.80", "0.2.81");
+        stack["status"]["lastUpstreamCheck"] = Value::Null;
+        let mut parent = parent_on(&stack, "0.2.80");
+        parent["status"]["sync"]["status"] = json!("OutOfSync");
+        let (client, state) = scripted(cluster(stack, parent));
+        let action = tokio::time::timeout(
+            HUNG,
+            reconcile(the_stack(&state), context(client, Arc::new(SilentRegistry))),
+        )
+        .await
+        .expect("the reconcile finished on its own")
+        .expect("the reconcile succeeds");
+        assert_eq!(action, Action::requeue(IN_FLIGHT_REQUEUE));
+        let patch = status_patch(&calls(&state));
+        assert_eq!(
+            written_condition(&patch, "UpstreamReachable")["status"],
+            "False"
+        );
+        assert_every_condition_carried(&patch);
+    }
+
+    /// A pin to a version whose transition cannot be classified because the
+    /// registry never answers: the reconcile fails CLOSED — it holds the
+    /// current target, creates no plan, and says why — instead of hanging
+    /// before the gate.
+    #[tokio::test(start_paused = true)]
+    async fn a_registry_that_never_answers_the_classification_holds_the_current_target() {
+        let stack = stack_on("0.2.80", "0.2.81");
+        let parent = parent_on(&stack, "0.2.80");
+        let (client, state) = scripted(cluster(stack, parent));
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(
+            HUNG,
+            reconcile(the_stack(&state), context(client, Arc::new(SilentRegistry))),
+        )
+        .await
+        .expect("the reconcile finished on its own")
+        .expect("the reconcile succeeds");
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_secs(20),
+            "the classification's budget"
+        );
+        let calls = calls(&state);
+        assert!(
+            !calls.iter().any(|c| c.is("POST", PLANS)),
+            "no gate without a class: {calls:#?}"
+        );
+        let bump = calls
+            .iter()
+            .find(|c| c.is("PATCH", PARENT))
+            .expect("the parent is patched");
+        assert_eq!(
+            bump.body["spec"]["source"]["targetRevision"], "0.2.80",
+            "held"
+        );
+        let patch = status_patch(&calls);
+        let reachable = written_condition(&patch, "UpstreamReachable");
+        assert_eq!(reachable["status"], "False");
+        assert!(
+            reachable["message"]
+                .as_str()
+                .unwrap()
+                .contains("did not finish classifying the transition within 20s"),
+            "{reachable:#}"
         );
         assert_eq!(patch.body["status"]["currentVersion"], "0.2.80");
         assert_every_condition_carried(&patch);
