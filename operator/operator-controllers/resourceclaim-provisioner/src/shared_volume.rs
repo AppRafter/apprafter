@@ -35,12 +35,14 @@ use tracing::{info, warn};
 
 use operator_core::matching::{select_provider, Candidate};
 use operator_core::{
-    ResourceClaim, ServiceProvider, SharedVolume, SharedVolumeCondition, COND_CAPACITY_WARNING,
+    ResourceClaim, ServiceProvider, SharedVolume, SharedVolumeCondition, SharedVolumeStatus,
+    COND_CAPACITY_WARNING,
 };
 
 use crate::{Context, ReconcileError, FIELD_MANAGER};
 use operator_core::capacity::{
-    is_volume_warning, pvc_usage, should_emit_event, DEFAULT_VOLUME_FULL_THRESHOLD,
+    is_volume_warning, pvc_usage, should_emit_event, DEFAULT_VOLUME_FULL_THRESHOLD, SCOPE_HOST,
+    SCOPE_VOLUME,
 };
 
 /// The `ServiceProvider.spec.type` a `SharedVolume` binds to. There is no
@@ -62,6 +64,20 @@ const EVENT_REPORTER_CONTROLLER: &str = "apprafter-resourceclaim-provisioner";
 /// is unowned (no `ownerReferences`), so without this finalizer the PVC
 /// would leak when the CR is deleted.
 const SV_PVC_FINALIZER: &str = "apprafter.io/sharedvolume-pvc-cleanup";
+
+/// How long the decorative capacity sample — the Node LIST and the kubelet
+/// Summary through the node proxy — may take before this pass stops waiting
+/// for it (WI-400).
+///
+/// It runs BEFORE the terminal status write, so without a bound of its own a
+/// wedged kubelet holds that write hostage: the reconcile deadline would cut
+/// the whole pass and `refCount` — what `volume rm` reads — would stop moving
+/// for every SharedVolume, this controller running one reconcile at a time.
+/// Under [`operator_core::capacity::FETCH_TIMEOUT`] (15s, the kubelet call
+/// alone) so it also covers the Node LIST and fires first; far under the
+/// SharedVolume reconcile deadline (60s). On expiry the figure on the object
+/// is carried forward ([`carried_capacity`]), never dropped.
+pub const CAPACITY_SAMPLE_BUDGET: Duration = Duration::from_secs(10);
 
 /// StorageClass the SharedVolume backend falls back to when the matched
 /// `shared-disk` ServiceProvider config omits `/storageClass`.
@@ -293,6 +309,67 @@ pub fn capacity_warning_condition(
     }
 }
 
+/// The capacity figure the object already reports, for a pass whose sample
+/// did not answer within [`CAPACITY_SAMPLE_BUDGET`].
+///
+/// A sample that never answered says nothing about the volume, and dropping
+/// the figure is not a neutral "unknown" here: the terminal status apply is
+/// the whole field-set of [`crate::FIELD_MANAGER`], so an omitted
+/// `status.capacity` is PRUNED — and the `CapacityWarning` with it, which also
+/// re-arms the edge trigger, so a kubelet that keeps landing near the budget
+/// would raise a fresh Warning Event every time it recovered. Carried forward,
+/// the figure reads as it did before the pass, and the condition beside it
+/// ([`carried_capacity_condition`]) says it was not re-measured.
+///
+/// (A sample that ANSWERED with nothing usable still drops the figure, as
+/// before — that is a finding, not a missing answer.)
+pub fn carried_capacity(status: Option<&SharedVolumeStatus>) -> Option<SvCapacity> {
+    let capacity = status?.capacity.as_ref()?;
+    Some(SvCapacity {
+        used: capacity.used_bytes?,
+        cap: capacity.capacity_bytes?,
+        scope: match capacity.scope.as_deref() {
+            Some(SCOPE_HOST) => Some(SCOPE_HOST),
+            Some(SCOPE_VOLUME) => Some(SCOPE_VOLUME),
+            _ => None,
+        },
+    })
+}
+
+/// What a carried `CapacityWarning` message ends with: the figure beside it
+/// was not measured on this pass.
+fn not_remeasured_note() -> String {
+    format!(
+        " — not re-measured: the kubelet did not answer within {}s",
+        CAPACITY_SAMPLE_BUDGET.as_secs()
+    )
+}
+
+/// The `CapacityWarning` condition the object already carries, for the same
+/// pass as [`carried_capacity`] and for the same reason, with its message
+/// saying that the figure was not re-measured.
+///
+/// Status, reason and `lastTransitionTime` stay as they were. Changing any of
+/// them would describe the kubelet rather than the volume, and a warning that
+/// stopped being `True` would re-arm the edge trigger. Only the message
+/// changes, so the age of the figure shows on the object (and in `apprafter
+/// volume status`, which prints the message while the warning is up) rather
+/// than only in a log line. Carried again on the next miss, the message does
+/// not grow: the note is replaced, never appended twice.
+pub fn carried_capacity_condition(
+    previous: &[SharedVolumeCondition],
+) -> Option<SharedVolumeCondition> {
+    let mut carried = previous
+        .iter()
+        .find(|c| c.type_ == COND_CAPACITY_WARNING)
+        .cloned()?;
+    let note = not_remeasured_note();
+    let measured = carried.message.as_deref().unwrap_or_default();
+    let measured = measured.strip_suffix(note.as_str()).unwrap_or(measured);
+    carried.message = Some(format!("{measured}{note}"));
+    Some(carried)
+}
+
 /// Whether the `previous` conditions show `CapacityWarning=True` (the prior
 /// state used to edge-trigger the Warning Event).
 pub fn was_capacity_warning(previous: &[SharedVolumeCondition]) -> bool {
@@ -446,90 +523,120 @@ pub async fn reconcile_shared_volume(
     // 5. Count the reference-ResourceClaims bound to this volume.
     let ref_count = current_ref_count(&ctx.client, &ns, &name).await?;
 
-    // 6. Sample capacity via the kubelet Summary API (BEST-EFFORT — any
-    //    failure leaves `capacity = None` + no CapacityWarning, NEVER fails
-    //    the reconcile). On single-node T1 the local-path PVC lives on the
-    //    one node, so we sample the first node's kubelet for both the
-    //    node-free fraction (warning trigger) and the PVC's own used/cap.
-    let summary = match first_node_name(&ctx.client).await {
-        Some(node) => ctx.capacity.summary_for_node(&ctx.client, &node).await,
-        None => None,
-    };
-    let capacity: Option<(i64, i64)> = summary.as_ref().and_then(|s| pvc_usage(s, &pvc_name));
-    // D29: the same figure carries the same ambiguity here as on a disk claim
-    // — a local-path PV makes the kubelet report the backing filesystem, so
-    // these can be the node's numbers wearing the volume's name. Decided from
-    // THIS summary, so the two readings cannot be a poll apart.
-    let sv_capacity: Option<SvCapacity> = capacity.map(|(used, cap)| SvCapacity {
-        used,
-        cap,
-        scope: summary.as_ref().map(|s| {
-            operator_core::capacity::capacity_scope(
-                cap,
-                operator_core::capacity::node_fs_capacity(s),
-            )
-        }),
-    });
-
-    // 2.22d (D8): `CapacityWarning` on a SharedVolume now means THE VOLUME.
-    //
-    // It used to be derived from the NODE's free fraction, so a condition
-    // named for a volume reported something else entirely — and the volume's
-    // own usage, which the sampler above has always collected, was written to
-    // `status.capacity` and never thresholded. A volume at 99% of its own
-    // request on a healthy node said nothing.
-    //
-    // The node signal has not been dropped; it moved to where it belongs, as
-    // `NodeDiskPressure` on the PlatformStack singleton, which every cluster
-    // has whether or not it has a SharedVolume.
-    let now_warning = capacity
-        .and_then(|(used, cap)| is_volume_warning(used, cap, DEFAULT_VOLUME_FULL_THRESHOLD))
-        .unwrap_or(false);
-
-    // 7. Write the terminal status — ready / pvcRef / refCount / capacity /
-    //    BOTH the `Ready` and (when sampled) the `CapacityWarning`
-    //    conditions, under our own field manager (never `.spec`). SSA
-    //    REPLACES the manager's field-set, so both conditions ride one body.
     let prior = sv
         .status
         .as_ref()
         .and_then(|s| s.conditions.clone())
         .unwrap_or_default();
+
+    // 6. Sample capacity via the kubelet Summary API (BEST-EFFORT — any
+    //    failure leaves `capacity = None` + no CapacityWarning, NEVER fails
+    //    the reconcile). On single-node T1 the local-path PVC lives on the
+    //    one node, so we sample the first node's kubelet for both the
+    //    node-free fraction (warning trigger) and the PVC's own used/cap.
+    //
+    //    BOUNDED by `CAPACITY_SAMPLE_BUDGET` (WI-400): a sample that does not
+    //    answer in time carries the object's own figure forward instead.
+    let sample = tokio::time::timeout(CAPACITY_SAMPLE_BUDGET, async {
+        match first_node_name(&ctx.client).await {
+            Some(node) => ctx.capacity.summary_for_node(&ctx.client, &node).await,
+            None => None,
+        }
+    })
+    .await;
+    let (sv_capacity, capacity_cond, now_warning) = match sample {
+        Ok(summary) => {
+            let capacity: Option<(i64, i64)> =
+                summary.as_ref().and_then(|s| pvc_usage(s, &pvc_name));
+            // D29: the same figure carries the same ambiguity here as on a
+            // disk claim — a local-path PV makes the kubelet report the
+            // backing filesystem, so these can be the node's numbers wearing
+            // the volume's name. Decided from THIS summary, so the two
+            // readings cannot be a poll apart.
+            let sv_capacity: Option<SvCapacity> = capacity.map(|(used, cap)| SvCapacity {
+                used,
+                cap,
+                scope: summary.as_ref().map(|s| {
+                    operator_core::capacity::capacity_scope(
+                        cap,
+                        operator_core::capacity::node_fs_capacity(s),
+                    )
+                }),
+            });
+
+            // 2.22d (D8): `CapacityWarning` on a SharedVolume now means THE
+            // VOLUME.
+            //
+            // It used to be derived from the NODE's free fraction, so a
+            // condition named for a volume reported something else entirely —
+            // and the volume's own usage, which the sampler above has always
+            // collected, was written to `status.capacity` and never
+            // thresholded. A volume at 99% of its own request on a healthy
+            // node said nothing.
+            //
+            // The node signal has not been dropped; it moved to where it
+            // belongs, as `NodeDiskPressure` on the PlatformStack singleton,
+            // which every cluster has whether or not it has a SharedVolume.
+            let now_warning = capacity
+                .and_then(|(used, cap)| is_volume_warning(used, cap, DEFAULT_VOLUME_FULL_THRESHOLD))
+                .unwrap_or(false);
+
+            // Stamped only when the volume's own usage was sampled this
+            // cycle; a sample-less cycle leaves the condition absent rather
+            // than carrying a stale value forward.
+            let capacity_cond = capacity.map(|(used, cap)| {
+                let pct_used = if cap > 0 {
+                    used as f64 / cap as f64 * 100.0
+                } else {
+                    0.0
+                };
+                if now_warning {
+                    capacity_warning_condition(
+                        "True",
+                        "VolumeNearlyFull",
+                        &format!(
+                            "volume {pct_used:.1}% full (> {:.0}% threshold) — writes will fail \
+                             when it reaches capacity",
+                            DEFAULT_VOLUME_FULL_THRESHOLD * 100.0
+                        ),
+                        &prior,
+                    )
+                } else {
+                    capacity_warning_condition(
+                        "False",
+                        "SufficientCapacity",
+                        &format!("volume {pct_used:.1}% full"),
+                        &prior,
+                    )
+                }
+            });
+            (sv_capacity, capacity_cond, now_warning)
+        }
+        Err(_elapsed) => {
+            warn!(
+                %name, %ns,
+                budget_secs = CAPACITY_SAMPLE_BUDGET.as_secs(),
+                "capacity: the kubelet sample did not answer in time — carrying the previous \
+                 figure forward"
+            );
+            (
+                carried_capacity(sv.status.as_ref()),
+                carried_capacity_condition(&prior),
+                was_capacity_warning(&prior),
+            )
+        }
+    };
+
+    // 7. Write the terminal status — ready / pvcRef / refCount / capacity /
+    //    BOTH the `Ready` and (when sampled or carried) the `CapacityWarning`
+    //    conditions, under our own field manager (never `.spec`). SSA
+    //    REPLACES the manager's field-set, so both conditions ride one body.
     let ready_cond = ready_condition(
         "True",
         "Provisioned",
         &format!("provisioned PVC {pvc_name} (class {storage_class})"),
         &prior,
     );
-    // Stamped only when the volume's own usage was sampled this cycle; a
-    // sample-less cycle leaves the condition absent rather than carrying a
-    // stale value forward.
-    let capacity_cond = capacity.map(|(used, cap)| {
-        let pct_used = if cap > 0 {
-            used as f64 / cap as f64 * 100.0
-        } else {
-            0.0
-        };
-        if now_warning {
-            capacity_warning_condition(
-                "True",
-                "VolumeNearlyFull",
-                &format!(
-                    "volume {pct_used:.1}% full (> {:.0}% threshold) — writes will fail when it \
-                     reaches capacity",
-                    DEFAULT_VOLUME_FULL_THRESHOLD * 100.0
-                ),
-                &prior,
-            )
-        } else {
-            capacity_warning_condition(
-                "False",
-                "SufficientCapacity",
-                &format!("volume {pct_used:.1}% full"),
-                &prior,
-            )
-        }
-    });
     patch_shared_volume_status_with_conditions(
         &ctx.client,
         &ns,
@@ -547,10 +654,10 @@ pub async fn reconcile_shared_volume(
     //    (anti-spam). Best-effort: a publish failure is logged, not fatal.
     let was_warning = was_capacity_warning(&prior);
     if should_emit_event(was_warning, now_warning) {
-        let pct_used = capacity
-            .map(|(u, c)| {
-                if c > 0 {
-                    u as f64 / c as f64 * 100.0
+        let pct_used = sv_capacity
+            .map(|c| {
+                if c.cap > 0 {
+                    c.used as f64 / c.cap as f64 * 100.0
                 } else {
                     0.0
                 }
@@ -1026,5 +1133,271 @@ mod tests {
         }];
         assert!(!was_capacity_warning(&cleared));
         assert!(!was_capacity_warning(&[]));
+    }
+}
+
+/// The capacity sample's bound (WI-400), driven through the real reconcile
+/// against a scripted apiserver whose kubelet proxy can be told to never
+/// answer.
+#[cfg(test)]
+mod capacity_budget_tests {
+    use super::*;
+
+    use operator_core::{Metrics, SharedVolumeCapacity, SharedVolumeSpec};
+
+    use crate::route_apiserver::{apiserver, calls_to, route, Reply, Route};
+
+    const STATUS_PATH: &str =
+        "/apis/apprafter.io/v1alpha1/namespaces/apps/sharedvolumes/data/status";
+    const SUMMARY_PATH: &str = "/api/v1/nodes/n1/proxy/stats/summary";
+    const T0: &str = "2026-09-01T00:00:00+00:00";
+
+    fn cond(type_: &str, status: &str, reason: &str) -> SharedVolumeCondition {
+        SharedVolumeCondition {
+            type_: type_.into(),
+            status: status.into(),
+            last_transition_time: T0.into(),
+            reason: Some(reason.into()),
+            message: Some(format!("{reason} as of the last sample")),
+        }
+    }
+
+    /// `apps/data`, finalizer on, last sampled 95% full with the warning up.
+    fn nearly_full_volume() -> Arc<SharedVolume> {
+        let mut sv = SharedVolume::new(
+            "data",
+            SharedVolumeSpec {
+                size: "1Gi".into(),
+                class: None,
+            },
+        );
+        sv.metadata.namespace = Some("apps".into());
+        sv.metadata.finalizers = Some(vec![SV_PVC_FINALIZER.into()]);
+        sv.status = Some(SharedVolumeStatus {
+            ready: Some(true),
+            pvc_ref: Some("sv-apps-data".into()),
+            ref_count: Some(0),
+            capacity: Some(SharedVolumeCapacity {
+                used_bytes: Some(950),
+                capacity_bytes: Some(1000),
+                scope: Some("volume".into()),
+            }),
+            conditions: Some(vec![
+                cond("Ready", "True", "Provisioned"),
+                cond(COND_CAPACITY_WARNING, "True", "VolumeNearlyFull"),
+            ]),
+        });
+        Arc::new(sv)
+    }
+
+    /// Every request the reconcile makes, with the kubelet Summary answering
+    /// `summary`.
+    fn routes(summary: Reply) -> Vec<Route> {
+        vec![
+            route(
+                "GET",
+                "/apis/apprafter.io/v1alpha1/serviceproviders",
+                Reply::Json(
+                    200,
+                    json!({
+                        "apiVersion": "apprafter.io/v1alpha1", "kind": "ServiceProviderList",
+                        "metadata": { "resourceVersion": "1" },
+                        "items": [{
+                            "apiVersion": "apprafter.io/v1alpha1", "kind": "ServiceProvider",
+                            "metadata": { "name": "shared-local", "namespace": "apprafter-system" },
+                            "spec": { "type": "shared-disk", "backend": "local-path" },
+                        }],
+                    }),
+                ),
+            ),
+            route(
+                "PATCH",
+                "/api/v1/namespaces/apps/persistentvolumeclaims/sv-apps-data",
+                Reply::Json(
+                    200,
+                    json!({
+                        "apiVersion": "v1", "kind": "PersistentVolumeClaim",
+                        "metadata": { "name": "sv-apps-data", "namespace": "apps" },
+                    }),
+                ),
+            ),
+            route(
+                "GET",
+                "/apis/apprafter.io/v1alpha1/namespaces/apps/resourceclaims",
+                Reply::Json(
+                    200,
+                    json!({
+                        "apiVersion": "apprafter.io/v1alpha1", "kind": "ResourceClaimList",
+                        "metadata": { "resourceVersion": "1" }, "items": [],
+                    }),
+                ),
+            ),
+            route(
+                "GET",
+                "/api/v1/nodes",
+                Reply::Json(
+                    200,
+                    json!({
+                        "apiVersion": "v1", "kind": "NodeList",
+                        "metadata": { "resourceVersion": "1" },
+                        "items": [{ "apiVersion": "v1", "kind": "Node", "metadata": { "name": "n1" } }],
+                    }),
+                ),
+            ),
+            route("GET", SUMMARY_PATH, summary),
+            route(
+                "PATCH",
+                STATUS_PATH,
+                Reply::Json(
+                    200,
+                    json!({
+                        "apiVersion": "apprafter.io/v1alpha1", "kind": "SharedVolume",
+                        "metadata": { "name": "data", "namespace": "apps" },
+                        "spec": { "size": "1Gi" },
+                    }),
+                ),
+            ),
+        ]
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_kubelet_that_never_answers_carries_the_previous_figure_forward() {
+        let (client, log) = apiserver(routes(Reply::Never));
+        let ctx = Arc::new(Context::new(client, Arc::new(Metrics::new())));
+        let started = tokio::time::Instant::now();
+        // Bounded from outside as well (the SharedVolume reconcile deadline),
+        // so a missing budget fails the test instead of hanging it.
+        let action = tokio::time::timeout(
+            Duration::from_secs(60),
+            reconcile_shared_volume(nearly_full_volume(), ctx),
+        )
+        .await
+        .expect("the capacity sample must not hold the reconcile")
+        .expect("a missing sample never fails the reconcile");
+
+        assert_eq!(action, Action::requeue(Duration::from_secs(300)));
+        assert_eq!(started.elapsed(), CAPACITY_SAMPLE_BUDGET);
+        assert_eq!(calls_to(&log, "GET", SUMMARY_PATH).len(), 1);
+
+        let writes = calls_to(&log, "PATCH", STATUS_PATH);
+        assert_eq!(writes.len(), 1, "{writes:?}");
+        let status = &writes[0].body["status"];
+        // Under SSA an omitted field is PRUNED: the figure and the warning
+        // must ride the write exactly as the object had them.
+        assert_eq!(
+            status["capacity"],
+            json!({ "usedBytes": 950, "capacityBytes": 1000, "scope": "volume" })
+        );
+        let warning = status["conditions"]
+            .as_array()
+            .expect("conditions")
+            .iter()
+            .find(|c| c["type"] == COND_CAPACITY_WARNING)
+            .expect("the CapacityWarning rides the write");
+        assert_eq!(warning["status"], "True");
+        assert_eq!(warning["reason"], "VolumeNearlyFull");
+        assert_eq!(warning["lastTransitionTime"], T0);
+        // …and it says the figure is the last one that answered.
+        assert_eq!(
+            warning["message"],
+            "VolumeNearlyFull as of the last sample — not re-measured: the kubelet did not \
+             answer within 10s"
+        );
+        // …so the edge trigger is not re-armed: no fresh Warning Event.
+        assert!(
+            !log.lock()
+                .expect("log")
+                .iter()
+                .any(|c| c.path.ends_with("/events")),
+            "no Event may be published for a carried warning"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_kubelet_that_answers_still_sets_the_fresh_figure() {
+        let summary = json!({
+            "node": { "nodeName": "n1", "fs": { "capacityBytes": 100_000, "availableBytes": 50_000 } },
+            "pods": [{ "volume": [{
+                "name": "data", "pvcRef": { "name": "sv-apps-data", "namespace": "apps" },
+                "usedBytes": 100, "capacityBytes": 1000,
+            }] }],
+        });
+        let (client, log) = apiserver(routes(Reply::Json(200, summary)));
+        let ctx = Arc::new(Context::new(client, Arc::new(Metrics::new())));
+        let started = tokio::time::Instant::now();
+        reconcile_shared_volume(nearly_full_volume(), ctx)
+            .await
+            .expect("reconcile");
+
+        assert_eq!(
+            started.elapsed(),
+            Duration::ZERO,
+            "nothing waited on the budget"
+        );
+        let writes = calls_to(&log, "PATCH", STATUS_PATH);
+        let status = &writes[0].body["status"];
+        assert_eq!(
+            status["capacity"],
+            json!({ "usedBytes": 100, "capacityBytes": 1000, "scope": "volume" })
+        );
+        let warning = status["conditions"]
+            .as_array()
+            .expect("conditions")
+            .iter()
+            .find(|c| c["type"] == COND_CAPACITY_WARNING)
+            .expect("a sampled volume carries the condition");
+        assert_eq!(warning["status"], "False");
+        assert_eq!(warning["reason"], "SufficientCapacity");
+    }
+
+    #[test]
+    fn nothing_is_carried_that_the_object_did_not_have() {
+        // A carried figure is the object's own, never a fabricated one.
+        assert_eq!(carried_capacity(None), None);
+        assert_eq!(carried_capacity(Some(&SharedVolumeStatus::default())), None);
+        assert_eq!(carried_capacity_condition(&[]), None);
+    }
+
+    #[test]
+    fn a_carried_figure_keeps_its_scope() {
+        let status = SharedVolumeStatus {
+            capacity: Some(SharedVolumeCapacity {
+                used_bytes: Some(1),
+                capacity_bytes: Some(2),
+                scope: Some("host".into()),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            carried_capacity(Some(&status)),
+            Some(SvCapacity {
+                used: 1,
+                cap: 2,
+                scope: Some(SCOPE_HOST),
+            })
+        );
+    }
+
+    #[test]
+    fn a_carried_warning_says_once_that_it_was_not_remeasured() {
+        let first = carried_capacity_condition(&[cond(
+            COND_CAPACITY_WARNING,
+            "False",
+            "SufficientCapacity",
+        )])
+        .expect("carried");
+        assert_eq!(
+            first.message.as_deref(),
+            Some(
+                "SufficientCapacity as of the last sample — not re-measured: the kubelet did \
+                 not answer within 10s"
+            )
+        );
+        assert_eq!(first.status, "False");
+        assert_eq!(first.reason.as_deref(), Some("SufficientCapacity"));
+        assert_eq!(first.last_transition_time, T0);
+        // A second miss in a row carries the same message, not a longer one.
+        let again = carried_capacity_condition(std::slice::from_ref(&first)).expect("carried");
+        assert_eq!(again, first);
     }
 }

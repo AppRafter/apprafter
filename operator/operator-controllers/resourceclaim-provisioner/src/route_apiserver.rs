@@ -12,6 +12,11 @@
 //! with a 500 naming the request, so an unexpected call fails the reconcile
 //! loudly instead of being silently satisfied.
 //!
+//! [`Reply::Never`] is a request that never answers: the hung kubelet, the
+//! black-holed apiserver. The bound tests drive it on a paused clock
+//! (`#[tokio::test(start_paused = true)]`), where it costs no wall time and
+//! the moment a bound fires is exact.
+//!
 //! A unit-test module rather than `tests/`: the reconcile under test needs
 //! the crate's `#[cfg(test)]` fakes (`FakePg`, `FakeRedis`), which an
 //! integration test cannot see.
@@ -36,6 +41,8 @@ pub(crate) struct Call {
 pub(crate) enum Reply {
     /// This status code with this JSON body.
     Json(u16, Value),
+    /// Never — the response future stays pending forever.
+    Never,
 }
 
 /// One scripted request: an exact method and an exact path.
@@ -95,6 +102,7 @@ pub(crate) fn apiserver(routes: Vec<Route>) -> (kube::Client, Arc<Mutex<Vec<Call
                         .body(Body::from(serde_json::to_vec(&payload).expect("payload")))
                         .expect("response"),
                 ),
+                Reply::Never => std::future::pending().await,
             }
         }
     });

@@ -78,9 +78,10 @@ reason `CapacityWarning` against the SharedVolume; a reconcile that finds the
 volume already warning publishes nothing, and recovering publishes nothing at
 all — so `kubectl describe` shows the moment the volume filled rather than one
 line per reconcile. The comparison is against the condition the object
-currently carries, so a cycle that could not sample — which drops the
+currently carries, so a cycle whose sample came back empty — which drops the
 condition, as below — makes the next successful cycle look like a fresh
-crossing and publish again.
+crossing and publish again. A sample that never came back keeps the
+condition, and publishes nothing.
 
 Sampling runs on every reconcile: the 300-second requeue, plus any change to a
 reference-claim, which fans a reconcile back to the parent volume. A
@@ -128,11 +129,26 @@ and a summary carrying no entry for this PVC, are silent. All five produce the
 same outcome: no sample, and a reconcile that carries on, so a volume provisions
 and goes `Ready` whether or not it can be measured.
 
-A cycle with no sample writes no `status.capacity` and no `CapacityWarning` at
-all. It does not carry the previous values forward — the status apply replaces
-everything this controller owns, so omitting the sample removes it. The
-condition is therefore never older than the last successful sample, and the
-absence of a warning is never evidence of space.
+A cycle whose sample comes back empty writes no `status.capacity` and no
+`CapacityWarning` at all — the status apply replaces everything this controller
+owns, so omitting the sample removes it. The absence of a warning is therefore
+never evidence of space.
+
+A sample that does not come back at all is the one exception. The node list
+and the kubelet fetch get 10 seconds between them (the kubelet fetch on its own
+gives up after 15, logged at warning); past that the reconcile stops waiting,
+logs a warning, and writes back the `status.capacity` and `CapacityWarning` the
+volume already carried. The condition keeps its status, reason and transition
+time, and its message gains "not re-measured: the kubelet did not answer
+within 10s". Dropping them there would describe the kubelet, not the volume,
+and the same status write carries the `refCount` that `apprafter volume rm`
+checks, so it is not held back waiting either. A figure kept this way is as old
+as the last sample that answered.
+
+`apprafter volume status` prints the condition's message only while the
+warning is up. On a volume that was not warning, a carried figure prints as an
+ordinary `Used/Free` line, and the condition on the object is where its age
+shows.
 
 That is also why an em-dash is the usual reading on a cluster whose kubelet
 publishes no per-volume metrics at all. `e2e/shared-volume-walk.sh` treats its
