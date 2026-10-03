@@ -69,6 +69,8 @@ pub mod acl_reconcile;
 pub mod cnpg;
 pub mod disk;
 pub mod dragonfly;
+#[cfg(test)]
+mod fake_apiserver;
 pub mod gc;
 pub mod grace;
 pub mod nats;
