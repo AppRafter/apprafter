@@ -389,6 +389,12 @@ pub struct PlatformStackStatus {
         rename = "versionHistory"
     )]
     pub version_history: Option<Vec<PlatformStackVersionHistoryEntry>>,
+    // A list-map keyed by `type` in the CRD (`schemas/crdmeta/meta.cue`
+    // statusSchemaPatches), with two SSA field managers (WI-400):
+    // `platform-controller` owns every condition except `ReconcileStalled`,
+    // which `apprafter-reconcile-deadline` owns. A plain comment, not a doc
+    // comment: schemars would turn one into a `description` on the derived
+    // schema.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conditions: Option<Vec<PlatformStackCondition>>,
 }

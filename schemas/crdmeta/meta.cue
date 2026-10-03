@@ -352,6 +352,24 @@ _crdMetas: PlatformStack: {
 		"values": {"x-kubernetes-preserve-unknown-fields": true}
 		"overrides[*].values": {"x-kubernetes-preserve-unknown-fields": true}
 	}
+
+	// `status.conditions` as a server-side-merged list keyed by `type`
+	// (WI-400). Two field managers write it: `platform-controller` every
+	// condition the PlatformController owns, and
+	// `apprafter-reconcile-deadline` the one `ReconcileStalled` condition, set
+	// when a reconcile is abandoned at its deadline and removed by the next
+	// reconcile that finishes. Without the listMap the list is ATOMIC under
+	// SSA, and either manager's apply would replace the other's conditions —
+	// the walk-found ResourceClaim failure (see that entry below). CUE→OpenAPI
+	// cannot emit these markers, so restore them here; `type` is already
+	// required on every item, which a list-map key must be. Paths are relative
+	// to the `status` node.
+	statusSchemaPatches: {
+		"conditions": {
+			"x-kubernetes-list-type": "map"
+			"x-kubernetes-list-map-keys": ["type"]
+		}
+	}
 }
 
 _crdMetas: SharedVolume: {
