@@ -231,6 +231,16 @@ pub struct Context {
     ///
     /// Waiting for it counts against the waiting reconcile's own deadline.
     pub dbnum_alloc: tokio::sync::Mutex<()>,
+    /// When each SharedVolume's last NON-deleting pass failed, keyed by
+    /// `(namespace, name)` (WI-400).
+    ///
+    /// Such a pass may have left its PVC apply in flight, and the SharedVolume
+    /// deletion path holds its finalizer until that apply can no longer land
+    /// — see `shared_volume::DELETE_SETTLE`. In memory on purpose: a fact
+    /// about requests this process sent, which no other process could have
+    /// sent.
+    pub(crate) sv_unsettled:
+        std::sync::Mutex<std::collections::HashMap<(String, String), tokio::time::Instant>>,
 }
 
 impl Context {
@@ -260,6 +270,7 @@ impl Context {
             backend_metrics: Arc::new(operator_core::promscrape::MetricsCache::new()),
             acl_dirty,
             dbnum_alloc: tokio::sync::Mutex::new(()),
+            sv_unsettled: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 }

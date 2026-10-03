@@ -424,6 +424,51 @@ fn apply_params() -> PatchParams {
 // Async reconcile + error_policy
 // ---------------------------------------------------------------------------
 
+/// How long a SharedVolume delete holds its finalizer after a failed pass of
+/// the same volume, so a PVC apply that pass left in flight cannot land after
+/// the finalizer is gone (WI-400).
+///
+/// The race: pass R1 sends the PVC server-side apply and is abandoned — the
+/// reconcile deadline, or an apiserver 504 whose write still commits. A
+/// deletion held during R1 runs R2 the moment the slot frees; R2's PVC DELETE
+/// answers 404 and it releases the finalizer. R1's apply then commits and
+/// CREATES the PVC — unowned by design, and with the SharedVolume gone
+/// nothing ever reconciles or reaps it again.
+///
+/// A request the apiserver has accepted either commits or is abandoned
+/// within its own request timeout (`--request-timeout`, 60s by default on
+/// every tier we ship), so after a failed pass the delete deletes the PVC,
+/// waits this long, deletes it again, and only then releases. 5s of margin
+/// over the 60s. A delete with no recent failure releases at once, as before.
+pub(crate) const DELETE_SETTLE: Duration = Duration::from_secs(65);
+
+/// Record that a non-deleting pass of `ns/name` failed and may have left
+/// its PVC apply in flight. Records older than [`DELETE_SETTLE`] are dropped
+/// on the way in, so the map holds at most the volumes that failed in the
+/// last 65 seconds.
+pub(crate) fn note_unsettled(ctx: &Context, ns: &str, name: &str) {
+    let now = tokio::time::Instant::now();
+    if let Ok(mut unsettled) = ctx.sv_unsettled.lock() {
+        unsettled.retain(|_, failed_at| now.duration_since(*failed_at) < DELETE_SETTLE);
+        unsettled.insert((ns.to_string(), name.to_string()), now);
+    }
+}
+
+/// How much longer a delete of `ns/name` must hold its finalizer, or `None`
+/// when it may release now — in which case the record is forgotten.
+fn settle_remaining(ctx: &Context, ns: &str, name: &str) -> Option<Duration> {
+    let mut unsettled = ctx.sv_unsettled.lock().ok()?;
+    let key = (ns.to_string(), name.to_string());
+    let failed_at = *unsettled.get(&key)?;
+    let elapsed = failed_at.elapsed();
+    if elapsed < DELETE_SETTLE {
+        Some(DELETE_SETTLE - elapsed)
+    } else {
+        unsettled.remove(&key);
+        None
+    }
+}
+
 /// How long one SharedVolume pass may run before it is abandoned (WI-400,
 /// GOTCHA-51).
 ///
@@ -448,7 +493,8 @@ pub const RECONCILE_DEADLINE: Duration = Duration::from_secs(60);
 /// `capacity` and both conditions. It reaches [`error_policy_sv`], which
 /// warns, counts `apprafter_reconcile_timeouts_total{kind="SharedVolume"}`
 /// and backs off, and it leaves a `ReconcileTimedOut` Warning Event on the
-/// volume.
+/// volume. Any failed non-deleting pass, timed out or not, is also noted for
+/// [`DELETE_SETTLE`].
 pub async fn reconcile_shared_volume_with_deadline(
     sv: Arc<SharedVolume>,
     ctx: Arc<Context>,
@@ -458,6 +504,9 @@ pub async fn reconcile_shared_volume_with_deadline(
         reconcile_shared_volume(sv.clone(), ctx.clone()),
     )
     .await;
+    if outcome.is_err() && sv.metadata.deletion_timestamp.is_none() {
+        note_unsettled(&ctx, &sv.namespace().unwrap_or_default(), &sv.name_any());
+    }
     if let Err(ReconcileError::TimedOut(timed_out)) = &outcome {
         crate::deadline_event::publish(&ctx.client, sv.object_ref(&()), KIND, *timed_out).await;
     }
@@ -499,6 +548,16 @@ pub async fn reconcile_shared_volume(
                 if !matches!(&e, kube::Error::Api(ae) if ae.code == 404) {
                     return Err(e.into());
                 }
+            }
+            // WI-400: a recent failed pass may still land its PVC apply after
+            // this DELETE; release only once it cannot (`DELETE_SETTLE`).
+            if let Some(wait) = settle_remaining(&ctx, &ns, &name) {
+                info!(
+                    %name, %ns, %pvc_name, wait_secs = wait.as_secs(),
+                    "SharedVolume deleted after a failed pass — holding the finalizer until \
+                     that pass's PVC apply can no longer land"
+                );
+                return Ok(Action::requeue(wait));
             }
             info!(%name, %ns, %pvc_name, "SharedVolume deleted — dropped backing PVC; releasing finalizer");
             set_finalizers(&ctx.client, &ns, &name, without_finalizer(&finalizers)).await?;
@@ -1756,5 +1815,108 @@ mod deadline_tests {
             Action::requeue(Duration::from_secs(30))
         );
         assert_eq!(timeouts(), 1.0, "only a timeout counts as one");
+    }
+
+    const VOLUME: &str = "/apis/apprafter.io/v1alpha1/namespaces/apps/sharedvolumes/data";
+
+    fn not_found() -> Reply {
+        Reply::Json(
+            404,
+            json!({
+                "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                "reason": "NotFound", "code": 404, "message": "not found",
+            }),
+        )
+    }
+
+    fn deleting_volume() -> Arc<SharedVolume> {
+        let mut sv = (*volume()).clone();
+        sv.metadata.deletion_timestamp =
+            Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                "2026-10-01T00:00:00Z".parse().expect("timestamp"),
+            ));
+        Arc::new(sv)
+    }
+
+    /// The delete path's answers: the PVC is already gone (404) and the
+    /// finalizer release succeeds.
+    fn deleting() -> Vec<Route> {
+        vec![
+            route("DELETE", PVC, not_found()),
+            route("PATCH", VOLUME, ok(volume_object())),
+        ]
+    }
+
+    fn methods(log: &[crate::route_apiserver::Call]) -> Vec<String> {
+        log.iter().map(|c| c.method.clone()).collect()
+    }
+
+    /// The late-landing PVC race, closed: right after a failed pass, the
+    /// delete deletes the PVC but HOLDS the finalizer for `DELETE_SETTLE`,
+    /// then deletes again and releases. A PVC apply the failed pass left in
+    /// flight lands inside that window, and the second DELETE takes it.
+    #[tokio::test(start_paused = true)]
+    async fn a_delete_right_after_a_failed_pass_holds_the_finalizer_until_it_settles() {
+        let (client, log) = apiserver(deleting());
+        let ctx = context(client);
+        note_unsettled(&ctx, "apps", "data");
+
+        let first = reconcile_shared_volume(deleting_volume(), ctx.clone())
+            .await
+            .expect("first delete pass");
+        assert_eq!(first, Action::requeue(DELETE_SETTLE));
+        assert!(
+            calls_to(&log, "PATCH", VOLUME).is_empty(),
+            "the finalizer was released while the failed pass's apply could still land"
+        );
+
+        tokio::time::advance(DELETE_SETTLE).await;
+        let second = reconcile_shared_volume(deleting_volume(), ctx.clone())
+            .await
+            .expect("second delete pass");
+        assert_eq!(second, Action::await_change());
+        assert_eq!(
+            methods(&log.lock().expect("log")),
+            vec!["DELETE", "DELETE", "PATCH"]
+        );
+        assert!(
+            ctx.sv_unsettled.lock().expect("map").is_empty(),
+            "a released delete forgets its record"
+        );
+    }
+
+    /// The common case keeps its latency: a delete with no recent failure
+    /// releases in the same pass.
+    #[tokio::test(start_paused = true)]
+    async fn a_delete_with_no_failed_pass_releases_at_once() {
+        let (client, log) = apiserver(deleting());
+        let outcome = reconcile_shared_volume(deleting_volume(), context(client))
+            .await
+            .expect("delete pass");
+        assert_eq!(outcome, Action::await_change());
+        assert_eq!(methods(&log.lock().expect("log")), vec!["DELETE", "PATCH"]);
+    }
+
+    /// The wrapper records a failed provisioning pass, and only that: a
+    /// failed DELETE pass sent no apply that could land late.
+    #[tokio::test(start_paused = true)]
+    async fn only_a_failed_non_deleting_pass_is_noted() {
+        let ctx = context(operator_core::testing::stalled_client());
+        let key = ("apps".to_string(), "data".to_string());
+
+        let guard = RECONCILE_DEADLINE * 2;
+        let deleting = reconcile_shared_volume_with_deadline(deleting_volume(), ctx.clone());
+        let outcome = tokio::time::timeout(guard, deleting)
+            .await
+            .expect("deadline");
+        assert!(matches!(outcome, Err(ReconcileError::TimedOut(_))));
+        assert!(!ctx.sv_unsettled.lock().expect("map").contains_key(&key));
+
+        let provisioning = reconcile_shared_volume_with_deadline(volume(), ctx.clone());
+        let outcome = tokio::time::timeout(guard, provisioning)
+            .await
+            .expect("deadline");
+        assert!(matches!(outcome, Err(ReconcileError::TimedOut(_))));
+        assert!(ctx.sv_unsettled.lock().expect("map").contains_key(&key));
     }
 }
