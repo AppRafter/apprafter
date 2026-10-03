@@ -42,6 +42,15 @@ pub fn install_rustls_crypto_provider() {
 /// The client read timeout kube-client applied by default up to 3.x.
 pub const CLIENT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(295);
 
+// WI-400: the Application reconcile's deadline must fire before the read
+// timeout above. Otherwise a pass held by one silent socket ends as a read
+// error at 295s, filed as `ReconcileFailed`, instead of as
+// `ReconcileTimedOut` at its own deadline, and the deadline bounds nothing.
+const _: () = assert!(
+    operator_controllers_application::RECONCILE_DEADLINE.as_secs() < CLIENT_READ_TIMEOUT.as_secs(),
+    "the Application controller's RECONCILE_DEADLINE must be shorter than CLIENT_READ_TIMEOUT"
+);
+
 /// Put back the two kube-client defaults that kube 4.0 moved, so the
 /// operator talks to the apiserver exactly as it did on kube 0.95.
 ///

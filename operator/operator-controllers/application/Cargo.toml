@@ -46,3 +46,7 @@ http  = { workspace = true }
 # request stays pending forever — builds the Context the deadline tests run
 # against. Dev-only: the feature never reaches the shipped operator.
 operator-core = { path = "../../operator-core", features = ["testing"] }
+# `test-util` for `#[tokio::test(start_paused = true)]`: the deadline tests
+# run a reconcile against a client that never answers, and the paused clock
+# jumps straight to the 120s deadline instead of waiting it out.
+tokio = { workspace = true, features = ["test-util"] }
