@@ -1102,29 +1102,44 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
         if let Some(foreign) = &foreign_writer {
             warn!(manager = %foreign, "foreign field manager on parent spec.source; force-reverting");
             // Walk-fix #6 v0.1.119 → v0.1.120: emit a
-            // Kubernetes Event so the foreign-write +
-            // revert pair leaves a durable audit trace
-            // visible via `kubectl describe platformstack
-            // default` (and `kubectl get events`). Without
-            // this, a transient revert vanishes from the
-            // `UnauthorizedSourceModification` condition
-            // within one reconcile cycle and operators
-            // staring at `kubectl get platformstack` see
-            // only the post-recovery `False/Clean` state —
-            // no record that a foreign write happened.
+            // Kubernetes Event pair so the foreign-write +
+            // revert leaves a durable audit trace visible via
+            // `kubectl describe platformstack default` (and
+            // `kubectl get events`). Without it, a transient
+            // revert vanishes from the
+            // `UnauthorizedSourceModification` condition within
+            // one reconcile cycle and operators staring at
+            // `kubectl get platformstack` see only the
+            // post-recovery `False/Clean` state — no record
+            // that a foreign write happened.
             //
-            // Best-effort: failures to publish the event
-            // are logged but don't fail the reconcile. The
-            // force-revert SSA patch (below) is the actual
-            // load-bearing action.
+            // This Warning is the DETECTION record, and it goes
+            // out BEFORE the revert on purpose (WI-400). If the
+            // revert lands but its answer is lost — the pass
+            // cut at `RECONCILE_DEADLINE`, or the operator
+            // restarted — the force apply has already taken
+            // the fields from the foreign manager: the next
+            // pass sees no foreign writer, publishes nothing,
+            // and the condition never goes True. Published
+            // after the patch, such a write would leave no
+            // trace at all. So the note says only what is true
+            // NOW — the revert is in progress — and the
+            // completion is `SourceReverted` below, published
+            // once the patch has landed. A revert whose answer
+            // is lost therefore shows the detection without the
+            // completion: it under-claims, never over-claims.
+            //
+            // Best-effort and bounded: a failed or unanswered
+            // publish is logged, never fatal. The force-revert
+            // SSA patch is the load-bearing action.
             let recorder = build_recorder(&ctx, &stack);
             let ev = KubeEvent {
                 type_: EventType::Warning,
                 reason: "ForeignFieldManager".into(),
                 note: Some(format!(
-                    "reverted external write to spec.source on parent Application \
+                    "detected external write to spec.source on parent Application \
                      {PARENT_APPLICATION_NAMESPACE}/{PARENT_APPLICATION_NAME} by field manager \
-                     {foreign:?}; PlatformController force-reapplied desired state \
+                     {foreign:?}; PlatformController is force-reapplying desired state \
                      (target={target_for_patch})"
                 )),
                 action: "ForceRevert".into(),
@@ -1134,9 +1149,9 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
         }
         patch_application(&apps, &patch_payload, &pending_upgrade).await?;
         if foreign_writer.is_some() {
-            // Companion Normal event so the audit trail
-            // records the recovery action, not just the
-            // violation.
+            // The COMPLETION record: reached only once the
+            // revert has landed (`?` above returns on a failed
+            // patch, and a cut pass never gets here).
             let recorder = build_recorder(&ctx, &stack);
             let ev = KubeEvent {
                 type_: EventType::Normal,
@@ -5397,6 +5412,131 @@ mod bounded_reconcile_tests {
             calls(&state).iter().any(|c| c.is("DELETE", &deleted)),
             "{:#?}",
             calls(&state)
+        );
+    }
+
+    /// The root Application with a foreign field manager on
+    /// `spec.source.targetRevision` — a `kubectl edit` to revert.
+    fn edited_parent(stack: &Value, target: &str) -> Value {
+        let mut parent = parent_on(stack, target);
+        parent["metadata"]["managedFields"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({ "manager": "kubectl-edit", "operation": "Update",
+                          "fieldsV1": { "f:spec": { "f:source": { "f:targetRevision": {} } } } }));
+        parent
+    }
+
+    /// The bodies of the Events the reconcile published, in order.
+    fn audit_events(calls: &[Call]) -> Vec<Value> {
+        calls
+            .iter()
+            .filter(|c| c.is("POST", EVENTS))
+            .map(|c| c.body.clone())
+            .collect()
+    }
+
+    /// WI-400 cancellation hazard: the `ForeignFieldManager` Warning goes out
+    /// BEFORE the revert patch, and its note used to say the controller
+    /// "force-reapplied desired state". A pass cut (or failed) at the patch
+    /// left that Warning describing a revert that never happened.
+    ///
+    /// The Warning must still go out before the patch: it is the only record
+    /// of the detection when the revert LANDS but its answer is lost. The
+    /// force apply has then already taken the fields from the foreign
+    /// manager, so the next pass sees no foreign writer, publishes nothing,
+    /// and `UnauthorizedSourceModification` never goes True.
+    #[tokio::test(start_paused = true)]
+    async fn a_reconcile_cut_at_the_revert_records_the_detection_and_claims_no_revert() {
+        let stack = stack_on("0.2.80", "0.2.80");
+        let parent = edited_parent(&stack, "0.2.80");
+        let mut cluster = cluster(stack, parent);
+        cluster.silent.push(("PATCH", PARENT.to_string()));
+        let (client, state) = scripted(cluster);
+        let ctx = context(client, Arc::new(NoRegistry));
+        let err = operator_core::deadline::within(
+            RECONCILE_DEADLINE,
+            reconcile(the_stack(&state), ctx.clone()),
+        )
+        .await
+        .expect_err("the revert never answers, so the reconcile is cut");
+        assert!(matches!(err, Error::TimedOut(_)), "{err:?}");
+        let first = calls(&state);
+        assert!(first.iter().any(|c| c.is("PATCH", PARENT)), "{first:#?}");
+        let events = audit_events(&first);
+        assert_eq!(
+            events.len(),
+            1,
+            "the detection and nothing else: {events:#?}"
+        );
+        assert_eq!(events[0]["type"], "Warning");
+        assert_eq!(events[0]["reason"], "ForeignFieldManager");
+        let note = events[0]["note"].as_str().expect("note");
+        assert!(note.contains("detected external write"), "{note}");
+        assert!(
+            !note.contains("reverted external write") && !note.contains("force-reapplied"),
+            "the detection claims no revert that has not landed: {note}"
+        );
+
+        // The revert had landed after all; only its answer was lost. The
+        // force apply took the fields, so the foreign manager is gone.
+        {
+            let mut cluster = state.lock().unwrap();
+            cluster.silent.clear();
+            cluster.parent["metadata"]["managedFields"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|m| m["manager"] != "kubectl-edit");
+        }
+        reconcile(the_stack(&state), ctx)
+            .await
+            .expect("the next reconcile succeeds");
+        let all = calls(&state);
+        assert_eq!(
+            audit_events(&all).len(),
+            1,
+            "the next pass sees no foreign writer and audits nothing: {all:#?}"
+        );
+        let patch = status_patch(&all);
+        assert_eq!(
+            written_condition(&patch, "UnauthorizedSourceModification")["status"],
+            "False",
+            "the condition never records this write, so the Warning is its only trace"
+        );
+    }
+
+    /// A revert that lands is audited as detection, revert, completion — in
+    /// that order — and the detection says the revert is in progress.
+    #[tokio::test]
+    async fn a_revert_is_audited_as_detection_then_completion() {
+        let stack = stack_on("0.2.80", "0.2.80");
+        let parent = edited_parent(&stack, "0.2.80");
+        let (client, state) = scripted(cluster(stack, parent));
+        reconcile(the_stack(&state), context(client, Arc::new(NoRegistry)))
+            .await
+            .expect("the reconcile succeeds");
+        let calls = calls(&state);
+        let event_at = |reason: &str| {
+            calls
+                .iter()
+                .position(|c| c.is("POST", EVENTS) && c.body["reason"] == reason)
+                .unwrap_or_else(|| panic!("a {reason} Event: {calls:#?}"))
+        };
+        let detection = event_at("ForeignFieldManager");
+        let completion = event_at("SourceReverted");
+        let revert = calls
+            .iter()
+            .position(|c| c.is("PATCH", PARENT))
+            .expect("the revert");
+        assert!(
+            detection < revert && revert < completion,
+            "detection, revert, completion: {calls:#?}"
+        );
+        assert_eq!(audit_events(&calls).len(), 2, "{calls:#?}");
+        let note = calls[detection].body["note"].as_str().expect("note");
+        assert!(
+            note.contains("is force-reapplying desired state (target=0.2.80)"),
+            "{note}"
         );
     }
 }
