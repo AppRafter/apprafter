@@ -83,6 +83,13 @@ condition, as below — makes the next successful cycle look like a fresh
 crossing and publish again. A sample that never came back keeps the
 condition, and publishes nothing.
 
+The Event is published before the status write that records the crossing,
+and it is that write which silences the next one. A reconcile interrupted
+between the two therefore publishes again on its next pass instead of not at
+all: an interruption can duplicate the Event but cannot swallow it. The
+publish waits at most five seconds; a failure is logged and the status write
+goes ahead.
+
 Sampling runs on every reconcile: the 300-second requeue, plus any change to a
 reference-claim, which fans a reconcile back to the parent volume. A
 30-second cache in front of the kubelet means several volumes reconciling
