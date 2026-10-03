@@ -945,6 +945,10 @@ async fn delete_connection_secret(
 
 /// Error policy: increment the GC error counter + requeue after 30s
 /// (mirror the scheduler/provisioner cadence).
+///
+/// A pass abandoned at [`RECONCILE_DEADLINE`] is also counted on
+/// `apprafter_reconcile_timeouts_total` (WI-400). Nothing is written on any
+/// error path: a `RetainedClaim` has no status subresource.
 pub fn error_policy(rc: Arc<RetainedClaim>, err: &ReconcileError, ctx: Arc<Context>) -> Action {
     let name = rc.name_any();
     let namespace = rc.namespace().unwrap_or_default();
@@ -957,6 +961,12 @@ pub fn error_policy(rc: Arc<RetainedClaim>, err: &ReconcileError, ctx: Arc<Conte
         .reconcile_errors
         .with_label_values(&[KIND])
         .inc();
+    if matches!(err, ReconcileError::TimedOut(_)) {
+        ctx.metrics
+            .reconcile_timeouts
+            .with_label_values(&[KIND])
+            .inc();
+    }
     Action::requeue(Duration::from_secs(30))
 }
 
@@ -2245,6 +2255,80 @@ mod tests {
         assert!(
             production.contains(wired),
             "gc::run() must drive reconcile_with_deadline, not the unbounded gc::reconcile"
+        );
+    }
+
+    /// A GC pass abandoned at its deadline is counted where an alert can see
+    /// it — `apprafter_reconcile_timeouts_total{kind="RetainedClaim"}` — on top
+    /// of the two counters every GC error already lands on, and is retried on
+    /// the same 30s cadence. The WARN line and this counter are its whole
+    /// report: a `RetainedClaim` has no status to carry it.
+    #[tokio::test]
+    async fn gc_error_policy_counts_a_timed_out_pass_on_the_timeout_counter() {
+        let ctx = Arc::new(Context::new(
+            operator_core::testing::stalled_client(),
+            Arc::new(Metrics::new()),
+        ));
+        let err = ReconcileError::from(operator_core::deadline::ReconcileTimedOut {
+            after: RECONCILE_DEADLINE,
+        });
+
+        let action = error_policy(expired_pg_snapshot(), &err, ctx.clone());
+
+        assert_eq!(
+            ctx.metrics
+                .reconcile_timeouts
+                .with_label_values(&[KIND])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            ctx.metrics
+                .reconcile_errors
+                .with_label_values(&[KIND])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            ctx.metrics
+                .claim_gc_total
+                .with_label_values(&["error", "apprafter-system"])
+                .get(),
+            1.0
+        );
+        assert_eq!(action, Action::requeue(Duration::from_secs(30)));
+    }
+
+    /// "A pass was cut" is not "a pass failed": an apiserver that ANSWERS
+    /// with an error — the live-guard failing closed on a 500, say — must not
+    /// move the timeout counter.
+    #[tokio::test]
+    async fn gc_error_policy_does_not_count_an_answered_apiserver_error_as_a_timeout() {
+        let ctx = Arc::new(Context::new(
+            operator_core::testing::stalled_client(),
+            Arc::new(Metrics::new()),
+        ));
+        let err = ReconcileError::Kube(kube::Error::Api(
+            kube::core::Status::failure("etcdserver: request timed out", "InternalError")
+                .with_code(500)
+                .boxed(),
+        ));
+
+        error_policy(expired_pg_snapshot(), &err, ctx.clone());
+
+        assert_eq!(
+            ctx.metrics
+                .reconcile_timeouts
+                .with_label_values(&[KIND])
+                .get(),
+            0.0
+        );
+        assert_eq!(
+            ctx.metrics
+                .reconcile_errors
+                .with_label_values(&[KIND])
+                .get(),
+            1.0
         );
     }
 }
