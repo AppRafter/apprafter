@@ -38,6 +38,17 @@ use tracing::debug;
 /// Per-probe wall-clock ceiling, so a hung host never stalls reconcile.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// TCP connect (and TLS handshake) bound for the registry probe's client.
+const PROBE_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Bound on each wait for a registry response. One registry probe is two or
+/// three requests in sequence — the `/v2/` challenge, the token exchange when
+/// the registry asks for one, the tag list — and oci-client swallows a failed
+/// challenge (`get_auth_token` ends in `.ok()??`) and sends the tag list
+/// anyway, so a silent registry costs two full waits. 3s keeps both inside
+/// [`PROBE_TIMEOUT`], which stays the ceiling on the whole probe.
+const PROBE_READ_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Outcome of a validity probe. Maps onto a k8s condition `(status,
 /// reason)` pair: `Valid → ("True", Reachable)`, `Invalid → ("False",
 /// AuthRejected)`, `Unverified → ("Unknown", Unverified)`.
@@ -148,7 +159,12 @@ fn registry_validity_from_error(err: &oci_client::errors::OciDistributionError) 
 /// `oci-distribution` performs the `/v2/` challenge → token-endpoint
 /// exchange with the supplied Basic credentials; an auth failure means
 /// the credential is rejected, any other error is inconclusive.
-async fn probe_registry(image: &str, username: &str, password: &str) -> Validity {
+async fn probe_registry(
+    client: &OciClient,
+    image: &str,
+    username: &str,
+    password: &str,
+) -> Validity {
     let reference: Reference = match image.parse() {
         Ok(r) => r,
         Err(e) => {
@@ -157,7 +173,6 @@ async fn probe_registry(image: &str, username: &str, password: &str) -> Validity
         }
     };
     let auth = RegistryAuth::Basic(username.to_string(), password.to_string());
-    let client = OciClient::new(ClientConfig::default());
     let probe = client.list_tags(&reference, &auth, Some(1), None);
     match tokio::time::timeout(PROBE_TIMEOUT, probe).await {
         Ok(Ok(_)) => Validity::Valid,
@@ -172,6 +187,20 @@ async fn probe_registry(image: &str, username: &str, password: &str) -> Validity
             debug!(%image, "registry probe timed out; Unverified");
             Validity::Unverified
         }
+    }
+}
+
+/// The configuration of the OCI client the registry probes share.
+/// `ClientConfig::default()` sets neither a connect nor a read timeout, and
+/// reqwest underneath defaults to none, so a registry that accepted the
+/// connection and then said nothing held each probe until the outer
+/// [`PROBE_TIMEOUT`] dropped it. The outer timeout stays (DNS runs on a
+/// blocking thread no reqwest timeout reaches); these bound the transport.
+fn probe_client_config() -> ClientConfig {
+    ClientConfig {
+        connect_timeout: Some(PROBE_CONNECT_TIMEOUT),
+        read_timeout: Some(PROBE_READ_TIMEOUT),
+        ..ClientConfig::default()
     }
 }
 
@@ -317,11 +346,12 @@ pub async fn probe_registry_half(
     username: &str,
     password: &str,
 ) -> (Validity, String) {
+    let oci = OciClient::new(probe_client_config());
     let mut results = Vec::new();
     let mut probed = 0usize;
     for host in host_prefixes {
         for image in representative_images(client, host).await {
-            results.push(probe_registry(&image, username, password).await);
+            results.push(probe_registry(&oci, &image, username, password).await);
             probed += 1;
         }
     }
@@ -858,6 +888,39 @@ mod tests {
         assert!(
             message.contains("no Application renders an image"),
             "{message}"
+        );
+    }
+
+    /// A registry that completes the TCP handshake and then never says a word
+    /// (a wedged registry, a proxy that swallows the request) must be cut by
+    /// the probe client's own transport timeouts. `ClientConfig::default()`
+    /// sets none and reqwest defaults to none, so before this the silent
+    /// registry held every probe for the whole outer `PROBE_TIMEOUT`.
+    #[tokio::test(start_paused = true)]
+    async fn a_registry_that_never_answers_is_cut_by_the_transport_timeouts() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        // Bound and never accepted: the kernel completes the handshake into
+        // the backlog, and nothing ever writes back.
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback port");
+        let addr = silent.local_addr().expect("loopback address");
+
+        let started = tokio::time::Instant::now();
+        let verdict = probe_registry(
+            &OciClient::new(probe_client_config()),
+            &format!("{addr}/acme/landing:v1"),
+            "acme-bot",
+            "ghp_x",
+        )
+        .await;
+        let took = started.elapsed();
+        drop(silent);
+
+        assert_eq!(verdict, Validity::Unverified);
+        assert!(
+            took < PROBE_TIMEOUT,
+            "a silent registry held the probe for {took:?}: the client's transport timeouts are not applied"
         );
     }
 
