@@ -29,7 +29,11 @@
 #     a call without it leaves a scratch file behind;
 #   - an apiserver that answers nothing makes the function fail: most walks
 #     call it bare from their EXIT trap under errexit, where a failure would
-#     skip the teardown.
+#     skip the teardown;
+#   - a reconcile-deadline hit that the console tail cuts is not printed
+#     first, or lib.sh greps for a text that is no longer the one
+#     operator_core::deadline::ReconcileTimedOut displays
+#     (operator/operator-core/src/deadline.rs).
 #
 # No cluster is reached: kubectl and helm are stubs at the front of PATH, the
 # check refuses to run if `command -v` resolves either anywhere else, and
@@ -37,7 +41,8 @@
 #
 # CHECK_DUMP_DIAGNOSTICS_LIB=<file> runs the checks against another copy of
 # lib.sh — how the guard is mutation-tested (copy lib.sh, revert one fix,
-# watch this fail).
+# watch this fail). CHECK_DUMP_DIAGNOSTICS_DEADLINE_RS=<file> does the same
+# for operator/operator-core/src/deadline.rs.
 #
 # Usage: bash scripts/check-dump-diagnostics.sh
 # Exit 0 = every check passed. Offline, a few seconds, bash + coreutils only.
@@ -108,6 +113,20 @@ case "${args[*]}" in
             {
                 printf '%s[2m2026-10-02T11:58:45Z%s[0m %s[32m INFO%s[0m FIRST-LINE-OF-THE-WALK\n' "$esc" "$esc" "$esc" "$esc"
                 for i in $(seq 2 2999); do
+                    # Two deadline WARNs, far outside the console's 2000-line
+                    # tail: an error_policy line inside kube-runtime's span,
+                    # and a run-stream line (the only one that carries the
+                    # text for SourceCredential, whose error_policy omits it).
+                    if [ "$i" -eq 400 ] && [ "${STUB_DEADLINE_HIT:-1}" = 1 ]; then
+                        printf '%s[2m2026-10-02T11:59:00Z%s[0m %s[33m WARN%s[0m reconciling object{object.ref=Application.v1alpha1.apprafter.io/web.demo object.reason=object updated}: operator_controllers_application: reconcile error name=web namespace=demo err=reconcile did not finish within 120s\n' \
+                            "$esc" "$esc" "$esc" "$esc"
+                        continue
+                    fi
+                    if [ "$i" -eq 700 ] && [ "${STUB_DEADLINE_HIT:-1}" = 1 ]; then
+                        printf '%s[2m2026-10-02T11:59:00Z%s[0m %s[33m WARN%s[0m operator_controllers_sourcecredential: sourcecredential step error err=reconciler for object SourceCredential.v1alpha1.apprafter.io/repo.demo failed: reconcile did not finish within 90s\n' \
+                            "$esc" "$esc" "$esc" "$esc"
+                        continue
+                    fi
                     printf '%s[2m2026-10-02T11:59:00Z%s[0m %s[32m INFO%s[0m reconciling object{object.ref=PlatformStack.v1alpha1.apprafter.io/default.apprafter-system}: steady-state line %d\n' \
                         "$esc" "$esc" "$esc" "$esc" "$i"
                 done
@@ -238,6 +257,31 @@ check "B: ... resourceclaims too" test -e "$B/objects/resourceclaims.apprafter.i
 check "B: ... and the Argo CD Applications" test -e "$B/objects/applications.argoproj.io.yaml"
 check "B: context.txt records the log window" has "$B/context.txt" "log window: $WANT_WINDOW"
 check "B: no scratch file is left behind outside the artifact" dir_empty "$WORK/b1.tmp"
+
+# ---- F: reconcile-deadline hits come first ------------------------------------
+# deadline_section <console> — the lines between the deadline header and the
+# first per-pod log header.
+deadline_section() {
+    awk '/^--- reconcile deadline hits \(whole walk\) ---$/ {on = 1; next}
+         /^=== logs apprafter-system\// {on = 0}
+         on' "$1"
+}
+section_has() { deadline_section "$1" | grep -F -- "$2" >/dev/null; }
+check "F: a deadline hit 2600 lines back is printed before the per-pod logs" \
+    section_has "$WORK/a.console" 'object.ref=Application.v1alpha1.apprafter.io/web.demo'
+check "F: ... with the deadline text" section_has "$WORK/a.console" 'err=reconcile did not finish within 120s'
+check "F: the run-stream hit, SourceCredential's only one, is printed there too" \
+    section_has "$WORK/a.console" 'err=reconciler for object SourceCredential.v1alpha1.apprafter.io/repo.demo failed: reconcile did not finish within 90s'
+DEADLINE_TEXT="$(bash -c 'source "$1" >/dev/null 2>&1; printf %s "${_DIAG_DEADLINE_TEXT:-}"' _ "$LIB")"
+DEADLINE_RS="${CHECK_DUMP_DIAGNOSTICS_DEADLINE_RS:-$REPO_ROOT/operator/operator-core/src/deadline.rs}"
+deadline_text_pinned() {
+    [ -n "$DEADLINE_TEXT" ] && [ -f "$DEADLINE_RS" ] \
+        && grep -F -- "#[error(\"${DEADLINE_TEXT} {}s\"" "$DEADLINE_RS" >/dev/null
+}
+check "F: lib.sh greps for exactly what ReconcileTimedOut displays (${DEADLINE_RS#"$REPO_ROOT"/})" \
+    deadline_text_pinned
+run_dump f STUB_DEADLINE_HIT=0
+check "F: no hit prints (none)" section_has "$WORK/f.console" '(none)'
 
 # ---- C: START_NS unusable -> the whole log, never a tail ---------------------
 run_dump c START_NS=not-a-number

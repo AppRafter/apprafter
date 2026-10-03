@@ -74,6 +74,9 @@ jobs:
             e2e_lib:
               - 'e2e/lib.sh'
               - 'scripts/check-dump-diagnostics.sh'
+              # The check pins lib.sh's deadline grep to ReconcileTimedOut's
+              # Display text, so a reword on the Rust side must wake it too.
+              - 'operator/operator-core/src/deadline.rs'
               - '.github/workflows/lint.yml'
 
   # The version guards and the workflow linter, on EVERY pull request and push

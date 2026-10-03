@@ -927,6 +927,14 @@ apply_branch_operator_rbac() {
 # dump_diagnostics helpers (_diag_*). Internal; see dump_diagnostics.
 # ---------------------------------------------------------------
 
+# The Display of operator_core::deadline::ReconcileTimedOut
+# (operator/operator-core/src/deadline.rs): what the operator logs when a
+# reconcile runs out of its WI-400 deadline. Every controller's run() stream
+# logs it as "reconciler for object <ref> failed: <this> <N>s", and most
+# error_policies log it again. scripts/check-dump-diagnostics.sh fails when
+# this drifts from the Rust text, so the summary cannot go silently empty.
+_DIAG_DEADLINE_TEXT='reconcile did not finish within'
+
 # _diag_strip_ansi — drop ANSI colour sequences. The operator and the
 # webhook colour their logs with no TTY attached, and a downloaded job
 # log renders every code as literal `^[[2m` text: about a third of the
@@ -1031,6 +1039,16 @@ _diag_control_plane_logs() {
     if [ "${#logs[@]}" -eq 0 ]; then
         printf '(no operator or webhook pod found)\n' >&2
         return 0
+    fi
+    # Deadline hits first, from the WHOLE logs, however far back they are
+    # and whatever the console tail below cuts. Each names the object whose
+    # reconcile hung, in kube-runtime's <Kind>.<version>.<group>/<name>.<ns>
+    # form: the run() stream's WARN reads "reconciler for object <ref>
+    # failed: …", and an error_policy WARN sits inside the span
+    # `reconciling object{object.ref=<ref>}`. A hit usually shows twice.
+    printf '\n--- reconcile deadline hits (whole walk) ---\n' >&2
+    if ! grep -hF -- "$_DIAG_DEADLINE_TEXT" "${logs[@]}" >&2 2>/dev/null; then
+        printf '(none)\n' >&2
     fi
     for i in "${!logs[@]}"; do
         _diag_print_log "${logs[$i]}" "${titles[$i]}" "$out"

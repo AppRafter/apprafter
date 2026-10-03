@@ -203,7 +203,7 @@ pre-commit:
     # dump_diagnostics is what a failing walk leaves behind, and nothing runs
     # it until a walk fails. See the header of the script.
     - name: dump-diagnostics
-      glob: "{e2e/lib.sh,scripts/check-dump-diagnostics.sh}"
+      glob: "{e2e/lib.sh,scripts/check-dump-diagnostics.sh,operator/operator-core/src/deadline.rs}"
       run: ./scripts/check-dump-diagnostics.sh
     # A workflow that does not parse fails as a run with ZERO JOBS, which
     # `gh pr checks` does not list — every check can be green while a
