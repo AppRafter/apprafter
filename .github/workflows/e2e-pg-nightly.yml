@@ -117,4 +117,19 @@ jobs:
         # run with APPRAFTER_E2E_LOCAL_OPERATOR=1 so Phase 1b builds +
         # side-loads the working-tree images and applies the branch CRDs. The
         # CI runner uses Docker, so `kind load docker-image` resolves the build.
+        env:
+          APPRAFTER_E2E_DIAG_DIR: ${{ runner.temp }}/e2e-diagnostics
         run: APPRAFTER_E2E_LOCAL_OPERATOR=1 bash e2e/needs-pg-walk.sh
+
+      - name: Upload walk diagnostics
+        # On failure e2e/lib.sh's dump_diagnostics writes the whole operator
+        # and webhook logs, every event and every apprafter.io object under
+        # APPRAFTER_E2E_DIAG_DIR; the job log keeps only the last 2000 lines
+        # of each log. One subdirectory per dump, so nothing overwrites.
+        if: ${{ failure() || cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-diagnostics-${{ github.job }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/e2e-diagnostics
+          if-no-files-found: ignore
+          retention-days: 14
