@@ -20,8 +20,10 @@ use tabled::{settings::Style, Table, Tabled};
 use crate::cli::VolumeCommand;
 use crate::commands::k8s_helpers::{
     ensure_kubeconfig_tempfile, kubectl_apply_json, kubectl_delete, kubectl_get_json,
-    kubectl_get_json_cluster_wide, namespace_confirmed_missing,
+    kubectl_get_json_cluster_wide, kubectl_get_json_showing_managed_fields,
+    namespace_confirmed_missing,
 };
+use crate::commands::reconcile_timeout::{self, SHARED_VOLUME_KIND};
 
 const RESOURCE: &str = "sharedvolume.apprafter.io";
 
@@ -209,7 +211,14 @@ fn volume_not_found(name: &str, namespace: &str, kubeconfig_path: &Path) -> CliE
 
 fn status(name: &str, namespace: &str) -> Result<()> {
     let kc = ensure_kubeconfig_tempfile()?;
-    let sv = match kubectl_get_json(RESOURCE, Some(name), Some(namespace), kc.path())? {
+    // With its field owners: the `Reconcile:` line below goes quiet once the
+    // provisioner has written this status after its last timeout (WI-400).
+    let sv = match kubectl_get_json_showing_managed_fields(
+        RESOURCE,
+        Some(name),
+        Some(namespace),
+        kc.path(),
+    )? {
         Some(sv) => sv,
         None => return Err(volume_not_found(name, namespace, kc.path())),
     };
@@ -270,7 +279,29 @@ fn status(name: &str, namespace: &str) -> Result<()> {
             cli_core::style::warn(&format!("Capacity:    {msg}"))
         );
     }
+    // WI-400: a pass abandoned at its deadline writes nothing here, and
+    // leaves a Warning Event instead. Printed while that Event exists, until
+    // the provisioner writes this status again; an older operator leaves no
+    // such Event, and prints nothing.
+    let events =
+        reconcile_timeout::read_events(namespace, SHARED_VOLUME_KIND, Some(name), kc.path());
+    if let Some(line) = reconcile_line(&sv, &events, chrono::Utc::now()) {
+        println!("  {}", cli_core::style::warn(&line));
+    }
     Ok(())
+}
+
+/// The `Reconcile:` line of `volume status`, when the newest
+/// `ReconcileTimedOut` Event is about this volume and the provisioner has
+/// not written its status since. Pure, so the shape is tested without a
+/// cluster.
+pub(crate) fn reconcile_line(
+    sv: &Value,
+    events: &[Value],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<String> {
+    reconcile_timeout::object_summary(sv, SHARED_VOLUME_KIND, events, now)
+        .map(|summary| format!("Reconcile:   {summary}"))
 }
 
 /// The `CapacityWarning` message when the condition is `True`.
@@ -386,6 +417,68 @@ mod tests {
         let m = sharedvolume_manifest("v", "10Gi", "ns");
         assert_eq!(m["apiVersion"], "apprafter.io/v1alpha1");
         assert_eq!(m["metadata"]["name"], "v");
+    }
+}
+
+#[cfg(test)]
+mod reconcile_tests {
+    use super::*;
+    use chrono::TimeZone;
+    use serde_json::json;
+
+    fn noon() -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc.with_ymd_and_hms(2026, 10, 2, 12, 0, 0).unwrap()
+    }
+
+    /// A ready volume: a timeout is shown whatever the status says.
+    fn volume(uid: &str) -> Value {
+        json!({
+            "metadata": { "name": "data", "namespace": "apps", "uid": uid },
+            "spec": { "size": "1Gi" },
+            "status": { "ready": true, "refCount": 2 }
+        })
+    }
+
+    fn abandoned_at(event_time: &str) -> Value {
+        json!({
+            "type": "Warning", "reason": "ReconcileTimedOut", "eventTime": event_time,
+            "note": "SharedVolume reconcile did not finish within 60s: the controller \
+                     abandoned this pass and will retry it; nothing was written to this \
+                     object's status",
+            "regarding": { "apiVersion": "apprafter.io/v1alpha1", "kind": "SharedVolume",
+                           "name": "data", "namespace": "apps", "uid": "u-sv-1" }
+        })
+    }
+
+    #[test]
+    fn an_abandoned_pass_is_one_line_under_the_volume() {
+        let line = reconcile_line(
+            &volume("u-sv-1"),
+            &[abandoned_at("2026-10-02T11:57:00.000000Z")],
+            noon(),
+        );
+        assert_eq!(
+            line.as_deref(),
+            Some(
+                "Reconcile:   last timed out 3 minutes ago (did not finish within 60s); the \
+                 operator retries on its own"
+            )
+        );
+    }
+
+    #[test]
+    fn a_volume_created_again_under_its_name_prints_no_line() {
+        let line = reconcile_line(
+            &volume("u-sv-2"),
+            &[abandoned_at("2026-10-02T11:57:00.000000Z")],
+            noon(),
+        );
+        assert_eq!(line, None);
+    }
+
+    #[test]
+    fn an_operator_that_leaves_no_event_adds_no_line() {
+        assert_eq!(reconcile_line(&volume("u-sv-1"), &[], noon()), None);
     }
 }
 

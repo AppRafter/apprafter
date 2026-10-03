@@ -35,6 +35,7 @@ pub mod open;
 pub mod plan;
 pub mod platform;
 pub mod port_forward;
+pub(crate) mod reconcile_timeout;
 pub mod repo_creds;
 pub mod repo_creds_wizard;
 pub mod restore;
