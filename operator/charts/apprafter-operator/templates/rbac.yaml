@@ -626,6 +626,11 @@ rules:
   # `ciliumnetworkpolicies.cilium.io` CRD is served (a single CRD GET) to
   # decide whether to apply egress CNPs — on a non-Cilium cluster (e2e /
   # kindnet) applying a CNP would 404 every reconcile.
+  # WI-400: the PlatformController's stall manager also GETs
+  # `platformstacks.apprafter.io` before every `ReconcileStalled` write, and
+  # writes nothing unless `status.conditions` is served as a list-map (a
+  # rollback re-applies the atomic CRD, under which its apply would replace
+  # every other condition). Same verb, no new rule.
   - apiGroups:
       - apiextensions.k8s.io
     resources:
