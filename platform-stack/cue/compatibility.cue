@@ -1954,8 +1954,8 @@ compatibility: "0.2.81": {
 		1. EVERY CONTROLLER HAS A DEADLINE. A controller never runs two
 		reconciles of one object at once, so a reconcile that never ends holds
 		every later change to that object, and nothing bounded one except the
-		client's 295s read timeout, which does not cover a request the
-		apiserver accepted and never answered. One such request froze an
+		client's 295s read timeout, which does not cover a request queued
+		behind a watch and never sent (8). One such request froze an
 		Application with no status, no Event and no log line. A reconcile is
 		now abandoned at its deadline and retried: Applications, claim
 		scheduling and provisioning, SharedDatabases, the PlatformStack and
