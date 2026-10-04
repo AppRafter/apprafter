@@ -2214,7 +2214,7 @@ fn leaves_the_site_for_the_repository(target: &str, page_directory: &str) -> boo
             other => segments.push(other),
         }
     }
-    !segments.first().is_some_and(|first| *first == "docs")
+    segments.first().is_none_or(|first| *first != "docs")
 }
 
 /// Whether a code span names a path in an implementation tree.
