@@ -201,10 +201,10 @@ Event expires, and its age keeps growing.
 Abandoning a reconcile does not recall a request it already sent: the
 apiserver may still apply its write to the backing PVC up to a minute later.
 So a volume deleted within about a minute of a failed reconcile deletes its
-PVC, keeps its finalizer for 65 seconds, then deletes the PVC again before
-letting go. Without the second delete, that late write would recreate the
-PVC after the volume was gone, with nothing left to remove it. A delete with
-no recent failure lets go at once.
+PVC, keeps its finalizer until 65 seconds after that reconcile failed, then
+deletes the PVC again before letting go. Without the second delete, that late
+write would recreate the PVC after the volume was gone, with nothing left to
+remove it. A delete with no recent failure lets go at once.
 
 ## See also
 
