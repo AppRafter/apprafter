@@ -238,6 +238,9 @@ redis_as() { # <user> <password> <args...>
         redis-cli --user "$user" --pass "$pw" --no-auth-warning "$@" 2>&1 || true
 }
 
+# Dragonfly (v1.37.0) answers ACL WHOAMI with `User is <name>`, Redis with `<name>`.
+whoami_name() { tr -d '\r' | sed -E 's/^User is //'; }
+
 keys_in() { # <dbnum>: DBSIZE as the admin user; a non-number is a failure
     local n
     n="$(redis_admin -n "$1" DBSIZE | tr -d '\r')"
@@ -384,7 +387,7 @@ phase "Phase 6: take ACL SETUSER away from the instance's admin user"
 assert_eq "proofadmin created" \
     "$(redis_admin ACL SETUSER proofadmin on ">${PROOF_ADMIN_PW}" '~*' '&*' '+@all' | tr -d '\r')" "OK"
 assert_eq "proofadmin authenticates" \
-    "$(redis_as proofadmin "$PROOF_ADMIN_PW" ACL WHOAMI | tr -d '\r')" "proofadmin"
+    "$(redis_as proofadmin "$PROOF_ADMIN_PW" ACL WHOAMI | whoami_name)" "proofadmin"
 
 # The narrowest rule this Dragonfly accepts that refuses ACL SETUSER to
 # `default`. A rule it rejects, or one that leaves ACL SETUSER allowed, is
@@ -472,7 +475,7 @@ phase "Phase 8: give ACL SETUSER back; the claim recovers"
 
 assert_eq "default gets ACL SETUSER back" \
     "$(redis_as proofadmin "$PROOF_ADMIN_PW" ACL SETUSER default '+@all' | tr -d '\r')" "OK"
-assert_eq "default runs ACL commands again" "$(redis_admin ACL WHOAMI | tr -d '\r')" "default"
+assert_eq "default runs ACL commands again" "$(redis_admin ACL WHOAMI | whoami_name)" "default"
 INJECTED=0
 redis_admin ACL DELUSER proofadmin proofprobe >/dev/null
 
