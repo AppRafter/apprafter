@@ -2016,8 +2016,8 @@ compatibility: "0.2.81": {
 		5. SHAREDVOLUME. The CapacityWarning Event is sent before the status
 		write that records it, so an interrupted reconcile repeats it instead
 		of losing it. A volume deleted within a minute of a failed reconcile
-		holds its finalizer for 65s and deletes its PVC again, so a late write
-		cannot leave an orphaned PVC.
+		holds its finalizer until 65s after that reconcile failed, then
+		deletes its PVC again, so a late write cannot leave an orphaned PVC.
 
 		6. PLATFORM UPGRADES SURVIVE AN INTERRUPTED RECONCILE. An approved
 		upgrade keeps its approval until the controller has moved the
@@ -2038,6 +2038,15 @@ compatibility: "0.2.81": {
 		list and the older operator carries ReconcileStalled forward as it
 		found it, so read it there as left behind, not as current.
 		"apprafter" 0.2.79 marks it as left behind on such a cluster.
+
+		8. THE STALL'S CAUSE IS FIXED. The request that froze a reconcile was
+		never sent: the client libraries' HTTP/1.1 connection pool
+		(hyper/hyper-util) could return a connection whose watch was still
+		streaming, and the next request waited behind that watch, up to about
+		five minutes, mostly right after the operator started or took over
+		leadership. The operator's Kubernetes client now opens a new
+		connection for every request (about 1ms each), so no request waits
+		behind a watch; the deadlines in 1 remain as a backstop.
 		"""
 	references: [
 		"docs/adr/0026-platformstack-crd.md",
