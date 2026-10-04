@@ -178,6 +178,34 @@ owned disk's `ResourceClaim` — that is what `apprafter app status` shows in it
 dependency table. There is no `CapacityWarning` condition there; the threshold
 and the Event are SharedVolume behaviour.
 
+## When a reconcile stalls
+
+A SharedVolume reconcile that runs for more than 60 seconds is abandoned and
+retried within a minute. Every SharedVolume waits behind the one in progress,
+so a stalled call would otherwise freeze `refCount` — the figure the
+`volume rm` guard reads — for all of them. An abandoned reconcile writes
+nothing to the volume's status; it leaves a `Warning` Event with reason
+`ReconcileTimedOut` on the volume, which `kubectl describe` shows.
+`apprafter volume status` prints the newest such Event with its age:
+
+    Reconcile:   last timed out 3 minutes ago (did not finish within 60s); the operator retries on its own
+
+The line goes once a later reconcile writes the volume's status, in a later
+second than the Event, or once the Event expires (an hour by default),
+whichever comes first. A stall that persists writes no status and is
+abandoned again about every two minutes, so its line stays and its age stays
+short. A reconcile that finishes without changing the status leaves no
+record that it finished, so after such a recovery the line stays until the
+Event expires, and its age keeps growing.
+
+Abandoning a reconcile does not recall a request it already sent: the
+apiserver may still apply its write to the backing PVC up to a minute later.
+So a volume deleted within about a minute of a failed reconcile deletes its
+PVC, keeps its finalizer for 65 seconds, then deletes the PVC again before
+letting go. Without the second delete, that late write would recreate the
+PVC after the volume was gone, with nothing left to remove it. A delete with
+no recent failure lets go at once.
+
 ## See also
 
 - [Shared volumes](../operator-guide/shared-volumes.md) — creating one,
