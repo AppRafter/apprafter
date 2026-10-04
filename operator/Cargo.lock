@@ -92,7 +92,11 @@ name = "apprafter-operator"
 version = "0.1.2"
 dependencies = [
  "axum",
+ "futures",
  "http-body-util",
+ "hyper",
+ "hyper-timeout",
+ "hyper-util",
  "k8s-openapi",
  "kube",
  "operator-controllers-application",
@@ -105,6 +109,7 @@ dependencies = [
  "rustls",
  "tokio",
  "tower",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
 ]

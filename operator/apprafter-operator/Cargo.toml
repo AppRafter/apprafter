@@ -28,7 +28,18 @@ operator-controllers-resourceclaim-provisioner = { path = "../operator-controlle
 
 axum               = { workspace = true }
 tokio              = { workspace = true }
-tower              = { workspace = true }
+# `retry`: `build_client` keeps kube's own in-call retry layer for a Config
+# that asks for it (`default_retry`), as kube's builder does.
+tower              = { workspace = true, features = ["retry"] }
+# WI-417: `build_client` (src/lib.rs) builds kube's own client stack from
+# these crates, the ones kube-client builds it from, at the versions
+# operator/Cargo.lock already holds, so that it can switch the HTTP/1.1
+# connection pool off. `hyper` names the response body type of kube's trace
+# hooks and re-exports the `http` types.
+hyper              = { version = "1.11.1", features = ["client", "http1"] }
+hyper-timeout      = "0.5.2"
+hyper-util         = { version = "0.1.20", features = ["client-legacy", "http1", "tokio"] }
+tower-http         = { version = "0.6.11", features = ["trace"] }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
 kube               = { workspace = true }
@@ -43,3 +54,7 @@ rustls             = { version = "0.23", default-features = false, features = ["
 [dev-dependencies]
 http-body-util = { workspace = true }
 tower          = { workspace = true }
+# WI-417: `tests/watch_connection_stall_test.rs` runs kube watchers against a
+# fake apiserver (`TcpListener`, raw HTTP/1.1) and reads their event streams.
+futures        = { workspace = true }
+tokio          = { workspace = true, features = ["net", "io-util", "time"] }

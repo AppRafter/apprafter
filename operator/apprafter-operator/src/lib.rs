@@ -119,6 +119,171 @@ pub fn with_operator_client_defaults(mut config: kube::Config) -> kube::Config {
     config
 }
 
+/// Build the operator's kube [`Client`](kube::Client): kube 4.2's own client
+/// stack (`ClientBuilder::try_from`, kube-client's `client/builder.rs`) with
+/// ONE change. The hyper-util connection pool keeps no idle connection, so
+/// every request is sent on a connection of its own.
+///
+/// What is kept, in kube's order:
+/// * the rustls HTTPS connector (`ConfigExt::rustls_https_connector`) inside
+///   a `hyper_timeout::TimeoutConnector` with the config's connect, read and
+///   write timeouts;
+/// * the base-URI layer, kube's retry layer when `default_retry` asks for it
+///   (the operator switches it off, see [`with_operator_client_defaults`]),
+///   the auth layer and the extra-headers layer;
+/// * kube's `TraceLayer`, with the same span and hooks under kube's tracing
+///   target, so each request still gets its `HTTP` span;
+/// * kube's handling of `proxy_url`. kube's `http-proxy` and `socks5`
+///   features are off in this build, so kube's builder refuses every proxy,
+///   and so does this one, with the same error.
+///
+/// Two parts of kube's builder do not appear here:
+/// * gzip decompression, behind kube's `gzip` feature, which is off in this
+///   build;
+/// * `Client::valid_until`, the expiry of a client certificate returned by an
+///   exec plugin. kube computes it with a crate-private helper. The operator
+///   authenticates with its ServiceAccount token, which carries no such
+///   expiry, and never reads `valid_until`.
+pub fn build_client(config: kube::Config) -> kube::Result<kube::Client> {
+    use hyper::body::Incoming;
+    use hyper::{HeaderMap, Request, Response};
+    use kube::client::{retry::RetryPolicy, Body, ConfigExt};
+    use std::time::Duration;
+    use tower::{retry::RetryLayer, ServiceBuilder};
+    use tower_http::classify::ServerErrorsFailureClass;
+    use tower_http::trace::TraceLayer;
+    use tracing::{debug, debug_span, error, Span};
+
+    // kube's builder installs the same provider when none is set, first.
+    install_rustls_crypto_provider();
+    if let Some(proxy_url) = config.proxy_url.as_ref() {
+        return Err(proxy_refused(proxy_url));
+    }
+
+    let default_ns = config.default_namespace.clone();
+    let auth_layer = config.auth_layer()?;
+
+    let client: hyper_util::client::legacy::Client<_, Body> = {
+        let mut connector = hyper_timeout::TimeoutConnector::new(config.rustls_https_connector()?);
+        connector.set_connect_timeout(config.connect_timeout);
+        connector.set_read_timeout(config.read_timeout);
+        connector.set_write_timeout(config.write_timeout);
+        hyper_util::client::legacy::Builder::new(hyper_util::rt::TokioExecutor::new())
+            // WI-417 (ATM GOTCHA-57): never reuse a connection. hyper 1.11.1 and
+            // hyper-util 0.1.20 can hand a request to an HTTP/1.1 connection
+            // that is still streaming a watch. hyper's `Sender::try_send` calls
+            // `giver.give()` and only then sends (`client/dispatch.rs:93-115`),
+            // and the dispatcher, woken by the previous body read, can re-arm
+            // WANT in between (`poll_recv` → `taker.want()`, :188). So a
+            // watcher's LIST → WATCH on a connection that has just gone idle can
+            // leave a stale WANT. hyper-util then puts the connection back in the
+            // pool at response-head time (`client.rs:358`, `is_ready()`) while
+            // the watch body still streams. The next request checked out on it
+            // is queued in the connection's channel and never written until the
+            // watch ends, up to its 290s `timeoutSeconds`. The read timeout
+            // cannot cut it, because a queued request reads no socket. Right
+            // after the operator takes the Lease, about twenty watchers LIST
+            // then WATCH at once, which is how first reconciles stalled
+            // (WI-400). With no idle connection kept, the pool is off. The cost
+            // is one TCP and TLS handshake per request.
+            .pool_max_idle_per_host(0)
+            .build(connector)
+    };
+
+    let service = ServiceBuilder::new()
+        .layer(config.base_uri_layer())
+        .option_layer(
+            config
+                .default_retry
+                .then_some(RetryLayer::new(RetryPolicy::server_retry())),
+        )
+        .option_layer(auth_layer)
+        .layer(config.extra_headers_layer()?)
+        .layer(
+            // kube's own trace layer (kube-client 4.2 `client/builder.rs`),
+            // verbatim but for one thing: every span and event names kube's
+            // target, so a filter such as `RUST_LOG=kube_client=debug` still
+            // selects them. Attribute names follow the OpenTelemetry HTTP
+            // semantic conventions.
+            TraceLayer::new_for_http()
+                .make_span_with(|req: &Request<Body>| {
+                    debug_span!(
+                        target: KUBE_TRACE_TARGET,
+                        "HTTP",
+                         http.method = %req.method(),
+                         http.url = %req.uri(),
+                         http.status_code = tracing::field::Empty,
+                         otel.name = req.extensions().get::<&'static str>().unwrap_or(&"HTTP"),
+                         otel.kind = "client",
+                         otel.status_code = tracing::field::Empty,
+                    )
+                })
+                .on_request(|_req: &Request<Body>, _span: &Span| {
+                    debug!(target: KUBE_TRACE_TARGET, "requesting");
+                })
+                .on_response(
+                    |res: &Response<Incoming>, _latency: Duration, span: &Span| {
+                        let status = res.status();
+                        span.record("http.status_code", status.as_u16());
+                        if status.is_client_error() || status.is_server_error() {
+                            span.record("otel.status_code", "ERROR");
+                        }
+                    },
+                )
+                // Explicitly disable `on_body_chunk`. The default does nothing.
+                .on_body_chunk(())
+                .on_eos(|_: Option<&HeaderMap>, _duration: Duration, _span: &Span| {
+                    debug!(target: KUBE_TRACE_TARGET, "stream closed");
+                })
+                .on_failure(
+                    |ec: ServerErrorsFailureClass, _latency: Duration, span: &Span| {
+                        // Called when
+                        // - Calling the inner service errored
+                        // - Polling `Body` errored
+                        // - the response was classified as failure (5xx)
+                        // - End of stream was classified as failure
+                        span.record("otel.status_code", "ERROR");
+                        match ec {
+                            ServerErrorsFailureClass::StatusCode(status) => {
+                                span.record("http.status_code", status.as_u16());
+                                error!(target: KUBE_TRACE_TARGET, "failed with status {status}")
+                            }
+                            ServerErrorsFailureClass::Error(err) => {
+                                error!(target: KUBE_TRACE_TARGET, "failed with error {err}")
+                            }
+                        }
+                    },
+                ),
+        )
+        .map_err(tower::BoxError::from)
+        .service(client);
+
+    Ok(kube::Client::new(service, default_ns))
+}
+
+/// The tracing target of kube's own request spans and events: the module of
+/// kube-client 4.2 that emits them.
+const KUBE_TRACE_TARGET: &str = "kube_client::client::builder";
+
+/// The error kube's builder returns for a configured proxy when its
+/// `socks5` and `http-proxy` features are off, as they are in this build
+/// (kube-client 4.2 `client/builder.rs`, `TryFrom<Config>`).
+fn proxy_refused(proxy_url: &hyper::Uri) -> kube::Error {
+    match proxy_url.scheme_str() {
+        Some("socks5") => kube::Error::ProxyProtocolDisabled {
+            proxy_url: proxy_url.clone(),
+            protocol_feature: "kube/socks5",
+        },
+        Some("http") | Some("https") => kube::Error::ProxyProtocolDisabled {
+            proxy_url: proxy_url.clone(),
+            protocol_feature: "kube/http-proxy",
+        },
+        _ => kube::Error::ProxyProtocolUnsupported {
+            proxy_url: proxy_url.clone(),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,16 +376,16 @@ mod tests {
         (format!("http://{addr}"), hits)
     }
 
-    /// The property the leader loop depends on, observed through a real
-    /// `Client` built from a `Config` (the retry layer lives in that
-    /// builder, so a `Client::new(service)` test could not see it): a 503
-    /// surfaces to the caller on the FIRST attempt, as it did on kube 0.95.
+    /// The property the leader loop depends on, observed through the
+    /// operator's real client, built from a `Config` by `build_client` (the
+    /// retry layer lives in that builder, so a `Client::new(service)` test
+    /// could not see it): a 503 surfaces to the caller on the FIRST attempt,
+    /// as it did on kube 0.95.
     #[tokio::test]
     async fn a_503_reaches_the_caller_instead_of_being_retried_inside_the_call() {
         use std::sync::atomic::Ordering;
         let (url, hits) = flaky_apiserver().await;
-        let client = kube::Client::try_from(with_operator_client_defaults(config_for(&url)))
-            .expect("client");
+        let client = build_client(with_operator_client_defaults(config_for(&url))).expect("client");
         let api: kube::Api<k8s_openapi::api::core::v1::ConfigMap> =
             kube::Api::namespaced(client, "default");
         let err = api
@@ -252,5 +417,129 @@ mod tests {
             .await
             .expect("kube 4 retries the 503 into a success");
         assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    // -----------------------------------------------------------------
+    // build_client
+    // -----------------------------------------------------------------
+
+    const PROBE_CONFIGMAP: &str = r#"{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"probe","namespace":"default"}}"#;
+
+    /// An apiserver that answers every request with one ConfigMap and keeps
+    /// the connection open for the next request (HTTP/1.1 keep-alive), so a
+    /// client that reuses connections can. Returns its URL and the number of
+    /// TCP connections it has accepted.
+    async fn connection_counting_apiserver(
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = accepted.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.expect("accept");
+                counter.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        // A GET has no body: the request ends with its head.
+                        let end = loop {
+                            if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                break i + 4;
+                            }
+                            match socket.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                            }
+                        };
+                        buf.drain(..end);
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{PROBE_CONFIGMAP}",
+                            PROBE_CONFIGMAP.len()
+                        );
+                        if socket.write_all(response.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (format!("http://{addr}"), accepted)
+    }
+
+    /// WI-417: the operator's client hands no request to a connection that an
+    /// earlier request used, so none can be queued behind a watch that is
+    /// still streaming on it (see `build_client`). Three sequential GETs,
+    /// which kube's stock client sends on one kept-alive connection, open
+    /// three connections.
+    #[tokio::test]
+    async fn the_operator_client_opens_a_connection_for_every_request() {
+        use std::sync::atomic::Ordering;
+        let (url, accepted) = connection_counting_apiserver().await;
+        let client = build_client(config_for(&url)).expect("client");
+        let api: kube::Api<k8s_openapi::api::core::v1::ConfigMap> =
+            kube::Api::namespaced(client, "default");
+        for _ in 0..3 {
+            api.get("probe").await.expect("the probe ConfigMap");
+        }
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            3,
+            "three sequential requests must open three connections: a request \
+             sent on a reused connection can queue behind a streaming watch"
+        );
+    }
+
+    /// `build_client` keeps kube's in-call retry for a `Config` that asks for
+    /// it, as kube's own builder does (the contrast test above): only the
+    /// connection pool differs.
+    #[tokio::test]
+    async fn the_operator_client_keeps_kubes_retry_when_the_config_asks_for_it() {
+        use std::sync::atomic::Ordering;
+        let (url, hits) = flaky_apiserver().await;
+        let client = build_client(config_for(&url)).expect("client");
+        let api: kube::Api<k8s_openapi::api::core::v1::ConfigMap> =
+            kube::Api::namespaced(client, "default");
+        api.get("probe")
+            .await
+            .expect("kube's retry turns the 503 into a success");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    /// A configured proxy is refused with the error kube's own builder
+    /// returns in this build. Should a kube feature ever make the stock
+    /// builder accept a proxy, this fails instead of the two drifting apart.
+    #[test]
+    fn a_proxy_is_refused_with_kubes_own_error() {
+        for proxy in [
+            "socks5://127.0.0.1:1080",
+            "http://127.0.0.1:3128",
+            "https://127.0.0.1:3128",
+            "ftp://127.0.0.1:21",
+        ] {
+            let mut config = config_for("https://127.0.0.1:6443");
+            config.proxy_url = Some(proxy.parse().expect("proxy url"));
+            let Err(stock) = kube::Client::try_from(config.clone()) else {
+                panic!("kube's builder accepted the proxy {proxy}");
+            };
+            let Err(ours) = build_client(config) else {
+                panic!("build_client accepted the proxy {proxy}");
+            };
+            assert!(
+                matches!(
+                    ours,
+                    kube::Error::ProxyProtocolDisabled { .. }
+                        | kube::Error::ProxyProtocolUnsupported { .. }
+                ),
+                "{proxy}: {ours:?}"
+            );
+            assert_eq!(format!("{ours:?}"), format!("{stock:?}"), "{proxy}");
+        }
     }
 }
