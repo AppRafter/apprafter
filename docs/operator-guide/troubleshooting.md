@@ -499,6 +499,50 @@ if it's crash-looping, check its logs. This is distinct from the
 [`k3s-ready` step](#the-k3s-ready-step-of-bootstrap-all-takes-longer-than-expected),
 which is the node coming up at all, before the CNI install.
 
+### A status says a reconcile did not finish {#reconcile-timed-out}
+
+The operator gives every reconcile a deadline. A reconcile still running when
+its deadline passes is abandoned and tried again, so one request that the
+Kubernetes API or a database never answers can no longer hold a resource
+without a word. Where an abandoned reconcile shows:
+
+| Resource | Deadline | Where it shows |
+| --- | --- | --- |
+| Application | 120 s | `apprafter app status`, as `ReconcileTimedOut` among its recent problems |
+| A dependency's claim, while it is scheduled or provisioned | 120 s | `apprafter app status`, as a `Reconcile:` entry under the claims table |
+| Shared volume | 60 s | `apprafter volume status`, as a `Reconcile:` line |
+| Shared database | 120 s | `apprafter db status`, as a `Reconcile:` line |
+| The platform | 120 s | `apprafter platform status` and `apprafter status`, as `ReconcileStalled=True` |
+
+The `Reconcile:` line of `apprafter volume status` reads, for example:
+
+```text
+  Reconcile:   last timed out 3 minutes ago (did not finish within 60s); the operator retries on its own
+```
+
+An abandoned reconcile writes nothing else, so everything else these commands
+print is what the last reconcile that finished recorded. The `Reconcile:`
+line comes from a `Warning` Event with reason `ReconcileTimedOut`, which
+`kubectl describe` also shows. The line goes once a later reconcile of the
+same controller writes the resource's status, in a later second than the
+Event, or once the Event expires, an hour by default, whichever comes first.
+A timeout that keeps coming back writes no status, so its line stays and is
+never more than a few minutes old. A reconcile that finishes without changing
+the status leaves no record that it finished, so after such a recovery the
+line stays until the Event expires, and its age keeps growing: a timeout
+whose age keeps growing has not come back. `ReconcileStalled` goes as soon as
+the next platform reconcile finishes; [How the platform upgrades
+itself](../how-it-works/platform-upgrades.md#when-the-controllers-own-reconcile-stalls)
+says what it does and does not point at.
+
+A single timeout needs nothing. One that repeats points at what that
+reconcile waits on: the Kubernetes API itself (a `kubectl get` of the same
+resource is slow or does not answer), the Postgres cluster for a shared
+database or a `needs.pg` claim, or the node's kubelet for a volume's capacity
+figure. Every abandoned reconcile is also counted on the operator's
+`apprafter_reconcile_timeouts_total` metric, by kind of resource, which stays
+at zero on a healthy cluster.
+
 ## Reading the rendered output
 
 A worked example. After `apprafter target add bad --token

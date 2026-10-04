@@ -80,6 +80,18 @@ hold the object indefinitely — a command that appeared to succeed followed by
 an object that never goes away, which is worse than a refusal because nothing
 says why.
 
+## When the server is slow to answer
+
+Each statement the platform runs on the shared Postgres cluster is bounded:
+ten seconds to connect, ten seconds waiting for a lock and thirty seconds
+per statement — those two enforced by the server, which is the only thing
+that frees a session waiting on a lock — and forty-five seconds per call. A
+grant held up by a tenant's lock reads `AwaitingLock`, one the server cut
+off reads `StatementTimedOut`, and a call the cluster did not answer at all
+reads `AwaitingCluster`. None of them takes `Ready` away from a database
+that is already provisioned, because its bindings wait on `Ready`, and the
+next pass tries again.
+
 ## What a delete does, in order
 
 For a Postgres database: the database is declared absent, and only then are
@@ -87,9 +99,11 @@ the groups dropped. The order is forced — the owning group owns the database,
 and Postgres refuses to drop a role that owns one. A first pass that cannot
 yet drop the groups is expected; the next one completes it.
 
-For a cache: the keyspace is flushed. The number itself needs no release,
-because the allocator derives which numbers are taken from the objects that
-exist.
+For a cache: the keyspace is flushed, unless the re-check described under
+[What the count does not protect](#what-the-count-does-not-protect) finds
+another holder of the number; the delete then completes without flushing.
+The number itself needs no release, because the allocator derives which
+numbers are taken from the objects that exist.
 
 Both resolve where the backing lives from the provider rather than assuming
 it, so moving the shared cluster or the cache pool does not silently orphan a
@@ -116,6 +130,17 @@ cleanup wipes the other. The allocator therefore reads shared databases as a
 third source alongside live and retained bindings, and that source is a
 required input rather than an optional one — so a future caller has to
 consider it rather than omit it.
+
+Reading all three is not enough on its own. Two allocators that read before
+either has written can pick the same number, and a write cut off
+mid-request can land after another allocator has read. So a shared cache
+records its number in its status before it prepares it, and reads
+`AwaitingKeyspace` until it has; owned bindings and shared caches take
+numbers one at a time; and every flush first re-reads every binding,
+retained binding and shared database. If another one holds the number,
+nothing is flushed. A holder that has not used the number yet lets it go,
+names the other holder in its status, and takes another number on its next
+attempt.
 
 ## Where each rule is enforced
 

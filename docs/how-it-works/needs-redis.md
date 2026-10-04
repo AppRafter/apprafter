@@ -114,6 +114,13 @@ immutable `RetainedClaim` snapshot with `retainUntil` set to deletion + 7 days,
 and the connection Secret cascades away, but the ACL user and the database's
 contents survive the window.
 
+**Re-creating the Application within the window** gives its claim the same
+database number back, as long as the persistence setting has not changed. On
+a persistent instance the claim reattaches to what is stored there; on an
+ephemeral one nothing was kept, and the database is flushed first. A reattach
+that fails part-way — the instance restarting under it, say — resumes on its
+next attempt and never flushes what it is recovering.
+
 Editing the manifest is a different path. Dropping a `needs.<type>` key is a
 destructive `data-migration` change, so it is gated behind a MigrationPlan and
 the Application pauses at `AwaitingMigrationApproval`. Even after approval
@@ -122,7 +129,13 @@ and skips the block when there are none. The retention path runs on Application
 deletion, not on a manifest edit.
 
 Once `retainUntil` passes, the GC runs `FLUSHDB` on the claim's database and
-`ACL DELUSER` on its user, then removes the snapshot.
+`ACL DELUSER` on its user, then removes the snapshot. Two things hold the
+flush back. A persistent snapshot whose claim has come back and is still
+re-attaching to it is kept until that claim is ready, however late that is.
+And before every `FLUSHDB` — this one, and those when a claim is provisioned
+or a shared cache is created or deleted — the platform re-reads every claim,
+retained claim and shared database: if another one holds the same number,
+nothing is flushed.
 
 **The snapshot is not a knob.** It is immutable by a CEL `self == oldSelf` rule,
 and the admission webhook restricts CREATE to the operator's ServiceAccount,
