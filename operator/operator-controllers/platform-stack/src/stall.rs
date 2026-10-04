@@ -173,7 +173,7 @@ pub fn controller_owns_conditions_by_key(stack: &PlatformStack) -> bool {
 /// Beside a list `platform-controller` owns whole, or no ownership at all,
 /// the apply adds the condition and keeps every other one (measured).
 pub fn mark_may_write(stack: &PlatformStack) -> bool {
-    !(owns_list_whole(stack, STALL_FIELD_MANAGER) && !controller_owns_conditions_by_key(stack))
+    !owns_list_whole(stack, STALL_FIELD_MANAGER) || controller_owns_conditions_by_key(stack)
 }
 
 /// Whether `platform-controller` must apply its conditions although they did

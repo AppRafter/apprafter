@@ -1199,7 +1199,7 @@ pub fn namespace_drain_risk(me: &ClaimView, peers: &[ClaimView]) -> Vec<String> 
         if others.is_empty() {
             continue;
         }
-        let concerns_me = me.app == p.app || (me.dynamic_streams && me.app != p.app);
+        let concerns_me = me.app == p.app || me.dynamic_streams;
         if !concerns_me {
             continue;
         }
