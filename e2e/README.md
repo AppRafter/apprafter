@@ -236,6 +236,31 @@ database. Phase 3 wakes it from inside the pod and waits for
 `payload_migrations` to appear, otherwise the "CMS database" fingerprint
 would cover nothing but the walk's own seed rows.
 
+## redis-reattach-proof.sh
+
+A focused proof for one defect: a persistent `needs.redis` claim that is
+re-created within its grace period, and whose first reattach pass fails after
+it has recorded its allocation, must keep the data it is reattaching to. The
+script writes 50 keys, deletes the Application, takes `ACL SETUSER` away from
+the instance's admin user (a second admin user gives it back later),
+re-applies the Application and waits until the reattach has failed at
+`ACL SETUSER`. It then lifts the failure and counts the keys once the claim is
+ready again on the same database number.
+
+```sh
+# the working tree's operator: the keys must survive
+KUBECONFIG=/nonexistent APPRAFTER_SKIP_STARTUP_CHECKS=1 APPRAFTER_E2E_LOCAL_OPERATOR=1 \
+  bash e2e/redis-reattach-proof.sh
+# the published operator: the keys must be lost, which shows the proof sees the defect
+KUBECONFIG=/nonexistent APPRAFTER_SKIP_STARTUP_CHECKS=1 bash e2e/redis-reattach-proof.sh
+```
+
+`PROOF_EXPECT=survive|loss` overrides the expectation, `PROOF_KEYS` (50) sets
+how many keys are written, and `PROOF_FAILURES` (1) how many failed passes the
+script waits for before it lifts the failure. It runs on a private kind
+cluster, deleted on exit unless `APPRAFTER_E2E_SKIP_DESTROY=1`, in about 20
+minutes.
+
 ## Failure diagnostics
 
 A walk that fails calls `dump_diagnostics` (`e2e/lib.sh`) from its exit
