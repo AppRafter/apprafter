@@ -251,10 +251,12 @@ and it is wrong in both directions: a capture stream over a neighbour's subjects
 is missed, and a capture stream over the departing application's prefix is swept
 along with it.
 
-Editing the manifest is a different path. Dropping a `needs.<type>` key is
-classified a destructive change, so it is gated behind a MigrationPlan and the
-Application pauses at `AwaitingMigrationApproval`. The retention path runs on
-Application deletion, not on a manifest edit.
+Editing the manifest is a different path to the same place. Dropping a
+`needs.<type>` key is classified as a destructive `data-migration` change, so
+it is gated behind a MigrationPlan and the Application pauses at
+`AwaitingMigrationApproval`. Once the change is approved, the operator deletes
+the claim the Application no longer declares, and the retention path above
+runs as it does for a deleted Application.
 
 ## Limits in force today
 

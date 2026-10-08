@@ -142,9 +142,8 @@ owns, so omitting the sample removes it. The absence of a warning is therefore
 never evidence of space.
 
 A sample that does not come back at all is the one exception. The node list
-and the kubelet fetch get 10 seconds between them (the kubelet fetch on its own
-gives up after 15, logged at warning); past that the reconcile stops waiting,
-logs a warning, and writes back the `status.capacity` and `CapacityWarning` the
+and the kubelet fetch get 10 seconds between them; past that the reconcile
+stops waiting, logs a warning, and writes back the `status.capacity` and `CapacityWarning` the
 volume already carried. The condition keeps its status, reason and transition
 time, and its message gains "not re-measured: the kubelet did not answer
 within 10s". Dropping them there would describe the kubelet, not the volume,
@@ -153,9 +152,9 @@ checks, so it is not held back waiting either. A figure kept this way is as old
 as the last sample that answered.
 
 `apprafter volume status` prints the condition's message only while the
-warning is up. On a volume that was not warning, a carried figure prints as an
-ordinary `Used/Free` line, and the condition on the object is where its age
-shows.
+warning is up. On a volume that was not warning, a carried figure prints
+exactly as a fresh one would, and only the condition on the object says it was
+not re-measured.
 
 That is also why an em-dash is the usual reading on a cluster whose kubelet
 publishes no per-volume metrics at all. `e2e/shared-volume-walk.sh` treats its
@@ -190,7 +189,7 @@ nothing to the volume's status; it leaves a `Warning` Event with reason
 
     Reconcile:   last timed out 3 minutes ago (did not finish within 60s); the operator retries on its own
 
-The line goes once a later reconcile writes the volume's status, in a later
+The line goes once a later reconcile changes the volume's status, in a later
 second than the Event, or once the Event expires (an hour by default),
 whichever comes first. A stall that persists writes no status and is
 abandoned again about every two minutes, so its line stays and its age stays
@@ -200,11 +199,13 @@ Event expires, and its age keeps growing.
 
 Abandoning a reconcile does not recall a request it already sent: the
 apiserver may still apply its write to the backing PVC up to a minute later.
-So a volume deleted within about a minute of a failed reconcile deletes its
-PVC, keeps its finalizer until 65 seconds after that reconcile failed, then
-deletes the PVC again before letting go. Without the second delete, that late
-write would recreate the PVC after the volume was gone, with nothing left to
-remove it. A delete with no recent failure lets go at once.
+So a volume deleted within 65 seconds of a failed reconcile deletes its PVC,
+keeps its finalizer until 65 seconds after that reconcile failed, then deletes
+the PVC again before letting go. Without the second delete, that late write
+would recreate the PVC after the volume was gone, with nothing left to remove
+it. A delete with no recent failure lets go at once. The operator keeps the
+record of a failed reconcile in memory only, so if the operator restarts
+between the failure and the delete, the delete also lets go at once.
 
 ## See also
 

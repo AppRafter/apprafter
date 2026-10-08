@@ -67,19 +67,24 @@ than silently moving.
 Each platform reconcile has 120 seconds. One still running then is abandoned
 and tried again, and a second writer on the stack sets `ReconcileStalled=True`,
 which `apprafter platform status` and `apprafter status` show. The next
-reconcile that finishes removes it.
+reconcile that finishes without an error removes it; one that ends in an error
+leaves it in place.
 
 Nothing else is written for the abandoned reconcile: the versions, the history
 and every other condition are from the last reconcile that finished. Each
 abandoned reconcile also leaves a `ReconcileTimedOut` Warning Event on the
-stack, which `kubectl -n apprafter-system describe platformstack default` keeps
-after the condition is gone. An approval already given for an upgrade is kept
+stack, which `kubectl -n apprafter-system describe platformstack default` still
+shows after the condition is gone, until Kubernetes expires it (by default, an
+hour after the reconcile that left it). An approval already given for an upgrade is kept
 until the controller has moved the platform's root Application to the new
 version, so an abandoned reconcile cannot cost it.
 
 A registry that does not answer is not a stall. Every question the controller
 asks the registry has its own bound of 20 seconds, and an unanswered one reads
-as `UpstreamReachable=False`, the fourth case above. `ReconcileStalled`
+as `UpstreamReachable=False`, the fourth case above. The exception is a stack
+with no pin that has never resolved a version, such as a fresh install: with
+nothing to deploy, the controller writes no status for it and retries every 60
+seconds until the registry answers. `ReconcileStalled`
 therefore points at the Kubernetes API, not at the registry.
 
 On a cluster rolled back to a release older than the condition, the older

@@ -140,7 +140,7 @@ post-launch work is not a roadmap phase and has no subscribe control.
 |---|---|---|---|
 | Shipped | ✅ | One command for the state of the cluster — version, upgrades, unhealthy conditions, applications in trouble, changes awaiting approval | [CLI reference](reference/cli/status.md) |
 | Shipped | ✅ | A failing reconcile is visible without reading the operator log | [Troubleshooting](operator-guide/troubleshooting.md) |
-| Shipped | 🚧 | A reconcile that stalls is abandoned at a deadline and retried, and the status commands say so | [Troubleshooting](operator-guide/troubleshooting.md#reconcile-timed-out) |
+| Shipped | 🚧 | A reconcile that stalls is abandoned at a deadline and retried; the status commands show it for applications and their dependencies, shared volumes, shared databases and the platform | [Troubleshooting](operator-guide/troubleshooting.md#reconcile-timed-out) |
 | Shipped | ✅ | Disk pressure on the node is surfaced before it becomes an outage, and clears on its own | [Troubleshooting](operator-guide/troubleshooting.md#node-disk) |
 | Shipped | ✅ | Removing a dependency from the manifest releases it onto the documented retention path | [Troubleshooting](operator-guide/troubleshooting.md) |
 | Shipped | ✅ | A one-line installer that verifies its own checksum, and a download page | [Quickstart](operator-guide/quickstart.md) |

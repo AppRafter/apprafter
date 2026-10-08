@@ -87,10 +87,15 @@ ten seconds to connect, ten seconds waiting for a lock and thirty seconds
 per statement — those two enforced by the server, which is the only thing
 that frees a session waiting on a lock — and forty-five seconds per call. A
 grant held up by a tenant's lock reads `AwaitingLock`, one the server cut
-off reads `StatementTimedOut`, and a call the cluster did not answer at all
-reads `AwaitingCluster`. None of them takes `Ready` away from a database
-that is already provisioned, because its bindings wait on `Ready`, and the
-next pass tries again.
+off reads `StatementTimedOut`, and a call still unanswered after forty-five
+seconds reads `AwaitingCluster`. None of these takes `Ready` away from a
+database that is already provisioned, because its bindings wait on `Ready`,
+and the next pass tries again. A connection that is refused, or not made
+within its ten seconds, does: it reads `AwaitingCluster` (`AwaitingDatabase`
+while granting) with `Ready` false, and bindings wait until the cluster
+answers. The exception is the check for declared extensions that ends a pass:
+whichever way its call fails, the pass still reads `Provisioned` with `Ready`
+true and keeps any `ExtensionUnavailable` finding it already had.
 
 ## What a delete does, in order
 

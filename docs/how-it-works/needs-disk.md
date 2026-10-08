@@ -99,12 +99,12 @@ controlling `ownerReference` back to it — and the finalizer writes an immutabl
 volume claim's name and namespace. The PVC survives untouched. Once
 `retainUntil` passes, the GC deletes the PVC and removes the snapshot.
 
-Editing the manifest is a different path. Dropping a `needs.<type>` key is
-classified as a destructive `data-migration` change, so it is gated behind a
-MigrationPlan and the Application pauses at `AwaitingMigrationApproval`. Even
-after approval nothing deletes the claim: the render path applies claims for
-*declared* needs and skips the block when there are none. The retention path
-runs on Application deletion, not on a manifest edit.
+Editing the manifest is a different path to the same place. Dropping a
+`needs.<type>` key is classified as a destructive `data-migration` change, so
+it is gated behind a MigrationPlan and the Application pauses at
+`AwaitingMigrationApproval`. Once the change is approved, the operator deletes
+the claim the Application no longer declares, and the retention path above
+runs as it does for a deleted Application.
 
 The snapshot is immutable by a CEL `self == oldSelf` rule, and the admission
 webhook restricts CREATE to the operator's ServiceAccount, with a deliberate

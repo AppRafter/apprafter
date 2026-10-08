@@ -107,14 +107,12 @@ cascades. A finalizer then writes an immutable `RetainedClaim` snapshot with
 `retainUntil` set to **deletion + 7 days**, and the connection Secret cascades
 away, but the role and the database survive the window.
 
-Editing the manifest is a different path. Dropping a `needs.<type>` key is
-classified as a destructive `data-migration` change, so it is gated: the
-operator cuts a MigrationPlan and holds the Application at
-`AwaitingMigrationApproval` until the change is approved. And even after
-approval nothing deletes the claim — the render path applies claims for
-*declared* needs and skips the block entirely when there are none, so the claim
-stays in place, still holding its database. The retention path runs on
-Application deletion, not on a manifest edit.
+Editing the manifest is a different path to the same place. Dropping a
+`needs.<type>` key is classified as a destructive `data-migration` change, so
+it is gated: the operator cuts a MigrationPlan and holds the Application at
+`AwaitingMigrationApproval` until the change is approved. Once it is, the
+operator deletes the claim the Application no longer declares, and the
+retention path above runs as it does for a deleted Application.
 
 The snapshot is immutable by a CEL `self == oldSelf` rule, and the admission
 webhook rejects a CREATE from anyone but the operator's ServiceAccount or a

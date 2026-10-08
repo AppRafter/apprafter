@@ -503,8 +503,17 @@ which is the node coming up at all, before the CNI install.
 
 The operator gives every reconcile a deadline. A reconcile still running when
 its deadline passes is abandoned and tried again, so one request that the
-Kubernetes API or a database never answers can no longer hold a resource
-without a word. Where an abandoned reconcile shows:
+Kubernetes API never answers can no longer hold a resource without a word. A
+Postgres call has a shorter limit of its own, so a Postgres server that does
+not answer at all does not end up here (a shared database's `Ready` condition
+gives the reason `AwaitingCluster`, which `apprafter db status` prints only
+while `Ready` is false; see [When the server is slow to
+answer](../how-it-works/shared-databases.md#when-the-server-is-slow-to-answer));
+one that answers slowly, call after call, can. Source
+credentials, migration plans and the clean-up of retained claims have
+deadlines too (90 s, 190 s and 120 s), but their timeouts appear only as a
+warning in the operator's log and on the metric at the end of this section.
+For everything else, an abandoned reconcile shows:
 
 | Resource | Deadline | Where it shows |
 | --- | --- | --- |
@@ -520,28 +529,36 @@ The `Reconcile:` line of `apprafter volume status` reads, for example:
   Reconcile:   last timed out 3 minutes ago (did not finish within 60s); the operator retries on its own
 ```
 
-An abandoned reconcile writes nothing else, so everything else these commands
-print is what the last reconcile that finished recorded. The `Reconcile:`
-line comes from a `Warning` Event with reason `ReconcileTimedOut`, which
-`kubectl describe` also shows. The line goes once a later reconcile of the
-same controller writes the resource's status, in a later second than the
-Event, or once the Event expires, an hour by default, whichever comes first.
-A timeout that keeps coming back writes no status, so its line stays and is
-never more than a few minutes old. A reconcile that finishes without changing
-the status leaves no record that it finished, so after such a recovery the
-line stays until the Event expires, and its age keeps growing: a timeout
-whose age keeps growing has not come back. `ReconcileStalled` goes as soon as
-the next platform reconcile finishes; [How the platform upgrades
+Apart from what the table lists, a timeout writes nothing to the resource's
+status, so the rest of the status these commands print can be older than the
+timeout. What they read live from the cluster, such as an application's pods,
+is current. The `Reconcile:` line comes from a `Warning` Event with reason
+`ReconcileTimedOut`, which `kubectl describe` also shows. The line goes once a
+later reconcile of the same controller changes the resource's status, in a
+later second than the Event (for a claim, its size and capacity figures do not
+count), or once the Event expires, an hour by default, whichever comes first.
+A timeout that keeps coming back writes no status but leaves a new Event on
+each retry, so its line stays and its age stays short. A reconcile that
+finishes without changing the status leaves no record that it finished, so
+after such a recovery the line stays until the Event expires, and its age
+keeps growing: a timeout whose age keeps growing has not come back.
+`ReconcileStalled` goes once a later platform reconcile finishes without an
+error; [How the platform upgrades
 itself](../how-it-works/platform-upgrades.md#when-the-controllers-own-reconcile-stalls)
 says what it does and does not point at.
 
 A single timeout needs nothing. One that repeats points at what that
 reconcile waits on: the Kubernetes API itself (a `kubectl get` of the same
-resource is slow or does not answer), the Postgres cluster for a shared
-database or a `needs.pg` claim, or the node's kubelet for a volume's capacity
-figure. Every abandoned reconcile is also counted on the operator's
-`apprafter_reconcile_timeouts_total` metric, by kind of resource, which stays
-at zero on a healthy cluster.
+resource is slow or does not answer), or the Postgres cluster for a shared
+database or a `needs.pg` claim. A node's kubelet that does not answer never
+causes a timeout: a shared volume keeps its last capacity figure, and its
+`CapacityWarning` condition says the figure was not re-measured. `apprafter
+volume status` shows that note only while the volume is warning; otherwise the
+kept figure prints as an ordinary line. Every abandoned
+reconcile is also counted on the operator's
+`apprafter_reconcile_timeouts_total` metric, by kind of resource. A healthy
+operator never increments it, so the metric does not appear at all until the
+first timeout.
 
 ## Reading the rendered output
 
