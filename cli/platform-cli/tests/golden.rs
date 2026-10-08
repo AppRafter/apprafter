@@ -365,13 +365,33 @@ fn target_add_invalid_name_is_refused() {
         &[
             "target",
             "add",
-            "-bad-",
+            "bad_name",
             "--provider",
             "hetzner-cloud",
             "--token",
             TOKEN_A,
             "--no-ping",
             "--no-interactive",
+        ],
+    );
+}
+
+#[test]
+fn target_add_name_with_dash_edges_is_refused() {
+    let sb = Sandbox::new();
+    sb.golden(
+        "target/add_name_dash_edges",
+        &[
+            "target",
+            "add",
+            "--provider",
+            "hetzner-cloud",
+            "--token",
+            TOKEN_A,
+            "--no-ping",
+            "--no-interactive",
+            "--",
+            "-bad-",
         ],
     );
 }

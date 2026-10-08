@@ -1,10 +1,10 @@
-$ apprafter target add bad_name --provider hetzner-cloud --token aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --no-ping --no-interactive
+$ apprafter target add --provider hetzner-cloud --token aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --no-ping --no-interactive -- -bad-
 [exit 1]
 [stdout]
 [stderr]
 Error: apprafter::cli::other
 
-  × target name `bad_name` is invalid — allowed: alphanumeric + `-`
+  × target name `-bad-` must not start or end with `-`
   help: This is the catch-all CLI error. The message above is the only
         context. If you see this often with the same wording, please file an
         issue — recurring messages should be promoted to a typed `CliError`
