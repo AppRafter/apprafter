@@ -43,6 +43,21 @@ the switch.
 
 ## platform-stack 0.2.81 / operator v0.2.53 / cli v0.2.79 — 2026-10-08
 
+### Upgrade notes
+
+Before a cluster moves to platform-stack 0.2.81:
+
+1. **Install apprafter 0.2.79 first.** It prints the new `Reconcile:` lines in `apprafter app status`, `volume status` and `db status`, and on a platform rolled back below 0.2.81 it marks a `ReconcileStalled` row `NOT CURRENT`. Older CLIs print no `Reconcile:` line. They do list `ReconcileStalled`, like any condition they do not know, and from 0.2.52 an Application's `ReconcileTimedOut` among its problems. Nothing they already show changes meaning.
+2. **Update anything that matches the `ForeignFieldManager` Event's note text** (see Changed), or match on its reason instead. The upgrade itself publishes no such Event. Until v0.2.53 replaces the operator, an outside write to the root Application's `spec.source` is still reported in the old wording, and an Event already published keeps it until it expires (one hour by default), so match both wordings until then.
+3. **Approve the upgrade, and approve it again if asked.** 0.2.81 is classified `requires-restart`, so it waits for approval (`apprafter migration list`, then `apprafter migration approve <plan>`). The bump is made by the operator already running (v0.2.52, or an older one on a cluster below 0.2.80), which deletes the approved plan before it moves the platform and can lose the approval if that pass fails (fixed in this release). If `apprafter migration list` shows the plan pending again after you approved it, approve it again. The operator and the admission webhook restart once; no application, Postgres, Dragonfly or NATS pod restarts. Every existing PlatformStack condition is kept through the CRD change.
+
+**Redis data until the upgrade lands.** Operator v0.2.52 and earlier (platform-stack 0.2.80 and earlier) has two bugs that can flush Redis data (see Fixed):
+
+- A persistent `needs.redis` claim that is deleted and re-created within its 7-day grace period can lose its retained data if its first reattach fails part-way. Until the cluster runs 0.2.81, do not remove and re-add an application with a persistent `needs.redis` (`apprafter app remove --keep-data` keeps its claim), and do not drop and re-add its `needs.redis`.
+- A Redis shared database and a `needs.redis` claim allocated at the same moment can end up on one database number. Deleting the shared database then flushes the claim's data at once, and deleting the claim flushes the shared database's data when the claim's 7-day grace ends. Until the cluster runs 0.2.81, do not create a Redis shared database (`apprafter db create <name> --type redis`) while an application with a new `needs.redis` claim is deploying, or the other way round.
+
+What the upgrade restarts, and what it does not, is in the 0.2.81 record of `platform-stack/cue/compatibility.cue`.
+
 ### Added
 
 - `apprafter status` and `apprafter platform status` know the PlatformStack's new `ReconcileStalled` condition: `apprafter status` lists it as a problem while it is `True`, and both commands mark the row `NOT CURRENT` on a platform older than 0.2.81, where an older operator carries a `True` it found forward without re-checking it. Older CLIs list the condition too, as one they do not recognise, but cannot tell a current one from one left behind by a rollback. (WI-400)
