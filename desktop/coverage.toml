@@ -1,0 +1,344 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+# Every visible leaf of docs/reference/cli/commands.json → a GUI action id (src/actions/registry.ts)
+# or a status (design spec §2): planned (+ slice; allowed until D.13, which requires zero),
+# cli-only, unavailable (documented NOT IMPLEMENTED in the CLI), superseded.
+# src/actions/coverage.test.ts fails on a missing or stale leaf.
+
+[leaf."app add"]
+status = "planned"
+slice = "D.6"
+
+[leaf."app list"]
+status = "planned"
+slice = "D.6"
+
+[leaf."app logs"]
+status = "planned"
+slice = "D.6"
+
+[leaf."app open"]
+status = "planned"
+slice = "D.6"
+
+[leaf."app remove"]
+status = "planned"
+slice = "D.6"
+
+[leaf."app restart"]
+status = "planned"
+slice = "D.6"
+
+[leaf."app rollback"]
+status = "planned"
+slice = "D.6"
+
+[leaf."app scaffold"]
+status = "planned"
+slice = "D.6"
+
+[leaf."app status"]
+status = "planned"
+slice = "D.6"
+
+[leaf."app unpin"]
+status = "planned"
+slice = "D.6"
+
+[leaf."app validate"]
+status = "planned"
+slice = "D.6"
+
+[leaf."apply"]
+status = "planned"
+slice = "D.12"
+
+[leaf."argocd-password"]
+status = "planned"
+slice = "D.12"
+
+[leaf."backup check"]
+status = "planned"
+slice = "D.11"
+
+[leaf."backup create"]
+status = "planned"
+slice = "D.11"
+
+[leaf."backup disable"]
+status = "planned"
+slice = "D.11"
+
+[leaf."backup enable"]
+status = "planned"
+slice = "D.11"
+
+[leaf."backup list"]
+status = "planned"
+slice = "D.11"
+
+[leaf."backup prune"]
+status = "planned"
+slice = "D.11"
+
+[leaf."backup run"]
+status = "planned"
+slice = "D.11"
+
+[leaf."backup set"]
+status = "planned"
+slice = "D.11"
+
+[leaf."backup show"]
+status = "planned"
+slice = "D.11"
+
+[leaf."backup status"]
+status = "planned"
+slice = "D.11"
+
+[leaf."backup unlock"]
+status = "planned"
+slice = "D.11"
+
+[leaf."cluster-bootstrap"]
+status = "planned"
+slice = "D.12"
+
+[leaf."completion"]
+status = "cli-only"
+
+[leaf."db create"]
+status = "planned"
+slice = "D.8"
+
+[leaf."db list"]
+status = "planned"
+slice = "D.8"
+
+[leaf."db rm"]
+status = "planned"
+slice = "D.8"
+
+[leaf."db status"]
+status = "planned"
+slice = "D.8"
+
+[leaf."destroy"]
+status = "planned"
+slice = "D.12"
+
+[leaf."doctor"]
+status = "planned"
+slice = "D.3"
+
+[leaf."export"]
+status = "planned"
+slice = "D.11"
+
+[leaf."import"]
+status = "planned"
+slice = "D.12"
+
+[leaf."init"]
+status = "superseded"
+
+[leaf."kubeconfig"]
+status = "planned"
+slice = "D.12"
+
+[leaf."login"]
+status = "unavailable"
+
+[leaf."migration approve"]
+status = "planned"
+slice = "D.7"
+
+[leaf."migration list"]
+status = "planned"
+slice = "D.7"
+
+[leaf."migration reject"]
+status = "planned"
+slice = "D.7"
+
+[leaf."node prep"]
+status = "planned"
+slice = "D.12"
+
+[leaf."node status"]
+status = "planned"
+slice = "D.5"
+
+[leaf."open argocd"]
+status = "planned"
+slice = "D.12"
+
+[leaf."plan"]
+status = "unavailable"
+
+[leaf."platform autoscale set"]
+status = "planned"
+slice = "D.10"
+
+[leaf."platform autoscale show"]
+status = "planned"
+slice = "D.5"
+
+[leaf."platform egress set"]
+status = "planned"
+slice = "D.9"
+
+[leaf."platform egress show"]
+status = "planned"
+slice = "D.9"
+
+[leaf."platform env set"]
+status = "planned"
+slice = "D.10"
+
+[leaf."platform env show"]
+status = "planned"
+slice = "D.5"
+
+[leaf."platform freeze"]
+status = "planned"
+slice = "D.10"
+
+[leaf."platform rescue"]
+status = "planned"
+slice = "D.10"
+
+[leaf."platform status"]
+status = "planned"
+slice = "D.5"
+
+[leaf."platform unfreeze"]
+status = "planned"
+slice = "D.10"
+
+[leaf."platform upgrade"]
+status = "planned"
+slice = "D.10"
+
+[leaf."repo creds add"]
+status = "planned"
+slice = "D.8"
+
+[leaf."repo creds list"]
+status = "planned"
+slice = "D.8"
+
+[leaf."repo creds remove"]
+status = "planned"
+slice = "D.8"
+
+[leaf."repo creds rotate"]
+status = "planned"
+slice = "D.8"
+
+[leaf."repo creds show"]
+status = "planned"
+slice = "D.8"
+
+[leaf."restore"]
+status = "planned"
+slice = "D.11"
+
+[leaf."secret list"]
+status = "planned"
+slice = "D.8"
+
+[leaf."secret remove"]
+status = "planned"
+slice = "D.8"
+
+[leaf."secret seal"]
+status = "planned"
+slice = "D.8"
+
+[leaf."status"]
+status = "planned"
+slice = "D.5"
+
+[leaf."target add"]
+status = "planned"
+slice = "D.3"
+
+[leaf."target cert import"]
+status = "planned"
+slice = "D.9"
+
+[leaf."target domain add"]
+status = "planned"
+slice = "D.9"
+
+[leaf."target domain list"]
+status = "planned"
+slice = "D.9"
+
+[leaf."target domain remove"]
+status = "planned"
+slice = "D.9"
+
+[leaf."target firewall cloudflare-origin"]
+status = "planned"
+slice = "D.9"
+
+[leaf."target ip"]
+status = "planned"
+slice = "D.9"
+
+[leaf."target list"]
+status = "planned"
+slice = "D.3"
+
+[leaf."target machine"]
+status = "planned"
+slice = "D.3"
+
+[leaf."target remove"]
+status = "planned"
+slice = "D.3"
+
+[leaf."target rename"]
+status = "planned"
+slice = "D.3"
+
+[leaf."target show"]
+status = "planned"
+slice = "D.3"
+
+[leaf."target use"]
+status = "planned"
+slice = "D.3"
+
+[leaf."top"]
+status = "planned"
+slice = "D.5"
+
+[leaf."up"]
+status = "planned"
+slice = "D.12"
+
+[leaf."upgrade-tier"]
+status = "unavailable"
+
+[leaf."volume create"]
+status = "planned"
+slice = "D.8"
+
+[leaf."volume list"]
+status = "planned"
+slice = "D.8"
+
+[leaf."volume rm"]
+status = "planned"
+slice = "D.8"
+
+[leaf."volume status"]
+status = "planned"
+slice = "D.8"
+
+[leaf."whoami"]
+status = "planned"
+slice = "D.3"
