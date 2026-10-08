@@ -8,9 +8,9 @@
 //! `AllowListEnv::with_lookup` and never mutates the real environment. A file outside the
 //! allow-list fails on:
 //!
-//! - a path ending in `env::var`, `env::var_os`, `env::vars`, `env::vars_os`, `env::set_var` or
-//!   `env::remove_var` ([`READS`]): `std::env::var`, `::std::env::var`, `env::var` after an
-//!   import, a function pointer taken from one;
+//! - a path ending in `env::var`, `env::var_os`, `env::vars`, `env::vars_os`, `env::set_var`,
+//!   `env::remove_var` or `env::home_dir` (which reads `HOME`) ([`READS`]): `std::env::var`,
+//!   `::std::env::var`, `env::var` after an import, a function pointer taken from one;
 //! - a `use` that imports `std::env` or anything under it, imports or renames `std` itself, or
 //!   globs `std::*`, in any form (groups, `self`, renames): each brings `env` into scope under a
 //!   name the path rule cannot see (`use std::env as e; e::var("X")`);
@@ -33,8 +33,16 @@ use syn::{Expr, Item, UseTree};
 /// starts.
 const ALLOWED: [&str; 1] = ["env.rs"];
 
-/// The `std::env` functions that read or write variables, by name.
-const READS: [&str; 6] = ["var", "var_os", "vars", "vars_os", "set_var", "remove_var"];
+/// The `std::env` functions that read or write variables, by name; `home_dir` reads `HOME`.
+const READS: [&str; 7] = [
+    "var",
+    "var_os",
+    "vars",
+    "vars_os",
+    "set_var",
+    "remove_var",
+    "home_dir",
+];
 
 /// One way a file reaches the environment.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -245,6 +253,23 @@ fn every_read_and_write_is_caught_however_it_is_qualified() {
             assert_eq!(whats(&src), std::slice::from_ref(&path), "{src}");
         }
     }
+}
+
+#[test]
+fn home_dir_is_caught_because_it_reads_home() {
+    for path in [
+        "std::env::home_dir",
+        "::std::env::home_dir",
+        "env::home_dir",
+    ] {
+        let src = format!("fn f() {{ let _ = {path}(); }}");
+        assert_eq!(whats(&src), [path], "{src}");
+    }
+    assert_eq!(
+        whats("fn f() { println!(\"{:?}\", std::env::home_dir()); }"),
+        ["std::env::home_dir"],
+        "in a macro's tokens too"
+    );
 }
 
 #[test]

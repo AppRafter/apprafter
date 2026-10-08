@@ -10,13 +10,14 @@
 //! [`EventSink`], both under the manager's lock, so a page that subscribes gets the replay
 //! and then exactly the events after it. An ended operation keeps its summary and replay
 //! until the webview [`discard`](OperationManager::discard)s it after showing the result, or
-//! until [`ENDED_KEPT`] operations ended after it.
+//! until [`ENDED_KEPT`] operations ended after it. A plan that never runs — its prompt
+//! refused, expired, swept, or dropped by a lock — sends the pages that followed it one
+//! `Failed` saying why, so none of them waits for an end that never comes.
 //!
 //! A plan leaves the manager's maps under its lock and is dropped after the lock is released:
 //! what an executor captured may do anything when it goes, calling back into the manager
 //! included.
 
-use std::any::Any;
 use std::collections::{HashMap, VecDeque};
 use std::mem;
 use std::panic::{self, AssertUnwindSafe};
@@ -30,11 +31,12 @@ use apprafter_core::{
 use apprafter_desktop_ipc::{AuthOutcome, OpEvent, OpId, OpState, OpSummary, PlanView};
 
 use super::replay::REPLAY_CAP;
-use super::{trip, Clock, OpReporter, ReplayBuffer};
+use super::{panic_message, trip, Clock, OpReporter, ReplayBuffer, Stamp};
 use crate::auth::{AuthPurpose, Authenticator};
 use crate::errors::DesktopError;
 
-/// How long a plan can wait for `execute`, on the monotonic clock.
+/// How long a plan can wait for `execute`, measured by [`elapsed_ms`](super::elapsed_ms):
+/// a suspend counts, a wall clock stepped back does not.
 pub const PLAN_TTL_MS: u64 = 10 * 60 * 1000;
 
 /// How many ended operations are kept, not yet discarded, before the first of them to end
@@ -51,7 +53,9 @@ const CANCEL_THREAD: &str = "op-cancel";
 pub trait EventSink: Send + Sync {
     /// `false` when the receiver is gone; the manager then drops the sink. Called — and the
     /// sink dropped — under the manager's lock, so it must be quick and must never call back
-    /// into the manager.
+    /// into the manager. Nor into the [`LockMachine`](crate::lock::LockMachine): a lock sends
+    /// the pages of the plans it drops their final event from the machine's hook, under the
+    /// machine's lock and then this one, and the locks are never taken the other way round.
     fn send(&self, event: &OpEvent) -> bool;
     /// The label of the webview the sink delivers to.
     fn webview(&self) -> &str;
@@ -120,12 +124,15 @@ impl Inner {
         self.ops.values().filter(|op| op.run().is_some()).count()
     }
 
-    /// Take out every plan one [`PLAN_TTL_MS`] past its deadline, for the caller to drop
-    /// once it has let go of the lock.
-    fn sweep(&mut self, now_ms: u64) -> Vec<Pending> {
+    /// Take out every plan one [`PLAN_TTL_MS`] past its expiry, its pages told it expired,
+    /// for the caller to drop once it has let go of the lock.
+    fn sweep(&mut self, clock: &dyn Clock) -> Vec<Pending> {
         self.pending
-            .extract_if(|_, plan| now_ms > plan.deadline_ms.saturating_add(PLAN_TTL_MS))
-            .map(|(_, plan)| plan)
+            .extract_if(|_, plan| plan.registered.elapsed_ms(clock) > 2 * PLAN_TTL_MS)
+            .map(|(op_id, mut plan)| {
+                refuse(&mut plan.sinks, &DesktopError::PlanExpired { op_id });
+                plan
+            })
             .collect()
     }
 
@@ -159,11 +166,18 @@ struct Pending {
     target: Option<String>,
     /// Set when the owner must confirm before it runs.
     gesture: Option<AuthPurpose>,
-    /// On the monotonic clock: after it, `execute` refuses the plan.
-    deadline_ms: u64,
+    /// When it was registered; one [`PLAN_TTL_MS`] after it, `execute` refuses the plan.
+    registered: Stamp,
     exec: Executor,
     /// Pages subscribed before `execute`; they follow the plan into its operation.
     sinks: Vec<Arc<dyn EventSink>>,
+}
+
+impl Pending {
+    /// Its [`PLAN_TTL_MS`] has passed, on either clock.
+    fn expired(&self, clock: &dyn Clock) -> bool {
+        self.registered.elapsed_ms(clock) > PLAN_TTL_MS
+    }
 }
 
 struct Prompt {
@@ -214,7 +228,8 @@ enum Answer {
     Run(Vec<Arc<dyn EventSink>>),
     /// Nothing was asked: the plan waits for another `execute`, as it was.
     Again(Vec<Arc<dyn EventSink>>),
-    Refuse(DesktopError),
+    /// Refused, for the reason given; the pages that followed the prompt are told it.
+    Refuse(DesktopError, Vec<Arc<dyn EventSink>>),
 }
 
 impl OperationManager {
@@ -227,23 +242,24 @@ impl OperationManager {
     }
 
     /// Keep a plan for [`execute`](Self::execute); the view is all the webview gets. Its
-    /// `expires_at_ms` is wall time, for display; the plan itself expires one
-    /// [`PLAN_TTL_MS`] from now on the monotonic clock, whatever the wall clock does.
+    /// `expires_at_ms` is wall time, for display; the plan itself expires once one
+    /// [`PLAN_TTL_MS`] has passed on either clock ([`elapsed_ms`](super::elapsed_ms)): a
+    /// suspend expires it, a wall clock stepped back does not keep it alive.
     ///
     /// A plan lives until it is executed, cancelled or discarded, the app locks, or one
     /// [`PLAN_TTL_MS`] after it expired: swept here and on every
     /// [`flush_due`](Self::flush_due) tick, so an abandoned plan does not keep what its
     /// executor captured. Until then `execute` answers `PlanExpired`.
     pub fn register_plan(&self, parts: PlanParts, exec: Executor) -> PlanView {
-        let now = self.clock.monotonic_ms();
-        let expires_at_ms = self.clock.now_ms().saturating_add(PLAN_TTL_MS);
+        let registered = Stamp::now(&*self.clock);
+        let expires_at_ms = registered.wall_ms.saturating_add(PLAN_TTL_MS);
         let needs_gesture = parts.requires_gesture || parts.class == PlanClass::Destructive;
         let gesture = needs_gesture.then(|| AuthPurpose::Confirm {
             target: parts.target.clone(),
             verb: parts.verb,
         });
         let mut inner = self.lock();
-        let swept = inner.sweep(now);
+        let swept = inner.sweep(&*self.clock);
         inner.next_id += 1;
         let op_id = OpId(inner.next_id);
         inner.pending.insert(
@@ -252,7 +268,7 @@ impl OperationManager {
                 title: parts.title.clone(),
                 target: parts.target.clone(),
                 gesture,
-                deadline_ms: now.saturating_add(PLAN_TTL_MS),
+                registered,
                 exec,
                 sinks: Vec::new(),
             },
@@ -284,16 +300,17 @@ impl OperationManager {
         id: OpId,
         auth: &dyn Authenticator,
     ) -> Result<OpId, DesktopError> {
-        let now = self.clock.monotonic_ms();
         let mut inner = self.lock();
         let mut plan = inner
             .pending
             .remove(&id)
             .ok_or(DesktopError::PlanNotFound { op_id: id })?;
-        if now > plan.deadline_ms {
+        if plan.expired(&*self.clock) {
+            let err = DesktopError::PlanExpired { op_id: id };
+            refuse(&mut plan.sinks, &err);
             drop(inner);
             drop(plan);
-            return Err(DesktopError::PlanExpired { op_id: id });
+            return Err(err);
         }
         if let Some(purpose) = plan.gesture.clone() {
             let cancel = CancellationToken::new();
@@ -307,19 +324,20 @@ impl OperationManager {
             );
             drop(inner);
             let answer = panic::catch_unwind(AssertUnwindSafe(|| auth.verify(&purpose, &cancel)));
-            let now = self.clock.monotonic_ms();
+            let expired = plan.expired(&*self.clock);
             inner = self.lock();
             let prompt = inner.prompts.remove(&id);
-            match judge(id, answer, prompt, now > plan.deadline_ms) {
+            match judge(id, answer, prompt, expired) {
                 Answer::Run(sinks) => plan.sinks = sinks,
                 Answer::Again(sinks) => {
                     plan.sinks = sinks;
                     inner.pending.insert(id, plan);
                     return Err(DesktopError::AuthBusy);
                 }
-                Answer::Refuse(err) => {
+                Answer::Refuse(err, mut sinks) => {
+                    refuse(&mut sinks, &err);
                     drop(inner);
-                    drop(plan);
+                    drop((plan, sinks));
                     return Err(err);
                 }
             }
@@ -395,8 +413,10 @@ impl OperationManager {
 
     /// What the operation reported so far; `sink` then receives every later event, with
     /// nothing lost or repeated in between, and the caller shows the replay first. A plan
-    /// has no events yet, and the sink follows it when it runs. An ended operation returns
-    /// its whole replay and keeps no sink.
+    /// has no events yet, and the sink follows it when it runs — or receives one `Failed`
+    /// when it never will: refused, expired, swept or dropped by a lock (a plan the webview
+    /// cancels or discards itself sends nothing). An ended operation returns its whole replay
+    /// and keeps no sink.
     pub fn subscribe(
         &self,
         id: OpId,
@@ -486,13 +506,16 @@ impl OperationManager {
         self.lock().running()
     }
 
-    /// The app locked: no plan made before it may run after it. Every plan goes, and every
-    /// open prompt is refused before this returns (its dialog closes, and its `execute`
-    /// refuses whatever the OS answers). Running operations go on: they were confirmed
-    /// before the lock.
+    /// The app locked: no plan made before it may run after it. Every plan goes, the pages
+    /// that followed it told `Locked`, and every open prompt is refused before this returns
+    /// (its dialog closes, and its `execute` refuses whatever the OS answers and tells its
+    /// pages `AuthCancelled`). Running operations go on: they were confirmed before the lock.
     pub fn drop_all_plans(&self) {
         let mut inner = self.lock();
-        let plans: Vec<Pending> = inner.pending.drain().map(|(_, plan)| plan).collect();
+        let mut plans: Vec<Pending> = inner.pending.drain().map(|(_, plan)| plan).collect();
+        for plan in &mut plans {
+            refuse(&mut plan.sinks, &DesktopError::Locked);
+        }
         let prompts = refuse_prompts(&mut inner.prompts);
         drop(inner);
         drop(plans);
@@ -527,10 +550,9 @@ impl OperationManager {
     /// which takes this lock, under its own lock; holding them the other way round
     /// deadlocks against an operation that is writing.
     pub fn flush_due(&self) {
-        let now = self.clock.monotonic_ms();
         let (reporters, swept) = {
             let mut inner = self.lock();
-            let swept = inner.sweep(now);
+            let swept = inner.sweep(&*self.clock);
             let reporters: Vec<Arc<OpReporter>> = inner
                 .ops
                 .values()
@@ -600,6 +622,11 @@ impl Drop for Ending<'_> {
     }
 }
 
+/// Tell the pages that followed a plan that it will never run, and why.
+fn refuse(sinks: &mut Vec<Arc<dyn EventSink>>, why: &DesktopError) {
+    fan_out(sinks, &OpEvent::Failed { error: why.to_ui() });
+}
+
 /// Refuse every open prompt not refused yet; their tokens, to close their dialogs.
 fn refuse_prompts(prompts: &mut HashMap<OpId, Prompt>) -> Vec<CancellationToken> {
     prompts
@@ -613,38 +640,39 @@ fn refuse_prompts(prompts: &mut HashMap<OpId, Prompt>) -> Vec<CancellationToken>
 }
 
 /// What a prompt's answer means for plan `id`. `prompt` is its entry, gone when it was
-/// closed some other way; `expired` says the plan's deadline passed while it was open.
+/// closed some other way; `expired` says the plan's time to live passed while it was open.
 fn judge(
     id: OpId,
     answer: thread::Result<AuthOutcome>,
     prompt: Option<Prompt>,
     expired: bool,
 ) -> Answer {
+    let (refused, sinks) = prompt.map_or((true, Vec::new()), |p| (p.refused, p.sinks));
     let outcome = match answer {
         Ok(outcome) => outcome,
         Err(panic) => {
-            return Answer::Refuse(DesktopError::Internal(format!(
+            let err = DesktopError::Internal(format!(
                 "the authentication prompt panicked: {}",
                 panic_message(&*panic)
-            )))
+            ));
+            return Answer::Refuse(err, sinks);
         }
     };
     // A lock, a cancel or a quit closed it: whatever the OS answered, the plan was dropped.
-    let Some(prompt) = prompt.filter(|prompt| !prompt.refused) else {
-        return Answer::Refuse(DesktopError::AuthCancelled);
-    };
-    match outcome {
-        AuthOutcome::Verified | AuthOutcome::Busy if expired => {
-            Answer::Refuse(DesktopError::PlanExpired { op_id: id })
-        }
-        AuthOutcome::Verified => Answer::Run(prompt.sinks),
-        AuthOutcome::Busy => Answer::Again(prompt.sinks),
-        AuthOutcome::Cancelled { .. } => Answer::Refuse(DesktopError::AuthCancelled),
-        AuthOutcome::Failed { exhausted } => Answer::Refuse(DesktopError::AuthFailed { exhausted }),
-        AuthOutcome::Unavailable { reason } => {
-            Answer::Refuse(DesktopError::AuthUnavailable { reason })
-        }
+    if refused {
+        return Answer::Refuse(DesktopError::AuthCancelled, sinks);
     }
+    let err = match outcome {
+        AuthOutcome::Verified | AuthOutcome::Busy if expired => {
+            DesktopError::PlanExpired { op_id: id }
+        }
+        AuthOutcome::Verified => return Answer::Run(sinks),
+        AuthOutcome::Busy => return Answer::Again(sinks),
+        AuthOutcome::Cancelled { .. } => DesktopError::AuthCancelled,
+        AuthOutcome::Failed { exhausted } => DesktopError::AuthFailed { exhausted },
+        AuthOutcome::Unavailable { reason } => DesktopError::AuthUnavailable { reason },
+    };
+    Answer::Refuse(err, sinks)
 }
 
 /// The final event and state for how the executor returned.
@@ -724,14 +752,6 @@ mod test_spawn {
     }
 }
 
-fn panic_message(payload: &(dyn Any + Send)) -> &str {
-    payload
-        .downcast_ref::<&str>()
-        .copied()
-        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-        .unwrap_or("no message")
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -756,11 +776,13 @@ mod tests {
     };
     use crate::auth::{AuthPurpose, Authenticator, FakeAuthenticator, NoAuthenticator};
     use crate::errors::DesktopError;
+    use crate::ops::replay::MESSAGE_CAP;
     use crate::ops::reporter::FLUSH_AGE_MS;
     use crate::ops::test_clock::ManualClock;
     use crate::ops::{test_trips, Clock};
 
     const T0: u64 = 1_700_000_000_000;
+    const DAY: u64 = 24 * 60 * 60 * 1000;
     /// What a test waits before it calls something stuck.
     const LONG: Duration = Duration::from_secs(10);
 
@@ -1368,6 +1390,9 @@ mod tests {
     #[test]
     fn a_subscriber_never_misses_or_repeats_an_event_while_the_op_emits() {
         const N: u32 = 4_000;
+        // Where the operation pauses: few enough events that the replay keeps every one.
+        const PAUSE: u32 = 1_000;
+        assert!((PAUSE as usize) < MESSAGE_CAP);
         let expected: Vec<OpEvent> = (0..N)
             .map(|index| OpEvent::Stage {
                 index,
@@ -1376,38 +1401,49 @@ mod tests {
             })
             .chain([completed(json!(N))])
             .collect();
-        let mut interleaved = 0;
         for _ in 0..8 {
             let (_, mgr) = manager();
+            let (paused_tx, paused_rx) = mpsc::channel();
+            let (resume, resume_gate) = gate();
             let (half_tx, half_rx) = mpsc::channel();
-            let (open, gate) = gate();
+            let (finish, finish_gate) = gate();
             let view = mgr.register_plan(
                 parts(PlanClass::Bounded),
                 Box::new(move |r, _| {
                     for index in 0..N {
+                        if index == PAUSE {
+                            paused_tx.send(()).unwrap();
+                            resume_gate.wait();
+                        }
                         r.report(Event::Stage {
                             index,
                             total: N,
                             title: String::new(),
                         });
-                        if index == N / 2 {
+                        if index == (PAUSE + N) / 2 {
                             half_tx.send(()).unwrap();
                         }
                     }
-                    gate.wait();
+                    finish_gate.wait();
                     complete(json!(N))
                 }),
             );
             mgr.execute(view.op_id, &FakeAuthenticator::new()).unwrap();
+            // Forced: the operation stopped after exactly PAUSE events, and goes on emitting
+            // once this page has subscribed.
+            paused_rx.recv_timeout(LONG).unwrap();
+            let paused = VecSink::new("main");
+            let replay = mgr.subscribe(view.op_id, paused.clone()).unwrap();
+            assert_same_events(&replay, &expected[..PAUSE as usize]);
+            resume.send(()).unwrap();
+            // Sampled: another page subscribes while the burst runs, wherever it lands.
             half_rx.recv_timeout(LONG).unwrap();
-            let sink = VecSink::new("main");
-            let replay = mgr.subscribe(view.op_id, sink.clone()).unwrap();
-            if replay.len() < N as usize {
-                interleaved += 1;
-            }
-            open.send(()).unwrap();
+            let racing = VecSink::new("main");
+            let racing_replay = mgr.subscribe(view.op_id, racing.clone()).unwrap();
+            finish.send(()).unwrap();
             wait_ended(&mgr, view.op_id);
-            let all: Vec<OpEvent> = replay.into_iter().chain(sink.events()).collect();
+            assert_same_events(&paused.events(), &expected[PAUSE as usize..]);
+            let all: Vec<OpEvent> = racing_replay.into_iter().chain(racing.events()).collect();
             // The replay keeps the newest stages and leads with how many went before them:
             // what follows must be exactly the rest, the live events joined on without a gap.
             let (dropped, kept) = match all.split_first() {
@@ -1421,8 +1457,6 @@ mod tests {
             };
             assert_same_events(kept, &expected[dropped..]);
         }
-        // Not asserted (a scheduler may finish the burst first); printed for the record.
-        println!("subscribed mid-burst in {interleaved} of 8 rounds");
     }
 
     #[test]
@@ -1963,6 +1997,8 @@ mod tests {
             let (auth, opened, answer) = held_prompt();
             let ran = Arc::new(AtomicBool::new(false));
             let view = mgr.register_plan(parts(PlanClass::Destructive), flags(&ran));
+            let sink = VecSink::new("main");
+            mgr.subscribe(view.op_id, sink.clone()).unwrap();
             let result = execute_in_background(&mgr, view.op_id, auth);
             opened.recv_timeout(LONG).expect("the prompt opened");
             // Closing the prompt trips its token on a thread of its own. Holding that thread
@@ -1980,6 +2016,13 @@ mod tests {
                 "{name}: {result:?}"
             );
             assert!(!ran.load(SeqCst), "the plan ran after {name} returned");
+            assert_eq!(
+                sink.events(),
+                vec![OpEvent::Failed {
+                    error: DesktopError::AuthCancelled.to_ui()
+                }],
+                "{name}: the page that followed the plan hears it was refused"
+            );
             assert!(mgr.list().is_empty(), "{name}");
             assert!(matches!(
                 mgr.execute(view.op_id, &FakeAuthenticator::new()),
@@ -2077,33 +2120,47 @@ mod tests {
         assert!(mgr.list().is_empty());
     }
 
-    // 12. Time to live, on the clock that never steps back.
+    // 12. Time to live, on both clocks: a suspend counts, a wall step back does not.
 
     #[test]
     fn a_plan_that_expired_while_its_prompt_was_open_never_runs() {
-        let (clock, mgr) = manager();
-        let (auth, opened, answer) = held_prompt();
-        let ran = Arc::new(AtomicBool::new(false));
-        let view = mgr.register_plan(parts(PlanClass::Destructive), flags(&ran));
-        let result = execute_in_background(&mgr, view.op_id, auth);
-        opened.recv_timeout(LONG).expect("the prompt opened");
-        clock.advance(PLAN_TTL_MS + 1);
-        answer.send(AuthOutcome::Verified).unwrap();
-        let result = result.recv_timeout(LONG).expect("execute returned");
-        assert!(
-            matches!(result, Err(DesktopError::PlanExpired { op_id }) if op_id == view.op_id),
-            "{result:?}"
-        );
-        assert!(!ran.load(SeqCst));
-        assert!(mgr.list().is_empty());
-        assert!(matches!(
-            mgr.execute(view.op_id, &FakeAuthenticator::new()),
-            Err(DesktopError::PlanNotFound { .. })
-        ));
+        type Passes = fn(&ManualClock);
+        let ways: [(&str, Passes); 2] = [
+            ("time passed", |clock| clock.advance(PLAN_TTL_MS + 1)),
+            // The machine slept with the dialog up: only the wall clock saw it.
+            ("the machine slept", |clock| clock.set_wall(T0 + DAY)),
+        ];
+        // `Busy` would put the plan back to wait: not once it expired.
+        for answered in [AuthOutcome::Verified, AuthOutcome::Busy] {
+            for (how, pass) in ways {
+                let (clock, mgr) = manager();
+                let (auth, opened, answer) = held_prompt();
+                let ran = Arc::new(AtomicBool::new(false));
+                let view = mgr.register_plan(parts(PlanClass::Destructive), flags(&ran));
+                let result = execute_in_background(&mgr, view.op_id, auth);
+                opened.recv_timeout(LONG).expect("the prompt opened");
+                pass(&clock);
+                answer.send(answered).unwrap();
+                let result = result.recv_timeout(LONG).expect("execute returned");
+                assert!(
+                    matches!(result, Err(DesktopError::PlanExpired { op_id }) if op_id == view.op_id),
+                    "{how}, {answered:?}: {result:?}"
+                );
+                assert!(!ran.load(SeqCst), "{how}, {answered:?}");
+                assert!(mgr.list().is_empty(), "{how}, {answered:?}");
+                assert!(
+                    matches!(
+                        mgr.execute(view.op_id, &FakeAuthenticator::new()),
+                        Err(DesktopError::PlanNotFound { .. })
+                    ),
+                    "{how}, {answered:?}"
+                );
+            }
+        }
     }
 
     #[test]
-    fn the_time_to_live_runs_on_the_monotonic_clock_whatever_the_wall_clock_does() {
+    fn a_plan_expires_when_either_clock_says_its_time_to_live_passed() {
         let (clock, mgr) = manager();
         let auth = FakeAuthenticator::new();
         let runs = Arc::new(AtomicUsize::new(0));
@@ -2116,11 +2173,21 @@ mod tests {
             matches!(result, Err(DesktopError::PlanExpired { .. })),
             "{result:?}"
         );
-        // The wall clock jumps a day ahead while no time passes: the plan is as young as it
+        // The wall clock jumps a day ahead while the monotonic clock stands still: that is
+        // what a suspend looks like from inside (`Instant` does not count the sleep), and a
+        // plan shown before the lid closed must not run on wake.
+        let slept = mgr.register_plan(parts(PlanClass::Bounded), counting(&runs));
+        clock.set_wall(T0 + DAY);
+        let result = mgr.execute(slept.op_id, &auth);
+        assert!(
+            matches!(result, Err(DesktopError::PlanExpired { op_id }) if op_id == slept.op_id),
+            "{result:?}"
+        );
+        // The wall clock steps back a day while no time passes: the plan is as young as it
         // was, for `execute` and for the sweep alike. The view shows wall time.
         let fresh = mgr.register_plan(parts(PlanClass::Bounded), counting(&runs));
-        assert_eq!(fresh.expires_at_ms, T0 + PLAN_TTL_MS);
-        clock.set_wall(T0 + 24 * 60 * 60 * 1000);
+        assert_eq!(fresh.expires_at_ms, T0 + DAY + PLAN_TTL_MS);
+        clock.set_wall(T0);
         mgr.flush_due();
         mgr.register_plan(parts(PlanClass::Bounded), returns(json!(0)));
         mgr.execute(fresh.op_id, &auth).unwrap();
@@ -2183,13 +2250,17 @@ mod tests {
     #[test]
     fn a_plan_is_dropped_outside_the_managers_lock_wherever_it_goes() {
         type Path = fn(&Arc<OperationManager>, &ManualClock, OpId);
-        let paths: [(&str, Path); 7] = [
+        let paths: [(&str, Path); 8] = [
             ("the sweep in register_plan", |mgr, clock, _| {
                 clock.advance(2 * PLAN_TTL_MS + 1);
                 mgr.register_plan(parts(PlanClass::Bounded), returns(json!(0)));
             }),
             ("the sweep in flush_due", |mgr, clock, _| {
                 clock.advance(2 * PLAN_TTL_MS + 1);
+                mgr.flush_due();
+            }),
+            ("the sweep after a suspend", |mgr, clock, _| {
+                clock.set_wall(T0 + DAY);
                 mgr.flush_due();
             }),
             ("an expired execute", |mgr, clock, id| {
@@ -2221,6 +2292,66 @@ mod tests {
                 within(name, move || path(&mgr, &clock, view.op_id));
             }
             assert!(dropped.load(SeqCst), "{name} let the plan go");
+        }
+    }
+
+    #[test]
+    fn a_plan_that_never_runs_gives_the_pages_that_followed_it_a_final_event() {
+        type End = fn(&Arc<OperationManager>, &ManualClock, OpId) -> DesktopError;
+        let ends: [(&str, End); 7] = [
+            ("a refused prompt", |mgr, _, id| {
+                let auth = FakeAuthenticator::new();
+                auth.then(AuthOutcome::Cancelled {
+                    by: CancelledBy::User,
+                });
+                let err = mgr.execute(id, &auth).unwrap_err();
+                assert!(matches!(err, DesktopError::AuthCancelled), "{err:?}");
+                err
+            }),
+            ("a failed prompt", |mgr, _, id| {
+                let auth = FakeAuthenticator::new();
+                auth.then(AuthOutcome::Failed { exhausted: true });
+                mgr.execute(id, &auth).unwrap_err()
+            }),
+            ("a panicking prompt", |mgr, _, id| {
+                mgr.execute(id, &PanickingPrompt).unwrap_err()
+            }),
+            ("an expired execute", |mgr, clock, id| {
+                clock.advance(PLAN_TTL_MS + 1);
+                let err = mgr.execute(id, &FakeAuthenticator::new()).unwrap_err();
+                assert!(matches!(err, DesktopError::PlanExpired { .. }), "{err:?}");
+                err
+            }),
+            ("a lock", |mgr, _, _| {
+                mgr.drop_all_plans();
+                DesktopError::Locked
+            }),
+            ("the sweep in flush_due", |mgr, clock, id| {
+                clock.advance(2 * PLAN_TTL_MS + 1);
+                mgr.flush_due();
+                DesktopError::PlanExpired { op_id: id }
+            }),
+            ("the sweep in register_plan", |mgr, clock, id| {
+                clock.set_wall(T0 + DAY);
+                mgr.register_plan(parts(PlanClass::Bounded), returns(json!(0)));
+                DesktopError::PlanExpired { op_id: id }
+            }),
+        ];
+        for (name, end) in ends {
+            let (clock, mgr) = manager();
+            let view = mgr.register_plan(parts(PlanClass::Destructive), returns(json!(0)));
+            let main = VecSink::new("main");
+            let other = VecSink::new("other");
+            mgr.subscribe(view.op_id, main.clone()).unwrap();
+            mgr.subscribe(view.op_id, other.clone()).unwrap();
+            let why = {
+                let mgr = mgr.clone();
+                within(name, move || end(&mgr, &clock, view.op_id))
+            };
+            let last = OpEvent::Failed { error: why.to_ui() };
+            assert_eq!(main.events(), vec![last.clone()], "{name}");
+            assert_eq!(other.events(), vec![last], "{name}");
+            assert!(mgr.list().is_empty(), "{name}");
         }
     }
 

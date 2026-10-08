@@ -2,14 +2,19 @@
 //! The desktop's preferences in `settings.json` (design spec §4.6), owned by Rust because the
 //! lock, the tray and the notifier read them too.
 //!
-//! Loading never fails the app. A missing file reads as the defaults. A file this build cannot
-//! read — not JSON, not an object, a value it does not know — reads as the defaults with a
-//! [`notice`](SettingsStore::notice) for the owner, and is moved aside to
-//! `settings.json.corrupt-<ms>` so the next save does not overwrite it (when it cannot be
-//! moved, the notice says the next change overwrites it). A file written by a newer AppRafter
-//! (a higher `version`) also reads as the defaults with a notice, but is neither moved nor
-//! rewritten by loading: it stays as it is until the owner's next explicit
-//! [`set`](SettingsStore::set) replaces it, which the notice says.
+//! Loading never fails the app. A missing file reads as the defaults. Every other way it falls
+//! back to the defaults leaves a [`notice`](SettingsStore::notice) for the owner that says
+//! what happened to the file:
+//!
+//! - unreadable as settings — not JSON, not an object, a value this build does not know, a
+//!   `version` that is no number: moved aside to `settings.json.corrupt-<ms>`, so the next save
+//!   does not overwrite it (when it cannot be moved, it is left in place, and the notice says
+//!   the next change overwrites it);
+//! - not readable at all (an I/O error, such as a permission): left in place, since the
+//!   settings in it may be fine, and the notice names the error and says the next change
+//!   overwrites it;
+//! - written by a newer AppRafter (a higher `version`): left as it is until the owner's next
+//!   explicit [`set`](SettingsStore::set) replaces it, which the notice says.
 //!
 //! [`set`](SettingsStore::set) writes the whole file through [`cli_core::atomic_replace`] (a
 //! reader sees the old file or the new one, never a partial write) with mode 0600, as pretty
@@ -45,7 +50,10 @@ enum Read {
     Missing,
     Loaded(Settings),
     Newer(u64),
+    /// Read, but not as settings: why.
     Unreadable(String),
+    /// Not read: the I/O error.
+    Inaccessible(String),
 }
 
 impl SettingsStore {
@@ -66,20 +74,27 @@ impl SettingsStore {
             ),
             Read::Unreadable(reason) => {
                 let aside = format!("{FILE_NAME}.corrupt-{}", clock.now_ms());
-                let kept = match std::fs::rename(&path, dir.join(&aside)) {
-                    Ok(()) => format!("The unreadable file was moved to {aside}."),
+                let notice = match std::fs::rename(&path, dir.join(&aside)) {
+                    Ok(()) => format!(
+                        "{FILE_NAME} was unreadable ({reason}); defaults are in use, and the \
+                         file was moved to {aside}."
+                    ),
                     Err(e) => format!(
-                        "Moving it to {aside} failed ({e}), so the next change overwrites it."
+                        "{FILE_NAME} was unreadable ({reason}); defaults are in use. Moving it \
+                         to {aside} failed ({e}), so it was left in place and the next change \
+                         overwrites it."
                     ),
                 };
-                (
-                    Settings::default(),
-                    Some(format!(
-                        "{FILE_NAME} was unreadable ({reason}); defaults are in use and the \
-                         file will be replaced on the next change. {kept}"
-                    )),
-                )
+                (Settings::default(), Some(notice))
             }
+            // Not moved: nothing says the settings in it are bad.
+            Read::Inaccessible(error) => (
+                Settings::default(),
+                Some(format!(
+                    "{FILE_NAME} could not be read ({error}); defaults are in use. The file was \
+                     left in place, and the next change overwrites it."
+                )),
+            ),
         };
         Self {
             path,
@@ -124,7 +139,7 @@ fn read(path: &Path) -> Read {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Read::Missing,
-        Err(e) => return Read::Unreadable(e.to_string()),
+        Err(e) => return Read::Inaccessible(e.to_string()),
     };
     let value: serde_json::Value = match serde_json::from_slice(&bytes) {
         Ok(value) => value,
@@ -239,10 +254,11 @@ mod tests {
                 "{what}: {notice}"
             );
             assert!(notice.contains(reason), "{what}: {notice}");
+            // It says what happened, and only that: the file is out of the way, not replaced.
             assert!(
-                notice.contains(
-                    "); defaults are in use and the file will be replaced on the next change. \
-                     The unreadable file was moved to settings.json.corrupt-1700000000000."
+                notice.ends_with(
+                    "); defaults are in use, and the file was moved to \
+                     settings.json.corrupt-1700000000000."
                 ),
                 "{what}: {notice}"
             );
@@ -284,13 +300,13 @@ mod tests {
         );
         assert!(
             notice.contains(
-                "; defaults are in use and the file will be replaced on the next change. \
-                 Moving it to settings.json.corrupt-1700000000000 failed ("
+                "); defaults are in use. Moving it to settings.json.corrupt-1700000000000 \
+                 failed ("
             ),
             "{notice}"
         );
         assert!(
-            notice.ends_with("), so the next change overwrites it."),
+            notice.ends_with("), so it was left in place and the next change overwrites it."),
             "{notice}"
         );
         assert_eq!(
@@ -298,6 +314,51 @@ mod tests {
             "garbage",
             "left where it was"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_that_cannot_be_read_is_left_in_place_for_the_next_change_to_overwrite() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        // Settings the owner may want back: an error reading them says nothing about them.
+        let valid = r#"{"version":1,"theme":"light"}"#;
+        fs::write(&path, valid).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(
+            fs::read(&path).is_err(),
+            "this test cannot run as root: root reads a mode-000 file, so there is no read \
+             error to test"
+        );
+        let store = load(dir.path());
+        assert_eq!(store.get(), Settings::default());
+        let notice = store.notice().expect("a notice");
+        assert!(
+            notice.starts_with("settings.json could not be read ("),
+            "{notice}"
+        );
+        assert!(
+            notice.contains("Permission denied"),
+            "names the error: {notice}"
+        );
+        assert!(
+            notice.ends_with(
+                "); defaults are in use. The file was left in place, and the next change \
+                 overwrites it."
+            ),
+            "{notice}"
+        );
+        assert_eq!(
+            names(dir.path()),
+            vec![FILE_NAME.to_string()],
+            "not moved aside"
+        );
+        // As the notice says.
+        store.set(changed()).unwrap();
+        assert_eq!(store.notice(), None);
+        assert_eq!(load(dir.path()).get(), changed());
+        assert_eq!(names(dir.path()), vec![FILE_NAME.to_string()]);
     }
 
     #[test]

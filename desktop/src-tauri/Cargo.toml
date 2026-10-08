@@ -38,6 +38,8 @@ serde                 = { workspace = true }
 serde_json            = { workspace = true }
 tauri                 = { workspace = true }
 thiserror             = "2"
+# The version cli/Cargo.toml pins, already in the lock (cli-core logs through it).
+tracing               = "0.1"
 
 [dev-dependencies]
 # tests/env_guard.rs reads src/ as syntax trees, not text: versions already in the lock (as in

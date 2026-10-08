@@ -10,16 +10,34 @@
 //!
 //! Settings reach the machine as a copy: [`LockMachine::new`] takes the loaded settings and
 //! only [`LockMachine::set_settings`] replaces them. It checks the change, then calls the
-//! caller's `persist` (in the app, `|s| store.set(s.clone())`) under the machine's lock and
-//! applies the change only if that succeeded, so the file and the machine change together or
-//! not at all. The machine knows nothing of the
-//! [`SettingsStore`](crate::settings::SettingsStore) and the store nothing of the machine.
+//! caller's `persist` (in the app, `|s| store.set(s.clone())`) and applies the change only if
+//! that succeeded, so the file and the machine change together or not at all. The machine
+//! knows nothing of the [`SettingsStore`](crate::settings::SettingsStore) and the store nothing
+//! of the machine.
 //!
 //! Every transition between locked and unlocked calls the hook exactly once, with the new
 //! state, under the machine's lock (so hooks run in transition order). The state at
-//! construction is not a transition: nothing is listening yet.
+//! construction is not a transition: nothing is listening yet. The idle time is measured with
+//! [`elapsed_ms`](crate::ops::elapsed_ms): a suspend counts, a wall clock stepped back does not.
+//!
+//! # What waits for what
+//!
+//! Tauri runs the invoke handler on the main thread, and every command passes
+//! [`guard`](LockMachine::guard) there, so the guard reads an atomic and never waits. The
+//! machine's own lock is held for bookkeeping and the hook only — never across a prompt or a
+//! disk write. [`set_settings`](LockMachine::set_settings) holds a lock of its own across
+//! `persist` and the apply, which orders concurrent changes and holds up nothing but the next
+//! change.
+//!
+//! The locks are taken in one order: the settings write, then the machine, then the
+//! [`OperationManager`](crate::ops::OperationManager) — the hook drops pending plans, which
+//! takes the manager's lock and sends their pages a final event under it. Nothing may take
+//! them the other way round, so no `LockMachine` method may be called from an
+//! [`EventSink::send`](crate::ops::EventSink::send), from a Rust-side `lock-changed`
+//! listener, from the hook itself, or from `persist`.
 
 use std::panic::{self, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use apprafter_core::CancellationToken;
@@ -29,13 +47,15 @@ use apprafter_desktop_ipc::{
 
 use crate::auth::{AuthPurpose, Authenticator};
 use crate::errors::DesktopError;
-use crate::ops::Clock;
+use crate::ops::{panic_message, Clock, Stamp};
 
 const MINUTE_MS: u64 = 60_000;
 
 /// Called on every transition between locked and unlocked, with the new state; the app drops
 /// pending plans and emits `lock-changed`. It runs under the machine's lock, so it must be
-/// quick, must not panic, and must never call back into the machine.
+/// quick and must never call back into the machine (see the module docs for the lock order).
+/// A panic in it is caught and logged: the transition stands, and whoever made it — the idle
+/// ticker among them — goes on.
 pub type LockHook = Box<dyn Fn(&LockState) + Send + Sync>;
 
 pub struct LockMachine {
@@ -43,15 +63,21 @@ pub struct LockMachine {
     clock: Arc<dyn Clock>,
     hook: LockHook,
     inner: Mutex<Inner>,
+    /// `inner.reason.is_some()`, for [`guard`](Self::guard). Every transition writes it under
+    /// `inner`, before the hook hears of it, so it is never ahead of the state.
+    locked: AtomicBool,
+    /// Held by [`set_settings`](Self::set_settings) across `persist` and the apply.
+    settings_write: Mutex<()>,
 }
 
 struct Inner {
     settings: Settings,
     /// `Some` while locked.
     reason: Option<LockReason>,
-    /// When the current state began.
+    /// When the current state began, on the wall clock: what the webview shows.
     since_ms: u64,
-    last_activity_ms: u64,
+    /// The last activity (or unlock): the idle time runs from it.
+    last_activity: Stamp,
     /// The unlock prompt while it is open; a second unlock is `AuthBusy` meanwhile.
     prompt: Option<Prompt>,
 }
@@ -73,7 +99,7 @@ impl LockMachine {
         clock: Arc<dyn Clock>,
         hook: LockHook,
     ) -> Self {
-        let now = clock.now_ms();
+        let now = Stamp::now(&*clock);
         let reason = (in_effect(&settings, &auth.info()) && settings.lock_on_start)
             .then_some(LockReason::Startup);
         Self {
@@ -83,10 +109,12 @@ impl LockMachine {
             inner: Mutex::new(Inner {
                 settings,
                 reason,
-                since_ms: now,
-                last_activity_ms: now,
+                since_ms: now.wall_ms,
+                last_activity: now,
                 prompt: None,
             }),
+            locked: AtomicBool::new(reason.is_some()),
+            settings_write: Mutex::new(()),
         }
     }
 
@@ -95,10 +123,11 @@ impl LockMachine {
         state_of(&self.lock_inner(), &info)
     }
 
-    /// `Locked` for any command not in [`ALLOWED_WHILE_LOCKED`] while locked. Never waits
-    /// for an open prompt.
+    /// `Locked` for any command not in [`ALLOWED_WHILE_LOCKED`] while locked. It never
+    /// waits — not for an open prompt, a transition's hook or a settings write: every command
+    /// passes it on the main thread.
     pub fn guard(&self, command: &str) -> Result<(), DesktopError> {
-        if self.lock_inner().reason.is_some() && !ALLOWED_WHILE_LOCKED.contains(&command) {
+        if self.locked.load(Ordering::SeqCst) && !ALLOWED_WHILE_LOCKED.contains(&command) {
             return Err(DesktopError::Locked);
         }
         Ok(())
@@ -106,14 +135,15 @@ impl LockMachine {
 
     /// The owner did something: the idle time starts again.
     pub fn activity(&self) {
-        let now = self.clock.now_ms();
-        self.lock_inner().last_activity_ms = now;
+        let now = Stamp::now(&*self.clock);
+        self.lock_inner().last_activity = now;
     }
 
     /// Lock with [`LockReason::Idle`] once `auto_lock` minutes have passed since the last
-    /// activity (or unlock). Does nothing while locked, with the lock not in effect, or with
-    /// `auto_lock` set to never.
-    pub fn tick(&self, now_ms: u64) {
+    /// activity (or unlock), on either clock: a suspend counts, a wall clock stepped back does
+    /// not. Does nothing while locked, with the lock not in effect, or with `auto_lock` set to
+    /// never.
+    pub fn tick(&self) {
         let info = self.auth.info();
         let mut inner = self.lock_inner();
         if inner.reason.is_some() || !in_effect(&inner.settings, &info) {
@@ -122,8 +152,9 @@ impl LockMachine {
         let Some(minutes) = inner.settings.auto_lock.minutes() else {
             return;
         };
-        if now_ms.saturating_sub(inner.last_activity_ms) >= u64::from(minutes) * MINUTE_MS {
-            self.enter(&mut inner, &info, Some(LockReason::Idle), now_ms);
+        if inner.last_activity.elapsed_ms(&*self.clock) >= u64::from(minutes) * MINUTE_MS {
+            let now = self.clock.now_ms();
+            self.enter(&mut inner, &info, Some(LockReason::Idle), now);
         }
     }
 
@@ -193,9 +224,9 @@ impl LockMachine {
         match outcome {
             AuthOutcome::Verified if closed => Err(DesktopError::AuthCancelled),
             AuthOutcome::Verified => {
-                let now = self.clock.now_ms();
-                inner.last_activity_ms = now;
-                self.enter(&mut inner, &info, None, now);
+                let now = Stamp::now(&*self.clock);
+                inner.last_activity = now;
+                self.enter(&mut inner, &info, None, now.wall_ms);
                 Ok(())
             }
             AuthOutcome::Cancelled { .. } => Err(DesktopError::AuthCancelled),
@@ -210,30 +241,49 @@ impl LockMachine {
     /// Switching the lock on is refused with `AuthUnavailable` when nothing can verify the
     /// owner; keeping it on is not (the defaults have it on, and every other setting must
     /// stay changeable). Switching it off never unlocks. A new idle time applies from the
-    /// next tick. `persist` runs under the machine's lock, so concurrent changes reach the
-    /// file and the machine in the same order.
+    /// next tick.
+    ///
+    /// `persist` runs outside the machine's lock, so a slow disk holds up no command, lock or
+    /// tick; a lock of its own, held across `persist` and the apply, makes concurrent changes
+    /// reach the file and the machine in the same order. `persist` must not call back into
+    /// the machine.
     pub fn set_settings(
         &self,
         settings: Settings,
         persist: impl FnOnce(&Settings) -> Result<(), DesktopError>,
     ) -> Result<(), DesktopError> {
+        let _writing = self
+            .settings_write
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let info = self.auth.info();
-        let mut inner = self.lock_inner();
-        if settings.lock_enabled && !inner.settings.lock_enabled && !info.available {
+        // Only this function changes the settings, one call at a time: what is checked here
+        // is still what the change applies over once `persist` returns.
+        let switching_on = settings.lock_enabled && !self.lock_inner().settings.lock_enabled;
+        if switching_on && !info.available {
             return Err(DesktopError::AuthUnavailable {
                 reason: info.unavailable.unwrap_or(UnavailableReason::NoBackend),
             });
         }
         persist(&settings)?;
-        inner.settings = settings;
+        self.lock_inner().settings = settings;
         Ok(())
     }
 
-    /// Move to `reason` (`None` = unlocked) and tell the hook.
+    /// Move to `reason` (`None` = unlocked) and tell the hook; a panic in the hook is logged,
+    /// and the transition stands.
     fn enter(&self, inner: &mut Inner, info: &AuthInfo, reason: Option<LockReason>, now: u64) {
         inner.reason = reason;
         inner.since_ms = now;
-        (self.hook)(&state_of(inner, info));
+        self.locked.store(reason.is_some(), Ordering::SeqCst);
+        let state = state_of(inner, info);
+        if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| (self.hook)(&state))) {
+            tracing::error!(
+                locked = state.locked,
+                "the lock hook panicked: {}",
+                panic_message(&*payload)
+            );
+        }
     }
 
     fn lock_inner(&self) -> MutexGuard<'_, Inner> {
@@ -275,9 +325,11 @@ mod tests {
     use crate::auth::{AuthPurpose, Authenticator, FakeAuthenticator, NoAuthenticator};
     use crate::errors::DesktopError;
     use crate::ops::test_clock::ManualClock;
+    use crate::ops::test_trips;
 
     const T0: u64 = 1_700_000_000_000;
     const MIN: u64 = 60_000;
+    const DAY: u64 = 24 * 60 * MIN;
     /// What a test waits before it calls something stuck.
     const LONG: Duration = Duration::from_secs(10);
 
@@ -485,7 +537,8 @@ mod tests {
         assert_eq!(r.machine.state(), unlocked(T0, None));
         // Nothing locks it: there would be no way back.
         r.machine.lock(LockReason::Manual);
-        r.machine.tick(T0 + 1000 * MIN);
+        r.clock.set(T0 + 1000 * MIN);
+        r.machine.tick();
         assert_eq!(r.machine.state(), unlocked(T0, None));
         assert!(r.hooked.calls().is_empty());
     }
@@ -546,14 +599,17 @@ mod tests {
     #[test]
     fn it_locks_after_the_idle_time_without_activity() {
         let r = rig(unlocked_at_start(), fake());
-        r.machine.tick(T0 + 10 * MIN - 1);
+        r.clock.set(T0 + 10 * MIN - 1);
+        r.machine.tick();
         assert!(!r.machine.state().locked);
-        r.machine.tick(T0 + 10 * MIN);
+        r.clock.set(T0 + 10 * MIN);
+        r.machine.tick();
         let idle = locked(LockReason::Idle, T0 + 10 * MIN, Some(10));
         assert_eq!(r.machine.state(), idle);
         assert_eq!(r.hooked.calls(), vec![idle.clone()]);
         // While locked, ticks do nothing.
-        r.machine.tick(T0 + 100 * MIN);
+        r.clock.set(T0 + 100 * MIN);
+        r.machine.tick();
         assert_eq!(r.machine.state(), idle);
         assert_eq!(r.hooked.calls().len(), 1);
     }
@@ -563,10 +619,13 @@ mod tests {
         let r = rig(unlocked_at_start(), fake());
         r.clock.set(T0 + 9 * MIN);
         r.machine.activity();
-        r.machine.tick(T0 + 10 * MIN);
-        r.machine.tick(T0 + 19 * MIN - 1);
+        r.clock.set(T0 + 10 * MIN);
+        r.machine.tick();
+        r.clock.set(T0 + 19 * MIN - 1);
+        r.machine.tick();
         assert!(!r.machine.state().locked);
-        r.machine.tick(T0 + 19 * MIN);
+        r.clock.set(T0 + 19 * MIN);
+        r.machine.tick();
         assert_eq!(
             r.machine.state(),
             locked(LockReason::Idle, T0 + 19 * MIN, Some(10))
@@ -585,7 +644,8 @@ mod tests {
         };
         for settings in [never, off] {
             let r = rig(settings.clone(), fake());
-            r.machine.tick(T0 + 1000 * 24 * 60 * MIN);
+            r.clock.set(T0 + 1000 * 24 * 60 * MIN);
+            r.machine.tick();
             assert!(!r.machine.state().locked, "{settings:?}");
             assert_eq!(r.machine.state().auto_lock_minutes, None, "{settings:?}");
             assert!(r.hooked.calls().is_empty());
@@ -601,8 +661,36 @@ mod tests {
         };
         r.machine.set_settings(five, |_| Ok(())).unwrap();
         assert_eq!(r.machine.state().auto_lock_minutes, Some(5));
-        r.machine.tick(T0 + 5 * MIN);
+        r.clock.set(T0 + 5 * MIN);
+        r.machine.tick();
         assert_eq!(r.machine.state().reason, Some(LockReason::Idle));
+    }
+
+    #[test]
+    fn a_wall_clock_stepped_back_does_not_postpone_the_idle_lock() {
+        let r = rig(unlocked_at_start(), fake());
+        r.clock.advance(5 * MIN);
+        // A time sync, or the owner changing the date: the wall clock goes back a day.
+        r.clock.set_wall(T0 - DAY);
+        r.clock.advance(5 * MIN);
+        r.machine.tick();
+        assert_eq!(
+            r.machine.state(),
+            locked(LockReason::Idle, T0 - DAY + 5 * MIN, Some(10)),
+            "ten minutes passed, whatever the wall clock says"
+        );
+    }
+
+    #[test]
+    fn a_suspend_past_the_idle_time_locks_on_the_next_tick() {
+        let r = rig(unlocked_at_start(), fake());
+        // Asleep for 11 minutes: the monotonic clock stood still, the wall clock did not.
+        r.clock.set_wall(T0 + 11 * MIN);
+        r.machine.tick();
+        assert_eq!(
+            r.machine.state(),
+            locked(LockReason::Idle, T0 + 11 * MIN, Some(10))
+        );
     }
 
     #[test]
@@ -610,7 +698,8 @@ mod tests {
         let r = rig(Settings::default(), fake());
         r.clock.set(T0 + 30 * MIN);
         r.machine.unlock().unwrap();
-        r.machine.tick(T0 + 30 * MIN + 1);
+        r.clock.set(T0 + 30 * MIN + 1);
+        r.machine.tick();
         assert_eq!(r.machine.state(), unlocked(T0 + 30 * MIN, Some(10)));
     }
 
@@ -753,6 +842,40 @@ mod tests {
     }
 
     #[test]
+    fn a_yes_that_beats_the_closing_thread_does_not_unlock_either() {
+        let (prompt, ends) = HeldPrompt::new();
+        let r = rig(Settings::default(), prompt);
+        let first = unlock_in_background(&r.machine);
+        ends.opened.recv_timeout(LONG).expect("the prompt opened");
+        // A lock closes the prompt by tripping its token on a thread of its own. Holding that
+        // thread back makes the OS answer yes after `lock` returned and before the dialog
+        // closed — the window a scheduler opens only sometimes — so only the machine's own
+        // record that the prompt was closed can refuse the answer.
+        let ((), held) = {
+            let machine = r.machine.clone();
+            within("lock", move || {
+                test_trips::held(|| machine.lock(LockReason::OsSession))
+            })
+        };
+        assert_eq!(held.len(), 1, "the lock closes the prompt");
+        assert!(
+            ends.tripped.try_recv().is_err(),
+            "held back, the token has not tripped"
+        );
+        ends.answer.send(AuthOutcome::Verified).unwrap();
+        let result = first.recv_timeout(LONG).expect("the unlock returned");
+        assert!(
+            matches!(result, Err(DesktopError::AuthCancelled)),
+            "{result:?}"
+        );
+        assert_eq!(r.machine.state(), locked(LockReason::Startup, T0, Some(10)));
+        assert!(r.hooked.calls().is_empty());
+        for token in held {
+            token.cancel();
+        }
+    }
+
+    #[test]
     fn a_panicking_prompt_leaves_the_next_unlock_free_to_ask() {
         struct PanicsOnce(AtomicBool);
         impl Authenticator for PanicsOnce {
@@ -790,8 +913,10 @@ mod tests {
         r.clock.set(T0 + 2 * MIN);
         r.machine.unlock().unwrap();
         r.machine.unlock().unwrap();
-        r.machine.tick(T0 + 12 * MIN);
-        r.machine.tick(T0 + 13 * MIN);
+        r.clock.set(T0 + 12 * MIN);
+        r.machine.tick();
+        r.clock.set(T0 + 13 * MIN);
+        r.machine.tick();
         r.clock.set(T0 + 14 * MIN);
         r.machine.unlock().unwrap();
         assert_eq!(
@@ -803,6 +928,46 @@ mod tests {
                 unlocked(T0 + 14 * MIN, Some(10)),
             ]
         );
+    }
+
+    #[test]
+    fn a_panicking_hook_neither_undoes_the_transition_nor_stops_later_ticks() {
+        let clock = Arc::new(ManualClock::at(T0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let machine = {
+            let calls = calls.clone();
+            LockMachine::new(
+                unlocked_at_start(),
+                fake(),
+                clock.clone(),
+                Box::new(move |_| {
+                    if calls.fetch_add(1, SeqCst) == 0 {
+                        panic!("the hook broke");
+                    }
+                }),
+            )
+        };
+        // The idle ticker calls this: a panic out of it would end the ticker, and with it
+        // every later auto-lock.
+        clock.set(T0 + 10 * MIN);
+        machine.tick();
+        assert_eq!(
+            machine.state(),
+            locked(LockReason::Idle, T0 + 10 * MIN, Some(10))
+        );
+        assert!(matches!(
+            machine.guard("op_list"),
+            Err(DesktopError::Locked)
+        ));
+        clock.set(T0 + 11 * MIN);
+        machine.unlock().unwrap();
+        clock.set(T0 + 21 * MIN);
+        machine.tick();
+        assert_eq!(
+            machine.state(),
+            locked(LockReason::Idle, T0 + 21 * MIN, Some(10))
+        );
+        assert_eq!(calls.load(SeqCst), 3, "the hook heard every transition");
     }
 
     // 7. The guard.
@@ -839,6 +1004,42 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_guard_answers_while_a_transition_holds_the_machine() {
+        // The hook runs under the machine's lock; every command passes the guard, on the main
+        // thread, so the guard must never wait for that lock.
+        let (entered_tx, entered) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel::<()>();
+        let gate = Mutex::new((entered_tx, release_rx));
+        let machine = Arc::new(LockMachine::new(
+            unlocked_at_start(),
+            fake(),
+            Arc::new(ManualClock::at(T0)),
+            Box::new(move |_| {
+                let gate = gate.lock().unwrap();
+                let _ = gate.0.send(());
+                // Until the test releases it, or fails and drops the sender.
+                let _ = gate.1.recv();
+            }),
+        ));
+        let locking = {
+            let machine = machine.clone();
+            thread::spawn(move || machine.lock(LockReason::Manual))
+        };
+        entered.recv_timeout(LONG).expect("the hook ran");
+        let guard = {
+            let machine = machine.clone();
+            within("the guard", move || machine.guard("op_list"))
+        };
+        assert!(
+            matches!(guard, Err(DesktopError::Locked)),
+            "the state the hook is told of is the one the guard enforces: {guard:?}"
+        );
+        release.send(()).unwrap();
+        locking.join().unwrap();
+        assert!(machine.state().locked);
+    }
+
     // Settings.
 
     #[test]
@@ -854,7 +1055,8 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, DesktopError::SettingsIo(_)), "{err:?}");
         assert_eq!(r.machine.state().auto_lock_minutes, Some(10));
-        r.machine.tick(T0 + 10 * MIN);
+        r.clock.set(T0 + 10 * MIN);
+        r.machine.tick();
         assert!(r.machine.state().locked);
     }
 
@@ -874,6 +1076,108 @@ mod tests {
             .unwrap();
         assert_eq!(saved.into_inner().unwrap(), Some(never));
         assert_eq!(r.machine.state().auto_lock_minutes, None);
+    }
+
+    #[test]
+    fn a_slow_save_holds_up_no_command() {
+        let r = rig(unlocked_at_start(), fake());
+        let (saving_tx, saving) = mpsc::channel();
+        let (saved, saved_rx) = mpsc::channel::<()>();
+        let five = Settings {
+            auto_lock: AutoLock::Min5,
+            ..unlocked_at_start()
+        };
+        let setting = {
+            let machine = r.machine.clone();
+            thread::spawn(move || {
+                machine.set_settings(five, move |_| {
+                    let _ = saving_tx.send(());
+                    // Until the test lets the disk finish, or fails and drops the sender.
+                    let _ = saved_rx.recv();
+                    Ok(())
+                })
+            })
+        };
+        saving.recv_timeout(LONG).expect("the save started");
+        let (guard, state) = {
+            let machine = r.machine.clone();
+            within("commands during a save", move || {
+                let guard = machine.guard("op_list");
+                machine.activity();
+                machine.tick();
+                machine.lock(LockReason::Manual);
+                (guard, machine.state())
+            })
+        };
+        assert!(guard.is_ok(), "{guard:?}");
+        assert!(state.locked, "a lock does not wait for the disk");
+        assert_eq!(
+            state.auto_lock_minutes,
+            Some(10),
+            "a change applies once it is saved"
+        );
+        saved.send(()).unwrap();
+        setting.join().unwrap().unwrap();
+        assert_eq!(r.machine.state().auto_lock_minutes, Some(5));
+    }
+
+    #[test]
+    fn a_second_save_waits_until_the_first_is_saved_and_applied() {
+        let r = rig(unlocked_at_start(), fake());
+        let (saving_tx, saving) = mpsc::channel();
+        let (saved, saved_rx) = mpsc::channel::<()>();
+        let five = Settings {
+            auto_lock: AutoLock::Min5,
+            ..unlocked_at_start()
+        };
+        let never = Settings {
+            auto_lock: AutoLock::Never,
+            ..unlocked_at_start()
+        };
+        let first = {
+            let machine = r.machine.clone();
+            thread::spawn(move || {
+                machine.set_settings(five, move |_| {
+                    let _ = saving_tx.send(());
+                    let _ = saved_rx.recv();
+                    Ok(())
+                })
+            })
+        };
+        saving.recv_timeout(LONG).expect("the first save started");
+        let (seen_tx, seen) = mpsc::channel();
+        let second = {
+            let machine = r.machine.clone();
+            thread::spawn(move || {
+                let reader = machine.clone();
+                machine.set_settings(never, move |_| {
+                    let _ = seen_tx.send(reader.state().auto_lock_minutes);
+                    Ok(())
+                })
+            })
+        };
+        // The first is on the disk: the second must not reach its own save meanwhile, or
+        // the two could reach the file and the machine in different orders.
+        assert!(
+            matches!(
+                seen.recv_timeout(Duration::from_millis(20)),
+                Err(RecvTimeoutError::Timeout)
+            ),
+            "the second save started while the first was on the disk"
+        );
+        saved.send(()).unwrap();
+        assert_eq!(
+            seen.recv_timeout(LONG).expect("the second save ran"),
+            Some(5),
+            "the first change was applied before the second was saved"
+        );
+        first.join().unwrap().unwrap();
+        second.join().unwrap().unwrap();
+        assert_eq!(
+            r.machine.state().auto_lock_minutes,
+            None,
+            "the last one wins"
+        );
     }
 
     #[test]

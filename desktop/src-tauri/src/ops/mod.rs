@@ -12,6 +12,7 @@ pub mod replay;
 pub mod reporter;
 pub mod text;
 
+use std::any::Any;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::OnceLock;
 use std::thread;
@@ -29,8 +30,9 @@ pub trait Clock: Send + Sync {
     /// Milliseconds since the Unix epoch: what the webview shows, and what file names carry.
     /// It can step either way (a time sync, the owner changing the date).
     fn now_ms(&self) -> u64;
-    /// Milliseconds on a clock that never steps back, from an arbitrary start: what a
-    /// deadline is measured on.
+    /// Milliseconds on a clock that never steps back, from an arbitrary start. It may stand
+    /// still while the machine sleeps, so a deadline is measured on both clocks: see
+    /// [`elapsed_ms`].
     fn monotonic_ms(&self) -> u64;
 }
 
@@ -54,6 +56,52 @@ impl Clock for SystemClock {
 
 fn saturating_ms(ms: u128) -> u64 {
     u64::try_from(ms).unwrap_or(u64::MAX)
+}
+
+/// What a caught panic said, for an error message or a log line.
+pub(crate) fn panic_message(payload: &(dyn Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("no message")
+}
+
+/// One moment, read on both of a [`Clock`]'s clocks, to measure [`elapsed_ms`] from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stamp {
+    pub wall_ms: u64,
+    pub monotonic_ms: u64,
+}
+
+impl Stamp {
+    pub fn now(clock: &dyn Clock) -> Self {
+        Self {
+            wall_ms: clock.now_ms(),
+            monotonic_ms: clock.monotonic_ms(),
+        }
+    }
+
+    /// [`elapsed_ms`] since this moment.
+    pub fn elapsed_ms(&self, clock: &dyn Clock) -> u64 {
+        elapsed_ms(self.wall_ms, self.monotonic_ms, clock)
+    }
+}
+
+/// How much time has passed since the moment `clock` read as `start_wall` (wall) and
+/// `start_mono` (monotonic): the larger of the monotonic and the forward wall elapsed time.
+/// Every expiry and idle time in the shell is measured with it, and with nothing else.
+///
+/// Neither clock is enough alone. The monotonic one misses a suspend: `Instant` does not
+/// advance while the machine sleeps on Linux and macOS, so a plan shown before an overnight
+/// lid-close would still be fresh on wake. The wall one can be stepped back (a time sync, the
+/// owner changing the date) to keep a plan alive or an idle app unlocked. So a wall step back
+/// counts as nothing elapsed, never as negative, and a wall step forward counts in full: a
+/// deadline can come early, never late.
+pub fn elapsed_ms(start_wall: u64, start_mono: u64, clock: &dyn Clock) -> u64 {
+    let monotonic = clock.monotonic_ms().saturating_sub(start_mono);
+    let wall = clock.now_ms().saturating_sub(start_wall);
+    monotonic.max(wall)
 }
 
 /// Trip `token` on a short-lived thread named `name`. `CancellationToken::cancel` runs every
@@ -177,7 +225,66 @@ mod tests {
     use apprafter_core::CancellationToken;
 
     use super::test_clock::ManualClock;
-    use super::{test_trips, trip, Clock, SystemClock};
+    use super::{elapsed_ms, test_trips, trip, Clock, Stamp, SystemClock};
+
+    const T0: u64 = 1_700_000_000_000;
+    const DAY: u64 = 24 * 60 * 60 * 1000;
+
+    #[test]
+    fn time_that_passes_on_both_clocks_is_elapsed_once() {
+        let clock = ManualClock::at(T0);
+        let start = Stamp::now(&clock);
+        assert_eq!(start.elapsed_ms(&clock), 0);
+        clock.advance(250);
+        assert_eq!(start.elapsed_ms(&clock), 250);
+        assert_eq!(
+            elapsed_ms(start.wall_ms, start.monotonic_ms, &clock),
+            250,
+            "the stamp and the function are one rule"
+        );
+    }
+
+    #[test]
+    fn a_suspend_counts_the_wall_time_the_monotonic_clock_missed() {
+        // From inside, a suspend is the wall clock jumping while the monotonic one stood still.
+        let clock = ManualClock::at(T0);
+        let start = Stamp::now(&clock);
+        clock.advance(10);
+        clock.set_wall(T0 + DAY);
+        assert_eq!(start.elapsed_ms(&clock), DAY);
+    }
+
+    #[test]
+    fn a_wall_step_back_counts_as_nothing_and_never_as_negative() {
+        let clock = ManualClock::at(T0);
+        let start = Stamp::now(&clock);
+        clock.set_wall(T0 - DAY);
+        assert_eq!(start.elapsed_ms(&clock), 0, "no time passed");
+        clock.advance(300);
+        assert_eq!(
+            start.elapsed_ms(&clock),
+            300,
+            "the monotonic time still counts in full"
+        );
+        // Below the epoch is no special case either.
+        let clock = ManualClock::at(5);
+        let start = Stamp::now(&clock);
+        clock.set_wall(0);
+        assert_eq!(start.elapsed_ms(&clock), 0);
+    }
+
+    #[test]
+    fn the_larger_of_the_two_is_what_passed() {
+        let clock = ManualClock::at(T0);
+        let start = Stamp::now(&clock);
+        clock.advance(1_000);
+        // A time sync pulls the wall clock back a little: the monotonic reading wins.
+        clock.set_wall(T0 + 400);
+        assert_eq!(start.elapsed_ms(&clock), 1_000);
+        // And pushes it ahead: the wall reading wins.
+        clock.set_wall(T0 + 5_000);
+        assert_eq!(start.elapsed_ms(&clock), 5_000);
+    }
 
     #[test]
     fn the_system_clock_reads_the_epoch_and_never_steps_back() {
