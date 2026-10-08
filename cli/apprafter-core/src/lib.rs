@@ -24,7 +24,7 @@ pub mod op;
 pub mod report;
 pub mod target_ref;
 
-pub use cancel::Cancelled;
+pub use cancel::{CancellationToken, Cancelled, Registration};
 pub use context::{CliOverrides, Context, SecretString};
 pub use env::{EnvSource, MapEnv};
 pub use error::{CoreError, CoreResult, UiError};
