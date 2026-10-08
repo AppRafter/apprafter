@@ -15,6 +15,8 @@
     "core:event:allow-listen",
     // Drop that subscription when the component that made it unmounts.
     "core:event:allow-unlisten",
+    // The native title bar follows the app theme, the lock screen's included; changes nothing else.
+    "core:window:allow-set-theme",
     // Versions, OS, account, auth support: the About line, title bar and lock screen.
     "allow-app-info",
     // The preferences, read even while locked so the lock screen has its theme.

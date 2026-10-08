@@ -86,9 +86,10 @@ fn every_command_is_registered_and_allowed_and_a_quit_starts_nothing_new() {
 /// Plugin commands never reach the app's invoke handler, so the lock gate never sees them:
 /// the capability is all that stands between a page and a plugin command. Pinned here for
 /// three a page could misuse — forging an event (`lock-changed` among them), closing the
-/// window past the quit, reading the app's details — each refused by the ACL.
+/// window past the quit, reading the app's details — each refused by the ACL, while the three
+/// granted ones (`listen`, `unlisten`, the window's `set_theme`) pass it.
 #[test]
-fn plugin_commands_beyond_listen_and_unlisten_are_refused_by_the_acl() {
+fn plugin_commands_beyond_the_granted_three_are_refused_by_the_acl() {
     let rig = rig(lock_off());
     for cmd in [
         "plugin:event|emit",
@@ -115,14 +116,20 @@ fn plugin_commands_beyond_listen_and_unlisten_are_refused_by_the_acl() {
         }
         other => panic!("listen with no arguments: {other:?}"),
     }
+    // The other control: the native window follows the app theme, so `set_theme` passes the
+    // ACL and runs (the mock window takes any theme).
+    assert_eq!(
+        invoke(&rig, "plugin:window|set_theme", json!({ "value": "dark" })),
+        Ok(Value::Null)
+    );
 }
 
-/// The capability, read as Tauri reads it: exactly `listen` and `unlisten` from the core, and
-/// the generated `allow-<command>` of every app command — nothing more, nothing less, once
-/// each. A permission added for a later step must be added here too, with its reason in the
-/// file.
+/// The capability, read as Tauri reads it: exactly `listen` and `unlisten` from the core,
+/// `set_theme` for the window, and the generated `allow-<command>` of every app command —
+/// nothing more, nothing less, once each. A permission added for a later step must be added
+/// here too, with its reason in the file.
 #[test]
-fn the_capability_grants_listen_unlisten_and_every_app_command_only() {
+fn the_capability_grants_the_pinned_core_permissions_and_every_app_command_only() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("capabilities/main.json5");
     let text = fs::read_to_string(&path).unwrap();
     let capability: Value = json5::from_str(&text).unwrap();
@@ -137,9 +144,13 @@ fn the_capability_grants_listen_unlisten_and_every_app_command_only() {
         .collect();
     let set: BTreeSet<String> = granted.iter().map(|p| p.to_string()).collect();
     assert_eq!(set.len(), granted.len(), "a permission twice: {granted:?}");
-    let mut expected: BTreeSet<String> = ["core:event:allow-listen", "core:event:allow-unlisten"]
-        .map(String::from)
-        .into();
+    let mut expected: BTreeSet<String> = [
+        "core:event:allow-listen",
+        "core:event:allow-unlisten",
+        "core:window:allow-set-theme",
+    ]
+    .map(String::from)
+    .into();
     expected.extend(
         COMMANDS
             .iter()
