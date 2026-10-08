@@ -164,6 +164,10 @@ fn run_add(mut args: AddArgs) -> Result<()> {
         verify_ssh_key_readable(path)?;
     }
 
+    // Held from the existence check through `ensure_active_target`, so two
+    // concurrent adds can neither both create the same target nor both see
+    // a fresh store and race for the active pointer.
+    let _store_lock = cli_core::StoreLock::exclusive(&paths)?;
     let existing = load_target(&paths, &name);
     match existing {
         Ok(_) if !args.force => {
@@ -351,6 +355,7 @@ pub(crate) fn map_wizard_prompt_error(err: inquire::InquireError) -> CliError {
 }
 
 fn run_renew(paths: &TargetStorePaths, args: AddArgs, name: &str) -> Result<()> {
+    let _store_lock = store_lock_if_present(paths)?;
     let mut existing = match load_target(paths, name) {
         Ok(t) => t,
         Err(CliError::TargetNotFound { .. }) => {
@@ -575,6 +580,18 @@ fn verify_ssh_key_readable(path: &Path) -> Result<()> {
         CliError::Other(format!("SSH key `{}` is not readable: {e}", path.display()))
     })?;
     Ok(())
+}
+
+/// The store lock, or none when there is no store yet: a command that
+/// will fail on a missing store must not create one by locking it.
+pub(crate) fn store_lock_if_present(
+    paths: &TargetStorePaths,
+) -> Result<Option<cli_core::StoreLock>> {
+    if paths.root().exists() {
+        cli_core::StoreLock::exclusive(paths).map(Some)
+    } else {
+        Ok(None)
+    }
 }
 
 /// Promote the supplied target to active when the store has no
@@ -1344,6 +1361,7 @@ pub(crate) fn list_summary_line(count: usize, active: &str) -> String {
 fn run_use(name: &str) -> Result<()> {
     info!(target = %name, "target use invoked");
     let paths = TargetStorePaths::for_root(default_config_root()?);
+    let _store_lock = store_lock_if_present(&paths)?;
     // `load_target` returns TargetNotFound with an `available`
     // hint when the name doesn't exist — we let that surface
     // verbatim.
@@ -1463,6 +1481,7 @@ fn run_rename(from: &str, to: &str) -> Result<()> {
     info!(from = %from, to = %to, "target rename invoked");
     check_rename(from, to)?;
     let paths = TargetStorePaths::for_root(default_config_root()?);
+    let _store_lock = store_lock_if_present(&paths)?;
 
     rename_target(&paths, from, to)?;
 
@@ -1504,6 +1523,10 @@ fn run_remove(name: &str, yes: bool) -> Result<()> {
         }
     }
 
+    // Taken after the confirmation, never across it: a prompt can wait on
+    // a human indefinitely. `remove_target` re-checks that the target
+    // still exists under the lock.
+    let _store_lock = store_lock_if_present(&paths)?;
     remove_target(&paths, name)?;
 
     // If the removed target was active, repoint the active marker

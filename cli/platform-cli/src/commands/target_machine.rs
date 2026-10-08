@@ -301,6 +301,10 @@ pub fn run_machine(args: MachineArgs) -> Result<()> {
     // to get the state, but we also need the raw target record to patch it.
     let resolved = resolve_state_paths(args.target.as_deref())?;
     let store = TargetStorePaths::for_root(default_config_root()?);
+    // Held from the load through `machine_core`'s save: the whole config is
+    // written back, so an edit made in between would be lost. The
+    // interactive picker runs under it too.
+    let _store_lock = crate::commands::target::store_lock_if_present(&store)?;
     let mut target = load_target(&store, &resolved.target_name)?;
     let state = cli_state::State::load_or_default(&resolved.paths)?;
     let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();

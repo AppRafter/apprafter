@@ -573,6 +573,7 @@ fn run_backfill_and_guard(
     let region_candidate = region_to_backfill(target_region_at_start, live_region_opt.as_deref());
     let need_region_backfill = region_candidate.is_some();
     if need_type_backfill || need_region_backfill {
+        let _store_lock = best_effort_store_lock(target_store);
         match load_target(target_store, target_name) {
             Ok(mut target) => {
                 let mut changed = false;
@@ -688,6 +689,7 @@ fn adopt_provisioned_machine(
         return; // the API reported neither field; leave the target as it is
     }
 
+    let _store_lock = best_effort_store_lock(target_store);
     let mut target = match load_target(target_store, target_name) {
         Ok(t) => t,
         Err(e) => {
@@ -729,6 +731,16 @@ fn adopt_provisioned_machine(
             eprintln!("warning: could not persist the provisioned machine to target config: {e}");
         }
     }
+}
+
+/// The store lock around a backfill's load → save, best-effort like the
+/// backfill: when it cannot be taken (a read-only config dir, a filesystem
+/// without locks) the backfill runs unlocked, as it always has, and a save
+/// that then fails still warns. Never creates a missing store.
+fn best_effort_store_lock(target_store: &TargetStorePaths) -> Option<cli_core::StoreLock> {
+    crate::commands::target::store_lock_if_present(target_store)
+        .ok()
+        .flatten()
 }
 
 /// Pure helper: returns the region that should be written back to

@@ -11,6 +11,7 @@
 //!
 //! ```text
 //! $XDG_CONFIG_HOME/apprafter/          # resolved via dirs::config_dir
+//! ├── .lock                            # StoreLock sentinel, always empty
 //! ├── config.yaml                      # GlobalConfig (active_target + version)
 //! ├── targets/
 //! │   ├── default/
@@ -56,6 +57,7 @@ const STATE_DIR_NAME: &str = "state";
 const TARGET_CONFIG_FILE: &str = "config.yaml";
 const TARGET_CREDENTIALS_FILE: &str = "credentials.yaml";
 const AUTH_KEEP_FILE: &str = ".keep";
+const LOCK_FILE: &str = ".lock";
 
 /// Env-var that overrides `default_config_root()`. Primary use is
 /// integration tests pointing the store at a `tempfile::TempDir`
@@ -200,6 +202,42 @@ impl TargetStorePaths {
     /// the existing per-CWD `.apprafter/state.json` flow over here.
     pub fn state_dir(&self, name: &str) -> PathBuf {
         self.root.join(STATE_DIR_NAME).join(name)
+    }
+
+    /// The sentinel [`StoreLock`] locks. A dot-file at the root, so it is
+    /// neither a target nor a file anything reads.
+    fn lock_file(&self) -> PathBuf {
+        self.root.join(LOCK_FILE)
+    }
+}
+
+/// An advisory, exclusive lock over the whole target store, held for the
+/// life of the value. Take it around every read-modify-write of the store
+/// (load → change → save), so the CLI and AppRafter Desktop editing the
+/// same store never lose each other's update (ADR 0067).
+///
+/// It locks a sentinel, `<root>/.lock`, never a data file: data files are
+/// replaced by rename (`atomic_write`), so a lock on one would guard an
+/// inode that is about to disappear, and on Windows byte-range locks are
+/// mandatory, so locking a data file would make a plain read fail.
+#[must_use = "the store is locked only while this value is alive"]
+pub struct StoreLock {
+    _file: fs::File,
+}
+
+impl StoreLock {
+    /// Block until the store is exclusively locked. Creates the root and
+    /// the sentinel if missing.
+    pub fn exclusive(paths: &TargetStorePaths) -> Result<StoreLock> {
+        fs::create_dir_all(paths.root())?;
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(paths.lock_file())?;
+        file.lock()?;
+        Ok(StoreLock { _file: file })
     }
 }
 
@@ -825,6 +863,41 @@ mod tests {
             cfg_mode, 0o644,
             "config.yaml must be 0644 (group/world readable), got {cfg_mode:o}"
         );
+    }
+
+    #[test]
+    fn the_store_lock_is_exclusive_across_handles() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = TargetStorePaths::for_root(dir.path().to_path_buf());
+        let held = StoreLock::exclusive(&paths).unwrap();
+        let other = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(paths.root().join(".lock"))
+            .unwrap();
+        assert!(matches!(
+            other.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        drop(held);
+        other.try_lock().expect("free once the holder drops");
+    }
+
+    #[test]
+    fn the_store_lock_creates_the_root_and_its_sentinel() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("fresh");
+        let paths = TargetStorePaths::for_root(root.clone());
+        let _g = StoreLock::exclusive(&paths).unwrap();
+        assert!(root.join(".lock").is_file());
+    }
+
+    #[test]
+    fn the_sentinel_is_not_a_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = TargetStorePaths::for_root(dir.path().to_path_buf());
+        let _g = StoreLock::exclusive(&paths).unwrap();
+        assert!(list_target_names(&paths).unwrap().is_empty());
     }
 
     #[test]
