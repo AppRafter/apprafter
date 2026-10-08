@@ -8,7 +8,9 @@
 //!
 //! [`CoreError`] wraps `cli_core::CliError` (left unchanged: it is also the
 //! error type of the backup engine and reaches the in-cluster runner) and
-//! adds the variants the core itself raises. Messages carry no client
+//! adds the variants the core itself raises. A code has one shape: the
+//! `CliError` variants the core also raises (`TargetNotFound`) are mapped
+//! onto the core's own on the way in. Messages carry no client
 //! wording ("pass `--yes`", "run `apprafter …`"): the CLI adds those hints
 //! when it renders, the desktop turns codes into actions.
 
@@ -45,10 +47,33 @@ pub enum CoreError {
     #[diagnostic(code(apprafter::op::cancelled))]
     Cancelled,
 
-    /// An error from the CLI's shared crates, passed through unchanged.
+    /// An error from the CLI's shared crates, passed through unchanged —
+    /// except `TargetNotFound`, which [`From`] maps onto the core's own.
     #[error(transparent)]
     #[diagnostic(transparent)]
-    Cli(#[from] cli_core::CliError),
+    Cli(cli_core::CliError),
+}
+
+/// One shape per error code: `apprafter::target::not_found` always arrives
+/// as [`CoreError::TargetNotFound`] with `available` as a list, never as a
+/// wrapped `CliError::TargetNotFound` whose `available` is one joined
+/// string. Splitting that string on `", "` is exact: the CLI only creates
+/// target names in `[A-Za-z0-9-]+`, and an empty string means an empty
+/// store. Every other `CliError` is wrapped unchanged.
+impl From<cli_core::CliError> for CoreError {
+    fn from(e: cli_core::CliError) -> Self {
+        match e {
+            cli_core::CliError::TargetNotFound { name, available } => CoreError::TargetNotFound {
+                name,
+                available: available
+                    .split(", ")
+                    .filter(|n| !n.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+            },
+            other => CoreError::Cli(other),
+        }
+    }
 }
 
 impl From<Cancelled> for CoreError {
@@ -168,6 +193,86 @@ mod tests {
             ui.help.is_some(),
             "the typed CliError help survives the wrap"
         );
+    }
+
+    #[test]
+    fn a_cli_target_not_found_takes_the_core_shape_with_a_list() {
+        let e = CoreError::from(cli_core::CliError::TargetNotFound {
+            name: "ghost".into(),
+            available: "dev, work".into(),
+        });
+        match &e {
+            CoreError::TargetNotFound { name, available } => {
+                assert_eq!(name, "ghost");
+                assert_eq!(available, &vec!["dev".to_string(), "work".to_string()]);
+            }
+            other => panic!("expected the core's TargetNotFound, got {other:?}"),
+        }
+        assert_eq!(
+            e.to_string(),
+            "target `ghost` not found (available: dev, work)"
+        );
+        let ui = UiError::from(&e);
+        assert_eq!(ui.code.as_deref(), Some("apprafter::target::not_found"));
+        assert_eq!(ui.fields["available"], serde_json::json!(["dev", "work"]));
+    }
+
+    #[test]
+    fn a_cli_target_not_found_on_an_empty_store_has_an_empty_list() {
+        let e = CoreError::from(cli_core::CliError::TargetNotFound {
+            name: "x".into(),
+            available: String::new(),
+        });
+        assert!(matches!(
+            &e,
+            CoreError::TargetNotFound { available, .. } if available.is_empty()
+        ));
+        assert_eq!(UiError::from(&e).fields["available"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn every_other_cli_error_is_wrapped() {
+        let e = CoreError::from(cli_core::CliError::BackupJobActive {
+            job: "nightly-1".into(),
+        });
+        assert!(matches!(e, CoreError::Cli(_)), "{e:?}");
+    }
+
+    #[test]
+    fn an_io_error_carries_its_os_message_as_the_only_cause() {
+        let io = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied: /x");
+        let ui = UiError::from(&CoreError::from(cli_core::CliError::Io(io)));
+        assert_eq!(ui.code.as_deref(), Some("apprafter::io::error"));
+        assert_eq!(ui.message, "io error: denied: /x");
+        assert_eq!(ui.causes, vec!["denied: /x".to_string()]);
+    }
+
+    #[test]
+    fn a_rejected_token_carries_the_provider_error_once() {
+        let provider_error = cli_core::CliError::Hetzner {
+            endpoint: "GET /v1/locations".into(),
+            status: 401,
+            code: "unauthorized".into(),
+            message: "invalid token".into(),
+        };
+        let provider_text = provider_error.to_string();
+        let ui = UiError::from(&CoreError::from(
+            cli_core::CliError::ProviderTokenRejected {
+                provider: "hetzner-cloud".into(),
+                cause: Box::new(provider_error),
+            },
+        ));
+        assert_eq!(
+            ui.code.as_deref(),
+            Some("apprafter::target::token_rejected")
+        );
+        assert_eq!(
+            ui.message,
+            "provider `hetzner-cloud` rejected the supplied token"
+        );
+        // Reached through both `source()` and `diagnostic_source()`, listed
+        // once; the message itself is not repeated as a cause.
+        assert_eq!(ui.causes, vec![provider_text]);
     }
 
     #[test]
