@@ -53,9 +53,13 @@ pub struct CliOverrides {
 
 /// What the desktop allows itself to read from its environment (ADR 0067 §2).
 ///
-/// A release build reads `APPRAFTER_CONFIG_DIR` and nothing else. A test build
-/// (walks and CI, cargo feature `test-build` in desktop/) may also point the
-/// Hetzner API at a loopback mock through `APPRAFTER_HCLOUD_BASE_URL`.
+/// Through its [`EnvSource`] a release build reads only `APPRAFTER_CONFIG_DIR`;
+/// a test build (walks and CI, cargo feature `test-build` in desktop/) also
+/// reads `APPRAFTER_HCLOUD_BASE_URL`, to point the Hetzner API at a loopback
+/// mock. When `APPRAFTER_CONFIG_DIR` is unset, the default store root comes
+/// from the platform config directory (HOME / XDG_CONFIG_HOME on Unix, via
+/// `dirs`), exactly as for the CLI — that is what keeps both clients on the
+/// same store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DesktopPolicy {
     pub loopback_api_base: bool,
@@ -70,26 +74,40 @@ impl DesktopPolicy {
     };
 }
 
-/// `http://` to a loopback host and nothing else: no TLS (a mock), no
-/// userinfo, no host that merely starts with a loopback name. The scheme is
-/// matched case-sensitively on purpose: the value is ours to write.
+/// What [`is_loopback_http`] accepts, in words, for the refusal message.
+const LOOPBACK_HTTP_FORMS: &str =
+    "a test build accepts only http://127.0.0.1[:port] or http://[::1][:port], \
+     optionally followed by a /path";
+
+/// `http://127.0.0.1` or `http://[::1]`, then nothing or `:` and a port of
+/// one to five ASCII digits in 1..=65535, then nothing or a `/` path. No TLS
+/// (a mock), no userinfo, no `?` or `#` straight after the authority, and
+/// no `localhost`: a name goes through getaddrinfo, which is not bound to
+/// answer with a loopback address (a resolver that misses it in /etc/hosts
+/// may try the search domains). The walks' mockito server binds 127.0.0.1.
+/// The scheme is matched case-sensitively on purpose: the value is ours to
+/// write.
 fn is_loopback_http(url: &str) -> bool {
     let Some(rest) = url.strip_prefix("http://") else {
         return false;
     };
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    if authority.contains('@') {
+    let Some(tail) = rest
+        .strip_prefix("127.0.0.1")
+        .or_else(|| rest.strip_prefix("[::1]"))
+    else {
         return false;
-    }
-    let host = if let Some(v6) = authority.strip_prefix('[') {
-        match v6.split_once(']') {
-            Some((h, tail)) if tail.is_empty() || tail.starts_with(':') => h,
-            _ => return false,
-        }
-    } else {
-        authority.split(':').next().unwrap_or("")
     };
-    matches!(host, "127.0.0.1" | "localhost" | "::1")
+    let port = tail.find('/').map_or(tail, |path| &tail[..path]);
+    port.is_empty() || port.strip_prefix(':').is_some_and(is_port)
+}
+
+/// One to five ASCII digits naming a port in 1..=65535.
+fn is_port(digits: &str) -> bool {
+    (1..=5).contains(&digits.len())
+        && digits.bytes().all(|b| b.is_ascii_digit())
+        && digits
+            .parse::<u32>()
+            .is_ok_and(|p| (1..=65535).contains(&p))
 }
 
 /// Everything a core operation may read besides its own arguments.
@@ -124,30 +142,38 @@ impl Context {
         })
     }
 
-    /// The desktop's context, read from an allow-list of its environment:
-    /// `APPRAFTER_CONFIG_DIR` (resolved exactly as the CLI resolves it, so both
-    /// clients open the same target store), and — under
-    /// [`DesktopPolicy::TEST_BUILD`] only — a loopback `APPRAFTER_HCLOUD_BASE_URL`.
-    /// Every CLI override (`HCLOUD_TOKEN`, `APPRAFTER_AGE_KEY`,
-    /// `APPRAFTER_SSH_*`, `APPRAFTER_SERVER_TYPE`) is ignored: a desktop started
-    /// from a terminal inherits them, and every tab would then act on that one
-    /// provider project.
+    /// The desktop's context, read from an allow-list of its environment.
+    /// Through `env` it reads only `APPRAFTER_CONFIG_DIR` and, under
+    /// [`DesktopPolicy::TEST_BUILD`] only, `APPRAFTER_HCLOUD_BASE_URL`, which
+    /// must then be a loopback `http://` URL. The store root is resolved
+    /// exactly as the CLI resolves it — `APPRAFTER_CONFIG_DIR`, else the
+    /// platform config directory (HOME / XDG_CONFIG_HOME on Unix, via `dirs`) +
+    /// `apprafter` — so both clients open the same target store. A release
+    /// build never looks at `APPRAFTER_HCLOUD_BASE_URL`, so one exported for
+    /// the CLI in the shell it starts from is no error. Every CLI override
+    /// (`HCLOUD_TOKEN`, `APPRAFTER_AGE_KEY`, `APPRAFTER_SSH_*`,
+    /// `APPRAFTER_SERVER_TYPE`) is ignored: a desktop started from a terminal
+    /// inherits them, and every tab would then act on that one provider
+    /// project.
     pub fn from_desktop_env(env: &dyn EnvSource, policy: DesktopPolicy) -> CoreResult<Self> {
         let config_root =
             cli_core::target::config_root_from_override(env.var(cli_core::CONFIG_DIR_ENV))?;
-        let hcloud_base_url = match env.var(HCLOUD_BASE_URL_ENV) {
-            Some(url) if policy.loopback_api_base => {
-                if !is_loopback_http(&url) {
-                    return Err(CoreError::UnsafeOverride {
-                        var: HCLOUD_BASE_URL_ENV,
-                        reason: format!(
-                            "a test build accepts only a loopback http:// URL, got {url:?}"
-                        ),
-                    });
-                }
-                url
+        let inherited_base = if policy.loopback_api_base {
+            env.var(HCLOUD_BASE_URL_ENV)
+        } else {
+            None
+        };
+        let hcloud_base_url = match inherited_base {
+            // The refusal names what is accepted, never the value: it may
+            // carry userinfo, and the message reaches the UI.
+            Some(url) if !is_loopback_http(&url) => {
+                return Err(CoreError::UnsafeOverride {
+                    var: HCLOUD_BASE_URL_ENV,
+                    reason: LOOPBACK_HTTP_FORMS.to_string(),
+                });
             }
-            _ => cli_providers::hetzner_cloud::DEFAULT_BASE_URL.to_string(),
+            Some(url) => url,
+            None => cli_providers::hetzner_cloud::DEFAULT_BASE_URL.to_string(),
         };
         Ok(Context {
             config_root,
@@ -188,8 +214,11 @@ impl Context {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use super::*;
     use crate::env::MapEnv;
+    use crate::error::UiError;
 
     #[test]
     fn cli_env_reads_store_root_api_base_and_token() {
@@ -269,13 +298,55 @@ mod tests {
         assert_eq!(desk.config_root(), cli.config_root());
     }
 
+    /// A developer's shell may export the variable for the CLI; a release
+    /// desktop started from that shell must still start, on the real API.
+    #[test]
+    fn a_release_build_ignores_an_inherited_non_loopback_api_base() {
+        let env = MapEnv::new().with("APPRAFTER_HCLOUD_BASE_URL", "https://evil.example");
+        let ctx = Context::from_desktop_env(&env, DesktopPolicy::RELEASE).unwrap();
+        assert_eq!(
+            ctx.hcloud_base_url(),
+            cli_providers::hetzner_cloud::DEFAULT_BASE_URL
+        );
+    }
+
+    /// An [`EnvSource`] that records every key read through it.
+    struct Recording {
+        env: MapEnv,
+        keys: RefCell<Vec<String>>,
+    }
+
+    impl EnvSource for Recording {
+        fn var(&self, key: &str) -> Option<String> {
+            self.keys.borrow_mut().push(key.to_string());
+            self.env.var(key)
+        }
+    }
+
+    #[test]
+    fn the_desktop_reads_only_its_allow_list() {
+        for (policy, allowed) in [
+            (DesktopPolicy::RELEASE, vec!["APPRAFTER_CONFIG_DIR"]),
+            (
+                DesktopPolicy::TEST_BUILD,
+                vec!["APPRAFTER_CONFIG_DIR", "APPRAFTER_HCLOUD_BASE_URL"],
+            ),
+        ] {
+            let env = Recording {
+                env: ambient_cli_overrides(),
+                keys: RefCell::new(Vec::new()),
+            };
+            Context::from_desktop_env(&env, policy).unwrap();
+            let mut read = env.keys.into_inner();
+            read.sort();
+            read.dedup();
+            assert_eq!(read, allowed, "{policy:?}");
+        }
+    }
+
     #[test]
     fn a_test_build_honours_a_loopback_api_base_only() {
-        for ok in [
-            "http://127.0.0.1:8080",
-            "http://localhost:9",
-            "http://[::1]:1/v1",
-        ] {
+        for ok in ["http://127.0.0.1:8080", "http://[::1]:1/v1"] {
             let env = MapEnv::new().with("APPRAFTER_HCLOUD_BASE_URL", ok);
             let ctx = Context::from_desktop_env(&env, DesktopPolicy::TEST_BUILD).unwrap();
             assert_eq!(ctx.hcloud_base_url(), ok);
@@ -284,6 +355,7 @@ mod tests {
             "https://127.0.0.1:8080",
             "http://api.hetzner.cloud",
             "http://127.0.0.1.evil.example",
+            "http://localhost:9",
             "http://localhost.evil.example:80",
             "http://user@127.0.0.1",
             "",
@@ -310,15 +382,70 @@ mod tests {
     }
 
     #[test]
-    fn loopback_http_is_exactly_a_loopback_host_over_plain_http() {
+    fn a_refused_api_base_never_shows_its_value() {
+        let env = MapEnv::new().with(
+            "APPRAFTER_HCLOUD_BASE_URL",
+            "http://user:secret@127.0.0.1:8080",
+        );
+        let err = Context::from_desktop_env(&env, DesktopPolicy::TEST_BUILD).unwrap_err();
+        let ui = UiError::from(&err);
+        for shown in [err.to_string(), serde_json::to_string(&ui).unwrap()] {
+            assert!(
+                !shown.contains("secret") && !shown.contains("user:"),
+                "the refused value leaked: {shown}"
+            );
+        }
+        assert!(
+            ui.message.contains("http://127.0.0.1[:port]"),
+            "the message says what is accepted: {}",
+            ui.message
+        );
+    }
+
+    /// Only the IP literals: `localhost` resolves through getaddrinfo, and a
+    /// resolver that misses it in /etc/hosts may try the search domains.
+    #[test]
+    fn loopback_http_is_a_loopback_ip_literal_over_plain_http() {
         for ok in [
             "http://127.0.0.1",
+            "http://127.0.0.1:8080",
+            "http://127.0.0.1:8080/v1",
             "http://[::1]",
-            "http://localhost/path?q",
+            "http://[::1]:1/v1",
         ] {
             assert!(is_loopback_http(ok), "{ok:?} is a loopback http URL");
         }
-        for bad in ["http://[::1]x", "HTTP://127.0.0.1"] {
+        for bad in [
+            "http://localhost",
+            "http://localhost:9",
+            "http://localhost/path?q",
+            "http://[::1]x",
+            "HTTP://127.0.0.1",
+        ] {
+            assert!(!is_loopback_http(bad), "{bad:?} must be refused");
+        }
+    }
+
+    /// After the host: nothing, or `:` and a port of one to five digits in
+    /// 1..=65535; then nothing, or a path.
+    #[test]
+    fn loopback_http_takes_only_a_port_and_a_path_after_the_host() {
+        for ok in ["http://127.0.0.1:1", "http://127.0.0.1:65535/"] {
+            assert!(is_loopback_http(ok), "{ok:?} is a loopback http URL");
+        }
+        for bad in [
+            "http://127.0.0.1:abc",
+            "http://127.0.0.1:99999",
+            "http://127.0.0.1:65536",
+            "http://127.0.0.1:0",
+            "http://127.0.0.1:",
+            "http://127.0.0.1:+80",
+            "http://127.0.0.1:80 .evil",
+            "http://[::1]:80]",
+            "http://127.0.0.1?x",
+            "http://127.0.0.1#x",
+            "http://127.0.0.1:80%40evil.com",
+        ] {
             assert!(!is_loopback_http(bad), "{bad:?} must be refused");
         }
     }
