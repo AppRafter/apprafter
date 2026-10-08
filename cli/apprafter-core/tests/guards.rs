@@ -117,6 +117,10 @@ const SANCTIONED: &[(&str, &str)] = &[
 
 /// Crates `apprafter-core` must not depend on: a client prompts, draws
 /// progress, renders tables and colours, and handles signals.
+///
+/// Only `[dependencies]` and `[target.*.dependencies]` are checked:
+/// `[dev-dependencies]` and `[build-dependencies]` never reach the shipped
+/// binary, so they may use any of these.
 const FORBIDDEN_DEPS: &[&str] = &[
     "inquire",
     "indicatif",
@@ -312,18 +316,51 @@ fn trait_item_attrs(item: &TraitItem) -> &[Attribute] {
     }
 }
 
-/// The attributes of an expression statement, for the kinds that carry a
-/// `#[cfg]` in practice.
+/// The attributes of an expression, for every kind that carries them (syn
+/// 2): a `#[cfg(test)]` on a `loop`, `for` or `return` statement gates it as
+/// surely as one on a call. Only `Verbatim` has none; `Expr` is
+/// non-exhaustive, so a kind a newer syn adds falls there too.
 fn expr_attrs(e: &Expr) -> &[Attribute] {
     match e {
+        Expr::Array(x) => &x.attrs,
         Expr::Assign(x) => &x.attrs,
+        Expr::Async(x) => &x.attrs,
+        Expr::Await(x) => &x.attrs,
+        Expr::Binary(x) => &x.attrs,
         Expr::Block(x) => &x.attrs,
+        Expr::Break(x) => &x.attrs,
         Expr::Call(x) => &x.attrs,
+        Expr::Cast(x) => &x.attrs,
+        Expr::Closure(x) => &x.attrs,
+        Expr::Const(x) => &x.attrs,
+        Expr::Continue(x) => &x.attrs,
+        Expr::Field(x) => &x.attrs,
+        Expr::ForLoop(x) => &x.attrs,
+        Expr::Group(x) => &x.attrs,
         Expr::If(x) => &x.attrs,
+        Expr::Index(x) => &x.attrs,
+        Expr::Infer(x) => &x.attrs,
+        Expr::Let(x) => &x.attrs,
+        Expr::Lit(x) => &x.attrs,
+        Expr::Loop(x) => &x.attrs,
         Expr::Macro(x) => &x.attrs,
         Expr::Match(x) => &x.attrs,
         Expr::MethodCall(x) => &x.attrs,
+        Expr::Paren(x) => &x.attrs,
+        Expr::Path(x) => &x.attrs,
+        Expr::Range(x) => &x.attrs,
+        Expr::RawAddr(x) => &x.attrs,
+        Expr::Reference(x) => &x.attrs,
+        Expr::Repeat(x) => &x.attrs,
+        Expr::Return(x) => &x.attrs,
+        Expr::Struct(x) => &x.attrs,
+        Expr::Try(x) => &x.attrs,
+        Expr::TryBlock(x) => &x.attrs,
+        Expr::Tuple(x) => &x.attrs,
+        Expr::Unary(x) => &x.attrs,
         Expr::Unsafe(x) => &x.attrs,
+        Expr::While(x) => &x.attrs,
+        Expr::Yield(x) => &x.attrs,
         _ => &[],
     }
 }
@@ -1090,6 +1127,47 @@ impl T {
 impl T { fn u() { let _ = std::env::var(\"C\"); } }
 ";
         assert_eq!(hits(src), vec![read("std::env::vars", 11)]);
+    }
+
+    #[test]
+    fn a_test_gated_loop_for_or_return_statement_is_skipped() {
+        let src = "\
+fn f() -> Option<String> {
+    #[cfg(test)]
+    loop { std::env::var(\"A\"); }
+    #[cfg(test)]
+    for _ in 0..1 { std::env::var(\"B\"); }
+    #[cfg(test)]
+    return std::env::var(\"C\").ok();
+    std::env::var(\"D\").ok()
+}
+";
+        assert_eq!(hits(src), vec![read("std::env::var", 8)]);
+    }
+
+    #[test]
+    fn a_test_gated_match_arm_or_struct_field_is_skipped() {
+        let src = "\
+struct S { a: Option<String>, b: Option<String> }
+fn f(x: u8) -> Option<String> {
+    match x {
+        #[cfg(test)]
+        0 => std::env::var(\"A\").ok(),
+        _ => std::env::var(\"B\").ok(),
+    }
+}
+fn g() -> S {
+    S {
+        #[cfg(test)]
+        a: std::env::var(\"C\").ok(),
+        b: std::env::var(\"D\").ok(),
+    }
+}
+";
+        assert_eq!(
+            hits(src),
+            vec![read("std::env::var", 6), read("std::env::var", 13)]
+        );
     }
 
     #[test]
