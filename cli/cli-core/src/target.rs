@@ -77,7 +77,19 @@ pub const CONFIG_DIR_ENV: &str = "APPRAFTER_CONFIG_DIR";
 /// `XDG_CONFIG_HOME`, no env override) — should never happen on a
 /// sane install, but `Result` is the safe surface.
 pub fn default_config_root() -> Result<PathBuf> {
-    if let Ok(custom) = std::env::var(CONFIG_DIR_ENV) {
+    config_root_from_override(std::env::var(CONFIG_DIR_ENV).ok())
+}
+
+/// The target-store root for an explicit override value — the value of
+/// `APPRAFTER_CONFIG_DIR` as the caller read it. A non-empty value is used
+/// verbatim; `None` or an empty value falls back to
+/// `dirs::config_dir().join("apprafter")`.
+///
+/// Pure, so a caller that reads its environment through something other
+/// than `std::env` (the shared core's `Context` builder, ADR 0067) resolves
+/// the root exactly as [`default_config_root`] does.
+pub fn config_root_from_override(custom: Option<String>) -> Result<PathBuf> {
+    if let Some(custom) = custom {
         if !custom.is_empty() {
             return Ok(PathBuf::from(custom));
         }
@@ -1152,5 +1164,26 @@ mod tests {
         let legacy = "provider: hetzner-cloud\n";
         let cfg: TargetConfig = serde_yaml::from_str(legacy).unwrap();
         assert_eq!(cfg.firewall, None);
+    }
+
+    #[test]
+    fn config_root_from_override_uses_a_non_empty_value_verbatim() {
+        let root = config_root_from_override(Some("/tmp/somewhere".to_string())).unwrap();
+        assert_eq!(root, PathBuf::from("/tmp/somewhere"));
+    }
+
+    #[test]
+    fn config_root_from_override_treats_empty_as_unset() {
+        let root = config_root_from_override(Some(String::new())).unwrap();
+        assert!(
+            root.ends_with("apprafter"),
+            "fell back to the platform dir, got {root:?}"
+        );
+    }
+
+    #[test]
+    fn config_root_from_override_without_value_uses_the_platform_dir() {
+        let root = config_root_from_override(None).unwrap();
+        assert!(root.ends_with("apprafter"), "got {root:?}");
     }
 }
