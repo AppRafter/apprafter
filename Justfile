@@ -130,6 +130,14 @@ desktop-dev: _desktop-sysdeps
 desktop-build: _desktop-sysdeps
     cd desktop && bun install --frozen-lockfile && bun run tauri build --debug --no-bundle
 
+# Run after changing a type or a constant in desktop/ipc, and commit the result;
+# scripts/check-desktop-ipc-types.sh (desktop-check, CI) fails on a stale copy. Needs no
+# WebKitGTK: the ipc crate is Tauri-free.
+#
+# Regenerate the TypeScript IPC types in desktop/src/ipc/generated/.
+desktop-ipc-types:
+    cd desktop && cargo test --locked -p apprafter-desktop-ipc --features ts --test export
+
 # Every desktop gate CI runs.
 desktop-check: _desktop-sysdeps
     #!/usr/bin/env bash
@@ -138,6 +146,7 @@ desktop-check: _desktop-sysdeps
         && cargo clippy --locked --all-targets --all-features -- -D warnings \
         && cargo test --locked --all-features )
     ./scripts/check-desktop-core-lock.sh
+    ./scripts/check-desktop-ipc-types.sh
     ( cd desktop && bun install --frozen-lockfile && bun run lint && bun test )
 
 _desktop-sysdeps:

@@ -63,6 +63,7 @@ jobs:
               - 'deny.toml'
               - 'scripts/cargo-deny.sh'
               - 'scripts/check-desktop-core-lock.sh'
+              - 'scripts/check-desktop-ipc-types.sh'
               - '.github/workflows/test.yml'
             # The desktop's bun package; its CLI-coverage gate reads the
             # generated CLI reference.
@@ -222,6 +223,11 @@ jobs:
         working-directory: desktop
         shell: bash
         run: cargo test --locked --all-features --no-fail-fast
+      # The committed TypeScript IPC types match a fresh export. One leg is enough: the
+      # export writes the same bytes on every OS.
+      - if: runner.os == 'Linux'
+        name: TypeScript IPC types are current
+        run: bash scripts/check-desktop-ipc-types.sh
       # Evidence that the app builds on this OS: a debug binary, no installer.
       - name: tauri build --debug --no-bundle
         working-directory: desktop

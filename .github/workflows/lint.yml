@@ -101,6 +101,7 @@ jobs:
               - 'deny.toml'
               - 'scripts/cargo-deny.sh'
               - 'scripts/check-desktop-core-lock.sh'
+              - 'scripts/check-desktop-ipc-types.sh'
               - '.github/workflows/lint.yml'
             # The desktop's bun package; its CLI-coverage gate reads the
             # generated CLI reference.
