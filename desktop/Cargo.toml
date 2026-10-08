@@ -6,7 +6,7 @@
 # `cargo update -p <desktop-only crate>`; a newer shared crate moves cli/Cargo.lock first.
 [workspace]
 resolver = "2"
-members = ["src-tauri", "ipc"]
+members = ["src-tauri", "ipc", "os-auth"]
 
 [workspace.package]
 edition      = "2021"

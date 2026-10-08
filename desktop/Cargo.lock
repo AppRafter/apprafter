@@ -231,6 +231,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "apprafter-os-auth"
+version = "0.0.0"
+dependencies = [
+ "apprafter-core",
+ "apprafter-desktop-ipc",
+]
+
+[[package]]
 name = "arc-swap"
 version = "1.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

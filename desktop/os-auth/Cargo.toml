@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+[package]
+name        = "apprafter-os-auth"
+description = "Device-owner authentication through the OS for AppRafter Desktop: Windows Hello, macOS LocalAuthentication, Linux polkit and PAM."
+# Not a version authority: desktop/src-tauri/Cargo.toml is (design spec §6.1).
+version     = "0.0.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+# Tauri-free: src-tauri depends on this crate, never the other way round.
+[dependencies]
+# CancellationToken: what closes an open prompt (lock-on-sleep, quit).
+apprafter-core        = { workspace = true }
+# AuthOutcome: the one answer every backend gives.
+apprafter-desktop-ipc = { path = "../ipc" }
+
+# Windows Hello and the Windows credential dialog.
+[target.'cfg(windows)'.dependencies]
+
+# LocalAuthentication.
+[target.'cfg(target_os = "macos")'.dependencies]
+
+# polkit, and PAM where polkit cannot prompt.
+[target.'cfg(target_os = "linux")'.dependencies]
