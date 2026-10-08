@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Which target an operation acts on (ADR 0067 §2).
 //!
-//! Every operation takes an explicit [`TargetRef`]. The CLI resolves it from
-//! `--target` or its active pointer; the desktop passes the tab's target and
-//! never reads the pointer for that purpose.
+//! Every operation takes an explicit [`TargetRef`], and how it was found is
+//! in the constructor's name: [`TargetRef::named`] for a name the caller
+//! holds (`--target`, a desktop tab), [`TargetRef::active`] for the CLI's
+//! active pointer. The desktop binds each tab with `named` and never calls
+//! `active` for that (a desktop grep guard will enforce it).
 
 use serde::Serialize;
 
@@ -19,16 +21,28 @@ impl TargetRef {
         &self.0
     }
 
-    /// `explicit` when given (it must exist), else the store's active
-    /// target.
-    pub fn resolve(ctx: &Context, explicit: Option<&str>) -> CoreResult<TargetRef> {
-        let store = ctx.store();
-        let available = cli_core::list_target_names(&store)?;
-        let name = match explicit {
-            Some(n) => n.to_string(),
-            None => cli_core::resolve_active_target_name(&store, None)?
-                .ok_or(CoreError::NoActiveTarget)?,
-        };
+    /// The target called `name`, which must exist in the store.
+    pub fn named(ctx: &Context, name: &str) -> CoreResult<TargetRef> {
+        Self::existing(ctx, name.to_string())
+    }
+
+    /// The target the CLI's active pointer names, which must exist too: a
+    /// pointer left dangling (its target removed by hand) is
+    /// [`CoreError::TargetNotFound`] with the pointer's value as `name`; no
+    /// pointer is [`CoreError::NoActiveTarget`].
+    ///
+    /// This is stricter than the CLI's `state_paths::resolve_state_paths`
+    /// today, which checks that a `--target` name exists but takes the
+    /// active pointer on trust. D.3 records a golden of the dangling-pointer
+    /// case before the target family moves onto the core.
+    pub fn active(ctx: &Context) -> CoreResult<TargetRef> {
+        let name = cli_core::resolve_active_target_name(&ctx.store(), None)?
+            .ok_or(CoreError::NoActiveTarget)?;
+        Self::existing(ctx, name)
+    }
+
+    fn existing(ctx: &Context, name: String) -> CoreResult<TargetRef> {
+        let available = cli_core::list_target_names(&ctx.store())?;
         if available.iter().any(|a| a == &name) {
             Ok(TargetRef(name))
         } else {
@@ -80,24 +94,17 @@ mod tests {
     }
 
     #[test]
-    fn an_explicit_existing_name_resolves() {
+    fn a_named_target_resolves_whatever_the_pointer_says() {
         let (_d, ctx) = store_with(&["prod", "staging"], Some("prod"));
-        assert_eq!(
-            TargetRef::resolve(&ctx, Some("staging")).unwrap().name(),
-            "staging"
-        );
-    }
-
-    #[test]
-    fn no_name_resolves_to_the_active_target() {
-        let (_d, ctx) = store_with(&["prod", "staging"], Some("prod"));
-        assert_eq!(TargetRef::resolve(&ctx, None).unwrap().name(), "prod");
+        assert_eq!(TargetRef::named(&ctx, "staging").unwrap().name(), "staging");
+        let (_d, ctx) = store_with(&["prod"], None);
+        assert_eq!(TargetRef::named(&ctx, "prod").unwrap().name(), "prod");
     }
 
     #[test]
     fn an_unknown_name_lists_what_exists() {
         let (_d, ctx) = store_with(&["prod", "staging"], Some("prod"));
-        match TargetRef::resolve(&ctx, Some("ghost")) {
+        match TargetRef::named(&ctx, "ghost") {
             Err(CoreError::TargetNotFound { name, available }) => {
                 assert_eq!(name, "ghost");
                 assert_eq!(available, vec!["prod".to_string(), "staging".to_string()]);
@@ -107,10 +114,26 @@ mod tests {
     }
 
     #[test]
+    fn a_name_on_an_empty_store_is_not_found_with_nothing_available() {
+        let (_d, ctx) = store_with(&[], None);
+        assert!(matches!(
+            TargetRef::named(&ctx, "prod"),
+            Err(CoreError::TargetNotFound { ref name, ref available })
+                if name == "prod" && available.is_empty()
+        ));
+    }
+
+    #[test]
+    fn active_resolves_to_the_pointer() {
+        let (_d, ctx) = store_with(&["prod", "staging"], Some("staging"));
+        assert_eq!(TargetRef::active(&ctx).unwrap().name(), "staging");
+    }
+
+    #[test]
     fn an_empty_store_has_no_active_target() {
         let (_d, ctx) = store_with(&[], None);
         assert!(matches!(
-            TargetRef::resolve(&ctx, None),
+            TargetRef::active(&ctx),
             Err(CoreError::NoActiveTarget)
         ));
     }
@@ -118,10 +141,13 @@ mod tests {
     #[test]
     fn a_dangling_active_pointer_is_not_found() {
         let (_d, ctx) = store_with(&["prod"], Some("gone"));
-        assert!(matches!(
-            TargetRef::resolve(&ctx, None),
-            Err(CoreError::TargetNotFound { ref name, .. }) if name == "gone"
-        ));
+        match TargetRef::active(&ctx) {
+            Err(CoreError::TargetNotFound { name, available }) => {
+                assert_eq!(name, "gone");
+                assert_eq!(available, vec!["prod".to_string()]);
+            }
+            other => panic!("expected TargetNotFound, got {other:?}"),
+        }
     }
 
     #[test]
