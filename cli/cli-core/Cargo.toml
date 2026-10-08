@@ -25,7 +25,7 @@ age                = { workspace = true }
 # but the workspace entry carries it.
 chrono             = { workspace = true }
 dirs               = { workspace = true }
-# Used both in production (target::atomic_write builds tempfiles in
+# Used both in production (fsutil::atomic_replace builds tempfiles in
 # the destination dir for safe replace) and in tests (per-test root).
 tempfile           = { workspace = true }
 

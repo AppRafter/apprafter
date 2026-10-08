@@ -39,7 +39,6 @@
 //! resolution chain spec'd in `cli-dx-task.md` §7.
 
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -597,16 +596,16 @@ pub fn remove_target(paths: &TargetStorePaths, name: &str) -> Result<()> {
 // Internal: atomic write + permission enforcement
 // ---------------------------------------------------------------
 
-/// Write `bytes` to `final_path` atomically. The pattern is the
-/// standard recipe: create a tempfile in the same directory,
-/// write + fsync + close, set the desired mode while still under
-/// the tempfile name, then `rename(2)` over `final_path`. The
-/// rename is atomic on POSIX and on NTFS, so readers either see
-/// the old file or the new file, never a partial write or an
-/// over-permissive mode.
+/// Write `bytes` to `final_path` atomically, through
+/// [`crate::atomic_replace`]: a temp file in the same directory
+/// (`.apprafter-tgt-XXXXXX.tmp`), written, given its mode and fsynced
+/// under the temp name, then renamed over `final_path`. Readers see the
+/// old file or the new one, never a partial write or an over-permissive
+/// mode, and on Windows a reader holding the old file open does not make
+/// the replace fail.
 ///
 /// `secret = true` enforces mode 0600 (owner read/write only) on
-/// Unix. On Windows the mode argument is ignored (NTFS ACLs
+/// Unix, `false` 0644. On Windows the mode is ignored (NTFS ACLs
 /// inherit from the parent; tightening per-file is out of scope
 /// for v0.1.72).
 fn atomic_write(final_path: &Path, bytes: &[u8], secret: bool) -> Result<()> {
@@ -617,31 +616,8 @@ fn atomic_write(final_path: &Path, bytes: &[u8], secret: bool) -> Result<()> {
         ))
     })?;
     fs::create_dir_all(parent)?;
-
-    let mut tmp = tempfile::Builder::new()
-        .prefix(".apprafter-tgt-")
-        .suffix(".tmp")
-        .tempfile_in(parent)?;
-    tmp.write_all(bytes)?;
-    tmp.as_file_mut().sync_all()?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = if secret { 0o600 } else { 0o644 };
-        let perms = fs::Permissions::from_mode(mode);
-        fs::set_permissions(tmp.path(), perms)?;
-    }
-    #[cfg(not(unix))]
-    {
-        // Windows: mode arg ignored. Suppress unused-var lint.
-        let _ = secret;
-    }
-
-    // `persist` does an atomic rename. If the destination exists
-    // it is replaced atomically on POSIX (and via ReplaceFileW on
-    // Windows).
-    tmp.persist(final_path).map_err(|e| CliError::Io(e.error))?;
+    let mode = if secret { 0o600 } else { 0o644 };
+    crate::atomic_replace(final_path, bytes, ".apprafter-tgt-", Some(mode))?;
     Ok(())
 }
 

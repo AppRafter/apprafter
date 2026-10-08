@@ -5,6 +5,7 @@ pub mod credentials;
 pub mod cue;
 pub mod diagnose;
 pub mod error;
+pub mod fsutil;
 pub mod logging;
 pub mod manifest;
 pub mod quantity;
@@ -21,6 +22,7 @@ pub use credentials::{
     HCLOUD_TOKEN_ENV, SSH_PUBLIC_KEY_ENV,
 };
 pub use error::{CliError, Result, UnavailableKind};
+pub use fsutil::atomic_replace;
 pub use target::{
     config_root_from_override, default_config_root, list_target_names, load_active_target_config,
     load_global_config, load_target, remove_target, rename_target, resolve_active_target_name,

@@ -34,7 +34,7 @@ $XDG_CONFIG_HOME/apprafter/          # ~/.config/apprafter on Linux
 └── state/
     └── <target>/
         └── .apprafter/
-            ├── state.json           # provisioned resource IDs + cached kubeconfig
+            ├── state.json           # provisioned resource IDs + cached kubeconfig, mode 0600
             └── known_hosts          # per-cluster SSH known_hosts
 ```
 

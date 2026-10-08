@@ -14,6 +14,9 @@ repository.workspace   = true
 cli-core   = { path = "../cli-core" }
 serde      = { workspace = true }
 serde_json = { workspace = true }
-# `State::save` writes a temp file and renames it over state.json.
-tempfile   = { workspace = true }
 thiserror  = { workspace = true }
+
+[dev-dependencies]
+# Per-test state roots. `State::save` writes through
+# `cli_core::atomic_replace`, which owns the temp file.
+tempfile   = { workspace = true }
