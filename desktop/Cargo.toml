@@ -18,6 +18,7 @@ repository   = "https://github.com/apprafter/apprafter"
 
 [workspace.dependencies]
 apprafter-core = { path = "../cli/apprafter-core" }
+cli-core       = { path = "../cli/cli-core" }
 serde          = { version = "1", features = ["derive"] }
 serde_json     = "1"
 tauri          = { version = "~2.12", features = ["config-json5"] }

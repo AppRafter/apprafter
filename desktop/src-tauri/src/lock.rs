@@ -1,0 +1,904 @@
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
+//! The app lock, decided in Rust (design spec §4.3): the webview only renders
+//! [`LockState`], and every command passes [`LockMachine::guard`] first.
+//!
+//! The lock is in effect when the settings switch it on **and** the [`Authenticator`] can
+//! verify the owner. Without an authenticator it fails closed in the only safe direction: a
+//! lock nobody could open is no lock, so it is off (the webview shows a persistent banner from
+//! `AuthInfo`), switching it on is refused with `AuthUnavailable`, and destructive operations
+//! are refused by the [`OperationManager`](crate::ops::OperationManager) for the same reason.
+//!
+//! Settings reach the machine as a copy: [`LockMachine::new`] takes the loaded settings and
+//! only [`LockMachine::set_settings`] replaces them. It checks the change, then calls the
+//! caller's `persist` (in the app, `|s| store.set(s.clone())`) under the machine's lock and
+//! applies the change only if that succeeded, so the file and the machine change together or
+//! not at all. The machine knows nothing of the
+//! [`SettingsStore`](crate::settings::SettingsStore) and the store nothing of the machine.
+//!
+//! Every transition between locked and unlocked calls the hook exactly once, with the new
+//! state, under the machine's lock (so hooks run in transition order). The state at
+//! construction is not a transition: nothing is listening yet.
+
+use std::panic::{self, AssertUnwindSafe};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread;
+
+use apprafter_core::CancellationToken;
+use apprafter_desktop_ipc::{
+    AuthInfo, AuthOutcome, LockReason, LockState, Settings, UnavailableReason, ALLOWED_WHILE_LOCKED,
+};
+
+use crate::auth::{AuthPurpose, Authenticator};
+use crate::errors::DesktopError;
+use crate::ops::Clock;
+
+const MINUTE_MS: u64 = 60_000;
+
+/// Called on every transition between locked and unlocked, with the new state; the app drops
+/// pending plans and emits `lock-changed`. It runs under the machine's lock, so it must be
+/// quick, must not panic, and must never call back into the machine.
+pub type LockHook = Box<dyn Fn(&LockState) + Send + Sync>;
+
+pub struct LockMachine {
+    auth: Arc<dyn Authenticator>,
+    clock: Arc<dyn Clock>,
+    hook: LockHook,
+    inner: Mutex<Inner>,
+}
+
+struct Inner {
+    settings: Settings,
+    /// `Some` while locked.
+    reason: Option<LockReason>,
+    /// When the current state began.
+    since_ms: u64,
+    last_activity_ms: u64,
+    /// The unlock prompt while it is open; a second unlock is `AuthBusy` meanwhile.
+    prompt: Option<Prompt>,
+}
+
+struct Prompt {
+    cancel: CancellationToken,
+    /// Set, under the machine's lock, when a lock closed the prompt: its answer no longer
+    /// counts. The token trips on another thread, so this flag — not the token — decides,
+    /// and a `Verified` that arrives before the token has tripped does not unlock either.
+    closed: bool,
+}
+
+impl LockMachine {
+    /// Locked with [`LockReason::Startup`] when the lock is in effect and `lock_on_start` is
+    /// set; unlocked otherwise.
+    pub fn new(
+        settings: Settings,
+        auth: Arc<dyn Authenticator>,
+        clock: Arc<dyn Clock>,
+        hook: LockHook,
+    ) -> Self {
+        let now = clock.now_ms();
+        let reason = (in_effect(&settings, &auth.info()) && settings.lock_on_start)
+            .then_some(LockReason::Startup);
+        Self {
+            auth,
+            clock,
+            hook,
+            inner: Mutex::new(Inner {
+                settings,
+                reason,
+                since_ms: now,
+                last_activity_ms: now,
+                prompt: None,
+            }),
+        }
+    }
+
+    pub fn state(&self) -> LockState {
+        let info = self.auth.info();
+        state_of(&self.lock_inner(), &info)
+    }
+
+    /// `Locked` for any command not in [`ALLOWED_WHILE_LOCKED`] while locked. Never waits
+    /// for an open prompt.
+    pub fn guard(&self, command: &str) -> Result<(), DesktopError> {
+        if self.lock_inner().reason.is_some() && !ALLOWED_WHILE_LOCKED.contains(&command) {
+            return Err(DesktopError::Locked);
+        }
+        Ok(())
+    }
+
+    /// The owner did something: the idle time starts again.
+    pub fn activity(&self) {
+        let now = self.clock.now_ms();
+        self.lock_inner().last_activity_ms = now;
+    }
+
+    /// Lock with [`LockReason::Idle`] once `auto_lock` minutes have passed since the last
+    /// activity (or unlock). Does nothing while locked, with the lock not in effect, or with
+    /// `auto_lock` set to never.
+    pub fn tick(&self, now_ms: u64) {
+        let info = self.auth.info();
+        let mut inner = self.lock_inner();
+        if inner.reason.is_some() || !in_effect(&inner.settings, &info) {
+            return;
+        }
+        let Some(minutes) = inner.settings.auto_lock.minutes() else {
+            return;
+        };
+        if now_ms.saturating_sub(inner.last_activity_ms) >= u64::from(minutes) * MINUTE_MS {
+            self.enter(&mut inner, &info, Some(LockReason::Idle), now_ms);
+        }
+    }
+
+    /// Lock for `reason`. Already locked, it keeps the reason and time it locked with, and
+    /// closes an open unlock prompt (the session locked or slept while it was open). With
+    /// the lock not in effect it does nothing: there would be no way to unlock.
+    pub fn lock(&self, reason: LockReason) {
+        let info = self.auth.info();
+        let now = self.clock.now_ms();
+        let close = {
+            let mut inner = self.lock_inner();
+            if inner.reason.is_some() {
+                inner.prompt.as_mut().and_then(|prompt| {
+                    (!prompt.closed).then(|| {
+                        prompt.closed = true;
+                        prompt.cancel.clone()
+                    })
+                })
+            } else {
+                if in_effect(&inner.settings, &info) {
+                    self.enter(&mut inner, &info, Some(reason), now);
+                }
+                None
+            }
+        };
+        if let Some(cancel) = close {
+            trip(cancel);
+        }
+    }
+
+    /// Ask the owner, and unlock if the OS verifies them. Blocks until the prompt answers
+    /// (it can take minutes), without holding the machine's lock: meanwhile every other
+    /// call answers at once, and a second `unlock` is `AuthBusy`. Unlocked already, it asks
+    /// nothing.
+    pub fn unlock(&self) -> Result<(), DesktopError> {
+        let cancel = {
+            let mut inner = self.lock_inner();
+            if inner.reason.is_none() {
+                return Ok(());
+            }
+            if inner.prompt.is_some() {
+                return Err(DesktopError::AuthBusy);
+            }
+            let cancel = CancellationToken::new();
+            inner.prompt = Some(Prompt {
+                cancel: cancel.clone(),
+                closed: false,
+            });
+            cancel
+        };
+        let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+            self.auth.verify(&AuthPurpose::Unlock, &cancel)
+        }));
+        let info = self.auth.info();
+        let mut inner = self.lock_inner();
+        let closed = inner.prompt.take().is_none_or(|prompt| prompt.closed);
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            // The prompt is closed above, so the next unlock can ask again.
+            Err(payload) => {
+                drop(inner);
+                panic::resume_unwind(payload)
+            }
+        };
+        match outcome {
+            AuthOutcome::Verified if closed => Err(DesktopError::AuthCancelled),
+            AuthOutcome::Verified => {
+                let now = self.clock.now_ms();
+                inner.last_activity_ms = now;
+                self.enter(&mut inner, &info, None, now);
+                Ok(())
+            }
+            AuthOutcome::Cancelled { .. } => Err(DesktopError::AuthCancelled),
+            AuthOutcome::Failed { exhausted } => Err(DesktopError::AuthFailed { exhausted }),
+            AuthOutcome::Unavailable { reason } => Err(DesktopError::AuthUnavailable { reason }),
+            AuthOutcome::Busy => Err(DesktopError::AuthBusy),
+        }
+    }
+
+    /// Replace the settings the machine follows, once `persist` has saved them.
+    ///
+    /// Switching the lock on is refused with `AuthUnavailable` when nothing can verify the
+    /// owner; keeping it on is not (the defaults have it on, and every other setting must
+    /// stay changeable). Switching it off never unlocks. A new idle time applies from the
+    /// next tick. `persist` runs under the machine's lock, so concurrent changes reach the
+    /// file and the machine in the same order.
+    pub fn set_settings(
+        &self,
+        settings: Settings,
+        persist: impl FnOnce(&Settings) -> Result<(), DesktopError>,
+    ) -> Result<(), DesktopError> {
+        let info = self.auth.info();
+        let mut inner = self.lock_inner();
+        if settings.lock_enabled && !inner.settings.lock_enabled && !info.available {
+            return Err(DesktopError::AuthUnavailable {
+                reason: info.unavailable.unwrap_or(UnavailableReason::NoBackend),
+            });
+        }
+        persist(&settings)?;
+        inner.settings = settings;
+        Ok(())
+    }
+
+    /// Move to `reason` (`None` = unlocked) and tell the hook.
+    fn enter(&self, inner: &mut Inner, info: &AuthInfo, reason: Option<LockReason>, now: u64) {
+        inner.reason = reason;
+        inner.since_ms = now;
+        (self.hook)(&state_of(inner, info));
+    }
+
+    fn lock_inner(&self) -> MutexGuard<'_, Inner> {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
+fn in_effect(settings: &Settings, info: &AuthInfo) -> bool {
+    settings.lock_enabled && info.available
+}
+
+fn state_of(inner: &Inner, info: &AuthInfo) -> LockState {
+    LockState {
+        locked: inner.reason.is_some(),
+        reason: inner.reason,
+        since_ms: inner.since_ms,
+        auto_lock_minutes: in_effect(&inner.settings, info)
+            .then(|| inner.settings.auto_lock.minutes())
+            .flatten(),
+    }
+}
+
+/// Trip `token` on a short-lived thread of its own, as the operation manager trips a
+/// prompt's: `CancellationToken::cancel` runs the backend's callbacks on the calling thread
+/// and re-raises the first one's panic, and the caller may be the main thread.
+fn trip(token: CancellationToken) {
+    let spawned = thread::Builder::new().name("lock-cancel".into()).spawn({
+        let token = token.clone();
+        move || token.cancel()
+    });
+    if spawned.is_err() {
+        // No thread to be had: trip it here rather than not at all, and keep a callback's
+        // panic from reaching the caller.
+        let _ = panic::catch_unwind(AssertUnwindSafe(|| token.cancel()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::panic::{self, AssertUnwindSafe};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::Duration;
+
+    use apprafter_core::CancellationToken;
+    use apprafter_desktop_ipc::{
+        AuthInfo, AuthOutcome, AutoLock, CancelledBy, LockReason, LockState, Settings, Theme,
+        UnavailableReason, ALLOWED_WHILE_LOCKED, COMMANDS,
+    };
+
+    use super::LockMachine;
+    use crate::auth::{AuthPurpose, Authenticator, FakeAuthenticator, NoAuthenticator};
+    use crate::errors::DesktopError;
+    use crate::ops::test_clock::ManualClock;
+
+    const T0: u64 = 1_700_000_000_000;
+    const MIN: u64 = 60_000;
+    /// What a test waits before it calls something stuck.
+    const LONG: Duration = Duration::from_secs(10);
+
+    /// Every state the hook was called with.
+    #[derive(Default)]
+    struct Hooked(Mutex<Vec<LockState>>);
+
+    impl Hooked {
+        fn calls(&self) -> Vec<LockState> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    struct Rig {
+        clock: Arc<ManualClock>,
+        hooked: Arc<Hooked>,
+        machine: Arc<LockMachine>,
+    }
+
+    fn rig(settings: Settings, auth: Arc<dyn Authenticator>) -> Rig {
+        let clock = Arc::new(ManualClock::at(T0));
+        let hooked = Arc::new(Hooked::default());
+        let machine = {
+            let hooked = hooked.clone();
+            Arc::new(LockMachine::new(
+                settings,
+                auth,
+                clock.clone(),
+                Box::new(move |state| hooked.0.lock().unwrap().push(state.clone())),
+            ))
+        };
+        Rig {
+            clock,
+            hooked,
+            machine,
+        }
+    }
+
+    fn fake() -> Arc<FakeAuthenticator> {
+        Arc::new(FakeAuthenticator::new())
+    }
+
+    /// Lock on, no lock at start, 10 minutes idle.
+    fn unlocked_at_start() -> Settings {
+        Settings {
+            lock_on_start: false,
+            ..Settings::default()
+        }
+    }
+
+    fn locked(reason: LockReason, since_ms: u64, auto_lock_minutes: Option<u32>) -> LockState {
+        LockState {
+            locked: true,
+            reason: Some(reason),
+            since_ms,
+            auto_lock_minutes,
+        }
+    }
+
+    fn unlocked(since_ms: u64, auto_lock_minutes: Option<u32>) -> LockState {
+        LockState {
+            locked: false,
+            reason: None,
+            since_ms,
+            auto_lock_minutes,
+        }
+    }
+
+    /// Cannot authenticate, for `reason` (or for no reason given).
+    struct Unavailable(Option<UnavailableReason>);
+
+    impl Authenticator for Unavailable {
+        fn info(&self) -> AuthInfo {
+            AuthInfo {
+                available: false,
+                unavailable: self.0,
+                ..NoAuthenticator.info()
+            }
+        }
+
+        fn verify(&self, _purpose: &AuthPurpose, _cancel: &CancellationToken) -> AuthOutcome {
+            AuthOutcome::Unavailable {
+                reason: self.0.unwrap_or(UnavailableReason::NoBackend),
+            }
+        }
+    }
+
+    /// An OS prompt that stays open until the test answers it. It says when it opened and
+    /// when its token tripped (the app closing it).
+    struct HeldPrompt {
+        opened: Mutex<mpsc::Sender<()>>,
+        tripped: Mutex<mpsc::Sender<()>>,
+        answer: Mutex<mpsc::Receiver<AuthOutcome>>,
+    }
+
+    struct HeldPromptEnds {
+        opened: mpsc::Receiver<()>,
+        tripped: mpsc::Receiver<()>,
+        answer: mpsc::Sender<AuthOutcome>,
+    }
+
+    impl HeldPrompt {
+        fn new() -> (Arc<Self>, HeldPromptEnds) {
+            let (opened_tx, opened) = mpsc::channel();
+            let (tripped_tx, tripped) = mpsc::channel();
+            let (answer, answer_rx) = mpsc::channel();
+            let prompt = Arc::new(Self {
+                opened: Mutex::new(opened_tx),
+                tripped: Mutex::new(tripped_tx),
+                answer: Mutex::new(answer_rx),
+            });
+            let ends = HeldPromptEnds {
+                opened,
+                tripped,
+                answer,
+            };
+            (prompt, ends)
+        }
+    }
+
+    impl Authenticator for HeldPrompt {
+        fn info(&self) -> AuthInfo {
+            FakeAuthenticator::new().info()
+        }
+
+        fn verify(&self, _purpose: &AuthPurpose, cancel: &CancellationToken) -> AuthOutcome {
+            let tripped = self.tripped.lock().unwrap().clone();
+            let _registration = cancel.on_cancel(move || {
+                let _ = tripped.send(());
+            });
+            let _ = self.opened.lock().unwrap().send(());
+            // A test that failed drops the sender: answer at once rather than hang.
+            self.answer
+                .lock()
+                .unwrap()
+                .recv_timeout(LONG)
+                .unwrap_or(AuthOutcome::Cancelled {
+                    by: CancelledBy::App,
+                })
+        }
+    }
+
+    /// Runs `f` on a thread of its own, so a deadlock fails the test after `LONG` instead
+    /// of hanging it; a panic in `f` is re-raised here.
+    fn within<T: Send + 'static>(what: &str, f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        match rx.recv_timeout(LONG) {
+            Ok(value) => value,
+            Err(RecvTimeoutError::Timeout) => {
+                panic!("{what} did not return within {LONG:?}: blocked behind the prompt")
+            }
+            Err(RecvTimeoutError::Disconnected) => match handle.join() {
+                Err(panic) => panic::resume_unwind(panic),
+                Ok(()) => panic!("{what} ended without a result"),
+            },
+        }
+    }
+
+    /// Starts `machine.unlock()` on a thread; its result arrives on the receiver.
+    fn unlock_in_background(
+        machine: &Arc<LockMachine>,
+    ) -> mpsc::Receiver<Result<(), DesktopError>> {
+        let (tx, rx) = mpsc::channel();
+        let machine = machine.clone();
+        thread::spawn(move || {
+            let _ = tx.send(machine.unlock());
+        });
+        rx
+    }
+
+    // 1–3. Whether the lock is in effect, and the state at start.
+
+    #[test]
+    fn with_an_authenticator_the_default_settings_start_locked() {
+        let r = rig(Settings::default(), fake());
+        assert_eq!(r.machine.state(), locked(LockReason::Startup, T0, Some(10)));
+        assert!(
+            r.hooked.calls().is_empty(),
+            "the state at start is not a transition"
+        );
+    }
+
+    #[test]
+    fn without_lock_on_start_or_with_the_lock_off_it_starts_unlocked() {
+        let r = rig(unlocked_at_start(), fake());
+        assert_eq!(r.machine.state(), unlocked(T0, Some(10)));
+        let off = Settings {
+            lock_enabled: false,
+            ..Settings::default()
+        };
+        let r = rig(off, fake());
+        assert_eq!(
+            r.machine.state(),
+            unlocked(T0, None),
+            "no idle time when off"
+        );
+    }
+
+    #[test]
+    fn without_an_authenticator_the_lock_is_off_even_when_the_settings_say_on() {
+        let r = rig(Settings::default(), Arc::new(NoAuthenticator));
+        assert_eq!(r.machine.state(), unlocked(T0, None));
+        // Nothing locks it: there would be no way back.
+        r.machine.lock(LockReason::Manual);
+        r.machine.tick(T0 + 1000 * MIN);
+        assert_eq!(r.machine.state(), unlocked(T0, None));
+        assert!(r.hooked.calls().is_empty());
+    }
+
+    #[test]
+    fn the_lock_cannot_be_switched_on_without_an_authenticator() {
+        for (auth, reason) in [
+            (
+                Arc::new(NoAuthenticator) as Arc<dyn Authenticator>,
+                UnavailableReason::NoBackend,
+            ),
+            (
+                Arc::new(Unavailable(Some(UnavailableReason::PolicyMissing))),
+                UnavailableReason::PolicyMissing,
+            ),
+            (Arc::new(Unavailable(None)), UnavailableReason::NoBackend),
+        ] {
+            let off = Settings {
+                lock_enabled: false,
+                ..Settings::default()
+            };
+            let r = rig(off.clone(), auth);
+            let persisted = AtomicUsize::new(0);
+            let on = Settings {
+                lock_enabled: true,
+                ..off.clone()
+            };
+            let err = r
+                .machine
+                .set_settings(on, |_| {
+                    persisted.fetch_add(1, SeqCst);
+                    Ok(())
+                })
+                .unwrap_err();
+            assert!(
+                matches!(err, DesktopError::AuthUnavailable { reason: got } if got == reason),
+                "{err:?}"
+            );
+            assert_eq!(persisted.load(SeqCst), 0, "a refused change is not saved");
+        }
+    }
+
+    #[test]
+    fn a_lock_already_on_can_stay_on_without_an_authenticator() {
+        // The defaults have the lock on; refusing every save that keeps it on would make
+        // every other setting unchangeable on a machine without an authenticator.
+        let r = rig(Settings::default(), Arc::new(NoAuthenticator));
+        let light = Settings {
+            theme: Theme::Light,
+            ..Settings::default()
+        };
+        r.machine.set_settings(light, |_| Ok(())).unwrap();
+        assert_eq!(r.machine.state(), unlocked(T0, None));
+    }
+
+    // 4. Idle.
+
+    #[test]
+    fn it_locks_after_the_idle_time_without_activity() {
+        let r = rig(unlocked_at_start(), fake());
+        r.machine.tick(T0 + 10 * MIN - 1);
+        assert!(!r.machine.state().locked);
+        r.machine.tick(T0 + 10 * MIN);
+        let idle = locked(LockReason::Idle, T0 + 10 * MIN, Some(10));
+        assert_eq!(r.machine.state(), idle);
+        assert_eq!(r.hooked.calls(), vec![idle.clone()]);
+        // While locked, ticks do nothing.
+        r.machine.tick(T0 + 100 * MIN);
+        assert_eq!(r.machine.state(), idle);
+        assert_eq!(r.hooked.calls().len(), 1);
+    }
+
+    #[test]
+    fn activity_restarts_the_idle_time() {
+        let r = rig(unlocked_at_start(), fake());
+        r.clock.set(T0 + 9 * MIN);
+        r.machine.activity();
+        r.machine.tick(T0 + 10 * MIN);
+        r.machine.tick(T0 + 19 * MIN - 1);
+        assert!(!r.machine.state().locked);
+        r.machine.tick(T0 + 19 * MIN);
+        assert_eq!(
+            r.machine.state(),
+            locked(LockReason::Idle, T0 + 19 * MIN, Some(10))
+        );
+    }
+
+    #[test]
+    fn never_never_idles_and_neither_does_a_lock_switched_off() {
+        let never = Settings {
+            auto_lock: AutoLock::Never,
+            ..unlocked_at_start()
+        };
+        let off = Settings {
+            lock_enabled: false,
+            ..Settings::default()
+        };
+        for settings in [never, off] {
+            let r = rig(settings.clone(), fake());
+            r.machine.tick(T0 + 1000 * 24 * 60 * MIN);
+            assert!(!r.machine.state().locked, "{settings:?}");
+            assert_eq!(r.machine.state().auto_lock_minutes, None, "{settings:?}");
+            assert!(r.hooked.calls().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_changed_idle_time_applies_at_once() {
+        let r = rig(unlocked_at_start(), fake());
+        let five = Settings {
+            auto_lock: AutoLock::Min5,
+            ..unlocked_at_start()
+        };
+        r.machine.set_settings(five, |_| Ok(())).unwrap();
+        assert_eq!(r.machine.state().auto_lock_minutes, Some(5));
+        r.machine.tick(T0 + 5 * MIN);
+        assert_eq!(r.machine.state().reason, Some(LockReason::Idle));
+    }
+
+    #[test]
+    fn an_unlock_counts_as_activity() {
+        let r = rig(Settings::default(), fake());
+        r.clock.set(T0 + 30 * MIN);
+        r.machine.unlock().unwrap();
+        r.machine.tick(T0 + 30 * MIN + 1);
+        assert_eq!(r.machine.state(), unlocked(T0 + 30 * MIN, Some(10)));
+    }
+
+    // 5. Lock and unlock.
+
+    #[test]
+    fn lock_now_locks_and_a_verified_owner_unlocks() {
+        let auth = fake();
+        let r = rig(unlocked_at_start(), auth.clone());
+        r.clock.set(T0 + MIN);
+        r.machine.lock(LockReason::Manual);
+        assert_eq!(
+            r.machine.state(),
+            locked(LockReason::Manual, T0 + MIN, Some(10))
+        );
+        r.clock.set(T0 + 2 * MIN);
+        r.machine.unlock().unwrap();
+        assert_eq!(r.machine.state(), unlocked(T0 + 2 * MIN, Some(10)));
+        assert_eq!(auth.asked(), vec![AuthPurpose::Unlock]);
+    }
+
+    #[test]
+    fn locking_a_locked_app_keeps_why_and_since() {
+        let r = rig(Settings::default(), fake());
+        r.clock.set(T0 + MIN);
+        r.machine.lock(LockReason::Manual);
+        r.machine.lock(LockReason::OsSession);
+        assert_eq!(r.machine.state(), locked(LockReason::Startup, T0, Some(10)));
+        assert!(r.hooked.calls().is_empty(), "no transition happened");
+    }
+
+    #[test]
+    fn unlocking_an_unlocked_app_asks_nothing() {
+        let auth = fake();
+        let r = rig(unlocked_at_start(), auth.clone());
+        r.machine.unlock().unwrap();
+        assert!(auth.asked().is_empty());
+        assert!(r.hooked.calls().is_empty());
+    }
+
+    #[test]
+    fn anything_but_verified_keeps_it_locked() {
+        for (outcome, expected) in [
+            (
+                AuthOutcome::Cancelled {
+                    by: CancelledBy::User,
+                },
+                DesktopError::AuthCancelled,
+            ),
+            (
+                AuthOutcome::Failed { exhausted: true },
+                DesktopError::AuthFailed { exhausted: true },
+            ),
+            (
+                AuthOutcome::Failed { exhausted: false },
+                DesktopError::AuthFailed { exhausted: false },
+            ),
+            (
+                AuthOutcome::Unavailable {
+                    reason: UnavailableReason::NoAgent,
+                },
+                DesktopError::AuthUnavailable {
+                    reason: UnavailableReason::NoAgent,
+                },
+            ),
+            (AuthOutcome::Busy, DesktopError::AuthBusy),
+        ] {
+            let auth = fake();
+            auth.then(outcome);
+            let r = rig(Settings::default(), auth.clone());
+            let err = r.machine.unlock().unwrap_err();
+            assert_eq!(
+                err.to_ui(),
+                expected.to_ui(),
+                "{outcome:?} gave {err:?}, not {expected:?}"
+            );
+            assert_eq!(
+                r.machine.state(),
+                locked(LockReason::Startup, T0, Some(10)),
+                "{outcome:?}"
+            );
+            assert!(r.hooked.calls().is_empty(), "{outcome:?}");
+            // The prompt is closed: the next attempt asks again.
+            r.machine.unlock().unwrap();
+            assert_eq!(auth.asked().len(), 2, "{outcome:?}");
+        }
+    }
+
+    #[test]
+    fn a_second_unlock_while_the_prompt_is_open_is_busy_and_nothing_waits_for_the_prompt() {
+        let (prompt, ends) = HeldPrompt::new();
+        let r = rig(Settings::default(), prompt);
+        let first = unlock_in_background(&r.machine);
+        ends.opened.recv_timeout(LONG).expect("the prompt opened");
+        let (second, state, guard) = within("a second unlock", {
+            let machine = r.machine.clone();
+            move || (machine.unlock(), machine.state(), machine.guard("op_list"))
+        });
+        assert!(matches!(second, Err(DesktopError::AuthBusy)), "{second:?}");
+        assert!(state.locked);
+        assert!(matches!(guard, Err(DesktopError::Locked)), "{guard:?}");
+        assert!(
+            ends.opened.try_recv().is_err(),
+            "the second unlock opened no prompt"
+        );
+        ends.answer.send(AuthOutcome::Verified).unwrap();
+        first
+            .recv_timeout(LONG)
+            .expect("the first unlock returned")
+            .unwrap();
+        assert!(!r.machine.state().locked);
+        assert_eq!(r.hooked.calls().len(), 1);
+    }
+
+    #[test]
+    fn a_lock_while_the_prompt_is_open_closes_it_and_a_late_yes_does_not_unlock() {
+        let (prompt, ends) = HeldPrompt::new();
+        let r = rig(Settings::default(), prompt);
+        let first = unlock_in_background(&r.machine);
+        ends.opened.recv_timeout(LONG).expect("the prompt opened");
+        r.machine.lock(LockReason::OsSession);
+        ends.tripped
+            .recv_timeout(LONG)
+            .expect("the lock closed the prompt");
+        // The OS says yes anyway, as the session locks.
+        ends.answer.send(AuthOutcome::Verified).unwrap();
+        let result = first.recv_timeout(LONG).expect("the unlock returned");
+        assert!(
+            matches!(result, Err(DesktopError::AuthCancelled)),
+            "{result:?}"
+        );
+        assert_eq!(r.machine.state(), locked(LockReason::Startup, T0, Some(10)));
+        assert!(r.hooked.calls().is_empty());
+        // Closed is closed: the next unlock opens a new prompt.
+        let again = unlock_in_background(&r.machine);
+        ends.opened.recv_timeout(LONG).expect("a new prompt opened");
+        ends.answer.send(AuthOutcome::Verified).unwrap();
+        again.recv_timeout(LONG).expect("it returned").unwrap();
+        assert!(!r.machine.state().locked);
+    }
+
+    #[test]
+    fn a_panicking_prompt_leaves_the_next_unlock_free_to_ask() {
+        struct PanicsOnce(AtomicBool);
+        impl Authenticator for PanicsOnce {
+            fn info(&self) -> AuthInfo {
+                FakeAuthenticator::new().info()
+            }
+            fn verify(&self, _purpose: &AuthPurpose, _cancel: &CancellationToken) -> AuthOutcome {
+                if !self.0.swap(true, SeqCst) {
+                    panic!("the OS prompt broke");
+                }
+                AuthOutcome::Verified
+            }
+        }
+        let r = rig(
+            Settings::default(),
+            Arc::new(PanicsOnce(AtomicBool::new(false))),
+        );
+        let machine = r.machine.clone();
+        assert!(panic::catch_unwind(AssertUnwindSafe(|| machine.unlock())).is_err());
+        assert!(r.machine.state().locked);
+        r.machine
+            .unlock()
+            .expect("not busy behind the broken prompt");
+        assert!(!r.machine.state().locked);
+    }
+
+    // 6. The hook.
+
+    #[test]
+    fn every_transition_calls_the_hook_once_with_the_new_state() {
+        let r = rig(unlocked_at_start(), fake());
+        r.clock.set(T0 + MIN);
+        r.machine.lock(LockReason::Manual);
+        r.machine.lock(LockReason::Manual);
+        r.clock.set(T0 + 2 * MIN);
+        r.machine.unlock().unwrap();
+        r.machine.unlock().unwrap();
+        r.machine.tick(T0 + 12 * MIN);
+        r.machine.tick(T0 + 13 * MIN);
+        r.clock.set(T0 + 14 * MIN);
+        r.machine.unlock().unwrap();
+        assert_eq!(
+            r.hooked.calls(),
+            vec![
+                locked(LockReason::Manual, T0 + MIN, Some(10)),
+                unlocked(T0 + 2 * MIN, Some(10)),
+                locked(LockReason::Idle, T0 + 12 * MIN, Some(10)),
+                unlocked(T0 + 14 * MIN, Some(10)),
+            ]
+        );
+    }
+
+    // 7. The guard.
+
+    #[test]
+    fn locked_it_answers_only_the_allowed_commands() {
+        let r = rig(Settings::default(), fake());
+        for command in COMMANDS {
+            let result = r.machine.guard(command);
+            if ALLOWED_WHILE_LOCKED.contains(command) {
+                assert!(result.is_ok(), "{command}: {result:?}");
+            } else {
+                assert!(
+                    matches!(result, Err(DesktopError::Locked)),
+                    "{command}: {result:?}"
+                );
+            }
+        }
+        assert!(matches!(
+            r.machine.guard("not_a_command"),
+            Err(DesktopError::Locked)
+        ));
+        assert!(
+            COMMANDS.len() > ALLOWED_WHILE_LOCKED.len(),
+            "the test needs refused commands"
+        );
+    }
+
+    #[test]
+    fn unlocked_it_answers_every_command() {
+        let r = rig(unlocked_at_start(), fake());
+        for command in COMMANDS {
+            assert!(r.machine.guard(command).is_ok(), "{command}");
+        }
+    }
+
+    // Settings.
+
+    #[test]
+    fn a_failed_save_leaves_the_settings_in_use_as_they_were() {
+        let r = rig(unlocked_at_start(), fake());
+        let never = Settings {
+            auto_lock: AutoLock::Never,
+            ..unlocked_at_start()
+        };
+        let err = r
+            .machine
+            .set_settings(never, |_| Err(DesktopError::SettingsIo("disk full".into())))
+            .unwrap_err();
+        assert!(matches!(err, DesktopError::SettingsIo(_)), "{err:?}");
+        assert_eq!(r.machine.state().auto_lock_minutes, Some(10));
+        r.machine.tick(T0 + 10 * MIN);
+        assert!(r.machine.state().locked);
+    }
+
+    #[test]
+    fn the_saved_settings_are_the_ones_applied() {
+        let r = rig(unlocked_at_start(), fake());
+        let never = Settings {
+            auto_lock: AutoLock::Never,
+            ..unlocked_at_start()
+        };
+        let saved = Mutex::new(None);
+        r.machine
+            .set_settings(never.clone(), |s| {
+                *saved.lock().unwrap() = Some(s.clone());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(saved.into_inner().unwrap(), Some(never));
+        assert_eq!(r.machine.state().auto_lock_minutes, None);
+    }
+
+    #[test]
+    fn switching_the_lock_off_never_unlocks() {
+        let r = rig(Settings::default(), fake());
+        let off = Settings {
+            lock_enabled: false,
+            ..Settings::default()
+        };
+        r.machine.set_settings(off, |_| Ok(())).unwrap();
+        assert!(r.machine.state().locked);
+        assert!(r.hooked.calls().is_empty());
+    }
+}

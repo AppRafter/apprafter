@@ -30,9 +30,14 @@ tauri-build = { workspace = true }
 [dependencies]
 apprafter-core        = { workspace = true }
 apprafter-desktop-ipc = { path = "../ipc" }
+# `atomic_replace` for settings.json, the helper the CLI writes its own files with.
+cli-core              = { workspace = true }
 # The versions cli/Cargo.toml pins, already in the lock.
 miette                = "7"
 serde                 = { workspace = true }
 serde_json            = { workspace = true }
 tauri                 = { workspace = true }
 thiserror             = "2"
+
+[dev-dependencies]
+tempfile = "3"

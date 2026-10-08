@@ -3,7 +3,9 @@
 
 pub mod auth;
 pub mod errors;
+pub mod lock;
 pub mod ops;
+pub mod settings;
 pub mod window;
 
 /// Build and run the app; returns when the last window closes.
