@@ -1048,6 +1048,7 @@ mod tests {
     /// A stub `kubectl` that logs its argv (and stdin, for a delete) and
     /// answers `delete` with `delete_answer` (a shell snippet), anything else
     /// with nothing.
+    #[cfg(unix)]
     fn stub(dir: &tempfile::TempDir, delete_answer: &str) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt as _;
         let path = dir.path().join("kubectl-stub");
@@ -1076,14 +1077,17 @@ mod tests {
         path
     }
 
+    #[cfg(unix)]
     fn log(dir: &tempfile::TempDir) -> String {
         std::fs::read_to_string(dir.path().join("log")).unwrap_or_default()
     }
 
+    #[cfg(unix)]
     fn soon() -> Instant {
         Instant::now() + Duration::from_secs(10)
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_created_pod_is_deleted_by_uid_without_being_read() {
         let dir = tempfile::tempdir().unwrap();
@@ -1114,6 +1118,7 @@ mod tests {
     /// kubectl run at all: nothing read after the fact makes a pod this
     /// process's. The unsettled one is named with the command that deletes
     /// it.
+    #[cfg(unix)]
     #[test]
     fn a_pod_not_confirmed_as_created_here_is_left_unread() {
         let kc = kubeconfig();
@@ -1153,6 +1158,7 @@ mod tests {
     /// The apiserver's answers to a delete by uid, as `kubectl delete --raw`
     /// prints them (Kubernetes 1.36): a pod of that name that is another one
     /// now, and none at all.
+    #[cfg(unix)]
     #[test]
     fn a_delete_refused_by_its_precondition_or_of_a_gone_pod_is_reported_as_such() {
         let kc = kubeconfig();
@@ -1212,6 +1218,7 @@ mod tests {
 
     /// Bounded: a kubectl that does not answer is killed at the deadline, and
     /// the pod is named for deleting by hand.
+    #[cfg(unix)]
     #[test]
     fn a_kubectl_that_hangs_is_killed_at_the_deadline() {
         let kc = kubeconfig();
@@ -1237,6 +1244,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_signal_the_process_ignores_is_seen_as_ignored() {
         // SIGURG's default action is to ignore it, which is not SIG_IGN; set
@@ -1257,6 +1265,7 @@ mod tests {
     // A second signal removes the stop's kubeconfig copies
     // ------------------------------------------------------------------
 
+    #[cfg(unix)]
     fn recorded(slots: &[AtomicPtr<libc::c_char>], path: &Path) -> bool {
         use std::os::unix::ffi::OsStrExt as _;
         slots.iter().any(|slot| {
@@ -1267,10 +1276,42 @@ mod tests {
         })
     }
 
+    /// Windows: the slots hold plain paths (see `COPY_PATHS`).
+    #[cfg(windows)]
+    fn recorded(slots: &[Mutex<Option<PathBuf>>], path: &Path) -> bool {
+        slots
+            .iter()
+            .any(|slot| slot.lock().unwrap_or_else(|p| p.into_inner()).as_deref() == Some(path))
+    }
+
+    #[cfg(unix)]
     #[test]
     fn what_the_second_signal_runs_removes_every_recorded_path() {
         let slots: [AtomicPtr<libc::c_char>; 2] =
             [const { AtomicPtr::new(std::ptr::null_mut()) }; 2];
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b, c) = (
+            dir.path().join("a"),
+            dir.path().join("b"),
+            dir.path().join("c"),
+        );
+        for p in [&a, &b, &c] {
+            std::fs::write(p, "kubeconfig").unwrap();
+        }
+        claim_slot(&slots, &a).unwrap();
+        claim_slot(&slots, &b).unwrap();
+        // Full: refused, so no copy is ever written unrecorded.
+        assert!(claim_slot(&slots, &c).is_err());
+        unlink_all(&slots);
+        assert!(!a.exists() && !b.exists());
+        assert!(c.exists(), "only what was recorded");
+    }
+
+    /// Windows: the same, with the slots a second Ctrl-C reads.
+    #[cfg(windows)]
+    #[test]
+    fn what_the_second_signal_runs_removes_every_recorded_path() {
+        let slots: [Mutex<Option<PathBuf>>; 2] = [const { Mutex::new(None) }; 2];
         let dir = tempfile::tempdir().unwrap();
         let (a, b, c) = (
             dir.path().join("a"),
@@ -1307,6 +1348,7 @@ mod tests {
     /// hangs — when a second SIGTERM comes. The process exits at once with
     /// 143 and leaves no copy behind; before, `_exit` from the handler left
     /// the decrypted kubeconfig in `$TMPDIR`.
+    #[cfg(unix)]
     #[test]
     fn a_second_signal_exits_at_once_and_leaves_no_kubeconfig_copy() {
         let dir = tempfile::tempdir().unwrap();
@@ -1409,6 +1451,7 @@ mod tests {
     }
 
     /// Wait out `ETXTBSY` on a freshly written executable (see `stub`).
+    #[cfg(unix)]
     fn wait_until_executable(path: &Path) {
         for _ in 0..200 {
             match Command::new(path).arg("__probe").status() {
@@ -1421,6 +1464,7 @@ mod tests {
     /// The child process of the test above, and nothing else: it installs
     /// the interrupt, records one helper pod this process created, says it is
     /// ready and waits for the signals. Run on its own it fails, loudly.
+    #[cfg(unix)]
     #[test]
     #[ignore = "the child process of a_second_signal_exits_at_once_and_leaves_no_kubeconfig_copy"]
     fn second_signal_child() {

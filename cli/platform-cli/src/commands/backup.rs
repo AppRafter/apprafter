@@ -12424,6 +12424,7 @@ mod tests {
     /// still open for writing leaves the new process holding a write handle to
     /// it, and `execve` refuses until that handle is gone. Once a probe
     /// succeeds nothing writes this inode again, so every later spawn is safe.
+    #[cfg(unix)]
     fn stub_kubectl(dir: &tempfile::TempDir, body: &str) -> KubectlExec {
         use std::os::unix::fs::PermissionsExt as _;
         let path = dir.path().join("kubectl-stub");
@@ -12453,6 +12454,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn exec_stream_to_file_writes_the_pods_stdout_to_the_target_path() {
         let dir = tempfile::tempdir().unwrap();
@@ -12479,6 +12481,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_failed_exec_surfaces_the_last_stderr_lines_and_never_the_partial_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -12497,6 +12500,7 @@ mod tests {
 
     /// Run `exec_stream_to_file` on a thread and give up after `watchdog`, so
     /// a missing bound FAILS the test instead of hanging it.
+    #[cfg(unix)]
     fn stream_with_watchdog(
         k: KubectlExec,
         out: PathBuf,
@@ -12515,6 +12519,7 @@ mod tests {
             .unwrap_or_else(|_| panic!("exec_stream_to_file still running after {watchdog:?}"))
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_command_that_writes_nothing_within_the_bound_is_abandoned() {
         // The shape of a pg_dump waiting on a lock during its schema read:
@@ -12542,6 +12547,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_bound_times_only_the_first_byte() {
         // Writing at once and then going quiet for longer than the bound is a
@@ -12559,6 +12565,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "PGDMPREST");
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_first_byte_that_arrives_inside_the_bound_is_kept() {
         let dir = tempfile::tempdir().unwrap();
@@ -12574,6 +12581,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "PGDMP");
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_bounded_command_that_fails_before_writing_reports_its_own_error() {
         // A pg_dump whose TABLE lock wait ran out exits before the first-output
@@ -12591,6 +12599,7 @@ mod tests {
         assert!(!msg.contains(backup_core::kube::NO_OUTPUT_MARKER), "{msg}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn exec_stream_from_file_feeds_the_file_on_the_childs_stdin() {
         let dir = tempfile::tempdir().unwrap();
@@ -12616,6 +12625,7 @@ mod tests {
         assert!(argv.contains("exec -i pg-0 -n prod -- psql"), "{argv}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_consumer_that_stops_reading_early_is_not_a_restore_failure() {
         // `psql` legitimately exits 0 on a `\q` before EOF. The resulting
@@ -12631,6 +12641,7 @@ mod tests {
 
     /// A helper pod as `kubectl get` shows it once it is Running and Ready,
     /// with uid `uid`.
+    #[cfg(unix)]
     fn ready_pod(uid: &str) -> String {
         json!({
             "metadata": {"name": "helper", "namespace": "prod", "uid": uid},
@@ -12639,6 +12650,7 @@ mod tests {
         .to_string()
     }
 
+    #[cfg(unix)]
     #[test]
     fn apply_and_wait_pod_ready_pipes_the_spec_in_and_then_waits_for_ready() {
         let dir = tempfile::tempdir().unwrap();
@@ -12698,6 +12710,7 @@ mod tests {
     /// the pod Running and Ready and print its uid, as `-o jsonpath` does:
     /// `u-created` for a pod a create made, and for an apply the uid the pod
     /// had (`u-applied` if it had none).
+    #[cfg(unix)]
     fn stateful_stub(dir: &tempfile::TempDir, pod: &str, put: &str) -> (KubectlExec, PathBuf) {
         let log = dir.path().join("argv");
         let present = dir.path().join("present.json");
@@ -12736,6 +12749,7 @@ mod tests {
         (k, log)
     }
 
+    #[cfg(unix)]
     fn calls(log: &Path) -> Vec<String> {
         std::fs::read_to_string(log)
             .unwrap()
@@ -12744,11 +12758,13 @@ mod tests {
             .collect()
     }
 
+    #[cfg(unix)]
     const HELPER: &str = r#"{"metadata": {"name": "helper", "namespace": "prod"}}"#;
 
     /// A helper pod left behind `Completed` by an earlier run never becomes
     /// Ready again, so applying over it used to cost the whole five-minute
     /// wait and then the run. It is deleted, waited out, and created again.
+    #[cfg(unix)]
     #[test]
     fn an_ended_leftover_helper_is_deleted_and_created_again() {
         let dir = tempfile::tempdir().unwrap();
@@ -12779,6 +12795,7 @@ mod tests {
 
     /// A pod that is still running is used as it is: a same-spec apply over
     /// it changes nothing, and deleting it would kill whatever runs in it.
+    #[cfg(unix)]
     #[test]
     fn a_running_helper_of_the_same_spec_is_applied_over_not_replaced() {
         let dir = tempfile::tempdir().unwrap();
@@ -12794,6 +12811,7 @@ mod tests {
 
     /// The six-hour helper a command applies, and the same pod as `kubectl
     /// get` shows it, running, its container started `ago` before now.
+    #[cfg(unix)]
     fn six_hour_helper(ago: Duration) -> (Value, String) {
         let spec = json!({
             "metadata": {"name": "helper", "namespace": "prod"},
@@ -12811,6 +12829,7 @@ mod tests {
     /// A helper left running by a command interrupted before its cleanup —
     /// Ctrl-C on `backup create` five hours ago — has one hour of its `sleep`
     /// left, and a dump in it would die then. It is replaced.
+    #[cfg(unix)]
     #[test]
     fn a_running_leftover_with_hours_of_its_keep_alive_used_is_replaced() {
         let dir = tempfile::tempdir().unwrap();
@@ -12821,6 +12840,7 @@ mod tests {
     }
 
     /// One another command created moments ago is used as it is.
+    #[cfg(unix)]
     #[test]
     fn a_running_helper_started_moments_ago_is_used_as_it_is() {
         let dir = tempfile::tempdir().unwrap();
@@ -12834,6 +12854,7 @@ mod tests {
     /// runner's — is refused by the apiserver on the FIRST line of kubectl's
     /// stderr, above a diff of the pod spec that can run longer than the lines
     /// an error keeps (sixty here). It is replaced all the same.
+    #[cfg(unix)]
     #[test]
     fn a_leftover_whose_spec_cannot_change_in_place_is_replaced() {
         let dir = tempfile::tempdir().unwrap();
@@ -12861,6 +12882,7 @@ mod tests {
 
     /// A backup helper pod spec, as the builders stamp it: the interrupt
     /// tracks only pods carrying the helper label.
+    #[cfg(unix)]
     const LABELLED_HELPER: &str = r#"{"metadata": {"name": "helper", "namespace": "prod",
         "labels": {"apprafter.io/backup-helper": "true"}}}"#;
 
@@ -12868,6 +12890,7 @@ mod tests {
     /// the interrupt, from the apiserver's answer — created by this command
     /// (deleted on Ctrl-C, by uid) or there before it (left for the run using
     /// it).
+    #[cfg(unix)]
     #[test]
     fn each_helper_put_records_whether_it_created_its_pod() {
         use helper_interrupt::Origin;
@@ -12923,6 +12946,7 @@ mod tests {
     /// before, so Ctrl-C leaves it and the other run's dump goes on. Before,
     /// an apply "configured" it and the first read took it for this
     /// command's.
+    #[cfg(unix)]
     #[test]
     fn a_pod_another_run_created_after_the_read_is_not_taken_for_this_ones() {
         use helper_interrupt::Origin;
@@ -12971,6 +12995,7 @@ mod tests {
     /// immutable update, made nothing: when the step fails right after, the
     /// interrupt has no record of that pod at all, rather than one it cannot
     /// settle.
+    #[cfg(unix)]
     #[test]
     fn a_refused_create_or_update_leaves_no_record() {
         let spec: Value = serde_json::from_str(LABELLED_HELPER).unwrap();
@@ -13020,6 +13045,7 @@ mod tests {
     /// the one read just before it (that one was replaced in between), and a
     /// create whose kubectl died unanswered — the same Ctrl-C reaches it —
     /// stay unconfirmed, and the interrupt leaves both.
+    #[cfg(unix)]
     #[test]
     fn a_put_without_a_telling_answer_stays_unconfirmed() {
         use helper_interrupt::Origin;
@@ -13075,6 +13101,7 @@ mod tests {
     /// Forgotten once the command's own delete went through — and kept when
     /// it did not (its kubectl may have died of the same Ctrl-C), for the
     /// interrupt to delete.
+    #[cfg(unix)]
     #[test]
     fn a_helper_is_forgotten_only_once_its_delete_went_through() {
         use helper_interrupt::Origin;
@@ -13111,6 +13138,7 @@ mod tests {
     /// Once interrupted, the command's own thread makes no kubectl call at
     /// all: no apply that would outlive it, no exec, and no delete by name —
     /// the interrupt's deletes, by uid, are the only ones.
+    #[cfg(unix)]
     #[test]
     fn once_interrupted_no_kubectl_is_run_from_the_command() {
         let spec: Value = serde_json::from_str(LABELLED_HELPER).unwrap();
@@ -13178,6 +13206,7 @@ mod tests {
     /// WI-383, the CLI's side: a helper whose credential Secret is missing
     /// cannot start its container, and the wait says so with the kubelet's
     /// words once that has held for the grace — not after five minutes.
+    #[cfg(unix)]
     #[test]
     fn a_helper_whose_credential_secret_is_missing_fails_the_wait_with_the_kubelets_words() {
         let dir = tempfile::tempdir().unwrap();
@@ -13220,6 +13249,7 @@ mod tests {
     }
 
     /// Every other apply failure is the run's own, and nothing is deleted.
+    #[cfg(unix)]
     #[test]
     fn another_apply_failure_deletes_nothing() {
         let dir = tempfile::tempdir().unwrap();
@@ -13236,6 +13266,7 @@ mod tests {
 
     /// A stale pod that will not go — its node unreachable — stops the step
     /// with the way out, rather than applying over it.
+    #[cfg(unix)]
     #[test]
     fn a_stale_helper_that_will_not_go_fails_with_the_way_out() {
         let dir = tempfile::tempdir().unwrap();
@@ -13585,6 +13616,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_pod_spec_without_an_identity_is_refused_before_kubectl_is_spawned() {
         let dir = tempfile::tempdir().unwrap();
@@ -13601,6 +13633,7 @@ mod tests {
         assert!(format!("{no_ns}").contains("metadata.namespace"), "{no_ns}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_pod_that_never_becomes_ready_is_reported_as_a_timeout_not_an_apply_failure() {
         let dir = tempfile::tempdir().unwrap();
@@ -13656,6 +13689,7 @@ mod tests {
         assert!(msg.contains("pods is forbidden"), "{msg}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_kubectl_that_dies_before_reading_the_spec_reports_its_own_complaint() {
         // The failure this guards is a diagnosis being replaced by a symptom.
@@ -13703,6 +13737,7 @@ mod tests {
         assert!(msg.contains("Broken pipe"), "{msg}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn get_secret_key_base64_decodes_the_jsonpath_output() {
         let dir = tempfile::tempdir().unwrap();
@@ -13727,6 +13762,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn get_secret_key_reports_a_non_base64_value_rather_than_returning_junk() {
         let dir = tempfile::tempdir().unwrap();
@@ -13741,6 +13777,7 @@ mod tests {
         assert!(msg.contains("NotFound"), "carries kubectl's stderr: {msg}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn get_json_treats_notfound_as_absence_and_everything_else_as_failure() {
         // The distinction the whole backup sweep rests on: a Secret that does
@@ -13781,6 +13818,7 @@ mod tests {
         assert!(msg.contains("kubectl JSON parse"), "{msg}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn deleting_a_helper_pod_does_not_wait_and_does_not_fail_the_run() {
         // This runs in the cleanup path of a backup that already produced its

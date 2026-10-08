@@ -7523,6 +7523,7 @@ mod tests {
     /// A non-zero restic exit MUST become an error: the steps that follow read
     /// the restored tree off disk, so a swallowed failure leaves an empty tree
     /// and reports a successful restore over nothing.
+    #[cfg(unix)]
     #[test]
     fn restic_output_to_result_yields_stdout_or_an_error_carrying_stderr() {
         use std::os::unix::process::ExitStatusExt;
