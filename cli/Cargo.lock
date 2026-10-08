@@ -299,10 +299,13 @@ dependencies = [
  "cli-core",
  "cli-providers",
  "miette",
+ "proc-macro2",
  "serde",
  "serde_json",
+ "syn 2.0.119",
  "tempfile",
  "thiserror 2.0.20",
+ "toml",
 ]
 
 [[package]]

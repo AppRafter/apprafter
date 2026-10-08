@@ -19,4 +19,10 @@ serde_json    = { workspace = true }
 thiserror     = { workspace = true }
 
 [dev-dependencies]
+# tests/guards.rs reads the sources as syntax trees, not text. `syn` 2 and
+# `toml` 0.5 are the versions already in the lock (no new package);
+# `span-locations` gives the guard's findings their line numbers.
+proc-macro2   = { version = "1", features = ["span-locations"] }
+syn           = { version = "2", features = ["full", "visit", "parsing"] }
 tempfile      = { workspace = true }
+toml          = "0.5"
