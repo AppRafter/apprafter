@@ -52,6 +52,14 @@ tracing-subscriber    = { version = "0.3", features = ["fmt"] }
 # The account and host name the title bar shows (`app_info`).
 whoami                = "~2.1"
 
+[target.'cfg(unix)'.dependencies]
+# SIGTERM, SIGHUP and SIGINT run the quit (src/signals.rs), as cli/platform-cli handles them.
+# `signal-hook`: new to this lock but not to the repo — the version cli/Cargo.lock pins, its
+# registry crate already here through zbus. `libc`: the one `sigaction` query std has no form
+# of, whether a signal was ignored when the process started; already in the lock.
+libc        = "0.2"
+signal-hook = "0.3"
+
 [dev-dependencies]
 # The mock runtime for tests/ipc_mock.rs.
 tauri       = { workspace = true, features = ["test"] }

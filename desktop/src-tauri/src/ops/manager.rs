@@ -265,9 +265,9 @@ impl OperationManager {
     /// suspend expires it, a wall clock stepped back does not keep it alive.
     ///
     /// A plan lives until it is executed, cancelled or discarded, the app locks, or one
-    /// [`PLAN_TTL_MS`] after it expired: swept here and on every
-    /// [`flush_due`](Self::flush_due) tick, so an abandoned plan does not keep what its
-    /// executor captured. Until then `execute` answers `PlanExpired`.
+    /// [`PLAN_TTL_MS`] after it expired: swept here and on every [`sweep`](Self::sweep)
+    /// tick, so an abandoned plan does not keep what its executor captured. Until then
+    /// `execute` answers `PlanExpired`.
     pub fn register_plan(&self, parts: PlanParts, exec: Executor) -> PlanView {
         let registered = Stamp::now(&*self.clock);
         let expires_at_ms = registered.wall_ms.saturating_add(PLAN_TTL_MS);
@@ -643,28 +643,31 @@ impl OperationManager {
         }
     }
 
-    /// The output ticker (every [`FLUSH_AGE_MS`](super::reporter::FLUSH_AGE_MS)): send the
-    /// output that has waited long enough, and sweep the plans long expired.
+    /// The output ticker (every [`FLUSH_AGE_MS`](super::reporter::FLUSH_AGE_MS) while an
+    /// operation runs): send the output that has waited long enough.
     ///
     /// The reporters are called after the lock is released. A reporter calls its sink,
     /// which takes this lock, under its own lock; holding them the other way round
     /// deadlocks against an operation that is writing.
     pub fn flush_due(&self) {
-        let (reporters, swept) = {
-            let mut inner = self.lock();
-            let swept = inner.sweep(&*self.clock);
-            let reporters: Vec<Arc<OpReporter>> = inner
-                .ops
-                .values()
-                .filter_map(|op| op.run().map(|run| run.reporter.clone()))
-                .collect();
-            (reporters, swept)
-        };
-        drop(swept);
+        let reporters: Vec<Arc<OpReporter>> = self
+            .lock()
+            .ops
+            .values()
+            .filter_map(|op| op.run().map(|run| run.reporter.clone()))
+            .collect();
         let now = self.clock.now_ms();
         for reporter in reporters {
             reporter.flush_due(now);
         }
+    }
+
+    /// The idle ticker (every few seconds, whatever runs): drop every plan one
+    /// [`PLAN_TTL_MS`] past its expiry, its pages told it expired, so an abandoned plan does
+    /// not keep what its executor captured. The plans are dropped after the lock is released.
+    pub fn sweep(&self) {
+        let swept = self.lock().sweep(&*self.clock);
+        drop(swept);
     }
 
     /// Quit: refuse every open prompt and close its dialog, trip every running operation's
@@ -2372,7 +2375,7 @@ mod tests {
         let fresh = mgr.register_plan(parts(PlanClass::Bounded), counting(&runs));
         assert_eq!(fresh.expires_at_ms, T0 + DAY + PLAN_TTL_MS);
         clock.set_wall(T0);
-        mgr.flush_due();
+        mgr.sweep();
         mgr.register_plan(parts(PlanClass::Bounded), returns(json!(0)));
         mgr.execute(fresh.op_id, &auth).unwrap();
         assert_eq!(wait_ended(&mgr, fresh.op_id), OpState::Finished);
@@ -2417,12 +2420,14 @@ mod tests {
             calls_back_on_drop(&mgr, &dropped),
         );
         clock.advance(2 * PLAN_TTL_MS);
-        mgr.flush_due();
+        mgr.sweep();
         assert!(!dropped.load(SeqCst), "kept for one TTL past its expiry");
         clock.advance(1);
+        mgr.flush_due();
+        assert!(!dropped.load(SeqCst), "the output ticker sweeps nothing");
         {
             let mgr = mgr.clone();
-            within("flush_due", move || mgr.flush_due());
+            within("sweep", move || mgr.sweep());
         }
         assert!(dropped.load(SeqCst), "what the executor captured is freed");
         assert!(matches!(
@@ -2439,13 +2444,13 @@ mod tests {
                 clock.advance(2 * PLAN_TTL_MS + 1);
                 mgr.register_plan(parts(PlanClass::Bounded), returns(json!(0)));
             }),
-            ("the sweep in flush_due", |mgr, clock, _| {
+            ("the ticker's sweep", |mgr, clock, _| {
                 clock.advance(2 * PLAN_TTL_MS + 1);
-                mgr.flush_due();
+                mgr.sweep();
             }),
             ("the sweep after a suspend", |mgr, clock, _| {
                 clock.set_wall(T0 + DAY);
-                mgr.flush_due();
+                mgr.sweep();
             }),
             ("an expired execute", |mgr, clock, id| {
                 clock.advance(PLAN_TTL_MS + 1);
@@ -2510,9 +2515,9 @@ mod tests {
                 mgr.drop_all_plans();
                 DesktopError::Locked
             }),
-            ("the sweep in flush_due", |mgr, clock, id| {
+            ("the ticker's sweep", |mgr, clock, id| {
                 clock.advance(2 * PLAN_TTL_MS + 1);
-                mgr.flush_due();
+                mgr.sweep();
                 DesktopError::PlanExpired { op_id: id }
             }),
             ("the sweep in register_plan", |mgr, clock, id| {

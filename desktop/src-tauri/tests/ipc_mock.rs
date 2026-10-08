@@ -16,6 +16,7 @@ use std::sync::Arc;
 use apprafter_core::{CancellationToken, Context, Outcome, PlanClass};
 use apprafter_desktop::app::{self, Shell, ShellCell};
 use apprafter_desktop::auth::{AuthPurpose, Authenticator};
+use apprafter_desktop::menu;
 use apprafter_desktop::ops::{Executor, PlanParts, SystemClock};
 use apprafter_desktop::settings::SettingsStore;
 use apprafter_desktop_ipc::{
@@ -23,6 +24,7 @@ use apprafter_desktop_ipc::{
 };
 use serde_json::{json, Value};
 use tauri::ipc::{CallbackFn, InvokeBody};
+use tauri::menu::{MenuEvent, MenuId, MenuItemKind};
 use tauri::test::{get_ipc_response, mock_builder, MockRuntime, INVOKE_KEY};
 use tauri::webview::InvokeRequest;
 use tauri::{WebviewUrl, WebviewWindow, WebviewWindowBuilder};
@@ -245,6 +247,57 @@ fn the_capability_grants_listen_unlisten_and_every_app_command_only() {
     assert_eq!(set, expected);
     assert_eq!(capability["windows"], json!(["main"]));
     assert_eq!(capability.get("remote"), None, "no remote origin");
+}
+
+/// The macOS app menu, built here on any OS (the app sets it on macOS only): one Quit, the
+/// app's own item rather than the system's `terminate:`, and choosing it runs the quit
+/// sequence — afterwards nothing starts.
+#[test]
+fn the_app_menus_quit_is_the_apps_own_and_runs_the_quit_sequence() {
+    let rig = rig(lock_off());
+    let handle = rig._app.handle();
+    let bar = menu::app_menu(handle).unwrap();
+    let mut items = Vec::new();
+    for top in bar.items().unwrap() {
+        let submenu = top.as_submenu().expect("a menu bar of submenus");
+        items.extend(submenu.items().unwrap());
+    }
+    let quits: Vec<String> = items
+        .iter()
+        .filter_map(|item| {
+            let text = match item {
+                MenuItemKind::MenuItem(item) => item.text(),
+                MenuItemKind::Predefined(item) => item.text(),
+                _ => return None,
+            };
+            Some(text.unwrap()).filter(|text| text.contains("Quit"))
+        })
+        .collect();
+    assert_eq!(quits, ["Quit AppRafter"], "one Quit, and no predefined one");
+    let quit = items
+        .iter()
+        .find(|item| item.id() == menu::QUIT_ITEM)
+        .expect("the Quit item");
+    assert!(quit.as_menuitem().is_some(), "the app's own item");
+
+    // As in the first test, the quit thread's final exit panics in the mock runtime, on its
+    // own thread, after everything checked here.
+    menu::on_menu_event(
+        handle,
+        &MenuEvent {
+            id: MenuId::new(menu::QUIT_ITEM),
+        },
+    );
+    let plan = rig.shell.ops.register_plan(
+        PlanParts::new(PlanClass::Bounded, "Upgrade", "upgrade"),
+        Box::new(|_, _| Ok(Outcome::Completed { result: json!(0) })),
+    );
+    let reply = invoke(
+        &rig,
+        "op_execute",
+        json!({ "opId": plan.op_id, "onEvent": "__CHANNEL__:7" }),
+    );
+    assert_eq!(code(&reply), Some(errors::CLOSING), "{reply:?}");
 }
 
 #[test]

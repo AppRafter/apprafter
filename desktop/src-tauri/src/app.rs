@@ -21,11 +21,19 @@
 //!
 //! # Quitting
 //!
-//! Every way out — the `quit` command, the last window closing, the OS asking — goes through
-//! [`quit`]: [`Shell::begin_quit`] closes the operation manager (nothing new starts), the
-//! unlock prompt and every operation prompt, and drops every plan; then a `quit` thread cancels
-//! the running operations, waits up to [`STOP_BOUND`] for them to stop, and exits. The run
-//! loop's exit request is refused until that thread is done ([`on_exit_requested`]).
+//! Every way out the app sees coming — the `quit` command, the last window closing, the macOS
+//! app menu's Quit ([`crate::menu`]), a quit signal ([`crate::signals`]), an exit request
+//! from the OS — goes through [`quit`]: [`Shell::begin_quit`] closes the operation manager
+//! (nothing new starts) and the lock machine (no unlock prompt opens), closes every open
+//! prompt, and drops every plan; then a `quit` thread cancels the running operations, waits up
+//! to [`STOP_BOUND`] for them to stop, and exits. The run loop's exit request is refused until
+//! that thread is done ([`on_exit_requested`]).
+//!
+//! Some exits the OS starts never ask: macOS ends an app with `terminate:` (the Dock's Quit, a
+//! logout, a shutdown), Windows ends a session's apps with `WM_ENDSESSION`, and the event loop
+//! exits with no exit request. [`Shell::on_exit`] runs the same quit there, with a wait of
+//! [`FORCED_STOP_BOUND`] on the main thread: the process ends as it returns. A process killed
+//! outright (`SIGKILL`, the Task Manager) runs nothing at all.
 
 use std::io;
 use std::panic::{self, AssertUnwindSafe};
@@ -52,6 +60,11 @@ use crate::settings::SettingsStore;
 /// How long a quit waits for cancelled operations to stop before it exits anyway: the CLI's
 /// helper-pod stop bound.
 pub const STOP_BOUND: Duration = Duration::from_secs(15);
+
+/// How long an exit the OS forced waits for cancelled operations ([`Shell::on_exit`]): short,
+/// since the OS is ending the process anyway and the wait blocks the main thread — Windows
+/// gives a session's apps about five seconds once the session ends.
+pub const FORCED_STOP_BOUND: Duration = Duration::from_secs(3);
 
 /// How often the idle ticker asks the lock whether the idle time has passed.
 pub const IDLE_TICK: Duration = Duration::from_secs(5);
@@ -82,6 +95,10 @@ pub struct Shell {
 }
 
 /// The tickers' stop signal: a ticker waits on it between ticks, so stopping wakes it at once.
+/// An idle ticker waits on it too, for work ([`nudge`](Self::nudge)).
+///
+/// Its lock comes before the [`OperationManager`]'s: a waiter's `ready` may take the
+/// manager's lock under it, so nothing may nudge or stop while holding the manager's lock.
 #[derive(Default)]
 struct Stop {
     stopped: Mutex<bool>,
@@ -91,12 +108,26 @@ struct Stop {
 impl Stop {
     /// Wait `every`, or until stopped; `true` once stopped.
     fn wait(&self, every: Duration) -> bool {
+        self.wait_until(every, || false)
+    }
+
+    /// Wait until `ready` holds or `backstop` has passed, or until stopped; `true` once
+    /// stopped. `ready` is asked under this lock, first and on every wake, so a
+    /// [`nudge`](Self::nudge) after a change it reads is never missed.
+    fn wait_until(&self, backstop: Duration, ready: impl Fn() -> bool) -> bool {
         let stopped = self.stopped.lock().unwrap_or_else(PoisonError::into_inner);
         let (stopped, _) = self
             .wake
-            .wait_timeout_while(stopped, every, |stopped| !*stopped)
+            .wait_timeout_while(stopped, backstop, |stopped| !*stopped && !ready())
             .unwrap_or_else(PoisonError::into_inner);
         *stopped
+    }
+
+    /// Something a waiter's `ready` reads changed: every waiter asks again. Under the lock,
+    /// so the wake cannot fall between a waiter's asking and its waiting.
+    fn nudge(&self) {
+        let _held = self.stopped.lock().unwrap_or_else(PoisonError::into_inner);
+        self.wake.notify_all();
     }
 
     fn stop(&self) {
@@ -190,7 +221,8 @@ impl Shell {
 
     /// Run plan `id`, `sink` following it from before the prompt. The subscription it holds,
     /// for `op_unsubscribe`; on an error the sink is unsubscribed again, so a busy prompt's
-    /// retry does not leave the first attempt's sink behind.
+    /// retry does not leave the first attempt's sink behind. A started operation wakes the
+    /// output flusher, which sleeps while nothing runs.
     pub fn execute(
         &self,
         id: OpId,
@@ -198,7 +230,10 @@ impl Shell {
     ) -> Result<SubscriptionId, DesktopError> {
         let subscription = self.ops.subscribe(id, sink)?.subscription;
         match self.ops.execute(id, &*self.auth) {
-            Ok(_) => Ok(subscription),
+            Ok(_) => {
+                self.stop.nudge();
+                Ok(subscription)
+            }
             Err(e) => {
                 self.ops.unsubscribe(id, subscription);
                 Err(e)
@@ -206,17 +241,41 @@ impl Shell {
         }
     }
 
-    /// The first step of a quit, once: no operation starts from here on (`Closing`), the
-    /// unlock prompt and every operation prompt are closed, and every pending plan is
-    /// dropped. `false` when a quit had already begun.
+    /// The first step of a quit, once: no operation starts and no unlock prompt opens from
+    /// here on (`Closing`), the open unlock prompt and every operation prompt are closed, and
+    /// every pending plan is dropped. `false` when a quit had already begun.
     pub fn begin_quit(&self) -> bool {
         if self.quitting.swap(true, SeqCst) {
             return false;
         }
         self.ops.close();
-        self.lock.close_prompt();
+        self.lock.close();
         self.ops.drop_all_plans();
         true
+    }
+
+    /// The event loop is exiting (`RunEvent::Exit`, on the main thread): the process ends once
+    /// this returns.
+    ///
+    /// When the quit has not waited for the running operations, the exit never went through
+    /// [`quit`]: the OS ended the app without asking (see the module docs). The quit begins
+    /// here, every subscription ends (the webview goes with the process), and this cancels the
+    /// running operations and waits for them up to [`FORCED_STOP_BOUND`]. Either way the
+    /// tickers stop.
+    pub fn on_exit(&self) {
+        if !self.drained.load(SeqCst) {
+            tracing::info!("the OS is ending the app: stopping the running operations");
+            self.begin_quit();
+            self.ops.drop_all_subscribers();
+            if !self.ops.cancel_all_and_wait(FORCED_STOP_BOUND) {
+                tracing::warn!(
+                    running = self.ops.running(),
+                    "operations still running {FORCED_STOP_BOUND:?} after the exit cancelled \
+                     them; exiting"
+                );
+            }
+        }
+        self.stop_tickers();
     }
 
     /// The event loop exited: the tickers stop now.
@@ -356,34 +415,58 @@ pub fn on_exit_requested<R: Runtime>(app: &AppHandle<R>, shell: &Arc<Shell>, api
     quit(app, shell);
 }
 
-/// Start the idle ticker (every [`IDLE_TICK`], the lock's idle check) and the output flusher
-/// (every [`FLUSH_TICK`], the operations' waiting output and long-expired plans), each on a
-/// `std::thread` of its own — never an async task: the lock hook they can set off drops plans
-/// and starts threads. They stop once the event loop exits ([`Shell::stop_tickers`]). An
-/// `Err` means no idle lock, so the app must not start.
+/// Start the idle ticker (every [`IDLE_TICK`]: the lock's idle check and the sweep of
+/// long-expired plans) and the output flusher (every [`FLUSH_TICK`] while an operation runs:
+/// the output that waited long enough), each on a `std::thread` of its own — never an async
+/// task: the lock hook they can set off drops plans and starts threads. While nothing runs the
+/// flusher sleeps, so an idle app does not wake twenty times a second; [`Shell::execute`] wakes
+/// it, and [`IDLE_TICK`] is its backstop. They stop once the event loop exits
+/// ([`Shell::stop_tickers`]). An `Err` means no idle lock, so the app must not start.
 pub fn start_tickers(shell: &Arc<Shell>) -> io::Result<()> {
-    spawn_ticker("idle-ticker", IDLE_TICK, shell, |shell| shell.lock.tick())?;
-    spawn_ticker("output-flusher", FLUSH_TICK, shell, |shell| {
+    spawn_ticker("idle-ticker", IDLE_TICK, shell, |_| true, idle_tick)?;
+    spawn_ticker("output-flusher", FLUSH_TICK, shell, running, |shell| {
         shell.ops.flush_due()
     })
 }
 
+/// The idle ticker's work: lock once the idle time has passed, and drop the plans one time to
+/// live past their expiry.
+fn idle_tick(shell: &Shell) {
+    shell.lock.tick();
+    shell.ops.sweep();
+}
+
+/// Whether an operation runs: the output flusher has work.
+fn running(shell: &Shell) -> bool {
+    shell.ops.running() > 0
+}
+
+/// A ticker that calls `tick` every `every` while `active` holds, and otherwise sleeps until
+/// it does (asked on a nudge, and at least every [`IDLE_TICK`]).
 fn spawn_ticker(
     name: &str,
     every: Duration,
     shell: &Arc<Shell>,
+    active: fn(&Shell) -> bool,
     tick: fn(&Shell),
 ) -> io::Result<()> {
     let shell = shell.clone();
     let label = name.to_string();
     thread::Builder::new()
         .name(label.clone())
-        .spawn(move || {
-            while !shell.stop.wait(every) {
-                // One bad tick must not end the ticker, and with it every later auto-lock.
-                if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| tick(&shell))) {
-                    tracing::error!("{label} panicked: {}", panic_message(&*payload));
-                }
+        .spawn(move || loop {
+            if shell.stop.wait_until(IDLE_TICK, || active(&shell)) {
+                break;
+            }
+            if !active(&shell) {
+                continue;
+            }
+            if shell.stop.wait(every) {
+                break;
+            }
+            // One bad tick must not end the ticker, and with it every later auto-lock.
+            if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| tick(&shell))) {
+                tracing::error!("{label} panicked: {}", panic_message(&*payload));
             }
         })
         .map(drop)
@@ -391,7 +474,7 @@ fn spawn_ticker(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
     use std::thread;
@@ -408,7 +491,7 @@ mod tests {
     use crate::auth::{AuthPurpose, Authenticator, FakeAuthenticator, NoAuthenticator};
     use crate::errors::DesktopError;
     use crate::ops::test_clock::ManualClock;
-    use crate::ops::{EventSink, Executor, PlanParts};
+    use crate::ops::{EventSink, Executor, PlanParts, PLAN_TTL_MS};
     use crate::settings::SettingsStore;
 
     const T0: u64 = 1_700_000_000_000;
@@ -416,6 +499,7 @@ mod tests {
 
     struct Rig {
         _dir: tempfile::TempDir,
+        clock: Arc<ManualClock>,
         shell: Arc<Shell>,
         notified: Arc<Mutex<Vec<LockState>>>,
     }
@@ -431,7 +515,7 @@ mod tests {
             Shell::new(
                 store,
                 auth,
-                clock,
+                clock.clone(),
                 Context::for_desktop(dir.path().join("store"), "http://127.0.0.1:9"),
                 false,
                 move |state| notified.lock().unwrap().push(state.clone()),
@@ -439,6 +523,7 @@ mod tests {
         };
         Rig {
             _dir: dir,
+            clock,
             shell,
             notified,
         }
@@ -759,6 +844,179 @@ mod tests {
         assert!(!ran.load(SeqCst));
     }
 
+    /// A running operation that ignores its token until `release` sends; `tripped` hears when
+    /// the token trips.
+    struct Stubborn {
+        id: OpId,
+        tripped: mpsc::Receiver<()>,
+        release: mpsc::Sender<()>,
+    }
+
+    fn stubborn(shell: &Shell, page: Arc<Sink>) -> Stubborn {
+        let (tripped_tx, tripped) = mpsc::channel();
+        let (release, released) = mpsc::channel::<()>();
+        let exec: Executor = Box::new(move |_, token| {
+            let _registration = token.on_cancel(move || {
+                let _ = tripped_tx.send(());
+            });
+            let _ = released.recv_timeout(LONG);
+            Ok(Outcome::Completed {
+                result: json!("ignored the token"),
+            })
+        });
+        let id = shell
+            .ops
+            .register_plan(
+                PlanParts::new(PlanClass::Bounded, "Upgrade", "upgrade"),
+                exec,
+            )
+            .op_id;
+        shell.execute(id, page).unwrap();
+        Stubborn {
+            id,
+            tripped,
+            release,
+        }
+    }
+
+    #[test]
+    fn an_exit_the_os_forced_quits_and_waits_its_short_bound_for_a_stubborn_op() {
+        let r = rig(unlocked_at_start(), Arc::new(FakeAuthenticator::new()));
+        let page = Arc::new(Sink::default());
+        let op = stubborn(&r.shell, page.clone());
+        let ran = Arc::new(AtomicBool::new(false));
+        let pending = plan(&r.shell, &ran);
+
+        let started = Instant::now();
+        r.shell.on_exit();
+        let waited = started.elapsed();
+        assert!(
+            waited >= super::FORCED_STOP_BOUND,
+            "returned after {waited:?}"
+        );
+        assert!(
+            waited < super::FORCED_STOP_BOUND + Duration::from_secs(2),
+            "returned after {waited:?}"
+        );
+        assert_eq!(super::FORCED_STOP_BOUND, Duration::from_secs(3));
+        op.tripped
+            .recv_timeout(LONG)
+            .expect("the exit tripped the operation's token");
+
+        // The quit began: the plans are gone, nothing new starts, no unlock prompt opens.
+        assert!(matches!(
+            r.shell.ops.execute(pending, &FakeAuthenticator::new()),
+            Err(DesktopError::PlanNotFound { .. })
+        ));
+        let after = plan(&r.shell, &ran);
+        let err = r
+            .shell
+            .ops
+            .execute(after, &FakeAuthenticator::new())
+            .unwrap_err();
+        assert!(matches!(err, DesktopError::Closing), "{err:?}");
+        assert!(!ran.load(SeqCst));
+        assert!(r.shell.stop.wait(LONG), "the tickers stopped");
+
+        // Nothing reaches the departing webview, the operation's end included.
+        op.release.send(()).unwrap();
+        wait_until("the operation ended", || r.shell.ops.running() == 0);
+        assert!(page.0.lock().unwrap().is_empty(), "{:?}", page.0);
+        assert!(r.shell.lock_now().locked, "a lock still locks");
+        assert!(matches!(r.shell.unlock(), Err(DesktopError::Closing)));
+    }
+
+    #[test]
+    fn an_exit_after_the_quit_drained_waits_for_nothing() {
+        let r = rig(unlocked_at_start(), Arc::new(FakeAuthenticator::new()));
+        let op = stubborn(&r.shell, Arc::new(Sink::default()));
+        // As the quit thread leaves it, once its own wait is over.
+        r.shell.drained.store(true, SeqCst);
+        let started = Instant::now();
+        r.shell.on_exit();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(
+            op.tripped.recv_timeout(Duration::from_millis(100)).is_err(),
+            "the exit cancelled nothing more"
+        );
+        assert!(r.shell.stop.wait(LONG), "the tickers stopped");
+        op.release.send(()).unwrap();
+        wait_until("the operation ended", || r.shell.ops.running() == 0);
+        assert!(r.shell.ops.list().iter().any(|op_| op_.op_id == op.id));
+    }
+
+    #[test]
+    fn the_idle_tick_sweeps_the_plans_long_expired() {
+        // No auto-lock: a lock would drop the plan first.
+        let never = Settings {
+            auto_lock: AutoLock::Never,
+            ..unlocked_at_start()
+        };
+        let r = rig(never, Arc::new(FakeAuthenticator::new()));
+        let ran = Arc::new(AtomicBool::new(false));
+        let abandoned = plan(&r.shell, &ran);
+        let page = Arc::new(Sink::default());
+        r.shell.ops.subscribe(abandoned, page.clone()).unwrap();
+        r.clock.advance(2 * PLAN_TTL_MS);
+        super::idle_tick(&r.shell);
+        assert!(
+            page.0.lock().unwrap().is_empty(),
+            "kept one TTL past its expiry"
+        );
+        r.clock.advance(1);
+        r.shell.ops.flush_due();
+        assert!(
+            page.0.lock().unwrap().is_empty(),
+            "the flusher sweeps nothing"
+        );
+        super::idle_tick(&r.shell);
+        assert_eq!(
+            *page.0.lock().unwrap(),
+            vec![OpEvent::Failed {
+                error: DesktopError::PlanExpired { op_id: abandoned }.to_ui()
+            }],
+            "swept, and its page told why"
+        );
+    }
+
+    /// Counts the test flusher's ticks.
+    static FLUSHES: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn the_output_flusher_sleeps_while_nothing_runs() {
+        let r = rig(unlocked_at_start(), Arc::new(FakeAuthenticator::new()));
+        super::spawn_ticker(
+            "test-flusher",
+            Duration::from_millis(1),
+            &r.shell,
+            super::running,
+            |_| {
+                FLUSHES.fetch_add(1, SeqCst);
+            },
+        )
+        .unwrap();
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(FLUSHES.load(SeqCst), 0, "idle: not a tick");
+
+        let (id, next) = two_stages(&r.shell);
+        let started = Instant::now();
+        r.shell.execute(id, Arc::new(Sink::default())).unwrap();
+        wait_until("the flusher ticked", || FLUSHES.load(SeqCst) > 2);
+        assert!(
+            started.elapsed() < super::IDLE_TICK / 2,
+            "the start woke it, not the backstop: {:?}",
+            started.elapsed()
+        );
+
+        next.send(()).unwrap();
+        wait_until("the operation ended", || r.shell.ops.running() == 0);
+        // A tick already past its check may still land, however slow the machine; no other.
+        let after = FLUSHES.load(SeqCst);
+        thread::sleep(Duration::from_millis(200));
+        assert!(FLUSHES.load(SeqCst) <= after + 1, "idle again: asleep");
+        r.shell.stop_tickers();
+    }
+
     #[test]
     fn the_tickers_stop_as_soon_as_the_event_loop_exits() {
         // The ticker threads hold the shell; stopped, they let it go — without waiting out
@@ -777,6 +1035,27 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn a_nudge_wakes_a_waiter_once_its_condition_holds_and_the_backstop_bounds_it() {
+        let stop = Arc::new(super::Stop::default());
+        let ready = Arc::new(AtomicBool::new(false));
+        let waiter = {
+            let (stop, ready) = (stop.clone(), ready.clone());
+            thread::spawn(move || stop.wait_until(LONG, || ready.load(SeqCst)))
+        };
+        thread::sleep(Duration::from_millis(20));
+        ready.store(true, SeqCst);
+        let started = Instant::now();
+        stop.nudge();
+        assert!(!waiter.join().unwrap(), "woken, not stopped");
+        assert!(started.elapsed() < LONG);
+        let started = Instant::now();
+        assert!(!stop.wait_until(Duration::from_millis(20), || false));
+        assert!(started.elapsed() >= Duration::from_millis(20));
+        stop.stop();
+        assert!(stop.wait_until(LONG, || false), "stopped");
     }
 
     #[test]

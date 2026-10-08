@@ -7,9 +7,11 @@ pub mod commands;
 pub mod env;
 pub mod errors;
 pub mod lock;
+pub mod menu;
 pub mod ops;
 pub mod runtime;
 pub mod settings;
+pub mod signals;
 pub mod window;
 
 use std::error::Error;
@@ -30,7 +32,12 @@ use crate::settings::SettingsStore;
 /// allow-listed environment and the core context, the app's identity and directories (a
 /// data-directory override moves every app directory and keys the single-instance lock on
 /// it), the app itself (the single-instance plugin first: a second launch only focuses the
-/// first window and exits), then the log, the settings and the shell, and the tickers.
+/// first window and exits; on macOS, the app menu), then the log, the settings and the shell,
+/// the tickers and, on Linux and macOS, the quit signals.
+///
+/// Every way out the app is told of runs the quit sequence ([`app`]'s module docs): the
+/// event loop's exit request, a quit signal, and the event loop's exit itself, which an exit
+/// the OS forces reaches with no request before it.
 pub fn run() -> Result<(), Box<dyn Error>> {
     runtime::init_runtime()?;
     runtime::install_crypto();
@@ -52,15 +59,20 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     }
 
     let cell = app::ShellCell::default();
-    let app = app::builder(tauri::Builder::default(), cell.clone())
+    let builder = app::builder(tauri::Builder::default(), cell.clone())
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             window::show_and_focus(app)
         }))
         .setup(|app| {
             window::build_main(app.handle())?;
             Ok(())
-        })
-        .build(tauri_context)?;
+        });
+    // Cmd+Q quits through the app, not through `terminate:` (see `menu`).
+    #[cfg(target_os = "macos")]
+    let builder = builder
+        .menu(menu::app_menu)
+        .on_menu_event(|app, event| menu::on_menu_event(app, &event));
+    let app = builder.build(tauri_context)?;
 
     match app.path().app_log_dir() {
         Ok(dir) => {
@@ -92,10 +104,18 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     );
     app::install(&app, &cell, shell.clone())?;
     app::start_tickers(&shell)?;
+    #[cfg(unix)]
+    {
+        let (handle, shell) = (app.handle().clone(), shell.clone());
+        let quit = move |_| app::quit(&handle, &shell);
+        if let Err(e) = signals::on_quit_signals(&signals::QUIT_SIGNALS, quit) {
+            tracing::warn!("a signal will end the app without its quit sequence: {e}");
+        }
+    }
 
     app.run(move |app, event| match event {
         RunEvent::ExitRequested { api, .. } => app::on_exit_requested(app, &shell, &api),
-        RunEvent::Exit => shell.stop_tickers(),
+        RunEvent::Exit => shell.on_exit(),
         _ => {}
     });
     Ok(())

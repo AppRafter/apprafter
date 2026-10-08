@@ -54,9 +54,8 @@ const MINUTE_MS: u64 = 60_000;
 /// Called on every transition between locked and unlocked, with the new state; the app drops
 /// pending plans, ends every operation subscription and emits `lock-changed`. It runs under
 /// the machine's lock, so it must be quick and must never call back into the machine (see the
-/// module docs for the lock order).
-/// A panic in it is caught and logged: the transition stands, and whoever made it — the idle
-/// ticker among them — goes on.
+/// module docs for the lock order). A panic in it is caught and logged: the transition
+/// stands, and whoever made it — the idle ticker among them — goes on.
 pub type LockHook = Box<dyn Fn(&LockState) + Send + Sync>;
 
 pub struct LockMachine {
@@ -81,6 +80,8 @@ struct Inner {
     last_activity: Stamp,
     /// The unlock prompt while it is open; a second unlock is `AuthBusy` meanwhile.
     prompt: Option<Prompt>,
+    /// Set for good by [`LockMachine::close`]: no unlock prompt opens from then on.
+    closing: bool,
 }
 
 struct Prompt {
@@ -113,6 +114,7 @@ impl LockMachine {
                 since_ms: now.wall_ms,
                 last_activity: now,
                 prompt: None,
+                closing: false,
             }),
             locked: AtomicBool::new(reason.is_some()),
             settings_write: Mutex::new(()),
@@ -181,22 +183,34 @@ impl LockMachine {
 
     /// Quit: close an open unlock prompt, as the [`Authenticator`] promises the app does, so
     /// that a `Verified` arriving after this returns — even before the dialog has closed —
-    /// does not unlock (its `unlock` answers `AuthCancelled`). Nothing else changes; with no
-    /// prompt open it does nothing.
-    pub fn close_prompt(&self) {
-        let close = close_open_prompt(&mut self.lock_inner());
+    /// does not unlock (its `unlock` answers `AuthCancelled`), and open none from here on:
+    /// every later `unlock` of a locked app is refused with `Closing`, decided under the same
+    /// lock hold that would open the prompt. Nothing else changes: the state stays as it is,
+    /// and a lock still locks.
+    pub fn close(&self) {
+        let close = {
+            let mut inner = self.lock_inner();
+            inner.closing = true;
+            close_open_prompt(&mut inner)
+        };
         trip_prompt(close);
     }
 
     /// Ask the owner, and unlock if the OS verifies them. Blocks until the prompt answers
     /// (it can take minutes), without holding the machine's lock: meanwhile every other
     /// call answers at once, and a second `unlock` is `AuthBusy`. Unlocked already, it asks
-    /// nothing.
+    /// nothing; once the quit has [`close`](Self::close)d the machine, it asks nothing and
+    /// answers `Closing`.
     pub fn unlock(&self) -> Result<(), DesktopError> {
         let cancel = {
             let mut inner = self.lock_inner();
             if inner.reason.is_none() {
                 return Ok(());
+            }
+            // The quit's drain may take seconds: no prompt may open meanwhile, and none
+            // between this check and the insert below, which is this same lock hold.
+            if inner.closing {
+                return Err(DesktopError::Closing);
             }
             if inner.prompt.is_some() {
                 return Err(DesktopError::AuthBusy);
@@ -901,7 +915,7 @@ mod tests {
         let r = rig(Settings::default(), prompt);
         let first = unlock_in_background(&r.machine);
         ends.opened.recv_timeout(LONG).expect("the prompt opened");
-        r.machine.close_prompt();
+        r.machine.close();
         ends.tripped
             .recv_timeout(LONG)
             .expect("the quit closed the prompt");
@@ -922,12 +936,10 @@ mod tests {
         let first = unlock_in_background(&r.machine);
         ends.opened.recv_timeout(LONG).expect("the prompt opened");
         // As with a lock: the token trips on a thread of its own, held back here so the OS
-        // answers yes after `close_prompt` returned and before the dialog closed.
+        // answers yes after `close` returned and before the dialog closed.
         let ((), held) = {
             let machine = r.machine.clone();
-            within("close_prompt", move || {
-                test_trips::held(|| machine.close_prompt())
-            })
+            within("close", move || test_trips::held(|| machine.close()))
         };
         assert_eq!(held.len(), 1, "the quit closes the prompt");
         assert!(
@@ -948,11 +960,56 @@ mod tests {
     }
 
     #[test]
-    fn closing_the_prompt_with_none_open_changes_nothing() {
+    fn once_the_quit_closed_the_machine_no_unlock_opens_a_prompt() {
+        let auth = fake();
+        let r = rig(Settings::default(), auth.clone());
+        r.machine.close();
+        let result = r.machine.unlock();
+        assert!(matches!(result, Err(DesktopError::Closing)), "{result:?}");
+        assert!(auth.asked().is_empty(), "no prompt opened during the quit");
+        assert_eq!(r.machine.state(), locked(LockReason::Startup, T0, Some(10)));
+        // Sticky: a later try is refused the same way, and an unlocked app asks nothing.
+        assert!(matches!(r.machine.unlock(), Err(DesktopError::Closing)));
+        let r = rig(unlocked_at_start(), auth.clone());
+        r.machine.close();
+        r.machine.unlock().unwrap();
+        assert!(auth.asked().is_empty());
+    }
+
+    #[test]
+    fn a_quit_that_closes_the_machine_after_a_prompt_opened_still_refuses_its_yes() {
+        // The other order: the prompt opened before the quit, which closes it; the next try is
+        // refused without a prompt.
+        let (prompt, ends) = HeldPrompt::new();
+        let r = rig(Settings::default(), prompt);
+        let first = unlock_in_background(&r.machine);
+        ends.opened.recv_timeout(LONG).expect("the prompt opened");
+        r.machine.close();
+        ends.tripped.recv_timeout(LONG).expect("the quit closed it");
+        let again = within("a second unlock", {
+            let machine = r.machine.clone();
+            move || machine.unlock()
+        });
+        assert!(matches!(again, Err(DesktopError::Closing)), "{again:?}");
+        ends.answer.send(AuthOutcome::Verified).unwrap();
+        let result = first.recv_timeout(LONG).expect("the unlock returned");
+        assert!(
+            matches!(result, Err(DesktopError::AuthCancelled)),
+            "{result:?}"
+        );
+        assert!(r.machine.state().locked);
+        assert!(
+            ends.opened.try_recv().is_err(),
+            "the second unlock opened no prompt"
+        );
+    }
+
+    #[test]
+    fn closing_with_no_prompt_open_leaves_the_state_as_it_was() {
         for settings in [Settings::default(), unlocked_at_start()] {
             let r = rig(settings, fake());
             let before = r.machine.state();
-            let ((), held) = test_trips::held(|| r.machine.close_prompt());
+            let ((), held) = test_trips::held(|| r.machine.close());
             assert!(held.is_empty(), "no prompt, nothing to close");
             assert_eq!(r.machine.state(), before);
             assert!(r.hooked.calls().is_empty());
@@ -963,8 +1020,8 @@ mod tests {
         let first = unlock_in_background(&r.machine);
         ends.opened.recv_timeout(LONG).expect("the prompt opened");
         let ((), held) = test_trips::held(|| {
-            r.machine.close_prompt();
-            r.machine.close_prompt();
+            r.machine.close();
+            r.machine.close();
             r.machine.lock(LockReason::OsSession);
         });
         assert_eq!(held.len(), 1);
