@@ -196,10 +196,12 @@ version = "0.1.0"
 dependencies = [
  "apprafter-core",
  "apprafter-desktop-ipc",
+ "miette",
  "serde",
  "serde_json",
  "tauri",
  "tauri-build",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

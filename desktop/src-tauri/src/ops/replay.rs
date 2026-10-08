@@ -3,9 +3,10 @@
 //! catch up before it receives live events.
 //!
 //! Only tool output is bounded: when the text of the kept `Output` events passes the cap,
-//! the oldest of them go and their bytes are counted. Stages, progress, warnings, notices
-//! and the final event always stay — they are what the page needs to show where the
-//! operation is.
+//! the oldest of them go and their bytes are counted. Stages, warnings, notices, the latest
+//! progress and the final event always stay — they are what the page needs to show where
+//! the operation is. An earlier progress is superseded by the next one, so frequent
+//! progress never grows the buffer.
 
 use std::collections::VecDeque;
 
@@ -35,10 +36,23 @@ impl ReplayBuffer {
 
     /// Keep `event`; drop the oldest output while the kept output text exceeds the cap.
     /// Output goes whole, so the kept text never exceeds the cap — an `Output` larger than
-    /// the cap on its own is dropped too.
+    /// the cap on its own is dropped too. A `Progress` replaces the one before it, so an
+    /// operation that reports progress all the time keeps one, at the place it arrived.
     pub fn push(&mut self, event: OpEvent) {
-        if let OpEvent::Output { text, .. } = &event {
-            self.output_bytes += text.len();
+        match &event {
+            OpEvent::Output { text, .. } => self.output_bytes += text.len(),
+            OpEvent::Progress { .. } => {
+                // At most one is kept, and usually near the back: searching from there
+                // costs the events since the previous progress.
+                let previous = self
+                    .events
+                    .iter()
+                    .rposition(|e| matches!(e, OpEvent::Progress { .. }));
+                if let Some(i) = previous {
+                    self.events.remove(i);
+                }
+            }
+            _ => {}
         }
         self.events.push_back(event);
         if self.output_bytes <= self.cap {
@@ -225,6 +239,47 @@ mod tests {
                 out("cccc"),
             ]
         );
+    }
+
+    fn progress(done: u64) -> OpEvent {
+        OpEvent::Progress {
+            done,
+            total: Some(10_000),
+            unit: "B".into(),
+        }
+    }
+
+    #[test]
+    fn only_the_latest_progress_is_kept_where_it_arrived() {
+        let warning = OpEvent::Warning {
+            message: "w".into(),
+        };
+        let mut buf = ReplayBuffer::new(1024);
+        buf.push(stage(1));
+        for done in 0..5_000 {
+            buf.push(progress(done));
+        }
+        buf.push(warning.clone());
+        for done in 5_000..10_000 {
+            buf.push(progress(done));
+            if done == 7_000 {
+                buf.push(out("x"));
+            }
+        }
+        buf.push(stage(2));
+        assert_eq!(
+            buf.snapshot(),
+            vec![stage(1), warning, out("x"), progress(9_999), stage(2)]
+        );
+        // A progress after the last stage moves to the end again.
+        buf.push(progress(10_000));
+        assert_eq!(buf.snapshot().last(), Some(&progress(10_000)));
+        let kept = buf
+            .snapshot()
+            .iter()
+            .filter(|e| matches!(e, OpEvent::Progress { .. }))
+            .count();
+        assert_eq!(kept, 1);
     }
 
     #[test]

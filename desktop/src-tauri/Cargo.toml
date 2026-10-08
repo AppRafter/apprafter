@@ -19,12 +19,20 @@ name = "apprafter_desktop"
 name = "apprafter-desktop"
 path = "src/main.rs"
 
+[features]
+# Walks and CI only: the scripted FakeAuthenticator in place of the OS (and, from later tasks,
+# the loopback provider override and a TEST BUILD banner). Never in a release; D.13 asserts it.
+test-build = []
+
 [build-dependencies]
 tauri-build = { workspace = true }
 
 [dependencies]
 apprafter-core        = { workspace = true }
 apprafter-desktop-ipc = { path = "../ipc" }
+# The versions cli/Cargo.toml pins, already in the lock.
+miette                = "7"
 serde                 = { workspace = true }
 serde_json            = { workspace = true }
 tauri                 = { workspace = true }
+thiserror             = "2"

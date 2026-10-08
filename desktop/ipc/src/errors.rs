@@ -13,6 +13,8 @@ pub const AUTH_CANCELLED: &str = "apprafter::desktop::auth_cancelled";
 pub const AUTH_FAILED: &str = "apprafter::desktop::auth_failed";
 /// The OS cannot authenticate here; `fields.reason` says why.
 pub const AUTH_UNAVAILABLE: &str = "apprafter::desktop::auth_unavailable";
+/// Another authentication prompt was already open; nothing was asked.
+pub const AUTH_BUSY: &str = "apprafter::desktop::auth_busy";
 /// `settings.json` could not be written.
 pub const SETTINGS_IO: &str = "apprafter::desktop::settings_io";
 /// A bug in the desktop, e.g. a panicked operation.
@@ -26,6 +28,7 @@ pub const ALL: &[&str] = &[
     AUTH_CANCELLED,
     AUTH_FAILED,
     AUTH_UNAVAILABLE,
+    AUTH_BUSY,
     SETTINGS_IO,
     INTERNAL,
 ];
@@ -38,7 +41,7 @@ mod tests {
 
     #[test]
     fn every_code_is_listed_once_under_the_desktop_prefix() {
-        assert_eq!(ALL.len(), 8);
+        assert_eq!(ALL.len(), 9);
         let unique: BTreeSet<_> = ALL.iter().collect();
         assert_eq!(unique.len(), ALL.len(), "{ALL:?}");
         for code in ALL {
@@ -51,6 +54,7 @@ mod tests {
             AUTH_CANCELLED,
             AUTH_FAILED,
             AUTH_UNAVAILABLE,
+            AUTH_BUSY,
             SETTINGS_IO,
             INTERNAL,
         ] {

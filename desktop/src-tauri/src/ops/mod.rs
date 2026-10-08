@@ -2,15 +2,17 @@
 //! Operations as the shell runs them: core events in, [`OpEvent`]s out.
 //!
 //! [`text`] turns a tool's raw output bytes into text, [`reporter`] coalesces that text and
-//! converts every core event, and [`replay`] keeps a bounded history so a page that reloads
-//! or re-attaches can catch up.
+//! converts every core event, [`replay`] keeps a bounded history so a page that reloads
+//! or re-attaches can catch up, and [`manager`] holds plans and runs operations.
 //!
 //! [`OpEvent`]: apprafter_desktop_ipc::OpEvent
 
+pub mod manager;
 pub mod replay;
 pub mod reporter;
 pub mod text;
 
+pub use manager::{EventSink, Executor, OperationManager, PlanParts, PLAN_TTL_MS};
 pub use replay::ReplayBuffer;
 pub use reporter::OpReporter;
 pub use text::Utf8Stream;
