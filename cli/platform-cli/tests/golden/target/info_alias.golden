@@ -13,3 +13,4 @@ Target: prod (active)
 Config:      <SANDBOX>/apprafter-config/targets/prod/config.yaml
 Credentials: <SANDBOX>/apprafter-config/targets/prod/credentials.yaml (mode 0600)
 [stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m target show invoked <ESC>[3mtarget<ESC>[0m<ESC>[2m=<ESC>[0mprod

@@ -3,3 +3,4 @@ $ apprafter target add staging --provider hetzner-cloud --token bbbbbbbbbbbbbbbb
 [stdout]
 target `staging` saved (active target unchanged — use `apprafter target use staging` to switch) (token NOT verified against the API — `--no-ping` was passed)
 [stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m target add invoked <ESC>[3mtarget<ESC>[0m<ESC>[2m=<ESC>[0mstaging <ESC>[3mrenew<ESC>[0m<ESC>[2m=<ESC>[0mfalse <ESC>[3mforce<ESC>[0m<ESC>[2m=<ESC>[0mfalse

@@ -2,6 +2,7 @@ $ apprafter target use ghost
 [exit 1]
 [stdout]
 [stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m target use invoked <ESC>[3mtarget<ESC>[0m<ESC>[2m=<ESC>[0mghost
 Error: apprafter::target::not_found
 
   × target `ghost` not found (available: prod)

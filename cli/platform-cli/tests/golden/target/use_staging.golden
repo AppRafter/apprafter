@@ -3,3 +3,4 @@ $ apprafter target use staging
 [stdout]
 active target switched: `prod` → `staging`
 [stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m target use invoked <ESC>[3mtarget<ESC>[0m<ESC>[2m=<ESC>[0mstaging

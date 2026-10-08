@@ -12,3 +12,4 @@ SSH key:      ~/id_ed25519.pub (loaded)
 
 Run `apprafter target show` for the full target config; `apprafter target list` for all configured targets.
 [stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m whoami invoked <ESC>[3mno_ping<ESC>[0m<ESC>[2m=<ESC>[0mtrue

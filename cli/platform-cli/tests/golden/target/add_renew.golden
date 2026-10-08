@@ -3,3 +3,19 @@ $ apprafter target add prod --renew --token bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 [stdout]
 target `prod` credentials rotated (token NOT verified — `--no-ping` was passed)
 [stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m target add invoked <ESC>[3mtarget<ESC>[0m<ESC>[2m=<ESC>[0mprod <ESC>[3mrenew<ESC>[0m<ESC>[2m=<ESC>[0mtrue <ESC>[3mforce<ESC>[0m<ESC>[2m=<ESC>[0mfalse
+$ apprafter whoami
+[exit 0]
+[stdout]
+Identity:     anonymous (self-hosted mode)
+Target:       prod (active)
+Provider:     hetzner-cloud (verified ✓)
+Region:       nbg1
+Server type:  not set
+Default tier: solo
+Cluster name: not set
+SSH key:      ~/id_ed25519.pub (loaded)
+
+Run `apprafter target show` for the full target config; `apprafter target list` for all configured targets.
+[stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m whoami invoked <ESC>[3mno_ping<ESC>[0m<ESC>[2m=<ESC>[0mfalse

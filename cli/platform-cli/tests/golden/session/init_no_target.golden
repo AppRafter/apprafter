@@ -2,6 +2,7 @@ $ apprafter init --provider hetzner-cloud --tier solo --region nbg1
 [exit 1]
 [stdout]
 [stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m init invoked <ESC>[3mprovider<ESC>[0m<ESC>[2m=<ESC>[0m"hetzner-cloud" <ESC>[3mtier<ESC>[0m<ESC>[2m=<ESC>[0msolo <ESC>[3mregion<ESC>[0m<ESC>[2m=<ESC>[0m"nbg1"
 Error: apprafter::cli::other
 
   × no active target — run `apprafter target add <name> --provider hetzner-

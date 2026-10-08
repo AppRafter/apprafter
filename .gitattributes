@@ -41,3 +41,7 @@ Dockerfile   text
 # Linguist overrides
 docs/**      linguist-documentation=true
 examples/**  linguist-documentation=true
+
+# Golden snapshots are byte-exact program output (cli/platform-cli/tests/golden.rs):
+# no EOL conversion, no whitespace fixing.
+*.golden     -text -whitespace

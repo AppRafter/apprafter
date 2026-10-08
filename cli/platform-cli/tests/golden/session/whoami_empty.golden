@@ -5,3 +5,4 @@ Identity:     anonymous (self-hosted mode)
 
 No active target. Run `apprafter target add` to create one — `apprafter target list` to see what's configured.
 [stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m whoami invoked <ESC>[3mno_ping<ESC>[0m<ESC>[2m=<ESC>[0mtrue

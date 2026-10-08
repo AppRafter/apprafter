@@ -2,6 +2,7 @@ $ apprafter target remove ghost --yes
 [exit 1]
 [stdout]
 [stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m target remove invoked <ESC>[3mtarget<ESC>[0m<ESC>[2m=<ESC>[0mghost <ESC>[3myes<ESC>[0m<ESC>[2m=<ESC>[0mtrue
 Error: apprafter::target::not_found
 
   × target `ghost` not found (available: prod)

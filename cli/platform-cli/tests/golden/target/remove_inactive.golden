@@ -3,3 +3,4 @@ $ apprafter target remove staging --yes
 [stdout]
 target `staging` removed
 [stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m target remove invoked <ESC>[3mtarget<ESC>[0m<ESC>[2m=<ESC>[0mstaging <ESC>[3myes<ESC>[0m<ESC>[2m=<ESC>[0mtrue

@@ -2,6 +2,7 @@ $ apprafter target add prod --provider hetzner-cloud --token bbbbbbbbbbbbbbbbbbb
 [exit 1]
 [stdout]
 [stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m target add invoked <ESC>[3mtarget<ESC>[0m<ESC>[2m=<ESC>[0mprod <ESC>[3mrenew<ESC>[0m<ESC>[2m=<ESC>[0mfalse <ESC>[3mforce<ESC>[0m<ESC>[2m=<ESC>[0mfalse
 Error: apprafter::cli::other
 
   × target `prod` already exists — pass `--force` to overwrite or `--renew` to
