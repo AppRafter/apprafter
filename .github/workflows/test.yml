@@ -80,9 +80,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
           toolchain: "1.98"
+      # --no-fail-fast: cargo otherwise stops at the first test target that
+      # fails, so a leg reported one broken target and hid every other one
+      # behind it — one CI round per failure instead of one for all of them.
       - if: runner.os == 'Linux'
         working-directory: cli
-        run: cargo test --all --all-features
+        run: cargo test --all --all-features --no-fail-fast
       # macOS and Windows build two crates fewer. `apprafter-backup` is the
       # in-cluster backup runner: it ships only as a Linux container image.
       # `docsgen` is the documentation generator, and its gate compares the
@@ -101,7 +104,7 @@ jobs:
         name: cargo test (macOS, Windows)
         working-directory: cli
         shell: bash
-        run: cargo test --workspace --exclude apprafter-backup --exclude docsgen --all-features
+        run: cargo test --workspace --exclude apprafter-backup --exclude docsgen --all-features --no-fail-fast
 
   # One check under the fixed name `cargo test cli/`, whatever the matrix
   # does. The matrix reports a check per leg, `cargo test cli/ (<os>)`, so a
