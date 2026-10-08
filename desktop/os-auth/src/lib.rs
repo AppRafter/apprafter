@@ -8,3 +8,6 @@
 //! how each OS's result becomes one, as pure functions that compile and are tested on every OS.
 
 pub mod outcome;
+
+#[cfg(target_os = "linux")]
+pub mod linux;

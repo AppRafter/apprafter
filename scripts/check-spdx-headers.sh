@@ -65,6 +65,9 @@ PATTERNS=(
   'desktop/*.svg'
   # The Windows application manifest: an XML comment after the declaration.
   'desktop/*.xml'
+  # polkit action files (desktop/packaging/linux/): XML too, and the XML declaration must be
+  # line 1, so the SPDX comment is line 2.
+  'desktop/*.policy'
   # The committed Claude Design export is upstream's file, kept verbatim.
   ':(exclude)desktop/design-source/*'
   # Platform manifests

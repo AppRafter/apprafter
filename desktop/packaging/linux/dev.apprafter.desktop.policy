@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-License-Identifier: FSL-1.1-Apache-2.0 -->
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!--
+  The polkit actions AppRafter Desktop asks for (apprafter-os-auth, src/linux/polkit.rs).
+  Installed by the deb and rpm packages into /usr/share/polkit-1/actions/ (D.13); a build
+  without it reports PolicyMissing and falls back to PAM.
+
+  auth_self: the user proves it is them with their own password, never an administrator's
+  (auth_admin), and never with a grant kept for minutes afterwards (auth_self_keep). Nothing
+  is allowed without an active local session.
+-->
+<policyconfig>
+  <vendor>AppRafter</vendor>
+  <vendor_url>https://apprafter.dev</vendor_url>
+  <action id="dev.apprafter.desktop.unlock">
+    <description>Unlock AppRafter Desktop</description>
+    <message>Authentication is required to unlock AppRafter Desktop</message>
+    <defaults><allow_any>no</allow_any><allow_inactive>no</allow_inactive><allow_active>auth_self</allow_active></defaults>
+  </action>
+  <action id="dev.apprafter.desktop.confirm">
+    <description>Confirm an AppRafter operation</description>
+    <message>Authentication is required to approve or run a destructive AppRafter operation</message>
+    <defaults><allow_any>no</allow_any><allow_inactive>no</allow_inactive><allow_active>auth_self</allow_active></defaults>
+  </action>
+</policyconfig>

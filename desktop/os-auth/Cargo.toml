@@ -26,3 +26,9 @@ apprafter-desktop-ipc = { path = "../ipc" }
 
 # polkit, and PAM where polkit cannot prompt.
 [target.'cfg(target_os = "linux")'.dependencies]
+# The zbus already in this workspace's graph (tauri-plugin-single-instance): the same minor and
+# its default features (async-io, blocking-api), so the lock keeps one zbus.
+zbus        = "~5.19"
+# >= 5.1.0: below it `Subject::new_for_owner` is the PID-reuse bypass RUSTSEC-2026-0278. The
+# backend never builds that subject (it asks about its own bus name), but no older copy may land.
+zbus_polkit = "~5.1"
