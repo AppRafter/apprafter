@@ -1946,55 +1946,87 @@ compatibility: "0.2.81": {
 		pods roll and the PlatformStack CRD changes (7), so the upgrade waits
 		for approval rather than applying unattended.
 
-		BEFORE UPGRADING. Anything that matches the ForeignFieldManager
-		Event's note text must follow its new wording (6). Install apprafter
-		0.2.79 to see the new status lines (1, 7); older CLIs show nothing
-		new, and nothing they already show changes meaning.
+		BEFORE UPGRADING. (a) The operator already running makes this upgrade
+		(v0.2.52, or an older one on a cluster below 0.2.80), and it can still
+		lose an approval it is acting on (6): if "apprafter migration list"
+		shows the plan pending again after you approved it, approve it again.
+		(b) Until the upgrade lands, do not let a persistent needs.redis claim
+		whose data you want be deleted and re-created: do not remove and
+		re-add its application ("apprafter app remove --keep-data" keeps the
+		claim), and do not drop and re-add its needs.redis (3). Do not create
+		a Redis shared database while a needs.redis claim is being
+		provisioned, or the other way round (4). (c) Anything that matches the
+		ForeignFieldManager Event's note text must follow its new wording (6).
+		(d) Install apprafter 0.2.79 to see an abandoned reconcile on a claim,
+		a SharedVolume or a SharedDatabase (1) and to have a ReconcileStalled
+		left behind by a rollback marked NOT CURRENT (7). apprafter 0.2.52 to
+		0.2.78 already lists an Application's ReconcileTimedOut among its
+		problems, and any older CLI lists ReconcileStalled among the
+		platform's conditions; nothing they already show changes meaning.
 
 		1. EVERY CONTROLLER HAS A DEADLINE. A controller never runs two
-		reconciles of one object at once, so a reconcile that never ends holds
-		every later change to that object, and nothing bounded one except the
-		client's 295s read timeout, which does not cover a request queued
-		behind a watch and never sent (8). One such request froze an
-		Application with no status, no Event and no log line. A reconcile is
-		now abandoned at its deadline and retried: Applications, claim
-		scheduling and provisioning, SharedDatabases, the PlatformStack and
-		retained-claim cleanup at 120s; SharedVolumes at 60s;
-		SourceCredentials at 90s; MigrationPlans at 190s. An abandoned
-		reconcile writes nothing to status. It shows as ReconcileTimedOut
-		among an Application's recent problems ("apprafter app status"), as a
+		reconciles of one object at once, and the claim provisioner,
+		SharedVolume and SharedDatabase controllers run one at a time for all
+		their objects, so a reconcile that never ends holds every later change
+		to that object, or to every object of that kind. Nothing bounded one
+		except the client's 295s read timeout, which does not cover a request
+		queued behind a watch until that watch ends (8). One such request
+		froze an Application with no status, no Event and no log line. A
+		reconcile is now abandoned at its deadline and retried: Applications,
+		claim scheduling and provisioning, SharedDatabases, the PlatformStack
+		and retained-claim cleanup at 120s; SharedVolumes at 60s;
+		SourceCredentials at 90s; MigrationPlans at 190s. The cut is never
+		written into status under the controller's own field manager, so it
+		cannot prune a status field. It shows as ReconcileTimedOut among an
+		Application's recent problems ("apprafter app status"); as a
 		ReconcileTimedOut Warning Event on a claim being scheduled or
 		provisioned, on a SharedVolume or on a SharedDatabase (apprafter
 		0.2.79 prints the newest one, with its age, in "app status", "volume
-		status" and "db status" until a later pass of the same controller
-		writes its status or the Event expires, one hour by default), and as
-		ReconcileStalled=True on the PlatformStack (7). Every one counts on
-		the new metric apprafter_reconcile_timeouts_total{kind}, which stays
-		at zero on a healthy operator, and
+		status" and "db status" until the same controller next changes the
+		object's status, a claim's size and capacity figures excepted, or the
+		Event expires, one hour by default); and as ReconcileStalled=True on
+		the PlatformStack (7), beside a ReconcileTimedOut Warning Event of its
+		own. SourceCredential, MigrationPlan and retained-claim timeouts show
+		only in the operator log and the metrics. Every one counts on the new
+		metric apprafter_reconcile_timeouts_total{kind}, which a healthy
+		operator never increments (it appears only after the first timeout),
+		and all but MigrationPlan's also count as a reconcile error.
 		apprafter_reconcile_duration_seconds gains buckets at 30, 60, 90, 120,
-		190 and 300 seconds, so an abandoned reconcile is filed just above its
+		190 and 300 seconds, so an abandoned Application, claim, SharedVolume,
+		SharedDatabase or SourceCredential reconcile is filed just above its
 		deadline rather than in +Inf. The Application controller now runs at
 		most 16 reconciles at once.
 
 		2. BOUNDS INSIDE EACH RECONCILE, so the deadline is the last resort.
 		Postgres admin sessions: 10s to connect, a 10s lock wait and a 30s
-		statement enforced by the server, 45s per call. A shared database
-		whose grants wait on a tenant's lock reads AwaitingLock or
-		StatementTimedOut and stays Ready once provisioned; a call the cluster
-		does not answer reads AwaitingCluster and leaves Ready as it was.
-		Deleting a consumer whose role is locked waits up to 5 minutes instead
-		of leaving the role behind. Metrics scrapes and kubelet capacity
-		reads: 15s. A SharedVolume whose kubelet does not answer within 10s
-		keeps its last capacity figure and warning, marked "not re-measured".
-		A ready claim's size refresh gives up after 40s, a disk claim's
-		provisioning-time sample after 20s. Registry requests from the
-		platform controller: 5s to connect, 10s to read, 20s per question; an
-		unreachable registry reads UpstreamReachable=False (PollFailed)
-		instead of freezing every condition, and unanswered backup reads read
-		BackupHealthy=Unknown. SourceCredential probes: 3s to connect or read,
-		30s per half (git, registry), at most four at once with hosts taken in
-		turn; a half out of time reads Unknown and says how many did not
-		answer, and lastValidated is kept.
+		statement enforced by the server, 45s per call, where v0.2.52 waited
+		with no bound. A shared database whose grants wait on a tenant's lock
+		reads AwaitingLock, one whose statement the server cuts off reads
+		StatementTimedOut, and either stays Ready once provisioned; a call
+		that connects and then gets no answer within 45s reads AwaitingCluster
+		and leaves Ready as it was (a dial refused or unanswered within 10s
+		still reads Ready=False, except in the extension check, which keeps
+		Ready). Postgres calls run one after another, so on a slow server a
+		shared database with declared extensions, or a needs.pg claim
+		declaring three or more, can still reach its deadline and is retried.
+		Deleting a consumer whose role is locked retries the revoke every 15s
+		for up to 5 minutes, then releases the claim and leaves the role to
+		drop by hand, with a WARN naming it. Metrics scrapes and kubelet
+		capacity reads: 15s. A SharedVolume whose kubelet does not answer
+		within 10s keeps its last capacity figure and warning, marked "not
+		re-measured". A ready claim's size refresh gives up after 40s, a disk
+		claim's provisioning-time sample after 20s. Registry requests from the
+		platform controller: 5s to connect, 10s to read, 20s per question; a
+		registry that never answers now reads UpstreamReachable=False
+		(PollFailed) instead of freezing every condition, once the stack is
+		pinned or has resolved a version, and unanswered backup reads read
+		BackupHealthy=Unknown. SourceCredential probes: 10s each as before, a
+		registry probe also 3s to connect or read, 30s per half (git,
+		registry), at most four at once per credential with hosts taken in
+		turn; a half out of time keeps a verdict it already reached; without
+		one it reads Unknown, says how many did not answer (or that the list
+		finding them did not return in time), and neither moves nor erases
+		lastValidated.
 
 		3. PERSISTENT REDIS: DATA LOSS FIXED (operator v0.2.52 and earlier). A
 		persistent claim re-created within its 7-day grace reattaches to its
@@ -2007,46 +2039,61 @@ compatibility: "0.2.81": {
 
 		4. A DATABASE NUMBER HAS ONE HOLDER. Claims and shared caches allocate
 		under one lock, a shared cache records its number before it prepares
-		it, and every FLUSHDB first re-checks that no other claim, snapshot or
-		shared database holds the number; on a conflict nothing is flushed. A
-		holder with nothing stored yet reads AwaitingKeyspace and takes
-		another number; a persistent reattach keeps its number and reads
-		DbnumConflict until the overlap is resolved.
+		it (reading AwaitingKeyspace until it has checked and flushed it), and
+		every FLUSHDB first re-checks that no other claim, snapshot or shared
+		database holds the number; on a conflict nothing is flushed. A holder
+		with nothing stored yet that finds the number held elsewhere reads
+		AwaitingKeyspace naming the other holder and takes another number; a
+		persistent reattach keeps its number and reads DbnumConflict until the
+		overlap is resolved. On v0.2.52 a shared cache and a claim allocating
+		at the same moment could end up on one number. Deleting the shared
+		cache flushed the claim's data at once; deleting the claim flushed the
+		shared cache's data when the claim's 7-day grace ended. A snapshot
+		still inside its grace when this release lands no longer flushes it.
 
 		5. SHAREDVOLUME. The CapacityWarning Event is sent before the status
 		write that records it, so an interrupted reconcile repeats it instead
-		of losing it. A volume deleted within a minute of a failed reconcile
-		holds its finalizer until 65s after that reconcile failed, then
-		deletes its PVC again, so a late write cannot leave an orphaned PVC.
+		of losing it. A volume deleted within 65s of a failed reconcile holds
+		its finalizer until 65s after that failure, then deletes its PVC
+		again, so a late write cannot leave an orphaned PVC. The failure is
+		remembered in memory only, so if the operator restarts between a
+		failed reconcile and the delete, or a restart cuts a reconcile short,
+		the delete releases the finalizer at once.
 
 		6. PLATFORM UPGRADES SURVIVE AN INTERRUPTED RECONCILE. An approved
 		upgrade keeps its approval until the controller has moved the
-		platform's root Application to the new version, and a bump applied
-		just before an interrupted reconcile is still recorded in
-		versionHistory. The ForeignFieldManager Warning is now the detection
-		record ("detected external write to spec.source ... PlatformController
-		is force-reapplying desired state", was "reverted ...
-		force-reapplied"); a SourceReverted Event follows once the revert
-		lands.
+		platform's root Application to the new version; operators v0.2.28 to
+		v0.2.52 deleted the approved plan first, so a pass that failed between
+		the two lost the approval, which is why (a) applies to this upgrade. A
+		bump the controller saw land is still recorded in versionHistory by a
+		later pass when the pass that made it is then cut or fails; the entry
+		is held in memory, so an operator restart in that window still loses
+		it. The ForeignFieldManager Warning is now the detection record
+		("detected external write to spec.source ... PlatformController is
+		force-reapplying desired state", was "reverted ... force-reapplied");
+		a SourceReverted Event follows once the controller sees the revert
+		land. Both are best-effort, so a Warning without a SourceReverted does
+		not by itself mean the revert failed.
 
 		7. PlatformStack CRD: status.conditions IS A LIST KEYED BY type. A
 		second field manager writes ReconcileStalled=True when a platform
-		reconcile is abandoned and clears it on the next one that finishes;
-		"apprafter platform status" and "apprafter status" show it. Every
-		existing condition is kept through the change, proven on kind from
-		the 0.2.80 CRD. Rolled back below 0.2.81, the CRD returns to an atomic
-		list and the older operator carries ReconcileStalled forward as it
-		found it, so read it there as left behind, not as current.
-		"apprafter" 0.2.79 marks it as left behind on such a cluster.
+		reconcile is abandoned and clears it once a later one completes
+		without an error; "apprafter platform status" and "apprafter status"
+		show it. Every existing condition is kept through the change, proven
+		on kind from the 0.2.80 CRD. Rolled back below 0.2.81, the CRD returns
+		to an atomic list and the older operator carries ReconcileStalled
+		forward as it found it, so read it there as left behind, not as
+		current. "apprafter" 0.2.79 marks it NOT CURRENT on such a cluster.
 
 		8. THE STALL'S CAUSE IS FIXED. The request that froze a reconcile was
-		never sent: the client libraries' HTTP/1.1 connection pool
-		(hyper/hyper-util) could return a connection whose watch was still
-		streaming, and the next request waited behind that watch, up to about
-		five minutes, mostly right after the operator started or took over
-		leadership. The operator's Kubernetes client now opens a new
-		connection for every request (about 1ms each), so no request waits
-		behind a watch; the deadlines in 1 remain as a backstop.
+		not sent until the watch ahead of it ended: the client libraries'
+		HTTP/1.1 connection pool (hyper/hyper-util) could return a connection
+		whose watch was still streaming, and the next request waited behind
+		that watch, up to about five minutes, mostly right after the operator
+		started or took over leadership. The operator's Kubernetes client now
+		opens a new connection for every request (one TCP and TLS handshake
+		each), so no request waits behind a watch; the deadlines in 1 remain
+		as a backstop.
 		"""
 	references: [
 		"docs/adr/0026-platformstack-crd.md",
