@@ -32,3 +32,7 @@ zbus        = "~5.19"
 # >= 5.1.0: below it `Subject::new_for_owner` is the PID-reuse bypass RUSTSEC-2026-0278. The
 # backend never builds that subject (it asks about its own bus name), but no older copy may land.
 zbus_polkit = "~5.1"
+
+# The container test drives pkttyagent through a pseudo-terminal.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = "0.2"

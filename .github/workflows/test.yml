@@ -64,6 +64,7 @@ jobs:
               - 'scripts/cargo-deny.sh'
               - 'scripts/check-desktop-core-lock.sh'
               - 'scripts/check-desktop-ipc-types.sh'
+              - 'scripts/test-osauth-linux.sh'
               - '.github/workflows/test.yml'
             # The desktop's bun package; its CLI-coverage gate reads the
             # generated CLI reference.
@@ -236,28 +237,57 @@ jobs:
           bun install --frozen-lockfile
           bun run tauri build --debug --no-bundle
 
+  # The Linux polkit backend (desktop/os-auth) against a real polkitd: every case of
+  # desktop/os-auth/tests/polkit_container.rs in a fresh Debian container, through the same
+  # script a developer runs. Rootful podman: each case puts the test in a logind-style session
+  # cgroup, and a rootless podman can write the cgroup tree only under a systemd user session,
+  # which the runner does not have. The script fails, never skips, when podman is missing.
+  osauth-linux:
+    name: OS authentication on Linux (polkit container)
+    needs: changes
+    if: needs.changes.outputs.desktop == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The test links apprafter-core, so cli/cli-providers/build.rs runs `cue export`.
+      - uses: cue-lang/setup-cue@b0e30e540a2dae47304ebf16586a5b2db023b61c # v2.0.0
+        with:
+          version: v0.17.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: "1.98"
+      - name: polkit cases
+        env:
+          PODMAN: sudo podman
+        run: bash scripts/test-osauth-linux.sh
+
   # One check under the fixed name `cargo test desktop/`, whatever the matrix
-  # does — the same reasoning and logic as rust-cli-result above.
+  # does — the same reasoning and logic as rust-cli-result above. It also
+  # stands for osauth-linux, the desktop's other test job.
   rust-desktop-result:
     name: cargo test desktop/
-    needs: [changes, rust-desktop]
+    needs: [changes, rust-desktop, osauth-linux]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
-      - name: every leg of the matrix passed
+      - name: every desktop test job passed
         env:
           CHANGES: ${{ needs.changes.result }}
           RESULT: ${{ needs.rust-desktop.result }}
+          OSAUTH: ${{ needs.osauth-linux.result }}
         run: |
-          echo "changes: $CHANGES, rust-desktop: $RESULT"
+          echo "changes: $CHANGES, rust-desktop: $RESULT, osauth-linux: $OSAUTH"
           if [ "$CHANGES" != success ]; then
             exit 1
           fi
-          case "$RESULT" in
-            success | skipped) ;;
-            *) exit 1 ;;
-          esac
+          for result in "$RESULT" "$OSAUTH"; do
+            case "$result" in
+              success | skipped) ;;
+              *) exit 1 ;;
+            esac
+          done
 
   rust-operator:
     name: cargo test operator/

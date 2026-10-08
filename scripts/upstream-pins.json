@@ -570,6 +570,22 @@
       "gateGap": "No version to test; the images are rebuilt continuously under the same tag.",
       "note": "distroless publishes no semver tags -- `:nonroot` is a moving tag and the version information is the Debian base (debian12) and, for the template, the node major (nodejs20). Both are human decisions; this row exists so they are at least visible. nodejs20 is the one worth revisiting."
     },
+    {
+      "id": "image-debian",
+      "class": "container-base-image",
+      "title": "debian (the polkit test container)",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": "scripts/test-osauth-linux.sh", "pattern": "(?m)^BASE_IMAGE=docker\\.io/library/debian:(\\d+)-slim$" }
+        ]
+      },
+      "upstream": { "kind": "docker-hub", "repository": "library/debian", "tagPattern": "^\\d+-slim$" },
+      "compare": "numeric",
+      "gate": null,
+      "gateGap": "The gate is test.yml's osauth-linux job, which builds this image and runs every polkit case against it; a new Debian release brings a new polkit, so its answers are what a bump has to review.",
+      "note": "Pinned to the Debian release, point releases floating: the image stands for 'Debian stable', whose polkit (126 in Debian 13) the Linux authentication backend is tested against."
+    },
 
     {
       "id": "action-actions-checkout",
