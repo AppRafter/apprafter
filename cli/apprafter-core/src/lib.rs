@@ -48,3 +48,15 @@ pub use error::{CoreError, CoreResult, UiError};
 pub use op::{Outcome, Plan, PlanClass, PlannedChange};
 pub use report::{CollectReporter, Event, NullReporter, Reporter, Stream};
 pub use target_ref::{ActivePointerChange, TargetRef};
+
+/// The core's version — what the desktop's About line shows as "core <ver>".
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn version_is_the_crate_version() {
+        assert_eq!(super::VERSION, env!("CARGO_PKG_VERSION"));
+        assert!(!super::VERSION.is_empty());
+    }
+}

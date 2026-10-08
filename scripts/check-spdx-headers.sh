@@ -88,8 +88,10 @@ PATTERNS=(
   # about markdown pages, so name them explicitly rather than widening
   # the exclusion's meaning.
   'docs/hooks/*.py'
-  'cli/**/Cargo.toml'
-  'cli/**/rust-toolchain.toml'
+  # A single `*` crosses `/` (no :(glob) magic), so these match cli/Cargo.toml and
+  # cli/rust-toolchain.toml as well as every crate's; `cli/**/…` needs a directory level.
+  'cli/*Cargo.toml'
+  'cli/*rust-toolchain.toml'
 )
 
 # Collect tracked files matching any pattern. `git ls-files` honours

@@ -101,6 +101,7 @@ impl From<Cancelled> for CoreError {
 /// `fields` carries the structured data some variants have, so the UI never
 /// parses prose.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct UiError {
     pub code: Option<String>,
     pub message: String,
@@ -327,6 +328,22 @@ mod tests {
             ui.fields["var"],
             serde_json::json!("APPRAFTER_HCLOUD_BASE_URL")
         );
+    }
+
+    #[cfg(feature = "ts")]
+    #[test]
+    fn ui_error_has_a_typescript_declaration() {
+        use ts_rs::TS;
+        let decl = UiError::decl(&ts_rs::Config::new().with_large_int("number"));
+        for field in [
+            "code: string | null",
+            "message: string",
+            "help: string | null",
+            "causes: Array<string>",
+        ] {
+            assert!(decl.contains(field), "{field} missing from {decl}");
+        }
+        assert!(decl.contains("fields:"), "{decl}");
     }
 
     #[test]

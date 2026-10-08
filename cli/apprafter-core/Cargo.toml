@@ -10,6 +10,13 @@ publish.workspace      = true
 authors.workspace      = true
 repository.workspace   = true
 
+[features]
+# TypeScript declarations of the IPC-facing types, for AppRafter Desktop (ADR 0067). Enabled only
+# from desktop/; exports run from desktop/ipc tests, never from here (`#[ts(export)]` is
+# forbidden by tests/guards.rs: under cli/'s `cargo test --all-features` it would write files
+# into this crate).
+ts = ["dep:ts-rs"]
+
 [dependencies]
 cli-core      = { path = "../cli-core" }
 cli-providers = { path = "../cli-providers" }
@@ -17,6 +24,7 @@ miette        = { workspace = true }
 serde         = { workspace = true }
 serde_json    = { workspace = true }
 thiserror     = { workspace = true }
+ts-rs         = { version = "12.0", optional = true, features = ["serde-json-impl"] }
 
 [dev-dependencies]
 # tests/guards.rs reads the sources as syntax trees, not text. `syn` 2 and

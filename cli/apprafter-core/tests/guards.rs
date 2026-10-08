@@ -13,6 +13,10 @@
 //!    moves its env reads behind `Context`. The count is exact, so a drop
 //!    must lower [`ENV_READ_BASELINE`] in the same commit and can never
 //!    creep back up.
+//! 4. **No TypeScript export.** No attribute in `apprafter-core/src`, test
+//!    code included, asks ts-rs to export a binding ([`ts_export_attrs`]):
+//!    under cli/'s `cargo test --all-features` it would write files into
+//!    this crate. The desktop exports the core's types from its own tests.
 //!
 //! The scan reads syntax trees (`syn`), not text, so neither a comment nor
 //! a string can hide or fake a hit, and nothing depends on where an item
@@ -35,7 +39,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use proc_macro2::{Span, TokenStream, TokenTree};
+use proc_macro2::{Delimiter, Span, TokenStream, TokenTree};
 use syn::punctuated::Punctuated;
 use syn::visit::{self, Visit};
 use syn::{Attribute, Expr, ImplItem, Item, Meta, Stmt, TraitItem, UseTree};
@@ -162,6 +166,8 @@ enum Kind {
     Print,
     /// One of [`FORBIDDEN_CALLEES`], or a [`SANCTIONED`] callee off its site.
     ForbiddenCallee,
+    /// A `ts(export)` / `ts(export_to = …)` attribute ([`ts_export_attrs`]).
+    TsExport,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -816,6 +822,83 @@ fn scan_tree(src: &Path) -> Vec<Finding> {
     findings
 }
 
+/// The lines of every attribute (`#[…]` / `#![…]`) in `src` that carries a
+/// `ts( … )` group naming the ident `export` or `export_to`, at any nesting
+/// (`#[ts(export)]`, `#[ts(rename = "x", export)]`,
+/// `#[cfg_attr(feature = "ts", ts(export_to = "x.ts"))]`). `#[ts(rename =
+/// "export")]` names a string, not the ident, and passes. The file is read
+/// as tokens, not as items: a test module and a macro's input are covered
+/// too, because an exported binding writes its file whenever the test that
+/// ts-rs generates for it runs.
+fn ts_export_attrs(src: &str) -> Vec<usize> {
+    let tokens: TokenStream = src.parse().unwrap_or_else(|e| panic!("tokenize: {e:?}"));
+    let mut lines = Vec::new();
+    collect_ts_export_attrs(tokens, &mut lines);
+    lines
+}
+
+fn collect_ts_export_attrs(tokens: TokenStream, lines: &mut Vec<usize>) {
+    let tts: Vec<TokenTree> = tokens.into_iter().collect();
+    let is_punct =
+        |i: usize, c: char| matches!(tts.get(i), Some(TokenTree::Punct(p)) if p.as_char() == c);
+    for (i, tt) in tts.iter().enumerate() {
+        let TokenTree::Group(g) = tt else { continue };
+        let attribute = g.delimiter() == Delimiter::Bracket
+            && i > 0
+            && (is_punct(i - 1, '#') || (i > 1 && is_punct(i - 1, '!') && is_punct(i - 2, '#')));
+        if attribute {
+            if let Some(line) = ts_export_in(g.stream()) {
+                lines.push(line);
+            }
+        }
+        collect_ts_export_attrs(g.stream(), lines);
+    }
+}
+
+/// The line of the first `ts( … )` in an attribute's tokens whose group
+/// names `export` or `export_to`.
+fn ts_export_in(tokens: TokenStream) -> Option<usize> {
+    let tts: Vec<TokenTree> = tokens.into_iter().collect();
+    tts.iter().enumerate().find_map(|(i, tt)| match tt {
+        TokenTree::Ident(id) if id == "ts" => match tts.get(i + 1) {
+            Some(TokenTree::Group(g))
+                if g.delimiter() == Delimiter::Parenthesis && names_export(g.stream()) =>
+            {
+                Some(line_of(id.span()))
+            }
+            _ => None,
+        },
+        TokenTree::Group(g) => ts_export_in(g.stream()),
+        _ => None,
+    })
+}
+
+fn names_export(tokens: TokenStream) -> bool {
+    tokens.into_iter().any(|tt| match tt {
+        TokenTree::Ident(id) => id == "export" || id == "export_to",
+        TokenTree::Group(g) => names_export(g.stream()),
+        _ => false,
+    })
+}
+
+/// [`ts_export_attrs`] over every `.rs` file under `src`, test modules
+/// included.
+fn ts_export_tree(src: &Path) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    for file in rust_files(src) {
+        let text = fs::read_to_string(&file).unwrap_or_else(|e| panic!("read {file:?}: {e}"));
+        for line in ts_export_attrs(&text) {
+            findings.push(Finding {
+                file: file.clone(),
+                line,
+                kind: Kind::TsExport,
+                callee: "ts(export)".into(),
+            });
+        }
+    }
+    findings
+}
+
 /// The dependencies of a member manifest that [`FORBIDDEN_DEPS`] names,
 /// by their real package name: a `package = "…"` rename counts, in the
 /// member or in the workspace entry a `workspace = true` points at, and so
@@ -920,10 +1003,13 @@ fn rust_files(dir: &Path) -> Vec<PathBuf> {
 
 #[test]
 fn the_core_never_prints_exits_or_reads_the_environment() {
-    let hits = scan_tree(&crate_dir("apprafter-core").join("src"));
+    let src = crate_dir("apprafter-core").join("src");
+    let mut hits = scan_tree(&src);
+    hits.extend(ts_export_tree(&src));
+    hits.sort();
     assert!(
         hits.is_empty(),
-        "apprafter-core must stay pure (ADR 0067 §2):\n{}",
+        "apprafter-core must stay pure (ADR 0067 §2) and export no TypeScript:\n{}",
         hits.iter()
             .map(|h| h.to_string())
             .collect::<Vec<_>>()
@@ -1303,6 +1389,25 @@ impl Context {
                 5
             )]
         );
+    }
+
+    #[test]
+    fn ts_export_is_forbidden_in_the_core() {
+        for (src, bad) in [
+            ("#[derive(ts_rs::TS)] #[ts(export)] struct A;", true),
+            ("#[ts(rename = \"B\", export)] struct B;", true),
+            (
+                "#[cfg_attr(feature = \"ts\", ts(export_to = \"x.ts\"))] struct C;",
+                true,
+            ),
+            (
+                "#[cfg_attr(feature = \"ts\", derive(ts_rs::TS))] struct D;",
+                false,
+            ),
+            ("#[ts(rename = \"export\")] struct E;", false),
+        ] {
+            assert_eq!(!ts_export_attrs(src).is_empty(), bad, "{src}");
+        }
     }
 
     #[test]
