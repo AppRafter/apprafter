@@ -29,6 +29,13 @@ target/
 !/cli/platform-cli/tests/golden/target/
 **/*.rs.bk
 *.pdb
+# AppRafter Desktop: the first vertical slice is `target` (design spec §6.3), so the
+# `target/` rule above would swallow its frontend and command modules. Verify with:
+#   git check-ignore -v desktop/src/screens/target/TargetScreen.tsx
+!/desktop/src/**/target/
+!/desktop/src-tauri/src/**/target/
+# Tauri writes capability-schema files at build time.
+/desktop/src-tauri/gen/
 
 # CUE
 cue.out/

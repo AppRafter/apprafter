@@ -17,6 +17,10 @@ indent_size = 2
 [*.{ts,tsx,js,jsx,mjs,cjs}]
 indent_size = 2
 
+# CSS and HTML match Biome's 2-space indent (desktop/).
+[*.{css,html}]
+indent_size = 2
+
 [*.{rs}]
 indent_size = 4
 

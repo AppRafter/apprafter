@@ -45,3 +45,10 @@ examples/**  linguist-documentation=true
 # Golden snapshots are byte-exact program output (cli/platform-cli/tests/golden.rs):
 # no EOL conversion, no whitespace fixing.
 *.golden     -text -whitespace
+
+# AppRafter Desktop: app icons and fonts, generated IPC bindings, vendored design source.
+*.icns       binary
+*.woff2      binary
+*.ttf        binary
+desktop/src/ipc/generated/** linguist-generated=true
+desktop/design-source/**     linguist-vendored=true
