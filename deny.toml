@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
 #
-# cargo-deny policy, shared by both Cargo workspaces (`cli/` and `operator/`
-# are separate workspaces with no top-level Cargo.toml, so `scripts/cargo-deny.sh`
-# runs cargo-deny once per workspace against THIS file).
+# cargo-deny policy, shared by all three Cargo workspaces (`cli/`, `operator/`
+# and `desktop/` are separate workspaces with no top-level Cargo.toml, so
+# `scripts/cargo-deny.sh` runs cargo-deny once per workspace against THIS file).
+# An ignore that only one workspace needs makes the other runs warn "advisory
+# was not encountered"; that warning is expected.
 #
 # ## Why this file exists
 #
@@ -62,6 +64,13 @@ the SealedSecret object carries no algorithm identifier or format version.
 RE-EXAMINE THIS if a private-key decrypt or sign ever enters a production path.
 That is the condition that makes this ignore wrong, not a version bump.
 """ },
+    # Desktop only, Linux only, build time only: tauri 2.12 -> tao/wry/muda/webkit2gtk
+    # -> gtk 0.18 -> glib-macros 0.18 and gtk3-macros 0.18 -> proc-macro-error 1.0.4.
+    # A proc-macro: it runs inside rustc and is not in the shipped binary. Unfixable
+    # on GTK3: glib-macros dropped it in 0.19, but the archived GTK3 bindings (gtk,
+    # gtk3-macros) end at 0.18 on glib 0.18; Tauri's move to GTK4 is its 3.0
+    # milestone. Not reachable from cli/ or operator/. Delete with the GTK4 move.
+    { id = "RUSTSEC-2024-0370", reason = "proc-macro-error via tauri -> gtk 0.18 -> glib-macros/gtk3-macros 0.18 on Linux (build-time proc-macro)" },
 ]
 
 [bans]

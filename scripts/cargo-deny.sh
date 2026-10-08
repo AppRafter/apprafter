@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
 #
-# cargo-deny.sh — advisory, licence, source and duplicate checks for both
-# Cargo workspaces.
+# cargo-deny.sh — advisory, licence, source and duplicate checks for every
+# Cargo workspace.
 #
 # ## Why
 #
@@ -20,12 +20,12 @@
 # (rustls-pemfile, backoff, derivative, instant), every one of the four
 # arriving through a single dependency, `kube` 0.95.
 #
-# ## Why one config for two workspaces
+# ## Why one config for every workspace
 #
-# `cli/` and `operator/` are SEPARATE Cargo workspaces — there is no top-level
-# Cargo.toml — so cargo-deny has to run once per workspace. Both point at the
-# repo-root `deny.toml` so an advisory decision is made once, in one place,
-# rather than drifting between two copies.
+# `cli/`, `operator/` and `desktop/` are SEPARATE Cargo workspaces — there is
+# no top-level Cargo.toml — so cargo-deny has to run once per workspace. Every
+# run points at the repo-root `deny.toml` so an advisory decision is made once,
+# in one place, rather than drifting between copies.
 #
 # Usage:  bash scripts/cargo-deny.sh
 set -euo pipefail
@@ -62,13 +62,13 @@ fi
 echo "==> cargo-deny ${deny_version}"
 
 status=0
-for ws in cli operator; do
+for ws in cli operator desktop; do
     [ -f "$ROOT/$ws/Cargo.toml" ] || { echo "==> no $ws/Cargo.toml — skipping"; continue; }
     echo "==> cargo-deny ($ws)"
     # `--all-features` is a TOP-LEVEL flag, before the subcommand — passing it
     # after `check` is rejected. It matters: a dependency reachable only behind
-    # a feature flag still ships when that feature is on, and CI builds both
-    # workspaces with --all-features.
+    # a feature flag still ships when that feature is on, and CI builds every
+    # workspace with --all-features.
     if ! ( cd "$ROOT/$ws" && _deny --all-features "${top_config[@]}" check "${check_config[@]}" ); then
         status=1
     fi
@@ -89,4 +89,4 @@ EOF
     exit 1
 fi
 
-echo "cargo-deny OK: advisories, bans, licences and sources clean in both workspaces."
+echo "cargo-deny OK: advisories, bans, licences and sources clean in every workspace."
