@@ -13855,16 +13855,26 @@ mod tests {
         );
     }
 
+    /// An `ExitStatus` that exited with `code`, on either platform.
+    fn exit_status(code: i32) -> std::process::ExitStatus {
+        #[cfg(unix)]
+        use std::os::unix::process::ExitStatusExt as _;
+        #[cfg(windows)]
+        use std::os::windows::process::ExitStatusExt as _;
+        #[cfg(unix)]
+        let raw = code << 8;
+        #[cfg(windows)]
+        let raw = code as u32;
+        std::process::ExitStatus::from_raw(raw)
+    }
+
     #[test]
     fn the_stderr_capture_keeps_the_last_lines_and_says_so_when_there_were_none() {
         // A pod that fails after logging thousands of lines must still report
         // the END of its output — the last lines are where the error is.
         let noisy: String = (1..=30).map(|i| format!("line{i}\n")).collect();
         let buf = spawn_capturing_drainer(io::Cursor::new(noisy.into_bytes()));
-        let failed = Command::new("/bin/sh")
-            .args(["-c", "exit 4"])
-            .status()
-            .unwrap();
+        let failed = exit_status(4);
         let msg = format!("{}", format_exec_error("ctx", failed, &buf));
         assert!(msg.contains("ctx"), "{msg}");
         assert!(msg.contains("line30"), "the tail must survive: {msg}");
