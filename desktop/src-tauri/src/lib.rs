@@ -2,6 +2,7 @@
 //! AppRafter Desktop (ADR 0067): the GUI twin of the apprafter CLI over `apprafter-core`.
 
 pub mod auth;
+pub mod env;
 pub mod errors;
 pub mod lock;
 pub mod ops;

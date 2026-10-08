@@ -40,4 +40,8 @@ tauri                 = { workspace = true }
 thiserror             = "2"
 
 [dev-dependencies]
-tempfile = "3"
+# tests/env_guard.rs reads src/ as syntax trees, not text: versions already in the lock (as in
+# apprafter-core's guard); `span-locations` gives its findings their line numbers.
+proc-macro2 = { version = "1", features = ["span-locations"] }
+syn         = { version = "2", features = ["full", "visit"] }
+tempfile    = "3"
