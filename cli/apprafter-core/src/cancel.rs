@@ -24,10 +24,33 @@ struct Callbacks {
     entries: Vec<(u64, Callback)>,
 }
 
+/// A test-only hook, see [`Inner::after_check`].
+#[cfg(test)]
+type Hook = Arc<dyn Fn() + Send + Sync>;
+
 #[derive(Default)]
 struct Inner {
     cancelled: AtomicBool,
     callbacks: Mutex<Callbacks>,
+    /// Runs in `on_cancel` after it reads the flag and before it acts on
+    /// it, so a test can land a `cancel` exactly in that window. Absent
+    /// from non-test builds.
+    #[cfg(test)]
+    after_check: Mutex<Option<Hook>>,
+}
+
+#[cfg(test)]
+impl Inner {
+    fn run_after_check(&self) {
+        let hook = self
+            .after_check
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
 }
 
 /// One operation's cancellation. Clones share the same state.
@@ -96,7 +119,10 @@ impl CancellationToken {
             .unwrap_or_else(|p| p.into_inner());
         let id = cbs.next_id;
         cbs.next_id += 1;
-        if self.is_cancelled() {
+        let cancelled = self.is_cancelled();
+        #[cfg(test)]
+        self.inner.run_after_check();
+        if cancelled {
             drop(cbs);
             f();
         } else {
@@ -213,5 +239,59 @@ mod tests {
             assert_eq!(hits.load(Ordering::SeqCst), 1);
             drop(registration);
         }
+    }
+
+    /// Forces the interleaving the sampled test above only hopes to hit:
+    /// `cancel` trips the flag after `on_cancel` has read it and before
+    /// `on_cancel` has queued the callback. `on_cancel` reads the flag under
+    /// the callback lock, so `cancel` waits for the push and then drains it.
+    #[test]
+    fn a_cancel_landing_between_check_and_push_still_runs_the_callback_once() {
+        use std::sync::{mpsc, Mutex, TryLockError};
+        use std::time::{Duration, Instant};
+
+        let t = CancellationToken::new();
+        let (checked_tx, checked_rx) = mpsc::channel::<()>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let go_rx = Mutex::new(go_rx);
+        *t.inner.after_check.lock().unwrap() = Some(Arc::new(move || {
+            checked_tx.send(()).unwrap();
+            go_rx.lock().unwrap().recv().unwrap();
+        }));
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let (ta, h) = (t.clone(), hits.clone());
+        let registering = std::thread::spawn(move || {
+            ta.on_cancel(move || {
+                h.fetch_add(1, Ordering::SeqCst);
+            })
+        });
+        checked_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("on_cancel never reached its flag check");
+
+        let tb = t.clone();
+        let cancelling = std::thread::spawn(move || tb.cancel());
+
+        // Hold the registration in its window until `cancel` has tripped the
+        // flag AND reached the callback lock: either it is waiting on (or
+        // holding) that lock, or it has already returned. Releasing earlier
+        // would let the registration push before `cancel` drains, which
+        // passes even when the flag is read outside the lock.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let lock_busy = matches!(t.inner.callbacks.try_lock(), Err(TryLockError::WouldBlock));
+            if t.is_cancelled() && (lock_busy || cancelling.is_finished()) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "cancel never tripped the flag");
+            std::thread::yield_now();
+        }
+        go_tx.send(()).unwrap();
+
+        let registration = registering.join().unwrap();
+        cancelling.join().unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        drop(registration);
     }
 }
