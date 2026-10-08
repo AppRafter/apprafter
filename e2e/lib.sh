@@ -1085,10 +1085,12 @@ _diag_artifact_dir() {
 #   walks call it bare from their EXIT trap, where one failing command
 #   would skip the teardown.
 #
-#   The operator and webhook logs cover the WHOLE walk: every
-#   container of every pod of the two deployments, read --since-time
-#   the walk started (START_NS), plus the previous instance of every
-#   container that restarted. The console shows the last
+#   The operator and webhook logs: every container of every pod the
+#   two deployments have when the dump runs, read --since-time a minute
+#   before the walk started (START_NS; the whole log when date cannot
+#   convert it), plus the previous instance of every container that
+#   restarted. A pod replaced during the walk is gone, and its log with
+#   it. The console shows the last
 #   APPRAFTER_E2E_DIAG_CONSOLE_LINES (default 2000) lines of each.
 #   It used to show the last 120, and on run 37001547817 (needs-redis
 #   nightly, 2026-10-02) those began 30s after the stalled Application
@@ -1098,9 +1100,10 @@ _diag_artifact_dir() {
 #   APPRAFTER_E2E_DIAG_DIR — when set, each call ALSO writes a fresh
 #   subdirectory of it (see _diag_artifact_dir) holding what the console
 #   has to cut: the whole control-plane logs, the whole logs of every
-#   not-Ready pod, every event, and every apprafter.io and Argo CD
-#   object as YAML. The e2e workflows set it and upload it as the run's
-#   `e2e-diagnostics-*` artifact when the job fails.
+#   not-Ready pod, every event, and every apprafter.io object and Argo
+#   CD Application as YAML. The e2e workflows set it and upload it as
+#   the run's `e2e-diagnostics-*` artifact when the job fails or is
+#   cancelled.
 # ---------------------------------------------------------------
 dump_diagnostics() {
     command -v kubectl >/dev/null 2>&1 || return 0

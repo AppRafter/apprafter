@@ -33,9 +33,14 @@
 # The verdict is the count after the claim recovered: every recovering pass
 # after the first one is a retry on top of the recorded allocation.
 #
-#   PROOF_EXPECT=survive|loss   default: survive with APPRAFTER_E2E_LOCAL_OPERATOR=1,
-#                               loss without it (the published v0.2.52 operator
-#                               flushes; running it shows the proof sees the defect)
+#   PROOF_EXPECT=survive|loss   default: survive. `loss` shows the proof sees the
+#                               defect. It needs APPRAFTER_E2E_LOCAL_OPERATOR unset
+#                               (the working tree's operator keeps the data) and a
+#                               newest published platform of 0.2.80 or earlier (an
+#                               operator older than v0.2.53). Bootstrap installs the
+#                               newest published platform (this checkout's own
+#                               currentVersion when GitHub's release list cannot be
+#                               read), so nothing here can pin an older one
 #   PROOF_KEYS=50               keys written before the delete
 #   PROOF_FAILURES=1            failed passes to wait for before the failure is lifted
 #   APPRAFTER_E2E_SKIP_DESTROY=1  keep the cluster after the run
@@ -77,11 +82,7 @@ RETAINED_RES="retainedclaim.apprafter.io"
 
 PROOF_KEYS="${PROOF_KEYS:-50}"
 PROOF_FAILURES="${PROOF_FAILURES:-1}"
-if [ -n "${APPRAFTER_E2E_LOCAL_OPERATOR:-}" ]; then
-    PROOF_EXPECT="${PROOF_EXPECT:-survive}"
-else
-    PROOF_EXPECT="${PROOF_EXPECT:-loss}"
-fi
+PROOF_EXPECT="${PROOF_EXPECT:-survive}"
 
 case "$PROOF_EXPECT" in
     survive | loss) ;;

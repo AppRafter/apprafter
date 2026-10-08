@@ -251,32 +251,46 @@ ready again on the same database number.
 # the working tree's operator: the keys must survive
 KUBECONFIG=/nonexistent APPRAFTER_SKIP_STARTUP_CHECKS=1 APPRAFTER_E2E_LOCAL_OPERATOR=1 \
   bash e2e/redis-reattach-proof.sh
-# the published operator: the keys must be lost, which shows the proof sees the defect
+# the published operator
 KUBECONFIG=/nonexistent APPRAFTER_SKIP_STARTUP_CHECKS=1 bash e2e/redis-reattach-proof.sh
 ```
 
-`PROOF_EXPECT=survive|loss` overrides the expectation, `PROOF_KEYS` (50) sets
-how many keys are written, and `PROOF_FAILURES` (1) how many failed passes the
-script waits for before it lifts the failure. It runs on a private kind
-cluster, deleted on exit unless `APPRAFTER_E2E_SKIP_DESTROY=1`, in about 20
-minutes.
+The keys must survive in both runs. `PROOF_EXPECT=loss` expects them lost
+instead, which shows the proof sees the defect. It holds only for the second
+run, and only while the newest published platform runs an operator older than
+v0.2.53 (platform-stack 0.2.80 or earlier): bootstrap installs the newest
+published platform (this checkout's own `currentVersion` when GitHub's release
+list cannot be read), and the script cannot pin an older one. `PROOF_KEYS` (50)
+sets how many keys are
+written, and `PROOF_FAILURES` (1) how many failed passes the script waits for
+before it lifts the failure. It runs on a private kind cluster, deleted on exit
+unless `APPRAFTER_E2E_SKIP_DESTROY=1`, in about 5 minutes with the published
+operator and 9 to 16 with the working tree's, which first builds the operator
+and webhook images.
 
 ## Failure diagnostics
 
-A walk that fails calls `dump_diagnostics` (`e2e/lib.sh`) from its exit
-trap, before the cluster is torn down. The operator and admission-webhook
-logs it prints cover the whole walk: every container of every pod of the
-two deployments, read from the walk's start (`--since-time`), plus the
-previous instance of any container that restarted. The console shows the
-last 2000 lines of each, with ANSI colour codes removed.
+Every walk the `.github/workflows/e2e-*.yml` workflows run calls
+`dump_diagnostics` (`e2e/lib.sh`) from its exit trap when it fails, before the
+cluster is torn down; `mvp.sh` and some one-off walks and probes print shorter
+diagnostics of their own, or none. It reads the operator and admission-webhook
+logs: every container of every pod the two deployments have when the dump
+runs, from a minute before the walk started (`--since-time`; the whole log
+where `date` cannot convert that time), plus the previous instance of any
+container that restarted. A pod replaced during the walk is gone by then, and
+its log with it, so a walk that restarts the operator (as every walk with
+`APPRAFTER_E2E_LOCAL_OPERATOR=1` does) keeps its log only from the last
+restart. The console first lists every line of those logs that
+reports a reconcile that did not finish within its deadline, then the last
+2000 lines of each log, with ANSI colour codes removed.
 
 | Var                                | Default | Purpose                                                                                                                                                                                                                                       |
 | ---------------------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `APPRAFTER_E2E_DIAG_DIR`           | unset   | When set, each dump also writes a new `<kube-context>-<UTC time>-XXXXXX/` directory here: the whole control-plane logs, the whole logs of every not-Ready pod, `events.txt`, and every `apprafter.io` object and Argo CD Application as YAML. |
 | `APPRAFTER_E2E_DIAG_CONSOLE_LINES` | `2000`  | Lines of each control-plane log printed to the console.                                                                                                                                                                                       |
 
-The e2e workflows set `APPRAFTER_E2E_DIAG_DIR` and, when the job fails,
-upload it as the `e2e-diagnostics-<job>-<attempt>` artifact, kept for 14
+The `.github/workflows/e2e-*.yml` workflows set `APPRAFTER_E2E_DIAG_DIR` and,
+when the job fails or is cancelled, upload it as the `e2e-diagnostics-<job>-<attempt>` artifact, kept for 14
 days. `scripts/check-dump-diagnostics.sh` runs `dump_diagnostics` against a
 stub `kubectl`.
 
