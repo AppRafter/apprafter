@@ -1,0 +1,5 @@
+$ apprafter --version
+[exit 0]
+[stdout]
+apprafter <VERSION>
+[stderr]

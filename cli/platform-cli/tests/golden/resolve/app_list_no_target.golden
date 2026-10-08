@@ -1,0 +1,13 @@
+$ apprafter app list
+[exit 1]
+[stdout]
+[stderr]
+Error: apprafter::cli::other
+
+  × no active target — run `apprafter target add <name> --provider hetzner-
+  │ cloud …` first, or supply `--target <name>` to point at a specific one
+  help: This is the catch-all CLI error. The message above is the only
+        context. If you see this often with the same wording, please file an
+        issue — recurring messages should be promoted to a typed `CliError`
+        variant with its own help text.
+

@@ -729,3 +729,71 @@ fn whoami_no_ping() {
 fn whoami_empty_store() {
     Sandbox::new().golden("session/whoami_empty", &["whoami", "--no-ping"]);
 }
+
+// ---------------------------------------------------------------------
+// Target resolution, init, version
+// ---------------------------------------------------------------------
+
+#[test]
+fn version_flag() {
+    Sandbox::new().golden("session/version", &["--version"]);
+}
+
+#[test]
+fn init_writes_state_for_active_target() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.golden(
+        "session/init",
+        &[
+            "init",
+            "--provider",
+            "hetzner-cloud",
+            "--tier",
+            "solo",
+            "--region",
+            "nbg1",
+        ],
+    );
+}
+
+#[test]
+fn init_without_target() {
+    Sandbox::new().golden(
+        "session/init_no_target",
+        &[
+            "init",
+            "--provider",
+            "hetzner-cloud",
+            "--tier",
+            "solo",
+            "--region",
+            "nbg1",
+        ],
+    );
+}
+
+#[test]
+fn kubeconfig_with_no_target() {
+    Sandbox::new().golden("resolve/kubeconfig_no_target", &["kubeconfig"]);
+}
+
+#[test]
+fn kubeconfig_with_unknown_target() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.golden(
+        "resolve/kubeconfig_unknown_target",
+        &["kubeconfig", "--target", "ghost"],
+    );
+}
+
+#[test]
+fn status_with_no_target() {
+    Sandbox::new().golden("resolve/status_no_target", &["status"]);
+}
+
+#[test]
+fn app_list_with_no_target() {
+    Sandbox::new().golden("resolve/app_list_no_target", &["app", "list"]);
+}
