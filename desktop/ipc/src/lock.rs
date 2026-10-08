@@ -3,6 +3,9 @@
 
 use serde::Serialize;
 
+/// The event every lock transition emits to the webview, with the new [`LockState`].
+pub const LOCK_CHANGED: &str = "lock-changed";
+
 /// Why the app is locked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]

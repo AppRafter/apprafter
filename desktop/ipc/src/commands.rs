@@ -17,6 +17,7 @@ pub const COMMANDS: &[&str] = &[
     "quit",
     "op_list",
     "op_subscribe",
+    "op_unsubscribe",
     "op_cancel",
     "op_discard",
     "op_execute",

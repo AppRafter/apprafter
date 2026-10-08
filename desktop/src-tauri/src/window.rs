@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
-//! The main window: size, background and the navigation guard.
+//! The main window: size, background, the navigation guard, and bringing it to the front.
 //!
 //! The webview may only ever show the app itself. A link, a redirect or an injected
 //! `location =` that leaves the app origin is refused, and new windows are never opened
@@ -7,7 +7,7 @@
 //! `tauri://localhost` on macOS/Linux, `http(s)://tauri.localhost` on Windows, and the Vite
 //! dev server in debug builds.
 
-use tauri::{Url, WebviewUrl, WebviewWindowBuilder};
+use tauri::{Manager, Url, WebviewUrl, WebviewWindowBuilder};
 
 /// The window label every capability and command refers to.
 pub const MAIN: &str = "main";
@@ -22,6 +22,18 @@ pub fn is_app_url(url: &Url, debug: bool) -> bool {
         "http" | "https" if url.host_str() == Some("tauri.localhost") => true,
         "http" if debug => url.origin().ascii_serialization() == DEV_ORIGIN,
         _ => false,
+    }
+}
+
+/// What a second launch does (the single-instance plugin): bring the main window to the front,
+/// and nothing else. The second process's arguments and working directory are never read, so
+/// nothing outside the app can make it act (ADR 0036). Without a main window (a quit is
+/// waiting for its operations) it does nothing.
+pub fn show_and_focus(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window(MAIN) {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
     }
 }
 

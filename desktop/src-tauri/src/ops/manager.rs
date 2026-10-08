@@ -9,10 +9,12 @@
 //! An operation's events go into its [`ReplayBuffer`] and to every subscribed
 //! [`EventSink`], both under the manager's lock, so a page that subscribes gets the replay
 //! and then exactly the events after it. Every subscription has its own [`SubscriptionId`], so
-//! a page can [`unsubscribe`](OperationManager::unsubscribe) exactly the one it made. An ended operation keeps its summary and replay
-//! until the webview [`discard`](OperationManager::discard)s it after showing the result, or
-//! until [`ENDED_KEPT`] operations ended after it. A plan that never runs — its prompt
-//! refused, expired, swept, or dropped by a lock — sends the pages that followed it one
+//! a page can [`unsubscribe`](OperationManager::unsubscribe) exactly the one it made.
+//!
+//! An ended operation keeps its summary and replay until the webview
+//! [`discard`](OperationManager::discard)s it after showing the result, or until
+//! [`ENDED_KEPT`] operations ended after it. A plan that never runs — its prompt refused,
+//! expired, swept, dropped by a lock or by a quit — sends the pages that followed it one
 //! `Failed` saying why, so none of them waits for an end that never comes.
 //!
 //! A plan leaves the manager's maps under its lock and is dropped after the lock is released:
@@ -583,14 +585,20 @@ impl OperationManager {
     }
 
     /// The app locked: no plan made before it may run after it. Every plan goes, the pages
-    /// that followed it told `Locked`, and every open prompt is refused before this returns
-    /// (its dialog closes, and its `execute` refuses whatever the OS answers and tells its
-    /// pages `AuthCancelled`). Running operations go on: they were confirmed before the lock.
+    /// that followed it told `Locked` (`Closing` once the manager is closed: a quit drops the
+    /// plans too), and every open prompt is refused before this returns (its dialog closes,
+    /// and its `execute` refuses whatever the OS answers and tells its pages
+    /// `AuthCancelled`). Running operations go on: they were confirmed before the lock.
     pub fn drop_all_plans(&self) {
         let mut inner = self.lock();
+        let why = if inner.closing {
+            DesktopError::Closing
+        } else {
+            DesktopError::Locked
+        };
         let mut plans: Vec<Pending> = inner.pending.drain().map(|(_, plan)| plan).collect();
         for plan in &mut plans {
-            refuse(&mut plan.sinks, &DesktopError::Locked);
+            refuse(&mut plan.sinks, &why);
         }
         let prompts = refuse_prompts(&mut inner.prompts);
         drop(inner);
@@ -2748,6 +2756,17 @@ mod tests {
             "nothing waits for another try"
         );
         assert_eq!(runs.load(SeqCst), 0);
+    }
+
+    #[test]
+    fn plans_dropped_after_the_manager_closed_tell_their_pages_it_is_quitting() {
+        let (_, mgr) = manager();
+        let view = mgr.register_plan(parts(PlanClass::Bounded), returns(json!(0)));
+        let sink = VecSink::new("main");
+        mgr.subscribe(view.op_id, sink.clone()).unwrap();
+        mgr.close();
+        mgr.drop_all_plans();
+        assert_eq!(sink.events(), vec![closing()], "not that the app locked");
     }
 
     // 17. Subscriptions: each one is numbered, and ending one ends exactly that one.

@@ -34,14 +34,27 @@ apprafter-desktop-ipc = { path = "../ipc" }
 cli-core              = { workspace = true }
 # The versions cli/Cargo.toml pins, already in the lock.
 miette                = "7"
+# The one crypto provider (as cli/Cargo.toml pins it): runtime.rs installs ring.
+rustls                = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde                 = { workspace = true }
 serde_json            = { workspace = true }
 tauri                 = { workspace = true }
+# A second launch focuses the first window instead of starting another app.
+tauri-plugin-single-instance = "~2.5"
 thiserror             = "2"
+# The async runtime Tauri runs commands on, built here with 8 MiB thread stacks.
+tokio                 = { version = "1", features = ["rt-multi-thread"] }
 # The version cli/Cargo.toml pins, already in the lock (cli-core logs through it).
 tracing               = "0.1"
+# The log file in the app's log directory, rotated daily, the last few kept.
+tracing-appender      = "~0.2"
+tracing-subscriber    = { version = "0.3", features = ["fmt"] }
+# The account and host name the title bar shows (`app_info`).
+whoami                = "~2.1"
 
 [dev-dependencies]
+# The mock runtime for tests/ipc_mock.rs.
+tauri       = { workspace = true, features = ["test"] }
 # tests/env_guard.rs reads src/ as syntax trees, not text: versions already in the lock (as in
 # apprafter-core's guard); `span-locations` gives its findings their line numbers.
 proc-macro2 = { version = "1", features = ["span-locations"] }

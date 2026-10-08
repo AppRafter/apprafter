@@ -18,7 +18,7 @@ pub mod errors;
 pub use app_info::{AppInfo, Os, SecretBackend};
 pub use auth::{AuthInfo, AuthMethod, AuthOutcome, CancelledBy, UnavailableReason};
 pub use commands::{ALLOWED_WHILE_LOCKED, COMMANDS};
-pub use lock::{LockReason, LockState};
+pub use lock::{LockReason, LockState, LOCK_CHANGED};
 pub use ops::{
     OpEvent, OpId, OpState, OpSummary, OutputStream, PlanView, Subscribed, SubscriptionId,
 };

@@ -1,10 +1,47 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 // The webview's permissions. Deliberately minimal: never `core:default`, which includes
 // `core:tray:default` and so every tray command. Each later step adds exactly what it uses.
+// App commands pass the lock gate (src/app.rs); plugin commands never do in Tauri 2, so every
+// plugin permission here must be harmless while locked. The single-instance plugin has no
+// commands and needs none. The `allow-*` names are what tauri-build generates from
+// apprafter_desktop_ipc::COMMANDS (gen/schemas/desktop-schema.json).
 {
   $schema: "../gen/schemas/desktop-schema.json",
   identifier: "main",
   windows: ["main"],
   platforms: ["linux", "macOS", "windows"],
-  permissions: [],
+  permissions: [
+    // Subscribe to `lock-changed`, the lock's only push to the page; carries nothing out.
+    "core:event:allow-listen",
+    // Drop that subscription when the component that made it unmounts.
+    "core:event:allow-unlisten",
+    // Versions, OS, account, auth support: the About line, title bar and lock screen.
+    "allow-app-info",
+    // The preferences, read even while locked so the lock screen has its theme.
+    "allow-settings-get",
+    // The settings dialog saves through it (the lock machine checks lockEnabled).
+    "allow-settings-set",
+    // The lock state the page renders; answered while locked.
+    "allow-lock-status",
+    // Lock now (Mod+L, the settings row).
+    "allow-lock-now",
+    // The lock screen's unlock button: Rust asks the OS for the owner.
+    "allow-unlock",
+    // Throttled pings that restart the idle time.
+    "allow-activity",
+    // The app menu's Quit: cancels running operations, waits, exits.
+    "allow-quit",
+    // The running and recent operations (the sidebar's "N running" sheet).
+    "allow-op-list",
+    // Follow an operation's events after a reload or a remount.
+    "allow-op-subscribe",
+    // End one subscription when its component unmounts.
+    "allow-op-unsubscribe",
+    // Cancel an operation, its prompt or its plan.
+    "allow-op-cancel",
+    // Forget an ended operation once its result was shown, or a closed plan.
+    "allow-op-discard",
+    // Run a confirmed plan by op id (the OS gesture, when needed, is asked in Rust).
+    "allow-op-execute",
+  ],
 }
