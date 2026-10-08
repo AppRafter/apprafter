@@ -3,9 +3,10 @@
 
 /// A command other than [`ALLOWED_WHILE_LOCKED`](crate::ALLOWED_WHILE_LOCKED) while locked.
 pub const LOCKED: &str = "apprafter::desktop::locked";
-/// No pending plan has this op id: executed already, discarded, or dropped on lock.
+/// No pending plan has this op id (`fields.opId`): executed already, discarded, or dropped on
+/// lock.
 pub const PLAN_NOT_FOUND: &str = "apprafter::desktop::plan_not_found";
-/// The plan outlived its time to live; plan again.
+/// The plan (`fields.opId`) outlived its time to live; plan again.
 pub const PLAN_EXPIRED: &str = "apprafter::desktop::plan_expired";
 /// The OS prompt was closed before it answered.
 pub const AUTH_CANCELLED: &str = "apprafter::desktop::auth_cancelled";
@@ -13,7 +14,7 @@ pub const AUTH_CANCELLED: &str = "apprafter::desktop::auth_cancelled";
 pub const AUTH_FAILED: &str = "apprafter::desktop::auth_failed";
 /// The OS cannot authenticate here; `fields.reason` says why.
 pub const AUTH_UNAVAILABLE: &str = "apprafter::desktop::auth_unavailable";
-/// Another authentication prompt was already open; nothing was asked.
+/// Another authentication prompt was already open; nothing was asked, and the plan waits.
 pub const AUTH_BUSY: &str = "apprafter::desktop::auth_busy";
 /// `settings.json` could not be written.
 pub const SETTINGS_IO: &str = "apprafter::desktop::settings_io";

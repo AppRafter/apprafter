@@ -21,7 +21,6 @@
 
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::thread;
 
 use apprafter_core::CancellationToken;
 use apprafter_desktop_ipc::{
@@ -151,7 +150,9 @@ impl LockMachine {
             }
         };
         if let Some(cancel) = close {
-            trip(cancel);
+            // Off this thread: `cancel` runs the backend's callbacks on the calling thread and
+            // re-raises the first one's panic, and the caller may be the main thread.
+            crate::ops::trip(cancel, "lock-cancel");
         }
     }
 
@@ -252,21 +253,6 @@ fn state_of(inner: &Inner, info: &AuthInfo) -> LockState {
         auto_lock_minutes: in_effect(&inner.settings, info)
             .then(|| inner.settings.auto_lock.minutes())
             .flatten(),
-    }
-}
-
-/// Trip `token` on a short-lived thread of its own, as the operation manager trips a
-/// prompt's: `CancellationToken::cancel` runs the backend's callbacks on the calling thread
-/// and re-raises the first one's panic, and the caller may be the main thread.
-fn trip(token: CancellationToken) {
-    let spawned = thread::Builder::new().name("lock-cancel".into()).spawn({
-        let token = token.clone();
-        move || token.cancel()
-    });
-    if spawned.is_err() {
-        // No thread to be had: trip it here rather than not at all, and keep a callback's
-        // panic from reaching the caller.
-        let _ = panic::catch_unwind(AssertUnwindSafe(|| token.cancel()));
     }
 }
 

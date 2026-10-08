@@ -85,8 +85,8 @@ fn wire_name(reason: &UnavailableReason) -> String {
 
 impl DesktopError {
     /// What a command returns: the diagnostic's code, message, help and causes, plus the
-    /// structured `fields` the webview acts on (`op_id`, `reason`, `exhausted`). A core
-    /// error keeps the core's own projection.
+    /// structured `fields` the webview acts on (`opId`, `reason`, `exhausted` — camelCase,
+    /// as every other key on the wire). A core error keeps the core's own projection.
     pub fn to_ui(&self) -> UiError {
         if let DesktopError::Core(core) = self {
             return UiError::from(core);
@@ -94,7 +94,7 @@ impl DesktopError {
         let mut ui = UiError::from_diagnostic(self);
         match self {
             DesktopError::PlanNotFound { op_id } | DesktopError::PlanExpired { op_id } => {
-                ui.fields.insert("op_id".into(), serde_json::json!(op_id.0));
+                ui.fields.insert("opId".into(), serde_json::json!(op_id.0));
             }
             DesktopError::AuthFailed { exhausted } => {
                 ui.fields
@@ -178,7 +178,12 @@ mod tests {
             DesktopError::PlanExpired { op_id: OpId(42) },
         ] {
             let ui = e.to_ui();
-            assert_eq!(ui.fields["op_id"], json!(42), "{ui:?}");
+            assert_eq!(ui.fields["opId"], json!(42), "{ui:?}");
+            assert_eq!(
+                ui.fields.len(),
+                1,
+                "camelCase like every other wire key: {ui:?}"
+            );
             assert!(ui.message.contains("42"), "{}", ui.message);
             assert!(ui.help.is_some());
         }
