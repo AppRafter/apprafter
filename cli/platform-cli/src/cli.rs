@@ -487,7 +487,8 @@ pub enum Commands {
         /// `$XDG_CONFIG_HOME/fish/completions/apprafter.fish`. Those
         /// three only: `elvish` and `powershell` are refused rather
         /// than written to a guessed path, and still print a script
-        /// you can redirect yourself.
+        /// you can redirect yourself. On Windows, which has no XDG
+        /// directories, `--install` is refused for every shell.
         ///
         /// Re-run after upgrading. The script describes the binary
         /// that produced it, and an installed one goes stale silently.
