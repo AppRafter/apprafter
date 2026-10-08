@@ -562,3 +562,170 @@ fn target_ip_without_server() {
     sb.add_target("prod");
     sb.golden("target/ip_no_server", &["target", "ip"]);
 }
+
+// ---------------------------------------------------------------------
+// Hetzner-backed (mockito)
+// ---------------------------------------------------------------------
+
+const LOCATIONS_OK: &str = r#"{"locations":[
+  {"id":1,"name":"fsn1","description":"Falkenstein DC Park 1","country":"DE","city":"Falkenstein","network_zone":"eu-central"},
+  {"id":2,"name":"nbg1","description":"Nuremberg DC Park 1","country":"DE","city":"Nuremberg","network_zone":"eu-central"}
+]}"#;
+
+const UNAUTHORIZED: &str =
+    r#"{"error":{"code":"unauthorized","message":"unable to authenticate"}}"#;
+
+/// Two SKUs in nbg1: cx22 (recommended) and cx32; cx32 is also sold in fsn1.
+const SERVER_TYPES: &str = r#"{"server_types":[
+  {"id":104,"name":"cx22","architecture":"x86","cpu_type":"shared","cores":2,"memory":4.0,"disk":40,"deprecation":null,
+   "locations":[{"name":"nbg1","available":true,"recommended":true}],
+   "prices":[{"location":"nbg1","price_monthly":{"net":"3.7900","gross":"4.5101"},"price_hourly":{"net":"0.0060","gross":"0.0071"}}]},
+  {"id":105,"name":"cx32","architecture":"x86","cpu_type":"shared","cores":4,"memory":8.0,"disk":80,"deprecation":null,
+   "locations":[{"name":"nbg1","available":true,"recommended":false},{"name":"fsn1","available":true,"recommended":false}],
+   "prices":[{"location":"nbg1","price_monthly":{"net":"6.8000","gross":"8.0920"},"price_hourly":{"net":"0.0109","gross":"0.0130"}},
+             {"location":"fsn1","price_monthly":{"net":"6.8000","gross":"8.0920"},"price_hourly":{"net":"0.0109","gross":"0.0130"}}]}
+],"meta":{"pagination":{"next_page":null}}}"#;
+
+fn json_mock(server: &mut mockito::Server, path: &str, status: usize, body: &str) -> mockito::Mock {
+    server
+        .mock("GET", path)
+        .match_query(mockito::Matcher::Any)
+        .with_status(status)
+        .with_header("content-type", "application/json")
+        .with_body(body)
+        .create()
+}
+
+#[test]
+fn target_add_with_ping_verifies_token() {
+    let mut server = mockito::Server::new();
+    let _loc = json_mock(&mut server, "/v1/locations", 200, LOCATIONS_OK);
+    let sb = Sandbox::new().with_hcloud(server.url());
+    let key = sb.ssh_key();
+    sb.golden(
+        "target/add_ping_ok",
+        &[
+            "target",
+            "add",
+            "prod",
+            "--provider",
+            "hetzner-cloud",
+            "--token",
+            TOKEN_A,
+            "--ssh-key",
+            &key,
+            "--region",
+            "nbg1",
+            "--tier",
+            "solo",
+            "--no-interactive",
+        ],
+    );
+}
+
+#[test]
+fn target_add_with_rejected_token() {
+    let mut server = mockito::Server::new();
+    let _loc = json_mock(&mut server, "/v1/locations", 401, UNAUTHORIZED);
+    let sb = Sandbox::new().with_hcloud(server.url());
+    let key = sb.ssh_key();
+    sb.golden(
+        "target/add_ping_rejected",
+        &[
+            "target",
+            "add",
+            "prod",
+            "--provider",
+            "hetzner-cloud",
+            "--token",
+            TOKEN_A,
+            "--ssh-key",
+            &key,
+            "--region",
+            "nbg1",
+            "--no-interactive",
+        ],
+    );
+}
+
+#[test]
+fn target_add_with_validated_server_type() {
+    let mut server = mockito::Server::new();
+    let _loc = json_mock(&mut server, "/v1/locations", 200, LOCATIONS_OK);
+    let _st = json_mock(&mut server, "/v1/server_types", 200, SERVER_TYPES);
+    let sb = Sandbox::new().with_hcloud(server.url());
+    let key = sb.ssh_key();
+    sb.golden(
+        "target/add_server_type_ok",
+        &[
+            "target",
+            "add",
+            "prod",
+            "--provider",
+            "hetzner-cloud",
+            "--token",
+            TOKEN_A,
+            "--ssh-key",
+            &key,
+            "--region",
+            "nbg1",
+            "--server-type",
+            "cx32",
+            "--no-interactive",
+        ],
+    );
+}
+
+#[test]
+fn target_machine_validated_server_type() {
+    let mut server = mockito::Server::new();
+    let _st = json_mock(&mut server, "/v1/server_types", 200, SERVER_TYPES);
+    let sb = Sandbox::new().with_hcloud(server.url());
+    sb.add_target("prod");
+    sb.golden(
+        "target/machine_validated",
+        &["target", "machine", "--server-type", "cx22"],
+    );
+}
+
+#[test]
+fn target_machine_unknown_server_type() {
+    let mut server = mockito::Server::new();
+    let _st = json_mock(&mut server, "/v1/server_types", 200, SERVER_TYPES);
+    let sb = Sandbox::new().with_hcloud(server.url());
+    sb.add_target("prod");
+    sb.golden(
+        "target/machine_unknown_sku",
+        &["target", "machine", "--server-type", "cx99"],
+    );
+}
+
+#[test]
+fn whoami_with_ping() {
+    let mut server = mockito::Server::new();
+    let _loc = json_mock(&mut server, "/v1/locations", 200, LOCATIONS_OK);
+    let sb = Sandbox::new().with_hcloud(server.url());
+    sb.add_target("prod");
+    sb.golden("session/whoami_ping_ok", &["whoami"]);
+}
+
+#[test]
+fn whoami_with_rejected_token() {
+    let mut server = mockito::Server::new();
+    let _loc = json_mock(&mut server, "/v1/locations", 401, UNAUTHORIZED);
+    let sb = Sandbox::new().with_hcloud(server.url());
+    sb.add_target("prod");
+    sb.golden("session/whoami_ping_rejected", &["whoami"]);
+}
+
+#[test]
+fn whoami_no_ping() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.golden("session/whoami_no_ping", &["whoami", "--no-ping"]);
+}
+
+#[test]
+fn whoami_empty_store() {
+    Sandbox::new().golden("session/whoami_empty", &["whoami", "--no-ping"]);
+}

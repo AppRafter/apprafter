@@ -1,0 +1,14 @@
+$ apprafter whoami
+[exit 0]
+[stdout]
+Identity:     anonymous (self-hosted mode)
+Target:       prod (active)
+Provider:     hetzner-cloud (verification failed ✗ — token rejected (HTTP 401). Run `apprafter target add <name> --renew` to rotate.)
+Region:       nbg1
+Server type:  not set
+Default tier: solo
+Cluster name: not set
+SSH key:      ~/id_ed25519.pub (loaded)
+
+Run `apprafter target show` for the full target config; `apprafter target list` for all configured targets.
+[stderr]

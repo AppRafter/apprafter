@@ -1,0 +1,7 @@
+$ apprafter whoami --no-ping
+[exit 0]
+[stdout]
+Identity:     anonymous (self-hosted mode)
+
+No active target. Run `apprafter target add` to create one — `apprafter target list` to see what's configured.
+[stderr]

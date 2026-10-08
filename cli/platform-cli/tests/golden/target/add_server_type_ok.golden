@@ -1,0 +1,5 @@
+$ apprafter target add prod --provider hetzner-cloud --token aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --ssh-key <SANDBOX>/home/id_ed25519.pub --region nbg1 --server-type cx32 --no-interactive
+[exit 0]
+[stdout]
+target `prod` saved and set as active (first target on fresh store) (token verified against Hetzner Cloud)
+[stderr]
