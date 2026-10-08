@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! AppRafter Desktop (ADR 0067): the GUI twin of the apprafter CLI over `apprafter-core`.
 
+pub mod ops;
 pub mod window;
 
 /// Build and run the app; returns when the last window closes.
