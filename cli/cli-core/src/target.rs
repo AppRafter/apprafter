@@ -80,14 +80,17 @@ pub fn default_config_root() -> Result<PathBuf> {
     config_root_from_override(std::env::var(CONFIG_DIR_ENV).ok())
 }
 
-/// The target-store root for an explicit override value — the value of
-/// `APPRAFTER_CONFIG_DIR` as the caller read it. A non-empty value is used
-/// verbatim; `None` or an empty value falls back to
+/// The target-store root for an override the caller passes explicitly — the
+/// value of `APPRAFTER_CONFIG_DIR` as the caller read it. A non-empty value
+/// is used verbatim; `None` or an empty value falls back to
 /// `dirs::config_dir().join("apprafter")`.
 ///
-/// Pure, so a caller that reads its environment through something other
-/// than `std::env` (the shared core's `Context` builder, ADR 0067) resolves
-/// the root exactly as [`default_config_root`] does.
+/// It never reads `APPRAFTER_CONFIG_DIR` itself, so a caller that reads its
+/// environment through something other than `std::env` (the shared core's
+/// `Context` builder, ADR 0067) resolves the root exactly as
+/// [`default_config_root`] does. It is not pure, though: the fallback
+/// consults the platform config directory through `dirs` (HOME /
+/// `XDG_CONFIG_HOME` on Unix, the Known Folder API on Windows).
 pub fn config_root_from_override(custom: Option<String>) -> Result<PathBuf> {
     if let Some(custom) = custom {
         if !custom.is_empty() {

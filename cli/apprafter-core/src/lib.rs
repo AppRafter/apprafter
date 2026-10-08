@@ -2,8 +2,7 @@
 //! The AppRafter CLI domain, shared by the `apprafter` CLI and AppRafter
 //! Desktop (ADR 0067).
 //!
-//! Rules every module here follows — `tests/guards.rs` enforces the first
-//! three by scanning the source:
+//! Rules every module here follows:
 //!
 //! - it never writes to stdout or stderr: progress and captured tool output
 //!   go through a [`Reporter`];
@@ -15,6 +14,22 @@
 //!   confirm, then executes it;
 //! - cancellation is a [`CancellationToken`] per operation, never a process
 //!   signal handler.
+//!
+//! `tests/guards.rs` enforces the first three on the parsed source, not its
+//! text, so production code after a test module, a renamed import
+//! (`use std::env::var as v`) and a call inside a macro's arguments are all
+//! seen. It fails on a print macro (`print!` … `dbg!`, any delimiter),
+//! `std::process::{exit, abort}`, `std::io::{stdout, stderr, stdin}`, any
+//! `std::env` read or write, any `dirs::*` call, and any call to a
+//! lower-crate function that reads the environment or touches the terminal
+//! on the core's behalf (the credential resolvers, `default_config_root`,
+//! `default_age_key_path`, `logging::init`, `KubectlCli` / `HelmCli`). The
+//! one sanctioned exception is `cli_core::target::config_root_from_override`,
+//! and only inside [`Context::from_cli_env`]: its fallback reads the CLI's
+//! own platform config directory. For the last two rules it keeps the crates
+//! they would need out of the core's dependencies — no prompt, progress,
+//! table, colour or signal crate. And it holds env reads in the crates below
+//! the core, and in the CLI, to a count that only goes down.
 
 pub mod cancel;
 pub mod context;

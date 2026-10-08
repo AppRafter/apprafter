@@ -9,9 +9,10 @@ use std::collections::BTreeMap;
 
 /// A read-only view of environment variables.
 pub trait EnvSource {
-    /// The value of `key`, or `None` when unset. An empty value comes back
-    /// as `Some("")`; each consumer decides whether empty means unset,
-    /// exactly as the CLI did before the core existed.
+    /// The value of `key`, or `None` when unset. A value that is not valid
+    /// Unicode comes back as `None` too, like `std::env::var(..).ok()`. An
+    /// empty value comes back as `Some("")`; each consumer decides whether
+    /// empty means unset, exactly as the CLI did before the core existed.
     fn var(&self, key: &str) -> Option<String>;
 }
 
