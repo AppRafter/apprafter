@@ -19,6 +19,13 @@ name = "apprafter_desktop"
 name = "apprafter-desktop"
 path = "src/main.rs"
 
+# No libtest: on macOS muda builds a menu item on the main thread only, and libtest runs every
+# test on a thread of its own. The target's `main` runs its checks on the main thread itself.
+[[test]]
+name    = "app_menu"
+path    = "tests/app_menu.rs"
+harness = false
+
 [features]
 # Walks and CI only: the scripted FakeAuthenticator in place of the OS (and, from later tasks,
 # the loopback provider override and a TEST BUILD banner). Never in a release; D.13 asserts it.
@@ -65,7 +72,7 @@ libc        = "0.2"
 signal-hook = "0.3"
 
 [dev-dependencies]
-# The mock runtime for tests/ipc_mock.rs.
+# The mock runtime for tests/ipc_mock.rs and tests/app_menu.rs.
 tauri       = { workspace = true, features = ["test"] }
 # tests/ipc_mock.rs reads capabilities/main.json5 as Tauri does: the version tauri-utils parses
 # it with (`config-json5`), already in the lock.

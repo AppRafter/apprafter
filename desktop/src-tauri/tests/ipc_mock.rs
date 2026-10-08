@@ -6,6 +6,11 @@
 //! The app manifest makes Tauri check the ACL for app commands: a command missing from the
 //! capability is refused before the gate, and one missing from `generate_handler!` answers
 //! `Command <name> not found` — the first test catches both.
+//!
+//! The macOS app menu's check is in tests/app_menu.rs, a target of its own: muda builds a
+//! menu item on the main thread only, and libtest runs every test on a thread of its own.
+
+mod common;
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -13,115 +18,11 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use std::sync::Arc;
 
-use apprafter_core::{CancellationToken, Context, Outcome, PlanClass};
-use apprafter_desktop::app::{self, Shell, ShellCell};
-use apprafter_desktop::auth::{AuthPurpose, Authenticator};
-use apprafter_desktop::menu;
-use apprafter_desktop::ops::{Executor, PlanParts, SystemClock};
-use apprafter_desktop::settings::SettingsStore;
-use apprafter_desktop_ipc::{
-    errors, AuthInfo, AuthMethod, AuthOutcome, Settings, Theme, ALLOWED_WHILE_LOCKED, COMMANDS,
-};
+use apprafter_core::{Outcome, PlanClass};
+use apprafter_desktop::ops::{Executor, PlanParts};
+use apprafter_desktop_ipc::{errors, Settings, Theme, ALLOWED_WHILE_LOCKED, COMMANDS};
+use common::{code, invoke, lock_off, rig};
 use serde_json::{json, Value};
-use tauri::ipc::{CallbackFn, InvokeBody};
-use tauri::menu::{MenuEvent, MenuId, MenuItemKind};
-use tauri::test::{get_ipc_response, mock_builder, MockRuntime, INVOKE_KEY};
-use tauri::webview::InvokeRequest;
-use tauri::{WebviewUrl, WebviewWindow, WebviewWindowBuilder};
-
-/// An OS that verifies the owner every time it is asked, and counts the asks.
-#[derive(Default)]
-struct Verifies(AtomicUsize);
-
-impl Authenticator for Verifies {
-    fn info(&self) -> AuthInfo {
-        AuthInfo {
-            available: true,
-            method: Some(AuthMethod::Fake),
-            unavailable: None,
-            biometrics_choice: false,
-            password_field: false,
-        }
-    }
-
-    fn verify(&self, _purpose: &AuthPurpose, _cancel: &CancellationToken) -> AuthOutcome {
-        self.0.fetch_add(1, SeqCst);
-        AuthOutcome::Verified
-    }
-}
-
-struct Rig {
-    _dir: tempfile::TempDir,
-    auth: Arc<Verifies>,
-    shell: Arc<Shell>,
-    _app: tauri::App<MockRuntime>,
-    window: WebviewWindow<MockRuntime>,
-}
-
-/// The app with `settings` saved, an OS that verifies, and the main window open.
-fn rig(settings: Settings) -> Rig {
-    let dir = tempfile::tempdir().unwrap();
-    let store = SettingsStore::load(dir.path(), &SystemClock);
-    store.set(settings).unwrap();
-    let auth = Arc::new(Verifies::default());
-    let shell = Shell::new(
-        store,
-        auth.clone(),
-        Arc::new(SystemClock),
-        Context::for_desktop(dir.path().join("store"), "http://127.0.0.1:9"),
-        false,
-        |_| {},
-    );
-    let cell = ShellCell::default();
-    let app = app::builder(mock_builder(), cell.clone())
-        .build(tauri::generate_context!())
-        .unwrap();
-    app::install(&app, &cell, shell.clone()).unwrap();
-    let window = WebviewWindowBuilder::new(&app, "main", WebviewUrl::default())
-        .build()
-        .unwrap();
-    Rig {
-        _dir: dir,
-        auth,
-        shell,
-        _app: app,
-        window,
-    }
-}
-
-fn lock_off() -> Settings {
-    Settings {
-        lock_enabled: false,
-        ..Settings::default()
-    }
-}
-
-/// What the webview gets back: `Ok` with the value, or `Err` with what was rejected.
-fn invoke(rig: &Rig, cmd: &str, args: Value) -> Result<Value, Value> {
-    let url = if cfg!(windows) {
-        "http://tauri.localhost"
-    } else {
-        "tauri://localhost"
-    };
-    get_ipc_response(
-        &rig.window,
-        InvokeRequest {
-            cmd: cmd.into(),
-            callback: CallbackFn(0),
-            error: CallbackFn(1),
-            url: url.parse().unwrap(),
-            body: InvokeBody::Json(args),
-            headers: Default::default(),
-            invoke_key: INVOKE_KEY.to_string(),
-        },
-    )
-    .map(|body| body.deserialize::<Value>().unwrap())
-}
-
-/// The `UiError.code` of a rejection, if it is one.
-fn code(reply: &Result<Value, Value>) -> Option<&str> {
-    reply.as_ref().err()?.get("code")?.as_str()
-}
 
 /// The command ran, past the ACL and into its own handler: it answered, or rejected with a
 /// `UiError`, or could not parse the (empty) arguments it was given. Never Tauri's
@@ -247,57 +148,6 @@ fn the_capability_grants_listen_unlisten_and_every_app_command_only() {
     assert_eq!(set, expected);
     assert_eq!(capability["windows"], json!(["main"]));
     assert_eq!(capability.get("remote"), None, "no remote origin");
-}
-
-/// The macOS app menu, built here on any OS (the app sets it on macOS only): one Quit, the
-/// app's own item rather than the system's `terminate:`, and choosing it runs the quit
-/// sequence — afterwards nothing starts.
-#[test]
-fn the_app_menus_quit_is_the_apps_own_and_runs_the_quit_sequence() {
-    let rig = rig(lock_off());
-    let handle = rig._app.handle();
-    let bar = menu::app_menu(handle).unwrap();
-    let mut items = Vec::new();
-    for top in bar.items().unwrap() {
-        let submenu = top.as_submenu().expect("a menu bar of submenus");
-        items.extend(submenu.items().unwrap());
-    }
-    let quits: Vec<String> = items
-        .iter()
-        .filter_map(|item| {
-            let text = match item {
-                MenuItemKind::MenuItem(item) => item.text(),
-                MenuItemKind::Predefined(item) => item.text(),
-                _ => return None,
-            };
-            Some(text.unwrap()).filter(|text| text.contains("Quit"))
-        })
-        .collect();
-    assert_eq!(quits, ["Quit AppRafter"], "one Quit, and no predefined one");
-    let quit = items
-        .iter()
-        .find(|item| item.id() == menu::QUIT_ITEM)
-        .expect("the Quit item");
-    assert!(quit.as_menuitem().is_some(), "the app's own item");
-
-    // As in the first test, the quit thread's final exit panics in the mock runtime, on its
-    // own thread, after everything checked here.
-    menu::on_menu_event(
-        handle,
-        &MenuEvent {
-            id: MenuId::new(menu::QUIT_ITEM),
-        },
-    );
-    let plan = rig.shell.ops.register_plan(
-        PlanParts::new(PlanClass::Bounded, "Upgrade", "upgrade"),
-        Box::new(|_, _| Ok(Outcome::Completed { result: json!(0) })),
-    );
-    let reply = invoke(
-        &rig,
-        "op_execute",
-        json!({ "opId": plan.op_id, "onEvent": "__CHANNEL__:7" }),
-    );
-    assert_eq!(code(&reply), Some(errors::CLOSING), "{reply:?}");
 }
 
 #[test]
