@@ -20,8 +20,10 @@ pub mod cancel;
 pub mod context;
 pub mod env;
 pub mod error;
+pub mod target_ref;
 
 pub use cancel::Cancelled;
 pub use context::{CliOverrides, Context, SecretString};
 pub use env::{EnvSource, MapEnv};
 pub use error::{CoreError, CoreResult, UiError};
+pub use target_ref::{ActivePointerChange, TargetRef};
