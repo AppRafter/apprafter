@@ -44,6 +44,7 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use crate::commands::backup::KubectlExec;
+use crate::commands::helper_interrupt::Noted as _;
 use backup_core::helper_pod::{
     explain_keep_alive_end, pg_helper_pod_spec, volume_pod_spec, SecretKey,
 };
@@ -2686,7 +2687,8 @@ fn wait_pg_reachable(pod: &str, ns: &str, conn: &PgConnection, kubeconfig: &Path
         let out = std::process::Command::new("kubectl")
             .args(psql_probe_args(pod, ns, conn))
             .env("KUBECONFIG", kubeconfig)
-            .output();
+            .output()
+            .noted();
         match out {
             Ok(o) if o.status.success() => Ok(()),
             Ok(o) => Err(format!(

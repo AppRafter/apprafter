@@ -82,11 +82,35 @@
 //!
 //! # On Windows
 //!
-//! There are no signals: a console control handler takes Ctrl-C, Ctrl-Break
-//! and the console window closing, and does the same as SIGINT above — the
-//! first runs the stop and exits with 130, a second during the stop removes
-//! the stop's kubeconfig copies and exits at once. Closing the window gives
-//! the stop only the few seconds Windows allows before it ends the process.
+//! There are no signals. A console control handler takes Ctrl-C, Ctrl-Break
+//! and the console window closing, and does what SIGINT does above, exiting
+//! with 130: the first event marks the process interrupted, wakes the same
+//! `interrupt` thread the Unix path runs the stop on, and returns; a second
+//! one, while the stop is still working, removes the stop's kubeconfig
+//! copies and ends the process from the handler, at once and with nothing
+//! else run (`TerminateProcess`, the counterpart of `_exit`). Windows ends a
+//! process about five seconds after its console window closes, so that
+//! event gives the stop four seconds, not [`STOP_BOUND`], and its handler
+//! does not return — returning would let Windows end the process straight
+//! away — but waits for the stop to end it.
+//!
+//! Windows has no SIGTERM: `taskkill /F` and Task Manager's End process end
+//! the CLI at once, as SIGKILL does, and none of this runs. Logoff and
+//! shutdown are left to the default handling: Windows sends those events to
+//! services only, and ends an interactive console program without them.
+//!
+//! The guarantee about the command's own thread is weaker than on Unix,
+//! where the handler sets the flag before any thread can see a child die.
+//! The console delivers Ctrl-C to every process attached to it, each on a
+//! thread of its own, in no defined order: the `kubectl` the command waits
+//! on can die of it, and the command's thread see that, before this
+//! process's handler has run. So a kubectl child that exits with
+//! `STATUS_CONTROL_C_EXIT` marks the process interrupted before its result
+//! is returned ([`note_child_exit`]), and the next step refuses as it would
+//! after the event; should no event follow, the command's thread starts the
+//! stop itself once it has unwound ([`StopGuard`]). Restic children are not
+//! checked this way yet: they run through `backup_core`, which moves with
+//! the backup commands (WI-439).
 //!
 //! The in-cluster runner has its own, different stop (`apprafter-backup`'s
 //! `stop` module): it is PID 1 of a Job's pod, is stopped by SIGTERM at its
@@ -97,10 +121,14 @@ use std::io::Write as _;
 use std::path::Path;
 #[cfg(windows)]
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Output, Stdio};
 #[cfg(unix)]
 use std::sync::atomic::AtomicPtr;
+#[cfg(windows)]
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(windows)]
+use std::sync::{mpsc, OnceLock};
 use std::sync::{Arc, LazyLock, Mutex, Once};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -109,6 +137,18 @@ use cli_core::{CliError, Result};
 
 /// The most the whole stop may take, from the signal to the exit.
 pub const STOP_BOUND: Duration = Duration::from_secs(15);
+
+/// Windows: the most the stop may take when the console window closes.
+/// Windows ends the process about five seconds after that event arrives,
+/// whatever its handler is doing.
+#[cfg(windows)]
+const CLOSE_STOP_BOUND: Duration = Duration::from_secs(4);
+
+/// Windows: how long the command's own thread, unwound after a kubectl died
+/// of a console Ctrl-C, waits for the console's event to start the stop
+/// before it starts the stop itself ([`StopGuard`]).
+#[cfg(windows)]
+const EVENT_GRACE: Duration = Duration::from_secs(1);
 
 /// The most the stop waits for a helper create or apply under way to be
 /// answered before it acts on the pods. kubectl answers in well under a
@@ -127,7 +167,9 @@ const DELETE_GRACE_SECONDS: u32 = 1;
 
 /// Set by the signal handler itself — an atomic store, the one thing a handler
 /// may safely do — the moment SIGINT or SIGTERM arrives, before any thread
-/// can see a `kubectl` child that died of the same Ctrl-C.
+/// can see a `kubectl` child that died of the same Ctrl-C. On Windows, set by
+/// the console handler on the first event, and by [`note_child_exit`] (see
+/// the module docs).
 static INTERRUPTED: LazyLock<Arc<AtomicBool>> = LazyLock::new(|| Arc::new(AtomicBool::new(false)));
 
 /// Set by [`StopGuard`] when the command's own thread has unwound and parked.
@@ -155,6 +197,53 @@ pub(crate) fn refuse_if_interrupted() -> Result<()> {
         return Err(interrupted_error());
     }
     Ok(())
+}
+
+/// `STATUS_CONTROL_C_EXIT`: the exit code of a Windows console program that
+/// a Ctrl-C or Ctrl-Break ended, as `ExitStatus::code` reports it.
+const STATUS_CONTROL_C_EXIT: i32 = 0xC000_013A_u32 as i32;
+
+/// Whether a child that exited with `code` was ended by a console Ctrl-C or
+/// Ctrl-Break (Windows). Pure, and the same on every platform: a Unix exit
+/// code is never this value.
+pub(crate) fn exited_by_console_interrupt(code: Option<i32>) -> bool {
+    code == Some(STATUS_CONTROL_C_EXIT)
+}
+
+/// Read how a `kubectl` child the command waited on ended, before its result
+/// is returned: on Windows, with the console handler installed, one that a
+/// console Ctrl-C ended marks the process interrupted, so the command's next
+/// step refuses even when this process's own event has not arrived yet (see
+/// the module docs). Nothing on Unix, where the signal handler sets the flag
+/// first.
+pub(crate) fn note_child_exit(status: &ExitStatus) {
+    if exited_by_console_interrupt(status.code()) && console_handler_installed() {
+        INTERRUPTED.store(true, Ordering::SeqCst);
+    }
+}
+
+/// A finished `kubectl` child's result, read by [`note_child_exit`] on its
+/// way to the caller: `.output().noted()`, `.wait().noted()`.
+pub(crate) trait Noted {
+    fn noted(self) -> Self;
+}
+
+impl Noted for std::io::Result<Output> {
+    fn noted(self) -> Self {
+        if let Ok(output) = &self {
+            note_child_exit(&output.status);
+        }
+        self
+    }
+}
+
+impl Noted for std::io::Result<ExitStatus> {
+    fn noted(self) -> Self {
+        if let Ok(status) = &self {
+            note_child_exit(status);
+        }
+        self
+    }
 }
 
 /// The flag is process-wide, and the tests of one binary share a process: a
@@ -553,6 +642,12 @@ pub(crate) fn clean_one(
 /// (its temporary files) has been dropped. Once the process has been
 /// interrupted, its drop marks the command unwound and parks the thread: the
 /// stop, on its own thread, finishes and exits the process.
+///
+/// On Windows the flag can be set with no console event behind it yet — by a
+/// kubectl that a console Ctrl-C ended ([`note_child_exit`]). The event is
+/// usually on its way and starts the stop under its own name; if none has
+/// within [`EVENT_GRACE`], the drop starts the stop as for Ctrl-C, so the
+/// thread never parks with nothing to end the process.
 #[must_use = "the command is interruptible only while this is held"]
 pub(crate) struct StopGuard(());
 
@@ -560,6 +655,14 @@ impl Drop for StopGuard {
     fn drop(&mut self) {
         if interrupted() {
             UNWOUND.store(true, Ordering::SeqCst);
+            #[cfg(windows)]
+            {
+                let until = Instant::now() + EVENT_GRACE;
+                while !STOP_REQUESTED.load(Ordering::SeqCst) && Instant::now() < until {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                request_stop(ConsoleEvent::CtrlC.cause());
+            }
             loop {
                 thread::park();
             }
@@ -607,8 +710,12 @@ fn ignored_at_start(signal: i32) -> bool {
     }
 }
 
-/// Windows has no "ignored at start" disposition for console control
-/// events that this command could inherit and must preserve.
+/// Windows: never — which is not to say a Windows process cannot start with
+/// Ctrl-C ignored. It can, through `SetConsoleCtrlHandler(NULL, TRUE)` in a
+/// parent or `CREATE_NEW_PROCESS_GROUP`, and it inherits that; but the
+/// console then delivers no Ctrl-C to any handler of the process, the one
+/// installed here included, so the ignore holds without this command
+/// preserving it.
 #[cfg(windows)]
 fn ignored_at_start(_signal: i32) -> bool {
     false
@@ -645,42 +752,143 @@ fn register(signals: &[i32]) -> std::io::Result<()> {
         .name("interrupt".into())
         .spawn(move || {
             if let Some(signal) = iterator.forever().next() {
-                stop(signal);
+                stop(StopCause::signal(signal));
             }
         })?;
     Ok(())
 }
 
+/// Windows: the console events this command takes, each stopping it as
+/// SIGINT does on Unix (exit code 130).
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConsoleEvent {
+    CtrlC,
+    CtrlBreak,
+    /// The console window closing (its close button, or Task Manager's End
+    /// task on it).
+    Close,
+}
+
+#[cfg(windows)]
+impl ConsoleEvent {
+    /// The event `ctrl_type` names, or `None` for one left to the default
+    /// handling (logoff and shutdown, which reach services only).
+    fn of(ctrl_type: u32) -> Option<ConsoleEvent> {
+        use windows_sys::Win32::System::Console::{
+            CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT,
+        };
+        match ctrl_type {
+            CTRL_C_EVENT => Some(ConsoleEvent::CtrlC),
+            CTRL_BREAK_EVENT => Some(ConsoleEvent::CtrlBreak),
+            CTRL_CLOSE_EVENT => Some(ConsoleEvent::Close),
+            _ => None,
+        }
+    }
+
+    /// The stop this event starts.
+    fn cause(self) -> StopCause {
+        let (label, bound) = match self {
+            ConsoleEvent::CtrlC => ("Ctrl-C", STOP_BOUND),
+            ConsoleEvent::CtrlBreak => ("Ctrl-Break", STOP_BOUND),
+            ConsoleEvent::Close => ("The console window closed", CLOSE_STOP_BOUND),
+        };
+        StopCause {
+            label,
+            code: CONSOLE_EXIT_CODE,
+            bound,
+        }
+    }
+}
+
+/// Windows: what every console event exits with, the code SIGINT gives on
+/// Unix.
+#[cfg(windows)]
+const CONSOLE_EXIT_CODE: i32 = 130;
+
+/// Windows: how many console events have arrived. The first starts the
+/// stop, any later one ends the process; counted here rather than read off
+/// [`INTERRUPTED`], which [`note_child_exit`] may set before any event.
+#[cfg(windows)]
+static CTRL_EVENTS: AtomicU32 = AtomicU32::new(0);
+
+/// Windows: whether the stop has been asked for ([`request_stop`]).
+#[cfg(windows)]
+static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Windows: the `interrupt` thread's wake-up, set once by [`register`].
+#[cfg(windows)]
+static STOP_REQUEST: OnceLock<mpsc::SyncSender<StopCause>> = OnceLock::new();
+
+/// Windows: start the stop on the `interrupt` thread, once; a later request
+/// does nothing.
+#[cfg(windows)]
+fn request_stop(cause: StopCause) {
+    if !STOP_REQUESTED.swap(true, Ordering::SeqCst) {
+        if let Some(wake) = STOP_REQUEST.get() {
+            let _ = wake.try_send(cause);
+        }
+    }
+}
+
+/// Whether this process has a console handler installed (Windows; see
+/// [`note_child_exit`]).
+#[cfg(windows)]
+fn console_handler_installed() -> bool {
+    STOP_REQUEST.get().is_some()
+}
+
+/// Unix has no console handler: the signal handler sets the flag itself.
+#[cfg(unix)]
+fn console_handler_installed() -> bool {
+    false
+}
+
 /// Windows: one console control handler for Ctrl-C, Ctrl-Break and the
-/// console window closing, in place of the SIGINT/SIGTERM handlers above;
-/// `signals` names no Windows event, so it is not read.
+/// console window closing, in place of the SIGINT/SIGTERM handlers above,
+/// and the `interrupt` thread the stop runs on, as on Unix. `signals` names
+/// no Windows event, so it is not read.
 #[cfg(windows)]
 fn register(_signals: &[i32]) -> std::io::Result<()> {
     use windows_sys::core::BOOL;
     use windows_sys::Win32::Foundation::{FALSE, TRUE};
-    use windows_sys::Win32::System::Console::{
-        SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT,
-    };
+    use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
 
-    /// Each console event runs on a new thread the system creates, so —
-    /// unlike a Unix signal handler — this may block and allocate. The
-    /// first event runs the stop (which ends the process); a second one,
-    /// while the stop is still working, removes the stop's kubeconfig
-    /// copies and ends the process at once, as a second signal does on
-    /// Unix.
+    /// Runs on a thread the system creates for each event, so — unlike a
+    /// Unix signal handler — it may block and allocate; but it does no more
+    /// than the Unix handler does. The first event marks the process
+    /// interrupted, wakes the `interrupt` thread and returns at once. A
+    /// second one, while the stop is still working, removes the stop's
+    /// kubeconfig copies and ends the process from here.
     unsafe extern "system" fn handler(ctrl_type: u32) -> BOOL {
-        match ctrl_type {
-            CTRL_C_EVENT | CTRL_BREAK_EVENT | CTRL_CLOSE_EVENT => {
-                if INTERRUPTED.swap(true, Ordering::SeqCst) {
-                    unlink_all(&COPY_PATHS);
-                    std::process::exit(128 + signal_hook::consts::SIGINT);
-                }
-                stop(signal_hook::consts::SIGINT)
-            }
-            _ => FALSE,
+        let Some(event) = ConsoleEvent::of(ctrl_type) else {
+            return FALSE;
+        };
+        if CTRL_EVENTS.fetch_add(1, Ordering::SeqCst) > 0 {
+            unlink_all(&COPY_PATHS);
+            exit_at_once(CONSOLE_EXIT_CODE);
         }
+        INTERRUPTED.store(true, Ordering::SeqCst);
+        request_stop(event.cause());
+        if event == ConsoleEvent::Close {
+            // Returning would let Windows end the process now: wait for the
+            // stop to end it, within its four seconds.
+            loop {
+                thread::park();
+            }
+        }
+        TRUE
     }
 
+    let (wake, woken) = mpsc::sync_channel::<StopCause>(1);
+    thread::Builder::new()
+        .name("interrupt".into())
+        .spawn(move || {
+            if let Ok(cause) = woken.recv() {
+                stop(cause);
+            }
+        })?;
+    let _ = STOP_REQUEST.set(wake);
     // SAFETY: registers a plain `extern "system"` function for the life of
     // the process; it is never removed.
     if unsafe { SetConsoleCtrlHandler(Some(handler), TRUE) } == 0 {
@@ -689,29 +897,70 @@ fn register(_signals: &[i32]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// The stop: see the module docs. Ends the process.
-fn stop(signal: i32) -> ! {
+/// Windows: end the process at once, running nothing else — no `atexit`
+/// handler, no DLL detach — as `_exit` does from the Unix signal handler.
+#[cfg(windows)]
+fn exit_at_once(code: i32) -> ! {
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+    // SAFETY: GetCurrentProcess returns a pseudo-handle that needs no
+    // closing; TerminateProcess on it does not return when it succeeds.
+    unsafe {
+        TerminateProcess(GetCurrentProcess(), code as u32);
+    }
+    std::process::exit(code)
+}
+
+/// What started the stop: the name it gives it, the code the process exits
+/// with, and the most the stop may take.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StopCause {
+    label: &'static str,
+    code: i32,
+    bound: Duration,
+}
+
+impl StopCause {
+    /// A Unix signal: 128 + its number, within [`STOP_BOUND`].
+    #[cfg(unix)]
+    fn signal(signal: i32) -> StopCause {
+        let label = match signal {
+            signal_hook::consts::SIGINT => "Ctrl-C (SIGINT)",
+            signal_hook::consts::SIGTERM => "SIGTERM",
+            _ => "a signal",
+        };
+        StopCause {
+            label,
+            code: 128 + signal,
+            bound: STOP_BOUND,
+        }
+    }
+
+    /// The first line the stop prints.
+    fn announcement(&self) -> String {
+        format!(
+            "\n{}: deleting the helper pods this command created, then exiting \
+             (at most {}s; interrupt again to exit at once).",
+            self.label,
+            self.bound.as_secs()
+        )
+    }
+}
+
+/// The stop: see the module docs. Ends the process, with `cause.code`,
+/// within `cause.bound`.
+fn stop(cause: StopCause) -> ! {
     let started = Instant::now();
-    let deadline = started + STOP_BOUND;
+    let deadline = started + cause.bound;
     let helpers = HelperPods::global();
     let say = |line: &str| {
         // A write to a closed terminal must not panic the stop.
         let _ = writeln!(std::io::stderr(), "{line}");
     };
-    let signal_name = match signal {
-        signal_hook::consts::SIGINT => "Ctrl-C (SIGINT)",
-        signal_hook::consts::SIGTERM => "SIGTERM",
-        _ => "a signal",
-    };
-    say(&format!(
-        "\n{signal_name}: deleting the helper pods this command created, then exiting \
-         (at most {}s; interrupt again to exit at once).",
-        STOP_BOUND.as_secs()
-    ));
+    say(&cause.announcement());
 
     // 1. No apply after this; the ones under way are waited out.
     helpers.close();
-    let settle = started + APPLY_SETTLE_BOUND;
+    let settle = (started + APPLY_SETTLE_BOUND).min(deadline);
     while helpers.applies_in_flight() > 0 && Instant::now() < settle {
         thread::sleep(Duration::from_millis(20));
     }
@@ -765,7 +1014,7 @@ fn stop(signal: i32) -> ! {
     while !UNWOUND.load(Ordering::SeqCst) && Instant::now() < unwind {
         thread::sleep(Duration::from_millis(20));
     }
-    std::process::exit(128 + signal)
+    std::process::exit(cause.code)
 }
 
 /// The stop's copies of the kubeconfig, as C paths, for a second signal to
@@ -806,11 +1055,43 @@ fn unlink_all(slots: &[AtomicPtr<libc::c_char>]) {
 }
 
 /// Windows: remove every path in `slots` (a second Ctrl-C, see `register`).
+/// A kubectl reading a copy may hold it open without sharing its deletion,
+/// so each removal is retried a moment ([`remove_retrying`]).
 #[cfg(windows)]
 fn unlink_all(slots: &[Mutex<Option<PathBuf>>]) {
     for slot in slots {
         if let Some(path) = slot.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
-            let _ = std::fs::remove_file(path);
+            remove_retrying(path, &mut |path| std::fs::remove_file(path));
+        }
+    }
+}
+
+/// `ERROR_SHARING_VIOLATION`: Windows refused to remove a file another
+/// process has open without `FILE_SHARE_DELETE`.
+#[cfg(any(windows, test))]
+const ERROR_SHARING_VIOLATION: i32 = 32;
+
+/// How many times, and how far apart, a removal refused by a sharing
+/// violation is tried: at most 200 ms per path.
+#[cfg(any(windows, test))]
+const SHARING_RETRIES: usize = 10;
+#[cfg(any(windows, test))]
+const SHARING_PAUSE: Duration = Duration::from_millis(20);
+
+/// Remove `path` with `remove`, trying again while it fails with a sharing
+/// violation, up to [`SHARING_RETRIES`] tries in all; any other outcome ends
+/// it. Best-effort: the result is not returned, the exit follows anyway.
+#[cfg(any(windows, test))]
+fn remove_retrying(path: &Path, remove: &mut dyn FnMut(&Path) -> std::io::Result<()>) {
+    for attempt in 1..=SHARING_RETRIES {
+        match remove(path) {
+            Err(e)
+                if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION)
+                    && attempt < SHARING_RETRIES =>
+            {
+                thread::sleep(SHARING_PAUSE);
+            }
+            _ => return,
         }
     }
 }
@@ -1330,6 +1611,95 @@ mod tests {
         assert!(c.exists(), "only what was recorded");
     }
 
+    /// Windows: a sharing violation — a kubectl holding the copy open — is
+    /// waited out a moment; anything else, success included, ends the tries.
+    #[test]
+    fn a_removal_is_retried_through_a_sharing_violation_only() {
+        let sharing = || std::io::Error::from_raw_os_error(ERROR_SHARING_VIOLATION);
+        let path = Path::new("copy");
+
+        let mut calls = 0;
+        remove_retrying(path, &mut |_| {
+            calls += 1;
+            if calls < 3 {
+                Err(sharing())
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(calls, 3, "tried until it went through");
+
+        let mut calls = 0;
+        remove_retrying(path, &mut |_| {
+            calls += 1;
+            Err(sharing())
+        });
+        assert_eq!(calls, SHARING_RETRIES, "and no more than the bound");
+
+        let mut calls = 0;
+        remove_retrying(path, &mut |_| {
+            calls += 1;
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        });
+        assert_eq!(calls, 1, "any other error is final");
+    }
+
+    /// Only `STATUS_CONTROL_C_EXIT` reads as a console interrupt; no Unix
+    /// exit code, and no ordinary failure, does.
+    #[test]
+    fn only_status_control_c_exit_is_a_console_interrupt() {
+        assert!(exited_by_console_interrupt(Some(0xC000_013A_u32 as i32)));
+        for code in [None, Some(0), Some(1), Some(130), Some(143), Some(-1)] {
+            assert!(!exited_by_console_interrupt(code), "{code:?}");
+        }
+    }
+
+    /// Unix keeps the stop's exact first line, code and bound.
+    #[cfg(unix)]
+    #[test]
+    fn the_stop_names_a_unix_signal_as_it_always_has() {
+        let int = StopCause::signal(libc::SIGINT);
+        assert_eq!(
+            int.announcement(),
+            "\nCtrl-C (SIGINT): deleting the helper pods this command created, then exiting \
+             (at most 15s; interrupt again to exit at once)."
+        );
+        assert_eq!((int.code, int.bound), (130, STOP_BOUND));
+        let term = StopCause::signal(libc::SIGTERM);
+        assert_eq!((term.label, term.code), ("SIGTERM", 143));
+        assert_eq!(StopCause::signal(libc::SIGHUP).label, "a signal");
+    }
+
+    /// Windows: each event the handler takes stops as SIGINT does, the
+    /// window closing within the four seconds Windows leaves it; logoff and
+    /// shutdown are left to the default handling.
+    #[cfg(windows)]
+    #[test]
+    fn each_console_event_names_its_stop() {
+        use windows_sys::Win32::System::Console::{
+            CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT, CTRL_LOGOFF_EVENT,
+            CTRL_SHUTDOWN_EVENT,
+        };
+        let cause = |ctrl| ConsoleEvent::of(ctrl).map(ConsoleEvent::cause);
+        let c = cause(CTRL_C_EVENT).unwrap();
+        assert_eq!((c.label, c.code, c.bound), ("Ctrl-C", 130, STOP_BOUND));
+        let brk = cause(CTRL_BREAK_EVENT).unwrap();
+        assert_eq!(
+            (brk.label, brk.code, brk.bound),
+            ("Ctrl-Break", 130, STOP_BOUND)
+        );
+        let close = cause(CTRL_CLOSE_EVENT).unwrap();
+        assert_eq!(close.code, 130);
+        assert_eq!(close.bound, Duration::from_secs(4));
+        assert!(
+            close.announcement().contains("(at most 4s;"),
+            "{}",
+            close.announcement()
+        );
+        assert_eq!(cause(CTRL_LOGOFF_EVENT), None);
+        assert_eq!(cause(CTRL_SHUTDOWN_EVENT), None);
+    }
+
     /// Each copy the stop writes is recorded before the kubeconfig goes in,
     /// for as long as it exists, and no longer.
     #[test]
@@ -1480,5 +1850,224 @@ mod tests {
         loop {
             thread::park();
         }
+    }
+
+    /// Windows: run this test binary's ignored test `name` as a child in a
+    /// process group of its own — so a Ctrl-Break sent to it reaches no other
+    /// process — with `TMP`/`TEMP` at `tmp` and `env` set, its stderr piped.
+    #[cfg(windows)]
+    fn console_child(name: &str, tmp: &Path, env: &[(&str, &Path)]) -> std::process::Child {
+        use std::os::windows::process::CommandExt as _;
+        use windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                &format!("commands::helper_interrupt::tests::{name}"),
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("TMP", tmp)
+            .env("TEMP", tmp)
+            .creation_flags(CREATE_NEW_PROCESS_GROUP)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        command.spawn().unwrap()
+    }
+
+    /// Windows: the child's stderr, line by line as it comes, and all of it
+    /// once the child has exited.
+    #[cfg(windows)]
+    fn stderr_lines(
+        child: &mut std::process::Child,
+    ) -> (mpsc::Receiver<String>, thread::JoinHandle<String>) {
+        use std::io::BufRead as _;
+        let (lines, received) = mpsc::channel();
+        let stderr = child.stderr.take().unwrap();
+        let all = thread::spawn(move || {
+            let mut all = String::new();
+            for line in std::io::BufReader::new(stderr).lines() {
+                let Ok(line) = line else { break };
+                all.push_str(&line);
+                all.push('\n');
+                let _ = lines.send(line);
+            }
+            all
+        });
+        (received, all)
+    }
+
+    /// Windows: wait for `child` to exit, at most `bound`; killed past it.
+    #[cfg(windows)]
+    fn exit_within(child: &mut std::process::Child, bound: Duration) -> Option<ExitStatus> {
+        let until = Instant::now() + bound;
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                return Some(status);
+            }
+            if Instant::now() > until {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Windows twin of `a_second_signal_exits_at_once_and_leaves_no_kubeconfig_copy`,
+    /// in a process of its own: the stop is under way — waiting out a helper
+    /// apply that was never answered — with a kubeconfig copy recorded, when
+    /// a second Ctrl-Break comes. The process exits at once with 130 and
+    /// leaves no copy behind.
+    ///
+    /// No kubectl stand-in: on Windows `Command` starts only an `.exe`, so a
+    /// script cannot stand in for one, and the copy is recorded by the child
+    /// itself, as the stop records its own ([`private_copy`]). Without the
+    /// second event the stop would run on for seconds and leave the copy.
+    #[cfg(windows)]
+    #[test]
+    fn a_second_console_event_exits_at_once_and_leaves_no_kubeconfig_copy() {
+        use windows_sys::Win32::System::Console::{GenerateConsoleCtrlEvent, CTRL_BREAK_EVENT};
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let kc = dir.path().join("kubeconfig");
+        std::fs::write(&kc, "apiVersion: v1\nkind: Config\n").unwrap();
+        let mut child = console_child(
+            "second_console_event_child",
+            tmp.path(),
+            &[("APPRAFTER_INTERRUPT_CHILD_KUBECONFIG", &kc)],
+        );
+        let (lines, all) = stderr_lines(&mut child);
+        let copies = || -> Vec<String> {
+            std::fs::read_dir(tmp.path())
+                .unwrap()
+                .filter_map(|e| e.ok()?.file_name().into_string().ok())
+                .filter(|n| n.starts_with("apprafter-interrupt-"))
+                .collect()
+        };
+        let ctrl_break = |child: &std::process::Child| {
+            // SAFETY: a console event to the child's own process group.
+            let sent = unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, child.id()) };
+            assert_ne!(
+                sent,
+                0,
+                "GenerateConsoleCtrlEvent: {}",
+                std::io::Error::last_os_error()
+            );
+        };
+
+        let ready = dir.path().join("ready");
+        let until = Instant::now() + Duration::from_secs(30);
+        while !ready.exists() {
+            assert!(Instant::now() < until, "the child is not ready within 30s");
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(copies().len(), 1, "the child recorded its copy");
+
+        ctrl_break(&child);
+        let begun = "Ctrl-Break: deleting the helper pods this command created";
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            let left = until.saturating_duration_since(Instant::now());
+            match lines.recv_timeout(left) {
+                Ok(line) if line.contains(begun) => break,
+                Ok(_) => {}
+                Err(_) => {
+                    let _ = child.kill();
+                    panic!(
+                        "the first Ctrl-Break started no stop: {}",
+                        all.join().unwrap()
+                    );
+                }
+            }
+        }
+        ctrl_break(&child);
+        let sent = Instant::now();
+        let status = exit_within(&mut child, Duration::from_secs(5));
+        let elapsed = sent.elapsed();
+        let stderr = all.join().unwrap();
+        let status =
+            status.unwrap_or_else(|| panic!("the second Ctrl-Break ended nothing: {stderr}"));
+        assert_eq!(status.code(), Some(130), "{stderr}");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "at once ({elapsed:?}): {stderr}"
+        );
+        assert!(
+            !stderr.contains("nothing else was undone"),
+            "the stop was still waiting when the second event came: {stderr}"
+        );
+        assert_eq!(copies(), Vec::<String>::new(), "{stderr}");
+    }
+
+    /// The child process of the test above, and nothing else: it installs
+    /// the interrupt, begins a helper apply it never settles (the stop waits
+    /// for it), records a kubeconfig copy, says it is ready and waits for the
+    /// events. Run on its own it fails, loudly.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "the child process of a_second_console_event_exits_at_once_and_leaves_no_kubeconfig_copy"]
+    fn second_console_event_child() {
+        let kc = std::env::var("APPRAFTER_INTERRUPT_CHILD_KUBECONFIG").expect(
+            "run only by a_second_console_event_exits_at_once_and_leaves_no_kubeconfig_copy",
+        );
+        let kc = Path::new(&kc);
+        let _guard = install(None);
+        let apply = HelperPods::global()
+            .begin_apply(kc, "demo", "bk-pg-db")
+            .unwrap();
+        let copy = private_copy(b"apiVersion: v1\nkind: Config\n").unwrap();
+        std::fs::write(kc.with_file_name("ready"), "").unwrap();
+        let _held = (apply, copy);
+        loop {
+            thread::park();
+        }
+    }
+
+    /// Windows, in a process of its own: a kubectl that a console Ctrl-C
+    /// ended marks the process interrupted — the command's next step refuses
+    /// — and, with no console event to follow, the command's own thread,
+    /// once unwound, starts the stop itself instead of parking forever.
+    #[cfg(windows)]
+    #[test]
+    fn a_kubectl_ended_by_a_console_interrupt_stops_the_command_without_an_event() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut child = console_child("console_interrupted_kubectl_child", tmp.path(), &[]);
+        let (_, all) = stderr_lines(&mut child);
+        let status = exit_within(&mut child, Duration::from_secs(30));
+        let stderr = all.join().unwrap();
+        let status = status.unwrap_or_else(|| panic!("the stop never ended the child: {stderr}"));
+        assert!(
+            stderr.contains("child: refused after the kubectl's exit"),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains("Ctrl-C: deleting the helper pods this command created"),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains("no helper pod of this command was running"),
+            "{stderr}"
+        );
+        assert_eq!(status.code(), Some(130), "{stderr}");
+    }
+
+    /// The child process of the test above, and nothing else.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "the child process of a_kubectl_ended_by_a_console_interrupt_stops_the_command_without_an_event"]
+    fn console_interrupted_kubectl_child() {
+        use std::os::windows::process::ExitStatusExt as _;
+        let guard = install(None);
+        assert!(!interrupted(), "interrupted before anything happened");
+        note_child_exit(&ExitStatus::from_raw(STATUS_CONTROL_C_EXIT as u32));
+        assert!(refuse_if_interrupted().is_err(), "the next step ran");
+        eprintln!("child: refused after the kubectl's exit");
+        drop(guard);
+        unreachable!("the stop ends the process");
     }
 }

@@ -63,8 +63,10 @@ libc          = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 # SetConsoleCtrlHandler: the Windows form of the SIGINT/SIGTERM stop in
-# commands::helper_interrupt. Already in the graph; no new crate.
-windows-sys   = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console"] }
+# commands::helper_interrupt, and TerminateProcess for a second event's exit
+# (Threading; its tests also start a child in a new process group). Already
+# in the graph; no new crate.
+windows-sys   = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Threading"] }
 
 [dev-dependencies]
 assert_cmd = { workspace = true }

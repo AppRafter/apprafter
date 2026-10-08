@@ -81,7 +81,7 @@ use cli_providers::k8s::sealing::{build_sealed_secret, fetch_controller_public_k
 use serde_json::Value;
 use tempfile::NamedTempFile;
 
-use crate::commands::helper_interrupt;
+use crate::commands::helper_interrupt::{self, Noted as _};
 use crate::commands::k8s_helpers::{
     ensure_kubeconfig_tempfile, kubectl_apply_server_side, kubectl_delete, kubectl_get_json,
     kubectl_get_json_cluster_wide, kubectl_merge_patch,
@@ -865,6 +865,7 @@ pub(crate) fn read_cluster_uid(kubeconfig: &Path) -> Result<String> {
         ])
         .env("KUBECONFIG", kubeconfig)
         .output()
+        .noted()
         .map_err(|e| CliError::Other(identity_read_error(&format!("spawn kubectl: {e}"))))?;
     if !out.status.success() {
         return Err(CliError::Other(identity_read_error(
@@ -1267,6 +1268,7 @@ impl KubectlExec {
 
         let apply_status = apply_child
             .wait()
+            .noted()
             .map_err(|e| CliError::Other(format!("wait kubectl {verb}: {e}")))?;
         // kubectl has exited, so its pipes are at EOF (it starts no children).
         let stdout = stdout_reader.join().unwrap_or_default();
@@ -1311,6 +1313,7 @@ impl KubectlExec {
             ])
             .env("KUBECONFIG", &self.kubeconfig)
             .output()
+            .noted()
             .map_err(|e| CliError::Other(format!("spawn kubectl get pod: {e}")))?;
         if !out.status.success() {
             return Err(CliError::Other(format!(
@@ -1527,6 +1530,7 @@ impl KubectlExec {
             ])
             .env("KUBECONFIG", &self.kubeconfig)
             .output()
+            .noted()
             .map_err(|e| CliError::Other(format!("spawn kubectl delete pod: {e}")))?;
         if out.status.success() {
             return Ok(());
@@ -1639,6 +1643,7 @@ impl KubeExec for KubectlExec {
 
         let status = child
             .wait()
+            .noted()
             .map_err(|e| CliError::Other(format!("wait kubectl exec: {e}")))?;
 
         if status.success() {
@@ -1703,6 +1708,7 @@ impl KubeExec for KubectlExec {
 
         let status = child
             .wait()
+            .noted()
             .map_err(|e| CliError::Other(format!("wait kubectl exec: {e}")))?;
 
         if status.success() {
@@ -1736,7 +1742,8 @@ impl KubeExec for KubectlExec {
             .env("KUBECONFIG", &self.kubeconfig)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status();
+            .status()
+            .noted();
         // Forgotten only when the delete went through: one that failed (or
         // whose kubectl died of the same Ctrl-C) leaves the pod for the
         // interrupt's cleanup.
@@ -1761,6 +1768,7 @@ impl KubeExec for KubectlExec {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()
+            .noted()
             .map_err(|e| CliError::Other(format!("spawn kubectl get secret: {e}")))?;
 
         if !out.status.success() {
@@ -1794,6 +1802,7 @@ impl KubeExec for KubectlExec {
 
         let out = c
             .output()
+            .noted()
             .map_err(|e| CliError::Other(format!("spawn kubectl: {e}")))?;
 
         if !out.status.success() {
