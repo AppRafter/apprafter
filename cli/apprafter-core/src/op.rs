@@ -1,0 +1,90 @@
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
+//! The shapes of core operations (ADR 0067 §2).
+//!
+//! A read returns a report. A mutation first returns a [`Plan`]; the client
+//! confirms it in its own way (the CLI prompts or takes `--yes`, the desktop
+//! shows the plan and, for a destructive one, asks for an OS authentication
+//! gesture); then the mutation executes and returns an [`Outcome`].
+
+use serde::Serialize;
+
+/// How much a mutation can lose, which decides the confirmation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanClass {
+    /// Undone by running the opposite operation; no confirmation.
+    Reversible,
+    /// Changes something that matters but loses nothing; a plain confirm.
+    Bounded,
+    /// Deletes data or infrastructure; the full plan and an explicit gesture.
+    Destructive,
+}
+
+/// One object a plan changes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PlannedChange {
+    /// What kind of object, e.g. `Target`, `ResourceClaim`.
+    pub kind: String,
+    /// Which one, e.g. `prod`, `billing-api/pg`.
+    pub object: String,
+    /// What happens to it, e.g. `delete`, `1.16.5 → 1.16.6`.
+    pub change: String,
+}
+
+/// What a mutation will do, before it does it. `payload` is the
+/// operation-specific data `execute` needs.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Plan<T> {
+    pub class: PlanClass,
+    pub title: String,
+    pub changes: Vec<PlannedChange>,
+    pub payload: T,
+}
+
+/// How an executed operation ended.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum Outcome<T> {
+    Completed {
+        result: T,
+    },
+    /// Stopped by its cancellation token. `cleaned` lists what it removed
+    /// on the way out, `left` what it could not.
+    Cancelled {
+        cleaned: Vec<String>,
+        left: Vec<String>,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plan_and_outcome_serialise_with_stable_tags() {
+        let plan = Plan {
+            class: PlanClass::Destructive,
+            title: "Remove target prod".into(),
+            changes: vec![PlannedChange {
+                kind: "Target".into(),
+                object: "prod".into(),
+                change: "delete".into(),
+            }],
+            payload: (),
+        };
+        let v = serde_json::to_value(&plan).unwrap();
+        assert_eq!(v["class"], "destructive");
+        assert_eq!(v["changes"][0]["change"], "delete");
+
+        let done: Outcome<u8> = Outcome::Completed { result: 7 };
+        assert_eq!(serde_json::to_value(&done).unwrap()["status"], "completed");
+        let stopped: Outcome<u8> = Outcome::Cancelled {
+            cleaned: vec!["pod/a".into()],
+            left: vec![],
+        };
+        assert_eq!(
+            serde_json::to_value(&stopped).unwrap()["status"],
+            "cancelled"
+        );
+    }
+}
