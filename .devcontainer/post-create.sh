@@ -93,12 +93,22 @@ install_cosign() {
   chmod +x "$INSTALL_BIN/cosign"
 }
 
+# AppRafter Desktop (ADR 0067): Tauri 2's Linux build dependencies (its prerequisites page).
+# Ubuntu packages, so they float with the base image like git.
+install_desktop_deps() {
+  if pkg-config --exists webkit2gtk-4.1 2>/dev/null; then return; fi
+  sudo apt-get update
+  sudo apt-get install -y --no-install-recommends build-essential pkg-config file \
+    libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
+}
+
 install_cue
 install_k3d
 install_bun
 install_just
 install_lefthook
 install_cosign
+install_desktop_deps
 
 echo
 echo "Dev container ready."

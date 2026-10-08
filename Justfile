@@ -112,9 +112,47 @@ test:
         fi
     done
     if find . -name package.json -not -path '*/node_modules/*' | head -1 | grep -q .; then
-        bun test
+        # desktop/'s tests need its own bunfig.toml preload (happy-dom), which a
+        # run from the root does not load; `just desktop-check` runs them.
+        bun test --path-ignore-patterns 'desktop/**'
     else
         echo "==> no package.json — skipping bun test"
+    fi
+
+# AppRafter Desktop (ADR 0067): its own Cargo workspace (desktop/) + bun package.
+# cli/cli-providers/build.rs needs the pinned cue: export CUE_BIN when the PATH cue is not v0.17.1.
+
+# Run the desktop app with hot reload.
+desktop-dev: _desktop-sysdeps
+    cd desktop && bun install --frozen-lockfile && bun run tauri dev
+
+# A debug build of the app, no installer (nothing is published before D.13).
+desktop-build: _desktop-sysdeps
+    cd desktop && bun install --frozen-lockfile && bun run tauri build --debug --no-bundle
+
+# Every desktop gate CI runs.
+desktop-check: _desktop-sysdeps
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ( cd desktop && cargo fmt -- --check \
+        && cargo clippy --locked --all-targets --all-features -- -D warnings \
+        && cargo test --locked --all-features )
+    ./scripts/check-desktop-core-lock.sh
+    ( cd desktop && bun install --frozen-lockfile && bun run lint && bun test )
+
+_desktop-sysdeps:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    [ "$(uname -s)" = Linux ] || exit 0
+    missing=()
+    for m in webkit2gtk-4.1 javascriptcoregtk-4.1 libsoup-3.0 gtk+-3.0 librsvg-2.0 ayatana-appindicator3-0.1; do
+        pkg-config --exists "$m" 2>/dev/null || missing+=("$m")
+    done
+    if [ ${#missing[@]} -gt 0 ]; then
+        echo "ERROR: the desktop build needs WebKitGTK/GTK development files; missing: ${missing[*]}" >&2
+        echo "  nix: nix develop .#desktop" >&2
+        echo "  apt: sudo apt-get install build-essential pkg-config file libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev" >&2
+        exit 1
     fi
 
 # Generate the operator chart CRDs from the v1alpha1 CUE schemas (ADR 0047).

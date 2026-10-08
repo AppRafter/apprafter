@@ -24,8 +24,11 @@
 // What still floats, because no option can pin it and the repository builds
 // nothing with it: the Docker engine from docker-in-docker, git from the
 // Ubuntu 22.04 packages, and the editor tools the go feature adds (gopls,
-// staticcheck, golangci-lint, ...). The `:1` / `:2` after each feature is
-// that feature's own major, not a tool version.
+// staticcheck, golangci-lint, ...). The Tauri apt packages post-create.sh
+// installs for the desktop app (WebKitGTK, GTK) float too, with the same
+// Ubuntu release, as CI's do with its runner image: for them the release is
+// the pin. The `:1` / `:2` after each feature is that feature's own major,
+// not a tool version.
 //
 // The FEATURES themselves -- the install scripts published under
 // ghcr.io/devcontainers/features, as distinct from the tool versions they are
