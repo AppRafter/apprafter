@@ -244,7 +244,7 @@ fn check_name_free(paths: &TargetStorePaths, name: &str, force: bool) -> Result<
 /// The name is checked again under the lock: another add may have created
 /// it since the first check, and only `force` overwrites it.
 fn save_new_target(paths: &TargetStorePaths, target: &Target, force: bool) -> Result<bool> {
-    let _store_lock = cli_core::StoreLock::exclusive(paths)?;
+    let _store_lock = store_lock(paths)?;
     check_name_free(paths, &target.name, force)?;
     save_target(paths, target)?;
     ensure_active_target(paths, &target.name)
@@ -625,9 +625,37 @@ pub(crate) fn store_lock_if_present(
     paths: &TargetStorePaths,
 ) -> Result<Option<cli_core::StoreLock>> {
     if paths.root().exists() {
-        cli_core::StoreLock::exclusive(paths).map(Some)
+        store_lock(paths).map(Some)
     } else {
         Ok(None)
+    }
+}
+
+/// The store lock for a CLI edit of the store. While another AppRafter
+/// process holds it the command waits, and says so once on stderr — a
+/// silent wait reads as a hang. Where the store cannot be locked at all
+/// (read-only, a filesystem without locks) it warns and the edit goes
+/// ahead unlocked.
+pub(crate) fn store_lock(paths: &TargetStorePaths) -> Result<cli_core::StoreLock> {
+    cli_core::StoreLock::exclusive_or_wait(paths, report_store_lock_event)
+}
+
+/// Print what taking the store lock reported, one stderr line per event.
+pub(crate) fn report_store_lock_event(event: cli_core::StoreLockEvent<'_>) {
+    eprintln!("{}", store_lock_event_line(&event));
+}
+
+/// The stderr line for a store-lock event.
+pub(crate) fn store_lock_event_line(event: &cli_core::StoreLockEvent<'_>) -> String {
+    match event {
+        cli_core::StoreLockEvent::Waiting { sentinel } => format!(
+            "waiting for another AppRafter process to release the target store ({})…",
+            sentinel.display()
+        ),
+        cli_core::StoreLockEvent::Unlocked { sentinel, error } => format!(
+            "warning: cannot lock the target store ({}): {error}; continuing without the lock",
+            sentinel.display()
+        ),
     }
 }
 
@@ -665,6 +693,33 @@ fn ensure_active_target(paths: &TargetStorePaths, name: &str) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── the store lock: what a wait and a lock-less store print ──────────
+
+    #[test]
+    fn a_wait_for_the_store_lock_names_the_sentinel() {
+        let sentinel = Path::new("/s/.lock");
+        let line = store_lock_event_line(&cli_core::StoreLockEvent::Waiting { sentinel });
+        assert_eq!(
+            line,
+            "waiting for another AppRafter process to release the target store (/s/.lock)…"
+        );
+    }
+
+    #[test]
+    fn a_store_that_cannot_be_locked_is_a_warning_naming_the_cause() {
+        let sentinel = Path::new("/s/.lock");
+        let error = std::io::Error::other("Read-only file system");
+        let line = store_lock_event_line(&cli_core::StoreLockEvent::Unlocked {
+            sentinel,
+            error: &error,
+        });
+        assert_eq!(
+            line,
+            "warning: cannot lock the target store (/s/.lock): Read-only file system; \
+             continuing without the lock"
+        );
+    }
 
     // ── the store lock: re-checked right before the save ─────────────────
 

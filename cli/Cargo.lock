@@ -701,6 +701,7 @@ dependencies = [
  "age",
  "chrono",
  "dirs",
+ "libc",
  "miette",
  "owo-colors",
  "serde",

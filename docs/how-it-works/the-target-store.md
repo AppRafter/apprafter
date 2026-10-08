@@ -21,6 +21,7 @@ way — is
 
 ```text
 $XDG_CONFIG_HOME/apprafter/          # ~/.config/apprafter on Linux
+├── .lock                            # the store lock; always empty
 ├── config.yaml                      # GlobalConfig
 ├── targets/
 │   ├── default/
@@ -44,6 +45,22 @@ network, firewall and floating-IP IDs, plus the age-encrypted
 kubeconfig. Everything under it is keyed by target name, which is why
 [renaming a target](../operator-guide/target-store.md#inspecting-renaming-and-removing-a-target) moves
 it and removing one deletes it.
+
+Every command that changes the store locks `.lock` while it reads,
+changes and saves, so two processes editing one store never lose each
+other's change. One that finds the lock held waits for it, and says so
+on stderr:
+
+```text
+waiting for another AppRafter process to release the target store (/home/operator/.config/apprafter/.lock)…
+```
+
+A store that cannot be locked at all — a read-only directory, a
+filesystem without locks — is used without the lock, after a
+`warning: cannot lock the target store (…): …; continuing without the
+lock` line. Each file is replaced whole: a save writes a temporary file
+beside it and renames that into place, so a reader sees the old version
+or the new one, never a partial write.
 
 ### `config.yaml` (global)
 
