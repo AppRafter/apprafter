@@ -97,12 +97,14 @@ const FORBIDDEN_CALLEES: &[&str] = &[
     "cli_providers::k8s::HelmCli",
 ];
 
-/// Callees the core may reach from the one function named beside them, and
-/// from nowhere else. `config_root_from_override` takes the override value
-/// explicitly, but without one it consults the platform config directory
-/// through `dirs` (HOME / XDG on Unix, the Known Folder API on Windows): that
-/// is the CLI's own environment, read for the CLI's context. The desktop
-/// passes its root explicitly (`Context::for_desktop`). `dirs::*` inside
+/// Callees the core may reach from the functions paired with them, and from
+/// nowhere else; a callee may be paired with several sites, one entry each.
+/// `config_root_from_override` takes the override value explicitly, but
+/// without one it consults the platform config directory through `dirs`
+/// (HOME / XDG on Unix, the Known Folder API on Windows). Both clients'
+/// context builders resolve the store root through it — the CLI in
+/// `Context::from_cli_env`, the desktop in `Context::from_desktop_env` — so
+/// both open the same default target store. `dirs::*` inside
 /// `apprafter-core/src` itself stays forbidden.
 const SANCTIONED: &[(&str, &str)] = &[
     (
@@ -112,6 +114,14 @@ const SANCTIONED: &[(&str, &str)] = &[
     (
         "cli_core::config_root_from_override",
         "Context::from_cli_env",
+    ),
+    (
+        "cli_core::target::config_root_from_override",
+        "Context::from_desktop_env",
+    ),
+    (
+        "cli_core::config_root_from_override",
+        "Context::from_desktop_env",
     ),
 ];
 
@@ -457,14 +467,15 @@ impl<'f> Scanner<'f> {
         if let Some(entry) = FORBIDDEN_CALLEES.iter().find(|e| path_matches(path, e)) {
             return Some((Kind::ForbiddenCallee, entry.to_string()));
         }
+        // A sanctioned callee is allowed when ANY entry pairs it with the
+        // current site, and forbidden everywhere else.
         let site = self.fns.last().map(String::as_str);
-        if let Some((entry, _)) = SANCTIONED
-            .iter()
-            .find(|(e, allowed)| path_matches(path, e) && site != Some(*allowed))
-        {
-            return Some((Kind::ForbiddenCallee, entry.to_string()));
+        let mut pairs = SANCTIONED.iter().filter(|(e, _)| path_matches(path, e));
+        let (entry, _) = pairs.clone().next()?;
+        if pairs.any(|(_, allowed)| site == Some(*allowed)) {
+            return None;
         }
-        None
+        Some((Kind::ForbiddenCallee, entry.to_string()))
     }
 
     fn check_path(&mut self, segs: &[String], span: Span) {
@@ -1280,6 +1291,7 @@ fn f() {
 struct Context;
 impl Context {
     fn from_cli_env() { let _ = cli_core::target::config_root_from_override(None); }
+    fn from_desktop_env() { let _ = cli_core::target::config_root_from_override(None); }
     fn for_desktop() { let _ = cli_core::target::config_root_from_override(None); }
 }
 ";
@@ -1288,7 +1300,7 @@ impl Context {
             vec![(
                 Kind::ForbiddenCallee,
                 "cli_core::target::config_root_from_override".into(),
-                4
+                5
             )]
         );
     }
