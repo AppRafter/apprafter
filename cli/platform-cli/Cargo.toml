@@ -61,6 +61,11 @@ ureq          = { workspace = true }
 signal-hook   = "0.3"
 libc          = "0.2"
 
+[target.'cfg(windows)'.dependencies]
+# SetConsoleCtrlHandler: the Windows form of the SIGINT/SIGTERM stop in
+# commands::helper_interrupt. Already in the graph; no new crate.
+windows-sys   = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console"] }
+
 [dev-dependencies]
 assert_cmd = { workspace = true }
 mockito    = { workspace = true }

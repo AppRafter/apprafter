@@ -80,6 +80,14 @@
 //! helm, kubectl — where no refusal reaches every call, and there is no
 //! helper pod to delete yet; a signal there ends the process at once.
 //!
+//! # On Windows
+//!
+//! There are no signals: a console control handler takes Ctrl-C, Ctrl-Break
+//! and the console window closing, and does the same as SIGINT above — the
+//! first runs the stop and exits with 130, a second during the stop removes
+//! the stop's kubeconfig copies and exits at once. Closing the window gives
+//! the stop only the few seconds Windows allows before it ends the process.
+//!
 //! The in-cluster runner has its own, different stop (`apprafter-backup`'s
 //! `stop` module): it is PID 1 of a Job's pod, is stopped by SIGTERM at its
 //! deadline, and records the run's failure as well.
@@ -87,8 +95,12 @@
 use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::path::Path;
+#[cfg(windows)]
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+#[cfg(unix)]
+use std::sync::atomic::AtomicPtr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Once};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -584,6 +596,7 @@ pub(crate) fn install(note: Option<&'static str>) -> StopGuard {
 
 /// Whether `signal` is ignored in this process right now — at install time,
 /// that is how it was started.
+#[cfg(unix)]
 fn ignored_at_start(signal: i32) -> bool {
     // SAFETY: sigaction with a null new action only reads the current one
     // into `old`, which is a plain, zero-initialised struct.
@@ -594,6 +607,14 @@ fn ignored_at_start(signal: i32) -> bool {
     }
 }
 
+/// Windows has no "ignored at start" disposition for console control
+/// events that this command could inherit and must preserve.
+#[cfg(windows)]
+fn ignored_at_start(_signal: i32) -> bool {
+    false
+}
+
+#[cfg(unix)]
 fn register(signals: &[i32]) -> std::io::Result<()> {
     for &signal in signals {
         // In this order, because signal-hook runs a signal's actions in the
@@ -627,6 +648,44 @@ fn register(signals: &[i32]) -> std::io::Result<()> {
                 stop(signal);
             }
         })?;
+    Ok(())
+}
+
+/// Windows: one console control handler for Ctrl-C, Ctrl-Break and the
+/// console window closing, in place of the SIGINT/SIGTERM handlers above;
+/// `signals` names no Windows event, so it is not read.
+#[cfg(windows)]
+fn register(_signals: &[i32]) -> std::io::Result<()> {
+    use windows_sys::core::BOOL;
+    use windows_sys::Win32::Foundation::{FALSE, TRUE};
+    use windows_sys::Win32::System::Console::{
+        SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT,
+    };
+
+    /// Each console event runs on a new thread the system creates, so —
+    /// unlike a Unix signal handler — this may block and allocate. The
+    /// first event runs the stop (which ends the process); a second one,
+    /// while the stop is still working, removes the stop's kubeconfig
+    /// copies and ends the process at once, as a second signal does on
+    /// Unix.
+    unsafe extern "system" fn handler(ctrl_type: u32) -> BOOL {
+        match ctrl_type {
+            CTRL_C_EVENT | CTRL_BREAK_EVENT | CTRL_CLOSE_EVENT => {
+                if INTERRUPTED.swap(true, Ordering::SeqCst) {
+                    unlink_all(&COPY_PATHS);
+                    std::process::exit(128 + signal_hook::consts::SIGINT);
+                }
+                stop(signal_hook::consts::SIGINT)
+            }
+            _ => FALSE,
+        }
+    }
+
+    // SAFETY: registers a plain `extern "system"` function for the life of
+    // the process; it is never removed.
+    if unsafe { SetConsoleCtrlHandler(Some(handler), TRUE) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
     Ok(())
 }
 
@@ -717,8 +776,14 @@ fn stop(signal: i32) -> ! {
 /// memory of a path is never freed, because the handler may be reading it at
 /// any moment — a few dozen bytes per copy, and the stop makes one copy per
 /// kubeconfig, once per process.
+#[cfg(unix)]
 static COPY_PATHS: [AtomicPtr<libc::c_char>; COPY_SLOTS] =
     [const { AtomicPtr::new(std::ptr::null_mut()) }; COPY_SLOTS];
+
+/// Windows: the stop's kubeconfig copies, for a second Ctrl-C to remove.
+/// No async-signal constraint applies (see `register`), so plain paths.
+#[cfg(windows)]
+static COPY_PATHS: [Mutex<Option<PathBuf>>; COPY_SLOTS] = [const { Mutex::new(None) }; COPY_SLOTS];
 
 /// More than the stop ever needs: a command applies every helper through one
 /// kubeconfig.
@@ -726,6 +791,7 @@ const COPY_SLOTS: usize = 8;
 
 /// `unlink(2)` every path in `slots`. Async-signal-safe: the second signal
 /// runs it from the handler.
+#[cfg(unix)]
 fn unlink_all(slots: &[AtomicPtr<libc::c_char>]) {
     for slot in slots {
         let path = slot.load(Ordering::SeqCst);
@@ -739,8 +805,19 @@ fn unlink_all(slots: &[AtomicPtr<libc::c_char>]) {
     }
 }
 
+/// Windows: remove every path in `slots` (a second Ctrl-C, see `register`).
+#[cfg(windows)]
+fn unlink_all(slots: &[Mutex<Option<PathBuf>>]) {
+    for slot in slots {
+        if let Some(path) = slot.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 /// Put `path` in a free slot of `slots` and return its index, or fail when
 /// none is free. The path's memory is leaked on purpose (see `COPY_PATHS`).
+#[cfg(unix)]
 fn claim_slot(slots: &[AtomicPtr<libc::c_char>], path: &Path) -> std::io::Result<usize> {
     use std::os::unix::ffi::OsStrExt as _;
     let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())?.into_raw();
@@ -764,6 +841,34 @@ fn claim_slot(slots: &[AtomicPtr<libc::c_char>], path: &Path) -> std::io::Result
     ))
 }
 
+/// Windows: put `path` in a free slot of `slots` and return its index, or
+/// fail when none is free.
+#[cfg(windows)]
+fn claim_slot(slots: &[Mutex<Option<PathBuf>>], path: &Path) -> std::io::Result<usize> {
+    for (index, slot) in slots.iter().enumerate() {
+        let mut held = slot.lock().unwrap_or_else(|p| p.into_inner());
+        if held.is_none() {
+            *held = Some(path.to_path_buf());
+            return Ok(index);
+        }
+    }
+    Err(std::io::Error::other(
+        "no room to record it for a second Ctrl-C to remove",
+    ))
+}
+
+/// Free slot `index` of [`COPY_PATHS`]: its copy is gone.
+#[cfg(unix)]
+fn release_slot(index: usize) {
+    COPY_PATHS[index].store(std::ptr::null_mut(), Ordering::SeqCst);
+}
+
+/// Free slot `index` of [`COPY_PATHS`]: its copy is gone.
+#[cfg(windows)]
+fn release_slot(index: usize) {
+    *COPY_PATHS[index].lock().unwrap_or_else(|p| p.into_inner()) = None;
+}
+
 /// A copy of the kubeconfig the stop runs its kubectl through: a file only
 /// this user can read, recorded in [`COPY_PATHS`] before the kubeconfig is
 /// written into it, removed when dropped, and removed by a second signal.
@@ -785,7 +890,7 @@ impl Drop for PrivateCopy {
         if let Some(file) = self.file.take() {
             let _ = file.close();
         }
-        COPY_PATHS[self.slot].store(std::ptr::null_mut(), Ordering::SeqCst);
+        release_slot(self.slot);
     }
 }
 
