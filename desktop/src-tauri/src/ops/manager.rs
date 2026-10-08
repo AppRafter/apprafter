@@ -8,7 +8,8 @@
 //!
 //! An operation's events go into its [`ReplayBuffer`] and to every subscribed
 //! [`EventSink`], both under the manager's lock, so a page that subscribes gets the replay
-//! and then exactly the events after it. An ended operation keeps its summary and replay
+//! and then exactly the events after it. Every subscription has its own [`SubscriptionId`], so
+//! a page can [`unsubscribe`](OperationManager::unsubscribe) exactly the one it made. An ended operation keeps its summary and replay
 //! until the webview [`discard`](OperationManager::discard)s it after showing the result, or
 //! until [`ENDED_KEPT`] operations ended after it. A plan that never runs — its prompt
 //! refused, expired, swept, or dropped by a lock — sends the pages that followed it one
@@ -17,6 +18,10 @@
 //! A plan leaves the manager's maps under its lock and is dropped after the lock is released:
 //! what an executor captured may do anything when it goes, calling back into the manager
 //! included.
+//!
+//! Quitting [`close`](OperationManager::close)s the manager first: from then on no operation
+//! starts, decided under the same lock hold that would start it, so nothing begins between the
+//! quit's [`cancel_all_and_wait`](OperationManager::cancel_all_and_wait) and the exit.
 
 use std::collections::{HashMap, VecDeque};
 use std::mem;
@@ -28,7 +33,9 @@ use std::time::{Duration, Instant};
 use apprafter_core::{
     CancellationToken, CoreError, CoreResult, Outcome, PlanClass, PlannedChange, Reporter, UiError,
 };
-use apprafter_desktop_ipc::{AuthOutcome, OpEvent, OpId, OpState, OpSummary, PlanView};
+use apprafter_desktop_ipc::{
+    AuthOutcome, OpEvent, OpId, OpState, OpSummary, PlanView, Subscribed, SubscriptionId,
+};
 
 use super::replay::REPLAY_CAP;
 use super::{panic_message, trip, Clock, OpReporter, ReplayBuffer, Stamp};
@@ -109,6 +116,9 @@ pub struct OperationManager {
 #[derive(Default)]
 struct Inner {
     next_id: u64,
+    next_subscription: u64,
+    /// Set once by [`OperationManager::close`]: no operation starts after it.
+    closing: bool,
     /// Registered, waiting for `execute`.
     pending: HashMap<OpId, Pending>,
     /// Taken by `execute`, the OS prompt open.
@@ -170,7 +180,13 @@ struct Pending {
     registered: Stamp,
     exec: Executor,
     /// Pages subscribed before `execute`; they follow the plan into its operation.
-    sinks: Vec<Arc<dyn EventSink>>,
+    sinks: Vec<Subscriber>,
+}
+
+/// One subscription: the page's sink and the id it ends it with.
+struct Subscriber {
+    id: SubscriptionId,
+    sink: Arc<dyn EventSink>,
 }
 
 impl Pending {
@@ -188,7 +204,7 @@ struct Prompt {
     /// not the token — decides; a `Verified` that arrives before the dialog closed is
     /// refused too.
     refused: bool,
-    sinks: Vec<Arc<dyn EventSink>>,
+    sinks: Vec<Subscriber>,
 }
 
 struct Op {
@@ -198,7 +214,7 @@ struct Op {
     status: Status,
     replay: ReplayBuffer,
     /// Pages that receive what comes next; empty once the operation ended.
-    sinks: Vec<Arc<dyn EventSink>>,
+    sinks: Vec<Subscriber>,
 }
 
 impl Op {
@@ -225,11 +241,11 @@ struct Run {
 /// What a prompt's answer means for its plan.
 enum Answer {
     /// Run it; the pages that followed the prompt follow the operation.
-    Run(Vec<Arc<dyn EventSink>>),
+    Run(Vec<Subscriber>),
     /// Nothing was asked: the plan waits for another `execute`, as it was.
-    Again(Vec<Arc<dyn EventSink>>),
+    Again(Vec<Subscriber>),
     /// Refused, for the reason given; the pages that followed the prompt are told it.
-    Refuse(DesktopError, Vec<Arc<dyn EventSink>>),
+    Refuse(DesktopError, Vec<Subscriber>),
 }
 
 impl OperationManager {
@@ -295,23 +311,27 @@ impl OperationManager {
     /// when the OS still answered yes — and so does a prompt that stayed open past the
     /// plan's expiry; the executor then never runs. Otherwise it starts on a thread of its
     /// own, named `op-<id>`, with an 8 MiB stack.
+    ///
+    /// Once the manager is [`close`](Self::close)d it refuses with `Closing`: before asking
+    /// anything, and again under the lock hold that would start the operation or put a busy
+    /// plan back, so a prompt that answers after the quit began starts nothing.
     pub fn execute(
         self: &Arc<Self>,
         id: OpId,
         auth: &dyn Authenticator,
     ) -> Result<OpId, DesktopError> {
         let mut inner = self.lock();
-        let mut plan = inner
+        let plan = inner
             .pending
             .remove(&id)
             .ok_or(DesktopError::PlanNotFound { op_id: id })?;
-        if plan.expired(&*self.clock) {
-            let err = DesktopError::PlanExpired { op_id: id };
-            refuse(&mut plan.sinks, &err);
-            drop(inner);
-            drop(plan);
-            return Err(err);
+        if inner.closing {
+            return spend(inner, plan, DesktopError::Closing);
         }
+        if plan.expired(&*self.clock) {
+            return spend(inner, plan, DesktopError::PlanExpired { op_id: id });
+        }
+        let mut plan = plan;
         if let Some(purpose) = plan.gesture.clone() {
             let cancel = CancellationToken::new();
             inner.prompts.insert(
@@ -331,6 +351,10 @@ impl OperationManager {
                 Answer::Run(sinks) => plan.sinks = sinks,
                 Answer::Again(sinks) => {
                     plan.sinks = sinks;
+                    // Quitting: nothing may wait for a try that will never come.
+                    if inner.closing {
+                        return spend(inner, plan, DesktopError::Closing);
+                    }
                     inner.pending.insert(id, plan);
                     return Err(DesktopError::AuthBusy);
                 }
@@ -341,6 +365,11 @@ impl OperationManager {
                     return Err(err);
                 }
             }
+        }
+        // The same lock hold as the insert below: a quit that began while the prompt was
+        // open is seen here, and one that begins after it finds the operation running.
+        if inner.closing {
+            return spend(inner, plan, DesktopError::Closing);
         }
         let cancel = CancellationToken::new();
         let reporter = {
@@ -417,26 +446,65 @@ impl OperationManager {
     /// when it never will: refused, expired, swept or dropped by a lock (a plan the webview
     /// cancels or discards itself sends nothing). An ended operation returns its whole replay
     /// and keeps no sink.
+    ///
+    /// Every call gets a new [`SubscriptionId`], an ended operation's included, which
+    /// [`unsubscribe`](Self::unsubscribe) takes.
     pub fn subscribe(
         &self,
         id: OpId,
         sink: Arc<dyn EventSink>,
-    ) -> Result<Vec<OpEvent>, DesktopError> {
+    ) -> Result<Subscribed, DesktopError> {
         let mut inner = self.lock();
-        if let Some(op) = inner.ops.get_mut(&id) {
-            if op.run().is_some() {
-                op.sinks.push(sink);
-            }
-            return Ok(op.replay.snapshot());
-        }
-        if let Some(plan) = inner.pending.get_mut(&id) {
-            plan.sinks.push(sink);
-        } else if let Some(prompt) = inner.prompts.get_mut(&id) {
-            prompt.sinks.push(sink);
+        let Inner {
+            next_subscription,
+            pending,
+            prompts,
+            ops,
+            ..
+        } = &mut *inner;
+        let (sinks, replay) = if let Some(op) = ops.get_mut(&id) {
+            let replay = op.replay.snapshot();
+            (op.run().is_some().then_some(&mut op.sinks), replay)
+        } else if let Some(plan) = pending.get_mut(&id) {
+            (Some(&mut plan.sinks), Vec::new())
+        } else if let Some(prompt) = prompts.get_mut(&id) {
+            (Some(&mut prompt.sinks), Vec::new())
         } else {
             return Err(DesktopError::PlanNotFound { op_id: id });
+        };
+        *next_subscription += 1;
+        let subscription = SubscriptionId(*next_subscription);
+        if let Some(sinks) = sinks {
+            sinks.push(Subscriber {
+                id: subscription,
+                sink,
+            });
         }
-        Ok(Vec::new())
+        Ok(Subscribed {
+            subscription,
+            replay,
+        })
+    }
+
+    /// End one subscription: its sink receives nothing more. The plan, prompt or operation
+    /// `id` names is left as it is. An unknown `id` or `subscription` — the operation ended
+    /// or was discarded meanwhile — is no error: there is nothing left to end.
+    pub fn unsubscribe(&self, id: OpId, subscription: SubscriptionId) {
+        let mut inner = self.lock();
+        let Inner {
+            pending,
+            prompts,
+            ops,
+            ..
+        } = &mut *inner;
+        let sinks = pending
+            .get_mut(&id)
+            .map(|plan| &mut plan.sinks)
+            .or_else(|| prompts.get_mut(&id).map(|prompt| &mut prompt.sinks))
+            .or_else(|| ops.get_mut(&id).map(|op| &mut op.sinks));
+        if let Some(sinks) = sinks {
+            sinks.retain(|s| s.id != subscription);
+        }
     }
 
     /// Stop an operation: trip its token, which the executor sees and stops the processes
@@ -501,6 +569,14 @@ impl OperationManager {
         list
     }
 
+    /// Quit has begun: from now on [`execute`](Self::execute) starts nothing and refuses with
+    /// `Closing`, telling the pages that followed the plan. Running operations, open prompts and
+    /// pending plans are left to the rest of the quit: [`drop_all_plans`](Self::drop_all_plans)
+    /// and [`cancel_all_and_wait`](Self::cancel_all_and_wait).
+    pub fn close(&self) {
+        self.lock().closing = true;
+    }
+
     /// How many executors are running.
     pub fn running(&self) -> usize {
         self.lock().running()
@@ -539,7 +615,7 @@ impl OperationManager {
             .chain(prompts.values_mut().map(|p| &mut p.sinks))
             .chain(ops.values_mut().map(|op| &mut op.sinks));
         for sinks in all {
-            sinks.retain(|s| s.webview() != webview);
+            sinks.retain(|s| s.sink.webview() != webview);
         }
     }
 
@@ -623,8 +699,21 @@ impl Drop for Ending<'_> {
 }
 
 /// Tell the pages that followed a plan that it will never run, and why.
-fn refuse(sinks: &mut Vec<Arc<dyn EventSink>>, why: &DesktopError) {
+fn refuse(sinks: &mut Vec<Subscriber>, why: &DesktopError) {
     fan_out(sinks, &OpEvent::Failed { error: why.to_ui() });
+}
+
+/// `execute` refuses `plan` for `why`: its pages are told under the lock, and the plan is
+/// dropped after the lock is released.
+fn spend(
+    inner: MutexGuard<'_, Inner>,
+    mut plan: Pending,
+    why: DesktopError,
+) -> Result<OpId, DesktopError> {
+    refuse(&mut plan.sinks, &why);
+    drop(inner);
+    drop(plan);
+    Err(why)
 }
 
 /// Refuse every open prompt not refused yet; their tokens, to close their dialogs.
@@ -716,9 +805,8 @@ fn final_event(
 
 /// Send `event` to every sink; a sink that answers `false` — or panics — is dropped, so a
 /// broken page can never stop an operation from ending.
-fn fan_out(sinks: &mut Vec<Arc<dyn EventSink>>, event: &OpEvent) {
-    sinks
-        .retain(|sink| panic::catch_unwind(AssertUnwindSafe(|| sink.send(event))).unwrap_or(false));
+fn fan_out(sinks: &mut Vec<Subscriber>, event: &OpEvent) {
+    sinks.retain(|s| panic::catch_unwind(AssertUnwindSafe(|| s.sink.send(event))).unwrap_or(false));
 }
 
 /// Start an operation's thread, named `op-<id>`, with an 8 MiB stack.
@@ -767,7 +855,7 @@ mod tests {
     };
     use apprafter_desktop_ipc::{
         errors, AuthInfo, AuthOutcome, CancelledBy, OpEvent, OpId, OpState, OutputStream,
-        UnavailableReason,
+        SubscriptionId, UnavailableReason,
     };
     use serde_json::json;
 
@@ -1331,7 +1419,7 @@ mod tests {
         );
         let early = VecSink::new("main");
         assert_eq!(
-            mgr.subscribe(view.op_id, early.clone()).unwrap(),
+            mgr.subscribe(view.op_id, early.clone()).unwrap().replay,
             vec![],
             "a plan has no events yet"
         );
@@ -1342,7 +1430,7 @@ mod tests {
             message: "a".into(),
         };
         assert_eq!(
-            mgr.subscribe(view.op_id, late.clone()).unwrap(),
+            mgr.subscribe(view.op_id, late.clone()).unwrap().replay,
             vec![staged(1), warning.clone()]
         );
         open.send(()).unwrap();
@@ -1351,7 +1439,10 @@ mod tests {
         assert_eq!(early.events(), all);
         assert_eq!(late.events(), vec![staged(2), completed(json!("done"))]);
         let after = VecSink::new("main");
-        assert_eq!(mgr.subscribe(view.op_id, after.clone()).unwrap(), all);
+        assert_eq!(
+            mgr.subscribe(view.op_id, after.clone()).unwrap().replay,
+            all
+        );
         assert_eq!(after.sends(), 0, "nothing follows the final event");
     }
 
@@ -1433,13 +1524,13 @@ mod tests {
             // once this page has subscribed.
             paused_rx.recv_timeout(LONG).unwrap();
             let paused = VecSink::new("main");
-            let replay = mgr.subscribe(view.op_id, paused.clone()).unwrap();
+            let replay = mgr.subscribe(view.op_id, paused.clone()).unwrap().replay;
             assert_same_events(&replay, &expected[..PAUSE as usize]);
             resume.send(()).unwrap();
             // Sampled: another page subscribes while the burst runs, wherever it lands.
             half_rx.recv_timeout(LONG).unwrap();
             let racing = VecSink::new("main");
-            let racing_replay = mgr.subscribe(view.op_id, racing.clone()).unwrap();
+            let racing_replay = mgr.subscribe(view.op_id, racing.clone()).unwrap().replay;
             finish.send(()).unwrap();
             wait_ended(&mgr, view.op_id);
             assert_same_events(&paused.events(), &expected[PAUSE as usize..]);
@@ -1520,7 +1611,10 @@ mod tests {
         assert_ne!(name, caller);
         assert_eq!(running, Some(1));
         assert_eq!(wait_ended(&mgr, view.op_id), OpState::Cancelled);
-        let replay = mgr.subscribe(view.op_id, VecSink::new("main")).unwrap();
+        let replay = mgr
+            .subscribe(view.op_id, VecSink::new("main"))
+            .unwrap()
+            .replay;
         assert_eq!(
             replay.last(),
             Some(&OpEvent::Finished {
@@ -1590,7 +1684,10 @@ mod tests {
         );
         mgr.execute(view.op_id, &FakeAuthenticator::new()).unwrap();
         assert_eq!(wait_ended(&mgr, view.op_id), OpState::Failed);
-        let replay = mgr.subscribe(view.op_id, VecSink::new("main")).unwrap();
+        let replay = mgr
+            .subscribe(view.op_id, VecSink::new("main"))
+            .unwrap()
+            .replay;
         assert_eq!(replay[0], staged(1));
         match replay.last() {
             Some(OpEvent::Failed { error }) => {
@@ -1614,7 +1711,10 @@ mod tests {
         );
         mgr.execute(failing.op_id, &auth).unwrap();
         assert_eq!(wait_ended(&mgr, failing.op_id), OpState::Failed);
-        let replay = mgr.subscribe(failing.op_id, VecSink::new("main")).unwrap();
+        let replay = mgr
+            .subscribe(failing.op_id, VecSink::new("main"))
+            .unwrap()
+            .replay;
         match replay.last() {
             Some(OpEvent::Failed { error }) => {
                 assert_eq!(error.code.as_deref(), Some("apprafter::target::no_active"))
@@ -1633,7 +1733,10 @@ mod tests {
         );
         mgr.execute(done.op_id, &auth).unwrap();
         assert_eq!(wait_ended(&mgr, done.op_id), OpState::Finished);
-        let replay = mgr.subscribe(done.op_id, VecSink::new("main")).unwrap();
+        let replay = mgr
+            .subscribe(done.op_id, VecSink::new("main"))
+            .unwrap()
+            .replay;
         assert_eq!(
             replay,
             vec![completed(json!(format!("op-{}", done.op_id.0)))],
@@ -2381,7 +2484,9 @@ mod tests {
         };
         assert_eq!(sink.events(), vec![finished.clone()]);
         assert_eq!(
-            mgr.subscribe(view.op_id, VecSink::new("main")).unwrap(),
+            mgr.subscribe(view.op_id, VecSink::new("main"))
+                .unwrap()
+                .replay,
             vec![finished]
         );
     }
@@ -2445,7 +2550,9 @@ mod tests {
             other => panic!("expected one Failed, got {other:?}"),
         }
         assert_eq!(
-            mgr.subscribe(view.op_id, VecSink::new("main")).unwrap(),
+            mgr.subscribe(view.op_id, VecSink::new("main"))
+                .unwrap()
+                .replay,
             events
         );
     }
@@ -2477,7 +2584,9 @@ mod tests {
         assert_eq!(mgr.running(), 0);
         assert_eq!(runs.load(SeqCst), 0);
         assert_eq!(
-            mgr.subscribe(view.op_id, VecSink::new("main")).unwrap(),
+            mgr.subscribe(view.op_id, VecSink::new("main"))
+                .unwrap()
+                .replay,
             events
         );
     }
@@ -2532,5 +2641,200 @@ mod tests {
         assert_eq!(kept.len(), ENDED_KEPT);
         assert!(kept.contains(&long.op_id));
         assert!(!kept.contains(&ids[4]));
+    }
+
+    // 16. Quitting: once the manager closes, nothing new runs.
+
+    fn closing() -> OpEvent {
+        OpEvent::Failed {
+            error: DesktopError::Closing.to_ui(),
+        }
+    }
+
+    #[test]
+    fn a_closed_manager_refuses_a_plan_and_leaves_running_ops_alone() {
+        let (_, mgr) = manager();
+        let auth = FakeAuthenticator::new();
+        let (open, gate) = gate();
+        let running = mgr.register_plan(
+            parts(PlanClass::Bounded),
+            Box::new(move |_, _| {
+                gate.wait();
+                complete(json!("confirmed before the quit"))
+            }),
+        );
+        mgr.execute(running.op_id, &auth).unwrap();
+        let ran = Arc::new(AtomicBool::new(false));
+        let plan = mgr.register_plan(parts(PlanClass::Bounded), flags(&ran));
+        let sink = VecSink::new("main");
+        mgr.subscribe(plan.op_id, sink.clone()).unwrap();
+        mgr.close();
+        let err = mgr.execute(plan.op_id, &auth).unwrap_err();
+        assert!(matches!(err, DesktopError::Closing), "{err:?}");
+        assert_eq!(
+            err.to_ui().code.as_deref(),
+            Some(errors::CLOSING),
+            "{err:?}"
+        );
+        assert!(!ran.load(SeqCst));
+        assert_eq!(sink.events(), vec![closing()], "its page hears why");
+        assert!(
+            matches!(
+                mgr.execute(plan.op_id, &auth),
+                Err(DesktopError::PlanNotFound { .. })
+            ),
+            "the plan is spent"
+        );
+        assert_eq!(state_of(&mgr, running.op_id), Some(OpState::Running));
+        open.send(()).unwrap();
+        assert_eq!(wait_ended(&mgr, running.op_id), OpState::Finished);
+    }
+
+    #[test]
+    fn a_closed_manager_asks_the_owner_nothing() {
+        let (_, mgr) = manager();
+        let auth = FakeAuthenticator::new();
+        let view = mgr.register_plan(parts(PlanClass::Destructive), returns(json!(0)));
+        mgr.close();
+        assert!(matches!(
+            mgr.execute(view.op_id, &auth),
+            Err(DesktopError::Closing)
+        ));
+        assert!(auth.asked().is_empty(), "no prompt opens while quitting");
+    }
+
+    #[test]
+    fn a_yes_that_arrives_after_the_manager_closed_runs_nothing() {
+        // Forced: the prompt opened before the quit and answers yes after it, and nothing else
+        // closed it — only the check made where the operation would start can refuse it.
+        let (_, mgr) = manager();
+        let (auth, opened, answer) = held_prompt();
+        let ran = Arc::new(AtomicBool::new(false));
+        let view = mgr.register_plan(parts(PlanClass::Destructive), flags(&ran));
+        let sink = VecSink::new("main");
+        mgr.subscribe(view.op_id, sink.clone()).unwrap();
+        let result = execute_in_background(&mgr, view.op_id, auth);
+        opened.recv_timeout(LONG).expect("the prompt opened");
+        mgr.close();
+        answer.send(AuthOutcome::Verified).unwrap();
+        let result = result.recv_timeout(LONG).expect("execute returned");
+        assert!(matches!(result, Err(DesktopError::Closing)), "{result:?}");
+        assert!(!ran.load(SeqCst), "the plan ran after the manager closed");
+        assert_eq!(sink.events(), vec![closing()]);
+        assert!(mgr.list().is_empty());
+        assert_eq!(mgr.running(), 0);
+    }
+
+    #[test]
+    fn a_busy_answer_after_the_manager_closed_does_not_put_the_plan_back() {
+        let (_, mgr) = manager();
+        let (auth, opened, answer) = held_prompt();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let view = mgr.register_plan(parts(PlanClass::Destructive), counting(&runs));
+        let sink = VecSink::new("main");
+        mgr.subscribe(view.op_id, sink.clone()).unwrap();
+        let result = execute_in_background(&mgr, view.op_id, auth);
+        opened.recv_timeout(LONG).expect("the prompt opened");
+        mgr.close();
+        answer.send(AuthOutcome::Busy).unwrap();
+        let result = result.recv_timeout(LONG).expect("execute returned");
+        assert!(matches!(result, Err(DesktopError::Closing)), "{result:?}");
+        assert_eq!(sink.events(), vec![closing()]);
+        assert!(
+            matches!(
+                mgr.execute(view.op_id, &FakeAuthenticator::new()),
+                Err(DesktopError::PlanNotFound { .. })
+            ),
+            "nothing waits for another try"
+        );
+        assert_eq!(runs.load(SeqCst), 0);
+    }
+
+    // 17. Subscriptions: each one is numbered, and ending one ends exactly that one.
+
+    #[test]
+    fn every_subscription_has_its_own_id_and_unsubscribe_ends_exactly_that_one() {
+        let (_, mgr) = manager();
+        let (half_tx, half_rx) = mpsc::channel();
+        let (open, gate) = gate();
+        let view = mgr.register_plan(
+            parts(PlanClass::Bounded),
+            Box::new(move |r, _| {
+                r.report(stage(1));
+                half_tx.send(()).unwrap();
+                gate.wait();
+                r.report(stage(2));
+                complete(json!(null))
+            }),
+        );
+        // The same page twice, as a component that remounted.
+        let first = VecSink::new("main");
+        let second = VecSink::new("main");
+        let a = mgr.subscribe(view.op_id, first.clone()).unwrap();
+        mgr.execute(view.op_id, &FakeAuthenticator::new()).unwrap();
+        half_rx.recv_timeout(LONG).unwrap();
+        let b = mgr.subscribe(view.op_id, second.clone()).unwrap();
+        assert_ne!(a.subscription, b.subscription);
+        assert_eq!(b.replay, vec![staged(1)]);
+        // Neither another op's id nor an unknown subscription ends anything.
+        mgr.unsubscribe(OpId(view.op_id.0 + 100), a.subscription);
+        mgr.unsubscribe(view.op_id, SubscriptionId(a.subscription.0 + 100));
+        mgr.unsubscribe(view.op_id, a.subscription);
+        open.send(()).unwrap();
+        assert_eq!(wait_ended(&mgr, view.op_id), OpState::Finished);
+        assert_eq!(
+            first.events(),
+            vec![staged(1)],
+            "nothing after its unsubscribe"
+        );
+        assert_eq!(second.events(), vec![staged(2), completed(json!(null))]);
+        // An ended op keeps no sink, but its subscription still has an id, and ending it
+        // is a no-op.
+        let late = mgr.subscribe(view.op_id, VecSink::new("main")).unwrap();
+        assert!(![a.subscription, b.subscription].contains(&late.subscription));
+        mgr.unsubscribe(view.op_id, late.subscription);
+    }
+
+    #[test]
+    fn unsubscribe_ends_a_subscription_to_a_plan_and_to_an_open_prompt() {
+        let (_, mgr) = manager();
+        let view = mgr.register_plan(parts(PlanClass::Bounded), returns(json!(0)));
+        let gone = VecSink::new("main");
+        let kept = VecSink::new("main");
+        let sub = mgr.subscribe(view.op_id, gone.clone()).unwrap();
+        mgr.subscribe(view.op_id, kept.clone()).unwrap();
+        mgr.unsubscribe(view.op_id, sub.subscription);
+        mgr.drop_all_plans();
+        assert_eq!(gone.sends(), 0);
+        assert_eq!(
+            kept.events(),
+            vec![OpEvent::Failed {
+                error: DesktopError::Locked.to_ui()
+            }]
+        );
+
+        let (auth, opened, answer) = held_prompt();
+        let view = mgr.register_plan(parts(PlanClass::Destructive), returns(json!(0)));
+        let result = execute_in_background(&mgr, view.op_id, auth);
+        opened.recv_timeout(LONG).expect("the prompt opened");
+        let gone = VecSink::new("main");
+        let kept = VecSink::new("main");
+        let sub = mgr.subscribe(view.op_id, gone.clone()).unwrap();
+        mgr.subscribe(view.op_id, kept.clone()).unwrap();
+        mgr.unsubscribe(view.op_id, sub.subscription);
+        answer
+            .send(AuthOutcome::Cancelled {
+                by: CancelledBy::User,
+            })
+            .unwrap();
+        let result = result.recv_timeout(LONG).expect("execute returned");
+        assert!(matches!(result, Err(DesktopError::AuthCancelled)));
+        assert_eq!(gone.sends(), 0);
+        assert_eq!(
+            kept.events(),
+            vec![OpEvent::Failed {
+                error: DesktopError::AuthCancelled.to_ui()
+            }]
+        );
     }
 }

@@ -17,6 +17,24 @@ use serde::{Deserialize, Serialize};
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct OpId(pub u64);
 
+/// Names one page's subscription to an operation, so the page can end exactly that one
+/// (`op_unsubscribe`) — a component that remounts subscribes again and must not receive every
+/// event twice. Below 2^53, a bare number on the wire, like [`OpId`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct SubscriptionId(pub u64);
+
+/// The `op_subscribe` answer: the subscription, and what the operation reported before it
+/// (shown first; the channel then carries exactly the events after it).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct Subscribed {
+    pub subscription: SubscriptionId,
+    /// Empty for a plan, which has no events yet.
+    pub replay: Vec<OpEvent>,
+}
+
 /// Which of a tool's output streams a chunk of text came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -283,6 +301,40 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_subscription_id_is_a_bare_number_both_ways() {
+        assert_eq!(serde_json::to_string(&SubscriptionId(4)).unwrap(), "4");
+        assert_eq!(
+            serde_json::from_str::<SubscriptionId>("4").unwrap(),
+            SubscriptionId(4)
+        );
+    }
+
+    #[test]
+    fn a_subscription_carries_its_id_and_the_replay_in_order() {
+        let subscribed = Subscribed {
+            subscription: SubscriptionId(9),
+            replay: vec![
+                OpEvent::Notice {
+                    message: "n".into(),
+                },
+                OpEvent::OutputDropped { bytes: 3 },
+            ],
+        };
+        assert_eq!(
+            serde_json::to_string(&subscribed).unwrap(),
+            r#"{"subscription":9,"replay":[{"kind":"notice","message":"n"},{"kind":"output_dropped","bytes":3}]}"#
+        );
+        let empty = Subscribed {
+            subscription: SubscriptionId(1),
+            replay: Vec::new(),
+        };
+        assert_eq!(
+            serde_json::to_string(&empty).unwrap(),
+            r#"{"subscription":1,"replay":[]}"#
+        );
+    }
+
     #[cfg(feature = "ts")]
     #[test]
     fn the_typescript_declarations_keep_numbers_and_tags() {
@@ -299,7 +351,16 @@ mod tests {
         for field in ["opId: OpId", "expiresAtMs: number", "class: PlanClass"] {
             assert!(view.contains(field), "{field} missing from {view}");
         }
-        for decl in [&op_id, &event, &view] {
+        let subscription = SubscriptionId::decl(&cfg);
+        assert!(subscription.contains("number"), "{subscription}");
+        let subscribed = Subscribed::decl(&cfg);
+        for field in ["subscription: SubscriptionId", "replay: Array<OpEvent>"] {
+            assert!(
+                subscribed.contains(field),
+                "{field} missing from {subscribed}"
+            );
+        }
+        for decl in [&op_id, &event, &view, &subscription, &subscribed] {
             assert!(!decl.contains("bigint"), "{decl}");
         }
     }

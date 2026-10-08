@@ -20,6 +20,8 @@ pub const AUTH_BUSY: &str = "apprafter::desktop::auth_busy";
 pub const SETTINGS_IO: &str = "apprafter::desktop::settings_io";
 /// A bug in the desktop, e.g. a panicked operation.
 pub const INTERNAL: &str = "apprafter::desktop::internal";
+/// The app is quitting: nothing new starts, and a plan that would have is dropped.
+pub const CLOSING: &str = "apprafter::desktop::closing";
 
 /// Every code above, once.
 pub const ALL: &[&str] = &[
@@ -32,6 +34,7 @@ pub const ALL: &[&str] = &[
     AUTH_BUSY,
     SETTINGS_IO,
     INTERNAL,
+    CLOSING,
 ];
 
 #[cfg(test)]
@@ -42,7 +45,7 @@ mod tests {
 
     #[test]
     fn every_code_is_listed_once_under_the_desktop_prefix() {
-        assert_eq!(ALL.len(), 9);
+        assert_eq!(ALL.len(), 10);
         let unique: BTreeSet<_> = ALL.iter().collect();
         assert_eq!(unique.len(), ALL.len(), "{ALL:?}");
         for code in ALL {
@@ -58,6 +61,7 @@ mod tests {
             AUTH_BUSY,
             SETTINGS_IO,
             INTERNAL,
+            CLOSING,
         ] {
             assert!(ALL.contains(&code), "{code} is not in ALL");
         }

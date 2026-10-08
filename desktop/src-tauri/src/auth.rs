@@ -2,7 +2,8 @@
 //! Device-owner authentication, behind one trait so the lock and the destructive-op gesture
 //! never depend on an OS. The real backends are D.2d. Until then a release build has
 //! [`NoAuthenticator`] — unavailable, so the lock fails closed (it cannot be enabled) — and a
-//! test build has [`FakeAuthenticator`].
+//! test build has `FakeAuthenticator` (compiled only with the `test-build` feature, so no
+//! link: a doc build without the feature would not find it).
 
 use apprafter_core::CancellationToken;
 use apprafter_desktop_ipc::{AuthInfo, AuthOutcome, UnavailableReason};

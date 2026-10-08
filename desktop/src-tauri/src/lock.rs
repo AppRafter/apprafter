@@ -84,8 +84,8 @@ struct Inner {
 
 struct Prompt {
     cancel: CancellationToken,
-    /// Set, under the machine's lock, when a lock closed the prompt: its answer no longer
-    /// counts. The token trips on another thread, so this flag — not the token — decides,
+    /// Set, under the machine's lock, when a lock or a quit closed the prompt: its answer no
+    /// longer counts. The token trips on another thread, so this flag — not the token — decides,
     /// and a `Verified` that arrives before the token has tripped does not unlock either.
     closed: bool,
 }
@@ -167,12 +167,7 @@ impl LockMachine {
         let close = {
             let mut inner = self.lock_inner();
             if inner.reason.is_some() {
-                inner.prompt.as_mut().and_then(|prompt| {
-                    (!prompt.closed).then(|| {
-                        prompt.closed = true;
-                        prompt.cancel.clone()
-                    })
-                })
+                close_open_prompt(&mut inner)
             } else {
                 if in_effect(&inner.settings, &info) {
                     self.enter(&mut inner, &info, Some(reason), now);
@@ -180,11 +175,16 @@ impl LockMachine {
                 None
             }
         };
-        if let Some(cancel) = close {
-            // Off this thread: `cancel` runs the backend's callbacks on the calling thread and
-            // re-raises the first one's panic, and the caller may be the main thread.
-            crate::ops::trip(cancel, "lock-cancel");
-        }
+        trip_prompt(close);
+    }
+
+    /// Quit: close an open unlock prompt, as the [`Authenticator`] promises the app does, so
+    /// that a `Verified` arriving after this returns — even before the dialog has closed —
+    /// does not unlock (its `unlock` answers `AuthCancelled`). Nothing else changes; with no
+    /// prompt open it does nothing.
+    pub fn close_prompt(&self) {
+        let close = close_open_prompt(&mut self.lock_inner());
+        trip_prompt(close);
     }
 
     /// Ask the owner, and unlock if the OS verifies them. Blocks until the prompt answers
@@ -288,6 +288,25 @@ impl LockMachine {
 
     fn lock_inner(&self) -> MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
+/// Mark the open unlock prompt closed, under the machine's lock: from here its answer does not
+/// count. Its token, to close the dialog, unless it was closed already.
+fn close_open_prompt(inner: &mut Inner) -> Option<CancellationToken> {
+    inner.prompt.as_mut().and_then(|prompt| {
+        (!prompt.closed).then(|| {
+            prompt.closed = true;
+            prompt.cancel.clone()
+        })
+    })
+}
+
+/// Close the dialog, off this thread: `cancel` runs the backend's callbacks on the calling
+/// thread and re-raises the first one's panic, and the caller may be the main thread.
+fn trip_prompt(cancel: Option<CancellationToken>) {
+    if let Some(cancel) = cancel {
+        crate::ops::trip(cancel, "lock-cancel");
     }
 }
 
@@ -870,6 +889,89 @@ mod tests {
         );
         assert_eq!(r.machine.state(), locked(LockReason::Startup, T0, Some(10)));
         assert!(r.hooked.calls().is_empty());
+        for token in held {
+            token.cancel();
+        }
+    }
+
+    #[test]
+    fn a_quit_closes_the_open_prompt_and_a_late_yes_does_not_unlock() {
+        let (prompt, ends) = HeldPrompt::new();
+        let r = rig(Settings::default(), prompt);
+        let first = unlock_in_background(&r.machine);
+        ends.opened.recv_timeout(LONG).expect("the prompt opened");
+        r.machine.close_prompt();
+        ends.tripped
+            .recv_timeout(LONG)
+            .expect("the quit closed the prompt");
+        ends.answer.send(AuthOutcome::Verified).unwrap();
+        let result = first.recv_timeout(LONG).expect("the unlock returned");
+        assert!(
+            matches!(result, Err(DesktopError::AuthCancelled)),
+            "{result:?}"
+        );
+        assert_eq!(r.machine.state(), locked(LockReason::Startup, T0, Some(10)));
+        assert!(r.hooked.calls().is_empty());
+    }
+
+    #[test]
+    fn a_yes_that_beats_the_quits_closing_thread_does_not_unlock_either() {
+        let (prompt, ends) = HeldPrompt::new();
+        let r = rig(Settings::default(), prompt);
+        let first = unlock_in_background(&r.machine);
+        ends.opened.recv_timeout(LONG).expect("the prompt opened");
+        // As with a lock: the token trips on a thread of its own, held back here so the OS
+        // answers yes after `close_prompt` returned and before the dialog closed.
+        let ((), held) = {
+            let machine = r.machine.clone();
+            within("close_prompt", move || {
+                test_trips::held(|| machine.close_prompt())
+            })
+        };
+        assert_eq!(held.len(), 1, "the quit closes the prompt");
+        assert!(
+            ends.tripped.try_recv().is_err(),
+            "held back, the token has not tripped"
+        );
+        ends.answer.send(AuthOutcome::Verified).unwrap();
+        let result = first.recv_timeout(LONG).expect("the unlock returned");
+        assert!(
+            matches!(result, Err(DesktopError::AuthCancelled)),
+            "{result:?}"
+        );
+        assert_eq!(r.machine.state(), locked(LockReason::Startup, T0, Some(10)));
+        assert!(r.hooked.calls().is_empty());
+        for token in held {
+            token.cancel();
+        }
+    }
+
+    #[test]
+    fn closing_the_prompt_with_none_open_changes_nothing() {
+        for settings in [Settings::default(), unlocked_at_start()] {
+            let r = rig(settings, fake());
+            let before = r.machine.state();
+            let ((), held) = test_trips::held(|| r.machine.close_prompt());
+            assert!(held.is_empty(), "no prompt, nothing to close");
+            assert_eq!(r.machine.state(), before);
+            assert!(r.hooked.calls().is_empty());
+        }
+        // A prompt closed once is not closed again (its token trips once).
+        let (prompt, ends) = HeldPrompt::new();
+        let r = rig(Settings::default(), prompt);
+        let first = unlock_in_background(&r.machine);
+        ends.opened.recv_timeout(LONG).expect("the prompt opened");
+        let ((), held) = test_trips::held(|| {
+            r.machine.close_prompt();
+            r.machine.close_prompt();
+            r.machine.lock(LockReason::OsSession);
+        });
+        assert_eq!(held.len(), 1);
+        ends.answer.send(AuthOutcome::Verified).unwrap();
+        assert!(matches!(
+            first.recv_timeout(LONG).expect("the unlock returned"),
+            Err(DesktopError::AuthCancelled)
+        ));
         for token in held {
             token.cancel();
         }

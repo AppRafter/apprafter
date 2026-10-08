@@ -69,6 +69,13 @@ pub enum DesktopError {
     #[diagnostic(code(apprafter::desktop::internal))]
     Internal(String),
 
+    #[error("AppRafter is quitting")]
+    #[diagnostic(
+        code(apprafter::desktop::closing),
+        help("Nothing new starts while AppRafter quits; start it again to continue.")
+    )]
+    Closing,
+
     #[error(transparent)]
     #[diagnostic(transparent)]
     Core(#[from] CoreError),
@@ -109,6 +116,7 @@ impl DesktopError {
             | DesktopError::AuthBusy
             | DesktopError::SettingsIo(_)
             | DesktopError::Internal(_)
+            | DesktopError::Closing
             | DesktopError::Core(_) => {}
         }
         ui
@@ -140,6 +148,7 @@ mod tests {
             DesktopError::AuthBusy,
             DesktopError::SettingsIo("disk full".into()),
             DesktopError::Internal("bug".into()),
+            DesktopError::Closing,
         ]
     }
 
@@ -154,6 +163,7 @@ mod tests {
             DesktopError::AuthBusy => errors::AUTH_BUSY,
             DesktopError::SettingsIo(_) => errors::SETTINGS_IO,
             DesktopError::Internal(_) => errors::INTERNAL,
+            DesktopError::Closing => errors::CLOSING,
             DesktopError::Core(_) => return None,
         })
     }
@@ -205,6 +215,7 @@ mod tests {
             DesktopError::Locked,
             DesktopError::AuthCancelled,
             DesktopError::AuthBusy,
+            DesktopError::Closing,
         ] {
             assert!(e.to_ui().fields.is_empty(), "{e:?}");
         }
