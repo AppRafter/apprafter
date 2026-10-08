@@ -16,6 +16,10 @@
 //! - cancellation is a [`CancellationToken`] per operation, never a process
 //!   signal handler.
 
+pub mod cancel;
 pub mod env;
+pub mod error;
 
+pub use cancel::Cancelled;
 pub use env::{EnvSource, MapEnv};
+pub use error::{CoreError, CoreResult, UiError};
