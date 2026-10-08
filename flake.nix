@@ -114,6 +114,10 @@
         # (`bun run tauri`), NOT nixpkgs' cargo-tauri (one minor behind): tauri-cli
         # refuses a build whose crate and @tauri-apps/api minors disagree. Rust comes
         # from rustup (desktop/rust-toolchain.toml), which nixpkgs' rustc would ignore.
+        # bun comes from mise (mise.toml pins 1.4) or the user's own install, the same
+        # way: nixpkgs' bun is 1.3 at the locked rev and cannot read desktop/bun.lock
+        # (lockfileVersion 2, written by bun 1.4). The shellHook warns, never fails,
+        # when the bun on PATH is not 1.4.x.
         desktopShell = pkgs.mkShell {
           name = "apprafter-desktop";
           nativeBuildInputs = with pkgs; [ pkg-config wrapGAppsHook3 ];
@@ -121,13 +125,32 @@
             webkitgtk_4_1 gtk3 libsoup_3 librsvg glib-networking
             libayatana-appindicator gsettings-desktop-schemas dbus
           ];
-          packages = with pkgs; [ cuePinned bun just jq git xvfb-run ];
+          packages = with pkgs; [ cuePinned just jq git xvfb-run ];
           shellHook = ''
             # GTK file chooser and HiDPI scale need the schemas (NixOS wiki, Tauri).
             export XDG_DATA_DIRS="$GSETTINGS_SCHEMAS_PATH''${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}"
             export GIO_MODULE_DIR="${pkgs.glib-networking}/lib/gio/modules/"
-            # libappindicator-sys dlopen()s libayatana-appindicator3 at run time.
-            export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath [ pkgs.libayatana-appindicator ]}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            # Every library the app loads, PREPENDED. Rust >= 1.90 links x86_64-linux-gnu
+            # with its bundled rust-lld, which bypasses nixpkgs' ld-wrapper, so a binary
+            # built in this shell gets no RUNPATH into /nix/store and dies with
+            # `libgobject-2.0.so.0: cannot open shared object file`. Prepended, not
+            # appended: an ambient LD_LIBRARY_PATH (a NixOS user profile) can carry a
+            # DIFFERENT webkitgtk build, and that one must not win. libappindicator-sys
+            # also dlopen()s libayatana-appindicator3 at run time. (atk ships inside
+            # at-spi2-core.)
+            export LD_LIBRARY_PATH="${
+              pkgs.lib.makeLibraryPath (
+                with pkgs;
+                [
+                  webkitgtk_4_1 gtk3 libsoup_3 glib cairo pango gdk-pixbuf harfbuzz
+                  at-spi2-core librsvg dbus libayatana-appindicator
+                ]
+              )
+            }''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            case "$(bun --version 2>/dev/null)" in
+              1.4.*) ;;
+              *) echo "apprafter-desktop: desktop/bun.lock needs bun 1.4.x, found '$(bun --version 2>/dev/null || echo none)' — install it with mise (mise.toml) or from bun.sh" >&2 ;;
+            esac
           '';
         };
       in
