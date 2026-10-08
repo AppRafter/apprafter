@@ -365,6 +365,20 @@ fn expr_attrs(e: &Expr) -> &[Attribute] {
     }
 }
 
+/// The expression a statement's attributes are attached to. syn hangs
+/// them on the leftmost operand, not on the expression the statement is:
+/// `#[cfg(test)] x = y;` parses as an `Assign` whose `left` carries the
+/// `cfg`, and so do a `Binary`'s `left` and a `Cast`'s `expr`, at any
+/// depth (`#[cfg(test)] a + b as u8 == c;` gates `a`).
+fn leftmost_operand(e: &Expr) -> &Expr {
+    match e {
+        Expr::Assign(x) => leftmost_operand(&x.left),
+        Expr::Binary(x) => leftmost_operand(&x.left),
+        Expr::Cast(x) => leftmost_operand(&x.expr),
+        _ => e,
+    }
+}
+
 /// The directory a file's out-of-line `mod x;` declarations live in.
 fn module_dir(file: &Path) -> PathBuf {
     let parent = file.parent().unwrap_or_else(|| Path::new(""));
@@ -701,7 +715,9 @@ impl<'ast, 'f> Visit<'ast> for Scanner<'f> {
         let gated = match s {
             Stmt::Local(l) => cfg_implies_test(&l.attrs),
             Stmt::Macro(m) => cfg_implies_test(&m.attrs),
-            Stmt::Expr(e, _) => cfg_implies_test(expr_attrs(e)),
+            Stmt::Expr(e, _) => {
+                cfg_implies_test(expr_attrs(e)) || cfg_implies_test(expr_attrs(leftmost_operand(e)))
+            }
             Stmt::Item(_) => false,
         };
         if !gated {
@@ -1143,6 +1159,28 @@ fn f() -> Option<String> {
 }
 ";
         assert_eq!(hits(src), vec![read("std::env::var", 8)]);
+    }
+
+    /// syn hangs a statement's attributes on its leftmost operand, not on
+    /// the assignment, binary or cast expression the statement is.
+    #[test]
+    fn a_test_gated_assignment_binary_or_cast_statement_is_skipped() {
+        let src = "\
+fn f(mut x: Option<String>) -> bool {
+    #[cfg(test)]
+    x = std::env::var(\"A\").ok();
+    #[cfg(test)]
+    x.is_some() && std::env::var(\"B\").is_ok();
+    #[cfg(test)]
+    std::env::var(\"C\").is_ok() as u8;
+    #[cfg(test)]
+    std::env::var(\"D\").map(|v| v.len()).unwrap_or(0) as u32 + 1;
+    #[cfg(test)]
+    1 + 2 * 3 == std::env::var(\"E\").map(|v| v.len()).unwrap_or(0) as i32;
+    std::env::var(\"F\").is_ok()
+}
+";
+        assert_eq!(hits(src), vec![read("std::env::var", 12)]);
     }
 
     #[test]
