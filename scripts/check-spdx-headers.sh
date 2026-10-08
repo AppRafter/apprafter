@@ -47,6 +47,24 @@ PATTERNS=(
   'providers/**/*.rs'
   'backstage-plugins/**/*.ts'
   'backstage-plugins/**/*.tsx'
+  # AppRafter Desktop (ADR 0067) — core licence. ONE `*`, on purpose: in a git pathspec
+  # without :(glob) magic `*` crosses `/`, so `desktop/*.ts` covers desktop/vite.config.ts AND
+  # desktop/src/**, while `desktop/**/*.ts` would skip every top-level file. Generated ts-rs
+  # files under desktop/src/ipc/generated/ carry the header (the export prepends it).
+  # JSON (package.json, tsconfig.json, biome.json) cannot carry one; json5 can. The SVG
+  # icon source is hand-written and carries one; the rasters generated from it cannot.
+  'desktop/*.rs'
+  'desktop/*.ts'
+  'desktop/*.tsx'
+  'desktop/*.js'
+  'desktop/*.mjs'
+  'desktop/*.css'
+  'desktop/*.html'
+  'desktop/*.toml'
+  'desktop/*.json5'
+  'desktop/*.svg'
+  # The committed Claude Design export is upstream's file, kept verbatim.
+  ':(exclude)desktop/design-source/*'
   # Platform manifests
   'manifests/**/*.yaml'
   'manifests/**/*.yml'
