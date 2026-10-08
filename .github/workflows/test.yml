@@ -109,19 +109,25 @@ jobs:
   # a check that never comes — and when nothing under cli/ changed, the
   # skipped matrix reports one check with its name's expression unexpanded.
   # This job passes when every leg passed, or when the matrix was skipped
-  # because nothing under cli/ changed, and fails otherwise.
+  # because nothing under cli/ changed, and fails otherwise. "Skipped" is
+  # only that when the change detection itself succeeded: a failed
+  # `changes` job skips the matrix too, and must not read as a pass.
   rust-cli-result:
     name: cargo test cli/
-    needs: rust-cli
+    needs: [changes, rust-cli]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
       - name: every leg of the matrix passed
         env:
+          CHANGES: ${{ needs.changes.result }}
           RESULT: ${{ needs.rust-cli.result }}
         run: |
-          echo "rust-cli: $RESULT"
+          echo "changes: $CHANGES, rust-cli: $RESULT"
+          if [ "$CHANGES" != success ]; then
+            exit 1
+          fi
           case "$RESULT" in
             success | skipped) ;;
             *) exit 1 ;;
