@@ -109,8 +109,12 @@
 //! is returned ([`note_child_exit`]), and the next step refuses as it would
 //! after the event; should no event follow, the command's thread starts the
 //! stop itself once it has unwound ([`StopGuard`]). Restic children are not
-//! checked this way yet: they run through `backup_core`, which moves with
-//! the backup commands (WI-439).
+//! checked this way yet, and this check would not catch them: they start
+//! from `backup_core` and also directly here (`restore`'s `restic_stdout`
+//! and `run_restic_restore`, `backup`'s `CredentialedRestic` and its repo
+//! probes), and restic, a Go program, handles the Ctrl-C itself and exits
+//! 130, not `STATUS_CONTROL_C_EXIT`. The restic case lands with D.11, with
+//! a check of its own.
 //!
 //! The in-cluster runner has its own, different stop (`apprafter-backup`'s
 //! `stop` module): it is PID 1 of a Job's pod, is stopped by SIGTERM at its
@@ -1928,8 +1932,9 @@ mod tests {
     /// a second Ctrl-Break comes. The process exits at once with 130 and
     /// leaves no copy behind.
     ///
-    /// No kubectl stand-in: on Windows `Command` starts only an `.exe`, so a
-    /// script cannot stand in for one, and the copy is recorded by the child
+    /// No kubectl stand-in: on Windows a bare `kubectl` resolves only to
+    /// `kubectl.exe` (`cli_core::tools::executable_names`), so a script
+    /// cannot stand in for one, and the copy is recorded by the child
     /// itself, as the stop records its own ([`private_copy`]). Without the
     /// second event the stop would run on for seconds and leave the copy.
     #[cfg(windows)]

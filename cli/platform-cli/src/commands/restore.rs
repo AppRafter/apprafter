@@ -7522,9 +7522,6 @@ mod tests {
     // restic invocation results
     // =======================================================================
 
-    /// A non-zero restic exit MUST become an error: the steps that follow read
-    /// the restored tree off disk, so a swallowed failure leaves an empty tree
-    /// and reports a successful restore over nothing.
     /// An `ExitStatus` that exited with `code`, on either platform.
     fn exit_status(code: i32) -> std::process::ExitStatus {
         #[cfg(unix)]
@@ -7538,6 +7535,9 @@ mod tests {
         std::process::ExitStatus::from_raw(raw)
     }
 
+    /// A non-zero restic exit MUST become an error: the steps that follow read
+    /// the restored tree off disk, so a swallowed failure leaves an empty tree
+    /// and reports a successful restore over nothing.
     #[test]
     fn restic_output_to_result_yields_stdout_or_an_error_carrying_stderr() {
         let argv = vec!["snapshots".to_string(), "--json".to_string()];
