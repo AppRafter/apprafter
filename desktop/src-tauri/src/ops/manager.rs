@@ -610,6 +610,22 @@ impl OperationManager {
 
     /// A page reloaded or closed: the sinks that delivered to it go.
     pub fn drop_subscribers_of(&self, webview: &str) {
+        self.drop_subscribers_where(|s| s.sink.webview() == webview);
+    }
+
+    /// The app locked or unlocked: every subscription ends, on every plan, prompt and
+    /// operation, and its sink receives nothing more. A locked page must not receive an
+    /// operation's output, and the page cannot unsubscribe while locked (the gate refuses
+    /// `op_unsubscribe`): it subscribes again once unlocked, so a sink kept across the lock
+    /// would deliver every event twice. The operations run on, and their replays stay whole
+    /// for that new subscription.
+    pub fn drop_all_subscribers(&self) {
+        self.drop_subscribers_where(|_| true);
+    }
+
+    /// The sinks dropped here are dropped under the lock, as everywhere: a sink never calls
+    /// back into the manager.
+    fn drop_subscribers_where(&self, gone: impl Fn(&Subscriber) -> bool) {
         let mut inner = self.lock();
         let Inner {
             pending,
@@ -623,7 +639,7 @@ impl OperationManager {
             .chain(prompts.values_mut().map(|p| &mut p.sinks))
             .chain(ops.values_mut().map(|op| &mut op.sinks));
         for sinks in all {
-            sinks.retain(|s| s.sink.webview() != webview);
+            sinks.retain(|s| !gone(s));
         }
     }
 
@@ -1937,6 +1953,63 @@ mod tests {
         assert_eq!(
             other.events(),
             vec![staged(1), staged(2), completed(json!(null))]
+        );
+    }
+
+    #[test]
+    fn dropping_every_subscriber_silences_them_all_and_the_op_runs_on_with_its_replay() {
+        let (_, mgr) = manager();
+        let auth = FakeAuthenticator::new();
+        let (half_tx, half_rx) = mpsc::channel();
+        let (open, gate) = gate();
+        let running = mgr.register_plan(
+            parts(PlanClass::Bounded),
+            Box::new(move |r, _| {
+                r.report(stage(1));
+                half_tx.send(()).unwrap();
+                gate.wait();
+                r.report(stage(2));
+                complete(json!(null))
+            }),
+        );
+        let main = VecSink::new("main");
+        let other = VecSink::new("other");
+        mgr.subscribe(running.op_id, main.clone()).unwrap();
+        mgr.subscribe(running.op_id, other.clone()).unwrap();
+        mgr.execute(running.op_id, &auth).unwrap();
+        half_rx.recv_timeout(LONG).unwrap();
+        // A plan and an open prompt have subscribers too.
+        let plan = mgr.register_plan(parts(PlanClass::Bounded), returns(json!(0)));
+        let on_plan = VecSink::new("main");
+        mgr.subscribe(plan.op_id, on_plan.clone()).unwrap();
+        let (prompt, opened, answer) = held_prompt();
+        let asked = mgr.register_plan(parts(PlanClass::Destructive), returns(json!(1)));
+        let on_prompt = VecSink::new("main");
+        mgr.subscribe(asked.op_id, on_prompt.clone()).unwrap();
+        let executing = execute_in_background(&mgr, asked.op_id, prompt);
+        opened.recv_timeout(LONG).expect("the prompt opened");
+
+        mgr.drop_all_subscribers();
+        open.send(()).unwrap();
+        assert_eq!(wait_ended(&mgr, running.op_id), OpState::Finished);
+        answer.send(AuthOutcome::Verified).unwrap();
+        executing
+            .recv_timeout(LONG)
+            .expect("execute returned")
+            .unwrap();
+        wait_ended(&mgr, asked.op_id);
+        // A plan dropped later tells its pages why: none is left to tell.
+        mgr.drop_all_plans();
+
+        assert_eq!(main.events(), vec![staged(1)], "nothing after the drop");
+        assert_eq!(other.events(), vec![staged(1)], "nothing after the drop");
+        assert_eq!(on_plan.sends(), 0);
+        assert_eq!(on_prompt.sends(), 0);
+        let again = VecSink::new("main");
+        assert_eq!(
+            mgr.subscribe(running.op_id, again.clone()).unwrap().replay,
+            vec![staged(1), staged(2), completed(json!(null))],
+            "the replay holds what the dropped pages missed"
         );
     }
 

@@ -107,12 +107,21 @@ impl Stop {
 
 impl Shell {
     /// The shell over `settings`, its lock starting as they say. Every lock transition — to
-    /// locked and to unlocked — drops every pending plan and then calls `on_lock_change` with
-    /// the new state (the app emits [`LOCK_CHANGED`]). Both run under the lock machine's lock:
-    /// neither may call back into it.
+    /// locked and to unlocked — drops every pending plan, then ends every operation
+    /// subscription, then calls `on_lock_change` with the new state (the app emits
+    /// [`LOCK_CHANGED`]). All three run under the lock machine's lock: none may call back
+    /// into it.
     ///
-    /// The plans go on an unlock too: a plan registered by a command that passed the guard
-    /// just before a lock would otherwise survive the lock and be executable after it.
+    /// A lock ends the subscriptions because a locked page must receive nothing, and it
+    /// cannot unsubscribe (the gate refuses `op_unsubscribe`): the shell unmounts on a lock and
+    /// subscribes again after the unlock, from the replay, so a sink kept across the lock
+    /// would show every later event twice. The operations themselves run on.
+    ///
+    /// Both go on an unlock too: a plan registered, or a subscription made, by a command that
+    /// passed the guard just before a lock lands after the lock's sweep, and would otherwise
+    /// survive it — a plan executable after the lock, a sink that doubles the page's output.
+    /// Nothing else can subscribe while locked, and the page subscribes again only once it
+    /// hears of the unlock, after this ran.
     pub fn new(
         settings: SettingsStore,
         auth: Arc<dyn Authenticator>,
@@ -126,6 +135,7 @@ impl Shell {
             let ops = ops.clone();
             Box::new(move |state: &LockState| {
                 ops.drop_all_plans();
+                ops.drop_all_subscribers();
                 on_lock_change(state);
             })
         };
@@ -387,7 +397,7 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use apprafter_core::{CancellationToken, Context, Outcome, PlanClass};
+    use apprafter_core::{CancellationToken, Context, Event, Outcome, PlanClass};
     use apprafter_desktop_ipc::{
         errors, AuthInfo, AuthOutcome, AutoLock, CancelledBy, LockReason, LockState, OpEvent, OpId,
         Settings,
@@ -495,6 +505,101 @@ mod tests {
         let notified = r.notified.lock().unwrap().clone();
         assert_eq!(notified.len(), 2, "{notified:?}");
         assert!(notified[0].locked && !notified[1].locked);
+    }
+
+    fn stage(index: u32) -> OpEvent {
+        OpEvent::Stage {
+            index,
+            total: 2,
+            title: format!("step {index}"),
+        }
+    }
+
+    /// Waits until `done` holds; a test that waits longer than `LONG` fails.
+    fn wait_until(what: &str, done: impl Fn() -> bool) {
+        let deadline = Instant::now() + LONG;
+        while !done() {
+            assert!(Instant::now() < deadline, "{what} never happened");
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// A plan whose operation reports stage 1 at once, then stage 2 and its end once the
+    /// sender returned with its id sends.
+    fn two_stages(shell: &Shell) -> (OpId, mpsc::Sender<()>) {
+        let (next, wait) = mpsc::channel::<()>();
+        let exec: Executor = Box::new(move |r, _| {
+            r.report(Event::Stage {
+                index: 1,
+                total: 2,
+                title: "step 1".into(),
+            });
+            let _ = wait.recv_timeout(LONG);
+            r.report(Event::Stage {
+                index: 2,
+                total: 2,
+                title: "step 2".into(),
+            });
+            Ok(Outcome::Completed { result: json!(2) })
+        });
+        let id = shell
+            .ops
+            .register_plan(
+                PlanParts::new(PlanClass::Bounded, "Upgrade", "upgrade"),
+                exec,
+            )
+            .op_id;
+        (id, next)
+    }
+
+    fn finished() -> OpEvent {
+        OpEvent::Finished {
+            outcome: Outcome::Completed { result: json!(2) },
+        }
+    }
+
+    #[test]
+    fn a_lock_ends_every_subscription_and_a_page_catches_up_after_the_unlock() {
+        let r = rig(unlocked_at_start(), Arc::new(FakeAuthenticator::new()));
+        let (id, next) = two_stages(&r.shell);
+        let page = Arc::new(Sink::default());
+        r.shell.execute(id, page.clone()).unwrap();
+        wait_until("stage 1 reached the page", || {
+            page.0.lock().unwrap().contains(&stage(1))
+        });
+
+        assert!(r.shell.lock_now().locked);
+        // The operation runs on, and ends, while the app is locked.
+        next.send(()).unwrap();
+        wait_until("the operation ended", || r.shell.ops.running() == 0);
+        assert_eq!(
+            *page.0.lock().unwrap(),
+            vec![stage(1)],
+            "a locked page receives nothing"
+        );
+
+        r.shell.unlock().unwrap();
+        // The page subscribes again, once: what it missed is in the replay.
+        let again = Arc::new(Sink::default());
+        let subscribed = r.shell.ops.subscribe(id, again).unwrap();
+        assert_eq!(subscribed.replay, vec![stage(1), stage(2), finished()]);
+        assert_eq!(*page.0.lock().unwrap(), vec![stage(1)], "never twice");
+    }
+
+    #[test]
+    fn a_subscription_that_lands_while_locked_ends_with_the_unlock() {
+        // `op_subscribe` passed the gate just before a lock, and its subscription landed after
+        // the lock had ended every other: the unlock ends it, as the page subscribes afresh.
+        let r = rig(unlocked_at_start(), Arc::new(FakeAuthenticator::new()));
+        let (id, next) = two_stages(&r.shell);
+        r.shell.execute(id, Arc::new(Sink::default())).unwrap();
+        assert!(r.shell.lock_now().locked);
+        let raced = Arc::new(Sink::default());
+        r.shell.ops.subscribe(id, raced.clone()).unwrap();
+        r.shell.unlock().unwrap();
+        next.send(()).unwrap();
+        wait_until("the operation ended", || r.shell.ops.running() == 0);
+        assert!(raced.0.lock().unwrap().is_empty(), "{:?}", raced.0);
     }
 
     #[test]

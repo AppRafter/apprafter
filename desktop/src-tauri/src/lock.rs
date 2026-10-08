@@ -52,8 +52,9 @@ use crate::ops::{panic_message, Clock, Stamp};
 const MINUTE_MS: u64 = 60_000;
 
 /// Called on every transition between locked and unlocked, with the new state; the app drops
-/// pending plans and emits `lock-changed`. It runs under the machine's lock, so it must be
-/// quick and must never call back into the machine (see the module docs for the lock order).
+/// pending plans, ends every operation subscription and emits `lock-changed`. It runs under
+/// the machine's lock, so it must be quick and must never call back into the machine (see the
+/// module docs for the lock order).
 /// A panic in it is caught and logged: the transition stands, and whoever made it — the idle
 /// ticker among them — goes on.
 pub type LockHook = Box<dyn Fn(&LockState) + Send + Sync>;

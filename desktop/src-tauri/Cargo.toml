@@ -55,6 +55,9 @@ whoami                = "~2.1"
 [dev-dependencies]
 # The mock runtime for tests/ipc_mock.rs.
 tauri       = { workspace = true, features = ["test"] }
+# tests/ipc_mock.rs reads capabilities/main.json5 as Tauri does: the version tauri-utils parses
+# it with (`config-json5`), already in the lock.
+json5       = "0.4"
 # tests/env_guard.rs reads src/ as syntax trees, not text: versions already in the lock (as in
 # apprafter-core's guard); `span-locations` gives its findings their line numbers.
 proc-macro2 = { version = "1", features = ["span-locations"] }

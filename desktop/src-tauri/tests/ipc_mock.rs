@@ -7,6 +7,9 @@
 //! capability is refused before the gate, and one missing from `generate_handler!` answers
 //! `Command <name> not found` — the first test catches both.
 
+use std::collections::BTreeSet;
+use std::fs;
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use std::sync::Arc;
 
@@ -175,6 +178,73 @@ fn every_command_is_registered_and_allowed_and_a_quit_starts_nothing_new() {
     );
     assert_eq!(code(&reply), Some(errors::CLOSING), "{reply:?}");
     assert_eq!(ran.load(SeqCst), 0);
+}
+
+/// Plugin commands never reach the app's invoke handler, so the lock gate never sees them:
+/// the capability is all that stands between a page and a plugin command. Pinned here for
+/// three a page could misuse — forging an event (`lock-changed` among them), closing the
+/// window past the quit, reading the app's details — each refused by the ACL.
+#[test]
+fn plugin_commands_beyond_listen_and_unlisten_are_refused_by_the_acl() {
+    let rig = rig(lock_off());
+    for cmd in [
+        "plugin:event|emit",
+        "plugin:window|close",
+        "plugin:app|version",
+    ] {
+        match invoke(&rig, cmd, json!({})) {
+            Err(Value::String(error)) => assert!(
+                error.contains("not allowed"),
+                "{cmd} was not refused by the ACL: {error}"
+            ),
+            other => panic!("{cmd} was not refused by the ACL: {other:?}"),
+        }
+    }
+    // The control: `listen` is granted, so it passes the ACL and fails only on its (empty)
+    // arguments.
+    match invoke(&rig, "plugin:event|listen", json!({})) {
+        Err(Value::String(error)) => {
+            assert!(
+                !error.contains("not allowed"),
+                "listen was refused: {error}"
+            );
+            assert!(error.contains("invalid args"), "{error}");
+        }
+        other => panic!("listen with no arguments: {other:?}"),
+    }
+}
+
+/// The capability, read as Tauri reads it: exactly `listen` and `unlisten` from the core, and
+/// the generated `allow-<command>` of every app command — nothing more, nothing less, once
+/// each. A permission added for a later step must be added here too, with its reason in the
+/// file.
+#[test]
+fn the_capability_grants_listen_unlisten_and_every_app_command_only() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("capabilities/main.json5");
+    let text = fs::read_to_string(&path).unwrap();
+    let capability: Value = json5::from_str(&text).unwrap();
+    let granted: Vec<&str> = capability["permissions"]
+        .as_array()
+        .expect("a permissions list")
+        .iter()
+        .map(|p| {
+            p.as_str()
+                .unwrap_or_else(|| panic!("a scoped permission: {p}"))
+        })
+        .collect();
+    let set: BTreeSet<String> = granted.iter().map(|p| p.to_string()).collect();
+    assert_eq!(set.len(), granted.len(), "a permission twice: {granted:?}");
+    let mut expected: BTreeSet<String> = ["core:event:allow-listen", "core:event:allow-unlisten"]
+        .map(String::from)
+        .into();
+    expected.extend(
+        COMMANDS
+            .iter()
+            .map(|cmd| format!("allow-{}", cmd.replace('_', "-"))),
+    );
+    assert_eq!(set, expected);
+    assert_eq!(capability["windows"], json!(["main"]));
+    assert_eq!(capability.get("remote"), None, "no remote origin");
 }
 
 #[test]

@@ -197,6 +197,7 @@ dependencies = [
  "apprafter-core",
  "apprafter-desktop-ipc",
  "cli-core",
+ "json5",
  "miette",
  "proc-macro2",
  "rustls",
