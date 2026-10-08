@@ -24,6 +24,8 @@ jobs:
       rust_cli: ${{ steps.filter.outputs.rust_cli }}
       rust_operator: ${{ steps.filter.outputs.rust_operator }}
       bun: ${{ steps.filter.outputs.bun }}
+      desktop: ${{ steps.filter.outputs.desktop }}
+      desktop_web: ${{ steps.filter.outputs.desktop_web }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
@@ -39,6 +41,34 @@ jobs:
             bun:
               - 'landing/**'
               - 'backstage-plugins/**'
+              - '.github/workflows/test.yml'
+            # AppRafter Desktop (ADR 0067). The Rust side builds apprafter-core by
+            # path, so its whole path-crate closure wakes it (`cargo tree -p
+            # apprafter-core -e normal,build` in cli/: apprafter-core, cli-core,
+            # cli-providers, backup-core); cli-providers/build.rs runs `cue export`
+            # over platform-stack/cue with the repo-root cue.mod/ and reads both
+            # operator Chart.yaml files.
+            desktop:
+              - 'desktop/**'
+              - 'cli/apprafter-core/**'
+              - 'cli/cli-core/**'
+              - 'cli/cli-providers/**'
+              - 'cli/backup-core/**'
+              - 'cli/Cargo.toml'
+              - 'cli/Cargo.lock'
+              - 'platform-stack/cue/**'
+              - 'cue.mod/**'
+              - 'scripts/cue'
+              - 'operator/charts/*/Chart.yaml'
+              - 'deny.toml'
+              - 'scripts/cargo-deny.sh'
+              - 'scripts/check-desktop-core-lock.sh'
+              - '.github/workflows/test.yml'
+            # The desktop's bun package; its CLI-coverage gate reads the
+            # generated CLI reference.
+            desktop_web:
+              - 'desktop/**'
+              - 'docs/reference/cli/commands.json'
               - '.github/workflows/test.yml'
 
   rust-cli:
@@ -150,6 +180,79 @@ jobs:
             *) exit 1 ;;
           esac
 
+  # AppRafter Desktop (ADR 0067) ships for Linux, macOS and Windows, so it is
+  # tested and built on all three. fail-fast off for the reason rust-cli gives.
+  rust-desktop:
+    name: cargo test desktop/ (${{ matrix.os }})
+    needs: changes
+    if: needs.changes.outputs.desktop == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    # A cold Tauri build on Windows takes 15–25 minutes.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - if: runner.os == 'Linux'
+        name: Install WebKitGTK / GTK (Tauri 2 Linux prerequisites)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential pkg-config file \
+            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
+      # cli/cli-providers/build.rs runs `cue export` — same reason as rust-cli.
+      - uses: cue-lang/setup-cue@b0e30e540a2dae47304ebf16586a5b2db023b61c # v2.0.0
+        with:
+          version: v0.17.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: "1.98"
+          components: clippy
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.4.x"
+      # Clippy runs here on macOS and Windows because lint.yml lints on Linux only.
+      - if: runner.os != 'Linux'
+        name: cargo clippy (macOS, Windows)
+        working-directory: desktop
+        shell: bash
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: cargo test
+        working-directory: desktop
+        shell: bash
+        run: cargo test --locked --all-features --no-fail-fast
+      # Evidence that the app builds on this OS: a debug binary, no installer.
+      - name: tauri build --debug --no-bundle
+        working-directory: desktop
+        shell: bash
+        run: |
+          bun install --frozen-lockfile
+          bun run tauri build --debug --no-bundle
+
+  # One check under the fixed name `cargo test desktop/`, whatever the matrix
+  # does — the same reasoning and logic as rust-cli-result above.
+  rust-desktop-result:
+    name: cargo test desktop/
+    needs: [changes, rust-desktop]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: every leg of the matrix passed
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          RESULT: ${{ needs.rust-desktop.result }}
+        run: |
+          echo "changes: $CHANGES, rust-desktop: $RESULT"
+          if [ "$CHANGES" != success ]; then
+            exit 1
+          fi
+          case "$RESULT" in
+            success | skipped) ;;
+            *) exit 1 ;;
+          esac
+
   rust-operator:
     name: cargo test operator/
     needs: changes
@@ -181,7 +284,7 @@ jobs:
   cargo-deny:
     name: cargo-deny (advisories, licences, sources)
     needs: changes
-    if: needs.changes.outputs.rust_cli == 'true' || needs.changes.outputs.rust_operator == 'true'
+    if: needs.changes.outputs.rust_cli == 'true' || needs.changes.outputs.rust_operator == 'true' || needs.changes.outputs.desktop == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -201,7 +304,7 @@ jobs:
   bun:
     name: bun test
     needs: changes
-    if: needs.changes.outputs.bun == 'true'
+    if: needs.changes.outputs.bun == 'true' || needs.changes.outputs.desktop_web == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -213,6 +316,8 @@ jobs:
           # walks the whole tree from the workspace root — running
           # again per child re-discovers the same suite and re-
           # installs deps for no gain.
+          # desktop/design-source/ is the design export, kept verbatim:
+          # nothing there is a package of ours.
           dirs=""
           while IFS= read -r pkg; do
             d="$(dirname "$pkg")"
@@ -224,6 +329,7 @@ jobs:
           done < <(find . -maxdepth 4 -name package.json \
               -not -path '*/node_modules/*' \
               -not -path '*/skeleton/*' \
+              -not -path './desktop/design-source/*' \
               | sort -u)
           dirs="$(echo "$dirs" | xargs)"
           if [ -n "$dirs" ]; then
