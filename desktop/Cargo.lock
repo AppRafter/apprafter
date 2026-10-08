@@ -197,6 +197,7 @@ dependencies = [
  "apprafter-core",
  "apprafter-desktop-ipc",
  "cli-core",
+ "dunce",
  "json5",
  "libc",
  "miette",

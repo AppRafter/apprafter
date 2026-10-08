@@ -31,9 +31,18 @@ use crate::settings::SettingsStore;
 /// In order: the async runtime and the crypto provider (before anything of Tauri's), the
 /// allow-listed environment and the core context, the app's identity and directories (a
 /// data-directory override moves every app directory and keys the single-instance lock on
-/// it), the app itself (the single-instance plugin first: a second launch only focuses the
-/// first window and exits; on macOS, the app menu), then the log, the settings and the shell,
-/// the tickers and, on Linux and macOS, the quit signals.
+/// it; one set but empty or not Unicode stops the start, [`exit_code`] 2), the app itself (the
+/// single-instance plugin first: a second launch only focuses the first window and exits; on
+/// macOS, the app menu), then the log, the settings and the shell, the tickers and, on Linux
+/// and macOS, the quit signals.
+///
+/// The log starts once the app is built, so a second launch, which exits while the plugins
+/// start, writes nothing to the running app's log. It is still up before the window: Tauri
+/// runs `setup`, which builds it, on the event loop's first event inside `App::run`, so a
+/// window or webview failure — and the panic Tauri makes of a `setup` error — reach the file.
+///
+/// With an override the webview's storage moves too, except on macOS 13: WKWebView keeps its
+/// own store, given one per override on macOS 14 and later only ([`window::build_main`]).
 ///
 /// Every way out the app is told of runs the quit sequence ([`app`]'s module docs): the
 /// event loop's exit request, a quit signal, and the event loop's exit itself, which an exit
@@ -43,18 +52,20 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     runtime::install_crypto();
     let env = AllowListEnv::from_process(cfg!(feature = "test-build"));
     let context = env::desktop_context(&env)?;
-    // Absolute against the working directory, as the CLI reads APPRAFTER_CONFIG_DIR: Tauri
-    // would resolve a relative override against the binary's directory instead.
-    let data_dir = env::data_dir_override(&env)
-        .map(std::path::absolute)
+    // Created and canonical (absolute against the working directory, as the CLI reads
+    // APPRAFTER_CONFIG_DIR — Tauri would resolve a relative one against the binary's
+    // directory), so every spelling of one directory is one instance on one set of files. A
+    // broken override stops the start here, before anything could use the owner's files.
+    let data_dir = env::data_dir_override(&env)?
+        .map(|dir| env::prepare_data_dir(&dir))
         .transpose()?;
 
     let mut tauri_context = tauri::generate_context!();
     let config = tauri_context.config_mut();
     config.identifier = env::instance_identifier(&config.identifier, data_dir.as_deref());
     if let Some(dir) = &data_dir {
-        // Config, data and local data (the webview's own storage too) are `dir`; the log
-        // goes to `dir/logs`.
+        // Config, data and local data are `dir`, and so is the webview's own storage on Linux
+        // and Windows (macOS: `window::build_main`); the log goes to `dir/logs`.
         config.app.app_directories_override = Some(AppDirectoriesOverride::Root(dir.clone()));
     }
 
@@ -63,9 +74,13 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             window::show_and_focus(app)
         }))
-        .setup(|app| {
-            window::build_main(app.handle())?;
-            Ok(())
+        .setup({
+            let data_dir = data_dir.clone();
+            move |app| {
+                window::build_main(app.handle(), data_dir.as_deref())?;
+                tracing::info!("the main window is open");
+                Ok(())
+            }
         });
     // Cmd+Q quits through the app, not through `terminate:` (see `menu`).
     #[cfg(target_os = "macos")]
@@ -121,6 +136,16 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// The process's exit code when [`run`] returns `error`: 2 for a data-directory override the
+/// app refuses ([`env::DataDirError`]), a usage error like the CLI's; 1 for anything else.
+pub fn exit_code(error: &(dyn Error + 'static)) -> i32 {
+    if error.is::<env::DataDirError>() {
+        2
+    } else {
+        1
+    }
+}
+
 /// Until the OS backends (D.2d): the scripted fake in a test build, and in a release nothing —
 /// so the lock and every gesture fail closed.
 fn authenticator() -> Arc<dyn Authenticator> {
@@ -129,4 +154,19 @@ fn authenticator() -> Arc<dyn Authenticator> {
     #[cfg(not(feature = "test-build"))]
     let auth: Arc<dyn Authenticator> = Arc::new(auth::NoAuthenticator);
     auth
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error;
+
+    use crate::env::DataDirError;
+
+    #[test]
+    fn a_refused_data_dir_exits_2_and_anything_else_1() {
+        let refused: Box<dyn Error> = Box::new(DataDirError::Empty);
+        assert_eq!(super::exit_code(&*refused), 2);
+        let other: Box<dyn Error> = "the app could not be built".into();
+        assert_eq!(super::exit_code(&*other), 1);
+    }
 }

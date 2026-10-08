@@ -32,6 +32,10 @@ apprafter-core        = { workspace = true }
 apprafter-desktop-ipc = { path = "../ipc" }
 # `atomic_replace` for settings.json, the helper the CLI writes its own files with.
 cli-core              = { workspace = true }
+# The data-dir override, canonical without Windows' `\\?\` prefix (env::prepare_data_dir):
+# the version Tauri resolves its own paths with, already in the lock.
+dunce                 = "1"
+
 # The versions cli/Cargo.toml pins, already in the lock.
 miette                = "7"
 # The one crypto provider (as cli/Cargo.toml pins it): runtime.rs installs ring.

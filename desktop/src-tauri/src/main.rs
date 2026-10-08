@@ -5,6 +5,6 @@
 fn main() {
     if let Err(e) = apprafter_desktop::run() {
         eprintln!("AppRafter Desktop could not start: {e}");
-        std::process::exit(1);
+        std::process::exit(apprafter_desktop::exit_code(&*e));
     }
 }

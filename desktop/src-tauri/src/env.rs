@@ -10,14 +10,17 @@
 //! - `APPRAFTER_CONFIG_DIR`: the target store root, the one the CLI opens too;
 //! - `APPRAFTER_DESKTOP_DATA_DIR`: the desktop's own data directory, so a walk never touches the
 //!   owner's settings and logs ([`data_dir_override`]), and never finds the owner's running
-//!   instance ([`instance_identifier`]);
+//!   instance ([`instance_identifier`]). It fails closed: set but empty or not Unicode, the app
+//!   refuses to start rather than fall back on the owner's own files;
 //! - in a test build only (cargo feature `test-build`), `APPRAFTER_HCLOUD_BASE_URL`, which the
 //!   core then accepts only as a loopback `http://` URL ([`desktop_context`]);
 //!
 //! and `None` for every other name, however it is set. [`AllowListEnv::from_process`] is the one
 //! place in `src/` that reads `std::env`: `tests/env_guard.rs` fails on any other.
 
+use std::ffi::OsString;
 use std::fmt;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use apprafter_core::context::HCLOUD_BASE_URL_ENV;
@@ -27,8 +30,8 @@ use cli_core::CONFIG_DIR_ENV;
 /// Points the desktop's own files (settings, logs) at another directory.
 pub const DATA_DIR_ENV: &str = "APPRAFTER_DESKTOP_DATA_DIR";
 
-/// How an [`AllowListEnv`] reads a name it allows.
-type Lookup = dyn Fn(&str) -> Option<String> + Send + Sync;
+/// How an [`AllowListEnv`] reads a name it allows: the raw value, as the OS holds it.
+type Lookup = dyn Fn(&str) -> Option<OsString> + Send + Sync;
 
 /// The process environment, seen through the desktop's allow-list (see the module docs).
 pub struct AllowListEnv {
@@ -39,18 +42,19 @@ pub struct AllowListEnv {
 impl AllowListEnv {
     /// The process environment. The app passes `cfg!(feature = "test-build")`.
     ///
-    /// A value that is not valid Unicode reads as unset, as [`EnvSource`] specifies (like
-    /// `std::env::var(..).ok()`): the core takes every one of these values as a `String`. The
-    /// walks that set them write ASCII scratch paths and a loopback URL.
+    /// Through [`EnvSource::var`] a value that is not valid Unicode reads as unset, as
+    /// [`EnvSource`] specifies (like `std::env::var(..).ok()`): the core takes every one of
+    /// these values as a `String`. [`var_os`](Self::var_os) has the raw value, for the one
+    /// name that must tell set-but-unreadable from unset ([`data_dir_override`]).
     pub fn from_process(test_build: bool) -> Self {
-        Self::with_lookup(test_build, |key| std::env::var_os(key)?.into_string().ok())
+        Self::with_lookup(test_build, |key| std::env::var_os(key))
     }
 
     /// The same allow-list over `lookup` in place of the process environment, so a test never
     /// mutates the real one. `lookup` is asked only for a name the allow-list lets through.
     pub fn with_lookup(
         test_build: bool,
-        lookup: impl Fn(&str) -> Option<String> + Send + Sync + 'static,
+        lookup: impl Fn(&str) -> Option<OsString> + Send + Sync + 'static,
     ) -> Self {
         AllowListEnv {
             test_build,
@@ -62,6 +66,16 @@ impl AllowListEnv {
     /// [`desktop_context`] builds under [`DesktopPolicy::TEST_BUILD`].
     pub fn test_build(&self) -> bool {
         self.test_build
+    }
+
+    /// The raw value of `key` when it is on the allow-list and set, Unicode or not; `None`
+    /// for every other name.
+    pub fn var_os(&self, key: &str) -> Option<OsString> {
+        if self.allows(key) {
+            (self.lookup)(key)
+        } else {
+            None
+        }
     }
 
     /// Whether `key` is on this view's allow-list.
@@ -82,11 +96,7 @@ impl AllowListEnv {
 
 impl EnvSource for AllowListEnv {
     fn var(&self, key: &str) -> Option<String> {
-        if self.allows(key) {
-            (self.lookup)(key)
-        } else {
-            None
-        }
+        self.var_os(key)?.into_string().ok()
     }
 }
 
@@ -110,30 +120,82 @@ pub fn desktop_context(env: &AllowListEnv) -> CoreResult<Context> {
     Context::from_desktop_env(env, env.policy())
 }
 
+/// Why the data-directory override cannot be used: the app refuses to start (exit code 2)
+/// rather than run on the owner's own files.
+#[derive(Debug, thiserror::Error)]
+pub enum DataDirError {
+    #[error("{DATA_DIR_ENV} is set but empty: unset it, or point it at a directory")]
+    Empty,
+    #[error("{DATA_DIR_ENV} is not valid Unicode ({0:?}): point it at a directory whose path is")]
+    NotUnicode(OsString),
+    #[error("{DATA_DIR_ENV} names {}, which cannot be used: {error}", dir.display())]
+    Unusable { dir: PathBuf, error: io::Error },
+}
+
 /// Where the desktop keeps its own files in place of the platform's app-data directory:
-/// `APPRAFTER_DESKTOP_DATA_DIR` when set and non-empty (empty reads as unset), taken verbatim
-/// like `APPRAFTER_CONFIG_DIR`. A walk points it at its scratch directory.
-pub fn data_dir_override(env: &AllowListEnv) -> Option<PathBuf> {
-    env.var(DATA_DIR_ENV)
-        .filter(|dir| !dir.is_empty())
-        .map(PathBuf::from)
+/// `APPRAFTER_DESKTOP_DATA_DIR` when set; `Ok(None)` when unset. A walk points it at its
+/// scratch directory, and [`prepare_data_dir`] makes it the one path every use agrees on.
+///
+/// It fails closed: set but empty, or set to a value that is not valid Unicode, is an error,
+/// never "unset" — a walk whose variable broke must not run on the owner's settings and logs,
+/// nor focus the owner's running app.
+pub fn data_dir_override(env: &AllowListEnv) -> Result<Option<PathBuf>, DataDirError> {
+    let Some(raw) = env.var_os(DATA_DIR_ENV) else {
+        return Ok(None);
+    };
+    if raw.is_empty() {
+        return Err(DataDirError::Empty);
+    }
+    let dir = raw.into_string().map_err(DataDirError::NotUnicode)?;
+    Ok(Some(PathBuf::from(dir)))
+}
+
+/// The override `dir` as every use of it must see it: created when missing, then canonical —
+/// absolute (a relative one against the working directory, as the CLI reads
+/// `APPRAFTER_CONFIG_DIR`), with no `.`, `..`, trailing separator or symbolic link left. So
+/// `x`, `x/`, `x/./` and `y/../x` are one directory, one instance ([`instance_identifier`])
+/// and one set of app directories. On Windows the path keeps its usual `C:\…` form, not the
+/// verbatim `\\?\` one `std::fs::canonicalize` gives (`dunce`, as Tauri resolves its own).
+pub fn prepare_data_dir(dir: &Path) -> Result<PathBuf, DataDirError> {
+    let unusable = |error| DataDirError::Unusable {
+        dir: dir.to_path_buf(),
+        error,
+    };
+    std::fs::create_dir_all(dir).map_err(unusable)?;
+    dunce::canonicalize(dir).map_err(unusable)
 }
 
 /// The identifier the single-instance lock is keyed on: `base` itself, or, with a data-dir
 /// override, `base.t<16 lowercase hex digits>` — so a walk's instance never finds (and focuses)
 /// the owner's, nor two walks on different directories each other.
 ///
-/// The digits are FNV-1a 64 over the directory as given (not canonicalised: it may not exist
-/// yet), as raw OS bytes — the bytes themselves on Unix, the UTF-16 code units in little-endian
-/// order on Windows. FNV is fixed by its definition, unlike `DefaultHasher`, so the identifier
-/// stays the same across runs and Rust releases. The `t` keeps the new element a valid D-Bus
-/// name element (`[A-Za-z_][A-Za-z0-9_]*`, never a leading digit): on Linux the single-instance
-/// plugin registers the identifier on the session bus.
+/// The digits are FNV-1a 64 over the directory as given — the app passes it through
+/// [`prepare_data_dir`] first — as raw OS bytes: the bytes themselves on Unix, the UTF-16 code
+/// units in little-endian order on Windows. FNV is fixed by its definition, unlike
+/// `DefaultHasher`, so the identifier stays the same across runs and Rust releases. The `t`
+/// keeps the new element a valid D-Bus name element (`[A-Za-z_][A-Za-z0-9_]*`, never a leading
+/// digit): on Linux the single-instance plugin registers the identifier on the session bus.
 pub fn instance_identifier(base: &str, data_dir: Option<&Path>) -> String {
     match data_dir {
         None => base.to_string(),
-        Some(dir) => format!("{base}.t{:016x}", fnv1a64(os_bytes(dir))),
+        Some(dir) => format!("{base}.t{:016x}", instance_hash(dir)),
     }
+}
+
+/// The webview's data store with a data-dir override, on macOS (see
+/// [`window::build_main`](crate::window::build_main)): the 16 hex digits of
+/// [`instance_identifier`]'s suffix, as bytes — so the store changes exactly when the instance
+/// does, and stays the same across runs.
+pub fn data_store_identifier(data_dir: &Path) -> [u8; 16] {
+    let hash = instance_hash(data_dir);
+    std::array::from_fn(|i| HEX_DIGITS[((hash >> (60 - 4 * i)) & 0xf) as usize])
+}
+
+const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+
+/// FNV-1a 64 over `dir`'s raw OS bytes.
+fn instance_hash(dir: &Path) -> u64 {
+    fnv1a64(os_bytes(dir))
 }
 
 const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
@@ -184,9 +246,15 @@ mod tests {
     ];
 
     fn env_of(test_build: bool, pairs: &[(&str, &str)]) -> AllowListEnv {
-        let map: BTreeMap<String, String> = pairs
+        let pairs: Vec<(&str, OsString)> = pairs.iter().map(|(k, v)| (*k, v.into())).collect();
+        env_of_os(test_build, &pairs)
+    }
+
+    /// [`env_of`] with raw values, Unicode or not.
+    fn env_of_os(test_build: bool, pairs: &[(&str, OsString)]) -> AllowListEnv {
+        let map: BTreeMap<String, OsString> = pairs
             .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .map(|(k, v)| (k.to_string(), v.clone()))
             .collect();
         AllowListEnv::with_lookup(test_build, move |k| map.get(k).cloned())
     }
@@ -224,7 +292,7 @@ mod tests {
                 let asked = asked.clone();
                 move |k| {
                     asked.lock().unwrap().push(k.to_string());
-                    Some("set".to_string())
+                    Some("set".into())
                 }
             });
             for (key, _) in AMBIENT {
@@ -356,14 +424,105 @@ mod tests {
     }
 
     #[test]
-    fn the_data_dir_override_is_a_non_empty_value_only() {
+    fn the_data_dir_override_is_a_path_when_set_and_nothing_when_unset() {
         for test_build in [false, true] {
             let set = env_of(test_build, &[("APPRAFTER_DESKTOP_DATA_DIR", "/tmp/walk")]);
-            assert_eq!(data_dir_override(&set), Some(PathBuf::from("/tmp/walk")));
-            let empty = env_of(test_build, &[("APPRAFTER_DESKTOP_DATA_DIR", "")]);
-            assert_eq!(data_dir_override(&empty), None);
-            assert_eq!(data_dir_override(&env_of(test_build, &[])), None);
+            assert_eq!(
+                data_dir_override(&set).unwrap(),
+                Some(PathBuf::from("/tmp/walk"))
+            );
+            assert_eq!(data_dir_override(&env_of(test_build, &[])).unwrap(), None);
         }
+    }
+
+    /// A broken variable must not read as unset: the walk would run on the owner's files.
+    #[test]
+    fn a_data_dir_override_set_but_empty_or_not_unicode_is_refused() {
+        for test_build in [false, true] {
+            let empty = env_of(test_build, &[("APPRAFTER_DESKTOP_DATA_DIR", "")]);
+            let err = data_dir_override(&empty).unwrap_err();
+            assert!(matches!(err, DataDirError::Empty), "{err:?}");
+            assert_eq!(
+                err.to_string(),
+                "APPRAFTER_DESKTOP_DATA_DIR is set but empty: unset it, or point it at a directory"
+            );
+            // Bytes that are no UTF-8 on Unix, an unpaired surrogate on Windows.
+            #[cfg(unix)]
+            let raw = {
+                use std::os::unix::ffi::OsStringExt;
+                OsString::from_vec(b"/tmp/walk-\xff".to_vec())
+            };
+            #[cfg(windows)]
+            let raw = {
+                use std::os::windows::ffi::OsStringExt;
+                OsString::from_wide(&[u16::from(b'w'), 0xd800])
+            };
+            let env = env_of_os(test_build, &[("APPRAFTER_DESKTOP_DATA_DIR", raw.clone())]);
+            assert_eq!(env.var(DATA_DIR_ENV), None, "unset, read as a String");
+            let err = data_dir_override(&env).unwrap_err();
+            assert!(
+                matches!(&err, DataDirError::NotUnicode(got) if *got == raw),
+                "{err:?}"
+            );
+            assert!(err.to_string().contains("not valid Unicode"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_prepared_data_dir_is_one_path_however_it_is_spelled() {
+        let root = tempfile::tempdir().unwrap();
+        // Canonical already, so the comparison below is not thrown by a symlinked temp dir.
+        let root = dunce::canonicalize(root.path()).unwrap();
+        std::fs::create_dir(root.join("y")).unwrap();
+        let x = root.join("x");
+        let spellings = [
+            x.clone(),
+            PathBuf::from(format!("{}/", x.display())),
+            x.join("."),
+            root.join("y").join("..").join("x"),
+        ];
+        for spelling in &spellings {
+            let prepared = prepare_data_dir(spelling).unwrap();
+            assert_eq!(prepared, x, "{spelling:?}");
+            assert!(prepared.is_dir(), "{spelling:?}: created");
+            assert_eq!(
+                instance_identifier(BASE, Some(&prepared)),
+                instance_identifier(BASE, Some(&x)),
+                "{spelling:?}"
+            );
+            assert_eq!(
+                data_store_identifier(&prepared),
+                data_store_identifier(&x),
+                "{spelling:?}"
+            );
+        }
+        // Different spellings, hashed as given, would have been different instances.
+        assert_ne!(
+            instance_identifier(BASE, Some(&spellings[0])),
+            instance_identifier(BASE, Some(&spellings[1]))
+        );
+    }
+
+    #[test]
+    fn a_data_dir_that_cannot_be_created_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("a-file");
+        std::fs::write(&file, b"").unwrap();
+        let err = prepare_data_dir(&file.join("walk")).unwrap_err();
+        assert!(matches!(err, DataDirError::Unusable { .. }), "{err:?}");
+        assert!(err.to_string().contains("cannot be used"), "{err}");
+    }
+
+    #[test]
+    fn the_data_store_is_the_identifiers_hex_digits_as_bytes() {
+        let dir = Path::new("/tmp/walk");
+        let id = instance_identifier(BASE, Some(dir));
+        let digits = id.rsplit_once(".t").unwrap().1;
+        assert_eq!(&data_store_identifier(dir), digits.as_bytes());
+        assert_ne!(
+            data_store_identifier(dir),
+            data_store_identifier(Path::new("/tmp/walk2"))
+        );
     }
 
     const BASE: &str = "dev.apprafter.desktop";
