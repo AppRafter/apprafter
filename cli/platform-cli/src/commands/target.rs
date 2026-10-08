@@ -1229,15 +1229,19 @@ mod tests {
         assert_eq!(resolve_show_target(Some("other"), "").unwrap(), "other");
     }
 
-    /// On a fresh store there is nothing to show, and the error has to name
-    /// BOTH ways out — an operator cannot guess "add one first" from a bare
-    /// "not found".
+    /// On a fresh store there is nothing to show: the typed no-active-target
+    /// error, whose message and help name the ways out — an operator cannot
+    /// guess "add one first" from a bare "not found".
     #[test]
-    fn show_without_a_name_or_an_active_target_points_at_both_ways_out() {
+    fn show_without_a_name_or_an_active_target_is_the_no_active_target_error() {
         let err = resolve_show_target(None, "").expect_err("nothing to show");
+        assert!(matches!(err, CliError::NoActiveTarget), "{err:?}");
         let msg = format!("{err}");
-        assert!(msg.contains("apprafter target list"), "{msg}");
         assert!(msg.contains("apprafter target add"), "{msg}");
+        let help = miette::Diagnostic::help(&err)
+            .map(|h| h.to_string())
+            .unwrap_or_default();
+        assert!(help.contains("apprafter target list"), "{help}");
     }
 
     /// A self-rename is refused rather than performed as a no-op that reports
@@ -1624,16 +1628,14 @@ fn run_show(name: Option<&str>) -> Result<()> {
 }
 
 /// Which target `target show` displays: the explicit name, else the active
-/// one. With neither, the error has to name BOTH ways out — an operator on a
-/// fresh store has no target to show and no way to guess that from "not
-/// found".
+/// one. With neither, it is the typed no-active-target error every other
+/// command gives (`apprafter::target::no_active`), whose message and help
+/// name the ways out — `target add`, `target list`, `target use` — an
+/// operator on a fresh store cannot guess from "not found".
 pub(crate) fn resolve_show_target(name: Option<&str>, active: &str) -> Result<String> {
     match name {
         Some(n) => Ok(n.to_string()),
-        None if active.is_empty() => Err(CliError::Other(
-            "no active target and no name supplied. Run `apprafter target list` to see configured targets, or `apprafter target add` to create one."
-                .to_string(),
-        )),
+        None if active.is_empty() => Err(CliError::NoActiveTarget),
         None => Ok(active.to_string()),
     }
 }
