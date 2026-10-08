@@ -5,6 +5,7 @@
   "license": "FSL-1.1-Apache-2.0",
   "scripts": {
     "dev": "vite",
+    "dev:mock": "VITE_MOCK_IPC=1 vite",
     "build": "tsc --noEmit && NODE_ENV=production vite build",
     "lint": "biome check . && tsc --noEmit",
     "test": "bun test",

@@ -8,6 +8,13 @@ import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 import { App } from './App';
 
+// `bun run dev:mock`: a browser stands in for the Rust side. The import is dynamic so a build
+// without the variable leaves the mock (and @tauri-apps/api/mocks) out of the bundle.
+if (import.meta.env.VITE_MOCK_IPC === '1') {
+  const { installMockIpc, mockOptionsFromUrl } = await import('./ipc/mock');
+  installMockIpc(mockOptionsFromUrl(window.location.search));
+}
+
 const host = document.getElementById('root');
 if (host === null) throw new Error('index.html has no #root');
 createRoot(host).render(
