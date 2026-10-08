@@ -166,7 +166,21 @@ pub const SSH: Tool = Tool {
 /// on all of them, and was checked nowhere.
 pub const ALL: &[Tool] = &[RESTIC, KUBECTL, HELM, GIT, SSH];
 
-/// Resolve `name` against a `PATH`-shaped variable.
+/// The file names `name` may have on disk: itself on Unix; on Windows
+/// `name.exe` (unless it already ends in `.exe`). Only `.exe`: Rust's
+/// `Command` does not apply `PATHEXT`, so a `.cmd`/`.bat` shim found here
+/// could not be started anyway.
+pub fn executable_names(name: &str, windows: bool) -> Vec<String> {
+    if windows && !name.to_ascii_lowercase().ends_with(".exe") {
+        vec![format!("{name}.exe")]
+    } else {
+        vec![name.to_string()]
+    }
+}
+
+/// Resolve `name` against a `PATH`-shaped variable, under the file
+/// names an executable of that name has on this platform
+/// ([`executable_names`]).
 ///
 /// Pure: `is_executable` decides what counts, so the search order and
 /// the empty-entry handling are testable without a filesystem. An empty
@@ -177,13 +191,29 @@ pub fn find_on_path<F>(name: &str, path_var: &OsStr, is_executable: F) -> Option
 where
     F: Fn(&Path) -> bool,
 {
+    find_on_path_with(
+        &executable_names(name, cfg!(windows)),
+        path_var,
+        is_executable,
+    )
+}
+
+/// [`find_on_path`] with the candidate file names given explicitly, so
+/// the Windows lookup is testable on any host. Directories are searched
+/// in `PATH` order and, within one directory, `names` in order.
+pub fn find_on_path_with<F>(names: &[String], path_var: &OsStr, is_executable: F) -> Option<PathBuf>
+where
+    F: Fn(&Path) -> bool,
+{
     for dir in std::env::split_paths(path_var) {
         if dir.as_os_str().is_empty() {
             continue;
         }
-        let candidate = dir.join(name);
-        if is_executable(&candidate) {
-            return Some(candidate);
+        for name in names {
+            let candidate = dir.join(name);
+            if is_executable(&candidate) {
+                return Some(candidate);
+            }
         }
     }
     None
@@ -248,23 +278,39 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
 
-    fn os(s: &str) -> OsString {
-        OsString::from(s)
+    /// A `PATH` value in this platform's syntax (`:` on Unix, `;` on
+    /// Windows), so the search tests mean the same thing on both.
+    fn path_of(dirs: &[&str]) -> OsString {
+        std::env::join_paths(dirs).expect("test dirs hold no separator")
+    }
+
+    /// The file `find_on_path` probes for `stem` on this platform:
+    /// `stem` itself on Unix, `stem.exe` on Windows.
+    fn exe(stem: &str) -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(format!("{stem}.exe"))
+        } else {
+            PathBuf::from(stem)
+        }
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|n| n.to_string()).collect()
     }
 
     #[test]
     fn it_returns_the_first_match_in_path_order() {
         // PATH order is the whole contract: an operator who puts a
         // newer binary earlier expects that one.
-        let found = find_on_path("restic", &os("/a:/b:/c"), |p| {
-            p == Path::new("/b/restic") || p == Path::new("/c/restic")
+        let found = find_on_path("restic", &path_of(&["/a", "/b", "/c"]), |p| {
+            p == exe("/b/restic") || p == exe("/c/restic")
         });
-        assert_eq!(found, Some(PathBuf::from("/b/restic")));
+        assert_eq!(found, Some(exe("/b/restic")));
     }
 
     #[test]
     fn it_returns_none_when_nothing_matches() {
-        assert!(find_on_path("restic", &os("/a:/b"), |_| false).is_none());
+        assert!(find_on_path("restic", &path_of(&["/a", "/b"]), |_| false).is_none());
     }
 
     #[test]
@@ -273,8 +319,60 @@ mod tests {
         // platform tool out of the working directory is a footgun, so
         // the empty entry must not become a candidate — note the probe
         // would happily accept a bare relative "restic".
-        let found = find_on_path("restic", &os("/a::/b"), |p| p == Path::new("restic"));
+        let found = find_on_path("restic", &path_of(&["/a", "", "/b"]), |p| {
+            p == exe("restic")
+        });
         assert!(found.is_none(), "empty PATH entry was searched: {found:?}");
+    }
+
+    #[test]
+    fn executable_names_add_exe_on_windows_only() {
+        assert_eq!(executable_names("kubectl", false), names(&["kubectl"]));
+        assert_eq!(executable_names("kubectl", true), names(&["kubectl.exe"]));
+        // A name that already carries the extension, in any case, is
+        // not given a second one.
+        assert_eq!(
+            executable_names("kubectl.exe", true),
+            names(&["kubectl.exe"])
+        );
+        assert_eq!(
+            executable_names("KUBECTL.EXE", true),
+            names(&["KUBECTL.EXE"])
+        );
+    }
+
+    #[test]
+    fn a_dot_exe_is_found_only_under_the_windows_names() {
+        // The defect this pins: on Windows the binary on disk is
+        // `kubectl.exe`, and probing for a bare `kubectl` reported every
+        // installed tool as missing.
+        let path = path_of(&["/a", "/b"]);
+        let only_exe = |p: &Path| p == Path::new("/b/kubectl.exe");
+        assert_eq!(
+            find_on_path_with(&executable_names("kubectl", true), &path, only_exe),
+            Some(PathBuf::from("/b/kubectl.exe"))
+        );
+        assert_eq!(
+            find_on_path_with(&executable_names("kubectl", false), &path, only_exe),
+            None
+        );
+        // And the Windows names do not fall back to an extensionless
+        // file: `Command` could not start one.
+        let only_bare = |p: &Path| p == Path::new("/b/kubectl");
+        assert_eq!(
+            find_on_path_with(&executable_names("kubectl", true), &path, only_bare),
+            None
+        );
+    }
+
+    #[test]
+    fn find_on_path_probes_for_this_platforms_file_name() {
+        // `find_on_path` is `find_on_path_with` over the names of the
+        // platform this binary was built for.
+        let found = find_on_path("kubectl", &path_of(&["/a", "/b"]), |p| {
+            p == Path::new("/b/kubectl.exe")
+        });
+        assert_eq!(found.is_some(), cfg!(windows), "{found:?}");
     }
 
     #[test]

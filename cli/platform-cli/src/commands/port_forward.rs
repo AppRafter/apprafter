@@ -191,19 +191,31 @@ fn spawn_capturing_drainer<R: Read + Send + 'static>(reader: R) -> Arc<Mutex<Vec
     buf
 }
 
-/// Open `url` in the operator's default browser. Cross-
-/// platform shellout — `xdg-open` on Linux, `open` on
-/// macOS, `cmd /c start` on Windows. Failures fall through
-/// quietly: the URL is already printed to stdout, so the
-/// operator can paste it manually.
+/// The program and arguments that open `url` in the default browser on
+/// `os` (a [`std::env::consts::OS`] value): `open` on macOS,
+/// `rundll32 url.dll,FileProtocolHandler` on Windows, `xdg-open`
+/// everywhere else.
+///
+/// Windows deliberately avoids `cmd /c start <url>`: that hands the URL
+/// to cmd's parser, which ends the command at the first `&` of a query
+/// string. rundll32 runs no shell, so the URL arrives as one argument.
+fn browser_command(url: &str, os: &str) -> (String, Vec<String>) {
+    match os {
+        "macos" => ("open".to_string(), vec![url.to_string()]),
+        "windows" => (
+            "rundll32".to_string(),
+            vec!["url.dll,FileProtocolHandler".to_string(), url.to_string()],
+        ),
+        _ => ("xdg-open".to_string(), vec![url.to_string()]),
+    }
+}
+
+/// Open `url` in the operator's default browser, through the platform
+/// opener [`browser_command`] picks. Failures fall through quietly: the
+/// URL is already printed to stdout, so the operator can paste it
+/// manually.
 pub fn open_in_browser(url: &str) -> Result<()> {
-    let (program, args): (&str, Vec<String>) = if cfg!(target_os = "macos") {
-        ("open", vec![url.to_string()])
-    } else if cfg!(target_os = "windows") {
-        ("cmd", vec!["/c".into(), "start".into(), url.to_string()])
-    } else {
-        ("xdg-open", vec![url.to_string()])
-    };
+    let (program, args) = browser_command(url, std::env::consts::OS);
     Command::new(program)
         .args(&args)
         .stdout(Stdio::null())
@@ -219,6 +231,44 @@ mod tests {
     use std::io::Cursor;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    fn strings(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn browser_command_uses_each_platforms_opener() {
+        let url = "https://localhost:8080/";
+        assert_eq!(
+            browser_command(url, "macos"),
+            ("open".to_string(), strings(&[url]))
+        );
+        assert_eq!(
+            browser_command(url, "linux"),
+            ("xdg-open".to_string(), strings(&[url]))
+        );
+        // Any other Unix keeps the freedesktop opener, as before.
+        assert_eq!(
+            browser_command(url, "freebsd"),
+            ("xdg-open".to_string(), strings(&[url]))
+        );
+    }
+
+    #[test]
+    fn browser_command_on_windows_passes_the_url_as_one_unparsed_argument() {
+        // `cmd /c start <url>` hands the URL to cmd's parser, which ends
+        // the command at the first `&`, and `start` takes a leading
+        // quoted argument for a window title. rundll32 runs no shell: the
+        // URL reaches the protocol handler as one argument, byte for byte.
+        let url = "https://localhost:8080/?a=1&b=2";
+        assert_eq!(
+            browser_command(url, "windows"),
+            (
+                "rundll32".to_string(),
+                strings(&["url.dll,FileProtocolHandler", url])
+            )
+        );
+    }
 
     #[test]
     fn ready_drainer_signals_on_forwarding_line() {

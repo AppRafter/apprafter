@@ -12,7 +12,7 @@
 //!    deliberately tiny (~one Command builder) so it doesn't need
 //!    its own coverage.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
 use cli_core::{CliError, Result};
@@ -208,13 +208,16 @@ impl SshCommandRunner {
 
 /// Path to the SSH private key used by the fetcher. Resolves
 /// `APPRAFTER_SSH_PRIVATE_KEY` first, then falls back to
-/// `$HOME/.ssh/id_ed25519`.
+/// `~/.ssh/id_ed25519`, where `~` is [`dirs::home_dir`]: `$HOME` on Unix
+/// when it is set and non-empty, else the account's home from the
+/// password database; on Windows the user profile, which is where its
+/// OpenSSH keeps `.ssh` as well. `/` only when no home resolves at all.
 pub fn default_ssh_identity_path() -> PathBuf {
     if let Ok(p) = std::env::var("APPRAFTER_SSH_PRIVATE_KEY") {
         return PathBuf::from(p);
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| String::from("/"));
-    Path::new(&home).join(".ssh").join("id_ed25519")
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+    home.join(".ssh").join("id_ed25519")
 }
 
 #[cfg(test)]
@@ -365,6 +368,9 @@ clusters:\n\
         );
         std::env::remove_var("APPRAFTER_SSH_PRIVATE_KEY");
         let p = default_ssh_identity_path();
+        // Home-relative on every platform (`Path::ends_with` compares
+        // components, so `/` separates them on Windows too).
         assert!(p.ends_with(".ssh/id_ed25519"), "{p:?}");
+        assert!(p.is_absolute(), "{p:?}");
     }
 }

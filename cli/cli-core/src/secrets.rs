@@ -18,16 +18,16 @@ use age::x25519::{Identity, Recipient};
 use crate::{CliError, Result};
 
 /// Resolve the on-disk path for the age private key. Honours
-/// `APPRAFTER_AGE_KEY`; falls back to `$HOME/.config/apprafter/age.key`.
+/// `APPRAFTER_AGE_KEY`; falls back to `~/.config/apprafter/age.key`,
+/// where `~` is [`dirs::home_dir`]: `$HOME` on Unix when it is set and
+/// non-empty, else the account's home from the password database; the
+/// user profile on Windows. `/` only when no home resolves at all.
 pub fn default_age_key_path() -> PathBuf {
     if let Ok(p) = std::env::var("APPRAFTER_AGE_KEY") {
         return PathBuf::from(p);
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| String::from("/"));
-    Path::new(&home)
-        .join(".config")
-        .join("apprafter")
-        .join("age.key")
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+    home.join(".config").join("apprafter").join("age.key")
 }
 
 /// Load the identity at `path`, or generate a fresh one and persist
@@ -178,11 +178,24 @@ mod tests {
 
     #[test]
     fn default_age_key_path_honours_env_override() {
+        // Serialise with the crate-wide test mutex: sibling tests flip
+        // env vars the resolvers read.
+        let _guard = crate::TEST_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var_os("APPRAFTER_AGE_KEY");
         std::env::set_var("APPRAFTER_AGE_KEY", "/tmp/custom-age");
-        assert_eq!(default_age_key_path(), PathBuf::from("/tmp/custom-age"));
+        let overridden = default_age_key_path();
         std::env::remove_var("APPRAFTER_AGE_KEY");
         let p = default_age_key_path();
+        if let Some(v) = prior {
+            std::env::set_var("APPRAFTER_AGE_KEY", v);
+        }
+        assert_eq!(overridden, PathBuf::from("/tmp/custom-age"));
+        // Unset: home-relative, on every platform (`Path::ends_with`
+        // compares components, so `/` separates them on Windows too).
         assert!(p.ends_with(".config/apprafter/age.key"), "{p:?}");
+        assert!(p.is_absolute(), "{p:?}");
     }
 
     #[test]
