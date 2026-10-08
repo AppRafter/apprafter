@@ -7525,14 +7525,25 @@ mod tests {
     /// A non-zero restic exit MUST become an error: the steps that follow read
     /// the restored tree off disk, so a swallowed failure leaves an empty tree
     /// and reports a successful restore over nothing.
-    #[cfg(unix)]
+    /// An `ExitStatus` that exited with `code`, on either platform.
+    fn exit_status(code: i32) -> std::process::ExitStatus {
+        #[cfg(unix)]
+        use std::os::unix::process::ExitStatusExt as _;
+        #[cfg(windows)]
+        use std::os::windows::process::ExitStatusExt as _;
+        #[cfg(unix)]
+        let raw = code << 8;
+        #[cfg(windows)]
+        let raw = code as u32;
+        std::process::ExitStatus::from_raw(raw)
+    }
+
     #[test]
     fn restic_output_to_result_yields_stdout_or_an_error_carrying_stderr() {
-        use std::os::unix::process::ExitStatusExt;
         let argv = vec!["snapshots".to_string(), "--json".to_string()];
 
         let ok = std::process::Output {
-            status: std::process::ExitStatus::from_raw(0),
+            status: exit_status(0),
             stdout: b"[{\"id\":\"abc\"}]".to_vec(),
             stderr: Vec::new(),
         };
@@ -7542,7 +7553,7 @@ mod tests {
         );
 
         let failed = std::process::Output {
-            status: std::process::ExitStatus::from_raw(1 << 8), // exit code 1
+            status: exit_status(1),
             stdout: Vec::new(),
             stderr: b"wrong password".to_vec(),
         };

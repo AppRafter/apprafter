@@ -210,11 +210,28 @@ fn browser_command(url: &str, os: &str) -> (String, Vec<String>) {
     }
 }
 
+/// Whether `url` is a web URL: `http://` or `https://`, the scheme in any
+/// case. Pure.
+fn is_web_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
+}
+
 /// Open `url` in the operator's default browser, through the platform
 /// opener [`browser_command`] picks. Failures fall through quietly: the
 /// URL is already printed to stdout, so the operator can paste it
 /// manually.
+///
+/// Anything but an `http://` or `https://` URL is refused before an opener
+/// is spawned: `rundll32 url.dll,FileProtocolHandler` on Windows (and
+/// `open`, `xdg-open` elsewhere) opens a file path or any registered scheme
+/// as readily as a web page, and the CLI only ever means a page.
 pub fn open_in_browser(url: &str) -> Result<()> {
+    if !is_web_url(url) {
+        return Err(CliError::Other(format!(
+            "refusing to open `{url}` in a browser: only http:// and https:// URLs are opened"
+        )));
+    }
     let (program, args) = browser_command(url, std::env::consts::OS);
     Command::new(program)
         .args(&args)
@@ -268,6 +285,37 @@ mod tests {
                 strings(&["url.dll,FileProtocolHandler", url])
             )
         );
+    }
+
+    /// The Windows opener hands its argument to the shell's protocol
+    /// handler, which opens a path or any registered scheme as readily as a
+    /// web page, so only a web URL is ever passed to an opener — on every
+    /// platform, before anything is spawned.
+    #[test]
+    fn only_an_http_or_https_url_is_opened() {
+        for url in [
+            "http://localhost:8080",
+            "https://localhost:8443/?a=1&b=2",
+            "HTTPS://LOCALHOST/",
+        ] {
+            assert!(is_web_url(url), "{url}");
+        }
+        for url in [
+            "file:///C:/Windows/System32/calc.exe",
+            "C:\\Windows\\System32\\calc.exe",
+            "javascript:alert(1)",
+            "ms-settings:",
+            "httpx://localhost",
+            "http:/localhost",
+            "",
+        ] {
+            assert!(!is_web_url(url), "{url}");
+            let refused = open_in_browser(url).expect_err("refused before any spawn");
+            assert!(
+                refused.to_string().contains("only http:// and https://"),
+                "{refused}"
+            );
+        }
     }
 
     #[test]

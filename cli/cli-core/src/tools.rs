@@ -167,11 +167,14 @@ pub const SSH: Tool = Tool {
 pub const ALL: &[Tool] = &[RESTIC, KUBECTL, HELM, GIT, SSH];
 
 /// The file names `name` may have on disk: itself on Unix; on Windows
-/// `name.exe` (unless it already ends in `.exe`). Only `.exe`: Rust's
-/// `Command` does not apply `PATHEXT`, so a `.cmd`/`.bat` shim found here
-/// could not be started anyway.
+/// `name.exe` when `name` has no `.` in it, else `name` as given. That is
+/// the rule Rust's `Command` applies when it searches `PATH` on Windows —
+/// `.exe` is appended to a name without an extension, `PATHEXT` is not
+/// read — so a tool found here is the file `Command` would start, and a
+/// name given with its extension (`kubectl.exe`, a `kubectl.cmd` shim) is
+/// looked for exactly as given.
 pub fn executable_names(name: &str, windows: bool) -> Vec<String> {
-    if windows && !name.to_ascii_lowercase().ends_with(".exe") {
+    if windows && !name.contains('.') {
         vec![format!("{name}.exe")]
     } else {
         vec![name.to_string()]
@@ -338,6 +341,26 @@ mod tests {
         assert_eq!(
             executable_names("KUBECTL.EXE", true),
             names(&["KUBECTL.EXE"])
+        );
+    }
+
+    #[test]
+    fn a_windows_name_with_any_extension_is_looked_for_as_given() {
+        // `Command`'s own rule: a `.` anywhere in the name means it has
+        // an extension, so nothing is appended — a `.cmd` shim named
+        // with its extension is found, and so is a dotted name.
+        assert_eq!(
+            executable_names("kubectl.cmd", true),
+            names(&["kubectl.cmd"])
+        );
+        assert_eq!(
+            executable_names("k3s.kubectl", true),
+            names(&["k3s.kubectl"])
+        );
+        // Unix never adds anything.
+        assert_eq!(
+            executable_names("kubectl.cmd", false),
+            names(&["kubectl.cmd"])
         );
     }
 

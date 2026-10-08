@@ -1363,7 +1363,6 @@ mod tests {
         std::fs::read_to_string(dir.path().join("log")).unwrap_or_default()
     }
 
-    #[cfg(unix)]
     fn soon() -> Instant {
         Instant::now() + Duration::from_secs(10)
     }
@@ -1399,12 +1398,16 @@ mod tests {
     /// kubectl run at all: nothing read after the fact makes a pod this
     /// process's. The unsettled one is named with the command that deletes
     /// it.
-    #[cfg(unix)]
     #[test]
     fn a_pod_not_confirmed_as_created_here_is_left_unread() {
         let kc = kubeconfig();
         let dir = tempfile::tempdir().unwrap();
+        // A kubectl that logs every run. Windows has no shell stub; there it
+        // is a path where nothing is, and the lines alone are checked.
+        #[cfg(unix)]
         let kubectl = stub(&dir, "exit 0");
+        #[cfg(windows)]
+        let kubectl = dir.path().join("no-kubectl-here.exe");
         let line = clean_one(
             &kubectl,
             kc.path(),
@@ -1433,6 +1436,7 @@ mod tests {
             line.contains("kubectl delete pod ld-pg-db -n demo"),
             "{line}"
         );
+        #[cfg(unix)]
         assert_eq!(log(&dir), "", "no kubectl was run");
     }
 

@@ -13625,13 +13625,21 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_pod_spec_without_an_identity_is_refused_before_kubectl_is_spawned() {
         let dir = tempfile::tempdir().unwrap();
         // The stub always succeeds — so if these checks were dropped, the
-        // calls below would wrongly return Ok.
+        // calls below would wrongly return Ok. Windows has no shell stub;
+        // there kubectl is a path where nothing is, so a dropped check fails
+        // on the spawn instead, with an error that names neither field.
+        #[cfg(unix)]
         let k = stub_kubectl(&dir, "exit 0");
+        #[cfg(windows)]
+        let k = KubectlExec {
+            kubeconfig: dir.path().join("kubeconfig.yaml"),
+            kubectl_bin: dir.path().join("no-kubectl-here.exe"),
+            helpers: helper_interrupt::HelperPods::default(),
+        };
         let no_name = k
             .apply_and_wait_pod_ready(&json!({"metadata": {"namespace": "prod"}}))
             .unwrap_err();
