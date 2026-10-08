@@ -17,6 +17,14 @@
       "preset": "recommended",
       "style": {
         "useNamingConvention": "off",
+        "noRestrictedImports": {
+          "level": "error",
+          "options": {
+            "paths": {
+              "@phosphor-icons/react": "Import icons from src/components/icons.ts: the barrel loads all 1,512 icon modules."
+            }
+          }
+        },
         "noRestrictedGlobals": {
           "level": "error",
           "options": {

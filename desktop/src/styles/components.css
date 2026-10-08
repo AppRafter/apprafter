@@ -1,0 +1,352 @@
+/* SPDX-License-Identifier: FSL-1.1-Apache-2.0 */
+
+/* The primitives in src/components. Components set class names and data-variant / data-tone /
+   data-size; every colour, size and radius here is a tokens.css token. */
+
+/* Tones (brief §1.5): text and background per tone, shared by pills and tinted tags. */
+.pill[data-tone="ok"],
+.tag[data-variant="tinted"][data-tone="ok"] {
+  color: var(--ok);
+  background: var(--ok-tint);
+}
+
+.pill[data-tone="warn"],
+.tag[data-variant="tinted"][data-tone="warn"] {
+  color: var(--warn);
+  background: var(--warn-tint);
+}
+
+.pill[data-tone="err"],
+.tag[data-variant="tinted"][data-tone="err"] {
+  color: var(--err);
+  background: var(--err-tint);
+}
+
+.pill[data-tone="neutral"],
+.tag[data-variant="tinted"][data-tone="neutral"] {
+  color: var(--fg-muted);
+  background: var(--surface-2);
+}
+
+/* Button ---------------------------------------------------------------------------------- */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: var(--h-30);
+  padding: 0 12px;
+  border: 1px solid transparent;
+  border-radius: var(--r-4);
+  font: 500 var(--fs-13) var(--font-sans);
+  white-space: nowrap;
+  cursor: pointer;
+  transition:
+    background var(--t-fast),
+    border-color var(--t-fast),
+    color var(--t-fast);
+}
+
+.btn svg {
+  flex: none;
+  font-size: 1.15em;
+}
+
+.btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.btn[data-size="26"] {
+  height: var(--h-26);
+  padding: 0 10px;
+  gap: 5px;
+  font-size: var(--fs-12-5);
+}
+
+.btn[data-size="28"] {
+  height: var(--h-28);
+  font-size: var(--fs-12-5);
+}
+
+.btn[data-size="32"] {
+  height: var(--h-32);
+  padding: 0 14px;
+}
+
+.btn[data-size="36"] {
+  height: var(--h-36);
+  padding: 0 16px;
+}
+
+.btn[data-full] {
+  width: 100%;
+}
+
+.btn[data-variant="primary"] {
+  background: var(--accent);
+  color: var(--accent-fg);
+}
+
+.btn[data-variant="primary"]:hover:not(:disabled) {
+  background: var(--accent-2);
+}
+
+.btn[data-variant="secondary"] {
+  background: transparent;
+  color: var(--fg);
+  border-color: var(--border-strong);
+}
+
+.btn[data-variant="secondary"]:hover:not(:disabled) {
+  background: var(--surface-2);
+}
+
+.btn[data-variant="danger"] {
+  background: transparent;
+  color: var(--err);
+  border-color: var(--err);
+}
+
+.btn[data-variant="danger"]:hover:not(:disabled) {
+  background: var(--err-tint);
+}
+
+.btn[data-variant="danger-solid"] {
+  background: var(--err);
+  color: var(--danger-fg);
+}
+
+.btn[data-variant="danger-solid"]:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+
+/* The table row action: always 26 high, whatever the size says. */
+.btn[data-variant="ghost"] {
+  height: var(--h-26);
+  padding: 0 8px;
+  background: transparent;
+  color: var(--fg-muted);
+  font-size: var(--fs-12);
+}
+
+.btn[data-variant="ghost"] svg {
+  font-size: 14px;
+}
+
+.btn[data-variant="ghost"]:hover:not(:disabled) {
+  background: var(--border);
+  color: var(--fg);
+}
+
+.btn[data-variant="ghost"]:disabled {
+  opacity: 0.5;
+}
+
+/* IconButton ------------------------------------------------------------------------------ */
+
+.icon-btn {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: var(--h-28);
+  height: var(--h-28);
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: var(--r-4);
+  background: transparent;
+  color: var(--fg-muted);
+  font-size: 15px;
+  cursor: pointer;
+  transition:
+    background var(--t-fast),
+    color var(--t-fast);
+}
+
+.icon-btn:hover:not(:disabled) {
+  background: var(--surface-2);
+  color: var(--fg);
+}
+
+.icon-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.icon-btn[aria-pressed="true"] {
+  color: var(--accent-text);
+}
+
+.icon-btn[data-size="22"] {
+  width: var(--h-22);
+  height: var(--h-22);
+  border-radius: var(--r-3);
+  font-size: 12px;
+}
+
+.icon-btn[data-size="26"] {
+  width: var(--h-26);
+  height: var(--h-26);
+  font-size: 14px;
+}
+
+.icon-btn[data-size="30"] {
+  width: var(--h-30);
+  height: var(--h-30);
+  font-size: 16px;
+}
+
+/* The bell: 34 wide, 30 high. */
+.icon-btn[data-size="34"] {
+  width: var(--h-34);
+  height: var(--h-30);
+  font-size: 16px;
+}
+
+.icon-btn[data-size="36"] {
+  width: var(--h-36);
+  height: var(--h-36);
+  font-size: 16px;
+}
+
+.icon-btn[data-tone="danger"] {
+  color: var(--err);
+}
+
+.icon-btn[data-tone="danger"]:hover:not(:disabled) {
+  background: var(--err-tint);
+  border-color: var(--err);
+  color: var(--err);
+}
+
+/* Badge, Dot, StatusPill, Tag, Eyebrow, Kbd ----------------------------------------------- */
+
+.badge {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 9px;
+  background: var(--warn-tint);
+  color: var(--warn);
+  font: 500 var(--fs-11) var(--font-mono);
+}
+
+.badge[data-tone="accent"] {
+  min-width: 15px;
+  height: 15px;
+  padding: 0 4px;
+  border-radius: var(--r-full);
+  background: var(--accent);
+  color: var(--accent-fg);
+  font-size: var(--fs-10);
+}
+
+.dot {
+  display: inline-block;
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--fg-faint);
+}
+
+.dot[data-size="6"] {
+  width: 6px;
+  height: 6px;
+}
+
+.dot[data-size="8"] {
+  width: 8px;
+  height: 8px;
+}
+
+.dot[data-tone="ok"] {
+  background: var(--ok);
+}
+
+.dot[data-tone="warn"] {
+  background: var(--warn);
+}
+
+.dot[data-tone="err"] {
+  background: var(--err);
+}
+
+.dot[data-tone="accent"] {
+  background: var(--accent);
+}
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: var(--h-22);
+  padding: 0 8px;
+  border-radius: var(--r-3);
+  font: 500 var(--fs-12) var(--font-sans);
+  white-space: nowrap;
+}
+
+.pill[data-size="20"] {
+  height: var(--h-20);
+  padding: 0 7px;
+  font-size: var(--fs-11-5);
+}
+
+.pill-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border-radius: var(--r-3);
+  font: 500 var(--fs-11) var(--font-sans);
+  white-space: nowrap;
+}
+
+.tag[data-variant="tinted"] {
+  height: var(--h-20);
+  padding: 0 7px;
+}
+
+.tag[data-variant="outline"] {
+  height: var(--h-22);
+  padding: 0 8px;
+  border: 1px solid var(--border-strong);
+  color: var(--fg-muted);
+}
+
+.tag[data-variant="chip"] {
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--fg-muted);
+}
+
+.tag[data-mono] {
+  font-family: var(--font-mono);
+  font-weight: 400;
+}
+
+.eyebrow {
+  color: var(--fg-faint);
+  font: 500 var(--fs-11) var(--font-mono);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.kbd {
+  color: var(--fg-faint);
+  font: 400 var(--fs-11-5) var(--font-mono);
+}
