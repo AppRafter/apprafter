@@ -18,6 +18,9 @@
 //!
 //! The run with `--timezone` is the control: the same sandbox prunes, which
 //! is what proves the refusal is about the zone and not about the sandbox.
+//!
+//! Unix only: the stand-ins are `#!/bin/sh` scripts.
+#![cfg(unix)]
 
 use std::fs;
 use std::path::PathBuf;

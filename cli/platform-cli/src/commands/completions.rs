@@ -78,6 +78,11 @@
 //! path completes nothing while reporting success. The other two are
 //! refused by name, with the redirect they can still use.
 //!
+//! The destinations are the XDG locations on every Unix, macOS included
+//! ([`xdg_root`]): that is where bash-completion and fish look there too.
+//! On Windows, which has no XDG directories, `--install` is refused for
+//! every shell ([`refuse_on_windows`]), and the script still prints.
+//!
 //! # Why the script still goes to stdout under `--install`
 //!
 //! A child process cannot add a completion to the shell that spawned
@@ -97,6 +102,7 @@
 //! is not a second way of being useful. The report goes to stderr in
 //! both cases — on stdout it would be fed to the shell as code.
 
+use std::ffi::OsString;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
@@ -194,12 +200,61 @@ fn prints_script(install: bool, stdout_is_terminal: bool) -> bool {
     !install || !stdout_is_terminal
 }
 
+/// One base directory, as the XDG Base Directory specification resolves
+/// it: `$XDG_DATA_HOME` / `$XDG_CONFIG_HOME` when it names an absolute
+/// directory, else `~/.local/share` / `~/.config` under `home`. `var`
+/// reads one environment variable. Pure.
+///
+/// Computed here rather than taken from `dirs::data_dir` /
+/// `dirs::config_dir`, because those are the PLATFORM directories: the
+/// same as these on Linux, but `~/Library/Application Support` on macOS,
+/// which neither bash-completion nor fish reads — an install there
+/// reported success and completed nothing. The shells read the XDG
+/// locations on every Unix, so that is what is resolved on every Unix.
+/// An empty or relative value is ignored, as the specification says and
+/// as `dirs` does on Linux, so nothing changes there.
+fn xdg_root(
+    root: Root,
+    var: &dyn Fn(&str) -> Option<OsString>,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
+    let xdg = |name: &str, under_home: &str| {
+        var(name)
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .or_else(|| home.map(|home| home.join(under_home)))
+    };
+    match root {
+        Root::Data => xdg("XDG_DATA_HOME", ".local/share"),
+        Root::Config => xdg("XDG_CONFIG_HOME", ".config"),
+        Root::Home => home.map(Path::to_path_buf),
+    }
+}
+
+/// `--install` on Windows (`windows`): refused for every shell. bash, zsh
+/// and fish read their completions from the XDG directories, which no
+/// Windows shell uses, so a destination there would be invented rather
+/// than known. Printing the script still works. Pure.
+fn refuse_on_windows(shell: Shell, windows: bool) -> Result<()> {
+    if windows {
+        return Err(CliError::CompletionInstall(format!(
+            "`--install` is not available on Windows: the shells it installs for \
+             read their completions from XDG directories that Windows does not \
+             have. The script still prints — redirect it to wherever your shell \
+             reads completions from: `apprafter completion {shell} > <file>`."
+        )));
+    }
+    Ok(())
+}
+
 /// Resolve one base directory, naming what could not be resolved.
 fn root_path(root: Root) -> Result<PathBuf> {
-    let (resolved, spelled) = match root {
-        Root::Data => (dirs::data_dir(), "$XDG_DATA_HOME (or ~/.local/share)"),
-        Root::Config => (dirs::config_dir(), "$XDG_CONFIG_HOME (or ~/.config)"),
-        Root::Home => (dirs::home_dir(), "$HOME"),
+    let home = dirs::home_dir();
+    let resolved = xdg_root(root, &|name| std::env::var_os(name), home.as_deref());
+    let spelled = match root {
+        Root::Data => "$XDG_DATA_HOME (or ~/.local/share)",
+        Root::Config => "$XDG_CONFIG_HOME (or ~/.config)",
+        Root::Home => "$HOME",
     };
     resolved.ok_or_else(|| {
         CliError::CompletionInstall(format!(
@@ -221,6 +276,7 @@ fn destination(shell: Shell) -> Result<PathBuf> {
             installable().join(", ")
         ))
     })?;
+    refuse_on_windows(shell, cfg!(windows))?;
     Ok(root_path(layout.root)?.join(layout.relative))
 }
 
@@ -421,6 +477,114 @@ mod tests {
             help.contains("apprafter completion"),
             "the help does not name the form that always works: {help}"
         );
+    }
+
+    /// An environment of exactly `vars`, for [`xdg_root`].
+    fn env_of(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> {
+        let vars: Vec<(String, OsString)> = vars
+            .iter()
+            .map(|(key, value)| (key.to_string(), OsString::from(value)))
+            .collect();
+        move |name| {
+            vars.iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+        }
+    }
+
+    /// `path` (written with `/`) as an absolute path on this platform: the
+    /// unit tests run on Windows too, where an absolute path has a drive.
+    fn abs(path: &str) -> String {
+        if cfg!(windows) {
+            format!("C:{path}")
+        } else {
+            path.to_string()
+        }
+    }
+
+    #[test]
+    fn the_xdg_variables_win_when_they_name_an_absolute_directory() {
+        let (data, config, home) = (abs("/srv/data"), abs("/srv/config"), abs("/home/someone"));
+        let env = env_of(&[("XDG_DATA_HOME", &data), ("XDG_CONFIG_HOME", &config)]);
+        let home = Some(Path::new(&home));
+        assert_eq!(xdg_root(Root::Data, &env, home), Some(PathBuf::from(&data)));
+        assert_eq!(
+            xdg_root(Root::Config, &env, home),
+            Some(PathBuf::from(&config))
+        );
+        assert_eq!(
+            xdg_root(Root::Home, &env, home),
+            home.map(Path::to_path_buf)
+        );
+    }
+
+    /// The macOS defect this pins: with no XDG variable set, bash-completion
+    /// and fish read `~/.local/share` and `~/.config` on macOS as they do on
+    /// Linux, while the platform directories (`dirs::data_dir`) are
+    /// `~/Library/Application Support`, which neither reads.
+    #[test]
+    fn without_them_the_xdg_defaults_hang_off_home_on_every_unix() {
+        let env = env_of(&[]);
+        let home = abs("/Users/someone");
+        let home = Some(Path::new(&home));
+        assert_eq!(
+            xdg_root(Root::Data, &env, home),
+            Some(PathBuf::from(abs("/Users/someone/.local/share")))
+        );
+        assert_eq!(
+            xdg_root(Root::Config, &env, home),
+            Some(PathBuf::from(abs("/Users/someone/.config")))
+        );
+    }
+
+    /// The specification's own rule, and the one `dirs` applies on Linux: an
+    /// empty or relative value is not a directory to write into.
+    #[test]
+    fn an_empty_or_relative_xdg_value_is_ignored() {
+        let home = abs("/home/someone");
+        let home = Some(Path::new(&home));
+        for value in ["", "relative/data"] {
+            let env = env_of(&[("XDG_DATA_HOME", value), ("XDG_CONFIG_HOME", value)]);
+            assert_eq!(
+                xdg_root(Root::Data, &env, home),
+                Some(PathBuf::from(abs("/home/someone/.local/share"))),
+                "XDG_DATA_HOME={value:?}"
+            );
+            assert_eq!(
+                xdg_root(Root::Config, &env, home),
+                Some(PathBuf::from(abs("/home/someone/.config"))),
+                "XDG_CONFIG_HOME={value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn with_no_home_only_an_xdg_variable_resolves() {
+        let data = abs("/srv/data");
+        let env = env_of(&[("XDG_DATA_HOME", &data)]);
+        assert_eq!(xdg_root(Root::Data, &env, None), Some(PathBuf::from(&data)));
+        assert_eq!(xdg_root(Root::Config, &env, None), None);
+        assert_eq!(xdg_root(Root::Home, &env, None), None);
+    }
+
+    /// Windows: no shell there reads the XDG directories, so `--install`
+    /// refuses for every shell, naming the redirect that still works.
+    #[test]
+    fn install_is_refused_on_windows_with_the_redirect_that_works() {
+        for shell in [Shell::Bash, Shell::Zsh, Shell::Fish] {
+            assert!(refuse_on_windows(shell, false).is_ok(), "{shell}");
+            let refused = refuse_on_windows(shell, true).expect_err("refused on Windows");
+            let message = refused.to_string();
+            assert!(message.contains("Windows"), "{message}");
+            assert!(
+                message.contains(&format!("apprafter completion {shell} > ")),
+                "{message}"
+            );
+            assert_eq!(
+                miette::Diagnostic::code(&refused).map(|code| code.to_string()),
+                Some("apprafter::completion::install".to_string())
+            );
+        }
     }
 
     #[test]

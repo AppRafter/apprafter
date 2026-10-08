@@ -24,6 +24,10 @@
 //! `cli/.cargo/config.toml` sets `APPRAFTER_SKIP_STARTUP_CHECKS` for
 //! everything cargo runs; the child's environment is cleared, so it runs with
 //! the checks on.
+//!
+//! Unix only: the stand-in is a `#!/bin/sh` script, and the version cache
+//! is seeded where `dirs::cache_dir` looks on Linux and macOS, not Windows.
+#![cfg(unix)]
 
 use std::fs;
 use std::path::PathBuf;

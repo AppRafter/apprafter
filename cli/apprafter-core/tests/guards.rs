@@ -43,7 +43,7 @@ use syn::{Attribute, Expr, ImplItem, Item, Meta, Stmt, TraitItem, UseTree};
 /// Production env reads ([`Kind::EnvRead`] and [`Kind::Dirs`]) in
 /// [`RATCHETED_CRATES`]. Re-measure, with a per-crate and per-callee
 /// breakdown, with `cargo test -p apprafter-core --test guards -- --nocapture`.
-const ENV_READ_BASELINE: usize = 56;
+const ENV_READ_BASELINE: usize = 55;
 
 /// The crates the core builds on, and the CLI.
 const RATCHETED_CRATES: &[&str] = &["cli-core", "cli-state", "cli-providers", "platform-cli"];
