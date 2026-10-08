@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- SPDX-License-Identifier: FSL-1.1-Apache-2.0 -->
+<!--
+  The Windows application manifest of every executable this package links on MSVC: the app,
+  and the test executables, which tauri-build's own manifest never reaches (build.rs). It asks
+  for Common Controls v6: without it the loader binds comctl32 v5, which has no
+  TaskDialogIndirect, and an executable that imports it does not start
+  (STATUS_ENTRYPOINT_NOT_FOUND). The content is tauri-build's default manifest.
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity
+        type="win32"
+        name="Microsoft.Windows.Common-Controls"
+        version="6.0.0.0"
+        processorArchitecture="*"
+        publicKeyToken="6595b64144ccf1df"
+        language="*"
+      />
+    </dependentAssembly>
+  </dependency>
+</assembly>

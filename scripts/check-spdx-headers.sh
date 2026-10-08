@@ -63,6 +63,8 @@ PATTERNS=(
   'desktop/*.toml'
   'desktop/*.json5'
   'desktop/*.svg'
+  # The Windows application manifest: an XML comment after the declaration.
+  'desktop/*.xml'
   # The committed Claude Design export is upstream's file, kept verbatim.
   ':(exclude)desktop/design-source/*'
   # Platform manifests
