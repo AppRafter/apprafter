@@ -1,0 +1,5 @@
+$ apprafter target list
+[exit 0]
+[stdout]
+No targets configured. Run `apprafter target add` to create one — or `apprafter target add <name>` to skip the wizard's name prompt.
+[stderr]

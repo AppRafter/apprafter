@@ -1,0 +1,14 @@
+$ apprafter target remove ghost --yes
+[exit 1]
+[stdout]
+[stderr]
+Error: apprafter::target::not_found
+
+  × target `ghost` not found (available: prod)
+  help: Either the `--target` flag was given a name that's not in the store,
+        or no target has been created yet. List existing targets with
+        `apprafter target list`; create a new one with `apprafter target add
+        <name> --provider hetzner-cloud …`. If the store is empty (`available:
+        ` shows nothing), this is your first run — start with `apprafter
+        target add`.
+

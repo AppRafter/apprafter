@@ -1,0 +1,12 @@
+$ apprafter target list
+[exit 0]
+[stdout]
+┌────────┬─────────┬───────────────┬────────┬──────┐
+│ Active │ Name    │ Provider      │ Region │ Tier │
+├────────┼─────────┼───────────────┼────────┼──────┤
+│ *      │ prod    │ hetzner-cloud │ nbg1   │ solo │
+│        │ staging │ hetzner-cloud │ nbg1   │ solo │
+└────────┴─────────┴───────────────┴────────┴──────┘
+
+2 targets configured. Active: 'prod'.
+[stderr]

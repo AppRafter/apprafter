@@ -1,0 +1,5 @@
+$ apprafter target remove staging --yes
+[exit 0]
+[stdout]
+target `staging` removed
+[stderr]

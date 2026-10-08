@@ -1,0 +1,5 @@
+$ apprafter target rename staging stage
+[exit 0]
+[stdout]
+target renamed: `staging` → `stage`
+[stderr]

@@ -1,0 +1,5 @@
+$ apprafter target machine --server-type cx32 --no-ping
+[exit 0]
+[stdout]
+server type set to `cx32` on target `prod` — NOT validated (--no-ping)
+[stderr]

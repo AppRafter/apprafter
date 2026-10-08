@@ -30,11 +30,6 @@
 //! the diff, and commit. A missing golden is a failure, never a silent
 //! pass.
 #![cfg(unix)]
-// This task lands only the harness and its own three `harness_*` tests;
-// later D.1 tasks add the first golden cases, which is when `TOKEN_B` and
-// the `Sandbox` helpers below (`ssh_key`, `cmd`, `setup`, `add_target`,
-// `render`, `golden`) get a real call site. Remove this once they do.
-#![allow(dead_code)]
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -247,4 +242,303 @@ fn harness_fails_on_a_missing_golden() {
         panic!("golden `harness/never-recorded` is missing (update mode)");
     }
     check("harness/never-recorded", "anything");
+}
+
+// ---------------------------------------------------------------------
+// target — local (no network)
+// ---------------------------------------------------------------------
+
+#[test]
+fn target_list_empty_store() {
+    Sandbox::new().golden("target/list_empty", &["target", "list"]);
+}
+
+#[test]
+fn target_add_first_becomes_active() {
+    let sb = Sandbox::new();
+    let key = sb.ssh_key();
+    sb.golden(
+        "target/add_first",
+        &[
+            "target",
+            "add",
+            "prod",
+            "--provider",
+            "hetzner-cloud",
+            "--token",
+            TOKEN_A,
+            "--ssh-key",
+            &key,
+            "--region",
+            "nbg1",
+            "--tier",
+            "team",
+            "--cluster-name",
+            "platform-1",
+            "--no-ping",
+            "--no-interactive",
+        ],
+    );
+}
+
+#[test]
+fn target_add_second_keeps_active() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    let key = sb.ssh_key();
+    sb.golden(
+        "target/add_second",
+        &[
+            "target",
+            "add",
+            "staging",
+            "--provider",
+            "hetzner-cloud",
+            "--token",
+            TOKEN_B,
+            "--ssh-key",
+            &key,
+            "--region",
+            "fsn1",
+            "--tier",
+            "solo",
+            "--no-ping",
+            "--no-interactive",
+        ],
+    );
+}
+
+#[test]
+fn target_add_existing_without_force_is_refused() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    let key = sb.ssh_key();
+    sb.golden(
+        "target/add_existing_refused",
+        &[
+            "target",
+            "add",
+            "prod",
+            "--provider",
+            "hetzner-cloud",
+            "--token",
+            TOKEN_B,
+            "--ssh-key",
+            &key,
+            "--no-ping",
+            "--no-interactive",
+        ],
+    );
+}
+
+#[test]
+fn target_add_force_overwrites() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    let key = sb.ssh_key();
+    sb.golden(
+        "target/add_force",
+        &[
+            "target",
+            "add",
+            "prod",
+            "--provider",
+            "hetzner-cloud",
+            "--token",
+            TOKEN_B,
+            "--ssh-key",
+            &key,
+            "--region",
+            "hel1",
+            "--force",
+            "--no-ping",
+            "--no-interactive",
+        ],
+    );
+}
+
+#[test]
+fn target_add_invalid_name_is_refused() {
+    let sb = Sandbox::new();
+    sb.golden(
+        "target/add_invalid_name",
+        &[
+            "target",
+            "add",
+            "-bad-",
+            "--provider",
+            "hetzner-cloud",
+            "--token",
+            TOKEN_A,
+            "--no-ping",
+            "--no-interactive",
+        ],
+    );
+}
+
+#[test]
+fn target_add_renew_rotates_token() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.golden(
+        "target/add_renew",
+        &[
+            "target",
+            "add",
+            "prod",
+            "--renew",
+            "--token",
+            TOKEN_B,
+            "--no-ping",
+            "--no-interactive",
+        ],
+    );
+}
+
+#[test]
+fn target_add_renew_identical_token_is_refused() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.golden(
+        "target/add_renew_identical",
+        &[
+            "target",
+            "add",
+            "prod",
+            "--renew",
+            "--token",
+            TOKEN_A,
+            "--no-ping",
+            "--no-interactive",
+        ],
+    );
+}
+
+#[test]
+fn target_list_two_marks_active() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.add_target("staging");
+    sb.golden("target/list_two", &["target", "list"]);
+}
+
+#[test]
+fn target_show_active() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.golden("target/show_active", &["target", "show"]);
+}
+
+#[test]
+fn target_info_alias_matches_show() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.golden("target/info_alias", &["target", "info"]);
+}
+
+#[test]
+fn target_show_named_unknown() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.golden("target/show_unknown", &["target", "show", "ghost"]);
+}
+
+#[test]
+fn target_use_switches_active() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.add_target("staging");
+    sb.golden("target/use_staging", &["target", "use", "staging"]);
+}
+
+#[test]
+fn target_use_unknown_is_refused() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.golden("target/use_unknown", &["target", "use", "ghost"]);
+}
+
+#[test]
+fn target_rename_active_keeps_it_active() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.add_target("staging");
+    sb.golden(
+        "target/rename_active",
+        &["target", "rename", "prod", "production"],
+    );
+}
+
+#[test]
+fn target_rename_inactive() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.add_target("staging");
+    sb.golden(
+        "target/rename_inactive",
+        &["target", "rename", "staging", "stage"],
+    );
+}
+
+#[test]
+fn target_remove_active_moves_pointer_to_next() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.add_target("staging");
+    sb.golden(
+        "target/remove_active",
+        &["target", "remove", "prod", "--yes"],
+    );
+}
+
+#[test]
+fn target_remove_inactive() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.add_target("staging");
+    sb.golden(
+        "target/remove_inactive",
+        &["target", "remove", "staging", "--yes"],
+    );
+}
+
+#[test]
+fn target_remove_last_clears_pointer() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.golden("target/remove_last", &["target", "remove", "prod", "--yes"]);
+}
+
+#[test]
+fn target_remove_without_yes_non_interactive() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.golden("target/remove_no_yes", &["target", "remove", "prod"]);
+}
+
+#[test]
+fn target_remove_unknown_is_refused() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.golden(
+        "target/remove_unknown",
+        &["target", "remove", "ghost", "--yes"],
+    );
+}
+
+#[test]
+fn target_machine_no_ping_records_unvalidated() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.golden(
+        "target/machine_no_ping",
+        &["target", "machine", "--server-type", "cx32", "--no-ping"],
+    );
+}
+
+#[test]
+fn target_ip_without_server() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.golden("target/ip_no_server", &["target", "ip"]);
 }

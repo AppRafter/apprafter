@@ -1,0 +1,5 @@
+$ apprafter target use staging
+[exit 0]
+[stdout]
+active target switched: `prod` → `staging`
+[stderr]

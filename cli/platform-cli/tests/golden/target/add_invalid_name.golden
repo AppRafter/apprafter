@@ -1,0 +1,11 @@
+$ apprafter target add -bad- --provider hetzner-cloud --token aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --no-ping --no-interactive
+[exit 2]
+[stdout]
+[stderr]
+error: unexpected argument '-b' found
+
+  tip: to pass '-b' as a value, use '-- -b'
+
+Usage: apprafter target add [OPTIONS] [NAME]
+
+For more information, try '--help'.

@@ -1,0 +1,15 @@
+$ apprafter target add prod --renew --token aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --no-ping --no-interactive
+[exit 1]
+[stdout]
+[stderr]
+Error: apprafter::cli::other
+
+  × `--renew` requires a NEW token, but the value provided is identical to the
+  │ one already saved for target `prod`. Generate a fresh token in the Hetzner
+  │ Cloud Console → Security → API Tokens, then re-run `apprafter target add
+  │ prod --renew` with the new value.
+  help: This is the catch-all CLI error. The message above is the only
+        context. If you see this often with the same wording, please file an
+        issue — recurring messages should be promoted to a typed `CliError`
+        variant with its own help text.
+

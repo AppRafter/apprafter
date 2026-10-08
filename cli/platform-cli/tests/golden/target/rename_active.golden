@@ -1,0 +1,5 @@
+$ apprafter target rename prod production
+[exit 0]
+[stdout]
+target renamed: `prod` → `production` (active pointer updated)
+[stderr]

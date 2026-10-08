@@ -1,0 +1,5 @@
+$ apprafter target add prod --renew --token bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb --no-ping --no-interactive
+[exit 0]
+[stdout]
+target `prod` credentials rotated (token NOT verified — `--no-ping` was passed)
+[stderr]

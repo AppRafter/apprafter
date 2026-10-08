@@ -1,0 +1,5 @@
+$ apprafter target remove prod --yes
+[exit 0]
+[stdout]
+target `prod` removed; no targets left, active pointer cleared
+[stderr]

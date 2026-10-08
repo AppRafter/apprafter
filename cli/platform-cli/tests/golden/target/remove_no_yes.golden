@@ -1,0 +1,13 @@
+$ apprafter target remove prod
+[exit 1]
+[stdout]
+[stderr]
+Error: apprafter::cli::other
+
+  × non-interactive invocation: pass `--yes` to confirm removing target `prod`
+  │ (refusing silent destruction)
+  help: This is the catch-all CLI error. The message above is the only
+        context. If you see this often with the same wording, please file an
+        issue — recurring messages should be promoted to a typed `CliError`
+        variant with its own help text.
+

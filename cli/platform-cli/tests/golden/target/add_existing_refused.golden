@@ -1,0 +1,13 @@
+$ apprafter target add prod --provider hetzner-cloud --token bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb --ssh-key <SANDBOX>/home/id_ed25519.pub --no-ping --no-interactive
+[exit 1]
+[stdout]
+[stderr]
+Error: apprafter::cli::other
+
+  × target `prod` already exists — pass `--force` to overwrite or `--renew` to
+  │ rotate credentials only
+  help: This is the catch-all CLI error. The message above is the only
+        context. If you see this often with the same wording, please file an
+        issue — recurring messages should be promoted to a typed `CliError`
+        variant with its own help text.
+
