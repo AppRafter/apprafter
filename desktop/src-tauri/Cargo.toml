@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+[package]
+name        = "apprafter-desktop"
+description = "AppRafter Desktop — the GUI twin of the apprafter CLI (ADR 0067)."
+# The desktop release stream's version authority (design spec §6.1). Unpublished until D.13;
+# tauri.conf.json5 carries no version and falls back to this one.
+version     = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "apprafter_desktop"
+
+[[bin]]
+name = "apprafter-desktop"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { workspace = true }
+
+[dependencies]
+apprafter-core        = { workspace = true }
+apprafter-desktop-ipc = { path = "../ipc" }
+serde                 = { workspace = true }
+serde_json            = { workspace = true }
+tauri                 = { workspace = true }

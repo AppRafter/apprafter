@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+# The minor CI pins (`toolchain: "1.98"`), as cli/rust-toolchain.toml does. rustup reads the
+# nearest file upward, so this one covers `bun run tauri …` in desktop/ and cargo in its crates.
+[toolchain]
+channel = "1.98"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

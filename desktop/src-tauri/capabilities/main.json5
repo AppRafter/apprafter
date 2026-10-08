@@ -1,0 +1,10 @@
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
+// The webview's permissions. Deliberately minimal: never `core:default`, which includes
+// `core:tray:default` and so every tray command. Each later step adds exactly what it uses.
+{
+  $schema: "../gen/schemas/desktop-schema.json",
+  identifier: "main",
+  windows: ["main"],
+  platforms: ["linux", "macOS", "windows"],
+  permissions: [],
+}
