@@ -9,8 +9,8 @@
 //! [`CoreError`] wraps `cli_core::CliError` (left unchanged: it is also the
 //! error type of the backup engine and reaches the in-cluster runner) and
 //! adds the variants the core itself raises. A code has one shape: the
-//! `CliError` variants the core also raises (`TargetNotFound`) are mapped
-//! onto the core's own on the way in. Messages carry no client
+//! `CliError` variants the core also raises (`TargetNotFound`,
+//! `NoActiveTarget`) are mapped onto the core's own on the way in. Messages carry no client
 //! wording ("pass `--yes`", "run `apprafter …`"): the CLI adds those hints
 //! when it renders, the desktop turns codes into actions.
 
@@ -48,7 +48,8 @@ pub enum CoreError {
     Cancelled,
 
     /// An error from the CLI's shared crates, passed through unchanged —
-    /// except `TargetNotFound`, which [`From`] maps onto the core's own.
+    /// except `TargetNotFound` and `NoActiveTarget`, which [`From`] maps
+    /// onto the core's own.
     #[error(transparent)]
     #[diagnostic(transparent)]
     Cli(cli_core::CliError),
@@ -59,7 +60,9 @@ pub enum CoreError {
 /// wrapped `CliError::TargetNotFound` whose `available` is one joined
 /// string. Splitting that string on `", "` is exact: the CLI only creates
 /// target names in `[A-Za-z0-9-]+`, and an empty string means an empty
-/// store. Every other `CliError` is wrapped unchanged.
+/// store. `apprafter::target::no_active` likewise always arrives as
+/// [`CoreError::NoActiveTarget`]. Every other `CliError` is wrapped
+/// unchanged.
 impl From<cli_core::CliError> for CoreError {
     fn from(e: cli_core::CliError) -> Self {
         match e {
@@ -71,6 +74,7 @@ impl From<cli_core::CliError> for CoreError {
                     .map(str::to_string)
                     .collect(),
             },
+            cli_core::CliError::NoActiveTarget => CoreError::NoActiveTarget,
             other => CoreError::Cli(other),
         }
     }
@@ -228,6 +232,15 @@ mod tests {
             CoreError::TargetNotFound { available, .. } if available.is_empty()
         ));
         assert_eq!(UiError::from(&e).fields["available"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn a_cli_no_active_target_takes_the_core_shape() {
+        let e = CoreError::from(cli_core::CliError::NoActiveTarget);
+        assert!(matches!(e, CoreError::NoActiveTarget), "{e:?}");
+        let ui = UiError::from(&e);
+        assert_eq!(ui.code.as_deref(), Some("apprafter::target::no_active"));
+        assert_eq!(ui.message, "no active target");
     }
 
     #[test]

@@ -2,12 +2,11 @@ $ apprafter app list
 [exit 1]
 [stdout]
 [stderr]
-Error: apprafter::cli::other
+Error: apprafter::target::no_active
 
   × no active target — run `apprafter target add <name> --provider hetzner-
   │ cloud …` first, or supply `--target <name>` to point at a specific one
-  help: This is the catch-all CLI error. The message above is the only
-        context. If you see this often with the same wording, please file an
-        issue — recurring messages should be promoted to a typed `CliError`
-        variant with its own help text.
+  help: List what is configured with `apprafter target list`; pick one with
+        `apprafter target use <name>`, or create the first with `apprafter
+        target add <name>`.
 

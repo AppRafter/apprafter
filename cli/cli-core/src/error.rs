@@ -322,6 +322,20 @@ pub enum CliError {
         available: String,
     },
 
+    /// No `--target` was given and the store has no active target.
+    #[error(
+        "no active target — run `apprafter target add <name> --provider hetzner-cloud …` first, or \
+         supply `--target <name>` to point at a specific one"
+    )]
+    #[diagnostic(
+        code(apprafter::target::no_active),
+        help(
+            "List what is configured with `apprafter target list`; pick one with \
+             `apprafter target use <name>`, or create the first with `apprafter target add <name>`."
+        )
+    )]
+    NoActiveTarget,
+
     /// Token validation ping during `target add` rejected the
     /// supplied credentials. Distinct from the generic
     /// `Hetzner { status: 401, .. }` so the operator gets a
@@ -472,6 +486,26 @@ mod tests {
         err.help()
             .map(|h| format!("{h}"))
             .unwrap_or_else(|| "<no help>".to_string())
+    }
+
+    #[test]
+    fn no_active_target_carries_its_own_code_and_a_next_step() {
+        let err = CliError::NoActiveTarget;
+        assert_eq!(code_of(&err), "apprafter::target::no_active");
+        // The message is the one the catch-all carried before, byte for byte.
+        assert_eq!(
+            err.to_string(),
+            "no active target — run `apprafter target add <name> --provider hetzner-cloud …` \
+             first, or supply `--target <name>` to point at a specific one"
+        );
+        let help = help_of(&err);
+        for hint in [
+            "apprafter target list",
+            "apprafter target use",
+            "apprafter target add",
+        ] {
+            assert!(help.contains(hint), "missing `{hint}`: {help}");
+        }
     }
 
     #[test]

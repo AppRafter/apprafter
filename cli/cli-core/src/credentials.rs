@@ -53,9 +53,11 @@ pub const SSH_PUBLIC_KEY_ENV: &str = "APPRAFTER_SSH_PUBLIC_KEY";
 /// `target_override`: per-invocation `--target <name>` override.
 /// `None` falls back to the active target.
 ///
-/// Returns the resolved token string on success. On failure the
-/// `CliError::Other` payload enumerates every path the user can
-/// take next (flag / env / `apprafter target add`).
+/// Returns the resolved token string on success. When no token is
+/// found anywhere, the `CliError::Other` payload enumerates every
+/// path the user can take next (flag / env / `apprafter target
+/// add`); a target the store does not have is
+/// `CliError::TargetNotFound`.
 pub fn resolve_hetzner_token(
     cli_flag: Option<&str>,
     paths: &TargetStorePaths,
@@ -82,9 +84,7 @@ pub fn resolve_hetzner_token(
                 "target `{name}` has no Hetzner Cloud token stored. Run `apprafter target add {name} --renew --token <X>` to add one, or pass `--token`/`{HCLOUD_TOKEN_ENV}` for this invocation."
             ))
         }),
-        Err(CliError::TargetNotFound { available, .. }) => Err(CliError::Other(format!(
-            "target `{name}` not found (available: {available}). Pass `--target <name>` with a configured name, or `apprafter target use <name>` to switch the active pointer."
-        ))),
+        // `TargetNotFound` among them: it carries its own code and help.
         Err(e) => Err(e),
     }
 }
@@ -354,19 +354,18 @@ mod tests {
     }
 
     #[test]
-    fn resolve_token_with_override_for_missing_target_surfaces_available_hint() {
+    fn resolve_token_with_override_for_missing_target_is_target_not_found() {
         with_clean_env(|| {
             let (_dir, paths) = make_paths();
             seed_target(&paths, "default", Some("token"));
             let err =
                 resolve_hetzner_token(None, &paths, Some("ghost")).expect_err("missing target");
             match err {
-                CliError::Other(msg) => {
-                    assert!(msg.contains("not found"), "{msg}");
-                    assert!(msg.contains("default"), "{msg}");
-                    assert!(msg.contains("--target"), "{msg}");
+                CliError::TargetNotFound { name, available } => {
+                    assert_eq!(name, "ghost");
+                    assert_eq!(available, "default");
                 }
-                other => panic!("expected Other, got {other:?}"),
+                other => panic!("expected TargetNotFound, got {other:?}"),
             }
         });
     }

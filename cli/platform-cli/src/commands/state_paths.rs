@@ -27,8 +27,8 @@
 //!    `cli_core::target::default_config_root()` (honours
 //!    `APPRAFTER_CONFIG_DIR` so integration tests can redirect).
 //! 2. Resolve the active target name — `--target <name>`
-//!    override → `GlobalConfig.active_target` → typed
-//!    `CliError::Other` with onboarding hint if nothing's set.
+//!    override → `GlobalConfig.active_target` →
+//!    `CliError::NoActiveTarget` if nothing's set.
 //! 3. Build the per-target [`StatePaths`].
 //! 4. Best-effort migration: if the operator has a legacy
 //!    `<cwd>/.apprafter/state.json` from v0.1.153 and the new
@@ -68,22 +68,16 @@ pub struct ResolvedStatePaths {
 /// `apprafter app add` that don't expose `--target` — they
 /// always read the active target.
 ///
-/// Returns a typed `CliError::Other` with an onboarding hint
-/// when the target store is empty (no active target, no
-/// override). That state is recoverable — `apprafter target add
-/// <name>` configures one — so the error wraps a guidance
-/// message rather than panicking the way the previous cwd-based
-/// flow did.
+/// Returns `CliError::NoActiveTarget` when the target store has
+/// no active target and no override was given, and
+/// `CliError::TargetNotFound` when the override names a target the
+/// store does not have. Both are recoverable — `apprafter target
+/// add <name>` / `target use <name>` — and their help says how.
 pub fn resolve_state_paths(target_override: Option<&str>) -> Result<ResolvedStatePaths> {
     let store_root = default_config_root()?;
     let store = TargetStorePaths::for_root(store_root);
-    let target_name = resolve_active_target_name(&store, target_override)?
-        .ok_or_else(|| {
-            CliError::Other(
-                "no active target — run `apprafter target add <name> --provider hetzner-cloud …` first, or supply `--target <name>` to point at a specific one"
-                    .to_string(),
-            )
-        })?;
+    let target_name =
+        resolve_active_target_name(&store, target_override)?.ok_or(CliError::NoActiveTarget)?;
 
     // Eager existence check when the operator supplied a
     // `--target <name>` override. Without it, an operator typing
@@ -96,10 +90,10 @@ pub fn resolve_state_paths(target_override: Option<&str>) -> Result<ResolvedStat
     if target_override.is_some() {
         let available = list_target_names(&store).unwrap_or_default();
         if !available.iter().any(|n| n == &target_name) {
-            return Err(CliError::Other(format!(
-                "target `{target_name}` not found (available: {}). Pass `--target <name>` with a configured name, or `apprafter target use <name>` to switch the active pointer.",
-                available.join(", ")
-            )));
+            return Err(CliError::TargetNotFound {
+                name: target_name,
+                available: available.join(", "),
+            });
         }
     }
 

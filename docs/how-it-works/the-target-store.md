@@ -132,8 +132,9 @@ env → target store's `ssh_key_path` → read the file).
 
 There is **no single "chain tried 1/2/3" error**. Each rung fails with
 its own message, and which one you get tells you where you actually
-are. All three are `apprafter::cli::other`; the `help:` footer is
-omitted here.
+are. Their codes are `apprafter::target::no_active`,
+`apprafter::cli::other` and `apprafter::target::not_found`, in the
+order below; the `help:` footer is omitted here.
 
 On an empty store you never reach the token chain at all — resolving
 the per-target state directory refuses first, so this is the message a
@@ -156,14 +157,13 @@ And with `--target` pointing at a name that is not in the store — note
 that it lists what is:
 
 ```text
-  × target `ghost` not found (available: prod). Pass `--target <name>` with a
-  │ configured name, or `apprafter target use <name>` to switch the active
-  │ pointer.
+  × target `ghost` not found (available: prod)
 ```
 
-Each names the rung that failed and the next thing to type, which is
-what you need; what none of them does is enumerate the other two, so
-do not go looking for a rung-by-rung report.
+Each names the rung that failed and, in its message or its help, the
+next thing to type, which is what you need; what none of them does is
+enumerate the other two, so do not go looking for a rung-by-rung
+report.
 
 ## See also
 
