@@ -16,7 +16,17 @@
     "rules": {
       "preset": "recommended",
       "style": {
-        "useNamingConvention": "off"
+        "useNamingConvention": "off",
+        "noRestrictedGlobals": {
+          "level": "error",
+          "options": {
+            "deniedGlobals": {
+              "localStorage": "State lives in Rust; WKWebView storage ignores the data-dir override.",
+              "sessionStorage": "State lives in Rust; WKWebView storage ignores the data-dir override.",
+              "indexedDB": "State lives in Rust; WKWebView storage ignores the data-dir override."
+            }
+          }
+        }
       },
       "suspicious": {
         "noExplicitAny": "warn"
