@@ -800,7 +800,7 @@
     {
       "id": "rust-toolchain-minor",
       "class": "toolchain-minor",
-      "title": "Rust toolchain minor (CI, builder images, mise, cli/, dev container)",
+      "title": "Rust toolchain minor (CI, builder images, mise, cli/, desktop/, dev container)",
       "read": {
         "kind": "regex",
         "sources": [
@@ -808,6 +808,7 @@
           { "files": "*Dockerfile", "pattern": "FROM docker\\.io/library/rust:(\\d+\\.\\d+)-" },
           { "files": "mise.toml", "pattern": "(?m)^rust\\s*=\\s*\"([^\"]+)\"" },
           { "files": "cli/rust-toolchain.toml", "pattern": "(?m)^channel\\s*=\\s*\"([^\"]+)\"" },
+          { "files": "desktop/rust-toolchain.toml", "pattern": "(?m)^channel\\s*=\\s*\"([^\"]+)\"" },
           { "files": ".devcontainer/devcontainer.json", "pattern": "features/rust:1\"\\s*:\\s*\\{[^}]*?\"version\"\\s*:\\s*\"([^\"]+)\"" }
         ]
       },
@@ -815,7 +816,7 @@
       "compare": "minor",
       "gate": null,
       "gateGap": "A Rust minor is proven by the whole cargo test + clippy matrix under the candidate, i.e. test.yml and lint.yml on a pull request that moves every copy at once. A watch job cannot run that honestly.",
-      "note": "One decision, five surfaces: CI's dtolnay/rust-toolchain `toolchain:` input, the rust:<minor>-alpine builder images, mise.toml, cli/rust-toolchain.toml, and the dev container's rust feature. The last OVERRIDES the first inside cli/ (rustup: toolchain file beats `rustup default`), so a `stable` there silently un-pins every cli/ job in CI, release-cli.yml included -- and the release matrix's cross target is installed for the pinned toolchain only. Minor pinned, patch floats. The flake's nixpkgs rustc is not written in the tree and is not read here (1.95 at the locked rev)."
+      "note": "One decision, six surfaces: CI's dtolnay/rust-toolchain `toolchain:` input, the rust:<minor>-alpine builder images, mise.toml, cli/rust-toolchain.toml, desktop/rust-toolchain.toml, and the dev container's rust feature. A rust-toolchain.toml OVERRIDES the first inside its workspace (rustup: toolchain file beats `rustup default`), so a `stable` in cli/'s silently un-pins every cli/ job in CI, release-cli.yml included (and in desktop/'s, every desktop job) -- and the release matrix's cross target is installed for the pinned toolchain only. Minor pinned, patch floats. The flake's nixpkgs rustc is not written in the tree and is not read here (1.95 at the locked rev)."
     },
     {
       "id": "mise-bun",
@@ -1085,6 +1086,24 @@
       "note": "Encrypts the kubeconfig and argocd password cached under ~/.config/apprafter."
     },
     {
+      "id": "desktop-tauri-minor",
+      "class": "cargo-crate",
+      "title": "Tauri minor (AppRafter Desktop: the tauri crate, @tauri-apps/api, @tauri-apps/cli)",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": "desktop/Cargo.toml", "pattern": "(?m)^tauri\\s*=\\s*\\{\\s*version\\s*=\\s*\"~?(\\d+\\.\\d+)" },
+          { "files": "desktop/package.json", "pattern": "\"@tauri-apps/api\"\\s*:\\s*\"~?(\\d+\\.\\d+)" },
+          { "files": "desktop/package.json", "pattern": "\"@tauri-apps/cli\"\\s*:\\s*\"~?(\\d+\\.\\d+)" }
+        ]
+      },
+      "upstream": { "kind": "crates-io", "crate": "tauri" },
+      "compare": "minor",
+      "gate": null,
+      "gateGap": "A Tauri minor is proven by test.yml's rust-desktop matrix under the candidate -- cargo test plus `tauri build --debug --no-bundle` on Linux, macOS and Windows -- on a pull request that moves all three copies at once. A watch job cannot run that honestly.",
+      "note": "One decision, three copies: the `tauri` requirement in desktop/Cargo.toml and the @tauri-apps/api and @tauri-apps/cli ranges in desktop/package.json, each a `~` minor whose patch floats. A disagreement between them is exactly tauri-cli's \"Found version mismatched Tauri packages\" error (the NPM packages and the Rust crate must share a major/minor), so DRIFT here is a build `tauri build` refuses. tauri-build is numbered separately (2.7 beside tauri 2.12) and is not part of this decision."
+    },
+    {
       "id": "deps-cargo-cli",
       "class": "package-manager",
       "title": "cargo dependencies (cli/ workspace)",
@@ -1119,6 +1138,24 @@
       "gate": null,
       "gateGap": "Same as the cli workspace.",
       "note": "Separate Cargo workspace -- there is no top-level Cargo.toml, so this genuinely is a second inventory entry and not a duplicate."
+    },
+    {
+      "id": "deps-cargo-desktop",
+      "class": "package-manager",
+      "title": "cargo dependencies (desktop/ workspace)",
+      "read": {
+        "kind": "command",
+        "cmd": ["cargo", "update", "--dry-run", "--workspace"],
+        "cwd": "desktop",
+        "pattern": "(\\d+) unchanged dependencies behind latest",
+        "zeroText": "all dependencies at latest",
+        "unit": "crates behind latest"
+      },
+      "upstream": { "kind": "none" },
+      "compare": "none",
+      "gate": null,
+      "gateGap": "Same as the cli workspace.",
+      "note": "AppRafter Desktop's own Cargo workspace (ADR 0067), a third inventory entry for the same reason as operator/. It builds apprafter-core by path, and that closure must resolve as cli/Cargo.lock does (scripts/check-desktop-core-lock.sh): a shared crate moves in cli/ first, and only the desktop-only graph (Tauri and its platform crates) is taken here, with `cargo update -p`."
     },
     {
       "id": "deps-bun-landing",
@@ -1157,6 +1194,25 @@
       "gate": null,
       "gateGap": "Backstage plugin dependencies move with the Backstage release train, which is a coordinated upgrade rather than a per-package bump.",
       "note": "The frontend plugin and examples/templates/bun-http/skeleton are deliberately NOT tracked: the skeleton is a Backstage scaffolder template whose package.json `name` is the literal placeholder ${{ values.name }} and which ships no lockfile, so bumping it silently changes what every scaffolded user project starts from."
+    },
+    {
+      "id": "deps-bun-desktop",
+      "class": "package-manager",
+      "title": "bun dependencies (desktop/)",
+      "read": {
+        "kind": "command",
+        "cmd": ["bun", "outdated"],
+        "cwd": "desktop",
+        "pattern": null,
+        "countPattern": "(?m)^\\|\\s+(?!Package\\b)[^|\\s]",
+        "zeroText": "all dependencies at latest",
+        "unit": "packages behind latest"
+      },
+      "upstream": { "kind": "none" },
+      "compare": "none",
+      "gate": null,
+      "gateGap": "`bun update` + `bun test` is a real gate and test.yml's bun job already runs the desktop's tests -- but every range here is a `~` minor pin on purpose, so a count is a minor or a major to take deliberately, and the two @tauri-apps packages move only with the Rust crate (desktop-tauri-minor).",
+      "note": "AppRafter Desktop's frontend package (ADR 0067). Requires bun on PATH; reports TOOL-MISSING otherwise."
     }
   ]
 }
