@@ -164,16 +164,10 @@ fn run_add(mut args: AddArgs) -> Result<()> {
         verify_ssh_key_readable(path)?;
     }
 
-    let existing = load_target(&paths, &name);
-    match existing {
-        Ok(_) if !args.force => {
-            return Err(CliError::Other(format!(
-                "target `{name}` already exists — pass `--force` to overwrite or `--renew` to rotate credentials only"
-            )));
-        }
-        Ok(_) | Err(CliError::TargetNotFound { .. }) => {}
-        Err(e) => return Err(e),
-    }
+    // Checked here, before the ping, so an add that cannot succeed fails at
+    // once; and again under the store lock, right before the save
+    // (`save_new_target`), where it decides.
+    check_name_free(&paths, &name, args.force)?;
 
     // API ping confirms the token actually authenticates with the
     // provider. Happens AFTER the existing-target check so a no-op
@@ -216,9 +210,7 @@ fn run_add(mut args: AddArgs) -> Result<()> {
             hetzner_token: Some(token),
         },
     };
-    save_target(&paths, &target)?;
-
-    let became_active = ensure_active_target(&paths, &name)?;
+    let became_active = save_new_target(&paths, &target, args.force)?;
 
     let verified_suffix = add_verified_suffix(args.no_ping);
     if became_active {
@@ -231,6 +223,31 @@ fn run_add(mut args: AddArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Refuse to add `name` when the store already has it, unless `force`. A
+/// target that is there but unreadable is an error either way.
+fn check_name_free(paths: &TargetStorePaths, name: &str, force: bool) -> Result<()> {
+    match load_target(paths, name) {
+        Ok(_) if !force => Err(CliError::Other(format!(
+            "target `{name}` already exists — pass `--force` to overwrite or `--renew` to rotate credentials only"
+        ))),
+        Ok(_) | Err(CliError::TargetNotFound { .. }) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Save a new `target` and, on a fresh store, make it the active one;
+/// returns whether it became active. Under the store lock, and nothing slow
+/// inside it — the token ping and the SKU check ran before, unlocked — so
+/// the lock is held for a few file operations, never across the network.
+/// The name is checked again under the lock: another add may have created
+/// it since the first check, and only `force` overwrites it.
+fn save_new_target(paths: &TargetStorePaths, target: &Target, force: bool) -> Result<bool> {
+    let _store_lock = store_lock(paths)?;
+    check_name_free(paths, &target.name, force)?;
+    save_target(paths, target)?;
+    ensure_active_target(paths, &target.name)
 }
 
 /// Same idea as [`add_verified_suffix`], for the `--renew` path — a rotation
@@ -351,15 +368,9 @@ pub(crate) fn map_wizard_prompt_error(err: inquire::InquireError) -> CliError {
 }
 
 fn run_renew(paths: &TargetStorePaths, args: AddArgs, name: &str) -> Result<()> {
-    let mut existing = match load_target(paths, name) {
-        Ok(t) => t,
-        Err(CliError::TargetNotFound { .. }) => {
-            return Err(CliError::Other(format!(
-                "target `{name}` does not exist — drop `--renew` to create it fresh"
-            )));
-        }
-        Err(e) => return Err(e),
-    };
+    // Read without the lock: the checks and the ping below take as long as
+    // the network does. The save re-reads under it (`save_renewed`).
+    let existing = load_renewable(paths, name)?;
 
     // `--renew` deliberately ignores the config flags (provider,
     // region, tier, etc.). Refusing them up front beats silently
@@ -386,22 +397,53 @@ fn run_renew(paths: &TargetStorePaths, args: AddArgs, name: &str) -> Result<()> 
 
     if let Some(path) = args.ssh_key.as_ref() {
         verify_ssh_key_readable(path)?;
-        existing.config.ssh_key_path = Some(path.clone());
     }
     if !args.no_ping {
         ping_provider(&existing.config.provider, &token)?;
     }
 
-    existing.credentials = TargetCredentials {
-        hetzner_token: Some(token),
-    };
-    save_target(paths, &existing)?;
+    save_renewed(paths, name, token, args.ssh_key)?;
 
     println!(
         "target `{name}` credentials rotated{}",
         renew_verified_suffix(args.no_ping)
     );
     Ok(())
+}
+
+/// Target `name`, for `--renew`, which rotates the credentials of a target
+/// that exists.
+fn load_renewable(paths: &TargetStorePaths, name: &str) -> Result<Target> {
+    match load_target(paths, name) {
+        Ok(t) => Ok(t),
+        Err(CliError::TargetNotFound { .. }) => Err(CliError::Other(format!(
+            "target `{name}` does not exist — drop `--renew` to create it fresh"
+        ))),
+        Err(e) => Err(e),
+    }
+}
+
+/// Write the rotated `token` (and the new `ssh_key` path, if one was given)
+/// into target `name`, under the store lock: re-read, re-checked (the target
+/// still exists, and the token is still a new one), and only those fields
+/// changed, so an edit made while the token was being verified — a
+/// `target machine`, say — is kept rather than written over.
+fn save_renewed(
+    paths: &TargetStorePaths,
+    name: &str,
+    token: String,
+    ssh_key: Option<PathBuf>,
+) -> Result<()> {
+    let _store_lock = store_lock_if_present(paths)?;
+    let mut target = load_renewable(paths, name)?;
+    reject_identical_token(target.credentials.hetzner_token.as_deref(), &token, name)?;
+    if let Some(path) = ssh_key {
+        target.config.ssh_key_path = Some(path);
+    }
+    target.credentials = TargetCredentials {
+        hetzner_token: Some(token),
+    };
+    save_target(paths, &target)
 }
 
 // ---------------------------------------------------------------
@@ -577,6 +619,46 @@ fn verify_ssh_key_readable(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The store lock, or none when there is no store yet: a command that
+/// will fail on a missing store must not create one by locking it.
+pub(crate) fn store_lock_if_present(
+    paths: &TargetStorePaths,
+) -> Result<Option<cli_core::StoreLock>> {
+    if paths.root().exists() {
+        store_lock(paths).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+/// The store lock for a CLI edit of the store. While another AppRafter
+/// process holds it the command waits, and says so once on stderr — a
+/// silent wait reads as a hang. Where the store cannot be locked at all
+/// (read-only, a filesystem without locks) it warns and the edit goes
+/// ahead unlocked.
+pub(crate) fn store_lock(paths: &TargetStorePaths) -> Result<cli_core::StoreLock> {
+    cli_core::StoreLock::exclusive_or_wait(paths, report_store_lock_event)
+}
+
+/// Print what taking the store lock reported, one stderr line per event.
+pub(crate) fn report_store_lock_event(event: cli_core::StoreLockEvent<'_>) {
+    eprintln!("{}", store_lock_event_line(&event));
+}
+
+/// The stderr line for a store-lock event.
+pub(crate) fn store_lock_event_line(event: &cli_core::StoreLockEvent<'_>) -> String {
+    match event {
+        cli_core::StoreLockEvent::Waiting { sentinel } => format!(
+            "waiting for another AppRafter process to release the target store ({})…",
+            sentinel.display()
+        ),
+        cli_core::StoreLockEvent::Unlocked { sentinel, error } => format!(
+            "warning: cannot lock the target store ({}): {error}; continuing without the lock",
+            sentinel.display()
+        ),
+    }
+}
+
 /// Promote the supplied target to active when the store has no
 /// `GlobalConfig` yet (first-run case). Returns whether the active
 /// pointer changed — caller uses it to vary the confirmation
@@ -611,6 +693,117 @@ fn ensure_active_target(paths: &TargetStorePaths, name: &str) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── the store lock: what a wait and a lock-less store print ──────────
+
+    #[test]
+    fn a_wait_for_the_store_lock_names_the_sentinel() {
+        let sentinel = Path::new("/s/.lock");
+        let line = store_lock_event_line(&cli_core::StoreLockEvent::Waiting { sentinel });
+        assert_eq!(
+            line,
+            "waiting for another AppRafter process to release the target store (/s/.lock)…"
+        );
+    }
+
+    #[test]
+    fn a_store_that_cannot_be_locked_is_a_warning_naming_the_cause() {
+        let sentinel = Path::new("/s/.lock");
+        let error = std::io::Error::other("Read-only file system");
+        let line = store_lock_event_line(&cli_core::StoreLockEvent::Unlocked {
+            sentinel,
+            error: &error,
+        });
+        assert_eq!(
+            line,
+            "warning: cannot lock the target store (/s/.lock): Read-only file system; \
+             continuing without the lock"
+        );
+    }
+
+    // ── the store lock: re-checked right before the save ─────────────────
+
+    /// A target store at a fresh temp root.
+    fn store() -> (tempfile::TempDir, TargetStorePaths) {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = TargetStorePaths::for_root(dir.path().join("store"));
+        (dir, paths)
+    }
+
+    /// Target `name`, holding `token`.
+    fn target(name: &str, token: &str) -> Target {
+        Target {
+            name: name.to_string(),
+            config: TargetConfig {
+                provider: "hetzner-cloud".to_string(),
+                ..TargetConfig::default()
+            },
+            credentials: TargetCredentials {
+                hetzner_token: Some(token.to_string()),
+            },
+        }
+    }
+
+    fn token_of(paths: &TargetStorePaths, name: &str) -> Option<String> {
+        load_target(paths, name).unwrap().credentials.hetzner_token
+    }
+
+    /// `target add` checks the name, pings the provider unlocked, then
+    /// saves. Another add that created the same name in between is found
+    /// by the check under the lock and is not overwritten without
+    /// `--force` — the window the ping used to hold the lock across.
+    #[test]
+    fn an_add_does_not_overwrite_a_target_created_since_its_first_check() {
+        let (_dir, paths) = store();
+        check_name_free(&paths, "work", false).expect("free at the first check");
+        // Meanwhile, during the ping, another add creates it.
+        assert!(save_new_target(&paths, &target("work", "first"), false).unwrap());
+
+        let err = save_new_target(&paths, &target("work", "second"), false)
+            .expect_err("taken since the first check");
+        assert!(err.to_string().contains("already exists"), "{err}");
+        assert_eq!(token_of(&paths, "work").as_deref(), Some("first"));
+
+        // `--force` is what overwrites, and an existing store keeps its
+        // active target.
+        assert!(!save_new_target(&paths, &target("work", "second"), true).unwrap());
+        assert_eq!(token_of(&paths, "work").as_deref(), Some("second"));
+    }
+
+    /// `--renew` writes only the token (and a new key path) into the
+    /// target as it is under the lock: an edit made while the new token
+    /// was being verified is kept, and a target removed meanwhile is not
+    /// brought back.
+    #[test]
+    fn a_renew_patches_the_target_as_it_is_at_the_save() {
+        let (_dir, paths) = store();
+        save_target(&paths, &target("work", "old")).unwrap();
+        let read_first = load_renewable(&paths, "work").unwrap();
+        // Meanwhile, during the ping, `target machine` records a SKU.
+        let mut machine = load_target(&paths, "work").unwrap();
+        machine.config.server_type = Some("cx32".to_string());
+        save_target(&paths, &machine).unwrap();
+
+        save_renewed(&paths, "work", "new".to_string(), None).unwrap();
+        let saved = load_target(&paths, "work").unwrap();
+        assert_eq!(saved.credentials.hetzner_token.as_deref(), Some("new"));
+        assert_eq!(
+            saved.config.server_type.as_deref(),
+            Some("cx32"),
+            "the edit made meanwhile was written over by {read_first:?}"
+        );
+
+        // The same token again is still refused under the lock.
+        let err =
+            save_renewed(&paths, "work", "new".to_string(), None).expect_err("identical token");
+        assert!(err.to_string().contains("NEW token"), "{err}");
+
+        remove_target(&paths, "work").unwrap();
+        let err =
+            save_renewed(&paths, "work", "newer".to_string(), None).expect_err("removed meanwhile");
+        assert!(err.to_string().contains("does not exist"), "{err}");
+        assert!(!paths.target_dir("work").exists());
+    }
 
     #[test]
     fn validate_target_name_accepts_kebab_lowercase() {
@@ -1036,15 +1229,19 @@ mod tests {
         assert_eq!(resolve_show_target(Some("other"), "").unwrap(), "other");
     }
 
-    /// On a fresh store there is nothing to show, and the error has to name
-    /// BOTH ways out — an operator cannot guess "add one first" from a bare
-    /// "not found".
+    /// On a fresh store there is nothing to show: the typed no-active-target
+    /// error, whose message and help name the ways out — an operator cannot
+    /// guess "add one first" from a bare "not found".
     #[test]
-    fn show_without_a_name_or_an_active_target_points_at_both_ways_out() {
+    fn show_without_a_name_or_an_active_target_is_the_no_active_target_error() {
         let err = resolve_show_target(None, "").expect_err("nothing to show");
+        assert!(matches!(err, CliError::NoActiveTarget), "{err:?}");
         let msg = format!("{err}");
-        assert!(msg.contains("apprafter target list"), "{msg}");
         assert!(msg.contains("apprafter target add"), "{msg}");
+        let help = miette::Diagnostic::help(&err)
+            .map(|h| h.to_string())
+            .unwrap_or_default();
+        assert!(help.contains("apprafter target list"), "{help}");
     }
 
     /// A self-rename is refused rather than performed as a no-op that reports
@@ -1344,6 +1541,7 @@ pub(crate) fn list_summary_line(count: usize, active: &str) -> String {
 fn run_use(name: &str) -> Result<()> {
     info!(target = %name, "target use invoked");
     let paths = TargetStorePaths::for_root(default_config_root()?);
+    let _store_lock = store_lock_if_present(&paths)?;
     // `load_target` returns TargetNotFound with an `available`
     // hint when the name doesn't exist — we let that surface
     // verbatim.
@@ -1430,16 +1628,14 @@ fn run_show(name: Option<&str>) -> Result<()> {
 }
 
 /// Which target `target show` displays: the explicit name, else the active
-/// one. With neither, the error has to name BOTH ways out — an operator on a
-/// fresh store has no target to show and no way to guess that from "not
-/// found".
+/// one. With neither, it is the typed no-active-target error every other
+/// command gives (`apprafter::target::no_active`), whose message and help
+/// name the ways out — `target add`, `target list`, `target use` — an
+/// operator on a fresh store cannot guess from "not found".
 pub(crate) fn resolve_show_target(name: Option<&str>, active: &str) -> Result<String> {
     match name {
         Some(n) => Ok(n.to_string()),
-        None if active.is_empty() => Err(CliError::Other(
-            "no active target and no name supplied. Run `apprafter target list` to see configured targets, or `apprafter target add` to create one."
-                .to_string(),
-        )),
+        None if active.is_empty() => Err(CliError::NoActiveTarget),
         None => Ok(active.to_string()),
     }
 }
@@ -1463,6 +1659,7 @@ fn run_rename(from: &str, to: &str) -> Result<()> {
     info!(from = %from, to = %to, "target rename invoked");
     check_rename(from, to)?;
     let paths = TargetStorePaths::for_root(default_config_root()?);
+    let _store_lock = store_lock_if_present(&paths)?;
 
     rename_target(&paths, from, to)?;
 
@@ -1504,6 +1701,10 @@ fn run_remove(name: &str, yes: bool) -> Result<()> {
         }
     }
 
+    // Taken after the confirmation, never across it: a prompt can wait on
+    // a human indefinitely. `remove_target` re-checks that the target
+    // still exists under the lock.
+    let _store_lock = store_lock_if_present(&paths)?;
     remove_target(&paths, name)?;
 
     // If the removed target was active, repoint the active marker

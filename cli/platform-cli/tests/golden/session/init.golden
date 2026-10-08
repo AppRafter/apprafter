@@ -1,0 +1,7 @@
+$ apprafter init --provider hetzner-cloud --tier solo --region nbg1
+[exit 0]
+[stdout]
+would init: provider=hetzner-cloud tier=solo region=nbg1
+(state written to <SANDBOX>/apprafter-config/state/prod/.apprafter/state.json; run `apply` next)
+[stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m init invoked <ESC>[3mprovider<ESC>[0m<ESC>[2m=<ESC>[0m"hetzner-cloud" <ESC>[3mtier<ESC>[0m<ESC>[2m=<ESC>[0msolo <ESC>[3mregion<ESC>[0m<ESC>[2m=<ESC>[0m"nbg1"

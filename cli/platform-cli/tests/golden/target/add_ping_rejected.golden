@@ -1,0 +1,37 @@
+$ apprafter target add prod --provider hetzner-cloud --token aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --ssh-key <SANDBOX>/home/id_ed25519.pub --region nbg1 --no-interactive
+[exit 1]
+[stdout]
+[stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m target add invoked <ESC>[3mtarget<ESC>[0m<ESC>[2m=<ESC>[0mprod <ESC>[3mrenew<ESC>[0m<ESC>[2m=<ESC>[0mfalse <ESC>[3mforce<ESC>[0m<ESC>[2m=<ESC>[0mfalse
+Error: apprafter::target::token_rejected
+
+  × provider `hetzner-cloud` rejected the supplied token
+  ╰─▶ apprafter::provider::hetzner_api_error
+      
+        × hetzner-cloud GET <HCLOUD>/v1/locations failed (status
+        │ 401): unauthorized: unable to authenticate
+        help: The Hetzner Cloud API returned a non-2xx response. Common
+              causes:
+              • 401 unauthorized — the stored API token was rotated or
+              revoked. Run `apprafter target add <name> --renew --token <new>`
+              to refresh it.
+              • 403 forbidden — the token's project lacks permission for this
+              resource type.
+              • 429 rate limit — back off and retry; if persistent, the
+              project may need a quota increase.
+              • 5xx — provider-side outage; check https://status.hetzner.com/.
+              Re-run `apprafter doctor` to confirm reachability after fixing
+              the root cause.
+      
+  help: The provider's read-only credential check returned 401 / unauthorized.
+        Either the token was mistyped, never had the right scopes, or has been
+        rotated / revoked since you copied it.
+        • Verify the token at https://console.hetzner.cloud/projects →
+        Security → API Tokens. It must say `Read & Write` next to the project.
+        • Copy the token again (it's 64 ASCII chars, no prefix) — common
+        cause: trailing newline from a clipboard manager.
+        • If you're rotating, run `apprafter target add <name> --renew --token
+        <new>` instead of re-creating the target.
+        • Pass `--no-ping` to skip the check if you're seeding a target
+        offline (CI sandbox, intermittent network).
+

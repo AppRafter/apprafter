@@ -17,4 +17,6 @@ serde_json = { workspace = true }
 thiserror  = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
+# Per-test state roots. `State::save` writes through
+# `cli_core::atomic_replace`, which owns the temp file.
+tempfile   = { workspace = true }

@@ -35,7 +35,10 @@
 //! (`helper_interrupt::refuse_if_interrupted`): the command's own
 //! thread starts nothing in the cluster after the signal. In every
 //! other command no handler is installed, the flag is never set, and
-//! the check is a load.
+//! the check is a load. Each wrapper also reads how its kubectl ended
+//! before it returns (`helper_interrupt::note_child_exit`): on Windows
+//! one that a console Ctrl-C ended sets the flag itself, since the
+//! console may deliver that Ctrl-C to kubectl before this process.
 
 use std::io::Write;
 use std::path::Path;
@@ -47,7 +50,7 @@ use cli_core::{CliError, Result};
 use cli_state::State;
 use tempfile::NamedTempFile;
 
-use crate::commands::helper_interrupt::refuse_if_interrupted;
+use crate::commands::helper_interrupt::{refuse_if_interrupted, Noted as _};
 use crate::commands::state_paths::resolve_state_paths;
 
 /// Build a classified [`CliError::Kubectl`] from a failed invocation.
@@ -256,6 +259,7 @@ fn kubectl_get_json_inner(
 
     let out = c
         .output()
+        .noted()
         .map_err(|e| CliError::Other(format!("spawn kubectl: {e}")))?;
 
     interpret_get_json_output(
@@ -343,6 +347,7 @@ pub(crate) fn kubectl_get_json_by_selector(
 
     let out = c
         .output()
+        .noted()
         .map_err(|e| CliError::Other(format!("spawn kubectl: {e}")))?;
 
     interpret_list_json_output(
@@ -426,6 +431,7 @@ pub(crate) fn kubectl_get_json_cluster_wide(
 
     let out = c
         .output()
+        .noted()
         .map_err(|e| CliError::Other(format!("spawn kubectl: {e}")))?;
 
     interpret_get_json_output(
@@ -452,6 +458,7 @@ pub fn kubectl_apply_json(manifest: &serde_json::Value, kubeconfig_path: &Path) 
         .arg(file.path())
         .env("KUBECONFIG", kubeconfig_path)
         .output()
+        .noted()
         .map_err(|e| CliError::Other(format!("spawn kubectl apply: {e}")))?;
     if !out.status.success() {
         return Err(kubectl_error(
@@ -524,6 +531,7 @@ pub fn kubectl_delete(
         .args(kubectl_delete_args(resource, name, namespace))
         .env("KUBECONFIG", kubeconfig_path)
         .output()
+        .noted()
         .map_err(|e| CliError::Other(format!("spawn kubectl delete: {e}")))?;
     if !out.status.success() {
         return Err(kubectl_error(
@@ -595,6 +603,7 @@ pub fn kubectl_merge_patch(
 
     let out = c
         .output()
+        .noted()
         .map_err(|e| CliError::Other(format!("spawn kubectl: {e}")))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -680,6 +689,7 @@ pub fn kubectl_apply_server_side(
 
     let out = child
         .wait_with_output()
+        .noted()
         .map_err(|e| CliError::Other(format!("wait for kubectl apply: {e}")))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);

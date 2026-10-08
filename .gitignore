@@ -20,6 +20,13 @@ out/
 
 # Rust
 target/
+# Golden snapshots are source: `tests/golden/<family>/` is named after the
+# CLI command family, so `target/` above would silently drop the `target`
+# family's files. A family named after a later rule here (`site/`, `tmp/`,
+# ...) needs its own negation after that rule. Verify:
+#
+#   git check-ignore -v cli/platform-cli/tests/golden/target/list_empty.golden
+!/cli/platform-cli/tests/golden/target/
 **/*.rs.bk
 *.pdb
 

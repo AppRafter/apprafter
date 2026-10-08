@@ -174,11 +174,15 @@ How to read it:
   `APPRAFTER_CONFIG_DIR` in your shell is pointing at.
 
 Two refusals are worth recognising. On an empty store, or after the
-active pointer has been cleared:
+active pointer has been cleared, it is the error an operational command
+such as `apply` gives there (for `show` the name goes in as an argument,
+`apprafter target show <name>`, not as `--target`):
 
 ```text
-× no active target and no name supplied. Run `apprafter target list` to see
-│ configured targets, or `apprafter target add` to create one.
+Error: apprafter::target::no_active
+
+  × no active target — run `apprafter target add <name> --provider hetzner-
+  │ cloud …` first, or supply `--target <name>` to point at a specific one
 ```
 
 and on a name that is not in the store — note that it lists what *is*:

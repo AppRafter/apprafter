@@ -84,7 +84,10 @@ pre-commit:
           # toolchain a byte-compare needs, and without nix a raw
           # "command not found" says nothing about what to do next.
           - name: docsgen
-            glob: "{cli/platform-cli/src/**,cli/docsgen/**,cli/Cargo.toml}"
+            # cli/apprafter-core/** (ADR 0067): clap-visible types stay in
+            # platform-cli by rule, but the shared core is listed so a moved
+            # ValueEnum or default cannot drift the reference unnoticed.
+            glob: "{cli/platform-cli/src/**,cli/apprafter-core/**,cli/docsgen/**,cli/Cargo.toml}"
             run: |
               command -v nix >/dev/null 2>&1 || {
                 echo "ERROR: regenerating the CLI reference needs nix — docsgen runs" >&2
@@ -136,7 +139,7 @@ pre-commit:
           # metrics` by hand, in the same commit, and say why in the
           # commit message.
           - name: docs-check
-            glob: "{README.md,docs/{*.md,**/*.md},docs/measurements/docs-health.json,mkdocs.yml,docs/hooks/**,scripts/docs-check.sh,scripts/docs-artefacts-check.py,cli/platform-cli/src/**,cli/docsgen/**,cli/Cargo.toml,schemas/v1alpha1/*.cue,operator/charts/apprafter-operator/templates/crd-*.yaml}"
+            glob: "{README.md,docs/{*.md,**/*.md},docs/measurements/docs-health.json,mkdocs.yml,docs/hooks/**,scripts/docs-check.sh,scripts/docs-artefacts-check.py,cli/platform-cli/src/**,cli/apprafter-core/**,cli/docsgen/**,cli/Cargo.toml,schemas/v1alpha1/*.cue,operator/charts/apprafter-operator/templates/crd-*.yaml}"
             run: ./scripts/docs-check.sh
     # THE VERSION GATES.
     #

@@ -1,0 +1,16 @@
+$ apprafter target add prod --provider hetzner-cloud --token aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --ssh-key <SANDBOX>/home/id_ed25519.pub --region nbg1 --server-type cx99 --no-interactive
+[exit 1]
+[stdout]
+[stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m target add invoked <ESC>[3mtarget<ESC>[0m<ESC>[2m=<ESC>[0mprod <ESC>[3mrenew<ESC>[0m<ESC>[2m=<ESC>[0mfalse <ESC>[3mforce<ESC>[0m<ESC>[2m=<ESC>[0mfalse
+Error: apprafter::provider::server_type_unavailable
+
+  × server type `cx99` is unavailable in region `nbg1`: unknown server type
+  │   try one of: cx22 (2c/4g/40d, x86), cx32 (4c/8g/80d, x86)
+  │   (override via APPRAFTER_MANIFEST or `--server-type` once it lands)
+  help: Hetzner periodically retires server types (e.g. cx22 → cpx22 in early
+        2026). The Infrastructure manifest's `nodes[0].kind` must reference a
+        type that is still active in the chosen region. Pick one of the
+        suggested alternatives above, or set `APPRAFTER_MANIFEST` to a
+        manifest with a different `nodes[0].kind`.
+

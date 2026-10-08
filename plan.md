@@ -43,6 +43,7 @@
 | 6 | Tier 4 — confidential | M6 | M | 5 |
 | 7 | Plugin ecosystem | (cross-cut) | L | 2 (gRPC), 3 (infra) |
 | 8 | 1.0 release | M7 | M | 4 (минимально), идеально 6 |
+| D | Desktop app (Tauri), отдельный трек | ADR 0067 | L | — (вне launch-бакетов) |
 | ∞ | Сквозные направления | — | — | running |
 
 Phase 7 запускается параллельно с 3+ как только готов CRD ServiceProvider (закроется в фазе 2).
@@ -7700,6 +7701,220 @@ CLI вообще.
 - [ ] **M.9 (PASS 5)** Migration helpers — Supabase / Railway basic (speedrun §3.8)
 - [ ] **M.10 (PASS 5)** Internal customer support tooling (speedrun §3.10)
 - [ ] **M.11 (PASS 6)** Polish + soft launch (closed beta → invite waves → public)
+
+---
+
+## Фаза D — Desktop app (Tauri) 🌱
+
+> 🏁 SR: вне бакетов — **отдельный трек** (решение владельца 2026-10-08), как Фаза M: не блокирует
+> запуск и не блокируется им. ATM: эпик **WI-427**, подэтапы **WI-428…WI-441**.
+
+**ADR:** 0067 (desktop = GUI-близнец CLI, не портал; общий домен `apprafter-core`; три ОС; keyring;
+поток версий `desktop/v*`).
+**Спек:** `docs/superpowers/specs/2026-10-08-desktop-app-design.md` (ревизия 2, после
+адверсариальной проверки; локальный, gitignored). Дизайн — проект Claude Design «Tauri приложение
+для AppRafter», файл `AppRafterApp.dc.html`, раскладка A; в D.2 коммитится в `desktop/design-source/`.
+
+**Цель:** кроссплатформенное (Windows / Linux / macOS) desktop-приложение со 100% покрытием видимых
+leaf-команд CLI (86 на CLI 0.2.79) плюс экстра из дизайна: вкладки кластеров с явным target,
+живое обновление, inbox / OS-уведомления / трей, замок через системную аутентификацию, OS-жест на
+деструктивных операциях, секреты в keyring (общие с CLI), мастер `app add` по локальным папкам,
+выбор машины.
+
+**Ключевые решения:** архитектура A — новый крейт `cli/apprafter-core` со всем доменом CLI
+(Read / Session / Mutation с plan→confirm→execute, `Context` вместо env, явный target,
+`Reporter`, `CancellationToken`, `CoreError`, трейт `Kube` с одной kubectl-реализацией); CLI —
+clap + мастера + рендерер с побайтовым паритетом по golden-снапшотам; `desktop/` — отдельный
+Cargo-воркспейс + bun (Tauri 2, React 19, TS, TanStack Query, типы через `ts-rs`). Утилиты —
+только детект + инструкции. Порядок — вертикальные срезы, первый — `target`.
+
+**Покрытие:** `desktop/coverage.toml` ↔ `docs/reference/cli/commands.json`; маркеры `cli-only`
+(`completion`), `unavailable` (`plan`, `login`, `upgrade-tier`), `superseded` (`init`), `planned`
+(допустим до D.13). Карта «команда → экран» — спек §7.
+
+---
+
+### D.0 — ADR 0067 и решения в документах
+
+> 🏁 SR: трек D · открыто 2026-10-08
+
+> ✅ **ЗАКРЫТО 2026-10-08** (`c4e58c62`, ветка `feat/desktop-d0`). ADR 0067 Accepted в репозитории; в ATM — ADR-67 `proposed` (принятие требует scope владельца). Спек — ATM SPEC-2.
+
+- [x] ADR 0067 + строка в `docs/adr/README.md` (2026-10-08, `c4e58c62`).
+- [x] `spec.md` — только решения (Revision 17): Appendix B — Windows-рабочие станции как
+      поддерживаемые клиенты при неизменном non-goal «Windows-ноды»; §7 #10 закрыт ADR 0067; §7 #6
+      (кастомный портал) не затронут; §1.1 и portal-non-goal стоят. Архитектурные правки (§2 UX,
+      Appendix A, стек) — при закрытии Фазы D.
+- [x] Этот раздел `plan.md` + строка в карте фаз (`c4e58c62`).
+- [x] Локальные заметки: `speedrun-plan.md` (ревизия 8: non-launch трек) и таблица потоков в
+      `CLAUDE.md` (оба gitignored — рабочие заметки; в отслеживаемый текст поток попадает в D.13).
+
+**Acceptance:** ADR принят и проиндексирован; правки spec.md ограничены решениями; трек виден в
+`plan.md` и ATM.
+**Размер:** S–M.
+
+---
+
+### D.1 — Фундамент `apprafter-core` + Windows-сборка CLI
+
+> 🏁 SR: трек D
+
+> 🚧 **КОД ГОТОВ 2026-10-08** (ветка `feat/desktop-d1`, cli 0.2.80 открыт, НЕ выпущен). Ждёт: (1) первого
+> прогона CI-матрицы ubuntu / macOS / Windows — ни разу не запускалась, ветку пушит владелец; (2) релиза
+> cli v0.2.80 — по запросу (`project-release`). Ревью каждой части (A–D) + повторные ревью исправлений —
+> одобрены. Планы: `docs/superpowers/plans/2026-10-08-d1*.md`. Решение «сначала потребитель» сузило объём
+> D.1 относительно пунктов ниже (сами пункты не переписаны — отметки показывают, что куда ушло).
+
+**Поставка:**
+- [~] Крейт `cli/apprafter-core`: `Context` (все env-чтения CLI становятся полями; CLI-only
+      переопределения `HCLOUD_TOKEN` / `APPRAFTER_AGE_KEY` / SSH-переменные читает только CLI),
+      `TargetRef` (`target use` выбирает активный target; `add` / `rename` / `remove` двигают
+      указатель побочно, как сейчас, и сообщают об этом), три формы операций, `Reporter`
+      (`Output{stream, bytes}`), `CancellationToken` с контрактом отмены (реестр дочерних процессов,
+      уборка helper-подов в отдельном потоке с прежними лимитами, `Outcome::Cancelled`, коды
+      130/143, механизм для Windows назван и протестирован), `CoreError` (`From<CliError>`,
+      полные коды, `kind` для kubectl-ошибок), трейт `Kube` (kubectl, таймаут запроса 10 с по
+      умолчанию), резолвер утилит (абсолютные пути, `.exe` на Windows, login-shell `PATH` на macOS,
+      `cue` в списке), `SecretStore`-трейт (пока файловый бэкенд).
+      → **сделано:** `Context` (CLI-builder через `EnvSource`, CLI-only `HCLOUD_TOKEN`),
+      `TargetRef::named`/`active`, `Plan`/`PlanClass`/`Outcome` (payload не сериализуется),
+      `Reporter`/`Event`, `CancellationToken` (колбэки изолированы от паник, гонка форсирована тестом),
+      `CoreError`/`UiError`; syn-guards (чистота core, запрещённые вызовы, зависимости) + ратчет env-чтений
+      (55). **Перенесено к первому потребителю:** `Kube` → D.5, резолвер утилит → D.3 (поиск `.exe`
+      уже в cli-core), `SecretStore` → D.4, реестр детей и `Outcome::Cancelled` в деле → D.6/D.11.
+- [x] Golden-снапшоты **до** любых изменений путей: target, apply / up / cluster-bootstrap,
+      status / top, backup / export / restore (non-TTY, stdout/stderr раздельно, `RUST_LOG=off`).
+      → **сделано для того, что D.1 реально меняет на Unix:** target-семейство, `whoami`, `init`,
+      `--version`, ошибки резолва (42 файла, харнес 58 тестов; stderr tracing учтён — `RUST_LOG=off`
+      отменён по ревью, время маскируется). apply / status / backup пути D.1 на Unix не тронул —
+      их golden снимаются в своих срезах (D.5 / D.11 / D.12) до переноса.
+- [~] Перешиваем только то, что требуют Windows и безопасность: `helper_interrupt` → токен;
+      пути от `$HOME` → `dirs::home_dir()`; поиск утилит; блокировки (`File::lock` на сентинеле
+      `<root>/.lock`, per-target `.op.lock`, `target::busy`) + атомарный `State::save`; env-чтения
+      за `Context`; типизированные «нет активного target» / «target не найден».
+      → **сделано:** `helper_interrupt` разделён cfg (Unix без изменений; Windows —
+      `SetConsoleCtrlHandler`, остановка в отдельном потоке, 0xC000013A у kubectl); пути через
+      `dirs::home_dir()`; поиск `.exe`; `cli_core::StoreLock` (+ ожидание видно, вложенность — паника,
+      ФС без блокировок — предупреждение) и `cli_core::atomic_replace` (Windows-устойчивый rename);
+      `apprafter::target::no_active` / `not_found`. **Перенесено:** перевод `helper_interrupt` на токен
+      и restic-код 130 → D.11; `.op.lock` / `target::busy` → D.11/D.12; env-чтения за `Context` — по
+      срезам (ратчет только вниз).
+- [x] CI: все крейты `cli/`, кроме `apprafter-backup` (Linux-раннер в кластере), — build + clippy
+      + test на `windows-latest`; `cli/apprafter-backup/**` и `cli/backup-core/**` в D.1 не
+      трогаем (иначе перепин раннера в platform-stack).
+      → `rust-cli` — матрица ubuntu/macOS/windows + агрегатор со старым именем `cargo test cli/`;
+      локально: Windows check + clippy чистые, часть тестов прогнана под wine. **Первый прогон в CI — после push.**
+- [x] `cli/apprafter-core/**` в глобы docsgen / docs-check (`lefthook.yml`, `docs.yml`) — `a70642ee`.
+
+**Acceptance:** golden-снапшоты совпадают побайтово; `cargo test --workspace --exclude
+apprafter-backup` зелёный на ubuntu / macos / windows; в core нет печати, промптов, `process::exit`
+и чтения env. Релиз CLI.
+**Зависит от:** D.0. **Размер:** L (делится на части в TDD-плане).
+
+---
+
+### D.2 — Оболочка desktop
+
+> 🏁 SR: трек D
+
+- [ ] `desktop/` (Tauri 2 + React 19 + TS strict + Vite, Biome, `bun test`), `rust-toolchain.toml`
+      1.98, лицензия FSL, SPDX-паттерны, CI-фильтр `desktop` (desktop/**, cli/**,
+      platform-stack/cue/**, chart'ы оператора, commands.json), cargo-deny, `devShells.desktop`,
+      рецепты `Justfile`, пины в `upstream-pins.json`.
+- [ ] Токены и темы (system / light / dark), раскладка A, вкладки + sidebar, примитивы (форма,
+      подтверждение, info, toast), `OperationManager`, настройки (спек §4.6), шорткаты Mod+T /
+      Mod+, / Mod+L.
+- [ ] Гейты: покрытие (`coverage.toml`), дрейф `ts-rs`, замыкание зависимостей `apprafter-core`
+      в двух lock-файлах.
+- [ ] Spike системной аутентификации на трёх ОС (Windows Hello / LocalAuthentication / polkit +
+      PAM для AppImage) → экран замка: одна кнопка Unlock, текст по бэкенду секретов.
+- [ ] Исходник дизайна и скриншоты → `desktop/design-source/`.
+
+**Acceptance:** приложение запускается на трёх ОС, замок снимается системной аутентификацией,
+гейт покрытия перечисляет все leaf, CI зелёный.
+**Зависит от:** D.0. **Размер:** L.
+
+---
+
+### D.3 — Срез target
+
+> 🏁 SR: трек D
+
+- [ ] `target add` (мастер: выбор машины, SSH-ключ путём, `--renew`), `list` / `show` / `use` /
+      `rename` / `remove` / `machine` (Change только без сервера; иначе путь пересборки), `doctor`
+      (+ группа Cluster и `cue` — CLI печатает тоже), `whoami`, панель утилит.
+- [ ] Windows-нога `release-cli.yml` (`.exe`, zip, setup-cue), строка Windows в `Download.astro` и
+      доках; walk на Windows (спек §6.5).
+
+**Acceptance:** все target-команды в GUI; golden совпадают; Windows-релиз CLI.
+**Зависит от:** D.1, D.2. **Размер:** M–L.
+
+---
+
+### D.4 — Keyring
+
+> 🏁 SR: трек D
+
+- [ ] `SecretStore` keyring (Keychain / Credential Manager / Secret Service), записи по
+      `<store-id>`; `apprafter secrets migrate` (`--dry-run`; запись → чтение → удаление файлов;
+      перешифровка legacy plaintext kubeconfig); порядок разрешения; WARN «secrets on disk» /
+      «stray age key file». macOS — keyring по умолчанию только в подписанном CLI.
+
+**Acceptance:** новые установки в keyring; миграция проверена на трёх ОС; doctor / status
+показывают, где секреты.
+**Зависит от:** D.3. **Размер:** M.
+
+---
+
+### D.5 — Срез чтения + уведомления
+
+> 🏁 SR: трек D
+
+- [ ] `status` (типизированный `reach`), `top` (четыре корзины, включая Other), `platform status`
+      (только `cached`; компоненты — новые данные, CLI печатает тоже), `platform autoscale` /
+      `env show`, `node status` → Overview / Nodes / Platform / Unreachable.
+- [ ] Нотификатор (60 с, только кластеры), inbox (фильтры, прочитанность, 30 дней), трей с
+      числом approvals, OS-уведомления.
+
+**Acceptance:** на экранах только поля core-отчётов, ничего не маскируется; события на kind-walk.
+**Зависит от:** D.3. **Размер:** L.
+
+---
+
+### D.6–D.12 — Срезы app, approvals, data, networking, platform, backups, lifecycle
+
+> 🏁 SR: трек D
+
+- [ ] **D.6** app — 11 команд, логи и port-forward как Session, мастер добавления. **L.**
+- [ ] **D.7** approvals — `migration *`, полный план, OS-жест; app-scope reject — путь git revert. **M.**
+- [ ] **D.8** data — `db`, `volume`, `secret` (seal = все ключи), `repo creds`. **L.**
+- [ ] **D.9** networking — `target ip` / `cert` / `domain` / `firewall`, `platform egress`. **M.**
+- [ ] **D.10** platform — `upgrade` (включая re-check), `freeze` / `unfreeze` / `rescue` /
+      `autoscale set` / `env set`. **M.**
+- [ ] **D.11** backups — `backup *`, `export`, `restore`; токен в `backup-core` + перепин раннера. **L.**
+- [ ] **D.12** lifecycle — `up`, `apply`, `destroy`, `import`, `cluster-bootstrap`, `kubeconfig`,
+      `argocd-password`, `open argocd`, `node prep`; about-текст `init`; честные заглушки. **L.**
+
+**Acceptance (каждого):** команды группы в GUI, golden совпадают, walk зелёный.
+**Зависит от:** по цепочке D.5 → D.6 → … → D.12.
+
+---
+
+### D.13 — Релиз desktop 0.1.0
+
+> 🏁 SR: трек D
+
+- [ ] `release-desktop.yml` (тег `desktop/v*` создаёт workflow), матрица deb / rpm / AppImage +
+      universal dmg + MSI / NSIS, подпись и нотаризация, cosign, апдейтер (не `/releases/latest`).
+- [ ] Окно релизов: `version_check.rs`, `install.sh`, `Download.astro`, `channel_latest.rs`
+      перестают зависеть от окна последних N релизов; smoke-тесты лендинга.
+- [ ] `check-desktop-version-bump.sh` (warn-only до первого релиза), поток в `CHANGELOG.md`
+      (преамбула) и `CONTRIBUTING.md`, гайды, строки `docs/status.md`.
+
+**Acceptance:** `desktop/v0.1.0` опубликован, артефакты подписаны; в гейте покрытия ноль
+`planned`; walk на трёх ОС зелёный; баннер обновления CLI и `install.sh` не ломаются.
+**Зависит от:** D.12, D.4. **Размер:** M–L. **Предусловие от владельца:** сертификаты подписи
+Apple / Windows и ключ апдейтера.
 
 ---
 

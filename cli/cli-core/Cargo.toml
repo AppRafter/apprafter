@@ -25,9 +25,15 @@ age                = { workspace = true }
 # but the workspace entry carries it.
 chrono             = { workspace = true }
 dirs               = { workspace = true }
-# Used both in production (target::atomic_write builds tempfiles in
+# Used both in production (fsutil::atomic_replace builds tempfiles in
 # the destination dir for safe replace) and in tests (per-test root).
 tempfile           = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# The errno values `target::StoreLock` reads as "this filesystem has no
+# locks" (ENOLCK, EOPNOTSUPP, ENOTSUP), which std reports uncategorised.
+# Already in the graph; no new crate.
+libc               = "0.2"
 
 [dev-dependencies]
 # Integration tests select a specific Application doc by name from a

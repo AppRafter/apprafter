@@ -16,6 +16,8 @@ backup-core = { path = "../backup-core" }
 base64     = { workspace = true }
 chrono     = { workspace = true }
 cli-core   = { path = "../cli-core" }
+# `~` for the SSH-identity default: $HOME on Unix, the user profile on Windows.
+dirs       = { workspace = true }
 include_dir = { workspace = true }
 serde      = { workspace = true }
 tempfile   = { workspace = true }

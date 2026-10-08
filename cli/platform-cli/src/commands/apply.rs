@@ -573,36 +573,39 @@ fn run_backfill_and_guard(
     let region_candidate = region_to_backfill(target_region_at_start, live_region_opt.as_deref());
     let need_region_backfill = region_candidate.is_some();
     if need_type_backfill || need_region_backfill {
-        match load_target(target_store, target_name) {
-            Ok(mut target) => {
-                let mut changed = false;
-                if need_type_backfill && target.config.server_type.is_none() {
-                    let t = live_type_opt.as_deref().unwrap();
-                    target.config.server_type = Some(t.to_string());
-                    eprintln!(
-                        "  server type baseline established: {t} \
-                         (recorded from live server — run `apprafter target machine` \
-                         to change)"
-                    );
-                    changed = true;
-                }
-                if let Some(r) = region_candidate.filter(|_| target.config.region.is_none()) {
-                    target.config.region = Some(r.to_string());
-                    eprintln!(
-                        "  region baseline established: {r} \
-                         (recorded from live server)"
-                    );
-                    changed = true;
-                }
-                if changed {
-                    if let Err(e) = save_target(target_store, &target) {
-                        eprintln!("warning: could not persist baseline to target config: {e}");
+        match backfill_store_lock(target_store, BACKFILL_LOCK_WAIT) {
+            Err(why) => eprintln!("warning: could not persist baseline to target config: {why}"),
+            Ok(_store_lock) => match load_target(target_store, target_name) {
+                Ok(mut target) => {
+                    let mut changed = false;
+                    if need_type_backfill && target.config.server_type.is_none() {
+                        let t = live_type_opt.as_deref().unwrap();
+                        target.config.server_type = Some(t.to_string());
+                        eprintln!(
+                            "  server type baseline established: {t} \
+                             (recorded from live server — run `apprafter target machine` \
+                             to change)"
+                        );
+                        changed = true;
+                    }
+                    if let Some(r) = region_candidate.filter(|_| target.config.region.is_none()) {
+                        target.config.region = Some(r.to_string());
+                        eprintln!(
+                            "  region baseline established: {r} \
+                             (recorded from live server)"
+                        );
+                        changed = true;
+                    }
+                    if changed {
+                        if let Err(e) = save_target(target_store, &target) {
+                            eprintln!("warning: could not persist baseline to target config: {e}");
+                        }
                     }
                 }
-            }
-            Err(e) => {
-                eprintln!("warning: could not load target config for backfill: {e}");
-            }
+                Err(e) => {
+                    eprintln!("warning: could not load target config for backfill: {e}");
+                }
+            },
         }
     }
 
@@ -688,6 +691,13 @@ fn adopt_provisioned_machine(
         return; // the API reported neither field; leave the target as it is
     }
 
+    let _store_lock = match backfill_store_lock(target_store, BACKFILL_LOCK_WAIT) {
+        Ok(lock) => lock,
+        Err(why) => {
+            eprintln!("warning: could not persist the provisioned machine to target config: {why}");
+            return;
+        }
+    };
     let mut target = match load_target(target_store, target_name) {
         Ok(t) => t,
         Err(e) => {
@@ -731,6 +741,39 @@ fn adopt_provisioned_machine(
     }
 }
 
+/// How long a backfill waits for another AppRafter process to release the
+/// target store before it gives up.
+const BACKFILL_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The store lock around a backfill's load → save. A backfill is
+/// best-effort and runs after the apply has done its work, so it waits for
+/// another AppRafter process at most `within`, not indefinitely: `Err`
+/// carries why the backfill is skipped, for the caller's warning. Where the
+/// store cannot be locked at all (read-only, a filesystem without locks)
+/// that is warned about and the backfill runs unlocked, as it always has —
+/// a save that then fails warns too. `Ok(None)` when there is no store:
+/// locking never creates one.
+fn backfill_store_lock(
+    target_store: &TargetStorePaths,
+    within: std::time::Duration,
+) -> std::result::Result<Option<cli_core::StoreLock>, String> {
+    if !target_store.root().exists() {
+        return Ok(None);
+    }
+    match cli_core::StoreLock::try_exclusive_for(
+        target_store,
+        within,
+        crate::commands::target::report_store_lock_event,
+    ) {
+        Ok(Some(lock)) => Ok(Some(lock)),
+        Ok(None) => Err(format!(
+            "another AppRafter process held the target store ({}) for {within:?}",
+            target_store.lock_file().display()
+        )),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 /// Pure helper: returns the region that should be written back to
 /// `target.config.region` during a backfill pass.
 ///
@@ -756,6 +799,64 @@ pub fn region_to_backfill<'a>(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ── the backfill's store lock: bounded, never creating a store ───────
+
+    /// A store at a fresh temp root, with something in it.
+    fn existing_store() -> (tempfile::TempDir, TargetStorePaths) {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = TargetStorePaths::for_root(dir.path().join("store"));
+        std::fs::create_dir_all(paths.root()).unwrap();
+        (dir, paths)
+    }
+
+    #[test]
+    fn a_backfill_takes_a_free_store_lock() {
+        let (_dir, paths) = existing_store();
+        let lock = backfill_store_lock(&paths, std::time::Duration::from_secs(10))
+            .expect("free")
+            .expect("the store exists");
+        assert!(lock.is_held());
+    }
+
+    #[test]
+    fn a_backfill_never_creates_a_missing_store_to_lock_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = TargetStorePaths::for_root(dir.path().join("none"));
+        assert!(backfill_store_lock(&paths, std::time::Duration::ZERO)
+            .unwrap()
+            .is_none());
+        assert!(!paths.root().exists());
+    }
+
+    /// A lock another process keeps past the bound skips the backfill,
+    /// with the reason the warning prints — the apply is not held up.
+    #[test]
+    fn a_backfill_gives_up_on_a_store_held_past_its_bound() {
+        let (_dir, paths) = existing_store();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder_paths = paths.clone();
+        let holder = std::thread::spawn(move || {
+            let _lock = cli_core::StoreLock::exclusive(&holder_paths).unwrap();
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        held_rx.recv().unwrap();
+        let why = backfill_store_lock(&paths, std::time::Duration::from_millis(100))
+            .map(|_| ())
+            .expect_err("held throughout");
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        assert!(
+            why.contains("another AppRafter process held the target store"),
+            "{why}"
+        );
+        assert!(
+            why.contains(&paths.lock_file().display().to_string()),
+            "{why}"
+        );
+    }
 
     fn manifest_from(value: serde_json::Value) -> InfrastructureManifest {
         serde_json::from_value(value).expect("valid InfrastructureManifest JSON")

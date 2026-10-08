@@ -193,15 +193,21 @@ nuke just the offending target's directory under
 global `config.yaml` is the only file shared across targets;
 treat it as the last line of defence.
 
+### `apprafter::target::no_active`
+
+A command needs a target, none was named with `--target`, and the
+store has no active target: none has been created yet, or the last
+one was removed.
+
+**Fix.** `apprafter target add <name> …` creates one; the first add
+on a fresh store makes it active. With targets in the store,
+`apprafter target use <name>` picks one, or pass `--target <name>`
+for a single run.
+
 ### `apprafter::target::not_found`
 
-A subcommand asked for a target that isn't in the store.
-Variants:
-
-- `--target ghost` against a populated store with no `ghost`
-  target.
-- Any subcommand reading the active pointer when no target has
-  been created yet.
+A subcommand asked for a target that isn't in the store — for
+example `--target ghost` against a store with no `ghost` target.
 
 **Fix.** `apprafter target list` shows what's in the store.
 `apprafter target add <name> …` creates a new one; the first add

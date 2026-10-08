@@ -238,7 +238,7 @@ dependencies = [
 
 [[package]]
 name = "apprafter"
-version = "0.2.79"
+version = "0.2.80"
 dependencies = [
  "age",
  "arboard",
@@ -269,11 +269,12 @@ dependencies = [
  "terminal_size",
  "tracing",
  "ureq",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "apprafter-backup"
-version = "0.2.79"
+version = "0.2.80"
 dependencies = [
  "backup-core",
  "chrono",
@@ -289,6 +290,22 @@ dependencies = [
  "tokio",
  "tower-service",
  "ureq",
+]
+
+[[package]]
+name = "apprafter-core"
+version = "0.2.80"
+dependencies = [
+ "cli-core",
+ "cli-providers",
+ "miette",
+ "proc-macro2",
+ "serde",
+ "serde_json",
+ "syn 2.0.119",
+ "tempfile",
+ "thiserror 2.0.20",
+ "toml",
 ]
 
 [[package]]
@@ -431,7 +448,7 @@ dependencies = [
 
 [[package]]
 name = "backup-core"
-version = "0.2.79"
+version = "0.2.80"
 dependencies = [
  "aes-gcm 0.11.1",
  "base64 0.23.1",
@@ -679,11 +696,12 @@ checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 
 [[package]]
 name = "cli-core"
-version = "0.2.79"
+version = "0.2.80"
 dependencies = [
  "age",
  "chrono",
  "dirs",
+ "libc",
  "miette",
  "owo-colors",
  "serde",
@@ -697,13 +715,14 @@ dependencies = [
 
 [[package]]
 name = "cli-providers"
-version = "0.2.79"
+version = "0.2.80"
 dependencies = [
  "aes-gcm 0.11.1",
  "backup-core",
  "base64 0.23.1",
  "chrono",
  "cli-core",
+ "dirs",
  "include_dir",
  "mockito",
  "rand 0.8.8",
@@ -722,7 +741,7 @@ dependencies = [
 
 [[package]]
 name = "cli-state"
-version = "0.2.79"
+version = "0.2.80"
 dependencies = [
  "cli-core",
  "serde",
@@ -1149,7 +1168,7 @@ dependencies = [
 
 [[package]]
 name = "docsgen"
-version = "0.2.79"
+version = "0.2.80"
 dependencies = [
  "apprafter",
  "clap",

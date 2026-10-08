@@ -7,6 +7,7 @@ members = [
     "cli-core",
     "cli-state",
     "cli-providers",
+    "apprafter-core",
     "backup-core",
     "apprafter-backup",
 ]
@@ -15,7 +16,7 @@ members = [
 # Bumped to match each released patch tag per the CONTRIBUTING.md
 # "Versioning" rule. Drifted at 0.1.2 from initial v0.1.2 commit
 # through v0.1.76; the policy starts at v0.1.77.
-version      = "0.2.79"
+version      = "0.2.80"
 edition      = "2021"
 rust-version = "1.89"
 # Never published to crates.io: these crates are a product, not a library,

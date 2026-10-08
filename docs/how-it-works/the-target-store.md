@@ -21,6 +21,7 @@ way — is
 
 ```text
 $XDG_CONFIG_HOME/apprafter/          # ~/.config/apprafter on Linux
+├── .lock                            # the store lock; always empty
 ├── config.yaml                      # GlobalConfig
 ├── targets/
 │   ├── default/
@@ -34,7 +35,7 @@ $XDG_CONFIG_HOME/apprafter/          # ~/.config/apprafter on Linux
 └── state/
     └── <target>/
         └── .apprafter/
-            ├── state.json           # provisioned resource IDs + cached kubeconfig
+            ├── state.json           # provisioned resource IDs + cached kubeconfig, mode 0600
             └── known_hosts          # per-cluster SSH known_hosts
 ```
 
@@ -44,6 +45,22 @@ network, firewall and floating-IP IDs, plus the age-encrypted
 kubeconfig. Everything under it is keyed by target name, which is why
 [renaming a target](../operator-guide/target-store.md#inspecting-renaming-and-removing-a-target) moves
 it and removing one deletes it.
+
+Every command that changes the store locks `.lock` while it reads,
+changes and saves, so two processes editing one store never lose each
+other's change. One that finds the lock held waits for it, and says so
+on stderr:
+
+```text
+waiting for another AppRafter process to release the target store (/home/operator/.config/apprafter/.lock)…
+```
+
+A store that cannot be locked at all — a read-only directory, a
+filesystem without locks — is used without the lock, after a
+`warning: cannot lock the target store (…): …; continuing without the
+lock` line. Each file is replaced whole: a save writes a temporary file
+beside it and renames that into place, so a reader sees the old version
+or the new one, never a partial write.
 
 ### `config.yaml` (global)
 
@@ -132,8 +149,9 @@ env → target store's `ssh_key_path` → read the file).
 
 There is **no single "chain tried 1/2/3" error**. Each rung fails with
 its own message, and which one you get tells you where you actually
-are. All three are `apprafter::cli::other`; the `help:` footer is
-omitted here.
+are. Their codes are `apprafter::target::no_active`,
+`apprafter::cli::other` and `apprafter::target::not_found`, in the
+order below; the `help:` footer is omitted here.
 
 On an empty store you never reach the token chain at all — resolving
 the per-target state directory refuses first, so this is the message a
@@ -156,14 +174,13 @@ And with `--target` pointing at a name that is not in the store — note
 that it lists what is:
 
 ```text
-  × target `ghost` not found (available: prod). Pass `--target <name>` with a
-  │ configured name, or `apprafter target use <name>` to switch the active
-  │ pointer.
+  × target `ghost` not found (available: prod)
 ```
 
-Each names the rung that failed and the next thing to type, which is
-what you need; what none of them does is enumerate the other two, so
-do not go looking for a rung-by-rung report.
+Each names the rung that failed and, in its message or its help, the
+next thing to type, which is what you need; what none of them does is
+enumerate the other two, so do not go looking for a rung-by-rung
+report.
 
 ## See also
 

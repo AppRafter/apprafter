@@ -1,0 +1,6 @@
+$ apprafter target rename staging stage
+[exit 0]
+[stdout]
+target renamed: `staging` → `stage`
+[stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m target rename invoked <ESC>[3mfrom<ESC>[0m<ESC>[2m=<ESC>[0mstaging <ESC>[3mto<ESC>[0m<ESC>[2m=<ESC>[0mstage

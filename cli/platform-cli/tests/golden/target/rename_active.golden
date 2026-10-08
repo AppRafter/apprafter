@@ -1,0 +1,19 @@
+$ apprafter target rename prod production
+[exit 0]
+[stdout]
+target renamed: `prod` → `production` (active pointer updated)
+[stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m target rename invoked <ESC>[3mfrom<ESC>[0m<ESC>[2m=<ESC>[0mprod <ESC>[3mto<ESC>[0m<ESC>[2m=<ESC>[0mproduction
+$ apprafter target list
+[exit 0]
+[stdout]
+┌────────┬────────────┬───────────────┬────────┬──────┐
+│ Active │ Name       │ Provider      │ Region │ Tier │
+├────────┼────────────┼───────────────┼────────┼──────┤
+│ *      │ production │ hetzner-cloud │ nbg1   │ solo │
+│        │ staging    │ hetzner-cloud │ nbg1   │ solo │
+└────────┴────────────┴───────────────┴────────┴──────┘
+
+2 targets configured. Active: 'production'.
+[stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m target list invoked

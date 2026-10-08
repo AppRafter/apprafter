@@ -7,6 +7,11 @@ use clap::{Parser, Subcommand};
 #[derive(Debug, Parser)]
 #[command(
     name = "apprafter",
+    // Fixed rather than taken from argv[0], which clap does by default with
+    // the file name's extension included: on Windows every usage line and
+    // "try --help" hint read `apprafter.exe` while the guides and the
+    // generated reference say `apprafter` — which also runs there.
+    bin_name = "apprafter",
     version,
     about = "AppRafter CLI: bootstrap and lifecycle of clusters.",
     long_about = None,
@@ -487,7 +492,8 @@ pub enum Commands {
         /// `$XDG_CONFIG_HOME/fish/completions/apprafter.fish`. Those
         /// three only: `elvish` and `powershell` are refused rather
         /// than written to a guessed path, and still print a script
-        /// you can redirect yourself.
+        /// you can redirect yourself. On Windows, which has no XDG
+        /// directories, `--install` is refused for every shell.
         ///
         /// Re-run after upgrading. The script describes the binary
         /// that produced it, and an installed one goes stale silently.
@@ -2330,5 +2336,27 @@ mod tests {
                 }
             }
         ));
+    }
+
+    #[test]
+    fn usage_names_the_binary_apprafter_whatever_argv0_is() {
+        use clap::CommandFactory;
+        for (args, usage) in [
+            (
+                vec!["/opt/bin/apprafter.exe", "--help"],
+                "Usage: apprafter <COMMAND>",
+            ),
+            (
+                vec!["/opt/bin/apprafter.exe", "app", "rm", "--help"],
+                "Usage: apprafter app remove",
+            ),
+        ] {
+            let help = Cli::command()
+                .try_get_matches_from(&args)
+                .unwrap_err()
+                .render()
+                .to_string();
+            assert!(help.contains(usage), "{args:?} rendered:\n{help}");
+        }
     }
 }

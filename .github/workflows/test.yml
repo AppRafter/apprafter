@@ -42,10 +42,21 @@ jobs:
               - '.github/workflows/test.yml'
 
   rust-cli:
-    name: cargo test cli/
+    name: cargo test cli/ (${{ matrix.os }})
     needs: changes
     if: needs.changes.outputs.rust_cli == 'true'
-    runs-on: ubuntu-latest
+    # The CLI ships for macOS and Windows as well as Linux, and code that
+    # only compiles on Unix (signals, file modes, `#!/bin/sh` stubs) is
+    # caught nowhere else. fail-fast off: a Windows-only failure must not
+    # cancel the Linux run that says whether the change is otherwise sound.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    # A test that hangs (a lock never released, a child never reaped) must
+    # fail the leg, not hold a runner for the six-hour default.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -69,8 +80,75 @@ jobs:
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
           toolchain: "1.98"
-      - working-directory: cli
-        run: cargo test --all --all-features
+      # --no-fail-fast: cargo otherwise stops at the first test target that
+      # fails, so a leg reported one broken target and hid every other one
+      # behind it — one CI round per failure instead of one for all of them.
+      - if: runner.os == 'Linux'
+        working-directory: cli
+        run: cargo test --all --all-features --no-fail-fast
+      # macOS and Windows build two crates fewer. `apprafter-backup` is the
+      # in-cluster backup runner: it ships only as a Linux container image.
+      # `docsgen` is the documentation generator, and its gate compares the
+      # generated CLI reference byte for byte with the committed one, which
+      # is a property of the source tree, not of the host — the Linux run
+      # above already enforces it. Clippy runs here because lint.yml lints
+      # on Linux only, so a warning in Windows- or macOS-only code would
+      # otherwise reach master unseen. `shell: bash` on both, so the commands
+      # run under the same shell on every runner (Windows defaults to pwsh).
+      - if: runner.os != 'Linux'
+        name: cargo clippy (macOS, Windows)
+        working-directory: cli
+        shell: bash
+        run: cargo clippy --workspace --exclude apprafter-backup --exclude docsgen --all-targets --all-features -- -D warnings
+      # One test is skipped on Windows, by name, because it found a real bug
+      # that cannot be fixed in the change that found it:
+      # backup-core's `repo_parent_to_create` reads a drive path (`D:\x\repo`)
+      # as a remote `<scheme>:` repository, so a fresh local repository on
+      # Windows gets no parent directory and `restic init` fails. Any edit
+      # under cli/backup-core moves the chart's backup-runner pin
+      # (scripts/check-backup-runner-pin.sh), which is a platform-stack
+      # release; the fix rides the runner re-pin planned for D.11 (WI-439),
+      # and that change deletes this skip.
+      - if: runner.os != 'Linux'
+        name: cargo test (macOS, Windows)
+        working-directory: cli
+        shell: bash
+        run: |
+          skip=()
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            skip=(-- --skip engine::tests::ensure_repo_initialises_a_missing_local_repo_and_creates_its_parent)
+          fi
+          cargo test --workspace --exclude apprafter-backup --exclude docsgen --all-features --no-fail-fast "${skip[@]}"
+
+  # One check under the fixed name `cargo test cli/`, whatever the matrix
+  # does. The matrix reports a check per leg, `cargo test cli/ (<os>)`, so a
+  # branch protection rule that requires the pre-matrix name would wait for
+  # a check that never comes — and when nothing under cli/ changed, the
+  # skipped matrix reports one check with its name's expression unexpanded.
+  # This job passes when every leg passed, or when the matrix was skipped
+  # because nothing under cli/ changed, and fails otherwise. "Skipped" is
+  # only that when the change detection itself succeeded: a failed
+  # `changes` job skips the matrix too, and must not read as a pass.
+  rust-cli-result:
+    name: cargo test cli/
+    needs: [changes, rust-cli]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: every leg of the matrix passed
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          RESULT: ${{ needs.rust-cli.result }}
+        run: |
+          echo "changes: $CHANGES, rust-cli: $RESULT"
+          if [ "$CHANGES" != success ]; then
+            exit 1
+          fi
+          case "$RESULT" in
+            success | skipped) ;;
+            *) exit 1 ;;
+          esac
 
   rust-operator:
     name: cargo test operator/

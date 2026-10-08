@@ -31,6 +31,10 @@
 //! reason the rest of this file does — a dispatch arm that never
 //! reaches the handler is the failure a unit test over the writer
 //! would sail past.
+//!
+//! Those checks run on Unix, macOS included: the destinations are the XDG
+//! directories there as on Linux. On Windows `--install` refuses, and the
+//! test of that refusal runs there instead.
 
 use std::fs;
 use std::path::Path;
@@ -150,7 +154,9 @@ fn run_in_home(args: &[&str], home: &Path, env: &[(&str, &str)]) -> Command {
 }
 
 /// Install `shell`'s script into `home`, and hand back what the
-/// command wrote to stdout and stderr.
+/// command wrote to stdout and stderr. Unix only: on Windows `--install`
+/// refuses (`install_is_refused_on_windows_and_the_refusal_is_the_whole_run`).
+#[cfg(unix)]
 fn install(shell: &str, home: &Path, env: &[(&str, &str)]) -> (String, String) {
     let assert = run_in_home(&["completion", shell, "--install"], home, env)
         .assert()
@@ -185,6 +191,7 @@ fn tree(root: &Path) -> Vec<String> {
     out
 }
 
+#[cfg(unix)]
 #[test]
 fn install_writes_each_shells_script_where_that_shell_reads_it() {
     let home = TempDir::new().expect("a temp HOME");
@@ -209,6 +216,7 @@ fn install_writes_each_shells_script_where_that_shell_reads_it() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn install_honours_the_xdg_directories_when_they_are_set() {
     // `~/.local/share` and `~/.config` are where these two land with
@@ -246,6 +254,7 @@ fn install_honours_the_xdg_directories_when_they_are_set() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn install_still_prints_the_script_so_one_line_can_install_and_apply() {
     // `source <(apprafter completion bash --install)` is the documented
@@ -262,6 +271,7 @@ fn install_still_prints_the_script_so_one_line_can_install_and_apply() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn the_install_report_goes_to_stderr_and_names_the_destination() {
     // On stderr rather than stdout because stdout is sourced: a report
@@ -283,6 +293,7 @@ fn the_install_report_goes_to_stderr_and_names_the_destination() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn the_zsh_report_names_the_fpath_line_a_new_shell_needs() {
     // Writing `~/.zfunc/_apprafter` is half the job: zsh reads it only
@@ -327,6 +338,44 @@ fn a_shell_with_no_published_destination_is_refused_and_nothing_is_written() {
     }
 }
 
+/// Windows has no XDG directories for bash, zsh or fish to read, so
+/// `--install` refuses there for every shell — before anything is printed
+/// or written, as every refusal of this command does.
+#[cfg(windows)]
+#[test]
+fn install_is_refused_on_windows_and_the_refusal_is_the_whole_run() {
+    for (shell, _) in INSTALL_DESTINATIONS {
+        let home = TempDir::new().expect("a temp HOME");
+        let assert = run_in_home(&["completion", shell, "--install"], home.path(), &[])
+            .assert()
+            .failure();
+        let output = assert.get_output();
+        // The renderer wraps long lines behind a `│` gutter: undo both.
+        let stderr = String::from_utf8_lossy(&output.stderr)
+            .split_whitespace()
+            .filter(|word| *word != "│")
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            stderr.contains("`--install` is not available on Windows"),
+            "{shell}: {stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("apprafter completion {shell} > <file>")),
+            "{shell}: the refusal does not name the redirect that works: {stderr}"
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "{shell}: refused, and still printed the script"
+        );
+        assert!(
+            tree(home.path()).is_empty(),
+            "{shell}: refused and still wrote {:?}",
+            tree(home.path())
+        );
+    }
+}
+
 #[test]
 fn without_the_flag_nothing_is_written_anywhere() {
     // The default is still "print, install nothing" — the property the
@@ -342,6 +391,7 @@ fn without_the_flag_nothing_is_written_anywhere() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn installing_twice_replaces_the_script_rather_than_appending_to_it() {
     // Upgrading is the common case: the script goes stale with the

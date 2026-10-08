@@ -44,6 +44,7 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use crate::commands::backup::KubectlExec;
+use crate::commands::helper_interrupt::Noted as _;
 use backup_core::helper_pod::{
     explain_keep_alive_end, pg_helper_pod_spec, volume_pod_spec, SecretKey,
 };
@@ -2686,7 +2687,8 @@ fn wait_pg_reachable(pod: &str, ns: &str, conn: &PgConnection, kubeconfig: &Path
         let out = std::process::Command::new("kubectl")
             .args(psql_probe_args(pod, ns, conn))
             .env("KUBECONFIG", kubeconfig)
-            .output();
+            .output()
+            .noted();
         match out {
             Ok(o) if o.status.success() => Ok(()),
             Ok(o) => Err(format!(
@@ -7520,16 +7522,28 @@ mod tests {
     // restic invocation results
     // =======================================================================
 
+    /// An `ExitStatus` that exited with `code`, on either platform.
+    fn exit_status(code: i32) -> std::process::ExitStatus {
+        #[cfg(unix)]
+        use std::os::unix::process::ExitStatusExt as _;
+        #[cfg(windows)]
+        use std::os::windows::process::ExitStatusExt as _;
+        #[cfg(unix)]
+        let raw = code << 8;
+        #[cfg(windows)]
+        let raw = code as u32;
+        std::process::ExitStatus::from_raw(raw)
+    }
+
     /// A non-zero restic exit MUST become an error: the steps that follow read
     /// the restored tree off disk, so a swallowed failure leaves an empty tree
     /// and reports a successful restore over nothing.
     #[test]
     fn restic_output_to_result_yields_stdout_or_an_error_carrying_stderr() {
-        use std::os::unix::process::ExitStatusExt;
         let argv = vec!["snapshots".to_string(), "--json".to_string()];
 
         let ok = std::process::Output {
-            status: std::process::ExitStatus::from_raw(0),
+            status: exit_status(0),
             stdout: b"[{\"id\":\"abc\"}]".to_vec(),
             stderr: Vec::new(),
         };
@@ -7539,7 +7553,7 @@ mod tests {
         );
 
         let failed = std::process::Output {
-            status: std::process::ExitStatus::from_raw(1 << 8), // exit code 1
+            status: exit_status(1),
             stdout: Vec::new(),
             stderr: b"wrong password".to_vec(),
         };

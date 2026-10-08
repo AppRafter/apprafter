@@ -316,10 +316,14 @@ pub(crate) fn apply_cloudflare_origin(
     let store = resolved.store;
 
     // 1. Persist the toggle FIRST (intent survives even if the live reconcile
-    //    can't run / the CF fetch fails).
-    let mut target = load_target(&store, &resolved.target_name)?;
-    target.config = with_cloudflare_origin(target.config, enable);
-    save_target(&store, &target)?;
+    //    can't run / the CF fetch fails), under the store lock.
+    let target = {
+        let _store_lock = crate::commands::target::store_lock_if_present(&store)?;
+        let mut target = load_target(&store, &resolved.target_name)?;
+        target.config = with_cloudflare_origin(target.config, enable);
+        save_target(&store, &target)?;
+        target
+    };
 
     // 1b. Record it in the cluster, where a backup can see it. Best-effort:
     //     the toggle is legitimately usable before there is a cluster at all

@@ -431,10 +431,19 @@ impl State {
         }
     }
 
+    /// Write `state.json` atomically: the bytes go to a temp file in the
+    /// same directory, which is flushed and then renamed over the old
+    /// file. A reader (another CLI process, AppRafter Desktop) sees the
+    /// old version or the new one, never a truncated file it would
+    /// report as `state::corrupt`. The temp file, and so `state.json`,
+    /// is created owner-only (0600 on Unix): it carries the encrypted
+    /// kubeconfig and, from older releases, a plaintext one. A reader
+    /// holding `state.json` open does not make the save fail, on Windows
+    /// either ([`cli_core::atomic_replace`]).
     pub fn save(&self, paths: &StatePaths) -> Result<()> {
         std::fs::create_dir_all(paths.state_dir())?;
         let bytes = serde_json::to_vec_pretty(self)?;
-        std::fs::write(paths.state_file(), bytes)?;
+        cli_core::atomic_replace(&paths.state_file(), &bytes, ".state.json.", None)?;
         Ok(())
     }
 }
@@ -443,6 +452,125 @@ impl State {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn save_replaces_the_file_atomically_and_leaves_no_temp_file() {
+        let dir = tempdir().unwrap();
+        let paths = StatePaths::for_root(&dir.path().join(".apprafter"));
+        let mut s = State {
+            cluster_name: Some("one".into()),
+            ..Default::default()
+        };
+        s.save(&paths).unwrap();
+        s.cluster_name = Some("two".into());
+        s.save(&paths).unwrap();
+        let back = State::load_or_default(&paths).unwrap();
+        assert_eq!(back.cluster_name.as_deref(), Some("two"));
+        let leftovers: Vec<_> = std::fs::read_dir(paths.state_dir())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n != "state.json")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
+    }
+
+    /// The property itself: a second save puts a new file in place
+    /// rather than truncating the old one, so a reader holding (or
+    /// opening) `state.json` mid-save sees one whole version.
+    #[cfg(unix)]
+    #[test]
+    fn save_puts_a_new_file_in_place_instead_of_rewriting_the_old_one() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempdir().unwrap();
+        let paths = StatePaths::for_root(dir.path());
+        State::default().save(&paths).unwrap();
+        let before = std::fs::metadata(paths.state_file()).unwrap().ino();
+        State::default().save(&paths).unwrap();
+        let after = std::fs::metadata(paths.state_file()).unwrap().ino();
+        assert_ne!(before, after, "state.json was rewritten in place");
+    }
+
+    /// `state.json` carries the encrypted kubeconfig (and, from older
+    /// releases, a plaintext one): a save leaves it owner-only even when
+    /// the file it replaces was wider.
+    #[cfg(unix)]
+    #[test]
+    fn save_over_a_0644_file_leaves_it_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let paths = StatePaths::for_root(dir.path());
+        std::fs::create_dir_all(paths.state_dir()).unwrap();
+        std::fs::write(paths.state_file(), b"{}").unwrap();
+        std::fs::set_permissions(paths.state_file(), std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        State::default().save(&paths).unwrap();
+        let mode = std::fs::metadata(paths.state_file())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "state.json is {mode:o} after a save");
+    }
+
+    /// A reader holding `state.json` open — another CLI run, AppRafter
+    /// Desktop — must not make the save fail. tempfile's `persist` did, on
+    /// Windows ("Access is denied").
+    #[cfg(windows)]
+    #[test]
+    fn save_succeeds_while_a_reader_holds_state_json_open() {
+        let dir = tempdir().unwrap();
+        let paths = StatePaths::for_root(dir.path());
+        State::default().save(&paths).unwrap();
+        let reader = std::fs::File::open(paths.state_file()).unwrap();
+        let s = State {
+            cluster_name: Some("held".into()),
+            ..Default::default()
+        };
+        s.save(&paths)
+            .expect("save with a reader holding state.json open");
+        drop(reader);
+        let back = State::load_or_default(&paths).unwrap();
+        assert_eq!(back.cluster_name.as_deref(), Some("held"));
+    }
+
+    /// A save that fails at the rename takes its temp file with it.
+    #[test]
+    fn a_failed_save_leaves_no_temp_file() {
+        let dir = tempdir().unwrap();
+        let paths = StatePaths::for_root(dir.path());
+        std::fs::create_dir_all(paths.state_dir()).unwrap();
+        // A directory where state.json goes: the rename over it fails.
+        std::fs::create_dir(paths.state_file()).unwrap();
+        std::fs::write(paths.state_file().join("x"), b"x").unwrap();
+        State::default()
+            .save(&paths)
+            .expect_err("cannot replace a directory");
+        let leftovers: Vec<_> = std::fs::read_dir(paths.state_dir())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n != "state.json")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn save_writes_the_same_bytes_as_before() {
+        let dir = tempdir().unwrap();
+        let paths = StatePaths::for_root(&dir.path().join(".apprafter"));
+        let s = State {
+            cluster_name: Some("p".into()),
+            ..Default::default()
+        };
+        s.save(&paths).unwrap();
+        let bytes = std::fs::read(paths.state_file()).unwrap();
+        assert_eq!(bytes, serde_json::to_vec_pretty(&s).unwrap());
+    }
 
     #[test]
     fn load_or_recover_returns_the_state_when_the_file_parses() {

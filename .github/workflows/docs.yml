@@ -50,6 +50,8 @@ on:
       # under commands/ (e.g. app::CoverageGate), whose variants
       # render in --help and therefore in the generated reference.
       - 'cli/platform-cli/src/**'
+      # The shared core (ADR 0067); see the docsgen glob in lefthook.yml.
+      - 'cli/apprafter-core/**'
       - 'cli/docsgen/**'
       # commands.json embeds `cli_version`, so a release bump is a
       # reference change: without this a bumped-but-not-regenerated
@@ -93,6 +95,8 @@ on:
       # under commands/ (e.g. app::CoverageGate), whose variants
       # render in --help and therefore in the generated reference.
       - 'cli/platform-cli/src/**'
+      # The shared core (ADR 0067); see the docsgen glob in lefthook.yml.
+      - 'cli/apprafter-core/**'
       - 'cli/docsgen/**'
       # commands.json embeds `cli_version`, so a release bump is a
       # reference change: without this a bumped-but-not-regenerated

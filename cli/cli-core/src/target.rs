@@ -11,6 +11,7 @@
 //!
 //! ```text
 //! $XDG_CONFIG_HOME/apprafter/          # resolved via dirs::config_dir
+//! ├── .lock                            # StoreLock sentinel, always empty
 //! ├── config.yaml                      # GlobalConfig (active_target + version)
 //! ├── targets/
 //! │   ├── default/
@@ -38,7 +39,6 @@
 //! resolution chain spec'd in `cli-dx-task.md` §7.
 
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -56,6 +56,7 @@ const STATE_DIR_NAME: &str = "state";
 const TARGET_CONFIG_FILE: &str = "config.yaml";
 const TARGET_CREDENTIALS_FILE: &str = "credentials.yaml";
 const AUTH_KEEP_FILE: &str = ".keep";
+const LOCK_FILE: &str = ".lock";
 
 /// Env-var that overrides `default_config_root()`. Primary use is
 /// integration tests pointing the store at a `tempfile::TempDir`
@@ -77,7 +78,22 @@ pub const CONFIG_DIR_ENV: &str = "APPRAFTER_CONFIG_DIR";
 /// `XDG_CONFIG_HOME`, no env override) — should never happen on a
 /// sane install, but `Result` is the safe surface.
 pub fn default_config_root() -> Result<PathBuf> {
-    if let Ok(custom) = std::env::var(CONFIG_DIR_ENV) {
+    config_root_from_override(std::env::var(CONFIG_DIR_ENV).ok())
+}
+
+/// The target-store root for an override the caller passes explicitly — the
+/// value of `APPRAFTER_CONFIG_DIR` as the caller read it. A non-empty value
+/// is used verbatim; `None` or an empty value falls back to
+/// `dirs::config_dir().join("apprafter")`.
+///
+/// It never reads `APPRAFTER_CONFIG_DIR` itself, so a caller that reads its
+/// environment through something other than `std::env` (the shared core's
+/// `Context` builder, ADR 0067) resolves the root exactly as
+/// [`default_config_root`] does. It is not pure, though: the fallback
+/// consults the platform config directory through `dirs` (HOME /
+/// `XDG_CONFIG_HOME` on Unix, the Known Folder API on Windows).
+pub fn config_root_from_override(custom: Option<String>) -> Result<PathBuf> {
+    if let Some(custom) = custom {
         if !custom.is_empty() {
             return Ok(PathBuf::from(custom));
         }
@@ -186,6 +202,242 @@ impl TargetStorePaths {
     pub fn state_dir(&self, name: &str) -> PathBuf {
         self.root.join(STATE_DIR_NAME).join(name)
     }
+
+    /// The sentinel [`StoreLock`] locks. A dot-file at the root, so it is
+    /// neither a target nor a file anything reads.
+    pub fn lock_file(&self) -> PathBuf {
+        self.root.join(LOCK_FILE)
+    }
+}
+
+/// What taking a [`StoreLock`] reports, for the caller to show in its own
+/// way (the CLI prints a stderr line; the core will have its own channel).
+#[derive(Debug)]
+pub enum StoreLockEvent<'a> {
+    /// Another process holds the lock, and the call is about to wait for
+    /// it. Reported once, before the wait.
+    Waiting {
+        /// The sentinel, `<root>/.lock`.
+        sentinel: &'a Path,
+    },
+    /// The store cannot be locked here — the sentinel can be neither
+    /// opened nor created (a read-only store), or the filesystem has no
+    /// locks — so the guard returned holds nothing, and the edit goes
+    /// ahead unlocked, as every edit did before the lock existed.
+    Unlocked {
+        /// The sentinel, `<root>/.lock`.
+        sentinel: &'a Path,
+        /// Why the store could not be locked.
+        error: &'a std::io::Error,
+    },
+}
+
+/// The panic a second lock on one thread raises. Both `flock` and
+/// `LockFileEx` treat a second handle of the same process as a stranger,
+/// so the second acquire would wait for the first forever.
+const NESTED_LOCK_PANIC: &str = "a target-store lock is already held on this thread: take one \
+     StoreLock per thread, and drop it before taking another (a second one would wait for the \
+     first forever)";
+
+/// How often [`StoreLock::try_exclusive_for`] retries a held lock.
+const LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+thread_local! {
+    /// [`StoreLock`]s alive on this thread: never more than one.
+    static LOCKS_ON_THIS_THREAD: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// An advisory, exclusive lock over the whole target store, held for the
+/// life of the value. Take it around every read-modify-write of the store
+/// (load → change → save), so the CLI and AppRafter Desktop editing the
+/// same store never lose each other's update (ADR 0067).
+///
+/// Never hold it across a slow step — a provider call, a prompt: every
+/// other edit of the store waits for it. Do the slow step first, then take
+/// the lock, re-read what the change needs, re-check what the step relied
+/// on, change, save.
+///
+/// One per thread: taking a second while one is alive on the same thread
+/// panics rather than deadlocking. Release it before taking it again.
+///
+/// It locks a sentinel, `<root>/.lock`, never a data file: data files are
+/// replaced by rename (`atomic_write`), so a lock on one would guard an
+/// inode that is about to disappear, and on Windows byte-range locks are
+/// mandatory, so locking a data file would make a plain read fail.
+///
+/// A store that cannot be locked — read-only, or on a filesystem without
+/// locks — yields a guard that holds nothing ([`StoreLockEvent::Unlocked`],
+/// [`StoreLock::is_held`]): the edit goes ahead unlocked, and a read-only
+/// store fails at the save that needs writing, not at the lock.
+#[must_use = "the store is locked only while this value is alive"]
+pub struct StoreLock {
+    /// The locked sentinel; `None` when the store could not be locked.
+    file: Option<fs::File>,
+}
+
+impl StoreLock {
+    /// Block until the store is exclusively locked, reporting nothing.
+    /// Creates the root and the sentinel if missing. A store that cannot be
+    /// locked yields an unheld guard ([`StoreLock::is_held`]); use
+    /// [`StoreLock::exclusive_or_wait`] to be told when, and when the call
+    /// waits.
+    pub fn exclusive(paths: &TargetStorePaths) -> Result<StoreLock> {
+        Self::exclusive_or_wait(paths, |_| {})
+    }
+
+    /// [`StoreLock::exclusive`], reporting to `on_event`: once, before
+    /// waiting for another process ([`StoreLockEvent::Waiting`]), and when
+    /// the store cannot be locked ([`StoreLockEvent::Unlocked`]).
+    pub fn exclusive_or_wait(
+        paths: &TargetStorePaths,
+        mut on_event: impl FnMut(StoreLockEvent<'_>),
+    ) -> Result<StoreLock> {
+        match acquire(paths, None, &mut on_event)? {
+            Some(lock) => Ok(lock),
+            None => unreachable!("a lock taken without a deadline is never given up"),
+        }
+    }
+
+    /// Like [`StoreLock::exclusive_or_wait`], but wait at most `within`
+    /// for another process to release the lock, retrying every 50 ms;
+    /// `Ok(None)` when it is still held then.
+    pub fn try_exclusive_for(
+        paths: &TargetStorePaths,
+        within: std::time::Duration,
+        mut on_event: impl FnMut(StoreLockEvent<'_>),
+    ) -> Result<Option<StoreLock>> {
+        acquire(paths, Some(within), &mut on_event)
+    }
+
+    /// Whether the store is actually locked: `false` for the guard of a
+    /// store that cannot be locked ([`StoreLockEvent::Unlocked`]).
+    pub fn is_held(&self) -> bool {
+        self.file.is_some()
+    }
+
+    fn new(file: Option<fs::File>) -> StoreLock {
+        LOCKS_ON_THIS_THREAD.with(|n| n.set(n.get() + 1));
+        StoreLock { file }
+    }
+}
+
+impl Drop for StoreLock {
+    fn drop(&mut self) {
+        LOCKS_ON_THIS_THREAD.with(|n| n.set(n.get().saturating_sub(1)));
+    }
+}
+
+/// Take the store lock, waiting for another process forever (`within:
+/// None`) or at most `within` (`Ok(None)` past it).
+fn acquire(
+    paths: &TargetStorePaths,
+    within: Option<std::time::Duration>,
+    on_event: &mut dyn FnMut(StoreLockEvent<'_>),
+) -> Result<Option<StoreLock>> {
+    assert!(
+        LOCKS_ON_THIS_THREAD.with(|n| n.get()) == 0,
+        "{NESTED_LOCK_PANIC}"
+    );
+    let sentinel = paths.lock_file();
+
+    fs::create_dir_all(paths.root()).map_err(|e| lock_error(&sentinel, e))?;
+    let file = match fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&sentinel)
+    {
+        Ok(file) => file,
+        // `flock` and `LockFileEx` need no write access: a sentinel this
+        // process may not write is still locked through a read-only
+        // handle. One it cannot create either (a read-only store) leaves
+        // the store unlockable.
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
+            ) =>
+        {
+            match fs::File::open(&sentinel) {
+                Ok(file) => file,
+                Err(_) => return unlocked(&sentinel, e, on_event),
+            }
+        }
+        Err(e) => return Err(lock_error(&sentinel, e)),
+    };
+
+    match file.try_lock() {
+        Ok(()) => return Ok(Some(StoreLock::new(Some(file)))),
+        Err(fs::TryLockError::WouldBlock) => on_event(StoreLockEvent::Waiting {
+            sentinel: &sentinel,
+        }),
+        Err(fs::TryLockError::Error(e)) if has_no_locks(&e) => {
+            return unlocked(&sentinel, e, on_event)
+        }
+        Err(fs::TryLockError::Error(e)) => return Err(lock_error(&sentinel, e)),
+    }
+    let locked = match within {
+        None => file.lock().map(|()| true),
+        Some(within) => poll_lock(&file, within),
+    };
+    match locked {
+        Ok(true) => Ok(Some(StoreLock::new(Some(file)))),
+        Ok(false) => Ok(None),
+        Err(e) if has_no_locks(&e) => unlocked(&sentinel, e, on_event),
+        Err(e) => Err(lock_error(&sentinel, e)),
+    }
+}
+
+/// The guard of a store that cannot be locked, reported to `on_event`.
+fn unlocked(
+    sentinel: &Path,
+    error: std::io::Error,
+    on_event: &mut dyn FnMut(StoreLockEvent<'_>),
+) -> Result<Option<StoreLock>> {
+    on_event(StoreLockEvent::Unlocked {
+        sentinel,
+        error: &error,
+    });
+    Ok(Some(StoreLock::new(None)))
+}
+
+/// Retry `try_lock` every [`LOCK_POLL`] until it succeeds (`true`) or
+/// `within` has passed (`false`).
+fn poll_lock(file: &fs::File, within: std::time::Duration) -> std::io::Result<bool> {
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        std::thread::sleep(LOCK_POLL.min(left));
+        match file.try_lock() {
+            Ok(()) => return Ok(true),
+            Err(fs::TryLockError::WouldBlock) if left.is_zero() => return Ok(false),
+            Err(fs::TryLockError::WouldBlock) => {}
+            Err(fs::TryLockError::Error(e)) => return Err(e),
+        }
+    }
+}
+
+/// Whether a lock call failed because the filesystem has no locks (some
+/// network and FUSE filesystems), rather than for a reason worth stopping
+/// on.
+fn has_no_locks(e: &std::io::Error) -> bool {
+    if e.kind() == std::io::ErrorKind::Unsupported {
+        return true;
+    }
+    #[cfg(unix)]
+    if let Some(code) = e.raw_os_error() {
+        return [libc::ENOLCK, libc::EOPNOTSUPP, libc::ENOTSUP].contains(&code);
+    }
+    false
+}
+
+/// A lock failure that stops the command, naming the sentinel.
+fn lock_error(sentinel: &Path, e: std::io::Error) -> CliError {
+    CliError::Io(std::io::Error::new(
+        e.kind(),
+        format!("cannot lock the target store ({}): {e}", sentinel.display()),
+    ))
 }
 
 /// `config.yaml` at the root of the target store. Tracks the
@@ -539,16 +791,16 @@ pub fn remove_target(paths: &TargetStorePaths, name: &str) -> Result<()> {
 // Internal: atomic write + permission enforcement
 // ---------------------------------------------------------------
 
-/// Write `bytes` to `final_path` atomically. The pattern is the
-/// standard recipe: create a tempfile in the same directory,
-/// write + fsync + close, set the desired mode while still under
-/// the tempfile name, then `rename(2)` over `final_path`. The
-/// rename is atomic on POSIX and on NTFS, so readers either see
-/// the old file or the new file, never a partial write or an
-/// over-permissive mode.
+/// Write `bytes` to `final_path` atomically, through
+/// [`crate::atomic_replace`]: a temp file in the same directory
+/// (`.apprafter-tgt-XXXXXX.tmp`), written, given its mode and fsynced
+/// under the temp name, then renamed over `final_path`. Readers see the
+/// old file or the new one, never a partial write or an over-permissive
+/// mode, and on Windows a reader holding the old file open does not make
+/// the replace fail.
 ///
 /// `secret = true` enforces mode 0600 (owner read/write only) on
-/// Unix. On Windows the mode argument is ignored (NTFS ACLs
+/// Unix, `false` 0644. On Windows the mode is ignored (NTFS ACLs
 /// inherit from the parent; tightening per-file is out of scope
 /// for v0.1.72).
 fn atomic_write(final_path: &Path, bytes: &[u8], secret: bool) -> Result<()> {
@@ -559,31 +811,8 @@ fn atomic_write(final_path: &Path, bytes: &[u8], secret: bool) -> Result<()> {
         ))
     })?;
     fs::create_dir_all(parent)?;
-
-    let mut tmp = tempfile::Builder::new()
-        .prefix(".apprafter-tgt-")
-        .suffix(".tmp")
-        .tempfile_in(parent)?;
-    tmp.write_all(bytes)?;
-    tmp.as_file_mut().sync_all()?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = if secret { 0o600 } else { 0o644 };
-        let perms = fs::Permissions::from_mode(mode);
-        fs::set_permissions(tmp.path(), perms)?;
-    }
-    #[cfg(not(unix))]
-    {
-        // Windows: mode arg ignored. Suppress unused-var lint.
-        let _ = secret;
-    }
-
-    // `persist` does an atomic rename. If the destination exists
-    // it is replaced atomically on POSIX (and via ReplaceFileW on
-    // Windows).
-    tmp.persist(final_path).map_err(|e| CliError::Io(e.error))?;
+    let mode = if secret { 0o600 } else { 0o644 };
+    crate::atomic_replace(final_path, bytes, ".apprafter-tgt-", Some(mode))?;
     Ok(())
 }
 
@@ -810,6 +1039,270 @@ mod tests {
             cfg_mode, 0o644,
             "config.yaml must be 0644 (group/world readable), got {cfg_mode:o}"
         );
+    }
+
+    #[test]
+    fn the_store_lock_is_exclusive_across_handles() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = TargetStorePaths::for_root(dir.path().to_path_buf());
+        let held = StoreLock::exclusive(&paths).unwrap();
+        let other = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(paths.root().join(".lock"))
+            .unwrap();
+        assert!(matches!(
+            other.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        drop(held);
+        other.try_lock().expect("free once the holder drops");
+    }
+
+    #[test]
+    fn the_store_lock_creates_the_root_and_its_sentinel() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("fresh");
+        let paths = TargetStorePaths::for_root(root.clone());
+        let _g = StoreLock::exclusive(&paths).unwrap();
+        assert!(root.join(".lock").is_file());
+    }
+
+    #[test]
+    fn the_sentinel_is_not_a_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = TargetStorePaths::for_root(dir.path().to_path_buf());
+        let _g = StoreLock::exclusive(&paths).unwrap();
+        assert!(list_target_names(&paths).unwrap().is_empty());
+    }
+
+    /// What a [`StoreLockEvent`] said, owned, so a test can compare it.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Seen {
+        Waiting(PathBuf),
+        Unlocked(PathBuf, std::io::ErrorKind),
+    }
+
+    fn seen(event: StoreLockEvent<'_>) -> Seen {
+        match event {
+            StoreLockEvent::Waiting { sentinel } => Seen::Waiting(sentinel.to_path_buf()),
+            StoreLockEvent::Unlocked { sentinel, error } => {
+                Seen::Unlocked(sentinel.to_path_buf(), error.kind())
+            }
+        }
+    }
+
+    /// Hold the store lock on another thread until the returned sender
+    /// sends (or drops). Returns once the lock is held.
+    fn hold_elsewhere(
+        paths: &TargetStorePaths,
+    ) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let paths = paths.clone();
+        let holder = std::thread::spawn(move || {
+            let _lock = StoreLock::exclusive(&paths).unwrap();
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        held_rx.recv().unwrap();
+        (release_tx, holder)
+    }
+
+    #[test]
+    fn a_free_lock_is_taken_without_a_word() {
+        let (_dir, paths) = make_paths();
+        let mut events = Vec::new();
+        let lock = StoreLock::exclusive_or_wait(&paths, |e| events.push(seen(e))).unwrap();
+        assert!(lock.is_held());
+        assert!(events.is_empty(), "{events:?}");
+    }
+
+    /// The release happens inside the callback, so the test proves the
+    /// order — "waiting" is reported before the wait — without a sleep.
+    #[test]
+    fn a_held_lock_is_reported_once_and_then_waited_for() {
+        let (_dir, paths) = make_paths();
+        let (release, holder) = hold_elsewhere(&paths);
+        let mut events = Vec::new();
+        let lock = StoreLock::exclusive_or_wait(&paths, |e| {
+            events.push(seen(e));
+            release.send(()).unwrap();
+        })
+        .unwrap();
+        holder.join().unwrap();
+        assert!(lock.is_held());
+        assert_eq!(events, vec![Seen::Waiting(paths.lock_file())]);
+    }
+
+    #[test]
+    fn try_exclusive_for_gives_up_on_a_lock_held_past_its_bound() {
+        let (_dir, paths) = make_paths();
+        let (release, holder) = hold_elsewhere(&paths);
+        let mut events = Vec::new();
+        let started = std::time::Instant::now();
+        let got =
+            StoreLock::try_exclusive_for(&paths, std::time::Duration::from_millis(200), |e| {
+                events.push(seen(e))
+            })
+            .unwrap();
+        assert!(got.is_none(), "the lock was held throughout");
+        assert!(started.elapsed() >= std::time::Duration::from_millis(200));
+        assert_eq!(events, vec![Seen::Waiting(paths.lock_file())]);
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        // Giving up holds nothing on this thread: the next lock is fine.
+        let again = StoreLock::exclusive(&paths).unwrap();
+        assert!(again.is_held());
+    }
+
+    #[test]
+    fn try_exclusive_for_takes_a_lock_released_within_its_bound() {
+        let (_dir, paths) = make_paths();
+        let (release, holder) = hold_elsewhere(&paths);
+        let got = StoreLock::try_exclusive_for(&paths, std::time::Duration::from_secs(30), |_| {
+            release.send(()).unwrap()
+        })
+        .unwrap()
+        .expect("released after the first try");
+        holder.join().unwrap();
+        assert!(got.is_held());
+    }
+
+    /// A second lock on one thread would wait for the first forever:
+    /// `flock` and `LockFileEx` see the second handle as a stranger.
+    #[test]
+    fn a_second_lock_on_the_same_thread_panics_instead_of_deadlocking() {
+        let (_dir, paths) = make_paths();
+        let first = StoreLock::exclusive(&paths).unwrap();
+        let nested = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            StoreLock::exclusive(&paths).map(|_| ())
+        }));
+        let payload = nested.expect_err("a nested lock must panic");
+        let message = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            message.contains("one StoreLock per thread"),
+            "the panic names the rule: {message:?}"
+        );
+        let bounded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            StoreLock::try_exclusive_for(&paths, std::time::Duration::ZERO, |_| {}).map(|_| ())
+        }));
+        assert!(bounded.is_err(), "the bounded form refuses as well");
+        drop(first);
+        let after = StoreLock::exclusive(&paths).unwrap();
+        assert!(after.is_held(), "released, the lock can be taken again");
+    }
+
+    #[test]
+    fn locks_on_other_threads_do_not_count_as_nested() {
+        let (_dir, paths) = make_paths();
+        let (release, holder) = hold_elsewhere(&paths);
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        let mine = StoreLock::exclusive(&paths).unwrap();
+        assert!(mine.is_held());
+    }
+
+    #[test]
+    fn a_filesystem_without_locks_is_recognised() {
+        use std::io::{Error, ErrorKind};
+        assert!(has_no_locks(&Error::from(ErrorKind::Unsupported)));
+        assert!(!has_no_locks(&Error::from(ErrorKind::PermissionDenied)));
+        assert!(!has_no_locks(&Error::other("anything else")));
+        #[cfg(unix)]
+        for code in [libc::ENOLCK, libc::EOPNOTSUPP, libc::ENOTSUP] {
+            assert!(has_no_locks(&Error::from_raw_os_error(code)), "{code}");
+        }
+        #[cfg(unix)]
+        assert!(!has_no_locks(&Error::from_raw_os_error(libc::EIO)));
+    }
+
+    #[test]
+    fn any_other_failure_names_the_sentinel() {
+        // The root is a file: the store directory cannot be created.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("not-a-dir");
+        fs::write(&root, b"x").unwrap();
+        let paths = TargetStorePaths::for_root(root);
+        let mut events = Vec::new();
+        let err = StoreLock::exclusive_or_wait(&paths, |e| events.push(seen(e)))
+            .map(|_| ())
+            .expect_err("a file where the store goes");
+        let sentinel = paths.lock_file().display().to_string();
+        assert!(matches!(err, CliError::Io(_)), "{err:?}");
+        assert!(err.to_string().contains(&sentinel), "{err}");
+        assert!(events.is_empty(), "an error, not a warning: {events:?}");
+    }
+
+    /// `flock` needs no write access: a sentinel this process may only
+    /// read is still locked (true as root too, who may write it anyway).
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_sentinel_is_still_locked() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, paths) = make_paths();
+        drop(StoreLock::exclusive(&paths).unwrap());
+        fs::set_permissions(paths.lock_file(), fs::Permissions::from_mode(0o444)).unwrap();
+        let mut events = Vec::new();
+        let lock = StoreLock::exclusive_or_wait(&paths, |e| events.push(seen(e))).unwrap();
+        assert!(lock.is_held());
+        assert!(events.is_empty(), "{events:?}");
+        let other = fs::File::open(paths.lock_file()).unwrap();
+        assert!(matches!(
+            other.try_lock(),
+            Err(fs::TryLockError::WouldBlock)
+        ));
+    }
+
+    /// Restores a directory's mode on drop, so a failed test still lets
+    /// its `TempDir` clean up.
+    #[cfg(unix)]
+    struct ModeGuard(PathBuf);
+
+    #[cfg(unix)]
+    impl Drop for ModeGuard {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    /// A store this process cannot write, with no sentinel in it yet: there
+    /// is nothing to lock, so the guard holds nothing and says why.
+    ///
+    /// Skipped — loudly — where the directory mode does not bind this
+    /// process (running as root): the probe write below then succeeds.
+    #[cfg(unix)]
+    #[test]
+    fn a_store_that_cannot_hold_a_sentinel_is_used_unlocked_with_a_warning() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, paths) = make_paths();
+        save_global_config(&paths, &GlobalConfig::default()).unwrap();
+        fs::set_permissions(paths.root(), fs::Permissions::from_mode(0o555)).unwrap();
+        let _restore = ModeGuard(paths.root().to_path_buf());
+        if fs::write(paths.root().join("probe"), b"").is_ok() {
+            eprintln!(
+                "SKIPPED a_store_that_cannot_hold_a_sentinel_is_used_unlocked_with_a_warning: \
+                 a 0555 directory is writable to this process (root?)"
+            );
+            return;
+        }
+        let mut events = Vec::new();
+        let lock = StoreLock::exclusive_or_wait(&paths, |e| events.push(seen(e))).unwrap();
+        assert!(!lock.is_held());
+        assert_eq!(
+            events,
+            vec![Seen::Unlocked(
+                paths.lock_file(),
+                std::io::ErrorKind::PermissionDenied
+            )]
+        );
+        // The silent form gives the same guard.
+        drop(lock);
+        assert!(!StoreLock::exclusive(&paths).unwrap().is_held());
     }
 
     #[test]
@@ -1152,5 +1645,26 @@ mod tests {
         let legacy = "provider: hetzner-cloud\n";
         let cfg: TargetConfig = serde_yaml::from_str(legacy).unwrap();
         assert_eq!(cfg.firewall, None);
+    }
+
+    #[test]
+    fn config_root_from_override_uses_a_non_empty_value_verbatim() {
+        let root = config_root_from_override(Some("/tmp/somewhere".to_string())).unwrap();
+        assert_eq!(root, PathBuf::from("/tmp/somewhere"));
+    }
+
+    #[test]
+    fn config_root_from_override_treats_empty_as_unset() {
+        let root = config_root_from_override(Some(String::new())).unwrap();
+        assert!(
+            root.ends_with("apprafter"),
+            "fell back to the platform dir, got {root:?}"
+        );
+    }
+
+    #[test]
+    fn config_root_from_override_without_value_uses_the_platform_dir() {
+        let root = config_root_from_override(None).unwrap();
+        assert!(root.ends_with("apprafter"), "got {root:?}");
     }
 }

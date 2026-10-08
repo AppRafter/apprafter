@@ -1,0 +1,6 @@
+$ apprafter target list
+[exit 0]
+[stdout]
+No targets configured. Run `apprafter target add` to create one — or `apprafter target add <name>` to skip the wizard's name prompt.
+[stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m target list invoked

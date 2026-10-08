@@ -16,6 +16,28 @@ fn cli() -> Command {
     Command::cargo_bin("apprafter").unwrap()
 }
 
+/// A `PATH` holding nothing but a stand-in for every tool `doctor` probes.
+///
+/// A clean run needs the required tools present, so a test that asserts one
+/// passed or failed on what the CI image happened to ship: the macOS runners
+/// carry no `kubectl`, and every happy-path test here failed on them. Each
+/// stand-in is a hard link to the `apprafter` binary under test, which answers
+/// `-V`/`--version` with its version and any other probe with a usage error on
+/// stderr — and `check_tool` counts either as the tool being there. A hard
+/// link rather than a script because Windows runs only real executables; made
+/// under `CARGO_TARGET_TMPDIR` because a hard link cannot cross volumes and the
+/// Windows runners keep `%TEMP%` and the checkout on different drives.
+fn tools_on_path() -> tempfile::TempDir {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    for tool in cli_core::tools::ALL {
+        let stand_in = dir
+            .path()
+            .join(format!("{}{}", tool.name, std::env::consts::EXE_SUFFIX));
+        std::fs::hard_link(env!("CARGO_BIN_EXE_apprafter"), stand_in).unwrap();
+    }
+    dir
+}
+
 fn synthetic_hetzner_token() -> String {
     "a".repeat(64)
 }
@@ -92,9 +114,11 @@ fn doctor_renders_target_and_env_checks_with_summary() {
 
     seed_target_with_ssh(dir.path(), Some(&key_path));
 
+    let tools = tools_on_path();
     cli()
         .env("APPRAFTER_CONFIG_DIR", dir.path())
         .env("APPRAFTER_NO_PING", "1")
+        .env("PATH", tools.path())
         .arg("doctor")
         .assert()
         .success()
@@ -141,9 +165,11 @@ fn doctor_target_flag_inspects_non_active_target() {
         .assert()
         .success();
 
+    let tools = tools_on_path();
     cli()
         .env("APPRAFTER_CONFIG_DIR", dir.path())
         .env("APPRAFTER_NO_PING", "1")
+        .env("PATH", tools.path())
         .args(["doctor", "--target", "secondary"])
         .assert()
         .success()
@@ -164,9 +190,11 @@ fn doctor_ssh_key_missing_path_fails_the_run_with_exit_1() {
     // doctor must surface this as a FAIL (stale config).
     std::fs::remove_file(&key_path).unwrap();
 
+    let tools = tools_on_path();
     cli()
         .env("APPRAFTER_CONFIG_DIR", dir.path())
         .env("APPRAFTER_NO_PING", "1")
+        .env("PATH", tools.path())
         .arg("doctor")
         .assert()
         .failure()
@@ -200,9 +228,11 @@ fn doctor_summary_line_phrases_outcomes_clearly() {
     std::fs::write(&key_path, "ssh-ed25519 AAAA test@host").unwrap();
     seed_target_with_ssh(dir.path(), Some(&key_path));
 
+    let tools = tools_on_path();
     cli()
         .env("APPRAFTER_CONFIG_DIR", dir.path())
         .env("APPRAFTER_NO_PING", "1")
+        .env("PATH", tools.path())
         .arg("doctor")
         .assert()
         .success()
