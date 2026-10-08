@@ -31,13 +31,21 @@ pub struct PlannedChange {
     pub change: String,
 }
 
-/// What a mutation will do, before it does it. `payload` is the
-/// operation-specific data `execute` needs.
+/// What a mutation will do, before it does it.
+///
+/// A plan serialises for display — class, title, changes — but never
+/// deserialises: nothing outside Rust can hand a plan back to execute.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Plan<T> {
     pub class: PlanClass,
     pub title: String,
     pub changes: Vec<PlannedChange>,
+    /// The operation-specific data `execute` consumes. It never crosses
+    /// IPC, so a webview can neither read it nor alter what runs after the
+    /// confirmation; the desktop keeps the `Plan` in Rust, keyed by an
+    /// operation id. It may hold secrets, and those must be
+    /// [`SecretString`](crate::SecretString)s: `Debug` prints the payload.
+    #[serde(skip)]
     pub payload: T,
 }
 
@@ -86,5 +94,42 @@ mod tests {
             serde_json::to_value(&stopped).unwrap()["status"],
             "cancelled"
         );
+    }
+
+    /// What `execute` would consume: deliberately not `Serialize`.
+    #[derive(Debug, Clone, PartialEq)]
+    struct Secretive {
+        token: crate::SecretString,
+    }
+
+    #[test]
+    fn a_plan_serialises_without_its_payload() {
+        let plan = Plan {
+            class: PlanClass::Bounded,
+            title: "Rotate the token".into(),
+            changes: vec![],
+            payload: Secretive {
+                token: crate::SecretString::new("hunter2"),
+            },
+        };
+        let v = serde_json::to_value(&plan).unwrap();
+        assert!(v.get("payload").is_none(), "payload crossed IPC: {v}");
+        assert_eq!(v["title"], "Rotate the token");
+        assert!(!v.to_string().contains("hunter2"));
+        assert!(!format!("{plan:?}").contains("hunter2"));
+    }
+
+    /// `Plan` must not implement `Deserialize`: a webview must not be able
+    /// to hand back a plan to execute. This fails to compile if it does —
+    /// the two blanket impls then both apply and the call is ambiguous.
+    #[test]
+    fn a_plan_cannot_be_deserialised() {
+        trait AmbiguousIfDeserialize<A> {
+            fn check() {}
+        }
+        impl<T> AmbiguousIfDeserialize<()> for T {}
+        struct Invalid;
+        impl<T: for<'de> serde::Deserialize<'de>> AmbiguousIfDeserialize<Invalid> for T {}
+        <Plan<()> as AmbiguousIfDeserialize<_>>::check();
     }
 }
