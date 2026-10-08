@@ -164,20 +164,10 @@ fn run_add(mut args: AddArgs) -> Result<()> {
         verify_ssh_key_readable(path)?;
     }
 
-    // Held from the existence check through `ensure_active_target`, so two
-    // concurrent adds can neither both create the same target nor both see
-    // a fresh store and race for the active pointer.
-    let _store_lock = cli_core::StoreLock::exclusive(&paths)?;
-    let existing = load_target(&paths, &name);
-    match existing {
-        Ok(_) if !args.force => {
-            return Err(CliError::Other(format!(
-                "target `{name}` already exists — pass `--force` to overwrite or `--renew` to rotate credentials only"
-            )));
-        }
-        Ok(_) | Err(CliError::TargetNotFound { .. }) => {}
-        Err(e) => return Err(e),
-    }
+    // Checked here, before the ping, so an add that cannot succeed fails at
+    // once; and again under the store lock, right before the save
+    // (`save_new_target`), where it decides.
+    check_name_free(&paths, &name, args.force)?;
 
     // API ping confirms the token actually authenticates with the
     // provider. Happens AFTER the existing-target check so a no-op
@@ -220,9 +210,7 @@ fn run_add(mut args: AddArgs) -> Result<()> {
             hetzner_token: Some(token),
         },
     };
-    save_target(&paths, &target)?;
-
-    let became_active = ensure_active_target(&paths, &name)?;
+    let became_active = save_new_target(&paths, &target, args.force)?;
 
     let verified_suffix = add_verified_suffix(args.no_ping);
     if became_active {
@@ -235,6 +223,31 @@ fn run_add(mut args: AddArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Refuse to add `name` when the store already has it, unless `force`. A
+/// target that is there but unreadable is an error either way.
+fn check_name_free(paths: &TargetStorePaths, name: &str, force: bool) -> Result<()> {
+    match load_target(paths, name) {
+        Ok(_) if !force => Err(CliError::Other(format!(
+            "target `{name}` already exists — pass `--force` to overwrite or `--renew` to rotate credentials only"
+        ))),
+        Ok(_) | Err(CliError::TargetNotFound { .. }) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Save a new `target` and, on a fresh store, make it the active one;
+/// returns whether it became active. Under the store lock, and nothing slow
+/// inside it — the token ping and the SKU check ran before, unlocked — so
+/// the lock is held for a few file operations, never across the network.
+/// The name is checked again under the lock: another add may have created
+/// it since the first check, and only `force` overwrites it.
+fn save_new_target(paths: &TargetStorePaths, target: &Target, force: bool) -> Result<bool> {
+    let _store_lock = cli_core::StoreLock::exclusive(paths)?;
+    check_name_free(paths, &target.name, force)?;
+    save_target(paths, target)?;
+    ensure_active_target(paths, &target.name)
 }
 
 /// Same idea as [`add_verified_suffix`], for the `--renew` path — a rotation
@@ -355,16 +368,9 @@ pub(crate) fn map_wizard_prompt_error(err: inquire::InquireError) -> CliError {
 }
 
 fn run_renew(paths: &TargetStorePaths, args: AddArgs, name: &str) -> Result<()> {
-    let _store_lock = store_lock_if_present(paths)?;
-    let mut existing = match load_target(paths, name) {
-        Ok(t) => t,
-        Err(CliError::TargetNotFound { .. }) => {
-            return Err(CliError::Other(format!(
-                "target `{name}` does not exist — drop `--renew` to create it fresh"
-            )));
-        }
-        Err(e) => return Err(e),
-    };
+    // Read without the lock: the checks and the ping below take as long as
+    // the network does. The save re-reads under it (`save_renewed`).
+    let existing = load_renewable(paths, name)?;
 
     // `--renew` deliberately ignores the config flags (provider,
     // region, tier, etc.). Refusing them up front beats silently
@@ -391,22 +397,53 @@ fn run_renew(paths: &TargetStorePaths, args: AddArgs, name: &str) -> Result<()> 
 
     if let Some(path) = args.ssh_key.as_ref() {
         verify_ssh_key_readable(path)?;
-        existing.config.ssh_key_path = Some(path.clone());
     }
     if !args.no_ping {
         ping_provider(&existing.config.provider, &token)?;
     }
 
-    existing.credentials = TargetCredentials {
-        hetzner_token: Some(token),
-    };
-    save_target(paths, &existing)?;
+    save_renewed(paths, name, token, args.ssh_key)?;
 
     println!(
         "target `{name}` credentials rotated{}",
         renew_verified_suffix(args.no_ping)
     );
     Ok(())
+}
+
+/// Target `name`, for `--renew`, which rotates the credentials of a target
+/// that exists.
+fn load_renewable(paths: &TargetStorePaths, name: &str) -> Result<Target> {
+    match load_target(paths, name) {
+        Ok(t) => Ok(t),
+        Err(CliError::TargetNotFound { .. }) => Err(CliError::Other(format!(
+            "target `{name}` does not exist — drop `--renew` to create it fresh"
+        ))),
+        Err(e) => Err(e),
+    }
+}
+
+/// Write the rotated `token` (and the new `ssh_key` path, if one was given)
+/// into target `name`, under the store lock: re-read, re-checked (the target
+/// still exists, and the token is still a new one), and only those fields
+/// changed, so an edit made while the token was being verified — a
+/// `target machine`, say — is kept rather than written over.
+fn save_renewed(
+    paths: &TargetStorePaths,
+    name: &str,
+    token: String,
+    ssh_key: Option<PathBuf>,
+) -> Result<()> {
+    let _store_lock = store_lock_if_present(paths)?;
+    let mut target = load_renewable(paths, name)?;
+    reject_identical_token(target.credentials.hetzner_token.as_deref(), &token, name)?;
+    if let Some(path) = ssh_key {
+        target.config.ssh_key_path = Some(path);
+    }
+    target.credentials = TargetCredentials {
+        hetzner_token: Some(token),
+    };
+    save_target(paths, &target)
 }
 
 // ---------------------------------------------------------------
@@ -628,6 +665,90 @@ fn ensure_active_target(paths: &TargetStorePaths, name: &str) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── the store lock: re-checked right before the save ─────────────────
+
+    /// A target store at a fresh temp root.
+    fn store() -> (tempfile::TempDir, TargetStorePaths) {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = TargetStorePaths::for_root(dir.path().join("store"));
+        (dir, paths)
+    }
+
+    /// Target `name`, holding `token`.
+    fn target(name: &str, token: &str) -> Target {
+        Target {
+            name: name.to_string(),
+            config: TargetConfig {
+                provider: "hetzner-cloud".to_string(),
+                ..TargetConfig::default()
+            },
+            credentials: TargetCredentials {
+                hetzner_token: Some(token.to_string()),
+            },
+        }
+    }
+
+    fn token_of(paths: &TargetStorePaths, name: &str) -> Option<String> {
+        load_target(paths, name).unwrap().credentials.hetzner_token
+    }
+
+    /// `target add` checks the name, pings the provider unlocked, then
+    /// saves. Another add that created the same name in between is found
+    /// by the check under the lock and is not overwritten without
+    /// `--force` — the window the ping used to hold the lock across.
+    #[test]
+    fn an_add_does_not_overwrite_a_target_created_since_its_first_check() {
+        let (_dir, paths) = store();
+        check_name_free(&paths, "work", false).expect("free at the first check");
+        // Meanwhile, during the ping, another add creates it.
+        assert!(save_new_target(&paths, &target("work", "first"), false).unwrap());
+
+        let err = save_new_target(&paths, &target("work", "second"), false)
+            .expect_err("taken since the first check");
+        assert!(err.to_string().contains("already exists"), "{err}");
+        assert_eq!(token_of(&paths, "work").as_deref(), Some("first"));
+
+        // `--force` is what overwrites, and an existing store keeps its
+        // active target.
+        assert!(!save_new_target(&paths, &target("work", "second"), true).unwrap());
+        assert_eq!(token_of(&paths, "work").as_deref(), Some("second"));
+    }
+
+    /// `--renew` writes only the token (and a new key path) into the
+    /// target as it is under the lock: an edit made while the new token
+    /// was being verified is kept, and a target removed meanwhile is not
+    /// brought back.
+    #[test]
+    fn a_renew_patches_the_target_as_it_is_at_the_save() {
+        let (_dir, paths) = store();
+        save_target(&paths, &target("work", "old")).unwrap();
+        let read_first = load_renewable(&paths, "work").unwrap();
+        // Meanwhile, during the ping, `target machine` records a SKU.
+        let mut machine = load_target(&paths, "work").unwrap();
+        machine.config.server_type = Some("cx32".to_string());
+        save_target(&paths, &machine).unwrap();
+
+        save_renewed(&paths, "work", "new".to_string(), None).unwrap();
+        let saved = load_target(&paths, "work").unwrap();
+        assert_eq!(saved.credentials.hetzner_token.as_deref(), Some("new"));
+        assert_eq!(
+            saved.config.server_type.as_deref(),
+            Some("cx32"),
+            "the edit made meanwhile was written over by {read_first:?}"
+        );
+
+        // The same token again is still refused under the lock.
+        let err =
+            save_renewed(&paths, "work", "new".to_string(), None).expect_err("identical token");
+        assert!(err.to_string().contains("NEW token"), "{err}");
+
+        remove_target(&paths, "work").unwrap();
+        let err =
+            save_renewed(&paths, "work", "newer".to_string(), None).expect_err("removed meanwhile");
+        assert!(err.to_string().contains("does not exist"), "{err}");
+        assert!(!paths.target_dir("work").exists());
+    }
 
     #[test]
     fn validate_target_name_accepts_kebab_lowercase() {

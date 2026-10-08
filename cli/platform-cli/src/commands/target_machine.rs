@@ -151,8 +151,11 @@ pub(crate) trait MachineEnv {
     fn is_provisioned(&mut self) -> bool;
     /// The target's current config.
     fn config(&mut self) -> TargetConfig;
-    /// Persist the patched config.
-    fn save(&mut self, config: TargetConfig) -> Result<()>;
+    /// Record the machine choice — `sku`, and `region` when the picker
+    /// moved it — on the target as it is when this runs, not as
+    /// [`Self::config`] read it before the validation or the picker
+    /// ([`record_machine`]).
+    fn save(&mut self, sku: &str, region: Option<&str>) -> Result<()>;
     /// Check the SKU exists in `region` per the provider catalogue.
     fn validate_sku(&mut self, sku: &str, region: &str) -> Result<()>;
     /// Run the interactive machine picker; returns `(region, sku)`.
@@ -186,7 +189,7 @@ pub(crate) fn machine_core(
     match decide_machine_action(args.no_ping, args.server_type.as_deref(), interactive)? {
         // (A) --no-ping + --server-type  → patch without validation
         MachineAction::RecordUnvalidated(sku) => {
-            env.save(with_machine(config, &sku, None))?;
+            env.save(&sku, None)?;
             env.report(&saved_message(target_name, &sku, SavedVia::Unvalidated));
         }
 
@@ -194,7 +197,7 @@ pub(crate) fn machine_core(
         MachineAction::ValidateThenRecord(sku) => {
             let current_region = region_for_validation(config.region.as_deref());
             env.validate_sku(&sku, &current_region)?;
-            env.save(with_machine(config, &sku, None))?;
+            env.save(&sku, None)?;
             env.report(&saved_message(
                 target_name,
                 &sku,
@@ -229,7 +232,7 @@ pub(crate) fn machine_core(
                 return Ok(());
             }
 
-            env.save(with_machine(config, &picked_sku, Some(&picked_region)))?;
+            env.save(&picked_sku, Some(&picked_region))?;
             env.report(&saved_message(
                 target_name,
                 &picked_sku,
@@ -245,7 +248,11 @@ pub(crate) fn machine_core(
 /// catalogue, the real `inquire` prompt and the real stdout.
 struct CliMachineEnv<'a> {
     store: &'a TargetStorePaths,
-    target: &'a mut cli_core::target::Target,
+    /// The target's state, re-read by the save ([`record_machine`]).
+    state: &'a cli_state::StatePaths,
+    /// The target as read before anything else ran: what the decision
+    /// reads (its config, its provider). Never written back.
+    target: &'a cli_core::target::Target,
     provisioned: bool,
     target_name: &'a str,
 }
@@ -259,9 +266,8 @@ impl MachineEnv for CliMachineEnv<'_> {
         self.target.config.clone()
     }
 
-    fn save(&mut self, config: TargetConfig) -> Result<()> {
-        self.target.config = config;
-        save_target(self.store, self.target)
+    fn save(&mut self, sku: &str, region: Option<&str>) -> Result<()> {
+        record_machine(self.store, self.state, self.target_name, sku, region)
     }
 
     fn validate_sku(&mut self, sku: &str, region: &str) -> Result<()> {
@@ -301,21 +307,45 @@ pub fn run_machine(args: MachineArgs) -> Result<()> {
     // to get the state, but we also need the raw target record to patch it.
     let resolved = resolve_state_paths(args.target.as_deref())?;
     let store = TargetStorePaths::for_root(default_config_root()?);
-    // Held from the load through `machine_core`'s save: the whole config is
-    // written back, so an edit made in between would be lost. The
-    // interactive picker runs under it too.
-    let _store_lock = crate::commands::target::store_lock_if_present(&store)?;
-    let mut target = load_target(&store, &resolved.target_name)?;
+    // Read without the store lock: the validation and the picker below can
+    // take as long as the network, or the operator, does. The save takes the
+    // lock and re-reads ([`record_machine`]).
+    let target = load_target(&store, &resolved.target_name)?;
     let state = cli_state::State::load_or_default(&resolved.paths)?;
     let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
 
     let mut env = CliMachineEnv {
         store: &store,
+        state: &resolved.paths,
         provisioned: is_provisioned(&state),
         target_name: &resolved.target_name,
-        target: &mut target,
+        target: &target,
     };
     machine_core(&mut env, &resolved.target_name, &args, interactive)
+}
+
+/// Record `sku` — and `region`, when the picker moved it — on target
+/// `name`, under the store lock. The target and its state are read again
+/// there, and what [`machine_core`] checked before its validation or picker
+/// ran is checked again (the target still exists, and has still not
+/// provisioned), because either can change while the operator picks. Only
+/// the machine fields of the target as it is now change: writing back the
+/// copy read before the picker would undo an edit made meanwhile, such as a
+/// `target add --renew` rotating its token.
+pub(crate) fn record_machine(
+    store: &TargetStorePaths,
+    state: &cli_state::StatePaths,
+    name: &str,
+    sku: &str,
+    region: Option<&str>,
+) -> Result<()> {
+    let _store_lock = crate::commands::target::store_lock_if_present(store)?;
+    let mut target = load_target(store, name)?;
+    if is_provisioned(&cli_state::State::load_or_default(state)?) {
+        return Err(CliError::Other(provisioned_refusal_message(name)));
+    }
+    target.config = with_machine(target.config, sku, region);
+    save_target(store, &target)
 }
 
 /// Whether picking a new region needs a confirmation prompt.
@@ -744,7 +774,8 @@ mod tests {
         fn config(&mut self) -> TargetConfig {
             self.config.clone()
         }
-        fn save(&mut self, config: TargetConfig) -> Result<()> {
+        fn save(&mut self, sku: &str, region: Option<&str>) -> Result<()> {
+            let config = with_machine(self.config.clone(), sku, region);
             self.log.push(format!(
                 "save:{}@{}",
                 config.server_type.as_deref().unwrap_or("-"),
@@ -939,5 +970,192 @@ mod tests {
         // pair of backticks that reads like a corrupted config.
         let unset = region_change_prompt(None, "hel1");
         assert!(unset.contains("(unset)"), "{unset}");
+    }
+}
+
+/// The save under the store lock, against a real target store on disk:
+/// whatever changes between `machine_core`'s decision and its save — a
+/// concurrent `target add --renew`, a provision, a removal — the save sees.
+#[cfg(test)]
+mod locked_save_tests {
+    use super::{
+        machine_core, provisioned_refusal_message, CliMachineEnv, MachineArgs, MachineEnv,
+    };
+    use cli_core::target::{
+        load_target, remove_target, save_target, Target, TargetConfig, TargetCredentials,
+        TargetStorePaths,
+    };
+    use cli_core::{CliError, Result};
+    use cli_state::{HetznerCloudState, State, StatePaths};
+
+    const OLD_TOKEN: &str = "old-token";
+    const RENEWED_TOKEN: &str = "renewed-token";
+
+    struct Sandbox {
+        _dir: tempfile::TempDir,
+        store: TargetStorePaths,
+        state: StatePaths,
+    }
+
+    /// A store holding target `work` (region `hel1`, token [`OLD_TOKEN`]),
+    /// and its state, not provisioned.
+    fn sandbox() -> Sandbox {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TargetStorePaths::for_root(dir.path().join("store"));
+        let state = StatePaths::for_root(&dir.path().join("state"));
+        save_target(
+            &store,
+            &Target {
+                name: "work".to_string(),
+                config: TargetConfig {
+                    provider: "hetzner-cloud".to_string(),
+                    region: Some("hel1".to_string()),
+                    ..TargetConfig::default()
+                },
+                credentials: TargetCredentials {
+                    hetzner_token: Some(OLD_TOKEN.to_string()),
+                },
+            },
+        )
+        .unwrap();
+        Sandbox {
+            _dir: dir,
+            store,
+            state,
+        }
+    }
+
+    /// The production env for everything `machine_core` writes and reads
+    /// back — `config`, `is_provisioned`, `save` — with the two slow steps
+    /// (the catalogue check and the picker) replaced by `meanwhile`: what
+    /// another process does to the store while they run.
+    struct Concurrent<'a> {
+        inner: CliMachineEnv<'a>,
+        meanwhile: Box<dyn FnMut() + 'a>,
+    }
+
+    impl MachineEnv for Concurrent<'_> {
+        fn is_provisioned(&mut self) -> bool {
+            self.inner.is_provisioned()
+        }
+        fn config(&mut self) -> TargetConfig {
+            self.inner.config()
+        }
+        fn save(&mut self, sku: &str, region: Option<&str>) -> Result<()> {
+            self.inner.save(sku, region)
+        }
+        fn validate_sku(&mut self, _sku: &str, _region: &str) -> Result<()> {
+            (self.meanwhile)();
+            Ok(())
+        }
+        fn pick_machine(&mut self) -> Result<(Option<String>, Option<String>)> {
+            (self.meanwhile)();
+            Ok((Some("fsn1".to_string()), Some("cx42".to_string())))
+        }
+        fn confirm(&mut self, _prompt: &str) -> Result<bool> {
+            Ok(true)
+        }
+        fn report(&mut self, _line: &str) {}
+    }
+
+    /// Run `target machine work` with `server_type` (else the picker), the
+    /// way `run_machine` does — the target and its state read first, without
+    /// the lock — and `meanwhile` run in place of the validation or picker.
+    fn run<'a>(
+        sb: &'a Sandbox,
+        server_type: Option<&str>,
+        meanwhile: impl FnMut() + 'a,
+    ) -> Result<()> {
+        let target = load_target(&sb.store, "work").unwrap();
+        let provisioned = super::is_provisioned(&State::load_or_default(&sb.state).unwrap());
+        let mut env = Concurrent {
+            inner: CliMachineEnv {
+                store: &sb.store,
+                state: &sb.state,
+                target: &target,
+                provisioned,
+                target_name: "work",
+            },
+            meanwhile: Box::new(meanwhile),
+        };
+        let args = MachineArgs {
+            target: None,
+            server_type: server_type.map(str::to_string),
+            no_ping: false,
+        };
+        machine_core(&mut env, "work", &args, server_type.is_none())
+    }
+
+    /// What `target add work --renew` writes.
+    fn renew(store: &TargetStorePaths) {
+        let mut target = load_target(store, "work").unwrap();
+        target.credentials.hetzner_token = Some(RENEWED_TOKEN.to_string());
+        save_target(store, &target).unwrap();
+    }
+
+    /// The defect the re-read fixes: the target read before the picker was
+    /// written back whole, credentials included, so a token rotated while
+    /// the operator picked was silently rotated back.
+    #[test]
+    fn a_token_renewed_while_the_machine_was_chosen_survives_the_save() {
+        for server_type in [Some("cx32"), None] {
+            let sb = sandbox();
+            run(&sb, server_type, || renew(&sb.store)).unwrap();
+            let saved = load_target(&sb.store, "work").unwrap();
+            assert_eq!(
+                saved.credentials.hetzner_token.as_deref(),
+                Some(RENEWED_TOKEN),
+                "{server_type:?}: the renewed token was written over"
+            );
+            let (sku, region) = match server_type {
+                Some(sku) => (sku, "hel1"),
+                None => ("cx42", "fsn1"),
+            };
+            assert_eq!(saved.config.server_type.as_deref(), Some(sku));
+            assert_eq!(saved.config.region.as_deref(), Some(region));
+        }
+    }
+
+    /// Provisioned while the machine was chosen: the save refuses as the
+    /// first check would have, and writes nothing.
+    #[test]
+    fn a_target_provisioned_meanwhile_is_refused_at_the_save() {
+        let sb = sandbox();
+        let err = run(&sb, Some("cx32"), || {
+            State {
+                hetzner_cloud: Some(HetznerCloudState {
+                    server_id: 1,
+                    server_name: "platform-1".to_string(),
+                    server_type: Some("cx22".to_string()),
+                    ssh_key_ids: vec![],
+                    network_id: None,
+                    firewall_id: None,
+                    floating_ip_ids: vec![],
+                    kubeconfig_yaml: None,
+                    kubeconfig_age: None,
+                    argocd_admin_password_age: None,
+                }),
+                ..State::default()
+            }
+            .save(&sb.state)
+            .unwrap();
+        })
+        .expect_err("a provisioned target is refused");
+        assert_eq!(err.to_string(), provisioned_refusal_message("work"));
+        let saved = load_target(&sb.store, "work").unwrap();
+        assert_eq!(saved.config.server_type, None, "nothing was written");
+    }
+
+    /// Removed while the machine was chosen: the save does not bring it
+    /// back as a target holding nothing but a machine type.
+    #[test]
+    fn a_target_removed_meanwhile_is_not_recreated_by_the_save() {
+        let sb = sandbox();
+        let err = run(&sb, Some("cx32"), || {
+            remove_target(&sb.store, "work").unwrap()
+        })
+        .expect_err("a removed target is refused");
+        assert!(matches!(err, CliError::TargetNotFound { .. }), "{err:?}");
+        assert!(!sb.store.target_dir("work").exists());
     }
 }

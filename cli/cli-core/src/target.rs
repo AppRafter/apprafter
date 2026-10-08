@@ -216,6 +216,11 @@ impl TargetStorePaths {
 /// (load → change → save), so the CLI and AppRafter Desktop editing the
 /// same store never lose each other's update (ADR 0067).
 ///
+/// Never hold it across a slow step — a provider call, a prompt: every
+/// other edit of the store waits for it. Do the slow step first, then take
+/// the lock, re-read what the change needs, re-check what the step relied
+/// on, change, save.
+///
 /// It locks a sentinel, `<root>/.lock`, never a data file: data files are
 /// replaced by rename (`atomic_write`), so a lock on one would guard an
 /// inode that is about to disappear, and on Windows byte-range locks are
