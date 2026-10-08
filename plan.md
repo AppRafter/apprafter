@@ -7759,8 +7759,14 @@ Cargo-воркспейс + bun (Tauri 2, React 19, TS, TanStack Query, типы 
 
 > 🏁 SR: трек D
 
+> 🚧 **КОД ГОТОВ 2026-10-08** (ветка `feat/desktop-d1`, cli 0.2.80 открыт, НЕ выпущен). Ждёт: (1) первого
+> прогона CI-матрицы ubuntu / macOS / Windows — ни разу не запускалась, ветку пушит владелец; (2) релиза
+> cli v0.2.80 — по запросу (`project-release`). Ревью каждой части (A–D) + повторные ревью исправлений —
+> одобрены. Планы: `docs/superpowers/plans/2026-10-08-d1*.md`. Решение «сначала потребитель» сузило объём
+> D.1 относительно пунктов ниже (сами пункты не переписаны — отметки показывают, что куда ушло).
+
 **Поставка:**
-- [ ] Крейт `cli/apprafter-core`: `Context` (все env-чтения CLI становятся полями; CLI-only
+- [~] Крейт `cli/apprafter-core`: `Context` (все env-чтения CLI становятся полями; CLI-only
       переопределения `HCLOUD_TOKEN` / `APPRAFTER_AGE_KEY` / SSH-переменные читает только CLI),
       `TargetRef` (`target use` выбирает активный target; `add` / `rename` / `remove` двигают
       указатель побочно, как сейчас, и сообщают об этом), три формы операций, `Reporter`
@@ -7770,16 +7776,35 @@ Cargo-воркспейс + bun (Tauri 2, React 19, TS, TanStack Query, типы 
       полные коды, `kind` для kubectl-ошибок), трейт `Kube` (kubectl, таймаут запроса 10 с по
       умолчанию), резолвер утилит (абсолютные пути, `.exe` на Windows, login-shell `PATH` на macOS,
       `cue` в списке), `SecretStore`-трейт (пока файловый бэкенд).
-- [ ] Golden-снапшоты **до** любых изменений путей: target, apply / up / cluster-bootstrap,
+      → **сделано:** `Context` (CLI-builder через `EnvSource`, CLI-only `HCLOUD_TOKEN`),
+      `TargetRef::named`/`active`, `Plan`/`PlanClass`/`Outcome` (payload не сериализуется),
+      `Reporter`/`Event`, `CancellationToken` (колбэки изолированы от паник, гонка форсирована тестом),
+      `CoreError`/`UiError`; syn-guards (чистота core, запрещённые вызовы, зависимости) + ратчет env-чтений
+      (55). **Перенесено к первому потребителю:** `Kube` → D.5, резолвер утилит → D.3 (поиск `.exe`
+      уже в cli-core), `SecretStore` → D.4, реестр детей и `Outcome::Cancelled` в деле → D.6/D.11.
+- [x] Golden-снапшоты **до** любых изменений путей: target, apply / up / cluster-bootstrap,
       status / top, backup / export / restore (non-TTY, stdout/stderr раздельно, `RUST_LOG=off`).
-- [ ] Перешиваем только то, что требуют Windows и безопасность: `helper_interrupt` → токен;
+      → **сделано для того, что D.1 реально меняет на Unix:** target-семейство, `whoami`, `init`,
+      `--version`, ошибки резолва (42 файла, харнес 58 тестов; stderr tracing учтён — `RUST_LOG=off`
+      отменён по ревью, время маскируется). apply / status / backup пути D.1 на Unix не тронул —
+      их golden снимаются в своих срезах (D.5 / D.11 / D.12) до переноса.
+- [~] Перешиваем только то, что требуют Windows и безопасность: `helper_interrupt` → токен;
       пути от `$HOME` → `dirs::home_dir()`; поиск утилит; блокировки (`File::lock` на сентинеле
       `<root>/.lock`, per-target `.op.lock`, `target::busy`) + атомарный `State::save`; env-чтения
       за `Context`; типизированные «нет активного target» / «target не найден».
-- [ ] CI: все крейты `cli/`, кроме `apprafter-backup` (Linux-раннер в кластере), — build + clippy
+      → **сделано:** `helper_interrupt` разделён cfg (Unix без изменений; Windows —
+      `SetConsoleCtrlHandler`, остановка в отдельном потоке, 0xC000013A у kubectl); пути через
+      `dirs::home_dir()`; поиск `.exe`; `cli_core::StoreLock` (+ ожидание видно, вложенность — паника,
+      ФС без блокировок — предупреждение) и `cli_core::atomic_replace` (Windows-устойчивый rename);
+      `apprafter::target::no_active` / `not_found`. **Перенесено:** перевод `helper_interrupt` на токен
+      и restic-код 130 → D.11; `.op.lock` / `target::busy` → D.11/D.12; env-чтения за `Context` — по
+      срезам (ратчет только вниз).
+- [x] CI: все крейты `cli/`, кроме `apprafter-backup` (Linux-раннер в кластере), — build + clippy
       + test на `windows-latest`; `cli/apprafter-backup/**` и `cli/backup-core/**` в D.1 не
       трогаем (иначе перепин раннера в platform-stack).
-- [ ] `cli/apprafter-core/**` в глобы docsgen / docs-check (`lefthook.yml`, `docs.yml`).
+      → `rust-cli` — матрица ubuntu/macOS/windows + агрегатор со старым именем `cargo test cli/`;
+      локально: Windows check + clippy чистые, часть тестов прогнана под wine. **Первый прогон в CI — после push.**
+- [x] `cli/apprafter-core/**` в глобы docsgen / docs-check (`lefthook.yml`, `docs.yml`) — `a70642ee`.
 
 **Acceptance:** golden-снапшоты совпадают побайтово; `cargo test --workspace --exclude
 apprafter-backup` зелёный на ubuntu / macos / windows; в core нет печати, промптов, `process::exit`
