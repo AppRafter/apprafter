@@ -22,7 +22,7 @@ http        = { workspace = true }
 tracing     = { workspace = true }
 thiserror   = { workspace = true }
 futures     = { workspace = true }
-tokio       = { workspace = true }
+tokio       = { workspace = true, features = ["sync"] }
 chrono      = { workspace = true }
 serde_json  = { workspace = true }
 json-patch  = { workspace = true }
@@ -49,3 +49,17 @@ tokio-postgres = "0.7"
 # Dev-only — no admission-webhook dependency in the production build; both
 # crates already depend only on operator-core, so this adds no cycle.
 admission-webhook = { path = "../../admission-webhook" }
+# WI-400: the deadline tests run a reconcile against
+# `operator_core::testing::stalled_client()` — an apiserver that accepts every
+# request and never answers — on a paused clock (`test-util`), so a 120s
+# deadline elapses in no wall time and the moment it fires is exact.
+operator-core = { path = "../../operator-core", features = ["testing"] }
+# `net` + `io-util` (WI-400, pg_client's bound tests): the scripted PostgreSQL
+# server those tests run is a `TcpListener` the real `PgClient` dials. Both
+# already reach this crate through tokio-postgres; they are named so the
+# tests do not depend on that.
+tokio         = { workspace = true, features = ["test-util", "net", "io-util"] }
+# WI-400: `src/route_apiserver.rs` answers a reconcile's requests from a route
+# table through a `tower::service_fn` — `kube::Client` is a thin wrapper over
+# a `tower::Service`, so the real client runs with no cluster.
+tower = { workspace = true }

@@ -69,6 +69,10 @@ pub mod acl_reconcile;
 pub mod cnpg;
 pub mod disk;
 pub mod dragonfly;
+#[cfg(test)]
+mod dragonfly_alloc_tests;
+#[cfg(test)]
+mod fake_apiserver;
 pub mod gc;
 pub mod grace;
 pub mod nats;
@@ -82,12 +86,22 @@ pub mod shared_database;
 pub mod shared_pg;
 pub mod shared_volume;
 
+#[cfg(test)]
+mod route_apiserver;
+
 use nats_client::{NatsAdmin, NatsClient};
 use operator_core::capacity::CapacityCache;
 use pg_client::{PgAdmin, PgClient};
 use redis_client::{RedisAdmin, RedisClient};
 
 pub(crate) const KIND: &str = "ResourceClaim";
+
+/// The `reportingController` of the `ReconcileTimedOut` Warning Event a
+/// deadline-cut pass of any controller in this crate leaves on its object
+/// (`operator_core::deadline_event`) — the same one the claim's and the
+/// SharedVolume's own Events carry, and distinct from the scheduler's, so a
+/// reader can tell which controller's pass was cut.
+pub(crate) const REPORTER_CONTROLLER: &str = "apprafter-resourceclaim-provisioner";
 
 /// SSA field manager for everything this controller owns
 /// (`status.ready` / `status.connectionSecretRef` / the `Ready`
@@ -199,6 +213,40 @@ pub struct Context {
     /// a fresh LIST, and `ListParams::default()` sends no resourceVersion, so
     /// that LIST is a quorum read which observes any committed prior write.
     pub acl_dirty: Arc<tokio::sync::Notify>,
+    /// One Dragonfly `$N` allocation at a time, across the claim controller
+    /// AND the SharedDatabase controller (WI-402).
+    ///
+    /// Allocation is LIST → pick the lowest free number → record it, and is
+    /// not atomic. `concurrency(1)` serializes it within ONE controller only;
+    /// since 2.29 the SharedDatabase controller allocates from the same pool
+    /// instances concurrently (`tokio::join!` in [`run`]), so both could LIST
+    /// before either recorded and take the same number. Both controllers share
+    /// this `Context`, so this lock is the one place both pass through. Each
+    /// holds it from its allocation LIST until its allocation checkpoint is
+    /// answered — from then on a fresh LIST sees the number — and never across
+    /// Redis I/O.
+    ///
+    /// It is NOT a guarantee on its own. Dropping a reconcile future (a
+    /// deadline, a lost leader) releases the guard at once while the dropped
+    /// checkpoint may still commit on the apiserver after the next allocator's
+    /// LIST. The safety net for that is the re-read of every holder that each
+    /// allocator runs AFTER its own checkpoint is committed and BEFORE it
+    /// flushes or pins anything (`reconcile::dbnum_holders_besides`): of two
+    /// allocators that raced, the later re-read always sees the other's
+    /// committed number. This lock only makes the race rare.
+    ///
+    /// Waiting for it counts against the waiting reconcile's own deadline.
+    pub dbnum_alloc: tokio::sync::Mutex<()>,
+    /// When each SharedVolume's last NON-deleting pass failed, keyed by
+    /// `(namespace, name)` (WI-400).
+    ///
+    /// Such a pass may have left its PVC apply in flight, and the SharedVolume
+    /// deletion path holds its finalizer until that apply can no longer land
+    /// — see `shared_volume::DELETE_SETTLE`. In memory on purpose: a fact
+    /// about requests this process sent, which no other process could have
+    /// sent.
+    pub(crate) sv_unsettled:
+        std::sync::Mutex<std::collections::HashMap<(String, String), tokio::time::Instant>>,
 }
 
 impl Context {
@@ -227,6 +275,8 @@ impl Context {
             capacity: Arc::new(CapacityCache::new()),
             backend_metrics: Arc::new(operator_core::promscrape::MetricsCache::new()),
             acl_dirty,
+            dbnum_alloc: tokio::sync::Mutex::new(()),
+            sv_unsettled: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 }
@@ -273,6 +323,13 @@ pub enum ReconcileError {
     /// content of this variant.
     #[error("nats storage budget: {0}")]
     NatsStorageBudget(String),
+    /// A pass ran past its controller's reconcile deadline and was abandoned
+    /// (WI-400). One variant for the whole crate, like the type itself: each
+    /// of the four controllers here wires its own deadline at its
+    /// `Controller::run` site, and `error_policy` tells a cut pass from a
+    /// failed one by this variant.
+    #[error(transparent)]
+    TimedOut(#[from] operator_core::deadline::ReconcileTimedOut),
 }
 
 /// Spawn the ResourceClaim provisioner Controller.
@@ -309,12 +366,24 @@ pub async fn run(
     // so both pick the same number → two tenants pinned to one logical DB
     // (isolation breach). One in-flight reconcile at a time makes each claim's
     // allocation visible (a fresh apiserver list) before the next claim
-    // allocates. Leader election already guarantees a single active
-    // controller, so this fully serializes allocation. Throughput is a
-    // non-issue at claim volumes.
+    // allocates.
+    //
+    // That serializes CLAIM allocations only. The SharedDatabase controller
+    // (controller 3, 2.29) allocates from the same pool instances in its own
+    // Runner, concurrently under the `join!` below — so the two share
+    // `Context::dbnum_alloc`, which is what actually orders allocations across
+    // both. And neither serializes against a reconcile that was DROPPED with
+    // its checkpoint still in flight: that write can commit after the next
+    // allocator's LIST. The re-read every allocator runs after committing its
+    // number and before flushing it (`reconcile::dbnum_holders_besides`) is
+    // the net under both (WI-402).
     let claim_drive = Controller::new(claims, watcher::Config::default())
         .with_config(ControllerConfig::default().concurrency(1))
-        .run(reconcile::reconcile, reconcile::error_policy, ctx.clone())
+        .run(
+            reconcile::reconcile_with_deadline,
+            reconcile::error_policy,
+            ctx.clone(),
+        )
         .for_each(|res| async move {
             match res {
                 Ok((obj_ref, _)) => info!(claim = %obj_ref.name, "provisioned"),
@@ -359,7 +428,7 @@ pub async fn run(
             shared_volume::shared_volume_refs_in_store(&claim, &sv_store).into_iter()
         })
         .run(
-            shared_volume::reconcile_shared_volume,
+            shared_volume::reconcile_shared_volume_with_deadline,
             shared_volume::error_policy_sv,
             ctx,
         )
@@ -391,7 +460,7 @@ pub async fn run(
             shared_database::shared_database_refs_in_store(&claim, &sd_store).into_iter()
         })
         .run(
-            shared_database::reconcile_shared_database,
+            shared_database::reconcile_shared_database_with_deadline,
             shared_database::error_policy_sd,
             sd_ctx,
         )

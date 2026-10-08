@@ -240,9 +240,13 @@ pub(crate) fn condition_polarity(type_: &str) -> Option<ConditionPolarity> {
         // `UnauthorizedSourceModification=True` means a foreign writer
         // WAS detected on `spec.source`. Reading it as positive is how
         // the roll-up came to call a clean cluster unhealthy.
-        "YankedVersion" | "NodeDiskPressure" | "UnauthorizedSourceModification" => {
-            Some(ConditionPolarity::Negative)
-        }
+        // `ReconcileStalled=True` (WI-400): the operator's last reconcile
+        // of the stack was abandoned at its deadline, so every other row is
+        // from the last one that finished. Absent on a healthy stack.
+        "YankedVersion"
+        | "NodeDiskPressure"
+        | "UnauthorizedSourceModification"
+        | "ReconcileStalled" => Some(ConditionPolarity::Negative),
         // On the version line.
         "UpgradeAvailable" => Some(ConditionPolarity::ReportedElsewhere),
         // Gets its own section, which names the plans rather than just
@@ -276,12 +280,41 @@ pub(crate) const BACKUP_CONDITIONS_SINCE: &str = "0.2.80";
 /// `None` when the version is newer, or does not parse (a branch, an unset
 /// field): that proves nothing, and the condition is read.
 fn backup_conditions_predate(json: &Value) -> Option<&str> {
+    platform_predates(json, BACKUP_CONDITIONS_SINCE)
+}
+
+/// The platform version the stack runs, when it is older than `since`.
+/// `None` when it is not, or when either version does not parse: that
+/// proves nothing, and the condition is read.
+fn platform_predates<'a>(json: &'a Value, since: &str) -> Option<&'a str> {
     let current = json
         .pointer("/status/currentVersion")
         .and_then(Value::as_str)?;
     let version = semver::Version::parse(current.trim_start_matches('v')).ok()?;
-    let since = semver::Version::parse(BACKUP_CONDITIONS_SINCE).ok()?;
+    let since = semver::Version::parse(since).ok()?;
     (version < since).then_some(current)
+}
+
+/// The first platform release whose operator writes `ReconcileStalled`
+/// (WI-400; the compatibility record is checked by a test).
+pub(crate) const RECONCILE_STALLED_SINCE: &str = "0.2.81";
+
+/// The `ReconcileStalled` row, marked when it is not current. After a
+/// rollback below [`RECONCILE_STALLED_SINCE`] while the stack was stalled,
+/// the older operator neither sets nor removes the condition and carries the
+/// `True` it found forward in every status write, so the row would report a
+/// stall that nothing re-evaluates.
+fn mark_reconcile_stalled_row_not_current(rows: &mut [ConditionRow], json: &Value) {
+    let Some(version) = platform_predates(json, RECONCILE_STALLED_SINCE) else {
+        return;
+    };
+    for row in rows.iter_mut().filter(|r| r.type_ == "ReconcileStalled") {
+        row.message = format!(
+            "NOT CURRENT: left by a newer release; the operator of platform {version} does not \
+             report stalled reconciles. It last said: {}",
+            row.message
+        );
+    }
 }
 
 /// Where a reader whose backup cannot run for lack of room is sent: the
@@ -944,8 +977,9 @@ fn condition_rows(status: &Value) -> Vec<ConditionRow> {
 /// the worst available answer.
 pub(crate) fn unhealthy_condition_rows(json: &Value) -> Vec<ConditionRow> {
     let status = json.get("status").cloned().unwrap_or(Value::Null);
-    condition_rows(&status)
-        .into_iter()
+    let mut rows = condition_rows(&status);
+    mark_reconcile_stalled_row_not_current(&mut rows, json);
+    rows.into_iter()
         .filter(|row| match condition_polarity(&row.type_) {
             Some(ConditionPolarity::Positive) => row.status != "True",
             Some(ConditionPolarity::Negative) => row.status == "True",
@@ -1076,6 +1110,7 @@ fn print_status(json: &Value, now: DateTime<Utc>) {
     // to run next, is `apprafter backup status` (WI-394).
     let mut conditions: Vec<ConditionRow> = condition_rows(&status);
     mark_backup_rows_not_current(&mut conditions, json);
+    mark_reconcile_stalled_row_not_current(&mut conditions, json);
 
     if conditions.is_empty() {
         println!("Conditions: (none)");
@@ -2778,12 +2813,9 @@ mod tests {
         assert!(!text.contains("not current"), "nothing was left: {text}");
     }
 
-    /// [`BACKUP_CONDITIONS_SINCE`] names a release the chart's history
-    /// records, and every release before it runs an older operator — which
-    /// is what makes "older than this" mean "cannot have written them".
-    #[test]
-    fn the_first_release_that_reports_backups_is_recorded_and_every_older_one_runs_an_older_operator(
-    ) {
+    /// `(platform version, operator version)` for every record in the
+    /// chart's `compatibility.cue`.
+    fn compatibility_records() -> Vec<(semver::Version, semver::Version)> {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../platform-stack/cue/compatibility.cue");
         let src =
@@ -2814,7 +2846,15 @@ mod tests {
             records.len(),
             path.display()
         );
-        let since = semver::Version::parse(BACKUP_CONDITIONS_SINCE).unwrap();
+        records
+    }
+
+    /// `since` names a release the chart's history records, and every
+    /// release before it runs an older operator — which is what makes "older
+    /// than this" mean "cannot have written it".
+    fn assert_every_older_release_runs_an_older_operator(since: &str, what: &str) {
+        let records = compatibility_records();
+        let since = semver::Version::parse(since).unwrap();
         let (_, first_op) = records
             .iter()
             .find(|(v, _)| *v == since)
@@ -2823,7 +2863,106 @@ mod tests {
             assert!(
                 op < first_op,
                 "platform {v} runs operator {op}, not older than the {first_op} that {since} \
-                 introduced the backup conditions with"
+                 introduced {what} with"
+            );
+        }
+    }
+
+    /// [`BACKUP_CONDITIONS_SINCE`] names a release the chart's history
+    /// records, and every release before it runs an older operator — which
+    /// is what makes "older than this" mean "cannot have written them".
+    #[test]
+    fn the_first_release_that_reports_backups_is_recorded_and_every_older_one_runs_an_older_operator(
+    ) {
+        assert_every_older_release_runs_an_older_operator(
+            BACKUP_CONDITIONS_SINCE,
+            "the backup conditions",
+        );
+    }
+
+    /// [`RECONCILE_STALLED_SINCE`], the same way: a release older than it
+    /// runs an operator that cannot have written `ReconcileStalled`.
+    #[test]
+    fn the_first_release_that_reports_stalls_is_recorded_and_every_older_one_runs_an_older_operator(
+    ) {
+        assert_every_older_release_runs_an_older_operator(
+            RECONCILE_STALLED_SINCE,
+            "ReconcileStalled",
+        );
+    }
+
+    fn stalled_stack(current: &str) -> Value {
+        json!({ "status": { "currentVersion": current, "conditions": [
+            { "type": "Ready", "status": "True",
+              "reason": "Healthy", "message": "parent platform Application reports Healthy" },
+            { "type": "ReconcileStalled", "status": "True", "reason": "ReconcileTimedOut",
+              "message": "the last reconcile did not finish within 120s and was abandoned; the \
+                          other conditions are from the last reconcile that finished" },
+        ]}})
+    }
+
+    /// WI-400: a stack whose last reconcile was abandoned is a problem
+    /// `apprafter status` names, and one where the condition is gone is not.
+    #[test]
+    fn a_stalled_reconcile_is_a_problem_until_its_condition_is_removed() {
+        assert_eq!(
+            condition_polarity("ReconcileStalled"),
+            Some(ConditionPolarity::Negative)
+        );
+        let rows = unhealthy_condition_rows(&stalled_stack("0.2.81"));
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].type_, "ReconcileStalled");
+        assert_eq!(rows[0].reason, "ReconcileTimedOut");
+        assert!(
+            rows[0].message.starts_with("the last reconcile"),
+            "{rows:?}"
+        );
+
+        let mut recovered = stalled_stack("0.2.81");
+        recovered["status"]["conditions"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|c| c["type"] != "ReconcileStalled");
+        assert!(unhealthy_condition_rows(&recovered).is_empty());
+
+        let mut not_stalled = stalled_stack("0.2.81");
+        not_stalled["status"]["conditions"][1]["status"] = json!("False");
+        assert!(unhealthy_condition_rows(&not_stalled).is_empty());
+    }
+
+    /// After a rollback below [`RECONCILE_STALLED_SINCE`] while stalled, the
+    /// older operator carries the `True` forward and never removes it: the
+    /// row says it is not current instead of reporting a live stall.
+    #[test]
+    fn a_stall_left_by_a_newer_release_is_marked_not_current() {
+        let rows = unhealthy_condition_rows(&stalled_stack("0.2.80"));
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let message = &rows[0].message;
+        assert!(message.starts_with("NOT CURRENT"), "{message}");
+        assert!(message.contains("platform 0.2.80"), "{message}");
+        assert!(
+            message.ends_with(
+                "It last said: the last reconcile did not finish within 120s and was abandoned; \
+                 the other conditions are from the last reconcile that finished"
+            ),
+            "{message}"
+        );
+        let mut table = condition_rows(&stalled_stack("0.2.80")["status"]);
+        mark_reconcile_stalled_row_not_current(&mut table, &stalled_stack("0.2.80"));
+        assert!(table[1].message.starts_with("NOT CURRENT"), "{table:?}");
+        assert!(!table[0].message.starts_with("NOT CURRENT"), "{table:?}");
+
+        for current in [
+            RECONCILE_STALLED_SINCE,
+            "0.2.82",
+            "0.3.0",
+            "v0.2.81",
+            "main",
+        ] {
+            let rows = unhealthy_condition_rows(&stalled_stack(current));
+            assert!(
+                !rows[0].message.starts_with("NOT CURRENT"),
+                "{current}: {rows:?}"
             );
         }
     }

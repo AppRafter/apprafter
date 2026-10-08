@@ -53,6 +53,13 @@ pub struct SharedVolumeCapacity {
     pub used_bytes: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capacity_bytes: Option<i64>,
+    /// What the figure measured (D29): `"volume"` (a backend with a real
+    /// quota) or `"host"` (a local-path PV reporting the node's filesystem).
+    /// Read back so a pass that carries the figure forward
+    /// (`shared_volume::carried_capacity`) carries the scope with it rather
+    /// than pruning it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq)]
@@ -98,6 +105,20 @@ mod tests {
         assert_eq!(status.pvc_ref.as_deref(), Some("sv-demo-shared"));
         assert_eq!(status.ref_count, Some(2));
         assert_eq!(status.conditions.as_ref().unwrap()[0].type_, "Ready");
+    }
+
+    #[test]
+    fn the_capacity_scope_the_controller_wrote_is_read_back() {
+        // The controller writes `capacity.scope`; a typed read that dropped it
+        // would make every carry-forward of the figure prune it.
+        let status: SharedVolumeStatus = serde_json::from_value(json!({
+            "capacity": { "usedBytes": 950, "capacityBytes": 1000, "scope": "host" }
+        }))
+        .unwrap();
+        let capacity = status.capacity.expect("capacity");
+        assert_eq!(capacity.scope.as_deref(), Some("host"));
+        assert_eq!(capacity.used_bytes, Some(950));
+        assert_eq!(capacity.capacity_bytes, Some(1000));
     }
 
     #[test]

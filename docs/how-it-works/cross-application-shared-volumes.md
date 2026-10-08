@@ -78,9 +78,17 @@ reason `CapacityWarning` against the SharedVolume; a reconcile that finds the
 volume already warning publishes nothing, and recovering publishes nothing at
 all — so `kubectl describe` shows the moment the volume filled rather than one
 line per reconcile. The comparison is against the condition the object
-currently carries, so a cycle that could not sample — which drops the
+currently carries, so a cycle whose sample came back empty — which drops the
 condition, as below — makes the next successful cycle look like a fresh
-crossing and publish again.
+crossing and publish again. A sample that never came back keeps the
+condition, and publishes nothing.
+
+The Event is published before the status write that records the crossing,
+and it is that write which silences the next one. A reconcile interrupted
+between the two therefore publishes again on its next pass instead of not at
+all: an interruption can duplicate the Event but cannot swallow it. The
+publish waits at most five seconds; a failure is logged and the status write
+goes ahead.
 
 Sampling runs on every reconcile: the 300-second requeue, plus any change to a
 reference-claim, which fans a reconcile back to the parent volume. A
@@ -128,11 +136,25 @@ and a summary carrying no entry for this PVC, are silent. All five produce the
 same outcome: no sample, and a reconcile that carries on, so a volume provisions
 and goes `Ready` whether or not it can be measured.
 
-A cycle with no sample writes no `status.capacity` and no `CapacityWarning` at
-all. It does not carry the previous values forward — the status apply replaces
-everything this controller owns, so omitting the sample removes it. The
-condition is therefore never older than the last successful sample, and the
-absence of a warning is never evidence of space.
+A cycle whose sample comes back empty writes no `status.capacity` and no
+`CapacityWarning` at all — the status apply replaces everything this controller
+owns, so omitting the sample removes it. The absence of a warning is therefore
+never evidence of space.
+
+A sample that does not come back at all is the one exception. The node list
+and the kubelet fetch get 10 seconds between them; past that the reconcile
+stops waiting, logs a warning, and writes back the `status.capacity` and `CapacityWarning` the
+volume already carried. The condition keeps its status, reason and transition
+time, and its message gains "not re-measured: the kubelet did not answer
+within 10s". Dropping them there would describe the kubelet, not the volume,
+and the same status write carries the `refCount` that `apprafter volume rm`
+checks, so it is not held back waiting either. A figure kept this way is as old
+as the last sample that answered.
+
+`apprafter volume status` prints the condition's message only while the
+warning is up. On a volume that was not warning, a carried figure prints
+exactly as a fresh one would, and only the condition on the object says it was
+not re-measured.
 
 That is also why an em-dash is the usual reading on a cluster whose kubelet
 publishes no per-volume metrics at all. `e2e/shared-volume-walk.sh` treats its
@@ -154,6 +176,36 @@ The same sampler stamps `status.capacity`, with the same `scope` field, on an
 owned disk's `ResourceClaim` — that is what `apprafter app status` shows in its
 dependency table. There is no `CapacityWarning` condition there; the threshold
 and the Event are SharedVolume behaviour.
+
+## When a reconcile stalls
+
+A SharedVolume reconcile that runs for more than 60 seconds is abandoned and
+retried within a minute. Every SharedVolume waits behind the one in progress,
+so a stalled call would otherwise freeze `refCount` — the figure the
+`volume rm` guard reads — for all of them. An abandoned reconcile writes
+nothing to the volume's status; it leaves a `Warning` Event with reason
+`ReconcileTimedOut` on the volume, which `kubectl describe` shows.
+`apprafter volume status` prints the newest such Event with its age:
+
+    Reconcile:   last timed out 3 minutes ago (did not finish within 60s); the operator retries on its own
+
+The line goes once a later reconcile changes the volume's status, in a later
+second than the Event, or once the Event expires (an hour by default),
+whichever comes first. A stall that persists writes no status and is
+abandoned again about every two minutes, so its line stays and its age stays
+short. A reconcile that finishes without changing the status leaves no
+record that it finished, so after such a recovery the line stays until the
+Event expires, and its age keeps growing.
+
+Abandoning a reconcile does not recall a request it already sent: the
+apiserver may still apply its write to the backing PVC up to a minute later.
+So a volume deleted within 65 seconds of a failed reconcile deletes its PVC,
+keeps its finalizer until 65 seconds after that reconcile failed, then deletes
+the PVC again before letting go. Without the second delete, that late write
+would recreate the PVC after the volume was gone, with nothing left to remove
+it. A delete with no recent failure lets go at once. The operator keeps the
+record of a failed reconcile in memory only, so if the operator restarts
+between the failure and the delete, the delete also lets go at once.
 
 ## See also
 

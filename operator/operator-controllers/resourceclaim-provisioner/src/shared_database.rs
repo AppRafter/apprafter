@@ -48,12 +48,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use kube::api::{Api, ApiResource, DynamicObject, Patch, PatchParams};
 use kube::core::GroupVersionKind;
 use kube::runtime::controller::Action;
 use kube::runtime::reflector::{ObjectRef, Store};
-use kube::{Client, ResourceExt};
+use kube::{Client, Resource as _, ResourceExt};
 use serde_json::{json, Value};
 use tracing::{info, warn};
 
@@ -64,6 +64,7 @@ use operator_core::{
 };
 
 use crate::cnpg::{self, k8s_name, pg_identifier};
+use crate::pg_client::{PgAdminError, ServerBound};
 use crate::shared_pg::{self, shared_group};
 use crate::{Context, ReconcileError, FIELD_MANAGER};
 
@@ -74,7 +75,7 @@ const KIND: &str = "SharedDatabase";
 /// cascade. Without it a `SharedDatabase` vanishes and the backing database
 /// survives with nothing left pointing at it — an orphan holding real data
 /// that no longer appears in any inventory.
-const SD_FINALIZER: &str = "apprafter.io/shareddatabase-cleanup";
+pub(crate) const SD_FINALIZER: &str = "apprafter.io/shareddatabase-cleanup";
 
 /// `Ready=False` reason while the shared Postgres cluster is not yet
 /// answering. Distinct from a provisioning failure: it clears by itself.
@@ -83,6 +84,21 @@ const REASON_AWAITING_CLUSTER: &str = "AwaitingCluster";
 /// `Ready=False` reason while CNPG has not yet reported the `Database` CR
 /// reconciled.
 const REASON_AWAITING_DATABASE: &str = "AwaitingDatabase";
+
+/// `Ready` reason when the server cancelled one of this pass's statements on
+/// the session's `lock_timeout` ([`ServerBound::Lock`]): another transaction
+/// holds a lock the statement needs. `Awaiting…` because it clears by itself
+/// when that transaction ends — the Argo CD health script reads an
+/// `Awaiting` prefix on `Ready=False` as Progressing, anything else as
+/// Degraded. See [`server_cancelled_condition`] for why it can also sit
+/// beside `True`.
+const REASON_AWAITING_LOCK: &str = "AwaitingLock";
+
+/// `Ready` reason when the server cancelled one of this pass's statements on
+/// the session's `statement_timeout` ([`ServerBound::Statement`]): the
+/// statement ran past the bound on its own, which may repeat on every pass —
+/// so, deliberately, not an `Awaiting…` reason.
+const REASON_STATEMENT_TIMED_OUT: &str = "StatementTimedOut";
 
 /// `Ready=False` reason on a delete held open by live consumers.
 const REASON_IN_USE: &str = "InUse";
@@ -385,6 +401,72 @@ fn apply_params() -> PatchParams {
 // Async reconcile
 // ---------------------------------------------------------------------------
 
+/// How long one SharedDatabase pass may run before it is abandoned (WI-400,
+/// GOTCHA-51).
+///
+/// This controller runs at `concurrency(1)`, so while one pass is in flight
+/// kube-runtime holds every SharedDatabase's triggers: the first binds of
+/// every consumer of a not-yet-ready database wait, and deletes sit in
+/// Terminating with no stated reason. A healthy pass is about 15 apiserver
+/// round trips and a few milliseconds of SQL.
+///
+/// 120s is safe ONLY because the Postgres client carries bounds of its own:
+/// `pg_client::CONNECT_TIMEOUT` (10s), a server-side `lock_timeout` (10s) and
+/// `statement_timeout` (30s) on every admin session, and
+/// `pg_client::CALL_TIMEOUT` (45s) per call. Dropping a statement's future
+/// does not stop the statement: the backend keeps waiting on its lock after
+/// the socket closes (measured: a `GRANT SELECT ON ALL TABLES` behind a
+/// consumer's open `ALTER TABLE`), so a deadline alone would leak one backend
+/// per retry on the shared cluster. With those bounds, a lock wait ends
+/// server-side within 10s and lands in a designed arm (`AwaitingLock`,
+/// `StatementTimedOut`, `AwaitingCluster`).
+///
+/// What this deadline does NOT dominate: a pg pass makes its Postgres calls
+/// in sequence (the groups batch, the reader grants, then one probe per
+/// declared extension), each capped at `CALL_TIMEOUT`. A server that is slow
+/// but answering on every one therefore costs up to 45s × (2 + declared
+/// extensions), plus the apiserver round trips: past 120s as soon as one
+/// extension is declared. A cut there is safe. Every statement is
+/// existence-guarded and idempotent, so the next pass simply runs them again;
+/// nothing is written to status; and a cut delete keeps its finalizer,
+/// because releasing it is the delete's last step.
+pub const RECONCILE_DEADLINE: Duration = Duration::from_secs(120);
+
+/// [`reconcile_shared_database`] under [`RECONCILE_DEADLINE`] — what
+/// [`crate::run`] hands kube-runtime, never the unbounded reconcile.
+///
+/// A timed-out pass writes nothing to the SharedDatabase's status: a body
+/// under [`FIELD_MANAGER`] missing `database`/`instance`/`dbnum` would prune
+/// the backing, and `Ready=False` would refuse every new consumer of a
+/// database that is serving. A cut delete keeps its finalizer — the release
+/// is the pass's last step. The pass reaches [`error_policy_sd`], which warns,
+/// counts `apprafter_reconcile_timeouts_total{kind="SharedDatabase"}` and
+/// backs off, and it leaves a `ReconcileTimedOut` Warning Event on the object.
+/// A cut also drops the `Context::dbnum_alloc` guard a redis allocation held;
+/// the re-read of every `$N` holder before each `FLUSHDB` (WI-402) covers a
+/// status write that commits after the cut.
+pub async fn reconcile_shared_database_with_deadline(
+    sd: Arc<SharedDatabase>,
+    ctx: Arc<Context>,
+) -> Result<Action, ReconcileError> {
+    let outcome = operator_core::deadline::within(
+        RECONCILE_DEADLINE,
+        reconcile_shared_database(sd.clone(), ctx.clone()),
+    )
+    .await;
+    if let Err(ReconcileError::TimedOut(timed_out)) = &outcome {
+        operator_core::deadline_event::publish(
+            &ctx.client,
+            crate::REPORTER_CONTROLLER,
+            sd.object_ref(&()),
+            KIND,
+            *timed_out,
+        )
+        .await;
+    }
+    outcome
+}
+
 /// Reconcile one `SharedDatabase`.
 ///
 /// 1. Under deletion → refuse while `refCount > 0`, else drop the backing and
@@ -650,6 +732,23 @@ async fn reconcile_pg(
     );
     let groups = shared_pg::create_groups(ns, name, cnpg::PLATFORM_ROLE);
     if let Err(e) = ctx.pg.execute_all(&admin_dsn, &groups).await {
+        // A server that cancelled a statement ANSWERED, and one that timed
+        // out may still be serving its consumers: "not answering yet" below
+        // would be false of the first, and its `ready=false` and dropped
+        // `ExtensionUnavailable` wrong for both on a database that is serving.
+        if let Some(action) = report_unfinished_call(
+            ctx,
+            sd,
+            prior,
+            &database,
+            &cluster,
+            "creating the groups",
+            &e,
+        )
+        .await?
+        {
+            return Ok(action);
+        }
         // Not a hard error: a cluster still starting is the common case on a
         // fresh install, and the reason says so rather than surfacing a dial
         // failure as a provisioning fault.
@@ -712,6 +811,25 @@ async fn reconcile_pg(
         .execute_all(&db_dsn, &shared_pg::grant_reader(ns, name, &database))
         .await
     {
+        // Two failures here are NOT "CNPG has not created it yet", and saying
+        // so would be false: a statement the server cancelled on one of the
+        // session's bounds — the routine one is `GRANT SELECT ON ALL TABLES`
+        // queued behind a consumer's migration — and a call that got no
+        // answer at all. On a database that is already serving, neither may
+        // take `Ready` away from it or prune its status.
+        if let Some(action) = report_unfinished_call(
+            ctx,
+            sd,
+            prior,
+            &database,
+            &cluster,
+            "granting the reader group",
+            &e,
+        )
+        .await?
+        {
+            return Ok(action);
+        }
         warn!(%name, %ns, error = %e, "shared database not ready for reader grants yet");
         let cond = ready_condition(
             "False",
@@ -843,9 +961,18 @@ async fn reconcile_redis(
             _ => None,
         });
 
+    // WI-402: an allocation a previous pass checkpointed and did not finish
+    // still owes its check and its flush.
+    let unfinished = existing.is_some() && allocation_unfinished(prior);
+    let ref_count = current_ref_count(&ctx.client, ns, name).await?;
+
     let dbnum = match existing {
         Some(n) => n,
         None => {
+            // WI-402: under the pool-wide lock the claim controller also takes
+            // (see `Context::dbnum_alloc`), from this LIST until the
+            // checkpoint below is answered — the end of this arm.
+            let _alloc_guard = ctx.dbnum_alloc.lock().await;
             let live: Vec<ResourceClaim> = Api::<ResourceClaim>::all(ctx.client.clone())
                 .list(&Default::default())
                 .await?
@@ -874,41 +1001,106 @@ async fn reconcile_redis(
                     ),
                     prior,
                 );
-                write_status(
-                    ctx,
-                    sd,
-                    ns,
-                    name,
-                    false,
-                    None,
-                    current_ref_count(&ctx.client, ns, name).await?,
-                    cond,
-                    None,
-                )
-                .await?;
+                write_status(ctx, sd, ns, name, false, None, ref_count, cond, None).await?;
                 return Ok(Action::requeue(Duration::from_secs(120)));
             };
-            // Recycle-safety (ADR 0042 §3): a reused `$N` must start empty, or
-            // the first consumer of this shared cache reads a departed
-            // tenant's keys. Only on a FRESH allocation — flushing an existing
-            // one would wipe the data this database exists to hold.
-            let addr = crate::dragonfly::instance_addr(&pool.instance, &pool.df_ns);
-            let admin_pw = crate::acl_reconcile::read_secret_key(
+            // WI-402: record the number BEFORE checking and flushing it — the
+            // order the claim path keeps. Another allocator's LIST or re-read
+            // can only see a number that is committed, so a database that
+            // flushed first and wrote its number last could be overtaken by a
+            // claim that saw neither, and both would end up ready on one
+            // keyspace. Not ready, and under a reason that marks the number
+            // as still owing its check and flush.
+            let cond = ready_condition(
+                "False",
+                crate::reconcile::REASON_AWAITING_KEYSPACE,
+                &format!(
+                    "allocated ${n} on {} ({}); checking that nothing else holds it, then \
+                     flushing it, before first use",
+                    pool.instance, pool.df_ns
+                ),
+                prior,
+            );
+            write_status(
                 ctx,
-                &pool.df_ns,
-                &crate::dragonfly::admin_secret_name(&pool.instance),
-                "password",
+                sd,
+                ns,
+                name,
+                false,
+                Some(&Backing::redis(&pool.instance, i64::from(n))),
+                ref_count,
+                cond,
+                None,
             )
             .await?;
-            ctx.redis
-                .flushdb(&addr, &admin_pw, n)
-                .await
-                .map_err(|e| ReconcileError::Provisioning(format!("flushdb ${n}: {e}")))?;
             n
         }
     };
 
-    let ref_count = current_ref_count(&ctx.client, ns, name).await?;
+    if existing.is_none() || unfinished {
+        // WI-402: re-read every holder now that this number is committed. The
+        // LIST above is a snapshot; a claim reconcile dropped mid-checkpoint
+        // can commit onto the same number after it, and flushing then wipes
+        // that claim's keyspace.
+        let others = crate::reconcile::dbnum_holders_besides(
+            &ctx.client,
+            &pool.instance,
+            dbnum,
+            crate::dragonfly::DbnumOwner::Shared {
+                namespace: ns,
+                name,
+            },
+        )
+        .await?;
+        if !others.is_empty() {
+            // Never provisioned and no consumer bound, so the number holds
+            // nothing of this database's own: let it go. `Backing::default()`
+            // is deliberate — an apply without `instance`/`dbnum` prunes this
+            // database's checkpoint, and the next pass allocates afresh.
+            let message = format!(
+                "dragonfly {} ${dbnum} is also held by {}; this database had not used it \
+                 yet, so it released it and takes another number on its next attempt",
+                pool.instance,
+                others.join(", ")
+            );
+            let cond = ready_condition(
+                "False",
+                crate::reconcile::REASON_AWAITING_KEYSPACE,
+                &message,
+                prior,
+            );
+            write_status(
+                ctx,
+                sd,
+                ns,
+                name,
+                false,
+                Some(&Backing::default()),
+                ref_count,
+                cond,
+                None,
+            )
+            .await?;
+            return Err(ReconcileError::Provisioning(message));
+        }
+        // Recycle-safety (ADR 0042 §3): a reused `$N` must start empty, or
+        // the first consumer of this shared cache reads a departed tenant's
+        // keys. Only while the allocation is unfinished — flushing a
+        // provisioned one would wipe the data this database exists to hold.
+        let addr = crate::dragonfly::instance_addr(&pool.instance, &pool.df_ns);
+        let admin_pw = crate::acl_reconcile::read_secret_key(
+            ctx,
+            &pool.df_ns,
+            &crate::dragonfly::admin_secret_name(&pool.instance),
+            "password",
+        )
+        .await?;
+        ctx.redis
+            .flushdb(&addr, &admin_pw, dbnum)
+            .await
+            .map_err(|e| ReconcileError::Provisioning(format!("flushdb ${dbnum}: {e}")))?;
+    }
+
     let cond = ready_condition(
         "True",
         "Provisioned",
@@ -1037,7 +1229,18 @@ async fn drop_backing(
                         // per-database and cannot reach them from `postgres`.
                         // Returning `false` holds the finalizer so the next
                         // pass tries again.
-                        info!(%name, %ns, error = %e, "groups not droppable yet — the database is still there");
+                        //
+                        // With the session bounds (WI-400) a lock held past
+                        // `lock_timeout`, or a `DROP OWNED` that runs past
+                        // `statement_timeout`, is cancelled by the server
+                        // rather than waited out. That is "not yet" too, for
+                        // another reason, and `kind` says which: `statement`
+                        // for the refusal above, `lock_timeout` /
+                        // `statement_timeout` for a bound.
+                        info!(
+                            %name, %ns, error = %e, kind = e.kind(),
+                            "the shared database's groups are not dropped yet — holding the finalizer to try again"
+                        );
                         return Ok(false);
                     }
                     info!(%name, %ns, "dropped the shared database's groups");
@@ -1074,7 +1277,29 @@ async fn drop_backing(
             .await
             {
                 Ok(admin_pw) => {
-                    if let Err(e) = ctx.redis.flushdb(&addr, &admin_pw, dbnum).await {
+                    // WI-402: flush only a keyspace this database still holds
+                    // alone. Another holder means an allocation race already
+                    // put a second tenant here; flushing would wipe THEIR
+                    // data, while leaving it changes nothing they could not
+                    // already read. So skip the flush, say so, and let the
+                    // delete finish — holding the finalizer would wedge the
+                    // object on a conflict no retry resolves.
+                    let others = crate::reconcile::dbnum_holders_besides(
+                        &ctx.client,
+                        &instance,
+                        dbnum,
+                        crate::dragonfly::DbnumOwner::Shared {
+                            namespace: ns,
+                            name,
+                        },
+                    )
+                    .await?;
+                    if !others.is_empty() {
+                        warn!(
+                            %name, %ns, %instance, dbnum, holders = %others.join(", "),
+                            "the shared keyspace is also held elsewhere — NOT flushing it"
+                        );
+                    } else if let Err(e) = ctx.redis.flushdb(&addr, &admin_pw, dbnum).await {
                         warn!(%name, %ns, error = %e, "could not flush the shared keyspace");
                     } else {
                         info!(%name, %ns, %instance, dbnum, "flushed the shared keyspace");
@@ -1088,6 +1313,172 @@ async fn drop_backing(
         _ => {}
     }
     Ok(true)
+}
+
+/// Whether this object records `database` as provisioned.
+///
+/// `status.database` is written by exactly one path — the pg arm's
+/// `Provisioned` write — and every other write carries it forward
+/// ([`backing_of`]), so a recorded name means CNPG created the database and
+/// a pass completed against it. Deliberately NOT `status.ready`: a single
+/// transient failure (a refused dial) writes `ready=false`, and a rule keyed
+/// on it would keep a database that is serving at `Ready=False` for as long
+/// as the passes after it kept meeting a lock.
+fn is_provisioned(sd: &SharedDatabase, database: &str) -> bool {
+    sd.status.as_ref().and_then(|s| s.database.as_deref()) == Some(database)
+}
+
+/// What a `SharedDatabase` reports when the server cancelled `step` on one of
+/// the session's bounds ([`PgAdminError::ServerCancelled`]). Returns
+/// `(ready, Ready condition)`.
+///
+/// The server ANSWERED, so the two reasons the surrounding arms use are both
+/// false here: the cluster is not "not answering" ([`REASON_AWAITING_CLUSTER`])
+/// and CNPG is not "creating" a database that is already there
+/// ([`REASON_AWAITING_DATABASE`]). The reason names the bound instead:
+/// [`REASON_AWAITING_LOCK`] or [`REASON_STATEMENT_TIMED_OUT`].
+///
+/// A provisioned database ([`is_provisioned`]) reads `Ready=True`, whatever
+/// the pass before said: the server just answered, inside that database or
+/// beside it. Consumer binds gate on `status.ready` (`bind_pg_consumer`), and
+/// the usual cause is a tenant's own migration holding a lock the reader
+/// grants need — so a `Ready=False` would refuse every new consumer claim for
+/// as long as that migration runs, over a database that is up and serving
+/// the consumers it already has. What this pass could not re-assert was in
+/// place as of the last pass that completed it, and every statement is
+/// idempotent; the same judgement `ExtensionUnavailable` makes beside a
+/// `Ready=True`. The reason and message still change, so the condition says
+/// what happened rather than "Provisioned".
+///
+/// A database never provisioned stays `Ready=False`, with the accurate reason.
+pub fn server_cancelled_condition(
+    sd: &SharedDatabase,
+    database: &str,
+    step: &str,
+    bound: ServerBound,
+    err: &PgAdminError,
+    prior: &[SharedDatabaseCondition],
+) -> (bool, SharedDatabaseCondition) {
+    let (reason, what) = match bound {
+        ServerBound::Lock => (
+            REASON_AWAITING_LOCK,
+            "waited on a lock past the session's lock_timeout — another transaction, usually a \
+             consumer's migration, holds a lock it needs",
+        ),
+        ServerBound::Statement => (
+            REASON_STATEMENT_TIMED_OUT,
+            "ran past the session's statement_timeout",
+        ),
+    };
+    if is_provisioned(sd, database) {
+        let message = format!(
+            "{database} is provisioned and serving; {step} {what} ({err}). Retried every 30s; \
+             existing bindings are unaffected."
+        );
+        (true, ready_condition("True", reason, &message, prior))
+    } else {
+        let message = format!("{step} {what} ({err}). Retried every 30s.");
+        (false, ready_condition("False", reason, &message, prior))
+    }
+}
+
+/// What a `SharedDatabase` reports when a call made while `step` got no
+/// answer at all within `pg_client::CALL_TIMEOUT`
+/// ([`PgAdminError::TimedOut`]). Returns `(ready, Ready condition)`.
+///
+/// The reason is [`REASON_AWAITING_CLUSTER`]: what is missing is an answer
+/// from the cluster, not a database CNPG has yet to create
+/// ([`REASON_AWAITING_DATABASE`] would be false in the grants arm).
+///
+/// Unlike a refused dial — the designed `AwaitingCluster` path, which writes
+/// `Ready=False` — a timeout NEVER MOVES `Ready`. A provisioned database
+/// ([`is_provisioned`], the rule [`server_cancelled_condition`] uses) that is
+/// `Ready` stays `Ready=True`: consumer binds gate on it, so a `False` would
+/// refuse every new consumer claim over one silence that says nothing about
+/// whether the database is serving the consumers it already has. Anything
+/// that is not `Ready` stays `False`, because the silence is no evidence that
+/// it serves either — which is also why this rule, unlike the cancelled one,
+/// looks at the `ready` the object already has.
+pub fn call_timed_out_condition(
+    sd: &SharedDatabase,
+    database: &str,
+    cluster: &str,
+    step: &str,
+    err: &PgAdminError,
+    prior: &[SharedDatabaseCondition],
+) -> (bool, SharedDatabaseCondition) {
+    let was_ready = sd.status.as_ref().and_then(|s| s.ready) == Some(true);
+    if was_ready && is_provisioned(sd, database) {
+        let message = format!(
+            "{database} is provisioned; the shared PostgreSQL cluster {cluster} did not answer \
+             while {step} ({err}). Retried every 20s; existing bindings are unaffected."
+        );
+        (
+            true,
+            ready_condition("True", REASON_AWAITING_CLUSTER, &message, prior),
+        )
+    } else {
+        let message = format!(
+            "the shared PostgreSQL cluster {cluster} did not answer while {step} ({err}). \
+             Retried every 20s."
+        );
+        (
+            false,
+            ready_condition("False", REASON_AWAITING_CLUSTER, &message, prior),
+        )
+    }
+}
+
+/// Report a pg call that the server CANCELLED on one of the session's bounds,
+/// or that got NO ANSWER within the call bound, and return the action. `None`
+/// for any other failure, which the calling arm's own designed reason covers.
+///
+/// Both are kept off the designed arms because each would say something false
+/// there — `AwaitingCluster`'s "not answering yet" of a server that answered,
+/// `AwaitingDatabase`'s "waiting for CNPG to create" of a database that
+/// exists — and because those arms write `ready=false` and drop
+/// `ExtensionUnavailable`, which a bound firing must never do to a database
+/// that is serving. This write carries the backing (`None`, see
+/// [`write_status`]) and the `ExtensionUnavailable` finding forward: the pass
+/// learned nothing that contradicts either, and an omitted condition is a
+/// PRUNED one under SSA — which the extension probe's own carry-forward could
+/// not restore later, since it carries only what the object still has.
+async fn report_unfinished_call(
+    ctx: &Arc<Context>,
+    sd: &SharedDatabase,
+    prior: &[SharedDatabaseCondition],
+    database: &str,
+    cluster: &str,
+    step: &str,
+    err: &PgAdminError,
+) -> Result<Option<Action>, ReconcileError> {
+    let (ready, cond, retry) = match err {
+        PgAdminError::ServerCancelled { bound, .. } => {
+            let (ready, cond) = server_cancelled_condition(sd, database, step, *bound, err, prior);
+            (ready, cond, Duration::from_secs(30))
+        }
+        PgAdminError::TimedOut { .. } => {
+            let (ready, cond) = call_timed_out_condition(sd, database, cluster, step, err, prior);
+            (ready, cond, Duration::from_secs(20))
+        }
+        _ => return Ok(None),
+    };
+    let ns = sd.namespace().unwrap_or_default();
+    let name = sd.name_any();
+    warn!(%name, %ns, %step, error = %err, "a shared-database statement did not complete");
+    write_status(
+        ctx,
+        sd,
+        &ns,
+        &name,
+        ready,
+        None,
+        current_ref_count(&ctx.client, &ns, &name).await?,
+        cond,
+        extension_condition_of(prior),
+    )
+    .await?;
+    Ok(Some(Action::requeue(retry)))
 }
 
 /// Which backing a status write carries: the caller's override, or — when
@@ -1113,11 +1504,37 @@ fn backing_of(sd: &SharedDatabase) -> Backing {
     let Some(st) = sd.status.as_ref() else {
         return Backing::default();
     };
+    // WI-402: except an UNFINISHED redis allocation. Carried forward under
+    // another reason it would read as provisioned, and the next pass would
+    // skip the check and the flush that number still owes. It holds nothing
+    // — no consumer binds a database that is not ready — so releasing it
+    // costs a fresh allocation and nothing else.
+    if allocation_unfinished(st.conditions.as_deref().unwrap_or_default()) {
+        return Backing {
+            database: st.database.clone(),
+            ..Default::default()
+        };
+    }
     Backing {
         database: st.database.clone(),
         instance: st.instance.clone(),
         dbnum: st.dbnum,
     }
+}
+
+/// Whether the `$N` this database records comes from an allocation that has
+/// not finished — checkpointed under `reconcile::REASON_AWAITING_KEYSPACE`,
+/// not yet checked or flushed (WI-402). A database that released a number it
+/// found someone else holding carries the same reason but records no number,
+/// so for it the answer changes nothing. Keyed on that reason and nothing
+/// broader: `ready=false` alone also describes a provisioned database that
+/// lost its provider for a while, whose data must never be flushed.
+fn allocation_unfinished(prior: &[SharedDatabaseCondition]) -> bool {
+    prior.iter().any(|c| {
+        c.type_ == COND_READY
+            && c.status == "False"
+            && c.reason.as_deref() == Some(crate::reconcile::REASON_AWAITING_KEYSPACE)
+    })
 }
 
 /// The `ExtensionUnavailable` condition already on the object, carried
@@ -1150,6 +1567,11 @@ fn previously_missing(prior: &[SharedDatabaseCondition]) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Error policy for the SharedDatabase controller: warn, count, and requeue
+/// after 30 seconds — or, for a pass abandoned at [`RECONCILE_DEADLINE`],
+/// count the timeout and back off by one deadline, so a database that stalls
+/// on every pass cannot hold the controller's only slot most of the time. A
+/// watch event still runs it at once.
 pub fn error_policy_sd(sd: Arc<SharedDatabase>, err: &ReconcileError, ctx: Arc<Context>) -> Action {
     let name = sd.name_any();
     let namespace = sd.namespace().unwrap_or_default();
@@ -1162,6 +1584,13 @@ pub fn error_policy_sd(sd: Arc<SharedDatabase>, err: &ReconcileError, ctx: Arc<C
         .reconcile_errors
         .with_label_values(&[KIND])
         .inc();
+    if let ReconcileError::TimedOut(timed_out) = err {
+        ctx.metrics
+            .reconcile_timeouts
+            .with_label_values(&[KIND])
+            .inc();
+        return Action::requeue(timed_out.after);
+    }
     Action::requeue(Duration::from_secs(30))
 }
 
@@ -1512,6 +1941,50 @@ pub async fn bind_redis_consumer(
     Ok(Action::requeue(Duration::from_secs(300)))
 }
 
+/// How long a consumer claim's delete keeps retrying a revoke that the server
+/// cancelled on a LOCK, before [`revoke_consumer`] falls back to its
+/// best-effort release (WI-400).
+///
+/// The admin sessions carry `lock_timeout` (`pg_client::SESSION_OPTIONS`), so
+/// a revoke that meets a lock is cancelled after 10s instead of waiting it
+/// out. Releasing the finalizer then — the best-effort rule for every other
+/// failure — would leave the consumer's LOGIN role on the server for good,
+/// while a lock wait is the one failure that says the server is up and the
+/// revoke will most likely go through on a later try. So the claim keeps its
+/// finalizer and the revoke runs again every [`REVOKE_LOCK_RETRY`]. Bounded,
+/// because a lock that is never released (a forgotten prepared transaction,
+/// say) must not hold a delete forever: past this the revoke gives up exactly
+/// as it always did, with a WARN naming the role.
+pub const REVOKE_LOCK_PATIENCE: Duration = Duration::from_secs(300);
+
+/// How soon a revoke the server cancelled on a lock is tried again.
+pub const REVOKE_LOCK_RETRY: Duration = Duration::from_secs(15);
+
+/// What [`revoke_consumer`] tells the claim's delete to do with its finalizer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Revocation {
+    /// The credential is gone, or the revoke was given up on (logged at
+    /// WARN with what to drop by hand): release the finalizer.
+    Settled,
+    /// The server cancelled the revoke on a lock, within
+    /// [`REVOKE_LOCK_PATIENCE`] of the delete: keep the finalizer and come
+    /// back in [`REVOKE_LOCK_RETRY`].
+    RetryAfterLock,
+}
+
+/// Whether a revoke that met a lock may still hold `claim`'s delete: only
+/// within [`REVOKE_LOCK_PATIENCE`] of its `deletionTimestamp`. A timestamp
+/// ahead of `now` (clock skew) counts as within.
+pub fn revoke_may_wait(claim: &ResourceClaim, now: DateTime<Utc>) -> bool {
+    let Some(deleting_since) = claim.metadata.deletion_timestamp.as_ref() else {
+        return false;
+    };
+    let waited = now - operator_core::k8s_time::from_time(deleting_since);
+    waited
+        .to_std()
+        .map_or(true, |waited| waited < REVOKE_LOCK_PATIENCE)
+}
+
 /// Revoke ONE consumer's credential when its claim is deleted (ADR 0066 §6).
 ///
 /// Drops that consumer's role or ACL user and nothing else. The shared
@@ -1530,19 +2003,28 @@ pub async fn bind_redis_consumer(
 ///
 /// It is not silent, though: a failure is logged at WARN with the role named,
 /// which is what an operator needs in order to drop it by hand.
-pub async fn revoke_consumer(ctx: &Arc<Context>, claim: &Arc<ResourceClaim>, ns: &str, name: &str) {
+///
+/// One failure is not given up on: a Postgres revoke the server cancelled on
+/// a lock returns [`Revocation::RetryAfterLock`] for up to
+/// [`REVOKE_LOCK_PATIENCE`], and the claim keeps its finalizer meanwhile.
+pub async fn revoke_consumer(
+    ctx: &Arc<Context>,
+    claim: &Arc<ResourceClaim>,
+    ns: &str,
+    name: &str,
+) -> Revocation {
     let Some(shared_name) = claim.spec.shared_ref.as_deref() else {
-        return;
+        return Revocation::Settled;
     };
     let sd_api: Api<SharedDatabase> = Api::namespaced(ctx.client.clone(), ns);
     let sd = match sd_api.get_opt(shared_name).await {
         Ok(Some(sd)) => sd,
         // The database is gone too — its own delete drops the groups, and a
         // consumer role inside a dropped database goes with `DROP OWNED`.
-        Ok(None) => return,
+        Ok(None) => return Revocation::Settled,
         Err(e) => {
             warn!(%name, %ns, error = %e, "could not read the shared database to revoke a consumer");
-            return;
+            return Revocation::Settled;
         }
     };
 
@@ -1553,7 +2035,7 @@ pub async fn revoke_consumer(ctx: &Arc<Context>, claim: &Arc<ResourceClaim>, ns:
         Ok(l) => l.items,
         Err(e) => {
             warn!(%name, %ns, error = %e, "could not list providers to revoke a consumer");
-            return;
+            return Revocation::Settled;
         }
     };
     let candidates: Vec<Candidate> = providers.iter().map(Candidate::from_provider).collect();
@@ -1566,7 +2048,7 @@ pub async fn revoke_consumer(ctx: &Arc<Context>, claim: &Arc<ResourceClaim>, ns:
     match sd.spec.type_.as_str() {
         "pg" => {
             let Some(database) = sd.status.as_ref().and_then(|s| s.database.clone()) else {
-                return;
+                return Revocation::Settled;
             };
             let cluster = cfg
                 .pointer("/cluster")
@@ -1584,25 +2066,41 @@ pub async fn revoke_consumer(ctx: &Arc<Context>, claim: &Arc<ResourceClaim>, ns:
                 crate::acl_reconcile::read_secret_key(ctx, &cnpg_ns, &pw_secret, "password").await
             else {
                 warn!(%name, %ns, %role, "platform role secret unreadable; consumer role NOT dropped");
-                return;
+                return Revocation::Settled;
             };
             // Connected to the SHARED database, not to `postgres`: `DROP
             // OWNED BY` is per-database, and running it elsewhere would drop
             // the role while leaving whatever it owns here behind.
             let dsn = cnpg::dsn(cnpg::PLATFORM_ROLE, &pw, &database, &cluster, &cnpg_ns);
-            if let Err(e) = ctx
+            match ctx
                 .pg
                 .execute_all(&dsn, &shared_pg::unbind_consumer(&role))
                 .await
             {
-                warn!(%name, %ns, %role, error = %e, "consumer role NOT dropped — drop it by hand");
-            } else {
-                info!(%name, %ns, %role, "revoked the consumer's role");
+                Ok(()) => info!(%name, %ns, %role, "revoked the consumer's role"),
+                // The server is up and the role is merely locked: holding the
+                // finalizer for another try beats leaving a LOGIN behind.
+                Err(
+                    e @ PgAdminError::ServerCancelled {
+                        bound: ServerBound::Lock,
+                        ..
+                    },
+                ) if revoke_may_wait(claim, Utc::now()) => {
+                    warn!(
+                        %name, %ns, %role, error = %e,
+                        retry_secs = REVOKE_LOCK_RETRY.as_secs(),
+                        "consumer role is locked — holding the claim's finalizer to try again"
+                    );
+                    return Revocation::RetryAfterLock;
+                }
+                Err(e) => {
+                    warn!(%name, %ns, %role, error = %e, kind = e.kind(), "consumer role NOT dropped — drop it by hand");
+                }
             }
         }
         "redis" => {
             let Some(instance) = sd.status.as_ref().and_then(|s| s.instance.clone()) else {
-                return;
+                return Revocation::Settled;
             };
             let df_ns = cfg
                 .pointer("/namespace")
@@ -1620,7 +2118,7 @@ pub async fn revoke_consumer(ctx: &Arc<Context>, claim: &Arc<ResourceClaim>, ns:
             .await
             else {
                 warn!(%name, %ns, %user, "instance admin secret unreadable; ACL user NOT dropped");
-                return;
+                return Revocation::Settled;
             };
             // DELUSER only. NOT flushdb — the keyspace belongs to the shared
             // database and its other consumers are still using it. That one
@@ -1634,6 +2132,7 @@ pub async fn revoke_consumer(ctx: &Arc<Context>, claim: &Arc<ResourceClaim>, ns:
         }
         _ => {}
     }
+    Revocation::Settled
 }
 
 /// Read one `data` key off a Secret object, base64-decoded.
@@ -2038,5 +2537,814 @@ mod tests {
     #[test]
     fn no_extension_condition_when_nothing_is_missing() {
         assert!(extension_unavailable_condition(&[], &[]).is_none());
+    }
+}
+
+/// The pg arm's failure reasons, driven through the real reconcile against a
+/// scripted apiserver and a scripted `PgAdmin` (WI-400). The server-side
+/// bounds `PgClient` now carries make "the server cancelled a statement" an
+/// everyday outcome, and these pin what each kind of failure says on the
+/// object — and that the designed reasons are unchanged.
+#[cfg(test)]
+mod reconcile_pg_tests {
+    use super::*;
+
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
+    use operator_core::{Metrics, SharedDatabaseSpec, SharedDatabaseStatus};
+
+    use crate::pg_client::{PgAdmin, PgAdminError, ServerBound, CALL_TIMEOUT};
+    use crate::route_apiserver::{apiserver, calls_to, route, Reply, Route};
+
+    const STATUS_PATH: &str =
+        "/apis/apprafter.io/v1alpha1/namespaces/apps/shareddatabases/orders/status";
+    const HOST: &str = "platform-postgres-rw.cnpg-system.svc:5432";
+    const T0: &str = "2026-09-01T00:00:00+00:00";
+
+    /// A `PgAdmin` that answers each `execute_all` from a queue, in call
+    /// order: the groups batch first, then the reader grants.
+    struct ScriptedPg(Mutex<VecDeque<Result<(), PgAdminError>>>);
+
+    #[async_trait]
+    impl PgAdmin for ScriptedPg {
+        async fn execute_all(&self, _dsn: &str, _s: &[String]) -> Result<(), PgAdminError> {
+            self.0
+                .lock()
+                .expect("script")
+                .pop_front()
+                .expect("an execute_all the test did not script")
+        }
+        async fn extension_available(&self, _dsn: &str, _e: &str) -> Result<bool, PgAdminError> {
+            Ok(true)
+        }
+    }
+
+    fn lock_timeout(index: usize) -> PgAdminError {
+        PgAdminError::ServerCancelled {
+            index,
+            total: 7,
+            host: HOST.into(),
+            bound: ServerBound::Lock,
+            cause: "canceling statement due to lock timeout".into(),
+        }
+    }
+
+    fn statement_timeout(index: usize) -> PgAdminError {
+        PgAdminError::ServerCancelled {
+            index,
+            total: 7,
+            host: HOST.into(),
+            bound: ServerBound::Statement,
+            cause: "canceling statement due to statement timeout".into(),
+        }
+    }
+
+    fn unreachable() -> PgAdminError {
+        PgAdminError::ConnectionLost { host: HOST.into() }
+    }
+
+    fn cond(type_: &str, status: &str, reason: &str, message: &str) -> SharedDatabaseCondition {
+        SharedDatabaseCondition {
+            type_: type_.into(),
+            status: status.into(),
+            last_transition_time: T0.into(),
+            reason: Some(reason.into()),
+            message: Some(message.into()),
+        }
+    }
+
+    /// `apps/orders`, type pg, finalizer already on, with `status`.
+    fn shared_db(status: Option<SharedDatabaseStatus>) -> Arc<SharedDatabase> {
+        let mut sd = SharedDatabase::new(
+            "orders",
+            SharedDatabaseSpec {
+                type_: "pg".into(),
+                ..Default::default()
+            },
+        );
+        sd.metadata.namespace = Some("apps".into());
+        sd.metadata.finalizers = Some(vec![SD_FINALIZER.into()]);
+        sd.status = status;
+        Arc::new(sd)
+    }
+
+    /// Ready and serving, with an extension warning a pass that does not
+    /// re-probe must carry forward.
+    fn serving() -> SharedDatabaseStatus {
+        SharedDatabaseStatus {
+            ready: Some(true),
+            ref_count: Some(2),
+            database: Some("shd_apps_orders".into()),
+            instance: Some("platform-postgres".into()),
+            dbnum: None,
+            conditions: Some(vec![
+                cond(
+                    COND_READY,
+                    "True",
+                    "Provisioned",
+                    "shd_apps_orders in platform-postgres",
+                ),
+                cond(
+                    COND_EXTENSION_UNAVAILABLE,
+                    "True",
+                    "NotInOperandImage",
+                    "the running PostgreSQL image does not provide: vector",
+                ),
+            ]),
+        }
+    }
+
+    /// Provisioned, but the last pass met a refused dial and wrote the
+    /// designed `AwaitingCluster` with `ready=false`.
+    fn after_a_transient_failure() -> SharedDatabaseStatus {
+        SharedDatabaseStatus {
+            ready: Some(false),
+            conditions: Some(vec![cond(
+                COND_READY,
+                "False",
+                REASON_AWAITING_CLUSTER,
+                "the shared PostgreSQL cluster platform-postgres is not answering yet",
+            )]),
+            ..serving()
+        }
+    }
+
+    fn silent() -> PgAdminError {
+        PgAdminError::TimedOut {
+            host: HOST.into(),
+            after: CALL_TIMEOUT,
+        }
+    }
+
+    fn extension_warning_of(status: &Value) -> Option<&Value> {
+        status["conditions"]
+            .as_array()
+            .expect("conditions")
+            .iter()
+            .find(|c| c["type"] == COND_EXTENSION_UNAVAILABLE)
+    }
+
+    /// Every apiserver request the pg arm makes up to its status write.
+    fn pg_arm_routes() -> Vec<Route> {
+        let cluster = json!({
+            "apiVersion": "postgresql.cnpg.io/v1", "kind": "Cluster",
+            "metadata": { "name": "platform-postgres", "namespace": "cnpg-system", "resourceVersion": "7" },
+            "spec": { "instances": 1 },
+        });
+        let cluster_path =
+            "/apis/postgresql.cnpg.io/v1/namespaces/cnpg-system/clusters/platform-postgres";
+        vec![
+            route(
+                "GET",
+                "/apis/apprafter.io/v1alpha1/serviceproviders",
+                Reply::Json(
+                    200,
+                    json!({
+                        "apiVersion": "apprafter.io/v1alpha1", "kind": "ServiceProviderList",
+                        "metadata": { "resourceVersion": "1" },
+                        "items": [{
+                            "apiVersion": "apprafter.io/v1alpha1", "kind": "ServiceProvider",
+                            "metadata": { "name": "pg-shared", "namespace": "apprafter-system" },
+                            "spec": { "type": "pg", "backend": "cloudnative-pg" },
+                        }],
+                    }),
+                ),
+            ),
+            route("PATCH", cluster_path, Reply::Json(200, cluster.clone())),
+            route("GET", cluster_path, Reply::Json(200, cluster.clone())),
+            route("PUT", cluster_path, Reply::Json(200, cluster)),
+            route(
+                "GET",
+                "/api/v1/namespaces/cnpg-system/secrets/platform-postgres-apprafter-admin",
+                Reply::Json(
+                    200,
+                    json!({
+                        "apiVersion": "v1", "kind": "Secret",
+                        "metadata": { "name": "platform-postgres-apprafter-admin", "namespace": "cnpg-system" },
+                        "data": { "password": "cHc=" },
+                    }),
+                ),
+            ),
+            route(
+                "PATCH",
+                "/apis/postgresql.cnpg.io/v1/namespaces/cnpg-system/databases/shd-apps-orders",
+                Reply::Json(
+                    200,
+                    json!({
+                        "apiVersion": "postgresql.cnpg.io/v1", "kind": "Database",
+                        "metadata": { "name": "shd-apps-orders", "namespace": "cnpg-system" },
+                        "spec": {},
+                    }),
+                ),
+            ),
+            route(
+                "GET",
+                "/apis/apprafter.io/v1alpha1/namespaces/apps/resourceclaims",
+                Reply::Json(
+                    200,
+                    json!({
+                        "apiVersion": "apprafter.io/v1alpha1", "kind": "ResourceClaimList",
+                        "metadata": { "resourceVersion": "1" }, "items": [],
+                    }),
+                ),
+            ),
+            route(
+                "PATCH",
+                STATUS_PATH,
+                Reply::Json(
+                    200,
+                    json!({
+                        "apiVersion": "apprafter.io/v1alpha1", "kind": "SharedDatabase",
+                        "metadata": { "name": "orders", "namespace": "apps" },
+                        "spec": { "type": "pg" },
+                    }),
+                ),
+            ),
+        ]
+    }
+
+    /// Reconcile `sd` once with `pg` answering the SQL; return the action and
+    /// the `status` of the one status write.
+    async fn reconcile_once(
+        sd: Arc<SharedDatabase>,
+        pg: Vec<Result<(), PgAdminError>>,
+    ) -> (Action, Value) {
+        let (client, log) = apiserver(pg_arm_routes());
+        let mut ctx = Context::new(client, Arc::new(Metrics::new()));
+        ctx.pg = Arc::new(ScriptedPg(Mutex::new(pg.into())));
+        let action = reconcile_shared_database(sd, Arc::new(ctx))
+            .await
+            .expect("every pg failure here is reported on the object, not returned");
+        let writes = calls_to(&log, "PATCH", STATUS_PATH);
+        assert_eq!(writes.len(), 1, "exactly one status write: {writes:?}");
+        (action, writes[0].body["status"].clone())
+    }
+
+    fn ready_of(status: &Value) -> &Value {
+        status["conditions"]
+            .as_array()
+            .expect("conditions")
+            .iter()
+            .find(|c| c["type"] == COND_READY)
+            .expect("a Ready condition")
+    }
+
+    #[tokio::test]
+    async fn a_lock_timeout_on_a_serving_database_keeps_it_ready_and_says_why() {
+        let (action, status) = reconcile_once(
+            shared_db(Some(serving())),
+            vec![Ok(()), Err(lock_timeout(3))],
+        )
+        .await;
+
+        assert_eq!(action, Action::requeue(Duration::from_secs(30)));
+        // Ready stays: consumer binds gate on it, and the database is serving.
+        assert_eq!(status["ready"], json!(true));
+        // Nothing is pruned: the backing and the extension finding ride along.
+        assert_eq!(status["database"], json!("shd_apps_orders"));
+        assert_eq!(status["instance"], json!("platform-postgres"));
+        assert_eq!(
+            extension_warning_of(&status).map(|c| c["status"].clone()),
+            Some(json!("True"))
+        );
+        let ready = ready_of(&status);
+        assert_eq!(ready["status"], "True");
+        assert_eq!(ready["reason"], "AwaitingLock");
+        // Same (type, status) → the transition time is kept, so the write is
+        // not a fresh change on every pass.
+        assert_eq!(ready["lastTransitionTime"], T0);
+        let message = ready["message"].as_str().expect("message");
+        assert!(message.contains("lock timeout"), "{message}");
+        assert!(message.contains("granting the reader group"), "{message}");
+        assert!(!message.contains("waiting for CNPG to create"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_lock_wait_after_a_transient_failure_still_reads_the_database_as_serving() {
+        // One refused dial wrote ready=false. The lock waits that follow are
+        // the server ANSWERING inside a database it has: they must not keep
+        // the database unready for the length of a tenant's migration.
+        let (_, status) = reconcile_once(
+            shared_db(Some(after_a_transient_failure())),
+            vec![Ok(()), Err(lock_timeout(3))],
+        )
+        .await;
+
+        assert_eq!(status["ready"], json!(true));
+        let ready = ready_of(&status);
+        assert_eq!(ready["status"], "True");
+        assert_eq!(ready["reason"], "AwaitingLock");
+    }
+
+    #[tokio::test]
+    async fn a_lock_timeout_before_the_first_ready_is_not_cnpg_creating_the_database() {
+        let (action, status) =
+            reconcile_once(shared_db(None), vec![Ok(()), Err(lock_timeout(3))]).await;
+
+        assert_eq!(action, Action::requeue(Duration::from_secs(30)));
+        assert_eq!(status["ready"], json!(false));
+        let ready = ready_of(&status);
+        assert_eq!(ready["status"], "False");
+        // `Awaiting…`: it clears when the lock holder commits, and the Argo CD
+        // health script reads that prefix as Progressing, not Degraded.
+        assert_eq!(ready["reason"], "AwaitingLock");
+        let message = ready["message"].as_str().expect("message");
+        assert!(!message.contains("waiting for CNPG to create"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_server_cancelled_group_batch_is_not_an_unanswering_cluster() {
+        let (action, status) = reconcile_once(shared_db(None), vec![Err(lock_timeout(1))]).await;
+
+        assert_eq!(action, Action::requeue(Duration::from_secs(30)));
+        let ready = ready_of(&status);
+        assert_eq!(ready["reason"], "AwaitingLock");
+        let message = ready["message"].as_str().expect("message");
+        assert!(message.contains("creating the groups"), "{message}");
+        assert!(!message.contains("not answering"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_statement_timeout_is_not_reported_as_a_lock_wait() {
+        // A statement that runs past statement_timeout on its own may do so on
+        // every pass: it gets a reason that is NOT `Awaiting…`, so a database
+        // that never comes up this way reads Degraded and asks for a person.
+        let (_, never_ready) =
+            reconcile_once(shared_db(None), vec![Ok(()), Err(statement_timeout(3))]).await;
+        let ready = ready_of(&never_ready);
+        assert_eq!(ready["status"], "False");
+        assert_eq!(ready["reason"], "StatementTimedOut");
+
+        // …and a serving database still keeps Ready.
+        let (_, serving_db) = reconcile_once(
+            shared_db(Some(serving())),
+            vec![Ok(()), Err(statement_timeout(3))],
+        )
+        .await;
+        assert_eq!(serving_db["ready"], json!(true));
+        assert_eq!(ready_of(&serving_db)["reason"], "StatementTimedOut");
+    }
+
+    #[tokio::test]
+    async fn a_silent_server_during_the_grants_keeps_a_serving_database_and_prunes_nothing() {
+        let (action, status) =
+            reconcile_once(shared_db(Some(serving())), vec![Ok(()), Err(silent())]).await;
+
+        assert_eq!(action, Action::requeue(Duration::from_secs(20)));
+        // A timeout never moves Ready, and never prunes: the backing and the
+        // extension finding ride the write exactly as the object had them.
+        assert_eq!(status["ready"], json!(true));
+        assert_eq!(status["database"], json!("shd_apps_orders"));
+        assert_eq!(status["instance"], json!("platform-postgres"));
+        let warning = extension_warning_of(&status).expect("ExtensionUnavailable is carried");
+        assert_eq!(warning["status"], "True");
+        assert_eq!(warning["reason"], "NotInOperandImage");
+        let ready = ready_of(&status);
+        assert_eq!(ready["status"], "True");
+        assert_eq!(ready["reason"], REASON_AWAITING_CLUSTER);
+        assert_eq!(ready["lastTransitionTime"], T0);
+        let message = ready["message"].as_str().expect("message");
+        assert!(message.contains("did not answer"), "{message}");
+        assert!(message.contains("granting the reader group"), "{message}");
+        assert!(!message.contains("waiting for CNPG to create"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_silent_server_while_creating_the_groups_prunes_nothing_either() {
+        let (action, status) =
+            reconcile_once(shared_db(Some(serving())), vec![Err(silent())]).await;
+
+        assert_eq!(action, Action::requeue(Duration::from_secs(20)));
+        assert_eq!(status["ready"], json!(true));
+        assert_eq!(status["database"], json!("shd_apps_orders"));
+        assert_eq!(
+            extension_warning_of(&status).map(|c| c["status"].clone()),
+            Some(json!("True"))
+        );
+        let ready = ready_of(&status);
+        assert_eq!(ready["reason"], REASON_AWAITING_CLUSTER);
+        let message = ready["message"].as_str().expect("message");
+        assert!(message.contains("creating the groups"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_silent_server_never_makes_a_database_ready() {
+        // The silence is no evidence either way: a database that was not
+        // Ready stays not Ready, with the same transition time.
+        let (_, status) = reconcile_once(
+            shared_db(Some(after_a_transient_failure())),
+            vec![Err(silent())],
+        )
+        .await;
+
+        assert_eq!(status["ready"], json!(false));
+        assert_eq!(status["database"], json!("shd_apps_orders"));
+        let ready = ready_of(&status);
+        assert_eq!(ready["status"], "False");
+        assert_eq!(ready["reason"], REASON_AWAITING_CLUSTER);
+        assert_eq!(ready["lastTransitionTime"], T0);
+        let message = ready["message"].as_str().expect("message");
+        assert!(message.contains("did not answer"), "{message}");
+    }
+
+    // --- the designed reasons, unchanged ---
+
+    #[tokio::test]
+    async fn an_unreachable_cluster_is_still_awaiting_cluster() {
+        let (action, status) = reconcile_once(shared_db(None), vec![Err(unreachable())]).await;
+
+        assert_eq!(action, Action::requeue(Duration::from_secs(20)));
+        assert_eq!(status["ready"], json!(false));
+        let ready = ready_of(&status);
+        assert_eq!(ready["reason"], REASON_AWAITING_CLUSTER);
+        assert_eq!(
+            ready["message"],
+            "the shared PostgreSQL cluster platform-postgres is not answering yet"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_database_cnpg_has_not_created_is_still_awaiting_database() {
+        let (action, status) =
+            reconcile_once(shared_db(None), vec![Ok(()), Err(unreachable())]).await;
+
+        assert_eq!(action, Action::requeue(Duration::from_secs(20)));
+        assert_eq!(status["ready"], json!(false));
+        let ready = ready_of(&status);
+        assert_eq!(ready["reason"], REASON_AWAITING_DATABASE);
+        assert_eq!(
+            ready["message"],
+            "waiting for CNPG to create shd_apps_orders in platform-postgres"
+        );
+    }
+
+    // --- a consumer revoke that meets a lock (WI-400) ---
+
+    const CLAIM_PATH: &str = "/apis/apprafter.io/v1alpha1/namespaces/apps/resourceclaims/web";
+
+    /// `apps/web`, a pg consumer of `orders`, deleted `ago`, still holding
+    /// the provisioner finalizer.
+    fn deleted_consumer(ago: Duration) -> Arc<ResourceClaim> {
+        let mut claim = ResourceClaim::new(
+            "web",
+            operator_core::ResourceClaimSpec {
+                type_: "pg".into(),
+                shared_ref: Some("orders".into()),
+                ..Default::default()
+            },
+        );
+        claim.metadata.namespace = Some("apps".into());
+        claim.metadata.finalizers = Some(vec![crate::PROVISIONER_FINALIZER.into()]);
+        let since = Utc::now() - chrono::TimeDelta::from_std(ago).expect("a small duration");
+        claim.metadata.deletion_timestamp = Some(operator_core::k8s_time::time(since));
+        Arc::new(claim)
+    }
+
+    /// Every request a consumer's delete makes, up to the finalizer patch.
+    fn revoke_routes() -> Vec<Route> {
+        vec![
+            route(
+                "GET",
+                "/apis/apprafter.io/v1alpha1/namespaces/apps/shareddatabases/orders",
+                Reply::Json(
+                    200,
+                    json!({
+                        "apiVersion": "apprafter.io/v1alpha1", "kind": "SharedDatabase",
+                        "metadata": { "name": "orders", "namespace": "apps" },
+                        "spec": { "type": "pg" },
+                        "status": { "ready": true, "database": "shd_apps_orders" },
+                    }),
+                ),
+            ),
+            route(
+                "GET",
+                "/apis/apprafter.io/v1alpha1/serviceproviders",
+                Reply::Json(
+                    200,
+                    json!({
+                        "apiVersion": "apprafter.io/v1alpha1", "kind": "ServiceProviderList",
+                        "metadata": { "resourceVersion": "1" },
+                        "items": [{
+                            "apiVersion": "apprafter.io/v1alpha1", "kind": "ServiceProvider",
+                            "metadata": { "name": "pg-shared", "namespace": "apprafter-system" },
+                            "spec": { "type": "pg", "backend": "cloudnative-pg" },
+                        }],
+                    }),
+                ),
+            ),
+            route(
+                "GET",
+                "/api/v1/namespaces/cnpg-system/secrets/platform-postgres-apprafter-admin",
+                Reply::Json(
+                    200,
+                    json!({
+                        "apiVersion": "v1", "kind": "Secret",
+                        "metadata": { "name": "platform-postgres-apprafter-admin", "namespace": "cnpg-system" },
+                        "data": { "password": "cHc=" },
+                    }),
+                ),
+            ),
+            route(
+                "PATCH",
+                CLAIM_PATH,
+                Reply::Json(
+                    200,
+                    json!({
+                        "apiVersion": "apprafter.io/v1alpha1", "kind": "ResourceClaim",
+                        "metadata": { "name": "web", "namespace": "apps" },
+                        "spec": { "type": "pg", "selector": {} },
+                    }),
+                ),
+            ),
+        ]
+    }
+
+    /// Run the claim controller's reconcile on `claim` once, with `pg`
+    /// answering the revoke; return the action and the finalizer patches.
+    async fn delete_consumer(
+        claim: Arc<ResourceClaim>,
+        pg: Vec<Result<(), PgAdminError>>,
+    ) -> (Action, Vec<crate::route_apiserver::Call>) {
+        let (client, log) = apiserver(revoke_routes());
+        let mut ctx = Context::new(client, Arc::new(Metrics::new()));
+        ctx.pg = Arc::new(ScriptedPg(Mutex::new(pg.into())));
+        let action = crate::reconcile::reconcile(claim, Arc::new(ctx))
+            .await
+            .expect("a consumer's delete never fails on its revoke");
+        (action, calls_to(&log, "PATCH", CLAIM_PATH))
+    }
+
+    #[tokio::test]
+    async fn a_revoke_that_meets_a_lock_keeps_the_claims_finalizer() {
+        let (action, finalizer_patches) = delete_consumer(
+            deleted_consumer(Duration::from_secs(30)),
+            vec![Err(lock_timeout(0))],
+        )
+        .await;
+
+        assert_eq!(action, Action::requeue(REVOKE_LOCK_RETRY));
+        assert!(
+            finalizer_patches.is_empty(),
+            "the finalizer must stay while the role is locked: {finalizer_patches:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lock_held_past_the_patience_is_given_up_on_as_before() {
+        let (action, finalizer_patches) = delete_consumer(
+            deleted_consumer(REVOKE_LOCK_PATIENCE + Duration::from_secs(60)),
+            vec![Err(lock_timeout(0))],
+        )
+        .await;
+
+        assert_eq!(action, Action::await_change());
+        assert_eq!(finalizer_patches.len(), 1, "{finalizer_patches:?}");
+        assert_eq!(
+            finalizer_patches[0].body["metadata"]["finalizers"],
+            json!([])
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_server_still_releases_the_finalizer() {
+        // The designed best-effort rule, unchanged: a server that is down
+        // must not hold an application's delete.
+        let (action, finalizer_patches) = delete_consumer(
+            deleted_consumer(Duration::from_secs(30)),
+            vec![Err(unreachable())],
+        )
+        .await;
+
+        assert_eq!(action, Action::await_change());
+        assert_eq!(finalizer_patches.len(), 1, "{finalizer_patches:?}");
+    }
+
+    #[test]
+    fn the_lock_patience_is_measured_from_the_delete() {
+        let now = Utc::now();
+        let claim = |ago: i64| {
+            let mut c = ResourceClaim::new("web", Default::default());
+            c.metadata.deletion_timestamp = Some(operator_core::k8s_time::time(
+                now - chrono::TimeDelta::seconds(ago),
+            ));
+            c
+        };
+        assert!(revoke_may_wait(&claim(0), now));
+        assert!(revoke_may_wait(&claim(299), now));
+        assert!(!revoke_may_wait(&claim(300), now));
+        // A delete stamped ahead of this clock (skew) is still within.
+        assert!(revoke_may_wait(&claim(-5), now));
+        // A claim that is not being deleted has nothing to wait for.
+        assert!(!revoke_may_wait(
+            &ResourceClaim::new("web", Default::default()),
+            now
+        ));
+    }
+}
+
+/// WI-400: the SharedDatabase deadline, driven through the scripted
+/// apiserver (`crate::route_apiserver`) on a paused clock.
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+    use crate::pg_client::{PgAdmin, PgAdminError};
+    use crate::route_apiserver::{apiserver, route, Reply};
+    use operator_core::{Metrics, SharedDatabaseSpec, SharedDatabaseStatus};
+
+    const EVENTS: &str = "/apis/events.k8s.io/v1/namespaces/apps/events";
+
+    fn context(client: Client) -> Arc<Context> {
+        Arc::new(Context::new(client, Arc::new(Metrics::new())))
+    }
+
+    fn ok(body: Value) -> Reply {
+        Reply::Json(200, body)
+    }
+
+    /// A pg SharedDatabase `apps/orders`, finalizer in place.
+    fn database() -> SharedDatabase {
+        let mut sd = SharedDatabase::new(
+            "orders",
+            SharedDatabaseSpec {
+                type_: "pg".into(),
+                ..Default::default()
+            },
+        );
+        sd.metadata.namespace = Some("apps".into());
+        sd.metadata.uid = Some("u-sd".into());
+        sd.metadata.finalizers = Some(vec![SD_FINALIZER.into()]);
+        sd
+    }
+
+    /// A `PgAdmin` whose every call never returns: what a statement waiting
+    /// on a lock looked like before the Postgres client had server-side
+    /// timeouts, and still the shape of any hang this deadline exists for.
+    struct HangingPg;
+
+    #[async_trait::async_trait]
+    impl PgAdmin for HangingPg {
+        async fn execute_all(&self, _dsn: &str, _s: &[String]) -> Result<(), PgAdminError> {
+            std::future::pending().await
+        }
+        async fn extension_available(&self, _dsn: &str, _e: &str) -> Result<bool, PgAdminError> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_database_pass_that_never_returns_is_abandoned_at_the_deadline() {
+        let ctx = context(operator_core::testing::stalled_client());
+
+        let started = tokio::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            RECONCILE_DEADLINE * 2,
+            reconcile_shared_database_with_deadline(Arc::new(database()), ctx),
+        )
+        .await
+        .expect("the deadline must end the pass");
+
+        match outcome {
+            Err(ReconcileError::TimedOut(t)) => assert_eq!(t.after, RECONCILE_DEADLINE),
+            other => panic!("expected TimedOut, got {other:?}"),
+        }
+        assert_eq!(
+            started.elapsed(),
+            RECONCILE_DEADLINE + operator_core::deadline_event::PUBLISH_BOUND
+        );
+    }
+
+    /// A delete cut inside Postgres (`drop_groups` never returning) keeps
+    /// its finalizer and writes no status: the only request after the cut is
+    /// the Warning Event. The database stays in Terminating and is retried,
+    /// which is the safe direction for the one path in 2.29 that destroys
+    /// data.
+    #[tokio::test(start_paused = true)]
+    async fn a_delete_cut_inside_postgres_keeps_its_finalizer_and_writes_no_status() {
+        let (client, log) = apiserver(vec![
+            route(
+                "GET",
+                "/apis/apprafter.io/v1alpha1/namespaces/apps/resourceclaims",
+                ok(json!({
+                    "apiVersion": "apprafter.io/v1alpha1", "kind": "ResourceClaimList",
+                    "metadata": {}, "items": [],
+                })),
+            ),
+            route(
+                "GET",
+                "/apis/apprafter.io/v1alpha1/serviceproviders",
+                ok(json!({
+                    "apiVersion": "apprafter.io/v1alpha1", "kind": "ServiceProviderList",
+                    "metadata": {}, "items": [],
+                })),
+            ),
+            route(
+                "GET",
+                "/apis/postgresql.cnpg.io/v1/namespaces/cnpg-system/databases/shd-apps-orders",
+                Reply::Json(
+                    404,
+                    json!({
+                        "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                        "reason": "NotFound", "code": 404, "message": "not found",
+                    }),
+                ),
+            ),
+            route(
+                "GET",
+                "/api/v1/namespaces/cnpg-system/secrets/platform-postgres-apprafter-admin",
+                ok(json!({
+                    "apiVersion": "v1", "kind": "Secret",
+                    "metadata": {
+                        "name": "platform-postgres-apprafter-admin",
+                        "namespace": "cnpg-system",
+                    },
+                    "data": { "password": "cHc=" },
+                })),
+            ),
+            route(
+                "POST",
+                EVENTS,
+                Reply::Json(
+                    201,
+                    json!({
+                        "apiVersion": "events.k8s.io/v1", "kind": "Event",
+                        "metadata": { "name": "orders.1", "namespace": "apps" },
+                    }),
+                ),
+            ),
+        ]);
+        let mut ctx = Context::new(client, Arc::new(Metrics::new()));
+        ctx.pg = Arc::new(HangingPg);
+        let mut sd = database();
+        sd.metadata.deletion_timestamp =
+            Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                "2026-10-01T00:00:00Z".parse().expect("timestamp"),
+            ));
+        sd.status = Some(SharedDatabaseStatus {
+            database: Some("shd_apps_orders".into()),
+            ..Default::default()
+        });
+
+        let outcome = tokio::time::timeout(
+            RECONCILE_DEADLINE * 2,
+            reconcile_shared_database_with_deadline(Arc::new(sd), Arc::new(ctx)),
+        )
+        .await
+        .expect("the deadline must end the pass");
+        assert!(
+            matches!(outcome, Err(ReconcileError::TimedOut(_))),
+            "{outcome:?}"
+        );
+
+        let log = log.lock().expect("log").clone();
+        assert!(
+            log.iter().any(|c| c
+                .path
+                .ends_with("/secrets/platform-postgres-apprafter-admin")),
+            "the pass reached the Postgres step before it hung: {log:#?}"
+        );
+        assert!(
+            !log.iter().any(|c| c.method == "PATCH"),
+            "neither a status write nor a finalizer release: {log:#?}"
+        );
+        let last = log.last().expect("requests were made");
+        assert_eq!(last.method, "POST", "{log:#?}");
+        assert_eq!(last.path, EVENTS);
+        assert_eq!(last.body["reason"], json!("ReconcileTimedOut"));
+        assert_eq!(last.body["regarding"]["kind"], json!("SharedDatabase"));
+        assert_eq!(
+            last.body["reportingController"],
+            json!("apprafter-resourceclaim-provisioner")
+        );
+    }
+
+    #[tokio::test]
+    async fn error_policy_sd_counts_a_timeout_and_backs_off_one_deadline() {
+        let ctx = context(operator_core::testing::stalled_client());
+        let timed_out = ReconcileError::TimedOut(operator_core::deadline::ReconcileTimedOut {
+            after: RECONCILE_DEADLINE,
+        });
+
+        assert_eq!(
+            error_policy_sd(Arc::new(database()), &timed_out, ctx.clone()),
+            Action::requeue(RECONCILE_DEADLINE)
+        );
+        let timeouts = || {
+            ctx.metrics
+                .reconcile_timeouts
+                .with_label_values(&[KIND])
+                .get()
+        };
+        assert_eq!(timeouts(), 1.0);
+        assert_eq!(
+            error_policy_sd(
+                Arc::new(database()),
+                &ReconcileError::Provisioning("x".into()),
+                ctx.clone()
+            ),
+            Action::requeue(Duration::from_secs(30))
+        );
+        assert_eq!(timeouts(), 1.0, "only a timeout counts as one");
     }
 }

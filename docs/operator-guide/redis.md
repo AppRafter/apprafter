@@ -226,6 +226,8 @@ window.
 | `NOPERM` from `INFO`, or from `PUBSUB CHANNELS` | both are denied to application credentials, deliberately | `INFO KEYSPACE` reports every database on the shared instance, and `PUBSUB CHANNELS` names every other application using pub/sub — neither can be narrowed to one tenant, so both are refused. Publishing and subscribing on your own prefix are unaffected. **BullMQ** calls `INFO` on startup: pass `skipVersionCheck: true` to its connection options. |
 | The application starts but its Redis env-vars are empty or missing | the manifest declares `needs.redis` but binds nothing — nothing is injected automatically | Add both bindings, as above. |
 | Data vanished after a restart | the claim is ephemeral, which is the default | Add `persistent: true` to the need. The claim moves to a persistent instance. |
+| The claim is not ready with reason `AwaitingKeyspace`, and its message names another holder of its database number | another claim, a retained claim or a shared cache holds the number this claim had picked; nothing was flushed | Nothing: the claim let the number go and takes a different one on its next attempt. |
+| A re-created persistent claim stays not ready with reason `DbnumConflict` | the number that holds its retained data is also held by what the message names | The claim keeps the number and flushes nothing, so the retained data is safe, and it keeps retrying. A holder that is still being set up gives the number up on its next attempt, and the claim then completes on its own. If the message keeps naming the same holder, do not delete either application — a deleted claim's retained snapshot goes on holding the number — and open an issue with the message. |
 
 ## Cleanup
 

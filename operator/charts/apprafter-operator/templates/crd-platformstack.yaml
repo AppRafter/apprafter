@@ -263,6 +263,9 @@ spec:
                   - lastTransitionTime
                   type: object
                 type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
               currentVersion:
                 type: string
               lastUpstreamCheck:

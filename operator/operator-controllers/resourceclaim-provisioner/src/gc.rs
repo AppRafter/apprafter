@@ -122,12 +122,52 @@ fn clamp_requeue(raw: Duration) -> Duration {
     raw.max(MIN_REQUEUE).min(MAX_REQUEUE)
 }
 
+/// Re-check interval while a live claim is still re-attaching to an expired
+/// persistent snapshot (WI-402, [`reattach_in_progress`]). Nothing about the
+/// claim wakes this controller — it watches `RetainedClaim`s only — so this
+/// poll is how the snapshot is eventually deleted if the provisioner's own
+/// cancel after its terminal write was itself cut short.
+const REATTACH_PENDING_REQUEUE: Duration = Duration::from_secs(60);
+
 /// Requeue between Phase 2 polls while waiting for CNPG to drop the
 /// `ensure: absent` role (2.4f Fix B2). CNPG drops the DB then the role
 /// over a few reconcile passes; we poll the Cluster `status` until the
 /// role lands in `byStatus.reconciled`, then prune. Short so the drop
 /// finalizes promptly without a tight busy-loop.
 const ROLE_DROP_REQUEUE: Duration = Duration::from_secs(15);
+
+/// How long one GC pass may run before it is abandoned (WI-400).
+///
+/// Every client in a pass other than kube is already bounded: Redis at 1s to
+/// connect and 500ms per reply, NATS at 5s to connect and 2s per request. The
+/// slowest legitimate pass is the NATS arm — one DELETE per declared stream
+/// and consumer, a stream sweep that costs about 7s per stream against a
+/// server that went dark mid-sweep, then `reconcile_accounts_secret`'s Secret
+/// GETs and one PUT — and 120s covers a sweep of about a dozen streams in that
+/// state. The CNPG, disk and Dragonfly arms are five to eight round trips.
+/// The CNPG role drop is never waited for in-pass: it is polled across passes
+/// at `ROLE_DROP_REQUEUE`.
+///
+/// Abandoning a pass is safe at every point. The phase is recomputed from live
+/// state on every pass, each step is idempotent and 404-tolerant, and the
+/// live-guard runs first on every pass and fails closed. Streams a cut sweep
+/// already deleted stay deleted, and the accounts Secret PUT is
+/// resourceVersion-guarded. A `RetainedClaim` has no status subresource, so a
+/// timeout cannot prune anything: `error_policy` warns, counts it and
+/// requeues. The GC runs at the default, unbounded concurrency, so a stuck
+/// pass holds only its own snapshot.
+pub const RECONCILE_DEADLINE: Duration = Duration::from_secs(120);
+
+/// [`reconcile`], abandoned once it runs past [`RECONCILE_DEADLINE`]. This —
+/// never the unbounded reconcile — is what [`run`] hands kube-runtime, which
+/// holds every later trigger for a snapshot while a pass for it is in flight
+/// (WI-400).
+pub async fn reconcile_with_deadline(
+    rc: Arc<RetainedClaim>,
+    ctx: Arc<Context>,
+) -> Result<Action, ReconcileError> {
+    operator_core::deadline::within(RECONCILE_DEADLINE, reconcile(rc, ctx)).await
+}
 
 /// Spawn the RetainedClaim GC Controller (7th controller).
 pub async fn run(
@@ -139,7 +179,7 @@ pub async fn run(
     let ctx = Arc::new(Context::with_acl_dirty(client, metrics, acl_dirty));
     info!("RetainedClaimGC starting");
     Controller::new(retained, watcher::Config::default())
-        .run(reconcile, error_policy, ctx)
+        .run(reconcile_with_deadline, error_policy, ctx)
         .for_each(|res| async move {
             match res {
                 Ok((obj_ref, _)) => info!(retained = %obj_ref.name, "gc reconciled"),
@@ -208,6 +248,27 @@ pub async fn reconcile(
     let claim_api: Api<ResourceClaim> =
         Api::namespaced(ctx.client.clone(), &rc.spec.claim_ref.namespace);
     match claim_api.get_opt(&rc.spec.claim_ref.name).await? {
+        Some(c) if claim_is_live(&c) && reattach_in_progress(&rc, &c) => {
+            // WI-402: a re-created claim has not finished re-attaching to
+            // this snapshot's allocation. The snapshot is the provisioner's
+            // only record that the claim's `$N` holds RETAINED data — its next
+            // pass reads it to decide "do not FLUSHDB". Deleting it here,
+            // because grace ran out while the reattach kept failing (or before
+            // its first checkpoint landed), would turn that pass into a flush
+            // of the data being recovered. Keep it; the provisioner cancels it
+            // after its terminal write, and the arm below deletes it once the
+            // claim is ready.
+            info!(
+                retained = %rc_name, claim = %rc.spec.claim_ref.name,
+                "live ResourceClaim is still re-attaching to this snapshot's allocation — \
+                 keeping the snapshot until the reattach completes"
+            );
+            ctx.metrics
+                .claim_gc_total
+                .with_label_values(&["reattach-pending", &rc_ns])
+                .inc();
+            return Ok(Action::requeue(REATTACH_PENDING_REQUEUE));
+        }
         Some(c) if claim_is_live(&c) => {
             info!(
                 retained = %rc_name, claim = %rc.spec.claim_ref.name,
@@ -383,20 +444,6 @@ async fn gc_drop_dragonfly(
         let addr = dragonfly::instance_addr(&instance, &df_ns);
         let admin_secret = dragonfly::admin_secret_name(&instance);
 
-        // 2.6 Fix #2b defensive live-guard: if a DIFFERENT live claim has
-        // recycled this snapshot's (instance, dbnum) before the grace
-        // elapsed, FLUSHDB would wipe THAT tenant's data (cross-tenant loss).
-        // List live ResourceClaims and decide per `dragonfly_flushdb_is_safe`.
-        // The allocator now RESERVES retained dbnums so a recycle should never
-        // happen, but this guard makes the destructive flush fail-safe. When
-        // unsafe we SKIP the FLUSHDB but STILL ACL DELUSER (per-claim
-        // usernames differ, so dropping the dead user is always safe) + the
-        // Secret/snapshot delete below.
-        let live_claims: Vec<ResourceClaim> = Api::<ResourceClaim>::all(ctx.client.clone())
-            .list(&Default::default())
-            .await?
-            .items;
-
         // Reading the admin password is itself tolerated-on-failure: if the
         // instance (and its admin Secret) is already gone, there is nothing
         // left to reclaim on it, so we log and proceed to the local cleanup
@@ -404,13 +451,27 @@ async fn gc_drop_dragonfly(
         match read_secret_key(ctx, &df_ns, &admin_secret, "password").await {
             Ok(admin_pw) => {
                 if let Some(dbnum) = dbnum {
-                    if dragonfly_flushdb_is_safe(
-                        &live_claims,
+                    // 2.6 Fix #2b defensive live-guard, widened by WI-402: if
+                    // anything other than this snapshot's own claim holds its
+                    // (instance, dbnum) — a live claim that recycled it, a
+                    // SharedDatabase, another snapshot — FLUSHDB would wipe
+                    // THAT tenant's data. The allocator reserves retained
+                    // dbnums, so this should never trip; it makes the
+                    // destructive flush fail-safe when it does. When unsafe we
+                    // SKIP the FLUSHDB but STILL ACL DELUSER (per-claim
+                    // usernames differ, so dropping the dead user is always
+                    // safe) + the Secret/snapshot delete below.
+                    let others = crate::reconcile::dbnum_holders_besides(
+                        &ctx.client,
                         &instance,
                         dbnum,
-                        &rc.spec.claim_ref.name,
-                        &rc.spec.claim_ref.namespace,
-                    ) {
+                        dragonfly::DbnumOwner::Claim {
+                            namespace: &rc.spec.claim_ref.namespace,
+                            name: &rc.spec.claim_ref.name,
+                        },
+                    )
+                    .await?;
+                    if others.is_empty() {
                         if let Err(err) = ctx.redis.flushdb(&addr, &admin_pw, dbnum).await {
                             warn!(
                                 retained = %rc_name, %instance, dbnum, %err,
@@ -419,8 +480,8 @@ async fn gc_drop_dragonfly(
                         }
                     } else {
                         warn!(
-                            retained = %rc_name, %instance, dbnum,
-                            "dragonfly GC live-guard: a different live claim holds this \
+                            retained = %rc_name, %instance, dbnum, holders = %others.join(", "),
+                            "dragonfly GC live-guard: something else holds this \
                              (instance, dbnum) — SKIPPING FLUSHDB to avoid cross-tenant data loss; \
                              still revoking the dead ACL user"
                         );
@@ -912,6 +973,10 @@ async fn delete_connection_secret(
 
 /// Error policy: increment the GC error counter + requeue after 30s
 /// (mirror the scheduler/provisioner cadence).
+///
+/// A pass abandoned at [`RECONCILE_DEADLINE`] is also counted on
+/// `apprafter_reconcile_timeouts_total` (WI-400). Nothing is written on any
+/// error path: a `RetainedClaim` has no status subresource.
 pub fn error_policy(rc: Arc<RetainedClaim>, err: &ReconcileError, ctx: Arc<Context>) -> Action {
     let name = rc.name_any();
     let namespace = rc.namespace().unwrap_or_default();
@@ -924,6 +989,12 @@ pub fn error_policy(rc: Arc<RetainedClaim>, err: &ReconcileError, ctx: Arc<Conte
         .reconcile_errors
         .with_label_values(&[KIND])
         .inc();
+    if matches!(err, ReconcileError::TimedOut(_)) {
+        ctx.metrics
+            .reconcile_timeouts
+            .with_label_values(&[KIND])
+            .inc();
+    }
     Action::requeue(Duration::from_secs(30))
 }
 
@@ -1240,42 +1311,47 @@ pub fn dragonfly_reclaim_target(rc: &RetainedClaim) -> Option<DragonflyReclaim> 
     })
 }
 
-/// Defensive live-guard for the dragonfly grace-GC `FLUSHDB` (2.6 Fix #2b,
-/// ADR 0042 §8). Returns `false` (SKIP the destructive flush) iff some
-/// OTHER live `ResourceClaim` currently holds the SAME `(instance, dbnum)`
-/// the snapshot points at — i.e. the freed dbnum was recycled to a new
-/// tenant before this snapshot's grace elapsed. Flushing then would wipe
-/// the new tenant's data (cross-tenant loss).
+/// True iff this dragonfly snapshot is still load-bearing for a live claim
+/// that has not finished re-attaching to it (WI-402), so the GC must keep it
+/// however long ago its grace ran out.
 ///
-/// "Other" means `(name, namespace) != (snap_claim_name, snap_claim_ns)`:
-/// the snapshot's OWN origin claim being back is a recovery the
-/// reconcile-level live-guard already handles, and its data IS the
-/// snapshot's data, so that case is `true` (safe). Any DIFFERENT claim on
-/// the same `(instance, dbnum)` is the recycle hazard → `false`.
+/// The provisioner can tell "this `$N` holds RETAINED data, skip FLUSHDB"
+/// from "this `$N` was freshly allocated, flush it" only by this snapshot
+/// still existing — on a retry after its allocation checkpoint, and on the
+/// pass that found the snapshot but has not written that checkpoint yet. So
+/// the snapshot is load-bearing while the claim
+///   - is not `ready` (the provisioner cancels the snapshot itself right after
+///     its terminal status write), and
+///   - holds the snapshot's exact `(instance, dbnum)` (checkpointed, mid
+///     reattach) or no allocation at all (not checkpointed yet).
 ///
-/// This is belt-and-suspenders: the allocator now RESERVES retained dbnums
-/// ([`dragonfly::used_dbnums`]), so a recycle should not happen — but if a
-/// snapshot were ever mis-created or the reservation regressed, this guard
-/// prevents the data-loss flush. The caller still runs `ACL DELUSER` + the
-/// Secret/snapshot delete when this returns `false` (per-claim usernames
-/// differ, so dropping the dead user is always safe).
-pub fn dragonfly_flushdb_is_safe(
-    live: &[ResourceClaim],
-    snap_instance: &str,
-    snap_dbnum: u16,
-    snap_claim_name: &str,
-    snap_claim_ns: &str,
-) -> bool {
-    !live.iter().any(|c| {
-        let st = match c.status.as_ref() {
-            Some(st) => st,
-            None => return false,
-        };
-        st.instance.as_deref() == Some(snap_instance)
-            && st.dbnum == Some(snap_dbnum)
-            && (c.name_any().as_str() != snap_claim_name
-                || c.namespace().as_deref() != Some(snap_claim_ns))
-    })
+/// `false` for a ready claim, for one that holds a different allocation (it
+/// allocated elsewhere, so the snapshot is stale), for a snapshot that names
+/// no allocation, and for any snapshot not on a PERSISTENT dragonfly instance:
+/// an ephemeral instance retains nothing, a reattach there flushes anyway, and
+/// nothing depends on its snapshot surviving.
+///
+/// A `true` costs a snapshot kept past grace — still reserving its `$N`,
+/// still holding its data, re-checked every [`REATTACH_PENDING_REQUEUE`] —
+/// never a flush.
+pub fn reattach_in_progress(rc: &RetainedClaim, claim: &ResourceClaim) -> bool {
+    if gc_backend(&rc.spec.backend) != GcBackend::Dragonfly {
+        return false;
+    }
+    let (Some(instance), Some(dbnum)) = (rc.spec.instance.as_deref(), rc.spec.dbnum) else {
+        return false;
+    };
+    if dragonfly::class_of_instance(instance) != Some(dragonfly::PoolClass::Persistent) {
+        return false;
+    }
+    let status = claim.status.as_ref();
+    if status.and_then(|s| s.ready) == Some(true) {
+        return false;
+    }
+    match status.and_then(|s| s.instance.as_deref().zip(s.dbnum)) {
+        None => true,
+        Some((i, n)) => i == instance && n == dbnum,
+    }
 }
 
 /// True iff the fetched `ResourceClaim` is LIVE — present with no
@@ -1424,6 +1500,82 @@ mod tests {
         let mut claim = ResourceClaim::new("demo-web-pg", ResourceClaimSpec::default());
         claim.metadata.deletion_timestamp = Some(operator_core::k8s_time::time(Utc::now()));
         assert!(!claim_is_live(&claim));
+    }
+
+    // --- reattach_in_progress() (WI-402: the snapshot outlives a failing reattach) ---
+
+    const PERSISTENT_000: &str = "platform-redis-persistent-000";
+
+    fn claim_holding(alloc: Option<(&str, u16)>, ready: Option<bool>) -> ResourceClaim {
+        let mut c = ResourceClaim::new("web-redis", ResourceClaimSpec::default());
+        c.metadata.namespace = Some("demo".into());
+        c.status = Some(operator_core::ResourceClaimStatus {
+            instance: alloc.map(|(i, _)| i.to_string()),
+            dbnum: alloc.map(|(_, n)| n),
+            ready,
+            ..Default::default()
+        });
+        c
+    }
+
+    fn persistent_snapshot(dbnum: u16) -> RetainedClaim {
+        dragonfly_snapshot(
+            Some(PERSISTENT_000),
+            Some(dbnum),
+            Some("claim_demo_web-redis_redis"),
+        )
+    }
+
+    #[test]
+    fn a_not_ready_claim_on_the_snapshots_allocation_is_mid_reattach() {
+        let rc = persistent_snapshot(7);
+        let on_it = Some((PERSISTENT_000, 7));
+        assert!(reattach_in_progress(&rc, &claim_holding(on_it, None)));
+        assert!(reattach_in_progress(
+            &rc,
+            &claim_holding(on_it, Some(false))
+        ));
+    }
+
+    #[test]
+    fn a_not_ready_claim_with_no_allocation_yet_may_be_about_to_reattach() {
+        let rc = persistent_snapshot(7);
+        assert!(reattach_in_progress(&rc, &claim_holding(None, None)));
+        let mut bare = claim_holding(None, None);
+        bare.status = None;
+        assert!(reattach_in_progress(&rc, &bare));
+    }
+
+    #[test]
+    fn a_ready_claim_has_finished_its_reattach() {
+        let ready = claim_holding(Some((PERSISTENT_000, 7)), Some(true));
+        assert!(!reattach_in_progress(&persistent_snapshot(7), &ready));
+    }
+
+    #[test]
+    fn a_claim_that_allocated_elsewhere_is_not_reattaching_to_this_snapshot() {
+        let rc = persistent_snapshot(7);
+        for elsewhere in [
+            (PERSISTENT_000, 3),
+            ("platform-redis-persistent-001", 7),
+            ("platform-redis-ephemeral-000", 7),
+        ] {
+            let c = claim_holding(Some(elsewhere), None);
+            assert!(!reattach_in_progress(&rc, &c), "{elsewhere:?}");
+        }
+    }
+
+    #[test]
+    fn only_a_persistent_dragonfly_snapshot_with_an_allocation_is_load_bearing() {
+        let waiting = claim_holding(None, None);
+        let user = Some("claim_demo_web-redis_redis");
+        let ephemeral = dragonfly_snapshot(Some("platform-redis-ephemeral-000"), Some(7), user);
+        assert!(!reattach_in_progress(&ephemeral, &waiting));
+        let never_provisioned = dragonfly_snapshot(Some(""), Some(0), user);
+        assert!(!reattach_in_progress(&never_provisioned, &waiting));
+        let mut cnpg = persistent_snapshot(7);
+        cnpg.spec.backend = "cloudnative-pg".into();
+        assert!(!reattach_in_progress(&cnpg, &waiting));
     }
 
     // --- role_is_dropped() (2.4f Fix B2 drop-confirmation) ---
@@ -2018,116 +2170,161 @@ mod tests {
         );
     }
 
-    // --- dragonfly_flushdb_is_safe() (2.6 Fix #2b GC live-guard) ---
+    // ---- WI-400: the reconcile deadline ----
 
-    fn live_redis_claim(name: &str, ns: &str, instance: &str, dbnum: u16) -> ResourceClaim {
-        let mut c = ResourceClaim::new(name, ResourceClaimSpec::default());
-        c.metadata.namespace = Some(ns.to_owned());
-        c.status = Some(operator_core::ResourceClaimStatus {
-            instance: Some(instance.to_owned()),
-            dbnum: Some(dbnum),
-            ..Default::default()
+    /// A pg snapshot whose grace has long elapsed, so a pass gets past the
+    /// clock check and makes its first apiserver call: the live-guard GET of
+    /// the original claim.
+    fn expired_pg_snapshot() -> Arc<RetainedClaim> {
+        let mut rc = RetainedClaim::new(
+            "claim-apps-web-pg",
+            operator_core::RetainedClaimSpec {
+                claim_ref: operator_core::retainedclaim::ClaimRef {
+                    name: "web-pg".into(),
+                    namespace: "apps".into(),
+                },
+                provider: "pg-integrated".into(),
+                backend: "cloudnative-pg".into(),
+                retain_until: "2020-01-01T00:00:00+00:00".into(),
+                ..Default::default()
+            },
+        );
+        rc.metadata.namespace = Some("apprafter-system".into());
+        Arc::new(rc)
+    }
+
+    /// The crate's error type is shared by all four controllers here, and the
+    /// WARN line is the only report of a cut GC pass (a `RetainedClaim` has no
+    /// status), so the timeout has to read as a timeout, with its bound.
+    #[test]
+    fn a_timed_out_gc_pass_names_the_deadline_it_ran_past() {
+        let shown = ReconcileError::from(operator_core::deadline::ReconcileTimedOut {
+            after: RECONCILE_DEADLINE,
+        })
+        .to_string();
+        assert_eq!(shown, "reconcile did not finish within 120s");
+    }
+
+    /// The WI-400 hang, on this controller: the live-guard GET is accepted and
+    /// never answered. Unbounded, the pass — and every later trigger for the
+    /// snapshot — waits for the client's 295s read timeout, or forever above
+    /// the socket. Bounded, it gives up at exactly [`RECONCILE_DEADLINE`] with
+    /// this crate's own error, and nothing destructive ran: the live-guard
+    /// fails closed.
+    #[tokio::test(start_paused = true)]
+    async fn a_gc_pass_whose_apiserver_never_answers_is_abandoned_at_the_deadline() {
+        let ctx = Arc::new(Context::new(
+            operator_core::testing::stalled_client(),
+            Arc::new(Metrics::new()),
+        ));
+        let started = tokio::time::Instant::now();
+
+        // Bounded from outside as well, so a pass that is no longer cut fails
+        // this test instead of hanging it.
+        let outcome = tokio::time::timeout(
+            RECONCILE_DEADLINE * 2,
+            reconcile_with_deadline(expired_pg_snapshot(), ctx),
+        )
+        .await
+        .expect("the deadline must cut a GC pass whose apiserver never answers");
+
+        assert_eq!(started.elapsed(), RECONCILE_DEADLINE);
+        match outcome {
+            Err(ReconcileError::TimedOut(timed_out)) => {
+                assert_eq!(timed_out.after, RECONCILE_DEADLINE)
+            }
+            other => panic!("expected ReconcileError::TimedOut, got {other:?}"),
+        }
+    }
+
+    /// The deadline only exists if `run` hands kube-runtime the BOUNDED
+    /// reconcile; a `Controller` needs a live watch, so the run site is read
+    /// instead. The needle is assembled with `concat!` so this test's own
+    /// text can never satisfy it.
+    #[test]
+    fn the_gc_controller_runs_the_deadline_bounded_reconcile() {
+        let production = include_str!("gc.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("gc.rs has production code above its test module");
+        let wired = concat!(".run(reconcile_with_", "deadline, error_policy, ctx)");
+        assert!(
+            production.contains(wired),
+            "gc::run() must drive reconcile_with_deadline, not the unbounded gc::reconcile"
+        );
+    }
+
+    /// A GC pass abandoned at its deadline is counted where an alert can see
+    /// it — `apprafter_reconcile_timeouts_total{kind="RetainedClaim"}` — on top
+    /// of the two counters every GC error already lands on, and is retried on
+    /// the same 30s cadence. The WARN line and this counter are its whole
+    /// report: a `RetainedClaim` has no status to carry it.
+    #[tokio::test]
+    async fn gc_error_policy_counts_a_timed_out_pass_on_the_timeout_counter() {
+        let ctx = Arc::new(Context::new(
+            operator_core::testing::stalled_client(),
+            Arc::new(Metrics::new()),
+        ));
+        let err = ReconcileError::from(operator_core::deadline::ReconcileTimedOut {
+            after: RECONCILE_DEADLINE,
         });
-        c
+
+        let action = error_policy(expired_pg_snapshot(), &err, ctx.clone());
+
+        assert_eq!(
+            ctx.metrics
+                .reconcile_timeouts
+                .with_label_values(&[KIND])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            ctx.metrics
+                .reconcile_errors
+                .with_label_values(&[KIND])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            ctx.metrics
+                .claim_gc_total
+                .with_label_values(&["error", "apprafter-system"])
+                .get(),
+            1.0
+        );
+        assert_eq!(action, Action::requeue(Duration::from_secs(30)));
     }
 
-    #[test]
-    fn flushdb_safe_when_no_live_claim_on_dbnum() {
-        // No live claim holds this (instance, dbnum) — the snapshot owns it,
-        // so FLUSHDB is safe.
-        let live = vec![live_redis_claim(
-            "other",
-            "demo",
-            "platform-redis-ephemeral-000",
-            3,
-        )];
-        assert!(dragonfly_flushdb_is_safe(
-            &live,
-            "platform-redis-ephemeral-000",
-            7,
-            "web-redis",
-            "demo",
+    /// "A pass was cut" is not "a pass failed": an apiserver that ANSWERS
+    /// with an error — the live-guard failing closed on a 500, say — must not
+    /// move the timeout counter.
+    #[tokio::test]
+    async fn gc_error_policy_does_not_count_an_answered_apiserver_error_as_a_timeout() {
+        let ctx = Arc::new(Context::new(
+            operator_core::testing::stalled_client(),
+            Arc::new(Metrics::new()),
         ));
-    }
+        let err = ReconcileError::Kube(kube::Error::Api(
+            kube::core::Status::failure("etcdserver: request timed out", "InternalError")
+                .with_code(500)
+                .boxed(),
+        ));
 
-    #[test]
-    fn flushdb_safe_when_owner_is_the_snapshots_own_claim() {
-        // The only live claim on (instance, dbnum) is the snapshot's OWN
-        // origin claim (same name+ns) — a recovery the live-guard already
-        // handles; the flush decision itself treats it as safe (it is the
-        // snapshot's own data). The reconcile-level live-guard is what skips
-        // the destructive drop in that case.
-        let live = vec![live_redis_claim(
-            "web-redis",
-            "demo",
-            "platform-redis-ephemeral-000",
-            7,
-        )];
-        assert!(dragonfly_flushdb_is_safe(
-            &live,
-            "platform-redis-ephemeral-000",
-            7,
-            "web-redis",
-            "demo",
-        ));
-    }
+        error_policy(expired_pg_snapshot(), &err, ctx.clone());
 
-    #[test]
-    fn flushdb_not_safe_when_different_claim_recycled_the_dbnum() {
-        // A DIFFERENT live tenant now holds the same (instance, dbnum) — the
-        // freed number was recycled. FLUSHDB here would wipe the new tenant's
-        // data (cross-tenant data loss). The guard must return false.
-        let live = vec![live_redis_claim(
-            "new-tenant",
-            "other-ns",
-            "platform-redis-ephemeral-000",
-            7,
-        )];
-        assert!(!dragonfly_flushdb_is_safe(
-            &live,
-            "platform-redis-ephemeral-000",
-            7,
-            "web-redis",
-            "demo",
-        ));
-    }
-
-    #[test]
-    fn flushdb_safe_when_a_live_claim_has_no_status() {
-        // A live claim with no `status` (None — newly created, not yet
-        // provisioned) carries no (instance, dbnum), so it can NOT be the
-        // recycler of this snapshot's DB. The guard's per-claim closure
-        // returns `false` for it (not-a-conflict), so the FLUSHDB stays safe.
-        // Guards the `None => return false` branch in `dragonfly_flushdb_is_safe`.
-        let mut c = ResourceClaim::new("new-claim", ResourceClaimSpec::default());
-        c.metadata.namespace = Some("demo".to_owned());
-        c.status = None;
-        let live = vec![c];
-        assert!(dragonfly_flushdb_is_safe(
-            &live,
-            "platform-redis-ephemeral-000",
-            7,
-            "web-redis",
-            "demo",
-        ));
-    }
-
-    #[test]
-    fn flushdb_safe_when_recycler_is_on_a_different_instance() {
-        // Same dbnum but a DIFFERENT instance is a different DB — not a
-        // conflict.
-        let live = vec![live_redis_claim(
-            "new-tenant",
-            "other-ns",
-            "platform-redis-ephemeral-001",
-            7,
-        )];
-        assert!(dragonfly_flushdb_is_safe(
-            &live,
-            "platform-redis-ephemeral-000",
-            7,
-            "web-redis",
-            "demo",
-        ));
+        assert_eq!(
+            ctx.metrics
+                .reconcile_timeouts
+                .with_label_values(&[KIND])
+                .get(),
+            0.0
+        );
+        assert_eq!(
+            ctx.metrics
+                .reconcile_errors
+                .with_label_values(&[KIND])
+                .get(),
+            1.0
+        );
     }
 }

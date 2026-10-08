@@ -39,3 +39,12 @@ tar              = { workspace = true }
 # `BackupHealthy` rides every write alongside the conditions it must not prune.
 tower = { workspace = true }
 http  = { workspace = true }
+# `test-util` for `#[tokio::test(start_paused = true)]`: a registry or an
+# apiserver that never answers is driven against the real budgets (seconds to
+# minutes) on a paused clock, which jumps to the next timer whenever every
+# task is idle — so a hang costs no wall time and the moment a bound fires is
+# exact.
+tokio = { workspace = true, features = ["test-util"] }
+# `operator_core::testing::stalled_client()`: an apiserver that takes every
+# request and never answers, for the reconcile-deadline tests (WI-400).
+operator-core = { path = "../../operator-core", features = ["testing"] }

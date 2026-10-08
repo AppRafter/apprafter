@@ -114,15 +114,35 @@ immutable `RetainedClaim` snapshot with `retainUntil` set to deletion + 7 days,
 and the connection Secret cascades away, but the ACL user and the database's
 contents survive the window.
 
-Editing the manifest is a different path. Dropping a `needs.<type>` key is a
-destructive `data-migration` change, so it is gated behind a MigrationPlan and
-the Application pauses at `AwaitingMigrationApproval`. Even after approval
-nothing deletes the claim: the render path applies claims for *declared* needs
-and skips the block when there are none. The retention path runs on Application
-deletion, not on a manifest edit.
+**Re-creating the Application within the window** gives its claim the same
+database number back, as long as the persistence setting has not changed. On
+a persistent instance the claim reattaches to what is stored there; on an
+ephemeral one the database is flushed first, so the claim starts empty even if
+its old keys were still in memory. A reattach
+that fails part-way — the instance restarting under it, say — resumes on its
+next attempt and never flushes what it is recovering.
+
+Editing the manifest is a different path to the same place. Dropping a
+`needs.<type>` key is a destructive `data-migration` change, so it is gated
+behind a MigrationPlan and the Application pauses at
+`AwaitingMigrationApproval`. Once the change is approved, the operator deletes
+the claim the Application no longer declares, and the retention path above runs
+as it does for a deleted Application.
 
 Once `retainUntil` passes, the GC runs `FLUSHDB` on the claim's database and
-`ACL DELUSER` on its user, then removes the snapshot.
+`ACL DELUSER` on its user, then removes the snapshot. Re-creating the
+Application within the window with the other persistence setting skips this:
+its claim takes a fresh number on the other instance and, once ready, deletes
+the old snapshot, so the GC never reaches it. The old database is not flushed,
+its user is not revoked, and its number is no longer reserved. Otherwise, two
+things hold the flush back. If the claim has come back, the GC flushes nothing
+and deletes no user; the snapshot is just removed. On a persistent instance
+that waits until the re-attaching claim is ready, however late that is,
+because the snapshot is what tells a retried re-attach not to flush. And
+before every `FLUSHDB` — this one, and those when a claim is provisioned
+or a shared cache is created or deleted — the platform re-reads every claim,
+retained claim and shared database: if another one holds the same number,
+nothing is flushed.
 
 **The snapshot is not a knob.** It is immutable by a CEL `self == oldSelf` rule,
 and the admission webhook restricts CREATE to the operator's ServiceAccount,

@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use apprafter_operator::{
-    build_router, install_rustls_crypto_provider, with_operator_client_defaults,
+    build_client, build_router, install_rustls_crypto_provider, with_operator_client_defaults,
 };
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
 use kube::api::Api;
@@ -122,8 +122,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let metrics = Arc::new(Metrics::new());
     // `Client::try_default()` is `Config::infer()` + `Client::try_from`;
     // the step between them restores the pre-kube-4 read timeout and
-    // switches off kube 4's in-call retries (see the helper's docs).
-    let client = Client::try_from(with_operator_client_defaults(kube::Config::infer().await?))?;
+    // switches off kube 4's in-call retries (see the helper's docs), and
+    // `build_client` is kube's own stack with the connection pool off, so no
+    // request can queue behind a streaming watch (WI-417, see its docs).
+    let client = build_client(with_operator_client_defaults(kube::Config::infer().await?))?;
 
     let port: u16 = env::var("HTTP_PORT")
         .ok()
@@ -274,14 +276,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // MigrationController — third controller (Track B.1.76).
     // Owns `MigrationPlan.status.*` writes under field manager
-    // `migration-controller`. Currently does not consume the
-    // shared `metrics` handle — strategy actions are no-ops in
-    // 1.76, no counters to surface yet. Wires in when 1.77 +
-    // 1.78 ship real action runners.
+    // `migration-controller`. It takes the shared `metrics`
+    // handle for one series: a pass abandoned at its deadline
+    // counts `apprafter_reconcile_timeouts_total{kind="MigrationPlan"}`
+    // (WI-400). Strategy actions are still no-ops, so nothing else
+    // is counted.
     let migration_controller_handle = tokio::spawn({
         let client = client.clone();
+        let metrics = metrics.clone();
         async move {
-            if let Err(err) = operator_controllers_migration::run(client).await {
+            if let Err(err) = operator_controllers_migration::run(client, metrics).await {
                 error!(%err, "MigrationController error");
             }
         }

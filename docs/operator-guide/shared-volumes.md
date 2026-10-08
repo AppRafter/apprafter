@@ -191,10 +191,17 @@ full:
 ```
 
 The line is absent while the volume has room — and also absent when the
-operator could not measure the volume this cycle, so a missing warning is not
-a promise of space. Check that the same output carries a `Used/Free` or
-`Host disk:` figure rather than an em-dash before you read the silence as good
-news.
+operator's sample of the volume came back empty this cycle, so a missing
+warning is not a promise of space. Check that the same output carries a
+`Used/Free` or `Host disk:` figure rather than an em-dash before you read the
+silence as good news, and know that the figure can be old. When the node did
+not answer in time, the volume keeps the figure it already had. On a volume
+that was warning, the `Capacity:` line also stays and says it was not
+re-measured. On a volume that was not warning, `volume status` prints the kept
+figure as an ordinary line, and only the volume's `CapacityWarning` condition
+(`kubectl describe sharedvolume <name> -n <namespace>`) says it was not
+re-measured. Either
+way, the figure is as old as the last sample that answered.
 
 There is nothing to configure and nothing to acknowledge. Free space and the
 line clears on the next reconcile, up to five minutes later. On Tier 1, where
@@ -207,6 +214,25 @@ What gets sampled, why a Tier-1 volume's figures can be the node's, and where
 the node's own disk is reported are in [Cross-application shared
 volumes](../how-it-works/cross-application-shared-volumes.md#what-capacitywarning-measures).
 
+## When the operator abandoned a reconcile
+
+`apprafter volume status` prints one more line when the operator abandoned a
+pass over the volume at its deadline:
+
+```text
+  Reconcile:   last timed out 3 minutes ago (did not finish within 60s); the operator retries on its own
+```
+
+The other lines are from the last pass that finished. The line is read from a
+Kubernetes Event. It goes once a later pass changes the volume's status, in a
+later second than the Event, or once the Event expires, an hour by default,
+whichever comes first. A timeout that keeps coming back writes no status but
+leaves a new Event on each retry, about every two minutes while it is the only
+volume stalling, so its line stays and its age stays short. A pass that finishes
+without changing the status leaves no record that it finished, so after such
+a recovery the line stays until the Event expires, and its age keeps growing.
+The operator retries on its own; see [When a
+reconcile stalls](../how-it-works/cross-application-shared-volumes.md#when-a-reconcile-stalls).
 
 ## Example end-to-end
 

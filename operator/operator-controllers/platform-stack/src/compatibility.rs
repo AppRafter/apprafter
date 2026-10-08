@@ -14,7 +14,6 @@
 use std::collections::BTreeMap;
 use std::io::Read;
 
-use oci_client::client::ClientConfig;
 use oci_client::errors::{OciDistributionError, OciErrorCode};
 use oci_client::manifest::OciManifest;
 use oci_client::secrets::RegistryAuth;
@@ -164,7 +163,7 @@ pub async fn fetch_compatibility_doc_with_self_version(
         CompatError::InvalidReference(with_tag.clone(), e.to_string())
     })?;
 
-    let client = Client::new(ClientConfig::default());
+    let client = Client::new(crate::oci::registry_client_config());
     // Classify the MANIFEST pull's error structurally: a missing
     // `:<channel>` tag (`MANIFEST_UNKNOWN` / 404) becomes the
     // typed `ManifestNotFound` so ADR 0041's resolver can fall

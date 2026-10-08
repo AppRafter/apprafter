@@ -44,6 +44,7 @@ use crate::commands::k8s_helpers::{
     ensure_kubeconfig_tempfile, kubectl_apply_server_side, kubectl_get_json,
     kubectl_get_json_by_selector, kubectl_get_json_showing_managed_fields, kubectl_merge_patch,
 };
+use crate::commands::reconcile_timeout::{self, CLAIM_KIND};
 
 pub(crate) const ARGOCD_NAMESPACE: &str = "argocd";
 const APPRAFTER_MANAGED_LABEL: &str = "apprafter.io/managed-by=apprafter";
@@ -2700,6 +2701,17 @@ pub(crate) struct ResourceClaimSummary {
     /// no list of known types, so a condition added later appears without
     /// a CLI change.
     pub advisories: Vec<(String, String)>,
+    /// The newest `ReconcileTimedOut` Event about this claim (WI-400), as
+    /// [`reconcile_timeout::timeout_summary`]'s text: the provisioner or the
+    /// scheduler abandoned a pass over it at the deadline, while that Event is
+    /// kept and until the controller whose pass was cut writes the claim's
+    /// status again. `None` otherwise, and always `None` against an operator
+    /// that predates the Event.
+    ///
+    /// Not a condition, because the timed-out pass writes none: every status
+    /// write on a claim is a full-body apply, and one carrying a "timed out"
+    /// condition would prune the allocation it left out.
+    pub reconcile_timeout: Option<String>,
 }
 
 /// Argo CD resource entry rendered into the tracked-
@@ -3293,8 +3305,59 @@ fn list_resource_claims_for_app(
     namespace: &str,
     kubeconfig: &Path,
 ) -> Result<Vec<ResourceClaimSummary>> {
-    let parsed = list_resource_claim_payload(namespace, kubeconfig)?;
-    Ok(parse_resource_claim_summaries(&parsed, owner))
+    // With their field owners: a claim's `Reconcile:` block goes quiet once
+    // the controller whose pass was cut has written its status since
+    // (WI-400).
+    let parsed = list_resource_claim_payload(namespace, true, kubeconfig)?;
+    Ok(claim_summaries_with_timeouts(
+        &parsed,
+        owner,
+        |kind| reconcile_timeout::read_events(namespace, kind, None, kubeconfig),
+        chrono::Utc::now(),
+    ))
+}
+
+/// Pure helper — [`parse_resource_claim_summaries`], plus each claim's
+/// reconcile line (WI-400).
+///
+/// `read_events` is handed the Event `regarding.kind` to list and returns
+/// the `ReconcileTimedOut` Events of every such object in the namespace. It
+/// is called at most once, and not at all for an application without
+/// claims: one LIST per `app status`, not one per claim, and none where
+/// there is nothing to annotate. Injected so the wiring is tested without a
+/// cluster. Each claim's own item in `payload` is what its Event's uid, and
+/// the status writes since the Event (its `managedFields`), are checked
+/// against.
+pub(crate) fn claim_summaries_with_timeouts(
+    payload: &Value,
+    owner: &str,
+    read_events: impl FnOnce(&str) -> Vec<Value>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<ResourceClaimSummary> {
+    let mut claims = parse_resource_claim_summaries(payload, owner);
+    if claims.is_empty() {
+        return claims;
+    }
+    let latest = reconcile_timeout::latest_by_name(&read_events(CLAIM_KIND), CLAIM_KIND);
+    if latest.is_empty() {
+        return claims;
+    }
+    let items = payload
+        .get("items")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    // One namespace's LIST, so a claim's name is unique in it.
+    for claim in &mut claims {
+        let object = items.iter().find(|item| {
+            item.pointer("/metadata/name").and_then(Value::as_str) == Some(&claim.name)
+        });
+        if let Some(object) = object {
+            claim.reconcile_timeout =
+                reconcile_timeout::timeout_summary(object, latest.get(&claim.name), now);
+        }
+    }
+    claims
 }
 
 /// The raw `kubectl get resourceclaim.apprafter.io -n <ns> -o json`
@@ -3303,9 +3366,22 @@ fn list_resource_claims_for_app(
 /// `app remove`'s blast-radius enumeration, which is owned by any
 /// workload of the bundle rather than by one — spends one read rather
 /// than one per workload.
-fn list_resource_claim_payload(namespace: &str, kubeconfig: &Path) -> Result<Value> {
+///
+/// `show_managed_fields` asks kubectl to keep each claim's
+/// `metadata.managedFields`, which it strips by default (see
+/// [`kubectl_get_json_showing_managed_fields`]); the flag goes where that
+/// getter puts it, right after the resource.
+fn list_resource_claim_payload(
+    namespace: &str,
+    show_managed_fields: bool,
+    kubeconfig: &Path,
+) -> Result<Value> {
+    let mut args = kubectl_list_args(RESOURCECLAIM_RESOURCE, namespace, None);
+    if show_managed_fields {
+        args.insert(2, "--show-managed-fields".to_string());
+    }
     let out = Command::new("kubectl")
-        .args(kubectl_list_args(RESOURCECLAIM_RESOURCE, namespace, None))
+        .args(args)
         .env("KUBECONFIG", kubeconfig)
         .output()
         .map_err(|e| CliError::Other(format!("spawn kubectl get resourceclaim: {e}")))?;
@@ -3446,6 +3522,7 @@ fn summarise_resource_claim(claim: &Value) -> ResourceClaimSummary {
         size: claim_size_cell(claim),
         not_ready,
         advisories,
+        reconcile_timeout: None,
     }
 }
 
@@ -3728,6 +3805,10 @@ pub(crate) fn render_resource_claim_lines(
         if let Some((reason, message)) = &c.not_ready {
             out.push(String::new());
             out.extend(claim_detail_lines(&c.name, reason, message));
+        }
+        if let Some(summary) = &c.reconcile_timeout {
+            out.push(String::new());
+            out.extend(claim_detail_lines(&c.name, "Reconcile", summary));
         }
         for (type_, message) in &c.advisories {
             out.push(String::new());
@@ -5275,7 +5356,7 @@ fn read_claim_inventory(
     let owners: Vec<String> = workloads.iter().map(|w| w.name.clone()).collect();
     let mut lines: Vec<String> = data_bearing_lines(app);
     for ns in &namespaces {
-        let Ok(payload) = list_resource_claim_payload(ns, kubeconfig_path) else {
+        let Ok(payload) = list_resource_claim_payload(ns, false, kubeconfig_path) else {
             return ClaimInventory::Unavailable(probe(ns));
         };
         lines.extend(owned_claim_lines(&payload, &owners, ns));
@@ -10493,6 +10574,7 @@ mod render_tests {
             scheduled: true,
             not_ready: None,
             advisories: Vec::new(),
+            reconcile_timeout: None,
         }
     }
 
@@ -10602,6 +10684,207 @@ mod render_tests {
             )],
             "Scheduled is a column, a False condition is not firing, and an \
              unknown type must still surface"
+        );
+    }
+
+    #[test]
+    fn a_claim_whose_last_pass_was_abandoned_says_so_under_the_table() {
+        let mut c = claim("web-pg", "cnpg", true, Some("web-pg-conn"));
+        c.reconcile_timeout = Some(
+            "last timed out 3 minutes ago (did not finish within 120s); the operator retries \
+             on its own"
+                .into(),
+        );
+        let lines = render_resource_claim_lines(&[c], "apps");
+        assert_eq!(
+            lines[4..],
+            [
+                "",
+                "  web-pg — Reconcile:",
+                "    last timed out 3 minutes ago (did not finish within 120s)",
+                "    the operator retries on its own",
+            ],
+            "{lines:#?}"
+        );
+    }
+
+    /// One claim of `owner`'s, as the claims LIST returns it.
+    fn owned_claim(name: &str, owner: &str, uid: &str) -> Value {
+        json!({
+            "metadata": {
+                "name": name, "namespace": "apps", "uid": uid,
+                "ownerReferences": [{ "kind": "Application", "name": owner }]
+            },
+            "status": { "provider": "cnpg", "ready": true }
+        })
+    }
+
+    fn claim_abandoned_at(name: &str, uid: &str, event_time: &str) -> Value {
+        json!({
+            "type": "Warning", "reason": "ReconcileTimedOut", "eventTime": event_time,
+            "note": "ResourceClaim reconcile did not finish within 120s: the controller \
+                     abandoned this pass and will retry it; nothing was written to this \
+                     object's status",
+            "regarding": { "apiVersion": "apprafter.io/v1alpha1", "kind": "ResourceClaim",
+                           "name": name, "namespace": "apps", "uid": uid },
+            "reportingController": "apprafter-resourceclaim-provisioner"
+        })
+    }
+
+    fn noon() -> chrono::DateTime<chrono::Utc> {
+        use chrono::TimeZone;
+        chrono::Utc.with_ymd_and_hms(2026, 10, 2, 12, 0, 0).unwrap()
+    }
+
+    #[test]
+    fn each_claim_gets_its_own_latest_timeout_from_one_event_list() {
+        let payload = json!({ "items": [
+            owned_claim("web-pg", "web", "u-web-pg"),
+            // Removed and added again since its timeout: a new uid.
+            owned_claim("web-redis", "web", "u-web-redis-2"),
+            owned_claim("api-pg", "api", "u-api-pg"),
+        ]});
+        let mut asked: Vec<String> = Vec::new();
+        let claims = claim_summaries_with_timeouts(
+            &payload,
+            "web",
+            |kind| {
+                asked.push(kind.to_string());
+                vec![
+                    claim_abandoned_at("web-pg", "u-web-pg", "2026-10-02T11:57:00.000000Z"),
+                    claim_abandoned_at("web-redis", "u-web-redis-1", "2026-10-02T11:57:00.000000Z"),
+                    claim_abandoned_at("api-pg", "u-api-pg", "2026-10-02T11:57:00.000000Z"),
+                ]
+            },
+            noon(),
+        );
+        assert_eq!(asked, ["ResourceClaim"], "one LIST, of claim Events");
+        let by_name: BTreeMap<&str, Option<&str>> = claims
+            .iter()
+            .map(|c| (c.name.as_str(), c.reconcile_timeout.as_deref()))
+            .collect();
+        assert_eq!(
+            by_name,
+            BTreeMap::from([
+                (
+                    "web-pg",
+                    Some(
+                        "last timed out 3 minutes ago (did not finish within 120s); the \
+                         operator retries on its own"
+                    )
+                ),
+                ("web-redis", None),
+            ]),
+            "another app's claim is not listed, and a claim created again since its \
+             timeout carries no line"
+        );
+    }
+
+    #[test]
+    fn an_app_without_claims_lists_no_events() {
+        let claims = claim_summaries_with_timeouts(
+            &json!({ "items": [owned_claim("api-pg", "api", "u-api-pg")] }),
+            "web",
+            |_| panic!("no claim of this app, so nothing to annotate"),
+            noon(),
+        );
+        assert!(claims.is_empty());
+    }
+
+    #[test]
+    fn an_operator_that_leaves_no_event_changes_nothing_in_the_table() {
+        let payload = json!({ "items": [owned_claim("web-pg", "web", "u-web-pg")] });
+        let claims = claim_summaries_with_timeouts(&payload, "web", |_| Vec::new(), noon());
+        assert_eq!(claims, parse_resource_claim_summaries(&payload, "web"));
+        assert_eq!(render_resource_claim_lines(&claims, "apps").len(), 4);
+    }
+
+    /// [`owned_claim`] as `app status` reads it, with its `managedFields`:
+    /// `manager` last wrote its status at `time` (whole seconds, as the
+    /// apiserver records them).
+    fn status_written_by(mut claim: Value, manager: &str, time: &str) -> Value {
+        claim["metadata"]["managedFields"] = json!([{
+            "manager": manager, "operation": "Apply", "apiVersion": "apprafter.io/v1alpha1",
+            "subresource": "status", "time": time,
+            "fieldsType": "FieldsV1", "fieldsV1": { "f:status": {} }
+        }]);
+        claim
+    }
+
+    /// The Events of a provisioner cut on `web-pg` and a scheduler cut on
+    /// `web-redis`, both at 11:57:00, three minutes before noon.
+    fn provisioner_and_scheduler_cuts() -> Vec<Value> {
+        let mut scheduler_cut =
+            claim_abandoned_at("web-redis", "u-web-redis", "2026-10-02T11:57:00.000000Z");
+        scheduler_cut["reportingController"] = json!("apprafter-resourceclaim-scheduler");
+        vec![
+            claim_abandoned_at("web-pg", "u-web-pg", "2026-10-02T11:57:00.000000Z"),
+            scheduler_cut,
+        ]
+    }
+
+    #[test]
+    fn a_claim_whose_cut_controller_has_written_its_status_since_carries_no_line() {
+        // Owner override O2: a later pass of the controller that was cut got
+        // through and wrote the claim's status, so that timeout is over.
+        let payload = json!({ "items": [
+            status_written_by(
+                owned_claim("web-pg", "web", "u-web-pg"),
+                "resourceclaim-provisioner",
+                "2026-10-02T11:58:00Z",
+            ),
+            status_written_by(
+                owned_claim("web-redis", "web", "u-web-redis"),
+                "resourceclaim-scheduler",
+                "2026-10-02T11:58:00Z",
+            ),
+        ]});
+        let claims = claim_summaries_with_timeouts(
+            &payload,
+            "web",
+            |_| provisioner_and_scheduler_cuts(),
+            noon(),
+        );
+        assert_eq!(claims.len(), 2, "{claims:#?}");
+        assert!(
+            claims.iter().all(|c| c.reconcile_timeout.is_none()),
+            "{claims:#?}"
+        );
+    }
+
+    #[test]
+    fn a_claim_cut_again_since_that_controllers_last_status_write_carries_the_line() {
+        let payload = json!({ "items": [
+            // The provisioner last wrote this status before its newest cut.
+            status_written_by(
+                owned_claim("web-pg", "web", "u-web-pg"),
+                "resourceclaim-provisioner",
+                "2026-10-02T11:56:00Z",
+            ),
+            // The scheduler's pass was cut, and the provisioner's later write
+            // says nothing about it.
+            status_written_by(
+                owned_claim("web-redis", "web", "u-web-redis"),
+                "resourceclaim-provisioner",
+                "2026-10-02T11:58:00Z",
+            ),
+        ]});
+        let claims = claim_summaries_with_timeouts(
+            &payload,
+            "web",
+            |_| provisioner_and_scheduler_cuts(),
+            noon(),
+        );
+        let line = "last timed out 3 minutes ago (did not finish within 120s); the operator \
+                    retries on its own";
+        let by_name: Vec<(&str, Option<&str>)> = claims
+            .iter()
+            .map(|c| (c.name.as_str(), c.reconcile_timeout.as_deref()))
+            .collect();
+        assert_eq!(
+            by_name,
+            [("web-pg", Some(line)), ("web-redis", Some(line))],
+            "{claims:#?}"
         );
     }
 

@@ -534,6 +534,182 @@ detect_host_gateway_ip() {
 }
 
 # ---------------------------------------------------------------
+# ECR Public images and the month-end quota
+#
+# cluster-bootstrap installs Argo CD from the upstream argo-cd chart, whose
+# Redis image is public.ecr.aws/docker/library/redis:<tag>. ECR Public serves
+# anonymous pulls 500 GB a month, "limited by source IP". GitHub-hosted runners
+# share egress IPs with other tenants, and in the last days of a month some of
+# those IPs have spent the quota: every anonymous GET then answers 429
+# "toomanyrequests: Data limit exceeded", argocd-redis never starts and helm's
+# --wait times out. That failed one walk on 2026-08-31 and three on 2026-09-30,
+# and none on the 1st of any month. bootstrap_with_retry's retry cannot help:
+# it runs on the same IP, and the quota lasts until the month changes.
+#
+# So the walks put the SAME image into each node's containerd before
+# bootstrap, under its ECR name, from a registry without that quota:
+# mirror.gcr.io (Google's cache of Docker Hub), then Docker Hub itself. Both
+# serve the Docker Official Images that ECR Public's docker/library mirrors;
+# the index digest of redis:7.4.1-alpine is identical on all three. The chart
+# sets imagePullPolicy IfNotPresent, so the kubelet uses that copy and never
+# asks ECR. Chart, values and image reference stay the product's own; only
+# where the bytes come from changes. e2e/mvp.sh (the real-Hetzner nightly)
+# does not seed, so the genuine anonymous ECR pull keeps its test.
+#
+# Both value sets that install the chart are covered: the loader's, which
+# cluster-bootstrap installs, and the platform-stack component's, which Argo
+# CD re-syncs itself to afterwards. One window stays open by design: on a PR
+# that bumps the argo-cd chart, Argo CD re-syncs to the PUBLISHED platform-stack
+# chart, which still pins the old version until the bump is released, so that
+# version's Redis is pulled from ECR there.
+#
+# A containerd registry mirror (hosts.toml) cannot do this: containerd appends
+# the repository path to the mirror host, and mirror.gcr.io has no
+# docker/library/ path (404). The seed is best effort, so a regression in it
+# is quiet in a walk; scripts/check-ecr-seed.sh is where it fails: it runs
+# these functions, asks the seed sources and ECR itself, and checks the pull
+# policy.
+# ---------------------------------------------------------------
+
+# argocd_charts_rendered
+#   Render the Argo CD chart with each value set that installs it, and print
+#   both renders: the loader's (`_loaderValues.argocd`, the export
+#   cli/cli-providers/build.rs compiles into the CLI) and the platform-stack
+#   component's (`_components.argocd`). Needs helm, the pinned cue and the
+#   network (the chart repository). Returns non-zero when either fails.
+argocd_charts_rendered() {
+    local cue_dir="${REPO_ROOT}/platform-stack/cue" cue="${REPO_ROOT}/scripts/cue"
+    local repo chart pair values_expr version_expr values version
+    repo="$(cd "$cue_dir" && "$cue" export -e '_components.argocd.source.repoURL' --out text ./...)" || return 1
+    chart="$(cd "$cue_dir" && "$cue" export -e '_components.argocd.source.chart' --out text ./...)" || return 1
+    for pair in _loaderValues.argocd.values:_loaderValues.argocd.chartVersion \
+        _components.argocd.values:_components.argocd.version; do
+        values_expr="${pair%%:*}"
+        version_expr="${pair#*:}"
+        values="$(cd "$cue_dir" && "$cue" export -e "$values_expr" --out yaml ./...)" || return 1
+        version="$(cd "$cue_dir" && "$cue" export -e "$version_expr" --out text ./...)" || return 1
+        printf '%s\n' "$values" \
+            | helm template argocd "$chart" --repo "$repo" --version "$version" --namespace argocd -f - \
+            || return 1
+        printf -- '---\n'
+    done
+}
+
+# ecr_public_images_in
+#   Read rendered manifests on stdin and print, one per line, every ECR Public
+#   image (public.ecr.aws or ecr-public.aws.com; argo-helm moved to the latter
+#   after 7.7.7) they name. Returns 1 when the manifests name no image at all:
+#   the Argo CD chart always renders its own, so an empty list means the
+#   extraction broke, and that must not read as "nothing to seed".
+ecr_public_images_in() {
+    local images
+    images="$(sed -nE "s/^[[:space:]]*(-[[:space:]]+)?image:[[:space:]]*[\"']?([^\"'[:space:]]+).*/\\2/p" | sort -u)"
+    [ -n "$images" ] || return 1
+    printf '%s\n' "$images" | { grep -E '^(public\.ecr\.aws|ecr-public\.aws\.com)/' || true; }
+}
+
+# ecr_public_images_rendered
+#   Every ECR Public image the Argo CD chart renders, one per line. Returns
+#   non-zero when the chart cannot be rendered or no image could be read.
+ecr_public_images_rendered() {
+    local rendered
+    rendered="$(argocd_charts_rendered)" || return 1
+    printf '%s\n' "$rendered" | ecr_public_images_in
+}
+
+# ecr_public_seed_sources <image>
+#   The registries holding the same content as an ECR Public docker/library
+#   image, best first: <ecr-host>/docker/library/<name>:<tag> becomes
+#   mirror.gcr.io/library/<name>:<tag>, then docker.io/library/<name>:<tag>.
+#   Prints nothing and returns 1 for any other ECR Public path, since only
+#   the Docker Official Images have a copy elsewhere, and for a digest-pinned
+#   reference: CRI stores a `name:tag@digest` pull under `name@digest`, which
+#   the `ctr images tag` below would not find.
+ecr_public_seed_sources() {
+    local image="$1" rest
+    case "$image" in
+        *@*) return 1 ;;
+        public.ecr.aws/docker/library/*) rest="${image#public.ecr.aws/docker/library/}" ;;
+        ecr-public.aws.com/docker/library/*) rest="${image#ecr-public.aws.com/docker/library/}" ;;
+        *) return 1 ;;
+    esac
+    printf 'mirror.gcr.io/library/%s\ndocker.io/library/%s\n' "$rest" "$rest"
+}
+
+# _in_cluster_node <node> <command...>
+#   Run a command inside a cluster node's container, with the engine that runs
+#   it. kind and k3d both name the container after the node.
+_in_cluster_node() {
+    local node="$1"
+    shift
+    if [ "$(cluster_runtime)" = "kind" ] && _kind_uses_podman; then
+        podman exec "$node" "$@"
+    else
+        docker exec "$node" "$@"
+    fi
+}
+
+# _seed_warn <message>
+#   A seed WARN on stderr and, under GitHub Actions, also a ::warning::
+#   annotation, so a degraded seed shows on the summary of a walk that
+#   otherwise goes green.
+_seed_warn() {
+    printf '  WARN: %s\n' "$1" >&2
+    if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+        printf '::warning title=ECR Public seed::%s\n' "$1"
+    fi
+}
+
+# seed_ecr_public_images
+#   Put every ECR Public image the Argo CD chart renders into each node's
+#   containerd, under its ECR name, from ecr_public_seed_sources. Best effort
+#   and loud: one line per image and node, and every failure is a WARN that
+#   leaves the node to pull from ECR Public as before. It never fails harder
+#   than not seeding, and it is safe to run again. Requires $KUBECONFIG
+#   exported.
+seed_ecr_public_images() {
+    local images nodes image node source sources seeded inspect digest
+    if ! images="$(ecr_public_images_rendered)"; then
+        _seed_warn "could not render the Argo CD chart or read its images; nodes pull ECR Public images from ECR Public"
+        return 0
+    fi
+    if [ -z "$images" ]; then
+        printf '  the Argo CD chart renders no ECR Public image; nothing to seed\n'
+        return 0
+    fi
+    nodes="$(kubectl get nodes -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)" || nodes=""
+    if [ -z "$nodes" ]; then
+        _seed_warn "no cluster node listed; nodes pull ECR Public images from ECR Public"
+        return 0
+    fi
+    for image in $images; do
+        if ! sources="$(ecr_public_seed_sources "$image")"; then
+            _seed_warn "${image} is digest-pinned or not a docker/library image, so it is not seeded; nodes pull it from ECR Public"
+            continue
+        fi
+        for node in $nodes; do
+            seeded=""
+            for source in $sources; do
+                # The last step asks the CRI, which is what the kubelet asks:
+                # a ctr tag the CRI image service does not see would seed nothing.
+                if _in_cluster_node "$node" crictl pull "$source" >/dev/null \
+                    && _in_cluster_node "$node" ctr -n k8s.io images tag --force "$source" "$image" >/dev/null \
+                    && inspect="$(_in_cluster_node "$node" crictl inspecti -o json "$image")"; then
+                    digest="$(printf '%s' "$inspect" \
+                        | jq -r '[.status.repoDigests[]? | select(contains("@")) | sub("^[^@]*@"; "")] | first // empty' \
+                            2>/dev/null)" || digest=""
+                    printf '  seeded %s on %s from %s (%s)\n' "$image" "$node" "$source" "${digest:-digest unknown}"
+                    seeded=1
+                    break
+                fi
+                printf '  could not seed %s on %s from %s; trying the next source\n' "$image" "$node" "$source" >&2
+            done
+            [ -n "$seeded" ] || _seed_warn "could not seed ${image} on ${node}; it pulls from ECR Public"
+        done
+    done
+}
+
+# ---------------------------------------------------------------
 # bootstrap_with_retry
 #   Runs `apprafter cluster-bootstrap` with APPRAFTER_BOOTSTRAP_SKIP_CILIUM
 #   so it leaves the cluster's default CNI in place (see k3d_up for why). That
@@ -543,6 +719,7 @@ detect_host_gateway_ip() {
 # ---------------------------------------------------------------
 bootstrap_with_retry() {
     export APPRAFTER_BOOTSTRAP_SKIP_CILIUM=1
+    seed_ecr_public_images
     # cluster-bootstrap is idempotent (helm upgrade --install + SSA),
     # so a plain re-run is the safety net — do NOT `helm uninstall`
     # anything (that orphans argocd-server, so the next install fails
@@ -551,6 +728,7 @@ bootstrap_with_retry() {
     apprafter cluster-bootstrap || {
         printf '  cluster-bootstrap failed; retrying once (idempotent)\n' >&2
         sleep 15
+        seed_ecr_public_images
         apprafter cluster-bootstrap
     }
 }
@@ -571,9 +749,11 @@ bootstrap_with_cilium() {
     # Defensive: a prior bootstrap_with_retry in the same shell would have
     # exported the skip flag — unset it so Cilium installs.
     unset APPRAFTER_BOOTSTRAP_SKIP_CILIUM
+    seed_ecr_public_images
     apprafter cluster-bootstrap || {
         printf '  cluster-bootstrap (Cilium-on) failed; retrying once (idempotent)\n' >&2
         sleep 20
+        seed_ecr_public_images
         apprafter cluster-bootstrap
     }
 }
@@ -684,13 +864,6 @@ WRAP
 }
 
 # ---------------------------------------------------------------
-# dump_diagnostics
-#   Best-effort cluster-state dump for CI debugging. Call this on
-#   failure BEFORE tearing the cluster down — otherwise the evidence
-#   (stuck pods, events, helm-hook state) is destroyed with it.
-#   No-op + never fails if KUBECONFIG/kubectl are unavailable.
-# ---------------------------------------------------------------
-# ---------------------------------------------------------------
 # apply_branch_operator_rbac
 #
 # In APPRAFTER_E2E_LOCAL_OPERATOR mode the walks swap the operator IMAGE but
@@ -750,10 +923,209 @@ apply_branch_operator_rbac() {
     printf '  branch operator RBAC applied (ClusterRole/Binding, Role/Binding, SA)\n'
 }
 
+# ---------------------------------------------------------------
+# dump_diagnostics helpers (_diag_*). Internal; see dump_diagnostics.
+# ---------------------------------------------------------------
+
+# The Display of operator_core::deadline::ReconcileTimedOut
+# (operator/operator-core/src/deadline.rs): what the operator logs when a
+# reconcile runs out of its WI-400 deadline. Every controller's run() stream
+# logs it as "reconciler for object <ref> failed: <this> <N>s", and most
+# error_policies log it again. scripts/check-dump-diagnostics.sh fails when
+# this drifts from the Rust text, so the summary cannot go silently empty.
+_DIAG_DEADLINE_TEXT='reconcile did not finish within'
+
+# _diag_strip_ansi — drop ANSI colour sequences. The operator and the
+# webhook colour their logs with no TTY attached, and a downloaded job
+# log renders every code as literal `^[[2m` text: about a third of the
+# bytes of each operator line.
+_diag_strip_ansi() {
+    sed $'s/\033\\[[0-9;]*[A-Za-z]//g'
+}
+
+# _diag_log_window — the one `kubectl logs` argument that selects THIS
+# walk: --since-time=<walk start minus 60s>, in RFC3339. The slack absorbs
+# clock skew against a remote node (the Hetzner walks); kind and k3d nodes
+# read this host's clock. When START_NS is not a number, or `date` cannot
+# convert it (BSD date has no `-d @`), the window is the whole container
+# log (--tail=-1) — never a tail.
+_diag_log_window() {
+    local start_s stamp=''
+    case "${START_NS:-}" in
+        '' | *[!0-9]*) printf '%s\n' '--tail=-1'; return 0 ;;
+    esac
+    start_s=$(( START_NS / 1000000000 - 60 ))
+    stamp="$(date -u -d "@${start_s}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" || stamp=''
+    if [ -n "$stamp" ]; then
+        printf -- '--since-time=%s\n' "$stamp"
+    else
+        printf '%s\n' '--tail=-1'
+    fi
+}
+
+# _diag_fetch_log <ns> <pod> <container> <previous: true|false> <window> <file>
+#   One container's log, ANSI-stripped, into <file>. kubectl's own error
+#   (a container still waiting, an apiserver gone) lands in the file as
+#   well, so a section that looks empty still says why.
+_diag_fetch_log() {
+    kubectl -n "$1" logs "$2" -c "$3" --previous="$4" "$5" 2>&1 \
+        | _diag_strip_ansi >"$6" || true
+}
+
+# _diag_print_log <file> <title> <artifact dir, or empty>
+#   The last APPRAFTER_E2E_DIAG_CONSOLE_LINES (default 2000) lines of
+#   <file> to stderr, saying how many lines were left out and where the
+#   whole log is.
+_diag_print_log() {
+    local file="$1" title="$2" out="$3" keep total
+    keep="${APPRAFTER_E2E_DIAG_CONSOLE_LINES:-2000}"
+    case "$keep" in '' | *[!0-9]*) keep=2000 ;; esac
+    total="$(wc -l <"$file" 2>/dev/null | tr -d ' ')" || total=0
+    case "$total" in '' | *[!0-9]*) total=0 ;; esac
+    printf '\n=== %s (%s line(s)) ===\n' "$title" "$total" >&2
+    if [ "$total" -gt "$keep" ]; then
+        if [ -n "$out" ]; then
+            printf '... %s earlier line(s) omitted here; the whole log is %s in the e2e-diagnostics artifact\n' \
+                "$(( total - keep ))" "${file#"$out"/}" >&2
+        else
+            printf '... %s earlier line(s) omitted here; set APPRAFTER_E2E_DIAG_DIR to keep the whole log\n' \
+                "$(( total - keep ))" >&2
+        fi
+    fi
+    tail -n "$keep" "$file" >&2 || true
+}
+
+# _diag_control_plane_logs <dir> <window> <artifact dir, or empty>
+#   Fetch the log of every container of every pod of the operator and the
+#   webhook deployments into <dir>/apprafter-system/ — and the previous
+#   instance of each container that restarted — then print each one's
+#   tail. Pods, not `deploy/<name>`: `kubectl logs deploy/x` reads ONE pod,
+#   which during a rollout may be the wrong one. The resourceclaim
+#   scheduler, provisioner and GC are tasks inside the operator binary,
+#   not deployments of their own.
+_diag_control_plane_logs() {
+    local dir="$1/apprafter-system" window="$2" out="$3" dep sel pod ctr restarts f i
+    local -a logs=() titles=()
+    mkdir -p "$dir" 2>/dev/null || return 0
+    for dep in apprafter-operator admission-webhook; do
+        # $k and $v are go-template variables, not shell ones.
+        # shellcheck disable=SC2016
+        sel="$(kubectl -n apprafter-system get deploy "$dep" \
+            -o go-template='{{range $k, $v := .spec.selector.matchLabels}}{{$k}}={{$v}},{{end}}' \
+            2>/dev/null)" || continue
+        sel="${sel%,}"
+        [ -n "$sel" ] || continue
+        for pod in $(kubectl -n apprafter-system get pods -l "$sel" \
+            -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true); do
+            while read -r ctr restarts; do
+                [ -n "$ctr" ] || continue
+                case "$restarts" in '' | *[!0-9]*) restarts=0 ;; esac
+                if [ "$restarts" -gt 0 ]; then
+                    f="$dir/${pod}.${ctr}.previous.log"
+                    _diag_fetch_log apprafter-system "$pod" "$ctr" true "$window" "$f"
+                    logs+=("$f")
+                    titles+=("logs apprafter-system/${pod} [${ctr}] PREVIOUS instance (restarted ${restarts}x)")
+                fi
+                f="$dir/${pod}.${ctr}.log"
+                _diag_fetch_log apprafter-system "$pod" "$ctr" false "$window" "$f"
+                logs+=("$f")
+                titles+=("logs apprafter-system/${pod} [${ctr}]")
+            done < <(kubectl -n apprafter-system get pod "$pod" \
+                -o jsonpath='{range .status.containerStatuses[*]}{.name}{" "}{.restartCount}{"\n"}{end}' \
+                2>/dev/null || true)
+        done
+    done
+    printf '\n--- apprafter-system control-plane logs (%s) ---\n' "$window" >&2
+    if [ "${#logs[@]}" -eq 0 ]; then
+        printf '(no operator or webhook pod found)\n' >&2
+        return 0
+    fi
+    # Deadline hits first, from the WHOLE logs, however far back they are
+    # and whatever the console tail below cuts. Each names the object whose
+    # reconcile hung, in kube-runtime's <Kind>.<version>.<group>/<name>.<ns>
+    # form: the run() stream's WARN reads "reconciler for object <ref>
+    # failed: …", and an error_policy WARN sits inside the span
+    # `reconciling object{object.ref=<ref>}`. A hit usually shows twice.
+    printf '\n--- reconcile deadline hits (whole walk) ---\n' >&2
+    if ! grep -hF -- "$_DIAG_DEADLINE_TEXT" "${logs[@]}" >&2 2>/dev/null; then
+        printf '(none)\n' >&2
+    fi
+    for i in "${!logs[@]}"; do
+        _diag_print_log "${logs[$i]}" "${titles[$i]}" "$out"
+    done
+}
+
+# _diag_artifact_dir — create and print this call's own subdirectory of
+#   APPRAFTER_E2E_DIAG_DIR: "<kube-context>-<UTC time>-XXXXXX". One per
+#   call, so the two clusters of a backup walk and the two runs of the
+#   gateway job never overwrite each other. Prints nothing when the
+#   variable is unset, or (with a warning) when the directory cannot be
+#   made; the dump then goes to the console only.
+_diag_artifact_dir() {
+    local base="${APPRAFTER_E2E_DIAG_DIR:-}" ctx dir
+    [ -n "$base" ] || return 0
+    ctx="$(kubectl config current-context 2>/dev/null)" || ctx=''
+    ctx="${ctx//[!A-Za-z0-9._-]/_}"
+    [ -n "$ctx" ] || ctx=cluster
+    if ! mkdir -p "$base" 2>/dev/null \
+        || ! dir="$(mktemp -d "${base}/${ctx}-$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX" 2>/dev/null)"; then
+        printf 'WARN: cannot create a diagnostics directory under %s; the dump goes to the console only\n' "$base" >&2
+        return 0
+    fi
+    printf '%s\n' "$dir"
+}
+
+# ---------------------------------------------------------------
+# dump_diagnostics
+#   Best-effort cluster-state dump for CI debugging. Call this on
+#   failure BEFORE tearing the cluster down — otherwise the evidence
+#   (stuck pods, events, helm-hook state) is destroyed with it.
+#   No-op + never fails if KUBECONFIG/kubectl are unavailable, and
+#   never fails under the caller's `set -euo pipefail` either: most
+#   walks call it bare from their EXIT trap, where one failing command
+#   would skip the teardown.
+#
+#   The operator and webhook logs: every container of every pod the
+#   two deployments have when the dump runs, read --since-time a minute
+#   before the walk started (START_NS; the whole log when date cannot
+#   convert it), plus the previous instance of every container that
+#   restarted. A pod replaced during the walk is gone, and its log with
+#   it. The console shows the last
+#   APPRAFTER_E2E_DIAG_CONSOLE_LINES (default 2000) lines of each.
+#   It used to show the last 120, and on run 37001547817 (needs-redis
+#   nightly, 2026-10-02) those began 30s after the stalled Application
+#   was created: steady-state requeue lines had pushed every line about
+#   it out of the window. scripts/check-dump-diagnostics.sh guards this.
+#
+#   APPRAFTER_E2E_DIAG_DIR — when set, each call ALSO writes a fresh
+#   subdirectory of it (see _diag_artifact_dir) holding what the console
+#   has to cut: the whole control-plane logs, the whole logs of every
+#   not-Ready pod, every event, and every apprafter.io object and Argo
+#   CD Application as YAML. The e2e workflows set it and upload it as
+#   the run's `e2e-diagnostics-*` artifact when the job fails or is
+#   cancelled.
+# ---------------------------------------------------------------
 dump_diagnostics() {
     command -v kubectl >/dev/null 2>&1 || return 0
     [ -n "${KUBECONFIG:-}" ] || return 0
+    local window out='' work='' res
+    window="$(_diag_log_window)"
+    out="$(_diag_artifact_dir)" || out=''
+    if [ -n "$out" ]; then
+        work="$out"
+    else
+        work="$(mktemp -d 2>/dev/null)" || work=''
+    fi
     printf '\n----- cluster diagnostics (failure) -----\n' >&2
+    if [ -n "$out" ]; then
+        printf 'whole logs, events and objects: %s (the e2e-diagnostics artifact)\n' "$out" >&2
+        {
+            printf 'walk: %s\n' "$0"
+            printf 'kube context: %s\n' "$(kubectl config current-context 2>/dev/null || true)"
+            printf 'log window: %s\n' "$window"
+            printf 'dumped at: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        } >"$out/context.txt" 2>/dev/null || true
+    fi
     kubectl get nodes -o wide >&2 2>&1 || true
     printf '\n--- pods (all namespaces) ---\n' >&2
     kubectl get pods -A -o wide >&2 2>&1 || true
@@ -762,6 +1134,10 @@ dump_diagnostics() {
     # fully-ready (e.g. a crash-looping `0/1 Running` cilium-agent —
     # READY ratio r[1] != r[2]). For each, dump describe + current and
     # previous-instance container logs (the crash reason lives there).
+    # The trailing `|| true` is load-bearing: with the apiserver gone the
+    # `kubectl get` fails, pipefail fails the pipe, and errexit used to end
+    # the walk's EXIT trap right here — no teardown, and the walk's own
+    # exit code replaced by 1.
     kubectl get pods -A --no-headers 2>/dev/null \
         | awk '{split($3, r, "/");
                 if ($4 != "Running" && $4 != "Completed") print $1, $2;
@@ -773,18 +1149,23 @@ dump_diagnostics() {
             kubectl -n "$ns" logs "$pod" --all-containers --tail=60 >&2 2>&1 || true
             printf '\n--- logs %s/%s (previous instance) ---\n' "$ns" "$pod" >&2
             kubectl -n "$ns" logs "$pod" --all-containers --previous --tail=60 >&2 2>&1 || true
-        done
+            if [ -n "$out" ] && mkdir -p "$out/pods/$ns" 2>/dev/null; then
+                kubectl -n "$ns" logs "$pod" --all-containers --prefix "$window" 2>&1 \
+                    | _diag_strip_ansi >"$out/pods/$ns/$pod.log" || true
+                kubectl -n "$ns" logs "$pod" --all-containers --prefix --previous "$window" 2>&1 \
+                    | _diag_strip_ansi >"$out/pods/$ns/$pod.previous.log" || true
+            fi
+        done || true
     # apprafter-system control-plane logs ALWAYS — the operator and
     # admission-webhook run 1/1 Ready, so the not-Ready loop above skips
     # them, yet a reconcile that errors before writing any status (empty
     # `.status.phase`) leaves its only trace in the operator log. Dump
     # the full control-plane regardless of Ready state.
-    printf '\n--- apprafter-system control-plane logs ---\n' >&2
-    for dep in apprafter-operator admission-webhook resourceclaim-provisioner resourceclaim-scheduler; do
-        kubectl -n apprafter-system get deploy "$dep" >/dev/null 2>&1 || continue
-        printf '\n=== logs deploy/%s (tail 120) ===\n' "$dep" >&2
-        kubectl -n apprafter-system logs "deploy/$dep" --all-containers --tail=120 >&2 2>&1 || true
-    done
+    if [ -n "$work" ]; then
+        _diag_control_plane_logs "$work" "$window" "$out"
+    else
+        printf '\n--- apprafter-system control-plane logs: no scratch directory (mktemp -d failed), skipped ---\n' >&2
+    fi
     # Application + ResourceClaim CRs in the workload namespace — the
     # full status (phase, conditions) that the wait-loop only sampled.
     printf '\n--- Application + ResourceClaim CRs (all namespaces) ---\n' >&2
@@ -820,7 +1201,13 @@ dump_diagnostics() {
             >&2 2>&1 || true
     done
     printf '\n--- recent events ---\n' >&2
-    kubectl get events -A --sort-by=.lastTimestamp 2>/dev/null | tail -60 >&2 || true
+    if [ -n "$out" ]; then
+        kubectl get events -A --sort-by=.lastTimestamp >"$out/events.txt" 2>&1 || true
+        tail -60 "$out/events.txt" >&2 || true
+        printf '(the last 60; every event is in events.txt in the artifact)\n' >&2
+    else
+        kubectl get events -A --sort-by=.lastTimestamp 2>/dev/null | tail -60 >&2 || true
+    fi
     printf '\n--- helm releases ---\n' >&2
     (command -v helm >/dev/null 2>&1 && helm list -A >&2 2>&1) || true
     # Argo CD Applications + why each is not Synced/Healthy — the
@@ -834,5 +1221,17 @@ dump_diagnostics() {
 'sync={.status.sync.status} health={.status.health.status}{"\n"}conditions={range .status.conditions[*]}[{.type}: {.message}]{end}{"\n"}op={.status.operationState.phase}: {.status.operationState.message}{"\n"}' \
             >&2 2>&1 || true
     done
+    # Every apprafter.io object and every Argo CD Application in full: the
+    # console above carries only the fields a wait loop usually needs.
+    if [ -n "$out" ] && mkdir -p "$out/objects" 2>/dev/null; then
+        for res in $(kubectl api-resources --api-group=apprafter.io -o name 2>/dev/null || true) \
+            applications.argoproj.io; do
+            kubectl get "$res" -A -o yaml >"$out/objects/${res}.yaml" 2>&1 || true
+        done
+    fi
     printf '%s\n' '----- end diagnostics -----' >&2
+    if [ -n "$work" ] && [ -z "$out" ]; then
+        rm -rf "$work"
+    fi
+    return 0
 }

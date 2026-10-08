@@ -29,6 +29,7 @@ lint:
     ./scripts/check-spdx-headers.sh
     ./scripts/check-no-cyrillic.sh
     ./scripts/check-heredoc-backticks.sh
+    ./scripts/check-dump-diagnostics.sh
     ./scripts/check-workflows.sh
     ./scripts/docs-check.sh
     ./scripts/check-crd-structural.sh
@@ -41,6 +42,8 @@ lint:
     ./scripts/check-component-enablement.sh
     # Pulls each component's upstream chart, so it needs the network (~45s).
     ./scripts/check-component-claim-templates.sh
+    # Renders the loader's Argo CD chart and HEADs two registries (network, ~5s).
+    ./scripts/check-ecr-seed.sh
     ./scripts/check-backup-render.sh
     ./scripts/check-version-coherence.sh
     ./scripts/check-plan-checkboxes.sh

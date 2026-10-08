@@ -33,8 +33,10 @@ use tabled::{settings::Style, Table, Tabled};
 use crate::cli::DbCommand;
 use crate::commands::k8s_helpers::{
     ensure_kubeconfig_tempfile, kubectl_apply_json, kubectl_delete, kubectl_get_json,
-    kubectl_get_json_cluster_wide, namespace_confirmed_missing,
+    kubectl_get_json_cluster_wide, kubectl_get_json_showing_managed_fields,
+    namespace_confirmed_missing,
 };
+use crate::commands::reconcile_timeout::{self, SHARED_DATABASE_KIND};
 
 const RESOURCE: &str = "shareddatabase.apprafter.io";
 const CLAIM_RESOURCE: &str = "resourceclaim.apprafter.io";
@@ -317,7 +319,14 @@ fn namespace_claims(namespace: &str, kubeconfig_path: &Path) -> Vec<Value> {
 
 fn status(name: &str, namespace: &str) -> Result<()> {
     let kc = ensure_kubeconfig_tempfile()?;
-    let db = match kubectl_get_json(RESOURCE, Some(name), Some(namespace), kc.path())? {
+    // With its field owners: the `Reconcile:` line below goes quiet once the
+    // provisioner has written this status after its last timeout (WI-400).
+    let db = match kubectl_get_json_showing_managed_fields(
+        RESOURCE,
+        Some(name),
+        Some(namespace),
+        kc.path(),
+    )? {
         Some(db) => db,
         None => return Err(db_not_found(name, namespace, kc.path())),
     };
@@ -355,6 +364,15 @@ fn status(name: &str, namespace: &str) -> Result<()> {
             println!("                {b}");
         }
     }
+    // WI-400: a pass abandoned at its deadline writes nothing to this
+    // status, and leaves a Warning Event instead. Printed while that Event
+    // exists, until the provisioner writes this status again; an older
+    // operator leaves no such Event, and prints nothing.
+    let events =
+        reconcile_timeout::read_events(namespace, SHARED_DATABASE_KIND, Some(name), kc.path());
+    if let Some(line) = reconcile_line(&db, &events, chrono::Utc::now()) {
+        println!("  {}", cli_core::style::warn(&line));
+    }
 
     if let Some(msg) = condition_message(&db, "ExtensionUnavailable") {
         println!();
@@ -374,6 +392,18 @@ fn status(name: &str, namespace: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The `Reconcile:` line of `db status`, when the newest `ReconcileTimedOut`
+/// Event is about this database and the provisioner has not written its
+/// status since. Pure, so the shape is tested without a cluster.
+pub(crate) fn reconcile_line(
+    db: &Value,
+    events: &[Value],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<String> {
+    reconcile_timeout::object_summary(db, SHARED_DATABASE_KIND, events, now)
+        .map(|summary| format!("Reconcile:    {summary}"))
 }
 
 fn rm(name: &str, namespace: &str, yes: bool) -> Result<()> {
@@ -565,6 +595,67 @@ mod tests {
         assert_eq!(
             condition_message(&db, "ExtensionUnavailable").as_deref(),
             Some("no vector")
+        );
+    }
+
+    /// A ready database: a timeout is shown whatever the status says.
+    fn database(uid: &str) -> Value {
+        json!({
+            "metadata": { "name": "orders", "namespace": "shop", "uid": uid },
+            "spec": { "type": "pg" },
+            "status": { "ready": true, "refCount": 1, "database": "shd_shop_orders" }
+        })
+    }
+
+    fn database_abandoned_at(event_time: &str) -> Value {
+        json!({
+            "type": "Warning", "reason": "ReconcileTimedOut", "eventTime": event_time,
+            "note": "SharedDatabase reconcile did not finish within 120s: the controller \
+                     abandoned this pass and will retry it; nothing was written to this \
+                     object's status",
+            "regarding": { "apiVersion": "apprafter.io/v1alpha1", "kind": "SharedDatabase",
+                           "name": "orders", "namespace": "shop", "uid": "u-db-1" }
+        })
+    }
+
+    fn noon() -> chrono::DateTime<chrono::Utc> {
+        use chrono::TimeZone;
+        chrono::Utc.with_ymd_and_hms(2026, 10, 2, 12, 0, 0).unwrap()
+    }
+
+    #[test]
+    fn an_abandoned_pass_is_one_line_under_the_database() {
+        let line = reconcile_line(
+            &database("u-db-1"),
+            &[database_abandoned_at("2026-10-02T11:58:00.000000Z")],
+            noon(),
+        );
+        assert_eq!(
+            line.as_deref(),
+            Some(
+                "Reconcile:    last timed out 2 minutes ago (did not finish within 120s); the \
+                 operator retries on its own"
+            )
+        );
+    }
+
+    #[test]
+    fn a_database_created_again_under_its_name_prints_no_line() {
+        let line = reconcile_line(
+            &database("u-db-2"),
+            &[database_abandoned_at("2026-10-02T11:58:00.000000Z")],
+            noon(),
+        );
+        assert_eq!(line, None);
+    }
+
+    #[test]
+    fn a_volume_event_is_not_a_database_event() {
+        let mut volume_event = database_abandoned_at("2026-10-02T11:58:00.000000Z");
+        volume_event["regarding"]["kind"] = json!("SharedVolume");
+        assert_eq!(
+            reconcile_line(&database("u-db-1"), &[volume_event], noon()),
+            None
         );
     }
 }

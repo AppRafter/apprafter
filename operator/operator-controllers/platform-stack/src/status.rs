@@ -73,6 +73,14 @@ pub const COND_BACKUP_HEALTHY: &str = "BackupHealthy";
 /// true. See `backup_retention`.
 pub const COND_BACKUP_RETENTION: &str = "BackupRetention";
 
+/// `ReconcileStalled=True` — the last reconcile of the stack was abandoned at
+/// its deadline (WI-400), so every other condition is from the last one that
+/// finished. NOT written by `platform-controller`: a field manager of its own
+/// sets it and removes it (`crate::stall`), and `status.conditions` is a
+/// list-map keyed by `type`, so neither manager's apply touches the other's
+/// conditions. Absent on a healthy stack.
+pub const COND_RECONCILE_STALLED: &str = "ReconcileStalled";
+
 /// Maximum entries kept in `PlatformStack.status.versionHistory`.
 /// Ring-buffer behaviour: oldest entry drops when this cap is
 /// exceeded. Per spec.md §3.11 ("recent N transitions"); 10 is
@@ -117,6 +125,34 @@ pub fn upsert_condition(status: &mut PlatformStackStatus, c: PlatformStackCondit
         conds.push(c);
     }
     status.conditions = Some(conds);
+}
+
+/// The status as `platform-controller` applies it (WI-400): without
+/// `ReconcileStalled`, which has a field manager of its own — sending it
+/// would make `platform-controller` co-own it, and the stall manager could
+/// then not remove it — and with one condition per `type`, because the
+/// list-map apply refuses a list that names one twice, and a stack written
+/// while the list was atomic can carry such a pair. The first of a pair is
+/// kept: it is the one [`upsert_condition`] updates.
+pub fn platform_controller_view(status: &PlatformStackStatus) -> PlatformStackStatus {
+    let mut view = without_reconcile_stalled(status);
+    if let Some(conds) = view.conditions.as_mut() {
+        let mut seen = std::collections::BTreeSet::new();
+        conds.retain(|c| seen.insert(c.type_.clone()));
+    }
+    view
+}
+
+/// `status` without `ReconcileStalled`, and otherwise as it is: what
+/// `platform-controller` compares the status it computed against, so the
+/// stall manager's condition alone is never a reason for it to write, and a
+/// duplicate it read back is.
+pub fn without_reconcile_stalled(status: &PlatformStackStatus) -> PlatformStackStatus {
+    let mut status = status.clone();
+    if let Some(conds) = status.conditions.as_mut() {
+        conds.retain(|c| c.type_ != COND_RECONCILE_STALLED);
+    }
+    status
 }
 
 /// Append a version-history entry as a ring buffer capped at
@@ -271,6 +307,78 @@ mod tests {
             },
         );
         assert_eq!(status.conditions.as_ref().unwrap().len(), 1);
+    }
+
+    fn cond(type_: &str, status: &str) -> PlatformStackCondition {
+        PlatformStackCondition {
+            type_: type_.into(),
+            status: status.into(),
+            reason: None,
+            message: None,
+            last_transition_time: "t".into(),
+        }
+    }
+
+    fn types(status: &PlatformStackStatus) -> Vec<(String, String)> {
+        status
+            .conditions
+            .iter()
+            .flatten()
+            .map(|c| (c.type_.clone(), c.status.clone()))
+            .collect()
+    }
+
+    /// WI-400: `platform-controller` never sends the stall manager's
+    /// condition, and sends every one of its own.
+    #[test]
+    fn the_controllers_view_leaves_out_reconcile_stalled_and_nothing_else() {
+        let status = PlatformStackStatus {
+            current_version: Some("0.2.81".into()),
+            conditions: Some(vec![
+                cond("Ready", "True"),
+                cond(COND_RECONCILE_STALLED, "True"),
+                cond("Synced", "True"),
+            ]),
+            ..PlatformStackStatus::default()
+        };
+        let view = platform_controller_view(&status);
+        assert_eq!(
+            types(&view),
+            vec![
+                ("Ready".to_string(), "True".to_string()),
+                ("Synced".to_string(), "True".to_string()),
+            ]
+        );
+        assert_eq!(view.current_version.as_deref(), Some("0.2.81"));
+        assert_eq!(without_reconcile_stalled(&status), view);
+    }
+
+    /// A pair of one `type` (possible on a stack written while the list was
+    /// atomic) is sent once, as the first of the pair — the one
+    /// `upsert_condition` updated — and the comparison still sees the pair,
+    /// so the write that drops it is made.
+    #[test]
+    fn the_controllers_view_sends_one_condition_per_type() {
+        let status = PlatformStackStatus {
+            conditions: Some(vec![
+                cond("Ready", "True"),
+                cond("Synced", "True"),
+                cond("Ready", "False"),
+            ]),
+            ..PlatformStackStatus::default()
+        };
+        assert_eq!(
+            types(&platform_controller_view(&status)),
+            vec![
+                ("Ready".to_string(), "True".to_string()),
+                ("Synced".to_string(), "True".to_string()),
+            ]
+        );
+        assert_eq!(types(&without_reconcile_stalled(&status)).len(), 3);
+        assert_ne!(
+            without_reconcile_stalled(&status),
+            platform_controller_view(&status)
+        );
     }
 
     fn entry(version: &str, applied_at: &str) -> operator_core::PlatformStackVersionHistoryEntry {

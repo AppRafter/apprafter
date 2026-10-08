@@ -125,6 +125,12 @@ pub enum ReconcileError {
     /// `ReconcileError::MissingUid`.
     #[error("SourceCredential {0} has no metadata.uid; cannot own a MigrationPlan")]
     MissingUid(String),
+
+    /// The reconcile ran past [`RECONCILE_DEADLINE`] and was abandoned
+    /// (WI-400). Raised by the `operator_core::deadline::within` wrapper at
+    /// the `Controller::run` call, never by `reconcile` itself.
+    #[error(transparent)]
+    TimedOut(#[from] operator_core::deadline::ReconcileTimedOut),
 }
 
 /// Per-controller reconcile context.
@@ -132,6 +138,36 @@ pub struct Context {
     pub client: Client,
     pub metrics: Arc<Metrics>,
 }
+
+/// How long one SourceCredential reconcile may run before it is abandoned
+/// (WI-400). kube-runtime holds every later trigger for a credential while a
+/// reconcile of it is in flight — including the `.owns(plans)` trigger that
+/// consumes an approved MigrationPlan — and nothing else bounds a pass: the
+/// kube client's 295s read timeout bounds one call at a time.
+///
+/// The worst legitimate pass is the two validity halves, each capped at
+/// `validity::HALF_PROBE_BUDGET` (30s) and run one after the other, so 60s,
+/// plus about ten kube calls and one SSA per `repoPrefix` (finalizer, plan
+/// LIST, two material GETs, the derived Secrets, the status write, the plan
+/// delete), each milliseconds. 90s leaves 30s for those. The deadline holds
+/// ONLY because of that budget: the probes sit between the derived-Secret
+/// writes and the status write, and unbudgeted they cost N representatives
+/// x 10s, so any fixed deadline below that cut EVERY pass before its status
+/// write — frozen conditions, no `lastAppliedSpec` stamp, an approved plan
+/// never consumed. The `const` assertion below keeps the two in step.
+///
+/// A cut is safe to retry on every arm: on the pause arm a plan created
+/// without its paused status is found again by label and, phase-less, counts
+/// as blocking (`NoOp` -> `Pause { create: false }`); on the render arm every
+/// write is a forced SSA or a 404-tolerant delete in derive -> stamp ->
+/// delete order. Expiry writes nothing (see [`error_policy`]).
+pub const RECONCILE_DEADLINE: Duration = Duration::from_secs(90);
+
+// Both probe budgets plus 30s of kube calls must fit inside the deadline.
+const _: () = assert!(
+    2 * validity::HALF_PROBE_BUDGET.as_secs() + 30 <= RECONCILE_DEADLINE.as_secs(),
+    "RECONCILE_DEADLINE no longer covers both validity probe budgets"
+);
 
 /// Spawn the SourceCredential Controller. Watches
 /// `apprafter.io/v1alpha1` `SourceCredential` resources cluster-wide.
@@ -148,7 +184,11 @@ pub async fn run(client: Client, metrics: Arc<Metrics>) -> Result<(), ReconcileE
 
     Controller::new(creds, watcher::Config::default())
         .owns(plans, watcher::Config::default())
-        .run(reconcile, error_policy, context)
+        .run(
+            |cred, ctx| operator_core::deadline::within(RECONCILE_DEADLINE, reconcile(cred, ctx)),
+            error_policy,
+            context,
+        )
         .for_each(|res| async move {
             match res {
                 Ok((obj_ref, _action)) => info!(?obj_ref, "sourcecredential step ok"),
@@ -344,7 +384,13 @@ pub async fn reconcile(
     let mut conditions: Vec<SourceCredentialCondition> = Vec::new();
     let mut covered_prefixes: Vec<String> = Vec::new();
     let mut covered_hosts: Vec<String> = Vec::new();
-    let mut last_validated: Option<String> = None;
+    // Only a concluded verdict stamps a new time (`validity_outcome`), and
+    // `patch_status` is a forced single-manager apply that PRUNES a field it
+    // leaves out. So start from the last stamp: an inconclusive pass —
+    // restricted egress, nothing to probe yet, a half out of its probe
+    // budget — must neither move nor erase it.
+    let mut last_validated: Option<String> =
+        cred.status.as_ref().and_then(|s| s.last_validated.clone());
     let mut pending = false;
     let pp = PatchParams::apply(FIELD_MANAGER).force();
 
@@ -460,7 +506,25 @@ pub fn error_policy(
 ) -> Action {
     let name = cred.name_any();
     let namespace = cred.namespace().unwrap_or_default();
-    warn!(%name, %namespace, %err, "sourcecredential reconcile error");
+    if let ReconcileError::TimedOut(timed_out) = err {
+        // Abandoned at RECONCILE_DEADLINE. Nothing is written for it and
+        // nothing may be: `patch_status` is a forced single-manager apply, so
+        // a status built here would PRUNE every field it left out (covered
+        // lists, `lastValidated`, the `lastAppliedSpec` baseline the
+        // migration gate reads). This WARN — inside kube-runtime's
+        // `reconciling object{object.ref=…}` span — the timeout counter and
+        // the retry are the whole surface.
+        warn!(
+            %name, %namespace, after_secs = timed_out.after.as_secs(),
+            "sourcecredential reconcile abandoned at its deadline"
+        );
+        ctx.metrics
+            .reconcile_timeouts
+            .with_label_values(&[KIND])
+            .inc();
+    } else {
+        warn!(%name, %namespace, %err, "sourcecredential reconcile error");
+    }
     ctx.metrics
         .reconcile_total
         .with_label_values(&[KIND, &namespace, "error"])
@@ -2519,6 +2583,92 @@ mod tests {
         );
     }
 
+    /// WI-400: a pass whose apiserver accepts every request and never answers
+    /// is abandoned at exactly `RECONCILE_DEADLINE`. Before, only the client's
+    /// 295s read timeout bounded each call, and kube-runtime held every later
+    /// trigger for the credential the whole time.
+    #[tokio::test(start_paused = true)]
+    async fn a_reconcile_whose_apiserver_never_answers_is_abandoned_at_the_deadline() {
+        let ctx = context(operator_core::testing::stalled_client());
+
+        let started = tokio::time::Instant::now();
+        let err = operator_core::deadline::within(
+            RECONCILE_DEADLINE,
+            reconcile(Arc::new(live_cred()), ctx.clone()),
+        )
+        .await
+        .expect_err("an abandoned reconcile is an error, not a success");
+
+        assert_eq!(started.elapsed(), Duration::from_secs(90));
+        assert!(
+            matches!(err, ReconcileError::TimedOut(t) if t.after == RECONCILE_DEADLINE),
+            "{err:?}"
+        );
+        assert_eq!(err.to_string(), "reconcile did not finish within 90s");
+    }
+
+    /// A timeout is counted on `apprafter_reconcile_timeouts_total{kind}` —
+    /// the one signal that tells "abandoned at the deadline" apart from "the
+    /// apiserver said no" — AND on the two error counters existing alerts
+    /// read, and it is retried like any other error. No other error moves
+    /// the timeout counter.
+    #[tokio::test]
+    async fn error_policy_counts_a_timeout_on_its_own_counter_and_as_an_error() {
+        let ctx = context(operator_core::testing::stalled_client());
+        let cred = Arc::new(live_cred());
+        let timed_out = ReconcileError::from(operator_core::deadline::ReconcileTimedOut {
+            after: RECONCILE_DEADLINE,
+        });
+
+        let action = error_policy(cred.clone(), &timed_out, ctx.clone());
+        assert_eq!(
+            ctx.metrics
+                .reconcile_timeouts
+                .with_label_values(&[KIND])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            ctx.metrics
+                .reconcile_errors
+                .with_label_values(&[KIND])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            ctx.metrics
+                .reconcile_total
+                .with_label_values(&[KIND, "apprafter-system", "error"])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            format!("{action:?}"),
+            format!("{:?}", Action::requeue(Duration::from_secs(30)))
+        );
+
+        error_policy(
+            cred,
+            &ReconcileError::MissingUid("acme".into()),
+            ctx.clone(),
+        );
+        assert_eq!(
+            ctx.metrics
+                .reconcile_timeouts
+                .with_label_values(&[KIND])
+                .get(),
+            1.0,
+            "only a timeout is counted as one"
+        );
+        assert_eq!(
+            ctx.metrics
+                .reconcile_errors
+                .with_label_values(&[KIND])
+                .get(),
+            2.0
+        );
+    }
+
     #[test]
     fn build_migration_failed_status_surfaces_failed_condition_and_carries_baseline() {
         let baseline = sc_spec(&["github.com/acme/"], &[]);
@@ -2574,11 +2724,25 @@ mod tests {
     where
         F: FnMut(&Call) -> (u16, Value) + Send + 'static,
     {
+        stalling_apiserver(|_| false, respond)
+    }
+
+    /// [`scripted_apiserver`], except that a request `stall` picks is logged
+    /// and then never answered — the apiserver took it and went quiet, which
+    /// is what a stalled kine/etcd write looks like from the client. The
+    /// write may or may not have landed; the controller cannot know.
+    pub(crate) fn stalling_apiserver<S, F>(stall: S, respond: F) -> (Client, Arc<Mutex<Vec<Call>>>)
+    where
+        S: Fn(&Call) -> bool + Send + Sync + 'static,
+        F: FnMut(&Call) -> (u16, Value) + Send + 'static,
+    {
         let log = Arc::new(Mutex::new(Vec::<Call>::new()));
         let sink = log.clone();
+        let stall = Arc::new(stall);
         let respond = Arc::new(Mutex::new(respond));
         let service = tower::service_fn(move |req: http::Request<Body>| {
             let sink = sink.clone();
+            let stall = stall.clone();
             let respond = respond.clone();
             async move {
                 let method = req.method().to_string();
@@ -2589,6 +2753,10 @@ mod tests {
                     uri,
                     body: serde_json::from_slice(&bytes).unwrap_or(Value::Null),
                 };
+                if stall(&call) {
+                    sink.lock().expect("log").push(call);
+                    return std::future::pending().await;
+                }
                 let (code, payload) = (respond.lock().expect("responder"))(&call);
                 sink.lock().expect("log").push(call);
                 Ok::<_, std::convert::Infallible>(
@@ -3722,6 +3890,237 @@ mod tests {
         assert!(
             position_of(&calls, "PATCH", "/secrets/").is_some(),
             "derivation must still happen: {calls:#?}"
+        );
+    }
+
+    // ---------------- WI-400: what a deadline cut leaves behind ----------------
+
+    /// A pass whose probes conclude nothing carries the last proven
+    /// `lastValidated` forward. Here both representative lists hang, so each
+    /// half runs out of its budget and reports `Unverified`, which stamps no
+    /// new time. `patch_status` is a forced single-manager apply, so a status
+    /// that OMITTED the field would PRUNE it: a half out of time — like
+    /// restricted egress, or a cluster with nothing to probe yet — would
+    /// erase the only record of when the credential was last actually proven.
+    #[tokio::test(start_paused = true)]
+    async fn a_pass_that_concludes_nothing_carries_last_validated_forward() {
+        let (client, log) = stalling_apiserver(
+            |call| call.method == "GET" && call.uri.contains("/applications"),
+            happy_path,
+        );
+        let mut cred = live_cred();
+        cred.status = Some(SourceCredentialStatus {
+            last_validated: Some("2026-07-01T00:00:00+00:00".to_string()),
+            ..SourceCredentialStatus::default()
+        });
+
+        reconcile(Arc::new(cred), context(client))
+            .await
+            .expect("a pass whose halves ran out of budget still completes");
+
+        let calls = calls_of(&log);
+        let status = call_at(&calls, "PATCH", "/sourcecredentials/acme/status");
+        assert_eq!(
+            status.body.pointer("/status/lastValidated"),
+            Some(&json!("2026-07-01T00:00:00+00:00")),
+            "an inconclusive pass must neither move nor prune lastValidated: {}",
+            status.body
+        );
+    }
+
+    /// The livelock guard. The validity probes run AFTER the derived Secrets
+    /// are written and BEFORE the status write, so a pass whose probes outlast
+    /// `RECONCILE_DEADLINE` never reaches its status: conditions and covered
+    /// lists freeze, `lastAppliedSpec` is never stamped (the migration gate
+    /// never arms) and an approved plan is never consumed — on every pass,
+    /// forever. Forty repos and forty images on a host that never answers
+    /// were 400s + 240s of probing; with each half held to its budget the
+    /// pass still writes its status — both `*Valid` conditions `Unknown`,
+    /// saying the budget ran out, and the baseline stamped — inside the
+    /// deadline.
+    #[tokio::test(start_paused = true)]
+    async fn a_pass_whose_every_probe_stalls_still_writes_its_status_before_the_deadline() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        // Bound and never accepted: the handshake completes into the backlog
+        // and nothing ever writes back.
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback port");
+        let addr = silent.local_addr().expect("loopback address");
+        let argo: Vec<Value> = (0..40)
+            .map(|i| {
+                json!({
+                    "apiVersion": "argoproj.io/v1alpha1",
+                    "kind": "Application",
+                    "metadata": { "name": format!("argo-{i}"), "namespace": "argocd" },
+                    "spec": { "source": { "repoURL": format!("http://{addr}/acme/repo-{i}") } },
+                })
+            })
+            .collect();
+        let apps: Vec<Value> = (0..40)
+            .map(|i| {
+                json!({
+                    "apiVersion": "apprafter.io/v1alpha1",
+                    "kind": "Application",
+                    "metadata": { "name": format!("app-{i}"), "namespace": "landing" },
+                    "spec": { "base": { "image": format!("{addr}/acme/app-{i}:v1") } },
+                })
+            })
+            .collect();
+        let (client, log) = scripted_apiserver(move |call| {
+            if call.method == "GET" && call.uri.contains("argoproj.io/v1alpha1/applications") {
+                return list_of("argoproj.io/v1alpha1", "ApplicationList", argo.clone());
+            }
+            if call.method == "GET" && call.uri.contains("apprafter.io/v1alpha1/applications") {
+                return list_of("apprafter.io/v1alpha1", "ApplicationList", apps.clone());
+            }
+            happy_path(call)
+        });
+        let repo_prefix = format!("http://{addr}/acme/");
+        let host = format!("{addr}/acme/");
+        let mut cred = live_cred();
+        cred.spec = sc_spec(&[repo_prefix.as_str()], &[host.as_str()]);
+        let spec = cred.spec.clone();
+
+        let started = tokio::time::Instant::now();
+        let action = operator_core::deadline::within(
+            RECONCILE_DEADLINE,
+            reconcile(Arc::new(cred), context(client)),
+        )
+        .await
+        .expect("bounded probes leave the pass room to write its status");
+        let took = started.elapsed();
+        drop(silent);
+
+        assert!(
+            took <= validity::HALF_PROBE_BUDGET * 2,
+            "the probes ran {took:?}"
+        );
+        assert_eq!(
+            format!("{action:?}"),
+            format!("{:?}", Action::requeue(Duration::from_secs(60)))
+        );
+        let calls = calls_of(&log);
+        let status = call_at(&calls, "PATCH", "/sourcecredentials/acme/status");
+        let conditions = status
+            .body
+            .pointer("/status/conditions")
+            .and_then(Value::as_array)
+            .expect("conditions");
+        for type_ in [COND_GIT_VALID, COND_REGISTRY_VALID] {
+            let cond = conditions
+                .iter()
+                .find(|c| c.get("type").and_then(Value::as_str) == Some(type_))
+                .unwrap_or_else(|| panic!("no {type_} condition: {conditions:#?}"));
+            assert_eq!(
+                cond.get("status").and_then(Value::as_str),
+                Some("Unknown"),
+                "{cond}"
+            );
+            assert!(
+                cond.get("message")
+                    .and_then(Value::as_str)
+                    .is_some_and(|m| m.contains("probe budget")),
+                "{cond}"
+            );
+        }
+        assert_eq!(
+            status.body.pointer("/status/lastAppliedSpec"),
+            Some(&serde_json::to_value(&spec).expect("spec json")),
+            "the migration baseline must be stamped: {}",
+            status.body
+        );
+    }
+
+    /// A deadline cut on the PAUSE arm, after the gating plan's SSA landed but
+    /// while the paused-status write hung. The next pass must find that plan
+    /// by label, treat it — phase-less, nobody has approved it — as the gate
+    /// for this very change, and write the paused status naming it: no
+    /// second plan, no delete, no derivation. A second plan would split the
+    /// operator's approval across two objects; a derive would hand the
+    /// narrowed coverage out before anyone approved it.
+    #[tokio::test(start_paused = true)]
+    async fn a_pause_cut_after_the_plan_landed_re_pauses_on_that_same_plan() {
+        let narrowed = || {
+            let mut cred = live_cred();
+            cred.status = Some(SourceCredentialStatus {
+                last_applied_spec: Some(sc_spec(
+                    &["github.com/acme/", "github.com/acme-labs/"],
+                    &["ghcr.io/acme/"],
+                )),
+                ..SourceCredentialStatus::default()
+            });
+            cred
+        };
+
+        // Pass 1: the plan SSA is answered, the paused-status write never is.
+        let (client, log) = stalling_apiserver(
+            |call| call.method == "PATCH" && call.uri.contains("/sourcecredentials/acme/status"),
+            happy_path,
+        );
+        let err = operator_core::deadline::within(
+            RECONCILE_DEADLINE,
+            reconcile(Arc::new(narrowed()), context(client)),
+        )
+        .await
+        .expect_err("a pass whose status write never returns is abandoned");
+        assert!(matches!(err, ReconcileError::TimedOut(_)), "{err:?}");
+        let calls = calls_of(&log);
+        let created = call_at(&calls, "PATCH", "/migrationplans/").body.clone();
+        let plan_name = created
+            .pointer("/metadata/name")
+            .and_then(Value::as_str)
+            .expect("the plan has a name")
+            .to_string();
+        assert!(
+            position_of(&calls, "PATCH", "/secrets/").is_none(),
+            "the cut pass must not have derived anything: {calls:#?}"
+        );
+
+        // Pass 2: the plan pass 1 created is what the LIST now returns.
+        let (client, log) = scripted_apiserver(move |call| {
+            if call.method == "GET" && call.uri.contains("/migrationplans") {
+                return list_of(
+                    "apprafter.io/v1alpha1",
+                    "MigrationPlanList",
+                    vec![created.clone()],
+                );
+            }
+            happy_path(call)
+        });
+        reconcile(Arc::new(narrowed()), context(client))
+            .await
+            .expect("re-pausing is not an error");
+
+        let calls = calls_of(&log);
+        assert!(
+            position_of(&calls, "PATCH", "/migrationplans/").is_none(),
+            "the plan pass 1 created already gates — a second one splits the approval: {calls:#?}"
+        );
+        assert!(
+            position_of(&calls, "DELETE", "/migrationplans/").is_none(),
+            "the gating plan must not be deleted out from under the operator: {calls:#?}"
+        );
+        assert!(
+            position_of(&calls, "PATCH", "/secrets/").is_none(),
+            "a paused credential derives nothing: {calls:#?}"
+        );
+        let status = call_at(&calls, "PATCH", "/sourcecredentials/acme/status");
+        assert_eq!(
+            status.body.pointer("/status/phase").and_then(Value::as_str),
+            Some(PHASE_AWAITING_MIGRATION_APPROVAL)
+        );
+        let conditions = status
+            .body
+            .pointer("/status/conditions")
+            .and_then(Value::as_array)
+            .expect("conditions");
+        assert!(
+            conditions.iter().any(|c| c
+                .get("message")
+                .and_then(Value::as_str)
+                .is_some_and(|m| m.contains(&plan_name))),
+            "the paused status must name the plan pass 1 created ({plan_name}): {conditions:#?}"
         );
     }
 }

@@ -13,6 +13,18 @@ repository.workspace   = true
 [lib]
 path = "src/lib.rs"
 
+[features]
+# `testing` exposes `operator_core::testing`: fixtures for the controller
+# crates' tests, such as a `kube::Client` whose every request hangs. It also
+# turns on tokio's `test-util`, since that client is only useful under
+# `#[tokio::test(start_paused = true)]`. A controller crate's
+# `[dev-dependencies]` entry turns it on, as does `--all-features` in
+# `just lint`/`just test` and CI. Neither reaches the release image build
+# (`cargo build --release --locked --bin ...`), and resolver 2 does not unify
+# a dev-dependency's features into that build, so no shipped binary links the
+# module.
+testing = ["dep:tower", "tokio/test-util"]
+
 [dependencies]
 kube         = { workspace = true }
 k8s-openapi  = { workspace = true }
@@ -21,12 +33,14 @@ serde        = { workspace = true }
 serde_json   = { workspace = true }
 prometheus   = { workspace = true }
 chrono       = { workspace = true }
-tokio        = { workspace = true }
+tokio        = { workspace = true, features = ["time"] }
 tracing      = { workspace = true }
 thiserror    = { workspace = true }
 async-trait  = { workspace = true }
 sha2         = { workspace = true }
 http         = { workspace = true }
+# Only for the `testing` feature's stalled client.
+tower        = { workspace = true, optional = true }
 
 [dev-dependencies]
 # `leader.rs` drives leader election against a scripted in-process
@@ -41,3 +55,7 @@ tower = { workspace = true }
 # to the next timer whenever every task is idle — so a request that never
 # answers costs no wall time, and the moment the loop gives up is exact.
 tokio = { workspace = true, features = ["test-util"] }
+# `deadline.rs` drives kube-runtime's public `applier` (the loop
+# `Controller::run` runs) from an in-memory queue, which is a `futures`
+# channel and stream.
+futures = { workspace = true }

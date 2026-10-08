@@ -33,6 +33,7 @@ jobs:
       rust_cli: ${{ steps.filter.outputs.rust_cli }}
       rust_operator: ${{ steps.filter.outputs.rust_operator }}
       bun: ${{ steps.filter.outputs.bun }}
+      e2e_lib: ${{ steps.filter.outputs.e2e_lib }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
@@ -69,6 +70,13 @@ jobs:
               - 'landing/**'
               - 'backstage-plugins/**'
               - 'scripts/check-payload-types.sh'
+              - '.github/workflows/lint.yml'
+            e2e_lib:
+              - 'e2e/lib.sh'
+              - 'scripts/check-dump-diagnostics.sh'
+              # The check pins lib.sh's deadline grep to ReconcileTimedOut's
+              # Display text, so a reword on the Rust side must wake it too.
+              - 'operator/operator-core/src/deadline.rs'
               - '.github/workflows/lint.yml'
 
   # The version guards and the workflow linter, on EVERY pull request and push
@@ -159,6 +167,21 @@ jobs:
       - name: check-workflows.sh
         if: ${{ !cancelled() }}
         run: ./scripts/check-workflows.sh
+
+  # e2e/lib.sh's dump_diagnostics is what a failing walk leaves behind, and
+  # nothing runs it until a walk fails — the worst time to find it broken.
+  # The check runs it against a stub kubectl: offline, a few seconds. Wired
+  # here as well as in `just lint` because no workflow runs `just lint`.
+  e2e-lib:
+    name: e2e/lib.sh dump_diagnostics
+    needs: changes
+    if: needs.changes.outputs.e2e_lib == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: check-dump-diagnostics.sh
+        run: ./scripts/check-dump-diagnostics.sh
 
   cue:
     name: CUE (fmt + vet)

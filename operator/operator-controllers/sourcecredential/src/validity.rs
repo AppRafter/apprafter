@@ -5,11 +5,11 @@
 //! `ghcr.io/acme/`) — org-level, not a single repo. A live reachability
 //! probe, however, needs a *concrete* object: git smart-HTTP validates a
 //! repository, and a registry token exchange only reliably rejects bad
-//! credentials when scoped to a concrete image. So the probe finds a
-//! **representative** object actually covered by the prefix — a git repo
-//! from a matching Argo CD `Application`, an image from a matching
-//! AppRafter `Application` — and probes that. Validity therefore means
-//! "the credential can serve the applications that depend on it."
+//! credentials when scoped to a concrete image. So the probe finds the
+//! **representative** objects actually covered by the prefix — the git repos
+//! of matching Argo CD `Application`s, the images of matching AppRafter
+//! `Application`s — and probes those. Validity therefore means "the
+//! credential can serve the applications that depend on it."
 //!
 //! When no application references a covered prefix yet, there is nothing
 //! concrete to probe and the half is reported `Unverified` (`status:
@@ -22,8 +22,33 @@
 //! `Unverified` for everything ambiguous (404, 5xx, DNS/connect errors,
 //! no representative object). It never declares `Invalid` from a network
 //! error, so a blocked egress can never look like a bad credential.
+//!
+//! Each half is bounded. Its distinct representatives are probed
+//! [`PROBE_CONCURRENCY`] at a time, and the whole half — the cluster-wide
+//! list that finds them and every probe — runs inside one
+//! [`HALF_PROBE_BUDGET`]. The reconcile writes the derived Secrets, THEN runs
+//! both halves, THEN writes status, so an unbounded half is a credential whose
+//! status never moves: one silent host behind N applications used to cost
+//! N x 10s, sequentially, which outran any reconcile deadline (WI-400). A
+//! probe still running when the budget ends counts as `Unverified`; a verdict
+//! already reached is KEPT, so a 401/403 seen before the budget ran out still
+//! makes the half `Invalid`.
+//!
+//! The hosts take turns. Silence belongs to a host — a git host or registry
+//! behind a dropped route answers none of its representatives — so in list
+//! order a silent host listed first held every probe slot until the budget
+//! ran out, and a host behind it that would have answered 401/403 was never
+//! asked, on any pass. Every host's first representative now starts before
+//! any host's second ([`by_host_in_turn`]). Within one host the list order
+//! is kept: when a half runs out of budget on every pass, that host's later
+//! representatives are not reached, and the condition message's "N of M …
+//! did not answer" says so.
 
+use std::collections::HashSet;
+use std::future::Future;
 use std::time::Duration;
+
+use futures::StreamExt;
 
 use kube::api::{Api, ListParams};
 use kube::core::{DynamicObject, GroupVersionKind};
@@ -37,6 +62,32 @@ use tracing::debug;
 
 /// Per-probe wall-clock ceiling, so a hung host never stalls reconcile.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// TCP connect (and TLS handshake) bound for the registry probe's client.
+const PROBE_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Bound on each wait for a registry response. One registry probe is two or
+/// three requests in sequence — the `/v2/` challenge, the token exchange when
+/// the registry asks for one, the tag list — and oci-client swallows a failed
+/// challenge (`get_auth_token` ends in `.ok()??`) and sends the tag list
+/// anyway, so a silent registry costs two full waits. 3s keeps both inside
+/// [`PROBE_TIMEOUT`], which stays the ceiling on the whole probe.
+const PROBE_READ_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Wall-clock budget for ONE half (git or registry): the cluster-wide list
+/// that finds its representatives plus every probe of them. Two halves run
+/// one after the other, so 2 x 30s = 60s of probing is the most a reconcile
+/// spends here, which is what lets the controller's 90s
+/// `RECONCILE_DEADLINE` hold with room for its kube calls. Even when every
+/// host is silent (10s per probe) a half concludes 3 x
+/// [`PROBE_CONCURRENCY`] = 12 probes before it runs out.
+pub(crate) const HALF_PROBE_BUDGET: Duration = Duration::from_secs(30);
+
+/// How many representatives of one half are probed at once. Bounded so a
+/// cluster with hundreds of applications does not open hundreds of
+/// connections to one git host or registry per reconcile — those count
+/// against the credential's own rate limit.
+const PROBE_CONCURRENCY: usize = 4;
 
 /// Outcome of a validity probe. Maps onto a k8s condition `(status,
 /// reason)` pair: `Valid → ("True", Reachable)`, `Invalid → ("False",
@@ -107,16 +158,15 @@ fn git_validity_from_status(code: u16) -> Validity {
     }
 }
 
-/// Probe one concrete git repo over smart-HTTP with Basic auth. Any
+/// Probe one concrete git repo over smart-HTTP with Basic auth, through the
+/// half's shared `client` (built with the [`PROBE_TIMEOUT`] ceiling). Any
 /// transport error degrades to `Unverified` (never `Invalid`).
-async fn probe_git(repo_url: &str, username: &str, password: &str) -> Validity {
-    let client = match reqwest::Client::builder().timeout(PROBE_TIMEOUT).build() {
-        Ok(c) => c,
-        Err(e) => {
-            debug!(%e, "reqwest client build failed; reporting Unverified");
-            return Validity::Unverified;
-        }
-    };
+async fn probe_git(
+    client: &reqwest::Client,
+    repo_url: &str,
+    username: &str,
+    password: &str,
+) -> Validity {
     let url = git_info_refs_url(repo_url);
     match client
         .get(&url)
@@ -148,7 +198,12 @@ fn registry_validity_from_error(err: &oci_client::errors::OciDistributionError) 
 /// `oci-distribution` performs the `/v2/` challenge → token-endpoint
 /// exchange with the supplied Basic credentials; an auth failure means
 /// the credential is rejected, any other error is inconclusive.
-async fn probe_registry(image: &str, username: &str, password: &str) -> Validity {
+async fn probe_registry(
+    client: &OciClient,
+    image: &str,
+    username: &str,
+    password: &str,
+) -> Validity {
     let reference: Reference = match image.parse() {
         Ok(r) => r,
         Err(e) => {
@@ -157,7 +212,6 @@ async fn probe_registry(image: &str, username: &str, password: &str) -> Validity
         }
     };
     let auth = RegistryAuth::Basic(username.to_string(), password.to_string());
-    let client = OciClient::new(ClientConfig::default());
     let probe = client.list_tags(&reference, &auth, Some(1), None);
     match tokio::time::timeout(PROBE_TIMEOUT, probe).await {
         Ok(Ok(_)) => Validity::Valid,
@@ -175,11 +229,26 @@ async fn probe_registry(image: &str, username: &str, password: &str) -> Validity
     }
 }
 
+/// The configuration of the OCI client the registry probes share.
+/// `ClientConfig::default()` sets neither a connect nor a read timeout, and
+/// reqwest underneath defaults to none, so a registry that accepted the
+/// connection and then said nothing held each probe until the outer
+/// [`PROBE_TIMEOUT`] dropped it. The outer timeout stays (DNS runs on a
+/// blocking thread no reqwest timeout reaches); these bound the transport.
+fn probe_client_config() -> ClientConfig {
+    ClientConfig {
+        connect_timeout: Some(PROBE_CONNECT_TIMEOUT),
+        read_timeout: Some(PROBE_READ_TIMEOUT),
+        ..ClientConfig::default()
+    }
+}
+
 /// Collect every Argo CD `Application` `repoURL` (single `source` and
-/// multi-`sources`) covered by `normalized_prefix`. Cluster-wide list;
-/// the operator's ClusterRole already grants `argoproj.io/applications`
-/// read.
-async fn representative_repos(client: &Client, normalized_prefix: &str) -> Vec<String> {
+/// multi-`sources`) covered by any of `normalized_prefixes`, trailing slash
+/// trimmed so `…/landing` and `…/landing/` are one repo. ONE cluster-wide
+/// list for the whole half, not one per prefix; the operator's ClusterRole
+/// already grants `argoproj.io/applications` read.
+async fn representative_repos(client: &Client, normalized_prefixes: &[String]) -> Vec<String> {
     let ar = ApiResource::from_gvk(&GroupVersionKind {
         group: "argoproj.io".into(),
         version: "v1alpha1".into(),
@@ -191,7 +260,13 @@ async fn representative_repos(client: &Client, normalized_prefix: &str) -> Vec<S
     };
     let mut repos = Vec::new();
     for app in list {
-        repos.extend(matching_repo_urls(app.data.get("spec"), normalized_prefix));
+        for prefix in normalized_prefixes {
+            repos.extend(
+                matching_repo_urls(app.data.get("spec"), prefix)
+                    .into_iter()
+                    .map(|repo| repo.trim_end_matches('/').to_string()),
+            );
+        }
     }
     repos
 }
@@ -229,15 +304,18 @@ fn matching_repo_urls(spec: Option<&serde_json::Value>, normalized_prefix: &str)
 }
 
 /// Collect every AppRafter `Application` image (base + environments)
-/// covered by `host_prefix`.
-async fn representative_images(client: &Client, host_prefix: &str) -> Vec<String> {
+/// covered by any of `host_prefixes` — ONE cluster-wide list for the whole
+/// half.
+async fn representative_images(client: &Client, host_prefixes: &[String]) -> Vec<String> {
     let api: Api<Application> = Api::all(client.clone());
     let Ok(list) = api.list(&ListParams::default()).await else {
         return Vec::new();
     };
     let mut images = Vec::new();
     for app in list {
-        images.extend(matching_images(&app, host_prefix));
+        for host in host_prefixes {
+            images.extend(matching_images(&app, host));
+        }
     }
     images
 }
@@ -269,24 +347,185 @@ fn matching_images(app: &Application, host_prefix: &str) -> Vec<String> {
         .collect()
 }
 
-/// Probe the git half: for each normalised prefix, find a representative
-/// repo and probe it, then aggregate. `(Validity, message)`.
+/// What one half's probes concluded within its budget.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct HalfProbe {
+    /// Verdicts of the probes that FINISHED, in completion order. A probe
+    /// the budget cut off contributes nothing — it is neither `Valid` nor
+    /// `Invalid`, which is exactly `Unverified` under [`aggregate`].
+    finished: Vec<Validity>,
+    /// Distinct representatives found; `None` when the budget ran out
+    /// before the list that finds them returned.
+    found: Option<usize>,
+    /// The budget ran out with work still outstanding.
+    expired: bool,
+}
+
+impl HalfProbe {
+    fn verdict(&self) -> Validity {
+        aggregate(&self.finished)
+    }
+
+    /// Representatives found but not answered within the budget.
+    fn unanswered(&self) -> usize {
+        self.found.unwrap_or(0).saturating_sub(self.finished.len())
+    }
+}
+
+/// Pure: `targets` without repeats, first occurrence kept. One repo named by
+/// many Argo CD `Application`s (or matched by two overlapping prefixes), or
+/// one image shared by several environments, is probed once — the answer
+/// cannot differ, and every repeat used to cost a full probe.
+fn distinct(targets: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    targets
+        .into_iter()
+        .filter(|target| seen.insert(target.clone()))
+        .collect()
+}
+
+/// Pure: the host a representative lives on — the authority of a repo URL
+/// (`https://github.com/acme/landing` → `github.com`), the registry of an
+/// image reference (`ghcr.io/acme/app:v1` → `ghcr.io`). The port is part of
+/// it: two ports are two servers.
+fn host_of(target: &str) -> &str {
+    let rest = target.split_once("://").map_or(target, |(_, rest)| rest);
+    rest.split_once('/').map_or(rest, |(host, _)| host)
+}
+
+/// Pure: `targets` reordered so their hosts take turns — the first
+/// representative of every host (hosts in the order they first appear), then
+/// the second of every host, and so on; each host keeps its own list order.
+/// Every host's first representative starts before any host's second, so one
+/// silent host can no longer keep the others from being asked.
+fn by_host_in_turn(targets: Vec<String>) -> Vec<String> {
+    let total = targets.len();
+    let mut hosts: Vec<(String, Vec<String>)> = Vec::new();
+    for target in targets {
+        let host = host_of(&target).to_string();
+        match hosts.iter_mut().find(|(seen, _)| *seen == host) {
+            Some((_, queue)) => queue.push(target),
+            None => hosts.push((host, vec![target])),
+        }
+    }
+    let mut queues: Vec<_> = hosts
+        .into_iter()
+        .map(|(_, queue)| queue.into_iter())
+        .collect();
+    let mut ordered = Vec::with_capacity(total);
+    while ordered.len() < total {
+        for queue in &mut queues {
+            ordered.extend(queue.next());
+        }
+    }
+    ordered
+}
+
+/// Find a half's representatives and probe each distinct one,
+/// [`PROBE_CONCURRENCY`] at a time with the hosts taking turns
+/// ([`by_host_in_turn`]), all inside `budget`. Verdicts are gathered OUTSIDE
+/// the timed future, so when the budget runs out the probes that already
+/// answered are kept and only the unfinished ones are lost — throwing them
+/// away would turn a 401 already seen into `Unverified`.
+async fn probe_within<P, F>(
+    budget: Duration,
+    representatives: impl Future<Output = Vec<String>>,
+    probe: P,
+) -> HalfProbe
+where
+    P: Fn(String) -> F,
+    F: Future<Output = Validity>,
+{
+    let mut finished = Vec::new();
+    let mut found = None;
+    let gather = async {
+        let targets = by_host_in_turn(distinct(representatives.await));
+        found = Some(targets.len());
+        let mut verdicts = futures::stream::iter(targets)
+            .map(&probe)
+            .buffer_unordered(PROBE_CONCURRENCY);
+        while let Some(verdict) = verdicts.next().await {
+            finished.push(verdict);
+        }
+    };
+    let expired = tokio::time::timeout(budget, gather).await.is_err();
+    HalfProbe {
+        finished,
+        found,
+        expired,
+    }
+}
+
+/// Probe the git half: every distinct repo of an Argo CD `Application` under
+/// a covered prefix, within [`HALF_PROBE_BUDGET`], then aggregate.
+/// `(Validity, message)`.
 pub async fn probe_git_half(
     client: &Client,
     normalized_prefixes: &[String],
     username: &str,
     password: &str,
 ) -> (Validity, String) {
-    let mut results = Vec::new();
-    let mut probed = 0usize;
-    for prefix in normalized_prefixes {
-        for repo in representative_repos(client, prefix).await {
-            results.push(probe_git(&repo, username, password).await);
-            probed += 1;
+    if normalized_prefixes.is_empty() {
+        // Nothing is covered, so there is nothing to look up: no list.
+        return (
+            Validity::Unverified,
+            git_half_message(Validity::Unverified, 0),
+        );
+    }
+    let http = reqwest::Client::builder().timeout(PROBE_TIMEOUT).build();
+    let half = probe_within(
+        HALF_PROBE_BUDGET,
+        representative_repos(client, normalized_prefixes),
+        |repo| {
+            let http = &http;
+            async move {
+                match http {
+                    Ok(http) => probe_git(http, &repo, username, password).await,
+                    Err(e) => {
+                        debug!(%e, "reqwest client build failed; reporting Unverified");
+                        Validity::Unverified
+                    }
+                }
+            }
+        },
+    )
+    .await;
+    (half.verdict(), git_message(&half, HALF_PROBE_BUDGET))
+}
+
+/// Pure: what a half whose budget ran out did not get to. `noun` names a
+/// representative, `list` the kind whose cluster-wide list finds them.
+fn shortfall(half: &HalfProbe, budget: Duration, noun: &str, list: &str) -> String {
+    let secs = budget.as_secs();
+    match half.found {
+        None => format!("the {secs}s probe budget ran out before the {list} list returned"),
+        Some(found) => format!(
+            "{} of {found} representative {noun} did not answer within the {secs}s probe budget",
+            half.unanswered()
+        ),
+    }
+}
+
+/// Pure: the `GitValid` message for a half that ran under a budget. Inside
+/// the budget it is [`git_half_message`] unchanged. When the budget ran out,
+/// a concluded verdict keeps its wording (a `Valid` one notes what went
+/// unprobed), and an inconclusive one says the BUDGET ran out — not
+/// "restricted egress", not "nothing to probe", which are the two other
+/// states an operator has to be able to tell apart from it.
+fn git_message(half: &HalfProbe, budget: Duration) -> String {
+    let verdict = half.verdict();
+    let base = git_half_message(verdict, half.finished.len());
+    if !half.expired {
+        return base;
+    }
+    let shortfall = shortfall(half, budget, "repo(s)", "Argo CD Application");
+    match verdict {
+        Validity::Invalid => base,
+        Validity::Valid => format!("{base}; {shortfall}"),
+        Validity::Unverified => {
+            format!("git validity unverified: {shortfall}; coverage gated by presence")
         }
     }
-    let verdict = aggregate(&results);
-    (verdict, git_half_message(verdict, probed))
 }
 
 /// Pure: the `GitValid` condition message for a verdict. The two
@@ -309,24 +548,51 @@ fn git_half_message(verdict: Validity, probed: usize) -> String {
     }
 }
 
-/// Probe the registry half: for each host prefix, find a representative
-/// image and probe it, then aggregate. `(Validity, message)`.
+/// Probe the registry half: every distinct image of an AppRafter
+/// `Application` under a covered host, within [`HALF_PROBE_BUDGET`], then
+/// aggregate. `(Validity, message)`.
 pub async fn probe_registry_half(
     client: &Client,
     host_prefixes: &[String],
     username: &str,
     password: &str,
 ) -> (Validity, String) {
-    let mut results = Vec::new();
-    let mut probed = 0usize;
-    for host in host_prefixes {
-        for image in representative_images(client, host).await {
-            results.push(probe_registry(&image, username, password).await);
-            probed += 1;
+    if host_prefixes.is_empty() {
+        // Nothing is covered, so there is nothing to look up: no list.
+        return (
+            Validity::Unverified,
+            registry_half_message(Validity::Unverified, 0),
+        );
+    }
+    let oci = OciClient::new(probe_client_config());
+    let half = probe_within(
+        HALF_PROBE_BUDGET,
+        representative_images(client, host_prefixes),
+        |image| {
+            let oci = &oci;
+            async move { probe_registry(oci, &image, username, password).await }
+        },
+    )
+    .await;
+    (half.verdict(), registry_message(&half, HALF_PROBE_BUDGET))
+}
+
+/// Pure: the `RegistryValid` message for a half that ran under a budget —
+/// the registry counterpart of [`git_message`].
+fn registry_message(half: &HalfProbe, budget: Duration) -> String {
+    let verdict = half.verdict();
+    let base = registry_half_message(verdict, half.finished.len());
+    if !half.expired {
+        return base;
+    }
+    let shortfall = shortfall(half, budget, "image(s)", "Application");
+    match verdict {
+        Validity::Invalid => base,
+        Validity::Valid => format!("{base}; {shortfall}"),
+        Validity::Unverified => {
+            format!("registry validity unverified: {shortfall}; coverage gated by presence")
         }
     }
-    let verdict = aggregate(&results);
-    (verdict, registry_half_message(verdict, probed))
 }
 
 /// Pure: the `RegistryValid` condition message for a verdict. Same
@@ -859,6 +1125,506 @@ mod tests {
             message.contains("no Application renders an image"),
             "{message}"
         );
+    }
+
+    /// A registry that completes the TCP handshake and then never says a word
+    /// (a wedged registry, a proxy that swallows the request) must be cut by
+    /// the probe client's own transport timeouts. `ClientConfig::default()`
+    /// sets none and reqwest defaults to none, so before this the silent
+    /// registry held every probe for the whole outer `PROBE_TIMEOUT`.
+    #[tokio::test(start_paused = true)]
+    async fn a_registry_that_never_answers_is_cut_by_the_transport_timeouts() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        // Bound and never accepted: the kernel completes the handshake into
+        // the backlog, and nothing ever writes back.
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback port");
+        let addr = silent.local_addr().expect("loopback address");
+
+        let started = tokio::time::Instant::now();
+        let verdict = probe_registry(
+            &OciClient::new(probe_client_config()),
+            &format!("{addr}/acme/landing:v1"),
+            "acme-bot",
+            "ghp_x",
+        )
+        .await;
+        let took = started.elapsed();
+        drop(silent);
+
+        assert_eq!(verdict, Validity::Unverified);
+        assert!(
+            took < PROBE_TIMEOUT,
+            "a silent registry held the probe for {took:?}: the client's transport timeouts are not applied"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // The half budget
+    //
+    // The reconcile writes its status AFTER both halves, so a half that
+    // never ends is a credential whose status never moves. These hold each
+    // half — the cluster-wide list that finds the representatives and every
+    // probe of them — to one budget, measured on a paused clock: the 10s
+    // per-probe timeouts and the budget elapse instantly, and `elapsed()` is
+    // exact.
+    // -----------------------------------------------------------------
+
+    /// A host that completes the TCP handshake and then never says a word:
+    /// bound and never accepted, so the kernel queues the connection in the
+    /// backlog and nothing ever writes back.
+    async fn silent_host() -> (tokio::net::TcpListener, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback port");
+        let addr = listener.local_addr().expect("loopback address").to_string();
+        (listener, addr)
+    }
+
+    /// Forty covered repos on a git host that never answers. Sequentially,
+    /// at 10s each, that was 400s; the half must end at its 30s budget, as
+    /// `Unverified`, and say the budget ran out rather than blaming egress.
+    #[tokio::test(start_paused = true)]
+    async fn git_hosts_that_never_answer_end_at_the_half_budget_as_unverified() {
+        let (silent, addr) = silent_host().await;
+        let repos = (0..40)
+            .map(|i| format!("http://{addr}/acme/repo-{i}"))
+            .collect();
+        let client = apps_client(repos, vec![]);
+
+        let started = tokio::time::Instant::now();
+        let (verdict, message) = tokio::time::timeout(
+            Duration::from_secs(120),
+            probe_git_half(
+                &client,
+                &[format!("http://{addr}/acme")],
+                "acme-bot",
+                "ghp_x",
+            ),
+        )
+        .await
+        .expect("the git half must end on its own budget");
+        let took = started.elapsed();
+        drop(silent);
+
+        assert_eq!(verdict, Validity::Unverified);
+        assert!(took <= Duration::from_secs(30), "the git half ran {took:?}");
+        assert!(
+            message.contains("did not answer within the 30s probe budget"),
+            "{message}"
+        );
+    }
+
+    /// The registry half under the same silence: forty covered images on a
+    /// registry that never answers (6s each — two 3s transport waits) end at
+    /// the 30s budget as `Unverified`.
+    #[tokio::test(start_paused = true)]
+    async fn registries_that_never_answer_end_at_the_half_budget_as_unverified() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let (silent, addr) = silent_host().await;
+        let images = (0..40).map(|i| format!("{addr}/acme/app-{i}:v1")).collect();
+        let client = apps_client(vec![], images);
+
+        let started = tokio::time::Instant::now();
+        let (verdict, message) = tokio::time::timeout(
+            Duration::from_secs(120),
+            probe_registry_half(&client, &[format!("{addr}/acme/")], "acme-bot", "ghp_x"),
+        )
+        .await
+        .expect("the registry half must end on its own budget");
+        let took = started.elapsed();
+        drop(silent);
+
+        assert_eq!(verdict, Validity::Unverified);
+        assert!(
+            took <= Duration::from_secs(30),
+            "the registry half ran {took:?}"
+        );
+        assert!(
+            message.contains("did not answer within the 30s probe budget"),
+            "{message}"
+        );
+    }
+
+    /// The cluster-wide list that finds the representatives is INSIDE the
+    /// budget. An apiserver that accepts the LIST and never answers used to
+    /// hold the half for as long as the client's 295s read timeout; now the
+    /// half ends at exactly its budget, `Unverified`, and says the list never
+    /// came back.
+    #[tokio::test(start_paused = true)]
+    async fn a_representative_list_that_never_returns_ends_at_the_half_budget() {
+        let client = operator_core::testing::stalled_client();
+
+        let started = tokio::time::Instant::now();
+        let (verdict, message) = tokio::time::timeout(
+            Duration::from_secs(120),
+            probe_git_half(
+                &client,
+                &["https://github.com/acme".to_string()],
+                "git",
+                "ghp_x",
+            ),
+        )
+        .await
+        .expect("the git half must end on its own budget");
+        assert_eq!(started.elapsed(), Duration::from_secs(30));
+        assert_eq!(verdict, Validity::Unverified);
+        assert!(
+            message.contains("before the Argo CD Application list returned"),
+            "{message}"
+        );
+
+        let started = tokio::time::Instant::now();
+        let (verdict, message) = tokio::time::timeout(
+            Duration::from_secs(120),
+            probe_registry_half(&client, &["ghcr.io/acme/".to_string()], "git", "ghp_x"),
+        )
+        .await
+        .expect("the registry half must end on its own budget");
+        assert_eq!(started.elapsed(), Duration::from_secs(30));
+        assert_eq!(verdict, Validity::Unverified);
+        assert!(
+            message.contains("before the Application list returned"),
+            "{message}"
+        );
+    }
+
+    /// End to end over real sockets: a 403 from one repo, then forty repos on
+    /// a host that never answers. The budget runs out with most of them
+    /// unprobed, and the rejection already seen must still make the half
+    /// `Invalid` — a budget that discarded finished probes would report a
+    /// revoked PAT as merely unverified, and the coverage gate accepts that.
+    /// (The paused clock advances only when no task can run and no I/O is
+    /// ready; the server task's loopback write makes the 403 readable at once,
+    /// so it is read before any timer fires.)
+    #[tokio::test(start_paused = true)]
+    async fn a_rejection_seen_before_the_budget_ran_out_still_makes_the_half_invalid() {
+        let (base, serving) = local_host("403 Forbidden").await;
+        let (silent, addr) = silent_host().await;
+        let mut repos: Vec<String> = (0..40)
+            .map(|i| format!("http://{addr}/acme/repo-{i}"))
+            .collect();
+        repos.insert(0, format!("{base}/acme/landing"));
+        let client = apps_client(repos, vec![]);
+
+        let (verdict, message) = probe_git_half(
+            &client,
+            &[format!("{base}/acme"), format!("http://{addr}/acme")],
+            "acme-bot",
+            "ghp_x",
+        )
+        .await;
+        serving.abort();
+        drop(silent);
+
+        assert_eq!(verdict, Validity::Invalid, "{message}");
+        assert!(message.contains("401/403"), "{message}");
+    }
+
+    // ---- probe_within, driven by pure futures on a paused clock ----
+
+    const BUDGET: Duration = Duration::from_secs(30);
+
+    fn targets(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    /// Probes that never answer end at exactly the budget, with nothing
+    /// concluded — `Unverified`, and `expired` so the message can say why.
+    #[tokio::test(start_paused = true)]
+    async fn probes_that_never_answer_end_at_exactly_the_budget() {
+        let started = tokio::time::Instant::now();
+        // Bounded from outside as well, so a collector that ignores its
+        // budget fails here instead of hanging the test.
+        let half = tokio::time::timeout(
+            BUDGET * 4,
+            probe_within(BUDGET, async { targets(&["a", "b"]) }, |_target| {
+                std::future::pending::<Validity>()
+            }),
+        )
+        .await
+        .expect("the budget must end probes that never answer");
+
+        assert_eq!(started.elapsed(), BUDGET);
+        assert!(half.expired);
+        assert_eq!(half.found, Some(2));
+        assert!(half.finished.is_empty());
+        assert_eq!(half.unanswered(), 2);
+        assert_eq!(half.verdict(), Validity::Unverified);
+    }
+
+    /// THE property the budget must not break: a rejection that arrived
+    /// before the budget ran out still condemns the credential, even though
+    /// other probes were cut off — including one that would have said `Valid`.
+    #[tokio::test(start_paused = true)]
+    async fn a_rejection_seen_before_the_budget_ran_out_is_kept() {
+        let half = probe_within(
+            BUDGET,
+            async { targets(&["rejects", "silent", "valid-too-late"]) },
+            |target| async move {
+                match target.as_str() {
+                    "rejects" => {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        Validity::Invalid
+                    }
+                    "valid-too-late" => {
+                        tokio::time::sleep(BUDGET * 2).await;
+                        Validity::Valid
+                    }
+                    _ => std::future::pending::<Validity>().await,
+                }
+            },
+        )
+        .await;
+
+        assert!(half.expired);
+        assert_eq!(half.finished, vec![Validity::Invalid]);
+        assert_eq!(half.unanswered(), 2);
+        assert_eq!(half.verdict(), Validity::Invalid);
+    }
+
+    /// One repo named by several applications (or matched by two overlapping
+    /// prefixes) is ONE probe: the answer cannot differ, and each repeat used
+    /// to cost a full probe of the budget.
+    #[tokio::test(start_paused = true)]
+    async fn a_representative_named_many_times_is_probed_once() {
+        let probed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let half = probe_within(
+            BUDGET,
+            async { targets(&["a", "b", "a", "a", "b"]) },
+            |target| {
+                let probed = probed.clone();
+                async move {
+                    probed.lock().expect("probe log").push(target);
+                    Validity::Valid
+                }
+            },
+        )
+        .await;
+
+        let mut seen = probed.lock().expect("probe log").clone();
+        seen.sort();
+        assert_eq!(seen, targets(&["a", "b"]));
+        assert_eq!(half.found, Some(2));
+        assert!(!half.expired);
+    }
+
+    /// At most `PROBE_CONCURRENCY` probes are in flight at once, and they DO
+    /// overlap: ten 1s probes take ceil(10 / 4) = 3s, not 10s.
+    #[tokio::test(start_paused = true)]
+    async fn probes_run_concurrently_but_no_more_than_the_limit_at_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let in_flight = std::sync::Arc::new(AtomicUsize::new(0));
+        let peak = std::sync::Arc::new(AtomicUsize::new(0));
+        let names: Vec<String> = (0..10).map(|i| format!("repo-{i}")).collect();
+
+        let started = tokio::time::Instant::now();
+        let half = probe_within(BUDGET, async { names }, |_target| {
+            let in_flight = in_flight.clone();
+            let peak = peak.clone();
+            async move {
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                Validity::Valid
+            }
+        })
+        .await;
+
+        assert_eq!(peak.load(Ordering::SeqCst), PROBE_CONCURRENCY);
+        assert_eq!(half.finished.len(), 10);
+        assert_eq!(started.elapsed(), Duration::from_secs(3));
+    }
+
+    /// The list that finds the representatives is part of the budget: one
+    /// that never returns ends the half at the budget with nothing found.
+    #[tokio::test(start_paused = true)]
+    async fn a_list_that_never_returns_ends_at_the_budget_with_nothing_found() {
+        let started = tokio::time::Instant::now();
+        let half = tokio::time::timeout(
+            BUDGET * 4,
+            probe_within(
+                BUDGET,
+                std::future::pending::<Vec<String>>(),
+                |_target| async { Validity::Valid },
+            ),
+        )
+        .await
+        .expect("the budget must cover the list that finds the representatives");
+
+        assert_eq!(started.elapsed(), BUDGET);
+        assert!(half.expired);
+        assert_eq!(half.found, None);
+        assert_eq!(half.verdict(), Validity::Unverified);
+    }
+
+    /// The messages for a half whose budget ran out. An inconclusive one says
+    /// the BUDGET ran out — never "restricted egress" or "nothing to probe",
+    /// the two other `Unverified` states an operator must tell it apart from.
+    /// A concluded one keeps its verdict's wording.
+    #[test]
+    fn an_expired_budget_says_so_instead_of_blaming_egress_or_an_empty_cluster() {
+        let cut = HalfProbe {
+            finished: vec![Validity::Unverified],
+            found: Some(5),
+            expired: true,
+        };
+        let git = git_message(&cut, BUDGET);
+        assert!(
+            git.contains(
+                "4 of 5 representative repo(s) did not answer within the 30s probe budget"
+            ),
+            "{git}"
+        );
+        assert!(!git.contains("restricted egress"), "{git}");
+        assert!(!git.contains("no Argo Application references"), "{git}");
+        let registry = registry_message(&cut, BUDGET);
+        assert!(
+            registry.contains(
+                "4 of 5 representative image(s) did not answer within the 30s probe budget"
+            ),
+            "{registry}"
+        );
+        assert!(!registry.contains("restricted egress"), "{registry}");
+
+        let listless = HalfProbe {
+            finished: vec![],
+            found: None,
+            expired: true,
+        };
+        assert!(git_message(&listless, BUDGET)
+            .contains("the 30s probe budget ran out before the Argo CD Application list returned"));
+        assert!(registry_message(&listless, BUDGET)
+            .contains("the 30s probe budget ran out before the Application list returned"));
+
+        let rejected = HalfProbe {
+            finished: vec![Validity::Invalid],
+            found: Some(3),
+            expired: true,
+        };
+        assert_eq!(
+            git_message(&rejected, BUDGET),
+            git_half_message(Validity::Invalid, 1)
+        );
+        let partly_valid = HalfProbe {
+            finished: vec![Validity::Valid],
+            found: Some(3),
+            expired: true,
+        };
+        let message = git_message(&partly_valid, BUDGET);
+        assert!(
+            message.contains("reachable for 1 representative repo(s)"),
+            "{message}"
+        );
+        assert!(
+            message.contains("2 of 3 representative repo(s) did not answer"),
+            "{message}"
+        );
+    }
+
+    /// Inside the budget nothing changes: the message is exactly the one the
+    /// unbudgeted probe produced.
+    #[test]
+    fn a_half_that_finished_in_time_keeps_its_unbudgeted_message() {
+        let done = HalfProbe {
+            finished: vec![Validity::Unverified, Validity::Unverified],
+            found: Some(2),
+            expired: false,
+        };
+        assert_eq!(
+            git_message(&done, BUDGET),
+            git_half_message(Validity::Unverified, 2)
+        );
+        assert_eq!(
+            registry_message(&done, BUDGET),
+            registry_half_message(Validity::Unverified, 2)
+        );
+        let nothing = HalfProbe {
+            finished: vec![],
+            found: Some(0),
+            expired: false,
+        };
+        assert_eq!(
+            git_message(&nothing, BUDGET),
+            git_half_message(Validity::Unverified, 0)
+        );
+    }
+
+    #[test]
+    fn distinct_keeps_the_first_of_each_in_order() {
+        assert_eq!(
+            distinct(targets(&["b", "a", "b", "c", "a"])),
+            targets(&["b", "a", "c"])
+        );
+        assert!(distinct(Vec::new()).is_empty());
+    }
+
+    /// A silent host listed first must not starve the others. Ten
+    /// representatives on a host that never answers come before one on a host
+    /// that rejects the credential. In list order the first
+    /// `PROBE_CONCURRENCY` slots all went to the silent host and stayed there
+    /// until the budget ran out, so the rejection was never asked for — on
+    /// every pass, and `Unverified` passes the `present` gate. With the hosts
+    /// taking turns the rejecting host is asked in the first wave.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_host_listed_first_does_not_starve_a_rejecting_one() {
+        let mut names: Vec<String> = (0..10)
+            .map(|i| format!("https://silent.example/acme/repo-{i}"))
+            .collect();
+        names.push("https://rejects.example/acme/landing".to_string());
+
+        let half = probe_within(BUDGET, async { names }, |target| async move {
+            if target.starts_with("https://rejects.example/") {
+                Validity::Invalid
+            } else {
+                std::future::pending::<Validity>().await
+            }
+        })
+        .await;
+
+        assert!(half.expired);
+        assert_eq!(half.finished, vec![Validity::Invalid]);
+        assert_eq!(half.verdict(), Validity::Invalid);
+    }
+
+    #[test]
+    fn hosts_take_turns_and_each_keeps_its_own_order() {
+        assert_eq!(
+            by_host_in_turn(targets(&[
+                "https://github.com/acme/a",
+                "https://github.com/acme/b",
+                "https://github.com/acme/c",
+                "https://gitlab.com/acme/a",
+                "http://127.0.0.1:8080/acme/a",
+                "https://gitlab.com/acme/b",
+            ])),
+            targets(&[
+                "https://github.com/acme/a",
+                "https://gitlab.com/acme/a",
+                "http://127.0.0.1:8080/acme/a",
+                "https://github.com/acme/b",
+                "https://gitlab.com/acme/b",
+                "https://github.com/acme/c",
+            ])
+        );
+        assert_eq!(
+            by_host_in_turn(targets(&[
+                "ghcr.io/acme/a:v1",
+                "ghcr.io/acme/b:v1",
+                "quay.io/acme/a:v1",
+            ])),
+            targets(&[
+                "ghcr.io/acme/a:v1",
+                "quay.io/acme/a:v1",
+                "ghcr.io/acme/b:v1"
+            ])
+        );
+        assert_eq!(host_of("https://github.com/acme/landing"), "github.com");
+        assert_eq!(host_of("http://127.0.0.1:8080/acme/a"), "127.0.0.1:8080");
+        assert_eq!(host_of("ghcr.io/acme/app:v1"), "ghcr.io");
+        assert!(by_host_in_turn(Vec::new()).is_empty());
     }
 
     #[test]

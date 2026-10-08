@@ -12,6 +12,7 @@
 //! visible.
 
 use std::future::Future;
+use std::time::Duration;
 
 use oci_client::client::ClientConfig;
 use oci_client::secrets::RegistryAuth;
@@ -28,6 +29,35 @@ const PAGE_SIZE: usize = 100;
 /// that never signals exhaustion. At `PAGE_SIZE` tags per page this
 /// is far above any realistic platform-stack tag count.
 const MAX_PAGES: usize = 200;
+
+/// How long opening a registry connection may take: TCP and the TLS
+/// handshake together. ghcr answers in well under a second from a Tier 1
+/// node; five seconds is a dead or blackholed peer, not a slow one.
+pub const REGISTRY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long one read from an established registry connection may wait for
+/// its next bytes. It resets on every read that returns data, so it bounds a
+/// peer that went SILENT mid-answer, not a slow download; the reconcile
+/// bounds each whole question separately (`OCI_OPERATION_BUDGET`).
+pub const REGISTRY_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The client configuration every registry request in this crate uses.
+///
+/// WI-400: `ClientConfig::default()` in oci-client 0.18 sets neither
+/// `connect_timeout` nor `read_timeout`, and reqwest underneath has no
+/// default either. Its TCP keepalive and `TCP_USER_TIMEOUT` catch a peer that
+/// stops ACKing, not one that accepts the connection and never answers, so a
+/// registry in that state held the PlatformStack reconcile forever — the poll
+/// is its first `.await`, before the parent Application is read or any status
+/// written. These two bounds turn that into an ordinary registry error, which
+/// the reconcile already degrades on (`UpstreamReachable=False`).
+pub fn registry_client_config() -> ClientConfig {
+    ClientConfig {
+        connect_timeout: Some(REGISTRY_CONNECT_TIMEOUT),
+        read_timeout: Some(REGISTRY_READ_TIMEOUT),
+        ..ClientConfig::default()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Channel {
@@ -117,7 +147,7 @@ pub async fn tags_in_channel(
         OciError::InvalidReference(bare.to_string(), e.to_string())
     })?;
 
-    let client = Client::new(ClientConfig::default());
+    let client = Client::new(registry_client_config());
     let all_tags = collect_all_tags(PAGE_SIZE, |last| {
         let client = &client;
         let reference = &reference;
@@ -243,6 +273,13 @@ pub async fn latest_in_channel(upstream_url: &str, channel: Channel) -> Result<V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_registry_request_is_bounded() {
+        let config = registry_client_config();
+        assert_eq!(config.connect_timeout, Some(REGISTRY_CONNECT_TIMEOUT));
+        assert_eq!(config.read_timeout, Some(REGISTRY_READ_TIMEOUT));
+    }
 
     #[test]
     fn channel_stable_rejects_prerelease() {
@@ -498,6 +535,74 @@ mod tests {
         assert!(
             sorted.iter().any(|v| v.to_string() == "0.2.11"),
             "0.2.11 from a later page must be present"
+        );
+    }
+
+    /// A registry that accepts the TCP connection and then never says a
+    /// word — the WI-400 hang, measured at 75 s and counting before these
+    /// bounds existed. On a loopback port; nothing leaves the machine.
+    ///
+    /// The TLS handshake never completes against it, so each request gives
+    /// up at `REGISTRY_CONNECT_TIMEOUT`. oci-client sends two requests on
+    /// each path tested here, hence the `2 *` in the assertions.
+    async fn silent_registry() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        addr
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_registry_that_never_answers_fails_the_tag_listing_within_its_bounds() {
+        let addr = silent_registry().await;
+        let started = tokio::time::Instant::now();
+        let listed = tokio::time::timeout(
+            Duration::from_secs(600),
+            tags_in_channel(
+                &format!("oci://{addr}/apprafter/platform-stack"),
+                Channel::Stable,
+            ),
+        )
+        .await
+        .expect("the listing gave up on its own, well inside ten minutes");
+        let err = listed.expect_err("a registry that never answers is an error");
+        assert!(matches!(err, OciError::Registry(_)), "{err:?}");
+        assert!(
+            started.elapsed() <= 2 * REGISTRY_CONNECT_TIMEOUT,
+            "gave up after {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_registry_that_never_answers_fails_the_compatibility_pull_within_its_bounds() {
+        let addr = silent_registry().await;
+        let started = tokio::time::Instant::now();
+        let pulled = tokio::time::timeout(
+            Duration::from_secs(600),
+            crate::compatibility::fetch_compatibility_doc(
+                &format!("oci://{addr}/apprafter/platform-stack"),
+                "stable",
+            ),
+        )
+        .await
+        .expect("the pull gave up on its own, well inside ten minutes");
+        let err = pulled.expect_err("a registry that never answers is an error");
+        assert!(
+            matches!(err, crate::compatibility::CompatError::Registry(_)),
+            "{err:?}"
+        );
+        assert!(
+            started.elapsed() <= 2 * REGISTRY_CONNECT_TIMEOUT,
+            "gave up after {:?}",
+            started.elapsed()
         );
     }
 

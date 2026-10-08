@@ -79,10 +79,68 @@ const DEFAULT_DISK_STORAGE_CLASS: &str = "local-path";
 /// referenced `SharedVolume` is absent or not yet `status.ready` (2.6c).
 const REASON_AWAITING_SHARED_VOLUME: &str = "AwaitingSharedVolume";
 
+/// `Ready=False` reason while a dragonfly claim or shared cache is waiting for
+/// a `$N` of its own (WI-402). Self-clearing — the `Awaiting` prefix the Argo
+/// CD health scripts read as Progressing. A shared cache carries it from its
+/// allocation checkpoint until it has checked and flushed that number; a claim
+/// or shared cache carries it after releasing a number it found someone else
+/// holding (named in the message), until its next pass allocates another.
+pub(crate) const REASON_AWAITING_KEYSPACE: &str = "AwaitingKeyspace";
+
+/// `Ready=False` reason when a persistent reattach finds the `$N` that holds
+/// its retained data also held by something else (WI-402) — a claim, a
+/// retention snapshot or a shared database, named in the message. The
+/// allocator reserves every holder it can see, so this follows a write it
+/// could not see: a reconcile dropped mid-request whose allocation committed
+/// late. The claim keeps its number, since that number IS its retained data,
+/// and stays not ready until a person resolves the overlap; nothing is flushed
+/// and no ACL user is created on it.
+pub(crate) const REASON_DBNUM_CONFLICT: &str = "DbnumConflict";
+
 /// How many times to retry the read-modify-write of the shared Cluster's
 /// unkeyed `spec.managed.roles` list when the GET→replace races another
 /// claim's provisioner pass (HTTP 409 Conflict).
 const ROLE_RMW_RETRIES: usize = 5;
+
+/// How long the decorative refresh on a READY claim's 60s gate may run, as a
+/// whole (WI-400).
+///
+/// The refresh — the database-size scrape, the kubelet volume sample, the
+/// jetstream inventory — is best-effort by contract: every step swallows its
+/// own failure. Its proxied reads carry their own bounds
+/// (`operator_core::promscrape::SCRAPE_TIMEOUT` and
+/// `operator_core::capacity::FETCH_TIMEOUT`, 15s each), but the plain apiserver
+/// reads around them (the Node LIST, the CNPG `Cluster` GET) are bounded only
+/// by the client's 295s per-read timeout. Without this budget one of those
+/// would run the pass into the 120s reconcile deadline, which would turn "skip
+/// the figure this tick" into a timed-out reconcile, a Warning Event and a
+/// backoff on a claim that is fine.
+///
+/// 40s, so that the inner bounds fire first. A never-measured disk claim on a
+/// hung kubelet samples twice, two Node LISTs and two fetches at
+/// `FETCH_TIMEOUT`, before its own "disk usage has never been measured"
+/// warning, which names the node. A pg size miss re-scrapes once, two scrapes
+/// at `SCRAPE_TIMEOUT`. Each comes to just over 30s, so a 30s budget would cut
+/// them on every pass and replace that warning with this one. 40s is a third
+/// of the deadline. Healthy, the refresh costs milliseconds, because both
+/// proxied reads are TTL-cached. A cut costs nothing durable: the size,
+/// capacity and inventory writes it can interrupt use their own field managers
+/// and are idempotent, and a cut stream sweep resumes next tick.
+const READY_REFRESH_BUDGET: Duration = Duration::from_secs(40);
+
+/// How long `provision_disk` and `provision_shared_disk` wait for the
+/// best-effort volume sample (WI-400).
+///
+/// The sample runs BEFORE the terminal status write. Without a bound, a hung
+/// Node LIST held that write for up to the client's 295s read timeout, and
+/// under the 120s reconcile deadline it would cut the write entirely, leaving
+/// the claim unready on every pass for want of a decorative figure.
+///
+/// 20s, above `operator_core::capacity::FETCH_TIMEOUT` (15s): a hung kubelet is
+/// ended by that bound first, with a warning naming the node, so this one
+/// fires only for a hung Node LIST. A healthy sample is a Node LIST plus one
+/// cached Summary.
+const PROVISION_SAMPLE_BOUND: Duration = Duration::from_secs(20);
 
 // ---------------------------------------------------------------------------
 // NATS / jetstream (2.5d, ADR 0061)
@@ -347,6 +405,75 @@ impl Backend {
 // Public reconcile + error_policy
 // ---------------------------------------------------------------------------
 
+/// How long one claim pass may run before it is abandoned (WI-400,
+/// GOTCHA-51).
+///
+/// The claim controller runs at `concurrency(1)`, which the dbnum allocator
+/// needs, so kube-runtime holds EVERY claim's triggers while one pass is in
+/// flight. Without a deadline one hung apiserver read froze provisioning,
+/// finalizer release and the 60s ready refresh cluster-wide for up to the
+/// client's 295s per-read timeout, and for longer when the read kept
+/// trickling.
+///
+/// No pass waits in-reconcile, because every wait is a requeue. The slowest
+/// legitimate passes are these. `provision_nats` with every NATS bound hit
+/// takes about 25s, plus 10s per capture delete. A disk provision whose
+/// volume sample runs to `PROVISION_SAMPLE_BOUND` takes 20s. An owned CNPG
+/// provision behind a Postgres server that is slow but answering is the
+/// worst: its extension probe makes one call per declared extension, each
+/// capped at `pg_client::CALL_TIMEOUT` (45s), so 45s × declared extensions
+/// on top of a handful of apiserver round trips. 120s holds two extensions
+/// at that cap. A third at the cap is cut, and the cut is safe: the terminal
+/// status write comes after the probe, so the claim simply stays unready and
+/// the next pass re-applies every object with a fresh role password. 120s
+/// also ends an accepted-and-never-answered request about 2.5x sooner than
+/// the read timeout. The decorative reads cannot reach it: see
+/// `READY_REFRESH_BUDGET` and `PROVISION_SAMPLE_BOUND`.
+pub const RECONCILE_DEADLINE: Duration = Duration::from_secs(120);
+
+/// [`reconcile`] under [`RECONCILE_DEADLINE`] — what [`crate::run`] hands
+/// kube-runtime, never the unbounded reconcile.
+///
+/// A timed-out pass writes NOTHING to the claim. The provisioner owns the
+/// claim's status under [`FIELD_MANAGER`] with full-body SSA, so a
+/// `Ready=False` body would prune `instance`/`dbnum`/`connectionSecretRef`
+/// (freeing a `$N` whose ACL user is still pinned to it), and `ready=false`
+/// on a live claim would make it provision again — a `FLUSHDB` on a
+/// Dragonfly tenant, a password rotation under a running app. What it does
+/// instead:
+///
+/// - the error reaches [`error_policy`], which warns, counts
+///   `apprafter_reconcile_timeouts_total{kind="ResourceClaim"}` and backs off;
+/// - a Warning Event with reason `ReconcileTimedOut` lands on the claim;
+/// - the ACL resync loop is poked, because a pass cut after its terminal
+///   status committed never reached its own `acl_dirty.notify_one()` — a
+///   bare poke is always safe, the loop re-derives from a fresh LIST.
+///
+/// Dropping the pass also drops any `Context::dbnum_alloc` guard it held,
+/// while a checkpoint write it sent may still commit. What covers that is the
+/// re-read of every `$N` holder before each `FLUSHDB` (WI-402), not this
+/// wrapper.
+pub async fn reconcile_with_deadline(
+    claim: Arc<ResourceClaim>,
+    ctx: Arc<Context>,
+) -> Result<Action, ReconcileError> {
+    let outcome =
+        operator_core::deadline::within(RECONCILE_DEADLINE, reconcile(claim.clone(), ctx.clone()))
+            .await;
+    if let Err(ReconcileError::TimedOut(timed_out)) = &outcome {
+        ctx.acl_dirty.notify_one();
+        operator_core::deadline_event::publish(
+            &ctx.client,
+            crate::REPORTER_CONTROLLER,
+            claim.object_ref(&()),
+            KIND,
+            *timed_out,
+        )
+        .await;
+    }
+    outcome
+}
+
 /// Reconcile a single `ResourceClaim`:
 ///
 /// 1. On delete (`deletion_timestamp` set) → snapshot the claim into an
@@ -407,7 +534,14 @@ pub async fn reconcile(
             // would be false: the Secret cascades out of the cluster while
             // the login it held keeps working against the shared data.
             if claim.spec.shared_ref.is_some() {
-                crate::shared_database::revoke_consumer(&ctx, &claim, &ns, &name).await;
+                // WI-400: a revoke the server cancelled on a lock keeps the
+                // finalizer for another try; releasing it would leave the
+                // consumer's login behind (`REVOKE_LOCK_PATIENCE`).
+                if crate::shared_database::revoke_consumer(&ctx, &claim, &ns, &name).await
+                    == crate::shared_database::Revocation::RetryAfterLock
+                {
+                    return Ok(Action::requeue(crate::shared_database::REVOKE_LOCK_RETRY));
+                }
                 info!(
                     %name, %ns,
                     "shared-database consumer deleted — credential revoked, no RetainedClaim snapshot"
@@ -443,15 +577,27 @@ pub async fn reconcile(
         // is the only place a size figure can be kept current. Best-effort
         // and deadbanded — see `refresh_claim_size`.
         if status_json.pointer("/ready").and_then(Value::as_bool) == Some(true) {
-            refresh_claim_size(ctx.as_ref(), &claim, &ns, &name).await;
-            // 2.5f (ADR 0061 §5/§7): this gate is where "the provisioner
-            // resync that already lists the account's streams" actually
-            // is. A ready claim never provisions again, so a detector
-            // living only in `provision_nats` would look exactly once —
-            // at the moment a claim goes live, before there is anything
-            // to find. Best-effort; it never fails the reconcile.
-            if claim.spec.type_ == "jetstream" {
-                refresh_jetstream_claim(&ctx, &claim, &ns, &name).await;
+            let refresh = async {
+                refresh_claim_size(ctx.as_ref(), &claim, &ns, &name).await;
+                // 2.5f (ADR 0061 §5/§7): this gate is where "the provisioner
+                // resync that already lists the account's streams" actually
+                // is. A ready claim never provisions again, so a detector
+                // living only in `provision_nats` would look exactly once —
+                // at the moment a claim goes live, before there is anything
+                // to find. Best-effort; it never fails the reconcile.
+                if claim.spec.type_ == "jetstream" {
+                    refresh_jetstream_claim(&ctx, &claim, &ns, &name).await;
+                }
+            };
+            // WI-400: bounded as a whole — see `READY_REFRESH_BUDGET`.
+            if tokio::time::timeout(READY_REFRESH_BUDGET, refresh)
+                .await
+                .is_err()
+            {
+                warn!(
+                    %name, %ns, budget_secs = READY_REFRESH_BUDGET.as_secs(),
+                    "ready-claim refresh did not finish within its budget — skipped this tick"
+                );
             }
         }
         info!(%name, %ns, "not yet Scheduled (or already ready) — waiting for scheduler");
@@ -752,7 +898,15 @@ pub(crate) async fn ensure_dragonfly_instance(
     })
 }
 
-/// Error policy: increment error metrics and requeue after 30 seconds.
+/// Error policy: increment error metrics and requeue after 30 seconds — or,
+/// for a pass abandoned at [`RECONCILE_DEADLINE`], count the timeout and back
+/// off by one deadline.
+///
+/// The longer backoff is for the single slot (`concurrency(1)`): a claim
+/// that stalls on every pass would otherwise hold it 120s out of every 150s,
+/// starving every other claim; one deadline of backoff halves that. It only
+/// sets the fallback requeue — a watch event for the claim still runs it at
+/// once.
 pub fn error_policy(claim: Arc<ResourceClaim>, err: &ReconcileError, ctx: Arc<Context>) -> Action {
     let name = claim.name_any();
     let namespace = claim.namespace().unwrap_or_default();
@@ -765,6 +919,13 @@ pub fn error_policy(claim: Arc<ResourceClaim>, err: &ReconcileError, ctx: Arc<Co
         .reconcile_errors
         .with_label_values(&[KIND])
         .inc();
+    if let ReconcileError::TimedOut(timed_out) = err {
+        ctx.metrics
+            .reconcile_timeouts
+            .with_label_values(&[KIND])
+            .inc();
+        return Action::requeue(timed_out.after);
+    }
     Action::requeue(Duration::from_secs(30))
 }
 
@@ -1015,9 +1176,14 @@ async fn provision_dragonfly(
     //
     //    (a) Own-status idempotency: if THIS claim already holds an
     //        allocation on this instance (a re-reconcile after the status
-    //        landed but before the ACL/Secret steps finished), keep it. No
-    //        committed data exists yet (the claim is not `ready`), so the
-    //        recycle-safety FLUSHDB below is harmless.
+    //        landed but before the ACL/Secret steps finished), keep it. The
+    //        claim is not `ready`, but that does NOT mean the `$N` is empty:
+    //        a persistent REATTACH checkpoints the retained `$N` it is
+    //        recovering, and any failure before the terminal status write
+    //        (admin password GET, ACL SETUSER, connection Secret apply) lands
+    //        the retry here. Flushing then wipes the very data the reattach
+    //        exists to recover (WI-402). So the retry flushes only when the
+    //        checkpoint is NOT a reattach in flight — see `skip_flush` below.
     //    (b) Otherwise resolve via `resolve_allocation` (ADR 0042 §8): if a
     //        `RetainedClaim` snapshot for THIS claim is still within grace
     //        (deleted + re-created), REATTACH to its original (instance,
@@ -1041,8 +1207,30 @@ async fn provision_dragonfly(
     let object_name = cnpg::k8s_name(ns, name);
     let rc_api: Api<RetainedClaim> = Api::namespaced(ctx.client.clone(), RETAINED_CLAIM_NAMESPACE);
 
+    // WI-402: allocate under the pool-wide lock the SharedDatabase
+    // controller also takes (see `Context::dbnum_alloc`), held until the
+    // checkpoint below is answered — from then on a fresh LIST sees our
+    // number. Taken on the `existing_alloc` path too: it re-sends the same
+    // checkpoint, and one rule is easier to keep than two.
+    let alloc_guard = ctx.dbnum_alloc.lock().await;
     let (dbnum, skip_flush, reattached) = match existing_alloc {
-        Some(n) => (n, false, false),
+        // A checkpointed reattach is still in flight iff THIS claim's own
+        // snapshot still names the checkpoint's exact (instance, dbnum): the
+        // provisioner deletes that snapshot only after the terminal status
+        // write below, and the GC keeps a persistent one while this claim is
+        // mid-reattach (`gc::reattach_in_progress`), so it outlives every
+        // failed pass. Only a PERSISTENT reattach skips the flush — an
+        // ephemeral instance retains nothing (`resolve_allocation`'s
+        // `skip_flush = persistent`) — and a fresh allocation has no such
+        // snapshot and is flushed as before (recycle-safety, ADR 0042 §3).
+        // A GET error propagates: an unknown answer must not become a
+        // FLUSHDB.
+        Some(n) => {
+            let own_snapshot = rc_api.get_opt(&object_name).await?.is_some_and(|rc| {
+                rc.spec.instance.as_deref() == Some(instance.as_str()) && rc.spec.dbnum == Some(n)
+            });
+            (n, persistent && own_snapshot, own_snapshot)
+        }
         None => {
             // List live claims AND retained snapshots so the used-set
             // reserves both (Fix #2a) and we can detect a reattach.
@@ -1113,6 +1301,9 @@ async fn provision_dragonfly(
     //    status apply (step 6) re-sends instance+dbnum so SSA does not prune
     //    this checkpoint (2.6 Fix #1).
     patch_allocation(&ctx.client, ns, name, &instance, dbnum).await?;
+    // Released before any Redis I/O: a slow instance must not stall every
+    // other allocator in the cluster.
+    drop(alloc_guard);
 
     // 4. Drive the per-claim `$N` ACL user imperatively (it is runtime
     //    state, not declarable on the CR). Read the instance admin
@@ -1130,6 +1321,78 @@ async fn provision_dragonfly(
     let user = dragonfly::acl_user(ns, name);
     let claim_pw = generate_password();
 
+    // WI-402: the last read before this pass touches the keyspace. One LIST
+    // before the checkpoint does not make this `$N` ours — a reconcile
+    // dropped mid-request can commit its own checkpoint onto the same number
+    // after that LIST — so re-read every holder now, on BOTH branches: a
+    // FLUSHDB would wipe the other holder's data, and an ACL user pinned to
+    // their `$N` would read it.
+    let others = dbnum_holders_besides(
+        &ctx.client,
+        &instance,
+        dbnum,
+        dragonfly::DbnumOwner::Claim {
+            namespace: ns,
+            name,
+        },
+    )
+    .await?;
+    if !others.is_empty() {
+        // Which of two holders gives way. A number this pass was about to
+        // FLUSHDB holds nothing of this claim's own yet, so it lets go: the
+        // status apply below leaves `instance`/`dbnum` out, which prunes the
+        // checkpoint, and the next pass allocates around the other holder.
+        // Without that, two claims checkpointed on one number would each
+        // refuse forever. An ephemeral reattach also cancels its own
+        // snapshot, which retains nothing and would otherwise send the next
+        // pass straight back to this number. A persistent reattach
+        // (`skip_flush`) is the one holder that may not move — its number IS
+        // the retained data — so it re-sends its checkpoint (nothing is
+        // pruned) and refuses until a person resolves the overlap.
+        let (reason, allocation, outcome) = if skip_flush {
+            (
+                REASON_DBNUM_CONFLICT,
+                Some((instance.as_str(), dbnum)),
+                "it holds the data this claim is re-attaching to, so the claim keeps it \
+                 and stays not ready; nothing was flushed and no ACL user was created on it",
+            )
+        } else {
+            if reattached {
+                if let Err(e) = rc_api.delete(&object_name, &DeleteParams::default()).await {
+                    if !matches!(&e, kube::Error::Api(ae) if ae.code == 404) {
+                        return Err(e.into());
+                    }
+                }
+            }
+            (
+                REASON_AWAITING_KEYSPACE,
+                None,
+                "this claim had not used it yet, so it released it and takes another \
+                 number on its next attempt",
+            )
+        };
+        let message = format!(
+            "dragonfly {instance} ${dbnum} is also held by {}; {outcome}",
+            others.join(", ")
+        );
+        let prior: Vec<ResourceClaimCondition> = claim
+            .status
+            .as_ref()
+            .and_then(|s| s.conditions.clone())
+            .unwrap_or_default();
+        patch_status(
+            &ctx.client,
+            ns,
+            name,
+            ready_condition("False", reason, &message, &prior),
+            ClaimStatusFields {
+                allocation,
+                ..Default::default()
+            },
+        )
+        .await?;
+        return Err(ReconcileError::Provisioning(message));
+    }
     if skip_flush {
         info!(
             %name, %ns, %instance, dbnum,
@@ -1327,7 +1590,7 @@ async fn provision_disk(
     // makes a fraction meaningful — unlike a tenant slice of a shared
     // backend. Best-effort: an unreadable kubelet leaves capacity absent
     // rather than failing a provision that otherwise succeeded.
-    let capacity = sample_claim_volume(ctx, &pvc_name).await;
+    let capacity = sample_claim_volume_bounded(ctx, &pvc_name).await;
     patch_status(
         &ctx.client,
         ns,
@@ -1453,7 +1716,7 @@ async fn provision_shared_disk(
         &format!("bound SharedVolume {sv_name} PVC {pvc_ref}"),
         &prior,
     );
-    let capacity = sample_claim_volume(ctx, &pvc_ref).await;
+    let capacity = sample_claim_volume_bounded(ctx, &pvc_ref).await;
     patch_status(
         &ctx.client,
         ns,
@@ -2845,6 +3108,46 @@ async fn read_admin_password(
     crate::acl_reconcile::read_secret_key(ctx, df_ns, admin_secret_name, "password").await
 }
 
+/// Everything other than `me` holding `(instance, dbnum)`, read FRESH from
+/// the apiserver right before a `FLUSHDB` (WI-402). Empty = `me` holds it
+/// exclusively.
+///
+/// Fresh means three quorum LISTs (`ListParams::default()` sends no
+/// `resourceVersion`), never a cache: a stale read here does not look stale,
+/// it looks like "nobody else", and the next command wipes a keyspace. An
+/// apiserver error propagates — an unknown answer is never a "go".
+///
+/// It is the safety net under allocation only because every allocator COMMITS
+/// its number (the claim's checkpoint, the shared database's `AwaitingKeyspace`
+/// status) before it calls this, and calls this before it flushes or pins
+/// anything. Of two allocators that took one number, the later re-read then
+/// always sees the other's committed write, whatever the allocation lock
+/// (`Context::dbnum_alloc`) did: that lock is released when a reconcile future
+/// is dropped while its checkpoint may still commit, and only a read taken
+/// after the fact can see such a write.
+pub(crate) async fn dbnum_holders_besides(
+    client: &Client,
+    instance: &str,
+    dbnum: u16,
+    me: dragonfly::DbnumOwner<'_>,
+) -> Result<Vec<String>, ReconcileError> {
+    let live = Api::<ResourceClaim>::all(client.clone())
+        .list(&Default::default())
+        .await?
+        .items;
+    let retained = Api::<RetainedClaim>::namespaced(client.clone(), RETAINED_CLAIM_NAMESPACE)
+        .list(&Default::default())
+        .await?
+        .items;
+    let shared = Api::<operator_core::SharedDatabase>::all(client.clone())
+        .list(&Default::default())
+        .await?
+        .items;
+    Ok(dragonfly::other_dbnum_holders(
+        &live, &retained, &shared, instance, dbnum, me,
+    ))
+}
+
 /// SSA-patch ONLY the dragonfly allocation fields (`status.instance` /
 /// `status.dbnum`) under the provisioner field manager. Never touches
 /// `ready` / `connectionSecretRef` (step 6) or the scheduler's
@@ -3972,6 +4275,25 @@ fn figure_moved_materially(previous: Option<i64>, sample: i64, absolute: i64) ->
 /// status writer omits the field so SSA does not prune it.
 async fn sample_claim_volume(ctx: &Context, pvc_name: &str) -> Option<VolumeSample> {
     sample_claim_volume_detailed(ctx, pvc_name).await.ok()
+}
+
+/// [`sample_claim_volume`] given at most [`PROVISION_SAMPLE_BOUND`] (WI-400).
+///
+/// For the provisioning paths, where the sample precedes the terminal status
+/// write: a read that does not answer costs the provision its figure, never
+/// its write. `None` here means exactly what any other failed sample means:
+/// the field is omitted from the apply.
+async fn sample_claim_volume_bounded(ctx: &Context, pvc_name: &str) -> Option<VolumeSample> {
+    match tokio::time::timeout(PROVISION_SAMPLE_BOUND, sample_claim_volume(ctx, pvc_name)).await {
+        Ok(sample) => sample,
+        Err(_) => {
+            warn!(
+                %pvc_name, bound_secs = PROVISION_SAMPLE_BOUND.as_secs(),
+                "volume sample did not finish within its bound — writing status without it"
+            );
+            None
+        }
+    }
 }
 
 /// As [`sample_claim_volume`], but naming the stage that produced nothing.
@@ -6104,5 +6426,468 @@ mod tests {
             "ForeignSubjectCapture"
         );
         assert_eq!(body["status"]["conditions"][0]["status"], "True");
+    }
+}
+
+/// WI-400: the bounds on the claim reconcile's decorative I/O, driven
+/// through the scripted apiserver (`crate::route_apiserver`) on a paused clock.
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+    use crate::route_apiserver::{apiserver, calls_to, route, Reply, Route};
+    use operator_core::capacity::FETCH_TIMEOUT;
+    use operator_core::Metrics;
+
+    /// Longer than any bound under test, so a bound that stops cutting fails
+    /// the test instead of hanging it.
+    const OUTER_GUARD: Duration = Duration::from_secs(600);
+
+    const PROVIDERS: &str = "/apis/apprafter.io/v1alpha1/serviceproviders";
+    const NODES: &str = "/api/v1/nodes";
+    const SUMMARY: &str = "/api/v1/nodes/n1/proxy/stats/summary";
+    const DISK_STATUS: &str =
+        "/apis/apprafter.io/v1alpha1/namespaces/apps/resourceclaims/web-disk/status";
+
+    fn context(client: Client) -> Arc<Context> {
+        Arc::new(Context::new(client, Arc::new(Metrics::new())))
+    }
+
+    fn ok(body: Value) -> Reply {
+        Reply::Json(200, body)
+    }
+
+    fn not_found() -> Reply {
+        Reply::Json(
+            404,
+            json!({
+                "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                "reason": "NotFound", "code": 404, "message": "not found",
+            }),
+        )
+    }
+
+    /// One schedulable node, `n1`.
+    fn node_list() -> Reply {
+        ok(json!({
+            "apiVersion": "v1", "kind": "NodeList", "metadata": {},
+            "items": [{ "apiVersion": "v1", "kind": "Node", "metadata": { "name": "n1" } }],
+        }))
+    }
+
+    fn provider_list(provider: Value) -> Reply {
+        ok(json!({
+            "apiVersion": "apprafter.io/v1alpha1", "kind": "ServiceProviderList",
+            "metadata": {}, "items": [provider],
+        }))
+    }
+
+    fn disk_provider() -> Value {
+        json!({
+            "apiVersion": "apprafter.io/v1alpha1", "kind": "ServiceProvider",
+            "metadata": { "name": "disk-local", "namespace": "apprafter-system" },
+            "spec": { "type": "disk", "backend": "disk" },
+        })
+    }
+
+    /// The backing PVC (and RetainedClaim) name of claim `apps/web-disk`.
+    fn disk_pvc() -> String {
+        cnpg::k8s_name("apps", "web-disk")
+    }
+
+    fn scheduled() -> Value {
+        json!({
+            "type": "Scheduled", "status": "True",
+            "lastTransitionTime": "2026-10-01T00:00:00Z",
+        })
+    }
+
+    /// A disk claim the scheduler matched to `disk-local`, `status` merged in.
+    fn disk_claim(status: Value) -> Arc<ResourceClaim> {
+        let mut st = json!({ "provider": "disk-local", "conditions": [scheduled()] });
+        if let (Some(base), Some(extra)) = (st.as_object_mut(), status.as_object()) {
+            for (k, v) in extra {
+                base.insert(k.clone(), v.clone());
+            }
+        }
+        Arc::new(
+            serde_json::from_value(json!({
+                "apiVersion": "apprafter.io/v1alpha1", "kind": "ResourceClaim",
+                "metadata": {
+                    "name": "web-disk", "namespace": "apps", "uid": "u-1",
+                    "finalizers": [PROVISIONER_FINALIZER],
+                },
+                "spec": { "type": "disk", "selector": {}, "size": "1Gi" },
+                "status": st,
+            }))
+            .expect("claim fixture"),
+        )
+    }
+
+    /// A READY disk claim that has never been measured.
+    fn ready_disk_claim() -> Arc<ResourceClaim> {
+        disk_claim(json!({ "ready": true, "volumeClaimRef": disk_pvc() }))
+    }
+
+    /// The bare object an apiserver hands back from a claim write.
+    fn claim_object(name: &str, type_: &str) -> Value {
+        json!({
+            "apiVersion": "apprafter.io/v1alpha1", "kind": "ResourceClaim",
+            "metadata": { "name": name, "namespace": "apps" },
+            "spec": { "type": type_, "selector": {} },
+        })
+    }
+
+    /// Every request a disk provision makes, the volume sample's Node LIST
+    /// and kubelet Summary answered by `nodes` and `summary`.
+    fn disk_provision(nodes: Reply, summary: Reply) -> Vec<Route> {
+        vec![
+            route("GET", PROVIDERS, provider_list(disk_provider())),
+            route(
+                "PATCH",
+                format!(
+                    "/api/v1/namespaces/apps/persistentvolumeclaims/{}",
+                    disk_pvc()
+                ),
+                ok(json!({
+                    "apiVersion": "v1", "kind": "PersistentVolumeClaim",
+                    "metadata": { "name": disk_pvc(), "namespace": "apps" },
+                })),
+            ),
+            route("GET", NODES, nodes),
+            route("GET", SUMMARY, summary),
+            route("PATCH", DISK_STATUS, ok(claim_object("web-disk", "disk"))),
+            route(
+                "DELETE",
+                format!(
+                    "/apis/apprafter.io/v1alpha1/namespaces/apprafter-system/retainedclaims/{}",
+                    disk_pvc()
+                ),
+                not_found(),
+            ),
+        ]
+    }
+
+    /// A READY disk claim refreshes its capacity on the 60s gate. The Node
+    /// LIST is a plain apiserver read, which nothing below the gate bounds
+    /// but the client's 295s read timeout. Hung, the gate gives up at its
+    /// budget and the pass returns the gate's own requeue, instead of running
+    /// into the reconcile deadline.
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_node_list_on_a_ready_claim_costs_the_tick_not_the_pass() {
+        let (client, log) = apiserver(vec![route("GET", NODES, Reply::Never)]);
+
+        let started = tokio::time::Instant::now();
+        let outcome =
+            tokio::time::timeout(OUTER_GUARD, reconcile(ready_disk_claim(), context(client)))
+                .await
+                .expect("the ready gate must not hang");
+
+        assert_eq!(
+            outcome.expect("the gate never fails"),
+            Action::requeue(Duration::from_secs(60))
+        );
+        assert_eq!(started.elapsed(), READY_REFRESH_BUDGET);
+        let methods: Vec<String> = log
+            .lock()
+            .expect("log")
+            .iter()
+            .map(|c| c.method.clone())
+            .collect();
+        assert_eq!(methods, vec!["GET"], "the refresh wrote nothing");
+    }
+
+    /// A hung KUBELET on the same gate is pg-bounds' to end. A never-measured
+    /// claim samples twice, the second time for the reason, and each fetch
+    /// gives up at `FETCH_TIMEOUT`. The budget leaves room for both, so the
+    /// refresh ends through its own "disk usage has never been measured"
+    /// warning, which names the node, and not through the budget's generic one.
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_kubelet_on_a_never_measured_claim_reaches_its_own_warning_first() {
+        let (client, log) = apiserver(vec![
+            route("GET", NODES, node_list()),
+            route("GET", SUMMARY, Reply::Never),
+        ]);
+
+        let started = tokio::time::Instant::now();
+        let outcome =
+            tokio::time::timeout(OUTER_GUARD, reconcile(ready_disk_claim(), context(client)))
+                .await
+                .expect("the ready gate must not hang");
+
+        assert_eq!(
+            outcome.expect("the gate never fails"),
+            Action::requeue(Duration::from_secs(60))
+        );
+        assert_eq!(started.elapsed(), FETCH_TIMEOUT * 2);
+        assert_eq!(
+            calls_to(&log, "GET", SUMMARY).len(),
+            2,
+            "sampled, then sampled again for the reason"
+        );
+        assert!(calls_to(&log, "PATCH", DISK_STATUS).is_empty());
+    }
+
+    /// The disk arm samples its volume BEFORE its terminal status write. A
+    /// Node LIST that never answers is cut at `PROVISION_SAMPLE_BOUND`, and
+    /// the write lands without a capacity figure.
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_node_list_does_not_hold_the_disk_claims_terminal_write() {
+        let (client, log) = apiserver(disk_provision(Reply::Never, Reply::Never));
+
+        let started = tokio::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            OUTER_GUARD,
+            reconcile(disk_claim(json!({})), context(client)),
+        )
+        .await
+        .expect("a hung sample must not hold the provision");
+
+        assert_eq!(
+            outcome.expect("provisioned"),
+            Action::requeue(Duration::from_secs(300))
+        );
+        assert_eq!(started.elapsed(), PROVISION_SAMPLE_BOUND);
+        let writes = calls_to(&log, "PATCH", DISK_STATUS);
+        assert_eq!(writes.len(), 1, "the terminal status write landed once");
+        let status = &writes[0].body["status"];
+        assert_eq!(status["ready"], json!(true));
+        assert_eq!(status["volumeClaimRef"], json!(disk_pvc()));
+        assert!(
+            status.get("capacity").is_none(),
+            "no figure was sampled, so none is claimed: {status}"
+        );
+    }
+
+    /// A hung kubelet on the same path ends at its OWN bound, `FETCH_TIMEOUT`,
+    /// whose warning names the node, before `PROVISION_SAMPLE_BOUND` would.
+    /// The outer bound is there for the Node LIST.
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_kubelet_on_a_disk_provision_gives_up_at_its_own_fetch_timeout() {
+        let (client, log) = apiserver(disk_provision(node_list(), Reply::Never));
+
+        let started = tokio::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            OUTER_GUARD,
+            reconcile(disk_claim(json!({})), context(client)),
+        )
+        .await
+        .expect("a hung kubelet must not hold the provision");
+
+        assert_eq!(
+            outcome.expect("provisioned"),
+            Action::requeue(Duration::from_secs(300))
+        );
+        assert_eq!(started.elapsed(), FETCH_TIMEOUT);
+        assert_eq!(calls_to(&log, "PATCH", DISK_STATUS).len(), 1);
+    }
+
+    /// The same bound on the `shared-disk` bind arm, which also samples before
+    /// its terminal write.
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_node_list_does_not_hold_a_shared_disk_bind() {
+        let shared_status =
+            "/apis/apprafter.io/v1alpha1/namespaces/apps/resourceclaims/web-shared/status";
+        let (client, log) = apiserver(vec![
+            route(
+                "GET",
+                PROVIDERS,
+                provider_list(json!({
+                    "apiVersion": "apprafter.io/v1alpha1", "kind": "ServiceProvider",
+                    "metadata": { "name": "shared-local", "namespace": "apprafter-system" },
+                    "spec": { "type": "shared-disk", "backend": "shared-disk" },
+                })),
+            ),
+            route(
+                "GET",
+                "/apis/apprafter.io/v1alpha1/namespaces/apps/sharedvolumes/data",
+                ok(json!({
+                    "apiVersion": "apprafter.io/v1alpha1", "kind": "SharedVolume",
+                    "metadata": { "name": "data", "namespace": "apps" },
+                    "spec": { "size": "1Gi" },
+                    "status": { "ready": true, "pvcRef": "sv-apps-data" },
+                })),
+            ),
+            route("GET", NODES, Reply::Never),
+            route(
+                "PATCH",
+                shared_status,
+                ok(claim_object("web-shared", "shared-disk")),
+            ),
+        ]);
+        let claim: Arc<ResourceClaim> = Arc::new(
+            serde_json::from_value(json!({
+                "apiVersion": "apprafter.io/v1alpha1", "kind": "ResourceClaim",
+                "metadata": {
+                    "name": "web-shared", "namespace": "apps", "uid": "u-2",
+                    "finalizers": [PROVISIONER_FINALIZER],
+                    "labels": { "apprafter.io/shared-volume": "data" },
+                },
+                "spec": { "type": "shared-disk", "selector": {} },
+                "status": { "provider": "shared-local", "conditions": [scheduled()] },
+            }))
+            .expect("claim fixture"),
+        );
+
+        let started = tokio::time::Instant::now();
+        let outcome = tokio::time::timeout(OUTER_GUARD, reconcile(claim, context(client)))
+            .await
+            .expect("a hung sample must not hold the bind");
+
+        assert_eq!(
+            outcome.expect("bound"),
+            Action::requeue(Duration::from_secs(300))
+        );
+        assert_eq!(started.elapsed(), PROVISION_SAMPLE_BOUND);
+        assert_eq!(
+            calls_to(&log, "PATCH", shared_status).len(),
+            1,
+            "the terminal status write landed"
+        );
+    }
+
+    /// What an apiserver hands back from an Event create.
+    fn created_event() -> Reply {
+        Reply::Json(
+            201,
+            json!({
+                "apiVersion": "events.k8s.io/v1", "kind": "Event",
+                "metadata": { "name": "web-disk.1", "namespace": "apps" },
+            }),
+        )
+    }
+
+    /// A pass that never returns is abandoned at the deadline and comes back
+    /// as the controller's own `TimedOut` error. Every request hangs here,
+    /// the Event publish included, so the wrapper returns one publish bound
+    /// later, and no later.
+    #[tokio::test(start_paused = true)]
+    async fn a_claim_pass_that_never_returns_is_abandoned_at_the_deadline() {
+        let ctx = context(operator_core::testing::stalled_client());
+        let claim: Arc<ResourceClaim> = Arc::new(
+            serde_json::from_value(json!({
+                "apiVersion": "apprafter.io/v1alpha1", "kind": "ResourceClaim",
+                "metadata": { "name": "web-pg", "namespace": "apps", "uid": "u-3" },
+                "spec": { "type": "pg", "selector": {} },
+            }))
+            .expect("claim fixture"),
+        );
+
+        let started = tokio::time::Instant::now();
+        let outcome =
+            tokio::time::timeout(RECONCILE_DEADLINE * 2, reconcile_with_deadline(claim, ctx))
+                .await
+                .expect("the deadline must end the pass");
+
+        match outcome {
+            Err(ReconcileError::TimedOut(t)) => assert_eq!(t.after, RECONCILE_DEADLINE),
+            other => panic!("expected TimedOut, got {other:?}"),
+        }
+        assert_eq!(
+            started.elapsed(),
+            RECONCILE_DEADLINE + operator_core::deadline_event::PUBLISH_BOUND
+        );
+    }
+
+    /// THE property of the timeout path: it writes nothing to the claim's
+    /// status. The pass is cut mid-provision (PVC apply sent, never
+    /// answered), and the only request after the cut is the Warning Event.
+    /// A `Ready=False` here, under the provisioner's field manager, would
+    /// prune the allocation a Dragonfly claim checkpointed and make a live
+    /// claim provision again.
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_claim_pass_writes_no_status() {
+        let (client, log) = apiserver(vec![
+            route("GET", PROVIDERS, provider_list(disk_provider())),
+            route(
+                "PATCH",
+                format!(
+                    "/api/v1/namespaces/apps/persistentvolumeclaims/{}",
+                    disk_pvc()
+                ),
+                Reply::Never,
+            ),
+            route(
+                "POST",
+                "/apis/events.k8s.io/v1/namespaces/apps/events",
+                created_event(),
+            ),
+        ]);
+
+        let outcome = tokio::time::timeout(
+            RECONCILE_DEADLINE * 2,
+            reconcile_with_deadline(disk_claim(json!({})), context(client)),
+        )
+        .await
+        .expect("the deadline must end the pass");
+        assert!(
+            matches!(outcome, Err(ReconcileError::TimedOut(_))),
+            "{outcome:?}"
+        );
+
+        let log = log.lock().expect("log").clone();
+        assert!(
+            !log.iter().any(|c| c.path.ends_with("/status")),
+            "a timed-out pass must not touch status: {log:#?}"
+        );
+        let methods: Vec<&str> = log.iter().map(|c| c.method.as_str()).collect();
+        assert_eq!(methods, vec!["GET", "PATCH", "POST"], "{log:#?}");
+        assert_eq!(log[2].body["reason"], json!("ReconcileTimedOut"));
+        assert_eq!(log[2].body["regarding"]["name"], json!("web-disk"));
+        assert_eq!(
+            log[2].body["reportingController"],
+            json!("apprafter-resourceclaim-provisioner")
+        );
+    }
+
+    /// A cut can land after a terminal status committed but before the pass
+    /// reached `acl_dirty.notify_one()`, which would leave the ACL file a
+    /// full resync tick behind. The wrapper pokes the loop on every timeout.
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_claim_pass_pokes_the_acl_resync() {
+        let ctx = context(operator_core::testing::stalled_client());
+        let outcome = tokio::time::timeout(
+            RECONCILE_DEADLINE * 2,
+            reconcile_with_deadline(disk_claim(json!({})), ctx.clone()),
+        )
+        .await
+        .expect("the deadline must end the pass");
+        assert!(matches!(outcome, Err(ReconcileError::TimedOut(_))));
+
+        tokio::time::timeout(Duration::from_millis(1), ctx.acl_dirty.notified())
+            .await
+            .expect("the timeout path stores a wake-up for the ACL resync loop");
+    }
+
+    #[tokio::test]
+    async fn error_policy_counts_a_timeout_and_backs_off_one_deadline() {
+        let ctx = context(operator_core::testing::stalled_client());
+        let claim = disk_claim(json!({}));
+        let timed_out = ReconcileError::TimedOut(operator_core::deadline::ReconcileTimedOut {
+            after: RECONCILE_DEADLINE,
+        });
+
+        let action = error_policy(claim.clone(), &timed_out, ctx.clone());
+        assert_eq!(action, Action::requeue(RECONCILE_DEADLINE));
+        let timeouts = || {
+            ctx.metrics
+                .reconcile_timeouts
+                .with_label_values(&[KIND])
+                .get()
+        };
+        assert_eq!(timeouts(), 1.0);
+
+        let other = ReconcileError::Provisioning("refused".into());
+        assert_eq!(
+            error_policy(claim, &other, ctx.clone()),
+            Action::requeue(Duration::from_secs(30))
+        );
+        assert_eq!(timeouts(), 1.0, "only a timeout counts as one");
+        assert_eq!(
+            ctx.metrics
+                .reconcile_errors
+                .with_label_values(&[KIND])
+                .get(),
+            2.0
+        );
     }
 }

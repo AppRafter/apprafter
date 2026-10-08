@@ -24,6 +24,7 @@ pub mod compatibility;
 pub mod desired;
 pub mod oci;
 pub mod reconcile;
+pub mod stall;
 pub mod status;
 
 /// SSA field manager for every patch this controller emits. The
@@ -33,6 +34,11 @@ pub mod status;
 /// non-`platform-controller` write to `spec.source.targetRevision`
 /// or `spec.source.helm.valuesObject` is treated as an unauthorized
 /// modification (see `reconcile::detect_outside_writer`).
+///
+/// One condition on the stack's own status is not this manager's:
+/// `ReconcileStalled`, which `stall::STALL_FIELD_MANAGER` sets and removes
+/// (WI-400). `status.conditions` is a list-map keyed by `type`, so the two
+/// managers' applies merge by key instead of replacing each other's.
 pub const FIELD_MANAGER: &str = "platform-controller";
 
 /// PlatformStack singleton coordinates per webhook contract

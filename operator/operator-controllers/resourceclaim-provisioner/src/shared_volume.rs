@@ -35,12 +35,14 @@ use tracing::{info, warn};
 
 use operator_core::matching::{select_provider, Candidate};
 use operator_core::{
-    ResourceClaim, ServiceProvider, SharedVolume, SharedVolumeCondition, COND_CAPACITY_WARNING,
+    ResourceClaim, ServiceProvider, SharedVolume, SharedVolumeCondition, SharedVolumeStatus,
+    COND_CAPACITY_WARNING,
 };
 
 use crate::{Context, ReconcileError, FIELD_MANAGER};
 use operator_core::capacity::{
-    is_volume_warning, pvc_usage, should_emit_event, DEFAULT_VOLUME_FULL_THRESHOLD,
+    is_volume_warning, pvc_usage, should_emit_event, DEFAULT_VOLUME_FULL_THRESHOLD, SCOPE_HOST,
+    SCOPE_VOLUME,
 };
 
 /// The `ServiceProvider.spec.type` a `SharedVolume` binds to. There is no
@@ -62,6 +64,25 @@ const EVENT_REPORTER_CONTROLLER: &str = "apprafter-resourceclaim-provisioner";
 /// is unowned (no `ownerReferences`), so without this finalizer the PVC
 /// would leak when the CR is deleted.
 const SV_PVC_FINALIZER: &str = "apprafter.io/sharedvolume-pvc-cleanup";
+
+/// How long the decorative capacity sample — the Node LIST and the kubelet
+/// Summary through the node proxy — may take before this pass stops waiting
+/// for it (WI-400).
+///
+/// It runs BEFORE the terminal status write, so without a bound of its own a
+/// wedged kubelet holds that write hostage: the reconcile deadline would cut
+/// the whole pass and `refCount` — what `volume rm` reads — would stop moving
+/// for every SharedVolume, this controller running one reconcile at a time.
+/// Under [`operator_core::capacity::FETCH_TIMEOUT`] (15s, the kubelet call
+/// alone) so it also covers the Node LIST and fires first; far under the
+/// SharedVolume reconcile deadline (60s). On expiry the figure on the object
+/// is carried forward ([`carried_capacity`]), never dropped.
+pub const CAPACITY_SAMPLE_BUDGET: Duration = Duration::from_secs(10);
+
+/// How long the edge-triggered `CapacityWarning` Event publish may take
+/// (WI-400). It runs before the terminal status write (step 8 of
+/// [`reconcile_shared_volume`]), so it must not be able to hold that write.
+const CAPACITY_EVENT_BOUND: Duration = Duration::from_secs(5);
 
 /// StorageClass the SharedVolume backend falls back to when the matched
 /// `shared-disk` ServiceProvider config omits `/storageClass`.
@@ -293,6 +314,67 @@ pub fn capacity_warning_condition(
     }
 }
 
+/// The capacity figure the object already reports, for a pass whose sample
+/// did not answer within [`CAPACITY_SAMPLE_BUDGET`].
+///
+/// A sample that never answered says nothing about the volume, and dropping
+/// the figure is not a neutral "unknown" here: the terminal status apply is
+/// the whole field-set of [`crate::FIELD_MANAGER`], so an omitted
+/// `status.capacity` is PRUNED — and the `CapacityWarning` with it, which also
+/// re-arms the edge trigger, so a kubelet that keeps landing near the budget
+/// would raise a fresh Warning Event every time it recovered. Carried forward,
+/// the figure reads as it did before the pass, and the condition beside it
+/// ([`carried_capacity_condition`]) says it was not re-measured.
+///
+/// (A sample that ANSWERED with nothing usable still drops the figure, as
+/// before — that is a finding, not a missing answer.)
+pub fn carried_capacity(status: Option<&SharedVolumeStatus>) -> Option<SvCapacity> {
+    let capacity = status?.capacity.as_ref()?;
+    Some(SvCapacity {
+        used: capacity.used_bytes?,
+        cap: capacity.capacity_bytes?,
+        scope: match capacity.scope.as_deref() {
+            Some(SCOPE_HOST) => Some(SCOPE_HOST),
+            Some(SCOPE_VOLUME) => Some(SCOPE_VOLUME),
+            _ => None,
+        },
+    })
+}
+
+/// What a carried `CapacityWarning` message ends with: the figure beside it
+/// was not measured on this pass.
+fn not_remeasured_note() -> String {
+    format!(
+        " — not re-measured: the kubelet did not answer within {}s",
+        CAPACITY_SAMPLE_BUDGET.as_secs()
+    )
+}
+
+/// The `CapacityWarning` condition the object already carries, for the same
+/// pass as [`carried_capacity`] and for the same reason, with its message
+/// saying that the figure was not re-measured.
+///
+/// Status, reason and `lastTransitionTime` stay as they were. Changing any of
+/// them would describe the kubelet rather than the volume, and a warning that
+/// stopped being `True` would re-arm the edge trigger. Only the message
+/// changes, so the age of the figure shows on the object (and in `apprafter
+/// volume status`, which prints the message while the warning is up) rather
+/// than only in a log line. Carried again on the next miss, the message does
+/// not grow: the note is replaced, never appended twice.
+pub fn carried_capacity_condition(
+    previous: &[SharedVolumeCondition],
+) -> Option<SharedVolumeCondition> {
+    let mut carried = previous
+        .iter()
+        .find(|c| c.type_ == COND_CAPACITY_WARNING)
+        .cloned()?;
+    let note = not_remeasured_note();
+    let measured = carried.message.as_deref().unwrap_or_default();
+    let measured = measured.strip_suffix(note.as_str()).unwrap_or(measured);
+    carried.message = Some(format!("{measured}{note}"));
+    Some(carried)
+}
+
 /// Whether the `previous` conditions show `CapacityWarning=True` (the prior
 /// state used to edge-trigger the Warning Event).
 pub fn was_capacity_warning(previous: &[SharedVolumeCondition]) -> bool {
@@ -342,6 +424,102 @@ fn apply_params() -> PatchParams {
 // Async reconcile + error_policy
 // ---------------------------------------------------------------------------
 
+/// How long a SharedVolume delete holds its finalizer after a failed pass of
+/// the same volume, so a PVC apply that pass left in flight cannot land after
+/// the finalizer is gone (WI-400).
+///
+/// The race: pass R1 sends the PVC server-side apply and is abandoned — the
+/// reconcile deadline, or an apiserver 504 whose write still commits. A
+/// deletion held during R1 runs R2 the moment the slot frees; R2's PVC DELETE
+/// answers 404 and it releases the finalizer. R1's apply then commits and
+/// CREATES the PVC — unowned by design, and with the SharedVolume gone
+/// nothing ever reconciles or reaps it again.
+///
+/// A request the apiserver has accepted either commits or is abandoned
+/// within its own request timeout (`--request-timeout`, 60s by default on
+/// every tier we ship), so after a failed pass the delete deletes the PVC,
+/// waits this long, deletes it again, and only then releases. 5s of margin
+/// over the 60s. A delete with no recent failure releases at once, as before.
+pub(crate) const DELETE_SETTLE: Duration = Duration::from_secs(65);
+
+/// Record that a non-deleting pass of `ns/name` failed and may have left
+/// its PVC apply in flight. Records older than [`DELETE_SETTLE`] are dropped
+/// on the way in, so the map holds at most the volumes that failed in the
+/// last 65 seconds.
+pub(crate) fn note_unsettled(ctx: &Context, ns: &str, name: &str) {
+    let now = tokio::time::Instant::now();
+    if let Ok(mut unsettled) = ctx.sv_unsettled.lock() {
+        unsettled.retain(|_, failed_at| now.duration_since(*failed_at) < DELETE_SETTLE);
+        unsettled.insert((ns.to_string(), name.to_string()), now);
+    }
+}
+
+/// How much longer a delete of `ns/name` must hold its finalizer, or `None`
+/// when it may release now — in which case the record is forgotten.
+fn settle_remaining(ctx: &Context, ns: &str, name: &str) -> Option<Duration> {
+    let mut unsettled = ctx.sv_unsettled.lock().ok()?;
+    let key = (ns.to_string(), name.to_string());
+    let failed_at = *unsettled.get(&key)?;
+    let elapsed = failed_at.elapsed();
+    if elapsed < DELETE_SETTLE {
+        Some(DELETE_SETTLE - elapsed)
+    } else {
+        unsettled.remove(&key);
+        None
+    }
+}
+
+/// How long one SharedVolume pass may run before it is abandoned (WI-400,
+/// GOTCHA-51).
+///
+/// Short on purpose. This controller runs at `concurrency(1)`, so while one
+/// pass is in flight kube-runtime holds every SharedVolume's triggers, and
+/// `status.refCount`, the figure the `volume rm` guard reads, freezes for
+/// all of them. A healthy pass is about six apiserver round trips and
+/// sub-second. The worst first pass: three writes (the finalizer add, the
+/// PVC apply and the status write) at a slow-but-healthy 10s each, the
+/// admission webhook included; the provider and claim LISTs fast; the
+/// capacity sample at `CAPACITY_SAMPLE_BUDGET` (10s) and the Event at
+/// `CAPACITY_EVENT_BOUND` (5s). That comes to about 45s, and a steady-state
+/// pass skips the finalizer write. 60s also ends an accepted-and-never-
+/// answered request about 5x sooner than the client's 295s read timeout.
+pub const RECONCILE_DEADLINE: Duration = Duration::from_secs(60);
+
+/// [`reconcile_shared_volume`] under [`RECONCILE_DEADLINE`] — what
+/// [`crate::run`] hands kube-runtime, never the unbounded reconcile.
+///
+/// A timed-out pass writes nothing to the SharedVolume's status — under
+/// [`crate::FIELD_MANAGER`] a partial body would prune `refCount`, `pvcRef`,
+/// `capacity` and both conditions. It reaches [`error_policy_sv`], which
+/// warns, counts `apprafter_reconcile_timeouts_total{kind="SharedVolume"}`
+/// and backs off, and it leaves a `ReconcileTimedOut` Warning Event on the
+/// volume. Any failed non-deleting pass, timed out or not, is also noted for
+/// [`DELETE_SETTLE`].
+pub async fn reconcile_shared_volume_with_deadline(
+    sv: Arc<SharedVolume>,
+    ctx: Arc<Context>,
+) -> Result<Action, ReconcileError> {
+    let outcome = operator_core::deadline::within(
+        RECONCILE_DEADLINE,
+        reconcile_shared_volume(sv.clone(), ctx.clone()),
+    )
+    .await;
+    if outcome.is_err() && sv.metadata.deletion_timestamp.is_none() {
+        note_unsettled(&ctx, &sv.namespace().unwrap_or_default(), &sv.name_any());
+    }
+    if let Err(ReconcileError::TimedOut(timed_out)) = &outcome {
+        operator_core::deadline_event::publish(
+            &ctx.client,
+            crate::REPORTER_CONTROLLER,
+            sv.object_ref(&()),
+            KIND,
+            *timed_out,
+        )
+        .await;
+    }
+    outcome
+}
+
 /// Reconcile a single `SharedVolume`:
 ///
 /// 1. On delete (`deletion_timestamp` set) → delete the backing PVC
@@ -377,6 +555,16 @@ pub async fn reconcile_shared_volume(
                 if !matches!(&e, kube::Error::Api(ae) if ae.code == 404) {
                     return Err(e.into());
                 }
+            }
+            // WI-400: a recent failed pass may still land its PVC apply after
+            // this DELETE; release only once it cannot (`DELETE_SETTLE`).
+            if let Some(wait) = settle_remaining(&ctx, &ns, &name) {
+                info!(
+                    %name, %ns, %pvc_name, wait_secs = wait.as_secs(),
+                    "SharedVolume deleted after a failed pass — holding the finalizer until \
+                     that pass's PVC apply can no longer land"
+                );
+                return Ok(Action::requeue(wait));
             }
             info!(%name, %ns, %pvc_name, "SharedVolume deleted — dropped backing PVC; releasing finalizer");
             set_finalizers(&ctx.client, &ns, &name, without_finalizer(&finalizers)).await?;
@@ -446,111 +634,137 @@ pub async fn reconcile_shared_volume(
     // 5. Count the reference-ResourceClaims bound to this volume.
     let ref_count = current_ref_count(&ctx.client, &ns, &name).await?;
 
-    // 6. Sample capacity via the kubelet Summary API (BEST-EFFORT — any
-    //    failure leaves `capacity = None` + no CapacityWarning, NEVER fails
-    //    the reconcile). On single-node T1 the local-path PVC lives on the
-    //    one node, so we sample the first node's kubelet for both the
-    //    node-free fraction (warning trigger) and the PVC's own used/cap.
-    let summary = match first_node_name(&ctx.client).await {
-        Some(node) => ctx.capacity.summary_for_node(&ctx.client, &node).await,
-        None => None,
-    };
-    let capacity: Option<(i64, i64)> = summary.as_ref().and_then(|s| pvc_usage(s, &pvc_name));
-    // D29: the same figure carries the same ambiguity here as on a disk claim
-    // — a local-path PV makes the kubelet report the backing filesystem, so
-    // these can be the node's numbers wearing the volume's name. Decided from
-    // THIS summary, so the two readings cannot be a poll apart.
-    let sv_capacity: Option<SvCapacity> = capacity.map(|(used, cap)| SvCapacity {
-        used,
-        cap,
-        scope: summary.as_ref().map(|s| {
-            operator_core::capacity::capacity_scope(
-                cap,
-                operator_core::capacity::node_fs_capacity(s),
-            )
-        }),
-    });
-
-    // 2.22d (D8): `CapacityWarning` on a SharedVolume now means THE VOLUME.
-    //
-    // It used to be derived from the NODE's free fraction, so a condition
-    // named for a volume reported something else entirely — and the volume's
-    // own usage, which the sampler above has always collected, was written to
-    // `status.capacity` and never thresholded. A volume at 99% of its own
-    // request on a healthy node said nothing.
-    //
-    // The node signal has not been dropped; it moved to where it belongs, as
-    // `NodeDiskPressure` on the PlatformStack singleton, which every cluster
-    // has whether or not it has a SharedVolume.
-    let now_warning = capacity
-        .and_then(|(used, cap)| is_volume_warning(used, cap, DEFAULT_VOLUME_FULL_THRESHOLD))
-        .unwrap_or(false);
-
-    // 7. Write the terminal status — ready / pvcRef / refCount / capacity /
-    //    BOTH the `Ready` and (when sampled) the `CapacityWarning`
-    //    conditions, under our own field manager (never `.spec`). SSA
-    //    REPLACES the manager's field-set, so both conditions ride one body.
     let prior = sv
         .status
         .as_ref()
         .and_then(|s| s.conditions.clone())
         .unwrap_or_default();
+
+    // 6. Sample capacity via the kubelet Summary API (BEST-EFFORT — any
+    //    failure leaves `capacity = None` + no CapacityWarning, NEVER fails
+    //    the reconcile). On single-node T1 the local-path PVC lives on the
+    //    one node, so we sample the first node's kubelet for both the
+    //    node-free fraction (warning trigger) and the PVC's own used/cap.
+    //
+    //    BOUNDED by `CAPACITY_SAMPLE_BUDGET` (WI-400): a sample that does not
+    //    answer in time carries the object's own figure forward instead.
+    let sample = tokio::time::timeout(CAPACITY_SAMPLE_BUDGET, async {
+        match first_node_name(&ctx.client).await {
+            Some(node) => ctx.capacity.summary_for_node(&ctx.client, &node).await,
+            None => None,
+        }
+    })
+    .await;
+    let (sv_capacity, capacity_cond, now_warning) = match sample {
+        Ok(summary) => {
+            let capacity: Option<(i64, i64)> =
+                summary.as_ref().and_then(|s| pvc_usage(s, &pvc_name));
+            // D29: the same figure carries the same ambiguity here as on a
+            // disk claim — a local-path PV makes the kubelet report the
+            // backing filesystem, so these can be the node's numbers wearing
+            // the volume's name. Decided from THIS summary, so the two
+            // readings cannot be a poll apart.
+            let sv_capacity: Option<SvCapacity> = capacity.map(|(used, cap)| SvCapacity {
+                used,
+                cap,
+                scope: summary.as_ref().map(|s| {
+                    operator_core::capacity::capacity_scope(
+                        cap,
+                        operator_core::capacity::node_fs_capacity(s),
+                    )
+                }),
+            });
+
+            // 2.22d (D8): `CapacityWarning` on a SharedVolume now means THE
+            // VOLUME.
+            //
+            // It used to be derived from the NODE's free fraction, so a
+            // condition named for a volume reported something else entirely —
+            // and the volume's own usage, which the sampler above has always
+            // collected, was written to `status.capacity` and never
+            // thresholded. A volume at 99% of its own request on a healthy
+            // node said nothing.
+            //
+            // The node signal has not been dropped; it moved to where it
+            // belongs, as `NodeDiskPressure` on the PlatformStack singleton,
+            // which every cluster has whether or not it has a SharedVolume.
+            let now_warning = capacity
+                .and_then(|(used, cap)| is_volume_warning(used, cap, DEFAULT_VOLUME_FULL_THRESHOLD))
+                .unwrap_or(false);
+
+            // Stamped only when the volume's own usage was sampled this
+            // cycle; a sample-less cycle leaves the condition absent rather
+            // than carrying a stale value forward.
+            let capacity_cond = capacity.map(|(used, cap)| {
+                let pct_used = if cap > 0 {
+                    used as f64 / cap as f64 * 100.0
+                } else {
+                    0.0
+                };
+                if now_warning {
+                    capacity_warning_condition(
+                        "True",
+                        "VolumeNearlyFull",
+                        &format!(
+                            "volume {pct_used:.1}% full (> {:.0}% threshold) — writes will fail \
+                             when it reaches capacity",
+                            DEFAULT_VOLUME_FULL_THRESHOLD * 100.0
+                        ),
+                        &prior,
+                    )
+                } else {
+                    capacity_warning_condition(
+                        "False",
+                        "SufficientCapacity",
+                        &format!("volume {pct_used:.1}% full"),
+                        &prior,
+                    )
+                }
+            });
+            (sv_capacity, capacity_cond, now_warning)
+        }
+        Err(_elapsed) => {
+            warn!(
+                %name, %ns,
+                budget_secs = CAPACITY_SAMPLE_BUDGET.as_secs(),
+                "capacity: the kubelet sample did not answer in time — carrying the previous \
+                 figure forward"
+            );
+            (
+                carried_capacity(sv.status.as_ref()),
+                carried_capacity_condition(&prior),
+                was_capacity_warning(&prior),
+            )
+        }
+    };
+
+    // 7. Build the terminal conditions: `Ready`, plus the `CapacityWarning`
+    //    step 6 sampled or carried. Step 9 writes them.
     let ready_cond = ready_condition(
         "True",
         "Provisioned",
         &format!("provisioned PVC {pvc_name} (class {storage_class})"),
         &prior,
     );
-    // Stamped only when the volume's own usage was sampled this cycle; a
-    // sample-less cycle leaves the condition absent rather than carrying a
-    // stale value forward.
-    let capacity_cond = capacity.map(|(used, cap)| {
-        let pct_used = if cap > 0 {
-            used as f64 / cap as f64 * 100.0
-        } else {
-            0.0
-        };
-        if now_warning {
-            capacity_warning_condition(
-                "True",
-                "VolumeNearlyFull",
-                &format!(
-                    "volume {pct_used:.1}% full (> {:.0}% threshold) — writes will fail when it \
-                     reaches capacity",
-                    DEFAULT_VOLUME_FULL_THRESHOLD * 100.0
-                ),
-                &prior,
-            )
-        } else {
-            capacity_warning_condition(
-                "False",
-                "SufficientCapacity",
-                &format!("volume {pct_used:.1}% full"),
-                &prior,
-            )
-        }
-    });
-    patch_shared_volume_status_with_conditions(
-        &ctx.client,
-        &ns,
-        &name,
-        true,
-        Some(&pvc_name),
-        ref_count,
-        sv_capacity,
-        ready_cond,
-        capacity_cond,
-    )
-    .await?;
 
     // 8. Edge-triggered Warning Event on an OK→warning transition only
     //    (anti-spam). Best-effort: a publish failure is logged, not fatal.
+    //
+    //    Sent BEFORE the status write below, and bounded (WI-400). The edge
+    //    is read from the condition the object carries, and the write below
+    //    is what records the crossing — so with the Event after the write, a
+    //    pass cut between the two (the reconcile deadline, or a crash) lost
+    //    the Event for good: the next pass reads `was_warning = true`. In
+    //    this order a cut before the write repeats the Event next pass
+    //    instead; a duplicate Warning is the cheaper failure. A carried
+    //    sample (step 6) takes `now_warning` from the same condition as
+    //    `was_warning`, so it never sends one.
     let was_warning = was_capacity_warning(&prior);
     if should_emit_event(was_warning, now_warning) {
-        let pct_used = capacity
-            .map(|(u, c)| {
-                if c > 0 {
-                    u as f64 / c as f64 * 100.0
+        let pct_used = sv_capacity
+            .map(|c| {
+                if c.cap > 0 {
+                    c.used as f64 / c.cap as f64 * 100.0
                 } else {
                     0.0
                 }
@@ -567,10 +781,34 @@ pub async fn reconcile_shared_volume(
             action: "Provision".into(),
             secondary: None,
         };
-        if let Err(e) = recorder.publish(ev).await {
-            warn!(%name, %ns, error = %e, "failed to publish CapacityWarning event (continuing)");
+        match tokio::time::timeout(CAPACITY_EVENT_BOUND, recorder.publish(ev)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                warn!(%name, %ns, error = %e, "failed to publish CapacityWarning event (continuing)")
+            }
+            Err(_) => warn!(
+                %name, %ns, bound_secs = CAPACITY_EVENT_BOUND.as_secs(),
+                "CapacityWarning event publish did not answer within its bound (continuing)"
+            ),
         }
     }
+
+    // 9. Write the terminal status — ready / pvcRef / refCount / capacity /
+    //    BOTH the `Ready` and (when sampled or carried) the `CapacityWarning`
+    //    conditions, under our own field manager (never `.spec`). SSA
+    //    REPLACES the manager's field-set, so both conditions ride one body.
+    patch_shared_volume_status_with_conditions(
+        &ctx.client,
+        &ns,
+        &name,
+        true,
+        Some(&pvc_name),
+        ref_count,
+        sv_capacity,
+        ready_cond,
+        capacity_cond,
+    )
+    .await?;
 
     // SharedVolume provisioning is deliberately counted under the shared
     // `claim_provisioned_total` metric with the synthetic `shared-disk`
@@ -589,7 +827,11 @@ pub async fn reconcile_shared_volume(
 }
 
 /// Error policy for the SharedVolume controller: increment error metrics
-/// and requeue after 30 seconds (mirrors the ResourceClaim provisioner).
+/// and requeue after 30 seconds (mirrors the ResourceClaim provisioner) — or,
+/// for a pass abandoned at [`RECONCILE_DEADLINE`], count the timeout and back
+/// off by one deadline, so a volume that stalls on every pass cannot hold the
+/// controller's only slot most of the time. A watch event still runs it at
+/// once.
 pub fn error_policy_sv(sv: Arc<SharedVolume>, err: &ReconcileError, ctx: Arc<Context>) -> Action {
     let name = sv.name_any();
     let namespace = sv.namespace().unwrap_or_default();
@@ -602,6 +844,13 @@ pub fn error_policy_sv(sv: Arc<SharedVolume>, err: &ReconcileError, ctx: Arc<Con
         .reconcile_errors
         .with_label_values(&[KIND])
         .inc();
+    if let ReconcileError::TimedOut(timed_out) = err {
+        ctx.metrics
+            .reconcile_timeouts
+            .with_label_values(&[KIND])
+            .inc();
+        return Action::requeue(timed_out.after);
+    }
     Action::requeue(Duration::from_secs(30))
 }
 
@@ -1026,5 +1275,659 @@ mod tests {
         }];
         assert!(!was_capacity_warning(&cleared));
         assert!(!was_capacity_warning(&[]));
+    }
+}
+
+/// The capacity sample's bound (WI-400), driven through the real reconcile
+/// against a scripted apiserver whose kubelet proxy can be told to never
+/// answer.
+#[cfg(test)]
+mod capacity_budget_tests {
+    use super::*;
+
+    use operator_core::{Metrics, SharedVolumeCapacity, SharedVolumeSpec};
+
+    use crate::route_apiserver::{apiserver, calls_to, route, Reply, Route};
+
+    const STATUS_PATH: &str =
+        "/apis/apprafter.io/v1alpha1/namespaces/apps/sharedvolumes/data/status";
+    const SUMMARY_PATH: &str = "/api/v1/nodes/n1/proxy/stats/summary";
+    const T0: &str = "2026-09-01T00:00:00+00:00";
+
+    fn cond(type_: &str, status: &str, reason: &str) -> SharedVolumeCondition {
+        SharedVolumeCondition {
+            type_: type_.into(),
+            status: status.into(),
+            last_transition_time: T0.into(),
+            reason: Some(reason.into()),
+            message: Some(format!("{reason} as of the last sample")),
+        }
+    }
+
+    /// `apps/data`, finalizer on, last sampled 95% full with the warning up.
+    fn nearly_full_volume() -> Arc<SharedVolume> {
+        let mut sv = SharedVolume::new(
+            "data",
+            SharedVolumeSpec {
+                size: "1Gi".into(),
+                class: None,
+            },
+        );
+        sv.metadata.namespace = Some("apps".into());
+        sv.metadata.finalizers = Some(vec![SV_PVC_FINALIZER.into()]);
+        sv.status = Some(SharedVolumeStatus {
+            ready: Some(true),
+            pvc_ref: Some("sv-apps-data".into()),
+            ref_count: Some(0),
+            capacity: Some(SharedVolumeCapacity {
+                used_bytes: Some(950),
+                capacity_bytes: Some(1000),
+                scope: Some("volume".into()),
+            }),
+            conditions: Some(vec![
+                cond("Ready", "True", "Provisioned"),
+                cond(COND_CAPACITY_WARNING, "True", "VolumeNearlyFull"),
+            ]),
+        });
+        Arc::new(sv)
+    }
+
+    /// Every request the reconcile makes, with the kubelet Summary answering
+    /// `summary`.
+    fn routes(summary: Reply) -> Vec<Route> {
+        vec![
+            route(
+                "GET",
+                "/apis/apprafter.io/v1alpha1/serviceproviders",
+                Reply::Json(
+                    200,
+                    json!({
+                        "apiVersion": "apprafter.io/v1alpha1", "kind": "ServiceProviderList",
+                        "metadata": { "resourceVersion": "1" },
+                        "items": [{
+                            "apiVersion": "apprafter.io/v1alpha1", "kind": "ServiceProvider",
+                            "metadata": { "name": "shared-local", "namespace": "apprafter-system" },
+                            "spec": { "type": "shared-disk", "backend": "local-path" },
+                        }],
+                    }),
+                ),
+            ),
+            route(
+                "PATCH",
+                "/api/v1/namespaces/apps/persistentvolumeclaims/sv-apps-data",
+                Reply::Json(
+                    200,
+                    json!({
+                        "apiVersion": "v1", "kind": "PersistentVolumeClaim",
+                        "metadata": { "name": "sv-apps-data", "namespace": "apps" },
+                    }),
+                ),
+            ),
+            route(
+                "GET",
+                "/apis/apprafter.io/v1alpha1/namespaces/apps/resourceclaims",
+                Reply::Json(
+                    200,
+                    json!({
+                        "apiVersion": "apprafter.io/v1alpha1", "kind": "ResourceClaimList",
+                        "metadata": { "resourceVersion": "1" }, "items": [],
+                    }),
+                ),
+            ),
+            route(
+                "GET",
+                "/api/v1/nodes",
+                Reply::Json(
+                    200,
+                    json!({
+                        "apiVersion": "v1", "kind": "NodeList",
+                        "metadata": { "resourceVersion": "1" },
+                        "items": [{ "apiVersion": "v1", "kind": "Node", "metadata": { "name": "n1" } }],
+                    }),
+                ),
+            ),
+            route("GET", SUMMARY_PATH, summary),
+            route(
+                "PATCH",
+                STATUS_PATH,
+                Reply::Json(
+                    200,
+                    json!({
+                        "apiVersion": "apprafter.io/v1alpha1", "kind": "SharedVolume",
+                        "metadata": { "name": "data", "namespace": "apps" },
+                        "spec": { "size": "1Gi" },
+                    }),
+                ),
+            ),
+        ]
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_kubelet_that_never_answers_carries_the_previous_figure_forward() {
+        let (client, log) = apiserver(routes(Reply::Never));
+        let ctx = Arc::new(Context::new(client, Arc::new(Metrics::new())));
+        let started = tokio::time::Instant::now();
+        // Bounded from outside as well (the SharedVolume reconcile deadline),
+        // so a missing budget fails the test instead of hanging it.
+        let action = tokio::time::timeout(
+            Duration::from_secs(60),
+            reconcile_shared_volume(nearly_full_volume(), ctx),
+        )
+        .await
+        .expect("the capacity sample must not hold the reconcile")
+        .expect("a missing sample never fails the reconcile");
+
+        assert_eq!(action, Action::requeue(Duration::from_secs(300)));
+        assert_eq!(started.elapsed(), CAPACITY_SAMPLE_BUDGET);
+        assert_eq!(calls_to(&log, "GET", SUMMARY_PATH).len(), 1);
+
+        let writes = calls_to(&log, "PATCH", STATUS_PATH);
+        assert_eq!(writes.len(), 1, "{writes:?}");
+        let status = &writes[0].body["status"];
+        // Under SSA an omitted field is PRUNED: the figure and the warning
+        // must ride the write exactly as the object had them.
+        assert_eq!(
+            status["capacity"],
+            json!({ "usedBytes": 950, "capacityBytes": 1000, "scope": "volume" })
+        );
+        let warning = status["conditions"]
+            .as_array()
+            .expect("conditions")
+            .iter()
+            .find(|c| c["type"] == COND_CAPACITY_WARNING)
+            .expect("the CapacityWarning rides the write");
+        assert_eq!(warning["status"], "True");
+        assert_eq!(warning["reason"], "VolumeNearlyFull");
+        assert_eq!(warning["lastTransitionTime"], T0);
+        // …and it says the figure is the last one that answered.
+        assert_eq!(
+            warning["message"],
+            "VolumeNearlyFull as of the last sample — not re-measured: the kubelet did not \
+             answer within 10s"
+        );
+        // …so the edge trigger is not re-armed: no fresh Warning Event.
+        assert!(
+            !log.lock()
+                .expect("log")
+                .iter()
+                .any(|c| c.path.ends_with("/events")),
+            "no Event may be published for a carried warning"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_kubelet_that_answers_still_sets_the_fresh_figure() {
+        let summary = json!({
+            "node": { "nodeName": "n1", "fs": { "capacityBytes": 100_000, "availableBytes": 50_000 } },
+            "pods": [{ "volume": [{
+                "name": "data", "pvcRef": { "name": "sv-apps-data", "namespace": "apps" },
+                "usedBytes": 100, "capacityBytes": 1000,
+            }] }],
+        });
+        let (client, log) = apiserver(routes(Reply::Json(200, summary)));
+        let ctx = Arc::new(Context::new(client, Arc::new(Metrics::new())));
+        let started = tokio::time::Instant::now();
+        reconcile_shared_volume(nearly_full_volume(), ctx)
+            .await
+            .expect("reconcile");
+
+        assert_eq!(
+            started.elapsed(),
+            Duration::ZERO,
+            "nothing waited on the budget"
+        );
+        let writes = calls_to(&log, "PATCH", STATUS_PATH);
+        let status = &writes[0].body["status"];
+        assert_eq!(
+            status["capacity"],
+            json!({ "usedBytes": 100, "capacityBytes": 1000, "scope": "volume" })
+        );
+        let warning = status["conditions"]
+            .as_array()
+            .expect("conditions")
+            .iter()
+            .find(|c| c["type"] == COND_CAPACITY_WARNING)
+            .expect("a sampled volume carries the condition");
+        assert_eq!(warning["status"], "False");
+        assert_eq!(warning["reason"], "SufficientCapacity");
+    }
+
+    #[test]
+    fn nothing_is_carried_that_the_object_did_not_have() {
+        // A carried figure is the object's own, never a fabricated one.
+        assert_eq!(carried_capacity(None), None);
+        assert_eq!(carried_capacity(Some(&SharedVolumeStatus::default())), None);
+        assert_eq!(carried_capacity_condition(&[]), None);
+    }
+
+    #[test]
+    fn a_carried_figure_keeps_its_scope() {
+        let status = SharedVolumeStatus {
+            capacity: Some(SharedVolumeCapacity {
+                used_bytes: Some(1),
+                capacity_bytes: Some(2),
+                scope: Some("host".into()),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            carried_capacity(Some(&status)),
+            Some(SvCapacity {
+                used: 1,
+                cap: 2,
+                scope: Some(SCOPE_HOST),
+            })
+        );
+    }
+
+    #[test]
+    fn a_carried_warning_says_once_that_it_was_not_remeasured() {
+        let first = carried_capacity_condition(&[cond(
+            COND_CAPACITY_WARNING,
+            "False",
+            "SufficientCapacity",
+        )])
+        .expect("carried");
+        assert_eq!(
+            first.message.as_deref(),
+            Some(
+                "SufficientCapacity as of the last sample — not re-measured: the kubelet did \
+                 not answer within 10s"
+            )
+        );
+        assert_eq!(first.status, "False");
+        assert_eq!(first.reason.as_deref(), Some("SufficientCapacity"));
+        assert_eq!(first.last_transition_time, T0);
+        // A second miss in a row carries the same message, not a longer one.
+        let again = carried_capacity_condition(std::slice::from_ref(&first)).expect("carried");
+        assert_eq!(again, first);
+    }
+}
+
+/// WI-400: the order and the bound of the SharedVolume reconcile's
+/// edge-triggered Event, and its deadline, driven through the scripted
+/// apiserver (`crate::route_apiserver`) on a paused clock.
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+    use crate::route_apiserver::{apiserver, calls_to, route, Reply, Route};
+    use operator_core::{Metrics, SharedVolumeSpec};
+
+    /// Longer than any bound under test, so a bound that stops cutting fails
+    /// the test instead of hanging it.
+    const OUTER_GUARD: Duration = Duration::from_secs(600);
+
+    const PROVIDERS: &str = "/apis/apprafter.io/v1alpha1/serviceproviders";
+    const PVC: &str = "/api/v1/namespaces/apps/persistentvolumeclaims/sv-apps-data";
+    const CLAIMS: &str = "/apis/apprafter.io/v1alpha1/namespaces/apps/resourceclaims";
+    const NODES: &str = "/api/v1/nodes";
+    const SUMMARY: &str = "/api/v1/nodes/n1/proxy/stats/summary";
+    const EVENTS: &str = "/apis/events.k8s.io/v1/namespaces/apps/events";
+    const STATUS: &str = "/apis/apprafter.io/v1alpha1/namespaces/apps/sharedvolumes/data/status";
+
+    fn context(client: Client) -> Arc<Context> {
+        Arc::new(Context::new(client, Arc::new(Metrics::new())))
+    }
+
+    fn ok(body: Value) -> Reply {
+        Reply::Json(200, body)
+    }
+
+    /// SharedVolume `apps/data`, finalizer already in place, never sampled.
+    fn volume() -> Arc<SharedVolume> {
+        let mut sv = SharedVolume::new(
+            "data",
+            SharedVolumeSpec {
+                size: "1Gi".into(),
+                class: None,
+            },
+        );
+        sv.metadata.namespace = Some("apps".into());
+        sv.metadata.uid = Some("u-sv".into());
+        sv.metadata.finalizers = Some(vec![SV_PVC_FINALIZER.into()]);
+        Arc::new(sv)
+    }
+
+    /// The bare object an apiserver hands back from a SharedVolume write.
+    fn volume_object() -> Value {
+        json!({
+            "apiVersion": "apprafter.io/v1alpha1", "kind": "SharedVolume",
+            "metadata": { "name": "data", "namespace": "apps" },
+            "spec": { "size": "1Gi" },
+        })
+    }
+
+    /// What an apiserver hands back from an Event create.
+    fn created_event() -> Reply {
+        Reply::Json(
+            201,
+            json!({
+                "apiVersion": "events.k8s.io/v1", "kind": "Event",
+                "metadata": { "name": "data.1", "namespace": "apps" },
+            }),
+        )
+    }
+
+    fn pvc_applied() -> Reply {
+        ok(json!({
+            "apiVersion": "v1", "kind": "PersistentVolumeClaim",
+            "metadata": { "name": "sv-apps-data", "namespace": "apps" },
+        }))
+    }
+
+    /// A kubelet Summary reporting the backing PVC at 95% of its capacity.
+    fn nearly_full_summary() -> Reply {
+        ok(json!({
+            "node": { "nodeName": "n1", "fs": { "capacityBytes": 100_000, "availableBytes": 50_000 } },
+            "pods": [{ "volume": [{
+                "name": "data", "pvcRef": { "name": "sv-apps-data", "namespace": "apps" },
+                "usedBytes": 950, "capacityBytes": 1000,
+            }] }],
+        }))
+    }
+
+    /// Every request a provisioning pass makes; the PVC apply, the Event
+    /// publish and the status write answer as given.
+    fn provisioning(pvc: Reply, event: Reply, status: Reply) -> Vec<Route> {
+        vec![
+            route(
+                "GET",
+                PROVIDERS,
+                ok(json!({
+                    "apiVersion": "apprafter.io/v1alpha1", "kind": "ServiceProviderList",
+                    "metadata": {},
+                    "items": [{
+                        "apiVersion": "apprafter.io/v1alpha1", "kind": "ServiceProvider",
+                        "metadata": { "name": "shared-local", "namespace": "apprafter-system" },
+                        "spec": { "type": "shared-disk", "backend": "shared-disk" },
+                    }],
+                })),
+            ),
+            route("PATCH", PVC, pvc),
+            route(
+                "GET",
+                CLAIMS,
+                ok(json!({
+                    "apiVersion": "apprafter.io/v1alpha1", "kind": "ResourceClaimList",
+                    "metadata": {}, "items": [],
+                })),
+            ),
+            route(
+                "GET",
+                NODES,
+                ok(json!({
+                    "apiVersion": "v1", "kind": "NodeList", "metadata": {},
+                    "items": [{ "apiVersion": "v1", "kind": "Node", "metadata": { "name": "n1" } }],
+                })),
+            ),
+            route("GET", SUMMARY, nearly_full_summary()),
+            route("POST", EVENTS, event),
+            route("PATCH", STATUS, status),
+        ]
+    }
+
+    /// The edge-triggered Event goes out BEFORE the status write that
+    /// records the crossing. Here that write never answers, so this is the
+    /// pass a deadline would cut, and the Event has still been sent. In the
+    /// old order (write, then Event) it never was, and the next pass, reading
+    /// `CapacityWarning=True` back, never sent it either.
+    #[tokio::test(start_paused = true)]
+    async fn the_capacity_warning_event_is_sent_before_the_status_write() {
+        let (client, log) = apiserver(provisioning(pvc_applied(), created_event(), Reply::Never));
+
+        let cut = tokio::time::timeout(
+            Duration::from_secs(60),
+            reconcile_shared_volume(volume(), context(client)),
+        )
+        .await;
+        assert!(
+            cut.is_err(),
+            "the status write never answers, so the pass is cut"
+        );
+
+        let log = log.lock().expect("log").clone();
+        let event_at = log
+            .iter()
+            .position(|c| c.method == "POST" && c.path == EVENTS)
+            .expect("the CapacityWarning Event was sent before the cut");
+        assert_eq!(log[event_at].body["reason"], json!("CapacityWarning"));
+        let status_at = log
+            .iter()
+            .position(|c| c.method == "PATCH" && c.path == STATUS)
+            .expect("the status write was attempted");
+        assert!(
+            event_at < status_at,
+            "Event first, then the write: {log:#?}"
+        );
+    }
+
+    /// The Event cannot hold the status write either: a publish that never
+    /// answers is abandoned at its bound, and the write follows, carrying the
+    /// warning.
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_event_publish_does_not_hold_the_status_write() {
+        let (client, log) = apiserver(provisioning(
+            pvc_applied(),
+            Reply::Never,
+            ok(volume_object()),
+        ));
+
+        let started = tokio::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            OUTER_GUARD,
+            reconcile_shared_volume(volume(), context(client)),
+        )
+        .await
+        .expect("a hung Event publish must not hold the pass");
+
+        assert_eq!(
+            outcome.expect("provisioned"),
+            Action::requeue(Duration::from_secs(300))
+        );
+        assert_eq!(started.elapsed(), CAPACITY_EVENT_BOUND);
+        let writes = calls_to(&log, "PATCH", STATUS);
+        assert_eq!(writes.len(), 1, "{writes:?}");
+        let warning = writes[0].body["status"]["conditions"]
+            .as_array()
+            .expect("conditions")
+            .iter()
+            .find(|c| c["type"] == COND_CAPACITY_WARNING)
+            .cloned()
+            .expect("the CapacityWarning rides the write");
+        assert_eq!(warning["status"], json!("True"));
+        assert_eq!(warning["reason"], json!("VolumeNearlyFull"));
+    }
+
+    /// A pass that never returns is abandoned at the deadline; every request
+    /// hangs here, the Event publish included.
+    #[tokio::test(start_paused = true)]
+    async fn a_volume_pass_that_never_returns_is_abandoned_at_the_deadline() {
+        let ctx = context(operator_core::testing::stalled_client());
+
+        let started = tokio::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            RECONCILE_DEADLINE * 2,
+            reconcile_shared_volume_with_deadline(volume(), ctx),
+        )
+        .await
+        .expect("the deadline must end the pass");
+
+        match outcome {
+            Err(ReconcileError::TimedOut(t)) => assert_eq!(t.after, RECONCILE_DEADLINE),
+            other => panic!("expected TimedOut, got {other:?}"),
+        }
+        assert_eq!(
+            started.elapsed(),
+            RECONCILE_DEADLINE + operator_core::deadline_event::PUBLISH_BOUND
+        );
+    }
+
+    /// The timeout path writes nothing to the volume's status: a body without
+    /// `refCount` would prune the figure `volume rm` reads. The pass is cut on
+    /// its PVC apply; the only request after the cut is the Event.
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_volume_pass_writes_no_status() {
+        let (client, log) = apiserver(provisioning(
+            Reply::Never,
+            created_event(),
+            ok(volume_object()),
+        ));
+
+        let outcome = tokio::time::timeout(
+            RECONCILE_DEADLINE * 2,
+            reconcile_shared_volume_with_deadline(volume(), context(client)),
+        )
+        .await
+        .expect("the deadline must end the pass");
+        assert!(
+            matches!(outcome, Err(ReconcileError::TimedOut(_))),
+            "{outcome:?}"
+        );
+
+        let log = log.lock().expect("log").clone();
+        assert!(
+            !log.iter().any(|c| c.path.ends_with("/status")),
+            "a timed-out pass must not touch status: {log:#?}"
+        );
+        let methods: Vec<&str> = log.iter().map(|c| c.method.as_str()).collect();
+        assert_eq!(methods, vec!["GET", "PATCH", "POST"], "{log:#?}");
+        assert_eq!(log[2].body["reason"], json!("ReconcileTimedOut"));
+        assert_eq!(log[2].body["regarding"]["kind"], json!("SharedVolume"));
+        assert_eq!(
+            log[2].body["reportingController"],
+            json!("apprafter-resourceclaim-provisioner")
+        );
+    }
+
+    #[tokio::test]
+    async fn error_policy_sv_counts_a_timeout_and_backs_off_one_deadline() {
+        let ctx = context(operator_core::testing::stalled_client());
+        let timed_out = ReconcileError::TimedOut(operator_core::deadline::ReconcileTimedOut {
+            after: RECONCILE_DEADLINE,
+        });
+
+        assert_eq!(
+            error_policy_sv(volume(), &timed_out, ctx.clone()),
+            Action::requeue(RECONCILE_DEADLINE)
+        );
+        let timeouts = || {
+            ctx.metrics
+                .reconcile_timeouts
+                .with_label_values(&[KIND])
+                .get()
+        };
+        assert_eq!(timeouts(), 1.0);
+        assert_eq!(
+            error_policy_sv(
+                volume(),
+                &ReconcileError::Provisioning("x".into()),
+                ctx.clone()
+            ),
+            Action::requeue(Duration::from_secs(30))
+        );
+        assert_eq!(timeouts(), 1.0, "only a timeout counts as one");
+    }
+
+    const VOLUME: &str = "/apis/apprafter.io/v1alpha1/namespaces/apps/sharedvolumes/data";
+
+    fn not_found() -> Reply {
+        Reply::Json(
+            404,
+            json!({
+                "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                "reason": "NotFound", "code": 404, "message": "not found",
+            }),
+        )
+    }
+
+    fn deleting_volume() -> Arc<SharedVolume> {
+        let mut sv = (*volume()).clone();
+        sv.metadata.deletion_timestamp =
+            Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                "2026-10-01T00:00:00Z".parse().expect("timestamp"),
+            ));
+        Arc::new(sv)
+    }
+
+    /// The delete path's answers: the PVC is already gone (404) and the
+    /// finalizer release succeeds.
+    fn deleting() -> Vec<Route> {
+        vec![
+            route("DELETE", PVC, not_found()),
+            route("PATCH", VOLUME, ok(volume_object())),
+        ]
+    }
+
+    fn methods(log: &[crate::route_apiserver::Call]) -> Vec<String> {
+        log.iter().map(|c| c.method.clone()).collect()
+    }
+
+    /// The late-landing PVC race, closed: right after a failed pass, the
+    /// delete deletes the PVC but HOLDS the finalizer for `DELETE_SETTLE`,
+    /// then deletes again and releases. A PVC apply the failed pass left in
+    /// flight lands inside that window, and the second DELETE takes it.
+    #[tokio::test(start_paused = true)]
+    async fn a_delete_right_after_a_failed_pass_holds_the_finalizer_until_it_settles() {
+        let (client, log) = apiserver(deleting());
+        let ctx = context(client);
+        note_unsettled(&ctx, "apps", "data");
+
+        let first = reconcile_shared_volume(deleting_volume(), ctx.clone())
+            .await
+            .expect("first delete pass");
+        assert_eq!(first, Action::requeue(DELETE_SETTLE));
+        assert!(
+            calls_to(&log, "PATCH", VOLUME).is_empty(),
+            "the finalizer was released while the failed pass's apply could still land"
+        );
+
+        tokio::time::advance(DELETE_SETTLE).await;
+        let second = reconcile_shared_volume(deleting_volume(), ctx.clone())
+            .await
+            .expect("second delete pass");
+        assert_eq!(second, Action::await_change());
+        assert_eq!(
+            methods(&log.lock().expect("log")),
+            vec!["DELETE", "DELETE", "PATCH"]
+        );
+        assert!(
+            ctx.sv_unsettled.lock().expect("map").is_empty(),
+            "a released delete forgets its record"
+        );
+    }
+
+    /// The common case keeps its latency: a delete with no recent failure
+    /// releases in the same pass.
+    #[tokio::test(start_paused = true)]
+    async fn a_delete_with_no_failed_pass_releases_at_once() {
+        let (client, log) = apiserver(deleting());
+        let outcome = reconcile_shared_volume(deleting_volume(), context(client))
+            .await
+            .expect("delete pass");
+        assert_eq!(outcome, Action::await_change());
+        assert_eq!(methods(&log.lock().expect("log")), vec!["DELETE", "PATCH"]);
+    }
+
+    /// The wrapper records a failed provisioning pass, and only that: a
+    /// failed DELETE pass sent no apply that could land late.
+    #[tokio::test(start_paused = true)]
+    async fn only_a_failed_non_deleting_pass_is_noted() {
+        let ctx = context(operator_core::testing::stalled_client());
+        let key = ("apps".to_string(), "data".to_string());
+
+        let guard = RECONCILE_DEADLINE * 2;
+        let deleting = reconcile_shared_volume_with_deadline(deleting_volume(), ctx.clone());
+        let outcome = tokio::time::timeout(guard, deleting)
+            .await
+            .expect("deadline");
+        assert!(matches!(outcome, Err(ReconcileError::TimedOut(_))));
+        assert!(!ctx.sv_unsettled.lock().expect("map").contains_key(&key));
+
+        let provisioning = reconcile_shared_volume_with_deadline(volume(), ctx.clone());
+        let outcome = tokio::time::timeout(guard, provisioning)
+            .await
+            .expect("deadline");
+        assert!(matches!(outcome, Err(ReconcileError::TimedOut(_))));
+        assert!(ctx.sv_unsettled.lock().expect("map").contains_key(&key));
     }
 }

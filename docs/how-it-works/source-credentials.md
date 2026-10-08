@@ -108,9 +108,18 @@ an organisation, and there is nothing there to authenticate against — so the
 controller finds every **representative** repository the prefix actually covers by
 reading the repository URL of every Argo CD Application in the cluster and
 keeping the ones under the prefix, then makes a git smart-HTTP request against
-one with the credential's Basic auth and a ten-second ceiling. `GitValid`
-therefore means *this credential can serve the applications that depend on it*,
-not *this prefix exists*.
+each distinct one, four at a time, with the credential's Basic auth and a
+ten-second ceiling per request. `GitValid` therefore means *this credential can
+serve the applications that depend on it*, not *this prefix exists*.
+
+The whole half — listing the Applications and every request — runs inside a
+thirty-second budget, so a git host that accepts connections and never answers
+cannot hold the credential's status back. The covered hosts take turns: every
+host gets its first request before any host gets a second, so one host that
+never answers cannot keep the others from being asked. Within one host the
+repositories go in the order the Applications list them. Requests still
+outstanding when the budget runs out count as unverified; verdicts already
+reached are kept.
 
 Three verdicts, mapped conservatively on purpose:
 
@@ -122,21 +131,27 @@ Three verdicts, mapped conservatively on purpose:
   below — so an Argo CD `404` on a repository you can browse yourself is
   compatible with a healthy `GitValid`.
 - **`Unknown`, reason `Unverified`** — everything else: no Argo CD Application
-  references a covered prefix yet, the host was unreachable, or it answered
-  404 or 5xx. A network failure can never be reported as a bad credential.
-  The condition message separates "nothing to probe yet" from "probed and
-  could not reach the host" in words.
+  references a covered prefix yet, the host was unreachable, it answered
+  404 or 5xx, or the thirty-second budget ran out before any representative
+  gave a verdict. A network failure can never be reported as a bad credential.
+  The condition message separates "nothing to probe yet", "probed and could
+  not reach the host" and "the probe budget ran out" in words, and the last
+  one says how many representatives went unanswered, or that the Application
+  list itself did not return in time.
 
 Across several representatives an explicit rejection wins over any success, so
-one bad prefix is not hidden by a good one. `status.lastValidated` advances
-only on `True` or `False` — on a cluster with no outbound access it stays at
-the last time the credential was genuinely proven, rather than creeping forward
-on passes that proved nothing.
+one bad prefix is not hidden by a good one — and a rejection that arrived
+before the budget ran out still counts. `status.lastValidated` advances only on
+`True` or `False` — on a cluster with no outbound access, or on a pass whose
+budget ran out before any verdict, it stays at the last time the credential
+was genuinely proven, rather than creeping forward on passes that proved
+nothing.
 
 `RegistryValid` has the same shape against a representative **image**: every
 image an Application declares — the base one and any per-environment override —
 that falls under a covered host, probed with a scoped registry v2 token
-exchange. Again only an authentication failure is `False`.
+exchange under the same four-at-a-time limit, host turns and thirty-second
+budget. Again only an authentication failure is `False`.
 
 `GitValid` is the half the registration gate reads. `RegistryValid` is reported for the operator's own use; nothing in the CLI consumes it.
 `apprafter app add --coverage-gate confirmed` refuses an `https` repository

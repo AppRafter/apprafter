@@ -34,3 +34,9 @@ serde_json  = { workspace = true }
 # failed ServiceProvider list writes no status at all.
 tower = { workspace = true }
 http  = { workspace = true }
+# WI-400: the deadline tests run a reconcile against
+# `operator_core::testing::stalled_client()` — an apiserver that accepts every
+# request and never answers — on a paused clock (`test-util`), so the 120s
+# deadline elapses in no wall time and the moment it fires is exact.
+operator-core = { path = "../../operator-core", features = ["testing"] }
+tokio         = { workspace = true, features = ["test-util"] }

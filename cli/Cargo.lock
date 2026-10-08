@@ -238,7 +238,7 @@ dependencies = [
 
 [[package]]
 name = "apprafter"
-version = "0.2.78"
+version = "0.2.79"
 dependencies = [
  "age",
  "arboard",
@@ -273,7 +273,7 @@ dependencies = [
 
 [[package]]
 name = "apprafter-backup"
-version = "0.2.78"
+version = "0.2.79"
 dependencies = [
  "backup-core",
  "chrono",
@@ -431,7 +431,7 @@ dependencies = [
 
 [[package]]
 name = "backup-core"
-version = "0.2.78"
+version = "0.2.79"
 dependencies = [
  "aes-gcm 0.11.1",
  "base64 0.23.1",
@@ -679,7 +679,7 @@ checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 
 [[package]]
 name = "cli-core"
-version = "0.2.78"
+version = "0.2.79"
 dependencies = [
  "age",
  "chrono",
@@ -697,7 +697,7 @@ dependencies = [
 
 [[package]]
 name = "cli-providers"
-version = "0.2.78"
+version = "0.2.79"
 dependencies = [
  "aes-gcm 0.11.1",
  "backup-core",
@@ -722,7 +722,7 @@ dependencies = [
 
 [[package]]
 name = "cli-state"
-version = "0.2.78"
+version = "0.2.79"
 dependencies = [
  "cli-core",
  "serde",
@@ -1149,7 +1149,7 @@ dependencies = [
 
 [[package]]
 name = "docsgen"
-version = "0.2.78"
+version = "0.2.79"
 dependencies = [
  "apprafter",
  "clap",
@@ -5017,9 +5017,9 @@ dependencies = [
 
 [[package]]
 name = "yoke-derive"
-version = "0.8.3"
+version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33811428bee40dbceb6d545e95754741d17a6aef9a4849f0fd62e2ba4f412a78"
+checksum = "ec8ebde2db3681e8c9980cc27822030e68752690ddfa9473e739aeb4dbde6d71"
 dependencies = [
  "proc-macro2",
  "quote",

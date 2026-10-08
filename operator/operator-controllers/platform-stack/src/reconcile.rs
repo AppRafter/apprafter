@@ -44,9 +44,10 @@ use crate::compatibility::{
 use crate::desired::{build as build_desired, DesiredSource};
 use crate::oci::{channel_matches, tags_in_channel, Channel};
 use crate::status::{
-    append_version_history, condition, upsert_condition, COND_MIGRATION_PENDING,
-    COND_NODE_DISK_PRESSURE, COND_READY, COND_SYNCED, COND_UNAUTHORIZED_SOURCE_MODIFICATION,
-    COND_UPGRADE_AVAILABLE, COND_UPSTREAM_REACHABLE, COND_YANKED_VERSION,
+    append_version_history, condition, platform_controller_view, upsert_condition,
+    without_reconcile_stalled, COND_MIGRATION_PENDING, COND_NODE_DISK_PRESSURE, COND_READY,
+    COND_SYNCED, COND_UNAUTHORIZED_SOURCE_MODIFICATION, COND_UPGRADE_AVAILABLE,
+    COND_UPSTREAM_REACHABLE, COND_YANKED_VERSION,
 };
 use crate::{FIELD_MANAGER, SINGLETON_NAME, SINGLETON_NAMESPACE};
 
@@ -93,6 +94,22 @@ fn build_recorder(ctx: &Context, stack: &PlatformStack) -> ObjectRecorder {
     };
     let reference = stack.object_ref(&());
     ObjectRecorder::new(ctx.client.clone(), reporter, reference)
+}
+
+/// Publish one audit Event, best-effort and bounded by
+/// `DECORATIVE_CALL_BUDGET`: an Event that fails or never answers is logged
+/// and skipped, never a reason to hold the reconcile.
+async fn publish_bounded(recorder: &ObjectRecorder, ev: KubeEvent) {
+    let reason = ev.reason.clone();
+    match tokio::time::timeout(DECORATIVE_CALL_BUDGET, recorder.publish(ev)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!(reason = %reason, error = %e, "failed to publish event (continuing)"),
+        Err(_) => warn!(
+            reason = %reason,
+            budget_secs = DECORATIVE_CALL_BUDGET.as_secs(),
+            "event publish did not answer in time (continuing)"
+        ),
+    }
 }
 
 /// Static ObjectReference for the parent platform Application.
@@ -149,6 +166,63 @@ const MIN_OCI_POLL_INTERVAL_SECS: i64 = 60;
 /// `spec.source.checkInterval` (default 6h).
 const RECHECK_REQUESTED_ANNOTATION: &str = "apprafter.io/recheck-requested";
 
+/// How long one question to the registry may take as a whole (WI-400):
+/// resolving the channel-latest — the `:<channel>` pull, or the paginated
+/// listing plus a pull when it falls back — or classifying a transition (one
+/// pull). Healthy ghcr answers either in 0.5–3 s.
+///
+/// The registry client's own bounds (`oci::REGISTRY_CONNECT_TIMEOUT`,
+/// `oci::REGISTRY_READ_TIMEOUT`) stop a peer that goes SILENT. This stops one
+/// that keeps answering too slowly ever to finish: up to `MAX_PAGES` listing
+/// requests, or a blob dribbled out a few bytes per read. On expiry the
+/// question fails like any registry error, so the reconcile takes its
+/// existing degrade paths — `UpstreamReachable=False`, the pin still
+/// enforced, a transition held rather than bumped blind — and still writes
+/// its status.
+const OCI_OPERATION_BUDGET: Duration = Duration::from_secs(20);
+
+/// How long the backup objects' reads may take together (WI-400): three
+/// namespaced LISTs and one GET, milliseconds each on a healthy apiserver. On
+/// expiry the reads have FAILED, and that is the verdict the condition
+/// already gives a failed read: `BackupHealthy=Unknown` (`StateUnreadable`).
+const BACKUP_READ_BUDGET: Duration = Duration::from_secs(10);
+
+/// How long the `NodeDiskPressure` sample may take (WI-400): a Node LIST and
+/// the kubelet Summary through the apiserver's node proxy. The proxy is a
+/// long-running request that the apiserver's own 60s limit does not cover,
+/// and the kubelet answers slowest exactly when its node is short of disk. On
+/// expiry there is no sample and the condition is left as it was — the
+/// existing answer to "we could not look".
+const NODE_SAMPLE_BUDGET: Duration = Duration::from_secs(10);
+
+/// How long each decorative call may take (WI-400): the ADR 0048 anchor
+/// lookup, the anchor's annotation patch, and each audit Event. The anchor-403
+/// fix made these tolerate an ERROR; a call that never answers froze the
+/// reconcile before its status write all the same. On expiry each is skipped
+/// exactly as when it fails.
+const DECORATIVE_CALL_BUDGET: Duration = Duration::from_secs(5);
+
+/// The registry did not finish one question within `OCI_OPERATION_BUDGET`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("the OCI upstream did not finish {operation} within {}s", .after.as_secs())]
+pub struct UpstreamTimedOut {
+    pub operation: &'static str,
+    pub after: Duration,
+}
+
+/// Ask the registry one question under `OCI_OPERATION_BUDGET`.
+async fn within_oci_budget<T>(
+    operation: &'static str,
+    question: impl std::future::Future<Output = T>,
+) -> Result<T, UpstreamTimedOut> {
+    tokio::time::timeout(OCI_OPERATION_BUDGET, question)
+        .await
+        .map_err(|_| UpstreamTimedOut {
+            operation,
+            after: OCI_OPERATION_BUDGET,
+        })
+}
+
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("kube-rs error: {0}")]
@@ -161,11 +235,14 @@ pub enum Error {
     Serde(#[from] serde_json::Error),
     #[error("unparseable check interval {0:?}")]
     CheckInterval(String),
+    #[error(transparent)]
+    UpstreamTimedOut(#[from] UpstreamTimedOut),
+    #[error(transparent)]
+    TimedOut(#[from] operator_core::deadline::ReconcileTimedOut),
 }
 
 struct Context {
     client: Client,
-    #[allow(dead_code)]
     metrics: Arc<Metrics>,
     app_api_resource: ApiResource,
     /// TTL cache for the kubelet Summary sample behind `NodeDiskPressure`
@@ -173,6 +250,168 @@ struct Context {
     /// so a node's kubelet is hit at most once per TTL per controller rather
     /// than once per reconcile.
     capacity: operator_core::capacity::CapacityCache,
+    /// Where published versions are read from: [`OciRegistry`] in
+    /// production. See [`Upstream`].
+    upstream: Arc<dyn Upstream>,
+    /// Bumps that landed on the parent and are not yet in a status write
+    /// (WI-400). See [`Context::note_bump`].
+    unrecorded_bumps: std::sync::Mutex<Vec<PlatformStackVersionHistoryEntry>>,
+}
+
+impl Context {
+    /// Remember a bump the moment the parent patch carrying it has landed,
+    /// until a status write records it in `versionHistory`.
+    ///
+    /// WI-400: the history entry is decided from the LIVE parent — a pass
+    /// appends it only when it is the one that moves `targetRevision`. A pass
+    /// cut (or failed) between the bump and its status write lost the entry
+    /// for good, because the next pass already finds the parent on the new
+    /// version. Held here, it rides the next status write instead. In memory
+    /// only: an operator restart in that window still loses it, as a crash
+    /// there always has.
+    fn note_bump(&self, entry: PlatformStackVersionHistoryEntry) {
+        let mut bumps = self
+            .unrecorded_bumps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        bumps.push(entry);
+        if bumps.len() > crate::status::VERSION_HISTORY_CAP {
+            let drop = bumps.len() - crate::status::VERSION_HISTORY_CAP;
+            bumps.drain(0..drop);
+        }
+    }
+
+    /// The bumps not yet recorded, oldest first.
+    fn unrecorded_bumps(&self) -> Vec<PlatformStackVersionHistoryEntry> {
+        self.unrecorded_bumps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Drop `recorded` once a status write carrying them has succeeded.
+    fn forget_bumps(&self, recorded: &[PlatformStackVersionHistoryEntry]) {
+        self.unrecorded_bumps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|e| !recorded.contains(e));
+    }
+}
+
+/// The two questions the reconcile asks the published chart repository.
+///
+/// A SEAM, and only one: production has exactly one implementation,
+/// [`OciRegistry`]. It exists so a whole reconcile can be driven against an
+/// upstream that never answers (WI-400). A real socket cannot stand in for
+/// that once the registry client has its own connect and read bounds — they
+/// fire first, so a test on a silent socket would pass with the reconcile's
+/// whole-operation budget removed.
+#[async_trait::async_trait]
+trait Upstream: Send + Sync {
+    /// The channel-latest; see [`resolve_channel_latest`].
+    async fn channel_latest(
+        &self,
+        upstream: &str,
+        channel: Channel,
+        channel_label: &str,
+    ) -> Result<(String, bool, Option<CompatibilityDoc>), Error>;
+
+    /// The most destructive change class between two versions; see
+    /// [`fetch_path_max_change_class`].
+    async fn path_max_change_class(
+        &self,
+        upstream: &str,
+        from_version: &str,
+        to_version: &str,
+    ) -> Result<ChangeClass, CompatError>;
+}
+
+/// The OCI registry named by `spec.source.upstream`.
+struct OciRegistry;
+
+#[async_trait::async_trait]
+impl Upstream for OciRegistry {
+    async fn channel_latest(
+        &self,
+        upstream: &str,
+        channel: Channel,
+        channel_label: &str,
+    ) -> Result<(String, bool, Option<CompatibilityDoc>), Error> {
+        resolve_channel_latest(upstream, channel, channel_label).await
+    }
+
+    async fn path_max_change_class(
+        &self,
+        upstream: &str,
+        from_version: &str,
+        to_version: &str,
+    ) -> Result<ChangeClass, CompatError> {
+        fetch_path_max_change_class(upstream, from_version, to_version).await
+    }
+}
+
+/// The `kind` label this controller's metrics carry.
+const KIND: &str = "PlatformStack";
+
+/// How long one PlatformStack reconcile may run before it is abandoned
+/// (WI-400). The controller watches a singleton, so a reconcile that never
+/// returns stalls EVERY trigger it has: the stack, the parent Application and
+/// the backup CronJobs, Jobs and runner pods all map to `PlatformStack/default`,
+/// and kube-runtime holds them behind the running one (GOTCHA-51).
+///
+/// The legitimate worst case is bounded from the inside: the two registry
+/// questions (`OCI_OPERATION_BUDGET`, 20s each), the backup reads
+/// (`BACKUP_READ_BUDGET`, 10s), the node sample (`NODE_SAMPLE_BUDGET`, 10s),
+/// four decorative calls (`DECORATIVE_CALL_BUDGET`, 5s each) and a
+/// MigrationPlan create behind its admission webhook (10s) come to 90s, beside
+/// about a dozen apiserver calls that take milliseconds. 120s leaves room and
+/// stays under the client's 295s socket read timeout, so this — not a socket —
+/// is the real bound.
+///
+/// What is left for it to cut is an apiserver call that does not answer, and
+/// against such an apiserver no status write could land either. Every hang the
+/// status CAN outlive — the registry, the backup reads, the node proxy, the
+/// anchor and the Events — has its own bound and becomes the condition that
+/// says so (`UpstreamReachable=False`, `BackupHealthy=Unknown`), so the
+/// deadline never re-creates the v0.2.12 wedge of frozen conditions with a
+/// stale `UpstreamReachable=True`.
+///
+/// A cut is reported on the stack itself: [`reconcile_with_deadline`] sets
+/// `ReconcileStalled=True` under a field manager of its own (`crate::stall`),
+/// which `apprafter platform status` shows, and the first reconcile that
+/// finishes removes it. Every other condition keeps the value of the last
+/// reconcile that finished. `error_policy` adds a Warning Event on the stack,
+/// a WARN and `apprafter_reconcile_timeouts_total{kind="PlatformStack"}`, and
+/// requeues the stack in 60s.
+pub const RECONCILE_DEADLINE: Duration = Duration::from_secs(120);
+
+/// One reconcile under [`RECONCILE_DEADLINE`], with the outcome kept in the
+/// stack's `ReconcileStalled` condition (WI-400, `crate::stall`): set when
+/// the pass is cut, removed after a pass that finishes. A pass that fails for
+/// any other reason changes neither: it neither stalled nor proved the stall
+/// over.
+///
+/// Both writes come after the pass, under their own budget
+/// (`stall::STALL_WRITE_BUDGET`), so a pass holds its slot for at most
+/// `RECONCILE_DEADLINE + STALL_WRITE_BUDGET`. The clear acts on the stack
+/// this pass read: a `ReconcileStalled` that lands after the read is removed
+/// by the next pass, which that write itself starts through the stack's
+/// watch.
+async fn reconcile_with_deadline(
+    stack: Arc<PlatformStack>,
+    ctx: Arc<Context>,
+) -> Result<Action, Error> {
+    let outcome =
+        operator_core::deadline::within(RECONCILE_DEADLINE, reconcile(stack.clone(), ctx.clone()))
+            .await;
+    match &outcome {
+        Err(Error::TimedOut(timed_out)) => {
+            crate::stall::mark(&ctx.client, &stack, timed_out.after).await
+        }
+        Ok(_) => crate::stall::clear(&ctx.client, &stack).await,
+        Err(_) => {}
+    }
+    outcome
 }
 
 pub async fn run(client: Client, metrics: Arc<Metrics>) -> Result<(), Error> {
@@ -198,6 +437,8 @@ pub async fn run(client: Client, metrics: Arc<Metrics>) -> Result<(), Error> {
         metrics,
         app_api_resource,
         capacity: operator_core::capacity::CapacityCache::new(),
+        upstream: Arc::new(OciRegistry),
+        unrecorded_bumps: std::sync::Mutex::new(Vec::new()),
     });
 
     info!(
@@ -264,7 +505,7 @@ pub async fn run(client: Client, metrics: Arc<Metrics>) -> Result<(), Error> {
                 }
             },
         )
-        .run(reconcile, error_policy, ctx)
+        .run(reconcile_with_deadline, error_policy, ctx)
         .for_each(|res| async move {
             match res {
                 Ok((obj, action)) => {
@@ -465,7 +706,17 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
     // propagates.
     let mut upstream_poll_error: Option<String> = None;
     let (channel_latest_str, did_poll_oci, compat_doc) = if should_poll_oci {
-        match resolve_channel_latest(&spec.source.upstream, channel, &spec.channel).await {
+        let resolved = match within_oci_budget(
+            "resolving the channel-latest",
+            ctx.upstream
+                .channel_latest(&spec.source.upstream, channel, &spec.channel),
+        )
+        .await
+        {
+            Ok(answer) => answer,
+            Err(timed_out) => Err(Error::from(timed_out)),
+        };
+        match resolved {
             Ok(resolved) => resolved,
             Err(e) => {
                 let msg = e.to_string();
@@ -591,6 +842,11 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
     let allow_target_bump = pin_set || spec.auto_upgrade;
 
     let mut migration_pending: Option<MigrationPendingState> = None;
+    // The `completed` plan whose approval this pass's bump rides on. The GC
+    // below must keep it until a pass sees the parent on the new version:
+    // deleted before the bump lands, a cut or failed pass loses the approval
+    // for good (the next pass finds no plan and gates the transition anew).
+    let mut authorising_plan: Option<String> = None;
     let target_for_patch = if target_changed && allow_target_bump {
         // Track B.1.78: gate destructive transitions behind a
         // MigrationPlan. Deterministic plan name per
@@ -621,6 +877,7 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
                     plan = %plan_name,
                     "platform MigrationPlan completed — proceeding with bump"
                 );
+                authorising_plan = Some(plan_name.clone());
                 desired.target_revision.clone()
             } else {
                 // Pending / approved / executing / failed /
@@ -664,13 +921,20 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
             // status with UpstreamReachable=False, then requeues) and
             // the pin applies once the upstream recovers and the
             // transition can be classified.
-            match fetch_path_max_change_class(
-                &spec.source.upstream,
-                &current_target,
-                &desired.target_revision,
+            let classified = match within_oci_budget(
+                "classifying the transition",
+                ctx.upstream.path_max_change_class(
+                    &spec.source.upstream,
+                    &current_target,
+                    &desired.target_revision,
+                ),
             )
             .await
             {
+                Ok(answer) => answer.map_err(|e| e.to_string()),
+                Err(timed_out) => Err(timed_out.to_string()),
+            };
+            match classified {
                 Err(e) => {
                     warn!(
                         error = %e,
@@ -678,7 +942,7 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
                         to = %desired.target_revision,
                         "cannot classify transition (upstream unreachable); holding current target"
                     );
-                    upstream_poll_error.get_or_insert(e.to_string());
+                    upstream_poll_error.get_or_insert(e);
                     current_target.clone()
                 }
                 Ok(class)
@@ -715,25 +979,42 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
                     // swallows both None and Err to None.
                     let anchor_api: Api<ConfigMap> =
                         Api::namespaced(ctx.client.clone(), MIGRATION_PLAN_NAMESPACE);
-                    let anchor_get = anchor_api.get_opt(PLATFORM_MIGRATION_ANCHOR).await;
-                    match &anchor_get {
-                        Ok(Some(_)) => debug!(
-                            anchor = PLATFORM_MIGRATION_ANCHOR,
-                            "anchoring MigrationPlan to ConfigMap ownerRef"
-                        ),
-                        Ok(None) => warn!(
-                            anchor = PLATFORM_MIGRATION_ANCHOR,
-                            namespace = MIGRATION_PLAN_NAMESPACE,
-                            "anchor ConfigMap absent — creating MigrationPlan un-owned (off the Argo tree)"
-                        ),
-                        Err(e) => warn!(
-                            anchor = PLATFORM_MIGRATION_ANCHOR,
-                            namespace = MIGRATION_PLAN_NAMESPACE,
-                            error = %e,
-                            "anchor ConfigMap lookup failed (e.g. configmaps RBAC) — creating MigrationPlan un-owned; detection/status NOT blocked"
-                        ),
-                    }
-                    let anchor_uid = anchor_uid_from_get(anchor_get);
+                    let anchor_uid = match tokio::time::timeout(
+                        DECORATIVE_CALL_BUDGET,
+                        anchor_api.get_opt(PLATFORM_MIGRATION_ANCHOR),
+                    )
+                    .await
+                    {
+                        Ok(anchor_get) => {
+                            match &anchor_get {
+                                Ok(Some(_)) => debug!(
+                                    anchor = PLATFORM_MIGRATION_ANCHOR,
+                                    "anchoring MigrationPlan to ConfigMap ownerRef"
+                                ),
+                                Ok(None) => warn!(
+                                    anchor = PLATFORM_MIGRATION_ANCHOR,
+                                    namespace = MIGRATION_PLAN_NAMESPACE,
+                                    "anchor ConfigMap absent — creating MigrationPlan un-owned (off the Argo tree)"
+                                ),
+                                Err(e) => warn!(
+                                    anchor = PLATFORM_MIGRATION_ANCHOR,
+                                    namespace = MIGRATION_PLAN_NAMESPACE,
+                                    error = %e,
+                                    "anchor ConfigMap lookup failed (e.g. configmaps RBAC) — creating MigrationPlan un-owned; detection/status NOT blocked"
+                                ),
+                            }
+                            anchor_uid_from_get(anchor_get)
+                        }
+                        Err(_) => {
+                            warn!(
+                                anchor = PLATFORM_MIGRATION_ANCHOR,
+                                namespace = MIGRATION_PLAN_NAMESPACE,
+                                budget_secs = DECORATIVE_CALL_BUDGET.as_secs(),
+                                "anchor ConfigMap lookup did not answer in time — creating MigrationPlan un-owned; detection/status NOT blocked"
+                            );
+                            None
+                        }
+                    };
                     create_platform_migration_plan(
                         &plan_api,
                         &plan_name,
@@ -801,12 +1082,18 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
     // 26-28 all lingered). Runs unconditionally — not only inside the
     // gating branch — so the last completed plan is dropped once the
     // upgrade settles. Best-effort: a failure is logged, never fatal.
+    //
+    // The two names it keeps never coexist: `migration_pending` is the gate
+    // of a held transition, `authorising_plan` the completed plan of the one
+    // being bumped this pass (WI-400). The latter is collected by the first
+    // pass that finds the parent already on the new version.
     {
         let plan_api: Api<MigrationPlan> =
             Api::namespaced(ctx.client.clone(), MIGRATION_PLAN_NAMESPACE);
         let keep = migration_pending
             .as_ref()
             .and_then(|m| m.plan_name.as_deref())
+            .or(authorising_plan.as_deref())
             .unwrap_or("");
         match plan_api.list(&ListParams::default()).await {
             Ok(list) => {
@@ -831,8 +1118,21 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
     // App, by contrast, never affects the top-level app's own tile).
     // SSA with our own field manager survives Argo syncs + causes no
     // OutOfSync. Best-effort: the tile signal is a nicety, never fatal.
-    if let Err(e) = reconcile_anchor_health(&ctx, &pending_upgrade).await {
-        warn!(error = %e, "failed to reconcile anchor ConfigMap pending-upgrade annotation (continuing)");
+    match tokio::time::timeout(
+        DECORATIVE_CALL_BUDGET,
+        reconcile_anchor_health(&ctx, &pending_upgrade),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!(
+            error = %e,
+            "failed to reconcile anchor ConfigMap pending-upgrade annotation (continuing)"
+        ),
+        Err(_) => warn!(
+            budget_secs = DECORATIVE_CALL_BUDGET.as_secs(),
+            "anchor ConfigMap pending-upgrade annotation did not answer in time (continuing)"
+        ),
     }
 
     // Detect foreign writer BEFORE patching — so we know whether
@@ -870,43 +1170,63 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
         if let Some(foreign) = &foreign_writer {
             warn!(manager = %foreign, "foreign field manager on parent spec.source; force-reverting");
             // Walk-fix #6 v0.1.119 → v0.1.120: emit a
-            // Kubernetes Event so the foreign-write +
-            // revert pair leaves a durable audit trace
-            // visible via `kubectl describe platformstack
-            // default` (and `kubectl get events`). Without
-            // this, a transient revert vanishes from the
-            // `UnauthorizedSourceModification` condition
-            // within one reconcile cycle and operators
-            // staring at `kubectl get platformstack` see
-            // only the post-recovery `False/Clean` state —
-            // no record that a foreign write happened.
+            // Kubernetes Event pair so the foreign-write +
+            // revert leaves a durable audit trace visible via
+            // `kubectl describe platformstack default` (and
+            // `kubectl get events`). Without it, a transient
+            // revert vanishes from the
+            // `UnauthorizedSourceModification` condition within
+            // one reconcile cycle and operators staring at
+            // `kubectl get platformstack` see only the
+            // post-recovery `False/Clean` state — no record
+            // that a foreign write happened.
             //
-            // Best-effort: failures to publish the event
-            // are logged but don't fail the reconcile. The
-            // force-revert SSA patch (below) is the actual
-            // load-bearing action.
+            // This Warning is the DETECTION record, and it goes
+            // out BEFORE the revert on purpose (WI-400). If the
+            // revert lands but its answer is lost — the pass
+            // cut at `RECONCILE_DEADLINE`, or the operator
+            // restarted — the force apply has already taken
+            // the fields from the foreign manager: the next
+            // pass sees no foreign writer, publishes nothing,
+            // and the condition never goes True. Published
+            // after the patch, such a write would leave no
+            // trace at all. So the note says only what is true
+            // NOW — the revert is in progress — and the
+            // completion is `SourceReverted` below, published
+            // once the patch has landed. A revert whose answer
+            // is lost therefore shows the detection without the
+            // completion: it under-claims, never over-claims.
+            //
+            // Best-effort and bounded: a failed or unanswered
+            // publish is logged, never fatal. The force-revert
+            // SSA patch is the load-bearing action.
             let recorder = build_recorder(&ctx, &stack);
             let ev = KubeEvent {
                 type_: EventType::Warning,
                 reason: "ForeignFieldManager".into(),
                 note: Some(format!(
-                    "reverted external write to spec.source on parent Application \
+                    "detected external write to spec.source on parent Application \
                      {PARENT_APPLICATION_NAMESPACE}/{PARENT_APPLICATION_NAME} by field manager \
-                     {foreign:?}; PlatformController force-reapplied desired state \
+                     {foreign:?}; PlatformController is force-reapplying desired state \
                      (target={target_for_patch})"
                 )),
                 action: "ForceRevert".into(),
                 secondary: Some(parent_object_reference()),
             };
-            if let Err(e) = recorder.publish(ev).await {
-                warn!(error = %e, "failed to publish ForeignFieldManager event (continuing)");
-            }
+            publish_bounded(&recorder, ev).await;
         }
         patch_application(&apps, &patch_payload, &pending_upgrade).await?;
+        if target_for_patch != current_target {
+            ctx.note_bump(PlatformStackVersionHistoryEntry {
+                version: target_for_patch.clone(),
+                applied_at: now.to_rfc3339(),
+                outcome: "succeeded".into(),
+            });
+        }
         if foreign_writer.is_some() {
-            // Companion Normal event so the audit trail
-            // records the recovery action, not just the
-            // violation.
+            // The COMPLETION record: reached only once the
+            // revert has landed (`?` above returns on a failed
+            // patch, and a cut pass never gets here).
             let recorder = build_recorder(&ctx, &stack);
             let ev = KubeEvent {
                 type_: EventType::Normal,
@@ -918,9 +1238,7 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
                 action: "Reconciled".into(),
                 secondary: Some(parent_object_reference()),
             };
-            if let Err(e) = recorder.publish(ev).await {
-                warn!(error = %e, "failed to publish SourceReverted event (continuing)");
-            }
+            publish_bounded(&recorder, ev).await;
         }
     }
 
@@ -1112,7 +1430,22 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
     // missing node or a parse failure leaves the condition untouched rather
     // than flipping it to a false negative. A decorative read must never
     // fail a reconcile — the ADR 0048 anchor-403 lesson.
-    if let Some(fraction) = sample_node_free_fraction(&ctx.client, &ctx.capacity).await {
+    let fraction = match tokio::time::timeout(
+        NODE_SAMPLE_BUDGET,
+        sample_node_free_fraction(&ctx.client, &ctx.capacity),
+    )
+    .await
+    {
+        Ok(fraction) => fraction,
+        Err(_) => {
+            warn!(
+                budget_secs = NODE_SAMPLE_BUDGET.as_secs(),
+                "node disk sample did not answer in time; NodeDiskPressure left as it was"
+            );
+            None
+        }
+    };
+    if let Some(fraction) = fraction {
         let (status, reason, message) = node_disk_pressure_verdict(fraction);
         let cond = condition(
             COND_NODE_DISK_PRESSURE,
@@ -1197,25 +1530,30 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
             .map_or(0, |v| v.len()),
         "PlatformController bump decision"
     );
-    if appended_history {
-        append_version_history(
-            &mut new_status,
-            PlatformStackVersionHistoryEntry {
-                version: target_for_patch.clone(),
-                applied_at: now.to_rfc3339(),
-                outcome: "succeeded".into(),
-            },
-        );
+    // This pass's bump (noted when its patch landed) and any an earlier pass
+    // landed but was cut before writing (WI-400), oldest first. An entry
+    // already in the status is not appended twice.
+    let unrecorded = ctx.unrecorded_bumps();
+    for entry in &unrecorded {
+        let recorded = new_status
+            .version_history
+            .as_ref()
+            .is_some_and(|h| h.contains(entry));
+        if !recorded {
+            append_version_history(&mut new_status, entry.clone());
+        }
     }
 
     new_status.current_version = Some(target_for_patch.clone());
     new_status.target_version = Some(target_for_patch);
     info!(
         include_version_history = appended_history,
+        unrecorded_bumps = unrecorded.len(),
         new_history_len = new_status.version_history.as_ref().map_or(0, |v| v.len()),
         "PlatformController writing status"
     );
     write_status_if_changed(&stack, &ctx, new_status, appended_history).await?;
+    ctx.forget_bumps(&unrecorded);
     Ok(Action::requeue(sooner(
         parse_check_interval(&spec.source.check_interval),
         backup_recheck,
@@ -1245,7 +1583,18 @@ async fn assess_backup_health(
 ) -> Option<Duration> {
     let enabled = spec.backup.as_ref().is_some_and(|b| b.enabled);
     let observed = if enabled {
-        crate::backup_health::observe(&ctx.client).await
+        match tokio::time::timeout(
+            BACKUP_READ_BUDGET,
+            crate::backup_health::observe(&ctx.client),
+        )
+        .await
+        {
+            Ok(observed) => observed,
+            Err(_) => Err(format!(
+                "the apiserver did not answer within {}s",
+                BACKUP_READ_BUDGET.as_secs()
+            )),
+        }
     } else {
         // Disabled: `assess` returns `Absent` without looking at this.
         Ok(crate::backup_health::Observed::default())
@@ -1941,8 +2290,28 @@ async fn write_status_if_changed(
     include_version_history: bool,
 ) -> Result<(), Error> {
     let prior = stack.status.clone().unwrap_or_default();
-    if prior == new_status {
+    // Compared as `platform-controller` applies it (WI-400): the stall
+    // manager's `ReconcileStalled` alone is no reason to write; a duplicate
+    // condition type read back is, once, so the write drops it; and so is an
+    // ownership of `status.conditions` that only this manager's own apply
+    // puts right (`stall::controller_must_reapply`).
+    let prior_view = without_reconcile_stalled(&prior);
+    let unchanged = prior_view == platform_controller_view(&new_status);
+    if unchanged && !crate::stall::controller_must_reapply(stack) {
         return Ok(());
+    }
+    // A list this manager owns WHOLE (last written under the atomic CRD), or
+    // one carrying a condition nobody holds that this write leaves out, is
+    // first re-applied as it was read: that apply takes every condition by
+    // key. Applied straight away, the new status would NOT remove a
+    // condition it leaves out (a `BackupHealthy` that backups being turned
+    // off retire): it would stay, owned by nobody, and nothing would ever
+    // remove it (`stall::controller_must_adopt_first`).
+    if crate::stall::controller_must_adopt_first(stack, &new_status) {
+        write_status(stack, ctx, prior_view, false).await?;
+        if unchanged {
+            return Ok(());
+        }
     }
     write_status(stack, ctx, new_status, include_version_history).await
 }
@@ -1957,7 +2326,11 @@ fn build_status_patch(
     // append-only field is preserved across racy reconciles.
     // Walk-fix #7 v0.1.121 → v0.1.122. See
     // `write_status_if_changed` docstring for the rationale.
-    let mut status_value = serde_json::to_value(new_status)
+    //
+    // Serialized through `platform_controller_view` (WI-400): never
+    // `ReconcileStalled`, which has its own field manager, and never a
+    // second condition of one `type`, which the list-map apply refuses.
+    let mut status_value = serde_json::to_value(platform_controller_view(new_status))
         .expect("PlatformStackStatus is always serializable to JSON");
     if !include_version_history {
         if let Value::Object(map) = &mut status_value {
@@ -2008,9 +2381,58 @@ fn parse_check_interval(s: &str) -> Duration {
 /// not a slow poll.
 const MAX_CHECK_INTERVAL_SECS: u64 = 86_400;
 
-fn error_policy(_: Arc<PlatformStack>, err: &Error, _: Arc<Context>) -> Action {
-    warn!(error = %err, "PlatformController reconcile failed");
+fn error_policy(stack: Arc<PlatformStack>, err: &Error, ctx: Arc<Context>) -> Action {
+    ctx.metrics
+        .reconcile_errors
+        .with_label_values(&[KIND])
+        .inc();
+    match err {
+        Error::TimedOut(timed_out) => {
+            ctx.metrics
+                .reconcile_timeouts
+                .with_label_values(&[KIND])
+                .inc();
+            warn!(
+                error = %err,
+                deadline_secs = timed_out.after.as_secs(),
+                "PlatformController reconcile abandoned at its deadline; PlatformStack/default \
+                 keeps the status of the last reconcile that finished"
+            );
+            publish_deadline_event(&ctx, &stack, *timed_out);
+        }
+        _ => warn!(error = %err, "PlatformController reconcile failed"),
+    }
     Action::requeue(Duration::from_secs(60))
+}
+
+/// Report a reconcile cut at `RECONCILE_DEADLINE` as a Warning Event on
+/// `PlatformStack/default` (`kubectl describe platformstack default`).
+///
+/// Beside `ReconcileStalled`, which [`reconcile_with_deadline`] sets on the
+/// status: the condition says the stack is stalled NOW and goes when a pass
+/// finishes, while the Event stays in `kubectl get events` as the record of
+/// each cut. It is the only report of a cut whose condition could not be
+/// written, or must not be: while a rollback serves the atomic CRD
+/// (`crate::stall`). `error_policy` is synchronous, so the publish runs on a
+/// task of its own, bounded like every other Event here.
+fn publish_deadline_event(
+    ctx: &Context,
+    stack: &PlatformStack,
+    timed_out: operator_core::deadline::ReconcileTimedOut,
+) {
+    let recorder = build_recorder(ctx, stack);
+    let ev = KubeEvent {
+        type_: EventType::Warning,
+        reason: "ReconcileTimedOut".into(),
+        note: Some(format!(
+            "the reconcile did not finish within {}s and was abandoned; the status shown is \
+             from the last reconcile that finished, and the next attempt starts within 60s",
+            timed_out.after.as_secs()
+        )),
+        action: "Reconcile".into(),
+        secondary: None,
+    };
+    tokio::spawn(async move { publish_bounded(&recorder, ev).await });
 }
 
 /// In-memory marker the reconcile body sets when a destructive
@@ -3723,6 +4145,8 @@ mod backup_reconcile_tests {
                 kind: "Application".into(),
             }),
             capacity: operator_core::capacity::CapacityCache::new(),
+            upstream: Arc::new(super::test_upstreams::NoRegistry),
+            unrecorded_bumps: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -4137,5 +4561,1927 @@ mod backup_reconcile_tests {
             patch.body
         );
         assert_everything_else_carried(patch);
+    }
+}
+
+/// Stand-ins for the published chart repository, for the whole-reconcile
+/// tests. None of them touches the network.
+#[cfg(test)]
+mod test_upstreams {
+    use super::*;
+
+    /// Fails the test if the reconcile asks the registry anything. For
+    /// fixtures whose `lastUpstreamCheck` is fresh: a request there would
+    /// otherwise go to ghcr.io.
+    pub(super) struct NoRegistry;
+
+    #[async_trait::async_trait]
+    impl Upstream for NoRegistry {
+        async fn channel_latest(
+            &self,
+            upstream: &str,
+            _: Channel,
+            _: &str,
+        ) -> Result<(String, bool, Option<CompatibilityDoc>), Error> {
+            panic!("this test does not reach the registry, but the reconcile asked {upstream} for the channel-latest")
+        }
+
+        async fn path_max_change_class(
+            &self,
+            upstream: &str,
+            from_version: &str,
+            to_version: &str,
+        ) -> Result<ChangeClass, CompatError> {
+            panic!(
+                "this test does not reach the registry, but the reconcile asked {upstream} \
+                 to classify {from_version} -> {to_version}"
+            )
+        }
+    }
+
+    /// A registry that takes every request and never answers.
+    pub(super) struct SilentRegistry;
+
+    #[async_trait::async_trait]
+    impl Upstream for SilentRegistry {
+        async fn channel_latest(
+            &self,
+            _: &str,
+            _: Channel,
+            _: &str,
+        ) -> Result<(String, bool, Option<CompatibilityDoc>), Error> {
+            std::future::pending().await
+        }
+
+        async fn path_max_change_class(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<ChangeClass, CompatError> {
+            std::future::pending().await
+        }
+    }
+
+    /// A registry that answers at once: `latest` is the channel-latest and
+    /// every transition classifies as `class`.
+    pub(super) struct Published {
+        pub(super) latest: &'static str,
+        pub(super) class: ChangeClass,
+    }
+
+    #[async_trait::async_trait]
+    impl Upstream for Published {
+        async fn channel_latest(
+            &self,
+            _: &str,
+            _: Channel,
+            _: &str,
+        ) -> Result<(String, bool, Option<CompatibilityDoc>), Error> {
+            Ok((self.latest.to_string(), true, None))
+        }
+
+        async fn path_max_change_class(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<ChangeClass, CompatError> {
+            Ok(self.class)
+        }
+    }
+}
+
+/// Whole reconciles against an apiserver and a registry that may never
+/// answer (WI-400). The apiserver is scripted and MUTABLE between passes, so
+/// a test can cut one reconcile mid-flight and then run the one that
+/// follows it against what the first left behind.
+#[cfg(test)]
+mod bounded_reconcile_tests {
+    use std::sync::{Arc, Mutex};
+
+    use kube::client::Body;
+    use operator_core::Metrics;
+    use serde_json::{json, Value};
+
+    use super::test_upstreams::{NoRegistry, Published, SilentRegistry};
+    use super::*;
+
+    const NS: &str = "/namespaces/apprafter-system";
+    const PARENT: &str = "/apis/argoproj.io/v1alpha1/namespaces/argocd/applications/platform";
+    const ANCHOR: &str = "/api/v1/namespaces/apprafter-system/configmaps/platform-migration-anchor";
+    const STATUS: &str =
+        "/apis/apprafter.io/v1alpha1/namespaces/apprafter-system/platformstacks/default/status";
+    const PLANS: &str = "/apis/apprafter.io/v1alpha1/namespaces/apprafter-system/migrationplans";
+    const EVENTS: &str = "/apis/events.k8s.io/v1/namespaces/apprafter-system/events";
+    const CRD: &str =
+        "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/platformstacks.apprafter.io";
+
+    #[derive(Clone, Debug)]
+    struct Call {
+        method: String,
+        uri: String,
+        body: Value,
+    }
+
+    impl Call {
+        fn path(&self) -> &str {
+            self.uri.split('?').next().unwrap_or("")
+        }
+
+        fn is(&self, method: &str, path: &str) -> bool {
+            self.method == method && self.path() == path
+        }
+    }
+
+    /// What the scripted apiserver holds. Writes land in it, so the next
+    /// pass reads what the last one left.
+    struct Cluster {
+        stack: Value,
+        parent: Value,
+        plans: Vec<Value>,
+        anchor: Option<Value>,
+        /// `(method, path)` pairs the apiserver accepts and never answers.
+        silent: Vec<(&'static str, String)>,
+        calls: Vec<Call>,
+        /// Status applies merge `status.conditions` by `type`, with the
+        /// ownership kept in `metadata.managedFields`, as on a cluster whose
+        /// CRD makes the list a list-map (WI-400): see
+        /// [`apply_status_list_map`]. Off, a status write replaces the
+        /// status whole.
+        list_map: bool,
+        /// The PlatformStack CRD the apiserver serves makes
+        /// `status.conditions` a list-map ([`served_crd`]). Set with
+        /// `list_map`; off, it is the atomic list a rollback serves.
+        crd_list_map: bool,
+    }
+
+    type Shared = Arc<Mutex<Cluster>>;
+
+    fn ok(body: Value) -> (u16, Value) {
+        (200, body)
+    }
+
+    fn not_found() -> (u16, Value) {
+        (
+            404,
+            json!({ "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                    "reason": "NotFound", "code": 404, "message": "not found" }),
+        )
+    }
+
+    fn list(kind: &str, api_version: &str, items: &[Value]) -> (u16, Value) {
+        ok(json!({ "apiVersion": api_version, "kind": kind,
+                   "metadata": { "resourceVersion": "1" }, "items": items }))
+    }
+
+    fn respond(cluster: &mut Cluster, call: &Call) -> (u16, Value) {
+        let path = call.path().to_string();
+        let plan_name = path.strip_prefix(&format!("{PLANS}/")).map(str::to_string);
+        match (call.method.as_str(), path.as_str()) {
+            ("GET", PARENT) => ok(cluster.parent.clone()),
+            ("PATCH", PARENT) => {
+                let source = &call.body["spec"]["source"];
+                cluster.parent["spec"]["source"]["targetRevision"] =
+                    source["targetRevision"].clone();
+                cluster.parent["spec"]["source"]["helm"] = source["helm"].clone();
+                ok(cluster.parent.clone())
+            }
+            ("GET", PLANS) => list("MigrationPlanList", "apprafter.io/v1alpha1", &cluster.plans),
+            ("POST", PLANS) => {
+                cluster.plans.push(call.body.clone());
+                (201, call.body.clone())
+            }
+            ("GET", _) if plan_name.is_some() => {
+                let name = plan_name.unwrap();
+                match cluster.plans.iter().find(|p| p["metadata"]["name"] == name) {
+                    Some(plan) => ok(plan.clone()),
+                    None => not_found(),
+                }
+            }
+            ("DELETE", _) if plan_name.is_some() => {
+                let name = plan_name.unwrap();
+                cluster.plans.retain(|p| p["metadata"]["name"] != name);
+                ok(
+                    json!({ "kind": "Status", "apiVersion": "v1", "status": "Success",
+                           "metadata": {} }),
+                )
+            }
+            ("GET", ANCHOR) => match &cluster.anchor {
+                Some(anchor) => ok(anchor.clone()),
+                None => not_found(),
+            },
+            ("PATCH", ANCHOR) => ok(cluster
+                .anchor
+                .clone()
+                .expect("only an existing anchor is patched")),
+            ("GET", "/api/v1/nodes") => list("NodeList", "v1", &[]),
+            ("GET", p) if p == format!("/apis/batch/v1{NS}/cronjobs") => {
+                list("CronJobList", "batch/v1", &[])
+            }
+            ("GET", p) if p == format!("/apis/batch/v1{NS}/jobs") => {
+                list("JobList", "batch/v1", &[])
+            }
+            ("GET", p) if p == format!("/api/v1{NS}/pods") => list("PodList", "v1", &[]),
+            ("GET", p) if p == format!("/api/v1{NS}/configmaps/apprafter-backup-status") => {
+                not_found()
+            }
+            ("GET", STATUS) => ok(cluster.stack.clone()),
+            ("PATCH", STATUS) if cluster.list_map => apply_status_list_map(cluster, call),
+            ("PATCH", STATUS) => {
+                cluster.stack["status"] = call.body["status"].clone();
+                ok(cluster.stack.clone())
+            }
+            ("POST", EVENTS) => (201, call.body.clone()),
+            ("GET", CRD) => ok(served_crd(cluster.crd_list_map)),
+            _ => panic!("unscripted request: {} {}", call.method, call.uri),
+        }
+    }
+
+    /// The PlatformStack CRD as the apiserver serves it, cut down to what
+    /// `stall` reads: `status.conditions` in `v1alpha1`, a list-map keyed by
+    /// `type` or the atomic list of the CRD before WI-400.
+    fn served_crd(list_map: bool) -> Value {
+        let mut conditions = json!({ "type": "array",
+                                     "items": { "type": "object", "required": ["type"] } });
+        if list_map {
+            conditions["x-kubernetes-list-type"] = json!("map");
+            conditions["x-kubernetes-list-map-keys"] = json!(["type"]);
+        }
+        json!({
+            "apiVersion": "apiextensions.k8s.io/v1", "kind": "CustomResourceDefinition",
+            "metadata": { "name": "platformstacks.apprafter.io" },
+            "spec": {
+                "group": "apprafter.io", "scope": "Namespaced",
+                "names": { "kind": "PlatformStack", "plural": "platformstacks" },
+                "versions": [{
+                    "name": "v1alpha1", "served": true, "storage": true,
+                    "schema": { "openAPIV3Schema": { "type": "object", "properties": {
+                        "status": { "type": "object",
+                                    "properties": { "conditions": conditions } } } } },
+                }],
+            },
+        })
+    }
+
+    /// A status apply as the apiserver merges it once `status.conditions` is
+    /// a list-map keyed by `type` (WI-400), following what kind measured
+    /// (`e2e/platformstack-listmap-upgrade-proof.sh`): a manager owns, by
+    /// `type`, the conditions it sent; an entry it stops sending goes unless
+    /// another manager owns it by key; an ownership of the whole list left
+    /// from the atomic list (`f:conditions: {}`) is replaced by one by key,
+    /// and an entry that apply leaves out stays, owned by nobody; a pair of
+    /// one `type` already on the object becomes one entry; a list that names
+    /// one `type` twice is refused. The rest of the status is
+    /// `platform-controller`'s, and its apply replaces it.
+    fn apply_status_list_map(cluster: &mut Cluster, call: &Call) -> (u16, Value) {
+        let manager = call
+            .uri
+            .split(['?', '&'])
+            .find_map(|p| p.strip_prefix("fieldManager="))
+            .expect("an apply names its field manager")
+            .to_string();
+        let type_of = |c: &Value| c["type"].as_str().unwrap_or_default().to_string();
+        let key = |t: &str| format!(r#"k:{{"type":"{t}"}}"#);
+        let sent = call.body["status"]["conditions"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let mut sent_types: Vec<String> = Vec::new();
+        for t in sent.iter().map(type_of) {
+            if sent_types.contains(&t) {
+                return (
+                    422,
+                    json!({ "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                            "reason": "Invalid", "code": 422,
+                            "message": format!(
+                                ".status.conditions: duplicate entries for key [type=\"{t}\"]") }),
+                );
+            }
+            sent_types.push(t);
+        }
+        let fields = cluster.stack["metadata"]["managedFields"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let (mine, others): (Vec<Value>, Vec<Value>) = fields
+            .into_iter()
+            .partition(|e| e["subresource"] == "status" && e["manager"] == manager.as_str());
+        let owns = |e: &Value, t: &str| {
+            e["subresource"] == "status"
+                && e["fieldsV1"]["f:status"]["f:conditions"]
+                    .get(key(t))
+                    .is_some()
+        };
+        let mut conditions = cluster.stack["status"]["conditions"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        conditions.retain(|c| {
+            let t = type_of(c);
+            let let_go = mine.iter().any(|e| owns(e, &t)) && !sent_types.contains(&t);
+            !let_go || others.iter().any(|e| owns(e, &t))
+        });
+        for c in sent {
+            match conditions
+                .iter_mut()
+                .find(|have| type_of(have) == type_of(&c))
+            {
+                Some(have) => *have = c,
+                None => conditions.push(c),
+            }
+        }
+        let mut seen: Vec<String> = Vec::new();
+        conditions.retain(|c| {
+            let t = type_of(c);
+            let first = !seen.contains(&t);
+            seen.push(t);
+            first
+        });
+        if manager == FIELD_MANAGER {
+            cluster.stack["status"] = call.body["status"].clone();
+        }
+        cluster.stack["status"]["conditions"] = json!(conditions);
+        let mut fields = others;
+        if !sent_types.is_empty() {
+            let owned: serde_json::Map<String, Value> = sent_types
+                .iter()
+                .map(|t| (key(t), json!({ ".": {} })))
+                .collect();
+            fields.push(json!({
+                "manager": manager, "operation": "Apply", "subresource": "status",
+                "apiVersion": "apprafter.io/v1alpha1", "fieldsType": "FieldsV1",
+                "fieldsV1": { "f:status": { "f:conditions": owned } },
+            }));
+        }
+        cluster.stack["metadata"]["managedFields"] = json!(fields);
+        ok(cluster.stack.clone())
+    }
+
+    fn scripted(cluster: Cluster) -> (Client, Shared) {
+        let shared: Shared = Arc::new(Mutex::new(cluster));
+        let state = shared.clone();
+        let service = tower::service_fn(move |req: http::Request<Body>| {
+            let state = state.clone();
+            async move {
+                let method = req.method().to_string();
+                let uri = req.uri().to_string();
+                let bytes = req.into_body().collect_bytes().await.expect("request body");
+                let call = Call {
+                    method,
+                    uri,
+                    body: serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+                };
+                let answer = {
+                    let mut cluster = state.lock().expect("cluster");
+                    cluster.calls.push(call.clone());
+                    let silent = cluster
+                        .silent
+                        .iter()
+                        .any(|(m, p)| *m == call.method && p.as_str() == call.path());
+                    (!silent).then(|| respond(&mut cluster, &call))
+                };
+                let Some((code, payload)) = answer else {
+                    std::future::pending::<()>().await;
+                    unreachable!("a silent request is never answered");
+                };
+                Ok::<_, std::convert::Infallible>(
+                    http::Response::builder()
+                        .status(code)
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&payload).expect("payload")))
+                        .expect("response"),
+                )
+            }
+        });
+        (Client::new(service, "apprafter-system"), shared)
+    }
+
+    fn context(client: Client, upstream: Arc<dyn Upstream>) -> Arc<Context> {
+        Arc::new(Context {
+            client,
+            metrics: Arc::new(Metrics::new()),
+            app_api_resource: ApiResource::from_gvk(&GroupVersionKind {
+                group: "argoproj.io".into(),
+                version: "v1alpha1".into(),
+                kind: "Application".into(),
+            }),
+            capacity: operator_core::capacity::CapacityCache::new(),
+            upstream,
+            unrecorded_bumps: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    fn prior_condition(type_: &str, status: &str, reason: &str) -> Value {
+        json!({ "type": type_, "status": status, "reason": reason, "message": "m",
+                "lastTransitionTime": "2026-09-01T00:00:00+00:00" })
+    }
+
+    /// `PlatformStack/default` settled on `version`, pinned to `pin`,
+    /// polled a moment ago (so no registry request unless a test clears
+    /// `lastUpstreamCheck`), with every condition a settled cluster carries.
+    fn stack_on(version: &str, pin: &str) -> Value {
+        json!({
+            "apiVersion": "apprafter.io/v1alpha1", "kind": "PlatformStack",
+            "metadata": { "name": "default", "namespace": "apprafter-system", "generation": 3,
+                          "uid": "ps-uid" },
+            "spec": {
+                "channel": "stable", "pin": pin,
+                "source": { "upstream": "oci://ghcr.io/apprafter/platform-stack",
+                            "repoURL": "oci://ghcr.io/apprafter/platform-stack",
+                            "checkInterval": "6h" },
+                "values": { "tier": 1 },
+            },
+            "status": {
+                "currentVersion": version, "targetVersion": version,
+                "availableVersion": pin, "lastUpstreamCheck": Utc::now().to_rfc3339(),
+                "versionHistory": [{ "version": version,
+                                     "appliedAt": "2026-09-20T00:00:00+00:00",
+                                     "outcome": "succeeded" }],
+                "conditions": [
+                    prior_condition("Ready", "True", "Healthy"),
+                    prior_condition("Synced", "True", "Reconciled"),
+                    prior_condition("UpstreamReachable", "True", "Reachable"),
+                    prior_condition("YankedVersion", "False", "NotYanked"),
+                    prior_condition("MigrationPending", "False", "Clean"),
+                    prior_condition("UpgradeAvailable", "False", "UpToDate"),
+                    prior_condition("UnauthorizedSourceModification", "False", "Clean"),
+                ],
+            },
+        })
+    }
+
+    /// The root Application on `target`, synced, healthy, its source owned
+    /// by `platform-controller`.
+    fn parent_on(stack: &Value, target: &str) -> Value {
+        let spec: PlatformStack = serde_json::from_value(stack.clone()).expect("stack");
+        let desired = build_desired(&spec.spec, target);
+        json!({
+            "apiVersion": "argoproj.io/v1alpha1", "kind": "Application",
+            "metadata": {
+                "name": "platform", "namespace": "argocd",
+                "managedFields": [{ "manager": "platform-controller", "operation": "Apply",
+                                    "fieldsV1": { "f:spec": { "f:source": { "f:targetRevision": {} } } } }],
+            },
+            "spec": { "source": { "targetRevision": target,
+                                  "helm": { "valuesObject": desired.helm_values } } },
+            "status": { "sync": { "status": "Synced" }, "health": { "status": "Healthy" },
+                        "operationState": { "phase": "Succeeded" } },
+        })
+    }
+
+    fn cluster(stack: Value, parent: Value) -> Cluster {
+        Cluster {
+            stack,
+            parent,
+            plans: vec![],
+            anchor: None,
+            silent: vec![],
+            calls: vec![],
+            list_map: false,
+            crd_list_map: false,
+        }
+    }
+
+    fn the_stack(state: &Shared) -> Arc<PlatformStack> {
+        let stack = state.lock().unwrap().stack.clone();
+        Arc::new(serde_json::from_value(stack).expect("stack"))
+    }
+
+    fn calls(state: &Shared) -> Vec<Call> {
+        state.lock().unwrap().calls.clone()
+    }
+
+    /// The one status patch the reconcile sent.
+    fn status_patch(calls: &[Call]) -> Call {
+        let patches: Vec<&Call> = calls.iter().filter(|c| c.is("PATCH", STATUS)).collect();
+        assert_eq!(patches.len(), 1, "one status write: {calls:#?}");
+        patches[0].clone()
+    }
+
+    fn written_condition<'a>(patch: &'a Call, type_: &str) -> &'a Value {
+        patch.body["status"]["conditions"]
+            .as_array()
+            .expect("the patch carries the conditions")
+            .iter()
+            .find(|c| c["type"] == type_)
+            .unwrap_or_else(|| panic!("{type_} must ride the write: {:#}", patch.body))
+    }
+
+    /// Every condition rides the write, under the controller's own SSA
+    /// identity: a write that left one out would prune it.
+    fn assert_every_condition_carried(patch: &Call) {
+        for t in [
+            "Ready",
+            "Synced",
+            "UpstreamReachable",
+            "YankedVersion",
+            "MigrationPending",
+            "UpgradeAvailable",
+            "UnauthorizedSourceModification",
+        ] {
+            written_condition(patch, t);
+        }
+        assert!(
+            patch.uri.contains("fieldManager=platform-controller")
+                && patch.uri.contains("force=true"),
+            "{}",
+            patch.uri
+        );
+    }
+
+    /// The channel-latest comes from the upstream behind `ctx.upstream`.
+    #[tokio::test]
+    async fn the_channel_latest_is_read_through_the_upstream() {
+        let mut stack = stack_on("0.2.80", "0.2.80");
+        stack["status"]["lastUpstreamCheck"] = Value::Null;
+        let parent = parent_on(&stack, "0.2.80");
+        let (client, state) = scripted(cluster(stack, parent));
+        let upstream = Arc::new(Published {
+            latest: "0.2.81",
+            class: ChangeClass::Safe,
+        });
+        reconcile(the_stack(&state), context(client, upstream))
+            .await
+            .expect("the reconcile succeeds");
+        let patch = status_patch(&calls(&state));
+        assert_eq!(patch.body["status"]["availableVersion"], "0.2.81");
+        assert_eq!(
+            written_condition(&patch, "UpstreamReachable")["status"],
+            "True"
+        );
+        assert_every_condition_carried(&patch);
+    }
+
+    /// A transition is classified through `ctx.upstream` too: a breaking one
+    /// is gated behind a MigrationPlan instead of deployed.
+    #[tokio::test]
+    async fn a_transition_is_classified_through_the_upstream() {
+        let stack = stack_on("0.2.80", "0.2.81");
+        let parent = parent_on(&stack, "0.2.80");
+        let (client, state) = scripted(cluster(stack, parent));
+        let upstream = Arc::new(Published {
+            latest: "0.2.81",
+            class: ChangeClass::Breaking,
+        });
+        reconcile(the_stack(&state), context(client, upstream))
+            .await
+            .expect("the reconcile succeeds");
+        let calls = calls(&state);
+        assert!(
+            calls.iter().any(|c| c.is("POST", PLANS)
+                && c.body["metadata"]["name"] == "platform-0-2-80-to-0-2-81"),
+            "{calls:#?}"
+        );
+        let patch = status_patch(&calls);
+        assert_eq!(
+            written_condition(&patch, "MigrationPending")["status"],
+            "True"
+        );
+        assert_eq!(patch.body["status"]["currentVersion"], "0.2.80");
+        assert_every_condition_carried(&patch);
+    }
+
+    /// Far past every budget inside a reconcile: a reconcile still running at
+    /// this point is hung, not slow.
+    const HUNG: Duration = Duration::from_secs(600);
+
+    /// WI-400: a registry that takes the connection and never answers. The
+    /// poll is the reconcile's FIRST `.await`, so without a bound nothing
+    /// after it ran — no parent read, no status — and every condition froze
+    /// at its last value, `UpstreamReachable=True` included: the v0.2.12
+    /// wedge by a different road. Bounded, the poll fails like any registry
+    /// error and the reconcile degrades: the pin is still enforced and the
+    /// status says the upstream is unreachable.
+    #[tokio::test(start_paused = true)]
+    async fn a_registry_that_never_answers_the_poll_degrades_instead_of_freezing() {
+        let mut stack = stack_on("0.2.80", "0.2.80");
+        stack["status"]["lastUpstreamCheck"] = Value::Null;
+        let parent = parent_on(&stack, "0.2.80");
+        let (client, state) = scripted(cluster(stack, parent));
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(
+            HUNG,
+            reconcile(the_stack(&state), context(client, Arc::new(SilentRegistry))),
+        )
+        .await
+        .expect("the reconcile finished on its own")
+        .expect("a registry that never answers degrades, it does not fail the reconcile");
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_secs(20),
+            "the poll's budget"
+        );
+        let patch = status_patch(&calls(&state));
+        let reachable = written_condition(&patch, "UpstreamReachable");
+        assert_eq!(reachable["status"], "False");
+        assert_eq!(reachable["reason"], "PollFailed");
+        assert!(
+            reachable["message"]
+                .as_str()
+                .unwrap()
+                .contains("did not finish resolving the channel-latest within 20s"),
+            "{reachable:#}"
+        );
+        assert_eq!(
+            patch.body["status"]["availableVersion"], "0.2.80",
+            "kept, not cleared"
+        );
+        assert!(
+            patch.body["status"]["lastUpstreamCheck"].is_null(),
+            "a failed poll does not count as a check: {:#}",
+            patch.body
+        );
+        assert_every_condition_carried(&patch);
+    }
+
+    /// The same silent registry while the parent is mid-sync: the in-flight
+    /// early return writes the degraded verdict too.
+    #[tokio::test(start_paused = true)]
+    async fn a_registry_that_never_answers_mid_upgrade_still_reaches_the_status() {
+        let mut stack = stack_on("0.2.80", "0.2.81");
+        stack["status"]["lastUpstreamCheck"] = Value::Null;
+        let mut parent = parent_on(&stack, "0.2.80");
+        parent["status"]["sync"]["status"] = json!("OutOfSync");
+        let (client, state) = scripted(cluster(stack, parent));
+        let action = tokio::time::timeout(
+            HUNG,
+            reconcile(the_stack(&state), context(client, Arc::new(SilentRegistry))),
+        )
+        .await
+        .expect("the reconcile finished on its own")
+        .expect("the reconcile succeeds");
+        assert_eq!(action, Action::requeue(IN_FLIGHT_REQUEUE));
+        let patch = status_patch(&calls(&state));
+        assert_eq!(
+            written_condition(&patch, "UpstreamReachable")["status"],
+            "False"
+        );
+        assert_every_condition_carried(&patch);
+    }
+
+    /// A pin to a version whose transition cannot be classified because the
+    /// registry never answers: the reconcile fails CLOSED — it holds the
+    /// current target, creates no plan, and says why — instead of hanging
+    /// before the gate.
+    #[tokio::test(start_paused = true)]
+    async fn a_registry_that_never_answers_the_classification_holds_the_current_target() {
+        let stack = stack_on("0.2.80", "0.2.81");
+        let parent = parent_on(&stack, "0.2.80");
+        let (client, state) = scripted(cluster(stack, parent));
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(
+            HUNG,
+            reconcile(the_stack(&state), context(client, Arc::new(SilentRegistry))),
+        )
+        .await
+        .expect("the reconcile finished on its own")
+        .expect("the reconcile succeeds");
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_secs(20),
+            "the classification's budget"
+        );
+        let calls = calls(&state);
+        assert!(
+            !calls.iter().any(|c| c.is("POST", PLANS)),
+            "no gate without a class: {calls:#?}"
+        );
+        let bump = calls
+            .iter()
+            .find(|c| c.is("PATCH", PARENT))
+            .expect("the parent is patched");
+        assert_eq!(
+            bump.body["spec"]["source"]["targetRevision"], "0.2.80",
+            "held"
+        );
+        let patch = status_patch(&calls);
+        let reachable = written_condition(&patch, "UpstreamReachable");
+        assert_eq!(reachable["status"], "False");
+        assert!(
+            reachable["message"]
+                .as_str()
+                .unwrap()
+                .contains("did not finish classifying the transition within 20s"),
+            "{reachable:#}"
+        );
+        assert_eq!(patch.body["status"]["currentVersion"], "0.2.80");
+        assert_every_condition_carried(&patch);
+    }
+
+    /// `BackupHealthy` reads the backup objects (WI-386). A read the
+    /// apiserver never answers is itself the verdict, `Unknown`, and it is
+    /// written beside every other condition — the ADR 0048 anchor-403 lesson
+    /// made these reads tolerate ERRORS; this makes them tolerate a HANG.
+    #[tokio::test(start_paused = true)]
+    async fn a_backup_read_that_never_answers_is_unknown_and_the_status_is_written() {
+        let mut stack = stack_on("0.2.80", "0.2.80");
+        stack["spec"]["backup"] = json!({
+            "enabled": true, "schedule": "0 3 * * *",
+            "bucket": "s3:https://s3.example/bucket",
+            "credentialRef": { "name": "apprafter-backup-s3" },
+            "stagingMode": "monolithic", "checkSchedule": "",
+        });
+        let parent = parent_on(&stack, "0.2.80");
+        let mut cluster = cluster(stack, parent);
+        cluster
+            .silent
+            .push(("GET", format!("/apis/batch/v1{NS}/cronjobs")));
+        let (client, state) = scripted(cluster);
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(
+            HUNG,
+            reconcile(the_stack(&state), context(client, Arc::new(NoRegistry))),
+        )
+        .await
+        .expect("the reconcile finished on its own")
+        .expect("the reconcile succeeds");
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_secs(10),
+            "the backup reads' budget"
+        );
+        let patch = status_patch(&calls(&state));
+        let backup = written_condition(&patch, crate::status::COND_BACKUP_HEALTHY);
+        assert_eq!(backup["status"], "Unknown");
+        assert_eq!(backup["reason"], crate::backup_health::REASON_UNREADABLE);
+        assert!(
+            backup["message"]
+                .as_str()
+                .unwrap()
+                .contains("the apiserver did not answer within 10s"),
+            "{backup:#}"
+        );
+        assert_every_condition_carried(&patch);
+    }
+
+    /// `NodeDiskPressure` samples the kubelet through the apiserver's node
+    /// proxy — a long-running request the apiserver's own 60s limit does not
+    /// cover, and slowest exactly when the node is short of disk. A sample
+    /// that never answers leaves the condition as it was, and the status is
+    /// still written.
+    ///
+    /// The stack starts WITH a `NodeDiskPressure=True` from an earlier
+    /// sample: "left as it was" has to be told apart from "pruned". The
+    /// status write is an SSA apply under `platform-controller`, so a write
+    /// that left the condition out would remove it from the cluster —
+    /// exactly when the node is short of disk.
+    #[tokio::test(start_paused = true)]
+    async fn a_node_sample_that_never_answers_leaves_its_condition_and_the_status_is_written() {
+        let mut stack = stack_on("0.2.80", "0.2.80");
+        let earlier_sample =
+            prior_condition("NodeDiskPressure", "True", "NodeFilesystemNearlyFull");
+        stack["status"]["conditions"]
+            .as_array_mut()
+            .unwrap()
+            .push(earlier_sample.clone());
+        let parent = parent_on(&stack, "0.2.80");
+        let mut cluster = cluster(stack, parent);
+        cluster.silent.push(("GET", "/api/v1/nodes".to_string()));
+        let (client, state) = scripted(cluster);
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(
+            HUNG,
+            reconcile(the_stack(&state), context(client, Arc::new(NoRegistry))),
+        )
+        .await
+        .expect("the reconcile finished on its own")
+        .expect("the reconcile succeeds");
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_secs(10),
+            "the node sample's budget"
+        );
+        let patch = status_patch(&calls(&state));
+        assert_eq!(
+            written_condition(&patch, COND_NODE_DISK_PRESSURE),
+            &earlier_sample,
+            "no sample, so the earlier verdict is carried unchanged — status, reason, \
+             message and lastTransitionTime"
+        );
+        assert_every_condition_carried(&patch);
+    }
+
+    /// The anchor ConfigMap is an Argo-tree nicety (ADR 0048). Its lookup
+    /// and its annotation patch never answering must not stop the gate it
+    /// decorates: the plan is created un-owned, exactly as when the anchor is
+    /// unreadable, and the status says the upgrade is pending.
+    #[tokio::test(start_paused = true)]
+    async fn an_anchor_that_never_answers_neither_blocks_the_gate_nor_the_status() {
+        let stack = stack_on("0.2.80", "0.2.81");
+        let parent = parent_on(&stack, "0.2.80");
+        let mut cluster = cluster(stack, parent);
+        cluster.anchor = Some(json!({
+            "apiVersion": "v1", "kind": "ConfigMap",
+            "metadata": { "name": "platform-migration-anchor",
+                          "namespace": "apprafter-system", "uid": "anchor-uid" },
+        }));
+        cluster.silent.push(("GET", ANCHOR.to_string()));
+        let (client, state) = scripted(cluster);
+        let upstream = Arc::new(Published {
+            latest: "0.2.81",
+            class: ChangeClass::Breaking,
+        });
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(
+            HUNG,
+            reconcile(the_stack(&state), context(client, upstream)),
+        )
+        .await
+        .expect("the reconcile finished on its own")
+        .expect("the reconcile succeeds");
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_secs(10),
+            "two anchor calls, each on its own budget"
+        );
+        let calls = calls(&state);
+        let plan = calls
+            .iter()
+            .find(|c| c.is("POST", PLANS))
+            .expect("the gate is created");
+        assert!(
+            plan.body["metadata"]["ownerReferences"].is_null(),
+            "un-owned, as when the anchor is unreadable: {:#}",
+            plan.body
+        );
+        let patch = status_patch(&calls);
+        assert_eq!(
+            written_condition(&patch, "MigrationPending")["status"],
+            "True"
+        );
+        assert_every_condition_carried(&patch);
+    }
+
+    /// The audit Events of a foreign-writer revert are best-effort. An Events
+    /// API that never answers does not hold the status — which carries the
+    /// same finding as `UnauthorizedSourceModification=True`.
+    #[tokio::test(start_paused = true)]
+    async fn an_events_api_that_never_answers_does_not_hold_the_status() {
+        let stack = stack_on("0.2.80", "0.2.80");
+        let mut parent = parent_on(&stack, "0.2.80");
+        parent["metadata"]["managedFields"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({ "manager": "kubectl-edit", "operation": "Update",
+                          "fieldsV1": { "f:spec": { "f:source": { "f:targetRevision": {} } } } }));
+        let mut cluster = cluster(stack, parent);
+        cluster.silent.push(("POST", EVENTS.to_string()));
+        let (client, state) = scripted(cluster);
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(
+            HUNG,
+            reconcile(the_stack(&state), context(client, Arc::new(NoRegistry))),
+        )
+        .await
+        .expect("the reconcile finished on its own")
+        .expect("the reconcile succeeds");
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_secs(10),
+            "two audit Events, each on its own budget"
+        );
+        let patch = status_patch(&calls(&state));
+        assert_eq!(
+            written_condition(&patch, "UnauthorizedSourceModification")["status"],
+            "True"
+        );
+        assert_every_condition_carried(&patch);
+    }
+
+    /// WI-400 / GOTCHA-51: an apiserver that takes a request and never
+    /// answers held this singleton's reconcile — and every trigger queued
+    /// behind it — for good. Under `RECONCILE_DEADLINE` the reconcile is
+    /// abandoned at exactly the deadline and comes back as the controller's
+    /// own error, which `error_policy` counts and requeues.
+    #[tokio::test(start_paused = true)]
+    async fn a_reconcile_the_apiserver_never_answers_is_abandoned_at_its_deadline() {
+        let stack: Arc<PlatformStack> =
+            Arc::new(serde_json::from_value(stack_on("0.2.80", "0.2.80")).expect("stack"));
+        let ctx = context(
+            operator_core::testing::stalled_client(),
+            Arc::new(NoRegistry),
+        );
+        let started = tokio::time::Instant::now();
+        let err = operator_core::deadline::within(
+            RECONCILE_DEADLINE,
+            reconcile(stack.clone(), ctx.clone()),
+        )
+        .await
+        .expect_err("a reconcile that never finishes is cut");
+        assert_eq!(started.elapsed(), RECONCILE_DEADLINE);
+        assert!(
+            matches!(
+                err,
+                Error::TimedOut(operator_core::deadline::ReconcileTimedOut { after })
+                    if after == RECONCILE_DEADLINE
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            error_policy(stack, &err, ctx.clone()),
+            Action::requeue(Duration::from_secs(60))
+        );
+        assert_eq!(
+            ctx.metrics
+                .reconcile_timeouts
+                .with_label_values(&["PlatformStack"])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            ctx.metrics
+                .reconcile_errors
+                .with_label_values(&["PlatformStack"])
+                .get(),
+            1.0
+        );
+    }
+
+    /// Any other failure is counted as an error, not as a timeout.
+    #[tokio::test]
+    async fn an_ordinary_failure_is_not_counted_as_a_timeout() {
+        let stack: Arc<PlatformStack> =
+            Arc::new(serde_json::from_value(stack_on("0.2.80", "0.2.80")).expect("stack"));
+        let (client, _) = scripted(cluster(stack_on("0.2.80", "0.2.80"), json!({})));
+        let ctx = context(client, Arc::new(NoRegistry));
+        let err = Error::CheckInterval("9x".into());
+        assert_eq!(
+            error_policy(stack, &err, ctx.clone()),
+            Action::requeue(Duration::from_secs(60))
+        );
+        assert_eq!(
+            ctx.metrics
+                .reconcile_timeouts
+                .with_label_values(&["PlatformStack"])
+                .get(),
+            0.0
+        );
+        assert_eq!(
+            ctx.metrics
+                .reconcile_errors
+                .with_label_values(&["PlatformStack"])
+                .get(),
+            1.0
+        );
+    }
+
+    /// `error_policy` reports a cut as a Warning Event on the stack, the
+    /// record `kubectl describe platformstack default` keeps after the
+    /// `ReconcileStalled` condition is gone, and writes no status itself:
+    /// the condition is `reconcile_with_deadline`'s (see `stall_tests`).
+    #[tokio::test(start_paused = true)]
+    async fn an_abandoned_reconcile_is_reported_as_a_warning_event_on_the_stack() {
+        let stack = stack_on("0.2.80", "0.2.80");
+        let parent = parent_on(&stack, "0.2.80");
+        let mut cluster = cluster(stack, parent);
+        cluster.silent.push(("GET", PARENT.to_string()));
+        let (client, state) = scripted(cluster);
+        let ctx = context(client, Arc::new(NoRegistry));
+        let err = operator_core::deadline::within(
+            RECONCILE_DEADLINE,
+            reconcile(the_stack(&state), ctx.clone()),
+        )
+        .await
+        .expect_err("a reconcile that never finishes is cut");
+        error_policy(the_stack(&state), &err, ctx);
+        let event = tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let found = calls(&state).into_iter().find(|c| c.is("POST", EVENTS));
+                if let Some(event) = found {
+                    return event;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the Event is published");
+        assert_eq!(event.body["type"], "Warning");
+        assert_eq!(event.body["reason"], "ReconcileTimedOut");
+        assert_eq!(event.body["regarding"]["kind"], "PlatformStack");
+        assert_eq!(event.body["regarding"]["name"], "default");
+        let note = event.body["note"].as_str().unwrap();
+        assert!(note.contains("did not finish within 120s"), "{note}");
+        assert!(
+            !calls(&state).iter().any(|c| c.is("PATCH", STATUS)),
+            "error_policy writes no status"
+        );
+    }
+
+    /// A platform MigrationPlan for `from -> to`, approved and executed.
+    fn completed_plan(from: &str, to: &str) -> Value {
+        let name = synthesize_platform_plan_name(from, to);
+        let plan = build_platform_migration_plan_cr(
+            &name,
+            from,
+            to,
+            ChangeClass::Breaking,
+            Some(to),
+            None,
+        );
+        let mut plan = serde_json::to_value(plan).expect("plan");
+        plan["status"] = json!({ "phase": "completed" });
+        plan
+    }
+
+    /// WI-400 cancellation hazard: an approved upgrade's plan reaches
+    /// `completed` and the reconcile takes the bump. The plan GC used to run
+    /// with nothing to keep and DELETE that plan before the parent was
+    /// patched, so a reconcile cut in between — a hang on the anchor, an
+    /// Event or the patch itself, now cut at `RECONCILE_DEADLINE` — left the
+    /// parent on the old version and the approval gone: the next pass found
+    /// no plan, classified the transition again and gated it behind a fresh
+    /// `pending-approval` plan. The operator's approval was lost, and no
+    /// reconcile could bring it back.
+    #[tokio::test(start_paused = true)]
+    async fn a_reconcile_cut_before_the_bump_keeps_the_approval_that_authorises_it() {
+        let stack = stack_on("0.2.79", "0.2.80");
+        let parent = parent_on(&stack, "0.2.79");
+        let mut cluster = cluster(stack, parent);
+        cluster.plans.push(completed_plan("0.2.79", "0.2.80"));
+        cluster.silent.push(("PATCH", PARENT.to_string()));
+        let (client, state) = scripted(cluster);
+        let ctx = context(client, Arc::new(NoRegistry));
+
+        let err = operator_core::deadline::within(
+            RECONCILE_DEADLINE,
+            reconcile(the_stack(&state), ctx.clone()),
+        )
+        .await
+        .expect_err("the bump never answers, so the reconcile is cut");
+        assert!(matches!(err, Error::TimedOut(_)), "{err:?}");
+        let first = calls(&state);
+        assert!(
+            first.iter().any(|c| c.is("PATCH", PARENT)),
+            "the cut fell on the bump: {first:#?}"
+        );
+        assert!(
+            !first.iter().any(|c| c.method == "DELETE"),
+            "the approving plan survives the cut: {first:#?}"
+        );
+
+        // The apiserver answers again: the next pass makes the approved bump.
+        state.lock().unwrap().silent.clear();
+        reconcile(the_stack(&state), ctx)
+            .await
+            .expect("the next reconcile succeeds");
+        let bump = calls(&state)
+            .into_iter()
+            .rev()
+            .find(|c| c.is("PATCH", PARENT))
+            .expect("the bump");
+        assert_eq!(bump.body["spec"]["source"]["targetRevision"], "0.2.80");
+        assert!(
+            !calls(&state).iter().any(|c| c.is("POST", PLANS)),
+            "no second gate for an approved transition"
+        );
+    }
+
+    /// The approving plan is kept only while it still authorises something:
+    /// once the parent is on the new version the GC collects it, as before.
+    #[tokio::test]
+    async fn the_approving_plan_is_collected_once_the_bump_has_landed() {
+        let stack = stack_on("0.2.80", "0.2.80");
+        let parent = parent_on(&stack, "0.2.80");
+        let mut cluster = cluster(stack, parent);
+        cluster.plans.push(completed_plan("0.2.79", "0.2.80"));
+        let (client, state) = scripted(cluster);
+        reconcile(the_stack(&state), context(client, Arc::new(NoRegistry)))
+            .await
+            .expect("the reconcile succeeds");
+        let deleted = format!("{PLANS}/platform-0-2-79-to-0-2-80");
+        assert!(
+            calls(&state).iter().any(|c| c.is("DELETE", &deleted)),
+            "{:#?}",
+            calls(&state)
+        );
+    }
+
+    /// The root Application with a foreign field manager on
+    /// `spec.source.targetRevision` — a `kubectl edit` to revert.
+    fn edited_parent(stack: &Value, target: &str) -> Value {
+        let mut parent = parent_on(stack, target);
+        parent["metadata"]["managedFields"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({ "manager": "kubectl-edit", "operation": "Update",
+                          "fieldsV1": { "f:spec": { "f:source": { "f:targetRevision": {} } } } }));
+        parent
+    }
+
+    /// The bodies of the Events the reconcile published, in order.
+    fn audit_events(calls: &[Call]) -> Vec<Value> {
+        calls
+            .iter()
+            .filter(|c| c.is("POST", EVENTS))
+            .map(|c| c.body.clone())
+            .collect()
+    }
+
+    /// WI-400 cancellation hazard: the `ForeignFieldManager` Warning goes out
+    /// BEFORE the revert patch, and its note used to say the controller
+    /// "force-reapplied desired state". A pass cut (or failed) at the patch
+    /// left that Warning describing a revert that never happened.
+    ///
+    /// The Warning must still go out before the patch: it is the only record
+    /// of the detection when the revert LANDS but its answer is lost. The
+    /// force apply has then already taken the fields from the foreign
+    /// manager, so the next pass sees no foreign writer, publishes nothing,
+    /// and `UnauthorizedSourceModification` never goes True.
+    #[tokio::test(start_paused = true)]
+    async fn a_reconcile_cut_at_the_revert_records_the_detection_and_claims_no_revert() {
+        let stack = stack_on("0.2.80", "0.2.80");
+        let parent = edited_parent(&stack, "0.2.80");
+        let mut cluster = cluster(stack, parent);
+        cluster.silent.push(("PATCH", PARENT.to_string()));
+        let (client, state) = scripted(cluster);
+        let ctx = context(client, Arc::new(NoRegistry));
+        let err = operator_core::deadline::within(
+            RECONCILE_DEADLINE,
+            reconcile(the_stack(&state), ctx.clone()),
+        )
+        .await
+        .expect_err("the revert never answers, so the reconcile is cut");
+        assert!(matches!(err, Error::TimedOut(_)), "{err:?}");
+        let first = calls(&state);
+        assert!(first.iter().any(|c| c.is("PATCH", PARENT)), "{first:#?}");
+        let events = audit_events(&first);
+        assert_eq!(
+            events.len(),
+            1,
+            "the detection and nothing else: {events:#?}"
+        );
+        assert_eq!(events[0]["type"], "Warning");
+        assert_eq!(events[0]["reason"], "ForeignFieldManager");
+        let note = events[0]["note"].as_str().expect("note");
+        assert!(note.contains("detected external write"), "{note}");
+        assert!(
+            !note.contains("reverted external write") && !note.contains("force-reapplied"),
+            "the detection claims no revert that has not landed: {note}"
+        );
+
+        // The revert had landed after all; only its answer was lost. The
+        // force apply took the fields, so the foreign manager is gone.
+        {
+            let mut cluster = state.lock().unwrap();
+            cluster.silent.clear();
+            cluster.parent["metadata"]["managedFields"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|m| m["manager"] != "kubectl-edit");
+        }
+        reconcile(the_stack(&state), ctx)
+            .await
+            .expect("the next reconcile succeeds");
+        let all = calls(&state);
+        assert_eq!(
+            audit_events(&all).len(),
+            1,
+            "the next pass sees no foreign writer and audits nothing: {all:#?}"
+        );
+        let patch = status_patch(&all);
+        assert_eq!(
+            written_condition(&patch, "UnauthorizedSourceModification")["status"],
+            "False",
+            "the condition never records this write, so the Warning is its only trace"
+        );
+    }
+
+    /// A revert that lands is audited as detection, revert, completion — in
+    /// that order — and the detection says the revert is in progress.
+    #[tokio::test]
+    async fn a_revert_is_audited_as_detection_then_completion() {
+        let stack = stack_on("0.2.80", "0.2.80");
+        let parent = edited_parent(&stack, "0.2.80");
+        let (client, state) = scripted(cluster(stack, parent));
+        reconcile(the_stack(&state), context(client, Arc::new(NoRegistry)))
+            .await
+            .expect("the reconcile succeeds");
+        let calls = calls(&state);
+        let event_at = |reason: &str| {
+            calls
+                .iter()
+                .position(|c| c.is("POST", EVENTS) && c.body["reason"] == reason)
+                .unwrap_or_else(|| panic!("a {reason} Event: {calls:#?}"))
+        };
+        let detection = event_at("ForeignFieldManager");
+        let completion = event_at("SourceReverted");
+        let revert = calls
+            .iter()
+            .position(|c| c.is("PATCH", PARENT))
+            .expect("the revert");
+        assert!(
+            detection < revert && revert < completion,
+            "detection, revert, completion: {calls:#?}"
+        );
+        assert_eq!(audit_events(&calls).len(), 2, "{calls:#?}");
+        let note = calls[detection].body["note"].as_str().expect("note");
+        assert!(
+            note.contains("is force-reapplying desired state (target=0.2.80)"),
+            "{note}"
+        );
+    }
+
+    fn history_versions(status: &Value) -> Vec<String> {
+        status["versionHistory"]
+            .as_array()
+            .expect("versionHistory")
+            .iter()
+            .map(|e| e["version"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    /// WI-400 cancellation hazard: the `versionHistory` entry for a bump was
+    /// appended only by the pass that made it, and that pass decides from the
+    /// LIVE parent. A pass cut after the bump landed but before its status
+    /// write lost the entry for good: the next pass finds the parent already
+    /// on the new version and has nothing to append.
+    #[tokio::test(start_paused = true)]
+    async fn a_bump_cut_before_its_status_write_is_still_recorded_in_the_history() {
+        let stack = stack_on("0.2.79", "0.2.80");
+        let parent = parent_on(&stack, "0.2.79");
+        let mut cluster = cluster(stack, parent);
+        cluster.plans.push(completed_plan("0.2.79", "0.2.80"));
+        cluster.silent.push(("GET", STATUS.to_string()));
+        let (client, state) = scripted(cluster);
+        let ctx = context(client, Arc::new(NoRegistry));
+
+        let err = operator_core::deadline::within(
+            RECONCILE_DEADLINE,
+            reconcile(the_stack(&state), ctx.clone()),
+        )
+        .await
+        .expect_err("the status write never answers, so the reconcile is cut");
+        assert!(matches!(err, Error::TimedOut(_)), "{err:?}");
+        assert_eq!(
+            state.lock().unwrap().parent["spec"]["source"]["targetRevision"],
+            "0.2.80",
+            "the bump landed"
+        );
+        assert!(!calls(&state).iter().any(|c| c.is("PATCH", STATUS)));
+
+        // The apiserver answers again: the next pass records the bump.
+        state.lock().unwrap().silent.clear();
+        reconcile(the_stack(&state), ctx.clone())
+            .await
+            .expect("the next reconcile succeeds");
+        let patch = status_patch(&calls(&state));
+        assert_eq!(
+            history_versions(&patch.body["status"]),
+            vec!["0.2.79".to_string(), "0.2.80".to_string()]
+        );
+        assert_eq!(patch.body["status"]["currentVersion"], "0.2.80");
+
+        // And only once.
+        reconcile(the_stack(&state), ctx)
+            .await
+            .expect("a settled reconcile succeeds");
+        assert_eq!(
+            history_versions(&state.lock().unwrap().stack["status"]),
+            vec!["0.2.79".to_string(), "0.2.80".to_string()]
+        );
+    }
+
+    /// `ReconcileStalled` on the stack's status, under its own field manager
+    /// (WI-400): set by `reconcile_with_deadline` when a pass is cut, removed
+    /// after a pass that finishes, never sent by `platform-controller`, and
+    /// written only while the served CRD makes the list a list-map and the
+    /// ownership on the stack is one whose transitions kind measured. Run
+    /// against the scripted apiserver's list-map model
+    /// ([`apply_status_list_map`]).
+    mod stall_tests {
+        use super::*;
+        use crate::stall::{STALL_FIELD_MANAGER, STALL_WRITE_BUDGET};
+
+        const STALL_QUERY: &str = "fieldManager=apprafter-reconcile-deadline";
+        const CONTROLLER_QUERY: &str = "fieldManager=platform-controller";
+        const STALLED: &str = "ReconcileStalled";
+
+        /// Every condition `stack_on` carries.
+        const SETTLED: [&str; 7] = [
+            "Ready",
+            "Synced",
+            "UpstreamReachable",
+            "YankedVersion",
+            "MigrationPending",
+            "UpgradeAvailable",
+            "UnauthorizedSourceModification",
+        ];
+
+        fn by_key(types: &[&str]) -> Value {
+            Value::Object(
+                types
+                    .iter()
+                    .map(|t| (format!(r#"k:{{"type":"{t}"}}"#), json!({ ".": {} })))
+                    .collect(),
+            )
+        }
+
+        fn status_entry(manager: &str, conditions: Value) -> Value {
+            json!({ "manager": manager, "operation": "Apply", "subresource": "status",
+                    "apiVersion": "apprafter.io/v1alpha1", "fieldsType": "FieldsV1",
+                    "fieldsV1": { "f:status": { "f:conditions": conditions } } })
+        }
+
+        /// `stack_on`, as written under the list-map CRD:
+        /// `platform-controller` owns each of its conditions by key.
+        fn listed_stack_on(version: &str, pin: &str) -> Value {
+            let mut stack = stack_on(version, pin);
+            stack["metadata"]["managedFields"] =
+                json!([status_entry(FIELD_MANAGER, by_key(&SETTLED))]);
+            stack
+        }
+
+        fn listed(stack: Value, parent: Value) -> Cluster {
+            let mut cluster = cluster(stack, parent);
+            cluster.list_map = true;
+            cluster.crd_list_map = true;
+            cluster
+        }
+
+        fn stalled() -> Value {
+            prior_condition(STALLED, "True", "ReconcileTimedOut")
+        }
+
+        /// `ReconcileStalled` added to `stack`, owned by key by `owners`;
+        /// with none, it is one nobody's apply holds any more.
+        fn with_stall(mut stack: Value, owners: &[&str]) -> Value {
+            stack["status"]["conditions"]
+                .as_array_mut()
+                .expect("conditions")
+                .push(stalled());
+            if !stack["metadata"]["managedFields"].is_array() {
+                stack["metadata"]["managedFields"] = json!([]);
+            }
+            for owner in owners {
+                stack["metadata"]["managedFields"]
+                    .as_array_mut()
+                    .expect("managedFields")
+                    .push(status_entry(owner, by_key(&[STALLED])));
+            }
+            stack
+        }
+
+        /// What `platform-controller` owns of the conditions, replaced.
+        fn controller_owns(state: &Shared, conditions: Value) {
+            let mut cluster = state.lock().unwrap();
+            let entry = cluster.stack["metadata"]["managedFields"]
+                .as_array_mut()
+                .expect("managedFields")
+                .iter_mut()
+                .find(|e| e["manager"] == FIELD_MANAGER && e["subresource"] == "status")
+                .expect("platform-controller's status entry");
+            entry["fieldsV1"]["f:status"]["f:conditions"] = conditions;
+        }
+
+        fn status_writes(state: &Shared) -> Vec<Call> {
+            calls(state)
+                .into_iter()
+                .filter(|c| c.is("PATCH", STATUS))
+                .collect()
+        }
+
+        fn condition_types(write: &Call) -> Vec<String> {
+            write.body["status"]["conditions"]
+                .as_array()
+                .map(|cs| {
+                    cs.iter()
+                        .map(|c| c["type"].as_str().unwrap_or_default().to_string())
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+
+        fn stored_types(state: &Shared) -> Vec<String> {
+            state.lock().unwrap().stack["status"]["conditions"]
+                .as_array()
+                .map(|cs| {
+                    cs.iter()
+                        .map(|c| c["type"].as_str().unwrap_or_default().to_string())
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+
+        /// A stack the controller has written once, under the list-map
+        /// model, and the context to run more passes on it.
+        async fn settled() -> (Shared, Arc<Context>) {
+            let stack = listed_stack_on("0.2.80", "0.2.80");
+            let parent = parent_on(&stack, "0.2.80");
+            let (client, state) = scripted(listed(stack, parent));
+            let ctx = context(client, Arc::new(NoRegistry));
+            reconcile(the_stack(&state), ctx.clone())
+                .await
+                .expect("the settling pass");
+            (state, ctx)
+        }
+
+        /// `ReconcileStalled` put on the stored stack, owned by `owners`.
+        fn stall_into(state: &Shared, owners: &[&str]) {
+            let mut cluster = state.lock().unwrap();
+            let stack = cluster.stack.take();
+            cluster.stack = with_stall(stack, owners);
+        }
+
+        /// A cut pass sets `ReconcileStalled=True` in one apply under its own
+        /// field manager, carrying that condition and nothing else of the
+        /// status, so it can neither re-assert nor prune what
+        /// `platform-controller` owns.
+        #[tokio::test(start_paused = true)]
+        async fn a_cut_pass_sets_reconcile_stalled_under_its_own_field_manager() {
+            let stack = listed_stack_on("0.2.80", "0.2.80");
+            let parent = parent_on(&stack, "0.2.80");
+            let mut cluster = listed(stack, parent);
+            cluster.silent.push(("GET", PARENT.to_string()));
+            let (client, state) = scripted(cluster);
+            let ctx = context(client, Arc::new(NoRegistry));
+            let started = tokio::time::Instant::now();
+            let err = reconcile_with_deadline(the_stack(&state), ctx)
+                .await
+                .expect_err("a reconcile that never finishes is cut");
+            assert!(matches!(err, Error::TimedOut(_)), "{err:?}");
+            assert_eq!(
+                started.elapsed(),
+                RECONCILE_DEADLINE,
+                "the stall write is answered at once"
+            );
+            let writes = status_writes(&state);
+            assert_eq!(writes.len(), 1, "{writes:#?}");
+            let write = &writes[0];
+            assert!(
+                write.uri.contains(STALL_QUERY) && write.uri.contains("force=true"),
+                "{}",
+                write.uri
+            );
+            assert_eq!(write.body["kind"], "PlatformStack");
+            assert_eq!(write.body["metadata"]["name"], "default");
+            assert_eq!(
+                write.body["status"].as_object().map(|s| s.len()),
+                Some(1),
+                "the status carries the conditions alone: {:#}",
+                write.body
+            );
+            assert_eq!(condition_types(write), vec![STALLED]);
+            let written = &write.body["status"]["conditions"][0];
+            assert_eq!(written["status"], "True");
+            assert_eq!(written["reason"], "ReconcileTimedOut");
+            let message = written["message"].as_str().expect("message");
+            assert!(message.contains("did not finish within 120s"), "{message}");
+            let mut kept: Vec<&str> = SETTLED.to_vec();
+            kept.push(STALLED);
+            assert_eq!(
+                stored_types(&state),
+                kept,
+                "every condition stays beside it"
+            );
+        }
+
+        /// An apiserver that answers nothing does not answer the stall write
+        /// either. That write has its own budget, so the pass gives its slot
+        /// back at `RECONCILE_DEADLINE + STALL_WRITE_BUDGET`, not never.
+        #[tokio::test(start_paused = true)]
+        async fn the_stall_write_has_its_own_budget() {
+            let stack: Arc<PlatformStack> = Arc::new(
+                serde_json::from_value(listed_stack_on("0.2.80", "0.2.80")).expect("stack"),
+            );
+            let ctx = context(
+                operator_core::testing::stalled_client(),
+                Arc::new(NoRegistry),
+            );
+            let started = tokio::time::Instant::now();
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(3600),
+                reconcile_with_deadline(stack, ctx),
+            )
+            .await
+            .expect("a stall write the apiserver never answers is given up at its budget");
+            assert!(matches!(outcome, Err(Error::TimedOut(_))), "{outcome:?}");
+            assert_eq!(started.elapsed(), RECONCILE_DEADLINE + STALL_WRITE_BUDGET);
+        }
+
+        /// A cut on a stack whose conditions `platform-controller` still
+        /// owns whole (last written while the list was atomic: the first
+        /// passes after the upgrade) sets `ReconcileStalled` beside them and
+        /// leaves that ownership to `platform-controller`'s next apply.
+        /// Measured on kind: the apply adds the condition and keeps every
+        /// other one, and the condition survives `platform-controller`'s
+        /// first apply by key.
+        #[tokio::test(start_paused = true)]
+        async fn a_cut_on_a_list_the_controller_owns_whole_is_set_beside_it() {
+            let mut stack = stack_on("0.2.80", "0.2.80");
+            stack["metadata"]["managedFields"] = json!([status_entry(FIELD_MANAGER, json!({}))]);
+            let parent = parent_on(&stack, "0.2.80");
+            let mut cluster = listed(stack, parent);
+            cluster.silent.push(("GET", PARENT.to_string()));
+            let (client, state) = scripted(cluster);
+            let ctx = context(client, Arc::new(NoRegistry));
+            let err = reconcile_with_deadline(the_stack(&state), ctx)
+                .await
+                .expect_err("a reconcile that never finishes is cut");
+            assert!(matches!(err, Error::TimedOut(_)), "{err:?}");
+            let writes = status_writes(&state);
+            assert_eq!(writes.len(), 1, "{writes:#?}");
+            assert!(writes[0].uri.contains(STALL_QUERY), "{}", writes[0].uri);
+            assert_eq!(condition_types(&writes[0]), vec![STALLED]);
+            let mut kept: Vec<&str> = SETTLED.to_vec();
+            kept.push(STALLED);
+            assert_eq!(
+                stored_types(&state),
+                kept,
+                "every condition stays beside it"
+            );
+            assert!(crate::stall::controller_owns_list_whole(&the_stack(&state)));
+        }
+
+        /// After a rollback while stalled and a re-upgrade, both managers own
+        /// the list whole, and the `ReconcileStalled` the older operator
+        /// carried is on the stack. A cut writes nothing then: the stall
+        /// manager's first step there, letting go of its whole-list
+        /// ownership, was not measured in that state, and the condition on
+        /// the stack already says it is stalled. `platform-controller`'s
+        /// next apply ends the state.
+        #[tokio::test(start_paused = true)]
+        async fn a_cut_writes_nothing_while_both_managers_own_a_carried_stall_whole() {
+            let mut stack = with_stall(stack_on("0.2.80", "0.2.80"), &[]);
+            stack["metadata"]["managedFields"] = json!([
+                status_entry(FIELD_MANAGER, json!({})),
+                status_entry(STALL_FIELD_MANAGER, json!({})),
+            ]);
+            let parent = parent_on(&stack, "0.2.80");
+            let mut cluster = listed(stack, parent);
+            cluster.silent.push(("GET", PARENT.to_string()));
+            let (client, state) = scripted(cluster);
+            let ctx = context(client, Arc::new(NoRegistry));
+            let err = reconcile_with_deadline(the_stack(&state), ctx)
+                .await
+                .expect_err("a reconcile that never finishes is cut");
+            assert!(matches!(err, Error::TimedOut(_)), "{err:?}");
+            assert!(status_writes(&state).is_empty(), "{:#?}", calls(&state));
+            assert!(stored_types(&state).contains(&STALLED.to_string()));
+        }
+
+        /// A rollback re-applies the atomic CRD while this operator can
+        /// still hold the lease, and the CRD switch leaves every by-key
+        /// `managedFields` entry in place. On the atomic list an apply of
+        /// `[ReconcileStalled]` replaces every other condition (measured on
+        /// kind), so neither a cut nor a pass that finishes writes anything
+        /// under the stall manager: both read the served CRD first.
+        #[tokio::test(start_paused = true)]
+        async fn nothing_is_written_while_the_served_crd_is_atomic() {
+            let (state, ctx) = settled().await;
+            {
+                let mut cluster = state.lock().unwrap();
+                cluster.list_map = false;
+                cluster.crd_list_map = false;
+                cluster.silent.push(("GET", PARENT.to_string()));
+            }
+            let before = calls(&state).len();
+            let err = reconcile_with_deadline(the_stack(&state), ctx.clone())
+                .await
+                .expect_err("a reconcile that never finishes is cut");
+            assert!(matches!(err, Error::TimedOut(_)), "{err:?}");
+            let cut = calls(&state)[before..].to_vec();
+            assert!(
+                cut.iter().any(|c| c.is("GET", CRD)),
+                "mark reads the CRD: {cut:#?}"
+            );
+            assert!(
+                !cut.iter().any(|c| c.is("PATCH", STATUS)),
+                "mark writes nothing: {cut:#?}"
+            );
+
+            state.lock().unwrap().silent.clear();
+            stall_into(&state, &[STALL_FIELD_MANAGER]);
+            let before = calls(&state).len();
+            reconcile_with_deadline(the_stack(&state), ctx)
+                .await
+                .expect("the pass finishes");
+            let finished = calls(&state)[before..].to_vec();
+            assert!(
+                finished.iter().any(|c| c.is("GET", CRD)),
+                "clear reads the CRD: {finished:#?}"
+            );
+            assert!(
+                !finished.iter().any(|c| c.is("PATCH", STATUS)),
+                "clear writes nothing: {finished:#?}"
+            );
+            assert!(stored_types(&state).contains(&STALLED.to_string()));
+        }
+
+        /// A pass that finishes removes `ReconcileStalled` with one empty
+        /// apply under the stall manager, and every other condition stays.
+        #[tokio::test]
+        async fn a_pass_that_finishes_removes_reconcile_stalled_and_nothing_else() {
+            let (state, ctx) = settled().await;
+            let kept = stored_types(&state);
+            stall_into(&state, &[STALL_FIELD_MANAGER]);
+            let before = status_writes(&state).len();
+            reconcile_with_deadline(the_stack(&state), ctx)
+                .await
+                .expect("the pass finishes");
+            let writes = status_writes(&state)[before..].to_vec();
+            assert_eq!(writes.len(), 1, "{writes:#?}");
+            assert!(
+                writes[0].uri.contains(STALL_QUERY) && writes[0].uri.contains("force=true"),
+                "{}",
+                writes[0].uri
+            );
+            assert_eq!(writes[0].body["status"], json!({ "conditions": [] }));
+            assert_eq!(stored_types(&state), kept);
+        }
+
+        /// One nobody owns any more — what a rollback while stalled leaves
+        /// behind — is adopted as it is, then let go, and goes.
+        #[tokio::test]
+        async fn a_reconcile_stalled_nobody_owns_is_adopted_then_let_go() {
+            let (state, ctx) = settled().await;
+            let kept = stored_types(&state);
+            stall_into(&state, &[]);
+            let before = status_writes(&state).len();
+            reconcile_with_deadline(the_stack(&state), ctx)
+                .await
+                .expect("the pass finishes");
+            let writes = status_writes(&state)[before..].to_vec();
+            assert_eq!(writes.len(), 3, "let go, adopt, let go: {writes:#?}");
+            assert!(writes.iter().all(|w| w.uri.contains(STALL_QUERY)));
+            assert_eq!(writes[0].body["status"], json!({ "conditions": [] }));
+            assert_eq!(
+                writes[1].body["status"],
+                json!({ "conditions": [stalled()] })
+            );
+            assert_eq!(writes[2].body["status"], json!({ "conditions": [] }));
+            assert_eq!(stored_types(&state), kept);
+        }
+
+        /// One another manager owns stays, after a single empty apply: an
+        /// adopt beside that owner would remove nothing, and repeated on
+        /// every pass would be a write loop.
+        #[tokio::test]
+        async fn a_reconcile_stalled_another_manager_holds_is_left_in_place() {
+            let (state, ctx) = settled().await;
+            stall_into(&state, &["kubectl-edit"]);
+            let before = status_writes(&state).len();
+            reconcile_with_deadline(the_stack(&state), ctx)
+                .await
+                .expect("the pass finishes");
+            let writes = status_writes(&state)[before..].to_vec();
+            assert_eq!(writes.len(), 1, "{writes:#?}");
+            assert_eq!(writes[0].body["status"], json!({ "conditions": [] }));
+            assert!(stored_types(&state).contains(&STALLED.to_string()));
+        }
+
+        /// A pass that fails for another reason neither set the stall nor
+        /// proved it over: no write under the stall manager.
+        #[tokio::test]
+        async fn a_pass_that_fails_otherwise_leaves_reconcile_stalled_alone() {
+            let stack = with_stall(listed_stack_on("0.2.80", "0.2.80"), &[STALL_FIELD_MANAGER]);
+            let (client, state) = scripted(listed(stack, Value::Null));
+            let ctx = context(client, Arc::new(NoRegistry));
+            let err = reconcile_with_deadline(the_stack(&state), ctx)
+                .await
+                .expect_err("a parent Application that does not parse fails the pass");
+            assert!(!matches!(err, Error::TimedOut(_)), "{err:?}");
+            assert!(
+                status_writes(&state)
+                    .iter()
+                    .all(|c| !c.uri.contains(STALL_QUERY)),
+                "{:#?}",
+                calls(&state)
+            );
+        }
+
+        /// A settled stack is re-applied once when `platform-controller`
+        /// owns its conditions whole (a stack last written while the list
+        /// was atomic) or co-owns `ReconcileStalled` (an older operator
+        /// copied it into its apply): only its own apply puts either right,
+        /// and after it the stall manager can write.
+        #[tokio::test]
+        async fn a_settled_stack_whose_conditions_are_not_owned_by_key_is_reapplied_once() {
+            let mut with_stall_key: Vec<&str> = SETTLED.to_vec();
+            with_stall_key.push(STALLED);
+            for owned in [json!({}), by_key(&with_stall_key)] {
+                let (state, ctx) = settled().await;
+                controller_owns(&state, owned.clone());
+                let before = status_writes(&state).len();
+                reconcile(the_stack(&state), ctx.clone())
+                    .await
+                    .expect("the re-applying pass");
+                let writes = status_writes(&state)[before..].to_vec();
+                assert_eq!(writes.len(), 1, "{owned}: {writes:#?}");
+                assert!(
+                    writes[0].uri.contains(CONTROLLER_QUERY),
+                    "{}",
+                    writes[0].uri
+                );
+                assert!(!condition_types(&writes[0]).contains(&STALLED.to_string()));
+                assert!(
+                    crate::stall::controller_owns_conditions_by_key(&the_stack(&state)),
+                    "{owned}"
+                );
+                reconcile(the_stack(&state), ctx)
+                    .await
+                    .expect("a settled pass");
+                assert_eq!(status_writes(&state).len(), before + 1, "{owned}: once");
+            }
+        }
+
+        /// The live upgrade end to end: a stall on a stack whose conditions
+        /// `platform-controller` still owns whole stays through the pass that
+        /// re-applies them (that pass read the old ownership), and goes with
+        /// the next one.
+        #[tokio::test]
+        async fn a_stall_on_a_list_owned_whole_goes_once_the_controller_has_reapplied() {
+            let (state, ctx) = settled().await;
+            controller_owns(&state, json!({}));
+            stall_into(&state, &[STALL_FIELD_MANAGER]);
+            let before = status_writes(&state).len();
+            reconcile_with_deadline(the_stack(&state), ctx.clone())
+                .await
+                .expect("the re-applying pass");
+            let first = status_writes(&state)[before..].to_vec();
+            assert_eq!(first.len(), 1, "{first:#?}");
+            assert!(first[0].uri.contains(CONTROLLER_QUERY), "{}", first[0].uri);
+            assert!(stored_types(&state).contains(&STALLED.to_string()));
+            reconcile_with_deadline(the_stack(&state), ctx.clone())
+                .await
+                .expect("the next pass");
+            let second = status_writes(&state)[before + 1..].to_vec();
+            assert_eq!(second.len(), 1, "{second:#?}");
+            assert!(second[0].uri.contains(STALL_QUERY), "{}", second[0].uri);
+            assert!(!stored_types(&state).contains(&STALLED.to_string()));
+            reconcile_with_deadline(the_stack(&state), ctx)
+                .await
+                .expect("a settled pass");
+            assert_eq!(status_writes(&state).len(), before + 2);
+        }
+
+        /// `platform-controller` clones the status it read, `ReconcileStalled`
+        /// included, and must not send it: co-owning it would keep it on the
+        /// stack after the stall manager lets it go.
+        #[tokio::test]
+        async fn the_controllers_status_write_never_carries_reconcile_stalled() {
+            let mut stack = with_stall(listed_stack_on("0.2.80", "0.2.80"), &[STALL_FIELD_MANAGER]);
+            stack["status"]["lastUpstreamCheck"] = Value::Null;
+            let parent = parent_on(&stack, "0.2.80");
+            let (client, state) = scripted(listed(stack, parent));
+            let upstream = Arc::new(Published {
+                latest: "0.2.81",
+                class: ChangeClass::Safe,
+            });
+            reconcile(the_stack(&state), context(client, upstream))
+                .await
+                .expect("the reconcile succeeds");
+            let patch = status_patch(&calls(&state));
+            assert!(
+                !condition_types(&patch).contains(&STALLED.to_string()),
+                "{:#}",
+                patch.body
+            );
+            assert_every_condition_carried(&patch);
+            assert!(stored_types(&state).contains(&STALLED.to_string()));
+        }
+
+        /// A settled stack is not rewritten, and the stall manager's
+        /// condition appearing on it is no reason to rewrite it either.
+        #[tokio::test]
+        async fn reconcile_stalled_alone_is_no_reason_for_the_controller_to_write() {
+            let (state, ctx) = settled().await;
+            let settled_writes = status_writes(&state).len();
+            reconcile(the_stack(&state), ctx.clone())
+                .await
+                .expect("a settled pass");
+            assert_eq!(status_writes(&state).len(), settled_writes);
+            stall_into(&state, &[STALL_FIELD_MANAGER]);
+            reconcile(the_stack(&state), ctx)
+                .await
+                .expect("a pass that reads the stall");
+            assert_eq!(
+                status_writes(&state).len(),
+                settled_writes,
+                "ReconcileStalled alone is no reason to write"
+            );
+        }
+
+        /// A duplicate condition type read back (possible on a stack written
+        /// while the list was atomic) is written away, once, by a pass that
+        /// would otherwise write nothing: the list-map apply that carried it
+        /// would be refused on every pass.
+        #[tokio::test]
+        async fn a_duplicate_condition_type_is_written_away() {
+            let (state, ctx) = settled().await;
+            state.lock().unwrap().stack["status"]["conditions"]
+                .as_array_mut()
+                .expect("conditions")
+                .push(prior_condition("Ready", "False", "Degraded"));
+            let before = status_writes(&state).len();
+            reconcile(the_stack(&state), ctx.clone())
+                .await
+                .expect("the reconcile succeeds");
+            let writes = status_writes(&state)[before..].to_vec();
+            assert_eq!(writes.len(), 1, "{writes:#?}");
+            let types = condition_types(&writes[0]);
+            assert_eq!(
+                types.iter().filter(|t| *t == "Ready").count(),
+                1,
+                "{types:?}"
+            );
+            assert_every_condition_carried(&writes[0]);
+            let ready = stored_types(&state)
+                .into_iter()
+                .filter(|t| t == "Ready")
+                .count();
+            assert_eq!(ready, 1);
+            reconcile(the_stack(&state), ctx)
+                .await
+                .expect("a settled pass");
+            assert_eq!(status_writes(&state).len(), before + 1, "once");
+        }
+
+        /// The first write after the upgrade, on a list `platform-controller`
+        /// owns whole, can be one that retires a condition: here
+        /// `BackupHealthy`, with backups off. Applied straight from the
+        /// whole-list ownership, that apply would keep it, owned by nobody
+        /// (measured on kind), and every later pass would re-apply in vain.
+        /// The list is first re-applied as it was read, which takes it by
+        /// key, and the write after it removes the condition.
+        #[tokio::test]
+        async fn a_condition_retired_by_the_first_write_after_the_upgrade_is_removed() {
+            let mut stack = stack_on("0.2.80", "0.2.80");
+            stack["status"]["conditions"]
+                .as_array_mut()
+                .expect("conditions")
+                .push(prior_condition("BackupHealthy", "True", "Succeeded"));
+            stack["metadata"]["managedFields"] = json!([status_entry(FIELD_MANAGER, json!({}))]);
+            assert!(stack["spec"]["backup"].is_null(), "backups are off");
+            let parent = parent_on(&stack, "0.2.80");
+            let (client, state) = scripted(listed(stack, parent));
+            let ctx = context(client, Arc::new(NoRegistry));
+            reconcile(the_stack(&state), ctx.clone())
+                .await
+                .expect("the first pass after the upgrade");
+            let writes = status_writes(&state);
+            assert_eq!(writes.len(), 2, "{writes:#?}");
+            assert!(
+                writes.iter().all(|w| w.uri.contains(CONTROLLER_QUERY)),
+                "{writes:#?}"
+            );
+            let backup = "BackupHealthy".to_string();
+            assert!(
+                condition_types(&writes[0]).contains(&backup),
+                "the list as read"
+            );
+            assert!(!condition_types(&writes[1]).contains(&backup));
+            let stored = stored_types(&state);
+            assert!(!stored.contains(&backup), "{stored:?}");
+            for t in SETTLED {
+                assert!(stored.contains(&t.to_string()), "{t}: {stored:?}");
+            }
+            reconcile(the_stack(&state), ctx)
+                .await
+                .expect("a settled pass");
+            assert_eq!(
+                status_writes(&state).len(),
+                2,
+                "the next pass writes nothing"
+            );
+        }
+
+        /// An older operator still running under the list-map CRD (between
+        /// the CRD's sync wave and its own pod's replacement) applies by key
+        /// from its whole-list ownership, so a condition it left out stays,
+        /// owned by nobody, while `platform-controller` owns the rest by key.
+        /// The first write that leaves it out too re-applies the status as
+        /// read first, which adopts it, and the write after it removes it.
+        #[tokio::test]
+        async fn a_condition_nobody_holds_is_adopted_before_the_write_that_retires_it() {
+            let mut stack = listed_stack_on("0.2.80", "0.2.80");
+            stack["status"]["conditions"]
+                .as_array_mut()
+                .expect("conditions")
+                .push(prior_condition("BackupHealthy", "True", "Succeeded"));
+            let parent = parent_on(&stack, "0.2.80");
+            let (client, state) = scripted(listed(stack, parent));
+            let ctx = context(client, Arc::new(NoRegistry));
+            reconcile(the_stack(&state), ctx.clone())
+                .await
+                .expect("the pass");
+            let writes = status_writes(&state);
+            assert_eq!(writes.len(), 2, "{writes:#?}");
+            let backup = "BackupHealthy".to_string();
+            assert!(
+                condition_types(&writes[0]).contains(&backup),
+                "the list as read"
+            );
+            assert!(!condition_types(&writes[1]).contains(&backup));
+            assert!(!stored_types(&state).contains(&backup));
+            reconcile(the_stack(&state), ctx)
+                .await
+                .expect("a settled pass");
+            assert_eq!(
+                status_writes(&state).len(),
+                2,
+                "the next pass writes nothing"
+            );
+        }
     }
 }

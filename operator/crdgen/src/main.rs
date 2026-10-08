@@ -223,6 +223,51 @@ mod tests {
         );
     }
 
+    /// `status.conditions` that more than one SSA field manager writes must
+    /// be a list-map keyed by `type`, or each manager's apply replaces the
+    /// whole list and with it the other managers' conditions (walk-found on
+    /// ResourceClaim). PlatformStack joined the set with WI-400: its
+    /// `ReconcileStalled` condition has its own field manager beside
+    /// `platform-controller`. The markers live only in the
+    /// `statusSchemaPatches` of `schemas/crdmeta/meta.cue`, and nothing else
+    /// asserts them: `crd-check` compares bytes (a dropped patch renders and
+    /// commits consistently) and the structural schema is valid either way.
+    /// A list-map key must also be required on every item, which `type` is
+    /// only because the CUE type declares it without `?`.
+    #[test]
+    fn multi_manager_status_conditions_are_list_maps_keyed_by_type() {
+        for stem in [
+            "crd-resourceclaim",
+            "crd-sharedvolume",
+            "crd-shareddatabase",
+            "crd-platformstack",
+        ] {
+            let crd = committed_crd(stem);
+            let conditions = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]
+                ["status"]["properties"]["conditions"];
+            assert_eq!(
+                conditions["x-kubernetes-list-type"],
+                json!("map"),
+                "{stem}: status.conditions is not a list-map — two field managers would \
+                 overwrite each other's conditions (schemas/crdmeta/meta.cue \
+                 statusSchemaPatches, then `just gen-crds`)"
+            );
+            assert_eq!(
+                conditions["x-kubernetes-list-map-keys"],
+                json!(["type"]),
+                "{stem}: status.conditions must be keyed by `type`"
+            );
+            let required = conditions["items"]["required"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            assert!(
+                required.contains(&json!("type")),
+                "{stem}: a list-map key must be required on every item: {required:?}"
+            );
+        }
+    }
+
     /// 2.5 / ADR 0061: `needs.jetstream.streams[].subjects` must stay
     /// non-empty at the apiserver, same class of guard as
     /// `application_status_last_applied_spec_is_preserve_unknown` above —

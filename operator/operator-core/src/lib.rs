@@ -3,6 +3,8 @@
 
 pub mod application;
 pub mod capacity;
+pub mod deadline;
+pub mod deadline_event;
 pub mod events;
 pub mod k8s_time;
 pub mod leader;
@@ -20,6 +22,8 @@ pub mod serviceprovider;
 pub mod shareddatabase;
 pub mod sharedvolume;
 pub mod sourcecredential;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 
 pub use application::{
     image_repo, AppResources, Application, ApplicationBaseSpec, ApplicationCondition,
