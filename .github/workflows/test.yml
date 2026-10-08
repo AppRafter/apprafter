@@ -100,6 +100,30 @@ jobs:
         shell: bash
         run: cargo test --workspace --exclude apprafter-backup --exclude docsgen --all-features
 
+  # One check under the fixed name `cargo test cli/`, whatever the matrix
+  # does. The matrix reports a check per leg, `cargo test cli/ (<os>)`, so a
+  # branch protection rule that requires the pre-matrix name would wait for
+  # a check that never comes — and when nothing under cli/ changed, the
+  # skipped matrix reports one check with its name's expression unexpanded.
+  # This job passes when every leg passed, or when the matrix was skipped
+  # because nothing under cli/ changed, and fails otherwise.
+  rust-cli-result:
+    name: cargo test cli/
+    needs: rust-cli
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: every leg of the matrix passed
+        env:
+          RESULT: ${{ needs.rust-cli.result }}
+        run: |
+          echo "rust-cli: $RESULT"
+          case "$RESULT" in
+            success | skipped) ;;
+            *) exit 1 ;;
+          esac
+
   rust-operator:
     name: cargo test operator/
     needs: changes
