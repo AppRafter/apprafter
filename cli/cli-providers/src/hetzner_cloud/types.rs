@@ -79,6 +79,12 @@ pub struct ServerListResponse {
     pub servers: Vec<Server>,
 }
 
+/// `GET /v1/servers/{id}`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServerResponse {
+    pub server: Server,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ServerCreateRequest {
     pub name: String,

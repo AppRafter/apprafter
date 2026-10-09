@@ -11,19 +11,42 @@ use super::types::{ApiErrorEnvelope, ServerListResponse};
 /// Default base URL for the public Hetzner Cloud API.
 pub const DEFAULT_BASE_URL: &str = "https://api.hetzner.cloud";
 
-#[derive(Debug, Clone)]
+/// A Hetzner Cloud API client: a base URL, a token, and the `ureq` agent every request goes
+/// through. `Debug` never shows the token.
+#[derive(Clone)]
 pub struct HetznerCloudClient {
     pub base_url: String,
     pub token: String,
+    agent: ureq::Agent,
+}
+
+impl std::fmt::Debug for HetznerCloudClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HetznerCloudClient")
+            .field("base_url", &self.base_url)
+            .field("token", &"<redacted>")
+            .finish_non_exhaustive()
+    }
 }
 
 impl HetznerCloudClient {
-    /// Construct a client. Pass `DEFAULT_BASE_URL` for production;
-    /// tests pass a `mockito::Server::url()`.
+    /// A client on a default agent (no read timeout), as before: the CLI's own paths. Pass
+    /// `DEFAULT_BASE_URL` for production; tests pass a `mockito::Server::url()`.
     pub fn new(base_url: impl Into<String>, token: impl Into<String>) -> Self {
+        Self::with_agent(base_url, token, ureq::agent())
+    }
+
+    /// A client on `agent` — `apprafter_core::Context` hands one built with timeouts and a
+    /// deadline-bound resolver.
+    pub fn with_agent(
+        base_url: impl Into<String>,
+        token: impl Into<String>,
+        agent: ureq::Agent,
+    ) -> Self {
         Self {
             base_url: base_url.into(),
             token: token.into(),
+            agent,
         }
     }
 
@@ -37,7 +60,9 @@ impl HetznerCloudClient {
 
     pub fn list_servers(&self) -> Result<ServerListResponse> {
         let endpoint = self.endpoint("/servers");
-        let resp = ureq::get(&endpoint)
+        let resp = self
+            .agent
+            .get(&endpoint)
             .set("Authorization", &self.auth_header())
             .set("Accept", "application/json")
             .call();
@@ -76,7 +101,9 @@ impl HetznerCloudClient {
     /// `cli-dx-task.md` §11.
     pub fn list_locations(&self) -> Result<super::types::LocationListResponse> {
         let endpoint = self.endpoint("/locations");
-        let resp = ureq::get(&endpoint)
+        let resp = self
+            .agent
+            .get(&endpoint)
             .set("Authorization", &self.auth_header())
             .set("Accept", "application/json")
             .call();
@@ -107,71 +134,90 @@ impl HetznerCloudClient {
         }
     }
 
-    pub fn list_server_types(&self) -> Result<super::types::ServerTypeListResponse> {
+    /// `GET /v1/servers/{id}`; `Ok(None)` when Hetzner answers 404.
+    pub fn get_server(&self, id: u64) -> Result<Option<super::types::Server>> {
+        let endpoint = self.endpoint(&format!("/servers/{id}"));
+        let resp = self
+            .agent
+            .get(&endpoint)
+            .set("Authorization", &self.auth_header())
+            .set("Accept", "application/json")
+            .call();
+        match resp {
+            Ok(r) => r
+                .into_json::<super::types::ServerResponse>()
+                .map(|b| Some(b.server))
+                .map_err(|e| CliError::Other(format!("parse get_server response: {e}"))),
+            Err(ureq::Error::Status(404, _)) => Ok(None),
+            Err(ureq::Error::Status(status, response)) => {
+                Err(api_error("GET", &endpoint, status, response))
+            }
+            Err(ureq::Error::Transport(t)) => Err(CliError::Other(format!(
+                "transport error talking to {endpoint}: {t}"
+            ))),
+        }
+    }
+
+    /// One page of `GET /v1/server_types` (50 per page) and the next page number, when it is
+    /// greater than `page` — a non-advancing `next_page` (a misbehaving API returning the
+    /// current or an earlier page) ends the listing, so a caller never loops forever.
+    pub fn list_server_types_page(
+        &self,
+        page: u32,
+    ) -> Result<(Vec<super::types::ServerType>, Option<u32>)> {
         let endpoint = self.endpoint("/server_types");
-        let mut all_types: Vec<super::types::ServerType> = Vec::new();
-        let mut page: u32 = 1;
+        let resp = self
+            .agent
+            .get(&endpoint)
+            .query("page", &page.to_string())
+            .query("per_page", "50")
+            .set("Authorization", &self.auth_header())
+            .set("Accept", "application/json")
+            .call();
 
+        let page_response = match resp {
+            Ok(r) => r
+                .into_json::<super::types::ServerTypeListResponse>()
+                .map_err(|e| CliError::Other(format!("parse list_server_types response: {e}")))?,
+            Err(ureq::Error::Status(status, response)) => {
+                return Err(api_error("GET", &endpoint, status, response));
+            }
+            Err(ureq::Error::Transport(t)) => {
+                return Err(CliError::Other(format!(
+                    "transport error talking to {endpoint}: {t}"
+                )));
+            }
+        };
+
+        let next = page_response
+            .meta
+            .as_ref()
+            .and_then(|m| m.pagination.next_page);
+        Ok((page_response.server_types, next.filter(|n| *n > page)))
+    }
+
+    /// Every server type, page by page through [`Self::list_server_types_page`].
+    pub fn list_server_types(&self) -> Result<super::types::ServerTypeListResponse> {
+        let (mut all, mut page) = (Vec::new(), 1);
         loop {
-            let resp = ureq::get(&endpoint)
-                .query("page", &page.to_string())
-                .query("per_page", "50")
-                .set("Authorization", &self.auth_header())
-                .set("Accept", "application/json")
-                .call();
-
-            let page_response = match resp {
-                Ok(r) => r
-                    .into_json::<super::types::ServerTypeListResponse>()
-                    .map_err(|e| {
-                        CliError::Other(format!("parse list_server_types response: {e}"))
-                    })?,
-                Err(ureq::Error::Status(status, response)) => {
-                    let body = response.into_string().unwrap_or_default();
-                    let envelope: ApiErrorEnvelope =
-                        serde_json::from_str(&body).unwrap_or(ApiErrorEnvelope {
-                            error: super::types::ApiErrorDetails {
-                                code: "unknown".to_string(),
-                                message: body,
-                            },
-                        });
-                    return Err(CliError::Hetzner {
-                        endpoint: format!("GET {endpoint}"),
-                        status,
-                        code: envelope.error.code,
-                        message: envelope.error.message,
-                    });
-                }
-                Err(ureq::Error::Transport(t)) => {
-                    return Err(CliError::Other(format!(
-                        "transport error talking to {endpoint}: {t}"
-                    )));
-                }
-            };
-
-            let next = page_response
-                .meta
-                .as_ref()
-                .and_then(|m| m.pagination.next_page);
-            all_types.extend(page_response.server_types);
-
+            let (types, next) = self.list_server_types_page(page)?;
+            all.extend(types);
             match next {
-                // Guard against a non-advancing `next_page` (a misbehaving API
-                // returning the current or an earlier page) — never loop forever.
-                Some(n) if n > page => page = n,
-                _ => break,
+                Some(n) => page = n,
+                None => break,
             }
         }
-
         Ok(super::types::ServerTypeListResponse {
-            server_types: all_types,
+            server_types: all,
             meta: None,
         })
     }
 
     pub fn list_ssh_keys(&self) -> Result<super::types::SshKeyListResponse> {
         let endpoint = self.endpoint("/ssh_keys");
-        let resp = ureq::get(&endpoint)
+        let resp = self
+            .agent
+            .get(&endpoint)
             .set("Authorization", &self.auth_header())
             .set("Accept", "application/json")
             .call();
@@ -204,7 +250,9 @@ impl HetznerCloudClient {
 
     pub fn list_networks(&self) -> Result<super::types::NetworkListResponse> {
         let endpoint = self.endpoint("/networks");
-        let resp = ureq::get(&endpoint)
+        let resp = self
+            .agent
+            .get(&endpoint)
             .set("Authorization", &self.auth_header())
             .set("Accept", "application/json")
             .call();
@@ -240,7 +288,9 @@ impl HetznerCloudClient {
         req: &super::types::NetworkCreateRequest,
     ) -> Result<super::types::NetworkCreateResponse> {
         let endpoint = self.endpoint("/networks");
-        let resp = ureq::post(&endpoint)
+        let resp = self
+            .agent
+            .post(&endpoint)
             .set("Authorization", &self.auth_header())
             .set("Content-Type", "application/json")
             .set("Accept", "application/json")
@@ -275,7 +325,8 @@ impl HetznerCloudClient {
     pub fn delete_network(&self, id: u64) -> Result<()> {
         let endpoint = self.endpoint(&format!("/networks/{id}"));
         delete_with_retry_on_transient_lock(&endpoint, || {
-            ureq::delete(&endpoint)
+            self.agent
+                .delete(&endpoint)
                 .set("Authorization", &self.auth_header())
                 .set("Accept", "application/json")
         })
@@ -283,7 +334,9 @@ impl HetznerCloudClient {
 
     pub fn list_firewalls(&self) -> Result<super::types::FirewallListResponse> {
         let endpoint = self.endpoint("/firewalls");
-        let resp = ureq::get(&endpoint)
+        let resp = self
+            .agent
+            .get(&endpoint)
             .set("Authorization", &self.auth_header())
             .set("Accept", "application/json")
             .call();
@@ -319,7 +372,9 @@ impl HetznerCloudClient {
         req: &super::types::FirewallCreateRequest,
     ) -> Result<super::types::FirewallCreateResponse> {
         let endpoint = self.endpoint("/firewalls");
-        let resp = ureq::post(&endpoint)
+        let resp = self
+            .agent
+            .post(&endpoint)
             .set("Authorization", &self.auth_header())
             .set("Content-Type", "application/json")
             .set("Accept", "application/json")
@@ -359,7 +414,9 @@ impl HetznerCloudClient {
         let req = super::types::SetFirewallRulesRequest {
             rules: rules.to_vec(),
         };
-        let resp = ureq::post(&endpoint)
+        let resp = self
+            .agent
+            .post(&endpoint)
             .set("Authorization", &self.auth_header())
             .set("Content-Type", "application/json")
             .set("Accept", "application/json")
@@ -392,7 +449,8 @@ impl HetznerCloudClient {
     pub fn delete_firewall(&self, id: u64) -> Result<()> {
         let endpoint = self.endpoint(&format!("/firewalls/{id}"));
         delete_with_retry_on_transient_lock(&endpoint, || {
-            ureq::delete(&endpoint)
+            self.agent
+                .delete(&endpoint)
                 .set("Authorization", &self.auth_header())
                 .set("Accept", "application/json")
         })
@@ -400,7 +458,9 @@ impl HetznerCloudClient {
 
     pub fn delete_ssh_key(&self, id: u64) -> Result<()> {
         let endpoint = self.endpoint(&format!("/ssh_keys/{id}"));
-        let resp = ureq::delete(&endpoint)
+        let resp = self
+            .agent
+            .delete(&endpoint)
             .set("Authorization", &self.auth_header())
             .set("Accept", "application/json")
             .call();
@@ -435,7 +495,9 @@ impl HetznerCloudClient {
         req: &super::types::SshKeyCreateRequest,
     ) -> Result<super::types::SshKeyCreateResponse> {
         let endpoint = self.endpoint("/ssh_keys");
-        let resp = ureq::post(&endpoint)
+        let resp = self
+            .agent
+            .post(&endpoint)
             .set("Authorization", &self.auth_header())
             .set("Content-Type", "application/json")
             .set("Accept", "application/json")
@@ -469,7 +531,9 @@ impl HetznerCloudClient {
 
     pub fn delete_server(&self, id: u64) -> Result<()> {
         let endpoint = self.endpoint(&format!("/servers/{id}"));
-        let resp = ureq::delete(&endpoint)
+        let resp = self
+            .agent
+            .delete(&endpoint)
             .set("Authorization", &self.auth_header())
             .set("Accept", "application/json")
             .call();
@@ -505,7 +569,9 @@ impl HetznerCloudClient {
         req: &super::types::ServerCreateRequest,
     ) -> Result<super::types::ServerCreateResponse> {
         let endpoint = self.endpoint("/servers");
-        let resp = ureq::post(&endpoint)
+        let resp = self
+            .agent
+            .post(&endpoint)
             .set("Authorization", &self.auth_header())
             .set("Content-Type", "application/json")
             .set("Accept", "application/json")
@@ -539,7 +605,9 @@ impl HetznerCloudClient {
 
     pub fn list_floating_ips(&self) -> Result<super::types::FloatingIpListResponse> {
         let endpoint = self.endpoint("/floating_ips");
-        let resp = ureq::get(&endpoint)
+        let resp = self
+            .agent
+            .get(&endpoint)
             .set("Authorization", &self.auth_header())
             .set("Accept", "application/json")
             .call();
@@ -575,7 +643,9 @@ impl HetznerCloudClient {
         req: &super::types::FloatingIpCreateRequest,
     ) -> Result<super::types::FloatingIpCreateResponse> {
         let endpoint = self.endpoint("/floating_ips");
-        let resp = ureq::post(&endpoint)
+        let resp = self
+            .agent
+            .post(&endpoint)
             .set("Authorization", &self.auth_header())
             .set("Content-Type", "application/json")
             .set("Accept", "application/json")
@@ -619,7 +689,9 @@ impl HetznerCloudClient {
     ///    so the substring check is the only reliable signal.
     pub fn unassign_floating_ip(&self, id: u64) -> Result<()> {
         let endpoint = self.endpoint(&format!("/floating_ips/{id}/actions/unassign"));
-        let resp = ureq::post(&endpoint)
+        let resp = self
+            .agent
+            .post(&endpoint)
             .set("Authorization", &self.auth_header())
             .set("Accept", "application/json")
             .call();
@@ -667,10 +739,29 @@ impl HetznerCloudClient {
         let endpoint = self.endpoint(&format!("/floating_ips/{id}"));
         let auth = self.auth_header();
         delete_with_retry_on_transient_lock(&endpoint, || {
-            ureq::delete(&endpoint)
+            self.agent
+                .delete(&endpoint)
                 .set("Authorization", &auth)
                 .set("Accept", "application/json")
         })
+    }
+}
+
+/// The `CliError::Hetzner` for a non-2xx answer: the API's error envelope, or the raw body as
+/// the message when it is not one.
+fn api_error(method: &str, endpoint: &str, status: u16, response: ureq::Response) -> CliError {
+    let body = response.into_string().unwrap_or_default();
+    let envelope: ApiErrorEnvelope = serde_json::from_str(&body).unwrap_or(ApiErrorEnvelope {
+        error: super::types::ApiErrorDetails {
+            code: "unknown".to_string(),
+            message: body,
+        },
+    });
+    CliError::Hetzner {
+        endpoint: format!("{method} {endpoint}"),
+        status,
+        code: envelope.error.code,
+        message: envelope.error.message,
     }
 }
 

@@ -995,3 +995,104 @@ fn delete_floating_ip_maps_5xx_to_hetzner() {
         "internal_error",
     );
 }
+
+const SERVER_42: &str = r#"{"id":42,"name":"prod-node","status":"running","labels":{},
+  "public_net":{"ipv4":{"ip":"203.0.113.10"},"ipv6":{"ip":"2001:db8:1::/64"}}}"#;
+
+#[test]
+fn get_server_reads_one_server_by_id() {
+    let mut server = mockito::Server::new();
+    let m = server
+        .mock("GET", "/v1/servers/42")
+        .match_header("Authorization", "Bearer t")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(format!(r#"{{"server":{SERVER_42}}}"#))
+        .create();
+    let got = HetznerCloudClient::new(server.url(), "t")
+        .get_server(42)
+        .unwrap()
+        .expect("found");
+    assert_eq!(got.id, 42);
+    assert_eq!(got.public_net.unwrap().ipv4.unwrap().ip, "203.0.113.10");
+    m.assert();
+}
+
+#[test]
+fn get_server_404_is_none() {
+    let mut server = mockito::Server::new();
+    server
+        .mock("GET", "/v1/servers/42")
+        .with_status(404)
+        .with_body(r#"{"error":{"code":"not_found","message":"nope"}}"#)
+        .create();
+    assert!(HetznerCloudClient::new(server.url(), "t")
+        .get_server(42)
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn get_server_401_names_the_by_id_endpoint() {
+    let mut server = mockito::Server::new();
+    server
+        .mock("GET", "/v1/servers/42")
+        .with_status(401)
+        .with_body(r#"{"error":{"code":"unauthorized","message":"bad"}}"#)
+        .create();
+    match HetznerCloudClient::new(server.url(), "t")
+        .get_server(42)
+        .unwrap_err()
+    {
+        CliError::Hetzner {
+            status: 401,
+            endpoint,
+            ..
+        } => assert!(endpoint.ends_with("/v1/servers/42"), "{endpoint}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn the_client_debug_never_shows_the_token() {
+    let c = HetznerCloudClient::new("http://x", "hunter2hunter2");
+    assert!(!format!("{c:?}").contains("hunter2"));
+}
+
+#[test]
+fn a_caller_built_agent_bounds_every_read() {
+    let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); // accepts, never answers
+    let url = format!("http://{}", silent.local_addr().unwrap());
+    let agent = ureq::AgentBuilder::new()
+        .timeout_read(std::time::Duration::from_millis(200))
+        .build();
+    let client = HetznerCloudClient::with_agent(url, "t", agent);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send((
+            client.list_locations().is_err(),
+            client.get_server(1).is_err(),
+        ));
+    });
+    let (a, b) = rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("both requests give up at the agent's read timeout");
+    assert!(a && b);
+    drop(silent);
+}
+
+#[test]
+fn a_server_type_page_reports_only_a_next_page_that_advances() {
+    let mut server = mockito::Server::new();
+    server
+        .mock("GET", "/v1/server_types")
+        .match_query(mockito::Matcher::UrlEncoded("page".into(), "2".into()))
+        .with_status(200)
+        .with_body(r#"{"server_types":[],"meta":{"pagination":{"next_page":2}}}"#)
+        .create();
+    let (types, next) = HetznerCloudClient::new(server.url(), "t")
+        .list_server_types_page(2)
+        .unwrap();
+    assert!(types.is_empty());
+    assert_eq!(next, None, "a page that does not advance ends the listing");
+}
