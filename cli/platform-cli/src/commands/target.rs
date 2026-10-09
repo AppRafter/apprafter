@@ -1108,6 +1108,35 @@ mod tests {
         );
     }
 
+    /// R6 after the removal: the server the core found under the lock is warned about unless
+    /// the warning before the prompt already named it — a server recorded in between, or a
+    /// different one, is not left unmentioned; no server, no warning.
+    #[test]
+    fn the_late_remove_warning_names_only_a_server_not_warned_about_yet() {
+        let done = |id: Option<u64>| TargetRemoved {
+            name: "prod".into(),
+            state_removed: true,
+            orphaned_server: id.map(|server_id| apprafter_core::target::ProvisionedServer {
+                server_id,
+                server_name: "platform-1".into(),
+                server_type: None,
+            }),
+            cli_default: None,
+        };
+        let late = |warned, id| late_orphaned_server_warning("prod", warned, &done(id));
+        assert_eq!(
+            late(None, Some(42)),
+            Some(orphaned_server_warning(
+                "prod",
+                done(Some(42)).orphaned_server.as_ref().unwrap()
+            ))
+        );
+        assert_eq!(late(Some(42), Some(42)), None, "already warned");
+        assert!(late(Some(42), Some(43)).is_some_and(|w| w.contains("(id 43)")));
+        assert_eq!(late(None, None), None);
+        assert_eq!(late(Some(42), None), None);
+    }
+
     #[test]
     fn the_list_footer_uses_the_pointer_even_when_it_dangles() {
         assert_eq!(
@@ -1866,11 +1895,17 @@ pub(crate) fn remove(name: &str, yes: bool) -> miette::Result<()> {
     require_loadable(&ctx, name)?;
     let plan = core_target::plan_remove(&ctx, &tref).map_err(report)?;
     // R6: before any confirmation, so a terminal user reads it before answering.
-    match core_target::provisioned(&ctx, &tref) {
-        Ok(Some(server)) => eprintln!("{}", orphaned_server_warning(name, &server)),
-        Ok(None) => {}
-        Err(e) => eprintln!("{}", unreadable_state_warning(name, &e.to_string())),
-    }
+    let warned = match core_target::provisioned(&ctx, &tref) {
+        Ok(Some(server)) => {
+            eprintln!("{}", orphaned_server_warning(name, &server));
+            Some(server.server_id)
+        }
+        Ok(None) => None,
+        Err(e) => {
+            eprintln!("{}", unreadable_state_warning(name, &e.to_string()));
+            None
+        }
+    };
     if !yes {
         let stdin_tty = std::io::stdin().is_terminal();
         let stdout_tty = std::io::stdout().is_terminal();
@@ -1890,8 +1925,26 @@ pub(crate) fn remove(name: &str, yes: bool) -> miette::Result<()> {
         core_target::execute_remove(&ctx, plan, &CliReporter, &CancellationToken::new())
             .map_err(report)?,
     )?;
+    if let Some(w) = late_orphaned_server_warning(name, warned, &done) {
+        eprintln!("{w}");
+    }
     println!("{}", remove_done_line(&done));
     Ok(())
+}
+
+/// R6 after the removal: the warning for the server `execute_remove` found under the lock, unless
+/// the warning printed before the prompt already named it. A server recorded in between — an
+/// `apply` in another terminal writes the state without the lock — would otherwise go unmentioned
+/// while its only local record is deleted.
+pub(crate) fn late_orphaned_server_warning(
+    name: &str,
+    warned: Option<u64>,
+    done: &TargetRemoved,
+) -> Option<String> {
+    done.orphaned_server
+        .as_ref()
+        .filter(|s| Some(s.server_id) != warned)
+        .map(|s| orphaned_server_warning(name, s))
 }
 
 /// `target remove` of a target whose state records a server (R6): the server is not deleted

@@ -177,6 +177,23 @@ mod tests {
         );
     }
 
+    /// The server is read again under the lock: one recorded after the plan (an `apply` in
+    /// another terminal writes the state without the lock) is still reported as left running.
+    #[test]
+    fn a_server_recorded_after_the_plan_is_reported() {
+        let (_d, ctx) = store(&["prod", "x"], Some("x"));
+        let plan = plan_remove(&ctx, &TargetRef::named(&ctx, "prod").unwrap()).unwrap();
+        assert!(plan.changes.iter().all(|c| c.kind != "LocalState"));
+        seed_server(&ctx, "prod", 42, "platform-1", None);
+        let Outcome::Completed { result } =
+            execute_remove(&ctx, plan, &NullReporter, &CancellationToken::new()).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(result.orphaned_server.map(|s| s.server_id), Some(42));
+        assert!(result.state_removed);
+    }
+
     #[test]
     fn removing_the_last_target_deletes_the_pointer_file() {
         let (_d, ctx) = store(&["only"], Some("only"));
