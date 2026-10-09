@@ -7,7 +7,7 @@ Checking target...
 
 Checking environment...
   ⚠ `restic` on PATH
-      hint: not found (No such file or directory (os error <N>)) — needed for backup and restore.
+      hint: not found — needed for backup and restore.
 Install restic (>= 0.14):
   • macOS      brew install restic
   • Debian     apt install restic
@@ -16,7 +16,7 @@ Install restic (>= 0.14):
   • Windows    winget install restic.restic
   • other      https://restic.readthedocs.io/en/stable/020_installation.html
   ✗ `kubectl` on PATH
-      hint: not found (No such file or directory (os error <N>)) — needed for talking to the cluster.
+      hint: not found — needed for talking to the cluster.
 Install kubectl:
   • macOS      brew install kubectl
   • Debian     apt install kubectl
@@ -24,7 +24,7 @@ Install kubectl:
   • Windows    winget install Kubernetes.kubectl
   • other      https://kubernetes.io/docs/tasks/tools/
   ⚠ `helm` on PATH
-      hint: not found (No such file or directory (os error <N>)) — needed for installing platform charts.
+      hint: not found — needed for installing platform charts.
 Install helm:
   • macOS      brew install helm
   • Debian     apt install helm
@@ -32,7 +32,7 @@ Install helm:
   • Windows    winget install Helm.Helm
   • other      https://helm.sh/docs/intro/install/
   ⚠ `git` on PATH
-      hint: not found (No such file or directory (os error <N>)) — needed for reading the application repository.
+      hint: not found — needed for reading the application repository.
 Install git:
   • macOS      xcode-select --install
   • Debian     apt install git
@@ -40,14 +40,14 @@ Install git:
   • Windows    winget install Git.Git
   • other      https://git-scm.com/downloads
   ⚠ `ssh` on PATH
-      hint: not found (No such file or directory (os error <N>)) — needed for reaching the node over SSH.
+      hint: not found — needed for reaching the node over SSH.
 Install an OpenSSH client:
   • macOS      preinstalled
   • Debian     apt install openssh-client
   • Nix        nix profile install nixpkgs#openssh
   • Windows    built into Windows 10/11: Settings › Optional features › OpenSSH Client
   ⚠ `cue` on PATH
-      hint: not found (No such file or directory (os error <N>)) — needed for validating application manifests.
+      hint: not found — needed for validating application manifests.
 Install cue:
   • macOS      brew install cue
   • Arch       pacman -S cue

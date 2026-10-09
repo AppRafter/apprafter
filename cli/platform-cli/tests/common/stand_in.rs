@@ -35,7 +35,6 @@ pub fn tool_stand_ins<'a>(tools: impl IntoIterator<Item = &'a Tool>) -> TempDir 
 
 #[cfg(unix)]
 fn write_stand_in(path: &std::path::Path, tool: &Tool) {
-    use std::os::unix::fs::PermissionsExt;
     let name = tool.name;
     let call = tool.version_args.join(" ");
     let answer = if name == "ssh" {
@@ -43,16 +42,26 @@ fn write_stand_in(path: &std::path::Path, tool: &Tool) {
     } else {
         format!("echo '{name} stand-in'")
     };
-    std::fs::write(
+    script(
         path,
-        format!(
-            "#!/bin/sh\n\
-             case \"$*\" in\n\
-             __probe) exit 0 ;;\n\
+        &format!(
+            "case \"$*\" in\n\
              '{call}') {answer} ;;\n\
              *) echo \"{name} stand-in: unexpected arguments: $*\" >&2; exit 2 ;;\n\
-             esac\n"
+             esac"
         ),
+    );
+}
+
+/// Replace `path` with a `/bin/sh` script running `body`; `__probe` exits 0 before it. Only
+/// shell builtins, or an absolute path: the probed child's `PATH` is the stand-in directory
+/// alone (GOTCHA-104).
+#[cfg(unix)]
+pub fn script(path: &std::path::Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(
+        path,
+        format!("#!/bin/sh\ncase \"$*\" in __probe) exit 0 ;; esac\n{body}\n"),
     )
     .expect("write stand-in");
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod stand-in");

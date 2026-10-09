@@ -2,4 +2,5 @@
 //! How the CLI shows what the core returns.
 
 pub(crate) mod core_error;
+pub(crate) mod doctor;
 pub(crate) mod reporter;

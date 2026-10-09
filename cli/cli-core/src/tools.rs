@@ -82,9 +82,12 @@ pub struct Tool {
     /// This distinction is what `doctor` reports on; D11's complaint was
     /// that a missing `kubectl` printed "Ready to go" and exited 0.
     pub required: bool,
-    /// Arguments that make the tool print its version. `ssh -V` writes
-    /// to stderr and some tools exit non-zero, which `check_tool`
-    /// tolerates — any output at all counts as present.
+    /// Arguments that make the tool print its version, exiting 0 when the
+    /// tool works (`ssh -V` writes to stderr). The core's resolver
+    /// (`apprafter_core::tools::ToolResolver::probe`, which `doctor` uses)
+    /// takes the first line of a run that exited 0 as the version, and
+    /// reports any other run as having none, with the tool's own first line
+    /// as the reason: a shim with no version set prints an error and fails.
     ///
     /// PRESENCE ONLY. The version is asked for and then thrown away:
     /// nothing here declares or compares a minimum, and `RESTIC`'s

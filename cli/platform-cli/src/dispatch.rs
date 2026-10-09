@@ -15,7 +15,7 @@ use crate::commands;
 
 /// Commands on `apprafter-core` convert their own errors at the arm boundary
 /// (`crate::render::core_error::report`); every other command goes through [`dispatch_cli`],
-/// mapped once. D.3c adds `Doctor`.
+/// mapped once.
 pub(crate) fn dispatch(args: Cli) -> miette::Result<()> {
     match args.command {
         Commands::Target { action } => match action {
@@ -64,6 +64,7 @@ pub(crate) fn dispatch(args: Cli) -> miette::Result<()> {
             other => commands::target::run(other),
         },
         Commands::Whoami { no_ping } => commands::whoami::run(no_ping),
+        Commands::Doctor { target, no_ping } => commands::doctor::run(target.as_deref(), no_ping),
         command => dispatch_cli(Cli { command }).map_err(miette::Report::new),
     }
 }
@@ -74,11 +75,10 @@ pub(crate) fn dispatch(args: Cli) -> miette::Result<()> {
 /// in [`dispatch`].
 fn dispatch_cli(args: Cli) -> cli_core::Result<()> {
     match args.command {
-        Commands::Target { .. } | Commands::Whoami { .. } => {
-            unreachable!("`dispatch` runs `target` and `whoami` on the core")
+        Commands::Target { .. } | Commands::Whoami { .. } | Commands::Doctor { .. } => {
+            unreachable!("`dispatch` runs `target`, `whoami` and `doctor` on the core")
         }
         Commands::Auth { action } => commands::auth::run(action)?,
-        Commands::Doctor { target, no_ping } => commands::doctor::run(target.as_deref(), no_ping)?,
         Commands::Init {
             provider,
             tier,
