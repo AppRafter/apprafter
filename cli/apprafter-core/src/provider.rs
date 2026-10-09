@@ -383,6 +383,14 @@ mod tests {
             }
         );
         none.assert();
+        // A revoked token is `Rejected`, not `Unreachable`: whoami and doctor send one to
+        // rotating the token, the other to the network.
+        let mut s = mockito::Server::new();
+        let _m = locations(&mut s, 401);
+        assert_eq!(
+            verification(&ctx(&s.url()), "hetzner-cloud", Some(&token()), &cancel),
+            Verification::Rejected
+        );
         let mut s = mockito::Server::new();
         let _m = locations(&mut s, 503);
         assert_eq!(
