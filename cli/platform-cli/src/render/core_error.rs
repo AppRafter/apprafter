@@ -122,9 +122,14 @@ pub(crate) fn cli_help(e: &CoreError) -> Option<String> {
              not provisioned yet.)"
                 .into()
         }
+        // Transport, timeout and parse alike (overview §3.6.1): a 200 whose body does not
+        // deserialise lands here too, and doctor passes for it.
         CoreError::ProviderRequestFailed { .. } => {
-            "The provider API did not answer; nothing was changed. `apprafter doctor` checks \
-             reachability and DNS; retry once it passes."
+            "The provider API did not answer, or answered with something this version of \
+             AppRafter cannot read; the cause above says which. Nothing was changed. `apprafter \
+             doctor` checks reachability and DNS: retry once it passes. If it already passes, \
+             the answer itself is the problem: a proxy in between, or a change in the \
+             provider's API."
                 .into()
         }
         CoreError::ToolUnsupported { tool, .. } => format!(
@@ -270,6 +275,27 @@ mod tests {
         assert!(
             case("new id").contains("`apprafter import --force --target prod`"),
             "{help}"
+        );
+    }
+
+    #[test]
+    fn a_failed_provider_request_covers_an_answer_it_cannot_read() {
+        // `public_address` wraps a 200 whose body does not parse (client.rs `get_server`) as
+        // the same variant as a transport error, so the help may not say "did not answer".
+        let r = report(CoreError::ProviderRequestFailed {
+            provider: "hetzner-cloud".into(),
+            endpoint: "GET /v1/servers/42".into(),
+            cause: Box::new(CoreError::Cli(CliError::Other(
+                "parse get_server response: unknown variant `migrating`".into(),
+            ))),
+        });
+        let help = r.help().unwrap().to_string();
+        assert!(help.contains("did not answer"), "{help}");
+        assert!(help.contains("cannot read"), "{help}");
+        assert!(
+            r.chain()
+                .any(|e| e.to_string().contains("parse get_server response")),
+            "the cause the help points at is shown"
         );
     }
 
