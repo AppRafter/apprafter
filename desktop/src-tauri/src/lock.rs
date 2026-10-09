@@ -305,6 +305,15 @@ impl LockMachine {
                 return;
             }
             if inner.reason.is_some() {
+                // Already locked, an open unlock prompt is still closed: with lock-on-sleep on,
+                // the app is locked after every session lock or sleep until an unlock that
+                // began after it, so the yes of a prompt opened before must not count (the
+                // owner may have left, or typed just as the lid closed). A prompt exists only
+                // while the app is locked, so leaving it alone here would mean no session event
+                // ever closed one. Each event closes only the prompt it finds open. That a
+                // stream of events would close every prompt is why the watch hears only the
+                // OS's own senders (on Linux it drops a signal sent to the app alone); anything
+                // else that can send them runs as the owner, and could do worse.
                 close_open_prompt(&mut inner)
             } else {
                 if in_effect(&inner.settings, &info) {
@@ -2035,6 +2044,43 @@ mod tests {
         );
         ends.answer.send(AuthOutcome::Verified).unwrap();
         first
+            .recv_timeout(LONG)
+            .expect("the unlock returned")
+            .unwrap();
+        assert!(!r.machine.state().locked);
+    }
+
+    /// The decision in `lock_if`: a session event on a locked app closes the unlock prompt it
+    /// finds open, so that prompt's yes does not unlock after the session locked or slept, and
+    /// only that one: a prompt opened after the event is the owner answering anew, and unlocks.
+    #[test]
+    fn a_session_event_closes_the_open_prompt_and_not_the_next() {
+        let (prompt, ends) = HeldPrompt::new();
+        let r = rig(Settings::default(), prompt);
+        let before = unlock_in_background(&r.machine);
+        ends.opened.recv_timeout(LONG).expect("the prompt opened");
+        r.machine.os_session();
+        ends.tripped
+            .recv_timeout(LONG)
+            .expect("the event closed the prompt it found");
+        ends.answer.send(AuthOutcome::Verified).unwrap();
+        let result = before.recv_timeout(LONG).expect("the unlock returned");
+        assert!(
+            matches!(result, Err(DesktopError::AuthCancelled)),
+            "{result:?}"
+        );
+        assert!(r.machine.state().locked);
+
+        let after = unlock_in_background(&r.machine);
+        ends.opened.recv_timeout(LONG).expect("a new prompt opened");
+        assert!(
+            ends.tripped
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "the event closed a prompt opened after it"
+        );
+        ends.answer.send(AuthOutcome::Verified).unwrap();
+        after
             .recv_timeout(LONG)
             .expect("the unlock returned")
             .unwrap();
