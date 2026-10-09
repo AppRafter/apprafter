@@ -13,11 +13,13 @@
 //!   instance ([`instance_identifier`]). It fails closed: set but empty or not Unicode, the app
 //!   refuses to start rather than fall back on the owner's own files;
 //! - on Linux and Windows, `PATH`: where the tools the app runs (`kubectl`, `helm`, `restic`,
-//!   `git`, `ssh`, `cue`) are looked for, and the `PATH` they get ([`desktop_host`]). An
+//!   `git`, `ssh`, `cue`) are looked for, and the `PATH` they get ([`tool_search_path`]). An
 //!   inherited `PATH` decides which `kubectl` runs: a recorded trust decision (spec rev 4 §10).
 //!   macOS does not read it — an app started from Finder has launchd's bare `PATH` — and asks
 //!   the account's interactive login shell for its `PATH` instead (five-second limit), falling
-//!   back to [`MACOS_FALLBACK_PATH`];
+//!   back to [`MACOS_FALLBACK_PATH`]. It asks on a thread of its own from the start, so the
+//!   window never waits for a slow profile; the first lookup of a tool waits for the answer,
+//!   at most [`TOOL_PATH_WAIT`] from the start ([`ToolSearchPath`]);
 //! - in a test build only (cargo feature `test-build`), `APPRAFTER_HCLOUD_BASE_URL`, which the
 //!   core then accepts only as a loopback `http://` URL ([`desktop_context`]), and
 //!   `APPRAFTER_DESKTOP_TEST_PASSWORD`, the password the fake authenticator's own field accepts,
@@ -41,7 +43,12 @@
 use std::ffi::OsString;
 use std::fmt;
 use std::io;
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use apprafter_core::context::{HCLOUD_BASE_URL_ENV, PATH_ENV};
 use apprafter_core::{Context, CoreResult, DesktopHost, DesktopPolicy, EnvSource, PathSource};
@@ -147,9 +154,12 @@ impl fmt::Debug for AllowListEnv {
 }
 
 /// What only this process knows about where the core may look and write: the tool search path
-/// and the runtime dir (`<app data dir>/run`).
-pub fn desktop_host(env: &AllowListEnv, runtime_dir: PathBuf) -> DesktopHost {
-    let (tool_search_path, tool_search_path_source) = tool_search_path(env);
+/// as it is known now — on macOS, before the login shell answered, its fallback
+/// ([`ToolSearchPath::now`]: this never waits) — and the runtime dir (`<app data dir>/run`).
+/// What runs tools takes the path from [`ToolSearchPath::get`] instead
+/// ([`Shell::tool_context`](crate::app::Shell::tool_context)).
+pub fn desktop_host(tools: &ToolSearchPath, runtime_dir: PathBuf) -> DesktopHost {
+    let (tool_search_path, tool_search_path_source) = tools.now();
     DesktopHost {
         runtime_dir,
         tool_search_path,
@@ -157,19 +167,157 @@ pub fn desktop_host(env: &AllowListEnv, runtime_dir: PathBuf) -> DesktopHost {
     }
 }
 
-/// Linux and Windows: the allow-listed `PATH`, raw.
+/// Linux and Windows: the allow-listed `PATH`, raw, known at once.
 #[cfg(not(target_os = "macos"))]
-fn tool_search_path(env: &AllowListEnv) -> (OsString, PathSource) {
-    (
+pub fn tool_search_path(env: &AllowListEnv) -> ToolSearchPath {
+    ToolSearchPath::known(
         env.var_os(PATH_ENV).unwrap_or_default(),
         PathSource::Environment,
     )
 }
 
-/// macOS: the account's login shell's `PATH` (an app started from Finder has launchd's).
+/// macOS: the account's login shell's `PATH` (an app started from Finder has launchd's), asked
+/// from now on a thread of its own; [`MACOS_FALLBACK_PATH`] when it gives none.
 #[cfg(target_os = "macos")]
-fn tool_search_path(_env: &AllowListEnv) -> (OsString, PathSource) {
-    login_shell_path()
+pub fn tool_search_path(_env: &AllowListEnv) -> ToolSearchPath {
+    ToolSearchPath::probe(
+        || {
+            let path =
+                account_shell().and_then(|shell| probe_login_shell(login_shell_command(&shell)));
+            if path.is_none() {
+                tracing::warn!(
+                    "the login shell gave no PATH; tools are looked for in {MACOS_FALLBACK_PATH}"
+                );
+            }
+            path
+        },
+        PathSource::LoginShell,
+        (OsString::from(MACOS_FALLBACK_PATH), PathSource::Fallback),
+        TOOL_PATH_WAIT,
+    )
+}
+
+/// How long the first lookup of a tool waits for the login shell's answer, counted from when
+/// the app asked: the probe's own five-second bound and a second's grace. Past it the lookup
+/// takes the fallback.
+pub const TOOL_PATH_WAIT: Duration = Duration::from_secs(6);
+
+/// The tool search path and where it came from, as the app learns it. Off macOS it is known at
+/// once ([`known`](Self::known)). On macOS the login shell is asked on a thread of its own,
+/// started with the app ([`probe`](Self::probe)), so nothing on the way to the window waits
+/// for a slow profile: the app's context is built with what is known by then
+/// ([`now`](Self::now)), and only what needs a tool waits for the answer ([`get`](Self::get)),
+/// at most until its wait has passed since the app asked; past it, the fallback, until the
+/// answer comes after all. Clones share the one answer.
+#[derive(Debug, Clone)]
+pub struct ToolSearchPath(Arc<ToolPathState>);
+
+#[derive(Debug)]
+struct ToolPathState {
+    /// Set once, by the probe's thread (or at once by [`ToolSearchPath::known`]).
+    answer: Mutex<Option<(OsString, PathSource)>>,
+    answered: Condvar,
+    /// [`ToolSearchPath::get`] never waits past it.
+    deadline: Instant,
+    /// The path before the answer, and in its place when there is none.
+    fallback: (OsString, PathSource),
+    /// The fallback taken for want of an answer in time is logged once.
+    warned: AtomicBool,
+}
+
+impl ToolPathState {
+    fn new(
+        answer: Option<(OsString, PathSource)>,
+        fallback: (OsString, PathSource),
+        wait: Duration,
+    ) -> Self {
+        Self {
+            answer: Mutex::new(answer),
+            answered: Condvar::new(),
+            deadline: Instant::now() + wait,
+            fallback,
+            warned: AtomicBool::new(false),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Option<(OsString, PathSource)>> {
+        self.answer.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn answer(&self, answer: (OsString, PathSource)) {
+        *self.lock() = Some(answer);
+        self.answered.notify_all();
+    }
+}
+
+impl ToolSearchPath {
+    /// A path known now.
+    pub fn known(path: OsString, source: PathSource) -> Self {
+        let known = (path, source);
+        Self(Arc::new(ToolPathState::new(
+            Some(known.clone()),
+            known,
+            Duration::ZERO,
+        )))
+    }
+
+    /// `probe`'s path (from `source`), asked from now on a thread of its own (`path-probe`), and
+    /// `fallback` when it gives none, panics, or no thread can be had. [`get`](Self::get) waits
+    /// for it until `wait` has passed from now.
+    pub fn probe(
+        probe: impl FnOnce() -> Option<OsString> + Send + 'static,
+        source: PathSource,
+        fallback: (OsString, PathSource),
+        wait: Duration,
+    ) -> Self {
+        let state = Arc::new(ToolPathState::new(None, fallback, wait));
+        let answering = Arc::clone(&state);
+        let spawned = thread::Builder::new()
+            .name("path-probe".into())
+            .spawn(move || {
+                let found = panic::catch_unwind(AssertUnwindSafe(probe)).ok().flatten();
+                let answer = match found {
+                    Some(path) => (path, source),
+                    None => answering.fallback.clone(),
+                };
+                answering.answer(answer);
+            });
+        if let Err(e) = spawned {
+            tracing::warn!(
+                "no thread to ask for the tool search path on ({e}); the fallback holds"
+            );
+            state.answer(state.fallback.clone());
+        }
+        Self(state)
+    }
+
+    /// What is known now, never waiting: the answer, or the fallback while there is none.
+    pub fn now(&self) -> (OsString, PathSource) {
+        let answer = self.0.lock().clone();
+        answer.unwrap_or_else(|| self.0.fallback.clone())
+    }
+
+    /// The answer, waiting for it until the wait given at the start has passed; the fallback
+    /// past that, until the answer comes.
+    pub fn get(&self) -> (OsString, PathSource) {
+        let state = &*self.0;
+        let remaining = state.deadline.saturating_duration_since(Instant::now());
+        let (answer, _) = state
+            .answered
+            .wait_timeout_while(state.lock(), remaining, |answer| answer.is_none())
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(answer) = &*answer {
+            return answer.clone();
+        }
+        drop(answer);
+        if !state.warned.swap(true, SeqCst) {
+            tracing::warn!(
+                "the tool search path was not known in time; tools are looked for in {:?} until it is",
+                state.fallback.0
+            );
+        }
+        state.fallback.clone()
+    }
 }
 
 /// The marker line, one literal for both [`PATH_MARKER`] and [`LOGIN_SHELL_SCRIPT`], so the
@@ -235,21 +383,6 @@ fn probe_login_shell(cmd: std::process::Command) -> Option<OsString> {
     ) {
         Ok(out) if !out.timed_out => parse_login_shell_output(&out.stdout),
         _ => None,
-    }
-}
-
-/// The account's login shell's `PATH` ([`probe_login_shell`]); [`MACOS_FALLBACK_PATH`] when
-/// that gives none.
-#[cfg(target_os = "macos")]
-fn login_shell_path() -> (OsString, PathSource) {
-    match account_shell().and_then(|shell| probe_login_shell(login_shell_command(&shell))) {
-        Some(path) => (path, PathSource::LoginShell),
-        None => {
-            tracing::warn!(
-                "the login shell gave no PATH; tools are looked for in {MACOS_FALLBACK_PATH}"
-            );
-            (OsString::from(MACOS_FALLBACK_PATH), PathSource::Fallback)
-        }
     }
 }
 
@@ -735,14 +868,13 @@ mod tests {
     /// writing holds a write handle to it until it execs.
     #[cfg(unix)]
     fn fake_login_shell(dir: &Path) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         // The script, spelled out rather than taken from LOGIN_SHELL_SCRIPT: it is the contract
         // with the shell, so a change to it must change this test too.
         const EXPECTED_SCRIPT: &str = "echo __APPRAFTER_PATH__; /usr/bin/printenv PATH";
         let shell = dir.join("fake-login-shell");
-        std::fs::write(
+        install_script(
             &shell,
-            format!(
+            &format!(
                 r#"#!/bin/sh
 case "$1" in __probe) exit 0;; esac
 if [ "$#" != 4 ] || [ "$1 $2 $3" != "-i -l -c" ] || [ "$4" != '{EXPECTED_SCRIPT}' ]; then
@@ -757,18 +889,160 @@ echo '{PATH_MARKER}'
 echo '/opt/homebrew/bin:/usr/bin:/bin'
 "#
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
+        shell
+    }
+
+    /// Write `body` to `script`, executable, and run it once with `__probe` (it must exit 0 on
+    /// that) to wait out `ETXTBSY`: a sibling test thread that forks while the file is still
+    /// open for writing holds a write handle to it until it execs.
+    #[cfg(unix)]
+    fn install_script(script: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(script, body).unwrap();
+        std::fs::set_permissions(script, std::fs::Permissions::from_mode(0o755)).unwrap();
         for _ in 0..200 {
-            match std::process::Command::new(&shell).arg("__probe").status() {
+            match std::process::Command::new(script).arg("__probe").status() {
                 Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
                     std::thread::sleep(std::time::Duration::from_millis(5))
                 }
                 _ => break,
             }
         }
+    }
+
+    /// A login shell with a slow profile: it answers as the probe's script would, `/slow/bin`,
+    /// after `secs` seconds.
+    #[cfg(unix)]
+    fn slow_login_shell(dir: &Path, secs: u32) -> PathBuf {
+        let shell = dir.join("slow-login-shell");
+        install_script(
+            &shell,
+            &format!(
+                "#!/bin/sh\ncase \"$1\" in __probe) exit 0;; esac\nsleep {secs}\necho '{PATH_MARKER}'\necho /slow/bin\n"
+            ),
+        );
         shell
+    }
+
+    fn fallback() -> (OsString, PathSource) {
+        (OsString::from(MACOS_FALLBACK_PATH), PathSource::Fallback)
+    }
+
+    /// The macOS start, on every Unix against a slow stand-in shell: asking it holds up nothing
+    /// — not the host the context is built from, which has the fallback meanwhile — and the
+    /// first lookup of a tool waits for its answer.
+    #[cfg(unix)]
+    #[test]
+    fn a_slow_login_shell_holds_up_the_first_tool_lookup_and_nothing_before_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let shell = slow_login_shell(dir.path(), 2);
+        let started = Instant::now();
+        let tools = ToolSearchPath::probe(
+            move || probe_login_shell(login_shell_command(&shell)),
+            PathSource::LoginShell,
+            fallback(),
+            TOOL_PATH_WAIT,
+        );
+        let host = desktop_host(&tools, PathBuf::from("/data/run"));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the start waited {:?} for the login shell",
+            started.elapsed()
+        );
+        assert_eq!(
+            (host.tool_search_path, host.tool_search_path_source),
+            fallback()
+        );
+        assert_eq!(
+            tools.get(),
+            (OsString::from("/slow/bin"), PathSource::LoginShell)
+        );
+        assert!(
+            started.elapsed() >= Duration::from_secs(2),
+            "it waited for the answer"
+        );
+        assert_eq!(
+            tools.clone().now().1,
+            PathSource::LoginShell,
+            "clones share it"
+        );
+    }
+
+    /// A shell slower than the wait: the lookup takes the fallback at the wait's end, later
+    /// lookups take it at once, and the answer still counts once it comes.
+    #[test]
+    fn past_its_wait_a_lookup_takes_the_fallback_until_the_answer_comes() {
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let started = Instant::now();
+        let tools = ToolSearchPath::probe(
+            move || {
+                let _ = released.recv_timeout(Duration::from_secs(30));
+                Some(OsString::from("/late/bin"))
+            },
+            PathSource::LoginShell,
+            fallback(),
+            Duration::from_millis(200),
+        );
+        assert_eq!(tools.get(), fallback());
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_millis(200) && waited < Duration::from_secs(5),
+            "{waited:?}"
+        );
+        let again = Instant::now();
+        assert_eq!(tools.get(), fallback());
+        assert!(
+            again.elapsed() < Duration::from_millis(100),
+            "no second wait"
+        );
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while tools.now().1 != PathSource::LoginShell {
+            assert!(Instant::now() < deadline, "the late answer never counted");
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(
+            tools.get(),
+            (OsString::from("/late/bin"), PathSource::LoginShell)
+        );
+    }
+
+    /// No answer, or a probe that panicked: the fallback, without waiting out the wait.
+    #[test]
+    fn a_probe_that_finds_nothing_or_panics_gives_the_fallback_at_once() {
+        let nothing = ToolSearchPath::probe(|| None, PathSource::LoginShell, fallback(), LONG_WAIT);
+        let broken = ToolSearchPath::probe(
+            || panic!("the probe broke"),
+            PathSource::LoginShell,
+            fallback(),
+            LONG_WAIT,
+        );
+        let started = Instant::now();
+        assert_eq!(nothing.get(), fallback());
+        assert_eq!(broken.get(), fallback());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Longer than any test waits.
+    const LONG_WAIT: Duration = Duration::from_secs(60);
+
+    #[test]
+    fn a_known_path_is_known_at_once() {
+        let tools = ToolSearchPath::known("/a:/b".into(), PathSource::Environment);
+        assert_eq!(tools.now(), ("/a:/b".into(), PathSource::Environment));
+        assert_eq!(tools.get(), ("/a:/b".into(), PathSource::Environment));
+    }
+
+    /// The wait covers the probe's own bound, and a second more.
+    #[cfg(unix)]
+    #[test]
+    fn the_wait_is_the_probe_s_bound_and_a_second() {
+        assert_eq!(TOOL_PATH_WAIT, LOGIN_SHELL_TIMEOUT + Duration::from_secs(1));
     }
 
     /// The probe on every Unix, against a stand-in shell: asked interactive and login, it takes
@@ -818,7 +1092,7 @@ echo '/opt/homebrew/bin:/usr/bin:/bin'
     #[test]
     fn the_host_takes_the_allow_listed_path() {
         let env = env_of(false, &[("PATH", "/usr/bin:/bin")]);
-        let host = desktop_host(&env, PathBuf::from("/data/run"));
+        let host = desktop_host(&tool_search_path(&env), PathBuf::from("/data/run"));
         assert_eq!(host.tool_search_path, OsString::from("/usr/bin:/bin"));
         assert_eq!(host.tool_search_path_source, PathSource::Environment);
         assert_eq!(host.runtime_dir, PathBuf::from("/data/run"));

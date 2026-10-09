@@ -10,9 +10,10 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use apprafter_core::{CancellationToken, Context};
+use apprafter_core::{CancellationToken, Context, PathSource};
 use apprafter_desktop::app::{self, SessionSource, Shell, ShellCell};
 use apprafter_desktop::auth::{AuthPurpose, Authenticator, PasswordAnswer};
+use apprafter_desktop::env::ToolSearchPath;
 use apprafter_desktop::ops::SystemClock;
 use apprafter_desktop::settings::SettingsStore;
 use apprafter_desktop_ipc::{AuthInfo, AuthMethod, AuthOutcome, Settings, UnavailableReason};
@@ -110,6 +111,14 @@ pub fn rig(settings: Settings) -> Rig {
 
 /// [`rig`], with an OS that verifies by `route`.
 pub fn rig_by(settings: Settings, route: Route) -> Rig {
+    // The tool search path the context has: an empty one, set by the caller.
+    let tools = ToolSearchPath::known(Default::default(), PathSource::Explicit);
+    rig_with_tools(settings, route, tools)
+}
+
+/// [`rig_by`], the shell learning the tool search path through `tools` (as the app on macOS
+/// learns it from the login shell), the rest built as the app builds it meanwhile.
+pub fn rig_with_tools(settings: Settings, route: Route, tools: ToolSearchPath) -> Rig {
     let dir = tempfile::tempdir().unwrap();
     let store = SettingsStore::load(dir.path(), &SystemClock);
     store.set(settings).unwrap();
@@ -123,6 +132,7 @@ pub fn rig_by(settings: Settings, route: Route) -> Rig {
         auth.clone(),
         Arc::new(SystemClock),
         Context::for_desktop(dir.path().join("store"), "http://127.0.0.1:9"),
+        tools,
         false,
         |_| {},
     );

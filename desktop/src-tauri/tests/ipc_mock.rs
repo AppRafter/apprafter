@@ -20,13 +20,14 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
 
-use apprafter_core::{CoreError, Outcome, PlanClass};
+use apprafter_core::{CoreError, Outcome, PathSource, PlanClass};
 use apprafter_desktop::app;
+use apprafter_desktop::env::ToolSearchPath;
 use apprafter_desktop::ops::{Executor, PlanParts};
 use apprafter_desktop_ipc::{errors, Settings, Theme, ALLOWED_WHILE_LOCKED, COMMANDS, QUITTING};
 use common::{
-    code, invoke, lock_off, rig, rig_by, wait_for, watch, Log, Rig, Route, PAM_SAYS, PASSWORD,
-    WATCH_DROPPED,
+    code, invoke, lock_off, rig, rig_by, rig_with_tools, wait_for, watch, Log, Rig, Route,
+    PAM_SAYS, PASSWORD, WATCH_DROPPED,
 };
 use serde_json::{json, Value};
 use tauri::Listener;
@@ -176,6 +177,49 @@ fn a_quit_with_operations_running_tells_the_page_what_it_waits_for() {
     assert_eq!(
         serde_json::from_str::<Value>(&payload).unwrap(),
         json!({ "running": 1, "waitMs": app::STOP_BOUND.as_millis() as u64 })
+    );
+}
+
+/// WI-452: a slow login shell (macOS asks one for the tools' `PATH`) delays neither the shell
+/// nor the window: the app is built, and `window_ready` shows the window, while the shell has
+/// not answered — the context meanwhile has the fallback — and the first lookup of a tool
+/// waits for the answer.
+#[test]
+fn a_slow_login_shell_does_not_delay_window_ready() {
+    let (release, released) = mpsc::channel::<()>();
+    let tools = ToolSearchPath::probe(
+        move || {
+            // The slow shell: it answers when the test lets it.
+            let _ = released.recv_timeout(Duration::from_secs(60));
+            Some("/from/the/login/shell".into())
+        },
+        PathSource::LoginShell,
+        ("/usr/bin:/bin".into(), PathSource::Fallback),
+        Duration::from_secs(60),
+    );
+    let rig = rig_with_tools(lock_off(), Route::Prompt, tools.clone());
+    assert_eq!(invoke(&rig, "window_ready", json!({})), Ok(Value::Null));
+    assert_eq!(
+        tools.now().1,
+        PathSource::Fallback,
+        "the window showed before the login shell answered"
+    );
+    let lookup = {
+        let shell = rig.shell.clone();
+        thread::spawn(move || {
+            let context = shell.tool_context();
+            (
+                context.tool_search_path().to_owned(),
+                context.tool_search_path_source(),
+            )
+        })
+    };
+    thread::sleep(Duration::from_millis(50));
+    assert!(!lookup.is_finished(), "the lookup waits for the answer");
+    release.send(()).unwrap();
+    assert_eq!(
+        lookup.join().unwrap(),
+        ("/from/the/login/shell".into(), PathSource::LoginShell)
     );
 }
 

@@ -76,6 +76,7 @@ use crate::auth::Authenticator;
 use crate::auth_cache::AuthCache;
 use crate::commands;
 use crate::drafts::DraftStore;
+use crate::env::ToolSearchPath;
 use crate::errors::{DesktopError, Refusal};
 use crate::lock::{LockChange, LockHook, LockMachine};
 use crate::ops::{panic_message, Clock, EventSink, Executor, OperationManager};
@@ -291,8 +292,13 @@ pub struct Shell {
     pub drafts: Arc<DraftStore>,
     /// The authenticator, its answer about what it can do kept ([`AuthCache`]).
     pub auth: Arc<AuthCache>,
-    /// The core's view of this process: the target store and the provider API.
+    /// The core's view of this process: the target store and the provider API. Its tool search
+    /// path is what was known when the app started; what runs tools takes
+    /// [`tool_context`](Self::tool_context) instead.
     pub context: Context,
+    /// The tool search path as the app learns it: on macOS, the login shell's answer, asked from
+    /// the start on a thread of its own ([`crate::env::tool_search_path`]).
+    tools: ToolSearchPath,
     /// A test build (fake authentication): `app_info` tells the webview to say so.
     pub test_build: bool,
     /// Set by the first [`begin_quit`](Self::begin_quit).
@@ -376,12 +382,15 @@ impl Shell {
     ///
     /// `auth` is kept behind an [`AuthCache`], which the lock reads instead of the OS. It is
     /// given the settings first ([`Authenticator::apply_settings`]: Windows' `hello`), and again
-    /// after every save.
+    /// after every save. `tools` is where the tools are looked for ([`tool_context`]).
+    ///
+    /// [`tool_context`]: Self::tool_context
     pub fn new(
         settings: SettingsStore,
         auth: Arc<dyn Authenticator>,
         clock: Arc<dyn Clock>,
         context: Context,
+        tools: ToolSearchPath,
         test_build: bool,
         on_lock_change: impl Fn(&LockState) + Send + Sync + 'static,
     ) -> Arc<Self> {
@@ -410,6 +419,7 @@ impl Shell {
             drafts,
             auth,
             context,
+            tools,
             test_build,
             quitting: AtomicBool::new(false),
             drained: AtomicBool::new(false),
@@ -508,6 +518,15 @@ impl Shell {
                 Err(e)
             }
         }
+    }
+
+    /// The core's context for work that runs tools (the toolchain, doctor): the tool search path
+    /// as the app knows it, waiting the first time for the macOS login shell's answer — at most
+    /// until [`TOOL_PATH_WAIT`](crate::env::TOOL_PATH_WAIT) has passed since the app asked
+    /// ([`ToolSearchPath::get`]). Call it on a blocking worker or an operation's thread.
+    pub fn tool_context(&self) -> Context {
+        let (path, source) = self.tools.get();
+        self.context.clone().with_tool_search_path(path, source)
     }
 
     /// Start a read ([`OperationManager::start`]) and wake the output flusher, which sleeps
@@ -874,7 +893,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use apprafter_core::{
-        CancellationToken, Context, CoreError, Event, Outcome, PlanClass, SecretString,
+        CancellationToken, Context, CoreError, Event, Outcome, PathSource, PlanClass, SecretString,
     };
     use apprafter_desktop_ipc::SessionEvents;
     use apprafter_desktop_ipc::{
@@ -890,6 +909,7 @@ mod tests {
     use crate::auth::test_os::{self, Call, ScriptedOs};
     use crate::auth::{AuthPurpose, Authenticator, FakeAuthenticator, NoAuthenticator};
     use crate::drafts::DRAFT_TTL_MS;
+    use crate::env::ToolSearchPath;
     use crate::errors::DesktopError;
     use crate::ops::test_clock::ManualClock;
     use crate::ops::{EventSink, Executor, PlanParts, PLAN_TTL_MS};
@@ -918,6 +938,7 @@ mod tests {
                 auth,
                 clock.clone(),
                 Context::for_desktop(dir.path().join("store"), "http://127.0.0.1:9"),
+                ToolSearchPath::known(Default::default(), PathSource::Explicit),
                 false,
                 move |state| notified.lock().unwrap().push(state.clone()),
             )

@@ -53,8 +53,10 @@ use crate::settings::SettingsStore;
 /// The core context is built once the app is: its runtime dir is `<app data dir>/run`, and
 /// Tauri resolves the app data dir — the override included — only then. So a refused
 /// `APPRAFTER_HCLOUD_BASE_URL` (a test build only) stops the start after the single-instance
-/// plugin has registered. On macOS this is also where the login shell is asked for the tools'
-/// `PATH` ([`env::desktop_host`]).
+/// plugin has registered. On macOS the login shell is asked for the tools' `PATH` once the log
+/// is up, on a thread of its own ([`env::tool_search_path`]): nothing on the way to the window
+/// waits for it — the context is built with what is known by then — and the first lookup of a
+/// tool waits for its answer, bounded ([`app::Shell::tool_context`]).
 ///
 /// The log starts once the app is built, so a second launch, which exits while the plugins
 /// start, writes nothing to the running app's log. It is still up before the window: Tauri
@@ -141,12 +143,14 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     );
     #[cfg(target_os = "linux")]
     dmabuf_renderer.log();
+    // macOS: the login shell is asked for the tools' PATH from here, on a thread of its own.
+    let tools = env::tool_search_path(&env);
 
     let settings = SettingsStore::load(&app.path().app_config_dir()?, &SystemClock);
     if let Some(notice) = settings.notice() {
         tracing::warn!("{notice}");
     }
-    let host = env::desktop_host(&env, app.path().app_data_dir()?.join("run"));
+    let host = env::desktop_host(&tools, app.path().app_data_dir()?.join("run"));
     let context = env::desktop_context(&env, host)?;
     let handle = app.handle().clone();
     let shell = app::Shell::new(
@@ -154,6 +158,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         auth,
         clock,
         context,
+        tools,
         env.test_build(),
         move |state| app::emit_lock_changed(&handle, state),
     );
@@ -385,6 +390,51 @@ mod tests {
                 "the sweep's statement names {ident}"
             );
         }
+    }
+
+    /// WI-452: nothing on the way to the window waits for the macOS login shell. `run` starts
+    /// asking it once the log is up ([`crate::env::tool_search_path`]), builds the context from
+    /// what is known by then ([`crate::env::desktop_host`], which never waits), and never asks
+    /// for the answer itself: no `tools.get()`, no `tool_context()`.
+    #[test]
+    fn run_starts_the_tool_path_probe_and_never_waits_for_it() {
+        let run = run_fn();
+        let stmts = &run.block.stmts;
+        let first = |ident: &str| {
+            stmts
+                .iter()
+                .position(|stmt| mentions(stmt, ident))
+                .unwrap_or_else(|| panic!("run names {ident}"))
+        };
+        let (logging, probe, host) = (
+            first("init_logging"),
+            first("tool_search_path"),
+            first("desktop_host"),
+        );
+        assert!(
+            logging < probe && probe < host,
+            "init_logging at {logging}, tool_search_path at {probe}, desktop_host at {host}"
+        );
+
+        /// Finds a wait for the answer: `tools.get()`, or the shell's `tool_context`.
+        struct Waits(Vec<String>);
+        impl<'ast> syn::visit::Visit<'ast> for Waits {
+            fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+                let on_tools =
+                    matches!(&*call.receiver, syn::Expr::Path(p) if p.path.is_ident("tools"));
+                if call.method == "tool_context" || (on_tools && call.method == "get") {
+                    self.0.push(call.method.to_string());
+                }
+                syn::visit::visit_expr_method_call(self, call);
+            }
+        }
+        let mut waits = Waits(Vec::new());
+        syn::visit::visit_block(&mut waits, &run.block);
+        assert!(
+            waits.0.is_empty(),
+            "run waits for the tool search path: {:?}",
+            waits.0
+        );
     }
 
     #[test]
