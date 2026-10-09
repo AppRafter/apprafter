@@ -169,6 +169,11 @@ How to read it:
 - **The token line reports presence and length only.** The bytes are
   never printed, here or in `apprafter whoami`. Read
   `credentials.yaml` directly if a script needs the value.
+- **A `Server:` line appears once the target has a provisioned
+  server**, naming the server the target's local state records, for
+  example `Server:      prod-node (id 42, type cx22)`. A target with no
+  server has no such line; a state file that cannot be read shows
+  `Server:      unknown — the state file cannot be read: …`.
 - **The two paths at the foot** are the files every field above was
   read from — useful when you are not sure which store an
   `APPRAFTER_CONFIG_DIR` in your shell is pointing at.
@@ -238,7 +243,9 @@ Read this before you run it.
 > is where the CLI keeps the IDs of the server, network, firewall and
 > floating IPs it provisioned. Remove a target whose cluster is still
 > running and the machines keep running — and keep billing — with
-> nothing left on your machine pointing at them.
+> nothing left on your machine pointing at them. `target remove` warns
+> when the state it deletes records a server, naming it, before it asks
+> for confirmation.
 
 So the order is destroy, then remove:
 

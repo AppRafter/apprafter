@@ -1040,6 +1040,74 @@ mod tests {
         assert_eq!(lines[7], "  Hetzner token: not set");
     }
 
+    /// R6: `show` names the server the target's state records, and says when that state
+    /// cannot be read; nothing when there is none.
+    #[test]
+    fn show_names_a_recorded_server_and_an_unreadable_state() {
+        use apprafter_core::target::ProvisionedServer;
+        let mut r = report_with("prod", true);
+        r.provisioned = ProvisionedState::Provisioned {
+            server: ProvisionedServer {
+                server_id: 42,
+                server_name: "platform-1".into(),
+                server_type: Some("cx22".into()),
+            },
+        };
+        let lines = show_lines(&r);
+        assert_eq!(lines[8], "  Server:      platform-1 (id 42, type cx22)");
+        assert_eq!(lines.len(), 12);
+        r.provisioned = ProvisionedState::Provisioned {
+            server: ProvisionedServer {
+                server_id: 42,
+                server_name: "platform-1".into(),
+                server_type: None,
+            },
+        };
+        assert!(show_lines(&r).contains(&"  Server:      platform-1 (id 42)".to_string()));
+        r.provisioned = ProvisionedState::Unreadable {
+            error: apprafter_core::UiError::from(&CoreError::Cli(CliError::InvalidState {
+                path: "/s/state.json".into(),
+                message: "expected value".into(),
+            })),
+        };
+        assert!(show_lines(&r).contains(
+            &"  Server:      unknown — the state file cannot be read: state file at \
+              /s/state.json: expected value"
+                .to_string()
+        ));
+        r.provisioned = ProvisionedState::NotProvisioned;
+        assert!(!show_lines(&r).iter().any(|l| l.starts_with("  Server:")));
+    }
+
+    /// R6: `remove` of a target whose state records a server warns that the server keeps
+    /// running, and hands over the teardown with `destroy`'s real scope.
+    #[test]
+    fn the_remove_warning_names_the_server_and_the_destroy_scope() {
+        let w = orphaned_server_warning(
+            "prod",
+            &apprafter_core::target::ProvisionedServer {
+                server_id: 42,
+                server_name: "platform-1".into(),
+                server_type: None,
+            },
+        );
+        assert_eq!(
+            w,
+            "warning: target `prod` records server `platform-1` (id 42); removing the target \
+             does not delete it, and it keeps running (and billing) at the provider. To delete \
+             it first, run `apprafter destroy --target prod`, which deletes every \
+             `apprafter=true` resource in the token's Hetzner project, not only this cluster; \
+             or delete server 42 in the Hetzner Cloud Console."
+        );
+        assert_eq!(assert_commands_parse(&w), 1, "{w}");
+        let u = unreadable_state_warning("prod", "state file at /s: expected value");
+        assert!(u.starts_with("warning: "), "{u}");
+        assert!(
+            u.contains("cannot be read") && u.contains("expected value"),
+            "{u}"
+        );
+    }
+
     #[test]
     fn the_list_footer_uses_the_pointer_even_when_it_dangles() {
         assert_eq!(
@@ -1699,10 +1767,29 @@ pub(crate) fn show(name: Option<&str>) -> miette::Result<()> {
 }
 
 /// The lines `target show` prints. The token is summarised by its length — the report never
-/// carries its bytes; read `credentials.yaml` for the raw value.
+/// carries its bytes; read `credentials.yaml` for the raw value. A server the target's state
+/// records gets a `Server:` line after the token (R6), as does a state that cannot be read; no
+/// server, no line.
 pub(crate) fn show_lines(r: &TargetReport) -> Vec<String> {
     let or = |v: &Option<String>| v.clone().unwrap_or_else(|| "not set".into());
-    vec![
+    let server = match &r.provisioned {
+        core_target::ProvisionedState::NotProvisioned => None,
+        core_target::ProvisionedState::Provisioned { server } => Some(format!(
+            "  Server:      {} (id {}{})",
+            server.server_name,
+            server.server_id,
+            server
+                .server_type
+                .as_deref()
+                .map(|t| format!(", type {t}"))
+                .unwrap_or_default()
+        )),
+        core_target::ProvisionedState::Unreadable { error } => Some(format!(
+            "  Server:      unknown — the state file cannot be read: {}",
+            error.message
+        )),
+    };
+    let mut lines = vec![
         format!(
             "Target: {}{}",
             r.name,
@@ -1728,10 +1815,14 @@ pub(crate) fn show_lines(r: &TargetReport) -> Vec<String> {
                 _ => "not set".into(),
             }
         ),
+    ];
+    lines.extend(server);
+    lines.extend([
         String::new(),
         format!("Config:      {}", r.config_file),
         format!("Credentials: {} (mode 0600)", r.credentials_file),
-    ]
+    ]);
+    lines
 }
 
 /// Which target `target show` displays: the explicit name, else the active
@@ -1774,6 +1865,12 @@ pub(crate) fn remove(name: &str, yes: bool) -> miette::Result<()> {
     let tref = TargetRef::named(&ctx, name).map_err(report)?;
     require_loadable(&ctx, name)?;
     let plan = core_target::plan_remove(&ctx, &tref).map_err(report)?;
+    // R6: before any confirmation, so a terminal user reads it before answering.
+    match core_target::provisioned(&ctx, &tref) {
+        Ok(Some(server)) => eprintln!("{}", orphaned_server_warning(name, &server)),
+        Ok(None) => {}
+        Err(e) => eprintln!("{}", unreadable_state_warning(name, &e.to_string())),
+    }
     if !yes {
         let stdin_tty = std::io::stdin().is_terminal();
         let stdout_tty = std::io::stdout().is_terminal();
@@ -1795,6 +1892,32 @@ pub(crate) fn remove(name: &str, yes: bool) -> miette::Result<()> {
     )?;
     println!("{}", remove_done_line(&done));
     Ok(())
+}
+
+/// `target remove` of a target whose state records a server (R6): the server is not deleted
+/// and keeps running. `destroy` is the teardown, with its real scope — the token's whole Hetzner
+/// project, not only this cluster (operator guide, target store: the destroy scope).
+pub(crate) fn orphaned_server_warning(
+    name: &str,
+    server: &apprafter_core::target::ProvisionedServer,
+) -> String {
+    format!(
+        "warning: target `{name}` records server `{}` (id {}); removing the target does not \
+         delete it, and it keeps running (and billing) at the provider. To delete it first, run \
+         `apprafter destroy --target {name}`, which deletes every `apprafter=true` resource in \
+         the token's Hetzner project, not only this cluster; or delete server {} in the Hetzner \
+         Cloud Console.",
+        server.server_name, server.server_id, server.server_id
+    )
+}
+
+/// `target remove` of a target whose state cannot be read: whether it records a server is
+/// unknown, so the reader is told rather than left to assume there is none.
+pub(crate) fn unreadable_state_warning(name: &str, error: &str) -> String {
+    format!(
+        "warning: the state of target `{name}` cannot be read ({error}); if it records a \
+         server, removing the target does not delete it, and it keeps running at the provider."
+    )
 }
 
 /// The line `target remove` ends with: where the CLI default went, when it named the target.
