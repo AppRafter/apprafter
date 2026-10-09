@@ -26,8 +26,9 @@
   --log-debug: #64748b;
   --log-msg: var(--code-fg);
   --log-msg-error: #fca5a5;
-  /* The design removes every outline; keyboard focus gets this ring instead. */
-  --focus-ring: 0 0 0 2px var(--accent);
+  /* The design removes every outline; keyboard focus gets this ring instead. An outline value
+     (base.css), so it never replaces an element's own box-shadow. */
+  --focus-ring: 2px solid var(--accent);
 
   /* Type scale. */
   --fs-10: 10px;

@@ -76,12 +76,10 @@ describe('resolveTheme', () => {
 });
 
 describe('applyTheme', () => {
-  test('sets data-theme on <html> and the native window theme to the same value', async () => {
-    await applyTheme('light');
+  test('an explicit theme goes to the page and to the native window alike', async () => {
+    await applyTheme('light', true);
     expect(document.documentElement.dataset.theme).toBe('light');
-    expect(setThemeCalls()).toEqual([{ label: 'main', value: 'light' }]);
-
-    await applyTheme('dark');
+    await applyTheme('dark', false);
     expect(document.documentElement.dataset.theme).toBe('dark');
     expect(setThemeCalls()).toEqual([
       { label: 'main', value: 'light' },
@@ -89,11 +87,26 @@ describe('applyTheme', () => {
     ]);
   });
 
+  test('under system the page follows the OS, and the native window is left to the OS', async () => {
+    // A forced window theme would force the webview's prefers-color-scheme too (macOS sets
+    // NSApp.appearance app-wide), and the OS change would never reach the page again.
+    await applyTheme('system', true);
+    expect(document.documentElement.dataset.theme).toBe('dark');
+    await applyTheme('system', false);
+    expect(document.documentElement.dataset.theme).toBe('light');
+    expect(setThemeCalls()).toEqual([
+      { label: 'main', value: null },
+      { label: 'main', value: null },
+    ]);
+  });
+
   test('the page theme is set even when the native call is refused', async () => {
     clearMocks();
     mockWindows('main');
     mockIPC(() => Promise.reject('core:window:allow-set-theme not allowed'));
-    await expect(applyTheme('light')).rejects.toBe('core:window:allow-set-theme not allowed');
+    await expect(applyTheme('light', false)).rejects.toBe(
+      'core:window:allow-set-theme not allowed',
+    );
     expect(document.documentElement.dataset.theme).toBe('light');
   });
 });
@@ -113,7 +126,7 @@ describe('watchSystemTheme', () => {
 });
 
 describe('followTheme', () => {
-  test('under system it applies the OS appearance now and again on each change', async () => {
+  test('under system the page follows each OS change; the window is left to the OS once', async () => {
     const system = stubSystem(true);
     const stop = followTheme('system');
     await settle();
@@ -122,10 +135,10 @@ describe('followTheme', () => {
     system.flip(false);
     await settle();
     expect(document.documentElement.dataset.theme).toBe('light');
-    expect(setThemeCalls()).toEqual([
-      { label: 'main', value: 'dark' },
-      { label: 'main', value: 'light' },
-    ]);
+    system.flip(true);
+    await settle();
+    expect(document.documentElement.dataset.theme).toBe('dark');
+    expect(setThemeCalls()).toEqual([{ label: 'main', value: null }]);
 
     stop();
     expect(system.listeners.size).toBe(0);

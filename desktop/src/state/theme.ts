@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
-// The colour scheme. The setting (Rust's `Theme`) resolves against the OS appearance here, not
-// in CSS, so one answer drives both the page (`data-theme` on <html>, which tokens.css keys on)
-// and the native window (the macOS traffic lights, the Linux header bar).
+// The colour scheme. The page resolves the setting (Rust's `Theme`) against the OS appearance
+// and sets `data-theme` on <html>, which tokens.css keys on. The native window (the macOS
+// traffic lights, the Linux header bar) gets the explicit theme, or under `system` is left to
+// the OS: forcing it would force the webview's prefers-color-scheme as well (tao sets
+// NSApp.appearance app-wide on macOS, gtk-application-prefer-dark-theme on Linux), and the page
+// would never hear the OS change again.
+// Whether WebKitGTK follows the GNOME colour scheme with the theme left to the OS needs a real
+// Linux desktop to tell (D.2f manual list).
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import type { Theme } from '../ipc/generated/Theme';
 
@@ -14,13 +19,18 @@ export function resolveTheme(setting: Theme, prefersDark: boolean): ResolvedThem
   return setting;
 }
 
-/**
- * Sets the page theme, then the native window's. The page goes first, so a refused native call
- * still leaves the page right; the returned promise rejects with that refusal.
- */
-export async function applyTheme(resolved: ResolvedTheme): Promise<void> {
+function setPageTheme(resolved: ResolvedTheme) {
   document.documentElement.dataset.theme = resolved;
-  await getCurrentWindow().setTheme(resolved);
+}
+
+/**
+ * Sets the page theme, then the native window's: the explicit theme, or null under `system`.
+ * The page goes first, so a refused native call still leaves it right; the returned promise
+ * rejects with that refusal.
+ */
+export async function applyTheme(setting: Theme, prefersDark: boolean): Promise<void> {
+  setPageTheme(resolveTheme(setting, prefersDark));
+  await getCurrentWindow().setTheme(setting === 'system' ? null : setting);
 }
 
 /** Calls `onChange` with the OS's dark preference each time it changes; returns the unsubscribe. */
@@ -32,15 +42,14 @@ export function watchSystemTheme(onChange: (prefersDark: boolean) => void): () =
 }
 
 /**
- * Applies `setting` now and, under `system` only, again on each OS appearance change. Returns
- * the stop. A refused native call is reported to the console: the page theme is already right.
+ * Applies `setting` now and, under `system` only, follows each OS appearance change on the page
+ * (the window follows the OS by itself). Returns the stop. A refused native call is reported to
+ * the console: the page theme is already right.
  */
 export function followTheme(setting: Theme): () => void {
-  const apply = (prefersDark: boolean) => {
-    applyTheme(resolveTheme(setting, prefersDark)).catch((error: unknown) => {
-      console.error('the window theme was not applied:', error);
-    });
-  };
-  apply(window.matchMedia(DARK_QUERY).matches);
-  return setting === 'system' ? watchSystemTheme(apply) : () => {};
+  applyTheme(setting, window.matchMedia(DARK_QUERY).matches).catch((error: unknown) => {
+    console.error('the window theme was not applied:', error);
+  });
+  if (setting !== 'system') return () => {};
+  return watchSystemTheme((prefersDark) => setPageTheme(resolveTheme(setting, prefersDark)));
 }

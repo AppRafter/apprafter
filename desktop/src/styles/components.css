@@ -390,9 +390,9 @@
   color: var(--fg);
 }
 
-/* The box clips an outer ring. */
+/* The box clips an outer ring: draw it inside. */
 .seg > button:focus-visible {
-  box-shadow: inset 0 0 0 2px var(--accent);
+  outline-offset: -2px;
 }
 
 .seg > button:disabled {
