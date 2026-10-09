@@ -22,9 +22,10 @@
 //! ever send: on sway, i3 or Hyprland no screen saver runs, and on a system without logind
 //! (Devuan, OpenRC without elogind) nothing sends `PrepareForSleep`. What the watch says it
 //! hears ([`Listening`]) therefore counts a source only when its sender runs as it is set up: a
-//! screen saver that owns its name, logind owning its name for sleeps — except under WSL,
-//! whose logind never sends one ([`sleeps_expected`]) — and logind having answered for the
-//! app's session for its `Lock`. A name the bus can start proves nothing (its service file may
+//! screen saver that owns its name, logind owning its name for sleeps, and logind having
+//! answered for the app's session for its `Lock` — neither of logind's under WSL, whose logind
+//! never sends a sleep ([`sleeps_expected`]) and never hears the Windows screen lock
+//! ([`session_locks_expected`]). A name the bus can start proves nothing (its service file may
 //! hand the start to a systemd that is not PID 1, as in a container), and on a desktop the
 //! owner's session was made by a logind that runs. It listens to every source all the same, so
 //! a sender that starts later is heard without being promised.
@@ -257,8 +258,12 @@ async fn logind(setup: &mut Setup, system: &Connection) {
             let lock = rule(LOGIN1, Some(path.as_str()), LOGIN1_SESSION, "Lock");
             if let Some(stream) = subscribe(system, Kind::SessionLock, LOGIN1, lock).await {
                 setup.streams.push(stream);
-                // logind answered for the app's session, so it runs.
-                setup.heard.push(Kind::SessionLock);
+                match session_locks_expected(kernel_release) {
+                    Ok(()) => setup.heard.push(Kind::SessionLock),
+                    Err(why) => {
+                        tracing::info!("{why}: session locks are listened for, not expected")
+                    }
+                }
             }
         }
         Err(why) => tracing::info!("{why}: logind's session locks are not watched"),
@@ -297,14 +302,36 @@ fn sleeps_expected(
     if !logind_runs {
         return Err("no logind runs on the system bus");
     }
-    let wsl = osrelease().is_some_and(|release| {
-        let release = release.to_ascii_lowercase();
-        release.contains("microsoft") || release.contains("wsl")
-    });
-    if wsl {
+    if wsl(osrelease()) {
         return Err("under WSL logind never sends sleeps (the WSL VM does not suspend through it)");
     }
     Ok(())
+}
+
+/// Whether logind's `Lock` on the app's session can be expected here, given the kernel's
+/// release; `Err` says why not. logind answered for the session, so it runs. Under WSL it may
+/// run with systemd, but the screen lock is Windows': Win+L locks the Windows session, and
+/// nothing tells WSL's logind, so only a `loginctl lock-session` typed inside WSL would send
+/// `Lock`. Counting it would have the page say the app hears screen locks it never hears, so the
+/// watch reports none there. A screen saver on a WSLg session bus is not this rule's: it counts
+/// as anywhere else, when it owns its name.
+fn session_locks_expected(osrelease: impl FnOnce() -> Option<String>) -> Result<(), &'static str> {
+    if wsl(osrelease()) {
+        return Err(
+            "under WSL the Windows screen lock never reaches logind (only `loginctl lock-session` \
+             sends its Lock)",
+        );
+    }
+    Ok(())
+}
+
+/// Whether a kernel release is WSL's: `microsoft` in WSL1's and WSL2's releases, `WSL` in
+/// WSL2's. A release that could not be read is not.
+fn wsl(osrelease: Option<String>) -> bool {
+    osrelease.is_some_and(|release| {
+        let release = release.to_ascii_lowercase();
+        release.contains("microsoft") || release.contains("wsl")
+    })
 }
 
 /// The running kernel's release, as `uname -r` prints it.
@@ -558,6 +585,31 @@ mod tests {
         // Read only when logind runs.
         assert!(sleeps_expected(false, || panic!("read")).is_err());
         assert!(kernel_release().is_some_and(|release| !release.trim().is_empty()));
+    }
+
+    /// Under WSL logind promises neither half: no sleep, and no lock of the app's session
+    /// either, though logind answered for it — Win+L locks Windows, never WSL's logind.
+    #[test]
+    fn under_wsl_logind_promises_neither_sleeps_nor_session_locks() {
+        let kernel = |release: &'static str| move || Some(release.to_owned());
+        for release in [
+            "5.15.167.4-microsoft-standard-WSL2",
+            "6.6.87.2-microsoft-standard-WSL2+",
+            "4.4.0-19041-Microsoft",
+            "6.1.21-custom-wsl",
+        ] {
+            assert!(sleeps_expected(true, kernel(release)).is_err(), "{release}");
+            assert!(
+                session_locks_expected(kernel(release)).is_err(),
+                "{release}"
+            );
+        }
+        for release in ["6.10.3-arch1-1", "6.1.0-26-amd64"] {
+            assert_eq!(sleeps_expected(true, kernel(release)), Ok(()), "{release}");
+            assert_eq!(session_locks_expected(kernel(release)), Ok(()), "{release}");
+        }
+        // A release that cannot be read is no WSL's.
+        assert_eq!(session_locks_expected(|| None), Ok(()));
     }
 
     #[test]
