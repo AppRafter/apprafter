@@ -341,3 +341,28 @@
   font: 400 var(--fs-11-5) var(--font-mono);
   color: var(--fg-faint);
 }
+
+/* Settings › About › This computer -------------------------------------------------------- */
+
+.this-computer {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+/* The default target's machine and key, as the CLI prints them. */
+.this-computer-machine {
+  font: 400 var(--fs-11-5) var(--font-mono);
+}
+
+.this-computer [data-tone="ok"] {
+  color: var(--ok);
+}
+
+.this-computer [data-tone="warn"] {
+  color: var(--warn);
+}
+
+.this-computer [data-tone="err"] {
+  color: var(--err);
+}

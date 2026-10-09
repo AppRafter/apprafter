@@ -9,6 +9,8 @@ import type { MachineSet } from '../ipc/generated/MachineSet';
 import type { PlanView } from '../ipc/generated/PlanView';
 import type { TargetAdded } from '../ipc/generated/TargetAdded';
 import type { ToolchainReport } from '../ipc/generated/ToolchainReport';
+import type { Verification } from '../ipc/generated/Verification';
+import type { WhoamiReport } from '../ipc/generated/WhoamiReport';
 
 export function offer(more: Partial<MachineOfferView> = {}): MachineOfferView {
   return {
@@ -291,5 +293,30 @@ export function machineSet(more: Partial<MachineSet> = {}): MachineSet {
     region: 'nbg1',
     skuCheck: { status: 'validated', sku: 'cpx22', region: 'nbg1', regionWasDefault: false },
     ...more,
+  };
+}
+
+/** whoami with prod-eu as the CLI default (Hetzner Cloud, nbg1, cx22, a key that exists). */
+export function whoamiReport(verification: Verification): WhoamiReport {
+  return {
+    identity: 'anonymous_self_hosted',
+    cliDefault: {
+      status: 'found',
+      target: {
+        name: 'prod-eu',
+        provider: 'hetzner-cloud',
+        verification,
+        region: 'nbg1',
+        serverType: 'cx22',
+        defaultTier: 'team',
+        clusterName: null,
+        sshKey: {
+          path: '/home/alex/.ssh/id_ed25519.pub',
+          display: '~/.ssh/id_ed25519.pub',
+          exists: true,
+          algo: 'ssh-ed25519',
+        },
+      },
+    },
   };
 }
