@@ -196,6 +196,7 @@ version = "0.1.0"
 dependencies = [
  "apprafter-core",
  "apprafter-desktop-ipc",
+ "apprafter-os-auth",
  "cli-core",
  "dunce",
  "json5",
@@ -218,6 +219,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "whoami",
+ "zeroize",
 ]
 
 [[package]]

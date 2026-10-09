@@ -26,6 +26,13 @@ name    = "app_menu"
 path    = "tests/app_menu.rs"
 harness = false
 
+# The spike's instrument for the owner's real-hardware matrix (D.2d): one window that asks the
+# OS to authenticate and logs what it answers. `test`: CI runs its unit tests, pure functions
+# that open no window and ask the OS nothing.
+[[example]]
+name = "os_auth_probe"
+test = true
+
 [features]
 # Walks and CI only: the scripted FakeAuthenticator in place of the OS (and, from later tasks,
 # the loopback provider override and a TEST BUILD banner). Never in a release; D.13 asserts it.
@@ -37,6 +44,8 @@ tauri-build = { workspace = true }
 [dependencies]
 apprafter-core        = { workspace = true }
 apprafter-desktop-ipc = { path = "../ipc" }
+# Device-owner authentication through the OS, and its lock and sleep signals.
+apprafter-os-auth     = { path = "../os-auth" }
 # `atomic_replace` for settings.json, the helper the CLI writes its own files with.
 cli-core              = { workspace = true }
 # The data-dir override, canonical without Windows' `\\?\` prefix (env::prepare_data_dir):
@@ -84,3 +93,6 @@ json5       = "0.4"
 proc-macro2 = { version = "1", features = ["span-locations"] }
 syn         = { version = "2", features = ["full", "visit"] }
 tempfile    = "3"
+# examples/os_auth_probe.rs: the password it hands PAM, wiped when dropped. The version
+# apprafter-os-auth takes it in, already in the lock.
+zeroize     = "~1.9"
