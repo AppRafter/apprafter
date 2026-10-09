@@ -15,6 +15,11 @@ pub mod settings;
 pub mod signals;
 pub mod window;
 
+/// The product's name as people see it: the window title and the macOS app menu. Not Tauri's
+/// `productName`, which tauri.linux.conf.json5 sets to the binary's name so the Linux packages
+/// are called `apprafter-desktop`; tauri.conf.json5 keeps it equal to this everywhere else.
+pub const PRODUCT_NAME: &str = "AppRafter";
+
 use std::error::Error;
 use std::sync::Arc;
 
@@ -166,6 +171,24 @@ mod tests {
     use std::error::Error;
 
     use crate::env::DataDirError;
+
+    /// The name people see is the configured product name everywhere but Linux, where the
+    /// packaging names the product after the binary: the menu and the window title must not
+    /// follow tauri.linux.conf.json5 there (they once did, and the menu said "Quit apprafter-desktop").
+    #[test]
+    fn the_product_name_is_the_config_s_except_in_linux_packaging() {
+        let base = include_str!("../tauri.conf.json5");
+        let linux = include_str!("../tauri.linux.conf.json5");
+        assert!(
+            base.contains(&format!("productName: \"{}\",", super::PRODUCT_NAME)),
+            "tauri.conf.json5's productName is PRODUCT_NAME"
+        );
+        assert!(base.contains("mainBinaryName: \"apprafter-desktop\","));
+        assert!(
+            linux.contains("productName: \"apprafter-desktop\","),
+            "on Linux the package is named after the binary"
+        );
+    }
 
     #[test]
     fn a_refused_data_dir_exits_2_and_anything_else_1() {

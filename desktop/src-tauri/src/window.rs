@@ -138,7 +138,7 @@ pub fn show_and_focus(app: &tauri::AppHandle) {
 pub fn build_main(app: &tauri::AppHandle, data_dir: Option<&Path>) -> tauri::Result<WebviewWindow> {
     let debug = cfg!(debug_assertions);
     let window = WebviewWindowBuilder::new(app, MAIN, WebviewUrl::App("index.html".into()))
-        .title("AppRafter")
+        .title(crate::PRODUCT_NAME)
         .inner_size(1280.0, 800.0)
         .min_inner_size(1024.0, 640.0)
         .background_color(tauri::window::Color(0x0a, 0x0e, 0x1a, 0xff))

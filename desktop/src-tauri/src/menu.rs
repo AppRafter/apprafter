@@ -27,7 +27,7 @@ pub const QUIT_ITEM: &str = "quit";
 /// The macOS app menu (see the module docs): the app's own submenu (About, Services, Hide,
 /// Hide Others, Quit), File, Edit, View, Window and Help, as Tauri builds them by default.
 pub fn app_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
-    let name = app.package_info().name.clone();
+    let name = crate::PRODUCT_NAME.to_owned();
     let about = AboutMetadata {
         name: Some(name.clone()),
         version: Some(app.package_info().version.to_string()),
