@@ -689,7 +689,13 @@ mod tests {
         // the lock had ended every other: the unlock ends it, as the page subscribes afresh.
         let r = rig(unlocked_at_start(), Arc::new(FakeAuthenticator::new()));
         let (id, next) = two_stages(&r.shell);
-        r.shell.execute(id, Arc::new(Sink::default())).unwrap();
+        let first = Arc::new(Sink::default());
+        r.shell.execute(id, first.clone()).unwrap();
+        // Step 1 is reported on the operation's own thread: wait for it, or it could land
+        // between the raced subscription and the unlock and reach that sink legitimately.
+        wait_until("step 1 was reported", || {
+            !first.0.lock().unwrap().is_empty()
+        });
         assert!(r.shell.lock_now().locked);
         let raced = Arc::new(Sink::default());
         r.shell.ops.subscribe(id, raced.clone()).unwrap();
