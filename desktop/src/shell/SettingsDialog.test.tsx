@@ -2,7 +2,7 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
 import { QueryClientProvider } from '@tanstack/react-query';
 import { clearMocks, mockIPC } from '@tauri-apps/api/mocks';
-import { act, cleanup, render, screen, within } from '@testing-library/react';
+import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { ToastProvider, ToastViewport } from '../components/Toast';
 import type { AppInfo } from '../ipc/generated/AppInfo';
@@ -13,17 +13,69 @@ import { createQueryClient } from '../state/queryClient';
 import { appInfo, authInfo, settings } from '../test/fixtures';
 import { SettingsDialog } from './SettingsDialog';
 
+interface HeldSave {
+  readonly request: Settings;
+  readonly resolve: (inUse: Settings) => void;
+  readonly reject: (error: unknown) => void;
+}
+
 let calls: { cmd: string; args: Record<string, unknown> }[];
 let stored: Settings;
 let refuse: string | null;
+/** Saves wait in `held` until answerHeld(); off, each is answered at once. */
+let holding: boolean;
+let held: HeldSave[];
+
+const refusal = (message: string) => ({
+  code: DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE,
+  message,
+  help: null,
+  causes: [],
+  fields: {},
+});
+
+/** Rust's settings_set, as far as these tests need it: the lock cannot be switched on. */
+function answer(save: HeldSave) {
+  if (save.request.lockEnabled && !stored.lockEnabled) {
+    save.reject(refusal('No system authentication.'));
+    return;
+  }
+  stored = save.request;
+  save.resolve(stored);
+}
+
+/**
+ * Answers the held saves, the newest first, until none is left: what two saves in flight at
+ * once would meet if the second reached Rust first.
+ */
+async function answerHeld() {
+  for (let quiet = 0; quiet < 3; ) {
+    await act(() => new Promise((resolve) => setTimeout(resolve, 10)));
+    const batch = held.splice(0).reverse();
+    if (batch.length === 0) {
+      quiet += 1;
+      continue;
+    }
+    quiet = 0;
+    await act(async () => {
+      for (const save of batch) answer(save);
+    });
+  }
+}
 
 beforeEach(() => {
   calls = [];
   stored = settings();
   refuse = null;
+  holding = false;
+  held = [];
   mockIPC((cmd, args) => {
     calls.push({ cmd, args: args as Record<string, unknown> });
     if (cmd === 'settings_get') return stored;
+    if (cmd === 'settings_set' && holding) {
+      const request = (args as { settings: Settings }).settings;
+      return new Promise((resolve, reject) => held.push({ request, resolve, reject }));
+    }
     if (cmd === 'settings_set') {
       if (refuse !== null) {
         return Promise.reject({
@@ -135,9 +187,57 @@ describe('SettingsDialog', () => {
     const { user } = await open();
     const master = screen.getByRole('switch', { name: 'Require unlock' });
     await user.click(master);
-    await act(() => new Promise((resolve) => setTimeout(resolve, 0)));
-    expect(master.getAttribute('aria-checked')).toBe('false');
+    await waitFor(() => expect(master.getAttribute('aria-checked')).toBe('false'));
     expect(screen.getByRole('status').textContent).toContain('No system authentication.');
+  });
+
+  test('a refused save, then another change: both end on what Rust holds, plus the change', async () => {
+    stored = settings({ lockEnabled: false, theme: 'dark' });
+    holding = true;
+    const { user } = await open();
+    await user.click(screen.getByRole('switch', { name: 'Require unlock' }));
+    await user.click(screen.getByRole('radio', { name: 'Light' }));
+    await answerHeld();
+    expect(stored).toEqual(settings({ lockEnabled: false, theme: 'light' }));
+    expect(
+      screen.getByRole('switch', { name: 'Require unlock' }).getAttribute('aria-checked'),
+    ).toBe('false');
+    expect(screen.getByRole('radio', { name: 'Light' }).getAttribute('aria-checked')).toBe('true');
+    expect(screen.getByRole('status').textContent).toContain('No system authentication.');
+    // The refusal is not undone from a snapshot: the settings are read again.
+    expect(calls.filter((c) => c.cmd === 'settings_get').length).toBe(2);
+  });
+
+  test('a save waiting behind another never carries a later save’s change', async () => {
+    stored = settings({ lockEnabled: false, theme: 'dark' });
+    holding = true;
+    const { user } = await open();
+    await user.click(screen.getByRole('radio', { name: 'Light' }));
+    await user.click(screen.getByRole('radio', { name: 'System' }));
+    await user.click(screen.getByRole('switch', { name: 'Require unlock' }));
+    await answerHeld();
+    // The lock was refused; the theme the owner picked before it was not dragged down with it.
+    expect(stored).toEqual(settings({ lockEnabled: false, theme: 'system' }));
+    expect(saved().map((s) => [s.theme, s.lockEnabled])).toEqual([
+      ['light', false],
+      ['system', false],
+      ['system', true],
+    ]);
+  });
+
+  test('two quick choices, whatever order Rust would answer them in: the last one wins', async () => {
+    stored = settings({ autoLock: '10' });
+    holding = true;
+    const { user } = await open();
+    await user.click(screen.getByRole('radio', { name: '5 min' }));
+    await user.click(screen.getByRole('radio', { name: '30 min' }));
+    // Optimistic meanwhile: the dialog shows the last choice at once.
+    expect(screen.getByRole('radio', { name: '30 min' }).getAttribute('aria-checked')).toBe('true');
+    await answerHeld();
+    expect(stored.autoLock).toBe('30');
+    expect(screen.getByRole('radio', { name: '30 min' }).getAttribute('aria-checked')).toBe('true');
+    // One at a time, each from the settings Rust confirmed plus its own change.
+    expect(saved().map((s) => s.autoLock)).toEqual(['5', '30']);
   });
 
   test('copy follows the OS and its authentication', async () => {
