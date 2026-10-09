@@ -3,7 +3,9 @@
 // and what depends on it; the versions and links. Live data, notifications and the tray come
 // with D.5, and "lock when the computer sleeps" with D.2d's session sources (AppInfo does not
 // say yet whether they exist), so those rows are not shown. With the lock off, the rows below
-// it are disabled, not only dimmed.
+// it are disabled, not only dimmed. With no system authentication the lock shows as it is in
+// effect, off with its switch disabled whatever settings.json says: Rust locks only with both,
+// and refuses switching it on.
 import { Button } from '../components/Button';
 import { ErrorPanel } from '../components/ErrorPanel';
 import { Eyebrow } from '../components/Eyebrow';
@@ -25,7 +27,7 @@ import type { AutoLock } from '../ipc/generated/AutoLock';
 import type { Settings } from '../ipc/generated/Settings';
 import type { Theme } from '../ipc/generated/Theme';
 import { authPrompt } from '../state/auth';
-import { useLockActions } from '../state/lock';
+import { lockOff, NO_AUTH_NOTICE, useLockActions } from '../state/lock';
 import { osName, usePlatform } from '../state/platform';
 import { useSaveSettings, useSettings } from '../state/settings';
 import { shortcutHint } from '../state/shortcuts';
@@ -61,7 +63,8 @@ function SettingsBody({ settings }: { settings: Settings }) {
   const info = usePlatform();
   const save = useSaveSettings();
   const { lock } = useLockActions();
-  const off = !settings.lockEnabled;
+  const noAuth = !info.auth.available;
+  const off = lockOff(info.auth.available, settings.lockEnabled) !== null;
   const method = info.auth.method;
 
   return (
@@ -87,13 +90,14 @@ function SettingsBody({ settings }: { settings: Settings }) {
       />
 
       <Eyebrow>Security</Eyebrow>
-      {!info.auth.available && (
+      {noAuth && (
         <p className="settings-banner" role="note">
-          This computer offers no system authentication AppRafter can use, so the app lock is off.
+          {NO_AUTH_NOTICE}
         </p>
       )}
       <SettingRow
         label="Require unlock"
+        disabled={noAuth}
         sub={
           method === null
             ? 'Ask for the computer’s owner before showing any cluster.'
@@ -102,7 +106,8 @@ function SettingsBody({ settings }: { settings: Settings }) {
         control={
           <Switch
             label="Require unlock"
-            checked={settings.lockEnabled}
+            checked={settings.lockEnabled && !noAuth}
+            disabled={noAuth}
             onChange={(lockEnabled) => save({ lockEnabled })}
           />
         }

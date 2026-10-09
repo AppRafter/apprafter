@@ -181,6 +181,17 @@
   color: var(--fg);
 }
 
+/* The notice under the title bar while the app lock cannot be in effect (no system auth). */
+.shell-notice {
+  flex: none;
+  margin: 0;
+  padding: 6px 16px;
+  border-bottom: 1px solid var(--warn);
+  background: var(--warn-tint);
+  color: var(--fg);
+  font-size: var(--fs-12-5);
+}
+
 /* Views ----------------------------------------------------------------------------------------- */
 
 /* The tab views and the Targets view stack here; <Activity> hides all but the one shown. */

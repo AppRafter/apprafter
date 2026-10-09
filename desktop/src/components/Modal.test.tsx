@@ -14,6 +14,7 @@ function Harness({ dismissOnBackdrop = false }: { dismissOnBackdrop?: boolean })
           Open settings
         </button>
       </main>
+      <div className="toast-viewport" role="status" aria-live="polite" />
       {open && (
         <Modal
           title="Settings"
@@ -62,6 +63,12 @@ describe('Modal', () => {
     expect(main.hasAttribute('inert')).toBe(true);
     await user.click(button('Close'));
     expect(main.hasAttribute('inert')).toBe(false);
+  });
+
+  test('a live region beside it stays live: a message is still heard over the dialog', async () => {
+    await openIt();
+    expect(document.querySelector('main')?.hasAttribute('inert')).toBe(true);
+    expect(screen.getByRole('status').hasAttribute('inert')).toBe(false);
   });
 
   test('Esc closes it and the focus goes back where it was', async () => {

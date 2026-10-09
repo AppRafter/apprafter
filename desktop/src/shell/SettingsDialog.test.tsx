@@ -188,7 +188,30 @@ describe('SettingsDialog', () => {
     const master = screen.getByRole('switch', { name: 'Require unlock' });
     await user.click(master);
     await waitFor(() => expect(master.getAttribute('aria-checked')).toBe('false'));
-    expect(screen.getByRole('status').textContent).toContain('No system authentication.');
+    const status = screen.getByRole('status');
+    expect(status.textContent).toContain('No system authentication.');
+    // Announced: the modal leaves the live region out of what it makes inert.
+    expect(status.closest('[inert]')).toBeNull();
+  });
+
+  test('with no system authentication the lock shows as it is: off, and nothing to switch', async () => {
+    stored = settings({ lockEnabled: true });
+    await open(
+      appInfo({ auth: authInfo({ available: false, method: null, unavailable: 'no_backend' }) }),
+    );
+    const master = screen.getByRole('switch', { name: 'Require unlock' }) as HTMLButtonElement;
+    expect(master.getAttribute('aria-checked')).toBe('false');
+    expect(master.disabled).toBe(true);
+    expect(
+      (screen.getByRole('switch', { name: 'Lock when the app starts' }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
+    for (const radio of within(
+      screen.getByRole('radiogroup', { name: 'Auto-lock after inactivity' }),
+    ).getAllByRole('radio')) {
+      expect((radio as HTMLButtonElement).disabled).toBe(true);
+    }
+    expect((screen.getByRole('button', { name: 'Lock' }) as HTMLButtonElement).disabled).toBe(true);
   });
 
   test('a refused save, then another change: both end on what Rust holds, plus the change', async () => {

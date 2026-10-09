@@ -79,6 +79,33 @@ export function useLockActions(): { lock: () => Promise<void>; unlock: () => Pro
   );
 }
 
+/** Why the app lock is not in effect: nothing to verify the owner with, or the owner's choice. */
+export type LockOff = 'no_auth' | 'turned_off';
+
+/** What the shell says, under its title bar, while the OS offers no way to verify the owner. */
+export const NO_AUTH_NOTICE =
+  'This computer offers no system authentication AppRafter can use, so the app lock is off.';
+
+const LOCK_OFF_MESSAGES: Record<LockOff, string> = {
+  no_auth: NO_AUTH_NOTICE,
+  turned_off: 'The app lock is off: turn on Require unlock in Settings to use it.',
+};
+
+/**
+ * Why the lock is not in effect — Rust locks only with both the setting on and a way to verify
+ * the owner — or null when it is, or the settings are not read yet (Rust decides then).
+ */
+export function lockOff(authAvailable: boolean, lockEnabled: boolean | undefined): LockOff | null {
+  if (!authAvailable) return 'no_auth';
+  if (lockEnabled === false) return 'turned_off';
+  return null;
+}
+
+/** What Mod+L says instead of locking. */
+export function lockOffMessage(off: LockOff): string {
+  return LOCK_OFF_MESSAGES[off];
+}
+
 /** A lock leaves no cluster data in the page: every query but the lock screen's own goes. */
 export function dropUnlockedData(client: QueryClient): void {
   client.removeQueries({ predicate: (query) => !KEPT_WHILE_LOCKED.has(query.queryKey[0]) });

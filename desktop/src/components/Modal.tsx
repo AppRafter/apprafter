@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 // Overlays are positioned divs, not <dialog>.showModal(): its top layer would cover the Windows
 // caption buttons, and an overlay belongs to its tab (it hides with the tab). The layer fills
-// its positioned parent; while it is open its siblings there are `inert`.
+// its positioned parent; while it is open its siblings there are `inert`, a live region apart.
 import {
   type KeyboardEvent,
   type MouseEvent,
@@ -70,7 +70,9 @@ export function ModalFrame({
     const own = layerRef.current;
     const madeInert: Element[] = [];
     for (const sibling of own?.parentElement?.children ?? []) {
-      if (sibling !== own && !sibling.hasAttribute('inert')) {
+      // A live region (the toasts) stays live: what it announces must be heard over the dialog
+      // — a refused save in Settings among it. It holds no controls to reach past the modal.
+      if (sibling !== own && !sibling.hasAttribute('inert') && !sibling.hasAttribute('aria-live')) {
         sibling.setAttribute('inert', '');
         madeInert.push(sibling);
       }

@@ -31,6 +31,8 @@ export interface SidebarProps {
   onNavigate: (section: Section) => void;
   onShowTargets: () => void;
   onLock: () => void;
+  /** The lock is not in effect (no system authentication, or Require unlock off). */
+  lockDisabled?: boolean;
   /** Opens Settings; without it there is no Settings entry. */
   onSettings?: () => void;
 }
@@ -42,6 +44,7 @@ export function Sidebar({
   onNavigate,
   onShowTargets,
   onLock,
+  lockDisabled = false,
   onSettings,
 }: SidebarProps) {
   const nav = (group: SectionInfo['group']) =>
@@ -88,7 +91,14 @@ export function Sidebar({
             onClick={onSettings}
           />
         )}
-        <FooterItem icon={LockSimpleIcon} label="Lock" os={os} shortcut="lock" onClick={onLock} />
+        <FooterItem
+          icon={LockSimpleIcon}
+          label="Lock"
+          os={os}
+          shortcut="lock"
+          disabled={lockDisabled}
+          onClick={onLock}
+        />
         <OperationsIndicator />
         <div className="sidebar-links">
           <IconButton
@@ -144,12 +154,14 @@ function FooterItem({
   label,
   os,
   shortcut,
+  disabled = false,
   onClick,
 }: {
   icon: Icon;
   label: string;
   os: Os;
   shortcut: ShortcutAction;
+  disabled?: boolean;
   onClick: () => void;
 }) {
   const hint = shortcutHint(shortcut, os);
@@ -157,6 +169,7 @@ function FooterItem({
     <button
       type="button"
       className="footer-item"
+      disabled={disabled}
       aria-keyshortcuts={hint.replace('⌘', 'Meta+').replace('Ctrl', 'Control')}
       onClick={onClick}
     >

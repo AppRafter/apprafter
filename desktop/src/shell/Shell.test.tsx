@@ -2,11 +2,12 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { QueryClientProvider } from '@tanstack/react-query';
 import { clearMocks, mockIPC, mockWindows } from '@tauri-apps/api/mocks';
-import { act, cleanup, render, screen, within } from '@testing-library/react';
+import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { ToastProvider } from '../components/Toast';
 import type { AppInfo } from '../ipc/generated/AppInfo';
 import type { OpSummary } from '../ipc/generated/OpSummary';
+import type { Settings } from '../ipc/generated/Settings';
 import { MOCK_TARGETS } from '../ipc/mock/fixtures';
 import { refreshList, resetOperations } from '../ipc/operations';
 import { TargetsSource } from '../screens/targets/targets';
@@ -33,18 +34,34 @@ const INFO: AppInfo = {
   settingsNotice: null,
 };
 
+const NO_AUTH: AppInfo = {
+  ...INFO,
+  auth: {
+    available: false,
+    method: null,
+    unavailable: 'no_backend',
+    biometricsChoice: false,
+    passwordField: false,
+  },
+};
+
+const NO_AUTH_NOTICE =
+  'This computer offers no system authentication AppRafter can use, so the app lock is off.';
+
 let calls: string[];
 let summaries: OpSummary[];
+let stored: Settings;
 
 beforeEach(() => {
   calls = [];
   summaries = [];
+  stored = settings();
   mockWindows('main');
   mockIPC(
     (cmd) => {
       calls.push(cmd);
       if (cmd === 'op_list') return summaries;
-      if (cmd === 'settings_get') return settings();
+      if (cmd === 'settings_get') return stored;
       if (cmd === 'lock_now') return lockState({ reason: 'manual' });
       if (cmd === 'plugin:window|is_maximized') return false;
       return null;
@@ -60,10 +77,10 @@ afterEach(async () => {
   clearMocks();
 });
 
-function shell() {
+function shell(info: AppInfo = INFO) {
   render(
     <QueryClientProvider client={createQueryClient()}>
-      <PlatformContext value={INFO}>
+      <PlatformContext value={info}>
         <TargetsSource value={MOCK_TARGETS}>
           <ToastProvider>
             <Shell />
@@ -119,6 +136,42 @@ describe('Shell', () => {
     expect(tab('prod-eu').getAttribute('aria-selected')).toBe('false');
     await user.keyboard('{Control>}l{/Control}');
     expect(calls).toContain('lock_now');
+  });
+
+  test('with no system authentication a notice stays under the title bar, on every view', async () => {
+    const user = shell(NO_AUTH);
+    expect(screen.getByRole('note').textContent).toBe(NO_AUTH_NOTICE);
+    await user.click(screen.getByRole('button', { name: /prod-eu/ }));
+    expect(screen.getByRole('note').textContent).toBe(NO_AUTH_NOTICE);
+    cleanup();
+    shell();
+    expect(screen.queryByRole('note')).toBeNull();
+  });
+
+  test('with no system authentication Lock is disabled, and Ctrl+L says why instead', async () => {
+    const user = shell(NO_AUTH);
+    await screen.findByRole('button', { name: 'Lock Ctrl+L' });
+    expect(
+      (screen.getByRole('button', { name: 'Lock Ctrl+L' }) as HTMLButtonElement).disabled,
+    ).toBe(true);
+    await user.keyboard('{Control>}l{/Control}');
+    expect(calls).not.toContain('lock_now');
+    expect(screen.getByRole('status').textContent).toBe(NO_AUTH_NOTICE);
+  });
+
+  test('with Require unlock off, Lock is disabled too, and Ctrl+L says where to turn it on', async () => {
+    stored = settings({ lockEnabled: false });
+    const user = shell();
+    await waitFor(() =>
+      expect(
+        (screen.getByRole('button', { name: 'Lock Ctrl+L' }) as HTMLButtonElement).disabled,
+      ).toBe(true),
+    );
+    await user.keyboard('{Control>}l{/Control}');
+    expect(calls).not.toContain('lock_now');
+    expect(screen.getByRole('status').textContent).toBe(
+      'The app lock is off: turn on Require unlock in Settings to use it.',
+    );
   });
 
   test('closing the shown tab shows its neighbour, and the last one the Targets view', async () => {
