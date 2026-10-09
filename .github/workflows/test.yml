@@ -197,12 +197,13 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # libpam0g-dev: desktop/os-auth's PAM fallback links -lpam.
       - if: runner.os == 'Linux'
-        name: Install WebKitGTK / GTK (Tauri 2 Linux prerequisites)
+        name: Install WebKitGTK / GTK (Tauri 2 Linux prerequisites) and libpam
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends build-essential pkg-config file \
-            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
+            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libpam0g-dev
       # cli/cli-providers/build.rs runs `cue export` — same reason as rust-cli.
       - uses: cue-lang/setup-cue@b0e30e540a2dae47304ebf16586a5b2db023b61c # v2.0.0
         with:
@@ -250,6 +251,11 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The tests link -lpam (desktop/os-auth's PAM fallback).
+      - name: Install libpam
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libpam0g-dev
       # The test links apprafter-core, so cli/cli-providers/build.rs runs `cue export`.
       - uses: cue-lang/setup-cue@b0e30e540a2dae47304ebf16586a5b2db023b61c # v2.0.0
         with:

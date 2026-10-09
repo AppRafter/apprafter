@@ -121,9 +121,10 @@
         desktopShell = pkgs.mkShell {
           name = "apprafter-desktop";
           nativeBuildInputs = with pkgs; [ pkg-config wrapGAppsHook3 ];
+          # linux-pam: desktop/os-auth's PAM fallback links -lpam (nonstick's libpam-sys).
           buildInputs = with pkgs; [
             webkitgtk_4_1 gtk3 libsoup_3 librsvg glib-networking
-            libayatana-appindicator gsettings-desktop-schemas dbus
+            libayatana-appindicator gsettings-desktop-schemas dbus linux-pam
           ];
           packages = with pkgs; [ cuePinned just jq git xvfb-run ];
           shellHook = ''
@@ -137,13 +138,13 @@
             # appended: an ambient LD_LIBRARY_PATH (a NixOS user profile) can carry a
             # DIFFERENT webkitgtk build, and that one must not win. libappindicator-sys
             # also dlopen()s libayatana-appindicator3 at run time. (atk ships inside
-            # at-spi2-core.)
+            # at-spi2-core.) linux-pam: every desktop/os-auth binary links libpam.
             export LD_LIBRARY_PATH="${
               pkgs.lib.makeLibraryPath (
                 with pkgs;
                 [
                   webkitgtk_4_1 gtk3 libsoup_3 glib cairo pango gdk-pixbuf harfbuzz
-                  at-spi2-core librsvg dbus libayatana-appindicator
+                  at-spi2-core librsvg dbus libayatana-appindicator linux-pam
                 ]
               )
             }''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"

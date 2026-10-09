@@ -32,7 +32,15 @@ zbus        = "~5.19"
 # >= 5.1.0: below it `Subject::new_for_owner` is the PID-reuse bypass RUSTSEC-2026-0278. The
 # backend never builds that subject (it asks about its own bus name), but no older copy may land.
 zbus_polkit = "~5.1"
-
-# The container test drives pkttyagent through a pseudo-terminal.
-[target.'cfg(target_os = "linux")'.dev-dependencies]
+# PAM through libpam-sys, which declares the functions itself (no bindgen) and links `-lpam`:
+# libpam0g-dev on CI, linux-pam in the nix desktop shell.
+nonstick = "~0.1.2"
+# The account PAM checks (`getpwuid_r(getuid())`); the polkit container test also drives
+# pkttyagent through a pseudo-terminal with it.
 libc = "0.2"
+# The password the PAM conversation answers with, wiped when dropped.
+zeroize = "~1.9"
+
+# The PAM service probe's tests build their own /etc/pam.d and /usr/lib/pam.d.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+tempfile = "3"

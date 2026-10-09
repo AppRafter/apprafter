@@ -93,13 +93,15 @@ install_cosign() {
   chmod +x "$INSTALL_BIN/cosign"
 }
 
-# AppRafter Desktop (ADR 0067): Tauri 2's Linux build dependencies (its prerequisites page).
-# Ubuntu packages, so they float with the base image like git.
+# AppRafter Desktop (ADR 0067): Tauri 2's Linux build dependencies (its prerequisites page),
+# and libpam's development files (desktop/os-auth's PAM fallback links -lpam). Ubuntu
+# packages, so they float with the base image like git.
 install_desktop_deps() {
-  if pkg-config --exists webkit2gtk-4.1 2>/dev/null; then return; fi
+  if pkg-config --exists webkit2gtk-4.1 2>/dev/null &&
+    [ -e /usr/include/security/pam_appl.h ]; then return; fi
   sudo apt-get update
   sudo apt-get install -y --no-install-recommends build-essential pkg-config file \
-    libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
+    libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libpam0g-dev
 }
 
 install_cue

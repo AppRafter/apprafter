@@ -78,6 +78,15 @@ pub fn verify(action: Action, cancel: &CancellationToken) -> AuthOutcome {
     }
 }
 
+/// Step 1 alone, for `action`: whether polkit would open the session's authentication agent,
+/// asking nobody. `Ok` when it would; otherwise the outcome [`verify`] would give without a
+/// dialog. `Ok` does not say an agent is registered: polkit tells that only to a check that may
+/// open one, so only [`verify`] finds `NoAgent`.
+pub fn probe(action: Action) -> Result<(), AuthOutcome> {
+    let bus = SystemBus::connect().map_err(|error| map_polkit(PolkitAnswer::Error(error)))?;
+    probe_with(&bus, action.id())
+}
+
 const APP_CANCELLED: AuthOutcome = AuthOutcome::Cancelled {
     by: CancelledBy::App,
 };
@@ -117,7 +126,7 @@ fn authenticate(
     if cancel.is_cancelled() {
         return APP_CANCELLED;
     }
-    if let Some(outcome) = probe_outcome(authority.check(action, Interaction::None)) {
+    if let Err(outcome) = probe_with(authority, action) {
         return outcome;
     }
     let prompt = Prompt::default();
@@ -156,18 +165,18 @@ fn authenticate(
     }
 }
 
-/// Step 1's answer: `None` when polkit would ask the user, else the outcome without a dialog.
-fn probe_outcome(answer: PolkitAnswer) -> Option<AuthOutcome> {
-    match answer {
+/// Step 1: `Ok` when polkit would ask the user, else the outcome without a dialog.
+fn probe_with(authority: &impl Authority, action: &str) -> Result<(), AuthOutcome> {
+    match authority.check(action, Interaction::None) {
         PolkitAnswer::Answered {
             authorized: true, ..
-        } => Some(AuthOutcome::Unavailable {
+        } => Err(AuthOutcome::Unavailable {
             reason: UnavailableReason::ImplicitGrant,
         }),
         PolkitAnswer::Answered {
             challenge: true, ..
-        } => None,
-        other => Some(map_polkit(other)),
+        } => Ok(()),
+        other => Err(map_polkit(other)),
     }
 }
 
@@ -558,6 +567,29 @@ mod tests {
                 "{error:?}"
             );
             assert_eq!(fake.calls(), probe_only(), "{error:?}");
+        }
+    }
+
+    /// What `info` asks: step 1 alone, which never opens a dialog.
+    #[test]
+    fn the_probe_asks_without_interaction_and_opens_no_dialog() {
+        for (probe, outcome) in [
+            (CHALLENGE, Ok(())),
+            (AUTHORIZED, Err(unavailable(ImplicitGrant))),
+            (answered(true, true, false), Err(unavailable(ImplicitGrant))),
+            (REFUSED, Err(unavailable(NotPermittedHere))),
+            (
+                PolkitAnswer::Error(PolkitError::Failed),
+                Err(unavailable(PolicyMissing)),
+            ),
+            (
+                PolkitAnswer::Error(PolkitError::Other),
+                Err(unavailable(NoBackend)),
+            ),
+        ] {
+            let fake = Fake::new(probe, Dialog::Answers(AUTHORIZED));
+            assert_eq!(probe_with(&fake, ACTION), outcome, "{probe:?}");
+            assert_eq!(fake.calls(), probe_only(), "{probe:?}");
         }
     }
 
