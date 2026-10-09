@@ -436,9 +436,11 @@ pub enum CliError {
         code(apprafter::io::yaml),
         help(
             "YAML decode/encode error — most often raised by a target store file under \
-             `$XDG_CONFIG_HOME/apprafter/`. Re-create the offending target with \
-             `apprafter target add <name> --force` to rewrite both halves \
-             (`config.yaml` + `credentials.yaml`) cleanly."
+             `$XDG_CONFIG_HOME/apprafter/`. Fix the YAML by hand (target store files are \
+             small), or delete that target's directory under \
+             `$XDG_CONFIG_HOME/apprafter/targets/<name>/` and add it again with `apprafter \
+             target add <name> --provider hetzner-cloud …`. `target add --force` cannot \
+             rewrite it: it keeps the stored values, so it needs a readable config."
         )
     )]
     Yaml(#[from] serde_yaml::Error),
@@ -591,6 +593,18 @@ mod tests {
             help.contains("apprafter target add"),
             "missing recreate hint: {help}"
         );
+    }
+
+    /// Bug 8: `--force` now keeps the stored values, so it refuses an unreadable target (it
+    /// always did since it read both files) and cannot be the way to rewrite one.
+    #[test]
+    fn yaml_help_never_sends_the_reader_to_force() {
+        let err = CliError::from(serde_yaml::from_str::<u8>("[").unwrap_err());
+        assert_eq!(code_of(&err), "apprafter::io::yaml");
+        let help = help_of(&err);
+        assert!(!help.contains("<name> --force"), "{help}");
+        assert!(help.contains("by hand"), "{help}");
+        assert!(help.contains("targets/<name>/"), "{help}");
     }
 
     #[test]

@@ -102,8 +102,8 @@ apprafter target add prod --renew --token "$NEW_TOKEN"
 ```
 
 `--renew` updates only the credentials half of an existing
-target. Fails if the target doesn't exist (`--force` would
-replace the entire target). The wizard pings the new token
+target. Fails if the target doesn't exist (`--force` overwrites
+the token and the fields you pass, and keeps the rest). The wizard pings the new token
 before saving; pass `--no-ping` to skip the round-trip.
 
 The token bytes are byte-compared against the stored value —

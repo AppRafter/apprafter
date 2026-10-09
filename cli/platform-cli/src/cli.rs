@@ -1363,15 +1363,18 @@ pub enum TargetCommand {
         /// Default cluster name; falls back to `platform-1`.
         #[arg(long = "cluster-name")]
         cluster_name: Option<String>,
-        /// Overwrite an existing target. Without `--force`, the
-        /// command fails when the target name is taken.
+        /// Overwrite an existing target: the flags you pass replace their stored values, every
+        /// field you do not pass keeps its stored value (the Cloudflare origin firewall toggle
+        /// always does), and the token is replaced. On a target with a provisioned server,
+        /// `--force` refuses a region or server-type change (rebuild from a backup instead). To
+        /// start from scratch, run `apprafter target remove <name>`, then `apprafter target add
+        /// <name>`. Without `--force`, the command fails when the target name is taken.
         #[arg(long, default_value_t = false)]
         force: bool,
         /// Update only the credentials of an existing target.
         /// Errors when the target does not exist. Mutually
-        /// exclusive with `--force` (use `--force` if you want
-        /// to replace the whole target, not just rotate the
-        /// token).
+        /// exclusive with `--force` (use `--force` to change the
+        /// target's other fields as well as the token).
         #[arg(long, default_value_t = false, conflicts_with = "force")]
         renew: bool,
         /// Skip the interactive wizard even when stdin + stdout

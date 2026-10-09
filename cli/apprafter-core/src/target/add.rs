@@ -1,18 +1,18 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
-//! `target add` (a new target, or today's `--force` overwrite) and `target add --renew` (rotate
-//! a target's token), as plan and execute.
+//! `target add` (a new target, or a `--force` overwrite that keeps every field it is not given)
+//! and `target add --renew` (rotate a target's token), as plan and execute.
 
 use std::path::{Path, PathBuf};
 
 use cli_core::{GlobalConfig, Target, TargetConfig, TargetCredentials, TargetStorePaths};
 
 use crate::context::SecretString;
-use crate::op::{ChangeAction, Outcome, Plan, PlanClass};
+use crate::op::{ChangeAction, Outcome, Plan, PlanClass, PlannedChange};
 use crate::provider::{SkipReason, Verification};
 use crate::report::Reporter;
 use crate::target::{
-    cancelled, change, cli_default, lock_store, lock_store_if_present, validate_name, SkuCheck,
-    TargetAdded, TargetRenewed,
+    cancelled, change, cli_default, lock_store, lock_store_if_present, provisioned, validate_name,
+    SkuCheck, TargetAdded, TargetRenewed,
 };
 use crate::{ActivePointerChange, CancellationToken, Context, CoreError, CoreResult, TargetRef};
 
@@ -69,8 +69,11 @@ fn stored_config(store: &TargetStorePaths, name: &str) -> CoreResult<Option<Targ
 
 /// Local checks only (R2), in today's order: name, provider, token format, SSH key, name free
 /// (unless `force`). A new name is Bounded (`Create Target`, `Create Credentials`, and
-/// `SetDefault CliDefault` when `config.yaml` is absent); a forced overwrite is Destructive
-/// (`Replace Target`, `Replace Credentials`).
+/// `SetDefault CliDefault` when `config.yaml` is absent) — with `force` too (deviation 3). A
+/// forced overwrite of a stored target is Destructive: one `Update` or `Keep Target` per field
+/// ([`force_changes`]), then `Replace Credentials`; on a target whose state records a server it
+/// refuses a region or server-type change ([`CoreError::TargetProvisioned`], the guard `target
+/// machine` uses).
 pub fn plan_add(ctx: &Context, args: AddArgs) -> CoreResult<Plan<AddPayload>> {
     validate_name(&args.name).map_err(|problem| CoreError::InvalidTargetName {
         name: args.name.clone(),
@@ -99,11 +102,14 @@ pub fn plan_add(ctx: &Context, args: AddArgs) -> CoreResult<Plan<AddPayload>> {
                 Some(create_detail(ctx, &args)),
             )],
         ),
-        Some(_) => (
-            PlanClass::Destructive,
-            format!("Overwrite target {n}"),
-            vec![change("Target", &n, ChangeAction::Replace, None)],
-        ),
+        Some(stored) => {
+            refuse_machine_change_if_provisioned(ctx, stored, &args)?;
+            (
+                PlanClass::Destructive,
+                format!("Overwrite target {n}"),
+                force_changes(ctx, stored, &args),
+            )
+        }
     };
     changes.push(change(
         "Credentials",
@@ -156,11 +162,140 @@ fn create_detail(ctx: &Context, a: &AddArgs) -> String {
     parts.join(", ")
 }
 
+/// `--force` over a stored target: a flag replaces its field, every other field keeps its stored
+/// value, the firewall (no flag sets it) is always carried over. A struct literal on purpose: a
+/// new `TargetConfig` field fails to compile here until someone decides how `--force` treats it.
+fn merge_force(stored: &TargetConfig, a: &AddArgs) -> TargetConfig {
+    TargetConfig {
+        provider: a.provider.clone(),
+        region: a.region.clone().or_else(|| stored.region.clone()),
+        default_tier: a.tier.clone().or_else(|| stored.default_tier.clone()),
+        cluster_name: a
+            .cluster_name
+            .clone()
+            .or_else(|| stored.cluster_name.clone()),
+        ssh_key_path: a.ssh_key.clone().or_else(|| stored.ssh_key_path.clone()),
+        firewall: stored.firewall.clone(),
+        server_type: a.server_type.clone().or_else(|| stored.server_type.clone()),
+    }
+}
+
+/// A new target from the flags alone. A struct literal for the same reason as [`merge_force`].
+fn new_config(a: &AddArgs) -> TargetConfig {
+    TargetConfig {
+        provider: a.provider.clone(),
+        region: a.region.clone(),
+        default_tier: a.tier.clone(),
+        cluster_name: a.cluster_name.clone(),
+        ssh_key_path: a.ssh_key.clone(),
+        firewall: None,
+        server_type: a.server_type.clone(),
+    }
+}
+
+/// The flags move the machine: a region or server type that differs from the stored one.
+fn changes_machine(stored: &TargetConfig, a: &AddArgs) -> bool {
+    a.region
+        .as_deref()
+        .is_some_and(|r| stored.region.as_deref() != Some(r))
+        || a.server_type
+            .as_deref()
+            .is_some_and(|s| stored.server_type.as_deref() != Some(s))
+}
+
+/// [`CoreError::TargetProvisioned`] when the flags move the machine of a target whose state
+/// records a server: there is no in-place resize (the guard `target machine` uses). The state is
+/// read only when the machine would move.
+fn refuse_machine_change_if_provisioned(
+    ctx: &Context,
+    stored: &TargetConfig,
+    a: &AddArgs,
+) -> CoreResult<()> {
+    if !changes_machine(stored, a) {
+        return Ok(());
+    }
+    let t = TargetRef::named(ctx, &a.name)?;
+    match provisioned(ctx, &t)? {
+        Some(s) => Err(CoreError::TargetProvisioned {
+            name: a.name.clone(),
+            server_id: s.server_id,
+            server_name: s.server_name,
+        }),
+        None => Ok(()),
+    }
+}
+
+/// One `Update` / `Keep Target` per field, unset-and-unpassed fields omitted, then the firewall
+/// (always kept, when set). `plan_add` adds `Replace Credentials` after them.
+fn force_changes(ctx: &Context, stored: &TargetConfig, a: &AddArgs) -> Vec<PlannedChange> {
+    let key = |p: &Path| cli_core::paths::abbreviate_home(p, ctx.home_dir());
+    let fields = [
+        ("region", stored.region.clone(), a.region.clone()),
+        ("tier", stored.default_tier.clone(), a.tier.clone()),
+        (
+            "cluster name",
+            stored.cluster_name.clone(),
+            a.cluster_name.clone(),
+        ),
+        (
+            "ssh key",
+            stored.ssh_key_path.as_deref().map(key),
+            a.ssh_key.as_deref().map(key),
+        ),
+        (
+            "server type",
+            stored.server_type.clone(),
+            a.server_type.clone(),
+        ),
+    ];
+    let mut out: Vec<PlannedChange> = fields
+        .into_iter()
+        .filter_map(|(label, s, f)| match (s, f) {
+            (None, None) => None,
+            (Some(s), None) => Some(change(
+                "Target",
+                &a.name,
+                ChangeAction::Keep,
+                Some(format!("{label}: {s}")),
+            )),
+            (Some(s), Some(f)) if s == f => Some(change(
+                "Target",
+                &a.name,
+                ChangeAction::Keep,
+                Some(format!("{label}: {f}")),
+            )),
+            (s, Some(f)) => Some(change(
+                "Target",
+                &a.name,
+                ChangeAction::Update,
+                Some(format!(
+                    "{label}: {} → {f}",
+                    s.as_deref().unwrap_or("not set")
+                )),
+            )),
+        })
+        .collect();
+    if let Some(fw) = &stored.firewall {
+        out.push(change(
+            "Target",
+            &a.name,
+            ChangeAction::Keep,
+            Some(format!(
+                "firewall: Cloudflare origin {}",
+                if fw.cloudflare_origin { "on" } else { "off" }
+            )),
+        ));
+    }
+    out
+}
+
 /// Ping (unless `no_ping`; even after a wizard verify — R2), the SKU check (server types only,
-/// in the flag's region or [`crate::machine::DEFAULT_REGION`]), then, under the lock (always
-/// taken, creating the root — this plan's deviation 1), re-check the name and save. The pointer
-/// moves only when `config.yaml` is absent; the outcome reports what happened. Today's
-/// `--force`: the target is rebuilt from the arguments.
+/// in the flag's region, else — with `force` — the stored one, else
+/// [`crate::machine::DEFAULT_REGION`]), then, under the lock (always taken, creating the root —
+/// this plan's deviation 1), re-check and save. A forced overwrite re-reads the stored target
+/// under the lock, runs the provisioned guard again and merges onto it ([`merge_force`]), so an
+/// edit made during the ping is kept. The pointer moves only when `config.yaml` is absent; the
+/// outcome reports what happened.
 pub fn execute_add(
     ctx: &Context,
     plan: Plan<AddPayload>,
@@ -185,8 +320,13 @@ pub fn execute_add(
         None => None,
         Some(sku) if ctx.no_ping() => Some(SkuCheck::NotValidated { sku: sku.clone() }),
         Some(sku) => {
-            let (region, region_was_default) = match &a.region {
-                Some(r) => (r.clone(), false),
+            let stored_region = if a.force {
+                stored_config(&ctx.store(), &a.name)?.and_then(|c| c.region)
+            } else {
+                None
+            };
+            let (region, region_was_default) = match a.region.clone().or(stored_region) {
+                Some(r) => (r, false),
                 None => (crate::machine::DEFAULT_REGION.to_string(), true),
             };
             crate::machine::check_sku(ctx, &a.token, sku, &region, cancel)?;
@@ -202,19 +342,17 @@ pub fn execute_add(
     }
     let store = ctx.store();
     let _lock = lock_store(ctx, reporter)?;
-    let replaced = stored_config(&store, &a.name)?.is_some();
+    let stored = stored_config(&store, &a.name)?;
+    let replaced = stored.is_some();
     if replaced && !a.force {
         return Err(CoreError::TargetExists { name: a.name });
     }
-    // Today's `--force`: rebuilt from the arguments (this plan's Task 25 makes it a merge).
-    let config = TargetConfig {
-        provider: a.provider,
-        region: a.region,
-        default_tier: a.tier,
-        cluster_name: a.cluster_name,
-        ssh_key_path: a.ssh_key,
-        firewall: None,
-        server_type: a.server_type,
+    let config = match &stored {
+        Some(stored) => {
+            refuse_machine_change_if_provisioned(ctx, stored, &a)?;
+            merge_force(stored, &a)
+        }
+        None => new_config(&a),
     };
     cli_core::save_target(
         &store,
@@ -580,6 +718,253 @@ mod tests {
         assert_eq!(
             (inactive.cli_default, inactive.is_cli_default),
             (None, false)
+        );
+    }
+
+    /// Bug 8: `--force` replaced the whole target from the flags, so the Cloudflare origin
+    /// firewall toggle (no `target add` flag sets it) was turned off and every field the
+    /// command did not repeat was wiped.
+    #[test]
+    fn force_keeps_every_field_it_is_not_given_and_always_the_firewall() {
+        let (dir, ctx) = store(&["prod"], Some("prod"));
+        let ctx = ctx.with_no_ping(true);
+        let key = dir.path().join("k.pub");
+        std::fs::write(&key, "ssh-ed25519 AAAA k\n").unwrap();
+        edit(&ctx, "prod", |t| {
+            t.config.cluster_name = Some("edge-1".into());
+            t.config.ssh_key_path = Some(key.clone());
+            t.config.server_type = Some("cx22".into());
+            t.config.firewall = Some(cli_core::target::FirewallConfig {
+                cloudflare_origin: true,
+            });
+        });
+        let plan = plan_add(
+            &ctx,
+            AddArgs {
+                force: true,
+                region: Some("hel1".into()),
+                ..args("prod", TOKEN_B)
+            },
+        )
+        .unwrap();
+        assert_eq!(plan.class, PlanClass::Destructive);
+        let details: Vec<_> = plan
+            .changes
+            .iter()
+            .filter_map(|c| c.detail.clone().map(|d| (c.action, d)))
+            .collect();
+        assert!(details.contains(&(ChangeAction::Update, "region: nbg1 → hel1".into())));
+        assert!(details.contains(&(ChangeAction::Keep, "tier: solo".into())));
+        assert!(details.contains(&(ChangeAction::Keep, "cluster name: edge-1".into())));
+        assert!(details.contains(&(ChangeAction::Keep, "server type: cx22".into())));
+        assert!(details.contains(&(ChangeAction::Keep, "firewall: Cloudflare origin on".into())));
+        assert!(details.contains(&(ChangeAction::Replace, "API token".into())));
+        execute_add(&ctx, plan, &NullReporter, &CancellationToken::new()).unwrap();
+        let t = cli_core::load_target(&ctx.store(), "prod").unwrap();
+        let c = t.config;
+        assert_eq!(
+            (
+                c.region.as_deref(),
+                c.default_tier.as_deref(),
+                c.cluster_name.as_deref(),
+                c.server_type.as_deref()
+            ),
+            (Some("hel1"), Some("solo"), Some("edge-1"), Some("cx22"))
+        );
+        assert_eq!(c.ssh_key_path, Some(key));
+        assert_eq!(
+            c.firewall,
+            Some(cli_core::target::FirewallConfig {
+                cloudflare_origin: true
+            })
+        );
+        assert_eq!(t.credentials.hetzner_token.as_deref(), Some(TOKEN_B));
+    }
+
+    /// A flag that names the stored value is no change, so it reads as kept.
+    #[test]
+    fn force_with_the_stored_value_keeps_it_and_omits_what_was_never_set() {
+        let (_d, ctx) = store(&["prod"], Some("prod"));
+        let plan = plan_add(
+            &ctx,
+            AddArgs {
+                force: true,
+                region: Some("nbg1".into()),
+                ..args("prod", TOKEN_B)
+            },
+        )
+        .unwrap();
+        let target: Vec<_> = plan
+            .changes
+            .iter()
+            .filter(|c| c.kind == "Target")
+            .map(|c| (c.action, c.detail.clone().unwrap_or_default()))
+            .collect();
+        assert_eq!(
+            target,
+            [
+                (ChangeAction::Keep, "region: nbg1".to_string()),
+                (ChangeAction::Keep, "tier: solo".to_string()),
+            ],
+            "unset-and-unpassed fields (cluster name, ssh key, server type, firewall) are omitted"
+        );
+    }
+
+    #[test]
+    fn force_refuses_a_region_or_sku_change_on_a_provisioned_target_but_not_a_token_change() {
+        let (_d, ctx) = store(&["prod"], Some("prod"));
+        let ctx = ctx.with_no_ping(true);
+        seed_server(&ctx, "prod", 42, "platform-1", Some("cx22"));
+        assert!(matches!(
+            plan_add(
+                &ctx,
+                AddArgs {
+                    force: true,
+                    region: Some("hel1".into()),
+                    ..args("prod", TOKEN_B)
+                }
+            ),
+            Err(CoreError::TargetProvisioned { server_id: 42, .. })
+        ));
+        assert!(matches!(
+            plan_add(
+                &ctx,
+                AddArgs {
+                    force: true,
+                    server_type: Some("cx32".into()),
+                    ..args("prod", TOKEN_B)
+                }
+            ),
+            Err(CoreError::TargetProvisioned { .. })
+        ));
+        assert!(
+            plan_add(
+                &ctx,
+                AddArgs {
+                    force: true,
+                    region: Some("nbg1".into()),
+                    ..args("prod", TOKEN_B)
+                }
+            )
+            .is_ok(),
+            "same region is no change"
+        );
+        run(
+            &ctx,
+            AddArgs {
+                force: true,
+                ..args("prod", TOKEN_B)
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            cli_core::load_target(&ctx.store(), "prod")
+                .unwrap()
+                .credentials
+                .hetzner_token
+                .as_deref(),
+            Some(TOKEN_B)
+        );
+    }
+
+    /// The guard runs again under the lock: a server recorded while the plan waited (another
+    /// terminal's `up`) still refuses the machine change.
+    #[test]
+    fn the_provisioned_guard_runs_again_under_the_lock() {
+        let (_d, ctx) = store(&["prod"], Some("prod"));
+        let ctx = ctx.with_no_ping(true);
+        let plan = plan_add(
+            &ctx,
+            AddArgs {
+                force: true,
+                region: Some("hel1".into()),
+                ..args("prod", TOKEN_B)
+            },
+        )
+        .unwrap();
+        seed_server(&ctx, "prod", 42, "platform-1", None);
+        assert!(matches!(
+            execute_add(&ctx, plan, &NullReporter, &CancellationToken::new()),
+            Err(CoreError::TargetProvisioned { server_id: 42, .. })
+        ));
+        let c = cli_core::load_target(&ctx.store(), "prod").unwrap();
+        assert_eq!(
+            (
+                c.config.region.as_deref(),
+                c.credentials.hetzner_token.as_deref()
+            ),
+            (Some("nbg1"), Some(TOKEN_A)),
+            "nothing written"
+        );
+    }
+
+    #[test]
+    fn the_merge_happens_again_under_the_lock() {
+        let (_d, ctx) = store(&["prod"], Some("prod"));
+        let ctx = ctx.with_no_ping(true);
+        let plan = plan_add(
+            &ctx,
+            AddArgs {
+                force: true,
+                ..args("prod", TOKEN_B)
+            },
+        )
+        .unwrap();
+        // during the ping
+        edit(&ctx, "prod", |t| {
+            t.config.firewall = Some(cli_core::target::FirewallConfig {
+                cloudflare_origin: true,
+            })
+        });
+        execute_add(&ctx, plan, &NullReporter, &CancellationToken::new()).unwrap();
+        assert!(cli_core::load_target(&ctx.store(), "prod")
+            .unwrap()
+            .config
+            .firewall
+            .is_some_and(|f| f.cloudflare_origin));
+    }
+
+    /// Deviation 3: `--force` on a name that does not exist is a plain add.
+    #[test]
+    fn force_on_a_new_name_is_a_bounded_add() {
+        let (_d, ctx) = store(&["prod"], Some("prod"));
+        let plan = plan_add(
+            &ctx,
+            AddArgs {
+                force: true,
+                ..args("fresh", TOKEN_B)
+            },
+        )
+        .unwrap();
+        assert_eq!(plan.class, PlanClass::Bounded);
+        assert_eq!(plan.changes[0].action, ChangeAction::Create);
+    }
+
+    /// The SKU check of a forced overwrite without `--region` runs in the stored region, not
+    /// the default one.
+    #[test]
+    fn a_forced_sku_is_checked_in_the_stored_region() {
+        let mut s = mockito::Server::new();
+        let _l = route(&mut s, "/v1/locations", 200, LOCATIONS, TOKEN_B).create();
+        let _t = route(&mut s, "/v1/server_types", 200, SERVER_TYPES, TOKEN_B).create();
+        let (_d, ctx) = store_at(&["prod"], Some("prod"), &s.url());
+        edit(&ctx, "prod", |t| t.config.region = Some("fsn1".into()));
+        let r = run(
+            &ctx,
+            AddArgs {
+                force: true,
+                server_type: Some("cx32".into()),
+                ..args("prod", TOKEN_B)
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            r.sku,
+            Some(SkuCheck::Validated {
+                sku: "cx32".into(),
+                region: "fsn1".into(),
+                region_was_default: false
+            })
         );
     }
 

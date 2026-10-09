@@ -260,8 +260,11 @@ encode/decode error on `state.json` (JSON) /
 **Fix.** The captured OS message names the failing path or
 socket. Common cases: missing directory, wrong permissions
 (`chmod 0600` on credentials), full disk. For decode failures on
-target-store files, re-create the offending target with
-`apprafter target add <name> --force`.
+target-store files, fix the YAML by hand (they are small files),
+or delete that target's directory under the target store and add
+it again with `apprafter target add`. `target add --force` cannot
+rewrite such a target: it keeps the stored values, so it needs a
+readable config.
 
 ### `apprafter::backup::job_active`
 

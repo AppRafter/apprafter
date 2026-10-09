@@ -3612,7 +3612,7 @@
           "env": null,
           "required": false,
           "possible_values": [],
-          "help": "Overwrite an existing target. Without `--force`, the command fails when the target name is taken"
+          "help": "Overwrite an existing target: the flags you pass replace their stored values, every field you do not pass keeps its stored value (the Cloudflare origin firewall toggle always does), and the token is replaced. On a target with a provisioned server, `--force` refuses a region or server-type change (rebuild from a backup instead). To start from scratch, run `apprafter target remove <name>`, then `apprafter target add <name>`. Without `--force`, the command fails when the target name is taken"
         },
         {
           "id": "no_interactive",
@@ -3672,7 +3672,7 @@
           "env": null,
           "required": false,
           "possible_values": [],
-          "help": "Update only the credentials of an existing target. Errors when the target does not exist. Mutually exclusive with `--force` (use `--force` if you want to replace the whole target, not just rotate the token)"
+          "help": "Update only the credentials of an existing target. Errors when the target does not exist. Mutually exclusive with `--force` (use `--force` to change the target's other fields as well as the token)"
         },
         {
           "id": "server_type",

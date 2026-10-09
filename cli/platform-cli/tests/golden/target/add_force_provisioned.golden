@@ -1,19 +1,35 @@
 $ apprafter target add prod --force --provider hetzner-cloud --token bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb --region hel1 --no-ping --no-interactive
-[exit 0]
+[exit 1]
 [stdout]
-target `prod` saved (active target unchanged — use `apprafter target use prod` to switch) (token NOT verified against the API — `--no-ping` was passed)
 [stderr]
 <ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m target add invoked <ESC>[3mtarget<ESC>[0m<ESC>[2m=<ESC>[0mprod <ESC>[3mrenew<ESC>[0m<ESC>[2m=<ESC>[0mfalse <ESC>[3mforce<ESC>[0m<ESC>[2m=<ESC>[0mtrue
+Error: apprafter::target::provisioned
+
+  × target `prod` has a provisioned server (`prod-node`, id 42), so its
+  │ machine or region cannot change
+  help: There is no in-place resize: rebuild from a backup on a new machine.
+        `destroy` deletes every `apprafter=true` resource in the token's
+        Hetzner project, not only this cluster: read the operator guide's
+        "Moving to a bigger machine" first.
+        
+            apprafter target use prod
+            apprafter backup create --repo <repo>
+            apprafter destroy --yes
+            apprafter restore <repo> --reprovision --server-type <sku>
+        
+        (`target machine` and `target add --force` change the machine only on
+        a target that has not provisioned yet.)
+
 $ apprafter target show
 [exit 0]
 [stdout]
 Target: prod (active)
   Provider:    hetzner-cloud
-  Region:      hel1
+  Region:      nbg1
   Server type: not set
-  Default tier: not set
+  Default tier: solo
   Cluster name: not set
-  SSH key:     not set
+  SSH key:     <SANDBOX>/home/id_ed25519.pub
   Hetzner token: set (64 chars; read credentials.yaml for the raw value)
 
 Config:      <SANDBOX>/apprafter-config/targets/prod/config.yaml
@@ -22,10 +38,10 @@ Credentials: <SANDBOX>/apprafter-config/targets/prod/credentials.yaml (mode 0600
 <ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m target show invoked <ESC>[3mtarget<ESC>[0m<ESC>[2m=<ESC>[0mprod
 [file targets/prod/config.yaml]
 provider: hetzner-cloud
-region: hel1
-default_tier: null
+region: nbg1
+default_tier: solo
 cluster_name: null
-ssh_key_path: null
+ssh_key_path: <SANDBOX>/home/id_ed25519.pub
 firewall: null
 server_type: null
 [file state/prod/.apprafter/state.json]

@@ -174,6 +174,9 @@ pub(crate) fn add(mut args: AddArgs) -> miette::Result<()> {
         },
     )
     .map_err(legacy)?;
+    // What a forced overwrite keeps, as planned (an edit made during the ping is merged too, but
+    // these lines describe the plan).
+    let kept = kept_lines(&plan.changes);
     let added = completed(
         core_target::execute_add(&ctx, plan, &CliReporter, &CancellationToken::new())
             .map_err(legacy)?,
@@ -192,7 +195,21 @@ pub(crate) fn add(mut args: AddArgs) -> miette::Result<()> {
             "target `{name}` saved (active target unchanged — use `apprafter target use {name}` to switch){verified_suffix}"
         );
     }
+    for line in kept {
+        println!("{line}");
+    }
     Ok(())
+}
+
+/// One `  kept <field>: <value>` line per field a forced overwrite keeps (the plan's `Keep
+/// Target` changes, in plan order): the fields not passed, and the firewall toggle, which no
+/// flag sets.
+pub(crate) fn kept_lines(changes: &[apprafter_core::PlannedChange]) -> Vec<String> {
+    changes
+        .iter()
+        .filter(|c| c.kind == "Target" && c.action == apprafter_core::ChangeAction::Keep)
+        .filter_map(|c| c.detail.as_deref().map(|d| format!("  kept {d}")))
+        .collect()
 }
 
 /// `provider` is one of the core's supported providers (the one list,
@@ -605,6 +622,52 @@ mod tests {
                 "{err}"
             );
         }
+    }
+
+    // ── --force: what it keeps ───────────────────────────────────────────
+
+    /// The texts that describe `--force` name only commands that exist.
+    #[test]
+    fn the_force_texts_name_commands_that_exist() {
+        let yaml = CliError::from(serde_yaml::from_str::<u8>("[").unwrap_err());
+        let help = miette::Diagnostic::help(&yaml).unwrap().to_string();
+        assert_eq!(assert_commands_parse(&help), 1, "{help}");
+        let cli = <crate::cli::Cli as clap::CommandFactory>::command();
+        let force_doc = cli
+            .find_subcommand("target")
+            .and_then(|t| t.find_subcommand("add"))
+            .and_then(|a| a.get_arguments().find(|x| x.get_id() == "force"))
+            .and_then(|f| f.get_long_help().or(f.get_help()))
+            .map(|h| h.to_string())
+            .expect("`target add --force` is documented");
+        assert!(force_doc.contains("keeps its stored value"), "{force_doc}");
+        assert_eq!(assert_commands_parse(&force_doc), 2, "{force_doc}");
+    }
+
+    #[test]
+    fn kept_lines_are_the_plans_kept_target_fields_in_order() {
+        use apprafter_core::{ChangeAction, PlannedChange};
+        let c = |kind: &str, action, detail: &str| PlannedChange {
+            kind: kind.into(),
+            object: "prod".into(),
+            action,
+            detail: Some(detail.into()),
+        };
+        let changes = [
+            c("Target", ChangeAction::Update, "region: nbg1 → hel1"),
+            c("Target", ChangeAction::Keep, "tier: solo"),
+            c(
+                "Target",
+                ChangeAction::Keep,
+                "firewall: Cloudflare origin on",
+            ),
+            c("Credentials", ChangeAction::Replace, "API token"),
+            c("CliDefault", ChangeAction::Keep, "not a target field"),
+        ];
+        assert_eq!(
+            kept_lines(&changes),
+            ["  kept tier: solo", "  kept firewall: Cloudflare origin on"]
+        );
     }
 
     // ── verification suffixes ────────────────────────────────────────────

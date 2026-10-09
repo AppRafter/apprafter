@@ -425,6 +425,9 @@ fn target_add_force_overwrites() {
             &["target", "show"],
         ],
     );
+    // Bug 8: the tier the setup stored survives a `--force` that did not pass `--tier`.
+    let cfg = fs::read_to_string(sb.path("apprafter-config/targets/prod/config.yaml")).unwrap();
+    assert!(cfg.contains("default_tier: solo"), "{cfg}");
 }
 
 #[test]
@@ -1156,8 +1159,10 @@ fn target_add_force_on_an_inactive_target() {
     );
 }
 
+/// Bug 8: `--force` reset the Cloudflare origin firewall toggle (no `target add` flag sets it),
+/// so the next `apply` reopened 80/443. It is carried over now, with every field not passed.
 #[test]
-fn target_add_force_drops_a_seeded_firewall_toggle() {
+fn target_add_force_keeps_a_seeded_firewall_toggle() {
     let sb = Sandbox::new();
     sb.add_target("prod");
     sb.seed_config(
@@ -1180,8 +1185,13 @@ fn target_add_force_drops_a_seeded_firewall_toggle() {
         ]],
         &["targets/prod/config.yaml"],
     );
+    let cfg = fs::read_to_string(sb.path("apprafter-config/targets/prod/config.yaml")).unwrap();
+    assert!(cfg.contains("cloudflare_origin: true"), "{cfg}");
+    assert!(cfg.contains("default_tier: solo"), "{cfg}");
 }
 
+/// Bug 8: on a target whose state records a server, `--force --region <other>` is refused
+/// (the guard `target machine` uses); nothing is written.
 #[test]
 fn target_add_force_region_on_a_provisioned_target() {
     let sb = Sandbox::new();
@@ -1209,6 +1219,32 @@ fn target_add_force_region_on_a_provisioned_target() {
         &[
             "targets/prod/config.yaml",
             "state/prod/.apprafter/state.json",
+        ],
+    );
+}
+
+/// Bug 8: a `--force` that changes only the token is allowed on a provisioned target.
+#[test]
+fn target_add_force_keeps_a_provisioned_target_when_only_the_token_changes() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.seed_state("prod", PROVISIONED_STATE);
+    sb.golden_steps(
+        "target/add_force_provisioned_token_only",
+        &[
+            &[
+                "target",
+                "add",
+                "prod",
+                "--provider",
+                "hetzner-cloud",
+                "--token",
+                TOKEN_B,
+                "--force",
+                "--no-ping",
+                "--no-interactive",
+            ],
+            &["target", "show"],
         ],
     );
 }

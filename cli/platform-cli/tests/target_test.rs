@@ -278,6 +278,8 @@ fn target_add_force_overwrites_existing_target_and_keeps_active_pointer() {
             &token1,
             "--region",
             "nbg1",
+            "--tier",
+            "solo",
         ])
         .assert()
         .success();
@@ -308,6 +310,8 @@ fn target_add_force_overwrites_existing_target_and_keeps_active_pointer() {
     // Region flag in the overwrite must land in the on-disk config.
     let cfg = std::fs::read_to_string(dir.path().join("targets/work/config.yaml")).unwrap();
     assert!(cfg.contains("region: fsn1"), "{cfg}");
+    // Bug 8: a field the overwrite did not pass keeps its stored value.
+    assert!(cfg.contains("default_tier: solo"), "{cfg}");
     // Token in the overwrite is the new one.
     let creds = std::fs::read_to_string(dir.path().join("targets/work/credentials.yaml")).unwrap();
     assert!(creds.contains(&token2));

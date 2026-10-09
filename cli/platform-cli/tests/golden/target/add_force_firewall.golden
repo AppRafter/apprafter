@@ -2,13 +2,17 @@ $ apprafter target add prod --force --provider hetzner-cloud --token bbbbbbbbbbb
 [exit 0]
 [stdout]
 target `prod` saved (active target unchanged — use `apprafter target use prod` to switch) (token NOT verified against the API — `--no-ping` was passed)
+  kept region: nbg1
+  kept tier: solo
+  kept firewall: Cloudflare origin on
 [stderr]
 <ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m target add invoked <ESC>[3mtarget<ESC>[0m<ESC>[2m=<ESC>[0mprod <ESC>[3mrenew<ESC>[0m<ESC>[2m=<ESC>[0mfalse <ESC>[3mforce<ESC>[0m<ESC>[2m=<ESC>[0mtrue
 [file targets/prod/config.yaml]
 provider: hetzner-cloud
-region: null
-default_tier: null
+region: nbg1
+default_tier: solo
 cluster_name: null
 ssh_key_path: null
-firewall: null
+firewall:
+  cloudflare_origin: true
 server_type: null
