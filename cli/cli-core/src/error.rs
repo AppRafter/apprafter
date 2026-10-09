@@ -314,15 +314,18 @@ pub enum CliError {
     /// has no such target. `available` lists what *is* configured
     /// (may be empty, signalling first-run + `apprafter target add`
     /// is the right next step).
+    ///
+    /// The name arrives positionally (`target show ghost`), through
+    /// `--target`, or from a CLI default naming a removed target, so
+    /// the help names the target and none of those sources.
     #[error("target `{name}` not found (available: {available})")]
     #[diagnostic(
         code(apprafter::target::not_found),
         help(
-            "Either the `--target` flag was given a name that's not in the store, or no target \
-             has been created yet. List existing targets with `apprafter target list`; create a \
-             new one with `apprafter target add <name> --provider hetzner-cloud …`. If the \
-             store is empty (`available: ` shows nothing), this is your first run — start with \
-             `apprafter target add`."
+            "No target named `{name}` is configured here. `apprafter target list` lists the \
+             targets that are; `apprafter target add {name} --provider hetzner-cloud …` \
+             creates it. An empty `available:` list means this store has no targets yet — \
+             start with `apprafter target add`."
         )
     )]
     TargetNotFound {
@@ -548,6 +551,25 @@ mod tests {
         assert!(
             help.contains("apprafter target add"),
             "missing add hint: {help}"
+        );
+    }
+
+    /// Bug 3: the name reaches this error positionally (`show`, `use`, `remove`), through
+    /// `--target`, or from a CLI default naming a target that is gone. The help names the
+    /// target and blames none of those sources.
+    #[test]
+    fn target_not_found_help_names_the_target_and_never_blames_a_flag() {
+        let err = CliError::TargetNotFound {
+            name: "ghost".into(),
+            available: "dev".into(),
+        };
+        let help = help_of(&err);
+        assert!(help.contains("`ghost`"), "{help}");
+        assert!(!help.contains("`--target` flag"), "{help}");
+        assert!(
+            help.contains("`apprafter target list`")
+                && help.contains("`apprafter target add ghost --provider hetzner-cloud …`"),
+            "{help}"
         );
     }
 

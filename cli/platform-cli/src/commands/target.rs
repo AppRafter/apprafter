@@ -451,6 +451,39 @@ pub(crate) fn store_lock_event_line(event: &cli_core::StoreLockEvent<'_>) -> Str
         .unwrap_or_default()
 }
 
+/// Every backticked `apprafter …` command in `text` parses with the CLI's clap tree, once each
+/// `<placeholder>` gets a sample value and a `…` is dropped; returns how many it checked. A help
+/// text may only send the reader to a command that exists.
+#[cfg(test)]
+pub(crate) fn assert_commands_parse(text: &str) -> usize {
+    use clap::Parser as _;
+    let mut checked = 0;
+    for span in text.split('`').skip(1).step_by(2) {
+        if !span.starts_with("apprafter ") {
+            continue;
+        }
+        let mut sample = String::new();
+        let mut in_placeholder = false;
+        for c in span.chars() {
+            match c {
+                '<' => in_placeholder = true,
+                '>' if in_placeholder => {
+                    in_placeholder = false;
+                    sample.push('x');
+                }
+                _ if in_placeholder => {}
+                c => sample.push(c),
+            }
+        }
+        let argv: Vec<&str> = sample.split_whitespace().filter(|w| *w != "…").collect();
+        if let Err(e) = crate::cli::Cli::try_parse_from(&argv) {
+            panic!("`{span}` does not parse: {e}");
+        }
+        checked += 1;
+    }
+    checked
+}
+
 // ---------------------------------------------------------------
 // Unit tests for pure validators
 // ---------------------------------------------------------------
@@ -854,6 +887,25 @@ mod tests {
             .map(|h| h.to_string())
             .unwrap_or_default();
         assert!(help.contains("apprafter target list"), "{help}");
+    }
+
+    /// Bug 3: the not-found help, as every target arm renders it, sends the reader only to
+    /// commands that exist.
+    #[test]
+    fn the_not_found_help_names_commands_that_exist() {
+        let r = report(CoreError::TargetNotFound {
+            name: "ghost".into(),
+            available: vec!["dev".into()],
+        });
+        let help = r.help().map(|h| h.to_string()).unwrap_or_default();
+        assert_eq!(assert_commands_parse(&help), 3, "{help}");
+    }
+
+    #[test]
+    fn the_command_check_refuses_a_command_that_does_not_exist() {
+        assert_eq!(assert_commands_parse("run `apprafter target list`"), 1);
+        let bad = std::panic::catch_unwind(|| assert_commands_parse("`apprafter target nope`"));
+        assert!(bad.is_err(), "a command clap rejects must fail the check");
     }
 
     /// `target remove`'s last line, for each way the CLI default can move.

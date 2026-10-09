@@ -318,12 +318,10 @@ diagnostic code and a multi-line `help:` block. Examples:
 Error: apprafter::target::not_found
 
   × target `ghost` not found (available: prod)
-  help: Either the `--target` flag was given a name that's not in the store,
-        or no target has been created yet. List existing targets with
-        `apprafter target list`; create a new one with `apprafter target add
-        <name> --provider hetzner-cloud …`. If the store is empty (`available:
-        ` shows nothing), this is your first run — start with `apprafter
-        target add`.
+  help: No target named `ghost` is configured here. `apprafter target list`
+        lists the targets that are; `apprafter target add ghost --provider
+        hetzner-cloud …` creates it. An empty `available:` list means this
+        store has no targets yet — start with `apprafter target add`.
 ```
 
 Set `NO_COLOR=1` for CI / pipe consumers. Output stays
