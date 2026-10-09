@@ -122,6 +122,18 @@ impl Authenticator for NoAuthenticator {
             reason: UnavailableReason::NoBackend,
         }
     }
+
+    /// Refused for the prompt's reason, the password wiped unread: there is no system prompt to
+    /// send the owner to (the trait's `UseSystemPrompt`), nor anything to check the field with.
+    fn verify_password(
+        &self,
+        purpose: &AuthPurpose,
+        password: Zeroizing<String>,
+        cancel: &CancellationToken,
+    ) -> PasswordAnswer {
+        drop(password);
+        self.verify(purpose, cancel).into()
+    }
 }
 
 /// What [`SystemAuthenticator`] asks of the OS's authenticator
@@ -747,19 +759,16 @@ mod tests {
                     reason: UnavailableReason::NoBackend
                 }
             );
+            // No field where nothing could check it, and no system prompt to send the owner to
+            // either: the same reason as the prompt's.
             assert_eq!(
                 NoAuthenticator.verify_password(&purpose, password("guess"), &token),
-                PasswordAnswer::USE_SYSTEM_PROMPT,
-                "no field where nothing could check it"
+                AuthOutcome::Unavailable {
+                    reason: UnavailableReason::NoBackend
+                }
+                .into()
             );
         }
-        // Not the OS's final refusal: the OS's own prompt is the way, and asking it works.
-        assert_eq!(
-            PasswordAnswer::USE_SYSTEM_PROMPT.outcome,
-            AuthOutcome::Unavailable {
-                reason: UnavailableReason::UseSystemPrompt
-            }
-        );
     }
 
     fn system() -> (SystemAuthenticator, Calls, Arc<ManualClock>) {
@@ -889,6 +898,13 @@ mod tests {
                 PasswordAnswer::USE_SYSTEM_PROMPT
             );
         }
+        // Not the OS's final refusal: the OS's own prompt is the way, and asking it works.
+        assert_eq!(
+            PasswordAnswer::USE_SYSTEM_PROMPT.outcome,
+            AuthOutcome::Unavailable {
+                reason: UnavailableReason::UseSystemPrompt
+            }
+        );
         // And the hooks an OS does not have do nothing.
         auth.locked();
         auth.apply_settings(&Settings::default());
