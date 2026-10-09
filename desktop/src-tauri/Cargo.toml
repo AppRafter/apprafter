@@ -26,13 +26,6 @@ name    = "app_menu"
 path    = "tests/app_menu.rs"
 harness = false
 
-# The spike's instrument for the owner's real-hardware matrix (D.2d): one window that asks the
-# OS to authenticate and logs what it answers. `test`: CI runs its unit tests, pure functions
-# that open no window and ask the OS nothing.
-[[example]]
-name = "os_auth_probe"
-test = true
-
 [features]
 # Walks and CI only: the scripted FakeAuthenticator in place of the OS (and, from later tasks,
 # the loopback provider override and a TEST BUILD banner). Never in a release; D.13 asserts it.
