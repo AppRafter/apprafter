@@ -451,6 +451,7 @@ fn renew(ctx: &Context, args: AddArgs, name: &str) -> miette::Result<()> {
         args.region.as_deref(),
         args.tier.as_deref(),
         args.cluster_name.as_deref(),
+        args.server_type.as_deref(),
     )
     .map_err(miette::Report::new)?;
     let token = args.token.ok_or_else(|| token_required(&provider))?;
@@ -480,18 +481,24 @@ fn renew(ctx: &Context, args: AddArgs, name: &str) -> miette::Result<()> {
 
 /// `--renew` rotates credentials and nothing else. Refusing the config flags
 /// up front beats silently dropping a value the operator clearly meant to
-/// change.
+/// change (R5: `--server-type` was dropped that way).
 pub(crate) fn reject_config_flags_on_renew(
     provider: Option<&str>,
     region: Option<&str>,
     tier: Option<&str>,
     cluster_name: Option<&str>,
+    server_type: Option<&str>,
 ) -> Result<()> {
-    if provider.is_some() || region.is_some() || tier.is_some() || cluster_name.is_some() {
+    if provider.is_some()
+        || region.is_some()
+        || tier.is_some()
+        || cluster_name.is_some()
+        || server_type.is_some()
+    {
         return Err(CliError::UsageRefused {
             message: "`--renew` only updates credentials — `--provider`, `--region`, `--tier`, \
-                      `--cluster-name` are not allowed alongside it. Drop `--renew` if you want \
-                      to change config too."
+                      `--cluster-name`, `--server-type` are not allowed alongside it. Drop \
+                      `--renew` if you want to change config too."
                 .to_string(),
             help: "`--renew` rotates the token (and `--ssh-key`). To change other fields, run \
                    `apprafter target add <name> --force --provider hetzner-cloud --token <X>` \
@@ -661,18 +668,22 @@ mod tests {
     /// guard exists to prevent.
     #[test]
     fn every_config_flag_is_refused_alongside_renew() {
-        assert!(reject_config_flags_on_renew(None, None, None, None).is_ok());
-        for (p, r, t, c) in [
-            (Some("hetzner-cloud"), None, None, None),
-            (None, Some("hel1"), None, None),
-            (None, None, Some("1"), None),
-            (None, None, None, Some("platform-2")),
+        assert!(reject_config_flags_on_renew(None, None, None, None, None).is_ok());
+        for (p, r, t, c, s) in [
+            (Some("hetzner-cloud"), None, None, None, None),
+            (None, Some("hel1"), None, None, None),
+            (None, None, Some("1"), None, None),
+            (None, None, None, Some("platform-2"), None),
+            // R5: `--server-type` was silently dropped.
+            (None, None, None, None, Some("cx32")),
         ] {
-            let err = reject_config_flags_on_renew(p, r, t, c)
+            let err = reject_config_flags_on_renew(p, r, t, c, s)
                 .expect_err("a config flag alongside --renew must be refused");
+            let msg = format!("{err}");
+            assert!(msg.contains("only updates credentials"), "{msg}");
             assert!(
-                format!("{err}").contains("only updates credentials"),
-                "{err}"
+                msg.contains("`--server-type`"),
+                "the refusal lists every refused flag: {msg}"
             );
         }
     }
@@ -731,7 +742,7 @@ mod tests {
             ),
             (
                 miette::Report::new(
-                    reject_config_flags_on_renew(Some("x"), None, None, None).unwrap_err(),
+                    reject_config_flags_on_renew(Some("x"), None, None, None, None).unwrap_err(),
                 ),
                 "apprafter::cli::usage_refused",
             ),
