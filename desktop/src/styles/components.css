@@ -1430,3 +1430,119 @@
 .radio-row-extra {
   padding: 0 12px 10px 42px;
 }
+
+/* DataTable ------------------------------------------------------------------------------- */
+
+/* The scroll box; a row the keyboard moves to scrolls in below the sticky header. */
+.data-table-scroll {
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--r-4);
+  scroll-padding-top: var(--h-30);
+}
+
+/* Separate borders, not collapsed: a collapsed border belongs to the table, so a sticky header
+   would scroll away from its own bottom line. */
+.data-table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  table-layout: fixed;
+  font: 400 var(--fs-12-5) var(--font-mono);
+}
+
+.data-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  height: var(--h-30);
+  padding: 0 4px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--fg-faint);
+  font: 500 var(--fs-10-5) var(--font-mono);
+  letter-spacing: 0.08em;
+  text-align: start;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.data-table td {
+  overflow: hidden;
+  padding: 7px 4px;
+  border-bottom: 1px solid var(--border);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The design's 12 px at the row's ends and 8 px between columns. */
+.data-table th:first-child,
+.data-table td:first-child {
+  padding-left: 12px;
+}
+
+.data-table th:last-child,
+.data-table td:last-child {
+  padding-right: 12px;
+}
+
+.data-table [data-align="end"] {
+  text-align: end;
+}
+
+/* The box's border closes the last row; `after` draws its own line. */
+.data-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.th-sort {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  letter-spacing: inherit;
+  text-transform: inherit;
+  cursor: pointer;
+}
+
+.th-sort:hover,
+.data-table th[aria-sort="ascending"] .th-sort,
+.data-table th[aria-sort="descending"] .th-sort {
+  color: var(--fg);
+}
+
+.data-table tbody tr:hover:not([data-disabled]):not([data-chosen]) {
+  background: var(--surface-2);
+}
+
+.data-table[data-choose] tbody tr:not([data-disabled]) {
+  cursor: pointer;
+}
+
+.data-table tbody tr[data-chosen] {
+  background: var(--accent-tint);
+}
+
+.data-table tbody tr[data-disabled] td {
+  opacity: 0.45;
+}
+
+/* The cell is dimmed already; its radio is not dimmed twice. */
+.data-table tbody tr[data-disabled] .radio-dot:disabled {
+  opacity: 1;
+}
+
+.data-table td.data-table-empty {
+  padding-top: 16px;
+  padding-bottom: 16px;
+  color: var(--fg-faint);
+  text-align: center;
+  white-space: normal;
+}
+
+.data-table-after {
+  padding: 6px 8px;
+  border-top: 1px solid var(--border);
+}
