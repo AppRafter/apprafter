@@ -7,10 +7,8 @@
 //! answers with the one [`AuthOutcome`](apprafter_desktop_ipc::AuthOutcome); [`outcome`] holds
 //! how each OS's result becomes one, as pure functions that compile and are tested on every OS.
 
-pub mod outcome;
-
-#[cfg(not(target_os = "linux"))]
 mod action;
+pub mod outcome;
 
 #[cfg(target_os = "linux")]
 pub mod linux;
@@ -18,10 +16,7 @@ pub mod linux;
 #[cfg(windows)]
 pub mod windows;
 
-#[cfg(not(target_os = "linux"))]
 pub use action::Action;
-#[cfg(target_os = "linux")]
-pub use linux::polkit::Action;
 
 #[cfg(target_os = "linux")]
 pub use linux::OsAuthenticator;

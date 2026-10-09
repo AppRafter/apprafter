@@ -46,14 +46,8 @@ use zbus_polkit::policykit1::{AuthorityProxyBlocking, CheckAuthorizationFlags, S
 
 use crate::outcome::{map_polkit, PolkitAnswer, PolkitError};
 
-/// The actions `dev.apprafter.desktop.policy` registers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Action {
-    /// Unlock the app.
-    Unlock,
-    /// Approve or run one destructive operation.
-    Confirm,
-}
+/// The crate's one [`Action`]: the two actions `dev.apprafter.desktop.policy` registers.
+pub use crate::Action;
 
 impl Action {
     /// The action id in the policy file.
