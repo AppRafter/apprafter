@@ -13,6 +13,10 @@ pub mod outcome;
 #[cfg(target_os = "linux")]
 pub mod linux;
 
+// Everywhere in tests: all but the framework's calls is tested on every OS, against a fake.
+#[cfg(any(target_os = "macos", test))]
+pub mod macos;
+
 #[cfg(windows)]
 pub mod windows;
 
@@ -20,6 +24,8 @@ pub use action::Action;
 
 #[cfg(target_os = "linux")]
 pub use linux::OsAuthenticator;
+#[cfg(target_os = "macos")]
+pub use macos::OsAuthenticator;
 // `self::`: a bare `windows` here would also name the `windows` crate.
 #[cfg(windows)]
 pub use self::windows::OsAuthenticator;

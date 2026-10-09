@@ -46,6 +46,23 @@ zeroize = "~1.9"
 
 # LocalAuthentication.
 [target.'cfg(target_os = "macos")'.dependencies]
+# LAContext's reply block.
+block2 = "0.6"
+# The objc2 already in this workspace's graph (tauri, tao, wry): the same minor, so the lock
+# keeps one objc2.
+objc2 = "0.6"
+# NSString for the reason, NSError for the reply: the version tao and wry already resolve.
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "NSError",
+    "NSString",
+] }
+objc2-local-authentication = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "block2",
+    "LAContext",
+    "LAError",
+] }
 
 # polkit, and PAM where polkit cannot prompt.
 [target.'cfg(target_os = "linux")'.dependencies]
