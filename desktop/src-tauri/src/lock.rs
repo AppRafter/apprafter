@@ -438,7 +438,7 @@ mod tests {
     use std::sync::mpsc::{self, RecvTimeoutError};
     use std::sync::{Arc, Mutex};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use apprafter_core::CancellationToken;
     use apprafter_desktop_ipc::{
@@ -1690,35 +1690,32 @@ mod tests {
         // An OS session lock and the owner's unlock land on two threads, here all within one
         // millisecond (the clock stands still): every state the hook is told of, and every
         // state read back, carries the number of the transition it follows, one more each time.
-        const ROUNDS: usize = 200;
+        // Each thread keeps at its own act until the two together made enough transitions, so
+        // the count does not depend on how the scheduler runs them.
+        const TRANSITIONS: usize = 100;
+        const READS_KEPT: usize = 1_000;
         let r = rig(unlocked_at_start(), fake());
-        let locking = {
-            let machine = r.machine.clone();
+        let spin = |act: fn(&LockMachine)| {
+            let (machine, hooked) = (r.machine.clone(), r.hooked.clone());
             thread::spawn(move || {
-                (0..ROUNDS)
-                    .map(|_| {
-                        machine.lock(LockReason::OsSession);
-                        machine.state()
-                    })
-                    .collect::<Vec<_>>()
+                let deadline = Instant::now() + LONG;
+                let mut read = Vec::new();
+                while hooked.calls().len() < TRANSITIONS && Instant::now() < deadline {
+                    act(&machine);
+                    if read.len() < READS_KEPT {
+                        read.push(machine.state());
+                    }
+                }
+                read
             })
         };
-        let unlocking = {
-            let machine = r.machine.clone();
-            thread::spawn(move || {
-                (0..ROUNDS)
-                    .map(|_| {
-                        // A lock that lands while the prompt is open closes it: AuthCancelled.
-                        let _ = machine.unlock();
-                        machine.state()
-                    })
-                    .collect::<Vec<_>>()
-            })
-        };
+        let locking = spin(|machine| machine.lock(LockReason::OsSession));
+        // A lock that lands while the prompt is open closes it: AuthCancelled.
+        let unlocking = spin(|machine| drop(machine.unlock()));
         let mut read = locking.join().unwrap();
         read.extend(unlocking.join().unwrap());
         let hooked = r.hooked.calls();
-        assert!(hooked.len() > 1, "{hooked:?}");
+        assert!(hooked.len() >= TRANSITIONS, "{} transitions", hooked.len());
         for (i, state) in hooked.iter().enumerate() {
             assert_eq!(state.seq, i as u64 + 1, "{hooked:?}");
             assert_eq!(state.locked, i % 2 == 0, "locks and unlocks alternate");
