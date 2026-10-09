@@ -5,7 +5,9 @@
 // itself, so Unlock unlocks without asking anyone and the password field is refused
 // (`not_permitted_here`); with `?auth=pam` (Linux's PAM route) the field is the way — it unlocks
 // with MOCK_PASSWORD and refuses anything else as PAM would, saying MOCK_PAM_SAYS — and Unlock
-// finds no polkit agent (`no_agent`).
+// finds no polkit agent (`no_agent`). What the session tells the app (`?session=`): by default
+// both its locks and its sleeps, as a desktop session does; or one half, or nothing at all (no
+// bus, as in WSL or a container), for the settings' lock-on-sleep row.
 import type { InvokeArgs } from '@tauri-apps/api/core';
 import { emit } from '@tauri-apps/api/event';
 import { mockIPC, mockWindows } from '@tauri-apps/api/mocks';
@@ -17,6 +19,7 @@ import { LOCK_CHANGED } from '../generated/events';
 import type { LockReason } from '../generated/LockReason';
 import type { LockState } from '../generated/LockState';
 import type { Os } from '../generated/Os';
+import type { SessionEvents } from '../generated/SessionEvents';
 import type { Settings } from '../generated/Settings';
 import type { Theme } from '../generated/Theme';
 import type { UiError } from '../generated/UiError';
@@ -32,18 +35,33 @@ export const MOCK_PAM_SAYS = 'Authentication failure';
 /** How the mock OS verifies the owner: its own prompt, or Linux's PAM route (the app's field). */
 export type MockAuth = 'os' | 'pam';
 
+/** Which of the session's signals reach the app: both, one of them, or none. */
+export type MockSession = 'both' | 'lock' | 'sleep' | 'none';
+
 export interface MockOptions {
   readonly os?: Os;
   readonly theme?: Theme;
   /** `pam`: Linux's PAM route, whatever `os` says. */
   readonly auth?: MockAuth;
+  readonly session?: MockSession;
 }
 
 const OSES: readonly Os[] = ['windows', 'macos', 'linux'];
 const THEMES: readonly Theme[] = ['system', 'light', 'dark'];
 const AUTHS: readonly MockAuth[] = ['os', 'pam'];
+const SESSIONS: readonly MockSession[] = ['both', 'lock', 'sleep', 'none'];
 
-/** `?os=windows|macos|linux&theme=system|light|dark&auth=os|pam`; an unknown value throws. */
+const SESSION_EVENTS: Record<MockSession, SessionEvents> = {
+  both: { lock: true, sleep: true },
+  lock: { lock: true, sleep: false },
+  sleep: { lock: false, sleep: true },
+  none: { lock: false, sleep: false },
+};
+
+/**
+ * `?os=windows|macos|linux&theme=system|light|dark&auth=os|pam&session=both|lock|sleep|none`;
+ * an unknown value throws.
+ */
 export function mockOptionsFromUrl(search: string): MockOptions {
   const params = new URLSearchParams(search);
   const pick = <T extends string>(name: string, allowed: readonly T[]): T | undefined => {
@@ -57,7 +75,13 @@ export function mockOptionsFromUrl(search: string): MockOptions {
   const os = pick('os', OSES);
   const theme = pick('theme', THEMES);
   const auth = pick('auth', AUTHS);
-  return { ...(os && { os }), ...(theme && { theme }), ...(auth && { auth }) };
+  const session = pick('session', SESSIONS);
+  return {
+    ...(os && { os }),
+    ...(theme && { theme }),
+    ...(auth && { auth }),
+    ...(session && { session }),
+  };
 }
 
 // Rust's Settings::default().
@@ -159,8 +183,7 @@ export function installMockIpc(options: MockOptions = {}): void {
     account: 'alex',
     host: 'workstation',
     auth,
-    // A desktop session: the OS reports both its locks and its sleeps.
-    sessionEvents: { lock: true, sleep: true },
+    sessionEvents: SESSION_EVENTS[options.session ?? 'both'],
     testBuild: false,
     settingsNotice: null,
   });

@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 // Settings (spec §4.6, brief §3), with the rows D.2 has something behind: the theme; the lock
 // and what depends on it; the versions and links. Live data, notifications and the tray come
-// with D.5, and "lock when the computer sleeps" with D.2d's session sources (AppInfo does not
-// say yet whether they exist), so those rows are not shown. With the lock off, the rows below
-// it are disabled, not only dimmed. With no system authentication the lock shows as it is in
-// effect, off with its switch disabled whatever settings.json says: Rust locks only with both,
-// and refuses switching it on.
+// with D.5, so those rows are not shown. With the lock off, the rows below it are disabled, not
+// only dimmed. With no system authentication the lock shows as it is in effect, off with its
+// switch disabled whatever settings.json says: Rust locks only with both, and refuses switching
+// it on. "Lock when the computer sleeps or locks" follows what the OS tells the app
+// (AppInfo.sessionEvents): disabled, saying why, when it tells neither; a note naming the half
+// that is missing when it tells one. Opening Settings reads app_info again, so a session watch
+// that answered late counts.
 import { useQueryClient } from '@tanstack/react-query';
 import { useEffect } from 'react';
 import { Button } from '../components/Button';
@@ -26,6 +28,7 @@ import { SettingRow } from '../components/SettingRow';
 import { Switch } from '../components/Switch';
 import { uiErrorOf } from '../ipc/api';
 import type { AutoLock } from '../ipc/generated/AutoLock';
+import type { SessionEvents } from '../ipc/generated/SessionEvents';
 import type { Settings } from '../ipc/generated/Settings';
 import type { Theme } from '../ipc/generated/Theme';
 import { authPrompt } from '../state/auth';
@@ -47,6 +50,14 @@ const AUTO_LOCK = [
   { value: '30', label: '30 min' },
   { value: 'never', label: 'Never' },
 ] as const satisfies readonly SegmentOption<AutoLock>[];
+
+/** The lock-on-sleep row's note: what the OS tells the app of its session, and what it does not. */
+function sessionNote({ lock, sleep }: SessionEvents): string {
+  if (lock && sleep) return 'When the screen locks or the computer goes to sleep.';
+  if (lock) return 'AppRafter is told when the screen locks, not when the computer sleeps.';
+  if (sleep) return 'AppRafter is told when the computer sleeps, not when the screen locks.';
+  return 'This computer does not tell AppRafter when it locks or sleeps.';
+}
 
 export function SettingsDialog({ onClose }: { onClose: () => void }) {
   const settings = useSettings();
@@ -71,6 +82,7 @@ function SettingsBody({ settings }: { settings: Settings }) {
   const { lock } = useLockActions();
   const noAuth = !info.auth.available;
   const off = lockOff(info.auth.available, settings.lockEnabled) !== null;
+  const untold = !info.sessionEvents.lock && !info.sessionEvents.sleep;
   const method = info.auth.method;
 
   return (
@@ -128,6 +140,19 @@ function SettingsBody({ settings }: { settings: Settings }) {
             checked={settings.lockOnStart}
             disabled={off}
             onChange={(lockOnStart) => save({ lockOnStart })}
+          />
+        }
+      />
+      <SettingRow
+        label="Lock when the computer sleeps or locks"
+        sub={sessionNote(info.sessionEvents)}
+        disabled={off || untold}
+        control={
+          <Switch
+            label="Lock when the computer sleeps or locks"
+            checked={settings.lockOnSleep}
+            disabled={off || untold}
+            onChange={(lockOnSleep) => save({ lockOnSleep })}
           />
         }
       />

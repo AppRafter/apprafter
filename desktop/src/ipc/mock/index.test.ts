@@ -159,6 +159,20 @@ describe('installMockIpc', () => {
     expect((await api.settingsGet()).theme).toBe('light');
   });
 
+  test('what the session tells comes from the options: both, one half, or nothing', async () => {
+    const cases = [
+      ['both', { lock: true, sleep: true }],
+      ['lock', { lock: true, sleep: false }],
+      ['sleep', { lock: false, sleep: true }],
+      ['none', { lock: false, sleep: false }],
+    ] as const;
+    for (const [session, events] of cases) {
+      installMockIpc({ session });
+      expect((await api.appInfo()).sessionEvents, session).toEqual(events);
+      clearMocks();
+    }
+  });
+
   test('an unknown command is refused as Tauri refuses it, not answered', async () => {
     installMockIpc();
     const { invoke } = await import('@tauri-apps/api/core');
@@ -167,9 +181,10 @@ describe('installMockIpc', () => {
 });
 
 describe('mockOptionsFromUrl', () => {
-  test('reads os, theme and auth', () => {
+  test('reads os, theme, auth and session', () => {
     expect(mockOptionsFromUrl('?os=macos&theme=system')).toEqual({ os: 'macos', theme: 'system' });
     expect(mockOptionsFromUrl('?auth=pam')).toEqual({ auth: 'pam' });
+    expect(mockOptionsFromUrl('?session=none')).toEqual({ session: 'none' });
     expect(mockOptionsFromUrl('')).toEqual({});
   });
 
@@ -177,5 +192,6 @@ describe('mockOptionsFromUrl', () => {
     expect(() => mockOptionsFromUrl('?os=beos')).toThrow('os');
     expect(() => mockOptionsFromUrl('?theme=sepia')).toThrow('theme');
     expect(() => mockOptionsFromUrl('?auth=fingerprint')).toThrow('auth');
+    expect(() => mockOptionsFromUrl('?session=hibernate')).toThrow('session');
   });
 });

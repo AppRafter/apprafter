@@ -21,8 +21,9 @@ interface HeldSave {
 }
 
 let calls: { cmd: string; args: Record<string, unknown> }[];
-/** What app_info answers, for the tests that render the PlatformGate. */
+/** What app_info answers, for the tests that render the PlatformGate; `later` from the second. */
 let info: AppInfo;
+let later: AppInfo | null;
 let stored: Settings;
 let refuse: string | null;
 /** Saves wait in `held` until answerHeld(); off, each is answered at once. */
@@ -69,13 +70,14 @@ async function answerHeld() {
 beforeEach(() => {
   calls = [];
   info = appInfo();
+  later = null;
   stored = settings();
   refuse = null;
   holding = false;
   held = [];
   mockIPC((cmd, args) => {
     calls.push({ cmd, args: args as Record<string, unknown> });
-    if (cmd === 'app_info') return info;
+    if (cmd === 'app_info') return reads() > 1 && later !== null ? later : info;
     if (cmd === 'settings_get') return stored;
     if (cmd === 'settings_set' && holding) {
       const request = (args as { settings: Settings }).settings;
@@ -137,6 +139,10 @@ async function openInGate() {
 
 const reads = () => calls.filter((c) => c.cmd === 'app_info').length;
 
+const SLEEP_ROW = 'Lock when the computer sleeps or locks';
+const sleepSwitch = () => screen.getByRole('switch', { name: SLEEP_ROW }) as HTMLButtonElement;
+const sleepRow = () => sleepSwitch().closest('.row') as HTMLElement;
+
 const saved = () =>
   calls.filter((c) => c.cmd === 'settings_set').map((c) => c.args.settings as Settings);
 const lastSaved = () => saved().at(-1);
@@ -148,6 +154,8 @@ describe('SettingsDialog', () => {
     expect(lastSaved()?.theme).toBe('light');
     await user.click(screen.getByRole('switch', { name: 'Lock when the app starts' }));
     expect(lastSaved()?.lockOnStart).toBe(false);
+    await user.click(screen.getByRole('switch', { name: SLEEP_ROW }));
+    expect(lastSaved()?.lockOnSleep).toBe(false);
     await user.click(screen.getByRole('switch', { name: 'Prefer biometrics' }));
     expect(lastSaved()?.hello).toBe(false);
     await user.click(screen.getByRole('radio', { name: '30 min' }));
@@ -159,6 +167,7 @@ describe('SettingsDialog', () => {
       settings({
         theme: 'light',
         lockOnStart: false,
+        lockOnSleep: false,
         hello: false,
         autoLock: '30',
         lockEnabled: false,
@@ -173,6 +182,7 @@ describe('SettingsDialog', () => {
       (screen.getByRole('switch', { name: 'Lock when the app starts' }) as HTMLButtonElement)
         .disabled,
     ).toBe(true);
+    expect(sleepSwitch().disabled).toBe(true);
     for (const radio of within(
       screen.getByRole('radiogroup', { name: 'Auto-lock after inactivity' }),
     ).getAllByRole('radio')) {
@@ -187,9 +197,66 @@ describe('SettingsDialog', () => {
   test('rows with nothing behind them yet stay hidden', async () => {
     await open();
     expect(screen.queryByRole('switch', { name: 'Prefer biometrics' })).toBeNull();
-    for (const name of [/sleep/i, /Refresh/, /Pause/, /Notify/, /tray/i]) {
+    for (const name of [/Refresh/, /Pause/, /Notify/, /tray/i]) {
       expect(screen.queryByText(name)).toBeNull();
     }
+  });
+
+  test('locking with the computer: on while the computer tells both its locks and sleeps', async () => {
+    await open();
+    expect(sleepSwitch().disabled).toBe(false);
+    expect(sleepSwitch().getAttribute('aria-checked')).toBe('true');
+    expect(sleepRow().textContent).toContain(
+      'When the screen locks or the computer goes to sleep.',
+    );
+    expect(sleepRow().dataset.disabled).toBeUndefined();
+  });
+
+  test('…disabled, saying why, when the computer tells neither', async () => {
+    await open(appInfo({ sessionEvents: { lock: false, sleep: false } }));
+    expect(sleepSwitch().disabled).toBe(true);
+    expect(sleepRow().dataset.disabled).toBe('true');
+    expect(sleepRow().textContent).toContain(
+      'This computer does not tell AppRafter when it locks or sleeps.',
+    );
+  });
+
+  test.each([
+    [
+      { lock: true, sleep: false },
+      'AppRafter is told when the screen locks, not when the computer sleeps.',
+    ],
+    [
+      { lock: false, sleep: true },
+      'AppRafter is told when the computer sleeps, not when the screen locks.',
+    ],
+  ])(
+    '…on, naming what is missing, when only one half is told (%o)',
+    async (sessionEvents, note) => {
+      await open(appInfo({ sessionEvents }));
+      expect(sleepSwitch().disabled).toBe(false);
+      expect(sleepRow().textContent).toContain(note);
+    },
+  );
+
+  test('…and off with the lock, whatever the computer tells: the A1 rule', async () => {
+    stored = settings({ lockEnabled: false });
+    await open(appInfo({ sessionEvents: { lock: true, sleep: false } }));
+    expect(sleepSwitch().disabled).toBe(true);
+    cleanup();
+    await open(
+      appInfo({ auth: authInfo({ available: false, method: null, unavailable: 'no_backend' }) }),
+    );
+    expect(sleepSwitch().disabled).toBe(true);
+  });
+
+  test('a session watch that answered late: the row follows the read Settings makes', async () => {
+    // The first read is the gate's, at start; the watch has said nothing yet.
+    info = appInfo({ sessionEvents: { lock: false, sleep: false } });
+    later = appInfo({ sessionEvents: { lock: true, sleep: true } });
+    await openInGate();
+    await waitFor(() => expect(sleepSwitch().disabled).toBe(false));
+    expect(reads()).toBe(2);
   });
 
   test('the banner shows exactly when no system authentication is available', async () => {
