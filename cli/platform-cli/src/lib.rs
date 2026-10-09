@@ -13,8 +13,10 @@
 
 pub(crate) mod cli;
 pub(crate) mod commands;
+mod context;
 mod dispatch;
 pub(crate) mod examples;
+mod render;
 mod startup;
 
 use clap::{CommandFactory, FromArgMatches};
@@ -108,5 +110,5 @@ pub fn run() -> Result<()> {
     // command that goes beyond this machine itself (`startup`).
     startup::run_startup_checks(&args.command);
 
-    dispatch(args).map_err(miette::Report::new)
+    dispatch(args)
 }

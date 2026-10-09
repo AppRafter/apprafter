@@ -1,8 +1,12 @@
 $ apprafter target ip
-[exit 0]
+[exit 1]
 [stdout]
-  (no IPv4 reported by Hetzner)
-
-Set these as your domain's DNS records (proxied through Cloudflare), then:
-  apprafter target domain add <zone> --cert <name>
 [stderr]
+Error: apprafter::target::server_missing
+
+  × the server recorded for `prod` (id 42) no longer exists at the provider
+  help: The server was deleted outside AppRafter, or the token belongs to
+        another Hetzner project. Check the Hetzner Cloud Console; `apprafter
+        import --force` rebuilds the local state from the servers labelled
+        `apprafter=true`.
+

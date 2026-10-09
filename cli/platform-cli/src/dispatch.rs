@@ -12,14 +12,23 @@ use crate::cli::{
 };
 use crate::commands;
 
-/// Pure dispatch over the parsed CLI. Returns `cli_core::Result`
-/// so the typed `CliError -> miette::Report` conversion happens
-/// exactly once at the crate's entry point ([`crate::run`]) and the
-/// inner code keeps using the original `?` ergonomics over
-/// `cli_core::Result<T>`.
-pub(crate) fn dispatch(args: Cli) -> cli_core::Result<()> {
+/// Commands on `apprafter-core` convert their own errors at the arm boundary
+/// (`crate::render::core_error::report`); every other command goes through [`dispatch_cli`],
+/// mapped once. D.3b adds `Whoami`, D.3c `Doctor`.
+pub(crate) fn dispatch(args: Cli) -> miette::Result<()> {
     match args.command {
-        Commands::Target { action } => commands::target::run(action)?,
+        Commands::Target { action } => commands::target::run(action),
+        command => dispatch_cli(Cli { command }).map_err(miette::Report::new),
+    }
+}
+
+/// The commands not on the core yet: pure dispatch over the parsed CLI, returning
+/// `cli_core::Result` so the inner code keeps the original `?` ergonomics over
+/// `cli_core::Result<T>` and the typed `CliError -> miette::Report` conversion happens once,
+/// in [`dispatch`].
+fn dispatch_cli(args: Cli) -> cli_core::Result<()> {
+    match args.command {
+        Commands::Target { .. } => unreachable!("`dispatch` runs `target` on the core"),
         Commands::Whoami { no_ping } => commands::whoami::run(no_ping)?,
         Commands::Auth { action } => commands::auth::run(action)?,
         Commands::Doctor { target, no_ping } => commands::doctor::run(target.as_deref(), no_ping)?,

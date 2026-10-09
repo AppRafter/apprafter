@@ -1438,7 +1438,7 @@ fn target_machine_with_the_token_from_the_environment() {
 #[test]
 fn target_ip_with_a_server() {
     let mut server = mockito::Server::new();
-    let _list = json_mock(&mut server, "/v1/servers", 200, SERVERS_WITH_42, TOKEN_A);
+    let _server = json_mock(&mut server, "/v1/servers/42", 200, SERVER_42_BODY, TOKEN_A);
     let sb = Sandbox::new().with_hcloud(server.url());
     sb.add_target("prod");
     sb.seed_state("prod", PROVISIONED_STATE);
@@ -1448,7 +1448,13 @@ fn target_ip_with_a_server() {
 #[test]
 fn target_ip_with_the_server_absent() {
     let mut server = mockito::Server::new();
-    let _list = json_mock(&mut server, "/v1/servers", 200, SERVERS_EMPTY, TOKEN_A);
+    let _server = json_mock(
+        &mut server,
+        "/v1/servers/42",
+        404,
+        SERVER_NOT_FOUND,
+        TOKEN_A,
+    );
     let sb = Sandbox::new().with_hcloud(server.url());
     sb.add_target("prod");
     sb.seed_state("prod", PROVISIONED_STATE);

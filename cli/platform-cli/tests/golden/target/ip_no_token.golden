@@ -2,13 +2,9 @@ $ apprafter target ip
 [exit 1]
 [stdout]
 [stderr]
-Error: apprafter::cli::other
+Error: apprafter::target::token_missing
 
-  × target `prod` has no Hetzner Cloud token stored. Run `apprafter target add
-  │ prod --renew --token <X>` to add one, or pass `--token`/`HCLOUD_TOKEN` for
-  │ this invocation.
-  help: This is the catch-all CLI error. The message above is the only
-        context. If you see this often with the same wording, please file an
-        issue — recurring messages should be promoted to a typed `CliError`
-        variant with its own help text.
+  × target `prod` has no provider token stored
+  help: Run `apprafter target add prod --renew --token <X>` to store one, or
+        set `HCLOUD_TOKEN` for this invocation.
 

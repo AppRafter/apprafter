@@ -17,6 +17,7 @@
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
+use apprafter_core::{CancellationToken, CoreError, TargetRef};
 use cli_core::target::{
     default_config_root, list_target_names, load_global_config, load_target, remove_target,
     rename_target, save_global_config, save_target, validate_hetzner_token_format, GlobalConfig,
@@ -25,7 +26,6 @@ use cli_core::target::{
 use cli_core::{CliError, Result};
 use cli_providers::hetzner_cloud::validate_server_type;
 use cli_providers::{HetznerCloudClient, HetznerCloudValidator, ProviderValidator};
-use cli_state::State;
 use tabled::{settings::Style, Table, Tabled};
 use tracing::info;
 
@@ -39,6 +39,7 @@ use cli_providers::cert::{
 
 use crate::commands::hcloud::hcloud_base_url;
 use crate::commands::state_paths::resolve_state_paths;
+use crate::render::core_error::report;
 
 /// Maximum length for a target name. Matches the spec
 /// (`cli-dx-task.md` §5.1 validation rules). A short cap keeps
@@ -51,7 +52,10 @@ pub const MAX_TARGET_NAME_LEN: usize = 64;
 /// instead of saving a half-working config.
 pub const SUPPORTED_PROVIDERS: &[&str] = &["hetzner-cloud"];
 
-pub fn run(action: TargetCommand) -> Result<()> {
+/// `apprafter target …`. `ip` runs on apprafter-core and renders its own errors
+/// ([`crate::render::core_error::report`]); every other sub-command is today's code, its
+/// `CliError` mapped at this boundary.
+pub fn run(action: TargetCommand) -> miette::Result<()> {
     match action {
         TargetCommand::Add {
             name,
@@ -79,15 +83,20 @@ pub fn run(action: TargetCommand) -> Result<()> {
             no_interactive,
             no_ping,
             server_type,
-        }),
-        TargetCommand::List => run_list(),
-        TargetCommand::Use { name } => run_use(&name),
-        TargetCommand::Show { name } => run_show(name.as_deref()),
-        TargetCommand::Rename { from, to } => run_rename(&from, &to),
-        TargetCommand::Remove { name, yes } => run_remove(&name, yes),
-        TargetCommand::Cert { action } => run_cert(action),
-        TargetCommand::Domain { action } => crate::commands::target_domain::run(action),
-        TargetCommand::Firewall { action } => crate::commands::target_firewall::run(action),
+        })
+        .map_err(miette::Report::new),
+        TargetCommand::List => run_list().map_err(miette::Report::new),
+        TargetCommand::Use { name } => run_use(&name).map_err(miette::Report::new),
+        TargetCommand::Show { name } => run_show(name.as_deref()).map_err(miette::Report::new),
+        TargetCommand::Rename { from, to } => run_rename(&from, &to).map_err(miette::Report::new),
+        TargetCommand::Remove { name, yes } => run_remove(&name, yes).map_err(miette::Report::new),
+        TargetCommand::Cert { action } => run_cert(action).map_err(miette::Report::new),
+        TargetCommand::Domain { action } => {
+            crate::commands::target_domain::run(action).map_err(miette::Report::new)
+        }
+        TargetCommand::Firewall { action } => {
+            crate::commands::target_firewall::run(action).map_err(miette::Report::new)
+        }
         TargetCommand::Ip => run_ip(),
         TargetCommand::Machine {
             target,
@@ -99,7 +108,8 @@ pub fn run(action: TargetCommand) -> Result<()> {
                 server_type,
                 no_ping,
             },
-        ),
+        )
+        .map_err(miette::Report::new),
     }
 }
 
@@ -1430,21 +1440,23 @@ struct TargetListRow {
     tier: String,
 }
 
-fn run_ip() -> Result<()> {
-    let resolved = resolve_state_paths(None)?;
-    let store = resolved.store;
-    let state = State::load_or_default(&resolved.paths)?;
-
-    let Some(server_id) = state.hetzner_cloud.as_ref().map(|h| h.server_id) else {
-        println!("{NO_PROVISIONED_SERVER_HINT}");
-        return Ok(());
-    };
-
-    let token = cli_core::resolve_hetzner_token(None, &store, None)?;
-    let client = HetznerCloudClient::new(hcloud_base_url(), token);
-    let (v4, v6) = cli_providers::node_public_ips(&client, server_id)?;
-
-    for line in ip_report_lines(v4.as_deref(), v6.as_deref()) {
+/// `target ip` on apprafter-core (D.3a): the active target's server, read by id.
+fn run_ip() -> miette::Result<()> {
+    // The legacy `<cwd>/.apprafter/state.json` migration stays CLI-only (spec §3.1); it runs
+    // before the core reads state, and it answers "no active target" exactly as before.
+    resolve_state_paths(None).map_err(miette::Report::new)?;
+    let ctx = crate::context::cli_context()?;
+    let target = TargetRef::active(&ctx).map_err(report)?;
+    let address =
+        match apprafter_core::target::public_address(&ctx, &target, &CancellationToken::new()) {
+            // Kept byte-identical by this move; Task 17 (bug 4) deletes this arm.
+            Err(CoreError::NotProvisioned { .. }) => {
+                println!("{NO_PROVISIONED_SERVER_HINT}");
+                return Ok(());
+            }
+            other => other.map_err(report)?,
+        };
+    for line in ip_report_lines(address.ipv4.as_deref(), address.ipv6.as_deref()) {
         println!("{line}");
     }
     Ok(())

@@ -241,6 +241,7 @@ name = "apprafter"
 version = "0.2.80"
 dependencies = [
  "age",
+ "apprafter-core",
  "arboard",
  "assert_cmd",
  "backup-core",

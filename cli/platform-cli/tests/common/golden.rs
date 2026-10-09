@@ -587,9 +587,9 @@ pub const SERVER_TYPES: &str = r#"{"server_types":[
 /// `state.json` of a target whose server Hetzner knows as 42.
 pub const PROVISIONED_STATE: &str =
     r#"{"hetzner_cloud":{"server_id":42,"server_name":"prod-node","server_type":"cx22"}}"#;
-/// `GET /v1/servers` today's `target ip` reads (the list; Task 16 moves to `/v1/servers/42`).
-pub const SERVERS_WITH_42: &str = r#"{"servers":[{"id":42,"name":"prod-node","status":"running","labels":{},"public_net":{"ipv4":{"ip":"203.0.113.10"},"ipv6":{"ip":"2001:db8:1::/64"}}}]}"#;
-pub const SERVERS_EMPTY: &str = r#"{"servers":[]}"#;
+/// `GET /v1/servers/42`, the read `target ip` makes: the server `PROVISIONED_STATE` records.
+pub const SERVER_42_BODY: &str = r#"{"server":{"id":42,"name":"prod-node","status":"running","labels":{},"public_net":{"ipv4":{"ip":"203.0.113.10"},"ipv6":{"ip":"2001:db8:1::/64"}}}}"#;
+/// Hetzner's 404 for a server id it does not know.
 pub const SERVER_NOT_FOUND: &str =
     r#"{"error":{"code":"not_found","message":"server with ID '42' not found"}}"#;
 
