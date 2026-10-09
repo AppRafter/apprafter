@@ -642,6 +642,7 @@ fn target_machine_no_ping_records_unvalidated() {
     );
 }
 
+/// bug 4: exit 1 with `apprafter::target::not_provisioned`, nothing on stdout.
 #[test]
 fn target_ip_without_server() {
     let sb = Sandbox::new();

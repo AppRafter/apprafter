@@ -17,7 +17,7 @@
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
-use apprafter_core::{CancellationToken, CoreError, TargetRef};
+use apprafter_core::{CancellationToken, TargetRef};
 use cli_core::target::{
     default_config_root, list_target_names, load_global_config, load_target, remove_target,
     rename_target, save_global_config, save_target, validate_hetzner_token_format, GlobalConfig,
@@ -1447,24 +1447,13 @@ fn run_ip() -> miette::Result<()> {
     resolve_state_paths(None).map_err(miette::Report::new)?;
     let ctx = crate::context::cli_context()?;
     let target = TargetRef::active(&ctx).map_err(report)?;
-    let address =
-        match apprafter_core::target::public_address(&ctx, &target, &CancellationToken::new()) {
-            // Kept byte-identical by this move; Task 17 (bug 4) deletes this arm.
-            Err(CoreError::NotProvisioned { .. }) => {
-                println!("{NO_PROVISIONED_SERVER_HINT}");
-                return Ok(());
-            }
-            other => other.map_err(report)?,
-        };
+    let address = apprafter_core::target::public_address(&ctx, &target, &CancellationToken::new())
+        .map_err(report)?;
     for line in ip_report_lines(address.ipv4.as_deref(), address.ipv6.as_deref()) {
         println!("{line}");
     }
     Ok(())
 }
-
-/// Shown by `target ip` when the active target has never provisioned.
-const NO_PROVISIONED_SERVER_HINT: &str =
-    "No provisioned server for the active target — run `apprafter up` first.";
 
 /// Render the DNS records for `target ip`.
 ///
