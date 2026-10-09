@@ -1,33 +1,29 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 // Layout variant A (brief §2, §4.3): the title bar with the tabs, then one view per tab and the
 // Targets view. Each view sits in an <Activity>: a hidden tab keeps its screen state (section,
-// scroll, open dialogs), its effects stop, and its overlays hide with it. The shortcuts listen
-// on the window.
-import { Activity, useCallback, useEffect, useMemo, useReducer } from 'react';
+// scroll, open dialogs), its effects stop, and its overlays hide with it. Settings is the app's
+// own overlay, over every view. The shortcuts listen on the window.
+import { Activity, useCallback, useEffect, useMemo, useReducer, useState } from 'react';
 import { ToastViewport } from '../components/Toast';
-import { lockNow } from '../ipc/api';
 import { refreshList, useOperations } from '../ipc/operations';
 import { PlannedSection } from '../screens/placeholders/PlannedSection';
 import { TargetsPage } from '../screens/targets/TargetsPage';
+import { useLockActions } from '../state/lock';
 import { usePlatform } from '../state/platform';
 import { INITIAL_SESSION, sessionReducer, type TargetTab } from '../state/session';
 import { shortcutFor } from '../state/shortcuts';
 import { TabContext } from '../state/tab';
+import { SettingsDialog } from './SettingsDialog';
 import { Sidebar } from './Sidebar';
 import { TabStrip } from './TabStrip';
 import { TitleBar } from './TitleBar';
 import { ViewFrame } from './ViewFrame';
 
-export interface ShellProps {
-  /** Opens Settings (its dialog is the caller's); without it, no Settings entry or shortcut. */
-  onSettings?: () => void;
-}
-
 const report = (what: string) => (error: unknown) => {
   console.error(`${what} failed:`, error);
 };
 
-export function Shell({ onSettings }: ShellProps) {
+export function Shell() {
   const info = usePlatform();
   const { os } = info;
   const [session, dispatch] = useReducer(sessionReducer, INITIAL_SESSION);
@@ -42,10 +38,13 @@ export function Shell({ onSettings }: ShellProps) {
     [operations],
   );
 
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const { lock: lockNow } = useLockActions();
   const showTargets = useCallback(() => dispatch({ type: 'show', view: { kind: 'targets' } }), []);
+  const openSettings = useCallback(() => setSettingsOpen(true), []);
   const lock = useCallback(() => {
     lockNow().catch(report('lock_now'));
-  }, []);
+  }, [lockNow]);
 
   useEffect(() => {
     refreshList().catch(report('op_list'));
@@ -54,15 +53,15 @@ export function Shell({ onSettings }: ShellProps) {
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       const action = shortcutFor(event, os);
-      if (action === null || (action === 'settings' && onSettings === undefined)) return;
+      if (action === null) return;
       event.preventDefault();
       if (action === 'targets') showTargets();
-      else if (action === 'settings') onSettings?.();
+      else if (action === 'settings') openSettings();
       else lock();
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [os, onSettings, showTargets, lock]);
+  }, [os, showTargets, openSettings, lock]);
 
   const sidebar = (tab: TargetTab | null) => (
     <Sidebar
@@ -74,7 +73,7 @@ export function Shell({ onSettings }: ShellProps) {
       }}
       onShowTargets={showTargets}
       onLock={lock}
-      {...(onSettings !== undefined && { onSettings })}
+      onSettings={openSettings}
     />
   );
 
@@ -119,6 +118,7 @@ export function Shell({ onSettings }: ShellProps) {
             </main>
           </ViewFrame>
         </Activity>
+        {settingsOpen && <SettingsDialog onClose={() => setSettingsOpen(false)} />}
         <ToastViewport />
       </div>
     </div>

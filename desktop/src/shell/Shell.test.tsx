@@ -12,6 +12,7 @@ import { refreshList, resetOperations } from '../ipc/operations';
 import { TargetsSource } from '../screens/targets/targets';
 import { PlatformContext } from '../state/platform';
 import { createQueryClient } from '../state/queryClient';
+import { lockState, settings } from '../test/fixtures';
 import { Shell } from './Shell';
 
 const INFO: AppInfo = {
@@ -43,6 +44,8 @@ beforeEach(() => {
     (cmd) => {
       calls.push(cmd);
       if (cmd === 'op_list') return summaries;
+      if (cmd === 'settings_get') return settings();
+      if (cmd === 'lock_now') return lockState({ reason: 'manual' });
       if (cmd === 'plugin:window|is_maximized') return false;
       return null;
     },
@@ -76,6 +79,17 @@ const tab = (name: string | RegExp) => screen.getByRole('tab', { name });
 const pageTitle = () => screen.getByRole('heading', { level: 1 }).textContent;
 
 describe('Shell', () => {
+  test('Settings opens from the sidebar footer and with Ctrl+,', async () => {
+    const user = shell();
+    await user.click(screen.getByRole('button', { name: 'Settings Ctrl+,' }));
+    expect(await screen.findByRole('dialog', { name: 'Settings' })).toBeDefined();
+    await user.keyboard('{Escape}');
+    expect(screen.queryByRole('dialog', { name: 'Settings' })).toBeNull();
+    // By physical key: user-event's default key map has no "," (the shortcut matches `code`).
+    await user.keyboard('{Control>}[Comma]{/Control}');
+    expect(await screen.findByRole('dialog', { name: 'Settings' })).toBeDefined();
+  });
+
   test('starts on the Targets view; a card opens its target in a tab on Overview', async () => {
     const user = shell();
     expect(screen.getByRole('heading', { name: 'Open a cluster' })).toBeDefined();

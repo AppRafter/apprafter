@@ -6,9 +6,9 @@
 import { type ReactNode, useId, useState } from 'react';
 import { uiErrorOf } from '../ipc/api';
 import type { AuthInfo } from '../ipc/generated/AuthInfo';
-import type { AuthMethod } from '../ipc/generated/AuthMethod';
 import type { PlanClass } from '../ipc/generated/PlanClass';
 import type { UiError } from '../ipc/generated/UiError';
+import { authPrompt } from '../state/auth';
 import { Button } from './Button';
 import { ErrorPanel } from './ErrorPanel';
 import { type Icon, QuestionIcon } from './icons';
@@ -18,15 +18,6 @@ import { ModalFrame } from './Modal';
 export function needsDialog(planClass: PlanClass): planClass is 'bounded' | 'destructive' {
   return planClass !== 'reversible';
 }
-
-const PROMPTS: Record<AuthMethod, string> = {
-  windows_hello: 'Windows Hello',
-  windows_credential: 'your Windows password',
-  mac_local_authentication: 'Touch ID or your Mac password',
-  polkit: 'your account password',
-  pam: 'your account password',
-  fake: 'the test build prompt',
-};
 
 export interface ConfirmDialogProps {
   title: string;
@@ -129,7 +120,7 @@ export function ConfirmDialog({
         {error !== null && <ErrorPanel error={error} />}
         <div className="alert-foot">
           {osGesture && method !== null && (
-            <span className="confirm-gesture">{`Confirm with ${PROMPTS[method]} next.`}</span>
+            <span className="confirm-gesture">{`Confirm with ${authPrompt(method)} next.`}</span>
           )}
           <Button size={32} onClick={onClose} disabled={busy}>
             Cancel

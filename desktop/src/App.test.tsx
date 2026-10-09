@@ -4,37 +4,28 @@ import { clearMocks, mockIPC, mockWindows } from '@tauri-apps/api/mocks';
 import { act, cleanup, render, screen } from '@testing-library/react';
 import { App } from './App';
 import { DESKTOP_ERROR_CODES } from './ipc/generated/errors';
+import type { LockState } from './ipc/generated/LockState';
+import type { Settings } from './ipc/generated/Settings';
 import { resetOperations } from './ipc/operations';
+import { appInfo, lockState, settings } from './test/fixtures';
 
-const INFO = {
-  os: 'linux',
-  desktopVersion: '0.1.0',
-  coreVersion: '0.2.80',
-  secretBackend: 'file',
-  account: 'alex',
-  host: 'workstation',
-  auth: {
-    available: true,
-    method: 'polkit',
-    unavailable: null,
-    biometricsChoice: false,
-    passwordField: false,
-  },
-  testBuild: false,
-  settingsNotice: null,
-};
-
-let calls: string[];
-let appInfo: () => unknown;
+let calls: { cmd: string; args: unknown }[];
+let appInfoAnswer: () => unknown;
+let status: LockState;
+let stored: Settings;
 
 beforeEach(() => {
   calls = [];
-  appInfo = () => INFO;
+  appInfoAnswer = () => appInfo();
+  status = lockState({ locked: false });
+  stored = settings();
   mockWindows('main');
   mockIPC(
-    (cmd) => {
-      calls.push(cmd);
-      if (cmd === 'app_info') return appInfo();
+    (cmd, args) => {
+      calls.push({ cmd, args });
+      if (cmd === 'app_info') return appInfoAnswer();
+      if (cmd === 'lock_status') return status;
+      if (cmd === 'settings_get') return stored;
       if (cmd === 'op_list') return [];
       return null;
     },
@@ -47,20 +38,36 @@ afterEach(async () => {
   await new Promise((resolve) => setTimeout(resolve, 0));
   resetOperations();
   clearMocks();
+  delete document.documentElement.dataset.theme;
 });
 
 const paint = () => act(() => new Promise((resolve) => setTimeout(resolve, 50)));
+const count = (cmd: string) => calls.filter((c) => c.cmd === cmd).length;
 
-test('the app reads app_info, opens on the Targets view, and shows its window once', async () => {
+test('unlocked, the app opens on the Targets view and shows its window once', async () => {
   render(<App />);
   expect(await screen.findByRole('heading', { name: 'Open a cluster' })).toBeDefined();
   await paint();
-  expect(calls.filter((c) => c === 'app_info')).toHaveLength(1);
-  expect(calls.filter((c) => c === 'window_ready')).toHaveLength(1);
+  expect(count('app_info')).toBe(1);
+  expect(count('window_ready')).toBe(1);
+});
+
+test('locked at start, the app is the lock screen, in the chosen theme', async () => {
+  status = lockState({ reason: 'startup' });
+  stored = settings({ theme: 'light' });
+  render(<App />);
+  expect(await screen.findByRole('heading', { name: 'AppRafter is locked' })).toBeDefined();
+  expect(screen.queryByRole('heading', { name: 'Open a cluster' })).toBeNull();
+  await paint();
+  expect(document.documentElement.dataset.theme).toBe('light');
+  expect(calls.find((c) => c.cmd === 'plugin:window|set_theme')?.args).toEqual({
+    label: 'main',
+    value: 'light',
+  });
 });
 
 test('when app_info fails, the error shows — and the window still does', async () => {
-  appInfo = () =>
+  appInfoAnswer = () =>
     Promise.reject({
       code: DESKTOP_ERROR_CODES.INTERNAL,
       message: 'the shell has not started yet',
@@ -71,5 +78,5 @@ test('when app_info fails, the error shows — and the window still does', async
   render(<App />);
   expect((await screen.findByRole('alert')).textContent).toContain('the shell has not started yet');
   await paint();
-  expect(calls).toContain('window_ready');
+  expect(count('window_ready')).toBe(1);
 });

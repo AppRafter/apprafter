@@ -4,8 +4,10 @@ import { useEffect, useState } from 'react';
 import { ToastProvider } from './components/Toast';
 import { windowReady } from './ipc/api';
 import { type TargetSummary, TargetsSource } from './screens/targets/targets';
+import { LockGate } from './shell/LockGate';
 import { PlatformGate } from './shell/PlatformGate';
 import { Shell } from './shell/Shell';
+import { ThemeController } from './shell/ThemeController';
 import { createQueryClient } from './state/queryClient';
 
 /** The window starts hidden (no white flash): show it once the page has painted. */
@@ -29,10 +31,14 @@ export function App({ targets = null }: AppProps) {
   return (
     <QueryClientProvider client={client}>
       <PlatformGate>
+        <ThemeController />
         <TargetsSource value={targets}>
-          <ToastProvider>
-            <Shell />
-          </ToastProvider>
+          {/* The toasts belong to the shell: a lock takes them away with it. */}
+          <LockGate>
+            <ToastProvider>
+              <Shell />
+            </ToastProvider>
+          </LockGate>
         </TargetsSource>
       </PlatformGate>
     </QueryClientProvider>

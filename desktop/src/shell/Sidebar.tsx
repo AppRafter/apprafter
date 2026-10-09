@@ -2,7 +2,6 @@
 // The left column of a view (brief §2). On a target tab: the target's name, the sections and the
 // Manage sections. Always: the footer — Targets, Settings, Lock with their shortcuts, the
 // running operations, the three links and the version. On the Targets view only the footer.
-import { openUrl } from '@tauri-apps/plugin-opener';
 import { Dot } from '../components/Dot';
 import { Eyebrow } from '../components/Eyebrow';
 import { IconButton } from '../components/IconButton';
@@ -20,15 +19,9 @@ import type { AppInfo } from '../ipc/generated/AppInfo';
 import type { Os } from '../ipc/generated/Os';
 import type { Section, TargetTab } from '../state/session';
 import { type ShortcutAction, shortcutHint } from '../state/shortcuts';
+import { LINKS, openLink } from './links';
 import { OperationsIndicator } from './OperationsIndicator';
 import { SECTIONS, type SectionInfo } from './sections';
-
-/** The capability lets the opener open exactly these (capabilities/main.json5). */
-export const LINKS = {
-  website: 'https://apprafter.dev',
-  docs: 'https://docs.apprafter.dev',
-  github: 'https://github.com/AppRafter/apprafter',
-} as const;
 
 export interface SidebarProps {
   os: Os;
@@ -41,10 +34,6 @@ export interface SidebarProps {
   /** Opens Settings; without it there is no Settings entry. */
   onSettings?: () => void;
 }
-
-const open = (url: string) => () => {
-  openUrl(url).catch((error: unknown) => console.error(`${url} did not open:`, error));
-};
 
 export function Sidebar({
   os,
@@ -106,10 +95,20 @@ export function Sidebar({
             label="Website"
             icon={GlobeSimpleIcon}
             size={26}
-            onClick={open(LINKS.website)}
+            onClick={() => openLink(LINKS.website)}
           />
-          <IconButton label="Docs" icon={BookOpenIcon} size={26} onClick={open(LINKS.docs)} />
-          <IconButton label="GitHub" icon={GithubLogoIcon} size={26} onClick={open(LINKS.github)} />
+          <IconButton
+            label="Docs"
+            icon={BookOpenIcon}
+            size={26}
+            onClick={() => openLink(LINKS.docs)}
+          />
+          <IconButton
+            label="GitHub"
+            icon={GithubLogoIcon}
+            size={26}
+            onClick={() => openLink(LINKS.github)}
+          />
           <span className="sidebar-version">{`v${info.desktopVersion}`}</span>
         </div>
       </div>
