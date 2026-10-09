@@ -131,6 +131,34 @@ fn plugin_commands_beyond_the_granted_ones_are_refused_by_the_acl() {
     );
 }
 
+/// The opener's scope is the three URLs exactly as the capability writes them: a URL the page
+/// does not show, a trailing slash on one it does, and a host that only starts like ours are
+/// each refused by the plugin's own scope check — reached past the ACL, which grants
+/// `open_url` with that scope. (A listed URL would open the browser, so none is tried here.)
+#[test]
+fn the_opener_opens_the_listed_urls_only_and_only_as_written() {
+    let rig = rig(lock_off());
+    for url in [
+        "https://example.com",
+        "https://apprafter.dev/",
+        "https://apprafter.dev.evil",
+        "https://apprafter.dev.evil/",
+        "http://apprafter.dev",
+        "https://docs.apprafter.dev/../x",
+        "https://github.com/AppRafter/apprafter/",
+        "https://github.com/AppRafter/apprafter-evil",
+    ] {
+        match invoke(&rig, "plugin:opener|open_url", json!({ "url": url })) {
+            Err(Value::String(error)) => assert_eq!(
+                error,
+                format!("Not allowed to open url {url}"),
+                "{url} was not refused by the opener's scope"
+            ),
+            other => panic!("{url} was not refused by the opener's scope: {other:?}"),
+        }
+    }
+}
+
 /// The capability, read as Tauri reads it: exactly the pinned core permissions, the opener
 /// scoped to the three links the app shows, and the generated `allow-<command>` of every app
 /// command — nothing more, nothing less, once each. A permission added for a later step must

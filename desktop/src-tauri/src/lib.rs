@@ -75,7 +75,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             window::show_and_focus(app)
         }))
         // The capability lets the page open three URLs with it, nothing else.
-        .plugin(tauri_plugin_opener::init())
+        .plugin(app::opener_plugin())
         .setup({
             let data_dir = data_dir.clone();
             move |app| {

@@ -346,6 +346,17 @@ pub fn builder<R: Runtime>(base: tauri::Builder<R>, cell: ShellCell) -> tauri::B
     })
 }
 
+/// The opener plugin as the app uses it: `open_url`, which the capability scopes to the three
+/// links the page shows, exactly as written. No injected script: the plugin's default would
+/// also open any `<a target="_blank">`, or a link clicked with Ctrl or Shift, in the browser on
+/// its own, a way out the page never needs (its links go through `open_url`) and an injected
+/// link could use.
+pub fn opener_plugin<R: Runtime>() -> impl tauri::plugin::Plugin<R> {
+    tauri_plugin_opener::Builder::new()
+        .open_js_links_on_click(false)
+        .build()
+}
+
 fn guard(cell: &ShellCell, command: &str) -> Result<(), DesktopError> {
     match cell.get() {
         Some(shell) => shell.lock.guard(command),
