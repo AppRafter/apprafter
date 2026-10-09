@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 import { describe, expect, mock, test } from 'bun:test';
+import { clearMocks, mockIPC } from '@tauri-apps/api/mocks';
 import { cleanup as cleanupDialog, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import type { AuthInfo } from '../ipc/generated/AuthInfo';
 import { DESKTOP_ERROR_CODES } from '../ipc/generated/errors';
 import type { JsonValue } from '../ipc/generated/serde_json/JsonValue';
+import { execute, resetOperations } from '../ipc/operations';
 import { BACKOFF_LINE } from '../state/auth';
 import { ConfirmDialog, type ConfirmDialogProps, needsDialog } from './ConfirmDialog';
 
@@ -209,6 +211,49 @@ describe('ConfirmDialog where the OS cannot prompt: the password field', () => {
     answer = () => Promise.resolve();
     await user.type(password(), 'hunter2{Enter}');
     expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  test('a retry after a wrong password confirms the same plan: the same opId, in place', async () => {
+    // As a screen wires it: confirming executes the plan the dialog shows. Rust keeps the plan
+    // after a wrong password, so the owner types again here and the same opId runs.
+    const sent: { opId: unknown; password: unknown }[] = [];
+    const answers = [
+      () =>
+        Promise.reject(
+          refusal(DESKTOP_ERROR_CODES.AUTH_FAILED, {
+            exhausted: false,
+            messages: ['Authentication failure'],
+          }),
+        ),
+      () => 1,
+    ];
+    mockIPC((cmd, args) => {
+      if (cmd !== 'op_execute') return null;
+      const { opId, password } = args as { opId: unknown; password?: unknown };
+      sent.push({ opId, password });
+      return answers.shift()?.();
+    });
+    try {
+      const { user, onClose } = open({
+        auth: pam,
+        onConfirm: async (typed) => {
+          await execute(7, typed);
+        },
+      });
+      await user.type(password(), 'guess{Enter}');
+      expect((await screen.findByRole('alert')).textContent).toBe('Authentication failure');
+      expect(onClose).not.toHaveBeenCalled();
+      expect(password().disabled).toBe(false);
+      await user.type(password(), 'hunter2{Enter}');
+      await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
+      expect(sent).toEqual([
+        { opId: 7, password: 'guess' },
+        { opId: 7, password: 'hunter2' },
+      ]);
+    } finally {
+      resetOperations();
+      clearMocks();
+    }
   });
 
   test('busy: a check is already open', async () => {

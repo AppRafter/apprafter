@@ -451,6 +451,39 @@ fn op_execute_checks_the_confirm_dialog_s_password_on_the_pam_route() {
     );
 }
 
+/// The confirm dialog's retry: a wrong password through `op_execute` keeps the plan, and the
+/// same `opId` with the right password then runs it, once.
+#[test]
+fn op_execute_after_a_wrong_password_runs_the_same_op_id_with_the_right_one() {
+    let pam = rig_by(lock_off(), Route::PasswordField);
+    let op_id = pam
+        .shell
+        .ops
+        .register_plan(
+            PlanParts::new(PlanClass::Destructive, "Remove target prod", "delete"),
+            Box::new(|_, _| Ok(Outcome::Completed { result: json!(0) })),
+        )
+        .op_id;
+    let execute = |channel: u32, password: &str| {
+        invoke(
+            &pam,
+            "op_execute",
+            json!({ "opId": op_id, "onEvent": format!("__CHANNEL__:{channel}"), "password": password }),
+        )
+    };
+    let wrong = execute(11, "guess");
+    assert_eq!(code(&wrong), Some(errors::AUTH_FAILED), "{wrong:?}");
+    let right = execute(12, PASSWORD);
+    assert!(right.is_ok(), "the plan waited for the retry: {right:?}");
+    let again = execute(13, PASSWORD);
+    assert_eq!(
+        code(&again),
+        Some(errors::PLAN_NOT_FOUND),
+        "it ran once: {again:?}"
+    );
+    assert_eq!(pam.auth.checks.load(SeqCst), 2);
+}
+
 /// What [`stops_when_cancelled`]'s operation logs as it stops.
 const OP_STOPPED: &str = "the operation stopped";
 

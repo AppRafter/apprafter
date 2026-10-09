@@ -6,7 +6,7 @@
 // (AuthInfo.passwordField): there the dialog has its own password field, whose value onConfirm
 // hands to execute() and Rust checks. It refuses as the lock screen's does, and is shown the same
 // way: the OS's words or a plain line, the back-off, busy. The field is emptied after every
-// answer.
+// answer; a wrong password leaves the plan waiting in Rust, so the owner simply tries again.
 import { type FormEvent, type ReactNode, useEffect, useId, useRef, useState } from 'react';
 import { uiErrorOf } from '../ipc/api';
 import type { AuthInfo } from '../ipc/generated/AuthInfo';
@@ -50,7 +50,8 @@ export interface ConfirmDialogProps {
   /**
    * The dialog closes once this resolves; a rejection is shown inline and it stays open.
    * `password`: given only when the dialog asked for it (a gesture, where the OS cannot
-   * prompt), for execute(). A refusal other than busy ends the plan in Rust, so a retry plans
+   * prompt), for execute(). After a wrong password (`auth_failed`) or a busy prompt Rust keeps
+   * the plan, so the owner tries again in place and this runs the same plan (the same opId)
    * again.
    */
   onConfirm: (password?: string) => Promise<void> | void;

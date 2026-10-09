@@ -170,8 +170,14 @@ function forgetLive(entry: Entry) {
 
 const isLocked = (e: unknown) =>
   e instanceof IpcError && e.error.code === DESKTOP_ERROR_CODES.LOCKED;
-const isBusy = (e: unknown) =>
-  e instanceof IpcError && e.error.code === DESKTOP_ERROR_CODES.AUTH_BUSY;
+/**
+ * A refusal after which the plan waits in Rust for another try under the same id: a busy prompt
+ * asked nothing, and a failed gesture (a wrong password, the back-off) lets the owner try again.
+ */
+const leavesThePlanWaiting = (e: unknown) =>
+  e instanceof IpcError &&
+  (e.error.code === DESKTOP_ERROR_CODES.AUTH_BUSY ||
+    e.error.code === DESKTOP_ERROR_CODES.AUTH_FAILED);
 
 /** A channel for `entry`: its events reach that entry object, whatever the map holds now. */
 function openChannel(entry: Entry): Subscription {
@@ -311,7 +317,8 @@ function releaser(entry: Entry): () => void {
  * The rejection is the answer, thrown as it came. The `Failed` that Rust may also send on this
  * call's channel is dropped, so the error shows once. A subscription the store already held for
  * the plan is held still while execute answers: when it starts the operation that subscription
- * ends (both carry the same events from the start); a busy prompt leaves the plan waiting and the
+ * ends (both carry the same events from the start); a busy prompt or a failed gesture (a wrong
+ * password, the back-off) leaves the plan waiting for another try with the same `opId`, and the
  * subscription resumes; any other refusal ends the plan, and the subscription with it — its own
  * `Failed` would repeat the answer.
  */
@@ -329,7 +336,7 @@ export async function execute(opId: OpId, password?: string): Promise<() => void
     entry.executing -= 1;
     end(entry, sub, false);
     const previous = entry.current;
-    if (previous !== null && isBusy(e)) {
+    if (previous !== null && leavesThePlanWaiting(e)) {
       resume(entry, previous);
     } else if (previous !== null) {
       end(entry, previous, true);

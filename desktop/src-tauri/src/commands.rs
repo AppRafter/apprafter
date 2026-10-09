@@ -217,9 +217,12 @@ pub async fn op_discard(shell: ShellState<'_>, op_id: OpId) -> Result<(), UiErro
 /// failed. The `Failed` event it may also send on `on_event` — the channel this call has just
 /// subscribed — carries the same error: it is meant for the pages that subscribed to the plan
 /// earlier (through `op_subscribe`), which have no other way to hear it. A page that handles
-/// the rejection ignores that event on its own channel; on a busy prompt
-/// (`apprafter::desktop::auth_busy`) nothing is sent, the plan waits, and the channel's
-/// subscription has already ended.
+/// the rejection ignores that event on its own channel. Two refusals are not the plan's end,
+/// and send nothing: a busy prompt (`apprafter::desktop::auth_busy`) and a failed gesture
+/// (`apprafter::desktop::auth_failed`: a wrong password, a finger not recognised, or the
+/// back-off, which says how long it still refuses as `fields.retryInMs`). The plan then waits
+/// for the owner to try again with the same `op_id`, and the channel's subscription has
+/// already ended.
 ///
 /// `password`, when the page sends one, is the confirm dialog's own field (shown where the OS
 /// cannot prompt, `AuthInfo.passwordField`): a plan that needs the gesture checks it in place of

@@ -15,7 +15,9 @@
 //! [`discard`](OperationManager::discard)s it after showing the result, or until
 //! [`ENDED_KEPT`] operations ended after it. A plan that never runs — its prompt refused,
 //! expired, swept, dropped by a lock or by a quit — sends the pages that followed it one
-//! `Failed` saying why, so none of them waits for an end that never comes.
+//! `Failed` saying why, so none of them waits for an end that never comes. A gesture that
+//! failed (a wrong password) is not such an end: the plan waits for the owner's next try
+//! ([`OperationManager::execute`] says why), and its pages hear nothing until it runs or ends.
 //!
 //! A plan leaves the manager's maps under its lock and is dropped after the lock is released:
 //! what an executor captured may do anything when it goes, calling back into the manager
@@ -246,8 +248,11 @@ struct Run {
 enum Answer {
     /// Run it; the pages that followed the prompt follow the operation.
     Run(Vec<Subscriber>),
-    /// Nothing was asked: the plan waits for another `execute`, as it was.
-    Again(Vec<Subscriber>),
+    /// The plan waits for another `execute`, as it was, and the caller is told why (with what
+    /// the OS said): nothing was asked (busy), or the owner was not verified and may try again
+    /// (failed). The pages that followed the prompt follow the plan again and hear nothing: it
+    /// has not ended.
+    Again(Refusal, Vec<Subscriber>),
     /// Refused, for the reason given (with what the OS said); the pages that followed the
     /// prompt are told it.
     Refuse(Refusal, Vec<Subscriber>),
@@ -306,9 +311,11 @@ impl OperationManager {
         }
     }
 
-    /// Run a plan, once: whatever happens here, the plan is spent — except on `AuthBusy`,
-    /// when another prompt was open and nothing was asked, and the plan waits for another try
-    /// with the time it had left.
+    /// Run a plan, once: whatever happens here, the plan is spent — except when the owner may
+    /// simply try again, and the plan then waits for another try, under the same id, with the
+    /// time it had left: on `AuthBusy`, when another prompt was open and nothing was asked, and
+    /// on `AuthFailed`, when the owner was not verified (a wrong password, a finger not
+    /// recognised) or a back-off turned the try away.
     ///
     /// When the plan needs the owner, this asks `auth` and blocks until the prompt answers
     /// (so the caller is a blocking thread, never an async worker). Anything but `Verified`
@@ -316,6 +323,15 @@ impl OperationManager {
     /// when the OS still answered yes — and so does a prompt that stayed open past the
     /// plan's expiry; the executor then never runs. Otherwise it starts on a thread of its
     /// own, named `op-<id>`, with an 8 MiB stack.
+    ///
+    /// Why a failed gesture keeps the plan, where a cancelled or unavailable one spends it: a
+    /// typo would otherwise send the owner back to plan the change again, and keeping it gives
+    /// away nothing the gesture guards. Each try asks the owner again, and what bounds the
+    /// tries is the authenticator's — the app's own back-off on the password paths, the OS's
+    /// limits on its prompts — not the plan's. Every other rule holds: the plan runs once, its
+    /// time to live runs from when it was planned, and a cancel, a lock or a quit drops it. A
+    /// cancel is the owner (or the app, or the system) saying no, and an unavailable gesture will
+    /// not become available by asking again, so both end the plan.
     ///
     /// Once the manager is [`close`](Self::close)d it refuses with `Closing`: before asking
     /// anything, and again under the lock hold that would start the operation or put a busy
@@ -372,14 +388,14 @@ impl OperationManager {
             let prompt = inner.prompts.remove(&id);
             match judge(id, answer, prompt, expired) {
                 Answer::Run(sinks) => plan.sinks = sinks,
-                Answer::Again(sinks) => {
+                Answer::Again(refusal, sinks) => {
                     plan.sinks = sinks;
                     // Quitting: nothing may wait for a try that will never come.
                     if inner.closing {
                         return spend(inner, plan, DesktopError::Closing);
                     }
                     inner.pending.insert(id, plan);
-                    return Err(DesktopError::AuthBusy.into());
+                    return Err(refusal);
                 }
                 Answer::Refuse(refusal, mut sinks) => {
                     fan_out(
@@ -784,6 +800,7 @@ fn refuse_prompts(prompts: &mut HashMap<OpId, Prompt>) -> Vec<CancellationToken>
 /// What a prompt's answer means for plan `id`. `prompt` is its entry, gone when it was
 /// closed some other way; `expired` says the plan's time to live passed while it was open.
 /// What the OS said comes with a refusal the OS gave, never with a yes refused afterwards.
+/// A failed gesture keeps the plan ([`OperationManager::execute`] says why).
 fn judge(
     id: OpId,
     answer: thread::Result<PasswordAnswer>,
@@ -810,19 +827,23 @@ fn judge(
         return Answer::Refuse(said(DesktopError::AuthCancelled), sinks);
     }
     let err = match outcome {
-        AuthOutcome::Verified | AuthOutcome::Busy if expired => {
+        // Run, or wait for another try: neither once the plan has expired.
+        AuthOutcome::Verified | AuthOutcome::Busy | AuthOutcome::Failed { .. } if expired => {
             DesktopError::PlanExpired { op_id: id }
         }
         AuthOutcome::Verified => return Answer::Run(sinks),
-        AuthOutcome::Busy => return Answer::Again(sinks),
-        AuthOutcome::Cancelled { .. } => DesktopError::AuthCancelled,
+        AuthOutcome::Busy => return Answer::Again(DesktopError::AuthBusy.into(), sinks),
         AuthOutcome::Failed {
             exhausted,
             retry_in_ms,
-        } => DesktopError::AuthFailed {
-            exhausted,
-            retry_in_ms,
-        },
+        } => {
+            let failed = DesktopError::AuthFailed {
+                exhausted,
+                retry_in_ms,
+            };
+            return Answer::Again(said(failed), sinks);
+        }
+        AuthOutcome::Cancelled { .. } => DesktopError::AuthCancelled,
         AuthOutcome::Unavailable { reason } => DesktopError::AuthUnavailable { reason },
     };
     Answer::Refuse(said(err), sinks)
@@ -1297,51 +1318,37 @@ mod tests {
     }
 
     #[test]
-    fn a_refused_gesture_consumes_the_plan_and_never_runs_it() {
+    fn a_cancelled_or_unavailable_gesture_spends_the_plan_and_never_runs_it() {
         let (_, mgr) = manager();
         let auth = FakeAuthenticator::new();
-        let cases = [
-            (
-                AuthOutcome::Cancelled {
-                    by: CancelledBy::User,
-                },
-                DesktopError::AuthCancelled,
-            ),
-            (
-                AuthOutcome::Failed {
-                    exhausted: true,
-                    retry_in_ms: None,
-                },
-                DesktopError::AuthFailed {
-                    exhausted: true,
-                    retry_in_ms: None,
-                },
-            ),
-            (
-                AuthOutcome::Failed {
-                    exhausted: false,
-                    retry_in_ms: None,
-                },
-                DesktopError::AuthFailed {
-                    exhausted: false,
-                    retry_in_ms: None,
-                },
-            ),
-            (
-                AuthOutcome::Unavailable {
-                    reason: UnavailableReason::NotInteractive,
-                },
-                DesktopError::AuthUnavailable {
-                    reason: UnavailableReason::NotInteractive,
-                },
-            ),
-        ];
+        let mut cases: Vec<(AuthOutcome, DesktopError)> =
+            [CancelledBy::User, CancelledBy::App, CancelledBy::System]
+                .into_iter()
+                .map(|by| (AuthOutcome::Cancelled { by }, DesktopError::AuthCancelled))
+                .collect();
+        cases.push((
+            AuthOutcome::Unavailable {
+                reason: UnavailableReason::NotInteractive,
+            },
+            DesktopError::AuthUnavailable {
+                reason: UnavailableReason::NotInteractive,
+            },
+        ));
         let runs = Arc::new(AtomicUsize::new(0));
         for (outcome, expected) in cases {
             let view = mgr.register_plan(parts(PlanClass::Destructive), counting(&runs));
+            let sink = VecSink::new("main");
+            mgr.subscribe(view.op_id, sink.clone()).unwrap();
             auth.then(outcome);
             let err = mgr.execute(view.op_id, &auth).unwrap_err();
             assert_eq!(err.to_ui(), expected.to_ui(), "{outcome:?}");
+            assert_eq!(
+                sink.events(),
+                [OpEvent::Failed {
+                    error: expected.to_ui()
+                }],
+                "{outcome:?}: the page that followed the plan hears it ended"
+            );
             let again = mgr.execute(view.op_id, &auth);
             assert!(
                 matches!(again, Err(DesktopError::PlanNotFound { .. })),
@@ -1350,6 +1357,115 @@ mod tests {
         }
         assert_eq!(runs.load(SeqCst), 0);
         assert!(mgr.list().is_empty());
+    }
+
+    /// A wrong password or an unrecognised finger: the owner may try again, so the plan waits
+    /// under the same id, its expiry unchanged, and the pages that followed it follow it still
+    /// (it has not ended). It still runs once.
+    #[test]
+    fn a_failed_gesture_keeps_the_plan_and_a_retry_with_the_same_id_runs_it() {
+        let (clock, mgr) = manager();
+        let auth = FakeAuthenticator::new();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let view = mgr.register_plan(parts(PlanClass::Destructive), counting(&runs));
+        let sink = VecSink::new("main");
+        mgr.subscribe(view.op_id, sink.clone()).unwrap();
+        let failed = AuthOutcome::Failed {
+            exhausted: false,
+            retry_in_ms: None,
+        };
+        auth.then(failed).then(failed);
+        for _ in 0..2 {
+            clock.advance(1_000);
+            let err = mgr.execute(view.op_id, &auth).unwrap_err();
+            assert_eq!(
+                err.to_ui(),
+                DesktopError::AuthFailed {
+                    exhausted: false,
+                    retry_in_ms: None
+                }
+                .to_ui()
+            );
+            assert!(sink.events().is_empty(), "the plan has not ended");
+            assert!(mgr.list().is_empty(), "nothing runs");
+        }
+        assert_eq!(runs.load(SeqCst), 0);
+        assert_eq!(mgr.execute(view.op_id, &auth).unwrap(), view.op_id);
+        assert_eq!(wait_ended(&mgr, view.op_id), OpState::Finished);
+        assert_eq!(runs.load(SeqCst), 1);
+        assert_eq!(auth.asked().len(), 3, "every try asks the owner");
+        assert_eq!(sink.events(), vec![completed(json!(null))]);
+        assert!(
+            matches!(
+                mgr.execute(view.op_id, &auth),
+                Err(DesktopError::PlanNotFound { .. })
+            ),
+            "once run, it is spent"
+        );
+    }
+
+    /// The back-off's refusal is a failure too: the plan waits, and every try it turns away
+    /// says how long it still refuses, until a try after it runs the plan.
+    #[test]
+    fn an_exhausted_gesture_refuses_each_try_until_the_back_off_ends() {
+        let (_, mgr) = manager();
+        let auth = FakeAuthenticator::new();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let view = mgr.register_plan(parts(PlanClass::Destructive), counting(&runs));
+        for left in [30_000, 12_000] {
+            auth.then(AuthOutcome::Failed {
+                exhausted: true,
+                retry_in_ms: Some(left),
+            });
+            let ui = mgr.execute(view.op_id, &auth).unwrap_err().to_ui();
+            assert_eq!(ui.code.as_deref(), Some(errors::AUTH_FAILED), "{ui:?}");
+            assert_eq!(ui.fields["exhausted"], json!(true));
+            assert_eq!(ui.fields["retryInMs"], json!(left));
+            assert_eq!(runs.load(SeqCst), 0);
+        }
+        assert_eq!(mgr.execute(view.op_id, &auth).unwrap(), view.op_id);
+        assert_eq!(wait_ended(&mgr, view.op_id), OpState::Finished);
+        assert_eq!(runs.load(SeqCst), 1);
+    }
+
+    /// Kept after a failed gesture, a plan still goes as any pending plan does: on a lock, and
+    /// once its time to live has passed.
+    #[test]
+    fn a_plan_kept_after_a_failed_gesture_still_goes_on_a_lock_and_at_its_expiry() {
+        let (clock, mgr) = manager();
+        let auth = FakeAuthenticator::new();
+        let failed = AuthOutcome::Failed {
+            exhausted: false,
+            retry_in_ms: None,
+        };
+        let runs = Arc::new(AtomicUsize::new(0));
+        let locked = mgr.register_plan(parts(PlanClass::Destructive), counting(&runs));
+        let sink = VecSink::new("main");
+        mgr.subscribe(locked.op_id, sink.clone()).unwrap();
+        auth.then(failed);
+        mgr.execute(locked.op_id, &auth).unwrap_err();
+        mgr.drop_all_plans();
+        assert_eq!(
+            sink.events(),
+            [OpEvent::Failed {
+                error: DesktopError::Locked.to_ui()
+            }]
+        );
+        assert!(matches!(
+            mgr.execute(locked.op_id, &auth),
+            Err(DesktopError::PlanNotFound { .. })
+        ));
+
+        let expiring = mgr.register_plan(parts(PlanClass::Destructive), counting(&runs));
+        auth.then(failed);
+        mgr.execute(expiring.op_id, &auth).unwrap_err();
+        clock.advance(PLAN_TTL_MS + 1);
+        let expired = mgr.execute(expiring.op_id, &auth);
+        assert!(
+            matches!(expired, Err(DesktopError::PlanExpired { op_id }) if op_id == expiring.op_id),
+            "{expired:?}"
+        );
+        assert_eq!(runs.load(SeqCst), 0);
     }
 
     #[test]
@@ -1401,8 +1517,11 @@ mod tests {
         assert_eq!(runs.load(SeqCst), 2);
     }
 
+    /// The confirm dialog's retry: a wrong password keeps the plan, and the right one runs it
+    /// under the same id. The page that followed the plan hears nothing of the wrong one (the
+    /// plan has not ended), then follows the operation.
     #[test]
-    fn a_refused_password_spends_the_plan_and_says_what_pam_said_to_every_page() {
+    fn a_wrong_password_keeps_the_plan_and_the_right_one_runs_it_under_the_same_id() {
         let auth = FakeAuthenticator::new().with_password("open sesame".to_owned());
         auth.saying(&["Authentication failure"]);
         let (_, mgr) = manager();
@@ -1423,17 +1542,56 @@ mod tests {
             ),
             "{refusal:?}"
         );
-        assert_eq!(refusal.messages, ["Authentication failure"]);
+        assert_eq!(
+            refusal.to_ui().fields["messages"],
+            json!(["Authentication failure"])
+        );
+        assert!(earlier.events().is_empty(), "the plan has not ended");
+        assert_eq!(runs.load(SeqCst), 0);
+        assert_eq!(
+            mgr.execute_with(view.op_id, &auth, typed("open sesame"))
+                .unwrap(),
+            view.op_id
+        );
+        assert_eq!(wait_ended(&mgr, view.op_id), OpState::Finished);
+        assert_eq!(runs.load(SeqCst), 1);
+        assert_eq!(auth.asked().len(), 2);
+        assert_eq!(earlier.events(), vec![completed(json!(null))]);
+    }
+
+    /// A password check that ends the plan (here PAM asked for a second secret the field does
+    /// not hold) tells every page that followed it, with what PAM said.
+    #[test]
+    fn a_password_refusal_that_ends_the_plan_says_what_pam_said_to_every_page() {
+        let auth = FakeAuthenticator::new().with_password("open sesame".to_owned());
+        auth.saying(&["Verification code:"])
+            .then(AuthOutcome::Unavailable {
+                reason: UnavailableReason::NotInteractive,
+            });
+        let (_, mgr) = manager();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let view = mgr.register_plan(parts(PlanClass::Destructive), counting(&runs));
+        let earlier = VecSink::new("main");
+        mgr.subscribe(view.op_id, earlier.clone()).unwrap();
+        let refusal = mgr
+            .execute_with(view.op_id, &auth, typed("open sesame"))
+            .unwrap_err();
+        assert!(
+            matches!(
+                *refusal.error,
+                DesktopError::AuthUnavailable {
+                    reason: UnavailableReason::NotInteractive
+                }
+            ),
+            "{refusal:?}"
+        );
+        assert_eq!(refusal.messages, ["Verification code:"]);
         assert_eq!(
             earlier.events(),
             [OpEvent::Failed {
                 error: refusal.to_ui()
             }],
             "the page that followed the plan hears it with what was said"
-        );
-        assert_eq!(
-            refusal.to_ui().fields["messages"],
-            json!(["Authentication failure"])
         );
         assert!(matches!(
             mgr.execute_with(view.op_id, &auth, typed("open sesame")),
@@ -2342,7 +2500,14 @@ mod tests {
             ("cancel", |mgr, id| mgr.cancel(id).unwrap()),
             ("quit", |mgr, _| assert!(mgr.cancel_all_and_wait(LONG))),
         ];
-        for (name, close) in closers {
+        let failed = AuthOutcome::Failed {
+            exhausted: false,
+            retry_in_ms: None,
+        };
+        for ((name, close), answered) in closers
+            .into_iter()
+            .flat_map(|closer| [(closer, AuthOutcome::Verified), (closer, failed)])
+        {
             let (_, mgr) = manager();
             let (auth, opened, answer) = held_prompt();
             let ran = Arc::new(AtomicBool::new(false));
@@ -2359,11 +2524,11 @@ mod tests {
                 within(name, move || test_trips::held(|| close(&mgr, view.op_id)).1)
             };
             assert_eq!(held.len(), 1, "{name} closes the prompt");
-            answer.send(AuthOutcome::Verified).unwrap();
+            answer.send(answered).unwrap();
             let result = result.recv_timeout(LONG).expect("execute returned");
             assert!(
                 matches!(result, Err(DesktopError::AuthCancelled)),
-                "{name}: {result:?}"
+                "{name}, {answered:?}: {result:?}"
             );
             assert!(!ran.load(SeqCst), "the plan ran after {name} returned");
             assert_eq!(
@@ -2480,8 +2645,12 @@ mod tests {
             // The machine slept with the dialog up: only the wall clock saw it.
             ("the machine slept", |clock| clock.set_wall(T0 + DAY)),
         ];
-        // `Busy` would put the plan back to wait: not once it expired.
-        for answered in [AuthOutcome::Verified, AuthOutcome::Busy] {
+        // `Busy` and `Failed` would put the plan back to wait: not once it expired.
+        let failed = AuthOutcome::Failed {
+            exhausted: false,
+            retry_in_ms: None,
+        };
+        for answered in [AuthOutcome::Verified, AuthOutcome::Busy, failed] {
             for (how, pass) in ways {
                 let (clock, mgr) = manager();
                 let (auth, opened, answer) = held_prompt();
@@ -2660,11 +2829,11 @@ mod tests {
                 assert!(matches!(err, DesktopError::AuthCancelled), "{err:?}");
                 err
             }),
-            ("a failed prompt", |mgr, _, id| {
+            // A failed one is no end: the plan waits for another try.
+            ("an unavailable prompt", |mgr, _, id| {
                 let auth = FakeAuthenticator::new();
-                auth.then(AuthOutcome::Failed {
-                    exhausted: true,
-                    retry_in_ms: None,
+                auth.then(AuthOutcome::Unavailable {
+                    reason: UnavailableReason::NotInteractive,
                 });
                 mgr.execute(id, &auth).unwrap_err()
             }),
@@ -2978,28 +3147,37 @@ mod tests {
     }
 
     #[test]
-    fn a_busy_answer_after_the_manager_closed_does_not_put_the_plan_back() {
-        let (_, mgr) = manager();
-        let (auth, opened, answer) = held_prompt();
-        let runs = Arc::new(AtomicUsize::new(0));
-        let view = mgr.register_plan(parts(PlanClass::Destructive), counting(&runs));
-        let sink = VecSink::new("main");
-        mgr.subscribe(view.op_id, sink.clone()).unwrap();
-        let result = execute_in_background(&mgr, view.op_id, auth);
-        opened.recv_timeout(LONG).expect("the prompt opened");
-        mgr.close();
-        answer.send(AuthOutcome::Busy).unwrap();
-        let result = result.recv_timeout(LONG).expect("execute returned");
-        assert!(matches!(result, Err(DesktopError::Closing)), "{result:?}");
-        assert_eq!(sink.events(), vec![closing()]);
-        assert!(
-            matches!(
-                mgr.execute(view.op_id, &FakeAuthenticator::new()),
-                Err(DesktopError::PlanNotFound { .. })
-            ),
-            "nothing waits for another try"
-        );
-        assert_eq!(runs.load(SeqCst), 0);
+    fn a_busy_or_failed_answer_after_the_manager_closed_does_not_put_the_plan_back() {
+        let failed = AuthOutcome::Failed {
+            exhausted: false,
+            retry_in_ms: None,
+        };
+        for answered in [AuthOutcome::Busy, failed] {
+            let (_, mgr) = manager();
+            let (auth, opened, answer) = held_prompt();
+            let runs = Arc::new(AtomicUsize::new(0));
+            let view = mgr.register_plan(parts(PlanClass::Destructive), counting(&runs));
+            let sink = VecSink::new("main");
+            mgr.subscribe(view.op_id, sink.clone()).unwrap();
+            let result = execute_in_background(&mgr, view.op_id, auth);
+            opened.recv_timeout(LONG).expect("the prompt opened");
+            mgr.close();
+            answer.send(answered).unwrap();
+            let result = result.recv_timeout(LONG).expect("execute returned");
+            assert!(
+                matches!(result, Err(DesktopError::Closing)),
+                "{answered:?}: {result:?}"
+            );
+            assert_eq!(sink.events(), vec![closing()], "{answered:?}");
+            assert!(
+                matches!(
+                    mgr.execute(view.op_id, &FakeAuthenticator::new()),
+                    Err(DesktopError::PlanNotFound { .. })
+                ),
+                "{answered:?}: nothing waits for another try"
+            );
+            assert_eq!(runs.load(SeqCst), 0);
+        }
     }
 
     #[test]
