@@ -31,6 +31,60 @@ function open(spec: Partial<FormSpec> & Pick<FormSpec, 'fields'>, onClose = mock
 const submit = () => screen.getByRole('button', { name: 'Save' }) as HTMLButtonElement;
 
 describe('FormDialog', () => {
+  test('a radio field: one choice; a disabled option cannot be chosen; its detail describes it', async () => {
+    const { user, onSubmit } = open({
+      fields: [
+        {
+          key: 'key',
+          label: 'SSH public key',
+          kind: 'radio',
+          options: [
+            { value: 'a', label: '~/.ssh/a.pub', detail: 'ssh-ed25519 · alex@a', disabled: true },
+            { value: 'b', label: '~/.ssh/b.pub', detail: 'ssh-rsa' },
+            { value: 'other', label: 'Other path…' },
+          ],
+        },
+        { key: 'path', label: 'Path to a public key', when: (v) => v.key === 'other' },
+      ],
+      required: ['key', 'path'],
+    });
+    expect(screen.getByRole('group', { name: 'SSH public key' })).toBeDefined();
+    const a = screen.getByRole('radio', { name: '~/.ssh/a.pub' }) as HTMLInputElement;
+    expect(a.disabled).toBe(true);
+    expect(document.getElementById(a.getAttribute('aria-describedby') ?? '')?.textContent).toBe(
+      'ssh-ed25519 · alex@a',
+    );
+    expect(submit().disabled).toBe(true);
+    expect(screen.queryByLabelText('Path to a public key')).toBeNull();
+    await user.click(screen.getByRole('radio', { name: 'Other path…' }));
+    expect(submit().disabled).toBe(true);
+    await user.type(screen.getByLabelText('Path to a public key'), '~/.ssh/c.pub');
+    expect(submit().disabled).toBe(false);
+    await user.click(screen.getByRole('radio', { name: '~/.ssh/b.pub' }));
+    expect(screen.queryByLabelText('Path to a public key')).toBeNull();
+    await user.click(submit());
+    expect(onSubmit).toHaveBeenCalledWith({ key: 'b' });
+  });
+
+  test('a radio field starts from its default', () => {
+    open({
+      fields: [
+        {
+          key: 'key',
+          label: 'SSH public key',
+          kind: 'radio',
+          options: [
+            { value: 'a', label: 'A' },
+            { value: 'b', label: 'B' },
+          ],
+          def: 'b',
+        },
+      ],
+    });
+    expect((screen.getByRole('radio', { name: 'B' }) as HTMLInputElement).checked).toBe(true);
+    expect((screen.getByRole('radio', { name: 'A' }) as HTMLInputElement).checked).toBe(false);
+  });
+
   test('starts each kind from its default, and submits what it shows', async () => {
     const { user, onSubmit } = open({
       fields: [

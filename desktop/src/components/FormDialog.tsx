@@ -21,6 +21,14 @@ export type FormValues = Readonly<Record<string, FormValue>>;
 /** An option: its value, or [value, label]. */
 export type Opt = string | readonly [value: string, label: string];
 
+/** A radio option: a row with its label, a line that describes it, and whether it can be chosen. */
+export interface RadioOpt {
+  readonly value: string;
+  readonly label: string;
+  readonly detail?: string;
+  readonly disabled?: boolean;
+}
+
 export type FormField = {
   readonly key: string;
   readonly label: string;
@@ -40,6 +48,8 @@ export type FormField = {
       readonly check?: (value: string) => string | null;
     }
   | { readonly kind: 'seg'; readonly options: readonly Opt[]; readonly def?: string }
+  /** One choice from a list of rows, as native radios (the SSH key picker); '' until chosen. */
+  | { readonly kind: 'radio'; readonly options: readonly RadioOpt[]; readonly def?: string }
   | {
       readonly kind: 'chips';
       readonly options: readonly string[];
@@ -214,6 +224,41 @@ function Field({
           />
           {hint}
         </div>
+      );
+    case 'radio':
+      return (
+        <fieldset className="field form-radios">
+          <legend className="eyebrow">{field.label}</legend>
+          {field.options.map((option, index) => {
+            const detailId = `${id}-${index}-detail`;
+            return (
+              <label
+                key={option.value}
+                className="form-radio"
+                data-disabled={option.disabled || undefined}
+              >
+                <input
+                  type="radio"
+                  className="form-radio-dot"
+                  name={id}
+                  value={option.value}
+                  checked={value === option.value}
+                  disabled={option.disabled ?? false}
+                  aria-label={option.label}
+                  aria-describedby={option.detail === undefined ? undefined : detailId}
+                  onChange={() => onChange(option.value)}
+                />
+                <span className="form-radio-label">{option.label}</span>
+                {option.detail !== undefined && (
+                  <span className="form-radio-detail" id={detailId}>
+                    {option.detail}
+                  </span>
+                )}
+              </label>
+            );
+          })}
+          {hint}
+        </fieldset>
       );
     case 'chips': {
       const chosen = Array.isArray(value) ? (value as readonly string[]) : [];
