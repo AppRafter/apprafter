@@ -556,6 +556,12 @@
   border-color: var(--accent);
 }
 
+/* As a disabled button: the lock screen's field waiting out the back-off. */
+.input:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
 .field-trailing {
   position: absolute;
   top: 3px;

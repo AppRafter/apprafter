@@ -21,7 +21,7 @@ import {
   useQueryClient,
 } from '@tanstack/react-query';
 import { useEffect, useMemo } from 'react';
-import { lockNow, lockStatus, unlock } from '../ipc/api';
+import { lockNow, lockStatus, unlock, unlockWithPassword } from '../ipc/api';
 import { onLockChanged } from '../ipc/events';
 import type { LockState } from '../ipc/generated/LockState';
 
@@ -111,8 +111,19 @@ export function useLockState(): UseQueryResult<LockState> {
   return query;
 }
 
+export interface LockActions {
+  lock: () => Promise<void>;
+  unlock: () => Promise<void>;
+  /**
+   * The lock screen's own field (AuthInfo.passwordField). Called directly, never through a
+   * mutation: a mutation keeps its variables in the cache, and the password must not outlive
+   * the request.
+   */
+  unlockWithPassword: (password: string) => Promise<void>;
+}
+
 /** Lock and unlock; each answer is the new state, written where the event writes it. */
-export function useLockActions(): { lock: () => Promise<void>; unlock: () => Promise<void> } {
+export function useLockActions(): LockActions {
   const client = useQueryClient();
   return useMemo(
     () => ({
@@ -121,6 +132,9 @@ export function useLockActions(): { lock: () => Promise<void>; unlock: () => Pro
       },
       unlock: async () => {
         write(client, await unlock());
+      },
+      unlockWithPassword: async (password) => {
+        write(client, await unlockWithPassword(password));
       },
     }),
     [client],

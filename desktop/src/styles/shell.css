@@ -623,10 +623,45 @@
   font: 400 var(--fs-11-5) var(--font-mono);
 }
 
+/* The password field and its arrow on one line, as the design has them: 36px, the arrow square. */
+.lock-password {
+  display: flex;
+  align-items: flex-end;
+  gap: 6px;
+  width: 100%;
+  text-align: left;
+}
+
+.lock-password .field {
+  flex: 1;
+  min-width: 0;
+}
+
+.lock-password .input {
+  height: var(--h-36);
+}
+
+.lock-password .field-trailing {
+  top: 4px;
+  right: 4px;
+}
+
+.lock-password .btn {
+  flex: none;
+  width: var(--h-36);
+  padding: 0;
+}
+
 .lock-refusal {
-  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
   color: var(--err);
   font-size: var(--fs-12-5);
+}
+
+.lock-refusal p {
+  margin: 0;
 }
 
 .lock-footer {

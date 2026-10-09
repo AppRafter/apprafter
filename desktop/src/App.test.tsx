@@ -3,14 +3,15 @@ import { afterEach, beforeEach, expect, test } from 'bun:test';
 import { emit } from '@tauri-apps/api/event';
 import { clearMocks, mockIPC, mockWindows } from '@tauri-apps/api/mocks';
 import { act, cleanup, render, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { App } from './App';
 import { DESKTOP_ERROR_CODES } from './ipc/generated/errors';
-import { QUITTING } from './ipc/generated/events';
+import { LOCK_CHANGED, QUITTING } from './ipc/generated/events';
 import type { LockState } from './ipc/generated/LockState';
 import type { Quitting } from './ipc/generated/Quitting';
 import type { Settings } from './ipc/generated/Settings';
 import { resetOperations } from './ipc/operations';
-import { appInfo, lockState, settings } from './test/fixtures';
+import { appInfo, authInfo, lockState, settings } from './test/fixtures';
 
 let calls: { cmd: string; args: unknown }[];
 let appInfoAnswer: () => unknown;
@@ -176,4 +177,67 @@ test('when app_info fails, the error shows under a title bar, and the window sho
   expect(count('window_ready')).toBe(1);
   // The theme applies above the platform gate, so the error has it too.
   expect(themeAtReveal).toBe('light');
+});
+
+const unavailable = (reason: string) =>
+  Promise.reject({
+    code: DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE,
+    message: `device-owner authentication is unavailable here (${reason})`,
+    help: null,
+    causes: [],
+    fields: { reason },
+  });
+
+test('Linux without a polkit agent: the field comes after the refusal, and no lock keeps it', async () => {
+  // As Rust: polkit is the way until it finds no agent; the PAM route and its field from then
+  // on; and every lock forgets that again.
+  let agentMissing = false;
+  let state = lockState({ reason: 'startup', seq: 0 });
+  appInfoAnswer = () =>
+    appInfo({ auth: authInfo({ method: 'polkit', passwordField: agentMissing }) });
+  lockAnswer = () => state;
+  mockIPC(
+    (cmd, args) => {
+      calls.push({ cmd, args });
+      if (cmd === 'unlock') {
+        agentMissing = true;
+        return unavailable('no_agent');
+      }
+      if (cmd === 'unlock_with_password') {
+        if (!agentMissing) return unavailable('not_permitted_here');
+        state = lockState({ locked: false, seq: state.seq + 1 });
+        return state;
+      }
+      if (cmd === 'app_info') return appInfoAnswer();
+      if (cmd === 'lock_status') return lockAnswer();
+      if (cmd === 'settings_get') return settingsAnswer();
+      if (cmd === 'op_list') return [];
+      return null;
+    },
+    { shouldMockEvents: true },
+  );
+  render(<App />);
+  const user = userEvent.setup();
+  await screen.findByRole('heading', { name: 'AppRafter is locked' });
+  expect(screen.queryByLabelText('Account password')).toBeNull();
+
+  await user.click(screen.getByRole('button', { name: 'Unlock' }));
+  await user.type(await screen.findByLabelText('Account password'), 'hunter2{Enter}');
+  expect(await screen.findByRole('heading', { name: 'Open a cluster' })).toBeDefined();
+  expect(calls.find((c) => c.cmd === 'unlock_with_password')?.args).toEqual({
+    password: 'hunter2',
+  });
+
+  // An idle lock: Rust forgot the missing agent, so the field would answer not_permitted_here.
+  agentMissing = false;
+  state = lockState({ reason: 'idle', seq: state.seq + 1 });
+  await act(async () => {
+    await emit(LOCK_CHANGED, state);
+  });
+  expect(await screen.findByRole('heading', { name: 'AppRafter is locked' })).toBeDefined();
+  expect(screen.queryByLabelText('Account password')).toBeNull();
+  await idle();
+  expect(screen.queryByLabelText('Account password')).toBeNull();
+  expect(screen.getByRole('button', { name: 'Unlock' }).textContent).toBe('Unlock');
+  expect(count('app_info')).toBe(3);
 });

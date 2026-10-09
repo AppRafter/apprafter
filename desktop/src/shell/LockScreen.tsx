@@ -1,16 +1,25 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 // What a locked app shows (spec §4.3, brief §3): why it is locked, whose account unlocks it, and
-// one Unlock button — Rust asks the OS for the owner. The webview's own password field belongs
-// to the PAM path and needs `unlock_with_password` (D.2d); that command does not exist yet, so
-// no field is shown rather than one that cannot unlock anything.
-import { useState } from 'react';
+// how. Where the OS prompts (AuthInfo.passwordField false), one Unlock button: Rust asks the OS
+// for the owner. Where it cannot — Linux without a polkit agent or policy — the app's own
+// password field instead, checked by Rust (`unlock_with_password`); the plain button would only
+// ask for a prompt that cannot show. Whether the field shows is app_info's to say, read again on
+// every lock and after every refusal (state/platform.ts).
+//
+// The password lives in the field's state while it is typed, goes out with the request, and the
+// field is emptied when the answer comes, whatever it is: it is never cached, mutated through
+// the query client or logged. A wrong password shows what the OS said (PAM's messages) or a
+// plain line; too many failures hold the field for the back-off, saying why.
+import { type FormEvent, useEffect, useRef, useState } from 'react';
 import { Button } from '../components/Button';
+import { ArrowRightIcon, SpinnerGapIcon } from '../components/icons';
 import { Logo } from '../components/Logo';
+import { PasswordField } from '../components/PasswordField';
 import { Tag } from '../components/Tag';
 import { uiErrorOf } from '../ipc/api';
 import type { LockState } from '../ipc/generated/LockState';
 import type { SecretBackend } from '../ipc/generated/SecretBackend';
-import { authPrompt } from '../state/auth';
+import { authPrompt, authRefusal, BACKOFF_LINE, BACKOFF_MS, useBackoff } from '../state/auth';
 import { useLockActions } from '../state/lock';
 import { osName, usePlatform } from '../state/platform';
 
@@ -48,20 +57,41 @@ function initials(account: string): string {
   );
 }
 
-export function LockScreen({ state }: { state: LockState }) {
+export interface LockScreenProps {
+  state: LockState;
+  /** How long too many failed passwords hold the field; tests pass their own. */
+  backoffMs?: number;
+}
+
+export function LockScreen({ state, backoffMs = BACKOFF_MS }: LockScreenProps) {
   const info = usePlatform();
-  const { unlock } = useLockActions();
+  const { unlock, unlockWithPassword } = useLockActions();
   const [waiting, setWaiting] = useState(false);
-  const [refusal, setRefusal] = useState<string | null>(null);
+  const [refusal, setRefusal] = useState<readonly string[]>([]);
+  const [backoff, startBackoff] = useBackoff(backoffMs);
   const method = info.auth.method;
 
   const onUnlock = async () => {
     setWaiting(true);
-    setRefusal(null);
+    setRefusal([]);
     try {
       await unlock();
     } catch (error) {
-      setRefusal(uiErrorOf(error).message);
+      setRefusal(authRefusal(uiErrorOf(error), false).lines);
+      setWaiting(false);
+    }
+  };
+
+  // Resolves once the answer is in (never rejects): the field then empties itself.
+  const onPassword = async (password: string) => {
+    setWaiting(true);
+    setRefusal([]);
+    try {
+      await unlockWithPassword(password);
+    } catch (error) {
+      const refused = authRefusal(uiErrorOf(error), true);
+      setRefusal(refused.lines);
+      if (refused.backoff) startBackoff();
       setWaiting(false);
     }
   };
@@ -81,17 +111,93 @@ export function LockScreen({ state }: { state: LockState }) {
             <span className="lock-account-meta">{`${osName(info.os)} account · ${info.host}`}</span>
           </span>
         </div>
-        <Button variant="primary" size={36} full disabled={waiting} onClick={onUnlock}>
-          {waiting && method !== null ? `Waiting for ${authPrompt(method)}…` : 'Unlock'}
-        </Button>
-        {refusal !== null && (
-          <p className="lock-refusal" role="alert">
-            {refusal}
-          </p>
+        {info.auth.passwordField ? (
+          <PasswordForm
+            account={info.account}
+            checking={waiting}
+            backoff={backoff}
+            onSubmit={onPassword}
+          />
+        ) : (
+          <Button variant="primary" size={36} full disabled={waiting} onClick={onUnlock}>
+            {waiting && method !== null ? `Waiting for ${authPrompt(method)}…` : 'Unlock'}
+          </Button>
+        )}
+        {(refusal.length > 0 || backoff) && (
+          <div className="lock-refusal" role="alert">
+            {refusal.map((line, index) => (
+              // A fixed list per answer, replaced whole: the index is a stable key.
+              // biome-ignore lint/suspicious/noArrayIndexKey: see above
+              <p key={index}>{line}</p>
+            ))}
+            {backoff && <p>{BACKOFF_LINE}</p>}
+          </div>
         )}
         {info.testBuild && <Tag tone="warn">TEST BUILD</Tag>}
       </div>
       <footer className="lock-footer">{FOOTERS[info.secretBackend]}</footer>
     </main>
+  );
+}
+
+interface PasswordFormProps {
+  account: string;
+  /** A check is running: the field cannot change and nothing is sent again. */
+  checking: boolean;
+  /** Too many failed attempts: the field waits. */
+  backoff: boolean;
+  onSubmit: (password: string) => Promise<void>;
+}
+
+/**
+ * The field and its arrow (the design's lock screen). Its own component, so the password state
+ * goes with it whenever the field does.
+ */
+function PasswordForm({ account, checking, backoff, onSubmit }: PasswordFormProps) {
+  const input = useRef<HTMLInputElement>(null);
+  const [password, setPassword] = useState('');
+  const blocked = checking || backoff;
+
+  // In reach at once, and again once the back-off ends (a disabled field loses the focus).
+  useEffect(() => {
+    if (!backoff) input.current?.focus();
+  }, [backoff]);
+
+  const submit = (event: FormEvent) => {
+    event.preventDefault();
+    // Rust counts an empty password as a wrong one: never send it.
+    if (password === '' || blocked) return;
+    void onSubmit(password).finally(() => setPassword(''));
+  };
+
+  return (
+    <form className="lock-password" onSubmit={submit}>
+      <PasswordField
+        ref={input}
+        label="Account password"
+        placeholder={`Password for ${account}`}
+        value={password}
+        onChange={setPassword}
+        mono={false}
+        background="surface"
+        readOnly={checking}
+        disabled={backoff}
+      />
+      <Button
+        type="submit"
+        variant="primary"
+        size={36}
+        aria-label="Unlock"
+        title="Unlock"
+        aria-busy={checking || undefined}
+        disabled={password === '' || blocked}
+      >
+        {checking ? (
+          <SpinnerGapIcon className="spin" aria-hidden="true" />
+        ) : (
+          <ArrowRightIcon aria-hidden="true" />
+        )}
+      </Button>
+    </form>
   );
 }

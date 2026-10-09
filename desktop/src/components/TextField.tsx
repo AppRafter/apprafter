@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
-import { type InputHTMLAttributes, type ReactNode, useId } from 'react';
+import { type InputHTMLAttributes, type ReactNode, type Ref, useId } from 'react';
 import { Eyebrow } from './Eyebrow';
 
 export interface TextFieldProps
@@ -15,6 +15,8 @@ export interface TextFieldProps
   background?: 'bg' | 'surface';
   /** Inside the box, at the right (the password field's reveal button). */
   trailing?: ReactNode;
+  /** The input element, to move the focus to it. */
+  ref?: Ref<HTMLInputElement>;
 }
 
 /** An Eyebrow label, a 34px input and a hint, wired together for a screen reader. */

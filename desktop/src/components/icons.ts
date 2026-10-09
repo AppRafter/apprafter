@@ -4,6 +4,7 @@
 // CSS font-size (`1em`) and take `currentColor`, as the design's icon font did.
 
 export { ArchiveIcon } from '@phosphor-icons/react/dist/csr/Archive';
+export { ArrowRightIcon } from '@phosphor-icons/react/dist/csr/ArrowRight';
 export { BookOpenIcon } from '@phosphor-icons/react/dist/csr/BookOpen';
 export { CaretRightIcon } from '@phosphor-icons/react/dist/csr/CaretRight';
 export { CheckCircleIcon } from '@phosphor-icons/react/dist/csr/CheckCircle';
