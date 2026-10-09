@@ -171,10 +171,6 @@ fn server_types(
 }
 
 /// The SKU check of `execute_add` / `execute_machine`: server types only (no `/v1/locations`).
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "first caller: execute_machine (D.3b Task 8)")
-)]
 pub(crate) fn check_sku(
     ctx: &Context,
     token: &SecretString,
