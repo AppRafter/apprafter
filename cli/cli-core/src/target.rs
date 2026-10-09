@@ -105,6 +105,9 @@ pub fn config_root_from_override(custom: Option<String>) -> Result<PathBuf> {
         })
 }
 
+/// The length of a Hetzner Cloud API token: 64 ASCII alphanumeric characters.
+pub const HETZNER_TOKEN_LEN: usize = 64;
+
 /// Validate a Hetzner Cloud API token's surface format. Cheap
 /// pre-flight before the real `GET /v1/locations` ping that
 /// arrives in Track A.4 — here we only catch obvious typos and
@@ -127,10 +130,9 @@ pub fn config_root_from_override(custom: Option<String>) -> Result<PathBuf> {
 /// best how to phrase the surrounding error ("invalid token for
 /// --token flag" vs. "invalid token in credentials.yaml").
 pub fn validate_hetzner_token_format(token: &str) -> std::result::Result<(), String> {
-    const EXPECTED_LEN: usize = 64;
-    if token.len() != EXPECTED_LEN {
+    if token.len() != HETZNER_TOKEN_LEN {
         return Err(format!(
-            "Hetzner Cloud tokens are {EXPECTED_LEN} ASCII alphanumeric characters; got {}",
+            "Hetzner Cloud tokens are {HETZNER_TOKEN_LEN} ASCII alphanumeric characters; got {}",
             token.len()
         ));
     }
@@ -620,11 +622,9 @@ pub fn load_active_target_config(
 // Per-target IO
 // ---------------------------------------------------------------
 
-/// Read both halves (`config.yaml` + `credentials.yaml`) of one
-/// target. Missing target → `CliError::TargetNotFound` with the
-/// list of names currently present so error messages can be
-/// helpful without an extra round-trip.
-pub fn load_target(paths: &TargetStorePaths, name: &str) -> Result<Target> {
+/// Read one target's `config.yaml` only — never its credentials, so a listing reads no secret.
+/// Missing target → `CliError::TargetNotFound` with the names present, as [`load_target`].
+pub fn load_target_config(paths: &TargetStorePaths, name: &str) -> Result<TargetConfig> {
     let cfg_path = paths.target_config_file(name);
     if !cfg_path.exists() {
         let available = list_target_names(paths).unwrap_or_default().join(", ");
@@ -634,11 +634,18 @@ pub fn load_target(paths: &TargetStorePaths, name: &str) -> Result<Target> {
         });
     }
     let cfg_bytes = fs::read(&cfg_path)?;
-    let config: TargetConfig =
-        serde_yaml::from_slice(&cfg_bytes).map_err(|err| CliError::InvalidTargetConfig {
-            path: cfg_path.clone(),
-            message: err.to_string(),
-        })?;
+    serde_yaml::from_slice(&cfg_bytes).map_err(|err| CliError::InvalidTargetConfig {
+        path: cfg_path.clone(),
+        message: err.to_string(),
+    })
+}
+
+/// Read both halves (`config.yaml` + `credentials.yaml`) of one
+/// target. Missing target → `CliError::TargetNotFound` with the
+/// list of names currently present so error messages can be
+/// helpful without an extra round-trip.
+pub fn load_target(paths: &TargetStorePaths, name: &str) -> Result<Target> {
+    let config = load_target_config(paths, name)?;
 
     let creds_path = paths.target_credentials_file(name);
     let credentials = if creds_path.exists() {
@@ -1666,5 +1673,36 @@ mod tests {
     fn config_root_from_override_without_value_uses_the_platform_dir() {
         let root = config_root_from_override(None).unwrap();
         assert!(root.ends_with("apprafter"), "got {root:?}");
+    }
+
+    #[test]
+    fn the_config_loads_without_reading_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = TargetStorePaths::for_root(dir.path().to_path_buf());
+        save_target(
+            &paths,
+            &Target {
+                name: "prod".into(),
+                config: TargetConfig {
+                    provider: "hetzner-cloud".into(),
+                    ..Default::default()
+                },
+                credentials: TargetCredentials::default(),
+            },
+        )
+        .unwrap();
+        std::fs::write(paths.target_credentials_file("prod"), "{not yaml").unwrap();
+        assert_eq!(
+            load_target_config(&paths, "prod").unwrap().provider,
+            "hetzner-cloud"
+        );
+        assert!(
+            load_target(&paths, "prod").is_err(),
+            "the full load still reads credentials"
+        );
+        assert!(matches!(
+            load_target_config(&paths, "ghost"),
+            Err(CliError::TargetNotFound { .. })
+        ));
     }
 }

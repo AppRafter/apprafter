@@ -17,28 +17,50 @@ use age::x25519::{Identity, Recipient};
 
 use crate::{CliError, Result};
 
+/// The variable that overrides the age key path.
+pub const AGE_KEY_ENV: &str = "APPRAFTER_AGE_KEY";
+
 /// Resolve the on-disk path for the age private key. Honours
 /// `APPRAFTER_AGE_KEY`; falls back to `~/.config/apprafter/age.key`,
 /// where `~` is [`dirs::home_dir`]: `$HOME` on Unix when it is set and
 /// non-empty, else the account's home from the password database; the
 /// user profile on Windows. `/` only when no home resolves at all.
 pub fn default_age_key_path() -> PathBuf {
-    if let Ok(p) = std::env::var("APPRAFTER_AGE_KEY") {
-        return PathBuf::from(p);
+    let override_path = std::env::var(AGE_KEY_ENV).ok().map(PathBuf::from);
+    age_key_path_from(override_path.as_deref(), dirs::home_dir().as_deref())
+}
+
+/// The age key path from explicit inputs: the override verbatim (even empty), else
+/// `<home>/.config/apprafter/age.key`, else `/.config/apprafter/age.key`.
+pub fn age_key_path_from(override_path: Option<&Path>, home: Option<&Path>) -> PathBuf {
+    if let Some(p) = override_path {
+        return p.to_path_buf();
     }
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
-    home.join(".config").join("apprafter").join("age.key")
+    home.unwrap_or(Path::new("/"))
+        .join(".config")
+        .join("apprafter")
+        .join("age.key")
+}
+
+/// The identity at `path`, or `None` when the file is absent. Never creates anything: a read
+/// (doctor, a kubeconfig probe) must not mint a key that matches no ciphertext.
+pub fn load_identity(path: &Path) -> Result<Option<Identity>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| CliError::Other(format!("read age key {path:?}: {e}")))?;
+    Identity::from_str(raw.trim())
+        .map(Some)
+        .map_err(|e| CliError::Other(format!("parse age key {path:?}: {e}")))
 }
 
 /// Load the identity at `path`, or generate a fresh one and persist
 /// it (parent dir created, file mode 0600 on Unix) when the file
 /// is absent.
 pub fn load_or_create_identity(path: &Path) -> Result<Identity> {
-    if path.exists() {
-        let raw = std::fs::read_to_string(path)
-            .map_err(|e| CliError::Other(format!("read age key {path:?}: {e}")))?;
-        return Identity::from_str(raw.trim())
-            .map_err(|e| CliError::Other(format!("parse age key {path:?}: {e}")));
+    if let Some(identity) = load_identity(path)? {
+        return Ok(identity);
     }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -196,6 +218,49 @@ mod tests {
         // compares components, so `/` separates them on Windows too).
         assert!(p.ends_with(".config/apprafter/age.key"), "{p:?}");
         assert!(p.is_absolute(), "{p:?}");
+    }
+
+    #[test]
+    fn the_age_key_path_is_the_override_or_under_the_home() {
+        assert_eq!(
+            age_key_path_from(Some(Path::new("/k/age.key")), Some(Path::new("/h"))),
+            PathBuf::from("/k/age.key")
+        );
+        assert_eq!(
+            age_key_path_from(None, Some(Path::new("/h"))),
+            PathBuf::from("/h/.config/apprafter/age.key")
+        );
+        assert_eq!(
+            age_key_path_from(None, None),
+            PathBuf::from("/.config/apprafter/age.key")
+        );
+        assert_eq!(
+            age_key_path_from(Some(Path::new("")), None),
+            PathBuf::from("")
+        );
+    }
+
+    #[test]
+    fn loading_an_absent_identity_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sub/age.key");
+        assert!(load_identity(&path).unwrap().is_none());
+        assert!(
+            !path.exists() && !path.parent().unwrap().exists(),
+            "a read never writes"
+        );
+    }
+
+    #[test]
+    fn a_present_identity_loads_as_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("age.key");
+        let created = load_or_create_identity(&path).unwrap();
+        let loaded = load_identity(&path).unwrap().expect("present");
+        assert_eq!(
+            loaded.to_public().to_string(),
+            created.to_public().to_string()
+        );
     }
 
     #[test]
