@@ -5,6 +5,7 @@ import type { Check } from '../ipc/generated/Check';
 import type { DoctorReport } from '../ipc/generated/DoctorReport';
 import type { MachineCatalogue } from '../ipc/generated/MachineCatalogue';
 import type { MachineOfferView } from '../ipc/generated/MachineOfferView';
+import type { MachineSet } from '../ipc/generated/MachineSet';
 import type { PlanView } from '../ipc/generated/PlanView';
 import type { TargetAdded } from '../ipc/generated/TargetAdded';
 import type { ToolchainReport } from '../ipc/generated/ToolchainReport';
@@ -278,6 +279,17 @@ export function planParts(more: Partial<Omit<PlanView, 'opId'>> = {}): Omit<Plan
     changes: [],
     target: 'lab',
     expiresAtMs: Date.now() + 600_000,
+    ...more,
+  };
+}
+
+/** What `target machine` answers for staging: cpx22, checked in nbg1. */
+export function machineSet(more: Partial<MachineSet> = {}): MachineSet {
+  return {
+    name: 'staging',
+    sku: 'cpx22',
+    region: 'nbg1',
+    skuCheck: { status: 'validated', sku: 'cpx22', region: 'nbg1', regionWasDefault: false },
     ...more,
   };
 }
