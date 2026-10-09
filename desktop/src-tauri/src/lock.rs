@@ -3,7 +3,8 @@
 //! [`LockState`], and every command passes [`LockMachine::guard`] first.
 //!
 //! The lock is in effect when the settings switch it on **and** the [`Authenticator`] can
-//! verify the owner. Without an authenticator it fails closed in the only safe direction: a
+//! verify the owner — as its last answer says: the machine reads the [`AuthCache`], never the
+//! OS, so an OS slow to answer or hung holds up no tick, lock or state read. Without an authenticator it fails closed in the only safe direction: a
 //! lock nobody could open is no lock, so it is off (the webview shows a persistent banner from
 //! `AuthInfo`), switching it on is refused with `AuthUnavailable`, and destructive operations
 //! are refused by the [`OperationManager`](crate::ops::OperationManager) for the same reason.
@@ -27,6 +28,16 @@
 //! measured with [`elapsed_ms`](crate::ops::elapsed_ms): a suspend counts, a wall clock stepped
 //! back does not.
 //!
+//! # The start
+//!
+//! The start needs the authenticator's answer only to lock at start (`lock_on_start`, the lock
+//! on); otherwise it starts unlocked and asks nothing, the first answer coming in the
+//! background. When it needs it, it waits up to [`STARTUP_WITHIN`]. An answer later than that
+//! starts it locked provisionally — a slow answer never starts it unlocked — and when that
+//! answer comes, it unlocks through a normal transition only if it says nothing can verify the
+//! owner here (rule 3: a lock nobody could open is no lock) and nothing has changed since the
+//! start; otherwise the lock stands.
+//!
 //! # What waits for what
 //!
 //! Tauri runs the invoke handler on the main thread, and every command passes
@@ -41,12 +52,14 @@
 //! takes the manager's lock and sends their pages a final event under it. Nothing may take
 //! them the other way round, so no `LockMachine` method may be called from an
 //! [`EventSink::send`](crate::ops::EventSink::send), from a Rust-side `lock-changed`
-//! listener, from the hook itself, or from `persist`.
+//! listener, from the hook itself, or from `persist`. The [`AuthCache`]'s own lock comes last:
+//! the machine reads the cache under its lock, and the cache tells the machine of an answer on
+//! its asking thread, holding none of its own.
 
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::thread;
+use std::time::Duration;
 
 use apprafter_core::CancellationToken;
 use apprafter_desktop_ipc::{
@@ -55,10 +68,15 @@ use apprafter_desktop_ipc::{
 use zeroize::Zeroizing;
 
 use crate::auth::{AuthPurpose, Authenticator, PasswordAnswer};
+use crate::auth_cache::AuthCache;
 use crate::errors::{DesktopError, Refusal};
 use crate::ops::{panic_message, Clock, Stamp};
 
 const MINUTE_MS: u64 = 60_000;
+
+/// How long the start waits for the authenticator's first answer, when it needs one (see the
+/// module docs).
+pub const STARTUP_WITHIN: Duration = Duration::from_millis(500);
 
 /// Called with the new state on every transition between locked and unlocked, on which the app
 /// drops pending plans and ends every operation subscription, and on every update; on both it
@@ -77,7 +95,7 @@ pub enum LockChange {
 }
 
 pub struct LockMachine {
-    auth: Arc<dyn Authenticator>,
+    auth: Arc<AuthCache>,
     clock: Arc<dyn Clock>,
     hook: LockHook,
     inner: Mutex<Inner>,
@@ -104,6 +122,8 @@ struct Inner {
     prompt: Option<Prompt>,
     /// Set for good by [`LockMachine::close`]: no unlock prompt opens from then on.
     closing: bool,
+    /// Locked at start for want of the authenticator's answer, which has not come yet.
+    provisional: bool,
 }
 
 struct Prompt {
@@ -116,23 +136,39 @@ struct Prompt {
 
 impl LockMachine {
     /// Locked with [`LockReason::Startup`] when the lock is in effect and `lock_on_start` is
-    /// set; unlocked otherwise.
+    /// set; unlocked otherwise; locked provisionally when it would need the authenticator's
+    /// answer and that does not come within [`STARTUP_WITHIN`] (see the module docs).
     ///
     /// The app builds the machine on its main thread, where no OS backend may be asked (Windows
-    /// answers Hello's availability through a COM apartment the main thread does not pump), so
-    /// the authenticator is asked on a thread of its own, and waited for.
+    /// answers Hello's availability through a COM apartment the main thread does not pump): the
+    /// cache asks on a thread of its own, and this waits at most the bound.
     pub fn new(
         settings: Settings,
-        auth: Arc<dyn Authenticator>,
+        auth: Arc<AuthCache>,
         clock: Arc<dyn Clock>,
         hook: LockHook,
-    ) -> Self {
+    ) -> Arc<Self> {
         let now = Stamp::now(&*clock);
-        let info = off_this_thread("auth-info", || auth.info());
-        let reason =
-            (in_effect(&settings, &info) && settings.lock_on_start).then_some(LockReason::Startup);
-        let minutes = reported_minutes(&settings, &info);
-        Self {
+        let (reason, provisional) = if settings.lock_enabled && settings.lock_on_start {
+            match auth.fresh(STARTUP_WITHIN) {
+                Some(info) => (
+                    in_effect(&settings, &info).then_some(LockReason::Startup),
+                    false,
+                ),
+                None => {
+                    tracing::warn!(
+                        "the authenticator did not answer within {STARTUP_WITHIN:?}: locked \
+                         until it does"
+                    );
+                    (Some(LockReason::Startup), true)
+                }
+            }
+        } else {
+            auth.refresh();
+            (None, false)
+        };
+        let minutes = reported_minutes(&settings, &auth.info());
+        let machine = Arc::new(Self {
             auth,
             clock,
             hook,
@@ -145,10 +181,46 @@ impl LockMachine {
                 last_activity: now,
                 prompt: None,
                 closing: false,
+                provisional,
             }),
             locked: AtomicBool::new(reason.is_some()),
             settings_write: Mutex::new(()),
-        }
+        });
+        let weak = Arc::downgrade(&machine);
+        machine.auth.on_answer(move || {
+            if let Some(machine) = weak.upgrade() {
+                machine.auth_changed();
+            }
+        });
+        // An answer that came in before the listener did.
+        machine.auth_changed();
+        machine
+    }
+
+    /// The authenticator answered again: a start locked provisionally learns whether it may
+    /// stay locked (see the module docs), and a changed idle time is reported.
+    fn auth_changed(&self) {
+        let Some(info) = self.auth.known() else {
+            return;
+        };
+        let close = {
+            let mut inner = self.lock_inner();
+            let provisional = std::mem::take(&mut inner.provisional);
+            if provisional && !info.available && inner.seq == 0 {
+                tracing::info!(
+                    "the authenticator's late answer: nothing can verify the owner here, so the \
+                     start's lock is lifted"
+                );
+                let close = close_open_prompt(&mut inner);
+                let now = self.clock.now_ms();
+                self.enter(&mut inner, &info, None, now);
+                close
+            } else {
+                self.report(&mut inner, &info);
+                None
+            }
+        };
+        trip_prompt(close);
     }
 
     /// The state now. Should the authenticator's answer have changed what it reports (its idle
@@ -434,28 +506,6 @@ fn trip_prompt(cancel: Option<CancellationToken>) {
     }
 }
 
-/// `work`'s answer, worked out on a thread named `name` while this one waits; here, when no
-/// thread is to be had. A panic in `work` is raised again here.
-fn off_this_thread<T: Send>(name: &str, work: impl FnOnce() -> T + Send) -> T {
-    let work = Mutex::new(Some(work));
-    let run = || {
-        let work = work.lock().unwrap_or_else(|p| p.into_inner()).take();
-        work.map(|work| work())
-    };
-    let answer = thread::scope(|scope| {
-        match thread::Builder::new()
-            .name(name.into())
-            .spawn_scoped(scope, run)
-        {
-            Ok(handle) => handle
-                .join()
-                .unwrap_or_else(|payload| panic::resume_unwind(payload)),
-            Err(_) => run(),
-        }
-    });
-    answer.expect("the work runs once, on one thread or the other")
-}
-
 fn in_effect(settings: &Settings, info: &AuthInfo) -> bool {
     settings.lock_enabled && info.available
 }
@@ -495,11 +545,12 @@ mod tests {
 
     use zeroize::Zeroizing;
 
-    use super::{LockChange, LockMachine};
+    use super::{LockChange, LockMachine, STARTUP_WITHIN};
     use crate::auth::test_os::{self, Call, ScriptedOs};
     use crate::auth::{
         AuthPurpose, Authenticator, FakeAuthenticator, NoAuthenticator, PasswordAnswer,
     };
+    use crate::auth_cache::AuthCache;
     use crate::errors::DesktopError;
     use crate::ops::test_clock::ManualClock;
     use crate::ops::test_trips;
@@ -535,26 +586,37 @@ mod tests {
         clock: Arc<ManualClock>,
         hooked: Arc<Hooked>,
         machine: Arc<LockMachine>,
+        cache: Arc<AuthCache>,
     }
 
+    /// The machine over `auth`, once the authenticator's first answer is in.
     fn rig(settings: Settings, auth: Arc<dyn Authenticator>) -> Rig {
+        let r = rig_unsettled(settings, auth);
+        assert!(r.cache.settled(LONG), "the authenticator never answered");
+        r
+    }
+
+    /// The machine over `auth`, as it returns from its start.
+    fn rig_unsettled(settings: Settings, auth: Arc<dyn Authenticator>) -> Rig {
         let clock = Arc::new(ManualClock::at(T0));
         let hooked = Arc::new(Hooked::default());
+        let cache = AuthCache::new(auth);
         let machine = {
             let hooked = hooked.clone();
-            Arc::new(LockMachine::new(
+            LockMachine::new(
                 settings,
-                auth,
+                cache.clone(),
                 clock.clone(),
                 Box::new(move |state, change| {
                     hooked.0.lock().unwrap().push((state.clone(), change))
                 }),
-            ))
+            )
         };
         Rig {
             clock,
             hooked,
             machine,
+            cache,
         }
     }
 
@@ -791,9 +853,213 @@ mod tests {
             locked(LockReason::Startup, T0, Some(10), 0),
             "its answer still decides the start"
         );
+        r.machine.tick();
+        r.machine.lock(LockReason::OsSession);
         let askers = auth.0.lock().unwrap().clone();
         assert!(!askers.is_empty());
-        assert_ne!(askers[0], thread::current().id(), "asked on this thread");
+        assert!(
+            askers.iter().all(|asker| *asker != thread::current().id()),
+            "asked on this thread"
+        );
+    }
+
+    // I-2, I-3. The machine reads the kept answer, never the OS, and starts within its bound.
+
+    /// An OS whose every `info` waits for the test to answer it; prompts verify at once.
+    struct Gated {
+        answers: Mutex<mpsc::Receiver<AuthInfo>>,
+        asked: AtomicUsize,
+    }
+
+    impl Gated {
+        fn new() -> (Arc<Self>, mpsc::Sender<AuthInfo>) {
+            let (send, answers) = mpsc::channel();
+            let gated = Arc::new(Self {
+                answers: Mutex::new(answers),
+                asked: AtomicUsize::new(0),
+            });
+            (gated, send)
+        }
+    }
+
+    impl Authenticator for Gated {
+        fn info(&self) -> AuthInfo {
+            self.asked.fetch_add(1, SeqCst);
+            self.answers
+                .lock()
+                .unwrap()
+                .recv_timeout(LONG)
+                .unwrap_or_else(|_| NoAuthenticator.info())
+        }
+
+        fn verify(&self, _purpose: &AuthPurpose, _cancel: &CancellationToken) -> AuthOutcome {
+            AuthOutcome::Verified
+        }
+    }
+
+    /// The machine over `auth`, started on a thread of its own, so a start that waits for ever
+    /// fails the test instead of hanging it.
+    fn started(settings: Settings, auth: Arc<dyn Authenticator>) -> Rig {
+        within("the start", move || rig_unsettled(settings, auth))
+    }
+
+    #[test]
+    fn the_lock_reads_the_kept_answer_and_an_os_that_stops_answering_holds_nothing_up() {
+        let (os, answer) = Gated::new();
+        let r = started(unlocked_at_start(), os.clone());
+        answer.send(FakeAuthenticator::new().info()).unwrap();
+        assert!(r.cache.settled(LONG));
+        // From here every question hangs.
+        r.cache.refresh();
+        let ((), took) = {
+            let (machine, clock) = (r.machine.clone(), r.clock.clone());
+            within("the lock's calls", move || {
+                let started = Instant::now();
+                machine.tick();
+                let _ = machine.state();
+                machine
+                    .set_settings(unlocked_at_start(), |_| Ok(()))
+                    .unwrap();
+                machine.os_session();
+                assert!(machine.state().locked, "the session event locked it");
+                machine.unlock().unwrap();
+                clock.set(T0 + 10 * MIN);
+                machine.tick();
+                ((), started.elapsed())
+            })
+        };
+        assert!(took < LONG / 2, "{took:?}");
+        assert_eq!(
+            r.machine.state().reason,
+            Some(LockReason::Idle),
+            "the idle lock still fired"
+        );
+        drop(answer);
+    }
+
+    #[test]
+    fn without_lock_on_start_the_start_asks_nothing_and_waits_for_nothing() {
+        let (os, answer) = Gated::new();
+        let started_at = Instant::now();
+        let r = started(unlocked_at_start(), os.clone());
+        assert!(started_at.elapsed() < STARTUP_WITHIN, "it waited");
+        assert_eq!(r.machine.state(), unlocked(T0, Some(10), 0));
+        drop(answer);
+    }
+
+    #[test]
+    fn a_slow_answer_starts_locked_within_the_bound() {
+        let (os, answer) = Gated::new();
+        let started_at = Instant::now();
+        let r = started(Settings::default(), os.clone());
+        let took = started_at.elapsed();
+        assert!(
+            took >= STARTUP_WITHIN && took < STARTUP_WITHIN + LONG / 4,
+            "{took:?}"
+        );
+        assert_eq!(
+            r.machine.state(),
+            locked(LockReason::Startup, T0, Some(10), 0)
+        );
+        assert!(matches!(
+            r.machine.guard("op_list"),
+            Err(DesktopError::Locked)
+        ));
+        drop(answer);
+    }
+
+    #[test]
+    fn a_late_unavailable_unlocks_through_a_transition_the_page_hears() {
+        let (os, answer) = Gated::new();
+        let r = started(Settings::default(), os.clone());
+        assert!(r.machine.state().locked);
+        r.clock.set(T0 + MIN);
+        answer.send(NoAuthenticator.info()).unwrap();
+        assert!(r.cache.settled(LONG));
+        let open = unlocked(T0 + MIN, None, 1);
+        assert_eq!(
+            r.hooked.calls(),
+            std::slice::from_ref(&open),
+            "the page heard it"
+        );
+        assert_eq!(r.hooked.changes(), [LockChange::Transition]);
+        assert_eq!(r.machine.state(), open, "rule 3's end state");
+        assert!(r.machine.guard("op_list").is_ok());
+    }
+
+    #[test]
+    fn a_late_available_keeps_it_locked() {
+        let (os, answer) = Gated::new();
+        let r = started(Settings::default(), os.clone());
+        answer.send(FakeAuthenticator::new().info()).unwrap();
+        assert!(r.cache.settled(LONG));
+        assert_eq!(
+            r.machine.state(),
+            locked(LockReason::Startup, T0, Some(10), 0)
+        );
+        assert!(r.hooked.calls().is_empty());
+    }
+
+    #[test]
+    fn a_late_answer_after_the_owner_acted_changes_nothing() {
+        let (os, answer) = Gated::new();
+        let r = started(Settings::default(), os.clone());
+        // The owner unlocks (the prompt is the OS's own, asked afresh) and locks again.
+        r.machine.unlock().unwrap();
+        r.clock.set(T0 + MIN);
+        r.machine.lock(LockReason::Manual);
+        answer.send(NoAuthenticator.info()).unwrap();
+        // The first answer, then the question the unlock and the lock asked meanwhile.
+        answer.send(NoAuthenticator.info()).unwrap();
+        assert!(r.cache.settled(LONG));
+        let state = r.machine.state();
+        assert!(state.locked, "{state:?}");
+        assert_eq!(state.reason, Some(LockReason::Manual));
+        assert_eq!(
+            r.hooked.changes(),
+            [
+                LockChange::Transition,
+                LockChange::Transition,
+                LockChange::Update
+            ],
+            "unlock, lock, then only the idle time it no longer has"
+        );
+        assert_eq!(state.auto_lock_minutes, None);
+    }
+
+    #[test]
+    fn a_late_unavailable_closes_an_open_unlock_prompt() {
+        let (prompt, ends) = HeldPrompt::new();
+        let (os, answer) = Gated::new();
+        struct Both(Arc<Gated>, Arc<HeldPrompt>);
+        impl Authenticator for Both {
+            fn info(&self) -> AuthInfo {
+                self.0.info()
+            }
+            fn verify(&self, purpose: &AuthPurpose, cancel: &CancellationToken) -> AuthOutcome {
+                self.1.verify(purpose, cancel)
+            }
+        }
+        let r = started(Settings::default(), Arc::new(Both(os, prompt)));
+        let first = unlock_in_background(&r.machine);
+        ends.opened.recv_timeout(LONG).expect("the prompt opened");
+        answer.send(NoAuthenticator.info()).unwrap();
+        ends.tripped
+            .recv_timeout(LONG)
+            .expect("the unlock closed the prompt");
+        ends.answer.send(AuthOutcome::Verified).unwrap();
+        let result = first.recv_timeout(LONG).expect("the unlock returned");
+        assert!(
+            matches!(result, Err(DesktopError::AuthCancelled)),
+            "{result:?}"
+        );
+        assert_eq!(
+            r.hooked.changes(),
+            [LockChange::Transition],
+            "unlocked once"
+        );
+        assert!(!r.machine.state().locked);
+        drop(answer);
     }
 
     #[test]
@@ -1568,7 +1834,7 @@ mod tests {
             let (auth, heard) = (auth.clone(), heard.clone());
             LockMachine::new(
                 unlocked_at_start(),
-                auth.clone(),
+                AuthCache::new(auth.clone()),
                 clock.clone(),
                 Box::new(move |state, _| {
                     heard
@@ -1651,9 +1917,20 @@ mod tests {
             (unlocked_at_start(), Arc::new(NoAuthenticator)),
         ] {
             let r = rig(settings.clone(), auth);
+            let before = r.hooked.calls();
             r.machine.os_session();
             assert!(!r.machine.state().locked, "{settings:?}");
-            assert!(r.hooked.calls().is_empty(), "{settings:?}");
+            // Without an authenticator the start reported an idle time until it answered,
+            // and then an update without one: no transition, before or after the event.
+            assert!(
+                !r.hooked.changes().contains(&LockChange::Transition),
+                "{settings:?}"
+            );
+            assert_eq!(
+                r.hooked.calls(),
+                before,
+                "{settings:?}: the event changed nothing"
+            );
         }
     }
 
@@ -1802,7 +2079,7 @@ mod tests {
             let calls = calls.clone();
             LockMachine::new(
                 unlocked_at_start(),
-                fake(),
+                AuthCache::new(fake()),
                 clock.clone(),
                 Box::new(move |_, _| {
                     if calls.fetch_add(1, SeqCst) == 0 {
@@ -1875,9 +2152,9 @@ mod tests {
         let (entered_tx, entered) = mpsc::channel();
         let (release, release_rx) = mpsc::channel::<()>();
         let gate = Mutex::new((entered_tx, release_rx));
-        let machine = Arc::new(LockMachine::new(
+        let machine = LockMachine::new(
             unlocked_at_start(),
-            fake(),
+            AuthCache::new(fake()),
             Arc::new(ManualClock::at(T0)),
             Box::new(move |_, _| {
                 let gate = gate.lock().unwrap();
@@ -1885,7 +2162,7 @@ mod tests {
                 // Until the test releases it, or fails and drops the sender.
                 let _ = gate.1.recv();
             }),
-        ));
+        );
         let locking = {
             let machine = machine.clone();
             thread::spawn(move || machine.lock(LockReason::Manual))

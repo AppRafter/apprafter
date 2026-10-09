@@ -94,6 +94,10 @@ pub fn rig(settings: Settings) -> Rig {
         false,
         |_| {},
     );
+    assert!(
+        shell.auth.settled(Duration::from_secs(10)),
+        "the authenticator never answered"
+    );
     let cell = ShellCell::default();
     let app = app::builder(mock_builder(), cell.clone())
         .plugin(app::opener_plugin())

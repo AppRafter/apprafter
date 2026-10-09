@@ -3,6 +3,7 @@
 
 pub mod app;
 pub mod auth;
+pub mod auth_cache;
 pub mod commands;
 pub mod env;
 pub mod errors;

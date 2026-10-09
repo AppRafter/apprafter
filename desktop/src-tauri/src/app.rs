@@ -73,6 +73,7 @@ use tauri::{AppHandle, Emitter, ExitRequestApi, Manager, Runtime};
 use zeroize::Zeroizing;
 
 use crate::auth::Authenticator;
+use crate::auth_cache::AuthCache;
 use crate::commands;
 use crate::errors::{DesktopError, Refusal};
 use crate::lock::{LockChange, LockHook, LockMachine};
@@ -97,6 +98,9 @@ pub const FLUSH_TICK: Duration = Duration::from_millis(crate::ops::reporter::FLU
 
 /// What `app_info` says when the OS does not name the account or the host.
 const UNKNOWN: &str = "unknown";
+
+/// How long `app_info` waits for the authenticator's fresh answer before it gives the last one.
+pub const APP_INFO_AUTH_WITHIN: Duration = Duration::from_secs(1);
 
 /// How long `app_info` waits, from the OS session watch's start, for the watch to say what it
 /// hears (`AppInfo.sessionEvents`); after it, `app_info` says what is known.
@@ -280,7 +284,8 @@ pub struct Shell {
     pub settings: SettingsStore,
     pub lock: Arc<LockMachine>,
     pub ops: Arc<OperationManager>,
-    pub auth: Arc<dyn Authenticator>,
+    /// The authenticator, its answer about what it can do kept ([`AuthCache`]).
+    pub auth: Arc<AuthCache>,
     /// The core's view of this process: the target store and the provider API.
     pub context: Context,
     /// A test build (fake authentication): `app_info` tells the webview to say so.
@@ -356,8 +361,9 @@ impl Shell {
     /// Nothing else can subscribe while locked, and the page subscribes again only once it
     /// hears of the unlock, after this ran.
     ///
-    /// `auth` is given the settings first ([`Authenticator::apply_settings`]: Windows' `hello`),
-    /// and again after every save.
+    /// `auth` is kept behind an [`AuthCache`], which the lock reads instead of the OS. It is
+    /// given the settings first ([`Authenticator::apply_settings`]: Windows' `hello`), and again
+    /// after every save.
     pub fn new(
         settings: SettingsStore,
         auth: Arc<dyn Authenticator>,
@@ -377,8 +383,9 @@ impl Shell {
                 on_lock_change(state);
             })
         };
+        let auth = AuthCache::new(auth);
         auth.apply_settings(&settings.get());
-        let lock = Arc::new(LockMachine::new(settings.get(), auth.clone(), clock, hook));
+        let lock = LockMachine::new(settings.get(), auth.clone(), clock, hook);
         Arc::new(Self {
             settings,
             lock,
@@ -393,9 +400,10 @@ impl Shell {
         })
     }
 
-    /// The `app_info` answer. Its `auth` is the authenticator's answer now, never one kept from
-    /// the start: it changes (a polkit dialog that found no agent moves Linux to the password
-    /// field, a lock moves it back). Its `session_events` waits, up to
+    /// The `app_info` answer. Its `auth` is asked of the authenticator afresh, waiting up to
+    /// [`APP_INFO_AUTH_WITHIN`] for it and else the last answer: it changes (a polkit dialog
+    /// that found no agent moves Linux to the password field, a lock moves it back), and before
+    /// any answer it is [`UNANSWERED`](crate::auth_cache::UNANSWERED). Its `session_events` waits, up to
     /// [`SESSION_READY_WITHIN`] from the watch's start, while the watch has not said what it
     /// hears (see the module docs): call it on a blocking worker, never on the main thread.
     pub fn app_info(&self) -> AppInfo {
@@ -406,7 +414,10 @@ impl Shell {
             secret_backend: SecretBackend::File,
             account: whoami::username().unwrap_or_else(|_| UNKNOWN.into()),
             host: whoami::hostname().unwrap_or_else(|_| UNKNOWN.into()),
-            auth: self.auth.info(),
+            auth: self
+                .auth
+                .fresh(APP_INFO_AUTH_WITHIN)
+                .unwrap_or_else(|| self.auth.info()),
             session_events: self.session.events(),
             test_build: self.test_build,
             settings_notice: self.settings.notice(),
@@ -852,6 +863,7 @@ mod tests {
                 move |state| notified.lock().unwrap().push(state.clone()),
             )
         };
+        assert!(shell.auth.settled(LONG), "the authenticator never answered");
         Rig {
             _dir: dir,
             clock,
