@@ -101,7 +101,7 @@ install_desktop_deps() {
     [ -e /usr/include/security/pam_appl.h ]; then return; fi
   sudo apt-get update
   sudo apt-get install -y --no-install-recommends build-essential pkg-config file \
-    libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libpam0g-dev
+    libwebkit2gtk-4.1-dev librsvg2-dev libpam0g-dev
 }
 
 install_cue

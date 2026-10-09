@@ -52,6 +52,9 @@
     active: true,
     icon: ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico"],
     macOS: { minimumSystemVersion: "13.0" },
+    // What the deb and rpm packages and the launcher say about the app.
+    shortDescription: "AppRafter Desktop: the AppRafter command line, as a desktop app.",
+    longDescription: "AppRafter Desktop works with the same targets as the apprafter command line. It locks itself\nand unlocks with the operating system's own sign-in.",
     // Tauri adds WebKitGTK and GTK to `depends` itself; PAM is the app's own (its password
     // field links -lpam), named by soname for rpm as Tauri names its own. The polkit policy
     // goes where every polkit version reads actions. polkitd is recommended, not required:

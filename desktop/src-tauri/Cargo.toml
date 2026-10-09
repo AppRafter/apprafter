@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
 [package]
 name        = "apprafter-desktop"
-description = "AppRafter Desktop — the GUI twin of the apprafter CLI (ADR 0067)."
+description = "AppRafter Desktop: the AppRafter command line, as a desktop app."
 # The desktop release stream's version authority (design spec §6.1). Unpublished until D.13;
 # tauri.conf.json5 carries no version and falls back to this one.
 version     = "0.1.0"

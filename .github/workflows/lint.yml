@@ -301,7 +301,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends build-essential pkg-config file \
-            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libpam0g-dev
+            libwebkit2gtk-4.1-dev librsvg2-dev libpam0g-dev
       # cli/cli-providers/build.rs runs `cue export` — same reason as the rust-cli job.
       - uses: cue-lang/setup-cue@b0e30e540a2dae47304ebf16586a5b2db023b61c # v2.0.0
         with:
