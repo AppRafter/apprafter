@@ -12,6 +12,12 @@
 //!   owner's settings and logs ([`data_dir_override`]), and never finds the owner's running
 //!   instance ([`instance_identifier`]). It fails closed: set but empty or not Unicode, the app
 //!   refuses to start rather than fall back on the owner's own files;
+//! - on Linux and Windows, `PATH`: where the tools the app runs (`kubectl`, `helm`, `restic`,
+//!   `git`, `ssh`, `cue`) are looked for, and the `PATH` they get ([`desktop_host`]). An
+//!   inherited `PATH` decides which `kubectl` runs: a recorded trust decision (spec rev 4 §10).
+//!   macOS does not read it — an app started from Finder has launchd's bare `PATH` — and asks
+//!   the account's login shell for its `PATH` instead (five-second limit), falling back to
+//!   [`MACOS_FALLBACK_PATH`];
 //! - in a test build only (cargo feature `test-build`), `APPRAFTER_HCLOUD_BASE_URL`, which the
 //!   core then accepts only as a loopback `http://` URL ([`desktop_context`]), and
 //!   `APPRAFTER_DESKTOP_TEST_PASSWORD`, the password the fake authenticator's own field accepts,
@@ -25,8 +31,8 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use apprafter_core::context::HCLOUD_BASE_URL_ENV;
-use apprafter_core::{Context, CoreResult, DesktopPolicy, EnvSource};
+use apprafter_core::context::{HCLOUD_BASE_URL_ENV, PATH_ENV};
+use apprafter_core::{Context, CoreResult, DesktopHost, DesktopPolicy, EnvSource, PathSource};
 use cli_core::CONFIG_DIR_ENV;
 
 /// Points the desktop's own files (settings, logs) at another directory.
@@ -87,9 +93,7 @@ impl AllowListEnv {
 
     /// Whether `key` is on this view's allow-list.
     pub fn allows(&self, key: &str) -> bool {
-        key == CONFIG_DIR_ENV
-            || key == DATA_DIR_ENV
-            || (self.test_build && (key == HCLOUD_BASE_URL_ENV || key == TEST_PASSWORD_ENV))
+        allows_on(key, self.test_build, cfg!(target_os = "macos"))
     }
 
     fn policy(&self) -> DesktopPolicy {
@@ -101,9 +105,24 @@ impl AllowListEnv {
     }
 }
 
+/// Whether `key` is on the allow-list for a view with `test_build`, on macOS or not. `PATH` is
+/// read on Linux and Windows (the tool search path, a recorded trust decision: spec rev 4
+/// §10); macOS asks the account's login shell instead ([`desktop_host`]).
+fn allows_on(key: &str, test_build: bool, macos: bool) -> bool {
+    key == CONFIG_DIR_ENV
+        || key == DATA_DIR_ENV
+        || (key == PATH_ENV && !macos)
+        || (test_build && (key == HCLOUD_BASE_URL_ENV || key == TEST_PASSWORD_ENV))
+}
+
 impl EnvSource for AllowListEnv {
     fn var(&self, key: &str) -> Option<String> {
         self.var_os(key)?.into_string().ok()
+    }
+
+    /// The raw value, so a `PATH` that is not valid Unicode survives.
+    fn var_os(&self, key: &str) -> Option<OsString> {
+        AllowListEnv::var_os(self, key)
     }
 }
 
@@ -115,16 +134,117 @@ impl fmt::Debug for AllowListEnv {
     }
 }
 
+/// What only this process knows about where the core may look and write: the tool search path
+/// and the runtime dir (`<app data dir>/run`).
+pub fn desktop_host(env: &AllowListEnv, runtime_dir: PathBuf) -> DesktopHost {
+    let (tool_search_path, tool_search_path_source) = tool_search_path(env);
+    DesktopHost {
+        runtime_dir,
+        tool_search_path,
+        tool_search_path_source,
+    }
+}
+
+/// Linux and Windows: the allow-listed `PATH`, raw.
+#[cfg(not(target_os = "macos"))]
+fn tool_search_path(env: &AllowListEnv) -> (OsString, PathSource) {
+    (
+        env.var_os(PATH_ENV).unwrap_or_default(),
+        PathSource::Environment,
+    )
+}
+
+/// macOS: the account's login shell's `PATH` (an app started from Finder has launchd's).
+#[cfg(target_os = "macos")]
+fn tool_search_path(_env: &AllowListEnv) -> (OsString, PathSource) {
+    login_shell_path()
+}
+
+/// The line before the `PATH` in the login shell's output.
+const PATH_MARKER: &str = "__APPRAFTER_PATH__";
+
+/// `printenv` prints the exported, `:`-joined `PATH` in every shell (fish included, which
+/// expands a quoted `"$PATH"` to a space-joined list).
+#[cfg(target_os = "macos")]
+const LOGIN_SHELL_SCRIPT: &str = "echo __APPRAFTER_PATH__; /usr/bin/printenv PATH";
+
+/// The search path when the login shell gives none: the system's own directories.
+pub const MACOS_FALLBACK_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+
+/// The first non-empty line after the last marker line of a login shell's stdout (a profile may
+/// print before it).
+pub fn parse_login_shell_output(stdout: &[u8]) -> Option<OsString> {
+    let text = String::from_utf8_lossy(stdout);
+    let (_, after) = text.rsplit_once(PATH_MARKER)?;
+    let line = after.lines().find(|l| !l.trim().is_empty())?.trim();
+    Some(OsString::from(line))
+}
+
+/// The account's login shell's `PATH`, run as `<shell> -l -c '<script>'` with stdin null and
+/// killed after five seconds; [`MACOS_FALLBACK_PATH`] when that gives none.
+#[cfg(target_os = "macos")]
+fn login_shell_path() -> (OsString, PathSource) {
+    let fallback = || {
+        tracing::warn!(
+            "the login shell gave no PATH; tools are looked for in {MACOS_FALLBACK_PATH}"
+        );
+        (OsString::from(MACOS_FALLBACK_PATH), PathSource::Fallback)
+    };
+    let Some(shell) = account_shell() else {
+        return fallback();
+    };
+    let mut cmd = std::process::Command::new(shell);
+    cmd.args(["-l", "-c", LOGIN_SHELL_SCRIPT]);
+    match apprafter_core::process::run_bounded(
+        cmd,
+        std::time::Duration::from_secs(5),
+        &apprafter_core::CancellationToken::new(),
+    ) {
+        Ok(out) if !out.timed_out => parse_login_shell_output(&out.stdout)
+            .map(|p| (p, PathSource::LoginShell))
+            .unwrap_or_else(fallback),
+        _ => fallback(),
+    }
+}
+
+/// The account's login shell from the password database (`SHELL` is an environment read).
+#[cfg(target_os = "macos")]
+fn account_shell() -> Option<PathBuf> {
+    // SAFETY: `passwd` is a plain C struct; all-zero is a valid (empty) value.
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buf = vec![0 as libc::c_char; 4096];
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: every pointer refers to a live, correctly sized buffer owned by this frame.
+    let rc = unsafe {
+        libc::getpwuid_r(
+            libc::getuid(),
+            &mut pwd,
+            buf.as_mut_ptr(),
+            buf.len(),
+            &mut result,
+        )
+    };
+    if rc != 0 || result.is_null() || pwd.pw_shell.is_null() {
+        return None;
+    }
+    // SAFETY: `pw_shell` points into `buf`, NUL-terminated by getpwuid_r.
+    let shell = unsafe { std::ffi::CStr::from_ptr(pwd.pw_shell) }
+        .to_str()
+        .ok()?;
+    (!shell.is_empty()).then(|| PathBuf::from(shell))
+}
+
 /// The core's [`Context`] for this process: the store root from `APPRAFTER_CONFIG_DIR` (else the
 /// platform default the CLI uses too), and the real Hetzner API — or, in a test build, the
 /// loopback mock `APPRAFTER_HCLOUD_BASE_URL` names; any other value there is refused with
 /// [`CoreError::UnsafeOverride`](apprafter_core::CoreError::UnsafeOverride). Every CLI override
-/// the process inherited (`HCLOUD_TOKEN` first) is ignored.
+/// the process inherited (`HCLOUD_TOKEN` first) is ignored. The tool search path and the
+/// runtime dir come from `host` ([`desktop_host`]).
 ///
 /// The policy follows `env`'s own build flag ([`AllowListEnv::test_build`]), so a release view
 /// can never be paired with the test-build policy, nor the other way round.
-pub fn desktop_context(env: &AllowListEnv) -> CoreResult<Context> {
-    Context::from_desktop_env(env, env.policy())
+pub fn desktop_context(env: &AllowListEnv, host: DesktopHost) -> CoreResult<Context> {
+    Context::from_desktop_env(env, env.policy(), host)
 }
 
 /// Why the data-directory override cannot be used: the app refuses to start (exit code 2)
@@ -238,13 +358,14 @@ mod tests {
 
     use super::*;
 
-    /// Everything a terminal might hand the app: the four names on the list and some it must
-    /// never see.
+    /// Everything a terminal might hand the app: the names on the list (`PATH` off macOS) and
+    /// some it must never see.
     const AMBIENT: &[(&str, &str)] = &[
         ("APPRAFTER_CONFIG_DIR", "/tmp/store"),
         ("APPRAFTER_DESKTOP_DATA_DIR", "/tmp/walk"),
         ("APPRAFTER_HCLOUD_BASE_URL", "http://127.0.0.1:9"),
         ("APPRAFTER_DESKTOP_TEST_PASSWORD", "open sesame"),
+        ("PATH", "/usr/bin:/bin"),
         ("HCLOUD_TOKEN", "inherited-token"),
         ("APPRAFTER_AGE_KEY", "/tmp/age.key"),
         ("APPRAFTER_SSH_PRIVATE_KEY", "/tmp/id"),
@@ -267,11 +388,16 @@ mod tests {
         AllowListEnv::with_lookup(test_build, move |k| map.get(k).cloned())
     }
 
+    /// Whether this platform's allow-list carries `PATH` (Linux and Windows; macOS asks the
+    /// login shell instead).
+    const PATH_LISTED: bool = !cfg!(target_os = "macos");
+
     #[test]
-    fn a_release_build_answers_only_the_store_root_and_the_data_dir() {
+    fn a_release_build_answers_only_the_store_root_the_data_dir_and_path() {
         let env = env_of(false, AMBIENT);
         for (key, value) in AMBIENT {
-            let expected = matches!(*key, "APPRAFTER_CONFIG_DIR" | "APPRAFTER_DESKTOP_DATA_DIR")
+            let expected = (matches!(*key, "APPRAFTER_CONFIG_DIR" | "APPRAFTER_DESKTOP_DATA_DIR")
+                || (*key == "PATH" && PATH_LISTED))
                 .then(|| value.to_string());
             assert_eq!(env.var(key), expected, "{key}");
         }
@@ -282,17 +408,61 @@ mod tests {
     fn a_test_build_also_answers_the_api_base_and_the_test_password_and_nothing_else() {
         let env = env_of(true, AMBIENT);
         for (key, value) in AMBIENT {
-            let expected = matches!(
+            let expected = (matches!(
                 *key,
                 "APPRAFTER_CONFIG_DIR"
                     | "APPRAFTER_DESKTOP_DATA_DIR"
                     | "APPRAFTER_HCLOUD_BASE_URL"
                     | "APPRAFTER_DESKTOP_TEST_PASSWORD"
-            )
-            .then(|| value.to_string());
+            ) || (*key == "PATH" && PATH_LISTED))
+                .then(|| value.to_string());
             assert_eq!(env.var(key), expected, "{key}");
         }
         assert!(env.test_build());
+    }
+
+    #[test]
+    fn path_is_on_the_list_except_on_macos() {
+        for test_build in [false, true] {
+            assert!(
+                allows_on("PATH", test_build, false),
+                "Linux/Windows read PATH"
+            );
+            assert!(
+                !allows_on("PATH", test_build, true),
+                "macOS asks the login shell instead"
+            );
+        }
+    }
+
+    #[test]
+    fn the_login_shell_output_yields_the_path_after_the_last_marker() {
+        let out = b"Last login: x\n__APPRAFTER_PATH__\n/old\n__APPRAFTER_PATH__\n/opt/homebrew/bin:/usr/bin\n";
+        assert_eq!(
+            parse_login_shell_output(out),
+            Some(OsString::from("/opt/homebrew/bin:/usr/bin"))
+        );
+        assert_eq!(parse_login_shell_output(b"no marker\n"), None);
+        assert_eq!(parse_login_shell_output(b"__APPRAFTER_PATH__\n\n"), None);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn the_host_takes_the_allow_listed_path() {
+        let env = env_of(false, &[("PATH", "/usr/bin:/bin")]);
+        let host = desktop_host(&env, PathBuf::from("/data/run"));
+        assert_eq!(host.tool_search_path, OsString::from("/usr/bin:/bin"));
+        assert_eq!(host.tool_search_path_source, PathSource::Environment);
+        assert_eq!(host.runtime_dir, PathBuf::from("/data/run"));
+    }
+
+    /// The host the context tests pass: a fixed search path and runtime dir.
+    fn test_host() -> DesktopHost {
+        DesktopHost {
+            runtime_dir: "/tmp/desk/run".into(),
+            tool_search_path: "/opt/bin".into(),
+            tool_search_path_source: PathSource::Explicit,
+        }
     }
 
     #[test]
@@ -321,6 +491,9 @@ mod tests {
                     "APPRAFTER_HCLOUD_BASE_URL",
                 ]);
             }
+            if PATH_LISTED {
+                expected.push("PATH");
+            }
             let mut asked_sorted = asked;
             asked_sorted.sort();
             assert_eq!(asked_sorted, expected, "test_build={test_build}");
@@ -328,7 +501,6 @@ mod tests {
     }
 
     /// The real environment, read and never written: whatever this test process inherited.
-    /// `PATH` is set in any process, so its `None` shows the list at work.
     #[test]
     fn from_process_reads_the_real_environment_through_the_list() {
         for test_build in [false, true] {
@@ -345,8 +517,13 @@ mod tests {
                 .then(|| std::env::var(TEST_PASSWORD_ENV).ok())
                 .flatten();
             assert_eq!(env.var(TEST_PASSWORD_ENV), password);
-            assert!(std::env::var_os("PATH").is_some());
-            assert_eq!(env.var("PATH"), None);
+            assert_eq!(
+                env.var("PATH"),
+                PATH_LISTED.then(|| std::env::var("PATH").ok()).flatten()
+            );
+            // `HOME` is set in any test process, so its `None` shows the list at work.
+            assert!(std::env::var_os("HOME").is_some() || cfg!(windows));
+            assert_eq!(env.var("HOME"), None);
             assert_eq!(env.var("HCLOUD_TOKEN"), None);
         }
     }
@@ -374,7 +551,7 @@ mod tests {
     /// The API base a context gets when nothing redirects it.
     fn real_api_base() -> String {
         let env = MapEnv::new().with("APPRAFTER_CONFIG_DIR", "/tmp/store");
-        let base = Context::from_desktop_env(&env, DesktopPolicy::RELEASE)
+        let base = Context::from_desktop_env(&env, DesktopPolicy::RELEASE, test_host())
             .unwrap()
             .hcloud_base_url()
             .to_string();
@@ -394,7 +571,7 @@ mod tests {
                     ("APPRAFTER_HCLOUD_BASE_URL", base),
                 ],
             );
-            let ctx = desktop_context(&env).unwrap();
+            let ctx = desktop_context(&env, test_host()).unwrap();
             assert_eq!(ctx.config_root(), Path::new("/tmp/store"));
             assert_eq!(ctx.overrides(), &CliOverrides::default());
             assert_eq!(ctx.hcloud_base_url(), real_api_base(), "{base}");
@@ -411,7 +588,7 @@ mod tests {
                 ("APPRAFTER_HCLOUD_BASE_URL", "http://127.0.0.1:9"),
             ],
         );
-        let ctx = desktop_context(&env).unwrap();
+        let ctx = desktop_context(&env, test_host()).unwrap();
         assert_eq!(ctx.config_root(), Path::new("/tmp/store"));
         assert_eq!(ctx.hcloud_base_url(), "http://127.0.0.1:9");
         assert_eq!(ctx.overrides(), &CliOverrides::default());
@@ -426,7 +603,7 @@ mod tests {
                 ("APPRAFTER_HCLOUD_BASE_URL", "http://evil.example"),
             ],
         );
-        let err = desktop_context(&env).unwrap_err();
+        let err = desktop_context(&env, test_host()).unwrap_err();
         assert!(
             matches!(err, CoreError::UnsafeOverride { var, .. } if var == HCLOUD_BASE_URL_ENV),
             "{err:?}"
@@ -437,7 +614,9 @@ mod tests {
     fn a_test_build_context_without_an_api_base_uses_the_real_one() {
         let env = env_of(true, &[("APPRAFTER_CONFIG_DIR", "/tmp/store")]);
         assert_eq!(
-            desktop_context(&env).unwrap().hcloud_base_url(),
+            desktop_context(&env, test_host())
+                .unwrap()
+                .hcloud_base_url(),
             real_api_base()
         );
     }

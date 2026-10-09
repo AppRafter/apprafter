@@ -24,11 +24,15 @@
 //! `std::env` read or write, any `dirs::*` call, and any call to a
 //! lower-crate function that reads the environment or touches the terminal
 //! on the core's behalf (the credential resolvers, `default_config_root`,
-//! `default_age_key_path`, `logging::init`, `KubectlCli` / `HelmCli`). The
-//! one sanctioned exception is `cli_core::target::config_root_from_override`,
-//! and only inside [`Context::from_cli_env`] and [`Context::from_desktop_env`]:
-//! its fallback reads the platform config directory, so both clients open the
-//! same default target store. For the last two rules it keeps the crates
+//! `default_age_key_path`, `logging::init`, `KubectlCli` / `HelmCli`, the
+//! `PATH`-reading tool preflights, `cue::export`, the SSH identity default,
+//! the legacy state migration) or writes a key (`load_or_create_identity`).
+//! The two sanctioned exceptions are `cli_core::target::config_root_from_override`
+//! and `cli_core::paths::home_dir`, and only inside [`Context::from_cli_env`]
+//! and [`Context::from_desktop_env`]: the first's fallback reads the platform
+//! config directory, so both clients open the same default target store; the
+//! second gives the age key its default and shown paths their `~/`. For the
+//! last two rules it keeps the crates
 //! they would need out of the core's dependencies — no prompt, progress,
 //! table, colour or signal crate. And it holds env reads in the crates below
 //! the core, and in the CLI, to a count that only goes down.
@@ -44,7 +48,10 @@ pub mod report;
 pub mod target_ref;
 
 pub use cancel::{CancellationToken, Cancelled, Registration};
-pub use context::{CliOverrides, Context, DesktopPolicy, SecretString};
+pub use context::{
+    CliOverrides, Context, DesktopHost, DesktopPolicy, PathSource, SecretString,
+    DEFAULT_REQUEST_TIMEOUT,
+};
 pub use env::{EnvSource, MapEnv};
 pub use error::{CoreError, CoreResult, UiError};
 pub use op::{Outcome, Plan, PlanClass, PlannedChange};

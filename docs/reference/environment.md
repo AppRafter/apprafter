@@ -110,7 +110,7 @@ projected from the parser.
 ## AppRafter Desktop
 
 AppRafter Desktop (`desktop/`, not yet released) reads its environment
-through an allow-list: the four names below, and nothing else however it
+through an allow-list: the names below, and nothing else however it
 is set. A desktop started from a terminal therefore does not pick up that
 terminal's `HCLOUD_TOKEN`, `APPRAFTER_AGE_KEY` or any other variable on
 this page, so every cluster tab works with the targets it was given.
@@ -120,6 +120,7 @@ Paths in this table are relative to the repository root.
 | --- | --- | --- | --- |
 | `APPRAFTER_CONFIG_DIR` | The target store root, exactly as for the CLI (see [Target store and credentials](#target-store-and-credentials)), so the app and the CLI open the same targets. | as for the CLI | `desktop/src-tauri/src/env.rs`, `AllowListEnv::from_process()` |
 | `APPRAFTER_DESKTOP_DATA_DIR` | Moves the app's own files — its settings, its logs (under `logs/`) and, on Linux and Windows, the webview's storage — to this directory, for test runs and scripted launches. It also gives the app a separate single-instance lock, so such a run never brings an already running app to the front. On macOS 14 and later the window gets a webview store of its own for the directory; on macOS 13 the webview keeps the default store. Set but empty, or not valid Unicode, the app refuses to start rather than fall back on its default directory. | the operating system's application-data directory for the app | `desktop/src-tauri/src/env.rs`, `data_dir_override()` |
+| `PATH` | Linux and Windows: the search path for the tools the app runs (`kubectl`, `helm`, `restic`, `git`, `ssh`, `cue`), and the `PATH` they get. macOS does not read it: the app asks the account's login shell for its `PATH` (five-second limit) and falls back to `/usr/bin:/bin:/usr/sbin:/sbin`. | the inherited `PATH` | `desktop/src-tauri/src/env.rs`, `desktop_host()` |
 | `APPRAFTER_HCLOUD_BASE_URL` | Test builds only (the `test-build` cargo feature): the Hetzner Cloud API base URL, accepted only as a loopback `http://` URL. A release build ignores it. | the upstream Hetzner Cloud API | `desktop/src-tauri/src/env.rs`, `desktop_context()` |
 | `APPRAFTER_DESKTOP_TEST_PASSWORD` | Test builds only: the password a test build's stand-in for the system's authentication accepts in the lock screen's password field. A release build ignores it. | unset — no password field in a test build | `desktop/src-tauri/src/auth.rs`, `choice()` |
 

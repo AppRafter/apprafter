@@ -34,14 +34,20 @@ use crate::settings::SettingsStore;
 /// exits from the event loop.
 ///
 /// In order: the async runtime and the crypto provider (before anything of Tauri's), the
-/// allow-listed environment and the core context, the app's identity and directories (a
-/// data-directory override moves every app directory and keys the single-instance lock on
-/// it; one set but empty or not Unicode stops the start, [`exit_code`] 2), the authenticator
-/// ([`auth::choice`]: the OS's in a release, the fake in a test build), the app itself (the
-/// single-instance plugin first: a second launch only focuses the first window and exits; on
-/// macOS, the app menu), then the log, the settings and the shell, the tickers, the OS session
-/// watch (lock-on-sleep) and, on Linux and macOS, the quit signals. On Windows the prompts are
+/// allow-listed environment, the app's identity and directories (a data-directory override
+/// moves every app directory and keys the single-instance lock on it; one set but empty or not
+/// Unicode stops the start, [`exit_code`] 2), the authenticator ([`auth::choice`]: the OS's in
+/// a release, the fake in a test build), the app itself (the single-instance plugin first: a
+/// second launch only focuses the first window and exits; on macOS, the app menu), then the
+/// log, the settings, the core context, the shell, the tickers, the OS session watch
+/// (lock-on-sleep) and, on Linux and macOS, the quit signals. On Windows the prompts are
 /// parented to the main window as soon as it is built.
+///
+/// The core context is built once the app is: its runtime dir is `<app data dir>/run`, and
+/// Tauri resolves the app data dir — the override included — only then. So a refused
+/// `APPRAFTER_HCLOUD_BASE_URL` (a test build only) stops the start after the single-instance
+/// plugin has registered. On macOS this is also where the login shell is asked for the tools'
+/// `PATH` ([`env::desktop_host`]).
 ///
 /// The log starts once the app is built, so a second launch, which exits while the plugins
 /// start, writes nothing to the running app's log. It is still up before the window: Tauri
@@ -59,7 +65,6 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     runtime::init_runtime()?;
     runtime::install_crypto();
     let env = AllowListEnv::from_process(cfg!(feature = "test-build"));
-    let context = env::desktop_context(&env)?;
     // Created and canonical (absolute against the working directory, as the CLI reads
     // APPRAFTER_CONFIG_DIR — Tauri would resolve a relative one against the binary's
     // directory), so every spelling of one directory is one instance on one set of files. A
@@ -128,6 +133,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     if let Some(notice) = settings.notice() {
         tracing::warn!("{notice}");
     }
+    let host = env::desktop_host(&env, app.path().app_data_dir()?.join("run"));
+    let context = env::desktop_context(&env, host)?;
     let handle = app.handle().clone();
     let shell = app::Shell::new(
         settings,
