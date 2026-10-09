@@ -16,13 +16,17 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
+use std::thread;
+use std::time::Duration;
 
-use apprafter_core::{Outcome, PlanClass};
+use apprafter_core::{CoreError, Outcome, PlanClass};
+use apprafter_desktop::app;
 use apprafter_desktop::ops::{Executor, PlanParts};
-use apprafter_desktop_ipc::{errors, Settings, Theme, ALLOWED_WHILE_LOCKED, COMMANDS};
+use apprafter_desktop_ipc::{errors, Settings, Theme, ALLOWED_WHILE_LOCKED, COMMANDS, QUITTING};
 use common::{code, invoke, lock_off, rig};
 use serde_json::{json, Value};
+use tauri::Listener;
 
 /// The command ran, past the ACL and into its own handler: it answered, or rejected with a
 /// `UiError`, or could not parse the (empty) arguments it was given. Never Tauri's
@@ -129,6 +133,60 @@ fn plugin_commands_beyond_the_granted_ones_are_refused_by_the_acl() {
         invoke(&rig, "plugin:window|is_maximized", json!({})),
         Ok(json!(false))
     );
+}
+
+/// A quit that has operations to wait for tells the page, which then shows that it is stopping
+/// them instead of a page whose every command is refused: `quitting`, with how many and the
+/// longest wait. The page hears it through `core:event:allow-listen`, no new permission.
+#[test]
+fn a_quit_with_operations_running_tells_the_page_what_it_waits_for() {
+    let rig = rig(lock_off());
+    let (heard_tx, heard) = mpsc::channel::<String>();
+    rig._app.listen_any(QUITTING, move |event| {
+        let _ = heard_tx.send(event.payload().to_string());
+    });
+    let (started_tx, started) = mpsc::channel::<()>();
+    let exec: Executor = Box::new(move |_, cancel| {
+        let _ = started_tx.send(());
+        while !cancel.is_cancelled() {
+            thread::sleep(Duration::from_millis(1));
+        }
+        Err(CoreError::Cancelled)
+    });
+    let plan = rig.shell.ops.register_plan(
+        PlanParts::new(PlanClass::Bounded, "Upgrade", "upgrade"),
+        exec,
+    );
+    let reply = invoke(
+        &rig,
+        "op_execute",
+        json!({ "opId": plan.op_id, "onEvent": "__CHANNEL__:7" }),
+    );
+    assert!(reply.is_ok(), "{reply:?}");
+    started.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    // As in the first test, the mock runtime cannot exit: the quit thread's final exit
+    // panics on its own thread, after the operation stopped.
+    assert_eq!(invoke(&rig, "quit", json!({})), Ok(Value::Null));
+    let payload = heard
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the quit did not say what it waits for");
+    assert_eq!(
+        serde_json::from_str::<Value>(&payload).unwrap(),
+        json!({ "running": 1, "waitMs": app::STOP_BOUND.as_millis() as u64 })
+    );
+}
+
+/// A quit with nothing running exits at once: there is nothing to say, and nothing is said.
+#[test]
+fn a_quit_with_nothing_running_says_nothing() {
+    let rig = rig(lock_off());
+    let (heard_tx, heard) = mpsc::channel::<String>();
+    rig._app.listen_any(QUITTING, move |event| {
+        let _ = heard_tx.send(event.payload().to_string());
+    });
+    assert_eq!(invoke(&rig, "quit", json!({})), Ok(Value::Null));
+    assert!(heard.recv_timeout(Duration::from_millis(200)).is_err());
 }
 
 /// The opener's scope is the three URLs exactly as the capability writes them: a URL the page

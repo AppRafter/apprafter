@@ -27,7 +27,8 @@
 //! (nothing new starts) and the lock machine (no unlock prompt opens), closes every open
 //! prompt, and drops every plan; then a `quit` thread cancels the running operations, waits up
 //! to [`STOP_BOUND`] for them to stop, and exits. The run loop's exit request is refused until
-//! that thread is done ([`on_exit_requested`]).
+//! that thread is done ([`on_exit_requested`]). While it waits, the window stays, and the page
+//! says that it is stopping them (`quitting`, with how many and that bound).
 //!
 //! Some exits the OS starts never ask: macOS ends an app with `terminate:` (the Dock's Quit, a
 //! logout, a shutdown), Windows ends a session's apps with `WM_ENDSESSION`, and the event loop
@@ -44,7 +45,8 @@ use std::time::Duration;
 
 use apprafter_core::Context;
 use apprafter_desktop_ipc::{
-    AppInfo, LockReason, LockState, OpId, Os, SecretBackend, Settings, SubscriptionId, LOCK_CHANGED,
+    AppInfo, LockReason, LockState, OpId, Os, Quitting, SecretBackend, Settings, SubscriptionId,
+    LOCK_CHANGED, QUITTING,
 };
 use tauri::ipc::Invoke;
 use tauri::webview::PageLoadEvent;
@@ -395,6 +397,7 @@ pub fn quit<R: Runtime>(app: &AppHandle<R>, shell: &Arc<Shell>) {
         return;
     }
     tracing::info!("quitting");
+    tell_quitting(app, shell.ops.running());
     let spawned = thread::Builder::new().name("quit".into()).spawn({
         let (app, shell) = (app.clone(), shell.clone());
         move || drain_and_exit(&app, &shell)
@@ -403,6 +406,22 @@ pub fn quit<R: Runtime>(app: &AppHandle<R>, shell: &Arc<Shell>) {
         tracing::error!("no thread to wait for running operations on ({e}); exiting at once");
         shell.drained.store(true, SeqCst);
         app.exit(0);
+    }
+}
+
+/// A quit waiting for `running` operations tells the page ([`QUITTING`]), which shows that it
+/// is stopping them rather than a window whose every command is refused. With none running it
+/// exits at once, and nothing is said.
+fn tell_quitting<R: Runtime>(app: &AppHandle<R>, running: usize) {
+    if running == 0 {
+        return;
+    }
+    let quitting = Quitting {
+        running: u32::try_from(running).unwrap_or(u32::MAX),
+        wait_ms: u64::try_from(STOP_BOUND.as_millis()).unwrap_or(u64::MAX),
+    };
+    if let Err(e) = app.emit(QUITTING, quitting) {
+        tracing::warn!("{QUITTING} was not delivered: {e}");
     }
 }
 

@@ -9,6 +9,7 @@ mod app_info;
 mod auth;
 mod lock;
 mod ops;
+mod quit;
 mod settings;
 
 /// The command names. Plain Rust with no imports: `src-tauri/build.rs` `include!`s it.
@@ -22,6 +23,7 @@ pub use lock::{LockReason, LockState, LOCK_CHANGED};
 pub use ops::{
     OpEvent, OpId, OpState, OpSummary, OutputStream, PlanView, Subscribed, SubscriptionId,
 };
+pub use quit::{Quitting, QUITTING};
 pub use settings::{AutoLock, Refresh, Settings, Theme};
 
 /// What every failed command returns: the core's serialisable error projection.

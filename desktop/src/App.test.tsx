@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 import { afterEach, beforeEach, expect, test } from 'bun:test';
+import { emit } from '@tauri-apps/api/event';
 import { clearMocks, mockIPC, mockWindows } from '@tauri-apps/api/mocks';
 import { act, cleanup, render, screen, waitFor } from '@testing-library/react';
 import { App } from './App';
 import { DESKTOP_ERROR_CODES } from './ipc/generated/errors';
+import { QUITTING } from './ipc/generated/events';
 import type { LockState } from './ipc/generated/LockState';
+import type { Quitting } from './ipc/generated/Quitting';
 import type { Settings } from './ipc/generated/Settings';
 import { resetOperations } from './ipc/operations';
 import { appInfo, lockState, settings } from './test/fixtures';
@@ -134,6 +137,32 @@ test('settings that cannot be read leave the default theme, and the window shows
   expect(await screen.findByRole('heading', { name: 'Open a cluster' })).toBeDefined();
   await paint();
   expect(count('window_ready')).toBe(1);
+});
+
+test('a quit waiting for operations shows that it is stopping them, not a dead page', async () => {
+  render(<App />);
+  expect(await screen.findByRole('heading', { name: 'Open a cluster' })).toBeDefined();
+  await act(async () => {
+    await emit(QUITTING, { running: 2, waitMs: 15_000 } satisfies Quitting);
+  });
+  expect(await screen.findByRole('heading', { name: 'Stopping 2 operations…' })).toBeDefined();
+  expect(
+    screen.getByText('AppRafter quits once they have stopped, within 15 seconds.'),
+  ).toBeDefined();
+  expect(screen.queryByRole('heading', { name: 'Open a cluster' })).toBeNull();
+  expect(document.querySelector('header.titlebar')).not.toBeNull();
+});
+
+test('over the lock screen too, and in the singular for one', async () => {
+  lockAnswer = () => lockState({ reason: 'startup' });
+  render(<App />);
+  expect(await screen.findByRole('heading', { name: 'AppRafter is locked' })).toBeDefined();
+  await act(async () => {
+    await emit(QUITTING, { running: 1, waitMs: 15_000 } satisfies Quitting);
+  });
+  expect(await screen.findByRole('heading', { name: 'Stopping 1 operation…' })).toBeDefined();
+  expect(screen.getByText('AppRafter quits once it has stopped, within 15 seconds.')).toBeDefined();
+  expect(screen.queryByRole('heading', { name: 'AppRafter is locked' })).toBeNull();
 });
 
 test('when app_info fails, the error shows under a title bar, and the window shows', async () => {

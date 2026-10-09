@@ -19,9 +19,9 @@ use std::path::{Path, PathBuf};
 use apprafter_core::{Outcome, PlanClass, PlannedChange};
 use apprafter_desktop_ipc::{
     errors, AppInfo, AuthInfo, AuthMethod, AuthOutcome, AutoLock, CancelledBy, LockReason,
-    LockState, OpEvent, OpId, OpState, OpSummary, Os, OutputStream, PlanView, Refresh,
+    LockState, OpEvent, OpId, OpState, OpSummary, Os, OutputStream, PlanView, Quitting, Refresh,
     SecretBackend, Settings, Subscribed, SubscriptionId, Theme, UiError, UnavailableReason,
-    ALLOWED_WHILE_LOCKED, COMMANDS, LOCK_CHANGED,
+    ALLOWED_WHILE_LOCKED, COMMANDS, LOCK_CHANGED, QUITTING,
 };
 use ts_rs::TS;
 
@@ -62,6 +62,8 @@ fn export_the_typescript_bindings() {
         AppInfo, Os, SecretBackend,
         // ops.rs
         OpId, OpEvent, OutputStream, PlanView, OpSummary, OpState, Subscribed, SubscriptionId,
+        // quit.rs
+        Quitting,
         // apprafter-core, as OpEvent and PlanView carry them
         UiError, PlanClass, PlannedChange, Outcome<serde_json::Value>,
     );
@@ -209,11 +211,16 @@ fn errors_ts() -> String {
 
 fn events_ts() -> String {
     format!(
-        "// Generated from desktop/ipc/src/lock.rs by `just desktop-ipc-types`. Do not edit.\n\
+        "// Generated from desktop/ipc/src/lock.rs and quit.rs by `just desktop-ipc-types`. Do \
+         not edit.\n\
          \n\
          /** Emitted on every lock transition, with the new `LockState`. */\n\
-         export const LOCK_CHANGED = {} as const;\n",
+         export const LOCK_CHANGED = {} as const;\n\
+         \n\
+         /** Emitted when a quit begins with operations running, with `Quitting`. */\n\
+         export const QUITTING = {} as const;\n",
         ts_string(LOCK_CHANGED),
+        ts_string(QUITTING),
     )
 }
 

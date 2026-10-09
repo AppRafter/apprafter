@@ -5,6 +5,7 @@ import { ToastProvider } from './components/Toast';
 import { type TargetSummary, TargetsSource } from './screens/targets/targets';
 import { LockGate } from './shell/LockGate';
 import { PlatformGate } from './shell/PlatformGate';
+import { QuitGate } from './shell/QuitGate';
 import { RevealWindow } from './shell/reveal';
 import { Shell } from './shell/Shell';
 import { ThemeController } from './shell/ThemeController';
@@ -23,14 +24,17 @@ export function App({ targets = null }: AppProps) {
       <RevealWindow>
         <ThemeController />
         <PlatformGate>
-          <TargetsSource value={targets}>
-            {/* The toasts belong to the shell: a lock takes them away with it. */}
-            <LockGate>
-              <ToastProvider>
-                <Shell />
-              </ToastProvider>
-            </LockGate>
-          </TargetsSource>
+          {/* A quit waiting for operations replaces whatever shows, the lock screen too. */}
+          <QuitGate>
+            <TargetsSource value={targets}>
+              {/* The toasts belong to the shell: a lock takes them away with it. */}
+              <LockGate>
+                <ToastProvider>
+                  <Shell />
+                </ToastProvider>
+              </LockGate>
+            </TargetsSource>
+          </QuitGate>
         </PlatformGate>
       </RevealWindow>
     </QueryClientProvider>
