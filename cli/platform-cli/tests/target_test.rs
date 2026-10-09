@@ -1012,6 +1012,55 @@ fn target_use_and_remove_refuse_a_target_whose_files_cannot_be_read() {
     assert!(global.contains("active_target: first"), "{global}");
 }
 
+/// `add` (with `--force` or without) and `add --renew` refuse a target whose credentials file
+/// cannot be parsed with that file's error, as they always have — never "already exists",
+/// never an overwrite — and `--renew` reports it before the config-flag refusal (today's
+/// order: the target is read first).
+#[test]
+fn target_add_and_renew_refuse_a_target_whose_credentials_cannot_be_read() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_two_targets(dir.path());
+    let creds = dir.path().join("targets/second/credentials.yaml");
+    std::fs::write(&creds, "hetzner_token: [unclosed").unwrap();
+    let token = "b".repeat(64);
+
+    for extra in [
+        &[][..],
+        &["--force"][..],
+        &["--renew", "--region", "hel1"][..],
+    ] {
+        let mut args = vec![
+            "target",
+            "add",
+            "second",
+            "--provider",
+            "hetzner-cloud",
+            "--token",
+            &token,
+            "--no-interactive",
+        ];
+        if extra.first() == Some(&"--renew") {
+            // `--renew` refuses `--provider` too; keep `--region` as the one config flag.
+            args.retain(|a| *a != "--provider" && *a != "hetzner-cloud");
+        }
+        args.extend_from_slice(extra);
+        cli()
+            .env("APPRAFTER_CONFIG_DIR", dir.path())
+            .env("APPRAFTER_NO_PING", "1")
+            .env_remove("HCLOUD_TOKEN")
+            .args(&args)
+            .assert()
+            .failure()
+            .stderr(contains("credentials.yaml"))
+            .stderr(contains("already exists").not())
+            .stderr(contains("only updates credentials").not());
+    }
+    assert_eq!(
+        std::fs::read_to_string(&creds).unwrap(),
+        "hetzner_token: [unclosed"
+    );
+}
+
 #[test]
 fn target_alias_t_subcommand_resolves_to_target() {
     // Smoke for the `apprafter t add …` alias declared in clap.

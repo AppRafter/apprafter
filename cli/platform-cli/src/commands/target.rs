@@ -15,20 +15,16 @@
 //!   6. Print one-line confirmation.
 
 use std::io::IsTerminal;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use apprafter_core::target::{self as core_target, CliDefaultPointer, TargetRemoved, TargetReport};
+use apprafter_core::target::{
+    self as core_target, CliDefaultPointer, SkuCheck, TargetRemoved, TargetReport,
+};
 use apprafter_core::{
-    ActivePointerChange, CancellationToken, Context, CoreError, Outcome, TargetRef,
+    ActivePointerChange, CancellationToken, Context, CoreError, Outcome, SecretString, TargetRef,
 };
-use cli_core::target::{
-    default_config_root, load_global_config, load_target, save_global_config, save_target,
-    validate_hetzner_token_format, GlobalConfig, Target, TargetConfig, TargetCredentials,
-    TargetStorePaths,
-};
+use cli_core::target::{default_config_root, load_target, TargetStorePaths};
 use cli_core::{CliError, Result};
-use cli_providers::hetzner_cloud::validate_server_type;
-use cli_providers::{HetznerCloudClient, HetznerCloudValidator, ProviderValidator};
 use tabled::{settings::Style, Table, Tabled};
 use tracing::info;
 
@@ -40,7 +36,6 @@ use cli_providers::cert::{
     build_tls_secret, expiry_status, parse_and_validate, validate_cert_name, ExpiryStatus,
 };
 
-use crate::commands::hcloud::hcloud_base_url;
 use crate::commands::state_paths::resolve_state_paths;
 use crate::commands::target_legacy;
 use crate::render::core_error::report;
@@ -52,45 +47,12 @@ use crate::render::reporter::CliReporter;
 /// being meaningfully restrictive.
 pub const MAX_TARGET_NAME_LEN: usize = 64;
 
-/// Only `hetzner-cloud` is wired in v0.1.73. AWS / Managed land in
-/// later phases; surface a clear error so users hit a typed wall
-/// instead of saving a half-working config.
-pub const SUPPORTED_PROVIDERS: &[&str] = &["hetzner-cloud"];
-
 /// `apprafter target …` for the sub-commands `dispatch` does not route to a core-backed arm.
 /// `ip` runs on apprafter-core and renders its own errors
 /// ([`crate::render::core_error::report`]); every other sub-command here is today's code, its
 /// `CliError` mapped at this boundary.
 pub fn run(action: TargetCommand) -> miette::Result<()> {
     match action {
-        TargetCommand::Add {
-            name,
-            provider,
-            token,
-            ssh_key,
-            region,
-            tier,
-            cluster_name,
-            force,
-            renew,
-            no_interactive,
-            no_ping,
-            server_type,
-        } => run_add(AddArgs {
-            name,
-            provider,
-            token,
-            ssh_key,
-            region,
-            tier,
-            cluster_name,
-            force,
-            renew,
-            no_interactive,
-            no_ping,
-            server_type,
-        })
-        .map_err(miette::Report::new),
         TargetCommand::Cert { action } => run_cert(action).map_err(miette::Report::new),
         TargetCommand::Domain { action } => {
             crate::commands::target_domain::run(action).map_err(miette::Report::new)
@@ -99,7 +61,8 @@ pub fn run(action: TargetCommand) -> miette::Result<()> {
             crate::commands::target_firewall::run(action).map_err(miette::Report::new)
         }
         TargetCommand::Ip => run_ip(),
-        TargetCommand::List
+        TargetCommand::Add { .. }
+        | TargetCommand::List
         | TargetCommand::Show { .. }
         | TargetCommand::Use { .. }
         | TargetCommand::Rename { .. }
@@ -133,94 +96,94 @@ pub struct AddArgs {
     pub server_type: Option<String>,
 }
 
-fn run_add(mut args: AddArgs) -> Result<()> {
-    // Decide before validating: the wizard is allowed to fill the
-    // missing inputs, so we shouldn't reject e.g. `apprafter target
-    // add` (no name) up front when the user is on a TTY. v0.1.77
-    // dropped the "skip when all required supplied" short-circuit —
-    // wizard now always fires on a TTY so optional fields
-    // (ssh-key, tier, region) get prompted too. Pre-supplied fields
-    // are silent through per-prompt prefill checks.
+/// `target add` (and `--renew`) on the core. The CLI keeps the wizard, the inputs it requires
+/// (name, `--provider`, `--token`) with today's texts and in today's order, the `info!` line
+/// and the output; the checks, the ping, the SKU check and the save are the core's
+/// (`plan_add` / `execute_add`). The save-time ping runs even after the wizard verified the
+/// token (R2).
+pub(crate) fn add(mut args: AddArgs) -> miette::Result<()> {
+    // Decide before validating: the wizard is allowed to fill the missing inputs, so `apprafter
+    // target add` (no name) is not rejected up front on a TTY. The wizard always fires on a TTY
+    // so the optional fields get prompted too; pre-supplied fields are silent through
+    // per-prompt prefill checks.
     let want_wizard = crate::commands::target_wizard::should_use_wizard(
         args.no_interactive,
         std::io::stdin().is_terminal(),
         std::io::stdout().is_terminal(),
     );
     if want_wizard {
-        run_wizard_into_args(&mut args)?;
+        run_wizard_into_args(&mut args).map_err(miette::Report::new)?;
     }
 
     let name = args.name.clone().ok_or_else(|| {
-        CliError::Other(
+        miette::Report::new(CliError::Other(
             "target name required — pass it as a positional argument (`apprafter target add <name>`) or run on a TTY to enter the wizard".to_string(),
-        )
+        ))
     })?;
     info!(target = %name, renew = args.renew, force = args.force, "target add invoked");
-    validate_target_name(&name)?;
-
-    let paths = TargetStorePaths::for_root(default_config_root()?);
+    core_target::validate_name(&name).map_err(|problem| {
+        target_legacy::add(
+            CoreError::InvalidTargetName {
+                name: name.clone(),
+                problem,
+            },
+            "",
+        )
+    })?;
+    let ctx = crate::context::cli_context()?.with_no_ping(args.no_ping);
 
     if args.renew {
-        return run_renew(&paths, args, &name);
+        return renew(&ctx, args, &name);
     }
 
-    // Plain create / overwrite path.
-    let provider = require_known_provider(args.provider.as_deref())?;
-    let token = require_token(&provider, args.token.as_deref())?;
-    if let Some(path) = args.ssh_key.as_ref() {
-        verify_ssh_key_readable(path)?;
+    let supported = apprafter_core::provider::SUPPORTED_PROVIDERS;
+    let provider = args.provider.clone().ok_or_else(|| {
+        miette::Report::new(CliError::Other(format!(
+            "`--provider` is required (supported: {})",
+            supported.join(", ")
+        )))
+    })?;
+    // Today's order: the provider is refused before the token is asked for.
+    if !supported.contains(&provider.as_str()) {
+        return Err(target_legacy::add(
+            CoreError::UnknownProvider {
+                provider,
+                supported: supported.iter().map(|s| s.to_string()).collect(),
+            },
+            "",
+        ));
     }
-
-    // Checked here, before the ping, so an add that cannot succeed fails at
-    // once; and again under the store lock, right before the save
-    // (`save_new_target`), where it decides.
-    check_name_free(&paths, &name, args.force)?;
-
-    // API ping confirms the token actually authenticates with the
-    // provider. Happens AFTER the existing-target check so a no-op
-    // run with `--no-ping` against an existing target still
-    // surfaces the "already exists" error immediately. `--no-ping`
-    // skips the round-trip for CI / offline setups. When the
-    // wizard already ran an inline ping the result is re-verified
-    // here on purpose — cheap (~200ms) and keeps the save-time
-    // check authoritative.
-    if !args.no_ping {
-        ping_provider(&provider, &token)?;
-    }
-
-    // 2.16h: if a server type SKU was supplied, validate it against the
-    // live API for the resolved region before saving. Skipped when
-    // `--no-ping` is set (same rationale as the token ping above).
-    if let Some(ref sku) = args.server_type {
-        if args.no_ping {
-            println!("{}", sku_not_validated_line(sku));
-        } else {
-            let resolved_region = region_for_sku_check(args.region.as_deref());
-            let client = HetznerCloudClient::new(hcloud_base_url(), &token);
-            let types = client.list_server_types()?.server_types;
-            validate_server_type(&types, sku, resolved_region)?;
-        }
-    }
-
-    let target = Target {
-        name: name.clone(),
-        config: TargetConfig {
+    let token = args.token.clone().ok_or_else(|| {
+        miette::Report::new(CliError::Other(format!(
+            "`--token` is required for provider `{provider}` (or set `HCLOUD_TOKEN` env var)"
+        )))
+    })?;
+    let legacy = |e| target_legacy::add(e, &token);
+    let plan = core_target::plan_add(
+        &ctx,
+        core_target::AddArgs {
+            name: name.clone(),
             provider,
+            token: SecretString::new(token.clone()),
+            ssh_key: args.ssh_key,
             region: args.region,
-            default_tier: args.tier,
+            tier: args.tier,
             cluster_name: args.cluster_name,
-            ssh_key_path: args.ssh_key,
-            firewall: None,
             server_type: args.server_type,
+            force: args.force,
         },
-        credentials: TargetCredentials {
-            hetzner_token: Some(token),
-        },
-    };
-    let became_active = save_new_target(&paths, &target, args.force)?;
+    )
+    .map_err(legacy)?;
+    let added = completed(
+        core_target::execute_add(&ctx, plan, &CliReporter, &CancellationToken::new())
+            .map_err(legacy)?,
+    )?;
 
+    if let Some(SkuCheck::NotValidated { sku }) = &added.sku {
+        println!("{}", sku_not_validated_line(sku));
+    }
     let verified_suffix = add_verified_suffix(args.no_ping);
-    if became_active {
+    if added.cli_default.is_some() {
         println!(
             "target `{name}` saved and set as active (first target on fresh store){verified_suffix}"
         );
@@ -230,31 +193,6 @@ fn run_add(mut args: AddArgs) -> Result<()> {
         );
     }
     Ok(())
-}
-
-/// Refuse to add `name` when the store already has it, unless `force`. A
-/// target that is there but unreadable is an error either way.
-fn check_name_free(paths: &TargetStorePaths, name: &str, force: bool) -> Result<()> {
-    match load_target(paths, name) {
-        Ok(_) if !force => Err(CliError::Other(format!(
-            "target `{name}` already exists — pass `--force` to overwrite or `--renew` to rotate credentials only"
-        ))),
-        Ok(_) | Err(CliError::TargetNotFound { .. }) => Ok(()),
-        Err(e) => Err(e),
-    }
-}
-
-/// Save a new `target` and, on a fresh store, make it the active one;
-/// returns whether it became active. Under the store lock, and nothing slow
-/// inside it — the token ping and the SKU check ran before, unlocked — so
-/// the lock is held for a few file operations, never across the network.
-/// The name is checked again under the lock: another add may have created
-/// it since the first check, and only `force` overwrites it.
-fn save_new_target(paths: &TargetStorePaths, target: &Target, force: bool) -> Result<bool> {
-    let _store_lock = store_lock(paths)?;
-    check_name_free(paths, &target.name, force)?;
-    save_target(paths, target)?;
-    ensure_active_target(paths, &target.name)
 }
 
 /// Same idea as [`add_verified_suffix`], for the `--renew` path — a rotation
@@ -272,13 +210,6 @@ pub(crate) fn renew_verified_suffix(no_ping: bool) -> &'static str {
 /// will find out it does not exist.
 pub(crate) fn sku_not_validated_line(sku: &str) -> String {
     format!("server type `{sku}` NOT validated against the Hetzner API (`--no-ping` was passed)")
-}
-
-/// Region a `--server-type` is checked against at `target add` time. Server
-/// types are per-location on Hetzner, so an unset `--region` still needs the
-/// same default the rest of the CLI provisions into.
-pub(crate) fn region_for_sku_check(region: Option<&str>) -> &str {
-    region.unwrap_or(apprafter_core::machine::DEFAULT_REGION)
 }
 
 /// Suffix on the `target add` confirmation stating whether the token was
@@ -374,83 +305,48 @@ pub(crate) fn map_wizard_prompt_error(err: inquire::InquireError) -> CliError {
     }
 }
 
-fn run_renew(paths: &TargetStorePaths, args: AddArgs, name: &str) -> Result<()> {
-    // Read without the lock: the checks and the ping below take as long as
-    // the network does. The save re-reads under it (`save_renewed`).
-    let existing = load_renewable(paths, name)?;
-
-    // `--renew` deliberately ignores the config flags (provider,
-    // region, tier, etc.). Refusing them up front beats silently
-    // dropping a user-provided value.
+/// `target add --renew` on the core, in today's order: the target (both of its files, as
+/// `load_renewable` read them), the config-flag refusal, the token, then `plan_renew` (format,
+/// "is it new", SSH key) and `execute_renew` (ping, then the patch under the lock).
+fn renew(ctx: &Context, args: AddArgs, name: &str) -> miette::Result<()> {
+    let tref = TargetRef::named(ctx, name).map_err(|e| target_legacy::renew(e, ""))?;
+    let provider = cli_core::load_target(&ctx.store(), name)
+        .map_err(|e| target_legacy::renew(e.into(), ""))?
+        .config
+        .provider;
+    // `--renew` deliberately ignores the config flags; refusing them up front beats silently
+    // dropping a value the operator passed.
     reject_config_flags_on_renew(
         args.provider.as_deref(),
         args.region.as_deref(),
         args.tier.as_deref(),
         args.cluster_name.as_deref(),
+    )
+    .map_err(miette::Report::new)?;
+    let token = args.token.ok_or_else(|| {
+        miette::Report::new(CliError::Other(format!(
+            "`--token` is required for provider `{provider}` (or set `HCLOUD_TOKEN` env var)"
+        )))
+    })?;
+    let legacy = |e| target_legacy::renew(e, &token);
+    let plan = core_target::plan_renew(
+        ctx,
+        &tref,
+        core_target::RenewArgs {
+            token: SecretString::new(token.clone()),
+            ssh_key: args.ssh_key,
+        },
+    )
+    .map_err(legacy)?;
+    completed(
+        core_target::execute_renew(ctx, plan, &CliReporter, &CancellationToken::new())
+            .map_err(legacy)?,
     )?;
-
-    // Token is required for renew (whole point of the flag);
-    // ssh-key path is optional (user may renew only the token).
-    let token = require_token(&existing.config.provider, args.token.as_deref())?;
-
-    // Reject identical-token "rotations" loudly. The wizard happily
-    // accepts whatever the user types, the CLI happily accepts the
-    // env var — and an operator who pastes the OLD token by
-    // muscle-memory gets a green "credentials rotated" message
-    // without anything actually changing in Hetzner. That's the
-    // exact opposite of what `--renew` advertises. Match a token
-    // by raw bytes so even a single-char drift counts as "new".
-    reject_identical_token(existing.credentials.hetzner_token.as_deref(), &token, name)?;
-
-    if let Some(path) = args.ssh_key.as_ref() {
-        verify_ssh_key_readable(path)?;
-    }
-    if !args.no_ping {
-        ping_provider(&existing.config.provider, &token)?;
-    }
-
-    save_renewed(paths, name, token, args.ssh_key)?;
-
     println!(
         "target `{name}` credentials rotated{}",
         renew_verified_suffix(args.no_ping)
     );
     Ok(())
-}
-
-/// Target `name`, for `--renew`, which rotates the credentials of a target
-/// that exists.
-fn load_renewable(paths: &TargetStorePaths, name: &str) -> Result<Target> {
-    match load_target(paths, name) {
-        Ok(t) => Ok(t),
-        Err(CliError::TargetNotFound { .. }) => Err(CliError::Other(format!(
-            "target `{name}` does not exist — drop `--renew` to create it fresh"
-        ))),
-        Err(e) => Err(e),
-    }
-}
-
-/// Write the rotated `token` (and the new `ssh_key` path, if one was given)
-/// into target `name`, under the store lock: re-read, re-checked (the target
-/// still exists, and the token is still a new one), and only those fields
-/// changed, so an edit made while the token was being verified — a
-/// `target machine`, say — is kept rather than written over.
-fn save_renewed(
-    paths: &TargetStorePaths,
-    name: &str,
-    token: String,
-    ssh_key: Option<PathBuf>,
-) -> Result<()> {
-    let _store_lock = store_lock_if_present(paths)?;
-    let mut target = load_renewable(paths, name)?;
-    reject_identical_token(target.credentials.hetzner_token.as_deref(), &token, name)?;
-    if let Some(path) = ssh_key {
-        target.config.ssh_key_path = Some(path);
-    }
-    target.credentials = TargetCredentials {
-        hetzner_token: Some(token),
-    };
-    save_target(paths, &target)
 }
 
 // ---------------------------------------------------------------
@@ -470,21 +366,6 @@ pub(crate) fn reject_config_flags_on_renew(
         return Err(CliError::Other(
             "`--renew` only updates credentials — `--provider`, `--region`, `--tier`, `--cluster-name` are not allowed alongside it. Drop `--renew` if you want to change config too.".to_string(),
         ));
-    }
-    Ok(())
-}
-
-/// Reject an identical-token "rotation" loudly.
-///
-/// The wizard happily accepts whatever the operator types and the CLI happily
-/// accepts the env var — so someone who pastes the OLD token by muscle memory
-/// otherwise gets a green "credentials rotated" with nothing rotated. Compared
-/// by raw bytes: a single-character drift counts as new.
-pub(crate) fn reject_identical_token(existing: Option<&str>, new: &str, name: &str) -> Result<()> {
-    if existing == Some(new) {
-        return Err(CliError::Other(format!(
-            "`--renew` requires a NEW token, but the value provided is identical to the one already saved for target `{name}`. Generate a fresh token in the Hetzner Cloud Console → Security → API Tokens, then re-run `apprafter target add {name} --renew` with the new value."
-        )));
     }
     Ok(())
 }
@@ -517,112 +398,6 @@ pub(crate) fn check_target_name(name: &str) -> std::result::Result<(), String> {
             "target name `{name}` must not start or end with `-`"
         ));
     }
-    Ok(())
-}
-
-fn validate_target_name(name: &str) -> Result<()> {
-    check_target_name(name).map_err(CliError::Other)
-}
-
-fn require_known_provider(provider: Option<&str>) -> Result<String> {
-    let provider = provider.ok_or_else(|| {
-        CliError::Other(format!(
-            "`--provider` is required (supported: {})",
-            SUPPORTED_PROVIDERS.join(", ")
-        ))
-    })?;
-    if !SUPPORTED_PROVIDERS.contains(&provider) {
-        return Err(CliError::Other(format!(
-            "provider `{provider}` is not supported in v0.1.73 (supported: {})",
-            SUPPORTED_PROVIDERS.join(", ")
-        )));
-    }
-    Ok(provider.to_string())
-}
-
-fn require_token(provider: &str, token: Option<&str>) -> Result<String> {
-    let token = token.ok_or_else(|| {
-        CliError::Other(format!(
-            "`--token` is required for provider `{provider}` (or set `HCLOUD_TOKEN` env var)"
-        ))
-    })?;
-    if provider == "hetzner-cloud" {
-        validate_hetzner_token_format(token)
-            .map_err(|reason| CliError::Other(format!("invalid Hetzner Cloud token: {reason}")))?;
-    }
-    Ok(token.to_string())
-}
-
-/// Run the read-only `validate_credentials()` ping for the
-/// provider. For Hetzner Cloud this is `GET /v1/locations`
-/// against the production base URL (overridable via
-/// `APPRAFTER_HCLOUD_BASE_URL` through `hcloud_base_url()` —
-/// integration tests redirect against a `mockito::Server`).
-///
-/// v0.1.87: failures classify into one of two typed CliError
-/// variants (`ProviderTokenRejected` for 401, otherwise
-/// `ProviderApiUnreachable`) and carry the original error as a
-/// `#[source]` cause chain. Miette renders both layers — operator
-/// gets the high-level rotation / reachability help PLUS the raw
-/// API envelope underneath.
-fn ping_provider(provider: &str, token: &str) -> Result<()> {
-    match provider {
-        "hetzner-cloud" => {
-            let base = hcloud_base_url();
-            tracing::debug!(provider, base = %base, "running provider validator ping");
-            let validator = HetznerCloudValidator::new(base.clone(), token);
-            validator
-                .validate_credentials()
-                .map_err(|err| classify_ping_error(provider, err))
-        }
-        _ => {
-            // Defensive: require_known_provider already gates
-            // on the whitelist, so this arm should be
-            // unreachable. Surface a typed error rather than
-            // panic so a future regression in the whitelist
-            // doesn't blow up the user's shell.
-            Err(CliError::Other(format!(
-                "no validator wired for provider `{provider}` — pass `--no-ping` to skip"
-            )))
-        }
-    }
-}
-
-/// Sort a credential-validation error into the right typed variant.
-/// 401 → `ProviderTokenRejected` (operator can rotate); everything
-/// else → `ProviderApiUnreachable` (operator can run
-/// `apprafter doctor` or wait out the outage). Both wrappers carry
-/// the original error as a `#[source]` cause chain so miette
-/// renders both the top-level summary and the underlying API
-/// envelope. Shared with the wizard's classification path so both
-/// flows emit identical diagnostic codes.
-fn classify_ping_error(provider: &str, err: CliError) -> CliError {
-    match err {
-        CliError::Hetzner { status: 401, .. } => CliError::ProviderTokenRejected {
-            provider: provider.to_string(),
-            cause: Box::new(err),
-        },
-        _ => CliError::ProviderApiUnreachable {
-            provider: provider.to_string(),
-            cause: Box::new(err),
-        },
-    }
-}
-
-fn verify_ssh_key_readable(path: &Path) -> Result<()> {
-    if !path.exists() {
-        return Err(CliError::Other(format!(
-            "SSH key path `{}` does not exist",
-            path.display()
-        )));
-    }
-    // Surface unreadable file early — read_to_string is fine for
-    // a public key (small file). Don't keep the contents around;
-    // the path is what gets stored in `TargetConfig`, not the
-    // key body.
-    std::fs::read_to_string(path).map_err(|e| {
-        CliError::Other(format!("SSH key `{}` is not readable: {e}", path.display()))
-    })?;
     Ok(())
 }
 
@@ -660,30 +435,6 @@ pub(crate) fn store_lock_event_line(event: &cli_core::StoreLockEvent<'_>) -> Str
         .unwrap_or_default()
 }
 
-/// Promote the supplied target to active when the store has no
-/// `GlobalConfig` yet (first-run case). Returns whether the active
-/// pointer changed — caller uses it to vary the confirmation
-/// message between "saved + active" and "saved, active unchanged".
-/// Existing stores keep their active target; users switch
-/// explicitly via `apprafter target use <name>` (Track A.5).
-fn ensure_active_target(paths: &TargetStorePaths, name: &str) -> Result<bool> {
-    match load_global_config(paths)? {
-        Some(_) => Ok(false),
-        None => {
-            // No global config yet — either we just created the
-            // very first target, or someone hand-deleted config.yaml.
-            // Either way, point active at the most-recently-saved
-            // target, which by definition exists on disk now.
-            let cfg = GlobalConfig {
-                active_target: name.to_string(),
-                version: cli_core::target::TARGET_STORE_VERSION,
-            };
-            save_global_config(paths, &cfg)?;
-            Ok(true)
-        }
-    }
-}
-
 // ---------------------------------------------------------------
 // Unit tests for pure validators
 // ---------------------------------------------------------------
@@ -695,7 +446,7 @@ fn ensure_active_target(paths: &TargetStorePaths, name: &str) -> Result<bool> {
 mod tests {
     use super::*;
     use apprafter_core::target::{ProvisionedState, TokenPresence};
-    use cli_core::target::remove_target;
+    use std::path::Path;
 
     // ── the store lock: what a wait and a lock-less store print ──────────
 
@@ -737,108 +488,23 @@ mod tests {
         );
     }
 
-    // ── the store lock: re-checked right before the save ─────────────────
-
-    /// A target store at a fresh temp root.
-    fn store() -> (tempfile::TempDir, TargetStorePaths) {
-        let dir = tempfile::tempdir().unwrap();
-        let paths = TargetStorePaths::for_root(dir.path().join("store"));
-        (dir, paths)
-    }
-
-    /// Target `name`, holding `token`.
-    fn target(name: &str, token: &str) -> Target {
-        Target {
-            name: name.to_string(),
-            config: TargetConfig {
-                provider: "hetzner-cloud".to_string(),
-                ..TargetConfig::default()
-            },
-            credentials: TargetCredentials {
-                hetzner_token: Some(token.to_string()),
-            },
-        }
-    }
-
-    fn token_of(paths: &TargetStorePaths, name: &str) -> Option<String> {
-        load_target(paths, name).unwrap().credentials.hetzner_token
-    }
-
-    /// `target add` checks the name, pings the provider unlocked, then
-    /// saves. Another add that created the same name in between is found
-    /// by the check under the lock and is not overwritten without
-    /// `--force` — the window the ping used to hold the lock across.
-    #[test]
-    fn an_add_does_not_overwrite_a_target_created_since_its_first_check() {
-        let (_dir, paths) = store();
-        check_name_free(&paths, "work", false).expect("free at the first check");
-        // Meanwhile, during the ping, another add creates it.
-        assert!(save_new_target(&paths, &target("work", "first"), false).unwrap());
-
-        let err = save_new_target(&paths, &target("work", "second"), false)
-            .expect_err("taken since the first check");
-        assert!(err.to_string().contains("already exists"), "{err}");
-        assert_eq!(token_of(&paths, "work").as_deref(), Some("first"));
-
-        // `--force` is what overwrites, and an existing store keeps its
-        // active target.
-        assert!(!save_new_target(&paths, &target("work", "second"), true).unwrap());
-        assert_eq!(token_of(&paths, "work").as_deref(), Some("second"));
-    }
-
-    /// `--renew` writes only the token (and a new key path) into the
-    /// target as it is under the lock: an edit made while the new token
-    /// was being verified is kept, and a target removed meanwhile is not
-    /// brought back.
-    #[test]
-    fn a_renew_patches_the_target_as_it_is_at_the_save() {
-        let (_dir, paths) = store();
-        save_target(&paths, &target("work", "old")).unwrap();
-        let read_first = load_renewable(&paths, "work").unwrap();
-        // Meanwhile, during the ping, `target machine` records a SKU.
-        let mut machine = load_target(&paths, "work").unwrap();
-        machine.config.server_type = Some("cx32".to_string());
-        save_target(&paths, &machine).unwrap();
-
-        save_renewed(&paths, "work", "new".to_string(), None).unwrap();
-        let saved = load_target(&paths, "work").unwrap();
-        assert_eq!(saved.credentials.hetzner_token.as_deref(), Some("new"));
-        assert_eq!(
-            saved.config.server_type.as_deref(),
-            Some("cx32"),
-            "the edit made meanwhile was written over by {read_first:?}"
-        );
-
-        // The same token again is still refused under the lock.
-        let err =
-            save_renewed(&paths, "work", "new".to_string(), None).expect_err("identical token");
-        assert!(err.to_string().contains("NEW token"), "{err}");
-
-        remove_target(&paths, "work").unwrap();
-        let err =
-            save_renewed(&paths, "work", "newer".to_string(), None).expect_err("removed meanwhile");
-        assert!(err.to_string().contains("does not exist"), "{err}");
-        assert!(!paths.target_dir("work").exists());
-    }
+    // ── check_target_name (the wizard's prompt and the legacy texts) ─────
 
     #[test]
-    fn validate_target_name_accepts_kebab_lowercase() {
+    fn check_target_name_accepts_kebab_lowercase() {
         for n in ["default", "work", "prod-eu", "team-2", "alpha9", "A-B-C"] {
-            validate_target_name(n).unwrap_or_else(|e| panic!("name `{n}` should be valid: {e}"));
+            check_target_name(n).unwrap_or_else(|e| panic!("name `{n}` should be valid: {e}"));
         }
     }
 
     #[test]
-    fn validate_target_name_rejects_empty() {
-        let err = validate_target_name("").expect_err("empty must error");
-        match err {
-            CliError::Other(msg) => assert!(msg.contains("must not be empty"), "{msg}"),
-            other => panic!("expected Other, got {other:?}"),
-        }
+    fn check_target_name_rejects_empty() {
+        let msg = check_target_name("").expect_err("empty must error");
+        assert!(msg.contains("must not be empty"), "{msg}");
     }
 
     #[test]
-    fn validate_target_name_rejects_punctuation() {
+    fn check_target_name_rejects_punctuation() {
         for n in [
             "foo.bar",
             "with space",
@@ -847,150 +513,23 @@ mod tests {
             "@home",
         ] {
             assert!(
-                validate_target_name(n).is_err(),
+                check_target_name(n).is_err(),
                 "name `{n}` should be rejected"
             );
         }
     }
 
     #[test]
-    fn validate_target_name_rejects_leading_or_trailing_dash() {
-        assert!(validate_target_name("-leading").is_err());
-        assert!(validate_target_name("trailing-").is_err());
-        assert!(validate_target_name("--").is_err());
+    fn check_target_name_rejects_leading_or_trailing_dash() {
+        assert!(check_target_name("-leading").is_err());
+        assert!(check_target_name("trailing-").is_err());
+        assert!(check_target_name("--").is_err());
     }
 
     #[test]
-    fn validate_target_name_rejects_overlong() {
+    fn check_target_name_rejects_overlong() {
         let long = "a".repeat(MAX_TARGET_NAME_LEN + 1);
-        let err = validate_target_name(&long).expect_err("too long");
-        assert!(matches!(err, CliError::Other(_)));
-    }
-
-    #[test]
-    fn require_known_provider_rejects_missing_flag() {
-        let err = require_known_provider(None).expect_err("missing provider");
-        match err {
-            CliError::Other(msg) => {
-                assert!(msg.contains("`--provider` is required"), "{msg}");
-                assert!(msg.contains("hetzner-cloud"), "{msg}");
-            }
-            other => panic!("expected Other, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn require_known_provider_rejects_unknown_value() {
-        let err = require_known_provider(Some("aws-bedrock")).expect_err("unknown provider");
-        match err {
-            CliError::Other(msg) => assert!(msg.contains("not supported"), "{msg}"),
-            other => panic!("expected Other, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn require_token_validates_hetzner_format() {
-        // Canonical 64-char alphanumeric, no prefix — what Hetzner
-        // Cloud Console actually issues.
-        let token = "a".repeat(64);
-        assert!(require_token("hetzner-cloud", Some(&token)).is_ok());
-
-        // Underscore is non-alphanumeric → rejected. Pinning this
-        // case to make sure the v0.1.73 regression (which required
-        // an `hcloud_` prefix) never sneaks back.
-        let bad = require_token("hetzner-cloud", Some("not_a_token")).expect_err("bad token");
-        match bad {
-            CliError::Other(msg) => assert!(msg.contains("invalid Hetzner Cloud token"), "{msg}"),
-            other => panic!("expected Other, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn verify_ssh_key_readable_errors_on_missing_path() {
-        let err = verify_ssh_key_readable(Path::new("/this/should/not/exist/anywhere/key.pub"))
-            .expect_err("missing path");
-        match err {
-            CliError::Other(msg) => assert!(msg.contains("does not exist"), "{msg}"),
-            other => panic!("expected Other, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn verify_ssh_key_readable_accepts_real_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("id_ed25519.pub");
-        std::fs::write(&path, "ssh-ed25519 AAAA...").unwrap();
-        assert!(verify_ssh_key_readable(&path).is_ok());
-    }
-
-    // ── ping_provider / classify_ping_error ──────────────────────────────
-
-    /// A 401 means the token is wrong and the operator can fix it by rotating;
-    /// anything else means the API could not be reached and rotating would be
-    /// a waste of time. The two must not collapse into one diagnostic.
-    #[test]
-    fn a_401_classifies_as_a_rejected_token_and_everything_else_as_unreachable() {
-        let rejected = classify_ping_error(
-            "hetzner-cloud",
-            CliError::Hetzner {
-                endpoint: "GET /v1/locations".to_string(),
-                status: 401,
-                code: "unauthorized".to_string(),
-                message: "unauthorized".to_string(),
-            },
-        );
-        assert!(
-            matches!(rejected, CliError::ProviderTokenRejected { .. }),
-            "{rejected:?}"
-        );
-
-        let unreachable = classify_ping_error(
-            "hetzner-cloud",
-            CliError::Hetzner {
-                endpoint: "GET /v1/locations".to_string(),
-                status: 503,
-                code: "unavailable".to_string(),
-                message: "maintenance".to_string(),
-            },
-        );
-        assert!(
-            matches!(unreachable, CliError::ProviderApiUnreachable { .. }),
-            "{unreachable:?}"
-        );
-
-        let offline = classify_ping_error("hetzner-cloud", CliError::Other("dns".to_string()));
-        assert!(
-            matches!(offline, CliError::ProviderApiUnreachable { .. }),
-            "{offline:?}"
-        );
-    }
-
-    /// The classified error keeps the original as its `#[source]` cause, so
-    /// miette renders the raw API envelope under the high-level help. Losing
-    /// it would leave the operator with advice and no evidence.
-    #[test]
-    fn a_classified_ping_error_keeps_the_original_as_its_cause() {
-        let classified = classify_ping_error(
-            "hetzner-cloud",
-            CliError::Hetzner {
-                endpoint: "GET /v1/locations".to_string(),
-                status: 401,
-                code: "unauthorized".to_string(),
-                message: "token invalid".to_string(),
-            },
-        );
-        let cause = std::error::Error::source(&classified).expect("a cause chain");
-        assert!(format!("{cause}").contains("token invalid"), "{cause}");
-    }
-
-    /// A provider that slips past the whitelist must surface a typed error
-    /// with a way forward, not panic the operator's shell.
-    #[test]
-    fn an_unwired_provider_errors_instead_of_panicking() {
-        let err = ping_provider("aws", "irrelevant").expect_err("no validator for aws");
-        let msg = format!("{err}");
-        assert!(msg.contains("aws"), "{msg}");
-        assert!(msg.contains("--no-ping"), "{msg}");
+        assert!(check_target_name(&long).is_err());
     }
 
     // ── renew guards ─────────────────────────────────────────────────────
@@ -1016,23 +555,6 @@ mod tests {
         }
     }
 
-    /// Re-pasting the SAME token must fail loudly. A green "credentials
-    /// rotated" that rotated nothing is worse than an error — the operator
-    /// believes the old, possibly leaked, token is out of use.
-    #[test]
-    fn re_pasting_the_same_token_is_refused_but_one_char_counts_as_new() {
-        let old = "a".repeat(64);
-        let err = reject_identical_token(Some(&old), &old, "work")
-            .expect_err("an identical token is not a rotation");
-        let msg = format!("{err}");
-        assert!(msg.contains("requires a NEW token"), "{msg}");
-        assert!(msg.contains("work"), "{msg}");
-
-        let nearly = format!("{}b", &old[..63]);
-        assert!(reject_identical_token(Some(&old), &nearly, "work").is_ok());
-        assert!(reject_identical_token(None, &old, "work").is_ok());
-    }
-
     // ── verification suffixes ────────────────────────────────────────────
 
     /// A `--no-ping` save must say the token was NOT verified. Rendering it
@@ -1055,18 +577,6 @@ mod tests {
         assert!(line.contains("cx42"), "{line}");
         assert!(line.contains("NOT validated"), "{line}");
         assert!(line.contains("--no-ping"), "{line}");
-    }
-
-    /// Server types are per-location, so an unset `--region` must fall back to
-    /// the same default the CLI provisions into — checking against a different
-    /// one would pass here and fail at `apply`.
-    #[test]
-    fn the_sku_check_region_defaults_to_the_provisioning_default() {
-        assert_eq!(region_for_sku_check(Some("hel1")), "hel1");
-        assert_eq!(
-            region_for_sku_check(None),
-            apprafter_core::machine::DEFAULT_REGION
-        );
     }
 
     // ── list / show over the core's reports ──────────────────────────────

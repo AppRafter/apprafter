@@ -19,6 +19,33 @@ use crate::commands;
 pub(crate) fn dispatch(args: Cli) -> miette::Result<()> {
     match args.command {
         Commands::Target { action } => match action {
+            TargetCommand::Add {
+                name,
+                provider,
+                token,
+                ssh_key,
+                region,
+                tier,
+                cluster_name,
+                force,
+                renew,
+                no_interactive,
+                no_ping,
+                server_type,
+            } => commands::target::add(commands::target::AddArgs {
+                name,
+                provider,
+                token,
+                ssh_key,
+                region,
+                tier,
+                cluster_name,
+                force,
+                renew,
+                no_interactive,
+                no_ping,
+                server_type,
+            }),
             TargetCommand::List => commands::target::list(),
             TargetCommand::Show { name } => commands::target::show(name.as_deref()),
             TargetCommand::Use { name } => commands::target::use_target(&name),

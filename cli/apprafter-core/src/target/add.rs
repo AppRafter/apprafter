@@ -55,11 +55,13 @@ pub struct RenewPayload {
     ssh_key: Option<PathBuf>,
 }
 
-/// The stored `config.yaml` of `name`, or `None` when there is no such target. Never reads the
-/// credentials.
+/// The stored `config.yaml` of `name`, or `None` when there is no such target. Both of the
+/// target's files are read, as the CLI's name check always read them: a target whose
+/// credentials file cannot be read is that error, `force` or not — never "exists", and never
+/// overwritten. (The token itself is dropped here.)
 fn stored_config(store: &TargetStorePaths, name: &str) -> CoreResult<Option<TargetConfig>> {
-    match cli_core::target::load_target_config(store, name) {
-        Ok(c) => Ok(Some(c)),
+    match cli_core::load_target(store, name) {
+        Ok(t) => Ok(Some(t.config)),
         Err(cli_core::CliError::TargetNotFound { .. }) => Ok(None),
         Err(e) => Err(e.into()),
     }
@@ -430,6 +432,38 @@ mod tests {
             plan_add(&ctx, args("prod", TOKEN_B)),
             Err(CoreError::TargetExists { .. })
         ));
+    }
+
+    /// The name check reads both of the target's files, as the CLI's always did: a target whose
+    /// credentials file cannot be read is refused with that error, `force` or not — never
+    /// reported as merely existing, and never overwritten.
+    #[test]
+    fn an_existing_target_with_unreadable_credentials_is_refused_force_or_not() {
+        let (_d, ctx) = store(&["prod"], Some("prod"));
+        let creds = ctx.store().target_credentials_file("prod");
+        std::fs::write(&creds, "hetzner_token: [unclosed").unwrap();
+        for force in [false, true] {
+            let err = plan_add(
+                &ctx,
+                AddArgs {
+                    force,
+                    ..args("prod", TOKEN_B)
+                },
+            )
+            .expect_err("unreadable credentials");
+            assert!(
+                matches!(
+                    &err,
+                    CoreError::Cli(cli_core::CliError::InvalidTargetConfig { path, .. })
+                        if path == &creds
+                ),
+                "force={force}: {err:?}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(&creds).unwrap(),
+            "hetzner_token: [unclosed"
+        );
     }
 
     #[test]

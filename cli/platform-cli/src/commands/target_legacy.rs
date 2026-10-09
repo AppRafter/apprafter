@@ -55,6 +55,46 @@ pub(crate) fn rename(e: CoreError) -> miette::Report {
     }
 }
 
+/// `target add`'s refusals as today (`check_name_free`, `require_known_provider`), then the
+/// shared ones over the token the command was given; anything else through the core renderer.
+pub(crate) fn add(e: CoreError, token: &str) -> miette::Report {
+    let text = match &e {
+        CoreError::TargetExists { name } => Some(format!(
+            "target `{name}` already exists — pass `--force` to overwrite or `--renew` to rotate credentials only"
+        )),
+        CoreError::UnknownProvider {
+            provider,
+            supported,
+        } => Some(format!(
+            "provider `{provider}` is not supported in v0.1.73 (supported: {})",
+            supported.join(", ")
+        )),
+        other => common(other, Some(token)),
+    };
+    match text {
+        Some(t) => other(t),
+        None => report(e),
+    }
+}
+
+/// `target add --renew`'s refusals as today (`reject_identical_token`, `load_renewable`), then
+/// the shared ones; anything else through the core renderer.
+pub(crate) fn renew(e: CoreError, token: &str) -> miette::Report {
+    let text = match &e {
+        CoreError::RenewTokenUnchanged { name } => Some(format!(
+            "`--renew` requires a NEW token, but the value provided is identical to the one already saved for target `{name}`. Generate a fresh token in the Hetzner Cloud Console → Security → API Tokens, then re-run `apprafter target add {name} --renew` with the new value."
+        )),
+        CoreError::TargetNotFound { name, .. } => Some(format!(
+            "target `{name}` does not exist — drop `--renew` to create it fresh"
+        )),
+        other => common(other, Some(token)),
+    };
+    match text {
+        Some(t) => other(t),
+        None => report(e),
+    }
+}
+
 /// `target machine`'s refusals as today: the provisioned refusal with its rebuild recipe, and
 /// `resolve_hetzner_token`'s no-token text; then the shared ones; anything else through the
 /// core renderer.
@@ -141,6 +181,82 @@ mod tests {
             r.code().map(|c| c.to_string()).as_deref(),
             Some("apprafter::cli::other")
         );
+    }
+
+    #[test]
+    fn add_and_renew_refusals_render_todays_text() {
+        let t = |r: miette::Report| r.to_string();
+        assert_eq!(
+            t(add(CoreError::TargetExists { name: "prod".into() }, "x")),
+            "target `prod` already exists — pass `--force` to overwrite or `--renew` to rotate credentials only"
+        );
+        assert_eq!(
+            t(add(
+                CoreError::UnknownProvider {
+                    provider: "aws".into(),
+                    supported: vec!["hetzner-cloud".into()]
+                },
+                "x"
+            )),
+            "provider `aws` is not supported in v0.1.73 (supported: hetzner-cloud)"
+        );
+        assert_eq!(
+            t(add(
+                CoreError::InvalidToken {
+                    problem: apprafter_core::provider::TokenProblem::WrongLength { got: 5 }
+                },
+                "short"
+            )),
+            "invalid Hetzner Cloud token: Hetzner Cloud tokens are 64 ASCII alphanumeric characters; got 5"
+        );
+        assert_eq!(
+            t(add(
+                CoreError::SshKeyUnreadable {
+                    path: "/k.pub".into(),
+                    problem: apprafter_core::ssh::SshKeyProblem::Missing,
+                    error: None
+                },
+                "x"
+            )),
+            "SSH key path `/k.pub` does not exist"
+        );
+        assert_eq!(
+            t(add(
+                CoreError::SshKeyUnreadable {
+                    path: "/k.pub".into(),
+                    problem: apprafter_core::ssh::SshKeyProblem::Unreadable,
+                    error: Some("Permission denied (os error 13)".into())
+                },
+                "x"
+            )),
+            "SSH key `/k.pub` is not readable: Permission denied (os error 13)"
+        );
+        assert!(t(renew(
+            CoreError::RenewTokenUnchanged {
+                name: "prod".into()
+            },
+            "x"
+        ))
+        .starts_with("`--renew` requires a NEW token"));
+        assert_eq!(
+            t(renew(
+                CoreError::TargetNotFound {
+                    name: "ghost".into(),
+                    available: vec![]
+                },
+                "x"
+            )),
+            "target `ghost` does not exist — drop `--renew` to create it fresh"
+        );
+        for r in [
+            add(CoreError::TargetExists { name: "p".into() }, "x"),
+            renew(CoreError::RenewTokenUnchanged { name: "p".into() }, "x"),
+        ] {
+            assert_eq!(
+                r.code().map(|c| c.to_string()).as_deref(),
+                Some("apprafter::cli::other")
+            );
+        }
     }
 
     /// Everything the legacy table does not name renders as the core renderer does.
