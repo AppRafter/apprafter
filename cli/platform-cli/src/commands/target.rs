@@ -153,9 +153,9 @@ pub(crate) fn add(mut args: AddArgs) -> miette::Result<()> {
         },
     )
     .map_err(report)?;
-    // What a forced overwrite keeps, as planned (an edit made during the ping is merged too, but
-    // these lines describe the plan).
-    let kept = kept_lines(&plan.changes);
+    // What a forced overwrite changes and keeps, as planned (an edit made during the ping is
+    // merged too, but these lines describe the plan).
+    let fields = force_lines(&plan.changes);
     let added = completed(
         core_target::execute_add(&ctx, plan, &CliReporter, &CancellationToken::new())
             .map_err(report)?,
@@ -168,7 +168,7 @@ pub(crate) fn add(mut args: AddArgs) -> miette::Result<()> {
         "{}",
         add_saved_line(&added, add_verified_suffix(args.no_ping))
     );
-    for line in kept {
+    for line in fields {
         println!("{line}");
     }
     Ok(())
@@ -199,14 +199,24 @@ pub(crate) fn add_saved_line(a: &core_target::TargetAdded, suffix: &str) -> Stri
     }
 }
 
-/// One `  kept <field>: <value>` line per field a forced overwrite keeps (the plan's `Keep
-/// Target` changes, in plan order): the fields not passed, and the firewall toggle, which no
-/// flag sets.
-pub(crate) fn kept_lines(changes: &[apprafter_core::PlannedChange]) -> Vec<String> {
+/// One line per field of a forced overwrite, in plan order, so no field changes without the
+/// CLI saying so (bug 8): `  updated <field>: <old> → <new>` for the plan's `Update Target`
+/// changes (a flag, or a wizard answer, that differs from the stored value), `  kept <field>:
+/// <value>` for its `Keep Target` ones (the fields not passed or passed unchanged, and the
+/// firewall toggle, which no flag sets).
+pub(crate) fn force_lines(changes: &[apprafter_core::PlannedChange]) -> Vec<String> {
+    use apprafter_core::ChangeAction;
     changes
         .iter()
-        .filter(|c| c.kind == "Target" && c.action == apprafter_core::ChangeAction::Keep)
-        .filter_map(|c| c.detail.as_deref().map(|d| format!("  kept {d}")))
+        .filter(|c| c.kind == "Target")
+        .filter_map(|c| {
+            let verb = match c.action {
+                ChangeAction::Update => "updated",
+                ChangeAction::Keep => "kept",
+                _ => return None,
+            };
+            c.detail.as_deref().map(|d| format!("  {verb} {d}"))
+        })
         .collect()
 }
 
@@ -899,8 +909,10 @@ mod tests {
         assert_eq!(assert_commands_parse(&force_doc), 2, "{force_doc}");
     }
 
+    /// Bug 8: no field of a forced overwrite changes without the CLI saying so — the plan's
+    /// `Update Target` lines print beside its `Keep` lines, in plan order; nothing else does.
     #[test]
-    fn kept_lines_are_the_plans_kept_target_fields_in_order() {
+    fn force_lines_are_the_plans_kept_and_updated_target_fields_in_order() {
         use apprafter_core::{ChangeAction, PlannedChange};
         let c = |kind: &str, action, detail: &str| PlannedChange {
             kind: kind.into(),
@@ -920,8 +932,12 @@ mod tests {
             c("CliDefault", ChangeAction::Keep, "not a target field"),
         ];
         assert_eq!(
-            kept_lines(&changes),
-            ["  kept tier: solo", "  kept firewall: Cloudflare origin on"]
+            force_lines(&changes),
+            [
+                "  updated region: nbg1 → hel1",
+                "  kept tier: solo",
+                "  kept firewall: Cloudflare origin on"
+            ]
         );
     }
 

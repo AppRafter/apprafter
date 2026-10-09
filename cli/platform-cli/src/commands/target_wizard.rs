@@ -124,12 +124,25 @@ pub struct WizardOutput {
 /// Prompt order (v0.2.42+):
 ///  1. name → 2. provider → 3. token → 4. ssh-key → 5. tier
 ///     → 6. machine matrix (region × SKU, replaces the old region step)
+///
+/// With `--force` on a stored target (bug 8) the wizard starts from that target
+/// (`ForceBase`): each optional prompt offers "keep the stored value" as its default, so
+/// Enter changes nothing, and a target whose state records a server skips the machine step —
+/// its region and server type cannot change, the guard `plan_add` applies. A kept field comes
+/// back `None`, which `target add` treats as a flag not passed: the core keeps the stored value.
 pub fn run_add_wizard(ctx: &Context, initial: &AddArgs) -> CoreResult<WizardOutput> {
     eprintln!();
     eprintln!("Welcome to AppRafter. Let's set up a deployment target.");
     eprintln!();
 
     let name = prompt_name(initial.name.as_deref(), "positional argument")?;
+    let base = ForceBase::load(ctx, &name, initial.force)?;
+    if base.is_some() {
+        eprintln!(
+            "  ℹ Target `{name}` exists: --force keeps each stored value you do not change \
+             (Enter keeps it)"
+        );
+    }
     let provider = prompt_provider(initial.provider.as_deref(), "--provider flag")?;
     let token_source = classify_token_source(ctx, initial.token.as_deref());
     let (token, token_already_verified) = prompt_token(
@@ -140,18 +153,42 @@ pub fn run_add_wizard(ctx: &Context, initial: &AddArgs) -> CoreResult<WizardOutp
         initial.no_ping,
     )?;
     let ssh_key_source = classify_ssh_key_source(initial.ssh_key.as_deref());
-    let ssh_key = prompt_ssh_key(ctx, initial.ssh_key.as_ref(), ssh_key_source)?;
+    let ssh_key = prompt_ssh_key(
+        ctx,
+        initial.ssh_key.as_ref(),
+        ssh_key_source,
+        base.as_ref().map(|b| b.ssh_key_shown(ctx)),
+    )?;
     // Tier comes BEFORE the machine matrix so a future tier-aware
     // filter can use the chosen tier to narrow the offer list.
-    let tier = prompt_tier(initial.tier.as_deref(), "--tier flag")?;
-    let (region, server_type) = prompt_machine(
-        ctx,
-        &provider,
-        &SecretString::new(token.clone()),
+    let tier = prompt_tier(
+        initial.tier.as_deref(),
+        "--tier flag",
+        base.as_ref().map(|b| b.config.default_tier.as_deref()),
+    )?;
+    let secret = SecretString::new(token.clone());
+    let step = force_machine_step(
+        base.as_ref(),
         initial.region.as_deref(),
         initial.server_type.as_deref(),
-        initial.no_ping,
-    )?;
+    );
+    let (region, server_type) = match (step, &base) {
+        (ForceMachineStep::Skip(line), _) => {
+            eprintln!("{line}");
+            (None, None)
+        }
+        (ForceMachineStep::OfferKeep, Some(b)) => {
+            prompt_machine_keeping(ctx, &provider, &secret, &b.config, initial.no_ping)?
+        }
+        (ForceMachineStep::Ask, _) | (ForceMachineStep::OfferKeep, None) => prompt_machine(
+            ctx,
+            &provider,
+            &secret,
+            initial.region.as_deref(),
+            initial.server_type.as_deref(),
+            initial.no_ping,
+        )?,
+    };
 
     Ok(WizardOutput {
         name,
@@ -163,6 +200,168 @@ pub fn run_add_wizard(ctx: &Context, initial: &AddArgs) -> CoreResult<WizardOutp
         server_type,
         token_already_verified,
     })
+}
+
+/// What `target add <name> --force` overwrites, read before the optional prompts so each can
+/// offer to keep its stored value (bug 8: the wizard's defaults used to replace them).
+struct ForceBase {
+    name: String,
+    config: cli_core::TargetConfig,
+    server: StoredServer,
+}
+
+/// Whether the stored target's state records a server.
+enum StoredServer {
+    None,
+    Recorded(apprafter_core::target::ProvisionedServer),
+    /// The state cannot be read (the error, as shown).
+    Unreadable(String),
+}
+
+impl ForceBase {
+    /// The stored target `--force` overwrites. `None` without `--force`, for a name that is
+    /// not stored, or for an invalid name (refused after the wizard, as today). A target whose
+    /// files cannot be read is that error now: `plan_add` reads both files and would refuse it
+    /// with the same error after the whole wizard.
+    fn load(ctx: &Context, name: &str, force: bool) -> CoreResult<Option<ForceBase>> {
+        if !force || apprafter_core::target::validate_name(name).is_err() {
+            return Ok(None);
+        }
+        let config = match cli_core::load_target(&ctx.store(), name) {
+            Ok(t) => t.config,
+            Err(CliError::TargetNotFound { .. }) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let server = match apprafter_core::TargetRef::named(ctx, name)
+            .and_then(|t| apprafter_core::target::provisioned(ctx, &t))
+        {
+            Ok(None) => StoredServer::None,
+            Ok(Some(s)) => StoredServer::Recorded(s),
+            Err(e) => StoredServer::Unreadable(e.to_string()),
+        };
+        Ok(Some(ForceBase {
+            name: name.to_string(),
+            config,
+            server,
+        }))
+    }
+
+    /// The stored SSH key as the prompts show paths (`~/…`), or `None` when none is stored.
+    fn ssh_key_shown(&self, ctx: &Context) -> Option<String> {
+        self.config
+            .ssh_key_path
+            .as_deref()
+            .map(|p| cli_core::paths::abbreviate_home(p, ctx.home_dir()))
+    }
+
+    /// "region hel1, server type cx32", each "not set" when unset.
+    fn machine_shown(&self) -> String {
+        stored_machine(&self.config)
+    }
+}
+
+/// "region hel1, server type cx32", each "not set" when unset.
+fn stored_machine(c: &cli_core::TargetConfig) -> String {
+    format!(
+        "region {}, server type {}",
+        c.region.as_deref().unwrap_or("not set"),
+        c.server_type.as_deref().unwrap_or("not set")
+    )
+}
+
+/// The machine step of the add wizard.
+#[derive(Debug, PartialEq, Eq)]
+enum ForceMachineStep {
+    /// Today's step: no stored target, or `--region` / `--server-type` passed.
+    Ask,
+    /// A provisioned target (or one whose state cannot be read): no prompt; the line says why.
+    Skip(String),
+    /// A stored target that has not provisioned: keeping its machine is the default.
+    OfferKeep,
+}
+
+/// Which machine step a `--force` overwrite gets. A target whose state records a server keeps
+/// its machine (no in-place resize: the guard `plan_add` and `target machine` apply), so the
+/// step is skipped; a flag that moves it is refused by `plan_add` with that guard's error.
+fn force_machine_step(
+    base: Option<&ForceBase>,
+    flag_region: Option<&str>,
+    flag_sku: Option<&str>,
+) -> ForceMachineStep {
+    let Some(b) = base else {
+        return ForceMachineStep::Ask;
+    };
+    match &b.server {
+        StoredServer::Recorded(s) => ForceMachineStep::Skip(format!(
+            "  ℹ Machine: kept ({}) — target `{}` records server `{}` (id {}), and a \
+             provisioned target's region and server type cannot change",
+            b.machine_shown(),
+            b.name,
+            s.server_name,
+            s.server_id
+        )),
+        StoredServer::Unreadable(e) => ForceMachineStep::Skip(format!(
+            "  ℹ Machine: kept ({}) — the state of target `{}` cannot be read ({e}), so \
+             whether it records a server is unknown",
+            b.machine_shown(),
+            b.name
+        )),
+        StoredServer::None if flag_region.is_some() || flag_sku.is_some() => ForceMachineStep::Ask,
+        StoredServer::None => ForceMachineStep::OfferKeep,
+    }
+}
+
+/// The machine step of a `--force` overwrite of a target that has not provisioned, with no
+/// `--region` / `--server-type`: keeping the stored machine is the default, and picking another
+/// is today's step. Under `--no-ping` the region prompt defaults to the stored region and the
+/// stored server type is kept.
+fn prompt_machine_keeping(
+    ctx: &Context,
+    provider: &str,
+    token: &SecretString,
+    stored: &cli_core::TargetConfig,
+    no_ping: bool,
+) -> CoreResult<(Option<String>, Option<String>)> {
+    if no_ping {
+        match &stored.server_type {
+            Some(sku) => eprintln!(
+                "  machine picker skipped (--no-ping); the stored server type {sku} is kept"
+            ),
+            None => eprintln!(
+                "  machine picker skipped (--no-ping); no server type is stored — pass \
+                 --server-type or set one via `apprafter target machine`, or a fresh provision \
+                 will fail"
+            ),
+        }
+        return Ok((prompt_region(None, "", stored.region.as_deref())?, None));
+    }
+    let choices = vec![
+        MachineKeepChoice::Keep(stored_machine(stored)),
+        MachineKeepChoice::Pick,
+    ];
+    match Select::new("Machine (region × server type):", choices)
+        .prompt()
+        .map_err(map_inquire_err)?
+    {
+        MachineKeepChoice::Keep(_) => Ok((None, None)),
+        MachineKeepChoice::Pick => prompt_machine(ctx, provider, token, None, None, false),
+    }
+}
+
+/// The two rows of [`prompt_machine_keeping`]'s Select, keeping first (the default).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MachineKeepChoice {
+    Keep(String),
+    Pick,
+}
+
+impl std::fmt::Display for MachineKeepChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Keep(m) => write!(f, "Keep the stored machine: {m}"),
+            Self::Pick => f.write_str("Pick another machine"),
+        }
+    }
 }
 
 /// Whether the SSH-key prefill came in via the `--ssh-key` flag or
@@ -374,10 +573,14 @@ fn prompt_token(
     Ok((answer, !no_ping))
 }
 
+/// `keep` is a `--force` overwrite's stored key (`Some(None)`: none is stored): keeping it is
+/// the first row and the default, and returns `None` — the flag not passed, so the core keeps
+/// the stored value.
 fn prompt_ssh_key(
     ctx: &Context,
     prefill: Option<&PathBuf>,
     source: &str,
+    keep: Option<Option<String>>,
 ) -> CoreResult<Option<PathBuf>> {
     if let Some(path) = prefill {
         let abbrev = cli_core::paths::abbreviate_home(path, ctx.home_dir());
@@ -388,14 +591,15 @@ fn prompt_ssh_key(
     // Inventory ~/.ssh/*.pub so users with multiple keys (work +
     // personal + per-host) get a real picker rather than a Text
     // input with a blind default. Falls back to the Text path
-    // when the directory is empty / unreadable.
+    // when the directory is empty / unreadable (and there is no
+    // stored key to keep).
     let candidates = apprafter_core::ssh::public_key_candidates(ctx)?;
 
-    if candidates.is_empty() {
+    if candidates.is_empty() && keep.is_none() {
         return prompt_ssh_key_text_fallback(ctx.home_dir());
     }
 
-    let options = build_ssh_key_choices(candidates);
+    let options = build_ssh_key_choices(candidates, keep);
 
     let selected = Select::new("SSH public key:", options)
         .with_help_message("Used for server provisioning; can be added/changed later.")
@@ -405,7 +609,7 @@ fn prompt_ssh_key(
     match selected {
         SshKeyChoice::Path { path, .. } => Ok(Some(path)),
         SshKeyChoice::Other => prompt_ssh_key_text_fallback(ctx.home_dir()),
-        SshKeyChoice::Skip => Ok(None),
+        SshKeyChoice::Skip | SshKeyChoice::Keep(_) => Ok(None),
     }
 }
 
@@ -424,19 +628,27 @@ fn prompt_ssh_key_text_fallback(home: Option<&Path>) -> CoreResult<Option<PathBu
 
 /// Build the SSH-key picker rows: one `Path` row per found key
 /// in the core's order, then the two escape hatches pinned to the
-/// bottom (`Other` before `Skip`). Pure — extracted from
-/// `prompt_ssh_key` so the row set and the sentinel placement are
-/// testable without a terminal.
-fn build_ssh_key_choices(candidates: Vec<SshKeyCandidate>) -> Vec<SshKeyChoice> {
-    let mut options: Vec<SshKeyChoice> = candidates
-        .into_iter()
-        .map(|c| SshKeyChoice::Path {
-            label: candidate_label(&c),
-            path: PathBuf::from(c.path),
-        })
-        .collect();
+/// bottom (`Other` before `Skip`). With `keep` (a `--force`
+/// overwrite's stored key) its `Keep` row comes first — the
+/// default — and `Skip` is left out: a forced overwrite cannot
+/// clear a stored key, so "don't attach one" would only keep it
+/// under another name. Pure — extracted from `prompt_ssh_key` so
+/// the row set and the sentinel placement are testable without a
+/// terminal.
+fn build_ssh_key_choices(
+    candidates: Vec<SshKeyCandidate>,
+    keep: Option<Option<String>>,
+) -> Vec<SshKeyChoice> {
+    let forced = keep.is_some();
+    let mut options: Vec<SshKeyChoice> = keep.map(SshKeyChoice::Keep).into_iter().collect();
+    options.extend(candidates.into_iter().map(|c| SshKeyChoice::Path {
+        label: candidate_label(&c),
+        path: PathBuf::from(c.path),
+    }));
     options.push(SshKeyChoice::Other);
-    options.push(SshKeyChoice::Skip);
+    if !forced {
+        options.push(SshKeyChoice::Skip);
+    }
     options
 }
 
@@ -488,7 +700,12 @@ fn ssh_key_answer_to_path(answer: &str, home: Option<&Path>) -> Option<PathBuf> 
 /// doesn't have to re-read the file on every redraw.
 #[derive(Clone)]
 enum SshKeyChoice {
-    Path { path: PathBuf, label: String },
+    /// A `--force` overwrite's stored key (as shown), or `None` when none is stored.
+    Keep(Option<String>),
+    Path {
+        path: PathBuf,
+        label: String,
+    },
     Other,
     Skip,
 }
@@ -496,6 +713,8 @@ enum SshKeyChoice {
 impl std::fmt::Display for SshKeyChoice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Keep(Some(key)) => write!(f, "Keep the stored key: {key}"),
+            Self::Keep(None) => f.write_str("Keep: no SSH key (none is stored)"),
             Self::Path { label, .. } => f.write_str(label),
             Self::Other => f.write_str("Other (type a path)"),
             Self::Skip => f.write_str("Skip (don't attach an SSH key now)"),
@@ -503,18 +722,25 @@ impl std::fmt::Display for SshKeyChoice {
     }
 }
 
-/// The `--no-ping` region prompt: a Text input with the spec's default `nbg1`, since the API
-/// cannot be asked for the region list. (It had a network branch, which nothing could reach:
-/// its one caller passed `no_ping = true`.)
-fn prompt_region(prefill: Option<&str>, source: &str) -> CoreResult<Option<String>> {
+/// The `--no-ping` region prompt: a Text input with `default` (the spec's `nbg1` for a new
+/// target; a `--force` overwrite's stored region, so Enter keeps it — or none, when none is
+/// stored, so Enter keeps it unset), since the API cannot be asked for the region list. (It had
+/// a network branch, which nothing could reach: its one caller passed `no_ping = true`.)
+fn prompt_region(
+    prefill: Option<&str>,
+    source: &str,
+    default: Option<&str>,
+) -> CoreResult<Option<String>> {
     if let Some(r) = prefill {
         eprintln!("  ℹ Default region: {r} (from {source})");
         return Ok(Some(r.to_string()));
     }
-    let answer = Text::new("Default region:")
-        .with_default(apprafter_core::machine::DEFAULT_REGION)
-        .prompt()
-        .map_err(map_inquire_err)?;
+    let prompt = Text::new("Default region:");
+    let prompt = match default {
+        Some(d) => prompt.with_default(d),
+        None => prompt.with_help_message("leave empty to keep it unset"),
+    };
+    let answer = prompt.prompt().map_err(map_inquire_err)?;
     Ok(region_text_answer(&answer))
 }
 
@@ -618,7 +844,11 @@ pub fn prompt_machine(
              pass --server-type or set one via `apprafter target machine`, \
              or a fresh provision will fail"
         );
-        let region = prompt_region(prefill_region, "--region flag")?;
+        let region = prompt_region(
+            prefill_region,
+            "--region flag",
+            Some(apprafter_core::machine::DEFAULT_REGION),
+        )?;
         return Ok((region, None));
     }
 
@@ -666,40 +896,67 @@ pub fn prompt_machine(
     Ok((Some(region), Some(sku)))
 }
 
-fn prompt_tier(prefill: Option<&str>, source: &str) -> CoreResult<Option<String>> {
+/// `keep` is a `--force` overwrite's stored tier (`Some(None)`: none is stored): keeping it is
+/// the first row and the default, and returns `None` — the flag not passed, so the core keeps
+/// the stored value.
+fn prompt_tier(
+    prefill: Option<&str>,
+    source: &str,
+    keep: Option<Option<&str>>,
+) -> CoreResult<Option<String>> {
     if let Some(t) = prefill {
         eprintln!("  ℹ Default tier: {t} (from {source})");
         return Ok(Some(t.to_string()));
     }
-    let options = build_tier_choices();
+    let options = build_tier_choices(keep);
     let selected = Select::new("Default tier:", options)
         .prompt()
         .map_err(map_inquire_err)?;
-    Ok(Some(selected.key))
+    Ok(selected.tier())
 }
 
-/// Materialise the tier picker rows from `TIER_CHOICES`. Pure —
-/// extracted from `prompt_tier` so the offered set and its order
-/// (price ladder, cheapest first) are testable without a terminal.
-fn build_tier_choices() -> Vec<TierChoice> {
-    TIER_CHOICES
-        .iter()
-        .map(|(k, label)| TierChoice {
+/// Materialise the tier picker rows from `TIER_CHOICES`, after a
+/// `Keep` row (the default) when `keep` is a `--force` overwrite's
+/// stored tier. Pure — extracted from `prompt_tier` so the offered
+/// set and its order (price ladder, cheapest first) are testable
+/// without a terminal.
+fn build_tier_choices(keep: Option<Option<&str>>) -> Vec<TierChoice> {
+    let keep = keep.map(|k| TierChoice::Keep(k.map(str::to_string)));
+    keep.into_iter()
+        .chain(TIER_CHOICES.iter().map(|(k, label)| TierChoice::Tier {
             key: (*k).to_string(),
             label: (*label).to_string(),
-        })
+        }))
         .collect()
 }
 
-#[derive(Clone)]
-struct TierChoice {
-    key: String,
-    label: String,
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TierChoice {
+    /// A `--force` overwrite's stored tier, or `None` when none is stored.
+    Keep(Option<String>),
+    Tier {
+        key: String,
+        label: String,
+    },
+}
+
+impl TierChoice {
+    /// What the prompt answers: a tier, or `None` to keep the stored one.
+    fn tier(self) -> Option<String> {
+        match self {
+            TierChoice::Keep(_) => None,
+            TierChoice::Tier { key, .. } => Some(key),
+        }
+    }
 }
 
 impl std::fmt::Display for TierChoice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} — {}", self.key, self.label)
+        match self {
+            Self::Keep(Some(t)) => write!(f, "Keep the stored tier: {t}"),
+            Self::Keep(None) => f.write_str("Keep: no tier (none is stored)"),
+            Self::Tier { key, label } => write!(f, "{key} — {label}"),
+        }
     }
 }
 
@@ -1016,7 +1273,7 @@ mod tests {
 
     #[test]
     fn tier_choice_display_includes_both_key_and_label() {
-        let c = TierChoice {
+        let c = TierChoice::Tier {
             key: "solo".into(),
             label: "Tier 1 — €5".into(),
         };
@@ -1204,6 +1461,269 @@ mod tests {
         assert!(!out.token_already_verified);
     }
 
+    /// A store holding target `prod` as an operator would have it after a provision: tier team,
+    /// region hel1, server type cx32, an SSH key, a Cloudflare firewall — and, when `server` is
+    /// set, a state that records server 42.
+    fn stored_prod(server: bool) -> (tempfile::TempDir, Context, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = Context::for_desktop(dir.path().join("store"), "http://127.0.0.1:1")
+            .with_home_dir(Some(dir.path().join("home")));
+        let key = dir.path().join("home").join(".ssh").join("prod.pub");
+        std::fs::create_dir_all(key.parent().unwrap()).unwrap();
+        std::fs::write(&key, "ssh-ed25519 AAAA op@prod\n").unwrap();
+        cli_core::save_target(
+            &ctx.store(),
+            &cli_core::Target {
+                name: "prod".into(),
+                config: cli_core::TargetConfig {
+                    provider: "hetzner-cloud".into(),
+                    region: Some("hel1".into()),
+                    default_tier: Some("team".into()),
+                    cluster_name: None,
+                    ssh_key_path: Some(key.clone()),
+                    firewall: Some(cli_core::target::FirewallConfig {
+                        cloudflare_origin: true,
+                    }),
+                    server_type: Some("cx32".into()),
+                },
+                credentials: cli_core::TargetCredentials {
+                    hetzner_token: Some("a".repeat(64)),
+                },
+            },
+        )
+        .unwrap();
+        if server {
+            let state = cli_state::StatePaths::for_active_target(&ctx.store(), "prod");
+            std::fs::create_dir_all(state.state_dir()).unwrap();
+            std::fs::write(
+                state.state_file(),
+                r#"{"hetzner_cloud":{"server_id":42,"server_name":"prod-node","server_type":"cx32"}}"#,
+            )
+            .unwrap();
+        }
+        (dir, ctx, key)
+    }
+
+    /// `target add prod --force` with every optional flag left out but `--ssh-key` / `--tier`
+    /// (so no Select opens in a test), as a terminal user rotating only the token would run it.
+    fn force_args(key: &Path) -> AddArgs {
+        AddArgs {
+            name: Some("prod".into()),
+            provider: Some("hetzner-cloud".into()),
+            token: Some("b".repeat(64)),
+            ssh_key: Some(key.to_path_buf()),
+            region: None,
+            tier: Some("team".into()),
+            cluster_name: None,
+            force: true,
+            renew: false,
+            no_interactive: false,
+            no_ping: true,
+            server_type: None,
+        }
+    }
+
+    /// The `--force` wizard and its merge, through to the core's plan: what the wizard hands
+    /// back, merged as `target add` merges it, must plan no change the operator did not make.
+    fn plan_of(
+        ctx: &Context,
+        mut args: AddArgs,
+    ) -> apprafter_core::CoreResult<Vec<(String, String)>> {
+        let out = run_add_wizard(ctx, &args)?;
+        crate::commands::target::merge_wizard_output(&mut args, out);
+        let plan = apprafter_core::target::plan_add(
+            ctx,
+            apprafter_core::target::AddArgs {
+                name: args.name.unwrap(),
+                provider: args.provider.unwrap(),
+                token: SecretString::new(args.token.unwrap()),
+                ssh_key: args.ssh_key,
+                region: args.region,
+                tier: args.tier,
+                cluster_name: args.cluster_name,
+                server_type: args.server_type,
+                force: args.force,
+            },
+        )?;
+        Ok(plan
+            .changes
+            .iter()
+            .filter(|c| c.kind == "Target")
+            .map(|c| {
+                (
+                    format!("{:?}", c.action),
+                    c.detail.clone().unwrap_or_default(),
+                )
+            })
+            .collect())
+    }
+
+    /// Bug 8 on a terminal: with `--force` each optional Select opens on "keep the stored
+    /// value", so Enter changes nothing. The tier row keeps the stored tier (or its absence) and
+    /// answers `None` — the flag not passed — and the four tiers follow in price order.
+    #[test]
+    fn a_forced_tier_prompt_opens_on_keeping_the_stored_tier() {
+        let rows = build_tier_choices(Some(Some("team")));
+        assert_eq!(rows[0], TierChoice::Keep(Some("team".into())));
+        assert_eq!(rows[0].to_string(), "Keep the stored tier: team");
+        assert_eq!(rows[0].clone().tier(), None, "keeping is no flag");
+        assert_eq!(
+            rows[1..]
+                .iter()
+                .cloned()
+                .filter_map(TierChoice::tier)
+                .collect::<Vec<_>>(),
+            ["solo", "team", "prod", "regulated"]
+        );
+        let unset = build_tier_choices(Some(None));
+        assert_eq!(unset[0].to_string(), "Keep: no tier (none is stored)");
+        assert_eq!(unset[0].clone().tier(), None);
+        assert!(
+            !build_tier_choices(None)
+                .iter()
+                .any(|c| matches!(c, TierChoice::Keep(_))),
+            "a new target has nothing to keep"
+        );
+    }
+
+    /// The same for the SSH key: keeping the stored key is the first row and answers `None`,
+    /// and `Skip` is gone — a forced overwrite cannot clear a stored key, so "don't attach one"
+    /// would only have kept it under another name. A new target's rows are unchanged.
+    #[test]
+    fn a_forced_ssh_key_prompt_opens_on_keeping_the_stored_key() {
+        let candidate = SshKeyCandidate {
+            path: "/h/.ssh/a.pub".into(),
+            display: "~/.ssh/a.pub".into(),
+            algo: None,
+            comment: None,
+        };
+        let rows = build_ssh_key_choices(
+            vec![candidate.clone()],
+            Some(Some("~/.ssh/prod.pub".into())),
+        );
+        assert_eq!(
+            rows.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
+            [
+                "Keep the stored key: ~/.ssh/prod.pub",
+                "~/.ssh/a.pub",
+                "Other (type a path)"
+            ]
+        );
+        let none_stored = build_ssh_key_choices(Vec::new(), Some(None));
+        assert_eq!(
+            none_stored
+                .iter()
+                .map(|r| r.to_string())
+                .collect::<Vec<_>>(),
+            ["Keep: no SSH key (none is stored)", "Other (type a path)"]
+        );
+        let fresh = build_ssh_key_choices(vec![candidate], None);
+        assert_eq!(
+            fresh.last().unwrap().to_string(),
+            "Skip (don't attach an SSH key now)"
+        );
+    }
+
+    /// The machine step of `--force`: a provisioned target (or one whose state cannot be read)
+    /// skips it with a line that says why and what is kept; a target that has not provisioned
+    /// offers to keep its machine unless `--region` / `--server-type` was passed; no stored
+    /// target is today's step.
+    #[test]
+    fn the_forced_machine_step_follows_the_provisioned_guard() {
+        let (_d, ctx, _) = stored_prod(true);
+        let base = ForceBase::load(&ctx, "prod", true).unwrap().unwrap();
+        let ForceMachineStep::Skip(line) = force_machine_step(Some(&base), None, None) else {
+            panic!("a provisioned target skips the machine step")
+        };
+        assert_eq!(
+            line,
+            "  ℹ Machine: kept (region hel1, server type cx32) — target `prod` records server \
+             `prod-node` (id 42), and a provisioned target's region and server type cannot change"
+        );
+        assert!(matches!(
+            force_machine_step(Some(&base), Some("fsn1"), None),
+            ForceMachineStep::Skip(_)
+        ));
+
+        let (_d, ctx, _) = stored_prod(false);
+        let base = ForceBase::load(&ctx, "prod", true).unwrap().unwrap();
+        assert_eq!(
+            force_machine_step(Some(&base), None, None),
+            ForceMachineStep::OfferKeep
+        );
+        assert_eq!(
+            force_machine_step(Some(&base), None, Some("cx22")),
+            ForceMachineStep::Ask
+        );
+        assert_eq!(force_machine_step(None, None, None), ForceMachineStep::Ask);
+        assert_eq!(
+            MachineKeepChoice::Keep(base.machine_shown()).to_string(),
+            "Keep the stored machine: region hel1, server type cx32"
+        );
+
+        let state = cli_state::StatePaths::for_active_target(&ctx.store(), "prod");
+        std::fs::create_dir_all(state.state_dir()).unwrap();
+        std::fs::write(state.state_file(), "{").unwrap();
+        let base = ForceBase::load(&ctx, "prod", true).unwrap().unwrap();
+        let ForceMachineStep::Skip(line) = force_machine_step(Some(&base), None, None) else {
+            panic!("an unreadable state skips the machine step")
+        };
+        assert!(line.contains("cannot be read"), "{line}");
+    }
+
+    /// The base is the stored target only under `--force`, for a valid stored name; a target
+    /// whose files cannot be read is that error before any prompt (`plan_add` would give it
+    /// after the whole wizard).
+    #[test]
+    fn the_force_base_is_the_stored_target_or_its_read_error() {
+        let (_d, ctx, _) = stored_prod(false);
+        assert!(ForceBase::load(&ctx, "prod", false).unwrap().is_none());
+        assert!(ForceBase::load(&ctx, "fresh", true).unwrap().is_none());
+        assert!(ForceBase::load(&ctx, "../prod", true).unwrap().is_none());
+        let base = ForceBase::load(&ctx, "prod", true).unwrap().unwrap();
+        assert_eq!(base.config.default_tier.as_deref(), Some("team"));
+        assert_eq!(
+            base.ssh_key_shown(&ctx).as_deref(),
+            Some(&*format!(
+                "~/{}",
+                Path::new(".ssh").join("prod.pub").display()
+            ))
+        );
+
+        std::fs::write(
+            ctx.store().target_credentials_file("prod"),
+            "hetzner_token: [unclosed",
+        )
+        .unwrap();
+        let err = ForceBase::load(&ctx, "prod", true)
+            .err()
+            .expect("unreadable");
+        assert_eq!(
+            UiError::from(&err).code.as_deref(),
+            Some("apprafter::target::invalid_config")
+        );
+    }
+
+    /// Bug 8 on a terminal: `--force` on a target whose state records a server skips the
+    /// machine step (no prompt opens — under `--no-ping` it used to ask for a region with
+    /// `nbg1` as the default), so the stored machine is kept, the plan is not refused as a
+    /// machine change after the whole wizard, and every field reads as kept.
+    #[test]
+    fn a_forced_wizard_keeps_the_machine_of_a_provisioned_target() {
+        let (_d, ctx, key) = stored_prod(true);
+        let changes = plan_of(&ctx, force_args(&key)).expect("no prompt, no refusal");
+        assert!(
+            changes.iter().all(|(action, _)| action == "Keep"),
+            "{changes:?}"
+        );
+        for kept in ["region: hel1", "tier: team", "server type: cx32"] {
+            assert!(
+                changes.iter().any(|(_, d)| d == kept),
+                "{kept}: {changes:?}"
+            );
+        }
+    }
+
     /// A pre-supplied name is announced and accepted verbatim —
     /// v0.1.76 re-prompted with the name as the default, which was
     /// pure noise.
@@ -1304,7 +1824,7 @@ mod tests {
     fn prompt_ssh_key_accepts_a_supplied_path_without_scanning() {
         let dir = tempfile::tempdir().unwrap();
         let p = PathBuf::from("/nowhere/on/this/disk/id_ed25519.pub");
-        let got = prompt_ssh_key(&ctx_with_home(dir.path()), Some(&p), "--ssh-key flag")
+        let got = prompt_ssh_key(&ctx_with_home(dir.path()), Some(&p), "--ssh-key flag", None)
             .expect("prefill must not prompt");
         assert_eq!(got, Some(p));
     }
@@ -1321,7 +1841,7 @@ mod tests {
             algo: Some("ssh-ed25519".into()),
             comment: Some(format!("me@{n}")),
         };
-        let opts = build_ssh_key_choices(vec![candidate("a"), candidate("b")]);
+        let opts = build_ssh_key_choices(vec![candidate("a"), candidate("b")], None);
         assert_eq!(opts.len(), 4);
         match &opts[0] {
             SshKeyChoice::Path { path, label } => {
@@ -1339,7 +1859,7 @@ mod tests {
 
         // With nothing found the escape hatches are still the
         // whole list — an empty Select would trap the operator.
-        let empty = build_ssh_key_choices(Vec::new());
+        let empty = build_ssh_key_choices(Vec::new(), None);
         assert_eq!(empty.len(), 2);
         assert_eq!(empty[0].to_string(), "Other (type a path)");
         assert_eq!(empty[1].to_string(), "Skip (don't attach an SSH key now)");
@@ -1398,8 +1918,8 @@ mod tests {
     /// `--region` skips the region prompt.
     #[test]
     fn prompt_region_returns_a_supplied_region_without_prompting() {
-        let got =
-            prompt_region(Some("hel1"), "--region flag").expect("prefilled region must not prompt");
+        let got = prompt_region(Some("hel1"), "--region flag", Some("nbg1"))
+            .expect("prefilled region must not prompt");
         assert_eq!(got, Some("hel1".to_string()));
     }
 
@@ -1448,14 +1968,18 @@ mod tests {
     /// spec-blessed default.
     #[test]
     fn build_tier_choices_offers_all_four_tiers_cheapest_first() {
-        let keys: Vec<String> = build_tier_choices().into_iter().map(|c| c.key).collect();
+        let keys: Vec<String> = build_tier_choices(None)
+            .into_iter()
+            .filter_map(TierChoice::tier)
+            .collect();
         assert_eq!(keys, vec!["solo", "team", "prod", "regulated"]);
     }
 
     /// `--tier` skips the picker.
     #[test]
     fn prompt_tier_accepts_a_supplied_tier_verbatim() {
-        let got = prompt_tier(Some("regulated"), "--tier flag").expect("prefill must not prompt");
+        let got =
+            prompt_tier(Some("regulated"), "--tier flag", None).expect("prefill must not prompt");
         assert_eq!(got, Some("regulated".to_string()));
     }
 
