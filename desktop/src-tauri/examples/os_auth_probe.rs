@@ -11,8 +11,8 @@
 //! password field for the PAM path and **Forget the missing agent**
 //! (`OsAuthenticator::reset_agent_memory`); on Windows **Prefer Windows Hello** (the `hello`
 //! setting). The log lists every outcome with how long it took, the `AuthInfo` at start and
-//! after each outcome, PAM's messages, and the session watch: whether it became ready and every
-//! lock or sleep it reports. Each entry is also written to stderr.
+//! after each outcome, PAM's messages, and the session watch: what it hears once set up, and
+//! every lock or sleep it reports. Each entry is also written to stderr.
 //!
 //! The page talks to the probe through a URI scheme of its own (`probe`), not the app's IPC: the
 //! package's build script makes the app's command list its ACL manifest, so a command this
@@ -23,10 +23,14 @@
 //! the page polls the log.
 //!
 //! The probe keeps nothing of the app's: Tauri's directories are keyed by an identifier of the
-//! probe's own, and the webview's storage is a temporary directory removed on exit (Linux,
-//! Windows) or a store that keeps nothing (macOS, whose WKWebView takes no data directory). No
-//! single-instance lock, so it runs beside the app. The password is moved into `Zeroizing` as
-//! soon as it arrives and is never logged, echoed or kept.
+//! probe's own, and the webview's storage is a temporary directory (Linux, Windows) or a store
+//! that keeps nothing (macOS, whose WKWebView takes no data directory). The directory is removed
+//! on exit; on Windows WebView2 may still hold it then, and the probe names it on stderr for
+//! removal by hand. No single-instance lock, so it runs beside the app. The password is moved
+//! into `Zeroizing` as soon as it arrives and is never logged, echoed or kept.
+//!
+//! The session watch starts as the app's does, on the main thread before the event loop runs,
+//! and the log says what it hears once it is set up.
 
 use std::error::Error;
 use std::path::PathBuf;
@@ -262,16 +266,26 @@ struct Log {
     /// The probe's start: the log's monotonic clock and PAM's.
     started: Instant,
     entries: Mutex<Vec<Entry>>,
+    /// Where an entry is written out once it is in: stderr.
+    write: fn(&Log, &str),
 }
 
 impl Log {
     fn new() -> Self {
+        Self::writing_with(|_, text| eprintln!("{text}"))
+    }
+
+    fn writing_with(write: fn(&Log, &str)) -> Self {
         Self {
             started: Instant::now(),
             entries: Mutex::default(),
+            write,
         }
     }
 
+    /// Adds an entry, then writes it out with the lock released: the page's `/log` handler takes
+    /// that lock on the event loop's thread, which must not wait for stderr. Two threads' lines
+    /// may reach stderr in another order than the page shows; the stamp orders them.
     fn push(&self, text: impl AsRef<str>) {
         let since_epoch = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -281,11 +295,15 @@ impl Log {
             stamp(self.started.elapsed(), since_epoch),
             text.as_ref()
         );
-        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-        // Under the lock, so stderr has the page's order.
-        eprintln!("{text}");
-        let seq = entries.len() + 1;
-        entries.push(Entry { seq, text });
+        {
+            let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+            let seq = entries.len() + 1;
+            entries.push(Entry {
+                seq,
+                text: text.clone(),
+            });
+        }
+        (self.write)(self, &text);
     }
 
     fn after(&self, since: usize) -> Vec<Entry> {
@@ -526,30 +544,30 @@ fn parent_prompts(_: &Probe, _: &WebviewWindow) -> tauri::Result<()> {
     Ok(())
 }
 
-/// Watches the OS's lock and sleep signals on a thread that keeps the watch until the returned
-/// sender is dropped. The watch's callback takes the log's lock, which that thread never holds
-/// while it drops the watch.
+/// Watches the OS's lock and sleep signals as the app does: the watch starts here, on the main
+/// thread before the event loop runs (macOS delivers through that loop), and a thread of its
+/// own waits for it to say what it hears, then keeps it until the returned sender is dropped.
+/// The watch's callback takes the log's lock, which that thread never holds while it drops the
+/// watch.
 fn watch_session(probe: &Arc<Probe>) -> Option<(mpsc::Sender<()>, JoinHandle<()>)> {
+    let watch = apprafter_os_auth::watch({
+        let probe = Arc::clone(probe);
+        move |event| probe.log.push(format!("session: {event:?}"))
+    });
     let (stop, stopped) = mpsc::channel::<()>();
-    let probe = Arc::clone(probe);
     let spawned = thread::Builder::new()
         .name("probe-session-watch".to_owned())
         .spawn({
-            let probe = Arc::clone(&probe);
+            let probe = Arc::clone(probe);
             move || {
-                let watch = apprafter_os_auth::watch({
-                    let probe = Arc::clone(&probe);
-                    move |event| probe.log.push(format!("session: {event:?}"))
-                });
-                if let Some(listening) = watch.listening(WATCH_READY_WITHIN) {
-                    probe
+                match watch.listening(WATCH_READY_WITHIN) {
+                    Some(listening) => probe
                         .log
-                        .push(format!("session watch: ready, {listening:?}"));
-                } else {
-                    probe.log.push(format!(
+                        .push(format!("session watch: ready, {listening:?}")),
+                    None => probe.log.push(format!(
                         "session watch: not ready within {}",
                         seconds(WATCH_READY_WITHIN)
-                    ));
+                    )),
                 }
                 // Until the probe exits.
                 let _ = stopped.recv();
@@ -559,6 +577,7 @@ fn watch_session(probe: &Arc<Probe>) -> Option<(mpsc::Sender<()>, JoinHandle<()>
     match spawned {
         Ok(watching) => Some((stop, watching)),
         Err(error) => {
+            // The watch went with the closure: nothing is watched.
             probe
                 .log
                 .push(format!("no thread for the session watch: {error}"));
@@ -568,7 +587,8 @@ fn watch_session(probe: &Arc<Probe>) -> Option<(mpsc::Sender<()>, JoinHandle<()>
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    // The webview's storage on Linux and Windows, removed on exit (macOS: `open_window`).
+    // The webview's storage on Linux and Windows, removed on exit when the webview has let go of
+    // it (macOS: `open_window`).
     let webview_data = tempfile::Builder::new()
         .prefix("apprafter-os-auth-probe-")
         .tempdir()?;
@@ -608,7 +628,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         drop(stop);
         let _ = watching.join();
     }
-    drop(webview_data);
+    let storage = webview_data.path().to_owned();
+    if let Err(error) = webview_data.close() {
+        // WebView2 can hold its files a moment past the window.
+        eprintln!(
+            "the webview's storage {} was not removed ({error}); remove it by hand",
+            storage.display()
+        );
+    }
     std::process::exit(code);
 }
 
@@ -755,6 +782,22 @@ mod tests {
             stamp(Duration::from_secs(4_000), Duration::from_secs(86_399)),
             "23:59:59.000Z +4000.000s"
         );
+    }
+
+    /// The writer runs with the log's lock free: the page's `/log` reads, on the event loop,
+    /// never wait for stderr.
+    #[test]
+    fn an_entry_is_written_out_with_the_log_s_lock_free() {
+        fn write(log: &Log, text: &str) {
+            assert!(
+                log.entries.try_lock().is_ok(),
+                "written under the log's lock: {text}"
+            );
+        }
+        let log = Log::writing_with(write);
+        log.push("first");
+        log.push("second");
+        assert_eq!(log.after(0).len(), 2);
     }
 
     #[test]
