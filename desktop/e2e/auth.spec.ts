@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 // The OS-authentication screens on the mock IPC: the lock screen's own password field on Linux's
 // PAM route (`?auth=pam`), its back-off counted down on Playwright's clock, and the lock-on-sleep
-// row where the computer tells the app nothing of its session (`?session=none`).
+// row where the computer tells the app nothing of its session (`?session=none`): still a
+// choice, its note naming the limit.
 import { expect, type Page, type TestInfo, test } from '@playwright/test';
 
 /** The mock's demo password (MOCK_PASSWORD in src/ipc/mock), nobody's real one. */
@@ -80,7 +81,7 @@ test('too many wrong passwords: the field counts down what Rust says, then unloc
   await expect(page.getByRole('heading', { name: 'Open a cluster' })).toBeVisible();
 });
 
-test('lock on sleep is disabled, saying why, where the computer tells nothing', async ({
+test('lock on sleep stays a choice, saying the limit, where the computer tells nothing', async ({
   page,
 }, info) => {
   await page.goto(`/${queryOf(info)}&session=none`);
@@ -90,7 +91,7 @@ test('lock on sleep is disabled, saying why, where the computer tells nothing', 
   const settings = page.getByRole('dialog', { name: 'Settings' });
   await expect(
     settings.getByRole('switch', { name: 'Lock when the computer sleeps or locks' }),
-  ).toBeDisabled();
+  ).toBeEnabled();
   await expect(
     settings.getByText('This computer does not tell AppRafter when it locks or sleeps.'),
   ).toBeVisible();

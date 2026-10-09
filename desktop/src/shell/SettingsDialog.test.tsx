@@ -212,13 +212,17 @@ describe('SettingsDialog', () => {
     expect(sleepRow().dataset.disabled).toBeUndefined();
   });
 
-  test('…disabled, saying why, when the computer tells neither', async () => {
-    await open(appInfo({ sessionEvents: { lock: false, sleep: false } }));
-    expect(sleepSwitch().disabled).toBe(true);
-    expect(sleepRow().dataset.disabled).toBe('true');
+  test('…on all the same when the computer tells neither, the note naming the limit', async () => {
+    // Every source is still listened to — a `loginctl lock-session`, a screen saver started
+    // later — so the owner must be able to switch locking with them off.
+    const { user } = await open(appInfo({ sessionEvents: { lock: false, sleep: false } }));
+    expect(sleepSwitch().disabled).toBe(false);
+    expect(sleepRow().dataset.disabled).toBeUndefined();
     expect(sleepRow().textContent).toContain(
       'This computer does not tell AppRafter when it locks or sleeps.',
     );
+    await user.click(sleepSwitch());
+    expect(lastSaved()?.lockOnSleep).toBe(false);
   });
 
   test.each([
@@ -255,7 +259,11 @@ describe('SettingsDialog', () => {
     info = appInfo({ sessionEvents: { lock: false, sleep: false } });
     later = appInfo({ sessionEvents: { lock: true, sleep: true } });
     await openInGate();
-    await waitFor(() => expect(sleepSwitch().disabled).toBe(false));
+    await waitFor(() =>
+      expect(sleepRow().textContent).toContain(
+        'When the screen locks or the computer goes to sleep.',
+      ),
+    );
     expect(reads()).toBe(2);
   });
 

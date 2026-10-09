@@ -4,9 +4,11 @@
 // with D.5, so those rows are not shown. With the lock off, the rows below it are disabled, not
 // only dimmed. With no system authentication the lock shows as it is in effect, off with its
 // switch disabled whatever settings.json says: Rust locks only with both, and refuses switching
-// it on. "Lock when the computer sleeps or locks" follows what the OS tells the app
-// (AppInfo.sessionEvents): disabled, saying why, when it tells neither; a note naming the half
-// that is missing when it tells one. Opening Settings reads app_info again, so a session watch
+// it on. "Lock when the computer sleeps or locks" says what the OS tells the app
+// (AppInfo.sessionEvents): a note naming the half that is missing when it tells one, and the
+// limit when it tells neither. It stays a choice whenever the lock is in effect, even then: every
+// source is still listened to (a `loginctl lock-session`, a screen saver started later), so the
+// owner must be able to switch it off. Opening Settings reads app_info again, so a session watch
 // that answered late counts.
 import { useQueryClient } from '@tanstack/react-query';
 import { useEffect } from 'react';
@@ -82,7 +84,6 @@ function SettingsBody({ settings }: { settings: Settings }) {
   const { lock } = useLockActions();
   const noAuth = !info.auth.available;
   const off = lockOff(info.auth.available, settings.lockEnabled) !== null;
-  const untold = !info.sessionEvents.lock && !info.sessionEvents.sleep;
   const method = info.auth.method;
 
   return (
@@ -146,12 +147,12 @@ function SettingsBody({ settings }: { settings: Settings }) {
       <SettingRow
         label="Lock when the computer sleeps or locks"
         sub={sessionNote(info.sessionEvents)}
-        disabled={off || untold}
+        disabled={off}
         control={
           <Switch
             label="Lock when the computer sleeps or locks"
             checked={settings.lockOnSleep}
-            disabled={off || untold}
+            disabled={off}
             onChange={(lockOnSleep) => save({ lockOnSleep })}
           />
         }
