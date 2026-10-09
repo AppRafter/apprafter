@@ -225,9 +225,13 @@ export const opStartWhoami = () => call<OpId>('op_start_whoami');
 /** Plan adding a target with a verified token's draft (bounded); the plan takes the draft. */
 export const opPlanTargetAdd = (args: TargetAddArgs) =>
   call<PlanView>('op_plan_target_add', { args });
-/** Plan renewing a target's token (bounded); the token crosses IPC here, once per attempt. */
-export const opPlanTargetRenew = (name: string, token: string) =>
-  call<PlanView>('op_plan_target_renew', { name, token });
+/**
+ * Plan renewing a target's token (bounded); the token crosses IPC here, once per attempt. With
+ * `sshKey` (a path, as `sshKeyInspect` answers it) the plan also sets the target's SSH key: the
+ * core saves a key only with a new token (`target add <name> --renew --ssh-key <path>`).
+ */
+export const opPlanTargetRenew = (name: string, token: string, sshKey: string | null) =>
+  call<PlanView>('op_plan_target_renew', { name, token, sshKey });
 /** Plan making `name` the CLI's default (reversible: execute it at once). */
 export const opPlanTargetUse = (name: string) => call<PlanView>('op_plan_target_use', { name });
 export const opPlanTargetRename = (from: string, to: string) =>

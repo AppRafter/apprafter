@@ -649,3 +649,38 @@ fn a_quit_signal_drops_the_session_watch_once_the_operations_stopped() {
     wait_for(&log, WATCH_DROPPED);
     assert_eq!(*log.lock().unwrap(), [OP_STOPPED, WATCH_DROPPED]);
 }
+
+/// The renew command hands its `sshKey` to the core (the Target screen's SSH key row, WI-452):
+/// a key the core cannot read is refused before any plan, and without one the same renew plans.
+#[test]
+fn the_renew_command_hands_its_ssh_key_to_the_core() {
+    let rig = rig(lock_off());
+    let target = cli_core::target::Target {
+        name: "prod".into(),
+        config: cli_core::target::TargetConfig {
+            provider: "hetzner-cloud".into(),
+            ..Default::default()
+        },
+        credentials: Default::default(),
+    };
+    cli_core::save_target(&rig.shell.context.store(), &target).unwrap();
+    let token = "k".repeat(64);
+    let missing = rig.shell.context.config_root().join("nothing-here.pub");
+    let refused = invoke(
+        &rig,
+        "op_plan_target_renew",
+        json!({ "name": "prod", "token": token, "sshKey": missing }),
+    );
+    assert_eq!(
+        code(&refused),
+        Some("apprafter::target::ssh_key_unreadable"),
+        "{refused:?}"
+    );
+    let planned = invoke(
+        &rig,
+        "op_plan_target_renew",
+        json!({ "name": "prod", "token": token, "sshKey": null }),
+    )
+    .unwrap();
+    assert_eq!(planned["class"], "bounded");
+}

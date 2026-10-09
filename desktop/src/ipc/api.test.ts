@@ -114,9 +114,9 @@ describe('each function sends its command with camelCase arguments', () => {
       { args: ADD_ARGS },
     ],
     opPlanTargetRenew: [
-      () => api.opPlanTargetRenew('prod-eu', 'not-a-real-token'),
+      () => api.opPlanTargetRenew('prod-eu', 'not-a-real-token', '/home/alex/.ssh/work.pub'),
       'op_plan_target_renew',
-      { name: 'prod-eu', token: 'not-a-real-token' },
+      { name: 'prod-eu', token: 'not-a-real-token', sshKey: '/home/alex/.ssh/work.pub' },
     ],
     opPlanTargetUse: [
       () => api.opPlanTargetUse('prod-eu'),

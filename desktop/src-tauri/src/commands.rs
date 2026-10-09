@@ -17,6 +17,7 @@
 //! The D.3 commands (targets, doctor, whoami) are thin wrappers over [`target_ops`], which
 //! holds their bodies and their tests.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use apprafter_core::session::WhoamiReport;
@@ -386,17 +387,18 @@ pub async fn op_plan_target_add(
     .await
 }
 
-/// Plan the token renewal of `name` (Bounded); the new token is checked with the provider when
-/// the plan runs, and only then saved.
+/// Plan the token renewal of `name` (Bounded), with a new SSH key path when `ssh_key` is given;
+/// the new token is checked with the provider when the plan runs, and only then saved.
 #[tauri::command]
 pub async fn op_plan_target_renew(
     shell: ShellState<'_>,
     name: String,
     token: String,
+    ssh_key: Option<String>,
 ) -> Result<PlanView, UiError> {
     let token = SecretString::from(Zeroizing::new(token));
     on_shell(&shell, move |shell| {
-        target_ops::plan_target_renew(shell, &name, token)
+        target_ops::plan_target_renew(shell, &name, token, ssh_key.map(PathBuf::from))
     })
     .await
 }

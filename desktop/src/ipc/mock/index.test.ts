@@ -66,7 +66,8 @@ function callEach(): Record<(typeof COMMANDS)[number], () => Promise<unknown>> {
         tier: 'solo',
         serverType: 'cx22',
       }),
-    op_plan_target_renew: () => api.opPlanTargetRenew('prod-eu', 'k'.repeat(HETZNER_TOKEN_LEN)),
+    op_plan_target_renew: () =>
+      api.opPlanTargetRenew('prod-eu', 'k'.repeat(HETZNER_TOKEN_LEN), null),
     op_plan_target_use: () => api.opPlanTargetUse('prod-eu'),
     op_plan_target_rename: () => api.opPlanTargetRename('prod-eu', 'prod-us'),
     op_plan_target_remove: () => api.opPlanTargetRemove('prod-eu'),

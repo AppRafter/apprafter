@@ -210,6 +210,31 @@ test('add takes the draft when planning succeeds; a second plan with it is DRAFT
   expect((await api.targetShow('lab-2')).tierLevel).toBe(1);
 });
 
+test('add with an SSH key: an unreadable one is refused and keeps the draft; a found one is saved', async () => {
+  const { draftId } = result(
+    await runRead(await api.opStartVerifyToken('hetzner-cloud', goodToken())),
+  ) as { draftId: number };
+  const args = {
+    name: 'lab-2',
+    provider: 'hetzner-cloud',
+    draftId,
+    sshKey: '~/.ssh/nothing.pub',
+    region: null,
+    tier: null,
+    serverType: null,
+  };
+  const unreadable = await refusalOf(api.opPlanTargetAdd(args));
+  expect(unreadable.code).toBe(CORE_ERROR_CODES.TARGET_SSH_KEY_UNREADABLE);
+  const view = await api.opPlanTargetAdd({ ...args, sshKey: '~/.ssh/work.pub' });
+  await runPlan(view);
+  expect((await api.targetShow('lab-2')).sshKey).toEqual({
+    path: '/home/alex/.ssh/work.pub',
+    display: '~/.ssh/work.pub',
+    exists: true,
+    algo: 'ssh-rsa',
+  });
+});
+
 test('the catalogue of an unknown draft or target is refused at the command, before a read starts (as Rust)', async () => {
   const refused = (source: Parameters<typeof api.opStartMachineCatalogue>[0]) =>
     api.opStartMachineCatalogue(source).then(
@@ -250,17 +275,55 @@ test('a discarded draft is gone; an unknown one is no error', async () => {
 });
 
 test('renew: a malformed token is refused at once; the x-token fails when the plan runs', async () => {
-  const bad = await refusalOf(api.opPlanTargetRenew('lab', 'short'));
+  const bad = await refusalOf(api.opPlanTargetRenew('lab', 'short', null));
   expect(bad.code).toBe(CORE_ERROR_CODES.TARGET_INVALID_TOKEN);
-  const view = await api.opPlanTargetRenew('lab', 'x'.repeat(HETZNER_TOKEN_LEN));
+  const view = await api.opPlanTargetRenew('lab', 'x'.repeat(HETZNER_TOKEN_LEN), null);
   expect(view.class).toBe('bounded');
   expect(failure(await runPlan(view))?.code).toBe(CORE_ERROR_CODES.TARGET_TOKEN_REJECTED);
-  const ok = await api.opPlanTargetRenew('lab', goodToken());
+  const ok = await api.opPlanTargetRenew('lab', goodToken(), null);
   expect(result(await runPlan(ok))).toEqual({
     name: 'lab',
     token: { status: 'verified', elapsedMs: 182 },
     sshKeyChanged: false,
   });
+});
+
+test('renew with an SSH key: an unreadable key is refused; a new one is planned and saved', async () => {
+  const unreadable = await refusalOf(
+    api.opPlanTargetRenew('lab', goodToken(), '/home/alex/.ssh/nothing.pub'),
+  );
+  expect(unreadable.code).toBe(CORE_ERROR_CODES.TARGET_SSH_KEY_UNREADABLE);
+  expect(unreadable.fields).toMatchObject({ path: '/home/alex/.ssh/nothing.pub' });
+  const view = await api.opPlanTargetRenew('lab', goodToken(), '/home/alex/.ssh/work.pub');
+  expect(view.class).toBe('bounded');
+  expect(view.changes).toEqual([
+    { kind: 'Credentials', object: 'lab', action: 'replace', detail: 'API token' },
+    {
+      kind: 'Target',
+      object: 'lab',
+      action: 'update',
+      detail: 'ssh key: ~/.ssh/lab.pub → ~/.ssh/work.pub',
+    },
+  ]);
+  expect(result(await runPlan(view))).toEqual({
+    name: 'lab',
+    token: { status: 'verified', elapsedMs: 182 },
+    sshKeyChanged: true,
+  });
+  expect((await api.targetShow('lab')).sshKey).toEqual({
+    path: '/home/alex/.ssh/work.pub',
+    display: '~/.ssh/work.pub',
+    exists: true,
+    algo: 'ssh-rsa',
+  });
+  // The key it has now, with another new token: only the token changes, as the core leaves an
+  // equal path out.
+  const same = await api.opPlanTargetRenew(
+    'lab',
+    'm'.repeat(HETZNER_TOKEN_LEN),
+    '/home/alex/.ssh/work.pub',
+  );
+  expect(same.changes.map((c) => c.kind)).toEqual(['Credentials']);
 });
 
 test('doctor counts three stages for a target the store holds and two otherwise', async () => {
