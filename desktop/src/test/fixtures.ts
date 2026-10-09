@@ -25,7 +25,7 @@ export function appInfo(more: Partial<AppInfo> = {}): AppInfo {
     account: 'alex',
     host: 'workstation',
     auth: authInfo(),
-    sessionEvents: true,
+    sessionEvents: { lock: true, sleep: true },
     testBuild: false,
     settingsNotice: null,
     ...more,

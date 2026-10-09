@@ -24,7 +24,7 @@ const INFO: AppInfo = {
     biometricsChoice: false,
     passwordField: false,
   },
-  sessionEvents: true,
+  sessionEvents: { lock: true, sleep: true },
   testBuild: false,
   settingsNotice: null,
 };

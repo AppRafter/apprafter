@@ -121,7 +121,7 @@ describe('installMockIpc', () => {
   test('the OS and the theme come from the options', async () => {
     installMockIpc({ os: 'windows', theme: 'light' });
     expect((await api.appInfo()).os).toBe('windows');
-    expect((await api.appInfo()).sessionEvents).toBe(true);
+    expect((await api.appInfo()).sessionEvents).toEqual({ lock: true, sleep: true });
     expect((await api.settingsGet()).theme).toBe('light');
   });
 

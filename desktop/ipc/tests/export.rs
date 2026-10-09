@@ -20,8 +20,8 @@ use apprafter_core::{Outcome, PlanClass, PlannedChange};
 use apprafter_desktop_ipc::{
     errors, AppInfo, AuthInfo, AuthMethod, AuthOutcome, AutoLock, CancelledBy, LockReason,
     LockState, OpEvent, OpId, OpState, OpSummary, Os, OutputStream, PlanView, Quitting, Refresh,
-    SecretBackend, Settings, Subscribed, SubscriptionId, Theme, UiError, UnavailableReason,
-    ALLOWED_WHILE_LOCKED, COMMANDS, LOCK_CHANGED, QUITTING,
+    SecretBackend, SessionEvents, Settings, Subscribed, SubscriptionId, Theme, UiError,
+    UnavailableReason, ALLOWED_WHILE_LOCKED, COMMANDS, LOCK_CHANGED, QUITTING,
 };
 use ts_rs::TS;
 
@@ -59,7 +59,7 @@ fn export_the_typescript_bindings() {
         // auth.rs
         AuthInfo, AuthOutcome, AuthMethod, CancelledBy, UnavailableReason,
         // app_info.rs
-        AppInfo, Os, SecretBackend,
+        AppInfo, Os, SecretBackend, SessionEvents,
         // ops.rs
         OpId, OpEvent, OutputStream, PlanView, OpSummary, OpState, Subscribed, SubscriptionId,
         // quit.rs

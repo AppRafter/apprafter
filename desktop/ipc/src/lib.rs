@@ -16,7 +16,7 @@ mod settings;
 pub mod commands;
 pub mod errors;
 
-pub use app_info::{AppInfo, Os, SecretBackend};
+pub use app_info::{AppInfo, Os, SecretBackend, SessionEvents};
 pub use auth::{AuthInfo, AuthMethod, AuthOutcome, CancelledBy, UnavailableReason};
 pub use commands::{ALLOWED_WHILE_LOCKED, COMMANDS};
 pub use lock::{LockReason, LockState, LOCK_CHANGED};

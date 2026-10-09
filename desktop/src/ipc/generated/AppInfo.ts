@@ -3,6 +3,7 @@
 import type { AuthInfo } from "./AuthInfo";
 import type { Os } from "./Os";
 import type { SecretBackend } from "./SecretBackend";
+import type { SessionEvents } from "./SessionEvents";
 
 /**
  * The `app_info` answer: the About line, the account shown in the title bar, auth support.
@@ -21,12 +22,12 @@ account: string,
  */
 host: string, auth: AuthInfo, 
 /**
- * The OS reports its session's locks and sleeps to the app, so `lockOnSleep` can work: the
- * watch on them listens. `false` while it does not (yet): the settings show the row
- * disabled, with the reason. Final in the first answer — `app_info` waits a short, bounded
- * time for the watch to say.
+ * What the OS reports of its session to the app, for `lockOnSleep`. Both false while
+ * nothing listens, or not yet: the settings show the row disabled, with the reason. The
+ * first answer waits a short, bounded time for the watch to say; a watch that says later
+ * counts from then on, so a later `app_info` may say more.
  */
-sessionEvents: boolean, 
+sessionEvents: SessionEvents, 
 /**
  * A test build (fake authentication); the UI shows a TEST BUILD banner.
  */

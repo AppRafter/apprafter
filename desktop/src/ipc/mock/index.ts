@@ -131,8 +131,8 @@ export function installMockIpc(options: MockOptions = {}): void {
     account: 'alex',
     host: 'workstation',
     auth: AUTH[os],
-    // Every OS the app runs on reports its locks and sleeps once the watch listens.
-    sessionEvents: true,
+    // A desktop session: the OS reports both its locks and its sleeps.
+    sessionEvents: { lock: true, sleep: true },
     testBuild: false,
     settingsNotice: null,
   });

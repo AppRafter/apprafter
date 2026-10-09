@@ -156,8 +156,11 @@ pub const WATCH_DROPPED: &str = "the session watch was dropped";
 pub struct Watch(Log);
 
 impl SessionSource for Watch {
-    fn listens(&self) -> bool {
-        true
+    fn listening(&self) -> Option<apprafter_os_auth::Listening> {
+        Some(apprafter_os_auth::Listening {
+            lock: true,
+            sleep: true,
+        })
     }
 }
 
