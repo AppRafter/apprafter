@@ -55,6 +55,25 @@ pub(crate) fn report_with_help(e: CoreError, help: &str) -> miette::Report {
     })
 }
 
+/// The title of the operator guide's page on moving a cluster to another machine. By title,
+/// not URL: miette wraps a long URL at its hyphens, which breaks it for copying.
+pub(crate) const RESIZE_GUIDE: &str = "Moving to a bigger machine";
+
+/// The rebuild onto another machine for target `name` (the guide's Route A). `destroy` comes
+/// before the restore because `restore --reprovision` runs `up`, which reuses a live server of
+/// the cluster's name and ignores `--server-type` on it. `target use` first: `backup create`
+/// and `destroy` act on the active target, which need not be `name`.
+pub(crate) fn resize_recipe(name: &str) -> String {
+    format!(
+        "`destroy` deletes every `apprafter=true` resource in the token's Hetzner project, not \
+         only this cluster: read the operator guide's \"{RESIZE_GUIDE}\" first.\n\n    \
+         apprafter target use {name}\n    \
+         apprafter backup create --repo <repo>\n    \
+         apprafter destroy --yes\n    \
+         apprafter restore <repo> --reprovision --server-type <sku>"
+    )
+}
+
 /// The CLI's help for `e`; `None` for the three variants `report` renders through their own
 /// `CliError`. Exhaustive: a new variant does not compile until it has CLI help.
 pub(crate) fn cli_help(e: &CoreError) -> Option<String> {
@@ -115,13 +134,12 @@ pub(crate) fn cli_help(e: &CoreError) -> Option<String> {
              environment outranks the stored token). If the cluster's server was recreated \
              under a new id, `apprafter import --force --target {name}` records it."
         ),
-        CoreError::TargetProvisioned { .. } => {
-            "There is no in-place resize. Rebuild from a backup:\n\n    apprafter backup \
-             create\n    apprafter restore --reprovision --server-type <sku>\n\n(`target \
+        CoreError::TargetProvisioned { name, .. } => format!(
+            "There is no in-place resize: rebuild from a backup on a new machine. {}\n\n(`target \
              machine` and `target add --force` change the machine only on a target that has \
-             not provisioned yet.)"
-                .into()
-        }
+             not provisioned yet.)",
+            resize_recipe(name)
+        ),
         // Transport, timeout and parse alike (overview §3.6.1): a 200 whose body does not
         // deserialise lands here too, and doctor passes for it.
         CoreError::ProviderRequestFailed { .. } => {
@@ -297,6 +315,57 @@ mod tests {
                 .any(|e| e.to_string().contains("parse get_server response")),
             "the cause the help points at is shown"
         );
+    }
+
+    #[test]
+    fn the_resize_recipe_parses_and_frees_the_machine_before_it_reprovisions() {
+        // `restore --reprovision` runs `up`, which reuses a live server of the cluster's name
+        // (apply.rs ignores `--server-type` then): the old machine has to be gone first.
+        use clap::Parser as _;
+        let help = report(CoreError::TargetProvisioned {
+            name: "prod".into(),
+            server_id: 42,
+            server_name: "prod-node".into(),
+        })
+        .help()
+        .unwrap()
+        .to_string();
+        let steps: Vec<&str> = help
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with("apprafter "))
+            .collect();
+        for step in &steps {
+            let argv = step
+                .replace("<repo>", "/backups/prod")
+                .replace("<sku>", "cx33");
+            if let Err(e) = crate::cli::Cli::try_parse_from(argv.split_whitespace()) {
+                panic!("`{step}` does not parse: {e}");
+            }
+        }
+        let at = |prefix: &str| {
+            steps
+                .iter()
+                .position(|s| s.starts_with(prefix))
+                .unwrap_or_else(|| panic!("no `{prefix}` step: {help}"))
+        };
+        assert_eq!(at("apprafter target use prod"), 0, "{help}");
+        assert!(
+            at("apprafter backup create") < at("apprafter destroy"),
+            "{help}"
+        );
+        assert!(at("apprafter destroy") < at("apprafter restore"), "{help}");
+        // The page the help names by title exists under that title.
+        let page = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/operator-guide/moving-to-a-bigger-machine.md");
+        let text = std::fs::read_to_string(&page)
+            .unwrap_or_else(|e| panic!("{} must exist: {e}", page.display()));
+        assert!(
+            text.lines().any(|l| l == format!("# {RESIZE_GUIDE}")),
+            "{} is not titled {RESIZE_GUIDE:?}",
+            page.display()
+        );
+        assert!(help.contains(&format!("\"{RESIZE_GUIDE}\"")), "{help}");
     }
 
     #[test]

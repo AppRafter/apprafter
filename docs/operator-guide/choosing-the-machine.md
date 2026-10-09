@@ -356,10 +356,15 @@ preference that would never take effect:
 Error: apprafter::cli::other
 
   × `<name>` already runs a provisioned cluster — its machine type cannot be
-  │ changed in place. To move to a different machine, rebuild from a backup:
+  │ changed in place. To move to a different machine, rebuild from a backup.
+  │ `destroy` deletes every `apprafter=true` resource in the token's Hetzner
+  │ project, not only this cluster: read the operator guide's "Moving to a
+  │ bigger machine" first.
   │
-  │     apprafter backup create
-  │     apprafter restore --reprovision --server-type <sku>
+  │     apprafter target use <name>
+  │     apprafter backup create --repo <repo>
+  │     apprafter destroy --yes
+  │     apprafter restore <repo> --reprovision --server-type <sku>
   │
   │ (`target machine` only sets the type on a target that has NOT provisioned
   │ yet.)

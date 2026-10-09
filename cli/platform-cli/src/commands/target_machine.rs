@@ -19,7 +19,8 @@
 //! **Provisioned guard**: when the resolved target already has a live server
 //! (`state.hetzner_cloud` is `Some`), the command hard-refuses BEFORE writing
 //! anything. There is no in-place machine resize; the rebuild path is
-//! `apprafter backup create` + `apprafter restore --reprovision --server-type <sku>`.
+//! `backup create`, `destroy`, then `restore <repo> --reprovision --server-type <sku>`
+//! (`render::core_error::resize_recipe`).
 
 use std::io::IsTerminal;
 
@@ -99,10 +100,9 @@ pub(crate) fn decide_machine_action(
 pub(crate) fn provisioned_refusal_message(target_name: &str) -> String {
     format!(
         "`{target_name}` already runs a provisioned cluster — its machine type cannot be \
-         changed in place. To move to a different machine, rebuild from a backup:\n\n    \
-         apprafter backup create\n    \
-         apprafter restore --reprovision --server-type <sku>\n\n\
-         (`target machine` only sets the type on a target that has NOT provisioned yet.)"
+         changed in place. To move to a different machine, rebuild from a backup. {}\n\n\
+         (`target machine` only sets the type on a target that has NOT provisioned yet.)",
+        crate::render::core_error::resize_recipe(target_name)
     )
 }
 
@@ -584,18 +584,17 @@ mod tests {
     // ── provisioned_refusal_message ──────────────────────────────────────
 
     /// The refusal is the operator's only pointer to the rebuild path; it has
-    /// to carry both commands, in order, plus the name it refused.
+    /// to carry the whole recipe for the target it refused — the renderer's,
+    /// whose test parses each step and checks that `destroy` frees the
+    /// machine before the restore reprovisions.
     #[test]
     fn the_provisioned_refusal_hands_over_the_whole_rebuild_recipe() {
         let m = provisioned_refusal_message("prod-eu");
-        assert!(m.contains("prod-eu"), "{m}");
-        let backup = m
-            .find("apprafter backup create")
-            .expect("names the backup step");
-        let restore = m
-            .find("apprafter restore --reprovision --server-type")
-            .expect("names the reprovision step");
-        assert!(backup < restore, "the steps must be listed in order: {m}");
+        assert!(m.starts_with("`prod-eu` already runs"), "{m}");
+        assert!(
+            m.contains(&crate::render::core_error::resize_recipe("prod-eu")),
+            "{m}"
+        );
     }
 
     // ── saved_message ────────────────────────────────────────────────────
@@ -828,7 +827,10 @@ mod tests {
             .expect_err("a provisioned target must be refused");
         let msg = format!("{err}");
         assert!(msg.contains("prod-eu"), "{msg}");
-        assert!(msg.contains("apprafter restore --reprovision"), "{msg}");
+        assert!(
+            msg.contains("apprafter restore <repo> --reprovision"),
+            "{msg}"
+        );
         assert_eq!(env.saved(), None, "nothing may be written: {:?}", env.log);
         assert!(env.reports().is_empty(), "{:?}", env.log);
     }
