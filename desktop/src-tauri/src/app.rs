@@ -525,8 +525,18 @@ impl Shell {
     /// until [`TOOL_PATH_WAIT`](crate::env::TOOL_PATH_WAIT) has passed since the app asked
     /// ([`ToolSearchPath::get`]). Call it on a blocking worker or an operation's thread.
     pub fn tool_context(&self) -> Context {
-        let (path, source) = self.tools.get();
-        self.context.clone().with_tool_search_path(path, source)
+        self.tool_context_later()()
+    }
+
+    /// [`tool_context`](Self::tool_context), made later by the closure this returns — on the
+    /// thread of the work that runs the tools (a doctor read), so whoever starts that work never
+    /// waits for the tool search path.
+    pub fn tool_context_later(&self) -> impl FnOnce() -> Context + Send + 'static {
+        let (context, tools) = (self.context.clone(), self.tools.clone());
+        move || {
+            let (path, source) = tools.get();
+            context.with_tool_search_path(path, source)
+        }
     }
 
     /// Start a read ([`OperationManager::start`]) and wake the output flusher, which sleeps

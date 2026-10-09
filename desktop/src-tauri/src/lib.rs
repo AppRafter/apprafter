@@ -14,6 +14,7 @@ pub mod ops;
 pub mod runtime;
 pub mod settings;
 pub mod signals;
+pub mod target_ops;
 pub mod theme;
 pub mod window;
 
