@@ -70,8 +70,6 @@ const TIER_CHOICES: &[(&str, &str)] = &[
     ("regulated", "Tier 4 — confidential compute"),
 ];
 
-const PROVIDER_CHOICES: &[&str] = &["hetzner-cloud"];
-
 const DEFAULT_TARGET_NAME: &str = "default";
 
 /// Decide whether the wizard should fire for this invocation.
@@ -270,19 +268,16 @@ fn prompt_provider(prefill: Option<&str>, source: &str) -> CoreResult<String> {
         // is otherwise prompting for other fields. Skipping the
         // prompt entirely matches the "wizard only fills missing
         // bits" contract.
-        if PROVIDER_CHOICES.contains(&p) {
-            eprintln!("  ℹ Provider: {p} (from {source})");
-            return Ok(p.to_string());
-        }
-        return Err(CliError::Other(format!(
-            "provider `{p}` is not supported (wizard surface: {})",
-            PROVIDER_CHOICES.join(", ")
-        ))
-        .into());
+        crate::commands::target::check_provider(p)?;
+        eprintln!("  ℹ Provider: {p} (from {source})");
+        return Ok(p.to_string());
     }
-    let answer = Select::new("Provider:", PROVIDER_CHOICES.to_vec())
-        .prompt()
-        .map_err(map_inquire_err)?;
+    let answer = Select::new(
+        "Provider:",
+        apprafter_core::provider::SUPPORTED_PROVIDERS.to_vec(),
+    )
+    .prompt()
+    .map_err(map_inquire_err)?;
     Ok(answer.to_string())
 }
 
@@ -1218,20 +1213,26 @@ mod tests {
     /// The provider prefill is honoured only when it is a provider
     /// the wizard can actually drive. An unknown one has to fail
     /// here, at the flag, rather than later inside a validator that
-    /// has no client wired for it.
+    /// has no client wired for it — with the core's code and its one
+    /// provider list (bug 5: the wizard had a second list and wording).
     #[test]
-    fn prompt_provider_accepts_a_supported_prefill_and_rejects_an_unknown_one() {
-        let got = prompt_provider(Some("hetzner-cloud"), "--provider flag")
-            .expect("supported provider must be accepted");
-        assert_eq!(got, "hetzner-cloud");
-
-        let err = prompt_provider(Some("aws"), "--provider flag")
-            .expect_err("unsupported provider must be rejected");
-        let msg = err.to_string();
-        assert!(msg.contains("aws"), "{msg}");
-        // The error has to name what IS supported, otherwise the
-        // operator is left guessing.
-        assert!(msg.contains("hetzner-cloud"), "{msg}");
+    fn prompt_provider_takes_the_core_list_and_refuses_with_the_core_code() {
+        assert_eq!(
+            prompt_provider(Some("hetzner-cloud"), "--provider flag").unwrap(),
+            "hetzner-cloud"
+        );
+        let err =
+            prompt_provider(Some("aws"), "--provider flag").expect_err("aws is not supported");
+        let ui = apprafter_core::UiError::from(&err);
+        assert_eq!(
+            ui.code.as_deref(),
+            Some("apprafter::target::unknown_provider")
+        );
+        assert_eq!(ui.fields["provider"], serde_json::json!("aws"));
+        assert_eq!(
+            ui.fields["supported"],
+            serde_json::json!(apprafter_core::provider::SUPPORTED_PROVIDERS)
+        );
     }
 
     /// Under `--no-ping` a well-formed prefilled token is accepted

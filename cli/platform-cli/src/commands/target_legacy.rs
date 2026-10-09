@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! TEMPORARY. Today's `apprafter::cli::other` wording for the refusals the core now types, so the
-//! move onto the core changes no golden. Bug 5 deletes the `UnknownProvider` arm, bug 2 this file.
+//! move onto the core changes no golden. Bug 2 deletes this file.
 //!
 //! Each text is produced by the CLI's own code or copied from it, never from the core's
 //! message, so a refusal no golden covers still reads exactly as before.
@@ -55,19 +55,11 @@ pub(crate) fn rename(e: CoreError) -> miette::Report {
     }
 }
 
-/// `target add`'s refusals as today (`check_name_free`, `require_known_provider`), then the
-/// shared ones over the token the command was given; anything else through the core renderer.
+/// `target add`'s refusals as today (`check_name_free`), then the shared ones over the token the command was given; anything else through the core renderer.
 pub(crate) fn add(e: CoreError, token: &str) -> miette::Report {
     let text = match &e {
         CoreError::TargetExists { name } => Some(format!(
             "target `{name}` already exists — pass `--force` to overwrite or `--renew` to rotate credentials only"
-        )),
-        CoreError::UnknownProvider {
-            provider,
-            supported,
-        } => Some(format!(
-            "provider `{provider}` is not supported in v0.1.73 (supported: {})",
-            supported.join(", ")
         )),
         other => common(other, Some(token)),
     };
@@ -189,16 +181,6 @@ mod tests {
         assert_eq!(
             t(add(CoreError::TargetExists { name: "prod".into() }, "x")),
             "target `prod` already exists — pass `--force` to overwrite or `--renew` to rotate credentials only"
-        );
-        assert_eq!(
-            t(add(
-                CoreError::UnknownProvider {
-                    provider: "aws".into(),
-                    supported: vec!["hetzner-cloud".into()]
-                },
-                "x"
-            )),
-            "provider `aws` is not supported in v0.1.73 (supported: hetzner-cloud)"
         );
         assert_eq!(
             t(add(

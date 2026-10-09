@@ -1,18 +1,15 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! `apprafter target …` subcommand handlers.
 //!
-//! v0.1.73 (Track A.3) ships **`target add`** in pure non-interactive
-//! mode. CRUD commands (`list / use / show / rename / remove`)
-//! arrive in Track A.5; the interactive wizard arrives in A.4.
+//! `add` (with `--force` and `--renew`), `list`, `show`, `use`, `rename`, `remove` and `ip` run
+//! on apprafter-core (`apprafter_core::target`); `machine` lives in `target_machine.rs`, the
+//! wizard in `target_wizard.rs`. The core does the work: the checks, the provider calls and
+//! the store edits, each mutation as a plan, then its execution under the store lock. This
+//! module keeps the CLI's part: the wizard and the inputs it requires, the CLI-only refusals,
+//! the confirmation prompt, the `info!` lines, and the output. Every core error is rendered
+//! through [`crate::render::core_error::report`], which adds the CLI's help.
 //!
-//! Resolution flow for `target add`:
-//!   1. Parse + validate flags (provider known, token regex, ssh-key
-//!      readable if provided, name shape).
-//!   2. Load existing target if any.
-//!   3. Apply create / renew / overwrite semantics.
-//!   4. Persist via `cli_core::target::save_target`.
-//!   5. If first target, set as active in `GlobalConfig`.
-//!   6. Print one-line confirmation.
+//! `cert`, `domain` and `firewall` are still the CLI's own code.
 
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -148,23 +145,14 @@ pub(crate) fn add(mut args: AddArgs) -> miette::Result<()> {
         return renew(&ctx, args, &name);
     }
 
-    let supported = apprafter_core::provider::SUPPORTED_PROVIDERS;
     let provider = args.provider.clone().ok_or_else(|| {
         miette::Report::new(CliError::Other(format!(
             "`--provider` is required (supported: {})",
-            supported.join(", ")
+            apprafter_core::provider::SUPPORTED_PROVIDERS.join(", ")
         )))
     })?;
     // Today's order: the provider is refused before the token is asked for.
-    if !supported.contains(&provider.as_str()) {
-        return Err(target_legacy::add(
-            CoreError::UnknownProvider {
-                provider,
-                supported: supported.iter().map(|s| s.to_string()).collect(),
-            },
-            "",
-        ));
-    }
+    check_provider(&provider).map_err(report)?;
     let token = args.token.clone().ok_or_else(|| {
         miette::Report::new(CliError::Other(format!(
             "`--token` is required for provider `{provider}` (or set `HCLOUD_TOKEN` env var)"
@@ -205,6 +193,21 @@ pub(crate) fn add(mut args: AddArgs) -> miette::Result<()> {
         );
     }
     Ok(())
+}
+
+/// `provider` is one of the core's supported providers (the one list,
+/// `apprafter_core::provider::SUPPORTED_PROVIDERS`); else the core's
+/// [`CoreError::UnknownProvider`]. The `add` arm and the wizard's provider prompt both ask it.
+pub(crate) fn check_provider(provider: &str) -> CoreResult<()> {
+    let supported = apprafter_core::provider::SUPPORTED_PROVIDERS;
+    if supported.contains(&provider) {
+        Ok(())
+    } else {
+        Err(CoreError::UnknownProvider {
+            provider: provider.to_string(),
+            supported: supported.iter().map(|p| p.to_string()).collect(),
+        })
+    }
 }
 
 /// Same idea as [`add_verified_suffix`], for the `--renew` path — a rotation
@@ -899,6 +902,41 @@ mod tests {
         });
         let help = r.help().map(|h| h.to_string()).unwrap_or_default();
         assert_eq!(assert_commands_parse(&help), 3, "{help}");
+    }
+
+    /// Bug 5: the unknown-provider refusal has its own code, names the provider and the one
+    /// supported list, and dates nothing.
+    #[test]
+    fn the_unknown_provider_refusal_has_its_code_and_no_version() {
+        assert!(check_provider("hetzner-cloud").is_ok());
+        let r = report(check_provider("aws").expect_err("aws is not supported"));
+        assert_eq!(
+            r.code().map(|c| c.to_string()).as_deref(),
+            Some("apprafter::target::unknown_provider")
+        );
+        let text = format!("{r}");
+        assert!(
+            text.contains("aws") && text.contains("hetzner-cloud"),
+            "{text}"
+        );
+        let help = r.help().map(|h| h.to_string()).unwrap_or_default();
+        for s in [&text, &help] {
+            assert!(!has_version_number(s), "{s}");
+        }
+        assert!(has_version_number("not supported in v0.1.73 (x)"));
+    }
+
+    /// A `v<d>.<d>.<d>` anywhere in `s`.
+    fn has_version_number(s: &str) -> bool {
+        s.split(|c: char| !(c.is_ascii_alphanumeric() || c == '.'))
+            .any(|w| {
+                w.strip_prefix('v').is_some_and(|r| {
+                    let p: Vec<_> = r.split('.').collect();
+                    p.len() == 3
+                        && p.iter()
+                            .all(|x| !x.is_empty() && x.bytes().all(|b| b.is_ascii_digit()))
+                })
+            })
     }
 
     #[test]
