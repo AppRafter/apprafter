@@ -502,3 +502,55 @@ fn a_polkitd_that_does_not_answer_is_given_up_on() {
         "a polkitd that does not answer is not offered: {info:?}"
     );
 }
+
+/// The lock screen's Unlock against the same hung polkitd: its first check is a probe, so the
+/// request ends after `PROBE_TIMEOUT` as if there were no polkitd, and the authenticator takes
+/// the next one (it is not left `Busy`). A lock tripping the token while that check is out
+/// ends the request at once, not when the check gives up.
+#[test]
+#[ignore = "needs the polkit container: bash scripts/test-osauth-linux.sh"]
+fn an_unlock_against_a_hung_polkitd_ends_and_a_cancel_ends_it_at_once() {
+    container();
+    let bound = PROBE_TIMEOUT + Duration::from_secs(5);
+    let auth = Arc::new(OsAuthenticator::new());
+    let unlock = |cancel: CancellationToken| {
+        let (tx, outcome) = mpsc::channel();
+        let auth = Arc::clone(&auth);
+        thread::spawn(move || {
+            let _ = tx.send(auth.verify(Action::Unlock, &cancel));
+        });
+        outcome
+    };
+
+    let started = Instant::now();
+    let outcome = unlock(CancellationToken::new())
+        .recv_timeout(bound)
+        .unwrap_or_else(|_| panic!("the unlock did not end within {bound:?}"));
+    assert_eq!(outcome, unavailable(UnavailableReason::NoBackend));
+    assert!(
+        started.elapsed() >= PROBE_TIMEOUT - Duration::from_millis(500),
+        "answered after {:?}: polkitd was not stopped",
+        started.elapsed()
+    );
+
+    let cancel = CancellationToken::new();
+    let outcome = unlock(cancel.clone());
+    // Its first check is out by now, and polkitd will not answer it.
+    thread::sleep(Duration::from_millis(500));
+    let cancelled = Instant::now();
+    cancel.cancel();
+    let outcome = outcome
+        .recv_timeout(bound)
+        .unwrap_or_else(|_| panic!("the cancelled unlock did not end within {bound:?}"));
+    assert_eq!(
+        outcome,
+        AuthOutcome::Cancelled {
+            by: CancelledBy::App
+        }
+    );
+    assert!(
+        cancelled.elapsed() < Duration::from_secs(1),
+        "ended {:?} after the cancel: it waited for the check",
+        cancelled.elapsed()
+    );
+}

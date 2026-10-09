@@ -68,6 +68,7 @@ CASES=(
     "polkit_container outside_an_active_local_session_it_is_not_permitted --no-session"
     "polkit_container a_dialog_the_app_cancels_is_cancelled_by_the_app"
     "polkit_container a_polkitd_that_does_not_answer_is_given_up_on --stopped-polkitd"
+    "polkit_container an_unlock_against_a_hung_polkitd_ends_and_a_cancel_ends_it_at_once --stopped-polkitd"
     "pam_container the_right_password_is_verified"
     "pam_container wrong_passwords_fail_and_the_back_off_refuses_without_asking_pam"
     "pam_container without_a_service_file_there_is_no_pam_service --no-pam-service"

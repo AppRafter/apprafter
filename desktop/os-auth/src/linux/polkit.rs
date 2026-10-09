@@ -28,18 +28,22 @@
 //!   `polkit.dismissed` (`check_authorization_challenge_cb`, polkit 126), so it is `Failed`,
 //!   not the `NotPermittedHere` the same answer means in step 1.
 //!
-//! A [`probe`] asks nobody, so its connection gives each call [`PROBE_TIMEOUT`]: a polkitd that
-//! does not answer by then is hung, and the probe answers as if there were none
-//! (`Unavailable { NoBackend }`, the password field's way). [`verify`]'s connection has no
-//! limit: its step 2 waits for a person, who may take minutes.
+//! Step 1 asks nobody, so it is a [`probe`], on a connection of its own that gives each call
+//! [`PROBE_TIMEOUT`]: a polkitd that does not answer by then is hung, and the probe answers as if
+//! there were none (`Unavailable { NoBackend }`, the password field's way). Steps 2 and 3 use a
+//! connection without a limit: step 2 waits for a person, who may take minutes. Both
+//! connections are the app's, and polkitd resolves either bus name to the same process.
 //!
 //! Threads: zbus's blocking API, whose own executor thread drives the socket. [`verify`] blocks
 //! its caller until the agent answers, so it runs on a blocking worker, never on an async
-//! worker or the main thread. While the dialog is open a second, scoped thread waits to send
-//! the cancel, because the token's callback must return at once
+//! worker or the main thread. The token is watched from the start: step 1 runs on a thread of
+//! its own, and [`verify`] waits for its answer or for the token, so a cancel during step 1
+//! returns at once (the probe, bounded, ends on its own). While the dialog is open a second,
+//! scoped thread waits to send the cancel, because the token's callback must return at once
 //! ([`CancellationToken::on_cancel`]).
 
 use std::collections::HashMap;
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -68,17 +72,17 @@ impl Action {
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Asks polkit to authenticate the device owner for `action` (the module docs give the steps).
-/// Blocks until the agent answers; `cancel` closes the agent's dialog. A token already tripped
-/// opens nothing.
+/// Blocks until the agent answers, or for up to [`PROBE_TIMEOUT`] when polkitd does not answer
+/// step 1; `cancel` ends it at any step, closing the agent's dialog if one is open. A token
+/// already tripped opens nothing.
 pub fn verify(action: Action, cancel: &CancellationToken) -> AuthOutcome {
-    if cancel.is_cancelled() {
-        return APP_CANCELLED;
-    }
-    // No limit: step 2 waits for the owner.
-    match SystemBus::connect(None) {
-        Ok(bus) => authenticate(&bus, action.id(), cancel),
-        Err(error) => map_polkit(PolkitAnswer::Error(error)),
-    }
+    authenticate(
+        action.id(),
+        cancel,
+        move || probe(action),
+        // No limit: step 2 waits for the owner.
+        || SystemBus::connect(None),
+    )
 }
 
 /// Step 1 alone, for `action`: whether polkit would open the session's authentication agent,
@@ -122,27 +126,35 @@ trait Authority: Sync {
     fn cancel_check(&self, cancellation_id: &str) -> CancelReply;
 }
 
-/// The three steps of the module docs.
-fn authenticate(
-    authority: &impl Authority,
+/// The three steps of the module docs: `first` is step 1 (in the app a [`probe`], bounded),
+/// and `connect` gives the authority steps 2 and 3 ask.
+fn authenticate<A: Authority>(
     action: &str,
     cancel: &CancellationToken,
+    first: impl FnOnce() -> Result<(), AuthOutcome> + Send + 'static,
+    connect: impl FnOnce() -> Result<A, PolkitError>,
 ) -> AuthOutcome {
     if cancel.is_cancelled() {
         return APP_CANCELLED;
     }
-    if let Err(outcome) = probe_with(authority, action) {
-        return outcome;
-    }
+    // Registered before step 1, so a cancel during it ends the request at once.
     let prompt = Prompt::default();
     let _registration = {
         let prompt = prompt.clone();
         cancel.on_cancel(move || prompt.cancel())
     };
-    // Tripped during the first check: the callback ran inline above, and no dialog opens.
+    if let Err(outcome) = prompt.first_check(first) {
+        return outcome;
+    }
+    let authority = match connect() {
+        Ok(authority) => authority,
+        Err(error) => return map_polkit(PolkitAnswer::Error(error)),
+    };
+    // Tripped while connecting: no dialog opens.
     if prompt.cancelled() {
         return APP_CANCELLED;
     }
+    let authority = &authority;
     let cancellation_id = next_cancellation_id();
     let answer = std::thread::scope(|scope| {
         let canceller = std::thread::Builder::new()
@@ -220,6 +232,8 @@ struct Prompt(Arc<(Mutex<PromptState>, Condvar)>);
 struct PromptState {
     /// The token tripped: the app closed the dialog, whatever polkitd answers.
     cancelled: bool,
+    /// Step 1's answer, once it has come.
+    first: Option<Result<(), AuthOutcome>>,
     /// polkitd has answered the check.
     answered: bool,
 }
@@ -242,6 +256,44 @@ impl Prompt {
     fn answered(&self) {
         self.state().answered = true;
         self.0 .1.notify_all();
+    }
+
+    /// Step 1, `check`, on a thread of its own: its answer, or the app's cancel as soon as the
+    /// token trips, whichever comes first. A cancelled check runs on to its own end (bounded, in
+    /// the app) and its answer is dropped. A check that panics answers as no polkitd would.
+    fn first_check(
+        &self,
+        check: impl FnOnce() -> Result<(), AuthOutcome> + Send + 'static,
+    ) -> Result<(), AuthOutcome> {
+        if self.cancelled() {
+            return Err(APP_CANCELLED);
+        }
+        let prompt = self.clone();
+        let spawned = std::thread::Builder::new()
+            .name("polkit-probe".to_owned())
+            .spawn(move || {
+                let answer = panic::catch_unwind(AssertUnwindSafe(check)).unwrap_or_else(|_| {
+                    tracing::error!("polkit's first check panicked: counted as no polkitd");
+                    Err(map_polkit(PolkitAnswer::Error(PolkitError::Other)))
+                });
+                prompt.state().first = Some(answer);
+                prompt.0 .1.notify_all();
+            });
+        // Without the thread a cancel could not end step 1 at once, so it is not asked.
+        if spawned.is_err() {
+            return Err(map_polkit(PolkitAnswer::Error(PolkitError::Other)));
+        }
+        let condvar = &self.0 .1;
+        let mut state = self.state();
+        loop {
+            if state.cancelled {
+                return Err(APP_CANCELLED);
+            }
+            if let Some(answer) = state.first.take() {
+                return answer;
+            }
+            state = condvar.wait(state).unwrap_or_else(PoisonError::into_inner);
+        }
     }
 
     /// Runs beside the open check: once the token trips, sends `CancelCheckAuthorization` until
@@ -500,6 +552,28 @@ mod tests {
         }
     }
 
+    /// The app's authority is the system bus; a test's, a fake, borrowed.
+    impl<T: Authority> Authority for &T {
+        fn check(&self, action: &str, interaction: Interaction<'_>) -> PolkitAnswer {
+            (**self).check(action, interaction)
+        }
+
+        fn cancel_check(&self, cancellation_id: &str) -> CancelReply {
+            (**self).cancel_check(cancellation_id)
+        }
+    }
+
+    /// `authenticate` as [`verify`] runs it, with `fake` as polkitd for every step.
+    fn run(fake: &Arc<Fake>, cancel: &CancellationToken) -> AuthOutcome {
+        let first = Arc::clone(fake);
+        authenticate(
+            ACTION,
+            cancel,
+            move || probe_with(&*first, ACTION),
+            || Ok(&**fake),
+        )
+    }
+
     fn probe_only() -> Vec<Call> {
         vec![Call::Check {
             action: ACTION.to_owned(),
@@ -522,7 +596,7 @@ mod tests {
     }
 
     /// Runs `authenticate` and trips the token once the fake's dialog is open.
-    fn cancelled_while_open(fake: &Fake) -> AuthOutcome {
+    fn cancelled_while_open(fake: &Arc<Fake>) -> AuthOutcome {
         let token = CancellationToken::new();
         let opened = fake.watch_dialog();
         let canceller = {
@@ -534,18 +608,18 @@ mod tests {
                 token.cancel();
             })
         };
-        let outcome = authenticate(fake, ACTION, &token);
+        let outcome = run(fake, &token);
         canceller.join().unwrap();
         outcome
     }
 
     #[test]
     fn an_unregistered_action_is_policy_missing_and_opens_no_dialog() {
-        let fake = Fake::new(
+        let fake = Arc::new(Fake::new(
             PolkitAnswer::Error(PolkitError::Failed),
             Dialog::Answers(AUTHORIZED),
-        );
-        let outcome = authenticate(&fake, ACTION, &CancellationToken::new());
+        ));
+        let outcome = run(&fake, &CancellationToken::new());
         assert_eq!(outcome, unavailable(PolicyMissing));
         assert_eq!(fake.calls(), probe_only());
     }
@@ -554,16 +628,16 @@ mod tests {
     /// interactive check, which would come back authorized at once, is never made.
     #[test]
     fn an_action_granted_without_asking_is_refused_as_an_implicit_grant() {
-        let fake = Fake::new(AUTHORIZED, Dialog::Answers(AUTHORIZED));
-        let outcome = authenticate(&fake, ACTION, &CancellationToken::new());
+        let fake = Arc::new(Fake::new(AUTHORIZED, Dialog::Answers(AUTHORIZED)));
+        let outcome = run(&fake, &CancellationToken::new());
         assert_eq!(outcome, unavailable(ImplicitGrant));
         assert_eq!(fake.calls(), probe_only());
     }
 
     #[test]
     fn a_refusal_without_a_challenge_is_not_permitted_here_and_opens_no_dialog() {
-        let fake = Fake::new(REFUSED, Dialog::Answers(AUTHORIZED));
-        let outcome = authenticate(&fake, ACTION, &CancellationToken::new());
+        let fake = Arc::new(Fake::new(REFUSED, Dialog::Answers(AUTHORIZED)));
+        let outcome = run(&fake, &CancellationToken::new());
         assert_eq!(outcome, unavailable(NotPermittedHere));
         assert_eq!(fake.calls(), probe_only());
     }
@@ -576,12 +650,11 @@ mod tests {
             (PolkitError::NotAuthorized, unavailable(NotPermittedHere)),
             (PolkitError::CancellationIdNotUnique, AuthOutcome::Busy),
         ] {
-            let fake = Fake::new(PolkitAnswer::Error(error), Dialog::Answers(AUTHORIZED));
-            assert_eq!(
-                authenticate(&fake, ACTION, &CancellationToken::new()),
-                outcome,
-                "{error:?}"
-            );
+            let fake = Arc::new(Fake::new(
+                PolkitAnswer::Error(error),
+                Dialog::Answers(AUTHORIZED),
+            ));
+            assert_eq!(run(&fake, &CancellationToken::new()), outcome, "{error:?}");
             assert_eq!(fake.calls(), probe_only(), "{error:?}");
         }
     }
@@ -611,8 +684,8 @@ mod tests {
 
     #[test]
     fn a_challenge_opens_the_dialog_with_interaction_and_a_cancellation_id() {
-        let fake = Fake::new(CHALLENGE, Dialog::Answers(AUTHORIZED));
-        let outcome = authenticate(&fake, ACTION, &CancellationToken::new());
+        let fake = Arc::new(Fake::new(CHALLENGE, Dialog::Answers(AUTHORIZED)));
+        let outcome = run(&fake, &CancellationToken::new());
         assert_eq!(outcome, AuthOutcome::Verified);
         let calls = fake.calls();
         let id = dialog_id(&calls);
@@ -653,12 +726,8 @@ mod tests {
                 unavailable(NoBackend),
             ),
         ] {
-            let fake = Fake::new(CHALLENGE, Dialog::Answers(answer));
-            assert_eq!(
-                authenticate(&fake, ACTION, &CancellationToken::new()),
-                outcome,
-                "{answer:?}"
-            );
+            let fake = Arc::new(Fake::new(CHALLENGE, Dialog::Answers(answer)));
+            assert_eq!(run(&fake, &CancellationToken::new()), outcome, "{answer:?}");
         }
     }
 
@@ -674,7 +743,10 @@ mod tests {
             PolkitAnswer::Error(PolkitError::Cancelled),
             PolkitAnswer::Error(PolkitError::Other),
         ] {
-            let fake = Fake::new(CHALLENGE, Dialog::OpenUntilCancelled { unknown: 0, then });
+            let fake = Arc::new(Fake::new(
+                CHALLENGE,
+                Dialog::OpenUntilCancelled { unknown: 0, then },
+            ));
             assert_eq!(cancelled_while_open(&fake), APP_CANCELLED, "{then:?}");
             let calls = fake.calls();
             let id = dialog_id(&calls);
@@ -684,13 +756,13 @@ mod tests {
 
     #[test]
     fn a_cancel_that_overtakes_its_check_is_sent_again() {
-        let fake = Fake::new(
+        let fake = Arc::new(Fake::new(
             CHALLENGE,
             Dialog::OpenUntilCancelled {
                 unknown: 3,
                 then: DISMISSED,
             },
-        );
+        ));
         assert_eq!(cancelled_while_open(&fake), APP_CANCELLED);
         let calls = fake.calls();
         let id = dialog_id(&calls);
@@ -700,10 +772,10 @@ mod tests {
 
     #[test]
     fn a_token_tripped_before_the_request_asks_nothing() {
-        let fake = Fake::new(CHALLENGE, Dialog::Answers(AUTHORIZED));
+        let fake = Arc::new(Fake::new(CHALLENGE, Dialog::Answers(AUTHORIZED)));
         let token = CancellationToken::new();
         token.cancel();
-        assert_eq!(authenticate(&fake, ACTION, &token), APP_CANCELLED);
+        assert_eq!(run(&fake, &token), APP_CANCELLED);
         assert_eq!(fake.calls(), []);
     }
 
@@ -713,15 +785,121 @@ mod tests {
         let mut fake = Fake::new(CHALLENGE, Dialog::Answers(AUTHORIZED));
         let trip = token.clone();
         fake.during_probe = Some(Box::new(move || trip.cancel()));
-        assert_eq!(authenticate(&fake, ACTION, &token), APP_CANCELLED);
+        let fake = Arc::new(fake);
+        assert_eq!(run(&fake, &token), APP_CANCELLED);
+        assert_eq!(fake.calls(), probe_only());
+    }
+
+    /// polkitd hangs on the first check (in the app the probe gives up after `PROBE_TIMEOUT`):
+    /// a lock or a quit tripping the token meanwhile ends the request at once, not when the
+    /// check gives up, and no dialog opens.
+    #[test]
+    fn a_token_tripped_while_the_first_check_hangs_ends_the_request_at_once() {
+        let (entered, probing) = mpsc::channel();
+        let (release, released) = mpsc::channel::<()>();
+        let (entered, released) = (Mutex::new(entered), Mutex::new(released));
+        let mut fake = Fake::new(CHALLENGE, Dialog::Answers(AUTHORIZED));
+        fake.during_probe = Some(Box::new(move || {
+            entered.lock().unwrap().send(()).unwrap();
+            let _ = released.lock().unwrap().recv_timeout(PATIENCE);
+        }));
+        let fake = Arc::new(fake);
+        let token = CancellationToken::new();
+        let canceller = {
+            let token = token.clone();
+            thread::spawn(move || {
+                probing
+                    .recv_timeout(PATIENCE)
+                    .expect("the first check began");
+                token.cancel();
+            })
+        };
+        let started = Instant::now();
+        let outcome = run(&fake, &token);
+        let took = started.elapsed();
+        canceller.join().unwrap();
+        release.send(()).unwrap();
+        assert_eq!(outcome, APP_CANCELLED);
+        assert!(took < PATIENCE / 2, "it waited {took:?} for the hung check");
+        assert_eq!(fake.calls(), probe_only(), "no dialog opened");
+    }
+
+    #[test]
+    fn a_token_tripped_while_connecting_for_the_dialog_opens_none() {
+        let fake = Arc::new(Fake::new(CHALLENGE, Dialog::Answers(AUTHORIZED)));
+        let token = CancellationToken::new();
+        let first = Arc::clone(&fake);
+        let outcome = authenticate(
+            ACTION,
+            &token,
+            move || probe_with(&*first, ACTION),
+            || {
+                token.cancel();
+                Ok(&*fake)
+            },
+        );
+        assert_eq!(outcome, APP_CANCELLED);
+        assert_eq!(fake.calls(), probe_only());
+    }
+
+    /// Step 1 is asked apart from the connection the dialog uses: in the app the probe's own,
+    /// with its time limit, while the dialog's has none.
+    #[test]
+    fn the_first_check_is_not_asked_on_the_dialog_s_connection() {
+        let probe = Arc::new(Fake::new(CHALLENGE, Dialog::Answers(REFUSED)));
+        let dialog = Fake::new(REFUSED, Dialog::Answers(AUTHORIZED));
+        let first = Arc::clone(&probe);
+        let outcome = authenticate(
+            ACTION,
+            &CancellationToken::new(),
+            move || probe_with(&*first, ACTION),
+            || Ok(&dialog),
+        );
+        assert_eq!(outcome, AuthOutcome::Verified);
+        assert_eq!(probe.calls(), probe_only());
+        let calls = dialog.calls();
+        assert_eq!(
+            calls,
+            [Call::Check {
+                action: ACTION.to_owned(),
+                interactive: Some(dialog_id(&calls)),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_failed_connection_for_the_dialog_is_polkits_mapping_and_a_panicking_check_no_backend() {
+        let fake = Arc::new(Fake::new(CHALLENGE, Dialog::Answers(AUTHORIZED)));
+        let first = Arc::clone(&fake);
+        let outcome = authenticate(
+            ACTION,
+            &CancellationToken::new(),
+            move || probe_with(&*first, ACTION),
+            || Err::<&Fake, _>(PolkitError::Other),
+        );
+        assert_eq!(outcome, unavailable(NoBackend));
+        assert_eq!(fake.calls(), probe_only());
+
+        let mut fake = Fake::new(CHALLENGE, Dialog::Answers(AUTHORIZED));
+        fake.during_probe = Some(Box::new(|| panic!("the first check broke")));
+        let fake = Arc::new(fake);
+        let (tx, answered) = mpsc::channel();
+        {
+            let fake = Arc::clone(&fake);
+            thread::spawn(move || tx.send(run(&fake, &CancellationToken::new())));
+        }
+        let outcome = answered
+            .recv_timeout(PATIENCE)
+            .expect("a panicking check left the request waiting");
+        assert_eq!(outcome, unavailable(NoBackend));
         assert_eq!(fake.calls(), probe_only());
     }
 
     #[test]
     fn a_token_tripped_after_the_answer_cancels_nothing() {
-        let fake = Fake::new(CHALLENGE, Dialog::Answers(AUTHORIZED));
+        let fake = Arc::new(Fake::new(CHALLENGE, Dialog::Answers(AUTHORIZED)));
         let token = CancellationToken::new();
-        assert_eq!(authenticate(&fake, ACTION, &token), AuthOutcome::Verified);
+        assert_eq!(run(&fake, &token), AuthOutcome::Verified);
         token.cancel();
         assert!(
             !fake.calls().iter().any(|c| matches!(c, Call::Cancel(_))),
@@ -732,10 +910,10 @@ mod tests {
 
     #[test]
     fn every_dialog_has_its_own_cancellation_id() {
-        let first = Fake::new(CHALLENGE, Dialog::Answers(AUTHORIZED));
-        let second = Fake::new(CHALLENGE, Dialog::Answers(AUTHORIZED));
-        authenticate(&first, ACTION, &CancellationToken::new());
-        authenticate(&second, ACTION, &CancellationToken::new());
+        let first = Arc::new(Fake::new(CHALLENGE, Dialog::Answers(AUTHORIZED)));
+        let second = Arc::new(Fake::new(CHALLENGE, Dialog::Answers(AUTHORIZED)));
+        run(&first, &CancellationToken::new());
+        run(&second, &CancellationToken::new());
         assert_ne!(dialog_id(&first.calls()), dialog_id(&second.calls()));
     }
 
