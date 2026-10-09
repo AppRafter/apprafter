@@ -403,9 +403,10 @@ impl Shell {
     /// The `app_info` answer. Its `auth` is asked of the authenticator afresh, waiting up to
     /// [`APP_INFO_AUTH_WITHIN`] for it and else the last answer: it changes (a polkit dialog
     /// that found no agent moves Linux to the password field, a lock moves it back), and before
-    /// any answer it is [`UNANSWERED`](crate::auth_cache::UNANSWERED). Its `session_events` waits, up to
-    /// [`SESSION_READY_WITHIN`] from the watch's start, while the watch has not said what it
-    /// hears (see the module docs): call it on a blocking worker, never on the main thread.
+    /// any answer it is [`UNANSWERED`](crate::auth_cache::UNANSWERED). Its `session_events`
+    /// waits, up to [`SESSION_READY_WITHIN`] from the watch's start, while the watch has not said
+    /// what it hears (see the module docs): call it on a blocking worker, never on the main
+    /// thread.
     pub fn app_info(&self) -> AppInfo {
         AppInfo {
             os: current_os(),

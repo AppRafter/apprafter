@@ -4,10 +4,11 @@
 //!
 //! The lock is in effect when the settings switch it on **and** the [`Authenticator`] can
 //! verify the owner — as its last answer says: the machine reads the [`AuthCache`], never the
-//! OS, so an OS slow to answer or hung holds up no tick, lock or state read. Without an authenticator it fails closed in the only safe direction: a
-//! lock nobody could open is no lock, so it is off (the webview shows a persistent banner from
-//! `AuthInfo`), switching it on is refused with `AuthUnavailable`, and destructive operations
-//! are refused by the [`OperationManager`](crate::ops::OperationManager) for the same reason.
+//! OS, so an OS slow to answer or hung holds up no tick, lock or state read. Without an
+//! authenticator it fails closed in the only safe direction: a lock nobody could open is no
+//! lock, so it is off (the webview shows a persistent banner from `AuthInfo`), switching it on
+//! is refused with `AuthUnavailable`, and destructive operations are refused by the
+//! [`OperationManager`](crate::ops::OperationManager) for the same reason.
 //!
 //! Settings reach the machine as a copy: [`LockMachine::new`] takes the loaded settings and
 //! only [`LockMachine::set_settings`] replaces them. It checks the change, then calls the
