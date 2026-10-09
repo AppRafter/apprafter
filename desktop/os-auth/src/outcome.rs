@@ -436,7 +436,16 @@ pub fn map_pam(raw: i32) -> AuthOutcome {
 /// and a success starts the count again. The Windows credential dialog and PAM keep one each:
 /// a failed `LogonUserW` counts toward the account-lockout policy (a domain account's too), and
 /// PAM's own delay after a failure is a few seconds. While it refuses, a backend answers
-/// `Failed { exhausted: true }` without a prompt. It lives in memory: a restart forgets it.
+/// `Failed { exhausted: true }` without a prompt.
+///
+/// It lives in memory, so a restart forgets it, and that is accepted: what bounds guessing
+/// across restarts is the OS's own. On Linux that is PAM's delay after every failure
+/// (`pam_unix`'s ~2 s, or `pam_faildelay`'s), which no restart lifts. The polkit path has no
+/// back-off of the app's at all: each dialog is one authentication by polkit's agent helper,
+/// through polkit's own PAM stack and that stack's delay. Open: whether a failure on the PAM
+/// path also counts toward `pam_faillock` where a distribution's stack includes it, which
+/// would keep a lockout across processes — its tally directory is root's, and a check from the
+/// unprivileged app has not been tried against it.
 ///
 /// Time is a monotonic millisecond reading the caller passes in (the shell's
 /// `Clock::monotonic_ms`). Monotonic only, unlike the shell's deadlines, which take the larger

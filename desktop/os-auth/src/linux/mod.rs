@@ -5,6 +5,7 @@
 mod authenticator;
 pub mod pam;
 pub mod polkit;
+pub mod session;
 
 pub use authenticator::OsAuthenticator;
 pub use pam::PasswordCheck;

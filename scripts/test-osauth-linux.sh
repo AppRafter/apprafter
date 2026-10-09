@@ -25,9 +25,11 @@
 # The session: polkit applies `allow_active` only to a subject in an active local session, and
 # looks that up through sd-login: the process's cgroup (`.../session-<id>.scope`) and the
 # files logind keeps under /run/systemd/. The container runs no systemd, so the in-container
-# driver writes those two files and moves the test into such a cgroup. That takes a writable
-# cgroup tree: `--security-opt unmask=/sys/fs/cgroup`, plus, rootless, a cgroup delegated by a
-# systemd user session. CI has no such session, so it runs rootful.
+# driver writes those two files (active, or with --inactive-session inactive) and moves the
+# test into such a cgroup (not with --no-session); the authenticator reads the same files to
+# tell an active local session from the others. Moving it takes a writable cgroup tree:
+# `--security-opt unmask=/sys/fs/cgroup`, plus, rootless, a cgroup delegated by a systemd user
+# session. CI has no such session, so it runs rootful.
 #
 # A case passes only when its one test reported `ok` and the harness ran exactly one test, and
 # the cases here must be exactly the tests in the binaries, so a renamed test cannot turn into
@@ -62,6 +64,10 @@ CASES=(
     "pam_container without_a_service_file_there_is_no_pam_service --no-pam-service"
     "pam_container without_an_agent_the_authenticator_moves_to_the_password"
     "pam_container without_the_policy_file_the_authenticator_offers_the_password --no-policy"
+    "pam_container an_empty_password_is_never_verified --empty-password"
+    "pam_container an_administrator_s_no_in_an_active_session_is_final --rule-no"
+    "pam_container outside_a_session_the_authenticator_offers_the_password --no-session"
+    "pam_container in_an_inactive_session_the_authenticator_offers_the_password --inactive-session"
 )
 
 die() {
@@ -147,13 +153,16 @@ cat >"$work/osauth-case" <<'DRIVER_EOF'
 #   osauth-case [flags] <test binary> <test name>
 set -euo pipefail
 
-policy=yes rule=no session=yes pam_service=yes
+policy=yes rule=none session=yes active=yes pam_service=yes password=yes
 while [[ $# -gt 2 ]]; do
     case "$1" in
     --no-policy) policy=no ;;
-    --rule-yes) rule=yes ;;
+    --rule-yes) rule=YES ;;
+    --rule-no) rule=NO ;;
     --no-session) session=no ;;
+    --inactive-session) active=no ;;
     --no-pam-service) pam_service=no ;;
+    --empty-password) password=no ;;
     *)
         echo "osauth-case: unknown flag $1" >&2
         exit 2
@@ -172,27 +181,43 @@ if [[ $pam_service == no ]]; then
         rm -f "$dir/common-auth" "$dir/system-auth" "$dir/login"
     done
 fi
-if [[ $rule == yes ]]; then
-    cat >/etc/polkit-1/rules.d/00-apprafter-test-yes.rules <<'RULE_EOF'
+if [[ $password == no ]]; then
+    # pam_unix with `nullok` (Debian's common-auth) verifies an account like this without a
+    # prompt unless the caller passes PAM_DISALLOW_NULL_AUTHTOK.
+    passwd --delete walk >/dev/null
+    if [[ -n "$(getent shadow walk | cut -d: -f2)" ]]; then
+        echo "osauth-case: walk still has a password" >&2
+        exit 3
+    fi
+fi
+if [[ $rule != none ]]; then
+    # An administrator's rule for the app's actions: YES grants without asking, NO refuses.
+    cat >/etc/polkit-1/rules.d/00-apprafter-test.rules <<RULE_EOF
 polkit.addRule(function (action, subject) {
     if (action.id.indexOf("dev.apprafter.desktop.") === 0) {
-        return polkit.Result.YES;
+        return polkit.Result.$rule;
     }
 });
 RULE_EOF
-    chmod 0644 /etc/polkit-1/rules.d/00-apprafter-test-yes.rules
+    chmod 0644 /etc/polkit-1/rules.d/00-apprafter-test.rules
 fi
 
-# What logind would keep for an active local session of `walk` on seat0: sd-login reads the
-# session's seat and activity from these files, and finds a process's session from its cgroup.
+# What logind would keep for a local session of `walk` on seat0, active or (another session in
+# the foreground of the seat) inactive: sd-login reads the session's seat and activity, and the
+# user's state, from these files, and finds a process's session from its cgroup.
 uid="$(id -u walk)"
+if [[ $active == yes ]]; then
+    flag=1 state=active active_sessions="$OSAUTH_SESSION" active_seats=seat0
+else
+    flag=0 state=online active_sessions="" active_seats=""
+fi
 mkdir -p /run/systemd/sessions /run/systemd/users /run/systemd/seats
-printf '%s\n' "UID=$uid" USER=walk ACTIVE=1 IS_DISPLAY=0 STATE=active REMOTE=0 TYPE=tty \
-    ORIGINAL_TYPE=tty CLASS=user "SCOPE=session-$OSAUTH_SESSION.scope" SEAT=seat0 \
+printf '%s\n' "UID=$uid" USER=walk "ACTIVE=$flag" IS_DISPLAY=0 "STATE=$state" REMOTE=0 \
+    TYPE=tty ORIGINAL_TYPE=tty CLASS=user "SCOPE=session-$OSAUTH_SESSION.scope" SEAT=seat0 \
     >"/run/systemd/sessions/$OSAUTH_SESSION"
-printf '%s\n' NAME=walk STATE=active STOPPING=no "SESSIONS=$OSAUTH_SESSION" SEATS=seat0 \
-    "ACTIVE_SESSIONS=$OSAUTH_SESSION" "ONLINE_SESSIONS=$OSAUTH_SESSION" ACTIVE_SEATS=seat0 \
-    ONLINE_SEATS=seat0 >"/run/systemd/users/$uid"
+printf '%s\n' NAME=walk "STATE=$state" STOPPING=no "SESSIONS=$OSAUTH_SESSION" SEATS=seat0 \
+    "ACTIVE_SESSIONS=$active_sessions" "ONLINE_SESSIONS=$OSAUTH_SESSION" \
+    "ACTIVE_SEATS=$active_seats" ONLINE_SEATS=seat0 >"/run/systemd/users/$uid"
 scope="/sys/fs/cgroup/user.slice/user-$uid.slice/session-$OSAUTH_SESSION.scope"
 if ! mkdir -p "$scope"; then
     echo "osauth-case: cannot create $scope: the cgroup tree is read-only or not delegated" \

@@ -11,9 +11,18 @@
 //! 2. The account: `getpwuid_r(getuid())`, the user running the app, never a name from the UI.
 //!    `pam_unix` cannot read `/etc/shadow` for a user who is not root and checks the password
 //!    through the set-group-id `unix_chkpwd`, which verifies the caller's own account only.
-//! 3. `pam_authenticate` with `PAM_DISALLOW_NULL_AUTHTOK` (an account without a password proves
-//!    nothing), and nothing else: no `pam_acct_mgmt`, `pam_setcred` or `pam_open_session`. The
-//!    app asks who is at the keyboard; it logs nobody in.
+//! 3. An empty password is `Failed` without asking PAM.
+//! 4. `pam_authenticate` with `PAM_DISALLOW_NULL_AUTHTOK`, and nothing else: no
+//!    `pam_acct_mgmt`, `pam_setcred` or `pam_open_session`. The app asks who is at the keyboard;
+//!    it logs nobody in.
+//!
+//! Steps 3 and 4 are two guards against one hole. Debian, Ubuntu, Fedora and Arch ship
+//! `pam_unix.so nullok`, under which an account without a password is verified without a prompt,
+//! whatever was typed; `PAM_DISALLOW_NULL_AUTHTOK` overrides `nullok` for this call, and is what
+//! stops a non-empty password from verifying such an account. Step 3 keeps the empty password
+//! out of PAM whatever the stack or the flag does. The container case
+//! `an_empty_password_is_never_verified` (`tests/pam_container.rs`) runs both against Debian's
+//! `pam_unix` with the account's password removed.
 //!
 //! The conversation answers the first hidden prompt with the password. Any other prompt — a
 //! second hidden one, as a one-time-code module asks, one that echoes, Linux-PAM's radio and
@@ -32,17 +41,23 @@
 //! - any other code: [`map_pam`].
 //!
 //! Back-off ([`Backoff`], one per [`Pam`], so per process): every check that reached PAM and did
-//! not end `Verified` is a failure, `NotInteractive` and cancels included. With a `requisite`
-//! password module before a one-time-code module, "a second prompt came" says the password was
-//! right, so it costs what a wrong one does. The failure that starts a refusal answers
-//! `Failed { exhausted: true }`, and so does every check the refusal turns away, without calling
-//! PAM: that is how "refused by the back-off" reads. Checks run one at a time: one asked while
-//! another runs is `Busy`, since parallel checks would each pass the back-off before any failed.
+//! not end `Verified` is a failure, `NotInteractive` and cancels included, and so is an empty
+//! password, which never reaches it. With a `requisite` password module before a one-time-code
+//! module, "a second prompt came" says the password was right, so it costs what a wrong one
+//! does. The failure that starts a refusal answers `Failed { exhausted: true }`, and so does
+//! every check the refusal turns away, without calling PAM: that is how "refused by the
+//! back-off" reads. Checks run one at a time: one asked while another runs is `Busy`, since
+//! parallel checks would each pass the back-off before any failed.
 //!
 //! Memory: the password is a [`Zeroizing`] string, wiped when the check ends, and nothing here
 //! formats or logs it (the conversation's `Debug` leaves it out). nonstick hands the answer to
 //! libpam through an `OsString` it frees without wiping, and libpam owns the C copy from then
-//! on: one short-lived copy per check that this crate cannot reach.
+//! on: one short-lived copy per check that this crate cannot reach. One more, only when a
+//! module sends several messages in one call and the conversation refuses one after the hidden
+//! prompt (an OTP prompt in the same call): nonstick 0.1.2's `Answers::build` has by then copied
+//! the password to the C heap, stops at the refusal, and frees that copy without wiping it (a
+//! text answer gives up its zero-on-drop wrapper when it is filled). It is never handed to
+//! libpam, and this crate cannot reach it either.
 //!
 //! Blocking: PAM sleeps a few seconds after a failure and a fingerprint module waits for a
 //! finger, so a check runs on a blocking worker, never on an async worker or the main thread.
@@ -174,10 +189,16 @@ impl Pam {
             Ok(target) => target,
             Err(reason) => return PasswordCheck::unasked(unavailable(reason)),
         };
-        let dialogue = Dialogue::new(password, cancel.clone());
-        let answer = self.library.authenticate(service, &user, &dialogue);
-        let record = dialogue.into_record();
-        let outcome = decide(&answer, &user, &record, cancel.is_cancelled());
+        let (outcome, messages) = if password.is_empty() {
+            // Never asked (the module docs say why), and counted below as a wrong one.
+            (FAILED, Vec::new())
+        } else {
+            let dialogue = Dialogue::new(password, cancel.clone());
+            let answer = self.library.authenticate(service, &user, &dialogue);
+            let record = dialogue.into_record();
+            let outcome = decide(&answer, &user, &record, cancel.is_cancelled());
+            (outcome, record.messages)
+        };
         let outcome = if outcome == AuthOutcome::Verified {
             backoff.record_success();
             outcome
@@ -188,10 +209,7 @@ impl Pam {
                 other => other,
             }
         };
-        PasswordCheck {
-            outcome,
-            messages: record.messages,
-        }
+        PasswordCheck { outcome, messages }
     }
 }
 
@@ -236,10 +254,24 @@ pub fn current_user() -> Option<OsString> {
             return None;
         }
         // SAFETY: getpwuid_r succeeded, so `found` points at the initialised `entry`, whose
-        // `pw_name` is a NUL-terminated string inside `buffer`, which is still alive.
-        let name = unsafe { CStr::from_ptr((*found).pw_name) }.to_bytes();
-        return (!name.is_empty()).then(|| OsStr::from_bytes(name).to_owned());
+        // `pw_name` is null or a NUL-terminated string inside `buffer`, which is still alive.
+        return unsafe { account_name(&*found) };
     }
+}
+
+/// The account name of a passwd record: `None` when it has none (a null or an empty
+/// `pw_name`).
+///
+/// # Safety
+///
+/// `entry.pw_name` is null or points at a NUL-terminated string that outlives the call.
+unsafe fn account_name(entry: &libc::passwd) -> Option<OsString> {
+    if entry.pw_name.is_null() {
+        return None;
+    }
+    // SAFETY: not null, so the caller's contract makes it a NUL-terminated string.
+    let name = unsafe { CStr::from_ptr(entry.pw_name) }.to_bytes();
+    (!name.is_empty()).then(|| OsStr::from_bytes(name).to_owned())
 }
 
 /// What PAM answered one check.
@@ -298,6 +330,8 @@ impl Library for LibPam {
                 }
             }
         };
+        // Overrides the stack's `nullok`: without it an account with no password is verified
+        // whatever was typed (the module docs, and the container case that pins it).
         let code = match transaction.authenticate(AuthnFlags::DISALLOW_NULL_AUTHTOK) {
             Ok(()) => SUCCESS,
             Err(error) => raw_code(error),
@@ -918,6 +952,26 @@ mod tests {
         assert_eq!(fake.calls(), []);
     }
 
+    /// Debian's, Fedora's and Arch's stacks say `nullok`, which verifies an account without a
+    /// password whatever is typed unless PAM is told otherwise: an empty password never reaches
+    /// PAM, and costs what a wrong one does.
+    #[test]
+    fn an_empty_password_fails_without_asking_pam_and_counts_as_a_failure() {
+        // A stack that verifies anything, as `nullok` does an account without a password.
+        let fake = Fake::script(&[], Code::Fixed(SUCCESS));
+        let pam = fake.pam();
+        assert_eq!(check(&pam, "", 0), AuthOutcome::Failed { exhausted: false });
+        assert_eq!(check(&pam, "", 1), AuthOutcome::Failed { exhausted: false });
+        assert_eq!(
+            check(&pam, "", 2),
+            EXHAUSTED,
+            "the third failure starts the refusal"
+        );
+        assert_eq!(fake.calls(), [], "PAM was never asked");
+        assert_eq!(check(&pam, RIGHT, 3), EXHAUSTED, "and the refusal holds");
+        assert_eq!(fake.calls(), []);
+    }
+
     #[test]
     fn a_service_and_an_account_are_available() {
         assert_eq!(Fake::script(&[], Code::Right).pam().available(), Ok(()));
@@ -946,6 +1000,22 @@ mod tests {
             assert_eq!(first.join().unwrap(), VERIFIED);
         });
         assert_eq!(fake.calls().len(), 1);
+    }
+
+    /// A directory service may hand back a record without a name: no account, not a crash.
+    #[test]
+    fn a_passwd_record_without_a_name_is_no_account() {
+        // SAFETY: all zeroes is a valid passwd: null pointers and zero ids.
+        let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+        // SAFETY (each call below): `pw_name` is null or one of the literals, which outlive it.
+        assert_eq!(unsafe { account_name(&entry) }, None, "a null name");
+        entry.pw_name = c"".as_ptr().cast_mut();
+        assert_eq!(unsafe { account_name(&entry) }, None, "an empty name");
+        entry.pw_name = c"walk".as_ptr().cast_mut();
+        assert_eq!(
+            unsafe { account_name(&entry) },
+            Some(OsString::from("walk"))
+        );
     }
 
     #[test]

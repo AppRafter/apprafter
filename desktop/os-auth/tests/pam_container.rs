@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! The PAM fallback against a real PAM stack, and the Linux authenticator's move to it, inside
 //! the container `scripts/test-osauth-linux.sh` builds: Debian's libpam, `pam_unix` and the
-//! set-group-id `unix_chkpwd`, its `/etc/pam.d/common-auth`, a user `walk` with a known
-//! password, and polkitd with the app's policy for the routing cases. The script prepares the
-//! system for each case (the service files present or not, the policy file present or not) and
-//! runs exactly that test as `walk`, through the container's own loader, so the libpam and the
-//! modules it loads are the container's.
+//! set-group-id `unix_chkpwd`, its `/etc/pam.d/common-auth` (`nullok`), a user `walk` with a
+//! known password, and polkitd with the app's policy and the driver's logind files for the
+//! routing cases. The script prepares the system for each case (the service files present or
+//! not, `walk`'s password removed, the policy file present or not, a `rules.d` rule, the session
+//! active, inactive or not joined) and runs exactly that test as `walk`, through the
+//! container's own loader, so the libpam and the modules it loads are the container's.
 //!
 //! ```text
 //! bash scripts/test-osauth-linux.sh          # every case, each in a fresh container
@@ -22,6 +23,7 @@ use apprafter_core::CancellationToken;
 use apprafter_desktop_ipc::{AuthInfo, AuthMethod, AuthOutcome, UnavailableReason};
 use apprafter_os_auth::linux::pam::{current_user, find_service, Pam, SERVICES, SERVICE_DIRS};
 use apprafter_os_auth::linux::polkit::Action;
+use apprafter_os_auth::linux::session::active_local_session;
 use apprafter_os_auth::outcome::Backoff;
 use apprafter_os_auth::OsAuthenticator;
 use zeroize::Zeroizing;
@@ -214,4 +216,102 @@ fn without_the_policy_file_the_authenticator_offers_the_password() {
         );
         assert_eq!(checked.outcome, outcome);
     }
+}
+
+/// The script removed `walk`'s password (`passwd -d`). Debian's `common-auth` says `nullok`,
+/// under which `pam_unix` verifies such an account without a prompt, whatever was typed, unless
+/// the caller passes `PAM_DISALLOW_NULL_AUTHTOK`. Neither probe verifies: the empty password
+/// never reaches PAM, and the flag refuses the other.
+#[test]
+#[ignore = "needs the PAM container: bash scripts/test-osauth-linux.sh"]
+fn an_empty_password_is_never_verified() {
+    container();
+    // A Pam per probe, so that the back-off's count stays out of the outcomes.
+    let outcomes: Vec<_> = ["", "anything at all"]
+        .into_iter()
+        .map(|text| (text, check(&Pam::new(), text, 0)))
+        .collect();
+    assert_eq!(
+        outcomes,
+        [
+            ("", AuthOutcome::Failed { exhausted: false }),
+            ("anything at all", AuthOutcome::Failed { exhausted: false }),
+        ]
+    );
+}
+
+/// The script installed a `rules.d` rule that answers NO for the app's actions, and the test
+/// runs in the driver's active local session, where the policy's defaults ask: the refusal is
+/// the administrator's, and the password field must not get round it.
+#[test]
+#[ignore = "needs the PAM container: bash scripts/test-osauth-linux.sh"]
+fn an_administrator_s_no_in_an_active_session_is_final() {
+    let right = container();
+    assert!(
+        active_local_session(),
+        "the case runs in an active local session"
+    );
+    let auth = OsAuthenticator::new();
+    assert_eq!(
+        auth.info(),
+        AuthInfo {
+            available: false,
+            method: None,
+            unavailable: Some(UnavailableReason::NotPermittedHere),
+            biometrics_choice: false,
+            password_field: false,
+        }
+    );
+    assert_eq!(
+        auth.verify(Action::Unlock, &CancellationToken::new()),
+        unavailable(UnavailableReason::NotPermittedHere)
+    );
+    for action in [Action::Unlock, Action::Confirm] {
+        let refused = auth.verify_password(action, password(&right), &CancellationToken::new(), 0);
+        assert_eq!(
+            refused.outcome,
+            unavailable(UnavailableReason::NotPermittedHere),
+            "{action:?}"
+        );
+    }
+    assert_eq!(
+        check(&Pam::new(), &right, 0),
+        AuthOutcome::Verified,
+        "PAM itself verifies it: the refusal is the authenticator's"
+    );
+}
+
+/// Where polkit's own defaults refuse, the password field stands in for it.
+fn the_password_stands_in_for_polkit_s_refusal(right: &str) {
+    let auth = OsAuthenticator::new();
+    assert_eq!(auth.info(), available(AuthMethod::Pam, true));
+    assert_eq!(
+        auth.verify(Action::Unlock, &CancellationToken::new()),
+        unavailable(UnavailableReason::NotPermittedHere)
+    );
+    let checked = auth.verify_password(
+        Action::Unlock,
+        password(right),
+        &CancellationToken::new(),
+        0,
+    );
+    assert_eq!(checked.outcome, AuthOutcome::Verified, "{checked:?}");
+}
+
+/// The script ran this case outside the session: no session, so `allow_any` (`no`) applies.
+#[test]
+#[ignore = "needs the PAM container: bash scripts/test-osauth-linux.sh"]
+fn outside_a_session_the_authenticator_offers_the_password() {
+    let right = container();
+    assert!(!active_local_session(), "the case runs outside the session");
+    the_password_stands_in_for_polkit_s_refusal(&right);
+}
+
+/// The script made the session, and so its user, inactive: `allow_inactive` (`no`) applies.
+#[test]
+#[ignore = "needs the PAM container: bash scripts/test-osauth-linux.sh"]
+fn in_an_inactive_session_the_authenticator_offers_the_password() {
+    let right = container();
+    assert!(!active_local_session(), "the case's session is inactive");
+    the_password_stands_in_for_polkit_s_refusal(&right);
 }
