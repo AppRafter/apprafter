@@ -75,7 +75,8 @@ You will also need:
   for every cluster-facing command, and `apprafter doctor` reports a
   missing `kubectl` as a failure rather than a warning.
 - **`helm`** for `cluster-bootstrap`, **`restic`** for backup and
-  restore, **`git`** for reading an application repository, and an
+  restore, **`git`** for reading an application repository, **`cue`**
+  for checking an application manifest with `app validate`, and an
   **SSH client** for node preparation. Each is needed only by the
   commands that use it, so `doctor` reports a missing one as a warning
   naming the capability you will not have.
@@ -84,7 +85,7 @@ Any command that needs a tool checks for it **before** it prompts for
 anything, contacts a cluster or creates a billable resource, and names
 the install steps when it is absent.
 
-Confirm all five now, before step 1 and before anything is billable:
+Confirm all six now, before step 1 and before anything is billable:
 
 ```sh
 apprafter doctor
@@ -92,7 +93,7 @@ apprafter doctor
 
 With no target configured it reports `active target: none configured` as
 a warning and exits 0, and still prints one line per tool —
-`kubectl` `helm` `git` `ssh` `restic` — plus a DNS reachability check. A
+`restic` `kubectl` `helm` `git` `ssh` `cue` — plus a DNS reachability check. A
 missing `kubectl` is the only FAIL; the rest warn and name the capability
 you would lose. Step 3 runs it a second time, when there is a target for
 its six target-side checks to read.
@@ -217,11 +218,14 @@ apprafter cb                    # alias for cluster-bootstrap
 apprafter doctor                # self-diagnostic, exits 1 on FAIL
 ```
 
-The second run is the one that exercises the six target-side checks the
-Prerequisites run could not: the config file, the credentials file and its
-mode, the provider, the token format, a token ping, and the SSH key. Each
-check reports PASS / WARN / FAIL with a hint pointing at the right next
-command.
+The second run is the one that exercises what the Prerequisites run could
+not: six target-side checks (the config file, the credentials file and its
+mode, the provider, the token format, a token ping and the SSH key) and
+three cluster checks (the kubeconfig `apprafter up` cached, the Kubernetes
+API answering through it within the request timeout, and the node
+accepting a connection on port 22). Each check reports PASS / WARN / FAIL
+with a hint pointing at the right next command, and `–` for a check it did
+not run: `--no-ping` skips the token ping and the SSH port.
 
 Then ask whether anything is wrong with the cluster:
 

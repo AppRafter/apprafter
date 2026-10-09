@@ -358,9 +358,10 @@ If you see `> 60 s` consistently on `k3s-ready`:
   nothing, and because `RUST_LOG` **replaces** the default filter
   rather than adding to it, such a directive on its own turns the
   logging off instead of up.
-- Confirm the Hetzner Cloud Firewall has port 22 open
-  (`apprafter doctor` sanity-checks DNS + reachability, not
-  port-level connectivity).
+- Confirm the Hetzner Cloud Firewall has port 22 open:
+  `apprafter doctor`'s **`Node reachable over SSH`** check connects
+  to port 22 of the node's public IPv4, and FAILs naming the address
+  when nothing accepts the connection.
 - Try `apprafter kubeconfig --refresh` once the cluster reports
   ready in the Hetzner Cloud Console (the Web Console gives you
   out-of-band access to the boot log).

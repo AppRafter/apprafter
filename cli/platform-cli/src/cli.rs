@@ -60,21 +60,23 @@ pub enum Commands {
         #[command(subcommand)]
         action: AuthCommand,
     },
-    /// Self-diagnostic over the active target's config, credentials
-    /// and reachability plus the surrounding shell environment
-    /// (kubectl, helm, ssh, DNS). Prints PASS / WARN / FAIL per
-    /// check; exits 1 if any FAIL fires so CI gates can wire
-    /// `apprafter doctor` in directly.
+    /// Self-diagnostic over the active target's config and credentials,
+    /// its cluster (the cached kubeconfig, the Kubernetes API, the
+    /// node's SSH port) and this computer (restic, kubectl, helm, git,
+    /// ssh, cue, DNS). Prints PASS / WARN / FAIL per check, and `–` for
+    /// a check it did not run; exits 1 if any FAIL fires so CI gates
+    /// can wire `apprafter doctor` in directly.
     Doctor {
         /// Inspect a target other than the active one. Defaults
         /// to the active target.
         #[arg(long)]
         target: Option<String>,
-        /// Skip the Hetzner Cloud API ping. Also settable via
-        /// `APPRAFTER_NO_PING`, which takes a boolish value: `1`
-        /// `true` `yes` `y` `t` `on` skip the ping, `0` `false` `no`
-        /// `n` `f` `off` keep it. Any other value, including the
-        /// empty string, is an error rather than a no-op.
+        /// Skip the checks that contact the provider or the node: the
+        /// Hetzner Cloud API ping and the node's SSH port. Also settable
+        /// via `APPRAFTER_NO_PING`, which takes a boolish value: `1`
+        /// `true` `yes` `y` `t` `on` skip them, `0` `false` `no` `n` `f`
+        /// `off` keep them. Any other value, including the empty
+        /// string, is an error rather than a no-op.
         #[arg(
             long = "no-ping",
             env = "APPRAFTER_NO_PING",

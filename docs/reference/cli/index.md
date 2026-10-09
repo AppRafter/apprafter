@@ -60,7 +60,7 @@ specific release rather than scraping these pages.
 | [`apprafter completion`](completion.md) | — | Print a shell completion script on stdout |
 | [`apprafter db`](db.md) | — | Manage SharedDatabase CRs — a PostgreSQL database or a Redis keyspace several Applications bind, each with its own credential and its own access level. |
 | [`apprafter destroy`](destroy.md) | — | Destroy every `apprafter=true`-labelled resource in the provider project the token belongs to — servers, floating IPs, firewalls, networks and SSH keys |
-| [`apprafter doctor`](doctor.md) | — | Self-diagnostic over the active target's config, credentials and reachability plus the surrounding shell environment (kubectl, helm, ssh, DNS). |
+| [`apprafter doctor`](doctor.md) | — | Self-diagnostic over the active target's config and credentials, its cluster (the cached kubeconfig, the Kubernetes API, the node's SSH port) and this computer (restic, kubectl, helm, git, ssh, cue, DNS). |
 | [`apprafter export`](export.md) | — | Native data export (Kind 1) — pull pg dumps, volume tars, persistent-redis snapshots and JetStream stream snapshots to a plain local folder + `manifest.json`. |
 | [`apprafter import`](import.md) | — | Rebuild local state from live Hetzner Cloud resources tagged with `apprafter=true`. |
 | [`apprafter init`](init.md) | — | Bootstrap a fresh cluster on the given provider/tier |

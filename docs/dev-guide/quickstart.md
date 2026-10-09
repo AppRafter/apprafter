@@ -205,7 +205,7 @@ server-side regardless.
 | Docker ≥ 24 | To ship **your own** app | builds and pushes the container image (step 3). |
 | A container registry | To ship **your own** app | e.g. GHCR — where the image lives. See [private repos & registries](./private-repos-and-registries.md). |
 | Domain + Cloudflare account | **Public HTTPS only** | step 5 — skip it if you only want to evaluate. |
-| `cue` ≥ 0.10 | _Optional_ | only for `apprafter app validate` locally. |
+| `cue` ≥ 0.10 | _Optional_ | only for `apprafter app validate` locally; `apprafter doctor` checks it. |
 | Bun ≥ 1.x | _Optional_ | only to run the OneBun starter on your machine. |
 
 ## 1. Register a target and bring the cluster up
