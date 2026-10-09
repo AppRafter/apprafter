@@ -9,8 +9,9 @@
 // The password lives in the field's state while it is typed, goes out with the request, and the
 // field is emptied when the answer comes, whatever it is: it is never cached, mutated through
 // the query client or logged. A wrong password shows what the OS said (PAM's messages) or a
-// plain line; too many failures hold the field for the back-off, saying why.
-import { type FormEvent, useEffect, useRef, useState } from 'react';
+// plain line under the field, which is marked until the owner types again; too many failures
+// hold the field for the back-off, saying why.
+import { type FormEvent, type ReactNode, useEffect, useRef, useState } from 'react';
 import { Button } from '../components/Button';
 import { ArrowRightIcon, SpinnerGapIcon } from '../components/icons';
 import { Logo } from '../components/Logo';
@@ -96,6 +97,17 @@ export function LockScreen({ state, backoffMs = BACKOFF_MS }: LockScreenProps) {
     }
   };
 
+  const said = (refusal.length > 0 || backoff) && (
+    <div className="lock-refusal" role="alert">
+      {refusal.map((line, index) => (
+        // A fixed list per answer, replaced whole: the index is a stable key.
+        // biome-ignore lint/suspicious/noArrayIndexKey: see above
+        <p key={index}>{line}</p>
+      ))}
+      {backoff && <p>{BACKOFF_LINE}</p>}
+    </div>
+  );
+
   return (
     <main className="lock-screen">
       <div className="lock-column">
@@ -116,22 +128,19 @@ export function LockScreen({ state, backoffMs = BACKOFF_MS }: LockScreenProps) {
             account={info.account}
             checking={waiting}
             backoff={backoff}
+            refused={refusal.length > 0}
+            onType={() => setRefusal((lines) => (lines.length === 0 ? lines : []))}
             onSubmit={onPassword}
-          />
+          >
+            {said}
+          </PasswordForm>
         ) : (
-          <Button variant="primary" size={36} full disabled={waiting} onClick={onUnlock}>
-            {waiting && method !== null ? `Waiting for ${authPrompt(method)}…` : 'Unlock'}
-          </Button>
-        )}
-        {(refusal.length > 0 || backoff) && (
-          <div className="lock-refusal" role="alert">
-            {refusal.map((line, index) => (
-              // A fixed list per answer, replaced whole: the index is a stable key.
-              // biome-ignore lint/suspicious/noArrayIndexKey: see above
-              <p key={index}>{line}</p>
-            ))}
-            {backoff && <p>{BACKOFF_LINE}</p>}
-          </div>
+          <>
+            <Button variant="primary" size={36} full disabled={waiting} onClick={onUnlock}>
+              {waiting && method !== null ? `Waiting for ${authPrompt(method)}…` : 'Unlock'}
+            </Button>
+            {said}
+          </>
         )}
         {info.testBuild && <Tag tone="warn">TEST BUILD</Tag>}
       </div>
@@ -146,14 +155,27 @@ interface PasswordFormProps {
   checking: boolean;
   /** Too many failed attempts: the field waits. */
   backoff: boolean;
+  /** The last attempt was refused: the field is marked (aria-invalid) until the owner types. */
+  refused: boolean;
+  onType: () => void;
   onSubmit: (password: string) => Promise<void>;
+  /** What the refusal says, under the field. */
+  children: ReactNode;
 }
 
 /**
- * The field and its arrow (the design's lock screen). Its own component, so the password state
- * goes with it whenever the field does.
+ * The field, its arrow and what a refusal says under them (the design's lock screen). Its own
+ * component, so the password state goes with it whenever the field does.
  */
-function PasswordForm({ account, checking, backoff, onSubmit }: PasswordFormProps) {
+function PasswordForm({
+  account,
+  checking,
+  backoff,
+  refused,
+  onType,
+  onSubmit,
+  children,
+}: PasswordFormProps) {
   const input = useRef<HTMLInputElement>(null);
   const [password, setPassword] = useState('');
   const blocked = checking || backoff;
@@ -171,33 +193,40 @@ function PasswordForm({ account, checking, backoff, onSubmit }: PasswordFormProp
   };
 
   return (
-    <form className="lock-password" onSubmit={submit}>
-      <PasswordField
-        ref={input}
-        label="Account password"
-        placeholder={`Password for ${account}`}
-        value={password}
-        onChange={setPassword}
-        mono={false}
-        background="surface"
-        readOnly={checking}
-        disabled={backoff}
-      />
-      <Button
-        type="submit"
-        variant="primary"
-        size={36}
-        aria-label="Unlock"
-        title="Unlock"
-        aria-busy={checking || undefined}
-        disabled={password === '' || blocked}
-      >
-        {checking ? (
-          <SpinnerGapIcon className="spin" aria-hidden="true" />
-        ) : (
-          <ArrowRightIcon aria-hidden="true" />
-        )}
-      </Button>
-    </form>
+    <div className="lock-password">
+      <form className="lock-password-row" onSubmit={submit}>
+        <PasswordField
+          ref={input}
+          label="Account password"
+          placeholder={`Password for ${account}`}
+          value={password}
+          onChange={(value) => {
+            setPassword(value);
+            onType();
+          }}
+          mono={false}
+          background="surface"
+          readOnly={checking}
+          disabled={backoff}
+          aria-invalid={refused || undefined}
+        />
+        <Button
+          type="submit"
+          variant="primary"
+          size={36}
+          aria-label="Unlock"
+          title="Unlock"
+          aria-busy={checking || undefined}
+          disabled={password === '' || blocked}
+        >
+          {checking ? (
+            <SpinnerGapIcon className="spin" aria-hidden="true" />
+          ) : (
+            <ArrowRightIcon aria-hidden="true" />
+          )}
+        </Button>
+      </form>
+      {children}
+    </div>
   );
 }

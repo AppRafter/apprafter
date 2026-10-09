@@ -195,6 +195,20 @@ describe('LockScreen where the OS cannot prompt: the password field', () => {
     expect(screen.queryByRole('alert')).toBeNull();
   });
 
+  test('a refusal marks the field until the owner types again, and sits under it', async () => {
+    passwordAnswer = () => refusal(DESKTOP_ERROR_CODES.AUTH_FAILED, { exhausted: false });
+    const user = lockScreen(lockState(), PAM);
+    expect(passwordInput().getAttribute('aria-invalid')).toBeNull();
+    await user.keyboard('guess{Enter}');
+    const alert = await screen.findByRole('alert');
+    expect(passwordInput().getAttribute('aria-invalid')).toBe('true');
+    // Under the field, in its block, as the design has it.
+    expect(alert.closest('.lock-password')).not.toBeNull();
+    await user.keyboard('h');
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(passwordInput().getAttribute('aria-invalid')).toBeNull();
+  });
+
   test('…and when the OS said nothing, that the password is not right', async () => {
     passwordAnswer = () => refusal(DESKTOP_ERROR_CODES.AUTH_FAILED, { exhausted: false });
     const user = lockScreen(lockState(), PAM);

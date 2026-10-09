@@ -623,13 +623,22 @@
   font: 400 var(--fs-11-5) var(--font-mono);
 }
 
-/* The password field and its arrow on one line, as the design has them: 36px, the arrow square. */
+/*
+ * The password field and its arrow on one line, as the design has them: 36px, the arrow square;
+ * what a refusal says just under them, at the left.
+ */
 .lock-password {
   display: flex;
-  align-items: flex-end;
+  flex-direction: column;
   gap: 6px;
   width: 100%;
   text-align: left;
+}
+
+.lock-password-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 6px;
 }
 
 .lock-password .field {
@@ -639,6 +648,10 @@
 
 .lock-password .input {
   height: var(--h-36);
+}
+
+.lock-password .input[aria-invalid="true"] {
+  border-color: var(--err);
 }
 
 .lock-password .field-trailing {
