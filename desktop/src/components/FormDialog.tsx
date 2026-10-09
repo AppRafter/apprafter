@@ -33,6 +33,11 @@ export type FormField = {
       readonly type?: 'text' | 'password';
       readonly def?: string;
       readonly placeholder?: string;
+      /**
+       * What is wrong with a non-empty value, or null: shown in place of the hint, and the
+       * submit waits until it is fixed.
+       */
+      readonly check?: (value: string) => string | null;
     }
   | { readonly kind: 'seg'; readonly options: readonly Opt[]; readonly def?: string }
   | {
@@ -92,9 +97,19 @@ export function FormDialog({
   const [error, setError] = useState<UiError | null>(null);
 
   const visible = fields.filter((field) => field.when === undefined || field.when(values));
-  const blocked = visible.some(
-    (field) => required.includes(field.key) && missing(values[field.key]),
-  );
+  const problems = new Map<string, string>();
+  for (const field of visible) {
+    if ((field.kind ?? 'text') !== 'text' || !('check' in field) || field.check === undefined) {
+      continue;
+    }
+    const value = values[field.key];
+    if (typeof value !== 'string' || value === '') continue;
+    const problem = field.check(value);
+    if (problem !== null) problems.set(field.key, problem);
+  }
+  const blocked =
+    problems.size > 0 ||
+    visible.some((field) => required.includes(field.key) && missing(values[field.key]));
   const set = (key: string, value: FormValue) => setValues({ ...values, [key]: value });
 
   const send = async (event: FormEvent) => {
@@ -140,6 +155,7 @@ export function FormDialog({
               id={`${id}-${field.key}`}
               field={field}
               value={values[field.key]}
+              problem={problems.get(field.key) ?? null}
               onChange={(value) => set(field.key, value)}
             />
           ))}
@@ -167,11 +183,14 @@ function Field({
   id,
   field,
   value,
+  problem,
   onChange,
 }: {
   id: string;
   field: FormField;
   value: FormValue;
+  /** What the field's check said of its value; text fields only. */
+  problem: string | null;
   onChange: (value: FormValue) => void;
 }) {
   const hint =
@@ -240,12 +259,14 @@ function Field({
         </div>
       );
     default: {
+      const hintText = problem ?? field.hint;
       const text = {
         label: field.label,
         value: typeof value === 'string' ? value : '',
         onChange: (next: string) => onChange(next),
         ...(field.placeholder !== undefined && { placeholder: field.placeholder }),
-        ...(field.hint !== undefined && { hint: field.hint }),
+        ...(hintText !== undefined && { hint: hintText }),
+        ...(problem !== null && { 'aria-invalid': true as const }),
       };
       return field.type === 'password' ? <PasswordField {...text} /> : <TextField {...text} />;
     }

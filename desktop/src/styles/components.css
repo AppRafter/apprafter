@@ -684,6 +684,15 @@
   font-size: var(--fs-12);
 }
 
+/* A value a field's check refuses: the hint says why (FormDialog). */
+.input[aria-invalid="true"] {
+  border-color: var(--err);
+}
+
+.field:has(.input[aria-invalid="true"]) .field-hint {
+  color: var(--err);
+}
+
 /* Modal, FormDialog, ConfirmDialog, InfoSheet --------------------------------------------- */
 
 /* Fills its positioned parent: the tab's overlay host, or the app's for Settings. */

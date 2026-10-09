@@ -94,6 +94,58 @@ describe('FormDialog', () => {
     expect(submit().disabled).toBe(true);
   });
 
+  test('a field check blocks the submit and says why, in place of the hint', async () => {
+    const onSubmit = mock();
+    render(
+      <FormDialog
+        title="Rename target"
+        fields={[
+          {
+            key: 'to',
+            label: 'New name',
+            hint: 'Letters, digits and dashes',
+            check: (v) => (v.includes(' ') ? 'No spaces.' : null),
+          },
+        ]}
+        required={['to']}
+        onSubmit={onSubmit}
+        onClose={() => {}}
+      />,
+    );
+    const user = userEvent.setup();
+    const input = screen.getByLabelText('New name');
+    expect(input.getAttribute('aria-invalid')).toBeNull();
+    await user.type(input, 'a b');
+    expect(screen.getByText('No spaces.')).toBeDefined();
+    expect(screen.queryByText('Letters, digits and dashes')).toBeNull();
+    expect(input.getAttribute('aria-invalid')).toBe('true');
+    expect(submit().disabled).toBe(true);
+    await user.clear(input);
+    await user.type(input, 'ab');
+    expect(screen.queryByText('No spaces.')).toBeNull();
+    expect(screen.getByText('Letters, digits and dashes')).toBeDefined();
+    expect(input.getAttribute('aria-invalid')).toBeNull();
+    expect(submit().disabled).toBe(false);
+    await user.click(submit());
+    expect(onSubmit).toHaveBeenCalledWith({ to: 'ab' });
+  });
+
+  test('a check is asked only of a non-empty value; an optional field with a problem still blocks', async () => {
+    const check = mock((v: string) => (v === 'bad' ? 'Not that one.' : null));
+    const { user } = open({
+      fields: [
+        { key: 'name', label: 'Name', def: 'x' },
+        { key: 'token', label: 'Token', type: 'password', check },
+      ],
+    });
+    expect(check).not.toHaveBeenCalled();
+    expect(submit().disabled).toBe(false);
+    await user.type(screen.getByLabelText('Token'), 'bad');
+    expect(screen.getByText('Not that one.')).toBeDefined();
+    expect(screen.getByLabelText('Token').getAttribute('aria-invalid')).toBe('true');
+    expect(submit().disabled).toBe(true);
+  });
+
   test('a password field reveals its own value only', async () => {
     const { user } = open({
       fields: [
