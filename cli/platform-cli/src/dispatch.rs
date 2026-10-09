@@ -9,6 +9,7 @@
 use crate::cli::{
     AppCommand, AutoscaleCommand, BackupAction, Cli, Commands, EgressCommand, EnvCommand,
     MigrationCommand, OpenUi, PlatformCommand, RepoCommand, RepoCredsCommand, SecretCommand,
+    TargetCommand,
 };
 use crate::commands;
 
@@ -17,7 +18,12 @@ use crate::commands;
 /// mapped once. D.3b adds `Whoami`, D.3c `Doctor`.
 pub(crate) fn dispatch(args: Cli) -> miette::Result<()> {
     match args.command {
-        Commands::Target { action } => commands::target::run(action),
+        Commands::Target { action } => match action {
+            TargetCommand::List => commands::target::list(),
+            TargetCommand::Show { name } => commands::target::show(name.as_deref()),
+            // `cert`, `domain`, `firewall` and `ip`.
+            other => commands::target::run(other),
+        },
         command => dispatch_cli(Cli { command }).map_err(miette::Report::new),
     }
 }

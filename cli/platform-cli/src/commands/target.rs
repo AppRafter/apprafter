@@ -17,6 +17,7 @@
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
+use apprafter_core::target::{self as core_target, CliDefaultPointer, TargetReport};
 use apprafter_core::{CancellationToken, TargetRef};
 use cli_core::target::{
     default_config_root, list_target_names, load_global_config, load_target, remove_target,
@@ -52,8 +53,9 @@ pub const MAX_TARGET_NAME_LEN: usize = 64;
 /// instead of saving a half-working config.
 pub const SUPPORTED_PROVIDERS: &[&str] = &["hetzner-cloud"];
 
-/// `apprafter target …`. `ip` runs on apprafter-core and renders its own errors
-/// ([`crate::render::core_error::report`]); every other sub-command is today's code, its
+/// `apprafter target …` for the sub-commands `dispatch` does not route to a core-backed arm.
+/// `ip` runs on apprafter-core and renders its own errors
+/// ([`crate::render::core_error::report`]); every other sub-command here is today's code, its
 /// `CliError` mapped at this boundary.
 pub fn run(action: TargetCommand) -> miette::Result<()> {
     match action {
@@ -85,9 +87,7 @@ pub fn run(action: TargetCommand) -> miette::Result<()> {
             server_type,
         })
         .map_err(miette::Report::new),
-        TargetCommand::List => run_list().map_err(miette::Report::new),
         TargetCommand::Use { name } => run_use(&name).map_err(miette::Report::new),
-        TargetCommand::Show { name } => run_show(name.as_deref()).map_err(miette::Report::new),
         TargetCommand::Rename { from, to } => run_rename(&from, &to).map_err(miette::Report::new),
         TargetCommand::Remove { name, yes } => run_remove(&name, yes).map_err(miette::Report::new),
         TargetCommand::Cert { action } => run_cert(action).map_err(miette::Report::new),
@@ -110,6 +110,9 @@ pub fn run(action: TargetCommand) -> miette::Result<()> {
             },
         )
         .map_err(miette::Report::new),
+        TargetCommand::List | TargetCommand::Show { .. } => {
+            unreachable!("`dispatch` runs this sub-command on the core")
+        }
     }
 }
 
@@ -697,6 +700,7 @@ fn ensure_active_target(paths: &TargetStorePaths, name: &str) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use apprafter_core::target::{ProvisionedState, TokenPresence};
 
     // ── the store lock: what a wait and a lock-less store print ──────────
 
@@ -1081,17 +1085,87 @@ mod tests {
         );
     }
 
+    // ── list / show over the core's reports ──────────────────────────────
+
+    fn report_with(name: &str, active: bool) -> TargetReport {
+        TargetReport {
+            name: name.into(),
+            is_cli_default: active,
+            provider: "hetzner-cloud".into(),
+            region: Some("nbg1".into()),
+            server_type: None,
+            default_tier: Some("solo".into()),
+            tier_level: Some(1),
+            cluster_name: None,
+            ssh_key: None,
+            token: TokenPresence {
+                set: true,
+                chars: Some(64),
+            },
+            config_file: "/s/targets/p/config.yaml".into(),
+            credentials_file: "/s/targets/p/credentials.yaml".into(),
+            provisioned: ProvisionedState::NotProvisioned,
+        }
+    }
+
+    /// Today's `target show` layout, line by line. The report carries the token's length, never
+    /// its bytes, so the summary cannot echo it.
     #[test]
-    fn token_summary_renders_set_or_not_set_without_leaking_bytes() {
-        assert_eq!(token_summary(None), "not set");
-        let summary = token_summary(Some("aaaaaaaaaaaaaaaa"));
-        assert!(summary.contains("set"), "{summary}");
-        assert!(summary.contains("16 chars"), "{summary}");
-        // No literal token bytes in the rendered string.
-        assert!(
-            !summary.contains("aaaaaaaaaaaaaaaa"),
-            "summary must not echo the token: {summary}"
+    fn show_lines_match_todays_layout() {
+        let lines = show_lines(&report_with("prod", true));
+        assert_eq!(lines[0], "Target: prod (active)");
+        assert_eq!(lines[1], "  Provider:    hetzner-cloud");
+        assert_eq!(lines[2], "  Region:      nbg1");
+        assert_eq!(lines[3], "  Server type: not set");
+        assert_eq!(lines[4], "  Default tier: solo");
+        assert_eq!(lines[5], "  Cluster name: not set");
+        assert_eq!(lines[6], "  SSH key:     not set");
+        assert_eq!(
+            lines[7],
+            "  Hetzner token: set (64 chars; read credentials.yaml for the raw value)"
         );
+        assert_eq!(lines[8], "");
+        assert_eq!(lines[9], "Config:      /s/targets/p/config.yaml");
+        assert_eq!(
+            lines.last().unwrap(),
+            "Credentials: /s/targets/p/credentials.yaml (mode 0600)"
+        );
+        assert_eq!(lines.len(), 11);
+
+        let inactive = TargetReport {
+            ssh_key: Some(apprafter_core::ssh::SshKeyInfo {
+                path: "/h/.ssh/k.pub".into(),
+                display: "~/.ssh/k.pub".into(),
+                exists: true,
+                algo: None,
+            }),
+            token: TokenPresence {
+                set: false,
+                chars: None,
+            },
+            ..report_with("other", false)
+        };
+        let lines = show_lines(&inactive);
+        assert_eq!(lines[0], "Target: other");
+        assert_eq!(lines[6], "  SSH key:     /h/.ssh/k.pub");
+        assert_eq!(lines[7], "  Hetzner token: not set");
+    }
+
+    #[test]
+    fn the_list_footer_uses_the_pointer_even_when_it_dangles() {
+        assert_eq!(
+            list_pointer_name(&CliDefaultPointer::Missing {
+                name: "gone".into()
+            }),
+            "gone"
+        );
+        assert_eq!(
+            list_pointer_name(&CliDefaultPointer::Set {
+                name: "prod".into()
+            }),
+            "prod"
+        );
+        assert_eq!(list_pointer_name(&CliDefaultPointer::Unset), "");
     }
 
     // ── merge_wizard_output ──────────────────────────────────────────────
@@ -1495,52 +1569,54 @@ pub(crate) fn ip_report_lines(v4: Option<&str>, v6: Option<&str>) -> Vec<String>
     lines
 }
 
-fn run_list() -> Result<()> {
+/// `target list` on the core's report. A target whose `config.yaml` cannot be read stays a
+/// tracing warning here (R7) — the desktop shows it as a row.
+pub(crate) fn list() -> miette::Result<()> {
     info!("target list invoked");
-    let paths = TargetStorePaths::for_root(default_config_root()?);
-    let names = list_target_names(&paths)?;
-    if names.is_empty() {
+    let ctx = crate::context::cli_context()?;
+    let r = core_target::list(&ctx).map_err(report)?;
+    for u in &r.unreadable {
+        tracing::warn!(target = %u.name, error = %u.error.message, "skipping unreadable target in list");
+    }
+    if r.targets.is_empty() && r.unreadable.is_empty() {
         println!(
             "No targets configured. Run `apprafter target add` to create one — or `apprafter target add <name>` to skip the wizard's name prompt."
         );
         return Ok(());
     }
-    let active = load_global_config(&paths)?
-        .map(|g| g.active_target)
-        .unwrap_or_default();
-
-    let mut rows: Vec<TargetListRow> = Vec::with_capacity(names.len());
-    for name in &names {
-        // load_target needs both config.yaml and (optionally)
-        // credentials.yaml. We only care about config here; if
-        // either file is broken we skip the row with a tracing
-        // warning rather than erroring out the whole listing.
-        let cfg = match load_target(&paths, name) {
-            Ok(t) => t.config,
-            Err(e) => {
-                tracing::warn!(target = %name, error = %e, "skipping unreadable target in list");
-                continue;
-            }
-        };
-        rows.push(TargetListRow {
-            active: if *name == active {
+    let rows: Vec<TargetListRow> = r
+        .targets
+        .iter()
+        .map(|t| TargetListRow {
+            active: if t.is_cli_default {
                 "*".into()
             } else {
                 String::new()
             },
-            name: name.clone(),
-            provider: cfg.provider,
-            region: cfg.region.unwrap_or_else(|| "-".into()),
-            tier: cfg.default_tier.unwrap_or_else(|| "-".into()),
-        });
-    }
-
+            name: t.name.clone(),
+            provider: t.provider.clone(),
+            region: t.region.clone().unwrap_or_else(|| "-".into()),
+            tier: t.default_tier.clone().unwrap_or_else(|| "-".into()),
+        })
+        .collect();
     let mut table = Table::new(&rows);
     table.with(Style::sharp());
     println!("{table}");
     println!();
-    println!("{}", list_summary_line(rows.len(), &active));
+    println!(
+        "{}",
+        list_summary_line(rows.len(), list_pointer_name(&r.cli_default))
+    );
     Ok(())
+}
+
+/// The name the list footer shows as active: the pointer's value even when it dangles (today's
+/// footer), empty when there is none.
+pub(crate) fn list_pointer_name(p: &CliDefaultPointer) -> &str {
+    match p {
+        CliDefaultPointer::Unset => "",
+        CliDefaultPointer::Set { name } | CliDefaultPointer::Missing { name } => name,
+    }
 }
 
 /// Footer under `target list`.
@@ -1608,60 +1684,56 @@ pub(crate) fn switched_active_line(previous: &str, name: &str) -> String {
     }
 }
 
-fn run_show(name: Option<&str>) -> Result<()> {
-    let paths = TargetStorePaths::for_root(default_config_root()?);
-    let active = load_global_config(&paths)?
-        .map(|g| g.active_target)
-        .unwrap_or_default();
-
-    let resolved = resolve_show_target(name, &active)?;
+/// `target show` on the core's report. The name is resolved here first, for the `info!` line
+/// (decision 5): the explicit one, else the CLI default.
+pub(crate) fn show(name: Option<&str>) -> miette::Result<()> {
+    let ctx = crate::context::cli_context()?;
+    let pointer =
+        cli_core::resolve_active_target_name(&ctx.store(), None).map_err(miette::Report::new)?;
+    let resolved =
+        resolve_show_target(name, pointer.as_deref().unwrap_or("")).map_err(miette::Report::new)?;
     info!(target = %resolved, "target show invoked");
-    let target = load_target(&paths, &resolved)?;
-
-    let is_active = resolved == active;
-    let active_marker = if is_active { " (active)" } else { "" };
-
-    println!("Target: {resolved}{active_marker}");
-    println!("  Provider:    {}", target.config.provider);
-    println!(
-        "  Region:      {}",
-        target.config.region.as_deref().unwrap_or("not set")
-    );
-    println!(
-        "  Server type: {}",
-        target.config.server_type.as_deref().unwrap_or("not set")
-    );
-    println!(
-        "  Default tier: {}",
-        target.config.default_tier.as_deref().unwrap_or("not set")
-    );
-    println!(
-        "  Cluster name: {}",
-        target.config.cluster_name.as_deref().unwrap_or("not set")
-    );
-    println!(
-        "  SSH key:     {}",
-        target
-            .config
-            .ssh_key_path
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "not set".to_string())
-    );
-    println!(
-        "  Hetzner token: {}",
-        token_summary(target.credentials.hetzner_token.as_deref())
-    );
-    println!();
-    println!(
-        "Config:      {}",
-        paths.target_config_file(&resolved).display()
-    );
-    println!(
-        "Credentials: {} (mode 0600)",
-        paths.target_credentials_file(&resolved).display()
-    );
+    let tref = TargetRef::named(&ctx, &resolved).map_err(report)?;
+    for line in show_lines(&core_target::show(&ctx, &tref).map_err(report)?) {
+        println!("{line}");
+    }
     Ok(())
+}
+
+/// The lines `target show` prints. The token is summarised by its length — the report never
+/// carries its bytes; read `credentials.yaml` for the raw value.
+pub(crate) fn show_lines(r: &TargetReport) -> Vec<String> {
+    let or = |v: &Option<String>| v.clone().unwrap_or_else(|| "not set".into());
+    vec![
+        format!(
+            "Target: {}{}",
+            r.name,
+            if r.is_cli_default { " (active)" } else { "" }
+        ),
+        format!("  Provider:    {}", r.provider),
+        format!("  Region:      {}", or(&r.region)),
+        format!("  Server type: {}", or(&r.server_type)),
+        format!("  Default tier: {}", or(&r.default_tier)),
+        format!("  Cluster name: {}", or(&r.cluster_name)),
+        format!(
+            "  SSH key:     {}",
+            r.ssh_key
+                .as_ref()
+                .map_or_else(|| "not set".into(), |k| k.path.clone())
+        ),
+        format!(
+            "  Hetzner token: {}",
+            match r.token.chars {
+                Some(n) if r.token.set => {
+                    format!("set ({n} chars; read credentials.yaml for the raw value)")
+                }
+                _ => "not set".into(),
+            }
+        ),
+        String::new(),
+        format!("Config:      {}", r.config_file),
+        format!("Credentials: {} (mode 0600)", r.credentials_file),
+    ]
 }
 
 /// Which target `target show` displays: the explicit name, else the active
@@ -1920,18 +1992,4 @@ pub(crate) fn cert_import_lines(
         "(How to mint a Cloudflare Origin CA cert: docs → Public ingress → Cloudflare Origin CA cert.)"
             .to_string(),
     ]
-}
-
-/// One-line summary of a stored token suitable for `target show`.
-/// We intentionally do NOT echo any of the token bytes — even the
-/// last 4 chars are identifying. The user reads
-/// `credentials.yaml` directly when they need the raw value.
-fn token_summary(token: Option<&str>) -> String {
-    match token {
-        None => "not set".to_string(),
-        Some(t) => format!(
-            "set ({} chars; read credentials.yaml for the raw value)",
-            t.len()
-        ),
-    }
 }
