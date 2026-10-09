@@ -230,6 +230,29 @@ describe('Wizard focus', () => {
     expect(document.activeElement).toBe(field);
   });
 
+  test("a control that goes while it has the focus hands it to the step's first control", async () => {
+    const { user, update } = stepping({
+      children: (
+        <>
+          <button type="button">Use another token</button>
+          <input aria-label="Field" />
+        </>
+      ),
+    });
+    await user.click(button('Use another token'));
+    update({ children: <input aria-label="Field" /> });
+    expect(document.activeElement).toBe(screen.getByLabelText('Field'));
+  });
+
+  test('…and with no control left in the step, to the dialog, never the page', async () => {
+    const { user, update } = stepping({
+      children: <button type="button">Try again</button>,
+    });
+    await user.click(button('Try again'));
+    update({ children: <p>Reading…</p> });
+    expect(document.activeElement).toBe(screen.getByRole('dialog', { name: 'Add target' }));
+  });
+
   test('a render that changes neither step nor busy leaves the focus alone', async () => {
     const { user, update } = stepping();
     await user.click(button('Continue'));

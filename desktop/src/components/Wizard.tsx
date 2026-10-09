@@ -9,7 +9,9 @@
 // step took it already. While busy, the focus moves to the dialog if busy disabled the control
 // that had it: a browser drops the focus of a control it disables onto the page, out of reach
 // of Esc and Tab. When busy ends, a focus parked on the dialog, or lost to the page, goes back
-// to the step. A polite status says which step is shown.
+// to the step. A control of the step that goes while it has the focus ("Use another token", a
+// Try again replaced by what it started) hands it to the step's first control, or the dialog. A
+// polite status says which step is shown.
 import { type FormEvent, type ReactNode, useId, useLayoutEffect, useRef } from 'react';
 import { Button } from './Button';
 import { IconButton } from './IconButton';
@@ -61,6 +63,8 @@ export function Wizard({
   const id = useId();
   const bodyRef = useRef<HTMLDivElement>(null);
   const before = useRef({ step, busy });
+  /** The control of the frame that last had the focus. */
+  const held = useRef<HTMLElement | null>(null);
 
   useLayoutEffect(() => {
     const was = before.current;
@@ -79,6 +83,20 @@ export function Wizard({
     if (was.step !== step ? !inBody : was.busy && parked) (firstStop(body) ?? panel).focus();
   }, [step, busy]);
 
+  // After every render: the control that had the focus is gone, and the focus fell out of the
+  // dialog (a browser drops it onto the page). Not while another dialog covers this one.
+  useLayoutEffect(() => {
+    const was = held.current;
+    if (was === null || was.isConnected) return;
+    held.current = null;
+    const active = document.activeElement;
+    if (active instanceof HTMLElement && active !== document.body && active.isConnected) return;
+    const body = bodyRef.current;
+    const panel = body?.closest<HTMLElement>('[role="dialog"]') ?? null;
+    if (body === null || panel === null || panel.closest('[inert]') !== null) return;
+    (firstStop(body) ?? panel).focus();
+  });
+
   const submit = (event: FormEvent) => {
     event.preventDefault();
     if (!nextDisabled && !busy) onNext();
@@ -93,7 +111,14 @@ export function Wizard({
       onClose={onClose}
       closable={!busy}
     >
-      <form className="wizard" onSubmit={submit} aria-busy={busy || undefined}>
+      <form
+        className="wizard"
+        onSubmit={submit}
+        onFocus={(event) => {
+          held.current = event.target;
+        }}
+        aria-busy={busy || undefined}
+      >
         <div className="modal-head wizard-head">
           <h2 className="modal-title wizard-title" id={`${id}-title`}>
             {title}

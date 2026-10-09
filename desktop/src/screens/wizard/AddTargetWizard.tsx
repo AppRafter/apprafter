@@ -4,7 +4,7 @@
 // as a draft and the field is emptied (decision 6). The catalogue and the plan name the draft.
 // No Paste (no clipboard read, R11), no --force, no --no-ping (decision 8), no provisioning (D.12).
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { useEffect, useReducer, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useReducer, useRef, useState } from 'react';
 import { Button } from '../../components/Button';
 import { ChoiceCardGroup } from '../../components/ChoiceCardGroup';
 import { ErrorPanel } from '../../components/ErrorPanel';
@@ -134,7 +134,16 @@ export function AddTargetWizard({ onClose }: { onClose: () => void }) {
     catalogueRead.reset();
     latencyRead.reset();
   };
+  // "Use another token" goes with the line it is on: the focus goes to the token field it brings.
+  const tokenField = useRef<HTMLInputElement>(null);
+  const focusToken = useRef(false);
+  useLayoutEffect(() => {
+    if (!focusToken.current || tokenField.current === null) return;
+    focusToken.current = false;
+    tokenField.current.focus();
+  });
   const takeAnotherToken = () => {
+    focusToken.current = true;
     if (state.draft !== null) discardDraft(state.draft);
     verify.reset();
     resetReads();
@@ -356,6 +365,7 @@ export function AddTargetWizard({ onClose }: { onClose: () => void }) {
       />
       {state.draft === null ? (
         <PasswordField
+          ref={tokenField}
           label="API token"
           placeholder={`${HETZNER_TOKEN_LEN} characters`}
           value={state.token}

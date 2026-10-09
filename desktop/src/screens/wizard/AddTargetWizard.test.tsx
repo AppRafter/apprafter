@@ -123,6 +123,18 @@ describe('provider and token', () => {
     expect(screen.getByLabelText('API token')).toBeDefined();
   });
 
+  test('"Use another token" by keyboard puts the focus in the token field, not the page', async () => {
+    h.read('op_start_verify_token', [completed({ draftId: 7, elapsedMs: 182 })]);
+    const { user } = renderWizard();
+    await user.type(screen.getByLabelText('API token'), TOKEN);
+    await user.click(screen.getByRole('button', { name: 'Verify and continue' }));
+    await waitFor(() => expect(currentStep()).toContain('Machine'));
+    await user.click(screen.getByRole('button', { name: 'Back' }));
+    screen.getByRole('button', { name: 'Use another token' }).focus();
+    await user.keyboard('{Enter}');
+    expect(document.activeElement).toBe(screen.getByLabelText('API token'));
+  });
+
   test('while verifying the frame is busy: Close and Next wait', async () => {
     h.read('op_start_verify_token', []); // keeps running
     const { user } = renderWizard();
@@ -235,6 +247,24 @@ describe('machine step', () => {
     await toMachine(user, []); // the queued read is never used: the answer wins
     expect(await screen.findByText(DRAFT_GONE)).toBeDefined();
     expect((screen.getByLabelText('API token') as HTMLInputElement).value).toBe('');
+  });
+
+  test('Try again keeps the focus in the dialog, so Esc still closes it', async () => {
+    const { user, onClose } = renderWizard();
+    await toMachine(user, [
+      failed(
+        uiError('apprafter::provider::request_failed', 'the Hetzner Cloud API did not answer'),
+      ),
+    ]);
+    const again = await screen.findByRole('button', { name: 'Try again' });
+    h.read('op_start_machine_catalogue', []); // keeps reading: the step has no control meanwhile
+    again.focus();
+    await user.keyboard('{Enter}');
+    expect(await screen.findByText("Reading the provider's catalogue…")).toBeDefined();
+    const dialog = screen.getByRole('dialog', { name: 'Add target' });
+    expect(dialog.contains(document.activeElement)).toBe(true);
+    await user.keyboard('{Escape}');
+    expect(onClose).toHaveBeenCalledTimes(1);
   });
 
   test('another catalogue failure shows its message, and Try again reads again', async () => {
