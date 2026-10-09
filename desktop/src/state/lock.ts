@@ -1,20 +1,24 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 // The lock as the page knows it. Rust is authoritative: the ['lock'] query holds its LockState,
 // fed by lock_status, by every `lock-changed` event, and by the answers of lock_now and unlock.
-// An answer and its event carry the same state and land on the same entry, so the order they
-// reach the page in changes nothing.
 //
-// At startup nothing may slip between the read and the listener: the `lock-changed` listener is
-// registered first, and lock_status is asked only then. An event can still land while that
-// answer is on its way; of the two the newer state wins, by `sinceMs` (when that state began),
-// and on a tie — the same state, seen twice — the answer.
+// Never back to an older state: wherever the entry is written, a state that began (`sinceMs`)
+// before the one held is dropped; on a tie — the same state seen twice, or a change within it
+// such as its auto-lock minutes — the one arriving is taken. So an answer and its event land in
+// either order, and an unlock's answer that a later lock overtook changes nothing.
+//
+// Nothing missed: lock_status is asked only once the `lock-changed` listener is in place, and
+// every registration is followed by a read — the first one releases the query's own read, any
+// later one (a remount) reads again — since what changed while nothing listened is heard of no
+// other way. Under StrictMode's double mount, the registration its cleanup drops releases
+// nothing: the read waits for the one that stays.
 import {
   type QueryClient,
   type UseQueryResult,
   useQuery,
   useQueryClient,
 } from '@tanstack/react-query';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo } from 'react';
 import { lockNow, lockStatus, unlock } from '../ipc/api';
 import { onLockChanged } from '../ipc/events';
 import type { LockState } from '../ipc/generated/LockState';
@@ -27,39 +31,78 @@ export const ACTIVITY_INTERVAL_MS = 30_000;
 /** What the lock screen itself reads; a lock removes every other query (spec §4.3). */
 const KEPT_WHILE_LOCKED: ReadonlySet<unknown> = new Set(['lock', 'settings', 'app-info']);
 
+/** `incoming`, unless it began before `held`. */
+function newer(held: LockState | undefined, incoming: LockState): LockState {
+  return held !== undefined && incoming.sinceMs < held.sinceMs ? held : incoming;
+}
+
+/** Writes `state` to the entry, unless the entry holds a newer one. */
+function write(client: QueryClient, state: LockState): void {
+  client.setQueryData<LockState>(LOCK_KEY, (held) => newer(held, state));
+}
+
+/** Resolved by the first registration of a listener that stays; per query client. */
+interface FirstListener {
+  readonly promise: Promise<void>;
+  readonly resolve: () => void;
+  registered: boolean;
+}
+
+const firstListeners = new WeakMap<QueryClient, FirstListener>();
+
+function firstListenerOf(client: QueryClient): FirstListener {
+  let first = firstListeners.get(client);
+  if (first === undefined) {
+    let resolve!: () => void;
+    const promise = new Promise<void>((res) => (resolve = res));
+    first = { promise, resolve, registered: false };
+    firstListeners.set(client, first);
+  }
+  return first;
+}
+
 export function useLockState(): UseQueryResult<LockState> {
   const client = useQueryClient();
-  // Resolved once the listener is in place (or could not be): the read waits for it.
-  const [listening] = useState(() => {
-    let ready!: () => void;
-    const promise = new Promise<void>((resolve) => (ready = resolve));
-    return { promise, ready };
-  });
   const query = useQuery({
     queryKey: LOCK_KEY,
     queryFn: async () => {
-      await listening.promise;
+      await firstListenerOf(client).promise;
       const answer = await lockStatus();
-      const heard = client.getQueryData<LockState>(LOCK_KEY);
-      return heard !== undefined && heard.sinceMs > answer.sinceMs ? heard : answer;
+      return newer(client.getQueryData<LockState>(LOCK_KEY), answer);
     },
     staleTime: Infinity,
   });
   useEffect(() => {
     let mounted = true;
     let off: (() => void) | undefined;
-    onLockChanged((state) => client.setQueryData(LOCK_KEY, state))
+    // In place (or it could not be, and the read must not wait for ever): read, now or again.
+    const listening = () => {
+      const first = firstListenerOf(client);
+      if (!first.registered) {
+        first.registered = true;
+        first.resolve();
+      } else {
+        void client.refetchQueries({ queryKey: LOCK_KEY });
+      }
+    };
+    onLockChanged((state) => write(client, state))
       .then((unlisten) => {
-        if (mounted) off = unlisten;
-        else unlisten();
+        if (!mounted) {
+          unlisten();
+          return;
+        }
+        off = unlisten;
+        listening();
       })
-      .catch((error: unknown) => console.error('lock-changed is not heard:', error))
-      .finally(listening.ready);
+      .catch((error: unknown) => {
+        console.error('lock-changed is not heard:', error);
+        if (mounted) listening();
+      });
     return () => {
       mounted = false;
       off?.();
     };
-  }, [client, listening]);
+  }, [client]);
   return query;
 }
 
@@ -69,10 +112,10 @@ export function useLockActions(): { lock: () => Promise<void>; unlock: () => Pro
   return useMemo(
     () => ({
       lock: async () => {
-        client.setQueryData(LOCK_KEY, await lockNow());
+        write(client, await lockNow());
       },
       unlock: async () => {
-        client.setQueryData(LOCK_KEY, await unlock());
+        write(client, await unlock());
       },
     }),
     [client],
