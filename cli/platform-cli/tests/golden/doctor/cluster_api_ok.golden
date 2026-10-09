@@ -1,19 +1,18 @@
-$ apprafter doctor
-[exit 1]
+$ apprafter doctor --no-ping
+[exit 0]
 [stdout]
 Checking target `prod`...
   ✓ Config file readable (<SANDBOX>/apprafter-config/targets/prod/config.yaml)
   ✓ Credentials file present (mode 0600) (<SANDBOX>/apprafter-config/targets/prod/credentials.yaml)
   ✓ Provider `hetzner-cloud` supported
   ✓ Token format valid (64 chars, alphanumeric)
-  ✗ Token verified against provider API (transport error talking to <HCLOUD>/v1/locations: <HCLOUD>/v1/locations: Connection Failed: Connect error: Connection refused (os error <N>))
-      hint: could not reach the provider API — check DNS / network / proxy, or rerun with `--no-ping` to skip this check
+  – Token verified against provider API (not requested)
   ✓ SSH key readable (<SANDBOX>/home/id_ed25519.pub (ssh-ed25519))
 
 Checking cluster...
-  – Kubeconfig cached (no provisioned server)
-  – Kube API reachable (no provisioned server)
-  – Node reachable over SSH (no provisioned server)
+  ✓ Kubeconfig cached (encrypted)
+  ✓ Kube API reachable (v1.31.0+k3s1 · <MS> ms)
+  – Node reachable over SSH (not requested)
 
 Checking environment...
   ⚠ `restic` on PATH
@@ -25,14 +24,7 @@ Install restic (>= 0.14):
   • Nix        nix profile install nixpkgs#restic
   • Windows    winget install restic.restic
   • other      https://restic.readthedocs.io/en/stable/020_installation.html
-  ✗ `kubectl` on PATH
-      hint: not found — needed for talking to the cluster.
-Install kubectl:
-  • macOS      brew install kubectl
-  • Debian     apt install kubectl
-  • Nix        nix profile install nixpkgs#kubectl
-  • Windows    winget install Kubernetes.kubectl
-  • other      https://kubernetes.io/docs/tasks/tools/
+  ✓ `kubectl` on PATH (Client Version: v1.31.0)
   ⚠ `helm` on PATH
       hint: not found — needed for installing platform charts.
 Install helm:
@@ -66,6 +58,6 @@ Install cue:
   • other      https://cuelang.org/docs/introduction/installation/
   ✓ DNS resolves `127.0.0.1` (443/tcp)
 
-13 checks for target `prod`: 6 passed, 5 warning(s), 2 FAIL — fix the FAILs and rerun `apprafter doctor`.
+14 checks for target `prod`: 9 passed, 5 warning(s). Ready to go; review warnings if they apply to your use case.
 [stderr]
-<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m doctor invoked <ESC>[3mno_ping<ESC>[0m<ESC>[2m=<ESC>[0mfalse
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m doctor invoked <ESC>[3mno_ping<ESC>[0m<ESC>[2m=<ESC>[0mtrue

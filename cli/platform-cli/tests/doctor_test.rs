@@ -12,8 +12,12 @@ use assert_cmd::Command;
 use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 
+/// `doctor` reaches beyond this machine (`startup.rs`), so without the bypass the startup
+/// checks would call the network from a test (overview §6.2).
 fn cli() -> Command {
-    Command::cargo_bin("apprafter").unwrap()
+    let mut cmd = Command::cargo_bin("apprafter").unwrap();
+    cmd.env("APPRAFTER_SKIP_STARTUP_CHECKS", "1");
+    cmd
 }
 
 mod common;
@@ -393,5 +397,94 @@ fn ctrl_c_stops_doctor_and_kills_the_tool_it_was_probing() {
     assert!(
         !stdout.contains("checks"),
         "an interrupted run prints no report:\n{stdout}"
+    );
+}
+
+#[test]
+fn doctor_prints_the_cluster_group_for_an_existing_target() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_target_with_ssh(dir.path(), None);
+    let tools = tools_on_path();
+    let out = cli()
+        .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_NO_PING", "1")
+        .env("APPRAFTER_HCLOUD_BASE_URL", "http://127.0.0.1:1")
+        .env("KUBECONFIG", "/nonexistent")
+        .env("PATH", tools.path())
+        .arg("doctor")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Checking cluster...\n"), "{stdout}");
+    for row in [
+        "  – Kubeconfig cached (no provisioned server)",
+        "  – Kube API reachable (no provisioned server)",
+        "  – Node reachable over SSH (no provisioned server)",
+    ] {
+        assert!(stdout.contains(row), "missing `{row}`:\n{stdout}");
+    }
+}
+
+/// Overview §3.11: the CLI moves a v0.1.153 `<cwd>/.apprafter/state.json` into the store
+/// before the core reads state, as every state-reading command does.
+#[test]
+fn doctor_migrates_a_legacy_cwd_state_before_reading_it() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_target_with_ssh(dir.path(), None);
+    let cwd = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(cwd.path().join(".apprafter")).unwrap();
+    std::fs::write(
+        cwd.path().join(".apprafter/state.json"),
+        r#"{"hetzner_cloud":{"server_id":9,"server_name":"legacy"}}"#,
+    )
+    .unwrap();
+    let tools = tools_on_path();
+    let out = cli()
+        .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_NO_PING", "1")
+        .env("APPRAFTER_HCLOUD_BASE_URL", "http://127.0.0.1:1")
+        .env("KUBECONFIG", "/nonexistent")
+        .env("PATH", tools.path())
+        .current_dir(cwd.path())
+        .arg("doctor")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("✗ Kubeconfig cached (none cached for server `legacy` (id 9))"),
+        "{stdout}"
+    );
+    assert!(dir
+        .path()
+        .join("state/default/.apprafter/state.json")
+        .exists());
+}
+
+/// Deviation 3: a missing target is a row, and doctor creates no state directory for it.
+#[test]
+fn doctor_of_a_missing_target_creates_no_state_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_target_with_ssh(dir.path(), None);
+    let cwd = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(cwd.path().join(".apprafter")).unwrap();
+    std::fs::write(
+        cwd.path().join(".apprafter/state.json"),
+        r#"{"hetzner_cloud":{"server_id":9,"server_name":"legacy"}}"#,
+    )
+    .unwrap();
+    cli()
+        .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_NO_PING", "1")
+        .env("APPRAFTER_HCLOUD_BASE_URL", "http://127.0.0.1:1")
+        .env("KUBECONFIG", "/nonexistent")
+        .current_dir(cwd.path())
+        .args(["doctor", "--target", "ghost"])
+        .assert()
+        .failure()
+        .stdout(contains("Target `ghost` exists"));
+    assert!(!dir.path().join("state/ghost").exists());
+    assert!(
+        cwd.path().join(".apprafter/state.json").exists(),
+        "the legacy file is left for a command on an existing target"
     );
 }

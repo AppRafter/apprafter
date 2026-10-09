@@ -21,9 +21,11 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 
 use apprafter_core::doctor::{self, DoctorArgs, DoctorTarget};
-use apprafter_core::{CancellationToken, CoreError};
+use apprafter_core::{CancellationToken, Context, CoreError};
+use cli_core::CliError;
 use tracing::info;
 
+use crate::commands::state_paths::resolve_state_paths;
 use crate::context::cli_context;
 use crate::render;
 
@@ -32,6 +34,7 @@ pub fn run(target_override: Option<&str>, no_ping: bool) -> miette::Result<()> {
     let cancel = CancellationToken::new();
     let interrupt = cancel_on_interrupt(&cancel);
     let ctx = cli_context()?.with_no_ping(no_ping);
+    migrate_legacy_state(&ctx, target_override).map_err(miette::Report::new)?;
     let target = match target_override {
         Some(name) => DoctorTarget::Named(name.to_string()),
         None => DoctorTarget::CliDefault,
@@ -60,6 +63,22 @@ pub fn run(target_override: Option<&str>, no_ping: bool) -> miette::Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// The one-shot `<cwd>/.apprafter/state.json` migration every state-reading command runs first
+/// (CLI-only, spec §3.1; overview §3.11): the core reads state and never runs it. Only for a
+/// target that exists: doctor reports a missing one as a row and must not create a state
+/// directory for it (deviation 3).
+fn migrate_legacy_state(ctx: &Context, target_override: Option<&str>) -> cli_core::Result<()> {
+    let Some(name) = cli_core::resolve_active_target_name(&ctx.store(), target_override)? else {
+        return Ok(());
+    };
+    // `Some(name)`: the existence check runs for the CLI default too, so a dangling pointer
+    // migrates nothing.
+    match resolve_state_paths(Some(&name)) {
+        Ok(_) | Err(CliError::TargetNotFound { .. }) => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// The exit code of the interrupt that cancelled the run.

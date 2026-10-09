@@ -2,17 +2,21 @@
 //! Doctor (D.3 overview §3.9): the report a run produces, grouped, with a typed fix per row,
 //! and [`run`], the Read that produces it.
 
+use std::path::Path;
+
 use cli_core::target::{load_target, validate_hetzner_token_format, Target, TargetStorePaths};
 use cli_core::CliError;
+use cli_state::{HetznerCloudState, State, StatePaths};
 use serde::Serialize;
 
 use crate::cancel::CancellationToken;
 use crate::context::{Context, SecretString};
 use crate::error::{CoreError, CoreResult};
-use crate::kube::KubeErrorKind;
+use crate::kube::{Kube, KubeErrorKind, KubectlKube};
 use crate::net;
 use crate::provider::{self, SUPPORTED_PROVIDERS};
 use crate::report::{Event, Reporter};
+use crate::runtime;
 use crate::target_ref::TargetRef;
 use crate::tools::{self, ToolId, ToolProblem, ToolStatus};
 
@@ -215,6 +219,11 @@ const TITLE_CONFIG: &str = "Config file readable";
 const TITLE_CREDENTIALS: &str = "Credentials file present";
 const TITLE_TOKEN_VERIFIED: &str = "Token verified against provider API";
 const TITLE_SSH_KEY: &str = "SSH key readable";
+const TITLE_KUBECONFIG_CACHED: &str = "Kubeconfig cached";
+const TITLE_KUBE_API: &str = "Kube API reachable";
+const TITLE_NODE_SSH: &str = "Node reachable over SSH";
+/// The node row's port: the SSH the CLI's node preparation uses.
+const SSH_PORT: u16 = 22;
 /// The DNS row names the provider API's HTTPS port, as it always has.
 const DNS_PORT: u16 = 443;
 /// The host the DNS row resolves when the API base names none (the CLI's `DEFAULT_API_HOST`).
@@ -234,6 +243,11 @@ enum Lookup {
 /// is only cancellation or a store it cannot read at all (`config.yaml`, the target list).
 /// Lockless: the files it reads are replaced atomically (overview R3). The token row verifies
 /// the STORED token (R4); a check that did not run is `Skipped` (R8).
+///
+/// Groups: Target always; Cluster only for a target that exists; This computer always. A Read
+/// that still writes in one place: the Cluster group decrypts the cached kubeconfig into the
+/// private runtime dir for the length of one probe and removes it, and a run starts by sweeping
+/// copies a crashed run left there (R9). It never creates an age key (decision 2).
 pub fn run(
     ctx: &Context,
     args: DoctorArgs,
@@ -241,6 +255,15 @@ pub fn run(
     cancel: &CancellationToken,
 ) -> CoreResult<DoctorReport> {
     cancel.check()?;
+    // R9: leftovers of a crashed run go first; failing to sweep never fails the run.
+    if let Err(e) = runtime::sweep_stale(ctx, runtime::STALE_KUBECONFIG_AGE) {
+        reporter.report(Event::Warning {
+            message: format!(
+                "cannot remove old kubeconfig copies from {}: {e}",
+                ctx.runtime_dir().display()
+            ),
+        });
+    }
     let name = match args.target {
         DoctorTarget::Named(name) => Some(name),
         // R1: no `config.yaml` is no CLI default.
@@ -256,13 +279,25 @@ pub fn run(
             Err(e) => return Err(e),
         },
     };
-    let total = 2;
+    let total = if matches!(lookup, Lookup::Found(_)) {
+        3
+    } else {
+        2
+    };
     let mut groups = Vec::with_capacity(3);
     stage(reporter, 1, total, "Target");
     groups.push(CheckGroup {
         id: GroupId::Target,
         checks: target_group(ctx, &lookup, cancel)?,
     });
+    if let Lookup::Found(target) = &lookup {
+        cancel.check()?;
+        stage(reporter, 2, total, "Cluster");
+        groups.push(CheckGroup {
+            id: GroupId::Cluster,
+            checks: cluster_group(ctx, target, cancel)?,
+        });
+    }
     cancel.check()?;
     stage(reporter, total, total, "This computer");
     groups.push(CheckGroup {
@@ -615,6 +650,289 @@ fn ssh_key(target: &Target) -> Check {
     }
 }
 
+fn cluster_group(
+    ctx: &Context,
+    target: &TargetRef,
+    cancel: &CancellationToken,
+) -> CoreResult<Vec<Check>> {
+    let paths = StatePaths::for_active_target(&ctx.store(), target.name());
+    let skip_all = |detail: &str| {
+        [
+            (CheckId::KubeconfigCached, TITLE_KUBECONFIG_CACHED),
+            (CheckId::KubeApiReachable, TITLE_KUBE_API),
+            (CheckId::NodeSshReachable, TITLE_NODE_SSH),
+        ]
+        .into_iter()
+        .map(|(id, title)| Check {
+            detail: Some(detail.to_string()),
+            ..row(id, CheckStatus::Skipped, title)
+        })
+        .collect::<Vec<_>>()
+    };
+    let state = match State::load_or_default(&paths) {
+        Ok(state) => state,
+        Err(e) => {
+            let mut rows = skip_all("state unreadable");
+            rows[0] = Check {
+                detail: Some(paths.state_file().display().to_string()),
+                fix: Some(CheckFix::Explain {
+                    text: e.to_string(),
+                }),
+                ..row(
+                    CheckId::KubeconfigCached,
+                    CheckStatus::Fail,
+                    TITLE_KUBECONFIG_CACHED,
+                )
+            };
+            return Ok(rows);
+        }
+    };
+    let Some(server) = state.hetzner_cloud else {
+        return Ok(skip_all("no provisioned server"));
+    };
+    let cached = kubeconfig_cached(target.name(), &server);
+    cancel.check()?;
+    let api = kube_api(ctx, target, &server, cancel)?;
+    cancel.check()?;
+    let node = node_ssh(ctx, target, cancel, SSH_PORT)?;
+    Ok(vec![cached, api, node])
+}
+
+/// Which slot holds the cached kubeconfig. spec §4.5: doctor WARNs while a plaintext slot
+/// remains, and the fix re-fetches it encrypted.
+fn kubeconfig_cached(name: &str, s: &HetznerCloudState) -> Check {
+    let base = row(
+        CheckId::KubeconfigCached,
+        CheckStatus::Pass,
+        TITLE_KUBECONFIG_CACHED,
+    );
+    let fetch = Some(CheckFix::FetchKubeconfig {
+        target: name.to_string(),
+    });
+    match (s.kubeconfig_age.is_some(), s.kubeconfig_yaml.is_some()) {
+        (true, false) => Check {
+            detail: Some("encrypted".into()),
+            ..base
+        },
+        (true, true) => Check {
+            status: CheckStatus::Warn,
+            detail: Some("encrypted, and an unencrypted legacy copy remains".into()),
+            fix: fetch,
+            ..base
+        },
+        (false, true) => Check {
+            status: CheckStatus::Warn,
+            detail: Some("stored unencrypted (legacy)".into()),
+            fix: fetch,
+            ..base
+        },
+        (false, false) => Check {
+            status: CheckStatus::Fail,
+            detail: Some(format!(
+                "none cached for server `{}` (id {})",
+                s.server_name, s.server_id
+            )),
+            fix: fetch,
+            ..base
+        },
+    }
+}
+
+/// Order: a cache to probe → the age key, read WITHOUT creating one (only for the encrypted
+/// slot) → kubectl resolves → decrypt into the runtime dir → `/version` within the bound. The
+/// file is removed when `file` drops, at the end of this function; nothing is written when a
+/// step before the decrypt says the probe cannot run.
+fn kube_api(
+    ctx: &Context,
+    target: &TargetRef,
+    s: &HetznerCloudState,
+    cancel: &CancellationToken,
+) -> CoreResult<Check> {
+    let base = row(
+        CheckId::KubeApiReachable,
+        CheckStatus::Skipped,
+        TITLE_KUBE_API,
+    );
+    if s.kubeconfig_age.is_none() && s.kubeconfig_yaml.is_none() {
+        return Ok(Check {
+            detail: Some("no cached kubeconfig".into()),
+            ..base
+        });
+    }
+    if s.kubeconfig_age.is_some() {
+        match cli_core::secrets::load_identity(ctx.age_key_path()) {
+            Ok(Some(_)) => {}
+            Ok(None) => return Ok(age_key_missing(base, ctx.age_key_path())),
+            Err(e) => {
+                return Ok(Check {
+                    status: CheckStatus::Fail,
+                    fix: Some(CheckFix::Explain {
+                        text: e.to_string(),
+                    }),
+                    ..base
+                });
+            }
+        }
+    }
+    if let Err(e) = ctx.tools().resolve(ToolId::Kubectl) {
+        let detail = match &e {
+            CoreError::ToolUnsupported { .. } => e.to_string(),
+            _ => "`kubectl` not found".to_string(),
+        };
+        return Ok(Check {
+            detail: Some(detail),
+            fix: Some(CheckFix::InstallTool {
+                tool: ToolId::Kubectl,
+            }),
+            ..base
+        });
+    }
+    let file = match runtime::materialise_kubeconfig(ctx, target) {
+        Ok(Some(file)) => file,
+        Ok(None) => {
+            return Ok(Check {
+                detail: Some("no cached kubeconfig".into()),
+                ..base
+            })
+        }
+        Err(CoreError::AgeKeyMissing { .. }) => {
+            return Ok(age_key_missing(base, ctx.age_key_path()))
+        }
+        Err(e) => {
+            return Ok(Check {
+                status: CheckStatus::Fail,
+                detail: Some("the cached kubeconfig cannot be read".into()),
+                fix: Some(CheckFix::Explain {
+                    text: e.to_string(),
+                }),
+                ..base
+            });
+        }
+    };
+    let kube = match KubectlKube::new(ctx, &file) {
+        Ok(kube) => kube,
+        Err(e) => {
+            return Ok(Check {
+                detail: Some(e.to_string()),
+                fix: Some(CheckFix::InstallTool {
+                    tool: ToolId::Kubectl,
+                }),
+                ..base
+            })
+        }
+    };
+    match kube.server_version(cancel) {
+        Ok(v) => Ok(Check {
+            status: CheckStatus::Pass,
+            detail: Some(format!("{} · {} ms", v.git_version, v.elapsed_ms)),
+            ..base
+        }),
+        Err(CoreError::Cancelled) => Err(CoreError::Cancelled),
+        Err(CoreError::Kube { kind, detail }) => Ok(Check {
+            status: CheckStatus::Fail,
+            detail: Some(detail),
+            fix: Some(CheckFix::ClusterUnreachable { reason: kind }),
+            ..base
+        }),
+        Err(e) => Ok(Check {
+            status: CheckStatus::Fail,
+            fix: Some(CheckFix::Explain {
+                text: e.to_string(),
+            }),
+            ..base
+        }),
+    }
+}
+
+fn age_key_missing(base: Check, key: &Path) -> Check {
+    Check {
+        status: CheckStatus::Fail,
+        detail: None,
+        fix: Some(CheckFix::AgeKeyMissing {
+            path: key.display().to_string(),
+        }),
+        ..base
+    }
+}
+
+/// `public_address` (GET /v1/servers/{id}, the token per R4) then a bounded TCP connect. IPv4
+/// only: Hetzner's IPv6 is a /64 prefix, not an address to dial.
+fn node_ssh(
+    ctx: &Context,
+    target: &TargetRef,
+    cancel: &CancellationToken,
+    port: u16,
+) -> CoreResult<Check> {
+    let base = row(
+        CheckId::NodeSshReachable,
+        CheckStatus::Skipped,
+        TITLE_NODE_SSH,
+    );
+    let skipped = |detail: &str| Check {
+        detail: Some(detail.to_string()),
+        ..base.clone()
+    };
+    if ctx.no_ping() {
+        return Ok(skipped("not requested"));
+    }
+    let address = match crate::target::public_address(ctx, target, cancel) {
+        Ok(address) => address,
+        Err(CoreError::Cancelled) => return Err(CoreError::Cancelled),
+        Err(CoreError::NotProvisioned { .. }) => return Ok(skipped("no provisioned server")),
+        Err(CoreError::TokenNotStored { .. }) => return Ok(skipped("no token stored")),
+        Err(e) => return Ok(provider_failure(base, target.name(), e)),
+    };
+    let Some(ip) = address.ipv4 else {
+        return Ok(skipped("the server has no public IPv4 address"));
+    };
+    cancel.check()?;
+    match net::tcp_probe(&ip, port, ctx.request_timeout(), cancel) {
+        Ok(_) => Ok(Check {
+            status: CheckStatus::Pass,
+            detail: Some(format!("port {port} · {ip}")),
+            ..base
+        }),
+        Err(e) => {
+            cancel.check()?;
+            Ok(Check {
+                status: CheckStatus::Fail,
+                detail: Some(format!("port {port} · {ip}: {e}")),
+                fix: Some(CheckFix::NodeUnreachable { address: ip }),
+                ..base
+            })
+        }
+    }
+}
+
+/// The node row when the provider could not say where the server is: 401 (renew), another
+/// status, no answer, or — `ServerMissing` and anything else — the core's own sentence.
+fn provider_failure(base: Check, name: &str, e: CoreError) -> Check {
+    let text = e.to_string();
+    let fix = match &e {
+        CoreError::Cli(CliError::Hetzner { status: 401, .. }) => CheckFix::RenewToken {
+            target: name.to_string(),
+            why: RenewWhy::TokenRejected,
+        },
+        CoreError::Cli(CliError::Hetzner { status, .. }) => {
+            CheckFix::ProviderError { status: *status }
+        }
+        CoreError::ProviderRequestFailed { .. } => CheckFix::ProviderUnreachable,
+        _ => {
+            return Check {
+                status: CheckStatus::Fail,
+                fix: Some(CheckFix::Explain { text }),
+                ..base
+            }
+        }
+    };
+    Check {
+        status: CheckStatus::Fail,
+        detail: Some(text),
+        fix: Some(fix),
+        ..base
+    }
+}
+
 fn this_computer_group(ctx: &Context, cancel: &CancellationToken) -> CoreResult<Vec<Check>> {
     // Concurrent probes, each killed at TOOL_PROBE_TIMEOUT, in ToolId::ALL order.
     let toolchain = tools::toolchain(ctx, cancel)?;
@@ -746,6 +1064,7 @@ mod tests {
     use crate::context::PathSource;
     use crate::report::{CollectReporter, NullReporter};
     use cli_core::target::{GlobalConfig, TargetConfig, TargetCredentials};
+    use cli_state::{HetznerCloudState, State, StatePaths};
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -1307,33 +1626,43 @@ mod tests {
     #[test]
     fn one_stage_per_group() {
         let f = fx();
-        let reporter = CollectReporter::new();
-        run(
-            &ctx(&f, OFFLINE).with_no_ping(true),
-            DoctorArgs {
-                target: DoctorTarget::CliDefault,
-            },
-            &reporter,
-            &CancellationToken::new(),
-        )
-        .unwrap();
-        let stages: Vec<(u32, u32, String)> = reporter
-            .take()
-            .into_iter()
-            .filter_map(|e| match e {
-                Event::Stage {
-                    index,
-                    total,
-                    title,
-                } => Some((index, total, title)),
-                _ => None,
-            })
-            .collect();
+        let ctx = ctx(&f, OFFLINE).with_no_ping(true);
+        let stages = |target: DoctorTarget| -> Vec<(u32, u32, String)> {
+            let reporter = CollectReporter::new();
+            run(
+                &ctx,
+                DoctorArgs { target },
+                &reporter,
+                &CancellationToken::new(),
+            )
+            .unwrap();
+            reporter
+                .take()
+                .into_iter()
+                .filter_map(|e| match e {
+                    Event::Stage {
+                        index,
+                        total,
+                        title,
+                    } => Some((index, total, title)),
+                    _ => None,
+                })
+                .collect()
+        };
         assert_eq!(
-            stages,
+            stages(DoctorTarget::CliDefault),
             [
                 (1, 2, "Target".to_string()),
                 (2, 2, "This computer".to_string())
+            ]
+        );
+        add(&ctx, "prod", "hetzner-cloud", Some(TOKEN), None);
+        assert_eq!(
+            stages(named("prod")),
+            [
+                (1, 3, "Target".to_string()),
+                (2, 3, "Cluster".to_string()),
+                (3, 3, "This computer".to_string())
             ]
         );
     }
@@ -1426,5 +1755,458 @@ mod tests {
             serde_json::to_value(&fix).unwrap(),
             serde_json::json!({"kind":"cluster_unreachable","reason":"unreachable"})
         );
+    }
+
+    // ---- the Cluster group (Task 8) ----
+
+    const YAML: &str = "apiVersion: v1\nkind: Config\nclusters: []\n";
+
+    fn seed_state(ctx: &Context, name: &str, server: serde_json::Value) {
+        let hetzner: HetznerCloudState = serde_json::from_value(server).unwrap();
+        State {
+            hetzner_cloud: Some(hetzner),
+            ..Default::default()
+        }
+        .save(&StatePaths::for_active_target(&ctx.store(), name))
+        .unwrap();
+    }
+
+    fn cluster(r: &DoctorReport) -> Vec<Check> {
+        group(r, GroupId::Cluster)
+    }
+
+    /// Creates the age key at the context's path (a test fixture; doctor never does).
+    fn encrypt(ctx: &Context) -> String {
+        let id = cli_core::secrets::load_or_create_identity(ctx.age_key_path()).unwrap();
+        cli_core::secrets::encrypt_for_recipient(YAML, &id.to_public()).unwrap()
+    }
+
+    #[test]
+    fn the_cluster_group_runs_only_for_an_existing_target() {
+        let f = fx();
+        let ctx = ctx(&f, OFFLINE).with_no_ping(true);
+        add(&ctx, "prod", "hetzner-cloud", Some(TOKEN), None);
+        let missing = doctor(&ctx, named("ghost"));
+        assert!(missing.groups.iter().all(|g| g.id != GroupId::Cluster));
+        let none = doctor(&ctx, DoctorTarget::CliDefault);
+        assert!(none.groups.iter().all(|g| g.id != GroupId::Cluster));
+        let found = doctor(&ctx, named("prod"));
+        assert_eq!(
+            found.groups.iter().map(|g| g.id).collect::<Vec<_>>(),
+            [GroupId::Target, GroupId::Cluster, GroupId::ThisComputer]
+        );
+        assert_eq!(
+            ids(&cluster(&found)),
+            [
+                CheckId::KubeconfigCached,
+                CheckId::KubeApiReachable,
+                CheckId::NodeSshReachable
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unprovisioned_target_skips_all_three() {
+        let f = fx();
+        let ctx = ctx(&f, OFFLINE);
+        add(&ctx, "prod", "hetzner-cloud", Some(TOKEN), None);
+        let c = cluster(&doctor(&ctx, named("prod")));
+        assert!(
+            c.iter().all(|c| c.status == CheckStatus::Skipped
+                && c.detail.as_deref() == Some("no provisioned server")),
+            "{c:?}"
+        );
+        assert_eq!(
+            c.iter().map(|c| c.title.as_str()).collect::<Vec<_>>(),
+            [
+                "Kubeconfig cached",
+                "Kube API reachable",
+                "Node reachable over SSH"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unreadable_state_fails_the_first_row_and_skips_the_rest() {
+        let f = fx();
+        let ctx = ctx(&f, OFFLINE).with_no_ping(true);
+        add(&ctx, "prod", "hetzner-cloud", Some(TOKEN), None);
+        let file = StatePaths::for_active_target(&ctx.store(), "prod").state_file();
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "{ not json").unwrap();
+        let c = cluster(&doctor(&ctx, named("prod")));
+        assert_eq!(c[0].status, CheckStatus::Fail);
+        assert_eq!(
+            c[0].detail.as_deref(),
+            Some(file.display().to_string().as_str())
+        );
+        assert!(
+            matches!(c[0].fix, Some(CheckFix::Explain { .. })),
+            "{:?}",
+            c[0]
+        );
+        for row in &c[1..] {
+            assert_eq!(
+                (row.status, row.detail.as_deref()),
+                (CheckStatus::Skipped, Some("state unreadable"))
+            );
+        }
+    }
+
+    #[test]
+    fn a_server_without_a_cached_kubeconfig_fails_with_a_fetch_fix() {
+        let f = fx();
+        let ctx = ctx(&f, OFFLINE).with_no_ping(true);
+        add(&ctx, "prod", "hetzner-cloud", Some(TOKEN), None);
+        seed_state(
+            &ctx,
+            "prod",
+            serde_json::json!({"server_id": 7, "server_name": "apprafter-prod"}),
+        );
+        let c = cluster(&doctor(&ctx, named("prod")));
+        assert_eq!(c[0].status, CheckStatus::Fail);
+        assert_eq!(
+            c[0].detail.as_deref(),
+            Some("none cached for server `apprafter-prod` (id 7)")
+        );
+        assert_eq!(
+            c[0].fix,
+            Some(CheckFix::FetchKubeconfig {
+                target: "prod".into()
+            })
+        );
+        assert_eq!(
+            (c[1].status, c[1].detail.as_deref()),
+            (CheckStatus::Skipped, Some("no cached kubeconfig"))
+        );
+        assert_eq!(c[2].status, CheckStatus::Skipped);
+        assert_eq!(c[2].detail.as_deref(), Some("not requested"));
+    }
+
+    #[test]
+    fn plaintext_copies_warn_and_the_encrypted_one_passes() {
+        let f = fx();
+        let ctx = ctx(&f, OFFLINE).with_no_ping(true);
+        for name in ["legacy", "both", "sealed"] {
+            add(&ctx, name, "hetzner-cloud", Some(TOKEN), None);
+        }
+        let armored = encrypt(&ctx);
+        seed_state(
+            &ctx,
+            "legacy",
+            serde_json::json!({"server_id": 1, "server_name": "a", "kubeconfig_yaml": YAML}),
+        );
+        seed_state(
+            &ctx,
+            "both",
+            serde_json::json!({"server_id": 2, "server_name": "b", "kubeconfig_yaml": YAML, "kubeconfig_age": armored}),
+        );
+        seed_state(
+            &ctx,
+            "sealed",
+            serde_json::json!({"server_id": 3, "server_name": "c", "kubeconfig_age": armored}),
+        );
+        let first = |n: &str| cluster(&doctor(&ctx, named(n)))[0].clone();
+        let legacy = first("legacy");
+        assert_eq!(
+            (legacy.status, legacy.detail.as_deref()),
+            (CheckStatus::Warn, Some("stored unencrypted (legacy)"))
+        );
+        assert_eq!(
+            legacy.fix,
+            Some(CheckFix::FetchKubeconfig {
+                target: "legacy".into()
+            })
+        );
+        let both = first("both");
+        assert_eq!(
+            (both.status, both.detail.as_deref()),
+            (
+                CheckStatus::Warn,
+                Some("encrypted, and an unencrypted legacy copy remains")
+            )
+        );
+        let sealed = first("sealed");
+        assert_eq!(
+            (sealed.status, sealed.detail.as_deref(), sealed.fix),
+            (CheckStatus::Pass, Some("encrypted"), None)
+        );
+    }
+
+    #[test]
+    fn a_missing_age_key_fails_and_is_never_created() {
+        let f = fx();
+        let ctx = ctx(&f, OFFLINE).with_no_ping(true);
+        add(&ctx, "prod", "hetzner-cloud", Some(TOKEN), None);
+        seed_state(
+            &ctx,
+            "prod",
+            serde_json::json!({"server_id": 7, "server_name": "n",
+                "kubeconfig_age": "-----BEGIN AGE ENCRYPTED FILE-----\n-----END AGE ENCRYPTED FILE-----\n"}),
+        );
+        let c = cluster(&doctor(&ctx, named("prod")));
+        assert_eq!(c[1].status, CheckStatus::Fail);
+        assert_eq!(
+            c[1].fix,
+            Some(CheckFix::AgeKeyMissing {
+                path: ctx.age_key_path().display().to_string()
+            })
+        );
+        assert!(
+            !ctx.age_key_path().exists(),
+            "a Read never writes a key (decision 2)"
+        );
+    }
+
+    #[test]
+    fn kubectl_missing_skips_the_api_check_and_writes_no_kubeconfig() {
+        let f = fx();
+        let ctx = ctx(&f, OFFLINE).with_no_ping(true); // `bin` is empty
+        add(&ctx, "prod", "hetzner-cloud", Some(TOKEN), None);
+        seed_state(
+            &ctx,
+            "prod",
+            serde_json::json!({"server_id": 7, "server_name": "n", "kubeconfig_yaml": YAML}),
+        );
+        let c = cluster(&doctor(&ctx, named("prod")));
+        assert_eq!(c[1].status, CheckStatus::Skipped);
+        assert_eq!(c[1].detail.as_deref(), Some("`kubectl` not found"));
+        assert_eq!(
+            c[1].fix,
+            Some(CheckFix::InstallTool {
+                tool: ToolId::Kubectl
+            })
+        );
+        assert!(
+            !ctx.runtime_dir().exists(),
+            "nothing is decrypted to disk when it cannot be used"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_api_check_passes_through_kubectl_and_leaves_no_file() {
+        let f = fx();
+        crate::kube::tests::fake_kubectl(
+            &f.root.join("bin"),
+            "case \"$1\" in version) echo 'Client Version: v1.31.0'; exit 0;; esac\n\
+             printf '%s' '{\"gitVersion\":\"v1.31.0+k3s1\"}'",
+        );
+        let ctx = ctx(&f, OFFLINE).with_no_ping(true);
+        add(&ctx, "prod", "hetzner-cloud", Some(TOKEN), None);
+        let armored = encrypt(&ctx);
+        seed_state(
+            &ctx,
+            "prod",
+            serde_json::json!({"server_id": 7, "server_name": "n", "kubeconfig_age": armored}),
+        );
+        let c = cluster(&doctor(&ctx, named("prod")));
+        assert_eq!(c[1].status, CheckStatus::Pass, "{:?}", c[1]);
+        let d = c[1].detail.as_deref().unwrap();
+        assert!(
+            d.starts_with("v1.31.0+k3s1 · ") && d.ends_with(" ms"),
+            "{d}"
+        );
+        let left: Vec<_> = std::fs::read_dir(ctx.runtime_dir()).unwrap().collect();
+        assert!(
+            left.is_empty(),
+            "the decrypted copy is removed after the probe: {left:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreachable_api_fails_with_its_kind() {
+        let f = fx();
+        crate::kube::tests::fake_kubectl(
+            &f.root.join("bin"),
+            "echo 'Unable to connect to the server: dial tcp 127.0.0.1:6443: connect: connection refused' >&2\nexit 1",
+        );
+        let ctx = ctx(&f, OFFLINE).with_no_ping(true);
+        add(&ctx, "prod", "hetzner-cloud", Some(TOKEN), None);
+        seed_state(
+            &ctx,
+            "prod",
+            serde_json::json!({"server_id": 7, "server_name": "n", "kubeconfig_yaml": YAML}),
+        );
+        let c = cluster(&doctor(&ctx, named("prod")));
+        assert_eq!(c[1].status, CheckStatus::Fail);
+        assert_eq!(
+            c[1].detail.as_deref(),
+            Some("Unable to connect to the server: dial tcp 127.0.0.1:6443: connect: connection refused")
+        );
+        assert_eq!(
+            c[1].fix,
+            Some(CheckFix::ClusterUnreachable {
+                reason: KubeErrorKind::Unreachable
+            })
+        );
+    }
+
+    fn server_mock(
+        server: &mut mockito::Server,
+        status: usize,
+        ipv4: Option<&str>,
+    ) -> mockito::Mock {
+        let body = serde_json::json!({"server": {"id": 7, "name": "n", "status": "running", "labels": {},
+            "public_net": {"ipv4": ipv4.map(|ip| serde_json::json!({"ip": ip})), "ipv6": null}}});
+        server
+            .mock("GET", "/v1/servers/7")
+            .with_status(status)
+            .with_header("content-type", "application/json")
+            .with_body(body.to_string())
+            .create()
+    }
+
+    fn provisioned(f: &Fx, base: &str, token: Option<&str>) -> (Context, TargetRef) {
+        let ctx = ctx(f, base);
+        add(&ctx, "prod", "hetzner-cloud", token, None);
+        seed_state(
+            &ctx,
+            "prod",
+            serde_json::json!({"server_id": 7, "server_name": "n"}),
+        );
+        let target = TargetRef::named(&ctx, "prod").unwrap();
+        (ctx, target)
+    }
+
+    #[test]
+    fn the_node_check_connects_to_the_public_ipv4() {
+        let mut server = mockito::Server::new();
+        let _m = server_mock(&mut server, 200, Some("127.0.0.1"));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let f = fx();
+        let (ctx, target) = provisioned(&f, &server.url(), Some(TOKEN));
+        let c = node_ssh(&ctx, &target, &CancellationToken::new(), port).unwrap();
+        assert_eq!(c.status, CheckStatus::Pass, "{c:?}");
+        assert_eq!(c.detail, Some(format!("port {port} · 127.0.0.1")));
+    }
+
+    #[test]
+    fn the_node_check_fails_when_nothing_listens() {
+        let mut server = mockito::Server::new();
+        let _m = server_mock(&mut server, 200, Some("127.0.0.1"));
+        // Bound and dropped: the port is closed again.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let f = fx();
+        let (ctx, target) = provisioned(&f, &server.url(), Some(TOKEN));
+        let c = node_ssh(&ctx, &target, &CancellationToken::new(), port).unwrap();
+        assert_eq!(c.status, CheckStatus::Fail);
+        assert!(
+            c.detail
+                .as_deref()
+                .unwrap()
+                .starts_with(&format!("port {port} · 127.0.0.1: ")),
+            "{c:?}"
+        );
+        assert_eq!(
+            c.fix,
+            Some(CheckFix::NodeUnreachable {
+                address: "127.0.0.1".into()
+            })
+        );
+    }
+
+    #[test]
+    fn a_server_without_a_public_ipv4_skips_the_node_check() {
+        let mut server = mockito::Server::new();
+        let _m = server_mock(&mut server, 200, None);
+        let f = fx();
+        let (ctx, target) = provisioned(&f, &server.url(), Some(TOKEN));
+        let c = node_ssh(&ctx, &target, &CancellationToken::new(), 22).unwrap();
+        assert_eq!(
+            (c.status, c.detail.as_deref()),
+            (
+                CheckStatus::Skipped,
+                Some("the server has no public IPv4 address")
+            )
+        );
+    }
+
+    #[test]
+    fn a_server_gone_at_the_provider_fails_and_no_token_skips() {
+        let mut server = mockito::Server::new();
+        let _m = server_mock(&mut server, 404, None);
+        let f = fx();
+        let (ctx, target) = provisioned(&f, &server.url(), Some(TOKEN));
+        let gone = node_ssh(&ctx, &target, &CancellationToken::new(), 22).unwrap();
+        assert_eq!(gone.status, CheckStatus::Fail);
+        assert!(
+            matches!(gone.fix, Some(CheckFix::Explain { .. })),
+            "{gone:?}"
+        );
+        let f2 = fx();
+        let (ctx2, target2) = provisioned(&f2, &server.url(), None);
+        let skipped = node_ssh(&ctx2, &target2, &CancellationToken::new(), 22).unwrap();
+        assert_eq!(
+            (skipped.status, skipped.detail.as_deref()),
+            (CheckStatus::Skipped, Some("no token stored"))
+        );
+    }
+
+    #[test]
+    fn a_rejected_token_fails_the_node_check_with_a_renew_fix() {
+        let mut server = mockito::Server::new();
+        server
+            .mock("GET", "/v1/servers/7")
+            .with_status(401)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"error":{"code":"unauthorized","message":"unable to authenticate"}}"#)
+            .create();
+        let f = fx();
+        let (ctx, target) = provisioned(&f, &server.url(), Some(TOKEN));
+        let c = node_ssh(&ctx, &target, &CancellationToken::new(), 22).unwrap();
+        assert_eq!(c.status, CheckStatus::Fail);
+        assert_eq!(
+            c.fix,
+            Some(CheckFix::RenewToken {
+                target: "prod".into(),
+                why: RenewWhy::TokenRejected
+            })
+        );
+    }
+
+    #[test]
+    fn no_ping_skips_the_node_check_without_asking_the_provider() {
+        let mut server = mockito::Server::new();
+        let m = server.mock("GET", mockito::Matcher::Any).expect(0).create();
+        let f = fx();
+        let (ctx, target) = provisioned(&f, &server.url(), Some(TOKEN));
+        let c = node_ssh(
+            &ctx.with_no_ping(true),
+            &target,
+            &CancellationToken::new(),
+            22,
+        )
+        .unwrap();
+        assert_eq!(
+            (c.status, c.detail.as_deref()),
+            (CheckStatus::Skipped, Some("not requested"))
+        );
+        m.assert();
+    }
+
+    #[test]
+    fn stale_runtime_copies_are_swept_at_the_start_of_a_run() {
+        let f = fx();
+        let ctx = ctx(&f, OFFLINE).with_no_ping(true);
+        std::fs::create_dir_all(ctx.runtime_dir()).unwrap();
+        let old = ctx.runtime_dir().join("kubeconfig-1-0.yaml");
+        let fresh = ctx.runtime_dir().join("kubeconfig-2-0.yaml");
+        std::fs::write(&old, "x").unwrap();
+        std::fs::write(&fresh, "x").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(7200))
+            .unwrap();
+        doctor(&ctx, DoctorTarget::CliDefault);
+        assert!(!old.exists() && fresh.exists());
     }
 }

@@ -191,7 +191,7 @@ fn io_error(e: io::Error) -> CoreError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::context::PathSource;
     use crate::runtime::materialise_kubeconfig;
@@ -248,7 +248,7 @@ mod tests {
     /// forks while the file is open for writing makes `execve` refuse until that child execs.
     /// Only shell builtins: the child's PATH is `dir` alone (GOTCHA-104).
     #[cfg(unix)]
-    fn fake_kubectl(dir: &std::path::Path, body: &str) {
+    pub(crate) fn fake_kubectl(dir: &std::path::Path, body: &str) {
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join("kubectl");
         std::fs::write(

@@ -9,6 +9,11 @@ Checking target `prod`...
   ✓ Token verified against provider API (Hetzner Cloud /v1/locations, <MS> ms)
   ✓ SSH key readable (<SANDBOX>/home/id_ed25519.pub (ssh-ed25519))
 
+Checking cluster...
+  – Kubeconfig cached (no provisioned server)
+  – Kube API reachable (no provisioned server)
+  – Node reachable over SSH (no provisioned server)
+
 Checking environment...
   ✓ `restic` on PATH (restic stand-in)
   ✓ `kubectl` on PATH (kubectl stand-in)

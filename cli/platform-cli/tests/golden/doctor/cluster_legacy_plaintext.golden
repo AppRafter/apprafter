@@ -1,4 +1,4 @@
-$ apprafter doctor
+$ apprafter doctor --no-ping
 [exit 1]
 [stdout]
 Checking target `prod`...
@@ -6,14 +6,15 @@ Checking target `prod`...
   ✓ Credentials file present (mode 0600) (<SANDBOX>/apprafter-config/targets/prod/credentials.yaml)
   ✓ Provider `hetzner-cloud` supported
   ✓ Token format valid (64 chars, alphanumeric)
-  ✗ Token verified against provider API (transport error talking to <HCLOUD>/v1/locations: <HCLOUD>/v1/locations: Connection Failed: Connect error: Connection refused (os error <N>))
-      hint: could not reach the provider API — check DNS / network / proxy, or rerun with `--no-ping` to skip this check
+  – Token verified against provider API (not requested)
   ✓ SSH key readable (<SANDBOX>/home/id_ed25519.pub (ssh-ed25519))
 
 Checking cluster...
-  – Kubeconfig cached (no provisioned server)
-  – Kube API reachable (no provisioned server)
-  – Node reachable over SSH (no provisioned server)
+  ⚠ Kubeconfig cached (stored unencrypted (legacy))
+      hint: run `apprafter kubeconfig --refresh --target prod` to replace the unencrypted copy with an encrypted one
+  – Kube API reachable (`kubectl` not found)
+      hint: `kubectl` is needed to reach the cluster; the `kubectl` row under `Checking environment` says how to install it
+  – Node reachable over SSH (not requested)
 
 Checking environment...
   ⚠ `restic` on PATH
@@ -66,6 +67,6 @@ Install cue:
   • other      https://cuelang.org/docs/introduction/installation/
   ✓ DNS resolves `127.0.0.1` (443/tcp)
 
-13 checks for target `prod`: 6 passed, 5 warning(s), 2 FAIL — fix the FAILs and rerun `apprafter doctor`.
+13 checks for target `prod`: 6 passed, 6 warning(s), 1 FAIL — fix the FAILs and rerun `apprafter doctor`.
 [stderr]
-<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m doctor invoked <ESC>[3mno_ping<ESC>[0m<ESC>[2m=<ESC>[0mfalse
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m doctor invoked <ESC>[3mno_ping<ESC>[0m<ESC>[2m=<ESC>[0mtrue
