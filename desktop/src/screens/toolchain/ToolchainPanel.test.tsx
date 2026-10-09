@@ -1,0 +1,144 @@
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
+import { afterEach, beforeEach, expect, mock, test } from 'bun:test';
+import { QueryClientProvider } from '@tanstack/react-query';
+import { clearMocks } from '@tauri-apps/api/mocks';
+import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { ToastProvider, ToastViewport } from '../../components/Toast';
+import { resetOperations } from '../../ipc/operations';
+import { ViewFrame } from '../../shell/ViewFrame';
+import { PlatformContext } from '../../state/platform';
+import { createQueryClient } from '../../state/queryClient';
+import { appInfo } from '../../test/fixtures';
+import { toolchainReport } from '../../test/flows';
+import { type Harness, installHarness, uiError } from '../../test/ipc';
+import { ToolchainPanel } from './ToolchainPanel';
+
+let h: Harness;
+beforeEach(() => {
+  h = installHarness();
+  h.answer('toolchain_status', toolchainReport());
+});
+afterEach(() => {
+  cleanup();
+  resetOperations();
+  clearMocks();
+});
+
+function renderPanel(os: 'linux' | 'macos' | 'windows') {
+  const onClose = mock();
+  render(
+    <QueryClientProvider client={createQueryClient()}>
+      <PlatformContext value={appInfo({ os })}>
+        <ToastProvider>
+          <ViewFrame>
+            <ToolchainPanel onClose={onClose} />
+          </ViewFrame>
+          <ToastViewport />
+        </ToastProvider>
+      </PlatformContext>
+    </QueryClientProvider>,
+  );
+  return { user: userEvent.setup(), onClose };
+}
+
+/** The row of one tool, by its name. */
+const toolRow = (tool: string) => {
+  const name = screen.getAllByText(tool).find((e) => e.classList.contains('tool-name'));
+  const row = name?.closest('li');
+  if (!row) throw new Error(`no row for ${tool}`);
+  return row;
+};
+
+test("macOS: a found tool's version and path; a missing one's macOS line; a note is not a command", async () => {
+  renderPanel('macos');
+  expect(screen.getByRole('dialog', { name: 'Toolchain' })).toBeDefined();
+  expect(await screen.findByText('Client Version: v1.34.1')).toBeDefined();
+  expect(screen.getByText('/usr/bin/kubectl')).toBeDefined();
+  expect(screen.getByText('Not found on the search path')).toBeDefined();
+  expect(screen.getByText('brew install helm').tagName).toBe('CODE');
+  expect(screen.queryByText(/winget/)).toBeNull();
+  // ssh timed out, so its install line shows; on macOS it reads "preinstalled": a note to read.
+  expect(screen.getByText('preinstalled').tagName).not.toBe('CODE');
+});
+
+test("Windows: the missing tool's winget line", async () => {
+  renderPanel('windows');
+  expect(await screen.findByText('winget install Helm.Helm')).toBeDefined();
+  expect(screen.queryByText('brew install helm')).toBeNull();
+});
+
+test("Linux: every distribution's line, each labelled; a link is shown as its address", async () => {
+  renderPanel('linux');
+  await screen.findByText('Client Version: v1.34.1');
+  const helm = toolRow('helm');
+  for (const label of ['Debian / Ubuntu', 'Nix', 'Other']) {
+    expect(within(helm).getByText(label)).toBeDefined();
+  }
+  expect(within(helm).getByText('apt install helm').tagName).toBe('CODE');
+  // The opener may open only the app's own three URLs, so an install page is shown, not linked.
+  const link = within(helm).getByText('https://helm.sh/docs/intro/install/');
+  expect(link.tagName).toBe('CODE');
+  expect(link.closest('a')).toBeNull();
+  expect(within(helm).queryByText(/brew|winget/)).toBeNull();
+});
+
+test('a found tool shows no install lines; required or optional, and the state tone', async () => {
+  renderPanel('macos');
+  await screen.findByText('Client Version: v1.34.1');
+  const kubectl = toolRow('kubectl');
+  expect(within(kubectl).getByText('required')).toBeDefined();
+  expect(within(kubectl).queryByText('brew install kubectl')).toBeNull();
+  expect(within(kubectl).getByText('Client Version: v1.34.1').getAttribute('data-tone')).toBe('ok');
+  const helm = toolRow('helm');
+  expect(within(helm).getByText('optional')).toBeDefined();
+  // An optional tool that is missing is a warning, not an error.
+  expect(within(helm).getByText('Not found on the search path').getAttribute('data-tone')).toBe(
+    'warn',
+  );
+});
+
+test("a probe's own words are shown as they are", async () => {
+  renderPanel('macos');
+  expect(
+    await screen.findByText(
+      'xcrun: error: invalid active developer path (/Library/Developer/CommandLineTools)',
+    ),
+  ).toBeDefined();
+  expect(screen.getByText('Found, but it exited 1 without printing a version')).toBeDefined();
+});
+
+test('Check again reads the toolchain again', async () => {
+  const { user } = renderPanel('macos');
+  await screen.findByText('Client Version: v1.34.1');
+  await user.click(screen.getByRole('button', { name: 'Check again' }));
+  await waitFor(() => expect(h.of('toolchain_status')).toHaveLength(2));
+});
+
+test('the footer names the search path and, opened, lists it', async () => {
+  const { user } = renderPanel('macos');
+  const summary = await screen.findByText(
+    'Searched 2 directories of the PATH your login shell sets',
+  );
+  await user.click(summary);
+  expect(screen.getByText('/usr/local/bin')).toBeDefined();
+  expect(screen.getByText('/usr/bin')).toBeDefined();
+});
+
+test('while it reads it says so; a refusal is shown with Check again', async () => {
+  let answer = (_value: unknown) => {};
+  h.answer(
+    'toolchain_status',
+    () =>
+      new Promise((resolve) => {
+        answer = resolve;
+      }),
+  );
+  const { user } = renderPanel('macos');
+  expect(await screen.findByText('Checking the tools…')).toBeDefined();
+  answer(Promise.reject(uiError('apprafter::desktop::internal', 'the probe broke')));
+  expect(await screen.findByText('the probe broke')).toBeDefined();
+  h.answer('toolchain_status', toolchainReport());
+  await user.click(screen.getByRole('button', { name: 'Check again' }));
+  expect(await screen.findByText('Client Version: v1.34.1')).toBeDefined();
+});

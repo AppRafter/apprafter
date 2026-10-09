@@ -241,3 +241,103 @@
   flex: none;
   align-self: center;
 }
+
+/* Toolchain ------------------------------------------------------------------------------ */
+
+.tool-rows {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* One tool: its name, required or optional and what it is for; then what the probe found. */
+.tool-row {
+  display: grid;
+  gap: 3px;
+  padding: 10px 0;
+  border-top: 1px solid var(--border);
+}
+
+.tool-row:first-child {
+  border-top: none;
+  padding-top: 0;
+}
+
+.tool-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.tool-name {
+  font: 500 var(--fs-12-5) var(--font-mono);
+}
+
+.tool-purpose {
+  color: var(--fg-muted);
+  font-size: var(--fs-12-5);
+}
+
+.tool-state {
+  font-size: var(--fs-12-5);
+}
+
+.tool-state[data-tone="ok"] {
+  color: var(--ok);
+}
+
+.tool-state[data-tone="warn"] {
+  color: var(--warn);
+}
+
+.tool-state[data-tone="err"] {
+  color: var(--err);
+}
+
+/* The tool's or the system's own words, and the path it was found at: as they are. */
+.tool-detail,
+.tool-path {
+  font: 400 var(--fs-11-5) var(--font-mono);
+  color: var(--fg-faint);
+  overflow-wrap: anywhere;
+}
+
+.tool-hints {
+  display: grid;
+  gap: 4px;
+  margin-top: 4px;
+}
+
+/* An install line: the OS it is for, then the command or address in mono, or a note. */
+.tool-hint {
+  display: grid;
+  grid-template-columns: 110px minmax(0, 1fr);
+  align-items: baseline;
+  gap: 8px;
+  font-size: var(--fs-12-5);
+}
+
+.tool-hint-os {
+  color: var(--fg-muted);
+}
+
+.tool-hint code {
+  font: 400 var(--fs-12-5) var(--font-mono);
+  overflow-wrap: anywhere;
+}
+
+/* "Searched 2 directories of …", which opens to the directories. */
+.tool-foot {
+  flex: 1;
+  min-width: 0;
+  align-self: center;
+  font-size: var(--fs-12-5);
+  color: var(--fg-muted);
+}
+
+.tool-search-path {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  font: 400 var(--fs-11-5) var(--font-mono);
+  color: var(--fg-faint);
+}

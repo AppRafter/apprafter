@@ -75,6 +75,27 @@ describe('install lines', () => {
     expect(copyable('preinstalled')).toBe(false);
   });
 
+  test("a timed-out probe's seconds are the core's TOOL_PROBE_TIMEOUT", async () => {
+    // The report says only that the probe timed out; the bound is apprafter-core's constant.
+    const rust = await Bun.file(
+      join(import.meta.dir, '../../../../cli/apprafter-core/src/tools.rs'),
+    ).text();
+    const secs = rust.match(
+      /pub const TOOL_PROBE_TIMEOUT: Duration = Duration::from_secs\((\d+)\);/,
+    )?.[1];
+    expect(secs, 'TOOL_PROBE_TIMEOUT in apprafter-core/src/tools.rs').toBeDefined();
+    const line = toolStateLine({
+      tool: 'ssh',
+      required: false,
+      purpose: 'reaching the node over SSH',
+      path: '/usr/bin/ssh',
+      version: null,
+      problem: { kind: 'timed_out' },
+      install: [],
+    });
+    expect(line.text).toBe(`Found, but it did not print its version within ${secs} s`);
+  });
+
   test('every install line the CLI ships is a command, a link or one of its two notes', async () => {
     // cli-core's tool definitions are the source of every line the core sends. A new installer
     // there fails here, rather than losing its Copy button quietly.
