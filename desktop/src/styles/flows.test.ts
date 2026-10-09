@@ -35,3 +35,16 @@ test('a row the keyboard moves to scrolls into view below the header, not under 
   );
   expect(await rule('components.css', '.data-table thead th')).toMatch(/height:\s*var\(--h-30\);/);
 });
+
+test('every stylesheet is loaded: main.tsx imports each one', async () => {
+  const main = await Bun.file(join(import.meta.dir, '..', 'main.tsx')).text();
+  const sheets = [...new Bun.Glob('*.css').scanSync(import.meta.dir)].sort();
+  expect(sheets).toContain('flows.css');
+  for (const sheet of sheets) expect(main, sheet).toContain(`import './styles/${sheet}';`);
+});
+
+test("the machine picker's rows line up: its eyebrow is as wide as the region row's", async () => {
+  const width = /min-width:\s*64px;/;
+  expect(await rule('components.css', '.chip-select-legend')).toMatch(width);
+  expect(await rule('flows.css', '.machine-tools-legend')).toMatch(width);
+});

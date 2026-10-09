@@ -1,0 +1,90 @@
+/* SPDX-License-Identifier: FSL-1.1-Apache-2.0 */
+/* The D.3 flows' screens: the machine picker, the doctor, the toolchain. Primitives live in
+   components.css. */
+
+/* Machine picker ------------------------------------------------------------------------- */
+
+/* The design's step 2: region row, tools row, table and summary, 16 px apart as in the body. */
+.machine-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 0;
+}
+
+.machine-tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+/* The "Machine" eyebrow, as wide as the region row's "Region", so the two rows line up. */
+.machine-tools-legend {
+  flex: none;
+  min-width: 64px;
+}
+
+.machine-caption {
+  flex: 1;
+  min-width: 0;
+  color: var(--fg-faint);
+  font-size: var(--fs-12);
+}
+
+/* The design's toggle: an outline chip, tinted while on. */
+.machine-hide {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 6px;
+  height: var(--h-28);
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-4);
+  background: transparent;
+  color: var(--fg-muted);
+  font: 400 var(--fs-12) var(--font-sans);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.machine-hide:hover {
+  color: var(--fg);
+}
+
+.machine-hide[aria-pressed="true"] {
+  border-color: var(--accent);
+  background: var(--accent-tint);
+  color: var(--accent-text);
+}
+
+.machine-sku {
+  font-weight: 500;
+}
+
+.machine-muted {
+  color: var(--fg-muted);
+}
+
+.machine-note {
+  font-size: var(--fs-11-5);
+}
+
+.machine-note[data-tone="accent"] {
+  color: var(--accent-text);
+}
+
+.machine-note[data-tone="warn"] {
+  color: var(--warn);
+}
+
+.machine-note[data-tone="faint"] {
+  color: var(--fg-faint);
+}
+
+.machine-summary {
+  margin: 0;
+  color: var(--fg-muted);
+  font-size: var(--fs-12-5);
+}
