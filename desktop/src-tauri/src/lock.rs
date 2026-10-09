@@ -254,7 +254,17 @@ impl LockMachine {
     /// activity (or unlock), on either clock: a suspend counts, a wall clock stepped back does
     /// not. Does nothing while locked, with the lock not in effect, or with `auto_lock` set to
     /// never.
+    ///
+    /// While the authenticator has not answered, or its last answer is that nothing can verify
+    /// the owner, it is asked again ([`AuthCache::refresh`]: off this thread, and one question
+    /// however many ticks ask): a lock, a prompt or a save would ask, but none comes while the
+    /// lock is off, so a first answer that was wrong for a moment (an OS still starting) would
+    /// keep it off for good. Once the answer is that the owner can be verified, a tick asks
+    /// nothing.
     pub fn tick(&self) {
+        if self.auth.known().is_none_or(|info| !info.available) {
+            self.auth.refresh();
+        }
         let info = self.auth.info();
         let mut inner = self.lock_inner();
         self.report(&mut inner, &info);
@@ -1321,6 +1331,59 @@ mod tests {
             r.machine.state(),
             locked(LockReason::Idle, T0 + 11 * MIN, Some(10), 1)
         );
+    }
+
+    /// Answers that nothing can verify the owner its first `unavailable` times (an OS not ready
+    /// yet), then that something can; counts the questions.
+    struct UnavailableAtFirst {
+        unavailable: usize,
+        asked: AtomicUsize,
+    }
+
+    impl Authenticator for UnavailableAtFirst {
+        fn info(&self) -> AuthInfo {
+            if self.asked.fetch_add(1, SeqCst) < self.unavailable {
+                NoAuthenticator.info()
+            } else {
+                FakeAuthenticator::new().info()
+            }
+        }
+
+        fn verify(&self, _purpose: &AuthPurpose, _cancel: &CancellationToken) -> AuthOutcome {
+            AuthOutcome::Verified
+        }
+    }
+
+    /// Nothing but a lock, a prompt, a save or `app_info` asks the OS again, and none of them
+    /// comes while the lock is off: an "unavailable" that was wrong for a moment must not keep
+    /// it off for good. Each tick asks again while that is the answer — and only then.
+    #[test]
+    fn each_tick_asks_again_while_the_answer_is_unavailable_and_only_then() {
+        let auth = Arc::new(UnavailableAtFirst {
+            unavailable: 2,
+            asked: AtomicUsize::new(0),
+        });
+        let r = rig(unlocked_at_start(), auth.clone());
+        assert_eq!(r.machine.state().auto_lock_minutes, None, "not in effect");
+        for (tick, in_effect) in [(1, false), (2, true)] {
+            r.machine.tick();
+            assert!(r.cache.settled(LONG));
+            assert_eq!(auth.asked.load(SeqCst), tick + 1, "tick {tick} asked again");
+            assert_eq!(
+                r.machine.state().auto_lock_minutes.is_some(),
+                in_effect,
+                "after tick {tick}"
+            );
+        }
+        // In effect: a tick asks nothing.
+        for _ in 0..3 {
+            r.machine.tick();
+        }
+        assert!(r.cache.settled(LONG));
+        assert_eq!(auth.asked.load(SeqCst), 3, "ticks asked nothing more");
+        r.clock.set(T0 + 10 * MIN);
+        r.machine.tick();
+        assert_eq!(r.machine.state().reason, Some(LockReason::Idle));
     }
 
     #[test]
