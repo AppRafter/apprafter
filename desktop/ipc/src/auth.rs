@@ -26,12 +26,16 @@ pub enum UnavailableReason {
     ImplicitGrant,
     /// The OS refuses here, for good as things stand: an administrator's polkit rule saying NO
     /// in the owner's active session, or the account's own restrictions (Windows: its logon
-    /// hours or workstations, a password that expired or must change, the account disabled or
-    /// expired). Asking again, either way, does not change it.
+    /// hours or workstations, the account disabled or expired). Asking again, either way, does
+    /// not change it.
     NotPermittedHere,
     /// The app's own password field was used where the OS prompts itself (polkit can prompt;
     /// macOS and Windows always do): the OS's prompt is the way, and asking through it works.
     UseSystemPrompt,
+    /// The account's password has expired, or must be changed at the next sign-in (Windows'
+    /// `LogonUserW`): the right password is refused until the owner changes it. Final for this
+    /// attempt.
+    PasswordExpired,
     NoPamService,
     NotInteractive,
     NoBackend,
@@ -147,6 +151,7 @@ mod tests {
             (UnavailableReason::ImplicitGrant, "implicit_grant"),
             (UnavailableReason::NotPermittedHere, "not_permitted_here"),
             (UnavailableReason::UseSystemPrompt, "use_system_prompt"),
+            (UnavailableReason::PasswordExpired, "password_expired"),
             (UnavailableReason::NoPamService, "no_pam_service"),
             (UnavailableReason::NotInteractive, "not_interactive"),
             (UnavailableReason::NoBackend, "no_backend"),

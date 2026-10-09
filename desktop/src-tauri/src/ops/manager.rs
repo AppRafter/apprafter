@@ -1358,6 +1358,7 @@ mod tests {
         // OS's own (an administrator's rule, the account's logon hours) is final.
         for reason in [
             UnavailableReason::NotPermittedHere,
+            UnavailableReason::PasswordExpired,
             UnavailableReason::NotConfigured,
             UnavailableReason::DisabledByPolicy,
             UnavailableReason::PolicyMissing,

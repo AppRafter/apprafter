@@ -4,4 +4,4 @@
 /**
  * Why the OS cannot authenticate the device owner here; the UI says which and what to do.
  */
-export type UnavailableReason = "not_configured" | "disabled_by_policy" | "no_agent" | "policy_missing" | "implicit_grant" | "not_permitted_here" | "use_system_prompt" | "no_pam_service" | "not_interactive" | "no_backend";
+export type UnavailableReason = "not_configured" | "disabled_by_policy" | "no_agent" | "policy_missing" | "implicit_grant" | "not_permitted_here" | "use_system_prompt" | "password_expired" | "no_pam_service" | "not_interactive" | "no_backend";

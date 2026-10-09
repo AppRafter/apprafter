@@ -192,6 +192,22 @@ describe('authRefusal, for either way', () => {
     },
   );
 
+  test.each([true, false])(
+    'an expired password says to change it, and holds nothing (field: %p)',
+    (viaField) => {
+      // Windows: the right password, expired or one that must change at the sign-in.
+      expect(
+        authRefusal(
+          refused(DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE, { reason: 'password_expired' }),
+          viaField,
+        ),
+      ).toEqual({
+        lines: ['Your system password has expired. Change it, then try again.'],
+        retryInMs: null,
+      });
+    },
+  );
+
   test("the OS's own refusal with its own words (the field's route): those, then the line", () => {
     expect(
       authRefusal(

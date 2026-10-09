@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use apprafter_desktop_ipc::{AuthOutcome, CancelledBy, UnavailableReason};
 use UnavailableReason::{
     DisabledByPolicy, NoAgent, NoBackend, NotConfigured, NotInteractive, NotPermittedHere,
-    PolicyMissing,
+    PasswordExpired, PolicyMissing,
 };
 
 const fn cancelled(by: CancelledBy) -> AuthOutcome {
@@ -183,23 +183,26 @@ impl LogonError {
 }
 
 /// A `LogonUserW` refusal as an outcome. A wrong password, and any code not named here, is
-/// `Failed { exhausted: false }`; a locked-out account is `Failed { exhausted: true }`. An
-/// account Windows would not sign in here whatever the password (disabled, expired, outside its
-/// hours, an expired password it must change at the Windows sign-in) is
-/// `Unavailable { NotPermittedHere }`, final for now: no way of asking changes it. An account
-/// without a password is `Unavailable { NotConfigured }`: there is no password to check.
+/// `Failed { exhausted: false }`; a locked-out account is `Failed { exhausted: true }`. A password
+/// that has expired or must be changed at the next sign-in is `Unavailable { PasswordExpired }`:
+/// the owner typed the right one and must change it first, and is told so. An account Windows
+/// would not sign in here whatever the password (disabled, expired, outside its hours or
+/// workstations, not granted an interactive logon) is `Unavailable { NotPermittedHere }`, final
+/// for now: no way of asking changes it. An account without a password is
+/// `Unavailable { NotConfigured }`: there is no password to check.
 pub fn map_windows_logon(code: u32) -> AuthOutcome {
     match LogonError::from_code(code) {
         LogonError::LogonFailure | LogonError::Other(_) => failed(false),
         LogonError::AccountLockedOut => failed(true),
         LogonError::AccountRestriction => unavailable(NotConfigured),
+        LogonError::PasswordExpired | LogonError::PasswordMustChange => {
+            unavailable(PasswordExpired)
+        }
         LogonError::InvalidLogonHours
         | LogonError::InvalidWorkstation
-        | LogonError::PasswordExpired
         | LogonError::AccountDisabled
         | LogonError::LogonTypeNotGranted
-        | LogonError::AccountExpired
-        | LogonError::PasswordMustChange => unavailable(NotPermittedHere),
+        | LogonError::AccountExpired => unavailable(NotPermittedHere),
     }
 }
 
@@ -594,18 +597,19 @@ mod tests {
     #[test]
     fn every_logon_error_has_its_outcome() {
         use LogonError as E;
-        use UnavailableReason::{NotConfigured, NotPermittedHere};
+        use UnavailableReason::{NotConfigured, NotPermittedHere, PasswordExpired};
         for (code, named, outcome) in [
             (1326, E::LogonFailure, failed(false)),
             // No password to check: Windows signs such an account in at the console only.
             (1327, E::AccountRestriction, unavailable(NotConfigured)),
             (1328, E::InvalidLogonHours, unavailable(NotPermittedHere)),
             (1329, E::InvalidWorkstation, unavailable(NotPermittedHere)),
-            (1330, E::PasswordExpired, unavailable(NotPermittedHere)),
+            // The right password, expired: the owner must change it, and is told so.
+            (1330, E::PasswordExpired, unavailable(PasswordExpired)),
             (1331, E::AccountDisabled, unavailable(NotPermittedHere)),
             (1385, E::LogonTypeNotGranted, unavailable(NotPermittedHere)),
             (1793, E::AccountExpired, unavailable(NotPermittedHere)),
-            (1907, E::PasswordMustChange, unavailable(NotPermittedHere)),
+            (1907, E::PasswordMustChange, unavailable(PasswordExpired)),
             (1909, E::AccountLockedOut, failed(true)),
             // Not named: never verified, and worth another try.
             (0, E::Other(0), failed(false)),
