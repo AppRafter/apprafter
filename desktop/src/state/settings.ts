@@ -9,8 +9,10 @@
 // the optimistic view, which may hold changes Rust has not taken. Meanwhile the view shows the
 // confirmed settings with every save not yet answered laid over them, in order, so the dialog
 // shows the owner's last choices at once. A refusal (e.g. switching the lock on with nothing to
-// verify the owner) says why in a toast and reads the settings again: what Rust holds then,
-// with the saves still waiting laid over it, is what shows — no snapshot from before is put back.
+// verify the owner) says why in a toast, drops its change from the view at once — the confirmed
+// settings with the saves still waiting, so a read that fails cannot keep it — and reads the
+// settings again: what Rust holds then, with the saves still waiting laid over it, is what
+// shows. No snapshot from before the save is put back.
 import {
   type QueryClient,
   type UseQueryResult,
@@ -95,6 +97,11 @@ export function useSaveSettings(): (change: Partial<Settings>) => void {
     onError: async (error, save) => {
       const ledger = ledgerOf(client);
       ledger.waiting = ledger.waiting.filter((waiting) => waiting !== save);
+      // The refused change leaves the view now, not when the read answers: a read that fails
+      // keeps the entry's data, and the refused theme would stay applied.
+      if (ledger.confirmed !== undefined) {
+        client.setQueryData(SETTINGS_KEY, shown(ledger.confirmed, ledger.waiting));
+      }
       toast({ message: uiErrorOf(error).message, icon: WarningCircleIcon });
       // The next save waits for this: it goes out from what Rust holds now.
       await client.refetchQueries({ queryKey: SETTINGS_KEY });
