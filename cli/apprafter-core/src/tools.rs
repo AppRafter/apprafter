@@ -105,6 +105,7 @@ pub struct InstallHint {
     rename_all_fields = "camelCase"
 )]
 pub enum ToolProblem {
+    /// Not on the search path (`path` is `None`).
     NotFound,
     /// Found only as a `.cmd` / `.bat` shim, which cannot be run directly (Windows).
     Unsupported {
@@ -305,8 +306,14 @@ impl<'a> ToolResolver<'a> {
             .env(PATH_ENV, self.search_path);
         let out = match crate::process::run_bounded(cmd, timeout, cancel) {
             Ok(out) => out,
+            // `resolve` found an executable file, so ENOENT from exec is about what the file
+            // needs: the interpreter of its `#!` line, or the dynamic loader of a binary built
+            // for another libc (NixOS, musl). The tool is installed; `NotFound` would offer
+            // install lines for it and hide the cause.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                status.problem = Some(ToolProblem::NotFound);
+                status.problem = Some(ToolProblem::SpawnFailed {
+                    error: format!("{e}: its interpreter (`#!` line) or dynamic loader is missing"),
+                });
                 return status;
             }
             Err(e) => {
@@ -530,6 +537,31 @@ mod tests {
             (None, Some(ToolProblem::NoVersionOutput { exit: Some(1) }))
         );
         assert!(kubectl.path.is_some(), "it was found, and ran");
+    }
+
+    /// A script whose `#!` interpreter is absent (or a binary whose dynamic loader is): the
+    /// file was found and is executable, and exec fails with ENOENT. The tool is installed.
+    #[cfg(unix)]
+    #[test]
+    fn a_found_tool_whose_interpreter_is_missing_is_not_reported_missing() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let helm = dir.path().join("helm");
+        std::fs::write(&helm, "#!/nonexistent/interpreter\n").unwrap();
+        std::fs::set_permissions(&helm, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let p = dir.path().as_os_str().to_owned();
+        let status = ToolResolver::new(&p, None, false).probe(
+            ToolId::Helm,
+            Duration::from_secs(5),
+            &CancellationToken::new(),
+        );
+        assert_eq!(status.path, Some(helm.display().to_string()));
+        match status.problem {
+            Some(ToolProblem::SpawnFailed { ref error }) => {
+                assert!(error.contains("interpreter"), "{error}")
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[cfg(unix)]
