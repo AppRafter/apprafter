@@ -47,8 +47,8 @@ const UNAVAILABLE: Partial<Record<UnavailableReason, string>> = {
   // The field was used where the OS prompts itself (a stale field, or a lock in between): the
   // re-read app_info then takes the field away, and the OS's prompt is the way.
   use_system_prompt: 'The system asks for your password itself now. Try again.',
-  // Windows: the right password, expired or one that must change at the next sign-in. Final for
-  // this attempt: nothing is held, and the owner changes it in the system first.
+  // Windows: the right password, expired or one that must change at the next sign-in. Nothing
+  // is held, and Rust keeps a plan: the owner changes it in the system, then tries again here.
   password_expired: 'Your system password has expired. Change it, then try again.',
 };
 

@@ -33,8 +33,8 @@ pub enum UnavailableReason {
     /// macOS and Windows always do): the OS's prompt is the way, and asking through it works.
     UseSystemPrompt,
     /// The account's password has expired, or must be changed at the next sign-in (Windows'
-    /// `LogonUserW`): the right password is refused until the owner changes it. Final for this
-    /// attempt.
+    /// `LogonUserW`): the right password is refused until the owner changes it. Asking again
+    /// works once it is changed, so a plan waits for that try.
     PasswordExpired,
     NoPamService,
     NotInteractive,

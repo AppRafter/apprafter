@@ -172,12 +172,14 @@ function forgetLive(entry: Entry) {
 const isLocked = (e: unknown) =>
   e instanceof IpcError && e.error.code === DESKTOP_ERROR_CODES.LOCKED;
 /**
- * `auth_unavailable` reasons where the other way to ask is there (Linux): Rust keeps the plan.
- * Typed by the generated reasons, so a reason Rust renames or drops fails the type check.
+ * `auth_unavailable` reasons after which Rust keeps the plan: the other way to ask is there
+ * (Linux), or the password was right but expired (Windows), and the owner changes it and tries
+ * again. Typed by the generated reasons, so a reason Rust renames or drops fails the type check.
  */
 const OTHER_WAY: ReadonlySet<UnavailableReason> = new Set<UnavailableReason>([
   'no_agent',
   'use_system_prompt',
+  'password_expired',
 ]);
 
 /** Whether `reason`, as a refusal's fields carry it, is one of OTHER_WAY. */
@@ -185,9 +187,10 @@ const isOtherWay = (reason: unknown) => (OTHER_WAY as ReadonlySet<unknown>).has(
 
 /**
  * A refusal after which the plan waits in Rust for another try under the same id: a busy prompt
- * asked nothing; a failed gesture (a wrong password, the back-off) lets the owner try again; and
- * a gesture that could not be asked this way (polkit found no agent, or the field was used where
- * the OS prompts itself) is asked the other way next.
+ * asked nothing; a failed gesture (a wrong password, the back-off) lets the owner try again; a
+ * gesture that could not be asked this way (polkit found no agent, or the field was used where
+ * the OS prompts itself) is asked the other way next; and an expired password is asked again
+ * once the owner has changed it.
  */
 const leavesThePlanWaiting = (e: unknown) => {
   if (!(e instanceof IpcError)) return false;

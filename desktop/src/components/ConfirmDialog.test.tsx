@@ -371,6 +371,50 @@ describe('ConfirmDialog where the OS cannot prompt: the password field', () => {
     }
   });
 
+  test('an expired password: changed meanwhile, a retry confirms the same plan, same opId', async () => {
+    // Windows' credential dialog took the right password, expired: Rust keeps the plan, the
+    // owner changes the password in the system with this dialog still open, and confirms again.
+    const credential: AuthInfo = {
+      ...hello,
+      method: 'windows_credential',
+      biometricsChoice: false,
+    };
+    const sent: unknown[] = [];
+    const answers = [
+      () =>
+        Promise.reject(
+          refusal(DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE, { reason: 'password_expired' }),
+        ),
+      () => 1,
+    ];
+    mockIPC((cmd, args) => {
+      if (cmd !== 'op_execute') return null;
+      sent.push((args as { opId: unknown }).opId);
+      return answers.shift()?.();
+    });
+    try {
+      const { user, onClose } = open({
+        auth: credential,
+        onConfirm: async (typed) => {
+          await execute(7, typed);
+        },
+      });
+      expect(screen.getByText('Confirm with your Windows password next.')).toBeDefined();
+      await user.click(confirm());
+      expect((await screen.findByRole('alert')).textContent).toBe(
+        'Your system password has expired. Change it, then try again.',
+      );
+      expect(onClose).not.toHaveBeenCalled();
+      expect(confirm().disabled).toBe(false);
+      await user.click(confirm());
+      await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
+      expect(sent).toEqual([7, 7]);
+    } finally {
+      resetOperations();
+      clearMocks();
+    }
+  });
+
   test('busy: a check is already open', async () => {
     const { user } = open({
       auth: pam,

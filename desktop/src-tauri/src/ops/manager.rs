@@ -16,9 +16,10 @@
 //! [`ENDED_KEPT`] operations ended after it. A plan that never runs — its prompt refused,
 //! expired, swept, dropped by a lock or by a quit — sends the pages that followed it one
 //! `Failed` saying why, so none of them waits for an end that never comes. A gesture that
-//! failed (a wrong password), or that could not be asked this way while the other way is there,
-//! is not such an end: the plan waits for the owner's next try ([`OperationManager::execute`]
-//! says why), and its pages hear nothing until it runs or ends.
+//! failed (a wrong password), that could not be asked this way while the other way is there,
+//! or that found the password expired, is not such an end: the plan waits for the owner's next
+//! try ([`OperationManager::execute`] says why), and its pages hear nothing until it runs or
+//! ends.
 //!
 //! A plan leaves the manager's maps under its lock and is dropped after the lock is released:
 //! what an executor captured may do anything when it goes, calling back into the manager
@@ -252,8 +253,9 @@ enum Answer {
     Run(Vec<Subscriber>),
     /// The plan waits for another `execute`, as it was, and the caller is told why (with what
     /// the OS said): nothing was asked (busy), the owner was not verified and may try again
-    /// (failed), or the other way to ask is there ([`waits`]). The pages that followed the
-    /// prompt follow the plan again and hear nothing: it has not ended.
+    /// (failed), the other way to ask is there, or the password expired and the owner changes
+    /// it first ([`waits`]). The pages that followed the prompt follow the plan again and hear
+    /// nothing: it has not ended.
     Again(Refusal, Vec<Subscriber>),
     /// Refused, for the reason given (with what the OS said); the pages that followed the
     /// prompt are told it.
@@ -319,7 +321,7 @@ impl OperationManager {
     /// `AuthFailed`, when the owner was not verified (a wrong password, a finger not
     /// recognised) or a back-off turned the try away; and on `AuthUnavailable` with `NoAgent`
     /// or `UseSystemPrompt`, when the gesture could not be asked this way and the other way is
-    /// there ([`waits`]).
+    /// there, or with `PasswordExpired`, when the owner changes the password first ([`waits`]).
     ///
     /// When the plan needs the owner, this asks `auth` and blocks until the prompt answers
     /// (so the caller is a blocking thread, never an async worker). Anything but `Verified`
@@ -335,12 +337,15 @@ impl OperationManager {
     /// limits on its prompts — not the plan's. Every other rule holds: the plan runs once, its
     /// time to live runs from when it was planned, and a cancel, a lock or a quit drops it. A
     /// cancel is the owner (or the app, or the system) saying no, so it ends the plan. An
-    /// unavailable gesture ends it too, but for two reasons on Linux, where asking again does
-    /// make it available because the route switches: polkit found no agent (`NoAgent`), and the
-    /// app's own field takes over; the field was used where the OS prompts itself
-    /// (`UseSystemPrompt`), and the OS's prompt takes over. No password was checked either
-    /// time, and the next try goes through the password back-off or the OS's prompt. Every other
-    /// reason asking again does not change: the OS's own refusal (`NotPermittedHere`: an
+    /// unavailable gesture ends it too, but not for the reasons asking again does change. Two
+    /// are Linux's, where the route switches: polkit found no agent (`NoAgent`), and the app's
+    /// own field takes over; the field was used where the OS prompts itself (`UseSystemPrompt`),
+    /// and the OS's prompt takes over. No password was checked either time, and the next try
+    /// goes through the password back-off or the OS's prompt. The third is Windows' credential
+    /// dialog given the right password, expired (`PasswordExpired`): the owner changes it in the
+    /// system, the dialog still open, and confirms again; that try asks the OS again, and the
+    /// expired one counted toward the dialog's back-off as a wrong one does. Every other reason
+    /// asking again does not change: the OS's own refusal (`NotPermittedHere`: an
     /// administrator's polkit rule, a Windows account outside its logon hours), no policy, no
     /// backend, no PAM service, not interactive…
     ///
@@ -811,16 +816,19 @@ fn refuse_prompts(prompts: &mut HashMap<OpId, Prompt>) -> Vec<CancellationToken>
 
 /// Whether the plan waits for the owner's next try after `outcome`, rather than ending
 /// ([`OperationManager::execute`] says why): another prompt was open, the owner was not
-/// verified, or the gesture could not be asked this way and the other way is there (on Linux,
+/// verified, the gesture could not be asked this way and the other way is there (on Linux,
 /// polkit without an agent hands over to the app's field, and the field where the OS prompts
-/// itself hands back to the OS's prompt).
+/// itself hands back to the OS's prompt), or the password was right but expired, and the owner
+/// tries again once it is changed.
 fn waits(outcome: AuthOutcome) -> bool {
     matches!(
         outcome,
         AuthOutcome::Busy
             | AuthOutcome::Failed { .. }
             | AuthOutcome::Unavailable {
-                reason: UnavailableReason::NoAgent | UnavailableReason::UseSystemPrompt,
+                reason: UnavailableReason::NoAgent
+                    | UnavailableReason::UseSystemPrompt
+                    | UnavailableReason::PasswordExpired,
             }
     )
 }
@@ -828,7 +836,8 @@ fn waits(outcome: AuthOutcome) -> bool {
 /// What a prompt's answer means for plan `id`. `prompt` is its entry, gone when it was
 /// closed some other way; `expired` says the plan's time to live passed while it was open.
 /// What the OS said comes with a refusal the OS gave, never with a yes refused afterwards.
-/// A failed gesture keeps the plan, as does one asked the wrong way ([`waits`]).
+/// A failed gesture keeps the plan, as does one asked the wrong way or with an expired password
+/// ([`waits`]).
 fn judge(
     id: OpId,
     answer: thread::Result<PasswordAnswer>,
@@ -1354,11 +1363,11 @@ mod tests {
                 .into_iter()
                 .map(|by| (AuthOutcome::Cancelled { by }, DesktopError::AuthCancelled))
                 .collect();
-        // Every reason but the two that switch the route (kept: the next test). A refusal of the
-        // OS's own (an administrator's rule, the account's logon hours) is final.
+        // Every reason but those that switch the route (kept: the next test) and an expired
+        // password (kept for the retry after the change). A refusal of the OS's own (an
+        // administrator's rule, the account's logon hours) is final.
         for reason in [
             UnavailableReason::NotPermittedHere,
-            UnavailableReason::PasswordExpired,
             UnavailableReason::NotConfigured,
             UnavailableReason::DisabledByPolicy,
             UnavailableReason::PolicyMissing,
@@ -1496,6 +1505,33 @@ mod tests {
             ),
             "once run, it is spent"
         );
+    }
+
+    /// The right password, expired (Windows' credential dialog): the owner changes it in the
+    /// system with the dialog still open and confirms again, so the plan waits under the same
+    /// id, its pages told nothing, and the retry asks the OS again and runs it.
+    #[test]
+    fn an_expired_password_keeps_the_plan_and_the_retry_after_the_change_runs_it() {
+        let (_, mgr) = manager();
+        let auth = FakeAuthenticator::new();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let view = mgr.register_plan(parts(PlanClass::Destructive), counting(&runs));
+        let sink = VecSink::new("main");
+        mgr.subscribe(view.op_id, sink.clone()).unwrap();
+        let reason = UnavailableReason::PasswordExpired;
+        auth.then(AuthOutcome::Unavailable { reason });
+        let err = mgr.execute(view.op_id, &auth).unwrap_err();
+        assert_eq!(
+            err.to_ui(),
+            DesktopError::AuthUnavailable { reason }.to_ui()
+        );
+        assert!(sink.events().is_empty(), "the plan has not ended");
+        assert_eq!(runs.load(SeqCst), 0);
+        assert_eq!(mgr.execute(view.op_id, &auth).unwrap(), view.op_id);
+        assert_eq!(wait_ended(&mgr, view.op_id), OpState::Finished);
+        assert_eq!(runs.load(SeqCst), 1);
+        assert_eq!(auth.asked().len(), 2, "the retry asked the OS again");
+        assert_eq!(sink.events(), vec![completed(json!(null))]);
     }
 
     /// The back-off's refusal is a failure too: the plan waits, and every try it turns away
@@ -2744,13 +2780,14 @@ mod tests {
             exhausted: false,
             retry_in_ms: None,
         };
-        let other_way = |reason| AuthOutcome::Unavailable { reason };
+        let unavailable = |reason| AuthOutcome::Unavailable { reason };
         for answered in [
             AuthOutcome::Verified,
             AuthOutcome::Busy,
             failed,
-            other_way(UnavailableReason::NoAgent),
-            other_way(UnavailableReason::UseSystemPrompt),
+            unavailable(UnavailableReason::NoAgent),
+            unavailable(UnavailableReason::UseSystemPrompt),
+            unavailable(UnavailableReason::PasswordExpired),
         ] {
             for (how, pass) in ways {
                 let (clock, mgr) = manager();
@@ -3253,12 +3290,13 @@ mod tests {
             exhausted: false,
             retry_in_ms: None,
         };
-        let other_way = |reason| AuthOutcome::Unavailable { reason };
+        let unavailable = |reason| AuthOutcome::Unavailable { reason };
         for answered in [
             AuthOutcome::Busy,
             failed,
-            other_way(UnavailableReason::NoAgent),
-            other_way(UnavailableReason::UseSystemPrompt),
+            unavailable(UnavailableReason::NoAgent),
+            unavailable(UnavailableReason::UseSystemPrompt),
+            unavailable(UnavailableReason::PasswordExpired),
         ] {
             let (_, mgr) = manager();
             let (auth, opened, answer) = held_prompt();
