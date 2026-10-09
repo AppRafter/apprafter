@@ -16,6 +16,10 @@ repository.workspace   = true
 # forbidden by tests/guards.rs: under cli/'s `cargo test --all-features` it would write files
 # into this crate).
 ts = ["dep:ts-rs"]
+# `error::samples`, one value of every CoreError variant, for another crate's tests (the CLI's
+# CoreError renderer). Enabled only by platform-cli's [dev-dependencies]: under resolver 2 a
+# dev-dependency's features never reach the shipped binary.
+test-support = []
 
 [dependencies]
 # `ureq` and `zeroize` are already in both locks (cli/ and desktop/) at the same versions, and
