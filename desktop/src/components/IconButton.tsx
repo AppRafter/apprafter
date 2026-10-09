@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
-import type { ButtonHTMLAttributes } from 'react';
+import type { ButtonHTMLAttributes, Ref } from 'react';
 import type { Icon } from './icons';
 
 export interface IconButtonProps
@@ -11,6 +11,7 @@ export interface IconButtonProps
   tone?: 'default' | 'danger';
   /** A toggle's state (aria-pressed); leave out for a plain button. */
   pressed?: boolean;
+  ref?: Ref<HTMLButtonElement>;
 }
 
 export function IconButton({

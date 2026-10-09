@@ -7,7 +7,10 @@
 // sideways, and the shown tab is scrolled into view, so every tab stays reachable and its close
 // button usable. The keyboard follows the ARIA tabs pattern: one tab stop (the shown tab, or
 // the first while the Targets view shows), the arrow keys, Home and End move to a tab and show
-// it, wrapping at the ends. Each tab controls its view, the tab panel with tabPanelId(key).
+// it, wrapping at the ends, and Delete closes the focused tab — the close buttons are for the
+// pointer and are no Tab stops — handing the focus to the tab that follows it (the one before
+// it for the last, "+" for the only one). Mod+W is not offered: on macOS the app menu's Close
+// Window holds it. Each tab controls its view, the tab panel with tabPanelId(key).
 import { type KeyboardEvent, useEffect, useRef } from 'react';
 import { Badge } from '../components/Badge';
 import { Dot } from '../components/Dot';
@@ -45,6 +48,9 @@ export function TabStrip({
   onNewTab,
 }: TabStripProps) {
   const elements = useRef(new Map<string, HTMLButtonElement>());
+  const plus = useRef<HTMLButtonElement>(null);
+  /** A tab Delete closed, and the tab the focus goes to once it is gone (null: "+"). */
+  const closing = useRef<{ key: string; next: string | null } | null>(null);
   const shown = view.kind === 'tab' ? view.key : null;
   const stop = shown ?? tabs[0]?.key ?? null;
 
@@ -54,7 +60,23 @@ export function TabStrip({
     }
   }, [shown]);
 
+  useEffect(() => {
+    const closed = closing.current;
+    if (closed === null || tabs.some((tab) => tab.key === closed.key)) return;
+    closing.current = null;
+    const next = closed.next === null ? undefined : elements.current.get(closed.next);
+    (next ?? plus.current)?.focus();
+  }, [tabs]);
+
   const onKeyDown = (event: KeyboardEvent, index: number) => {
+    if (event.key === 'Delete') {
+      const tab = tabs[index];
+      if (tab === undefined) return;
+      event.preventDefault();
+      closing.current = { key: tab.key, next: (tabs[index + 1] ?? tabs[index - 1])?.key ?? null };
+      onClose(tab.key);
+      return;
+    }
     const last = tabs.length - 1;
     const target = {
       ArrowRight: index === last ? 0 : index + 1,
@@ -105,6 +127,7 @@ export function TabStrip({
                 label={`Close ${tab.target}`}
                 icon={XIcon}
                 size={22}
+                tabIndex={-1}
                 onClick={(event) => {
                   event.stopPropagation();
                   onClose(tab.key);
@@ -115,6 +138,7 @@ export function TabStrip({
         })}
       </div>
       <IconButton
+        ref={plus}
         label="Open a cluster"
         title={`Open a cluster (${shortcutHint('targets', os)})`}
         icon={PlusIcon}

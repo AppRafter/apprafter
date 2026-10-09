@@ -28,6 +28,27 @@ function strip(view: View, more: Partial<TabStripProps> = {}) {
   return { user: userEvent.setup(), onShow, onClose, onNewTab };
 }
 
+/** A strip whose tabs and view the test changes afterwards, as the shell's reducer would. */
+function closable(view: View) {
+  const onClose = mock();
+  const props = (tabs: readonly TargetTab[], shown: View): TabStripProps => ({
+    tabs,
+    view: shown,
+    os: 'windows',
+    running: new Set<string>(),
+    onShow: mock(),
+    onClose,
+    onNewTab: mock(),
+  });
+  const { rerender } = render(<TabStrip {...props(TABS, view)} />);
+  return {
+    user: userEvent.setup(),
+    onClose,
+    rerender: (tabs: readonly TargetTab[], shown: View) =>
+      rerender(<TabStrip {...props(tabs, shown)} />),
+  };
+}
+
 describe('TabStrip', () => {
   test('one tab per open target; the shown one is selected', () => {
     strip({ kind: 'tab', key: 'b' });
@@ -102,6 +123,44 @@ describe('TabStrip', () => {
     await user.keyboard('{End}');
     expect(document.activeElement).toBe(screen.getByRole('tab', { name: 'staging' }));
     expect(onShow).toHaveBeenLastCalledWith({ kind: 'tab', key: 'b' });
+  });
+
+  test('the close buttons are not Tab stops: the strip stays one stop, as the tabs pattern has it', () => {
+    strip({ kind: 'tab', key: 'a' });
+    for (const name of ['Close prod-eu', 'Close staging']) {
+      expect(screen.getByRole('button', { name }).tabIndex).toBe(-1);
+    }
+  });
+
+  test('Delete closes the focused tab, and the focus moves to the tab that follows it', async () => {
+    const view: View = { kind: 'tab', key: 'a' };
+    const { user, onClose, rerender } = closable(view);
+    screen.getByRole('tab', { name: 'prod-eu' }).focus();
+    await user.keyboard('{Delete}');
+    expect(onClose).toHaveBeenCalledWith('a');
+    // The parent drops the tab and shows its neighbour (sessionReducer's closeTab).
+    rerender([TABS[1] as TargetTab], { kind: 'tab', key: 'b' });
+    expect(document.activeElement).toBe(screen.getByRole('tab', { name: 'staging' }));
+  });
+
+  test('…the last tab hands the focus back to the one before it, and the only one to +', async () => {
+    const { user, onClose, rerender } = closable({ kind: 'tab', key: 'b' });
+    screen.getByRole('tab', { name: 'staging' }).focus();
+    await user.keyboard('{Delete}');
+    expect(onClose).toHaveBeenCalledWith('b');
+    rerender([TABS[0] as TargetTab], { kind: 'tab', key: 'a' });
+    expect(document.activeElement).toBe(screen.getByRole('tab', { name: 'prod-eu' }));
+    await user.keyboard('{Delete}');
+    expect(onClose).toHaveBeenLastCalledWith('a');
+    rerender([], { kind: 'targets' });
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Open a cluster' }));
+  });
+
+  test('other keys on a tab close nothing', async () => {
+    const { user, onClose } = strip({ kind: 'tab', key: 'a' });
+    screen.getByRole('tab', { name: 'prod-eu' }).focus();
+    await user.keyboard('{Backspace}{Enter}x');
+    expect(onClose).not.toHaveBeenCalled();
   });
 
   test('the shown tab is scrolled into view, so one past the window width is reachable', () => {
