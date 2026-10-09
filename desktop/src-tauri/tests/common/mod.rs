@@ -14,9 +14,11 @@ use apprafter_core::{CancellationToken, Context, PathSource};
 use apprafter_desktop::app::{self, SessionSource, Shell, ShellCell};
 use apprafter_desktop::auth::{AuthPurpose, Authenticator, PasswordAnswer};
 use apprafter_desktop::env::ToolSearchPath;
-use apprafter_desktop::ops::SystemClock;
+use apprafter_desktop::ops::{EventSink, SystemClock};
 use apprafter_desktop::settings::SettingsStore;
-use apprafter_desktop_ipc::{AuthInfo, AuthMethod, AuthOutcome, Settings, UnavailableReason};
+use apprafter_desktop_ipc::{
+    AuthInfo, AuthMethod, AuthOutcome, OpEvent, OpId, Settings, UnavailableReason,
+};
 use serde_json::Value;
 use tauri::ipc::{CallbackFn, InvokeBody};
 use tauri::test::{get_ipc_response, mock_builder, MockRuntime, INVOKE_KEY};
@@ -119,6 +121,20 @@ pub fn rig_by(settings: Settings, route: Route) -> Rig {
 /// [`rig_by`], the shell learning the tool search path through `tools` (as the app on macOS
 /// learns it from the login shell), the rest built as the app builds it meanwhile.
 pub fn rig_with_tools(settings: Settings, route: Route, tools: ToolSearchPath) -> Rig {
+    rig_on(settings, route, tools, "http://127.0.0.1:9")
+}
+
+/// [`rig`], the provider API at `base_url` (a loopback mock of it).
+// Read by tests/token_secrecy.rs only; the other targets compile this module too.
+#[allow(dead_code)]
+pub fn rig_with_api(settings: Settings, base_url: &str) -> Rig {
+    let tools = ToolSearchPath::known(Default::default(), PathSource::Explicit);
+    rig_on(settings, Route::Prompt, tools, base_url)
+}
+
+/// The rig, its provider API at `api_base`: nothing answers at the default
+/// (`127.0.0.1:9`), so a test that reaches the provider by mistake fails rather than calls out.
+fn rig_on(settings: Settings, route: Route, tools: ToolSearchPath, api_base: &str) -> Rig {
     let dir = tempfile::tempdir().unwrap();
     let store = SettingsStore::load(dir.path(), &SystemClock);
     store.set(settings).unwrap();
@@ -131,7 +147,7 @@ pub fn rig_with_tools(settings: Settings, route: Route, tools: ToolSearchPath) -
         store,
         auth.clone(),
         Arc::new(SystemClock),
-        Context::for_desktop(dir.path().join("store"), "http://127.0.0.1:9"),
+        Context::for_desktop(dir.path().join("store"), api_base),
         tools,
         false,
         |_| {},
@@ -190,6 +206,48 @@ pub fn invoke(rig: &Rig, cmd: &str, args: Value) -> Result<Value, Value> {
 /// The `UiError.code` of a rejection, if it is one.
 pub fn code(reply: &Result<Value, Value>) -> Option<&str> {
     reply.as_ref().err()?.get("code")?.as_str()
+}
+
+/// An event sink for the webview `main` that keeps every event it is sent.
+// Read by tests/token_secrecy.rs only; the other targets compile this module too.
+#[allow(dead_code)]
+#[derive(Default)]
+pub struct Recorder(pub Mutex<Vec<OpEvent>>);
+
+impl EventSink for Recorder {
+    fn send(&self, event: &OpEvent) -> bool {
+        self.0.lock().unwrap().push(event.clone());
+        true
+    }
+
+    fn webview(&self) -> &str {
+        "main"
+    }
+}
+
+/// Every event of operation `id`, from its first to its end: a [`Recorder`] subscribes, the
+/// replay first (an operation that ended before the subscription has its end there), then what
+/// the recorder hears, until the last is `Finished` or `Failed`. Panics after ten seconds.
+#[allow(dead_code)]
+pub fn follow_to_end(rig: &Rig, id: OpId) -> Vec<OpEvent> {
+    let recorder = Arc::new(Recorder::default());
+    let subscribed = rig.shell.ops.subscribe(id, recorder.clone()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut events = subscribed.replay.clone();
+        events.extend(recorder.0.lock().unwrap().iter().cloned());
+        if matches!(
+            events.last(),
+            Some(OpEvent::Finished { .. } | OpEvent::Failed { .. })
+        ) {
+            return events;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "operation {id:?} never ended: {events:?}"
+        );
+        thread::sleep(Duration::from_millis(2));
+    }
 }
 
 /// What happened, in order, as the tests that quit log it.
