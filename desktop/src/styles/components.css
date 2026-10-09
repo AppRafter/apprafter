@@ -1192,14 +1192,16 @@
 
 /* A fieldset reset: no border, no padding, no min-content floor on its width. The fieldset stays
    a block (flex on a fieldset is not the same in every engine); its legend is a field's label. */
-.choice-cards {
+.choice-cards,
+.radio-list {
   min-inline-size: 0;
   margin: 0;
   padding: 0;
   border: 0;
 }
 
-.choice-cards > legend {
+.choice-cards > legend,
+.radio-list > legend {
   padding: 0;
   margin-bottom: 6px;
 }
@@ -1321,4 +1323,110 @@
 .chip-option-meta {
   color: var(--fg-faint);
   font: 400 var(--fs-11) var(--font-mono);
+}
+
+/* The design's radio: a 14 px ring, filled with a dot when chosen (RadioList, DataTable). */
+.radio-dot {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  border: 1.5px solid var(--border-strong);
+  border-radius: 50%;
+  background: transparent;
+  cursor: pointer;
+  appearance: none;
+}
+
+.radio-dot:checked {
+  border-color: var(--accent);
+  background: var(--accent);
+  box-shadow: inset 0 0 0 3px var(--surface);
+}
+
+.radio-dot:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: 1px;
+}
+
+.radio-dot:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* The rows' box clips a chosen row's tint to its rounded corners. */
+.radio-list-rows {
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--r-4);
+}
+
+.radio-row + .radio-row {
+  border-top: 1px solid var(--border);
+}
+
+.radio-row:hover:not([data-disabled]):not([data-checked]) {
+  background: var(--surface-2);
+}
+
+.radio-row[data-checked] {
+  background: var(--accent-tint);
+}
+
+.radio-row[data-disabled] {
+  opacity: 0.45;
+}
+
+/* The row is dimmed already; its radio is not dimmed twice. */
+.radio-row[data-disabled] .radio-dot:disabled {
+  opacity: 1;
+}
+
+/* Radio, label, detail, meta: the design's SSH key row without its fingerprint column. */
+.radio-row-main {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1.3fr) minmax(0, 0.7fr) minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  font: 400 var(--fs-12-5) var(--font-mono);
+  cursor: pointer;
+}
+
+.radio-row[data-disabled] .radio-row-main {
+  cursor: default;
+}
+
+.radio-row-label,
+.radio-row-detail,
+.radio-row-meta {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.radio-row-label {
+  font-weight: 500;
+}
+
+/* A row with no detail or meta: its text takes the columns they leave. */
+.radio-row-label:last-child {
+  grid-column: 2 / -1;
+}
+
+.radio-row-detail {
+  color: var(--fg-muted);
+}
+
+.radio-row-detail:last-child {
+  grid-column: 3 / -1;
+}
+
+.radio-row-meta {
+  color: var(--fg-faint);
+}
+
+/* Under the row's text: past the radio's 20 px column and the 10 px gap. */
+.radio-row-extra {
+  padding: 0 12px 10px 42px;
 }
