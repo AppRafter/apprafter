@@ -21,16 +21,33 @@ pub enum PlanClass {
     Destructive,
 }
 
+/// What a plan does to one object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeAction {
+    Create,
+    Update,
+    Replace,
+    Keep,
+    Rename,
+    Delete,
+    SetDefault,
+    ClearDefault,
+}
+
 /// One object a plan changes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct PlannedChange {
-    /// What kind of object, e.g. `Target`, `ResourceClaim`.
+    /// What kind of object: D.3 uses `Target`, `Credentials`, `LocalState`, `CliDefault`.
     pub kind: String,
-    /// Which one, e.g. `prod`, `billing-api/pg`.
+    /// Which one, e.g. `prod`.
     pub object: String,
-    /// What happens to it, e.g. `delete`, `1.16.5 → 1.16.6`.
-    pub change: String,
+    /// What happens to it.
+    pub action: ChangeAction,
+    /// One neutral line, e.g. `region: nbg1 → hel1`; never a secret value.
+    pub detail: Option<String>,
 }
 
 /// What a mutation will do, before it does it.
@@ -79,13 +96,14 @@ mod tests {
             changes: vec![PlannedChange {
                 kind: "Target".into(),
                 object: "prod".into(),
-                change: "delete".into(),
+                action: ChangeAction::Delete,
+                detail: None,
             }],
             payload: (),
         };
         let v = serde_json::to_value(&plan).unwrap();
         assert_eq!(v["class"], "destructive");
-        assert_eq!(v["changes"][0]["change"], "delete");
+        assert_eq!(v["changes"][0]["action"], "delete");
 
         let done: Outcome<u8> = Outcome::Completed { result: 7 };
         assert_eq!(serde_json::to_value(&done).unwrap()["status"], "completed");
@@ -97,6 +115,30 @@ mod tests {
             serde_json::to_value(&stopped).unwrap()["status"],
             "cancelled"
         );
+    }
+
+    #[test]
+    fn a_planned_change_has_an_action_and_a_neutral_detail() {
+        let c = PlannedChange {
+            kind: "Target".into(),
+            object: "prod".into(),
+            action: ChangeAction::Update,
+            detail: Some("region: nbg1 → hel1".into()),
+        };
+        assert_eq!(
+            serde_json::to_value(&c).unwrap(),
+            serde_json::json!({"kind":"Target","object":"prod","action":"update","detail":"region: nbg1 → hel1"})
+        );
+        let none = PlannedChange {
+            detail: None,
+            action: ChangeAction::SetDefault,
+            ..c
+        };
+        assert_eq!(
+            serde_json::to_value(&none).unwrap()["action"],
+            "set_default"
+        );
+        assert!(serde_json::to_value(&none).unwrap()["detail"].is_null());
     }
 
     #[cfg(feature = "ts")]
@@ -111,9 +153,15 @@ mod tests {
         );
         let change = PlannedChange::decl(&cfg);
         assert!(
-            change.contains("kind: string") && change.contains("change: string"),
+            change.contains("kind: string")
+                && change.contains("action: ChangeAction")
+                && change.contains("detail: string | null"),
             "{change}"
         );
+        let action = ChangeAction::decl(&cfg);
+        assert!(action.contains("\"clear_default\""), "{action}");
+        let pointer = crate::target_ref::ActivePointerChange::decl(&cfg);
+        assert!(pointer.contains("from: string | null"), "{pointer}");
         let outcome = Outcome::<()>::decl(&cfg);
         assert!(
             outcome.contains("\"status\": \"completed\"")

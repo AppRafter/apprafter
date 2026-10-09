@@ -976,7 +976,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use apprafter_core::{
-        CancellationToken, CoreError, CoreResult, Event, Outcome, PlanClass, PlannedChange, Stream,
+        CancellationToken, ChangeAction, CoreError, CoreResult, Event, Outcome, PlanClass,
+        PlannedChange, Stream,
     };
     use apprafter_desktop_ipc::{
         errors, AuthInfo, AuthOutcome, CancelledBy, OpEvent, OpId, OpState, OutputStream,
@@ -1014,7 +1015,8 @@ mod tests {
             changes: vec![PlannedChange {
                 kind: "Target".into(),
                 object: "prod".into(),
-                change: "delete".into(),
+                action: ChangeAction::Delete,
+                detail: None,
             }],
             ..PlanParts::new(class, "Remove target prod", "delete")
         }

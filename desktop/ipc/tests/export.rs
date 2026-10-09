@@ -16,7 +16,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use apprafter_core::{Outcome, PlanClass, PlannedChange};
+use apprafter_core::{ChangeAction, Outcome, PlanClass, PlannedChange};
 use apprafter_desktop_ipc::{
     errors, AppInfo, AuthInfo, AuthMethod, AuthOutcome, AutoLock, CancelledBy, LockReason,
     LockState, OpEvent, OpId, OpState, OpSummary, Os, OutputStream, PlanView, Quitting, Refresh,
@@ -65,7 +65,7 @@ fn export_the_typescript_bindings() {
         // quit.rs
         Quitting,
         // apprafter-core, as OpEvent and PlanView carry them
-        UiError, PlanClass, PlannedChange, Outcome<serde_json::Value>,
+        UiError, PlanClass, PlannedChange, ChangeAction, Outcome<serde_json::Value>,
     );
     fs::write(tmp.path().join("commands.ts"), commands_ts()).unwrap();
     fs::write(tmp.path().join("errors.ts"), errors_ts()).unwrap();

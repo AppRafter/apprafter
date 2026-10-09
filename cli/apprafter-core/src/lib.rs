@@ -54,7 +54,7 @@ pub use context::{
 };
 pub use env::{EnvSource, MapEnv};
 pub use error::{CoreError, CoreResult, UiError};
-pub use op::{Outcome, Plan, PlanClass, PlannedChange};
+pub use op::{ChangeAction, Outcome, Plan, PlanClass, PlannedChange};
 pub use report::{CollectReporter, Event, NullReporter, Reporter, Stream};
 pub use target_ref::{ActivePointerChange, TargetRef};
 
