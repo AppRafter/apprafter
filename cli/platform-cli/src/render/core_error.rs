@@ -103,12 +103,18 @@ pub(crate) fn cli_help(e: &CoreError) -> Option<String> {
         CoreError::NotProvisioned { name } => {
             format!("Target `{name}` has no server yet: `apprafter up` provisions one.")
         }
-        CoreError::ServerMissing { .. } => {
-            "The server was deleted outside AppRafter, or the token belongs to another Hetzner \
-             project. Check the Hetzner Cloud Console; `apprafter import --force` rebuilds the \
-             local state from the servers labelled `apprafter=true`."
-                .into()
-        }
+        // `import --force` records only a live labelled server named after the cluster
+        // (import.rs `build_snapshot`): after a deletion it finds nothing and writes nothing,
+        // so it answers only the recreated-elsewhere case. `up` creates a server when none of
+        // that name exists and `persist_state` records its id.
+        CoreError::ServerMissing { name, .. } => format!(
+            "Check the Hetzner Cloud Console for the cause. If the server was deleted, \
+             `apprafter up --target {name}` provisions a replacement and records it. If the \
+             token belongs to another Hetzner project, `apprafter target add {name} --renew \
+             --token <X>` stores one from the server's project (an `HCLOUD_TOKEN` in the \
+             environment outranks the stored token). If the cluster's server was recreated \
+             under a new id, `apprafter import --force --target {name}` records it."
+        ),
         CoreError::TargetProvisioned { .. } => {
             "There is no in-place resize. Rebuild from a backup:\n\n    apprafter backup \
              create\n    apprafter restore --reprovision --server-type <sku>\n\n(`target \
@@ -234,6 +240,37 @@ mod tests {
             name: "prod".into(),
         });
         assert!(r.help().unwrap().to_string().contains("`prod`"));
+    }
+
+    #[test]
+    fn a_missing_server_is_sent_to_the_command_that_recovers_its_cause() {
+        // `import --force` records only a live labelled server named after the cluster, so
+        // after a deletion it changes nothing; `up` provisions a replacement and records it.
+        let help = report(CoreError::ServerMissing {
+            name: "prod".into(),
+            server_id: 42,
+        })
+        .help()
+        .unwrap()
+        .to_string();
+        let case = |cause: &str| {
+            help.split(". ")
+                .find(|s| s.contains(cause))
+                .unwrap_or_else(|| panic!("no sentence about {cause:?}: {help}"))
+        };
+        let deleted = case("deleted");
+        assert!(deleted.contains("`apprafter up --target prod`"), "{help}");
+        assert!(!deleted.contains("import"), "{help}");
+        let foreign = case("another Hetzner project");
+        assert!(
+            foreign.contains("`apprafter target add prod --renew --token <X>`"),
+            "{help}"
+        );
+        assert!(!foreign.contains("import"), "{help}");
+        assert!(
+            case("new id").contains("`apprafter import --force --target prod`"),
+            "{help}"
+        );
     }
 
     #[test]
