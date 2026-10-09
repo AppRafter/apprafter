@@ -25,8 +25,9 @@
 //! driver, so there [`turn_off_dmabuf_renderer_on_nvidia_wayland`] restarts the app at once
 //! with `WEBKIT_DISABLE_DMABUF_RENDERER=1`, unless the user set it — a restart, not a
 //! `set_var`, since a thread of WebKitGTK's runs before `main`. It reads the display variables
-//! GTK reads, that one and the restart's mark ([`GraphicsFacts::from_process`]): none of them
-//! is a setting of the app, and none reaches the core.
+//! GTK reads, that one and the restart's mark, which counts only in the process whose ID it
+//! names ([`GraphicsFacts::from_process`]): none of them is a setting of the app, and none
+//! reaches the core.
 //!
 //! Nowhere else in `src/` reads or writes `std::env`: `tests/env_guard.rs` fails on any other
 //! file.
@@ -247,11 +248,21 @@ fn os_bytes(path: &Path) -> impl Iterator<Item = u8> + '_ {
 #[cfg(target_os = "linux")]
 pub const DMABUF_RENDERER_ENV: &str = "WEBKIT_DISABLE_DMABUF_RENDERER";
 
-/// Set, to `1`, in the environment of the process the app restarts into with the renderer off
-/// ([`restart_with_dmabuf_renderer_off`]): its `1` in [`DMABUF_RENDERER_ENV`] is then the app's,
-/// not the user's.
+/// Set, to the process's ID, in the environment of the process the app restarts into with the
+/// renderer off ([`restart_with_dmabuf_renderer_off`]; `exec` keeps the ID): in the process it
+/// names, the `1` in [`DMABUF_RENDERER_ENV`] is the app's, not the user's. Neither can be taken
+/// out of the environment again (the thread `set_var` would race is running), so the programs
+/// the app starts inherit both; to them the mark names another process, and the variable reads
+/// as one the user set ([`names_this_process`]).
 #[cfg(target_os = "linux")]
 pub const DMABUF_RESTARTED_ENV: &str = "APPRAFTER_DESKTOP_DMABUF_RESTARTED";
+
+/// Whether the restart's `mark` names the process `pid`: its ID in decimal, exactly as the
+/// restart writes it.
+#[cfg(target_os = "linux")]
+pub fn names_this_process(mark: Option<&std::ffi::OsStr>, pid: u32) -> bool {
+    mark.is_some_and(|mark| mark == pid.to_string().as_str())
+}
 
 /// The facts [`dmabuf_renderer`] decides on, as [`GraphicsFacts::from_process`] finds them.
 #[cfg(target_os = "linux")]
@@ -268,7 +279,7 @@ pub struct GraphicsFacts {
     pub nvidia_driver: bool,
     /// [`DMABUF_RENDERER_ENV`] as the process has it.
     pub dmabuf_renderer: Option<OsString>,
-    /// [`DMABUF_RESTARTED_ENV`] is set: this process is the app's restart.
+    /// [`DMABUF_RESTARTED_ENV`] names this process: it is the app's restart.
     pub restarted: bool,
 }
 
@@ -279,13 +290,14 @@ impl GraphicsFacts {
     /// its renderer, and the app's mark of its own restart; none of them a setting of the app.
     pub fn from_process() -> Self {
         let exists = |path: &str| Path::new(path).exists();
+        let mark = std::env::var_os(DMABUF_RESTARTED_ENV);
         GraphicsFacts {
             wayland_display: std::env::var_os("WAYLAND_DISPLAY"),
             xdg_session_type: std::env::var_os("XDG_SESSION_TYPE"),
             gdk_backend: std::env::var_os("GDK_BACKEND"),
             nvidia_driver: exists("/sys/module/nvidia") || exists("/proc/driver/nvidia/version"),
             dmabuf_renderer: std::env::var_os(DMABUF_RENDERER_ENV),
-            restarted: std::env::var_os(DMABUF_RESTARTED_ENV).is_some(),
+            restarted: names_this_process(mark.as_deref(), std::process::id()),
         }
     }
 
@@ -320,7 +332,7 @@ pub enum DmabufRenderer {
     /// a Wayland protocol error (`Error 71`), and the variable unset: the app restarts with
     /// [`DMABUF_RENDERER_ENV`] set to `1`. The decision only: the restart replaces the process.
     Restart,
-    /// This process is that restart: the app turned the renderer off.
+    /// This process is that restart (the mark names it): the app turned the renderer off.
     TurnedOff,
     /// NVIDIA's driver under Wayland, and the user has set [`DMABUF_RENDERER_ENV`] (to this
     /// value): theirs stands.
@@ -405,24 +417,40 @@ pub fn apply_dmabuf_renderer(facts: &GraphicsFacts) -> DmabufRenderer {
 }
 
 /// Replace this process with this program again — same process, same arguments and name, the
-/// same environment plus [`DMABUF_RENDERER_ENV`]`=1` and [`DMABUF_RESTARTED_ENV`]`=1`. Returns
-/// only when that failed, with why.
+/// same environment plus [`DMABUF_RENDERER_ENV`]`=1` and [`DMABUF_RESTARTED_ENV`] set to the
+/// process's ID. Returns only when that failed, or cannot be done ([`restart_command`]), with
+/// why.
 #[cfg(target_os = "linux")]
 pub fn restart_with_dmabuf_renderer_off() -> io::Error {
     use std::os::unix::process::CommandExt;
 
-    match std::env::current_exe() {
-        Ok(exe) => restart_command(&exe, std::env::args_os()).exec(),
+    let restart = std::env::current_exe()
+        .and_then(|exe| restart_command(&exe, std::env::args_os(), std::process::id()));
+    match restart {
+        Ok(mut command) => command.exec(),
         Err(error) => error,
     }
 }
 
 /// The restart's command: `exe`, given `args` (the first one the program's name, as it was
-/// started), in the inherited environment plus the variable and the mark.
+/// started), in the inherited environment plus the variable and the mark naming the process
+/// `pid`. None when `exe` is the dynamic loader ([`is_dynamic_loader`]): the process was
+/// started as `ld.so <program> …`, and the loader took its options and the program's path out
+/// of the arguments, so the restart would run the loader with nothing to load.
 #[cfg(target_os = "linux")]
-fn restart_command(exe: &Path, args: impl IntoIterator<Item = OsString>) -> std::process::Command {
+fn restart_command(
+    exe: &Path,
+    args: impl IntoIterator<Item = OsString>,
+    pid: u32,
+) -> io::Result<std::process::Command> {
     use std::os::unix::process::CommandExt;
 
+    if is_dynamic_loader(exe) {
+        return Err(io::Error::other(format!(
+            "it was started through the dynamic loader {}, which a restart cannot repeat",
+            exe.display()
+        )));
+    }
     let mut args = args.into_iter();
     let mut command = std::process::Command::new(exe);
     if let Some(name) = args.next() {
@@ -431,8 +459,21 @@ fn restart_command(exe: &Path, args: impl IntoIterator<Item = OsString>) -> std:
     command
         .args(args)
         .env(DMABUF_RENDERER_ENV, "1")
-        .env(DMABUF_RESTARTED_ENV, "1");
-    command
+        .env(DMABUF_RESTARTED_ENV, pid.to_string());
+    Ok(command)
+}
+
+/// Whether `exe`, this process's image, is the dynamic loader rather than a program: glibc's
+/// `ld-linux*.so.*` (`ld64.so.*` on ppc64 and s390x, `ld.so.*` on some others) or musl's
+/// `ld-musl-*.so.*`.
+#[cfg(target_os = "linux")]
+fn is_dynamic_loader(exe: &Path) -> bool {
+    exe.file_name().is_some_and(|name| {
+        let name = name.to_string_lossy();
+        ["ld-linux", "ld-musl", "ld.so", "ld64.so"]
+            .iter()
+            .any(|loader| name.starts_with(loader))
+    })
 }
 
 #[cfg(test)]
@@ -967,12 +1008,29 @@ mod tests {
             );
         }
 
+        /// The restarted process finds its own ID in the mark, and only it does: a copy that a
+        /// program inherited from the restarted app names another process.
+        #[test]
+        fn the_mark_names_the_restarted_process_alone() {
+            let mark = |value: &str| Some(OsString::from(value));
+            assert!(names_this_process(mark("4242").as_deref(), 4242));
+            for other in ["4243", "1", "04242", "+4242", "4242 ", ""] {
+                assert!(
+                    !names_this_process(mark(other).as_deref(), 4242),
+                    "{other:?}"
+                );
+            }
+            assert!(!names_this_process(None, 4242));
+        }
+
         /// The restart runs this program, with its own arguments and its own name, in the
-        /// environment it has, plus the variable set to `1` and the mark: nothing else changes.
+        /// environment it has, plus the variable set to `1` and the mark naming the process
+        /// (`exec` keeps its ID): nothing else changes.
         #[test]
         fn the_restart_is_this_program_with_its_arguments_and_the_renderer_off() {
             let args = ["apprafter-desktop", "--flag", "two words"].map(OsString::from);
-            let command = restart_command(Path::new("/opt/bin/apprafter-desktop"), args);
+            let command =
+                restart_command(Path::new("/opt/bin/apprafter-desktop"), args, 4242).unwrap();
             assert_eq!(command.get_program(), "/opt/bin/apprafter-desktop");
             let given: Vec<_> = command.get_args().collect();
             assert_eq!(given, ["--flag", "two words"]);
@@ -986,7 +1044,7 @@ mod tests {
                 [
                     (
                         OsString::from(DMABUF_RESTARTED_ENV),
-                        Some(OsString::from("1"))
+                        Some(OsString::from("4242"))
                     ),
                     (
                         OsString::from(DMABUF_RENDERER_ENV),
@@ -994,6 +1052,51 @@ mod tests {
                     ),
                 ]
             );
+        }
+
+        /// Started as `ld-linux-x86-64.so.2 ./apprafter-desktop`, the process's image is the
+        /// loader, and its arguments no longer hold the program or the loader's options: a
+        /// restart would run the loader with nothing to load, and die before any window or log.
+        /// So there is none, and the failure's warning says to set the variable. A program that
+        /// is not a loader restarts, whatever its name or directory.
+        #[test]
+        fn a_process_started_through_the_dynamic_loader_is_not_restarted() {
+            let args = || ["./apprafter-desktop"].map(OsString::from);
+            for loader in [
+                "/lib64/ld-linux-x86-64.so.2",
+                "/lib/ld-linux-aarch64.so.1",
+                "/lib/ld-linux.so.2",
+                "/lib/ld-musl-x86_64.so.1",
+                "/lib/ld.so.1",
+                "/usr/lib/ld.so",
+                "/lib64/ld64.so.2",
+                "/nix/store/0000-glibc-2.40/lib/ld-linux-x86-64.so.2",
+            ] {
+                let error = restart_command(Path::new(loader), args(), 4242)
+                    .expect_err(loader)
+                    .to_string();
+                assert!(
+                    error.contains("dynamic loader") && error.contains(loader),
+                    "{loader}: {error}"
+                );
+                let warning = logged(|| DmabufRenderer::RestartFailed(error.clone()).log());
+                assert!(warning.contains(loader), "{warning}");
+                assert!(
+                    warning.contains("start the app with WEBKIT_DISABLE_DMABUF_RENDERER=1"),
+                    "{warning}"
+                );
+            }
+            for program in [
+                "/opt/bin/apprafter-desktop",
+                "/usr/bin/ld",
+                "/usr/bin/ldd",
+                "/tmp/ld.so.d/apprafter-desktop",
+            ] {
+                assert!(
+                    restart_command(Path::new(program), args(), 4242).is_ok(),
+                    "{program}"
+                );
+            }
         }
 
         #[test]

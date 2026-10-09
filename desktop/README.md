@@ -300,10 +300,17 @@ app shares.
   - When the NVIDIA driver is loaded and the window opens on Wayland, the app turns
     WebKitGTK's DMA-BUF renderer off by itself: that renderer is what closes the window with
     `Error 71` there. At start, before it opens anything, the app restarts itself once with
-    `WEBKIT_DISABLE_DMABUF_RENDERER=1` (and `APPRAFTER_DESKTOP_DMABUF_RESTARTED=1`, which marks
-    the restart). Its log then has a `WebKitGTK's DMA-BUF renderer is off` line. It does this
-    whenever the NVIDIA driver is loaded, also on a laptop whose screen another graphics chip
-    drives.
+    `WEBKIT_DISABLE_DMABUF_RENDERER=1`, and with `APPRAFTER_DESKTOP_DMABUF_RESTARTED` set to
+    its process ID to mark the restart. Its log then has a `WebKitGTK's DMA-BUF renderer is
+    off` line. It does this whenever the NVIDIA driver is loaded, also on a laptop whose screen
+    another graphics chip drives.
+  - Programs the app starts after that restart, such as a browser that opening a link starts,
+    inherit `WEBKIT_DISABLE_DMABUF_RENDERER=1`, so a WebKitGTK program among them runs with
+    that renderer off too. An AppRafter started from one of them takes the inherited value as
+    one you set: its log says `WEBKIT_DISABLE_DMABUF_RENDERER="1" is set`.
+  - Started through the dynamic loader (`/lib64/ld-linux-x86-64.so.2 apprafter-desktop`, as
+    some repackaged AppImages do), the app cannot restart itself. Its log then has a warning
+    that it `could not restart itself`; start it with `WEBKIT_DISABLE_DMABUF_RENDERER=1`.
   - To keep the renderer on, start the app with `WEBKIT_DISABLE_DMABUF_RENDERER=0`. The app
     never changes a value you set yourself, whatever it is.
   - Tauri's [Linux graphics notes](https://tauri.app/develop/debug/linux-graphics/) give more
