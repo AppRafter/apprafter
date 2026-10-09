@@ -66,7 +66,8 @@ pub struct WhoamiReport {
 /// Who the operator is and what the CLI default is. Pings with the STORED token unless
 /// `ctx.no_ping()` — never the CLI's `HCLOUD_TOKEN` override (today's CLI; R4). A dangling
 /// pointer is `Missing`, never an error: the CLI turns it into `TargetNotFound`, the GUI shows a
-/// row. Lockless (R3).
+/// row. Lockless (R3). A token cancelled by the time the verification is over ends the read
+/// with [`CoreError::Cancelled`], never with a report.
 pub fn whoami(ctx: &Context, cancel: &CancellationToken) -> CoreResult<WhoamiReport> {
     let identity = Identity::AnonymousSelfHosted;
     let Some(name) = crate::target::cli_default(ctx)? else {
@@ -88,6 +89,8 @@ pub fn whoami(ctx: &Context, cancel: &CancellationToken) -> CoreResult<WhoamiRep
     let token = t.credentials.hetzner_token.clone().map(SecretString::new);
     let verification =
         crate::provider::verification(ctx, &t.config.provider, token.as_ref(), cancel);
+    // `verification` reads a cancelled ping as `Unreachable`; its caller ends the read here.
+    cancel.check()?;
     Ok(WhoamiReport {
         identity,
         cli_default: CliDefaultTarget::Found {
@@ -161,6 +164,44 @@ mod tests {
             if matches!(target.verification, Verification::Verified { .. }))
         );
         ok.assert();
+    }
+
+    /// A cancelled whoami ends `Cancelled`, never a report: `verification` reads a cancelled
+    /// ping as `Unreachable`, and a report would show a provider failure for a read the user
+    /// cancelled. A token cancelled before the call sends nothing.
+    #[test]
+    fn a_cancelled_whoami_is_cancelled_not_unreachable() {
+        let mut s = mockito::Server::new();
+        let ping = route(&mut s, "/v1/locations", 200, LOCATIONS, TOKEN_A)
+            .expect(0)
+            .create();
+        let (_d, ctx) = store_at(&["prod"], Some("prod"), &s.url());
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert!(
+            matches!(whoami(&ctx, &cancel), Err(CoreError::Cancelled)),
+            "{:?}",
+            whoami(&ctx, &cancel)
+        );
+        ping.assert();
+    }
+
+    /// A cancel that lands while the ping is in flight (the ping itself checks only before it
+    /// sends) still ends `Cancelled`, not with the ping's result.
+    #[test]
+    fn a_whoami_cancelled_during_its_ping_is_cancelled() {
+        let mut s = mockito::Server::new();
+        let cancel = CancellationToken::new();
+        let tripped = cancel.clone();
+        let _ping = route(&mut s, "/v1/locations", 200, LOCATIONS, TOKEN_A)
+            .with_body_from_request(move |_| {
+                tripped.cancel();
+                LOCATIONS.as_bytes().to_vec()
+            })
+            .create();
+        let (_d, ctx) = store_at(&["prod"], Some("prod"), &s.url());
+        let got = whoami(&ctx, &cancel);
+        assert!(matches!(got, Err(CoreError::Cancelled)), "{got:?}");
     }
 
     #[test]
