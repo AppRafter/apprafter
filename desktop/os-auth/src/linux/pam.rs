@@ -47,8 +47,9 @@
 //! does. The failure that starts a refusal answers `Failed { exhausted: true }`, and so does
 //! every check the refusal turns away, without calling PAM: that is how "refused by the
 //! back-off" reads. Each says how long the refusal still runs (`retry_in_ms`), by the clock the
-//! caller passes, so the page counts down what is left rather than a guess. Checks run one at a time: one asked while another runs is `Busy`, since
-//! parallel checks would each pass the back-off before any failed.
+//! caller passes, so the page counts down what is left rather than a guess. Checks run one at a
+//! time: one asked while another runs is `Busy`, since parallel checks would each pass the
+//! back-off before any failed.
 //!
 //! Memory: the password is a [`Zeroizing`] string, wiped when the check ends, and nothing here
 //! formats or logs it (the conversation's `Debug` leaves it out). nonstick hands the answer to

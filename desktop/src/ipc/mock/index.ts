@@ -6,9 +6,10 @@
 // (`not_permitted_here`); with `?auth=pam` (Linux's PAM route) the field is the way — it unlocks
 // with MOCK_PASSWORD and refuses anything else as PAM would, saying MOCK_PAM_SAYS, behind Rust's
 // back-off (MOCK_BACKOFF: too many wrong passwords, and every try is turned away for a while,
-// each answer saying how long as `retryInMs`) — and Unlock finds no polkit agent (`no_agent`). What the session tells the app (`?session=`): by default
-// both its locks and its sleeps, as a desktop session does; or one half, or nothing at all (no
-// bus, as in WSL or a container), for the settings' lock-on-sleep row.
+// each answer saying how long as `retryInMs`) — and Unlock finds no polkit agent (`no_agent`).
+// What the session tells the app (`?session=`): by default both its locks and its sleeps, as a
+// desktop session does; or one half, or nothing at all (no bus, as in WSL or a container), for
+// the settings' lock-on-sleep row.
 import type { InvokeArgs } from '@tauri-apps/api/core';
 import { emit } from '@tauri-apps/api/event';
 import { mockIPC, mockWindows } from '@tauri-apps/api/mocks';
