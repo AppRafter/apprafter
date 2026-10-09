@@ -72,3 +72,10 @@ pub(crate) fn seed_state_raw(ctx: &Context, name: &str, body: &str) {
     std::fs::create_dir_all(p.state_dir()).unwrap();
     std::fs::write(p.state_file(), body).unwrap();
 }
+
+/// Load target `name`, change it with `f`, save it back.
+pub(crate) fn edit(ctx: &Context, name: &str, f: impl FnOnce(&mut Target)) {
+    let mut t = cli_core::load_target(&ctx.store(), name).unwrap();
+    f(&mut t);
+    cli_core::save_target(&ctx.store(), &t).unwrap();
+}

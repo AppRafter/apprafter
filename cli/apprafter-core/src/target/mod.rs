@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! The core target API (D.3 overview §3.7): the report and outcome types both clients show, the
-//! name rule, and the reads `hetzner_token` and `public_address`; `list`, `show` and the
-//! mutations arrive in D.3b.
+//! name rule, the reads (`list`, `show`, `hetzner_token`, `public_address`) and the helpers the
+//! mutations share.
 
 pub mod name;
 mod read;
@@ -9,7 +9,7 @@ mod read;
 pub(crate) mod testkit;
 
 pub use name::{validate_name, NameProblem, TARGET_NAME_MAX_LEN};
-pub use read::{hetzner_token, public_address};
+pub use read::{hetzner_token, list, public_address, show};
 
 use cli_core::{StoreLock, StoreLockEvent};
 use serde::Serialize;
@@ -288,6 +288,12 @@ pub fn provisioned(ctx: &Context, target: &TargetRef) -> CoreResult<Option<Provi
             server_name: h.server_name,
             server_type: h.server_type,
         }))
+}
+
+/// The CLI-default pointer as on disk: `None` when `config.yaml` is absent or empty (R1) —
+/// never `GlobalConfig::default()`'s `"default"`.
+pub(crate) fn cli_default(ctx: &Context) -> CoreResult<Option<String>> {
+    Ok(cli_core::resolve_active_target_name(&ctx.store(), None)?)
 }
 
 #[cfg(test)]
