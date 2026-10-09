@@ -17,12 +17,14 @@
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
-use apprafter_core::target::{self as core_target, CliDefaultPointer, TargetReport};
-use apprafter_core::{CancellationToken, TargetRef};
+use apprafter_core::target::{self as core_target, CliDefaultPointer, TargetRemoved, TargetReport};
+use apprafter_core::{
+    ActivePointerChange, CancellationToken, Context, CoreError, Outcome, TargetRef,
+};
 use cli_core::target::{
-    default_config_root, list_target_names, load_global_config, load_target, remove_target,
-    rename_target, save_global_config, save_target, validate_hetzner_token_format, GlobalConfig,
-    Target, TargetConfig, TargetCredentials, TargetStorePaths,
+    default_config_root, load_global_config, load_target, save_global_config, save_target,
+    validate_hetzner_token_format, GlobalConfig, Target, TargetConfig, TargetCredentials,
+    TargetStorePaths,
 };
 use cli_core::{CliError, Result};
 use cli_providers::hetzner_cloud::validate_server_type;
@@ -40,7 +42,9 @@ use cli_providers::cert::{
 
 use crate::commands::hcloud::hcloud_base_url;
 use crate::commands::state_paths::resolve_state_paths;
+use crate::commands::target_legacy;
 use crate::render::core_error::report;
+use crate::render::reporter::CliReporter;
 
 /// Maximum length for a target name. Matches the spec
 /// (`cli-dx-task.md` §5.1 validation rules). A short cap keeps
@@ -87,9 +91,6 @@ pub fn run(action: TargetCommand) -> miette::Result<()> {
             server_type,
         })
         .map_err(miette::Report::new),
-        TargetCommand::Use { name } => run_use(&name).map_err(miette::Report::new),
-        TargetCommand::Rename { from, to } => run_rename(&from, &to).map_err(miette::Report::new),
-        TargetCommand::Remove { name, yes } => run_remove(&name, yes).map_err(miette::Report::new),
         TargetCommand::Cert { action } => run_cert(action).map_err(miette::Report::new),
         TargetCommand::Domain { action } => {
             crate::commands::target_domain::run(action).map_err(miette::Report::new)
@@ -110,7 +111,11 @@ pub fn run(action: TargetCommand) -> miette::Result<()> {
             },
         )
         .map_err(miette::Report::new),
-        TargetCommand::List | TargetCommand::Show { .. } => {
+        TargetCommand::List
+        | TargetCommand::Show { .. }
+        | TargetCommand::Use { .. }
+        | TargetCommand::Rename { .. }
+        | TargetCommand::Remove { .. } => {
             unreachable!("`dispatch` runs this sub-command on the core")
         }
     }
@@ -701,6 +706,7 @@ fn ensure_active_target(paths: &TargetStorePaths, name: &str) -> Result<bool> {
 mod tests {
     use super::*;
     use apprafter_core::target::{ProvisionedState, TokenPresence};
+    use cli_core::target::remove_target;
 
     // ── the store lock: what a wait and a lock-less store print ──────────
 
@@ -767,17 +773,6 @@ mod tests {
 
     fn token_of(paths: &TargetStorePaths, name: &str) -> Option<String> {
         load_target(paths, name).unwrap().credentials.hetzner_token
-    }
-
-    /// R1: a store without `config.yaml` has no CLI default. `GlobalConfig::default()` names
-    /// `"default"`, which made `target use default` claim it was already active and write
-    /// nothing, and `target use prod` report a switch away from a pointer that never existed.
-    #[test]
-    fn use_on_a_store_without_config_yaml_names_no_previous_target() {
-        let (_dir, paths) = store();
-        save_target(&paths, &target("default", "t")).unwrap();
-        save_target(&paths, &target("prod", "t")).unwrap();
-        assert_eq!(previous_cli_default(&paths).unwrap(), "");
     }
 
     /// `target add` checks the name, pings the provider unlocked, then
@@ -1346,22 +1341,30 @@ mod tests {
         assert!(help.contains("apprafter target list"), "{help}");
     }
 
-    /// A self-rename is refused rather than performed as a no-op that reports
-    /// success, and the DESTINATION name is shape-checked before the store is
-    /// touched (a rename to `../evil` must never reach the filesystem).
+    /// `target remove`'s last line, for each way the CLI default can move.
     #[test]
-    fn rename_refuses_a_self_rename_and_a_malformed_destination() {
-        assert!(check_rename("work", "prod-eu").is_ok());
-
-        let same = check_rename("work", "work").expect_err("a self-rename is a no-op");
-        assert!(format!("{same}").contains("identical"), "{same}");
-
-        for bad in ["../evil", "with space", "-leading", ""] {
-            assert!(
-                check_rename("work", bad).is_err(),
-                "destination `{bad}` must be rejected"
-            );
-        }
+    fn the_removal_line_says_where_the_cli_default_went() {
+        let removed = |cli_default| TargetRemoved {
+            name: "prod".into(),
+            state_removed: false,
+            orphaned_server: None,
+            cli_default,
+        };
+        assert_eq!(remove_done_line(&removed(None)), "target `prod` removed");
+        assert_eq!(
+            remove_done_line(&removed(Some(ActivePointerChange {
+                from: Some("prod".into()),
+                to: Some("staging".into()),
+            }))),
+            "target `prod` removed; active switched to `staging` (alphabetically next)"
+        );
+        assert_eq!(
+            remove_done_line(&removed(Some(ActivePointerChange {
+                from: Some("prod".into()),
+                to: None,
+            }))),
+            "target `prod` removed; no targets left, active pointer cleared"
+        );
     }
 
     // ── list / use readouts ──────────────────────────────────────────────
@@ -1633,42 +1636,43 @@ pub(crate) fn list_summary_line(count: usize, active: &str) -> String {
     }
 }
 
-fn run_use(name: &str) -> Result<()> {
+/// `target use` on the core: plan, then execute (which re-reads the pointer under the lock).
+pub(crate) fn use_target(name: &str) -> miette::Result<()> {
     info!(target = %name, "target use invoked");
-    let paths = TargetStorePaths::for_root(default_config_root()?);
-    let _store_lock = store_lock_if_present(&paths)?;
-    // `load_target` returns TargetNotFound with an `available`
-    // hint when the name doesn't exist — we let that surface
-    // verbatim.
-    let _ = load_target(&paths, name)?;
-
-    let previous = previous_cli_default(&paths)?;
-    if previous == name {
-        println!("target `{name}` was already the active target");
-        return Ok(());
+    let ctx = crate::context::cli_context()?;
+    let tref = TargetRef::named(&ctx, name).map_err(report)?;
+    require_loadable(&ctx, name)?;
+    let plan = core_target::plan_use(&ctx, &tref).map_err(report)?;
+    let used = completed(
+        core_target::execute_use(&ctx, plan, &CliReporter, &CancellationToken::new())
+            .map_err(report)?,
+    )?;
+    match used.pointer {
+        None => println!("target `{name}` was already the active target"),
+        Some(p) => println!(
+            "{}",
+            switched_active_line(p.from.as_deref().unwrap_or(""), name)
+        ),
     }
-    let global = match load_global_config(&paths)? {
-        Some(g) => GlobalConfig {
-            active_target: name.to_string(),
-            ..g
-        },
-        None => GlobalConfig {
-            active_target: name.to_string(),
-            version: cli_core::target::TARGET_STORE_VERSION,
-        },
-    };
-    save_global_config(&paths, &global)?;
-    println!("{}", switched_active_line(&previous, name));
     Ok(())
 }
 
-/// The CLI default as `config.yaml` records it; empty when the file is absent (R1) — never
-/// the `"default"` that `GlobalConfig::default()` carries, which names a pointer that does not
-/// exist.
-fn previous_cli_default(paths: &TargetStorePaths) -> Result<String> {
-    Ok(load_global_config(paths)?
-        .map(|g| g.active_target)
-        .unwrap_or_default())
+/// Today's `target use` / `target remove` found the target with `load_target`, which reads
+/// both of its files: a target whose `config.yaml` or `credentials.yaml` cannot be read is
+/// refused as before. (The core checks only that the target exists.)
+fn require_loadable(ctx: &Context, name: &str) -> miette::Result<()> {
+    cli_core::load_target(&ctx.store(), name)
+        .map(drop)
+        .map_err(miette::Report::new)
+}
+
+/// An outcome the CLI's never-tripped token cannot cancel; `Cancelled` still renders as the
+/// error, as an `Err(CoreError::Cancelled)` from the same call does.
+pub(crate) fn completed<T>(o: Outcome<T>) -> miette::Result<T> {
+    match o {
+        Outcome::Completed { result } => Ok(result),
+        Outcome::Cancelled { .. } => Err(report(CoreError::Cancelled)),
+    }
 }
 
 /// Confirmation for `target use`.
@@ -1749,107 +1753,71 @@ pub(crate) fn resolve_show_target(name: Option<&str>, active: &str) -> Result<St
     }
 }
 
-/// Pre-flight for `target rename`: the DESTINATION name must be well-formed
-/// (the source is validated by the store lookup), and a self-rename is refused
-/// rather than performed as a no-op that reports success.
-pub(crate) fn check_rename(from: &str, to: &str) -> Result<()> {
-    // Validate the destination name shape here (cli_core layer
-    // stays IO-pure on names).
-    check_target_name(to).map_err(CliError::Other)?;
-    if from == to {
-        return Err(CliError::Other(
-            "source and destination target names are identical — nothing to rename".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-fn run_rename(from: &str, to: &str) -> Result<()> {
+/// `target rename` on the core. Its refusals read as today (`target_legacy`).
+pub(crate) fn rename(from: &str, to: &str) -> miette::Result<()> {
     info!(from = %from, to = %to, "target rename invoked");
-    check_rename(from, to)?;
-    let paths = TargetStorePaths::for_root(default_config_root()?);
-    let _store_lock = store_lock_if_present(&paths)?;
-
-    rename_target(&paths, from, to)?;
-
-    // Keep `GlobalConfig.active_target` pointed at the right name.
-    if let Some(mut global) = load_global_config(&paths)? {
-        if global.active_target == from {
-            global.active_target = to.to_string();
-            save_global_config(&paths, &global)?;
-            println!("target renamed: `{from}` → `{to}` (active pointer updated)");
-            return Ok(());
-        }
-    }
-    println!("target renamed: `{from}` → `{to}`");
+    let ctx = crate::context::cli_context()?;
+    let tref = TargetRef::named(&ctx, from).map_err(report)?;
+    let plan = core_target::plan_rename(&ctx, &tref, to).map_err(target_legacy::rename)?;
+    let done = completed(
+        core_target::execute_rename(&ctx, plan, &CliReporter, &CancellationToken::new())
+            .map_err(target_legacy::rename)?,
+    )?;
+    let suffix = if done.cli_default.is_some() {
+        " (active pointer updated)"
+    } else {
+        ""
+    };
+    println!("target renamed: `{from}` → `{to}`{suffix}");
     Ok(())
 }
 
-fn run_remove(name: &str, yes: bool) -> Result<()> {
+/// `target remove` on the core. The confirmation stays the CLI's: `--yes`, else a TTY prompt
+/// (never a lock held across it — `execute_remove` takes the lock after it).
+pub(crate) fn remove(name: &str, yes: bool) -> miette::Result<()> {
     info!(target = %name, yes, "target remove invoked");
-    let paths = TargetStorePaths::for_root(default_config_root()?);
-    // Load to verify existence early and surface the canonical
-    // "available targets" hint when the name is wrong.
-    let _ = load_target(&paths, name)?;
-
+    let ctx = crate::context::cli_context()?;
+    let tref = TargetRef::named(&ctx, name).map_err(report)?;
+    require_loadable(&ctx, name)?;
+    let plan = core_target::plan_remove(&ctx, &tref).map_err(report)?;
     if !yes {
         let stdin_tty = std::io::stdin().is_terminal();
         let stdout_tty = std::io::stdout().is_terminal();
         if !(stdin_tty && stdout_tty) {
-            return Err(CliError::Other(format!(
+            return Err(miette::Report::new(CliError::Other(format!(
                 "non-interactive invocation: pass `--yes` to confirm removing target `{name}` (refusing silent destruction)"
-            )));
+            ))));
         }
         let confirmed = inquire::Confirm::new(&remove_prompt(name))
             .with_default(false)
             .prompt()
-            .map_err(map_remove_prompt_error)?;
+            .map_err(|e| miette::Report::new(map_remove_prompt_error(e)))?;
         if !confirmed {
             println!("{}", remove_aborted_line(name));
             return Ok(());
         }
     }
-
-    // Taken after the confirmation, never across it: a prompt can wait on
-    // a human indefinitely. `remove_target` re-checks that the target
-    // still exists under the lock.
-    let _store_lock = store_lock_if_present(&paths)?;
-    remove_target(&paths, name)?;
-
-    // If the removed target was active, repoint the active marker
-    // at the first remaining target alphabetically. With no
-    // targets left, clear the active pointer entirely (delete
-    // config.yaml) so the next `target add` flips back to the
-    // "first target on fresh store" greeting.
-    if previous_cli_default(&paths)? == name {
-        let remaining = list_target_names(&paths)?;
-        match remaining.into_iter().next() {
-            Some(next) => {
-                // The pointer named `name`, so `config.yaml` exists: keep its other fields.
-                let global = GlobalConfig {
-                    active_target: next.clone(),
-                    ..load_global_config(&paths)?.unwrap_or_default()
-                };
-                save_global_config(&paths, &global)?;
-                println!(
-                    "target `{name}` removed; active switched to `{next}` (alphabetically next)"
-                );
-            }
-            None => {
-                // No targets left — drop the global config file so
-                // `load_global_config` returns None again, which
-                // `target add` interprets as "fresh store".
-                let cfg_file = paths.global_config_file();
-                if cfg_file.exists() {
-                    std::fs::remove_file(cfg_file)?;
-                }
-                println!("target `{name}` removed; no targets left, active pointer cleared");
-            }
-        }
-    } else {
-        println!("target `{name}` removed");
-    }
+    let done = completed(
+        core_target::execute_remove(&ctx, plan, &CliReporter, &CancellationToken::new())
+            .map_err(report)?,
+    )?;
+    println!("{}", remove_done_line(&done));
     Ok(())
+}
+
+/// The line `target remove` ends with: where the CLI default went, when it named the target.
+pub(crate) fn remove_done_line(r: &TargetRemoved) -> String {
+    match &r.cli_default {
+        Some(ActivePointerChange { to: Some(next), .. }) => format!(
+            "target `{}` removed; active switched to `{next}` (alphabetically next)",
+            r.name
+        ),
+        Some(ActivePointerChange { to: None, .. }) => format!(
+            "target `{}` removed; no targets left, active pointer cleared",
+            r.name
+        ),
+        None => format!("target `{}` removed", r.name),
+    }
 }
 
 /// The removal confirmation. It has to enumerate WHAT is destroyed: an

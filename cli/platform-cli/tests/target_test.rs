@@ -981,6 +981,37 @@ fn target_remove_on_missing_target_surfaces_available_hint() {
         .stderr(contains("target `ghost` not found"));
 }
 
+/// `use` and `remove` find their target by reading both of its files, as they always have: a
+/// target whose credentials file cannot be parsed is refused and left in place, and the CLI
+/// default does not move onto it. (The core checks only that a target exists; the CLI keeps
+/// this check so moving onto the core changes nothing here.)
+#[test]
+fn target_use_and_remove_refuse_a_target_whose_files_cannot_be_read() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_two_targets(dir.path());
+    std::fs::write(
+        dir.path().join("targets/second/credentials.yaml"),
+        "hetzner_token: [unclosed",
+    )
+    .unwrap();
+
+    for args in [
+        &["target", "use", "second"][..],
+        &["target", "remove", "second", "--yes"][..],
+    ] {
+        cli()
+            .env("APPRAFTER_CONFIG_DIR", dir.path())
+            .env("APPRAFTER_NO_PING", "1")
+            .args(args)
+            .assert()
+            .failure()
+            .stderr(contains("credentials.yaml"));
+    }
+    assert!(dir.path().join("targets/second/config.yaml").exists());
+    let global = std::fs::read_to_string(dir.path().join("config.yaml")).unwrap();
+    assert!(global.contains("active_target: first"), "{global}");
+}
+
 #[test]
 fn target_alias_t_subcommand_resolves_to_target() {
     // Smoke for the `apprafter t add …` alias declared in clap.

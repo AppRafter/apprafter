@@ -21,6 +21,9 @@ pub(crate) fn dispatch(args: Cli) -> miette::Result<()> {
         Commands::Target { action } => match action {
             TargetCommand::List => commands::target::list(),
             TargetCommand::Show { name } => commands::target::show(name.as_deref()),
+            TargetCommand::Use { name } => commands::target::use_target(&name),
+            TargetCommand::Rename { from, to } => commands::target::rename(&from, &to),
+            TargetCommand::Remove { name, yes } => commands::target::remove(&name, yes),
             // `cert`, `domain`, `firewall` and `ip`.
             other => commands::target::run(other),
         },

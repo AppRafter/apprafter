@@ -47,6 +47,7 @@ pub mod status;
 pub mod target;
 pub mod target_domain;
 pub mod target_firewall;
+pub(crate) mod target_legacy;
 pub mod target_machine;
 pub mod target_wizard;
 pub mod top;
