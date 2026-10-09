@@ -6,6 +6,7 @@
 //! Tauri-free, so the shell depends on this crate and never the other way round. Every backend
 //! answers with the one [`AuthOutcome`](apprafter_desktop_ipc::AuthOutcome); [`outcome`] holds
 //! how each OS's result becomes one, as pure functions that compile and are tested on every OS.
+//! [`session`] watches the OS's lock and sleep signals, which lock the app.
 
 mod action;
 pub mod outcome;
@@ -17,10 +18,15 @@ pub mod linux;
 #[cfg(any(target_os = "macos", test))]
 pub mod macos;
 
+pub mod session;
+
 #[cfg(windows)]
 pub mod windows;
 
 pub use action::Action;
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+pub use session::watch;
+pub use session::{SessionEvent, SessionWatch};
 
 #[cfg(target_os = "linux")]
 pub use linux::OsAuthenticator;

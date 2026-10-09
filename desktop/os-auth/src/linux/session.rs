@@ -42,6 +42,12 @@ pub fn active_local_session() -> bool {
     active_local_in(Path::new("/"))
 }
 
+/// The id of the logind session polkitd sees this process in (step 1 of the module docs), if
+/// any: the session whose `Lock` the session watch listens for.
+pub(crate) fn session_id() -> Option<String> {
+    session_of(Path::new("/"))
+}
+
 /// [`active_local_session`] with the files under `root`.
 fn active_local_in(root: &Path) -> bool {
     let Some(id) = session_of(root) else {

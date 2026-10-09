@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
 #
 # AppRafter Desktop's Linux authentication (desktop/os-auth/src/linux/) against a real polkitd
-# and a real PAM stack: every test of desktop/os-auth/tests/{polkit,pam}_container.rs, each in a
+# and a real PAM stack, and its session watch (desktop/os-auth/src/session/) against real D-Bus
+# daemons: every test of desktop/os-auth/tests/{polkit,pam,session}_container.rs, each in a
 # fresh podman container of Debian stable with dbus, polkitd, the app's policy file, Debian's
 # PAM (pam_unix and its set-group-id unix_chkpwd) and a user `walk` with a known password.
 #
@@ -31,6 +32,10 @@
 # `--security-opt unmask=/sys/fs/cgroup`, plus, rootless, a cgroup delegated by a systemd user
 # session. CI has no such session, so it runs rootful.
 #
+# The session watch's cases play logind and the screen savers themselves: --fake-logind lets
+# `walk` own org.freedesktop.login1 on the container's system bus (there is no systemd), and
+# --session-bus starts a session bus of `walk`'s and hands the test its address.
+#
 # A case passes only when its one test reported `ok` and the harness ran exactly one test, and
 # the cases here must be exactly the tests in the binaries, so a renamed test cannot turn into
 # an empty, passing run.
@@ -47,7 +52,7 @@ PASSWORD=walk-osauth-test
 SESSION=c1
 
 # The test binaries: desktop/os-auth/tests/<name>.rs.
-TESTS=(polkit_container pam_container)
+TESTS=(polkit_container pam_container session_container)
 # Each case: its test binary, the test's name (unique across the binaries), then the driver's
 # flags for the system it needs.
 CASES=(
@@ -68,6 +73,9 @@ CASES=(
     "pam_container an_administrator_s_no_in_an_active_session_is_final --rule-no"
     "pam_container outside_a_session_the_authenticator_offers_the_password --no-session"
     "pam_container in_an_inactive_session_the_authenticator_offers_the_password --inactive-session"
+    "session_container each_source_reports_its_event --fake-logind --session-bus"
+    "session_container a_dropped_watch_reports_nothing --fake-logind --session-bus"
+    "session_container without_a_session_bus_logind_still_reports --fake-logind"
 )
 
 die() {
@@ -154,6 +162,7 @@ cat >"$work/osauth-case" <<'DRIVER_EOF'
 set -euo pipefail
 
 policy=yes rule=none session=yes active=yes pam_service=yes password=yes
+fake_logind=no session_bus=no
 while [[ $# -gt 2 ]]; do
     case "$1" in
     --no-policy) policy=no ;;
@@ -163,6 +172,8 @@ while [[ $# -gt 2 ]]; do
     --inactive-session) active=no ;;
     --no-pam-service) pam_service=no ;;
     --empty-password) password=no ;;
+    --fake-logind) fake_logind=yes ;;
+    --session-bus) session_bus=yes ;;
     *)
         echo "osauth-case: unknown flag $1" >&2
         exit 2
@@ -225,6 +236,21 @@ if ! mkdir -p "$scope"; then
     exit 3
 fi
 
+if [[ $fake_logind == yes ]]; then
+    # The test plays logind: `walk` may own its name on the system bus and be asked GetSession.
+    mkdir -p /etc/dbus-1/system.d
+    cat >/etc/dbus-1/system.d/apprafter-test-login1.conf <<'POLICY_EOF'
+<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-BUS Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <policy user="walk">
+    <allow own="org.freedesktop.login1"/>
+    <allow send_destination="org.freedesktop.login1"/>
+  </policy>
+</busconfig>
+POLICY_EOF
+fi
+
 mkdir -p /run/dbus
 dbus-daemon --system --fork
 /usr/lib/polkit-1/polkitd --log-level=info >/tmp/polkitd.log 2>&1 &
@@ -242,6 +268,18 @@ if [[ $ready != yes ]]; then
     echo "osauth-case: polkitd did not take its bus name" >&2
     cat /tmp/polkitd.log >&2
     exit 3
+fi
+
+# A session bus of `walk`'s, which only `walk` may connect to.
+session_env=()
+if [[ $session_bus == yes ]]; then
+    address="$(setpriv --reuid=walk --regid=walk --init-groups --reset-env \
+        dbus-daemon --session --fork --print-address=1)"
+    if [[ $address != unix:* ]]; then
+        echo "osauth-case: the session bus did not start (address '$address')" >&2
+        exit 3
+    fi
+    session_env=("DBUS_SESSION_BUS_ADDRESS=$address")
 fi
 
 # The container's loader and library directory (see the script's header).
@@ -263,7 +301,7 @@ status=0
     fi
     exec setpriv --reuid=walk --regid=walk --init-groups --reset-env \
         env APPRAFTER_OSAUTH_CONTAINER=1 APPRAFTER_OSAUTH_PASSWORD="$OSAUTH_PASSWORD" \
-        APPRAFTER_OSAUTH_SESSION="$OSAUTH_SESSION" \
+        APPRAFTER_OSAUTH_SESSION="$OSAUTH_SESSION" "${session_env[@]}" \
         "${loaders[0]}" --library-path "$libdir" \
         "/opt/osauth/$binary" --ignored --exact --nocapture "$name"
 ) || status=$?
@@ -279,7 +317,7 @@ FROM $BASE_IMAGE
 # (/etc/pam.d/common-auth) are already in the base image; naming them keeps it so.
 RUN apt-get update \\
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \\
-      dbus-daemon dbus-bin polkitd \\
+      dbus-daemon dbus-bin dbus-session-bus-common polkitd \\
       libpam0g libpam-modules libpam-modules-bin libpam-runtime \\
  && rm -rf /var/lib/apt/lists/*
 RUN useradd --create-home --shell /bin/bash walk \\

@@ -238,8 +238,9 @@ jobs:
           bun install --frozen-lockfile
           bun run tauri build --debug --no-bundle
 
-  # The Linux backends (desktop/os-auth) against a real polkitd and a real PAM stack: every
-  # case of desktop/os-auth/tests/{polkit,pam}_container.rs in a fresh Debian container,
+  # The Linux backends (desktop/os-auth) against a real polkitd and a real PAM stack, and the
+  # session watch against real D-Bus daemons: every case of
+  # desktop/os-auth/tests/{polkit,pam,session}_container.rs in a fresh Debian container,
   # through the same script a developer runs. Rootful podman: each case puts the test in a
   # logind-style session cgroup, and a rootless podman can write the cgroup tree only under a
   # systemd user session, which the runner does not have. The script fails, never skips, when

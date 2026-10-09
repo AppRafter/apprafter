@@ -17,6 +17,9 @@ repository.workspace   = true
 apprafter-core        = { workspace = true }
 # AuthOutcome: the one answer every backend gives.
 apprafter-desktop-ipc = { path = "../ipc" }
+# A session source the OS does not offer is logged at info and skipped: the version the shell
+# logs through, already in the lock.
+tracing               = "0.1"
 
 # Windows Hello and the Windows credential dialog.
 [target.'cfg(windows)'.dependencies]
@@ -26,7 +29,9 @@ apprafter-desktop-ipc = { path = "../ipc" }
 # needs Win32_Graphics_Gdi for its banner field); GetUserNameExW
 # (Win32_Security_Authentication_Identity); LogonUserW (Win32_Security); CloseHandle and the
 # Win32 errors (Win32_Foundation); CoTaskMemFree and the dialog thread's apartment
-# (Win32_System_Com).
+# (Win32_System_Com). The session watch's message-only window (Win32_UI_WindowsAndMessaging,
+# Win32_System_LibraryLoader), its lock notification (Win32_System_RemoteDesktop) and its
+# suspend notification (Win32_System_Power).
 windows = { version = "0.62", features = [
     "Foundation",
     "Security_Credentials_UI",
@@ -36,7 +41,11 @@ windows = { version = "0.62", features = [
     "Win32_Security_Authentication_Identity",
     "Win32_Security_Credentials",
     "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Power",
+    "Win32_System_RemoteDesktop",
     "Win32_System_WinRT",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 # IAsyncOperation, which windows 0.62 takes from windows-future without re-exporting it: the
 # copy windows already depends on.
@@ -44,17 +53,35 @@ windows-future = "0.3"
 # The password the credential dialog returns, wiped when dropped.
 zeroize = "~1.9"
 
-# LocalAuthentication.
+# LocalAuthentication, and the notifications the session watch listens to.
 [target.'cfg(target_os = "macos")'.dependencies]
-# LAContext's reply block.
+# LAContext's reply block, and the workspace observers' blocks.
 block2 = "0.6"
 # The objc2 already in this workspace's graph (tauri, tao, wry): the same minor, so the lock
 # keeps one objc2.
 objc2 = "0.6"
-# NSString for the reason, NSError for the reply: the version tao and wry already resolve.
+# The Mac's frameworks at the versions tao and wry already resolve. NSWorkspace for its sleep
+# notifications; Core Foundation's distributed centre (CFNotificationCenter, a feature nothing
+# else in the graph turns on), which delivers the screen lock at once.
+objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "NSWorkspace",
+] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "CFDictionary",
+    "CFNotificationCenter",
+    "CFString",
+] }
+# NSString for the reason, NSError for the reply; NSNotification and NSOperation for the
+# block observers (`addObserverForName:object:queue:usingBlock:` is gated on NSOperation,
+# another feature new to the graph).
 objc2-foundation = { version = "0.3.2", default-features = false, features = [
     "std",
+    "block2",
     "NSError",
+    "NSNotification",
+    "NSOperation",
     "NSString",
 ] }
 objc2-local-authentication = { version = "0.3.2", default-features = false, features = [
@@ -80,6 +107,10 @@ nonstick = "~0.1.2"
 libc = "0.2"
 # The password the PAM conversation answers with, wiped when dropped.
 zeroize = "~1.9"
+# The session watch reads the logind and screen-saver streams together on zbus's executor and
+# stops on a closed channel: the versions zbus already pulls in.
+async-channel = "2"
+futures-lite  = "2"
 
 # The PAM service probe's tests build their own /etc/pam.d and /usr/lib/pam.d.
 [target.'cfg(target_os = "linux")'.dev-dependencies]
