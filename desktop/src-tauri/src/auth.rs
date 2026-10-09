@@ -81,8 +81,8 @@ pub trait Authenticator: Send + Sync {
     /// Checks the password the owner typed into the app's own field, which the page shows where
     /// the OS cannot prompt ([`AuthInfo::password_field`], Linux's PAM path). Blocks as
     /// [`verify`](Self::verify) does. Where the OS prompts itself this is
-    /// [`PasswordAnswer::USE_SYSTEM_PROMPT`], and the password is not looked at: an OS whose policy asks
-    /// for more than the user's own password must not be got round through the field.
+    /// [`PasswordAnswer::USE_SYSTEM_PROMPT`], and the password is not looked at: an OS whose
+    /// policy asks for more than the user's own password must not be got round through the field.
     fn verify_password(
         &self,
         _purpose: &AuthPurpose,
@@ -147,7 +147,8 @@ impl Authenticator for NoAuthenticator {
 pub(crate) trait Backend: Send + Sync {
     fn info(&self) -> AuthInfo;
     fn verify(&self, action: Action, cancel: &CancellationToken) -> AuthOutcome;
-    /// Linux's PAM path; elsewhere the field is not the OS's way ([`PasswordAnswer::USE_SYSTEM_PROMPT`]).
+    /// Linux's PAM path; elsewhere the field is not the OS's way
+    /// ([`PasswordAnswer::USE_SYSTEM_PROMPT`]).
     fn verify_password(
         &self,
         action: Action,
