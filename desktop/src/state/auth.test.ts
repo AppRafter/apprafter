@@ -176,6 +176,15 @@ describe('authRefusal, for either way', () => {
     ).toEqual(['The system asks for your password itself now. Try again.']);
   });
 
+  test('the system prompt refused outside an active session: the field is the way', () => {
+    expect(
+      authRefusal(
+        refused(DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE, { reason: 'use_password_field' }),
+        false,
+      ),
+    ).toEqual({ lines: ['Use your system password here instead.'], retryInMs: null });
+  });
+
   test.each([true, false])(
     "the OS's own refusal is final, and never says to try again (field: %p)",
     (viaField) => {

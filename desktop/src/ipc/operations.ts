@@ -178,6 +178,7 @@ const isLocked = (e: unknown) =>
  */
 const OTHER_WAY: ReadonlySet<UnavailableReason> = new Set<UnavailableReason>([
   'no_agent',
+  'use_password_field',
   'use_system_prompt',
   'password_expired',
 ]);
@@ -188,8 +189,8 @@ const isOtherWay = (reason: unknown) => (OTHER_WAY as ReadonlySet<unknown>).has(
 /**
  * A refusal after which the plan waits in Rust for another try under the same id: a busy prompt
  * asked nothing; a failed gesture (a wrong password, the back-off) lets the owner try again; a
- * gesture that could not be asked this way (polkit found no agent, or the field was used where
- * the OS prompts itself) is asked the other way next; and an expired password is asked again
+ * gesture that could not be asked this way (polkit found no agent or refused outside an active
+ * session, or the field was used where the OS prompts itself) is asked the other way next; and an expired password is asked again
  * once the owner has changed it.
  */
 const leavesThePlanWaiting = (e: unknown) => {

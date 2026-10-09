@@ -16,12 +16,14 @@
 //!
 //! polkit's refusal (its probe's `NotPermittedHere`) is not always "polkit cannot prompt here".
 //! Outside an active local session — none, an inactive one, a remote one — it is the policy's
-//! own defaults (`allow_any` and `allow_inactive` are `no`), and the password field stands in.
-//! Inside one the defaults ask (`auth_self`), so the refusal is an administrator's `rules.d` rule
-//! returning NO, and it is final: [`OsAuthenticator::info`] reports nothing available and the
-//! password is refused with that `NotPermittedHere`, PAM unasked — the reason the page reads as
-//! final. Which session polkitd sees is read from the files it reads ([`session`] gives the
-//! method).
+//! own defaults (`allow_any` and `allow_inactive` are `no`), and the password field stands in;
+//! a dialog polkit refuses there (the session stopped being active after the page read `info`)
+//! answers `UsePasswordField`, the way on, not a final refusal. Inside one the defaults ask
+//! (`auth_self`), so the refusal is an administrator's `rules.d` rule returning NO, and it is
+//! final: [`OsAuthenticator::info`] reports nothing available, a dialog answers that
+//! `NotPermittedHere`, and the password is refused with it too, PAM unasked — the reason the
+//! page reads as final. Which session polkitd sees is read from the files it reads
+//! ([`session`] gives the method).
 //!
 //! The password path runs only where polkit cannot prompt. Where it can, the policy is polkit's
 //! to apply — an administrator's rule may ask for more than the user's own password — so
@@ -215,9 +217,12 @@ impl OsAuthenticator {
     /// offers the password field, or, for a final refusal, nothing. `cancel` closes the agent's
     /// dialog. `Busy`, asking polkit nothing, while another request runs.
     ///
-    /// A dialog that finds no agent answers `NoAgent` only where the password field can stand
-    /// in; where PAM cannot check one either, it answers PAM's reason, final and the same as
-    /// [`Self::info`] then reports.
+    /// Two answers send the owner to the password field, and say so only where it can stand in
+    /// (PAM can check a password): a dialog that found no agent (`NoAgent`), and polkit's refusal
+    /// outside an active local session (`UsePasswordField`: its own defaults refuse there, as
+    /// [`Self::info`] reads them). Where PAM cannot check one either, both answer PAM's reason,
+    /// final and the same as [`Self::info`] then reports. Inside an active local session the
+    /// refusal stays `NotPermittedHere`: an administrator's NO, final.
     pub fn verify(&self, action: Action, cancel: &CancellationToken) -> AuthOutcome {
         let _request = match self.request.try_lock() {
             Ok(request) => request,
@@ -231,6 +236,13 @@ impl OsAuthenticator {
             } => {
                 self.no_agent.store(true, Ordering::SeqCst);
                 return self.to_the_field(reason);
+            }
+            // The same test `route` makes: outside an active local session the refusal is the
+            // policy's defaults, and the field is the way.
+            AuthOutcome::Unavailable {
+                reason: UnavailableReason::NotPermittedHere,
+            } if !self.session.active_local() => {
+                return self.to_the_field(UnavailableReason::UsePasswordField);
             }
             // An agent asked: it is there now.
             AuthOutcome::Verified
@@ -293,7 +305,7 @@ mod tests {
     use super::*;
     use UnavailableReason::{
         ImplicitGrant, NoAgent, NoBackend, NoPamService, NotConfigured, NotPermittedHere,
-        PolicyMissing, UseSystemPrompt,
+        PolicyMissing, UsePasswordField, UseSystemPrompt,
     };
 
     const SECRET: &str = "hunter2 but longer";
@@ -679,6 +691,46 @@ mod tests {
             "PAM was never asked: {:?}",
             calls.lock().unwrap()
         );
+    }
+
+    /// polkit refuses a dialog outside an active local session (none, an inactive one, a remote
+    /// one), as when the session stopped being active after `info` offered polkit: its own
+    /// defaults refuse there (`allow_any`, `allow_inactive`), and the password field stands in.
+    /// So the answer is the way on (`UsePasswordField`), not the final `NotPermittedHere` that
+    /// the same refusal is inside an active local session (the test above); `info` then offers
+    /// the field, and PAM checks it.
+    #[test]
+    fn a_dialog_polkit_refuses_outside_an_active_local_session_moves_to_the_field() {
+        let (auth, calls) = authenticator(
+            Err(unavailable(NotPermittedHere)),
+            &[unavailable(NotPermittedHere)],
+            Ok(()),
+        );
+        assert_eq!(
+            auth.verify(Action::Confirm, &CancellationToken::new()),
+            unavailable(UsePasswordField)
+        );
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [Call::Verify(Action::Confirm)],
+            "the dialog's answer checked nothing with PAM"
+        );
+        assert_eq!(auth.info(), pam_info());
+        assert_eq!(password_check(&auth, Action::Confirm), from_pam());
+        // Where PAM cannot check one either, there is no field to move to: PAM's reason, final,
+        // as `info` reports it.
+        for pam in [NoPamService, NotConfigured] {
+            let (auth, _) = authenticator(
+                Err(unavailable(NotPermittedHere)),
+                &[unavailable(NotPermittedHere)],
+                Err(pam),
+            );
+            assert_eq!(
+                auth.verify(Action::Confirm, &CancellationToken::new()),
+                unavailable(pam)
+            );
+            assert_eq!(auth.info().unavailable, Some(pam), "{pam:?}");
+        }
     }
 
     /// Only a refusal is the administrator's: polkit's other reasons for not prompting still

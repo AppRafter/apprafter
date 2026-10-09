@@ -52,8 +52,8 @@ export interface ConfirmDialogProps {
    * The dialog closes once this resolves; a rejection is shown inline and it stays open.
    * `password`: given only when the dialog asked for it (a gesture, where the OS cannot
    * prompt), for execute(). After a wrong password (`auth_failed`), a busy prompt, a gesture
-   * asked the way that is not there (no polkit agent: the field appears; the field where the OS
-   * prompts: the field goes), or an expired password (changed in the system meanwhile) Rust
+   * asked the way that is not there (no polkit agent, or polkit refusing outside an active
+   * session: the field appears; the field where the OS prompts: the field goes), or an expired password (changed in the system meanwhile) Rust
    * keeps the plan, so the owner tries again in place and this runs the same plan (the same
    * opId) again.
    */

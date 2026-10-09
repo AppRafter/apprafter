@@ -47,6 +47,9 @@ const UNAVAILABLE: Partial<Record<UnavailableReason, string>> = {
   // The field was used where the OS prompts itself (a stale field, or a lock in between): the
   // re-read app_info then takes the field away, and the OS's prompt is the way.
   use_system_prompt: 'The system asks for your password itself now. Try again.',
+  // The mirror (Linux): polkit refused outside an active session, where the app's own field is
+  // the way; the re-read app_info then brings the field.
+  use_password_field: 'Use your system password here instead.',
   // Windows: the right password, expired or one that must change at the next sign-in. Nothing
   // is held, and Rust keeps a plan: the owner changes it in the system, then tries again here.
   password_expired: 'Your system password has expired. Change it, then try again.',

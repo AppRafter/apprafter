@@ -32,6 +32,11 @@ pub enum UnavailableReason {
     /// The app's own password field was used where the OS prompts itself (polkit can prompt;
     /// macOS and Windows always do): the OS's prompt is the way, and asking through it works.
     UseSystemPrompt,
+    /// The mirror of `UseSystemPrompt`: the OS's prompt cannot be used here, but the app's own
+    /// password field can, and `AppInfo` now offers it (Linux: polkit refused outside an active
+    /// local session, where its own defaults refuse and PAM stands in). Asking through the
+    /// field works.
+    UsePasswordField,
     /// The account's password has expired, or must be changed at the next sign-in (Windows'
     /// `LogonUserW`): the right password is refused until the owner changes it. Asking again
     /// works once it is changed, so a plan waits for that try.
@@ -151,6 +156,7 @@ mod tests {
             (UnavailableReason::ImplicitGrant, "implicit_grant"),
             (UnavailableReason::NotPermittedHere, "not_permitted_here"),
             (UnavailableReason::UseSystemPrompt, "use_system_prompt"),
+            (UnavailableReason::UsePasswordField, "use_password_field"),
             (UnavailableReason::PasswordExpired, "password_expired"),
             (UnavailableReason::NoPamService, "no_pam_service"),
             (UnavailableReason::NotInteractive, "not_interactive"),

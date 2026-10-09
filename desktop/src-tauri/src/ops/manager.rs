@@ -319,9 +319,10 @@ impl OperationManager {
     /// simply try again, and the plan then waits for another try, under the same id, with the
     /// time it had left: on `AuthBusy`, when another prompt was open and nothing was asked; on
     /// `AuthFailed`, when the owner was not verified (a wrong password, a finger not
-    /// recognised) or a back-off turned the try away; and on `AuthUnavailable` with `NoAgent`
-    /// or `UseSystemPrompt`, when the gesture could not be asked this way and the other way is
-    /// there, or with `PasswordExpired`, when the owner changes the password first ([`waits`]).
+    /// recognised) or a back-off turned the try away; and on `AuthUnavailable` with `NoAgent`,
+    /// `UsePasswordField` or `UseSystemPrompt`, when the gesture could not be asked this way and
+    /// the other way is there, or with `PasswordExpired`, when the owner changes the password
+    /// first ([`waits`]).
     ///
     /// When the plan needs the owner, this asks `auth` and blocks until the prompt answers
     /// (so the caller is a blocking thread, never an async worker). Anything but `Verified`
@@ -337,11 +338,12 @@ impl OperationManager {
     /// limits on its prompts — not the plan's. Every other rule holds: the plan runs once, its
     /// time to live runs from when it was planned, and a cancel, a lock or a quit drops it. A
     /// cancel is the owner (or the app, or the system) saying no, so it ends the plan. An
-    /// unavailable gesture ends it too, but not for the reasons asking again does change. Two
-    /// are Linux's, where the route switches: polkit found no agent (`NoAgent`), and the app's
-    /// own field takes over; the field was used where the OS prompts itself (`UseSystemPrompt`),
-    /// and the OS's prompt takes over. No password was checked either time, and the next try
-    /// goes through the password back-off or the OS's prompt. The third is Windows' credential
+    /// unavailable gesture ends it too, but not for the reasons asking again does change. Three
+    /// are Linux's, where the route switches: polkit found no agent (`NoAgent`) or refused
+    /// outside an active local session (`UsePasswordField`), and the app's own field takes
+    /// over; the field was used where the OS prompts itself (`UseSystemPrompt`), and the OS's
+    /// prompt takes over. No password was checked any of those times, and the next try goes
+    /// through the password back-off or the OS's prompt. The fourth is Windows' credential
     /// dialog given the right password, expired (`PasswordExpired`): the owner changes it in the
     /// system, the dialog still open, and confirms again; that try asks the OS again, and the
     /// expired one counted toward the dialog's back-off as a wrong one does. Every other reason
@@ -817,9 +819,9 @@ fn refuse_prompts(prompts: &mut HashMap<OpId, Prompt>) -> Vec<CancellationToken>
 /// Whether the plan waits for the owner's next try after `outcome`, rather than ending
 /// ([`OperationManager::execute`] says why): another prompt was open, the owner was not
 /// verified, the gesture could not be asked this way and the other way is there (on Linux,
-/// polkit without an agent hands over to the app's field, and the field where the OS prompts
-/// itself hands back to the OS's prompt), or the password was right but expired, and the owner
-/// tries again once it is changed.
+/// polkit without an agent or refusing outside an active local session hands over to the app's
+/// field, and the field where the OS prompts itself hands back to the OS's prompt), or the
+/// password was right but expired, and the owner tries again once it is changed.
 fn waits(outcome: AuthOutcome) -> bool {
     matches!(
         outcome,
@@ -827,6 +829,7 @@ fn waits(outcome: AuthOutcome) -> bool {
             | AuthOutcome::Failed { .. }
             | AuthOutcome::Unavailable {
                 reason: UnavailableReason::NoAgent
+                    | UnavailableReason::UsePasswordField
                     | UnavailableReason::UseSystemPrompt
                     | UnavailableReason::PasswordExpired,
             }
@@ -1407,22 +1410,33 @@ mod tests {
     }
 
     /// The gesture could not be asked this way, and the other way is there: on Linux polkit
-    /// found no agent (`NoAgent`), so the confirm dialog's own field takes over; or the field
-    /// was used where the OS prompts itself (`UseSystemPrompt`), so the OS's prompt does. No
+    /// found no agent (`NoAgent`), or refused outside an active local session
+    /// (`UsePasswordField`), so the confirm dialog's own field takes over; or the field was
+    /// used where the OS prompts itself (`UseSystemPrompt`), so the OS's prompt does. No
     /// password was checked, so the plan waits, its pages told nothing, and the next try — the
     /// other way — runs it under the same id.
     #[test]
     fn a_gesture_that_could_not_ask_this_way_keeps_the_plan_for_the_other_way() {
         // polkit finds no agent; the field checks the password.
         let pam = FakeAuthenticator::new().with_password("open sesame".to_owned());
+        // polkit refuses this session; the field checks the password.
+        let refused = FakeAuthenticator::new().with_password("open sesame".to_owned());
+        refused.then(AuthOutcome::Unavailable {
+            reason: UnavailableReason::UsePasswordField,
+        });
         // The OS prompts itself; the field is not its way.
         let prompt = FakeAuthenticator::new();
         type Try<'a> = (&'a FakeAuthenticator, Option<Zeroizing<String>>);
-        let ways: [(UnavailableReason, Try, Try); 2] = [
+        let ways: [(UnavailableReason, Try, Try); 3] = [
             (
                 UnavailableReason::NoAgent,
                 (&pam, None),
                 (&pam, typed("open sesame")),
+            ),
+            (
+                UnavailableReason::UsePasswordField,
+                (&refused, None),
+                (&refused, typed("open sesame")),
             ),
             (
                 UnavailableReason::UseSystemPrompt,
@@ -2787,6 +2801,7 @@ mod tests {
             failed,
             unavailable(UnavailableReason::NoAgent),
             unavailable(UnavailableReason::UseSystemPrompt),
+            unavailable(UnavailableReason::UsePasswordField),
             unavailable(UnavailableReason::PasswordExpired),
         ] {
             for (how, pass) in ways {
@@ -3296,6 +3311,7 @@ mod tests {
             failed,
             unavailable(UnavailableReason::NoAgent),
             unavailable(UnavailableReason::UseSystemPrompt),
+            unavailable(UnavailableReason::UsePasswordField),
             unavailable(UnavailableReason::PasswordExpired),
         ] {
             let (_, mgr) = manager();

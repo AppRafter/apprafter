@@ -222,7 +222,7 @@ pub async fn op_discard(shell: ShellState<'_>, op_id: OpId) -> Result<(), UiErro
 /// (`apprafter::desktop::auth_failed`: a wrong password, a finger not recognised, or the
 /// back-off, which says how long it still refuses as `fields.retryInMs`), a gesture asked the
 /// way that is not there while the other is (`apprafter::desktop::auth_unavailable` with
-/// `no_agent` or `use_system_prompt`), and an expired password (`password_expired`, which the
+/// `no_agent`, `use_password_field` or `use_system_prompt`), and an expired password (`password_expired`, which the
 /// owner changes first). The plan then waits for the owner to try again with the same `op_id`,
 /// and the channel's subscription has already ended.
 ///

@@ -332,13 +332,14 @@ fn an_administrator_s_no_in_an_active_session_is_final() {
     );
 }
 
-/// Where polkit's own defaults refuse, the password field stands in for it.
+/// Where polkit's own defaults refuse, the password field stands in for it: a dialog polkit
+/// refuses there says to use the field (`UsePasswordField`), not the final `NotPermittedHere`.
 fn the_password_stands_in_for_polkit_s_refusal(right: &str) {
     let auth = OsAuthenticator::new();
     assert_eq!(auth.info(), available(AuthMethod::Pam, true));
     assert_eq!(
         auth.verify(Action::Unlock, &CancellationToken::new()),
-        unavailable(UnavailableReason::NotPermittedHere)
+        unavailable(UnavailableReason::UsePasswordField)
     );
     let checked = auth.verify_password(
         Action::Unlock,

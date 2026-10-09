@@ -395,14 +395,15 @@ describe('execute', () => {
   });
 
   // A busy prompt, a wrong password, a gesture asked the way that is not there while the other
-  // is (Linux without a polkit agent; the field where the OS prompts), or an expired password
-  // the owner changes before trying again: Rust sends nothing, the plan waits for another try,
-  // and this call's subscription is gone.
+  // is (Linux without a polkit agent, or polkit refusing outside an active session; the field
+  // where the OS prompts), or an expired password the owner changes before trying again: Rust
+  // sends nothing, the plan waits for another try, and this call's subscription is gone.
   test.each([
     [DESKTOP_ERROR_CODES.AUTH_BUSY, {}],
     [DESKTOP_ERROR_CODES.AUTH_FAILED, { exhausted: false }],
     [DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE, { reason: 'no_agent' }],
     [DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE, { reason: 'use_system_prompt' }],
+    [DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE, { reason: 'use_password_field' }],
     [DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE, { reason: 'password_expired' }],
   ])(
     'a refusal that leaves the plan waiting (%s %o) leaves an earlier subscription following it',
