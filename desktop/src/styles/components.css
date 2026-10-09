@@ -1187,3 +1187,75 @@
 .error-actions {
   margin-top: 4px;
 }
+
+/* ChoiceCardGroup, ChipSelect, RadioList: a group of native radios ------------------------ */
+
+/* A fieldset reset: no border, no padding, no min-content floor on its width. The fieldset stays
+   a block (flex on a fieldset is not the same in every engine); its legend is a field's label. */
+.choice-cards {
+  min-inline-size: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.choice-cards > legend {
+  padding: 0;
+  margin-bottom: 6px;
+}
+
+.choice-cards-hint {
+  margin-top: 6px;
+}
+
+.choice-cards-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.choice-cards-grid[data-columns="2"] {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.choice-cards-grid[data-columns="4"] {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+/* The card is the label of a hidden radio; positioned, so the radio it holds stays inside it
+   and focusing the radio scrolls nothing. */
+.choice-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-4);
+  cursor: pointer;
+}
+
+.choice-card:has(input:checked) {
+  border-color: var(--accent);
+  background: var(--accent-tint);
+}
+
+.choice-card:has(input:focus-visible) {
+  outline: var(--focus-ring);
+  outline-offset: 1px;
+}
+
+.choice-card[data-disabled] {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.choice-card-label {
+  font-weight: 500;
+}
+
+.choice-card-sub {
+  color: var(--fg-faint);
+  font: 400 var(--fs-11) var(--font-mono);
+}
