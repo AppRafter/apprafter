@@ -154,14 +154,12 @@ pub fn run_machine(args: MachineArgs) -> miette::Result<()> {
                 let provider = cli_core::target::load_target_config(&ctx.store(), tref.name())
                     .map_err(miette::Report::new)?
                     .provider;
+                // No prefill: the operator picks both. `report`, never `Report::new`: a picker
+                // failure keeps the CLI's help (overview §3.6.4).
                 let (region, sku) = crate::commands::target_wizard::prompt_machine(
-                    &provider,
-                    token.expose(),
-                    None, // no prefill region — let the user pick
-                    None, // no prefill sku
-                    false,
+                    &ctx, &provider, &token, None, None, false,
                 )
-                .map_err(miette::Report::new)?;
+                .map_err(report)?;
                 let (region, sku) =
                     normalize_picker_result(region, sku).map_err(miette::Report::new)?;
                 (

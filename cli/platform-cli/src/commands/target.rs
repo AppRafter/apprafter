@@ -21,9 +21,10 @@ use apprafter_core::target::{
     self as core_target, CliDefaultPointer, SkuCheck, TargetRemoved, TargetReport,
 };
 use apprafter_core::{
-    ActivePointerChange, CancellationToken, Context, CoreError, Outcome, SecretString, TargetRef,
+    ActivePointerChange, CancellationToken, Context, CoreError, CoreResult, Outcome, SecretString,
+    TargetRef,
 };
-use cli_core::target::{default_config_root, load_target, TargetStorePaths};
+use cli_core::target::TargetStorePaths;
 use cli_core::{CliError, Result};
 use tabled::{settings::Style, Table, Tabled};
 use tracing::info;
@@ -111,8 +112,15 @@ pub(crate) fn add(mut args: AddArgs) -> miette::Result<()> {
         std::io::stdin().is_terminal(),
         std::io::stdout().is_terminal(),
     );
-    if want_wizard {
-        run_wizard_into_args(&mut args).map_err(miette::Report::new)?;
+    // The context is built before the wizard only when the wizard runs, so the flag-driven
+    // order (the `info!` line, then the context) is unchanged.
+    let early = if want_wizard {
+        Some(crate::context::cli_context()?)
+    } else {
+        None
+    };
+    if let Some(ctx) = &early {
+        run_wizard_into_args(ctx, &mut args).map_err(report)?;
     }
 
     let name = args.name.clone().ok_or_else(|| {
@@ -130,7 +138,11 @@ pub(crate) fn add(mut args: AddArgs) -> miette::Result<()> {
             "",
         )
     })?;
-    let ctx = crate::context::cli_context()?.with_no_ping(args.no_ping);
+    let ctx = match early {
+        Some(c) => c,
+        None => crate::context::cli_context()?,
+    }
+    .with_no_ping(args.no_ping);
 
     if args.renew {
         return renew(&ctx, args, &name);
@@ -225,9 +237,10 @@ pub(crate) fn add_verified_suffix(no_ping: bool) -> &'static str {
 }
 
 /// Fill `args` from wizard prompts for whatever fields aren't
-/// already supplied. Split out so the main `run_add` body reads
-/// linearly.
-fn run_wizard_into_args(args: &mut AddArgs) -> Result<()> {
+/// already supplied, reading through `ctx` (the core's token ping,
+/// machine catalogue, region latencies and SSH key candidates).
+/// Split out so the main `add` body reads linearly.
+fn run_wizard_into_args(ctx: &Context, args: &mut AddArgs) -> CoreResult<()> {
     use crate::commands::target_wizard;
     if args.renew {
         // Renew wizard needs the existing target's provider, so
@@ -235,21 +248,24 @@ fn run_wizard_into_args(args: &mut AddArgs) -> Result<()> {
         // target so we know what provider's validator to wire.
         if args.name.is_none() {
             let n = inquire::Text::new("Target name to rotate credentials for:")
-                .with_validator(|v: &str| match check_target_name(v) {
+                .with_validator(|v: &str| match core_target::validate_name(v) {
                     Ok(()) => Ok(inquire::validator::Validation::Valid),
-                    Err(msg) => Ok(inquire::validator::Validation::Invalid(msg.into())),
+                    Err(problem) => Ok(inquire::validator::Validation::Invalid(
+                        problem.reason(v).into(),
+                    )),
                 })
                 .prompt()
                 .map_err(map_wizard_prompt_error)?;
             args.name = Some(n);
         }
-        let paths = TargetStorePaths::for_root(default_config_root()?);
-        let existing = load_target(&paths, args.name.as_deref().unwrap())?;
+        // Both of the target's files, as before: a missing target is the raw `TargetNotFound`,
+        // an unreadable one its file's error.
+        let existing = cli_core::load_target(&ctx.store(), args.name.as_deref().unwrap())?;
         let (token, _verified) =
-            target_wizard::run_renew_wizard(&existing.config.provider, args.no_ping)?;
+            target_wizard::run_renew_wizard(ctx, &existing.config.provider, args.no_ping)?;
         args.token = Some(token);
     } else {
-        let out = target_wizard::run_add_wizard(args)?;
+        let out = target_wizard::run_add_wizard(ctx, args)?;
         merge_wizard_output(args, out);
     }
     Ok(())
