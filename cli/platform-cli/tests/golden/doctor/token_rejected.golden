@@ -11,11 +11,11 @@ Checking target `prod`...
   ✓ SSH key readable (<SANDBOX>/home/id_ed25519.pub (ssh-ed25519))
 
 Checking environment...
-  ✓ `restic` on PATH (error: unrecognized subcommand 'version')
-  ✓ `kubectl` on PATH (error: unrecognized subcommand 'version')
-  ✓ `helm` on PATH (error: unrecognized subcommand 'version')
-  ✓ `git` on PATH (apprafter <VERSION>)
-  ✓ `ssh` on PATH (apprafter <VERSION>)
+  ✓ `restic` on PATH (restic stand-in)
+  ✓ `kubectl` on PATH (kubectl stand-in)
+  ✓ `helm` on PATH (helm stand-in)
+  ✓ `git` on PATH (git stand-in)
+  ✓ `ssh` on PATH (ssh stand-in)
   ✓ DNS resolves `127.0.0.1` (443/tcp)
 
 12 checks for target `prod`: 11 passed, 0 warning(s), 1 FAIL — fix the FAILs and rerun `apprafter doctor`.

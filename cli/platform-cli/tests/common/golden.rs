@@ -19,9 +19,9 @@
 //! - scratch `HOME`, XDG dirs and `APPRAFTER_CONFIG_DIR`;
 //! - `PATH` is one empty directory, so no real tool can run. A case may
 //!   replace it (`Sandbox::with_path`); doctor cases use GOTCHA-66
-//!   stand-ins (`Sandbox::with_stand_in_tools`): hard links of the
-//!   `apprafter` binary named after each tool doctor probes, never the
-//!   host's tools;
+//!   stand-ins (`Sandbox::with_stand_in_tools`): one script per tool
+//!   doctor probes that answers its version call as the real tool does,
+//!   never the host's tools;
 //! - `KUBECONFIG` names a sandbox file that does not exist, so no cluster
 //!   can be reached;
 //! - startup checks off;
@@ -154,20 +154,13 @@ impl Sandbox {
         self
     }
 
-    /// GOTCHA-66: `PATH` holds only a hard link of the `apprafter` binary per tool doctor
-    /// probes (`cli_core::tools::ALL`, and `cue`), named `<tool>{EXE_SUFFIX}`. Made under
-    /// `CARGO_TARGET_TMPDIR`: a hard link cannot cross volumes.
+    /// GOTCHA-66: `PATH` holds only a stand-in per tool doctor probes (`cli_core::tools::ALL`,
+    /// and `cue`), each answering its version call as the real tool does
+    /// ([`super::stand_in::tool_stand_ins`]).
     pub fn with_stand_in_tools(mut self) -> Self {
-        let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("tools dir");
-        let mut names: std::collections::BTreeSet<&str> =
-            cli_core::tools::ALL.iter().map(|t| t.name).collect();
-        names.insert("cue");
-        for name in names {
-            let link = dir
-                .path()
-                .join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
-            fs::hard_link(env!("CARGO_BIN_EXE_apprafter"), link).expect("stand-in tool");
-        }
+        let dir = super::stand_in::tool_stand_ins(
+            cli_core::tools::ALL.iter().chain([&cli_core::tools::CUE]),
+        );
         self.path_override = Some(dir.path().to_path_buf());
         self.tools = Some(dir);
         self

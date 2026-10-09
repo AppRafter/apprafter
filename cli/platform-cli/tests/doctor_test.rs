@@ -16,26 +16,49 @@ fn cli() -> Command {
     Command::cargo_bin("apprafter").unwrap()
 }
 
+mod common;
+
 /// A `PATH` holding nothing but a stand-in for every tool `doctor` probes.
 ///
 /// A clean run needs the required tools present, so a test that asserts one
 /// passed or failed on what the CI image happened to ship: the macOS runners
-/// carry no `kubectl`, and every happy-path test here failed on them. Each
-/// stand-in is a hard link to the `apprafter` binary under test, which answers
-/// `-V`/`--version` with its version and any other probe with a usage error on
-/// stderr — and `check_tool` counts either as the tool being there. A hard
-/// link rather than a script because Windows runs only real executables; made
-/// under `CARGO_TARGET_TMPDIR` because a hard link cannot cross volumes and the
-/// Windows runners keep `%TEMP%` and the checkout on different drives.
+/// carry no `kubectl`, and every happy-path test here failed on them. What a
+/// stand-in is, per platform, is `common::stand_in::tool_stand_ins`'s to say.
 fn tools_on_path() -> tempfile::TempDir {
-    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    common::stand_in::tool_stand_ins(cli_core::tools::ALL)
+}
+
+/// Decision 2 of the D.3c review: each stand-in answers its tool's version call as the real
+/// tool does — a version line and exit 0 (`ssh -V` on stderr) — and anything else with a usage
+/// error. The resolver reports a tool that exits non-zero on its version call as having no
+/// version (whatever it printed), so a stand-in that did would test a broken tool instead.
+/// Unix only: on Windows the stand-ins stay hard links of `apprafter` (GOTCHA-66).
+#[cfg(unix)]
+#[test]
+fn the_stand_ins_answer_their_version_call_like_the_real_tools() {
+    let tools = tools_on_path();
     for tool in cli_core::tools::ALL {
-        let stand_in = dir
-            .path()
-            .join(format!("{}{}", tool.name, std::env::consts::EXE_SUFFIX));
-        std::fs::hard_link(env!("CARGO_BIN_EXE_apprafter"), stand_in).unwrap();
+        let bin = tools.path().join(tool.name);
+        let out = std::process::Command::new(&bin)
+            .args(tool.version_args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "`{}`: {out:?}", tool.name);
+        let answer = if tool.name == "ssh" {
+            &out.stderr
+        } else {
+            &out.stdout
+        };
+        assert_eq!(
+            String::from_utf8_lossy(answer),
+            format!("{} stand-in\n", tool.name)
+        );
+        let wrong = std::process::Command::new(&bin)
+            .arg("--no-such-flag")
+            .output()
+            .unwrap();
+        assert_eq!(wrong.status.code(), Some(2), "`{}`: {wrong:?}", tool.name);
     }
-    dir
 }
 
 fn synthetic_hetzner_token() -> String {
