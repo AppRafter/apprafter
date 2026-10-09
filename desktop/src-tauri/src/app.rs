@@ -75,9 +75,10 @@ use zeroize::Zeroizing;
 use crate::auth::Authenticator;
 use crate::auth_cache::AuthCache;
 use crate::commands;
+use crate::drafts::DraftStore;
 use crate::errors::{DesktopError, Refusal};
 use crate::lock::{LockChange, LockHook, LockMachine};
-use crate::ops::{panic_message, Clock, EventSink, OperationManager};
+use crate::ops::{panic_message, Clock, EventSink, Executor, OperationManager};
 use crate::settings::SettingsStore;
 use crate::theme::Appearance;
 
@@ -285,6 +286,9 @@ pub struct Shell {
     pub settings: SettingsStore,
     pub lock: Arc<LockMachine>,
     pub ops: Arc<OperationManager>,
+    /// Verified tokens waiting for their add plan; dropped on every lock transition and on
+    /// quit.
+    pub drafts: Arc<DraftStore>,
     /// The authenticator, its answer about what it can do kept ([`AuthCache`]).
     pub auth: Arc<AuthCache>,
     /// The core's view of this process: the target store and the provider API.
@@ -348,11 +352,16 @@ impl Stop {
 
 impl Shell {
     /// The shell over `settings`, its lock starting as they say. Every lock transition — to
-    /// locked and to unlocked — drops every pending plan, then ends every operation
-    /// subscription, then calls `on_lock_change` with the new state (the app emits
-    /// [`LOCK_CHANGED`]). All three run under the lock machine's lock: none may call back
-    /// into it. An update — the same lock reported anew, its idle time changed — only calls
-    /// `on_lock_change`: the page hears of it, and its plans and subscriptions stay.
+    /// locked and to unlocked — drops every pending plan, cancels every running read, drops
+    /// every verified token waiting as a draft, then ends every operation subscription, then
+    /// calls `on_lock_change` with the new state (the app emits [`LOCK_CHANGED`]). All five run
+    /// under the lock machine's lock: none may call back into it. An update — the same lock
+    /// reported anew, its idle time changed — only calls `on_lock_change`: the page hears of
+    /// it, and its plans, reads, drafts and subscriptions stay.
+    ///
+    /// A read stops on a lock where a confirmed plan runs on: nobody confirmed it, and a
+    /// locked page cannot follow it. A draft goes for the reason a plan does: no token verified
+    /// before the lock may be used after it.
     ///
     /// A lock ends the subscriptions because a locked page must receive nothing, and it
     /// cannot unsubscribe (the gate refuses `op_unsubscribe`): the shell unmounts on a lock and
@@ -377,11 +386,14 @@ impl Shell {
         on_lock_change: impl Fn(&LockState) + Send + Sync + 'static,
     ) -> Arc<Self> {
         let ops = OperationManager::new(clock.clone());
+        let drafts = Arc::new(DraftStore::new(clock.clone()));
         let hook: LockHook = {
-            let ops = ops.clone();
+            let (ops, drafts) = (ops.clone(), drafts.clone());
             Box::new(move |state: &LockState, change| {
                 if change == LockChange::Transition {
                     ops.drop_all_plans();
+                    ops.cancel_reads();
+                    drafts.drop_all();
                     ops.drop_all_subscribers();
                 }
                 on_lock_change(state);
@@ -395,6 +407,7 @@ impl Shell {
             settings,
             lock,
             ops,
+            drafts,
             auth,
             context,
             test_build,
@@ -497,9 +510,22 @@ impl Shell {
         }
     }
 
+    /// Start a read ([`OperationManager::start`]) and wake the output flusher, which sleeps
+    /// while nothing runs. `Closing` once a quit began.
+    pub fn start_read(
+        &self,
+        title: impl Into<String>,
+        target: Option<String>,
+        exec: Executor,
+    ) -> Result<OpId, DesktopError> {
+        let id = self.ops.start(title, target, exec)?;
+        self.stop.nudge();
+        Ok(id)
+    }
+
     /// The first step of a quit, once: no operation starts and no unlock prompt opens from
     /// here on (`Closing`), the open unlock prompt and every operation prompt are closed, and
-    /// every pending plan is dropped. `false` when a quit had already begun.
+    /// every pending plan and every draft is dropped. `false` when a quit had already begun.
     pub fn begin_quit(&self) -> bool {
         if self.quitting.swap(true, SeqCst) {
             return false;
@@ -507,6 +533,7 @@ impl Shell {
         self.ops.close();
         self.lock.close();
         self.ops.drop_all_plans();
+        self.drafts.drop_all();
         true
     }
 
@@ -774,11 +801,32 @@ pub fn start_tickers(shell: &Arc<Shell>) -> io::Result<()> {
     })
 }
 
-/// The idle ticker's work: lock once the idle time has passed, and drop the plans one time to
-/// live past their expiry.
+/// The idle ticker's work: lock once the idle time has passed, drop the plans one time to live
+/// past their expiry, and the drafts past theirs.
 fn idle_tick(shell: &Shell) {
     shell.lock.tick();
     shell.ops.sweep();
+    shell.drafts.sweep();
+}
+
+/// Remove the stale `kubeconfig-*` files from `context`'s runtime dir — older than the core's
+/// [`STALE_KUBECONFIG_AGE`](apprafter_core::runtime::STALE_KUBECONFIG_AGE) (R9): what a crash
+/// left; how many went. A failure is a logged warning, never fatal: the next start, and every
+/// doctor run, tries again.
+pub fn sweep_runtime_dir(context: &Context) -> usize {
+    use apprafter_core::runtime::{sweep_stale, STALE_KUBECONFIG_AGE};
+    match sweep_stale(context, STALE_KUBECONFIG_AGE) {
+        Ok(removed) => {
+            if removed > 0 {
+                tracing::info!(removed, "removed stale kubeconfigs from the runtime dir");
+            }
+            removed
+        }
+        Err(e) => {
+            tracing::warn!("the runtime dir could not be swept: {e}");
+            0
+        }
+    }
 }
 
 /// Whether an operation runs: the output flusher has work.
@@ -825,11 +873,13 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use apprafter_core::{CancellationToken, Context, Event, Outcome, PlanClass};
+    use apprafter_core::{
+        CancellationToken, Context, CoreError, Event, Outcome, PlanClass, SecretString,
+    };
     use apprafter_desktop_ipc::SessionEvents;
     use apprafter_desktop_ipc::{
         errors, AuthInfo, AuthOutcome, AutoLock, CancelledBy, LockReason, LockState, OpEvent, OpId,
-        Settings, UnavailableReason,
+        OpState, Settings, UnavailableReason,
     };
     use apprafter_os_auth::{Listening, SessionEvent};
     use serde_json::json;
@@ -839,6 +889,7 @@ mod tests {
     use super::Shell;
     use crate::auth::test_os::{self, Call, ScriptedOs};
     use crate::auth::{AuthPurpose, Authenticator, FakeAuthenticator, NoAuthenticator};
+    use crate::drafts::DRAFT_TTL_MS;
     use crate::errors::DesktopError;
     use crate::ops::test_clock::ManualClock;
     use crate::ops::{EventSink, Executor, PlanParts, PLAN_TTL_MS};
@@ -1826,5 +1877,169 @@ mod tests {
         let opener = super::opener_plugin::<tauri::test::MockRuntime>();
         assert!(opener.initialization_script().is_none());
         assert!(opener.initialization_script_2().is_none());
+    }
+
+    // Drafts and reads: a lock or a quit drops the drafts and stops the reads; the idle tick
+    // sweeps the drafts past their time; stale kubeconfigs go at start.
+
+    /// A read that waits for its token, then ends cancelled — or, when it never trips, ends
+    /// completed once `LONG` has passed, so a cancel that never came is the wrong end.
+    fn waits_for_cancel() -> Executor {
+        Box::new(|_, cancel| {
+            let deadline = Instant::now() + LONG;
+            while !cancel.is_cancelled() {
+                if Instant::now() >= deadline {
+                    return Ok(Outcome::Completed {
+                        result: json!("never cancelled"),
+                    });
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(CoreError::Cancelled)
+        })
+    }
+
+    fn a_token(c: char) -> SecretString {
+        SecretString::new(c.to_string().repeat(64))
+    }
+
+    #[test]
+    fn a_lock_drops_the_drafts_cancels_the_reads_and_a_late_verify_keeps_nothing() {
+        let r = rig(unlocked_at_start(), Arc::new(FakeAuthenticator::new()));
+        let before = r.shell.drafts.epoch();
+        let kept = r
+            .shell
+            .drafts
+            .insert(before, "hetzner-cloud".into(), a_token('k'))
+            .unwrap();
+        let read = r
+            .shell
+            .start_read("Doctor · prod", Some("prod".into()), waits_for_cancel())
+            .unwrap();
+        assert!(r.shell.lock_now().locked);
+        assert!(matches!(
+            r.shell.drafts.get(kept),
+            Err(DesktopError::DraftNotFound { .. })
+        ));
+        wait_until("the read ended", || {
+            r.shell
+                .ops
+                .list()
+                .iter()
+                .any(|s| s.op_id == read && s.state != OpState::Running)
+        });
+        let state = r.shell.ops.list().into_iter().find(|s| s.op_id == read);
+        assert_eq!(state.map(|s| s.state), Some(OpState::Cancelled));
+        assert_eq!(
+            r.shell
+                .drafts
+                .insert(before, "hetzner-cloud".into(), a_token('m')),
+            None,
+            "a verify that began before the lock keeps nothing"
+        );
+    }
+
+    #[test]
+    fn a_quit_drops_the_drafts_and_starts_no_read() {
+        let r = rig(unlocked_at_start(), Arc::new(FakeAuthenticator::new()));
+        let id = r
+            .shell
+            .drafts
+            .insert(r.shell.drafts.epoch(), "hetzner-cloud".into(), a_token('k'))
+            .unwrap();
+        assert!(r.shell.begin_quit());
+        assert!(matches!(
+            r.shell.drafts.get(id),
+            Err(DesktopError::DraftNotFound { .. })
+        ));
+        assert!(matches!(
+            r.shell.start_read("Doctor", None, waits_for_cancel()),
+            Err(DesktopError::Closing)
+        ));
+        assert!(r.shell.ops.list().is_empty());
+    }
+
+    #[test]
+    fn the_idle_tick_sweeps_the_expired_drafts() {
+        // No auto-lock: a lock would drop the draft first.
+        let never = Settings {
+            auto_lock: AutoLock::Never,
+            ..unlocked_at_start()
+        };
+        let r = rig(never, Arc::new(FakeAuthenticator::new()));
+        let id = r
+            .shell
+            .drafts
+            .insert(r.shell.drafts.epoch(), "hetzner-cloud".into(), a_token('k'))
+            .unwrap();
+        r.clock.advance(DRAFT_TTL_MS + 1);
+        super::idle_tick(&r.shell);
+        assert!(!r.shell.lock.state().locked);
+        assert!(
+            matches!(
+                r.shell.drafts.get(id),
+                Err(DesktopError::DraftNotFound { .. })
+            ),
+            "swept, not merely expired"
+        );
+    }
+
+    #[test]
+    fn a_started_read_wakes_the_output_flusher() {
+        let r = rig(unlocked_at_start(), Arc::new(FakeAuthenticator::new()));
+        let asked = Arc::new(AtomicUsize::new(0));
+        let (woke_tx, woke) = mpsc::channel();
+        {
+            let (shell, asked) = (r.shell.clone(), asked.clone());
+            thread::spawn(move || {
+                let started = Instant::now();
+                shell.stop.wait_until(LONG, || {
+                    asked.fetch_add(1, SeqCst);
+                    super::running(&shell)
+                });
+                let _ = woke_tx.send(started.elapsed());
+            });
+        }
+        // Forced, not sampled: the flusher asked once under the stop lock and found nothing, so
+        // it waits; the nudge takes that lock, so it lands only once the flusher is waiting.
+        wait_until("the flusher asked", || asked.load(SeqCst) > 0);
+        let id = r
+            .shell
+            .start_read("Doctor", None, waits_for_cancel())
+            .unwrap();
+        let waited = woke.recv_timeout(2 * LONG).expect("the flusher returned");
+        assert!(
+            waited < LONG / 2,
+            "the flusher slept through the read: {waited:?}"
+        );
+        r.shell.ops.cancel(id).unwrap();
+        wait_until("the read ended", || r.shell.ops.running() == 0);
+    }
+
+    #[test]
+    fn the_runtime_sweep_removes_only_stale_kubeconfigs() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = dir.path().join("run");
+        std::fs::create_dir_all(&run).unwrap();
+        let old = std::time::SystemTime::now() - Duration::from_secs(2 * 60 * 60);
+        for (name, stale) in [
+            ("kubeconfig-1-1.yaml", true),
+            ("kubeconfig-1-2.yaml", false),
+            ("notes.txt", true),
+        ] {
+            let file = std::fs::File::create(run.join(name)).unwrap();
+            if stale {
+                file.set_modified(old).unwrap();
+            }
+        }
+        let ctx = Context::for_desktop(dir.path().join("store"), "http://127.0.0.1:9")
+            .with_runtime_dir(run.clone());
+        assert_eq!(super::sweep_runtime_dir(&ctx), 1);
+        assert!(!run.join("kubeconfig-1-1.yaml").exists());
+        assert!(run.join("kubeconfig-1-2.yaml").exists() && run.join("notes.txt").exists());
+        // A runtime dir that cannot be read is a warning, never an error: none removed.
+        let unreadable = Context::for_desktop(dir.path().join("store"), "http://127.0.0.1:9")
+            .with_runtime_dir(run.join("notes.txt"));
+        assert_eq!(super::sweep_runtime_dir(&unreadable), 0);
     }
 }

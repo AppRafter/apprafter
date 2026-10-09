@@ -45,8 +45,9 @@ use crate::settings::SettingsStore;
 /// test build), the app itself (the single-instance plugin first: a second launch only focuses
 /// the first window and exits; on macOS, the app menu), then the log, the settings, the core
 /// context, the shell, on Linux the window's theme and the desktop's colour scheme
-/// ([`theme::start`]), the tickers, the OS session watch (lock-on-sleep) and, on Linux and
-/// macOS, the quit signals. On Windows the prompts are parented to the main window as soon as
+/// ([`theme::start`]), the tickers, the sweep of the kubeconfig copies a crash left in the
+/// runtime dir ([`app::sweep_runtime_dir`], on a thread of its own), the OS session watch
+/// (lock-on-sleep) and, on Linux and macOS, the quit signals. On Windows the prompts are parented to the main window as soon as
 /// it is built.
 ///
 /// The core context is built once the app is: its runtime dir is `<app data dir>/run`, and
@@ -162,6 +163,18 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     #[cfg(target_os = "linux")]
     theme::start(app.handle(), &shell.appearance);
     app::start_tickers(&shell)?;
+    // R9: kubeconfig copies a crash left in the runtime dir go, off the start path.
+    let sweep = std::thread::Builder::new()
+        .name("runtime-sweep".into())
+        .spawn({
+            let context = shell.context.clone();
+            move || {
+                app::sweep_runtime_dir(&context);
+            }
+        });
+    if let Err(e) = sweep {
+        tracing::warn!("no thread to sweep the runtime dir on ({e}); the next start tries again");
+    }
     // The OS's lock and sleep signals, until a quit drops the watch. Started here, before the
     // event loop runs: macOS delivers them through it.
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
@@ -323,6 +336,55 @@ mod tests {
             ["env", "turn_off_dmabuf_renderer_on_nvidia_wayland"],
             "run's first statement"
         );
+    }
+
+    /// Whether `stmt` names `ident` anywhere inside it, closures included.
+    fn mentions(stmt: &syn::Stmt, ident: &str) -> bool {
+        struct Finder<'a>(&'a str, bool);
+        impl<'ast> syn::visit::Visit<'ast> for Finder<'_> {
+            fn visit_ident(&mut self, ident: &'ast proc_macro2::Ident) {
+                self.1 |= ident == self.0;
+            }
+        }
+        let mut finder = Finder(ident, false);
+        syn::visit::visit_stmt(&mut finder, stmt);
+        finder.1
+    }
+
+    /// R9: the kubeconfig copies a crash left in the runtime dir go at start,
+    /// once, on a thread of its own (the window never waits for a slow disk), with the shell's
+    /// own context, once the shell is in place and before the event loop runs.
+    #[test]
+    fn run_sweeps_the_runtime_dir_once_on_a_thread_of_its_own() {
+        let run = run_fn();
+        let stmts = &run.block.stmts;
+        let sweeps: Vec<usize> = (0..stmts.len())
+            .filter(|&i| mentions(&stmts[i], "sweep_runtime_dir"))
+            .collect();
+        let [sweep] = sweeps.as_slice() else {
+            panic!("run sweeps the runtime dir once: {sweeps:?}");
+        };
+        let install = stmts
+            .iter()
+            .position(|stmt| called(stmt).is_some_and(|(path, _)| path == ["app", "install"]))
+            .expect("run calls app::install");
+        let window = stmts
+            .iter()
+            .position(|stmt| {
+                matches!(stmt, syn::Stmt::Expr(syn::Expr::MethodCall(call), _)
+                    if call.method == "run")
+            })
+            .expect("run ends in app.run");
+        assert!(
+            install < *sweep && *sweep < window,
+            "{install} < {sweep} < {window}"
+        );
+        for ident in ["Builder", "spawn", "context"] {
+            assert!(
+                mentions(&stmts[*sweep], ident),
+                "the sweep's statement names {ident}"
+            );
+        }
     }
 
     #[test]
