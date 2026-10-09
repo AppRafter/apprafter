@@ -34,7 +34,6 @@ use cli_core::{CliError, Result};
 
 use crate::commands::state_paths::resolve_state_paths;
 use crate::commands::target::{completed, require_loadable};
-use crate::commands::target_legacy;
 use crate::render::core_error::report;
 use crate::render::reporter::CliReporter;
 
@@ -69,32 +68,25 @@ pub(crate) fn decide_machine_action(
 ) -> Result<MachineAction> {
     match (no_ping, server_type) {
         (true, Some(sku)) => Ok(MachineAction::RecordUnvalidated(sku.to_string())),
-        (true, None) => Err(CliError::Other(
-            "`target machine` needs the provider API to show the picker — \
-             drop `--no-ping` or pass `--server-type <sku>`"
+        (true, None) => Err(CliError::UsageRefused {
+            message: "`target machine` needs the provider API to show the picker — \
+                      drop `--no-ping` or pass `--server-type <sku>`"
                 .to_string(),
-        )),
+            help: "The picker reads the provider's catalogue: drop `--no-ping`, or pass \
+                   `--server-type <sku>` to record a type without checking it."
+                .to_string(),
+        }),
         (false, Some(sku)) => Ok(MachineAction::ValidateThenRecord(sku.to_string())),
         (false, None) if interactive => Ok(MachineAction::Picker),
-        (false, None) => Err(CliError::Other(
-            "non-interactive shell: pass `--server-type <sku>` to set the machine type \
-             without the interactive picker"
+        (false, None) => Err(CliError::UsageRefused {
+            message: "non-interactive shell: pass `--server-type <sku>` to set the machine type \
+                      without the interactive picker"
                 .to_string(),
-        )),
+            help: "Pass `--server-type <sku>`, or run `apprafter target machine` in a terminal to \
+                   open the picker."
+                .to_string(),
+        }),
     }
-}
-
-/// Refusal shown when the target already runs a provisioned cluster.
-///
-/// There is no in-place resize, so the message has to hand the operator the
-/// whole rebuild recipe — a bare "not allowed" leaves them stuck.
-pub(crate) fn provisioned_refusal_message(target_name: &str) -> String {
-    format!(
-        "`{target_name}` already runs a provisioned cluster — its machine type cannot be \
-         changed in place. To move to a different machine, rebuild from a backup. {}\n\n\
-         (`target machine` only sets the type on a target that has NOT provisioned yet.)",
-        crate::render::core_error::resize_recipe(target_name)
-    )
 }
 
 /// How the SKU that just got saved was arrived at. Drives the confirmation, so
@@ -134,7 +126,7 @@ pub fn run_machine(args: MachineArgs) -> miette::Result<()> {
     let tref = TargetRef::named(&ctx, &resolved.target_name).map_err(report)?;
     require_loadable(&ctx, tref.name())?;
     if let Some(s) = apprafter_core::target::provisioned(&ctx, &tref).map_err(report)? {
-        return Err(target_legacy::machine(CoreError::TargetProvisioned {
+        return Err(report(CoreError::TargetProvisioned {
             name: resolved.target_name.clone(),
             server_id: s.server_id,
             server_name: s.server_name,
@@ -149,8 +141,7 @@ pub fn run_machine(args: MachineArgs) -> miette::Result<()> {
                 (MachineChoice { sku, region: None }, false)
             }
             MachineAction::Picker => {
-                let token = apprafter_core::target::hetzner_token(&ctx, &tref)
-                    .map_err(target_legacy::machine)?;
+                let token = apprafter_core::target::hetzner_token(&ctx, &tref).map_err(report)?;
                 let provider = cli_core::target::load_target_config(&ctx.store(), tref.name())
                     .map_err(miette::Report::new)?
                     .provider;
@@ -171,8 +162,7 @@ pub fn run_machine(args: MachineArgs) -> miette::Result<()> {
                 )
             }
         };
-    let plan = apprafter_core::target::plan_machine(&ctx, &tref, choice)
-        .map_err(target_legacy::machine)?;
+    let plan = apprafter_core::target::plan_machine(&ctx, &tref, choice).map_err(report)?;
     let set = completed(
         apprafter_core::target::execute_machine(
             &ctx,
@@ -180,7 +170,7 @@ pub fn run_machine(args: MachineArgs) -> miette::Result<()> {
             &CliReporter,
             &CancellationToken::new(),
         )
-        .map_err(target_legacy::machine)?,
+        .map_err(report)?,
     )?;
     let via = match (&set.sku_check, &set.region) {
         (_, Some(r)) if picked => SavedVia::Picked(r),
@@ -212,8 +202,7 @@ pub(crate) fn normalize_picker_result(
 #[cfg(test)]
 mod tests {
     use super::{
-        decide_machine_action, normalize_picker_result, provisioned_refusal_message, saved_message,
-        MachineAction, SavedVia,
+        decide_machine_action, normalize_picker_result, saved_message, MachineAction, SavedVia,
     };
 
     // ── decide_machine_action ────────────────────────────────────────────
@@ -272,6 +261,17 @@ mod tests {
         let msg = format!("{no_tty}");
         assert!(msg.contains("non-interactive"), "{msg}");
         assert!(msg.contains("--server-type"), "{msg}");
+
+        // Bug 2: a usage refusal with its own code and a way forward, never the catch-all.
+        for err in [no_api, no_tty] {
+            let code = miette::Diagnostic::code(&err).map(|c| c.to_string());
+            assert_eq!(code.as_deref(), Some("apprafter::cli::usage_refused"));
+            let help = miette::Diagnostic::help(&err)
+                .map(|h| h.to_string())
+                .unwrap_or_default();
+            assert!(help.contains("--server-type <sku>"), "{help}");
+            crate::commands::target::assert_commands_parse(&help);
+        }
     }
 
     /// `--no-ping` on a non-TTY still records rather than tripping the
@@ -281,22 +281,6 @@ mod tests {
     fn a_non_tty_shell_is_not_refused_when_a_sku_is_supplied() {
         assert!(decide_machine_action(true, Some("cx32"), false).is_ok());
         assert!(decide_machine_action(false, Some("cx32"), false).is_ok());
-    }
-
-    // ── provisioned_refusal_message ──────────────────────────────────────
-
-    /// The refusal is the operator's only pointer to the rebuild path; it has
-    /// to carry the whole recipe for the target it refused — the renderer's,
-    /// whose test parses each step and checks that `destroy` frees the
-    /// machine before the restore reprovisions.
-    #[test]
-    fn the_provisioned_refusal_hands_over_the_whole_rebuild_recipe() {
-        let m = provisioned_refusal_message("prod-eu");
-        assert!(m.starts_with("`prod-eu` already runs"), "{m}");
-        assert!(
-            m.contains(&crate::render::core_error::resize_recipe("prod-eu")),
-            "{m}"
-        );
     }
 
     // ── saved_message ────────────────────────────────────────────────────

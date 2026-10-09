@@ -3,12 +3,10 @@ $ apprafter target add prod --provider hetzner-cloud --token short --no-ping --n
 [stdout]
 [stderr]
 <ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m target add invoked <ESC>[3mtarget<ESC>[0m<ESC>[2m=<ESC>[0mprod <ESC>[3mrenew<ESC>[0m<ESC>[2m=<ESC>[0mfalse <ESC>[3mforce<ESC>[0m<ESC>[2m=<ESC>[0mfalse
-Error: apprafter::cli::other
+Error: apprafter::target::invalid_token
 
   × invalid Hetzner Cloud token: Hetzner Cloud tokens are 64 ASCII
   │ alphanumeric characters; got 5
-  help: This is the catch-all CLI error. The message above is the only
-        context. If you see this often with the same wording, please file an
-        issue — recurring messages should be promoted to a typed `CliError`
-        variant with its own help text.
+  help: Copy the token again from the Hetzner Cloud Console → Security → API
+        Tokens: 64 ASCII letters and digits, no prefix, no trailing newline.
 

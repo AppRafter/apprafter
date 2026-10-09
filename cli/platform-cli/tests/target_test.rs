@@ -189,6 +189,7 @@ fn target_add_errors_on_malformed_hetzner_token() {
         ])
         .assert()
         .failure()
+        .stderr(contains("apprafter::target::invalid_token"))
         .stderr(contains("invalid Hetzner Cloud token"));
 }
 
@@ -380,7 +381,8 @@ fn target_add_renew_on_missing_target_errors_with_hint() {
         ])
         .assert()
         .failure()
-        .stderr(contains("does not exist"))
+        .stderr(contains("apprafter::target::not_found"))
+        .stderr(contains("not found"))
         .stderr(contains("drop `--renew`"));
 }
 
@@ -418,7 +420,7 @@ fn target_add_renew_rejects_identical_token_with_rotation_hint() {
         .args(["target", "add", "rotate-me", "--token", &token, "--renew"])
         .assert()
         .failure()
-        .stderr(contains("requires a NEW token"))
+        .stderr(contains("apprafter::target::renew_token_unchanged"))
         .stderr(contains("Hetzner Cloud Console"));
 
     // On-disk credentials must still reflect the original token,
@@ -575,6 +577,7 @@ fn target_add_errors_when_ssh_key_path_missing() {
         ])
         .assert()
         .failure()
+        .stderr(contains("apprafter::target::ssh_key_unreadable"))
         .stderr(contains("does not exist"));
 }
 
@@ -881,7 +884,7 @@ fn target_rename_refuses_identical_source_and_destination() {
         .args(["target", "rename", "first", "first"])
         .assert()
         .failure()
-        .stderr(contains("identical"));
+        .stderr(contains("apprafter::target::same_name"));
 }
 
 #[test]

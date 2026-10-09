@@ -408,7 +408,7 @@ than it looks:
 
 - `apprafter target add --ssh-key <path>` **refuses at add time** if
   the path does not exist: `SSH key path '<path>' does not exist`
-  (code `apprafter::cli::other`). So a bad path never gets stored in
+  (code `apprafter::target::ssh_key_unreadable`). So a bad path never gets stored in
   the first place.
 - `apprafter doctor`'s check is named **`SSH key readable`** — not
   "SSH public key readable" — and that is all it verifies. It FAILs

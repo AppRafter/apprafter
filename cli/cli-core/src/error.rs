@@ -465,6 +465,27 @@ pub enum CliError {
     )]
     CompletionInstall(String),
 
+    /// A destructive command run where no one can be asked: `--yes` is the confirmation.
+    ///
+    /// Typed rather than [`CliError::Other`]: it is a decision, and the catch-all's "file an
+    /// issue" is the wrong advice. `action` completes "pass `--yes` to confirm …", e.g.
+    /// "removing target `prod`".
+    #[error("non-interactive invocation: pass `--yes` to confirm {action} (refusing silent destruction)")]
+    #[diagnostic(
+        code(apprafter::cli::confirmation_required),
+        help(
+            "Run the command in a terminal to be asked first, or pass `--yes` when you are sure."
+        )
+    )]
+    ConfirmationRequired { action: String },
+
+    /// The command line cannot work as given: a required input is missing or two flags
+    /// contradict each other. `help` says what would work. CLI-input policy only — a domain
+    /// refusal is a typed `apprafter_core::CoreError`.
+    #[error("{message}")]
+    #[diagnostic(code(apprafter::cli::usage_refused), help("{help}"))]
+    UsageRefused { message: String, help: String },
+
     /// Catch-all, free-form message. New call sites should prefer
     /// promoting recurring messages to dedicated variants with
     /// stable diagnostic codes. The miette `code()` here remains
@@ -911,6 +932,36 @@ mod tests {
         assert!(help.contains("`apprafter backup run`"), "{help}");
         assert!(help.contains("do not both finish"), "{help}");
         assert!(!help.contains("file an issue"), "{help}");
+    }
+
+    #[test]
+    fn a_confirmation_refusal_has_its_own_code_and_says_how_to_confirm() {
+        let err = CliError::ConfirmationRequired {
+            action: "removing target `prod`".into(),
+        };
+        assert_eq!(code_of(&err), "apprafter::cli::confirmation_required");
+        assert_eq!(
+            err.to_string(),
+            "non-interactive invocation: pass `--yes` to confirm removing target `prod` \
+             (refusing silent destruction)"
+        );
+        let help = help_of(&err);
+        assert!(
+            help.contains("`--yes`") && help.contains("terminal"),
+            "{help}"
+        );
+        assert!(!help.contains("file an issue"), "{help}");
+    }
+
+    #[test]
+    fn a_usage_refusal_carries_the_callers_message_and_help() {
+        let err = CliError::UsageRefused {
+            message: "`--provider` is required".into(),
+            help: "Supported providers: hetzner-cloud.".into(),
+        };
+        assert_eq!(code_of(&err), "apprafter::cli::usage_refused");
+        assert_eq!(err.to_string(), "`--provider` is required");
+        assert_eq!(help_of(&err), "Supported providers: hetzner-cloud.");
     }
 
     #[test]

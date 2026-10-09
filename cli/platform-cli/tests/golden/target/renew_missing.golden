@@ -3,11 +3,9 @@ $ apprafter target add ghost --renew --token bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 [stdout]
 [stderr]
 <ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m target add invoked <ESC>[3mtarget<ESC>[0m<ESC>[2m=<ESC>[0mghost <ESC>[3mrenew<ESC>[0m<ESC>[2m=<ESC>[0mtrue <ESC>[3mforce<ESC>[0m<ESC>[2m=<ESC>[0mfalse
-Error: apprafter::cli::other
+Error: apprafter::target::not_found
 
-  × target `ghost` does not exist — drop `--renew` to create it fresh
-  help: This is the catch-all CLI error. The message above is the only
-        context. If you see this often with the same wording, please file an
-        issue — recurring messages should be promoted to a typed `CliError`
-        variant with its own help text.
+  × target `ghost` not found (available: prod)
+  help: There is no target `ghost` to renew: drop `--renew` to create it fresh
+        (`apprafter target add ghost --provider hetzner-cloud …`).
 

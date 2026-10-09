@@ -350,24 +350,26 @@ argocd-password` fetch again.
 
 There is no in-place resize. `apprafter target machine` refuses outright
 once the target has a provisioned cluster, rather than saving a
-preference that would never take effect:
+preference that would never take effect, and so does `apprafter target
+add --force` given a different `--region` or `--server-type`:
 
 ```text
-Error: apprafter::cli::other
+Error: apprafter::target::provisioned
 
-  × `<name>` already runs a provisioned cluster — its machine type cannot be
-  │ changed in place. To move to a different machine, rebuild from a backup.
-  │ `destroy` deletes every `apprafter=true` resource in the token's Hetzner
-  │ project, not only this cluster: read the operator guide's "Moving to a
-  │ bigger machine" first.
-  │
-  │     apprafter target use <name>
-  │     apprafter backup create --repo <repo>
-  │     apprafter destroy --yes
-  │     apprafter restore <repo> --reprovision --server-type <sku>
-  │
-  │ (`target machine` only sets the type on a target that has NOT provisioned
-  │ yet.)
+  × target `<name>` has a provisioned server (`<server>`, id <id>), so its
+  │ machine or region cannot change
+  help: There is no in-place resize: rebuild from a backup on a new machine.
+        `destroy` deletes every `apprafter=true` resource in the token's
+        Hetzner project, not only this cluster: read the operator guide's
+        "Moving to a bigger machine" first.
+
+            apprafter target use <name>
+            apprafter backup create --repo <repo>
+            apprafter destroy --yes
+            apprafter restore <repo> --reprovision --server-type <sku>
+
+        (`target machine` and `target add --force` change the machine only on
+        a target that has not provisioned yet.)
 ```
 
 

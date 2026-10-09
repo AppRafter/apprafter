@@ -2,12 +2,10 @@ $ apprafter target machine --no-ping
 [exit 1]
 [stdout]
 [stderr]
-Error: apprafter::cli::other
+Error: apprafter::cli::usage_refused
 
   × `target machine` needs the provider API to show the picker — drop `--no-
   │ ping` or pass `--server-type <sku>`
-  help: This is the catch-all CLI error. The message above is the only
-        context. If you see this often with the same wording, please file an
-        issue — recurring messages should be promoted to a typed `CliError`
-        variant with its own help text.
+  help: The picker reads the provider's catalogue: drop `--no-ping`, or pass
+        `--server-type <sku>` to record a type without checking it.
 

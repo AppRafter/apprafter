@@ -3,12 +3,9 @@ $ apprafter target rename prod staging
 [stdout]
 [stderr]
 <ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m target rename invoked <ESC>[3mfrom<ESC>[0m<ESC>[2m=<ESC>[0mprod <ESC>[3mto<ESC>[0m<ESC>[2m=<ESC>[0mstaging
-Error: apprafter::cli::other
+Error: apprafter::target::exists
 
-  × target `staging` already exists — pick a different name or remove the
-  │ existing target first
-  help: This is the catch-all CLI error. The message above is the only
-        context. If you see this often with the same wording, please file an
-        issue — recurring messages should be promoted to a typed `CliError`
-        variant with its own help text.
+  × target `staging` already exists
+  help: Pick another name, or remove the existing `staging` first (`apprafter
+        target remove staging`); nothing was renamed.
 

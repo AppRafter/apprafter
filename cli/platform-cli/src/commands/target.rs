@@ -35,15 +35,8 @@ use cli_providers::cert::{
 };
 
 use crate::commands::state_paths::resolve_state_paths;
-use crate::commands::target_legacy;
 use crate::render::core_error::report;
 use crate::render::reporter::CliReporter;
-
-/// Maximum length for a target name. Matches the spec
-/// (`cli-dx-task.md` §5.1 validation rules). A short cap keeps
-/// directory traversal and shell-history scenarios sane without
-/// being meaningfully restrictive.
-pub const MAX_TARGET_NAME_LEN: usize = 64;
 
 /// `apprafter target …` for the sub-commands `dispatch` does not route to a core-backed arm.
 /// `ip` runs on apprafter-core and renders its own errors
@@ -120,20 +113,13 @@ pub(crate) fn add(mut args: AddArgs) -> miette::Result<()> {
         run_wizard_into_args(ctx, &mut args).map_err(report)?;
     }
 
-    let name = args.name.clone().ok_or_else(|| {
-        miette::Report::new(CliError::Other(
-            "target name required — pass it as a positional argument (`apprafter target add <name>`) or run on a TTY to enter the wizard".to_string(),
-        ))
-    })?;
+    let name = args.name.clone().ok_or_else(name_required)?;
     info!(target = %name, renew = args.renew, force = args.force, "target add invoked");
     core_target::validate_name(&name).map_err(|problem| {
-        target_legacy::add(
-            CoreError::InvalidTargetName {
-                name: name.clone(),
-                problem,
-            },
-            "",
-        )
+        report(CoreError::InvalidTargetName {
+            name: name.clone(),
+            problem,
+        })
     })?;
     let ctx = match early {
         Some(c) => c,
@@ -145,20 +131,13 @@ pub(crate) fn add(mut args: AddArgs) -> miette::Result<()> {
         return renew(&ctx, args, &name);
     }
 
-    let provider = args.provider.clone().ok_or_else(|| {
-        miette::Report::new(CliError::Other(format!(
-            "`--provider` is required (supported: {})",
-            apprafter_core::provider::SUPPORTED_PROVIDERS.join(", ")
-        )))
-    })?;
+    let provider = args.provider.clone().ok_or_else(provider_required)?;
     // Today's order: the provider is refused before the token is asked for.
     check_provider(&provider).map_err(report)?;
-    let token = args.token.clone().ok_or_else(|| {
-        miette::Report::new(CliError::Other(format!(
-            "`--token` is required for provider `{provider}` (or set `HCLOUD_TOKEN` env var)"
-        )))
-    })?;
-    let legacy = |e| target_legacy::add(e, &token);
+    let token = args
+        .token
+        .clone()
+        .ok_or_else(|| token_required(&provider))?;
     let plan = core_target::plan_add(
         &ctx,
         core_target::AddArgs {
@@ -173,13 +152,13 @@ pub(crate) fn add(mut args: AddArgs) -> miette::Result<()> {
             force: args.force,
         },
     )
-    .map_err(legacy)?;
+    .map_err(report)?;
     // What a forced overwrite keeps, as planned (an edit made during the ping is merged too, but
     // these lines describe the plan).
     let kept = kept_lines(&plan.changes);
     let added = completed(
         core_target::execute_add(&ctx, plan, &CliReporter, &CancellationToken::new())
-            .map_err(legacy)?,
+            .map_err(report)?,
     )?;
 
     if let Some(SkuCheck::NotValidated { sku }) = &added.sku {
@@ -225,6 +204,80 @@ pub(crate) fn check_provider(provider: &str) -> CoreResult<()> {
             supported: supported.iter().map(|p| p.to_string()).collect(),
         })
     }
+}
+
+/// A command line that cannot work as given — CLI-input policy, never a domain refusal (those
+/// are the core's): today's message, with the way forward as its help.
+pub(crate) fn usage(message: impl Into<String>, help: impl Into<String>) -> miette::Report {
+    miette::Report::new(CliError::UsageRefused {
+        message: message.into(),
+        help: help.into(),
+    })
+}
+
+/// `target add` with no name, and no wizard to ask for one.
+pub(crate) fn name_required() -> miette::Report {
+    usage(
+        "target name required — pass it as a positional argument (`apprafter target add <name>`) \
+         or run on a TTY to enter the wizard",
+        "Pass the name as the first argument (`apprafter target add <name> …`), or run the \
+         command in a terminal without `--no-interactive` to use the wizard.",
+    )
+}
+
+/// `target add` with no `--provider`, and no wizard to ask for one.
+pub(crate) fn provider_required() -> miette::Report {
+    let supported = apprafter_core::provider::SUPPORTED_PROVIDERS.join(", ");
+    usage(
+        format!("`--provider` is required (supported: {supported})"),
+        format!(
+            "Pass `--provider <provider>`, one of: {supported}. Or run the command in a terminal \
+             without `--no-interactive` to use the wizard."
+        ),
+    )
+}
+
+/// `target add` (or `--renew`) with no token, and no wizard to ask for one.
+pub(crate) fn token_required(provider: &str) -> miette::Report {
+    usage(
+        format!("`--token` is required for provider `{provider}` (or set `HCLOUD_TOKEN` env var)"),
+        "Pass `--token <64 characters>` or set `HCLOUD_TOKEN`; create a token in the Hetzner \
+         Cloud Console → Security → API Tokens.",
+    )
+}
+
+/// `--renew`'s errors: a target that does not exist is the not-found error with renew's way
+/// forward (drop `--renew`); anything else renders as [`report`] does.
+pub(crate) fn renew_missing(e: CoreError) -> miette::Report {
+    let help = match &e {
+        CoreError::TargetNotFound { name, .. } => format!(
+            "There is no target `{name}` to renew: drop `--renew` to create it fresh \
+             (`apprafter target add {name} --provider hetzner-cloud …`)."
+        ),
+        _ => return report(e),
+    };
+    crate::render::core_error::report_with_help(e, &help)
+}
+
+/// `target rename`'s errors: a destination that is taken gets rename's way forward (`target
+/// add`'s help names `--force` and `--renew`, which rename does not have); anything else renders
+/// as [`report`] does.
+pub(crate) fn rename_refused(e: CoreError) -> miette::Report {
+    let help = match &e {
+        CoreError::TargetExists { name } => format!(
+            "Pick another name, or remove the existing `{name}` first (`apprafter target remove \
+             {name}`); nothing was renamed."
+        ),
+        _ => return report(e),
+    };
+    crate::render::core_error::report_with_help(e, &help)
+}
+
+/// `target remove` with neither `--yes` nor a terminal to ask in.
+pub(crate) fn removal_needs_yes(name: &str) -> miette::Report {
+    miette::Report::new(CliError::ConfirmationRequired {
+        action: format!("removing target `{name}`"),
+    })
 }
 
 /// Same idea as [`add_verified_suffix`], for the `--renew` path — a rotation
@@ -345,9 +398,9 @@ pub(crate) fn map_wizard_prompt_error(err: inquire::InquireError) -> CliError {
 /// `load_renewable` read them), the config-flag refusal, the token, then `plan_renew` (format,
 /// "is it new", SSH key) and `execute_renew` (ping, then the patch under the lock).
 fn renew(ctx: &Context, args: AddArgs, name: &str) -> miette::Result<()> {
-    let tref = TargetRef::named(ctx, name).map_err(|e| target_legacy::renew(e, ""))?;
+    let tref = TargetRef::named(ctx, name).map_err(renew_missing)?;
     let provider = cli_core::load_target(&ctx.store(), name)
-        .map_err(|e| target_legacy::renew(e.into(), ""))?
+        .map_err(|e| renew_missing(e.into()))?
         .config
         .provider;
     // `--renew` deliberately ignores the config flags; refusing them up front beats silently
@@ -359,12 +412,7 @@ fn renew(ctx: &Context, args: AddArgs, name: &str) -> miette::Result<()> {
         args.cluster_name.as_deref(),
     )
     .map_err(miette::Report::new)?;
-    let token = args.token.ok_or_else(|| {
-        miette::Report::new(CliError::Other(format!(
-            "`--token` is required for provider `{provider}` (or set `HCLOUD_TOKEN` env var)"
-        )))
-    })?;
-    let legacy = |e| target_legacy::renew(e, &token);
+    let token = args.token.ok_or_else(|| token_required(&provider))?;
     let plan = core_target::plan_renew(
         ctx,
         &tref,
@@ -373,10 +421,10 @@ fn renew(ctx: &Context, args: AddArgs, name: &str) -> miette::Result<()> {
             ssh_key: args.ssh_key,
         },
     )
-    .map_err(legacy)?;
+    .map_err(renew_missing)?;
     completed(
         core_target::execute_renew(ctx, plan, &CliReporter, &CancellationToken::new())
-            .map_err(legacy)?,
+            .map_err(renew_missing)?,
     )?;
     println!(
         "target `{name}` credentials rotated{}",
@@ -399,40 +447,17 @@ pub(crate) fn reject_config_flags_on_renew(
     cluster_name: Option<&str>,
 ) -> Result<()> {
     if provider.is_some() || region.is_some() || tier.is_some() || cluster_name.is_some() {
-        return Err(CliError::Other(
-            "`--renew` only updates credentials — `--provider`, `--region`, `--tier`, `--cluster-name` are not allowed alongside it. Drop `--renew` if you want to change config too.".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-/// Pure target-name validator. Returns `Result<(), String>` so
-/// callers can pick the right error wrapping (CliError for direct
-/// CLI surface; `inquire::Validation::Invalid` for wizard
-/// prompts). The string body is reused verbatim in both paths so
-/// error UX stays consistent.
-pub(crate) fn check_target_name(name: &str) -> std::result::Result<(), String> {
-    if name.is_empty() {
-        return Err("target name must not be empty".to_string());
-    }
-    if name.len() > MAX_TARGET_NAME_LEN {
-        return Err(format!(
-            "target name must be ≤ {MAX_TARGET_NAME_LEN} chars (got {})",
-            name.len()
-        ));
-    }
-    // Avoid filesystem-reserved characters and any path-traversal
-    // surface. The pattern matches Kubernetes resource names which
-    // are already familiar to operators.
-    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-        return Err(format!(
-            "target name `{name}` is invalid — allowed: alphanumeric + `-`"
-        ));
-    }
-    if name.starts_with('-') || name.ends_with('-') {
-        return Err(format!(
-            "target name `{name}` must not start or end with `-`"
-        ));
+        return Err(CliError::UsageRefused {
+            message: "`--renew` only updates credentials — `--provider`, `--region`, `--tier`, \
+                      `--cluster-name` are not allowed alongside it. Drop `--renew` if you want \
+                      to change config too."
+                .to_string(),
+            help: "`--renew` rotates the token (and `--ssh-key`). To change other fields, run \
+                   `apprafter target add <name> --force --provider hetzner-cloud --token <X>` \
+                   with the flags to change (the fields you do not pass are kept), or \
+                   `apprafter target machine --target <name>` for the server type."
+                .to_string(),
+        });
     }
     Ok(())
 }
@@ -557,48 +582,35 @@ mod tests {
         );
     }
 
-    // ── check_target_name (the wizard's prompt and the legacy texts) ─────
+    // ── the name rule (the core's `validate_name`) ───────────────────────
 
     #[test]
-    fn check_target_name_accepts_kebab_lowercase() {
+    fn the_name_rule_accepts_kebab_names_and_refuses_the_rest() {
         for n in ["default", "work", "prod-eu", "team-2", "alpha9", "A-B-C"] {
-            check_target_name(n).unwrap_or_else(|e| panic!("name `{n}` should be valid: {e}"));
+            assert_eq!(
+                core_target::validate_name(n),
+                Ok(()),
+                "`{n}` should be valid"
+            );
         }
-    }
-
-    #[test]
-    fn check_target_name_rejects_empty() {
-        let msg = check_target_name("").expect_err("empty must error");
-        assert!(msg.contains("must not be empty"), "{msg}");
-    }
-
-    #[test]
-    fn check_target_name_rejects_punctuation() {
+        let long = "a".repeat(core_target::TARGET_NAME_MAX_LEN + 1);
         for n in [
+            "",
             "foo.bar",
             "with space",
             "slash/path",
             "under_score",
             "@home",
+            "-leading",
+            "trailing-",
+            "--",
+            long.as_str(),
         ] {
             assert!(
-                check_target_name(n).is_err(),
-                "name `{n}` should be rejected"
+                core_target::validate_name(n).is_err(),
+                "`{n}` should be refused"
             );
         }
-    }
-
-    #[test]
-    fn check_target_name_rejects_leading_or_trailing_dash() {
-        assert!(check_target_name("-leading").is_err());
-        assert!(check_target_name("trailing-").is_err());
-        assert!(check_target_name("--").is_err());
-    }
-
-    #[test]
-    fn check_target_name_rejects_overlong() {
-        let long = "a".repeat(MAX_TARGET_NAME_LEN + 1);
-        assert!(check_target_name(&long).is_err());
     }
 
     // ── renew guards ─────────────────────────────────────────────────────
@@ -622,6 +634,150 @@ mod tests {
                 "{err}"
             );
         }
+    }
+
+    // ── bug 2: deliberate refusals have their own codes and help ─────────
+
+    fn help(r: &miette::Report) -> String {
+        r.help().map(|h| h.to_string()).unwrap_or_default()
+    }
+    fn code(r: &miette::Report) -> String {
+        r.code().map(|c| c.to_string()).unwrap_or_default()
+    }
+
+    #[test]
+    fn every_target_refusal_has_its_code_and_none_says_file_an_issue() {
+        let cases: Vec<(miette::Report, &str)> = vec![
+            (
+                report(CoreError::TargetExists { name: "p".into() }),
+                "apprafter::target::exists",
+            ),
+            (
+                report(CoreError::RenewTokenUnchanged { name: "p".into() }),
+                "apprafter::target::renew_token_unchanged",
+            ),
+            (
+                report(CoreError::InvalidTargetName {
+                    name: "a_b".into(),
+                    problem: core_target::validate_name("a_b").unwrap_err(),
+                }),
+                "apprafter::target::invalid_name",
+            ),
+            (
+                report(CoreError::SameTargetName { name: "p".into() }),
+                "apprafter::target::same_name",
+            ),
+            (
+                report(CoreError::TargetProvisioned {
+                    name: "p".into(),
+                    server_id: 1,
+                    server_name: "s".into(),
+                }),
+                "apprafter::target::provisioned",
+            ),
+            (
+                renew_missing(CoreError::TargetNotFound {
+                    name: "g".into(),
+                    available: vec![],
+                }),
+                "apprafter::target::not_found",
+            ),
+            (name_required(), "apprafter::cli::usage_refused"),
+            (provider_required(), "apprafter::cli::usage_refused"),
+            (
+                token_required("hetzner-cloud"),
+                "apprafter::cli::usage_refused",
+            ),
+            (
+                miette::Report::new(
+                    reject_config_flags_on_renew(Some("x"), None, None, None).unwrap_err(),
+                ),
+                "apprafter::cli::usage_refused",
+            ),
+            (
+                removal_needs_yes("p"),
+                "apprafter::cli::confirmation_required",
+            ),
+        ];
+        for (r, want) in cases {
+            assert_eq!(code(&r), want);
+            let h = help(&r);
+            assert!(!h.is_empty() && !h.contains("file an issue"), "{want}: {h}");
+            assert_commands_parse(&h);
+        }
+    }
+
+    /// The CLI-input refusals keep today's messages; only the code and the help are new.
+    #[test]
+    fn the_usage_refusals_keep_todays_messages() {
+        assert_eq!(
+            name_required().to_string(),
+            "target name required — pass it as a positional argument (`apprafter target add \
+             <name>`) or run on a TTY to enter the wizard"
+        );
+        assert_eq!(
+            provider_required().to_string(),
+            "`--provider` is required (supported: hetzner-cloud)"
+        );
+        assert_eq!(
+            token_required("hetzner-cloud").to_string(),
+            "`--token` is required for provider `hetzner-cloud` (or set `HCLOUD_TOKEN` env var)"
+        );
+        assert_eq!(
+            removal_needs_yes("prod").to_string(),
+            "non-interactive invocation: pass `--yes` to confirm removing target `prod` \
+             (refusing silent destruction)"
+        );
+    }
+
+    #[test]
+    fn renew_on_a_missing_target_says_drop_renew() {
+        let r = renew_missing(CoreError::TargetNotFound {
+            name: "g".into(),
+            available: vec![],
+        });
+        assert!(help(&r).contains("drop `--renew`"), "{}", help(&r));
+        assert_eq!(r.to_string(), "target `g` not found (available: )");
+        // Anything else renders as `report` does.
+        let other = renew_missing(CoreError::RenewTokenUnchanged { name: "g".into() });
+        assert_eq!(
+            help(&other),
+            help(&report(CoreError::RenewTokenUnchanged { name: "g".into() }))
+        );
+    }
+
+    /// `target rename` has no `--force` or `--renew`: its taken-name refusal says what rename
+    /// can do instead of `target add`'s way forward.
+    #[test]
+    fn a_rename_onto_a_taken_name_offers_what_rename_can_do() {
+        let r = rename_refused(CoreError::TargetExists {
+            name: "staging".into(),
+        });
+        assert_eq!(code(&r), "apprafter::target::exists");
+        let h = help(&r);
+        assert!(!h.contains("--force") && !h.contains("--renew"), "{h}");
+        assert!(h.contains("`apprafter target remove staging`"), "{h}");
+        assert_eq!(assert_commands_parse(&h), 1, "{h}");
+        // Anything else renders as `report` does.
+        let other = rename_refused(CoreError::SameTargetName { name: "p".into() });
+        assert_eq!(
+            help(&other),
+            help(&report(CoreError::SameTargetName { name: "p".into() }))
+        );
+    }
+
+    #[test]
+    fn the_provisioned_refusal_hands_over_the_rebuild_recipe() {
+        let h = help(&report(CoreError::TargetProvisioned {
+            name: "p".into(),
+            server_id: 1,
+            server_name: "s".into(),
+        }));
+        // D.3a (WI-449 finding 3) fixed the recipe: `restore <repo> --reprovision`, after `destroy`.
+        assert!(
+            h.contains("apprafter backup create") && h.contains("restore <repo> --reprovision"),
+            "{h}"
+        );
     }
 
     // ── --force: what it keeps ───────────────────────────────────────────
@@ -1446,15 +1602,15 @@ pub(crate) fn resolve_show_target(name: Option<&str>, active: &str) -> Result<St
     }
 }
 
-/// `target rename` on the core. Its refusals read as today (`target_legacy`).
+/// `target rename` on the core; its refusals are the core's, with the CLI's help.
 pub(crate) fn rename(from: &str, to: &str) -> miette::Result<()> {
     info!(from = %from, to = %to, "target rename invoked");
     let ctx = crate::context::cli_context()?;
     let tref = TargetRef::named(&ctx, from).map_err(report)?;
-    let plan = core_target::plan_rename(&ctx, &tref, to).map_err(target_legacy::rename)?;
+    let plan = core_target::plan_rename(&ctx, &tref, to).map_err(rename_refused)?;
     let done = completed(
         core_target::execute_rename(&ctx, plan, &CliReporter, &CancellationToken::new())
-            .map_err(target_legacy::rename)?,
+            .map_err(rename_refused)?,
     )?;
     let suffix = if done.cli_default.is_some() {
         " (active pointer updated)"
@@ -1477,9 +1633,7 @@ pub(crate) fn remove(name: &str, yes: bool) -> miette::Result<()> {
         let stdin_tty = std::io::stdin().is_terminal();
         let stdout_tty = std::io::stdout().is_terminal();
         if !(stdin_tty && stdout_tty) {
-            return Err(miette::Report::new(CliError::Other(format!(
-                "non-interactive invocation: pass `--yes` to confirm removing target `{name}` (refusing silent destruction)"
-            ))));
+            return Err(removal_needs_yes(name));
         }
         let confirmed = inquire::Confirm::new(&remove_prompt(name))
             .with_default(false)

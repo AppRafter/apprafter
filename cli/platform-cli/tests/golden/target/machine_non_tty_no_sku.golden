@@ -2,12 +2,10 @@ $ apprafter target machine
 [exit 1]
 [stdout]
 [stderr]
-Error: apprafter::cli::other
+Error: apprafter::cli::usage_refused
 
   × non-interactive shell: pass `--server-type <sku>` to set the machine type
   │ without the interactive picker
-  help: This is the catch-all CLI error. The message above is the only
-        context. If you see this often with the same wording, please file an
-        issue — recurring messages should be promoted to a typed `CliError`
-        variant with its own help text.
+  help: Pass `--server-type <sku>`, or run `apprafter target machine` in a
+        terminal to open the picker.
 

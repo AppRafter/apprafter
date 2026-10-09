@@ -35,10 +35,6 @@ pub(crate) fn report(e: CoreError) -> miette::Report {
 /// [`report`] with `help` in place of the CLI's help — for a command whose way forward differs
 /// (renew's `TargetNotFound`: "drop `--renew` to create it fresh", overview §3.6.4). Message,
 /// code and cause chain stay exactly what `report` shows.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "first caller: D.3b's `target add --renew` arm")
-)]
 pub(crate) fn report_with_help(e: CoreError, help: &str) -> miette::Report {
     let inner: Box<dyn Diagnostic + Send + Sync> = match e {
         CoreError::Cli(inner) => Box::new(inner),
