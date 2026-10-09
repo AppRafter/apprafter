@@ -413,14 +413,16 @@ On Linux, `XDG_CONFIG_HOME` and `XDG_DATA_HOME` move these as usual, and the win
 storage is in `~/.local/share/dev.apprafter.desktop/` too.
 
 `APPRAFTER_DESKTOP_DATA_DIR=<dir>` puts the settings in `<dir>` and the logs in `<dir>/logs`,
-and runs the app as a separate instance. The app's own code reads only that variable and
-`APPRAFTER_CONFIG_DIR` from its environment (a test build reads two more), so `HCLOUD_TOKEN`,
-`KUBECONFIG` and `RUST_LOG` have no effect on it. On Linux it also reads `WAYLAND_DISPLAY`,
+and runs the app as a separate instance. The app's own code reads only that variable,
+`APPRAFTER_CONFIG_DIR` and, on Linux and Windows, `PATH` from its environment (a test build
+reads two more), so `HCLOUD_TOKEN`, `KUBECONFIG` and `RUST_LOG` have no effect on it. `PATH` is
+where the app looks for the tools it runs (`kubectl`, `helm`, `restic`, `git`, `ssh`, `cue`);
+on macOS it asks your login shell for one instead. On Linux it also reads `WAYLAND_DISPLAY`,
 `XDG_SESSION_TYPE`, `GDK_BACKEND`, `WEBKIT_DISABLE_DMABUF_RENDERER` and its own
 `APPRAFTER_DESKTOP_DMABUF_RESTARTED`, only for the NVIDIA workaround under
-[Troubleshooting](#troubleshooting). Variables that the system and the
-libraries the app uses read still apply, such as `HOME`, `XDG_CONFIG_HOME` and the graphics
-ones under Troubleshooting. See
+[Troubleshooting](#troubleshooting). Variables that the system and the libraries the app uses
+read still apply, such as `HOME`, `XDG_CONFIG_HOME` and the graphics ones under
+Troubleshooting. See
 [Environment variables](../docs/reference/environment.md#apprafter-desktop).
 
 ### The log
