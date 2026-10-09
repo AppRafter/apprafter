@@ -31,6 +31,7 @@ use zeroize::Zeroizing;
 use crate::env::EnvSource;
 use crate::error::{CoreError, CoreResult};
 use crate::net::DeadlineResolver;
+use crate::tools::ToolResolver;
 
 /// Points every Hetzner call at another base URL (integration tests).
 pub const HCLOUD_BASE_URL_ENV: &str = "APPRAFTER_HCLOUD_BASE_URL";
@@ -427,6 +428,16 @@ impl Context {
             self.hcloud_base_url.clone(),
             token.expose(),
             self.http.clone(),
+        )
+    }
+
+    /// The tools on this context's search path, `CUE_BIN` first for cue, `.exe` only on
+    /// Windows.
+    pub fn tools(&self) -> ToolResolver<'_> {
+        ToolResolver::new(
+            &self.tool_search_path,
+            self.overrides.cue_bin.as_deref(),
+            cfg!(windows),
         )
     }
 }
