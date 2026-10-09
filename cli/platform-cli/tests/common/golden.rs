@@ -154,13 +154,11 @@ impl Sandbox {
         self
     }
 
-    /// GOTCHA-66: `PATH` holds only a stand-in per tool doctor probes (`cli_core::tools::ALL`,
-    /// and `cue`), each answering its version call as the real tool does
+    /// GOTCHA-66: `PATH` holds only a stand-in per tool doctor probes (`cli_core::tools::ALL`),
+    /// each answering its version call as the real tool does
     /// ([`super::stand_in::tool_stand_ins`]).
     pub fn with_stand_in_tools(mut self) -> Self {
-        let dir = super::stand_in::tool_stand_ins(
-            cli_core::tools::ALL.iter().chain([&cli_core::tools::CUE]),
-        );
+        let dir = super::stand_in::tool_stand_ins(cli_core::tools::ALL);
         self.path_override = Some(dir.path().to_path_buf());
         self.tools = Some(dir);
         self

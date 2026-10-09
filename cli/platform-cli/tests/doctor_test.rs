@@ -117,7 +117,7 @@ fn doctor_on_empty_store_still_reports_the_environment() {
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
 
     // The environment half reached the reader.
-    for tool in ["kubectl", "helm", "restic", "git", "ssh"] {
+    for tool in ["kubectl", "helm", "restic", "git", "ssh", "cue"] {
         assert!(
             stdout.contains(tool),
             "`{tool}` missing from the report a first-run user sees:\n{stdout}"

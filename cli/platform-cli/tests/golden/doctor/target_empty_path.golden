@@ -46,8 +46,15 @@ Install an OpenSSH client:
   • macOS      preinstalled
   • Debian     apt install openssh-client
   • Nix        nix profile install nixpkgs#openssh
+  ⚠ `cue` on PATH
+      hint: not found (No such file or directory (os error <N>)) — needed for validating application manifests.
+Install cue:
+  • macOS      brew install cue
+  • Arch       pacman -S cue
+  • Nix        nix profile install nixpkgs#cue
+  • other      https://cuelang.org/docs/introduction/installation/
   ✓ DNS resolves `127.0.0.1` (443/tcp)
 
-12 checks for target `prod`: 6 passed, 4 warning(s), 2 FAIL — fix the FAILs and rerun `apprafter doctor`.
+13 checks for target `prod`: 6 passed, 5 warning(s), 2 FAIL — fix the FAILs and rerun `apprafter doctor`.
 [stderr]
 <ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m doctor invoked <ESC>[3mno_ping<ESC>[0m<ESC>[2m=<ESC>[0mfalse

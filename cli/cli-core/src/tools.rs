@@ -4,7 +4,7 @@
 //!
 //! # Why this exists
 //!
-//! The CLI spawns `restic`, `kubectl`, `helm`, `git` and `ssh`. When one
+//! The CLI spawns `restic`, `kubectl`, `helm`, `git`, `ssh` and `cue`. When one
 //! is missing the spawn fails with `os error 2`, and the audit recorded
 //! as D11 in `docs/measurements/day2-followups.md` found that the check
 //! for it runs *after* the expensive part of the command in eight
@@ -307,11 +307,9 @@ pub const SSH: Tool = Tool {
 /// own, so a new dependency cannot be added without appearing there —
 /// the gap D11 recorded, where `restic` had eight spawn sites, was fatal
 /// on all of them, and was checked nowhere.
-pub const ALL: &[Tool] = &[RESTIC, KUBECTL, HELM, GIT, SSH];
+pub const ALL: &[Tool] = &[RESTIC, KUBECTL, HELM, GIT, SSH, CUE];
 
-/// cue — `app validate`, which checks an application manifest locally. Not in `ALL` until D.3c
-/// adds it to doctor together with its golden change; `apprafter_core::tools::ToolId::Cue`
-/// resolves it now.
+/// cue — `app validate`, which checks an application manifest locally.
 pub const CUE: Tool = Tool {
     name: "cue",
     purpose: "validating application manifests",
@@ -577,7 +575,7 @@ mod tests {
 
     #[test]
     fn the_install_text_is_the_rendering_of_header_and_hints() {
-        for t in ALL.iter().chain([&CUE]) {
+        for t in ALL {
             assert_eq!(
                 t.install,
                 render_install(t.install_header, t.hints),
@@ -606,12 +604,12 @@ mod tests {
     }
 
     #[test]
-    fn cue_is_defined_but_not_yet_probed() {
-        assert_eq!(CUE.name, "cue");
-        assert!(
-            !ALL.iter().any(|t| t.name == "cue"),
-            "CUE joins ALL in D.3c with its golden change"
-        );
+    fn cue_is_checked_last_and_is_optional() {
+        // The doctor row order is ALL's order: restic, kubectl, helm, git, ssh, cue (overview §3.9).
+        assert_eq!(ALL.last(), Some(&CUE));
+        // Checked when the test compiles: a `required` cue would fail the build of the tests.
+        const { assert!(!CUE.required, "only `app validate` needs cue") };
+        assert_eq!(CUE.version_args, &["version"]);
     }
 
     #[test]
@@ -681,7 +679,7 @@ mod tests {
         // fatal on all of them, and appeared in no checked list. If a
         // new binary is introduced, it belongs here before it is spawned.
         let names: Vec<&str> = ALL.iter().map(|t| t.name).collect();
-        for expected in ["restic", "kubectl", "helm", "git", "ssh"] {
+        for expected in ["restic", "kubectl", "helm", "git", "ssh", "cue"] {
             assert!(names.contains(&expected), "`{expected}` missing from ALL");
         }
     }
