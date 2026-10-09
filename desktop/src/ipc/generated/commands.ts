@@ -17,6 +17,7 @@ export const COMMANDS = [
   'settings_get',
   'settings_set',
   'unlock',
+  'window_ready',
 ] as const;
 
 /** What a locked app still answers; everything else fails with `DESKTOP_ERROR_CODES.LOCKED`. */
@@ -26,4 +27,5 @@ export const ALLOWED_WHILE_LOCKED = [
   'quit',
   'settings_get',
   'unlock',
+  'window_ready',
 ] as const;

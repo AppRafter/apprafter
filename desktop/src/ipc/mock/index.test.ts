@@ -33,6 +33,7 @@ function callEach(): Record<(typeof COMMANDS)[number], () => Promise<unknown>> {
     settings_get: () => api.settingsGet(),
     settings_set: async () => api.settingsSet(await api.settingsGet()),
     unlock: () => api.unlock(),
+    window_ready: () => api.windowReady(),
   };
 }
 

@@ -50,6 +50,8 @@ rustls                = { version = "0.23", default-features = false, features =
 serde                 = { workspace = true }
 serde_json            = { workspace = true }
 tauri                 = { workspace = true }
+# Website, Docs and GitHub open in the browser; the capability scopes it to those three URLs.
+tauri-plugin-opener   = "~2.7"
 # A second launch focuses the first window instead of starting another app.
 tauri-plugin-single-instance = "~2.5"
 thiserror             = "2"

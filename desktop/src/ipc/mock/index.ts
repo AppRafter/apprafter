@@ -121,6 +121,14 @@ export function installMockIpc(options: MockOptions = {}): void {
     settingsNotice: null,
   });
 
+  // The window, as far as the title bar can tell: maximized or not, and a resize event.
+  let maximized = false;
+  const toggleMaximize = async () => {
+    maximized = !maximized;
+    await emit('tauri://resize', { width: 1280, height: 800 });
+    return null;
+  };
+
   const notFound = (args: InvokeArgs | undefined) => {
     const opId = (args as { opId?: number } | undefined)?.opId;
     return Promise.reject(
@@ -147,7 +155,18 @@ export function installMockIpc(options: MockOptions = {}): void {
     op_cancel: notFound,
     op_discard: () => null,
     op_execute: notFound,
+    window_ready: () => null,
     'plugin:window|set_theme': () => null,
+    'plugin:window|minimize': () => null,
+    'plugin:window|toggle_maximize': toggleMaximize,
+    'plugin:window|internal_toggle_maximize': toggleMaximize,
+    'plugin:window|is_maximized': () => maximized,
+    'plugin:window|start_dragging': () => null,
+    // A browser has no opener: a new tab stands in for it.
+    'plugin:opener|open_url': (args) => {
+      window.open(String((args as { url: string }).url), '_blank', 'noopener');
+      return null;
+    },
   };
 
   mockWindows('main');

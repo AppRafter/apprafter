@@ -17,6 +17,26 @@
     "core:event:allow-unlisten",
     // The native title bar follows the app theme, the lock screen's included; changes nothing else.
     "core:window:allow-set-theme",
+    // The Windows caption buttons (the window has no decorations there); close is not granted:
+    // that button quits through the app, which waits for running operations.
+    "core:window:allow-minimize",
+    "core:window:allow-toggle-maximize",
+    // The maximize button shows restore while the window is maximized.
+    "core:window:allow-is-maximized",
+    // data-tauri-drag-region: the title bar moves the window, a double-click maximizes it.
+    "core:window:allow-start-dragging",
+    "core:window:allow-internal-toggle-maximize",
+    // Website, Docs and GitHub (sidebar footer, About) in the browser: these three URLs only.
+    {
+      identifier: "opener:allow-open-url",
+      allow: [
+        { url: "https://apprafter.dev" },
+        { url: "https://docs.apprafter.dev" },
+        { url: "https://github.com/AppRafter/apprafter" },
+      ],
+    },
+    // The page has painted: the window, created hidden, shows (also while locked).
+    "allow-window-ready",
     // Versions, OS, account, auth support: the About line, title bar and lock screen.
     "allow-app-info",
     // The preferences, read even while locked so the lock screen has its theme.

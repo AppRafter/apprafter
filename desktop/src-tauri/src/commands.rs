@@ -15,11 +15,12 @@ use apprafter_desktop_ipc::{
     AppInfo, LockState, OpEvent, OpId, OpSummary, Settings, Subscribed, SubscriptionId,
 };
 use tauri::ipc::Channel;
-use tauri::{AppHandle, Runtime, State, Webview};
+use tauri::{AppHandle, Runtime, State, Webview, WebviewWindow};
 
 use crate::app::{self, Shell};
 use crate::errors::DesktopError;
 use crate::ops::{panic_message, EventSink};
+use crate::window;
 
 type ShellState<'a> = State<'a, Arc<Shell>>;
 
@@ -203,6 +204,14 @@ pub async fn op_execute<R: Runtime>(
 ) -> Result<SubscriptionId, UiError> {
     let sink = ChannelSink::new(on_event, &webview);
     on_shell(&shell, move |shell| shell.execute(op_id, sink)).await
+}
+
+/// The page has painted: the window, created hidden so it never flashes white, shows. The one
+/// command with no blocking work: showing the window is a message to the event loop.
+#[tauri::command]
+pub async fn window_ready<R: Runtime>(window: WebviewWindow<R>) -> Result<(), UiError> {
+    window::reveal(&window)
+        .map_err(|e| DesktopError::Internal(format!("the window could not be shown: {e}")).to_ui())
 }
 
 #[cfg(test)]

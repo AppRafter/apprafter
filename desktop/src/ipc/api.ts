@@ -29,6 +29,7 @@ export const API_COMMANDS = [
   'op_cancel',
   'op_discard',
   'op_execute',
+  'window_ready',
 ] as const satisfies readonly (typeof COMMANDS)[number][];
 
 export type ApiCommand = (typeof API_COMMANDS)[number];
@@ -100,3 +101,5 @@ export const opDiscard = (opId: OpId) => call<void>('op_discard', { opId });
 /** Run a confirmed plan (Rust asks for the OS gesture when it needs one); `onEvent` follows it. */
 export const opExecute = (opId: OpId, onEvent: Channel<OpEvent>) =>
   call<SubscriptionId>('op_execute', { opId, onEvent });
+/** The page has painted: the window, created hidden, shows. */
+export const windowReady = () => call<void>('window_ready');

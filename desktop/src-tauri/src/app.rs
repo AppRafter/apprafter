@@ -325,6 +325,7 @@ pub fn builder<R: Runtime>(base: tauri::Builder<R>, cell: ShellCell) -> tauri::B
         commands::op_cancel,
         commands::op_discard,
         commands::op_execute,
+        commands::window_ready,
     ]);
     let gate = cell.clone();
     base.invoke_handler(move |invoke| {

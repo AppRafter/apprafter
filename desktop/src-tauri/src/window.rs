@@ -1,6 +1,15 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
-//! The main window: size, background, the navigation guard, its webview storage, and bringing
-//! it to the front.
+//! The main window: size, background, per-OS chrome, the navigation guard, its webview storage,
+//! and bringing it to the front.
+//!
+//! # Chrome
+//!
+//! The page draws a 38px title bar (logo, tabs). On Windows the window has no decorations (the
+//! page draws the caption buttons) and keeps its shadow, which on Windows 11 also rounds the
+//! corners. On macOS the title bar is an overlay with no title, the traffic lights placed in the
+//! page's bar. On Linux the window keeps its native decorations: client-side ones vary across
+//! X11 and Wayland. The window is created hidden and shows when the page has painted
+//! (`window_ready`), or after [`REVEAL_FALLBACK`] if the page never says so.
 //!
 //! The webview may only ever show the app itself. A link, a redirect or an injected
 //! `location =` that leaves the app origin is refused, and new windows are never opened
@@ -20,14 +29,26 @@
 //! owner's app — the app's settings, logs and single-instance lock still move.
 
 use std::path::Path;
+use std::thread;
+use std::time::Duration;
 
-use tauri::{Manager, Url, WebviewUrl, WebviewWindowBuilder};
+use tauri::{Manager, Runtime, Url, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
 #[cfg(target_os = "macos")]
 use crate::env;
 
 /// The window label every capability and command refers to.
 pub const MAIN: &str = "main";
+
+/// How long the hidden window waits for the page's `window_ready` before it shows anyway: a
+/// page that failed to start must not leave the app running with no window to quit from.
+pub const REVEAL_FALLBACK: Duration = Duration::from_secs(5);
+
+/// Show the window and give it the focus (`window_ready`, and the fallback).
+pub fn reveal<R: Runtime>(window: &WebviewWindow<R>) -> tauri::Result<()> {
+    window.show()?;
+    window.set_focus()
+}
 
 /// The dev server `tauri dev` loads (tauri.conf.json5 `build.devUrl`).
 const DEV_ORIGIN: &str = "http://localhost:1420";
@@ -64,10 +85,19 @@ pub fn build_main(app: &tauri::AppHandle, data_dir: Option<&Path>) -> tauri::Res
         .inner_size(1280.0, 800.0)
         .min_inner_size(1024.0, 640.0)
         .background_color(tauri::window::Color(0x0a, 0x0e, 0x1a, 0xff))
+        .visible(false)
         .disable_drag_drop_handler()
         .zoom_hotkeys_enabled(false)
         .on_navigation(move |url| is_app_url(url, debug))
         .on_new_window(|_, _| tauri::webview::NewWindowResponse::Deny);
+    #[cfg(target_os = "windows")]
+    let window = window.decorations(false).shadow(true);
+    // The lights centred in the page's 38px bar (to be tuned on a Mac, D.2f manual list).
+    #[cfg(target_os = "macos")]
+    let window = window
+        .title_bar_style(tauri::TitleBarStyle::Overlay)
+        .hidden_title(true)
+        .traffic_light_position(tauri::LogicalPosition::new(14.0, 19.0));
     // macOS 14 and later; on macOS 13 WKWebView ignores it and keeps the default store.
     #[cfg(target_os = "macos")]
     let window = match data_dir {
@@ -77,6 +107,28 @@ pub fn build_main(app: &tauri::AppHandle, data_dir: Option<&Path>) -> tauri::Res
     #[cfg(not(target_os = "macos"))]
     let _ = data_dir;
     window.build()?;
+    let handle = app.clone();
+    let fallback = thread::Builder::new()
+        .name("reveal-fallback".into())
+        .spawn(move || {
+            thread::sleep(REVEAL_FALLBACK);
+            let Some(window) = handle.get_webview_window(MAIN) else {
+                return;
+            };
+            if !window.is_visible().unwrap_or(true) {
+                tracing::warn!("the page did not report ready within {REVEAL_FALLBACK:?}");
+                if let Err(e) = reveal(&window) {
+                    tracing::error!("the window could not be shown: {e}");
+                }
+            }
+        });
+    if let Err(e) = fallback {
+        // No thread to wait on: show the window now rather than risk never showing it.
+        tracing::warn!("no thread for the reveal fallback ({e}); showing the window at once");
+        if let Some(window) = app.get_webview_window(MAIN) {
+            reveal(&window)?;
+        }
+    }
     Ok(())
 }
 

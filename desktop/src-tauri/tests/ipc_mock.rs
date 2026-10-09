@@ -86,10 +86,10 @@ fn every_command_is_registered_and_allowed_and_a_quit_starts_nothing_new() {
 /// Plugin commands never reach the app's invoke handler, so the lock gate never sees them:
 /// the capability is all that stands between a page and a plugin command. Pinned here for
 /// three a page could misuse — forging an event (`lock-changed` among them), closing the
-/// window past the quit, reading the app's details — each refused by the ACL, while the three
-/// granted ones (`listen`, `unlisten`, the window's `set_theme`) pass it.
+/// window past the quit (the Windows caption's close button quits through the app instead),
+/// reading the app's details — each refused by the ACL, while the granted ones pass it.
 #[test]
-fn plugin_commands_beyond_the_granted_three_are_refused_by_the_acl() {
+fn plugin_commands_beyond_the_granted_ones_are_refused_by_the_acl() {
     let rig = rig(lock_off());
     for cmd in [
         "plugin:event|emit",
@@ -116,38 +116,46 @@ fn plugin_commands_beyond_the_granted_three_are_refused_by_the_acl() {
         }
         other => panic!("listen with no arguments: {other:?}"),
     }
-    // The other control: the native window follows the app theme, so `set_theme` passes the
-    // ACL and runs (the mock window takes any theme).
+    // The other controls: the native window follows the app theme, and the Windows caption
+    // buttons minimize and maximize it; each passes the ACL and runs on the mock window.
     assert_eq!(
         invoke(&rig, "plugin:window|set_theme", json!({ "value": "dark" })),
         Ok(Value::Null)
     );
+    for cmd in ["plugin:window|minimize", "plugin:window|toggle_maximize"] {
+        assert_eq!(invoke(&rig, cmd, json!({})), Ok(Value::Null), "{cmd}");
+    }
+    assert_eq!(
+        invoke(&rig, "plugin:window|is_maximized", json!({})),
+        Ok(json!(false))
+    );
 }
 
-/// The capability, read as Tauri reads it: exactly `listen` and `unlisten` from the core,
-/// `set_theme` for the window, and the generated `allow-<command>` of every app command —
-/// nothing more, nothing less, once each. A permission added for a later step must be added
-/// here too, with its reason in the file.
+/// The capability, read as Tauri reads it: exactly the pinned core permissions, the opener
+/// scoped to the three links the app shows, and the generated `allow-<command>` of every app
+/// command — nothing more, nothing less, once each. A permission added for a later step must
+/// be added here too, with its reason in the file.
 #[test]
-fn the_capability_grants_the_pinned_core_permissions_and_every_app_command_only() {
+fn the_capability_grants_the_pinned_permissions_and_every_app_command_only() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("capabilities/main.json5");
     let text = fs::read_to_string(&path).unwrap();
     let capability: Value = json5::from_str(&text).unwrap();
-    let granted: Vec<&str> = capability["permissions"]
+    let permissions = capability["permissions"]
         .as_array()
-        .expect("a permissions list")
-        .iter()
-        .map(|p| {
-            p.as_str()
-                .unwrap_or_else(|| panic!("a scoped permission: {p}"))
-        })
-        .collect();
+        .expect("a permissions list");
+    let granted: Vec<&str> = permissions.iter().filter_map(Value::as_str).collect();
+    let scoped: Vec<&Value> = permissions.iter().filter(|p| !p.is_string()).collect();
     let set: BTreeSet<String> = granted.iter().map(|p| p.to_string()).collect();
     assert_eq!(set.len(), granted.len(), "a permission twice: {granted:?}");
     let mut expected: BTreeSet<String> = [
         "core:event:allow-listen",
         "core:event:allow-unlisten",
         "core:window:allow-set-theme",
+        "core:window:allow-minimize",
+        "core:window:allow-toggle-maximize",
+        "core:window:allow-is-maximized",
+        "core:window:allow-start-dragging",
+        "core:window:allow-internal-toggle-maximize",
     ]
     .map(String::from)
     .into();
@@ -157,6 +165,16 @@ fn the_capability_grants_the_pinned_core_permissions_and_every_app_command_only(
             .map(|cmd| format!("allow-{}", cmd.replace('_', "-"))),
     );
     assert_eq!(set, expected);
+    // The one scoped permission: the opener, for exactly these URLs, no pattern.
+    let links = json!({
+        "identifier": "opener:allow-open-url",
+        "allow": [
+            { "url": "https://apprafter.dev" },
+            { "url": "https://docs.apprafter.dev" },
+            { "url": "https://github.com/AppRafter/apprafter" },
+        ],
+    });
+    assert_eq!(scoped, [&links]);
     assert_eq!(capability["windows"], json!(["main"]));
     assert_eq!(capability.get("remote"), None, "no remote origin");
 }

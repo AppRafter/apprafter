@@ -21,9 +21,17 @@ pub const COMMANDS: &[&str] = &[
     "op_cancel",
     "op_discard",
     "op_execute",
+    "window_ready",
 ];
 
 /// What a locked app still answers; everything else is `apprafter::desktop::locked`.
-/// `settings_get` stays readable so the lock screen renders in the chosen theme.
-pub const ALLOWED_WHILE_LOCKED: &[&str] =
-    &["app_info", "settings_get", "lock_status", "unlock", "quit"];
+/// `settings_get` stays readable so the lock screen renders in the chosen theme, and
+/// `window_ready` shows the window, created hidden, once the lock screen has painted.
+pub const ALLOWED_WHILE_LOCKED: &[&str] = &[
+    "app_info",
+    "settings_get",
+    "lock_status",
+    "unlock",
+    "quit",
+    "window_ready",
+];
