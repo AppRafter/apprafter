@@ -145,7 +145,7 @@ struct Setup {
 async fn listen(emitter: Emitter) {
     let mut setup = Setup::default();
     match Connection::system().await {
-        Ok(system) => logind(&mut setup, &system).await,
+        Ok(system) => logind(&mut setup, &system, kernel_release).await,
         Err(error) => tracing::info!(
             "no system bus ({error}): sleep and session locks from logind are not watched"
         ),
@@ -241,16 +241,19 @@ fn listening(kinds: impl IntoIterator<Item = Kind>) -> Listening {
 }
 
 /// logind's two sources, the manager's `PrepareForSleep` and `Lock` on the app's session, and
-/// which of them have a logind to send them.
-async fn logind(setup: &mut Setup, system: &Connection) {
+/// which of them have a logind to send them ([`logind_heard`], given the kernel's release that
+/// `osrelease` reads).
+async fn logind(setup: &mut Setup, system: &Connection, osrelease: fn() -> Option<String>) {
     let running = owner(system, LOGIN1).await;
+    let mut found = LogindFound {
+        runs: running.is_some(),
+        sleep_rule: false,
+        lock_rule: false,
+    };
     let sleep = rule(LOGIN1, Some(LOGIN1_PATH), LOGIN1_MANAGER, "PrepareForSleep");
     if let Some(stream) = subscribe(system, Kind::PrepareForSleep, LOGIN1, sleep).await {
         setup.streams.push(stream);
-        match sleeps_expected(running.is_some(), kernel_release) {
-            Ok(()) => setup.heard.push(Kind::PrepareForSleep),
-            Err(why) => tracing::info!("{why}: sleeps are listened for, not expected"),
-        }
+        found.sleep_rule = true;
     }
     setup.owners.insert(LOGIN1, running);
     match own_session(system).await {
@@ -258,16 +261,43 @@ async fn logind(setup: &mut Setup, system: &Connection) {
             let lock = rule(LOGIN1, Some(path.as_str()), LOGIN1_SESSION, "Lock");
             if let Some(stream) = subscribe(system, Kind::SessionLock, LOGIN1, lock).await {
                 setup.streams.push(stream);
-                match session_locks_expected(kernel_release) {
-                    Ok(()) => setup.heard.push(Kind::SessionLock),
-                    Err(why) => {
-                        tracing::info!("{why}: session locks are listened for, not expected")
-                    }
-                }
+                found.lock_rule = true;
             }
         }
         Err(why) => tracing::info!("{why}: logind's session locks are not watched"),
     }
+    setup.heard.extend(logind_heard(found, osrelease));
+}
+
+/// What logind's set-up found: whether logind owns its name, and which of its two rules the bus
+/// took (the session's only once logind answered for the app's session).
+#[derive(Debug, Clone, Copy)]
+struct LogindFound {
+    runs: bool,
+    sleep_rule: bool,
+    lock_rule: bool,
+}
+
+/// Which of logind's sources count as heard (see the module docs): `PrepareForSleep` when its
+/// rule was taken and sleeps are expected ([`sleeps_expected`]), `Lock` when its rule on the
+/// app's session was taken — logind answered for the session, so it runs — and session locks
+/// are expected ([`session_locks_expected`]); neither under WSL. A source listened for but not
+/// counted is logged with why. `osrelease` reads the kernel's release, only when it matters.
+fn logind_heard(found: LogindFound, osrelease: impl Fn() -> Option<String>) -> Vec<Kind> {
+    let mut heard = Vec::new();
+    if found.sleep_rule {
+        match sleeps_expected(found.runs, &osrelease) {
+            Ok(()) => heard.push(Kind::PrepareForSleep),
+            Err(why) => tracing::info!("{why}: sleeps are listened for, not expected"),
+        }
+    }
+    if found.lock_rule {
+        match session_locks_expected(&osrelease) {
+            Ok(()) => heard.push(Kind::SessionLock),
+            Err(why) => tracing::info!("{why}: session locks are listened for, not expected"),
+        }
+    }
+    heard
 }
 
 /// The screen savers' sources, and which of them run.
@@ -610,6 +640,48 @@ mod tests {
         }
         // A release that cannot be read is no WSL's.
         assert_eq!(session_locks_expected(|| None), Ok(()));
+    }
+
+    /// logind's counting as its set-up does it: with both rules taken from a logind that runs,
+    /// both halves count outside WSL and neither under it; a rule not taken never counts, and a
+    /// logind that does not run promises no sleep.
+    #[test]
+    fn logind_counts_what_it_heard_and_neither_half_under_wsl() {
+        let release = |release: &'static str| move || Some(release.to_owned());
+        let all = LogindFound {
+            runs: true,
+            sleep_rule: true,
+            lock_rule: true,
+        };
+        let both = vec![Kind::PrepareForSleep, Kind::SessionLock];
+        assert_eq!(logind_heard(all, release("6.10.3-arch1-1")), both);
+        assert_eq!(logind_heard(all, || None), both);
+        for wsl in [
+            "5.15.167.4-microsoft-standard-WSL2",
+            "4.4.0-19041-Microsoft",
+        ] {
+            assert_eq!(logind_heard(all, release(wsl)), Vec::<Kind>::new(), "{wsl}");
+        }
+        let without = |found: LogindFound| logind_heard(found, release("6.1.0-26-amd64"));
+        assert_eq!(
+            without(LogindFound {
+                lock_rule: false,
+                ..all
+            }),
+            [Kind::PrepareForSleep]
+        );
+        assert_eq!(
+            without(LogindFound {
+                sleep_rule: false,
+                ..all
+            }),
+            [Kind::SessionLock]
+        );
+        assert_eq!(
+            without(LogindFound { runs: false, ..all }),
+            [Kind::SessionLock],
+            "logind answered for the session: its lock still counts"
+        );
     }
 
     #[test]
