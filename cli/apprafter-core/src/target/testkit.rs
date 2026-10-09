@@ -79,3 +79,25 @@ pub(crate) fn edit(ctx: &Context, name: &str, f: impl FnOnce(&mut Target)) {
     f(&mut t);
     cli_core::save_target(&ctx.store(), &t).unwrap();
 }
+
+pub(crate) const TOKEN_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+/// `GET path` (any query) answering `status` / `body` only to `Bearer token`.
+pub(crate) fn route(
+    s: &mut mockito::Server,
+    path: &str,
+    status: usize,
+    body: &str,
+    token: &str,
+) -> mockito::Mock {
+    s.mock("GET", path)
+        .match_query(mockito::Matcher::Any)
+        .match_header("authorization", format!("Bearer {token}").as_str())
+        .with_status(status)
+        .with_header("content-type", "application/json")
+        .with_body(body)
+}
+
+pub(crate) const LOCATIONS: &str = r#"{"locations":[
+ {"id":2,"name":"nbg1","description":"Nuremberg DC Park 1","country":"DE","city":"Nuremberg","network_zone":"eu-central"},
+ {"id":1,"name":"fsn1","description":"Falkenstein DC Park 1","country":"DE","city":"Falkenstein","network_zone":"eu-central"}]}"#;
