@@ -1,20 +1,26 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
 #
-# AppRafter Desktop's polkit backend (desktop/os-auth/src/linux/polkit.rs) against a real
-# polkitd: every test of desktop/os-auth/tests/polkit_container.rs, each in a fresh podman
-# container of Debian stable with dbus, polkitd, the app's policy file and a user `walk`.
+# AppRafter Desktop's Linux authentication (desktop/os-auth/src/linux/) against a real polkitd
+# and a real PAM stack: every test of desktop/os-auth/tests/{polkit,pam}_container.rs, each in a
+# fresh podman container of Debian stable with dbus, polkitd, the app's policy file, Debian's
+# PAM (pam_unix and its set-group-id unix_chkpwd) and a user `walk` with a known password.
 #
 #   bash scripts/test-osauth-linux.sh [case...]                # every case by default
 #   PODMAN='sudo podman' bash scripts/test-osauth-linux.sh     # rootful, as CI runs it
 #
-# Needs cargo (the desktop toolchain; cli-providers' build script runs cue) and podman. A
-# missing podman FAILS: this is a regression test, and skipping it would read as a pass.
-# Nothing touches the host's polkit or D-Bus: each container runs its own bus and polkitd.
+# Needs cargo (the desktop toolchain; cli-providers' build script runs cue; linking needs
+# libpam's development files) and podman. A missing podman FAILS: this is a regression test,
+# and skipping it would read as a pass. Nothing touches the host's polkit, D-Bus or PAM: each
+# container runs its own bus and polkitd and reads its own /etc/pam.d.
 #
-# The test binary is built here, on the host, and mounted read-only. CI builds it on
-# ubuntu-24.04 (glibc 2.39), which runs on Debian 13's newer glibc; a Nix-built binary loads
-# its glibc from /nix/store, mounted read-only when the host has one.
+# The test binaries are built here, on the host, mounted read-only, and started through the
+# container's own loader with the container's library directory first, so the libpam and the
+# PAM modules they load are Debian's, as an installed app's would be the system's. A binary
+# built in a nix shell names nix's loader, which never looks in the container's library
+# directories. The container's glibc (Debian 13: 2.41) runs a binary built against a newer one
+# as long as the binary uses no newer symbol; a build that does fails loudly here, it does not
+# pass. CI builds on ubuntu-24.04 (glibc 2.39).
 #
 # The session: polkit applies `allow_active` only to a subject in an active local session, and
 # looks that up through sd-login: the process's cgroup (`.../session-<id>.scope`) and the
@@ -24,13 +30,13 @@
 # systemd user session. CI has no such session, so it runs rootful.
 #
 # A case passes only when its one test reported `ok` and the harness ran exactly one test, and
-# the cases here must be exactly the tests in the binary, so a renamed test cannot turn into
+# the cases here must be exactly the tests in the binaries, so a renamed test cannot turn into
 # an empty, passing run.
 
 set -euo pipefail
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
-IMAGE=localhost/apprafter-osauth-polkit:dev
+IMAGE=localhost/apprafter-osauth-linux:dev
 BASE_IMAGE=docker.io/library/debian:13-slim
 POLICY="$REPO_ROOT/desktop/packaging/linux/dev.apprafter.desktop.policy"
 # The container user's password: a throwaway account in a throwaway container.
@@ -38,16 +44,24 @@ PASSWORD=walk-osauth-test
 # The logind session id the driver fakes for `walk`.
 SESSION=c1
 
-# Each case: the test's name, then the driver's flags for the system it needs.
+# The test binaries: desktop/os-auth/tests/<name>.rs.
+TESTS=(polkit_container pam_container)
+# Each case: its test binary, the test's name (unique across the binaries), then the driver's
+# flags for the system it needs.
 CASES=(
-    "the_right_password_is_verified_and_asked_for_every_time"
-    "a_wrong_password_fails"
-    "a_dismissed_dialog_is_cancelled_by_the_user"
-    "without_an_agent_nobody_can_ask"
-    "without_the_policy_file_the_action_is_missing --no-policy"
-    "a_rule_that_grants_without_asking_is_refused --rule-yes"
-    "outside_an_active_local_session_it_is_not_permitted --no-session"
-    "a_dialog_the_app_cancels_is_cancelled_by_the_app"
+    "polkit_container the_right_password_is_verified_and_asked_for_every_time"
+    "polkit_container a_wrong_password_fails"
+    "polkit_container a_dismissed_dialog_is_cancelled_by_the_user"
+    "polkit_container without_an_agent_nobody_can_ask"
+    "polkit_container without_the_policy_file_the_action_is_missing --no-policy"
+    "polkit_container a_rule_that_grants_without_asking_is_refused --rule-yes"
+    "polkit_container outside_an_active_local_session_it_is_not_permitted --no-session"
+    "polkit_container a_dialog_the_app_cancels_is_cancelled_by_the_app"
+    "pam_container the_right_password_is_verified"
+    "pam_container wrong_passwords_fail_and_the_back_off_refuses_without_asking_pam"
+    "pam_container without_a_service_file_there_is_no_pam_service --no-pam-service"
+    "pam_container without_an_agent_the_authenticator_moves_to_the_password"
+    "pam_container without_the_policy_file_the_authenticator_offers_the_password --no-policy"
 )
 
 die() {
@@ -57,37 +71,57 @@ die() {
 
 read -ra podman <<<"${PODMAN:-podman}"
 command -v "${podman[0]}" >/dev/null ||
-    die "${podman[0]} is not installed: the polkit cases cannot run, and they are not skipped"
+    die "${podman[0]} is not installed: the cases cannot run, and they are not skipped"
 command -v cargo >/dev/null || die "cargo is not on PATH"
 
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
-# 1. The test binary, built on the host.
-echo "==> building desktop/os-auth/tests/polkit_container.rs"
+# 1. The test binaries, built on the host.
+echo "==> building desktop/os-auth/tests/{$(IFS=,; echo "${TESTS[*]}")}.rs"
+test_flags=()
+for t in "${TESTS[@]}"; do
+    test_flags+=(--test "$t")
+done
 if ! (cd "$REPO_ROOT/desktop" &&
-    cargo test --locked --color never -p apprafter-os-auth --test polkit_container --no-run) \
+    cargo test --locked --color never -p apprafter-os-auth "${test_flags[@]}" --no-run) \
     >"$work/build.log" 2>&1; then
     cat "$work/build.log" >&2
-    die "building the test failed"
+    die "building the tests failed"
 fi
-bin="$(sed -n 's/^ *Executable tests\/polkit_container\.rs (\(.*\))$/\1/p' "$work/build.log")"
-[[ -n "$bin" ]] || {
-    cat "$work/build.log" >&2
-    die "cargo did not name the test binary"
-}
-[[ "$bin" == /* ]] || bin="$REPO_ROOT/desktop/$bin"
+declare -A bins
+for t in "${TESTS[@]}"; do
+    bin="$(sed -n "s/^ *Executable tests\/$t\.rs (\(.*\))\$/\1/p" "$work/build.log")"
+    [[ -n "$bin" ]] || {
+        cat "$work/build.log" >&2
+        die "cargo did not name the $t binary"
+    }
+    [[ "$bin" == /* ]] || bin="$REPO_ROOT/desktop/$bin"
+    bins[$t]="$bin"
+done
 
-# 2. The cases here are exactly the binary's tests.
-mapfile -t listed < <("$bin" --list --ignored | sed -n 's/: test$//p' | sort)
-mapfile -t known < <(for c in "${CASES[@]}"; do echo "${c%% *}"; done | sort)
+# 2. The cases here are exactly the binaries' tests.
+mapfile -t listed < <(for t in "${TESTS[@]}"; do
+    "${bins[$t]}" --list --ignored | sed -n "s/: test\$//p" | sed "s/^/$t /"
+done | sort)
+mapfile -t known < <(for c in "${CASES[@]}"; do
+    read -ra words <<<"$c"
+    echo "${words[0]} ${words[1]}"
+done | sort)
 if [[ "${listed[*]}" != "${known[*]}" ]]; then
-    echo "tests in the binary: ${listed[*]}" >&2
-    echo "cases in this script: ${known[*]}" >&2
-    die "the cases here and the tests in polkit_container.rs differ"
+    printf 'tests in the binaries:\n' >&2
+    printf '    %s\n' "${listed[@]}" >&2
+    printf 'cases in this script:\n' >&2
+    printf '    %s\n' "${known[@]}" >&2
+    die "the cases here and the tests in the binaries differ"
 fi
+mapfile -t names < <(for c in "${CASES[@]}"; do
+    read -ra words <<<"$c"
+    echo "${words[1]}"
+done | sort | uniq -d)
+[[ ${#names[@]} -eq 0 ]] || die "test names in more than one binary: ${names[*]}"
 
-# 3. Which cases to run: the arguments, or all of them.
+# 3. Which cases to run: the arguments (test names), or all of them.
 selected=()
 if [[ $# -eq 0 ]]; then
     selected=("${CASES[@]}")
@@ -95,7 +129,8 @@ else
     for want in "$@"; do
         found=""
         for c in "${CASES[@]}"; do
-            [[ "${c%% *}" == "$want" ]] && found="$c"
+            read -ra words <<<"$c"
+            [[ "${words[1]}" == "$want" ]] && found="$c"
         done
         [[ -n "$found" ]] || die "no case named $want"
         selected+=("$found")
@@ -108,14 +143,17 @@ cat >"$work/osauth-case" <<'DRIVER_EOF'
 #!/bin/bash
 # Runs one case as the container's PID 1: prepares the system the flags ask for, starts the
 # system bus and polkitd, and runs that one test as `walk`.
+#
+#   osauth-case [flags] <test binary> <test name>
 set -euo pipefail
 
-policy=yes rule=no session=yes
-while [[ $# -gt 1 ]]; do
+policy=yes rule=no session=yes pam_service=yes
+while [[ $# -gt 2 ]]; do
     case "$1" in
     --no-policy) policy=no ;;
     --rule-yes) rule=yes ;;
     --no-session) session=no ;;
+    --no-pam-service) pam_service=no ;;
     *)
         echo "osauth-case: unknown flag $1" >&2
         exit 2
@@ -123,10 +161,16 @@ while [[ $# -gt 1 ]]; do
     esac
     shift
 done
-name="$1"
+binary="$1" name="$2"
 
 if [[ $policy == no ]]; then
     rm /usr/share/polkit-1/actions/dev.apprafter.desktop.policy
+fi
+if [[ $pam_service == no ]]; then
+    # Every service the PAM fallback probes for, from both directories libpam reads.
+    for dir in /etc/pam.d /usr/lib/pam.d; do
+        rm -f "$dir/common-auth" "$dir/system-auth" "$dir/login"
+    done
 fi
 if [[ $rule == yes ]]; then
     cat >/etc/polkit-1/rules.d/00-apprafter-test-yes.rules <<'RULE_EOF'
@@ -175,6 +219,16 @@ if [[ $ready != yes ]]; then
     exit 3
 fi
 
+# The container's loader and library directory (see the script's header).
+shopt -s nullglob
+loaders=(/lib64/ld-linux-*.so.2 /lib/ld-linux-*.so.1)
+shopt -u nullglob
+if [[ ${#loaders[@]} -eq 0 ]]; then
+    echo "osauth-case: no dynamic loader in /lib64 or /lib" >&2
+    exit 3
+fi
+libdir="/usr/lib/$(uname -m)-linux-gnu"
+
 status=0
 (
     # Only the test joins the session. sd-login reads a process's cgroup relative to PID 1's,
@@ -185,7 +239,8 @@ status=0
     exec setpriv --reuid=walk --regid=walk --init-groups --reset-env \
         env APPRAFTER_OSAUTH_CONTAINER=1 APPRAFTER_OSAUTH_PASSWORD="$OSAUTH_PASSWORD" \
         APPRAFTER_OSAUTH_SESSION="$OSAUTH_SESSION" \
-        /opt/osauth/polkit_container --ignored --exact --nocapture "$name"
+        "${loaders[0]}" --library-path "$libdir" \
+        "/opt/osauth/$binary" --ignored --exact --nocapture "$name"
 ) || status=$?
 if [[ $status -ne 0 ]]; then
     echo "--- polkitd log"
@@ -195,9 +250,12 @@ exit "$status"
 DRIVER_EOF
 cat >"$work/Containerfile" <<EOF
 FROM $BASE_IMAGE
+# libpam0g, libpam-modules (pam_unix), libpam-modules-bin (unix_chkpwd) and libpam-runtime
+# (/etc/pam.d/common-auth) are already in the base image; naming them keeps it so.
 RUN apt-get update \\
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \\
       dbus-daemon dbus-bin polkitd \\
+      libpam0g libpam-modules libpam-modules-bin libpam-runtime \\
  && rm -rf /var/lib/apt/lists/*
 RUN useradd --create-home --shell /bin/bash walk \\
  && echo 'walk:$PASSWORD' | chpasswd
@@ -213,21 +271,22 @@ echo "==> building the image ($BASE_IMAGE)"
     die "building the image failed"
 }
 # shellcheck disable=SC2016 # expanded by the container's shell
-"${podman[@]}" run --rm "$IMAGE" sh -c 'echo "    $(pkaction --version), $(dbus-daemon --version | head -1)"'
+"${podman[@]}" run --rm "$IMAGE" sh -c 'echo "    $(pkaction --version), $(dbus-daemon --version | head -1), libpam $(dpkg-query -W -f="\${Version}" libpam0g)"'
 
 # 5. The cases.
-mounts=(--volume "$bin:/opt/osauth/polkit_container:ro")
-if [[ -d /nix/store ]]; then
-    mounts+=(--volume /nix/store:/nix/store:ro)
-fi
+mounts=()
+for t in "${TESTS[@]}"; do
+    mounts+=(--volume "${bins[$t]}:/opt/osauth/$t:ro")
+done
 failed=()
 for c in "${selected[@]}"; do
     read -ra words <<<"$c"
-    name="${words[0]}"
-    flags=("${words[@]:1}")
+    binary="${words[0]}"
+    name="${words[1]}"
+    flags=("${words[@]:2}")
     log="$work/$name.log"
     if "${podman[@]}" run --rm --security-opt unmask=/sys/fs/cgroup "${mounts[@]}" "$IMAGE" \
-        osauth-case "${flags[@]}" "$name" >"$log" 2>&1 &&
+        osauth-case "${flags[@]}" "$binary" "$name" >"$log" 2>&1 &&
         grep -qx "test $name ... ok" "$log" &&
         grep -q '^test result: ok\. 1 passed; 0 failed' "$log"; then
         echo "ok    $name"
@@ -239,6 +298,6 @@ for c in "${selected[@]}"; do
 done
 
 if [[ ${#failed[@]} -gt 0 ]]; then
-    die "${#failed[@]} of ${#selected[@]} polkit case(s) failed: ${failed[*]}"
+    die "${#failed[@]} of ${#selected[@]} case(s) failed: ${failed[*]}"
 fi
-echo "all ${#selected[@]} polkit case(s) passed"
+echo "all ${#selected[@]} case(s) passed"
