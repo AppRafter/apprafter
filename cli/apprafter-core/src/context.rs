@@ -185,10 +185,14 @@ pub struct Context {
     http: ureq::Agent,
 }
 
-/// The agent every network client of the core is built on: connect, read and write each
-/// bounded by `timeout`, and names resolved within it.
+/// The agent every network client of the core is built on: the whole request (redirects and
+/// the body included) bounded by `timeout`, as are connect, each read and each write, and
+/// names resolved within it. The overall bound is what stops a server or middlebox that drips
+/// a byte at a time: `timeout_read` bounds each read alone, and a blocking request cannot be
+/// cancelled.
 fn http_agent(timeout: Duration) -> ureq::Agent {
     ureq::AgentBuilder::new()
+        .timeout(timeout)
         .timeout_connect(timeout)
         .timeout_read(timeout)
         .timeout_write(timeout)
@@ -530,6 +534,43 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("bounded by the request timeout"));
         drop(silent);
+    }
+
+    /// Review finding 4: `timeout_read` bounds each read, so a server that keeps dripping
+    /// bytes would hold a request for as long as it likes. The request as a whole is bounded.
+    #[test]
+    fn the_http_agent_gives_up_on_a_dripping_server_at_the_request_timeout() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let Ok((mut conn, _)) = listener.accept() else {
+                return;
+            };
+            // One byte of a never-ending header every 500 ms, for 20 s: every read is answered
+            // well inside the per-read timeout.
+            let head = b"HTTP/1.1 200 OK\r\nX-Drip: ";
+            for byte in head.iter().chain(std::iter::repeat(&b'a')).take(40) {
+                if conn.write_all(&[*byte]).is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        });
+        let timeout = Duration::from_secs(1);
+        let ctx = Context::for_desktop("/s".into(), url).with_request_timeout(timeout);
+        let client = ctx.hetzner_client(&SecretString::new("t"));
+        let started = std::time::Instant::now();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(client.list_locations().is_err());
+        });
+        let failed = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the dripping request outlived its timeout");
+        let took = started.elapsed();
+        assert!(failed);
+        assert!(took < timeout + Duration::from_millis(1500), "{took:?}");
     }
 
     #[test]
