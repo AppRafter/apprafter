@@ -25,6 +25,7 @@ import type { SessionEvents } from '../generated/SessionEvents';
 import type { Settings } from '../generated/Settings';
 import type { Theme } from '../generated/Theme';
 import type { UiError } from '../generated/UiError';
+import type { UnavailableReason } from '../generated/UnavailableReason';
 
 export { MOCK_TARGETS } from './fixtures';
 
@@ -154,7 +155,7 @@ const uiError = (code: string, message: string): UiError => ({
 });
 
 /** Rust's `auth_unavailable` for `reason`. */
-const unavailable = (reason: string): UiError => ({
+const unavailable = (reason: UnavailableReason): UiError => ({
   ...uiError(
     DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE,
     `device-owner authentication is unavailable here (${reason})`,

@@ -25,6 +25,7 @@ import type { Subscribed } from './generated/Subscribed';
 import type { SubscriptionId } from './generated/SubscriptionId';
 import type { JsonValue } from './generated/serde_json/JsonValue';
 import type { UiError } from './generated/UiError';
+import type { UnavailableReason } from './generated/UnavailableReason';
 
 /** The output one view keeps, in UTF-8 bytes (Rust's replay keeps as much); older goes. */
 export const OUTPUT_CAP = 1 << 20;
@@ -170,8 +171,17 @@ function forgetLive(entry: Entry) {
 
 const isLocked = (e: unknown) =>
   e instanceof IpcError && e.error.code === DESKTOP_ERROR_CODES.LOCKED;
-/** `auth_unavailable` reasons where the other way to ask is there (Linux): Rust keeps the plan. */
-const OTHER_WAY: ReadonlySet<unknown> = new Set(['no_agent', 'use_system_prompt']);
+/**
+ * `auth_unavailable` reasons where the other way to ask is there (Linux): Rust keeps the plan.
+ * Typed by the generated reasons, so a reason Rust renames or drops fails the type check.
+ */
+const OTHER_WAY: ReadonlySet<UnavailableReason> = new Set<UnavailableReason>([
+  'no_agent',
+  'use_system_prompt',
+]);
+
+/** Whether `reason`, as a refusal's fields carry it, is one of OTHER_WAY. */
+const isOtherWay = (reason: unknown) => (OTHER_WAY as ReadonlySet<unknown>).has(reason);
 
 /**
  * A refusal after which the plan waits in Rust for another try under the same id: a busy prompt
@@ -185,7 +195,7 @@ const leavesThePlanWaiting = (e: unknown) => {
   return (
     code === DESKTOP_ERROR_CODES.AUTH_BUSY ||
     code === DESKTOP_ERROR_CODES.AUTH_FAILED ||
-    (code === DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE && OTHER_WAY.has(fields.reason))
+    (code === DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE && isOtherWay(fields.reason))
   );
 };
 

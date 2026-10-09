@@ -7,6 +7,7 @@ import { useCallback, useEffect, useState } from 'react';
 import type { AuthMethod } from '../ipc/generated/AuthMethod';
 import { DESKTOP_ERROR_CODES } from '../ipc/generated/errors';
 import type { UiError } from '../ipc/generated/UiError';
+import type { UnavailableReason } from '../ipc/generated/UnavailableReason';
 
 const PROMPTS: Record<AuthMethod, string> = {
   windows_hello: 'Windows Hello',
@@ -36,8 +37,11 @@ const WRONG_PASSWORD = 'That password is not right.';
 
 const BUSY = 'A check is already open. Finish it, then try again.';
 
-/** The `auth_unavailable` reasons that come with a way on, in plain words. */
-const UNAVAILABLE: Partial<Record<string, string>> = {
+/**
+ * The `auth_unavailable` reasons that come with a way on, in plain words. Keyed by the generated
+ * reasons, so a reason Rust renames or drops fails the type check.
+ */
+const UNAVAILABLE: Partial<Record<UnavailableReason, string>> = {
   // Linux: polkit has no agent to show its dialog; the app's own field takes over.
   no_agent: 'The system could not show its password prompt.',
   // The field was used where the OS prompts itself (a stale field, or a lock in between): the
@@ -55,6 +59,13 @@ const UNAVAILABLE: Partial<Record<string, string>> = {
  */
 const NOT_PERMITTED =
   "This computer's settings do not allow AppRafter to ask for your password here.";
+
+/** UNAVAILABLE's line for `reason` as a refusal's fields carry it; only its own keys count. */
+function unavailableLine(reason: unknown): string | undefined {
+  return typeof reason === 'string' && Object.hasOwn(UNAVAILABLE, reason)
+    ? UNAVAILABLE[reason as UnavailableReason]
+    : undefined;
+}
 
 export interface AuthRefusal {
   /** What to say, a line each: what the OS said, or the app's own words. */
@@ -105,12 +116,12 @@ export function authRefusal(error: UiError, viaField: boolean): AuthRefusal {
   }
   if (error.code === DESKTOP_ERROR_CODES.AUTH_BUSY) return { lines: [BUSY], retryInMs: null };
   if (error.code === DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE) {
-    const reason = String(error.fields.reason);
+    const reason = error.fields.reason;
     // What the OS said of it (the field's route) comes first: the more specific words.
-    if (reason === 'not_permitted_here') {
+    if (reason === ('not_permitted_here' satisfies UnavailableReason)) {
       return { lines: [...(viaField ? messagesOf(error) : []), NOT_PERMITTED], retryInMs: null };
     }
-    const line = UNAVAILABLE[reason];
+    const line = unavailableLine(reason);
     if (line !== undefined) return { lines: [line], retryInMs: null };
   }
   return { lines: [error.message], retryInMs: null };

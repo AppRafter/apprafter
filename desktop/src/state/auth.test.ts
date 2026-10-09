@@ -234,4 +234,11 @@ describe('authRefusal, for either way', () => {
       expect(authRefusal(error, false)).toEqual({ lines: [error.message], retryInMs: null });
     }
   });
+
+  test("a reason the copy does not know is Rust's message, even a name every object has", () => {
+    for (const reason of ['toString', 'constructor', '__proto__', 'no_such_reason', 7, null]) {
+      const error = refused(DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE, { reason });
+      expect(authRefusal(error, false)).toEqual({ lines: [error.message], retryInMs: null });
+    }
+  });
 });
