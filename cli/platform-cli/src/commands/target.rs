@@ -161,8 +161,8 @@ pub(crate) fn add(mut args: AddArgs) -> miette::Result<()> {
             .map_err(report)?,
     )?;
 
-    if let Some(SkuCheck::NotValidated { sku }) = &added.sku {
-        println!("{}", sku_not_validated_line(sku));
+    if let Some(check) = &added.sku {
+        println!("{}", sku_line(check));
     }
     println!(
         "{}",
@@ -306,6 +306,28 @@ pub(crate) fn renew_verified_suffix(no_ping: bool) -> &'static str {
         " (token NOT verified — `--no-ping` was passed)"
     } else {
         " (token verified against Hetzner Cloud)"
+    }
+}
+
+/// What the SKU check of `target add --server-type` found, printed after the save (bug 7: a
+/// validated type used to print nothing). A validated type names the region it was checked in,
+/// and says when that was the default region (no `--region` was passed, so the target stores
+/// none); an unchecked one is [`sku_not_validated_line`].
+pub(crate) fn sku_line(check: &SkuCheck) -> String {
+    match check {
+        SkuCheck::Validated {
+            sku,
+            region,
+            region_was_default,
+        } => format!(
+            "server type `{sku}` validated against Hetzner Cloud for region `{region}`{}",
+            if *region_was_default {
+                " (the default region; `--region` was not passed)"
+            } else {
+                ""
+            }
+        ),
+        SkuCheck::NotValidated { sku } => sku_not_validated_line(sku),
     }
 }
 
@@ -905,6 +927,31 @@ mod tests {
 
         assert!(renew_verified_suffix(true).contains("NOT verified"));
         assert!(!renew_verified_suffix(false).contains("NOT"));
+    }
+
+    /// Bug 7: a server type checked against the API says so, and in which region — flagging
+    /// the default one, which the target does not store.
+    #[test]
+    fn the_sku_line_names_the_region_and_flags_the_default() {
+        let v = |d| SkuCheck::Validated {
+            sku: "cx32".into(),
+            region: "nbg1".into(),
+            region_was_default: d,
+        };
+        assert_eq!(
+            sku_line(&v(false)),
+            "server type `cx32` validated against Hetzner Cloud for region `nbg1`"
+        );
+        assert_eq!(
+            sku_line(&v(true)),
+            "server type `cx32` validated against Hetzner Cloud for region `nbg1` (the default \
+             region; `--region` was not passed)"
+        );
+        assert_eq!(
+            sku_line(&SkuCheck::NotValidated { sku: "cx32".into() }),
+            sku_not_validated_line("cx32")
+        );
+        assert!(!sku_line(&v(true)).contains("NOT"));
     }
 
     /// Same contract for the unvalidated SKU notice.

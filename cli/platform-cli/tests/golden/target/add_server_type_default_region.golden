@@ -1,6 +1,7 @@
 $ apprafter target add prod --provider hetzner-cloud --token aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --ssh-key <SANDBOX>/home/id_ed25519.pub --server-type cx32 --no-interactive
 [exit 0]
 [stdout]
+server type `cx32` validated against Hetzner Cloud for region `nbg1` (the default region; `--region` was not passed)
 target `prod` saved and set as active (first target on fresh store) (token verified against Hetzner Cloud)
 [stderr]
 <ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m target add invoked <ESC>[3mtarget<ESC>[0m<ESC>[2m=<ESC>[0mprod <ESC>[3mrenew<ESC>[0m<ESC>[2m=<ESC>[0mfalse <ESC>[3mforce<ESC>[0m<ESC>[2m=<ESC>[0mfalse
