@@ -110,7 +110,8 @@ pub enum ToolProblem {
     Unsupported {
         path: String,
     },
-    /// It ran but printed no version; `exit` is its exit code, when it had one.
+    /// It ran but reported no version: it exited non-zero or was killed, whatever it printed
+    /// (an error line is not a version). `exit` is its exit code, when it had one.
     NoVersionOutput {
         exit: Option<i32>,
     },
@@ -281,8 +282,10 @@ impl<'a> ToolResolver<'a> {
 
     /// Resolve `tool` and run its version arguments, killed after `timeout` or when `cancel`
     /// trips. Never fails: what went wrong is the status's `problem`. The version is the first
-    /// non-empty line of stdout, then stderr (`ssh -V` writes to stderr; some tools exit
-    /// non-zero on their version flag, which does not matter when they printed one).
+    /// non-empty line of stdout, then stderr (`ssh -V` writes to stderr), of a run that exited
+    /// 0. Each of the six version calls exits 0 when the tool works, so a non-zero exit is
+    /// `NoVersionOutput` whatever it printed: an asdf / mise shim with no version set, or the
+    /// macOS `git` stub without the developer tools, prints an error line and fails.
     pub fn probe(&self, tool: ToolId, timeout: Duration, cancel: &CancellationToken) -> ToolStatus {
         let mut status = ToolStatus::unprobed(tool);
         let path = match self.resolve(tool) {
@@ -317,9 +320,9 @@ impl<'a> ToolResolver<'a> {
             status.problem = Some(ToolProblem::TimedOut);
             return status;
         }
-        status.version = first_nonempty_line(&out.stdout, &out.stderr);
-        let succeeded = out.status.is_some_and(|s| s.success());
-        if status.version.is_none() && !succeeded {
+        if out.status.is_some_and(|s| s.success()) {
+            status.version = first_nonempty_line(&out.stdout, &out.stderr);
+        } else {
             status.problem = Some(ToolProblem::NoVersionOutput {
                 exit: out.status.and_then(|s| s.code()),
             });
@@ -328,7 +331,8 @@ impl<'a> ToolResolver<'a> {
     }
 }
 
-/// The first non-empty trimmed line of `stdout`, else of `stderr` (doctor's rule).
+/// The first non-empty trimmed line of `stdout`, else of `stderr` (doctor's rule, less its
+/// leniency for a failed run).
 fn first_nonempty_line(stdout: &[u8], stderr: &[u8]) -> Option<String> {
     [stdout, stderr]
         .iter()
@@ -470,7 +474,7 @@ mod tests {
 
     /// `sleep` by its absolute path, from the test process's own `PATH`: a probed child's
     /// `PATH` is the search path (a temp dir here), where a bare `sleep` is not found, and the
-    /// shell's "not found" line would then read as a version.
+    /// shell would exit at once instead of running into the timeout.
     #[cfg(unix)]
     fn sleep_bin() -> String {
         let path = std::env::var_os("PATH").unwrap_or_default();
@@ -502,6 +506,30 @@ mod tests {
             !restic.install.is_empty(),
             "a missing tool carries its install lines"
         );
+    }
+
+    /// An asdf / mise shim with no version set, or the macOS `git` stub without the developer
+    /// tools: one error line on stderr and a non-zero exit. That line is not a version.
+    #[cfg(unix)]
+    #[test]
+    fn a_tool_that_fails_reports_no_version_whatever_it_printed() {
+        let dir = tempfile::tempdir().unwrap();
+        script(
+            dir.path(),
+            "kubectl",
+            "echo 'mise ERROR No version is set for command kubectl' >&2; exit 1",
+        );
+        let p = dir.path().as_os_str().to_owned();
+        let kubectl = ToolResolver::new(&p, None, false).probe(
+            ToolId::Kubectl,
+            Duration::from_secs(5),
+            &CancellationToken::new(),
+        );
+        assert_eq!(
+            (kubectl.version, kubectl.problem),
+            (None, Some(ToolProblem::NoVersionOutput { exit: Some(1) }))
+        );
+        assert!(kubectl.path.is_some(), "it was found, and ran");
     }
 
     #[cfg(unix)]
