@@ -78,10 +78,15 @@ pub enum CoreError {
     #[diagnostic(code(apprafter::target::exists))]
     TargetExists { name: String },
 
-    /// A renewal would store the token the target already has.
+    /// A renewal would store the token the target already has, and changes no SSH key.
     #[error("the new token for `{name}` is the one already stored")]
     #[diagnostic(code(apprafter::target::renew_token_unchanged))]
     RenewTokenUnchanged { name: String },
+
+    /// A renewal with no token would change nothing: no SSH key, or the one already stored.
+    #[error("renewing `{name}` would change nothing: no new token and no new SSH key")]
+    #[diagnostic(code(apprafter::target::renew_nothing_to_change))]
+    RenewNothingToChange { name: String },
 
     /// The message is the CLI's own reason text for the name, byte for byte.
     #[error("{}", problem.reason(name))]
@@ -178,6 +183,7 @@ pub mod codes {
     pub const UNSAFE_OVERRIDE: &str = "apprafter::env::unsafe_override";
     pub const TARGET_EXISTS: &str = "apprafter::target::exists";
     pub const RENEW_TOKEN_UNCHANGED: &str = "apprafter::target::renew_token_unchanged";
+    pub const RENEW_NOTHING_TO_CHANGE: &str = "apprafter::target::renew_nothing_to_change";
     pub const INVALID_TARGET_NAME: &str = "apprafter::target::invalid_name";
     pub const SAME_TARGET_NAME: &str = "apprafter::target::same_name";
     pub const UNKNOWN_PROVIDER: &str = "apprafter::target::unknown_provider";
@@ -209,6 +215,7 @@ pub mod codes {
         UNSAFE_OVERRIDE,
         TARGET_EXISTS,
         RENEW_TOKEN_UNCHANGED,
+        RENEW_NOTHING_TO_CHANGE,
         INVALID_TARGET_NAME,
         SAME_TARGET_NAME,
         UNKNOWN_PROVIDER,
@@ -326,6 +333,7 @@ impl From<&CoreError> for UiError {
             CoreError::UnsafeOverride { var, .. } => put("var", json!(var)),
             CoreError::TargetExists { name }
             | CoreError::RenewTokenUnchanged { name }
+            | CoreError::RenewNothingToChange { name }
             | CoreError::SameTargetName { name }
             | CoreError::TokenNotStored { name }
             | CoreError::NotProvisioned { name } => put("name", json!(name)),
@@ -443,7 +451,7 @@ pub mod samples {
 
     /// How many variants `CoreError` declares: checked against `error.rs`'s own syntax tree
     /// (`the_samples_are_exactly_the_declared_variants`), as is [`one_of_each`].
-    pub const VARIANTS: usize = 20;
+    pub const VARIANTS: usize = 21;
 
     pub fn one_of_each() -> Vec<CoreError> {
         let s = |v: &str| v.to_string();
@@ -461,6 +469,7 @@ pub mod samples {
             CoreError::Cli(cli_core::CliError::BackupJobActive { job: s("backup-1") }),
             CoreError::TargetExists { name: s("prod") },
             CoreError::RenewTokenUnchanged { name: s("prod") },
+            CoreError::RenewNothingToChange { name: s("prod") },
             CoreError::InvalidTargetName {
                 name: s("-a"),
                 problem: NameProblem::EdgeDash,
@@ -523,6 +532,7 @@ pub mod samples {
             | CoreError::Cli(_)
             | CoreError::TargetExists { .. }
             | CoreError::RenewTokenUnchanged { .. }
+            | CoreError::RenewNothingToChange { .. }
             | CoreError::InvalidTargetName { .. }
             | CoreError::SameTargetName { .. }
             | CoreError::UnknownProvider { .. }
@@ -738,6 +748,7 @@ mod tests {
             ("Cli", json!({})),
             ("TargetExists", json!({"name": "prod"})),
             ("RenewTokenUnchanged", json!({"name": "prod"})),
+            ("RenewNothingToChange", json!({"name": "prod"})),
             (
                 "InvalidTargetName",
                 json!({"name": "-a", "problem": NameProblem::EdgeDash.as_str()}),

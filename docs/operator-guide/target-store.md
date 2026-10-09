@@ -101,14 +101,25 @@ flow is preserved.
 apprafter target add prod --renew --token "$NEW_TOKEN"
 ```
 
-`--renew` updates only the credentials half of an existing
+`--renew` updates only the token and the SSH key of an existing
 target. Fails if the target doesn't exist (`--force` overwrites
 the token and the fields you pass, and keeps the rest). The wizard pings the new token
 before saving; pass `--no-ping` to skip the round-trip.
 
+To change only the SSH key, pass `--ssh-key` without a new token:
+
+```sh
+apprafter target add prod --renew --ssh-key ~/.ssh/id_ed25519.pub
+```
+
+The credentials file is not touched and nothing is sent to the
+provider. A token equal to the stored one (for example an
+`HCLOUD_TOKEN` that still holds it) counts as no new token.
+
 The token bytes are byte-compared against the stored value —
-identical input is rejected with a hint pointing at the Hetzner
-Cloud Console to confirm rotation actually happened.
+identical input with nothing else to change is rejected with a hint
+pointing at the Hetzner Cloud Console to confirm rotation actually
+happened.
 
 ### Per-machine target with stricter perms
 

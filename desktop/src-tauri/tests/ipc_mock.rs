@@ -684,3 +684,42 @@ fn the_renew_command_hands_its_ssh_key_to_the_core() {
     .unwrap();
     assert_eq!(planned["class"], "bounded");
 }
+
+/// WI-452: the token is optional on the wire. A key with `token: null` plans the key alone (the
+/// SSH key row: no token field); neither is the core's nothing-to-change refusal.
+#[test]
+fn the_renew_command_takes_a_key_without_a_token() {
+    let rig = rig(lock_off());
+    let target = cli_core::target::Target {
+        name: "prod".into(),
+        config: cli_core::target::TargetConfig {
+            provider: "hetzner-cloud".into(),
+            ..Default::default()
+        },
+        credentials: Default::default(),
+    };
+    cli_core::save_target(&rig.shell.context.store(), &target).unwrap();
+    let key = rig.shell.context.config_root().join("id_ed25519.pub");
+    std::fs::write(&key, "ssh-ed25519 AAAA k\n").unwrap();
+    let planned = invoke(
+        &rig,
+        "op_plan_target_renew",
+        json!({ "name": "prod", "token": null, "sshKey": key }),
+    )
+    .unwrap();
+    assert_eq!(
+        (planned["class"].clone(), planned["title"].clone()),
+        (json!("bounded"), json!("Change the SSH key of prod"))
+    );
+    assert_eq!(planned["changes"].as_array().map(Vec::len), Some(1));
+    let refused = invoke(
+        &rig,
+        "op_plan_target_renew",
+        json!({ "name": "prod", "token": null, "sshKey": null }),
+    );
+    assert_eq!(
+        code(&refused),
+        Some("apprafter::target::renew_nothing_to_change"),
+        "{refused:?}"
+    );
+}

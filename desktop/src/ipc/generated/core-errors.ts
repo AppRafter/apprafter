@@ -23,6 +23,7 @@ export const CORE_ERROR_CODES = {
   TARGET_NO_ACTIVE: 'apprafter::target::no_active',
   TARGET_PROVIDER_UNREACHABLE: 'apprafter::target::provider_unreachable',
   TARGET_PROVISIONED: 'apprafter::target::provisioned',
+  TARGET_RENEW_NOTHING_TO_CHANGE: 'apprafter::target::renew_nothing_to_change',
   TARGET_RENEW_TOKEN_UNCHANGED: 'apprafter::target::renew_token_unchanged',
   TARGET_SAME_NAME: 'apprafter::target::same_name',
   TARGET_SERVER_MISSING: 'apprafter::target::server_missing',

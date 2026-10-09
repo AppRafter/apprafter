@@ -113,10 +113,11 @@ describe('each function sends its command with camelCase arguments', () => {
       'op_plan_target_add',
       { args: ADD_ARGS },
     ],
+    // The SSH key row's call: no token, sent as null (Rust's Option), not left out.
     opPlanTargetRenew: [
-      () => api.opPlanTargetRenew('prod-eu', 'not-a-real-token', '/home/alex/.ssh/work.pub'),
+      () => api.opPlanTargetRenew('prod-eu', null, '/home/alex/.ssh/work.pub'),
       'op_plan_target_renew',
-      { name: 'prod-eu', token: 'not-a-real-token', sshKey: '/home/alex/.ssh/work.pub' },
+      { name: 'prod-eu', token: null, sshKey: '/home/alex/.ssh/work.pub' },
     ],
     opPlanTargetUse: [
       () => api.opPlanTargetUse('prod-eu'),

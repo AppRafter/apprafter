@@ -387,16 +387,17 @@ pub async fn op_plan_target_add(
     .await
 }
 
-/// Plan the token renewal of `name` (Bounded), with a new SSH key path when `ssh_key` is given;
-/// the new token is checked with the provider when the plan runs, and only then saved.
+/// Plan renewing `name` (Bounded): a new token, a new SSH key path, or both. With no token the
+/// key alone changes and the credentials are kept; a new token is checked with the provider
+/// when the plan runs, and only then saved.
 #[tauri::command]
 pub async fn op_plan_target_renew(
     shell: ShellState<'_>,
     name: String,
-    token: String,
+    token: Option<String>,
     ssh_key: Option<String>,
 ) -> Result<PlanView, UiError> {
-    let token = SecretString::from(Zeroizing::new(token));
+    let token = token.map(|t| SecretString::from(Zeroizing::new(t)));
     on_shell(&shell, move |shell| {
         target_ops::plan_target_renew(shell, &name, token, ssh_key.map(PathBuf::from))
     })

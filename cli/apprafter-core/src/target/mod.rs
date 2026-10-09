@@ -186,13 +186,15 @@ pub struct TargetAdded {
     pub sku: Option<SkuCheck>,
 }
 
-/// What renewing a target's token did.
+/// What a renewal did: the token it saved, the SSH key it changed, or both.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct TargetRenewed {
     pub name: String,
-    pub token: Verification,
+    /// How the new token was checked (`Verified`, or `Skipped { NoPing }`); `None` when the
+    /// stored credentials were kept as they were (not written).
+    pub token: Option<Verification>,
     pub ssh_key_changed: bool,
 }
 

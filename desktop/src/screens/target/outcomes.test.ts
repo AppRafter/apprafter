@@ -60,4 +60,8 @@ test('each outcome says what moved: the CLI default and a running server include
       token: { status: 'verified', elapsedMs: 182 },
     }),
   ).toBe('SSH key changed, token renewed · verified with the provider');
+  // The SSH key row: no token was saved, and the toast says the credentials were kept.
+  expect(renewedMessage({ name: 'prod', sshKeyChanged: true, token: null })).toBe(
+    'SSH key changed · credentials unchanged',
+  );
 });

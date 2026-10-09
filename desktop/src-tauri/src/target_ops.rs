@@ -273,23 +273,30 @@ pub fn plan_target_add(shell: &Shell, args: TargetAddArgs) -> Result<PlanView, D
     Ok(register(shell, plan, name, "add", target::execute_add))
 }
 
-/// Plan the token renewal of `name` (Bounded), with a new SSH key path when `ssh_key` is given
-/// (`target add <name> --renew --ssh-key <path>`: the Target screen's SSH key row). The core
-/// saves a key only with a new token; the token is checked with the provider when the plan runs,
-/// and only then are both saved. An unreadable key is refused before any plan.
+/// Plan renewing `name` (Bounded): a new token, a new SSH key path, or both (`target add
+/// <name> --renew [--token <t>] [--ssh-key <path>]`; the Target screen's Renew token and its SSH
+/// key row). The core changes what differs from what is stored: a key alone (`token: None`)
+/// keeps the credentials and asks the provider nothing; a new token is checked with the provider
+/// when the plan runs, and only then saved. An unreadable key, or a renewal that would change
+/// nothing, is refused before any plan.
 pub fn plan_target_renew(
     shell: &Shell,
     name: &str,
-    token: SecretString,
+    token: Option<SecretString>,
     ssh_key: Option<PathBuf>,
 ) -> Result<PlanView, DesktopError> {
     let named = TargetRef::named(&shell.context, name)?;
+    let verb = if token.is_some() {
+        "renew the token of"
+    } else {
+        "change the SSH key of"
+    };
     let plan = target::plan_renew(&shell.context, &named, RenewArgs { token, ssh_key })?;
     Ok(register(
         shell,
         plan,
         name.into(),
-        "renew the token of",
+        verb,
         target::execute_renew,
     ))
 }
@@ -750,9 +757,9 @@ mod tests {
     #[test]
     fn renew_is_bounded_and_a_malformed_token_is_refused_before_any_plan() {
         let s = store(&["prod"], None);
-        let view = plan_target_renew(&s.shell, "prod", a_token('k'), None).unwrap();
+        let view = plan_target_renew(&s.shell, "prod", Some(a_token('k')), None).unwrap();
         assert_eq!(view.class, PlanClass::Bounded);
-        let ui = plan_target_renew(&s.shell, "prod", SecretString::new("short"), None)
+        let ui = plan_target_renew(&s.shell, "prod", Some(SecretString::new("short")), None)
             .unwrap_err()
             .to_ui();
         assert_eq!(ui.code.as_deref(), Some("apprafter::target::invalid_token"));
@@ -766,7 +773,8 @@ mod tests {
         let s = unlocked_store_on(&["prod"], &api);
         let key = s._dir.path().join("id_ed25519.pub");
         std::fs::write(&key, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5 alex@workstation\n").unwrap();
-        let view = plan_target_renew(&s.shell, "prod", a_token('k'), Some(key.clone())).unwrap();
+        let view =
+            plan_target_renew(&s.shell, "prod", Some(a_token('k')), Some(key.clone())).unwrap();
         assert_eq!(view.class, PlanClass::Bounded);
         assert!(
             view.changes.iter().any(|c| c.kind == "Target"
@@ -796,13 +804,61 @@ mod tests {
     fn renew_with_an_unreadable_ssh_key_is_refused_before_any_plan() {
         let s = store(&["prod"], None);
         let missing = s._dir.path().join("nothing-here.pub");
-        let ui = plan_target_renew(&s.shell, "prod", a_token('k'), Some(missing))
+        let ui = plan_target_renew(&s.shell, "prod", Some(a_token('k')), Some(missing))
             .unwrap_err()
             .to_ui();
         assert_eq!(
             ui.code.as_deref(),
             Some("apprafter::target::ssh_key_unreadable")
         );
+    }
+
+    /// WI-452: the SSH key row's renewal carries no token: the plan lists only the key, the
+    /// run asks the provider nothing and keeps the credentials, and the result says so.
+    #[test]
+    fn a_key_only_renew_asks_the_provider_nothing_and_keeps_the_credentials() {
+        let api = api();
+        let s = unlocked_store_on(&["prod"], &api);
+        let key = s._dir.path().join("id_ed25519.pub");
+        std::fs::write(&key, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5 alex@workstation\n").unwrap();
+        let view = plan_target_renew(&s.shell, "prod", None, Some(key.clone())).unwrap();
+        assert_eq!(
+            (view.class, view.title.as_str()),
+            (PlanClass::Bounded, "Change the SSH key of prod")
+        );
+        assert_eq!(
+            view.changes
+                .iter()
+                .map(|c| (c.kind.as_str(), c.action))
+                .collect::<Vec<_>>(),
+            [("Target", ChangeAction::Update)]
+        );
+        let result = run(&s.shell, &view);
+        assert!(
+            api.asked.try_recv().is_err(),
+            "no provider request for a key-only renewal"
+        );
+        assert_eq!(
+            (result["token"].clone(), result["sshKeyChanged"].clone()),
+            (Value::Null, json!(true))
+        );
+        let saved = cli_core::load_target(&s.shell.context.store(), "prod").unwrap();
+        assert_eq!(saved.config.ssh_key_path.as_deref(), Some(key.as_path()));
+        assert_eq!(saved.credentials.hetzner_token, None);
+    }
+
+    #[test]
+    fn a_renew_with_nothing_to_change_is_refused_before_any_plan() {
+        let s = store(&["prod"], None);
+        let ui = plan_target_renew(&s.shell, "prod", None, None)
+            .unwrap_err()
+            .to_ui();
+        assert_eq!(
+            ui.code.as_deref(),
+            Some("apprafter::target::renew_nothing_to_change")
+        );
+        assert_eq!(ui.fields["name"], json!("prod"));
+        assert!(s.shell.ops.list().is_empty());
     }
 
     #[test]

@@ -385,9 +385,14 @@ fn run_wizard_into_args(ctx: &Context, args: &mut AddArgs) -> CoreResult<()> {
         // Both of the target's files, as before: a missing target is the raw `TargetNotFound`,
         // an unreadable one its file's error.
         let existing = cli_core::load_target(&ctx.store(), args.name.as_deref().unwrap())?;
-        let (token, _verified) =
-            target_wizard::run_renew_wizard(ctx, &existing.config.provider, args.no_ping)?;
-        args.token = Some(token);
+        if renew_asks_for_a_token(
+            args.ssh_key.as_deref(),
+            existing.config.ssh_key_path.as_deref(),
+        ) {
+            let (token, _verified) =
+                target_wizard::run_renew_wizard(ctx, &existing.config.provider, args.no_ping)?;
+            args.token = Some(token);
+        }
     } else {
         let out = target_wizard::run_add_wizard(ctx, args)?;
         merge_wizard_output(args, out);
@@ -446,8 +451,11 @@ pub(crate) fn map_wizard_prompt_error(err: inquire::InquireError) -> CliError {
 }
 
 /// `target add --renew` on the core, in today's order: the target (both of its files, as
-/// `load_renewable` read them), the config-flag refusal, the token, then `plan_renew` (format,
-/// "is it new", SSH key) and `execute_renew` (ping, then the patch under the lock).
+/// `load_renewable` read them), the config-flag refusal, a token unless `--ssh-key` was given,
+/// then `plan_renew` (format, SSH key, "does anything change") and `execute_renew` (ping a new
+/// token, then the patch under the lock). Renew changes what differs from what is stored: with
+/// `--ssh-key` and no new token (none given, or `HCLOUD_TOKEN` holding the stored one) only the
+/// key changes and the credentials are left as they are.
 fn renew(ctx: &Context, args: AddArgs, name: &str) -> miette::Result<()> {
     let tref = TargetRef::named(ctx, name).map_err(renew_missing)?;
     let provider = cli_core::load_target(&ctx.store(), name)
@@ -464,25 +472,55 @@ fn renew(ctx: &Context, args: AddArgs, name: &str) -> miette::Result<()> {
         args.server_type.as_deref(),
     )
     .map_err(miette::Report::new)?;
-    let token = args.token.ok_or_else(|| token_required(&provider))?;
+    if args.token.is_none() && args.ssh_key.is_none() {
+        return Err(token_required(&provider));
+    }
     let plan = core_target::plan_renew(
         ctx,
         &tref,
         core_target::RenewArgs {
-            token: SecretString::new(token.clone()),
+            token: args.token.map(SecretString::new),
             ssh_key: args.ssh_key,
         },
     )
     .map_err(renew_missing)?;
-    completed(
+    let renewed = completed(
         core_target::execute_renew(ctx, plan, &CliReporter, &CancellationToken::new())
             .map_err(renew_missing)?,
     )?;
-    println!(
-        "target `{name}` credentials rotated{}",
-        renew_verified_suffix(args.no_ping)
-    );
+    println!("{}", renewed_line(&renewed));
     Ok(())
+}
+
+/// The line `target add --renew` ends with: what changed, read off the outcome. A saved token
+/// says how it was checked ([`renew_verified_suffix`]); a key-only renewal says the credentials
+/// were kept.
+pub(crate) fn renewed_line(r: &core_target::TargetRenewed) -> String {
+    use apprafter_core::provider::Verification;
+    let name = &r.name;
+    match (&r.token, r.ssh_key_changed) {
+        (Some(v), key) => format!(
+            "target `{name}` credentials rotated{}{}",
+            if key { " and SSH key updated" } else { "" },
+            renew_verified_suffix(matches!(v, Verification::Skipped { .. }))
+        ),
+        (None, true) => format!("target `{name}` SSH key updated (credentials unchanged)"),
+        // The core refuses a renewal that changes nothing; said plainly all the same.
+        (None, false) => format!("target `{name}` unchanged"),
+    }
+}
+
+/// Whether the renew wizard asks for a token: when the SSH key would not change (none given,
+/// or the stored one), as it always did, since then a token is all a renewal can change. A key
+/// other than the stored one is a change of its own, so the token comes from `--token` /
+/// `HCLOUD_TOKEN` or not at all (a key-only renewal keeps the credentials). The key may come
+/// from `APPRAFTER_SSH_PUBLIC_KEY_PATH`, which names the stored key when it is set for
+/// every command: that still asks.
+pub(crate) fn renew_asks_for_a_token(
+    given: Option<&std::path::Path>,
+    stored: Option<&std::path::Path>,
+) -> bool {
+    given.is_none() || given == stored
 }
 
 // ---------------------------------------------------------------
@@ -717,6 +755,10 @@ mod tests {
             (
                 report(CoreError::RenewTokenUnchanged { name: "p".into() }),
                 "apprafter::target::renew_token_unchanged",
+            ),
+            (
+                report(CoreError::RenewNothingToChange { name: "p".into() }),
+                "apprafter::target::renew_nothing_to_change",
             ),
             (
                 report(CoreError::InvalidTargetName {
@@ -954,6 +996,56 @@ mod tests {
 
         assert!(renew_verified_suffix(true).contains("NOT verified"));
         assert!(!renew_verified_suffix(false).contains("NOT"));
+    }
+
+    /// WI-452: the renew line says what changed — the token (and how it was checked), the SSH
+    /// key, or both — and, when no token was saved, that the credentials were kept.
+    #[test]
+    fn the_renew_line_says_what_changed_and_what_was_kept() {
+        use apprafter_core::provider::{SkipReason, Verification};
+        let r = |token, ssh_key_changed| core_target::TargetRenewed {
+            name: "prod".into(),
+            token,
+            ssh_key_changed,
+        };
+        let verified = || Some(Verification::Verified { elapsed_ms: 9 });
+        let skipped = || {
+            Some(Verification::Skipped {
+                reason: SkipReason::NoPing,
+            })
+        };
+        assert_eq!(
+            renewed_line(&r(verified(), false)),
+            "target `prod` credentials rotated (token verified against Hetzner Cloud)"
+        );
+        assert_eq!(
+            renewed_line(&r(skipped(), false)),
+            "target `prod` credentials rotated (token NOT verified — `--no-ping` was passed)"
+        );
+        assert_eq!(
+            renewed_line(&r(verified(), true)),
+            "target `prod` credentials rotated and SSH key updated (token verified against \
+             Hetzner Cloud)"
+        );
+        assert_eq!(
+            renewed_line(&r(None, true)),
+            "target `prod` SSH key updated (credentials unchanged)"
+        );
+    }
+
+    /// WI-452: `--renew --ssh-key <new>` without a token changes only the key, so the renew
+    /// wizard asks for a token only when the key would not change (today's flow).
+    #[test]
+    fn the_renew_wizard_asks_for_a_token_only_when_the_key_would_not_change() {
+        let (old, new) = (
+            std::path::Path::new("/k/old.pub"),
+            std::path::Path::new("/k/new.pub"),
+        );
+        assert!(renew_asks_for_a_token(None, Some(old)));
+        assert!(renew_asks_for_a_token(None, None));
+        assert!(renew_asks_for_a_token(Some(old), Some(old)));
+        assert!(!renew_asks_for_a_token(Some(new), Some(old)));
+        assert!(!renew_asks_for_a_token(Some(new), None));
     }
 
     /// Bug 7: a server type checked against the API says so, and in which region — flagging

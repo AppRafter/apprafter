@@ -1353,6 +1353,131 @@ fn target_renew_with_a_server_type() {
     );
 }
 
+/// A second readable public key in the sandbox, other than the one `add_target` stores.
+fn work_key(sb: &Sandbox) -> String {
+    let p = sb.path("home/work.pub");
+    fs::write(&p, "ssh-ed25519 AAAA golden work key\n").expect("ssh key");
+    p.display().to_string()
+}
+
+/// `prod`'s credentials file, hand-written: a comment the CLI never writes, so a renewal that
+/// rewrote the file would show.
+fn hand_written_credentials(sb: &Sandbox) -> String {
+    let creds = format!("# pasted by hand\nhetzner_token: {TOKEN_A}\n");
+    sb.seed_store_file("targets/prod/credentials.yaml", &creds);
+    creds
+}
+
+fn credentials_of_prod(sb: &Sandbox) -> String {
+    fs::read_to_string(sb.path("apprafter-config/targets/prod/credentials.yaml")).unwrap()
+}
+
+/// WI-452: `--renew --ssh-key` with no token changes only the key: no ping (the provider is a
+/// closed port and the ping is not skipped), the credentials file untouched, byte for byte.
+#[test]
+fn target_renew_with_only_an_ssh_key() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    let creds = hand_written_credentials(&sb);
+    let key = work_key(&sb);
+    sb.golden_with_files(
+        "target/renew_ssh_key_only",
+        &[&[
+            "target",
+            "add",
+            "prod",
+            "--renew",
+            "--ssh-key",
+            &key,
+            "--no-interactive",
+        ]],
+        &["targets/prod/config.yaml"],
+    );
+    assert_eq!(credentials_of_prod(&sb), creds);
+}
+
+/// WI-452: an `HCLOUD_TOKEN` holding the stored token is no new token: beside `--ssh-key` it is
+/// the key-only renewal, not the unchanged-token refusal.
+#[test]
+fn target_renew_with_an_ssh_key_and_the_stored_token_in_the_env() {
+    let sb = Sandbox::new().with_env("HCLOUD_TOKEN", TOKEN_A);
+    sb.add_target("prod");
+    let creds = hand_written_credentials(&sb);
+    let key = work_key(&sb);
+    sb.golden_with_files(
+        "target/renew_ssh_key_env_token_unchanged",
+        &[&[
+            "target",
+            "add",
+            "prod",
+            "--renew",
+            "--ssh-key",
+            &key,
+            "--no-interactive",
+        ]],
+        &["targets/prod/config.yaml"],
+    );
+    assert_eq!(credentials_of_prod(&sb), creds);
+}
+
+/// WI-452: no token and the stored key: nothing would change, and that is the refusal.
+#[test]
+fn target_renew_that_would_change_nothing() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    let key = sb.ssh_key();
+    sb.golden(
+        "target/renew_nothing_to_change",
+        &[
+            "target",
+            "add",
+            "prod",
+            "--renew",
+            "--ssh-key",
+            &key,
+            "--no-interactive",
+        ],
+    );
+}
+
+/// WI-452: an `HCLOUD_TOKEN` other than the stored one beside `--ssh-key`: the token is
+/// verified (the mock answers only it) and saved, and the key changes with it.
+#[test]
+fn target_renew_rotates_the_token_and_changes_the_ssh_key() {
+    let mut server = mockito::Server::new();
+    let _loc = json_mock(&mut server, "/v1/locations", 200, LOCATIONS_OK, TOKEN_B);
+    let sb = Sandbox::new()
+        .with_hcloud(server.url())
+        .with_env("HCLOUD_TOKEN", TOKEN_B);
+    sb.add_target("prod");
+    let key = work_key(&sb);
+    sb.golden_with_files(
+        "target/renew_token_and_ssh_key",
+        &[&[
+            "target",
+            "add",
+            "prod",
+            "--renew",
+            "--ssh-key",
+            &key,
+            "--no-interactive",
+        ]],
+        &["targets/prod/config.yaml"],
+    );
+    assert!(credentials_of_prod(&sb).contains(TOKEN_B));
+}
+
+/// `--renew` with neither a token nor `--ssh-key` (and no terminal) is today's refusal.
+#[test]
+fn target_renew_without_a_token_or_a_key() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.golden(
+        "target/renew_no_token",
+        &["target", "add", "prod", "--renew", "--no-interactive"],
+    );
+}
+
 #[test]
 fn target_rename_to_an_existing_name() {
     let sb = Sandbox::new();

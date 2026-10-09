@@ -674,16 +674,7 @@ pub fn load_target(paths: &TargetStorePaths, name: &str) -> Result<Target> {
 /// no race window where the credentials are briefly readable by
 /// other local users.
 pub fn save_target(paths: &TargetStorePaths, target: &Target) -> Result<()> {
-    fs::create_dir_all(paths.target_dir(&target.name))?;
-    ensure_auth_placeholder(paths)?;
-
-    let cfg_yaml = serde_yaml::to_string(&target.config)?;
-    atomic_write(
-        &paths.target_config_file(&target.name),
-        cfg_yaml.as_bytes(),
-        false,
-    )?;
-
+    save_target_config(paths, &target.name, &target.config)?;
     let creds_yaml = serde_yaml::to_string(&target.credentials)?;
     atomic_write(
         &paths.target_credentials_file(&target.name),
@@ -691,6 +682,20 @@ pub fn save_target(paths: &TargetStorePaths, target: &Target) -> Result<()> {
         true,
     )?;
     Ok(())
+}
+
+/// Persist a target's `config.yaml` (mode 0644) and nothing else: its `credentials.yaml` is
+/// neither read nor written, so a change that keeps the token leaves that file as it was,
+/// byte for byte (`target add --renew --ssh-key` without a new token).
+pub fn save_target_config(
+    paths: &TargetStorePaths,
+    name: &str,
+    config: &TargetConfig,
+) -> Result<()> {
+    fs::create_dir_all(paths.target_dir(name))?;
+    ensure_auth_placeholder(paths)?;
+    let cfg_yaml = serde_yaml::to_string(config)?;
+    atomic_write(&paths.target_config_file(name), cfg_yaml.as_bytes(), false)
 }
 
 /// Names of every target directory under `<root>/targets/`,
@@ -890,6 +895,31 @@ mod tests {
         let (_dir, paths) = make_paths();
         let loaded = load_global_config(&paths).expect("missing file is not an error");
         assert!(loaded.is_none());
+    }
+
+    /// A config-only save rewrites `config.yaml` and leaves `credentials.yaml` exactly as it
+    /// was, a hand-written comment included, and creates none where there was none.
+    #[test]
+    fn a_config_only_save_never_touches_the_credentials_file() {
+        let (_dir, paths) = make_paths();
+        let config = |key: &str| TargetConfig {
+            provider: "hetzner-cloud".into(),
+            ssh_key_path: Some(key.into()),
+            ..Default::default()
+        };
+        save_target_config(&paths, "work", &config("/k/old.pub")).unwrap();
+        assert!(!paths.target_credentials_file("work").exists());
+        let creds = "# rotated by hand\nhetzner_token: 'abc'\n";
+        fs::write(paths.target_credentials_file("work"), creds).unwrap();
+        save_target_config(&paths, "work", &config("/k/new.pub")).unwrap();
+        assert_eq!(
+            fs::read_to_string(paths.target_credentials_file("work")).unwrap(),
+            creds
+        );
+        assert_eq!(
+            load_target_config(&paths, "work").unwrap().ssh_key_path,
+            Some("/k/new.pub".into())
+        );
     }
 
     #[test]

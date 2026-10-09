@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! `target add` (a new target, or a `--force` overwrite that keeps every field it is not given)
-//! and `target add --renew` (rotate a target's token), as plan and execute.
+//! and `target add --renew` (a target's token, its SSH key, or both), as plan and execute.
 
 use std::path::{Path, PathBuf};
 
@@ -32,11 +32,11 @@ pub struct AddArgs {
     pub force: bool,
 }
 
-/// What `target add --renew` asks for (overview §3.7.3): a new token, and optionally a new SSH
-/// key path.
+/// What `target add --renew` asks for (overview §3.7.3): a new token, a new SSH key path, or
+/// both. `token: None` keeps the stored credentials (no ping, the file is not written).
 #[derive(Debug)]
 pub struct RenewArgs {
-    pub token: SecretString,
+    pub token: Option<SecretString>,
     pub ssh_key: Option<PathBuf>,
 }
 
@@ -46,12 +46,13 @@ pub struct AddPayload {
     args: AddArgs,
 }
 
-/// What [`execute_renew`] needs from its plan.
+/// What [`execute_renew`] needs from its plan: the new token and the new key path, each only
+/// when it differed from the stored one when planned.
 #[derive(Debug)]
 pub struct RenewPayload {
     name: String,
     provider: String,
-    token: SecretString,
+    token: Option<SecretString>,
     ssh_key: Option<PathBuf>,
 }
 
@@ -401,10 +402,13 @@ pub fn execute_add(
     })
 }
 
-/// Bounded. Local checks, in today's order: the target exists, the token's format, the token
-/// differs from the stored one ([`CoreError::RenewTokenUnchanged`]), the SSH key is readable.
-/// Changes: `Replace Credentials` ("API token"), and `Update Target` ("ssh key: a → b") when a
-/// different key path is given.
+/// Bounded. A renewal changes whatever differs from what is stored, and nothing else: a token
+/// equal to the stored one counts as no token (so a key change beside it is not refused), and a
+/// key path equal to the stored one is no change. Local checks, in order: the target exists (both
+/// of its files), the token's format, the SSH key is readable, then something would change —
+/// else [`CoreError::RenewTokenUnchanged`] when a token was given (the stored one), or
+/// [`CoreError::RenewNothingToChange`] when none was. Changes: `Replace Credentials` ("API
+/// token") for a new token, `Update Target` ("ssh key: a → b") for a new key path.
 pub fn plan_renew(
     ctx: &Context,
     target: &TargetRef,
@@ -412,25 +416,28 @@ pub fn plan_renew(
 ) -> CoreResult<Plan<RenewPayload>> {
     let name = target.name();
     let t = cli_core::load_target(&ctx.store(), name)?;
-    crate::provider::TokenProblem::check(args.token.expose())
-        .map_err(|problem| CoreError::InvalidToken { problem })?;
-    if t.credentials.hetzner_token.as_deref() == Some(args.token.expose()) {
-        return Err(CoreError::RenewTokenUnchanged { name: name.into() });
+    if let Some(token) = &args.token {
+        crate::provider::TokenProblem::check(token.expose())
+            .map_err(|problem| CoreError::InvalidToken { problem })?;
     }
     if let Some(p) = &args.ssh_key {
         crate::ssh::check_readable(p)?;
     }
-    let mut changes = vec![change(
-        "Credentials",
-        name,
-        ChangeAction::Replace,
-        Some("API token".into()),
-    )];
-    if let Some(p) = args
-        .ssh_key
-        .as_deref()
-        .filter(|p| t.config.ssh_key_path.as_deref() != Some(*p))
-    {
+    let token_given = args.token.is_some();
+    let (token, ssh_key) = what_differs(&t, args.token, args.ssh_key);
+    if token.is_none() && ssh_key.is_none() {
+        return Err(nothing_to_change(name, token_given));
+    }
+    let mut changes = Vec::new();
+    if token.is_some() {
+        changes.push(change(
+            "Credentials",
+            name,
+            ChangeAction::Replace,
+            Some("API token".into()),
+        ));
+    }
+    if let Some(p) = &ssh_key {
         let show = |p: &Path| cli_core::paths::abbreviate_home(p, ctx.home_dir());
         changes.push(change(
             "Target",
@@ -447,22 +454,52 @@ pub fn plan_renew(
             )),
         ));
     }
+    let title = match (&token, &ssh_key) {
+        (Some(_), None) => format!("Rotate the API token of {name}"),
+        (None, _) => format!("Change the SSH key of {name}"),
+        (Some(_), Some(_)) => format!("Rotate the API token and change the SSH key of {name}"),
+    };
     Ok(Plan {
         class: PlanClass::Bounded,
-        title: format!("Rotate the API token of {name}"),
+        title,
         changes,
         payload: RenewPayload {
             name: name.into(),
             provider: t.config.provider,
-            token: args.token,
-            ssh_key: args.ssh_key,
+            token,
+            ssh_key,
         },
     })
 }
 
-/// Ping the new token (unless `no_ping`), then under the lock re-read, re-check (the target
-/// exists, the token is still a new one) and patch only the credentials (+ the key path): an
-/// edit made during the ping is kept.
+/// The token and the key path of a renewal that differ from what `t` stores; `None` for each
+/// that does not (or was not given).
+fn what_differs(
+    t: &Target,
+    token: Option<SecretString>,
+    ssh_key: Option<PathBuf>,
+) -> (Option<SecretString>, Option<PathBuf>) {
+    (
+        token.filter(|tok| t.credentials.hetzner_token.as_deref() != Some(tok.expose())),
+        ssh_key.filter(|p| t.config.ssh_key_path.as_ref() != Some(p)),
+    )
+}
+
+/// The refusal of a renewal that would change nothing, by what it was given.
+fn nothing_to_change(name: &str, token_given: bool) -> CoreError {
+    let name = name.to_string();
+    if token_given {
+        CoreError::RenewTokenUnchanged { name }
+    } else {
+        CoreError::RenewNothingToChange { name }
+    }
+}
+
+/// Ping the new token (only when there is one, and not with `no_ping`), then under the lock
+/// re-read the target and change only what still differs ([`plan_renew`]'s rules, refused the
+/// same way when nothing does): an edit made during the ping is kept. With no new token left
+/// only `config.yaml` is written, so the credentials file stays as it was, byte for byte, and
+/// the outcome's `token` is `None`.
 pub fn execute_renew(
     ctx: &Context,
     plan: Plan<RenewPayload>,
@@ -478,14 +515,14 @@ pub fn execute_renew(
         token,
         ssh_key,
     } = plan.payload;
-    let verification = if ctx.no_ping() {
-        Verification::Skipped {
+    let verification = match &token {
+        None => None,
+        Some(_) if ctx.no_ping() => Some(Verification::Skipped {
             reason: SkipReason::NoPing,
-        }
-    } else {
-        Verification::Verified {
-            elapsed_ms: crate::provider::ping(ctx, &provider, &token, cancel)?.as_millis() as u64,
-        }
+        }),
+        Some(token) => Some(Verification::Verified {
+            elapsed_ms: crate::provider::ping(ctx, &provider, token, cancel)?.as_millis() as u64,
+        }),
     };
     if cancel.is_cancelled() {
         return Ok(cancelled());
@@ -493,23 +530,32 @@ pub fn execute_renew(
     let store = ctx.store();
     let _lock = lock_store_if_present(ctx, reporter)?;
     let mut t = cli_core::load_target(&store, &name)?;
-    if t.credentials.hetzner_token.as_deref() == Some(token.expose()) {
-        return Err(CoreError::RenewTokenUnchanged { name });
+    let token_given = token.is_some();
+    let (token, ssh_key) = what_differs(&t, token, ssh_key);
+    if token.is_none() && ssh_key.is_none() {
+        return Err(nothing_to_change(&name, token_given));
     }
-    let ssh_key_changed = ssh_key
-        .as_ref()
-        .is_some_and(|p| t.config.ssh_key_path.as_ref() != Some(p));
+    let ssh_key_changed = ssh_key.is_some();
     if let Some(p) = ssh_key {
         t.config.ssh_key_path = Some(p);
     }
-    t.credentials = TargetCredentials {
-        hetzner_token: Some(token.expose().to_string()),
+    let token = match token {
+        Some(token) => {
+            t.credentials = TargetCredentials {
+                hetzner_token: Some(token.expose().to_string()),
+            };
+            cli_core::save_target(&store, &t)?;
+            verification
+        }
+        None => {
+            cli_core::save_target_config(&store, &name, &t.config)?;
+            None
+        }
     };
-    cli_core::save_target(&store, &t)?;
     Ok(Outcome::Completed {
         result: TargetRenewed {
             name,
-            token: verification,
+            token,
             ssh_key_changed,
         },
     })
@@ -1132,7 +1178,7 @@ mod tests {
                 &ctx,
                 &w,
                 RenewArgs {
-                    token: SecretString::new(TOKEN_B),
+                    token: Some(SecretString::new(TOKEN_B)),
                     ssh_key: None,
                 },
             )
@@ -1173,7 +1219,7 @@ mod tests {
                 &ctx,
                 &w,
                 RenewArgs {
-                    token: SecretString::new(token),
+                    token: Some(SecretString::new(token)),
                     ssh_key: Some(key.to_path_buf()),
                 },
             )
@@ -1203,7 +1249,19 @@ mod tests {
                 format!("ssh key: {} → {}", shown("old.pub"), shown("new.pub"))
             )]
         );
-        assert!(execute(plan).ssh_key_changed);
+        assert_eq!(
+            plan.title,
+            "Rotate the API token and change the SSH key of work"
+        );
+        let both = execute(plan);
+        assert!(both.ssh_key_changed);
+        assert_eq!(
+            both.token,
+            Some(Verification::Skipped {
+                reason: SkipReason::NoPing
+            }),
+            "the credentials were written"
+        );
         let t = cli_core::load_target(&ctx.store(), "work").unwrap();
         assert_eq!(
             (
@@ -1215,6 +1273,7 @@ mod tests {
 
         let plan = renew(TOKEN_A, &new);
         assert_eq!(target_changes(&plan), [], "the stored key is no change");
+        assert_eq!(plan.title, "Rotate the API token of work");
         assert!(!execute(plan).ssh_key_changed);
         assert_eq!(
             cli_core::load_target(&ctx.store(), "work")
@@ -1235,7 +1294,7 @@ mod tests {
                 &ctx,
                 &w,
                 RenewArgs {
-                    token: SecretString::new(TOKEN_A),
+                    token: Some(SecretString::new(TOKEN_A)),
                     ssh_key: None
                 }
             ),
@@ -1245,7 +1304,7 @@ mod tests {
             &ctx,
             &w,
             RenewArgs {
-                token: SecretString::new(TOKEN_B),
+                token: Some(SecretString::new(TOKEN_B)),
                 ssh_key: None,
             },
         )
@@ -1265,7 +1324,7 @@ mod tests {
             &ctx,
             &w,
             RenewArgs {
-                token: SecretString::new(TOKEN_A),
+                token: Some(SecretString::new(TOKEN_A)),
                 ssh_key: None,
             },
         )
@@ -1276,5 +1335,212 @@ mod tests {
             Err(CoreError::TargetNotFound { .. })
         ));
         assert!(!ctx.store().target_dir("work").exists());
+    }
+    /// A target `work` whose stored key is `~/.ssh/old.pub`, and a readable `~/.ssh/new.pub`;
+    /// its credentials file is hand-written (a comment serde never writes), so a save that
+    /// rewrote it would show. The Hetzner API is `api`.
+    fn keyed_store(api: &str) -> (tempfile::TempDir, Context, PathBuf, PathBuf, String) {
+        let (dir, ctx) = store_at(&["work"], Some("work"), api);
+        let ssh = dir.path().join("home").join(".ssh");
+        std::fs::create_dir_all(&ssh).unwrap();
+        let (old, new) = (ssh.join("old.pub"), ssh.join("new.pub"));
+        for k in [&old, &new] {
+            std::fs::write(k, "ssh-ed25519 AAAA me@x\n").unwrap();
+        }
+        edit(&ctx, "work", |t| t.config.ssh_key_path = Some(old.clone()));
+        let creds = format!("# pasted by hand\nhetzner_token: {TOKEN_A}\n");
+        std::fs::write(ctx.store().target_credentials_file("work"), &creds).unwrap();
+        (dir, ctx, old, new, creds)
+    }
+
+    fn renew_args(token: Option<&str>, key: Option<&Path>) -> RenewArgs {
+        RenewArgs {
+            token: token.map(SecretString::new),
+            ssh_key: key.map(Path::to_path_buf),
+        }
+    }
+
+    fn renewed(ctx: &Context, plan: Plan<RenewPayload>) -> TargetRenewed {
+        match execute_renew(ctx, plan, &NullReporter, &CancellationToken::new()).unwrap() {
+            Outcome::Completed { result } => result,
+            o => panic!("{o:?}"),
+        }
+    }
+
+    /// WI-452: a key-only renewal (no token, or the stored one) plans only the key, asks the
+    /// provider nothing, and leaves the credentials file as it was, byte for byte.
+    #[test]
+    fn a_key_only_renew_changes_the_key_and_never_touches_the_credentials() {
+        for token in [None, Some(TOKEN_A)] {
+            let mut s = mockito::Server::new();
+            let ping = s
+                .mock("GET", "/v1/locations")
+                .match_query(mockito::Matcher::Any)
+                .expect(0)
+                .create();
+            let (_d, ctx, old, new, creds) = keyed_store(&s.url());
+            let w = TargetRef::named(&ctx, "work").unwrap();
+            let plan = plan_renew(&ctx, &w, renew_args(token, Some(&new))).unwrap();
+            assert_eq!(plan.class, PlanClass::Bounded, "{token:?}");
+            assert_eq!(plan.title, "Change the SSH key of work", "{token:?}");
+            let shown = |p: &Path| cli_core::paths::abbreviate_home(p, ctx.home_dir());
+            assert_eq!(
+                plan.changes
+                    .iter()
+                    .map(|c| (
+                        c.kind.as_str(),
+                        c.action,
+                        c.detail.clone().unwrap_or_default()
+                    ))
+                    .collect::<Vec<_>>(),
+                [(
+                    "Target",
+                    ChangeAction::Update,
+                    format!("ssh key: {} → {}", shown(&old), shown(&new))
+                )],
+                "{token:?}: no Credentials change"
+            );
+            let r = renewed(&ctx, plan);
+            assert_eq!((r.token, r.ssh_key_changed), (None, true), "{token:?}");
+            assert_eq!(
+                std::fs::read_to_string(ctx.store().target_credentials_file("work")).unwrap(),
+                creds,
+                "{token:?}: the credentials file is untouched"
+            );
+            assert_eq!(
+                cli_core::load_target_config(&ctx.store(), "work")
+                    .unwrap()
+                    .ssh_key_path,
+                Some(new),
+                "{token:?}"
+            );
+            ping.assert();
+        }
+    }
+
+    /// A new token with a new key: both planned, the token pinged, both saved.
+    #[test]
+    fn a_rotation_with_a_new_key_pings_and_saves_both() {
+        let mut s = mockito::Server::new();
+        let ping = route(&mut s, "/v1/locations", 200, LOCATIONS, TOKEN_B)
+            .expect(1)
+            .create();
+        let (_d, ctx, _old, new, _creds) = keyed_store(&s.url());
+        let w = TargetRef::named(&ctx, "work").unwrap();
+        let plan = plan_renew(&ctx, &w, renew_args(Some(TOKEN_B), Some(&new))).unwrap();
+        assert_eq!(
+            plan.changes
+                .iter()
+                .map(|c| (c.kind.as_str(), c.action))
+                .collect::<Vec<_>>(),
+            [
+                ("Credentials", ChangeAction::Replace),
+                ("Target", ChangeAction::Update)
+            ]
+        );
+        let r = renewed(&ctx, plan);
+        assert!(
+            matches!(r.token, Some(Verification::Verified { .. })),
+            "{:?}",
+            r.token
+        );
+        assert!(r.ssh_key_changed);
+        let t = cli_core::load_target(&ctx.store(), "work").unwrap();
+        assert_eq!(
+            (
+                t.credentials.hetzner_token.as_deref(),
+                t.config.ssh_key_path
+            ),
+            (Some(TOKEN_B), Some(new))
+        );
+        ping.assert();
+    }
+
+    /// Nothing would change: with the stored token it is today's refusal, without a token its
+    /// own; no key and the stored key read alike.
+    #[test]
+    fn a_renew_that_would_change_nothing_is_refused_by_what_was_given() {
+        let (_d, ctx, old, _new, creds) = keyed_store("http://127.0.0.1:1");
+        let w = TargetRef::named(&ctx, "work").unwrap();
+        for key in [None, Some(old.as_path())] {
+            assert!(
+                matches!(
+                    plan_renew(&ctx, &w, renew_args(None, key)),
+                    Err(CoreError::RenewNothingToChange { ref name }) if name == "work"
+                ),
+                "{key:?}"
+            );
+            assert!(
+                matches!(
+                    plan_renew(&ctx, &w, renew_args(Some(TOKEN_A), key)),
+                    Err(CoreError::RenewTokenUnchanged { .. })
+                ),
+                "{key:?}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(ctx.store().target_credentials_file("work")).unwrap(),
+            creds
+        );
+    }
+
+    /// Under the lock the change is worked out again: a key set to the planned one meanwhile
+    /// leaves nothing to do (refused, nothing written); a token stored meanwhile leaves only the
+    /// key, so the credentials are not written and the outcome says so.
+    #[test]
+    fn under_the_lock_a_renew_changes_only_what_still_differs() {
+        let (_d, ctx, _old, new, _creds) = keyed_store("http://127.0.0.1:1");
+        let ctx = ctx.with_no_ping(true);
+        let w = TargetRef::named(&ctx, "work").unwrap();
+        let plan = plan_renew(&ctx, &w, renew_args(None, Some(&new))).unwrap();
+        edit(&ctx, "work", |t| t.config.ssh_key_path = Some(new.clone()));
+        assert!(matches!(
+            execute_renew(&ctx, plan, &NullReporter, &CancellationToken::new()),
+            Err(CoreError::RenewNothingToChange { .. })
+        ));
+
+        let (_d, ctx, _old, new, _creds) = keyed_store("http://127.0.0.1:1");
+        let ctx = ctx.with_no_ping(true);
+        let w = TargetRef::named(&ctx, "work").unwrap();
+        let plan = plan_renew(&ctx, &w, renew_args(Some(TOKEN_B), Some(&new))).unwrap();
+        edit(&ctx, "work", |t| {
+            t.credentials.hetzner_token = Some(TOKEN_B.into())
+        });
+        let r = renewed(&ctx, plan);
+        assert_eq!((r.token, r.ssh_key_changed), (None, true));
+
+        let (_d, ctx, _old, _new, _creds) = keyed_store("http://127.0.0.1:1");
+        let ctx = ctx.with_no_ping(true);
+        let w = TargetRef::named(&ctx, "work").unwrap();
+        let plan = plan_renew(&ctx, &w, renew_args(Some(TOKEN_B), None)).unwrap();
+        edit(&ctx, "work", |t| {
+            t.credentials.hetzner_token = Some(TOKEN_B.into())
+        });
+        assert!(matches!(
+            execute_renew(&ctx, plan, &NullReporter, &CancellationToken::new()),
+            Err(CoreError::RenewTokenUnchanged { .. })
+        ));
+    }
+
+    /// A key that cannot be read is refused whatever else is given, before the nothing-to-change
+    /// check: a new path, and the stored path once its file is gone (passing it is no change, but
+    /// it is not a key either).
+    #[test]
+    fn an_unreadable_key_is_refused_before_the_nothing_to_change_check() {
+        let (dir, ctx, old, _new, _creds) = keyed_store("http://127.0.0.1:1");
+        let w = TargetRef::named(&ctx, "work").unwrap();
+        let missing = dir.path().join("missing.pub");
+        std::fs::remove_file(&old).unwrap();
+        for key in [&missing, &old] {
+            for token in [None, Some(TOKEN_A), Some(TOKEN_B)] {
+                assert!(
+                    matches!(
+                        plan_renew(&ctx, &w, renew_args(token, Some(key))),
+                        Err(CoreError::SshKeyUnreadable { .. })
+                    ),
+                    "{key:?} {token:?}"
+                );
+            }
+        }
     }
 }

@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 // The Target screen on the mock IPC: the report, and each action by its plan class — make
-// default at once, rename / renew / the SSH key a plain confirm listing the changes, remove the
-// full plan with the typed name and the gesture.
+// default at once, rename / renew / the SSH key a plain confirm listing the changes (the SSH key
+// alone, no token), remove the full plan with the typed name and the gesture.
 import { afterEach, beforeEach, expect, mock, test } from 'bun:test';
 import { clearMocks } from '@tauri-apps/api/mocks';
 import { screen, waitFor, within } from '@testing-library/react';
 import * as api from '../../ipc/api';
 import { installMockIpc } from '../../ipc/mock';
 import { resetOperations } from '../../ipc/operations';
+import { startPlan } from '../../ipc/plans';
 import { renderScreen } from '../../test/screens';
 import { TargetScreen } from './TargetScreen';
 
@@ -138,7 +139,24 @@ test('make default from its row runs at once: no dialog, the row says Yes', asyn
   );
 });
 
-test('SSH key: Change offers the keys in ~/.ssh, the one in use disabled, and saves the choice with a new token', async () => {
+/** The arguments of every `cmd` the page sends from here on, read off the mock IPC. */
+function sentArgs(cmd: string): Record<string, unknown>[] {
+  const internals = (
+    window as unknown as {
+      __TAURI_INTERNALS__: { invoke: (cmd: string, args?: unknown, options?: unknown) => unknown };
+    }
+  ).__TAURI_INTERNALS__;
+  const invoke = internals.invoke;
+  const sent: Record<string, unknown>[] = [];
+  internals.invoke = (c, args, options) => {
+    if (c === cmd) sent.push({ ...(args as Record<string, unknown>) });
+    return invoke(c, args, options);
+  };
+  return sent;
+}
+
+test('SSH key: Change offers the keys in ~/.ssh, the one in use disabled, and saves only the key', async () => {
+  const renews = sentArgs('op_plan_target_renew');
   const user = screenOf('staging');
   const row = await screen.findByRole('group', { name: 'SSH key' });
   await user.click(within(row).getByRole('button', { name: 'Change' }));
@@ -147,20 +165,35 @@ test('SSH key: Change offers the keys in ~/.ssh, the one in use disabled, and sa
   expect((inUse as HTMLInputElement).disabled).toBe(true);
   const other = within(form).getByRole('radio', { name: '~/.ssh/work.pub' }) as HTMLInputElement;
   expect(other.checked).toBe(true);
-  const go = within(form).getByRole('button', { name: 'Continue' }) as HTMLButtonElement;
-  expect(go.disabled).toBe(true); // the token first
-  await user.type(within(form).getByLabelText('Hetzner Cloud token'), 'k'.repeat(64));
-  await user.click(go);
+  expect(within(form).queryByLabelText('Hetzner Cloud token')).toBeNull(); // no token asked
+  await user.click(within(form).getByRole('button', { name: 'Continue' }));
   const confirm = await screen.findByRole('dialog', { name: 'Change the SSH key of staging?' });
+  expect(renews).toEqual([{ name: 'staging', token: null, sshKey: '/home/alex/.ssh/work.pub' }]);
   expect(confirm.textContent).toContain('ssh key: ~/.ssh/id_ed25519.pub → ~/.ssh/work.pub');
-  expect(confirm.textContent).toContain('API token');
+  expect(confirm.textContent).not.toContain('Credentials'); // the key alone
   await user.click(within(confirm).getByRole('button', { name: 'Change key' }));
-  expect(
-    await screen.findByText('SSH key changed, token renewed · verified with the provider'),
-  ).toBeDefined();
+  expect(await screen.findByText('SSH key changed · credentials unchanged')).toBeDefined();
   await waitFor(() =>
     expect(screen.getByRole('group', { name: 'SSH key' }).textContent).toContain('~/.ssh/work.pub'),
   );
+});
+
+test('SSH key: a key that became the one in use since the form opened is refused in the form', async () => {
+  const user = screenOf('staging');
+  await user.click(
+    within(await screen.findByRole('group', { name: 'SSH key' })).getByRole('button', {
+      name: 'Change',
+    }),
+  );
+  const form = await screen.findByRole('dialog', { name: 'Change SSH key' });
+  // Meanwhile (another window, the CLI): staging's key becomes work.pub, the form's choice.
+  const meanwhile = await api.opPlanTargetRenew('staging', null, '/home/alex/.ssh/work.pub');
+  await (await startPlan(meanwhile.opId)).ended;
+  await user.click(within(form).getByRole('button', { name: 'Continue' }));
+  expect((await within(form).findByRole('alert')).textContent).toContain(
+    'renewing `staging` would change nothing: no new token and no new SSH key',
+  );
+  expect(screen.queryByRole('dialog', { name: /Change the SSH key of/ })).toBeNull();
 });
 
 test('SSH key: Other path… is looked up first; a path with no file says so in the form', async () => {
@@ -176,7 +209,6 @@ test('SSH key: Other path… is looked up first; a path with no file says so in 
   ).toBe(true);
   await user.click(within(form).getByRole('radio', { name: 'Other path…' }));
   await user.type(within(form).getByLabelText('Path to a public key'), '~/.ssh/nothing.pub');
-  await user.type(within(form).getByLabelText('Hetzner Cloud token'), 'k'.repeat(64));
   await user.click(within(form).getByRole('button', { name: 'Continue' }));
   expect((await within(form).findByRole('alert')).textContent).toContain(
     'No file at ~/.ssh/nothing.pub.',
@@ -198,7 +230,6 @@ test('SSH key: the key in use typed as another path is refused in the form', asy
   const form = await screen.findByRole('dialog', { name: 'Change SSH key' });
   await user.click(within(form).getByRole('radio', { name: 'Other path…' }));
   await user.type(within(form).getByLabelText('Path to a public key'), '~/.ssh/id_ed25519.pub');
-  await user.type(within(form).getByLabelText('Hetzner Cloud token'), 'k'.repeat(64));
   await user.click(within(form).getByRole('button', { name: 'Continue' }));
   expect((await within(form).findByRole('alert')).textContent).toContain(
     'staging uses that key now: choose another.',

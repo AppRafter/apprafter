@@ -3672,7 +3672,7 @@
           "env": null,
           "required": false,
           "possible_values": [],
-          "help": "Update only the credentials of an existing target. Errors when the target does not exist. Mutually exclusive with `--force` (use `--force` to change the target's other fields as well as the token)"
+          "help": "Update only the token and the SSH key of an existing target: a new `--token` (or `HCLOUD_TOKEN`) replaces the credentials, `--ssh-key` changes the key, and whatever equals the stored value is left as it is — so `--ssh-key` without a new token keeps the credentials. Errors when the target does not exist or when nothing would change. Mutually exclusive with `--force` (use `--force` to change the target's other fields as well as the token)"
         },
         {
           "id": "server_type",
@@ -4032,7 +4032,7 @@
         "machine"
       ],
       "aliases": [],
-      "about": "Set or change the server type (and region) on a target via the machine picker. This is the ONLY way to change the server type on an existing target — `target add <existing>` errors, and `--renew` is credentials-only",
+      "about": "Set or change the server type (and region) on a target via the machine picker. This is the ONLY way to change the server type on an existing target — `target add <existing>` errors, and `--renew` changes only the token and the SSH key",
       "long_about": null,
       "usage": "Usage: apprafter target machine [OPTIONS]",
       "hidden": false,

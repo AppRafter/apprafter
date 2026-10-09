@@ -326,6 +326,36 @@ test('renew with an SSH key: an unreadable key is refused; a new one is planned 
   expect(same.changes.map((c) => c.kind)).toEqual(['Credentials']);
 });
 
+test('renew with a key and no token: only the key is planned and saved, the token kept', async () => {
+  const before = (await api.targetShow('lab')).token;
+  const view = await api.opPlanTargetRenew('lab', null, '/home/alex/.ssh/work.pub');
+  expect(view.title).toBe('Change the SSH key of lab');
+  expect(view.changes).toEqual([
+    {
+      kind: 'Target',
+      object: 'lab',
+      action: 'update',
+      detail: 'ssh key: ~/.ssh/lab.pub → ~/.ssh/work.pub',
+    },
+  ]);
+  expect(result(await runPlan(view))).toEqual({ name: 'lab', token: null, sshKeyChanged: true });
+  const after = await api.targetShow('lab');
+  expect(after.sshKey?.display).toBe('~/.ssh/work.pub');
+  expect(after.token).toEqual(before);
+});
+
+test('renew with nothing to change is refused, at the plan and when it runs', async () => {
+  for (const sshKey of [null, '/home/alex/.ssh/id_ed25519.pub']) {
+    const e = await refusalOf(api.opPlanTargetRenew('staging', null, sshKey));
+    expect(e.code).toBe(CORE_ERROR_CODES.TARGET_RENEW_NOTHING_TO_CHANGE);
+    expect(e.fields).toEqual({ name: 'staging' });
+  }
+  // Planned while the key differed, run once it no longer does.
+  const late = await api.opPlanTargetRenew('lab', null, '/home/alex/.ssh/work.pub');
+  await runPlan(await api.opPlanTargetRenew('lab', null, '/home/alex/.ssh/work.pub'));
+  expect(failure(await runPlan(late))?.code).toBe(CORE_ERROR_CODES.TARGET_RENEW_NOTHING_TO_CHANGE);
+});
+
 test('doctor counts three stages for a target the store holds and two otherwise', async () => {
   const doctor = async (target: string) => {
     const opId = await api.opStartDoctor(target);

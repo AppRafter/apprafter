@@ -20,7 +20,7 @@ export interface TargetDetailActions {
   rename: () => void;
   renew: () => void;
   makeDefault: () => void;
-  /** The SSH key row's Change: another key, saved with a new token (a renewal). */
+  /** The SSH key row's Change: another key, alone (a key-only renewal; the token is kept). */
   changeSshKey: () => void;
 }
 

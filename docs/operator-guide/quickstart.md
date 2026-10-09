@@ -141,9 +141,9 @@ apprafter target add prod \
     The wizard above already made this choice. `apprafter target machine`
     is how you set it on a target created non-interactively, or change it
     later — and it is the only way to change it: `target add <existing>`
-    errors and `--renew` is credentials-only. It refuses once a server has
-    been provisioned, because changing the machine of a live cluster is a
-    rebuild, not an edit.
+    errors and `--renew` changes only the token and the SSH key. It
+    refuses once a server has been provisioned, because changing the
+    machine of a live cluster is a rebuild, not an edit.
 
     ```sh
     apprafter target machine          # the same matrix, on its own

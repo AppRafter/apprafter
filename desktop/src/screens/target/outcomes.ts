@@ -34,8 +34,14 @@ export function usedMessage(outcome: TargetUsed): string {
     : `${outcome.name} is the CLI default now`;
 }
 
-/** A renewal: the token, and the SSH key when it changed with it (the SSH key row). */
+/**
+ * A renewal: the token (and how it was checked), the SSH key, or both. No token means the
+ * credentials were kept as they were, and the toast says so.
+ */
 export function renewedMessage(outcome: TargetRenewed): string {
+  if (outcome.token === null) {
+    return outcome.sshKeyChanged ? 'SSH key changed · credentials unchanged' : 'Nothing changed';
+  }
   const what = outcome.sshKeyChanged ? 'SSH key changed, token renewed' : 'Token renewed';
   return outcome.token.status === 'verified' ? `${what} · verified with the provider` : what;
 }

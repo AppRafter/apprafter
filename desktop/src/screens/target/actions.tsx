@@ -96,10 +96,11 @@ function keyOption(candidate: SshKeyCandidate, inUse: boolean): RadioOpt {
 
 /**
  * The SSH key row's Change: the GUI form of `target add <name> --renew --ssh-key <path>`. A key
- * from `~/.ssh` (the one in use disabled) or another path, which the core looks up first; the core
- * saves a key only with a new token, so the form asks for one too; then the bounded renew plan's
- * confirm. What the target uses now is read when the form opens. Also what doctor's
- * `configure_ssh_key` fix opens (D.3e).
+ * from `~/.ssh` (the one in use disabled) or another path, which the core looks up first; then the
+ * bounded renew plan, with no token (the core changes the key alone and keeps the credentials),
+ * and its confirm, which lists the key change. What the target uses now is read when the form
+ * opens; a key that became the stored one since is the core's nothing-to-change refusal, shown
+ * in the form. Also what doctor's `configure_ssh_key` fix opens (D.3e).
  */
 export function useChangeSshKey(
   name: string,
@@ -141,7 +142,7 @@ export function useChangeSshKey(
       <FormDialog
         title="Change SSH key"
         icon={KeyIcon}
-        sub="The public key a new server is provisioned with. A key is saved together with a new API token, so the token is renewed too."
+        sub="The public key a new server is provisioned with. Only the key changes: the API token stays as it is."
         fields={[
           {
             key: 'key',
@@ -159,24 +160,16 @@ export function useChangeSshKey(
             placeholder: '~/.ssh/id_ed25519.pub',
             when: (values) => values.key === OTHER,
           },
-          {
-            key: 'token',
-            label: 'Hetzner Cloud token',
-            type: 'password',
-            placeholder: `${HETZNER_TOKEN_LEN} characters`,
-            hint: 'A new token: it is checked with the provider before anything is saved.',
-            check: tokenMessage,
-          },
         ]}
-        required={['key', 'path', 'token']}
+        required={['key', 'path']}
         submit="Continue"
         onSubmit={async (values) => {
           const path = await chosen(values);
-          const view = await api.opPlanTargetRenew(name, String(values.token), path);
+          const view = await api.opPlanTargetRenew(name, null, path);
           confirm({
             view,
             title: `Change the SSH key of ${name}?`,
-            body: 'AppRafter checks the new token with the provider, then saves the key and the token together.',
+            body: 'AppRafter saves the new key path. The API token and everything else on the target stay as they are.',
             confirmLabel: 'Change key',
             icon: KeyIcon,
             onDone: (result) => {

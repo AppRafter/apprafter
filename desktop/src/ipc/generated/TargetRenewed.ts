@@ -3,6 +3,11 @@
 import type { Verification } from "./Verification";
 
 /**
- * What renewing a target's token did.
+ * What a renewal did: the token it saved, the SSH key it changed, or both.
  */
-export type TargetRenewed = { name: string, token: Verification, sshKeyChanged: boolean, };
+export type TargetRenewed = { name: string, 
+/**
+ * How the new token was checked (`Verified`, or `Skipped { NoPing }`); `None` when the
+ * stored credentials were kept as they were (not written).
+ */
+token: Verification | null, sshKeyChanged: boolean, };

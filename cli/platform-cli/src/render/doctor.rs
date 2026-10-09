@@ -127,13 +127,17 @@ pub(crate) fn hint(c: &Check) -> Option<String> {
              `--no-ping` to skip this check"
                 .to_string()
         }
-        CheckFix::ConfigureSshKey { .. } => {
+        // `--renew --ssh-key` changes the key and keeps everything else, the token included;
+        // `--force` would replace the token and need every field it is not to keep (WI-452).
+        CheckFix::ConfigureSshKey { target } => format!(
             "no SSH key in target config — `apprafter init` / `apply` will refuse until you set \
-             one via `apprafter target add <name> --force --ssh-key <path>` or via the wizard"
-                .to_string()
-        }
+             one with `apprafter target add {target} --renew --ssh-key <path>` (it keeps \
+             everything else)"
+        ),
         CheckFix::SshKeyMissing { .. } => {
-            "file does not exist; the path stored in target config may be stale".to_string()
+            "file does not exist; the path stored in target config may be stale — point it at \
+             an existing key with `apprafter target add <name> --renew --ssh-key <path>`"
+                .to_string()
         }
         // The tool's own row: what it is needed for and how to install it. A detail means the
         // resolver found something it cannot run (a `.cmd` shim on Windows).
@@ -296,7 +300,9 @@ mod tests {
              \x20 ✓ Config file readable (/c/config.yaml)\n\
              \x20 – Token verified against provider API (not requested)\n\
              \x20 ✗ SSH key readable (/k.pub)\n\
-             \x20     hint: file does not exist; the path stored in target config may be stale\n\
+             \x20     hint: file does not exist; the path stored in target config may be stale — \
+             point it at an existing key with `apprafter target add <name> --renew --ssh-key \
+             <path>`\n\
              \n\
              Checking environment...\n\
              \x20 ✗ `kubectl` on PATH\n\
@@ -454,12 +460,13 @@ mod tests {
             (
                 CheckFix::ConfigureSshKey { target: "p".into() },
                 "no SSH key in target config — `apprafter init` / `apply` will refuse until you \
-                 set one via `apprafter target add <name> --force --ssh-key <path>` or via the \
-                 wizard",
+                 set one with `apprafter target add p --renew --ssh-key <path>` (it keeps \
+                 everything else)",
             ),
             (
                 CheckFix::SshKeyMissing { path: "/k".into() },
-                "file does not exist; the path stored in target config may be stale",
+                "file does not exist; the path stored in target config may be stale — point it \
+                 at an existing key with `apprafter target add <name> --renew --ssh-key <path>`",
             ),
             (CheckFix::Explain { text: "as is".into() }, "as is"),
         ];
@@ -473,6 +480,31 @@ mod tests {
             );
             assert_eq!(hint(&c).as_deref(), Some(want), "{fix:?}");
             assert!(!want.contains("file an issue"));
+        }
+    }
+
+    /// WI-452: both SSH key rows send the reader to `--renew --ssh-key`, which changes only
+    /// the key, never to `--force`, which replaces the token; and the command parses.
+    #[test]
+    fn the_ssh_key_hints_point_at_the_key_only_renewal() {
+        for fix in [
+            CheckFix::ConfigureSshKey {
+                target: "prod".into(),
+            },
+            CheckFix::SshKeyMissing { path: "/k".into() },
+        ] {
+            let c = check(CheckId::SshKey, CheckStatus::Warn, "t", None, Some(fix));
+            let h = hint(&c).unwrap();
+            assert!(h.contains("--renew --ssh-key <path>`"), "{h}");
+            assert!(!h.contains("--force"), "{h}");
+            let span = h
+                .split('`')
+                .find(|s| s.starts_with("apprafter target add"))
+                .unwrap_or_else(|| panic!("{h}"));
+            assert_eq!(
+                crate::commands::target::assert_commands_parse(&format!("`{span}`")),
+                1
+            );
         }
     }
 

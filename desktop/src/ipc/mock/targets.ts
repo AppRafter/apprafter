@@ -123,6 +123,13 @@ const TOKEN_REJECTED = UI_ERRORS.tokenRejected as UiError;
 const exists = (name: string) =>
   error(CORE_ERROR_CODES.TARGET_EXISTS, `target \`${name}\` already exists`, { name });
 
+const nothingToChange = (name: string) =>
+  error(
+    CORE_ERROR_CODES.TARGET_RENEW_NOTHING_TO_CHANGE,
+    `renewing \`${name}\` would change nothing: no new token and no new SSH key`,
+    { name },
+  );
+
 const unknownProvider = (provider: string) =>
   error(
     CORE_ERROR_CODES.TARGET_UNKNOWN_PROVIDER,
@@ -462,22 +469,29 @@ export function targetHandlers(ops: MockOps, store: MockStore): Record<string, H
       );
     }),
 
+    // As the core's plan_renew: a token, a key, or both, each a change only when it differs
+    // from what is stored (the mock keeps no token, so any token given counts as new); nothing
+    // to change is refused, at the plan and again when it runs.
     op_plan_target_renew: refusing((args) => {
       const { name, token, sshKey } = args as {
         name: string;
-        token: string;
+        token: string | null;
         sshKey?: string | null;
       };
       const report = named(name);
-      const problem = tokenProblem(token);
-      if (problem !== null) throw invalidToken(problem);
+      if (token !== null) {
+        const problem = tokenProblem(token);
+        if (problem !== null) throw invalidToken(problem);
+      }
       // The token is checked with the provider when the plan runs; only the verdict is kept.
-      const rejected = token.startsWith('x');
+      const rejected = token?.startsWith('x') ?? false;
+      const rotates = token !== null;
       const key = sshKey === undefined || sshKey === null ? null : keyAt(sshKey);
       // A key path the plan changes: a new one; the one stored now is left out, as the core does.
       const newKey = key !== null && key.path !== report.sshKey?.path ? key : null;
+      if (!rotates && newKey === null) throw nothingToChange(name);
       const changes = [
-        change('Credentials', name, 'replace', 'API token'),
+        ...(rotates ? [change('Credentials', name, 'replace', 'API token')] : []),
         ...(newKey === null
           ? []
           : [
@@ -489,22 +503,28 @@ export function targetHandlers(ops: MockOps, store: MockStore): Record<string, H
               ),
             ]),
       ];
+      const title = !rotates
+        ? `Change the SSH key of ${name}`
+        : newKey === null
+          ? `Rotate the API token of ${name}`
+          : `Rotate the API token and change the SSH key of ${name}`;
       return ops.registerPlan(
-        { class: 'bounded', title: `Rotate the API token of ${name}`, changes, target: name },
+        { class: 'bounded', title, changes, target: name },
         {
           end: () => {
             if (rejected) return { error: TOKEN_REJECTED };
             const current = store.reports.get(name);
             if (current === undefined) return { error: notFound(store, name) };
-            const keyChanged = key !== null && key.path !== current.sshKey?.path;
+            const keyChanged = newKey !== null && newKey.path !== current.sshKey?.path;
+            if (!rotates && !keyChanged) return { error: nothingToChange(name) };
             store.reports.set(name, {
               ...current,
-              token: { set: true, chars: 64 },
-              ...(key !== null && { sshKey: key }),
+              ...(rotates && { token: { set: true, chars: 64 } }),
+              ...(keyChanged && { sshKey: newKey }),
             });
             return result({
               name,
-              token: { status: 'verified', elapsedMs: VERIFY_MS },
+              token: rotates ? { status: 'verified', elapsedMs: VERIFY_MS } : null,
               sshKeyChanged: keyChanged,
             } satisfies TargetRenewed);
           },

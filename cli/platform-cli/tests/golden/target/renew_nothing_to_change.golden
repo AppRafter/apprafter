@@ -1,0 +1,12 @@
+$ apprafter target add prod --renew --ssh-key <SANDBOX>/home/id_ed25519.pub --no-interactive
+[exit 1]
+[stdout]
+[stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m target add invoked <ESC>[3mtarget<ESC>[0m<ESC>[2m=<ESC>[0mprod <ESC>[3mrenew<ESC>[0m<ESC>[2m=<ESC>[0mtrue <ESC>[3mforce<ESC>[0m<ESC>[2m=<ESC>[0mfalse
+Error: apprafter::target::renew_nothing_to_change
+
+  × renewing `prod` would change nothing: no new token and no new SSH key
+  help: Pass a new token (`--token <X>`, or `HCLOUD_TOKEN`) to rotate the
+        credentials, or `--ssh-key <path>` with a key other than the stored
+        one; `apprafter target show prod` shows what is stored.
+

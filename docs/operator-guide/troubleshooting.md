@@ -401,8 +401,9 @@ The common ones:
 Point `--ssh-key` at a real **public** key file (e.g.
 `~/.ssh/id_ed25519.pub`, not the private key). The key is injected into
 the node at provision time, so a change only takes effect on the next
-`apply` / `up` — re-add the target with `--force --ssh-key <path>`
-first.
+`apply` / `up` — set it first with
+`apprafter target add <name> --renew --ssh-key <path>`, which changes
+the key and keeps everything else, the token included.
 
 **What checks what, exactly** — because the obvious check does less
 than it looks:
