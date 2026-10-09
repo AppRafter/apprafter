@@ -184,12 +184,14 @@ dependencies = [
  "cli-core",
  "cli-providers",
  "cli-state",
+ "libc",
  "miette",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
  "ts-rs",
  "ureq",
+ "windows-sys 0.61.2",
  "zeroize",
 ]
 

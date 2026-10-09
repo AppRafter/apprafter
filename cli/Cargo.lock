@@ -299,6 +299,7 @@ dependencies = [
  "cli-core",
  "cli-providers",
  "cli-state",
+ "libc",
  "miette",
  "mockito",
  "proc-macro2",
@@ -310,6 +311,7 @@ dependencies = [
  "toml",
  "ts-rs",
  "ureq",
+ "windows-sys 0.61.2",
  "zeroize",
 ]
 
