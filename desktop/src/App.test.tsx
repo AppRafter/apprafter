@@ -219,10 +219,10 @@ test('Linux without a polkit agent: the field comes after the refusal, and no lo
   render(<App />);
   const user = userEvent.setup();
   await screen.findByRole('heading', { name: 'AppRafter is locked' });
-  expect(screen.queryByLabelText('Account password')).toBeNull();
+  expect(screen.queryByLabelText('System password')).toBeNull();
 
   await user.click(screen.getByRole('button', { name: 'Unlock' }));
-  await user.type(await screen.findByLabelText('Account password'), 'hunter2{Enter}');
+  await user.type(await screen.findByLabelText('System password'), 'hunter2{Enter}');
   expect(await screen.findByRole('heading', { name: 'Open a cluster' })).toBeDefined();
   expect(calls.find((c) => c.cmd === 'unlock_with_password')?.args).toEqual({
     password: 'hunter2',
@@ -235,9 +235,9 @@ test('Linux without a polkit agent: the field comes after the refusal, and no lo
     await emit(LOCK_CHANGED, state);
   });
   expect(await screen.findByRole('heading', { name: 'AppRafter is locked' })).toBeDefined();
-  expect(screen.queryByLabelText('Account password')).toBeNull();
+  expect(screen.queryByLabelText('System password')).toBeNull();
   await idle();
-  expect(screen.queryByLabelText('Account password')).toBeNull();
+  expect(screen.queryByLabelText('System password')).toBeNull();
   expect(screen.getByRole('button', { name: 'Unlock' }).textContent).toBe('Unlock');
   expect(count('app_info')).toBe(3);
 });

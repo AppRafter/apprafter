@@ -60,7 +60,7 @@ const PAM = appInfo({ auth: authInfo({ method: 'pam', passwordField: true }) });
 const refusal = (code: string, fields: Record<string, JsonValue> = {}) =>
   Promise.reject({ code, message: `Rust says ${code}`, help: null, causes: [], fields });
 
-const passwordInput = () => screen.getByLabelText('Account password') as HTMLInputElement;
+const passwordInput = () => screen.getByLabelText('System password') as HTMLInputElement;
 const unlockButton = () => screen.getByRole('button', { name: 'Unlock' }) as HTMLButtonElement;
 
 describe('LockScreen', () => {

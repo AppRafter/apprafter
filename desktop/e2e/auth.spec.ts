@@ -20,7 +20,7 @@ test('the PAM route: a wrong password says what PAM said, the right one unlocks'
   test.skip(query.includes('os=windows'), 'the PAM route is Linux’s');
   await page.goto(`/${query}&os=linux&auth=pam`);
   await expect(page.getByRole('heading', { name: 'AppRafter is locked' })).toBeVisible();
-  const field = page.getByLabel('Account password', { exact: true });
+  const field = page.getByLabel('System password', { exact: true });
   await expect(field).toBeFocused();
   await expect(page.getByRole('button', { name: 'Unlock' })).toBeDisabled();
   await shot(page, info, 'lock screen, password field');

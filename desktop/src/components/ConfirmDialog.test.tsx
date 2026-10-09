@@ -131,7 +131,7 @@ describe('ConfirmDialog', () => {
 });
 
 describe('ConfirmDialog where the OS cannot prompt: the password field', () => {
-  const password = () => screen.getByLabelText('Account password') as HTMLInputElement;
+  const password = () => screen.getByLabelText('System password') as HTMLInputElement;
 
   test('a destructive plan asks for the password here, and hands it to onConfirm', async () => {
     const { user, onConfirm, onClose } = open({ auth: pam });
@@ -156,7 +156,7 @@ describe('ConfirmDialog where the OS cannot prompt: the password field', () => {
     expect(prompted.onConfirm.mock.calls[0]).toEqual([]);
     cleanupDialog();
     const bounded = open({ planClass: 'bounded', auth: pam });
-    expect(screen.queryByLabelText('Account password')).toBeNull();
+    expect(screen.queryByLabelText('System password')).toBeNull();
     await bounded.user.click(confirm());
     expect(bounded.onConfirm.mock.calls[0]).toEqual([]);
   });

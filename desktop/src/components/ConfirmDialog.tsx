@@ -165,7 +165,7 @@ export function ConfirmDialog({
           <div className="confirm-password" data-modal-body>
             <PasswordField
               ref={passwordInput}
-              label="Account password"
+              label="System password"
               value={password}
               onChange={setPassword}
               mono={false}

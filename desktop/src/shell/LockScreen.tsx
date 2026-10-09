@@ -197,7 +197,7 @@ function PasswordForm({
       <form className="lock-password-row" onSubmit={submit}>
         <PasswordField
           ref={input}
-          label="Account password"
+          label="System password"
           placeholder={`Password for ${account}`}
           value={password}
           onChange={(value) => {
