@@ -29,6 +29,15 @@ import type { UiError } from './generated/UiError';
 /** The output one view keeps, in UTF-8 bytes (Rust's replay keeps as much); older goes. */
 export const OUTPUT_CAP = 1 << 20;
 
+/** The warnings and notices one view keeps (Rust's MESSAGE_CAP); older ones are counted. */
+export const MESSAGE_CAP = 1024;
+
+/**
+ * The events a subscription holds while its command is answering. More than that and the held
+ * events are not trusted: the subscription ends and the view follows the replay again.
+ */
+export const WAITING_CAP = 1024;
+
 export interface Stage {
   readonly index: number;
   readonly total: number;
@@ -43,7 +52,8 @@ export interface Progress {
 
 export type OpLine =
   | { readonly kind: 'stdout' | 'stderr' | 'warning' | 'notice'; readonly text: string }
-  | { readonly kind: 'dropped'; readonly bytes: number; readonly text: string };
+  | { readonly kind: 'dropped'; readonly bytes: number; readonly text: string }
+  | { readonly kind: 'messages_dropped'; readonly count: number; readonly text: string };
 
 export type OpEnd =
   | { readonly state: 'finished' | 'cancelled'; readonly outcome: Outcome<JsonValue> }
@@ -55,7 +65,10 @@ export interface OpView {
   readonly summary: OpSummary | null;
   readonly stage: Stage | null;
   readonly progress: Progress | null;
-  /** Output, warnings and notices in arrival order, after a `dropped` line when output went. */
+  /**
+   * Output, warnings and notices in arrival order, after a `dropped` line when output went and a
+   * `messages_dropped` line when messages did.
+   */
   readonly lines: readonly OpLine[];
   readonly end: OpEnd | null;
   /** The replay is applied and events arrive as they happen. */
@@ -68,18 +81,25 @@ interface Subscription {
   readonly channel: Channel<OpEvent>;
   /** Rust's id, once the command answered. */
   id: SubscriptionId | null;
-  /** `live`: its events apply as they come. Until then they wait; once `ended`, they go. */
+  /** `live`: its events can apply. Until then they wait; once `ended`, they go. */
   status: 'opening' | 'live' | 'ended';
   waiting: OpEvent[];
+  /** More than WAITING_CAP events waited: they are dropped and the view follows a new replay. */
+  overflowed: boolean;
 }
 
 interface Entry {
+  readonly opId: OpId;
   view: OpView;
   followers: number;
   /** The subscription whose events the view shows. */
   current: Subscription | null;
+  /** Executes answering: meanwhile the current subscription's events wait (see execute). */
+  executing: number;
   /** UTF-8 bytes of the output lines in the view. */
   outputBytes: number;
+  /** Warning and notice lines in the view. */
+  messages: number;
 }
 
 const entries = new Map<OpId, Entry>();
@@ -108,22 +128,27 @@ export function operationsSnapshot(): ReadonlyMap<OpId, OpView> {
   return snapshot;
 }
 
+/** Every followed or listed operation; re-renders on any change (the operations sheet). */
 export function useOperations(): ReadonlyMap<OpId, OpView> {
   return useSyncExternalStore(watchOperations, operationsSnapshot);
 }
 
+/** One operation; re-renders only when that operation's view changes. */
 export function useOperation(opId: OpId): OpView | undefined {
-  return useOperations().get(opId);
+  return useSyncExternalStore(watchOperations, () => snapshot.get(opId));
 }
 
 function entryFor(opId: OpId): Entry {
   let entry = entries.get(opId);
   if (entry === undefined) {
     entry = {
+      opId,
       view: { opId, summary: null, ...NOTHING_LIVE, attachError: null },
       followers: 0,
       current: null,
+      executing: 0,
       outputBytes: 0,
+      messages: 0,
     };
     entries.set(opId, entry);
   }
@@ -131,37 +156,53 @@ function entryFor(opId: OpId): Entry {
 }
 
 /** Nothing keeps an entry without followers and without a summary. */
-function prune(opId: OpId, entry: Entry) {
-  if (entry.followers === 0 && entry.view.summary === null && entries.get(opId) === entry) {
-    entries.delete(opId);
+function prune(entry: Entry) {
+  if (entry.followers === 0 && entry.view.summary === null && entries.get(entry.opId) === entry) {
+    entries.delete(entry.opId);
   }
 }
 
 function forgetLive(entry: Entry) {
   entry.view = { ...entry.view, ...NOTHING_LIVE, attachError: null };
   entry.outputBytes = 0;
+  entry.messages = 0;
 }
 
 const isLocked = (e: unknown) =>
   e instanceof IpcError && e.error.code === DESKTOP_ERROR_CODES.LOCKED;
+const isBusy = (e: unknown) =>
+  e instanceof IpcError && e.error.code === DESKTOP_ERROR_CODES.AUTH_BUSY;
 
-function openChannel(opId: OpId): Subscription {
+/** A channel for `entry`: its events reach that entry object, whatever the map holds now. */
+function openChannel(entry: Entry): Subscription {
   const sub: Subscription = {
-    channel: new Channel<OpEvent>((event) => {
-      if (sub.status === 'ended') return;
-      const entry = entries.get(opId);
-      if (sub.status === 'live' && entry?.current === sub) {
-        apply(entry, [event]);
-        publish();
-      } else {
-        sub.waiting.push(event);
-      }
-    }),
+    channel: new Channel<OpEvent>((event) => receive(entry, sub, event)),
     id: null,
     status: 'opening',
     waiting: [],
+    overflowed: false,
   };
   return sub;
+}
+
+function receive(entry: Entry, sub: Subscription, event: OpEvent) {
+  if (sub.status === 'ended' || sub.overflowed) return;
+  if (sub.status === 'live' && entry.current !== sub) {
+    // Replaced without being ended: it must not keep sending to a view that ignores it.
+    end(entry, sub, true);
+    return;
+  }
+  if (sub.status === 'live' && entry.executing === 0) {
+    apply(entry, [event]);
+    publish();
+    return;
+  }
+  if (sub.waiting.length >= WAITING_CAP) {
+    sub.overflowed = true;
+    sub.waiting = [];
+    return;
+  }
+  sub.waiting.push(event);
 }
 
 async function unsubscribe(opId: OpId, id: SubscriptionId) {
@@ -173,12 +214,16 @@ async function unsubscribe(opId: OpId, id: SubscriptionId) {
   }
 }
 
-/** Stop applying `sub`; `tellRust` ends it there too (once its id is known). */
-function end(opId: OpId, sub: Subscription, tellRust: boolean) {
+/**
+ * Stop applying `sub`; `tellRust` ends it there too, once its id is known (an answer that
+ * arrives for an ended subscription is unsubscribed then). Rust treats an unknown subscription
+ * as nothing to end, and while locked refuses the call, which is ignored.
+ */
+function end(entry: Entry, sub: Subscription, tellRust: boolean) {
   if (sub.status === 'ended') return;
   sub.status = 'ended';
   sub.waiting = [];
-  if (tellRust && sub.id !== null) void unsubscribe(opId, sub.id);
+  if (tellRust && sub.id !== null) void unsubscribe(entry.opId, sub.id);
 }
 
 /** `sub` becomes the view's source: its replay, then what its channel brought meanwhile. */
@@ -194,15 +239,22 @@ function goLive(entry: Entry, sub: Subscription, replay: readonly OpEvent[]) {
   publish();
 }
 
-async function follow(opId: OpId, entry: Entry) {
-  const sub = openChannel(opId);
+/** `sub` cannot be trusted any more (its backlog overflowed): end it and follow again. */
+function refollow(entry: Entry, sub: Subscription) {
+  end(entry, sub, true);
+  if (entry.current === sub) entry.current = null;
+  if (entry.followers > 0 && entry.current === null) void follow(entry);
+}
+
+async function follow(entry: Entry) {
+  const sub = openChannel(entry);
   entry.current = sub;
   let answer: Subscribed;
   try {
-    answer = await api.opSubscribe(opId, sub.channel);
+    answer = await api.opSubscribe(entry.opId, sub.channel);
   } catch (e) {
     const abandoned = entry.current !== sub;
-    end(opId, sub, false);
+    end(entry, sub, false);
     if (abandoned) return;
     entry.current = null;
     // Refused because locked: reattachAll follows it again after the unlock.
@@ -216,7 +268,11 @@ async function follow(opId: OpId, entry: Entry) {
   if (sub.status === 'ended' || entry.current !== sub) {
     // Released, or cleared by a lock, while the answer was on its way.
     sub.status = 'ended';
-    void unsubscribe(opId, answer.subscription);
+    void unsubscribe(entry.opId, answer.subscription);
+    return;
+  }
+  if (sub.overflowed) {
+    refollow(entry, sub);
     return;
   }
   goLive(entry, sub, answer.replay);
@@ -226,59 +282,90 @@ async function follow(opId: OpId, entry: Entry) {
 export function attach(opId: OpId): () => void {
   const entry = entryFor(opId);
   entry.followers += 1;
-  if (entry.current === null) void follow(opId, entry);
+  if (entry.current === null) void follow(entry);
   publish();
-  return releaser(opId, entry);
+  return releaser(entry);
 }
 
-function releaser(opId: OpId, entry: Entry): () => void {
+function releaser(entry: Entry): () => void {
   let released = false;
   return () => {
     if (released) return;
     released = true;
     entry.followers -= 1;
     if (entry.followers > 0) return;
-    if (entry.current !== null) end(opId, entry.current, true);
+    if (entry.current !== null) end(entry, entry.current, true);
     entry.current = null;
     forgetLive(entry);
-    prune(opId, entry);
+    prune(entry);
     publish();
   };
 }
 
 /**
- * Run the plan `opId` and follow it; resolves with the release once Rust has started it.
+ * Run the plan `opId` and follow it; resolves with the release once Rust has started it. The
+ * execute counts as a follower from the start, so nothing drops the entry while it answers.
  *
  * The rejection is the answer, thrown as it came. The `Failed` that Rust may also send on this
- * call's channel carries the same error for pages that followed the plan before; this channel's
- * copy is dropped, so the error shows once. A subscription the store already held for the plan
- * ends once execute answers: both carry the operation's events from its start.
+ * call's channel is dropped, so the error shows once. A subscription the store already held for
+ * the plan is held still while execute answers: when it starts the operation that subscription
+ * ends (both carry the same events from the start); a busy prompt leaves the plan waiting and the
+ * subscription resumes; any other refusal ends the plan, and the subscription with it — its own
+ * `Failed` would repeat the answer.
  */
 export async function execute(opId: OpId): Promise<() => void> {
   const entry = entryFor(opId);
-  const sub = openChannel(opId);
+  entry.followers += 1;
+  const release = releaser(entry);
+  const sub = openChannel(entry);
   const started = epoch;
+  entry.executing += 1;
   let id: SubscriptionId;
   try {
     id = await api.opExecute(opId, sub.channel);
   } catch (e) {
-    end(opId, sub, false);
-    prune(opId, entry);
+    entry.executing -= 1;
+    end(entry, sub, false);
+    const previous = entry.current;
+    if (previous !== null && isBusy(e)) {
+      resume(entry, previous);
+    } else if (previous !== null) {
+      end(entry, previous, true);
+      entry.current = null;
+      entry.view = { ...entry.view, live: false };
+    }
+    release();
     publish();
     throw e;
   }
+  entry.executing -= 1;
   sub.id = id;
-  entry.followers += 1;
   if (epoch !== started) {
-    // A lock came in between and Rust dropped this subscription: reattachAll follows it.
-    end(opId, sub, false);
-    if (!entries.has(opId)) entries.set(opId, entry);
+    // A lock came in between: Rust dropped this subscription (an unlock drops it too, so this
+    // one is ended there in any case); reattachAll follows the operation from its replay.
+    end(entry, sub, true);
     publish();
-    return releaser(opId, entry);
+    return release;
   }
-  if (entry.current !== null) end(opId, entry.current, true);
+  const previous = entry.current;
+  if (previous !== null) end(entry, previous, true);
+  if (sub.overflowed) {
+    refollow(entry, sub);
+    return release;
+  }
   goLive(entry, sub, []);
-  return releaser(opId, entry);
+  return release;
+}
+
+/** A subscription held while an execute answered goes on: what it received meanwhile applies. */
+function resume(entry: Entry, sub: Subscription) {
+  if (sub.overflowed) {
+    refollow(entry, sub);
+    return;
+  }
+  const held = sub.waiting;
+  sub.waiting = [];
+  apply(entry, held);
 }
 
 /** Cancel an operation, its open prompt or its plan; the operation then ends on its own. */
@@ -292,7 +379,7 @@ export async function discard(opId: OpId): Promise<void> {
   const entry = entries.get(opId);
   if (entry === undefined) return;
   entry.view = { ...entry.view, summary: null };
-  prune(opId, entry);
+  prune(entry);
   publish();
 }
 
@@ -300,10 +387,10 @@ export async function discard(opId: OpId): Promise<void> {
 export async function refreshList(): Promise<void> {
   const list = await api.opList();
   const listed = new Set(list.map((s) => s.opId));
-  for (const [opId, entry] of entries) {
-    if (listed.has(opId)) continue;
+  for (const entry of [...entries.values()]) {
+    if (listed.has(entry.opId)) continue;
     entry.view = { ...entry.view, summary: null };
-    prune(opId, entry);
+    prune(entry);
   }
   for (const summary of list) {
     const entry = entryFor(summary.opId);
@@ -317,33 +404,34 @@ export async function refreshList(): Promise<void> {
 }
 
 /**
- * The lock changed: Rust ended every subscription. Forget them, the live state and the
- * summaries; the followers stay counted for reattachAll.
+ * The lock changed. Rust ended every subscription it held; one made after an unlock whose answer
+ * reached JS before its `lock-changed` is ended there now. The live state and the summaries go;
+ * the followers stay counted for reattachAll.
  */
 export function clearLive(): void {
   epoch += 1;
-  for (const [opId, entry] of entries) {
-    if (entry.current !== null) end(opId, entry.current, false);
+  for (const entry of [...entries.values()]) {
+    if (entry.current !== null) end(entry, entry.current, true);
     entry.current = null;
     forgetLive(entry);
     entry.view = { ...entry.view, summary: null };
-    prune(opId, entry);
+    prune(entry);
   }
   publish();
 }
 
 /** After an unlock: follow again, from the replay, every operation still followed. */
 export function reattachAll(): void {
-  for (const [opId, entry] of entries) {
-    if (entry.followers > 0 && entry.current === null) void follow(opId, entry);
+  for (const entry of entries.values()) {
+    if (entry.followers > 0 && entry.current === null) void follow(entry);
   }
 }
 
 /** Forget everything without telling Rust; for tests. */
 export function resetOperations(): void {
   epoch += 1;
-  for (const [opId, entry] of entries) {
-    if (entry.current !== null) end(opId, entry.current, false);
+  for (const entry of entries.values()) {
+    if (entry.current !== null) end(entry, entry.current, false);
   }
   entries.clear();
   publish();
@@ -355,6 +443,12 @@ const droppedLine = (bytes: number): OpLine => ({
   text: `Earlier output was dropped (${bytes} bytes).`,
 });
 
+const messagesDroppedLine = (count: number): OpLine => ({
+  kind: 'messages_dropped',
+  count,
+  text: count === 1 ? '1 earlier message was dropped' : `${count} earlier messages were dropped`,
+});
+
 /** Count `bytes` more of dropped output in the leading `dropped` line. */
 function addDropped(lines: OpLine[], bytes: number) {
   if (bytes === 0) return;
@@ -363,21 +457,42 @@ function addDropped(lines: OpLine[], bytes: number) {
   else lines.unshift(droppedLine(bytes));
 }
 
-/** Past the cap, the oldest output lines go, counted in the leading `dropped` line. */
+/** Count `count` more dropped messages in the `messages_dropped` line, after `dropped`. */
+function addDroppedMessages(lines: OpLine[], count: number) {
+  if (count === 0) return;
+  const at = lines[0]?.kind === 'dropped' ? 1 : 0;
+  const line = lines[at];
+  if (line?.kind === 'messages_dropped') lines[at] = messagesDroppedLine(line.count + count);
+  else lines.splice(at, 0, messagesDroppedLine(count));
+}
+
+/** Past a cap, the oldest output lines and the oldest messages go, each counted in its line. */
 function trim(entry: Entry, lines: OpLine[]) {
-  let dropped = 0;
+  let bytes = 0;
   for (let i = 0; i < lines.length && entry.outputBytes > OUTPUT_CAP; ) {
     const line = lines[i];
     if (line?.kind === 'stdout' || line?.kind === 'stderr') {
-      const bytes = utf8Bytes(line.text);
-      entry.outputBytes -= bytes;
-      dropped += bytes;
+      const size = utf8Bytes(line.text);
+      entry.outputBytes -= size;
+      bytes += size;
       lines.splice(i, 1);
     } else {
       i++;
     }
   }
-  addDropped(lines, dropped);
+  addDropped(lines, bytes);
+  let messages = 0;
+  for (let i = 0; i < lines.length && entry.messages > MESSAGE_CAP; ) {
+    const line = lines[i];
+    if (line?.kind === 'warning' || line?.kind === 'notice') {
+      entry.messages -= 1;
+      messages += 1;
+      lines.splice(i, 1);
+    } else {
+      i++;
+    }
+  }
+  addDroppedMessages(lines, messages);
 }
 
 function apply(entry: Entry, events: readonly OpEvent[]) {
@@ -402,6 +517,7 @@ function apply(entry: Entry, events: readonly OpEvent[]) {
       case 'warning':
       case 'notice':
         lines.push({ kind: event.kind, text: event.message });
+        entry.messages += 1;
         break;
       case 'finished':
         end = {

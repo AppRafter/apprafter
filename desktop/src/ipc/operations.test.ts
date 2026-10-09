@@ -2,7 +2,8 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import type { Channel } from '@tauri-apps/api/core';
 import { clearMocks, mockIPC } from '@tauri-apps/api/mocks';
-import { act, renderHook } from '@testing-library/react';
+import { act, render, renderHook } from '@testing-library/react';
+import { createElement } from 'react';
 import { IpcError } from './api';
 import { DESKTOP_ERROR_CODES } from './generated/errors';
 import type { OpEvent } from './generated/OpEvent';
@@ -17,12 +18,14 @@ import {
   clearLive,
   discard,
   execute,
+  MESSAGE_CAP,
   OUTPUT_CAP,
   operationsSnapshot,
   reattachAll,
   refreshList,
   resetOperations,
   useOperation,
+  WAITING_CAP,
 } from './operations';
 
 interface Deferred<T> {
@@ -297,8 +300,27 @@ describe('the lock', () => {
     await settle();
     expect(texts(7)).toEqual(['a', 'b', 'c']);
     expect(view(7)?.live).toBe(true);
-    // Rust dropped the old subscription itself; nobody asks it to.
-    expect(calls.filter((c) => c.cmd === 'op_unsubscribe')).toHaveLength(0);
+  });
+
+  test('clearLive also ends the subscriptions in Rust: an unlock answered before its event', async () => {
+    // The unlock's answer reached JS first and the page subscribed again; then lock-changed
+    // arrived. Rust dropped what it had before the unlock, but not this fresh one.
+    answerNext('op_subscribe', subscribed(3, [out('a')]));
+    attach(7);
+    await settle();
+    // A refusal because the app locked again meanwhile is expected and not reported.
+    answerNext('op_unsubscribe', Promise.reject(uiError(DESKTOP_ERROR_CODES.LOCKED)));
+    const reported = spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      clearLive();
+      await settle();
+      expect(calls.filter((c) => c.cmd === 'op_unsubscribe')).toEqual([
+        { cmd: 'op_unsubscribe', args: { opId: 7, subscription: 3 } },
+      ]);
+      expect(reported).not.toHaveBeenCalled();
+    } finally {
+      reported.mockRestore();
+    }
   });
 
   test('an attach refused while locked is attached again by reattachAll, with no error', async () => {
@@ -426,4 +448,120 @@ test('useOperation re-renders on each event and keeps its snapshot between them'
   act(() => send(channelOf('op_subscribe'), 0, out('a')));
   expect(result.current?.lines.map((l) => l.text)).toEqual(['a']);
   expect(operationsSnapshot()).toBe(operationsSnapshot());
+});
+
+describe('execute keeps the operation it starts', () => {
+  test('a refreshList while it waits (a plan is not in op_list) does not drop it', async () => {
+    const answer = deferred<number>();
+    answerNext('op_execute', answer.promise);
+    const running = execute(5);
+    answerNext('op_list', []);
+    await refreshList();
+    expect(view(5)).toBeDefined();
+    answer.resolve(9);
+    await running;
+    send(channelOf('op_execute'), 0, out('a'));
+    expect(texts(5)).toEqual(['a']);
+    attach(5);
+    await settle();
+    expect(calls.filter((c) => c.cmd === 'op_subscribe')).toHaveLength(0);
+  });
+
+  test('a lock while it waits: the answer is not followed, and reattachAll follows the replay', async () => {
+    const answer = deferred<number>();
+    answerNext('op_execute', answer.promise);
+    const running = execute(5);
+    clearLive();
+    answer.resolve(9);
+    await running;
+    // Rust dropped that subscription at the lock; anything still on its way is not shown.
+    send(channelOf('op_execute'), 0, out('stale'));
+    expect(texts(5)).toEqual([]);
+    await settle();
+    expect(calls.filter((c) => c.cmd === 'op_unsubscribe')).toEqual([
+      { cmd: 'op_unsubscribe', args: { opId: 5, subscription: 9 } },
+    ]);
+    answerNext('op_subscribe', subscribed(10, [out('a')]));
+    reattachAll();
+    await settle();
+    expect(texts(5)).toEqual(['a']);
+  });
+
+  test('a refusal that is not busy ends the earlier subscription: its Failed does not show again', async () => {
+    const expired = uiError(DESKTOP_ERROR_CODES.PLAN_EXPIRED, 'The plan expired.');
+    answerNext('op_subscribe', subscribed(1));
+    attach(5);
+    await settle();
+    const answer = deferred<number>();
+    answerNext('op_execute', answer.promise);
+    const running = execute(5);
+    // Rust tells every page that followed the plan, the earlier subscription included.
+    send(channelOf('op_subscribe'), 0, { kind: 'failed', error: expired });
+    send(channelOf('op_execute'), 0, { kind: 'failed', error: expired });
+    answer.reject(expired);
+    await expect(running).rejects.toBeInstanceOf(IpcError);
+    send(channelOf('op_subscribe'), 1, { kind: 'failed', error: expired });
+    expect(view(5)?.end).toBeNull();
+    expect(view(5)?.live).toBe(false);
+    await settle();
+    expect(calls.filter((c) => c.cmd === 'op_unsubscribe')).toEqual([
+      { cmd: 'op_unsubscribe', args: { opId: 5, subscription: 1 } },
+    ]);
+  });
+
+  test('a backlog past WAITING_CAP before the answer is not trusted: it follows the replay again', async () => {
+    const answer = deferred<Subscribed>();
+    answerNext('op_subscribe', answer.promise);
+    attach(7);
+    const first = channelOf('op_subscribe', 0);
+    for (let i = 0; i <= WAITING_CAP; i++) send(first, i, out(`${i}`));
+    answerNext('op_subscribe', subscribed(2, [out('replayed')]));
+    answer.resolve(subscribed(1));
+    await settle();
+    await settle();
+    expect(calls.filter((c) => c.cmd === 'op_subscribe')).toHaveLength(2);
+    expect(calls.filter((c) => c.cmd === 'op_unsubscribe')).toEqual([
+      { cmd: 'op_unsubscribe', args: { opId: 7, subscription: 1 } },
+    ]);
+    expect(texts(7)).toEqual(['replayed']);
+  });
+});
+
+test(`warnings and notices past ${MESSAGE_CAP} drop the oldest, counted in one line`, async () => {
+  answerNext('op_subscribe', subscribed(1));
+  attach(7);
+  await settle();
+  const channel = channelOf('op_subscribe');
+  for (let i = 0; i < MESSAGE_CAP + 6; i++) {
+    send(channel, i, { kind: i % 2 === 0 ? 'warning' : 'notice', message: `m${i}` });
+  }
+  const lines = view(7)?.lines ?? [];
+  expect(lines[0]).toEqual({
+    kind: 'messages_dropped',
+    count: 6,
+    text: '6 earlier messages were dropped',
+  });
+  expect(lines).toHaveLength(MESSAGE_CAP + 1);
+  expect(lines[1]?.text).toBe('m6');
+  expect(lines.at(-1)?.text).toBe(`m${MESSAGE_CAP + 5}`);
+});
+
+test('useOperation re-renders for its own operation only', async () => {
+  answerNext('op_subscribe', subscribed(1));
+  answerNext('op_subscribe', subscribed(2));
+  attach(7);
+  attach(8);
+  await settle();
+  let renders = 0;
+  function Probe() {
+    renders += 1;
+    useOperation(7);
+    return null;
+  }
+  render(createElement(Probe));
+  const before = renders;
+  act(() => send(channelOf('op_subscribe', 1), 0, out('elsewhere')));
+  expect(renders).toBe(before);
+  act(() => send(channelOf('op_subscribe', 0), 0, out('here')));
+  expect(renders).toBe(before + 1);
 });
