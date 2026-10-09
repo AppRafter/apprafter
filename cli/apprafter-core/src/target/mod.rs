@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
-//! The core target API (D.3 overview §3.7): the report and outcome types both clients show, and
-//! the name rule. The reads (`hetzner_token`, `public_address`) arrive in D.3a's later tasks;
-//! `list`, `show` and the mutations in D.3b.
+//! The core target API (D.3 overview §3.7): the report and outcome types both clients show, the
+//! name rule, and the reads `hetzner_token` and `public_address`; `list`, `show` and the
+//! mutations arrive in D.3b.
 
 pub mod name;
+mod read;
 
 pub use name::{validate_name, NameProblem, TARGET_NAME_MAX_LEN};
+pub use read::{hetzner_token, public_address};
 
 use serde::Serialize;
 
