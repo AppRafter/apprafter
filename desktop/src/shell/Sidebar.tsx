@@ -2,6 +2,7 @@
 // The left column of a view (brief §2). On a target tab: the target's name, the sections and the
 // Manage sections. Always: the footer — Targets, Settings, Lock with their shortcuts, the
 // running operations, the three links and the version. On the Targets view only the footer.
+import type { ReactNode } from 'react';
 import { Dot } from '../components/Dot';
 import { Eyebrow } from '../components/Eyebrow';
 import { IconButton } from '../components/IconButton';
@@ -35,6 +36,8 @@ export interface SidebarProps {
   lockDisabled?: boolean;
   /** Opens Settings; without it there is no Settings entry. */
   onSettings?: () => void;
+  /** A line under the target's name (ClusterMeta: provider · region · tier). */
+  meta?: ReactNode;
 }
 
 export function Sidebar({
@@ -46,6 +49,7 @@ export function Sidebar({
   onLock,
   lockDisabled = false,
   onSettings,
+  meta,
 }: SidebarProps) {
   const nav = (group: SectionInfo['group']) =>
     SECTIONS.filter((s) => s.group === group).map((section) => (
@@ -63,6 +67,7 @@ export function Sidebar({
           <div className="cluster-header">
             <Dot size={8} />
             <span className="cluster-name">{tab.target}</span>
+            {meta}
           </div>
           <nav className="nav" aria-label="Sections">
             {nav('main')}

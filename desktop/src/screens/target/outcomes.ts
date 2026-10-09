@@ -34,8 +34,8 @@ export function usedMessage(outcome: TargetUsed): string {
     : `${outcome.name} is the CLI default now`;
 }
 
+/** A renewal: the token, and the SSH key when it changed with it (the SSH key row). */
 export function renewedMessage(outcome: TargetRenewed): string {
-  return outcome.token.status === 'verified'
-    ? 'Token renewed · verified with the provider'
-    : 'Token renewed';
+  const what = outcome.sshKeyChanged ? 'SSH key changed, token renewed' : 'Token renewed';
+  return outcome.token.status === 'verified' ? `${what} · verified with the provider` : what;
 }

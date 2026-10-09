@@ -20,6 +20,8 @@ export interface TargetDetailActions {
   rename: () => void;
   renew: () => void;
   makeDefault: () => void;
+  /** The SSH key row's Change: another key, saved with a new token (a renewal). */
+  changeSshKey: () => void;
 }
 
 export interface TargetDetailsProps {
@@ -122,7 +124,15 @@ export function TargetDetails({
         />
       </Group>
       <Group label="SSH key">
-        <CardRow label="SSH key" value={sshKeyValue(report.sshKey)} />
+        <CardRow
+          label="SSH key"
+          value={sshKeyValue(report.sshKey)}
+          control={
+            <Button size={26} onClick={actions.changeSshKey}>
+              Change
+            </Button>
+          }
+        />
       </Group>
       <Group label="Config file">
         <CardRow label="Config file" value={path(report.configFile)} />

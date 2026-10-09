@@ -53,4 +53,11 @@ test('each outcome says what moved: the CLI default and a running server include
       token: { status: 'skipped', reason: 'no_ping' },
     }),
   ).toBe('Token renewed');
+  expect(
+    renewedMessage({
+      name: 'prod',
+      sshKeyChanged: true,
+      token: { status: 'verified', elapsedMs: 182 },
+    }),
+  ).toBe('SSH key changed, token renewed · verified with the provider');
 });

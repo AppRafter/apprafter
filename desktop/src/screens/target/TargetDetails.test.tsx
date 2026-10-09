@@ -10,7 +10,7 @@ import { DangerZone } from './DangerZone';
 import { TargetDetails } from './TargetDetails';
 
 const row = (label: string) => screen.getByRole('group', { name: label });
-const noop = () => ({ rename: mock(), renew: mock(), makeDefault: mock() });
+const noop = () => ({ rename: mock(), renew: mock(), makeDefault: mock(), changeSshKey: mock() });
 
 test('the rows the CLI prints, with its "not set", and no token anywhere', () => {
   render(
@@ -180,6 +180,34 @@ test('not provisioned: Change only when a picker is given; unreadable state: nev
   );
   expect(within(row('Machine')).queryByRole('button', { name: 'Change' })).toBeNull();
   expect(row('Machine').textContent).toContain('state.json: expected value');
+});
+
+test('the SSH key row offers Change, set or not', async () => {
+  const actions = noop();
+  const { rerender } = render(
+    <TargetDetails
+      report={targetReport()}
+      os="linux"
+      secretBackend="file"
+      actions={actions}
+      onChangeMachine={null}
+    />,
+  );
+  const user = userEvent.setup();
+  await user.click(within(row('SSH key')).getByRole('button', { name: 'Change' }));
+  expect(actions.changeSshKey).toHaveBeenCalledTimes(1);
+  rerender(
+    <TargetDetails
+      report={targetReport({ sshKey: null })}
+      os="linux"
+      secretBackend="file"
+      actions={actions}
+      onChangeMachine={null}
+    />,
+  );
+  expect(row('SSH key').textContent).toContain('not set');
+  await user.click(within(row('SSH key')).getByRole('button', { name: 'Change' }));
+  expect(actions.changeSshKey).toHaveBeenCalledTimes(2);
 });
 
 test('Make default only on another target; Rename and Renew call back', async () => {

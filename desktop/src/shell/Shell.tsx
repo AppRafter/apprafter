@@ -10,6 +10,7 @@ import { ToastViewport, useToast } from '../components/Toast';
 import { useListRefresh } from '../ipc/listRefresh';
 import { refreshList, useOperations } from '../ipc/operations';
 import { PlannedSection } from '../screens/placeholders/PlannedSection';
+import { TargetScreen } from '../screens/target/TargetScreen';
 import { TargetsPage } from '../screens/targets/TargetsPage';
 import { lockOff, lockOffMessage, NO_AUTH_NOTICE, useLockActions } from '../state/lock';
 import { usePlatform } from '../state/platform';
@@ -17,6 +18,7 @@ import { INITIAL_SESSION, sessionReducer, type TargetTab } from '../state/sessio
 import { useSettings } from '../state/settings';
 import { shortcutFor } from '../state/shortcuts';
 import { TabContext } from '../state/tab';
+import { ClusterMeta } from './ClusterMeta';
 import { ScreenShown } from './reveal';
 import { SettingsDialog } from './SettingsDialog';
 import { Sidebar } from './Sidebar';
@@ -91,6 +93,7 @@ export function Shell() {
       onLock={lock}
       lockDisabled={off !== null}
       onSettings={openSettings}
+      {...(tab !== null && { meta: <ClusterMeta target={tab.target} /> })}
     />
   );
 
@@ -121,7 +124,15 @@ export function Shell() {
                 <ViewFrame panel={{ id: tabPanelId(tab.key), labelledBy: tabId(tab.key) }}>
                   {sidebar(tab)}
                   <main className="main">
-                    <PlannedSection section={tab.section} target={tab.target} />
+                    {tab.section === 'target' ? (
+                      <TargetScreen
+                        name={tab.target}
+                        onRenamed={(from, to) => dispatch({ type: 'targetRenamed', from, to })}
+                        onRemoved={(target) => dispatch({ type: 'targetRemoved', target })}
+                      />
+                    ) : (
+                      <PlannedSection section={tab.section} target={tab.target} />
+                    )}
                   </main>
                 </ViewFrame>
               </TabContext>

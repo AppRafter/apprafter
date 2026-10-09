@@ -277,8 +277,9 @@
 
 .cluster-header {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 8px;
+  gap: 2px 8px;
   padding: 16px 16px 14px;
   border-bottom: 1px solid var(--border);
 }
@@ -288,6 +289,18 @@
   font-size: var(--fs-15);
   font-weight: 700;
   letter-spacing: -0.01em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Provider · region · tier, on a line of its own under the name, aligned with it. */
+.cluster-meta {
+  flex-basis: 100%;
+  min-width: 0;
+  padding-left: 16px;
+  overflow: hidden;
+  color: var(--fg-faint);
+  font: 400 var(--fs-11-5) var(--font-mono);
   text-overflow: ellipsis;
   white-space: nowrap;
 }

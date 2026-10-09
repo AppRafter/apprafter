@@ -1,0 +1,214 @@
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
+// The Target screen on the mock IPC: the report, and each action by its plan class — make
+// default at once, rename / renew / the SSH key a plain confirm listing the changes, remove the
+// full plan with the typed name and the gesture.
+import { afterEach, beforeEach, expect, mock, test } from 'bun:test';
+import { clearMocks } from '@tauri-apps/api/mocks';
+import { screen, waitFor, within } from '@testing-library/react';
+import * as api from '../../ipc/api';
+import { installMockIpc } from '../../ipc/mock';
+import { resetOperations } from '../../ipc/operations';
+import { renderScreen } from '../../test/screens';
+import { TargetScreen } from './TargetScreen';
+
+beforeEach(async () => {
+  installMockIpc({ opDelayMs: 0 });
+  await api.unlock();
+});
+afterEach(() => {
+  resetOperations();
+  clearMocks();
+});
+
+const screenOf = (name: string, more: { onRenamed?: () => void; onRemoved?: () => void } = {}) =>
+  renderScreen(
+    <TargetScreen
+      name={name}
+      onRenamed={more.onRenamed ?? (() => {})}
+      onRemoved={more.onRemoved ?? (() => {})}
+    />,
+  );
+
+test('shows the report; a provisioned target offers no machine change', async () => {
+  screenOf('prod-eu');
+  expect(await screen.findByRole('group', { name: 'Machine' })).toBeDefined();
+  expect(screen.getByRole('heading', { level: 1, name: 'Target' })).toBeDefined();
+  expect(screen.getByText(/How this computer reaches prod-eu/)).toBeDefined();
+  expect(screen.getByRole('group', { name: 'Machine' }).textContent).toContain(
+    'apprafter backup create',
+  );
+  expect(screen.getByRole('region', { name: 'Danger zone' })).toBeDefined();
+});
+
+test('rename: the form checks the name, a plain confirm lists the changes, the tab follows', async () => {
+  const onRenamed = mock();
+  const user = screenOf('prod-eu', { onRenamed });
+  await user.click(await screen.findByRole('button', { name: 'Rename' }));
+  const form = screen.getByRole('dialog', { name: 'Rename target' });
+  const field = within(form).getByLabelText('New name');
+  expect(within(form).getByText('That is its name now.')).toBeDefined();
+  await user.clear(field);
+  await user.type(field, 'bad name');
+  expect(within(form).getByText('Letters, digits and dashes only.')).toBeDefined();
+  await user.clear(field);
+  await user.type(field, 'prod-de');
+  await user.click(within(form).getByRole('button', { name: 'Continue' }));
+  const confirm = await screen.findByRole('dialog', { name: 'Rename prod-eu to prod-de?' });
+  expect(confirm.textContent).toContain('CLI default');
+  expect(screen.queryByRole('dialog', { name: 'Rename target' })).toBeNull();
+  await user.click(within(confirm).getByRole('button', { name: 'Rename' }));
+  await waitFor(() => expect(onRenamed).toHaveBeenCalledWith('prod-eu', 'prod-de'));
+  expect(
+    await screen.findByText('Renamed prod-eu to prod-de · the CLI default is now prod-de'),
+  ).toBeDefined();
+});
+
+test('a taken name is refused in the form, which stays open', async () => {
+  const user = screenOf('prod-eu');
+  await user.click(await screen.findByRole('button', { name: 'Rename' }));
+  const form = screen.getByRole('dialog', { name: 'Rename target' });
+  await user.clear(within(form).getByLabelText('New name'));
+  await user.type(within(form).getByLabelText('New name'), 'staging');
+  await user.click(within(form).getByRole('button', { name: 'Continue' }));
+  expect((await within(form).findByRole('alert')).textContent).toContain(
+    'target `staging` already exists',
+  );
+  expect(screen.queryByRole('dialog', { name: /Rename prod-eu to/ })).toBeNull();
+});
+
+test('renew: the token is checked in the form, then the renewal is confirmed and runs', async () => {
+  const user = screenOf('staging');
+  await user.click(await screen.findByRole('button', { name: 'Renew' }));
+  const form = screen.getByRole('dialog', { name: 'Renew API token' });
+  const field = within(form).getByLabelText('Hetzner Cloud token');
+  await user.type(field, 'short');
+  expect(within(form).getByText(/this one has 5\./)).toBeDefined();
+  await user.clear(field);
+  await user.type(field, 'k'.repeat(64)); // token-shaped, nobody's
+  await user.click(within(form).getByRole('button', { name: 'Continue' }));
+  const confirm = await screen.findByRole('dialog', { name: 'Renew the API token of staging?' });
+  expect(confirm.textContent).toContain('API token');
+  expect(screen.queryByDisplayValue('k'.repeat(64))).toBeNull(); // the form, and its copy, are gone
+  await user.click(within(confirm).getByRole('button', { name: 'Renew' }));
+  expect(await screen.findByText('Token renewed · verified with the provider')).toBeDefined();
+});
+
+test('a rejected token shows on the screen, with Renew token to try again', async () => {
+  const user = screenOf('staging');
+  await user.click(await screen.findByRole('button', { name: 'Renew' }));
+  await user.type(screen.getByLabelText('Hetzner Cloud token'), 'x'.repeat(64)); // the mock's 401
+  await user.click(screen.getByRole('button', { name: 'Continue' }));
+  await user.click(
+    within(await screen.findByRole('dialog', { name: /Renew the API token/ })).getByRole('button', {
+      name: 'Renew',
+    }),
+  );
+  const panel = await screen.findByRole('alert');
+  expect(panel.textContent).toContain('rejected the supplied token');
+  await user.click(within(panel).getByRole('button', { name: 'Renew token' }));
+  expect(screen.getByRole('dialog', { name: 'Renew API token' })).toBeDefined();
+  expect(screen.queryByRole('alert')).toBeNull();
+});
+
+test('remove: the full plan, the typed name, then the gesture; the tab closes', async () => {
+  const onRemoved = mock();
+  const user = screenOf('prod-eu', { onRemoved });
+  await user.click(await screen.findByRole('button', { name: 'Remove…' }));
+  const confirm = await screen.findByRole('dialog', { name: 'Remove target prod-eu?' });
+  expect(confirm.textContent).toContain('keeps running at the provider');
+  const go = within(confirm).getByRole('button', { name: 'Remove target' }) as HTMLButtonElement;
+  expect(go.disabled).toBe(true);
+  await user.type(within(confirm).getByLabelText(/Type prod-eu to confirm/), 'prod-eu');
+  await user.click(go);
+  await waitFor(() => expect(onRemoved).toHaveBeenCalledWith('prod-eu'));
+  expect(
+    await screen.findByText(/Removed prod-eu from this computer · server prod-eu-1 keeps running/),
+  ).toBeDefined();
+});
+
+test('make default from its row runs at once: no dialog, the row says Yes', async () => {
+  const user = screenOf('staging');
+  const row = await screen.findByRole('group', { name: 'CLI default' });
+  expect(row.textContent).toContain('No');
+  await user.click(within(row).getByRole('button', { name: 'Make default' }));
+  expect(await screen.findByText('staging is the CLI default now')).toBeDefined();
+  expect(screen.queryByRole('dialog')).toBeNull();
+  await waitFor(() =>
+    expect(screen.getByRole('group', { name: 'CLI default' }).textContent).toContain('Yes'),
+  );
+});
+
+test('SSH key: Change offers the keys in ~/.ssh, the one in use disabled, and saves the choice with a new token', async () => {
+  const user = screenOf('staging');
+  const row = await screen.findByRole('group', { name: 'SSH key' });
+  await user.click(within(row).getByRole('button', { name: 'Change' }));
+  const form = await screen.findByRole('dialog', { name: 'Change SSH key' });
+  const inUse = within(form).getByRole('radio', { name: '~/.ssh/id_ed25519.pub' });
+  expect((inUse as HTMLInputElement).disabled).toBe(true);
+  const other = within(form).getByRole('radio', { name: '~/.ssh/work.pub' }) as HTMLInputElement;
+  expect(other.checked).toBe(true);
+  const go = within(form).getByRole('button', { name: 'Continue' }) as HTMLButtonElement;
+  expect(go.disabled).toBe(true); // the token first
+  await user.type(within(form).getByLabelText('Hetzner Cloud token'), 'k'.repeat(64));
+  await user.click(go);
+  const confirm = await screen.findByRole('dialog', { name: 'Change the SSH key of staging?' });
+  expect(confirm.textContent).toContain('ssh key: ~/.ssh/id_ed25519.pub → ~/.ssh/work.pub');
+  expect(confirm.textContent).toContain('API token');
+  await user.click(within(confirm).getByRole('button', { name: 'Change key' }));
+  expect(
+    await screen.findByText('SSH key changed, token renewed · verified with the provider'),
+  ).toBeDefined();
+  await waitFor(() =>
+    expect(screen.getByRole('group', { name: 'SSH key' }).textContent).toContain('~/.ssh/work.pub'),
+  );
+});
+
+test('SSH key: Other path… is looked up first; a path with no file says so in the form', async () => {
+  const user = screenOf('lab'); // its stored key is missing
+  const row = await screen.findByRole('group', { name: 'SSH key' });
+  expect(row.textContent).toContain('(missing)');
+  await user.click(within(row).getByRole('button', { name: 'Change' }));
+  const form = await screen.findByRole('dialog', { name: 'Change SSH key' });
+  // Nothing in ~/.ssh is in use by lab: the first key is chosen.
+  expect(
+    (within(form).getByRole('radio', { name: '~/.ssh/id_ed25519.pub' }) as HTMLInputElement)
+      .checked,
+  ).toBe(true);
+  await user.click(within(form).getByRole('radio', { name: 'Other path…' }));
+  await user.type(within(form).getByLabelText('Path to a public key'), '~/.ssh/nothing.pub');
+  await user.type(within(form).getByLabelText('Hetzner Cloud token'), 'k'.repeat(64));
+  await user.click(within(form).getByRole('button', { name: 'Continue' }));
+  expect((await within(form).findByRole('alert')).textContent).toContain(
+    'No file at ~/.ssh/nothing.pub.',
+  );
+  await user.clear(within(form).getByLabelText('Path to a public key'));
+  await user.type(within(form).getByLabelText('Path to a public key'), '~/.ssh/work.pub');
+  await user.click(within(form).getByRole('button', { name: 'Continue' }));
+  const confirm = await screen.findByRole('dialog', { name: 'Change the SSH key of lab?' });
+  expect(confirm.textContent).toContain('ssh key: ~/.ssh/lab.pub → ~/.ssh/work.pub');
+});
+
+test('SSH key: the key in use typed as another path is refused in the form', async () => {
+  const user = screenOf('staging');
+  await user.click(
+    within(await screen.findByRole('group', { name: 'SSH key' })).getByRole('button', {
+      name: 'Change',
+    }),
+  );
+  const form = await screen.findByRole('dialog', { name: 'Change SSH key' });
+  await user.click(within(form).getByRole('radio', { name: 'Other path…' }));
+  await user.type(within(form).getByLabelText('Path to a public key'), '~/.ssh/id_ed25519.pub');
+  await user.type(within(form).getByLabelText('Hetzner Cloud token'), 'k'.repeat(64));
+  await user.click(within(form).getByRole('button', { name: 'Continue' }));
+  expect((await within(form).findByRole('alert')).textContent).toContain(
+    'staging uses that key now: choose another.',
+  );
+});
+
+test('a target that cannot be shown says why', async () => {
+  screenOf('broken');
+  expect((await screen.findByRole('alert')).textContent).toContain(
+    'targets/broken/config.yaml: expected a mapping',
+  );
+  expect(screen.queryByRole('group', { name: 'Machine' })).toBeNull();
+});

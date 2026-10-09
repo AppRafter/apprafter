@@ -23,8 +23,12 @@ export const useTargetReport = (name: string) =>
     intervalMs: STORE_REFRESH_MS,
   });
 
-/** After a mutation: the list again; the reports of `gone` (a renamed or removed name) dropped. */
+/**
+ * After a mutation: the reports of `gone` (a renamed or removed name) dropped, then the list and
+ * every report shown read again (a renewal changes the report, a rename or remove the list).
+ */
 export function refreshTargets(client: QueryClient, ...gone: string[]): void {
-  void client.invalidateQueries({ queryKey: TARGETS_KEY });
   for (const name of gone) client.removeQueries({ queryKey: targetKey(name) });
+  void client.invalidateQueries({ queryKey: TARGETS_KEY });
+  void client.invalidateQueries({ queryKey: ['target'] });
 }

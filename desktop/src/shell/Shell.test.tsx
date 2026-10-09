@@ -5,10 +5,12 @@ import { clearMocks, mockIPC, mockWindows } from '@tauri-apps/api/mocks';
 import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { ToastProvider } from '../components/Toast';
+import * as api from '../ipc/api';
 import type { AppInfo } from '../ipc/generated/AppInfo';
 import type { OpSummary } from '../ipc/generated/OpSummary';
 import type { Settings } from '../ipc/generated/Settings';
 import type { TargetListReport } from '../ipc/generated/TargetListReport';
+import { installMockIpc } from '../ipc/mock';
 import { refreshList, resetOperations } from '../ipc/operations';
 import { PlatformContext } from '../state/platform';
 import { createQueryClient } from '../state/queryClient';
@@ -262,5 +264,49 @@ describe('Shell', () => {
         'Upgrade platform',
       ),
     ).toBeDefined();
+  });
+});
+
+describe('Shell, the Target section on the mock IPC', () => {
+  beforeEach(async () => {
+    clearMocks();
+    installMockIpc({ opDelayMs: 0 });
+    await api.unlock();
+  });
+
+  test('the Target section is the Target screen, and the sidebar says provider · region · tier', async () => {
+    const user = shell();
+    await user.click(await screen.findByRole('button', { name: 'Open prod-eu' }));
+    expect(await screen.findByText('hetzner-cloud · nbg1 · T2')).toBeDefined();
+    await user.click(screen.getByRole('button', { name: 'Target' }));
+    expect(pageTitle()).toBe('Target');
+    expect(await screen.findByRole('region', { name: 'Target' })).toBeDefined();
+    expect(screen.queryByRole('heading', { name: /arrives in D\.3/ })).toBeNull();
+  });
+
+  test('a rename rebinds the tab and its sidebar line; a remove closes the tab', async () => {
+    const user = shell();
+    await user.click(await screen.findByRole('button', { name: 'Open staging' }));
+    await user.click(screen.getByRole('button', { name: 'Target' }));
+    await user.click(await screen.findByRole('button', { name: 'Rename' }));
+    const form = screen.getByRole('dialog', { name: 'Rename target' });
+    await user.clear(within(form).getByLabelText('New name'));
+    await user.type(within(form).getByLabelText('New name'), 'staging-2');
+    await user.click(within(form).getByRole('button', { name: 'Continue' }));
+    const confirm = await screen.findByRole('dialog', { name: 'Rename staging to staging-2?' });
+    await user.click(within(confirm).getByRole('button', { name: 'Rename' }));
+    await waitFor(() => expect(tab('staging-2').getAttribute('aria-selected')).toBe('true'));
+    expect(screen.queryByRole('tab', { name: 'staging' })).toBeNull();
+    expect(pageTitle()).toBe('Target');
+    expect(await screen.findByText('hetzner-cloud · fsn1 · T1')).toBeDefined();
+    expect((await screen.findByRole('group', { name: 'Name' })).textContent).toContain('staging-2');
+
+    await user.click(screen.getByRole('button', { name: 'Remove…' }));
+    const remove = await screen.findByRole('dialog', { name: 'Remove target staging-2?' });
+    await user.type(within(remove).getByLabelText(/Type staging-2 to confirm/), 'staging-2');
+    await user.click(within(remove).getByRole('button', { name: 'Remove target' }));
+    await waitFor(() => expect(screen.queryAllByRole('tab')).toHaveLength(0));
+    expect(screen.getByRole('heading', { name: 'Open a cluster' })).toBeDefined();
+    expect(await screen.findByText(/Removed staging-2 from this computer/)).toBeDefined();
   });
 });
