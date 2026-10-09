@@ -500,14 +500,15 @@
     {
       "id": "image-node",
       "class": "container-base-image",
-      "title": "node LTS major (Backstage host + landing CMS base images, mise.toml, dev container)",
+      "title": "node LTS major (Backstage host + landing CMS base images, mise.toml, dev container, CI setup-node)",
       "read": {
         "kind": "regex",
         "sources": [
           { "files": "backstage-plugins/host/Dockerfile", "pattern": "(?m)^FROM node:(\\d+)-bookworm-slim\\b" },
           { "files": "landing/cms/Dockerfile", "pattern": "(?m)^FROM node:(\\d+)-alpine AS runtime" },
           { "files": "mise.toml", "pattern": "(?m)^node\\s*=\\s*\"(\\d+)\"" },
-          { "files": ".devcontainer/devcontainer.json", "pattern": "features/node:1\"\\s*:\\s*\\{[^}]*?\"version\"\\s*:\\s*\"(\\d+)\"" }
+          { "files": ".devcontainer/devcontainer.json", "pattern": "features/node:1\"\\s*:\\s*\\{[^}]*?\"version\"\\s*:\\s*\"(\\d+)\"" },
+          { "files": ".github/workflows/*.yml", "pattern": "(?m)^\\s*node-version:\\s*\"(\\d+)\"\\s*$" }
         ]
       },
       "upstream": { "kind": "http-text", "url": "https://nodejs.org/dist/index.json", "pattern": "\"version\":\\s*\"v(\\d+)\\.\\d+\\.\\d+\"[^{}]*\"lts\":\\s*\"[^\"]+\"" },
@@ -696,6 +697,17 @@
       "gate": null,
       "gateGap": "See actions/checkout.",
       "note": null
+    },
+    {
+      "id": "action-setup-node",
+      "class": "github-action",
+      "title": "actions/setup-node",
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: actions/setup-node@[0-9a-f]{40}[ \\t]+#[ \\t]+(v[0-9][0-9.]*)" } ] },
+      "upstream": { "kind": "github-release", "repo": "actions/setup-node" },
+      "compare": "numeric",
+      "gate": null,
+      "gateGap": "See actions/checkout.",
+      "note": "test.yml's desktop-e2e only: Playwright's test runner runs under node, not bun. The node it installs is the `node-version:` input, which image-node reads."
     },
     {
       "id": "action-paths-filter",

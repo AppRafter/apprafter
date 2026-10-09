@@ -7,6 +7,8 @@
       "!!src-tauri/target",
       "!!src-tauri/gen",
       "!!dist",
+      "!!e2e/playwright-report",
+      "!!e2e/test-results",
       "!!design-source",
       "!src/ipc/generated"
     ]
