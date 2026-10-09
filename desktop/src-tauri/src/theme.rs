@@ -11,8 +11,8 @@
 //!   `color-scheme`: 1 dark, 2 light, 0 no preference), else GTK's own preference as it stood at
 //!   start (`~/.config/gtk-3.0/settings.ini`, which KDE Plasma keeps in step), else light. It
 //!   applies the result with `set_theme(Some(..))`, at start before the window exists
-//!   ([`start`]), on `theme_apply`, and on every change the portal signals while the setting is
-//!   System ([`on_desktop_change`], [`portal`]).
+//!   ([`start`]), on `theme_apply`, and, while the setting is System, on every change the portal
+//!   signals and on its answer when a portal starts ([`on_desktop_change`], [`portal`]).
 //!
 //! The page decides its own `data-theme` from `matchMedia('(prefers-color-scheme: dark)')`.
 //! WebKitGTK follows `gtk-application-prefer-dark-theme` live: it listens for the property's
@@ -283,6 +283,50 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The dependencies `Cargo.lock` gives every package named `name`; it fails when there is
+    /// none, so a renamed package cannot pass for one without the dependency.
+    fn lock_dependencies<'a>(lock: &'a str, name: &str) -> Vec<&'a str> {
+        let entry = format!("name = \"{name}\"");
+        let packages: Vec<&str> = lock
+            .split("[[package]]")
+            .filter(|package| package.lines().any(|line| line == entry))
+            .collect();
+        assert!(!packages.is_empty(), "no {name} in Cargo.lock");
+        packages
+            .iter()
+            .flat_map(|package| {
+                package
+                    .lines()
+                    .skip_while(|line| *line != "dependencies = [")
+                    .skip(1)
+                    .take_while(|line| *line != "]")
+                    .map(|line| line.trim().trim_end_matches(',').trim_matches('"'))
+            })
+            .collect()
+    }
+
+    /// Tauri's `dbus` feature stays off (desktop/Cargo.toml). It turns on tao's own reading of
+    /// the portal (GOTCHA-107): on the main thread, blocking it for up to 5 s, at window
+    /// creation, and on every change of the desktop, forced over the theme this module decided
+    /// — Light or Dark turned with the desktop, and "no preference" light whatever GTK says.
+    /// Cargo unifies features, so one crate in the graph that takes `tauri`,
+    /// `tauri-runtime-wry` or `tao` with their default features turns it back on, and nothing
+    /// else shows it. tao's feature adds one dependency, `dbus`, which the lock lists among
+    /// tao's only while some target or feature of the workspace has the feature on. (It does
+    /// not carry tao's taskbar badge, which loads libunity at run time: the D.5 tray badge on
+    /// Linux needs its own `com.canonical.Unity.LauncherEntry`, WI-433.)
+    #[test]
+    fn tao_has_no_portal_reading_of_its_own() {
+        let tao = lock_dependencies(include_str!("../../Cargo.lock"), "tao");
+        assert!(tao.contains(&"gtk"), "tao's dependencies, as read: {tao:?}");
+        assert!(
+            !tao.iter()
+                .any(|dependency| *dependency == "dbus" || dependency.starts_with("dbus ")),
+            "tao's `dbus` feature is on: a dependency takes tauri, tauri-runtime-wry or tao with \
+             default features ({tao:?})"
+        );
     }
 
     /// `theme_apply`: the explicit theme, or System as this OS resolves it — on Linux from the

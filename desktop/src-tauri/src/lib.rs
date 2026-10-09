@@ -203,20 +203,95 @@ mod tests {
         );
     }
 
+    /// `run`, as this file spells it.
+    fn run_fn() -> syn::ItemFn {
+        let file = syn::parse_file(include_str!("lib.rs")).unwrap();
+        file.items
+            .into_iter()
+            .find_map(|item| match item {
+                syn::Item::Fn(f) if f.sig.ident == "run" => Some(f),
+                _ => None,
+            })
+            .expect("fn run")
+    }
+
+    /// The path of the function a statement calls, through a `?`: `["app", "install"]` for
+    /// `app::install(..)?;`.
+    fn called(stmt: &syn::Stmt) -> Option<(Vec<String>, &syn::ExprCall)> {
+        let syn::Stmt::Expr(expr, _) = stmt else {
+            return None;
+        };
+        let expr = match expr {
+            syn::Expr::Try(attempt) => &*attempt.expr,
+            expr => expr,
+        };
+        let syn::Expr::Call(call) = expr else {
+            return None;
+        };
+        let syn::Expr::Path(path) = &*call.func else {
+            return None;
+        };
+        let names = path.path.segments.iter().map(|s| s.ident.to_string());
+        Some((names.collect(), call))
+    }
+
+    /// The System theme on Linux needs `theme::start`: it gives the window the stored theme
+    /// before the window exists, and starts the portal's watch. Without it `theme_apply`
+    /// resolves System knowing nothing — light on a dark desktop, the bug it fixed — and no
+    /// other test fails. So `run` calls it on Linux, with the shell's own `appearance` (the one
+    /// `theme_apply` uses), once `app::install` has put the shell in place, and before
+    /// `app.run`, whose event loop builds the window.
+    #[test]
+    fn run_starts_the_theme_on_linux_before_the_window() {
+        let run = run_fn();
+        let stmts = &run.block.stmts;
+        let position = |name: [&str; 2]| {
+            stmts
+                .iter()
+                .position(|stmt| called(stmt).is_some_and(|(path, _)| path == name))
+                .unwrap_or_else(|| panic!("run calls {}", name.join("::")))
+        };
+        let install = position(["app", "install"]);
+        let theme = position(["theme", "start"]);
+        let window = stmts
+            .iter()
+            .position(|stmt| {
+                matches!(stmt, syn::Stmt::Expr(syn::Expr::MethodCall(call), _)
+                    if call.method == "run")
+            })
+            .expect("run ends in app.run");
+        assert!(
+            install < theme && theme < window,
+            "app::install at {install}, theme::start at {theme}, app.run at {window}"
+        );
+        let (_, call) = called(&stmts[theme]).unwrap();
+        let cfg: Vec<String> = call
+            .attrs
+            .iter()
+            .filter(|attr| attr.path().is_ident("cfg"))
+            .map(|attr| attr.meta.require_list().unwrap().tokens.to_string())
+            .collect();
+        assert_eq!(cfg, ["target_os = \"linux\""], "theme::start's cfg");
+        let appearance = match call.args.iter().nth(1) {
+            Some(syn::Expr::Reference(reference)) => match &*reference.expr {
+                syn::Expr::Field(field) => matches!(
+                    (&*field.base, &field.member),
+                    (syn::Expr::Path(base), syn::Member::Named(member))
+                        if base.path.is_ident("shell") && member == "appearance"
+                ),
+                _ => false,
+            },
+            _ => false,
+        };
+        assert!(appearance, "theme::start is given &shell.appearance");
+    }
+
     /// The DMA-BUF restart replaces the process: it is the first statement of `run`, before the
     /// runtime's threads, the log file or the single-instance name exist, so it throws nothing
     /// away and leaves nothing behind.
     #[test]
     fn the_graphics_workaround_is_run_s_first_statement() {
-        let file = syn::parse_file(include_str!("lib.rs")).unwrap();
-        let run = file
-            .items
-            .iter()
-            .find_map(|item| match item {
-                syn::Item::Fn(f) if f.sig.ident == "run" => Some(f),
-                _ => None,
-            })
-            .expect("fn run");
+        let run = run_fn();
         let Some(syn::Stmt::Local(first)) = run.block.stmts.first() else {
             panic!("run's first statement is no `let`");
         };

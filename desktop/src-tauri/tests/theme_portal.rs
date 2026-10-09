@@ -88,24 +88,67 @@ impl Drop for PrivateBus {
     }
 }
 
-/// The portal's settings, as much of them as the watch asks: `ReadOne` for the colour scheme,
-/// which fails as the portal does for a setting it does not have when `scheme` is `None`.
+/// The colour scheme, as a portal that has it answers; the error a portal gives for a setting it
+/// does not have when `scheme` is `None`.
+fn setting(scheme: &Mutex<Option<u32>>, namespace: &str, key: &str) -> zbus::fdo::Result<u32> {
+    match (namespace, key, *scheme.lock().unwrap()) {
+        (APPEARANCE, COLOR_SCHEME, Some(scheme)) => Ok(scheme),
+        _ => Err(zbus::fdo::Error::Failed(format!(
+            "Requested setting {key} not found"
+        ))),
+    }
+}
+
+/// The settings of a portal of 1.17.1 or later, as much of them as the watch asks: `ReadOne`
+/// for the colour scheme.
 struct Settings {
     scheme: Arc<Mutex<Option<u32>>>,
     /// How long `ReadOne` takes to answer.
     delay: Duration,
+    /// A change of the colour scheme the first `ReadOne` makes, and signals, before it answers
+    /// with the scheme it had: a change while the watch reads.
+    change_while_answering: Mutex<Option<u32>>,
 }
 
 #[zbus::interface(name = "org.freedesktop.portal.Settings")]
 impl Settings {
-    fn read_one(&self, namespace: &str, key: &str) -> zbus::fdo::Result<OwnedValue> {
+    async fn read_one(
+        &self,
+        #[zbus(connection)] connection: &zbus::Connection,
+        namespace: &str,
+        key: &str,
+    ) -> zbus::fdo::Result<OwnedValue> {
         thread::sleep(self.delay);
-        match (namespace, key, *self.scheme.lock().unwrap()) {
-            (APPEARANCE, COLOR_SCHEME, Some(scheme)) => Ok(OwnedValue::from(scheme)),
-            _ => Err(zbus::fdo::Error::Failed(format!(
-                "Requested setting {key} not found"
-            ))),
+        let answer = setting(&self.scheme, namespace, key);
+        let change = self.change_while_answering.lock().unwrap().take();
+        if let Some(scheme) = change {
+            *self.scheme.lock().unwrap() = Some(scheme);
+            connection
+                .emit_signal(
+                    None::<&str>,
+                    PATH,
+                    SETTINGS,
+                    "SettingChanged",
+                    &(APPEARANCE, COLOR_SCHEME, Value::U32(scheme)),
+                )
+                .await?;
         }
+        answer.map(OwnedValue::from)
+    }
+}
+
+/// The settings of a portal older than 1.17.1, which has no `ReadOne`: `Read`, whose value comes
+/// inside a second variant.
+struct OldSettings {
+    scheme: Arc<Mutex<Option<u32>>>,
+}
+
+#[zbus::interface(name = "org.freedesktop.portal.Settings")]
+impl OldSettings {
+    fn read(&self, namespace: &str, key: &str) -> zbus::fdo::Result<OwnedValue> {
+        let scheme = setting(&self.scheme, namespace, key)?;
+        OwnedValue::try_from(Value::new(Value::U32(scheme)))
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
     }
 }
 
@@ -121,18 +164,38 @@ impl FakePortal {
     }
 
     fn answering_after(bus: &PrivateBus, scheme: Option<u32>, delay: Duration) -> Self {
+        Self::serving(bus, scheme, |scheme| Settings {
+            scheme,
+            delay,
+            change_while_answering: Mutex::new(None),
+        })
+    }
+
+    /// A portal whose first `ReadOne` changes the scheme to `change`, and signals it, before it
+    /// answers with `scheme`.
+    fn changing_while_answering(bus: &PrivateBus, scheme: u32, change: u32) -> Self {
+        Self::serving(bus, Some(scheme), |scheme| Settings {
+            scheme,
+            delay: Duration::ZERO,
+            change_while_answering: Mutex::new(Some(change)),
+        })
+    }
+
+    /// A portal older than 1.17.1: `Read` only.
+    fn older_than_read_one(bus: &PrivateBus, scheme: Option<u32>) -> Self {
+        Self::serving(bus, scheme, |scheme| OldSettings { scheme })
+    }
+
+    fn serving<I: zbus::object_server::Interface>(
+        bus: &PrivateBus,
+        scheme: Option<u32>,
+        settings: impl FnOnce(Arc<Mutex<Option<u32>>>) -> I,
+    ) -> Self {
         let scheme = Arc::new(Mutex::new(scheme));
+        let settings = settings(scheme.clone());
         let connection = connection::Builder::address(bus.address.as_str())
             .and_then(|builder| builder.name(PORTAL))
-            .and_then(|builder| {
-                builder.serve_at(
-                    PATH,
-                    Settings {
-                        scheme: scheme.clone(),
-                        delay,
-                    },
-                )
-            })
+            .and_then(|builder| builder.serve_at(PATH, settings))
             .and_then(|builder| builder.build())
             .unwrap();
         FakePortal { connection, scheme }
@@ -192,10 +255,13 @@ fn the_first_answer_is_the_portal_s_and_every_change_follows() {
 
 /// Only the colour scheme, as a number, from the portal itself: another setting, another
 /// namespace, a value that is no number, and the same signal from a connection that does not
-/// own the portal's name are each dropped — broadcast, which the bus itself holds back for a
-/// rule naming the portal, and sent to the watch's connection alone, which the bus delivers
-/// whoever sends it (only the watch's own check of the sender stops that one). The portal's
-/// own change after them is the control: the one answer heard.
+/// own the portal's name are each dropped. The forger's signal is sent three ways: broadcast,
+/// which the bus itself holds back for a rule naming the portal; to the watch's connection
+/// alone, which the bus delivers whoever sends it and zbus drops for its sender; and to the
+/// watch's connection alone after a `NameOwnerChanged` there naming the forger the portal's
+/// owner, which the bus delivers too and zbus drops, taking that signal only from the bus
+/// itself (`theme::portal`'s module docs) — so the watch neither follows the forger nor reads
+/// again. The portal's own change after them is the control: the one answer heard.
 #[test]
 fn only_the_portal_s_own_colour_scheme_is_heard() {
     let bus = PrivateBus::start();
@@ -222,33 +288,77 @@ fn only_the_portal_s_own_colour_scheme_is_heard() {
         .filter(|name| name.starts_with(':') && !ours.contains(name))
         .collect();
     assert!(!others.is_empty(), "the watch's connection is on the bus");
-    for name in &others {
+    let forged_scheme = |to: &str| {
         forger
             .emit_signal(
-                Some(name.as_str()),
+                Some(to),
                 PATH,
                 SETTINGS,
                 "SettingChanged",
                 &(APPEARANCE, COLOR_SCHEME, Value::U32(1)),
             )
             .unwrap();
+    };
+    for name in &others {
+        forged_scheme(name);
+    }
+    let forger_name = &ours[0];
+    for name in &others {
+        forger
+            .emit_signal(
+                Some(name.as_str()),
+                "/org/freedesktop/DBus",
+                "org.freedesktop.DBus",
+                "NameOwnerChanged",
+                &(PORTAL, "", forger_name.as_str()),
+            )
+            .unwrap();
+        forged_scheme(name);
     }
 
-    portal.set_scheme(1);
-    assert_eq!(heard.recv_timeout(PATIENCE), Ok(Some(1)));
+    portal.set_scheme(0);
+    assert_eq!(heard.recv_timeout(PATIENCE), Ok(Some(0)));
     assert!(heard.recv_timeout(QUIET).is_err());
 }
 
-/// No portal on the bus: the first answer is "none", at once (nothing starts it), and a
-/// portal that starts later is heard from its first change.
+/// No portal on the bus: the first answer is "none", at once (nothing starts it). A portal that
+/// starts later is read as it takes its name, before it signals any change — a desktop that is
+/// dark already is followed from then on, not from its next switch — and its changes follow.
 #[test]
-fn without_a_portal_the_answer_is_none_and_one_that_starts_later_is_heard() {
+fn without_a_portal_the_answer_is_none_and_one_that_starts_later_is_read() {
     let bus = PrivateBus::start();
     let heard = watch(&bus, portal::CALL_TIMEOUT);
     assert_eq!(heard.recv_timeout(PATIENCE), Ok(None));
     let portal = FakePortal::start(&bus, Some(1));
+    assert_eq!(heard.recv_timeout(PATIENCE), Ok(Some(1)));
     portal.set_scheme(2);
     assert_eq!(heard.recv_timeout(PATIENCE), Ok(Some(2)));
+    assert!(heard.recv_timeout(QUIET).is_err());
+}
+
+/// A portal older than 1.17.1 answers `ReadOne` with `UnknownMethod`: the watch asks `Read`,
+/// which wraps the value in a second variant, and gets the scheme all the same.
+#[test]
+fn a_portal_older_than_read_one_is_read_with_read() {
+    let bus = PrivateBus::start();
+    let portal = FakePortal::older_than_read_one(&bus, Some(1));
+    let heard = watch(&bus, portal::CALL_TIMEOUT);
+    assert_eq!(heard.recv_timeout(PATIENCE), Ok(Some(1)));
+    portal.set_scheme(2);
+    assert_eq!(heard.recv_timeout(PATIENCE), Ok(Some(2)));
+}
+
+/// The scheme changes while the portal answers the first read, which still says the old one:
+/// the change is heard after it, since the watch subscribed before it read. A watch that read
+/// first would have had no rule on the bus for the change, and would end on the old scheme.
+#[test]
+fn a_change_while_the_portal_answers_the_first_read_is_heard_after_it() {
+    let bus = PrivateBus::start();
+    let _portal = FakePortal::changing_while_answering(&bus, 2, 1);
+    let heard = watch(&bus, portal::CALL_TIMEOUT);
+    assert_eq!(heard.recv_timeout(PATIENCE), Ok(Some(2)));
+    assert_eq!(heard.recv_timeout(PATIENCE), Ok(Some(1)));
+    assert!(heard.recv_timeout(QUIET).is_err());
 }
 
 /// A portal that does not have the setting answers "none", and its later changes are heard.

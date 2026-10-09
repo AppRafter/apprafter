@@ -314,11 +314,20 @@ app shares.
     this app.
 - **Theme set to System, but the app does not follow the desktop's light or dark mode.** On
   Linux the app reads the desktop's colour scheme from the XDG desktop portal
-  (`org.freedesktop.portal.Desktop`), at start and whenever it changes. Without a portal, or
-  when the portal has no preference, the app uses `gtk-application-prefer-dark-theme` from
-  your GTK settings (`~/.config/gtk-3.0/settings.ini`) as it was when the app started, and
-  light without that. The log's `the XDG desktop portal's colour scheme` line has the answer:
-  `color_scheme=Some(1)` is dark, `Some(2)` light, `Some(0)` no preference, `None` no answer.
+  (`org.freedesktop.portal.Desktop`) at start, again whenever a portal starts after it, and
+  follows each change the portal announces. A portal older than 1.17.1 is read through its
+  older `Read` method. Without a portal, or when the portal has no preference, the app uses
+  `gtk-application-prefer-dark-theme` from your GTK settings (`~/.config/gtk-3.0/settings.ini`)
+  as it was when the app started, and light without that. A portal that is running but does
+  not answer within 3 seconds counts as none until the scheme changes or the portal restarts.
+  The log says what the app found:
+  - A `the XDG desktop portal's colour scheme` line, at start and each time a portal starts:
+    `color_scheme=Some(1)` is dark, `Some(2)` light, `Some(0)` no preference, and `None` no
+    answer. When the portal answered with an error or not in time, the line before it,
+    `the XDG desktop portal did not say the colour scheme: …`, says which.
+  - A `the desktop's colour scheme cannot be followed (…)` line instead when the app could not
+    reach the session bus or subscribe on it, for example when `DBUS_SESSION_BUS_ADDRESS` names
+    a bus that is gone.
 - **Only the password field, never the system dialog.** Check that the policy is installed
   (`pkaction`, as above), that polkitd is installed and running, that a polkit agent runs in
   your session, and that you run the app as yourself (not with `sudo`) in a local desktop

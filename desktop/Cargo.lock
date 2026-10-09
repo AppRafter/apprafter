@@ -199,6 +199,7 @@ dependencies = [
  "apprafter-os-auth",
  "cli-core",
  "dunce",
+ "futures-lite",
  "gtk",
  "json5",
  "libc",

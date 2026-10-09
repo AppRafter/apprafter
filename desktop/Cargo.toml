@@ -23,7 +23,11 @@ serde          = { version = "1", features = ["derive"] }
 serde_json     = "1"
 # Tauri's default features but `dbus`, which makes tao read the XDG portal's colour scheme itself:
 # once at window creation, blocking the main thread for up to 5 s, and again on every change,
-# forcing it over the app's own theme. src-tauri/src/theme.rs owns the theme on Linux instead.
+# forcing it over the app's own theme. src-tauri/src/theme.rs owns the theme on Linux instead
+# (GOTCHA-107). Keep it off: Cargo unifies features, so any crate in the graph that takes tauri,
+# tauri-runtime-wry or tao with their default features turns it back on, which theme.rs's
+# `tao_has_no_portal_reading_of_its_own` catches in this lock. tao's taskbar badge does not need
+# it (tao loads libunity at run time); the D.5 tray badge needs a LauncherEntry of its own (WI-433).
 tauri          = { version = "~2.12", default-features = false, features = [
     "config-json5",
     "wry",
