@@ -2,7 +2,8 @@
 // One view (a target tab, or the Targets view): its content, and the overlays opened from it.
 // The overlays render beside the content in this positioned frame, so a modal covers the view
 // only, makes the content inert, and hides with its tab (brief §4.3: a "Remove target" confirm
-// must never stay over another tab).
+// must never stay over another tab). Each view is a stacking context of its own (shell.css), so
+// its dialogs stay under Settings, which covers every view.
 import {
   createContext,
   Fragment,
@@ -24,7 +25,13 @@ export function useOverlay(): ShowOverlay {
   return show;
 }
 
-export function ViewFrame({ children }: { children: ReactNode }) {
+export interface ViewFrameProps {
+  /** A tab's view is the panel its tab controls: its id, and the tab's that names it. */
+  panel?: { readonly id: string; readonly labelledBy: string };
+  children: ReactNode;
+}
+
+export function ViewFrame({ panel, children }: ViewFrameProps) {
   const [overlays, setOverlays] = useState<readonly { id: number; node: ReactNode }[]>([]);
   const next = useRef(0);
   const show = useCallback<ShowOverlay>((render) => {
@@ -35,7 +42,10 @@ export function ViewFrame({ children }: { children: ReactNode }) {
   }, []);
   return (
     <OverlayContext value={show}>
-      <div className="view">
+      <div
+        className="view"
+        {...(panel && { role: 'tabpanel', id: panel.id, 'aria-labelledby': panel.labelledBy })}
+      >
         <div className="view-content">{children}</div>
         {overlays.map((overlay) => (
           <Fragment key={overlay.id}>{overlay.node}</Fragment>

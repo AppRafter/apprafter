@@ -92,20 +92,24 @@
   padding-top: 6px;
 }
 
+/* Tabs shrink to their min-width, then the strip scrolls sideways (no scrollbar: the shown tab
+   is scrolled into view, and the trackpad or Shift+wheel reach the rest). */
 .tabs {
   display: flex;
   align-items: flex-end;
   gap: 2px;
   min-width: 0;
-  overflow: hidden;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
 }
 
 .tab {
   position: relative;
   display: flex;
-  flex: none;
+  flex: 0 1 184px;
   align-items: center;
-  width: 184px;
+  min-width: 96px;
   height: var(--h-32);
   margin-bottom: -1px;
   padding: 0 6px 0 0;
@@ -201,9 +205,11 @@
   min-height: 0;
 }
 
+/* A stacking context per view: a tab's dialog layers stay inside it, under Settings. */
 .view {
   position: absolute;
   inset: 0;
+  isolation: isolate;
 }
 
 .view-content {

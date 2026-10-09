@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 import { describe, expect, mock, test } from 'bun:test';
-import { render, screen, within } from '@testing-library/react';
+import { cleanup, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import type { TargetTab, View } from '../state/session';
-import { TabStrip, type TabStripProps } from './TabStrip';
+import { TabStrip, type TabStripProps, tabId, tabPanelId } from './TabStrip';
 
 const TABS: TargetTab[] = [
   { key: 'a', target: 'prod-eu', section: 'overview' },
@@ -65,6 +65,57 @@ describe('TabStrip', () => {
     const tab = screen.getByRole('tab', { name: 'prod-eu' });
     expect(tab.querySelector('.dot')?.getAttribute('data-tone')).toBe('unknown');
     expect(tab.querySelector('.badge')).toBeNull();
+  });
+
+  test('each tab has an id and controls its panel', () => {
+    strip({ kind: 'tab', key: 'a' });
+    const tab = screen.getByRole('tab', { name: 'prod-eu' });
+    expect(tab.id).toBe(tabId('a'));
+    expect(tab.getAttribute('aria-controls')).toBe(tabPanelId('a'));
+  });
+
+  test('one tab stop: the shown tab, or the first while the Targets view shows', () => {
+    strip({ kind: 'tab', key: 'b' });
+    const stops = () =>
+      within(screen.getByRole('tablist'))
+        .getAllByRole('tab')
+        .map((t) => t.tabIndex);
+    expect(stops()).toEqual([-1, 0]);
+    cleanup();
+    strip({ kind: 'targets' });
+    expect(stops()).toEqual([0, -1]);
+  });
+
+  test('the arrow keys, Home and End move to a tab and show it, wrapping at the ends', async () => {
+    const { user, onShow } = strip({ kind: 'tab', key: 'a' });
+    screen.getByRole('tab', { name: 'prod-eu' }).focus();
+    await user.keyboard('{ArrowRight}');
+    expect(document.activeElement).toBe(screen.getByRole('tab', { name: 'staging' }));
+    expect(onShow).toHaveBeenLastCalledWith({ kind: 'tab', key: 'b' });
+    await user.keyboard('{ArrowRight}');
+    expect(document.activeElement).toBe(screen.getByRole('tab', { name: 'prod-eu' }));
+    expect(onShow).toHaveBeenLastCalledWith({ kind: 'tab', key: 'a' });
+    await user.keyboard('{ArrowLeft}');
+    expect(onShow).toHaveBeenLastCalledWith({ kind: 'tab', key: 'b' });
+    await user.keyboard('{Home}');
+    expect(onShow).toHaveBeenLastCalledWith({ kind: 'tab', key: 'a' });
+    await user.keyboard('{End}');
+    expect(document.activeElement).toBe(screen.getByRole('tab', { name: 'staging' }));
+    expect(onShow).toHaveBeenLastCalledWith({ kind: 'tab', key: 'b' });
+  });
+
+  test('the shown tab is scrolled into view, so one past the window width is reachable', () => {
+    const scrolled: Element[] = [];
+    const original = HTMLElement.prototype.scrollIntoView;
+    HTMLElement.prototype.scrollIntoView = function (this: HTMLElement) {
+      scrolled.push(this);
+    };
+    try {
+      strip({ kind: 'tab', key: 'b' });
+      expect(scrolled).toContain(screen.getByRole('tab', { name: 'staging' }));
+    } finally {
+      HTMLElement.prototype.scrollIntoView = original;
+    }
   });
 
   test('a spinner replaces the dot while an operation runs on that target', () => {

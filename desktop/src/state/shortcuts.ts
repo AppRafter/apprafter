@@ -31,14 +31,19 @@ function typingIn(target: EventTarget | null): boolean {
   );
 }
 
-/** The action a key press asks for; while typing in a field, only the lock. */
+/** A modal dialog holds the focus: switching views or opening Settings would go behind it. */
+function inDialog(target: EventTarget | null): boolean {
+  return target instanceof Element && target.closest('[aria-modal="true"]') !== null;
+}
+
+/** The action a key press asks for; while typing in a field or in a dialog, only the lock. */
 export function shortcutFor(event: KeyLike, os: Os): ShortcutAction | null {
   const mod = os === 'macos' ? event.metaKey : event.ctrlKey;
   const other = os === 'macos' ? event.ctrlKey : event.metaKey;
   if (!mod || other || event.altKey || event.shiftKey) return null;
   const action = Object.hasOwn(KEYS, event.code) ? KEYS[event.code]?.action : undefined;
   if (action === undefined) return null;
-  if (action !== 'lock' && typingIn(event.target)) return null;
+  if (action !== 'lock' && (typingIn(event.target) || inDialog(event.target))) return null;
   return action;
 }
 

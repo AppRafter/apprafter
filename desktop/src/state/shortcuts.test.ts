@@ -45,6 +45,17 @@ describe('shortcutFor', () => {
     expect(shortcutFor(key('Comma', { ctrlKey: true }, area), 'windows')).toBeNull();
     expect(shortcutFor(key('KeyL', { ctrlKey: true }, input), 'windows')).toBe('lock');
   });
+
+  test('while a dialog holds the focus only the lock fires', () => {
+    const dialog = document.createElement('div');
+    dialog.setAttribute('role', 'dialog');
+    dialog.setAttribute('aria-modal', 'true');
+    const button = document.createElement('button');
+    dialog.append(button);
+    expect(shortcutFor(key('KeyT', { ctrlKey: true }, button), 'windows')).toBeNull();
+    expect(shortcutFor(key('Comma', { ctrlKey: true }, dialog), 'windows')).toBeNull();
+    expect(shortcutFor(key('KeyL', { ctrlKey: true }, button), 'windows')).toBe('lock');
+  });
 });
 
 test('hints read the way each OS writes shortcuts', () => {

@@ -1,7 +1,14 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
-// The open targets as tabs (brief §2): 184px each, health dot (unknown until the notifier
-// measures it, D.5), name, approvals badge (hidden at zero), close; and "+" for the Targets
-// view. A spinner replaces the dot while an operation runs on that target.
+// The open targets as tabs (brief §2): health dot (unknown until the notifier measures it,
+// D.5), name, approvals badge (hidden at zero), close; and "+" for the Targets view. A spinner
+// replaces the dot while an operation runs on that target.
+//
+// A tab is 184px and shrinks to 96px when the strip is full; past that the strip scrolls
+// sideways, and the shown tab is scrolled into view, so every tab stays reachable and its close
+// button usable. The keyboard follows the ARIA tabs pattern: one tab stop (the shown tab, or
+// the first while the Targets view shows), the arrow keys, Home and End move to a tab and show
+// it, wrapping at the ends. Each tab controls its view, the tab panel with tabPanelId(key).
+import { type KeyboardEvent, useEffect, useRef } from 'react';
 import { Badge } from '../components/Badge';
 import { Dot } from '../components/Dot';
 import { IconButton } from '../components/IconButton';
@@ -9,6 +16,10 @@ import { PlusIcon, SpinnerGapIcon, XIcon } from '../components/icons';
 import type { Os } from '../ipc/generated/Os';
 import type { TargetTab, View } from '../state/session';
 import { shortcutHint } from '../state/shortcuts';
+
+/** The id of a tab's tab element, and of the panel (its view) it controls. */
+export const tabId = (key: string) => `tab-${key}`;
+export const tabPanelId = (key: string) => `tabpanel-${key}`;
 
 export interface TabStripProps {
   tabs: readonly TargetTab[];
@@ -33,19 +44,52 @@ export function TabStrip({
   onClose,
   onNewTab,
 }: TabStripProps) {
+  const elements = useRef(new Map<string, HTMLButtonElement>());
+  const shown = view.kind === 'tab' ? view.key : null;
+  const stop = shown ?? tabs[0]?.key ?? null;
+
+  useEffect(() => {
+    if (shown !== null) {
+      elements.current.get(shown)?.scrollIntoView?.({ block: 'nearest', inline: 'nearest' });
+    }
+  }, [shown]);
+
+  const onKeyDown = (event: KeyboardEvent, index: number) => {
+    const last = tabs.length - 1;
+    const target = {
+      ArrowRight: index === last ? 0 : index + 1,
+      ArrowLeft: index === 0 ? last : index - 1,
+      Home: 0,
+      End: last,
+    }[event.key];
+    const tab = target === undefined ? undefined : tabs[target];
+    if (tab === undefined) return;
+    event.preventDefault();
+    elements.current.get(tab.key)?.focus();
+    onShow({ kind: 'tab', key: tab.key });
+  };
+
   return (
     <div className="tabstrip">
       <div className="tabs" role="tablist" aria-label="Open clusters">
-        {tabs.map((tab) => {
-          const selected = view.kind === 'tab' && view.key === tab.key;
+        {tabs.map((tab, index) => {
+          const selected = tab.key === shown;
           return (
             <div key={tab.key} className="tab" data-selected={selected || undefined}>
               <button
+                ref={(element) => {
+                  if (element === null) elements.current.delete(tab.key);
+                  else elements.current.set(tab.key, element);
+                }}
                 type="button"
                 role="tab"
+                id={tabId(tab.key)}
                 aria-selected={selected}
+                aria-controls={tabPanelId(tab.key)}
+                tabIndex={tab.key === stop ? 0 : -1}
                 className="tab-main"
                 onClick={() => onShow({ kind: 'tab', key: tab.key })}
+                onKeyDown={(event) => onKeyDown(event, index)}
               >
                 {running.has(tab.target) ? (
                   <span className="tab-status" role="img" aria-label="An operation is running">

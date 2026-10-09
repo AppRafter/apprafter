@@ -174,6 +174,42 @@ describe('Shell', () => {
     );
   });
 
+  test('each tab controls its view: a tab panel named by the tab', async () => {
+    const user = shell();
+    await user.click(screen.getByRole('button', { name: /prod-eu/ }));
+    const prod = tab('prod-eu');
+    const panel = document.getElementById(prod.getAttribute('aria-controls') ?? '');
+    expect(panel?.getAttribute('role')).toBe('tabpanel');
+    expect(panel?.getAttribute('aria-labelledby')).toBe(prod.id);
+    expect(panel?.contains(screen.getByRole('heading', { level: 1 }))).toBe(true);
+  });
+
+  test('while a dialog holds the focus, Ctrl+T and Ctrl+, leave it be; Ctrl+L still locks', async () => {
+    summaries = [
+      { opId: 1, title: 'Upgrade platform', target: 'prod-eu', state: 'running', startedAtMs: 1 },
+    ];
+    const user = shell();
+    await act(() => refreshList());
+    await user.click(screen.getByRole('button', { name: /prod-eu/ }));
+    // A tab's own dialog.
+    await user.click(screen.getByRole('button', { name: '1 running' }));
+    const sheet = screen.getByRole('dialog', { name: 'Running operations' });
+    expect(sheet.contains(document.activeElement)).toBe(true);
+    await user.keyboard('{Control>}t{/Control}');
+    expect(tab(/prod-eu/).getAttribute('aria-selected')).toBe('true');
+    await user.keyboard('{Control>}[Comma]{/Control}');
+    expect(screen.queryByRole('dialog', { name: 'Settings' })).toBeNull();
+    await user.keyboard('{Escape}');
+    // Settings over everything.
+    await user.keyboard('{Control>}[Comma]{/Control}');
+    expect(await screen.findByRole('dialog', { name: 'Settings' })).toBeDefined();
+    await user.keyboard('{Control>}t{/Control}');
+    expect(tab(/prod-eu/).getAttribute('aria-selected')).toBe('true');
+    expect(screen.getByRole('dialog', { name: 'Settings' })).toBeDefined();
+    await user.keyboard('{Control>}l{/Control}');
+    expect(calls).toContain('lock_now');
+  });
+
   test('closing the shown tab shows its neighbour, and the last one the Targets view', async () => {
     const user = shell();
     await user.click(screen.getByRole('button', { name: /prod-eu/ }));
@@ -195,7 +231,8 @@ describe('Shell', () => {
     await user.click(screen.getByRole('button', { name: /prod-eu/ }));
     await user.click(screen.getByRole('button', { name: '1 running' }));
     expect(screen.getByRole('dialog', { name: 'Running operations' })).toBeDefined();
-    await user.keyboard('{Control>}t{/Control}');
+    // The tab strip stays in reach of a tab's dialog (the shortcuts do not, see below).
+    await user.click(screen.getByRole('button', { name: 'Open a cluster' }));
     expect(screen.queryByRole('dialog', { name: 'Running operations' })).toBeNull();
     await user.click(tab(/prod-eu/));
     expect(

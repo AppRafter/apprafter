@@ -19,7 +19,7 @@ import { TabContext } from '../state/tab';
 import { ScreenShown } from './reveal';
 import { SettingsDialog } from './SettingsDialog';
 import { Sidebar } from './Sidebar';
-import { TabStrip } from './TabStrip';
+import { TabStrip, tabId, tabPanelId } from './TabStrip';
 import { TitleBar } from './TitleBar';
 import { ViewFrame } from './ViewFrame';
 
@@ -113,7 +113,7 @@ export function Shell() {
           return (
             <Activity key={tab.key} mode={shown ? 'visible' : 'hidden'}>
               <TabContext value={{ tab, active: shown }}>
-                <ViewFrame>
+                <ViewFrame panel={{ id: tabPanelId(tab.key), labelledBy: tabId(tab.key) }}>
                   {sidebar(tab)}
                   <main className="main">
                     <PlannedSection section={tab.section} target={tab.target} />
