@@ -71,8 +71,11 @@ pub enum Commands {
         /// to the active target.
         #[arg(long)]
         target: Option<String>,
-        /// Skip the checks that contact the provider or the node: the
-        /// Hetzner Cloud API ping and the node's SSH port. Also settable
+        /// Skip two checks: the token's verification against the
+        /// Hetzner Cloud API, and the node's SSH port (which asks that
+        /// API for the node's address first). The Kubernetes API check
+        /// still runs when a kubeconfig is cached, and connects to the
+        /// cluster's API server; the DNS lookup runs too. Also settable
         /// via `APPRAFTER_NO_PING`, which takes a boolish value: `1`
         /// `true` `yes` `y` `t` `on` skip them, `0` `false` `no` `n` `f`
         /// `off` keep them. Any other value, including the empty
