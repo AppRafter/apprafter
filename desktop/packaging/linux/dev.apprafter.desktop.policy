@@ -4,8 +4,8 @@
  "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
 <!--
   The polkit actions AppRafter Desktop asks for (apprafter-os-auth, src/linux/polkit.rs).
-  Installed by the deb and rpm packages into /usr/share/polkit-1/actions/ (D.13); a build
-  without it reports PolicyMissing and falls back to PAM.
+  The deb and rpm packages install it into /usr/share/polkit-1/actions/ (bundle.linux in
+  src-tauri/tauri.conf.json5); without it the app reports PolicyMissing and falls back to PAM.
 
   auth_self: the user proves it is them with their own password, never an administrator's
   (auth_admin), and never with a grant kept for minutes afterwards (auth_self_keep). Nothing

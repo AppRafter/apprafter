@@ -52,5 +52,25 @@
     active: true,
     icon: ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico"],
     macOS: { minimumSystemVersion: "13.0" },
+    // Tauri adds WebKitGTK and GTK to `depends` itself; PAM is the app's own (its password
+    // field links -lpam), named by soname for rpm as Tauri names its own. The polkit policy
+    // goes where every polkit version reads actions. polkitd is recommended, not required:
+    // without it the app's password field checks through PAM.
+    linux: {
+      deb: {
+        depends: ["libpam0g"],
+        recommends: ["polkitd"],
+        files: {
+          "/usr/share/polkit-1/actions/dev.apprafter.desktop.policy": "../packaging/linux/dev.apprafter.desktop.policy",
+        },
+      },
+      rpm: {
+        depends: ["libpam.so.0()(64bit)"],
+        recommends: ["polkit"],
+        files: {
+          "/usr/share/polkit-1/actions/dev.apprafter.desktop.policy": "../packaging/linux/dev.apprafter.desktop.policy",
+        },
+      },
+    },
   },
 }
