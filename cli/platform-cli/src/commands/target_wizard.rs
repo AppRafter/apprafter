@@ -311,10 +311,12 @@ fn prompt_token(
 
         // Validate up-front so the user gets the error attached to
         // the flag (`--token` or `HCLOUD_TOKEN` env) rather than a
-        // surprise mid-wizard prompt.
-        if let Err(reason) = validate_for_provider(provider, tok) {
-            return Err(CliError::Other(reason).into());
-        }
+        // surprise mid-wizard prompt — the flag path's own checks
+        // (`plan_add`), so the refusal is the same typed
+        // `apprafter::target::invalid_token` with the same text.
+        crate::commands::target::check_provider(provider)?;
+        apprafter_core::provider::TokenProblem::check(tok)
+            .map_err(|problem| CoreError::InvalidToken { problem })?;
         let verified = if no_ping {
             false
         } else {
@@ -1261,22 +1263,36 @@ mod tests {
         }
     }
 
-    /// A malformed prefilled token is rejected up front, attached
-    /// to the flag that carried it, instead of surviving into the
-    /// target store or surfacing as a confusing mid-wizard prompt.
+    /// A malformed prefilled token (`--token` or `HCLOUD_TOKEN`) is rejected up front, before
+    /// any API call, with the refusal the flag-driven path gives: the core's
+    /// `apprafter::target::invalid_token`, the same message (bugs 2: the wizard gave the
+    /// catch-all `apprafter::cli::other` with its "file an issue" help).
     #[test]
-    fn prompt_token_rejects_a_malformed_prefill_before_any_api_call() {
+    fn prompt_token_refuses_a_malformed_prefill_as_the_flag_path_does() {
         let dir = tempfile::tempdir().unwrap();
-        let err = prompt_token(
-            &ctx_with_home(dir.path()),
-            "hetzner-cloud",
-            Some("too-short"),
-            TokenSource::Flag,
-            true,
-        )
-        .expect_err("a 9-char token is not a Hetzner token");
-        let msg = err.to_string();
-        assert!(msg.contains("64"), "{msg}");
+        for (token, source) in [
+            ("too-short", TokenSource::Flag),
+            ("too-short", TokenSource::Env),
+            (&*format!("{}-", "a".repeat(63)), TokenSource::Flag),
+        ] {
+            let err = prompt_token(
+                &ctx_with_home(dir.path()),
+                "hetzner-cloud",
+                Some(token),
+                source,
+                false,
+            )
+            .expect_err("not a Hetzner token");
+            assert_eq!(
+                UiError::from(&err).code.as_deref(),
+                Some("apprafter::target::invalid_token"),
+                "{source:?}: {err:?}"
+            );
+            let flag_path = CoreError::InvalidToken {
+                problem: apprafter_core::provider::TokenProblem::check(token).unwrap_err(),
+            };
+            assert_eq!(err.to_string(), flag_path.to_string(), "{source:?}");
+        }
     }
 
     /// A supplied SSH key is taken as-is: no `~/.ssh` scan, no
