@@ -16,7 +16,27 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use apprafter_core::{ChangeAction, Outcome, PlanClass, PlannedChange};
+use apprafter_core::doctor::{
+    Check, CheckFix, CheckGroup, CheckId, CheckStatus, DoctorReport, GroupId, RenewWhy,
+};
+use apprafter_core::kube::{KubeErrorKind, KubeVersion};
+use apprafter_core::machine::{
+    DeprecationView, MachineCatalogue, MachineOfferView, RegionLatency, RegionView,
+};
+use apprafter_core::provider::{SkipReason, TokenCheck, Verification};
+use apprafter_core::session::{CliDefaultTarget, Identity, WhoamiReport, WhoamiTarget};
+use apprafter_core::ssh::{SshKeyCandidate, SshKeyInfo};
+use apprafter_core::target::{
+    CliDefaultPointer, MachineSet, ProvisionedServer, ProvisionedState, PublicAddress, SkuCheck,
+    TargetAdded, TargetListReport, TargetRemoved, TargetRenamed, TargetRenewed, TargetReport,
+    TargetSummary, TargetUsed, TokenPresence, UnreadableTarget,
+};
+use apprafter_core::tools::{
+    HintOs, InstallHint, ToolId, ToolProblem, ToolStatus, ToolchainReport,
+};
+use apprafter_core::{
+    ActivePointerChange, ChangeAction, Outcome, PathSource, PlanClass, PlannedChange,
+};
 use apprafter_desktop_ipc::{
     errors, AppInfo, AuthInfo, AuthMethod, AuthOutcome, AutoLock, CancelledBy, LockReason,
     LockState, OpEvent, OpId, OpState, OpSummary, Os, OutputStream, PlanView, Quitting, Refresh,
@@ -66,6 +86,15 @@ fn export_the_typescript_bindings() {
         Quitting,
         // apprafter-core, as OpEvent and PlanView carry them
         UiError, PlanClass, PlannedChange, ChangeAction, Outcome<serde_json::Value>,
+        // apprafter-core, D.3 (overview §3.5–§3.9)
+        ActivePointerChange, PathSource, TargetSummary, UnreadableTarget, CliDefaultPointer,
+        TargetListReport, ProvisionedServer, ProvisionedState, TokenPresence, TargetReport,
+        PublicAddress, SkuCheck, TargetAdded, TargetRenewed, TargetUsed, TargetRenamed, TargetRemoved,
+        MachineSet, TokenCheck, Verification, SkipReason, RegionView, DeprecationView,
+        MachineOfferView, MachineCatalogue, RegionLatency, SshKeyInfo, SshKeyCandidate, Identity,
+        WhoamiTarget, CliDefaultTarget, WhoamiReport, ToolId, HintOs, InstallHint, ToolProblem,
+        ToolStatus, ToolchainReport, GroupId, CheckStatus, CheckId, RenewWhy, CheckFix, Check,
+        CheckGroup, DoctorReport, KubeErrorKind, KubeVersion,
     );
     fs::write(tmp.path().join("commands.ts"), commands_ts()).unwrap();
     fs::write(tmp.path().join("errors.ts"), errors_ts()).unwrap();
