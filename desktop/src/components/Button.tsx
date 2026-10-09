@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
-import type { ButtonHTMLAttributes } from 'react';
+import type { ButtonHTMLAttributes, Ref } from 'react';
 import type { Icon } from './icons';
 
 export type ButtonVariant = 'primary' | 'secondary' | 'danger' | 'danger-solid' | 'ghost';
@@ -13,6 +13,8 @@ export interface ButtonProps extends Omit<ButtonHTMLAttributes<HTMLButtonElement
   type?: 'button' | 'submit';
   /** Full width (the lock screen's Unlock). */
   full?: boolean;
+  /** The button element, to move the focus to it. */
+  ref?: Ref<HTMLButtonElement>;
 }
 
 /** The design's B(): primary, secondary, danger (outline), danger-solid, ghost (row action). */

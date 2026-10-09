@@ -62,6 +62,20 @@ async function onFakeTime(body: () => Promise<void>) {
   }
 }
 
+/**
+ * What a browser does to a control that is disabled while it has the focus: it loses it.
+ * happy-dom keeps it there and ignores blur() on a disabled control, so the tests move the focus
+ * to a throwaway input and remove it, which leaves it on the body.
+ */
+const loseFocus = () =>
+  act(() => {
+    const elsewhere = document.createElement('input');
+    document.body.append(elsewhere);
+    elsewhere.focus();
+    elsewhere.remove();
+    expect(document.activeElement).toBe(document.body);
+  });
+
 /** Let a refused onConfirm reach the dialog: its promise chain settles in microtasks. */
 const settled = () =>
   act(async () => {
@@ -248,6 +262,7 @@ describe('ConfirmDialog where the OS cannot prompt: the password field', () => {
       );
       expect(password().disabled).toBe(true);
       expect(confirm().disabled).toBe(true);
+      loseFocus();
       act(() => jest.advanceTimersByTime(500));
       expect(screen.getByRole('alert').textContent).toBe(
         'Too many failed attempts. Try again in 1 s.',

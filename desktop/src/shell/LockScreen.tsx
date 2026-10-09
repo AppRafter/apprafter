@@ -72,6 +72,15 @@ export function LockScreen({ state }: LockScreenProps) {
   const backoff = retryIn !== null;
   const method = info.auth.method;
 
+  // The Unlock button the back-off disabled lost the focus: it gets it back once the back-off
+  // ends, as the field does.
+  const unlockButton = useRef<HTMLButtonElement>(null);
+  const wasBackoff = useRef(false);
+  useEffect(() => {
+    if (wasBackoff.current && !backoff) unlockButton.current?.focus();
+    wasBackoff.current = backoff;
+  }, [backoff]);
+
   const refused = (error: unknown, viaField: boolean) => {
     const said = authRefusal(uiErrorOf(error), viaField);
     setRefusal(said.lines);
@@ -141,6 +150,7 @@ export function LockScreen({ state }: LockScreenProps) {
         ) : (
           <>
             <Button
+              ref={unlockButton}
               variant="primary"
               size={36}
               full

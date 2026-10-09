@@ -76,6 +76,20 @@ async function onFakeTime(body: () => Promise<void>) {
   }
 }
 
+/**
+ * What a browser does to a control that is disabled while it has the focus: it loses it.
+ * happy-dom keeps it there and ignores blur() on a disabled control, so the tests move the focus
+ * to a throwaway input and remove it, which leaves it on the body.
+ */
+const loseFocus = () =>
+  act(() => {
+    const elsewhere = document.createElement('input');
+    document.body.append(elsewhere);
+    elsewhere.focus();
+    elsewhere.remove();
+    expect(document.activeElement).toBe(document.body);
+  });
+
 const alertLines = () =>
   [...screen.getByRole('alert').children].map((line) => line.textContent ?? '');
 
@@ -162,9 +176,12 @@ describe('LockScreen', () => {
       await settled();
       expect(alertLines()).toEqual(['Too many failed attempts. Try again in 2 s.']);
       expect(unlockButton().disabled).toBe(true);
+      loseFocus();
       act(() => jest.advanceTimersByTime(1_200));
       expect(screen.queryByRole('alert')).toBeNull();
       expect(unlockButton().disabled).toBe(false);
+      // A disabled button lost the focus: it gets it back, as the field does.
+      expect(document.activeElement).toBe(unlockButton());
     }));
 
   test("the OS's own lockout through its prompt says so, and Unlock stays", async () => {
@@ -296,6 +313,7 @@ describe('LockScreen where the OS cannot prompt: the password field', () => {
       ]);
       expect(passwordInput().disabled).toBe(true);
       expect(unlockButton().disabled).toBe(true);
+      loseFocus();
       act(() => jest.advanceTimersByTime(500));
       expect(alertLines()[1]).toBe('Too many failed attempts. Try again in 2 s.');
       act(() => jest.advanceTimersByTime(1_000));
