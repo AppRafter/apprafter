@@ -301,6 +301,20 @@ fn doctor_summary_line_phrases_outcomes_clearly() {
 #[cfg(unix)]
 #[test]
 fn ctrl_c_stops_doctor_and_kills_the_tool_it_was_probing() {
+    a_signal_stops_doctor_and_kills_the_tool_it_was_probing(libc::SIGINT, 130);
+}
+
+/// Start doctor with a tool probe that hangs, send it `signal` about a second in, and assert
+/// it exits `code` at once, prints no report and leaves no probe running.
+///
+/// Review finding 8: doctor keeps a signal it was started with ignored, and a test started as
+/// a background job of a non-interactive shell (`cargo test … &`) has SIGINT ignored, which
+/// `Command` passes on. So the child starts with `signal` back at its default disposition, as
+/// it has when a person runs doctor at a terminal: the test is about the handler, not about
+/// how its runner was started.
+#[cfg(unix)]
+fn a_signal_stops_doctor_and_kills_the_tool_it_was_probing(signal: i32, code: i32) {
+    use std::os::unix::process::CommandExt as _;
     use std::time::{Duration, Instant};
 
     use apprafter_core::tools::TOOL_PROBE_TIMEOUT;
@@ -327,7 +341,17 @@ fn ctrl_c_stops_doctor_and_kills_the_tool_it_was_probing() {
         ),
     );
     let started = Instant::now();
-    let mut doctor = std::process::Command::new(env!("CARGO_BIN_EXE_apprafter"))
+    let mut doctor = std::process::Command::new(env!("CARGO_BIN_EXE_apprafter"));
+    // SAFETY: `signal(2)` is async-signal-safe and touches no memory of this process.
+    unsafe {
+        doctor.pre_exec(move || {
+            if libc::signal(signal, libc::SIG_DFL) == libc::SIG_ERR {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut doctor = doctor
         .env("APPRAFTER_CONFIG_DIR", dir.path())
         .env("APPRAFTER_SKIP_STARTUP_CHECKS", "1")
         .env("APPRAFTER_NO_PING", "1")
@@ -356,7 +380,7 @@ fn ctrl_c_stops_doctor_and_kills_the_tool_it_was_probing() {
     std::thread::sleep(Duration::from_secs(1).saturating_sub(started.elapsed()));
     let signalled = Instant::now();
     // SAFETY: a plain kill(2) of the child this test started.
-    assert_eq!(unsafe { libc::kill(doctor.id() as i32, libc::SIGINT) }, 0);
+    assert_eq!(unsafe { libc::kill(doctor.id() as i32, signal) }, 0);
     let exited = loop {
         if doctor.try_wait().unwrap().is_some() {
             break Some(signalled.elapsed());
@@ -386,8 +410,9 @@ fn ctrl_c_stops_doctor_and_kills_the_tool_it_was_probing() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
     );
-    let exited = exited.unwrap_or_else(|| panic!("doctor did not exit after SIGINT:\n{stderr}"));
-    assert_eq!(out.status.code(), Some(130), "{stdout}\n{stderr}");
+    let exited =
+        exited.unwrap_or_else(|| panic!("doctor did not exit after signal {signal}:\n{stderr}"));
+    assert_eq!(out.status.code(), Some(code), "{stdout}\n{stderr}");
     assert!(
         exited < TOOL_PROBE_TIMEOUT - Duration::from_secs(1),
         "doctor took {exited:?} to stop: it waited for the probe's own timeout"
