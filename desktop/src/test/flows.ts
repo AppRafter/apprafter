@@ -5,6 +5,7 @@ import type { Check } from '../ipc/generated/Check';
 import type { DoctorReport } from '../ipc/generated/DoctorReport';
 import type { MachineCatalogue } from '../ipc/generated/MachineCatalogue';
 import type { MachineOfferView } from '../ipc/generated/MachineOfferView';
+import type { ToolchainReport } from '../ipc/generated/ToolchainReport';
 
 export function offer(more: Partial<MachineOfferView> = {}): MachineOfferView {
   return {
@@ -150,5 +151,101 @@ export function doctorReport(target = 'prod-eu'): DoctorReport {
         ],
       },
     ],
+  };
+}
+
+/**
+ * A toolchain probe in the core's tool order, the CLI's purposes and install lines: kubectl found;
+ * helm missing; git the macOS stub without the developer tools (it exits 1, its own words the
+ * reason); ssh timed out (its macOS line is "preinstalled"); cue found only as a `.cmd` shim.
+ */
+export function toolchainReport(): ToolchainReport {
+  return {
+    tools: [
+      {
+        tool: 'kubectl',
+        required: true,
+        purpose: 'talking to the cluster',
+        path: '/usr/bin/kubectl',
+        version: 'Client Version: v1.34.1',
+        problem: null,
+        install: [
+          { os: 'macos', command: 'brew install kubectl' },
+          { os: 'debian', command: 'apt install kubectl' },
+          { os: 'nix', command: 'nix profile install nixpkgs#kubectl' },
+          { os: 'windows', command: 'winget install Kubernetes.kubectl' },
+          { os: 'other', command: 'https://kubernetes.io/docs/tasks/tools/' },
+        ],
+      },
+      {
+        tool: 'helm',
+        required: false,
+        purpose: 'installing platform charts',
+        path: null,
+        version: null,
+        problem: { kind: 'not_found' },
+        install: [
+          { os: 'windows', command: 'winget install Helm.Helm' },
+          { os: 'macos', command: 'brew install helm' },
+          { os: 'debian', command: 'apt install helm' },
+          { os: 'nix', command: 'nix profile install nixpkgs#kubernetes-helm' },
+          { os: 'other', command: 'https://helm.sh/docs/intro/install/' },
+        ],
+      },
+      {
+        tool: 'git',
+        required: false,
+        purpose: 'reading the application repository',
+        path: '/usr/bin/git',
+        version: null,
+        problem: {
+          kind: 'no_version_output',
+          exit: 1,
+          detail:
+            'xcrun: error: invalid active developer path (/Library/Developer/CommandLineTools)',
+        },
+        install: [
+          { os: 'macos', command: 'xcode-select --install' },
+          { os: 'debian', command: 'apt install git' },
+          { os: 'nix', command: 'nix profile install nixpkgs#git' },
+          { os: 'windows', command: 'winget install Git.Git' },
+          { os: 'other', command: 'https://git-scm.com/downloads' },
+        ],
+      },
+      {
+        tool: 'ssh',
+        required: false,
+        purpose: 'reaching the node over SSH',
+        path: '/usr/bin/ssh',
+        version: null,
+        problem: { kind: 'timed_out' },
+        install: [
+          { os: 'macos', command: 'preinstalled' },
+          { os: 'debian', command: 'apt install openssh-client' },
+          { os: 'nix', command: 'nix profile install nixpkgs#openssh' },
+          {
+            os: 'windows',
+            command: 'built into Windows 10/11: Settings › Optional features › OpenSSH Client',
+          },
+        ],
+      },
+      {
+        tool: 'cue',
+        required: false,
+        purpose: 'validating application manifests',
+        path: null,
+        version: null,
+        problem: { kind: 'unsupported', path: 'C:\\tools\\cue.cmd' },
+        install: [
+          { os: 'macos', command: 'brew install cue' },
+          { os: 'arch', command: 'pacman -S cue' },
+          { os: 'nix', command: 'nix profile install nixpkgs#cue' },
+          { os: 'windows', command: 'winget install CueLang.Cue' },
+          { os: 'other', command: 'https://cuelang.org/docs/introduction/installation/' },
+        ],
+      },
+    ],
+    searchPath: ['/usr/local/bin', '/usr/bin'],
+    searchPathSource: 'login_shell',
   };
 }
