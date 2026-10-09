@@ -8,8 +8,17 @@
 //! page draws the caption buttons) and keeps its shadow, which on Windows 11 also rounds the
 //! corners. On macOS the title bar is an overlay with no title, the traffic lights placed in the
 //! page's bar. On Linux the window keeps its native decorations: client-side ones vary across
-//! X11 and Wayland. The window is created hidden and shows when the page has painted
-//! (`window_ready`), or after [`REVEAL_FALLBACK`] if the page never says so.
+//! X11 and Wayland.
+//!
+//! # Showing the window
+//!
+//! The window is created hidden, so it never flashes white, and shows on `window_ready`: the
+//! page sends it once its first screen and its theme are in. Two backstops show it anyway, each
+//! only if it is still hidden (a visibility check that fails counts as hidden): one
+//! [`REVEAL_AFTER_LOAD`] after the page finished loading — the page is there but has not said
+//! so — and one [`REVEAL_FALLBACK`] after the window was built, for a page that never loads.
+//! The first is not at the load itself: the first screen waits on IPC answers that usually come
+//! after it, and showing the window there would show the default dark page before a light one.
 //!
 //! The webview may only ever show the app itself. A link, a redirect or an injected
 //! `location =` that leaves the app origin is refused, and new windows are never opened
@@ -32,7 +41,8 @@ use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
-use tauri::{Manager, Runtime, Url, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+use tauri::webview::PageLoadEvent;
+use tauri::{AppHandle, Manager, Runtime, Url, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
 #[cfg(target_os = "macos")]
 use crate::env;
@@ -44,10 +54,57 @@ pub const MAIN: &str = "main";
 /// page that failed to start must not leave the app running with no window to quit from.
 pub const REVEAL_FALLBACK: Duration = Duration::from_secs(5);
 
-/// Show the window and give it the focus (`window_ready`, and the fallback).
+/// How long after the page finished loading the window waits for `window_ready` before it
+/// shows anyway: long enough for the first screen's IPC answers, short of the fallback.
+pub const REVEAL_AFTER_LOAD: Duration = Duration::from_secs(1);
+
+/// Show the window and give it the focus (`window_ready`, and the backstops).
 pub fn reveal<R: Runtime>(window: &WebviewWindow<R>) -> tauri::Result<()> {
     window.show()?;
     window.set_focus()
+}
+
+/// Is a window whose visibility check answered `visible` still to be shown? A check that
+/// failed counts as hidden: a window shown twice is harmless, one never shown is not.
+fn still_hidden(visible: tauri::Result<bool>) -> bool {
+    !visible.unwrap_or(false)
+}
+
+/// The backstop a page-load event arms: a finished load, [`REVEAL_AFTER_LOAD`] from now.
+fn backstop_after(event: PageLoadEvent) -> Option<Duration> {
+    match event {
+        PageLoadEvent::Finished => Some(REVEAL_AFTER_LOAD),
+        PageLoadEvent::Started => None,
+    }
+}
+
+/// After `after`, show the main window if it is still hidden, saying why (`what` completes
+/// "the page did not report ready ..."). Without a thread to wait on, it shows the window now.
+fn reveal_later<R: Runtime>(app: &AppHandle<R>, after: Duration, what: &'static str) {
+    let handle = app.clone();
+    let spawned = thread::Builder::new()
+        .name("reveal-backstop".into())
+        .spawn(move || {
+            thread::sleep(after);
+            if let Some(window) = handle.get_webview_window(MAIN) {
+                show_if_hidden(&window, what);
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::warn!("no thread for a reveal backstop ({e}); showing the window at once");
+        if let Some(window) = app.get_webview_window(MAIN) {
+            show_if_hidden(&window, "before a backstop could wait");
+        }
+    }
+}
+
+fn show_if_hidden<R: Runtime>(window: &WebviewWindow<R>, what: &str) {
+    if still_hidden(window.is_visible()) {
+        tracing::warn!("the page did not report ready {what}");
+        if let Err(e) = reveal(window) {
+            tracing::error!("the window could not be shown: {e}");
+        }
+    }
 }
 
 /// The dev server `tauri dev` loads (tauri.conf.json5 `build.devUrl`).
@@ -89,7 +146,12 @@ pub fn build_main(app: &tauri::AppHandle, data_dir: Option<&Path>) -> tauri::Res
         .disable_drag_drop_handler()
         .zoom_hotkeys_enabled(false)
         .on_navigation(move |url| is_app_url(url, debug))
-        .on_new_window(|_, _| tauri::webview::NewWindowResponse::Deny);
+        .on_new_window(|_, _| tauri::webview::NewWindowResponse::Deny)
+        .on_page_load(|window, payload| {
+            if let Some(after) = backstop_after(payload.event()) {
+                reveal_later(window.app_handle(), after, "within a second of loading");
+            }
+        });
     #[cfg(target_os = "windows")]
     let window = window.decorations(false).shadow(true);
     // The lights centred in the page's 38px bar (to be tuned on a Mac, D.2f manual list).
@@ -107,28 +169,7 @@ pub fn build_main(app: &tauri::AppHandle, data_dir: Option<&Path>) -> tauri::Res
     #[cfg(not(target_os = "macos"))]
     let _ = data_dir;
     window.build()?;
-    let handle = app.clone();
-    let fallback = thread::Builder::new()
-        .name("reveal-fallback".into())
-        .spawn(move || {
-            thread::sleep(REVEAL_FALLBACK);
-            let Some(window) = handle.get_webview_window(MAIN) else {
-                return;
-            };
-            if !window.is_visible().unwrap_or(true) {
-                tracing::warn!("the page did not report ready within {REVEAL_FALLBACK:?}");
-                if let Err(e) = reveal(&window) {
-                    tracing::error!("the window could not be shown: {e}");
-                }
-            }
-        });
-    if let Err(e) = fallback {
-        // No thread to wait on: show the window now rather than risk never showing it.
-        tracing::warn!("no thread for the reveal fallback ({e}); showing the window at once");
-        if let Some(window) = app.get_webview_window(MAIN) {
-            reveal(&window)?;
-        }
-    }
+    reveal_later(app, REVEAL_FALLBACK, "within 5s of the window opening");
     Ok(())
 }
 
@@ -138,6 +179,23 @@ mod tests {
 
     fn u(s: &str) -> Url {
         Url::parse(s).unwrap()
+    }
+
+    #[test]
+    fn a_failed_visibility_check_counts_as_hidden_so_the_window_shows() {
+        assert!(still_hidden(Err(tauri::Error::WindowNotFound)));
+        assert!(still_hidden(Ok(false)));
+        assert!(!still_hidden(Ok(true)));
+    }
+
+    #[test]
+    fn a_finished_load_arms_the_backstop_before_the_fallback() {
+        assert_eq!(
+            backstop_after(PageLoadEvent::Finished),
+            Some(REVEAL_AFTER_LOAD)
+        );
+        assert_eq!(backstop_after(PageLoadEvent::Started), None);
+        assert!(REVEAL_AFTER_LOAD < REVEAL_FALLBACK);
     }
 
     #[test]
