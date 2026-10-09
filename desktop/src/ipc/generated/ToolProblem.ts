@@ -4,4 +4,4 @@
 /**
  * Why a tool is not usable.
  */
-export type ToolProblem = { "kind": "not_found" } | { "kind": "unsupported", path: string, } | { "kind": "no_version_output", exit: number | null, } | { "kind": "timed_out" } | { "kind": "spawn_failed", error: string, };
+export type ToolProblem = { "kind": "not_found" } | { "kind": "unsupported", path: string, } | { "kind": "no_version_output", exit: number | null, detail: string | null, } | { "kind": "timed_out" } | { "kind": "spawn_failed", error: string, };

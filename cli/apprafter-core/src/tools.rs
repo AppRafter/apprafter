@@ -17,6 +17,13 @@ use crate::CancellationToken;
 /// How long one `--version` probe may take.
 pub const TOOL_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The most a [`ToolProblem::NoVersionOutput`] detail holds, in characters.
+pub const NO_VERSION_DETAIL_MAX_CHARS: usize = 200;
+
+/// A run of at least this many ASCII letters and digits reads as a secret (a Hetzner token is
+/// 64, an age key's body 59) and never reaches a detail.
+const SECRET_RUN_MIN: usize = 32;
+
 /// One external tool, in the CLI's probe order in [`ToolId::ALL`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -112,9 +119,12 @@ pub enum ToolProblem {
         path: String,
     },
     /// It ran but reported no version: it exited non-zero or was killed, whatever it printed
-    /// (an error line is not a version). `exit` is its exit code, when it had one.
+    /// (an error line is not a version). `exit` is its exit code, when it had one; `detail` is
+    /// why, in the tool's words: the first line it printed, stderr first, bounded and never a
+    /// secret ([`NO_VERSION_DETAIL_MAX_CHARS`]), e.g. a mise shim's "No version is set".
     NoVersionOutput {
         exit: Option<i32>,
+        detail: Option<String>,
     },
     TimedOut,
     SpawnFailed {
@@ -332,16 +342,17 @@ impl<'a> ToolResolver<'a> {
         } else {
             status.problem = Some(ToolProblem::NoVersionOutput {
                 exit: out.status.and_then(|s| s.code()),
+                detail: no_version_detail(&out.stderr, &out.stdout),
             });
         }
         status
     }
 }
 
-/// The first non-empty trimmed line of `stdout`, else of `stderr` (doctor's rule, less its
-/// leniency for a failed run).
-fn first_nonempty_line(stdout: &[u8], stderr: &[u8]) -> Option<String> {
-    [stdout, stderr]
+/// The first non-empty trimmed line of `first`, else of `then`: the version is stdout's, then
+/// stderr's (`ssh -V`); a failure's detail is stderr's, then stdout's.
+fn first_nonempty_line(first: &[u8], then: &[u8]) -> Option<String> {
+    [first, then]
         .iter()
         .map(|b| String::from_utf8_lossy(b))
         .find_map(|text| {
@@ -350,6 +361,64 @@ fn first_nonempty_line(stdout: &[u8], stderr: &[u8]) -> Option<String> {
                 .find(|l| !l.is_empty())
                 .map(str::to_string)
         })
+}
+
+/// Why a tool reported no version (decision 3 of the D.3a review): its first non-empty line,
+/// stderr first, with control characters and terminal escapes dropped (the CLI prints it, the
+/// desktop shows it), every run of [`SECRET_RUN_MIN`]+ ASCII letters and digits replaced with
+/// `[redacted]` (the child inherits the CLI's environment, a broken shim can print anything),
+/// then cut to [`NO_VERSION_DETAIL_MAX_CHARS`] characters — redacted before it is cut, so no
+/// secret survives as a shorter run. `None` when it printed nothing.
+fn no_version_detail(stderr: &[u8], stdout: &[u8]) -> Option<String> {
+    let line = first_nonempty_line(stderr, stdout)?;
+    let printable = strip_controls(&line);
+    let line = redact_secret_runs(printable.trim());
+    let detail: String = line.chars().take(NO_VERSION_DETAIL_MAX_CHARS).collect();
+    (!detail.is_empty()).then_some(detail)
+}
+
+/// `text` without control characters; an ANSI CSI escape (`ESC [ … final byte`) goes whole.
+fn strip_controls(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next();
+            // Parameter and intermediate bytes, then one final byte in `@`..=`~`.
+            for c in chars.by_ref() {
+                if ('@'..='~').contains(&c) {
+                    break;
+                }
+            }
+        } else if !c.is_control() {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// `text` with each run of [`SECRET_RUN_MIN`] or more ASCII letters and digits replaced.
+fn redact_secret_runs(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut run = String::new();
+    let flush = |run: &mut String, out: &mut String| {
+        if run.len() >= SECRET_RUN_MIN {
+            out.push_str("[redacted]");
+        } else {
+            out.push_str(run);
+        }
+        run.clear();
+    };
+    for c in text.chars() {
+        if c.is_ascii_alphanumeric() {
+            run.push(c);
+        } else {
+            flush(&mut run, &mut out);
+            out.push(c);
+        }
+    }
+    flush(&mut run, &mut out);
+    out
 }
 
 /// Every tool probed concurrently, each bounded by [`TOOL_PROBE_TIMEOUT`], in
@@ -534,9 +603,73 @@ mod tests {
         );
         assert_eq!(
             (kubectl.version, kubectl.problem),
-            (None, Some(ToolProblem::NoVersionOutput { exit: Some(1) }))
+            (
+                None,
+                Some(ToolProblem::NoVersionOutput {
+                    exit: Some(1),
+                    // Decision 3: the row says why.
+                    detail: Some("mise ERROR No version is set for command kubectl".into()),
+                })
+            )
         );
         assert!(kubectl.path.is_some(), "it was found, and ran");
+    }
+
+    #[test]
+    fn no_version_output_carries_its_detail_on_the_wire() {
+        assert_eq!(
+            serde_json::to_value(ToolProblem::NoVersionOutput {
+                exit: Some(1),
+                detail: Some("why".into()),
+            })
+            .unwrap(),
+            serde_json::json!({"kind": "no_version_output", "exit": 1, "detail": "why"})
+        );
+    }
+
+    #[test]
+    fn the_detail_is_the_first_line_stderr_first_trimmed() {
+        assert_eq!(
+            no_version_detail(b"\n  \n  shim: no version set  \nmore\n", b"usage: x\n"),
+            Some("shim: no version set".into())
+        );
+        assert_eq!(
+            no_version_detail(b"", b"\n usage: x \n"),
+            Some("usage: x".into()),
+            "stdout when stderr is empty"
+        );
+        assert_eq!(no_version_detail(b" \n", b""), None, "nothing printed");
+    }
+
+    #[test]
+    fn the_detail_is_bounded_and_printable() {
+        let long = "e".repeat(10) + " " + &"x ".repeat(300);
+        let got = no_version_detail(long.as_bytes(), b"").unwrap();
+        assert_eq!(got.chars().count(), NO_VERSION_DETAIL_MAX_CHARS);
+        // A tool's colours and other control characters never reach a terminal or the GUI.
+        assert_eq!(
+            no_version_detail(b"\x1b[31mmise ERROR\x1b[0m no\x07 version", b"").as_deref(),
+            Some("mise ERROR no version")
+        );
+    }
+
+    #[test]
+    fn the_detail_never_shows_a_token_shaped_run() {
+        // The child inherits the CLI's environment (HCLOUD_TOKEN included), and a broken shim can
+        // print anything: a run of 32+ ASCII letters and digits — a Hetzner token, an age key —
+        // is never shown, wherever it falls against the length bound.
+        let token = "a".repeat(64);
+        let got = no_version_detail(format!("bad token {token} here").as_bytes(), b"").unwrap();
+        assert_eq!(got, "bad token [redacted] here");
+        let at_the_edge = format!("{} {token}", "p".repeat(180));
+        let got = no_version_detail(at_the_edge.as_bytes(), b"").unwrap();
+        assert!(!got.contains("aaaaaaaa"), "{got}");
+        // Shorter runs (words, versions, short hashes) stay.
+        let short = "v1.31.0 deadbeefdeadbeef";
+        assert_eq!(
+            no_version_detail(short.as_bytes(), b"").as_deref(),
+            Some(short)
+        );
     }
 
     /// A script whose `#!` interpreter is absent (or a binary whose dynamic loader is): the
