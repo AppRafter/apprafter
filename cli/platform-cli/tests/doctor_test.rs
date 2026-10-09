@@ -304,6 +304,16 @@ fn ctrl_c_stops_doctor_and_kills_the_tool_it_was_probing() {
     a_signal_stops_doctor_and_kills_the_tool_it_was_probing(libc::SIGINT, 130);
 }
 
+/// Review finding 6: closing the terminal sends SIGHUP, which the probe (in a session of its
+/// own, with no terminal) never gets. Doctor cancels its run on it as on Ctrl-C, so the probe
+/// is killed and the kubeconfig copy removed, and exits 129. By default SIGHUP ended doctor
+/// on the spot and left both behind.
+#[cfg(unix)]
+#[test]
+fn a_closed_terminal_stops_doctor_and_kills_the_tool_it_was_probing() {
+    a_signal_stops_doctor_and_kills_the_tool_it_was_probing(libc::SIGHUP, 129);
+}
+
 /// Start doctor with a tool probe that hangs, send it `signal` about a second in, and assert
 /// it exits `code` at once, prints no report and leaves no probe running.
 ///

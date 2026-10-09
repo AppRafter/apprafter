@@ -9,15 +9,15 @@
 //!
 //! The core starts every tool probe and every `kubectl` in a session (Unix) or Job Object
 //! (Windows) of its own, so the terminal's Ctrl-C reaches none of them: only cancelling the
-//! run's token kills them. So the arm turns the first SIGINT or SIGTERM (Windows: Ctrl-C,
-//! Ctrl-Break, the console closing) into `CancellationToken::cancel`, from a thread of its own
-//! and never from inside a signal handler; the core, which checks the token between its steps
-//! and every 50 ms while it waits on a probe or a DNS lookup, then kills what it started,
-//! removes its kubeconfig copy and returns `Cancelled`, and doctor exits with 128 + the signal
-//! (130 for Ctrl-C; 130 on Windows) without a report. A second signal ends the process at once,
-//! as in `helper_interrupt`. A signal the process was started with ignored (a background job's
-//! SIGINT) stays ignored. The console closing on Windows is held while the run unwinds
-//! (`windows_console`).
+//! run's token kills them. So the arm turns the first SIGINT, SIGTERM or SIGHUP (the terminal
+//! closing; Windows: Ctrl-C, Ctrl-Break, the console closing) into `CancellationToken::cancel`,
+//! from a thread of its own and never from inside a signal handler; the core, which checks the
+//! token between its steps and every 50 ms while it waits on a probe or a DNS lookup, then kills
+//! what it started, removes its kubeconfig copy and returns `Cancelled`, and doctor exits with
+//! 128 + the signal (130 for Ctrl-C; 130 on Windows) without a report. A second signal ends the
+//! process at once, as in `helper_interrupt`. A signal the process was started with ignored (a
+//! background job's SIGINT, `nohup`'s SIGHUP) stays ignored. The console closing on Windows is
+//! held while the run unwinds (`windows_console`).
 
 use std::io::Write as _;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -100,8 +100,9 @@ impl Interrupt {
 /// What Ctrl-C exits with: 128 + SIGINT on Unix, and the same on Windows.
 const INTERRUPTED_EXIT: i32 = 130;
 
-/// Cancel `cancel` on the first SIGINT or SIGTERM (see the module docs). A failure to install
-/// the handler is a warning: doctor still runs, and a Ctrl-C then ends it the default way.
+/// Cancel `cancel` on the first SIGINT, SIGTERM or SIGHUP (see the module docs). A failure to
+/// install the handler is a warning: doctor still runs, and a Ctrl-C then ends it the default
+/// way.
 #[cfg(unix)]
 fn cancel_on_interrupt(cancel: &CancellationToken) -> Interrupt {
     let code = Arc::new(AtomicI32::new(0));
@@ -117,10 +118,10 @@ fn cancel_on_interrupt(cancel: &CancellationToken) -> Interrupt {
 
 #[cfg(unix)]
 fn register(cancel: &CancellationToken, code: &Arc<AtomicI32>) -> std::io::Result<()> {
-    use signal_hook::consts::{SIGINT, SIGTERM};
+    use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
     use std::sync::atomic::AtomicBool;
 
-    let signals: Vec<i32> = [SIGINT, SIGTERM]
+    let signals: Vec<i32> = [SIGINT, SIGTERM, SIGHUP]
         .into_iter()
         .filter(|&s| !crate::commands::helper_interrupt::ignored_at_start(s))
         .collect();
