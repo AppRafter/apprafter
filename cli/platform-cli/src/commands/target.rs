@@ -164,20 +164,39 @@ pub(crate) fn add(mut args: AddArgs) -> miette::Result<()> {
     if let Some(SkuCheck::NotValidated { sku }) = &added.sku {
         println!("{}", sku_not_validated_line(sku));
     }
-    let verified_suffix = add_verified_suffix(args.no_ping);
-    if added.cli_default.is_some() {
-        println!(
-            "target `{name}` saved and set as active (first target on fresh store){verified_suffix}"
-        );
-    } else {
-        println!(
-            "target `{name}` saved (active target unchanged — use `apprafter target use {name}` to switch){verified_suffix}"
-        );
-    }
+    println!(
+        "{}",
+        add_saved_line(&added, add_verified_suffix(args.no_ping))
+    );
     for line in kept {
         println!("{line}");
     }
     Ok(())
+}
+
+/// The line `target add` ends with, for each way the CLI default can stand after the save
+/// (bug 1: re-adding the active target with `--force` used to advise switching to it):
+/// - it moved to this target (a fresh store): "saved and set as active";
+/// - it already named this target, which was overwritten: "overwritten (it stays the active
+///   target)";
+/// - it already named this target, which did not exist until now: "saved (it is the active
+///   target)";
+/// - it names another target, or none: today's advice to `target use` it.
+pub(crate) fn add_saved_line(a: &core_target::TargetAdded, suffix: &str) -> String {
+    let name = &a.name;
+    match (&a.cli_default, a.is_cli_default, a.replaced) {
+        (Some(_), _, _) => {
+            format!("target `{name}` saved and set as active (first target on fresh store){suffix}")
+        }
+        (None, true, true) => {
+            format!("target `{name}` overwritten (it stays the active target){suffix}")
+        }
+        (None, true, false) => format!("target `{name}` saved (it is the active target){suffix}"),
+        (None, false, _) => format!(
+            "target `{name}` saved (active target unchanged — use `apprafter target use {name}` \
+             to switch){suffix}"
+        ),
+    }
 }
 
 /// One `  kept <field>: <value>` line per field a forced overwrite keeps (the plan's `Keep
@@ -778,6 +797,53 @@ mod tests {
             h.contains("apprafter backup create") && h.contains("restore <repo> --reprovision"),
             "{h}"
         );
+    }
+
+    // ── bug 1: the saved line tells the pointer outcomes apart ───────────
+
+    fn added(
+        cli_default: Option<ActivePointerChange>,
+        is_cli_default: bool,
+        replaced: bool,
+    ) -> core_target::TargetAdded {
+        core_target::TargetAdded {
+            name: "prod".into(),
+            replaced,
+            is_cli_default,
+            cli_default,
+            token: apprafter_core::provider::Verification::Skipped {
+                reason: apprafter_core::provider::SkipReason::NoPing,
+            },
+            sku: None,
+        }
+    }
+
+    #[test]
+    fn the_saved_line_tells_the_four_pointer_outcomes_apart() {
+        let s = "";
+        let became = Some(ActivePointerChange {
+            from: None,
+            to: Some("prod".into()),
+        });
+        assert_eq!(
+            add_saved_line(&added(became, true, false), s),
+            "target `prod` saved and set as active (first target on fresh store)"
+        );
+        assert_eq!(
+            add_saved_line(&added(None, true, true), s),
+            "target `prod` overwritten (it stays the active target)"
+        );
+        assert_eq!(
+            add_saved_line(&added(None, true, false), s),
+            "target `prod` saved (it is the active target)"
+        );
+        let other = add_saved_line(&added(None, false, true), s);
+        assert!(
+            other.contains("use `apprafter target use prod` to switch"),
+            "{other}"
+        );
+        assert!(!add_saved_line(&added(None, true, true), s).contains("target use"));
+        assert!(add_saved_line(&added(None, true, true), " (x)").ends_with("target) (x)"));
     }
 
     // ── --force: what it keeps ───────────────────────────────────────────

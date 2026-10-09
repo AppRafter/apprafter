@@ -303,10 +303,10 @@ fn target_add_force_overwrites_existing_target_and_keeps_active_pointer() {
         ])
         .assert()
         .success()
-        // Second save is not the first target → message must NOT
-        // claim it became active. Pre-existing global config is
-        // preserved.
-        .stdout(contains("active target unchanged"));
+        // `work` is the active target and stays it: the line says so and does not advise
+        // switching to it (bug 1). Pre-existing global config is preserved.
+        .stdout(contains("it stays the active target"))
+        .stdout(contains("target use").not());
 
     // Region flag in the overwrite must land in the on-disk config.
     let cfg = std::fs::read_to_string(dir.path().join("targets/work/config.yaml")).unwrap();

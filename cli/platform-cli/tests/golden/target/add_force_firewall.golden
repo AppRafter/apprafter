@@ -1,7 +1,7 @@
 $ apprafter target add prod --force --provider hetzner-cloud --token bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb --no-ping --no-interactive
 [exit 0]
 [stdout]
-target `prod` saved (active target unchanged — use `apprafter target use prod` to switch) (token NOT verified against the API — `--no-ping` was passed)
+target `prod` overwritten (it stays the active target) (token NOT verified against the API — `--no-ping` was passed)
   kept region: nbg1
   kept tier: solo
   kept firewall: Cloudflare origin on
