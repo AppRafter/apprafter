@@ -758,6 +758,17 @@ mod tests {
         load_target(paths, name).unwrap().credentials.hetzner_token
     }
 
+    /// R1: a store without `config.yaml` has no CLI default. `GlobalConfig::default()` names
+    /// `"default"`, which made `target use default` claim it was already active and write
+    /// nothing, and `target use prod` report a switch away from a pointer that never existed.
+    #[test]
+    fn use_on_a_store_without_config_yaml_names_no_previous_target() {
+        let (_dir, paths) = store();
+        save_target(&paths, &target("default", "t")).unwrap();
+        save_target(&paths, &target("prod", "t")).unwrap();
+        assert_eq!(previous_cli_default(&paths).unwrap(), "");
+    }
+
     /// `target add` checks the name, pings the provider unlocked, then
     /// saves. Another add that created the same name in between is found
     /// by the check under the lock and is not overwritten without
@@ -1548,15 +1559,33 @@ fn run_use(name: &str) -> Result<()> {
     // verbatim.
     let _ = load_target(&paths, name)?;
 
-    let mut global = load_global_config(&paths)?.unwrap_or_default();
-    if global.active_target == name {
+    let previous = previous_cli_default(&paths)?;
+    if previous == name {
         println!("target `{name}` was already the active target");
         return Ok(());
     }
-    let previous = std::mem::replace(&mut global.active_target, name.to_string());
+    let global = match load_global_config(&paths)? {
+        Some(g) => GlobalConfig {
+            active_target: name.to_string(),
+            ..g
+        },
+        None => GlobalConfig {
+            active_target: name.to_string(),
+            version: cli_core::target::TARGET_STORE_VERSION,
+        },
+    };
     save_global_config(&paths, &global)?;
     println!("{}", switched_active_line(&previous, name));
     Ok(())
+}
+
+/// The CLI default as `config.yaml` records it; empty when the file is absent (R1) — never
+/// the `"default"` that `GlobalConfig::default()` carries, which names a pointer that does not
+/// exist.
+fn previous_cli_default(paths: &TargetStorePaths) -> Result<String> {
+    Ok(load_global_config(paths)?
+        .map(|g| g.active_target)
+        .unwrap_or_default())
 }
 
 /// Confirmation for `target use`.
@@ -1713,12 +1742,15 @@ fn run_remove(name: &str, yes: bool) -> Result<()> {
     // targets left, clear the active pointer entirely (delete
     // config.yaml) so the next `target add` flips back to the
     // "first target on fresh store" greeting.
-    let mut global = load_global_config(&paths)?.unwrap_or_default();
-    if global.active_target == name {
+    if previous_cli_default(&paths)? == name {
         let remaining = list_target_names(&paths)?;
         match remaining.into_iter().next() {
             Some(next) => {
-                global.active_target = next.clone();
+                // The pointer named `name`, so `config.yaml` exists: keep its other fields.
+                let global = GlobalConfig {
+                    active_target: next.clone(),
+                    ..load_global_config(&paths)?.unwrap_or_default()
+                };
                 save_global_config(&paths, &global)?;
                 println!(
                     "target `{name}` removed; active switched to `{next}` (alphabetically next)"
