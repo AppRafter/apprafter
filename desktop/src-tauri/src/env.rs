@@ -16,8 +16,8 @@
 //!   `git`, `ssh`, `cue`) are looked for, and the `PATH` they get ([`desktop_host`]). An
 //!   inherited `PATH` decides which `kubectl` runs: a recorded trust decision (spec rev 4 §10).
 //!   macOS does not read it — an app started from Finder has launchd's bare `PATH` — and asks
-//!   the account's login shell for its `PATH` instead (five-second limit), falling back to
-//!   [`MACOS_FALLBACK_PATH`];
+//!   the account's interactive login shell for its `PATH` instead (five-second limit), falling
+//!   back to [`MACOS_FALLBACK_PATH`];
 //! - in a test build only (cargo feature `test-build`), `APPRAFTER_HCLOUD_BASE_URL`, which the
 //!   core then accepts only as a loopback `http://` URL ([`desktop_context`]), and
 //!   `APPRAFTER_DESKTOP_TEST_PASSWORD`, the password the fake authenticator's own field accepts,
@@ -160,13 +160,37 @@ fn tool_search_path(_env: &AllowListEnv) -> (OsString, PathSource) {
     login_shell_path()
 }
 
+/// The marker line, one literal for both [`PATH_MARKER`] and [`LOGIN_SHELL_SCRIPT`], so the
+/// script never prints a marker the parser does not look for.
+macro_rules! path_marker {
+    () => {
+        "__APPRAFTER_PATH__"
+    };
+}
+
 /// The line before the `PATH` in the login shell's output.
-const PATH_MARKER: &str = "__APPRAFTER_PATH__";
+const PATH_MARKER: &str = path_marker!();
 
 /// `printenv` prints the exported, `:`-joined `PATH` in every shell (fish included, which
 /// expands a quoted `"$PATH"` to a space-joined list).
-#[cfg(target_os = "macos")]
-const LOGIN_SHELL_SCRIPT: &str = "echo __APPRAFTER_PATH__; /usr/bin/printenv PATH";
+#[cfg(any(target_os = "macos", all(test, unix)))]
+const LOGIN_SHELL_SCRIPT: &str = concat!("echo ", path_marker!(), "; /usr/bin/printenv PATH");
+
+/// How the account's shell is asked for its `PATH`: as an interactive (`-i`) login (`-l`)
+/// shell, as VS Code's shell-environment resolver asks it. A login shell that is not
+/// interactive reads `.zprofile` but never `.zshrc` (bash: `.bash_profile`, not `.bashrc`), and
+/// `.zshrc` is where many users, and the installers they ran, extend `PATH` (nvm, pyenv, krew,
+/// mise, the Google Cloud SDK, Homebrew lines): without `-i` the app would miss tools a
+/// Terminal window finds, and still report the login shell as the source. Whatever an rc file
+/// prints before the marker is skipped ([`parse_login_shell_output`]); stdin is null, so an rc
+/// file that prompts reads end of file; and `run_bounded` starts the shell in a session of its
+/// own (no terminal to take over or to stop on) and kills it after [`LOGIN_SHELL_TIMEOUT`].
+#[cfg(any(target_os = "macos", all(test, unix)))]
+const LOGIN_SHELL_ARGS: [&str; 4] = ["-i", "-l", "-c", LOGIN_SHELL_SCRIPT];
+
+/// How long the login shell may take before the probe gives up on it.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+const LOGIN_SHELL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The search path when the login shell gives none: the system's own directories.
 pub const MACOS_FALLBACK_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
@@ -180,30 +204,40 @@ pub fn parse_login_shell_output(stdout: &[u8]) -> Option<OsString> {
     Some(OsString::from(line))
 }
 
-/// The account's login shell's `PATH`, run as `<shell> -l -c '<script>'` with stdin null and
-/// killed after five seconds; [`MACOS_FALLBACK_PATH`] when that gives none.
-#[cfg(target_os = "macos")]
-fn login_shell_path() -> (OsString, PathSource) {
-    let fallback = || {
-        tracing::warn!(
-            "the login shell gave no PATH; tools are looked for in {MACOS_FALLBACK_PATH}"
-        );
-        (OsString::from(MACOS_FALLBACK_PATH), PathSource::Fallback)
-    };
-    let Some(shell) = account_shell() else {
-        return fallback();
-    };
+/// `shell`, asked for its `PATH` with [`LOGIN_SHELL_ARGS`].
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn login_shell_command(shell: &Path) -> std::process::Command {
     let mut cmd = std::process::Command::new(shell);
-    cmd.args(["-l", "-c", LOGIN_SHELL_SCRIPT]);
+    cmd.args(LOGIN_SHELL_ARGS);
+    cmd
+}
+
+/// Run a [`login_shell_command`] (stdin null, killed with everything it started after
+/// [`LOGIN_SHELL_TIMEOUT`]): the `PATH` it printed after the marker, or `None`.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn probe_login_shell(cmd: std::process::Command) -> Option<OsString> {
     match apprafter_core::process::run_bounded(
         cmd,
-        std::time::Duration::from_secs(5),
+        LOGIN_SHELL_TIMEOUT,
         &apprafter_core::CancellationToken::new(),
     ) {
-        Ok(out) if !out.timed_out => parse_login_shell_output(&out.stdout)
-            .map(|p| (p, PathSource::LoginShell))
-            .unwrap_or_else(fallback),
-        _ => fallback(),
+        Ok(out) if !out.timed_out => parse_login_shell_output(&out.stdout),
+        _ => None,
+    }
+}
+
+/// The account's login shell's `PATH` ([`probe_login_shell`]); [`MACOS_FALLBACK_PATH`] when
+/// that gives none.
+#[cfg(target_os = "macos")]
+fn login_shell_path() -> (OsString, PathSource) {
+    match account_shell().and_then(|shell| probe_login_shell(login_shell_command(&shell))) {
+        Some(path) => (path, PathSource::LoginShell),
+        None => {
+            tracing::warn!(
+                "the login shell gave no PATH; tools are looked for in {MACOS_FALLBACK_PATH}"
+            );
+            (OsString::from(MACOS_FALLBACK_PATH), PathSource::Fallback)
+        }
     }
 }
 
@@ -444,6 +478,93 @@ mod tests {
         );
         assert_eq!(parse_login_shell_output(b"no marker\n"), None);
         assert_eq!(parse_login_shell_output(b"__APPRAFTER_PATH__\n\n"), None);
+    }
+
+    /// A stand-in login shell in `dir`: it fails (64) unless asked exactly `-i -l -c <the
+    /// probe's script>` (the real `/usr/bin/printenv` runs in the macOS tests), prints what a
+    /// chatty profile might (a stray marker included), starts a job that keeps stdout open past
+    /// its own exit, then answers as the script would. It is run once with `__probe` first, to
+    /// wait out `ETXTBSY`: a sibling test thread that forks while the file is still open for
+    /// writing holds a write handle to it until it execs.
+    #[cfg(unix)]
+    fn fake_login_shell(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        // The script, spelled out rather than taken from LOGIN_SHELL_SCRIPT: it is the contract
+        // with the shell, so a change to it must change this test too.
+        const EXPECTED_SCRIPT: &str = "echo __APPRAFTER_PATH__; /usr/bin/printenv PATH";
+        let shell = dir.join("fake-login-shell");
+        std::fs::write(
+            &shell,
+            format!(
+                r#"#!/bin/sh
+case "$1" in __probe) exit 0;; esac
+if [ "$#" != 4 ] || [ "$1 $2 $3" != "-i -l -c" ] || [ "$4" != '{EXPECTED_SCRIPT}' ]; then
+    echo "unexpected argv: $*" >&2
+    exit 64
+fi
+echo 'Last login: Thu Oct  9 10:00:00 on ttys000'
+echo '{PATH_MARKER}'
+echo '/from/a/profile/that/printed/the/marker'
+sleep 3 &
+echo '{PATH_MARKER}'
+echo '/opt/homebrew/bin:/usr/bin:/bin'
+"#
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for _ in 0..200 {
+            match std::process::Command::new(&shell).arg("__probe").status() {
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
+                    std::thread::sleep(std::time::Duration::from_millis(5))
+                }
+                _ => break,
+            }
+        }
+        shell
+    }
+
+    /// The probe on every Unix, against a stand-in shell: asked interactive and login, it takes
+    /// the `PATH` after the last marker, past the profile's noise and its background job.
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_asks_an_interactive_login_shell_and_takes_its_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let shell = fake_login_shell(dir.path());
+        assert_eq!(
+            probe_login_shell(login_shell_command(&shell)),
+            Some(OsString::from("/opt/homebrew/bin:/usr/bin:/bin"))
+        );
+    }
+
+    /// macOS: the password database names the account's shell, a file on disk.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_account_shell_is_a_file_on_disk() {
+        let shell = account_shell().expect("the password database names a login shell");
+        assert!(
+            shell.is_absolute() && shell.is_file(),
+            "{}",
+            shell.display()
+        );
+    }
+
+    /// macOS: the real probe against `/bin/sh`, with a scratch `HOME` and `ZDOTDIR` and no
+    /// `ENV`, so no rc file of the machine's own account is read. It must answer (`None` is
+    /// what falls back to [`MACOS_FALLBACK_PATH`]) with a `PATH` that holds `/usr/bin`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_real_probe_against_bin_sh_answers_with_usr_bin() {
+        let home = tempfile::tempdir().unwrap();
+        let mut cmd = login_shell_command(Path::new("/bin/sh"));
+        cmd.env("HOME", home.path())
+            .env("ZDOTDIR", home.path())
+            .env_remove("ENV"); // an interactive `sh` reads the file it names
+        let path = probe_login_shell(cmd).expect("the login shell printed a PATH");
+        assert!(
+            std::env::split_paths(&path).any(|dir| dir == Path::new("/usr/bin")),
+            "{path:?}"
+        );
     }
 
     #[cfg(not(target_os = "macos"))]
