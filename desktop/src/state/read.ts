@@ -2,7 +2,9 @@
 // One read a component runs at a time (a token verify, a catalogue, latencies, doctor, whoami):
 // its state, a cancel, and the guarantee that what runs is cancelled when the component goes — a
 // closed dialog, or the shell unmounted by a lock (Rust also cancels reads on a lock; then the
-// cancel here is refused as locked, and that refusal is expected).
+// cancel here is refused as locked, and that refusal is expected). A run that is no longer the
+// component's (superseded, reset, or the component went) never changes its state; a result it
+// still brings is handed to `onUnused`, so what it holds is released (a verify's draft).
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { OpId } from '../ipc/generated/OpId';
 import type { UiError } from '../ipc/generated/UiError';
@@ -18,8 +20,12 @@ export type ReadState<T> =
 
 export interface ReadHandle<T> {
   readonly state: ReadState<T>;
-  /** Starts the read (cancelling one that runs); its data, or null when it did not complete. */
-  readonly run: (start: () => Promise<OpId>) => Promise<T | null>;
+  /**
+   * Starts the read (cancelling one that runs); its data, or null when it did not complete or is
+   * no longer this component's. `onUnused` gets the data of a run that completed when it was no
+   * longer this component's. After the unmount a run starts nothing.
+   */
+  readonly run: (start: () => Promise<OpId>, onUnused?: (data: T) => void) => Promise<T | null>;
   readonly cancel: () => void;
   readonly reset: () => void;
 }
@@ -32,6 +38,7 @@ interface Run {
 export function useRead<T>(): ReadHandle<T> {
   const [state, setState] = useState<ReadState<T>>({ status: 'idle' });
   const current = useRef<Run | null>(null);
+  const gone = useRef(false);
 
   const stop = useCallback((run: Run | null) => {
     if (run === null || run.cancelled) return;
@@ -39,11 +46,21 @@ export function useRead<T>(): ReadHandle<T> {
     if (run.opId !== null) cancelOp(run.opId).catch(reportUnlessLocked(`op_cancel ${run.opId}`));
   }, []);
 
-  // The component goes (closed, or the shell unmounted by a lock): what runs is cancelled.
-  useEffect(() => () => stop(current.current), [stop]);
+  // The component goes (closed, or the shell unmounted by a lock): what runs is cancelled, and it
+  // is no longer the component's. StrictMode's remount runs the setup again.
+  useEffect(() => {
+    gone.current = false;
+    return () => {
+      gone.current = true;
+      const was = current.current;
+      current.current = null;
+      stop(was);
+    };
+  }, [stop]);
 
   const run = useCallback(
-    async (start: () => Promise<OpId>): Promise<T | null> => {
+    async (start: () => Promise<OpId>, onUnused?: (data: T) => void): Promise<T | null> => {
+      if (gone.current) return null;
       stop(current.current);
       const mine: Run = { opId: null, cancelled: false };
       current.current = mine;
@@ -55,7 +72,10 @@ export function useRead<T>(): ReadHandle<T> {
           if (mine.cancelled) cancelOp(opId).catch(reportUnlessLocked(`op_cancel ${opId}`));
           else if (live()) setState({ status: 'running', opId });
         });
-        if (!live()) return null;
+        if (!live()) {
+          onUnused?.(data);
+          return null;
+        }
         current.current = null;
         setState({ status: 'done', data });
         return data;

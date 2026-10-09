@@ -143,7 +143,12 @@ export function AddTargetWizard({ onClose }: { onClose: () => void }) {
 
   const verifyToken = async () => {
     setNotice(null);
-    const verified = await verify.run(() => api.opStartVerifyToken(state.provider, state.token));
+    // A verify that completes after the wizard went (or after a reset) left a draft in Rust that
+    // nothing will use: it goes at once.
+    const verified = await verify.run(
+      () => api.opStartVerifyToken(state.provider, state.token),
+      (unused) => discardDraft(unused.draftId),
+    );
     if (verified === null) return;
     resetReads();
     dispatch({ type: 'verified', draft: verified.draftId });

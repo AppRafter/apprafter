@@ -162,6 +162,47 @@ async function toMachine(
   await waitFor(() => expect(h.of('op_start_machine_catalogue')).toHaveLength(1));
 }
 
+describe('after the wizard went', () => {
+  test('a verify that completes after the wizard is gone discards its draft', async () => {
+    let answer = (_opId: number) => {};
+    h.answer(
+      'op_start_verify_token',
+      () =>
+        new Promise<number>((resolve) => {
+          answer = resolve;
+        }),
+    );
+    h.operation(77, [completed({ draftId: 9, elapsedMs: 182 })]);
+    const { user, unmount } = renderWizard();
+    await user.type(screen.getByLabelText('API token'), TOKEN);
+    await user.click(screen.getByRole('button', { name: 'Verify and continue' }));
+    unmount();
+    answer(77);
+    await waitFor(() =>
+      expect(h.of('target_draft_discard').map((c) => c.args)).toEqual([{ draftId: 9 }]),
+    );
+    expect(h.of('op_cancel').map((c) => c.args)).toEqual([{ opId: 77 }]);
+  });
+
+  test('a catalogue that lands after the wizard is gone starts no latency read', async () => {
+    let answer = (_opId: number) => {};
+    const { user, unmount } = renderWizard();
+    h.answer(
+      'op_start_machine_catalogue',
+      () =>
+        new Promise<number>((resolve) => {
+          answer = resolve;
+        }),
+    );
+    h.operation(78, [completed(catalogue())]);
+    await toMachine(user, []);
+    unmount();
+    answer(78);
+    await waitFor(() => expect(h.of('op_discard').map((c) => c.args)).toContainEqual({ opId: 78 }));
+    expect(h.of('op_start_region_latencies')).toHaveLength(0);
+  });
+});
+
 describe('machine step', () => {
   test('the catalogue is read once per draft; the latencies after it, with its region codes', async () => {
     const { user } = renderWizard();

@@ -5,7 +5,9 @@
 // test makes Rust refuse to follow. Otherwise: a command given with `read` answers a fresh
 // operation id, whose op_subscribe replays the events given (none: it keeps running); one given
 // with `plan` answers the PlanView, and op_execute of it sends its events on the execute's
-// channel. The rest answer null (op_list: []).
+// channel. The rest answer null (op_list: []). Operation ids are unique across every harness of
+// a test run, as Rust's are in a process: a read a test left waiting never wakes on a later test's
+// operation.
 import type { Channel, InvokeArgs } from '@tauri-apps/api/core';
 import { mockIPC } from '@tauri-apps/api/mocks';
 import type { OpEvent } from '../ipc/generated/OpEvent';
@@ -29,7 +31,11 @@ export interface Harness {
   /** An operation the test knows by id (op_subscribe replays its events). */
   operation(opId: OpId, events: readonly OpEvent[]): void;
   of(cmd: string): Call[];
+  /** The operation ids `cmd` was answered with by `read` or `plan`, in order. */
+  started(cmd: string): OpId[];
 }
+
+let nextOpId = 100;
 
 export const completed = (result: unknown): OpEvent => ({
   kind: 'finished',
@@ -64,7 +70,12 @@ export function installHarness(): Harness {
   const reads = new Map<string, (readonly OpEvent[])[]>();
   const plans = new Map<string, { view: Omit<PlanView, 'opId'>; events: readonly OpEvent[] }[]>();
   const events = new Map<OpId, readonly OpEvent[]>();
-  let next = 100;
+  const answered = new Map<string, OpId[]>();
+  const assign = (cmd: string): OpId => {
+    nextOpId += 1;
+    answered.set(cmd, [...(answered.get(cmd) ?? []), nextOpId]);
+    return nextOpId;
+  };
   mockIPC((cmd, raw?: InvokeArgs) => {
     const args = (raw ?? {}) as Record<string, unknown>;
     calls.push({ cmd, args });
@@ -75,15 +86,15 @@ export function installHarness(): Harness {
     }
     const read = reads.get(cmd)?.shift();
     if (read !== undefined) {
-      next += 1;
-      events.set(next, read);
-      return next;
+      const opId = assign(cmd);
+      events.set(opId, read);
+      return opId;
     }
     const plan = plans.get(cmd)?.shift();
     if (plan !== undefined) {
-      next += 1;
-      events.set(next, plan.events);
-      return { ...plan.view, opId: next };
+      const opId = assign(cmd);
+      events.set(opId, plan.events);
+      return { ...plan.view, opId };
     }
     if (cmd === 'op_subscribe') {
       return { subscription: 1, replay: events.get(args.opId as OpId) ?? [] };
@@ -117,5 +128,6 @@ export function installHarness(): Harness {
       events.set(opId, list);
     },
     of: (cmd) => calls.filter((c) => c.cmd === cmd),
+    started: (cmd) => answered.get(cmd) ?? [],
   };
 }

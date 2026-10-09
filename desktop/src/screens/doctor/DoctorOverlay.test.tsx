@@ -70,7 +70,9 @@ describe('DoctorOverlay', () => {
     expect(h.of('op_start_doctor')[0]?.args).toEqual({ target: 'prod-eu' });
     expect(runAgain().disabled).toBe(true);
     await user.click(screen.getByRole('button', { name: 'Cancel' }));
-    expect(h.of('op_cancel').map((c) => c.args)).toEqual([{ opId: 101 }]);
+    expect(h.of('op_cancel').map((c) => c.args)).toEqual([
+      { opId: h.started('op_start_doctor')[0] },
+    ]);
   });
 
   test('the report: summary chips, the groups in order, rows, footer', async () => {
