@@ -80,6 +80,19 @@ describe('Wizard', () => {
     expect(onNext).toHaveBeenCalledTimes(1);
   });
 
+  test('a double click on Next goes next once: its second click is not a second Next', async () => {
+    const { user, onNext } = wizard();
+    await user.dblClick(button('Continue'));
+    expect(onNext).toHaveBeenCalledTimes(1);
+  });
+
+  test('a held Enter goes next once: its repeats are not more Nexts', async () => {
+    const { user, onNext } = wizard();
+    await user.click(screen.getByLabelText('Field'));
+    await user.keyboard('{Enter>3/}');
+    expect(onNext).toHaveBeenCalledTimes(1);
+  });
+
   test('disabled Next: neither the button nor Enter goes next', async () => {
     const { user, onNext } = wizard({ nextDisabled: true });
     await user.type(screen.getByLabelText('Field'), '{Enter}');

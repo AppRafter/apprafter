@@ -12,6 +12,10 @@
 // to the step. A control of the step that goes while it has the focus ("Use another token", a
 // Try again replaced by what it started) hands it to the step's first control, or the dialog. A
 // polite status says which step is shown.
+//
+// One activation is one Next: Next is one button for every step, so the second click of a double
+// click, or a held Enter's repeat, would be the next step's Next (Save, after Continue) without
+// the owner ever seeing that step. Both are dropped.
 import { type FormEvent, type ReactNode, useId, useLayoutEffect, useRef } from 'react';
 import { Button } from './Button';
 import { IconButton } from './IconButton';
@@ -114,6 +118,9 @@ export function Wizard({
       <form
         className="wizard"
         onSubmit={submit}
+        onKeyDown={(event) => {
+          if (event.key === 'Enter' && event.repeat) event.preventDefault();
+        }}
         onFocus={(event) => {
           held.current = event.target;
         }}
@@ -163,7 +170,16 @@ export function Wizard({
               Back
             </Button>
           )}
-          <Button size={32} type="submit" variant="primary" disabled={nextDisabled || busy}>
+          <Button
+            size={32}
+            type="submit"
+            variant="primary"
+            disabled={nextDisabled || busy}
+            onClick={(event) => {
+              // A submit button's click submits: its default is cancelled for a repeated click.
+              if (event.detail > 1) event.preventDefault();
+            }}
+          >
             {nextLabel}
           </Button>
         </div>

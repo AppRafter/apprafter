@@ -453,6 +453,20 @@ describe('details and save', () => {
     expect(screen.queryByLabelText('Target name')).toBeNull();
   });
 
+  test('a double click on Continue goes to Details once and never saves', async () => {
+    h.plan('op_plan_target_add', planParts({}), [completed(targetAdded({ name: 'lab-2' }))]);
+    const { user } = renderWizard();
+    await toDetails(user);
+    await user.type(screen.getByLabelText('Target name'), 'lab-2');
+    await user.click(screen.getByRole('button', { name: 'Back' }));
+    await waitFor(() => expect(currentStep()).toContain('Machine'));
+    await user.dblClick(screen.getByRole('button', { name: 'Continue' }));
+    await waitFor(() => expect(currentStep()).toContain('Details'));
+    expect(h.of('op_plan_target_add')).toHaveLength(0);
+    expect(h.of('op_execute')).toHaveLength(0);
+    expect(saveButton().disabled).toBe(false);
+  });
+
   test('name rules inline, a taken name inline (target_list), Save disabled meanwhile', async () => {
     h.answer('target_list', {
       targets: [
