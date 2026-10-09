@@ -22,11 +22,12 @@
 //! ever send: on sway, i3 or Hyprland no screen saver runs, and on a system without logind
 //! (Devuan, OpenRC without elogind) nothing sends `PrepareForSleep`. What the watch says it
 //! hears ([`Listening`]) therefore counts a source only when its sender runs as it is set up: a
-//! screen saver that owns its name, logind owning its name for sleeps, and logind having
-//! answered for the app's session for its `Lock`. A name the bus can start proves nothing (its
-//! service file may hand the start to a systemd that is not PID 1, as in a container), and on a
-//! desktop the owner's session was made by a logind that runs. It listens to every source all
-//! the same, so a sender that starts later is heard without being promised.
+//! screen saver that owns its name, logind owning its name for sleeps — except under WSL,
+//! whose logind never sends one ([`sleeps_expected`]) — and logind having answered for the
+//! app's session for its `Lock`. A name the bus can start proves nothing (its service file may
+//! hand the start to a systemd that is not PID 1, as in a container), and on a desktop the
+//! owner's session was made by a logind that runs. It listens to every source all the same, so
+//! a sender that starts later is heard without being promised.
 
 use std::collections::HashMap;
 use std::future::poll_fn;
@@ -245,15 +246,9 @@ async fn logind(setup: &mut Setup, system: &Connection) {
     let sleep = rule(LOGIN1, Some(LOGIN1_PATH), LOGIN1_MANAGER, "PrepareForSleep");
     if let Some(stream) = subscribe(system, Kind::PrepareForSleep, LOGIN1, sleep).await {
         setup.streams.push(stream);
-        // A logind that runs: one the bus could only start counts for nothing (module docs).
-        // WSL2 with systemd runs a logind that never sends this (the WSL VM does not suspend
-        // through it): an accepted limit, which reads as listening.
-        if running.is_some() {
-            setup.heard.push(Kind::PrepareForSleep);
-        } else {
-            tracing::info!(
-                "no logind runs on the system bus: sleeps are listened for, not expected"
-            );
+        match sleeps_expected(running.is_some(), kernel_release) {
+            Ok(()) => setup.heard.push(Kind::PrepareForSleep),
+            Err(why) => tracing::info!("{why}: sleeps are listened for, not expected"),
         }
     }
     setup.owners.insert(LOGIN1, running);
@@ -287,6 +282,34 @@ async fn screen_savers(setup: &mut Setup, session_bus: &Connection) {
         }
         setup.owners.insert(name, running);
     }
+}
+
+/// Whether logind's `PrepareForSleep` can be expected here, given whether logind runs and the
+/// kernel's release (`osrelease`, read only when it does); `Err` says why not. A logind the bus
+/// could only start counts for nothing (see the module docs). Under WSL, whose kernel names it
+/// (`microsoft` in WSL1's and WSL2's releases, `WSL` in WSL2's), logind may run with systemd
+/// but never sends it: the WSL VM does not suspend through it. So the watch reports no sleep
+/// there, and the page shows that lock-on-sleep has no sleep to follow.
+fn sleeps_expected(
+    logind_runs: bool,
+    osrelease: impl FnOnce() -> Option<String>,
+) -> Result<(), &'static str> {
+    if !logind_runs {
+        return Err("no logind runs on the system bus");
+    }
+    let wsl = osrelease().is_some_and(|release| {
+        let release = release.to_ascii_lowercase();
+        release.contains("microsoft") || release.contains("wsl")
+    });
+    if wsl {
+        return Err("under WSL logind never sends sleeps (the WSL VM does not suspend through it)");
+    }
+    Ok(())
+}
+
+/// The running kernel's release, as `uname -r` prints it.
+fn kernel_release() -> Option<String> {
+    std::fs::read_to_string("/proc/sys/kernel/osrelease").ok()
 }
 
 /// The connection that owns `name` on `bus` now, if any: the bus driver's `GetNameOwner`.
@@ -504,6 +527,37 @@ mod tests {
                 "from {from:?} to {to:?}, the name owned by {owner:?}"
             );
         }
+    }
+
+    /// Sleeps come only from a logind that runs, and never under WSL, whose kernel names it:
+    /// WSL2 runs logind with systemd, but its VM does not suspend through it.
+    #[test]
+    fn sleeps_are_expected_from_a_running_logind_outside_wsl() {
+        let kernel = |release: &'static str| move || Some(release.to_owned());
+        for (release, expected) in [
+            ("6.10.3-arch1-1", true),
+            ("6.1.0-26-amd64", true),
+            // WSL2's kernels, WSL1's, and one built by hand.
+            ("5.15.167.4-microsoft-standard-WSL2", false),
+            ("6.6.87.2-microsoft-standard-WSL2+", false),
+            ("4.4.0-19041-Microsoft", false),
+            ("6.1.21-custom-wsl", false),
+        ] {
+            assert_eq!(
+                sleeps_expected(true, kernel(release)).is_ok(),
+                expected,
+                "{release}"
+            );
+            assert!(
+                sleeps_expected(false, kernel(release)).is_err(),
+                "no logind: {release}"
+            );
+        }
+        // A release that cannot be read is no WSL's.
+        assert_eq!(sleeps_expected(true, || None), Ok(()));
+        // Read only when logind runs.
+        assert!(sleeps_expected(false, || panic!("read")).is_err());
+        assert!(kernel_release().is_some_and(|release| !release.trim().is_empty()));
     }
 
     #[test]
