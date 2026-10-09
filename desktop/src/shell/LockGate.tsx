@@ -56,9 +56,12 @@ export function LockGate({ children, now = Date.now }: LockGateProps) {
     };
     window.addEventListener('pointerdown', ping, true);
     window.addEventListener('keydown', ping, true);
+    // Reading a long page is activity too; passive, so the listener never holds a scroll up.
+    window.addEventListener('wheel', ping, { capture: true, passive: true });
     return () => {
       window.removeEventListener('pointerdown', ping, true);
       window.removeEventListener('keydown', ping, true);
+      window.removeEventListener('wheel', ping, { capture: true });
     };
   }, [locked, now]);
 

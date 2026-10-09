@@ -152,6 +152,36 @@ describe('LockGate', () => {
     expect(calls.filter((c) => c === 'activity')).toHaveLength(2);
   });
 
+  test('scrolling is activity too, heard by a passive listener that never holds a scroll up', async () => {
+    status = lockState({ locked: false });
+    const added: { type: string; options: unknown }[] = [];
+    const original = window.addEventListener;
+    window.addEventListener = function (
+      this: Window,
+      type: string,
+      listener: EventListenerOrEventListenerObject,
+      options?: boolean | AddEventListenerOptions,
+    ) {
+      added.push({ type, options });
+      original.call(this, type, listener, options);
+    } as typeof window.addEventListener;
+    try {
+      gate();
+      await screen.findByText('the shell');
+    } finally {
+      window.addEventListener = original;
+    }
+    expect(added.find((a) => a.type === 'wheel')?.options).toEqual({
+      capture: true,
+      passive: true,
+    });
+    await act(async () => {
+      window.dispatchEvent(new WheelEvent('wheel', { deltaY: 40 }));
+      await settle();
+    });
+    expect(calls.filter((c) => c === 'activity')).toHaveLength(1);
+  });
+
   test('a lock forgets what the operations store showed; the unlock follows it again', async () => {
     status = lockState({ locked: false });
     gate();

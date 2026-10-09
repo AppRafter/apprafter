@@ -7,6 +7,7 @@
 import { Activity, useCallback, useEffect, useMemo, useReducer, useState } from 'react';
 import { WarningCircleIcon } from '../components/icons';
 import { ToastViewport, useToast } from '../components/Toast';
+import { useListRefresh } from '../ipc/listRefresh';
 import { refreshList, useOperations } from '../ipc/operations';
 import { PlannedSection } from '../screens/placeholders/PlannedSection';
 import { TargetsPage } from '../screens/targets/TargetsPage';
@@ -60,6 +61,7 @@ export function Shell() {
   useEffect(() => {
     refreshList().catch(report('op_list'));
   }, []);
+  useListRefresh();
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
