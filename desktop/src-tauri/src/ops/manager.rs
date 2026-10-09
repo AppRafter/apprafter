@@ -16,8 +16,9 @@
 //! [`ENDED_KEPT`] operations ended after it. A plan that never runs — its prompt refused,
 //! expired, swept, dropped by a lock or by a quit — sends the pages that followed it one
 //! `Failed` saying why, so none of them waits for an end that never comes. A gesture that
-//! failed (a wrong password) is not such an end: the plan waits for the owner's next try
-//! ([`OperationManager::execute`] says why), and its pages hear nothing until it runs or ends.
+//! failed (a wrong password), or that could not be asked this way while the other way is there,
+//! is not such an end: the plan waits for the owner's next try ([`OperationManager::execute`]
+//! says why), and its pages hear nothing until it runs or ends.
 //!
 //! A plan leaves the manager's maps under its lock and is dropped after the lock is released:
 //! what an executor captured may do anything when it goes, calling back into the manager
@@ -39,6 +40,7 @@ use apprafter_core::{
 };
 use apprafter_desktop_ipc::{
     AuthOutcome, OpEvent, OpId, OpState, OpSummary, PlanView, Subscribed, SubscriptionId,
+    UnavailableReason,
 };
 
 use zeroize::Zeroizing;
@@ -249,9 +251,9 @@ enum Answer {
     /// Run it; the pages that followed the prompt follow the operation.
     Run(Vec<Subscriber>),
     /// The plan waits for another `execute`, as it was, and the caller is told why (with what
-    /// the OS said): nothing was asked (busy), or the owner was not verified and may try again
-    /// (failed). The pages that followed the prompt follow the plan again and hear nothing: it
-    /// has not ended.
+    /// the OS said): nothing was asked (busy), the owner was not verified and may try again
+    /// (failed), or the other way to ask is there ([`waits`]). The pages that followed the
+    /// prompt follow the plan again and hear nothing: it has not ended.
     Again(Refusal, Vec<Subscriber>),
     /// Refused, for the reason given (with what the OS said); the pages that followed the
     /// prompt are told it.
@@ -313,9 +315,11 @@ impl OperationManager {
 
     /// Run a plan, once: whatever happens here, the plan is spent — except when the owner may
     /// simply try again, and the plan then waits for another try, under the same id, with the
-    /// time it had left: on `AuthBusy`, when another prompt was open and nothing was asked, and
-    /// on `AuthFailed`, when the owner was not verified (a wrong password, a finger not
-    /// recognised) or a back-off turned the try away.
+    /// time it had left: on `AuthBusy`, when another prompt was open and nothing was asked; on
+    /// `AuthFailed`, when the owner was not verified (a wrong password, a finger not
+    /// recognised) or a back-off turned the try away; and on `AuthUnavailable` with `NoAgent`
+    /// or `NotPermittedHere`, when the gesture could not be asked this way and the other way is
+    /// there ([`waits`]).
     ///
     /// When the plan needs the owner, this asks `auth` and blocks until the prompt answers
     /// (so the caller is a blocking thread, never an async worker). Anything but `Verified`
@@ -330,13 +334,19 @@ impl OperationManager {
     /// tries is the authenticator's — the app's own back-off on the password paths, the OS's
     /// limits on its prompts — not the plan's. Every other rule holds: the plan runs once, its
     /// time to live runs from when it was planned, and a cancel, a lock or a quit drops it. A
-    /// cancel is the owner (or the app, or the system) saying no, and an unavailable gesture will
-    /// not become available by asking again, so both end the plan.
+    /// cancel is the owner (or the app, or the system) saying no, so it ends the plan. An
+    /// unavailable gesture ends it too, but for two reasons on Linux, where asking again does
+    /// make it available because the route switches: polkit found no agent (`NoAgent`), and the
+    /// app's own field takes over; the field was used where the OS prompts itself
+    /// (`NotPermittedHere`), and the OS's prompt takes over. No password was checked either
+    /// time, and the next try goes through the password back-off or the OS's prompt. Every other
+    /// reason (no policy, no backend, no PAM service, not interactive…) asking again does not
+    /// change.
     ///
     /// Once the manager is [`close`](Self::close)d it refuses with `Closing`: before asking
     /// anything, and again under the lock hold that would start the operation or put a plan
-    /// back to wait (busy or failed), so a prompt that answers after the quit began starts
-    /// nothing and leaves nothing waiting.
+    /// back to wait, so a prompt that answers after the quit began starts nothing and leaves
+    /// nothing waiting.
     pub fn execute(
         self: &Arc<Self>,
         id: OpId,
@@ -798,10 +808,26 @@ fn refuse_prompts(prompts: &mut HashMap<OpId, Prompt>) -> Vec<CancellationToken>
         .collect()
 }
 
+/// Whether the plan waits for the owner's next try after `outcome`, rather than ending
+/// ([`OperationManager::execute`] says why): another prompt was open, the owner was not
+/// verified, or the gesture could not be asked this way and the other way is there (on Linux,
+/// polkit without an agent hands over to the app's field, and the field where the OS prompts
+/// itself hands back to the OS's prompt).
+fn waits(outcome: AuthOutcome) -> bool {
+    matches!(
+        outcome,
+        AuthOutcome::Busy
+            | AuthOutcome::Failed { .. }
+            | AuthOutcome::Unavailable {
+                reason: UnavailableReason::NoAgent | UnavailableReason::NotPermittedHere,
+            }
+    )
+}
+
 /// What a prompt's answer means for plan `id`. `prompt` is its entry, gone when it was
 /// closed some other way; `expired` says the plan's time to live passed while it was open.
 /// What the OS said comes with a refusal the OS gave, never with a yes refused afterwards.
-/// A failed gesture keeps the plan ([`OperationManager::execute`] says why).
+/// A failed gesture keeps the plan, as does one asked the wrong way ([`waits`]).
 fn judge(
     id: OpId,
     answer: thread::Result<PasswordAnswer>,
@@ -829,24 +855,24 @@ fn judge(
     }
     let err = match outcome {
         // Run, or wait for another try: neither once the plan has expired.
-        AuthOutcome::Verified | AuthOutcome::Busy | AuthOutcome::Failed { .. } if expired => {
-            DesktopError::PlanExpired { op_id: id }
+        _ if expired && (outcome == AuthOutcome::Verified || waits(outcome)) => {
+            return Answer::Refuse(said(DesktopError::PlanExpired { op_id: id }), sinks);
         }
         AuthOutcome::Verified => return Answer::Run(sinks),
-        AuthOutcome::Busy => return Answer::Again(DesktopError::AuthBusy.into(), sinks),
+        AuthOutcome::Busy => DesktopError::AuthBusy,
         AuthOutcome::Failed {
             exhausted,
             retry_in_ms,
-        } => {
-            let failed = DesktopError::AuthFailed {
-                exhausted,
-                retry_in_ms,
-            };
-            return Answer::Again(said(failed), sinks);
-        }
+        } => DesktopError::AuthFailed {
+            exhausted,
+            retry_in_ms,
+        },
         AuthOutcome::Cancelled { .. } => DesktopError::AuthCancelled,
         AuthOutcome::Unavailable { reason } => DesktopError::AuthUnavailable { reason },
     };
+    if waits(outcome) {
+        return Answer::Again(said(err), sinks);
+    }
     Answer::Refuse(said(err), sinks)
 }
 
@@ -1327,14 +1353,21 @@ mod tests {
                 .into_iter()
                 .map(|by| (AuthOutcome::Cancelled { by }, DesktopError::AuthCancelled))
                 .collect();
-        cases.push((
-            AuthOutcome::Unavailable {
-                reason: UnavailableReason::NotInteractive,
-            },
-            DesktopError::AuthUnavailable {
-                reason: UnavailableReason::NotInteractive,
-            },
-        ));
+        // Every reason but the two that switch the route (kept: the next test).
+        for reason in [
+            UnavailableReason::NotConfigured,
+            UnavailableReason::DisabledByPolicy,
+            UnavailableReason::PolicyMissing,
+            UnavailableReason::ImplicitGrant,
+            UnavailableReason::NoPamService,
+            UnavailableReason::NotInteractive,
+            UnavailableReason::NoBackend,
+        ] {
+            cases.push((
+                AuthOutcome::Unavailable { reason },
+                DesktopError::AuthUnavailable { reason },
+            ));
+        }
         let runs = Arc::new(AtomicUsize::new(0));
         for (outcome, expected) in cases {
             let view = mgr.register_plan(parts(PlanClass::Destructive), counting(&runs));
@@ -1358,6 +1391,62 @@ mod tests {
         }
         assert_eq!(runs.load(SeqCst), 0);
         assert!(mgr.list().is_empty());
+    }
+
+    /// The gesture could not be asked this way, and the other way is there: on Linux polkit
+    /// found no agent (`NoAgent`), so the confirm dialog's own field takes over; or the field
+    /// was used where the OS prompts itself (`NotPermittedHere`), so the OS's prompt does. No
+    /// password was checked, so the plan waits, its pages told nothing, and the next try — the
+    /// other way — runs it under the same id.
+    #[test]
+    fn a_gesture_that_could_not_ask_this_way_keeps_the_plan_for_the_other_way() {
+        // polkit finds no agent; the field checks the password.
+        let pam = FakeAuthenticator::new().with_password("open sesame".to_owned());
+        // The OS prompts itself; the field is not its way.
+        let prompt = FakeAuthenticator::new();
+        type Try<'a> = (&'a FakeAuthenticator, Option<Zeroizing<String>>);
+        let ways: [(UnavailableReason, Try, Try); 2] = [
+            (
+                UnavailableReason::NoAgent,
+                (&pam, None),
+                (&pam, typed("open sesame")),
+            ),
+            (
+                UnavailableReason::NotPermittedHere,
+                (&prompt, typed("open sesame")),
+                (&prompt, None),
+            ),
+        ];
+        for (reason, (first, field), (then, other_way)) in ways {
+            let (_, mgr) = manager();
+            let runs = Arc::new(AtomicUsize::new(0));
+            let view = mgr.register_plan(parts(PlanClass::Destructive), counting(&runs));
+            let sink = VecSink::new("main");
+            mgr.subscribe(view.op_id, sink.clone()).unwrap();
+            let refusal = mgr.execute_with(view.op_id, first, field).unwrap_err();
+            assert_eq!(
+                refusal.to_ui(),
+                DesktopError::AuthUnavailable { reason }.to_ui(),
+                "{reason:?}"
+            );
+            assert!(
+                sink.events().is_empty(),
+                "{reason:?}: the plan has not ended"
+            );
+            assert_eq!(runs.load(SeqCst), 0, "{reason:?}");
+            assert_eq!(
+                mgr.execute_with(view.op_id, then, other_way).unwrap(),
+                view.op_id,
+                "{reason:?}"
+            );
+            assert_eq!(
+                wait_ended(&mgr, view.op_id),
+                OpState::Finished,
+                "{reason:?}"
+            );
+            assert_eq!(runs.load(SeqCst), 1, "{reason:?}");
+            assert_eq!(sink.events(), vec![completed(json!(null))], "{reason:?}");
+        }
     }
 
     /// A wrong password or an unrecognised finger: the owner may try again, so the plan waits
@@ -2646,12 +2735,19 @@ mod tests {
             // The machine slept with the dialog up: only the wall clock saw it.
             ("the machine slept", |clock| clock.set_wall(T0 + DAY)),
         ];
-        // `Busy` and `Failed` would put the plan back to wait: not once it expired.
+        // The answers that put the plan back to wait: not once it expired.
         let failed = AuthOutcome::Failed {
             exhausted: false,
             retry_in_ms: None,
         };
-        for answered in [AuthOutcome::Verified, AuthOutcome::Busy, failed] {
+        let other_way = |reason| AuthOutcome::Unavailable { reason };
+        for answered in [
+            AuthOutcome::Verified,
+            AuthOutcome::Busy,
+            failed,
+            other_way(UnavailableReason::NoAgent),
+            other_way(UnavailableReason::NotPermittedHere),
+        ] {
             for (how, pass) in ways {
                 let (clock, mgr) = manager();
                 let (auth, opened, answer) = held_prompt();
@@ -3148,12 +3244,18 @@ mod tests {
     }
 
     #[test]
-    fn a_busy_or_failed_answer_after_the_manager_closed_does_not_put_the_plan_back() {
+    fn an_answer_that_would_wait_after_the_manager_closed_does_not_put_the_plan_back() {
         let failed = AuthOutcome::Failed {
             exhausted: false,
             retry_in_ms: None,
         };
-        for answered in [AuthOutcome::Busy, failed] {
+        let other_way = |reason| AuthOutcome::Unavailable { reason };
+        for answered in [
+            AuthOutcome::Busy,
+            failed,
+            other_way(UnavailableReason::NoAgent),
+            other_way(UnavailableReason::NotPermittedHere),
+        ] {
             let (_, mgr) = manager();
             let (auth, opened, answer) = held_prompt();
             let runs = Arc::new(AtomicUsize::new(0));

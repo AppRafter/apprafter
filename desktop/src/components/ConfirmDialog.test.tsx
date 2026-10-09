@@ -290,6 +290,57 @@ describe('ConfirmDialog where the OS cannot prompt: the password field', () => {
     }
   });
 
+  test('no polkit agent: the field the re-read brings confirms the same plan, same opId', async () => {
+    // Linux where polkit found no agent: Rust keeps the plan, app_info is read again and now
+    // offers the field, and the owner confirms the same plan with the password.
+    const polkit: AuthInfo = { ...pam, method: 'polkit', passwordField: false };
+    const sent: { opId: unknown; password: unknown }[] = [];
+    const answers = [
+      () => Promise.reject(refusal(DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE, { reason: 'no_agent' })),
+      () => 1,
+    ];
+    mockIPC((cmd, args) => {
+      if (cmd !== 'op_execute') return null;
+      const { opId, password } = args as { opId: unknown; password?: unknown };
+      sent.push({ opId, password });
+      return answers.shift()?.();
+    });
+    const onClose = mock();
+    const dialog = (auth: AuthInfo) => (
+      <ConfirmDialog
+        title="Remove target prod-eu"
+        body="The target store forgets it. The cluster keeps running."
+        confirmLabel="Remove"
+        planClass="destructive"
+        auth={auth}
+        onConfirm={async (typed) => {
+          await execute(7, typed);
+        }}
+        onClose={onClose}
+      />
+    );
+    try {
+      const { rerender } = render(dialog(polkit));
+      const user = userEvent.setup();
+      await user.click(confirm());
+      expect((await screen.findByRole('alert')).textContent).toBe(
+        'The system could not show its password prompt.',
+      );
+      expect(onClose).not.toHaveBeenCalled();
+      // The PlatformGate read app_info again: the PAM route now.
+      rerender(dialog(pam));
+      await user.type(password(), 'hunter2{Enter}');
+      await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
+      expect(sent).toEqual([
+        { opId: 7, password: undefined },
+        { opId: 7, password: 'hunter2' },
+      ]);
+    } finally {
+      resetOperations();
+      clearMocks();
+    }
+  });
+
   test('busy: a check is already open', async () => {
     const { user } = open({
       auth: pam,

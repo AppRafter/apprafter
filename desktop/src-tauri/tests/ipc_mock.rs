@@ -484,6 +484,42 @@ fn op_execute_after_a_wrong_password_runs_the_same_op_id_with_the_right_one() {
     assert_eq!(pam.auth.checks.load(SeqCst), 2);
 }
 
+/// The confirm dialog on Linux without a polkit agent: the OS's prompt finds none, the plan
+/// waits, and the same `opId` confirmed with the dialog's own field then runs it.
+#[test]
+fn op_execute_without_an_agent_keeps_the_plan_for_the_password_field() {
+    let pam = rig_by(lock_off(), Route::PasswordField);
+    let op_id = pam
+        .shell
+        .ops
+        .register_plan(
+            PlanParts::new(PlanClass::Destructive, "Remove target prod", "delete"),
+            Box::new(|_, _| Ok(Outcome::Completed { result: json!(0) })),
+        )
+        .op_id;
+    let prompted = invoke(
+        &pam,
+        "op_execute",
+        json!({ "opId": op_id, "onEvent": "__CHANNEL__:21" }),
+    );
+    assert_eq!(
+        code(&prompted),
+        Some(errors::AUTH_UNAVAILABLE),
+        "{prompted:?}"
+    );
+    assert_eq!(prompted.unwrap_err()["fields"]["reason"], "no_agent");
+    let field = invoke(
+        &pam,
+        "op_execute",
+        json!({ "opId": op_id, "onEvent": "__CHANNEL__:22", "password": PASSWORD }),
+    );
+    assert!(field.is_ok(), "the plan waited for the field: {field:?}");
+    assert_eq!(
+        (pam.auth.prompts.load(SeqCst), pam.auth.checks.load(SeqCst)),
+        (1, 1)
+    );
+}
+
 /// What [`stops_when_cancelled`]'s operation logs as it stops.
 const OP_STOPPED: &str = "the operation stopped";
 

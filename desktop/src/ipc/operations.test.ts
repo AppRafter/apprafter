@@ -389,15 +389,26 @@ describe('execute', () => {
     expect(view(5)).toBeUndefined();
   });
 
-  // A busy prompt, or a wrong password: Rust sends nothing, the plan waits for another try, and
-  // this call's subscription is gone.
-  test.each([DESKTOP_ERROR_CODES.AUTH_BUSY, DESKTOP_ERROR_CODES.AUTH_FAILED])(
-    'a refusal that leaves the plan waiting (%s) leaves an earlier subscription following it',
-    async (code) => {
+  const refusedWith = (code: string, fields: Record<string, JsonValue> = {}) => ({
+    ...uiError(code),
+    fields,
+  });
+
+  // A busy prompt, a wrong password, or a gesture asked the way that is not there while the
+  // other is (Linux without a polkit agent; the field where the OS prompts): Rust sends nothing,
+  // the plan waits for another try, and this call's subscription is gone.
+  test.each([
+    [DESKTOP_ERROR_CODES.AUTH_BUSY, {}],
+    [DESKTOP_ERROR_CODES.AUTH_FAILED, { exhausted: false }],
+    [DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE, { reason: 'no_agent' }],
+    [DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE, { reason: 'not_permitted_here' }],
+  ])(
+    'a refusal that leaves the plan waiting (%s %o) leaves an earlier subscription following it',
+    async (code, fields) => {
       answerNext('op_subscribe', subscribed(1));
       attach(5);
       await settle();
-      answerNext('op_execute', Promise.reject(uiError(code)));
+      answerNext('op_execute', Promise.reject(refusedWith(code, fields)));
       await expect(execute(5)).rejects.toBeInstanceOf(IpcError);
       send(channelOf('op_subscribe'), 0, { kind: 'stage', index: 1, total: 1, title: 'Run' });
       expect(view(5)?.stage?.title).toBe('Run');
@@ -407,21 +418,25 @@ describe('execute', () => {
   );
 
   test.each([
-    DESKTOP_ERROR_CODES.AUTH_CANCELLED,
-    DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE,
-    DESKTOP_ERROR_CODES.PLAN_EXPIRED,
-  ])('a refusal that ends the plan (%s) ends an earlier subscription with it', async (code) => {
-    answerNext('op_subscribe', subscribed(1));
-    attach(5);
-    await settle();
-    answerNext('op_execute', Promise.reject(uiError(code)));
-    await expect(execute(5)).rejects.toBeInstanceOf(IpcError);
-    expect(view(5)?.live).toBe(false);
-    await settle();
-    expect(calls.filter((c) => c.cmd === 'op_unsubscribe')).toEqual([
-      { cmd: 'op_unsubscribe', args: { opId: 5, subscription: 1 } },
-    ]);
-  });
+    [DESKTOP_ERROR_CODES.AUTH_CANCELLED, {}],
+    [DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE, { reason: 'policy_missing' }],
+    [DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE, { reason: 'not_interactive' }],
+    [DESKTOP_ERROR_CODES.PLAN_EXPIRED, {}],
+  ])(
+    'a refusal that ends the plan (%s %o) ends an earlier subscription with it',
+    async (code, fields) => {
+      answerNext('op_subscribe', subscribed(1));
+      attach(5);
+      await settle();
+      answerNext('op_execute', Promise.reject(refusedWith(code, fields)));
+      await expect(execute(5)).rejects.toBeInstanceOf(IpcError);
+      expect(view(5)?.live).toBe(false);
+      await settle();
+      expect(calls.filter((c) => c.cmd === 'op_unsubscribe')).toEqual([
+        { cmd: 'op_unsubscribe', args: { opId: 5, subscription: 1 } },
+      ]);
+    },
+  );
 
   test('an earlier subscription to the plan ends once execute answers; nothing shows twice', async () => {
     answerNext('op_subscribe', subscribed(1));

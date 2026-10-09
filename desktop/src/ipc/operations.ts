@@ -170,14 +170,24 @@ function forgetLive(entry: Entry) {
 
 const isLocked = (e: unknown) =>
   e instanceof IpcError && e.error.code === DESKTOP_ERROR_CODES.LOCKED;
+/** `auth_unavailable` reasons where the other way to ask is there (Linux): Rust keeps the plan. */
+const OTHER_WAY: ReadonlySet<unknown> = new Set(['no_agent', 'not_permitted_here']);
+
 /**
  * A refusal after which the plan waits in Rust for another try under the same id: a busy prompt
- * asked nothing, and a failed gesture (a wrong password, the back-off) lets the owner try again.
+ * asked nothing; a failed gesture (a wrong password, the back-off) lets the owner try again; and
+ * a gesture that could not be asked this way (polkit found no agent, or the field was used where
+ * the OS prompts itself) is asked the other way next.
  */
-const leavesThePlanWaiting = (e: unknown) =>
-  e instanceof IpcError &&
-  (e.error.code === DESKTOP_ERROR_CODES.AUTH_BUSY ||
-    e.error.code === DESKTOP_ERROR_CODES.AUTH_FAILED);
+const leavesThePlanWaiting = (e: unknown) => {
+  if (!(e instanceof IpcError)) return false;
+  const { code, fields } = e.error;
+  return (
+    code === DESKTOP_ERROR_CODES.AUTH_BUSY ||
+    code === DESKTOP_ERROR_CODES.AUTH_FAILED ||
+    (code === DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE && OTHER_WAY.has(fields.reason))
+  );
+};
 
 /** A channel for `entry`: its events reach that entry object, whatever the map holds now. */
 function openChannel(entry: Entry): Subscription {
@@ -317,10 +327,10 @@ function releaser(entry: Entry): () => void {
  * The rejection is the answer, thrown as it came. The `Failed` that Rust may also send on this
  * call's channel is dropped, so the error shows once. A subscription the store already held for
  * the plan is held still while execute answers: when it starts the operation that subscription
- * ends (both carry the same events from the start); a busy prompt or a failed gesture (a wrong
- * password, the back-off) leaves the plan waiting for another try with the same `opId`, and the
- * subscription resumes; any other refusal ends the plan, and the subscription with it — its own
- * `Failed` would repeat the answer.
+ * ends (both carry the same events from the start); a busy prompt, a failed gesture (a wrong
+ * password, the back-off) or one asked the way that is not there (leavesThePlanWaiting) leaves
+ * the plan waiting for another try with the same `opId`, and the subscription resumes; any other
+ * refusal ends the plan, and the subscription with it — its own `Failed` would repeat the answer.
  */
 export async function execute(opId: OpId, password?: string): Promise<() => void> {
   const entry = entryFor(opId);
