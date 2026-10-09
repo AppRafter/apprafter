@@ -334,8 +334,9 @@ impl OperationManager {
     /// not become available by asking again, so both end the plan.
     ///
     /// Once the manager is [`close`](Self::close)d it refuses with `Closing`: before asking
-    /// anything, and again under the lock hold that would start the operation or put a busy
-    /// plan back, so a prompt that answers after the quit began starts nothing.
+    /// anything, and again under the lock hold that would start the operation or put a plan
+    /// back to wait (busy or failed), so a prompt that answers after the quit began starts
+    /// nothing and leaves nothing waiting.
     pub fn execute(
         self: &Arc<Self>,
         id: OpId,
