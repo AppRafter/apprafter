@@ -2,7 +2,7 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import type { Channel } from '@tauri-apps/api/core';
 import { clearMocks, mockIPC } from '@tauri-apps/api/mocks';
-import { act, render, renderHook } from '@testing-library/react';
+import { act, cleanup, render, renderHook } from '@testing-library/react';
 import { createElement } from 'react';
 import { IpcError } from './api';
 import { DESKTOP_ERROR_CODES } from './generated/errors';
@@ -75,7 +75,9 @@ beforeEach(() => {
   });
 });
 
+// Unmount first: a reset publishes, and a mounted hook would re-render outside act().
 afterEach(() => {
+  cleanup();
   resetOperations();
   clearMocks();
 });

@@ -17,6 +17,8 @@ import type { Settings } from '../generated/Settings';
 import type { Theme } from '../generated/Theme';
 import type { UiError } from '../generated/UiError';
 
+export { MOCK_TARGETS } from './fixtures';
+
 export interface MockOptions {
   readonly os?: Os;
   readonly theme?: Theme;

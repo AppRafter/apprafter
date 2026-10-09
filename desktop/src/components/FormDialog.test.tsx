@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 import { describe, expect, mock, test } from 'bun:test';
-import { render, screen } from '@testing-library/react';
+import { act, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { IpcError } from '../ipc/api';
 import { FormDialog, type FormSpec, type FormValues } from './FormDialog';
@@ -126,8 +126,10 @@ describe('FormDialog', () => {
     );
     await user.keyboard('{Escape}');
     expect(onClose).not.toHaveBeenCalled();
-    running.resolve();
-    await new Promise((r) => setTimeout(r, 0));
+    await act(async () => {
+      running.resolve();
+      await new Promise((r) => setTimeout(r, 0));
+    });
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
