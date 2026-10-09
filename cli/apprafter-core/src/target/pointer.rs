@@ -125,6 +125,16 @@ mod tests {
         );
     }
 
+    /// Overview §3.7.3: a cancelled `use` moves nothing.
+    #[test]
+    fn a_cancelled_use_keeps_the_default() {
+        let (_d, ctx) = store(&["a", "b"], Some("a"));
+        let plan = plan_use(&ctx, &TargetRef::named(&ctx, "b").unwrap()).unwrap();
+        let got = execute_use(&ctx, plan, &NullReporter, &cancelled_token());
+        assert!(matches!(got, Ok(Outcome::Cancelled { .. })), "{got:?}");
+        assert_eq!(cli_default(&ctx).unwrap().as_deref(), Some("a"));
+    }
+
     #[test]
     fn a_target_removed_after_the_plan_is_not_made_default() {
         let (_d, ctx) = store(&["a", "b"], Some("a"));

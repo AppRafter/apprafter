@@ -215,6 +215,19 @@ mod tests {
         assert!(!ctx.store().global_config_file().exists());
     }
 
+    /// Overview §3.7.3: a cancelled remove deletes nothing and keeps the default.
+    #[test]
+    fn a_cancelled_remove_deletes_nothing() {
+        let (_d, ctx) = store(&["prod"], Some("prod"));
+        seed_server(&ctx, "prod", 42, "platform-1", None);
+        let plan = plan_remove(&ctx, &TargetRef::named(&ctx, "prod").unwrap()).unwrap();
+        let got = execute_remove(&ctx, plan, &NullReporter, &cancelled_token());
+        assert!(matches!(got, Ok(Outcome::Cancelled { .. })), "{got:?}");
+        let store = ctx.store();
+        assert!(store.target_dir("prod").exists() && store.state_dir("prod").exists());
+        assert_eq!(cli_default(&ctx).unwrap().as_deref(), Some("prod"));
+    }
+
     #[test]
     fn a_corrupt_state_does_not_block_the_remove_and_the_plan_says_so() {
         let (_d, ctx) = store(&["prod"], None);

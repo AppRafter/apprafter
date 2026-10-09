@@ -249,6 +249,97 @@ mod tests {
         );
     }
 
+    /// A target that stores a region has its SKU checked there, not in the default region,
+    /// and a region chosen in the picker wins over the stored one. cx22 is sold in nbg1 only,
+    /// so the region the check ran in decides the outcome — every other machine test stores
+    /// nbg1, the default, and could not tell the two apart.
+    #[test]
+    fn a_sku_is_validated_in_the_stored_region_unless_the_choice_names_one() {
+        let mut s = mockito::Server::new();
+        let _t = route(&mut s, "/v1/server_types", 200, SERVER_TYPES, TOKEN_A).create();
+        let (_d, ctx) = store_at(&["prod"], Some("prod"), &s.url());
+        edit(&ctx, "prod", |t| t.config.region = Some("fsn1".into()));
+        let p = TargetRef::named(&ctx, "prod").unwrap();
+        let run = |c| {
+            execute_machine(
+                &ctx,
+                plan_machine(&ctx, &p, c).unwrap(),
+                &NullReporter,
+                &CancellationToken::new(),
+            )
+        };
+        let stored = || cli_core::load_target(&ctx.store(), "prod").unwrap().config;
+
+        let e = run(choice("cx22", None)).unwrap_err();
+        let ui = crate::error::UiError::from(&e);
+        assert_eq!(
+            ui.code.as_deref(),
+            Some("apprafter::provider::server_type_unavailable")
+        );
+        assert_eq!(ui.fields["location"], serde_json::json!("fsn1"));
+        assert_eq!(stored().server_type, None, "a refused SKU is never written");
+
+        let Outcome::Completed { result } = run(choice("cx32", None)).unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            result.sku_check,
+            SkuCheck::Validated {
+                sku: "cx32".into(),
+                region: "fsn1".into(),
+                region_was_default: false
+            }
+        );
+
+        let Outcome::Completed { result } = run(choice("cx22", Some("nbg1"))).unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            result.sku_check,
+            SkuCheck::Validated {
+                sku: "cx22".into(),
+                region: "nbg1".into(),
+                region_was_default: false
+            }
+        );
+        let c = stored();
+        assert_eq!(
+            (c.region.as_deref(), c.server_type.as_deref()),
+            (Some("nbg1"), Some("cx22"))
+        );
+    }
+
+    /// Overview §3.7.3: a `target machine` cancelled before its SKU check, or while it runs,
+    /// writes nothing.
+    #[test]
+    fn a_cancelled_machine_writes_nothing() {
+        let mut s = mockito::Server::new();
+        let cancel = CancellationToken::new();
+        let _t =
+            route_cancelling(&mut s, "/v1/server_types", SERVER_TYPES, TOKEN_A, &cancel).create();
+        let (_d, ctx) = store_at(&["prod"], Some("prod"), &s.url());
+        let p = TargetRef::named(&ctx, "prod").unwrap();
+        for (when, token) in [
+            ("before", cancelled_token()),
+            ("during the SKU check", cancel),
+        ] {
+            let plan = plan_machine(&ctx, &p, choice("cx22", Some("nbg1"))).unwrap();
+            let got = execute_machine(&ctx, plan, &NullReporter, &token);
+            assert!(
+                matches!(got, Ok(Outcome::Cancelled { .. })),
+                "{when}: {got:?}"
+            );
+            assert_eq!(
+                cli_core::load_target(&ctx.store(), "prod")
+                    .unwrap()
+                    .config
+                    .server_type,
+                None,
+                "{when}"
+            );
+        }
+    }
+
     #[test]
     fn the_cli_override_token_validates_the_sku() {
         // R4: override first

@@ -421,6 +421,106 @@ mod tests {
         l.assert();
     }
 
+    /// Page 2 of `/v1/server_types`: ccx13, sold in fsn1 only, and the last page.
+    const SERVER_TYPES_PAGE_2: &str = r#"{"server_types":[
+ {"id":200,"name":"ccx13","architecture":"x86","cpu_type":"dedicated","cores":2,"memory":8.0,"disk":80,"deprecation":null,
+  "locations":[{"name":"fsn1","available":true,"recommended":false}],"prices":[]}
+],"meta":{"pagination":{"next_page":null}}}"#;
+
+    /// `GET /v1/server_types?page=<page>` (TOKEN_A) answered by `body`.
+    fn server_types_page(
+        s: &mut mockito::Server,
+        page: &str,
+        body: impl Fn() -> String + Send + Sync + 'static,
+    ) -> mockito::Mock {
+        s.mock("GET", "/v1/server_types")
+            .match_query(mockito::Matcher::UrlEncoded("page".into(), page.into()))
+            .match_header("authorization", format!("Bearer {TOKEN_A}").as_str())
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body_from_request(move |_| body().into_bytes())
+    }
+
+    /// Page 1 of the catalogue, pointing at page 2. A second request for page 1 (a loop that
+    /// does not move on) gets an empty last page, so such a loop fails the test instead of
+    /// spinning.
+    fn first_page_once() -> impl Fn() -> String + Send + Sync + 'static {
+        let served = std::sync::atomic::AtomicBool::new(false);
+        move || {
+            if served.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                r#"{"server_types":[],"meta":{"pagination":{"next_page":null}}}"#.into()
+            } else {
+                SERVER_TYPES.replace(r#""next_page":null"#, r#""next_page":2"#)
+            }
+        }
+    }
+
+    /// The server types are read page by page (Hetzner pages them, `per_page=50`): a type on
+    /// page 2 is offered and validated like one on page 1. (The core keeps its own loop over
+    /// `list_server_types_page`, rather than `list_server_types`, to check the token between
+    /// pages — overview decision 13.)
+    #[test]
+    fn every_page_of_server_types_is_read() {
+        let mut s = mockito::Server::new();
+        let _l = route(&mut s, "/v1/locations", 200, LOCATIONS, TOKEN_A).create();
+        let _p1 = server_types_page(&mut s, "1", first_page_once()).create();
+        let p2 = server_types_page(&mut s, "2", || SERVER_TYPES_PAGE_2.into())
+            .expect(1)
+            .create();
+        let ctx = Context::for_desktop("/unused".into(), s.url());
+        let token = SecretString::new(TOKEN_A);
+        let cat = catalogue(&ctx, token_source(&token), &CancellationToken::new()).unwrap();
+        let skus: Vec<_> = cat.offers.iter().map(|o| o.sku.as_str()).collect();
+        assert!(
+            skus.contains(&"cx22") && skus.contains(&"ccx13"),
+            "{skus:?}"
+        );
+        p2.assert();
+
+        let mut s = mockito::Server::new();
+        let _p1 = server_types_page(&mut s, "1", first_page_once()).create();
+        let _p2 = server_types_page(&mut s, "2", || SERVER_TYPES_PAGE_2.into()).create();
+        let ctx = Context::for_desktop("/unused".into(), s.url());
+        check_sku(
+            &ctx,
+            &token,
+            "ccx13",
+            "fsn1",
+            cli_core::SkuCheckFor::TargetAdd { name: "p".into() },
+            &CancellationToken::new(),
+        )
+        .expect("a page-2 type is known");
+    }
+
+    /// The token is checked before every page: a cancel that lands while page 1 is served
+    /// stops the read before page 2 is asked for.
+    #[test]
+    fn a_cancel_between_pages_asks_for_no_further_page() {
+        let mut s = mockito::Server::new();
+        let cancel = CancellationToken::new();
+        let tripped = cancel.clone();
+        let first = first_page_once();
+        let _p1 = server_types_page(&mut s, "1", move || {
+            tripped.cancel();
+            first()
+        })
+        .create();
+        let p2 = server_types_page(&mut s, "2", || SERVER_TYPES_PAGE_2.into())
+            .expect(0)
+            .create();
+        let ctx = Context::for_desktop("/unused".into(), s.url());
+        let got = check_sku(
+            &ctx,
+            &SecretString::new(TOKEN_A),
+            "ccx13",
+            "fsn1",
+            cli_core::SkuCheckFor::TargetAdd { name: "p".into() },
+            &cancel,
+        );
+        assert!(matches!(got, Err(CoreError::Cancelled)), "{got:?}");
+        p2.assert();
+    }
+
     #[test]
     fn latencies_keep_the_input_order_and_run_concurrently() {
         let regions: Vec<String> = ["a", "b", "c", "d", "e"].map(String::from).to_vec();

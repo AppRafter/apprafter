@@ -98,6 +98,30 @@ pub(crate) fn route(
         .with_body(body)
 }
 
+/// [`route`] answering 200 / `body`, cancelling `cancel` as it answers: a cancel that lands
+/// while the request is in flight, which the provider calls do not see (they check before they
+/// send), so only a check after them can.
+pub(crate) fn route_cancelling(
+    s: &mut mockito::Server,
+    path: &str,
+    body: &'static str,
+    token: &str,
+    cancel: &crate::CancellationToken,
+) -> mockito::Mock {
+    let tripped = cancel.clone();
+    route(s, path, 200, body, token).with_body_from_request(move |_| {
+        tripped.cancel();
+        body.as_bytes().to_vec()
+    })
+}
+
+/// A token that is already cancelled.
+pub(crate) fn cancelled_token() -> crate::CancellationToken {
+    let c = crate::CancellationToken::new();
+    c.cancel();
+    c
+}
+
 pub(crate) const LOCATIONS: &str = r#"{"locations":[
  {"id":2,"name":"nbg1","description":"Nuremberg DC Park 1","country":"DE","city":"Nuremberg","network_zone":"eu-central"},
  {"id":1,"name":"fsn1","description":"Falkenstein DC Park 1","country":"DE","city":"Falkenstein","network_zone":"eu-central"}]}"#;

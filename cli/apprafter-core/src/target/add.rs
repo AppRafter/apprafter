@@ -1064,6 +1064,167 @@ mod tests {
         );
     }
 
+    /// Overview §3.7.3: `execute_add` checks its token before the ping and again before it takes
+    /// the lock, and a cancelled add writes nothing — not even the store root. Only the second
+    /// check sees a cancel that lands during the ping or the SKU check: the provider calls check
+    /// before they send, not after.
+    #[test]
+    fn a_cancelled_add_writes_nothing_whether_cancelled_before_or_during_its_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = |api: &str| Context::for_desktop(dir.path().join("store"), api);
+        let nothing_written = |ctx: &Context| assert!(!ctx.store().root().exists());
+
+        let mut s = mockito::Server::new();
+        let ping = route(&mut s, "/v1/locations", 200, LOCATIONS, TOKEN_A)
+            .expect(0)
+            .create();
+        let ctx = fresh(&s.url());
+        let plan = plan_add(&ctx, args("prod", TOKEN_A)).unwrap();
+        let got = execute_add(&ctx, plan, &NullReporter, &cancelled_token());
+        assert!(matches!(got, Ok(Outcome::Cancelled { .. })), "{got:?}");
+        ping.assert();
+        nothing_written(&ctx);
+
+        let mut s = mockito::Server::new();
+        let cancel = CancellationToken::new();
+        let _ping = route_cancelling(&mut s, "/v1/locations", LOCATIONS, TOKEN_A, &cancel).create();
+        let ctx = fresh(&s.url());
+        let plan = plan_add(&ctx, args("prod", TOKEN_A)).unwrap();
+        let got = execute_add(&ctx, plan, &NullReporter, &cancel);
+        assert!(
+            matches!(got, Ok(Outcome::Cancelled { .. })),
+            "during the ping: {got:?}"
+        );
+        nothing_written(&ctx);
+
+        let mut s = mockito::Server::new();
+        let cancel = CancellationToken::new();
+        let _ping = route(&mut s, "/v1/locations", 200, LOCATIONS, TOKEN_A).create();
+        let _types =
+            route_cancelling(&mut s, "/v1/server_types", SERVER_TYPES, TOKEN_A, &cancel).create();
+        let ctx = fresh(&s.url());
+        let plan = plan_add(
+            &ctx,
+            AddArgs {
+                server_type: Some("cx22".into()),
+                ..args("prod", TOKEN_A)
+            },
+        )
+        .unwrap();
+        let got = execute_add(&ctx, plan, &NullReporter, &cancel);
+        assert!(
+            matches!(got, Ok(Outcome::Cancelled { .. })),
+            "during the SKU check: {got:?}"
+        );
+        nothing_written(&ctx);
+    }
+
+    /// The same two checks in `execute_renew`: a cancelled renewal keeps the stored token.
+    #[test]
+    fn a_cancelled_renew_keeps_the_stored_token() {
+        let mut s = mockito::Server::new();
+        let cancel = CancellationToken::new();
+        let _ping = route_cancelling(&mut s, "/v1/locations", LOCATIONS, TOKEN_B, &cancel).create();
+        let (_d, ctx) = store_at(&["work"], Some("work"), &s.url());
+        let w = TargetRef::named(&ctx, "work").unwrap();
+        let plan = || {
+            plan_renew(
+                &ctx,
+                &w,
+                RenewArgs {
+                    token: SecretString::new(TOKEN_B),
+                    ssh_key: None,
+                },
+            )
+            .unwrap()
+        };
+        let stored_token = || {
+            cli_core::load_target(&ctx.store(), "work")
+                .unwrap()
+                .credentials
+                .hetzner_token
+        };
+        for (when, token) in [("before", cancelled_token()), ("during the ping", cancel)] {
+            let got = execute_renew(&ctx, plan(), &NullReporter, &token);
+            assert!(
+                matches!(got, Ok(Outcome::Cancelled { .. })),
+                "{when}: {got:?}"
+            );
+            assert_eq!(stored_token().as_deref(), Some(TOKEN_A), "{when}");
+        }
+    }
+
+    /// `--renew --ssh-key`: the plan names the key change (`~/` paths), the save writes the new
+    /// path and the outcome says the key changed; passing the stored path again is no change.
+    #[test]
+    fn a_renew_with_a_new_ssh_key_saves_it_and_the_stored_key_is_no_change() {
+        let (dir, ctx) = store(&["work"], Some("work"));
+        let ctx = ctx.with_no_ping(true);
+        let ssh = dir.path().join("home").join(".ssh");
+        std::fs::create_dir_all(&ssh).unwrap();
+        let (old, new) = (ssh.join("old.pub"), ssh.join("new.pub"));
+        for k in [&old, &new] {
+            std::fs::write(k, "ssh-ed25519 AAAA me@x\n").unwrap();
+        }
+        edit(&ctx, "work", |t| t.config.ssh_key_path = Some(old.clone()));
+        let w = TargetRef::named(&ctx, "work").unwrap();
+        let renew = |token: &str, key: &Path| {
+            plan_renew(
+                &ctx,
+                &w,
+                RenewArgs {
+                    token: SecretString::new(token),
+                    ssh_key: Some(key.to_path_buf()),
+                },
+            )
+            .unwrap()
+        };
+        let target_changes = |plan: &Plan<RenewPayload>| -> Vec<(ChangeAction, String)> {
+            plan.changes
+                .iter()
+                .filter(|c| c.kind == "Target")
+                .map(|c| (c.action, c.detail.clone().unwrap_or_default()))
+                .collect()
+        };
+        let shown = |f: &str| format!("~/{}", Path::new(".ssh").join(f).display());
+        let execute =
+            |plan| match execute_renew(&ctx, plan, &NullReporter, &CancellationToken::new())
+                .unwrap()
+            {
+                Outcome::Completed { result } => result,
+                o => panic!("{o:?}"),
+            };
+
+        let plan = renew(TOKEN_B, &new);
+        assert_eq!(
+            target_changes(&plan),
+            [(
+                ChangeAction::Update,
+                format!("ssh key: {} → {}", shown("old.pub"), shown("new.pub"))
+            )]
+        );
+        assert!(execute(plan).ssh_key_changed);
+        let t = cli_core::load_target(&ctx.store(), "work").unwrap();
+        assert_eq!(
+            (
+                t.config.ssh_key_path.as_deref(),
+                t.credentials.hetzner_token.as_deref()
+            ),
+            (Some(new.as_path()), Some(TOKEN_B))
+        );
+
+        let plan = renew(TOKEN_A, &new);
+        assert_eq!(target_changes(&plan), [], "the stored key is no change");
+        assert!(!execute(plan).ssh_key_changed);
+        assert_eq!(
+            cli_core::load_target(&ctx.store(), "work")
+                .unwrap()
+                .config
+                .ssh_key_path,
+            Some(new)
+        );
+    }
+
     #[test]
     fn a_renew_refuses_the_same_token_and_patches_the_target_as_it_is_at_the_save() {
         let (_d, ctx) = store(&["work"], Some("work"));

@@ -155,6 +155,21 @@ mod tests {
         assert!(ctx.store().state_dir("c").exists() && !ctx.store().target_dir("a").exists());
     }
 
+    /// Overview §3.7.3: a cancelled rename moves nothing — not the target, its state or the
+    /// default.
+    #[test]
+    fn a_cancelled_rename_moves_nothing() {
+        let (_d, ctx) = store(&["a"], Some("a"));
+        seed_server(&ctx, "a", 1, "platform-1", None);
+        let plan = plan_rename(&ctx, &TargetRef::named(&ctx, "a").unwrap(), "c").unwrap();
+        let got = execute_rename(&ctx, plan, &NullReporter, &cancelled_token());
+        assert!(matches!(got, Ok(Outcome::Cancelled { .. })), "{got:?}");
+        let store = ctx.store();
+        assert!(store.target_dir("a").exists() && store.state_dir("a").exists());
+        assert!(!store.target_dir("c").exists() && !store.state_dir("c").exists());
+        assert_eq!(cli_default(&ctx).unwrap().as_deref(), Some("a"));
+    }
+
     #[test]
     fn a_destination_created_after_the_plan_is_refused_under_the_lock() {
         let (_d, ctx) = store(&["a"], Some("a"));
