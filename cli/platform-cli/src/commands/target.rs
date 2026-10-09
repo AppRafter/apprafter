@@ -1271,6 +1271,27 @@ mod tests {
             })
     }
 
+    /// Bugs 6 + 10: each server-type refusal's help sends the reader to commands that exist.
+    #[test]
+    fn every_server_type_help_names_commands_that_exist() {
+        use cli_core::{SkuCheckFor, UnavailableKind};
+        for context in [
+            SkuCheckFor::Provision,
+            SkuCheckFor::TargetAdd { name: "p".into() },
+            SkuCheckFor::TargetMachine { name: "p".into() },
+        ] {
+            let e = CliError::ServerTypeUnavailable {
+                requested: "cx99".into(),
+                location: "nbg1".into(),
+                kind: UnavailableKind::Unknown,
+                alternatives: String::new(),
+                context: context.clone(),
+            };
+            let h = miette::Diagnostic::help(&e).unwrap().to_string();
+            assert!(assert_commands_parse(&h) >= 1, "{context:?}: {h}");
+        }
+    }
+
     #[test]
     fn the_command_check_refuses_a_command_that_does_not_exist() {
         assert_eq!(assert_commands_parse("run `apprafter target list`"), 1);

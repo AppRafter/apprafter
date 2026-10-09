@@ -65,6 +65,73 @@ impl UnavailableKind {
     }
 }
 
+/// Which command checked a server type: the way forward differs (bug 6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkuCheckFor {
+    /// `apply` / `up` (and `restore --reprovision`), about to create the machine.
+    Provision,
+    /// `target add <name> --server-type`.
+    TargetAdd { name: String },
+    /// `target machine` for target `name`.
+    TargetMachine { name: String },
+}
+
+impl SkuCheckFor {
+    /// The snake_case name, for machine-readable surfaces (the desktop's error fields).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SkuCheckFor::Provision => "provision",
+            SkuCheckFor::TargetAdd { .. } => "target_add",
+            SkuCheckFor::TargetMachine { .. } => "target_machine",
+        }
+    }
+}
+
+/// `ServerTypeUnavailable`'s help: why, per kind, then what to do, per command. It never points
+/// at "the alternatives above", which can read "(no live alternatives found in this region)".
+/// It names no server type of its own and no date (bug 10: "cx22 → cpx22 in early 2026" was shown for every
+/// kind, beside alternatives that offered cx22), and the manifest key `spec.nodes[0].type`, not
+/// the Rust field.
+fn server_type_help(
+    kind: &UnavailableKind,
+    context: &SkuCheckFor,
+    requested: &str,
+    location: &str,
+) -> String {
+    let why = match kind {
+        UnavailableKind::Unknown => {
+            format!("Hetzner sells no server type called `{requested}`; check its spelling.")
+        }
+        UnavailableKind::NotOfferedInRegion => format!(
+            "`{requested}` is sold, but not in `{location}`: pick another region or another type."
+        ),
+        UnavailableKind::Retired => {
+            format!("Hetzner no longer sells `{requested}`; pick another type.")
+        }
+        UnavailableKind::OutOfCapacity => format!(
+            "`{requested}` is sold out in `{location}` right now; retry later or pick another type \
+             or region."
+        ),
+    };
+    let what = match context {
+        SkuCheckFor::Provision => "Pass `--server-type <type>` to `apprafter up` / `apprafter \
+             apply`, set `spec.nodes[0].type` in the Infrastructure manifest, or run `apprafter \
+             target machine` to pick one."
+            .to_string(),
+        SkuCheckFor::TargetAdd { name } => format!(
+            "Run the same `apprafter target add {name} …` again with another `--server-type \
+             <type>`, or leave `--server-type` out and run `apprafter target machine --target \
+             {name}` later. Nothing was saved."
+        ),
+        SkuCheckFor::TargetMachine { name } => format!(
+            "Run `apprafter target machine --target {name} --server-type <type>` with another \
+             type, or run it in a terminal without `--server-type` to open the picker. Nothing \
+             was saved."
+        ),
+    };
+    format!("{why}\n{what}")
+}
+
 #[derive(Debug, Error, Diagnostic)]
 pub enum CliError {
     /// The `cue` binary was not found on `PATH`.
@@ -241,20 +308,15 @@ pub enum CliError {
     /// unknown / deprecated / unavailable in the requested region.
     /// `alternatives` carries up to 3 suggested live names for the
     /// same region (may contain newlines for multi-axis suggestions).
+    /// The help depends on why (`kind`) and on which command checked
+    /// (`context`), see [`server_type_help`].
     #[error(
-        "server type `{requested}` is unavailable in region `{location}`: {}\n  \
-         {alternatives}\n  \
-         (override via APPRAFTER_MANIFEST or `--server-type` once it lands)",
+        "server type `{requested}` is unavailable in region `{location}`: {}\n  {alternatives}",
         kind.human_reason()
     )]
     #[diagnostic(
         code(apprafter::provider::server_type_unavailable),
-        help(
-            "Hetzner periodically retires server types (e.g. cx22 → cpx22 in early 2026). \
-             The Infrastructure manifest's `nodes[0].kind` must reference a type that is still \
-             active in the chosen region. Pick one of the suggested alternatives above, or set \
-             `APPRAFTER_MANIFEST` to a manifest with a different `nodes[0].kind`."
-        )
+        help("{}", server_type_help(kind, context, requested, location))
     )]
     ServerTypeUnavailable {
         requested: String,
@@ -263,6 +325,8 @@ pub enum CliError {
         kind: UnavailableKind,
         /// Formatted suggestions (may contain newlines for multi-axis output).
         alternatives: String,
+        /// The command that checked the type.
+        context: SkuCheckFor,
     },
 
     /// No server type has been chosen yet.
@@ -652,24 +716,94 @@ mod tests {
         }
     }
 
-    #[test]
-    fn server_type_unavailable_diagnostic_explains_retirement_path() {
-        let err = CliError::ServerTypeUnavailable {
-            requested: "cx22".into(),
+    fn unavailable(kind: UnavailableKind, context: SkuCheckFor) -> CliError {
+        CliError::ServerTypeUnavailable {
+            requested: "cx99".into(),
             location: "nbg1".into(),
-            kind: UnavailableKind::Retired,
-            alternatives: "cpx22, cpx21".into(),
-        };
-        assert_eq!(
-            code_of(&err),
-            "apprafter::provider::server_type_unavailable"
+            kind,
+            alternatives: "try one of: cx22".into(),
+            context,
+        }
+    }
+
+    const KINDS: [UnavailableKind; 4] = [
+        UnavailableKind::Unknown,
+        UnavailableKind::NotOfferedInRegion,
+        UnavailableKind::Retired,
+        UnavailableKind::OutOfCapacity,
+    ];
+
+    fn contexts() -> [SkuCheckFor; 3] {
+        [
+            SkuCheckFor::Provision,
+            SkuCheckFor::TargetAdd { name: "p".into() },
+            SkuCheckFor::TargetMachine { name: "p".into() },
+        ]
+    }
+
+    /// Bugs 6 + 10: the remedy fits the command that checked the type, and the text names no
+    /// SKU, no year, no Rust field and no flag that "will land".
+    #[test]
+    fn the_server_type_help_fits_the_command_and_names_no_sku_or_year() {
+        let add = help_of(&unavailable(
+            UnavailableKind::Unknown,
+            SkuCheckFor::TargetAdd {
+                name: "prod".into(),
+            },
+        ));
+        assert!(
+            add.contains("`apprafter target add prod …` again with another `--server-type <type>`"),
+            "{add}"
         );
-        let help = help_of(&err);
-        // The retirement story (cx22 → cpx22 in early 2026) is the
-        // single most common reason operators hit this — keep it
-        // explicit so the error speaks for itself.
-        assert!(help.contains("cx22"), "missing cx22 context: {help}");
-        assert!(help.contains("cpx22"), "missing cpx22 context: {help}");
+        let machine = help_of(&unavailable(
+            UnavailableKind::Retired,
+            SkuCheckFor::TargetMachine {
+                name: "prod".into(),
+            },
+        ));
+        assert!(
+            machine.contains("apprafter target machine --target prod --server-type"),
+            "{machine}"
+        );
+        let up = help_of(&unavailable(
+            UnavailableKind::OutOfCapacity,
+            SkuCheckFor::Provision,
+        ));
+        assert!(up.contains("spec.nodes[0].type"), "{up}");
+        for kind in KINDS {
+            for ctx in contexts() {
+                let e = unavailable(kind, ctx);
+                assert_eq!(code_of(&e), "apprafter::provider::server_type_unavailable");
+                let (h, d) = (help_of(&e), e.to_string());
+                for bad in ["cpx22", "2026", "nodes[0].kind", "once it lands"] {
+                    assert!(!h.contains(bad) && !d.contains(bad), "{bad} in {d} / {h}");
+                }
+            }
+        }
+    }
+
+    /// The first line of the help says why, per kind; the alternatives stay in the message.
+    #[test]
+    fn the_server_type_help_says_why_for_each_kind() {
+        let why = |kind| help_of(&unavailable(kind, SkuCheckFor::Provision));
+        assert!(why(UnavailableKind::Unknown).contains("no server type called `cx99`"));
+        assert!(why(UnavailableKind::NotOfferedInRegion).contains("not in `nbg1`"));
+        assert!(why(UnavailableKind::Retired).contains("no longer sells `cx99`"));
+        assert!(why(UnavailableKind::OutOfCapacity).contains("sold out in `nbg1`"));
+        let shown = unavailable(UnavailableKind::Retired, SkuCheckFor::Provision).to_string();
+        assert!(shown.contains("try one of: cx22"), "{shown}");
+        // The alternatives line can say none were found, so the help never relies on it.
+        for kind in KINDS {
+            assert!(!why(kind).contains("above"), "{}", why(kind));
+        }
+    }
+
+    #[test]
+    fn sku_check_contexts_have_snake_case_names() {
+        assert_eq!(
+            contexts().map(|c| c.as_str()),
+            ["provision", "target_add", "target_machine"]
+        );
     }
 
     #[test]

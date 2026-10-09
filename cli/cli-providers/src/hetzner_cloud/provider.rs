@@ -327,7 +327,12 @@ impl Provider for HetznerCloudProvider {
                 "validating server_type pre-flight"
             );
             let types = self.client.list_server_types()?;
-            validate_server_type(&types.server_types, st, &self.spec.location)?;
+            validate_server_type(
+                &types.server_types,
+                st,
+                &self.spec.location,
+                cli_core::SkuCheckFor::Provision,
+            )?;
             Some(st)
         } else {
             None

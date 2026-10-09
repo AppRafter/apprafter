@@ -378,8 +378,7 @@ impl From<&CoreError> for UiError {
 }
 
 /// Fields of the pass-through `CliError`s the desktop acts on (D.3 overview §3.6.2). Keys are
-/// camelCase (R12); `status` is a JSON number. `ServerTypeUnavailable` gains `context` when
-/// D.3b adds the field to the error.
+/// camelCase (R12); `status` is a JSON number.
 fn project_cli(e: &cli_core::CliError, put: &mut impl FnMut(&str, serde_json::Value)) {
     use cli_core::CliError as C;
     match e {
@@ -405,11 +404,13 @@ fn project_cli(e: &cli_core::CliError, put: &mut impl FnMut(&str, serde_json::Va
             requested,
             location,
             kind,
+            context,
             ..
         } => {
             put("requested", json!(requested));
             put("location", json!(location));
             put("kind", json!(kind.as_str()));
+            put("context", json!(context.as_str()));
         }
         C::ExternalToolNotFound {
             tool,
@@ -585,6 +586,29 @@ mod tests {
         );
     }
 
+    /// The desktop learns which command refused the server type (overview §3.6.2).
+    #[test]
+    fn a_server_type_refusal_projects_its_context() {
+        let ui = |context| {
+            UiError::from(&CoreError::from(
+                cli_core::CliError::ServerTypeUnavailable {
+                    requested: "cx99".into(),
+                    location: "nbg1".into(),
+                    kind: cli_core::UnavailableKind::Unknown,
+                    alternatives: String::new(),
+                    context,
+                },
+            ))
+            .fields["context"]
+                .clone()
+        };
+        assert_eq!(
+            ui(cli_core::SkuCheckFor::TargetMachine { name: "p".into() }),
+            json!("target_machine")
+        );
+        assert_eq!(ui(cli_core::SkuCheckFor::Provision), json!("provision"));
+    }
+
     #[test]
     fn pass_through_errors_project_their_fields() {
         let sku = UiError::from(&CoreError::from(
@@ -593,6 +617,7 @@ mod tests {
                 location: "nbg1".into(),
                 kind: cli_core::UnavailableKind::Retired,
                 alternatives: String::new(),
+                context: cli_core::SkuCheckFor::TargetAdd { name: "p".into() },
             },
         ));
         assert_eq!(
@@ -603,6 +628,7 @@ mod tests {
             ),
             (json!("cx99"), json!("nbg1"), json!("retired"))
         );
+        assert_eq!(sku.fields["context"], json!("target_add"));
         let tool = UiError::from(&CoreError::from(cli_core::CliError::ExternalToolNotFound {
             tool: "kubectl".into(),
             needed_by: "apprafter doctor".into(),
@@ -811,6 +837,7 @@ mod tests {
                     location: "nbg1".into(),
                     kind: cli_core::UnavailableKind::Unknown,
                     alternatives: String::new(),
+                    context: cli_core::SkuCheckFor::Provision,
                 },
                 codes::SERVER_TYPE_UNAVAILABLE,
             ),

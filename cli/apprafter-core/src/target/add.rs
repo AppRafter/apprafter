@@ -329,7 +329,16 @@ pub fn execute_add(
                 Some(r) => (r, false),
                 None => (crate::machine::DEFAULT_REGION.to_string(), true),
             };
-            crate::machine::check_sku(ctx, &a.token, sku, &region, cancel)?;
+            crate::machine::check_sku(
+                ctx,
+                &a.token,
+                sku,
+                &region,
+                cli_core::SkuCheckFor::TargetAdd {
+                    name: a.name.clone(),
+                },
+                cancel,
+            )?;
             Some(SkuCheck::Validated {
                 sku: sku.clone(),
                 region,

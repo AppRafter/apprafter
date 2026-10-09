@@ -111,7 +111,14 @@ pub fn execute_machine(
         }
     } else {
         let token = hetzner_token(ctx, &target)?;
-        crate::machine::check_sku(ctx, &token, &choice.sku, &region, cancel)?;
+        crate::machine::check_sku(
+            ctx,
+            &token,
+            &choice.sku,
+            &region,
+            cli_core::SkuCheckFor::TargetMachine { name: name.clone() },
+            cancel,
+        )?;
         SkuCheck::Validated {
             sku: choice.sku.clone(),
             region,

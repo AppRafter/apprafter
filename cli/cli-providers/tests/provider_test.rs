@@ -799,8 +799,11 @@ fn apply_rejects_deprecated_server_type_before_any_post() {
         cli_core::CliError::ServerTypeUnavailable {
             requested,
             alternatives,
+            context,
             ..
         } => {
+            // Provisioning names itself, so the help sends the reader to `up` / the manifest.
+            assert_eq!(context, cli_core::SkuCheckFor::Provision);
             assert_eq!(requested, "cx22");
             assert!(alternatives.contains("cpx22"));
         }

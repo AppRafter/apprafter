@@ -171,16 +171,19 @@ fn server_types(
 }
 
 /// The SKU check of `execute_add` / `execute_machine`: server types only (no `/v1/locations`).
+/// `context` names the command, so a refusal carries it (its `UiError` field `context`, and the
+/// CLI's help).
 pub(crate) fn check_sku(
     ctx: &Context,
     token: &SecretString,
     sku: &str,
     region: &str,
+    context: cli_core::SkuCheckFor,
     cancel: &CancellationToken,
 ) -> CoreResult<()> {
     let types = server_types(&ctx.hetzner_client(token), cancel)?;
     Ok(cli_providers::hetzner_cloud::validate_server_type(
-        &types, sku, region,
+        &types, sku, region, context,
     )?)
 }
 
@@ -390,12 +393,31 @@ mod tests {
         let _t = route(&mut s, "/v1/server_types", 200, SERVER_TYPES, TOKEN_A).create();
         let ctx = Context::for_desktop("/unused".into(), s.url());
         let token = SecretString::new(TOKEN_A);
-        check_sku(&ctx, &token, "cx32", "fsn1", &CancellationToken::new()).unwrap();
-        let e = check_sku(&ctx, &token, "cx99", "nbg1", &CancellationToken::new()).unwrap_err();
+        let add = || cli_core::SkuCheckFor::TargetAdd { name: "p".into() };
+        check_sku(
+            &ctx,
+            &token,
+            "cx32",
+            "fsn1",
+            add(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let e = check_sku(
+            &ctx,
+            &token,
+            "cx99",
+            "nbg1",
+            add(),
+            &CancellationToken::new(),
+        )
+        .unwrap_err();
+        let ui = UiError::from(&e);
         assert_eq!(
-            UiError::from(&e).code.as_deref(),
+            ui.code.as_deref(),
             Some("apprafter::provider::server_type_unavailable")
         );
+        assert_eq!(ui.fields["context"], serde_json::json!("target_add"));
         l.assert();
     }
 

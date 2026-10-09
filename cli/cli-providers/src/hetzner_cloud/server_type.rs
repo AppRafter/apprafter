@@ -8,7 +8,7 @@
 //! provisioning SSH-key / network / firewall.
 
 use chrono::{DateTime, Utc};
-use cli_core::{CliError, Result, UnavailableKind};
+use cli_core::{CliError, Result, SkuCheckFor, UnavailableKind};
 
 use crate::machine::{offers_from_server_types, MachineOffer};
 
@@ -52,10 +52,17 @@ pub fn classify<'a>(
 }
 
 /// Validate that `requested` is a known, non-retired server type that
-/// is currently orderable in `location`.
+/// is currently orderable in `location`. `context` names the command
+/// that checks it, so the refusal's help fits that command.
 ///
-/// Signature is stable — `provider.rs` calls this directly.
-pub fn validate_server_type(types: &[ServerType], requested: &str, location: &str) -> Result<()> {
+/// Callers: `provider.rs` (provisioning) and apprafter-core's
+/// `machine::check_sku` (`target add`, `target machine`).
+pub fn validate_server_type(
+    types: &[ServerType],
+    requested: &str,
+    location: &str,
+    context: SkuCheckFor,
+) -> Result<()> {
     let offers = offers_from_server_types(types);
     match classify(&offers, requested, location, Utc::now()) {
         Ok(_) => Ok(()),
@@ -64,6 +71,7 @@ pub fn validate_server_type(types: &[ServerType], requested: &str, location: &st
             location: location.into(),
             kind,
             alternatives: alternatives_for(kind, &offers, requested, location),
+            context,
         }),
     }
 }
@@ -296,19 +304,21 @@ mod tests {
     #[test]
     fn ok_when_type_is_live_and_available_in_region() {
         let types = vec![live("cpx22", 2, 4.0, 80, "nbg1")];
-        assert!(validate_server_type(&types, "cpx22", "nbg1").is_ok());
+        assert!(validate_server_type(&types, "cpx22", "nbg1", SkuCheckFor::Provision).is_ok());
     }
 
     #[test]
     fn errs_when_type_is_unknown() {
         let types = vec![live("cpx22", 2, 4.0, 80, "nbg1")];
-        let err = validate_server_type(&types, "made-up", "nbg1").unwrap_err();
+        let err =
+            validate_server_type(&types, "made-up", "nbg1", SkuCheckFor::Provision).unwrap_err();
         match err {
             CliError::ServerTypeUnavailable {
                 requested,
                 location,
                 kind,
                 alternatives,
+                context: _,
             } => {
                 assert_eq!(requested, "made-up");
                 assert_eq!(location, "nbg1");
@@ -325,7 +335,7 @@ mod tests {
     #[test]
     fn errs_when_type_is_deprecated_globally() {
         let types = vec![dead("cx22", "nbg1"), live("cpx22", 2, 4.0, 80, "nbg1")];
-        let err = validate_server_type(&types, "cx22", "nbg1").unwrap_err();
+        let err = validate_server_type(&types, "cx22", "nbg1", SkuCheckFor::Provision).unwrap_err();
         match err {
             CliError::ServerTypeUnavailable {
                 kind, alternatives, ..
@@ -354,7 +364,8 @@ mod tests {
             deprecation: None,
         });
         let types = vec![t, live("cax11", 2, 4.0, 40, "nbg1")];
-        let err = validate_server_type(&types, "cpx22", "nbg1").unwrap_err();
+        let err =
+            validate_server_type(&types, "cpx22", "nbg1", SkuCheckFor::Provision).unwrap_err();
         match err {
             CliError::ServerTypeUnavailable {
                 kind, alternatives, ..
@@ -378,7 +389,7 @@ mod tests {
             live("cpx22", 2, 4.0, 80, "nbg1"),
             live("cpx32", 4, 8.0, 160, "nbg1"),
         ];
-        let err = validate_server_type(&types, "cx22", "nbg1").unwrap_err();
+        let err = validate_server_type(&types, "cx22", "nbg1", SkuCheckFor::Provision).unwrap_err();
         match err {
             CliError::ServerTypeUnavailable { alternatives, .. } => {
                 let cpx22_idx = alternatives.find("cpx22").expect("cpx22 in alternatives");
@@ -402,7 +413,7 @@ mod tests {
             other_region,
             live("cpx22", 2, 4.0, 80, "nbg1"),
         ];
-        let err = validate_server_type(&types, "cx22", "nbg1").unwrap_err();
+        let err = validate_server_type(&types, "cx22", "nbg1", SkuCheckFor::Provision).unwrap_err();
         match err {
             CliError::ServerTypeUnavailable { alternatives, .. } => {
                 assert!(alternatives.contains("cpx22"));
@@ -422,7 +433,7 @@ mod tests {
     #[test]
     fn alternatives_show_placeholder_when_no_live_options_in_region() {
         let types = vec![dead("cx22", "nbg1"), dead("cx32", "nbg1")];
-        let err = validate_server_type(&types, "cx22", "nbg1").unwrap_err();
+        let err = validate_server_type(&types, "cx22", "nbg1", SkuCheckFor::Provision).unwrap_err();
         match err {
             CliError::ServerTypeUnavailable { alternatives, .. } => {
                 assert!(
@@ -537,7 +548,8 @@ mod tests {
             deprecation: None,
         });
         let types = vec![t_fsn];
-        let err = validate_server_type(&types, "cpx22", "nbg1").unwrap_err();
+        let err =
+            validate_server_type(&types, "cpx22", "nbg1", SkuCheckFor::Provision).unwrap_err();
         match err {
             CliError::ServerTypeUnavailable {
                 kind, alternatives, ..
