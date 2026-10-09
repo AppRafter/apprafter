@@ -13,6 +13,7 @@ pub mod ops;
 pub mod runtime;
 pub mod settings;
 pub mod signals;
+pub mod theme;
 pub mod window;
 
 /// The product's name as people see it: the window title and the macOS app menu. Not Tauri's
@@ -42,8 +43,8 @@ use crate::settings::SettingsStore;
 /// [`exit_code`] 2), the authenticator ([`auth::choice`]: the OS's in a release, the fake in a
 /// test build), the app itself (the single-instance plugin first: a second launch only focuses
 /// the first window and exits; on macOS, the app menu), then the log, the settings and the
-/// shell, the tickers, the OS session watch (lock-on-sleep) and, on Linux and macOS, the quit
-/// signals. On Windows the prompts are parented to the main window as soon as it is built.
+/// shell, on Linux the window's theme and the desktop's colour scheme ([`theme::start`]), the
+/// tickers, the OS session watch (lock-on-sleep) and, on Linux and macOS, the quit signals. On Windows the prompts are parented to the main window as soon as it is built.
 ///
 /// The log starts once the app is built, so a second launch, which exits while the plugins
 /// start, writes nothing to the running app's log. It is still up before the window: Tauri
@@ -146,6 +147,10 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         move |state| app::emit_lock_changed(&handle, state),
     );
     app::install(&app, &cell, shell.clone())?;
+    // Linux: GTK's own preference for a dark theme before anything sets it, the stored theme
+    // on the window before it exists, and the desktop's colour scheme followed from here on.
+    #[cfg(target_os = "linux")]
+    theme::start(app.handle(), &shell.appearance);
     app::start_tickers(&shell)?;
     // The OS's lock and sleep signals, until a quit drops the watch. Started here, before the
     // event loop runs: macOS delivers them through it.

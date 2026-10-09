@@ -79,6 +79,7 @@ use crate::errors::{DesktopError, Refusal};
 use crate::lock::{LockChange, LockHook, LockMachine};
 use crate::ops::{panic_message, Clock, EventSink, OperationManager};
 use crate::settings::SettingsStore;
+use crate::theme::Appearance;
 
 /// How long a quit waits for cancelled operations to stop before it exits anyway: the CLI's
 /// helper-pod stop bound.
@@ -298,6 +299,9 @@ pub struct Shell {
     stop: Stop,
     /// The OS session watch ([`Shell::watch_session`]).
     session: Arc<Session>,
+    /// The native window's theme ([`crate::theme`]): `theme_apply`'s, and on Linux the
+    /// desktop's colour scheme under System.
+    pub appearance: Arc<Appearance>,
 }
 
 /// The tickers' stop signal: a ticker waits on it between ticks, so stopping wakes it at once.
@@ -386,6 +390,7 @@ impl Shell {
         let auth = AuthCache::new(auth);
         auth.apply_settings(&settings.get());
         let lock = LockMachine::new(settings.get(), auth.clone(), clock, hook);
+        let appearance = Arc::new(Appearance::new(settings.get().theme));
         Arc::new(Self {
             settings,
             lock,
@@ -397,6 +402,7 @@ impl Shell {
             drained: AtomicBool::new(false),
             stop: Stop::default(),
             session: Arc::default(),
+            appearance,
         })
     }
 
@@ -621,6 +627,7 @@ pub fn builder<R: Runtime>(base: tauri::Builder<R>, cell: ShellCell) -> tauri::B
         commands::op_discard,
         commands::op_execute,
         commands::window_ready,
+        commands::theme_apply,
     ]);
     let gate = cell.clone();
     base.invoke_handler(move |invoke| {

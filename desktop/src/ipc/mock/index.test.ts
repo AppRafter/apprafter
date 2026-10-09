@@ -41,6 +41,7 @@ function callEach(): Record<(typeof COMMANDS)[number], () => Promise<unknown>> {
     unlock: () => api.unlock(),
     unlock_with_password: () => api.unlockWithPassword(MOCK_PASSWORD),
     window_ready: () => api.windowReady(),
+    theme_apply: () => api.themeApply('system'),
   };
 }
 

@@ -15,8 +15,6 @@
     "core:event:allow-listen",
     // Drop that subscription when the component that made it unmounts.
     "core:event:allow-unlisten",
-    // The native title bar follows the app theme, the lock screen's included; changes nothing else.
-    "core:window:allow-set-theme",
     // The Windows caption buttons (the window has no decorations there); close is not granted:
     // that button quits through the app, which waits for running operations.
     "core:window:allow-minimize",
@@ -68,5 +66,8 @@
     "allow-op-discard",
     // Run a confirmed plan by op id (the OS gesture, when needed, is asked in Rust).
     "allow-op-execute",
+    // The native window follows the theme setting, the lock screen's included (answered while
+    // locked). In place of the window plugin's set-theme, whose null forces light on Linux.
+    "allow-theme-apply",
   ],
 }

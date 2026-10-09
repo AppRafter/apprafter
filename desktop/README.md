@@ -299,9 +299,9 @@ app shares.
   WebKitGTK graphics problems, most often on NVIDIA.
   - When the NVIDIA driver is loaded and the window opens on Wayland, the app turns
     WebKitGTK's DMA-BUF renderer off by itself, as `WEBKIT_DISABLE_DMABUF_RENDERER=1` does:
-    that renderer is what closes the window with `Error 71` there. Its log then has a line
-    that starts with `WebKitGTK's DMA-BUF renderer is off`. It does this whenever the NVIDIA
-    driver is loaded, also on a laptop whose screen another graphics chip drives.
+    that renderer is what closes the window with `Error 71` there. Its log then has a
+    `WebKitGTK's DMA-BUF renderer is off` line. It does this whenever the NVIDIA driver is
+    loaded, also on a laptop whose screen another graphics chip drives.
   - To keep the renderer on, start the app with `WEBKIT_DISABLE_DMABUF_RENDERER=0`. The app
     never changes a value you set yourself, whatever it is.
   - Tauri's [Linux graphics notes](https://tauri.app/develop/debug/linux-graphics/) give more
@@ -310,6 +310,13 @@ app shares.
     `WEBKIT_DISABLE_COMPOSITING_MODE=1`. Set a variable for one start, for example
     `WEBKIT_DISABLE_COMPOSITING_MODE=1 apprafter-desktop`. These have not been tested with
     this app.
+- **Theme set to System, but the app does not follow the desktop's light or dark mode.** On
+  Linux the app reads the desktop's colour scheme from the XDG desktop portal
+  (`org.freedesktop.portal.Desktop`), at start and whenever it changes. Without a portal, or
+  when the portal has no preference, the app uses `gtk-application-prefer-dark-theme` from
+  your GTK settings (`~/.config/gtk-3.0/settings.ini`) as it was when the app started, and
+  light without that. The log's `the XDG desktop portal's colour scheme` line has the answer:
+  `color_scheme=Some(1)` is dark, `Some(2)` light, `Some(0)` no preference, `None` no answer.
 - **Only the password field, never the system dialog.** Check that the policy is installed
   (`pkaction`, as above), that polkitd is installed and running, that a polkit agent runs in
   your session, and that you run the app as yourself (not with `sudo`) in a local desktop
@@ -454,9 +461,11 @@ just desktop-ipc-types  # after changing a type in desktop/ipc; commit the resul
 ```
 
 On Linux, `desktop-dev`, `desktop-build` and `desktop-check` first check the
-[system packages](#system-packages) with `pkg-config`. On NixOS, run the recipes inside
-`nix develop .#desktop`. On Windows, run `just` from a Git Bash shell: its recipes run with
-bash, and its shebang recipes need Git Bash's `cygpath`.
+[system packages](#system-packages) with `pkg-config`. The Linux tests also start a private
+D-Bus daemon of their own, so they need `dbus-daemon` (the `dbus-daemon` package on Debian and
+Ubuntu). On NixOS, run the recipes inside `nix develop .#desktop`, which has it. On Windows,
+run `just` from a Git Bash shell: its recipes run with bash, and its shebang recipes need Git
+Bash's `cygpath`.
 
 A development build asks the real system for sign-in. A test build,
 `cd desktop && bun run tauri dev --features test-build`, uses a scripted stand-in instead (see

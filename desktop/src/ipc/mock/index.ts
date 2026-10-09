@@ -281,7 +281,7 @@ export function installMockIpc(options: MockOptions = {}): void {
     op_discard: () => null,
     op_execute: notFound,
     window_ready: () => null,
-    'plugin:window|set_theme': () => null,
+    theme_apply: () => null,
     'plugin:window|minimize': () => null,
     'plugin:window|toggle_maximize': toggleMaximize,
     'plugin:window|internal_toggle_maximize': toggleMaximize,

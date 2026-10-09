@@ -92,9 +92,11 @@ fn every_command_is_registered_and_allowed_and_a_quit_starts_nothing_new() {
 
 /// Plugin commands never reach the app's invoke handler, so the lock gate never sees them:
 /// the capability is all that stands between a page and a plugin command. Pinned here for
-/// three a page could misuse — forging an event (`lock-changed` among them), closing the
+/// those a page could misuse — forging an event (`lock-changed` among them), closing the
 /// window past the quit (the Windows caption's close button quits through the app instead),
-/// reading the app's details — each refused by the ACL, while the granted ones pass it.
+/// reading the app's details, and the window's own `set_theme`, whose `null` forces a light
+/// theme on Linux (`theme_apply` sets the theme instead) — each refused by the ACL, while the
+/// granted ones pass it.
 #[test]
 fn plugin_commands_beyond_the_granted_ones_are_refused_by_the_acl() {
     let rig = rig(lock_off());
@@ -102,6 +104,7 @@ fn plugin_commands_beyond_the_granted_ones_are_refused_by_the_acl() {
         "plugin:event|emit",
         "plugin:window|close",
         "plugin:app|version",
+        "plugin:window|set_theme",
     ] {
         match invoke(&rig, cmd, json!({})) {
             Err(Value::String(error)) => assert!(
@@ -123,12 +126,8 @@ fn plugin_commands_beyond_the_granted_ones_are_refused_by_the_acl() {
         }
         other => panic!("listen with no arguments: {other:?}"),
     }
-    // The other controls: the native window follows the app theme, and the Windows caption
-    // buttons minimize and maximize it; each passes the ACL and runs on the mock window.
-    assert_eq!(
-        invoke(&rig, "plugin:window|set_theme", json!({ "value": "dark" })),
-        Ok(Value::Null)
-    );
+    // The other controls: the Windows caption buttons minimize and maximize the window; each
+    // passes the ACL and runs on the mock window.
     for cmd in ["plugin:window|minimize", "plugin:window|toggle_maximize"] {
         assert_eq!(invoke(&rig, cmd, json!({})), Ok(Value::Null), "{cmd}");
     }
@@ -239,7 +238,6 @@ fn the_capability_grants_the_pinned_permissions_and_every_app_command_only() {
     let mut expected: BTreeSet<String> = [
         "core:event:allow-listen",
         "core:event:allow-unlisten",
-        "core:window:allow-set-theme",
         "core:window:allow-minimize",
         "core:window:allow-toggle-maximize",
         "core:window:allow-is-maximized",
@@ -293,6 +291,32 @@ fn locked_the_app_answers_only_the_allowed_commands() {
     let info = invoke(&rig, "app_info", json!({})).unwrap();
     assert_eq!(info["auth"]["method"], "fake");
     assert_eq!(rig.auth.prompts.load(SeqCst), 0, "nothing asked the owner");
+}
+
+/// The lock screen has its theme too: `theme_apply` answers while locked, for every setting,
+/// and keeps the last one for the desktop's later changes; a value that is no setting is
+/// refused before it reaches the window.
+#[test]
+fn locked_the_page_still_applies_its_theme() {
+    let rig = rig(Settings::default());
+    assert_eq!(
+        invoke(&rig, "lock_status", json!({})).unwrap()["locked"],
+        true
+    );
+    for (theme, setting) in [
+        ("system", Theme::System),
+        ("light", Theme::Light),
+        ("dark", Theme::Dark),
+    ] {
+        let reply = invoke(&rig, "theme_apply", json!({ "theme": theme }));
+        assert_eq!(reply, Ok(Value::Null), "{theme}");
+        assert_eq!(rig.shell.appearance.setting(), setting);
+    }
+    match invoke(&rig, "theme_apply", json!({ "theme": "sepia" })) {
+        Err(Value::String(error)) => assert!(error.contains("invalid args"), "{error}"),
+        other => panic!("a theme that is no setting: {other:?}"),
+    }
+    assert_eq!(rig.shell.appearance.setting(), Theme::Dark);
 }
 
 #[test]

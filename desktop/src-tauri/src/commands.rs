@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use apprafter_core::UiError;
 use apprafter_desktop_ipc::{
-    AppInfo, LockState, OpEvent, OpId, OpSummary, Settings, Subscribed, SubscriptionId,
+    AppInfo, LockState, OpEvent, OpId, OpSummary, Settings, Subscribed, SubscriptionId, Theme,
 };
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Runtime, State, Webview, WebviewWindow};
@@ -252,6 +252,24 @@ pub async fn op_execute<R: Runtime>(
 pub async fn window_ready<R: Runtime>(window: WebviewWindow<R>) -> Result<(), UiError> {
     window::reveal(&window)
         .map_err(|e| DesktopError::Internal(format!("the window could not be shown: {e}")).to_ui())
+}
+
+/// Give the native window the theme the setting `theme` names ([`crate::theme`]): Light and
+/// Dark as they are; System left to the OS on macOS and Windows, and on Linux resolved from the
+/// desktop's colour scheme and followed while it stays System. Answered while locked, so the
+/// lock screen has its theme too. No blocking work: the theme is a message to the event loop.
+#[tauri::command]
+pub async fn theme_apply<R: Runtime>(
+    window: WebviewWindow<R>,
+    shell: ShellState<'_>,
+    theme: Theme,
+) -> Result<(), UiError> {
+    shell
+        .appearance
+        .apply(theme, |native| window.set_theme(native))
+        .map_err(|e| {
+            DesktopError::Internal(format!("the window theme was not applied: {e}")).to_ui()
+        })
 }
 
 #[cfg(test)]
