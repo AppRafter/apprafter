@@ -32,13 +32,15 @@ fn tools_on_path() -> tempfile::TempDir {
 /// tool does — a version line and exit 0 (`ssh -V` on stderr) — and anything else with a usage
 /// error. The resolver reports a tool that exits non-zero on its version call as having no
 /// version (whatever it printed), so a stand-in that did would test a broken tool instead.
-/// Unix only: on Windows the stand-ins stay hard links of `apprafter` (GOTCHA-66).
-#[cfg(unix)]
+/// On every platform: the Unix scripts and the Windows `apprafter-tool-stand-in` keep the
+/// same contract.
 #[test]
 fn the_stand_ins_answer_their_version_call_like_the_real_tools() {
     let tools = tools_on_path();
     for tool in cli_core::tools::ALL {
-        let bin = tools.path().join(tool.name);
+        let bin = tools
+            .path()
+            .join(format!("{}{}", tool.name, std::env::consts::EXE_SUFFIX));
         let out = std::process::Command::new(&bin)
             .args(tool.version_args)
             .output()

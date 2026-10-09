@@ -17,9 +17,11 @@ use tempfile::TempDir;
 /// stand-in that did would test that path instead of a working tool. Only shell builtins: the
 /// probed child's `PATH` is this directory alone (GOTCHA-104).
 ///
-/// Windows: a hard link of the `apprafter` binary under test, because Windows runs only real
-/// executables. It answers `--version` (git) and `-V` (ssh) with its own version, and the
-/// `version` subcommands of the others with a usage error and exit 2.
+/// Windows: a hard link of `apprafter-tool-stand-in` (`src/bin/apprafter-tool-stand-in.rs`),
+/// which answers exactly as the script does, the tool being its own file name. Windows runs
+/// only real executables, and the core's resolver takes only `<tool>.exe`, so neither a
+/// script nor a `.cmd` will do. That binary is built only with the `tool-stand-in` feature;
+/// without it these tests fail and say so, they never pass on a missing stand-in.
 pub fn tool_stand_ins<'a>(tools: impl IntoIterator<Item = &'a Tool>) -> TempDir {
     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("stand-in tools dir");
     for tool in tools {
@@ -69,5 +71,11 @@ fn write_stand_in(path: &std::path::Path, tool: &Tool) {
 
 #[cfg(not(unix))]
 fn write_stand_in(path: &std::path::Path, _tool: &Tool) {
-    std::fs::hard_link(env!("CARGO_BIN_EXE_apprafter"), path).expect("stand-in tool");
+    let Some(stand_in) = option_env!("CARGO_BIN_EXE_apprafter-tool-stand-in") else {
+        panic!(
+            "the Windows tool stand-ins are the `apprafter-tool-stand-in` binary: run the tests \
+             with `--features tool-stand-in` (CI passes `--all-features`)"
+        );
+    };
+    std::fs::hard_link(stand_in, path).expect("stand-in tool");
 }

@@ -25,6 +25,19 @@ path = "src/main.rs"
 name = "platform-cli"
 path = "src/bin/platform-cli.rs"
 
+# Test-only: the Windows stand-in for the tools `doctor` probes (tests/common/stand_in.rs).
+# Behind `tool-stand-in`, so a release build and `cargo install` never build it; the test
+# runs pass `--all-features` (CI) or `--features tool-stand-in`.
+[[bin]]
+name              = "apprafter-tool-stand-in"
+path              = "src/bin/apprafter-tool-stand-in.rs"
+required-features = ["tool-stand-in"]
+test              = false
+doc               = false
+
+[features]
+tool-stand-in = []
+
 [dependencies]
 age           = { workspace = true }
 arboard       = { workspace = true }
