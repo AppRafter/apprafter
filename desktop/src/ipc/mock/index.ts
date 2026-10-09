@@ -155,9 +155,14 @@ export function installMockIpc(options: MockOptions = {}): void {
   const handlers: Record<string, (args: InvokeArgs | undefined) => unknown> = {
     app_info: appInfo,
     settings_get: () => settings,
-    settings_set: (args) => {
+    settings_set: async (args) => {
       settings = (args as { settings: Settings }).settings;
-      lock = { ...lock, autoLockMinutes: autoLockMinutes() };
+      // As Rust: a new idle time is the same lock reported anew, numbered and emitted.
+      if (autoLockMinutes() !== lock.autoLockMinutes) {
+        seq += 1;
+        lock = { ...lock, autoLockMinutes: autoLockMinutes(), seq };
+        await emit(LOCK_CHANGED, lock);
+      }
       return settings;
     },
     lock_status: () => lock,

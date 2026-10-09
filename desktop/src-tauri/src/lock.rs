@@ -16,13 +16,16 @@
 //! of the machine.
 //!
 //! Every transition between locked and unlocked calls the hook exactly once, with the new
-//! state, under the machine's lock (so hooks run in transition order). The state at
-//! construction is not a transition: nothing is listening yet. Each transition numbers the
-//! state it enters, under that same lock ([`LockState::seq`], 0 at construction): every state
-//! the hook is told of and every [`LockMachine::state`] carries the number of the transition it
-//! follows, which is the order the page keeps — its time (`since_ms`) is the wall clock's, which
-//! can step back. The idle time is measured with [`elapsed_ms`](crate::ops::elapsed_ms): a
-//! suspend counts, a wall clock stepped back does not.
+//! state, under the machine's lock (so hooks run in transition order). So does every other
+//! change to what the state reports — its idle time, after a settings change or a new answer
+//! from the authenticator — as an update ([`LockChange::Update`]): the same lock, reported
+//! anew. The state at construction is neither: nothing is listening yet. Each of them numbers
+//! the state it enters, under that same lock ([`LockState::seq`], 0 at construction): every
+//! state the hook is told of and every [`LockMachine::state`] carries the number of the change
+//! it follows, which is the order the page keeps — its time (`since_ms`) is the wall clock's,
+//! which can step back — and two states with one number are the same state. The idle time is
+//! measured with [`elapsed_ms`](crate::ops::elapsed_ms): a suspend counts, a wall clock stepped
+//! back does not.
 //!
 //! # What waits for what
 //!
@@ -57,12 +60,21 @@ use crate::ops::{panic_message, Clock, Stamp};
 
 const MINUTE_MS: u64 = 60_000;
 
-/// Called on every transition between locked and unlocked, with the new state; the app drops
-/// pending plans, ends every operation subscription and emits `lock-changed`. It runs under
-/// the machine's lock, so it must be quick and must never call back into the machine (see the
-/// module docs for the lock order). A panic in it is caught and logged: the transition
-/// stands, and whoever made it — the idle ticker among them — goes on.
-pub type LockHook = Box<dyn Fn(&LockState) + Send + Sync>;
+/// Called with the new state on every transition between locked and unlocked, on which the app
+/// drops pending plans and ends every operation subscription, and on every update; on both it
+/// emits `lock-changed`. It runs under the machine's lock, so it must be quick and must never
+/// call back into the machine (see the module docs for the lock order). A panic in it is caught
+/// and logged: the change stands, and whoever made it — the idle ticker among them — goes on.
+pub type LockHook = Box<dyn Fn(&LockState, LockChange) + Send + Sync>;
+
+/// What a numbered change to the state was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockChange {
+    /// Locked, or unlocked.
+    Transition,
+    /// The same lock, reported anew: its idle time changed.
+    Update,
+}
 
 pub struct LockMachine {
     auth: Arc<dyn Authenticator>,
@@ -82,8 +94,10 @@ struct Inner {
     reason: Option<LockReason>,
     /// When the current state began, on the wall clock: what the webview shows.
     since_ms: u64,
-    /// The transitions so far: the current state's [`LockState::seq`].
+    /// The numbered changes so far: the current state's [`LockState::seq`].
     seq: u64,
+    /// The idle time the current state reports ([`LockState::auto_lock_minutes`]).
+    minutes: Option<u32>,
     /// The last activity (or unlock): the idle time runs from it.
     last_activity: Stamp,
     /// The unlock prompt while it is open; a second unlock is `AuthBusy` meanwhile.
@@ -117,6 +131,7 @@ impl LockMachine {
         let info = off_this_thread("auth-info", || auth.info());
         let reason =
             (in_effect(&settings, &info) && settings.lock_on_start).then_some(LockReason::Startup);
+        let minutes = reported_minutes(&settings, &info);
         Self {
             auth,
             clock,
@@ -126,6 +141,7 @@ impl LockMachine {
                 reason,
                 since_ms: now.wall_ms,
                 seq: 0,
+                minutes,
                 last_activity: now,
                 prompt: None,
                 closing: false,
@@ -135,9 +151,13 @@ impl LockMachine {
         }
     }
 
+    /// The state now. Should the authenticator's answer have changed what it reports (its idle
+    /// time), that is numbered first, as an update.
     pub fn state(&self) -> LockState {
         let info = self.auth.info();
-        state_of(&self.lock_inner(), &info)
+        let mut inner = self.lock_inner();
+        self.report(&mut inner, &info);
+        state_of(&inner)
     }
 
     /// `Locked` for any command not in [`ALLOWED_WHILE_LOCKED`] while locked. It never
@@ -163,6 +183,7 @@ impl LockMachine {
     pub fn tick(&self) {
         let info = self.auth.info();
         let mut inner = self.lock_inner();
+        self.report(&mut inner, &info);
         if inner.reason.is_some() || !in_effect(&inner.settings, &info) {
             return;
         }
@@ -313,7 +334,7 @@ impl LockMachine {
     /// Switching the lock on is refused with `AuthUnavailable` when nothing can verify the
     /// owner; keeping it on is not (the defaults have it on, and every other setting must
     /// stay changeable). Switching it off never unlocks. A new idle time applies from the
-    /// next tick.
+    /// next tick, and a change to what the state reports is numbered, as an update.
     ///
     /// `persist` runs outside the machine's lock, so a slow disk holds up no command, lock or
     /// tick; a lock of its own, held across `persist` and the apply, makes concurrent changes
@@ -338,18 +359,21 @@ impl LockMachine {
             });
         }
         persist(&settings)?;
-        self.lock_inner().settings = settings;
+        let mut inner = self.lock_inner();
+        inner.settings = settings;
+        self.report(&mut inner, &info);
         Ok(())
     }
 
-    /// Move to `reason` (`None` = unlocked), numbered as the next transition, and tell the
-    /// hook; a panic in the hook is logged, and the transition stands. The one place a state
+    /// Move to `reason` (`None` = unlocked), numbered as the next change, and tell the hook;
+    /// a panic in the hook is logged, and the transition stands. The one place the lock
     /// changes, always under the machine's lock. A lock first tells the authenticator
     /// ([`Authenticator::locked`]), so what the lock screen reads of it is fresh.
     fn enter(&self, inner: &mut Inner, info: &AuthInfo, reason: Option<LockReason>, now: u64) {
         inner.reason = reason;
         inner.since_ms = now;
         inner.seq += 1;
+        inner.minutes = reported_minutes(&inner.settings, info);
         self.locked.store(reason.is_some(), Ordering::SeqCst);
         if reason.is_some() {
             if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| self.auth.locked())) {
@@ -359,10 +383,27 @@ impl LockMachine {
                 );
             }
         }
-        let state = state_of(inner, info);
-        if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| (self.hook)(&state))) {
+        self.tell(&state_of(inner), LockChange::Transition);
+    }
+
+    /// When the idle time the state reports is no longer what the settings and `info` make it,
+    /// report it anew: an update, numbered as the next change. The other place the state
+    /// changes, also under the machine's lock.
+    fn report(&self, inner: &mut Inner, info: &AuthInfo) {
+        let minutes = reported_minutes(&inner.settings, info);
+        if minutes != inner.minutes {
+            inner.minutes = minutes;
+            inner.seq += 1;
+            self.tell(&state_of(inner), LockChange::Update);
+        }
+    }
+
+    /// The hook, with `state`; a panic in it is logged.
+    fn tell(&self, state: &LockState, change: LockChange) {
+        if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| (self.hook)(state, change))) {
             tracing::error!(
                 locked = state.locked,
+                ?change,
                 "the lock hook panicked: {}",
                 panic_message(&*payload)
             );
@@ -419,14 +460,19 @@ fn in_effect(settings: &Settings, info: &AuthInfo) -> bool {
     settings.lock_enabled && info.available
 }
 
-fn state_of(inner: &Inner, info: &AuthInfo) -> LockState {
+/// The idle time a state reports: none while the lock is not in effect or set to never.
+fn reported_minutes(settings: &Settings, info: &AuthInfo) -> Option<u32> {
+    in_effect(settings, info)
+        .then(|| settings.auto_lock.minutes())
+        .flatten()
+}
+
+fn state_of(inner: &Inner) -> LockState {
     LockState {
         locked: inner.reason.is_some(),
         reason: inner.reason,
         since_ms: inner.since_ms,
-        auto_lock_minutes: in_effect(&inner.settings, info)
-            .then(|| inner.settings.auto_lock.minutes())
-            .flatten(),
+        auto_lock_minutes: inner.minutes,
         seq: inner.seq,
     }
 }
@@ -449,7 +495,7 @@ mod tests {
 
     use zeroize::Zeroizing;
 
-    use super::LockMachine;
+    use super::{LockChange, LockMachine};
     use crate::auth::test_os::{self, Call, ScriptedOs};
     use crate::auth::{
         AuthPurpose, Authenticator, FakeAuthenticator, NoAuthenticator, PasswordAnswer,
@@ -464,13 +510,24 @@ mod tests {
     /// What a test waits before it calls something stuck.
     const LONG: Duration = Duration::from_secs(10);
 
-    /// Every state the hook was called with.
+    /// Every state the hook was called with, and why.
     #[derive(Default)]
-    struct Hooked(Mutex<Vec<LockState>>);
+    struct Hooked(Mutex<Vec<(LockState, LockChange)>>);
 
     impl Hooked {
+        /// The states of every call, transitions and updates.
         fn calls(&self) -> Vec<LockState> {
-            self.0.lock().unwrap().clone()
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(s, _)| s.clone())
+                .collect()
+        }
+
+        /// What each call was.
+        fn changes(&self) -> Vec<LockChange> {
+            self.0.lock().unwrap().iter().map(|(_, c)| *c).collect()
         }
     }
 
@@ -489,7 +546,9 @@ mod tests {
                 settings,
                 auth,
                 clock.clone(),
-                Box::new(move |state| hooked.0.lock().unwrap().push(state.clone())),
+                Box::new(move |state, change| {
+                    hooked.0.lock().unwrap().push((state.clone(), change))
+                }),
             ))
         };
         Rig {
@@ -1511,7 +1570,7 @@ mod tests {
                 unlocked_at_start(),
                 auth.clone(),
                 clock.clone(),
-                Box::new(move |state| {
+                Box::new(move |state, _| {
                     heard
                         .lock()
                         .unwrap()
@@ -1745,7 +1804,7 @@ mod tests {
                 unlocked_at_start(),
                 fake(),
                 clock.clone(),
-                Box::new(move |_| {
+                Box::new(move |_, _| {
                     if calls.fetch_add(1, SeqCst) == 0 {
                         panic!("the hook broke");
                     }
@@ -1820,7 +1879,7 @@ mod tests {
             unlocked_at_start(),
             fake(),
             Arc::new(ManualClock::at(T0)),
-            Box::new(move |_| {
+            Box::new(move |_, _| {
                 let gate = gate.lock().unwrap();
                 let _ = gate.0.send(());
                 // Until the test releases it, or fails and drops the sender.
@@ -1992,8 +2051,109 @@ mod tests {
             lock_enabled: false,
             ..Settings::default()
         };
+        r.clock.set(T0 + MIN);
         r.machine.set_settings(off, |_| Ok(())).unwrap();
-        assert!(r.machine.state().locked);
+        let still = locked(LockReason::Startup, T0, None, 1);
+        // Told by the save itself, before anything reads the state.
+        assert_eq!(
+            r.hooked.calls(),
+            std::slice::from_ref(&still),
+            "reported, as an update"
+        );
+        assert_eq!(r.hooked.changes(), [LockChange::Update]);
+        assert_eq!(
+            r.machine.state(),
+            still,
+            "locked since the start, no idle time now"
+        );
+    }
+
+    // M-8. Whatever changes what the state reports is numbered, so the page's order holds.
+
+    #[test]
+    fn a_new_idle_time_is_reported_as_a_numbered_update() {
+        let r = rig(unlocked_at_start(), fake());
+        r.machine.lock(LockReason::Manual);
+        r.clock.set(T0 + MIN);
+        let five = Settings {
+            auto_lock: AutoLock::Min5,
+            ..unlocked_at_start()
+        };
+        r.machine.set_settings(five, |_| Ok(())).unwrap();
+        let updated = locked(LockReason::Manual, T0, Some(5), 2);
+        // Told by the save itself, before anything reads the state.
+        assert_eq!(
+            r.hooked.changes(),
+            [LockChange::Transition, LockChange::Update]
+        );
+        assert_eq!(r.hooked.calls()[1], updated);
+        assert_eq!(
+            r.machine.state(),
+            updated,
+            "the same lock, since its own time"
+        );
+        let never = Settings {
+            auto_lock: AutoLock::Never,
+            ..unlocked_at_start()
+        };
+        r.machine.set_settings(never, |_| Ok(())).unwrap();
+        assert_eq!(r.machine.state(), locked(LockReason::Manual, T0, None, 3));
+    }
+
+    #[test]
+    fn a_save_that_changes_nothing_the_state_reports_is_not_numbered() {
+        let r = rig(unlocked_at_start(), fake());
+        for settings in [
+            Settings {
+                theme: Theme::Light,
+                ..unlocked_at_start()
+            },
+            Settings {
+                lock_on_sleep: false,
+                ..unlocked_at_start()
+            },
+            unlocked_at_start(),
+        ] {
+            r.machine.set_settings(settings, |_| Ok(())).unwrap();
+        }
+        assert_eq!(r.machine.state(), unlocked(T0, Some(10), 0));
         assert!(r.hooked.calls().is_empty());
+    }
+
+    /// The tie the page resolves by taking the state that arrives last: two states with one
+    /// number are the same state, idle time included.
+    #[test]
+    fn two_states_with_one_number_are_the_same_state() {
+        let r = rig(unlocked_at_start(), fake());
+        let mut seen = vec![r.machine.state()];
+        let settings = [
+            AutoLock::Min5,
+            AutoLock::Min30,
+            AutoLock::Never,
+            AutoLock::Min10,
+        ];
+        for (i, auto_lock) in settings.into_iter().enumerate() {
+            let s = Settings {
+                auto_lock,
+                ..unlocked_at_start()
+            };
+            r.machine.set_settings(s, |_| Ok(())).unwrap();
+            seen.push(r.machine.state());
+            if i == 1 {
+                r.machine.lock(LockReason::Manual);
+                seen.push(r.machine.state());
+                r.machine.unlock().unwrap();
+                seen.push(r.machine.state());
+            }
+        }
+        seen.extend(r.hooked.calls());
+        for a in &seen {
+            for b in &seen {
+                if a.seq == b.seq {
+                    assert_eq!(a, b, "one number, two states");
+                }
+            }
+        }
+        assert_eq!(r.machine.state().seq, 6);
     }
 }

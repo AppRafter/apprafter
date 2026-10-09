@@ -110,6 +110,20 @@ describe('installMockIpc', () => {
     unlisten();
   });
 
+  test('a new idle time is numbered and heard; a save that changes nothing is not', async () => {
+    installMockIpc();
+    await api.unlock();
+    const heard: LockState[] = [];
+    const unlisten = await onLockChanged((state) => heard.push(state));
+    const settings = await api.settingsGet();
+    await api.settingsSet({ ...settings, theme: 'light' });
+    await api.settingsSet({ ...settings, autoLock: '5' });
+    await settle();
+    expect(heard).toEqual([await api.lockStatus()]);
+    expect(heard[0]).toMatchObject({ locked: false, autoLockMinutes: 5, seq: 2 });
+    unlisten();
+  });
+
   test('with the lock switched off, lock now leaves the app unlocked', async () => {
     installMockIpc();
     await api.unlock();

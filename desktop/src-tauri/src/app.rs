@@ -75,7 +75,7 @@ use zeroize::Zeroizing;
 use crate::auth::Authenticator;
 use crate::commands;
 use crate::errors::{DesktopError, Refusal};
-use crate::lock::{LockHook, LockMachine};
+use crate::lock::{LockChange, LockHook, LockMachine};
 use crate::ops::{panic_message, Clock, EventSink, OperationManager};
 use crate::settings::SettingsStore;
 
@@ -342,7 +342,8 @@ impl Shell {
     /// locked and to unlocked — drops every pending plan, then ends every operation
     /// subscription, then calls `on_lock_change` with the new state (the app emits
     /// [`LOCK_CHANGED`]). All three run under the lock machine's lock: none may call back
-    /// into it.
+    /// into it. An update — the same lock reported anew, its idle time changed — only calls
+    /// `on_lock_change`: the page hears of it, and its plans and subscriptions stay.
     ///
     /// A lock ends the subscriptions because a locked page must receive nothing, and it
     /// cannot unsubscribe (the gate refuses `op_unsubscribe`): the shell unmounts on a lock and
@@ -368,9 +369,11 @@ impl Shell {
         let ops = OperationManager::new(clock.clone());
         let hook: LockHook = {
             let ops = ops.clone();
-            Box::new(move |state: &LockState| {
-                ops.drop_all_plans();
-                ops.drop_all_subscribers();
+            Box::new(move |state: &LockState, change| {
+                if change == LockChange::Transition {
+                    ops.drop_all_plans();
+                    ops.drop_all_subscribers();
+                }
                 on_lock_change(state);
             })
         };
@@ -1027,6 +1030,31 @@ mod tests {
         let state = r.shell.lock_now();
         assert!(!state.locked, "a lock nobody could open is no lock");
         assert!(r.notified.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_new_idle_time_tells_the_page_and_keeps_its_plans_and_subscriptions() {
+        let r = rig(unlocked_at_start(), Arc::new(FakeAuthenticator::new()));
+        let ran = Arc::new(AtomicBool::new(false));
+        let pending = plan(&r.shell, &ran);
+        let page = Arc::new(Sink::default());
+        r.shell.ops.subscribe(pending, page.clone()).unwrap();
+        let five = Settings {
+            auto_lock: AutoLock::Min5,
+            ..unlocked_at_start()
+        };
+        r.shell.set_settings(five).unwrap();
+        let heard = r.notified.lock().unwrap().clone();
+        assert_eq!(
+            heard.len(),
+            1,
+            "the page heard of it from the save: {heard:?}"
+        );
+        assert_eq!((heard[0].auto_lock_minutes, heard[0].seq), (Some(5), 1));
+        assert_eq!(r.shell.lock.state(), heard[0]);
+        assert!(page.0.lock().unwrap().is_empty(), "nothing ended");
+        r.shell.execute(pending, page.clone()).unwrap();
+        wait_until("the plan ran", || ran.load(SeqCst));
     }
 
     #[test]
