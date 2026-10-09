@@ -175,18 +175,28 @@ mod tests {
 
     #[test]
     fn the_token_is_the_cli_override_else_the_stored_one() {
-        let (dir, ctx) = store("http://unused", None, true);
+        let (_none, ctx) = store("http://unused", None, true);
         let t = TargetRef::named(&ctx, "prod").unwrap();
         assert!(
             matches!(hetzner_token(&ctx, &t), Err(CoreError::TokenNotStored { ref name }) if name == "prod")
         );
-        let cli = Context::from_cli_env(
-            &MapEnv::new()
-                .with("APPRAFTER_CONFIG_DIR", dir.path().to_str().unwrap())
-                .with("HCLOUD_TOKEN", "env-tok"),
-        )
-        .unwrap();
-        assert_eq!(hetzner_token(&cli, &t).unwrap().expose(), "env-tok");
+        // Both present: the override still wins (R4), so a stored-first order fails here.
+        let (dir, ctx) = store("http://unused", Some("stored-tok"), true);
+        let t = TargetRef::named(&ctx, "prod").unwrap();
+        assert_eq!(hetzner_token(&ctx, &t).unwrap().expose(), "stored-tok");
+        let cli = |env: MapEnv| {
+            Context::from_cli_env(&env.with("APPRAFTER_CONFIG_DIR", dir.path().to_str().unwrap()))
+                .unwrap()
+        };
+        let with_override = cli(MapEnv::new().with("HCLOUD_TOKEN", "env-tok"));
+        assert_eq!(
+            hetzner_token(&with_override, &t).unwrap().expose(),
+            "env-tok"
+        );
+        assert_eq!(
+            hetzner_token(&cli(MapEnv::new()), &t).unwrap().expose(),
+            "stored-tok"
+        );
     }
 
     #[test]
