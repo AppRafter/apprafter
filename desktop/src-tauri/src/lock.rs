@@ -56,7 +56,7 @@
 //! [`EventSink::send`](crate::ops::EventSink::send), from a Rust-side `lock-changed`
 //! listener, from the hook itself, or from `persist`. The [`AuthCache`]'s own lock comes last:
 //! the machine reads the cache under its lock, and the cache tells the machine of an answer on
-//! its asking thread, holding none of its own.
+//! its asking thread, holding none of its own. The lock on the tick's back-off is taken alone.
 
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -79,6 +79,11 @@ const MINUTE_MS: u64 = 60_000;
 /// How long the start waits for the authenticator's first answer, when it needs one (see the
 /// module docs).
 pub const STARTUP_WITHIN: Duration = Duration::from_millis(500);
+
+/// The first pause between the idle tick's own questions to an authenticator whose answer is
+/// unavailable, and the longest; it doubles in between ([`LockMachine::tick`]).
+pub const RE_ASK_FIRST: Duration = Duration::from_secs(5);
+pub const RE_ASK_LAST: Duration = Duration::from_secs(5 * 60);
 
 /// Called with the new state on every transition between locked and unlocked, on which the app
 /// drops pending plans and ends every operation subscription, and on every update; on both it
@@ -106,6 +111,24 @@ pub struct LockMachine {
     locked: AtomicBool,
     /// Held by [`set_settings`](Self::set_settings) across `persist` and the apply.
     settings_write: Mutex<()>,
+    /// When the tick next asks an unavailable authenticator again. Its lock is taken alone.
+    re_ask: Mutex<ReAsk>,
+}
+
+/// The tick's own questions while the authenticator's answer is unavailable: when the next is
+/// due on the monotonic clock (`None`: at the next tick), and the pause after it.
+struct ReAsk {
+    due_ms: Option<u64>,
+    pause: Duration,
+}
+
+impl Default for ReAsk {
+    fn default() -> Self {
+        Self {
+            due_ms: None,
+            pause: RE_ASK_FIRST,
+        }
+    }
 }
 
 struct Inner {
@@ -187,6 +210,7 @@ impl LockMachine {
             }),
             locked: AtomicBool::new(reason.is_some()),
             settings_write: Mutex::new(()),
+            re_ask: Mutex::default(),
         });
         let weak = Arc::downgrade(&machine);
         machine.auth.on_answer(move || {
@@ -205,6 +229,10 @@ impl LockMachine {
         let Some(info) = self.auth.known() else {
             return;
         };
+        if info.available {
+            // Any answer that the owner can be verified starts the tick's back-off over.
+            *self.re_ask.lock().unwrap_or_else(|p| p.into_inner()) = ReAsk::default();
+        }
         let close = {
             let mut inner = self.lock_inner();
             let provisional = std::mem::take(&mut inner.provisional);
@@ -259,10 +287,13 @@ impl LockMachine {
     /// the owner, it is asked again ([`AuthCache::refresh`]: off this thread, and one question
     /// however many ticks ask): a lock, a prompt or a save would ask, but none comes while the
     /// lock is off, so a first answer that was wrong for a moment (an OS still starting) would
-    /// keep it off for good. Once the answer is that the owner can be verified, a tick asks
-    /// nothing.
+    /// keep it off for good. An answer that stays unavailable (an administrator's refusal) is
+    /// asked less and less often: [`RE_ASK_FIRST`] after the first question, doubling up to
+    /// [`RE_ASK_LAST`], on the monotonic clock; any available answer starts that over. Once
+    /// the answer is that the owner can be verified, a tick asks nothing. Only the tick backs
+    /// off: a lock, a prompt, a save and `app_info` ask at once.
     pub fn tick(&self) {
-        if self.auth.known().is_none_or(|info| !info.available) {
+        if self.auth.known().is_none_or(|info| !info.available) && self.re_ask_due() {
             self.auth.refresh();
         }
         let info = self.auth.info();
@@ -278,6 +309,20 @@ impl LockMachine {
             let now = self.clock.now_ms();
             self.enter(&mut inner, &info, Some(LockReason::Idle), now);
         }
+    }
+
+    /// Whether the tick's next question is due; if so, the one after is due a pause later, and
+    /// the pause doubles, up to [`RE_ASK_LAST`].
+    fn re_ask_due(&self) -> bool {
+        let now = self.clock.monotonic_ms();
+        let mut re_ask = self.re_ask.lock().unwrap_or_else(|p| p.into_inner());
+        if re_ask.due_ms.is_some_and(|due| now < due) {
+            return false;
+        }
+        let pause = u64::try_from(re_ask.pause.as_millis()).unwrap_or(u64::MAX);
+        re_ask.due_ms = Some(now.saturating_add(pause));
+        re_ask.pause = (re_ask.pause * 2).min(RE_ASK_LAST);
+        true
     }
 
     /// Lock for `reason`. Already locked, it keeps the reason and time it locked with, and
@@ -1375,6 +1420,8 @@ mod tests {
         let r = rig(unlocked_at_start(), auth.clone());
         assert_eq!(r.machine.state().auto_lock_minutes, None, "not in effect");
         for (tick, in_effect) in [(1, false), (2, true)] {
+            // The idle ticker's interval, which is also the first pause between re-asks.
+            r.clock.advance(5_000);
             r.machine.tick();
             assert!(r.cache.settled(LONG));
             assert_eq!(auth.asked.load(SeqCst), tick + 1, "tick {tick} asked again");
@@ -1393,6 +1440,75 @@ mod tests {
         r.clock.set(T0 + 10 * MIN);
         r.machine.tick();
         assert_eq!(r.machine.state().reason, Some(LockReason::Idle));
+    }
+
+    /// An OS whose answer the test switches; counts the questions.
+    #[derive(Default)]
+    struct Switched {
+        available: AtomicBool,
+        asked: AtomicUsize,
+    }
+
+    impl Authenticator for Switched {
+        fn info(&self) -> AuthInfo {
+            self.asked.fetch_add(1, SeqCst);
+            if self.available.load(SeqCst) {
+                FakeAuthenticator::new().info()
+            } else {
+                NoAuthenticator.info()
+            }
+        }
+
+        fn verify(&self, _purpose: &AuthPurpose, _cancel: &CancellationToken) -> AuthOutcome {
+            AuthOutcome::Verified
+        }
+    }
+
+    /// An answer that stays "unavailable" (an administrator's `rules.d` NO, say) is not asked
+    /// again every 5 s for good: the tick's own re-asks wait 5 s, then 10, 20 … up to 5
+    /// minutes, on the monotonic clock, and any available answer starts them over.
+    #[test]
+    fn the_tick_s_re_asks_back_off_to_five_minutes_and_an_available_answer_resets_them() {
+        let os = Arc::new(Switched::default());
+        let r = rig(unlocked_at_start(), os.clone());
+        let asked = || {
+            assert!(r.cache.settled(LONG));
+            os.asked.load(SeqCst)
+        };
+        // A tick every 5 s, from `from` to `to` seconds after T0: the seconds it asked at.
+        let ticks = |from: u64, to: u64| {
+            let mut asked_at = Vec::new();
+            for second in (from..=to).step_by(5) {
+                r.clock.set(T0 + second * 1000);
+                let before = asked();
+                r.machine.tick();
+                if asked() > before {
+                    asked_at.push(second);
+                }
+            }
+            asked_at
+        };
+        assert_eq!(ticks(5, 900), [5, 10, 20, 40, 80, 160, 320, 620]);
+        // A wall clock stepped forward is no time passing.
+        let before = asked();
+        r.clock.set_wall(T0 + 900_000 + DAY);
+        r.machine.tick();
+        assert_eq!(asked(), before, "the wall clock moved the re-ask");
+        r.clock.set_wall(T0 + 900_000);
+        assert_eq!(ticks(905, 1220), [920, 1220], "five minutes apart at most");
+
+        // An available answer, from anything that asks (here as `app_info` would).
+        os.available.store(true, SeqCst);
+        assert!(r.cache.fresh(LONG).is_some_and(|info| info.available));
+        os.available.store(false, SeqCst);
+        r.cache.refresh();
+        assert!(r.cache.settled(LONG));
+        assert_eq!(
+            r.machine.state().auto_lock_minutes,
+            None,
+            "unavailable again"
+        );
+        assert_eq!(ticks(1225, 1400), [1225, 1230, 1240, 1260, 1300, 1380]);
     }
 
     #[test]

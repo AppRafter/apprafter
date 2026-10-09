@@ -11,12 +11,12 @@
 //!
 //! It asks again ([`AuthCache::refresh`]): at start; after every lock ([`Authenticator::locked`]);
 //! after every prompt and every password check, whatever they answered; after every settings
-//! save (Windows' `hello` changes the method); on every idle tick while it has no answer or its
-//! last one says nothing can verify the owner ([`LockMachine::tick`]); and whenever `app_info`
-//! asks, which then waits for that answer, bounded ([`AuthCache::fresh`]) — before any answer,
-//! for the question already out. One question at a time: asked while one is out, they become
-//! one more question after it. A question that never comes back leaves the last answer in
-//! place, so the idle lock goes on.
+//! save (Windows' `hello` changes the method); on idle ticks while it has no answer or its last
+//! one says nothing can verify the owner, 5 s apart at first and up to 5 minutes as that answer
+//! stays ([`LockMachine::tick`]); and whenever `app_info` asks, which then waits for that
+//! answer, bounded ([`AuthCache::fresh`]) — before any answer, for the question already out.
+//! One question at a time: asked while one is out, they become one more question after it. A
+//! question that never comes back leaves the last answer in place, so the idle lock goes on.
 //!
 //! It keeps what the OS can do, never an authorisation: every prompt and every password is
 //! asked of the OS afresh. Until the first answer, [`AuthCache::info`] is [`UNANSWERED`],
