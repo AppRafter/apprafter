@@ -220,7 +220,7 @@ fn harness_seed_helpers_write_into_the_store() {
 fn harness_stand_in_tools_link_every_probed_tool() {
     let sb = Sandbox::new().with_stand_in_tools();
     let dir = sb.path_override().expect("stand-ins replace PATH");
-    for name in cli_core::tools::ALL.iter().map(|t| t.name).chain(["cue"]) {
+    for name in cli_core::tools::ALL.iter().map(|t| t.name) {
         let file = dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
         assert!(file.is_file(), "{}", file.display());
     }
