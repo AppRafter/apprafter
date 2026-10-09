@@ -2,7 +2,7 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
 import { QueryClientProvider } from '@tanstack/react-query';
 import { clearMocks } from '@tauri-apps/api/mocks';
-import { cleanup, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { ToastProvider, ToastViewport } from '../../components/Toast';
 import { DESKTOP_ERROR_CODES } from '../../ipc/generated/errors';
@@ -12,7 +12,7 @@ import { ViewFrame } from '../../shell/ViewFrame';
 import { PlatformContext } from '../../state/platform';
 import { createQueryClient } from '../../state/queryClient';
 import { appInfo } from '../../test/fixtures';
-import { catalogue } from '../../test/flows';
+import { catalogue, planParts, targetAdded } from '../../test/flows';
 import {
   cancelled,
   completed,
@@ -240,5 +240,174 @@ describe('machine step', () => {
     // test/flows' catalogue(): fsn1 offers cpx22 only.
     await user.click(screen.getByRole('radio', { name: 'cpx22' }));
     expect(next.disabled).toBe(false);
+  });
+});
+
+/** Tasks 13–14's path to the details step: verify, the catalogue (nbg1, cx22 recommended), Continue. */
+async function toDetails(user: ReturnType<typeof userEvent.setup>) {
+  h.answer('ssh_key_candidates', [
+    {
+      path: '/home/alex/.ssh/id_ed25519.pub',
+      display: '~/.ssh/id_ed25519.pub',
+      algo: 'ssh-ed25519',
+      comment: 'alex@host',
+    },
+  ]);
+  await toMachine(user);
+  await screen.findByRole('table', { name: 'Machines in nbg1' });
+  await user.click(screen.getByRole('button', { name: 'Continue' }));
+  await waitFor(() => expect(currentStep()).toContain('Details'));
+}
+
+const saveButton = () => screen.getByRole('button', { name: 'Save target' }) as HTMLButtonElement;
+
+describe('details and save', () => {
+  test('a Bounded plan is saved by the Save click: no dialog; toast, list refreshed, closed', async () => {
+    h.plan('op_plan_target_add', planParts({ class: 'bounded', title: 'Add target lab-2' }), [
+      completed(targetAdded({ name: 'lab-2', cliDefault: { from: null, to: 'lab-2' } })),
+    ]);
+    const { user, onClose } = renderWizard();
+    await toDetails(user);
+    await user.type(screen.getByLabelText('Target name'), 'lab-2');
+    await user.click(screen.getByRole('radio', { name: /Team \(T2\)/ }));
+    await user.click(saveButton());
+    expect(
+      await screen.findByText('Target “lab-2” saved. Your CLI default is now lab-2.'),
+    ).toBeDefined();
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(h.of('op_plan_target_add')[0]?.args).toEqual({
+      args: {
+        name: 'lab-2',
+        provider: 'hetzner-cloud',
+        draftId: 7,
+        sshKey: '/home/alex/.ssh/id_ed25519.pub',
+        region: 'nbg1',
+        tier: 'team',
+        serverType: 'cx22',
+      },
+    });
+    expect(h.of('op_execute')).toHaveLength(1);
+    expect(screen.queryByRole('dialog', { name: /confirm/i })).toBeNull();
+    await waitFor(() => expect(h.of('target_list').length).toBeGreaterThan(1)); // invalidated: read again
+    expect(h.of('target_draft_discard')).toHaveLength(0); // the plan took the draft
+  });
+
+  test('a Destructive plan is never run without its dialog (guard)', async () => {
+    h.plan(
+      'op_plan_target_add',
+      planParts({ class: 'destructive', title: 'Replace target lab-2' }),
+      [completed(targetAdded({ name: 'lab-2' }))],
+    );
+    const { user } = renderWizard();
+    await toDetails(user);
+    await user.type(screen.getByLabelText('Target name'), 'lab-2');
+    await user.click(saveButton());
+    expect(await screen.findByRole('dialog', { name: 'Replace target lab-2' })).toBeDefined();
+    expect(h.of('op_execute')).toHaveLength(0);
+  });
+
+  test("confirmed in its dialog, a Destructive plan runs once and saves; the wizard's own Save does not fire", async () => {
+    h.plan(
+      'op_plan_target_add',
+      planParts({ class: 'destructive', title: 'Replace target lab-2' }),
+      [completed(targetAdded({ name: 'lab-2' }))],
+    );
+    const { user, onClose } = renderWizard();
+    await toDetails(user);
+    await user.type(screen.getByLabelText('Target name'), 'lab-2');
+    await user.click(saveButton());
+    const dialog = await screen.findByRole('dialog', { name: 'Replace target lab-2' });
+    await user.click(within(dialog).getByRole('button', { name: 'Save target' }));
+    expect(await screen.findByText('Target “lab-2” saved.')).toBeDefined();
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(h.of('op_plan_target_add')).toHaveLength(1);
+    expect(h.of('op_execute')).toHaveLength(1);
+    expect(screen.queryByText(/Enter it again to retry/)).toBeNull();
+  });
+
+  test('a refused plan keeps the draft and says why; Save works again after a fix', async () => {
+    h.answer('op_plan_target_add', () =>
+      Promise.reject(
+        uiError('apprafter::target::exists', 'target `prod-eu` already exists', {
+          name: 'prod-eu',
+        }),
+      ),
+    );
+    const { user } = renderWizard();
+    await toDetails(user);
+    await user.type(screen.getByLabelText('Target name'), 'prod-eu');
+    await user.click(saveButton());
+    expect(await screen.findByText('target `prod-eu` already exists')).toBeDefined();
+    expect(saveButton().disabled).toBe(false);
+  });
+
+  test('a failed save needs the token again: the button says so and goes there', async () => {
+    h.plan('op_plan_target_add', planParts({}), [
+      failed(
+        uiError('apprafter::target::token_rejected', 'Hetzner Cloud rejected the token (HTTP 401)'),
+      ),
+    ]);
+    const { user } = renderWizard();
+    await toDetails(user);
+    await user.type(screen.getByLabelText('Target name'), 'lab-2');
+    await user.click(saveButton());
+    expect(await screen.findByText('Hetzner Cloud rejected the token (HTTP 401)')).toBeDefined();
+    await user.click(screen.getByRole('button', { name: 'Enter the token again' }));
+    expect(screen.getByLabelText('API token')).toBeDefined();
+    expect(screen.queryByLabelText('Target name')).toBeNull();
+  });
+
+  test('name rules inline, a taken name inline (target_list), Save disabled meanwhile', async () => {
+    h.answer('target_list', {
+      targets: [
+        {
+          name: 'prod-eu',
+          provider: 'hetzner-cloud',
+          region: 'nbg1',
+          serverType: null,
+          defaultTier: null,
+          tierLevel: null,
+          isCliDefault: true,
+        },
+      ],
+      unreadable: [],
+      cliDefault: { status: 'set', name: 'prod-eu' },
+    });
+    const { user } = renderWizard();
+    await toDetails(user);
+    const field = screen.getByLabelText('Target name');
+    await user.type(field, '-x');
+    expect(screen.getByText('No dash at the start or the end.')).toBeDefined(); // D.3d's nameMessage('edge_dash')
+    await user.clear(field);
+    await user.type(field, 'prod-eu');
+    expect(await screen.findByText('A target named prod-eu exists.')).toBeDefined();
+    expect(saveButton().disabled).toBe(true);
+  });
+
+  test('SSH: the first key is chosen; Other path is checked on leaving the field; Skip sends none', async () => {
+    h.answer('ssh_key_inspect', ({ path }: Record<string, unknown>) => ({
+      path,
+      display: String(path),
+      exists: false,
+      algo: null,
+    }));
+    h.plan('op_plan_target_add', planParts({}), [completed(targetAdded({ name: 'lab-2' }))]);
+    const { user } = renderWizard();
+    await toDetails(user);
+    await user.type(screen.getByLabelText('Target name'), 'lab-2');
+    expect(
+      (screen.getByRole('radio', { name: '~/.ssh/id_ed25519.pub' }) as HTMLInputElement).checked,
+    ).toBe(true);
+    await user.click(screen.getByRole('radio', { name: 'Other path…' }));
+    await user.type(screen.getByLabelText('Path to a public key'), '/nowhere/key.pub');
+    await user.tab();
+    expect(await screen.findByText('No file at that path.')).toBeDefined();
+    expect(h.of('ssh_key_inspect')[0]?.args).toEqual({ path: '/nowhere/key.pub' });
+    expect(saveButton().disabled).toBe(true);
+    await user.click(screen.getByRole('radio', { name: 'Skip' }));
+    await user.click(saveButton());
+    await screen.findByText('Target “lab-2” saved.');
+    const planned = h.of('op_plan_target_add')[0]?.args.args as { sshKey: unknown } | undefined;
+    expect(planned?.sshKey).toBeNull();
   });
 });

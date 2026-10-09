@@ -19,6 +19,26 @@
   color: var(--warn);
 }
 
+/* The details step: name, tier cards and the key list, one column. */
+.wizard-details {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 14px;
+}
+
+/* What the core found at the path typed under "Other path…". */
+.ssh-path-status[data-tone="ok"] {
+  color: var(--ok);
+}
+
+.ssh-path-status[data-tone="err"] {
+  color: var(--err);
+}
+
+.ssh-path-status[data-tone="faint"] {
+  color: var(--fg-faint);
+}
+
 /* Machine picker ------------------------------------------------------------------------- */
 
 /* The design's step 2: region row, tools row, table and summary, 16 px apart as in the body. */
