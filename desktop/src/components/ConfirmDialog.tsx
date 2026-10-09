@@ -5,9 +5,9 @@
 // so the dialog only says which prompt comes next — except where the OS cannot prompt
 // (AuthInfo.passwordField): there the dialog has its own password field, whose value onConfirm
 // hands to execute() and Rust checks. It refuses as the lock screen's does, and is shown the same
-// way: the OS's words or a plain line, the back-off counted down from what Rust says, busy. The
-// field is emptied after every answer; a wrong password leaves the plan waiting in Rust, so the
-// owner simply tries again.
+// way: the OS's words or a plain line, the back-off counted down from what Rust says, busy; the
+// field is marked until the owner types again. The field is emptied after every answer; a wrong
+// password leaves the plan waiting in Rust, so the owner simply tries again.
 import { type FormEvent, type ReactNode, useEffect, useId, useRef, useState } from 'react';
 import { uiErrorOf } from '../ipc/api';
 import type { AuthInfo } from '../ipc/generated/AuthInfo';
@@ -168,10 +168,15 @@ export function ConfirmDialog({
               ref={passwordInput}
               label="System password"
               value={password}
-              onChange={setPassword}
+              onChange={(value) => {
+                setPassword(value);
+                // The refusal was about the last password: typing a new one ends it.
+                setRefusal((lines) => (lines.length === 0 ? lines : []));
+              }}
               mono={false}
               readOnly={busy}
               disabled={backoff}
+              aria-invalid={refusal.length > 0 || undefined}
             />
           </div>
         )}

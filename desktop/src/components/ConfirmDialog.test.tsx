@@ -210,6 +210,21 @@ describe('ConfirmDialog where the OS cannot prompt: the password field', () => {
     expect(onClose).not.toHaveBeenCalled();
   });
 
+  test('a refusal marks the field until the owner types again, as the lock screen does', async () => {
+    const { user } = open({
+      auth: pam,
+      onConfirm: () =>
+        Promise.reject(refusal(DESKTOP_ERROR_CODES.AUTH_FAILED, { exhausted: false })),
+    });
+    expect(password().getAttribute('aria-invalid')).toBeNull();
+    await user.type(password(), 'guess{Enter}');
+    await screen.findByRole('alert');
+    expect(password().getAttribute('aria-invalid')).toBe('true');
+    await user.type(password(), 'h');
+    expect(password().getAttribute('aria-invalid')).toBeNull();
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
   test('…and that the password is not right when the OS said nothing', async () => {
     const { user } = open({
       auth: pam,

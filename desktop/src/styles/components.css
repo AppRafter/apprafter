@@ -796,6 +796,11 @@
   padding-left: 34px;
 }
 
+/* A refused password, until the owner types again (as on the lock screen). */
+.confirm-password .input[aria-invalid="true"] {
+  border-color: var(--err);
+}
+
 .confirm-refusal {
   display: flex;
   flex-direction: column;
