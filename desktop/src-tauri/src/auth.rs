@@ -127,27 +127,35 @@ impl Authenticator for NoAuthenticator {
 /// ([`apprafter_os_auth::OsAuthenticator`]): one implementation per OS in the app, a recording
 /// fake in the tests. So what the shell adds — the action for each purpose, its clock, which
 /// setting reaches the OS — is tested on every OS without asking this machine's OS anything.
-/// What an OS does not have is a default that does nothing.
+///
+/// No method has a default: each OS says what it does with every one, even nothing, so a
+/// forward left out (Windows' `set_window`, without which every prompt answers
+/// `NotInteractive`) does not compile.
 pub(crate) trait Backend: Send + Sync {
     fn info(&self) -> AuthInfo;
     fn verify(&self, action: Action, cancel: &CancellationToken) -> AuthOutcome;
-    /// Linux's PAM path; elsewhere the field is not the OS's way.
+    /// Linux's PAM path; elsewhere the field is not the OS's way ([`PasswordAnswer::NOT_HERE`]).
     fn verify_password(
         &self,
-        _action: Action,
+        action: Action,
         password: Zeroizing<String>,
-        _cancel: &CancellationToken,
-        _now_monotonic_ms: u64,
-    ) -> PasswordAnswer {
-        drop(password);
-        PasswordAnswer::NOT_HERE
-    }
+        cancel: &CancellationToken,
+        now_monotonic_ms: u64,
+    ) -> PasswordAnswer;
     /// Linux: forget that the last polkit dialog found no authentication agent.
-    fn forget_missing_agent(&self) {}
+    fn forget_missing_agent(&self);
     /// Windows: the `hello` setting.
-    fn set_hello(&self, _on: bool) {}
+    fn set_hello(&self, on: bool);
     /// Windows: the window prompts are parented to.
-    fn set_window(&self, _hwnd: isize) {}
+    fn set_window(&self, hwnd: isize);
+}
+
+/// [`Backend::verify_password`] where the field is not the OS's way: the password is wiped
+/// unread.
+#[cfg(any(test, target_os = "macos", windows))]
+fn not_here(password: Zeroizing<String>) -> PasswordAnswer {
+    drop(password);
+    PasswordAnswer::NOT_HERE
 }
 
 /// The OS's own authentication (the module docs list it per OS).
@@ -236,6 +244,12 @@ impl Backend for OsAuthenticator {
     fn forget_missing_agent(&self) {
         OsAuthenticator::reset_agent_memory(self);
     }
+
+    /// Hello is Windows'.
+    fn set_hello(&self, _on: bool) {}
+
+    /// polkit's agent and the PAM field need no window.
+    fn set_window(&self, _hwnd: isize) {}
 }
 
 /// A PAM check as the shell's answer.
@@ -256,6 +270,26 @@ impl Backend for OsAuthenticator {
     fn verify(&self, action: Action, cancel: &CancellationToken) -> AuthOutcome {
         OsAuthenticator::verify(self, action, cancel)
     }
+
+    /// The system draws its own dialog, password included.
+    fn verify_password(
+        &self,
+        _action: Action,
+        password: Zeroizing<String>,
+        _cancel: &CancellationToken,
+        _now_monotonic_ms: u64,
+    ) -> PasswordAnswer {
+        not_here(password)
+    }
+
+    /// No agent to forget.
+    fn forget_missing_agent(&self) {}
+
+    /// Hello is Windows'.
+    fn set_hello(&self, _on: bool) {}
+
+    /// The dialog has no parent window.
+    fn set_window(&self, _hwnd: isize) {}
 }
 
 #[cfg(windows)]
@@ -267,6 +301,20 @@ impl Backend for OsAuthenticator {
     fn verify(&self, action: Action, cancel: &CancellationToken) -> AuthOutcome {
         OsAuthenticator::verify(self, action, cancel)
     }
+
+    /// Hello and the credential dialog ask themselves.
+    fn verify_password(
+        &self,
+        _action: Action,
+        password: Zeroizing<String>,
+        _cancel: &CancellationToken,
+        _now_monotonic_ms: u64,
+    ) -> PasswordAnswer {
+        not_here(password)
+    }
+
+    /// No agent to forget.
+    fn forget_missing_agent(&self) {}
 
     fn set_hello(&self, on: bool) {
         OsAuthenticator::set_hello(self, on);
@@ -800,6 +848,18 @@ mod tests {
             fn verify(&self, _action: Action, _cancel: &CancellationToken) -> AuthOutcome {
                 AuthOutcome::Verified
             }
+            fn verify_password(
+                &self,
+                _action: Action,
+                password: Zeroizing<String>,
+                _cancel: &CancellationToken,
+                _now_monotonic_ms: u64,
+            ) -> PasswordAnswer {
+                super::not_here(password)
+            }
+            fn forget_missing_agent(&self) {}
+            fn set_hello(&self, _on: bool) {}
+            fn set_window(&self, _hwnd: isize) {}
         }
         let auth = SystemAuthenticator::with(Box::new(Prompts), Arc::new(ManualClock::at(0)));
         let token = CancellationToken::new();
