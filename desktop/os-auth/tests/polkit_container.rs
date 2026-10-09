@@ -30,7 +30,8 @@ use std::time::{Duration, Instant};
 
 use apprafter_core::CancellationToken;
 use apprafter_desktop_ipc::{AuthOutcome, CancelledBy, UnavailableReason};
-use apprafter_os_auth::linux::polkit::{verify, Action};
+use apprafter_os_auth::linux::polkit::{probe, verify, Action, PROBE_TIMEOUT};
+use apprafter_os_auth::OsAuthenticator;
 use zbus::zvariant::{OwnedValue, Value};
 use zbus_polkit::policykit1::{AuthorityProxyBlocking, Subject};
 
@@ -462,5 +463,42 @@ fn a_dialog_the_app_cancels_is_cancelled_by_the_app() {
         },
         "agent transcript:\n{}",
         agent.transcript()
+    );
+}
+
+/// A polkitd that does not answer (the driver stops it after it took its name): the probe gives
+/// up after `PROBE_TIMEOUT` as if there were no polkitd, and so does the authenticator's `info`,
+/// which the shell's idle lock depends on. Neither waits for ever.
+#[test]
+#[ignore = "needs the polkit container: bash scripts/test-osauth-linux.sh"]
+fn a_polkitd_that_does_not_answer_is_given_up_on() {
+    container();
+    let bound = PROBE_TIMEOUT + Duration::from_secs(5);
+    let (tx, answered) = mpsc::channel();
+    let started = Instant::now();
+    thread::spawn(move || {
+        let _ = tx.send(probe(Action::Unlock));
+    });
+    let answer = answered
+        .recv_timeout(bound)
+        .unwrap_or_else(|_| panic!("the probe did not answer within {bound:?}"));
+    assert_eq!(answer, Err(unavailable(UnavailableReason::NoBackend)));
+    assert!(
+        started.elapsed() >= PROBE_TIMEOUT - Duration::from_millis(500),
+        "answered after {:?}: polkitd was not stopped",
+        started.elapsed()
+    );
+
+    let (tx, answered) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(OsAuthenticator::new().info());
+    });
+    let info = answered
+        .recv_timeout(bound)
+        .unwrap_or_else(|_| panic!("info did not answer within {bound:?}"));
+    assert_ne!(
+        info.method,
+        Some(apprafter_desktop_ipc::AuthMethod::Polkit),
+        "a polkitd that does not answer is not offered: {info:?}"
     );
 }

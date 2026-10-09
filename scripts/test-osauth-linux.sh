@@ -34,7 +34,8 @@
 #
 # The session watch's cases play logind and the screen savers themselves: --fake-logind lets
 # `walk` own org.freedesktop.login1 on the container's system bus (there is no systemd), and
-# --session-bus starts a session bus of `walk`'s and hands the test its address. --no-system-bus
+# --session-bus starts a session bus of `walk`'s and hands the test its address. --stopped-polkitd
+# stops polkitd once it owns its name, so it never answers. --no-system-bus
 # points the test's system bus at a socket that does not exist, as on a system without one (the
 # container's own bus and polkitd still run).
 #
@@ -66,6 +67,7 @@ CASES=(
     "polkit_container a_rule_that_grants_without_asking_is_refused --rule-yes"
     "polkit_container outside_an_active_local_session_it_is_not_permitted --no-session"
     "polkit_container a_dialog_the_app_cancels_is_cancelled_by_the_app"
+    "polkit_container a_polkitd_that_does_not_answer_is_given_up_on --stopped-polkitd"
     "pam_container the_right_password_is_verified"
     "pam_container wrong_passwords_fail_and_the_back_off_refuses_without_asking_pam"
     "pam_container without_a_service_file_there_is_no_pam_service --no-pam-service"
@@ -166,7 +168,7 @@ cat >"$work/osauth-case" <<'DRIVER_EOF'
 set -euo pipefail
 
 policy=yes rule=none session=yes active=yes pam_service=yes password=yes
-fake_logind=no session_bus=no system_bus=yes
+fake_logind=no session_bus=no system_bus=yes stopped_polkitd=no
 while [[ $# -gt 2 ]]; do
     case "$1" in
     --no-policy) policy=no ;;
@@ -179,6 +181,7 @@ while [[ $# -gt 2 ]]; do
     --fake-logind) fake_logind=yes ;;
     --session-bus) session_bus=yes ;;
     --no-system-bus) system_bus=no ;;
+    --stopped-polkitd) stopped_polkitd=yes ;;
     *)
         echo "osauth-case: unknown flag $1" >&2
         exit 2
@@ -259,6 +262,7 @@ fi
 mkdir -p /run/dbus
 dbus-daemon --system --fork
 /usr/lib/polkit-1/polkitd --log-level=info >/tmp/polkitd.log 2>&1 &
+polkitd=$!
 ready=no
 for _ in $(seq 100); do
     reply="$(dbus-send --system --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus \
@@ -273,6 +277,10 @@ if [[ $ready != yes ]]; then
     echo "osauth-case: polkitd did not take its bus name" >&2
     cat /tmp/polkitd.log >&2
     exit 3
+fi
+if [[ $stopped_polkitd == yes ]]; then
+    # polkitd keeps its name and stops answering: a hung polkitd.
+    kill -STOP "$polkitd"
 fi
 
 # A session bus of `walk`'s, which only `walk` may connect to.

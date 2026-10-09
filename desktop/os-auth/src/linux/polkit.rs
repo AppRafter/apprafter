@@ -28,6 +28,11 @@
 //!   `polkit.dismissed` (`check_authorization_challenge_cb`, polkit 126), so it is `Failed`,
 //!   not the `NotPermittedHere` the same answer means in step 1.
 //!
+//! A [`probe`] asks nobody, so its connection gives each call [`PROBE_TIMEOUT`]: a polkitd that
+//! does not answer by then is hung, and the probe answers as if there were none
+//! (`Unavailable { NoBackend }`, the password field's way). [`verify`]'s connection has no
+//! limit: its step 2 waits for a person, who may take minutes.
+//!
 //! Threads: zbus's blocking API, whose own executor thread drives the socket. [`verify`] blocks
 //! its caller until the agent answers, so it runs on a blocking worker, never on an async
 //! worker or the main thread. While the dialog is open a second, scoped thread waits to send
@@ -59,6 +64,9 @@ impl Action {
     }
 }
 
+/// How long a probe waits for each answer from polkitd (see the module docs).
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Asks polkit to authenticate the device owner for `action` (the module docs give the steps).
 /// Blocks until the agent answers; `cancel` closes the agent's dialog. A token already tripped
 /// opens nothing.
@@ -66,7 +74,8 @@ pub fn verify(action: Action, cancel: &CancellationToken) -> AuthOutcome {
     if cancel.is_cancelled() {
         return APP_CANCELLED;
     }
-    match SystemBus::connect() {
+    // No limit: step 2 waits for the owner.
+    match SystemBus::connect(None) {
         Ok(bus) => authenticate(&bus, action.id(), cancel),
         Err(error) => map_polkit(PolkitAnswer::Error(error)),
     }
@@ -75,9 +84,11 @@ pub fn verify(action: Action, cancel: &CancellationToken) -> AuthOutcome {
 /// Step 1 alone, for `action`: whether polkit would open the session's authentication agent,
 /// asking nobody. `Ok` when it would; otherwise the outcome [`verify`] would give without a
 /// dialog. `Ok` does not say an agent is registered: polkit tells that only to a check that may
-/// open one, so only [`verify`] finds `NoAgent`.
+/// open one, so only [`verify`] finds `NoAgent`. A polkitd silent for [`PROBE_TIMEOUT`] is
+/// none: `Unavailable { NoBackend }`.
 pub fn probe(action: Action) -> Result<(), AuthOutcome> {
-    let bus = SystemBus::connect().map_err(|error| map_polkit(PolkitAnswer::Error(error)))?;
+    let bus = SystemBus::connect(Some(PROBE_TIMEOUT))
+        .map_err(|error| map_polkit(PolkitAnswer::Error(error)))?;
     probe_with(&bus, action.id())
 }
 
@@ -277,8 +288,15 @@ struct SystemBus {
 }
 
 impl SystemBus {
-    fn connect() -> Result<Self, PolkitError> {
-        let connection = zbus::blocking::Connection::system().map_err(|e| polkit_error(&e))?;
+    /// The system bus, each call on it given `method_timeout` (none: no limit).
+    fn connect(method_timeout: Option<Duration>) -> Result<Self, PolkitError> {
+        let builder =
+            zbus::blocking::connection::Builder::system().map_err(|e| polkit_error(&e))?;
+        let builder = match method_timeout {
+            Some(limit) => builder.method_timeout(limit),
+            None => builder,
+        };
+        let connection = builder.build().map_err(|e| polkit_error(&e))?;
         let name = connection.unique_name().ok_or(PolkitError::Other)?;
         let name =
             OwnedValue::try_from(Value::from(name.as_str())).map_err(|_| PolkitError::Other)?;
@@ -326,10 +344,14 @@ impl Authority for SystemBus {
 }
 
 /// A D-Bus error as polkit's: its error name, or [`PolkitError::Other`] for anything that is not
-/// an error reply (no system bus, no polkitd on it).
+/// an error reply (no system bus, no polkitd on it, a call past its time limit — logged).
 fn polkit_error(error: &zbus::Error) -> PolkitError {
     match error {
         zbus::Error::MethodError(name, _, _) => PolkitError::from_name(name.as_str()),
+        zbus::Error::InputOutput(io) if io.kind() == std::io::ErrorKind::TimedOut => {
+            tracing::warn!("polkitd did not answer within {PROBE_TIMEOUT:?}: counted as absent");
+            PolkitError::Other
+        }
         _ => PolkitError::Other,
     }
 }
@@ -719,6 +741,12 @@ mod tests {
 
     /// The action ids here are the ones the policy file registers, and the file asks for the
     /// user's own password every time, never an administrator's and never a kept grant.
+    /// A probe asks nobody, so a polkitd silent this long is hung, not waiting for the owner.
+    #[test]
+    fn a_probe_waits_five_seconds_for_polkitd() {
+        assert_eq!(PROBE_TIMEOUT, Duration::from_secs(5));
+    }
+
     #[test]
     fn the_policy_file_registers_both_actions_with_auth_self_only() {
         let policy = include_str!("../../../packaging/linux/dev.apprafter.desktop.policy");
