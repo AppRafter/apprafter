@@ -36,8 +36,9 @@ The first build downloads Rust crates and npm packages, so it needs network acce
 - **bun 1.4.x** from [bun.sh](https://bun.sh), or through [mise](https://mise.jdx.dev)
   (`mise install` at the repository root; `mise.toml` pins it). bun 1.3 cannot read
   `desktop/bun.lock`.
-- **cue v0.17.1**, which the build runs. `scripts/cue` uses `$CUE_BIN` when it is set, then a
-  `cue` on `PATH` that reports exactly v0.17.1, then `nix run .#cue` (x86_64 Linux only).
+- **cue v0.17.1**, which the build runs. `scripts/cue` uses `$CUE` or `$CUE_BIN` when one is
+  set, then a `cue` on `PATH` that reports exactly v0.17.1, then `nix run .#cue` (x86_64 Linux
+  only), and as a last resort any other `cue` on `PATH`, with only a warning.
   Without Nix, install that version from its
   [release page](https://github.com/cue-lang/cue/releases/tag/v0.17.1). On Linux, with `curl`:
 
@@ -57,7 +58,7 @@ expects the Vite dev server on `localhost:1420`.
 
 What is tested: CI builds the app on Ubuntu 24.04 (x86_64) and installs its packages into
 Debian 13 and Fedora 44 containers. The polkit and PAM sign-in is tested in Debian 13
-containers. Builds on Fedora or Arch, and other architectures, are not tested.
+containers. Builds on Debian, Fedora or Arch, and on other architectures, are not tested.
 
 ### System packages
 
@@ -102,9 +103,18 @@ sudo apt install ./target/release/bundle/deb/apprafter-desktop_*_amd64.deb   # D
 sudo dnf install ./target/release/bundle/rpm/apprafter-desktop-*.x86_64.rpm  # Fedora
 ```
 
-dnf warns that a local package is not signed and skips its OpenPGP check. That is expected for
-a package you built. Start the app from your applications menu (**AppRafter**) or with
-`apprafter-desktop`.
+dnf warns that it skipped OpenPGP checks for 1 package from repository `@commandline`, its name
+for a package file given on the command line. That is expected for a package you built. Start
+the app from your applications menu (**AppRafter**) or with `apprafter-desktop`.
+
+Every build has version 0.1.0, so installing a newer build the same way can keep the installed
+one: dnf always keeps it, and apt keeps it when the package's metadata, such as its installed
+size, has not changed. To update, build again and reinstall:
+
+```sh
+sudo apt install --reinstall ./target/release/bundle/deb/apprafter-desktop_*_amd64.deb   # Debian, Ubuntu
+sudo dnf reinstall ./target/release/bundle/rpm/apprafter-desktop-*.x86_64.rpm            # Fedora
+```
 
 The package installs:
 
@@ -113,7 +123,7 @@ The package installs:
 | `/usr/bin/apprafter-desktop` | The app. |
 | `/usr/share/applications/apprafter-desktop.desktop` | The launcher: **AppRafter** in your applications menu. |
 | `/usr/share/icons/hicolor/` | The app's icons. |
-| `/usr/share/polkit-1/actions/dev.apprafter.desktop.policy` | The polkit policy, mode 0644. |
+| `/usr/share/polkit-1/actions/dev.apprafter.desktop.policy` | The polkit policy, owned by root and readable by everyone. |
 
 It depends on WebKitGTK, GTK and the PAM library, and recommends the polkit daemon (`polkitd`
 on Debian and Ubuntu, `polkit` on Fedora), which apt and dnf install by default. polkit reads
@@ -123,7 +133,8 @@ the new policy by itself. To check that it did:
 pkaction --action-id dev.apprafter.desktop.unlock --verbose   # the "implicit active" line says auth_self
 ```
 
-On Linux the package and its files are named `apprafter-desktop`, after the binary.
+On Linux the package, its binary, launcher and icons are named `apprafter-desktop`, after the
+binary. The polkit policy keeps the app's identifier, `dev.apprafter.desktop`.
 
 Build a package on a distribution no newer than the one you install it on: the app needs the
 glibc it was built against, or a newer one. Never build packages on NixOS. A binary built there
@@ -134,15 +145,31 @@ uses the `/nix/store` loader and does not start on other distributions.
 Each run of the `test` workflow that touches `desktop/` builds both packages on Ubuntu 24.04,
 in the job **desktop Linux packages (deb, rpm)**. The job installs each package into a fresh
 Debian 13 or Fedora 44 container, and checks that `pkaction` shows both actions, that `ldd`
-resolves every library, and that the app starts. Only if every check passes does it upload the
-packages, as the artefact `apprafter-desktop-linux-packages`, kept for 30 days.
+resolves every library, and that the binary loads: it starts far enough to refuse an empty
+`APPRAFTER_DESKTOP_DATA_DIR`, before it opens any window. Only if every check passes does it
+upload the packages, as the artefact `apprafter-desktop-linux-packages`, kept for 30 days.
 
 Download the artefact from the run's summary page on GitHub (this needs a GitHub account with
-access to the repository), unzip it, and install the `.deb` or `.rpm` as above.
+access to the repository) and unzip it. It holds `deb/apprafter-desktop_0.1.0_amd64.deb` and
+`rpm/apprafter-desktop-0.1.0-1.x86_64.rpm`. Use a run on commit 55ce0d72 or later: older
+artefacts hold the package under an earlier name, `app-rafter`. In the directory you unzipped
+it into:
 
-These are unsigned test builds, and nothing updates them: to update, install a newer package
-the same way. They are built against Ubuntu 24.04's glibc (2.39), so they need a distribution
-at least that new.
+```sh
+sudo apt install ./deb/apprafter-desktop_0.1.0_amd64.deb     # Debian, Ubuntu
+sudo dnf install ./rpm/apprafter-desktop-0.1.0-1.x86_64.rpm  # Fedora
+```
+
+These are unsigned test builds, and nothing updates them. Every one has version 0.1.0, so to
+update, download a newer artefact and reinstall:
+
+```sh
+sudo apt install --reinstall ./deb/apprafter-desktop_0.1.0_amd64.deb   # Debian, Ubuntu
+sudo dnf reinstall ./rpm/apprafter-desktop-0.1.0-1.x86_64.rpm          # Fedora
+```
+
+They are built against Ubuntu 24.04's glibc (2.39), so they need a distribution at least that
+new.
 
 ### Other distributions
 
@@ -184,8 +211,8 @@ nix develop .#desktop --command bash -c 'cd desktop && bun install --frozen-lock
 nix develop .#desktop --command ./desktop/target/release/apprafter-desktop
 ```
 
-The binary finds its libraries only through the dev shell. Started any other way, it stops
-with `error while loading shared libraries`.
+Start it through the dev shell, which provides its libraries, GIO modules and GSettings
+schemas. Started any other way, it may stop with `error while loading shared libraries`.
 
 #### The polkit policy on NixOS
 
@@ -222,12 +249,17 @@ service.
 - With the policy installed, unlocking opens the system's polkit dialog, as long as a polkit
   authentication agent runs in your session. GNOME and KDE Plasma start one. On a window
   manager such as sway, Hyprland or i3, start one yourself, for example `hyprpolkitagent` or
-  the one from `polkit-gnome`. The dialog asks for your own password, never an
-  administrator's, and polkit keeps no grant for later.
+  the one from `polkit-gnome`. With the shipped policy, the dialog asks for your own password,
+  not an administrator's, and polkit keeps no grant for later. A polkit rule set by your
+  administrator can change either.
 - Otherwise the lock screen shows its own **System password** field, which PAM checks: without
-  the policy, without an agent, outside an active local session (over SSH, for example), or
-  when a polkit rule would let the app through without asking. PAM uses the first of
-  `common-auth`, `system-auth` and `login` that it finds in `/etc/pam.d` or `/usr/lib/pam.d`.
+  the policy, without polkitd, without an agent, outside an active local session (over SSH, for
+  example), or when polkit would let the app through without asking (a polkit rule, or the app
+  running as root). PAM uses the first of `common-auth`, `system-auth` and `login` that it
+  finds in `/etc/pam.d` or `/usr/lib/pam.d`.
+- Neither appears, and the lock stays off, when an administrator's polkit rule refuses the app
+  in your active local session, or when the app would show the field but PAM finds no service
+  to check it with or no account for the user running the app.
 - Run the app as your own user, never with `sudo`: the password field checks the account that
   runs the app.
 
@@ -272,9 +304,13 @@ app shares.
   `WEBKIT_DISABLE_DMABUF_RENDERER=1 apprafter-desktop`. These workarounds have not been tested
   with this app.
 - **Only the password field, never the system dialog.** Check that the policy is installed
-  (`pkaction`, as above) and that a polkit agent runs in your session.
-- **Nothing in the terminal.** A release build writes only to its log file; see
-  [Files and logs](#files-and-logs).
+  (`pkaction`, as above), that polkitd is installed and running, that a polkit agent runs in
+  your session, and that you run the app as yourself (not with `sudo`) in a local desktop
+  session (not over SSH). If you started the agent while the app showed the password field,
+  the dialog comes back the next time the app locks.
+- **Nothing in the terminal.** A release build writes its own log lines only to its log file;
+  see [Files and logs](#files-and-logs). Only a failure to start or to open the log, a crash,
+  and GTK's and WebKitGTK's own messages reach the terminal.
 - **Anything else.** Attach that day's log file when you report it.
 
 ## macOS
@@ -299,12 +335,13 @@ builds no installer for it yet.
 Besides the [build requirements](#build-requirements-every-os), you need:
 
 - Visual Studio Build Tools with the **Desktop development with C++** workload.
-- rustup with the MSVC toolchain as the default (`winget install --id Rustlang.Rustup`).
+- rustup with `x86_64-pc-windows-msvc` as its default host triple, which is rustup-init's
+  default on Windows (`winget install --id Rustlang.Rustup`).
 - WebView2, which Windows 11 includes (and Windows 10 from version 1803).
 - `cue.exe` v0.17.1 (`cue_v0.17.1_windows_amd64.zip`) on your `PATH`. On Windows the build
   cannot run `scripts/cue` and uses the `cue` on `PATH`, so `CUE_BIN` has no effect.
 
-CI runs these commands in Git Bash:
+To build and start a release build in Git Bash:
 
 ```sh
 cd desktop
@@ -315,7 +352,9 @@ bun run tauri build --no-bundle
 
 The app unlocks with Windows Hello, or with your Windows password when Hello is not set up or
 **Prefer biometrics** is off. Hello's prompt needs Windows 11; on older Windows the password
-dialog stands in. CI builds and tests the app on Windows, but builds no installer for it yet.
+dialog stands in. CI tests the app on Windows and builds it there in Git Bash, as a debug
+build (`bun run tauri build --debug --no-bundle`) that it does not start. It builds no
+installer for Windows yet.
 
 ## Sign-in messages
 
@@ -342,16 +381,23 @@ On Linux, `XDG_CONFIG_HOME` and `XDG_DATA_HOME` move these as usual, and the win
 storage is in `~/.local/share/dev.apprafter.desktop/` too.
 
 `APPRAFTER_DESKTOP_DATA_DIR=<dir>` puts the settings in `<dir>` and the logs in `<dir>/logs`,
-and runs the app as a separate instance. The app itself reads only that variable and
-`APPRAFTER_CONFIG_DIR` from its environment (a test build reads two more): `HCLOUD_TOKEN`,
-`KUBECONFIG` and `RUST_LOG` have no effect on it. See
+and runs the app as a separate instance. The app's own code reads only that variable and
+`APPRAFTER_CONFIG_DIR` from its environment (a test build reads two more), so `HCLOUD_TOKEN`,
+`KUBECONFIG` and `RUST_LOG` have no effect on it. Variables that the system and the libraries
+the app uses read still apply, such as `HOME`, `XDG_CONFIG_HOME` and the graphics ones under
+[Troubleshooting](#troubleshooting). See
 [Environment variables](../docs/reference/environment.md#apprafter-desktop).
 
 ### The log
 
 The app writes one log file per day, `apprafter-desktop.YYYY-MM-DD.log`, dated in UTC, and
-keeps the newest 14. A release build writes only to that file. A development build
-(`just desktop-dev`, or any `--debug` build) also prints every line in the terminal.
+keeps the newest 14. A release build writes its log lines only to that file. A development
+build (`just desktop-dev`, or any `--debug` build) also prints every line in the terminal.
+
+Two things go to the terminal and not to the log: why the app could not start (for example,
+`APPRAFTER_DESKTOP_DATA_DIR` is set but empty), and why it runs without a log file. On Windows
+a release build has no console of its own, so they may not show; a debug build started from a
+terminal shows them.
 
 To follow today's log on Linux:
 
@@ -359,13 +405,14 @@ To follow today's log on Linux:
 tail -f ~/.local/share/dev.apprafter.desktop/logs/apprafter-desktop.$(date -u +%F).log
 ```
 
-Every answer the system gives to a sign-in request is one `the OS answered` line. What the
-system can confirm you with is one `what can verify the owner here` line, logged at its first
-answer and whenever that changes:
+What the system can confirm you with is one `what can verify the owner here` line, logged at
+its first answer, which the app asks for at start, and whenever that changes. Every answer the
+system gives to a sign-in request is one `the OS answered` line. For example, at start and then
+at an unlock through polkit's dialog:
 
 ```
-2026-10-09T11:19:00.977514Z  INFO apprafter_desktop::auth_cache: the OS answered purpose=unlock way=password_field outcome=verified took_ms=0 method=unanswered available=true password_field=false messages=0
-2026-10-09T11:19:14.042318Z  INFO apprafter_desktop::auth_cache: what can verify the owner here available=true method=polkit unavailable=none password_field=false biometrics_choice=false
+2026-10-09T11:19:00.977514Z  INFO apprafter_desktop::auth_cache: what can verify the owner here available=true method=polkit unavailable=none password_field=false biometrics_choice=false
+2026-10-09T11:19:14.042318Z  INFO apprafter_desktop::auth_cache: the OS answered purpose=unlock way=prompt outcome=verified took_ms=3120 method=polkit available=true password_field=false
 ```
 
 | Field | Values |
@@ -384,7 +431,9 @@ The log never contains a password.
 The OS session watch, which locks the app when the computer sleeps or locks, logs
 `the OS session watch listens listening=Listening { lock: …, sleep: … }` at start, and
 `the OS session locked or is going to sleep event=Locked` (or `event=Sleeping`) each time it
-hears one.
+hears one. If the system reports neither locks nor sleeps, it logs
+`the OS reports neither the session's locks nor sleeps to the app here: lock-on-sleep has nothing to follow`
+at start instead, and the app cannot lock when the computer sleeps or locks.
 
 ## Development and tests
 
@@ -395,9 +444,10 @@ just desktop-build      # a debug build without packages: desktop/target/debug/a
 just desktop-ipc-types  # after changing a type in desktop/ipc; commit the result
 ```
 
-On Linux the recipes first check the [system packages](#system-packages) with `pkg-config`.
-On NixOS, run them inside `nix develop .#desktop`. `just` runs its recipes with bash, so on
-Windows it needs a bash on `PATH`, such as Git Bash.
+On Linux, `desktop-dev`, `desktop-build` and `desktop-check` first check the
+[system packages](#system-packages) with `pkg-config`. On NixOS, run the recipes inside
+`nix develop .#desktop`. On Windows, run `just` from a Git Bash shell: its recipes run with
+bash, and its shebang recipes need Git Bash's `cygpath`.
 
 A development build asks the real system for sign-in. A test build,
 `cd desktop && bun run tauri dev --features test-build`, uses a scripted stand-in instead (see
@@ -407,21 +457,29 @@ A development build asks the real system for sign-in. A test build,
 The interface in a browser, on mocked data, without building any Rust:
 
 ```sh
-cd desktop && bun run dev:mock    # http://localhost:1420
+cd desktop
+bun install --frozen-lockfile
+bun run dev:mock    # http://localhost:1420
 ```
 
 The browser tests (Playwright) also need Node.js:
 
 ```sh
 cd desktop
+bun install --frozen-lockfile
 npx --no-install playwright install --with-deps chromium webkit   # once; drop --with-deps off Debian and Ubuntu
 bun run e2e
 ```
 
-On NixOS, the browsers Playwright downloads start only with `programs.nix-ld.enable = true;`.
+On NixOS, the browsers Playwright downloads need `programs.nix-ld.enable = true;` and, in
+`programs.nix-ld.libraries`, the libraries they load, which nix-ld's default set does not
+include (NSS, ALSA, Mesa and GTK among them).
 
-Linux sign-in against a real polkit and PAM, each case in a fresh Debian 13 container with its
-own D-Bus, polkitd and PAM, touching nothing on your machine:
+`scripts/test-osauth-linux.sh` tests Linux sign-in against a real polkit and PAM, and the OS
+session watch against real D-Bus daemons. Each case runs in a fresh Debian 13 container with
+its own D-Bus, polkitd and PAM, and touches nothing of your machine's polkit, D-Bus or PAM. The
+script builds the tests in `desktop/target` and leaves the image
+`localhost/apprafter-osauth-linux:dev` in podman's store. From the repository root:
 
 ```sh
 PODMAN='sudo podman' bash scripts/test-osauth-linux.sh               # every case, as CI runs it
@@ -431,8 +489,10 @@ PODMAN='sudo podman' bash scripts/test-osauth-linux.sh <test_name>   # one case
 It needs cargo, cue, the PAM development files, podman and network access. Rootless podman
 works only under a systemd user session that delegates the cgroup tree.
 
-The Linux packages, each installed into a fresh Debian 13 or Fedora 44 container and checked
-as CI checks them:
+`scripts/test-desktop-packages.sh` installs the Linux packages into fresh Debian 13 and Fedora
+44 containers and checks them as CI does. Build them first in `desktop/`
+(`bun run tauri build --bundles deb,rpm`, or only the format you need), then run it from the
+repository root, naming only the packages you built:
 
 ```sh
 PODMAN='sudo podman' bash scripts/test-desktop-packages.sh \
