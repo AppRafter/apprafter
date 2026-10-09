@@ -110,8 +110,8 @@ pub struct Listening {
     /// Linux, the session notification on Windows, the distributed screen-lock notification on
     /// macOS.
     pub lock: bool,
-    /// A source of sleeps listens: logind's `PrepareForSleep` (logind running, or startable by
-    /// the bus), the suspend notification, or `NSWorkspace`'s sleep notifications.
+    /// A source of sleeps listens: logind's `PrepareForSleep` (logind running), the suspend
+    /// notification, or `NSWorkspace`'s sleep notifications.
     pub sleep: bool,
 }
 

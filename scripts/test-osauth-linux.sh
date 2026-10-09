@@ -87,7 +87,7 @@ CASES=(
     "session_container without_any_bus_nothing_listens --no-system-bus"
     "session_container without_a_screen_saver_no_lock_is_promised_and_one_started_later_is_heard --session-bus --no-system-bus"
     "session_container without_logind_no_sleep_is_promised_and_one_started_later_is_heard --fake-logind --session-bus --no-logind"
-    "session_container a_logind_the_bus_can_start_is_promised_for_sleeps"
+    "session_container a_logind_the_bus_lists_but_cannot_start_promises_no_sleep"
 )
 
 die() {

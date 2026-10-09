@@ -21,10 +21,12 @@
 //! A bus takes a rule for a name nobody owns, so a rule says nothing of whether anything will
 //! ever send: on sway, i3 or Hyprland no screen saver runs, and on a system without logind
 //! (Devuan, OpenRC without elogind) nothing sends `PrepareForSleep`. What the watch says it
-//! hears ([`Listening`]) therefore counts a source only when its sender is there as it is set
-//! up: a screen saver that runs (none is started on demand), logind running or startable by the
-//! bus for sleeps, and logind having answered for the app's session for its `Lock`. It listens
-//! to every source all the same, so a sender that starts later is heard without being promised.
+//! hears ([`Listening`]) therefore counts a source only when its sender runs as it is set up: a
+//! screen saver that owns its name, logind owning its name for sleeps, and logind having
+//! answered for the app's session for its `Lock`. A name the bus can start proves nothing (its
+//! service file may hand the start to a systemd that is not PID 1, as in a container), and on a
+//! desktop the owner's session was made by a logind that runs. It listens to every source all
+//! the same, so a sender that starts later is heard without being promised.
 
 use std::collections::HashMap;
 use std::future::poll_fn;
@@ -243,13 +245,15 @@ async fn logind(setup: &mut Setup, system: &Connection) {
     let sleep = rule(LOGIN1, Some(LOGIN1_PATH), LOGIN1_MANAGER, "PrepareForSleep");
     if let Some(stream) = subscribe(system, Kind::PrepareForSleep, LOGIN1, sleep).await {
         setup.streams.push(stream);
-        // logind running, or one the bus starts as soon as anything asks it to suspend
-        // (systemd's service file). WSL2 with systemd runs a logind that never sends this (the
-        // WSL VM does not suspend through it): an accepted limit, which reads as listening.
-        if running.is_some() || activatable(system, LOGIN1).await {
+        // A logind that runs: one the bus could only start counts for nothing (module docs).
+        // WSL2 with systemd runs a logind that never sends this (the WSL VM does not suspend
+        // through it): an accepted limit, which reads as listening.
+        if running.is_some() {
             setup.heard.push(Kind::PrepareForSleep);
         } else {
-            tracing::info!("no logind on the system bus: sleeps are listened for, not expected");
+            tracing::info!(
+                "no logind runs on the system bus: sleeps are listened for, not expected"
+            );
         }
     }
     setup.owners.insert(LOGIN1, running);
@@ -292,30 +296,6 @@ async fn owner(bus: &Connection, name: &str) -> Option<OwnedUniqueName> {
         .await
         .ok()?;
     reply.body().deserialize::<OwnedUniqueName>().ok()
-}
-
-/// Whether `bus` can start `name` on demand: the bus driver's `ListActivatableNames`.
-async fn activatable(bus: &Connection, name: &str) -> bool {
-    let names = match bus
-        .call_method(
-            Some(DBUS),
-            DBUS_PATH,
-            Some(DBUS),
-            "ListActivatableNames",
-            &(),
-        )
-        .await
-    {
-        Ok(reply) => reply.body().deserialize::<Vec<String>>(),
-        Err(error) => Err(error),
-    };
-    match names {
-        Ok(names) => names.iter().any(|activatable| activatable == name),
-        Err(error) => {
-            tracing::info!("the bus did not say which names it can start ({error})");
-            false
-        }
-    }
 }
 
 /// The object path of the session polkitd sees the app in, as logind names it.

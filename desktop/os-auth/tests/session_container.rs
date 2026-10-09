@@ -396,19 +396,25 @@ fn without_logind_no_sleep_is_promised_and_one_started_later_is_heard() {
     assert_eq!(next(&events), SessionEvent::Sleeping);
 }
 
-/// A logind the bus can start (systemd's service file, which this container's Debian has)
-/// counts for sleeps before it runs: on a systemd host the bus starts it as soon as anything
-/// asks it to suspend. The app's session is found only by asking a running logind, so no lock
-/// is promised. (Here nothing can start it, there being no systemd: the rule's one limit.)
+/// A logind the bus lists but cannot start: this container's Debian has systemd's service file,
+/// which hands the start to a systemd that is not PID 1 (as in other containers, or WSL with a
+/// hand-started bus). A name the bus lists proves nothing, so no sleep is promised; only a
+/// logind that runs counts (`without_a_session_bus_logind_still_reports`). The app's session is
+/// found only by asking a running logind, so no lock is promised either.
 #[test]
 #[ignore = "needs the session container: bash scripts/test-osauth-linux.sh"]
-fn a_logind_the_bus_can_start_is_promised_for_sleeps() {
+fn a_logind_the_bus_lists_but_cannot_start_promises_no_sleep() {
     let _session = container();
     assert!(Connection::session().is_err(), "there is no session bus");
-    let _watching = watching_for(Listening {
-        lock: false,
-        sleep: true,
-    });
+    let activatable = zbus::blocking::fdo::DBusProxy::new(&Connection::system().unwrap())
+        .expect("a proxy for the bus")
+        .list_activatable_names()
+        .expect("the bus lists what it can start");
+    assert!(
+        activatable.iter().any(|name| name.as_str() == LOGIN1),
+        "the bus lists {LOGIN1}: {activatable:?}"
+    );
+    let _watching = watching_for(Listening::NONE);
 }
 
 /// With neither bus (WSL, a container) nothing listens, and the watch says so.
