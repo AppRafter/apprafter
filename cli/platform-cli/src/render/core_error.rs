@@ -101,9 +101,13 @@ pub(crate) fn cli_help(e: &CoreError) -> Option<String> {
             "Supported providers: {}. Pass one of them with `--provider`.",
             supported.join(", ")
         ),
+        // The console shows a token's value only once, when it is created; its labels are the
+        // project's Security → API tokens (docs.hetzner.com, "Generating an API token").
         CoreError::InvalidToken { .. } => {
-            "Copy the token again from the Hetzner Cloud Console → Security → API Tokens: 64 \
-             ASCII letters and digits, no prefix, no trailing newline."
+            "Paste the whole token again from where you saved it: 64 ASCII letters and digits, \
+             no prefix, no trailing newline. The Hetzner Cloud Console shows a token only once, \
+             when it is created; if you no longer have it, generate a new one there (open the \
+             project, then Security → API tokens)."
                 .into()
         }
         CoreError::TokenNotStored { name } => format!(
@@ -251,6 +255,28 @@ mod tests {
             r.code().unwrap().to_string(),
             "apprafter::backup::job_active"
         );
+    }
+
+    /// The console shows a token's value only once, when it is created: the help for a
+    /// malformed token sends the reader back to where they saved it, or to generate a new one
+    /// under the project's Security → API tokens (the console's labels), and never to copy an
+    /// existing token out of the console.
+    #[test]
+    fn a_malformed_token_is_pasted_again_or_generated_anew() {
+        let help = report(CoreError::InvalidToken {
+            problem: apprafter_core::provider::TokenProblem::WrongLength { got: 63 },
+        })
+        .help()
+        .unwrap()
+        .to_string();
+        assert!(help.contains("from where you saved it"), "{help}");
+        assert!(help.contains("shows a token only once"), "{help}");
+        assert!(
+            help.contains("generate a new one") && help.contains("Security → API tokens"),
+            "{help}"
+        );
+        assert!(!help.contains("from the Hetzner Cloud Console"), "{help}");
+        assert!(help.contains("64 ASCII letters and digits"), "{help}");
     }
 
     #[test]

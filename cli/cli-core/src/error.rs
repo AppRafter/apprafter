@@ -114,9 +114,15 @@ fn server_type_help(
         ),
     };
     let what = match context {
-        SkuCheckFor::Provision => "Pass `--server-type <type>` to `apprafter up` / `apprafter \
-             apply`, set `spec.nodes[0].type` in the Infrastructure manifest, or run `apprafter \
-             target machine` to pick one."
+        // The order is `apply`'s (`resolve_precedence`); `target machine` sits below the
+        // manifest and the state, and refuses a target whose state records a server.
+        SkuCheckFor::Provision => "`apprafter up` / `apprafter apply` take the server type \
+             from the first of: `--server-type`, `spec.nodes[0].type` in the Infrastructure \
+             manifest, the type recorded in the state at the last provision or import, the \
+             target's (`apprafter target machine`), `APPRAFTER_SERVER_TYPE`; their `server \
+             type:` line names the one used. Pass `--server-type <type>`, which overrides the \
+             rest, or change that source: `apprafter target machine` takes effect only when \
+             neither the manifest nor the state names a type."
             .to_string(),
         SkuCheckFor::TargetAdd { name } => format!(
             "Run the same `apprafter target add {name} …` again with another `--server-type \
@@ -779,6 +785,52 @@ mod tests {
                     assert!(!h.contains(bad) && !d.contains(bad), "{bad} in {d} / {h}");
                 }
             }
+        }
+    }
+
+    /// `apply` / `up` resolve the server type as `--server-type` > `spec.nodes[0].type` > the
+    /// state's recorded type > the target's > `APPRAFTER_SERVER_TYPE`
+    /// ([`crate::resolve::resolve_precedence`]): the provisioning help lists the sources in
+    /// that order, says the flag overrides the rest, and says `target machine` helps only when
+    /// neither the manifest nor the state names a type — it is refused on a target whose state
+    /// records a server, and a type it saves is outranked by both.
+    #[test]
+    fn the_provisioning_help_follows_applys_precedence() {
+        let up = help_of(&unavailable(
+            UnavailableKind::Retired,
+            SkuCheckFor::Provision,
+        ));
+        let at = |needle: &str| {
+            up.find(needle)
+                .unwrap_or_else(|| panic!("{needle:?} missing: {up}"))
+        };
+        let order = [
+            at("`--server-type`"),
+            at("`spec.nodes[0].type`"),
+            at("recorded in the state"),
+            at("the target's (`apprafter target machine`)"),
+            at("`APPRAFTER_SERVER_TYPE`"),
+        ];
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "{up}");
+        assert!(
+            up.contains("`--server-type <type>`, which overrides the rest"),
+            "{up}"
+        );
+        assert!(
+            up.contains(
+                "`apprafter target machine` takes effect only when neither the manifest nor the \
+                 state names a type"
+            ),
+            "{up}"
+        );
+        // The order the help lists is the resolver's: each rung wins over every later one.
+        let rungs = ["flag", "manifest", "state", "target", "env"];
+        for first in 0..rungs.len() {
+            let r = |i: usize| (i >= first).then_some(rungs[i]);
+            assert_eq!(
+                crate::resolve::resolve_precedence(r(0), r(1), r(2), r(3), r(4)).as_deref(),
+                Some(rungs[first])
+            );
         }
     }
 
