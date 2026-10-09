@@ -669,6 +669,8 @@ mod tests {
             name: "apprafter-doctor-no-such-binary",
             purpose: "a test",
             install: "there is nothing to install",
+            install_header: "",
+            hints: &[],
             required: false,
             version_args: &["--version"],
         };
@@ -689,6 +691,8 @@ mod tests {
             name: "apprafter-doctor-no-such-binary",
             purpose: "a test",
             install: "there is nothing to install",
+            install_header: "",
+            hints: &[],
             required: true,
             version_args: &["--version"],
         };

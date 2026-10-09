@@ -42,6 +42,16 @@ pub enum UnavailableKind {
 }
 
 impl UnavailableKind {
+    /// The snake_case name, for machine-readable surfaces (the desktop's error fields).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UnavailableKind::Unknown => "unknown",
+            UnavailableKind::NotOfferedInRegion => "not_offered_in_region",
+            UnavailableKind::Retired => "retired",
+            UnavailableKind::OutOfCapacity => "out_of_capacity",
+        }
+    }
+
     /// Short human-readable reason clause used in the error `Display`.
     pub fn human_reason(self) -> &'static str {
         match self {
@@ -475,6 +485,20 @@ pub type Result<T> = std::result::Result<T, CliError>;
 mod tests {
     use super::*;
     use miette::Diagnostic;
+
+    #[test]
+    fn unavailable_kinds_have_snake_case_names() {
+        use UnavailableKind::*;
+        assert_eq!(
+            [Unknown, NotOfferedInRegion, Retired, OutOfCapacity].map(UnavailableKind::as_str),
+            [
+                "unknown",
+                "not_offered_in_region",
+                "retired",
+                "out_of_capacity"
+            ]
+        );
+    }
 
     fn code_of(err: &CliError) -> String {
         err.code()

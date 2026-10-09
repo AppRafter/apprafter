@@ -62,8 +62,14 @@ pub struct Tool {
     /// What the CLI uses it for — one clause, lowercase, no trailing
     /// stop. Rendered as "`{name}` is required by `{needed_by}`".
     pub purpose: &'static str,
-    /// Platform-agnostic install guidance, already wrapped.
+    /// Platform-agnostic install guidance, already wrapped: exactly
+    /// [`render_install`] of [`Tool::install_header`] and [`Tool::hints`]
+    /// (a unit test pins it), kept as text because the CLI prints it.
     pub install: &'static str,
+    /// The first line of [`Tool::install`], e.g. `"Install helm:"`.
+    pub install_header: &'static str,
+    /// The per-system lines of [`Tool::install`], in print order.
+    pub hints: &'static [InstallLine],
     /// Whether the CLI's core path is unusable without it.
     ///
     /// Only `kubectl` is `true`: every cluster-facing command spawns it,
@@ -93,6 +99,48 @@ pub struct Tool {
     pub version_args: &'static [&'static str],
 }
 
+/// Which system an install line is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallOs {
+    Windows,
+    Macos,
+    Debian,
+    Arch,
+    Nix,
+    Other,
+}
+
+impl InstallOs {
+    /// The label printed before the line, e.g. `macOS`.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Windows => "Windows",
+            Self::Macos => "macOS",
+            Self::Debian => "Debian",
+            Self::Arch => "Arch",
+            Self::Nix => "Nix",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// One install line: a command, a URL, or "preinstalled".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InstallLine {
+    pub os: InstallOs,
+    pub text: &'static str,
+}
+
+/// `header`, then one `  • <label padded to 10> <text>` line per hint — the text `install`
+/// carries and the CLI prints.
+pub fn render_install(header: &str, hints: &[InstallLine]) -> String {
+    let mut out = header.to_string();
+    for h in hints {
+        out.push_str(&format!("\n  • {:<10} {}", h.os.label(), h.text));
+    }
+    out
+}
+
 /// Restic — every backup and restore path.
 pub const RESTIC: Tool = Tool {
     name: "restic",
@@ -103,6 +151,29 @@ pub const RESTIC: Tool = Tool {
               • Arch       pacman -S restic\n  \
               • Nix        nix profile install nixpkgs#restic\n  \
               • other      https://restic.readthedocs.io/en/stable/020_installation.html",
+    install_header: "Install restic (>= 0.14):",
+    hints: &[
+        InstallLine {
+            os: InstallOs::Macos,
+            text: "brew install restic",
+        },
+        InstallLine {
+            os: InstallOs::Debian,
+            text: "apt install restic",
+        },
+        InstallLine {
+            os: InstallOs::Arch,
+            text: "pacman -S restic",
+        },
+        InstallLine {
+            os: InstallOs::Nix,
+            text: "nix profile install nixpkgs#restic",
+        },
+        InstallLine {
+            os: InstallOs::Other,
+            text: "https://restic.readthedocs.io/en/stable/020_installation.html",
+        },
+    ],
     required: false,
     version_args: &["version"],
 };
@@ -116,6 +187,25 @@ pub const KUBECTL: Tool = Tool {
               • Debian     apt install kubectl\n  \
               • Nix        nix profile install nixpkgs#kubectl\n  \
               • other      https://kubernetes.io/docs/tasks/tools/",
+    install_header: "Install kubectl:",
+    hints: &[
+        InstallLine {
+            os: InstallOs::Macos,
+            text: "brew install kubectl",
+        },
+        InstallLine {
+            os: InstallOs::Debian,
+            text: "apt install kubectl",
+        },
+        InstallLine {
+            os: InstallOs::Nix,
+            text: "nix profile install nixpkgs#kubectl",
+        },
+        InstallLine {
+            os: InstallOs::Other,
+            text: "https://kubernetes.io/docs/tasks/tools/",
+        },
+    ],
     required: true,
     version_args: &["version", "--client"],
 };
@@ -129,6 +219,25 @@ pub const HELM: Tool = Tool {
               • Debian     apt install helm\n  \
               • Nix        nix profile install nixpkgs#kubernetes-helm\n  \
               • other      https://helm.sh/docs/intro/install/",
+    install_header: "Install helm:",
+    hints: &[
+        InstallLine {
+            os: InstallOs::Macos,
+            text: "brew install helm",
+        },
+        InstallLine {
+            os: InstallOs::Debian,
+            text: "apt install helm",
+        },
+        InstallLine {
+            os: InstallOs::Nix,
+            text: "nix profile install nixpkgs#kubernetes-helm",
+        },
+        InstallLine {
+            os: InstallOs::Other,
+            text: "https://helm.sh/docs/intro/install/",
+        },
+    ],
     required: false,
     version_args: &["version", "--short"],
 };
@@ -142,6 +251,25 @@ pub const GIT: Tool = Tool {
               • Debian     apt install git\n  \
               • Nix        nix profile install nixpkgs#git\n  \
               • other      https://git-scm.com/downloads",
+    install_header: "Install git:",
+    hints: &[
+        InstallLine {
+            os: InstallOs::Macos,
+            text: "xcode-select --install",
+        },
+        InstallLine {
+            os: InstallOs::Debian,
+            text: "apt install git",
+        },
+        InstallLine {
+            os: InstallOs::Nix,
+            text: "nix profile install nixpkgs#git",
+        },
+        InstallLine {
+            os: InstallOs::Other,
+            text: "https://git-scm.com/downloads",
+        },
+    ],
     required: false,
     version_args: &["--version"],
 };
@@ -154,6 +282,21 @@ pub const SSH: Tool = Tool {
               • macOS      preinstalled\n  \
               • Debian     apt install openssh-client\n  \
               • Nix        nix profile install nixpkgs#openssh",
+    install_header: "Install an OpenSSH client:",
+    hints: &[
+        InstallLine {
+            os: InstallOs::Macos,
+            text: "preinstalled",
+        },
+        InstallLine {
+            os: InstallOs::Debian,
+            text: "apt install openssh-client",
+        },
+        InstallLine {
+            os: InstallOs::Nix,
+            text: "nix profile install nixpkgs#openssh",
+        },
+    ],
     required: false,
     version_args: &["-V"],
 };
@@ -165,6 +308,40 @@ pub const SSH: Tool = Tool {
 /// the gap D11 recorded, where `restic` had eight spawn sites, was fatal
 /// on all of them, and was checked nowhere.
 pub const ALL: &[Tool] = &[RESTIC, KUBECTL, HELM, GIT, SSH];
+
+/// cue — `app validate`, which checks an application manifest locally. Not in `ALL` until D.3c
+/// adds it to doctor together with its golden change; `apprafter_core::tools::ToolId::Cue`
+/// resolves it now.
+pub const CUE: Tool = Tool {
+    name: "cue",
+    purpose: "validating application manifests",
+    install: "Install cue:\n  \
+              • macOS      brew install cue\n  \
+              • Arch       pacman -S cue\n  \
+              • Nix        nix profile install nixpkgs#cue\n  \
+              • other      https://cuelang.org/docs/introduction/installation/",
+    install_header: "Install cue:",
+    hints: &[
+        InstallLine {
+            os: InstallOs::Macos,
+            text: "brew install cue",
+        },
+        InstallLine {
+            os: InstallOs::Arch,
+            text: "pacman -S cue",
+        },
+        InstallLine {
+            os: InstallOs::Nix,
+            text: "nix profile install nixpkgs#cue",
+        },
+        InstallLine {
+            os: InstallOs::Other,
+            text: "https://cuelang.org/docs/introduction/installation/",
+        },
+    ],
+    required: false,
+    version_args: &["version"],
+};
 
 /// The file names `name` may have on disk: itself on Unix; on Windows
 /// `name.exe` when `name` has no `.` in it, else `name` as given. That is
@@ -399,6 +576,45 @@ mod tests {
     }
 
     #[test]
+    fn the_install_text_is_the_rendering_of_header_and_hints() {
+        for t in ALL.iter().chain([&CUE]) {
+            assert_eq!(
+                t.install,
+                render_install(t.install_header, t.hints),
+                "`{}`",
+                t.name
+            );
+        }
+    }
+
+    #[test]
+    fn render_install_aligns_the_os_labels() {
+        let lines = [
+            InstallLine {
+                os: InstallOs::Macos,
+                text: "brew install x",
+            },
+            InstallLine {
+                os: InstallOs::Other,
+                text: "https://x",
+            },
+        ];
+        assert_eq!(
+            render_install("Install x:", &lines),
+            "Install x:\n  • macOS      brew install x\n  • other      https://x"
+        );
+    }
+
+    #[test]
+    fn cue_is_defined_but_not_yet_probed() {
+        assert_eq!(CUE.name, "cue");
+        assert!(
+            !ALL.iter().any(|t| t.name == "cue"),
+            "CUE joins ALL in D.3c with its golden change"
+        );
+    }
+
+    #[test]
     fn a_missing_tool_names_the_command_that_needed_it() {
         // The failure the whole module exists for: the reader must
         // learn which command they typed is blocked, not which
@@ -408,6 +624,8 @@ mod tests {
                 name: "definitely-not-a-real-binary-9f3a",
                 purpose: "a test",
                 install: "install it",
+                install_header: "",
+                hints: &[],
                 required: true,
                 version_args: &["--version"],
             },
