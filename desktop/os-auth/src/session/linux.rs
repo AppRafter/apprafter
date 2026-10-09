@@ -3,11 +3,20 @@
 //! [`super`] list the signals).
 //!
 //! One thread of the watch's own runs zbus's executor: it connects to each bus, adds a match
-//! rule per signal, and then reads every stream at once. Each rule names the signal's sender,
-//! so another program on the bus cannot speak for logind or the screen saver; a sender's
-//! well-known name matches whenever its owner sends, so logind or a screen saver that starts
-//! later is still heard. Dropping the sources closes a channel the thread also waits on, which
-//! ends it; the drop then joins it.
+//! rule per signal, and then reads every stream at once. Dropping the sources closes a channel
+//! the thread also waits on, which ends it; the drop then joins it.
+//!
+//! Only logind speaks for logind, and only a screen saver for itself. Each rule names the
+//! signal's sender by its well-known name, and the bus holds a broadcast to it: it delivers one
+//! only from the connection that owns that name. A signal sent to the app's connection alone,
+//! though, the bus delivers whatever its sender (the system bus's default policy lets every user
+//! send signals), and zbus does not match a rule's well-known sender itself (zbus 5
+//! `MatchRule::matches`) — so heard as it came, any local user could send the app
+//! `PrepareForSleep(true)` and lock it, closing its unlock prompt, at will. The watch therefore
+//! keeps a signal only when it is a broadcast, as logind and the screen savers always send
+//! these, from the connection that owns the sender's name: asked of the bus at set-up, and asked
+//! again when a broadcast comes from another connection, since the owner changes when logind
+//! restarts or a screen saver starts. A sender that starts later is heard.
 //!
 //! A bus takes a rule for a name nobody owns, so a rule says nothing of whether anything will
 //! ever send: on sway, i3 or Hyprland no screen saver runs, and on a system without logind
@@ -17,6 +26,7 @@
 //! bus for sleeps, and logind having answered for the app's session for its `Lock`. It listens
 //! to every source all the same, so a sender that starts later is heard without being promised.
 
+use std::collections::HashMap;
 use std::future::poll_fn;
 use std::pin::Pin;
 use std::task::Poll;
@@ -106,57 +116,107 @@ pub(super) fn start(emitter: Emitter) -> Sources {
     }
 }
 
+/// One source's stream: the signal it carries, the well-known name of its one sender, the bus it
+/// comes on (to ask who owns that name), and its messages.
+struct Stream {
+    kind: Kind,
+    sender: &'static str,
+    bus: Connection,
+    messages: Pin<Box<MessageStream>>,
+}
+
+/// The connection last seen owning each sender's name (the names on the two buses differ).
+type Owners = HashMap<&'static str, Option<OwnedUniqueName>>;
+
+/// What the set-up found.
+#[derive(Default)]
+struct Setup {
+    streams: Vec<Stream>,
+    /// The sources whose senders are there (see the module docs).
+    heard: Vec<Kind>,
+    owners: Owners,
+}
+
 /// Sets up every source the buses offer, then reports their signals until it is dropped.
 async fn listen(emitter: Emitter) {
-    let mut streams = Vec::new();
-    // The sources whose senders are there (see the module docs).
-    let mut heard = Vec::new();
-    // Kept for as long as their streams are read.
-    let mut _connections = Vec::new();
+    let mut setup = Setup::default();
     match Connection::system().await {
-        Ok(system) => {
-            let (logind_streams, logind_heard) = logind(&system).await;
-            streams.extend(logind_streams);
-            heard.extend(logind_heard);
-            _connections.push(system);
-        }
+        Ok(system) => logind(&mut setup, &system).await,
         Err(error) => tracing::info!(
             "no system bus ({error}): sleep and session locks from logind are not watched"
         ),
     }
     match Connection::session().await {
-        Ok(session_bus) => {
-            for name in SCREEN_SAVERS {
-                let Some(stream) = subscribe(
-                    &session_bus,
-                    Kind::ScreenSaver,
-                    rule(name, None, name, "ActiveChanged"),
-                )
-                .await
-                else {
-                    continue;
-                };
-                streams.push(stream);
-                // A screen saver must run to send; none is started on demand.
-                if owner(&session_bus, name).await.is_some() {
-                    heard.push(Kind::ScreenSaver);
-                } else {
-                    tracing::info!("no {name} runs: its locks are listened for, not expected");
-                }
-            }
-            _connections.push(session_bus);
-        }
+        Ok(session_bus) => screen_savers(&mut setup, &session_bus).await,
         Err(error) => {
             tracing::info!("no session bus ({error}): the screen saver's locks are not watched")
         }
     }
+    let Setup {
+        mut streams,
+        heard,
+        mut owners,
+    } = setup;
     emitter.ready(listening(heard));
     loop {
-        let (kind, message) = next(&mut streams).await;
-        if let Some(signal) = kind.signal(&message) {
-            emitter.signal(signal);
+        let (index, message) = next(&mut streams).await;
+        let stream = &streams[index];
+        if from_sender(stream, &message, &mut owners).await {
+            if let Some(signal) = stream.kind.signal(&message) {
+                emitter.signal(signal);
+            }
         }
     }
+}
+
+/// How a message on a source's stream stands to the source's sender.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// Broadcast by the connection that owns the sender's name: the signal.
+    FromSender,
+    /// Sent to the app's connection alone, which the senders never do (see the module docs):
+    /// dropped, whoever sent it.
+    Directed,
+    /// Broadcast by another connection than the owner known, or with no owner known.
+    NotFromOwner,
+}
+
+/// What `message` is to a source whose sender's name `owner` owns (see [`Verdict`]).
+fn verdict(message: &Message, owner: Option<&OwnedUniqueName>) -> Verdict {
+    let header = message.header();
+    if header.destination().is_some() {
+        return Verdict::Directed;
+    }
+    match (header.sender(), owner) {
+        (Some(sender), Some(owner)) if sender.as_str() == owner.as_str() => Verdict::FromSender,
+        _ => Verdict::NotFromOwner,
+    }
+}
+
+/// Whether `message` on `stream` is its sender's signal ([`verdict`]). A broadcast from another
+/// connection than the owner known asks the bus who owns the name now, once, and keeps the
+/// answer: the owner changes when logind restarts or a screen saver starts.
+async fn from_sender(stream: &Stream, message: &Message, owners: &mut Owners) -> bool {
+    let known = owners.get(stream.sender).and_then(Option::as_ref);
+    let verdict = match verdict(message, known) {
+        Verdict::NotFromOwner => {
+            let owner = owner(&stream.bus, stream.sender).await;
+            let now = verdict(message, owner.as_ref());
+            owners.insert(stream.sender, owner);
+            now
+        }
+        verdict => verdict,
+    };
+    if verdict != Verdict::FromSender {
+        // Debug only: anyone on the bus can send these, as often as they like.
+        tracing::debug!(
+            kind = ?stream.kind,
+            ?verdict,
+            "a signal not broadcast by {}: dropped",
+            stream.sender
+        );
+    }
+    verdict == Verdict::FromSender
 }
 
 /// What the sources whose senders are there hear: logind's `Lock` and the screen savers are the
@@ -178,33 +238,51 @@ fn listening(kinds: impl IntoIterator<Item = Kind>) -> Listening {
 
 /// logind's two sources, the manager's `PrepareForSleep` and `Lock` on the app's session, and
 /// which of them have a logind to send them.
-async fn logind(system: &Connection) -> (Vec<(Kind, Pin<Box<MessageStream>>)>, Vec<Kind>) {
-    let mut streams = Vec::new();
-    let mut heard = Vec::new();
+async fn logind(setup: &mut Setup, system: &Connection) {
+    let running = owner(system, LOGIN1).await;
     let sleep = rule(LOGIN1, Some(LOGIN1_PATH), LOGIN1_MANAGER, "PrepareForSleep");
-    if let Some(stream) = subscribe(system, Kind::PrepareForSleep, sleep).await {
-        streams.push(stream);
+    if let Some(stream) = subscribe(system, Kind::PrepareForSleep, LOGIN1, sleep).await {
+        setup.streams.push(stream);
         // logind running, or one the bus starts as soon as anything asks it to suspend
         // (systemd's service file). WSL2 with systemd runs a logind that never sends this (the
         // WSL VM does not suspend through it): an accepted limit, which reads as listening.
-        if owner(system, LOGIN1).await.is_some() || activatable(system, LOGIN1).await {
-            heard.push(Kind::PrepareForSleep);
+        if running.is_some() || activatable(system, LOGIN1).await {
+            setup.heard.push(Kind::PrepareForSleep);
         } else {
             tracing::info!("no logind on the system bus: sleeps are listened for, not expected");
         }
     }
+    setup.owners.insert(LOGIN1, running);
     match own_session(system).await {
         Ok(path) => {
             let lock = rule(LOGIN1, Some(path.as_str()), LOGIN1_SESSION, "Lock");
-            if let Some(stream) = subscribe(system, Kind::SessionLock, lock).await {
-                streams.push(stream);
+            if let Some(stream) = subscribe(system, Kind::SessionLock, LOGIN1, lock).await {
+                setup.streams.push(stream);
                 // logind answered for the app's session, so it runs.
-                heard.push(Kind::SessionLock);
+                setup.heard.push(Kind::SessionLock);
             }
         }
         Err(why) => tracing::info!("{why}: logind's session locks are not watched"),
     }
-    (streams, heard)
+}
+
+/// The screen savers' sources, and which of them run.
+async fn screen_savers(setup: &mut Setup, session_bus: &Connection) {
+    for name in SCREEN_SAVERS {
+        let active = rule(name, None, name, "ActiveChanged");
+        let Some(stream) = subscribe(session_bus, Kind::ScreenSaver, name, active).await else {
+            continue;
+        };
+        setup.streams.push(stream);
+        let running = owner(session_bus, name).await;
+        // A screen saver must run to send; none is started on demand.
+        if running.is_some() {
+            setup.heard.push(Kind::ScreenSaver);
+        } else {
+            tracing::info!("no {name} runs: its locks are listened for, not expected");
+        }
+        setup.owners.insert(name, running);
+    }
 }
 
 /// The connection that owns `name` on `bus` now, if any: the bus driver's `GetNameOwner`.
@@ -279,19 +357,25 @@ fn rule(
     Ok(rule.build())
 }
 
-/// The stream of messages `rule` matches, once the bus has added it; `None`, logged, when it
-/// cannot.
+/// The stream of messages `rule` matches, for `kind` from `sender`, once the bus has added it;
+/// `None`, logged, when it cannot.
 async fn subscribe(
     bus: &Connection,
     kind: Kind,
+    sender: &'static str,
     rule: Result<MatchRule<'static>, zbus::Error>,
-) -> Option<(Kind, Pin<Box<MessageStream>>)> {
+) -> Option<Stream> {
     let subscribed = match rule {
         Ok(rule) => MessageStream::for_match_rule(rule, bus, None).await,
         Err(error) => Err(error),
     };
     match subscribed {
-        Ok(stream) => Some((kind, Box::pin(stream))),
+        Ok(messages) => Some(Stream {
+            kind,
+            sender,
+            bus: bus.clone(),
+            messages: Box::pin(messages),
+        }),
         Err(error) => {
             tracing::info!("cannot listen for {kind:?} ({error}): it is not watched");
             None
@@ -299,15 +383,15 @@ async fn subscribe(
     }
 }
 
-/// The next message of any stream, with its kind. A stream that ends or fails is dropped;
-/// without any, this waits for ever (until the watch stops).
-async fn next(streams: &mut Vec<(Kind, Pin<Box<MessageStream>>)>) -> (Kind, Message) {
+/// The next message of any stream, with the stream's index. A stream that ends or fails is
+/// dropped; without any, this waits for ever (until the watch stops).
+async fn next(streams: &mut Vec<Stream>) -> (usize, Message) {
     poll_fn(|cx| {
         let mut index = 0;
         while index < streams.len() {
-            let (kind, stream) = &mut streams[index];
-            match stream.poll_next(cx) {
-                Poll::Ready(Some(Ok(message))) => return Poll::Ready((*kind, message)),
+            let Stream { kind, messages, .. } = &mut streams[index];
+            match messages.poll_next(cx) {
+                Poll::Ready(Some(Ok(message))) => return Poll::Ready((index, message)),
                 // A message the connection could not read: the stream goes on.
                 Poll::Ready(Some(Err(error))) => {
                     tracing::info!("a bad message on the {kind:?} stream ({error})");
@@ -397,6 +481,48 @@ mod tests {
             ),
         ] {
             assert_eq!(listening(kinds.clone()), expected, "{kinds:?}");
+        }
+    }
+
+    /// `PrepareForSleep(true)`, sent by `from` (the bus sets it), broadcast or `to` one
+    /// connection.
+    fn sent(from: Option<&str>, to: Option<&str>) -> Message {
+        let mut builder = Message::signal(LOGIN1_PATH, LOGIN1_MANAGER, "PrepareForSleep").unwrap();
+        if let Some(from) = from {
+            builder = builder.sender(from).unwrap();
+        }
+        if let Some(to) = to {
+            builder = builder.destination(to).unwrap();
+        }
+        builder.build(&(true,)).unwrap()
+    }
+
+    /// The bus already refuses a broadcast from a connection that does not own the rule's name;
+    /// the watch holds to it as well, and drops what the bus does pass: a signal sent to the app
+    /// alone, whoever sent it.
+    #[test]
+    fn only_a_broadcast_from_the_owner_of_the_name_is_its_signal() {
+        let owner = OwnedUniqueName::try_from(":1.7").unwrap();
+        let known = Some(&owner);
+        for (from, to, owner, expected) in [
+            (Some(":1.7"), None, known, Verdict::FromSender),
+            (Some(":1.7"), Some(":1.9"), known, Verdict::Directed),
+            (Some(":1.8"), Some(":1.9"), known, Verdict::Directed),
+            (
+                Some(":1.8"),
+                Some("dev.apprafter.Desktop"),
+                known,
+                Verdict::Directed,
+            ),
+            (Some(":1.8"), None, known, Verdict::NotFromOwner),
+            (Some(":1.7"), None, None, Verdict::NotFromOwner),
+            (None, None, known, Verdict::NotFromOwner),
+        ] {
+            assert_eq!(
+                verdict(&sent(from, to), owner),
+                expected,
+                "from {from:?} to {to:?}, the name owned by {owner:?}"
+            );
         }
     }
 

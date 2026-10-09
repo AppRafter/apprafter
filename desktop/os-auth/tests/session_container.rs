@@ -124,16 +124,38 @@ impl FakeScreenSavers {
 }
 
 fn active_changed(connection: &Connection, name: &str, active: bool) {
+    active_changed_to(connection, None, name, active);
+}
+
+/// `ActiveChanged(active)` as the screen saver `name` sends it, or sent to `destination` alone.
+fn active_changed_to(connection: &Connection, destination: Option<&str>, name: &str, active: bool) {
     let path = format!("/{}", name.replace('.', "/"));
     connection
         .emit_signal(
-            None::<&str>,
+            destination,
             path.as_str(),
             name,
             "ActiveChanged",
             &(active,),
         )
         .unwrap();
+}
+
+/// Every connection on `connection`'s bus but itself, by unique name: where one connection can
+/// send a signal to another alone, the watch's among them.
+fn every_other(connection: &Connection) -> Vec<String> {
+    let own = connection
+        .unique_name()
+        .expect("a bus connection")
+        .to_string();
+    zbus::blocking::fdo::DBusProxy::new(connection)
+        .expect("a proxy for the bus")
+        .list_names()
+        .expect("the bus lists its names")
+        .into_iter()
+        .map(|name| name.to_string())
+        .filter(|name| name.starts_with(':') && *name != own)
+        .collect()
 }
 
 const BOTH: Listening = Listening {
@@ -230,6 +252,55 @@ fn each_source_reports_its_event() {
         &events,
         "a signal from a connection that does not own the name was heard",
     );
+}
+
+/// A signal sent to the app's connection alone, not broadcast. The bus checks the sender of a
+/// broadcast against the rule's name (the impostor in `each_source_reports_its_event` is not
+/// heard), but delivers a signal sent to a connection whatever its sender, and the system bus
+/// lets every user send one; zbus cannot check a rule's well-known sender itself. Heard, it
+/// would let another local user lock the app, and close its unlock prompt, at will. logind and
+/// the screen savers only ever broadcast these, so none sent to the app is heard, from a
+/// connection that owns no name nor from the owners themselves; their broadcasts still are.
+#[test]
+#[ignore = "needs the session container: bash scripts/test-osauth-linux.sh"]
+fn a_signal_sent_to_the_app_alone_is_not_heard() {
+    let session = container();
+    let logind = FakeLogind::start(&session);
+    let screen_savers = FakeScreenSavers::start();
+    let (_watch, events) = watching();
+
+    let impostor = Connection::system().unwrap();
+    for from in [&impostor, &logind.0] {
+        for to in every_other(from) {
+            from.emit_signal(
+                Some(to.as_str()),
+                LOGIN1_PATH,
+                LOGIN1_MANAGER,
+                "PrepareForSleep",
+                &(true,),
+            )
+            .unwrap();
+            from.emit_signal(Some(to.as_str()), OWN_SESSION, LOGIN1_SESSION, "Lock", &())
+                .unwrap();
+        }
+    }
+    let impostor = Connection::session().unwrap();
+    for from in [&impostor, &screen_savers.0] {
+        for to in every_other(from) {
+            for name in [FREEDESKTOP, GNOME] {
+                active_changed_to(from, Some(to.as_str()), name, true);
+            }
+        }
+    }
+    quiet(&events, "a signal sent to the app alone was heard");
+
+    logind.prepare_for_sleep(true);
+    assert_eq!(next(&events), SessionEvent::Sleeping, "logind's broadcast");
+    logind.lock(OWN_SESSION);
+    assert_eq!(next(&events), SessionEvent::Locked, "logind's broadcast");
+    screen_savers.active_changed(GNOME, true);
+    assert_eq!(next(&events), SessionEvent::Locked, "{GNOME}'s broadcast");
+    quiet(&events, "a broadcast was heard twice");
 }
 
 /// Once the watch is dropped no signal reaches the callback, and the drop does not hang.

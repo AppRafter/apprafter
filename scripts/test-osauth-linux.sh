@@ -80,6 +80,7 @@ CASES=(
     "pam_container outside_a_session_the_authenticator_offers_the_password --no-session"
     "pam_container in_an_inactive_session_the_authenticator_offers_the_password --inactive-session"
     "session_container each_source_reports_its_event --fake-logind --session-bus"
+    "session_container a_signal_sent_to_the_app_alone_is_not_heard --fake-logind --session-bus"
     "session_container a_dropped_watch_reports_nothing --fake-logind --session-bus"
     "session_container without_a_session_bus_logind_still_reports --fake-logind"
     "session_container without_a_system_bus_only_the_screen_savers_report --session-bus --no-system-bus"
