@@ -108,6 +108,17 @@ describe('DoctorCheckRow', () => {
     expect(onAction).toHaveBeenLastCalledWith(target);
   });
 
+  test('a target with no SSH key offers to change it, passing its fix', async () => {
+    const onAction = mock();
+    const fix: CheckFix = { kind: 'configure_ssh_key', target: 'prod-eu' };
+    const { user } = row(
+      check({ id: 'ssh_key', status: 'warn', title: 'SSH key path configured', fix }),
+      onAction,
+    );
+    await user.click(screen.getByRole('button', { name: 'Change SSH key' }));
+    expect(onAction).toHaveBeenLastCalledWith(fix);
+  });
+
   test('a fix with no screen has no button; without onAction no fix has one', () => {
     row(
       check({

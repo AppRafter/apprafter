@@ -36,6 +36,7 @@ function renderDoctor(target: string, strict = false) {
   const onClose = mock();
   const onAddTarget = mock();
   const onToolchain = mock();
+  const onChangeSshKey = mock();
   render(
     <QueryClientProvider client={createQueryClient()}>
       <PlatformContext value={appInfo()}>
@@ -46,6 +47,7 @@ function renderDoctor(target: string, strict = false) {
               onClose={onClose}
               onAddTarget={onAddTarget}
               onToolchain={onToolchain}
+              onChangeSshKey={onChangeSshKey}
             />
           </ViewFrame>
           <ToastViewport />
@@ -54,7 +56,7 @@ function renderDoctor(target: string, strict = false) {
     </QueryClientProvider>,
     { reactStrictMode: strict },
   );
-  return { user: userEvent.setup(), onClose, onAddTarget, onToolchain };
+  return { user: userEvent.setup(), onClose, onAddTarget, onToolchain, onChangeSshKey };
 }
 
 const runAgain = () => screen.getByRole('button', { name: 'Run again' }) as HTMLButtonElement;
@@ -112,6 +114,15 @@ describe('DoctorOverlay', () => {
     const { user, onToolchain, onClose } = renderDoctor('prod-eu');
     await user.click(await screen.findByRole('button', { name: 'Show the toolchain' }));
     expect(onToolchain).toHaveBeenCalledTimes(1);
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  test('a target with no SSH key: its fix opens the key change over the doctor, which stays', async () => {
+    // test/flows' doctorReport(): the ssh_key row's fix is configure_ssh_key.
+    h.read('op_start_doctor', [completed(doctorReport())]);
+    const { user, onChangeSshKey, onClose } = renderDoctor('prod-eu');
+    await user.click(await screen.findByRole('button', { name: 'Change SSH key' }));
+    expect(onChangeSshKey).toHaveBeenCalledTimes(1);
     expect(onClose).not.toHaveBeenCalled();
   });
 

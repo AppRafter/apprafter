@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 // One doctor row (the design's): a tinted status badge, the core's title, its detail (a skipped
 // row's detail is why it did not run), and the fix line, with the screen that fixes it when the
-// app has one: a missing tool the toolchain, a missing target the add-target wizard.
+// app has one: a missing tool the toolchain, a missing target the add-target wizard, a target with
+// no SSH key the key change.
 import { Button } from '../../components/Button';
 import { ArrowRightIcon } from '../../components/icons';
 import { Tag } from '../../components/Tag';
@@ -30,6 +31,7 @@ export function Inline({ text }: { text: string }) {
 const ACTIONS: Partial<Record<CheckFix['kind'], string>> = {
   install_tool: 'Show the toolchain',
   add_target: 'Add a target',
+  configure_ssh_key: 'Change SSH key',
 };
 
 export interface DoctorCheckRowProps {

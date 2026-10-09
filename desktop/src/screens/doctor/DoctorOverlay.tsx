@@ -2,7 +2,9 @@
 // Doctor (spec §7): groups Target / Cluster / This computer, run as a read operation for one
 // target (the tab's), its stage shown live (core Event::Stage per group, 1-based) and cancellable.
 // A fix that has a screen offers it: a missing tool the toolchain, a missing target the wizard
-// (the doctor closes first: the wizard's layer is below the doctor's).
+// (the doctor closes first: the wizard's layer is below the doctor's), a target with no SSH key
+// the key change (the Target screen's, which reads the key in use itself; its form opens above
+// the doctor, which stays for Run again).
 import { useCallback, useEffect, useId, useState } from 'react';
 import { Button } from '../../components/Button';
 import { ErrorPanel } from '../../components/ErrorPanel';
@@ -30,6 +32,8 @@ export interface DoctorOverlayProps {
   readonly onClose: () => void;
   readonly onAddTarget: () => void;
   readonly onToolchain: () => void;
+  /** The `configure_ssh_key` fix: the Target screen's key change for this target. */
+  readonly onChangeSshKey: () => void;
 }
 
 /** The header's chips: one per status that has rows, in the order a reader triages them. */
@@ -59,7 +63,13 @@ function StageLine({ opId }: { opId: OpId }) {
   return stage === null ? null : `${stage.title} · ${stage.index} of ${stage.total}`;
 }
 
-export function DoctorOverlay({ target, onClose, onAddTarget, onToolchain }: DoctorOverlayProps) {
+export function DoctorOverlay({
+  target,
+  onClose,
+  onAddTarget,
+  onToolchain,
+  onChangeSshKey,
+}: DoctorOverlayProps) {
   const id = useId();
   const read = useRead<DoctorReport>();
   const [at, setAt] = useState<Date | null>(null);
@@ -75,6 +85,7 @@ export function DoctorOverlay({ target, onClose, onAddTarget, onToolchain }: Doc
 
   const onAction = (fix: CheckFix) => {
     if (fix.kind === 'install_tool') onToolchain();
+    else if (fix.kind === 'configure_ssh_key') onChangeSshKey();
     else if (fix.kind === 'add_target') {
       onClose();
       onAddTarget();
