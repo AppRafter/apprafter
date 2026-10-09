@@ -10,14 +10,23 @@
 //! before the command was even parsed.
 //!
 //! A password from the page is moved into a [`Zeroizing`] string on the command's first line,
-//! wiped when dropped, and never logged, printed or kept; no command here is traced with its
-//! arguments.
+//! wiped when dropped, and never logged, printed or kept; so is a Hetzner token
+//! (`op_start_verify_token`, `op_plan_target_renew`), moved into a [`SecretString`] there. No
+//! command here is traced with its arguments.
+//!
+//! The D.3 commands (targets, doctor, whoami) are thin wrappers over [`target_ops`], which
+//! holds their bodies and their tests.
 
 use std::sync::Arc;
 
-use apprafter_core::UiError;
+use apprafter_core::session::WhoamiReport;
+use apprafter_core::ssh::{SshKeyCandidate, SshKeyInfo};
+use apprafter_core::target::{TargetListReport, TargetReport};
+use apprafter_core::tools::ToolchainReport;
+use apprafter_core::{SecretString, UiError};
 use apprafter_desktop_ipc::{
-    AppInfo, LockState, OpEvent, OpId, OpSummary, Settings, Subscribed, SubscriptionId, Theme,
+    AppInfo, CatalogueSourceArg, DraftId, LockState, OpEvent, OpId, OpSummary, PlanView, Settings,
+    Subscribed, SubscriptionId, TargetAddArgs, Theme,
 };
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Runtime, State, Webview, WebviewWindow};
@@ -26,7 +35,7 @@ use zeroize::Zeroizing;
 use crate::app::{self, Shell};
 use crate::errors::{DesktopError, Refusal};
 use crate::ops::{panic_message, EventSink};
-use crate::window;
+use crate::{target_ops, window};
 
 type ShellState<'a> = State<'a, Arc<Shell>>;
 
@@ -270,6 +279,183 @@ pub async fn theme_apply<R: Runtime>(
         .map_err(|e| {
             DesktopError::Internal(format!("the window theme was not applied: {e}")).to_ui()
         })
+}
+
+// D.3: targets, doctor, whoami (overview §3.12.1). Each runs on the blocking pool; a read
+// answers with the id of the operation the page follows, a plan with its view.
+
+/// Every target in the store, the unreadable ones listed apart.
+#[tauri::command]
+pub async fn target_list(shell: ShellState<'_>) -> Result<TargetListReport, UiError> {
+    on_shell(&shell, |shell| target_ops::target_list(shell)).await
+}
+
+/// One target in full; an unknown name is `apprafter::target::not_found`.
+#[tauri::command]
+pub async fn target_show(shell: ShellState<'_>, name: String) -> Result<TargetReport, UiError> {
+    on_shell(&shell, move |shell| target_ops::target_show(shell, &name)).await
+}
+
+/// The public keys under `~/.ssh` the key picker offers.
+#[tauri::command]
+pub async fn ssh_key_candidates(shell: ShellState<'_>) -> Result<Vec<SshKeyCandidate>, UiError> {
+    on_shell(&shell, |shell| target_ops::ssh_key_candidates(shell)).await
+}
+
+/// A public key file as the clients show it.
+#[tauri::command]
+pub async fn ssh_key_inspect(shell: ShellState<'_>, path: String) -> Result<SshKeyInfo, UiError> {
+    on_shell(&shell, move |shell| {
+        target_ops::ssh_key_inspect(shell, &path)
+    })
+    .await
+}
+
+/// Every tool the app runs and where it was looked for (the probes bounded by the core).
+#[tauri::command]
+pub async fn toolchain_status(shell: ShellState<'_>) -> Result<ToolchainReport, UiError> {
+    on_shell(&shell, |shell| target_ops::toolchain_status(shell)).await
+}
+
+/// Who the app acts as and the CLI's default target, without a ping (`op_start_whoami` pings).
+#[tauri::command]
+pub async fn whoami(shell: ShellState<'_>) -> Result<WhoamiReport, UiError> {
+    on_shell(&shell, |shell| target_ops::whoami(shell)).await
+}
+
+/// Verify a provider token (a read the page follows): the result names a draft, never the
+/// token, which crosses IPC this once and is wiped when its draft goes.
+#[tauri::command]
+pub async fn op_start_verify_token(
+    shell: ShellState<'_>,
+    provider: String,
+    token: String,
+) -> Result<OpId, UiError> {
+    let token = SecretString::from(Zeroizing::new(token));
+    on_shell(&shell, move |shell| {
+        target_ops::start_verify_token(shell, provider, token)
+    })
+    .await
+}
+
+/// Read the regions and machines a picker offers, with a draft's token or a stored target's.
+#[tauri::command]
+pub async fn op_start_machine_catalogue(
+    shell: ShellState<'_>,
+    source: CatalogueSourceArg,
+) -> Result<OpId, UiError> {
+    on_shell(&shell, move |shell| {
+        target_ops::start_machine_catalogue(shell, source)
+    })
+    .await
+}
+
+/// Measure how far each region is from this computer.
+#[tauri::command]
+pub async fn op_start_region_latencies(
+    shell: ShellState<'_>,
+    regions: Vec<String>,
+) -> Result<OpId, UiError> {
+    on_shell(&shell, move |shell| {
+        target_ops::start_region_latencies(shell, regions)
+    })
+    .await
+}
+
+/// Run doctor on the target called `target`.
+#[tauri::command]
+pub async fn op_start_doctor(shell: ShellState<'_>, target: String) -> Result<OpId, UiError> {
+    on_shell(&shell, move |shell| target_ops::start_doctor(shell, target)).await
+}
+
+/// whoami with a ping of the CLI default's stored token.
+#[tauri::command]
+pub async fn op_start_whoami(shell: ShellState<'_>) -> Result<OpId, UiError> {
+    on_shell(&shell, |shell| target_ops::start_whoami(shell)).await
+}
+
+/// Plan adding a target with a verified token's draft (Bounded); the plan takes the draft.
+#[tauri::command]
+pub async fn op_plan_target_add(
+    shell: ShellState<'_>,
+    args: TargetAddArgs,
+) -> Result<PlanView, UiError> {
+    on_shell(&shell, move |shell| {
+        target_ops::plan_target_add(shell, args)
+    })
+    .await
+}
+
+/// Plan the token renewal of `name` (Bounded); the new token is checked with the provider when
+/// the plan runs, and only then saved.
+#[tauri::command]
+pub async fn op_plan_target_renew(
+    shell: ShellState<'_>,
+    name: String,
+    token: String,
+) -> Result<PlanView, UiError> {
+    let token = SecretString::from(Zeroizing::new(token));
+    on_shell(&shell, move |shell| {
+        target_ops::plan_target_renew(shell, &name, token)
+    })
+    .await
+}
+
+/// Plan making `name` the CLI's default (Reversible: the page runs it at once).
+#[tauri::command]
+pub async fn op_plan_target_use(shell: ShellState<'_>, name: String) -> Result<PlanView, UiError> {
+    on_shell(&shell, move |shell| {
+        target_ops::plan_target_use(shell, &name)
+    })
+    .await
+}
+
+/// Plan renaming `from` to `to` (Bounded).
+#[tauri::command]
+pub async fn op_plan_target_rename(
+    shell: ShellState<'_>,
+    from: String,
+    to: String,
+) -> Result<PlanView, UiError> {
+    on_shell(&shell, move |shell| {
+        target_ops::plan_target_rename(shell, &from, &to)
+    })
+    .await
+}
+
+/// Plan removing `name` from this computer (Destructive: the gesture runs inside `op_execute`).
+#[tauri::command]
+pub async fn op_plan_target_remove(
+    shell: ShellState<'_>,
+    name: String,
+) -> Result<PlanView, UiError> {
+    on_shell(&shell, move |shell| {
+        target_ops::plan_target_remove(shell, &name)
+    })
+    .await
+}
+
+/// Plan changing the machine of `name` (Bounded); a provisioned target is refused.
+#[tauri::command]
+pub async fn op_plan_target_machine(
+    shell: ShellState<'_>,
+    name: String,
+    sku: String,
+    region: Option<String>,
+) -> Result<PlanView, UiError> {
+    on_shell(&shell, move |shell| {
+        target_ops::plan_target_machine(shell, &name, sku, region)
+    })
+    .await
+}
+
+/// The add wizard closed: its draft goes. An unknown draft is no error.
+#[tauri::command]
+pub async fn target_draft_discard(shell: ShellState<'_>, draft_id: DraftId) -> Result<(), UiError> {
+    on_shell_ok(&shell, move |shell| {
+        target_ops::draft_discard(shell, draft_id)
+    })
+    .await
 }
 
 #[cfg(test)]

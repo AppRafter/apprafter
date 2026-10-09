@@ -11,6 +11,8 @@
 // desktop session does; or one half, or nothing at all (no bus, as in WSL or a container), for
 // the settings' lock-on-sleep row. Operations run on ops.ts's engine (Rust's OperationManager):
 // a destructive plan asks the gesture the way unlocking does, by the same route and back-off.
+// The D.3 commands answer from targets.ts's store (three targets and an unreadable one), whose
+// verified-token drafts go on every lock and unlock, as Rust's do.
 import { emit } from '@tauri-apps/api/event';
 import { mockIPC, mockWindows } from '@tauri-apps/api/mocks';
 import type { AppInfo } from '../generated/AppInfo';
@@ -27,6 +29,7 @@ import type { Theme } from '../generated/Theme';
 import type { UiError } from '../generated/UiError';
 import type { UnavailableReason } from '../generated/UnavailableReason';
 import { createMockOps, type Handler, type MockOps } from './ops';
+import { mockStore, targetHandlers } from './targets';
 
 export { MOCK_TARGETS } from './fixtures';
 
@@ -197,9 +200,10 @@ export function installMockIpc(options: MockOptions = {}): void {
   let lock = stateOf('startup');
 
   const transition = async (reason: LockReason | null) => {
-    // Rust's lock hook, on every lock and unlock: plans dropped, reads cancelled, every
-    // subscription ended.
+    // Rust's lock hook, on every lock and unlock: plans dropped, reads cancelled, drafts
+    // dropped, every subscription ended.
     engine.transition();
+    store.drafts.clear();
     seq += 1;
     lock = stateOf(reason);
     await emit(LOCK_CHANGED, lock);
@@ -275,6 +279,7 @@ export function installMockIpc(options: MockOptions = {}): void {
     },
   });
   current = engine;
+  const store = mockStore();
 
   const handlers: Record<string, Handler> = {
     app_info: appInfo,
@@ -309,6 +314,7 @@ export function installMockIpc(options: MockOptions = {}): void {
     ...engine.handlers,
     window_ready: () => null,
     theme_apply: () => null,
+    ...targetHandlers(engine, store),
     'plugin:window|minimize': () => null,
     'plugin:window|toggle_maximize': toggleMaximize,
     'plugin:window|internal_toggle_maximize': toggleMaximize,

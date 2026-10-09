@@ -7,6 +7,7 @@ import { COMMANDS } from './generated/commands';
 import { DESKTOP_ERROR_CODES } from './generated/errors';
 import type { OpEvent } from './generated/OpEvent';
 import type { Settings } from './generated/Settings';
+import type { TargetAddArgs } from './generated/TargetAddArgs';
 import type { UiError } from './generated/UiError';
 
 const SETTINGS: Settings = {
@@ -22,6 +23,17 @@ const SETTINGS: Settings = {
   osNotify: true,
   trayBadge: true,
   closeToTray: true,
+};
+
+/** What the add wizard sends: the token by its draft, never the token. */
+const ADD_ARGS: TargetAddArgs = {
+  name: 'lab-2',
+  provider: 'hetzner-cloud',
+  draftId: 3,
+  sshKey: null,
+  region: 'nbg1',
+  tier: 'solo',
+  serverType: 'cx22',
 };
 
 let calls: { cmd: string; args: unknown }[];
@@ -69,6 +81,64 @@ describe('each function sends its command with camelCase arguments', () => {
     opExecute: [() => api.opExecute(7, channel), 'op_execute', { opId: 7, onEvent: channel }],
     windowReady: [() => api.windowReady(), 'window_ready', {}],
     themeApply: [() => api.themeApply('system'), 'theme_apply', { theme: 'system' }],
+    targetList: [() => api.targetList(), 'target_list', {}],
+    targetShow: [() => api.targetShow('prod-eu'), 'target_show', { name: 'prod-eu' }],
+    sshKeyCandidates: [() => api.sshKeyCandidates(), 'ssh_key_candidates', {}],
+    sshKeyInspect: [
+      () => api.sshKeyInspect('~/.ssh/id_ed25519.pub'),
+      'ssh_key_inspect',
+      { path: '~/.ssh/id_ed25519.pub' },
+    ],
+    toolchainStatus: [() => api.toolchainStatus(), 'toolchain_status', {}],
+    whoami: [() => api.whoami(), 'whoami', {}],
+    opStartVerifyToken: [
+      () => api.opStartVerifyToken('hetzner-cloud', 'not-a-real-token'),
+      'op_start_verify_token',
+      { provider: 'hetzner-cloud', token: 'not-a-real-token' },
+    ],
+    opStartMachineCatalogue: [
+      () => api.opStartMachineCatalogue({ kind: 'draft', draftId: 3 }),
+      'op_start_machine_catalogue',
+      { source: { kind: 'draft', draftId: 3 } },
+    ],
+    opStartRegionLatencies: [
+      () => api.opStartRegionLatencies(['nbg1', 'hel1']),
+      'op_start_region_latencies',
+      { regions: ['nbg1', 'hel1'] },
+    ],
+    opStartDoctor: [() => api.opStartDoctor('prod-eu'), 'op_start_doctor', { target: 'prod-eu' }],
+    opStartWhoami: [() => api.opStartWhoami(), 'op_start_whoami', {}],
+    opPlanTargetAdd: [
+      () => api.opPlanTargetAdd(ADD_ARGS),
+      'op_plan_target_add',
+      { args: ADD_ARGS },
+    ],
+    opPlanTargetRenew: [
+      () => api.opPlanTargetRenew('prod-eu', 'not-a-real-token'),
+      'op_plan_target_renew',
+      { name: 'prod-eu', token: 'not-a-real-token' },
+    ],
+    opPlanTargetUse: [
+      () => api.opPlanTargetUse('prod-eu'),
+      'op_plan_target_use',
+      { name: 'prod-eu' },
+    ],
+    opPlanTargetRename: [
+      () => api.opPlanTargetRename('prod-eu', 'prod-us'),
+      'op_plan_target_rename',
+      { from: 'prod-eu', to: 'prod-us' },
+    ],
+    opPlanTargetRemove: [
+      () => api.opPlanTargetRemove('prod-eu'),
+      'op_plan_target_remove',
+      { name: 'prod-eu' },
+    ],
+    opPlanTargetMachine: [
+      () => api.opPlanTargetMachine('lab', 'cx32', null),
+      'op_plan_target_machine',
+      { name: 'lab', sku: 'cx32', region: null },
+    ],
+    targetDraftDiscard: [() => api.targetDraftDiscard(3), 'target_draft_discard', { draftId: 3 }],
   });
 
   test('every exported function is covered, and together they call every command', async () => {

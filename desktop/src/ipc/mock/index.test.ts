@@ -9,6 +9,7 @@ import { ALLOWED_WHILE_LOCKED, type COMMANDS } from '../generated/commands';
 import { DESKTOP_ERROR_CODES } from '../generated/errors';
 import type { LockState } from '../generated/LockState';
 import type { OpEvent } from '../generated/OpEvent';
+import { HETZNER_TOKEN_LEN } from '../generated/target';
 import {
   installMockIpc,
   MOCK_BACKOFF,
@@ -42,6 +43,35 @@ function callEach(): Record<(typeof COMMANDS)[number], () => Promise<unknown>> {
     unlock_with_password: () => api.unlockWithPassword(MOCK_PASSWORD),
     window_ready: () => api.windowReady(),
     theme_apply: () => api.themeApply('system'),
+    target_list: () => api.targetList(),
+    target_show: () => api.targetShow('prod-eu'),
+    ssh_key_candidates: () => api.sshKeyCandidates(),
+    ssh_key_inspect: () => api.sshKeyInspect('~/.ssh/id_ed25519.pub'),
+    toolchain_status: () => api.toolchainStatus(),
+    whoami: () => api.whoami(),
+    op_start_verify_token: () =>
+      api.opStartVerifyToken('hetzner-cloud', 'k'.repeat(HETZNER_TOKEN_LEN)),
+    op_start_machine_catalogue: () =>
+      api.opStartMachineCatalogue({ kind: 'target', name: 'prod-eu' }),
+    op_start_region_latencies: () => api.opStartRegionLatencies(['nbg1', 'hel1']),
+    op_start_doctor: () => api.opStartDoctor('prod-eu'),
+    op_start_whoami: () => api.opStartWhoami(),
+    op_plan_target_add: () =>
+      api.opPlanTargetAdd({
+        name: 'lab-2',
+        provider: 'hetzner-cloud',
+        draftId: 3,
+        sshKey: null,
+        region: 'nbg1',
+        tier: 'solo',
+        serverType: 'cx22',
+      }),
+    op_plan_target_renew: () => api.opPlanTargetRenew('prod-eu', 'k'.repeat(HETZNER_TOKEN_LEN)),
+    op_plan_target_use: () => api.opPlanTargetUse('prod-eu'),
+    op_plan_target_rename: () => api.opPlanTargetRename('prod-eu', 'prod-us'),
+    op_plan_target_remove: () => api.opPlanTargetRemove('prod-eu'),
+    op_plan_target_machine: () => api.opPlanTargetMachine('lab', 'cx32', null),
+    target_draft_discard: () => api.targetDraftDiscard(3),
   };
 }
 
@@ -70,13 +100,18 @@ describe('installMockIpc', () => {
     }
   });
 
-  test('unlocked, every command has an answer (an unknown operation is plan_not_found)', async () => {
+  test('unlocked, every command has an answer (an unknown operation or draft is not found)', async () => {
     installMockIpc();
     await api.unlock();
     for (const [name, call] of Object.entries(callEach())) {
       // It would lock the app for the calls after it; the lock-changed test covers it.
       if (name === 'lock_now') continue;
-      const fine: (string | null)[] = ['answered', DESKTOP_ERROR_CODES.PLAN_NOT_FOUND];
+      // A call naming a draft no verify made is refused at the command, as Rust refuses it.
+      const fine: (string | null)[] = [
+        'answered',
+        DESKTOP_ERROR_CODES.PLAN_NOT_FOUND,
+        DESKTOP_ERROR_CODES.DRAFT_NOT_FOUND,
+      ];
       expect(fine, name).toContain(await outcome(call));
     }
   });
@@ -231,7 +266,7 @@ describe('installMockIpc', () => {
   test('an unknown command is refused as Tauri refuses it, not answered', async () => {
     installMockIpc();
     const { invoke } = await import('@tauri-apps/api/core');
-    await expect(invoke('target_list')).rejects.toContain('target_list');
+    await expect(invoke('not_a_command')).rejects.toContain('not_a_command');
   });
 });
 

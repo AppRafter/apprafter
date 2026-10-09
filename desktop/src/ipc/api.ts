@@ -4,17 +4,27 @@
 // authentication refusal is also heard by onAuthRefusal, whichever command it came from.
 import { type Channel, type InvokeArgs, invoke } from '@tauri-apps/api/core';
 import type { AppInfo } from './generated/AppInfo';
+import type { CatalogueSourceArg } from './generated/CatalogueSourceArg';
 import type { COMMANDS } from './generated/commands';
+import type { DraftId } from './generated/DraftId';
 import { DESKTOP_ERROR_CODES } from './generated/errors';
 import type { LockState } from './generated/LockState';
 import type { OpEvent } from './generated/OpEvent';
 import type { OpId } from './generated/OpId';
 import type { OpSummary } from './generated/OpSummary';
+import type { PlanView } from './generated/PlanView';
 import type { Settings } from './generated/Settings';
+import type { SshKeyCandidate } from './generated/SshKeyCandidate';
+import type { SshKeyInfo } from './generated/SshKeyInfo';
 import type { Subscribed } from './generated/Subscribed';
 import type { SubscriptionId } from './generated/SubscriptionId';
+import type { TargetAddArgs } from './generated/TargetAddArgs';
+import type { TargetListReport } from './generated/TargetListReport';
+import type { TargetReport } from './generated/TargetReport';
 import type { Theme } from './generated/Theme';
+import type { ToolchainReport } from './generated/ToolchainReport';
 import type { UiError } from './generated/UiError';
+import type { WhoamiReport } from './generated/WhoamiReport';
 
 /** The commands the functions below call; api.test.ts holds it equal to Rust's COMMANDS. */
 export const API_COMMANDS = [
@@ -35,6 +45,25 @@ export const API_COMMANDS = [
   'op_execute',
   'window_ready',
   'theme_apply',
+  // D.3: targets, doctor, whoami.
+  'target_list',
+  'target_show',
+  'ssh_key_candidates',
+  'ssh_key_inspect',
+  'toolchain_status',
+  'whoami',
+  'op_start_verify_token',
+  'op_start_machine_catalogue',
+  'op_start_region_latencies',
+  'op_start_doctor',
+  'op_start_whoami',
+  'op_plan_target_add',
+  'op_plan_target_renew',
+  'op_plan_target_use',
+  'op_plan_target_rename',
+  'op_plan_target_remove',
+  'op_plan_target_machine',
+  'target_draft_discard',
 ] as const satisfies readonly (typeof COMMANDS)[number][];
 
 export type ApiCommand = (typeof API_COMMANDS)[number];
@@ -165,3 +194,50 @@ export const windowReady = () => call<void>('window_ready');
  * followed while it stays System. Answered while locked.
  */
 export const themeApply = (theme: Theme) => call<void>('theme_apply', { theme });
+
+// D.3: targets, doctor, whoami. A read (`opStart*`) answers with the id of an operation to follow
+// (`opSubscribe`) and cancel (`opCancel`); a plan (`opPlanTarget*`) with the view to confirm and
+// then execute (`opExecute`). Every target is named: none of these acts on the CLI's default.
+
+/** Every target in the store, the unreadable ones listed apart. */
+export const targetList = () => call<TargetListReport>('target_list');
+/** One target in full; an unknown name is `TARGET_NOT_FOUND` with the names there are. */
+export const targetShow = (name: string) => call<TargetReport>('target_show', { name });
+/** The public keys under `~/.ssh` the key picker offers. */
+export const sshKeyCandidates = () => call<SshKeyCandidate[]>('ssh_key_candidates');
+export const sshKeyInspect = (path: string) => call<SshKeyInfo>('ssh_key_inspect', { path });
+/** Each tool the app runs and where it was looked for. */
+export const toolchainStatus = () => call<ToolchainReport>('toolchain_status');
+/** The About row: no ping (its verification is `skipped`); `opStartWhoami` verifies. */
+export const whoami = () => call<WhoamiReport>('whoami');
+/** The token crosses IPC here, once; the read's result (TokenVerified) names its draft. */
+export const opStartVerifyToken = (provider: string, token: string) =>
+  call<OpId>('op_start_verify_token', { provider, token });
+/** The regions and machines a picker offers, read with a draft's token or a stored target's. */
+export const opStartMachineCatalogue = (source: CatalogueSourceArg) =>
+  call<OpId>('op_start_machine_catalogue', { source });
+export const opStartRegionLatencies = (regions: readonly string[]) =>
+  call<OpId>('op_start_region_latencies', { regions });
+/** Doctor on the target called `target`. */
+export const opStartDoctor = (target: string) => call<OpId>('op_start_doctor', { target });
+/** whoami with a ping of the CLI default's stored token. */
+export const opStartWhoami = () => call<OpId>('op_start_whoami');
+/** Plan adding a target with a verified token's draft (bounded); the plan takes the draft. */
+export const opPlanTargetAdd = (args: TargetAddArgs) =>
+  call<PlanView>('op_plan_target_add', { args });
+/** Plan renewing a target's token (bounded); the token crosses IPC here, once per attempt. */
+export const opPlanTargetRenew = (name: string, token: string) =>
+  call<PlanView>('op_plan_target_renew', { name, token });
+/** Plan making `name` the CLI's default (reversible: execute it at once). */
+export const opPlanTargetUse = (name: string) => call<PlanView>('op_plan_target_use', { name });
+export const opPlanTargetRename = (from: string, to: string) =>
+  call<PlanView>('op_plan_target_rename', { from, to });
+/** Plan removing `name` from this computer (destructive: the OS gesture runs in `opExecute`). */
+export const opPlanTargetRemove = (name: string) =>
+  call<PlanView>('op_plan_target_remove', { name });
+/** Plan changing the machine of `name` (bounded); a provisioned target is refused. */
+export const opPlanTargetMachine = (name: string, sku: string, region: string | null) =>
+  call<PlanView>('op_plan_target_machine', { name, sku, region });
+/** The add wizard closed: its draft goes. An unknown draft is no error. */
+export const targetDraftDiscard = (draftId: DraftId) =>
+  call<void>('target_draft_discard', { draftId });
