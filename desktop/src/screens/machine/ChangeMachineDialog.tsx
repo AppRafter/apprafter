@@ -23,7 +23,7 @@ import { failureOf, runPlan } from '../../ipc/plans';
 import { usePlatform } from '../../state/platform';
 import { useRead } from '../../state/read';
 import { TARGETS_KEY, targetKey } from '../../state/targets';
-import { choosable, defaultRegion, defaultSku, offerIn } from './catalogue';
+import { choosable, defaultRegion, defaultSku, latencyView, offerIn } from './catalogue';
 import { MachinePicker } from './MachinePicker';
 
 /** The machine the target is set to now (its TargetReport's region and server type). */
@@ -75,14 +75,22 @@ export function ChangeMachineDialog({ target, now, onClose }: ChangeMachineDialo
     if (!idle) return;
     void runCatalogue(() => api.opStartMachineCatalogue({ kind: 'target', name: target })).then(
       (found) => {
-        if (found === null) return;
-        setChoice(startingChoice(found, { region: nowRegion, serverType: nowType }));
-        void runLatencies(() => api.opStartRegionLatencies(found.regions.map((r) => r.code)));
+        if (found !== null) {
+          setChoice(startingChoice(found, { region: nowRegion, serverType: nowType }));
+        }
       },
     );
-  }, [idle, runCatalogue, runLatencies, target, nowRegion, nowType]);
+  }, [idle, runCatalogue, target, nowRegion, nowType]);
 
   const cat = catalogueRead.state.status === 'done' ? catalogueRead.state.data : null;
+
+  // The latencies of the catalogue's regions, once it is in, and again after Try again.
+  const latencyIdle = latencyRead.state.status === 'idle';
+  useEffect(() => {
+    if (cat === null || !latencyIdle) return;
+    const regions = cat.regions.map((r) => r.code);
+    void runLatencies(() => api.opStartRegionLatencies(regions));
+  }, [cat, latencyIdle, runLatencies]);
   const region = choice?.region ?? null;
   const sku = choice?.sku ?? null;
   const chosen = cat !== null && region !== null && choosable(offerIn(cat, region, sku));
@@ -117,18 +125,14 @@ export function ChangeMachineDialog({ target, now, onClose }: ChangeMachineDialo
     }
   };
 
-  const latencies =
-    latencyRead.state.status === 'done'
-      ? latencyRead.state.data
-      : latencyRead.state.status === 'failed' || latencyRead.state.status === 'cancelled'
-        ? [] // measured, and nothing answered: every chip shows "–"
-        : null;
+  const { latencies, latencyProblem } = latencyView(latencyRead.state, latencyRead.reset);
   const readState = catalogueRead.state;
   const body =
     cat !== null ? (
       <MachinePicker
         catalogue={cat}
         latencies={latencies}
+        latencyProblem={latencyProblem}
         region={region ?? ''}
         sku={sku}
         onRegion={(value) =>

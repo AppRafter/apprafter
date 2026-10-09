@@ -9,6 +9,7 @@ import type { ChipSelectOption } from '../../components/ChipSelect';
 import type { MachineCatalogue } from '../../ipc/generated/MachineCatalogue';
 import type { MachineOfferView } from '../../ipc/generated/MachineOfferView';
 import type { RegionLatency } from '../../ipc/generated/RegionLatency';
+import type { ReadState } from '../../state/read';
 
 /** The region the CLI checks a SKU against when none is set (`execute_add`, `target machine`). */
 export const CLI_DEFAULT_REGION = 'nbg1';
@@ -42,24 +43,56 @@ function latencyText(ms: Measured, covered: boolean): string {
 /**
  * The region chips: regions with at least one offer, nearest first once `latencies` is in (a
  * region with no answer, or one the probes did not cover, after the measured ones), then by code.
- * `latencies` is null while the probes run.
+ * `latencies` is null while the probes run. Not `measured` (the reading failed or was cancelled,
+ * which the picker says beside the chips), no chip shows a latency.
  */
 export function regionChips(
   cat: MachineCatalogue,
   latencies: readonly RegionLatency[] | null,
+  measured = true,
 ): ChipSelectOption<string>[] {
   const offered = new Set(cat.offers.map((o) => o.location));
-  const measured = new Map(latencies?.map((l) => [l.region, l.latencyMs]) ?? []);
+  const found = new Map(measured ? (latencies?.map((l) => [l.region, l.latencyMs]) ?? []) : []);
   return cat.regions
     .filter((r) => offered.has(r.code))
-    .map((r) => ({ r, ms: measured.get(r.code) }))
+    .map((r) => ({ r, ms: found.get(r.code) }))
     .sort((a, b) => rank(a.ms) - rank(b.ms) || a.r.code.localeCompare(b.r.code))
     .map(({ r, ms }) => ({
       value: r.code,
       label: r.code,
       secondary: r.city,
-      meta: latencyText(ms, latencies !== null),
+      ...(measured && { meta: latencyText(ms, latencies !== null) }),
     }));
+}
+
+/**
+ * What the picker shows of a latency reading: the latencies once measured, null while they are
+ * measured, and for a reading that failed or was cancelled why, with a retry. Never a failed
+ * reading drawn as one that measured nothing.
+ */
+export function latencyView(
+  read: ReadState<readonly RegionLatency[]>,
+  onRetry: () => void,
+): {
+  latencies: readonly RegionLatency[] | null;
+  latencyProblem: { text: string; onRetry: () => void } | null;
+} {
+  switch (read.status) {
+    case 'done':
+      return { latencies: read.data, latencyProblem: null };
+    case 'failed':
+      return {
+        latencies: null,
+        latencyProblem: { text: `Latency could not be measured: ${read.error.message}`, onRetry },
+      };
+    case 'cancelled':
+      return {
+        latencies: null,
+        latencyProblem: { text: 'Measuring latency was cancelled.', onRetry },
+      };
+    default:
+      return { latencies: null, latencyProblem: null };
+  }
 }
 
 /** One region's offers under the filters; `hidden` counts what "Hide unavailable" left out. */

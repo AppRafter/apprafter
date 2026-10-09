@@ -191,6 +191,18 @@ test('a catalogue read cancelled elsewhere says so, with Try again', async () =>
   expect(screen.getByRole('button', { name: 'Try again' })).toBeDefined();
 });
 
+test('a latency read that fails says why, with Try again', async () => {
+  h.answer('op_start_region_latencies', () =>
+    Promise.reject(uiError('apprafter::desktop::internal', 'the probe broke')),
+  );
+  const { user } = renderChange('staging', STAGING);
+  expect(await screen.findByText('Latency could not be measured: the probe broke')).toBeDefined();
+  h.answer('op_start_region_latencies', 79);
+  h.operation(79, [completed([{ region: 'nbg1', latencyMs: 38 }])]);
+  await user.click(screen.getByRole('button', { name: 'Try again' }));
+  expect(await screen.findByText('38 ms')).toBeDefined();
+});
+
 test("a Destructive plan opens D.3d's PlanConfirm first (guard)", async () => {
   h.plan(
     'op_plan_target_machine',

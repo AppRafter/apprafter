@@ -120,6 +120,16 @@
   color: var(--fg-faint);
 }
 
+/* Why the regions show no latency: the reading failed or was cancelled, with Try again. */
+.machine-latency-note {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: -8px;
+  color: var(--warn);
+  font-size: var(--fs-12-5);
+}
+
 .machine-summary {
   margin: 0;
   color: var(--fg-muted);

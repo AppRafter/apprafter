@@ -36,6 +36,18 @@ const cells = (sku: string) => {
 };
 
 describe('MachinePicker', () => {
+  test('a latency that could not be measured is said, with Try again, and no chip shows one', async () => {
+    const onRetry = mock();
+    const { user } = picker({
+      latencies: null,
+      latencyProblem: { text: 'Latency could not be measured: the probe broke', onRetry },
+    });
+    expect(screen.getByText('Latency could not be measured: the probe broke')).toBeDefined();
+    expect(document.querySelectorAll('.chip-option-meta')).toHaveLength(0);
+    await user.click(screen.getByRole('button', { name: 'Try again' }));
+    expect(onRetry).toHaveBeenCalledTimes(1);
+  });
+
   test("the region's table, cheapest first by the month; unavailable hidden behind a count", () => {
     picker();
     expect(screen.getByRole('table', { name: 'Machines in nbg1' })).toBeDefined();

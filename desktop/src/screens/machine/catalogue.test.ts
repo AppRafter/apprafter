@@ -45,6 +45,17 @@ describe('regionChips', () => {
     expect(chips.map((c) => c.value)).toEqual(['fsn1', 'hel1', 'nbg1']);
     expect(chips.every((c) => c.meta === '…')).toBe(true);
   });
+
+  test('not measured (the reading failed or was cancelled): no latency at all, in code order', () => {
+    const cat = catalogue();
+    cat.regions.reverse();
+    const chips = regionChips(cat, [{ region: 'nbg1', latencyMs: 38 }], false);
+    expect(chips.map((c) => [c.value, c.meta])).toEqual([
+      ['fsn1', undefined],
+      ['hel1', undefined],
+      ['nbg1', undefined],
+    ]);
+  });
 });
 
 describe('offers', () => {

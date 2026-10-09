@@ -28,10 +28,18 @@ import {
   visibleOffers,
 } from './catalogue';
 
+/** Why the regions show no latency (the reading failed or was cancelled), and how to retry. */
+export interface LatencyProblem {
+  readonly text: string;
+  readonly onRetry: () => void;
+}
+
 export interface MachinePickerProps {
   readonly catalogue: MachineCatalogue;
   /** null while the probes run. */
   readonly latencies: readonly RegionLatency[] | null;
+  /** The latency could not be measured: said under the regions, which then show none. */
+  readonly latencyProblem?: LatencyProblem | null;
   readonly region: string;
   readonly sku: string | null;
   readonly onRegion: (region: string) => void;
@@ -127,6 +135,7 @@ const COLUMNS: readonly DataColumn<MachineOfferView>[] = [
 export function MachinePicker({
   catalogue,
   latencies,
+  latencyProblem = null,
   region,
   sku,
   onRegion,
@@ -155,9 +164,17 @@ export function MachinePicker({
       <ChipSelect
         legend="Region"
         value={region}
-        options={regionChips(catalogue, latencies)}
+        options={regionChips(catalogue, latencies, latencyProblem === null)}
         onChange={onRegion}
       />
+      {latencyProblem !== null && (
+        <div className="machine-latency-note" role="note">
+          <span>{latencyProblem.text}</span>
+          <Button variant="ghost" size={26} onClick={latencyProblem.onRetry}>
+            Try again
+          </Button>
+        </div>
+      )}
       <div className="machine-tools">
         <span className="eyebrow machine-tools-legend">Machine</span>
         <span className="machine-caption">{`Live catalogue for ${region} · click a column to sort`}</span>
