@@ -13,15 +13,8 @@ import { clearLive, reattachAll } from '../ipc/operations';
 import { ACTIVITY_INTERVAL_MS, dropUnlockedData, useLockState } from '../state/lock';
 import { usePlatform } from '../state/platform';
 import { LockScreen } from './LockScreen';
-import { TitleBar } from './TitleBar';
-
-function Wordmark() {
-  return (
-    <span className="wordmark">
-      App<span className="wordmark-accent">Rafter</span>
-    </span>
-  );
-}
+import { ScreenShown } from './reveal';
+import { TitleBar, Wordmark } from './TitleBar';
 
 export interface LockGateProps {
   children: ReactNode;
@@ -79,6 +72,7 @@ export function LockGate({ children, now = Date.now }: LockGateProps) {
         <div className="app-error">
           <ErrorPanel error={uiErrorOf(lock.error)} />
         </div>
+        <ScreenShown />
       </div>
     );
   }
@@ -89,6 +83,7 @@ export function LockGate({ children, now = Date.now }: LockGateProps) {
           <Wordmark />
         </TitleBar>
         <LockScreen state={lock.data} />
+        <ScreenShown />
       </div>
     );
   }

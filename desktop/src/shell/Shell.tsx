@@ -13,6 +13,7 @@ import { usePlatform } from '../state/platform';
 import { INITIAL_SESSION, sessionReducer, type TargetTab } from '../state/session';
 import { shortcutFor } from '../state/shortcuts';
 import { TabContext } from '../state/tab';
+import { ScreenShown } from './reveal';
 import { SettingsDialog } from './SettingsDialog';
 import { Sidebar } from './Sidebar';
 import { TabStrip } from './TabStrip';
@@ -121,6 +122,7 @@ export function Shell() {
         {settingsOpen && <SettingsDialog onClose={() => setSettingsOpen(false)} />}
         <ToastViewport />
       </div>
+      <ScreenShown />
     </div>
   );
 }

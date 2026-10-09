@@ -9,6 +9,15 @@ import { Logo } from '../components/Logo';
 import type { Os } from '../ipc/generated/Os';
 import { CaptionButtons } from './CaptionButtons';
 
+/** The bar's content where there are no tabs: the lock screen and the error screens. */
+export function Wordmark() {
+  return (
+    <span className="wordmark">
+      App<span className="wordmark-accent">Rafter</span>
+    </span>
+  );
+}
+
 export function TitleBar({ os, children }: { os: Os; children: ReactNode }) {
   const drags = os !== 'linux';
   const region = (value: 'true' | 'deep') => (drags ? value : undefined);

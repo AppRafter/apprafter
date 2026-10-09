@@ -13,6 +13,16 @@ export function usePlatform(): AppInfo {
   return info;
 }
 
+/**
+ * The OS as the webview's user agent tells it, for the one screen app_info cannot inform: its
+ * own failure. WebView2 says "Windows", WKWebView "Macintosh"; anything else is taken for Linux.
+ */
+export function osFromUserAgent(userAgent: string): Os {
+  if (userAgent.includes('Windows')) return 'windows';
+  if (userAgent.includes('Macintosh') || userAgent.includes('Mac OS X')) return 'macos';
+  return 'linux';
+}
+
 const OS_NAMES: Record<Os, string> = { windows: 'Windows', macos: 'macOS', linux: 'Linux' };
 
 /** "Windows", "macOS", "Linux": per-OS copy ("System follows the macOS appearance."). */

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 import { afterEach, beforeEach, expect, test } from 'bun:test';
 import { clearMocks, mockIPC, mockWindows } from '@tauri-apps/api/mocks';
-import { act, cleanup, render, screen } from '@testing-library/react';
+import { act, cleanup, render, screen, waitFor } from '@testing-library/react';
 import { App } from './App';
 import { DESKTOP_ERROR_CODES } from './ipc/generated/errors';
 import type { LockState } from './ipc/generated/LockState';
@@ -11,22 +11,26 @@ import { appInfo, lockState, settings } from './test/fixtures';
 
 let calls: { cmd: string; args: unknown }[];
 let appInfoAnswer: () => unknown;
-let status: LockState;
-let stored: Settings;
+let lockAnswer: () => unknown;
+let settingsAnswer: () => unknown;
+/** The page theme when the page said it was ready. */
+let themeAtReveal: string | undefined;
 
 beforeEach(() => {
   calls = [];
   appInfoAnswer = () => appInfo();
-  status = lockState({ locked: false });
-  stored = settings();
+  lockAnswer = () => lockState({ locked: false });
+  settingsAnswer = () => settings();
+  themeAtReveal = undefined;
   mockWindows('main');
   mockIPC(
     (cmd, args) => {
       calls.push({ cmd, args });
       if (cmd === 'app_info') return appInfoAnswer();
-      if (cmd === 'lock_status') return status;
-      if (cmd === 'settings_get') return stored;
+      if (cmd === 'lock_status') return lockAnswer();
+      if (cmd === 'settings_get') return settingsAnswer();
       if (cmd === 'op_list') return [];
+      if (cmd === 'window_ready') themeAtReveal = document.documentElement.dataset.theme;
       return null;
     },
     { shouldMockEvents: true },
@@ -42,7 +46,26 @@ afterEach(async () => {
 });
 
 const paint = () => act(() => new Promise((resolve) => setTimeout(resolve, 50)));
+/** Long enough for anything the page would do on its own: answers, effects, their timers. */
+const idle = async () => {
+  for (let turn = 0; turn < 4; turn += 1) await paint();
+};
 const count = (cmd: string) => calls.filter((c) => c.cmd === cmd).length;
+
+function held<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => (resolve = res));
+  return { promise, resolve };
+}
+
+const refusal = (message: string) =>
+  Promise.reject({
+    code: DESKTOP_ERROR_CODES.INTERNAL,
+    message,
+    help: null,
+    causes: [],
+    fields: {},
+  });
 
 test('unlocked, the app opens on the Targets view and shows its window once', async () => {
   render(<App />);
@@ -53,8 +76,8 @@ test('unlocked, the app opens on the Targets view and shows its window once', as
 });
 
 test('locked at start, the app is the lock screen, in the chosen theme', async () => {
-  status = lockState({ reason: 'startup' });
-  stored = settings({ theme: 'light' });
+  lockAnswer = () => lockState({ reason: 'startup' });
+  settingsAnswer = () => settings({ theme: 'light' });
   render(<App />);
   expect(await screen.findByRole('heading', { name: 'AppRafter is locked' })).toBeDefined();
   expect(screen.queryByRole('heading', { name: 'Open a cluster' })).toBeNull();
@@ -66,17 +89,62 @@ test('locked at start, the app is the lock screen, in the chosen theme', async (
   });
 });
 
-test('when app_info fails, the error shows — and the window still does', async () => {
-  appInfoAnswer = () =>
-    Promise.reject({
-      code: DESKTOP_ERROR_CODES.INTERNAL,
-      message: 'the shell has not started yet',
-      help: null,
-      causes: [],
-      fields: {},
-    });
+test('the window shows without an animation frame: WebKitGTK runs none while it is hidden', async () => {
+  const frame = globalThis.requestAnimationFrame;
+  globalThis.requestAnimationFrame = () => 0;
+  try {
+    render(<App />);
+    expect(await screen.findByRole('heading', { name: 'Open a cluster' })).toBeDefined();
+    await paint();
+    expect(count('window_ready')).toBe(1);
+  } finally {
+    globalThis.requestAnimationFrame = frame;
+  }
+});
+
+test('the window shows only once there is a first screen to show', async () => {
+  const lock = held<LockState>();
+  lockAnswer = () => lock.promise;
   render(<App />);
-  expect((await screen.findByRole('alert')).textContent).toContain('the shell has not started yet');
+  await idle();
+  expect(count('lock_status')).toBe(1);
+  expect(count('window_ready')).toBe(0);
+  await act(async () => lock.resolve(lockState({ locked: false })));
+  expect(await screen.findByRole('heading', { name: 'Open a cluster' })).toBeDefined();
   await paint();
   expect(count('window_ready')).toBe(1);
+});
+
+test('the window shows only once the theme is applied: no dark page before a light one', async () => {
+  const stored = held<Settings>();
+  settingsAnswer = () => stored.promise;
+  lockAnswer = () => lockState({ reason: 'startup' });
+  render(<App />);
+  expect(await screen.findByRole('heading', { name: 'AppRafter is locked' })).toBeDefined();
+  await idle();
+  expect(count('window_ready')).toBe(0);
+  await act(async () => stored.resolve(settings({ theme: 'light' })));
+  await waitFor(() => expect(count('window_ready')).toBe(1));
+  expect(themeAtReveal).toBe('light');
+});
+
+test('settings that cannot be read leave the default theme, and the window shows', async () => {
+  settingsAnswer = () => refusal('settings.json is unreadable');
+  render(<App />);
+  expect(await screen.findByRole('heading', { name: 'Open a cluster' })).toBeDefined();
+  await paint();
+  expect(count('window_ready')).toBe(1);
+});
+
+test('when app_info fails, the error shows under a title bar, and the window shows', async () => {
+  appInfoAnswer = () => refusal('the shell has not started yet');
+  settingsAnswer = () => settings({ theme: 'light' });
+  render(<App />);
+  expect((await screen.findByRole('alert')).textContent).toContain('the shell has not started yet');
+  // Without decorations (Windows) the bar is what moves the window and closes it.
+  expect(document.querySelector('header.titlebar')).not.toBeNull();
+  await paint();
+  expect(count('window_ready')).toBe(1);
+  // The theme applies above the platform gate, so the error has it too.
+  expect(themeAtReveal).toBe('light');
 });
