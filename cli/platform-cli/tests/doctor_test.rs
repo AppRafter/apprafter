@@ -435,6 +435,122 @@ fn a_signal_stops_doctor_and_kills_the_tool_it_was_probing(signal: i32, code: i3
     );
 }
 
+/// Review finding 9: the Windows twin of the Ctrl-C test, through the real console handler.
+/// Doctor runs in a process group of its own (so the event reaches it and not this test) with
+/// its restic stand-in hanging on the version call; a Ctrl-Break about a second in must stop it
+/// at once with 130 and no report, and end the stand-in. The core starts the stand-in with
+/// CREATE_NO_WINDOW in a Job Object, so it gets no console event of its own: only doctor's
+/// cancel ends it. (A new process group ignores Ctrl-C, hence Ctrl-Break, which doctor handles
+/// alike.)
+#[cfg(windows)]
+#[test]
+fn ctrl_break_stops_doctor_and_kills_the_tool_it_was_probing() {
+    use std::os::windows::process::CommandExt as _;
+    use std::time::{Duration, Instant};
+
+    use apprafter_core::tools::TOOL_PROBE_TIMEOUT;
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+    use windows_sys::Win32::System::Console::{GenerateConsoleCtrlEvent, CTRL_BREAK_EVENT};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, TerminateProcess, WaitForSingleObject, CREATE_NEW_PROCESS_GROUP,
+        PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    };
+
+    /// Whether process `pid` ends within `bound`; one still running then is terminated.
+    fn ended_within(pid: u32, bound: Duration) -> bool {
+        // SAFETY: a handle opened, waited on, used and closed here, on the stand-in this test
+        // had doctor start.
+        unsafe {
+            let process = OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, 0, pid);
+            if process.is_null() {
+                return true; // already gone, its pid released
+            }
+            let ended = WaitForSingleObject(process, bound.as_millis() as u32) == WAIT_OBJECT_0;
+            if !ended {
+                TerminateProcess(process, 1); // do not leave it running
+            }
+            CloseHandle(process);
+            ended
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let tools = tools_on_path();
+    let pid_file = tools.path().join("restic.pid");
+    let started = Instant::now();
+    let mut doctor = std::process::Command::new(env!("CARGO_BIN_EXE_apprafter"))
+        .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_SKIP_STARTUP_CHECKS", "1")
+        .env("APPRAFTER_NO_PING", "1")
+        .env("APPRAFTER_HCLOUD_BASE_URL", "http://127.0.0.1:1")
+        .env("KUBECONFIG", "/nonexistent")
+        .env("PATH", tools.path())
+        .env("APPRAFTER_TOOL_STAND_IN_HANG", "restic")
+        .env("APPRAFTER_TOOL_STAND_IN_PID_FILE", &pid_file)
+        .arg("doctor")
+        .creation_flags(CREATE_NEW_PROCESS_GROUP)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let probe = loop {
+        if let Some(pid) = std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+        {
+            break pid;
+        }
+        if started.elapsed() > Duration::from_secs(30) {
+            let _ = doctor.kill();
+            panic!("the hung probe never started");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    // About a second in, the probe hung and its timeout still four seconds away.
+    std::thread::sleep(Duration::from_secs(1).saturating_sub(started.elapsed()));
+    let signalled = Instant::now();
+    // SAFETY: a console event to the process group of the child this test started.
+    let sent = unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, doctor.id()) };
+    if sent == 0 {
+        let error = std::io::Error::last_os_error();
+        let _ = doctor.kill();
+        ended_within(probe, Duration::ZERO);
+        panic!("GenerateConsoleCtrlEvent: {error}");
+    }
+    let exited = loop {
+        if doctor.try_wait().unwrap().is_some() {
+            break Some(signalled.elapsed());
+        }
+        if signalled.elapsed() > TOOL_PROBE_TIMEOUT * 3 {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    // Before reading doctor's output: a stand-in left running holds its pipes open.
+    let gone = ended_within(probe, Duration::from_secs(2));
+    if exited.is_none() {
+        let _ = doctor.kill();
+    }
+    let out = doctor.wait_with_output().unwrap();
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let exited =
+        exited.unwrap_or_else(|| panic!("doctor did not exit after Ctrl-Break:\n{stderr}"));
+    assert_eq!(out.status.code(), Some(130), "{stdout}\n{stderr}");
+    assert!(
+        exited < TOOL_PROBE_TIMEOUT - Duration::from_secs(1),
+        "doctor took {exited:?} to stop: it waited for the probe's own timeout"
+    );
+    assert!(gone, "the probed tool (pid {probe}) outlived doctor");
+    assert!(stderr.contains("interrupted"), "{stderr}");
+    assert!(
+        !stdout.contains("checks"),
+        "an interrupted run prints no report:\n{stdout}"
+    );
+}
+
 #[test]
 fn doctor_prints_the_cluster_group_for_an_existing_target() {
     let dir = tempfile::tempdir().unwrap();
