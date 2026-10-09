@@ -166,7 +166,11 @@ mod tests {
         let cancel = CancellationToken::new();
         assert!(tcp_probe("127.0.0.1", port, Duration::from_secs(2), &cancel).is_ok());
         drop(open);
-        assert!(tcp_probe("127.0.0.1", port, Duration::from_secs(2), &cancel).is_err());
+        // Not `port`: a listener this test drops may still accept. A test that spawns through
+        // `pre_exec` (process::) forks, and its child holds a copy of every socket until its
+        // exec, so the listener can outlive `drop`. Nothing listens on port 1 of loopback (the
+        // dead API base of the other tests here).
+        assert!(tcp_probe("127.0.0.1", 1, Duration::from_secs(2), &cancel).is_err());
         cancel.cancel();
         assert_eq!(
             tcp_probe("127.0.0.1", port, Duration::from_secs(2), &cancel)
