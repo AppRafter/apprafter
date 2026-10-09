@@ -9,8 +9,22 @@
 
 pub mod outcome;
 
+#[cfg(not(target_os = "linux"))]
+mod action;
+
 #[cfg(target_os = "linux")]
 pub mod linux;
 
+#[cfg(windows)]
+pub mod windows;
+
+#[cfg(not(target_os = "linux"))]
+pub use action::Action;
+#[cfg(target_os = "linux")]
+pub use linux::polkit::Action;
+
 #[cfg(target_os = "linux")]
 pub use linux::OsAuthenticator;
+// `self::`: a bare `windows` here would also name the `windows` crate.
+#[cfg(windows)]
+pub use self::windows::OsAuthenticator;

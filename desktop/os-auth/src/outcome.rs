@@ -130,6 +130,70 @@ pub fn map_windows_availability(raw: i32) -> WindowsRoute {
     }
 }
 
+/// The Win32 errors `LogonUserW` sets (`GetLastError`) when it refuses an account or its
+/// password: the `ERROR_*` values of `winerror.h`, as windows 0.62.2 names them
+/// (`src/Windows/Win32/Foundation/mod.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogonError {
+    /// `ERROR_LOGON_FAILURE`: the user name or the password is wrong.
+    LogonFailure,
+    /// `ERROR_ACCOUNT_RESTRICTION`, e.g. a local account without a password, which Windows
+    /// lets sign in at the console only.
+    AccountRestriction,
+    InvalidLogonHours,
+    InvalidWorkstation,
+    PasswordExpired,
+    AccountDisabled,
+    /// `ERROR_LOGON_TYPE_NOT_GRANTED`: the account may not sign in interactively.
+    LogonTypeNotGranted,
+    AccountExpired,
+    PasswordMustChange,
+    /// `ERROR_ACCOUNT_LOCKED_OUT`: the lockout policy counted too many wrong passwords.
+    AccountLockedOut,
+    /// Any other code.
+    Other(u32),
+}
+
+impl LogonError {
+    /// From the Win32 error code.
+    pub const fn from_code(code: u32) -> Self {
+        match code {
+            1326 => Self::LogonFailure,
+            1327 => Self::AccountRestriction,
+            1328 => Self::InvalidLogonHours,
+            1329 => Self::InvalidWorkstation,
+            1330 => Self::PasswordExpired,
+            1331 => Self::AccountDisabled,
+            1385 => Self::LogonTypeNotGranted,
+            1793 => Self::AccountExpired,
+            1907 => Self::PasswordMustChange,
+            1909 => Self::AccountLockedOut,
+            other => Self::Other(other),
+        }
+    }
+}
+
+/// A `LogonUserW` refusal as an outcome. A wrong password, and any code not named here, is
+/// `Failed { exhausted: false }`; a locked-out account is `Failed { exhausted: true }`. An
+/// account Windows would not sign in here whatever the password (disabled, expired, outside its
+/// hours, an expired password it must change at the Windows sign-in) is
+/// `Unavailable { NotPermittedHere }`, and an account without a password is
+/// `Unavailable { NotConfigured }`: there is no password to check.
+pub fn map_windows_logon(code: u32) -> AuthOutcome {
+    match LogonError::from_code(code) {
+        LogonError::LogonFailure | LogonError::Other(_) => AuthOutcome::Failed { exhausted: false },
+        LogonError::AccountLockedOut => AuthOutcome::Failed { exhausted: true },
+        LogonError::AccountRestriction => unavailable(NotConfigured),
+        LogonError::InvalidLogonHours
+        | LogonError::InvalidWorkstation
+        | LogonError::PasswordExpired
+        | LogonError::AccountDisabled
+        | LogonError::LogonTypeNotGranted
+        | LogonError::AccountExpired
+        | LogonError::PasswordMustChange => unavailable(NotPermittedHere),
+    }
+}
+
 /// `LAError`: the `code` of an `NSError` in `LAErrorDomain`, from `LAContext`'s
 /// `canEvaluatePolicy:error:` or `evaluatePolicy:localizedReason:reply:`. Values as
 /// objc2-local-authentication 0.3.2 generates them from Apple's `LAError.h`
@@ -438,9 +502,9 @@ mod tests {
     use apprafter_desktop_ipc::{AuthOutcome, CancelledBy, UnavailableReason};
 
     use super::{
-        map_la_error, map_pam, map_polkit, map_windows_availability, map_windows_hello, Backoff,
-        HelloAvailability, HelloResult, LaErrorCode, PamCode, PolkitAnswer, PolkitError, Refused,
-        WindowsRoute, POLKIT_DISMISSED,
+        map_la_error, map_pam, map_polkit, map_windows_availability, map_windows_hello,
+        map_windows_logon, Backoff, HelloAvailability, HelloResult, LaErrorCode, LogonError,
+        PamCode, PolkitAnswer, PolkitError, Refused, WindowsRoute, POLKIT_DISMISSED,
     };
 
     const VERIFIED: AuthOutcome = AuthOutcome::Verified;
@@ -499,6 +563,35 @@ mod tests {
         ] {
             assert_eq!(HelloAvailability::from_raw(raw), named, "{raw}");
             assert_eq!(map_windows_availability(raw), route, "{raw} ({named:?})");
+        }
+    }
+
+    #[test]
+    fn every_logon_error_has_its_outcome() {
+        use LogonError as E;
+        use UnavailableReason::{NotConfigured, NotPermittedHere};
+        for (code, named, outcome) in [
+            (1326, E::LogonFailure, failed(false)),
+            // No password to check: Windows signs such an account in at the console only.
+            (1327, E::AccountRestriction, unavailable(NotConfigured)),
+            (1328, E::InvalidLogonHours, unavailable(NotPermittedHere)),
+            (1329, E::InvalidWorkstation, unavailable(NotPermittedHere)),
+            (1330, E::PasswordExpired, unavailable(NotPermittedHere)),
+            (1331, E::AccountDisabled, unavailable(NotPermittedHere)),
+            (1385, E::LogonTypeNotGranted, unavailable(NotPermittedHere)),
+            (1793, E::AccountExpired, unavailable(NotPermittedHere)),
+            (1907, E::PasswordMustChange, unavailable(NotPermittedHere)),
+            (1909, E::AccountLockedOut, failed(true)),
+            // Not named: never verified, and worth another try.
+            (0, E::Other(0), failed(false)),
+            (5, E::Other(5), failed(false)),
+            (1311, E::Other(1311), failed(false)),
+            (1325, E::Other(1325), failed(false)),
+            (1910, E::Other(1910), failed(false)),
+            (u32::MAX, E::Other(u32::MAX), failed(false)),
+        ] {
+            assert_eq!(LogonError::from_code(code), named, "{code}");
+            assert_eq!(map_windows_logon(code), outcome, "{code} ({named:?})");
         }
     }
 

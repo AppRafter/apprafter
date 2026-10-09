@@ -20,6 +20,29 @@ apprafter-desktop-ipc = { path = "../ipc" }
 
 # Windows Hello and the Windows credential dialog.
 [target.'cfg(windows)'.dependencies]
+# The windows already in this workspace's graph (tauri, tao, wry, webview2-com): the same minor,
+# so the lock keeps one windows. Features: UserConsentVerifier (Security_Credentials_UI) and its
+# window interop (Win32_System_WinRT); CredUI (Win32_Security_Credentials, whose CREDUI_INFOW
+# needs Win32_Graphics_Gdi for its banner field); GetUserNameExW
+# (Win32_Security_Authentication_Identity); LogonUserW (Win32_Security); CloseHandle and the
+# Win32 errors (Win32_Foundation); CoTaskMemFree and the dialog thread's apartment
+# (Win32_System_Com).
+windows = { version = "0.62", features = [
+    "Foundation",
+    "Security_Credentials_UI",
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Security_Authentication_Identity",
+    "Win32_Security_Credentials",
+    "Win32_System_Com",
+    "Win32_System_WinRT",
+] }
+# IAsyncOperation, which windows 0.62 takes from windows-future without re-exporting it: the
+# copy windows already depends on.
+windows-future = "0.3"
+# The password the credential dialog returns, wiped when dropped.
+zeroize = "~1.9"
 
 # LocalAuthentication.
 [target.'cfg(target_os = "macos")'.dependencies]
