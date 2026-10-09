@@ -17,6 +17,10 @@
 //! ([`OsAuthenticator::set_window`]): without one, a request is `Unavailable { NotInteractive }`
 //! and opens nothing, since an unparented prompt can open behind the app.
 //!
+//! Requests run one at a time: one asked while another's prompt may be open is `Busy`, without
+//! asking Windows anything, so prompts never stack — Hello's own `DeviceBusy` covers only a
+//! second Hello prompt, never a credential dialog.
+//!
 //! Every method blocks; call them on a blocking worker, never on an async worker or the main
 //! thread (see [`hello`]).
 
@@ -24,6 +28,7 @@ pub mod credui;
 pub mod hello;
 
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::{Mutex, TryLockError};
 use std::time::Instant;
 
 use apprafter_core::CancellationToken;
@@ -58,6 +63,8 @@ pub struct OsAuthenticator {
     window: AtomicIsize,
     /// The `hello` setting: Hello when it can prompt, else the credential dialog.
     prefer_hello: AtomicBool,
+    /// Held while a request runs: one at a time.
+    request: Mutex<()>,
 }
 
 impl Default for OsAuthenticator {
@@ -85,6 +92,7 @@ impl OsAuthenticator {
             clock,
             window: AtomicIsize::new(0),
             prefer_hello: AtomicBool::new(true),
+            request: Mutex::new(()),
         }
     }
 
@@ -133,11 +141,16 @@ impl OsAuthenticator {
     /// Asks Windows to authenticate the owner for `action` (the module docs give the steps).
     /// Blocks until the prompt answers; `cancel` closes Hello's prompt, and makes whatever the
     /// credential dialog returns `Cancelled { by: App }`. A token already tripped opens
-    /// nothing.
+    /// nothing, and so does a request while another one runs (`Busy`).
     pub fn verify(&self, action: Action, cancel: &CancellationToken) -> AuthOutcome {
         if cancel.is_cancelled() {
             return APP_CANCELLED;
         }
+        let _request = match self.request.try_lock() {
+            Ok(request) => request,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => return AuthOutcome::Busy,
+        };
         let window = self.window.load(Ordering::SeqCst);
         if window == 0 {
             return AuthOutcome::Unavailable {
@@ -177,13 +190,17 @@ impl OsAuthenticator {
 mod tests {
     use std::collections::VecDeque;
     use std::sync::atomic::AtomicU64;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{mpsc, Arc, Mutex};
+    use std::thread;
+    use std::time::Duration;
 
     use super::credui::{Credentials, Prompted};
     use super::*;
     use zeroize::Zeroizing;
 
     const WINDOW: isize = 0x5150;
+    /// Longer than any wait a passing test makes; a failing one panics instead of hanging.
+    const PATIENCE: Duration = Duration::from_secs(10);
     const OWNER: &str = r"DESKTOP-1\Ada";
 
     const AVAILABLE: i32 = 0;
@@ -206,10 +223,14 @@ mod tests {
 
     type Calls = Arc<Mutex<Vec<Call>>>;
 
+    type Hook = Box<dyn FnOnce() + Send>;
+
     /// Hello from a script: the availability's answer, then each verification's in turn.
     struct FakeHello {
         availability: Asked,
         verify: Mutex<VecDeque<Asked>>,
+        /// Runs inside the first verification, before it answers.
+        during_first_verify: Mutex<Option<Hook>>,
         calls: Calls,
     }
 
@@ -224,6 +245,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(Call::Hello(window, message.to_owned()));
+            let hook = self.during_first_verify.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
             self.verify
                 .lock()
                 .unwrap()
@@ -267,6 +292,16 @@ mod tests {
     }
 
     fn fixture(availability: Asked, verify: &[Asked], logon: Result<(), u32>) -> Fixture {
+        fixture_with(availability, verify, logon, None)
+    }
+
+    /// [`fixture`], `during_first_verify` running inside Hello's first verification.
+    fn fixture_with(
+        availability: Asked,
+        verify: &[Asked],
+        logon: Result<(), u32>,
+        during_first_verify: Option<Hook>,
+    ) -> Fixture {
         let calls = Calls::default();
         let clock = Arc::new(AtomicU64::new(0));
         let auth = {
@@ -275,6 +310,7 @@ mod tests {
                 Box::new(FakeHello {
                     availability,
                     verify: Mutex::new(verify.iter().copied().collect()),
+                    during_first_verify: Mutex::new(during_first_verify),
                     calls: Arc::clone(&calls),
                 }),
                 Box::new(FakeDialog {
@@ -486,6 +522,48 @@ mod tests {
             );
         }
         assert!(f.calls().is_empty());
+    }
+
+    /// One request at a time: one asked while another's prompt may be open is `Busy` and asks
+    /// Windows nothing — not even Hello's availability — so prompts never stack, whichever of
+    /// the two the second would have opened.
+    #[test]
+    fn a_request_while_another_is_open_is_busy() {
+        let (entered_tx, entered) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel::<()>();
+        let f = fixture_with(
+            Asked::Answered(AVAILABLE),
+            &[Asked::Answered(VERIFIED), Asked::Answered(VERIFIED)],
+            Ok(()),
+            Some(Box::new(move || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(PATIENCE).unwrap();
+            })),
+        );
+        thread::scope(|scope| {
+            let first = scope.spawn(|| f.verify(Action::Unlock));
+            entered.recv_timeout(PATIENCE).unwrap();
+            assert_eq!(f.calls(), [Call::Availability, hello(Action::Unlock)]);
+            assert_eq!(f.verify(Action::Confirm), AuthOutcome::Busy);
+            f.auth.set_hello(false);
+            assert_eq!(
+                f.verify(Action::Confirm),
+                AuthOutcome::Busy,
+                "the credential dialog waits its turn too"
+            );
+            assert!(f.calls().is_empty(), "Windows was asked nothing");
+            f.auth.set_hello(true);
+            release.send(()).unwrap();
+            assert_eq!(first.join().unwrap(), AuthOutcome::Verified);
+        });
+        assert_eq!(
+            f.verify(Action::Confirm),
+            AuthOutcome::Verified,
+            "once the first has answered, the next one runs"
+        );
+        assert_eq!(f.calls(), [Call::Availability, hello(Action::Confirm)]);
+        // `info` asks no prompt, so it is never held up.
+        assert_eq!(f.auth.info(), info(AuthMethod::WindowsHello, true));
     }
 
     #[test]
