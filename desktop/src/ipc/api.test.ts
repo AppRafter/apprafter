@@ -68,6 +68,7 @@ describe('each function sends its command with camelCase arguments', () => {
     opDiscard: [() => api.opDiscard(7), 'op_discard', { opId: 7 }],
     opExecute: [() => api.opExecute(7, channel), 'op_execute', { opId: 7, onEvent: channel }],
     windowReady: [() => api.windowReady(), 'window_ready', {}],
+    themeApply: [() => api.themeApply('system'), 'theme_apply', { theme: 'system' }],
   });
 
   test('every exported function is covered, and together they call every command', async () => {

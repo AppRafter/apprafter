@@ -78,6 +78,17 @@ zeroize               = "~1.9"
 libc        = "0.2"
 signal-hook = "0.3"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# GTK's preference for a dark theme at start (src/theme.rs): the version tao and wry use, already
+# in the lock.
+gtk  = "0.18"
+# The XDG desktop portal's colour scheme and its changes (src/theme/portal.rs): the zbus os-auth
+# and the single-instance plugin use, the same minor and default features.
+zbus = "~5.19"
+# The portal's signal and its name's owner read together on zbus's executor: the version zbus
+# already pulls in, as os-auth's session watch uses it.
+futures-lite = "2"
+
 [dev-dependencies]
 # The mock runtime for tests/ipc_mock.rs and tests/app_menu.rs.
 tauri       = { workspace = true, features = ["test"] }

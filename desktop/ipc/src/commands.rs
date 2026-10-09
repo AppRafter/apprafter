@@ -23,13 +23,14 @@ pub const COMMANDS: &[&str] = &[
     "op_discard",
     "op_execute",
     "window_ready",
+    "theme_apply",
 ];
 
 /// What a locked app still answers; everything else is `apprafter::desktop::locked`.
-/// `settings_get` stays readable so the lock screen renders in the chosen theme,
-/// `unlock_with_password` is the lock screen's own password field (where the OS cannot prompt,
-/// `AuthInfo.passwordField`), and `window_ready` shows the window, created hidden, once the lock
-/// screen has painted.
+/// `settings_get` stays readable and `theme_apply` applies, so the lock screen renders in the
+/// chosen theme, `unlock_with_password` is the lock screen's own password field (where the OS
+/// cannot prompt, `AuthInfo.passwordField`), and `window_ready` shows the window, created
+/// hidden, once the lock screen has painted.
 pub const ALLOWED_WHILE_LOCKED: &[&str] = &[
     "app_info",
     "settings_get",
@@ -38,4 +39,5 @@ pub const ALLOWED_WHILE_LOCKED: &[&str] = &[
     "unlock_with_password",
     "quit",
     "window_ready",
+    "theme_apply",
 ];

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
-import { clearMocks, mockIPC, mockWindows } from '@tauri-apps/api/mocks';
+import { clearMocks, mockIPC } from '@tauri-apps/api/mocks';
+import { IpcError } from '../ipc/api';
 import type { Theme } from '../ipc/generated/Theme';
 import { applyTheme, followTheme, resolveTheme, watchSystemTheme } from './theme';
 
@@ -41,8 +42,6 @@ let calls: { cmd: string; args: unknown }[];
 
 beforeEach(() => {
   calls = [];
-  // Before anything touches @tauri-apps/api/window: getCurrentWindow() reads this metadata.
-  mockWindows('main');
   mockIPC((cmd, args) => {
     calls.push({ cmd, args });
     return null;
@@ -58,8 +57,12 @@ afterEach(() => {
 /** Lets the window API's promise chain reach the mocked invoke. */
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
 
-const setThemeCalls = () =>
-  calls.filter((c) => c.cmd === 'plugin:window|set_theme').map((c) => c.args);
+/** What the page asked Rust to give the native window, in order. */
+const themeApplyCalls = () => calls.filter((c) => c.cmd === 'theme_apply').map((c) => c.args);
+
+/** The page never sets the window's theme itself: the window plugin's `null` forces light on Linux. */
+const expectNoWindowSetTheme = () =>
+  expect(calls.filter((c) => c.cmd.startsWith('plugin:window|'))).toEqual([]);
 
 describe('resolveTheme', () => {
   const cases: [Theme, boolean, 'light' | 'dark'][] = [
@@ -76,37 +79,32 @@ describe('resolveTheme', () => {
 });
 
 describe('applyTheme', () => {
-  test('an explicit theme goes to the page and to the native window alike', async () => {
+  test('an explicit theme goes to the page and, through Rust, to the native window', async () => {
     await applyTheme('light', true);
     expect(document.documentElement.dataset.theme).toBe('light');
     await applyTheme('dark', false);
     expect(document.documentElement.dataset.theme).toBe('dark');
-    expect(setThemeCalls()).toEqual([
-      { label: 'main', value: 'light' },
-      { label: 'main', value: 'dark' },
-    ]);
+    expect(themeApplyCalls()).toEqual([{ theme: 'light' }, { theme: 'dark' }]);
+    expectNoWindowSetTheme();
   });
 
-  test('under system the page follows the OS, and the native window is left to the OS', async () => {
-    // A forced window theme would force the webview's prefers-color-scheme too (macOS sets
-    // NSApp.appearance app-wide), and the OS change would never reach the page again.
+  test('under system the page follows the OS, and Rust is told system, never a null theme', async () => {
+    // Rust leaves the window to the OS on macOS and Windows, and on Linux resolves it from the
+    // desktop: the window plugin's setTheme(null) would force light there (tao).
     await applyTheme('system', true);
     expect(document.documentElement.dataset.theme).toBe('dark');
     await applyTheme('system', false);
     expect(document.documentElement.dataset.theme).toBe('light');
-    expect(setThemeCalls()).toEqual([
-      { label: 'main', value: null },
-      { label: 'main', value: null },
-    ]);
+    expect(themeApplyCalls()).toEqual([{ theme: 'system' }, { theme: 'system' }]);
+    expectNoWindowSetTheme();
   });
 
   test('the page theme is set even when the native call is refused', async () => {
     clearMocks();
-    mockWindows('main');
-    mockIPC(() => Promise.reject('core:window:allow-set-theme not allowed'));
-    await expect(applyTheme('light', false)).rejects.toBe(
-      'core:window:allow-set-theme not allowed',
-    );
+    mockIPC(() => Promise.reject('theme_apply not allowed'));
+    const applied = applyTheme('light', false);
+    await expect(applied).rejects.toBeInstanceOf(IpcError);
+    await expect(applied).rejects.toThrow('theme_apply not allowed');
     expect(document.documentElement.dataset.theme).toBe('light');
   });
 });
@@ -126,7 +124,7 @@ describe('watchSystemTheme', () => {
 });
 
 describe('followTheme', () => {
-  test('under system the page follows each OS change; the window is left to the OS once', async () => {
+  test('under system the page follows each OS change; Rust is told system once', async () => {
     const system = stubSystem(true);
     const stop = followTheme('system');
     await settle();
@@ -138,7 +136,8 @@ describe('followTheme', () => {
     system.flip(true);
     await settle();
     expect(document.documentElement.dataset.theme).toBe('dark');
-    expect(setThemeCalls()).toEqual([{ label: 'main', value: null }]);
+    expect(themeApplyCalls()).toEqual([{ theme: 'system' }]);
+    expectNoWindowSetTheme();
 
     stop();
     expect(system.listeners.size).toBe(0);
@@ -147,14 +146,17 @@ describe('followTheme', () => {
   test('a refused native call is reported, and the page keeps its theme', async () => {
     stubSystem(false);
     clearMocks();
-    mockWindows('main');
     mockIPC(() => Promise.reject('not allowed'));
     const reported = spyOn(console, 'error').mockImplementation(() => {});
     try {
       const stop = followTheme('dark');
       await settle();
       expect(document.documentElement.dataset.theme).toBe('dark');
-      expect(reported).toHaveBeenCalledWith('the window theme was not applied:', 'not allowed');
+      expect(reported).toHaveBeenCalledTimes(1);
+      const [message, error] = reported.mock.calls[0] ?? [];
+      expect(message).toBe('the window theme was not applied:');
+      expect(error).toBeInstanceOf(IpcError);
+      expect((error as IpcError).message).toBe('not allowed');
       stop();
     } finally {
       reported.mockRestore();
@@ -170,7 +172,8 @@ describe('followTheme', () => {
       system.flip(theme !== 'light');
       await settle();
       expect(document.documentElement.dataset.theme).toBe(theme);
-      expect(setThemeCalls()).toEqual([{ label: 'main', value: theme }]);
+      expect(themeApplyCalls()).toEqual([{ theme }]);
+      expectNoWindowSetTheme();
       expect(system.listeners.size).toBe(0);
       stop();
     },

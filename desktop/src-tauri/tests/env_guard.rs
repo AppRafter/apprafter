@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! The environment guard (ADR 0067 §2): nothing in `src/` reads or writes the process
 //! environment except the files in [`ALLOWED`] — today `env.rs` alone, whose `AllowListEnv`
-//! answers an allow-list of names and `None` for the rest.
+//! answers an allow-list of names and `None` for the rest, and which on Linux also reads the
+//! display variables GTK reads and restarts the app with `WEBKIT_DISABLE_DMABUF_RENDERER`,
+//! WebKitGTK's own switch, set (its module docs).
 //!
 //! The scan reads syntax trees (`syn`), not text, so neither a comment nor a string can hide or
 //! fake a hit. Test code is scanned too: a test reads its inputs through
@@ -28,9 +30,9 @@ use proc_macro2::{Span, TokenStream, TokenTree};
 use syn::visit::{self, Visit};
 use syn::{Expr, Item, UseTree};
 
-/// The files under `src/` that may read the environment. A Linux-graphics module joins in
-/// D.2d/D.2e: WebKitGTK's rendering workarounds are set through the environment before GTK
-/// starts.
+/// The files under `src/` that may read the environment. WebKitGTK's rendering workaround,
+/// set through the environment of a restart before GTK starts, lives in `env.rs` too: one file
+/// to audit.
 const ALLOWED: [&str; 1] = ["env.rs"];
 
 /// The `std::env` functions that read or write variables, by name; `home_dir` reads `HOME`.

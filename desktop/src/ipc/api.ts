@@ -13,6 +13,7 @@ import type { OpSummary } from './generated/OpSummary';
 import type { Settings } from './generated/Settings';
 import type { Subscribed } from './generated/Subscribed';
 import type { SubscriptionId } from './generated/SubscriptionId';
+import type { Theme } from './generated/Theme';
 import type { UiError } from './generated/UiError';
 
 /** The commands the functions below call; api.test.ts holds it equal to Rust's COMMANDS. */
@@ -33,6 +34,7 @@ export const API_COMMANDS = [
   'op_discard',
   'op_execute',
   'window_ready',
+  'theme_apply',
 ] as const satisfies readonly (typeof COMMANDS)[number][];
 
 export type ApiCommand = (typeof API_COMMANDS)[number];
@@ -157,3 +159,9 @@ export const opExecute = (opId: OpId, onEvent: Channel<OpEvent>, password?: stri
   );
 /** The page has painted: the window, created hidden, shows. */
 export const windowReady = () => call<void>('window_ready');
+/**
+ * The native window follows the theme setting: Light and Dark as they are; System left to the
+ * OS on macOS and Windows, and on Linux resolved by Rust from the desktop's colour scheme and
+ * followed while it stays System. Answered while locked.
+ */
+export const themeApply = (theme: Theme) => call<void>('theme_apply', { theme });

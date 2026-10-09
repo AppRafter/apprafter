@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 // The colour scheme. The page resolves the setting (Rust's `Theme`) against the OS appearance
 // and sets `data-theme` on <html>, which tokens.css keys on. The native window (the macOS
-// traffic lights, the Linux header bar) gets the explicit theme, or under `system` is left to
-// the OS: forcing it would force the webview's prefers-color-scheme as well (tao sets
-// NSApp.appearance app-wide on macOS, gtk-application-prefer-dark-theme on Linux), and the page
-// would never hear the OS change again.
-// Whether WebKitGTK follows the GNOME colour scheme with the theme left to the OS needs a real
-// Linux desktop to tell (D.2f manual list).
-import { getCurrentWindow } from '@tauri-apps/api/window';
+// traffic lights, the Linux header bar) gets the setting through Rust's `theme_apply`
+// (src-tauri/src/theme.rs): an explicit theme as it is; under `system`, on macOS and Windows,
+// left to the OS, and on Linux resolved from the desktop's colour scheme (the XDG portal) and
+// followed while it stays `system`. Never the window plugin's setTheme(null): on Linux tao reads
+// it as light and forces it.
+// Either way the webview's prefers-color-scheme follows the window's theme (WebKitGTK re-reads
+// gtk-application-prefer-dark-theme on every change), so under `system` the page hears each
+// change through matchMedia and re-resolves.
+import { themeApply } from '../ipc/api';
 import type { Theme } from '../ipc/generated/Theme';
 
 export type ResolvedTheme = 'light' | 'dark';
@@ -24,13 +26,13 @@ function setPageTheme(resolved: ResolvedTheme) {
 }
 
 /**
- * Sets the page theme, then the native window's: the explicit theme, or null under `system`.
- * The page goes first, so a refused native call still leaves it right; the returned promise
- * rejects with that refusal.
+ * Sets the page theme, then has Rust give the native window the setting's (`theme_apply`). The
+ * page goes first, so a refused native call still leaves it right; the returned promise rejects
+ * with that refusal.
  */
 export async function applyTheme(setting: Theme, prefersDark: boolean): Promise<void> {
   setPageTheme(resolveTheme(setting, prefersDark));
-  await getCurrentWindow().setTheme(setting === 'system' ? null : setting);
+  await themeApply(setting);
 }
 
 /** Calls `onChange` with the OS's dark preference each time it changes; returns the unsubscribe. */
@@ -43,7 +45,7 @@ export function watchSystemTheme(onChange: (prefersDark: boolean) => void): () =
 
 /**
  * Applies `setting` now and, under `system` only, follows each OS appearance change on the page
- * (the window follows the OS by itself). Returns the stop. A refused native call is reported to
+ * (Rust keeps the window following it). Returns the stop. A refused native call is reported to
  * the console: the page theme is already right.
  */
 export function followTheme(setting: Theme): () => void {

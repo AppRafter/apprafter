@@ -296,13 +296,45 @@ app shares.
 
 - **A blank or white window, flicker, a crash on resize, or
   `Gdk-Message: Error 71 (Protocol error) dispatching to Wayland display`.** These are
-  WebKitGTK graphics problems, most often on NVIDIA. Tauri's
-  [Linux graphics notes](https://tauri.app/develop/debug/linux-graphics/) give workarounds to
-  try in order: the kernel parameter `nvidia_drm.modeset=1` (NVIDIA drivers older than 545),
-  then `__NV_DISABLE_EXPLICIT_SYNC=1`, `WEBKIT_DISABLE_DMABUF_RENDERER=1` and
-  `WEBKIT_DISABLE_COMPOSITING_MODE=1`. Set a variable for one start, for example
-  `WEBKIT_DISABLE_DMABUF_RENDERER=1 apprafter-desktop`. These workarounds have not been tested
-  with this app.
+  WebKitGTK graphics problems, most often on NVIDIA.
+  - When the NVIDIA driver is loaded and the window opens on Wayland, the app turns
+    WebKitGTK's DMA-BUF renderer off by itself: that renderer is what closes the window with
+    `Error 71` there. At start, before it opens anything, the app restarts itself once with
+    `WEBKIT_DISABLE_DMABUF_RENDERER=1`, and with `APPRAFTER_DESKTOP_DMABUF_RESTARTED` set to
+    its process ID to mark the restart. Its log then has a `WebKitGTK's DMA-BUF renderer is
+    off` line. It does this whenever the NVIDIA driver is loaded, also on a laptop whose screen
+    another graphics chip drives.
+  - Programs the app starts after that restart, such as a browser that opening a link starts,
+    inherit `WEBKIT_DISABLE_DMABUF_RENDERER=1`, so a WebKitGTK program among them runs with
+    that renderer off too. An AppRafter started from one of them takes the inherited value as
+    one you set: its log says `WEBKIT_DISABLE_DMABUF_RENDERER="1" is set`.
+  - Started through the dynamic loader (`/lib64/ld-linux-x86-64.so.2 apprafter-desktop`, as
+    some repackaged AppImages do), the app cannot restart itself. Its log then has a warning
+    that it `could not restart itself`; start it with `WEBKIT_DISABLE_DMABUF_RENDERER=1`.
+  - To keep the renderer on, start the app with `WEBKIT_DISABLE_DMABUF_RENDERER=0`. The app
+    never changes a value you set yourself, whatever it is.
+  - Tauri's [Linux graphics notes](https://tauri.app/develop/debug/linux-graphics/) give more
+    workarounds to try in order: the kernel parameter `nvidia_drm.modeset=1` (NVIDIA drivers
+    older than 545), then `__NV_DISABLE_EXPLICIT_SYNC=1` and
+    `WEBKIT_DISABLE_COMPOSITING_MODE=1`. Set a variable for one start, for example
+    `WEBKIT_DISABLE_COMPOSITING_MODE=1 apprafter-desktop`. These have not been tested with
+    this app.
+- **Theme set to System, but the app does not follow the desktop's light or dark mode.** On
+  Linux the app reads the desktop's colour scheme from the XDG desktop portal
+  (`org.freedesktop.portal.Desktop`) at start, again whenever a portal starts after it, and
+  follows each change the portal announces. A portal older than 1.17.1 is read through its
+  older `Read` method. Without a portal, or when the portal has no preference, the app uses
+  `gtk-application-prefer-dark-theme` from your GTK settings (`~/.config/gtk-3.0/settings.ini`)
+  as it was when the app started, and light without that. A portal that is running but does
+  not answer within 3 seconds counts as none until the scheme changes or the portal restarts.
+  The log says what the app found:
+  - A `the XDG desktop portal's colour scheme` line, at start and each time a portal starts:
+    `color_scheme=Some(1)` is dark, `Some(2)` light, `Some(0)` no preference, and `None` no
+    answer. When the portal answered with an error or not in time, the line before it,
+    `the XDG desktop portal did not say the colour scheme: …`, says which.
+  - A `the desktop's colour scheme cannot be followed (…)` line instead when the app could not
+    reach the session bus or subscribe on it, for example when `DBUS_SESSION_BUS_ADDRESS` names
+    a bus that is gone.
 - **Only the password field, never the system dialog.** Check that the policy is installed
   (`pkaction`, as above), that polkitd is installed and running, that a polkit agent runs in
   your session, and that you run the app as yourself (not with `sudo`) in a local desktop
@@ -383,9 +415,12 @@ storage is in `~/.local/share/dev.apprafter.desktop/` too.
 `APPRAFTER_DESKTOP_DATA_DIR=<dir>` puts the settings in `<dir>` and the logs in `<dir>/logs`,
 and runs the app as a separate instance. The app's own code reads only that variable and
 `APPRAFTER_CONFIG_DIR` from its environment (a test build reads two more), so `HCLOUD_TOKEN`,
-`KUBECONFIG` and `RUST_LOG` have no effect on it. Variables that the system and the libraries
-the app uses read still apply, such as `HOME`, `XDG_CONFIG_HOME` and the graphics ones under
-[Troubleshooting](#troubleshooting). See
+`KUBECONFIG` and `RUST_LOG` have no effect on it. On Linux it also reads `WAYLAND_DISPLAY`,
+`XDG_SESSION_TYPE`, `GDK_BACKEND`, `WEBKIT_DISABLE_DMABUF_RENDERER` and its own
+`APPRAFTER_DESKTOP_DMABUF_RESTARTED`, only for the NVIDIA workaround under
+[Troubleshooting](#troubleshooting). Variables that the system and the
+libraries the app uses read still apply, such as `HOME`, `XDG_CONFIG_HOME` and the graphics
+ones under Troubleshooting. See
 [Environment variables](../docs/reference/environment.md#apprafter-desktop).
 
 ### The log
@@ -445,9 +480,11 @@ just desktop-ipc-types  # after changing a type in desktop/ipc; commit the resul
 ```
 
 On Linux, `desktop-dev`, `desktop-build` and `desktop-check` first check the
-[system packages](#system-packages) with `pkg-config`. On NixOS, run the recipes inside
-`nix develop .#desktop`. On Windows, run `just` from a Git Bash shell: its recipes run with
-bash, and its shebang recipes need Git Bash's `cygpath`.
+[system packages](#system-packages) with `pkg-config`. The Linux tests also start a private
+D-Bus daemon of their own, so they need `dbus-daemon` (the `dbus-daemon` package on Debian and
+Ubuntu). On NixOS, run the recipes inside `nix develop .#desktop`, which has it. On Windows,
+run `just` from a Git Bash shell: its recipes run with bash, and its shebang recipes need Git
+Bash's `cygpath`.
 
 A development build asks the real system for sign-in. A test build,
 `cd desktop && bun run tauri dev --features test-build`, uses a scripted stand-in instead (see

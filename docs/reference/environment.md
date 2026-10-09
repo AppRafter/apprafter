@@ -110,11 +110,12 @@ projected from the parser.
 ## AppRafter Desktop
 
 AppRafter Desktop (`desktop/`, not yet released) reads its environment
-through an allow-list: the names below, and nothing else however it
-is set. A desktop started from a terminal therefore does not pick up that
-terminal's `HCLOUD_TOKEN`, `APPRAFTER_AGE_KEY` or any other variable on
-this page, so every cluster tab works with the targets it was given.
-Paths in this table are relative to the repository root.
+through an allow-list: the names below (on Linux, with the three display
+variables and the restart mark the last row names), and nothing else
+however it is set. A desktop started from a terminal therefore does not
+pick up that terminal's `HCLOUD_TOKEN`, `APPRAFTER_AGE_KEY` or any other
+variable on this page, so every cluster tab works with the targets it
+was given. Paths in this table are relative to the repository root.
 
 | Variable | What it does | Default | Read at |
 | --- | --- | --- | --- |
@@ -123,6 +124,7 @@ Paths in this table are relative to the repository root.
 | `PATH` | Linux and Windows: the search path for the tools the app runs (`kubectl`, `helm`, `restic`, `git`, `ssh`, `cue`), and the `PATH` they get. macOS does not read it: the app asks the account's login shell, started interactive so it reads the same startup files as a Terminal window (`.zshrc` included), for its `PATH` (five-second limit) and falls back to `/usr/bin:/bin:/usr/sbin:/sbin`. | the inherited `PATH` | `desktop/src-tauri/src/env.rs`, `desktop_host()` |
 | `APPRAFTER_HCLOUD_BASE_URL` | Test builds only (the `test-build` cargo feature): the Hetzner Cloud API base URL, accepted only as a loopback `http://` URL. A release build ignores it. | the upstream Hetzner Cloud API | `desktop/src-tauri/src/env.rs`, `desktop_context()` |
 | `APPRAFTER_DESKTOP_TEST_PASSWORD` | Test builds only: the password a test build's stand-in for the system's authentication accepts in the lock screen's password field. A release build ignores it. | unset — no password field in a test build | `desktop/src-tauri/src/auth.rs`, `choice()` |
+| `WEBKIT_DISABLE_DMABUF_RENDERER` | Linux only. WebKitGTK's own switch for its DMA-BUF renderer: any value but `0` turns the renderer off, and `0` keeps it on. When the NVIDIA kernel driver is loaded and GTK opens a Wayland display, where that renderer closes the window with a Wayland protocol error (`Error 71`), the app restarts itself once at start, before anything else, with it set to `1` and with `APPRAFTER_DESKTOP_DMABUF_RESTARTED` set to its process ID to mark the restart, and logs that it did. The app reads the mark too, and it counts only in the process whose ID it names: the restarted app itself. A value you set yourself, `0` included, is left as it is. Programs the app starts after the restart, such as a browser that opening a link starts, inherit `WEBKIT_DISABLE_DMABUF_RENDERER=1`, so a WebKitGTK program among them runs with the renderer off too, and an AppRafter started from one of them takes the inherited `1` as a value you set. Started through the dynamic loader (`/lib64/ld-linux-x86-64.so.2 apprafter-desktop`), the app cannot restart itself, and its log warns you to set the variable yourself. To tell whether GTK opens a Wayland display, the app reads `WAYLAND_DISPLAY`, `XDG_SESSION_TYPE` and `GDK_BACKEND`, for this alone. | unset: WebKitGTK decides. On Linux with the NVIDIA driver under Wayland, `1` | `desktop/src-tauri/src/env.rs`, `GraphicsFacts::from_process()`, `restart_with_dmabuf_renderer_off()` |
 
 ## Not read: `KUBECONFIG`
 

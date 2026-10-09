@@ -87,10 +87,8 @@ test('locked at start, the app is the lock screen, in the chosen theme', async (
   expect(screen.queryByRole('heading', { name: 'Open a cluster' })).toBeNull();
   await paint();
   expect(document.documentElement.dataset.theme).toBe('light');
-  expect(calls.find((c) => c.cmd === 'plugin:window|set_theme')?.args).toEqual({
-    label: 'main',
-    value: 'light',
-  });
+  expect(calls.find((c) => c.cmd === 'theme_apply')?.args).toEqual({ theme: 'light' });
+  expect(calls.filter((c) => c.cmd === 'plugin:window|set_theme')).toEqual([]);
 });
 
 test('the window shows without an animation frame: WebKitGTK runs none while it is hidden', async () => {
