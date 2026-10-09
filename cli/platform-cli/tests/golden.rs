@@ -226,8 +226,9 @@ fn harness_stand_in_tools_link_every_probed_tool() {
     }
 }
 
-/// Every recorded file must belong to a case in this file; otherwise a
-/// renamed or deleted case would leave a golden that nothing checks.
+/// Every recorded file must belong to a case in this file or in
+/// `golden_doctor.rs`; otherwise a renamed or deleted case would leave a
+/// golden that nothing checks.
 #[test]
 fn every_golden_file_has_a_case() {
     fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -240,7 +241,7 @@ fn every_golden_file_has_a_case() {
             }
         }
     }
-    let source = include_str!("golden.rs");
+    let sources = [include_str!("golden.rs"), include_str!("golden_doctor.rs")];
     let root = golden_root();
     let mut files = Vec::new();
     collect(&root, &mut files);
@@ -258,12 +259,15 @@ fn every_golden_file_has_a_case() {
                 .display()
                 .to_string()
         })
-        .filter(|id| !source.contains(&format!("\"{id}\"")))
+        .filter(|id| {
+            let quoted = format!("\"{id}\"");
+            !sources.iter().any(|source| source.contains(&quoted))
+        })
         .collect();
     assert!(
         orphans.is_empty(),
-        "golden files with no case in golden.rs (restore the case or delete the file): \
-         {orphans:?}"
+        "golden files with no case in golden.rs or golden_doctor.rs (restore the case or \
+         delete the file): {orphans:?}"
     );
 }
 

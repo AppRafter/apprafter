@@ -1,0 +1,22 @@
+$ apprafter doctor
+[exit 0]
+[stdout]
+Checking target `prod`...
+  ✓ Config file readable (<SANDBOX>/apprafter-config/targets/prod/config.yaml)
+  ✓ Credentials file present (mode 0600) (<SANDBOX>/apprafter-config/targets/prod/credentials.yaml)
+  ✓ Provider `hetzner-cloud` supported
+  ✓ Token format valid (64 chars, alphanumeric)
+  ✓ Token verified against provider API (Hetzner Cloud /v1/locations, <MS> ms)
+  ✓ SSH key readable (<SANDBOX>/home/id_ed25519.pub (ssh-ed25519))
+
+Checking environment...
+  ✓ `restic` on PATH (error: unrecognized subcommand 'version')
+  ✓ `kubectl` on PATH (error: unrecognized subcommand 'version')
+  ✓ `helm` on PATH (error: unrecognized subcommand 'version')
+  ✓ `git` on PATH (apprafter <VERSION>)
+  ✓ `ssh` on PATH (apprafter <VERSION>)
+  ✓ DNS resolves `127.0.0.1` (443/tcp)
+
+12 checks for target `prod`: 12 passed. All good — ready for `apprafter init` / `apprafter apply`.
+[stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m doctor invoked <ESC>[3mno_ping<ESC>[0m<ESC>[2m=<ESC>[0mfalse

@@ -1,0 +1,18 @@
+$ apprafter doctor --target ghost --no-ping
+[exit 1]
+[stdout]
+Checking target `ghost`...
+  ✗ Target `ghost` exists
+      hint: available targets: prod. Run `apprafter target add ghost` to create.
+
+Checking environment...
+  ✓ `restic` on PATH (error: unrecognized subcommand 'version')
+  ✓ `kubectl` on PATH (error: unrecognized subcommand 'version')
+  ✓ `helm` on PATH (error: unrecognized subcommand 'version')
+  ✓ `git` on PATH (apprafter <VERSION>)
+  ✓ `ssh` on PATH (apprafter <VERSION>)
+  ✓ DNS resolves `127.0.0.1` (443/tcp)
+
+7 checks for target `ghost`: 6 passed, 0 warning(s), 1 FAIL — fix the FAILs and rerun `apprafter doctor`.
+[stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m doctor invoked <ESC>[3mtarget_override<ESC>[0m<ESC>[2m=<ESC>[0m"ghost" <ESC>[3mno_ping<ESC>[0m<ESC>[2m=<ESC>[0mtrue

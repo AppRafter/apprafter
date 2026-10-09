@@ -1,0 +1,48 @@
+$ apprafter doctor
+[exit 1]
+[stdout]
+Checking target...
+  ⚠ active target
+      hint: none configured. Run `apprafter target add <name>` to set one up, then re-run `apprafter doctor` for the target-side checks.
+
+Checking environment...
+  ⚠ `restic` on PATH
+      hint: not found (No such file or directory (os error <N>)) — needed for backup and restore.
+Install restic (>= 0.14):
+  • macOS      brew install restic
+  • Debian     apt install restic
+  • Arch       pacman -S restic
+  • Nix        nix profile install nixpkgs#restic
+  • other      https://restic.readthedocs.io/en/stable/020_installation.html
+  ✗ `kubectl` on PATH
+      hint: not found (No such file or directory (os error <N>)) — needed for talking to the cluster.
+Install kubectl:
+  • macOS      brew install kubectl
+  • Debian     apt install kubectl
+  • Nix        nix profile install nixpkgs#kubectl
+  • other      https://kubernetes.io/docs/tasks/tools/
+  ⚠ `helm` on PATH
+      hint: not found (No such file or directory (os error <N>)) — needed for installing platform charts.
+Install helm:
+  • macOS      brew install helm
+  • Debian     apt install helm
+  • Nix        nix profile install nixpkgs#kubernetes-helm
+  • other      https://helm.sh/docs/intro/install/
+  ⚠ `git` on PATH
+      hint: not found (No such file or directory (os error <N>)) — needed for reading the application repository.
+Install git:
+  • macOS      xcode-select --install
+  • Debian     apt install git
+  • Nix        nix profile install nixpkgs#git
+  • other      https://git-scm.com/downloads
+  ⚠ `ssh` on PATH
+      hint: not found (No such file or directory (os error <N>)) — needed for reaching the node over SSH.
+Install an OpenSSH client:
+  • macOS      preinstalled
+  • Debian     apt install openssh-client
+  • Nix        nix profile install nixpkgs#openssh
+  ✓ DNS resolves `127.0.0.1` (443/tcp)
+
+7 checks: 1 passed, 5 warning(s), 1 FAIL — fix the FAILs and rerun `apprafter doctor`.
+[stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m doctor invoked <ESC>[3mno_ping<ESC>[0m<ESC>[2m=<ESC>[0mfalse
