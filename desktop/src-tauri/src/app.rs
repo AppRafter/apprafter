@@ -1809,4 +1809,15 @@ mod tests {
         assert!(stop.wait(LONG), "stopped");
         assert!(started.elapsed() < LONG);
     }
+
+    /// The opener as the app builds it puts no script in the page: the plugin's own
+    /// (`init-iife.js`, added with `open_js_links_on_click`) would open links in the browser
+    /// without `open_url`'s scope.
+    #[test]
+    fn the_opener_plugin_injects_no_script() {
+        use tauri::plugin::Plugin;
+        let opener = super::opener_plugin::<tauri::test::MockRuntime>();
+        assert!(opener.initialization_script().is_none());
+        assert!(opener.initialization_script_2().is_none());
+    }
 }
