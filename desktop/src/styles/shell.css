@@ -502,6 +502,19 @@
   font-size: var(--fs-12);
 }
 
+/* A target whose files cannot be read: listed, never hidden, and nothing to open. */
+.target-card[data-state="unreadable"] {
+  border-color: var(--err);
+  cursor: default;
+}
+
+.target-card-error {
+  margin: 0;
+  color: var(--fg-muted);
+  font-size: var(--fs-12-5);
+  overflow-wrap: anywhere;
+}
+
 .add-target-card {
   align-items: center;
   justify-content: center;
@@ -701,4 +714,23 @@
   background: var(--warn-tint);
   color: var(--fg);
   font-size: var(--fs-12-5);
+}
+
+/* Target screen --------------------------------------------------------------------------------- */
+
+.target-row-sub code {
+  color: var(--fg);
+  font: 400 var(--fs-11-5) var(--font-mono);
+}
+
+/* The CLI's rebuild recipe under a provisioned machine: one command a line. */
+.target-recipe {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 6px 0;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-3);
+  background: var(--bg);
 }
