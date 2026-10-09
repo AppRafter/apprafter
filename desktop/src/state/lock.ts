@@ -30,7 +30,10 @@ export const LOCK_KEY = ['lock'] as const;
 /** At most one `activity` ping per this long (Rust runs the idle timer). */
 export const ACTIVITY_INTERVAL_MS = 30_000;
 
-/** What the lock screen itself reads; a lock removes every other query (spec §4.3). */
+/**
+ * What the lock screen itself reads; a lock removes every other query (spec §4.3). app_info is
+ * kept, as the gate above everything needs it, and read again on each lock (shell/LockGate).
+ */
 const KEPT_WHILE_LOCKED: ReadonlySet<unknown> = new Set(['lock', 'settings', 'app-info']);
 
 /** `incoming`, unless `held` follows a later transition. */

@@ -11,6 +11,7 @@ import type { Settings } from '../ipc/generated/Settings';
 import { PlatformContext } from '../state/platform';
 import { createQueryClient } from '../state/queryClient';
 import { appInfo, authInfo, settings } from '../test/fixtures';
+import { PlatformGate } from './PlatformGate';
 import { SettingsDialog } from './SettingsDialog';
 
 interface HeldSave {
@@ -20,6 +21,8 @@ interface HeldSave {
 }
 
 let calls: { cmd: string; args: Record<string, unknown> }[];
+/** What app_info answers, for the tests that render the PlatformGate. */
+let info: AppInfo;
 let stored: Settings;
 let refuse: string | null;
 /** Saves wait in `held` until answerHeld(); off, each is answered at once. */
@@ -65,12 +68,14 @@ async function answerHeld() {
 
 beforeEach(() => {
   calls = [];
+  info = appInfo();
   stored = settings();
   refuse = null;
   holding = false;
   held = [];
   mockIPC((cmd, args) => {
     calls.push({ cmd, args: args as Record<string, unknown> });
+    if (cmd === 'app_info') return info;
     if (cmd === 'settings_get') return stored;
     if (cmd === 'settings_set' && holding) {
       const request = (args as { settings: Settings }).settings;
@@ -113,6 +118,24 @@ async function open(info: AppInfo = appInfo()) {
   await screen.findByRole('radiogroup', { name: 'Theme' });
   return { user: userEvent.setup(), onClose };
 }
+
+/** Settings under the PlatformGate, as the app has it: app_info read by the gate. */
+async function openInGate() {
+  render(
+    <QueryClientProvider client={createQueryClient()}>
+      <PlatformGate>
+        <ToastProvider>
+          <SettingsDialog onClose={mock()} />
+          <ToastViewport />
+        </ToastProvider>
+      </PlatformGate>
+    </QueryClientProvider>,
+  );
+  await screen.findByRole('radiogroup', { name: 'Theme' });
+  return userEvent.setup();
+}
+
+const reads = () => calls.filter((c) => c.cmd === 'app_info').length;
 
 const saved = () =>
   calls.filter((c) => c.cmd === 'settings_set').map((c) => c.args.settings as Settings);
@@ -281,6 +304,11 @@ describe('SettingsDialog', () => {
     expect(calls.find((c) => c.cmd === 'plugin:opener|open_url')?.args.url).toBe(
       'https://docs.apprafter.dev',
     );
+  });
+
+  test('opening Settings reads app_info again: what it says may have changed since', async () => {
+    await openInGate();
+    await waitFor(() => expect(reads()).toBe(2));
   });
 
   test('a notice about the settings file is shown when Rust has one', async () => {

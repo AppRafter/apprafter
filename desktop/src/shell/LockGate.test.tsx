@@ -10,7 +10,7 @@ import { LOCK_CHANGED } from '../ipc/generated/events';
 import type { LockState } from '../ipc/generated/LockState';
 import { attach, operationsSnapshot, resetOperations } from '../ipc/operations';
 import { ACTIVITY_INTERVAL_MS } from '../state/lock';
-import { PlatformContext } from '../state/platform';
+import { APP_INFO_KEY, PlatformContext } from '../state/platform';
 import { createQueryClient } from '../state/queryClient';
 import { appInfo, lockState } from '../test/fixtures';
 import { LockGate } from './LockGate';
@@ -107,6 +107,22 @@ describe('LockGate', () => {
     expect(screen.queryByText('the shell')).toBeNull();
     expect(client.getQueryData(['target', 'prod-eu'])).toBeUndefined();
     expect(client.getQueryData(['app-info'])).toBeDefined();
+  });
+
+  test('every lock puts what app_info said in question; the state the app starts in does not', async () => {
+    const client = createQueryClient();
+    client.setQueryData(APP_INFO_KEY, appInfo());
+    const inQuestion = () => client.getQueryState(APP_INFO_KEY)?.isInvalidated;
+    const user = gate({ client });
+    await screen.findByRole('heading', { name: 'AppRafter is locked' });
+    // Locked at start: app_info was read just before, by the gate above this one.
+    expect(inQuestion()).toBe(false);
+    await user.click(screen.getByRole('button', { name: 'Unlock' }));
+    await screen.findByText('the shell');
+    expect(inQuestion()).toBe(false);
+    // Rust forgets a missing polkit agent on every lock: the field it showed may be gone.
+    await changed(lockState({ reason: 'idle', seq: 2 }));
+    expect(inQuestion()).toBe(true);
   });
 
   test('an unlock mounts the shell once when its answer comes before the event', async () => {

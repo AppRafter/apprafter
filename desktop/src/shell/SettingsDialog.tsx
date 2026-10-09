@@ -6,6 +6,8 @@
 // it are disabled, not only dimmed. With no system authentication the lock shows as it is in
 // effect, off with its switch disabled whatever settings.json says: Rust locks only with both,
 // and refuses switching it on.
+import { useQueryClient } from '@tanstack/react-query';
+import { useEffect } from 'react';
 import { Button } from '../components/Button';
 import { ErrorPanel } from '../components/ErrorPanel';
 import { Eyebrow } from '../components/Eyebrow';
@@ -28,7 +30,7 @@ import type { Settings } from '../ipc/generated/Settings';
 import type { Theme } from '../ipc/generated/Theme';
 import { authPrompt } from '../state/auth';
 import { lockOff, NO_AUTH_NOTICE, useLockActions } from '../state/lock';
-import { osName, usePlatform } from '../state/platform';
+import { osName, rereadAppInfo, usePlatform } from '../state/platform';
 import { useSaveSettings, useSettings } from '../state/settings';
 import { shortcutHint } from '../state/shortcuts';
 import { LINKS, openLink } from './links';
@@ -48,6 +50,10 @@ const AUTO_LOCK = [
 
 export function SettingsDialog({ onClose }: { onClose: () => void }) {
   const settings = useSettings();
+  const client = useQueryClient();
+  // What app_info says may have changed since it was read: a session watch that answered late,
+  // the authentication Rust found since.
+  useEffect(() => rereadAppInfo(client, false), [client]);
   return (
     <Modal title="Settings" width={620} onClose={onClose} dismissOnBackdrop>
       {settings.isPending ? null : settings.isError ? (

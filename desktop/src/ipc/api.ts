@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 // One typed function per Rust command (generated/commands.ts). Arguments are camelCase, which
-// Tauri maps onto the Rust parameters. Every rejection is an IpcError carrying a UiError.
+// Tauri maps onto the Rust parameters. Every rejection is an IpcError carrying a UiError; an
+// authentication refusal is also heard by onAuthRefusal, whichever command it came from.
 import { type Channel, type InvokeArgs, invoke } from '@tauri-apps/api/core';
 import type { AppInfo } from './generated/AppInfo';
 import type { COMMANDS } from './generated/commands';
+import { DESKTOP_ERROR_CODES } from './generated/errors';
 import type { LockState } from './generated/LockState';
 import type { OpEvent } from './generated/OpEvent';
 import type { OpId } from './generated/OpId';
@@ -70,11 +72,44 @@ export function uiErrorOf(reason: unknown): UiError {
   return { code: null, message, help: null, causes: [], fields: {} };
 }
 
+/**
+ * The refusals after which what app_info says of authentication may have changed: Linux shows
+ * the password field once polkit finds no agent, and stops where the OS prompts after all.
+ */
+const AUTH_REFUSALS: ReadonlySet<string | null> = new Set([
+  DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE,
+  DESKTOP_ERROR_CODES.AUTH_FAILED,
+  DESKTOP_ERROR_CODES.AUTH_BUSY,
+]);
+
+const authRefusalListeners = new Set<(error: UiError) => void>();
+
+/**
+ * Hear every authentication refusal (`auth_unavailable`, `auth_failed`, `auth_busy`) from any
+ * command, before its caller does; the returned function stops it.
+ */
+export function onAuthRefusal(listener: (error: UiError) => void): () => void {
+  authRefusalListeners.add(listener);
+  return () => {
+    authRefusalListeners.delete(listener);
+  };
+}
+
 async function call<T>(command: ApiCommand, args?: InvokeArgs): Promise<T> {
   try {
     return await invoke<T>(command, args);
   } catch (reason) {
-    throw new IpcError(command, uiErrorOf(reason));
+    const error = uiErrorOf(reason);
+    if (AUTH_REFUSALS.has(error.code)) {
+      for (const listener of authRefusalListeners) {
+        try {
+          listener(error);
+        } catch (failure) {
+          console.error('an authentication refusal listener failed:', failure);
+        }
+      }
+    }
+    throw new IpcError(command, error);
   }
 }
 

@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 // Locked, the app is the title bar and the lock screen, and nothing else: the shell (its tabs,
-// dialogs, toasts) is unmounted, and the cluster data it read leaves the query cache. Unlocked,
-// the shell renders, and the owner's activity restarts Rust's idle timer at most once per
-// ACTIVITY_INTERVAL_MS. Rust ends every operation subscription on each transition; the
+// dialogs, toasts) is unmounted, and the cluster data it read leaves the query cache. Every lock
+// reads app_info again, the password field withheld until it answers: Rust forgets a missing
+// polkit agent on each lock, so the field the last unlock used may answer `not_permitted_here`
+// now. Unlocked, the shell renders, and the owner's activity restarts Rust's idle timer at most
+// once per ACTIVITY_INTERVAL_MS. Rust ends every operation subscription on each transition; the
 // operations store forgets them, and after an unlock follows again what is still followed.
 import { useQueryClient } from '@tanstack/react-query';
 import { type ReactNode, useEffect, useLayoutEffect, useRef } from 'react';
@@ -11,7 +13,7 @@ import { activity, IpcError, uiErrorOf } from '../ipc/api';
 import { DESKTOP_ERROR_CODES } from '../ipc/generated/errors';
 import { clearLive, reattachAll } from '../ipc/operations';
 import { ACTIVITY_INTERVAL_MS, dropUnlockedData, useLockState } from '../state/lock';
-import { usePlatform } from '../state/platform';
+import { rereadAppInfo, usePlatform } from '../state/platform';
 import { LockScreen } from './LockScreen';
 import { ScreenShown } from './reveal';
 import { TitleBar, Wordmark } from './TitleBar';
@@ -30,7 +32,8 @@ export function LockGate({ children, now = Date.now }: LockGateProps) {
 
   // Transitions, not events: the unlock's answer and its event change nothing twice. A layout
   // effect, so it runs before the shell's own (passive) effects in the commit that mounts it:
-  // what the shell follows as it mounts is not ended and followed again.
+  // what the shell follows as it mounts is not ended and followed again — and before the lock
+  // screen paints, so a field from before the lock is never seen.
   const previous = useRef<boolean | undefined>(undefined);
   useLayoutEffect(() => {
     if (locked === undefined) return;
@@ -38,8 +41,12 @@ export function LockGate({ children, now = Date.now }: LockGateProps) {
     previous.current = locked;
     if (before === undefined || before === locked) return;
     clearLive();
-    if (locked) dropUnlockedData(client);
-    else reattachAll();
+    if (locked) {
+      dropUnlockedData(client);
+      rereadAppInfo(client, true);
+    } else {
+      reattachAll();
+    }
   }, [locked, client]);
 
   useEffect(() => {

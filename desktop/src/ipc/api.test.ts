@@ -76,7 +76,10 @@ describe('each function sends its command with camelCase arguments', () => {
       // Every function but the error helpers calls a command.
       .filter(
         ([, value]) =>
-          typeof value === 'function' && value !== api.IpcError && value !== api.uiErrorOf,
+          typeof value === 'function' &&
+          value !== api.IpcError &&
+          value !== api.uiErrorOf &&
+          value !== api.onAuthRefusal,
       )
       .map(([name]) => name);
     expect(functions.sort()).toEqual(Object.keys(table).sort());
@@ -140,6 +143,85 @@ describe('a rejection is an IpcError', () => {
       causes: [],
       fields: {},
     });
+  });
+});
+
+describe('onAuthRefusal', () => {
+  const refusal = (code: string | null): UiError => ({
+    code,
+    message: 'refused',
+    help: null,
+    causes: [],
+    fields: {},
+  });
+
+  test('hears every authentication refusal, from whichever command, before the caller does', async () => {
+    const heard: (string | null)[] = [];
+    const off = api.onAuthRefusal((error) => heard.push(error.code));
+    try {
+      const codes = [
+        DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE,
+        DESKTOP_ERROR_CODES.AUTH_FAILED,
+        DESKTOP_ERROR_CODES.AUTH_BUSY,
+      ];
+      const calls = [
+        () => api.unlock(),
+        () => api.unlockWithPassword('guess'),
+        () => api.opExecute(7, new Channel<OpEvent>(), 'guess'),
+      ];
+      for (const [index, code] of codes.entries()) {
+        answer = () => Promise.reject(refusal(code));
+        const seen = await (calls[index] as () => Promise<unknown>)().catch(() => [...heard]);
+        expect(seen).toEqual(codes.slice(0, index + 1));
+      }
+    } finally {
+      off();
+    }
+  });
+
+  test('not what says nothing about authentication: a cancel, the lock, a plain error', async () => {
+    const heard: unknown[] = [];
+    const off = api.onAuthRefusal((error) => heard.push(error));
+    try {
+      for (const code of [
+        DESKTOP_ERROR_CODES.AUTH_CANCELLED,
+        DESKTOP_ERROR_CODES.LOCKED,
+        DESKTOP_ERROR_CODES.PLAN_NOT_FOUND,
+        null,
+      ]) {
+        answer = () => Promise.reject(refusal(code));
+        await api.unlock().catch(() => undefined);
+      }
+      expect(heard).toEqual([]);
+    } finally {
+      off();
+    }
+  });
+
+  test('a listener that throws is reported and the caller still gets the refusal', async () => {
+    const errors: unknown[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => errors.push(args);
+    const off = api.onAuthRefusal(() => {
+      throw new Error('listener bug');
+    });
+    try {
+      answer = () => Promise.reject(refusal(DESKTOP_ERROR_CODES.AUTH_FAILED));
+      const error = await api.unlock().catch((e: unknown) => e);
+      expect((error as api.IpcError).error.code).toBe(DESKTOP_ERROR_CODES.AUTH_FAILED);
+      expect(errors).toHaveLength(1);
+    } finally {
+      off();
+      console.error = original;
+    }
+  });
+
+  test('once its unsubscribe is called, a listener hears nothing more', async () => {
+    const heard: unknown[] = [];
+    api.onAuthRefusal((error) => heard.push(error))();
+    answer = () => Promise.reject(refusal(DESKTOP_ERROR_CODES.AUTH_FAILED));
+    await api.unlock().catch(() => undefined);
+    expect(heard).toEqual([]);
   });
 });
 
