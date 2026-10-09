@@ -150,6 +150,7 @@ pub const RESTIC: Tool = Tool {
               • Debian     apt install restic\n  \
               • Arch       pacman -S restic\n  \
               • Nix        nix profile install nixpkgs#restic\n  \
+              • Windows    winget install restic.restic\n  \
               • other      https://restic.readthedocs.io/en/stable/020_installation.html",
     install_header: "Install restic (>= 0.14):",
     hints: &[
@@ -170,6 +171,10 @@ pub const RESTIC: Tool = Tool {
             text: "nix profile install nixpkgs#restic",
         },
         InstallLine {
+            os: InstallOs::Windows,
+            text: "winget install restic.restic",
+        },
+        InstallLine {
             os: InstallOs::Other,
             text: "https://restic.readthedocs.io/en/stable/020_installation.html",
         },
@@ -186,6 +191,7 @@ pub const KUBECTL: Tool = Tool {
               • macOS      brew install kubectl\n  \
               • Debian     apt install kubectl\n  \
               • Nix        nix profile install nixpkgs#kubectl\n  \
+              • Windows    winget install Kubernetes.kubectl\n  \
               • other      https://kubernetes.io/docs/tasks/tools/",
     install_header: "Install kubectl:",
     hints: &[
@@ -200,6 +206,10 @@ pub const KUBECTL: Tool = Tool {
         InstallLine {
             os: InstallOs::Nix,
             text: "nix profile install nixpkgs#kubectl",
+        },
+        InstallLine {
+            os: InstallOs::Windows,
+            text: "winget install Kubernetes.kubectl",
         },
         InstallLine {
             os: InstallOs::Other,
@@ -218,6 +228,7 @@ pub const HELM: Tool = Tool {
               • macOS      brew install helm\n  \
               • Debian     apt install helm\n  \
               • Nix        nix profile install nixpkgs#kubernetes-helm\n  \
+              • Windows    winget install Helm.Helm\n  \
               • other      https://helm.sh/docs/intro/install/",
     install_header: "Install helm:",
     hints: &[
@@ -232,6 +243,10 @@ pub const HELM: Tool = Tool {
         InstallLine {
             os: InstallOs::Nix,
             text: "nix profile install nixpkgs#kubernetes-helm",
+        },
+        InstallLine {
+            os: InstallOs::Windows,
+            text: "winget install Helm.Helm",
         },
         InstallLine {
             os: InstallOs::Other,
@@ -250,6 +265,7 @@ pub const GIT: Tool = Tool {
               • macOS      xcode-select --install\n  \
               • Debian     apt install git\n  \
               • Nix        nix profile install nixpkgs#git\n  \
+              • Windows    winget install Git.Git\n  \
               • other      https://git-scm.com/downloads",
     install_header: "Install git:",
     hints: &[
@@ -264,6 +280,10 @@ pub const GIT: Tool = Tool {
         InstallLine {
             os: InstallOs::Nix,
             text: "nix profile install nixpkgs#git",
+        },
+        InstallLine {
+            os: InstallOs::Windows,
+            text: "winget install Git.Git",
         },
         InstallLine {
             os: InstallOs::Other,
@@ -281,7 +301,8 @@ pub const SSH: Tool = Tool {
     install: "Install an OpenSSH client:\n  \
               • macOS      preinstalled\n  \
               • Debian     apt install openssh-client\n  \
-              • Nix        nix profile install nixpkgs#openssh",
+              • Nix        nix profile install nixpkgs#openssh\n  \
+              • Windows    built into Windows 10/11: Settings › Optional features › OpenSSH Client",
     install_header: "Install an OpenSSH client:",
     hints: &[
         InstallLine {
@@ -295,6 +316,10 @@ pub const SSH: Tool = Tool {
         InstallLine {
             os: InstallOs::Nix,
             text: "nix profile install nixpkgs#openssh",
+        },
+        InstallLine {
+            os: InstallOs::Windows,
+            text: "built into Windows 10/11: Settings › Optional features › OpenSSH Client",
         },
     ],
     required: false,
@@ -317,6 +342,7 @@ pub const CUE: Tool = Tool {
               • macOS      brew install cue\n  \
               • Arch       pacman -S cue\n  \
               • Nix        nix profile install nixpkgs#cue\n  \
+              • Windows    winget install CueLang.Cue\n  \
               • other      https://cuelang.org/docs/introduction/installation/",
     install_header: "Install cue:",
     hints: &[
@@ -331,6 +357,10 @@ pub const CUE: Tool = Tool {
         InstallLine {
             os: InstallOs::Nix,
             text: "nix profile install nixpkgs#cue",
+        },
+        InstallLine {
+            os: InstallOs::Windows,
+            text: "winget install CueLang.Cue",
         },
         InstallLine {
             os: InstallOs::Other,
@@ -601,6 +631,41 @@ mod tests {
             render_install("Install x:", &lines),
             "Install x:\n  • macOS      brew install x\n  • other      https://x"
         );
+    }
+
+    #[test]
+    fn every_tool_names_its_windows_install() {
+        // winget ids verified against microsoft/winget-pkgs manifests on 2026-10-09
+        // (manifests/{r/restic/restic,k/Kubernetes/kubectl,h/Helm/Helm,g/Git/Git,c/CueLang/Cue});
+        // a wrong id would be a published wrong instruction.
+        let expected = [
+            ("restic", "winget install restic.restic"),
+            ("kubectl", "winget install Kubernetes.kubectl"),
+            ("helm", "winget install Helm.Helm"),
+            ("git", "winget install Git.Git"),
+            (
+                "ssh",
+                "built into Windows 10/11: Settings › Optional features › OpenSSH Client",
+            ),
+            ("cue", "winget install CueLang.Cue"),
+        ];
+        assert_eq!(ALL.len(), expected.len());
+        for (tool, (name, line)) in ALL.iter().zip(expected) {
+            assert_eq!(tool.name, name);
+            let windows: Vec<&str> = tool
+                .hints
+                .iter()
+                .filter(|h| h.os == InstallOs::Windows)
+                .map(|h| h.text)
+                .collect();
+            assert_eq!(windows, vec![line], "`{}`", tool.name);
+            assert!(
+                tool.install.contains(&format!("• Windows    {line}")),
+                "`{}` install text lacks its Windows line:\n{}",
+                tool.name,
+                tool.install
+            );
+        }
     }
 
     #[test]
