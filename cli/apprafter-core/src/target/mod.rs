@@ -3,6 +3,7 @@
 //! name rule, the reads (`list`, `show`, `hetzner_token`, `public_address`) and the helpers the
 //! mutations share.
 
+mod add;
 mod machine;
 pub mod name;
 mod pointer;
@@ -12,6 +13,9 @@ mod rename;
 #[cfg(test)]
 pub(crate) mod testkit;
 
+pub use add::{
+    execute_add, execute_renew, plan_add, plan_renew, AddArgs, AddPayload, RenewArgs, RenewPayload,
+};
 pub use machine::{execute_machine, plan_machine, MachineChoice, MachinePayload};
 pub use name::{validate_name, NameProblem, TARGET_NAME_MAX_LEN};
 pub use pointer::{execute_use, plan_use, UsePayload};
