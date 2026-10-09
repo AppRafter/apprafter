@@ -35,8 +35,8 @@ use crate::settings::SettingsStore;
 /// exits from the event loop.
 ///
 /// In order: on Linux, WebKitGTK's DMA-BUF renderer turned off under Wayland on NVIDIA's driver
-/// ([`env::turn_off_dmabuf_renderer_on_nvidia_wayland`]: an environment write, so while the
-/// process has one thread; logged once the log starts), the async runtime and the crypto
+/// ([`env::turn_off_dmabuf_renderer_on_nvidia_wayland`]: the process restarts with it off,
+/// before anything else starts; logged once the log starts), the async runtime and the crypto
 /// provider (before anything of Tauri's), the allow-listed environment and the core context,
 /// the app's identity and directories (a data-directory override moves every app directory and
 /// keys the single-instance lock on it; one set but empty or not Unicode stops the start,
@@ -59,8 +59,8 @@ use crate::settings::SettingsStore;
 /// the OS forces reaches with no request before it. Each drops the OS session watch once the
 /// running operations have stopped.
 pub fn run() -> Result<(), Box<dyn Error>> {
-    // First, while the process has one thread: the async runtime below starts its workers as it
-    // is built, and the environment must not change under a thread that reads it.
+    // First, before the app starts anything: on NVIDIA under Wayland this restarts the process
+    // with WebKitGTK's DMA-BUF renderer off, and nothing started before it would survive that.
     #[cfg(target_os = "linux")]
     let dmabuf_renderer = env::turn_off_dmabuf_renderer_on_nvidia_wayland();
     runtime::init_runtime()?;
@@ -203,8 +203,9 @@ mod tests {
         );
     }
 
-    /// The environment is written before any thread exists: the DMA-BUF decision is the first
-    /// statement of `run`, ahead of the async runtime, whose workers start as it is built.
+    /// The DMA-BUF restart replaces the process: it is the first statement of `run`, before the
+    /// runtime's threads, the log file or the single-instance name exist, so it throws nothing
+    /// away and leaves nothing behind.
     #[test]
     fn the_graphics_workaround_is_run_s_first_statement() {
         let file = syn::parse_file(include_str!("lib.rs")).unwrap();

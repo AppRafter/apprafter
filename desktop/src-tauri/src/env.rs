@@ -20,12 +20,13 @@
 //! and `None` for every other name, however it is set. [`AllowListEnv::from_process`] is where the
 //! app reads its own variables.
 //!
-//! On Linux this file also holds the one workaround the app applies through the environment,
-//! before any thread exists: WebKitGTK's DMA-BUF renderer closes the window with a Wayland
-//! protocol error on NVIDIA's driver, so there [`turn_off_dmabuf_renderer_on_nvidia_wayland`]
-//! sets `WEBKIT_DISABLE_DMABUF_RENDERER=1`, unless the user set it. It reads the display
-//! variables GTK reads and that one ([`GraphicsFacts::from_process`]): none of them is a setting
-//! of the app, and none reaches the core.
+//! On Linux this file also holds the one workaround the app applies through the environment:
+//! WebKitGTK's DMA-BUF renderer closes the window with a Wayland protocol error on NVIDIA's
+//! driver, so there [`turn_off_dmabuf_renderer_on_nvidia_wayland`] restarts the app at once
+//! with `WEBKIT_DISABLE_DMABUF_RENDERER=1`, unless the user set it — a restart, not a
+//! `set_var`, since a thread of WebKitGTK's runs before `main`. It reads the display variables
+//! GTK reads, that one and the restart's mark ([`GraphicsFacts::from_process`]): none of them
+//! is a setting of the app, and none reaches the core.
 //!
 //! Nowhere else in `src/` reads or writes `std::env`: `tests/env_guard.rs` fails on any other
 //! file.
@@ -246,6 +247,12 @@ fn os_bytes(path: &Path) -> impl Iterator<Item = u8> + '_ {
 #[cfg(target_os = "linux")]
 pub const DMABUF_RENDERER_ENV: &str = "WEBKIT_DISABLE_DMABUF_RENDERER";
 
+/// Set, to `1`, in the environment of the process the app restarts into with the renderer off
+/// ([`restart_with_dmabuf_renderer_off`]): its `1` in [`DMABUF_RENDERER_ENV`] is then the app's,
+/// not the user's.
+#[cfg(target_os = "linux")]
+pub const DMABUF_RESTARTED_ENV: &str = "APPRAFTER_DESKTOP_DMABUF_RESTARTED";
+
 /// The facts [`dmabuf_renderer`] decides on, as [`GraphicsFacts::from_process`] finds them.
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -259,17 +266,17 @@ pub struct GraphicsFacts {
     pub gdk_backend: Option<OsString>,
     /// NVIDIA's kernel driver is loaded (`/sys/module/nvidia`, `/proc/driver/nvidia/version`).
     pub nvidia_driver: bool,
-    /// [`DMABUF_RENDERER_ENV`] as the process inherited it.
+    /// [`DMABUF_RENDERER_ENV`] as the process has it.
     pub dmabuf_renderer: Option<OsString>,
-    /// How many threads the process runs (`/proc/self/task`); `None` when that cannot be read.
-    pub threads: Option<usize>,
+    /// [`DMABUF_RESTARTED_ENV`] is set: this process is the app's restart.
+    pub restarted: bool,
 }
 
 #[cfg(target_os = "linux")]
 impl GraphicsFacts {
     /// This process's facts. The one place besides [`AllowListEnv::from_process`] that reads
-    /// the environment: three names GTK reads to pick its display and the one WebKitGTK reads
-    /// for its renderer, none of them the app's own settings.
+    /// the environment: three names GTK reads to pick its display, the one WebKitGTK reads for
+    /// its renderer, and the app's mark of its own restart; none of them a setting of the app.
     pub fn from_process() -> Self {
         let exists = |path: &str| Path::new(path).exists();
         GraphicsFacts {
@@ -278,9 +285,7 @@ impl GraphicsFacts {
             gdk_backend: std::env::var_os("GDK_BACKEND"),
             nvidia_driver: exists("/sys/module/nvidia") || exists("/proc/driver/nvidia/version"),
             dmabuf_renderer: std::env::var_os(DMABUF_RENDERER_ENV),
-            threads: std::fs::read_dir("/proc/self/task")
-                .ok()
-                .map(|tasks| tasks.count()),
+            restarted: std::env::var_os(DMABUF_RESTARTED_ENV).is_some(),
         }
     }
 
@@ -312,74 +317,122 @@ pub enum DmabufRenderer {
     /// Not NVIDIA's driver under Wayland: WebKitGTK decides as it always does.
     Untouched,
     /// NVIDIA's driver under Wayland, where WebKitGTK's DMA-BUF renderer closes the window with
-    /// a Wayland protocol error (`Error 71`): the app sets [`DMABUF_RENDERER_ENV`] to `1`.
-    Off,
+    /// a Wayland protocol error (`Error 71`), and the variable unset: the app restarts with
+    /// [`DMABUF_RENDERER_ENV`] set to `1`. The decision only: the restart replaces the process.
+    Restart,
+    /// This process is that restart: the app turned the renderer off.
+    TurnedOff,
     /// NVIDIA's driver under Wayland, and the user has set [`DMABUF_RENDERER_ENV`] (to this
     /// value): theirs stands.
     UserSet(OsString),
-    /// NVIDIA's driver under Wayland, but the process was not known to run on one thread (how
-    /// many it ran, when that could be read): the environment is left as it is.
-    NotSingleThreaded(Option<usize>),
+    /// The restart failed (why): the renderer stays on.
+    RestartFailed(String),
 }
 
 #[cfg(target_os = "linux")]
 impl DmabufRenderer {
-    /// One line in the log, for every case but [`Untouched`](Self::Untouched). Called once the
-    /// log has started, long after the decision.
+    /// One line in the log for what the app did: nothing when it left the renderer alone. Called
+    /// once the log has started, long after the decision.
     pub fn log(&self) {
         match self {
-            Self::Untouched => {}
-            Self::Off => tracing::info!(
+            // `turn_off_dmabuf_renderer_on_nvidia_wayland` returns `Restart` never: the restart
+            // replaces the process, or failed.
+            Self::Untouched | Self::Restart => {}
+            Self::TurnedOff => tracing::info!(
                 "WebKitGTK's DMA-BUF renderer is off: the NVIDIA driver is loaded and the window \
                  is on Wayland, where the renderer closes the app with a Wayland protocol error \
-                 (Error 71). The app set {DMABUF_RENDERER_ENV}=1 for itself; starting it with \
-                 {DMABUF_RENDERER_ENV}=0 keeps the renderer on"
+                 (Error 71). The app restarted itself with {DMABUF_RENDERER_ENV}=1; starting it \
+                 with {DMABUF_RENDERER_ENV}=0 keeps the renderer on"
             ),
             Self::UserSet(value) => tracing::info!(
                 "{DMABUF_RENDERER_ENV}={value:?} is set: the app leaves WebKitGTK's DMA-BUF \
                  renderer as that says, although the NVIDIA driver is loaded under Wayland"
             ),
-            Self::NotSingleThreaded(threads) => tracing::warn!(
+            Self::RestartFailed(error) => tracing::warn!(
                 "WebKitGTK's DMA-BUF renderer stays on although the NVIDIA driver is loaded \
-                 under Wayland: the process was not on one thread when the app could have \
-                 turned it off (threads: {threads:?}). If the window closes with a Wayland \
-                 protocol error (Error 71), start the app with {DMABUF_RENDERER_ENV}=1"
+                 under Wayland: the app could not restart itself with it off ({error}). If the \
+                 window closes with a Wayland protocol error (Error 71), start the app with \
+                 {DMABUF_RENDERER_ENV}=1"
             ),
         }
     }
 }
 
-/// The decision, on `facts` alone: off under Wayland with NVIDIA's driver loaded, unless the
-/// user set the variable or the process is not known to run on one thread.
+/// The decision, on `facts` alone: under Wayland with NVIDIA's driver loaded, restart with the
+/// renderer off — unless this is that restart, or the user set the variable. A restarted
+/// process never restarts again, even without the variable: that restart would be the same.
 #[cfg(target_os = "linux")]
 pub fn dmabuf_renderer(facts: &GraphicsFacts) -> DmabufRenderer {
     if !facts.nvidia_driver || !facts.is_wayland() {
         return DmabufRenderer::Untouched;
     }
-    if let Some(value) = &facts.dmabuf_renderer {
-        return DmabufRenderer::UserSet(value.clone());
+    match &facts.dmabuf_renderer {
+        None if facts.restarted => DmabufRenderer::RestartFailed(format!(
+            "the restarted process has no {DMABUF_RENDERER_ENV}"
+        )),
+        None => DmabufRenderer::Restart,
+        Some(value) if facts.restarted && value == "1" => DmabufRenderer::TurnedOff,
+        Some(value) => DmabufRenderer::UserSet(value.clone()),
     }
-    if facts.threads != Some(1) {
-        return DmabufRenderer::NotSingleThreaded(facts.threads);
-    }
-    DmabufRenderer::Off
 }
 
 /// Turn WebKitGTK's DMA-BUF renderer off when [`dmabuf_renderer`] says so for this process,
-/// and say what was decided, for the log once it starts ([`DmabufRenderer::log`]).
+/// and say what was decided, for the log once it starts ([`DmabufRenderer::log`]). When it
+/// says so, this does not return: the process restarts with the renderer off
+/// ([`restart_with_dmabuf_renderer_off`]), unless that fails.
 ///
-/// The one place the app writes its environment. `run` calls it as its first statement, before
-/// the async runtime, the log, signals or Tauri start a thread; the decision itself writes
-/// nothing unless the process has exactly one thread, counted just before the write. So
-/// `set_var` runs single-threaded: no other thread can be reading the environment
-/// (`getenv`) while it changes.
+/// `run` calls it as its first statement, before the app starts anything: a restart then
+/// throws nothing away. The variable has to be in the environment before WebKitGTK reads it,
+/// and the process is never on one thread here — WebKitGTK's own library constructor starts
+/// its allocator's scavenger thread before `main` (libpas, `pas_scavenger`) — so a `set_var`
+/// could change the environment under a thread that reads it. The restart puts the variable in
+/// the new image's initial environment instead: nothing is written while anything runs.
 #[cfg(target_os = "linux")]
 pub fn turn_off_dmabuf_renderer_on_nvidia_wayland() -> DmabufRenderer {
-    let decision = dmabuf_renderer(&GraphicsFacts::from_process());
-    if decision == DmabufRenderer::Off {
-        std::env::set_var(DMABUF_RENDERER_ENV, "1");
+    apply_dmabuf_renderer(&GraphicsFacts::from_process())
+}
+
+/// [`turn_off_dmabuf_renderer_on_nvidia_wayland`] on `facts`: the decision, carried out. Does
+/// not return when it restarts.
+#[cfg(target_os = "linux")]
+pub fn apply_dmabuf_renderer(facts: &GraphicsFacts) -> DmabufRenderer {
+    match dmabuf_renderer(facts) {
+        DmabufRenderer::Restart => {
+            DmabufRenderer::RestartFailed(restart_with_dmabuf_renderer_off().to_string())
+        }
+        decision => decision,
     }
-    decision
+}
+
+/// Replace this process with this program again — same process, same arguments and name, the
+/// same environment plus [`DMABUF_RENDERER_ENV`]`=1` and [`DMABUF_RESTARTED_ENV`]`=1`. Returns
+/// only when that failed, with why.
+#[cfg(target_os = "linux")]
+pub fn restart_with_dmabuf_renderer_off() -> io::Error {
+    use std::os::unix::process::CommandExt;
+
+    match std::env::current_exe() {
+        Ok(exe) => restart_command(&exe, std::env::args_os()).exec(),
+        Err(error) => error,
+    }
+}
+
+/// The restart's command: `exe`, given `args` (the first one the program's name, as it was
+/// started), in the inherited environment plus the variable and the mark.
+#[cfg(target_os = "linux")]
+fn restart_command(exe: &Path, args: impl IntoIterator<Item = OsString>) -> std::process::Command {
+    use std::os::unix::process::CommandExt;
+
+    let mut args = args.into_iter();
+    let mut command = std::process::Command::new(exe);
+    if let Some(name) = args.next() {
+        command.arg0(name);
+    }
+    command
+        .args(args)
+        .env(DMABUF_RENDERER_ENV, "1")
+        .env(DMABUF_RESTARTED_ENV, "1");
+    command
 }
 
 #[cfg(test)]
@@ -778,10 +831,12 @@ mod tests {
     /// The DMA-BUF renderer decision, on facts the test writes: never the process's own.
     #[cfg(target_os = "linux")]
     mod graphics {
+        use std::ffi::OsStr;
+
         use super::*;
         use crate::runtime::logged;
 
-        /// NVIDIA's driver in a Wayland session, the variable unset, the process on one thread.
+        /// NVIDIA's driver in a Wayland session, the variable unset, before any restart.
         fn nvidia_wayland() -> GraphicsFacts {
             GraphicsFacts {
                 wayland_display: Some("wayland-0".into()),
@@ -789,7 +844,7 @@ mod tests {
                 gdk_backend: None,
                 nvidia_driver: true,
                 dmabuf_renderer: None,
-                threads: Some(1),
+                restarted: false,
             }
         }
 
@@ -798,8 +853,8 @@ mod tests {
         }
 
         #[test]
-        fn nvidia_s_driver_under_wayland_turns_the_renderer_off() {
-            assert_eq!(dmabuf_renderer(&nvidia_wayland()), DmabufRenderer::Off);
+        fn nvidia_s_driver_under_wayland_restarts_the_app_with_the_renderer_off() {
+            assert_eq!(dmabuf_renderer(&nvidia_wayland()), DmabufRenderer::Restart);
         }
 
         #[test]
@@ -832,6 +887,7 @@ mod tests {
         fn wayland_is_the_display_gtk_opens() {
             #[rustfmt::skip]
             let cases: &[Case] = &[
+                // WAYLAND_DISPLAY, XDG_SESSION_TYPE, GDK_BACKEND
                 (Some("wayland-0"), Some("wayland"), None, true),
                 (Some("wayland-1"), None, None, true),
                 // A compositor nested in an X11 session: GTK opens the compositor.
@@ -864,8 +920,8 @@ mod tests {
                     "WAYLAND_DISPLAY={display:?} XDG_SESSION_TYPE={session:?} GDK_BACKEND={backend:?}"
                 );
                 let decision = dmabuf_renderer(&facts);
-                let off = decision == DmabufRenderer::Off;
-                assert_eq!(off, expected, "{facts:?}: {decision:?}");
+                let restart = decision == DmabufRenderer::Restart;
+                assert_eq!(restart, expected, "{facts:?}: {decision:?}");
             }
         }
 
@@ -886,47 +942,70 @@ mod tests {
             }
         }
 
-        /// `set_var` with another thread running can race a `getenv` there: only a process
-        /// known to be on one thread is written to.
+        /// The restarted process finds the variable it was given, `1`, and the mark: the app
+        /// turned the renderer off. Any other value is the user's. A mark without the variable
+        /// never restarts again: a restart that lost it would restart for ever.
         #[test]
-        fn with_other_threads_or_an_unknown_count_the_environment_is_not_written() {
-            for threads in [Some(2), Some(9), Some(0), None] {
-                let facts = GraphicsFacts {
-                    threads,
-                    ..nvidia_wayland()
-                };
-                assert_eq!(
-                    dmabuf_renderer(&facts),
-                    DmabufRenderer::NotSingleThreaded(threads),
-                    "{threads:?}"
-                );
-            }
-        }
-
-        /// A test runs beside libtest's main thread, so the real call refuses to write, whatever
-        /// this machine's display and driver: the process environment stays as it was.
-        #[test]
-        fn the_real_call_never_writes_from_a_test() {
-            let facts = GraphicsFacts::from_process();
-            assert!(
-                facts.threads.is_some_and(|n| n > 1),
-                "the thread count: {facts:?}"
+        fn after_the_restart_the_app_knows_it_turned_the_renderer_off() {
+            let restarted = |value: Option<&str>| GraphicsFacts {
+                dmabuf_renderer: os(value),
+                restarted: true,
+                ..nvidia_wayland()
+            };
+            assert_eq!(
+                dmabuf_renderer(&restarted(Some("1"))),
+                DmabufRenderer::TurnedOff
             );
-            let before = std::env::var_os(DMABUF_RENDERER_ENV);
-            let decision = turn_off_dmabuf_renderer_on_nvidia_wayland();
-            assert_ne!(decision, DmabufRenderer::Off);
-            assert_eq!(std::env::var_os(DMABUF_RENDERER_ENV), before);
+            assert_eq!(
+                dmabuf_renderer(&restarted(Some("0"))),
+                DmabufRenderer::UserSet("0".into())
+            );
+            let again = dmabuf_renderer(&restarted(None));
+            assert!(
+                matches!(&again, DmabufRenderer::RestartFailed(why) if why.contains(DMABUF_RENDERER_ENV)),
+                "{again:?}"
+            );
+        }
+
+        /// The restart runs this program, with its own arguments and its own name, in the
+        /// environment it has, plus the variable set to `1` and the mark: nothing else changes.
+        #[test]
+        fn the_restart_is_this_program_with_its_arguments_and_the_renderer_off() {
+            let args = ["apprafter-desktop", "--flag", "two words"].map(OsString::from);
+            let command = restart_command(Path::new("/opt/bin/apprafter-desktop"), args);
+            assert_eq!(command.get_program(), "/opt/bin/apprafter-desktop");
+            let given: Vec<_> = command.get_args().collect();
+            assert_eq!(given, ["--flag", "two words"]);
+            let mut envs: Vec<_> = command
+                .get_envs()
+                .map(|(k, v)| (k.to_owned(), v.map(OsStr::to_owned)))
+                .collect();
+            envs.sort();
+            assert_eq!(
+                envs,
+                [
+                    (
+                        OsString::from(DMABUF_RESTARTED_ENV),
+                        Some(OsString::from("1"))
+                    ),
+                    (
+                        OsString::from(DMABUF_RENDERER_ENV),
+                        Some(OsString::from("1"))
+                    ),
+                ]
+            );
         }
 
         #[test]
-        fn the_variable_is_webkit_s_own() {
+        fn the_names_are_webkit_s_and_the_app_s_own() {
             assert_eq!(DMABUF_RENDERER_ENV, "WEBKIT_DISABLE_DMABUF_RENDERER");
+            assert_eq!(DMABUF_RESTARTED_ENV, "APPRAFTER_DESKTOP_DMABUF_RESTARTED");
         }
 
         /// One line says what the app did, why, and how to keep the renderer on.
         #[test]
         fn the_log_says_what_the_app_did_why_and_how_to_keep_the_renderer() {
-            let off = logged(|| DmabufRenderer::Off.log());
+            let off = logged(|| DmabufRenderer::TurnedOff.log());
             assert_eq!(off.lines().count(), 1, "{off}");
             assert!(off.contains(" INFO "), "{off}");
             for needle in [
@@ -939,6 +1018,7 @@ mod tests {
                 assert!(off.contains(needle), "{needle:?} in {off}");
             }
             assert_eq!(logged(|| DmabufRenderer::Untouched.log()), "");
+            assert_eq!(logged(|| DmabufRenderer::Restart.log()), "");
             let user = logged(|| DmabufRenderer::UserSet("0".into()).log());
             assert_eq!(user.lines().count(), 1, "{user}");
             assert!(user.contains(" INFO "), "{user}");
@@ -946,12 +1026,13 @@ mod tests {
                 user.contains("WEBKIT_DISABLE_DMABUF_RENDERER=\"0\""),
                 "{user}"
             );
-            let threads = logged(|| DmabufRenderer::NotSingleThreaded(Some(3)).log());
-            assert_eq!(threads.lines().count(), 1, "{threads}");
-            assert!(threads.contains(" WARN "), "{threads}");
+            let failed = logged(|| DmabufRenderer::RestartFailed("no exe".into()).log());
+            assert_eq!(failed.lines().count(), 1, "{failed}");
+            assert!(failed.contains(" WARN "), "{failed}");
+            assert!(failed.contains("no exe"), "{failed}");
             assert!(
-                threads.contains("WEBKIT_DISABLE_DMABUF_RENDERER=1"),
-                "{threads}"
+                failed.contains("WEBKIT_DISABLE_DMABUF_RENDERER=1"),
+                "{failed}"
             );
         }
     }

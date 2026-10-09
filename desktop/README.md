@@ -298,10 +298,12 @@ app shares.
   `Gdk-Message: Error 71 (Protocol error) dispatching to Wayland display`.** These are
   WebKitGTK graphics problems, most often on NVIDIA.
   - When the NVIDIA driver is loaded and the window opens on Wayland, the app turns
-    WebKitGTK's DMA-BUF renderer off by itself, as `WEBKIT_DISABLE_DMABUF_RENDERER=1` does:
-    that renderer is what closes the window with `Error 71` there. Its log then has a
-    `WebKitGTK's DMA-BUF renderer is off` line. It does this whenever the NVIDIA driver is
-    loaded, also on a laptop whose screen another graphics chip drives.
+    WebKitGTK's DMA-BUF renderer off by itself: that renderer is what closes the window with
+    `Error 71` there. At start, before it opens anything, the app restarts itself once with
+    `WEBKIT_DISABLE_DMABUF_RENDERER=1` (and `APPRAFTER_DESKTOP_DMABUF_RESTARTED=1`, which marks
+    the restart). Its log then has a `WebKitGTK's DMA-BUF renderer is off` line. It does this
+    whenever the NVIDIA driver is loaded, also on a laptop whose screen another graphics chip
+    drives.
   - To keep the renderer on, start the app with `WEBKIT_DISABLE_DMABUF_RENDERER=0`. The app
     never changes a value you set yourself, whatever it is.
   - Tauri's [Linux graphics notes](https://tauri.app/develop/debug/linux-graphics/) give more
@@ -398,8 +400,9 @@ storage is in `~/.local/share/dev.apprafter.desktop/` too.
 and runs the app as a separate instance. The app's own code reads only that variable and
 `APPRAFTER_CONFIG_DIR` from its environment (a test build reads two more), so `HCLOUD_TOKEN`,
 `KUBECONFIG` and `RUST_LOG` have no effect on it. On Linux it also reads `WAYLAND_DISPLAY`,
-`XDG_SESSION_TYPE`, `GDK_BACKEND` and `WEBKIT_DISABLE_DMABUF_RENDERER`, only to decide the
-NVIDIA workaround under [Troubleshooting](#troubleshooting). Variables that the system and the
+`XDG_SESSION_TYPE`, `GDK_BACKEND`, `WEBKIT_DISABLE_DMABUF_RENDERER` and its own
+`APPRAFTER_DESKTOP_DMABUF_RESTARTED`, only for the NVIDIA workaround under
+[Troubleshooting](#troubleshooting). Variables that the system and the
 libraries the app uses read still apply, such as `HOME`, `XDG_CONFIG_HOME` and the graphics
 ones under Troubleshooting. See
 [Environment variables](../docs/reference/environment.md#apprafter-desktop).
