@@ -9,7 +9,7 @@ import { ALLOWED_WHILE_LOCKED, type COMMANDS } from '../generated/commands';
 import { DESKTOP_ERROR_CODES } from '../generated/errors';
 import type { LockState } from '../generated/LockState';
 import type { OpEvent } from '../generated/OpEvent';
-import { installMockIpc, mockOptionsFromUrl } from './index';
+import { installMockIpc, MOCK_PAM_SAYS, MOCK_PASSWORD, mockOptionsFromUrl } from './index';
 
 afterEach(() => clearMocks());
 
@@ -33,6 +33,7 @@ function callEach(): Record<(typeof COMMANDS)[number], () => Promise<unknown>> {
     settings_get: () => api.settingsGet(),
     settings_set: async () => api.settingsSet(await api.settingsGet()),
     unlock: () => api.unlock(),
+    unlock_with_password: () => api.unlockWithPassword(MOCK_PASSWORD),
     window_ready: () => api.windowReady(),
   };
 }
@@ -54,7 +55,7 @@ describe('installMockIpc', () => {
     const state = await api.lockStatus();
     expect(state).toMatchObject({ locked: true, reason: 'startup', autoLockMinutes: 10 });
     for (const [name, call] of Object.entries(callEach())) {
-      if (name === 'unlock') continue;
+      if (name === 'unlock' || name === 'unlock_with_password') continue;
       const allowed = (ALLOWED_WHILE_LOCKED as readonly string[]).includes(name);
       const code = await outcome(call);
       if (allowed) expect(code, name).not.toBe(DESKTOP_ERROR_CODES.LOCKED);
@@ -87,6 +88,25 @@ describe('installMockIpc', () => {
       [false, 1],
       [true, 2],
     ]);
+    unlisten();
+  });
+
+  test('the password field unlocks with the demo password and refuses others as PAM would', async () => {
+    installMockIpc();
+    const heard: LockState[] = [];
+    const unlisten = await onLockChanged((state) => heard.push(state));
+    const refused = await api.unlockWithPassword('guess').catch((e: unknown) => e);
+    expect(refused).toBeInstanceOf(IpcError);
+    expect((refused as IpcError).error).toMatchObject({
+      code: DESKTOP_ERROR_CODES.AUTH_FAILED,
+      fields: { exhausted: false, messages: [MOCK_PAM_SAYS] },
+    });
+    expect((await api.lockStatus()).locked).toBe(true);
+    expect(await api.unlockWithPassword(MOCK_PASSWORD)).toMatchObject({ locked: false, seq: 1 });
+    // Unlocked, nothing is checked.
+    expect(await api.unlockWithPassword('guess')).toMatchObject({ locked: false, seq: 1 });
+    await settle();
+    expect(heard.map((s) => s.locked)).toEqual([false]);
     unlisten();
   });
 

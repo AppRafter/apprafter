@@ -73,6 +73,9 @@ tracing-appender      = "~0.2"
 tracing-subscriber    = { version = "0.3", features = ["fmt"] }
 # The account and host name the title bar shows (`app_info`).
 whoami                = "~2.1"
+# The password from the app's own field, wiped when dropped: the version apprafter-os-auth
+# takes it in, already in the lock.
+zeroize               = "~1.9"
 
 [target.'cfg(unix)'.dependencies]
 # SIGTERM, SIGHUP and SIGINT run the quit (src/signals.rs), as cli/platform-cli handles them.
@@ -93,6 +96,3 @@ json5       = "0.4"
 proc-macro2 = { version = "1", features = ["span-locations"] }
 syn         = { version = "2", features = ["full", "visit"] }
 tempfile    = "3"
-# examples/os_auth_probe.rs: the password it hands PAM, wiped when dropped. The version
-# apprafter-os-auth takes it in, already in the lock.
-zeroize     = "~1.9"

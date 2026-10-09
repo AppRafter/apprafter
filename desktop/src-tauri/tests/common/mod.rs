@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use apprafter_core::{CancellationToken, Context};
 use apprafter_desktop::app::{self, Shell, ShellCell};
-use apprafter_desktop::auth::{AuthPurpose, Authenticator};
+use apprafter_desktop::auth::{AuthPurpose, Authenticator, PasswordAnswer};
 use apprafter_desktop::ops::SystemClock;
 use apprafter_desktop::settings::SettingsStore;
 use apprafter_desktop_ipc::{AuthInfo, AuthMethod, AuthOutcome, Settings};
@@ -20,9 +20,19 @@ use tauri::test::{get_ipc_response, mock_builder, MockRuntime, INVOKE_KEY};
 use tauri::webview::InvokeRequest;
 use tauri::{WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
-/// An OS that verifies the owner every time it is asked, and counts the asks.
+/// The password [`Verifies`]' own field accepts.
+// Read by tests/ipc_mock.rs only; tests/app_menu.rs compiles this module too.
+#[allow(dead_code)]
+pub const PASSWORD: &str = "open sesame";
+
+/// What [`Verifies`]' field says with a wrong password, as PAM would.
+#[allow(dead_code)]
+pub const PAM_SAYS: &str = "Authentication failure";
+
+/// An OS that verifies the owner every time it is asked, and counts the asks: its prompts in
+/// `.0`, its password field's checks in `.1` (the field accepts [`PASSWORD`]).
 #[derive(Default)]
-pub struct Verifies(pub AtomicUsize);
+pub struct Verifies(pub AtomicUsize, pub AtomicUsize);
 
 impl Authenticator for Verifies {
     fn info(&self) -> AuthInfo {
@@ -38,6 +48,23 @@ impl Authenticator for Verifies {
     fn verify(&self, _purpose: &AuthPurpose, _cancel: &CancellationToken) -> AuthOutcome {
         self.0.fetch_add(1, SeqCst);
         AuthOutcome::Verified
+    }
+
+    fn verify_password(
+        &self,
+        _purpose: &AuthPurpose,
+        password: zeroize::Zeroizing<String>,
+        _cancel: &CancellationToken,
+    ) -> PasswordAnswer {
+        self.1.fetch_add(1, SeqCst);
+        if password.as_str() == PASSWORD {
+            AuthOutcome::Verified.into()
+        } else {
+            PasswordAnswer {
+                outcome: AuthOutcome::Failed { exhausted: false },
+                messages: vec![PAM_SAYS.to_owned()],
+            }
+        }
     }
 }
 

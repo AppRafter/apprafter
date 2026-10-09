@@ -39,10 +39,12 @@ use apprafter_desktop_ipc::{
     AuthOutcome, OpEvent, OpId, OpState, OpSummary, PlanView, Subscribed, SubscriptionId,
 };
 
+use zeroize::Zeroizing;
+
 use super::replay::REPLAY_CAP;
 use super::{panic_message, trip, Clock, OpReporter, ReplayBuffer, Stamp};
-use crate::auth::{AuthPurpose, Authenticator};
-use crate::errors::DesktopError;
+use crate::auth::{AuthPurpose, Authenticator, PasswordAnswer};
+use crate::errors::{DesktopError, Refusal};
 
 /// How long a plan can wait for `execute`, measured by [`elapsed_ms`](super::elapsed_ms):
 /// a suspend counts, a wall clock stepped back does not.
@@ -246,8 +248,9 @@ enum Answer {
     Run(Vec<Subscriber>),
     /// Nothing was asked: the plan waits for another `execute`, as it was.
     Again(Vec<Subscriber>),
-    /// Refused, for the reason given; the pages that followed the prompt are told it.
-    Refuse(DesktopError, Vec<Subscriber>),
+    /// Refused, for the reason given (with what the OS said); the pages that followed the
+    /// prompt are told it.
+    Refuse(Refusal, Vec<Subscriber>),
 }
 
 impl OperationManager {
@@ -322,6 +325,21 @@ impl OperationManager {
         id: OpId,
         auth: &dyn Authenticator,
     ) -> Result<OpId, DesktopError> {
+        self.execute_with(id, auth, None)
+            .map_err(|refusal| *refusal.error)
+    }
+
+    /// [`execute`](Self::execute), the gesture checking `password` — the app's own field, where
+    /// the OS cannot prompt — instead of opening the OS's prompt
+    /// ([`Authenticator::verify_password`]), by the same rules. A refused gesture carries what
+    /// the OS said (PAM's messages), to the caller and to the pages that followed the plan. A
+    /// plan that needs no gesture runs as it would, the password wiped unread.
+    pub fn execute_with(
+        self: &Arc<Self>,
+        id: OpId,
+        auth: &dyn Authenticator,
+        password: Option<Zeroizing<String>>,
+    ) -> Result<OpId, Refusal> {
         let mut inner = self.lock();
         let plan = inner
             .pending
@@ -345,7 +363,10 @@ impl OperationManager {
                 },
             );
             drop(inner);
-            let answer = panic::catch_unwind(AssertUnwindSafe(|| auth.verify(&purpose, &cancel)));
+            let answer = panic::catch_unwind(AssertUnwindSafe(|| match password {
+                Some(password) => auth.verify_password(&purpose, password, &cancel),
+                None => auth.verify(&purpose, &cancel).into(),
+            }));
             let expired = plan.expired(&*self.clock);
             inner = self.lock();
             let prompt = inner.prompts.remove(&id);
@@ -358,13 +379,18 @@ impl OperationManager {
                         return spend(inner, plan, DesktopError::Closing);
                     }
                     inner.pending.insert(id, plan);
-                    return Err(DesktopError::AuthBusy);
+                    return Err(DesktopError::AuthBusy.into());
                 }
-                Answer::Refuse(err, mut sinks) => {
-                    refuse(&mut sinks, &err);
+                Answer::Refuse(refusal, mut sinks) => {
+                    fan_out(
+                        &mut sinks,
+                        &OpEvent::Failed {
+                            error: refusal.to_ui(),
+                        },
+                    );
                     drop(inner);
                     drop((plan, sinks));
-                    return Err(err);
+                    return Err(refusal);
                 }
             }
         }
@@ -407,7 +433,7 @@ impl OperationManager {
             let message = format!("could not start the operation's thread: {e}");
             let error = DesktopError::Internal(message.clone()).to_ui();
             self.end(id, || (OpEvent::Failed { error }, OpState::Failed));
-            return Err(DesktopError::Internal(message));
+            return Err(DesktopError::Internal(message).into());
         }
         Ok(id)
     }
@@ -736,11 +762,11 @@ fn spend(
     inner: MutexGuard<'_, Inner>,
     mut plan: Pending,
     why: DesktopError,
-) -> Result<OpId, DesktopError> {
+) -> Result<OpId, Refusal> {
     refuse(&mut plan.sinks, &why);
     drop(inner);
     drop(plan);
-    Err(why)
+    Err(why.into())
 }
 
 /// Refuse every open prompt not refused yet; their tokens, to close their dialogs.
@@ -757,26 +783,31 @@ fn refuse_prompts(prompts: &mut HashMap<OpId, Prompt>) -> Vec<CancellationToken>
 
 /// What a prompt's answer means for plan `id`. `prompt` is its entry, gone when it was
 /// closed some other way; `expired` says the plan's time to live passed while it was open.
+/// What the OS said comes with a refusal the OS gave, never with a yes refused afterwards.
 fn judge(
     id: OpId,
-    answer: thread::Result<AuthOutcome>,
+    answer: thread::Result<PasswordAnswer>,
     prompt: Option<Prompt>,
     expired: bool,
 ) -> Answer {
     let (refused, sinks) = prompt.map_or((true, Vec::new()), |p| (p.refused, p.sinks));
-    let outcome = match answer {
-        Ok(outcome) => outcome,
+    let PasswordAnswer { outcome, messages } = match answer {
+        Ok(answer) => answer,
         Err(panic) => {
             let err = DesktopError::Internal(format!(
                 "the authentication prompt panicked: {}",
                 panic_message(&*panic)
             ));
-            return Answer::Refuse(err, sinks);
+            return Answer::Refuse(err.into(), sinks);
         }
+    };
+    let said = |error: DesktopError| match outcome {
+        AuthOutcome::Verified => Refusal::from(error),
+        _ => Refusal::new(error, messages.clone()),
     };
     // A lock, a cancel or a quit closed it: whatever the OS answered, the plan was dropped.
     if refused {
-        return Answer::Refuse(DesktopError::AuthCancelled, sinks);
+        return Answer::Refuse(said(DesktopError::AuthCancelled), sinks);
     }
     let err = match outcome {
         AuthOutcome::Verified | AuthOutcome::Busy if expired => {
@@ -788,7 +819,7 @@ fn judge(
         AuthOutcome::Failed { exhausted } => DesktopError::AuthFailed { exhausted },
         AuthOutcome::Unavailable { reason } => DesktopError::AuthUnavailable { reason },
     };
-    Answer::Refuse(err, sinks)
+    Answer::Refuse(said(err), sinks)
 }
 
 /// The final event and state for how the executor returned.
@@ -886,9 +917,12 @@ mod tests {
     };
     use serde_json::json;
 
+    use zeroize::Zeroizing;
+
     use super::{
         test_spawn, EventSink, Executor, OperationManager, PlanParts, ENDED_KEPT, PLAN_TTL_MS,
     };
+    use crate::auth::test_os::{self, Call, ScriptedOs};
     use crate::auth::{AuthPurpose, Authenticator, FakeAuthenticator, NoAuthenticator};
     use crate::errors::DesktopError;
     use crate::ops::replay::MESSAGE_CAP;
@@ -1315,6 +1349,114 @@ mod tests {
             ),
             "{err:?}"
         );
+        assert_eq!(runs.load(SeqCst), 0);
+    }
+
+    /// What the owner typed into the confirm dialog's field.
+    fn typed(password: &str) -> Option<Zeroizing<String>> {
+        Some(Zeroizing::new(password.to_owned()))
+    }
+
+    #[test]
+    fn a_password_given_is_checked_in_place_of_the_os_prompt() {
+        let (auth, calls) = test_os::system(
+            ScriptedOs::new(FakeAuthenticator::new().info(), AuthOutcome::Verified)
+                .saying(AuthOutcome::Verified.into()),
+        );
+        let (_, mgr) = manager();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let field = mgr.register_plan(parts(PlanClass::Destructive), counting(&runs));
+        mgr.execute_with(field.op_id, &*auth, typed("hunter2"))
+            .unwrap();
+        wait_ended(&mgr, field.op_id);
+        let prompt = mgr.register_plan(parts(PlanClass::Destructive), counting(&runs));
+        mgr.execute_with(prompt.op_id, &*auth, None).unwrap();
+        wait_ended(&mgr, prompt.op_id);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [
+                Call::Password(apprafter_os_auth::Action::Confirm, "hunter2".into(), 1_000),
+                Call::Verify(apprafter_os_auth::Action::Confirm),
+            ],
+            "the field, then the OS's prompt"
+        );
+        assert_eq!(runs.load(SeqCst), 2);
+    }
+
+    #[test]
+    fn a_refused_password_spends_the_plan_and_says_what_pam_said_to_every_page() {
+        let auth = FakeAuthenticator::new().with_password("open sesame");
+        auth.saying(&["Authentication failure"]);
+        let (_, mgr) = manager();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let view = mgr.register_plan(parts(PlanClass::Destructive), counting(&runs));
+        let earlier = VecSink::new("main");
+        mgr.subscribe(view.op_id, earlier.clone()).unwrap();
+        let refusal = mgr
+            .execute_with(view.op_id, &auth, typed("open sesame!"))
+            .unwrap_err();
+        assert!(
+            matches!(
+                *refusal.error,
+                DesktopError::AuthFailed { exhausted: false }
+            ),
+            "{refusal:?}"
+        );
+        assert_eq!(refusal.messages, ["Authentication failure"]);
+        assert_eq!(
+            earlier.events(),
+            [OpEvent::Failed {
+                error: refusal.to_ui()
+            }],
+            "the page that followed the plan hears it with what was said"
+        );
+        assert_eq!(
+            refusal.to_ui().fields["messages"],
+            json!(["Authentication failure"])
+        );
+        assert!(matches!(
+            mgr.execute_with(view.op_id, &auth, typed("open sesame")),
+            Err(refusal) if matches!(*refusal.error, DesktopError::PlanNotFound { .. })
+        ));
+        assert_eq!(runs.load(SeqCst), 0);
+        assert_eq!(auth.asked().len(), 1);
+    }
+
+    #[test]
+    fn a_plan_without_a_gesture_runs_and_its_password_is_never_checked() {
+        let auth = FakeAuthenticator::new().with_password("open sesame");
+        let (_, mgr) = manager();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let view = mgr.register_plan(parts(PlanClass::Bounded), counting(&runs));
+        mgr.execute_with(view.op_id, &auth, typed("wrong")).unwrap();
+        wait_ended(&mgr, view.op_id);
+        assert_eq!(runs.load(SeqCst), 1);
+        assert!(auth.asked().is_empty());
+    }
+
+    #[test]
+    fn where_the_os_cannot_verify_the_owner_a_destructive_plan_is_refused() {
+        let reason = UnavailableReason::NoAgent;
+        let (auth, _) = test_os::system(ScriptedOs::new(
+            AuthInfo {
+                available: false,
+                method: None,
+                unavailable: Some(reason),
+                biometrics_choice: false,
+                password_field: false,
+            },
+            AuthOutcome::Unavailable { reason },
+        ));
+        let (_, mgr) = manager();
+        let runs = Arc::new(AtomicUsize::new(0));
+        for password in [None, typed("hunter2")] {
+            let view = mgr.register_plan(parts(PlanClass::Destructive), counting(&runs));
+            let refusal = mgr.execute_with(view.op_id, &*auth, password).unwrap_err();
+            assert!(
+                matches!(*refusal.error, DesktopError::AuthUnavailable { .. }),
+                "{refusal:?}"
+            );
+        }
         assert_eq!(runs.load(SeqCst), 0);
     }
 

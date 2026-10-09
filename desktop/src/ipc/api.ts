@@ -21,6 +21,7 @@ export const API_COMMANDS = [
   'lock_status',
   'lock_now',
   'unlock',
+  'unlock_with_password',
   'activity',
   'quit',
   'op_list',
@@ -86,6 +87,13 @@ export const lockStatus = () => call<LockState>('lock_status');
 export const lockNow = () => call<LockState>('lock_now');
 /** Rust asks the OS for the owner; the resulting state. */
 export const unlock = () => call<LockState>('unlock');
+/**
+ * The lock screen's own password field, shown where the OS cannot prompt
+ * (`AuthInfo.passwordField`): Rust checks the password as `unlock` asks the OS; the resulting
+ * state. A refusal may carry what the OS said (PAM's messages) in `error.fields.messages`.
+ */
+export const unlockWithPassword = (password: string) =>
+  call<LockState>('unlock_with_password', { password });
 /** The owner did something: the idle time starts again. */
 export const activity = () => call<void>('activity');
 export const quit = () => call<void>('quit');
@@ -98,8 +106,16 @@ export const opUnsubscribe = (opId: OpId, subscription: SubscriptionId) =>
   call<void>('op_unsubscribe', { opId, subscription });
 export const opCancel = (opId: OpId) => call<void>('op_cancel', { opId });
 export const opDiscard = (opId: OpId) => call<void>('op_discard', { opId });
-/** Run a confirmed plan (Rust asks for the OS gesture when it needs one); `onEvent` follows it. */
-export const opExecute = (opId: OpId, onEvent: Channel<OpEvent>) =>
-  call<SubscriptionId>('op_execute', { opId, onEvent });
+/**
+ * Run a confirmed plan; `onEvent` follows it. When the plan needs the owner's gesture Rust asks
+ * the OS — or, given `password` (the confirm dialog's own field, shown where
+ * `AuthInfo.passwordField`), checks it instead; a refusal may then carry what the OS said in
+ * `error.fields.messages`.
+ */
+export const opExecute = (opId: OpId, onEvent: Channel<OpEvent>, password?: string) =>
+  call<SubscriptionId>(
+    'op_execute',
+    password === undefined ? { opId, onEvent } : { opId, onEvent, password },
+  );
 /** The page has painted: the window, created hidden, shows. */
 export const windowReady = () => call<void>('window_ready');

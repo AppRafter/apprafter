@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 // A stand-in for the Rust side, for `vite dev` in a browser (`bun run dev:mock`) and the
 // Playwright smoke: every command answers from in-memory state, behind the same lock gate.
-// The app starts locked (`startup`); Unlock unlocks without asking anyone.
+// The app starts locked (`startup`); Unlock unlocks without asking anyone, and the password
+// field (`unlock_with_password`) unlocks with MOCK_PASSWORD and refuses anything else as PAM
+// would, saying MOCK_PAM_SAYS.
 import type { InvokeArgs } from '@tauri-apps/api/core';
 import { emit } from '@tauri-apps/api/event';
 import { mockIPC, mockWindows } from '@tauri-apps/api/mocks';
@@ -18,6 +20,12 @@ import type { Theme } from '../generated/Theme';
 import type { UiError } from '../generated/UiError';
 
 export { MOCK_TARGETS } from './fixtures';
+
+/** The one password the mock's password field accepts: a demo value, nobody's password. */
+export const MOCK_PASSWORD = 'apprafter';
+
+/** What the mock's password field says with a wrong password, as PAM would. */
+export const MOCK_PAM_SAYS = 'Authentication failure';
 
 export interface MockOptions {
   readonly os?: Os;
@@ -153,6 +161,17 @@ export function installMockIpc(options: MockOptions = {}): void {
     lock_status: () => lock,
     lock_now: () => (settings.lockEnabled ? transition('manual') : lock),
     unlock: () => (lock.locked ? transition(null) : lock),
+    // As Rust: unlocked already, nothing is checked.
+    unlock_with_password: (args) => {
+      if (!lock.locked) return lock;
+      if ((args as { password?: unknown } | undefined)?.password === MOCK_PASSWORD) {
+        return transition(null);
+      }
+      return Promise.reject({
+        ...uiError(DESKTOP_ERROR_CODES.AUTH_FAILED, 'authentication failed'),
+        fields: { exhausted: false, messages: [MOCK_PAM_SAYS] },
+      });
+    },
     activity: () => null,
     quit: () => null,
     op_list: () => [],

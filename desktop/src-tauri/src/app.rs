@@ -52,9 +52,11 @@ use tauri::ipc::Invoke;
 use tauri::webview::PageLoadEvent;
 use tauri::{AppHandle, Emitter, ExitRequestApi, Manager, Runtime};
 
+use zeroize::Zeroizing;
+
 use crate::auth::Authenticator;
 use crate::commands;
-use crate::errors::DesktopError;
+use crate::errors::{DesktopError, Refusal};
 use crate::lock::{LockHook, LockMachine};
 use crate::ops::{panic_message, Clock, EventSink, OperationManager};
 use crate::settings::SettingsStore;
@@ -155,6 +157,9 @@ impl Shell {
     /// survive it — a plan executable after the lock, a sink that doubles the page's output.
     /// Nothing else can subscribe while locked, and the page subscribes again only once it
     /// hears of the unlock, after this ran.
+    ///
+    /// `auth` is given the settings first ([`Authenticator::apply_settings`]: Windows' `hello`),
+    /// and again after every save.
     pub fn new(
         settings: SettingsStore,
         auth: Arc<dyn Authenticator>,
@@ -172,6 +177,7 @@ impl Shell {
                 on_lock_change(state);
             })
         };
+        auth.apply_settings(&settings.get());
         let lock = Arc::new(LockMachine::new(settings.get(), auth.clone(), clock, hook));
         Arc::new(Self {
             settings,
@@ -186,7 +192,9 @@ impl Shell {
         })
     }
 
-    /// The `app_info` answer.
+    /// The `app_info` answer. Its `auth` is the authenticator's answer now, never one kept from
+    /// the start: it changes (a polkit dialog that found no agent moves Linux to the password
+    /// field, a lock moves it back).
     pub fn app_info(&self) -> AppInfo {
         AppInfo {
             os: current_os(),
@@ -202,10 +210,15 @@ impl Shell {
     }
 
     /// Save `settings` and apply them, through the lock machine (which refuses switching the
-    /// lock on with nothing to verify the owner); the settings now in use.
+    /// lock on with nothing to verify the owner), and give the authenticator the saved ones;
+    /// the settings now in use. The authenticator hears of them within the machine's settings
+    /// write, so concurrent saves reach it in the order they reach the file.
     pub fn set_settings(&self, settings: Settings) -> Result<Settings, DesktopError> {
-        self.lock
-            .set_settings(settings, |new| self.settings.set(new.clone()))?;
+        self.lock.set_settings(settings, |new| {
+            self.settings.set(new.clone())?;
+            self.auth.apply_settings(new);
+            Ok(())
+        })?;
         Ok(self.settings.get())
     }
 
@@ -221,6 +234,13 @@ impl Shell {
         Ok(self.lock.state())
     }
 
+    /// Unlock with the password from the lock screen's own field (blocks while it is checked);
+    /// the state that results.
+    pub fn unlock_with_password(&self, password: Zeroizing<String>) -> Result<LockState, Refusal> {
+        self.lock.unlock_with_password(password)?;
+        Ok(self.lock.state())
+    }
+
     /// Run plan `id`, `sink` following it from before the prompt. The subscription it holds,
     /// for `op_unsubscribe`; on an error the sink is unsubscribed again, so a busy prompt's
     /// retry does not leave the first attempt's sink behind. A started operation wakes the
@@ -230,8 +250,20 @@ impl Shell {
         id: OpId,
         sink: Arc<dyn EventSink>,
     ) -> Result<SubscriptionId, DesktopError> {
+        self.execute_with(id, sink, None)
+            .map_err(|refusal| *refusal.error)
+    }
+
+    /// [`execute`](Self::execute), the gesture checking `password` from the confirm dialog's
+    /// own field when it is given ([`OperationManager::execute_with`]).
+    pub fn execute_with(
+        &self,
+        id: OpId,
+        sink: Arc<dyn EventSink>,
+        password: Option<Zeroizing<String>>,
+    ) -> Result<SubscriptionId, Refusal> {
         let subscription = self.ops.subscribe(id, sink)?.subscription;
-        match self.ops.execute(id, &*self.auth) {
+        match self.ops.execute_with(id, &*self.auth, password) {
             Ok(_) => {
                 self.stop.nudge();
                 Ok(subscription)
@@ -319,6 +351,7 @@ pub fn builder<R: Runtime>(base: tauri::Builder<R>, cell: ShellCell) -> tauri::B
         commands::lock_status,
         commands::lock_now,
         commands::unlock,
+        commands::unlock_with_password,
         commands::activity,
         commands::quit,
         commands::op_list,
@@ -514,11 +547,14 @@ mod tests {
     use apprafter_core::{CancellationToken, Context, Event, Outcome, PlanClass};
     use apprafter_desktop_ipc::{
         errors, AuthInfo, AuthOutcome, AutoLock, CancelledBy, LockReason, LockState, OpEvent, OpId,
-        Settings,
+        Settings, UnavailableReason,
     };
     use serde_json::json;
 
+    use zeroize::Zeroizing;
+
     use super::Shell;
+    use crate::auth::test_os::{self, Call, ScriptedOs};
     use crate::auth::{AuthPurpose, Authenticator, FakeAuthenticator, NoAuthenticator};
     use crate::errors::DesktopError;
     use crate::ops::test_clock::ManualClock;
@@ -769,6 +805,111 @@ mod tests {
         assert!(!info.test_build);
         assert!(!info.account.is_empty() && !info.host.is_empty());
         assert_eq!(info.settings_notice, None);
+    }
+
+    #[test]
+    fn the_settings_reach_the_authenticator_at_start_and_after_every_save() {
+        let os = ScriptedOs::new(FakeAuthenticator::new().info(), AuthOutcome::Verified);
+        let (auth, calls) = test_os::system(os);
+        let no_hello = Settings {
+            hello: false,
+            ..unlocked_at_start()
+        };
+        let r = rig(no_hello.clone(), auth);
+        let hellos = || -> Vec<bool> {
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|call| match call {
+                    Call::Hello(on) => Some(*on),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(hellos(), [false], "at start");
+        r.shell.set_settings(unlocked_at_start()).unwrap();
+        assert_eq!(hellos(), [false, true], "after the save");
+
+        // A save the lock machine refuses reaches nothing.
+        let reason = UnavailableReason::NotConfigured;
+        let (auth, calls) = test_os::system(ScriptedOs::new(
+            AuthInfo {
+                available: false,
+                method: None,
+                unavailable: Some(reason),
+                biometrics_choice: false,
+                password_field: false,
+            },
+            AuthOutcome::Unavailable { reason },
+        ));
+        let off = Settings {
+            lock_enabled: false,
+            ..no_hello
+        };
+        let r = rig(off, auth);
+        assert!(r.shell.set_settings(Settings::default()).is_err());
+        let said: Vec<Call> = calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| matches!(call, Call::Hello(_)))
+            .cloned()
+            .collect();
+        assert_eq!(said, [Call::Hello(false)], "only the start's");
+    }
+
+    /// Answers `info` with a password field once `field` is set.
+    struct Changes {
+        field: AtomicBool,
+    }
+
+    impl Authenticator for Changes {
+        fn info(&self) -> AuthInfo {
+            AuthInfo {
+                password_field: self.field.load(SeqCst),
+                ..FakeAuthenticator::new().info()
+            }
+        }
+
+        fn verify(&self, _purpose: &AuthPurpose, _cancel: &CancellationToken) -> AuthOutcome {
+            AuthOutcome::Verified
+        }
+    }
+
+    #[test]
+    fn app_info_says_what_the_authenticator_says_now() {
+        // A polkit dialog that found no agent moves Linux to the password field: the page reads
+        // app_info again and must see it.
+        let auth = Arc::new(Changes {
+            field: AtomicBool::new(false),
+        });
+        let r = rig(unlocked_at_start(), auth.clone());
+        assert!(!r.shell.app_info().auth.password_field);
+        auth.field.store(true, SeqCst);
+        assert!(r.shell.app_info().auth.password_field);
+    }
+
+    #[test]
+    fn the_password_unlock_answers_the_state_it_left() {
+        let auth = Arc::new(FakeAuthenticator::new().with_password("open sesame"));
+        auth.saying(&["Authentication failure"]);
+        let r = rig(Settings::default(), auth);
+        let refusal = r
+            .shell
+            .unlock_with_password(Zeroizing::new("guess".into()))
+            .unwrap_err();
+        assert_eq!(
+            refusal.to_ui().fields["messages"],
+            json!(["Authentication failure"])
+        );
+        let state = r
+            .shell
+            .unlock_with_password(Zeroizing::new("open sesame".into()))
+            .unwrap();
+        assert!(!state.locked);
+        assert_eq!(state, r.shell.lock.state());
+        assert_eq!(r.notified.lock().unwrap().clone(), [state]);
     }
 
     #[test]

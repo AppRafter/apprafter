@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! The only codes the desktop itself raises, as `UiError.code`; core codes pass through.
+//!
+//! An authentication error from the app's own password field (`unlock_with_password`,
+//! `op_execute` with a password) may carry `fields.messages`: what the OS said while it checked
+//! the password — PAM's "Password expired", say — as a list of strings, never the password.
 
 /// A command other than [`ALLOWED_WHILE_LOCKED`](crate::ALLOWED_WHILE_LOCKED) while locked.
 pub const LOCKED: &str = "apprafter::desktop::locked";

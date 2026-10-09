@@ -20,9 +20,8 @@ use std::sync::Arc;
 use tauri::utils::config::AppDirectoriesOverride;
 use tauri::{Manager, RunEvent};
 
-use crate::auth::Authenticator;
 use crate::env::AllowListEnv;
-use crate::ops::SystemClock;
+use crate::ops::{Clock, SystemClock};
 use crate::settings::SettingsStore;
 
 /// Build and run the app. Returns only when it could not start; once running, the process
@@ -31,10 +30,12 @@ use crate::settings::SettingsStore;
 /// In order: the async runtime and the crypto provider (before anything of Tauri's), the
 /// allow-listed environment and the core context, the app's identity and directories (a
 /// data-directory override moves every app directory and keys the single-instance lock on
-/// it; one set but empty or not Unicode stops the start, [`exit_code`] 2), the app itself (the
+/// it; one set but empty or not Unicode stops the start, [`exit_code`] 2), the authenticator
+/// ([`auth::choice`]: the OS's in a release, the fake in a test build), the app itself (the
 /// single-instance plugin first: a second launch only focuses the first window and exits; on
 /// macOS, the app menu), then the log, the settings and the shell, the tickers and, on Linux
-/// and macOS, the quit signals.
+/// and macOS, the quit signals. On Windows the prompts are parented to the main window as soon
+/// as it is built.
 ///
 /// The log starts once the app is built, so a second launch, which exits while the plugins
 /// start, writes nothing to the running app's log. It is still up before the window: Tauri
@@ -69,6 +70,9 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         config.app.app_directories_override = Some(AppDirectoriesOverride::Root(dir.clone()));
     }
 
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let auth = auth::authenticator(auth::choice(&env), clock.clone());
+
     let cell = app::ShellCell::default();
     let builder = app::builder(tauri::Builder::default(), cell.clone())
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
@@ -78,8 +82,15 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         .plugin(app::opener_plugin())
         .setup({
             let data_dir = data_dir.clone();
+            #[cfg(windows)]
+            let auth = auth.clone();
             move |app| {
-                window::build_main(app.handle(), data_dir.as_deref())?;
+                let main = window::build_main(app.handle(), data_dir.as_deref())?;
+                // Windows: until the prompts have a parent, a request opens nothing.
+                #[cfg(windows)]
+                auth.set_window(main.hwnd()?.0 as isize);
+                #[cfg(not(windows))]
+                drop(main);
                 tracing::info!("the main window is open");
                 Ok(())
             }
@@ -113,8 +124,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     let handle = app.handle().clone();
     let shell = app::Shell::new(
         settings,
-        authenticator(),
-        Arc::new(SystemClock),
+        auth,
+        clock,
         context,
         env.test_build(),
         move |state| app::emit_lock_changed(&handle, state),
@@ -146,16 +157,6 @@ pub fn exit_code(error: &(dyn Error + 'static)) -> i32 {
     } else {
         1
     }
-}
-
-/// Until the OS backends (D.2d): the scripted fake in a test build, and in a release nothing —
-/// so the lock and every gesture fail closed.
-fn authenticator() -> Arc<dyn Authenticator> {
-    #[cfg(feature = "test-build")]
-    let auth: Arc<dyn Authenticator> = Arc::new(auth::FakeAuthenticator::new());
-    #[cfg(not(feature = "test-build"))]
-    let auth: Arc<dyn Authenticator> = Arc::new(auth::NoAuthenticator);
-    auth
 }
 
 #[cfg(test)]

@@ -43,14 +43,16 @@
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread;
 
 use apprafter_core::CancellationToken;
 use apprafter_desktop_ipc::{
     AuthInfo, AuthOutcome, LockReason, LockState, Settings, UnavailableReason, ALLOWED_WHILE_LOCKED,
 };
+use zeroize::Zeroizing;
 
-use crate::auth::{AuthPurpose, Authenticator};
-use crate::errors::DesktopError;
+use crate::auth::{AuthPurpose, Authenticator, PasswordAnswer};
+use crate::errors::{DesktopError, Refusal};
 use crate::ops::{panic_message, Clock, Stamp};
 
 const MINUTE_MS: u64 = 60_000;
@@ -101,6 +103,10 @@ struct Prompt {
 impl LockMachine {
     /// Locked with [`LockReason::Startup`] when the lock is in effect and `lock_on_start` is
     /// set; unlocked otherwise.
+    ///
+    /// The app builds the machine on its main thread, where no OS backend may be asked (Windows
+    /// answers Hello's availability through a COM apartment the main thread does not pump), so
+    /// the authenticator is asked on a thread of its own, and waited for.
     pub fn new(
         settings: Settings,
         auth: Arc<dyn Authenticator>,
@@ -108,8 +114,9 @@ impl LockMachine {
         hook: LockHook,
     ) -> Self {
         let now = Stamp::now(&*clock);
-        let reason = (in_effect(&settings, &auth.info()) && settings.lock_on_start)
-            .then_some(LockReason::Startup);
+        let info = off_this_thread("auth-info", || auth.info());
+        let reason =
+            (in_effect(&settings, &info) && settings.lock_on_start).then_some(LockReason::Startup);
         Self {
             auth,
             clock,
@@ -211,6 +218,26 @@ impl LockMachine {
     /// nothing; once the quit has [`close`](Self::close)d the machine, it asks nothing and
     /// answers `Closing`.
     pub fn unlock(&self) -> Result<(), DesktopError> {
+        self.unlock_by(|auth, cancel| auth.verify(&AuthPurpose::Unlock, cancel).into())
+            .map_err(|refusal| *refusal.error)
+    }
+
+    /// [`unlock`](Self::unlock) with the password from the app's own field
+    /// ([`Authenticator::verify_password`]) in place of the OS's prompt, by the same rules: one
+    /// check at a time, with any `unlock` (`AuthBusy`), closed by a lock or a quit, a `Verified`
+    /// that comes after that refused. A refusal carries what the OS said with it (PAM's
+    /// messages). The password goes to the authenticator, or is wiped unasked.
+    pub fn unlock_with_password(&self, password: Zeroizing<String>) -> Result<(), Refusal> {
+        self.unlock_by(move |auth, cancel| {
+            auth.verify_password(&AuthPurpose::Unlock, password, cancel)
+        })
+    }
+
+    /// The one unlock: `ask` is the authenticator's check, run once a prompt slot is had.
+    fn unlock_by(
+        &self,
+        ask: impl FnOnce(&dyn Authenticator, &CancellationToken) -> PasswordAnswer,
+    ) -> Result<(), Refusal> {
         let cancel = {
             let mut inner = self.lock_inner();
             if inner.reason.is_none() {
@@ -219,10 +246,10 @@ impl LockMachine {
             // The quit's drain may take seconds: no prompt may open meanwhile, and none
             // between this check and the insert below, which is this same lock hold.
             if inner.closing {
-                return Err(DesktopError::Closing);
+                return Err(DesktopError::Closing.into());
             }
             if inner.prompt.is_some() {
-                return Err(DesktopError::AuthBusy);
+                return Err(DesktopError::AuthBusy.into());
             }
             let cancel = CancellationToken::new();
             inner.prompt = Some(Prompt {
@@ -231,33 +258,37 @@ impl LockMachine {
             });
             cancel
         };
-        let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
-            self.auth.verify(&AuthPurpose::Unlock, &cancel)
-        }));
+        let answer = panic::catch_unwind(AssertUnwindSafe(|| ask(&*self.auth, &cancel)));
         let info = self.auth.info();
         let mut inner = self.lock_inner();
         let closed = inner.prompt.take().is_none_or(|prompt| prompt.closed);
-        let outcome = match outcome {
-            Ok(outcome) => outcome,
+        let PasswordAnswer { outcome, messages } = match answer {
+            Ok(answer) => answer,
             // The prompt is closed above, so the next unlock can ask again.
             Err(payload) => {
                 drop(inner);
                 panic::resume_unwind(payload)
             }
         };
-        match outcome {
-            AuthOutcome::Verified if closed => Err(DesktopError::AuthCancelled),
+        let error = match outcome {
+            AuthOutcome::Verified if closed => DesktopError::AuthCancelled,
             AuthOutcome::Verified => {
                 let now = Stamp::now(&*self.clock);
                 inner.last_activity = now;
                 self.enter(&mut inner, &info, None, now.wall_ms);
-                Ok(())
+                return Ok(());
             }
-            AuthOutcome::Cancelled { .. } => Err(DesktopError::AuthCancelled),
-            AuthOutcome::Failed { exhausted } => Err(DesktopError::AuthFailed { exhausted }),
-            AuthOutcome::Unavailable { reason } => Err(DesktopError::AuthUnavailable { reason }),
-            AuthOutcome::Busy => Err(DesktopError::AuthBusy),
-        }
+            AuthOutcome::Cancelled { .. } => DesktopError::AuthCancelled,
+            AuthOutcome::Failed { exhausted } => DesktopError::AuthFailed { exhausted },
+            AuthOutcome::Unavailable { reason } => DesktopError::AuthUnavailable { reason },
+            AuthOutcome::Busy => DesktopError::AuthBusy,
+        };
+        // What a refused check said; a yes refused for closing says nothing worth showing.
+        let messages = match outcome {
+            AuthOutcome::Verified => Vec::new(),
+            _ => messages,
+        };
+        Err(Refusal::new(error, messages))
     }
 
     /// Replace the settings the machine follows, once `persist` has saved them.
@@ -296,12 +327,21 @@ impl LockMachine {
 
     /// Move to `reason` (`None` = unlocked), numbered as the next transition, and tell the
     /// hook; a panic in the hook is logged, and the transition stands. The one place a state
-    /// changes, always under the machine's lock.
+    /// changes, always under the machine's lock. A lock first tells the authenticator
+    /// ([`Authenticator::locked`]), so what the lock screen reads of it is fresh.
     fn enter(&self, inner: &mut Inner, info: &AuthInfo, reason: Option<LockReason>, now: u64) {
         inner.reason = reason;
         inner.since_ms = now;
         inner.seq += 1;
         self.locked.store(reason.is_some(), Ordering::SeqCst);
+        if reason.is_some() {
+            if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| self.auth.locked())) {
+                tracing::error!(
+                    "the authenticator's lock notice panicked: {}",
+                    panic_message(&*payload)
+                );
+            }
+        }
         let state = state_of(inner, info);
         if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| (self.hook)(&state))) {
             tracing::error!(
@@ -336,6 +376,28 @@ fn trip_prompt(cancel: Option<CancellationToken>) {
     }
 }
 
+/// `work`'s answer, worked out on a thread named `name` while this one waits; here, when no
+/// thread is to be had. A panic in `work` is raised again here.
+fn off_this_thread<T: Send>(name: &str, work: impl FnOnce() -> T + Send) -> T {
+    let work = Mutex::new(Some(work));
+    let run = || {
+        let work = work.lock().unwrap_or_else(|p| p.into_inner()).take();
+        work.map(|work| work())
+    };
+    let answer = thread::scope(|scope| {
+        match thread::Builder::new()
+            .name(name.into())
+            .spawn_scoped(scope, run)
+        {
+            Ok(handle) => handle
+                .join()
+                .unwrap_or_else(|payload| panic::resume_unwind(payload)),
+            Err(_) => run(),
+        }
+    });
+    answer.expect("the work runs once, on one thread or the other")
+}
+
 fn in_effect(settings: &Settings, info: &AuthInfo) -> bool {
     settings.lock_enabled && info.available
 }
@@ -366,9 +428,15 @@ mod tests {
         AuthInfo, AuthOutcome, AutoLock, CancelledBy, LockReason, LockState, Settings, Theme,
         UnavailableReason, ALLOWED_WHILE_LOCKED, COMMANDS,
     };
+    use apprafter_os_auth::Action;
+
+    use zeroize::Zeroizing;
 
     use super::LockMachine;
-    use crate::auth::{AuthPurpose, Authenticator, FakeAuthenticator, NoAuthenticator};
+    use crate::auth::test_os::{self, Call, ScriptedOs};
+    use crate::auth::{
+        AuthPurpose, Authenticator, FakeAuthenticator, NoAuthenticator, PasswordAnswer,
+    };
     use crate::errors::DesktopError;
     use crate::ops::test_clock::ManualClock;
     use crate::ops::test_trips;
@@ -525,6 +593,16 @@ mod tests {
                     by: CancelledBy::App,
                 })
         }
+
+        /// The password check stays open the same way.
+        fn verify_password(
+            &self,
+            purpose: &AuthPurpose,
+            _password: Zeroizing<String>,
+            cancel: &CancellationToken,
+        ) -> PasswordAnswer {
+            self.verify(purpose, cancel).into()
+        }
     }
 
     /// Runs `f` on a thread of its own, so a deadlock fails the test after `LONG` instead
@@ -558,7 +636,89 @@ mod tests {
         rx
     }
 
+    /// What the owner typed into the lock screen's field.
+    fn typed(password: &str) -> Zeroizing<String> {
+        Zeroizing::new(password.to_owned())
+    }
+
+    /// Starts `machine.unlock_with_password(password)` on a thread; its error, if any, arrives
+    /// on the receiver.
+    fn password_unlock_in_background(
+        machine: &Arc<LockMachine>,
+        password: &str,
+    ) -> mpsc::Receiver<Result<(), DesktopError>> {
+        let (tx, rx) = mpsc::channel();
+        let (machine, password) = (machine.clone(), typed(password));
+        thread::spawn(move || {
+            let _ = tx.send(
+                machine
+                    .unlock_with_password(password)
+                    .map_err(|refusal| *refusal.error),
+            );
+        });
+        rx
+    }
+
+    /// The OS's own authenticator ([`crate::auth::SystemAuthenticator`]) over an OS that
+    /// reports `info` and answers every prompt `verify`.
+    fn os(info: AuthInfo, verify: AuthOutcome) -> (Arc<dyn Authenticator>, test_os::Calls) {
+        let (auth, calls) = test_os::system(ScriptedOs::new(info, verify));
+        (auth, calls)
+    }
+
+    /// An OS that can prompt (polkit, say).
+    fn os_available() -> AuthInfo {
+        AuthInfo {
+            available: true,
+            method: Some(apprafter_desktop_ipc::AuthMethod::Polkit),
+            unavailable: None,
+            biometrics_choice: false,
+            password_field: false,
+        }
+    }
+
+    /// An OS that cannot verify the owner here, for `reason`.
+    fn os_unavailable(reason: UnavailableReason) -> AuthInfo {
+        AuthInfo {
+            available: false,
+            method: None,
+            unavailable: Some(reason),
+            biometrics_choice: false,
+            password_field: false,
+        }
+    }
+
     // 1–3. Whether the lock is in effect, and the state at start.
+
+    /// Says which thread asked it for its info.
+    struct NamesItsAsker(Mutex<Vec<thread::ThreadId>>);
+
+    impl Authenticator for NamesItsAsker {
+        fn info(&self) -> AuthInfo {
+            self.0.lock().unwrap().push(thread::current().id());
+            FakeAuthenticator::new().info()
+        }
+
+        fn verify(&self, _purpose: &AuthPurpose, _cancel: &CancellationToken) -> AuthOutcome {
+            AuthOutcome::Verified
+        }
+    }
+
+    #[test]
+    fn the_start_asks_the_authenticator_off_the_building_thread() {
+        // The app builds the machine on the main thread, where an OS backend must never be
+        // asked (Windows answers through a COM apartment the main thread does not pump).
+        let auth = Arc::new(NamesItsAsker(Mutex::new(Vec::new())));
+        let r = rig(Settings::default(), auth.clone());
+        assert_eq!(
+            r.machine.state(),
+            locked(LockReason::Startup, T0, Some(10), 0),
+            "its answer still decides the start"
+        );
+        let askers = auth.0.lock().unwrap().clone();
+        assert!(!askers.is_empty());
+        assert_ne!(askers[0], thread::current().id(), "asked on this thread");
+    }
 
     #[test]
     fn with_an_authenticator_the_default_settings_start_locked() {
@@ -650,6 +810,74 @@ mod tests {
         };
         r.machine.set_settings(light, |_| Ok(())).unwrap();
         assert_eq!(r.machine.state(), unlocked(T0, None, 0));
+    }
+
+    // 3a. The same rules with the OS's own authenticator: in effect where the OS can verify the
+    // owner, failing closed where it cannot.
+
+    #[test]
+    fn with_an_os_that_can_verify_the_lock_is_in_effect() {
+        let (auth, calls) = os(os_available(), AuthOutcome::Verified);
+        let r = rig(Settings::default(), auth);
+        assert_eq!(
+            r.machine.state(),
+            locked(LockReason::Startup, T0, Some(10), 0)
+        );
+        r.machine.unlock().unwrap();
+        assert!(!r.machine.state().locked);
+        assert!(
+            calls
+                .lock()
+                .unwrap()
+                .contains(&Call::Verify(Action::Unlock)),
+            "{calls:?}"
+        );
+        // Off, it can be switched on again.
+        let off = Settings {
+            lock_enabled: false,
+            ..Settings::default()
+        };
+        let (auth, _) = os(os_available(), AuthOutcome::Verified);
+        let r = rig(off, auth);
+        r.machine
+            .set_settings(Settings::default(), |_| Ok(()))
+            .unwrap();
+        r.machine.lock(LockReason::Manual);
+        assert!(r.machine.state().locked);
+    }
+
+    #[test]
+    fn with_an_os_that_cannot_verify_the_lock_still_fails_closed() {
+        for reason in [
+            UnavailableReason::NotPermittedHere,
+            UnavailableReason::NoPamService,
+            UnavailableReason::NotConfigured,
+        ] {
+            let (auth, _) = os(os_unavailable(reason), AuthOutcome::Unavailable { reason });
+            let r = rig(Settings::default(), auth);
+            assert_eq!(r.machine.state(), unlocked(T0, None, 0), "{reason:?}");
+            r.machine.lock(LockReason::Manual);
+            r.machine.lock(LockReason::OsSession);
+            r.clock.set(T0 + 1000 * MIN);
+            r.machine.tick();
+            assert_eq!(r.machine.state(), unlocked(T0, None, 0), "{reason:?}");
+            assert!(r.hooked.calls().is_empty(), "{reason:?}");
+
+            let (auth, _) = os(os_unavailable(reason), AuthOutcome::Unavailable { reason });
+            let off = Settings {
+                lock_enabled: false,
+                ..Settings::default()
+            };
+            let r = rig(off, auth);
+            let err = r
+                .machine
+                .set_settings(Settings::default(), |_| Ok(()))
+                .unwrap_err();
+            assert!(
+                matches!(err, DesktopError::AuthUnavailable { reason: got } if got == reason),
+                "{err:?}"
+            );
+        }
     }
 
     // 4. Idle.
@@ -1102,6 +1330,213 @@ mod tests {
             .unlock()
             .expect("not busy behind the broken prompt");
         assert!(!r.machine.state().locked);
+    }
+
+    // 5a. The lock screen's own password field.
+
+    #[test]
+    fn the_right_password_unlocks_and_a_wrong_one_is_refused_with_what_pam_said() {
+        let auth = Arc::new(FakeAuthenticator::new().with_password("open sesame"));
+        auth.saying(&["Authentication failure"]);
+        let r = rig(Settings::default(), auth.clone());
+        let refusal = r
+            .machine
+            .unlock_with_password(typed("open sesame!"))
+            .unwrap_err();
+        assert!(
+            matches!(
+                *refusal.error,
+                DesktopError::AuthFailed { exhausted: false }
+            ),
+            "{refusal:?}"
+        );
+        assert_eq!(refusal.messages, ["Authentication failure"]);
+        assert_eq!(
+            r.machine.state(),
+            locked(LockReason::Startup, T0, Some(10), 0)
+        );
+        assert!(r.hooked.calls().is_empty());
+        // The check is over: the next one runs.
+        r.clock.set(T0 + MIN);
+        r.machine
+            .unlock_with_password(typed("open sesame"))
+            .unwrap();
+        let open = unlocked(T0 + MIN, Some(10), 1);
+        assert_eq!(r.machine.state(), open);
+        assert_eq!(r.hooked.calls(), vec![open]);
+        assert_eq!(auth.asked(), vec![AuthPurpose::Unlock, AuthPurpose::Unlock]);
+        // Unlocked, nothing is checked.
+        r.machine.unlock_with_password(typed("guess")).unwrap();
+        assert_eq!(auth.asked().len(), 2);
+    }
+
+    #[test]
+    fn where_the_os_prompts_itself_the_field_unlocks_nothing() {
+        let auth = fake();
+        let r = rig(Settings::default(), auth.clone());
+        let refusal = r
+            .machine
+            .unlock_with_password(typed("anything"))
+            .unwrap_err();
+        assert!(
+            matches!(
+                *refusal.error,
+                DesktopError::AuthUnavailable {
+                    reason: UnavailableReason::NotPermittedHere
+                }
+            ),
+            "{refusal:?}"
+        );
+        assert!(r.machine.state().locked);
+        r.machine.unlock().unwrap();
+        assert!(!r.machine.state().locked, "the slot was given back");
+    }
+
+    #[test]
+    fn a_password_check_and_an_os_prompt_never_run_together() {
+        // The OS's prompt is open: the field is busy, and checks nothing.
+        let (prompt, ends) = HeldPrompt::new();
+        let r = rig(Settings::default(), prompt);
+        let first = unlock_in_background(&r.machine);
+        ends.opened.recv_timeout(LONG).expect("the prompt opened");
+        let second = within("a password unlock", {
+            let machine = r.machine.clone();
+            move || machine.unlock_with_password(typed("pw"))
+        });
+        assert!(
+            matches!(second, Err(ref refusal) if matches!(*refusal.error, DesktopError::AuthBusy)),
+            "{second:?}"
+        );
+        assert!(ends.opened.try_recv().is_err(), "nothing else was asked");
+        ends.answer.send(AuthOutcome::Verified).unwrap();
+        first.recv_timeout(LONG).expect("it returned").unwrap();
+
+        // The field is being checked: the OS's prompt is busy.
+        r.machine.lock(LockReason::Manual);
+        let first = password_unlock_in_background(&r.machine, "pw");
+        ends.opened.recv_timeout(LONG).expect("the check began");
+        let second = within("an unlock", {
+            let machine = r.machine.clone();
+            move || machine.unlock()
+        });
+        assert!(matches!(second, Err(DesktopError::AuthBusy)), "{second:?}");
+        assert!(ends.opened.try_recv().is_err(), "nothing else was asked");
+        ends.answer.send(AuthOutcome::Verified).unwrap();
+        first.recv_timeout(LONG).expect("it returned").unwrap();
+        assert!(!r.machine.state().locked);
+    }
+
+    #[test]
+    fn a_lock_during_the_password_check_refuses_its_yes() {
+        let (prompt, ends) = HeldPrompt::new();
+        let r = rig(Settings::default(), prompt);
+        let checking = password_unlock_in_background(&r.machine, "pw");
+        ends.opened.recv_timeout(LONG).expect("the check began");
+        r.machine.lock(LockReason::OsSession);
+        ends.tripped
+            .recv_timeout(LONG)
+            .expect("the lock cancelled the check");
+        ends.answer.send(AuthOutcome::Verified).unwrap();
+        let result = checking.recv_timeout(LONG).expect("it returned");
+        assert!(
+            matches!(result, Err(DesktopError::AuthCancelled)),
+            "{result:?}"
+        );
+        assert_eq!(
+            r.machine.state(),
+            locked(LockReason::Startup, T0, Some(10), 0)
+        );
+    }
+
+    #[test]
+    fn once_the_quit_closed_the_machine_no_password_is_checked() {
+        let auth = Arc::new(FakeAuthenticator::new().with_password("pw"));
+        let r = rig(Settings::default(), auth.clone());
+        r.machine.close();
+        let refusal = r.machine.unlock_with_password(typed("pw")).unwrap_err();
+        assert!(
+            matches!(*refusal.error, DesktopError::Closing),
+            "{refusal:?}"
+        );
+        assert!(auth.asked().is_empty());
+        assert!(r.machine.state().locked);
+    }
+
+    /// Counts the lock notices it is given.
+    #[derive(Default)]
+    struct CountsLocks {
+        fake: FakeAuthenticator,
+        locks: AtomicUsize,
+    }
+
+    impl Authenticator for CountsLocks {
+        fn info(&self) -> AuthInfo {
+            self.fake.info()
+        }
+
+        fn verify(&self, purpose: &AuthPurpose, cancel: &CancellationToken) -> AuthOutcome {
+            self.fake.verify(purpose, cancel)
+        }
+
+        fn locked(&self) {
+            self.locks.fetch_add(1, SeqCst);
+        }
+    }
+
+    #[test]
+    fn every_lock_tells_the_authenticator_before_the_page_hears_of_it() {
+        let auth = Arc::new(CountsLocks::default());
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let clock = Arc::new(ManualClock::at(T0));
+        let machine = {
+            let (auth, heard) = (auth.clone(), heard.clone());
+            LockMachine::new(
+                unlocked_at_start(),
+                auth.clone(),
+                clock.clone(),
+                Box::new(move |state| {
+                    heard
+                        .lock()
+                        .unwrap()
+                        .push((state.locked, auth.locks.load(SeqCst)));
+                }),
+            )
+        };
+        machine.lock(LockReason::Manual);
+        machine.lock(LockReason::OsSession);
+        machine.unlock().unwrap();
+        clock.set(T0 + 10 * MIN);
+        machine.tick();
+        assert_eq!(auth.locks.load(SeqCst), 2, "a lock each, not the unlock");
+        assert_eq!(
+            *heard.lock().unwrap(),
+            [(true, 1), (false, 1), (true, 2)],
+            "told before the hook ran"
+        );
+    }
+
+    #[test]
+    fn a_panicking_lock_notice_neither_undoes_the_lock_nor_skips_the_hook() {
+        struct Panics;
+        impl Authenticator for Panics {
+            fn info(&self) -> AuthInfo {
+                FakeAuthenticator::new().info()
+            }
+            fn verify(&self, _purpose: &AuthPurpose, _cancel: &CancellationToken) -> AuthOutcome {
+                AuthOutcome::Verified
+            }
+            fn locked(&self) {
+                panic!("the notice broke");
+            }
+        }
+        let r = rig(unlocked_at_start(), Arc::new(Panics));
+        r.machine.lock(LockReason::Manual);
+        assert!(r.machine.state().locked);
+        assert_eq!(r.hooked.calls().len(), 1);
+        assert!(matches!(
+            r.machine.guard("op_list"),
+            Err(DesktopError::Locked)
+        ));
     }
 
     // 6. The hook.

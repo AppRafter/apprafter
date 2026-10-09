@@ -17,6 +17,7 @@ export const COMMANDS = [
   'settings_get',
   'settings_set',
   'unlock',
+  'unlock_with_password',
   'window_ready',
 ] as const;
 
@@ -27,5 +28,6 @@ export const ALLOWED_WHILE_LOCKED = [
   'quit',
   'settings_get',
   'unlock',
+  'unlock_with_password',
   'window_ready',
 ] as const;

@@ -123,6 +123,42 @@ impl DesktopError {
     }
 }
 
+/// An error, with what the OS said on the way to it: PAM's messages from a check of the app's
+/// own password field ("Password expired", "Authentication failure"), never the password. Every
+/// other error says nothing. [`Refusal::to_ui`] carries them to the page as `fields.messages`, a
+/// list of strings, when there are any. The error is boxed, so a `Result` carries a refusal by
+/// pointer.
+#[derive(Debug)]
+pub struct Refusal {
+    pub error: Box<DesktopError>,
+    pub messages: Vec<String>,
+}
+
+impl Refusal {
+    pub fn new(error: DesktopError, messages: Vec<String>) -> Self {
+        Self {
+            error: Box::new(error),
+            messages,
+        }
+    }
+
+    /// The error's own projection ([`DesktopError::to_ui`]), plus `fields.messages`.
+    pub fn to_ui(&self) -> UiError {
+        let mut ui = self.error.to_ui();
+        if !self.messages.is_empty() {
+            ui.fields
+                .insert("messages".into(), serde_json::json!(self.messages));
+        }
+        ui
+    }
+}
+
+impl From<DesktopError> for Refusal {
+    fn from(error: DesktopError) -> Self {
+        Self::new(error, Vec::new())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -131,7 +167,7 @@ mod tests {
     use apprafter_desktop_ipc::{errors, OpId, UnavailableReason};
     use serde_json::json;
 
-    use super::DesktopError;
+    use super::{DesktopError, Refusal};
 
     /// One of each variant. `code_of` below is exhaustive, so a new variant cannot compile
     /// until it has a code here.
@@ -232,6 +268,33 @@ mod tests {
         assert_eq!(ui, expected);
         assert_eq!(ui.code.as_deref(), Some("apprafter::target::not_found"));
         assert_eq!(ui.fields["available"], json!(["prod"]));
+    }
+
+    #[test]
+    fn a_refusal_carries_what_the_os_said_and_otherwise_is_its_error() {
+        let refusal = Refusal::new(
+            DesktopError::AuthFailed { exhausted: false },
+            vec![
+                "Password expired".into(),
+                "Contact your administrator".into(),
+            ],
+        );
+        let ui = refusal.to_ui();
+        assert_eq!(
+            ui.fields["messages"],
+            json!(["Password expired", "Contact your administrator"])
+        );
+        assert_eq!(
+            ui.fields["exhausted"],
+            json!(false),
+            "the error's own fields stay"
+        );
+        assert_eq!(ui.code, refusal.error.to_ui().code);
+        // Nothing said: exactly the error's projection, no empty list.
+        for error in [DesktopError::AuthCancelled, DesktopError::AuthBusy] {
+            let expected = error.to_ui();
+            assert_eq!(Refusal::from(error).to_ui(), expected);
+        }
     }
 
     #[test]

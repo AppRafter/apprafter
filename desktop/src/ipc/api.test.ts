@@ -54,6 +54,11 @@ describe('each function sends its command with camelCase arguments', () => {
     lockStatus: [() => api.lockStatus(), 'lock_status', {}],
     lockNow: [() => api.lockNow(), 'lock_now', {}],
     unlock: [() => api.unlock(), 'unlock', {}],
+    unlockWithPassword: [
+      () => api.unlockWithPassword('open sesame'),
+      'unlock_with_password',
+      { password: 'open sesame' },
+    ],
     activity: [() => api.activity(), 'activity', {}],
     quit: [() => api.quit(), 'quit', {}],
     opList: [() => api.opList(), 'op_list', {}],
@@ -85,6 +90,17 @@ describe('each function sends its command with camelCase arguments', () => {
       await run();
       expect(calls, name).toEqual([{ cmd, args }]);
     }
+  });
+
+  test("op_execute sends the confirm dialog's password only when there is one", async () => {
+    const channel = new Channel<OpEvent>();
+    await api.opExecute(7, channel, 'open sesame');
+    await api.opExecute(7, channel);
+    expect(calls.map((c) => c.args)).toEqual([
+      { opId: 7, onEvent: channel, password: 'open sesame' },
+      { opId: 7, onEvent: channel },
+    ]);
+    expect(Object.keys(calls[1]?.args as object)).not.toContain('password');
   });
 });
 

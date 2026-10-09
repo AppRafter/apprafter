@@ -24,7 +24,7 @@ use apprafter_core::{CoreError, Outcome, PlanClass};
 use apprafter_desktop::app;
 use apprafter_desktop::ops::{Executor, PlanParts};
 use apprafter_desktop_ipc::{errors, Settings, Theme, ALLOWED_WHILE_LOCKED, COMMANDS, QUITTING};
-use common::{code, invoke, lock_off, rig};
+use common::{code, invoke, lock_off, rig, PAM_SAYS, PASSWORD};
 use serde_json::{json, Value};
 use tauri::Listener;
 
@@ -314,5 +314,82 @@ fn unlocked_by_a_verified_owner_the_same_calls_answer() {
         code(&reply),
         Some(errors::LOCKED),
         "locked again: {reply:?}"
+    );
+}
+
+/// The lock screen's own password field: allowed while locked, it unlocks with the right
+/// password; a wrong one is refused with what the OS said, and the password itself is in no
+/// answer.
+#[test]
+fn the_password_field_unlocks_with_the_right_password_and_says_why_not_otherwise() {
+    let rig = rig(Settings::default());
+    let reply = invoke(&rig, "unlock_with_password", json!({ "password": "guess" }));
+    assert_eq!(code(&reply), Some(errors::AUTH_FAILED), "{reply:?}");
+    let error = reply.unwrap_err();
+    assert_eq!(error["fields"]["messages"], json!([PAM_SAYS]));
+    assert!(!error.to_string().contains("guess"), "{error}");
+    let still = invoke(&rig, "op_list", json!({}));
+    assert_eq!(
+        code(&still),
+        Some(errors::LOCKED),
+        "still locked: {still:?}"
+    );
+
+    let state = invoke(
+        &rig,
+        "unlock_with_password",
+        json!({ "password": PASSWORD }),
+    )
+    .unwrap();
+    assert_eq!(state["locked"], false, "{state}");
+    assert!(!state.to_string().contains(PASSWORD), "{state}");
+    assert_eq!(rig.auth.1.load(SeqCst), 2, "the field was checked twice");
+    assert_eq!(rig.auth.0.load(SeqCst), 0, "the OS's prompt never opened");
+    assert_eq!(invoke(&rig, "op_list", json!({})).unwrap(), json!([]));
+}
+
+/// `op_execute`'s `password` is the confirm dialog's own field: sent, the gesture checks it;
+/// left out or null, the gesture is the OS's prompt.
+#[test]
+fn op_execute_checks_the_confirm_dialog_s_password_when_the_page_sends_one() {
+    let rig = rig(lock_off());
+    let destructive = || {
+        rig.shell
+            .ops
+            .register_plan(
+                PlanParts::new(PlanClass::Destructive, "Remove target prod", "delete"),
+                Box::new(|_, _| Ok(Outcome::Completed { result: json!(0) })),
+            )
+            .op_id
+    };
+    let with = invoke(
+        &rig,
+        "op_execute",
+        json!({ "opId": destructive(), "onEvent": "__CHANNEL__:7", "password": PASSWORD }),
+    );
+    assert!(with.is_ok(), "{with:?}");
+    assert_eq!(
+        (rig.auth.0.load(SeqCst), rig.auth.1.load(SeqCst)),
+        (0, 1),
+        "the field, not the prompt"
+    );
+    let wrong = invoke(
+        &rig,
+        "op_execute",
+        json!({ "opId": destructive(), "onEvent": "__CHANNEL__:8", "password": "guess" }),
+    );
+    assert_eq!(code(&wrong), Some(errors::AUTH_FAILED), "{wrong:?}");
+    assert_eq!(wrong.unwrap_err()["fields"]["messages"], json!([PAM_SAYS]));
+    for args in [
+        json!({ "opId": destructive(), "onEvent": "__CHANNEL__:9" }),
+        json!({ "opId": destructive(), "onEvent": "__CHANNEL__:10", "password": null }),
+    ] {
+        let reply = invoke(&rig, "op_execute", args.clone());
+        assert!(reply.is_ok(), "{args}: {reply:?}");
+    }
+    assert_eq!(
+        (rig.auth.0.load(SeqCst), rig.auth.1.load(SeqCst)),
+        (2, 2),
+        "no password: the OS's prompt"
     );
 }

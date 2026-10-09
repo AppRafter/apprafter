@@ -132,10 +132,10 @@ pub fn show_and_focus(app: &tauri::AppHandle) {
     }
 }
 
-/// Build the main window. `data_dir` is the data-directory override, prepared
+/// Build the main window, and return it. `data_dir` is the data-directory override, prepared
 /// ([`env::prepare_data_dir`](crate::env::prepare_data_dir)); on macOS it picks the webview's
 /// store (see the module docs), elsewhere the app's directories already carry it.
-pub fn build_main(app: &tauri::AppHandle, data_dir: Option<&Path>) -> tauri::Result<()> {
+pub fn build_main(app: &tauri::AppHandle, data_dir: Option<&Path>) -> tauri::Result<WebviewWindow> {
     let debug = cfg!(debug_assertions);
     let window = WebviewWindowBuilder::new(app, MAIN, WebviewUrl::App("index.html".into()))
         .title("AppRafter")
@@ -168,9 +168,9 @@ pub fn build_main(app: &tauri::AppHandle, data_dir: Option<&Path>) -> tauri::Res
     };
     #[cfg(not(target_os = "macos"))]
     let _ = data_dir;
-    window.build()?;
+    let window = window.build()?;
     reveal_later(app, REVEAL_FALLBACK, "within 5s of the window opening");
-    Ok(())
+    Ok(window)
 }
 
 #[cfg(test)]

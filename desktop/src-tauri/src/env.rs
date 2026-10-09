@@ -13,7 +13,9 @@
 //!   instance ([`instance_identifier`]). It fails closed: set but empty or not Unicode, the app
 //!   refuses to start rather than fall back on the owner's own files;
 //! - in a test build only (cargo feature `test-build`), `APPRAFTER_HCLOUD_BASE_URL`, which the
-//!   core then accepts only as a loopback `http://` URL ([`desktop_context`]);
+//!   core then accepts only as a loopback `http://` URL ([`desktop_context`]), and
+//!   `APPRAFTER_DESKTOP_TEST_PASSWORD`, the password the fake authenticator's own field accepts,
+//!   so a walk can use the lock screen's password field ([`crate::auth::choice`]);
 //!
 //! and `None` for every other name, however it is set. [`AllowListEnv::from_process`] is the one
 //! place in `src/` that reads `std::env`: `tests/env_guard.rs` fails on any other.
@@ -29,6 +31,10 @@ use cli_core::CONFIG_DIR_ENV;
 
 /// Points the desktop's own files (settings, logs) at another directory.
 pub const DATA_DIR_ENV: &str = "APPRAFTER_DESKTOP_DATA_DIR";
+
+/// A test build's fake authenticator gets a password field accepting this password. Never read
+/// in a release: no owner's password is ever in the environment.
+pub const TEST_PASSWORD_ENV: &str = "APPRAFTER_DESKTOP_TEST_PASSWORD";
 
 /// How an [`AllowListEnv`] reads a name it allows: the raw value, as the OS holds it.
 type Lookup = dyn Fn(&str) -> Option<OsString> + Send + Sync;
@@ -62,8 +68,9 @@ impl AllowListEnv {
         }
     }
 
-    /// Whether this is a test build's view: it then also answers `APPRAFTER_HCLOUD_BASE_URL`, and
-    /// [`desktop_context`] builds under [`DesktopPolicy::TEST_BUILD`].
+    /// Whether this is a test build's view: it then also answers `APPRAFTER_HCLOUD_BASE_URL` and
+    /// `APPRAFTER_DESKTOP_TEST_PASSWORD`, and [`desktop_context`] builds under
+    /// [`DesktopPolicy::TEST_BUILD`].
     pub fn test_build(&self) -> bool {
         self.test_build
     }
@@ -82,7 +89,7 @@ impl AllowListEnv {
     pub fn allows(&self, key: &str) -> bool {
         key == CONFIG_DIR_ENV
             || key == DATA_DIR_ENV
-            || (self.test_build && key == HCLOUD_BASE_URL_ENV)
+            || (self.test_build && (key == HCLOUD_BASE_URL_ENV || key == TEST_PASSWORD_ENV))
     }
 
     fn policy(&self) -> DesktopPolicy {
@@ -231,12 +238,13 @@ mod tests {
 
     use super::*;
 
-    /// Everything a terminal might hand the app: the three names on the list and some it must
+    /// Everything a terminal might hand the app: the four names on the list and some it must
     /// never see.
     const AMBIENT: &[(&str, &str)] = &[
         ("APPRAFTER_CONFIG_DIR", "/tmp/store"),
         ("APPRAFTER_DESKTOP_DATA_DIR", "/tmp/walk"),
         ("APPRAFTER_HCLOUD_BASE_URL", "http://127.0.0.1:9"),
+        ("APPRAFTER_DESKTOP_TEST_PASSWORD", "open sesame"),
         ("HCLOUD_TOKEN", "inherited-token"),
         ("APPRAFTER_AGE_KEY", "/tmp/age.key"),
         ("APPRAFTER_SSH_PRIVATE_KEY", "/tmp/id"),
@@ -271,12 +279,15 @@ mod tests {
     }
 
     #[test]
-    fn a_test_build_also_answers_the_api_base_and_nothing_else() {
+    fn a_test_build_also_answers_the_api_base_and_the_test_password_and_nothing_else() {
         let env = env_of(true, AMBIENT);
         for (key, value) in AMBIENT {
             let expected = matches!(
                 *key,
-                "APPRAFTER_CONFIG_DIR" | "APPRAFTER_DESKTOP_DATA_DIR" | "APPRAFTER_HCLOUD_BASE_URL"
+                "APPRAFTER_CONFIG_DIR"
+                    | "APPRAFTER_DESKTOP_DATA_DIR"
+                    | "APPRAFTER_HCLOUD_BASE_URL"
+                    | "APPRAFTER_DESKTOP_TEST_PASSWORD"
             )
             .then(|| value.to_string());
             assert_eq!(env.var(key), expected, "{key}");
@@ -305,7 +316,10 @@ mod tests {
             );
             let mut expected = vec!["APPRAFTER_CONFIG_DIR", "APPRAFTER_DESKTOP_DATA_DIR"];
             if test_build {
-                expected.push("APPRAFTER_HCLOUD_BASE_URL");
+                expected.extend([
+                    "APPRAFTER_DESKTOP_TEST_PASSWORD",
+                    "APPRAFTER_HCLOUD_BASE_URL",
+                ]);
             }
             let mut asked_sorted = asked;
             asked_sorted.sort();
@@ -327,6 +341,10 @@ mod tests {
                 .then(|| std::env::var(HCLOUD_BASE_URL_ENV).ok())
                 .flatten();
             assert_eq!(env.var(HCLOUD_BASE_URL_ENV), base);
+            let password = test_build
+                .then(|| std::env::var(TEST_PASSWORD_ENV).ok())
+                .flatten();
+            assert_eq!(env.var(TEST_PASSWORD_ENV), password);
             assert!(std::env::var_os("PATH").is_some());
             assert_eq!(env.var("PATH"), None);
             assert_eq!(env.var("HCLOUD_TOKEN"), None);
@@ -350,6 +368,7 @@ mod tests {
         assert_eq!(CONFIG_DIR_ENV, "APPRAFTER_CONFIG_DIR");
         assert_eq!(HCLOUD_BASE_URL_ENV, "APPRAFTER_HCLOUD_BASE_URL");
         assert_eq!(DATA_DIR_ENV, "APPRAFTER_DESKTOP_DATA_DIR");
+        assert_eq!(TEST_PASSWORD_ENV, "APPRAFTER_DESKTOP_TEST_PASSWORD");
     }
 
     /// The API base a context gets when nothing redirects it.

@@ -49,6 +49,9 @@
     "allow-lock-now",
     // The lock screen's unlock button: Rust asks the OS for the owner.
     "allow-unlock",
+    // The lock screen's own password field, where the OS cannot prompt (Linux's PAM path);
+    // answered while locked, by the same rules as unlock.
+    "allow-unlock-with-password",
     // Throttled pings that restart the idle time.
     "allow-activity",
     // The app menu's Quit: cancels running operations, waits, exits.
