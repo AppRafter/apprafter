@@ -562,6 +562,15 @@ pub const SERVER_TYPES: &str = r#"{"server_types":[
              {"location":"fsn1","price_monthly":{"net":"6.8000","gross":"8.0920"},"price_hourly":{"net":"0.0109","gross":"0.0130"}}]}
 ],"meta":{"pagination":{"next_page":null}}}"#;
 
+/// `state.json` of a target whose server Hetzner knows as 42.
+pub const PROVISIONED_STATE: &str =
+    r#"{"hetzner_cloud":{"server_id":42,"server_name":"prod-node","server_type":"cx22"}}"#;
+/// `GET /v1/servers` today's `target ip` reads (the list; Task 16 moves to `/v1/servers/42`).
+pub const SERVERS_WITH_42: &str = r#"{"servers":[{"id":42,"name":"prod-node","status":"running","labels":{},"public_net":{"ipv4":{"ip":"203.0.113.10"},"ipv6":{"ip":"2001:db8:1::/64"}}}]}"#;
+pub const SERVERS_EMPTY: &str = r#"{"servers":[]}"#;
+pub const SERVER_NOT_FOUND: &str =
+    r#"{"error":{"code":"not_found","message":"server with ID '42' not found"}}"#;
+
 /// A JSON `GET path` route that answers only requests carrying
 /// `Bearer {token}`; not yet created, so a case can add expectations.
 pub fn json_route(

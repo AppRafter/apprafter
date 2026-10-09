@@ -1,0 +1,21 @@
+$ apprafter target machine --target staging --server-type cx32
+[exit 0]
+[stdout]
+server type set to `cx32` on target `staging` (validated against Hetzner Cloud for region `nbg1`)
+[stderr]
+$ apprafter target show staging
+[exit 0]
+[stdout]
+Target: staging
+  Provider:    hetzner-cloud
+  Region:      nbg1
+  Server type: cx32
+  Default tier: solo
+  Cluster name: not set
+  SSH key:     <SANDBOX>/home/id_ed25519.pub
+  Hetzner token: set (64 chars; read credentials.yaml for the raw value)
+
+Config:      <SANDBOX>/apprafter-config/targets/staging/config.yaml
+Credentials: <SANDBOX>/apprafter-config/targets/staging/credentials.yaml (mode 0600)
+[stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m target show invoked <ESC>[3mtarget<ESC>[0m<ESC>[2m=<ESC>[0mstaging

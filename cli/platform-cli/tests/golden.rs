@@ -870,3 +870,567 @@ fn status_with_no_target() {
 fn app_list_with_no_target() {
     Sandbox::new().golden("resolve/app_list_no_target", &["app", "list"]);
 }
+
+// ---------------------------------------------------------------------
+// target family — D.3 baselines
+//
+// Recorded on the binary as it was before D.3 moved any of these paths
+// onto `apprafter-core`, bugs included: every later change to one of
+// these files is deliberate and reviewed in its own commit.
+// ---------------------------------------------------------------------
+
+/// Two targets (`prod` active, then `staging`) and a pointer naming
+/// `gone`, which has no target directory.
+fn dangling_pointer_sandbox() -> Sandbox {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.add_target("staging");
+    sb.seed_pointer("gone");
+    sb
+}
+
+#[test]
+fn target_list_with_a_dangling_pointer() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.add_target("staging");
+    sb.seed_pointer("gone");
+    sb.golden("target/list_dangling", &["target", "list"]);
+}
+
+#[test]
+fn target_show_with_a_dangling_pointer() {
+    dangling_pointer_sandbox().golden("target/show_dangling", &["target", "show"]);
+}
+
+#[test]
+fn target_use_with_a_dangling_pointer() {
+    dangling_pointer_sandbox().golden_steps(
+        "target/use_dangling",
+        &[&["target", "use", "prod"], &["target", "list"]],
+    );
+}
+
+#[test]
+fn target_remove_with_a_dangling_pointer() {
+    dangling_pointer_sandbox().golden_steps(
+        "target/remove_dangling",
+        &[&["target", "remove", "prod", "--yes"], &["target", "list"]],
+    );
+}
+
+#[test]
+fn target_machine_with_a_dangling_pointer() {
+    dangling_pointer_sandbox().golden(
+        "target/machine_dangling",
+        &["target", "machine", "--server-type", "cx32", "--no-ping"],
+    );
+}
+
+#[test]
+fn whoami_with_a_dangling_pointer() {
+    dangling_pointer_sandbox().golden("session/whoami_dangling", &["whoami", "--no-ping"]);
+}
+
+#[test]
+fn target_ip_with_a_dangling_pointer() {
+    dangling_pointer_sandbox().golden("target/ip_dangling", &["target", "ip"]);
+}
+
+#[test]
+fn target_use_without_a_config_file() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.clear_pointer();
+    sb.golden_steps(
+        "target/use_no_config",
+        &[&["target", "use", "prod"], &["target", "list"]],
+    );
+}
+
+#[test]
+fn target_use_of_the_active_target() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.golden("target/use_already_active", &["target", "use", "prod"]);
+}
+
+#[test]
+fn target_add_with_the_token_from_the_environment() {
+    let sb = Sandbox::new().with_env("HCLOUD_TOKEN", TOKEN_A);
+    let key = sb.ssh_key();
+    sb.golden_steps(
+        "target/add_env_token",
+        &[
+            &[
+                "target",
+                "add",
+                "prod",
+                "--provider",
+                "hetzner-cloud",
+                "--ssh-key",
+                &key,
+                "--no-ping",
+                "--no-interactive",
+            ],
+            &["target", "show"],
+        ],
+    );
+}
+
+#[test]
+fn target_add_with_the_api_unreachable() {
+    let sb = Sandbox::new();
+    let key = sb.ssh_key();
+    sb.golden(
+        "target/add_api_unreachable",
+        &[
+            "target",
+            "add",
+            "prod",
+            "--provider",
+            "hetzner-cloud",
+            "--token",
+            TOKEN_A,
+            "--ssh-key",
+            &key,
+            "--no-interactive",
+        ],
+    );
+}
+
+#[test]
+fn target_add_with_a_malformed_token() {
+    Sandbox::new().golden(
+        "target/add_malformed_token",
+        &[
+            "target",
+            "add",
+            "prod",
+            "--provider",
+            "hetzner-cloud",
+            "--token",
+            "short",
+            "--no-ping",
+            "--no-interactive",
+        ],
+    );
+}
+
+#[test]
+fn target_add_with_an_unknown_provider() {
+    Sandbox::new().golden(
+        "target/add_unknown_provider",
+        &[
+            "target",
+            "add",
+            "prod",
+            "--provider",
+            "aws",
+            "--token",
+            TOKEN_A,
+            "--no-ping",
+            "--no-interactive",
+        ],
+    );
+}
+
+#[test]
+fn target_add_with_a_missing_ssh_key() {
+    let sb = Sandbox::new();
+    let missing = sb.path("home/missing.pub").display().to_string();
+    sb.golden(
+        "target/add_missing_ssh_key",
+        &[
+            "target",
+            "add",
+            "prod",
+            "--provider",
+            "hetzner-cloud",
+            "--token",
+            TOKEN_A,
+            "--ssh-key",
+            &missing,
+            "--no-ping",
+            "--no-interactive",
+        ],
+    );
+}
+
+#[test]
+fn target_add_server_type_without_a_region() {
+    let mut server = mockito::Server::new();
+    let _loc = json_mock(&mut server, "/v1/locations", 200, LOCATIONS_OK, TOKEN_A);
+    let _st = json_mock(&mut server, "/v1/server_types", 200, SERVER_TYPES, TOKEN_A);
+    let sb = Sandbox::new().with_hcloud(server.url());
+    let key = sb.ssh_key();
+    sb.golden_steps(
+        "target/add_server_type_default_region",
+        &[
+            &[
+                "target",
+                "add",
+                "prod",
+                "--provider",
+                "hetzner-cloud",
+                "--token",
+                TOKEN_A,
+                "--ssh-key",
+                &key,
+                "--server-type",
+                "cx32",
+                "--no-interactive",
+            ],
+            &["target", "show"],
+        ],
+    );
+}
+
+#[test]
+fn target_add_force_on_an_inactive_target() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.add_target("staging");
+    sb.golden_steps(
+        "target/add_force_inactive",
+        &[
+            &[
+                "target",
+                "add",
+                "staging",
+                "--force",
+                "--provider",
+                "hetzner-cloud",
+                "--token",
+                TOKEN_B,
+                "--no-ping",
+                "--no-interactive",
+            ],
+            &["target", "show", "staging"],
+        ],
+    );
+}
+
+#[test]
+fn target_add_force_drops_a_seeded_firewall_toggle() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.seed_config(
+        "prod",
+        "provider: hetzner-cloud\nregion: nbg1\ndefault_tier: solo\nfirewall:\n  cloudflare_origin: true\n",
+    );
+    sb.golden_with_files(
+        "target/add_force_firewall",
+        &[&[
+            "target",
+            "add",
+            "prod",
+            "--force",
+            "--provider",
+            "hetzner-cloud",
+            "--token",
+            TOKEN_B,
+            "--no-ping",
+            "--no-interactive",
+        ]],
+        &["targets/prod/config.yaml"],
+    );
+}
+
+#[test]
+fn target_add_force_region_on_a_provisioned_target() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.seed_state("prod", PROVISIONED_STATE);
+    sb.golden_with_files(
+        "target/add_force_provisioned",
+        &[
+            &[
+                "target",
+                "add",
+                "prod",
+                "--force",
+                "--provider",
+                "hetzner-cloud",
+                "--token",
+                TOKEN_B,
+                "--region",
+                "hel1",
+                "--no-ping",
+                "--no-interactive",
+            ],
+            &["target", "show"],
+        ],
+        &[
+            "targets/prod/config.yaml",
+            "state/prod/.apprafter/state.json",
+        ],
+    );
+}
+
+#[test]
+fn target_renew_with_a_verified_token() {
+    let mut server = mockito::Server::new();
+    let _loc = json_mock(&mut server, "/v1/locations", 200, LOCATIONS_OK, TOKEN_B);
+    let sb = Sandbox::new().with_hcloud(server.url());
+    sb.add_target("prod");
+    sb.golden(
+        "target/renew_ping_ok",
+        &[
+            "target",
+            "add",
+            "prod",
+            "--renew",
+            "--token",
+            TOKEN_B,
+            "--no-interactive",
+        ],
+    );
+}
+
+#[test]
+fn target_renew_with_a_rejected_token() {
+    let mut server = mockito::Server::new();
+    let _loc = json_mock(&mut server, "/v1/locations", 401, UNAUTHORIZED, TOKEN_B);
+    let sb = Sandbox::new().with_hcloud(server.url());
+    sb.add_target("prod");
+    sb.golden(
+        "target/renew_ping_rejected",
+        &[
+            "target",
+            "add",
+            "prod",
+            "--renew",
+            "--token",
+            TOKEN_B,
+            "--no-interactive",
+        ],
+    );
+}
+
+#[test]
+fn target_renew_of_a_missing_target() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.golden(
+        "target/renew_missing",
+        &[
+            "target",
+            "add",
+            "ghost",
+            "--renew",
+            "--token",
+            TOKEN_B,
+            "--no-ping",
+            "--no-interactive",
+        ],
+    );
+}
+
+#[test]
+fn target_renew_with_config_flags() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.golden(
+        "target/renew_config_flags",
+        &[
+            "target",
+            "add",
+            "prod",
+            "--renew",
+            "--token",
+            TOKEN_B,
+            "--region",
+            "hel1",
+            "--no-ping",
+            "--no-interactive",
+        ],
+    );
+}
+
+#[test]
+fn target_renew_with_a_server_type() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.golden_steps(
+        "target/renew_server_type",
+        &[
+            &[
+                "target",
+                "add",
+                "prod",
+                "--renew",
+                "--token",
+                TOKEN_B,
+                "--server-type",
+                "cx32",
+                "--no-ping",
+                "--no-interactive",
+            ],
+            &["target", "show"],
+        ],
+    );
+}
+
+#[test]
+fn target_rename_to_an_existing_name() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.add_target("staging");
+    sb.golden(
+        "target/rename_to_existing",
+        &["target", "rename", "prod", "staging"],
+    );
+}
+
+#[test]
+fn target_rename_to_an_invalid_name() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.golden(
+        "target/rename_invalid",
+        &["target", "rename", "prod", "bad.name"],
+    );
+}
+
+#[test]
+fn target_rename_to_the_same_name() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.golden(
+        "target/rename_identical",
+        &["target", "rename", "prod", "prod"],
+    );
+}
+
+#[test]
+fn target_remove_of_a_provisioned_target() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.seed_state("prod", PROVISIONED_STATE);
+    sb.golden_with_files(
+        "target/remove_provisioned",
+        &[&["target", "remove", "prod", "--yes"]],
+        &["state/prod/.apprafter/state.json"],
+    );
+}
+
+#[test]
+fn target_show_of_a_provisioned_target() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.seed_state("prod", PROVISIONED_STATE);
+    sb.golden("target/show_provisioned", &["target", "show"]);
+}
+
+#[test]
+fn target_machine_on_a_provisioned_target() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.seed_state("prod", PROVISIONED_STATE);
+    sb.golden(
+        "target/machine_provisioned",
+        &["target", "machine", "--server-type", "cx32", "--no-ping"],
+    );
+}
+
+#[test]
+fn target_machine_no_ping_without_a_server_type() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.golden(
+        "target/machine_no_ping_no_sku",
+        &["target", "machine", "--no-ping"],
+    );
+}
+
+#[test]
+fn target_machine_without_a_tty_or_a_server_type() {
+    // stdin is null under `output()`: not a TTY.
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.golden("target/machine_non_tty_no_sku", &["target", "machine"]);
+}
+
+#[test]
+fn target_machine_of_a_non_active_target() {
+    let mut server = mockito::Server::new();
+    let _st = json_mock(&mut server, "/v1/server_types", 200, SERVER_TYPES, TOKEN_A);
+    let sb = Sandbox::new().with_hcloud(server.url());
+    sb.add_target("prod");
+    sb.add_target("staging");
+    sb.golden_steps(
+        "target/machine_other_target",
+        &[
+            &[
+                "target",
+                "machine",
+                "--target",
+                "staging",
+                "--server-type",
+                "cx32",
+            ],
+            &["target", "show", "staging"],
+        ],
+    );
+}
+
+#[test]
+fn target_machine_with_the_token_from_the_environment() {
+    // The mock answers only TOKEN_B (the environment's); the stored
+    // token is TOKEN_A.
+    let mut server = mockito::Server::new();
+    let _st = json_mock(&mut server, "/v1/server_types", 200, SERVER_TYPES, TOKEN_B);
+    let sb = Sandbox::new()
+        .with_hcloud(server.url())
+        .with_env("HCLOUD_TOKEN", TOKEN_B);
+    sb.add_target("prod");
+    sb.golden(
+        "target/machine_env_token",
+        &["target", "machine", "--server-type", "cx32"],
+    );
+}
+
+#[test]
+fn target_ip_with_a_server() {
+    let mut server = mockito::Server::new();
+    let _list = json_mock(&mut server, "/v1/servers", 200, SERVERS_WITH_42, TOKEN_A);
+    let sb = Sandbox::new().with_hcloud(server.url());
+    sb.add_target("prod");
+    sb.seed_state("prod", PROVISIONED_STATE);
+    sb.golden("target/ip_with_server", &["target", "ip"]);
+}
+
+#[test]
+fn target_ip_with_the_server_absent() {
+    let mut server = mockito::Server::new();
+    let _list = json_mock(&mut server, "/v1/servers", 200, SERVERS_EMPTY, TOKEN_A);
+    let sb = Sandbox::new().with_hcloud(server.url());
+    sb.add_target("prod");
+    sb.seed_state("prod", PROVISIONED_STATE);
+    sb.golden("target/ip_server_absent", &["target", "ip"]);
+}
+
+#[test]
+fn target_ip_without_a_stored_token() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.seed_state("prod", PROVISIONED_STATE);
+    sb.seed_store_file("targets/prod/credentials.yaml", "{}\n");
+    sb.golden("target/ip_no_token", &["target", "ip"]);
+}
+
+#[test]
+fn whoami_with_the_api_unreachable() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.golden("session/whoami_unreachable", &["whoami"]);
+}
+
+#[test]
+fn whoami_with_the_ssh_key_file_missing() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    fs::remove_file(sb.path("home/id_ed25519.pub")).expect("remove the ssh key");
+    sb.golden("session/whoami_ssh_key_missing", &["whoami", "--no-ping"]);
+}

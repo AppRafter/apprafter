@@ -1,0 +1,16 @@
+$ apprafter whoami --no-ping
+[exit 1]
+[stdout]
+Identity:     anonymous (self-hosted mode)
+[stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m whoami invoked <ESC>[3mno_ping<ESC>[0m<ESC>[2m=<ESC>[0mtrue
+Error: apprafter::target::not_found
+
+  × target `gone` not found (available: prod, staging)
+  help: Either the `--target` flag was given a name that's not in the store,
+        or no target has been created yet. List existing targets with
+        `apprafter target list`; create a new one with `apprafter target add
+        <name> --provider hetzner-cloud …`. If the store is empty (`available:
+        ` shows nothing), this is your first run — start with `apprafter
+        target add`.
+

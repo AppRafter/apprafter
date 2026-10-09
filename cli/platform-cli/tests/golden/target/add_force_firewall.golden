@@ -1,0 +1,14 @@
+$ apprafter target add prod --force --provider hetzner-cloud --token bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb --no-ping --no-interactive
+[exit 0]
+[stdout]
+target `prod` saved (active target unchanged — use `apprafter target use prod` to switch) (token NOT verified against the API — `--no-ping` was passed)
+[stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m target add invoked <ESC>[3mtarget<ESC>[0m<ESC>[2m=<ESC>[0mprod <ESC>[3mrenew<ESC>[0m<ESC>[2m=<ESC>[0mfalse <ESC>[3mforce<ESC>[0m<ESC>[2m=<ESC>[0mtrue
+[file targets/prod/config.yaml]
+provider: hetzner-cloud
+region: null
+default_tier: null
+cluster_name: null
+ssh_key_path: null
+firewall: null
+server_type: null

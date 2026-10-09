@@ -1,0 +1,8 @@
+$ apprafter target ip
+[exit 0]
+[stdout]
+  (no IPv4 reported by Hetzner)
+
+Set these as your domain's DNS records (proxied through Cloudflare), then:
+  apprafter target domain add <zone> --cert <name>
+[stderr]

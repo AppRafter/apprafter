@@ -1,0 +1,9 @@
+$ apprafter target ip
+[exit 0]
+[stdout]
+  A    record → 203.0.113.10
+  AAAA record → 2001:db8:1::1
+
+Set these as your domain's DNS records (proxied through Cloudflare), then:
+  apprafter target domain add <zone> --cert <name>
+[stderr]

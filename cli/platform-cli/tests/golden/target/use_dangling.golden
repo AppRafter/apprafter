@@ -1,0 +1,19 @@
+$ apprafter target use prod
+[exit 0]
+[stdout]
+active target switched: `gone` → `prod`
+[stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m target use invoked <ESC>[3mtarget<ESC>[0m<ESC>[2m=<ESC>[0mprod
+$ apprafter target list
+[exit 0]
+[stdout]
+┌────────┬─────────┬───────────────┬────────┬──────┐
+│ Active │ Name    │ Provider      │ Region │ Tier │
+├────────┼─────────┼───────────────┼────────┼──────┤
+│ *      │ prod    │ hetzner-cloud │ nbg1   │ solo │
+│        │ staging │ hetzner-cloud │ nbg1   │ solo │
+└────────┴─────────┴───────────────┴────────┴──────┘
+
+2 targets configured. Active: 'prod'.
+[stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m target list invoked

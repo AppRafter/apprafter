@@ -1,0 +1,7 @@
+$ apprafter target remove prod --yes
+[exit 0]
+[stdout]
+target `prod` removed; no targets left, active pointer cleared
+[stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m target remove invoked <ESC>[3mtarget<ESC>[0m<ESC>[2m=<ESC>[0mprod <ESC>[3myes<ESC>[0m<ESC>[2m=<ESC>[0mtrue
+[file state/prod/.apprafter/state.json: absent]
