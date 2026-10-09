@@ -119,6 +119,9 @@ fn doctor_renders_target_and_env_checks_with_summary() {
         .env("APPRAFTER_CONFIG_DIR", dir.path())
         .env("APPRAFTER_NO_PING", "1")
         .env("PATH", tools.path())
+        // Pins the production host: the DNS row names the host of the
+        // configured API base, so an inherited override would move it.
+        .env_remove("APPRAFTER_HCLOUD_BASE_URL")
         .arg("doctor")
         .assert()
         .success()
@@ -142,6 +145,20 @@ fn doctor_renders_target_and_env_checks_with_summary() {
         // Summary line includes both the target name and the
         // overall verdict.
         .stdout(contains("checks for target `default`"));
+}
+
+#[test]
+fn doctor_resolves_the_host_of_the_configured_api_base() {
+    let dir = tempfile::tempdir().unwrap();
+    cli()
+        .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_SKIP_STARTUP_CHECKS", "1")
+        .env("APPRAFTER_HCLOUD_BASE_URL", "http://127.0.0.1:1")
+        .env("KUBECONFIG", "/nonexistent")
+        .arg("doctor")
+        .assert()
+        .stdout(contains("DNS resolves `127.0.0.1`"))
+        .stdout(contains("api.hetzner.cloud").not());
 }
 
 #[test]

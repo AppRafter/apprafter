@@ -182,7 +182,7 @@ pub fn run(target_override: Option<&str>, no_ping: bool) -> Result<()> {
     // docstring names, learned nothing about kubectl, helm, ssh or DNS.
     // These checks depend on no target, so nothing about a target can
     // gate them.
-    report.env_checks = build_env_checks();
+    report.env_checks = build_env_checks(&hcloud_base_url());
 
     match resolved {
         Some(name) => {
@@ -407,10 +407,31 @@ fn check_ssh_key(target: &Target) -> Check {
 /// Derived rather than hand-listed on purpose: D11 found `restic` with
 /// eight spawn sites, fatal on every one, and named in no checked list —
 /// and `git` likewise. A hand-written list is a second place to forget.
-fn build_env_checks() -> Vec<Check> {
+fn build_env_checks(api_base: &str) -> Vec<Check> {
     let mut checks: Vec<Check> = cli_core::tools::ALL.iter().map(check_tool).collect();
-    checks.push(check_dns_resolves("api.hetzner.cloud"));
+    checks.push(check_dns_resolves(api_host(api_base)));
     checks
+}
+
+/// The host doctor's DNS check resolves when the API base names none.
+const DEFAULT_API_HOST: &str = "api.hetzner.cloud";
+
+/// The host of `base_url`: `api.hetzner.cloud` in production, the mock's address under
+/// `APPRAFTER_HCLOUD_BASE_URL` (tests, walks) — so a doctor run in a sandbox never asks the
+/// real resolver about the real API.
+fn api_host(base_url: &str) -> &str {
+    let rest = base_url.split_once("://").map_or(base_url, |(_, r)| r);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = match host_port.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(""),
+        None => host_port.split(':').next().unwrap_or(""),
+    };
+    if host.is_empty() {
+        DEFAULT_API_HOST
+    } else {
+        host
+    }
 }
 
 /// Probe for a binary on PATH.
@@ -476,7 +497,12 @@ fn first_nonempty_line(o: &Output) -> Option<String> {
 
 fn check_dns_resolves(host: &str) -> Check {
     use std::net::ToSocketAddrs;
-    let target = format!("{host}:443");
+    // An IPv6 literal (`::1`) is bracketed before the port: `[::1]:443`.
+    let target = if host.contains(':') {
+        format!("[{host}]:443")
+    } else {
+        format!("{host}:443")
+    };
     match target.to_socket_addrs() {
         Ok(iter) => {
             // `iter` is mutable inside the arm body; we just need
@@ -612,6 +638,21 @@ mod tests {
     }
 
     #[test]
+    fn the_dns_host_is_the_host_of_the_api_base() {
+        for (base, host) in [
+            ("https://api.hetzner.cloud", "api.hetzner.cloud"),
+            ("http://127.0.0.1:1", "127.0.0.1"),
+            ("http://127.0.0.1:41234/v1", "127.0.0.1"),
+            ("http://[::1]:8080/v1", "::1"),
+            ("http://user:pw@127.0.0.1:9", "127.0.0.1"),
+            ("", "api.hetzner.cloud"),
+            ("http://", "api.hetzner.cloud"),
+        ] {
+            assert_eq!(api_host(base), host, "{base:?}");
+        }
+    }
+
+    #[test]
     fn check_dns_resolves_invalid_tld_fails() {
         // RFC 6761 `.invalid` is reserved as never-resolvable.
         let c = check_dns_resolves("doctor-probe-host.invalid");
@@ -675,7 +716,7 @@ mod tests {
         // Derived from cli_core::tools::ALL rather than hand-listed, so
         // a new dependency cannot be added without appearing here. D11
         // found restic with eight spawn sites and no check at all.
-        let checks = build_env_checks();
+        let checks = build_env_checks("http://127.0.0.1:1");
         for t in cli_core::tools::ALL {
             assert!(
                 checks.iter().any(|c| c.name.contains(t.name)),
