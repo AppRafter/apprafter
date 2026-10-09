@@ -8,6 +8,14 @@
 //! well-known name matches whenever its owner sends, so logind or a screen saver that starts
 //! later is still heard. Dropping the sources closes a channel the thread also waits on, which
 //! ends it; the drop then joins it.
+//!
+//! A bus takes a rule for a name nobody owns, so a rule says nothing of whether anything will
+//! ever send: on sway, i3 or Hyprland no screen saver runs, and on a system without logind
+//! (Devuan, OpenRC without elogind) nothing sends `PrepareForSleep`. What the watch says it
+//! hears ([`Listening`]) therefore counts a source only when its sender is there as it is set
+//! up: a screen saver that runs (none is started on demand), logind running or startable by the
+//! bus for sleeps, and logind having answered for the app's session for its `Lock`. It listens
+//! to every source all the same, so a sender that starts later is heard without being promised.
 
 use std::future::poll_fn;
 use std::pin::Pin;
@@ -16,6 +24,7 @@ use std::thread::{self, JoinHandle};
 
 use futures_lite::{future, StreamExt};
 use zbus::message::Type;
+use zbus::names::OwnedUniqueName;
 use zbus::zvariant::OwnedObjectPath;
 use zbus::{Connection, MatchRule, Message, MessageStream};
 
@@ -26,6 +35,9 @@ const LOGIN1: &str = "org.freedesktop.login1";
 const LOGIN1_PATH: &str = "/org/freedesktop/login1";
 const LOGIN1_MANAGER: &str = "org.freedesktop.login1.Manager";
 const LOGIN1_SESSION: &str = "org.freedesktop.login1.Session";
+/// The bus driver, which answers for names.
+const DBUS: &str = "org.freedesktop.DBus";
+const DBUS_PATH: &str = "/org/freedesktop/DBus";
 /// The screen savers' names, each also its interface: KDE and others, and GNOME.
 const SCREEN_SAVERS: [&str; 2] = ["org.freedesktop.ScreenSaver", "org.gnome.ScreenSaver"];
 
@@ -97,11 +109,15 @@ pub(super) fn start(emitter: Emitter) -> Sources {
 /// Sets up every source the buses offer, then reports their signals until it is dropped.
 async fn listen(emitter: Emitter) {
     let mut streams = Vec::new();
+    // The sources whose senders are there (see the module docs).
+    let mut heard = Vec::new();
     // Kept for as long as their streams are read.
     let mut _connections = Vec::new();
     match Connection::system().await {
         Ok(system) => {
-            streams.extend(logind(&system).await);
+            let (logind_streams, logind_heard) = logind(&system).await;
+            streams.extend(logind_streams);
+            heard.extend(logind_heard);
             _connections.push(system);
         }
         Err(error) => tracing::info!(
@@ -111,14 +127,21 @@ async fn listen(emitter: Emitter) {
     match Connection::session().await {
         Ok(session_bus) => {
             for name in SCREEN_SAVERS {
-                if let Some(stream) = subscribe(
+                let Some(stream) = subscribe(
                     &session_bus,
                     Kind::ScreenSaver,
                     rule(name, None, name, "ActiveChanged"),
                 )
                 .await
-                {
-                    streams.push(stream);
+                else {
+                    continue;
+                };
+                streams.push(stream);
+                // A screen saver must run to send; none is started on demand.
+                if owner(&session_bus, name).await.is_some() {
+                    heard.push(Kind::ScreenSaver);
+                } else {
+                    tracing::info!("no {name} runs: its locks are listened for, not expected");
                 }
             }
             _connections.push(session_bus);
@@ -127,7 +150,7 @@ async fn listen(emitter: Emitter) {
             tracing::info!("no session bus ({error}): the screen saver's locks are not watched")
         }
     }
-    emitter.ready(listening(streams.iter().map(|(kind, _)| *kind)));
+    emitter.ready(listening(heard));
     loop {
         let (kind, message) = next(&mut streams).await;
         if let Some(signal) = kind.signal(&message) {
@@ -136,8 +159,8 @@ async fn listen(emitter: Emitter) {
     }
 }
 
-/// What the streams set up hear: logind's `Lock` and the screen savers are the session's
-/// locks, `PrepareForSleep` the sleeps.
+/// What the sources whose senders are there hear: logind's `Lock` and the screen savers are the
+/// session's locks, `PrepareForSleep` the sleeps.
 fn listening(kinds: impl IntoIterator<Item = Kind>) -> Listening {
     kinds
         .into_iter()
@@ -153,19 +176,68 @@ fn listening(kinds: impl IntoIterator<Item = Kind>) -> Listening {
         })
 }
 
-/// logind's two sources: the manager's `PrepareForSleep`, and `Lock` on the app's session.
-async fn logind(system: &Connection) -> Vec<(Kind, Pin<Box<MessageStream>>)> {
+/// logind's two sources, the manager's `PrepareForSleep` and `Lock` on the app's session, and
+/// which of them have a logind to send them.
+async fn logind(system: &Connection) -> (Vec<(Kind, Pin<Box<MessageStream>>)>, Vec<Kind>) {
     let mut streams = Vec::new();
+    let mut heard = Vec::new();
     let sleep = rule(LOGIN1, Some(LOGIN1_PATH), LOGIN1_MANAGER, "PrepareForSleep");
-    streams.extend(subscribe(system, Kind::PrepareForSleep, sleep).await);
+    if let Some(stream) = subscribe(system, Kind::PrepareForSleep, sleep).await {
+        streams.push(stream);
+        // logind running, or one the bus starts as soon as anything asks it to suspend
+        // (systemd's service file). WSL2 with systemd runs a logind that never sends this (the
+        // WSL VM does not suspend through it): an accepted limit, which reads as listening.
+        if owner(system, LOGIN1).await.is_some() || activatable(system, LOGIN1).await {
+            heard.push(Kind::PrepareForSleep);
+        } else {
+            tracing::info!("no logind on the system bus: sleeps are listened for, not expected");
+        }
+    }
     match own_session(system).await {
         Ok(path) => {
             let lock = rule(LOGIN1, Some(path.as_str()), LOGIN1_SESSION, "Lock");
-            streams.extend(subscribe(system, Kind::SessionLock, lock).await);
+            if let Some(stream) = subscribe(system, Kind::SessionLock, lock).await {
+                streams.push(stream);
+                // logind answered for the app's session, so it runs.
+                heard.push(Kind::SessionLock);
+            }
         }
         Err(why) => tracing::info!("{why}: logind's session locks are not watched"),
     }
-    streams
+    (streams, heard)
+}
+
+/// The connection that owns `name` on `bus` now, if any: the bus driver's `GetNameOwner`.
+async fn owner(bus: &Connection, name: &str) -> Option<OwnedUniqueName> {
+    let reply = bus
+        .call_method(Some(DBUS), DBUS_PATH, Some(DBUS), "GetNameOwner", &(name,))
+        .await
+        .ok()?;
+    reply.body().deserialize::<OwnedUniqueName>().ok()
+}
+
+/// Whether `bus` can start `name` on demand: the bus driver's `ListActivatableNames`.
+async fn activatable(bus: &Connection, name: &str) -> bool {
+    let names = match bus
+        .call_method(
+            Some(DBUS),
+            DBUS_PATH,
+            Some(DBUS),
+            "ListActivatableNames",
+            &(),
+        )
+        .await
+    {
+        Ok(reply) => reply.body().deserialize::<Vec<String>>(),
+        Err(error) => Err(error),
+    };
+    match names {
+        Ok(names) => names.iter().any(|activatable| activatable == name),
+        Err(error) => {
+            tracing::info!("the bus did not say which names it can start ({error})");
+            false
+        }
+    }
 }
 
 /// The object path of the session polkitd sees the app in, as logind names it.
@@ -296,9 +368,9 @@ mod tests {
         }
     }
 
-    /// No bus, one bus, a logind without the app's session: each says what it hears.
+    /// No sender, one bus's, a logind without the app's session: each says what it hears.
     #[test]
-    fn the_streams_set_up_say_what_the_watch_hears() {
+    fn the_sources_with_a_sender_say_what_the_watch_hears() {
         let none = Listening::NONE;
         let lock = Listening {
             lock: true,

@@ -292,6 +292,54 @@ fn without_a_system_bus_only_the_screen_savers_report() {
     assert_eq!(next(&events), SessionEvent::Locked);
 }
 
+/// A session bus on which no screen saver runs (sway, i3, Hyprland): the bus takes a rule for a
+/// name nobody owns, so the rule alone promises nothing, and the watch says it hears no lock.
+/// It listens all the same: a screen saver that starts later is heard.
+#[test]
+#[ignore = "needs the session container: bash scripts/test-osauth-linux.sh"]
+fn without_a_screen_saver_no_lock_is_promised_and_one_started_later_is_heard() {
+    let _session = container();
+    assert!(Connection::system().is_err(), "there is no system bus");
+    let (_watch, events) = watching_for(Listening::NONE);
+    let screen_savers = FakeScreenSavers::start();
+    screen_savers.active_changed(FREEDESKTOP, true);
+    assert_eq!(next(&events), SessionEvent::Locked, "{FREEDESKTOP}");
+    screen_savers.active_changed(GNOME, true);
+    assert_eq!(next(&events), SessionEvent::Locked, "{GNOME}");
+}
+
+/// A system bus without logind (Devuan, or OpenRC without elogind; the script removed the
+/// service file that lets the bus start it): no sleep is promised, and the screen savers'
+/// locks still are. A logind that starts later is heard.
+#[test]
+#[ignore = "needs the session container: bash scripts/test-osauth-linux.sh"]
+fn without_logind_no_sleep_is_promised_and_one_started_later_is_heard() {
+    let session = container();
+    let _screen_savers = FakeScreenSavers::start();
+    let (_watch, events) = watching_for(Listening {
+        lock: true,
+        sleep: false,
+    });
+    let logind = FakeLogind::start(&session);
+    logind.prepare_for_sleep(true);
+    assert_eq!(next(&events), SessionEvent::Sleeping);
+}
+
+/// A logind the bus can start (systemd's service file, which this container's Debian has)
+/// counts for sleeps before it runs: on a systemd host the bus starts it as soon as anything
+/// asks it to suspend. The app's session is found only by asking a running logind, so no lock
+/// is promised. (Here nothing can start it, there being no systemd: the rule's one limit.)
+#[test]
+#[ignore = "needs the session container: bash scripts/test-osauth-linux.sh"]
+fn a_logind_the_bus_can_start_is_promised_for_sleeps() {
+    let _session = container();
+    assert!(Connection::session().is_err(), "there is no session bus");
+    let _watching = watching_for(Listening {
+        lock: false,
+        sleep: true,
+    });
+}
+
 /// With neither bus (WSL, a container) nothing listens, and the watch says so.
 #[test]
 #[ignore = "needs the session container: bash scripts/test-osauth-linux.sh"]

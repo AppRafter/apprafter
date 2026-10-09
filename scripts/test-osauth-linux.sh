@@ -34,10 +34,11 @@
 #
 # The session watch's cases play logind and the screen savers themselves: --fake-logind lets
 # `walk` own org.freedesktop.login1 on the container's system bus (there is no systemd), and
-# --session-bus starts a session bus of `walk`'s and hands the test its address. --stopped-polkitd
-# stops polkitd once it owns its name, so it never answers. --no-system-bus
-# points the test's system bus at a socket that does not exist, as on a system without one (the
-# container's own bus and polkitd still run).
+# --session-bus starts a session bus of `walk`'s and hands the test its address. --no-logind
+# removes the service file through which the system bus could start logind (systemd's, which
+# Debian installs), as on a system without logind. --stopped-polkitd stops polkitd once it owns
+# its name, so it never answers. --no-system-bus points the test's system bus at a socket that
+# does not exist, as on a system without one (the container's own bus and polkitd still run).
 #
 # A case passes only when its one test reported `ok` and the harness ran exactly one test, and
 # the cases here must be exactly the tests in the binaries, so a renamed test cannot turn into
@@ -83,6 +84,9 @@ CASES=(
     "session_container without_a_session_bus_logind_still_reports --fake-logind"
     "session_container without_a_system_bus_only_the_screen_savers_report --session-bus --no-system-bus"
     "session_container without_any_bus_nothing_listens --no-system-bus"
+    "session_container without_a_screen_saver_no_lock_is_promised_and_one_started_later_is_heard --session-bus --no-system-bus"
+    "session_container without_logind_no_sleep_is_promised_and_one_started_later_is_heard --fake-logind --session-bus --no-logind"
+    "session_container a_logind_the_bus_can_start_is_promised_for_sleeps"
 )
 
 die() {
@@ -169,7 +173,7 @@ cat >"$work/osauth-case" <<'DRIVER_EOF'
 set -euo pipefail
 
 policy=yes rule=none session=yes active=yes pam_service=yes password=yes
-fake_logind=no session_bus=no system_bus=yes stopped_polkitd=no
+fake_logind=no session_bus=no system_bus=yes stopped_polkitd=no logind_service=yes
 while [[ $# -gt 2 ]]; do
     case "$1" in
     --no-policy) policy=no ;;
@@ -182,6 +186,7 @@ while [[ $# -gt 2 ]]; do
     --fake-logind) fake_logind=yes ;;
     --session-bus) session_bus=yes ;;
     --no-system-bus) system_bus=no ;;
+    --no-logind) logind_service=no ;;
     --stopped-polkitd) stopped_polkitd=yes ;;
     *)
         echo "osauth-case: unknown flag $1" >&2
@@ -245,6 +250,9 @@ if ! mkdir -p "$scope"; then
     exit 3
 fi
 
+if [[ $logind_service == no ]]; then
+    rm /usr/share/dbus-1/system-services/org.freedesktop.login1.service
+fi
 if [[ $fake_logind == yes ]]; then
     # The test plays logind: `walk` may own its name on the system bus and be asked GetSession.
     mkdir -p /etc/dbus-1/system.d

@@ -22,7 +22,9 @@
 //! registration the OS refuses) is logged at info and skipped, never an error; the others
 //! still report. Once set up, the watch says which signals it hears ([`Listening`]): a lock
 //! source, a sleep source, both or neither (WSL or a container without a bus) — so the app can
-//! tell the owner when lock-on-sleep has nothing to follow.
+//! tell the owner when lock-on-sleep has nothing to follow. On Linux a source counts only when
+//! its sender is there (a window manager without a screen saver hears no lock, a system without
+//! logind no sleep), and it is listened to all the same, so a sender that starts later is heard.
 //!
 //! An OS signal becomes an event through [`event`], a pure function tested on every OS. Events
 //! reach `on_event` in order on one thread of the watch's own, never on the OS's (the main
@@ -104,11 +106,12 @@ enum Message {
 /// Which of the OS's signals a watch hears: what its sources could set up.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Listening {
-    /// A source of the session's locks listens: logind's `Lock` or a screen saver on Linux,
-    /// the session notification on Windows, the distributed screen-lock notification on macOS.
+    /// A source of the session's locks listens: logind's `Lock` or a running screen saver on
+    /// Linux, the session notification on Windows, the distributed screen-lock notification on
+    /// macOS.
     pub lock: bool,
-    /// A source of sleeps listens: logind's `PrepareForSleep`, the suspend notification, or
-    /// `NSWorkspace`'s sleep notifications.
+    /// A source of sleeps listens: logind's `PrepareForSleep` (logind running, or startable by
+    /// the bus), the suspend notification, or `NSWorkspace`'s sleep notifications.
     pub sleep: bool,
 }
 
