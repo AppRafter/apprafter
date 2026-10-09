@@ -5,6 +5,8 @@ import type { Check } from '../ipc/generated/Check';
 import type { DoctorReport } from '../ipc/generated/DoctorReport';
 import type { MachineCatalogue } from '../ipc/generated/MachineCatalogue';
 import type { MachineOfferView } from '../ipc/generated/MachineOfferView';
+import type { PlanView } from '../ipc/generated/PlanView';
+import type { TargetAdded } from '../ipc/generated/TargetAdded';
 import type { ToolchainReport } from '../ipc/generated/ToolchainReport';
 
 export function offer(more: Partial<MachineOfferView> = {}): MachineOfferView {
@@ -247,5 +249,35 @@ export function toolchainReport(): ToolchainReport {
     ],
     searchPath: ['/usr/local/bin', '/usr/bin'],
     searchPathSource: 'login_shell',
+  };
+}
+
+/** What `target add` answers for `lab`: verified, cx22 checked in nbg1, the CLI default unmoved. */
+export function targetAdded(more: Partial<TargetAdded> = {}): TargetAdded {
+  return {
+    name: 'lab',
+    replaced: false,
+    isCliDefault: false,
+    cliDefault: null,
+    token: { status: 'verified', elapsedMs: 182 },
+    sku: { status: 'validated', sku: 'cx22', region: 'nbg1', regionWasDefault: false },
+    ...more,
+  };
+}
+
+/**
+ * A bounded add plan for `lab` without its op id, which the IPC harness assigns
+ * (`Harness.plan` takes `Omit<PlanView, 'opId'>`). Not called `planView`: fixtures.ts has a
+ * `planView` that returns a whole `PlanView` for prod-eu, and two builders of one name with
+ * different shapes invite the wrong import.
+ */
+export function planParts(more: Partial<Omit<PlanView, 'opId'>> = {}): Omit<PlanView, 'opId'> {
+  return {
+    class: 'bounded',
+    title: 'Add target lab',
+    changes: [],
+    target: 'lab',
+    expiresAtMs: Date.now() + 600_000,
+    ...more,
   };
 }
