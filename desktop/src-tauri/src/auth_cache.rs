@@ -22,8 +22,25 @@
 //! asked of the OS afresh. Until the first answer, [`AuthCache::info`] is [`UNANSWERED`],
 //! counted as available, so nothing goes unlocked for want of an answer.
 //!
+//! Every answer the OS gives passes through here (the lock and the destructive-operation gesture
+//! both ask through the cache), so this is where the log hears them, at `info`, which a release
+//! build keeps:
+//! - `the OS answered`, once per prompt or password check: why it asked (`purpose`: `unlock`, or
+//!   `confirm(<verb>)` with the app's own word for the operation; the target's name is the
+//!   owner's, and stays out of a file people attach to bug reports), the `way` (`prompt` or
+//!   `password_field`), the `outcome` by its IPC names, how long it took (`took_ms`), what the
+//!   cache knew when it asked (`method`, `unanswered` before the first answer; `available`;
+//!   `password_field`), and, on the password field, how many `messages` the OS sent on the way.
+//!   Never their text: PAM modules the app does not control write it, and it can name the
+//!   account or echo what was typed. The page shows them. Never the password: the check has
+//!   taken it, and wiped it, before the line is written.
+//! - `what can verify the owner here`, at the first answer and whenever an answer differs from
+//!   the last: the whole [`AuthInfo`]. Not for the same answer again, which the idle tick asks
+//!   for every few seconds while nothing can verify the owner.
+//!
 //! [`LockMachine::tick`]: crate::lock::LockMachine::tick
 
+use std::fmt;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::thread;
@@ -31,6 +48,7 @@ use std::time::{Duration, Instant};
 
 use apprafter_core::CancellationToken;
 use apprafter_desktop_ipc::{AuthInfo, AuthOutcome, Settings};
+use serde::Serialize;
 use zeroize::Zeroizing;
 
 use crate::auth::{AuthPurpose, Authenticator, PasswordAnswer};
@@ -176,7 +194,12 @@ impl AuthCache {
         loop {
             let question = self.lock().asked;
             match panic::catch_unwind(AssertUnwindSafe(|| self.auth.info())) {
-                Ok(info) => self.lock().info = Some(info),
+                Ok(info) => {
+                    let last = self.lock().info.replace(info.clone());
+                    if last.as_ref() != Some(&info) {
+                        log_info(&info);
+                    }
+                }
                 Err(payload) => tracing::error!(
                     "the authenticator panicked when asked what it can do: {}; its last answer \
                      stays",
@@ -213,7 +236,17 @@ impl Authenticator for AuthCache {
     }
 
     fn verify(&self, purpose: &AuthPurpose, cancel: &CancellationToken) -> AuthOutcome {
+        let known = self.known();
+        let asked = Instant::now();
         let outcome = self.auth.verify(purpose, cancel);
+        log_answer(
+            purpose,
+            "prompt",
+            &outcome,
+            asked.elapsed(),
+            known.as_ref(),
+            None,
+        );
         // A prompt can change what the OS can do (Linux: a dialog that found no agent).
         self.refresh();
         outcome
@@ -225,7 +258,17 @@ impl Authenticator for AuthCache {
         password: Zeroizing<String>,
         cancel: &CancellationToken,
     ) -> PasswordAnswer {
+        let known = self.known();
+        let asked = Instant::now();
         let answer = self.auth.verify_password(purpose, password, cancel);
+        log_answer(
+            purpose,
+            "password_field",
+            &answer.outcome,
+            asked.elapsed(),
+            known.as_ref(),
+            Some(answer.messages.len()),
+        );
         self.refresh();
         answer
     }
@@ -245,12 +288,100 @@ impl Authenticator for AuthCache {
     }
 }
 
+/// The `the OS answered` line (see the module docs). `known` is what the cache knew when it
+/// asked; `messages`, on the password field, how many messages the OS sent.
+fn log_answer(
+    purpose: &AuthPurpose,
+    way: &str,
+    outcome: &AuthOutcome,
+    took: Duration,
+    known: Option<&AuthInfo>,
+    messages: Option<usize>,
+) {
+    let info = known.unwrap_or(&UNANSWERED);
+    let method = known.map_or_else(|| "unanswered".to_owned(), |info| name_or_none(info.method));
+    tracing::info!(
+        purpose = %Purpose(purpose),
+        way = %way,
+        outcome = %Outcome(outcome),
+        took_ms = u64::try_from(took.as_millis()).unwrap_or(u64::MAX),
+        method = %method,
+        available = info.available,
+        password_field = info.password_field,
+        messages,
+        "the OS answered"
+    );
+}
+
+/// The `what can verify the owner here` line (see the module docs).
+fn log_info(info: &AuthInfo) {
+    tracing::info!(
+        available = info.available,
+        method = %name_or_none(info.method),
+        unavailable = %name_or_none(info.unavailable),
+        password_field = info.password_field,
+        biometrics_choice = info.biometrics_choice,
+        "what can verify the owner here"
+    );
+}
+
+/// Why the OS was asked: `unlock`, or `confirm(<verb>)`. Never the target's name.
+struct Purpose<'a>(&'a AuthPurpose);
+
+impl fmt::Display for Purpose<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            AuthPurpose::Unlock => f.write_str("unlock"),
+            AuthPurpose::Confirm { verb, .. } => write!(f, "confirm({verb})"),
+        }
+    }
+}
+
+/// An outcome by its IPC names, one word: `verified`, `cancelled(by=user)`,
+/// `failed(exhausted=true,retry_in_ms=29873)`, `busy`, `unavailable(reason=policy_missing)`.
+struct Outcome<'a>(&'a AuthOutcome);
+
+impl fmt::Display for Outcome<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self.0 {
+            AuthOutcome::Verified => f.write_str("verified"),
+            AuthOutcome::Cancelled { by } => write!(f, "cancelled(by={})", name(by)),
+            AuthOutcome::Failed {
+                exhausted,
+                retry_in_ms: None,
+            } => write!(f, "failed(exhausted={exhausted})"),
+            AuthOutcome::Failed {
+                exhausted,
+                retry_in_ms: Some(ms),
+            } => write!(f, "failed(exhausted={exhausted},retry_in_ms={ms})"),
+            AuthOutcome::Busy => f.write_str("busy"),
+            AuthOutcome::Unavailable { reason } => {
+                write!(f, "unavailable(reason={})", name(reason))
+            }
+        }
+    }
+}
+
+/// A unit variant's name on the IPC wire (`policy_missing`, `polkit`), the names the page and
+/// its generated types use.
+fn name(variant: impl Serialize + fmt::Debug) -> String {
+    match serde_json::to_value(&variant) {
+        Ok(serde_json::Value::String(name)) => name,
+        _ => format!("{variant:?}"),
+    }
+}
+
+/// [`name`], or `none`.
+fn name_or_none(variant: Option<impl Serialize + fmt::Debug>) -> String {
+    variant.map_or_else(|| "none".to_owned(), name)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
     use std::sync::mpsc;
 
-    use apprafter_desktop_ipc::{AuthMethod, UnavailableReason};
+    use apprafter_desktop_ipc::{AuthMethod, CancelledBy, UnavailableReason};
 
     use super::*;
     use crate::auth::FakeAuthenticator;
@@ -509,6 +640,250 @@ mod tests {
         );
         release.send(()).unwrap();
         assert!(cache.settled(LONG));
+    }
+
+    /// The lines the log holds that contain `message`.
+    fn lines_with<'a>(log: &'a str, message: &str) -> Vec<&'a str> {
+        log.lines().filter(|line| line.contains(message)).collect()
+    }
+
+    /// A `field=value` of `line`, up to the next space.
+    fn field<'a>(line: &'a str, name: &str) -> Option<&'a str> {
+        line.split(' ')
+            .find_map(|word| word.strip_prefix(name)?.strip_prefix('='))
+    }
+
+    /// Answers the cache's questions here, on the calling thread (whose log [`logged`] reads),
+    /// rather than on the asking thread.
+    ///
+    /// [`logged`]: crate::runtime::logged
+    fn answer_here(cache: &AuthCache) {
+        {
+            let mut state = cache.lock();
+            state.asked += 1;
+            state.asking = true;
+        }
+        cache.answer_all();
+    }
+
+    #[test]
+    fn every_answer_of_the_os_is_one_line_with_why_how_what_and_how_long() {
+        let os = Arc::new(FakeAuthenticator::new());
+        let cache = AuthCache::new(os.clone());
+        let token = CancellationToken::new();
+        let confirm = AuthPurpose::Confirm {
+            target: Some("acme-prod".into()),
+            verb: "delete".into(),
+        };
+        for (purpose, outcome, says) in [
+            (&AuthPurpose::Unlock, AuthOutcome::Verified, "verified"),
+            (
+                &AuthPurpose::Unlock,
+                AuthOutcome::Failed {
+                    exhausted: false,
+                    retry_in_ms: None,
+                },
+                "failed(exhausted=false)",
+            ),
+            (
+                &AuthPurpose::Unlock,
+                AuthOutcome::Failed {
+                    exhausted: true,
+                    retry_in_ms: Some(29_873),
+                },
+                "failed(exhausted=true,retry_in_ms=29873)",
+            ),
+            (
+                &confirm,
+                AuthOutcome::Unavailable {
+                    reason: UnavailableReason::PolicyMissing,
+                },
+                "unavailable(reason=policy_missing)",
+            ),
+            (
+                &AuthPurpose::Unlock,
+                AuthOutcome::Cancelled {
+                    by: CancelledBy::User,
+                },
+                "cancelled(by=user)",
+            ),
+            (&confirm, AuthOutcome::Busy, "busy"),
+        ] {
+            os.then(outcome);
+            let log = crate::runtime::logged(|| {
+                assert_eq!(cache.verify(purpose, &token), outcome);
+            });
+            let lines = lines_with(&log, "the OS answered");
+            assert_eq!(lines.len(), 1, "one line per answer: {log}");
+            let line = lines[0];
+            assert!(
+                line.contains(" INFO apprafter_desktop::auth_cache: "),
+                "{line}"
+            );
+            assert_eq!(field(line, "outcome"), Some(says), "{line}");
+            assert_eq!(field(line, "way"), Some("prompt"), "{line}");
+            let why = match purpose {
+                AuthPurpose::Unlock => "unlock",
+                AuthPurpose::Confirm { .. } => "confirm(delete)",
+            };
+            assert_eq!(field(line, "purpose"), Some(why), "{line}");
+            assert!(
+                !line.contains("acme-prod"),
+                "the target's name stays out: {line}"
+            );
+            assert!(field(line, "took_ms").is_some(), "{line}");
+            assert_eq!(
+                field(line, "messages"),
+                None,
+                "a prompt says nothing: {line}"
+            );
+            assert!(cache.settled(LONG));
+        }
+
+        // The app closes the prompt: the token tripped.
+        let closed = CancellationToken::new();
+        closed.cancel();
+        let log = crate::runtime::logged(|| {
+            cache.verify(&AuthPurpose::Unlock, &closed);
+        });
+        let line = lines_with(&log, "the OS answered")[0];
+        assert_eq!(field(line, "outcome"), Some("cancelled(by=app)"), "{line}");
+    }
+
+    #[test]
+    fn an_answer_names_what_the_app_knew_when_it_asked() {
+        let cache = AuthCache::new(Arc::new(FakeAuthenticator::new()));
+        let token = CancellationToken::new();
+        let log = crate::runtime::logged(|| {
+            cache.verify(&AuthPurpose::Unlock, &token);
+        });
+        let before = lines_with(&log, "the OS answered")[0];
+        assert_eq!(field(before, "method"), Some("unanswered"), "{before}");
+        assert_eq!(field(before, "available"), Some("true"), "{before}");
+        assert_eq!(field(before, "password_field"), Some("false"), "{before}");
+
+        let cache = AuthCache::new(Arc::new(
+            FakeAuthenticator::new().with_password("pw".to_owned()),
+        ));
+        cache.fresh(LONG).expect("an answer");
+        let log = crate::runtime::logged(|| {
+            cache.verify(&AuthPurpose::Unlock, &token);
+        });
+        let after = lines_with(&log, "the OS answered")[0];
+        assert_eq!(field(after, "method"), Some("fake"), "{after}");
+        assert_eq!(field(after, "available"), Some("true"), "{after}");
+        assert_eq!(field(after, "password_field"), Some("true"), "{after}");
+    }
+
+    #[test]
+    fn an_answer_says_how_long_the_os_took() {
+        /// Takes its time over every prompt.
+        struct Slow;
+        impl Authenticator for Slow {
+            fn info(&self) -> AuthInfo {
+                FakeAuthenticator::new().info()
+            }
+            fn verify(&self, _: &AuthPurpose, _: &CancellationToken) -> AuthOutcome {
+                thread::sleep(Duration::from_millis(60));
+                AuthOutcome::Verified
+            }
+        }
+        let cache = AuthCache::new(Arc::new(Slow));
+        let log = crate::runtime::logged(|| {
+            cache.verify(&AuthPurpose::Unlock, &CancellationToken::new());
+        });
+        let line = lines_with(&log, "the OS answered")[0];
+        let took: u64 = field(line, "took_ms").unwrap().parse().unwrap();
+        assert!((60..LONG.as_millis() as u64).contains(&took), "{line}");
+    }
+
+    /// The password, and what PAM said on the way, never reach the log: PAM's messages come
+    /// from modules the app does not control and can name the account, or echo what was typed.
+    /// The log keeps how many there were.
+    #[test]
+    fn a_password_answer_never_logs_the_password_or_what_the_os_said() {
+        const SECRET: &str = "hunter2-SENTINEL";
+        let os = Arc::new(FakeAuthenticator::new().with_password(SECRET.to_owned()));
+        os.saying(&["Account walk: you typed hunter2-SENTINEL", "Try again"]);
+        let cache = AuthCache::new(os.clone());
+        let token = CancellationToken::new();
+        let log = crate::runtime::logged(|| {
+            let right =
+                cache.verify_password(&AuthPurpose::Unlock, SECRET.to_owned().into(), &token);
+            assert_eq!(right.outcome, AuthOutcome::Verified);
+            let wrong = format!("not-{SECRET}");
+            let wrong = cache.verify_password(&AuthPurpose::Unlock, wrong.into(), &token);
+            assert_eq!(wrong.messages.len(), 2, "the page still hears them");
+        });
+        assert!(!log.contains("SENTINEL"), "{log}");
+        assert!(!log.contains("Try again"), "{log}");
+        let lines = lines_with(&log, "the OS answered");
+        assert_eq!(lines.len(), 2, "{log}");
+        assert_eq!(field(lines[0], "way"), Some("password_field"), "{log}");
+        assert_eq!(field(lines[0], "outcome"), Some("verified"), "{log}");
+        assert_eq!(field(lines[0], "messages"), Some("0"), "{log}");
+        assert_eq!(
+            field(lines[1], "outcome"),
+            Some("failed(exhausted=false)"),
+            "{log}"
+        );
+        assert_eq!(field(lines[1], "messages"), Some("2"), "{log}");
+    }
+
+    /// The "what can verify the owner here" line: at the first answer, and whenever an answer
+    /// differs from the last, never for the same answer again (the idle tick re-asks every few
+    /// seconds while nothing can verify the owner).
+    #[test]
+    fn what_can_verify_the_owner_is_logged_at_the_first_answer_and_on_every_change() {
+        let (os, answer) = Gated::new();
+        let cache = AuthCache::new(os);
+        let polkit = method(AuthMethod::Polkit);
+        let no_agent = AuthInfo {
+            available: false,
+            method: Some(AuthMethod::Pam),
+            unavailable: Some(UnavailableReason::NoAgent),
+            biometrics_choice: false,
+            password_field: true,
+        };
+        let mut said = Vec::new();
+        for info in [polkit.clone(), polkit, no_agent.clone(), no_agent] {
+            answer.send(info).unwrap();
+            let log = crate::runtime::logged(|| answer_here(&cache));
+            said.push(
+                lines_with(&log, "what can verify the owner here")
+                    .iter()
+                    .map(|line| (*line).to_owned())
+                    .collect::<Vec<_>>(),
+            );
+        }
+        assert_eq!(
+            said.iter().map(Vec::len).collect::<Vec<_>>(),
+            [1, 0, 1, 0],
+            "{said:#?}"
+        );
+        let first = &said[0][0];
+        assert!(
+            first.contains(" INFO apprafter_desktop::auth_cache: "),
+            "{first}"
+        );
+        for (name, value) in [
+            ("available", "true"),
+            ("method", "polkit"),
+            ("unavailable", "none"),
+            ("password_field", "false"),
+            ("biometrics_choice", "false"),
+        ] {
+            assert_eq!(field(first, name), Some(value), "{name}: {first}");
+        }
+        let changed = &said[2][0];
+        for (name, value) in [
+            ("available", "false"),
+            ("method", "pam"),
+            ("unavailable", "no_agent"),
+            ("password_field", "true"),
+        ] {
+            assert_eq!(field(changed, name), Some(value), "{name}: {changed}");
+        }
     }
 
     #[test]

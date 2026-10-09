@@ -16,9 +16,13 @@ use std::panic;
 use std::path::Path;
 use std::sync::OnceLock;
 
+use tracing::Subscriber;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::filter::{LevelFilter, Targets};
+use tracing_subscriber::fmt::format::{DefaultFields, Format};
+use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt;
 
 /// The stack of every async-runtime thread, workers and the blocking pool alike.
@@ -30,10 +34,11 @@ const LOG_SUFFIX: &str = "log";
 /// How many daily files are kept; the oldest goes when a new day starts.
 const LOG_FILES_KEPT: usize = 14;
 
-/// The crates whose debug lines a debug build logs: the desktop and the core it runs. Every
-/// other crate (Tauri, WebKitGTK's bindings, zbus) logs from `info` up in every build.
-pub const OWN_CRATES: [&str; 5] = [
+/// The crates whose debug lines a debug build logs: the desktop's own and the core it runs.
+/// Every other crate (Tauri, WebKitGTK's bindings, zbus) logs from `info` up in every build.
+pub const OWN_CRATES: [&str; 6] = [
     "apprafter_desktop",
+    "apprafter_os_auth",
     "apprafter_core",
     "cli_core",
     "cli_providers",
@@ -86,9 +91,7 @@ pub fn init_logging(log_dir: &Path) -> Result<(), String> {
         .build(log_dir)
         .map_err(|e| format!("{}: {e}", log_dir.display()))?;
     let debug = cfg!(debug_assertions);
-    let to_file = tracing_subscriber::fmt::layer()
-        .with_writer(file)
-        .with_ansi(false);
+    let to_file = file_layer(file);
     let to_stderr = debug.then(|| tracing_subscriber::fmt::layer().with_writer(io::stderr));
     tracing_subscriber::registry()
         .with(log_filter(debug))
@@ -98,6 +101,52 @@ pub fn init_logging(log_dir: &Path) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     log_panics();
     Ok(())
+}
+
+/// The log file's lines: plain text, without colour codes. The tests read lines back in this
+/// format ([`logged`]).
+fn file_layer<S, W>(writer: W) -> tracing_subscriber::fmt::Layer<S, DefaultFields, Format, W>
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+    W: for<'w> MakeWriter<'w> + 'static,
+{
+    tracing_subscriber::fmt::layer()
+        .with_writer(writer)
+        .with_ansi(false)
+}
+
+/// What a release build's log file would hold of the lines `run` logs on this thread: the
+/// release filter ([`log_filter`]) and the file's format ([`file_layer`]).
+#[cfg(test)]
+pub(crate) fn logged(run: impl FnOnce()) -> String {
+    use std::sync::{Arc, Mutex, PoisonError};
+
+    /// Appends to the shared buffer.
+    struct Lines(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for Lines {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let mut lines = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            lines.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let writer = {
+        let lines = lines.clone();
+        move || Lines(lines.clone())
+    };
+    let subscriber = tracing_subscriber::registry()
+        .with(log_filter(false))
+        .with(file_layer(writer));
+    tracing::subscriber::with_default(subscriber, run);
+    let bytes = lines.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    String::from_utf8(bytes).expect("the log is UTF-8")
 }
 
 /// `info` and up for everything; in a debug build, `debug` and up for [`OWN_CRATES`].
@@ -150,5 +199,14 @@ mod tests {
             assert!(filter.would_enable(target, &Level::INFO), "{target}");
             assert!(!filter.would_enable(target, &Level::DEBUG), "{target}");
         }
+    }
+
+    /// The desktop's own OS-authentication crate is one of its own: its debug lines (a signal
+    /// the session watch dropped) show in `just desktop-dev`.
+    #[test]
+    fn a_debug_build_logs_the_os_auth_crate_s_debug_lines() {
+        let target = "apprafter_os_auth::session::linux";
+        assert!(log_filter(true).would_enable(target, &Level::DEBUG));
+        assert!(!log_filter(false).would_enable(target, &Level::DEBUG));
     }
 }
