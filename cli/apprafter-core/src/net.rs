@@ -23,8 +23,18 @@ impl DeadlineResolver {
 
 impl ureq::Resolver for DeadlineResolver {
     fn resolve(&self, netloc: &str) -> io::Result<Vec<SocketAddr>> {
+        #[cfg(test)]
+        LOOKUPS_ON_THIS_THREAD.with(|n| n.set(n.get() + 1));
         resolve_with_deadline(netloc, self.timeout)
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many names a [`DeadlineResolver`] was asked for on this thread (ureq resolves on the
+    /// thread making the request): the context tests prove the core's agent resolves through it.
+    pub(crate) static LOOKUPS_ON_THIS_THREAD: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 /// `netloc` (`host:port`, an IPv6 host in brackets) resolved within `timeout`, else

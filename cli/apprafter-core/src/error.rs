@@ -440,8 +440,8 @@ pub mod samples {
     use crate::ssh::SshKeyProblem;
     use crate::target::NameProblem;
 
-    /// How many variants `CoreError` has; `every_variant_has_a_listed_code` counts the samples'
-    /// discriminants against it.
+    /// How many variants `CoreError` declares: checked against `error.rs`'s own syntax tree
+    /// (`the_samples_are_exactly_the_declared_variants`), as is [`one_of_each`].
     pub const VARIANTS: usize = 20;
 
     pub fn one_of_each() -> Vec<CoreError> {
@@ -510,7 +510,9 @@ pub mod samples {
     }
 
     /// No wildcard arm: adding a `CoreError` variant stops this from compiling until the variant
-    /// is listed here, and so until `one_of_each` and `VARIANTS` are visited with it.
+    /// is listed here. That only points at this module; what makes [`one_of_each`] sample the
+    /// new variant (and so `codes::ALL` list its code) is the test that compares the samples
+    /// with the variants `error.rs` declares.
     pub fn every_variant_is_sampled(e: &CoreError) {
         match e {
             CoreError::NoActiveTarget
@@ -607,7 +609,19 @@ mod tests {
             purpose: "p".into(),
             install: "i".into(),
         }));
-        assert_eq!(tool.fields["neededBy"], json!("apprafter doctor"));
+        assert_eq!(
+            (
+                tool.fields["tool"].clone(),
+                tool.fields["neededBy"].clone(),
+                tool.fields["purpose"].clone()
+            ),
+            (json!("kubectl"), json!("apprafter doctor"), json!("p"))
+        );
+        let config = UiError::from(&CoreError::from(cli_core::CliError::InvalidTargetConfig {
+            path: "/s/targets/prod/config.yaml".into(),
+            message: "m".into(),
+        }));
+        assert_eq!(config.fields["path"], json!("/s/targets/prod/config.yaml"));
         assert_eq!(
             UiError::from(&CoreError::from(cli_core::CliError::CueNotFound)).fields["tool"],
             json!("cue")
@@ -643,6 +657,110 @@ mod tests {
             "target name `-a` must not start or end with `-`"
         );
         assert_eq!(bad.fields["problem"], json!("edge_dash"));
+    }
+
+    /// A sample's variant, as its `Debug` output names it first (`TargetNotFound { .. }`).
+    fn variant_name(e: &CoreError) -> String {
+        format!("{e:?}")
+            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// Review finding 7: the variants `CoreError` declares, read from this file's syntax tree,
+    /// are exactly the samples' (and `VARIANTS` counts them). `every_variant_is_sampled` only
+    /// forces a match arm; this is what forces a new variant into `one_of_each`, and through
+    /// `every_variant_has_a_listed_code` its code into `codes::ALL`.
+    #[test]
+    fn the_samples_are_exactly_the_declared_variants() {
+        let file = syn::parse_file(include_str!("error.rs")).expect("error.rs parses");
+        let declared: std::collections::BTreeSet<String> = file
+            .items
+            .iter()
+            .find_map(|item| match item {
+                syn::Item::Enum(e) if e.ident == "CoreError" => {
+                    Some(e.variants.iter().map(|v| v.ident.to_string()).collect())
+                }
+                _ => None,
+            })
+            .expect("error.rs declares CoreError");
+        let sampled: std::collections::BTreeSet<String> =
+            samples::one_of_each().iter().map(variant_name).collect();
+        assert_eq!(sampled, declared, "one_of_each must sample every variant");
+        assert_eq!(declared.len(), samples::VARIANTS);
+    }
+
+    /// Review finding 7: every variant projects exactly the fields the desktop reads (D.3
+    /// overview §3.6.1), no more and no fewer.
+    #[test]
+    fn every_sample_projects_exactly_its_fields() {
+        use crate::kube::KubeErrorKind;
+        use crate::provider::TokenProblem;
+        use crate::ssh::SshKeyProblem;
+        let expected: BTreeMap<&str, serde_json::Value> = [
+            ("NoActiveTarget", json!({})),
+            (
+                "TargetNotFound",
+                json!({"name": "ghost", "available": ["prod"]}),
+            ),
+            ("Cancelled", json!({})),
+            (
+                "UnsafeOverride",
+                json!({"var": "APPRAFTER_HCLOUD_BASE_URL"}),
+            ),
+            ("Cli", json!({})),
+            ("TargetExists", json!({"name": "prod"})),
+            ("RenewTokenUnchanged", json!({"name": "prod"})),
+            (
+                "InvalidTargetName",
+                json!({"name": "-a", "problem": NameProblem::EdgeDash.as_str()}),
+            ),
+            ("SameTargetName", json!({"name": "prod"})),
+            (
+                "UnknownProvider",
+                json!({"provider": "aws", "supported": ["hetzner-cloud"]}),
+            ),
+            (
+                "InvalidToken",
+                json!({"problem": TokenProblem::WrongLength { got: 5 }.as_str()}),
+            ),
+            ("TokenNotStored", json!({"name": "prod"})),
+            (
+                "SshKeyUnreadable",
+                json!({"path": "/home/a/.ssh/id.pub", "problem": SshKeyProblem::Missing.as_str()}),
+            ),
+            ("NotProvisioned", json!({"name": "prod"})),
+            ("ServerMissing", json!({"name": "prod", "serverId": 42})),
+            (
+                "TargetProvisioned",
+                json!({"name": "prod", "serverId": 42, "serverName": "prod-node"}),
+            ),
+            (
+                "ProviderRequestFailed",
+                json!({"provider": "hetzner-cloud", "endpoint": "GET /v1/locations"}),
+            ),
+            (
+                "ToolUnsupported",
+                json!({"tool": "kubectl", "path": r"C:\tools\kubectl.cmd"}),
+            ),
+            ("Kube", json!({"kind": KubeErrorKind::Unreachable.as_str()})),
+            (
+                "AgeKeyMissing",
+                json!({"path": "/home/a/.config/apprafter/age.key"}),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(expected.len(), samples::VARIANTS);
+        for e in samples::one_of_each() {
+            let name = variant_name(&e);
+            assert_eq!(
+                json!(UiError::from(&e).fields),
+                expected[name.as_str()],
+                "{name}"
+            );
+        }
     }
 
     #[test]

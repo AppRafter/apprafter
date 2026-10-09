@@ -573,6 +573,27 @@ mod tests {
         assert!(took < timeout + Duration::from_millis(1500), "{took:?}");
     }
 
+    /// Review finding 6: the agent resolves every host through [`DeadlineResolver`] (ureq's
+    /// default, `to_socket_addrs`, has no bound). ureq resolves on the requesting thread, an IP
+    /// literal included, so a fresh thread's count is this request's.
+    #[test]
+    fn the_http_agent_resolves_through_the_deadline_resolver() {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let ctx = Context::for_desktop("/s".into(), format!("http://{closed}"))
+            .with_request_timeout(Duration::from_millis(500));
+        let client = ctx.hetzner_client(&SecretString::new("t"));
+        let lookups = std::thread::spawn(move || {
+            let _ = client.list_locations();
+            crate::net::LOOKUPS_ON_THIS_THREAD.with(std::cell::Cell::get)
+        })
+        .join()
+        .unwrap();
+        assert!(lookups >= 1, "the request never asked the DeadlineResolver");
+    }
+
     #[test]
     fn a_secret_handed_over_as_zeroizing_keeps_its_value() {
         let s = SecretString::from(zeroize::Zeroizing::new("tok".to_string()));
