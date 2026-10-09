@@ -15,7 +15,7 @@
 import { Channel } from '@tauri-apps/api/core';
 import { useSyncExternalStore } from 'react';
 import * as api from './api';
-import { IpcError } from './api';
+import { IpcError, uiErrorOf } from './api';
 import { DESKTOP_ERROR_CODES } from './generated/errors';
 import type { OpEvent } from './generated/OpEvent';
 import type { OpId } from './generated/OpId';
@@ -207,11 +207,7 @@ async function follow(opId: OpId, entry: Entry) {
     entry.current = null;
     // Refused because locked: reattachAll follows it again after the unlock.
     if (!isLocked(e)) {
-      const error: UiError =
-        e instanceof IpcError
-          ? e.error
-          : { code: null, message: String(e), help: null, causes: [], fields: {} };
-      entry.view = { ...entry.view, attachError: error };
+      entry.view = { ...entry.view, attachError: uiErrorOf(e) };
       publish();
     }
     return;

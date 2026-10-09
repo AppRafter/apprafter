@@ -56,8 +56,13 @@ function isUiError(value: unknown): value is UiError {
   );
 }
 
-/** A command answers with a UiError; Tauri's own refusals (the ACL, bad arguments) are text. */
-function toUiError(reason: unknown): UiError {
+/**
+ * Whatever a call or a callback rejected with, as the UiError the UI shows: an IpcError's own,
+ * a UiError as it is (a command answers with one), and anything else — Tauri's own refusals (the
+ * ACL, bad arguments) are text — as a message with no code.
+ */
+export function uiErrorOf(reason: unknown): UiError {
+  if (reason instanceof IpcError) return reason.error;
   if (isUiError(reason)) return reason;
   const message = reason instanceof Error ? reason.message : String(reason);
   return { code: null, message, help: null, causes: [], fields: {} };
@@ -67,7 +72,7 @@ async function call<T>(command: ApiCommand, args?: InvokeArgs): Promise<T> {
   try {
     return await invoke<T>(command, args);
   } catch (reason) {
-    throw new IpcError(command, toUiError(reason));
+    throw new IpcError(command, uiErrorOf(reason));
   }
 }
 

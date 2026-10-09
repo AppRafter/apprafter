@@ -1,7 +1,8 @@
 /* SPDX-License-Identifier: FSL-1.1-Apache-2.0 */
 
 /* The primitives in src/components. Components set class names and data-variant / data-tone /
-   data-size; every colour, size and radius here is a tokens.css token. */
+   data-size. Colours, type sizes, radii, control heights, layers and motion are tokens.css
+   tokens; paddings, gaps and icon sizes are the design's own px. */
 
 /* Tones (brief §1.5): text and background per tone, shared by pills and tinted tags. */
 .pill[data-tone="ok"],
@@ -568,4 +569,406 @@
 .field-hint {
   color: var(--fg-faint);
   font-size: var(--fs-12);
+}
+
+/* Modal, FormDialog, ConfirmDialog, InfoSheet --------------------------------------------- */
+
+/* Fills its positioned parent: the tab's overlay host, or the app's for Settings. */
+.modal-layer {
+  position: absolute;
+  inset: 0;
+  z-index: var(--z-dialog);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: var(--overlay);
+}
+
+.modal-layer[data-layer="doctor"] {
+  z-index: var(--z-doctor);
+}
+
+.modal-layer[data-layer="form"] {
+  z-index: var(--z-form);
+}
+
+.modal-layer[data-layer="confirm"] {
+  z-index: var(--z-confirm);
+}
+
+.modal {
+  display: flex;
+  flex-direction: column;
+  max-width: 100%;
+  max-height: 100%;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-6);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.modal-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border);
+}
+
+.modal-icon {
+  flex: none;
+  margin-top: 1px;
+  color: var(--accent-text);
+  font-size: 20px;
+}
+
+.modal-titles {
+  flex: 1;
+  min-width: 0;
+}
+
+.modal-title {
+  margin: 0;
+  font-size: var(--fs-16);
+  font-weight: 700;
+}
+
+.modal-sub {
+  margin-top: 2px;
+  color: var(--fg-muted);
+  font-size: var(--fs-12-5);
+}
+
+.modal-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 6px 20px 20px;
+}
+
+.modal-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 14px 20px;
+  border-top: 1px solid var(--border);
+}
+
+/* The alert layout (Form, Confirm): icon and title in the body, buttons at the bottom. */
+.modal[data-variant="alert"] {
+  overflow: auto;
+  padding: 20px;
+}
+
+.alert-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.alert-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.alert-icon {
+  flex: none;
+  margin-top: 1px;
+  color: var(--accent-text);
+  font-size: 22px;
+}
+
+.alert-icon[data-danger] {
+  color: var(--err);
+}
+
+.alert-titles {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.alert-title {
+  margin: 0;
+  font-size: var(--fs-16);
+  font-weight: 700;
+}
+
+.alert-sub {
+  color: var(--fg-muted);
+  font-size: var(--fs-13);
+  text-wrap: pretty;
+}
+
+.alert-body {
+  color: var(--fg-muted);
+  font-size: var(--fs-13);
+  line-height: 1.55;
+  text-wrap: pretty;
+}
+
+.alert-foot {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.form-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-inline-size: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.chip {
+  height: var(--h-26);
+  padding: 0 9px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-3);
+  background: transparent;
+  color: var(--fg-muted);
+  font: 400 var(--fs-12) var(--font-mono);
+  cursor: pointer;
+}
+
+.chip[aria-pressed="true"] {
+  border-color: var(--accent);
+  background: var(--accent-tint);
+  color: var(--accent-text);
+}
+
+.form-toggle {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: var(--fs-13);
+}
+
+.confirm-plan {
+  padding-left: 34px;
+}
+
+.confirm-require {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-left: 34px;
+}
+
+.confirm-require label {
+  color: var(--fg-muted);
+  font-size: var(--fs-12);
+}
+
+.confirm-require-text {
+  color: var(--fg);
+  font-family: var(--font-mono);
+}
+
+.confirm-require .input {
+  height: var(--h-32);
+  padding: 0 10px;
+  border-color: var(--border-strong);
+}
+
+.confirm-gesture {
+  flex: 1;
+  color: var(--fg-faint);
+  font: 400 var(--fs-11-5) var(--font-mono);
+}
+
+.kv {
+  margin: 0;
+}
+
+.kv-row {
+  display: grid;
+  grid-template-columns: 150px minmax(0, 1fr);
+  gap: 12px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.kv dt {
+  color: var(--fg-muted);
+}
+
+.kv dd {
+  margin: 0;
+  font: 400 var(--fs-12-5) var(--font-mono);
+  overflow-wrap: anywhere;
+}
+
+/* Toast ----------------------------------------------------------------------------------- */
+
+.toast-viewport {
+  position: absolute;
+  right: 16px;
+  bottom: 16px;
+  z-index: var(--z-toast);
+  pointer-events: none;
+}
+
+.toast {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: 420px;
+  padding: 10px 14px;
+  border: 1px solid var(--border-strong);
+  border-left: 2px solid var(--accent);
+  border-radius: var(--r-4);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  font-size: var(--fs-13);
+  pointer-events: auto;
+}
+
+.toast-icon {
+  flex: none;
+  color: var(--accent-text);
+  font-size: 16px;
+}
+
+/* StatePanel ------------------------------------------------------------------------------ */
+
+.state-panel {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 12px;
+  max-width: 440px;
+}
+
+.state-icon {
+  color: var(--fg-muted);
+  font-size: 28px;
+}
+
+.state-panel[data-tone="ok"] .state-icon {
+  color: var(--ok);
+}
+
+.state-panel[data-tone="warn"] .state-icon {
+  color: var(--warn);
+}
+
+.state-panel[data-tone="err"] .state-icon {
+  color: var(--err);
+}
+
+.state-panel[data-tone="accent"] .state-icon {
+  color: var(--accent-text);
+}
+
+.state-title {
+  margin: 0;
+  font-size: var(--fs-18);
+  font-weight: 700;
+}
+
+.state-text {
+  color: var(--fg-muted);
+  font-size: var(--fs-13-5);
+  text-wrap: pretty;
+}
+
+.state-meta {
+  color: var(--fg-faint);
+  font: 400 var(--fs-11-5) var(--font-mono);
+}
+
+.state-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+/* ErrorPanel ------------------------------------------------------------------------------ */
+
+.error-panel {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px 14px;
+  border: 1px solid var(--err);
+  border-radius: var(--r-4);
+  background: var(--err-tint);
+}
+
+.error-icon {
+  flex: none;
+  margin-top: 1px;
+  color: var(--err);
+  font-size: 16px;
+}
+
+.error-main {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.error-message {
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+
+.error-code {
+  color: var(--fg-faint);
+  font: 400 var(--fs-11-5) var(--font-mono);
+}
+
+.error-help {
+  color: var(--fg-muted);
+  font-size: var(--fs-12-5);
+}
+
+.error-causes-toggle {
+  display: inline-flex;
+  align-items: center;
+  align-self: flex-start;
+  gap: 4px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--fg-muted);
+  font-size: var(--fs-12);
+  cursor: pointer;
+}
+
+.error-caret {
+  transition: transform var(--t-fast);
+}
+
+.error-causes-toggle[aria-expanded="true"] .error-caret {
+  transform: rotate(90deg);
+}
+
+.error-causes {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--fg-muted);
+  font: 400 var(--fs-12) var(--font-mono);
+}
+
+.error-actions {
+  margin-top: 4px;
 }

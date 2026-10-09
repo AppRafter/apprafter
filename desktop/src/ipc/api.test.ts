@@ -67,7 +67,11 @@ describe('each function sends its command with camelCase arguments', () => {
   test('every exported function is covered, and together they call every command', async () => {
     const table = cases(new Channel<OpEvent>());
     const functions = Object.entries(api)
-      .filter(([, value]) => typeof value === 'function' && value !== api.IpcError)
+      // Every function but the error helpers calls a command.
+      .filter(
+        ([, value]) =>
+          typeof value === 'function' && value !== api.IpcError && value !== api.uiErrorOf,
+      )
       .map(([name]) => name);
     expect(functions.sort()).toEqual(Object.keys(table).sort());
     for (const [run] of Object.values(table)) await run();
@@ -120,4 +124,25 @@ describe('a rejection is an IpcError', () => {
       fields: {},
     });
   });
+});
+
+test('uiErrorOf reads an IpcError, a UiError, an Error or anything else as a UiError', () => {
+  const locked: UiError = {
+    code: DESKTOP_ERROR_CODES.LOCKED,
+    message: 'AppRafter is locked.',
+    help: null,
+    causes: [],
+    fields: {},
+  };
+  const bare = (message: string): UiError => ({
+    code: null,
+    message,
+    help: null,
+    causes: [],
+    fields: {},
+  });
+  expect(api.uiErrorOf(new api.IpcError('unlock', locked))).toBe(locked);
+  expect(api.uiErrorOf(locked)).toBe(locked);
+  expect(api.uiErrorOf(new Error('boom'))).toEqual(bare('boom'));
+  expect(api.uiErrorOf('refused')).toEqual(bare('refused'));
 });
