@@ -6,6 +6,7 @@
 pub mod name;
 mod pointer;
 mod read;
+mod remove;
 mod rename;
 #[cfg(test)]
 pub(crate) mod testkit;
@@ -13,6 +14,7 @@ pub(crate) mod testkit;
 pub use name::{validate_name, NameProblem, TARGET_NAME_MAX_LEN};
 pub use pointer::{execute_use, plan_use, UsePayload};
 pub use read::{hetzner_token, list, public_address, show};
+pub use remove::{execute_remove, plan_remove, RemovePayload};
 pub use rename::{execute_rename, plan_rename, RenamePayload};
 
 use cli_core::{StoreLock, StoreLockEvent};
