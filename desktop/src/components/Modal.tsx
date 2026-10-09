@@ -33,9 +33,10 @@ const isRadio = (element: Element): element is HTMLInputElement =>
 /**
  * The Tab stops inside `root`, in order. A radio group is one stop, as a browser tabs through it:
  * its checked radio, or its first enabled one when none is checked (review #15) — so the trap's
- * first and last are the stops the browser really moves between.
+ * first and last are the stops the browser really moves between. Exported for the Wizard frame,
+ * which starts a step's focus at its first stop.
  */
-function focusables(root: HTMLElement | null): HTMLElement[] {
+export function focusables(root: HTMLElement | null): HTMLElement[] {
   if (root === null) return [];
   const all = [...root.querySelectorAll<HTMLElement>(FOCUSABLE)].filter(
     (element) =>

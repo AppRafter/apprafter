@@ -1546,3 +1546,99 @@
   padding: 6px 8px;
   border-top: 1px solid var(--border);
 }
+
+/* Wizard ---------------------------------------------------------------------------------- */
+
+/* The form fills the panel, so the body scrolls between a fixed head and foot. */
+.wizard {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
+}
+
+/* The design's head: title, stepper and close on one centred row. */
+.wizard-head {
+  align-items: center;
+  gap: 12px;
+}
+
+.wizard-head > .icon-btn {
+  margin-left: 6px;
+}
+
+.wizard-title {
+  flex: 1;
+  min-width: 0;
+}
+
+.stepper {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 12px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.stepper-step {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--fg-faint);
+  font-size: var(--fs-12);
+  white-space: nowrap;
+}
+
+.stepper-step[data-state="current"] {
+  color: var(--fg);
+}
+
+.stepper-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border: 1px solid var(--border-strong);
+  border-radius: 50%;
+  font: 500 var(--fs-11) var(--font-mono);
+}
+
+.stepper-step[data-state="current"] .stepper-mark {
+  border-color: var(--accent);
+  color: var(--accent-text);
+}
+
+.stepper-step[data-state="done"] .stepper-mark {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--accent-fg);
+}
+
+/* With the head and foot (about 120 px) it fits the smallest window's view: 640 px less the 38 px
+   title bar and the layer's 40 px of padding. Taller content scrolls in the body. */
+.wizard-body {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-height: 330px;
+  padding: 20px;
+}
+
+.wizard-foot {
+  align-items: center;
+}
+
+.wizard-hint {
+  flex: 1;
+  min-width: 0;
+  color: var(--fg-faint);
+  font: 400 var(--fs-11-5) var(--font-mono);
+}
+
+/* The design's Next is 16 px wide at the sides, Back 14. */
+.wizard-foot > .btn[data-variant="primary"] {
+  padding: 0 16px;
+}
