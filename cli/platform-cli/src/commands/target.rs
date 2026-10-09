@@ -655,18 +655,12 @@ pub(crate) fn report_store_lock_event(event: cli_core::StoreLockEvent<'_>) {
     eprintln!("{}", store_lock_event_line(&event));
 }
 
-/// The stderr line for a store-lock event.
+/// The stderr line for a store-lock event: the core's event as the CLI's reporter prints it,
+/// so the commands still on the old code (`apply`, `target firewall`) and the core-backed ones
+/// word a wait and a lock-less store the same way.
 pub(crate) fn store_lock_event_line(event: &cli_core::StoreLockEvent<'_>) -> String {
-    match event {
-        cli_core::StoreLockEvent::Waiting { sentinel } => format!(
-            "waiting for another AppRafter process to release the target store ({})…",
-            sentinel.display()
-        ),
-        cli_core::StoreLockEvent::Unlocked { sentinel, error } => format!(
-            "warning: cannot lock the target store ({}): {error}; continuing without the lock",
-            sentinel.display()
-        ),
-    }
+    crate::render::reporter::CliReporter::line(&apprafter_core::target::store_lock_event(event))
+        .unwrap_or_default()
 }
 
 /// Promote the supplied target to active when the store has no
@@ -728,6 +722,19 @@ mod tests {
             line,
             "warning: cannot lock the target store (/s/.lock): Read-only file system; \
              continuing without the lock"
+        );
+    }
+
+    #[test]
+    fn the_lock_lines_come_from_the_core_event_and_the_cli_reporter() {
+        let sentinel = std::path::Path::new("/s/.lock");
+        let waiting = cli_core::StoreLockEvent::Waiting { sentinel };
+        assert_eq!(
+            store_lock_event_line(&waiting),
+            crate::render::reporter::CliReporter::line(&apprafter_core::target::store_lock_event(
+                &waiting
+            ))
+            .unwrap(),
         );
     }
 
