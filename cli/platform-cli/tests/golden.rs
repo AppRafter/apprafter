@@ -226,6 +226,46 @@ fn harness_stand_in_tools_link_every_probed_tool() {
     }
 }
 
+/// miette wraps a `×` message at 80 columns, breaking inside a word, before the harness swaps
+/// the sandbox root for `<SANDBOX>`; so a case that prints a sandbox path in one matches only
+/// while the root keeps the length it was recorded with. macOS's `TMPDIR`
+/// (`/var/folders/<2>/<30>/T/`) is about 45 characters longer than Linux's `/tmp`. This re-runs
+/// such a case in a child of this test binary with a deliberately long `TMPDIR`: it must match.
+#[test]
+fn harness_a_long_tmpdir_changes_no_golden() {
+    let scratch = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("scratch dir");
+    let long = scratch
+        .path()
+        .join("a-temporary-directory-as-long-as-the-one-macos-hands-every-process");
+    fs::create_dir_all(&long).expect("long TMPDIR");
+    let case = "target_add_with_a_missing_ssh_key";
+    let out = std::process::Command::new(std::env::current_exe().expect("this test binary"))
+        .args(["--exact", case, "--test-threads=1"])
+        .env("TMPDIR", &long)
+        .env_remove(UPDATE_ENV)
+        .output()
+        .expect("re-run the case");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("1 passed"),
+        "`{case}` under TMPDIR={} failed:\n{stdout}\n{}",
+        long.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A spelling of the sandbox root the harness does not know, or a root a wrapped message split
+/// before its last component, leaves the root's own name in the normalised output: that fails
+/// with a clear message on every OS, in update mode too.
+#[test]
+#[should_panic(expected = "the sandbox root survived normalisation")]
+fn harness_refuses_output_that_still_names_the_sandbox_root() {
+    let sb = Sandbox::new();
+    let root = sb.path("").display().to_string();
+    let (head, tail) = root.split_at(3);
+    sb.assert_no_raw_root("harness/split", &format!("× {head}\n  │ {tail}/home\n"));
+}
+
 /// Every recorded file must belong to a case in this file or in
 /// `golden_doctor.rs`; otherwise a renamed or deleted case would leave a
 /// golden that nothing checks.

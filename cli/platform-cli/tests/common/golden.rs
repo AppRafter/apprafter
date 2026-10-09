@@ -8,6 +8,11 @@
 //! byte.
 //!
 //! Every case runs the shipped binary in a hermetic sandbox:
+//! - a root of one fixed length on every machine, `/tmp/.tmpXXXXXX`
+//!   ([`SANDBOX_PARENT`]), whatever `TMPDIR` says: miette wraps a `×`
+//!   message at 80 columns before the root becomes `<SANDBOX>`, so a path
+//!   printed in one would otherwise wrap where the root is longer (macOS's
+//!   `/var/folders/…/T/`);
 //! - a cleared environment, so the caller's env cannot change the result;
 //!   a case may add variables of its own (`Sandbox::with_env`, e.g.
 //!   `HCLOUD_TOKEN`);
@@ -77,6 +82,9 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const CLOSED_PORT_URL: &str = "http://127.0.0.1:1";
 /// Longest a single `apprafter` run may take before it counts as a hang.
 pub const RUN_TIMEOUT: Duration = Duration::from_secs(60);
+/// Where every sandbox is made, never `TMPDIR`: the root is `/tmp/.tmpXXXXXX`, 15 characters on
+/// every Unix machine, the length the goldens were recorded with (see the module docs).
+pub const SANDBOX_PARENT: &str = "/tmp";
 /// 64 ASCII alphanumerics: the shape `cli_core::target` accepts.
 pub const TOKEN_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 pub const TOKEN_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -101,7 +109,7 @@ pub struct Sandbox {
 
 impl Sandbox {
     pub fn new() -> Self {
-        let dir = TempDir::new().expect("tempdir");
+        let dir = TempDir::new_in(SANDBOX_PARENT).expect("sandbox root");
         for sub in ["home", "config", "cache", "apprafter-config", "bin"] {
             fs::create_dir_all(dir.path().join(sub)).expect("sandbox dir");
         }
@@ -335,7 +343,21 @@ impl Sandbox {
                 Err(_) => doc.push_str(&format!("[file {rel}: absent]\n")),
             }
         }
+        self.assert_no_raw_root(case, &doc);
         check(case, &doc);
+    }
+
+    /// Fails when `doc` still names the sandbox root's own directory: a spelling of the root
+    /// the harness does not know, or a root a wrapped message split before its last component.
+    /// Checked before the comparison, so update mode cannot record it either.
+    pub fn assert_no_raw_root(&self, case: &str, doc: &str) {
+        let name = self.dir.path().file_name().expect("root name");
+        let name = name.to_string_lossy();
+        assert!(
+            !doc.contains(name.as_ref()),
+            "golden `{case}`: the sandbox root survived normalisation (`{name}` is still in the \
+             output; a spelling of it the harness does not know, or a wrapped line split it):\n{doc}"
+        );
     }
 }
 
