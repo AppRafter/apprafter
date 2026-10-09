@@ -14,11 +14,21 @@ use predicates::str::contains;
 
 /// `doctor` reaches beyond this machine (`startup.rs`), so without the bypass the startup
 /// checks would call the network from a test (overview §6.2).
+///
+/// Review finding 10 (GOTCHA-66): no doctor test runs a tool of the machine running it. `PATH`
+/// is [`NO_TOOLS`] until a test sets the stand-ins' directory, and `CUE_BIN`, an override the
+/// cue row takes before `PATH`, is removed.
 fn cli() -> Command {
     let mut cmd = Command::cargo_bin("apprafter").unwrap();
-    cmd.env("APPRAFTER_SKIP_STARTUP_CHECKS", "1");
+    cmd.env("APPRAFTER_SKIP_STARTUP_CHECKS", "1")
+        .env("PATH", NO_TOOLS)
+        .env_remove("CUE_BIN");
     cmd
 }
+
+/// A `PATH` that finds nothing: a directory under the `apprafter` binary, which is a file, so
+/// it can never exist. Not an empty `PATH`, whose one empty entry means the current directory.
+const NO_TOOLS: &str = concat!(env!("CARGO_BIN_EXE_apprafter"), "/no-tools");
 
 mod common;
 
@@ -67,6 +77,33 @@ fn the_stand_ins_answer_their_version_call_like_the_real_tools() {
     }
 }
 
+/// The default above holds: through `cli()` alone, doctor finds none of the tools it probes,
+/// whatever the machine running the test has installed (`CUE_BIN` included).
+#[test]
+fn doctor_through_cli_finds_no_tool_of_the_machine_running_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = cli()
+        .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_NO_PING", "1")
+        .env("APPRAFTER_HCLOUD_BASE_URL", "http://127.0.0.1:1")
+        .env("KUBECONFIG", "/nonexistent")
+        .arg("doctor")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for tool in cli_core::tools::ALL {
+        let row = format!("`{}` on PATH", tool.name);
+        let line = stdout
+            .lines()
+            .find(|l| l.contains(&row))
+            .unwrap_or_else(|| panic!("no `{row}` row:\n{stdout}"));
+        assert!(
+            !line.trim_start().starts_with('✓'),
+            "a tool of this machine was found: {line}"
+        );
+    }
+}
+
 fn synthetic_hetzner_token() -> String {
     "a".repeat(64)
 }
@@ -108,16 +145,17 @@ fn doctor_on_empty_store_still_reports_the_environment() {
     // aborting there told them nothing about kubectl, helm, ssh or DNS:
     // precisely what they opened the command to learn.
     //
-    // The exit status is deliberately NOT asserted. It now depends on
-    // whether a REQUIRED tool is present on the machine running the
-    // test, which is not a property of this code path. The exit-code
-    // rule is pinned instead by the empty-PATH goldens
-    // (`golden/doctor/*_empty_path.golden`: a missing kubectl is a FAIL
-    // and `[exit 1]`).
+    // The exit status is deliberately NOT asserted: the tools are
+    // stand-ins, but the DNS row resolves the production API host, which
+    // the machine running the test may not. The exit-code rule is pinned
+    // instead by the empty-PATH goldens (`golden/doctor/*_empty_path.golden`:
+    // a missing kubectl is a FAIL and `[exit 1]`).
     let dir = tempfile::tempdir().unwrap();
+    let tools = tools_on_path();
     let out = cli()
         .env("APPRAFTER_CONFIG_DIR", dir.path())
         .env("APPRAFTER_NO_PING", "1")
+        .env("PATH", tools.path())
         .arg("doctor")
         .output()
         .expect("doctor runs");
@@ -368,6 +406,7 @@ fn a_signal_stops_doctor_and_kills_the_tool_it_was_probing(signal: i32, code: i3
         .env("APPRAFTER_HCLOUD_BASE_URL", "http://127.0.0.1:1")
         .env("KUBECONFIG", "/nonexistent")
         .env("PATH", tools.path())
+        .env_remove("CUE_BIN")
         .arg("doctor")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -485,6 +524,7 @@ fn ctrl_break_stops_doctor_and_kills_the_tool_it_was_probing() {
         .env("APPRAFTER_HCLOUD_BASE_URL", "http://127.0.0.1:1")
         .env("KUBECONFIG", "/nonexistent")
         .env("PATH", tools.path())
+        .env_remove("CUE_BIN")
         .env("APPRAFTER_TOOL_STAND_IN_HANG", "restic")
         .env("APPRAFTER_TOOL_STAND_IN_PID_FILE", &pid_file)
         .arg("doctor")
@@ -623,11 +663,13 @@ fn doctor_of_a_missing_target_creates_no_state_dir() {
         r#"{"hetzner_cloud":{"server_id":9,"server_name":"legacy"}}"#,
     )
     .unwrap();
+    let tools = tools_on_path();
     cli()
         .env("APPRAFTER_CONFIG_DIR", dir.path())
         .env("APPRAFTER_NO_PING", "1")
         .env("APPRAFTER_HCLOUD_BASE_URL", "http://127.0.0.1:1")
         .env("KUBECONFIG", "/nonexistent")
+        .env("PATH", tools.path())
         .current_dir(cwd.path())
         .args(["doctor", "--target", "ghost"])
         .assert()
