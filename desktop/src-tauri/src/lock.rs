@@ -33,7 +33,8 @@
 //!
 //! The start needs the authenticator's answer only to lock at start (`lock_on_start`, the lock
 //! on); otherwise it starts unlocked and asks nothing, the first answer coming in the
-//! background. When it needs it, it waits up to [`STARTUP_WITHIN`]. An answer later than that
+//! background. When it needs it, it waits up to [`STARTUP_WITHIN`], for a question the app
+//! already asked (the shell's, with the settings) if one is out. An answer later than that
 //! starts it locked provisionally — a slow answer never starts it unlocked — and when that
 //! answer comes, it unlocks through a normal transition only if it says nothing can verify the
 //! owner here (rule 3: a lock nobody could open is no lock) and nothing has changed since the

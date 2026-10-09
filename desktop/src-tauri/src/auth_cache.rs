@@ -12,9 +12,9 @@
 //! It asks again ([`AuthCache::refresh`]): at start; after every lock ([`Authenticator::locked`]);
 //! after every prompt and every password check, whatever they answered; after every settings
 //! save (Windows' `hello` changes the method); and whenever `app_info` asks, which then waits
-//! for that answer, bounded ([`AuthCache::fresh`]). One question at a time: asked while one is
-//! out, they become one more question after it. A question that never comes back leaves the
-//! last answer in place, so the idle lock goes on.
+//! for that answer, bounded ([`AuthCache::fresh`]) — before any answer, for the question already
+//! out. One question at a time: asked while one is out, they become one more question after it.
+//! A question that never comes back leaves the last answer in place, so the idle lock goes on.
 //!
 //! It keeps what the OS can do, never an authorisation: every prompt and every password is
 //! asked of the OS afresh. Until the first answer, [`AuthCache::info`] is [`UNANSWERED`],
@@ -94,8 +94,16 @@ impl AuthCache {
 
     /// Ask the OS again, and wait for that answer up to `within`; the answer, or `None` when
     /// it did not come in time (the last one stays in [`known`](Self::known)).
+    ///
+    /// Before the OS has answered anything, a question already out will do: it was asked as the
+    /// app started, so its answer is as fresh as a new one's, and the start's bound holds one
+    /// round trip to the OS rather than two (the settings' question, then this one).
     pub fn fresh(&self, within: Duration) -> Option<AuthInfo> {
-        let question = self.ask();
+        let out = {
+            let state = self.lock();
+            (state.answered == 0 && state.asking).then_some(state.asked)
+        };
+        let question = out.unwrap_or_else(|| self.ask());
         let deadline = Instant::now() + within;
         let mut state = self.lock();
         while state.answered < question {
@@ -358,13 +366,18 @@ mod tests {
         let cache = AuthCache::new(os.clone());
         cache.refresh();
         wait_until("the first question", || os.asked() == 1);
-        // An answer to the question already out is not fresh enough: it waits for its own.
+        answer.send(method(AuthMethod::Polkit)).unwrap();
+        assert!(cache.settled(LONG));
+        cache.refresh();
+        wait_until("the second question", || os.asked() == 2);
+        // Once anything has answered, an answer to the question already out is not fresh
+        // enough: it waits for its own.
         let fresh = {
             let cache = cache.clone();
             thread::spawn(move || cache.fresh(LONG))
         };
         answer.send(method(AuthMethod::Polkit)).unwrap();
-        wait_until("its own question", || os.asked() == 2);
+        wait_until("its own question", || os.asked() == 3);
         assert!(!fresh.is_finished(), "it took the older answer");
         answer.send(method(AuthMethod::Pam)).unwrap();
         assert_eq!(fresh.join().unwrap(), Some(method(AuthMethod::Pam)));
@@ -375,6 +388,24 @@ mod tests {
         assert!(started.elapsed() >= Duration::from_millis(100));
         assert_eq!(cache.info(), method(AuthMethod::Pam));
         drop(answer);
+    }
+
+    /// The start: the settings' question is out and nothing has answered yet. That question was
+    /// asked as the app started, so its answer is as fresh as a new one's, and the start's
+    /// bound (`STARTUP_WITHIN`) holds one round trip to the OS, not two.
+    #[test]
+    fn before_any_answer_fresh_takes_the_question_already_out() {
+        let (os, answer) = Gated::new();
+        let cache = AuthCache::new(os.clone());
+        cache.refresh();
+        wait_until("the first question", || os.asked() == 1);
+        assert_eq!(cache.fresh(Duration::ZERO), None, "nothing to give yet");
+        answer.send(method(AuthMethod::Polkit)).unwrap();
+        // Any later question would be answered at once, and differently.
+        drop(answer);
+        assert!(cache.settled(LONG));
+        assert_eq!(os.asked(), 1, "fresh asked no question of its own");
+        assert_eq!(cache.info(), method(AuthMethod::Polkit));
     }
 
     /// Counts the questions, answering at once.
