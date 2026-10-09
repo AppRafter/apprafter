@@ -19,6 +19,7 @@ export { GlobeHemisphereWestIcon } from '@phosphor-icons/react/dist/csr/GlobeHem
 export { GlobeSimpleIcon } from '@phosphor-icons/react/dist/csr/GlobeSimple';
 export { HardDriveIcon } from '@phosphor-icons/react/dist/csr/HardDrive';
 export { HardDrivesIcon } from '@phosphor-icons/react/dist/csr/HardDrives';
+export { KeyIcon } from '@phosphor-icons/react/dist/csr/Key';
 export { LockSimpleIcon } from '@phosphor-icons/react/dist/csr/LockSimple';
 export { MinusIcon } from '@phosphor-icons/react/dist/csr/Minus';
 export { MoonIcon } from '@phosphor-icons/react/dist/csr/Moon';
@@ -33,6 +34,7 @@ export { SquareIcon } from '@phosphor-icons/react/dist/csr/Square';
 export { SquaresFourIcon } from '@phosphor-icons/react/dist/csr/SquaresFour';
 export { StackIcon } from '@phosphor-icons/react/dist/csr/Stack';
 export { SunIcon } from '@phosphor-icons/react/dist/csr/Sun';
+export { TrashIcon } from '@phosphor-icons/react/dist/csr/Trash';
 export { WarningCircleIcon } from '@phosphor-icons/react/dist/csr/WarningCircle';
 export { WarningOctagonIcon } from '@phosphor-icons/react/dist/csr/WarningOctagon';
 export { XIcon } from '@phosphor-icons/react/dist/csr/X';

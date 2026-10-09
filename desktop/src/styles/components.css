@@ -455,6 +455,113 @@
   cursor: default;
 }
 
+/* Card, PageHeader, PageGrid -------------------------------------------------------------- */
+
+/* The design's card(): a surface of rows under an eyebrow title. */
+.card {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--r-4);
+  background: var(--surface);
+}
+
+.card[data-tone="danger"] {
+  border-color: var(--err);
+}
+
+.card-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 16px 10px;
+}
+
+.card-title {
+  flex: 1;
+  margin: 0;
+  color: var(--fg-faint);
+  font: 500 var(--fs-11) var(--font-mono);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.card[data-tone="danger"] .card-title {
+  color: var(--err);
+}
+
+.card-note {
+  margin: 0;
+  color: var(--fg-faint);
+  font: 400 var(--fs-11-5) var(--font-mono);
+}
+
+.page-titles {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.page-header[data-actions] {
+  flex-direction: row;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.page-actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 8px;
+}
+
+/* The design's mainCols for the Target screen. */
+.page-grid[data-layout="main-side"] {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr);
+  align-items: start;
+  gap: 12px;
+}
+
+/* PlanChanges ----------------------------------------------------------------------------- */
+
+.plan-changes {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.plan-change {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 8px;
+}
+
+.plan-change .tag {
+  flex: none;
+}
+
+.plan-change-object {
+  font-weight: 500;
+}
+
+.plan-change-detail {
+  flex-basis: 100%;
+  color: var(--fg-muted);
+  font: 400 var(--fs-11-5) var(--font-mono);
+  overflow-wrap: anywhere;
+}
+
+.plan-changes-none {
+  margin: 0;
+  color: var(--fg-muted);
+}
+
 /* SettingRow / CardRow -------------------------------------------------------------------- */
 
 .row {
