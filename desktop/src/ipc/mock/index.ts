@@ -9,8 +9,8 @@
 // each answer saying how long as `retryInMs`) — and Unlock finds no polkit agent (`no_agent`).
 // What the session tells the app (`?session=`): by default both its locks and its sleeps, as a
 // desktop session does; or one half, or nothing at all (no bus, as in WSL or a container), for
-// the settings' lock-on-sleep row.
-import type { InvokeArgs } from '@tauri-apps/api/core';
+// the settings' lock-on-sleep row. Operations run on ops.ts's engine (Rust's OperationManager):
+// a destructive plan asks the gesture the way unlocking does, by the same route and back-off.
 import { emit } from '@tauri-apps/api/event';
 import { mockIPC, mockWindows } from '@tauri-apps/api/mocks';
 import type { AppInfo } from '../generated/AppInfo';
@@ -26,6 +26,7 @@ import type { Settings } from '../generated/Settings';
 import type { Theme } from '../generated/Theme';
 import type { UiError } from '../generated/UiError';
 import type { UnavailableReason } from '../generated/UnavailableReason';
+import { createMockOps, type Handler, type MockOps } from './ops';
 
 export { MOCK_TARGETS } from './fixtures';
 
@@ -57,6 +58,11 @@ export interface MockOptions {
   /** `pam`: Linux's PAM route, whatever `os` says. */
   readonly auth?: MockAuth;
   readonly session?: MockSession;
+  /**
+   * How long a mock operation takes before it reports, in milliseconds: long enough in dev
+   * mode (150 by default) to see it running; tests pass 0.
+   */
+  readonly opDelayMs?: number;
 }
 
 const OSES: readonly Os[] = ['windows', 'macos', 'linux'];
@@ -163,6 +169,15 @@ const unavailable = (reason: UnavailableReason): UiError => ({
   fields: { reason },
 });
 
+/** The engine of the last installMockIpc. */
+let current: MockOps | null = null;
+
+/** The engine of the last installMockIpc; tests register plans and reads through it. */
+export function mockOps(): MockOps {
+  if (current === null) throw new Error('mock IPC: installMockIpc() has not run');
+  return current;
+}
+
 export function installMockIpc(options: MockOptions = {}): void {
   const os = options.os ?? 'macos';
   const auth = options.auth === 'pam' ? PAM : AUTH[os];
@@ -182,6 +197,9 @@ export function installMockIpc(options: MockOptions = {}): void {
   let lock = stateOf('startup');
 
   const transition = async (reason: LockReason | null) => {
+    // Rust's lock hook, on every lock and unlock: plans dropped, reads cancelled, every
+    // subscription ended.
+    engine.transition();
     seq += 1;
     lock = stateOf(reason);
     await emit(LOCK_CHANGED, lock);
@@ -197,13 +215,14 @@ export function installMockIpc(options: MockOptions = {}): void {
       ...uiError(DESKTOP_ERROR_CODES.AUTH_FAILED, 'authentication failed'),
       fields,
     });
-  const checkPassword = (password: unknown) => {
+  /** The password field's check, for unlocking and for a destructive plan's gesture alike. */
+  const verifyPassword = (password: unknown): Promise<void> => {
     const now = performance.now();
     // Turned away unchecked: nothing was said, and the right password does not help.
     if (now < refusedUntil) return failed({ exhausted: true, retryInMs: refusedUntil - now });
     if (password === MOCK_PASSWORD) {
       failures = 0;
-      return transition(null);
+      return Promise.resolve();
     }
     failures += 1;
     if (failures < MOCK_BACKOFF.failures) {
@@ -239,14 +258,25 @@ export function installMockIpc(options: MockOptions = {}): void {
     return null;
   };
 
-  const notFound = (args: InvokeArgs | undefined) => {
-    const opId = (args as { opId?: number } | undefined)?.opId;
-    return Promise.reject(
-      uiError(DESKTOP_ERROR_CODES.PLAN_NOT_FOUND, `No plan or operation ${opId} (mock IPC).`),
-    );
-  };
+  // A destructive plan's gesture, by the unlock's route: on the PAM route the field (a prompt
+  // finds no agent), elsewhere the OS's own prompt (the field is refused). Each refusal here is
+  // one after which Rust keeps the plan.
+  const engine = createMockOps({
+    delayMs: options.opDelayMs ?? 150,
+    gesture: (password) => {
+      if (auth.passwordField) {
+        return password === undefined
+          ? Promise.reject(unavailable('no_agent'))
+          : verifyPassword(password);
+      }
+      return password === undefined
+        ? Promise.resolve()
+        : Promise.reject(unavailable('use_system_prompt'));
+    },
+  });
+  current = engine;
 
-  const handlers: Record<string, (args: InvokeArgs | undefined) => unknown> = {
+  const handlers: Record<string, Handler> = {
     app_info: appInfo,
     settings_get: () => settings,
     settings_set: async (args) => {
@@ -270,16 +300,13 @@ export function installMockIpc(options: MockOptions = {}): void {
     unlock_with_password: (args) => {
       if (!lock.locked) return lock;
       if (!auth.passwordField) return Promise.reject(unavailable('use_system_prompt'));
-      return checkPassword((args as { password?: unknown } | undefined)?.password);
+      return verifyPassword((args as { password?: unknown } | undefined)?.password).then(() =>
+        transition(null),
+      );
     },
     activity: () => null,
     quit: () => null,
-    op_list: () => [],
-    op_subscribe: notFound,
-    op_unsubscribe: () => null,
-    op_cancel: notFound,
-    op_discard: () => null,
-    op_execute: notFound,
+    ...engine.handlers,
     window_ready: () => null,
     'plugin:window|set_theme': () => null,
     'plugin:window|minimize': () => null,
