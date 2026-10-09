@@ -39,6 +39,11 @@ pub struct AppInfo {
     /// The host name, `unknown` when the OS does not say.
     pub host: String,
     pub auth: AuthInfo,
+    /// The OS reports its session's locks and sleeps to the app, so `lockOnSleep` can work: the
+    /// watch on them listens. `false` while it does not (yet): the settings show the row
+    /// disabled, with the reason. Final in the first answer — `app_info` waits a short, bounded
+    /// time for the watch to say.
+    pub session_events: bool,
     /// A test build (fake authentication); the UI shows a TEST BUILD banner.
     pub test_build: bool,
     /// Why the settings are defaults this run (an unreadable or newer `settings.json`).
@@ -66,12 +71,13 @@ mod tests {
                 biometrics_choice: false,
                 password_field: false,
             },
+            session_events: true,
             test_build: false,
             settings_notice: None,
         };
         assert_eq!(
             serde_json::to_string(&info).unwrap(),
-            r#"{"os":"linux","desktopVersion":"0.1.0","coreVersion":"0.2.80","secretBackend":"file","account":"rem","host":"box","auth":{"available":false,"method":null,"unavailable":"no_backend","biometricsChoice":false,"passwordField":false},"testBuild":false,"settingsNotice":null}"#
+            r#"{"os":"linux","desktopVersion":"0.1.0","coreVersion":"0.2.80","secretBackend":"file","account":"rem","host":"box","auth":{"available":false,"method":null,"unavailable":"no_backend","biometricsChoice":false,"passwordField":false},"sessionEvents":true,"testBuild":false,"settingsNotice":null}"#
         );
     }
 

@@ -179,9 +179,26 @@ impl LockMachine {
     /// closes an open unlock prompt (the session locked or slept while it was open). With
     /// the lock not in effect it does nothing: there would be no way to unlock.
     pub fn lock(&self, reason: LockReason) {
+        self.lock_if(reason, |_| true);
+    }
+
+    /// The OS session locked or is going to sleep (`apprafter_os_auth::SessionEvent`): with the
+    /// `lock_on_sleep` setting on, [`lock`](Self::lock) with [`LockReason::OsSession`] — the hook
+    /// tells the page as it does of Lock now. With it off, nothing at all: the owner asked the
+    /// app not to follow the OS, and an open unlock prompt stays open.
+    pub fn os_session(&self) {
+        self.lock_if(LockReason::OsSession, |settings| settings.lock_on_sleep);
+    }
+
+    /// [`lock`](Self::lock), when `wanted` says so of the settings in use, asked under the
+    /// machine's lock so a settings change cannot fall between the two.
+    fn lock_if(&self, reason: LockReason, wanted: impl FnOnce(&Settings) -> bool) {
         let info = self.auth.info();
         let close = {
             let mut inner = self.lock_inner();
+            if !wanted(&inner.settings) {
+                return;
+            }
             if inner.reason.is_some() {
                 close_open_prompt(&mut inner)
             } else {
@@ -1537,6 +1554,107 @@ mod tests {
             r.machine.guard("op_list"),
             Err(DesktopError::Locked)
         ));
+    }
+
+    // 5b. The OS session locked or went to sleep.
+
+    #[test]
+    fn an_os_session_event_locks_when_lock_on_sleep_is_on() {
+        let r = rig(unlocked_at_start(), fake());
+        r.clock.set(T0 + MIN);
+        r.machine.os_session();
+        let session = locked(LockReason::OsSession, T0 + MIN, Some(10), 1);
+        assert_eq!(r.machine.state(), session);
+        assert_eq!(
+            r.hooked.calls(),
+            vec![session.clone()],
+            "the page hears it as it hears Lock now"
+        );
+        // Locked already: it keeps why and since, as a lock does.
+        r.machine.os_session();
+        assert_eq!(r.machine.state(), session);
+        assert_eq!(r.hooked.calls().len(), 1);
+    }
+
+    #[test]
+    fn without_lock_on_sleep_or_with_the_lock_not_in_effect_an_os_session_event_does_nothing() {
+        let no_sleep = Settings {
+            lock_on_sleep: false,
+            ..unlocked_at_start()
+        };
+        let off = Settings {
+            lock_enabled: false,
+            ..unlocked_at_start()
+        };
+        for (settings, auth) in [
+            (no_sleep, fake() as Arc<dyn Authenticator>),
+            (off, fake()),
+            (unlocked_at_start(), Arc::new(NoAuthenticator)),
+        ] {
+            let r = rig(settings.clone(), auth);
+            r.machine.os_session();
+            assert!(!r.machine.state().locked, "{settings:?}");
+            assert!(r.hooked.calls().is_empty(), "{settings:?}");
+        }
+    }
+
+    #[test]
+    fn an_os_session_event_closes_the_open_unlock_prompt_only_when_lock_on_sleep_is_on() {
+        // On: the session locked while the prompt was open, so its yes no longer counts.
+        let (prompt, ends) = HeldPrompt::new();
+        let r = rig(Settings::default(), prompt);
+        let first = unlock_in_background(&r.machine);
+        ends.opened.recv_timeout(LONG).expect("the prompt opened");
+        r.machine.os_session();
+        ends.tripped
+            .recv_timeout(LONG)
+            .expect("the event closed it");
+        ends.answer.send(AuthOutcome::Verified).unwrap();
+        let result = first.recv_timeout(LONG).expect("the unlock returned");
+        assert!(
+            matches!(result, Err(DesktopError::AuthCancelled)),
+            "{result:?}"
+        );
+
+        // Off: the owner asked for no reaction to the OS, so the prompt stays open.
+        let (prompt, ends) = HeldPrompt::new();
+        let no_sleep = Settings {
+            lock_on_sleep: false,
+            ..Settings::default()
+        };
+        let r = rig(no_sleep, prompt);
+        let first = unlock_in_background(&r.machine);
+        ends.opened.recv_timeout(LONG).expect("the prompt opened");
+        r.machine.os_session();
+        assert!(
+            ends.tripped
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "the prompt was left open"
+        );
+        ends.answer.send(AuthOutcome::Verified).unwrap();
+        first
+            .recv_timeout(LONG)
+            .expect("the unlock returned")
+            .unwrap();
+        assert!(!r.machine.state().locked);
+    }
+
+    #[test]
+    fn lock_on_sleep_follows_the_saved_settings() {
+        let r = rig(unlocked_at_start(), fake());
+        let no_sleep = Settings {
+            lock_on_sleep: false,
+            ..unlocked_at_start()
+        };
+        r.machine.set_settings(no_sleep, |_| Ok(())).unwrap();
+        r.machine.os_session();
+        assert!(!r.machine.state().locked);
+        r.machine
+            .set_settings(unlocked_at_start(), |_| Ok(()))
+            .unwrap();
+        r.machine.os_session();
+        assert_eq!(r.machine.state().reason, Some(LockReason::OsSession));
     }
 
     // 6. The hook.

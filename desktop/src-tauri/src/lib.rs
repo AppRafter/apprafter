@@ -33,9 +33,9 @@ use crate::settings::SettingsStore;
 /// it; one set but empty or not Unicode stops the start, [`exit_code`] 2), the authenticator
 /// ([`auth::choice`]: the OS's in a release, the fake in a test build), the app itself (the
 /// single-instance plugin first: a second launch only focuses the first window and exits; on
-/// macOS, the app menu), then the log, the settings and the shell, the tickers and, on Linux
-/// and macOS, the quit signals. On Windows the prompts are parented to the main window as soon
-/// as it is built.
+/// macOS, the app menu), then the log, the settings and the shell, the tickers, the OS session
+/// watch (lock-on-sleep) and, on Linux and macOS, the quit signals. On Windows the prompts are
+/// parented to the main window as soon as it is built.
 ///
 /// The log starts once the app is built, so a second launch, which exits while the plugins
 /// start, writes nothing to the running app's log. It is still up before the window: Tauri
@@ -47,7 +47,8 @@ use crate::settings::SettingsStore;
 ///
 /// Every way out the app is told of runs the quit sequence ([`app`]'s module docs): the
 /// event loop's exit request, a quit signal, and the event loop's exit itself, which an exit
-/// the OS forces reaches with no request before it.
+/// the OS forces reaches with no request before it. Each drops the OS session watch once the
+/// running operations have stopped.
 pub fn run() -> Result<(), Box<dyn Error>> {
     runtime::init_runtime()?;
     runtime::install_crypto();
@@ -132,13 +133,13 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     );
     app::install(&app, &cell, shell.clone())?;
     app::start_tickers(&shell)?;
+    // The OS's lock and sleep signals, until a quit drops the watch. Started here, before the
+    // event loop runs: macOS delivers them through it.
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    shell.watch_session(|on_event| Box::new(apprafter_os_auth::watch(on_event)));
     #[cfg(unix)]
-    {
-        let (handle, shell) = (app.handle().clone(), shell.clone());
-        let quit = move |_| app::quit(&handle, &shell);
-        if let Err(e) = signals::on_quit_signals(&signals::QUIT_SIGNALS, quit) {
-            tracing::warn!("a signal will end the app without its quit sequence: {e}");
-        }
+    if let Err(e) = app::quit_on_signals(app.handle(), &shell, &signals::QUIT_SIGNALS) {
+        tracing::warn!("a signal will end the app without its quit sequence: {e}");
     }
 
     app.run(move |app, event| match event {

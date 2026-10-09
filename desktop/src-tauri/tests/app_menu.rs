@@ -16,7 +16,7 @@ use apprafter_core::{Outcome, PlanClass};
 use apprafter_desktop::menu;
 use apprafter_desktop::ops::PlanParts;
 use apprafter_desktop_ipc::errors;
-use common::{code, invoke, lock_off, rig};
+use common::{code, invoke, lock_off, rig, wait_for, watch, Log, WATCH_DROPPED};
 use serde_json::json;
 use tauri::menu::{MenuEvent, MenuId, MenuItemKind};
 
@@ -30,6 +30,8 @@ fn main() {
     println!("ok: on the main thread");
 
     let rig = rig(lock_off());
+    let log = Log::default();
+    watch(&rig, &log);
     let handle = rig._app.handle();
     let bar = menu::app_menu(handle).unwrap();
     let mut items = Vec::new();
@@ -78,6 +80,8 @@ fn main() {
     );
     assert_eq!(code(&reply), Some(errors::CLOSING), "{reply:?}");
     println!("ok: choosing Quit starts the quit: op_execute then answers closing");
+    wait_for(&log, WATCH_DROPPED);
+    println!("ok: choosing Quit drops the OS session watch");
 }
 
 /// Under libtest (`harness = false` gone from Cargo.toml) `main` never runs, and a target with

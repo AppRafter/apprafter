@@ -35,19 +35,37 @@
 //! exits with no exit request. [`Shell::on_exit`] runs the same quit there, with a wait of
 //! [`FORCED_STOP_BOUND`] on the main thread: the process ends as it returns. A process killed
 //! outright (`SIGKILL`, the Task Manager) runs nothing at all.
+//!
+//! # The OS session watch
+//!
+//! [`Shell::watch_session`] keeps the OS's lock and sleep signals (`apprafter_os_auth::watch`):
+//! each one locks the app when `lockOnSleep` says so ([`LockMachine::os_session`]), on the
+//! watch's own thread. The shell keeps the watch until a quit drops it, once the quit has waited
+//! for the running operations ([`quit`]'s thread, or [`Shell::on_exit`]). Dropping it waits for
+//! a callback in progress, and a callback takes the lock machine's lock and the operation
+//! manager's: so it is dropped holding nothing, not even the shell's own hold on it.
+//!
+//! Whether the OS reports its locks and sleeps at all (`AppInfo.sessionEvents`) is known once
+//! the watch listens, which can take a moment (on Linux it connects to two buses). A thread
+//! asks the watch every [`SESSION_READY_POLL`] until it says so, for up to
+//! [`SESSION_READY_WITHIN`], never blocking the main thread; `app_info` (on the blocking pool)
+//! waits for that answer within the same bound rather than answer early. So the page's first
+//! `app_info` already has the final value, and no event is needed: a watch that has not
+//! listened within the bound counts as not reporting.
 
 use std::io;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use apprafter_core::Context;
 use apprafter_desktop_ipc::{
     AppInfo, LockReason, LockState, OpId, Os, Quitting, SecretBackend, Settings, SubscriptionId,
     LOCK_CHANGED, QUITTING,
 };
+use apprafter_os_auth::{SessionEvent, SessionWatch};
 use tauri::ipc::Invoke;
 use tauri::webview::PageLoadEvent;
 use tauri::{AppHandle, Emitter, ExitRequestApi, Manager, Runtime};
@@ -80,6 +98,137 @@ pub const FLUSH_TICK: Duration = Duration::from_millis(crate::ops::reporter::FLU
 /// What `app_info` says when the OS does not name the account or the host.
 const UNKNOWN: &str = "unknown";
 
+/// How long the OS session watch may take to listen before the app counts it as not reporting
+/// (`AppInfo.sessionEvents`), from its start. Also the longest `app_info` waits for the answer.
+pub const SESSION_READY_WITHIN: Duration = Duration::from_secs(2);
+
+/// How often the readiness thread asks the watch whether it listens yet.
+pub const SESSION_READY_POLL: Duration = Duration::from_millis(20);
+
+/// What the OS session watch calls with each signal.
+pub type SessionCallback = Box<dyn Fn(SessionEvent) + Send>;
+
+/// The OS session watch as the shell keeps it: `apprafter_os_auth::SessionWatch` in the app, a
+/// stand-in in the tests. Dropping it stops the watch, waiting for a callback in progress.
+pub trait SessionSource: Send {
+    /// Whether the watch listens, asked without waiting.
+    fn listens(&self) -> bool;
+}
+
+impl SessionSource for SessionWatch {
+    fn listens(&self) -> bool {
+        self.ready(Duration::ZERO)
+    }
+}
+
+/// Where [`Shell`] keeps the session watch, and what it knows of it.
+#[derive(Default)]
+struct Session {
+    state: Mutex<SessionState>,
+    /// Notified when `readiness` leaves `Pending`.
+    known: Condvar,
+}
+
+#[derive(Default)]
+struct SessionState {
+    watch: Option<Box<dyn SessionSource>>,
+    readiness: Readiness,
+    /// How long `readiness` may stay `Pending`.
+    within: Duration,
+    /// A quit dropped the watch: a later one is dropped at once.
+    stopped: bool,
+}
+
+/// Whether the session watch listens.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum Readiness {
+    /// No watch: none started, or the quit dropped it.
+    #[default]
+    None,
+    /// Started; not known yet.
+    Pending,
+    Listens,
+    /// It did not listen within the bound.
+    Silent,
+}
+
+impl Session {
+    fn lock(&self) -> MutexGuard<'_, SessionState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Keeps `watch`, its readiness pending for up to `within`; or drops it, after a quit.
+    fn keep(&self, watch: Box<dyn SessionSource>, within: Duration) -> bool {
+        let mut state = self.lock();
+        if state.stopped {
+            drop(state);
+            drop(watch);
+            return false;
+        }
+        state.watch = Some(watch);
+        state.readiness = Readiness::Pending;
+        state.within = within;
+        true
+    }
+
+    /// The readiness thread's work: ask the watch every [`SESSION_READY_POLL`] until it listens,
+    /// it is dropped, or `out_of_time` says the bound has passed. The lock is held for the
+    /// asking only, so a quit's drop never waits for this.
+    fn settle(&self, out_of_time: impl Fn(&SessionState) -> bool) {
+        loop {
+            {
+                let mut state = self.lock();
+                if state.readiness != Readiness::Pending {
+                    return;
+                }
+                let listens = state.watch.as_ref().is_some_and(|watch| watch.listens());
+                if listens || out_of_time(&state) {
+                    state.readiness = if listens {
+                        Readiness::Listens
+                    } else {
+                        tracing::warn!(
+                            "the OS session watch did not listen within {:?}: lock-on-sleep \
+                             is shown as unavailable",
+                            state.within
+                        );
+                        Readiness::Silent
+                    };
+                    self.known.notify_all();
+                    return;
+                }
+            }
+            thread::sleep(SESSION_READY_POLL);
+        }
+    }
+
+    /// `AppInfo.session_events`: waits while the answer is pending, at most its bound.
+    fn events(&self) -> bool {
+        let state = self.lock();
+        let within = state.within;
+        let (state, _) = self
+            .known
+            .wait_timeout_while(state, within, |state| state.readiness == Readiness::Pending)
+            .unwrap_or_else(PoisonError::into_inner);
+        state.readiness == Readiness::Listens
+    }
+
+    /// Drops the watch, holding nothing: a callback in progress may take any of the shell's
+    /// locks. No watch is kept from here on.
+    fn stop(&self) {
+        let watch = {
+            let mut state = self.lock();
+            state.stopped = true;
+            state.readiness = Readiness::None;
+            self.known.notify_all();
+            state.watch.take()
+        };
+        if watch.is_some() {
+            tracing::info!("the OS session watch stops");
+        }
+        drop(watch);
+    }
+}
+
 /// Everything the commands work on, built once per process.
 pub struct Shell {
     pub settings: SettingsStore,
@@ -96,6 +245,8 @@ pub struct Shell {
     drained: AtomicBool,
     /// Set when the event loop exits: the tickers stop.
     stop: Stop,
+    /// The OS session watch ([`Shell::watch_session`]).
+    session: Arc<Session>,
 }
 
 /// The tickers' stop signal: a ticker waits on it between ticks, so stopping wakes it at once.
@@ -189,12 +340,15 @@ impl Shell {
             quitting: AtomicBool::new(false),
             drained: AtomicBool::new(false),
             stop: Stop::default(),
+            session: Arc::default(),
         })
     }
 
     /// The `app_info` answer. Its `auth` is the authenticator's answer now, never one kept from
     /// the start: it changes (a polkit dialog that found no agent moves Linux to the password
-    /// field, a lock moves it back).
+    /// field, a lock moves it back). Its `session_events` waits, at most
+    /// [`SESSION_READY_WITHIN`], while the watch has not yet said whether it listens (see the
+    /// module docs): call it on a blocking worker, never on the main thread.
     pub fn app_info(&self) -> AppInfo {
         AppInfo {
             os: current_os(),
@@ -204,6 +358,7 @@ impl Shell {
             account: whoami::username().unwrap_or_else(|_| UNKNOWN.into()),
             host: whoami::hostname().unwrap_or_else(|_| UNKNOWN.into()),
             auth: self.auth.info(),
+            session_events: self.session.events(),
             test_build: self.test_build,
             settings_notice: self.settings.notice(),
         }
@@ -288,14 +443,55 @@ impl Shell {
         true
     }
 
+    /// Watch the OS's lock and sleep signals: `start` (`apprafter_os_auth::watch` in the app)
+    /// is called here with the callback, which locks as `lockOnSleep` says
+    /// ([`LockMachine::os_session`]); the shell keeps what it returns until a quit drops it, and
+    /// a thread of its own (`session-ready`) learns whether it listens (see the module docs).
+    /// Call it once. After a quit the watch is dropped at once.
+    pub fn watch_session(&self, start: impl FnOnce(SessionCallback) -> Box<dyn SessionSource>) {
+        self.watch_session_within(start, SESSION_READY_WITHIN);
+    }
+
+    /// [`watch_session`](Self::watch_session), counting a watch silent after `within`.
+    fn watch_session_within(
+        &self,
+        start: impl FnOnce(SessionCallback) -> Box<dyn SessionSource>,
+        within: Duration,
+    ) {
+        let lock = self.lock.clone();
+        let started = Instant::now();
+        let watch = start(Box::new(move |event| {
+            tracing::info!(?event, "the OS session locked or is going to sleep");
+            lock.os_session();
+        }));
+        if !self.session.keep(watch, within) {
+            return;
+        }
+        let session = self.session.clone();
+        let spawned = thread::Builder::new()
+            .name("session-ready".into())
+            .spawn(move || session.settle(|state| started.elapsed() >= state.within));
+        if let Err(e) = spawned {
+            // No waiting here (this may be the main thread): what the watch says now is final.
+            tracing::warn!("no thread to learn whether the OS session watch listens ({e})");
+            self.session.settle(|_| true);
+        }
+    }
+
+    /// Drop the OS session watch (see the module docs): the quit calls it once the running
+    /// operations have stopped. Never while holding a lock the watch's callback takes.
+    pub fn stop_session_watch(&self) {
+        self.session.stop();
+    }
+
     /// The event loop is exiting (`RunEvent::Exit`, on the main thread): the process ends once
     /// this returns.
     ///
     /// When the quit has not waited for the running operations, the exit never went through
     /// [`quit`]: the OS ended the app without asking (see the module docs). The quit begins
     /// here, every subscription ends (the webview goes with the process), and this cancels the
-    /// running operations and waits for them up to [`FORCED_STOP_BOUND`]. Either way the
-    /// tickers stop.
+    /// running operations and waits for them up to [`FORCED_STOP_BOUND`]. Either way the OS
+    /// session watch is dropped, if the quit has not dropped it yet, and the tickers stop.
     pub fn on_exit(&self) {
         if !self.drained.load(SeqCst) {
             tracing::info!("the OS is ending the app: stopping the running operations");
@@ -309,6 +505,7 @@ impl Shell {
                 );
             }
         }
+        self.stop_session_watch();
         self.stop_tickers();
     }
 
@@ -442,6 +639,18 @@ pub fn quit<R: Runtime>(app: &AppHandle<R>, shell: &Arc<Shell>) {
     }
 }
 
+/// Quit ([`quit`]) on the first of `signals` to arrive — the app passes
+/// [`QUIT_SIGNALS`](crate::signals::QUIT_SIGNALS); [`crate::signals`] has the rules.
+#[cfg(unix)]
+pub fn quit_on_signals<R: Runtime>(
+    app: &AppHandle<R>,
+    shell: &Arc<Shell>,
+    signals: &[std::os::raw::c_int],
+) -> io::Result<()> {
+    let (app, shell) = (app.clone(), shell.clone());
+    crate::signals::on_quit_signals(signals, move |_| quit(&app, &shell))
+}
+
 /// A quit waiting for `running` operations tells the page ([`QUITTING`]), which shows that it
 /// is stopping them rather than a window whose every command is refused. With none running it
 /// exits at once, and nothing is said.
@@ -465,6 +674,8 @@ fn drain_and_exit<R: Runtime>(app: &AppHandle<R>, shell: &Shell) {
             "operations still running {STOP_BOUND:?} after the quit cancelled them; exiting"
         );
     }
+    // On this thread, which holds nothing the watch's callback takes.
+    shell.stop_session_watch();
     shell.drained.store(true, SeqCst);
     app.exit(0);
 }
@@ -549,6 +760,7 @@ mod tests {
         errors, AuthInfo, AuthOutcome, AutoLock, CancelledBy, LockReason, LockState, OpEvent, OpId,
         Settings, UnavailableReason,
     };
+    use apprafter_os_auth::SessionEvent;
     use serde_json::json;
 
     use zeroize::Zeroizing;
@@ -1213,6 +1425,176 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// The OS session watch as a test drives it: whether it listens, and what its drop does.
+    struct FakeWatch {
+        listens: Arc<AtomicBool>,
+        /// Run by the drop, as the real watch's drop waits for a callback in progress.
+        on_drop: Option<Box<dyn FnOnce() + Send>>,
+        dropped: mpsc::Sender<thread::ThreadId>,
+    }
+
+    impl super::SessionSource for FakeWatch {
+        fn listens(&self) -> bool {
+            self.listens.load(SeqCst)
+        }
+    }
+
+    impl Drop for FakeWatch {
+        fn drop(&mut self) {
+            if let Some(on_drop) = self.on_drop.take() {
+                on_drop();
+            }
+            let _ = self.dropped.send(thread::current().id());
+        }
+    }
+
+    /// The callback the shell gave the watch, and what tells of the watch's drop.
+    struct Watched {
+        callback: Arc<Mutex<Option<super::SessionCallback>>>,
+        listens: Arc<AtomicBool>,
+        dropped: mpsc::Receiver<thread::ThreadId>,
+    }
+
+    impl Watched {
+        fn signal(&self, event: SessionEvent) {
+            (self.callback.lock().unwrap().as_ref().expect("a watch"))(event);
+        }
+    }
+
+    /// Starts a fake watch on `shell`, listening at once when `listening`, counted silent after
+    /// `within`; `on_drop` runs in its drop.
+    fn watch(
+        shell: &Shell,
+        listening: bool,
+        within: Duration,
+        on_drop: Option<Box<dyn FnOnce() + Send>>,
+    ) -> Watched {
+        let callback = Arc::new(Mutex::new(None));
+        let listens = Arc::new(AtomicBool::new(listening));
+        let (dropped_tx, dropped) = mpsc::channel();
+        shell.watch_session_within(
+            {
+                let (callback, listens) = (callback.clone(), listens.clone());
+                move |on_event| {
+                    *callback.lock().unwrap() = Some(on_event);
+                    Box::new(FakeWatch {
+                        listens,
+                        on_drop,
+                        dropped: dropped_tx,
+                    })
+                }
+            },
+            within,
+        );
+        Watched {
+            callback,
+            listens,
+            dropped,
+        }
+    }
+
+    #[test]
+    fn an_os_lock_or_sleep_locks_as_lock_on_sleep_says_and_the_page_hears_it() {
+        for event in [SessionEvent::Locked, SessionEvent::Sleeping] {
+            let r = rig(unlocked_at_start(), Arc::new(FakeAuthenticator::new()));
+            let watched = watch(&r.shell, true, LONG, None);
+            watched.signal(event);
+            let state = r.shell.lock.state();
+            assert_eq!(state.reason, Some(LockReason::OsSession), "{event:?}");
+            assert_eq!(*r.notified.lock().unwrap(), [state], "{event:?}");
+        }
+        let no_sleep = Settings {
+            lock_on_sleep: false,
+            ..unlocked_at_start()
+        };
+        let r = rig(no_sleep, Arc::new(FakeAuthenticator::new()));
+        watch(&r.shell, true, LONG, None).signal(SessionEvent::Locked);
+        assert!(!r.shell.lock.state().locked);
+        assert!(r.notified.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn app_info_says_whether_the_watch_listens_and_waits_for_the_answer_within_its_bound() {
+        let r = rig(unlocked_at_start(), Arc::new(FakeAuthenticator::new()));
+        let started = Instant::now();
+        assert!(!r.shell.app_info().session_events, "no watch");
+        assert!(started.elapsed() < Duration::from_millis(500), "no wait");
+
+        // It listens a moment after it starts: the first answer waits, and is final.
+        let watched = watch(&r.shell, false, LONG, None);
+        let listens = watched.listens.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(60));
+            listens.store(true, SeqCst);
+        });
+        let started = Instant::now();
+        assert!(r.shell.app_info().session_events);
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_millis(40) && waited < LONG,
+            "{waited:?}"
+        );
+
+        // It never listens: no after its bound, and no wait from then on.
+        let r = rig(unlocked_at_start(), Arc::new(FakeAuthenticator::new()));
+        let bound = Duration::from_millis(150);
+        let _watched = watch(&r.shell, false, bound, None);
+        let started = Instant::now();
+        assert!(!r.shell.app_info().session_events);
+        assert!(started.elapsed() >= bound - Duration::from_millis(50));
+        let started = Instant::now();
+        assert!(!r.shell.app_info().session_events);
+        assert!(started.elapsed() < Duration::from_millis(100), "final");
+    }
+
+    #[test]
+    fn an_exit_drops_the_watch_holding_nothing_its_callback_takes() {
+        // The real watch's drop waits for a callback in progress, which takes the lock
+        // machine's lock and the operation manager's: the stand-in runs one on a thread of its
+        // own and waits for it. Holding either while dropping would never return.
+        let r = rig(unlocked_at_start(), Arc::new(FakeAuthenticator::new()));
+        let callback: Arc<Mutex<Option<super::SessionCallback>>> = Arc::default();
+        let on_drop: Box<dyn FnOnce() + Send> = Box::new({
+            let callback = callback.clone();
+            move || {
+                let callback = callback.lock().unwrap().take().expect("a watch");
+                thread::spawn(move || callback(SessionEvent::Sleeping))
+                    .join()
+                    .unwrap();
+            }
+        });
+        let watched = watch(&r.shell, true, LONG, Some(on_drop));
+        *callback.lock().unwrap() = watched.callback.lock().unwrap().take();
+        assert!(r.shell.app_info().session_events);
+        let ran = Arc::new(AtomicBool::new(false));
+        let pending = plan(&r.shell, &ran);
+        let page = Arc::new(Sink::default());
+        r.shell.ops.subscribe(pending, page.clone()).unwrap();
+
+        let exiting = {
+            let shell = r.shell.clone();
+            thread::spawn(move || shell.on_exit())
+        };
+        let dropper = watched
+            .dropped
+            .recv_timeout(LONG)
+            .expect("the exit dropped the watch, without waiting for itself");
+        assert_eq!(dropper, exiting.thread().id(), "dropped by the exit itself");
+        exiting.join().unwrap();
+        assert_eq!(
+            r.shell.lock.state().reason,
+            Some(LockReason::OsSession),
+            "the callback in progress ran to its end"
+        );
+        assert!(!r.shell.app_info().session_events, "no watch any more");
+        // A watch started after the quit is dropped at once.
+        let late = watch(&r.shell, true, LONG, None);
+        late.dropped
+            .recv_timeout(LONG)
+            .expect("dropped at once after the quit");
+        assert!(!r.shell.app_info().session_events);
     }
 
     #[test]

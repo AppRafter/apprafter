@@ -30,6 +30,7 @@ const INFO: AppInfo = {
     biometricsChoice: true,
     passwordField: false,
   },
+  sessionEvents: true,
   testBuild: false,
   settingsNotice: null,
 };

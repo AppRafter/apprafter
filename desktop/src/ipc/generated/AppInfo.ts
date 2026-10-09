@@ -21,6 +21,13 @@ account: string,
  */
 host: string, auth: AuthInfo, 
 /**
+ * The OS reports its session's locks and sleeps to the app, so `lockOnSleep` can work: the
+ * watch on them listens. `false` while it does not (yet): the settings show the row
+ * disabled, with the reason. Final in the first answer — `app_info` waits a short, bounded
+ * time for the watch to say.
+ */
+sessionEvents: boolean, 
+/**
  * A test build (fake authentication); the UI shows a TEST BUILD banner.
  */
 testBuild: boolean, 

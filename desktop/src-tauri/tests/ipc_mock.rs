@@ -24,7 +24,9 @@ use apprafter_core::{CoreError, Outcome, PlanClass};
 use apprafter_desktop::app;
 use apprafter_desktop::ops::{Executor, PlanParts};
 use apprafter_desktop_ipc::{errors, Settings, Theme, ALLOWED_WHILE_LOCKED, COMMANDS, QUITTING};
-use common::{code, invoke, lock_off, rig, PAM_SAYS, PASSWORD};
+use common::{
+    code, invoke, lock_off, rig, wait_for, watch, Log, Rig, PAM_SAYS, PASSWORD, WATCH_DROPPED,
+};
 use serde_json::{json, Value};
 use tauri::Listener;
 
@@ -392,4 +394,66 @@ fn op_execute_checks_the_confirm_dialog_s_password_when_the_page_sends_one() {
         (2, 2),
         "no password: the OS's prompt"
     );
+}
+
+/// What [`stops_when_cancelled`]'s operation logs as it stops.
+const OP_STOPPED: &str = "the operation stopped";
+
+/// Starts, through `op_execute`, an operation that stops a moment after it is cancelled and logs
+/// that it did.
+fn stops_when_cancelled(rig: &Rig, log: &Log) {
+    let (started_tx, started) = mpsc::channel::<()>();
+    let exec: Executor = {
+        let log = log.clone();
+        Box::new(move |_, cancel| {
+            let _ = started_tx.send(());
+            while !cancel.is_cancelled() {
+                thread::sleep(Duration::from_millis(1));
+            }
+            thread::sleep(Duration::from_millis(50));
+            log.lock().unwrap().push(OP_STOPPED);
+            Err(CoreError::Cancelled)
+        })
+    };
+    let plan = rig.shell.ops.register_plan(
+        PlanParts::new(PlanClass::Bounded, "Upgrade", "upgrade"),
+        exec,
+    );
+    let reply = invoke(
+        rig,
+        "op_execute",
+        json!({ "opId": plan.op_id, "onEvent": "__CHANNEL__:7" }),
+    );
+    assert!(reply.is_ok(), "{reply:?}");
+    started.recv_timeout(Duration::from_secs(5)).unwrap();
+}
+
+/// The quit command drops the OS session watch, and only once the running operations stopped.
+/// (The mock runtime's exit then panics on the quit thread, as in the tests above.)
+#[test]
+fn the_quit_command_drops_the_session_watch_once_the_operations_stopped() {
+    let rig = rig(lock_off());
+    let log = Log::default();
+    watch(&rig, &log);
+    stops_when_cancelled(&rig, &log);
+    assert_eq!(invoke(&rig, "quit", json!({})), Ok(Value::Null));
+    wait_for(&log, WATCH_DROPPED);
+    assert_eq!(*log.lock().unwrap(), [OP_STOPPED, WATCH_DROPPED]);
+}
+
+/// A quit signal takes the same way out: the watch goes once the operations stopped. SIGUSR1,
+/// which nothing else in this binary uses, raised once: a second would end the process.
+#[cfg(unix)]
+#[test]
+fn a_quit_signal_drops_the_session_watch_once_the_operations_stopped() {
+    use signal_hook::consts::SIGUSR1;
+
+    let rig = rig(lock_off());
+    let log = Log::default();
+    watch(&rig, &log);
+    stops_when_cancelled(&rig, &log);
+    app::quit_on_signals(rig._app.handle(), &rig.shell, &[SIGUSR1]).unwrap();
+    signal_hook::low_level::raise(SIGUSR1).unwrap();
+    wait_for(&log, WATCH_DROPPED);
+    assert_eq!(*log.lock().unwrap(), [OP_STOPPED, WATCH_DROPPED]);
 }

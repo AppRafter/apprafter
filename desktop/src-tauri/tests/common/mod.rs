@@ -6,10 +6,12 @@
 //! the process's main thread. Each target compiles its own copy of this module.
 
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use apprafter_core::{CancellationToken, Context};
-use apprafter_desktop::app::{self, Shell, ShellCell};
+use apprafter_desktop::app::{self, SessionSource, Shell, ShellCell};
 use apprafter_desktop::auth::{AuthPurpose, Authenticator, PasswordAnswer};
 use apprafter_desktop::ops::SystemClock;
 use apprafter_desktop::settings::SettingsStore;
@@ -142,4 +144,40 @@ pub fn invoke(rig: &Rig, cmd: &str, args: Value) -> Result<Value, Value> {
 /// The `UiError.code` of a rejection, if it is one.
 pub fn code(reply: &Result<Value, Value>) -> Option<&str> {
     reply.as_ref().err()?.get("code")?.as_str()
+}
+
+/// What happened, in order, as the tests that quit log it.
+pub type Log = Arc<Mutex<Vec<&'static str>>>;
+
+/// What [`Watch`] logs when it is dropped.
+pub const WATCH_DROPPED: &str = "the session watch was dropped";
+
+/// The OS session watch as the IPC tests keep it: it listens at once, and its drop is logged.
+pub struct Watch(Log);
+
+impl SessionSource for Watch {
+    fn listens(&self) -> bool {
+        true
+    }
+}
+
+impl Drop for Watch {
+    fn drop(&mut self) {
+        self.0.lock().unwrap().push(WATCH_DROPPED);
+    }
+}
+
+/// Starts a [`Watch`] on the rig's shell, logging into `log`.
+pub fn watch(rig: &Rig, log: &Log) {
+    let log = log.clone();
+    rig.shell.watch_session(move |_| Box::new(Watch(log)));
+}
+
+/// Waits until `log` holds `entry`; panics after ten seconds.
+pub fn wait_for(log: &Log, entry: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !log.lock().unwrap().contains(&entry) {
+        assert!(Instant::now() < deadline, "never logged: {entry}");
+        thread::sleep(Duration::from_millis(2));
+    }
 }
