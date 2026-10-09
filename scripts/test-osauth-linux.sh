@@ -74,6 +74,7 @@ CASES=(
     "pam_container wrong_passwords_fail_and_the_back_off_refuses_without_asking_pam"
     "pam_container without_a_service_file_there_is_no_pam_service --no-pam-service"
     "pam_container without_an_agent_the_authenticator_moves_to_the_password"
+    "pam_container without_an_agent_or_a_pam_service_nothing_is_left_to_ask --no-pam-service"
     "pam_container without_the_policy_file_the_authenticator_offers_the_password --no-policy"
     "pam_container an_empty_password_is_never_verified --empty-password"
     "pam_container an_administrator_s_no_in_an_active_session_is_final --rule-no"

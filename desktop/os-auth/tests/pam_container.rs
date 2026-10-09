@@ -166,6 +166,32 @@ fn without_a_service_file_there_is_no_pam_service() {
     );
 }
 
+/// The script removed every service the PAM fallback probes for, and there is no agent: the
+/// first dialog finds none, and the password field cannot stand in, so the answer is PAM's
+/// reason, final — not `NoAgent`, which would send the owner to a field that never appears —
+/// and `info` then says the same.
+#[test]
+#[ignore = "needs the PAM container: bash scripts/test-osauth-linux.sh"]
+fn without_an_agent_or_a_pam_service_nothing_is_left_to_ask() {
+    container();
+    let auth = OsAuthenticator::new();
+    assert_eq!(auth.info(), available(AuthMethod::Polkit, false));
+    assert_eq!(
+        auth.verify(Action::Confirm, &CancellationToken::new()),
+        unavailable(UnavailableReason::NoPamService)
+    );
+    assert_eq!(
+        auth.info(),
+        AuthInfo {
+            available: false,
+            method: None,
+            unavailable: Some(UnavailableReason::NoPamService),
+            biometrics_choice: false,
+            password_field: false,
+        }
+    );
+}
+
 /// polkit can prompt as far as its probe tells, so the password is refused, pointing at the
 /// system's prompt (`UseSystemPrompt`, not a final refusal); the first dialog finds no agent,
 /// and from then on the password field stands in and PAM verifies.

@@ -10,7 +10,9 @@
 //! open a dialog can find out. The `NoAgent` finding holds until a later polkit request reaches
 //! an agent (the user started one) or the shell forgets it
 //! ([`OsAuthenticator::reset_agent_memory`], on each lock-screen entry); the others are probed
-//! afresh every time.
+//! afresh every time. A dialog that finds no agent where PAM cannot check a password either (no
+//! PAM service, no account) answers PAM's reason, not `NoAgent`: nothing is left to ask, and
+//! that reason is final, as [`OsAuthenticator::info`] then reports.
 //!
 //! polkit's refusal (its probe's `NotPermittedHere`) is not always "polkit cannot prompt here".
 //! Outside an active local session — none, an inactive one, a remote one — it is the policy's
@@ -212,6 +214,10 @@ impl OsAuthenticator {
     /// [`polkit::verify`]). `Unavailable` means polkit cannot prompt here: [`Self::info`] then
     /// offers the password field, or, for a final refusal, nothing. `cancel` closes the agent's
     /// dialog. `Busy`, asking polkit nothing, while another request runs.
+    ///
+    /// A dialog that finds no agent answers `NoAgent` only where the password field can stand
+    /// in; where PAM cannot check one either, it answers PAM's reason, final and the same as
+    /// [`Self::info`] then reports.
     pub fn verify(&self, action: Action, cancel: &CancellationToken) -> AuthOutcome {
         let _request = match self.request.try_lock() {
             Ok(request) => request,
@@ -221,8 +227,11 @@ impl OsAuthenticator {
         let outcome = self.polkit.verify(action, cancel);
         match outcome {
             AuthOutcome::Unavailable {
-                reason: UnavailableReason::NoAgent,
-            } => self.no_agent.store(true, Ordering::SeqCst),
+                reason: reason @ UnavailableReason::NoAgent,
+            } => {
+                self.no_agent.store(true, Ordering::SeqCst);
+                return self.to_the_field(reason);
+            }
             // An agent asked: it is there now.
             AuthOutcome::Verified
             | AuthOutcome::Failed { .. }
@@ -232,6 +241,18 @@ impl OsAuthenticator {
             _ => {}
         }
         outcome
+    }
+
+    /// polkit's dialog cannot be the way, and the password field would be (`reason`, which is
+    /// not final): `Unavailable { reason }` if PAM can check a password here, else
+    /// `Unavailable` with PAM's reason — final, the field never appears, and [`Self::info`]
+    /// reports that same reason.
+    fn to_the_field(&self, reason: UnavailableReason) -> AuthOutcome {
+        let reason = match self.password.available() {
+            Ok(()) => reason,
+            Err(pam) => pam,
+        };
+        AuthOutcome::Unavailable { reason }
     }
 
     /// Checks the password from the app's own field through PAM (see [`Pam::verify_password`]),
@@ -539,6 +560,47 @@ mod tests {
             );
             assert_eq!(auth.info(), polkit_info(), "{answered:?}: an agent asked");
         }
+    }
+
+    /// No agent, and no password field to stand in (no PAM service, no account): nothing is left
+    /// to ask, so the dialog's answer is PAM's reason, final and the same as `info` then reports
+    /// — not `NoAgent`, which would send the owner to a field that never appears.
+    #[test]
+    fn a_dialog_without_an_agent_where_pam_cannot_check_either_answers_pam_s_reason() {
+        for pam in [NoPamService, NotConfigured] {
+            let (auth, calls) = authenticator(Ok(()), &[unavailable(NoAgent)], Err(pam));
+            assert_eq!(auth.info(), polkit_info(), "{pam:?}");
+            assert_eq!(
+                auth.verify(Action::Confirm, &CancellationToken::new()),
+                unavailable(pam)
+            );
+            assert_eq!(
+                auth.info(),
+                AuthInfo {
+                    available: false,
+                    method: None,
+                    unavailable: Some(pam),
+                    biometrics_choice: false,
+                    password_field: false,
+                },
+                "{pam:?}: info agrees"
+            );
+            assert!(
+                !calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|call| matches!(call, Call::Password(..))),
+                "{pam:?}: PAM was never asked to check anything"
+            );
+        }
+        // Where PAM can check, the field stands in: the answer stays `NoAgent`.
+        let (auth, _) = authenticator(Ok(()), &[unavailable(NoAgent)], Ok(()));
+        assert_eq!(
+            auth.verify(Action::Confirm, &CancellationToken::new()),
+            unavailable(NoAgent)
+        );
+        assert_eq!(auth.info(), pam_info());
     }
 
     /// Answers that say nothing about an agent leave the finding as it is.
