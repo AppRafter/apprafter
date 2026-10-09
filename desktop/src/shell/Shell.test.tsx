@@ -8,12 +8,11 @@ import { ToastProvider } from '../components/Toast';
 import type { AppInfo } from '../ipc/generated/AppInfo';
 import type { OpSummary } from '../ipc/generated/OpSummary';
 import type { Settings } from '../ipc/generated/Settings';
-import { MOCK_TARGETS } from '../ipc/mock/fixtures';
+import type { TargetListReport } from '../ipc/generated/TargetListReport';
 import { refreshList, resetOperations } from '../ipc/operations';
-import { TargetsSource } from '../screens/targets/targets';
 import { PlatformContext } from '../state/platform';
 import { createQueryClient } from '../state/queryClient';
-import { lockState, settings } from '../test/fixtures';
+import { lockState, settings, targetSummary } from '../test/fixtures';
 import { Shell } from './Shell';
 
 const INFO: AppInfo = {
@@ -49,6 +48,17 @@ const NO_AUTH: AppInfo = {
 const NO_AUTH_NOTICE =
   'This computer offers no system authentication AppRafter can use, so the app lock is off.';
 
+/** target_list: prod-eu (the CLI default), staging and lab. */
+const TARGETS: TargetListReport = {
+  targets: [
+    targetSummary(),
+    targetSummary({ name: 'staging', region: 'fsn1', isCliDefault: false }),
+    targetSummary({ name: 'lab', region: 'hel1', isCliDefault: false }),
+  ],
+  unreadable: [],
+  cliDefault: { status: 'set', name: 'prod-eu' },
+};
+
 let calls: string[];
 let summaries: OpSummary[];
 let stored: Settings;
@@ -62,6 +72,7 @@ beforeEach(() => {
     (cmd) => {
       calls.push(cmd);
       if (cmd === 'op_list') return summaries;
+      if (cmd === 'target_list') return TARGETS;
       if (cmd === 'settings_get') return stored;
       if (cmd === 'lock_now') return lockState({ reason: 'manual' });
       if (cmd === 'plugin:window|is_maximized') return false;
@@ -82,11 +93,9 @@ function shell(info: AppInfo = INFO) {
   render(
     <QueryClientProvider client={createQueryClient()}>
       <PlatformContext value={info}>
-        <TargetsSource value={MOCK_TARGETS}>
-          <ToastProvider>
-            <Shell />
-          </ToastProvider>
-        </TargetsSource>
+        <ToastProvider>
+          <Shell />
+        </ToastProvider>
       </PlatformContext>
     </QueryClientProvider>,
   );
@@ -111,19 +120,31 @@ describe('Shell', () => {
   test('starts on the Targets view; a card opens its target in a tab on Overview', async () => {
     const user = shell();
     expect(screen.getByRole('heading', { name: 'Open a cluster' })).toBeDefined();
-    await user.click(screen.getByRole('button', { name: /prod-eu/ }));
+    await user.click(await screen.findByRole('button', { name: 'Open prod-eu' }));
     expect(tab('prod-eu').getAttribute('aria-selected')).toBe('true');
     expect(pageTitle()).toBe('Overview');
     expect(screen.queryByRole('heading', { name: 'Open a cluster' })).toBeNull();
   });
 
+  test('a target with a tab: its card switches to that tab, and opens no second one', async () => {
+    const user = shell();
+    await user.click(await screen.findByRole('button', { name: 'Open prod-eu' }));
+    await user.click(screen.getByRole('button', { name: 'Backups' }));
+    await user.click(screen.getByRole('button', { name: 'Open a cluster' }));
+    await user.click(screen.getByRole('button', { name: 'Switch to prod-eu' }));
+    expect(tab('prod-eu').getAttribute('aria-selected')).toBe('true');
+    expect(screen.getAllByRole('tab')).toHaveLength(1);
+    expect(pageTitle()).toBe('Backups');
+    expect(screen.queryByRole('button', { name: 'Switch to staging' })).toBeNull();
+  });
+
   test('each tab keeps its own section across switches', async () => {
     const user = shell();
-    await user.click(screen.getByRole('button', { name: /prod-eu/ }));
+    await user.click(await screen.findByRole('button', { name: 'Open prod-eu' }));
     await user.click(screen.getByRole('button', { name: 'Backups' }));
     expect(pageTitle()).toBe('Backups');
     await user.click(screen.getByRole('button', { name: 'Open a cluster' }));
-    await user.click(screen.getByRole('button', { name: /staging/ }));
+    await user.click(await screen.findByRole('button', { name: 'Open staging' }));
     expect(pageTitle()).toBe('Overview');
     await user.click(tab('prod-eu'));
     expect(pageTitle()).toBe('Backups');
@@ -131,7 +152,7 @@ describe('Shell', () => {
 
   test('Ctrl+T shows the Targets view; Ctrl+L locks', async () => {
     const user = shell();
-    await user.click(screen.getByRole('button', { name: /prod-eu/ }));
+    await user.click(await screen.findByRole('button', { name: 'Open prod-eu' }));
     await user.keyboard('{Control>}t{/Control}');
     expect(screen.getByRole('heading', { name: 'Open a cluster' })).toBeDefined();
     expect(tab('prod-eu').getAttribute('aria-selected')).toBe('false');
@@ -142,7 +163,7 @@ describe('Shell', () => {
   test('with no system authentication a notice stays under the title bar, on every view', async () => {
     const user = shell(NO_AUTH);
     expect(screen.getByRole('note').textContent).toBe(NO_AUTH_NOTICE);
-    await user.click(screen.getByRole('button', { name: /prod-eu/ }));
+    await user.click(await screen.findByRole('button', { name: 'Open prod-eu' }));
     expect(screen.getByRole('note').textContent).toBe(NO_AUTH_NOTICE);
     cleanup();
     shell();
@@ -177,7 +198,7 @@ describe('Shell', () => {
 
   test('each tab controls its view: a tab panel named by the tab', async () => {
     const user = shell();
-    await user.click(screen.getByRole('button', { name: /prod-eu/ }));
+    await user.click(await screen.findByRole('button', { name: 'Open prod-eu' }));
     const prod = tab('prod-eu');
     const panel = document.getElementById(prod.getAttribute('aria-controls') ?? '');
     expect(panel?.getAttribute('role')).toBe('tabpanel');
@@ -191,7 +212,7 @@ describe('Shell', () => {
     ];
     const user = shell();
     await act(() => refreshList());
-    await user.click(screen.getByRole('button', { name: /prod-eu/ }));
+    await user.click(await screen.findByRole('button', { name: 'Open prod-eu' }));
     // A tab's own dialog.
     await user.click(screen.getByRole('button', { name: '1 running' }));
     const sheet = screen.getByRole('dialog', { name: 'Running operations' });
@@ -213,9 +234,9 @@ describe('Shell', () => {
 
   test('closing the shown tab shows its neighbour, and the last one the Targets view', async () => {
     const user = shell();
-    await user.click(screen.getByRole('button', { name: /prod-eu/ }));
+    await user.click(await screen.findByRole('button', { name: 'Open prod-eu' }));
     await user.click(screen.getByRole('button', { name: 'Open a cluster' }));
-    await user.click(screen.getByRole('button', { name: /staging/ }));
+    await user.click(await screen.findByRole('button', { name: 'Open staging' }));
     await user.click(screen.getByRole('button', { name: 'Close staging' }));
     expect(tab('prod-eu').getAttribute('aria-selected')).toBe('true');
     await user.click(screen.getByRole('button', { name: 'Close prod-eu' }));
@@ -229,7 +250,7 @@ describe('Shell', () => {
     ];
     const user = shell();
     await act(() => refreshList());
-    await user.click(screen.getByRole('button', { name: /prod-eu/ }));
+    await user.click(await screen.findByRole('button', { name: 'Open prod-eu' }));
     await user.click(screen.getByRole('button', { name: '1 running' }));
     expect(screen.getByRole('dialog', { name: 'Running operations' })).toBeDefined();
     // The tab strip stays in reach of a tab's dialog (the shortcuts do not, see below).

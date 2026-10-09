@@ -3,7 +3,6 @@
 // the generated IPC types. Mock data lives here only, never in production code. Nothing here is
 // token-shaped: a draft names its provider, never a token.
 
-import type { TargetSummary as HandTargetSummary } from '../../screens/targets/targets';
 import type { DoctorReport } from '../generated/DoctorReport';
 import type { MachineCatalogue } from '../generated/MachineCatalogue';
 import type { SshKeyCandidate } from '../generated/SshKeyCandidate';
@@ -11,16 +10,6 @@ import type { TargetReport } from '../generated/TargetReport';
 import type { ToolchainReport } from '../generated/ToolchainReport';
 import type { UnreadableTarget } from '../generated/UnreadableTarget';
 import type { WhoamiReport } from '../generated/WhoamiReport';
-
-/**
- * The D.2 Targets view's hand-typed rows, which main.tsx still hands in, in mock mode, until the
- * Targets page reads `target_list` (D.3d, Task 17). The same three targets as MOCK_REPORTS.
- */
-export const MOCK_TARGETS: readonly HandTargetSummary[] = [
-  { name: 'prod-eu', provider: 'hetzner-cloud', region: 'nbg1', tier: 2, cliDefault: true },
-  { name: 'staging', provider: 'hetzner-cloud', region: 'fsn1', tier: 1, cliDefault: false },
-  { name: 'lab', provider: 'hetzner-cloud', region: 'hel1', tier: 1, cliDefault: false },
-];
 
 /** The CLI's default target in a fresh mock store. */
 export const MOCK_CLI_DEFAULT = 'prod-eu';

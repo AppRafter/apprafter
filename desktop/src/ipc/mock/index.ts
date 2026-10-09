@@ -31,8 +31,6 @@ import type { UnavailableReason } from '../generated/UnavailableReason';
 import { createMockOps, type Handler, type MockOps } from './ops';
 import { mockStore, targetHandlers } from './targets';
 
-export { MOCK_TARGETS } from './fixtures';
-
 /** The one password the mock's password field accepts: a demo value, nobody's password. */
 export const MOCK_PASSWORD = 'apprafter';
 

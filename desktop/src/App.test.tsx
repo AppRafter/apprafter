@@ -34,6 +34,8 @@ beforeEach(() => {
       if (cmd === 'lock_status') return lockAnswer();
       if (cmd === 'settings_get') return settingsAnswer();
       if (cmd === 'op_list') return [];
+      if (cmd === 'target_list')
+        return { targets: [], unreadable: [], cliDefault: { status: 'unset' } };
       if (cmd === 'window_ready') themeAtReveal = document.documentElement.dataset.theme;
       return null;
     },
@@ -210,6 +212,8 @@ test('Linux without a polkit agent: the field comes after the refusal, and no lo
       if (cmd === 'lock_status') return lockAnswer();
       if (cmd === 'settings_get') return settingsAnswer();
       if (cmd === 'op_list') return [];
+      if (cmd === 'target_list')
+        return { targets: [], unreadable: [], cliDefault: { status: 'unset' } };
       return null;
     },
     { shouldMockEvents: true },

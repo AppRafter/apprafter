@@ -446,6 +446,13 @@
 
 /* Targets page ---------------------------------------------------------------------------------- */
 
+/* A line about the store as a whole: a CLI default that names no target in it. */
+.page-notice {
+  margin: 0;
+  color: var(--warn);
+  font-size: var(--fs-12-5);
+}
+
 .target-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -468,11 +475,6 @@
 .target-card {
   border: 1px solid var(--border);
   background: var(--surface);
-  cursor: pointer;
-}
-
-.target-card:hover {
-  border-color: var(--border-strong);
 }
 
 .target-card-head {
@@ -502,10 +504,17 @@
   font-size: var(--fs-12);
 }
 
+/* Open (or switch to its tab) and make it the CLI default: the card itself is not a button. */
+.target-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 4px;
+}
+
 /* A target whose files cannot be read: listed, never hidden, and nothing to open. */
 .target-card[data-state="unreadable"] {
   border-color: var(--err);
-  cursor: default;
 }
 
 .target-card-error {

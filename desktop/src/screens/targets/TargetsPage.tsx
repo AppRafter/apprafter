@@ -1,43 +1,103 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
-// The Targets view: every target in the local target store, each opening in its own tab.
-import { PlugIcon } from '../../components/icons';
+// The Targets view: every target in the local target store (target_list), each opening in its
+// own tab; an unreadable one gets a card saying why; a CLI default that names no target says so.
+// Make default for the CLI runs the reversible use plan at once.
+import { useCallback, useState } from 'react';
+import { ErrorPanel } from '../../components/ErrorPanel';
+import { SpinnerGapIcon } from '../../components/icons';
+import { PageHeader } from '../../components/PageHeader';
 import { StatePanel } from '../../components/StatePanel';
+import { uiErrorOf } from '../../ipc/api';
+import type { TargetListReport } from '../../ipc/generated/TargetListReport';
+import type { UiError } from '../../ipc/generated/UiError';
+import { useTargetList } from '../../state/targets';
+import { useMakeDefault } from '../target/actions';
 import { AddTargetCard } from './AddTargetCard';
 import { TargetCard } from './TargetCard';
-import { useTargets } from './targets';
+import { UnreadableCard } from './UnreadableCard';
 
-export function TargetsPage({ onOpen }: { onOpen: (name: string) => void }) {
-  const source = useTargets();
+export interface TargetsPageProps {
+  readonly onOpen: (name: string) => void;
+  /** The targets with a tab: their cards switch to it. */
+  readonly openTargets: ReadonlySet<string>;
+}
+
+export function TargetsPage({ onOpen, openTargets }: TargetsPageProps) {
+  const list = useTargetList();
+  const [failure, setFailure] = useState<UiError | null>(null);
+  const makeDefault = useMakeDefault(setFailure);
+  const onMakeDefault = useCallback(
+    (name: string) => {
+      setFailure(null);
+      void makeDefault(name);
+    },
+    [makeDefault],
+  );
   return (
     <div className="page">
-      <header className="page-header">
-        <h1 className="page-title" data-size="22">
-          Open a cluster
-        </h1>
-        <p className="page-sub">
-          Targets live in your local target store. Each opens in its own tab.
-        </p>
-      </header>
-      {source.kind === 'unavailable' ? (
-        <>
-          <StatePanel
-            icon={PlugIcon}
-            title="No data source yet — target commands arrive in D.3"
-            text="Until then the CLI lists them:"
-            meta="apprafter target list"
-          />
-          <div className="target-grid">
-            <AddTargetCard />
-          </div>
-        </>
+      <PageHeader
+        title="Open a cluster"
+        size={22}
+        sub="Targets live in your local target store. Each opens in its own tab."
+      />
+      {failure !== null && <ErrorPanel error={failure} />}
+      {list.isPending ? (
+        <StatePanel icon={SpinnerGapIcon} spin title="Reading the target store…" />
+      ) : list.isError ? (
+        <ErrorPanel error={uiErrorOf(list.error)} />
       ) : (
-        <div className="target-grid">
-          {source.targets.map((target) => (
-            <TargetCard key={target.name} target={target} onOpen={onOpen} />
-          ))}
-          <AddTargetCard />
-        </div>
+        <Store
+          report={list.data}
+          openTargets={openTargets}
+          onOpen={onOpen}
+          onMakeDefault={onMakeDefault}
+        />
       )}
     </div>
+  );
+}
+
+function Store({
+  report,
+  openTargets,
+  onOpen,
+  onMakeDefault,
+}: {
+  report: TargetListReport;
+  openTargets: ReadonlySet<string>;
+  onOpen: (name: string) => void;
+  onMakeDefault: (name: string) => void;
+}) {
+  const empty = report.targets.length === 0 && report.unreadable.length === 0;
+  return (
+    <>
+      {report.cliDefault.status === 'missing' && (
+        <p className="page-notice">
+          {`The CLI default points at ${report.cliDefault.name}, which is not in the store.`}
+        </p>
+      )}
+      {empty && (
+        <StatePanel
+          title="No targets yet"
+          text="Add one here, or in a terminal:"
+          meta="apprafter target add"
+        />
+      )}
+      <div className="target-grid">
+        {report.targets.map((target) => (
+          <TargetCard
+            key={target.name}
+            target={target}
+            open={openTargets.has(target.name)}
+            onOpen={onOpen}
+            onMakeDefault={onMakeDefault}
+          />
+        ))}
+        {report.unreadable.map((target) => (
+          <UnreadableCard key={target.name} target={target} />
+        ))}
+        <AddTargetCard />
+      </div>
+    </>
   );
 }

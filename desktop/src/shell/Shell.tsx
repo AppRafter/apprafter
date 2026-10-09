@@ -43,6 +43,9 @@ export function Shell() {
     [operations],
   );
 
+  // The targets with a tab: their cards on the Targets view switch to it.
+  const openTargets = useMemo(() => new Set(session.tabs.map((tab) => tab.target)), [session.tabs]);
+
   const [settingsOpen, setSettingsOpen] = useState(false);
   const { lock: lockNow } = useLockActions();
   const toast = useToast();
@@ -130,6 +133,7 @@ export function Shell() {
             {sidebar(null)}
             <main className="main">
               <TargetsPage
+                openTargets={openTargets}
                 onOpen={(target) =>
                   dispatch({ type: 'openTarget', target, key: crypto.randomUUID() })
                 }
