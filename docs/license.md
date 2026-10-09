@@ -12,7 +12,7 @@ per-release basis, and the two-license history left by the
 ## Current state (from [ADR 0032](adr/0032-license-fsl-1-1-apache-2-0.md) onward)
 
 - **Platform core** — `cli/`, `operator/`, `schemas/`, `manifests/`,
-  and platform-internal services are licensed under
+  `desktop/`, and platform-internal services are licensed under
   **`FSL-1.1-Apache-2.0`** (Functional Source License v1.1 with
   Apache 2.0 Future License). See `LICENSE` for the FSL text;
   `LICENSE-APACHE` reproduces the full Apache 2.0 text used as the

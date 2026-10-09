@@ -9,10 +9,10 @@ Every source file in this repository must declare its license via an
 
 Two identifiers are in use across the monorepo:
 
-| Path                                            | SPDX identifier        |
-| ----------------------------------------------- | ---------------------- |
-| `cli/`, `operator/`, `schemas/`, `manifests/`   | `FSL-1.1-Apache-2.0`   |
-| `providers/`, `backstage-plugins/`              | `MIT`                  |
+| Path                                                      | SPDX identifier      |
+| --------------------------------------------------------- | -------------------- |
+| `cli/`, `operator/`, `schemas/`, `manifests/`, `desktop/` | `FSL-1.1-Apache-2.0` |
+| `providers/`, `backstage-plugins/`                        | `MIT`                |
 
 Plugins and SDKs are MIT from day one to keep contribution friction
 minimal; the platform core uses FSL-1.1-Apache-2.0 (see `NOTICE` and

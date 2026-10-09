@@ -55,7 +55,7 @@ By contributing, you agree your contribution is licensed under the
 same terms as the project:
 
 - **FSL-1.1-Apache-2.0** — for the platform core (`cli/`, `operator/`,
-  `schemas/`, `manifests/`, and platform-internal services).
+  `schemas/`, `manifests/`, `desktop/`, and platform-internal services).
 - **MIT** — for plugins (`providers/`, `backstage-plugins/`, and
   community SDKs).
 
