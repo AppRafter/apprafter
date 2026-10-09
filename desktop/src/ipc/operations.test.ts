@@ -363,6 +363,19 @@ describe('execute', () => {
     ]);
   });
 
+  test("the confirm dialog's password goes with op_execute, and none when it gave none", async () => {
+    answerNext('op_execute', 9);
+    answerNext('op_execute', 10);
+    (await execute(5, 'hunter2'))();
+    (await execute(6))();
+    const sent = calls.filter((c) => c.cmd === 'op_execute').map((c) => c.args);
+    expect(sent.map((args) => [args.opId, args.password])).toEqual([
+      [5, 'hunter2'],
+      [6, undefined],
+    ]);
+    expect(Object.keys(sent[1] ?? {})).not.toContain('password');
+  });
+
   test('a rejection is the answer: it throws, and the Failed on its own channel is not shown', async () => {
     const expired = uiError(DESKTOP_ERROR_CODES.PLAN_EXPIRED, 'The plan expired.');
     const answer = deferred<number>();

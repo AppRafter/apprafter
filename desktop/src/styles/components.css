@@ -792,6 +792,23 @@
   border-color: var(--border-strong);
 }
 
+.confirm-password {
+  padding-left: 34px;
+}
+
+.confirm-refusal {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-left: 34px;
+  color: var(--err);
+  font-size: var(--fs-12-5);
+}
+
+.confirm-refusal p {
+  margin: 0;
+}
+
 .confirm-gesture {
   flex: 1;
   color: var(--fg-faint);

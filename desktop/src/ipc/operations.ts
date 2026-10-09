@@ -305,6 +305,8 @@ function releaser(entry: Entry): () => void {
 /**
  * Run the plan `opId` and follow it; resolves with the release once Rust has started it. The
  * execute counts as a follower from the start, so nothing drops the entry while it answers.
+ * `password`: the confirm dialog's own field, where the OS cannot prompt; Rust checks it in
+ * place of the gesture. It is sent once and kept nowhere.
  *
  * The rejection is the answer, thrown as it came. The `Failed` that Rust may also send on this
  * call's channel is dropped, so the error shows once. A subscription the store already held for
@@ -313,7 +315,7 @@ function releaser(entry: Entry): () => void {
  * subscription resumes; any other refusal ends the plan, and the subscription with it — its own
  * `Failed` would repeat the answer.
  */
-export async function execute(opId: OpId): Promise<() => void> {
+export async function execute(opId: OpId, password?: string): Promise<() => void> {
   const entry = entryFor(opId);
   entry.followers += 1;
   const release = releaser(entry);
@@ -322,7 +324,7 @@ export async function execute(opId: OpId): Promise<() => void> {
   entry.executing += 1;
   let id: SubscriptionId;
   try {
-    id = await api.opExecute(opId, sub.channel);
+    id = await api.opExecute(opId, sub.channel, password);
   } catch (e) {
     entry.executing -= 1;
     end(entry, sub, false);
