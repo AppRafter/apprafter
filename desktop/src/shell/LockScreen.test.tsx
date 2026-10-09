@@ -167,6 +167,17 @@ describe('LockScreen', () => {
       expect(unlockButton().disabled).toBe(false);
     }));
 
+  test("the OS's own lockout through its prompt says so, and Unlock stays", async () => {
+    // Windows Hello's RetriesExhausted, or an account Windows locked out: no end is known.
+    unlockAnswer = () => refusal(DESKTOP_ERROR_CODES.AUTH_FAILED, { exhausted: true });
+    const user = lockScreen(lockState(), appInfo({ os: 'windows' }));
+    await user.click(unlockButton());
+    expect((await screen.findByRole('alert')).textContent).toBe(
+      'Too many failed attempts. The system will let you try again later.',
+    );
+    expect(unlockButton().disabled).toBe(false);
+  });
+
   test('no password field unless app_info says the OS cannot prompt', () => {
     lockScreen();
     expect(screen.queryByLabelText(/password/i)).toBeNull();
@@ -318,7 +329,7 @@ describe('LockScreen where the OS cannot prompt: the password field', () => {
     const user = lockScreen(lockState(), PAM);
     await user.keyboard('guess{Enter}');
     expect((await screen.findByRole('alert')).textContent).toBe(
-      'Too many failed attempts. Try again later.',
+      'Too many failed attempts. The system will let you try again later.',
     );
     expect(passwordInput().disabled).toBe(false);
   });

@@ -99,7 +99,7 @@ describe('authRefusal, for the password field', () => {
       expect(
         authRefusal(refused(DESKTOP_ERROR_CODES.AUTH_FAILED, { exhausted: true, messages }), true),
       ).toEqual({
-        lines: [...messages, 'Too many failed attempts. Try again later.'],
+        lines: [...messages, 'Too many failed attempts. The system will let you try again later.'],
         retryInMs: null,
       });
     }
@@ -137,6 +137,23 @@ describe('authRefusal, for either way', () => {
     });
   });
 
+  test("the OS's own lockout through its prompt (Hello, an account locked out): try later", () => {
+    // Not "authentication failed": the account is locked, and saying less would hide it.
+    expect(
+      authRefusal(
+        refused(DESKTOP_ERROR_CODES.AUTH_FAILED, {
+          exhausted: true,
+          // A prompt's refusal carries no words of the OS's; were there any, they stay unsaid.
+          messages: ['not for the prompt'],
+        }),
+        false,
+      ),
+    ).toEqual({
+      lines: ['Too many failed attempts. The system will let you try again later.'],
+      retryInMs: null,
+    });
+  });
+
   test("the OS's own dialog turned away by Rust's back-off (Windows): only the countdown", () => {
     expect(
       authRefusal(
@@ -161,7 +178,8 @@ describe('authRefusal, for either way', () => {
 
   test("anything else is Rust's own message: a prompt's failure, a cancel, another reason", () => {
     for (const error of [
-      refused(DESKTOP_ERROR_CODES.AUTH_FAILED, { exhausted: true }),
+      refused(DESKTOP_ERROR_CODES.AUTH_FAILED, { exhausted: false }),
+      refused(DESKTOP_ERROR_CODES.AUTH_FAILED),
       refused(DESKTOP_ERROR_CODES.AUTH_CANCELLED),
       refused(DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE, { reason: 'policy_missing' }),
       refused(DESKTOP_ERROR_CODES.INTERNAL),

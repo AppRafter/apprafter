@@ -26,8 +26,11 @@ export function retryLine(seconds: number): string {
   return `Too many failed attempts. Try again in ${seconds} s.`;
 }
 
-/** Too many attempts, and nothing says when the next may run (the OS's own limit). */
-const TRY_LATER = 'Too many failed attempts. Try again later.';
+/**
+ * Too many attempts, and the OS's own limit holds — Windows Hello's, an account Windows locked
+ * out, Touch ID's, PAM's — whose end Rust is not told.
+ */
+const TRY_LATER = 'Too many failed attempts. The system will let you try again later.';
 
 const WRONG_PASSWORD = 'That password is not right.';
 
@@ -69,21 +72,22 @@ function retryInMsOf(error: UiError): number | null {
 /**
  * What a refused unlock or confirmation says. `viaField`: the password came from the app's own
  * field, so a failure is about that password — the OS's own words when it gave any. Too many
- * failures: when Rust's back-off holds, how long it does (`retryInMs`, counted down by the
- * page), whichever way the owner was asked (the Windows credential dialog has the back-off
- * too); when the OS's own limit holds, the field says to try later. Any other failure through
- * the OS's prompt is shown as Rust words it.
+ * failures, whichever way the owner was asked: when Rust's back-off holds, how long it does
+ * (`retryInMs`, counted down by the page; the Windows credential dialog has the back-off too);
+ * when the OS's own limit holds, that the system lets the owner try later — never only
+ * "authentication failed", which would hide a locked account. Any other failure through the
+ * OS's prompt is shown as Rust words it.
  */
 export function authRefusal(error: UiError, viaField: boolean): AuthRefusal {
   if (error.code === DESKTOP_ERROR_CODES.AUTH_FAILED) {
     const retryInMs = retryInMsOf(error);
+    const exhausted = error.fields.exhausted === true;
     const said = viaField ? messagesOf(error) : [];
     // Turned away by the back-off itself, the password was not checked: nothing says it was
     // wrong, and the countdown says the rest.
     if (retryInMs !== null) return { lines: said, retryInMs };
+    if (exhausted) return { lines: [...said, TRY_LATER], retryInMs: null };
     if (viaField) {
-      const exhausted = error.fields.exhausted === true;
-      if (exhausted) return { lines: [...said, TRY_LATER], retryInMs: null };
       return { lines: said.length > 0 ? said : [WRONG_PASSWORD], retryInMs: null };
     }
   }
