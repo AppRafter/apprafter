@@ -5,7 +5,7 @@
 // ACTIVITY_INTERVAL_MS. Rust ends every operation subscription on each transition; the
 // operations store forgets them, and after an unlock follows again what is still followed.
 import { useQueryClient } from '@tanstack/react-query';
-import { type ReactNode, useEffect, useRef } from 'react';
+import { type ReactNode, useEffect, useLayoutEffect, useRef } from 'react';
 import { ErrorPanel } from '../components/ErrorPanel';
 import { activity, IpcError, uiErrorOf } from '../ipc/api';
 import { DESKTOP_ERROR_CODES } from '../ipc/generated/errors';
@@ -28,9 +28,11 @@ export function LockGate({ children, now = Date.now }: LockGateProps) {
   const lock = useLockState();
   const locked = lock.data?.locked;
 
-  // Transitions, not events: the unlock's answer and its event change nothing twice.
+  // Transitions, not events: the unlock's answer and its event change nothing twice. A layout
+  // effect, so it runs before the shell's own (passive) effects in the commit that mounts it:
+  // what the shell follows as it mounts is not ended and followed again.
   const previous = useRef<boolean | undefined>(undefined);
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (locked === undefined) return;
     const before = previous.current;
     previous.current = locked;

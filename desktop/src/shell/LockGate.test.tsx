@@ -182,6 +182,28 @@ describe('LockGate', () => {
     expect(calls.filter((c) => c === 'activity')).toHaveLength(1);
   });
 
+  test('after an unlock, what the shell follows as it mounts is subscribed to once', async () => {
+    function Follows() {
+      useEffect(() => attach(7), []);
+      return <div>the shell</div>;
+    }
+    render(
+      <QueryClientProvider client={createQueryClient()}>
+        <PlatformContext value={appInfo()}>
+          <LockGate>
+            <Follows />
+          </LockGate>
+        </PlatformContext>
+      </QueryClientProvider>,
+    );
+    await screen.findByRole('heading', { name: 'AppRafter is locked' });
+    await changed(lockState({ locked: false, sinceMs: 1 }));
+    await screen.findByText('the shell');
+    await act(settle);
+    expect(calls.filter((c) => c === 'op_subscribe')).toHaveLength(1);
+    expect(calls).not.toContain('op_unsubscribe');
+  });
+
   test('a lock forgets what the operations store showed; the unlock follows it again', async () => {
     status = lockState({ locked: false });
     gate();
