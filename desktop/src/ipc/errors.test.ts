@@ -56,3 +56,39 @@ test('the actions key on the generated codes, not on a hand list', () => {
   expect(errorAction(error(CORE_ERROR_CODES.STATE_CORRUPT)).kind).toBe('import');
   expect(errorAction(error(CORE_ERROR_CODES.BACKUP_JOB_ACTIVE)).kind).toBe('backup-status');
 });
+
+// Bug 11, the frontend half: the rules above run on the core's own projections
+// (`UiError::from(&CoreError)`, exported by desktop/ipc/tests/export.rs), never only on
+// hand-made objects. `tokenRejected` is what a ping answers a 401 with (verify, renew).
+const real = (await Bun.file(
+  new URL('./generated/fixtures/ui-errors.json', import.meta.url),
+).json()) as Record<string, UiError>;
+
+test.each([
+  ['hetzner401', 'renew-token'],
+  ['hetzner403', 'none'],
+  ['tokenRejected', 'renew-token'],
+  ['targetExists', 'none'],
+  ['serverTypeUnavailable', 'machine-picker'],
+  ['toolNotFound', 'toolchain'],
+] as const)('the real projection of %s offers %s', (name, kind) => {
+  const ui = real[name];
+  expect(ui, name).toBeDefined();
+  expect(errorAction(ui as UiError).kind).toBe(kind);
+});
+
+test('the real projections carry the fields the UI reads, in camelCase', () => {
+  expect(real.hetzner401?.fields).toMatchObject({
+    status: 401,
+    endpoint: 'GET /v1/locations',
+    apiCode: 'unauthorized',
+  });
+  expect(real.tokenRejected?.fields).toMatchObject({ provider: 'hetzner-cloud', status: 401 });
+  expect(real.serverTypeUnavailable?.fields).toMatchObject({
+    requested: 'cx22',
+    location: 'nbg1',
+    kind: 'retired',
+    context: 'target_add',
+  });
+  expect(real.toolNotFound?.fields).toMatchObject({ tool: 'kubectl', neededBy: 'doctor' });
+});

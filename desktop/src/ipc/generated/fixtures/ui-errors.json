@@ -1,0 +1,68 @@
+{
+  "hetzner401": {
+    "causes": [],
+    "code": "apprafter::provider::hetzner_api_error",
+    "fields": {
+      "apiCode": "unauthorized",
+      "endpoint": "GET /v1/locations",
+      "status": 401
+    },
+    "help": "The Hetzner Cloud API returned a non-2xx response. Common causes:\n• 401 unauthorized — the stored API token was rotated or revoked. Run `apprafter target add <name> --renew --token <new>` to refresh it.\n• 403 forbidden — the token's project lacks permission for this resource type.\n• 429 rate limit — back off and retry; if persistent, the project may need a quota increase.\n• 5xx — provider-side outage; check https://status.hetzner.com/.\nRe-run `apprafter doctor` to confirm reachability after fixing the root cause.",
+    "message": "hetzner-cloud GET /v1/locations failed (status 401): unauthorized: unable to authenticate"
+  },
+  "hetzner403": {
+    "causes": [],
+    "code": "apprafter::provider::hetzner_api_error",
+    "fields": {
+      "apiCode": "forbidden",
+      "endpoint": "GET /v1/locations",
+      "status": 403
+    },
+    "help": "The Hetzner Cloud API returned a non-2xx response. Common causes:\n• 401 unauthorized — the stored API token was rotated or revoked. Run `apprafter target add <name> --renew --token <new>` to refresh it.\n• 403 forbidden — the token's project lacks permission for this resource type.\n• 429 rate limit — back off and retry; if persistent, the project may need a quota increase.\n• 5xx — provider-side outage; check https://status.hetzner.com/.\nRe-run `apprafter doctor` to confirm reachability after fixing the root cause.",
+    "message": "hetzner-cloud GET /v1/locations failed (status 403): forbidden: insufficient permissions"
+  },
+  "serverTypeUnavailable": {
+    "causes": [],
+    "code": "apprafter::provider::server_type_unavailable",
+    "fields": {
+      "context": "target_add",
+      "kind": "retired",
+      "location": "nbg1",
+      "requested": "cx22"
+    },
+    "help": "Hetzner no longer sells `cx22`; pick another type.\nRun the same `apprafter target add prod …` again with another `--server-type <type>`, or leave `--server-type` out and run `apprafter target machine --target prod` later. Nothing was saved.",
+    "message": "server type `cx22` is unavailable in region `nbg1`: retired (no longer orderable)\n  cpx22"
+  },
+  "targetExists": {
+    "causes": [],
+    "code": "apprafter::target::exists",
+    "fields": {
+      "name": "prod"
+    },
+    "help": null,
+    "message": "target `prod` already exists"
+  },
+  "tokenRejected": {
+    "causes": [
+      "hetzner-cloud GET /v1/locations failed (status 401): unauthorized: unable to authenticate"
+    ],
+    "code": "apprafter::target::token_rejected",
+    "fields": {
+      "provider": "hetzner-cloud",
+      "status": 401
+    },
+    "help": "The provider's read-only credential check returned 401 / unauthorized. Either the token was mistyped, never had the right scopes, or has been rotated / revoked since you copied it.\n• Verify the token at https://console.hetzner.cloud/projects → Security → API Tokens. It must say `Read & Write` next to the project.\n• Copy the token again (it's 64 ASCII chars, no prefix) — common cause: trailing newline from a clipboard manager.\n• If you're rotating, run `apprafter target add <name> --renew --token <new>` instead of re-creating the target.\n• Pass `--no-ping` to skip the check if you're seeding a target offline (CI sandbox, intermittent network).",
+    "message": "provider `hetzner-cloud` rejected the supplied token"
+  },
+  "toolNotFound": {
+    "causes": [],
+    "code": "apprafter::env::tool_not_found",
+    "fields": {
+      "neededBy": "doctor",
+      "purpose": "talks to the cluster",
+      "tool": "kubectl"
+    },
+    "help": "Install kubectl.\n\nNothing was sent anywhere and no credential was used: this check runs before the command does any work, so re-running it after installing is safe. `apprafter doctor` lists every external tool the CLI needs.",
+    "message": "`kubectl` is required by `doctor` (talks to the cluster) but is not on PATH"
+  }
+}

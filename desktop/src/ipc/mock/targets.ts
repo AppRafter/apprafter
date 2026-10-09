@@ -14,6 +14,7 @@ import { CORE_ERROR_CODES } from '../generated/core-errors';
 import type { DoctorReport } from '../generated/DoctorReport';
 import type { DraftId } from '../generated/DraftId';
 import { DESKTOP_ERROR_CODES } from '../generated/errors';
+import UI_ERRORS from '../generated/fixtures/ui-errors.json';
 import type { MachineSet } from '../generated/MachineSet';
 import type { OpEvent } from '../generated/OpEvent';
 import type { PlannedChange } from '../generated/PlannedChange';
@@ -113,12 +114,11 @@ const invalidToken = (problem: string) =>
     problem,
   });
 
-/** The demo's 401: a well-formed token starting with `x`. */
-const TOKEN_REJECTED = error(
-  CORE_ERROR_CODES.TARGET_TOKEN_REJECTED,
-  'Hetzner Cloud rejected the token (HTTP 401)',
-  { provider: 'hetzner-cloud', status: 401 },
-);
+/**
+ * The demo's 401 (a well-formed token starting with `x`), as the core projects a ping's 401:
+ * the generated fixture, not a copy that could drift from what Rust sends.
+ */
+const TOKEN_REJECTED = UI_ERRORS.tokenRejected as UiError;
 
 const exists = (name: string) =>
   error(CORE_ERROR_CODES.TARGET_EXISTS, `target \`${name}\` already exists`, { name });

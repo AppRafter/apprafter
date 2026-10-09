@@ -2,8 +2,9 @@
 //! Writes `desktop/src/ipc/generated/`: the TypeScript declarations of every type that crosses
 //! IPC (ts-rs), the command, error-code and event names (`commands.ts`, `errors.ts`,
 //! `events.ts`) from this crate's constants, the core's error codes and target constants
-//! (`core-errors.ts`, `target.ts`), and `fixtures/target-names.json`, the core's own answers to
-//! the target-name rule.
+//! (`core-errors.ts`, `target.ts`), `fixtures/target-names.json`, the core's own answers to the
+//! target-name rule, and `fixtures/ui-errors.json`, the core's own projections of the errors the
+//! UI maps to actions.
 //!
 //! Running it IS the regeneration: `just desktop-ipc-types`. The output is committed, and
 //! `scripts/check-desktop-ipc-types.sh` (CI, `just desktop-check`) fails when a fresh export
@@ -114,6 +115,7 @@ fn export_the_typescript_bindings() {
         target_names_json(),
     )
     .unwrap();
+    fs::write(tmp.path().join("fixtures/ui-errors.json"), ui_errors_json()).unwrap();
 
     let files = files_under(tmp.path());
     check(tmp.path(), &files);
@@ -400,6 +402,76 @@ fn target_names_json() -> String {
         })
         .collect();
     format!("{}\n", serde_json::to_string_pretty(&rows).unwrap())
+}
+
+/// Real projections (`UiError::from(&CoreError)`) of the errors the UI maps to actions: the
+/// frontend's rules are tested on these, never on hand-made objects (bug 11). `tokenRejected` is
+/// what `provider::ping` makes of a 401 (a verify, a renew), the Hetzner error as its cause.
+fn ui_errors_json() -> String {
+    use cli_core::{CliError, SkuCheckFor, UnavailableKind};
+    let hetzner = |status: u16, code: &str, message: &str| CliError::Hetzner {
+        endpoint: "GET /v1/locations".into(),
+        status,
+        code: code.into(),
+        message: message.into(),
+    };
+    let cases: Vec<(&str, CoreError)> = vec![
+        (
+            "hetzner401",
+            hetzner(401, "unauthorized", "unable to authenticate").into(),
+        ),
+        (
+            "hetzner403",
+            hetzner(403, "forbidden", "insufficient permissions").into(),
+        ),
+        (
+            "tokenRejected",
+            CliError::ProviderTokenRejected {
+                provider: "hetzner-cloud".into(),
+                cause: Box::new(hetzner(401, "unauthorized", "unable to authenticate")),
+            }
+            .into(),
+        ),
+        (
+            "targetExists",
+            CoreError::TargetExists {
+                name: "prod".into(),
+            },
+        ),
+        (
+            "serverTypeUnavailable",
+            CliError::ServerTypeUnavailable {
+                requested: "cx22".into(),
+                location: "nbg1".into(),
+                kind: UnavailableKind::Retired,
+                alternatives: "cpx22".into(),
+                context: SkuCheckFor::TargetAdd {
+                    name: "prod".into(),
+                },
+            }
+            .into(),
+        ),
+        (
+            "toolNotFound",
+            CliError::ExternalToolNotFound {
+                tool: "kubectl".into(),
+                needed_by: "doctor".into(),
+                purpose: "talks to the cluster".into(),
+                install: "Install kubectl.".into(),
+            }
+            .into(),
+        ),
+    ];
+    let map: serde_json::Map<String, serde_json::Value> = cases
+        .into_iter()
+        .map(|(name, e)| {
+            (
+                name.to_string(),
+                serde_json::to_value(UiError::from(&e)).unwrap(),
+            )
+        })
+        .collect();
+    format!("{}\n", serde_json::to_string_pretty(&map).unwrap())
 }
 
 fn events_ts() -> String {
