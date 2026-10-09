@@ -17,7 +17,7 @@ use tempfile::TempDir;
 /// stand-in that did would test that path instead of a working tool. Only shell builtins: the
 /// probed child's `PATH` is this directory alone (GOTCHA-104).
 ///
-/// Windows: a hard link of `apprafter-tool-stand-in` (`src/bin/apprafter-tool-stand-in.rs`),
+/// Windows: a hard link of `apprafter-tool-stand-in` (`tests/support/apprafter_tool_stand_in.rs`),
 /// which answers exactly as the script does, the tool being its own file name. Windows runs
 /// only real executables, and the core's resolver takes only `<tool>.exe`, so neither a
 /// script nor a `.cmd` will do. That binary is built only with the `tool-stand-in` feature;

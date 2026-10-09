@@ -27,10 +27,12 @@ path = "src/bin/platform-cli.rs"
 
 # Test-only: the Windows stand-in for the tools `doctor` probes (tests/common/stand_in.rs).
 # Behind `tool-stand-in`, so a release build and `cargo install` never build it; the test
-# runs pass `--all-features` (CI) or `--features tool-stand-in`.
+# runs pass `--all-features` (CI) or `--features tool-stand-in`. It lives under tests/ so its
+# own env reads (the hang and pid-file knobs) stay out of the env-read ratchet in
+# apprafter-core/tests/guards.rs, which counts product code under src/.
 [[bin]]
 name              = "apprafter-tool-stand-in"
-path              = "src/bin/apprafter-tool-stand-in.rs"
+path              = "tests/support/apprafter_tool_stand_in.rs"
 required-features = ["tool-stand-in"]
 test              = false
 doc               = false
