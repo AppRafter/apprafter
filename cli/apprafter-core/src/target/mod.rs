@@ -5,16 +5,21 @@
 
 pub mod name;
 mod read;
+#[cfg(test)]
+pub(crate) mod testkit;
 
 pub use name::{validate_name, NameProblem, TARGET_NAME_MAX_LEN};
 pub use read::{hetzner_token, public_address};
 
+use cli_core::{StoreLock, StoreLockEvent};
 use serde::Serialize;
 
-use crate::error::UiError;
+use crate::context::Context;
+use crate::error::{CoreResult, UiError};
 use crate::provider::Verification;
+use crate::report::{Event, Reporter};
 use crate::ssh::SshKeyInfo;
-use crate::target_ref::ActivePointerChange;
+use crate::target_ref::{ActivePointerChange, TargetRef};
 
 /// One row of the target list (read from `config.yaml` only: no credentials).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -218,4 +223,158 @@ pub struct MachineSet {
     pub sku: String,
     pub region: Option<String>,
     pub sku_check: SkuCheck,
+}
+
+/// The event a store-lock report becomes. The CLI prints a `Notice` verbatim and a `Warning`
+/// as `warning: <message>`, which is exactly what it printed before the core existed.
+pub fn store_lock_event(event: &StoreLockEvent<'_>) -> Event {
+    match event {
+        StoreLockEvent::Waiting { sentinel } => Event::Notice {
+            message: format!(
+                "waiting for another AppRafter process to release the target store ({})…",
+                sentinel.display()
+            ),
+        },
+        StoreLockEvent::Unlocked { sentinel, error } => Event::Warning {
+            message: format!(
+                "cannot lock the target store ({}): {error}; continuing without the lock",
+                sentinel.display()
+            ),
+        },
+    }
+}
+
+/// The store lock, creating the root (an add on a fresh store must lock it). Never held across
+/// the network: every `execute_*` does its provider calls first.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "first caller: execute_use (D.3b Task 6)")
+)]
+pub(crate) fn lock_store(ctx: &Context, reporter: &dyn Reporter) -> CoreResult<StoreLock> {
+    Ok(StoreLock::exclusive_or_wait(&ctx.store(), |e| {
+        reporter.report(store_lock_event(&e))
+    })?)
+}
+
+/// The store lock, or none when the root does not exist (a command that will fail on a missing
+/// store must not create one by locking it).
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "first caller: execute_use (D.3b Task 6)")
+)]
+pub(crate) fn lock_store_if_present(
+    ctx: &Context,
+    reporter: &dyn Reporter,
+) -> CoreResult<Option<StoreLock>> {
+    if ctx.config_root().exists() {
+        lock_store(ctx, reporter).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+/// What `state/<name>/.apprafter/state.json` records about a server. Reads only that file —
+/// the legacy `<cwd>/.apprafter` migration is the CLI's (spec §3.1). Lockless: state files are
+/// replaced atomically.
+pub fn provisioned(ctx: &Context, target: &TargetRef) -> CoreResult<Option<ProvisionedServer>> {
+    let paths = cli_state::StatePaths::for_active_target(&ctx.store(), target.name());
+    Ok(cli_state::State::load_or_default(&paths)?
+        .hetzner_cloud
+        .map(|h| ProvisionedServer {
+            server_id: h.server_id,
+            server_name: h.server_name,
+            server_type: h.server_type,
+        }))
+}
+
+#[cfg(test)]
+mod helper_tests {
+    use super::testkit::*;
+    use super::*;
+    use crate::report::{CollectReporter, Event};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_lock_event_is_a_notice_or_a_warning_with_todays_words() {
+        let sentinel = std::path::Path::new("/s/.lock");
+        assert_eq!(
+            store_lock_event(&cli_core::StoreLockEvent::Waiting { sentinel }),
+            Event::Notice {
+                message:
+                    "waiting for another AppRafter process to release the target store (/s/.lock)…"
+                        .into()
+            }
+        );
+        let error = std::io::Error::other("Read-only file system");
+        assert_eq!(
+            store_lock_event(&cli_core::StoreLockEvent::Unlocked {
+                sentinel,
+                error: &error
+            }),
+            Event::Warning {
+                message: "cannot lock the target store (/s/.lock): Read-only file system; \
+                          continuing without the lock"
+                    .into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_held_store_is_waited_for_and_the_wait_is_reported() {
+        let (_d, ctx) = store(&["prod"], Some("prod"));
+        let held = cli_core::StoreLock::exclusive(&ctx.store()).unwrap();
+        let reporter = std::sync::Arc::new(CollectReporter::new());
+        let (r, c) = (reporter.clone(), ctx.clone());
+        let waiter = std::thread::spawn(move || lock_store(&c, &*r).map(|_| ()));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut seen = Vec::new();
+        while seen.is_empty() {
+            assert!(Instant::now() < deadline, "the wait was never reported");
+            seen.extend(reporter.take());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(held);
+        waiter.join().unwrap().unwrap();
+        assert!(
+            matches!(&seen[0], Event::Notice { message } if message.starts_with("waiting for another"))
+        );
+    }
+
+    #[test]
+    fn no_store_root_means_no_lock_and_no_root_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = Context::for_desktop(dir.path().join("absent"), "http://unused");
+        assert!(lock_store_if_present(&ctx, &crate::NullReporter)
+            .unwrap()
+            .is_none());
+        assert!(!dir.path().join("absent").exists());
+    }
+
+    #[test]
+    fn provisioned_reads_each_targets_own_state() {
+        let (_d, ctx) = store(&["prod", "dev"], Some("prod"));
+        seed_server(&ctx, "prod", 42, "platform-1", Some("cx22"));
+        let prod = TargetRef::named(&ctx, "prod").unwrap();
+        let dev = TargetRef::named(&ctx, "dev").unwrap();
+        assert_eq!(
+            provisioned(&ctx, &prod).unwrap(),
+            Some(ProvisionedServer {
+                server_id: 42,
+                server_name: "platform-1".into(),
+                server_type: Some("cx22".into())
+            })
+        );
+        assert_eq!(provisioned(&ctx, &dev).unwrap(), None);
+    }
+
+    #[test]
+    fn a_corrupt_state_is_the_state_corrupt_error() {
+        let (_d, ctx) = store(&["prod"], Some("prod"));
+        seed_state_raw(&ctx, "prod", "{not json");
+        let e = provisioned(&ctx, &TargetRef::named(&ctx, "prod").unwrap()).unwrap_err();
+        assert_eq!(
+            UiError::from(&e).code.as_deref(),
+            Some("apprafter::state::corrupt")
+        );
+    }
 }
