@@ -232,6 +232,7 @@ name = "apprafter-desktop-ipc"
 version = "0.0.0"
 dependencies = [
  "apprafter-core",
+ "cli-core",
  "serde",
  "serde_json",
  "tempfile",

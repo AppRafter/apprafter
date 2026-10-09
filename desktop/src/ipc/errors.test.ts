@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 import { expect, test } from 'bun:test';
 import { type ErrorAction, errorAction } from './errors';
+import { CORE_ERROR_CODES } from './generated/core-errors';
 import { DESKTOP_ERROR_CODES } from './generated/errors';
 import type { JsonValue } from './generated/serde_json/JsonValue';
 import type { UiError } from './generated/UiError';
@@ -34,7 +35,6 @@ const rows: [string, UiError, ErrorAction['kind']][] = [
   ],
   ['state corrupt', error('apprafter::state::corrupt'), 'import'],
   ['backup job active', error('apprafter::backup::job_active'), 'backup-status'],
-  ['target busy', error('apprafter::target::busy'), 'running-op'],
   ['locked: the gate shows the lock', error(DESKTOP_ERROR_CODES.LOCKED), 'none'],
   ['any other code', error('apprafter::op::cancelled'), 'none'],
   ['no code', error(null), 'none'],
@@ -43,4 +43,16 @@ const rows: [string, UiError, ErrorAction['kind']][] = [
 
 test.each(rows)('%s', (_, ui, kind) => {
   expect(errorAction(ui)).toEqual({ kind });
+});
+
+test('the actions key on the generated codes, not on a hand list', () => {
+  expect(errorAction(error(CORE_ERROR_CODES.TARGET_NOT_FOUND)).kind).toBe('add-target');
+  expect(errorAction(error(CORE_ERROR_CODES.TARGET_TOKEN_REJECTED)).kind).toBe('renew-token');
+  expect(errorAction(error(CORE_ERROR_CODES.PROVIDER_SERVER_TYPE_UNAVAILABLE)).kind).toBe(
+    'machine-picker',
+  );
+  expect(errorAction(error(CORE_ERROR_CODES.ENV_TOOL_NOT_FOUND)).kind).toBe('toolchain');
+  expect(errorAction(error(CORE_ERROR_CODES.ENV_CUE_NOT_FOUND)).kind).toBe('toolchain');
+  expect(errorAction(error(CORE_ERROR_CODES.STATE_CORRUPT)).kind).toBe('import');
+  expect(errorAction(error(CORE_ERROR_CODES.BACKUP_JOB_ACTIVE)).kind).toBe('backup-status');
 });

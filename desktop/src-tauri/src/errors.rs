@@ -10,7 +10,7 @@
 //! projection every command returns.
 
 use apprafter_core::{CoreError, UiError};
-use apprafter_desktop_ipc::{OpId, UnavailableReason};
+use apprafter_desktop_ipc::{DraftId, OpId, UnavailableReason};
 use miette::Diagnostic;
 use thiserror::Error;
 
@@ -80,6 +80,20 @@ pub enum DesktopError {
     )]
     Closing,
 
+    #[error("no verified token waits as draft {}", draft_id.0)]
+    #[diagnostic(
+        code(apprafter::desktop::draft_not_found),
+        help("It was used, discarded, or dropped when AppRafter locked; verify the token again.")
+    )]
+    DraftNotFound { draft_id: DraftId },
+
+    #[error("the verified token of draft {} expired", draft_id.0)]
+    #[diagnostic(
+        code(apprafter::desktop::draft_expired),
+        help("A verified token waits 10 minutes; verify it again.")
+    )]
+    DraftExpired { draft_id: DraftId },
+
     #[error(transparent)]
     #[diagnostic(transparent)]
     Core(#[from] CoreError),
@@ -96,9 +110,9 @@ fn wire_name(reason: &UnavailableReason) -> String {
 
 impl DesktopError {
     /// What a command returns: the diagnostic's code, message, help and causes, plus the
-    /// structured `fields` the webview acts on (`opId`, `reason`, `exhausted`, and `retryInMs`
-    /// when the back-off says how long it still refuses — camelCase, as every other key on the
-    /// wire). A core error keeps the core's own projection.
+    /// structured `fields` the webview acts on (`opId`, `draftId`, `reason`, `exhausted`, and
+    /// `retryInMs` when the back-off says how long it still refuses — camelCase, as every other
+    /// key on the wire). A core error keeps the core's own projection.
     pub fn to_ui(&self) -> UiError {
         if let DesktopError::Core(core) = self {
             return UiError::from(core);
@@ -107,6 +121,10 @@ impl DesktopError {
         match self {
             DesktopError::PlanNotFound { op_id } | DesktopError::PlanExpired { op_id } => {
                 ui.fields.insert("opId".into(), serde_json::json!(op_id.0));
+            }
+            DesktopError::DraftNotFound { draft_id } | DesktopError::DraftExpired { draft_id } => {
+                ui.fields
+                    .insert("draftId".into(), serde_json::json!(draft_id.0));
             }
             DesktopError::AuthFailed {
                 exhausted,
@@ -175,7 +193,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use apprafter_core::{CoreError, UiError};
-    use apprafter_desktop_ipc::{errors, OpId, UnavailableReason};
+    use apprafter_desktop_ipc::{errors, DraftId, OpId, UnavailableReason};
     use serde_json::json;
 
     use super::{DesktopError, Refusal};
@@ -199,6 +217,12 @@ mod tests {
             DesktopError::SettingsIo("disk full".into()),
             DesktopError::Internal("bug".into()),
             DesktopError::Closing,
+            DesktopError::DraftNotFound {
+                draft_id: DraftId(3),
+            },
+            DesktopError::DraftExpired {
+                draft_id: DraftId(3),
+            },
         ]
     }
 
@@ -214,6 +238,8 @@ mod tests {
             DesktopError::SettingsIo(_) => errors::SETTINGS_IO,
             DesktopError::Internal(_) => errors::INTERNAL,
             DesktopError::Closing => errors::CLOSING,
+            DesktopError::DraftNotFound { .. } => errors::DRAFT_NOT_FOUND,
+            DesktopError::DraftExpired { .. } => errors::DRAFT_EXPIRED,
             DesktopError::Core(_) => return None,
         })
     }
@@ -245,6 +271,28 @@ mod tests {
                 "camelCase like every other wire key: {ui:?}"
             );
             assert!(ui.message.contains("42"), "{}", ui.message);
+            assert!(ui.help.is_some());
+        }
+    }
+
+    #[test]
+    fn draft_errors_carry_the_draft_id_as_a_number() {
+        for e in [
+            DesktopError::DraftNotFound {
+                draft_id: DraftId(3),
+            },
+            DesktopError::DraftExpired {
+                draft_id: DraftId(3),
+            },
+        ] {
+            let ui = e.to_ui();
+            assert_eq!(ui.fields["draftId"], json!(3), "{ui:?}");
+            assert_eq!(
+                ui.fields.len(),
+                1,
+                "camelCase like every other wire key: {ui:?}"
+            );
+            assert!(ui.message.contains('3'), "{}", ui.message);
             assert!(ui.help.is_some());
         }
     }

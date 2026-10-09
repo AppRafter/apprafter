@@ -11,6 +11,7 @@ mod lock;
 mod ops;
 mod quit;
 mod settings;
+mod targets;
 
 /// The command names. Plain Rust with no imports: `src-tauri/build.rs` `include!`s it.
 pub mod commands;
@@ -25,6 +26,7 @@ pub use ops::{
 };
 pub use quit::{Quitting, QUITTING};
 pub use settings::{AutoLock, Refresh, Settings, Theme};
+pub use targets::{CatalogueSourceArg, DraftId, TargetAddArgs, TokenVerified};
 
 /// What every failed command returns: the core's serialisable error projection.
 pub use apprafter_core::UiError;

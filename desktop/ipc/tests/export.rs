@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Writes `desktop/src/ipc/generated/`: the TypeScript declarations of every type that crosses
-//! IPC (ts-rs), and the command, error-code and event names (`commands.ts`, `errors.ts`,
-//! `events.ts`) from this crate's constants.
+//! IPC (ts-rs), the command, error-code and event names (`commands.ts`, `errors.ts`,
+//! `events.ts`) from this crate's constants, the core's error codes and target constants
+//! (`core-errors.ts`, `target.ts`), and `fixtures/target-names.json`, the core's own answers to
+//! the target-name rule.
 //!
 //! Running it IS the regeneration: `just desktop-ipc-types`. The output is committed, and
 //! `scripts/check-desktop-ipc-types.sh` (CI, `just desktop-check`) fails when a fresh export
@@ -19,30 +21,33 @@ use std::path::{Path, PathBuf};
 use apprafter_core::doctor::{
     Check, CheckFix, CheckGroup, CheckId, CheckStatus, DoctorReport, GroupId, RenewWhy,
 };
+use apprafter_core::error::codes;
 use apprafter_core::kube::{KubeErrorKind, KubeVersion};
 use apprafter_core::machine::{
     DeprecationView, MachineCatalogue, MachineOfferView, RegionLatency, RegionView,
 };
-use apprafter_core::provider::{SkipReason, TokenCheck, Verification};
+use apprafter_core::provider::{SkipReason, TokenCheck, Verification, SUPPORTED_PROVIDERS};
 use apprafter_core::session::{CliDefaultTarget, Identity, WhoamiReport, WhoamiTarget};
 use apprafter_core::ssh::{SshKeyCandidate, SshKeyInfo};
 use apprafter_core::target::{
-    CliDefaultPointer, MachineSet, ProvisionedServer, ProvisionedState, PublicAddress, SkuCheck,
-    TargetAdded, TargetListReport, TargetRemoved, TargetRenamed, TargetRenewed, TargetReport,
-    TargetSummary, TargetUsed, TokenPresence, UnreadableTarget,
+    validate_name, CliDefaultPointer, MachineSet, ProvisionedServer, ProvisionedState,
+    PublicAddress, SkuCheck, TargetAdded, TargetListReport, TargetRemoved, TargetRenamed,
+    TargetRenewed, TargetReport, TargetSummary, TargetUsed, TokenPresence, UnreadableTarget,
 };
 use apprafter_core::tools::{
     HintOs, InstallHint, ToolId, ToolProblem, ToolStatus, ToolchainReport,
 };
 use apprafter_core::{
-    ActivePointerChange, ChangeAction, Outcome, PathSource, PlanClass, PlannedChange,
+    ActivePointerChange, ChangeAction, CoreError, Outcome, PathSource, PlanClass, PlannedChange,
 };
 use apprafter_desktop_ipc::{
-    errors, AppInfo, AuthInfo, AuthMethod, AuthOutcome, AutoLock, CancelledBy, LockReason,
-    LockState, OpEvent, OpId, OpState, OpSummary, Os, OutputStream, PlanView, Quitting, Refresh,
-    SecretBackend, SessionEvents, Settings, Subscribed, SubscriptionId, Theme, UiError,
-    UnavailableReason, ALLOWED_WHILE_LOCKED, COMMANDS, LOCK_CHANGED, QUITTING,
+    errors, AppInfo, AuthInfo, AuthMethod, AuthOutcome, AutoLock, CancelledBy, CatalogueSourceArg,
+    DraftId, LockReason, LockState, OpEvent, OpId, OpState, OpSummary, Os, OutputStream, PlanView,
+    Quitting, Refresh, SecretBackend, SessionEvents, Settings, Subscribed, SubscriptionId,
+    TargetAddArgs, Theme, TokenVerified, UiError, UnavailableReason, ALLOWED_WHILE_LOCKED,
+    COMMANDS, LOCK_CHANGED, QUITTING,
 };
+use cli_core::Tier;
 use ts_rs::TS;
 
 const SPDX: &str = "// SPDX-License-Identifier: FSL-1.1-Apache-2.0\n";
@@ -84,6 +89,8 @@ fn export_the_typescript_bindings() {
         OpId, OpEvent, OutputStream, PlanView, OpSummary, OpState, Subscribed, SubscriptionId,
         // quit.rs
         Quitting,
+        // targets.rs
+        DraftId, TokenVerified, TargetAddArgs, CatalogueSourceArg,
         // apprafter-core, as OpEvent and PlanView carry them
         UiError, PlanClass, PlannedChange, ChangeAction, Outcome<serde_json::Value>,
         // apprafter-core, D.3 (overview §3.5–§3.9)
@@ -99,10 +106,22 @@ fn export_the_typescript_bindings() {
     fs::write(tmp.path().join("commands.ts"), commands_ts()).unwrap();
     fs::write(tmp.path().join("errors.ts"), errors_ts()).unwrap();
     fs::write(tmp.path().join("events.ts"), events_ts()).unwrap();
+    fs::write(tmp.path().join("core-errors.ts"), core_errors_ts()).unwrap();
+    fs::write(tmp.path().join("target.ts"), target_ts()).unwrap();
+    fs::create_dir_all(tmp.path().join("fixtures")).unwrap();
+    fs::write(
+        tmp.path().join("fixtures/target-names.json"),
+        target_names_json(),
+    )
+    .unwrap();
 
     let files = files_under(tmp.path());
     check(tmp.path(), &files);
-    for file in &files {
+    // JSON has no comment syntax (scripts/check-spdx-headers.sh exempts it).
+    for file in files
+        .iter()
+        .filter(|f| f.extension().is_none_or(|e| e != "json"))
+    {
         let path = tmp.path().join(file);
         let body = fs::read_to_string(&path).unwrap();
         fs::write(&path, format!("{SPDX}{body}")).unwrap();
@@ -236,6 +255,151 @@ fn errors_ts() -> String {
     }
     out.push_str("} as const;\n");
     out
+}
+
+/// `apprafter::target::not_found` → `TARGET_NOT_FOUND`: the prefix goes, `::` becomes `_`.
+fn core_errors_ts() -> String {
+    let mut pairs: Vec<(String, &str)> = codes::ALL
+        .iter()
+        .map(|code| {
+            let key = code
+                .strip_prefix("apprafter::")
+                .unwrap_or_else(|| panic!("{code} lacks apprafter::"))
+                .replace("::", "_")
+                .to_ascii_uppercase();
+            assert!(
+                key.starts_with(|c: char| c.is_ascii_uppercase())
+                    && key
+                        .chars()
+                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'),
+                "{code} does not make a TypeScript key"
+            );
+            (key, *code)
+        })
+        .collect();
+    pairs.sort();
+    let keys: BTreeSet<&String> = pairs.iter().map(|(k, _)| k).collect();
+    assert_eq!(keys.len(), pairs.len(), "two codes make one key");
+    let mut out = String::from(
+        "// Generated from apprafter-core's error::codes by `just desktop-ipc-types`. Do not edit.\n\
+         \n\
+         /** The codes the core raises or passes through as `UiError.code`. */\n\
+         export const CORE_ERROR_CODES = {\n",
+    );
+    for (key, code) in pairs {
+        out.push_str(&format!("  {key}: {},\n", ts_string(code)));
+    }
+    out.push_str("} as const;\n");
+    out
+}
+
+/// Every tier, in order. The match stops compiling when cli-core gains a tier.
+fn all_tiers() -> [Tier; 4] {
+    let all = [Tier::Solo, Tier::Team, Tier::Prod, Tier::Regulated];
+    for tier in all {
+        match tier {
+            Tier::Solo | Tier::Team | Tier::Prod | Tier::Regulated => {}
+        }
+    }
+    all
+}
+
+/// D.3a's `apprafter_core::target::TARGET_NAME_MAX_LEN`, exported as is; the probe only
+/// cross-checks it against `validate_name` (bytes: the rule is `len()`).
+fn target_name_max_len() -> usize {
+    let max = apprafter_core::target::TARGET_NAME_MAX_LEN;
+    assert!(
+        validate_name(&"a".repeat(max)).is_ok() && validate_name(&"a".repeat(max + 1)).is_err(),
+        "TARGET_NAME_MAX_LEN is validate_name's limit"
+    );
+    max
+}
+
+/// D.3a's `cli_core::target::HETZNER_TOKEN_LEN`, exported as is; the probe only cross-checks it
+/// against `validate_hetzner_token_format`.
+fn hetzner_token_len() -> usize {
+    let len = cli_core::target::HETZNER_TOKEN_LEN;
+    for (n, ok) in [(len - 1, false), (len, true), (len + 1, false)] {
+        assert_eq!(
+            cli_core::validate_hetzner_token_format(&"a".repeat(n)).is_ok(),
+            ok,
+            "HETZNER_TOKEN_LEN vs {n}"
+        );
+    }
+    len
+}
+
+fn target_ts() -> String {
+    let tiers: String = all_tiers()
+        .iter()
+        .map(|t| {
+            format!(
+                "  {{ id: {}, level: {} }},\n",
+                ts_string(&t.to_string()),
+                t.level()
+            )
+        })
+        .collect();
+    format!(
+        "// Generated from apprafter-core and cli-core by `just desktop-ipc-types`. Do not edit.\n\
+         \n\
+         /** The providers `target add` accepts. */\n\
+         {}\n\
+         /** The default-tier hints, in order, with the hardware tier each names. */\n\
+         export const TIERS = [\n{tiers}] as const;\n\
+         \n\
+         /** The longest target name the core accepts, in UTF-8 bytes. */\n\
+         export const TARGET_NAME_MAX_LEN = {};\n\
+         \n\
+         /** A Hetzner Cloud API token's length. */\n\
+         export const HETZNER_TOKEN_LEN = {};\n",
+        ts_array("SUPPORTED_PROVIDERS", SUPPORTED_PROVIDERS),
+        target_name_max_len(),
+        hetzner_token_len(),
+    )
+}
+
+/// `validate_name` over cases that pin its order (length, then characters, then dashes) and its
+/// unit (bytes): the frontend's rule answers each the same (rules.test.ts).
+fn target_names_json() -> String {
+    let max = target_name_max_len();
+    let mut cases: Vec<String> = [
+        "prod",
+        "prod-eu-1",
+        "A-1",
+        "",
+        "a b",
+        "a_b",
+        "a/b",
+        "../x",
+        "-prod",
+        "prod-",
+        "-",
+        "pröd",
+        "-a b",
+    ]
+    .map(String::from)
+    .to_vec();
+    cases.push("a".repeat(max));
+    cases.push("a".repeat(max + 1));
+    cases.push("ö".repeat(max / 2 + 1)); // over the limit in bytes, under it in UTF-16 units
+    cases.push(format!("{} ", "a".repeat(max))); // too long and invalid: length first
+    let rows: Vec<serde_json::Value> = cases
+        .into_iter()
+        .map(|name| {
+            let problem = match validate_name(&name) {
+                Ok(()) => serde_json::Value::Null,
+                Err(problem) => UiError::from(&CoreError::InvalidTargetName {
+                    name: name.clone(),
+                    problem,
+                })
+                .fields["problem"]
+                    .clone(),
+            };
+            serde_json::json!({ "name": name, "problem": problem })
+        })
+        .collect();
+    format!("{}\n", serde_json::to_string_pretty(&rows).unwrap())
 }
 
 fn events_ts() -> String {
