@@ -122,9 +122,11 @@
           name = "apprafter-desktop";
           nativeBuildInputs = with pkgs; [ pkg-config wrapGAppsHook3 ];
           # linux-pam: desktop/os-auth's PAM fallback links -lpam (nonstick's libpam-sys).
+          # No appindicator: the app has no tray yet, and nothing in its graph links or loads
+          # one (`cargo tree -i libappindicator` prints nothing); it returns with the tray.
           buildInputs = with pkgs; [
             webkitgtk_4_1 gtk3 libsoup_3 librsvg glib-networking
-            libayatana-appindicator gsettings-desktop-schemas dbus linux-pam
+            gsettings-desktop-schemas dbus linux-pam
           ];
           packages = with pkgs; [ cuePinned just jq git xvfb-run ];
           shellHook = ''
@@ -136,15 +138,14 @@
             # built in this shell gets no RUNPATH into /nix/store and dies with
             # `libgobject-2.0.so.0: cannot open shared object file`. Prepended, not
             # appended: an ambient LD_LIBRARY_PATH (a NixOS user profile) can carry a
-            # DIFFERENT webkitgtk build, and that one must not win. libappindicator-sys
-            # also dlopen()s libayatana-appindicator3 at run time. (atk ships inside
+            # DIFFERENT webkitgtk build, and that one must not win. (atk ships inside
             # at-spi2-core.) linux-pam: every desktop/os-auth binary links libpam.
             export LD_LIBRARY_PATH="${
               pkgs.lib.makeLibraryPath (
                 with pkgs;
                 [
                   webkitgtk_4_1 gtk3 libsoup_3 glib cairo pango gdk-pixbuf harfbuzz
-                  at-spi2-core librsvg dbus libayatana-appindicator linux-pam
+                  at-spi2-core librsvg dbus linux-pam
                 ]
               )
             }''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"

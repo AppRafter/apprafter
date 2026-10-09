@@ -149,18 +149,22 @@ desktop-check: _desktop-sysdeps
     ./scripts/check-desktop-ipc-types.sh
     ( cd desktop && bun install --frozen-lockfile && bun run lint && bun test )
 
+# What the Linux build links: WebKitGTK, GTK and their libraries, and PAM (desktop/os-auth's
+# password field links -lpam). No appindicator: the app has no tray yet.
 _desktop-sysdeps:
     #!/usr/bin/env bash
     set -euo pipefail
     [ "$(uname -s)" = Linux ] || exit 0
     missing=()
-    for m in webkit2gtk-4.1 javascriptcoregtk-4.1 libsoup-3.0 gtk+-3.0 librsvg-2.0 ayatana-appindicator3-0.1; do
+    for m in webkit2gtk-4.1 javascriptcoregtk-4.1 libsoup-3.0 gtk+-3.0 librsvg-2.0 pam; do
         pkg-config --exists "$m" 2>/dev/null || missing+=("$m")
     done
     if [ ${#missing[@]} -gt 0 ]; then
-        echo "ERROR: the desktop build needs WebKitGTK/GTK development files; missing: ${missing[*]}" >&2
-        echo "  nix: nix develop .#desktop" >&2
-        echo "  apt: sudo apt-get install build-essential pkg-config file libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev" >&2
+        echo "ERROR: the desktop build needs WebKitGTK/GTK and PAM development files (pkg-config); missing: ${missing[*]}" >&2
+        echo "  NixOS:          nix develop .#desktop" >&2
+        echo "  Debian, Ubuntu: sudo apt-get install build-essential pkg-config file libwebkit2gtk-4.1-dev librsvg2-dev libpam0g-dev" >&2
+        echo "  Fedora:         sudo dnf group install c-development && sudo dnf install pkgconf-pkg-config file webkit2gtk4.1-devel librsvg2-devel pam-devel" >&2
+        echo "  Arch:           sudo pacman -S --needed base-devel webkit2gtk-4.1 librsvg pam" >&2
         exit 1
     fi
 
