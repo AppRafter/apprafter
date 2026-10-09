@@ -53,10 +53,11 @@ pub struct PasswordAnswer {
 }
 
 impl PasswordAnswer {
-    /// The OS prompts itself here, so the app's field is not its way: nothing was checked.
-    pub const NOT_HERE: PasswordAnswer = PasswordAnswer {
+    /// The OS prompts itself here, so the app's field is not its way: nothing was checked, and
+    /// the OS's prompt is the way (`UseSystemPrompt`, never the final `NotPermittedHere`).
+    pub const USE_SYSTEM_PROMPT: PasswordAnswer = PasswordAnswer {
         outcome: AuthOutcome::Unavailable {
-            reason: UnavailableReason::NotPermittedHere,
+            reason: UnavailableReason::UseSystemPrompt,
         },
         messages: Vec::new(),
     };
@@ -80,7 +81,7 @@ pub trait Authenticator: Send + Sync {
     /// Checks the password the owner typed into the app's own field, which the page shows where
     /// the OS cannot prompt ([`AuthInfo::password_field`], Linux's PAM path). Blocks as
     /// [`verify`](Self::verify) does. Where the OS prompts itself this is
-    /// [`PasswordAnswer::NOT_HERE`], and the password is not looked at: an OS whose policy asks
+    /// [`PasswordAnswer::USE_SYSTEM_PROMPT`], and the password is not looked at: an OS whose policy asks
     /// for more than the user's own password must not be got round through the field.
     fn verify_password(
         &self,
@@ -89,7 +90,7 @@ pub trait Authenticator: Send + Sync {
         _cancel: &CancellationToken,
     ) -> PasswordAnswer {
         drop(password);
-        PasswordAnswer::NOT_HERE
+        PasswordAnswer::USE_SYSTEM_PROMPT
     }
     /// The app has just locked (every transition to locked): an authenticator forgets what it
     /// learnt while unlocked. Called under the lock machine's lock, so it must be quick and
@@ -134,7 +135,7 @@ impl Authenticator for NoAuthenticator {
 pub(crate) trait Backend: Send + Sync {
     fn info(&self) -> AuthInfo;
     fn verify(&self, action: Action, cancel: &CancellationToken) -> AuthOutcome;
-    /// Linux's PAM path; elsewhere the field is not the OS's way ([`PasswordAnswer::NOT_HERE`]).
+    /// Linux's PAM path; elsewhere the field is not the OS's way ([`PasswordAnswer::USE_SYSTEM_PROMPT`]).
     fn verify_password(
         &self,
         action: Action,
@@ -155,7 +156,7 @@ pub(crate) trait Backend: Send + Sync {
 #[cfg(any(test, target_os = "macos", windows))]
 fn not_here(password: Zeroizing<String>) -> PasswordAnswer {
     drop(password);
-    PasswordAnswer::NOT_HERE
+    PasswordAnswer::USE_SYSTEM_PROMPT
 }
 
 /// The OS's own authentication (the module docs list it per OS).
@@ -421,7 +422,7 @@ mod fake {
     /// first), every answer but `Verified` says what [`saying`](Self::saying) set, as PAM
     /// would, and a prompt, the script once empty, finds no agent (`Unavailable { NoAgent }`),
     /// as polkit did to bring the field. Without one the field is not its way
-    /// ([`PasswordAnswer::NOT_HERE`]).
+    /// ([`PasswordAnswer::USE_SYSTEM_PROMPT`]).
     #[derive(Default)]
     pub struct FakeAuthenticator {
         script: Mutex<VecDeque<AuthOutcome>>,
@@ -511,7 +512,7 @@ mod fake {
             cancel: &CancellationToken,
         ) -> PasswordAnswer {
             let Some(accepted) = &self.password else {
-                return PasswordAnswer::NOT_HERE;
+                return PasswordAnswer::USE_SYSTEM_PROMPT;
             };
             lock(&self.asked).push(purpose.clone());
             if cancel.is_cancelled() {
@@ -577,7 +578,7 @@ pub(crate) mod test_os {
             Self {
                 info,
                 verify,
-                password: PasswordAnswer::NOT_HERE,
+                password: PasswordAnswer::USE_SYSTEM_PROMPT,
                 calls: Calls::default(),
             }
         }
@@ -748,14 +749,15 @@ mod tests {
             );
             assert_eq!(
                 NoAuthenticator.verify_password(&purpose, password("guess"), &token),
-                PasswordAnswer::NOT_HERE,
+                PasswordAnswer::USE_SYSTEM_PROMPT,
                 "no field where nothing could check it"
             );
         }
+        // Not the OS's final refusal: the OS's own prompt is the way, and asking it works.
         assert_eq!(
-            PasswordAnswer::NOT_HERE.outcome,
+            PasswordAnswer::USE_SYSTEM_PROMPT.outcome,
             AuthOutcome::Unavailable {
-                reason: UnavailableReason::NotPermittedHere
+                reason: UnavailableReason::UseSystemPrompt
             }
         );
     }
@@ -884,7 +886,7 @@ mod tests {
         for purpose in [AuthPurpose::Unlock, confirm()] {
             assert_eq!(
                 auth.verify_password(&purpose, password("guess"), &token),
-                PasswordAnswer::NOT_HERE
+                PasswordAnswer::USE_SYSTEM_PROMPT
             );
         }
         // And the hooks an OS does not have do nothing.
@@ -1006,7 +1008,7 @@ mod tests {
             password("anything"),
             &CancellationToken::new(),
         );
-        assert_eq!(answer, PasswordAnswer::NOT_HERE);
+        assert_eq!(answer, PasswordAnswer::USE_SYSTEM_PROMPT);
         assert!(fake.asked().is_empty(), "nothing was checked");
     }
 }

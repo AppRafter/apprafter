@@ -3,7 +3,7 @@
 // Playwright smoke: every command answers from in-memory state, behind the same lock gate.
 // The app starts locked (`startup`). As Rust, by route (`?auth=`): by default the OS prompts
 // itself, so Unlock unlocks without asking anyone and the password field is refused
-// (`not_permitted_here`); with `?auth=pam` (Linux's PAM route) the field is the way — it unlocks
+// (`use_system_prompt`); with `?auth=pam` (Linux's PAM route) the field is the way — it unlocks
 // with MOCK_PASSWORD and refuses anything else as PAM would, saying MOCK_PAM_SAYS, behind Rust's
 // back-off (MOCK_BACKOFF: too many wrong passwords, and every try is turned away for a while,
 // each answer saying how long as `retryInMs`) — and Unlock finds no polkit agent (`no_agent`).
@@ -268,7 +268,7 @@ export function installMockIpc(options: MockOptions = {}): void {
     },
     unlock_with_password: (args) => {
       if (!lock.locked) return lock;
-      if (!auth.passwordField) return Promise.reject(unavailable('not_permitted_here'));
+      if (!auth.passwordField) return Promise.reject(unavailable('use_system_prompt'));
       return checkPassword((args as { password?: unknown } | undefined)?.password);
     },
     activity: () => null,

@@ -8,7 +8,7 @@
 // Read again: on every lock (shell/LockGate), after every authentication refusal from any
 // command (PlatformGate, through onAuthRefusal), and when Settings opens. While a read is in
 // question — after a lock or `auth_unavailable`, until app_info answers — the password field is
-// not offered: never one that answers `not_permitted_here`. After `auth_failed` or `auth_busy`
+// not offered: never one that answers `use_system_prompt`. After `auth_failed` or `auth_busy`
 // the field the owner types in stays while app_info is read.
 import { type QueryClient, queryOptions } from '@tanstack/react-query';
 import { createContext, useContext } from 'react';

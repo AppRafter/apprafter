@@ -146,7 +146,7 @@ export const opDiscard = (opId: OpId) => call<void>('op_discard', { opId });
  * the OS — or, given `password` (the confirm dialog's own field, shown where
  * `AuthInfo.passwordField`), checks it instead; a refusal may then carry what the OS said in
  * `error.fields.messages`. A failed gesture (`auth_failed`), a busy prompt, and a gesture asked
- * the way that is not there (`auth_unavailable` with `no_agent` or `not_permitted_here`) keep
+ * the way that is not there (`auth_unavailable` with `no_agent` or `use_system_prompt`) keep
  * the plan: the same `opId` can be executed again.
  */
 export const opExecute = (opId: OpId, onEvent: Channel<OpEvent>, password?: string) =>

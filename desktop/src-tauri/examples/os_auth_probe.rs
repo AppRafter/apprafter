@@ -93,7 +93,8 @@ const PAGE: &str = r#"<!doctype html>
   <button data-password="confirm">Confirm with password</button>
   <button data-post="/forget-agent">Forget the missing agent</button>
   <br><small>PAM checks the password only where polkit cannot prompt (no policy installed, a
-  rules.d grant, no agent once a dialog found none); elsewhere the answer is
+  rules.d grant, no agent once a dialog found none); where polkit prompts the answer is
+  Unavailable { UseSystemPrompt }, after an administrator's NO
   Unavailable { NotPermittedHere }.</small>
 </div>
 <label class="windows"><input id="hello" type="checkbox" checked> Prefer Windows Hello</label>

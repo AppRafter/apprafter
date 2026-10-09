@@ -76,7 +76,7 @@ impl Authenticator for StandIn {
         _cancel: &CancellationToken,
     ) -> PasswordAnswer {
         if self.route == Route::Prompt {
-            return PasswordAnswer::NOT_HERE;
+            return PasswordAnswer::USE_SYSTEM_PROMPT;
         }
         self.checks.fetch_add(1, SeqCst);
         if password.as_str() == PASSWORD {

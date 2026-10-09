@@ -376,7 +376,7 @@ fn where_the_os_prompts_itself_the_password_field_unlocks_nothing() {
         json!({ "password": PASSWORD }),
     );
     assert_eq!(code(&reply), Some(errors::AUTH_UNAVAILABLE), "{reply:?}");
-    assert_eq!(reply.unwrap_err()["fields"]["reason"], "not_permitted_here");
+    assert_eq!(reply.unwrap_err()["fields"]["reason"], "use_system_prompt");
     assert_eq!(rig.auth.checks.load(SeqCst), 0);
     assert_eq!(
         invoke(&rig, "lock_status", json!({})).unwrap()["locked"],
@@ -440,7 +440,7 @@ fn op_execute_checks_the_confirm_dialog_s_password_on_the_pam_route() {
     );
     assert_eq!(
         refused.unwrap_err()["fields"]["reason"],
-        "not_permitted_here"
+        "use_system_prompt"
     );
     assert_eq!(
         (

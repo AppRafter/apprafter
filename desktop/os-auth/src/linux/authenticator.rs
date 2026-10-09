@@ -12,17 +12,20 @@
 //! ([`OsAuthenticator::reset_agent_memory`], on each lock-screen entry); the others are probed
 //! afresh every time.
 //!
-//! A refusal (`NotPermittedHere`) is not always "polkit cannot prompt here". Outside an active
-//! local session — none, an inactive one, a remote one — it is the policy's own defaults
-//! (`allow_any` and `allow_inactive` are `no`), and the password field stands in. Inside one the
-//! defaults ask (`auth_self`), so the refusal is an administrator's `rules.d` rule returning NO,
-//! and it is final: [`OsAuthenticator::info`] reports nothing available and the password is
-//! refused, PAM unasked. Which session polkitd sees is read from the files it reads
-//! ([`session`] gives the method).
+//! polkit's refusal (its probe's `NotPermittedHere`) is not always "polkit cannot prompt here".
+//! Outside an active local session — none, an inactive one, a remote one — it is the policy's
+//! own defaults (`allow_any` and `allow_inactive` are `no`), and the password field stands in.
+//! Inside one the defaults ask (`auth_self`), so the refusal is an administrator's `rules.d` rule
+//! returning NO, and it is final: [`OsAuthenticator::info`] reports nothing available and the
+//! password is refused with that `NotPermittedHere`, PAM unasked — the reason the page reads as
+//! final. Which session polkitd sees is read from the files it reads ([`session`] gives the
+//! method).
 //!
 //! The password path runs only where polkit cannot prompt. Where it can, the policy is polkit's
 //! to apply — an administrator's rule may ask for more than the user's own password — so
-//! [`OsAuthenticator::verify_password`] refuses there with `Unavailable { NotPermittedHere }`.
+//! [`OsAuthenticator::verify_password`] refuses there with `Unavailable { UseSystemPrompt }`:
+//! not final, the system's prompt is the way. `NotPermittedHere` from it is the final refusal
+//! above, the same whichever way the owner is asked.
 //!
 //! Known limits, both because polkit's answers to the app say less than its rules decide:
 //! - A rule that asks for an administrator (`AUTH_ADMIN`) is still a challenge to the probe,
@@ -232,8 +235,9 @@ impl OsAuthenticator {
     }
 
     /// Checks the password from the app's own field through PAM (see [`Pam::verify_password`]),
-    /// only where polkit cannot prompt for `action`; where it can, or where its refusal is final,
-    /// this is `Unavailable { NotPermittedHere }` and PAM is not asked.
+    /// only where polkit cannot prompt for `action`; PAM is not asked otherwise. Where polkit can
+    /// prompt this is `Unavailable { UseSystemPrompt }`: its prompt is the way. Where its refusal
+    /// is final it is that refusal, `Unavailable { NotPermittedHere }`.
     pub fn verify_password(
         &self,
         action: Action,
@@ -247,7 +251,7 @@ impl OsAuthenticator {
                 .verify_password(password, cancel, now_monotonic_ms),
             Route::Polkit => PasswordCheck {
                 outcome: AuthOutcome::Unavailable {
-                    reason: UnavailableReason::NotPermittedHere,
+                    reason: UnavailableReason::UseSystemPrompt,
                 },
                 messages: Vec::new(),
             },
@@ -268,7 +272,7 @@ mod tests {
     use super::*;
     use UnavailableReason::{
         ImplicitGrant, NoAgent, NoBackend, NoPamService, NotConfigured, NotPermittedHere,
-        PolicyMissing,
+        PolicyMissing, UseSystemPrompt,
     };
 
     const SECRET: &str = "hunter2 but longer";
@@ -435,7 +439,16 @@ mod tests {
         )
     }
 
-    const NOT_HERE: PasswordCheck = PasswordCheck {
+    /// The field used where polkit prompts: the OS's prompt is the way, and asking it works.
+    const USE_SYSTEM_PROMPT: PasswordCheck = PasswordCheck {
+        outcome: AuthOutcome::Unavailable {
+            reason: UseSystemPrompt,
+        },
+        messages: Vec::new(),
+    };
+
+    /// An administrator's NO: final, whichever way the owner is asked.
+    const REFUSED: PasswordCheck = PasswordCheck {
         outcome: AuthOutcome::Unavailable {
             reason: NotPermittedHere,
         },
@@ -453,7 +466,7 @@ mod tests {
     fn where_polkit_can_prompt_it_is_the_method_and_the_password_is_refused() {
         let (auth, calls) = authenticator(Ok(()), &[AuthOutcome::Verified], Ok(()));
         assert_eq!(auth.info(), polkit_info());
-        assert_eq!(password_check(&auth, Action::Confirm), NOT_HERE);
+        assert_eq!(password_check(&auth, Action::Confirm), USE_SYSTEM_PROMPT);
         assert_eq!(
             auth.verify(Action::Confirm, &CancellationToken::new()),
             AuthOutcome::Verified
@@ -513,7 +526,7 @@ mod tests {
         ] {
             let (auth, _) = authenticator(Ok(()), &[unavailable(NoAgent), answered], Ok(()));
             assert_eq!(auth.info(), polkit_info());
-            assert_eq!(password_check(&auth, Action::Unlock), NOT_HERE);
+            assert_eq!(password_check(&auth, Action::Unlock), USE_SYSTEM_PROMPT);
             assert_eq!(
                 auth.verify(Action::Unlock, &CancellationToken::new()),
                 unavailable(NoAgent)
@@ -589,8 +602,8 @@ mod tests {
                 password_field: false,
             }
         );
-        assert_eq!(password_check(&auth, Action::Confirm), NOT_HERE);
-        assert_eq!(password_check(&auth, Action::Unlock), NOT_HERE);
+        assert_eq!(password_check(&auth, Action::Confirm), REFUSED);
+        assert_eq!(password_check(&auth, Action::Unlock), REFUSED);
         assert_eq!(
             auth.verify(Action::Unlock, &CancellationToken::new()),
             unavailable(NotPermittedHere)
@@ -639,7 +652,7 @@ mod tests {
         assert_eq!(auth.info(), pam_info());
         auth.reset_agent_memory();
         assert_eq!(auth.info(), polkit_info(), "polkit is the method again");
-        assert_eq!(password_check(&auth, Action::Unlock), NOT_HERE);
+        assert_eq!(password_check(&auth, Action::Unlock), USE_SYSTEM_PROMPT);
         assert_eq!(
             auth.verify(Action::Unlock, &CancellationToken::new()),
             AuthOutcome::Verified
@@ -733,7 +746,11 @@ mod tests {
         ] {
             let (auth, _) = authenticator(Err(probe), &[probe], Ok(()));
             assert_eq!(auth.info(), polkit_info(), "{probe:?}");
-            assert_eq!(password_check(&auth, Action::Unlock), NOT_HERE, "{probe:?}");
+            assert_eq!(
+                password_check(&auth, Action::Unlock),
+                USE_SYSTEM_PROMPT,
+                "{probe:?}"
+            );
             assert_eq!(
                 auth.verify(Action::Unlock, &CancellationToken::new()),
                 probe

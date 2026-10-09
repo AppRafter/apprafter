@@ -163,17 +163,48 @@ describe('authRefusal, for either way', () => {
     ).toEqual({ lines: [], retryInMs: 9_000 });
   });
 
-  test('no agent: the system could not prompt; not here: it prompts itself', () => {
+  test('no agent: the system could not prompt; the field where it prompts: it does, try again', () => {
     expect(
       authRefusal(refused(DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE, { reason: 'no_agent' }), false)
         .lines,
     ).toEqual(['The system could not show its password prompt.']);
     expect(
       authRefusal(
-        refused(DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE, { reason: 'not_permitted_here' }),
+        refused(DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE, { reason: 'use_system_prompt' }),
         true,
       ).lines,
     ).toEqual(['The system asks for your password itself now. Try again.']);
+  });
+
+  test.each([true, false])(
+    "the OS's own refusal is final, and never says to try again (field: %p)",
+    (viaField) => {
+      // An administrator's polkit rule, a Windows account outside its logon hours.
+      const refusal = authRefusal(
+        refused(DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE, { reason: 'not_permitted_here' }),
+        viaField,
+      );
+      expect(refusal).toEqual({
+        lines: ["This computer's settings do not allow AppRafter to ask for your password here."],
+        retryInMs: null,
+      });
+      expect(refusal.lines.join(' ')).not.toMatch(/try again/i);
+    },
+  );
+
+  test("the OS's own refusal with its own words (the field's route): those, then the line", () => {
+    expect(
+      authRefusal(
+        refused(DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE, {
+          reason: 'not_permitted_here',
+          messages: ['Your account is not allowed to log in at this time'],
+        }),
+        true,
+      ).lines,
+    ).toEqual([
+      'Your account is not allowed to log in at this time',
+      "This computer's settings do not allow AppRafter to ask for your password here.",
+    ]);
   });
 
   test("anything else is Rust's own message: a prompt's failure, a cancel, another reason", () => {

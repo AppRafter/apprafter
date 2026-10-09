@@ -131,10 +131,10 @@ pub async fn unlock(shell: ShellState<'_>) -> Result<LockState, UiError> {
 }
 
 /// Unlock with the password from the lock screen's own field, which the page shows where the
-/// OS cannot prompt (`AuthInfo.passwordField`, Linux's PAM path; elsewhere the answer is
-/// `auth_unavailable` with `not_permitted_here`); the resulting state. As `unlock`: one check
-/// at a time (`auth_busy`), and a lock while it runs refuses its yes. A refusal may carry what
-/// the OS said as `fields.messages`.
+/// OS cannot prompt (`AuthInfo.passwordField`, Linux's PAM path; where the OS prompts itself the
+/// answer is `auth_unavailable` with `use_system_prompt`); the resulting state. As `unlock`: one
+/// check at a time (`auth_busy`), and a lock while it runs refuses its yes. A refusal may carry
+/// what the OS said as `fields.messages`.
 #[tauri::command]
 pub async fn unlock_with_password(
     shell: ShellState<'_>,
@@ -222,7 +222,7 @@ pub async fn op_discard(shell: ShellState<'_>, op_id: OpId) -> Result<(), UiErro
 /// (`apprafter::desktop::auth_failed`: a wrong password, a finger not recognised, or the
 /// back-off, which says how long it still refuses as `fields.retryInMs`), and a gesture asked
 /// the way that is not there while the other is (`apprafter::desktop::auth_unavailable` with
-/// `no_agent` or `not_permitted_here`). The plan then waits for the owner to try again with the
+/// `no_agent` or `use_system_prompt`). The plan then waits for the owner to try again with the
 /// same `op_id`, and the channel's subscription has already ended.
 ///
 /// `password`, when the page sends one, is the confirm dialog's own field (shown where the OS

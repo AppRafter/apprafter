@@ -166,8 +166,9 @@ fn without_a_service_file_there_is_no_pam_service() {
     );
 }
 
-/// polkit can prompt as far as its probe tells, so the password is refused; the first dialog
-/// finds no agent, and from then on the password field stands in and PAM verifies.
+/// polkit can prompt as far as its probe tells, so the password is refused, pointing at the
+/// system's prompt (`UseSystemPrompt`, not a final refusal); the first dialog finds no agent,
+/// and from then on the password field stands in and PAM verifies.
 #[test]
 #[ignore = "needs the PAM container: bash scripts/test-osauth-linux.sh"]
 fn without_an_agent_the_authenticator_moves_to_the_password() {
@@ -182,7 +183,7 @@ fn without_an_agent_the_authenticator_moves_to_the_password() {
     );
     assert_eq!(
         refused.outcome,
-        unavailable(UnavailableReason::NotPermittedHere)
+        unavailable(UnavailableReason::UseSystemPrompt)
     );
     assert_eq!(
         auth.verify(Action::Unlock, &CancellationToken::new()),

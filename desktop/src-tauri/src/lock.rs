@@ -1970,7 +1970,7 @@ mod tests {
             matches!(
                 *refusal.error,
                 DesktopError::AuthUnavailable {
-                    reason: UnavailableReason::NotPermittedHere
+                    reason: UnavailableReason::UseSystemPrompt
                 }
             ),
             "{refusal:?}"

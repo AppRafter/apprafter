@@ -318,7 +318,7 @@ impl OperationManager {
     /// time it had left: on `AuthBusy`, when another prompt was open and nothing was asked; on
     /// `AuthFailed`, when the owner was not verified (a wrong password, a finger not
     /// recognised) or a back-off turned the try away; and on `AuthUnavailable` with `NoAgent`
-    /// or `NotPermittedHere`, when the gesture could not be asked this way and the other way is
+    /// or `UseSystemPrompt`, when the gesture could not be asked this way and the other way is
     /// there ([`waits`]).
     ///
     /// When the plan needs the owner, this asks `auth` and blocks until the prompt answers
@@ -338,10 +338,11 @@ impl OperationManager {
     /// unavailable gesture ends it too, but for two reasons on Linux, where asking again does
     /// make it available because the route switches: polkit found no agent (`NoAgent`), and the
     /// app's own field takes over; the field was used where the OS prompts itself
-    /// (`NotPermittedHere`), and the OS's prompt takes over. No password was checked either
+    /// (`UseSystemPrompt`), and the OS's prompt takes over. No password was checked either
     /// time, and the next try goes through the password back-off or the OS's prompt. Every other
-    /// reason (no policy, no backend, no PAM service, not interactive…) asking again does not
-    /// change.
+    /// reason asking again does not change: the OS's own refusal (`NotPermittedHere`: an
+    /// administrator's polkit rule, a Windows account outside its logon hours), no policy, no
+    /// backend, no PAM service, not interactive…
     ///
     /// Once the manager is [`close`](Self::close)d it refuses with `Closing`: before asking
     /// anything, and again under the lock hold that would start the operation or put a plan
@@ -819,7 +820,7 @@ fn waits(outcome: AuthOutcome) -> bool {
         AuthOutcome::Busy
             | AuthOutcome::Failed { .. }
             | AuthOutcome::Unavailable {
-                reason: UnavailableReason::NoAgent | UnavailableReason::NotPermittedHere,
+                reason: UnavailableReason::NoAgent | UnavailableReason::UseSystemPrompt,
             }
     )
 }
@@ -1353,8 +1354,10 @@ mod tests {
                 .into_iter()
                 .map(|by| (AuthOutcome::Cancelled { by }, DesktopError::AuthCancelled))
                 .collect();
-        // Every reason but the two that switch the route (kept: the next test).
+        // Every reason but the two that switch the route (kept: the next test). A refusal of the
+        // OS's own (an administrator's rule, the account's logon hours) is final.
         for reason in [
+            UnavailableReason::NotPermittedHere,
             UnavailableReason::NotConfigured,
             UnavailableReason::DisabledByPolicy,
             UnavailableReason::PolicyMissing,
@@ -1395,7 +1398,7 @@ mod tests {
 
     /// The gesture could not be asked this way, and the other way is there: on Linux polkit
     /// found no agent (`NoAgent`), so the confirm dialog's own field takes over; or the field
-    /// was used where the OS prompts itself (`NotPermittedHere`), so the OS's prompt does. No
+    /// was used where the OS prompts itself (`UseSystemPrompt`), so the OS's prompt does. No
     /// password was checked, so the plan waits, its pages told nothing, and the next try — the
     /// other way — runs it under the same id.
     #[test]
@@ -1412,7 +1415,7 @@ mod tests {
                 (&pam, typed("open sesame")),
             ),
             (
-                UnavailableReason::NotPermittedHere,
+                UnavailableReason::UseSystemPrompt,
                 (&prompt, typed("open sesame")),
                 (&prompt, None),
             ),
@@ -2746,7 +2749,7 @@ mod tests {
             AuthOutcome::Busy,
             failed,
             other_way(UnavailableReason::NoAgent),
-            other_way(UnavailableReason::NotPermittedHere),
+            other_way(UnavailableReason::UseSystemPrompt),
         ] {
             for (how, pass) in ways {
                 let (clock, mgr) = manager();
@@ -3254,7 +3257,7 @@ mod tests {
             AuthOutcome::Busy,
             failed,
             other_way(UnavailableReason::NoAgent),
-            other_way(UnavailableReason::NotPermittedHere),
+            other_way(UnavailableReason::UseSystemPrompt),
         ] {
             let (_, mgr) = manager();
             let (auth, opened, answer) = held_prompt();

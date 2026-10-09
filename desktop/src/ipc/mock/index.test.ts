@@ -192,7 +192,7 @@ describe('installMockIpc', () => {
     const refused = await api.unlockWithPassword(MOCK_PASSWORD).catch((e: unknown) => e);
     expect((refused as IpcError).error).toMatchObject({
       code: DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE,
-      fields: { reason: 'not_permitted_here' },
+      fields: { reason: 'use_system_prompt' },
     });
     expect((await api.lockStatus()).locked).toBe(true);
     expect(await api.unlock()).toMatchObject({ locked: false });

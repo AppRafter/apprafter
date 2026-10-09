@@ -363,11 +363,21 @@ describe('LockScreen where the OS cannot prompt: the password field', () => {
 
   test('where the OS prompts after all, it says so', async () => {
     passwordAnswer = () =>
-      refusal(DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE, { reason: 'not_permitted_here' });
+      refusal(DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE, { reason: 'use_system_prompt' });
     const user = lockScreen(lockState(), PAM);
     await user.keyboard('hunter2{Enter}');
     expect((await screen.findByRole('alert')).textContent).toBe(
       'The system asks for your password itself now. Try again.',
+    );
+  });
+
+  test("an administrator's refusal is final: the screen says so, without a try again", async () => {
+    passwordAnswer = () =>
+      refusal(DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE, { reason: 'not_permitted_here' });
+    const user = lockScreen(lockState(), PAM);
+    await user.keyboard('hunter2{Enter}');
+    expect((await screen.findByRole('alert')).textContent).toBe(
+      "This computer's settings do not allow AppRafter to ask for your password here.",
     );
   });
 

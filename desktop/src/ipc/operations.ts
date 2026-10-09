@@ -171,7 +171,7 @@ function forgetLive(entry: Entry) {
 const isLocked = (e: unknown) =>
   e instanceof IpcError && e.error.code === DESKTOP_ERROR_CODES.LOCKED;
 /** `auth_unavailable` reasons where the other way to ask is there (Linux): Rust keeps the plan. */
-const OTHER_WAY: ReadonlySet<unknown> = new Set(['no_agent', 'not_permitted_here']);
+const OTHER_WAY: ReadonlySet<unknown> = new Set(['no_agent', 'use_system_prompt']);
 
 /**
  * A refusal after which the plan waits in Rust for another try under the same id: a busy prompt

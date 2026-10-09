@@ -186,8 +186,8 @@ impl LogonError {
 /// `Failed { exhausted: false }`; a locked-out account is `Failed { exhausted: true }`. An
 /// account Windows would not sign in here whatever the password (disabled, expired, outside its
 /// hours, an expired password it must change at the Windows sign-in) is
-/// `Unavailable { NotPermittedHere }`, and an account without a password is
-/// `Unavailable { NotConfigured }`: there is no password to check.
+/// `Unavailable { NotPermittedHere }`, final for now: no way of asking changes it. An account
+/// without a password is `Unavailable { NotConfigured }`: there is no password to check.
 pub fn map_windows_logon(code: u32) -> AuthOutcome {
     match LogonError::from_code(code) {
         LogonError::LogonFailure | LogonError::Other(_) => failed(false),
@@ -371,7 +371,9 @@ pub fn map_polkit(answer: PolkitAnswer) -> AuthOutcome {
         PolkitAnswer::Answered {
             challenge: true, ..
         } => unavailable(NoAgent),
-        // Refused without a prompt, e.g. an inactive session under `allow_inactive=no`.
+        // Refused without a prompt, e.g. an inactive session under `allow_inactive=no`; whether
+        // the password field stands in or the refusal is final is the authenticator's to decide
+        // from the session (crate::linux::OsAuthenticator).
         PolkitAnswer::Answered { .. } => unavailable(NotPermittedHere),
         PolkitAnswer::Error(error) => match error {
             PolkitError::Failed => unavailable(PolicyMissing),

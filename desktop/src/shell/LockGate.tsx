@@ -2,7 +2,7 @@
 // Locked, the app is the title bar and the lock screen, and nothing else: the shell (its tabs,
 // dialogs, toasts) is unmounted, and the cluster data it read leaves the query cache. Every lock
 // reads app_info again, the password field withheld until it answers: Rust forgets a missing
-// polkit agent on each lock, so the field the last unlock used may answer `not_permitted_here`
+// polkit agent on each lock, so the field the last unlock used may answer `use_system_prompt`
 // now. The withholding starts in the very render that shows the lock (LockedScreen), not when
 // the re-read's news reaches the PlatformGate a task later: the old field is never painted, nor
 // focused. Unlocked, the shell renders, and the owner's activity restarts Rust's idle timer at

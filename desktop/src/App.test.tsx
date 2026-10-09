@@ -204,7 +204,7 @@ test('Linux without a polkit agent: the field comes after the refusal, and no lo
         return unavailable('no_agent');
       }
       if (cmd === 'unlock_with_password') {
-        if (!agentMissing) return unavailable('not_permitted_here');
+        if (!agentMissing) return unavailable('use_system_prompt');
         state = lockState({ locked: false, seq: state.seq + 1 });
         return state;
       }
@@ -228,7 +228,7 @@ test('Linux without a polkit agent: the field comes after the refusal, and no lo
     password: 'hunter2',
   });
 
-  // An idle lock: Rust forgot the missing agent, so the field would answer not_permitted_here.
+  // An idle lock: Rust forgot the missing agent, so the field would answer use_system_prompt.
   agentMissing = false;
   state = lockState({ reason: 'idle', seq: state.seq + 1 });
   await act(async () => {

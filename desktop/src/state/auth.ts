@@ -40,9 +40,18 @@ const BUSY = 'A check is already open. Finish it, then try again.';
 const UNAVAILABLE: Partial<Record<string, string>> = {
   // Linux: polkit has no agent to show its dialog; the app's own field takes over.
   no_agent: 'The system could not show its password prompt.',
-  // The field was used where the OS prompts itself (a stale field, or a lock in between).
-  not_permitted_here: 'The system asks for your password itself now. Try again.',
+  // The field was used where the OS prompts itself (a stale field, or a lock in between): the
+  // re-read app_info then takes the field away, and the OS's prompt is the way.
+  use_system_prompt: 'The system asks for your password itself now. Try again.',
 };
+
+/**
+ * `not_permitted_here`: the OS refuses here for good as things stand — an administrator's polkit
+ * rule, a Windows account outside its logon hours or with a password that must change. Final,
+ * so it never says to try again.
+ */
+const NOT_PERMITTED =
+  "This computer's settings do not allow AppRafter to ask for your password here.";
 
 export interface AuthRefusal {
   /** What to say, a line each: what the OS said, or the app's own words. */
@@ -93,7 +102,12 @@ export function authRefusal(error: UiError, viaField: boolean): AuthRefusal {
   }
   if (error.code === DESKTOP_ERROR_CODES.AUTH_BUSY) return { lines: [BUSY], retryInMs: null };
   if (error.code === DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE) {
-    const line = UNAVAILABLE[String(error.fields.reason)];
+    const reason = String(error.fields.reason);
+    // What the OS said of it (the field's route) comes first: the more specific words.
+    if (reason === 'not_permitted_here') {
+      return { lines: [...(viaField ? messagesOf(error) : []), NOT_PERMITTED], retryInMs: null };
+    }
+    const line = UNAVAILABLE[reason];
     if (line !== undefined) return { lines: [line], retryInMs: null };
   }
   return { lines: [error.message], retryInMs: null };

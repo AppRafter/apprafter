@@ -106,7 +106,7 @@ describe('PlatformGate', () => {
     answer = () => reading.promise;
     refusal = () =>
       Promise.reject(
-        uiError(DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE, { reason: 'not_permitted_here' }),
+        uiError(DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE, { reason: 'use_system_prompt' }),
       );
     await act(() => api.unlock().catch(() => undefined));
     await settle();

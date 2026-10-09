@@ -401,7 +401,7 @@ describe('execute', () => {
     [DESKTOP_ERROR_CODES.AUTH_BUSY, {}],
     [DESKTOP_ERROR_CODES.AUTH_FAILED, { exhausted: false }],
     [DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE, { reason: 'no_agent' }],
-    [DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE, { reason: 'not_permitted_here' }],
+    [DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE, { reason: 'use_system_prompt' }],
   ])(
     'a refusal that leaves the plan waiting (%s %o) leaves an earlier subscription following it',
     async (code, fields) => {
@@ -419,6 +419,7 @@ describe('execute', () => {
 
   test.each([
     [DESKTOP_ERROR_CODES.AUTH_CANCELLED, {}],
+    [DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE, { reason: 'not_permitted_here' }],
     [DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE, { reason: 'policy_missing' }],
     [DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE, { reason: 'not_interactive' }],
     [DESKTOP_ERROR_CODES.PLAN_EXPIRED, {}],
