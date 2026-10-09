@@ -39,13 +39,21 @@
 
 pub mod cancel;
 pub mod context;
+pub mod doctor;
 pub mod env;
 pub mod error;
+pub mod kube;
+pub mod machine;
 pub mod net;
 pub mod op;
 pub mod process;
+pub mod provider;
 pub mod report;
+pub mod session;
+pub mod ssh;
+pub mod target;
 pub mod target_ref;
+pub mod tools;
 
 pub use cancel::{CancellationToken, Cancelled, Registration};
 pub use context::{
