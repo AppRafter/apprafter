@@ -1259,3 +1259,66 @@
   color: var(--fg-faint);
   font: 400 var(--fs-11) var(--font-mono);
 }
+
+/* The design's region row: the label inline at the start, then the chips, wrapping. */
+.chip-select {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.chip-select-legend {
+  flex: none;
+  min-width: 64px;
+}
+
+/* A chip is the label of a hidden radio; positioned, as a choice card is. */
+.chip-option {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: var(--h-28);
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-4);
+  color: var(--fg-muted);
+  font: 400 var(--fs-12-5) var(--font-sans);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.chip-option:hover:not([data-disabled]) {
+  color: var(--fg);
+}
+
+.chip-option:has(input:checked) {
+  border-color: var(--accent);
+  background: var(--accent-tint);
+  color: var(--fg);
+}
+
+.chip-option:has(input:focus-visible) {
+  outline: var(--focus-ring);
+  outline-offset: 1px;
+}
+
+.chip-option[data-disabled] {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.chip-option-label {
+  font-family: var(--font-mono);
+}
+
+.chip-option-secondary {
+  color: var(--fg-faint);
+}
+
+.chip-option-meta {
+  color: var(--fg-faint);
+  font: 400 var(--fs-11) var(--font-mono);
+}
