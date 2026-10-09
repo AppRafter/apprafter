@@ -376,10 +376,16 @@ describe('LockScreen where the OS cannot prompt: the password field', () => {
       refusal(DESKTOP_ERROR_CODES.AUTH_FAILED, { exhausted: false, messages: ['nope'] });
     const client = createQueryClient();
     const logged: unknown[] = [];
-    const saved = { error: console.error, warn: console.warn, log: console.log };
-    console.error = (...args: unknown[]) => logged.push(args);
-    console.warn = (...args: unknown[]) => logged.push(args);
-    console.log = (...args: unknown[]) => logged.push(args);
+    const saved = {
+      error: console.error,
+      warn: console.warn,
+      log: console.log,
+      info: console.info,
+      debug: console.debug,
+    };
+    for (const level of Object.keys(saved) as (keyof typeof saved)[]) {
+      console[level] = (...args: unknown[]) => logged.push(args);
+    }
     try {
       const user = lockScreen(lockState(), PAM, { client });
       await user.keyboard('correct-horse{Enter}');
@@ -398,7 +404,9 @@ describe('LockScreen where the OS cannot prompt: the password field', () => {
         .map((mutation) => mutation.state),
     ]);
     expect(kept).not.toContain('correct-horse');
-    expect(JSON.stringify(logged.map(String))).not.toContain('correct-horse');
+    // Every argument as a console shows it, objects and errors opened to the bottom: a logged
+    // `{ password }` is caught, not read as "[object Object]".
+    expect(Bun.inspect(logged, { depth: Number.POSITIVE_INFINITY })).not.toContain('correct-horse');
     expect(passwordInput().value).toBe('');
   });
 
