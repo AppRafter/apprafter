@@ -34,7 +34,9 @@
 #
 # The session watch's cases play logind and the screen savers themselves: --fake-logind lets
 # `walk` own org.freedesktop.login1 on the container's system bus (there is no systemd), and
-# --session-bus starts a session bus of `walk`'s and hands the test its address.
+# --session-bus starts a session bus of `walk`'s and hands the test its address. --no-system-bus
+# points the test's system bus at a socket that does not exist, as on a system without one (the
+# container's own bus and polkitd still run).
 #
 # A case passes only when its one test reported `ok` and the harness ran exactly one test, and
 # the cases here must be exactly the tests in the binaries, so a renamed test cannot turn into
@@ -76,6 +78,8 @@ CASES=(
     "session_container each_source_reports_its_event --fake-logind --session-bus"
     "session_container a_dropped_watch_reports_nothing --fake-logind --session-bus"
     "session_container without_a_session_bus_logind_still_reports --fake-logind"
+    "session_container without_a_system_bus_only_the_screen_savers_report --session-bus --no-system-bus"
+    "session_container without_any_bus_nothing_listens --no-system-bus"
 )
 
 die() {
@@ -162,7 +166,7 @@ cat >"$work/osauth-case" <<'DRIVER_EOF'
 set -euo pipefail
 
 policy=yes rule=none session=yes active=yes pam_service=yes password=yes
-fake_logind=no session_bus=no
+fake_logind=no session_bus=no system_bus=yes
 while [[ $# -gt 2 ]]; do
     case "$1" in
     --no-policy) policy=no ;;
@@ -174,6 +178,7 @@ while [[ $# -gt 2 ]]; do
     --empty-password) password=no ;;
     --fake-logind) fake_logind=yes ;;
     --session-bus) session_bus=yes ;;
+    --no-system-bus) system_bus=no ;;
     *)
         echo "osauth-case: unknown flag $1" >&2
         exit 2
@@ -281,6 +286,11 @@ if [[ $session_bus == yes ]]; then
     fi
     session_env=("DBUS_SESSION_BUS_ADDRESS=$address")
 fi
+# The test's system bus, when the case wants none: a socket that does not exist.
+system_env=()
+if [[ $system_bus == no ]]; then
+    system_env=("DBUS_SYSTEM_BUS_ADDRESS=unix:path=/nonexistent")
+fi
 
 # The container's loader and library directory (see the script's header).
 shopt -s nullglob
@@ -301,7 +311,7 @@ status=0
     fi
     exec setpriv --reuid=walk --regid=walk --init-groups --reset-env \
         env APPRAFTER_OSAUTH_CONTAINER=1 APPRAFTER_OSAUTH_PASSWORD="$OSAUTH_PASSWORD" \
-        APPRAFTER_OSAUTH_SESSION="$OSAUTH_SESSION" "${session_env[@]}" \
+        APPRAFTER_OSAUTH_SESSION="$OSAUTH_SESSION" "${session_env[@]}" "${system_env[@]}" \
         "${loaders[0]}" --library-path "$libdir" \
         "/opt/osauth/$binary" --ignored --exact --nocapture "$name"
 ) || status=$?

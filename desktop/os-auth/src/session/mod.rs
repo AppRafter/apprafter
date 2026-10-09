@@ -20,7 +20,9 @@
 //!
 //! Every source is optional. One the OS does not offer here (no session bus, no logind, a
 //! registration the OS refuses) is logged at info and skipped, never an error; the others
-//! still report.
+//! still report. Once set up, the watch says which signals it hears ([`Listening`]): a lock
+//! source, a sleep source, both or neither (WSL or a container without a bus) — so the app can
+//! tell the owner when lock-on-sleep has nothing to follow.
 //!
 //! An OS signal becomes an event through [`event`], a pure function tested on every OS. Events
 //! reach `on_event` in order on one thread of the watch's own, never on the OS's (the main
@@ -99,9 +101,33 @@ enum Message {
     Stop,
 }
 
-/// Set once a watch's sources listen.
+/// Which of the OS's signals a watch hears: what its sources could set up.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Listening {
+    /// A source of the session's locks listens: logind's `Lock` or a screen saver on Linux,
+    /// the session notification on Windows, the distributed screen-lock notification on macOS.
+    pub lock: bool,
+    /// A source of sleeps listens: logind's `PrepareForSleep`, the suspend notification, or
+    /// `NSWorkspace`'s sleep notifications.
+    pub sleep: bool,
+}
+
+impl Listening {
+    /// Nothing listens.
+    pub const NONE: Listening = Listening {
+        lock: false,
+        sleep: false,
+    };
+
+    /// Whether anything listens.
+    pub fn any(self) -> bool {
+        self.lock || self.sleep
+    }
+}
+
+/// Set once a watch's sources are set up, with what listens.
 #[derive(Default)]
-struct Ready(Mutex<bool>, Condvar);
+struct Ready(Mutex<Option<Listening>>, Condvar);
 
 /// Where a source sends what it sees: cheap to clone, `Send + Sync`, never blocks.
 #[derive(Clone)]
@@ -118,9 +144,9 @@ impl Emitter {
         }
     }
 
-    /// Every source that could be set up listens now.
-    pub(crate) fn ready(&self) {
-        *self.ready.0.lock().unwrap_or_else(PoisonError::into_inner) = true;
+    /// Every source that could be set up listens now; `listening` says which kinds there are.
+    pub(crate) fn ready(&self, listening: Listening) {
+        *self.ready.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(listening);
         self.ready.1.notify_all();
     }
 }
@@ -166,6 +192,10 @@ impl SessionWatch {
         let ready = Arc::new(Ready::default());
         let dispatcher = {
             let stopped = Arc::clone(&stopped);
+            #[cfg(test)]
+            if test_dispatcher::fails() {
+                return Self::without_dispatcher(sender, stopped, ready);
+            }
             thread::Builder::new()
                 .name("session-watch".to_owned())
                 .spawn(move || {
@@ -179,42 +209,78 @@ impl SessionWatch {
                 })
         };
         let dispatcher = match dispatcher {
-            Ok(dispatcher) => Some(dispatcher),
+            Ok(dispatcher) => dispatcher,
             Err(error) => {
                 tracing::warn!("no thread for the session watch ({error}): nothing is watched");
-                None
+                return Self::without_dispatcher(sender, stopped, ready);
             }
         };
         let emitter = Emitter {
             sender: sender.clone(),
             ready: Arc::clone(&ready),
         };
-        // Without a dispatcher nothing could hear a source, so none starts.
-        let sources = match dispatcher {
-            Some(_) => Some(start(emitter)),
-            None => {
-                emitter.ready();
-                None
-            }
-        };
         Self {
-            sources,
+            sources: Some(start(emitter)),
             sender,
             stopped,
             ready,
-            dispatcher,
+            dispatcher: Some(dispatcher),
         }
     }
 
-    /// Waits up to `timeout` until every source that could be set up listens; whether they all
-    /// do. Signals before then may be missed. The app need not wait; the tests do.
-    pub fn ready(&self, timeout: Duration) -> bool {
+    /// A watch with nothing to call back on: no source starts, and it hears nothing.
+    fn without_dispatcher(
+        sender: Sender<Message>,
+        stopped: Arc<AtomicBool>,
+        ready: Arc<Ready>,
+    ) -> Self {
+        let emitter = Emitter {
+            sender: sender.clone(),
+            ready: Arc::clone(&ready),
+        };
+        emitter.ready(Listening::NONE);
+        Self {
+            sources: None,
+            sender,
+            stopped,
+            ready,
+            dispatcher: None,
+        }
+    }
+
+    /// Waits up to `timeout` until every source that could be set up listens; which signals
+    /// they hear, or `None` while they are still being set up. Signals before then may be
+    /// missed. `Duration::ZERO` asks without waiting.
+    pub fn listening(&self, timeout: Duration) -> Option<Listening> {
         let (ready, woken) = (&self.ready.0, &self.ready.1);
         let ready = ready.lock().unwrap_or_else(PoisonError::into_inner);
         let (ready, _) = woken
-            .wait_timeout_while(ready, timeout, |ready| !*ready)
+            .wait_timeout_while(ready, timeout, |ready| ready.is_none())
             .unwrap_or_else(PoisonError::into_inner);
         *ready
+    }
+}
+
+/// Making a watch started inside [`failing`](test_dispatcher::failing) find no thread for its
+/// dispatcher, as an exhausted system would.
+#[cfg(test)]
+mod test_dispatcher {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FAIL: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Runs `f`; a watch it starts on this thread gets no dispatcher.
+    pub(super) fn failing<T>(f: impl FnOnce() -> T) -> T {
+        FAIL.with(|fail| fail.set(true));
+        let value = f();
+        FAIL.with(|fail| fail.set(false));
+        value
+    }
+
+    pub(super) fn fails() -> bool {
+        FAIL.with(Cell::get)
     }
 }
 
@@ -237,6 +303,7 @@ mod tests {
     use std::sync::mpsc::Receiver;
     use std::time::Instant;
 
+    use super::test_dispatcher;
     use super::*;
     use SessionEvent::{Locked, Sleeping};
 
@@ -294,6 +361,11 @@ mod tests {
         );
     }
 
+    const BOTH: Listening = Listening {
+        lock: true,
+        sleep: true,
+    };
+
     /// A watch whose one source is the returned emitter, and the events it reports.
     fn fake_watch() -> (SessionWatch, Emitter, Receiver<SessionEvent>) {
         let (events, received) = mpsc::channel();
@@ -304,7 +376,7 @@ mod tests {
             },
             move |emitter: Emitter| {
                 emitters.send(emitter.clone()).unwrap();
-                emitter.ready();
+                emitter.ready(BOTH);
                 Box::new(())
             },
         );
@@ -314,7 +386,7 @@ mod tests {
     #[test]
     fn a_source_s_signals_reach_the_callback_in_order() {
         let (watch, source, events) = fake_watch();
-        assert!(watch.ready(PATIENCE));
+        assert_eq!(watch.listening(PATIENCE), Some(BOTH));
         source.signal(Signal::SessionLock);
         source.signal(Signal::PrepareForSleep { start: false });
         source.signal(Signal::PrepareForSleep { start: true });
@@ -443,7 +515,7 @@ mod tests {
     }
 
     #[test]
-    fn ready_waits_for_the_sources_and_no_longer_than_asked() {
+    fn listening_waits_for_the_sources_and_no_longer_than_asked() {
         let (emitters, emitter) = mpsc::channel();
         let watch = SessionWatch::start(
             |_| {},
@@ -453,14 +525,72 @@ mod tests {
             },
         );
         let started = Instant::now();
-        assert!(!watch.ready(Duration::from_millis(50)));
+        assert_eq!(watch.listening(Duration::from_millis(50)), None);
         assert!(started.elapsed() >= Duration::from_millis(50));
+        assert_eq!(
+            watch.listening(Duration::ZERO),
+            None,
+            "asked without waiting"
+        );
         let source: Emitter = emitter.recv().unwrap();
         thread::spawn(move || {
             thread::sleep(Duration::from_millis(30));
-            source.ready();
+            source.ready(BOTH);
         });
-        assert!(watch.ready(PATIENCE));
+        assert_eq!(watch.listening(PATIENCE), Some(BOTH));
+        assert_eq!(
+            watch.listening(Duration::ZERO),
+            Some(BOTH),
+            "and from then on"
+        );
+    }
+
+    /// What the sources set up is what the watch says it hears: nothing, either half, or both.
+    #[test]
+    fn a_watch_says_which_signals_its_sources_hear() {
+        for listening in [
+            Listening::NONE,
+            Listening {
+                lock: true,
+                sleep: false,
+            },
+            Listening {
+                lock: false,
+                sleep: true,
+            },
+            BOTH,
+        ] {
+            let watch = SessionWatch::start(
+                |_| {},
+                move |emitter: Emitter| {
+                    emitter.ready(listening);
+                    Box::new(())
+                },
+            );
+            assert_eq!(watch.listening(PATIENCE), Some(listening));
+            assert_eq!(listening.any(), listening.lock || listening.sleep);
+        }
+        assert!(!Listening::NONE.any());
+    }
+
+    /// Without a thread to call back on, no source starts, and the watch says it hears nothing
+    /// rather than leave the question open.
+    #[test]
+    fn without_a_dispatcher_nothing_listens() {
+        let started = Arc::new(AtomicBool::new(false));
+        let watch = test_dispatcher::failing(|| {
+            let started = Arc::clone(&started);
+            SessionWatch::start(
+                |_| {},
+                move |emitter: Emitter| {
+                    started.store(true, Ordering::SeqCst);
+                    emitter.ready(BOTH);
+                    Box::new(())
+                },
+            )
+        });
+        assert_eq!(watch.listening(Duration::ZERO), Some(Listening::NONE));
+        assert!(!started.load(Ordering::SeqCst), "no source started");
     }
 
     #[test]

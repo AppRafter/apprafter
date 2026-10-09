@@ -541,8 +541,10 @@ fn watch_session(probe: &Arc<Probe>) -> Option<(mpsc::Sender<()>, JoinHandle<()>
                     let probe = Arc::clone(&probe);
                     move |event| probe.log.push(format!("session: {event:?}"))
                 });
-                if watch.ready(WATCH_READY_WITHIN) {
-                    probe.log.push("session watch: ready");
+                if let Some(listening) = watch.listening(WATCH_READY_WITHIN) {
+                    probe
+                        .log
+                        .push(format!("session watch: ready, {listening:?}"));
                 } else {
                     probe.log.push(format!(
                         "session watch: not ready within {}",

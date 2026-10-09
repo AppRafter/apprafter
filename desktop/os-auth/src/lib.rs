@@ -26,7 +26,7 @@ pub mod windows;
 pub use action::Action;
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub use session::watch;
-pub use session::{SessionEvent, SessionWatch};
+pub use session::{Listening, SessionEvent, SessionWatch};
 
 #[cfg(target_os = "linux")]
 pub use linux::OsAuthenticator;

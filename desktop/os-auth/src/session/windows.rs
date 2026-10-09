@@ -28,7 +28,7 @@ use ::windows::Win32::UI::WindowsAndMessaging::{
     WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_DESTROY, WNDCLASSEXW,
 };
 
-use super::{Emitter, Signal, WM_POWERBROADCAST, WM_WTSSESSION_CHANGE};
+use super::{Emitter, Listening, Signal, WM_POWERBROADCAST, WM_WTSSESSION_CHANGE};
 
 /// The window class every watch's window is created from.
 const CLASS: PCWSTR = w!("AppRafterDesktopSessionWatch");
@@ -92,10 +92,13 @@ pub(super) fn start(emitter: Emitter) -> Sources {
             None
         }
         Ok(thread) => match window.recv() {
-            Ok(Some(window)) => Some(Sources {
-                window,
-                thread: Some(thread),
-            }),
+            Ok(Some((window, listening))) => Some((
+                Sources {
+                    window,
+                    thread: Some(thread),
+                },
+                listening,
+            )),
             // No window: the thread has ended or is ending.
             Ok(None) | Err(_) => {
                 let _ = thread.join();
@@ -103,16 +106,29 @@ pub(super) fn start(emitter: Emitter) -> Sources {
             }
         },
     };
-    emitter.ready();
-    sources.unwrap_or(Sources {
-        window: 0,
-        thread: None,
-    })
+    let (sources, listening) = sources.unwrap_or((
+        Sources {
+            window: 0,
+            thread: None,
+        },
+        Listening::NONE,
+    ));
+    emitter.ready(listening);
+    sources
 }
 
-/// The window's thread: creates the window, registers it, says so through `created`, and runs
-/// the message loop until the window is destroyed.
-fn run(emitter: Emitter, created: &mpsc::Sender<Option<isize>>) {
+/// What the window hears: the session's locks once registered for session changes, sleeps
+/// once registered for suspends.
+fn listening(session: bool, power: bool) -> Listening {
+    Listening {
+        lock: session,
+        sleep: power,
+    }
+}
+
+/// The window's thread: creates the window, registers it, says so through `created` with what
+/// it hears, and runs the message loop until the window is destroyed.
+fn run(emitter: Emitter, created: &mpsc::Sender<Option<(isize, Listening)>>) {
     let Some(window) = create_window() else {
         let _ = created.send(None);
         return;
@@ -145,7 +161,10 @@ fn run(emitter: Emitter, created: &mpsc::Sender<Option<isize>>) {
             power,
         });
     });
-    let _ = created.send(Some(window.0 as isize));
+    let _ = created.send(Some((
+        window.0 as isize,
+        listening(session, power.is_some()),
+    )));
     let mut message = MSG::default();
     loop {
         // SAFETY: `message` is a valid MSG for the call to fill; no window filter, so it reads
@@ -315,7 +334,16 @@ mod tests {
                 Box::new(sources)
             },
         );
-        assert!(watch.ready(PATIENCE));
+        let listening = watch.listening(PATIENCE).expect("the watch was set up");
+        // Wine registers both; a Windows without the services behind them would say so here.
+        assert_eq!(
+            listening,
+            Listening {
+                lock: true,
+                sleep: true
+            },
+            "both registrations"
+        );
         let window = window.recv().unwrap();
         assert_ne!(window, 0, "a window was created");
 
@@ -332,6 +360,25 @@ mod tests {
         assert!(
             post(window, WM_WTSSESSION_CHANGE, WTS_SESSION_LOCK).is_err(),
             "the window is gone"
+        );
+    }
+
+    #[test]
+    fn each_registration_is_its_half() {
+        assert_eq!(listening(false, false), Listening::NONE);
+        assert_eq!(
+            listening(true, false),
+            Listening {
+                lock: true,
+                sleep: false
+            }
+        );
+        assert_eq!(
+            listening(false, true),
+            Listening {
+                lock: false,
+                sleep: true
+            }
         );
     }
 

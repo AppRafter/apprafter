@@ -32,7 +32,7 @@ use objc2_core_foundation::{
 };
 use objc2_foundation::{NSNotification, NSNotificationName};
 
-use super::{Emitter, Signal};
+use super::{Emitter, Listening, Signal};
 
 /// The distributed notification the screen's lock posts.
 const SCREEN_IS_LOCKED: &str = "com.apple.screenIsLocked";
@@ -109,7 +109,10 @@ pub(super) fn start(emitter: Emitter) -> Sources {
         workspace.push(Observer(token));
     }
     let distributed = distributed(&emitter);
-    emitter.ready();
+    emitter.ready(Listening {
+        lock: distributed.is_some(),
+        sleep: !workspace.is_empty(),
+    });
     Sources {
         workspace,
         distributed,
@@ -182,7 +185,14 @@ mod tests {
                 Box::new(sources)
             },
         );
-        assert!(watch.ready(Duration::from_secs(10)));
+        assert_eq!(
+            watch.listening(Duration::from_secs(10)),
+            Some(Listening {
+                lock: true,
+                sleep: true
+            }),
+            "both centres registered"
+        );
         let key = key.recv().unwrap().expect("the distributed observer");
         assert!(DISTRIBUTED.lock().unwrap().iter().any(|(k, _)| *k == key));
         drop(watch);

@@ -17,7 +17,7 @@
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
-use apprafter_os_auth::{watch, SessionEvent, SessionWatch};
+use apprafter_os_auth::{watch, Listening, SessionEvent, SessionWatch};
 use zbus::blocking::{connection, Connection};
 use zbus::zvariant::OwnedObjectPath;
 
@@ -136,17 +136,28 @@ fn active_changed(connection: &Connection, name: &str, active: bool) {
         .unwrap();
 }
 
-/// A watch whose events the case reads, ready to hear.
-fn watching() -> (SessionWatch, Receiver<SessionEvent>) {
+const BOTH: Listening = Listening {
+    lock: true,
+    sleep: true,
+};
+
+/// A watch whose events the case reads, set up and hearing what `expected` says.
+fn watching_for(expected: Listening) -> (SessionWatch, Receiver<SessionEvent>) {
     let (events, received) = mpsc::channel();
     let watch = watch(move |event| {
         let _ = events.send(event);
     });
-    assert!(
-        watch.ready(PATIENCE),
-        "the watch was not listening within {PATIENCE:?}"
+    assert_eq!(
+        watch.listening(PATIENCE),
+        Some(expected),
+        "what the watch hears, within {PATIENCE:?}"
     );
     (watch, received)
+}
+
+/// A watch that hears both the session's locks and sleeps.
+fn watching() -> (SessionWatch, Receiver<SessionEvent>) {
+    watching_for(BOTH)
 }
 
 fn next(events: &Receiver<SessionEvent>) -> SessionEvent {
@@ -263,4 +274,31 @@ fn without_a_session_bus_logind_still_reports() {
     assert_eq!(next(&events), SessionEvent::Sleeping);
     logind.lock(OWN_SESSION);
     assert_eq!(next(&events), SessionEvent::Locked);
+}
+
+/// Without a system bus there is no logind: only the screen savers report, so the watch hears
+/// the session's locks and no sleep.
+#[test]
+#[ignore = "needs the session container: bash scripts/test-osauth-linux.sh"]
+fn without_a_system_bus_only_the_screen_savers_report() {
+    let _session = container();
+    assert!(Connection::system().is_err(), "there is no system bus");
+    let screen_savers = FakeScreenSavers::start();
+    let (_watch, events) = watching_for(Listening {
+        lock: true,
+        sleep: false,
+    });
+    screen_savers.active_changed(GNOME, true);
+    assert_eq!(next(&events), SessionEvent::Locked);
+}
+
+/// With neither bus (WSL, a container) nothing listens, and the watch says so.
+#[test]
+#[ignore = "needs the session container: bash scripts/test-osauth-linux.sh"]
+fn without_any_bus_nothing_listens() {
+    let _session = container();
+    assert!(Connection::system().is_err(), "there is no system bus");
+    assert!(Connection::session().is_err(), "there is no session bus");
+    let (_watch, events) = watching_for(Listening::NONE);
+    quiet(&events, "a watch that hears nothing reported");
 }

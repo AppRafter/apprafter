@@ -116,8 +116,10 @@ pub trait SessionSource: Send {
 }
 
 impl SessionSource for SessionWatch {
+    /// Set up, with something listening: a watch that hears nothing does not count.
     fn listens(&self) -> bool {
-        self.ready(Duration::ZERO)
+        self.listening(Duration::ZERO)
+            .is_some_and(apprafter_os_auth::Listening::any)
     }
 }
 

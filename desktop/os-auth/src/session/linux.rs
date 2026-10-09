@@ -19,7 +19,7 @@ use zbus::message::Type;
 use zbus::zvariant::OwnedObjectPath;
 use zbus::{Connection, MatchRule, Message, MessageStream};
 
-use super::{Emitter, Signal};
+use super::{Emitter, Listening, Signal};
 use crate::linux::session;
 
 const LOGIN1: &str = "org.freedesktop.login1";
@@ -84,7 +84,7 @@ pub(super) fn start(emitter: Emitter) -> Sources {
         Ok(thread) => Some(thread),
         Err(error) => {
             tracing::warn!("no thread for logind and the screen saver ({error}): not watched");
-            emitter.ready();
+            emitter.ready(Listening::NONE);
             None
         }
     };
@@ -127,13 +127,30 @@ async fn listen(emitter: Emitter) {
             tracing::info!("no session bus ({error}): the screen saver's locks are not watched")
         }
     }
-    emitter.ready();
+    emitter.ready(listening(streams.iter().map(|(kind, _)| *kind)));
     loop {
         let (kind, message) = next(&mut streams).await;
         if let Some(signal) = kind.signal(&message) {
             emitter.signal(signal);
         }
     }
+}
+
+/// What the streams set up hear: logind's `Lock` and the screen savers are the session's
+/// locks, `PrepareForSleep` the sleeps.
+fn listening(kinds: impl IntoIterator<Item = Kind>) -> Listening {
+    kinds
+        .into_iter()
+        .fold(Listening::NONE, |listening, kind| match kind {
+            Kind::PrepareForSleep => Listening {
+                sleep: true,
+                ..listening
+            },
+            Kind::SessionLock | Kind::ScreenSaver => Listening {
+                lock: true,
+                ..listening
+            },
+        })
 }
 
 /// logind's two sources: the manager's `PrepareForSleep`, and `Lock` on the app's session.
@@ -276,6 +293,38 @@ mod tests {
             (Kind::ScreenSaver, None, None),
         ] {
             assert_eq!(signal(kind, body), expected, "{kind:?} {body:?}");
+        }
+    }
+
+    /// No bus, one bus, a logind without the app's session: each says what it hears.
+    #[test]
+    fn the_streams_set_up_say_what_the_watch_hears() {
+        let none = Listening::NONE;
+        let lock = Listening {
+            lock: true,
+            sleep: false,
+        };
+        let sleep = Listening {
+            lock: false,
+            sleep: true,
+        };
+        let both = Listening {
+            lock: true,
+            sleep: true,
+        };
+        for (kinds, expected) in [
+            (vec![], none),
+            (vec![Kind::ScreenSaver], lock),
+            (vec![Kind::ScreenSaver, Kind::ScreenSaver], lock),
+            (vec![Kind::SessionLock], lock),
+            (vec![Kind::PrepareForSleep], sleep),
+            (vec![Kind::PrepareForSleep, Kind::ScreenSaver], both),
+            (
+                vec![Kind::PrepareForSleep, Kind::SessionLock, Kind::ScreenSaver],
+                both,
+            ),
+        ] {
+            assert_eq!(listening(kinds.clone()), expected, "{kinds:?}");
         }
     }
 
