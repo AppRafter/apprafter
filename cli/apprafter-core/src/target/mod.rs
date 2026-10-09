@@ -246,9 +246,12 @@ pub fn store_lock_event(event: &StoreLockEvent<'_>) -> Event {
 
 /// The store lock, creating the root (an add on a fresh store must lock it). Never held across
 /// the network: every `execute_*` does its provider calls first.
+// `allow`, not `expect`: a fn whose only caller is itself dead is reported by rustc 1.98 but not
+// by the dev shell's 1.95, so an expectation is unfulfilled on one of them (GOTCHA-103's class).
+// Goes with the first caller.
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "first caller: execute_use (D.3b Task 6)")
+    allow(dead_code, reason = "first caller: execute_use (D.3b Task 6)")
 )]
 pub(crate) fn lock_store(ctx: &Context, reporter: &dyn Reporter) -> CoreResult<StoreLock> {
     Ok(StoreLock::exclusive_or_wait(&ctx.store(), |e| {
