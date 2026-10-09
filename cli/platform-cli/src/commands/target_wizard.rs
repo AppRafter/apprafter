@@ -765,9 +765,11 @@ fn default_ssh_key_hint(home: Option<&Path>) -> String {
     // expects. If the file doesn't exist, the validator gives the
     // user a clear "path does not exist" prompt without erroring
     // out the wizard — they can paste a different path.
+    // One component per `join`, so the platform's separator sits between each of them.
     if let Some(home) = home {
         return home
-            .join(".ssh/id_ed25519.pub")
+            .join(".ssh")
+            .join("id_ed25519.pub")
             .to_string_lossy()
             .into_owned();
     }
@@ -1478,12 +1480,17 @@ mod tests {
     /// context's home. It is the value most operators will accept
     /// with a single Return, so pointing it at a stale name
     /// (`id_rsa.pub`) would push people onto a weaker key or an
-    /// empty prompt. No home: the `~/` form.
+    /// empty prompt. No home: the `~/` form. The path is shown as the platform renders it —
+    /// on Windows `\` between every component, never `C:\Users\op\.ssh/id_ed25519.pub`.
     #[test]
     fn default_ssh_key_hint_offers_the_modern_openssh_key_name() {
+        let home = Path::new("/home/op");
         assert_eq!(
-            default_ssh_key_hint(Some(Path::new("/home/op"))),
-            "/home/op/.ssh/id_ed25519.pub"
+            default_ssh_key_hint(Some(home)),
+            home.join(".ssh")
+                .join("id_ed25519.pub")
+                .display()
+                .to_string()
         );
         assert_eq!(default_ssh_key_hint(None), "~/.ssh/id_ed25519.pub");
     }

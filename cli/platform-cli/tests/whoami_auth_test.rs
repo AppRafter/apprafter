@@ -64,7 +64,9 @@ fn whoami_on_empty_store_prints_onboarding_hint() {
 
 /// The CLI-default pointer is read before anything prints: a `config.yaml` that cannot be
 /// parsed is the error alone, with no identity line in front of it. A target whose own files
-/// cannot be read fails after the identity line. Both orders are today's.
+/// cannot be read fails after the identity line. Both orders are today's. Which file failed is
+/// told by the YAML key its parse error names, not by its path: miette wraps the path inside a
+/// word on Windows, where `\` allows no line break.
 #[test]
 fn whoami_reads_the_pointer_before_the_identity_line_and_the_target_after_it() {
     let dir = tempfile::tempdir().unwrap();
@@ -80,7 +82,8 @@ fn whoami_reads_the_pointer_before_the_identity_line_and_the_target_after_it() {
         .assert()
         .failure()
         .stdout(contains("Identity:"))
-        .stderr(contains("credentials.yaml"));
+        .stderr(contains("apprafter::target::invalid_config"))
+        .stderr(contains("hetzner_token:"));
 
     std::fs::write(dir.path().join("config.yaml"), "active_target: [unclosed").unwrap();
     cli()
@@ -89,7 +92,8 @@ fn whoami_reads_the_pointer_before_the_identity_line_and_the_target_after_it() {
         .assert()
         .failure()
         .stdout(predicates::str::is_empty())
-        .stderr(contains("config.yaml"));
+        .stderr(contains("apprafter::target::invalid_config"))
+        .stderr(contains("active_target:"));
 }
 
 #[test]

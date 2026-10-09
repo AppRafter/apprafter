@@ -988,6 +988,15 @@ fn target_remove_on_missing_target_surfaces_available_hint() {
         .stderr(contains("target `ghost` not found"));
 }
 
+/// The code of a target file that cannot be parsed. miette prints it on a line of its own,
+/// which it never wraps; the path is in the `×` message, which it wraps at 80 columns — and a
+/// Windows path (`\` allows no line break before a letter) is split inside a word, so asserting
+/// on the path would fail on the Windows runner only.
+const UNREADABLE_CODE: &str = "apprafter::target::invalid_config";
+/// The key a seeded `credentials.yaml` fails on, as its parse error names it: it says which file
+/// was read, path-free and too short to be split.
+const CREDENTIALS_KEY: &str = "hetzner_token:";
+
 /// `use` and `remove` find their target by reading both of its files, as they always have: a
 /// target whose credentials file cannot be parsed is refused and left in place, and the CLI
 /// default does not move onto it. (The core checks only that a target exists; the CLI keeps
@@ -1012,7 +1021,8 @@ fn target_use_and_remove_refuse_a_target_whose_files_cannot_be_read() {
             .args(args)
             .assert()
             .failure()
-            .stderr(contains("credentials.yaml"));
+            .stderr(contains(UNREADABLE_CODE))
+            .stderr(contains(CREDENTIALS_KEY));
     }
     assert!(dir.path().join("targets/second/config.yaml").exists());
     let global = std::fs::read_to_string(dir.path().join("config.yaml")).unwrap();
@@ -1058,7 +1068,8 @@ fn target_add_and_renew_refuse_a_target_whose_credentials_cannot_be_read() {
             .args(&args)
             .assert()
             .failure()
-            .stderr(contains("credentials.yaml"))
+            .stderr(contains(UNREADABLE_CODE))
+            .stderr(contains(CREDENTIALS_KEY))
             .stderr(contains("already exists").not())
             .stderr(contains("only updates credentials").not());
     }
