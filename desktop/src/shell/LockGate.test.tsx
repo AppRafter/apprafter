@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { type QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import {
+  defaultScheduler,
+  notifyManager,
+  type QueryClient,
+  QueryClientProvider,
+} from '@tanstack/react-query';
 import { emit } from '@tauri-apps/api/event';
 import { clearMocks, mockIPC, mockWindows } from '@tauri-apps/api/mocks';
 import { act, cleanup, render, screen } from '@testing-library/react';
@@ -12,8 +17,9 @@ import { attach, operationsSnapshot, resetOperations } from '../ipc/operations';
 import { ACTIVITY_INTERVAL_MS } from '../state/lock';
 import { APP_INFO_KEY, PlatformContext } from '../state/platform';
 import { createQueryClient } from '../state/queryClient';
-import { appInfo, lockState } from '../test/fixtures';
+import { appInfo, authInfo, lockState } from '../test/fixtures';
 import { LockGate } from './LockGate';
+import { PlatformGate } from './PlatformGate';
 
 let calls: string[];
 let status: LockState;
@@ -41,6 +47,7 @@ beforeEach(() => {
 
 afterEach(async () => {
   cleanup();
+  notifyManager.setScheduler(defaultScheduler);
   await settle();
   resetOperations();
   clearMocks();
@@ -233,5 +240,91 @@ describe('LockGate', () => {
     await act(settle);
     expect(calls.filter((c) => c === 'op_subscribe')).toHaveLength(2);
     expect(operationsSnapshot().get(7)?.live).toBe(true);
+  });
+});
+
+describe('LockGate under the PlatformGate: the field a lock puts in question', () => {
+  /** Linux without a polkit agent: the PAM route, and the lock screen's own field. */
+  const PAM = appInfo({ auth: authInfo({ method: 'pam', passwordField: true }) });
+
+  test('the commit that shows the lock has no field; the re-read that lands brings it back', async () => {
+    let reads = 0;
+    let reread!: (info: typeof PAM) => void;
+    mockIPC(
+      (cmd) => {
+        calls.push(cmd);
+        if (cmd === 'app_info') {
+          reads += 1;
+          if (reads === 1) return PAM;
+          return new Promise((resolve) => (reread = resolve));
+        }
+        if (cmd === 'lock_status') return lockState({ locked: false });
+        if (cmd === 'plugin:window|is_maximized') return false;
+        return null;
+      },
+      { shouldMockEvents: true },
+    );
+    render(
+      <QueryClientProvider client={createQueryClient()}>
+        <PlatformGate>
+          <LockGate>
+            <ShellProbe />
+          </LockGate>
+        </PlatformGate>
+      </QueryClientProvider>,
+    );
+    await screen.findByText('the shell');
+    // TanStack hands every observer its news on a later task (setTimeout 0): hold them all, so
+    // what is on screen is exactly what the commit that shows the lock rendered.
+    const held: (() => void)[] = [];
+    notifyManager.setScheduler((notify) => {
+      held.push(notify);
+    });
+    const runHeld = () =>
+      act(async () => {
+        for (const notify of held.splice(0)) notify();
+      });
+    await act(async () => {
+      await emit(LOCK_CHANGED, lockState({ reason: 'idle', seq: 2 }));
+    });
+    // The lock's own news: the commit that mounts the lock screen.
+    await runHeld();
+    expect(screen.getByRole('heading', { name: 'AppRafter is locked' })).toBeDefined();
+    expect(reads).toBe(2);
+    expect(screen.queryByLabelText('System password')).toBeNull();
+    expect(screen.getByRole('button', { name: 'Unlock' }).textContent).toBe('Unlock');
+    // The re-read's news that it started: still nothing that may be stale.
+    await runHeld();
+    expect(screen.queryByLabelText('System password')).toBeNull();
+    // It lands, and says the field is still the way.
+    await act(async () => {
+      reread(PAM);
+      await settle();
+    });
+    await runHeld();
+    expect(screen.getByLabelText('System password')).toBeDefined();
+  });
+  test('a lock the app starts in shows the field at once: app_info has just answered', async () => {
+    mockIPC(
+      (cmd) => {
+        calls.push(cmd);
+        if (cmd === 'app_info') return PAM;
+        if (cmd === 'lock_status') return lockState({ reason: 'startup' });
+        if (cmd === 'plugin:window|is_maximized') return false;
+        return null;
+      },
+      { shouldMockEvents: true },
+    );
+    render(
+      <QueryClientProvider client={createQueryClient()}>
+        <PlatformGate>
+          <LockGate>
+            <ShellProbe />
+          </LockGate>
+        </PlatformGate>
+      </QueryClientProvider>,
+    );
+    expect(await screen.findByLabelText('System password')).toBeDefined();
+    expect(calls.filter((c) => c === 'app_info')).toHaveLength(1);
   });
 });
