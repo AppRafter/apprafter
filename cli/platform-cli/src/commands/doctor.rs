@@ -14,10 +14,11 @@
 //! - 0  → no FAIL checks (WARNs allowed).
 //! - 1  → at least one FAIL.
 //!
-//! WARNs are informational (missing optional dep, unverified
-//! token because `--no-ping` was passed). FAILs are real broken
-//! state (token rejected, can't reach API, ssh-key path
-//! configured but file missing).
+//! WARNs are informational (a missing optional dependency). A check
+//! that did not run — the token ping under `--no-ping`, or with no
+//! token stored — is SKIPPED (`–`), and a skipped row counts in no
+//! total (R8). FAILs are real broken state (token rejected, can't
+//! reach API, ssh-key path configured but file missing).
 
 use std::process::{Command, Output};
 use std::time::Instant;
@@ -39,6 +40,8 @@ pub enum CheckStatus {
     Pass,
     Warn,
     Fail,
+    /// The check did not run (`--no-ping`, nothing to verify). Not counted in the summary (R8).
+    Skipped,
 }
 
 impl CheckStatus {
@@ -47,6 +50,7 @@ impl CheckStatus {
             Self::Pass => "✓",
             Self::Warn => "⚠",
             Self::Fail => "✗",
+            Self::Skipped => "–",
         }
     }
 
@@ -60,6 +64,7 @@ impl CheckStatus {
             Self::Pass => cli_core::style::ok(self.glyph()),
             Self::Warn => cli_core::style::warn(self.glyph()),
             Self::Fail => cli_core::style::fail(self.glyph()),
+            Self::Skipped => cli_core::style::dim(self.glyph()),
         }
     }
 }
@@ -100,6 +105,15 @@ impl Check {
         Self {
             name: name.into(),
             status: CheckStatus::Fail,
+            detail: None,
+            hint: None,
+        }
+    }
+
+    pub fn skipped(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            status: CheckStatus::Skipped,
             detail: None,
             hint: None,
         }
@@ -324,17 +338,18 @@ fn check_token_format(target: &Target) -> Check {
 }
 
 fn check_token_ping(target: &Target, no_ping: bool) -> Check {
+    // R8: a check that did not run is skipped, not a warning, and its detail names no CLI
+    // flag: the desktop shows the same report.
     if no_ping {
-        return Check::warn("Token verified against provider API")
-            .with_detail("skipped — `--no-ping`".to_string());
+        return Check::skipped("Token verified against provider API").with_detail("not requested");
     }
     let Some(tok) = target.credentials.hetzner_token.as_deref() else {
-        return Check::warn("Token verified against provider API")
-            .with_detail("skipped — no token stored".to_string());
+        return Check::skipped("Token verified against provider API")
+            .with_detail("no token stored");
     };
     if target.config.provider != "hetzner-cloud" {
-        return Check::warn("Token verified against provider API").with_detail(format!(
-            "no validator wired for provider `{}`",
+        return Check::skipped("Token verified against provider API").with_detail(format!(
+            "no validator for provider `{}`",
             target.config.provider
         ));
     }
@@ -762,11 +777,55 @@ mod tests {
     }
 
     #[test]
-    fn check_token_ping_warns_when_no_ping_flag_set() {
+    fn check_token_ping_is_skipped_when_not_requested() {
+        // R8: a check that never ran is neither a pass nor a warning, and the detail names no
+        // CLI flag (the GUI shows the same report).
         let t = make_target("hetzner-cloud", Some("a".repeat(64)));
         let c = check_token_ping(&t, true);
-        assert_eq!(c.status, CheckStatus::Warn);
-        assert!(c.detail.unwrap().contains("--no-ping"));
+        assert_eq!(c.status, CheckStatus::Skipped);
+        assert_eq!(c.detail.as_deref(), Some("not requested"));
+    }
+
+    #[test]
+    fn check_token_ping_without_a_token_is_skipped() {
+        let c = check_token_ping(&make_target("hetzner-cloud", None), false);
+        assert_eq!(c.status, CheckStatus::Skipped);
+        assert_eq!(c.detail.as_deref(), Some("no token stored"));
+    }
+
+    #[test]
+    fn check_token_ping_for_an_unsupported_provider_is_skipped() {
+        let c = check_token_ping(&make_target("aws-bedrock", Some("a".repeat(64))), false);
+        assert_eq!(c.status, CheckStatus::Skipped);
+        assert_eq!(
+            c.detail.as_deref(),
+            Some("no validator for provider `aws-bedrock`")
+        );
+    }
+
+    #[test]
+    fn skipped_checks_count_in_no_total() {
+        let report = DoctorReport {
+            target_name: None,
+            target_checks: vec![Check::skipped("s"), Check::pass("p")],
+            env_checks: vec![],
+        };
+        assert_eq!(report.passed(), 1);
+        assert_eq!(report.warned(), 0);
+        assert_eq!(report.failed(), 0);
+        // The row is still there, as a skipped one: nothing counts it in a total.
+        assert_eq!(
+            report
+                .iter_checks()
+                .filter(|c| c.status == CheckStatus::Skipped)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_skipped_check_renders_as_a_dash() {
+        assert_eq!(CheckStatus::Skipped.glyph(), "–");
     }
 
     fn make_target(provider: &str, token: Option<String>) -> Target {

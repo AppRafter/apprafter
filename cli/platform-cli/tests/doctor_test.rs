@@ -131,11 +131,11 @@ fn doctor_renders_target_and_env_checks_with_summary() {
         .stdout(contains("Credentials file"))
         .stdout(contains("Provider `hetzner-cloud` supported"))
         .stdout(contains("Token format valid"))
-        // --no-ping means the verification step is WARN with
-        // skipped detail, not PASS.
-        .stdout(contains("Token verified against provider API"))
-        .stdout(contains("skipped"))
-        .stdout(contains("--no-ping"))
+        // R8: --no-ping means the verification step did not run: a dash and
+        // a detail that names no CLI flag, not a WARN.
+        .stdout(contains(
+            "– Token verified against provider API (not requested)",
+        ))
         .stdout(contains("SSH key readable"))
         .stdout(contains("ssh-ed25519"))
         // Environment section.
@@ -238,7 +238,9 @@ fn doctor_target_not_found_fails_with_available_hint() {
 
 #[test]
 fn doctor_summary_line_phrases_outcomes_clearly() {
-    // Happy path: no FAILs. Summary should NOT contain "FAIL".
+    // Happy path: no FAILs and no warnings. With every tool present and the
+    // token check skipped (`--no-ping`, not counted), the summary is "All
+    // good" and contains neither "FAIL" nor "warning".
     let dir = tempfile::tempdir().unwrap();
     let key_dir = tempfile::tempdir().unwrap();
     let key_path = key_dir.path().join("id_ed25519.pub");
@@ -250,11 +252,14 @@ fn doctor_summary_line_phrases_outcomes_clearly() {
         .env("APPRAFTER_CONFIG_DIR", dir.path())
         .env("APPRAFTER_NO_PING", "1")
         .env("PATH", tools.path())
+        // The DNS row then resolves `127.0.0.1`, so the run is hermetic.
+        .env("APPRAFTER_HCLOUD_BASE_URL", "http://127.0.0.1:1")
         .arg("doctor")
         .assert()
         .success()
         .stdout(predicates::str::contains(" FAIL").not())
-        // With --no-ping, the token-verified check is a WARN —
-        // so the summary mentions "warning(s)".
-        .stdout(contains("warning"));
+        // R8: the token check `--no-ping` skipped is not a warning, so a healthy target is
+        // "All good" rather than "review warnings".
+        .stdout(contains("warning").not())
+        .stdout(contains("All good"));
 }
