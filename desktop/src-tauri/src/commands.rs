@@ -280,7 +280,10 @@ mod tests {
     fn a_refusal_reaches_the_webview_with_what_the_os_said() {
         let result: Result<(), _> = tauri::async_runtime::block_on(blocking(|| {
             Err(Refusal::new(
-                DesktopError::AuthFailed { exhausted: false },
+                DesktopError::AuthFailed {
+                    exhausted: false,
+                    retry_in_ms: None,
+                },
                 vec!["Password expired".into()],
             ))
         }));

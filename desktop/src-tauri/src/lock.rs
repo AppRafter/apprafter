@@ -455,7 +455,13 @@ impl LockMachine {
                 return Ok(());
             }
             AuthOutcome::Cancelled { .. } => DesktopError::AuthCancelled,
-            AuthOutcome::Failed { exhausted } => DesktopError::AuthFailed { exhausted },
+            AuthOutcome::Failed {
+                exhausted,
+                retry_in_ms,
+            } => DesktopError::AuthFailed {
+                exhausted,
+                retry_in_ms,
+            },
             AuthOutcome::Unavailable { reason } => DesktopError::AuthUnavailable { reason },
             AuthOutcome::Busy => DesktopError::AuthBusy,
         };
@@ -604,8 +610,8 @@ mod tests {
 
     use apprafter_core::CancellationToken;
     use apprafter_desktop_ipc::{
-        AuthInfo, AuthOutcome, AutoLock, CancelledBy, LockReason, LockState, Settings, Theme,
-        UnavailableReason, ALLOWED_WHILE_LOCKED, COMMANDS,
+        errors, AuthInfo, AuthOutcome, AutoLock, CancelledBy, LockReason, LockState, Settings,
+        Theme, UnavailableReason, ALLOWED_WHILE_LOCKED, COMMANDS,
     };
     use apprafter_os_auth::Action;
 
@@ -1571,12 +1577,34 @@ mod tests {
                 DesktopError::AuthCancelled,
             ),
             (
-                AuthOutcome::Failed { exhausted: true },
-                DesktopError::AuthFailed { exhausted: true },
+                AuthOutcome::Failed {
+                    exhausted: true,
+                    retry_in_ms: Some(29_000),
+                },
+                DesktopError::AuthFailed {
+                    exhausted: true,
+                    retry_in_ms: Some(29_000),
+                },
             ),
             (
-                AuthOutcome::Failed { exhausted: false },
-                DesktopError::AuthFailed { exhausted: false },
+                AuthOutcome::Failed {
+                    exhausted: true,
+                    retry_in_ms: None,
+                },
+                DesktopError::AuthFailed {
+                    exhausted: true,
+                    retry_in_ms: None,
+                },
+            ),
+            (
+                AuthOutcome::Failed {
+                    exhausted: false,
+                    retry_in_ms: None,
+                },
+                DesktopError::AuthFailed {
+                    exhausted: false,
+                    retry_in_ms: None,
+                },
             ),
             (
                 AuthOutcome::Unavailable {
@@ -1878,7 +1906,10 @@ mod tests {
         assert!(
             matches!(
                 *refusal.error,
-                DesktopError::AuthFailed { exhausted: false }
+                DesktopError::AuthFailed {
+                    exhausted: false,
+                    retry_in_ms: None
+                }
             ),
             "{refusal:?}"
         );
@@ -1900,6 +1931,31 @@ mod tests {
         // Unlocked, nothing is checked.
         r.machine.unlock_with_password(typed("guess")).unwrap();
         assert_eq!(auth.asked().len(), 2);
+    }
+
+    /// The back-off refuses: the page is told how long it still will, with what PAM said.
+    #[test]
+    fn a_password_refused_by_the_back_off_says_how_long_it_still_refuses() {
+        let auth = Arc::new(FakeAuthenticator::new().with_password("open sesame".to_owned()));
+        auth.saying(&["Authentication failure"])
+            .then(AuthOutcome::Failed {
+                exhausted: true,
+                retry_in_ms: Some(17_000),
+            });
+        let r = rig(Settings::default(), auth.clone());
+        let refusal = r
+            .machine
+            .unlock_with_password(typed("open sesame"))
+            .unwrap_err();
+        let ui = refusal.to_ui();
+        assert_eq!(ui.code.as_deref(), Some(errors::AUTH_FAILED), "{ui:?}");
+        assert_eq!(ui.fields["exhausted"], serde_json::json!(true));
+        assert_eq!(ui.fields["retryInMs"], serde_json::json!(17_000));
+        assert_eq!(
+            ui.fields["messages"],
+            serde_json::json!(["Authentication failure"])
+        );
+        assert!(r.machine.state().locked);
     }
 
     #[test]

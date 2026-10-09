@@ -204,7 +204,10 @@ fn prompt_outcome(answer: PolkitAnswer) -> AuthOutcome {
             authorized: false,
             challenge: false,
             dismissed: false,
-        } => AuthOutcome::Failed { exhausted: false },
+        } => AuthOutcome::Failed {
+            exhausted: false,
+            retry_in_ms: None,
+        },
         other => map_polkit(other),
     }
 }
@@ -716,7 +719,13 @@ mod tests {
             // No agent registered for the session: polkitd answers the challenge again.
             (CHALLENGE, unavailable(NoAgent)),
             // The agent asked and the authentication failed.
-            (REFUSED, AuthOutcome::Failed { exhausted: false }),
+            (
+                REFUSED,
+                AuthOutcome::Failed {
+                    exhausted: false,
+                    retry_in_ms: None,
+                },
+            ),
             (
                 PolkitAnswer::Error(PolkitError::CancellationIdNotUnique),
                 AuthOutcome::Busy,

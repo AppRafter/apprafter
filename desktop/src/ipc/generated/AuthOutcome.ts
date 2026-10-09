@@ -6,4 +6,11 @@ import type { UnavailableReason } from "./UnavailableReason";
 /**
  * How one authentication request ended; the same for every OS backend.
  */
-export type AuthOutcome = { "outcome": "verified" } | { "outcome": "cancelled", by: CancelledBy, } | { "outcome": "failed", exhausted: boolean, } | { "outcome": "busy" } | { "outcome": "unavailable", reason: UnavailableReason, };
+export type AuthOutcome = { "outcome": "verified" } | { "outcome": "cancelled", by: CancelledBy, } | { "outcome": "failed", exhausted: boolean, 
+/**
+ * With `exhausted`, when the app's own back-off refuses: how long it still will, in
+ * milliseconds of the monotonic clock it counts in. `None` otherwise — a wrong
+ * password with attempts left, or the OS's own lockout (Windows Hello's, Touch ID's,
+ * an account lockout, PAM's), whose end the app is not told.
+ */
+retryInMs: number | null, } | { "outcome": "busy" } | { "outcome": "unavailable", reason: UnavailableReason, };

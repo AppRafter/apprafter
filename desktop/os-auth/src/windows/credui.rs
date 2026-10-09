@@ -4,8 +4,9 @@
 //!
 //! One check, in this order:
 //! 1. The back-off ([`Backoff`], one per [`CredentialCheck`], so per process): while it refuses,
-//!    `Failed { exhausted: true }` without a dialog. Checks run one at a time: one asked while
-//!    another's dialog is open is `Busy`.
+//!    `Failed { exhausted: true }` without a dialog, with how long it still will
+//!    (`retry_in_ms`). Checks run one at a time: one asked while another's dialog is open is
+//!    `Busy`.
 //! 2. The owner: the account running the app, `GetUserNameExW(NameSamCompatible)`
 //!    (`DOMAIN\user`), never a name from the UI.
 //! 3. The dialog, modal and parented to the app's window, listing the current user only
@@ -26,9 +27,10 @@
 //! failure — another account's name, a buffer that could not be unpacked, a password
 //! `LogonUserW` refuses, an account it will not log on. A dialog closed or not shown is not,
 //! and neither is one whose answer the app discarded: no password was tried. The failure that
-//! starts a refusal answers `Failed { exhausted: true }`, as every check the refusal turns away
-//! does. Failed `LogonUserW` calls also count toward the account-lockout policy, a domain
-//! account's too, which the back-off keeps the app from running into.
+//! starts a refusal answers `Failed { exhausted: true }` with the refusal's time, as every check
+//! the refusal turns away does with what is left of it. Failed `LogonUserW` calls also count
+//! toward the account-lockout policy, a domain account's too, which the back-off keeps the app
+//! from running into.
 //!
 //! Memory: the password stays UTF-16 in a [`Zeroizing`] buffer, wiped when the check ends; the
 //! dialog's packed buffer is wiped before it is freed. `LogonUserW` gets the buffer itself.
@@ -59,7 +61,7 @@ use apprafter_core::CancellationToken;
 use apprafter_desktop_ipc::{AuthOutcome, CancelledBy, UnavailableReason};
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::outcome::{map_windows_logon, Backoff};
+use crate::outcome::{map_windows_logon, Backoff, Refused};
 
 /// The dialog's title.
 pub const CAPTION: &str = "AppRafter Desktop";
@@ -67,8 +69,18 @@ pub const CAPTION: &str = "AppRafter Desktop";
 const APP_CANCELLED: AuthOutcome = AuthOutcome::Cancelled {
     by: CancelledBy::App,
 };
-const EXHAUSTED: AuthOutcome = AuthOutcome::Failed { exhausted: true };
-const FAILED: AuthOutcome = AuthOutcome::Failed { exhausted: false };
+const FAILED: AuthOutcome = AuthOutcome::Failed {
+    exhausted: false,
+    retry_in_ms: None,
+};
+
+/// What the back-off answers while it refuses: no attempt is left, for `refused`'s time.
+const fn exhausted(refused: Refused) -> AuthOutcome {
+    AuthOutcome::Failed {
+        exhausted: true,
+        retry_in_ms: Some(refused.remaining_ms),
+    }
+}
 
 const fn unavailable(reason: UnavailableReason) -> AuthOutcome {
     AuthOutcome::Unavailable { reason }
@@ -151,8 +163,8 @@ impl CredentialCheck {
             Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
             Err(TryLockError::WouldBlock) => return AuthOutcome::Busy,
         };
-        if backoff.allow(now_monotonic_ms).is_err() {
-            return EXHAUSTED;
+        if let Err(refused) = backoff.allow(now_monotonic_ms) {
+            return exhausted(refused);
         }
         let Some(owner) = self.ui.owner() else {
             return unavailable(UnavailableReason::NotConfigured);
@@ -187,9 +199,11 @@ impl CredentialCheck {
             outcome
         } else {
             backoff.record_failure(now_monotonic_ms);
-            match outcome {
-                FAILED if backoff.allow(now_monotonic_ms).is_err() => EXHAUSTED,
-                other => other,
+            // A wrong password that starts the refusal says how long it lasts; Windows' own
+            // account lockout keeps its unknown end.
+            match (outcome, backoff.allow(now_monotonic_ms)) {
+                (FAILED, Err(refused)) => exhausted(refused),
+                (other, _) => other,
             }
         };
         // Tripped while `LogonUserW` ran: the attempt counted, the answer is the app's cancel.
@@ -456,6 +470,14 @@ mod tests {
     const ACCOUNT_DISABLED: u32 = 1331;
     const ACCOUNT_LOCKED_OUT: u32 = 1909;
 
+    /// What the back-off answers while it refuses, for `ms` more.
+    const fn refused_for(ms: u64) -> AuthOutcome {
+        AuthOutcome::Failed {
+            exhausted: true,
+            retry_in_ms: Some(ms),
+        }
+    }
+
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum Call {
         Owner,
@@ -627,7 +649,14 @@ mod tests {
     fn logon_refusals_map_through_the_logon_table() {
         for (code, outcome) in [
             (LOGON_FAILURE, FAILED),
-            (ACCOUNT_LOCKED_OUT, EXHAUSTED),
+            // Windows' own lockout: its end is the policy's, which the app is not told.
+            (
+                ACCOUNT_LOCKED_OUT,
+                AuthOutcome::Failed {
+                    exhausted: true,
+                    retry_in_ms: None,
+                },
+            ),
             (
                 ACCOUNT_DISABLED,
                 unavailable(UnavailableReason::NotPermittedHere),
@@ -768,11 +797,12 @@ mod tests {
         assert_eq!(verify(&check, &ui, 2_000), FAILED);
         assert_eq!(
             verify(&check, &ui, 3_000),
-            EXHAUSTED,
+            refused_for(30_000),
             "the third starts the refusal"
         );
         let asked = ui.calls().len();
-        assert_eq!(verify(&check, &ui, 32_999), EXHAUSTED);
+        assert_eq!(verify(&check, &ui, 20_000), refused_for(13_000));
+        assert_eq!(verify(&check, &ui, 32_999), refused_for(1));
         assert_eq!(ui.calls().len(), asked, "refused without a dialog");
         assert_eq!(verify(&check, &ui, 33_000), FAILED, "the refusal is over");
     }
@@ -794,7 +824,7 @@ mod tests {
         );
         assert_eq!(
             verify(&check, &ui, 0),
-            EXHAUSTED,
+            refused_for(30_000),
             "the third failure refused"
         );
 

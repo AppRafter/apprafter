@@ -503,7 +503,10 @@ mod tests {
     fn a_dialog_without_an_agent_moves_to_the_password_until_an_agent_answers() {
         for answered in [
             AuthOutcome::Verified,
-            AuthOutcome::Failed { exhausted: false },
+            AuthOutcome::Failed {
+                exhausted: false,
+                retry_in_ms: None,
+            },
             AuthOutcome::Cancelled {
                 by: CancelledBy::User,
             },
@@ -723,7 +726,10 @@ mod tests {
             AuthOutcome::Cancelled {
                 by: CancelledBy::App,
             },
-            AuthOutcome::Failed { exhausted: false },
+            AuthOutcome::Failed {
+                exhausted: false,
+                retry_in_ms: None,
+            },
         ] {
             let (auth, _) = authenticator(Err(probe), &[probe], Ok(()));
             assert_eq!(auth.info(), polkit_info(), "{probe:?}");

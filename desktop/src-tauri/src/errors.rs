@@ -45,7 +45,11 @@ pub enum DesktopError {
 
     #[error("authentication failed")]
     #[diagnostic(code(apprafter::desktop::auth_failed))]
-    AuthFailed { exhausted: bool },
+    AuthFailed {
+        exhausted: bool,
+        /// How long the app's own back-off still refuses, when it is what refuses.
+        retry_in_ms: Option<u64>,
+    },
 
     #[error(
         "device-owner authentication is unavailable here ({})",
@@ -92,8 +96,9 @@ fn wire_name(reason: &UnavailableReason) -> String {
 
 impl DesktopError {
     /// What a command returns: the diagnostic's code, message, help and causes, plus the
-    /// structured `fields` the webview acts on (`opId`, `reason`, `exhausted` — camelCase,
-    /// as every other key on the wire). A core error keeps the core's own projection.
+    /// structured `fields` the webview acts on (`opId`, `reason`, `exhausted`, and `retryInMs`
+    /// when the back-off says how long it still refuses — camelCase, as every other key on the
+    /// wire). A core error keeps the core's own projection.
     pub fn to_ui(&self) -> UiError {
         if let DesktopError::Core(core) = self {
             return UiError::from(core);
@@ -103,9 +108,15 @@ impl DesktopError {
             DesktopError::PlanNotFound { op_id } | DesktopError::PlanExpired { op_id } => {
                 ui.fields.insert("opId".into(), serde_json::json!(op_id.0));
             }
-            DesktopError::AuthFailed { exhausted } => {
+            DesktopError::AuthFailed {
+                exhausted,
+                retry_in_ms,
+            } => {
                 ui.fields
                     .insert("exhausted".into(), serde_json::json!(exhausted));
+                if let Some(ms) = retry_in_ms {
+                    ui.fields.insert("retryInMs".into(), serde_json::json!(ms));
+                }
             }
             DesktopError::AuthUnavailable { reason } => {
                 ui.fields
@@ -177,7 +188,10 @@ mod tests {
             DesktopError::PlanNotFound { op_id: OpId(7) },
             DesktopError::PlanExpired { op_id: OpId(7) },
             DesktopError::AuthCancelled,
-            DesktopError::AuthFailed { exhausted: true },
+            DesktopError::AuthFailed {
+                exhausted: true,
+                retry_in_ms: None,
+            },
             DesktopError::AuthUnavailable {
                 reason: UnavailableReason::NoBackend,
             },
@@ -237,10 +251,24 @@ mod tests {
 
     #[test]
     fn auth_errors_carry_what_the_webview_acts_on() {
-        let ui = DesktopError::AuthFailed { exhausted: true }.to_ui();
+        // The app's own back-off: exhausted, and how long it still refuses.
+        let ui = DesktopError::AuthFailed {
+            exhausted: true,
+            retry_in_ms: Some(12_345),
+        }
+        .to_ui();
         assert_eq!(ui.fields["exhausted"], json!(true));
-        let ui = DesktopError::AuthFailed { exhausted: false }.to_ui();
-        assert_eq!(ui.fields["exhausted"], json!(false));
+        assert_eq!(ui.fields["retryInMs"], json!(12_345));
+        // The OS's own lockout, or a wrong password: no end to say.
+        for exhausted in [true, false] {
+            let ui = DesktopError::AuthFailed {
+                exhausted,
+                retry_in_ms: None,
+            }
+            .to_ui();
+            assert_eq!(ui.fields["exhausted"], json!(exhausted));
+            assert!(!ui.fields.contains_key("retryInMs"), "{ui:?}");
+        }
         let ui = DesktopError::AuthUnavailable {
             reason: UnavailableReason::PolicyMissing,
         }
@@ -273,7 +301,10 @@ mod tests {
     #[test]
     fn a_refusal_carries_what_the_os_said_and_otherwise_is_its_error() {
         let refusal = Refusal::new(
-            DesktopError::AuthFailed { exhausted: false },
+            DesktopError::AuthFailed {
+                exhausted: false,
+                retry_in_ms: None,
+            },
             vec![
                 "Password expired".into(),
                 "Contact your administrator".into(),

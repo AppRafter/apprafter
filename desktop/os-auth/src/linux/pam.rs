@@ -46,7 +46,8 @@
 //! module, "a second prompt came" says the password was right, so it costs what a wrong one
 //! does. The failure that starts a refusal answers `Failed { exhausted: true }`, and so does
 //! every check the refusal turns away, without calling PAM: that is how "refused by the
-//! back-off" reads. Checks run one at a time: one asked while another runs is `Busy`, since
+//! back-off" reads. Each says how long the refusal still runs (`retry_in_ms`), by the clock the
+//! caller passes, so the page counts down what is left rather than a guess. Checks run one at a time: one asked while another runs is `Busy`, since
 //! parallel checks would each pass the back-off before any failed.
 //!
 //! Memory: the password is a [`Zeroizing`] string, wiped when the check ends, and nothing here
@@ -79,7 +80,7 @@ use nonstick::items::Items;
 use nonstick::{AuthnFlags, ErrorCode, PamShared, Transaction, TransactionBuilder};
 use zeroize::Zeroizing;
 
-use crate::outcome::{map_pam, Backoff, PamCode};
+use crate::outcome::{map_pam, Backoff, PamCode, Refused};
 
 /// The PAM services a check may use, in the order they are tried: the auth-only stacks of
 /// Debian, Ubuntu and openSUSE (`common-auth`) and of Fedora, RHEL and Arch (`system-auth`),
@@ -96,8 +97,18 @@ const SUCCESS: i32 = 0;
 const APP_CANCELLED: AuthOutcome = AuthOutcome::Cancelled {
     by: CancelledBy::App,
 };
-const EXHAUSTED: AuthOutcome = AuthOutcome::Failed { exhausted: true };
-const FAILED: AuthOutcome = AuthOutcome::Failed { exhausted: false };
+const FAILED: AuthOutcome = AuthOutcome::Failed {
+    exhausted: false,
+    retry_in_ms: None,
+};
+
+/// What the back-off answers while it refuses: no attempt is left, for `refused`'s time.
+const fn exhausted(refused: Refused) -> AuthOutcome {
+    AuthOutcome::Failed {
+        exhausted: true,
+        retry_in_ms: Some(refused.remaining_ms),
+    }
+}
 
 const fn unavailable(reason: UnavailableReason) -> AuthOutcome {
     AuthOutcome::Unavailable { reason }
@@ -182,8 +193,8 @@ impl Pam {
             Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
             Err(TryLockError::WouldBlock) => return PasswordCheck::unasked(AuthOutcome::Busy),
         };
-        if backoff.allow(now_monotonic_ms).is_err() {
-            return PasswordCheck::unasked(EXHAUSTED);
+        if let Err(refused) = backoff.allow(now_monotonic_ms) {
+            return PasswordCheck::unasked(exhausted(refused));
         }
         let (service, user) = match self.target() {
             Ok(target) => target,
@@ -204,9 +215,11 @@ impl Pam {
             outcome
         } else {
             backoff.record_failure(now_monotonic_ms);
-            match outcome {
-                FAILED if backoff.allow(now_monotonic_ms).is_err() => EXHAUSTED,
-                other => other,
+            // A wrong password that starts the refusal says how long it lasts; the stack's own
+            // limit (`PAM_MAXTRIES`) keeps its unknown end.
+            match (outcome, backoff.allow(now_monotonic_ms)) {
+                (FAILED, Err(refused)) => exhausted(refused),
+                (other, _) => other,
             }
         };
         PasswordCheck { outcome, messages }
@@ -466,6 +479,14 @@ mod tests {
     const PATIENCE: Duration = Duration::from_secs(10);
 
     const VERIFIED: AuthOutcome = AuthOutcome::Verified;
+
+    /// What the back-off answers while it refuses, for `ms` more.
+    const fn refused_for(ms: u64) -> AuthOutcome {
+        AuthOutcome::Failed {
+            exhausted: true,
+            retry_in_ms: Some(ms),
+        }
+    }
 
     fn password(text: &str) -> Zeroizing<String> {
         Zeroizing::new(text.to_owned())
@@ -780,28 +801,39 @@ mod tests {
         let fake = Fake::script(&[Step::Hidden], Code::Right);
         assert_eq!(
             check(&fake.pam(), WRONG, 0),
-            AuthOutcome::Failed { exhausted: false }
+            AuthOutcome::Failed {
+                exhausted: false,
+                retry_in_ms: None
+            }
         );
     }
 
-    /// The third failure starts the refusal and says so; the refusal asks PAM nothing, not even
-    /// with the right password, until it ends.
+    /// The third failure starts the refusal and says so, and for how long; the refusal asks PAM
+    /// nothing, not even with the right password, until it ends, and says how much of it is
+    /// left by the monotonic clock.
     #[test]
     fn three_failures_refuse_without_asking_pam_until_the_refusal_ends() {
         let fake = Fake::script(&[Step::Hidden], Code::Right);
         let pam = fake.pam();
         assert_eq!(
             check(&pam, WRONG, 1_000),
-            AuthOutcome::Failed { exhausted: false }
+            AuthOutcome::Failed {
+                exhausted: false,
+                retry_in_ms: None
+            }
         );
         assert_eq!(
             check(&pam, WRONG, 2_000),
-            AuthOutcome::Failed { exhausted: false }
+            AuthOutcome::Failed {
+                exhausted: false,
+                retry_in_ms: None
+            }
         );
-        assert_eq!(check(&pam, WRONG, 3_000), EXHAUSTED);
+        assert_eq!(check(&pam, WRONG, 3_000), refused_for(30_000));
         assert_eq!(fake.calls().len(), 3);
-        assert_eq!(check(&pam, RIGHT, 3_001), EXHAUSTED);
-        assert_eq!(check(&pam, RIGHT, 32_999), EXHAUSTED);
+        assert_eq!(check(&pam, RIGHT, 3_001), refused_for(29_999));
+        assert_eq!(check(&pam, RIGHT, 20_000), refused_for(13_000));
+        assert_eq!(check(&pam, RIGHT, 32_999), refused_for(1));
         assert_eq!(fake.calls().len(), 3, "a refused check asks PAM nothing");
         assert_eq!(check(&pam, RIGHT, 33_000), VERIFIED);
         assert_eq!(fake.calls().len(), 4);
@@ -817,7 +849,10 @@ mod tests {
         check(&pam, WRONG, 0);
         assert_eq!(
             check(&pam, WRONG, 0),
-            AuthOutcome::Failed { exhausted: false },
+            AuthOutcome::Failed {
+                exhausted: false,
+                retry_in_ms: None
+            },
             "two since the success"
         );
     }
@@ -836,7 +871,7 @@ mod tests {
                 );
             }
             assert_eq!(fake.calls()[0].hidden, [Some(RIGHT.to_owned()), None]);
-            assert_eq!(check(&pam, RIGHT, 3), EXHAUSTED, "code {code}");
+            assert_eq!(check(&pam, RIGHT, 3), refused_for(29_999), "code {code}");
             assert_eq!(fake.calls().len(), 3, "code {code}");
         }
     }
@@ -861,7 +896,10 @@ mod tests {
             Arc::get_mut(&mut fake).unwrap().user_after = Some(user_after.clone());
             assert_eq!(
                 check(&fake.pam(), RIGHT, 0),
-                AuthOutcome::Failed { exhausted: false },
+                AuthOutcome::Failed {
+                    exhausted: false,
+                    retry_in_ms: None
+                },
                 "{user_after:?}"
             );
         }
@@ -873,13 +911,56 @@ mod tests {
     fn pam_s_codes_without_a_refusal_or_a_cancel() {
         for (code, outcome) in [
             (19, unavailable(NotInteractive)),
-            (26, AuthOutcome::Failed { exhausted: false }),
-            (7, AuthOutcome::Failed { exhausted: false }),
-            (10, AuthOutcome::Failed { exhausted: false }),
-            (4, AuthOutcome::Failed { exhausted: false }),
-            (9, AuthOutcome::Failed { exhausted: false }),
-            (11, EXHAUSTED),
-            (-1, AuthOutcome::Failed { exhausted: false }),
+            (
+                26,
+                AuthOutcome::Failed {
+                    exhausted: false,
+                    retry_in_ms: None,
+                },
+            ),
+            (
+                7,
+                AuthOutcome::Failed {
+                    exhausted: false,
+                    retry_in_ms: None,
+                },
+            ),
+            (
+                10,
+                AuthOutcome::Failed {
+                    exhausted: false,
+                    retry_in_ms: None,
+                },
+            ),
+            (
+                4,
+                AuthOutcome::Failed {
+                    exhausted: false,
+                    retry_in_ms: None,
+                },
+            ),
+            (
+                9,
+                AuthOutcome::Failed {
+                    exhausted: false,
+                    retry_in_ms: None,
+                },
+            ),
+            // PAM_MAXTRIES: the stack's own limit, whose end the app is not told.
+            (
+                11,
+                AuthOutcome::Failed {
+                    exhausted: true,
+                    retry_in_ms: None,
+                },
+            ),
+            (
+                -1,
+                AuthOutcome::Failed {
+                    exhausted: false,
+                    retry_in_ms: None,
+                },
+            ),
         ] {
             let fake = Fake::script(&[Step::Hidden], Code::Fixed(code));
             assert_eq!(check(&fake.pam(), RIGHT, 0), outcome, "code {code}");
@@ -960,15 +1041,31 @@ mod tests {
         // A stack that verifies anything, as `nullok` does an account without a password.
         let fake = Fake::script(&[], Code::Fixed(SUCCESS));
         let pam = fake.pam();
-        assert_eq!(check(&pam, "", 0), AuthOutcome::Failed { exhausted: false });
-        assert_eq!(check(&pam, "", 1), AuthOutcome::Failed { exhausted: false });
+        assert_eq!(
+            check(&pam, "", 0),
+            AuthOutcome::Failed {
+                exhausted: false,
+                retry_in_ms: None
+            }
+        );
+        assert_eq!(
+            check(&pam, "", 1),
+            AuthOutcome::Failed {
+                exhausted: false,
+                retry_in_ms: None
+            }
+        );
         assert_eq!(
             check(&pam, "", 2),
-            EXHAUSTED,
+            refused_for(30_000),
             "the third failure starts the refusal"
         );
         assert_eq!(fake.calls(), [], "PAM was never asked");
-        assert_eq!(check(&pam, RIGHT, 3), EXHAUSTED, "and the refusal holds");
+        assert_eq!(
+            check(&pam, RIGHT, 3),
+            refused_for(29_999),
+            "and the refusal holds"
+        );
         assert_eq!(fake.calls(), []);
     }
 

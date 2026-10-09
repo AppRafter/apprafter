@@ -39,9 +39,15 @@ pub enum AuthOutcome {
     Cancelled {
         by: CancelledBy,
     },
-    /// `exhausted` when the OS allows no further attempt.
+    /// `exhausted` when no further attempt is allowed for now.
     Failed {
         exhausted: bool,
+        /// With `exhausted`, when the app's own back-off refuses: how long it still will, in
+        /// milliseconds of the monotonic clock it counts in. `None` otherwise — a wrong
+        /// password with attempts left, or the OS's own lockout (Windows Hello's, Touch ID's,
+        /// an account lockout, PAM's), whose end the app is not told.
+        #[serde(rename = "retryInMs")]
+        retry_in_ms: Option<u64>,
     },
     /// Another prompt is already open.
     Busy,
@@ -105,8 +111,18 @@ mod tests {
                 r#"{"outcome":"cancelled","by":"user"}"#,
             ),
             (
-                AuthOutcome::Failed { exhausted: true },
-                r#"{"outcome":"failed","exhausted":true}"#,
+                AuthOutcome::Failed {
+                    exhausted: false,
+                    retry_in_ms: None,
+                },
+                r#"{"outcome":"failed","exhausted":false,"retryInMs":null}"#,
+            ),
+            (
+                AuthOutcome::Failed {
+                    exhausted: true,
+                    retry_in_ms: Some(29_500),
+                },
+                r#"{"outcome":"failed","exhausted":true,"retryInMs":29500}"#,
             ),
             (AuthOutcome::Busy, r#"{"outcome":"busy"}"#),
         ] {

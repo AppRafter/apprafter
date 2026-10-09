@@ -174,7 +174,10 @@ impl OsAuthenticator {
                     outcome => outcome,
                 },
                 Asked::NotStarted => self.by_dialog(window, action, cancel),
-                Asked::Failed => AuthOutcome::Failed { exhausted: false },
+                Asked::Failed => AuthOutcome::Failed {
+                    exhausted: false,
+                    retry_in_ms: None,
+                },
                 Asked::Cancelled => APP_CANCELLED,
             },
         }
@@ -381,9 +384,21 @@ mod tests {
                     by: CancelledBy::User,
                 },
             ),
-            (RETRIES_EXHAUSTED, AuthOutcome::Failed { exhausted: true }),
+            (
+                RETRIES_EXHAUSTED,
+                AuthOutcome::Failed {
+                    exhausted: true,
+                    retry_in_ms: None,
+                },
+            ),
             (DEVICE_BUSY, AuthOutcome::Busy),
-            (99, AuthOutcome::Failed { exhausted: false }),
+            (
+                99,
+                AuthOutcome::Failed {
+                    exhausted: false,
+                    retry_in_ms: None,
+                },
+            ),
         ] {
             let f = fixture(
                 Asked::Answered(AVAILABLE),
@@ -449,7 +464,10 @@ mod tests {
             let f = fixture(Asked::Answered(AVAILABLE), &[answer], Err(1326));
             assert_eq!(
                 f.verify(Action::Confirm),
-                AuthOutcome::Failed { exhausted: false },
+                AuthOutcome::Failed {
+                    exhausted: false,
+                    retry_in_ms: None
+                },
                 "{answer:?}: the dialog's answer"
             );
             assert_eq!(
@@ -471,7 +489,10 @@ mod tests {
         let f = fixture(Asked::Answered(AVAILABLE), &[Asked::Failed], Ok(()));
         assert_eq!(
             f.verify(Action::Unlock),
-            AuthOutcome::Failed { exhausted: false }
+            AuthOutcome::Failed {
+                exhausted: false,
+                retry_in_ms: None
+            }
         );
         assert_eq!(f.calls(), [Call::Availability, hello(Action::Unlock)]);
     }
@@ -583,25 +604,39 @@ mod tests {
             f.clock.store(at, Ordering::SeqCst);
             assert_eq!(
                 f.verify(Action::Unlock),
-                AuthOutcome::Failed { exhausted: false }
+                AuthOutcome::Failed {
+                    exhausted: false,
+                    retry_in_ms: None
+                }
             );
         }
         f.clock.store(3_000, Ordering::SeqCst);
         assert_eq!(
             f.verify(Action::Unlock),
-            AuthOutcome::Failed { exhausted: true }
+            AuthOutcome::Failed {
+                exhausted: true,
+                retry_in_ms: Some(30_000)
+            },
+            "the third starts the refusal, and says how long it lasts"
         );
         f.clock.store(32_999, Ordering::SeqCst);
         f.calls();
         assert_eq!(
             f.verify(Action::Unlock),
-            AuthOutcome::Failed { exhausted: true }
+            AuthOutcome::Failed {
+                exhausted: true,
+                retry_in_ms: Some(1)
+            },
+            "what is left of it, by the same clock"
         );
         assert_eq!(f.calls(), [Call::Availability], "refused without a dialog");
         f.clock.store(33_000, Ordering::SeqCst);
         assert_eq!(
             f.verify(Action::Unlock),
-            AuthOutcome::Failed { exhausted: false }
+            AuthOutcome::Failed {
+                exhausted: false,
+                retry_in_ms: None
+            }
         );
     }
 

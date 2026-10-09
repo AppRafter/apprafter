@@ -816,7 +816,13 @@ fn judge(
         AuthOutcome::Verified => return Answer::Run(sinks),
         AuthOutcome::Busy => return Answer::Again(sinks),
         AuthOutcome::Cancelled { .. } => DesktopError::AuthCancelled,
-        AuthOutcome::Failed { exhausted } => DesktopError::AuthFailed { exhausted },
+        AuthOutcome::Failed {
+            exhausted,
+            retry_in_ms,
+        } => DesktopError::AuthFailed {
+            exhausted,
+            retry_in_ms,
+        },
         AuthOutcome::Unavailable { reason } => DesktopError::AuthUnavailable { reason },
     };
     Answer::Refuse(said(err), sinks)
@@ -1302,12 +1308,24 @@ mod tests {
                 DesktopError::AuthCancelled,
             ),
             (
-                AuthOutcome::Failed { exhausted: true },
-                DesktopError::AuthFailed { exhausted: true },
+                AuthOutcome::Failed {
+                    exhausted: true,
+                    retry_in_ms: None,
+                },
+                DesktopError::AuthFailed {
+                    exhausted: true,
+                    retry_in_ms: None,
+                },
             ),
             (
-                AuthOutcome::Failed { exhausted: false },
-                DesktopError::AuthFailed { exhausted: false },
+                AuthOutcome::Failed {
+                    exhausted: false,
+                    retry_in_ms: None,
+                },
+                DesktopError::AuthFailed {
+                    exhausted: false,
+                    retry_in_ms: None,
+                },
             ),
             (
                 AuthOutcome::Unavailable {
@@ -1398,7 +1416,10 @@ mod tests {
         assert!(
             matches!(
                 *refusal.error,
-                DesktopError::AuthFailed { exhausted: false }
+                DesktopError::AuthFailed {
+                    exhausted: false,
+                    retry_in_ms: None
+                }
             ),
             "{refusal:?}"
         );
@@ -2641,7 +2662,10 @@ mod tests {
             }),
             ("a failed prompt", |mgr, _, id| {
                 let auth = FakeAuthenticator::new();
-                auth.then(AuthOutcome::Failed { exhausted: true });
+                auth.then(AuthOutcome::Failed {
+                    exhausted: true,
+                    retry_in_ms: None,
+                });
                 mgr.execute(id, &auth).unwrap_err()
             }),
             ("a panicking prompt", |mgr, _, id| {

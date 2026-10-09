@@ -83,7 +83,10 @@ impl Authenticator for StandIn {
             AuthOutcome::Verified.into()
         } else {
             PasswordAnswer {
-                outcome: AuthOutcome::Failed { exhausted: false },
+                outcome: AuthOutcome::Failed {
+                    exhausted: false,
+                    retry_in_ms: None,
+                },
                 messages: vec![PAM_SAYS.to_owned()],
             }
         }

@@ -382,7 +382,10 @@ fn a_wrong_password_fails() {
     agent.type_line(&format!("not-{}", env.password));
     assert_eq!(
         request.outcome(Some(&agent)),
-        AuthOutcome::Failed { exhausted: false },
+        AuthOutcome::Failed {
+            exhausted: false,
+            retry_in_ms: None
+        },
         "agent transcript:\n{}",
         agent.transcript()
     );

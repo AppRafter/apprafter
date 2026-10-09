@@ -521,7 +521,10 @@ mod fake {
                 if *password == **accepted {
                     AuthOutcome::Verified
                 } else {
-                    AuthOutcome::Failed { exhausted: false }
+                    AuthOutcome::Failed {
+                        exhausted: false,
+                        retry_in_ms: None,
+                    }
                 }
             });
             let messages = match outcome {
@@ -769,7 +772,10 @@ mod tests {
             },
         )
         .saying(PasswordAnswer {
-            outcome: AuthOutcome::Failed { exhausted: true },
+            outcome: AuthOutcome::Failed {
+                exhausted: true,
+                retry_in_ms: None,
+            },
             messages: vec!["Password expired".into()],
         });
         let calls = os.calls();
@@ -812,7 +818,10 @@ mod tests {
         assert_eq!(
             answer,
             PasswordAnswer {
-                outcome: AuthOutcome::Failed { exhausted: true },
+                outcome: AuthOutcome::Failed {
+                    exhausted: true,
+                    retry_in_ms: None
+                },
                 messages: vec!["Password expired".into()],
             },
             "what the OS said comes back with its answer"
@@ -949,7 +958,10 @@ mod tests {
         assert_eq!(
             fake.verify_password(&confirm(), password("open sesame!"), &token),
             PasswordAnswer {
-                outcome: AuthOutcome::Failed { exhausted: false },
+                outcome: AuthOutcome::Failed {
+                    exhausted: false,
+                    retry_in_ms: None
+                },
                 messages: vec!["Authentication failure".into()],
             }
         );

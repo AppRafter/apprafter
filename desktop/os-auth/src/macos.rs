@@ -145,7 +145,10 @@ fn replied(reply: Result<(), LaError>) -> AuthOutcome {
     match reply {
         Ok(()) => AuthOutcome::Verified,
         Err(Some(code)) => map_la_error(code),
-        Err(None) => AuthOutcome::Failed { exhausted: false },
+        Err(None) => AuthOutcome::Failed {
+            exhausted: false,
+            retry_in_ms: None,
+        },
     }
 }
 
@@ -221,7 +224,10 @@ impl OsAuthenticator {
         match self.local_authentication.evaluate(reason(action), cancel) {
             Asked::CannotEvaluate(error) => cannot_evaluate(error),
             Asked::Replied(reply) => replied(reply),
-            Asked::NotStarted => AuthOutcome::Failed { exhausted: false },
+            Asked::NotStarted => AuthOutcome::Failed {
+                exhausted: false,
+                retry_in_ms: None,
+            },
             Asked::Cancelled => APP_CANCELLED,
         }
     }
@@ -372,7 +378,10 @@ mod tests {
         for (code, outcome) in [
             (
                 AUTHENTICATION_FAILED,
-                AuthOutcome::Failed { exhausted: false },
+                AuthOutcome::Failed {
+                    exhausted: false,
+                    retry_in_ms: None,
+                },
             ),
             (
                 USER_CANCEL,
@@ -386,10 +395,22 @@ mod tests {
                     by: CancelledBy::System,
                 },
             ),
-            (BIOMETRY_LOCKOUT, AuthOutcome::Failed { exhausted: true }),
+            (
+                BIOMETRY_LOCKOUT,
+                AuthOutcome::Failed {
+                    exhausted: true,
+                    retry_in_ms: None,
+                },
+            ),
             (APP_CANCEL, APP_CANCELLED),
             (NOT_INTERACTIVE, unavailable(NotInteractive)),
-            (42, AuthOutcome::Failed { exhausted: false }),
+            (
+                42,
+                AuthOutcome::Failed {
+                    exhausted: false,
+                    retry_in_ms: None,
+                },
+            ),
         ] {
             let (auth, _) = fixture(Ok(()), &[Asked::Replied(Err(Some(code)))], None);
             assert_eq!(
@@ -406,7 +427,10 @@ mod tests {
         let (auth, _) = fixture(Ok(()), &[Asked::Replied(Err(None))], None);
         assert_eq!(
             auth.verify(Action::Confirm, &CancellationToken::new()),
-            AuthOutcome::Failed { exhausted: false }
+            AuthOutcome::Failed {
+                exhausted: false,
+                retry_in_ms: None
+            }
         );
     }
 
@@ -460,7 +484,10 @@ mod tests {
         let (auth, _) = fixture(Ok(()), &[Asked::NotStarted], None);
         assert_eq!(
             auth.verify(Action::Unlock, &CancellationToken::new()),
-            AuthOutcome::Failed { exhausted: false }
+            AuthOutcome::Failed {
+                exhausted: false,
+                retry_in_ms: None
+            }
         );
     }
 

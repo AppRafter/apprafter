@@ -92,9 +92,9 @@ fn the_right_password_is_verified() {
     assert_eq!(outcome.outcome, AuthOutcome::Verified, "{outcome:?}");
 }
 
-/// Three wrong passwords fail, the third saying no attempt is left; then the right one is
-/// refused at once, so PAM was not asked (it would have verified it); once the refusal is over
-/// PAM is asked again and verifies it.
+/// Three wrong passwords fail, the third saying no attempt is left, and for how long; then the
+/// right one is refused at once, so PAM was not asked (it would have verified it), saying how
+/// much of the refusal is left; once the refusal is over PAM is asked again and verifies it.
 #[test]
 #[ignore = "needs the PAM container: bash scripts/test-osauth-linux.sh"]
 fn wrong_passwords_fail_and_the_back_off_refuses_without_asking_pam() {
@@ -105,7 +105,10 @@ fn wrong_passwords_fail_and_the_back_off_refuses_without_asking_pam() {
     for (now, exhausted) in [(0, false), (1, false), (2, true)] {
         assert_eq!(
             check(&pam, &wrong, now),
-            AuthOutcome::Failed { exhausted },
+            AuthOutcome::Failed {
+                exhausted,
+                retry_in_ms: exhausted.then_some(Backoff::REFUSAL_MS),
+            },
             "wrong password #{}",
             now + 1
         );
@@ -113,7 +116,10 @@ fn wrong_passwords_fail_and_the_back_off_refuses_without_asking_pam() {
     let started = Instant::now();
     assert_eq!(
         check(&pam, &right, 3),
-        AuthOutcome::Failed { exhausted: true },
+        AuthOutcome::Failed {
+            exhausted: true,
+            retry_in_ms: Some(Backoff::REFUSAL_MS - 1),
+        },
         "the refusal answers before PAM, even for the right password"
     );
     let refused_in = started.elapsed();
@@ -123,7 +129,10 @@ fn wrong_passwords_fail_and_the_back_off_refuses_without_asking_pam() {
     );
     assert_eq!(
         check(&pam, &right, 2 + Backoff::REFUSAL_MS - 1),
-        AuthOutcome::Failed { exhausted: true },
+        AuthOutcome::Failed {
+            exhausted: true,
+            retry_in_ms: Some(1),
+        },
         "a millisecond before the refusal ends"
     );
     assert_eq!(
@@ -204,7 +213,10 @@ fn without_the_policy_file_the_authenticator_offers_the_password() {
     for (text, outcome) in [
         (
             format!("not-{right}"),
-            AuthOutcome::Failed { exhausted: false },
+            AuthOutcome::Failed {
+                exhausted: false,
+                retry_in_ms: None,
+            },
         ),
         (right, AuthOutcome::Verified),
     ] {
@@ -234,8 +246,20 @@ fn an_empty_password_is_never_verified() {
     assert_eq!(
         outcomes,
         [
-            ("", AuthOutcome::Failed { exhausted: false }),
-            ("anything at all", AuthOutcome::Failed { exhausted: false }),
+            (
+                "",
+                AuthOutcome::Failed {
+                    exhausted: false,
+                    retry_in_ms: None
+                }
+            ),
+            (
+                "anything at all",
+                AuthOutcome::Failed {
+                    exhausted: false,
+                    retry_in_ms: None
+                }
+            ),
         ]
     );
 }

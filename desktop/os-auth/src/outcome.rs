@@ -29,6 +29,15 @@ const fn unavailable(reason: UnavailableReason) -> AuthOutcome {
     AuthOutcome::Unavailable { reason }
 }
 
+/// A refusal of the OS's own, `exhausted` when it allows no attempt for now: no OS says for how
+/// long, so it carries no `retry_in_ms` (only the app's [`Backoff`] knows its end).
+const fn failed(exhausted: bool) -> AuthOutcome {
+    AuthOutcome::Failed {
+        exhausted,
+        retry_in_ms: None,
+    }
+}
+
 /// `Windows.Security.Credentials.UI.UserConsentVerificationResult`, the answer of
 /// `UserConsentVerifier::RequestVerificationForWindowAsync`. Values as windows 0.62.2 generates
 /// them from the Windows metadata (`src/Windows/Security/Credentials/UI/mod.rs`).
@@ -71,9 +80,9 @@ pub fn map_windows_hello(raw: i32) -> AuthOutcome {
         }
         HelloResult::DisabledByPolicy => unavailable(DisabledByPolicy),
         HelloResult::DeviceBusy => AuthOutcome::Busy,
-        HelloResult::RetriesExhausted => AuthOutcome::Failed { exhausted: true },
+        HelloResult::RetriesExhausted => failed(true),
         HelloResult::Canceled => cancelled(CancelledBy::User),
-        HelloResult::Unknown(_) => AuthOutcome::Failed { exhausted: false },
+        HelloResult::Unknown(_) => failed(false),
     }
 }
 
@@ -181,8 +190,8 @@ impl LogonError {
 /// `Unavailable { NotConfigured }`: there is no password to check.
 pub fn map_windows_logon(code: u32) -> AuthOutcome {
     match LogonError::from_code(code) {
-        LogonError::LogonFailure | LogonError::Other(_) => AuthOutcome::Failed { exhausted: false },
-        LogonError::AccountLockedOut => AuthOutcome::Failed { exhausted: true },
+        LogonError::LogonFailure | LogonError::Other(_) => failed(false),
+        LogonError::AccountLockedOut => failed(true),
         LogonError::AccountRestriction => unavailable(NotConfigured),
         LogonError::InvalidLogonHours
         | LogonError::InvalidWorkstation
@@ -257,7 +266,7 @@ pub fn map_la_error(code: isize) -> AuthOutcome {
         LaErrorCode::UserCancel | LaErrorCode::UserFallback => cancelled(CancelledBy::User),
         LaErrorCode::AppCancel | LaErrorCode::InvalidContext => cancelled(CancelledBy::App),
         LaErrorCode::SystemCancel => cancelled(CancelledBy::System),
-        LaErrorCode::BiometryLockout => AuthOutcome::Failed { exhausted: true },
+        LaErrorCode::BiometryLockout => failed(true),
         LaErrorCode::PasscodeNotSet
         | LaErrorCode::BiometryNotAvailable
         | LaErrorCode::BiometryNotEnrolled
@@ -268,7 +277,7 @@ pub fn map_la_error(code: isize) -> AuthOutcome {
         // `InvalidDimensions` is about embedded UI, which the app does not use.
         LaErrorCode::AuthenticationFailed
         | LaErrorCode::InvalidDimensions
-        | LaErrorCode::Unknown(_) => AuthOutcome::Failed { exhausted: false },
+        | LaErrorCode::Unknown(_) => failed(false),
     }
 }
 
@@ -420,7 +429,7 @@ impl PamCode {
 pub fn map_pam(raw: i32) -> AuthOutcome {
     match PamCode::from_raw(raw) {
         PamCode::Success => AuthOutcome::Verified,
-        PamCode::Maxtries => AuthOutcome::Failed { exhausted: true },
+        PamCode::Maxtries => failed(true),
         PamCode::ConvErr | PamCode::Abort => cancelled(CancelledBy::App),
         PamCode::AuthErr
         | PamCode::UserUnknown
@@ -428,7 +437,7 @@ pub fn map_pam(raw: i32) -> AuthOutcome {
         | PamCode::BufErr
         | PamCode::CredInsufficient
         | PamCode::AuthinfoUnavail
-        | PamCode::Other(_) => AuthOutcome::Failed { exhausted: false },
+        | PamCode::Other(_) => failed(false),
     }
 }
 
@@ -436,7 +445,8 @@ pub fn map_pam(raw: i32) -> AuthOutcome {
 /// and a success starts the count again. The Windows credential dialog and PAM keep one each:
 /// a failed `LogonUserW` counts toward the account-lockout policy (a domain account's too), and
 /// PAM's own delay after a failure is a few seconds. While it refuses, a backend answers
-/// `Failed { exhausted: true }` without a prompt.
+/// `Failed { exhausted: true }` without a prompt, with how long it still will
+/// ([`Refused::remaining_ms`] as `retry_in_ms`), and so does the failure that starts it.
 ///
 /// It lives in memory, so a restart forgets it, and that is accepted: what bounds guessing
 /// across restarts is the OS's own. On Linux that is PAM's delay after every failure
@@ -523,8 +533,12 @@ mod tests {
         AuthOutcome::Cancelled { by }
     }
 
+    /// No OS's answer says how long a lockout lasts.
     const fn failed(exhausted: bool) -> AuthOutcome {
-        AuthOutcome::Failed { exhausted }
+        AuthOutcome::Failed {
+            exhausted,
+            retry_in_ms: None,
+        }
     }
 
     const fn unavailable(reason: UnavailableReason) -> AuthOutcome {
