@@ -1,6 +1,23 @@
 /* SPDX-License-Identifier: FSL-1.1-Apache-2.0 */
-/* The D.3 flows' screens: the machine picker, the doctor, the toolchain. Primitives live in
-   components.css. */
+/* The D.3 flows' screens: the add-target wizard, the machine picker, the doctor, the
+   toolchain. Primitives live in components.css. */
+
+/* Add-target wizard ---------------------------------------------------------------------- */
+
+/* The provider step after a verify: the draft stands for the token, and the field is gone. */
+.token-verified {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--ok);
+}
+
+/* Why the wizard came back to the token: a draft dropped, or used by a failed attempt. */
+.wizard-notice {
+  margin: 0;
+  font-size: var(--fs-12-5);
+  color: var(--warn);
+}
 
 /* Machine picker ------------------------------------------------------------------------- */
 
