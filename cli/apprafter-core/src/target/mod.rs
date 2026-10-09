@@ -4,18 +4,23 @@
 //! mutations share.
 
 pub mod name;
+mod pointer;
 mod read;
+mod rename;
 #[cfg(test)]
 pub(crate) mod testkit;
 
 pub use name::{validate_name, NameProblem, TARGET_NAME_MAX_LEN};
+pub use pointer::{execute_use, plan_use, UsePayload};
 pub use read::{hetzner_token, list, public_address, show};
+pub use rename::{execute_rename, plan_rename, RenamePayload};
 
 use cli_core::{StoreLock, StoreLockEvent};
 use serde::Serialize;
 
 use crate::context::Context;
 use crate::error::{CoreResult, UiError};
+use crate::op::{ChangeAction, Outcome, PlannedChange};
 use crate::provider::Verification;
 use crate::report::{Event, Reporter};
 use crate::ssh::SshKeyInfo;
@@ -246,13 +251,6 @@ pub fn store_lock_event(event: &StoreLockEvent<'_>) -> Event {
 
 /// The store lock, creating the root (an add on a fresh store must lock it). Never held across
 /// the network: every `execute_*` does its provider calls first.
-// `allow`, not `expect`: a fn whose only caller is itself dead is reported by rustc 1.98 but not
-// by the dev shell's 1.95, so an expectation is unfulfilled on one of them (GOTCHA-103's class).
-// Goes with the first caller.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "first caller: execute_use (D.3b Task 6)")
-)]
 pub(crate) fn lock_store(ctx: &Context, reporter: &dyn Reporter) -> CoreResult<StoreLock> {
     Ok(StoreLock::exclusive_or_wait(&ctx.store(), |e| {
         reporter.report(store_lock_event(&e))
@@ -261,10 +259,6 @@ pub(crate) fn lock_store(ctx: &Context, reporter: &dyn Reporter) -> CoreResult<S
 
 /// The store lock, or none when the root does not exist (a command that will fail on a missing
 /// store must not create one by locking it).
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "first caller: execute_use (D.3b Task 6)")
-)]
 pub(crate) fn lock_store_if_present(
     ctx: &Context,
     reporter: &dyn Reporter,
@@ -294,6 +288,29 @@ pub fn provisioned(ctx: &Context, target: &TargetRef) -> CoreResult<Option<Provi
 /// never `GlobalConfig::default()`'s `"default"`.
 pub(crate) fn cli_default(ctx: &Context) -> CoreResult<Option<String>> {
     Ok(cli_core::resolve_active_target_name(&ctx.store(), None)?)
+}
+
+/// An operation stopped by its token before it changed anything.
+pub(crate) fn cancelled<T>() -> Outcome<T> {
+    Outcome::Cancelled {
+        cleaned: Vec::new(),
+        left: Vec::new(),
+    }
+}
+
+/// One line of a plan.
+pub(crate) fn change(
+    kind: &str,
+    object: &str,
+    action: ChangeAction,
+    detail: Option<String>,
+) -> PlannedChange {
+    PlannedChange {
+        kind: kind.into(),
+        object: object.into(),
+        action,
+        detail,
+    }
 }
 
 #[cfg(test)]

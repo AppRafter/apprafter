@@ -112,3 +112,19 @@ pub(crate) const SERVER_TYPES: &str = r#"{"server_types":[
  {"id":1,"name":"cx11","architecture":"x86","cpu_type":"shared","cores":1,"memory":2.0,"disk":20,"deprecation":null,
   "locations":[{"name":"nbg1","available":false,"recommended":false,"deprecation":{"announced":"2019-01-01T00:00:00+00:00","unavailable_after":"2020-01-01T00:00:00+00:00"}}],"prices":[]}
 ],"meta":{"pagination":{"next_page":null}}}"#;
+
+/// Save a fresh hetzner-cloud target `name` (no region, tier or token) — another process's add.
+pub(crate) fn edit_new(ctx: &Context, name: &str) {
+    cli_core::save_target(
+        &ctx.store(),
+        &Target {
+            name: name.to_string(),
+            config: TargetConfig {
+                provider: "hetzner-cloud".into(),
+                ..Default::default()
+            },
+            credentials: TargetCredentials::default(),
+        },
+    )
+    .unwrap();
+}
