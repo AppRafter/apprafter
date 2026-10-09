@@ -141,6 +141,18 @@ install_package >/tmp/install.log 2>&1 || {
 }
 [[ -x "$BINARY" ]] || fail "$BINARY is not installed"
 
+step "the package is named after the binary, and the menu entry says AppRafter"
+# Tauri names the package after productName, kebab-cased: "AppRafter" became "app-rafter".
+# tauri.linux.conf.json5 sets it to the binary's name; the launcher keeps the product's name.
+case "$kind" in
+deb) dpkg-query --show apprafter-desktop >/dev/null 2>&1 || fail "no installed package apprafter-desktop" ;;
+rpm) rpm --query apprafter-desktop >/dev/null 2>&1 || fail "no installed package apprafter-desktop" ;;
+esac
+LAUNCHER=/usr/share/applications/apprafter-desktop.desktop
+[[ -f "$LAUNCHER" ]] || fail "$LAUNCHER is not installed"
+grep -qx 'Name=AppRafter' "$LAUNCHER" || fail "$LAUNCHER does not name the app AppRafter"
+grep -qx 'Exec=apprafter-desktop' "$LAUNCHER" || fail "$LAUNCHER does not start apprafter-desktop"
+
 step "the installed policy is the repository's"
 # sha256sum, not cmp: Fedora's image has no diffutils.
 [[ "$(sha256sum <"$POLICY_PATH")" == "$(sha256sum <"$expected")" ]] ||

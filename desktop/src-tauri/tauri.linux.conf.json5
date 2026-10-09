@@ -1,0 +1,15 @@
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
+// Linux only, merged over tauri.conf.json5. Tauri names the deb and rpm packages, their files and
+// the launcher after productName, kebab-cased, so "AppRafter" made a package called
+// "app-rafter". On Linux the product is named after its binary instead; the menu entry still
+// says "AppRafter" through the launcher template (Tauri's own, with Name fixed). productName is
+// not shown anywhere else on Linux: the window titles itself, and the app menu is macOS-only.
+{
+  productName: "apprafter-desktop",
+  bundle: {
+    linux: {
+      deb: { desktopTemplate: "../packaging/linux/apprafter-desktop.desktop.hbs" },
+      rpm: { desktopTemplate: "../packaging/linux/apprafter-desktop.desktop.hbs" },
+    },
+  },
+}

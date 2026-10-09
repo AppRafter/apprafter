@@ -3,7 +3,8 @@
 // tauri-build). No "version": desktop/src-tauri/Cargo.toml is the authority (spec §6.1).
 {
   $schema: "https://schema.tauri.app/config/2",
-  // Space-free: on Linux the badge / .desktop key is "<productName>.desktop".
+  // Space-free: on Linux the badge / .desktop key is "<productName>.desktop" (Linux overrides
+  // productName in tauri.linux.conf.json5).
   productName: "AppRafter",
   mainBinaryName: "apprafter-desktop",
   // Fixes the app-data directories for good; must not end in ".app".
@@ -54,7 +55,9 @@
     macOS: { minimumSystemVersion: "13.0" },
     // What the deb and rpm packages and the launcher say about the app.
     shortDescription: "AppRafter Desktop: the AppRafter command line, as a desktop app.",
-    longDescription: "AppRafter Desktop works with the same targets as the apprafter command line. It locks itself\nand unlocks with the operating system's own sign-in.",
+    longDescription: "AppRafter Desktop works with the same targets as the apprafter\ncommand line. It locks itself and unlocks with the operating\nsystem's own sign-in.",
+    // The menu category (Development on Linux; the Developer Tools category on macOS).
+    category: "DeveloperTool",
     // Tauri adds WebKitGTK and GTK to `depends` itself; PAM is the app's own (its password
     // field links -lpam), named by soname for rpm as Tauri names its own. The polkit policy
     // goes where every polkit version reads actions. polkitd is recommended, not required:
