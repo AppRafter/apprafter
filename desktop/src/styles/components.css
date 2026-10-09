@@ -893,6 +893,11 @@
   font: 400 var(--fs-11-5) var(--font-mono);
 }
 
+/* A command inside the text (a planned section's "target use" first). */
+.state-text code {
+  font: 400 var(--fs-11-5) var(--font-mono);
+}
+
 .state-actions {
   display: flex;
   gap: 8px;

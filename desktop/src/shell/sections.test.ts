@@ -39,3 +39,16 @@ test("each section's slice is coverage.toml's for its command, and its copy name
     expect(section.planned, section.id).toContain(`in ${section.slice}.`);
   }
 });
+
+const reference = (await Bun.file(
+  new URL('../../../docs/reference/cli/commands.json', import.meta.url),
+).json()) as { commands: { path: string[]; positionals: { id: string }[] }[] };
+
+test('a section names the tab’s target in its CLI hint exactly when the command takes a name', () => {
+  for (const section of SECTIONS) {
+    const command = reference.commands.find((c) => c.path.join(' ') === section.leaf);
+    expect(command, section.leaf).toBeDefined();
+    const takesName = command?.positionals.some((p) => p.id === 'name') ?? false;
+    expect(section.named ?? false, section.leaf).toBe(takesName);
+  }
+});

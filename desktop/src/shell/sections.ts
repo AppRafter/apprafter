@@ -25,6 +25,11 @@ export interface SectionInfo {
   readonly sub?: (target: string) => string;
   /** The CLI command whose read view the screen is, and the slice that brings it. */
   readonly leaf: string;
+  /**
+   * The command takes the target's name. The others run on the CLI's active target, so the
+   * hint says to switch to the tab's first (sections.test.ts checks it against the reference).
+   */
+  readonly named?: true;
   readonly slice: string;
   /** What the placeholder says until then. */
   readonly planned: string;
@@ -121,6 +126,7 @@ export const SECTIONS: readonly SectionInfo[] = [
     sub: (target) =>
       `How this computer reaches ${target} — provider credentials, the machine, and cached access to the cluster.`,
     leaf: 'target show',
+    named: true,
     slice: 'D.3',
     planned: 'The target screen arrives in D.3.',
   },
