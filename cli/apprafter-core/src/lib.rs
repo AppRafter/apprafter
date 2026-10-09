@@ -37,7 +37,9 @@ pub mod cancel;
 pub mod context;
 pub mod env;
 pub mod error;
+pub mod net;
 pub mod op;
+pub mod process;
 pub mod report;
 pub mod target_ref;
 

@@ -18,13 +18,19 @@ repository.workspace   = true
 ts = ["dep:ts-rs"]
 
 [dependencies]
+# `ureq` and `zeroize` are already in both locks (cli/ and desktop/) at the same versions, and
+# `cli-state` is the only package new to desktop/Cargo.lock, as a path crate: no registry crate
+# moves in either lock.
 cli-core      = { path = "../cli-core" }
 cli-providers = { path = "../cli-providers" }
+cli-state     = { path = "../cli-state" }
 miette        = { workspace = true }
 serde         = { workspace = true }
 serde_json    = { workspace = true }
 thiserror     = { workspace = true }
 ts-rs         = { version = "12.0", optional = true, features = ["serde-json-impl"] }
+ureq          = { workspace = true }
+zeroize       = "1.9"
 
 [dev-dependencies]
 # tests/guards.rs reads the sources as syntax trees, not text. `syn` 2 and
@@ -34,3 +40,6 @@ proc-macro2   = { version = "1", features = ["span-locations"] }
 syn           = { version = "2", features = ["full", "visit", "parsing"] }
 tempfile      = { workspace = true }
 toml          = "0.5"
+# A cli-only dev-dependency: a path crate's dev-dependencies are not resolved in
+# desktop/Cargo.lock, so this adds nothing there.
+mockito       = { workspace = true }

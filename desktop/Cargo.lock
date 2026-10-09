@@ -183,11 +183,14 @@ version = "0.2.80"
 dependencies = [
  "cli-core",
  "cli-providers",
+ "cli-state",
  "miette",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
  "ts-rs",
+ "ureq",
+ "zeroize",
 ]
 
 [[package]]
@@ -866,6 +869,16 @@ dependencies = [
  "tracing",
  "ureq",
  "x509-cert",
+]
+
+[[package]]
+name = "cli-state"
+version = "0.2.80"
+dependencies = [
+ "cli-core",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
