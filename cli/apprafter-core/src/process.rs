@@ -13,9 +13,13 @@
 //!   `/dev/tty` fails at once instead of waiting out the timeout.
 //! - Windows: a Job Object, the child assigned while still suspended so nothing it starts can
 //!   escape, then `TerminateJobObject`. `CREATE_NO_WINDOW` too, so the desktop (a GUI-subsystem
-//!   process with no console) never flashes a console window per console tool it runs.
+//!   process with no console) never flashes a console window per console tool it runs. The job
+//!   is KILL_ON_JOB_CLOSE while the child runs: a process that ends without unwinding (Windows
+//!   ending it once its console-close handler returns, End task, a crash) closes its handle to
+//!   the job as it dies, and the tree dies with it instead of outliving it.
 //!
-//! A child that exits leaves its tree alone: only a timeout or a cancellation kills it.
+//! A child that exits leaves its tree alone: only a timeout, a cancellation or (Windows) the end
+//! of the process running it kills it.
 
 use std::io::{self, Read};
 use std::process::{Command, ExitStatus, Stdio};
@@ -68,6 +72,7 @@ pub fn run_bounded(
     let deadline = Instant::now() + timeout;
     let (status, timed_out) = loop {
         if let Some(status) = child.try_wait()? {
+            tree.release();
             break (Some(status), false);
         }
         if cancel.is_cancelled() || Instant::now() >= deadline {
@@ -166,6 +171,9 @@ mod tree {
             unsafe { libc::kill(-self.group, libc::SIGKILL) };
             let _ = child.kill();
         }
+
+        /// The child exited on its own. Nothing to do: a session outlives this process anyway.
+        pub(super) fn release(&self) {}
     }
 }
 
@@ -181,7 +189,9 @@ mod tree {
         CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
     };
     use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, TerminateJobObject,
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, TerminateJobObject, JOBOBJECT_BASIC_LIMIT_INFORMATION,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
     use windows_sys::Win32::System::Threading::{
         OpenThread, ResumeThread, CREATE_NO_WINDOW, CREATE_SUSPENDED, THREAD_SUSPEND_RESUME,
@@ -218,24 +228,35 @@ mod tree {
             }
             let _ = child.kill();
         }
+
+        /// The child exited on its own: what it left running stays running (module docs), so
+        /// the job stops killing its processes when its handle closes.
+        pub(super) fn release(&self) {
+            if let Some(job) = self.job {
+                limit(job, 0);
+            }
+        }
     }
 
     impl Drop for Tree {
         fn drop(&mut self) {
             if let Some(job) = self.job {
-                // SAFETY: closed once, here. The job lives on while processes are in it, and
-                // without KILL_ON_JOB_CLOSE closing it kills nothing.
+                // SAFETY: closed once, here. The job lives on while processes are in it; this
+                // is its only handle, so closing it kills them unless `release` ran first.
                 unsafe { CloseHandle(job) };
             }
         }
     }
 
     fn assign(child: &Child) -> Option<HANDLE> {
-        // SAFETY: an unnamed job with default security; no pointer outlives the call.
+        // SAFETY: an unnamed job with default security; no pointer outlives the call. Its
+        // handle is not inheritable, so no child holds the job open past this process.
         let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
         if job.is_null() {
             return None;
         }
+        // Kill-on-close (module docs), set before the child is in the job.
+        limit(job, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE);
         // SAFETY: both handles are live; the child's is borrowed from `child`.
         if unsafe { AssignProcessToJobObject(job, child.as_raw_handle() as HANDLE) } == 0 {
             // SAFETY: the job was made above and is closed once.
@@ -243,6 +264,28 @@ mod tree {
             return None;
         }
         Some(job)
+    }
+
+    /// Set `job`'s limits to `flags` alone. Windows refuses only a bad handle or a malformed
+    /// struct, and this module passes neither.
+    fn limit(job: HANDLE, flags: JOB_OBJECT_LIMIT) {
+        let info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+            BasicLimitInformation: JOBOBJECT_BASIC_LIMIT_INFORMATION {
+                LimitFlags: flags,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // SAFETY: `job` is a live job handle; `info` is a correctly sized struct of this frame,
+        // read during the call only.
+        unsafe {
+            SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                (&info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            );
+        }
     }
 
     /// Resume every thread of the suspended process `pid` (std keeps no thread handle).
@@ -487,6 +530,148 @@ mod windows_tests {
         writeln!(out, "grandchild {}", sleeper.id()).unwrap();
         out.flush().unwrap();
         let _ = sleeper.wait();
+    }
+
+    /// Where `helper_records_and_hangs` writes its pid and its sleeper's.
+    const PIDS: &str = "APPRAFTER_PROCESS_TEST_PIDS";
+
+    #[test]
+    #[ignore = "a helper process of a_tree_dies_with_the_process_that_started_it"]
+    fn helper_runs_a_hanging_tree() {
+        if std::env::var_os(HELPER).is_none() {
+            return;
+        }
+        let _ = run_bounded(
+            helper("helper_records_and_hangs"),
+            Duration::from_secs(60),
+            &CancellationToken::new(),
+        );
+    }
+
+    #[test]
+    #[ignore = "a helper process of a_tree_dies_with_the_process_that_started_it"]
+    fn helper_records_and_hangs() {
+        let Some(pids) = std::env::var_os(PIDS) else {
+            return;
+        };
+        let mut sleeper = helper("helper_sleeps")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let partial = std::path::PathBuf::from(&pids).with_extension("partial");
+        std::fs::write(&partial, format!("{} {}", std::process::id(), sleeper.id())).unwrap();
+        std::fs::rename(&partial, &pids).unwrap();
+        let _ = sleeper.wait();
+    }
+
+    /// Leaving the sleeper unwaited is the point: it must outlive this helper. Windows keeps no
+    /// zombie of it.
+    #[test]
+    #[ignore = "a helper process of a_child_that_exits_leaves_what_it_started_running"]
+    #[allow(clippy::zombie_processes)]
+    fn helper_starts_a_sleeper_and_exits() {
+        if std::env::var_os(HELPER).is_none() {
+            return;
+        }
+        let sleeper = helper("helper_sleeps")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut out = std::io::stdout();
+        writeln!(out, "grandchild {}", sleeper.id()).unwrap();
+        out.flush().unwrap();
+    }
+
+    /// Wait at most `bound` for process `pid` to end; `None` when it has no process to wait on
+    /// (gone, its pid released). A process still running at the bound is left running.
+    fn ended_within(pid: u32, bound: Duration) -> Option<bool> {
+        // SAFETY: a handle opened, waited on and closed here.
+        unsafe {
+            let process = OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, 0, pid);
+            if process.is_null() {
+                return None;
+            }
+            let ended = WaitForSingleObject(process, bound.as_millis() as u32) == WAIT_OBJECT_0;
+            CloseHandle(process);
+            Some(ended)
+        }
+    }
+
+    fn terminate(pid: u32) {
+        // SAFETY: a handle opened, used and closed here, on a helper this test started.
+        unsafe {
+            let process = OpenProcess(PROCESS_TERMINATE, 0, pid);
+            if !process.is_null() {
+                TerminateProcess(process, 1);
+                CloseHandle(process);
+            }
+        }
+    }
+
+    /// Review findings 1 and 6: a process that ends without unwinding — Windows ending it once
+    /// its console-close handler returns, End task, a crash — takes the trees it was running
+    /// with it (KILL_ON_JOB_CLOSE: its handle to each job closes as it dies). Without that, a
+    /// probe and everything it started outlived doctor.
+    #[test]
+    fn a_tree_dies_with_the_process_that_started_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let pids = dir.path().join("pids");
+        let mut runner = helper("helper_runs_a_hanging_tree")
+            .env(PIDS, &pids)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let until = Instant::now() + Duration::from_secs(30);
+        let (child, grandchild) = loop {
+            if let Ok(text) = std::fs::read_to_string(&pids) {
+                let mut it = text.split_whitespace().map(|p| p.parse::<u32>().unwrap());
+                break (it.next().unwrap(), it.next().unwrap());
+            }
+            assert!(Instant::now() < until, "the tree never started");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        // Ended as Windows ends a process: nothing in it runs again, no destructor included.
+        runner.kill().unwrap();
+        let _ = runner.wait();
+        let child_ended = ended_within(child, Duration::from_secs(5)) != Some(false);
+        let grandchild_ended = ended_within(grandchild, Duration::from_secs(5)) != Some(false);
+        terminate(child); // do not leave them running
+        terminate(grandchild);
+        assert!(
+            child_ended && grandchild_ended,
+            "outlived the process that started them: child {child} ended {child_ended}, \
+             grandchild {grandchild} ended {grandchild_ended}"
+        );
+    }
+
+    /// What the module docs promise and the kill-on-close must not break: a child that exits on
+    /// its own leaves what it started running, after its job's handle is gone too.
+    #[test]
+    fn a_child_that_exits_leaves_what_it_started_running() {
+        let out = run_bounded(
+            helper("helper_starts_a_sleeper_and_exits"),
+            Duration::from_secs(30),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert!(out.status.is_some_and(|s| s.success()), "{out:?}");
+        let text = String::from_utf8_lossy(&out.stdout);
+        let pid: u32 = text
+            .split_once("grandchild ")
+            .and_then(|(_, rest)| rest.split_whitespace().next())
+            .unwrap_or_else(|| panic!("no grandchild pid in {text:?}"))
+            .parse()
+            .unwrap();
+        let ended = ended_within(pid, Duration::from_millis(1000));
+        terminate(pid); // do not leave it running
+        assert_eq!(
+            ended,
+            Some(false),
+            "the grandchild {pid} died with its parent's job"
+        );
     }
 
     /// The timeout terminates the job: the grandchild the child started dies with it.
