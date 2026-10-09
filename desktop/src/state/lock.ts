@@ -3,13 +3,18 @@
 // fed by lock_status, by every `lock-changed` event, and by the answers of lock_now and unlock.
 // An answer and its event carry the same state and land on the same entry, so the order they
 // reach the page in changes nothing.
+//
+// At startup nothing may slip between the read and the listener: the `lock-changed` listener is
+// registered first, and lock_status is asked only then. An event can still land while that
+// answer is on its way; of the two the newer state wins, by `sinceMs` (when that state began),
+// and on a tie — the same state, seen twice — the answer.
 import {
   type QueryClient,
   type UseQueryResult,
   useQuery,
   useQueryClient,
 } from '@tanstack/react-query';
-import { useEffect, useMemo } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { lockNow, lockStatus, unlock } from '../ipc/api';
 import { onLockChanged } from '../ipc/events';
 import type { LockState } from '../ipc/generated/LockState';
@@ -24,7 +29,22 @@ const KEPT_WHILE_LOCKED: ReadonlySet<unknown> = new Set(['lock', 'settings', 'ap
 
 export function useLockState(): UseQueryResult<LockState> {
   const client = useQueryClient();
-  const query = useQuery({ queryKey: LOCK_KEY, queryFn: lockStatus, staleTime: Infinity });
+  // Resolved once the listener is in place (or could not be): the read waits for it.
+  const [listening] = useState(() => {
+    let ready!: () => void;
+    const promise = new Promise<void>((resolve) => (ready = resolve));
+    return { promise, ready };
+  });
+  const query = useQuery({
+    queryKey: LOCK_KEY,
+    queryFn: async () => {
+      await listening.promise;
+      const answer = await lockStatus();
+      const heard = client.getQueryData<LockState>(LOCK_KEY);
+      return heard !== undefined && heard.sinceMs > answer.sinceMs ? heard : answer;
+    },
+    staleTime: Infinity,
+  });
   useEffect(() => {
     let mounted = true;
     let off: (() => void) | undefined;
@@ -33,12 +53,13 @@ export function useLockState(): UseQueryResult<LockState> {
         if (mounted) off = unlisten;
         else unlisten();
       })
-      .catch((error: unknown) => console.error('lock-changed is not heard:', error));
+      .catch((error: unknown) => console.error('lock-changed is not heard:', error))
+      .finally(listening.ready);
     return () => {
       mounted = false;
       off?.();
     };
-  }, [client]);
+  }, [client, listening]);
   return query;
 }
 
