@@ -898,6 +898,21 @@ mod tests {
         assert!(!some.contains("No active target"), "{some}");
     }
 
+    /// Bug 9: one target is "1 target", in both branches of the footer.
+    #[test]
+    fn the_list_footer_counts_one_target_in_the_singular() {
+        assert_eq!(
+            list_summary_line(1, ""),
+            "1 target configured. No active target — run `apprafter target use <name>` to pick one."
+        );
+        assert_eq!(
+            list_summary_line(1, "staging"),
+            "1 target configured. Active: 'staging'."
+        );
+        assert!(list_summary_line(2, "a").starts_with("2 targets configured."));
+        assert!(list_summary_line(0, "").starts_with("0 targets configured."));
+    }
+
     /// Switching away names the target being left behind — walking off a
     /// production target by accident is exactly what this readout catches.
     #[test]
@@ -1142,12 +1157,22 @@ pub(crate) fn list_pointer_name(p: &CliDefaultPointer) -> &str {
 /// With no active target the line has to say so AND name the command that sets
 /// one — an empty `Active:` field reads like a corrupted store.
 pub(crate) fn list_summary_line(count: usize, active: &str) -> String {
+    let count = target_count(count);
     if active.is_empty() {
         format!(
-            "{count} targets configured. No active target — run `apprafter target use <name>` to pick one."
+            "{count} configured. No active target — run `apprafter target use <name>` to pick one."
         )
     } else {
-        format!("{count} targets configured. Active: '{active}'.")
+        format!("{count} configured. Active: '{active}'.")
+    }
+}
+
+/// "1 target", "2 targets".
+fn target_count(n: usize) -> String {
+    if n == 1 {
+        "1 target".into()
+    } else {
+        format!("{n} targets")
     }
 }
 
