@@ -15,41 +15,58 @@ use apprafter_desktop::app::{self, SessionSource, Shell, ShellCell};
 use apprafter_desktop::auth::{AuthPurpose, Authenticator, PasswordAnswer};
 use apprafter_desktop::ops::SystemClock;
 use apprafter_desktop::settings::SettingsStore;
-use apprafter_desktop_ipc::{AuthInfo, AuthMethod, AuthOutcome, Settings};
+use apprafter_desktop_ipc::{AuthInfo, AuthMethod, AuthOutcome, Settings, UnavailableReason};
 use serde_json::Value;
 use tauri::ipc::{CallbackFn, InvokeBody};
 use tauri::test::{get_ipc_response, mock_builder, MockRuntime, INVOKE_KEY};
 use tauri::webview::InvokeRequest;
 use tauri::{WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
-/// The password [`Verifies`]' own field accepts.
+/// The password the PAM route's field accepts ([`Route::PasswordField`]).
 // Read by tests/ipc_mock.rs only; tests/app_menu.rs compiles this module too.
 #[allow(dead_code)]
 pub const PASSWORD: &str = "open sesame";
 
-/// What [`Verifies`]' field says with a wrong password, as PAM would.
+/// What the PAM route's field says with a wrong password, as PAM would.
 #[allow(dead_code)]
 pub const PAM_SAYS: &str = "Authentication failure";
 
-/// An OS that verifies the owner every time it is asked, and counts the asks: its prompts in
-/// `.0`, its password field's checks in `.1` (the field accepts [`PASSWORD`]).
-#[derive(Default)]
-pub struct Verifies(pub AtomicUsize, pub AtomicUsize);
+/// How the stand-in OS verifies the owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Route {
+    /// Its own prompt, which always verifies; the app's field is not its way.
+    Prompt,
+    /// Linux's PAM route: the app's own field, which accepts [`PASSWORD`]; its prompt finds no
+    /// agent, as polkit did to bring the field.
+    PasswordField,
+}
 
-impl Authenticator for Verifies {
+/// An OS that verifies the owner by `route`, counting its prompts and its field's checks.
+pub struct StandIn {
+    pub route: Route,
+    pub prompts: AtomicUsize,
+    pub checks: AtomicUsize,
+}
+
+impl Authenticator for StandIn {
     fn info(&self) -> AuthInfo {
         AuthInfo {
             available: true,
             method: Some(AuthMethod::Fake),
             unavailable: None,
             biometrics_choice: false,
-            password_field: false,
+            password_field: self.route == Route::PasswordField,
         }
     }
 
     fn verify(&self, _purpose: &AuthPurpose, _cancel: &CancellationToken) -> AuthOutcome {
-        self.0.fetch_add(1, SeqCst);
-        AuthOutcome::Verified
+        self.prompts.fetch_add(1, SeqCst);
+        match self.route {
+            Route::Prompt => AuthOutcome::Verified,
+            Route::PasswordField => AuthOutcome::Unavailable {
+                reason: UnavailableReason::NoAgent,
+            },
+        }
     }
 
     fn verify_password(
@@ -58,7 +75,10 @@ impl Authenticator for Verifies {
         password: zeroize::Zeroizing<String>,
         _cancel: &CancellationToken,
     ) -> PasswordAnswer {
-        self.1.fetch_add(1, SeqCst);
+        if self.route == Route::Prompt {
+            return PasswordAnswer::NOT_HERE;
+        }
+        self.checks.fetch_add(1, SeqCst);
         if password.as_str() == PASSWORD {
             AuthOutcome::Verified.into()
         } else {
@@ -74,18 +94,27 @@ pub struct Rig {
     _dir: tempfile::TempDir,
     // Read by tests/ipc_mock.rs only; tests/app_menu.rs compiles this module too.
     #[allow(dead_code)]
-    pub auth: Arc<Verifies>,
+    pub auth: Arc<StandIn>,
     pub shell: Arc<Shell>,
     pub _app: tauri::App<MockRuntime>,
     window: WebviewWindow<MockRuntime>,
 }
 
-/// The app with `settings` saved, an OS that verifies, and the main window open.
+/// The app with `settings` saved, an OS whose prompt verifies, and the main window open.
 pub fn rig(settings: Settings) -> Rig {
+    rig_by(settings, Route::Prompt)
+}
+
+/// [`rig`], with an OS that verifies by `route`.
+pub fn rig_by(settings: Settings, route: Route) -> Rig {
     let dir = tempfile::tempdir().unwrap();
     let store = SettingsStore::load(dir.path(), &SystemClock);
     store.set(settings).unwrap();
-    let auth = Arc::new(Verifies::default());
+    let auth = Arc::new(StandIn {
+        route,
+        prompts: AtomicUsize::new(0),
+        checks: AtomicUsize::new(0),
+    });
     let shell = Shell::new(
         store,
         auth.clone(),

@@ -91,8 +91,9 @@ describe('installMockIpc', () => {
     unlisten();
   });
 
-  test('the password field unlocks with the demo password and refuses others as PAM would', async () => {
-    installMockIpc();
+  test('on the PAM route the field unlocks with the demo password and refuses others as PAM would', async () => {
+    installMockIpc({ auth: 'pam' });
+    expect((await api.appInfo()).auth).toMatchObject({ method: 'pam', passwordField: true });
     const heard: LockState[] = [];
     const unlisten = await onLockChanged((state) => heard.push(state));
     const refused = await api.unlockWithPassword('guess').catch((e: unknown) => e);
@@ -124,6 +125,25 @@ describe('installMockIpc', () => {
     unlisten();
   });
 
+  test('on the PAM route a prompt finds no agent; where the OS prompts, the field is refused', async () => {
+    installMockIpc({ auth: 'pam', os: 'linux' });
+    expect(await outcome(() => api.unlock())).toBe(DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE);
+    const noAgent = await api.unlock().catch((e: unknown) => e);
+    expect((noAgent as IpcError).error.fields).toEqual({ reason: 'no_agent' });
+    expect((await api.lockStatus()).locked).toBe(true);
+    clearMocks();
+
+    installMockIpc({ os: 'linux' });
+    expect((await api.appInfo()).auth.passwordField).toBe(false);
+    const refused = await api.unlockWithPassword(MOCK_PASSWORD).catch((e: unknown) => e);
+    expect((refused as IpcError).error).toMatchObject({
+      code: DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE,
+      fields: { reason: 'not_permitted_here' },
+    });
+    expect((await api.lockStatus()).locked).toBe(true);
+    expect(await api.unlock()).toMatchObject({ locked: false });
+  });
+
   test('with the lock switched off, lock now leaves the app unlocked', async () => {
     installMockIpc();
     await api.unlock();
@@ -147,13 +167,15 @@ describe('installMockIpc', () => {
 });
 
 describe('mockOptionsFromUrl', () => {
-  test('reads os and theme', () => {
+  test('reads os, theme and auth', () => {
     expect(mockOptionsFromUrl('?os=macos&theme=system')).toEqual({ os: 'macos', theme: 'system' });
+    expect(mockOptionsFromUrl('?auth=pam')).toEqual({ auth: 'pam' });
     expect(mockOptionsFromUrl('')).toEqual({});
   });
 
   test('refuses a value it does not know', () => {
     expect(() => mockOptionsFromUrl('?os=beos')).toThrow('os');
     expect(() => mockOptionsFromUrl('?theme=sepia')).toThrow('theme');
+    expect(() => mockOptionsFromUrl('?auth=fingerprint')).toThrow('auth');
   });
 });

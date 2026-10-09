@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 // A stand-in for the Rust side, for `vite dev` in a browser (`bun run dev:mock`) and the
 // Playwright smoke: every command answers from in-memory state, behind the same lock gate.
-// The app starts locked (`startup`); Unlock unlocks without asking anyone, and the password
-// field (`unlock_with_password`) unlocks with MOCK_PASSWORD and refuses anything else as PAM
-// would, saying MOCK_PAM_SAYS.
+// The app starts locked (`startup`). As Rust, by route (`?auth=`): by default the OS prompts
+// itself, so Unlock unlocks without asking anyone and the password field is refused
+// (`not_permitted_here`); with `?auth=pam` (Linux's PAM route) the field is the way — it unlocks
+// with MOCK_PASSWORD and refuses anything else as PAM would, saying MOCK_PAM_SAYS — and Unlock
+// finds no polkit agent (`no_agent`).
 import type { InvokeArgs } from '@tauri-apps/api/core';
 import { emit } from '@tauri-apps/api/event';
 import { mockIPC, mockWindows } from '@tauri-apps/api/mocks';
@@ -27,15 +29,21 @@ export const MOCK_PASSWORD = 'apprafter';
 /** What the mock's password field says with a wrong password, as PAM would. */
 export const MOCK_PAM_SAYS = 'Authentication failure';
 
+/** How the mock OS verifies the owner: its own prompt, or Linux's PAM route (the app's field). */
+export type MockAuth = 'os' | 'pam';
+
 export interface MockOptions {
   readonly os?: Os;
   readonly theme?: Theme;
+  /** `pam`: Linux's PAM route, whatever `os` says. */
+  readonly auth?: MockAuth;
 }
 
 const OSES: readonly Os[] = ['windows', 'macos', 'linux'];
 const THEMES: readonly Theme[] = ['system', 'light', 'dark'];
+const AUTHS: readonly MockAuth[] = ['os', 'pam'];
 
-/** `?os=windows|macos|linux&theme=system|light|dark`; an unknown value throws. */
+/** `?os=windows|macos|linux&theme=system|light|dark&auth=os|pam`; an unknown value throws. */
 export function mockOptionsFromUrl(search: string): MockOptions {
   const params = new URLSearchParams(search);
   const pick = <T extends string>(name: string, allowed: readonly T[]): T | undefined => {
@@ -48,7 +56,8 @@ export function mockOptionsFromUrl(search: string): MockOptions {
   };
   const os = pick('os', OSES);
   const theme = pick('theme', THEMES);
-  return { ...(os && { os }), ...(theme && { theme }) };
+  const auth = pick('auth', AUTHS);
+  return { ...(os && { os }), ...(theme && { theme }), ...(auth && { auth }) };
 }
 
 // Rust's Settings::default().
@@ -91,6 +100,15 @@ const AUTH: Record<Os, AuthInfo> = {
   },
 };
 
+/** Linux's PAM route: polkit cannot prompt here, so the app shows its own field. */
+const PAM: AuthInfo = {
+  available: true,
+  method: 'pam',
+  unavailable: null,
+  biometricsChoice: false,
+  passwordField: true,
+};
+
 const uiError = (code: string, message: string): UiError => ({
   code,
   message,
@@ -99,8 +117,18 @@ const uiError = (code: string, message: string): UiError => ({
   fields: {},
 });
 
+/** Rust's `auth_unavailable` for `reason`. */
+const unavailable = (reason: string): UiError => ({
+  ...uiError(
+    DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE,
+    `device-owner authentication is unavailable here (${reason})`,
+  ),
+  fields: { reason },
+});
+
 export function installMockIpc(options: MockOptions = {}): void {
   const os = options.os ?? 'macos';
+  const auth = options.auth === 'pam' ? PAM : AUTH[os];
   let settings: Settings = { ...DEFAULT_SETTINGS, theme: options.theme ?? DEFAULT_SETTINGS.theme };
 
   const autoLockMinutes = () =>
@@ -130,7 +158,7 @@ export function installMockIpc(options: MockOptions = {}): void {
     secretBackend: 'file',
     account: 'alex',
     host: 'workstation',
-    auth: AUTH[os],
+    auth,
     // A desktop session: the OS reports both its locks and its sleeps.
     sessionEvents: { lock: true, sleep: true },
     testBuild: false,
@@ -167,10 +195,15 @@ export function installMockIpc(options: MockOptions = {}): void {
     },
     lock_status: () => lock,
     lock_now: () => (settings.lockEnabled ? transition('manual') : lock),
-    unlock: () => (lock.locked ? transition(null) : lock),
-    // As Rust: unlocked already, nothing is checked.
+    // As Rust: unlocked already, nothing is asked or checked.
+    unlock: () => {
+      if (!lock.locked) return lock;
+      if (auth.passwordField) return Promise.reject(unavailable('no_agent'));
+      return transition(null);
+    },
     unlock_with_password: (args) => {
       if (!lock.locked) return lock;
+      if (!auth.passwordField) return Promise.reject(unavailable('not_permitted_here'));
       if ((args as { password?: unknown } | undefined)?.password === MOCK_PASSWORD) {
         return transition(null);
       }

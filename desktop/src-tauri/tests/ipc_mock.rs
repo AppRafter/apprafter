@@ -25,7 +25,8 @@ use apprafter_desktop::app;
 use apprafter_desktop::ops::{Executor, PlanParts};
 use apprafter_desktop_ipc::{errors, Settings, Theme, ALLOWED_WHILE_LOCKED, COMMANDS, QUITTING};
 use common::{
-    code, invoke, lock_off, rig, wait_for, watch, Log, Rig, PAM_SAYS, PASSWORD, WATCH_DROPPED,
+    code, invoke, lock_off, rig, rig_by, wait_for, watch, Log, Rig, Route, PAM_SAYS, PASSWORD,
+    WATCH_DROPPED,
 };
 use serde_json::{json, Value};
 use tauri::Listener;
@@ -291,7 +292,7 @@ fn locked_the_app_answers_only_the_allowed_commands() {
     }
     let info = invoke(&rig, "app_info", json!({})).unwrap();
     assert_eq!(info["auth"]["method"], "fake");
-    assert_eq!(rig.auth.0.load(SeqCst), 0, "nothing asked the owner");
+    assert_eq!(rig.auth.prompts.load(SeqCst), 0, "nothing asked the owner");
 }
 
 #[test]
@@ -299,7 +300,7 @@ fn unlocked_by_a_verified_owner_the_same_calls_answer() {
     let rig = rig(Settings::default());
     let state = invoke(&rig, "unlock", json!({})).unwrap();
     assert_eq!(state["locked"], false, "{state}");
-    assert_eq!(rig.auth.0.load(SeqCst), 1);
+    assert_eq!(rig.auth.prompts.load(SeqCst), 1);
     assert_eq!(invoke(&rig, "op_list", json!({})).unwrap(), json!([]));
     let light = Settings {
         theme: Theme::Light,
@@ -324,7 +325,12 @@ fn unlocked_by_a_verified_owner_the_same_calls_answer() {
 /// answer.
 #[test]
 fn the_password_field_unlocks_with_the_right_password_and_says_why_not_otherwise() {
-    let rig = rig(Settings::default());
+    let rig = rig_by(Settings::default(), Route::PasswordField);
+    let info = invoke(&rig, "app_info", json!({})).unwrap();
+    assert_eq!(info["auth"]["passwordField"], true, "{info}");
+    let reply = invoke(&rig, "unlock", json!({}));
+    assert_eq!(code(&reply), Some(errors::AUTH_UNAVAILABLE), "{reply:?}");
+    assert_eq!(reply.unwrap_err()["fields"]["reason"], "no_agent");
     let reply = invoke(&rig, "unlock_with_password", json!({ "password": "guess" }));
     assert_eq!(code(&reply), Some(errors::AUTH_FAILED), "{reply:?}");
     let error = reply.unwrap_err();
@@ -345,17 +351,45 @@ fn the_password_field_unlocks_with_the_right_password_and_says_why_not_otherwise
     .unwrap();
     assert_eq!(state["locked"], false, "{state}");
     assert!(!state.to_string().contains(PASSWORD), "{state}");
-    assert_eq!(rig.auth.1.load(SeqCst), 2, "the field was checked twice");
-    assert_eq!(rig.auth.0.load(SeqCst), 0, "the OS's prompt never opened");
+    assert_eq!(
+        rig.auth.checks.load(SeqCst),
+        2,
+        "the field was checked twice"
+    );
+    assert_eq!(
+        rig.auth.prompts.load(SeqCst),
+        1,
+        "only the refused unlock asked a prompt"
+    );
     assert_eq!(invoke(&rig, "op_list", json!({})).unwrap(), json!([]));
 }
 
-/// `op_execute`'s `password` is the confirm dialog's own field: sent, the gesture checks it;
-/// left out or null, the gesture is the OS's prompt.
+/// Where the OS prompts itself the field is not its way: refused, the password unread.
 #[test]
-fn op_execute_checks_the_confirm_dialog_s_password_when_the_page_sends_one() {
-    let rig = rig(lock_off());
-    let destructive = || {
+fn where_the_os_prompts_itself_the_password_field_unlocks_nothing() {
+    let rig = rig(Settings::default());
+    let info = invoke(&rig, "app_info", json!({})).unwrap();
+    assert_eq!(info["auth"]["passwordField"], false, "{info}");
+    let reply = invoke(
+        &rig,
+        "unlock_with_password",
+        json!({ "password": PASSWORD }),
+    );
+    assert_eq!(code(&reply), Some(errors::AUTH_UNAVAILABLE), "{reply:?}");
+    assert_eq!(reply.unwrap_err()["fields"]["reason"], "not_permitted_here");
+    assert_eq!(rig.auth.checks.load(SeqCst), 0);
+    assert_eq!(
+        invoke(&rig, "lock_status", json!({})).unwrap()["locked"],
+        true
+    );
+}
+
+/// `op_execute`'s `password` is the confirm dialog's own field. On the PAM route the gesture
+/// checks it, and without it asks a prompt that finds no agent; where the OS prompts itself the
+/// gesture is its prompt, and a password is refused unread.
+#[test]
+fn op_execute_checks_the_confirm_dialog_s_password_on_the_pam_route() {
+    let destructive = |rig: &Rig| {
         rig.shell
             .ops
             .register_plan(
@@ -364,35 +398,56 @@ fn op_execute_checks_the_confirm_dialog_s_password_when_the_page_sends_one() {
             )
             .op_id
     };
-    let with = invoke(
-        &rig,
-        "op_execute",
-        json!({ "opId": destructive(), "onEvent": "__CHANNEL__:7", "password": PASSWORD }),
-    );
+    let execute = |rig: &Rig, password: Option<&str>| {
+        let mut args = json!({ "opId": destructive(rig), "onEvent": "__CHANNEL__:7" });
+        if let Some(password) = password {
+            args["password"] = json!(password);
+        }
+        invoke(rig, "op_execute", args)
+    };
+
+    let pam = rig_by(lock_off(), Route::PasswordField);
+    let with = execute(&pam, Some(PASSWORD));
     assert!(with.is_ok(), "{with:?}");
-    assert_eq!(
-        (rig.auth.0.load(SeqCst), rig.auth.1.load(SeqCst)),
-        (0, 1),
-        "the field, not the prompt"
-    );
-    let wrong = invoke(
-        &rig,
-        "op_execute",
-        json!({ "opId": destructive(), "onEvent": "__CHANNEL__:8", "password": "guess" }),
-    );
+    let wrong = execute(&pam, Some("guess"));
     assert_eq!(code(&wrong), Some(errors::AUTH_FAILED), "{wrong:?}");
     assert_eq!(wrong.unwrap_err()["fields"]["messages"], json!([PAM_SAYS]));
+    let without = execute(&pam, None);
+    assert_eq!(
+        code(&without),
+        Some(errors::AUTH_UNAVAILABLE),
+        "{without:?}"
+    );
+    assert_eq!(without.unwrap_err()["fields"]["reason"], "no_agent");
+    assert_eq!(
+        (pam.auth.prompts.load(SeqCst), pam.auth.checks.load(SeqCst)),
+        (1, 2)
+    );
+
+    let prompt = rig(lock_off());
     for args in [
-        json!({ "opId": destructive(), "onEvent": "__CHANNEL__:9" }),
-        json!({ "opId": destructive(), "onEvent": "__CHANNEL__:10", "password": null }),
+        json!({ "opId": destructive(&prompt), "onEvent": "__CHANNEL__:9" }),
+        json!({ "opId": destructive(&prompt), "onEvent": "__CHANNEL__:10", "password": null }),
     ] {
-        let reply = invoke(&rig, "op_execute", args.clone());
+        let reply = invoke(&prompt, "op_execute", args.clone());
         assert!(reply.is_ok(), "{args}: {reply:?}");
     }
+    let refused = execute(&prompt, Some(PASSWORD));
     assert_eq!(
-        (rig.auth.0.load(SeqCst), rig.auth.1.load(SeqCst)),
-        (2, 2),
-        "no password: the OS's prompt"
+        code(&refused),
+        Some(errors::AUTH_UNAVAILABLE),
+        "{refused:?}"
+    );
+    assert_eq!(
+        refused.unwrap_err()["fields"]["reason"],
+        "not_permitted_here"
+    );
+    assert_eq!(
+        (
+            prompt.auth.prompts.load(SeqCst),
+            prompt.auth.checks.load(SeqCst)
+        ),
+        (2, 0)
     );
 }
 

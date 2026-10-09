@@ -1678,7 +1678,7 @@ mod tests {
 
     #[test]
     fn the_right_password_unlocks_and_a_wrong_one_is_refused_with_what_pam_said() {
-        let auth = Arc::new(FakeAuthenticator::new().with_password("open sesame"));
+        let auth = Arc::new(FakeAuthenticator::new().with_password("open sesame".to_owned()));
         auth.saying(&["Authentication failure"]);
         let r = rig(Settings::default(), auth.clone());
         let refusal = r
@@ -1792,7 +1792,7 @@ mod tests {
 
     #[test]
     fn once_the_quit_closed_the_machine_no_password_is_checked() {
-        let auth = Arc::new(FakeAuthenticator::new().with_password("pw"));
+        let auth = Arc::new(FakeAuthenticator::new().with_password("pw".to_owned()));
         let r = rig(Settings::default(), auth.clone());
         r.machine.close();
         let refusal = r.machine.unlock_with_password(typed("pw")).unwrap_err();

@@ -326,13 +326,13 @@ impl Backend for OsAuthenticator {
 }
 
 /// Which authenticator a build uses.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub enum Choice {
     /// The OS's own: every release build.
     System,
     /// The test build's scripted fake, with the password its own field accepts, if the walk set
-    /// one (`APPRAFTER_DESKTOP_TEST_PASSWORD`).
-    Fake { password: Option<String> },
+    /// one (`APPRAFTER_DESKTOP_TEST_PASSWORD`), wiped when dropped.
+    Fake { password: Option<Zeroizing<String>> },
 }
 
 impl fmt::Debug for Choice {
@@ -356,7 +356,8 @@ pub fn choice(env: &AllowListEnv) -> Choice {
         Choice::Fake {
             password: env
                 .var_os(TEST_PASSWORD_ENV)
-                .and_then(|p| p.into_string().ok()),
+                .and_then(|p| p.into_string().ok())
+                .map(Zeroizing::new),
         }
     } else {
         Choice::System
@@ -403,7 +404,9 @@ mod fake {
     use std::sync::{Mutex, MutexGuard};
 
     use apprafter_core::CancellationToken;
-    use apprafter_desktop_ipc::{AuthInfo, AuthMethod, AuthOutcome, CancelledBy};
+    use apprafter_desktop_ipc::{
+        AuthInfo, AuthMethod, AuthOutcome, CancelledBy, UnavailableReason,
+    };
     use zeroize::Zeroizing;
 
     use super::{AuthPurpose, Authenticator, PasswordAnswer};
@@ -413,10 +416,11 @@ mod fake {
     /// already tripped is answered `Cancelled { by: App }` without using the script, as a
     /// real prompt closed by the app would be.
     ///
-    /// With a password ([`with_password`](Self::with_password)) it also has the app's own
-    /// password field, as Linux's PAM path does: the field checks that password (the script, if
-    /// it has an answer, comes first), and every answer but `Verified` says what
-    /// [`saying`](Self::saying) set, as PAM would. Without one the field is not its way
+    /// With a password ([`with_password`](Self::with_password)) it is Linux's PAM route: the
+    /// app's own password field checks that password (the script, if it has an answer, comes
+    /// first), every answer but `Verified` says what [`saying`](Self::saying) set, as PAM
+    /// would, and a prompt, the script once empty, finds no agent (`Unavailable { NoAgent }`),
+    /// as polkit did to bring the field. Without one the field is not its way
     /// ([`PasswordAnswer::NOT_HERE`]).
     #[derive(Default)]
     pub struct FakeAuthenticator {
@@ -440,10 +444,10 @@ mod fake {
             Self::default()
         }
 
-        /// The app's own password field, accepting `password`.
-        pub fn with_password(self, password: impl Into<String>) -> Self {
+        /// Linux's PAM route: the app's own password field, accepting `password`.
+        pub fn with_password(self, password: impl Into<Zeroizing<String>>) -> Self {
             Self {
-                password: Some(Zeroizing::new(password.into())),
+                password: Some(password.into()),
                 ..self
             }
         }
@@ -490,9 +494,14 @@ mod fake {
             if cancel.is_cancelled() {
                 return APP_CANCELLED;
             }
-            lock(&self.script)
-                .pop_front()
-                .unwrap_or(AuthOutcome::Verified)
+            let otherwise = match self.password {
+                // The PAM route: polkit found no agent.
+                Some(_) => AuthOutcome::Unavailable {
+                    reason: UnavailableReason::NoAgent,
+                },
+                None => AuthOutcome::Verified,
+            };
+            lock(&self.script).pop_front().unwrap_or(otherwise)
         }
 
         fn verify_password(
@@ -689,7 +698,7 @@ mod tests {
         assert_eq!(
             choice(&env(true, &walk)),
             Choice::Fake {
-                password: Some("open sesame".into())
+                password: Some(Zeroizing::new("open sesame".to_owned()))
             }
         );
         let printed = format!("{:?}", choice(&env(true, &walk)));
@@ -703,7 +712,7 @@ mod tests {
         assert_eq!(plain.info(), FakeAuthenticator::new().info());
         let with = authenticator(
             Choice::Fake {
-                password: Some("open sesame".into()),
+                password: Some(Zeroizing::new("open sesame".to_owned())),
             },
             clock,
         );
@@ -908,7 +917,7 @@ mod tests {
 
     #[test]
     fn a_tripped_token_closes_the_fake_prompt_as_the_app() {
-        let fake = FakeAuthenticator::new().with_password("pw");
+        let fake = FakeAuthenticator::new().with_password("pw".to_owned());
         let token = CancellationToken::new();
         token.cancel();
         let app = AuthOutcome::Cancelled {
@@ -928,7 +937,7 @@ mod tests {
 
     #[test]
     fn the_fake_s_field_checks_its_password_and_says_what_pam_would() {
-        let fake = FakeAuthenticator::new().with_password("open sesame");
+        let fake = FakeAuthenticator::new().with_password("open sesame".to_owned());
         fake.saying(&["Authentication failure"]);
         assert!(fake.info().password_field);
         let token = CancellationToken::new();
@@ -957,6 +966,24 @@ mod tests {
         );
         let printed = format!("{fake:?}");
         assert!(!printed.contains("sesame"), "{printed}");
+    }
+
+    /// The PAM route never answers a prompt yes: polkit found no agent, which is why the field
+    /// is there. A script still comes first.
+    #[test]
+    fn the_fake_with_a_field_finds_no_agent_for_a_prompt() {
+        let fake = FakeAuthenticator::new().with_password("open sesame".to_owned());
+        let token = CancellationToken::new();
+        for purpose in [AuthPurpose::Unlock, confirm()] {
+            assert_eq!(
+                fake.verify(&purpose, &token),
+                AuthOutcome::Unavailable {
+                    reason: UnavailableReason::NoAgent
+                }
+            );
+        }
+        fake.then(AuthOutcome::Verified);
+        assert_eq!(fake.verify(&confirm(), &token), AuthOutcome::Verified);
     }
 
     #[test]

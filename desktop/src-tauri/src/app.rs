@@ -1193,7 +1193,7 @@ mod tests {
 
     #[test]
     fn the_password_unlock_answers_the_state_it_left() {
-        let auth = Arc::new(FakeAuthenticator::new().with_password("open sesame"));
+        let auth = Arc::new(FakeAuthenticator::new().with_password("open sesame".to_owned()));
         auth.saying(&["Authentication failure"]);
         let r = rig(Settings::default(), auth);
         let refusal = r

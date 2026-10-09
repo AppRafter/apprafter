@@ -1385,7 +1385,7 @@ mod tests {
 
     #[test]
     fn a_refused_password_spends_the_plan_and_says_what_pam_said_to_every_page() {
-        let auth = FakeAuthenticator::new().with_password("open sesame");
+        let auth = FakeAuthenticator::new().with_password("open sesame".to_owned());
         auth.saying(&["Authentication failure"]);
         let (_, mgr) = manager();
         let runs = Arc::new(AtomicUsize::new(0));
@@ -1424,7 +1424,7 @@ mod tests {
 
     #[test]
     fn a_plan_without_a_gesture_runs_and_its_password_is_never_checked() {
-        let auth = FakeAuthenticator::new().with_password("open sesame");
+        let auth = FakeAuthenticator::new().with_password("open sesame".to_owned());
         let (_, mgr) = manager();
         let runs = Arc::new(AtomicUsize::new(0));
         let view = mgr.register_plan(parts(PlanClass::Bounded), counting(&runs));
