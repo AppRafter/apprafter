@@ -88,3 +88,71 @@
   color: var(--fg-muted);
   font-size: var(--fs-12-5);
 }
+
+/* Doctor --------------------------------------------------------------------------------- */
+
+/* The design's row: a 44 px badge, then the title, the detail and the fix, under a rule. */
+.doctor-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 9px 0;
+  border-top: 1px solid var(--border);
+  list-style: none;
+}
+
+.doctor-row > .tag {
+  flex: none;
+  justify-content: center;
+  width: 44px;
+  padding: 0;
+  font-weight: 500;
+}
+
+.doctor-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.doctor-title {
+  font-weight: 500;
+}
+
+.doctor-title code,
+.doctor-fix code {
+  font-family: var(--font-mono);
+  font-size: 0.95em;
+}
+
+.doctor-detail {
+  margin-top: 2px;
+  color: var(--fg-muted);
+  font: 400 var(--fs-12) var(--font-mono);
+  overflow-wrap: anywhere;
+}
+
+.doctor-fix {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin-top: 4px;
+  color: var(--accent-text);
+  font-size: var(--fs-12-5);
+}
+
+/* The arrow sits on the first line of a fix that wraps. */
+.doctor-fix > svg {
+  flex: none;
+  margin-top: 3px;
+}
+
+.doctor-fix-text {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.doctor-fix > .btn {
+  flex: none;
+  align-self: center;
+}
