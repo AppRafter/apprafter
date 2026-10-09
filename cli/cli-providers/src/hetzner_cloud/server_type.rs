@@ -42,14 +42,8 @@ pub fn classify<'a>(
         Some(o) => o,
         None => return Err(UnavailableKind::NotOfferedInRegion),
     };
-    if let Some(dep) = &offer.deprecation {
-        if let Some(ua) = &dep.unavailable_after {
-            if let Ok(ts) = DateTime::parse_from_rfc3339(ua) {
-                if ts.with_timezone(&Utc) <= now {
-                    return Err(UnavailableKind::Retired);
-                }
-            }
-        }
+    if offer.is_retired_at(now) {
+        return Err(UnavailableKind::Retired);
     }
     if !offer.available {
         return Err(UnavailableKind::OutOfCapacity);

@@ -101,3 +101,14 @@ pub(crate) fn route(
 pub(crate) const LOCATIONS: &str = r#"{"locations":[
  {"id":2,"name":"nbg1","description":"Nuremberg DC Park 1","country":"DE","city":"Nuremberg","network_zone":"eu-central"},
  {"id":1,"name":"fsn1","description":"Falkenstein DC Park 1","country":"DE","city":"Falkenstein","network_zone":"eu-central"}]}"#;
+
+/// cx22 (nbg1, recommended), cx32 (nbg1 + fsn1), cx11 retired in nbg1 (unavailable_after in 2020).
+pub(crate) const SERVER_TYPES: &str = r#"{"server_types":[
+ {"id":104,"name":"cx22","architecture":"x86","cpu_type":"shared","cores":2,"memory":4.0,"disk":40,"deprecation":null,
+  "locations":[{"name":"nbg1","available":true,"recommended":true}],
+  "prices":[{"location":"nbg1","price_monthly":{"net":"3.7900","gross":"4.5101"},"price_hourly":{"net":"0.0060","gross":"0.0071"}}]},
+ {"id":105,"name":"cx32","architecture":"x86","cpu_type":"shared","cores":4,"memory":8.0,"disk":80,"deprecation":null,
+  "locations":[{"name":"nbg1","available":true,"recommended":false},{"name":"fsn1","available":true,"recommended":false}],"prices":[]},
+ {"id":1,"name":"cx11","architecture":"x86","cpu_type":"shared","cores":1,"memory":2.0,"disk":20,"deprecation":null,
+  "locations":[{"name":"nbg1","available":false,"recommended":false,"deprecation":{"announced":"2019-01-01T00:00:00+00:00","unavailable_after":"2020-01-01T00:00:00+00:00"}}],"prices":[]}
+],"meta":{"pagination":{"next_page":null}}}"#;
