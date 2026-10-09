@@ -304,6 +304,9 @@ pub fn run(
         id: GroupId::ThisComputer,
         checks: this_computer_group(ctx, cancel)?,
     });
+    // A token that tripped while the last check ran, after its own look at it: the run is
+    // cancelled all the same, and an interrupted run has no report.
+    cancel.check()?;
     Ok(DoctorReport {
         target: name,
         groups,
@@ -938,7 +941,8 @@ fn this_computer_group(ctx: &Context, cancel: &CancellationToken) -> CoreResult<
     let toolchain = tools::toolchain(ctx, cancel)?;
     let mut out: Vec<Check> = toolchain.tools.iter().map(tool_check).collect();
     cancel.check()?;
-    out.push(dns_check(ctx));
+    // The lookup ends within 50 ms of a cancel; `run` turns the row it leaves into `Cancelled`.
+    out.push(dns_check(ctx, cancel));
     Ok(out)
 }
 
@@ -1012,7 +1016,7 @@ fn tool_check(s: &ToolStatus) -> Check {
     }
 }
 
-fn dns_check(ctx: &Context) -> Check {
+fn dns_check(ctx: &Context, cancel: &CancellationToken) -> Check {
     let host = api_host(ctx.hcloud_base_url());
     let title = format!("DNS resolves `{host}`");
     let netloc = if host.contains(':') {
@@ -1020,7 +1024,7 @@ fn dns_check(ctx: &Context) -> Check {
     } else {
         format!("{host}:{DNS_PORT}")
     };
-    match net::resolve_with_deadline(&netloc, ctx.request_timeout()) {
+    match net::resolve_with_deadline(&netloc, ctx.request_timeout(), cancel) {
         Ok(addrs) if !addrs.is_empty() => Check {
             detail: Some(format!("{DNS_PORT}/tcp")),
             ..row(CheckId::Dns, CheckStatus::Pass, title)
@@ -1678,6 +1682,64 @@ mod tests {
                 target: DoctorTarget::CliDefault,
             },
             &NullReporter,
+            &cancel,
+        );
+        assert!(matches!(r, Err(CoreError::Cancelled)), "{r:?}");
+    }
+
+    /// A run with no target whose DNS row resolves through `lookup`, with a 10 s request
+    /// timeout: what the run returned, and how long it took.
+    fn run_with_lookup(
+        lookup: impl Fn(&str) -> std::io::Result<Vec<std::net::SocketAddr>> + Send + Sync + 'static,
+        cancel: &CancellationToken,
+    ) -> (CoreResult<DoctorReport>, Duration) {
+        let f = fx();
+        let ctx = ctx(&f, "https://doctor-dns.invalid")
+            .with_no_ping(true)
+            .with_request_timeout(Duration::from_secs(10));
+        let _stub = net::stub_lookup(lookup);
+        let started = std::time::Instant::now();
+        let r = run(
+            &ctx,
+            DoctorArgs {
+                target: DoctorTarget::CliDefault,
+            },
+            &NullReporter,
+            cancel,
+        );
+        (r, started.elapsed())
+    }
+
+    /// Review findings 2, 5 and 7: a Ctrl-C while the DNS row waits on a resolver that never
+    /// answers ends the run at once with `Cancelled` (exit 130, no report), not with a report at
+    /// the lookup's deadline.
+    #[test]
+    fn a_cancel_during_the_dns_lookup_cancels_the_run_at_once() {
+        let cancel = CancellationToken::new();
+        let trip = cancel.clone();
+        let (r, took) = run_with_lookup(
+            move |_| {
+                trip.cancel();
+                std::thread::sleep(Duration::from_secs(10));
+                Ok(vec![])
+            },
+            &cancel,
+        );
+        assert!(matches!(r, Err(CoreError::Cancelled)), "{r:?}");
+        assert!(took < Duration::from_secs(2), "{took:?}");
+    }
+
+    /// The same, for a cancel that lands while the last row is finishing: its answer still
+    /// arrives, and the run is cancelled all the same, never a report.
+    #[test]
+    fn a_cancel_that_lands_as_the_last_row_finishes_still_cancels_the_run() {
+        let cancel = CancellationToken::new();
+        let trip = cancel.clone();
+        let (r, _) = run_with_lookup(
+            move |_| {
+                trip.cancel();
+                Ok(vec!["127.0.0.1:443".parse().unwrap()])
+            },
             &cancel,
         );
         assert!(matches!(r, Err(CoreError::Cancelled)), "{r:?}");
