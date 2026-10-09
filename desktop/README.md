@@ -296,13 +296,20 @@ app shares.
 
 - **A blank or white window, flicker, a crash on resize, or
   `Gdk-Message: Error 71 (Protocol error) dispatching to Wayland display`.** These are
-  WebKitGTK graphics problems, most often on NVIDIA. Tauri's
-  [Linux graphics notes](https://tauri.app/develop/debug/linux-graphics/) give workarounds to
-  try in order: the kernel parameter `nvidia_drm.modeset=1` (NVIDIA drivers older than 545),
-  then `__NV_DISABLE_EXPLICIT_SYNC=1`, `WEBKIT_DISABLE_DMABUF_RENDERER=1` and
-  `WEBKIT_DISABLE_COMPOSITING_MODE=1`. Set a variable for one start, for example
-  `WEBKIT_DISABLE_DMABUF_RENDERER=1 apprafter-desktop`. These workarounds have not been tested
-  with this app.
+  WebKitGTK graphics problems, most often on NVIDIA.
+  - When the NVIDIA driver is loaded and the window opens on Wayland, the app turns
+    WebKitGTK's DMA-BUF renderer off by itself, as `WEBKIT_DISABLE_DMABUF_RENDERER=1` does:
+    that renderer is what closes the window with `Error 71` there. Its log then has a line
+    that starts with `WebKitGTK's DMA-BUF renderer is off`. It does this whenever the NVIDIA
+    driver is loaded, also on a laptop whose screen another graphics chip drives.
+  - To keep the renderer on, start the app with `WEBKIT_DISABLE_DMABUF_RENDERER=0`. The app
+    never changes a value you set yourself, whatever it is.
+  - Tauri's [Linux graphics notes](https://tauri.app/develop/debug/linux-graphics/) give more
+    workarounds to try in order: the kernel parameter `nvidia_drm.modeset=1` (NVIDIA drivers
+    older than 545), then `__NV_DISABLE_EXPLICIT_SYNC=1` and
+    `WEBKIT_DISABLE_COMPOSITING_MODE=1`. Set a variable for one start, for example
+    `WEBKIT_DISABLE_COMPOSITING_MODE=1 apprafter-desktop`. These have not been tested with
+    this app.
 - **Only the password field, never the system dialog.** Check that the policy is installed
   (`pkaction`, as above), that polkitd is installed and running, that a polkit agent runs in
   your session, and that you run the app as yourself (not with `sudo`) in a local desktop
@@ -383,9 +390,11 @@ storage is in `~/.local/share/dev.apprafter.desktop/` too.
 `APPRAFTER_DESKTOP_DATA_DIR=<dir>` puts the settings in `<dir>` and the logs in `<dir>/logs`,
 and runs the app as a separate instance. The app's own code reads only that variable and
 `APPRAFTER_CONFIG_DIR` from its environment (a test build reads two more), so `HCLOUD_TOKEN`,
-`KUBECONFIG` and `RUST_LOG` have no effect on it. Variables that the system and the libraries
-the app uses read still apply, such as `HOME`, `XDG_CONFIG_HOME` and the graphics ones under
-[Troubleshooting](#troubleshooting). See
+`KUBECONFIG` and `RUST_LOG` have no effect on it. On Linux it also reads `WAYLAND_DISPLAY`,
+`XDG_SESSION_TYPE`, `GDK_BACKEND` and `WEBKIT_DISABLE_DMABUF_RENDERER`, only to decide the
+NVIDIA workaround under [Troubleshooting](#troubleshooting). Variables that the system and the
+libraries the app uses read still apply, such as `HOME`, `XDG_CONFIG_HOME` and the graphics
+ones under Troubleshooting. See
 [Environment variables](../docs/reference/environment.md#apprafter-desktop).
 
 ### The log

@@ -33,15 +33,17 @@ use crate::settings::SettingsStore;
 /// Build and run the app. Returns only when it could not start; once running, the process
 /// exits from the event loop.
 ///
-/// In order: the async runtime and the crypto provider (before anything of Tauri's), the
-/// allow-listed environment and the core context, the app's identity and directories (a
-/// data-directory override moves every app directory and keys the single-instance lock on
-/// it; one set but empty or not Unicode stops the start, [`exit_code`] 2), the authenticator
-/// ([`auth::choice`]: the OS's in a release, the fake in a test build), the app itself (the
-/// single-instance plugin first: a second launch only focuses the first window and exits; on
-/// macOS, the app menu), then the log, the settings and the shell, the tickers, the OS session
-/// watch (lock-on-sleep) and, on Linux and macOS, the quit signals. On Windows the prompts are
-/// parented to the main window as soon as it is built.
+/// In order: on Linux, WebKitGTK's DMA-BUF renderer turned off under Wayland on NVIDIA's driver
+/// ([`env::turn_off_dmabuf_renderer_on_nvidia_wayland`]: an environment write, so while the
+/// process has one thread; logged once the log starts), the async runtime and the crypto
+/// provider (before anything of Tauri's), the allow-listed environment and the core context,
+/// the app's identity and directories (a data-directory override moves every app directory and
+/// keys the single-instance lock on it; one set but empty or not Unicode stops the start,
+/// [`exit_code`] 2), the authenticator ([`auth::choice`]: the OS's in a release, the fake in a
+/// test build), the app itself (the single-instance plugin first: a second launch only focuses
+/// the first window and exits; on macOS, the app menu), then the log, the settings and the
+/// shell, the tickers, the OS session watch (lock-on-sleep) and, on Linux and macOS, the quit
+/// signals. On Windows the prompts are parented to the main window as soon as it is built.
 ///
 /// The log starts once the app is built, so a second launch, which exits while the plugins
 /// start, writes nothing to the running app's log. It is still up before the window: Tauri
@@ -56,6 +58,10 @@ use crate::settings::SettingsStore;
 /// the OS forces reaches with no request before it. Each drops the OS session watch once the
 /// running operations have stopped.
 pub fn run() -> Result<(), Box<dyn Error>> {
+    // First, while the process has one thread: the async runtime below starts its workers as it
+    // is built, and the environment must not change under a thread that reads it.
+    #[cfg(target_os = "linux")]
+    let dmabuf_renderer = env::turn_off_dmabuf_renderer_on_nvidia_wayland();
     runtime::init_runtime()?;
     runtime::install_crypto();
     let env = AllowListEnv::from_process(cfg!(feature = "test-build"));
@@ -123,6 +129,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         data_dir = ?data_dir,
         "AppRafter Desktop is starting"
     );
+    #[cfg(target_os = "linux")]
+    dmabuf_renderer.log();
 
     let settings = SettingsStore::load(&app.path().app_config_dir()?, &SystemClock);
     if let Some(notice) = settings.notice() {
@@ -187,6 +195,42 @@ mod tests {
         assert!(
             linux.contains("productName: \"apprafter-desktop\","),
             "on Linux the package is named after the binary"
+        );
+    }
+
+    /// The environment is written before any thread exists: the DMA-BUF decision is the first
+    /// statement of `run`, ahead of the async runtime, whose workers start as it is built.
+    #[test]
+    fn the_graphics_workaround_is_run_s_first_statement() {
+        let file = syn::parse_file(include_str!("lib.rs")).unwrap();
+        let run = file
+            .items
+            .iter()
+            .find_map(|item| match item {
+                syn::Item::Fn(f) if f.sig.ident == "run" => Some(f),
+                _ => None,
+            })
+            .expect("fn run");
+        let Some(syn::Stmt::Local(first)) = run.block.stmts.first() else {
+            panic!("run's first statement is no `let`");
+        };
+        let init = first.init.as_ref().expect("a `let` with a value");
+        let syn::Expr::Call(call) = &*init.expr else {
+            panic!("run's first statement calls no function");
+        };
+        let syn::Expr::Path(path) = &*call.func else {
+            panic!("run's first statement calls no path");
+        };
+        let names: Vec<String> = path
+            .path
+            .segments
+            .iter()
+            .map(|s| s.ident.to_string())
+            .collect();
+        assert_eq!(
+            names,
+            ["env", "turn_off_dmabuf_renderer_on_nvidia_wayland"],
+            "run's first statement"
         );
     }
 

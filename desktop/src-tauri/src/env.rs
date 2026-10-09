@@ -17,8 +17,18 @@
 //!   `APPRAFTER_DESKTOP_TEST_PASSWORD`, the password the fake authenticator's own field accepts,
 //!   so a walk can use the lock screen's password field ([`crate::auth::choice`]);
 //!
-//! and `None` for every other name, however it is set. [`AllowListEnv::from_process`] is the one
-//! place in `src/` that reads `std::env`: `tests/env_guard.rs` fails on any other.
+//! and `None` for every other name, however it is set. [`AllowListEnv::from_process`] is where the
+//! app reads its own variables.
+//!
+//! On Linux this file also holds the one workaround the app applies through the environment,
+//! before any thread exists: WebKitGTK's DMA-BUF renderer closes the window with a Wayland
+//! protocol error on NVIDIA's driver, so there [`turn_off_dmabuf_renderer_on_nvidia_wayland`]
+//! sets `WEBKIT_DISABLE_DMABUF_RENDERER=1`, unless the user set it. It reads the display
+//! variables GTK reads and that one ([`GraphicsFacts::from_process`]): none of them is a setting
+//! of the app, and none reaches the core.
+//!
+//! Nowhere else in `src/` reads or writes `std::env`: `tests/env_guard.rs` fails on any other
+//! file.
 
 use std::ffi::OsString;
 use std::fmt;
@@ -227,6 +237,149 @@ fn os_bytes(path: &Path) -> impl Iterator<Item = u8> + '_ {
 fn os_bytes(path: &Path) -> impl Iterator<Item = u8> + '_ {
     use std::os::windows::ffi::OsStrExt;
     path.as_os_str().encode_wide().flat_map(u16::to_le_bytes)
+}
+
+/// WebKitGTK's own switch for its DMA-BUF renderer, read once, when the first web view needs a
+/// renderer: set to anything but `0` (an empty value included) the renderer is off; set to `0`,
+/// or unset, it is on (WebKitGTK 2.52, `UIProcess/gtk/AcceleratedBackingStore.cpp`:
+/// `if (disableDMABuf && g_strcmp0(disableDMABuf, "0")) return;`).
+#[cfg(target_os = "linux")]
+pub const DMABUF_RENDERER_ENV: &str = "WEBKIT_DISABLE_DMABUF_RENDERER";
+
+/// The facts [`dmabuf_renderer`] decides on, as [`GraphicsFacts::from_process`] finds them.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GraphicsFacts {
+    /// `WAYLAND_DISPLAY`: the compositor's socket libwayland connects to.
+    pub wayland_display: Option<OsString>,
+    /// `XDG_SESSION_TYPE`: `wayland` in a Wayland session, whose socket is libwayland's default
+    /// when `WAYLAND_DISPLAY` is unset.
+    pub xdg_session_type: Option<OsString>,
+    /// `GDK_BACKEND`: the display backends GTK tries, in order.
+    pub gdk_backend: Option<OsString>,
+    /// NVIDIA's kernel driver is loaded (`/sys/module/nvidia`, `/proc/driver/nvidia/version`).
+    pub nvidia_driver: bool,
+    /// [`DMABUF_RENDERER_ENV`] as the process inherited it.
+    pub dmabuf_renderer: Option<OsString>,
+    /// How many threads the process runs (`/proc/self/task`); `None` when that cannot be read.
+    pub threads: Option<usize>,
+}
+
+#[cfg(target_os = "linux")]
+impl GraphicsFacts {
+    /// This process's facts. The one place besides [`AllowListEnv::from_process`] that reads
+    /// the environment: three names GTK reads to pick its display and the one WebKitGTK reads
+    /// for its renderer, none of them the app's own settings.
+    pub fn from_process() -> Self {
+        let exists = |path: &str| Path::new(path).exists();
+        GraphicsFacts {
+            wayland_display: std::env::var_os("WAYLAND_DISPLAY"),
+            xdg_session_type: std::env::var_os("XDG_SESSION_TYPE"),
+            gdk_backend: std::env::var_os("GDK_BACKEND"),
+            nvidia_driver: exists("/sys/module/nvidia") || exists("/proc/driver/nvidia/version"),
+            dmabuf_renderer: std::env::var_os(DMABUF_RENDERER_ENV),
+            threads: std::fs::read_dir("/proc/self/task")
+                .ok()
+                .map(|tasks| tasks.count()),
+        }
+    }
+
+    /// Whether GTK 3 opens a Wayland display. It tries the backends `GDK_BACKEND` lists in
+    /// order, all of them (`wayland` first) when it is unset: so the first entry must be
+    /// `wayland` or `*`. Its Wayland backend connects where libwayland does: `WAYLAND_DISPLAY`
+    /// (set but empty, nowhere — GTK goes on to X11), or `wayland-0` when that is unset, which
+    /// is the socket of the Wayland session `XDG_SESSION_TYPE` names.
+    pub fn is_wayland(&self) -> bool {
+        let backend_allows = match &self.gdk_backend {
+            None => true,
+            Some(list) => {
+                let list = list.to_string_lossy();
+                matches!(list.split(',').next(), Some("wayland" | "*"))
+            }
+        };
+        let socket = match &self.wayland_display {
+            Some(display) => !display.is_empty(),
+            None => self.xdg_session_type.as_deref() == Some("wayland".as_ref()),
+        };
+        backend_allows && socket
+    }
+}
+
+/// What the app does with WebKitGTK's DMA-BUF renderer at start ([`dmabuf_renderer`]).
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DmabufRenderer {
+    /// Not NVIDIA's driver under Wayland: WebKitGTK decides as it always does.
+    Untouched,
+    /// NVIDIA's driver under Wayland, where WebKitGTK's DMA-BUF renderer closes the window with
+    /// a Wayland protocol error (`Error 71`): the app sets [`DMABUF_RENDERER_ENV`] to `1`.
+    Off,
+    /// NVIDIA's driver under Wayland, and the user has set [`DMABUF_RENDERER_ENV`] (to this
+    /// value): theirs stands.
+    UserSet(OsString),
+    /// NVIDIA's driver under Wayland, but the process was not known to run on one thread (how
+    /// many it ran, when that could be read): the environment is left as it is.
+    NotSingleThreaded(Option<usize>),
+}
+
+#[cfg(target_os = "linux")]
+impl DmabufRenderer {
+    /// One line in the log, for every case but [`Untouched`](Self::Untouched). Called once the
+    /// log has started, long after the decision.
+    pub fn log(&self) {
+        match self {
+            Self::Untouched => {}
+            Self::Off => tracing::info!(
+                "WebKitGTK's DMA-BUF renderer is off: the NVIDIA driver is loaded and the window \
+                 is on Wayland, where the renderer closes the app with a Wayland protocol error \
+                 (Error 71). The app set {DMABUF_RENDERER_ENV}=1 for itself; starting it with \
+                 {DMABUF_RENDERER_ENV}=0 keeps the renderer on"
+            ),
+            Self::UserSet(value) => tracing::info!(
+                "{DMABUF_RENDERER_ENV}={value:?} is set: the app leaves WebKitGTK's DMA-BUF \
+                 renderer as that says, although the NVIDIA driver is loaded under Wayland"
+            ),
+            Self::NotSingleThreaded(threads) => tracing::warn!(
+                "WebKitGTK's DMA-BUF renderer stays on although the NVIDIA driver is loaded \
+                 under Wayland: the process was not on one thread when the app could have \
+                 turned it off (threads: {threads:?}). If the window closes with a Wayland \
+                 protocol error (Error 71), start the app with {DMABUF_RENDERER_ENV}=1"
+            ),
+        }
+    }
+}
+
+/// The decision, on `facts` alone: off under Wayland with NVIDIA's driver loaded, unless the
+/// user set the variable or the process is not known to run on one thread.
+#[cfg(target_os = "linux")]
+pub fn dmabuf_renderer(facts: &GraphicsFacts) -> DmabufRenderer {
+    if !facts.nvidia_driver || !facts.is_wayland() {
+        return DmabufRenderer::Untouched;
+    }
+    if let Some(value) = &facts.dmabuf_renderer {
+        return DmabufRenderer::UserSet(value.clone());
+    }
+    if facts.threads != Some(1) {
+        return DmabufRenderer::NotSingleThreaded(facts.threads);
+    }
+    DmabufRenderer::Off
+}
+
+/// Turn WebKitGTK's DMA-BUF renderer off when [`dmabuf_renderer`] says so for this process,
+/// and say what was decided, for the log once it starts ([`DmabufRenderer::log`]).
+///
+/// The one place the app writes its environment. `run` calls it as its first statement, before
+/// the async runtime, the log, signals or Tauri start a thread; the decision itself writes
+/// nothing unless the process has exactly one thread, counted just before the write. So
+/// `set_var` runs single-threaded: no other thread can be reading the environment
+/// (`getenv`) while it changes.
+#[cfg(target_os = "linux")]
+pub fn turn_off_dmabuf_renderer_on_nvidia_wayland() -> DmabufRenderer {
+    let decision = dmabuf_renderer(&GraphicsFacts::from_process());
+    if decision == DmabufRenderer::Off {
+        std::env::set_var(DMABUF_RENDERER_ENV, "1");
+    }
+    decision
 }
 
 #[cfg(test)]
@@ -620,5 +773,186 @@ mod tests {
             .next()
             .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
             && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    }
+
+    /// The DMA-BUF renderer decision, on facts the test writes: never the process's own.
+    #[cfg(target_os = "linux")]
+    mod graphics {
+        use super::*;
+        use crate::runtime::logged;
+
+        /// NVIDIA's driver in a Wayland session, the variable unset, the process on one thread.
+        fn nvidia_wayland() -> GraphicsFacts {
+            GraphicsFacts {
+                wayland_display: Some("wayland-0".into()),
+                xdg_session_type: Some("wayland".into()),
+                gdk_backend: None,
+                nvidia_driver: true,
+                dmabuf_renderer: None,
+                threads: Some(1),
+            }
+        }
+
+        fn os(value: Option<&str>) -> Option<OsString> {
+            value.map(OsString::from)
+        }
+
+        #[test]
+        fn nvidia_s_driver_under_wayland_turns_the_renderer_off() {
+            assert_eq!(dmabuf_renderer(&nvidia_wayland()), DmabufRenderer::Off);
+        }
+
+        #[test]
+        fn without_nvidia_s_driver_or_without_wayland_nothing_changes() {
+            let no_driver = GraphicsFacts {
+                nvidia_driver: false,
+                ..nvidia_wayland()
+            };
+            assert_eq!(dmabuf_renderer(&no_driver), DmabufRenderer::Untouched);
+            let x11 = GraphicsFacts {
+                wayland_display: None,
+                xdg_session_type: Some("x11".into()),
+                ..nvidia_wayland()
+            };
+            assert_eq!(dmabuf_renderer(&x11), DmabufRenderer::Untouched);
+        }
+
+        /// `WAYLAND_DISPLAY`, `XDG_SESSION_TYPE`, `GDK_BACKEND`, and whether that is Wayland.
+        type Case = (
+            Option<&'static str>,
+            Option<&'static str>,
+            Option<&'static str>,
+            bool,
+        );
+
+        /// Wayland is the display GTK 3 opens: `GDK_BACKEND`'s first entry, `wayland` by default,
+        /// and libwayland's socket — `WAYLAND_DISPLAY`, or `wayland-0` when it is unset, which a
+        /// Wayland session (`XDG_SESSION_TYPE`) has.
+        #[test]
+        fn wayland_is_the_display_gtk_opens() {
+            #[rustfmt::skip]
+            let cases: &[Case] = &[
+                (Some("wayland-0"), Some("wayland"), None, true),
+                (Some("wayland-1"), None, None, true),
+                // A compositor nested in an X11 session: GTK opens the compositor.
+                (Some("wayland-1"), Some("x11"), None, true),
+                // Unset: libwayland connects to wayland-0, the session's own.
+                (None, Some("wayland"), None, true),
+                (None, Some("x11"), None, false),
+                (None, Some("tty"), None, false),
+                (None, None, None, false),
+                // Set but empty: libwayland finds no socket and GTK goes on to X11.
+                (Some(""), Some("wayland"), None, false),
+                (Some("wayland-0"), Some("wayland"), Some("x11"), false),
+                (Some("wayland-0"), Some("wayland"), Some("x11,wayland"), false),
+                (Some("wayland-0"), Some("wayland"), Some("broadway"), false),
+                (Some("wayland-0"), Some("wayland"), Some("wayland"), true),
+                (Some("wayland-0"), Some("wayland"), Some("wayland,x11"), true),
+                (Some("wayland-0"), Some("wayland"), Some("*"), true),
+                (None, Some("wayland"), Some("x11"), false),
+            ];
+            for &(display, session, backend, expected) in cases {
+                let facts = GraphicsFacts {
+                    wayland_display: os(display),
+                    xdg_session_type: os(session),
+                    gdk_backend: os(backend),
+                    ..nvidia_wayland()
+                };
+                assert_eq!(
+                    facts.is_wayland(),
+                    expected,
+                    "WAYLAND_DISPLAY={display:?} XDG_SESSION_TYPE={session:?} GDK_BACKEND={backend:?}"
+                );
+                let decision = dmabuf_renderer(&facts);
+                let off = decision == DmabufRenderer::Off;
+                assert_eq!(off, expected, "{facts:?}: {decision:?}");
+            }
+        }
+
+        /// WebKitGTK reads any value but `0` as off, an empty one too, and `0` as on: whatever
+        /// the user set is theirs.
+        #[test]
+        fn a_value_the_user_set_stands_whatever_it_is() {
+            for value in ["1", "0", "", "yes"] {
+                let facts = GraphicsFacts {
+                    dmabuf_renderer: Some(value.into()),
+                    ..nvidia_wayland()
+                };
+                assert_eq!(
+                    dmabuf_renderer(&facts),
+                    DmabufRenderer::UserSet(value.into()),
+                    "{value:?}"
+                );
+            }
+        }
+
+        /// `set_var` with another thread running can race a `getenv` there: only a process
+        /// known to be on one thread is written to.
+        #[test]
+        fn with_other_threads_or_an_unknown_count_the_environment_is_not_written() {
+            for threads in [Some(2), Some(9), Some(0), None] {
+                let facts = GraphicsFacts {
+                    threads,
+                    ..nvidia_wayland()
+                };
+                assert_eq!(
+                    dmabuf_renderer(&facts),
+                    DmabufRenderer::NotSingleThreaded(threads),
+                    "{threads:?}"
+                );
+            }
+        }
+
+        /// A test runs beside libtest's main thread, so the real call refuses to write, whatever
+        /// this machine's display and driver: the process environment stays as it was.
+        #[test]
+        fn the_real_call_never_writes_from_a_test() {
+            let facts = GraphicsFacts::from_process();
+            assert!(
+                facts.threads.is_some_and(|n| n > 1),
+                "the thread count: {facts:?}"
+            );
+            let before = std::env::var_os(DMABUF_RENDERER_ENV);
+            let decision = turn_off_dmabuf_renderer_on_nvidia_wayland();
+            assert_ne!(decision, DmabufRenderer::Off);
+            assert_eq!(std::env::var_os(DMABUF_RENDERER_ENV), before);
+        }
+
+        #[test]
+        fn the_variable_is_webkit_s_own() {
+            assert_eq!(DMABUF_RENDERER_ENV, "WEBKIT_DISABLE_DMABUF_RENDERER");
+        }
+
+        /// One line says what the app did, why, and how to keep the renderer on.
+        #[test]
+        fn the_log_says_what_the_app_did_why_and_how_to_keep_the_renderer() {
+            let off = logged(|| DmabufRenderer::Off.log());
+            assert_eq!(off.lines().count(), 1, "{off}");
+            assert!(off.contains(" INFO "), "{off}");
+            for needle in [
+                "NVIDIA",
+                "Wayland",
+                "Error 71",
+                "WEBKIT_DISABLE_DMABUF_RENDERER=1",
+                "WEBKIT_DISABLE_DMABUF_RENDERER=0 keeps",
+            ] {
+                assert!(off.contains(needle), "{needle:?} in {off}");
+            }
+            assert_eq!(logged(|| DmabufRenderer::Untouched.log()), "");
+            let user = logged(|| DmabufRenderer::UserSet("0".into()).log());
+            assert_eq!(user.lines().count(), 1, "{user}");
+            assert!(user.contains(" INFO "), "{user}");
+            assert!(
+                user.contains("WEBKIT_DISABLE_DMABUF_RENDERER=\"0\""),
+                "{user}"
+            );
+            let threads = logged(|| DmabufRenderer::NotSingleThreaded(Some(3)).log());
+            assert_eq!(threads.lines().count(), 1, "{threads}");
+            assert!(threads.contains(" WARN "), "{threads}");
+            assert!(
+                threads.contains("WEBKIT_DISABLE_DMABUF_RENDERER=1"),
+                "{threads}"
+            );
+        }
     }
 }
