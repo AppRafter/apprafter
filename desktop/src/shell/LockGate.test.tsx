@@ -197,7 +197,7 @@ describe('LockGate', () => {
       </QueryClientProvider>,
     );
     await screen.findByRole('heading', { name: 'AppRafter is locked' });
-    await changed(lockState({ locked: false, sinceMs: 1 }));
+    await changed(lockState({ locked: false, sinceMs: 1, seq: 1 }));
     await screen.findByText('the shell');
     await act(settle);
     expect(calls.filter((c) => c === 'op_subscribe')).toHaveLength(1);

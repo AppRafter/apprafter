@@ -77,12 +77,16 @@ describe('installMockIpc', () => {
     installMockIpc();
     const heard: LockState[] = [];
     const unlisten = await onLockChanged((state) => heard.push(state));
+    expect((await api.lockStatus()).seq).toBe(0);
     const unlocked = await api.unlock();
-    expect(unlocked).toMatchObject({ locked: false, reason: null });
+    expect(unlocked).toMatchObject({ locked: false, reason: null, seq: 1 });
     const locked = await api.lockNow();
-    expect(locked).toMatchObject({ locked: true, reason: 'manual' });
+    expect(locked).toMatchObject({ locked: true, reason: 'manual', seq: 2 });
     await settle();
-    expect(heard.map((s) => s.locked)).toEqual([false, true]);
+    expect(heard.map((s) => [s.locked, s.seq])).toEqual([
+      [false, 1],
+      [true, 2],
+    ]);
     unlisten();
   });
 

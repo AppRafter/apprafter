@@ -17,8 +17,12 @@
 //!
 //! Every transition between locked and unlocked calls the hook exactly once, with the new
 //! state, under the machine's lock (so hooks run in transition order). The state at
-//! construction is not a transition: nothing is listening yet. The idle time is measured with
-//! [`elapsed_ms`](crate::ops::elapsed_ms): a suspend counts, a wall clock stepped back does not.
+//! construction is not a transition: nothing is listening yet. Each transition numbers the
+//! state it enters, under that same lock ([`LockState::seq`], 0 at construction): every state
+//! the hook is told of and every [`LockMachine::state`] carries the number of the transition it
+//! follows, which is the order the page keeps — its time (`since_ms`) is the wall clock's, which
+//! can step back. The idle time is measured with [`elapsed_ms`](crate::ops::elapsed_ms): a
+//! suspend counts, a wall clock stepped back does not.
 //!
 //! # What waits for what
 //!
@@ -76,6 +80,8 @@ struct Inner {
     reason: Option<LockReason>,
     /// When the current state began, on the wall clock: what the webview shows.
     since_ms: u64,
+    /// The transitions so far: the current state's [`LockState::seq`].
+    seq: u64,
     /// The last activity (or unlock): the idle time runs from it.
     last_activity: Stamp,
     /// The unlock prompt while it is open; a second unlock is `AuthBusy` meanwhile.
@@ -112,6 +118,7 @@ impl LockMachine {
                 settings,
                 reason,
                 since_ms: now.wall_ms,
+                seq: 0,
                 last_activity: now,
                 prompt: None,
                 closing: false,
@@ -166,13 +173,15 @@ impl LockMachine {
     /// the lock not in effect it does nothing: there would be no way to unlock.
     pub fn lock(&self, reason: LockReason) {
         let info = self.auth.info();
-        let now = self.clock.now_ms();
         let close = {
             let mut inner = self.lock_inner();
             if inner.reason.is_some() {
                 close_open_prompt(&mut inner)
             } else {
                 if in_effect(&inner.settings, &info) {
+                    // Read under the lock, as every transition reads it: a time read before
+                    // could be older than a transition that took the lock first.
+                    let now = self.clock.now_ms();
                     self.enter(&mut inner, &info, Some(reason), now);
                 }
                 None
@@ -285,11 +294,13 @@ impl LockMachine {
         Ok(())
     }
 
-    /// Move to `reason` (`None` = unlocked) and tell the hook; a panic in the hook is logged,
-    /// and the transition stands.
+    /// Move to `reason` (`None` = unlocked), numbered as the next transition, and tell the
+    /// hook; a panic in the hook is logged, and the transition stands. The one place a state
+    /// changes, always under the machine's lock.
     fn enter(&self, inner: &mut Inner, info: &AuthInfo, reason: Option<LockReason>, now: u64) {
         inner.reason = reason;
         inner.since_ms = now;
+        inner.seq += 1;
         self.locked.store(reason.is_some(), Ordering::SeqCst);
         let state = state_of(inner, info);
         if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| (self.hook)(&state))) {
@@ -337,6 +348,7 @@ fn state_of(inner: &Inner, info: &AuthInfo) -> LockState {
         auto_lock_minutes: in_effect(&inner.settings, info)
             .then(|| inner.settings.auto_lock.minutes())
             .flatten(),
+        seq: inner.seq,
     }
 }
 
@@ -414,21 +426,30 @@ mod tests {
         }
     }
 
-    fn locked(reason: LockReason, since_ms: u64, auto_lock_minutes: Option<u32>) -> LockState {
+    /// Locked for `reason`, by transition `seq` (0: as constructed).
+    fn locked(
+        reason: LockReason,
+        since_ms: u64,
+        auto_lock_minutes: Option<u32>,
+        seq: u64,
+    ) -> LockState {
         LockState {
             locked: true,
             reason: Some(reason),
             since_ms,
             auto_lock_minutes,
+            seq,
         }
     }
 
-    fn unlocked(since_ms: u64, auto_lock_minutes: Option<u32>) -> LockState {
+    /// Unlocked, by transition `seq` (0: as constructed).
+    fn unlocked(since_ms: u64, auto_lock_minutes: Option<u32>, seq: u64) -> LockState {
         LockState {
             locked: false,
             reason: None,
             since_ms,
             auto_lock_minutes,
+            seq,
         }
     }
 
@@ -542,7 +563,10 @@ mod tests {
     #[test]
     fn with_an_authenticator_the_default_settings_start_locked() {
         let r = rig(Settings::default(), fake());
-        assert_eq!(r.machine.state(), locked(LockReason::Startup, T0, Some(10)));
+        assert_eq!(
+            r.machine.state(),
+            locked(LockReason::Startup, T0, Some(10), 0)
+        );
         assert!(
             r.hooked.calls().is_empty(),
             "the state at start is not a transition"
@@ -552,7 +576,7 @@ mod tests {
     #[test]
     fn without_lock_on_start_or_with_the_lock_off_it_starts_unlocked() {
         let r = rig(unlocked_at_start(), fake());
-        assert_eq!(r.machine.state(), unlocked(T0, Some(10)));
+        assert_eq!(r.machine.state(), unlocked(T0, Some(10), 0));
         let off = Settings {
             lock_enabled: false,
             ..Settings::default()
@@ -560,7 +584,7 @@ mod tests {
         let r = rig(off, fake());
         assert_eq!(
             r.machine.state(),
-            unlocked(T0, None),
+            unlocked(T0, None, 0),
             "no idle time when off"
         );
     }
@@ -568,12 +592,12 @@ mod tests {
     #[test]
     fn without_an_authenticator_the_lock_is_off_even_when_the_settings_say_on() {
         let r = rig(Settings::default(), Arc::new(NoAuthenticator));
-        assert_eq!(r.machine.state(), unlocked(T0, None));
+        assert_eq!(r.machine.state(), unlocked(T0, None, 0));
         // Nothing locks it: there would be no way back.
         r.machine.lock(LockReason::Manual);
         r.clock.set(T0 + 1000 * MIN);
         r.machine.tick();
-        assert_eq!(r.machine.state(), unlocked(T0, None));
+        assert_eq!(r.machine.state(), unlocked(T0, None, 0));
         assert!(r.hooked.calls().is_empty());
     }
 
@@ -625,7 +649,7 @@ mod tests {
             ..Settings::default()
         };
         r.machine.set_settings(light, |_| Ok(())).unwrap();
-        assert_eq!(r.machine.state(), unlocked(T0, None));
+        assert_eq!(r.machine.state(), unlocked(T0, None, 0));
     }
 
     // 4. Idle.
@@ -638,7 +662,7 @@ mod tests {
         assert!(!r.machine.state().locked);
         r.clock.set(T0 + 10 * MIN);
         r.machine.tick();
-        let idle = locked(LockReason::Idle, T0 + 10 * MIN, Some(10));
+        let idle = locked(LockReason::Idle, T0 + 10 * MIN, Some(10), 1);
         assert_eq!(r.machine.state(), idle);
         assert_eq!(r.hooked.calls(), vec![idle.clone()]);
         // While locked, ticks do nothing.
@@ -662,7 +686,7 @@ mod tests {
         r.machine.tick();
         assert_eq!(
             r.machine.state(),
-            locked(LockReason::Idle, T0 + 19 * MIN, Some(10))
+            locked(LockReason::Idle, T0 + 19 * MIN, Some(10), 1)
         );
     }
 
@@ -710,7 +734,7 @@ mod tests {
         r.machine.tick();
         assert_eq!(
             r.machine.state(),
-            locked(LockReason::Idle, T0 - DAY + 5 * MIN, Some(10)),
+            locked(LockReason::Idle, T0 - DAY + 5 * MIN, Some(10), 1),
             "ten minutes passed, whatever the wall clock says"
         );
     }
@@ -723,7 +747,7 @@ mod tests {
         r.machine.tick();
         assert_eq!(
             r.machine.state(),
-            locked(LockReason::Idle, T0 + 11 * MIN, Some(10))
+            locked(LockReason::Idle, T0 + 11 * MIN, Some(10), 1)
         );
     }
 
@@ -734,7 +758,7 @@ mod tests {
         r.machine.unlock().unwrap();
         r.clock.set(T0 + 30 * MIN + 1);
         r.machine.tick();
-        assert_eq!(r.machine.state(), unlocked(T0 + 30 * MIN, Some(10)));
+        assert_eq!(r.machine.state(), unlocked(T0 + 30 * MIN, Some(10), 1));
     }
 
     // 5. Lock and unlock.
@@ -747,11 +771,11 @@ mod tests {
         r.machine.lock(LockReason::Manual);
         assert_eq!(
             r.machine.state(),
-            locked(LockReason::Manual, T0 + MIN, Some(10))
+            locked(LockReason::Manual, T0 + MIN, Some(10), 1)
         );
         r.clock.set(T0 + 2 * MIN);
         r.machine.unlock().unwrap();
-        assert_eq!(r.machine.state(), unlocked(T0 + 2 * MIN, Some(10)));
+        assert_eq!(r.machine.state(), unlocked(T0 + 2 * MIN, Some(10), 2));
         assert_eq!(auth.asked(), vec![AuthPurpose::Unlock]);
     }
 
@@ -761,7 +785,10 @@ mod tests {
         r.clock.set(T0 + MIN);
         r.machine.lock(LockReason::Manual);
         r.machine.lock(LockReason::OsSession);
-        assert_eq!(r.machine.state(), locked(LockReason::Startup, T0, Some(10)));
+        assert_eq!(
+            r.machine.state(),
+            locked(LockReason::Startup, T0, Some(10), 0)
+        );
         assert!(r.hooked.calls().is_empty(), "no transition happened");
     }
 
@@ -812,7 +839,7 @@ mod tests {
             );
             assert_eq!(
                 r.machine.state(),
-                locked(LockReason::Startup, T0, Some(10)),
+                locked(LockReason::Startup, T0, Some(10), 0),
                 "{outcome:?}"
             );
             assert!(r.hooked.calls().is_empty(), "{outcome:?}");
@@ -865,7 +892,10 @@ mod tests {
             matches!(result, Err(DesktopError::AuthCancelled)),
             "{result:?}"
         );
-        assert_eq!(r.machine.state(), locked(LockReason::Startup, T0, Some(10)));
+        assert_eq!(
+            r.machine.state(),
+            locked(LockReason::Startup, T0, Some(10), 0)
+        );
         assert!(r.hooked.calls().is_empty());
         // Closed is closed: the next unlock opens a new prompt.
         let again = unlock_in_background(&r.machine);
@@ -902,7 +932,10 @@ mod tests {
             matches!(result, Err(DesktopError::AuthCancelled)),
             "{result:?}"
         );
-        assert_eq!(r.machine.state(), locked(LockReason::Startup, T0, Some(10)));
+        assert_eq!(
+            r.machine.state(),
+            locked(LockReason::Startup, T0, Some(10), 0)
+        );
         assert!(r.hooked.calls().is_empty());
         for token in held {
             token.cancel();
@@ -925,7 +958,10 @@ mod tests {
             matches!(result, Err(DesktopError::AuthCancelled)),
             "{result:?}"
         );
-        assert_eq!(r.machine.state(), locked(LockReason::Startup, T0, Some(10)));
+        assert_eq!(
+            r.machine.state(),
+            locked(LockReason::Startup, T0, Some(10), 0)
+        );
         assert!(r.hooked.calls().is_empty());
     }
 
@@ -952,7 +988,10 @@ mod tests {
             matches!(result, Err(DesktopError::AuthCancelled)),
             "{result:?}"
         );
-        assert_eq!(r.machine.state(), locked(LockReason::Startup, T0, Some(10)));
+        assert_eq!(
+            r.machine.state(),
+            locked(LockReason::Startup, T0, Some(10), 0)
+        );
         assert!(r.hooked.calls().is_empty());
         for token in held {
             token.cancel();
@@ -967,7 +1006,10 @@ mod tests {
         let result = r.machine.unlock();
         assert!(matches!(result, Err(DesktopError::Closing)), "{result:?}");
         assert!(auth.asked().is_empty(), "no prompt opened during the quit");
-        assert_eq!(r.machine.state(), locked(LockReason::Startup, T0, Some(10)));
+        assert_eq!(
+            r.machine.state(),
+            locked(LockReason::Startup, T0, Some(10), 0)
+        );
         // Sticky: a later try is refused the same way, and an unlocked app asks nothing.
         assert!(matches!(r.machine.unlock(), Err(DesktopError::Closing)));
         let r = rig(unlocked_at_start(), auth.clone());
@@ -1082,12 +1124,65 @@ mod tests {
         assert_eq!(
             r.hooked.calls(),
             vec![
-                locked(LockReason::Manual, T0 + MIN, Some(10)),
-                unlocked(T0 + 2 * MIN, Some(10)),
-                locked(LockReason::Idle, T0 + 12 * MIN, Some(10)),
-                unlocked(T0 + 14 * MIN, Some(10)),
+                locked(LockReason::Manual, T0 + MIN, Some(10), 1),
+                unlocked(T0 + 2 * MIN, Some(10), 2),
+                locked(LockReason::Idle, T0 + 12 * MIN, Some(10), 3),
+                unlocked(T0 + 14 * MIN, Some(10), 4),
             ]
         );
+    }
+
+    #[test]
+    fn transitions_on_two_threads_are_numbered_in_the_order_they_happen() {
+        // An OS session lock and the owner's unlock land on two threads, here all within one
+        // millisecond (the clock stands still): every state the hook is told of, and every
+        // state read back, carries the number of the transition it follows, one more each time.
+        const ROUNDS: usize = 200;
+        let r = rig(unlocked_at_start(), fake());
+        let locking = {
+            let machine = r.machine.clone();
+            thread::spawn(move || {
+                (0..ROUNDS)
+                    .map(|_| {
+                        machine.lock(LockReason::OsSession);
+                        machine.state()
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        let unlocking = {
+            let machine = r.machine.clone();
+            thread::spawn(move || {
+                (0..ROUNDS)
+                    .map(|_| {
+                        // A lock that lands while the prompt is open closes it: AuthCancelled.
+                        let _ = machine.unlock();
+                        machine.state()
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        let mut read = locking.join().unwrap();
+        read.extend(unlocking.join().unwrap());
+        let hooked = r.hooked.calls();
+        assert!(hooked.len() > 1, "{hooked:?}");
+        for (i, state) in hooked.iter().enumerate() {
+            assert_eq!(state.seq, i as u64 + 1, "{hooked:?}");
+            assert_eq!(state.locked, i % 2 == 0, "locks and unlocks alternate");
+            assert_eq!(
+                state.since_ms, T0,
+                "one millisecond: only the number orders them"
+            );
+        }
+        // A state read back is the one its number entered: the two never come apart.
+        for state in read {
+            let entered = match state.seq {
+                0 => unlocked(T0, Some(10), 0),
+                seq => hooked[usize::try_from(seq).unwrap() - 1].clone(),
+            };
+            assert_eq!(state, entered);
+        }
+        assert_eq!(r.machine.state().seq, hooked.len() as u64);
     }
 
     #[test]
@@ -1113,7 +1208,7 @@ mod tests {
         machine.tick();
         assert_eq!(
             machine.state(),
-            locked(LockReason::Idle, T0 + 10 * MIN, Some(10))
+            locked(LockReason::Idle, T0 + 10 * MIN, Some(10), 1)
         );
         assert!(matches!(
             machine.guard("op_list"),
@@ -1125,7 +1220,7 @@ mod tests {
         machine.tick();
         assert_eq!(
             machine.state(),
-            locked(LockReason::Idle, T0 + 21 * MIN, Some(10))
+            locked(LockReason::Idle, T0 + 21 * MIN, Some(10), 3)
         );
         assert_eq!(calls.load(SeqCst), 3, "the hook heard every transition");
     }

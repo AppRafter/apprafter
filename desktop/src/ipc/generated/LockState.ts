@@ -17,4 +17,11 @@ sinceMs: number,
 /**
  * The idle time before an automatic lock; `None` when the lock is off or set to never.
  */
-autoLockMinutes: number | null, };
+autoLockMinutes: number | null, 
+/**
+ * The transition this state follows: 0 at start, one more on every lock and every unlock.
+ * The page keeps the state with the highest `seq` it has received, never orders by
+ * `since_ms`: that is wall-clock time, which can step back, and two transitions can share a
+ * millisecond. Two states with one `seq` describe the same transition.
+ */
+seq: number, };

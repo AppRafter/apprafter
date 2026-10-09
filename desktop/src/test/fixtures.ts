@@ -57,6 +57,7 @@ export function lockState(more: Partial<LockState> = {}): LockState {
     reason: locked ? 'startup' : null,
     sinceMs: 0,
     autoLockMinutes: 10,
+    seq: 0,
     ...more,
   };
 }

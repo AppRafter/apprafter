@@ -97,15 +97,19 @@ export function installMockIpc(options: MockOptions = {}): void {
 
   const autoLockMinutes = () =>
     settings.lockEnabled && settings.autoLock !== 'never' ? Number(settings.autoLock) : null;
+  // As Rust numbers them: 0 at start, one more on every lock and unlock.
+  let seq = 0;
   const stateOf = (reason: LockReason | null): LockState => ({
     locked: reason !== null,
     reason,
     sinceMs: Date.now(),
     autoLockMinutes: autoLockMinutes(),
+    seq,
   });
   let lock = stateOf('startup');
 
   const transition = async (reason: LockReason | null) => {
+    seq += 1;
     lock = stateOf(reason);
     await emit(LOCK_CHANGED, lock);
     return lock;

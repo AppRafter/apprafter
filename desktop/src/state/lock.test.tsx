@@ -3,7 +3,7 @@
 // listener is in place before `lock_status` is asked (the listener that stays, under
 // StrictMode's double mount too), every registration is followed by a read, and wherever the
 // ['lock'] entry is written — the read, an event, the answer of lock_now or unlock — a state
-// older than the one held is dropped.
+// of an earlier transition (`seq`) than the one held is dropped, whatever its time says.
 import { afterEach, beforeEach, expect, test } from 'bun:test';
 import { type QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { clearMocks, mockIPC } from '@tauri-apps/api/mocks';
@@ -120,63 +120,106 @@ test('the listener is registered before lock_status is asked', async () => {
 test('an event during the startup read wins over an older answer', async () => {
   const { result } = mount();
   await act(settle);
-  await deliver(lockState({ locked: false, sinceMs: 2_000 }));
-  await answerStatus(lockState({ locked: true, reason: 'startup', sinceMs: 1_000 }));
-  expect(result.current.state.data).toEqual(lockState({ locked: false, sinceMs: 2_000 }));
+  await deliver(lockState({ locked: false, sinceMs: 2_000, seq: 2 }));
+  await answerStatus(lockState({ locked: true, reason: 'startup', sinceMs: 1_000, seq: 1 }));
+  expect(result.current.state.data).toEqual(lockState({ locked: false, sinceMs: 2_000, seq: 2 }));
 });
 
 test('an answer newer than an earlier event wins', async () => {
   const { result } = mount();
   await act(settle);
-  await deliver(lockState({ locked: false, sinceMs: 1_000 }));
-  await answerStatus(lockState({ locked: true, reason: 'idle', sinceMs: 3_000 }));
+  await deliver(lockState({ locked: false, sinceMs: 1_000, seq: 1 }));
+  await answerStatus(lockState({ locked: true, reason: 'idle', sinceMs: 3_000, seq: 3 }));
   expect(result.current.state.data).toEqual(
-    lockState({ locked: true, reason: 'idle', sinceMs: 3_000 }),
+    lockState({ locked: true, reason: 'idle', sinceMs: 3_000, seq: 3 }),
   );
 });
 
 test('an event older than the state held is dropped', async () => {
   const { result } = mount();
   await act(settle);
-  await answerStatus(lockState({ locked: true, reason: 'idle', sinceMs: 3_000 }));
-  await deliver(lockState({ locked: false, sinceMs: 2_000 }));
+  await answerStatus(lockState({ locked: true, reason: 'idle', sinceMs: 3_000, seq: 3 }));
+  await deliver(lockState({ locked: false, sinceMs: 2_000, seq: 2 }));
   expect(result.current.state.data?.sinceMs).toBe(3_000);
   expect(result.current.state.data?.locked).toBe(true);
   // A newer one is taken.
-  await deliver(lockState({ locked: false, sinceMs: 4_000 }));
+  await deliver(lockState({ locked: false, sinceMs: 4_000, seq: 4 }));
   expect(result.current.state.data?.locked).toBe(false);
 });
 
 test('an unlock answer that arrives after a newer lock is dropped', async () => {
   const { result } = mount();
   await act(settle);
-  await answerStatus(lockState({ locked: true, reason: 'startup', sinceMs: 1_000 }));
+  await answerStatus(lockState({ locked: true, reason: 'startup', sinceMs: 1_000, seq: 1 }));
   let unlocking: Promise<void> | undefined;
   act(() => {
     unlocking = result.current.actions.unlock();
   });
   // The unlock happens (its event is late), then the idle timer locks again: that event
   // overtakes the unlock's answer.
-  await deliver(lockState({ locked: true, reason: 'idle', sinceMs: 3_000 }));
+  await deliver(lockState({ locked: true, reason: 'idle', sinceMs: 3_000, seq: 3 }));
   await act(async () => {
-    answers.unlock?.resolve(lockState({ locked: false, sinceMs: 2_000 }));
+    answers.unlock?.resolve(lockState({ locked: false, sinceMs: 2_000, seq: 2 }));
     await unlocking;
     await settle();
   });
   expect(result.current.state.data).toEqual(
-    lockState({ locked: true, reason: 'idle', sinceMs: 3_000 }),
+    lockState({ locked: true, reason: 'idle', sinceMs: 3_000, seq: 3 }),
   );
+});
+
+test('a lock whose time is earlier than the state held still locks: the clock stepped back', async () => {
+  const { result } = mount();
+  await act(settle);
+  await answerStatus(lockState({ locked: false, sinceMs: 5_000, seq: 1 }));
+  // The wall clock went back past the idle time, and the idle lock came after the unlock.
+  const idle = lockState({ locked: true, reason: 'idle', sinceMs: 1_000, seq: 2 });
+  await deliver(idle);
+  expect(result.current.state.data).toEqual(idle);
+  // So does Lock now, then: its answer is taken too.
+  let locking: Promise<void> | undefined;
+  act(() => {
+    locking = result.current.actions.lock();
+  });
+  await act(async () => {
+    answers.lock_now?.resolve(idle);
+    await locking;
+    await settle();
+  });
+  expect(result.current.state.data).toEqual(idle);
+});
+
+test('an unlock and a lock within one millisecond end locked, whatever arrives last', async () => {
+  const { result } = mount();
+  await act(settle);
+  await answerStatus(lockState({ locked: true, reason: 'startup', sinceMs: 1_000, seq: 0 }));
+  let unlocking: Promise<void> | undefined;
+  act(() => {
+    unlocking = result.current.actions.unlock();
+  });
+  // The unlock, then an OS session lock from another thread, in the same millisecond; the
+  // unlock's answer comes last.
+  const unlocked = lockState({ locked: false, sinceMs: 7_000, seq: 1 });
+  const osSession = lockState({ locked: true, reason: 'os_session', sinceMs: 7_000, seq: 2 });
+  await deliver(unlocked);
+  await deliver(osSession);
+  await act(async () => {
+    answers.unlock?.resolve(unlocked);
+    await unlocking;
+    await settle();
+  });
+  expect(result.current.state.data).toEqual(osSession);
 });
 
 test('a lock answer is taken over an older state, and its own event changes nothing', async () => {
   const { result } = mount();
   await act(settle);
-  await answerStatus(lockState({ locked: false, sinceMs: 1_000 }));
+  await answerStatus(lockState({ locked: false, sinceMs: 1_000, seq: 1 }));
   let locking: Promise<void> | undefined;
   act(() => {
     locking = result.current.actions.lock();
   });
-  const manual = lockState({ locked: true, reason: 'manual', sinceMs: 2_000 });
+  const manual = lockState({ locked: true, reason: 'manual', sinceMs: 2_000, seq: 2 });
   await act(async () => {
     answers.lock_now?.resolve(manual);
     await locking;
@@ -209,12 +252,12 @@ test('a listener registered again is followed by a read: what changed meanwhile 
   const client = createQueryClient();
   const first = mount(client);
   await act(settle);
-  await answerStatus(lockState({ locked: false, sinceMs: 1_000 }));
+  await answerStatus(lockState({ locked: false, sinceMs: 1_000, seq: 1 }));
   first.unmount();
   // While nothing listens, the app locks.
   const { result } = mount(client);
   await act(settle);
   expect(order.filter((cmd) => cmd === 'lock_status')).toHaveLength(2);
-  await answerStatus(lockState({ locked: true, reason: 'idle', sinceMs: 2_000 }));
+  await answerStatus(lockState({ locked: true, reason: 'idle', sinceMs: 2_000, seq: 2 }));
   expect(result.current.state.data?.locked).toBe(true);
 });

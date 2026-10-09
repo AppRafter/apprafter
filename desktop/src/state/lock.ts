@@ -2,10 +2,12 @@
 // The lock as the page knows it. Rust is authoritative: the ['lock'] query holds its LockState,
 // fed by lock_status, by every `lock-changed` event, and by the answers of lock_now and unlock.
 //
-// Never back to an older state: wherever the entry is written, a state that began (`sinceMs`)
-// before the one held is dropped; on a tie — the same state seen twice, or a change within it
-// such as its auto-lock minutes — the one arriving is taken. So an answer and its event land in
-// either order, and an unlock's answer that a later lock overtook changes nothing.
+// Never back to an older state: wherever the entry is written, a state whose transition (`seq`,
+// which Rust numbers under the lock machine's own lock) came before the one held is dropped; on a
+// tie — the same transition seen twice, or a change within it such as its auto-lock minutes — the
+// one arriving is taken. So an answer and its event land in either order, and an unlock's answer
+// that a later lock overtook changes nothing. Never by `sinceMs`: that is the wall clock's, which
+// can step back, and two transitions can share a millisecond.
 //
 // Nothing missed: lock_status is asked only once the `lock-changed` listener is in place, and
 // every registration is followed by a read — the first one releases the query's own read, any
@@ -31,9 +33,9 @@ export const ACTIVITY_INTERVAL_MS = 30_000;
 /** What the lock screen itself reads; a lock removes every other query (spec §4.3). */
 const KEPT_WHILE_LOCKED: ReadonlySet<unknown> = new Set(['lock', 'settings', 'app-info']);
 
-/** `incoming`, unless it began before `held`. */
+/** `incoming`, unless `held` follows a later transition. */
 function newer(held: LockState | undefined, incoming: LockState): LockState {
-  return held !== undefined && incoming.sinceMs < held.sinceMs ? held : incoming;
+  return held !== undefined && incoming.seq < held.seq ? held : incoming;
 }
 
 /** Writes `state` to the entry, unless the entry holds a newer one. */

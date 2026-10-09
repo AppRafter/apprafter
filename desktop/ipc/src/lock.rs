@@ -33,6 +33,11 @@ pub struct LockState {
     pub since_ms: u64,
     /// The idle time before an automatic lock; `None` when the lock is off or set to never.
     pub auto_lock_minutes: Option<u32>,
+    /// The transition this state follows: 0 at start, one more on every lock and every unlock.
+    /// The page keeps the state with the highest `seq` it has received, never orders by
+    /// `since_ms`: that is wall-clock time, which can step back, and two transitions can share a
+    /// millisecond. Two states with one `seq` describe the same transition.
+    pub seq: u64,
 }
 
 #[cfg(test)]
@@ -46,10 +51,11 @@ mod tests {
             reason: Some(LockReason::Idle),
             since_ms: 12,
             auto_lock_minutes: Some(10),
+            seq: 3,
         };
         assert_eq!(
             serde_json::to_string(&state).unwrap(),
-            r#"{"locked":true,"reason":"idle","sinceMs":12,"autoLockMinutes":10}"#
+            r#"{"locked":true,"reason":"idle","sinceMs":12,"autoLockMinutes":10,"seq":3}"#
         );
     }
 
@@ -60,10 +66,11 @@ mod tests {
             reason: None,
             since_ms: 0,
             auto_lock_minutes: None,
+            seq: 0,
         };
         assert_eq!(
             serde_json::to_string(&state).unwrap(),
-            r#"{"locked":false,"reason":null,"sinceMs":0,"autoLockMinutes":null}"#
+            r#"{"locked":false,"reason":null,"sinceMs":0,"autoLockMinutes":null,"seq":0}"#
         );
     }
 
