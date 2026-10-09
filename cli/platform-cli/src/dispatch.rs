@@ -24,6 +24,15 @@ pub(crate) fn dispatch(args: Cli) -> miette::Result<()> {
             TargetCommand::Use { name } => commands::target::use_target(&name),
             TargetCommand::Rename { from, to } => commands::target::rename(&from, &to),
             TargetCommand::Remove { name, yes } => commands::target::remove(&name, yes),
+            TargetCommand::Machine {
+                target,
+                server_type,
+                no_ping,
+            } => commands::target_machine::run_machine(commands::target_machine::MachineArgs {
+                target,
+                server_type,
+                no_ping,
+            }),
             // `cert`, `domain`, `firewall` and `ip`.
             other => commands::target::run(other),
         },

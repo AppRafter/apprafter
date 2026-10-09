@@ -55,6 +55,26 @@ pub(crate) fn rename(e: CoreError) -> miette::Report {
     }
 }
 
+/// `target machine`'s refusals as today: the provisioned refusal with its rebuild recipe, and
+/// `resolve_hetzner_token`'s no-token text; then the shared ones; anything else through the
+/// core renderer.
+pub(crate) fn machine(e: CoreError) -> miette::Report {
+    let text = match &e {
+        CoreError::TargetProvisioned { name, .. } => Some(
+            crate::commands::target_machine::provisioned_refusal_message(name),
+        ),
+        CoreError::TokenNotStored { name } => Some(format!(
+            "target `{name}` has no Hetzner Cloud token stored. Run `apprafter target add {name} --renew --token <X>` to add one, or pass `--token`/`{}` for this invocation.",
+            cli_core::HCLOUD_TOKEN_ENV
+        )),
+        other => common(other, None),
+    };
+    match text {
+        Some(t) => other(t),
+        None => report(e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -87,6 +107,35 @@ mod tests {
         assert_eq!(
             r.to_string(),
             "target name `bad_name` is invalid — allowed: alphanumeric + `-`"
+        );
+        assert_eq!(
+            r.code().map(|c| c.to_string()).as_deref(),
+            Some("apprafter::cli::other")
+        );
+    }
+
+    #[test]
+    fn machine_refusals_render_todays_text() {
+        let r = machine(CoreError::TargetProvisioned {
+            name: "prod".into(),
+            server_id: 1,
+            server_name: "p".into(),
+        });
+        assert_eq!(
+            r.to_string(),
+            crate::commands::target_machine::provisioned_refusal_message("prod")
+        );
+        assert!(r
+            .to_string()
+            .starts_with("`prod` already runs a provisioned cluster"));
+        let r = machine(CoreError::TokenNotStored {
+            name: "prod".into(),
+        });
+        assert_eq!(
+            r.to_string(),
+            "target `prod` has no Hetzner Cloud token stored. Run `apprafter target add prod \
+             --renew --token <X>` to add one, or pass `--token`/`HCLOUD_TOKEN` for this \
+             invocation."
         );
         assert_eq!(
             r.code().map(|c| c.to_string()).as_deref(),

@@ -99,23 +99,12 @@ pub fn run(action: TargetCommand) -> miette::Result<()> {
             crate::commands::target_firewall::run(action).map_err(miette::Report::new)
         }
         TargetCommand::Ip => run_ip(),
-        TargetCommand::Machine {
-            target,
-            server_type,
-            no_ping,
-        } => crate::commands::target_machine::run_machine(
-            crate::commands::target_machine::MachineArgs {
-                target,
-                server_type,
-                no_ping,
-            },
-        )
-        .map_err(miette::Report::new),
         TargetCommand::List
         | TargetCommand::Show { .. }
         | TargetCommand::Use { .. }
         | TargetCommand::Rename { .. }
-        | TargetCommand::Remove { .. } => {
+        | TargetCommand::Remove { .. }
+        | TargetCommand::Machine { .. } => {
             unreachable!("`dispatch` runs this sub-command on the core")
         }
     }
@@ -289,7 +278,7 @@ pub(crate) fn sku_not_validated_line(sku: &str) -> String {
 /// types are per-location on Hetzner, so an unset `--region` still needs the
 /// same default the rest of the CLI provisions into.
 pub(crate) fn region_for_sku_check(region: Option<&str>) -> &str {
-    region.unwrap_or(crate::commands::target_machine::DEFAULT_REGION)
+    region.unwrap_or(apprafter_core::machine::DEFAULT_REGION)
 }
 
 /// Suffix on the `target add` confirmation stating whether the token was
@@ -1076,7 +1065,7 @@ mod tests {
         assert_eq!(region_for_sku_check(Some("hel1")), "hel1");
         assert_eq!(
             region_for_sku_check(None),
-            crate::commands::target_machine::DEFAULT_REGION
+            apprafter_core::machine::DEFAULT_REGION
         );
     }
 
@@ -1657,10 +1646,10 @@ pub(crate) fn use_target(name: &str) -> miette::Result<()> {
     Ok(())
 }
 
-/// Today's `target use` / `target remove` found the target with `load_target`, which reads
+/// Today's `target use` / `remove` / `machine` found the target with `load_target`, which reads
 /// both of its files: a target whose `config.yaml` or `credentials.yaml` cannot be read is
 /// refused as before. (The core checks only that the target exists.)
-fn require_loadable(ctx: &Context, name: &str) -> miette::Result<()> {
+pub(crate) fn require_loadable(ctx: &Context, name: &str) -> miette::Result<()> {
     cli_core::load_target(&ctx.store(), name)
         .map(drop)
         .map_err(miette::Report::new)
