@@ -4,8 +4,9 @@
 // The app starts locked (`startup`). As Rust, by route (`?auth=`): by default the OS prompts
 // itself, so Unlock unlocks without asking anyone and the password field is refused
 // (`not_permitted_here`); with `?auth=pam` (Linux's PAM route) the field is the way — it unlocks
-// with MOCK_PASSWORD and refuses anything else as PAM would, saying MOCK_PAM_SAYS — and Unlock
-// finds no polkit agent (`no_agent`). What the session tells the app (`?session=`): by default
+// with MOCK_PASSWORD and refuses anything else as PAM would, saying MOCK_PAM_SAYS, behind Rust's
+// back-off (MOCK_BACKOFF: too many wrong passwords, and every try is turned away for a while,
+// each answer saying how long as `retryInMs`) — and Unlock finds no polkit agent (`no_agent`). What the session tells the app (`?session=`): by default
 // both its locks and its sleeps, as a desktop session does; or one half, or nothing at all (no
 // bus, as in WSL or a container), for the settings' lock-on-sleep row.
 import type { InvokeArgs } from '@tauri-apps/api/core';
@@ -31,6 +32,16 @@ export const MOCK_PASSWORD = 'apprafter';
 
 /** What the mock's password field says with a wrong password, as PAM would. */
 export const MOCK_PAM_SAYS = 'Authentication failure';
+
+/**
+ * Rust's back-off (`Backoff` in desktop/os-auth/src/outcome.rs; index.test.ts holds the two
+ * equal): `failures` wrong passwords start a refusal of `refusalMs`, counted on the monotonic
+ * clock (`performance.now()`, which the Playwright smoke fakes).
+ */
+export const MOCK_BACKOFF: { readonly failures: number; readonly refusalMs: number } = {
+  failures: 3,
+  refusalMs: 30_000,
+};
 
 /** How the mock OS verifies the owner: its own prompt, or Linux's PAM route (the app's field). */
 export type MockAuth = 'os' | 'pam';
@@ -175,6 +186,36 @@ export function installMockIpc(options: MockOptions = {}): void {
     return lock;
   };
 
+  // Rust's back-off on the password field: wrong passwords since the last refusal or success,
+  // and the monotonic reading the current refusal ends at.
+  let failures = 0;
+  let refusedUntil = 0;
+  const failed = (fields: UiError['fields']) =>
+    Promise.reject({
+      ...uiError(DESKTOP_ERROR_CODES.AUTH_FAILED, 'authentication failed'),
+      fields,
+    });
+  const checkPassword = (password: unknown) => {
+    const now = performance.now();
+    // Turned away unchecked: nothing was said, and the right password does not help.
+    if (now < refusedUntil) return failed({ exhausted: true, retryInMs: refusedUntil - now });
+    if (password === MOCK_PASSWORD) {
+      failures = 0;
+      return transition(null);
+    }
+    failures += 1;
+    if (failures < MOCK_BACKOFF.failures) {
+      return failed({ exhausted: false, messages: [MOCK_PAM_SAYS] });
+    }
+    failures = 0;
+    refusedUntil = now + MOCK_BACKOFF.refusalMs;
+    return failed({
+      exhausted: true,
+      retryInMs: MOCK_BACKOFF.refusalMs,
+      messages: [MOCK_PAM_SAYS],
+    });
+  };
+
   const appInfo = (): AppInfo => ({
     os,
     desktopVersion: '0.0.0-mock',
@@ -227,13 +268,7 @@ export function installMockIpc(options: MockOptions = {}): void {
     unlock_with_password: (args) => {
       if (!lock.locked) return lock;
       if (!auth.passwordField) return Promise.reject(unavailable('not_permitted_here'));
-      if ((args as { password?: unknown } | undefined)?.password === MOCK_PASSWORD) {
-        return transition(null);
-      }
-      return Promise.reject({
-        ...uiError(DESKTOP_ERROR_CODES.AUTH_FAILED, 'authentication failed'),
-        fields: { exhausted: false, messages: [MOCK_PAM_SAYS] },
-      });
+      return checkPassword((args as { password?: unknown } | undefined)?.password);
     },
     activity: () => null,
     quit: () => null,

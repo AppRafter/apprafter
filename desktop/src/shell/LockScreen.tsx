@@ -10,7 +10,8 @@
 // field is emptied when the answer comes, whatever it is: it is never cached, mutated through
 // the query client or logged. A wrong password shows what the OS said (PAM's messages) or a
 // plain line under the field, which is marked until the owner types again; too many failures
-// hold the field for the back-off, saying why.
+// hold the field — or the Unlock button, for the OS's dialog behind the same back-off — for as
+// long as Rust says its back-off refuses, counting it down, then give the field the focus back.
 import { type FormEvent, type ReactNode, useEffect, useRef, useState } from 'react';
 import { Button } from '../components/Button';
 import { ArrowRightIcon, SpinnerGapIcon } from '../components/icons';
@@ -20,7 +21,7 @@ import { Tag } from '../components/Tag';
 import { uiErrorOf } from '../ipc/api';
 import type { LockState } from '../ipc/generated/LockState';
 import type { SecretBackend } from '../ipc/generated/SecretBackend';
-import { authPrompt, authRefusal, BACKOFF_LINE, BACKOFF_MS, useBackoff } from '../state/auth';
+import { authPrompt, authRefusal, retryLine, useRetryCountdown } from '../state/auth';
 import { useLockActions } from '../state/lock';
 import { osName, usePlatform } from '../state/platform';
 
@@ -60,17 +61,23 @@ function initials(account: string): string {
 
 export interface LockScreenProps {
   state: LockState;
-  /** How long too many failed passwords hold the field; tests pass their own. */
-  backoffMs?: number;
 }
 
-export function LockScreen({ state, backoffMs = BACKOFF_MS }: LockScreenProps) {
+export function LockScreen({ state }: LockScreenProps) {
   const info = usePlatform();
   const { unlock, unlockWithPassword } = useLockActions();
   const [waiting, setWaiting] = useState(false);
   const [refusal, setRefusal] = useState<readonly string[]>([]);
-  const [backoff, startBackoff] = useBackoff(backoffMs);
+  const [retryIn, startRetry] = useRetryCountdown();
+  const backoff = retryIn !== null;
   const method = info.auth.method;
+
+  const refused = (error: unknown, viaField: boolean) => {
+    const said = authRefusal(uiErrorOf(error), viaField);
+    setRefusal(said.lines);
+    if (said.retryInMs !== null) startRetry(said.retryInMs);
+    setWaiting(false);
+  };
 
   const onUnlock = async () => {
     setWaiting(true);
@@ -78,8 +85,7 @@ export function LockScreen({ state, backoffMs = BACKOFF_MS }: LockScreenProps) {
     try {
       await unlock();
     } catch (error) {
-      setRefusal(authRefusal(uiErrorOf(error), false).lines);
-      setWaiting(false);
+      refused(error, false);
     }
   };
 
@@ -90,10 +96,7 @@ export function LockScreen({ state, backoffMs = BACKOFF_MS }: LockScreenProps) {
     try {
       await unlockWithPassword(password);
     } catch (error) {
-      const refused = authRefusal(uiErrorOf(error), true);
-      setRefusal(refused.lines);
-      if (refused.backoff) startBackoff();
-      setWaiting(false);
+      refused(error, true);
     }
   };
 
@@ -104,7 +107,8 @@ export function LockScreen({ state, backoffMs = BACKOFF_MS }: LockScreenProps) {
         // biome-ignore lint/suspicious/noArrayIndexKey: see above
         <p key={index}>{line}</p>
       ))}
-      {backoff && <p>{BACKOFF_LINE}</p>}
+      {/* Announced with the refusal, not again every second. */}
+      {backoff && <p aria-live="off">{retryLine(retryIn)}</p>}
     </div>
   );
 
@@ -136,7 +140,13 @@ export function LockScreen({ state, backoffMs = BACKOFF_MS }: LockScreenProps) {
           </PasswordForm>
         ) : (
           <>
-            <Button variant="primary" size={36} full disabled={waiting} onClick={onUnlock}>
+            <Button
+              variant="primary"
+              size={36}
+              full
+              disabled={waiting || backoff}
+              onClick={onUnlock}
+            >
               {waiting && method !== null ? `Waiting for ${authPrompt(method)}…` : 'Unlock'}
             </Button>
             {said}
@@ -153,7 +163,7 @@ interface PasswordFormProps {
   account: string;
   /** A check is running: the field cannot change and nothing is sent again. */
   checking: boolean;
-  /** Too many failed attempts: the field waits. */
+  /** Too many failed attempts: the field waits out Rust's back-off. */
   backoff: boolean;
   /** The last attempt was refused: the field is marked (aria-invalid) until the owner types. */
   refused: boolean;

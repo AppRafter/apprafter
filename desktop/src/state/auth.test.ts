@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, jest, test } from 'bun:test';
+import { act, renderHook } from '@testing-library/react';
 import { DESKTOP_ERROR_CODES } from '../ipc/generated/errors';
 import type { JsonValue } from '../ipc/generated/serde_json/JsonValue';
 import type { UiError } from '../ipc/generated/UiError';
-import { authRefusal, BACKOFF_LINE, BACKOFF_MS } from './auth';
+import { authRefusal, retryLine, useRetryCountdown } from './auth';
 
 const refused = (code: string, fields: Record<string, JsonValue> = {}): UiError => ({
   code,
@@ -13,14 +14,38 @@ const refused = (code: string, fields: Record<string, JsonValue> = {}): UiError 
   fields,
 });
 
-const outcomeRs = await Bun.file(new URL('../../os-auth/src/outcome.rs', import.meta.url)).text();
+describe('the back-off countdown', () => {
+  test('says how many seconds are left', () => {
+    expect(retryLine(30)).toBe('Too many failed attempts. Try again in 30 s.');
+    expect(retryLine(1)).toBe('Too many failed attempts. Try again in 1 s.');
+  });
 
-describe('the back-off', () => {
-  test("lasts as long as Rust's refusal after too many failures, and says so", () => {
-    const refusal = outcomeRs.match(/pub const REFUSAL_MS: u64 = ([\d_]+);/)?.[1];
-    expect(refusal, 'Backoff::REFUSAL_MS in os-auth/src/outcome.rs').toBeDefined();
-    expect(Number(refusal?.replaceAll('_', ''))).toBe(BACKOFF_MS);
-    expect(BACKOFF_LINE).toContain(`${BACKOFF_MS / 1000} seconds`);
+  test("counts down Rust's retryInMs by the clock, never showing 0 while it holds", () => {
+    jest.useFakeTimers();
+    try {
+      const { result } = renderHook(() => useRetryCountdown());
+      expect(result.current[0]).toBeNull();
+      act(() => result.current[1](2_500));
+      expect(result.current[0]).toBe(3);
+      act(() => jest.advanceTimersByTime(499));
+      expect(result.current[0]).toBe(3);
+      act(() => jest.advanceTimersByTime(1));
+      expect(result.current[0]).toBe(2);
+      act(() => jest.advanceTimersByTime(1_000));
+      expect(result.current[0]).toBe(1);
+      act(() => jest.advanceTimersByTime(999));
+      expect(result.current[0]).toBe(1);
+      act(() => jest.advanceTimersByTime(1));
+      expect(result.current[0]).toBeNull();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test('nothing to wait for holds nothing', () => {
+    const { result } = renderHook(() => useRetryCountdown());
+    act(() => result.current[1](0));
+    expect(result.current[0]).toBeNull();
   });
 });
 
@@ -35,7 +60,7 @@ describe('authRefusal, for the password field', () => {
     );
     expect(refusal).toEqual({
       lines: ['Authentication failure', 'Place your finger on the reader'],
-      backoff: false,
+      retryInMs: null,
     });
   });
 
@@ -43,26 +68,55 @@ describe('authRefusal, for the password field', () => {
     for (const fields of [{ exhausted: false }, { exhausted: false, messages: [] }, {}]) {
       expect(authRefusal(refused(DESKTOP_ERROR_CODES.AUTH_FAILED, fields), true)).toEqual({
         lines: ['That password is not right.'],
-        backoff: false,
+        retryInMs: null,
       });
     }
   });
 
-  test('exhausted: the back-off, after what the OS said; without its words, only the back-off', () => {
+  test("exhausted by Rust's back-off: what the OS said, and how long the back-off holds", () => {
     expect(
       authRefusal(
         refused(DESKTOP_ERROR_CODES.AUTH_FAILED, {
           exhausted: true,
+          retryInMs: 30_000,
           messages: ['Authentication failure'],
         }),
         true,
       ),
-    ).toEqual({ lines: ['Authentication failure'], backoff: true });
+    ).toEqual({ lines: ['Authentication failure'], retryInMs: 30_000 });
     // Turned away by the back-off itself: the password was never checked, so nothing says it
-    // was wrong.
+    // was wrong; the countdown says the rest.
     expect(
-      authRefusal(refused(DESKTOP_ERROR_CODES.AUTH_FAILED, { exhausted: true }), true),
-    ).toEqual({ lines: [], backoff: true });
+      authRefusal(
+        refused(DESKTOP_ERROR_CODES.AUTH_FAILED, { exhausted: true, retryInMs: 12_345 }),
+        true,
+      ),
+    ).toEqual({ lines: [], retryInMs: 12_345 });
+  });
+
+  test('exhausted with no end said (the OS’s own limit): try again later, nothing held', () => {
+    for (const messages of [[], ['Maximum number of tries exceeded']]) {
+      expect(
+        authRefusal(refused(DESKTOP_ERROR_CODES.AUTH_FAILED, { exhausted: true, messages }), true),
+      ).toEqual({
+        lines: [...messages, 'Too many failed attempts. Try again later.'],
+        retryInMs: null,
+      });
+    }
+  });
+
+  test('a retryInMs that is not a positive number holds nothing', () => {
+    for (const retryInMs of [0, -5, null, '30000', Number.NaN]) {
+      expect(
+        authRefusal(
+          refused(DESKTOP_ERROR_CODES.AUTH_FAILED, {
+            exhausted: true,
+            retryInMs: retryInMs as JsonValue,
+          }),
+          true,
+        ).retryInMs,
+      ).toBeNull();
+    }
   });
 
   test('what is not a string in the messages is left out', () => {
@@ -79,8 +133,17 @@ describe('authRefusal, for either way', () => {
   test.each([true, false])('busy says a check is already open (field: %p)', (viaField) => {
     expect(authRefusal(refused(DESKTOP_ERROR_CODES.AUTH_BUSY), viaField)).toEqual({
       lines: ['A check is already open. Finish it, then try again.'],
-      backoff: false,
+      retryInMs: null,
     });
+  });
+
+  test("the OS's own dialog turned away by Rust's back-off (Windows): only the countdown", () => {
+    expect(
+      authRefusal(
+        refused(DESKTOP_ERROR_CODES.AUTH_FAILED, { exhausted: true, retryInMs: 9_000 }),
+        false,
+      ),
+    ).toEqual({ lines: [], retryInMs: 9_000 });
   });
 
   test('no agent: the system could not prompt; not here: it prompts itself', () => {
@@ -103,7 +166,7 @@ describe('authRefusal, for either way', () => {
       refused(DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE, { reason: 'policy_missing' }),
       refused(DESKTOP_ERROR_CODES.INTERNAL),
     ]) {
-      expect(authRefusal(error, false)).toEqual({ lines: [error.message], backoff: false });
+      expect(authRefusal(error, false)).toEqual({ lines: [error.message], retryInMs: null });
     }
   });
 });

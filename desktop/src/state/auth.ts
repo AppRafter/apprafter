@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 // How the UI names the OS mechanism that confirms the device owner (AppInfo.auth.method):
-// "Confirm with Windows Hello next.", "Ask for your account password before…"; and what it says
-// when a check is refused, on the lock screen and in the confirm dialog alike.
+// "Confirm with Windows Hello next.", "Ask for your account password before…"; what it says
+// when a check is refused, on the lock screen and in the confirm dialog alike; and the countdown
+// of Rust's back-off after too many failures, from how long Rust says it still refuses.
 import { useCallback, useEffect, useState } from 'react';
 import type { AuthMethod } from '../ipc/generated/AuthMethod';
 import { DESKTOP_ERROR_CODES } from '../ipc/generated/errors';
@@ -20,16 +21,13 @@ export function authPrompt(method: AuthMethod): string {
   return PROMPTS[method];
 }
 
-/**
- * How long Rust turns password checks away after too many failures (`Backoff::REFUSAL_MS`,
- * desktop/os-auth/src/outcome.rs; auth.test.ts holds the two equal). Rust does not say how much
- * of it is left, so the field waits this long from the answer that said `exhausted`: never less
- * than Rust's refusal still runs.
- */
-export const BACKOFF_MS = 30_000;
+/** What a refusal says while Rust's back-off holds, `seconds` (rounded up) before it ends. */
+export function retryLine(seconds: number): string {
+  return `Too many failed attempts. Try again in ${seconds} s.`;
+}
 
-/** What the password field says while it waits out the back-off. */
-export const BACKOFF_LINE = 'Too many failed attempts. Wait 30 seconds, then try again.';
+/** Too many attempts, and nothing says when the next may run (the OS's own limit). */
+const TRY_LATER = 'Too many failed attempts. Try again later.';
 
 const WRONG_PASSWORD = 'That password is not right.';
 
@@ -46,8 +44,11 @@ const UNAVAILABLE: Partial<Record<string, string>> = {
 export interface AuthRefusal {
   /** What to say, a line each: what the OS said, or the app's own words. */
   readonly lines: readonly string[];
-  /** Too many failed attempts: the field waits BACKOFF_MS, saying BACKOFF_LINE meanwhile. */
-  readonly backoff: boolean;
+  /**
+   * Rust's back-off refuses every attempt for this long (`fields.retryInMs`): the page holds
+   * the field or the button and counts it down with retryLine. `null` when nothing is held.
+   */
+  readonly retryInMs: number | null;
 }
 
 /** What the OS said during a check of the app's own field (PAM's messages), never the password. */
@@ -59,35 +60,69 @@ function messagesOf(error: UiError): string[] {
   );
 }
 
-/**
- * What a refused unlock or confirmation says. `viaField`: the password came from the app's own
- * field, so a failure is about that password — the OS's own words when it gave any — and
- * `exhausted` starts the back-off. Through the OS's prompt, a failure is shown as Rust words it.
- */
-export function authRefusal(error: UiError, viaField: boolean): AuthRefusal {
-  if (error.code === DESKTOP_ERROR_CODES.AUTH_FAILED && viaField) {
-    const exhausted = error.fields.exhausted === true;
-    const said = messagesOf(error);
-    // Turned away by the back-off itself, the password was not checked: nothing says it was
-    // wrong.
-    return { lines: said.length > 0 || exhausted ? said : [WRONG_PASSWORD], backoff: exhausted };
-  }
-  if (error.code === DESKTOP_ERROR_CODES.AUTH_BUSY) return { lines: [BUSY], backoff: false };
-  if (error.code === DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE) {
-    const line = UNAVAILABLE[String(error.fields.reason)];
-    if (line !== undefined) return { lines: [line], backoff: false };
-  }
-  return { lines: [error.message], backoff: false };
+/** How long Rust's back-off still refuses (`fields.retryInMs`), when it says so. */
+function retryInMsOf(error: UiError): number | null {
+  const ms = error.fields.retryInMs;
+  return typeof ms === 'number' && Number.isFinite(ms) && ms > 0 ? ms : null;
 }
 
-/** A back-off: `[waiting, start]`; `start()` holds `waiting` true for `ms`. */
-export function useBackoff(ms: number = BACKOFF_MS): readonly [boolean, () => void] {
-  const [waiting, setWaiting] = useState(false);
+/**
+ * What a refused unlock or confirmation says. `viaField`: the password came from the app's own
+ * field, so a failure is about that password — the OS's own words when it gave any. Too many
+ * failures: when Rust's back-off holds, how long it does (`retryInMs`, counted down by the
+ * page), whichever way the owner was asked (the Windows credential dialog has the back-off
+ * too); when the OS's own limit holds, the field says to try later. Any other failure through
+ * the OS's prompt is shown as Rust words it.
+ */
+export function authRefusal(error: UiError, viaField: boolean): AuthRefusal {
+  if (error.code === DESKTOP_ERROR_CODES.AUTH_FAILED) {
+    const retryInMs = retryInMsOf(error);
+    const said = viaField ? messagesOf(error) : [];
+    // Turned away by the back-off itself, the password was not checked: nothing says it was
+    // wrong, and the countdown says the rest.
+    if (retryInMs !== null) return { lines: said, retryInMs };
+    if (viaField) {
+      const exhausted = error.fields.exhausted === true;
+      if (exhausted) return { lines: [...said, TRY_LATER], retryInMs: null };
+      return { lines: said.length > 0 ? said : [WRONG_PASSWORD], retryInMs: null };
+    }
+  }
+  if (error.code === DESKTOP_ERROR_CODES.AUTH_BUSY) return { lines: [BUSY], retryInMs: null };
+  if (error.code === DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE) {
+    const line = UNAVAILABLE[String(error.fields.reason)];
+    if (line !== undefined) return { lines: [line], retryInMs: null };
+  }
+  return { lines: [error.message], retryInMs: null };
+}
+
+/**
+ * The countdown of Rust's back-off: `[secondsLeft, start]`. `start(ms)` holds from now for `ms`
+ * (a refusal's `retryInMs`), by the monotonic `performance.now()`; `secondsLeft` is the whole
+ * seconds left, rounded up — never 0 while it holds — or `null` when nothing is held. It ticks
+ * when the shown number changes. Rust measured `ms` before its answer crossed IPC, so this ends
+ * a little after Rust's refusal does, never before.
+ */
+export function useRetryCountdown(): readonly [number | null, (ms: number) => void] {
+  const [held, setHeld] = useState<{ until: number; left: number } | null>(null);
+  const until = held?.until ?? null;
   useEffect(() => {
-    if (!waiting) return;
-    const timer = setTimeout(() => setWaiting(false), ms);
+    if (until === null) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const tick = () => {
+      const left = until - performance.now();
+      if (left <= 0) {
+        setHeld(null);
+        return;
+      }
+      setHeld({ until, left });
+      // Wake when the rounded-up second changes.
+      timer = setTimeout(tick, left % 1000 || 1000);
+    };
+    tick();
     return () => clearTimeout(timer);
-  }, [waiting, ms]);
-  const start = useCallback(() => setWaiting(true), []);
-  return [waiting, start];
+  }, [until]);
+  const start = useCallback((ms: number) => {
+    setHeld(ms > 0 ? { until: performance.now() + ms, left: ms } : null);
+  }, []);
+  return [held === null ? null : Math.ceil(held.left / 1000), start];
 }

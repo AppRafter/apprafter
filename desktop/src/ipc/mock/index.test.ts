@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, jest, test } from 'bun:test';
 import { Channel } from '@tauri-apps/api/core';
 import { clearMocks } from '@tauri-apps/api/mocks';
 import * as api from '../api';
@@ -9,7 +9,13 @@ import { ALLOWED_WHILE_LOCKED, type COMMANDS } from '../generated/commands';
 import { DESKTOP_ERROR_CODES } from '../generated/errors';
 import type { LockState } from '../generated/LockState';
 import type { OpEvent } from '../generated/OpEvent';
-import { installMockIpc, MOCK_PAM_SAYS, MOCK_PASSWORD, mockOptionsFromUrl } from './index';
+import {
+  installMockIpc,
+  MOCK_BACKOFF,
+  MOCK_PAM_SAYS,
+  MOCK_PASSWORD,
+  mockOptionsFromUrl,
+} from './index';
 
 afterEach(() => clearMocks());
 
@@ -109,6 +115,54 @@ describe('installMockIpc', () => {
     await settle();
     expect(heard.map((s) => s.locked)).toEqual([false]);
     unlisten();
+  });
+
+  test("on the PAM route too many wrong passwords start Rust's back-off, saying how long it holds", async () => {
+    jest.useFakeTimers();
+    try {
+      installMockIpc({ auth: 'pam' });
+      const refusal = async (password: string) => {
+        const refused = await api.unlockWithPassword(password).catch((e: unknown) => e);
+        expect(refused).toBeInstanceOf(IpcError);
+        return (refused as IpcError).error;
+      };
+      for (let i = 1; i < MOCK_BACKOFF.failures; i += 1) {
+        expect((await refusal('guess')).fields).toEqual({
+          exhausted: false,
+          messages: [MOCK_PAM_SAYS],
+        });
+      }
+      // The failure that starts it says how long it lasts, with what PAM said.
+      expect(await refusal('guess')).toMatchObject({
+        code: DESKTOP_ERROR_CODES.AUTH_FAILED,
+        fields: { exhausted: true, retryInMs: MOCK_BACKOFF.refusalMs, messages: [MOCK_PAM_SAYS] },
+      });
+      // While it holds, even the right password is turned away unchecked, with what is left.
+      jest.advanceTimersByTime(10_000);
+      expect((await refusal(MOCK_PASSWORD)).fields).toEqual({
+        exhausted: true,
+        retryInMs: MOCK_BACKOFF.refusalMs - 10_000,
+      });
+      jest.advanceTimersByTime(MOCK_BACKOFF.refusalMs - 10_000);
+      expect(await api.unlockWithPassword(MOCK_PASSWORD)).toMatchObject({ locked: false });
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test("the mock's back-off is Rust's: as many failures, as long a refusal", async () => {
+    const outcomeRs = await Bun.file(
+      new URL('../../../os-auth/src/outcome.rs', import.meta.url),
+    ).text();
+    const constant = (name: string, type: string) => {
+      const value = outcomeRs.match(new RegExp(`pub const ${name}: ${type} = ([\\d_]+);`))?.[1];
+      expect(value, `Backoff::${name} in os-auth/src/outcome.rs`).toBeDefined();
+      return Number(value?.replaceAll('_', ''));
+    };
+    expect(MOCK_BACKOFF).toEqual({
+      failures: constant('FAILURES', 'u32'),
+      refusalMs: constant('REFUSAL_MS', 'u64'),
+    });
   });
 
   test('a new idle time is numbered and heard; a save that changes nothing is not', async () => {

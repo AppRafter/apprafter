@@ -5,15 +5,16 @@
 // so the dialog only says which prompt comes next — except where the OS cannot prompt
 // (AuthInfo.passwordField): there the dialog has its own password field, whose value onConfirm
 // hands to execute() and Rust checks. It refuses as the lock screen's does, and is shown the same
-// way: the OS's words or a plain line, the back-off, busy. The field is emptied after every
-// answer; a wrong password leaves the plan waiting in Rust, so the owner simply tries again.
+// way: the OS's words or a plain line, the back-off counted down from what Rust says, busy. The
+// field is emptied after every answer; a wrong password leaves the plan waiting in Rust, so the
+// owner simply tries again.
 import { type FormEvent, type ReactNode, useEffect, useId, useRef, useState } from 'react';
 import { uiErrorOf } from '../ipc/api';
 import type { AuthInfo } from '../ipc/generated/AuthInfo';
 import { DESKTOP_ERROR_CODES } from '../ipc/generated/errors';
 import type { PlanClass } from '../ipc/generated/PlanClass';
 import type { UiError } from '../ipc/generated/UiError';
-import { authPrompt, authRefusal, BACKOFF_LINE, BACKOFF_MS, useBackoff } from '../state/auth';
+import { authPrompt, authRefusal, retryLine, useRetryCountdown } from '../state/auth';
 import { Button } from './Button';
 import { ErrorPanel } from './ErrorPanel';
 import { type Icon, QuestionIcon } from './icons';
@@ -56,8 +57,6 @@ export interface ConfirmDialogProps {
    */
   onConfirm: (password?: string) => Promise<void> | void;
   onClose: () => void;
-  /** How long too many failed passwords hold the field; tests pass their own. */
-  backoffMs?: number;
 }
 
 export function ConfirmDialog({
@@ -73,7 +72,6 @@ export function ConfirmDialog({
   auth,
   onConfirm,
   onClose,
-  backoffMs = BACKOFF_MS,
 }: ConfirmDialogProps) {
   const id = useId();
   const [typed, setTyped] = useState('');
@@ -81,7 +79,8 @@ export function ConfirmDialog({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<UiError | null>(null);
   const [refusal, setRefusal] = useState<readonly string[]>([]);
-  const [backoff, startBackoff] = useBackoff(backoffMs);
+  const [retryIn, startRetry] = useRetryCountdown();
+  const backoff = retryIn !== null;
   const passwordInput = useRef<HTMLInputElement>(null);
   const destructive = planClass === 'destructive';
   const guard = destructive ? requireText : undefined;
@@ -109,7 +108,7 @@ export function ConfirmDialog({
       if (AUTH_REFUSALS.has(refused.code)) {
         const said = authRefusal(refused, field);
         setRefusal(said.lines);
-        if (said.backoff) startBackoff();
+        if (said.retryInMs !== null) startRetry(said.retryInMs);
       } else {
         setError(refused);
       }
@@ -182,7 +181,8 @@ export function ConfirmDialog({
               // biome-ignore lint/suspicious/noArrayIndexKey: see above
               <p key={index}>{line}</p>
             ))}
-            {backoff && <p>{BACKOFF_LINE}</p>}
+            {/* Announced with the refusal, not again every second. */}
+            {backoff && <p aria-live="off">{retryLine(retryIn)}</p>}
           </div>
         )}
         {error !== null && <ErrorPanel error={error} />}

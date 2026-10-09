@@ -1,14 +1,13 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, jest, test } from 'bun:test';
 import { type QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { clearMocks, mockIPC } from '@tauri-apps/api/mocks';
-import { act, cleanup, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import type { AppInfo } from '../ipc/generated/AppInfo';
 import { DESKTOP_ERROR_CODES } from '../ipc/generated/errors';
 import type { LockState } from '../ipc/generated/LockState';
 import type { JsonValue } from '../ipc/generated/serde_json/JsonValue';
-import { BACKOFF_LINE } from '../state/auth';
 import { PlatformContext } from '../state/platform';
 import { createQueryClient } from '../state/queryClient';
 import { appInfo, authInfo, lockState } from '../test/fixtures';
@@ -39,20 +38,46 @@ afterEach(() => {
 
 const commands = () => calls.map((c) => c.cmd);
 
+/** Set while a test runs on fake timers (onFakeTime). */
+let fakeTime = false;
+
 function lockScreen(
   state: LockState = lockState(),
   info: AppInfo = appInfo(),
-  { client = createQueryClient(), backoffMs }: { client?: QueryClient; backoffMs?: number } = {},
+  { client = createQueryClient() }: { client?: QueryClient } = {},
 ) {
   render(
     <QueryClientProvider client={client}>
       <PlatformContext value={info}>
-        <LockScreen state={state} {...(backoffMs !== undefined && { backoffMs })} />
+        <LockScreen state={state} />
       </PlatformContext>
     </QueryClientProvider>,
   );
-  return userEvent.setup();
+  // Under fake timers (onFakeTime) user-event must not pause between keys: nothing would end
+  // the pause.
+  return userEvent.setup(fakeTime ? { delay: null } : {});
 }
+
+/** Let a refused IPC call reach the page: its promise chain settles in microtasks. */
+const settled = () =>
+  act(async () => {
+    for (let i = 0; i < 20; i += 1) await Promise.resolve();
+  });
+
+/** Run `body` with the clock faked (setTimeout and performance.now alike). */
+async function onFakeTime(body: () => Promise<void>) {
+  jest.useFakeTimers();
+  fakeTime = true;
+  try {
+    await body();
+  } finally {
+    fakeTime = false;
+    jest.useRealTimers();
+  }
+}
+
+const alertLines = () =>
+  [...screen.getByRole('alert').children].map((line) => line.textContent ?? '');
 
 /** Linux where polkit cannot prompt: the PAM route, and the app's own field. */
 const PAM = appInfo({ auth: authInfo({ method: 'pam', passwordField: true }) });
@@ -127,6 +152,20 @@ describe('LockScreen', () => {
     await user.click(unlockButton());
     expect((await screen.findByRole('alert')).textContent).toBe(line);
   });
+
+  test("the OS's dialog behind Rust's back-off: Unlock waits out the countdown", () =>
+    onFakeTime(async () => {
+      unlockAnswer = () =>
+        refusal(DESKTOP_ERROR_CODES.AUTH_FAILED, { exhausted: true, retryInMs: 1_200 });
+      const user = lockScreen(lockState(), appInfo({ os: 'windows' }));
+      await user.click(unlockButton());
+      await settled();
+      expect(alertLines()).toEqual(['Too many failed attempts. Try again in 2 s.']);
+      expect(unlockButton().disabled).toBe(true);
+      act(() => jest.advanceTimersByTime(1_200));
+      expect(screen.queryByRole('alert')).toBeNull();
+      expect(unlockButton().disabled).toBe(false);
+    }));
 
   test('no password field unless app_info says the OS cannot prompt', () => {
     lockScreen();
@@ -229,27 +268,59 @@ describe('LockScreen where the OS cannot prompt: the password field', () => {
     expect(passwordInput().value).toBe('');
   });
 
-  test('too many failed attempts: field and arrow wait out the back-off, saying why', async () => {
+  test("too many failed attempts: a live countdown from Rust's retryInMs, then the field", () =>
+    onFakeTime(async () => {
+      passwordAnswer = () =>
+        refusal(DESKTOP_ERROR_CODES.AUTH_FAILED, {
+          exhausted: true,
+          retryInMs: 2_500,
+          messages: ['Authentication failure'],
+        });
+      const user = lockScreen(lockState(), PAM);
+      await user.keyboard('guess{Enter}');
+      await settled();
+      expect(alertLines()).toEqual([
+        'Authentication failure',
+        'Too many failed attempts. Try again in 3 s.',
+      ]);
+      expect(passwordInput().disabled).toBe(true);
+      expect(unlockButton().disabled).toBe(true);
+      act(() => jest.advanceTimersByTime(500));
+      expect(alertLines()[1]).toBe('Too many failed attempts. Try again in 2 s.');
+      act(() => jest.advanceTimersByTime(1_000));
+      expect(alertLines()[1]).toBe('Too many failed attempts. Try again in 1 s.');
+      expect(passwordInput().disabled).toBe(true);
+      act(() => jest.advanceTimersByTime(1_000));
+      expect(passwordInput().disabled).toBe(false);
+      expect(document.activeElement).toBe(passwordInput());
+      expect(alertLines()).toEqual(['Authentication failure']);
+      passwordAnswer = () => lockState({ locked: false });
+      await user.keyboard('hunter2{Enter}');
+      expect(commands()).toEqual(['unlock_with_password', 'unlock_with_password']);
+    }));
+
+  test('turned away by the back-off itself: only the countdown, nothing about the password', () =>
+    onFakeTime(async () => {
+      passwordAnswer = () =>
+        refusal(DESKTOP_ERROR_CODES.AUTH_FAILED, { exhausted: true, retryInMs: 30_000 });
+      const user = lockScreen(lockState(), PAM);
+      await user.keyboard('hunter2{Enter}');
+      await settled();
+      expect(alertLines()).toEqual(['Too many failed attempts. Try again in 30 s.']);
+      act(() => jest.advanceTimersByTime(30_000));
+      expect(screen.queryByRole('alert')).toBeNull();
+      expect(passwordInput().disabled).toBe(false);
+    }));
+
+  test('too many attempts with no end said: try again later, and the field stays', async () => {
     passwordAnswer = () =>
-      refusal(DESKTOP_ERROR_CODES.AUTH_FAILED, {
-        exhausted: true,
-        messages: ['Authentication failure'],
-      });
-    const user = lockScreen(lockState(), PAM, { backoffMs: 80 });
+      refusal(DESKTOP_ERROR_CODES.AUTH_FAILED, { exhausted: true, messages: [] });
+    const user = lockScreen(lockState(), PAM);
     await user.keyboard('guess{Enter}');
-    const alert = await screen.findByRole('alert');
-    expect([...alert.children].map((line) => line.textContent)).toEqual([
-      'Authentication failure',
-      BACKOFF_LINE,
-    ]);
-    expect(passwordInput().disabled).toBe(true);
-    expect(unlockButton().disabled).toBe(true);
-    await waitFor(() => expect(passwordInput().disabled).toBe(false));
-    expect(document.activeElement).toBe(passwordInput());
-    expect(screen.getByRole('alert').textContent).toBe('Authentication failure');
-    passwordAnswer = () => lockState({ locked: false });
-    await user.keyboard('hunter2{Enter}');
-    expect(commands()).toEqual(['unlock_with_password', 'unlock_with_password']);
+    expect((await screen.findByRole('alert')).textContent).toBe(
+      'Too many failed attempts. Try again later.',
+    );
+    expect(passwordInput().disabled).toBe(false);
   });
 
   test('busy: a check is already open', async () => {

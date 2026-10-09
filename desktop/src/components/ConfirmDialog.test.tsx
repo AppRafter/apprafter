@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
-import { describe, expect, mock, test } from 'bun:test';
+import { describe, expect, jest, mock, test } from 'bun:test';
 import { clearMocks, mockIPC } from '@tauri-apps/api/mocks';
-import { cleanup as cleanupDialog, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup as cleanupDialog, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import type { AuthInfo } from '../ipc/generated/AuthInfo';
 import { DESKTOP_ERROR_CODES } from '../ipc/generated/errors';
 import type { JsonValue } from '../ipc/generated/serde_json/JsonValue';
 import { execute, resetOperations } from '../ipc/operations';
-import { BACKOFF_LINE } from '../state/auth';
 import { ConfirmDialog, type ConfirmDialogProps, needsDialog } from './ConfirmDialog';
 
 const hello: AuthInfo = {
@@ -44,8 +43,30 @@ function open(props: Partial<ConfirmDialogProps> = {}) {
       {...props}
     />,
   );
-  return { user: userEvent.setup(), onConfirm, onClose };
+  // Under fake timers user-event must not pause between keys: nothing would end the pause.
+  return { user: userEvent.setup(fakeTime ? { delay: null } : {}), onConfirm, onClose };
 }
+
+/** Set while a test runs on fake timers (onFakeTime). */
+let fakeTime = false;
+
+/** Run `body` with the clock faked (setTimeout and performance.now alike). */
+async function onFakeTime(body: () => Promise<void>) {
+  jest.useFakeTimers();
+  fakeTime = true;
+  try {
+    await body();
+  } finally {
+    fakeTime = false;
+    jest.useRealTimers();
+  }
+}
+
+/** Let a refused onConfirm reach the dialog: its promise chain settles in microtasks. */
+const settled = () =>
+  act(async () => {
+    for (let i = 0; i < 20; i += 1) await Promise.resolve();
+  });
 
 const confirm = () => screen.getByRole('button', { name: 'Remove' }) as HTMLButtonElement;
 
@@ -198,20 +219,33 @@ describe('ConfirmDialog where the OS cannot prompt: the password field', () => {
     expect((await screen.findByRole('alert')).textContent).toBe('That password is not right.');
   });
 
-  test('too many failed attempts: field and confirm wait out the back-off, saying why', async () => {
-    let answer = (): Promise<void> =>
-      Promise.reject(refusal(DESKTOP_ERROR_CODES.AUTH_FAILED, { exhausted: true }));
-    const { user, onClose } = open({ auth: pam, backoffMs: 80, onConfirm: () => answer() });
-    await user.type(password(), 'guess{Enter}');
-    expect((await screen.findByRole('alert')).textContent).toBe(BACKOFF_LINE);
-    expect(password().disabled).toBe(true);
-    expect(confirm().disabled).toBe(true);
-    await waitFor(() => expect(password().disabled).toBe(false));
-    expect(document.activeElement).toBe(password());
-    answer = () => Promise.resolve();
-    await user.type(password(), 'hunter2{Enter}');
-    expect(onClose).toHaveBeenCalledTimes(1);
-  });
+  test("too many failed attempts: field and confirm count down Rust's retryInMs, then refocus", () =>
+    onFakeTime(async () => {
+      let answer = (): Promise<void> =>
+        Promise.reject(
+          refusal(DESKTOP_ERROR_CODES.AUTH_FAILED, { exhausted: true, retryInMs: 1_500 }),
+        );
+      const { user, onClose } = open({ auth: pam, onConfirm: () => answer() });
+      await user.type(password(), 'guess{Enter}');
+      await settled();
+      expect(screen.getByRole('alert').textContent).toBe(
+        'Too many failed attempts. Try again in 2 s.',
+      );
+      expect(password().disabled).toBe(true);
+      expect(confirm().disabled).toBe(true);
+      act(() => jest.advanceTimersByTime(500));
+      expect(screen.getByRole('alert').textContent).toBe(
+        'Too many failed attempts. Try again in 1 s.',
+      );
+      act(() => jest.advanceTimersByTime(1_000));
+      expect(screen.queryByRole('alert')).toBeNull();
+      expect(password().disabled).toBe(false);
+      expect(document.activeElement).toBe(password());
+      answer = () => Promise.resolve();
+      await user.type(password(), 'hunter2{Enter}');
+      await settled();
+      expect(onClose).toHaveBeenCalledTimes(1);
+    }));
 
   test('a retry after a wrong password confirms the same plan: the same opId, in place', async () => {
     // As a screen wires it: confirming executes the plan the dialog shows. Rust keeps the plan
