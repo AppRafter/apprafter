@@ -127,9 +127,11 @@ fn dispatch_cli(args: Cli) -> cli_core::Result<()> {
             dry_run,
             target,
         } => commands::import::run(force, dry_run, target.as_deref())?,
-        Commands::Kubeconfig { refresh, target } => {
-            commands::kubeconfig::run(refresh, target.as_deref())?
-        }
+        Commands::Kubeconfig {
+            refresh,
+            yes,
+            target,
+        } => commands::kubeconfig::run(refresh, yes, target.as_deref())?,
         // `None`: the standalone subcommand carries no `--target` flag,
         // so it runs against the active target. The parameter exists
         // for `bootstrap-all --target X`, which must not fall back to

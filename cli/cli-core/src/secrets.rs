@@ -20,6 +20,26 @@ use crate::{CliError, Result};
 /// The variable that overrides the age key path.
 pub const AGE_KEY_ENV: &str = "APPRAFTER_AGE_KEY";
 
+/// A secret a target's state caches age-encrypted, in `state.json`'s `hetzner_cloud`. Every
+/// one of them opens only with the key it was cached under: a new key reads none of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CachedSecret {
+    /// `kubeconfig_age`: the k3s kubeconfig, fetched from the node over SSH.
+    Kubeconfig,
+    /// `argocd_admin_password_age`: the Argo CD admin password, read from the cluster.
+    ArgocdPassword,
+}
+
+impl CachedSecret {
+    /// What it is, as a sentence names it.
+    pub fn noun(self) -> &'static str {
+        match self {
+            CachedSecret::Kubeconfig => "kubeconfig",
+            CachedSecret::ArgocdPassword => "Argo CD admin password",
+        }
+    }
+}
+
 /// Resolve the on-disk path for the age private key. Honours
 /// `APPRAFTER_AGE_KEY`; falls back to `~/.config/apprafter/age.key`,
 /// where `~` is [`dirs::home_dir`]: `$HOME` on Unix when it is set and

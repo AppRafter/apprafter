@@ -132,7 +132,7 @@ kubeconfig:
 ```sh
 export HCLOUD_TOKEN=...
 export APPRAFTER_SSH_PRIVATE_KEY="$HOME/.ssh/id_ed25519"  # optional, default
-export APPRAFTER_AGE_KEY="$HOME/.config/apprafter/age.key" # optional, default; auto-created on first run, mode 0600
+export APPRAFTER_AGE_KEY="$HOME/.config/apprafter/age.key" # optional, default; created with the first cached secret, mode 0600
 
 cargo run --bin apprafter -- kubeconfig | KUBECONFIG=/dev/stdin kubectl get nodes
 ```
@@ -144,6 +144,14 @@ under the on-disk identity, caches the armored ciphertext in
 `.apprafter/state.json` (`hetzner_cloud.kubeconfig_age`), and
 prints the plaintext on stdout. Subsequent calls decrypt the cache
 in O(1); pass `--refresh` to force a re-fetch.
+
+A command that only reads the cache never creates the age key: with
+the key missing it fails with `apprafter::secrets::age_key_missing`.
+If the key is lost, `kubeconfig --refresh` fetches the kubeconfig
+again and caches it under a new key, after listing what else was
+cached under the lost one (which the new key cannot read) and asking;
+`--yes` agrees without a terminal. See the troubleshooting page's
+entry for that code.
 
 State files written by v0.1.9 (plaintext `kubeconfig_yaml` field)
 are still readable: the v0.1.9 entry is treated as a one-cycle

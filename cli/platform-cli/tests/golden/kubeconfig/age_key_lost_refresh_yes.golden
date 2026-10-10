@@ -1,0 +1,48 @@
+$ apprafter kubeconfig --refresh --yes
+[exit 0]
+[stdout]
+apiVersion: v1
+clusters:
+- cluster:
+    server: https://203.0.113.10:6443
+  name: default
+[stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m kubeconfig invoked <ESC>[3mrefresh<ESC>[0m<ESC>[2m=<ESC>[0mtrue <ESC>[3myes<ESC>[0m<ESC>[2m=<ESC>[0mtrue
+Created a new age key at <SANDBOX>/home/.config/apprafter/age.key; the kubeconfig of target `prod` is cached under it.
+Cached under the lost key, and unreadable now:
+  - target `prod`: the Argo CD admin password, dropped from the cache (`apprafter argocd-password` fetches it from the cluster again)
+  - target `staging`: the kubeconfig (`apprafter kubeconfig --refresh --target staging` fetches it again)
+  - target `staging`: the Argo CD admin password (`apprafter argocd-password --refresh` fetches it again while `staging` is the active target)
+$ apprafter kubeconfig
+[exit 0]
+[stdout]
+apiVersion: v1
+clusters:
+- cluster:
+    server: https://203.0.113.10:6443
+  name: default
+[stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m kubeconfig invoked <ESC>[3mrefresh<ESC>[0m<ESC>[2m=<ESC>[0mfalse <ESC>[3myes<ESC>[0m<ESC>[2m=<ESC>[0mfalse
+$ apprafter kubeconfig --target staging
+[exit 1]
+[stdout]
+[stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m kubeconfig invoked <ESC>[3mrefresh<ESC>[0m<ESC>[2m=<ESC>[0mfalse <ESC>[3myes<ESC>[0m<ESC>[2m=<ESC>[0mfalse <ESC>[3mtarget_override<ESC>[0m<ESC>[2m=<ESC>[0m"staging"
+Error: apprafter::secrets::cache_undecryptable
+
+  × the kubeconfig cached for target `staging` cannot be decrypted with the
+  │ age key at <SANDBOX>/home/.config/apprafter/age.key: age decrypt: No
+  │ matching keys found
+  help: It was cached under a different age key (one that was lost and
+        replaced), or the cached copy is damaged. If you still have the key it
+        was cached under, set `APPRAFTER_AGE_KEY` to it. Otherwise `apprafter
+        kubeconfig --refresh --target staging` fetches it from the node again
+        and caches it under the key at that path.
+
+$ apprafter argocd-password
+[exit 0]
+[stdout]
+new-password
+[no newline at end]
+[stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m argocd-password invoked <ESC>[3mrefresh<ESC>[0m<ESC>[2m=<ESC>[0mfalse

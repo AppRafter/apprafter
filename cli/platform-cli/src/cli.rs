@@ -212,9 +212,15 @@ pub enum Commands {
     #[command(alias = "kc")]
     Kubeconfig {
         /// Force a re-fetch over SSH even if a cached kubeconfig
-        /// is already in state.
+        /// is already in state. With the age key lost, it caches
+        /// the fresh copy under a new key, after listing what the
+        /// new key cannot read and asking.
         #[arg(long, default_value_t = false)]
         refresh: bool,
+        /// Agree to a new age key without asking, when the one the
+        /// cache was encrypted under is lost.
+        #[arg(long, default_value_t = false)]
+        yes: bool,
         /// Override the active target for the credential
         /// resolution chain (see `apprafter apply --target`).
         #[arg(long)]

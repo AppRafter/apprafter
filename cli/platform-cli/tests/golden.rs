@@ -2038,3 +2038,218 @@ fn whoami_with_the_ssh_key_file_missing() {
     fs::remove_file(sb.path("home/id_ed25519.pub")).expect("remove the ssh key");
     sb.golden("session/whoami_ssh_key_missing", &["whoami", "--no-ping"]);
 }
+
+// ---------------------------------------------------------------------
+// kubeconfig — a lost age key (WI-457, GOTCHA-120, GOTCHA-121)
+//
+// `prod` and `staging` cache their kubeconfig and Argo CD password under a key that is gone
+// (made here, never written). The node is a stand-in `ssh` on an otherwise empty `PATH` that
+// logs its arguments and prints a k3s kubeconfig; the server's address comes from the mocked
+// Hetzner API. Nothing reaches a real node, cluster or provider.
+// ---------------------------------------------------------------------
+
+/// What the stand-in node serves at `/etc/rancher/k3s/k3s.yaml`.
+const NODE_KUBECONFIG: &str =
+    "apiVersion: v1\nclusters:\n- cluster:\n    server: https://127.0.0.1:6443\n  name: default\n";
+
+/// `GET /v1/servers`: the server `prod`'s state records, labelled and addressed.
+const SERVERS_42: &str = r#"{"servers":[{"id":42,"name":"prod-node","status":"running","labels":{"apprafter":"true"},"public_net":{"ipv4":{"ip":"203.0.113.10"}}}]}"#;
+
+/// `prod` (active) and `staging`, each caching both secrets under `lost`, which is on no disk.
+fn lost_key_sandbox(server: &mockito::Server) -> (Sandbox, age::x25519::Identity) {
+    let lost = age::x25519::Identity::generate();
+    let enc = |text: &str| {
+        cli_core::secrets::encrypt_for_recipient(text, &lost.to_public()).expect("encrypt")
+    };
+    let sb = Sandbox::new().with_hcloud(server.url());
+    sb.add_target("prod");
+    sb.add_target("staging");
+    for (target, id) in [("prod", 42), ("staging", 43)] {
+        sb.seed_state(
+            target,
+            &serde_json::json!({"hetzner_cloud": {
+                "server_id": id, "server_name": format!("{target}-node"),
+                "kubeconfig_age": enc("from: the lost key\n"),
+                "argocd_admin_password_age": enc("lost-password"),
+            }})
+            .to_string(),
+        );
+    }
+    (sb, lost)
+}
+
+/// The stand-ins, alone on `PATH`: the node — `ssh … root@203.0.113.10 cat
+/// /etc/rancher/k3s/k3s.yaml` prints [`NODE_KUBECONFIG`] — and the cluster — `kubectl get secret
+/// argocd-initial-admin-secret -n argocd …` prints the password `new-password`, base64 as the
+/// API holds it. Each logs its calls to `<sandbox>/<tool>.log`; anything else exits non-zero.
+fn stand_in_tools(sb: &Sandbox) -> PathBuf {
+    let bin = sb.path("tools-bin");
+    fs::create_dir_all(&bin).expect("tools bin");
+    let body: String = NODE_KUBECONFIG.lines().map(|l| format!(" '{l}'")).collect();
+    for (tool, call, answer) in [
+        (
+            "ssh",
+            "*' root@203.0.113.10 cat /etc/rancher/k3s/k3s.yaml'",
+            format!("printf '%s\\n'{body}"),
+        ),
+        (
+            "kubectl",
+            "'get secret argocd-initial-admin-secret -n argocd -o jsonpath={.data.password}'",
+            "printf '%s' 'bmV3LXBhc3N3b3Jk'".to_string(),
+        ),
+    ] {
+        common::stand_in::script(
+            &bin.join(tool),
+            &format!(
+                "echo \"$*\" >> '{log}'\n\
+                 case \"$*\" in\n\
+                 {call}) {answer} ;;\n\
+                 *) echo \"{tool} stand-in: unexpected arguments: $*\" >&2; exit 2 ;;\n\
+                 esac",
+                log = sb.path(&format!("{tool}.log")).display()
+            ),
+        );
+    }
+    bin
+}
+
+fn age_key(sb: &Sandbox) -> PathBuf {
+    sb.path("home/.config/apprafter/age.key")
+}
+
+fn hetzner_state(sb: &Sandbox, target: &str) -> serde_json::Value {
+    let raw = fs::read_to_string(sb.path(&format!(
+        "apprafter-config/state/{target}/.apprafter/state.json"
+    )))
+    .expect("state");
+    serde_json::from_str::<serde_json::Value>(&raw).expect("json")["hetzner_cloud"].clone()
+}
+
+/// GOTCHA-120: a read with the key gone names the way back, and never creates a key.
+#[test]
+fn kubeconfig_with_the_age_key_lost() {
+    let server = mockito::Server::new();
+    let (sb, _lost) = lost_key_sandbox(&server);
+    let before = hetzner_state(&sb, "prod");
+    sb.golden("kubeconfig/age_key_lost", &["kubeconfig"]);
+    assert!(!age_key(&sb).exists(), "a read never creates a key");
+    assert_eq!(hetzner_state(&sb, "prod"), before);
+}
+
+/// Without a terminal and without `--yes`, `--refresh` lists what a new key leaves unreadable
+/// and refuses: no key, no read of the node, no write.
+#[test]
+fn kubeconfig_refresh_with_the_age_key_lost_needs_yes() {
+    let server = mockito::Server::new();
+    let (sb, _lost) = lost_key_sandbox(&server);
+    let tools = stand_in_tools(&sb);
+    let sb = sb.with_path(tools);
+    let before = hetzner_state(&sb, "prod");
+    sb.golden(
+        "kubeconfig/age_key_lost_refresh_needs_yes",
+        &["kubeconfig", "--refresh"],
+    );
+    assert!(!age_key(&sb).exists(), "no key without consent");
+    assert!(!sb.path("ssh.log").exists(), "the node is not read");
+    assert_eq!(hetzner_state(&sb, "prod"), before);
+}
+
+/// GOTCHA-121: `--refresh --yes` reads the node over SSH (only that: `cat` of the kubeconfig),
+/// caches it under a new key, drops `prod`'s password cached under the lost key, and says what
+/// is left: `staging`'s caches, each with its way back. The cache then reads under the new key,
+/// `staging`'s names its refetch, and `argocd-password` fetches the dropped password from the
+/// cluster again, caching it under the new key.
+#[test]
+fn kubeconfig_refresh_yes_recovers_from_a_lost_age_key() {
+    let mut server = mockito::Server::new();
+    let servers = json_route(&mut server, "/v1/servers", 200, SERVERS_42, TOKEN_A)
+        .expect(1)
+        .create();
+    let (sb, _lost) = lost_key_sandbox(&server);
+    let tools = stand_in_tools(&sb);
+    let sb = sb.with_path(tools);
+    let staging_before = hetzner_state(&sb, "staging");
+    sb.golden_steps(
+        "kubeconfig/age_key_lost_refresh_yes",
+        &[
+            &["kubeconfig", "--refresh", "--yes"],
+            &["kubeconfig"],
+            &["kubeconfig", "--target", "staging"],
+            &["argocd-password"],
+        ],
+    );
+    servers.assert();
+    let calls = |tool: &str| fs::read_to_string(sb.path(&format!("{tool}.log"))).expect(tool);
+    let ssh = calls("ssh");
+    assert_eq!(ssh.lines().count(), 1, "{ssh}");
+    assert!(
+        ssh.trim_end()
+            .ends_with(" root@203.0.113.10 cat /etc/rancher/k3s/k3s.yaml"),
+        "{ssh}"
+    );
+    assert_eq!(
+        calls("kubectl").lines().count(),
+        1,
+        "the password is read once"
+    );
+    let key = cli_core::secrets::load_identity(&age_key(&sb))
+        .expect("readable")
+        .expect("a new key");
+    let prod = hetzner_state(&sb, "prod");
+    let open = |slot: &str| {
+        cli_core::secrets::decrypt_with_identity(prod[slot].as_str().expect(slot), &key)
+            .expect("cached under the new key")
+    };
+    assert_eq!(
+        open("kubeconfig_age"),
+        NODE_KUBECONFIG.replace("127.0.0.1", "203.0.113.10")
+    );
+    assert_eq!(open("argocd_admin_password_age"), "new-password");
+    assert_eq!(hetzner_state(&sb, "staging"), staging_before);
+}
+
+/// A legacy plaintext kubeconfig needs no key, but the password fetched with it does: with
+/// another target's cache under a lost key, `argocd-password` refuses to create one (only
+/// `kubeconfig --refresh` does, after asking), before it writes anything.
+#[test]
+fn argocd_password_beside_a_lost_age_key_creates_none() {
+    let server = mockito::Server::new();
+    let (sb, _lost) = lost_key_sandbox(&server);
+    sb.seed_state(
+        "prod",
+        &serde_json::json!({"hetzner_cloud": {
+            "server_id": 42, "server_name": "prod-node", "kubeconfig_yaml": NODE_KUBECONFIG,
+        }})
+        .to_string(),
+    );
+    let tools = stand_in_tools(&sb);
+    let sb = sb.with_path(tools);
+    let before = hetzner_state(&sb, "prod");
+    sb.golden(
+        "kubeconfig/age_key_lost_password_with_plaintext_kubeconfig",
+        &["argocd-password"],
+    );
+    assert!(!age_key(&sb).exists(), "no key without asking");
+    assert_eq!(hetzner_state(&sb, "prod"), before);
+}
+
+/// GOTCHA-120 on every other command that reads a cache: each fails naming the way back, and
+/// none creates a key — not the password's read, not `--refresh` (which still needs the
+/// kubeconfig), not a command that talks to the cluster.
+#[test]
+fn reads_of_a_cache_with_the_age_key_lost() {
+    let server = mockito::Server::new();
+    let (sb, _lost) = lost_key_sandbox(&server);
+    let before = hetzner_state(&sb, "prod");
+    sb.golden_steps(
+        "kubeconfig/age_key_lost_reads",
+        &[
+            &["argocd-password"],
+            &["argocd-password", "--refresh"],
+            &["app", "list"],
+            &["cluster-bootstrap"],
+        ],
+    );
+    assert!(!age_key(&sb).exists(), "a read never creates a key");
+    assert_eq!(hetzner_state(&sb, "prod"), before);
+}

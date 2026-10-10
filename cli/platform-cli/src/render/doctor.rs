@@ -187,10 +187,12 @@ pub(crate) fn hint(c: &Check) -> Option<String> {
             "run `apprafter kubeconfig --refresh --target {target}` to replace the unencrypted \
              copy with an encrypted one"
         ),
-        // Not `--refresh`: it decrypts the cached copy first, so it cannot recover a lost key.
+        // `--refresh` never decrypts the cached copy on its way to a refetch (WI-457).
         CheckFix::AgeKeyMissing { path } => format!(
             "no age key at `{path}`, so the cached kubeconfig cannot be decrypted: restore the \
-             key it was cached with, or point `APPRAFTER_AGE_KEY` at it"
+             key it was cached with, or point `APPRAFTER_AGE_KEY` at it. If it is lost, \
+             `apprafter kubeconfig --refresh --target <name>` fetches the kubeconfig again under \
+             a new key, after listing what the new key cannot read and asking"
         ),
         CheckFix::ClusterUnreachable { reason } => cluster_hint(*reason),
         CheckFix::NodeUnreachable { address } => format!(
@@ -641,8 +643,8 @@ mod tests {
             "{age}"
         );
         assert!(
-            !age.contains("--refresh"),
-            "refresh cannot recover a lost key (Risks)"
+            age.contains("`apprafter kubeconfig --refresh --target <name>`"),
+            "refresh recovers a lost key (WI-457): {age}"
         );
         let unreachable = hint(&fail(
             CheckId::KubeApiReachable,

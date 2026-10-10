@@ -2345,7 +2345,7 @@
           "env": null,
           "required": false,
           "possible_values": [],
-          "help": "Force a re-fetch over SSH even if a cached kubeconfig is already in state"
+          "help": "Force a re-fetch over SSH even if a cached kubeconfig is already in state. With the age key lost, it caches the fresh copy under a new key, after listing what the new key cannot read and asking"
         },
         {
           "id": "target",
@@ -2358,6 +2358,18 @@
           "required": false,
           "possible_values": [],
           "help": "Override the active target for the credential resolution chain (see `apprafter apply --target`)"
+        },
+        {
+          "id": "yes",
+          "long": "yes",
+          "short": null,
+          "takes_value": false,
+          "value_name": "YES",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Agree to a new age key without asking, when the one the cache was encrypted under is lost"
         }
       ],
       "positionals": []

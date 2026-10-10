@@ -19,8 +19,9 @@ Aliases: `kc` — accepted on the command line, not listed in `--help`.
 
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
-| `--refresh` | flag | — | no | Force a re-fetch over SSH even if a cached kubeconfig is already in state |
+| `--refresh` | flag | — | no | Force a re-fetch over SSH even if a cached kubeconfig is already in state. With the age key lost, it caches the fresh copy under a new key, after listing what the new key cannot read and asking |
 | `--target` | — | — | no | Override the active target for the credential resolution chain (see `apprafter apply --target`) |
+| `--yes` | flag | — | no | Agree to a new age key without asking, when the one the cache was encrypted under is lost |
 
 Examples:
 

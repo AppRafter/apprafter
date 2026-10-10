@@ -261,8 +261,8 @@ pub mod codes {
 /// string. Splitting that string on `", "` is exact: the CLI only creates
 /// target names in `[A-Za-z0-9-]+`, and an empty string means an empty
 /// store. `apprafter::target::no_active` likewise always arrives as
-/// [`CoreError::NoActiveTarget`]. Every other `CliError` is wrapped
-/// unchanged.
+/// [`CoreError::NoActiveTarget`], and `apprafter::secrets::age_key_missing` as
+/// [`CoreError::AgeKeyMissing`]. Every other `CliError` is wrapped unchanged.
 impl From<cli_core::CliError> for CoreError {
     fn from(e: cli_core::CliError) -> Self {
         match e {
@@ -275,6 +275,8 @@ impl From<cli_core::CliError> for CoreError {
                     .collect(),
             },
             cli_core::CliError::NoActiveTarget => CoreError::NoActiveTarget,
+            // The CLI's own commands carry the target for their help; the core's shape has none.
+            cli_core::CliError::AgeKeyMissing { path, .. } => CoreError::AgeKeyMissing { path },
             other => CoreError::Cli(other),
         }
     }
@@ -548,8 +550,8 @@ fn neutral_help(e: &cli_core::CliError) -> Option<String> {
              fail on the other's repository lock."
         ),
         // CLI input policy and CLI-only commands (their help is about the command line), and
-        // errors no desktop flow reaches yet, whose help names CLI commands. `TargetNotFound`
-        // and `NoActiveTarget` arrive as the core's own variants (`From`).
+        // errors no desktop flow reaches yet, whose help names CLI commands. `TargetNotFound`,
+        // `NoActiveTarget` and `AgeKeyMissing` arrive as the core's own variants (`From`).
         C::CueExport { .. }
         | C::Restic { .. }
         | C::BackupRepoProbe { .. }
@@ -558,6 +560,8 @@ fn neutral_help(e: &cli_core::CliError) -> Option<String> {
         | C::ServerTypeNotSelected
         | C::TargetNotFound { .. }
         | C::NoActiveTarget
+        | C::AgeKeyMissing { .. }
+        | C::CacheUndecryptable { .. }
         | C::Yaml(_)
         | C::CompletionInstall(_)
         | C::ConfirmationRequired { .. }
@@ -882,6 +886,16 @@ pub mod samples {
                 origin: s("the manifest's `sshKeys[1]`"),
                 private_key: true,
                 from: KeySource::Manifest { index: 1 },
+            },
+            C::AgeKeyMissing {
+                path: s("/home/a/.config/apprafter/age.key"),
+                target: s("prod"),
+            },
+            C::CacheUndecryptable {
+                secret: cli_core::secrets::CachedSecret::Kubeconfig,
+                target: s("prod"),
+                path: s("/home/a/.config/apprafter/age.key"),
+                detail: s("age decrypt: No matching keys found"),
             },
             C::Other(s("o")),
         ];
@@ -1650,6 +1664,27 @@ mod tests {
         let ui = UiError::from(&e);
         assert_eq!(ui.code.as_deref(), Some("apprafter::target::no_active"));
         assert_eq!(ui.message, "no active target");
+    }
+
+    /// WI-457: the CLI's own commands raise `apprafter::secrets::age_key_missing` with the
+    /// target for their help; the core takes it as its own variant, so the code keeps one shape.
+    #[test]
+    fn a_cli_age_key_missing_takes_the_core_shape() {
+        let e = CoreError::from(cli_core::CliError::AgeKeyMissing {
+            path: "/k/age.key".into(),
+            target: "prod".into(),
+        });
+        assert!(
+            matches!(&e, CoreError::AgeKeyMissing { path } if path == "/k/age.key"),
+            "{e:?}"
+        );
+        let ui = UiError::from(&e);
+        assert_eq!(ui.code.as_deref(), Some(codes::AGE_KEY_MISSING));
+        assert_eq!(
+            ui.message,
+            "no age key at /k/age.key; the cached secrets cannot be decrypted"
+        );
+        assert_eq!(ui.fields.get("path"), Some(&json!("/k/age.key")));
     }
 
     #[test]

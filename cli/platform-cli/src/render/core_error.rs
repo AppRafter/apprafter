@@ -164,14 +164,10 @@ pub(crate) fn cli_help(e: &CoreError) -> Option<String> {
              kubeconfig again."
                 .into()
         }
-        // No `kubeconfig --refresh` here: today's `kubeconfig.rs:49` decrypts the cache with
-        // `load_or_create_identity` before it looks at `--refresh`, so with the key lost it
-        // creates a new key (a write) and then fails to decrypt (D.3c's gotcha, Task 11 Step 4).
-        CoreError::AgeKeyMissing { .. } => {
-            "Restore the age key file the cache was encrypted with, or set `APPRAFTER_AGE_KEY` \
-             to where it is."
-                .into()
-        }
+        // The CLI's own commands raise it with the target (`CliError::AgeKeyMissing`); the
+        // core's carries none. `kubeconfig --refresh` never decrypts the cache on its way to a
+        // refetch, so it is the way back from a lost key (WI-457, GOTCHA-121).
+        CoreError::AgeKeyMissing { .. } => cli_core::age_key_missing_help(None),
     })
 }
 
@@ -425,9 +421,9 @@ mod tests {
         assert!(help.contains(&format!("\"{RESIZE_GUIDE}\"")), "{help}");
     }
 
+    /// WI-457: restore the key, or fetch the kubeconfig again under a new one.
     #[test]
-    fn a_missing_age_key_is_never_sent_to_kubeconfig_refresh() {
-        // `kubeconfig --refresh` would create a new age key before it fails (kubeconfig.rs:49)
+    fn a_missing_age_key_names_restoring_it_and_the_recovery() {
         let help = report(CoreError::AgeKeyMissing {
             path: "/k/age.key".into(),
         })
@@ -435,7 +431,10 @@ mod tests {
         .unwrap()
         .to_string();
         assert!(help.contains("APPRAFTER_AGE_KEY"), "{help}");
-        assert!(!help.contains("--refresh"), "{help}");
+        assert!(
+            help.contains("`apprafter kubeconfig --refresh --target <name>`"),
+            "{help}"
+        );
     }
 
     #[test]

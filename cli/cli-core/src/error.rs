@@ -215,6 +215,42 @@ fn ssh_key_not_public_help(source: &crate::ssh_key::KeySource) -> String {
     format!("{what} {fix}")
 }
 
+/// The help of `apprafter::secrets::age_key_missing` (WI-457): restore the key, or fetch the
+/// kubeconfig again under a new one. `target` is whose cache it is; `None` names a placeholder
+/// (the core's `AgeKeyMissing` carries no target). The CLI's help for the core's variant uses it
+/// too, so both say the same.
+pub fn age_key_missing_help(target: Option<&str>) -> String {
+    let target = target.unwrap_or("<name>");
+    format!(
+        "Restore the age key file the cache was encrypted with, or set `APPRAFTER_AGE_KEY` to \
+         where it is. If the key is lost, `apprafter kubeconfig --refresh --target {target}` \
+         fetches the kubeconfig from the node again over SSH and caches it under a new key. A \
+         new key cannot read anything cached under the lost one, so the command lists those \
+         secrets and asks before it creates the key."
+    )
+}
+
+/// `CacheUndecryptable`'s help: the key it was cached under, or the command that fetches it
+/// again under the key there is now. `argocd-password` takes no `--target`: it reads the active
+/// target, the one whose cache it failed on.
+fn cache_undecryptable_help(secret: &crate::secrets::CachedSecret, target: &str) -> String {
+    use crate::secrets::CachedSecret;
+    let refetch = match secret {
+        CachedSecret::Kubeconfig => format!(
+            "`apprafter kubeconfig --refresh --target {target}` fetches it from the node again"
+        ),
+        CachedSecret::ArgocdPassword => {
+            "`apprafter argocd-password --refresh` fetches it from the cluster again".to_string()
+        }
+    };
+    format!(
+        "It was cached under a different age key (one that was lost and replaced), or the \
+         cached copy is damaged. If you still have the key it was cached under, set \
+         `APPRAFTER_AGE_KEY` to it. Otherwise {refetch} and caches it under the key at that \
+         path."
+    )
+}
+
 /// A provider request that got no answer — the name did not resolve, the connection was
 /// refused or dropped, the request timed out — as [`CliError::ProviderApiUnreachable`] carries
 /// it. `detail` is the HTTP client's account without the URL, which `endpoint` already names.
@@ -689,6 +725,35 @@ pub enum CliError {
         /// Where the key came from, which decides what fixes it ([`ssh_key_not_public_help`]).
         /// Not `source`: thiserror takes a field of that name for the error's cause.
         from: crate::ssh_key::KeySource,
+    },
+
+    /// The age key is absent where a cached secret needs it, and a read never creates one
+    /// (GOTCHA-120): a new key opens nothing cached before it. The core's `AgeKeyMissing`, same
+    /// code and message, as the CLI's own commands raise it, with the target whose cache it is
+    /// for the help's way back; the core takes it as its own variant (one shape per code).
+    #[error("no age key at {path}; the cached secrets cannot be decrypted")]
+    #[diagnostic(
+        code(apprafter::secrets::age_key_missing),
+        help("{}", age_key_missing_help(Some(target)))
+    )]
+    AgeKeyMissing { path: String, target: String },
+
+    /// A cached secret the age key at `path` cannot decrypt: it was cached under another key,
+    /// or the ciphertext is damaged. `detail` is the age library's own account.
+    #[error(
+        "the {} cached for target `{target}` cannot be decrypted with the age key at {path}: \
+         {detail}",
+        secret.noun()
+    )]
+    #[diagnostic(
+        code(apprafter::secrets::cache_undecryptable),
+        help("{}", cache_undecryptable_help(secret, target))
+    )]
+    CacheUndecryptable {
+        secret: crate::secrets::CachedSecret,
+        target: String,
+        path: String,
+        detail: String,
     },
 
     /// Catch-all, free-form message. New call sites should prefer
@@ -1451,6 +1516,75 @@ mod tests {
         assert_eq!(code_of(&err), "apprafter::cli::usage_refused");
         assert_eq!(err.to_string(), "`--provider` is required");
         assert_eq!(help_of(&err), "Supported providers: hetzner-cloud.");
+    }
+
+    /// WI-457: the CLI's own commands raise the core's code and message, and the help names
+    /// the way back for the target whose cache it is: restore the key, or fetch the kubeconfig
+    /// again under a new one (`kubeconfig --refresh`, which asks first).
+    #[test]
+    fn a_missing_age_key_names_the_recovery_for_its_target() {
+        let err = CliError::AgeKeyMissing {
+            path: "/k/age.key".into(),
+            target: "prod".into(),
+        };
+        assert_eq!(code_of(&err), "apprafter::secrets::age_key_missing");
+        assert_eq!(
+            err.to_string(),
+            "no age key at /k/age.key; the cached secrets cannot be decrypted"
+        );
+        let help = help_of(&err);
+        for part in [
+            "APPRAFTER_AGE_KEY",
+            "`apprafter kubeconfig --refresh --target prod`",
+            "new key",
+        ] {
+            assert!(help.contains(part), "{part:?} missing: {help}");
+        }
+        assert!(!help.contains("file an issue"), "{help}");
+        assert_eq!(help, age_key_missing_help(Some("prod")));
+        assert!(
+            age_key_missing_help(None).contains("`apprafter kubeconfig --refresh --target <name>`"),
+            "{}",
+            age_key_missing_help(None)
+        );
+    }
+
+    /// WI-457: a cached secret the key there cannot open names the command that fetches that
+    /// secret again under it: `argocd-password` takes no `--target` (it works on the active one).
+    #[test]
+    fn an_undecryptable_cache_names_how_to_fetch_it_again() {
+        use crate::secrets::CachedSecret;
+        let err = |secret| CliError::CacheUndecryptable {
+            secret,
+            target: "prod".into(),
+            path: "/k/age.key".into(),
+            detail: "age decrypt: No matching keys found".into(),
+        };
+        let kube = err(CachedSecret::Kubeconfig);
+        assert_eq!(code_of(&kube), "apprafter::secrets::cache_undecryptable");
+        assert_eq!(
+            kube.to_string(),
+            "the kubeconfig cached for target `prod` cannot be decrypted with the age key at \
+             /k/age.key: age decrypt: No matching keys found"
+        );
+        let help = help_of(&kube);
+        assert!(
+            help.contains("APPRAFTER_AGE_KEY")
+                && help.contains("`apprafter kubeconfig --refresh --target prod`"),
+            "{help}"
+        );
+        let argocd = err(CachedSecret::ArgocdPassword);
+        assert!(
+            argocd
+                .to_string()
+                .starts_with("the Argo CD admin password cached for target `prod`"),
+            "{argocd}"
+        );
+        let help = help_of(&argocd);
+        assert!(
+            help.contains("`apprafter argocd-password --refresh`") && !help.contains("--target"),
+            "{help}"
+        );
     }
 
     #[test]

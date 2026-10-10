@@ -343,6 +343,58 @@ whole case, including how to tell whether tonight's scheduled backup is
 stuck: [the backup runner's pod cannot be
 scheduled](backup-restore.md#runner-unschedulable).
 
+### `apprafter::secrets::age_key_missing` {#age-key-missing}
+
+The age key that the cached kubeconfig and Argo CD password are
+encrypted under is not at the path the error names —
+`APPRAFTER_AGE_KEY`, or `~/.config/apprafter/age.key` by default (see
+[Environment variables](../reference/environment.md)). A command that
+reads a cache never creates a key in its place: a new key cannot
+decrypt anything cached under the old one. `apprafter doctor` reports
+the same on its **Kube API reachable** row.
+
+**Fix.** If you still have the key, put it back at that path, or set
+`APPRAFTER_AGE_KEY` to where it is. Nothing else is needed.
+
+If the key is lost, fetch the kubeconfig again under a new key:
+
+```sh
+apprafter kubeconfig --refresh --target <name>
+```
+
+It reads `/etc/rancher/k3s/k3s.yaml` from the target's node over SSH,
+as the first fetch did, and changes nothing on the node or in the
+cluster. Before it creates the key it lists everything else cached
+under the lost key, which the new key cannot read, and asks; without a
+terminal it refuses unless you pass `--yes`. The key is created only
+once the node has answered, so a failed fetch leaves none behind.
+
+What the new key leaves behind, and the way back for each:
+
+| Cached under the lost key | After the new key |
+| --- | --- |
+| The target's kubeconfig | Fetched again by the command itself. |
+| The target's Argo CD admin password | Dropped from the cache: `apprafter argocd-password` fetches it from the cluster again. It reads `argocd-initial-admin-secret`; if you deleted that secret after changing the password, use the password you set. |
+| Another target's kubeconfig | `apprafter kubeconfig --refresh --target <other>` fetches it again under the new key, without asking: the key exists now. |
+| Another target's Argo CD admin password | `apprafter argocd-password --refresh` while that target is active (`apprafter target use <other>`), after its kubeconfig. |
+
+`apprafter up` never creates a key in place of a lost one: its
+`k3s-ready` step stops at once with this error, and runs through once
+the command above has created the new key.
+
+### `apprafter::secrets::cache_undecryptable` {#cache-undecryptable}
+
+A cached kubeconfig or Argo CD password does not decrypt with the age
+key there is. It was cached under another key — one that was lost and
+replaced, or one `APPRAFTER_AGE_KEY` no longer points at — or the
+cached copy is damaged.
+
+**Fix.** If you have the key it was cached under, set
+`APPRAFTER_AGE_KEY` to it. Otherwise fetch it again under the key
+there is: `apprafter kubeconfig --refresh --target <name>` for a
+kubeconfig, `apprafter argocd-password --refresh` for the password of
+the active target. Neither asks, since the key they cache under exists.
+
 ### `apprafter::cli::other`
 
 Catch-all for messages that haven't been promoted to a typed

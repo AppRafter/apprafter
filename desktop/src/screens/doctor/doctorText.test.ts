@@ -164,7 +164,9 @@ describe('fixText', () => {
     );
     expect(fixed({ kind: 'age_key_missing', path: '/k/age.key' })).toBe(
       'There is no age key at /k/age.key, so the cached kubeconfig cannot be decrypted: ' +
-        'restore the key it was cached with.',
+        'restore the key it was cached with. If the key is lost, fetching the kubeconfig from ' +
+        'the server again caches it under a new key, and what was cached under the lost one has ' +
+        'to be fetched again too.',
     );
     expect(fixed({ kind: 'explain', text: '`helm` exited 1 without printing a version' })).toBe(
       '`helm` exited 1 without printing a version',

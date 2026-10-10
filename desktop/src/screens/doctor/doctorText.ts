@@ -116,7 +116,8 @@ export function fixText(check: Check, target: string | null): string | null {
         ? `Fetch it from the server, cached encrypted: ${kubeconfigCommand(fix.target, false)}.`
         : `Replace the unencrypted copy with an encrypted one: ${kubeconfigCommand(fix.target, true)}.`;
     case 'age_key_missing':
-      return `There is no age key at ${fix.path}, so the cached kubeconfig cannot be decrypted: restore the key it was cached with.`;
+      // No command (WI-457): the way back from a lost key is the CLI's, described as what it does.
+      return `There is no age key at ${fix.path}, so the cached kubeconfig cannot be decrypted: restore the key it was cached with. If the key is lost, fetching the kubeconfig from the server again caches it under a new key, and what was cached under the lost one has to be fetched again too.`;
     case 'cluster_unreachable':
       return kubeText(fix.reason, target);
     case 'node_unreachable':
