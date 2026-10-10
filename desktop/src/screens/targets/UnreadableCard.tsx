@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
-// A target whose files cannot be read: listed with what the store said, never hidden (R7: the
-// CLI only logs it), tagged when the CLI default names it. It offers nothing to open — there is
+// A target whose config.yaml cannot be read (the list reads no other file): listed with what the
+// store said, never hidden (R7: the CLI only logs it), tagged when the CLI default names it. It offers nothing to open — there is
 // no report to show — and one action: remove it from this computer (WI-458), through the same
 // destructive plan as the Target screen's (its lines name the file that cannot be read).
 import { useId } from 'react';

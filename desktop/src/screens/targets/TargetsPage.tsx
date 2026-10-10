@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 // The Targets view: every target in the local target store (target_list), each opening in its
-// own tab; an unreadable one gets a card saying why, and can be removed (WI-458: the same
-// destructive plan as the Target screen's); a CLI default that names no target, or one that cannot
-// be read, says so. Make default for the CLI runs the reversible use plan at once.
+// own tab; one whose config.yaml cannot be read gets a card saying why, and can be removed
+// (WI-458: the same destructive plan as the Target screen's); a CLI default that names no target,
+// or one that cannot be read, says so. Make default for the CLI runs the reversible use plan at
+// once; the core refuses a target whose files cannot be read (WI-458 review #4), shown here.
 import { useCallback, useState } from 'react';
 import { ErrorPanel } from '../../components/ErrorPanel';
 import { SpinnerGapIcon } from '../../components/icons';
@@ -29,7 +30,8 @@ export function TargetsPage({ onOpen, openTargets, onRemoved }: TargetsPageProps
   const list = useTargetList();
   const [failure, setFailure] = useState<UiError | null>(null);
   const makeDefault = useMakeDefault(setFailure);
-  const removeTarget = useRemoveTarget(onRemoved, setFailure);
+  // The view is not the target's: its tabs close the moment the removal ends (review #5).
+  const removeTarget = useRemoveTarget(onRemoved, setFailure, { closeAtOnce: true });
   const onMakeDefault = useCallback(
     (name: string) => {
       setFailure(null);

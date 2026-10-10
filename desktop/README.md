@@ -15,10 +15,10 @@ What works today:
   person signed in to this computer.
 - If nothing on the computer can confirm you, the lock stays off and a banner says so.
 - The Targets page: the target store the CLI uses, every target with its provider, region,
-  server type and tier, the CLI default marked, and targets whose files cannot be read shown
-  with the reason. Each target opens in its own tab, and **Make default for the CLI** makes it
-  the CLI default. A target whose files cannot be read cannot be opened, but its card can remove
-  it, with the same confirmation as the Target screen.
+  server type and tier, the CLI default marked, and targets whose `config.yaml` cannot be read
+  shown with the reason. Each target opens in its own tab, and **Make default for the CLI** makes
+  it the CLI default. A target whose `config.yaml` cannot be read cannot be opened, but its card
+  can remove it, with the same confirmation as the Target screen.
 - The Target screen: what `apprafter target show` prints for the tab's target, and these
   changes to it:
   - Rename it. Its config, credentials and local state move to the new name, and the tab
@@ -33,10 +33,12 @@ What works today:
     nothing on the computer can confirm you, the app cannot remove a target;
     `apprafter target remove <name>` in a terminal still can.
 
-  A target whose credentials file cannot be read still opens here. The screen says why, and
-  it can still remove the target. When a target's files cannot be read, the confirmation names
-  the file. If the target's local state records a server, it also says that the app can neither
-  check nor destroy that server.
+  The Targets page reads only each target's `config.yaml`, so a target whose
+  `credentials.yaml` cannot be read has an ordinary card and opens here. The screen says why it
+  cannot show the target, and its Danger zone can still remove it. Until the file is fixed, the
+  target cannot be made the CLI default. When a target's files cannot be read, the confirmation
+  names the file. If the target's local state records a server, it also says that the app can
+  neither check nor destroy that server.
 
   The Machine row shows the server type the target is set to. For a target with a server it
   also names the server and gives the CLI commands that move it to another machine.

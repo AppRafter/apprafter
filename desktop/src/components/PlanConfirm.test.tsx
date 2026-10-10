@@ -21,7 +21,7 @@ import { PlatformContext } from '../state/platform';
 import { createQueryClient } from '../state/queryClient';
 import { appInfo } from '../test/fixtures';
 import { planParts } from '../test/flows';
-import { completed, failed, installHarness, uiError as uiErrorOf } from '../test/ipc';
+import { cancelled, completed, failed, installHarness, uiError as uiErrorOf } from '../test/ipc';
 import { renderScreen } from '../test/screens';
 import { settleIpc } from '../test/settle';
 import { tabHost } from '../test/tab';
@@ -161,9 +161,10 @@ test('a reversible plan has no dialog: it is refused', () => {
 
 /**
  * A confirm in a tab (test/tab.tsx), its plan run waiting on the IPC harness until `end(event)`;
- * the tab can be hidden, shown and closed as the Shell does.
+ * the tab can be hidden, shown and closed as the Shell does. `onRan`, when given, is the
+ * confirm's.
  */
-async function confirmedInTab() {
+async function confirmedInTab(onRan?: (result: unknown) => void) {
   clearMocks();
   const h = installHarness();
   let channel: { id: number } | null = null;
@@ -185,6 +186,7 @@ async function confirmedInTab() {
               confirmLabel="Rename"
               auth={null}
               {...handles}
+              {...(onRan !== undefined && { onRan })}
             />
           </tab.Tab>
         </ToastProvider>
@@ -215,6 +217,49 @@ test('a plan that ends while its tab is hidden: onDone once the tab is back, not
   expect(handles.onDone).toHaveBeenCalledTimes(1);
   await waitFor(() => expect(handles.onClose).toHaveBeenCalledTimes(1));
   expect(endedAwaySnapshot()).toEqual([]);
+});
+
+// WI-458 review #5: what a run changed for the whole app (a removed target's tabs, the list)
+// cannot wait for a hidden screen; only what the screen shows does.
+test('onRan runs the moment the plan ends, its tab hidden; onDone once the tab is back', async () => {
+  const onRan = mock();
+  const { handles, tab, end } = await confirmedInTab(onRan);
+  tab.hide();
+  await end(completed({ name: 'prod' }));
+  expect(onRan.mock.calls).toEqual([[{ name: 'prod' }]]);
+  expect(handles.onDone).not.toHaveBeenCalled();
+  tab.show();
+  await waitFor(() => expect(handles.onDone).toHaveBeenCalledWith({ name: 'prod' }));
+  expect(onRan).toHaveBeenCalledTimes(1);
+  expect(endedAwaySnapshot()).toEqual([]);
+});
+
+test('onRan runs when its tab closed during the run too; the end shows at the app level', async () => {
+  const onRan = mock();
+  const { view, handles, tab, end } = await confirmedInTab(onRan);
+  tab.close();
+  await end(completed({ name: 'prod' }));
+  expect(onRan.mock.calls).toEqual([[{ name: 'prod' }]]);
+  expect(endedAwaySnapshot()).toEqual([
+    { opId: view.opId, text: 'Rename prod: done.', failed: false },
+  ]);
+  expect(handles.onDone).not.toHaveBeenCalled();
+});
+
+test('a run that failed calls no onRan', async () => {
+  const onRan = mock();
+  const { handles, end } = await confirmedInTab(onRan);
+  await end(failed(uiErrorOf('apprafter::target::busy', 'prod is busy')));
+  await waitFor(() => expect(handles.onFailed).toHaveBeenCalledTimes(1));
+  expect(onRan).not.toHaveBeenCalled();
+});
+
+test('a run that was cancelled calls no onRan', async () => {
+  const onRan = mock();
+  const { handles, end } = await confirmedInTab(onRan);
+  await end(cancelled());
+  await waitFor(() => expect(handles.onFailed).toHaveBeenCalledTimes(1));
+  expect(onRan).not.toHaveBeenCalled();
 });
 
 test('a plan that fails while its tab is hidden: onFailed once the tab is back', async () => {

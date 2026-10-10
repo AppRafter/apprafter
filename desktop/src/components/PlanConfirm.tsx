@@ -10,8 +10,10 @@
 // runs a confirmed plan on; ipc/lifecycle.ts), it leaves the end to the app, which shows it and
 // only then discards it (ipc/away.ts): held covers a plan not yet started, away one that started,
 // so no plan is discarded twice. Only hidden (its tab's <Activity>), it keeps the end and applies
-// it when it is shown again. Its screen gone while Rust asks a destructive plan's gesture, a
-// refusal discards the plan the prompt kept from the hold's discard.
+// it when it is shown again; what the run changed for the whole app (onRan: a removed target's
+// tabs, the list) is done the moment it ends, shown, hidden or gone. Its screen gone while Rust
+// asks a destructive plan's gesture, a refusal discards the plan the prompt kept from the hold's
+// discard.
 import { type ReactNode, useRef } from 'react';
 import * as api from '../ipc/api';
 import { keepEndedAway } from '../ipc/away';
@@ -38,6 +40,14 @@ export interface PlanConfirmProps {
   readonly requireText?: string;
   readonly icon?: Icon;
   readonly auth: AuthInfo | null;
+  /**
+   * It ran: what the run changed for the whole app, done the moment it ends whether its screen
+   * is shown, hidden or gone (WI-458 review #5: a removal from a hidden Targets view left the
+   * removed target's tab open until the view was shown again). What the screen shows of the end,
+   * a toast, stays in onDone, which waits for the screen to be shown.
+   */
+  readonly onRan?: (result: JsonValue) => void;
+  /** It ran, and its screen is shown (at once, or on its next show). */
   readonly onDone: (result: JsonValue) => void;
   /** It ran and failed, or was cancelled: the dialog closes, and the caller shows this. */
   readonly onFailed: (error: UiError) => void;
@@ -52,6 +62,7 @@ export function PlanConfirm({
   requireText,
   icon,
   auth,
+  onRan,
   onDone,
   onFailed,
   onClose,
@@ -98,6 +109,10 @@ export function PlanConfirm({
     started.current = true;
     releasePlan(view.opId);
     const end = await run.ended;
+    // What it changed for the app, now: never behind a hidden screen's next show.
+    if (onRan !== undefined && end.state !== 'failed' && end.outcome.status === 'completed') {
+      onRan(end.outcome.result);
+    }
     // Its screen went: the app shows the end (startPlan kept it away).
     if (scope.gone()) return;
     await new Promise<void>((resolve) => {

@@ -207,6 +207,17 @@ export function useChangeSshKey(
   }, [name, onFailed, show, toast, client, confirm]);
 }
 
+export interface RemoveTargetOptions {
+  /**
+   * Close the target's tabs and read the store again the moment the run ends, shown or not: the
+   * Targets page's, whose view is not the target's own (WI-458 review #5: hidden, it left the
+   * removed target's tab open, maybe on screen, until it was shown again). The Target screen
+   * leaves both to its next show: the tab that closes is its own, and closing it at once would
+   * end the confirm's scope and turn its toast into the app's notice.
+   */
+  readonly closeAtOnce?: boolean;
+}
+
 /**
  * Remove a target from this computer: the destructive plan (op_plan_target_remove, which takes a
  * target whose files cannot be read too, WI-458), its confirm — the full plan, the typed name —
@@ -218,6 +229,7 @@ export function useChangeSshKey(
 export function useRemoveTarget(
   onRemoved: (name: string) => void,
   onFailed: (error: UiError) => void,
+  { closeAtOnce = false }: RemoveTargetOptions = {},
 ): (name: string) => Promise<void> {
   const toast = useToast();
   const client = useQueryClient();
@@ -231,6 +243,11 @@ export function useRemoveTarget(
         onFailed(refusalOf(reason));
         return;
       }
+      /** The target is gone: what showed it closes, and the store is read again. */
+      const gone = () => {
+        onRemoved(name);
+        refreshTargets(client, name);
+      };
       confirm({
         view,
         title: `Remove target ${name}?`,
@@ -238,15 +255,14 @@ export function useRemoveTarget(
         body: 'Deletes its config, token and local state from this computer. Nothing changes at the provider.',
         requireText: name,
         confirmLabel: 'Remove target',
+        ...(closeAtOnce && { onRan: gone }),
         onDone: (result) => {
-          const out = result as unknown as TargetRemoved;
-          onRemoved(name);
-          refreshTargets(client, name);
-          toast({ message: removedMessage(out), icon: TrashIcon });
+          if (!closeAtOnce) gone();
+          toast({ message: removedMessage(result as unknown as TargetRemoved), icon: TrashIcon });
         },
       });
     },
-    [toast, client, confirm, onRemoved, onFailed],
+    [toast, client, confirm, onRemoved, onFailed, closeAtOnce],
   );
 }
 

@@ -3,13 +3,14 @@
 // unreadable target's removal through the destructive plan (WI-458).
 import { afterEach, beforeEach, expect, mock, test } from 'bun:test';
 import { clearMocks, mockIPC } from '@tauri-apps/api/mocks';
-import { screen, waitFor, within } from '@testing-library/react';
+import { act, screen, waitFor, within } from '@testing-library/react';
 import * as api from '../../ipc/api';
 import { installMockIpc } from '../../ipc/mock';
 import { resetOperations } from '../../ipc/operations';
 import { startPlan } from '../../ipc/plans';
 import { renderScreen } from '../../test/screens';
 import { settleIpc } from '../../test/settle';
+import { tabHost } from '../../test/tab';
 import { TargetsPage } from './TargetsPage';
 
 beforeEach(async () => {
@@ -242,4 +243,51 @@ test('a refused removal is shown on the page', async () => {
   await user.click(within(card).getByRole('button', { name: 'Remove broken' }));
   expect((await screen.findByRole('alert')).textContent).toContain('target `broken` not found');
   expect(screen.queryByRole('dialog')).toBeNull();
+});
+
+// WI-458 review #5: a removal started here goes on while the page is hidden (another tab shown,
+// perhaps the removed target's own). Its tabs close and the store is read again the moment it
+// ends; only the toast, which this page shows, waits for the page to be shown again.
+test('a removal that ends while the page is hidden closes the tabs at once; the toast waits', async () => {
+  const internals = (
+    window as unknown as {
+      __TAURI_INTERNALS__: { invoke: (cmd: string, args?: unknown, options?: unknown) => unknown };
+    }
+  ).__TAURI_INTERNALS__;
+  const invoke = internals.invoke;
+  let release: () => void = () => {};
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let executing = false;
+  internals.invoke = async (cmd, args, options) => {
+    if (cmd === 'op_execute') {
+      executing = true;
+      await held;
+    }
+    return invoke(cmd, args, options);
+  };
+  const onRemoved = mock();
+  const tab = tabHost();
+  const user = renderScreen(
+    <tab.Tab>
+      <TargetsPage onOpen={() => {}} openTargets={new Set()} onRemoved={onRemoved} />
+    </tab.Tab>,
+  );
+  const card = await screen.findByRole('article', { name: 'broken' });
+  await user.click(within(card).getByRole('button', { name: 'Remove broken' }));
+  const confirm = await screen.findByRole('dialog', { name: 'Remove target broken?' });
+  await user.type(within(confirm).getByLabelText(/Type broken to confirm/), 'broken');
+  await user.click(within(confirm).getByRole('button', { name: 'Remove target' }));
+  await waitFor(() => expect(executing).toBe(true));
+  tab.hide();
+  await act(async () => {
+    release();
+    await settleIpc();
+  });
+  await waitFor(() => expect(onRemoved).toHaveBeenCalledWith('broken'));
+  expect(screen.queryByText('Removed broken from this computer')).toBeNull();
+  tab.show();
+  expect(await screen.findByText('Removed broken from this computer')).toBeDefined();
+  expect(onRemoved).toHaveBeenCalledTimes(1);
 });
