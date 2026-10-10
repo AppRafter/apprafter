@@ -2,27 +2,26 @@
 // Target › Machine › Change (spec §7, target machine): the machine picker on the target's own
 // catalogue (read with its stored token), opened on the machine the target is set to. "Apply
 // machine" is the Bounded plan's plain confirm (spec §4.4); a Destructive plan would open D.3d's
-// PlanConfirm first. A provisioned target never gets here (D.3d's Machine row offers the rebuild
+// PlanConfirm first, through D.3d's useConfirm: in a tab, the tab holds that plan until it runs,
+// so closing the tab discards it (heldPlans). A provisioned target never gets here (D.3d's Machine row offers the rebuild
 // recipe instead); if one was provisioned meanwhile, the core's refusal is shown as it is.
 import { useQueryClient } from '@tanstack/react-query';
 import { useEffect, useRef, useState } from 'react';
 import { Button } from '../../components/Button';
 import { ErrorPanel } from '../../components/ErrorPanel';
 import { HardDrivesIcon, SpinnerGapIcon } from '../../components/icons';
-import { PlanConfirm } from '../../components/PlanConfirm';
 import { StatePanel } from '../../components/StatePanel';
 import { useToast } from '../../components/Toast';
 import { Wizard } from '../../components/Wizard';
 import * as api from '../../ipc/api';
 import type { MachineCatalogue } from '../../ipc/generated/MachineCatalogue';
 import type { MachineSet } from '../../ipc/generated/MachineSet';
-import type { PlanView } from '../../ipc/generated/PlanView';
 import type { RegionLatency } from '../../ipc/generated/RegionLatency';
 import type { UiError } from '../../ipc/generated/UiError';
 import { failureOf, runPlan } from '../../ipc/plans';
-import { usePlatform } from '../../state/platform';
 import { useRead } from '../../state/read';
 import { TARGETS_KEY, targetKey } from '../../state/targets';
+import { useConfirm } from '../target/actions';
 import { choosable, defaultRegion, defaultSku, latencyView, offerIn } from './catalogue';
 import { MachinePicker } from './MachinePicker';
 
@@ -55,7 +54,6 @@ export interface ChangeMachineDialogProps {
 }
 
 export function ChangeMachineDialog({ target, now, onClose }: ChangeMachineDialogProps) {
-  const info = usePlatform();
   const client = useQueryClient();
   const toast = useToast();
   const catalogueRead = useRead<MachineCatalogue>();
@@ -63,7 +61,7 @@ export function ChangeMachineDialog({ target, now, onClose }: ChangeMachineDialo
   const [choice, setChoice] = useState<Choice | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<UiError | null>(null);
-  const [confirm, setConfirm] = useState<PlanView | null>(null);
+  const confirmPlan = useConfirm(setError);
   // Whether the dialog is still there to show the end (a lock or a closed tab takes it).
   const alive = useRef(true);
   useEffect(() => {
@@ -123,7 +121,13 @@ export function ChangeMachineDialog({ target, now, onClose }: ChangeMachineDialo
       const plan = await api.opPlanTargetMachine(target, sku, region);
       if (plan.class === 'destructive') {
         setSaving(false);
-        setConfirm(plan); // its dialog first
+        // Its dialog first: an overlay of its own, the plan held by the tab.
+        confirmPlan({
+          view: plan,
+          title: plan.title,
+          confirmLabel: 'Apply machine',
+          onDone: (result) => done(result as MachineSet),
+        });
         return;
       }
       // Bounded: the Apply click was its plain confirm.
@@ -172,34 +176,19 @@ export function ChangeMachineDialog({ target, now, onClose }: ChangeMachineDialo
     );
 
   return (
-    <>
-      <Wizard
-        title={`Change machine · ${target}`}
-        hint="Prices from the provider, excl. VAT"
-        nextLabel={saving ? 'Applying…' : 'Apply machine'}
-        nextDisabled={!chosen || unchanged}
-        busy={saving}
-        onNext={() => {
-          void apply();
-        }}
-        onClose={onClose}
-      >
-        {body}
-        {error !== null && <ErrorPanel error={error} />}
-      </Wizard>
-      {/* Beside the frame, not in it: the frame is a form, and the confirm's own form would sit
-          inside it, its submit bubbling up to Apply (GOTCHA-144). */}
-      {confirm !== null && (
-        <PlanConfirm
-          view={confirm}
-          title={confirm.title}
-          confirmLabel="Apply machine"
-          auth={info.auth}
-          onDone={(result) => done(result as MachineSet)}
-          onFailed={setError}
-          onClose={() => setConfirm(null)}
-        />
-      )}
-    </>
+    <Wizard
+      title={`Change machine · ${target}`}
+      hint="Prices from the provider, excl. VAT"
+      nextLabel={saving ? 'Applying…' : 'Apply machine'}
+      nextDisabled={!chosen || unchanged}
+      busy={saving}
+      onNext={() => {
+        void apply();
+      }}
+      onClose={onClose}
+    >
+      {body}
+      {error !== null && <ErrorPanel error={error} />}
+    </Wizard>
   );
 }

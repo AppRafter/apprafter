@@ -6,10 +6,12 @@ import { act, cleanup, render, screen, waitFor, within } from '@testing-library/
 import userEvent from '@testing-library/user-event';
 import { ToastProvider, ToastViewport } from '../../components/Toast';
 import { endedAwaySnapshot, resetEndedAway } from '../../ipc/away';
+import { discardPlansOf, resetHeldPlans } from '../../ipc/heldPlans';
 import { resetOperations } from '../../ipc/operations';
 import { ViewFrame } from '../../shell/ViewFrame';
 import { PlatformContext } from '../../state/platform';
 import { createQueryClient } from '../../state/queryClient';
+import { TabContext } from '../../state/tab';
 import { appInfo } from '../../test/fixtures';
 import { catalogue, machineSet, planParts } from '../../test/flows';
 import {
@@ -32,10 +34,16 @@ afterEach(() => {
   cleanup();
   resetOperations();
   resetEndedAway();
+  resetHeldPlans();
   clearMocks();
 });
 
-function renderChange(target: string, now: MachineNow, strict = false) {
+function renderChange(
+  target: string,
+  now: MachineNow,
+  strict = false,
+  tabKey: string | null = null,
+) {
   const onClose = mock();
   const client = createQueryClient();
   const invalidated = spyOn(client, 'invalidateQueries');
@@ -43,9 +51,17 @@ function renderChange(target: string, now: MachineNow, strict = false) {
     <QueryClientProvider client={client}>
       <PlatformContext value={appInfo()}>
         <ToastProvider>
-          <ViewFrame>
-            <ChangeMachineDialog target={target} now={now} onClose={onClose} />
-          </ViewFrame>
+          {tabKey === null ? (
+            <ViewFrame>
+              <ChangeMachineDialog target={target} now={now} onClose={onClose} />
+            </ViewFrame>
+          ) : (
+            <TabContext value={{ tab: { key: tabKey, target, section: 'target' }, active: true }}>
+              <ViewFrame>
+                <ChangeMachineDialog target={target} now={now} onClose={onClose} />
+              </ViewFrame>
+            </TabContext>
+          )}
           <ToastViewport />
         </ToastProvider>
       </PlatformContext>
@@ -233,6 +249,26 @@ test('a change that ends after the dialog went keeps its end for the app', async
       },
     ]),
   );
+});
+
+test("in a tab, a Destructive plan's confirm is held by the tab: closing the tab discards it", async () => {
+  h.plan(
+    'op_plan_target_machine',
+    planParts({ class: 'destructive', title: 'Replace the machine of staging', target: 'staging' }),
+    [completed(machineSet())],
+  );
+  const { user } = renderChange('staging', STAGING, false, 'tab-1');
+  await waitFor(() => expect(radio('cx22').checked).toBe(true));
+  await user.click(radio('cpx22'));
+  await user.click(apply());
+  expect(
+    await screen.findByRole('dialog', { name: 'Replace the machine of staging' }),
+  ).toBeDefined();
+  discardPlansOf('tab-1'); // the Shell tells it when the tab closes
+  expect(h.of('op_discard').map((c) => c.args)).toContainEqual({
+    opId: h.started('op_plan_target_machine')[0],
+  });
+  expect(h.of('op_execute')).toHaveLength(0);
 });
 
 test("a Destructive plan opens D.3d's PlanConfirm first (guard)", async () => {

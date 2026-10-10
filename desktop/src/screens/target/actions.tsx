@@ -76,9 +76,10 @@ export function useMakeDefault(
 /**
  * A bounded or destructive plan's confirm, opened as an overlay of the current view. In a tab,
  * the tab holds the plan until it runs or the confirm closes, so the tab's closing discards it
- * (heldPlans); a plan made after its tab closed is discarded at once.
+ * (heldPlans); a plan made after its tab closed is discarded at once. Also Change machine's
+ * (D.3e): its own overlay, so its form is never inside the frame's (GOTCHA-144).
  */
-function useConfirm(onFailed: (error: UiError) => void) {
+export function useConfirm(onFailed: (error: UiError) => void) {
   const show = useOverlay();
   const { auth } = usePlatform();
   const owner = useTab()?.tab.key ?? null;
