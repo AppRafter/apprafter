@@ -6,9 +6,9 @@ $ apprafter kubeconfig --refresh
 The age key at <SANDBOX>/home/.config/apprafter/age.key is missing, so nothing cached under it can be decrypted.
 If you still have that key, put it back there, or set APPRAFTER_AGE_KEY to where it is, instead of going on.
 Going on creates a new age key at <SANDBOX>/home/.config/apprafter/age.key, fetches the kubeconfig of target `prod` from its node again over SSH, and caches it under the new key. The new key cannot read what the lost one encrypted:
-  - target `prod`: the Argo CD admin password, dropped from the cache (`apprafter argocd-password` fetches it from the cluster again)
+  - target `prod`: the Argo CD admin password, dropped from the cache (`apprafter argocd-password --target prod` fetches it from the cluster again)
   - target `staging`: the kubeconfig (`apprafter kubeconfig --refresh --target staging` fetches it again)
-  - target `staging`: the Argo CD admin password (`apprafter argocd-password --refresh` fetches it again while `staging` is the active target)
+  - target `staging`: the Argo CD admin password (`apprafter argocd-password --refresh --target staging` fetches it again, once its kubeconfig is fetched)
 Error: apprafter::cli::confirmation_required
 
   × non-interactive invocation: pass `--yes` to confirm creating a new age key

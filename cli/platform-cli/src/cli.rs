@@ -245,6 +245,11 @@ pub enum Commands {
         /// password is already in state.
         #[arg(long, default_value_t = false)]
         refresh: bool,
+        /// Work on this target instead of the active one: its
+        /// cached password, or its cluster through its cached
+        /// kubeconfig.
+        #[arg(long)]
+        target: Option<String>,
     },
     /// Stand a cluster up in one command: runs `apply` → polls for the
     /// k3s kubeconfig to become SSH-reachable → runs

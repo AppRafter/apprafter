@@ -195,6 +195,7 @@ pub const EXAMPLES: &[CommandExamples] = &[
         lines: &[
             "apprafter argocd-password",
             "apprafter argocd-password --refresh  # after the admin secret is rotated",
+            "apprafter argocd-password --target staging  # another target's, not the active one",
         ],
     },
     CommandExamples {

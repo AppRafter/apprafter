@@ -137,7 +137,9 @@ fn dispatch_cli(args: Cli) -> cli_core::Result<()> {
         // for `bootstrap-all --target X`, which must not fall back to
         // the active pointer at phase 3 (finding C1).
         Commands::ClusterBootstrap => commands::cluster_bootstrap::run(None)?,
-        Commands::ArgocdPassword { refresh } => commands::argocd_password::run(refresh)?,
+        Commands::ArgocdPassword { refresh, target } => {
+            commands::argocd_password::run(refresh, target.as_deref())?
+        }
         Commands::BootstrapAll {
             target,
             dry_run,

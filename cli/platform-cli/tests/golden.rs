@@ -2055,6 +2055,9 @@ const NODE_KUBECONFIG: &str =
 /// `GET /v1/servers`: the server `prod`'s state records, labelled and addressed.
 const SERVERS_42: &str = r#"{"servers":[{"id":42,"name":"prod-node","status":"running","labels":{"apprafter":"true"},"public_net":{"ipv4":{"ip":"203.0.113.10"}}}]}"#;
 
+/// `GET /v1/servers`: [`SERVERS_42`] and `staging`'s server, 43, at 203.0.113.11.
+const SERVERS_42_43: &str = r#"{"servers":[{"id":42,"name":"prod-node","status":"running","labels":{"apprafter":"true"},"public_net":{"ipv4":{"ip":"203.0.113.10"}}},{"id":43,"name":"staging-node","status":"running","labels":{"apprafter":"true"},"public_net":{"ipv4":{"ip":"203.0.113.11"}}}]}"#;
+
 /// `prod` (active) and `staging`, each caching both secrets under `lost`, which is on no disk.
 fn lost_key_sandbox(server: &mockito::Server) -> (Sandbox, age::x25519::Identity) {
     let lost = age::x25519::Identity::generate();
@@ -2078,8 +2081,9 @@ fn lost_key_sandbox(server: &mockito::Server) -> (Sandbox, age::x25519::Identity
     (sb, lost)
 }
 
-/// The stand-ins, alone on `PATH`: the node — `ssh … root@203.0.113.10 cat
-/// /etc/rancher/k3s/k3s.yaml` prints [`NODE_KUBECONFIG`] — and the cluster — `kubectl get secret
+/// The stand-ins, alone on `PATH`: the nodes — `ssh … root@203.0.113.10 cat
+/// /etc/rancher/k3s/k3s.yaml` (or `.11`, `staging`'s) prints [`NODE_KUBECONFIG`] — and the
+/// cluster — `kubectl get secret
 /// argocd-initial-admin-secret -n argocd …` prints the password `new-password`, base64 as the
 /// API holds it. Each logs its calls to `<sandbox>/<tool>.log`; anything else exits non-zero.
 fn stand_in_tools(sb: &Sandbox) -> PathBuf {
@@ -2089,7 +2093,7 @@ fn stand_in_tools(sb: &Sandbox) -> PathBuf {
     for (tool, call, answer) in [
         (
             "ssh",
-            "*' root@203.0.113.10 cat /etc/rancher/k3s/k3s.yaml'",
+            "*' root@203.0.113.1'[01]' cat /etc/rancher/k3s/k3s.yaml'",
             format!("printf '%s\\n'{body}"),
         ),
         (
@@ -2361,7 +2365,8 @@ fn kubeconfig_refresh_yes_recovers_from_a_lost_age_key() {
 
 /// A legacy plaintext kubeconfig needs no key, but the password fetched with it does: with
 /// another target's cache under a lost key, `argocd-password` refuses to create one (only
-/// `kubeconfig --refresh` does, after asking), before it writes anything.
+/// `kubeconfig --refresh` does, after asking), before it reads the cluster's secret (review #1:
+/// a read whose result could not be cached is not made) and before it writes anything.
 #[test]
 fn argocd_password_beside_a_lost_age_key_creates_none() {
     let server = mockito::Server::new();
@@ -2380,8 +2385,92 @@ fn argocd_password_beside_a_lost_age_key_creates_none() {
         "kubeconfig/age_key_lost_password_with_plaintext_kubeconfig",
         &["argocd-password"],
     );
+    assert!(!sb.path("kubectl.log").exists(), "the cluster is not read");
     assert!(!age_key(&sb).exists(), "no key without asking");
     assert_eq!(hetzner_state(&sb, "prod"), before);
+}
+
+/// Review #2: a first use — a legacy plaintext kubeconfig, no key, nothing encrypted anywhere —
+/// is no lost key: `argocd-password` reads the cluster, creates the key and caches the password
+/// under it.
+#[test]
+fn argocd_password_creates_the_key_on_a_first_use() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.seed_state(
+        "prod",
+        &serde_json::json!({"hetzner_cloud": {
+            "server_id": 42, "server_name": "prod-node", "kubeconfig_yaml": NODE_KUBECONFIG,
+        }})
+        .to_string(),
+    );
+    let tools = stand_in_tools(&sb);
+    let sb = sb.with_path(tools);
+    sb.golden(
+        "kubeconfig/age_key_first_use_password",
+        &["argocd-password"],
+    );
+    let kubectl = fs::read_to_string(sb.path("kubectl.log")).expect("kubectl is called");
+    assert_eq!(kubectl.lines().count(), 1, "{kubectl}");
+    let key = cli_core::secrets::load_identity(&age_key(&sb))
+        .expect("readable")
+        .expect("the first use creates the key");
+    let cached = hetzner_state(&sb, "prod")["argocd_admin_password_age"]
+        .as_str()
+        .expect("the password is cached")
+        .to_string();
+    assert_eq!(
+        cli_core::secrets::decrypt_with_identity(&cached, &key).expect("under that key"),
+        "new-password"
+    );
+}
+
+/// Review #3: the way back the new-key summary prints for ANOTHER target's caches, walked as
+/// printed. After `prod`'s recovery, `staging`'s kubeconfig is fetched again under the new key
+/// without a question (the key exists); its password, still under the lost key, then fails
+/// naming itself and `argocd-password --refresh --target staging`, which fetches it from the
+/// cluster again. No step switches the active target.
+#[test]
+fn the_way_back_for_another_targets_argocd_password() {
+    let mut server = mockito::Server::new();
+    let servers = json_route(&mut server, "/v1/servers", 200, SERVERS_42_43, TOKEN_A)
+        .expect(2)
+        .create();
+    let (sb, _lost) = lost_key_sandbox(&server);
+    let tools = stand_in_tools(&sb);
+    let sb = sb.with_path(tools);
+    sb.golden_steps(
+        "kubeconfig/age_key_lost_password_of_another_target",
+        &[
+            &["kubeconfig", "--refresh", "--yes"],
+            &["kubeconfig", "--refresh", "--target", "staging"],
+            &["argocd-password", "--target", "staging"],
+            &["argocd-password", "--refresh", "--target", "staging"],
+        ],
+    );
+    servers.assert();
+    let ssh = fs::read_to_string(sb.path("ssh.log")).expect("ssh");
+    assert_eq!(ssh.lines().count(), 2, "{ssh}");
+    assert!(ssh.contains(" root@203.0.113.11 cat "), "{ssh}");
+    let key = cli_core::secrets::load_identity(&age_key(&sb))
+        .expect("readable")
+        .expect("the new key");
+    let staging = hetzner_state(&sb, "staging");
+    let open = |slot: &str| {
+        cli_core::secrets::decrypt_with_identity(staging[slot].as_str().expect(slot), &key)
+            .expect("cached under the new key")
+    };
+    assert_eq!(
+        open("kubeconfig_age"),
+        NODE_KUBECONFIG.replace("127.0.0.1", "203.0.113.11")
+    );
+    assert_eq!(open("argocd_admin_password_age"), "new-password");
+    assert!(
+        fs::read_to_string(sb.path("apprafter-config/config.yaml"))
+            .expect("pointer")
+            .contains("active_target: prod"),
+        "the active target is never switched"
+    );
 }
 
 /// GOTCHA-120 on every other command that reads a cache: each fails naming the way back, and

@@ -5,7 +5,9 @@
 use std::io::Write;
 use std::path::Path;
 
-use cli_core::secrets::{default_age_key_path, encrypt_for_recipient, CachedSecret};
+use cli_core::secrets::{
+    default_age_key_path, encrypt_for_recipient, load_or_create_identity, CachedSecret,
+};
 use cli_core::{CliError, Result};
 use cli_providers::k8s::{KubectlCli, KubectlRunner};
 use cli_state::State;
@@ -19,13 +21,12 @@ const ARGOCD_NAMESPACE: &str = "argocd";
 const ARGOCD_ADMIN_SECRET: &str = "argocd-initial-admin-secret";
 const ARGOCD_ADMIN_KEY: &str = "password";
 
-pub fn run(refresh: bool) -> Result<()> {
-    info!(refresh, "argocd-password invoked");
+pub fn run(refresh: bool, target_override: Option<&str>) -> Result<()> {
+    info!(refresh, target_override, "argocd-password invoked");
 
-    // Per-target state (v0.1.154). `argocd-password` has no
-    // `--target` override — it always operates against the active
-    // target, matching the behaviour of the kubeconfig it reuses.
-    let resolved = resolve_state_paths(None)?;
+    // Per-target state (v0.1.154): the active target's, or `--target`'s (WI-457 review #7, so
+    // the way back for another target's password never needs a switch of the active one).
+    let resolved = resolve_state_paths(target_override)?;
     let target = resolved.target_name.as_str();
     let mut state = State::load_or_default(&resolved.paths)?;
     let hetzner = state.hetzner_cloud.clone().ok_or_else(|| {
@@ -47,15 +48,23 @@ pub fn run(refresh: bool) -> Result<()> {
 
     // Cold path: decrypt kubeconfig, fetch secret via kubectl,
     // encrypt password into state, print plaintext.
+    //
+    // The key the password is cached under is settled first, before the cluster is read: beside
+    // a lost key (a plaintext kubeconfig needs none, another target's cache does) the read
+    // would be thrown away (review #1). A lost key is `kubeconfig --refresh`'s to replace,
+    // after it asks.
+    let key = age_cache::key_for_new_secret(&resolved.store, target, &key_path)?;
     let kubeconfig = age_cache::cached_kubeconfig(&hetzner, target, &key_path)?;
     let kubeconfig_file = write_tempfile_with("apprafter-kubeconfig-", &kubeconfig)?;
 
     let plaintext = compute_argocd_password(&KubectlCli, kubeconfig_file.path())?;
 
-    // The key the kubeconfig opened with; a new one only on a first use (a plaintext
-    // kubeconfig, and nothing encrypted anywhere). A lost one is `kubeconfig --refresh`'s to
-    // replace, after it asks.
-    let identity = age_cache::key_for_new_secret(&resolved.store, target, &key_path)?;
+    // A first use (a plaintext kubeconfig, and nothing encrypted anywhere) creates the key now
+    // that there is something to cache.
+    let identity = match key {
+        Some(identity) => identity,
+        None => load_or_create_identity(&key_path)?,
+    };
     let armored = encrypt_for_recipient(&plaintext, &identity.to_public())?;
     let mut updated = hetzner.clone();
     updated.argocd_admin_password_age = Some(armored);

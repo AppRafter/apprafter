@@ -77,21 +77,23 @@ pub(crate) fn cached_kubeconfig(
     }
 }
 
-/// The key to cache a new secret of `target` under, for a command that never asks: the key at
-/// `key_path`, or a new one on a first use. With anything cached anywhere the key it was cached
-/// under is lost, and the refusal names `apprafter kubeconfig --refresh`, which asks.
+/// The key to cache a new secret of `target` under, for a command that never asks, WITHOUT
+/// creating it: the key at `key_path`, or `None` on a first use (nothing cached anywhere), where
+/// the caller creates the key once it has something to cache. With anything cached anywhere the
+/// key it was cached under is lost, and the refusal names `apprafter kubeconfig --refresh`, which
+/// asks. Settled before the secret is read, so a refusal costs no read (review #1).
 pub(crate) fn key_for_new_secret(
     store: &TargetStorePaths,
     target: &str,
     key_path: &Path,
-) -> Result<Identity> {
+) -> Result<Option<Identity>> {
     if let Some(identity) = load_identity(key_path)? {
-        return Ok(identity);
+        return Ok(Some(identity));
     }
     if !held(store)?.is_empty() {
         return Err(missing(target, key_path));
     }
-    cli_core::secrets::load_or_create_identity(key_path)
+    Ok(None)
 }
 
 /// One thing a target's state holds under the age key.
@@ -199,7 +201,7 @@ impl LostKey {
                 (Holding::Secret(CachedSecret::Kubeconfig), true) => continue,
                 (Holding::Secret(CachedSecret::ArgocdPassword), true) => format!(
                     "target `{t}`: the Argo CD admin password, dropped from the cache \
-                     (`apprafter argocd-password` fetches it from the cluster again)"
+                     (`apprafter argocd-password --target {t}` fetches it from the cluster again)"
                 ),
                 (Holding::Secret(CachedSecret::Kubeconfig), false) => format!(
                     "target `{t}`: the kubeconfig (`apprafter kubeconfig --refresh --target {t}` \
@@ -207,7 +209,7 @@ impl LostKey {
                 ),
                 (Holding::Secret(CachedSecret::ArgocdPassword), false) => format!(
                     "target `{t}`: the Argo CD admin password (`apprafter argocd-password \
-                     --refresh` fetches it again while `{t}` is the active target)"
+                     --refresh --target {t}` fetches it again, once its kubeconfig is fetched)"
                 ),
                 (Holding::Unreadable(e), _) => format!(
                     "target `{t}`: its state cannot be read ({e}), so whatever it caches stays \
@@ -350,20 +352,24 @@ mod tests {
     }
 
     #[test]
-    fn a_first_use_creates_the_key_and_anything_cached_refuses_naming_the_recovery() {
+    fn a_first_use_has_no_key_yet_and_anything_cached_refuses_naming_the_recovery() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         seed(&s, "prod", Some(r#"{"server_id":1,"server_name":"p"}"#));
         let key = dir.path().join("k/age.key");
-        let first = key_for_new_secret(&s, "prod", &key).unwrap();
-        assert!(key.exists(), "a first use creates the key");
+        assert!(
+            key_for_new_secret(&s, "prod", &key).unwrap().is_none(),
+            "a first use: the caller creates the key once it has something to cache"
+        );
+        assert!(!key.exists(), "never created here");
+        let made = load_or_create_identity(&key).unwrap();
         assert_eq!(
             key_for_new_secret(&s, "prod", &key)
                 .unwrap()
+                .expect("the key there")
                 .to_public()
                 .to_string(),
-            first.to_public().to_string(),
-            "and later uses load it"
+            made.to_public().to_string(),
         );
 
         std::fs::remove_file(&key).unwrap();
@@ -417,11 +423,11 @@ mod tests {
             "creates a new age key at /k/age.key",
             "fetches the kubeconfig of target `prod` from its node again over SSH",
             "  - target `prod`: the Argo CD admin password, dropped from the cache \
-             (`apprafter argocd-password` fetches it from the cluster again)\n",
+             (`apprafter argocd-password --target prod` fetches it from the cluster again)\n",
             "  - target `staging`: the kubeconfig (`apprafter kubeconfig --refresh --target \
              staging` fetches it again)\n",
             "  - target `staging`: the Argo CD admin password (`apprafter argocd-password \
-             --refresh` fetches it again while `staging` is the active target)\n",
+             --refresh --target staging` fetches it again, once its kubeconfig is fetched)\n",
             "  - target `x`: its state cannot be read (bad json)",
         ] {
             assert!(explain.contains(part), "{part:?} missing:\n{explain}");

@@ -945,7 +945,8 @@
       "hidden": false,
       "examples": [
         "apprafter argocd-password",
-        "apprafter argocd-password --refresh  # after the admin secret is rotated"
+        "apprafter argocd-password --refresh  # after the admin secret is rotated",
+        "apprafter argocd-password --target staging  # another target's, not the active one"
       ],
       "args": [
         {
@@ -959,6 +960,18 @@
           "required": false,
           "possible_values": [],
           "help": "Force a re-fetch of the secret even if a cached password is already in state"
+        },
+        {
+          "id": "target",
+          "long": "target",
+          "short": null,
+          "takes_value": true,
+          "value_name": "TARGET",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Work on this target instead of the active one: its cached password, or its cluster through its cached kubeconfig"
         }
       ],
       "positionals": []

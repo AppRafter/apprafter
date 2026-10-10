@@ -231,17 +231,17 @@ pub fn age_key_missing_help(target: Option<&str>) -> String {
 }
 
 /// `CacheUndecryptable`'s help: the key it was cached under, or the command that fetches it
-/// again under the key there is now. `argocd-password` takes no `--target`: it reads the active
-/// target, the one whose cache it failed on.
+/// again under the key there is now, for `target`, whichever target is active.
 fn cache_undecryptable_help(secret: &crate::secrets::CachedSecret, target: &str) -> String {
     use crate::secrets::CachedSecret;
     let refetch = match secret {
         CachedSecret::Kubeconfig => format!(
             "`apprafter kubeconfig --refresh --target {target}` fetches it from the node again"
         ),
-        CachedSecret::ArgocdPassword => {
-            "`apprafter argocd-password --refresh` fetches it from the cluster again".to_string()
-        }
+        CachedSecret::ArgocdPassword => format!(
+            "`apprafter argocd-password --refresh --target {target}` fetches it from the cluster \
+             again"
+        ),
     };
     format!(
         "It was cached under a different age key (one that was lost and replaced), or the \
@@ -1570,7 +1570,8 @@ mod tests {
     }
 
     /// WI-457: a cached secret the key there cannot open names the command that fetches that
-    /// secret again under it: `argocd-password` takes no `--target` (it works on the active one).
+    /// secret again under it, for the target whose cache it is (review #7: `argocd-password`
+    /// takes `--target`, so the help never depends on which target is active).
     #[test]
     fn an_undecryptable_cache_names_how_to_fetch_it_again() {
         use crate::secrets::CachedSecret;
@@ -1602,7 +1603,7 @@ mod tests {
         );
         let help = help_of(&argocd);
         assert!(
-            help.contains("`apprafter argocd-password --refresh`") && !help.contains("--target"),
+            help.contains("`apprafter argocd-password --refresh --target prod`"),
             "{help}"
         );
     }
