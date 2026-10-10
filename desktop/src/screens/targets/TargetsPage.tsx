@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 // The Targets view: every target in the local target store (target_list), each opening in its
-// own tab; an unreadable one gets a card saying why; a CLI default that names no target, or one
-// that cannot be read, says so. Make default for the CLI runs the reversible use plan at once.
+// own tab; an unreadable one gets a card saying why, and can be removed (WI-458: the same
+// destructive plan as the Target screen's); a CLI default that names no target, or one that cannot
+// be read, says so. Make default for the CLI runs the reversible use plan at once.
 import { useCallback, useState } from 'react';
 import { ErrorPanel } from '../../components/ErrorPanel';
 import { SpinnerGapIcon } from '../../components/icons';
@@ -11,7 +12,7 @@ import { uiErrorOf } from '../../ipc/api';
 import type { TargetListReport } from '../../ipc/generated/TargetListReport';
 import type { UiError } from '../../ipc/generated/UiError';
 import { useTargetList } from '../../state/targets';
-import { useMakeDefault } from '../target/actions';
+import { useMakeDefault, useRemoveTarget } from '../target/actions';
 import { AddTargetCard } from './AddTargetCard';
 import { TargetCard } from './TargetCard';
 import { UnreadableCard } from './UnreadableCard';
@@ -20,18 +21,28 @@ export interface TargetsPageProps {
   readonly onOpen: (name: string) => void;
   /** The targets with a tab: their cards switch to it. */
   readonly openTargets: ReadonlySet<string>;
+  /** A target was removed here: a tab still open on it closes. */
+  readonly onRemoved: (name: string) => void;
 }
 
-export function TargetsPage({ onOpen, openTargets }: TargetsPageProps) {
+export function TargetsPage({ onOpen, openTargets, onRemoved }: TargetsPageProps) {
   const list = useTargetList();
   const [failure, setFailure] = useState<UiError | null>(null);
   const makeDefault = useMakeDefault(setFailure);
+  const removeTarget = useRemoveTarget(onRemoved, setFailure);
   const onMakeDefault = useCallback(
     (name: string) => {
       setFailure(null);
       void makeDefault(name);
     },
     [makeDefault],
+  );
+  const onRemove = useCallback(
+    (name: string) => {
+      setFailure(null);
+      void removeTarget(name);
+    },
+    [removeTarget],
   );
   return (
     <div className="page">
@@ -51,6 +62,7 @@ export function TargetsPage({ onOpen, openTargets }: TargetsPageProps) {
           openTargets={openTargets}
           onOpen={onOpen}
           onMakeDefault={onMakeDefault}
+          onRemove={onRemove}
         />
       )}
     </div>
@@ -62,11 +74,13 @@ function Store({
   openTargets,
   onOpen,
   onMakeDefault,
+  onRemove,
 }: {
   report: TargetListReport;
   openTargets: ReadonlySet<string>;
   onOpen: (name: string) => void;
   onMakeDefault: (name: string) => void;
+  onRemove: (name: string) => void;
 }) {
   const empty = report.targets.length === 0 && report.unreadable.length === 0;
   const pointer = report.cliDefault;
@@ -107,6 +121,7 @@ function Store({
             key={target.name}
             target={target}
             isCliDefault={target.name === cliDefault}
+            onRemove={onRemove}
           />
         ))}
         <AddTargetCard />

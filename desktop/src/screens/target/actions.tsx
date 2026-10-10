@@ -207,6 +207,49 @@ export function useChangeSshKey(
   }, [name, onFailed, show, toast, client, confirm]);
 }
 
+/**
+ * Remove a target from this computer: the destructive plan (op_plan_target_remove, which takes a
+ * target whose files cannot be read too, WI-458), its confirm — the full plan, the typed name —
+ * then the OS gesture inside op_execute. When it ran, `onRemoved` closes what showed the target
+ * (its tabs), the store is read again and a toast says what moved; a refusal, or a run that
+ * failed or was cancelled, goes to `onFailed`. The Target screen's Danger zone and the Targets
+ * page's unreadable card both remove through it.
+ */
+export function useRemoveTarget(
+  onRemoved: (name: string) => void,
+  onFailed: (error: UiError) => void,
+): (name: string) => Promise<void> {
+  const toast = useToast();
+  const client = useQueryClient();
+  const confirm = useConfirm(onFailed);
+  return useCallback(
+    async (name: string) => {
+      let view: Awaited<ReturnType<typeof api.opPlanTargetRemove>>;
+      try {
+        view = await api.opPlanTargetRemove(name);
+      } catch (reason) {
+        onFailed(refusalOf(reason));
+        return;
+      }
+      confirm({
+        view,
+        title: `Remove target ${name}?`,
+        icon: TrashIcon,
+        body: 'Deletes its config, token and local state from this computer. Nothing changes at the provider.',
+        requireText: name,
+        confirmLabel: 'Remove target',
+        onDone: (result) => {
+          const out = result as unknown as TargetRemoved;
+          onRemoved(name);
+          refreshTargets(client, name);
+          toast({ message: removedMessage(out), icon: TrashIcon });
+        },
+      });
+    },
+    [toast, client, confirm, onRemoved, onFailed],
+  );
+}
+
 export interface TargetActionsOptions {
   readonly name: string;
   /** The rename ran: the tab follows the new name. */
@@ -238,6 +281,7 @@ export function useTargetActions({
   const confirm = useConfirm(onFailed);
   const makeDefault = useMakeDefault(onFailed);
   const changeSshKey = useChangeSshKey(name, onFailed);
+  const removeTarget = useRemoveTarget(onRemoved, onFailed);
 
   return useMemo(() => {
     const rename = () =>
@@ -322,47 +366,12 @@ export function useTargetActions({
         />
       ));
 
-    const remove = async () => {
-      let view: Awaited<ReturnType<typeof api.opPlanTargetRemove>>;
-      try {
-        view = await api.opPlanTargetRemove(name);
-      } catch (reason) {
-        onFailed(refusalOf(reason));
-        return;
-      }
-      confirm({
-        view,
-        title: `Remove target ${name}?`,
-        icon: TrashIcon,
-        body: 'Deletes its config, token and local state from this computer. Nothing changes at the provider.',
-        requireText: name,
-        confirmLabel: 'Remove target',
-        onDone: (result) => {
-          const out = result as unknown as TargetRemoved;
-          onRemoved(name);
-          refreshTargets(client, name);
-          toast({ message: removedMessage(out), icon: TrashIcon });
-        },
-      });
-    };
-
     return {
       rename,
       renew,
-      remove: () => void remove(),
+      remove: () => void removeTarget(name),
       makeDefault: () => void makeDefault(name),
       changeSshKey: () => void changeSshKey(),
     };
-  }, [
-    name,
-    show,
-    toast,
-    client,
-    confirm,
-    makeDefault,
-    changeSshKey,
-    onRenamed,
-    onRemoved,
-    onFailed,
-  ]);
+  }, [name, show, toast, client, confirm, makeDefault, changeSshKey, removeTarget, onRenamed]);
 }

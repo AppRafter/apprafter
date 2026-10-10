@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
-// The Targets page on the mock IPC: target_list, and the reversible use plan run at once.
+// The Targets page on the mock IPC: target_list, the reversible use plan run at once, and an
+// unreadable target's removal through the destructive plan (WI-458).
 import { afterEach, beforeEach, expect, mock, test } from 'bun:test';
 import { clearMocks, mockIPC } from '@tauri-apps/api/mocks';
 import { screen, waitFor, within } from '@testing-library/react';
@@ -22,7 +23,7 @@ afterEach(async () => {
 });
 
 test('lists the store: cards, the unreadable one shown, the CLI default tagged', async () => {
-  renderScreen(<TargetsPage onOpen={() => {}} openTargets={new Set()} />);
+  renderScreen(<TargetsPage onOpen={() => {}} openTargets={new Set()} onRemoved={() => {}} />);
   expect(screen.getByRole('heading', { level: 1, name: 'Open a cluster' })).toBeDefined();
   expect(await screen.findByRole('article', { name: 'prod-eu' })).toBeDefined();
   expect(screen.getByRole('article', { name: 'broken' }).textContent).toContain('Cannot be read');
@@ -37,7 +38,9 @@ test('lists the store: cards, the unreadable one shown, the CLI default tagged',
 });
 
 test('make default runs the reversible plan at once: no dialog, the tag moves, a toast', async () => {
-  const user = renderScreen(<TargetsPage onOpen={() => {}} openTargets={new Set()} />);
+  const user = renderScreen(
+    <TargetsPage onOpen={() => {}} openTargets={new Set()} onRemoved={() => {}} />,
+  );
   await user.click(await screen.findByRole('button', { name: 'Make staging the CLI default' }));
   expect(await screen.findByText('staging is the CLI default now')).toBeDefined();
   await waitFor(() =>
@@ -70,7 +73,9 @@ function sentArgs(cmd: string): Record<string, unknown>[] {
 // Review #19: the card still offers Make default for a target that became the default since
 // the page read the store (in a terminal): the plan changes nothing, so it is discarded unrun.
 test('make default on a target that is the default already discards the plan unrun', async () => {
-  const user = renderScreen(<TargetsPage onOpen={() => {}} openTargets={new Set()} />);
+  const user = renderScreen(
+    <TargetsPage onOpen={() => {}} openTargets={new Set()} onRemoved={() => {}} />,
+  );
   const button = await screen.findByRole('button', { name: 'Make staging the CLI default' });
   const meanwhile = await api.opPlanTargetUse('staging');
   await (await startPlan(meanwhile.opId)).ended;
@@ -85,7 +90,9 @@ test('make default on a target that is the default already discards the plan unr
 });
 
 test('a refused make default is shown on the page', async () => {
-  const user = renderScreen(<TargetsPage onOpen={() => {}} openTargets={new Set()} />);
+  const user = renderScreen(
+    <TargetsPage onOpen={() => {}} openTargets={new Set()} onRemoved={() => {}} />,
+  );
   const button = await screen.findByRole('button', { name: 'Make lab the CLI default' });
   // Removed in a terminal meanwhile: the plan is refused with the names there are.
   clearMocks();
@@ -106,7 +113,9 @@ test('a refused make default is shown on the page', async () => {
 
 test('an open target switches to its tab; another opens one', async () => {
   const onOpen = mock();
-  const user = renderScreen(<TargetsPage onOpen={onOpen} openTargets={new Set(['lab'])} />);
+  const user = renderScreen(
+    <TargetsPage onOpen={onOpen} openTargets={new Set(['lab'])} onRemoved={() => {}} />,
+  );
   await user.click(await screen.findByRole('button', { name: 'Switch to lab' }));
   await user.click(screen.getByRole('button', { name: 'Open staging' }));
   expect(onOpen.mock.calls).toEqual([['lab'], ['staging']]);
@@ -119,7 +128,7 @@ test('an empty store says how to add one, and a dangling CLI default is named', 
       ? { targets: [], unreadable: [], cliDefault: { status: 'missing', name: 'gone' } }
       : null,
   );
-  renderScreen(<TargetsPage onOpen={() => {}} openTargets={new Set()} />);
+  renderScreen(<TargetsPage onOpen={() => {}} openTargets={new Set()} onRemoved={() => {}} />);
   expect(await screen.findByRole('heading', { name: 'No targets yet' })).toBeDefined();
   expect(screen.getByText('apprafter target add')).toBeDefined();
   expect(
@@ -150,7 +159,7 @@ test('a CLI default that names an unreadable target: its card is tagged, and the
         }
       : null,
   );
-  renderScreen(<TargetsPage onOpen={() => {}} openTargets={new Set()} />);
+  renderScreen(<TargetsPage onOpen={() => {}} openTargets={new Set()} onRemoved={() => {}} />);
   const card = await screen.findByRole('article', { name: 'broken' });
   expect(within(card).getByText('CLI default')).toBeDefined();
   expect(
@@ -173,17 +182,64 @@ test('a store that cannot be read says why', async () => {
         })
       : null,
   );
-  renderScreen(<TargetsPage onOpen={() => {}} openTargets={new Set()} />);
+  renderScreen(<TargetsPage onOpen={() => {}} openTargets={new Set()} onRemoved={() => {}} />);
   expect((await screen.findByRole('alert')).textContent).toContain('cannot read the target store');
   expect(screen.queryByRole('heading', { name: 'No targets yet' })).toBeNull();
 });
 
 test('the Add target card is enabled and opens the wizard', async () => {
-  const user = renderScreen(<TargetsPage onOpen={() => {}} openTargets={new Set()} />);
+  const user = renderScreen(
+    <TargetsPage onOpen={() => {}} openTargets={new Set()} onRemoved={() => {}} />,
+  );
   const add = (await screen.findByRole('button', { name: /Add target/ })) as HTMLButtonElement;
   expect(add.disabled).toBe(false);
   expect(add.textContent).toContain('Hetzner Cloud token, region, machine');
   expect(add.textContent).not.toContain('Arrives in D.3');
   await user.click(add);
   expect(await screen.findByRole('dialog', { name: 'Add target' })).toBeDefined();
+});
+
+/** The page, its removals told to `onRemoved`. */
+const page = (onRemoved: (name: string) => void = () => {}) =>
+  renderScreen(<TargetsPage onOpen={() => {}} openTargets={new Set()} onRemoved={onRemoved} />);
+
+// WI-458: the card of a target that cannot be read removes it through the same destructive plan
+// as the Target screen's — its lines name the file, the name is typed, the run asks the owner —
+// and a tab still open on it closes.
+test('an unreadable card removes its target: the full plan, the typed name, then the gesture', async () => {
+  const onRemoved = mock();
+  const user = page(onRemoved);
+  const card = await screen.findByRole('article', { name: 'broken' });
+  const runs = sentArgs('op_execute');
+  await user.click(within(card).getByRole('button', { name: 'Remove broken' }));
+  const confirm = await screen.findByRole('dialog', { name: 'Remove target broken?' });
+  expect(confirm.textContent).toContain('config.yaml cannot be read: expected a mapping');
+  const go = within(confirm).getByRole('button', { name: 'Remove target' }) as HTMLButtonElement;
+  expect(go.disabled).toBe(true);
+  await user.type(within(confirm).getByLabelText(/Type broken to confirm/), 'broken');
+  await user.click(go);
+  await waitFor(() => expect(onRemoved).toHaveBeenCalledWith('broken'));
+  expect(runs).toHaveLength(1);
+  expect(await screen.findByText('Removed broken from this computer')).toBeDefined();
+  await waitFor(() => expect(screen.queryByRole('article', { name: 'broken' })).toBeNull());
+});
+
+test('a refused removal is shown on the page', async () => {
+  const user = page();
+  const card = await screen.findByRole('article', { name: 'broken' });
+  clearMocks();
+  mockIPC((cmd) =>
+    cmd === 'op_plan_target_remove'
+      ? Promise.reject({
+          code: 'apprafter::target::not_found',
+          message: 'target `broken` not found (available: lab, prod-eu, staging)',
+          help: null,
+          causes: [],
+          fields: { name: 'broken', available: ['lab', 'prod-eu', 'staging'] },
+        })
+      : null,
+  );
+  await user.click(within(card).getByRole('button', { name: 'Remove broken' }));
+  expect((await screen.findByRole('alert')).textContent).toContain('target `broken` not found');
+  expect(screen.queryByRole('dialog')).toBeNull();
 });

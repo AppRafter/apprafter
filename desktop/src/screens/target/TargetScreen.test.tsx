@@ -4,8 +4,8 @@
 // alone, no token), remove the full plan with the typed name and the gesture.
 import { afterEach, beforeEach, expect, mock, test } from 'bun:test';
 import { QueryClientProvider } from '@tanstack/react-query';
-import { clearMocks } from '@tauri-apps/api/mocks';
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { clearMocks, mockIPC } from '@tauri-apps/api/mocks';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { Activity } from 'react';
 import { ToastProvider } from '../../components/Toast';
@@ -311,12 +311,42 @@ test('SSH key: the key in use typed as another path is refused in the form', asy
   );
 });
 
-test('a target that cannot be shown says why', async () => {
-  screenOf('broken');
-  expect((await screen.findByRole('alert')).textContent).toContain(
-    'targets/broken/config.yaml: expected a mapping',
-  );
+test('a target that cannot be shown says why, and its Danger zone still removes it', async () => {
+  const onRemoved = mock();
+  const user = screenOf('broken', { onRemoved });
+  const alert = await screen.findByRole('alert');
+  expect(alert.textContent).toContain('targets/broken/config.yaml: expected a mapping');
+  // The neutral help offers the removal (WI-458), and the screen offers it too.
+  expect(alert.textContent).toContain('Otherwise remove target `broken` and add it again');
   expect(screen.queryByRole('group', { name: 'Machine' })).toBeNull();
+  await user.click(
+    within(screen.getByRole('region', { name: 'Danger zone' })).getByRole('button', {
+      name: 'Remove…',
+    }),
+  );
+  const confirm = await screen.findByRole('dialog', { name: 'Remove target broken?' });
+  expect(confirm.textContent).toContain('config.yaml cannot be read: expected a mapping');
+  await user.type(within(confirm).getByLabelText(/Type broken to confirm/), 'broken');
+  await user.click(within(confirm).getByRole('button', { name: 'Remove target' }));
+  await waitFor(() => expect(onRemoved).toHaveBeenCalledWith('broken'));
+});
+
+// The store's own config.yaml belongs to no target: removing this one would not repair it (and
+// its plan is refused with the same error), so no Danger zone is offered; nor for any other
+// error, such as a target removed behind the screen's back.
+test('a target that cannot be shown for another reason offers no removal', async () => {
+  for (const fields of [{ path: '~/.config/apprafter/config.yaml' }, { target: 'lab' }]) {
+    clearMocks();
+    mockIPC((cmd) =>
+      cmd === 'target_show'
+        ? Promise.reject(uiError('apprafter::target::invalid_config', 'cannot be read', fields))
+        : null,
+    );
+    screenOf('staging');
+    expect((await screen.findByRole('alert')).textContent).toContain('cannot be read');
+    expect(screen.queryByRole('region', { name: 'Danger zone' })).toBeNull();
+    cleanup();
+  }
 });
 
 test('Run doctor in the page header opens Doctor · <name>', async () => {

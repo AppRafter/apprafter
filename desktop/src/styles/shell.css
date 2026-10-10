@@ -528,9 +528,14 @@
   margin-top: 4px;
 }
 
-/* A target whose files cannot be read: listed, never hidden, and nothing to open. */
+/* A target whose files cannot be read: listed, never hidden, nothing to open; its one action,
+   Remove, sits at the foot of the card as a readable card's do. */
 .target-card[data-state="unreadable"] {
   border-color: var(--err);
+}
+
+.target-card[data-state="unreadable"] .target-card-actions {
+  margin-top: auto;
 }
 
 .target-card-error {

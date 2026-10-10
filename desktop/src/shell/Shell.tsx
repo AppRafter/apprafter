@@ -207,6 +207,7 @@ export function Shell() {
                   onOpen={(target) =>
                     dispatch({ type: 'openTarget', target, key: crypto.randomUUID() })
                   }
+                  onRemoved={(target) => dispatch({ type: 'targetRemoved', target })}
                 />
               </main>
             </ViewFrame>

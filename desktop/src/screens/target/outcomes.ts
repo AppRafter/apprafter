@@ -19,12 +19,18 @@ export function renamedMessage(outcome: TargetRenamed): string {
   );
 }
 
+/**
+ * A removal: the server it leaves running, and where the CLI default went — naming the targets it
+ * passed over because they cannot be read (WI-458), as the CLI's last line does.
+ */
 export function removedMessage(outcome: TargetRemoved): string {
   const server = outcome.orphanedServer;
+  const skipped = outcome.skippedUnreadable;
+  const passedOver = skipped.length === 0 ? '' : ` (${skipped.join(', ')} cannot be read)`;
   return [
     `Removed ${outcome.name} from this computer`,
     ...(server === null ? [] : [`server ${server.serverName} keeps running at the provider`]),
-    ...pointerPart(outcome.cliDefault),
+    ...pointerPart(outcome.cliDefault).map((part) => `${part}${passedOver}`),
   ].join(' · ');
 }
 

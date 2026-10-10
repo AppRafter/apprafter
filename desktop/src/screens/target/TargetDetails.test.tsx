@@ -300,7 +300,8 @@ test('the danger zone removes from this computer and says the provider is untouc
   expect(onRemove).toHaveBeenCalled();
 });
 
-test('an unreadable target is shown, with what the store said, and offers nothing', () => {
+test('an unreadable target is shown, with what the store said, and offers only its removal', async () => {
+  const onRemove = mock();
   render(
     <UnreadableCard
       target={{
@@ -313,6 +314,7 @@ test('an unreadable target is shown, with what the store said, and offers nothin
           fields: {},
         },
       }}
+      onRemove={onRemove}
     />,
   );
   const card = screen.getByRole('article', { name: 'broken' });
@@ -320,5 +322,8 @@ test('an unreadable target is shown, with what the store said, and offers nothin
   expect(card.textContent).toContain('Cannot be read');
   expect(card.textContent).toContain('invalid YAML');
   expect(card.textContent).toContain('apprafter::target::invalid_config');
-  expect(within(card).queryByRole('button')).toBeNull();
+  const buttons = within(card).getAllByRole('button');
+  expect(buttons.map((b) => b.getAttribute('aria-label'))).toEqual(['Remove broken']);
+  await userEvent.setup().click(buttons[0] as HTMLElement);
+  expect(onRemove).toHaveBeenCalledWith('broken');
 });

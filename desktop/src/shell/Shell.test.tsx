@@ -407,6 +407,55 @@ describe('Shell, the Target section on the mock IPC', () => {
     expect(screen.queryByRole('heading', { name: /arrives in D\.3/ })).toBeNull();
   });
 
+  // WI-458: a target with a tab whose files became unreadable (edited in a terminal) is removed
+  // from its card on the Targets view, and its tab closes as a removal from the tab's screen does.
+  test('removing an unreadable target from the Targets view closes its tab', async () => {
+    const user = shell();
+    await user.click(await screen.findByRole('button', { name: 'Open lab' }));
+    expect(tab('lab').getAttribute('aria-selected')).toBe('true');
+    const internals = (
+      window as unknown as {
+        __TAURI_INTERNALS__: {
+          invoke: (cmd: string, args?: unknown, options?: unknown) => unknown;
+        };
+      }
+    ).__TAURI_INTERNALS__;
+    const invoke = internals.invoke;
+    // The store now lists lab as unreadable, until it is removed.
+    internals.invoke = async (c, args, options) => {
+      const answer = await invoke(c, args, options);
+      if (c !== 'target_list') return answer;
+      const list = answer as TargetListReport;
+      const lab = list.targets.find((t) => t.name === 'lab');
+      if (lab === undefined) return list;
+      return {
+        ...list,
+        targets: list.targets.filter((t) => t !== lab),
+        unreadable: [
+          ...list.unreadable,
+          {
+            name: 'lab',
+            error: {
+              code: 'apprafter::target::invalid_config',
+              message: 'target config at ~/.config/apprafter/targets/lab/config.yaml: bad',
+              help: null,
+              causes: [],
+              fields: { target: 'lab' },
+            },
+          },
+        ],
+      };
+    };
+    await user.keyboard('{Control>}t{/Control}');
+    const card = await screen.findByRole('article', { name: 'lab' });
+    await user.click(within(card).getByRole('button', { name: 'Remove lab' }));
+    const remove = await screen.findByRole('dialog', { name: 'Remove target lab?' });
+    await user.type(within(remove).getByLabelText(/Type lab to confirm/), 'lab');
+    await user.click(within(remove).getByRole('button', { name: 'Remove target' }));
+    await waitFor(() => expect(screen.queryByRole('tab', { name: 'lab' })).toBeNull());
+    expect(screen.getByRole('heading', { name: 'Open a cluster' })).toBeDefined();
+  });
+
   test('a rename rebinds the tab and its sidebar line; a remove closes the tab', async () => {
     const user = shell();
     await user.click(await screen.findByRole('button', { name: 'Open staging' }));

@@ -43,6 +43,25 @@ test('each outcome says what moved: the CLI default and a running server include
       skippedUnreadable: [],
     }),
   ).toBe('Removed prod from this computer');
+  // WI-458: a default that passed over targets that cannot be read says so, as the CLI does.
+  expect(
+    removedMessage({
+      name: 'prod-eu',
+      stateRemoved: false,
+      orphanedServer: null,
+      cliDefault: { from: 'prod-eu', to: 'lab' },
+      skippedUnreadable: ['broken'],
+    }),
+  ).toBe('Removed prod-eu from this computer · the CLI default is now lab (broken cannot be read)');
+  expect(
+    removedMessage({
+      name: 'prod-eu',
+      stateRemoved: false,
+      orphanedServer: null,
+      cliDefault: { from: 'prod-eu', to: null },
+      skippedUnreadable: ['a', 'b'],
+    }),
+  ).toBe('Removed prod-eu from this computer · no CLI default now (a, b cannot be read)');
   expect(usedMessage({ name: 'lab', pointer: { from: 'prod', to: 'lab' } })).toBe(
     'lab is the CLI default now',
   );
