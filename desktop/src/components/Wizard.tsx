@@ -38,16 +38,12 @@ export interface WizardProps {
   readonly children: ReactNode;
 }
 
-/** Where a step's focus starts: its first control, or the chosen radio of a group that is first. */
+/**
+ * Where a step's focus starts: its first Tab stop. ModalFrame's focusables already count a radio
+ * group as one stop, its chosen radio (the first enabled one when none is chosen).
+ */
 function firstStop(body: HTMLElement): HTMLElement | undefined {
-  const first = focusables(body)[0];
-  if (!(first instanceof HTMLInputElement) || first.type !== 'radio' || first.name === '') {
-    return first;
-  }
-  const chosen = [...body.querySelectorAll<HTMLInputElement>('input[type="radio"]')].find(
-    (radio) => radio.name === first.name && radio.checked && !radio.disabled,
-  );
-  return chosen ?? first;
+  return focusables(body)[0];
 }
 
 export function Wizard({
