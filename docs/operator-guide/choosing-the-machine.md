@@ -287,16 +287,15 @@ Error: apprafter::provider::server_type_not_selected
         • interactive: `apprafter target machine` (opens the machine picker)
         • non-interactive / CI: `--server-type <sku>` or
         `APPRAFTER_SERVER_TYPE`
-        • declaratively: set `nodes[0].kind` in your Infrastructure manifest
+        • declaratively: set `spec.nodes[0].type` in your Infrastructure
+        manifest
 ```
 
-Two things about that message are worth knowing. The manifest field it
-names is written `type:` in the file — `spec.nodes[0].type`, as in the
-example above. And the check fires **only when a machine is about to be
-created**: `apprafter apply` against a cluster that already exists
-reconciles the firewall, the network and the kubeconfig without needing a
-type at all, which is why upgrading the CLI never breaks a running
-cluster.
+The manifest field it names is the one in the example above. The check
+fires **only when a machine is about to be created**: `apprafter apply`
+against a cluster that already exists reconciles the firewall, the
+network and the kubeconfig without needing a type at all, which is why
+upgrading the CLI never breaks a running cluster.
 
 Before the failing run, `apply` says the same thing in one line:
 
