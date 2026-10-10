@@ -453,7 +453,8 @@ describe('details and save', () => {
     expect(h.of('target_draft_discard')).toHaveLength(0);
     await user.click(saveButton());
     await waitFor(() => expect(h.of('op_plan_target_add')).toHaveLength(2));
-    expect((h.of('op_plan_target_add')[1]?.args.args as { draftId: number }).draftId).toBe(7);
+    const again = h.of('op_plan_target_add')[1]?.args.args as { draftId: number } | undefined;
+    expect(again?.draftId).toBe(7);
   });
 
   test('a plan refused for a lost draft goes back to the token, the draft discarded', async () => {
@@ -740,9 +741,8 @@ describe('details and save', () => {
     expect(h.of('ssh_key_inspect').map((c) => c.args)).toEqual([{ path: '~/.ssh/work.pub' }]);
     await user.click(saveButton());
     await screen.findByText('Target “lab-2” saved.');
-    expect((h.of('op_plan_target_add')[0]?.args.args as { sshKey: unknown }).sshKey).toBe(
-      '/home/alex/.ssh/work.pub',
-    );
+    const planned = h.of('op_plan_target_add')[0]?.args.args as { sshKey: unknown } | undefined;
+    expect(planned?.sshKey).toBe('/home/alex/.ssh/work.pub');
   });
 
   test('SSH: the first key is chosen; Other path is checked on leaving the field; Skip sends none', async () => {
