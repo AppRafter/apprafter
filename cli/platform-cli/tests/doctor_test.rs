@@ -285,6 +285,10 @@ fn doctor_ssh_key_missing_path_fails_the_run_with_exit_1() {
         .failure()
         .stdout(contains("SSH key readable"))
         .stdout(contains("file does not exist"))
+        // The hint names the target the row is about, ready to run.
+        .stdout(contains(
+            "`apprafter target add default --renew --ssh-key <path>`",
+        ))
         .stdout(contains("FAIL"));
 }
 

@@ -134,11 +134,10 @@ pub(crate) fn hint(c: &Check) -> Option<String> {
              one with `apprafter target add {target} --renew --ssh-key <path>` (it keeps \
              everything else)"
         ),
-        CheckFix::SshKeyMissing { .. } => {
+        CheckFix::SshKeyMissing { target, .. } => format!(
             "file does not exist; the path stored in target config may be stale — point it at \
-             an existing key with `apprafter target add <name> --renew --ssh-key <path>`"
-                .to_string()
-        }
+             an existing key with `apprafter target add {target} --renew --ssh-key <path>`"
+        ),
         // The tool's own row: what it is needed for and how to install it. A detail means the
         // resolver found something it cannot run (a `.cmd` shim on Windows).
         CheckFix::InstallTool { tool } if c.id == CheckId::Tool => {
@@ -273,6 +272,7 @@ mod tests {
                             "SSH key readable",
                             Some("/k.pub"),
                             Some(CheckFix::SshKeyMissing {
+                                target: "prod".into(),
                                 path: "/k.pub".into(),
                             }),
                         ),
@@ -301,7 +301,7 @@ mod tests {
              \x20 – Token verified against provider API (not requested)\n\
              \x20 ✗ SSH key readable (/k.pub)\n\
              \x20     hint: file does not exist; the path stored in target config may be stale — \
-             point it at an existing key with `apprafter target add <name> --renew --ssh-key \
+             point it at an existing key with `apprafter target add prod --renew --ssh-key \
              <path>`\n\
              \n\
              Checking environment...\n\
@@ -464,9 +464,12 @@ mod tests {
                  everything else)",
             ),
             (
-                CheckFix::SshKeyMissing { path: "/k".into() },
+                CheckFix::SshKeyMissing {
+                    target: "p".into(),
+                    path: "/k".into(),
+                },
                 "file does not exist; the path stored in target config may be stale — point it \
-                 at an existing key with `apprafter target add <name> --renew --ssh-key <path>`",
+                 at an existing key with `apprafter target add p --renew --ssh-key <path>`",
             ),
             (CheckFix::Explain { text: "as is".into() }, "as is"),
         ];
@@ -483,19 +486,26 @@ mod tests {
         }
     }
 
-    /// WI-452: both SSH key rows send the reader to `--renew --ssh-key`, which changes only
-    /// the key, never to `--force`, which replaces the token; and the command parses.
+    /// WI-452: both SSH key rows send the reader to `--renew --ssh-key` on the target the
+    /// row is about, which changes only the key, never to `--force`, which replaces the token;
+    /// and the command parses.
     #[test]
     fn the_ssh_key_hints_point_at_the_key_only_renewal() {
         for fix in [
             CheckFix::ConfigureSshKey {
                 target: "prod".into(),
             },
-            CheckFix::SshKeyMissing { path: "/k".into() },
+            CheckFix::SshKeyMissing {
+                target: "prod".into(),
+                path: "/k".into(),
+            },
         ] {
             let c = check(CheckId::SshKey, CheckStatus::Warn, "t", None, Some(fix));
             let h = hint(&c).unwrap();
-            assert!(h.contains("--renew --ssh-key <path>`"), "{h}");
+            assert!(
+                h.contains("`apprafter target add prod --renew --ssh-key <path>`"),
+                "{h}"
+            );
             assert!(!h.contains("--force"), "{h}");
             let span = h
                 .split('`')

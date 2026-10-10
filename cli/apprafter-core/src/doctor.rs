@@ -120,7 +120,10 @@ pub enum CheckFix {
     ConfigureSshKey {
         target: String,
     },
+    /// The stored key file is gone: the target it is stored on, so the fix (a key-only
+    /// renewal) can name it, and the path as stored.
     SshKeyMissing {
+        target: String,
         path: String,
     },
     InstallTool {
@@ -629,7 +632,10 @@ fn ssh_key(target: &Target) -> Check {
     if !path.exists() {
         return Check {
             detail: Some(shown.clone()),
-            fix: Some(CheckFix::SshKeyMissing { path: shown }),
+            fix: Some(CheckFix::SshKeyMissing {
+                target: target.name.clone(),
+                path: shown,
+            }),
             ..row(CheckId::SshKey, CheckStatus::Fail, TITLE_SSH_KEY)
         };
     }
@@ -1449,7 +1455,14 @@ mod tests {
         assert_eq!(unset[5].status, CheckStatus::Warn);
         let gone = group(&doctor(&ctx, named("gone")), GroupId::Target);
         assert_eq!(gone[5].status, CheckStatus::Fail);
-        assert!(matches!(gone[5].fix, Some(CheckFix::SshKeyMissing { .. })));
+        // The target's name with the path: the fix that changes the key needs both.
+        assert_eq!(
+            gone[5].fix,
+            Some(CheckFix::SshKeyMissing {
+                target: "gone".into(),
+                path: f.root.join("home/nope.pub").display().to_string(),
+            })
+        );
     }
 
     #[test]
