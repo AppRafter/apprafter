@@ -135,6 +135,16 @@ test('doctor on a provisioned target: three stages, then a report with every sta
   const helm = report.groups[2]?.checks.find((c) => c.tool === 'helm');
   expect(helm).toMatchObject({ status: 'warn', fix: { kind: 'install_tool', tool: 'helm' } });
   expect(sshRow(report)).toMatchObject({ status: 'pass', fix: null });
+  // No kubeconfig cached, so nothing to probe the API with: the two rows agree, as the core's do.
+  expect(report.groups[1]?.checks.map((c) => [c.id, c.status])).toEqual([
+    ['kubeconfig_cached', 'fail'],
+    ['kube_api_reachable', 'skipped'],
+    ['node_ssh_reachable', 'fail'],
+  ]);
+  expect(report.groups[1]?.checks[0]).toMatchObject({
+    detail: 'none cached for server `prod-eu-1` (id 4711)',
+    fix: { kind: 'fetch_kubeconfig', target: 'prod-eu' },
+  });
 });
 
 test('doctor on a target with no server: the cluster checks are skipped', async () => {

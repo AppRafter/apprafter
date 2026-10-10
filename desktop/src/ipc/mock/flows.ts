@@ -314,7 +314,10 @@ function sshKeyRow(report: TargetReport): Check {
   }
 }
 
-/** What the doctor finds for a target the store holds; a provisioned one shows every status. */
+/**
+ * What the doctor finds for a target the store holds, row for row as the core writes it; a
+ * provisioned one shows every status.
+ */
 export function mockDoctorReport(report: TargetReport): DoctorReport {
   const target = report.name;
   const server = report.provisioned.status === 'provisioned' ? report.provisioned.server : null;
@@ -327,24 +330,27 @@ export function mockDoctorReport(report: TargetReport): DoctorReport {
         ].map(([id, title]) =>
           row({ id, status: 'skipped', title, detail: 'no provisioned server' }),
         )
-      : [
+      : // As the core's cluster rows read a state with no kubeconfig cached: nothing to probe the
+        // API with, and the node's SSH port not answering.
+        [
           row({
             id: 'kubeconfig_cached',
-            status: 'warn',
+            status: 'fail',
             title: 'Kubeconfig cached',
+            detail: `none cached for server \`${server.serverName}\` (id ${server.serverId})`,
             fix: { kind: 'fetch_kubeconfig', target },
           }),
           row({
             id: 'kube_api_reachable',
             status: 'skipped',
             title: 'Kube API reachable',
-            detail: 'no kubeconfig cached',
+            detail: 'no cached kubeconfig',
           }),
           row({
             id: 'node_ssh_reachable',
             status: 'fail',
             title: 'Node reachable over SSH',
-            detail: '203.0.113.17:22 timed out after 5 s',
+            detail: 'port 22 · 203.0.113.17: connection timed out',
             fix: { kind: 'node_unreachable', address: '203.0.113.17' },
           }),
         ];
