@@ -54,6 +54,8 @@ serde_json            = { workspace = true }
 tauri                 = { workspace = true }
 # Website, Docs and GitHub open in the browser; the capability scopes it to those three URLs.
 tauri-plugin-opener   = "~2.7"
+# Copy report and the toolchain's Copy buttons: write text only (the capability grants nothing else).
+tauri-plugin-clipboard-manager = "~2.4"
 # A second launch focuses the first window instead of starting another app.
 tauri-plugin-single-instance = "~2.5"
 thiserror             = "2"

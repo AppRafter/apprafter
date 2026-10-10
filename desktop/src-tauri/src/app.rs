@@ -733,6 +733,12 @@ pub fn opener_plugin<R: Runtime>() -> impl tauri::plugin::Plugin<R> {
         .build()
 }
 
+/// The clipboard plugin. The capability grants `write_text` alone: the app copies a report or a
+/// command out, and never reads what another program put on the clipboard (D.3 overview R11).
+pub fn clipboard_plugin<R: Runtime>() -> impl tauri::plugin::Plugin<R> {
+    tauri_plugin_clipboard_manager::init()
+}
+
 fn guard(cell: &ShellCell, command: &str) -> Result<(), DesktopError> {
     match cell.get() {
         Some(shell) => shell.lock.guard(command),

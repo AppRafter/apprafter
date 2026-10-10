@@ -33,6 +33,9 @@
         { url: "https://github.com/AppRafter/apprafter" },
       ],
     },
+    // Copy report (Doctor) and the toolchain's Copy buttons: write text, never read. A plugin
+    // command skips the lock gate; writing to the clipboard while locked discloses nothing.
+    "clipboard-manager:allow-write-text",
     // The page has painted: the window, created hidden, shows (also while locked).
     "allow-window-ready",
     // Versions, OS, account, auth support: the About line, title bar and lock screen.

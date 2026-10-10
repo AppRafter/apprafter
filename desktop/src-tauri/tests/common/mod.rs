@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! The rig the IPC tests share: Tauri's mock runtime with the app's real config and capability
-//! (`generate_context!`), the opener plugin as the app builds it, the shell installed, and the
-//! main window open. tests/ipc_mock.rs runs on libtest; tests/app_menu.rs is a `harness = false`
-//! target of its own, so its checks run on the process's main thread. Each target compiles its
-//! own copy of this module.
+//! (`generate_context!`), the opener and clipboard plugins as the app builds them, the shell
+//! installed, and the main window open. tests/ipc_mock.rs runs on libtest; tests/app_menu.rs is a
+//! `harness = false` target of its own, so its checks run on the process's main thread. Each
+//! target compiles its own copy of this module.
 
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
@@ -159,6 +159,7 @@ fn rig_on(settings: Settings, route: Route, tools: ToolSearchPath, api_base: &st
     let cell = ShellCell::default();
     let app = app::builder(mock_builder(), cell.clone())
         .plugin(app::opener_plugin())
+        .plugin(app::clipboard_plugin())
         .build(tauri::generate_context!())
         .unwrap();
     app::install(&app, &cell, shell.clone()).unwrap();

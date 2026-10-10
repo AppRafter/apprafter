@@ -138,6 +138,41 @@ fn plugin_commands_beyond_the_granted_ones_are_refused_by_the_acl() {
     );
 }
 
+/// The page may write text to the clipboard (Copy report, Copy command) and nothing else: reading
+/// what another program put there, writing HTML or an image, and clearing are refused by the ACL
+/// (D.3 overview R11). Plugin commands never pass the lock gate, so this grant must be harmless
+/// while locked — it only ever writes.
+#[test]
+fn the_clipboard_takes_text_and_gives_nothing_back() {
+    let rig = rig(lock_off());
+    for cmd in [
+        "plugin:clipboard-manager|read_text",
+        "plugin:clipboard-manager|read_image",
+        "plugin:clipboard-manager|write_html",
+        "plugin:clipboard-manager|write_image",
+        "plugin:clipboard-manager|clear",
+    ] {
+        match invoke(&rig, cmd, json!({})) {
+            Err(Value::String(error)) => assert!(
+                error.contains("not allowed"),
+                "{cmd} was not refused by the ACL: {error}"
+            ),
+            other => panic!("{cmd} was not refused by the ACL: {other:?}"),
+        }
+    }
+    // Empty arguments: past the ACL, refused for the missing text only — nothing is written.
+    match invoke(&rig, "plugin:clipboard-manager|write_text", json!({})) {
+        Err(Value::String(error)) => {
+            assert!(
+                !error.contains("not allowed"),
+                "write_text was refused: {error}"
+            );
+            assert!(error.contains("invalid args"), "{error}");
+        }
+        other => panic!("write_text with no arguments: {other:?}"),
+    }
+}
+
 /// A quit that has operations to wait for tells the page, which then shows that it is stopping
 /// them instead of a page whose every command is refused: `quitting`, with how many and the
 /// longest wait. The page hears it through `core:event:allow-listen`, no new permission.
@@ -287,6 +322,7 @@ fn the_capability_grants_the_pinned_permissions_and_every_app_command_only() {
         "core:window:allow-is-maximized",
         "core:window:allow-start-dragging",
         "core:window:allow-internal-toggle-maximize",
+        "clipboard-manager:allow-write-text",
     ]
     .map(String::from)
     .into();

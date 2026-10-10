@@ -106,6 +106,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         }))
         // The capability lets the page open three URLs with it, nothing else.
         .plugin(app::opener_plugin())
+        // The capability lets the page write text to the clipboard, nothing else.
+        .plugin(app::clipboard_plugin())
         .setup({
             let data_dir = data_dir.clone();
             #[cfg(windows)]
