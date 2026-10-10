@@ -253,6 +253,37 @@ describe('DoctorOverlay', () => {
     });
   }
 
+  test("the core's warnings during a run are shown with the report, and stay until it closes", async () => {
+    const SWEEP = 'cannot remove old kubeconfig copies from /run/apprafter: Permission denied';
+    const SLOW = 'kubectl answered slowly';
+    h.read('op_start_doctor', [{ kind: 'warning', message: SWEEP }, completed(doctorReport())]);
+    h.read('op_start_doctor', [{ kind: 'notice', message: SLOW }, completed(doctorReport())]);
+    h.read('op_start_doctor', [{ kind: 'warning', message: SWEEP }, completed(doctorReport())]);
+    const { user } = renderDoctor('prod-eu');
+    await screen.findByText('3 pass');
+    expect(screen.getByText(SWEEP)).toBeDefined();
+    // Run again brings another: the first is kept beside it.
+    await user.click(runAgain());
+    await waitFor(() => expect(h.of('op_discard')).toHaveLength(2));
+    await waitFor(() => expect(screen.queryByText(SLOW) === null).toBe(false));
+    expect(screen.getByText(SWEEP)).toBeDefined();
+    // And the first again: still shown once.
+    await user.click(runAgain());
+    await waitFor(() => expect(h.of('op_discard')).toHaveLength(3));
+    expect(screen.getAllByText(SWEEP)).toHaveLength(1);
+    expect(screen.getByText(SLOW)).toBeDefined();
+  });
+
+  test('a warning of a run that failed or was cancelled is shown too', async () => {
+    h.read('op_start_doctor', [
+      { kind: 'notice', message: 'kubectl answered slowly' },
+      failed(uiError('apprafter::desktop::internal', 'the doctor broke')),
+    ]);
+    renderDoctor('prod-eu');
+    expect(await screen.findByText('the doctor broke')).toBeDefined();
+    expect(screen.getByText('kubectl answered slowly')).toBeDefined();
+  });
+
   test('a failed run shows its error and Run again', async () => {
     h.read('op_start_doctor', [
       failed(uiError('apprafter::desktop::internal', 'the doctor broke')),

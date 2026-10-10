@@ -132,13 +132,30 @@ export async function startPlan(
   return { ended };
 }
 
+/** A warning or notice an operation reported while it ran (core Event::Warning / Notice). */
+export interface OpNote {
+  readonly kind: 'warning' | 'notice';
+  readonly text: string;
+}
+
+/** The warnings and notices the store kept of `opId`, in order. */
+function notesOf(opId: OpId): OpNote[] {
+  const lines = operationsSnapshot().get(opId)?.lines ?? [];
+  return lines.flatMap((line) =>
+    line.kind === 'warning' || line.kind === 'notice' ? [{ kind: line.kind, text: line.text }] : [],
+  );
+}
+
 /**
  * Start a read with `start` (an op_start_* call), follow it to its end, return its result.
- * `onStarted` gets the op id as soon as Rust answers (useRead cancels by it).
+ * `onStarted` gets the op id as soon as Rust answers (useRead cancels by it). `onNotes` gets the
+ * warnings and notices the read reported, however it ended, before the op is discarded with them
+ * (review #5: doctor's failed sweep of decrypted kubeconfig copies is one).
  */
 export async function runRead<T>(
   start: () => Promise<OpId>,
   onStarted?: (opId: OpId) => void,
+  onNotes?: (notes: readonly OpNote[]) => void,
 ): Promise<T> {
   const opId = await start();
   onStarted?.(opId);
@@ -146,8 +163,10 @@ export async function runRead<T>(
   try {
     return resultOf(await endOf(opId)) as T; // the Rust command's report type
   } finally {
+    const notes = notesOf(opId);
     release();
     discard(opId).catch(reportDiscard(opId));
+    if (notes.length > 0) onNotes?.(notes);
   }
 }
 

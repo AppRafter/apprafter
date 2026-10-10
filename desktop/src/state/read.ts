@@ -12,7 +12,7 @@ import { useCallback, useMemo, useRef, useState } from 'react';
 import type { OpId } from '../ipc/generated/OpId';
 import type { UiError } from '../ipc/generated/UiError';
 import { cancel as cancelOp } from '../ipc/operations';
-import { failureOf, isCancelled, reportUnlessLocked, runRead } from '../ipc/plans';
+import { failureOf, isCancelled, type OpNote, reportUnlessLocked, runRead } from '../ipc/plans';
 import { useScope } from './scope';
 
 export type ReadState<T> =
@@ -27,9 +27,14 @@ export interface ReadHandle<T> {
   /**
    * Starts the read (cancelling one that runs); its data, or null when it did not complete or is
    * no longer this component's. `onUnused` gets the data of a run that completed when it was no
-   * longer this component's. Once its screen is gone a run starts nothing.
+   * longer this component's. `onNotes` gets the warnings and notices the run reported, however it
+   * ended. Once its screen is gone a run starts nothing.
    */
-  readonly run: (start: () => Promise<OpId>, onUnused?: (data: T) => void) => Promise<T | null>;
+  readonly run: (
+    start: () => Promise<OpId>,
+    onUnused?: (data: T) => void,
+    onNotes?: (notes: readonly OpNote[]) => void,
+  ) => Promise<T | null>;
   readonly cancel: () => void;
   readonly reset: () => void;
 }
@@ -60,7 +65,11 @@ export function useRead<T>(): ReadHandle<T> {
   );
 
   const run = useCallback(
-    async (start: () => Promise<OpId>, onUnused?: (data: T) => void): Promise<T | null> => {
+    async (
+      start: () => Promise<OpId>,
+      onUnused?: (data: T) => void,
+      onNotes?: (notes: readonly OpNote[]) => void,
+    ): Promise<T | null> => {
       if (scope.gone()) return null;
       const was = current.current;
       if (was !== null) drop(was);
@@ -71,11 +80,15 @@ export function useRead<T>(): ReadHandle<T> {
       const live = () => current.current === mine;
       setState({ status: 'running', opId: null });
       try {
-        const data = await runRead<T>(start, (opId) => {
-          mine.opId = opId;
-          if (mine.cancelled) cancelOp(opId).catch(reportUnlessLocked(`op_cancel ${opId}`));
-          else if (live()) setState({ status: 'running', opId });
-        });
+        const data = await runRead<T>(
+          start,
+          (opId) => {
+            mine.opId = opId;
+            if (mine.cancelled) cancelOp(opId).catch(reportUnlessLocked(`op_cancel ${opId}`));
+            else if (live()) setState({ status: 'running', opId });
+          },
+          onNotes,
+        );
         if (!live()) {
           onUnused?.(data);
           return null;

@@ -241,6 +241,30 @@
   margin-top: 3px;
 }
 
+/* What the core warned of during a run, above the groups until the overlay closes. */
+.doctor-notes {
+  display: grid;
+  gap: 4px;
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  list-style: none;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: var(--fs-12-5);
+}
+
+.doctor-notes li {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 6px;
+  align-items: baseline;
+  overflow-wrap: anywhere;
+}
+
+.doctor-notes li[data-kind="warning"] svg {
+  color: var(--warn);
+}
+
 .doctor-fix-text {
   flex: 1;
   min-width: 0;
@@ -312,6 +336,17 @@
   overflow-wrap: anywhere;
 }
 
+/* A check again runs: the rows below are the last check's until it ends. */
+.tool-checking {
+  margin: 0 0 8px;
+  font-size: var(--fs-12-5);
+  color: var(--fg-muted);
+}
+
+.tool-rows[data-stale] {
+  opacity: 0.6;
+}
+
 .tool-hints {
   display: grid;
   gap: 4px;
@@ -361,6 +396,12 @@
 }
 
 /* The default target's machine and key, as the CLI prints them. */
+/* What to do about a refusal; and the line before what an earlier read found. */
+.this-computer-help,
+.this-computer-earlier {
+  color: var(--fg-muted);
+}
+
 .this-computer-machine {
   font: 400 var(--fs-11-5) var(--font-mono);
 }

@@ -107,6 +107,31 @@ describe('This computer', () => {
     expect(h.of('op_start_whoami')).toHaveLength(1);
   });
 
+  test('a read again that fails says why; what was read before is marked as from earlier', async () => {
+    const client = createQueryClient();
+    const row = () => (
+      <QueryClientProvider client={client}>
+        <PlatformContext value={appInfo()}>
+          <ThisComputerRow />
+        </PlatformContext>
+      </QueryClientProvider>
+    );
+    h.answer('whoami', whoamiReport({ status: 'skipped', reason: 'no_ping' }));
+    const first = render(row());
+    expect(await screen.findByText('CLI default: prod-eu · hetzner-cloud · nbg1')).toBeDefined();
+    first.unmount();
+    // Settings opened again: the cache has the report, and the read again fails.
+    h.answer('whoami', () =>
+      Promise.reject(
+        uiError('apprafter::target::invalid_config', 'config.yaml is not valid YAML', {}),
+      ),
+    );
+    render(row());
+    expect(await screen.findByText('config.yaml is not valid YAML')).toBeDefined();
+    expect(screen.getByText('From an earlier read:')).toBeDefined();
+    expect(screen.getByText('CLI default: prod-eu · hetzner-cloud · nbg1')).toBeDefined();
+  });
+
   test('a rejected token reads as rejected, in the error tone', async () => {
     h.answer('whoami', whoamiReport({ status: 'skipped', reason: 'no_ping' }));
     h.read('op_start_whoami', [completed(whoamiReport({ status: 'rejected' }))]);

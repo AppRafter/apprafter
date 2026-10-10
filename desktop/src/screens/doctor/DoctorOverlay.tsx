@@ -13,6 +13,7 @@ import {
   ArrowsClockwiseIcon,
   SpinnerGapIcon,
   StethoscopeIcon,
+  WarningCircleIcon,
   XIcon,
 } from '../../components/icons';
 import { ModalFrame } from '../../components/Modal';
@@ -23,6 +24,7 @@ import type { CheckFix } from '../../ipc/generated/CheckFix';
 import type { DoctorReport } from '../../ipc/generated/DoctorReport';
 import type { OpId } from '../../ipc/generated/OpId';
 import { useOperation } from '../../ipc/operations';
+import type { OpNote } from '../../ipc/plans';
 import { useRead } from '../../state/read';
 import { DoctorCheckRow } from './DoctorCheckRow';
 import { type CheckCounts, checkCounts, GROUP_TITLES, stamp } from './doctorText';
@@ -73,9 +75,20 @@ export function DoctorOverlay({
   const id = useId();
   const read = useRead<DoctorReport>();
   const [at, setAt] = useState<Date | null>(null);
+  // What the core warned of while a run went (a failed sweep of decrypted kubeconfig copies):
+  // kept, each once, until the overlay closes (review #5).
+  const [notes, setNotes] = useState<readonly OpNote[]>([]);
   const { run } = read;
   const start = useCallback(() => {
-    void run(() => api.opStartDoctor(target)).then((report) => {
+    void run(
+      () => api.opStartDoctor(target),
+      undefined,
+      (more) =>
+        setNotes((kept) => [
+          ...kept,
+          ...more.filter((note) => !kept.some((k) => k.text === note.text)),
+        ]),
+    ).then((report) => {
       if (report !== null) setAt(new Date());
     });
   }, [run, target]);
@@ -126,6 +139,16 @@ export function DoctorOverlay({
         <IconButton label="Close" icon={XIcon} onClick={onClose} />
       </div>
       <div className="modal-body doctor-body" data-modal-body>
+        {notes.length > 0 && (
+          <ul className="doctor-notes" aria-label="Warnings">
+            {notes.map((note) => (
+              <li key={note.text} data-kind={note.kind}>
+                <WarningCircleIcon aria-hidden="true" />
+                <span>{note.text}</span>
+              </li>
+            ))}
+          </ul>
+        )}
         {s.status === 'running' && (
           <StatePanel
             icon={SpinnerGapIcon}

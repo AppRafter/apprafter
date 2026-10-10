@@ -57,7 +57,11 @@ function ToolRow({ status }: { status: ToolStatus }) {
 
 export function ToolchainPanel({ onClose }: { onClose: () => void }) {
   const query = useQuery({ queryKey: ['toolchain'], queryFn: api.toolchainStatus });
-  const report = query.data;
+  // What is shown is what the last read found: a refused read shows no footer of an older one.
+  const report = query.isError ? undefined : query.data;
+  // A check again, or the panel opened over a cached check: the rows are the last check's until
+  // this one ends, and say so (review #2).
+  const again = query.isFetching && !query.isPending;
   return (
     <Modal
       title="Toolchain"
@@ -98,11 +102,18 @@ export function ToolchainPanel({ onClose }: { onClose: () => void }) {
       ) : query.isError ? (
         <ErrorPanel error={uiErrorOf(query.error)} />
       ) : (
-        <ul className="tool-rows">
-          {query.data.tools.map((status) => (
-            <ToolRow key={status.tool} status={status} />
-          ))}
-        </ul>
+        <>
+          {again && (
+            <p className="tool-checking" role="status">
+              Checking the tools again. These lines are from the last check.
+            </p>
+          )}
+          <ul className="tool-rows" aria-busy={again || undefined} data-stale={again || undefined}>
+            {query.data.tools.map((status) => (
+              <ToolRow key={status.tool} status={status} />
+            ))}
+          </ul>
+        </>
       )}
     </Modal>
   );

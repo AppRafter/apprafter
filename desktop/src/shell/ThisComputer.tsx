@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 // Settings › About › This computer (spec §7, whoami): the identity, the CLI's default target and
 // whether its token authenticates. Opening Settings never pings (R13): the row reads whoami without
-// one, and Verify runs the ping as an operation. Never verified unless the provider said so.
+// one, and Verify runs the ping as an operation. Never verified unless the provider said so. A
+// read that fails is shown, with its help; what an earlier read found stays, marked as such
+// (review #6): never shown as just read.
 import { useQuery } from '@tanstack/react-query';
 import { Button } from '../components/Button';
 import { SettingRow } from '../components/SettingRow';
@@ -9,6 +11,7 @@ import * as api from '../ipc/api';
 import { uiErrorOf } from '../ipc/api';
 import type { CliDefaultTarget } from '../ipc/generated/CliDefaultTarget';
 import type { Identity } from '../ipc/generated/Identity';
+import type { UiError } from '../ipc/generated/UiError';
 import type { Verification } from '../ipc/generated/Verification';
 import type { WhoamiReport } from '../ipc/generated/WhoamiReport';
 import type { WhoamiTarget } from '../ipc/generated/WhoamiTarget';
@@ -65,20 +68,32 @@ function machineLine(t: WhoamiTarget): string {
   return `${t.serverType ?? 'no server type'} · ${key}`;
 }
 
+/** A refusal in the row: what failed, and what to do about it when the core says. */
+function ErrorLines({ error }: { error: UiError }) {
+  return (
+    <>
+      <span data-tone="err">{error.message}</span>
+      {error.help !== null && <span className="this-computer-help">{error.help}</span>}
+    </>
+  );
+}
+
 export function ThisComputerRow() {
   const query = useQuery({ queryKey: ['whoami'], queryFn: api.whoami });
   const verify = useRead<WhoamiReport>();
   // The ping's report, once it has one, replaces the read without a ping.
-  const report = verify.state.status === 'done' ? verify.state.data : query.data;
+  const pinged = verify.state.status === 'done' ? verify.state.data : null;
+  const report = pinged ?? query.data;
+  const failure = query.isError ? uiErrorOf(query.error) : null;
   if (!report) {
     // `!report`: also the null a test's IPC mock answers for a command it does not know.
     return (
       <SettingRow
         label="This computer"
         sub={
-          query.isError ? (
+          failure !== null ? (
             <span className="this-computer">
-              <span data-tone="err">{uiErrorOf(query.error).message}</span>
+              <ErrorLines error={failure} />
             </span>
           ) : (
             'Reading…'
@@ -87,6 +102,8 @@ export function ThisComputerRow() {
       />
     );
   }
+  // The read again failed over a report read before: both, the older one said to be so.
+  const earlier = pinged === null && failure !== null;
   const found = report.cliDefault.status === 'found' ? report.cliDefault.target : null;
   const line = found === null ? null : verificationLine(found.verification);
   const running = verify.state.status === 'running';
@@ -95,13 +112,17 @@ export function ThisComputerRow() {
       label="This computer"
       sub={
         <span className="this-computer">
+          {earlier && (
+            <>
+              <ErrorLines error={failure} />
+              <span className="this-computer-earlier">From an earlier read:</span>
+            </>
+          )}
           <span>{IDENTITY[report.identity]}</span>
           <span>{cliDefaultLine(report.cliDefault)}</span>
           {found !== null && <span className="this-computer-machine">{machineLine(found)}</span>}
           {line !== null && <span data-tone={line.tone}>{line.text}</span>}
-          {verify.state.status === 'failed' && (
-            <span data-tone="err">{verify.state.error.message}</span>
-          )}
+          {verify.state.status === 'failed' && <ErrorLines error={verify.state.error} />}
           {verify.state.status === 'cancelled' && (
             <span data-tone="neutral">The check was cancelled.</span>
           )}

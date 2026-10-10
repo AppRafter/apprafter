@@ -144,6 +144,64 @@ test('Check again by keyboard keeps the focus while it reads: a press starts not
   expect(onClose).toHaveBeenCalledTimes(1);
 });
 
+test('reading again over the rows says so: the rows are marked as the last check until it ends', async () => {
+  const { user } = renderPanel('macos');
+  await screen.findByText('Client Version: v1.34.1');
+  let answer = (_report: unknown) => {};
+  h.answer(
+    'toolchain_status',
+    () =>
+      new Promise((resolve) => {
+        answer = resolve;
+      }),
+  );
+  await user.click(screen.getByRole('button', { name: 'Check again' }));
+  expect(
+    await screen.findByText('Checking the tools again. These lines are from the last check.'),
+  ).toBeDefined();
+  expect(document.querySelector('.tool-rows')?.getAttribute('aria-busy')).toBe('true');
+  answer(toolchainReport());
+  // A boolean, not the element: bun formats a failing element match slowly enough to starve
+  // waitFor's loop.
+  await waitFor(() => expect(screen.queryByText(/^Checking the tools again/) === null).toBe(true));
+  expect(document.querySelector('.tool-rows')?.getAttribute('aria-busy')).toBeNull();
+});
+
+test('opened again while the last check is cached: it says the lines are from the last check', async () => {
+  const client = createQueryClient();
+  const panel = () => (
+    <QueryClientProvider client={client}>
+      <PlatformContext value={appInfo({ os: 'macos' })}>
+        <ToastProvider>
+          <ViewFrame>
+            <ToolchainPanel onClose={() => {}} />
+          </ViewFrame>
+        </ToastProvider>
+      </PlatformContext>
+    </QueryClientProvider>
+  );
+  const first = render(panel());
+  await screen.findByText('Client Version: v1.34.1');
+  first.unmount();
+  h.answer('toolchain_status', () => new Promise(() => {})); // the new check keeps running
+  render(panel());
+  expect(
+    await screen.findByText('Checking the tools again. These lines are from the last check.'),
+  ).toBeDefined();
+  expect(screen.getByText('Client Version: v1.34.1')).toBeDefined();
+});
+
+test('a check again that is refused shows why, and no footer from the check before', async () => {
+  const { user } = renderPanel('macos');
+  await screen.findByText('Searched 2 directories of the PATH your login shell sets');
+  h.answer('toolchain_status', () =>
+    Promise.reject(uiError('apprafter::desktop::internal', 'the probe broke')),
+  );
+  await user.click(screen.getByRole('button', { name: 'Check again' }));
+  expect(await screen.findByText('the probe broke')).toBeDefined();
+  expect(screen.queryByText(/^Searched /)).toBeNull();
+});
+
 test('the footer names the search path and, opened, lists it', async () => {
   const { user } = renderPanel('macos');
   const summary = await screen.findByText(
