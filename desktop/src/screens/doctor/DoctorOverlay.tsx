@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 // Doctor (spec §7): groups Target / Cluster / This computer, run as a read operation for one
 // target (the tab's), its stage shown live (core Event::Stage per group, 1-based) and cancellable.
+// Copy report writes the plain-text report once there is one (the clipboard is write-only).
 // A fix that has a screen offers it: a missing tool the toolchain, a missing target the wizard
 // (the doctor closes first: the wizard's layer is below the doctor's), a target with no SSH key
 // the key change (the Target screen's, which reads the key in use itself; its form opens above
@@ -11,6 +12,7 @@ import { ErrorPanel } from '../../components/ErrorPanel';
 import { IconButton } from '../../components/IconButton';
 import {
   ArrowsClockwiseIcon,
+  CopyIcon,
   SpinnerGapIcon,
   StethoscopeIcon,
   WarningCircleIcon,
@@ -25,9 +27,10 @@ import type { DoctorReport } from '../../ipc/generated/DoctorReport';
 import type { OpId } from '../../ipc/generated/OpId';
 import { useOperation } from '../../ipc/operations';
 import type { OpNote } from '../../ipc/plans';
+import { useCopy } from '../../state/copy';
 import { useRead } from '../../state/read';
 import { DoctorCheckRow } from './DoctorCheckRow';
-import { type CheckCounts, checkCounts, GROUP_TITLES, stamp } from './doctorText';
+import { type CheckCounts, checkCounts, GROUP_TITLES, reportText, stamp } from './doctorText';
 
 export interface DoctorOverlayProps {
   readonly target: string;
@@ -73,6 +76,7 @@ export function DoctorOverlay({
   onChangeSshKey,
 }: DoctorOverlayProps) {
   const id = useId();
+  const copy = useCopy();
   const read = useRead<DoctorReport>();
   const [at, setAt] = useState<Date | null>(null);
   // What the core warned of while a run went (a failed sweep of decrypted kubeconfig copies):
@@ -198,6 +202,17 @@ export function DoctorOverlay({
             ? `${counts.total} ${counts.total === 1 ? 'check' : 'checks'} · ${stamp(at).slice(11)}`
             : ''}
         </span>
+        <Button
+          icon={CopyIcon}
+          disabled={report === null || at === null}
+          onClick={() => {
+            if (report !== null && at !== null) {
+              copy(reportText(report, at, notes), 'Report copied');
+            }
+          }}
+        >
+          Copy report
+        </Button>
         <Button
           variant="primary"
           icon={ArrowsClockwiseIcon}

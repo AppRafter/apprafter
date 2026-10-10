@@ -2,12 +2,14 @@
 // The toolchain (spec §5.1: tool_not_found / cue_not_found lead here; Settings › About opens it):
 // each tool the app runs, what the probe found and where, and for one that is missing or broken
 // the install lines for this OS. The probe is a plain command, each tool bounded by the core's
-// TOOL_PROBE_TIMEOUT (R14). An install page is shown as its address: the opener's capability
-// allows only the app's own three URLs.
+// TOOL_PROBE_TIMEOUT (R14). A command or an install page's address has a Copy button (the
+// clipboard is write-only); a note ("preinstalled") has none. An install page is shown as its
+// address: the opener's capability allows only the app's own three URLs.
 import { useQuery } from '@tanstack/react-query';
 import { Button } from '../../components/Button';
 import { ErrorPanel } from '../../components/ErrorPanel';
-import { ArrowsClockwiseIcon, SpinnerGapIcon } from '../../components/icons';
+import { IconButton } from '../../components/IconButton';
+import { ArrowsClockwiseIcon, CopyIcon, SpinnerGapIcon } from '../../components/icons';
 import { Modal } from '../../components/Modal';
 import { StatePanel } from '../../components/StatePanel';
 import { Tag } from '../../components/Tag';
@@ -15,16 +17,33 @@ import * as api from '../../ipc/api';
 import { uiErrorOf } from '../../ipc/api';
 import type { InstallHint } from '../../ipc/generated/InstallHint';
 import type { ToolStatus } from '../../ipc/generated/ToolStatus';
+import { useCopy } from '../../state/copy';
 import { usePlatform } from '../../state/platform';
-import { HINT_LABELS, hintKind, hintsFor, pathSourceLine, toolStateLine } from './toolchain';
+import {
+  copyable,
+  HINT_LABELS,
+  hintKind,
+  hintsFor,
+  pathSourceLine,
+  toolStateLine,
+} from './toolchain';
 
-/** One install line: its OS, then the command or address in mono, or a note to read. */
+/** One install line: its OS, then the command or address in mono with Copy, or a note to read. */
 function HintLine({ hint }: { hint: InstallHint }) {
+  const copy = useCopy();
   const kind = hintKind(hint.command);
   return (
     <div className="tool-hint" data-kind={kind}>
       <span className="tool-hint-os">{HINT_LABELS[hint.os]}</span>
       {kind === 'note' ? <span>{hint.command}</span> : <code>{hint.command}</code>}
+      {copyable(hint.command) && (
+        <IconButton
+          label={`Copy ${hint.command}`}
+          icon={CopyIcon}
+          size={22}
+          onClick={() => copy(hint.command, `Copied: ${hint.command}`)}
+        />
+      )}
     </div>
   );
 }

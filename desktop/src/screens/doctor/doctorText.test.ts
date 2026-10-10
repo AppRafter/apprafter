@@ -234,6 +234,21 @@ describe('reportText', () => {
     );
   });
 
+  test("the core's warnings and notices of the run follow the header, before the groups", () => {
+    const text = reportText(doctorReport(), new Date(2026, 9, 9, 14, 2), [
+      { kind: 'warning', text: 'cannot remove old kubeconfig copies' },
+      { kind: 'notice', text: 'kubectl answered slowly' },
+    ]);
+    expect(text.split('\n').slice(0, 6)).toEqual([
+      'AppRafter doctor · prod-eu · 2026-10-09 14:02',
+      '',
+      '  WARN  cannot remove old kubeconfig copies',
+      '  NOTE  kubectl answered slowly',
+      '',
+      'Target',
+    ]);
+  });
+
   test('no target, one check, nothing skipped', () => {
     const text = reportText(
       { target: null, groups: [{ id: 'this_computer', checks: [check({ id: 'dns' })] }] },

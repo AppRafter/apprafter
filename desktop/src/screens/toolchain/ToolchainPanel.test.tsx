@@ -62,6 +62,42 @@ test("macOS: a found tool's version and path; a missing one's macOS line; a note
   expect(screen.queryByText(/winget/)).toBeNull();
   // ssh timed out, so its install line shows; on macOS it reads "preinstalled": a note to read.
   expect(screen.getByText('preinstalled').tagName).not.toBe('CODE');
+  expect(screen.getByRole('button', { name: 'Copy brew install helm' })).toBeDefined();
+  expect(screen.queryByRole('button', { name: 'Copy preinstalled' })).toBeNull();
+});
+
+test('Copy writes the command to the clipboard and nothing else, and says so', async () => {
+  const { user } = renderPanel('macos');
+  await user.click(await screen.findByRole('button', { name: 'Copy brew install helm' }));
+  expect(h.of('plugin:clipboard-manager|write_text').map((c) => c.args)).toEqual([
+    expect.objectContaining({ text: 'brew install helm' }),
+  ]);
+  expect(await screen.findByText('Copied: brew install helm')).toBeDefined();
+});
+
+test('an install page can be copied as its address', async () => {
+  const { user } = renderPanel('linux');
+  await screen.findByText('Client Version: v1.34.1');
+  const helm = toolRow('helm');
+  await user.click(
+    within(helm).getByRole('button', { name: 'Copy https://helm.sh/docs/intro/install/' }),
+  );
+  expect(h.of('plugin:clipboard-manager|write_text').map((c) => c.args.text)).toEqual([
+    'https://helm.sh/docs/intro/install/',
+  ]);
+});
+
+test('a copy the system refuses says so, in its words', async () => {
+  h.answer('plugin:clipboard-manager|write_text', () =>
+    Promise.reject('Unknown error while interacting with the clipboard: no display'),
+  );
+  const { user } = renderPanel('macos');
+  await user.click(await screen.findByRole('button', { name: 'Copy brew install helm' }));
+  expect(
+    await screen.findByText(
+      'Not copied: Unknown error while interacting with the clipboard: no display',
+    ),
+  ).toBeDefined();
 });
 
 test("Windows: the missing tool's winget line", async () => {

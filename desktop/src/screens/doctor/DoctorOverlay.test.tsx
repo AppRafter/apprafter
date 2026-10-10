@@ -22,6 +22,7 @@ import {
 } from '../../test/ipc';
 import { settleIpc } from '../../test/settle';
 import { DoctorOverlay } from './DoctorOverlay';
+import { reportText } from './doctorText';
 
 let h: Harness;
 beforeEach(() => {
@@ -62,6 +63,7 @@ function renderDoctor(target: string, strict = false) {
 }
 
 const runAgain = () => screen.getByRole('button', { name: 'Run again' }) as HTMLButtonElement;
+const copyReport = () => screen.getByRole('button', { name: 'Copy report' }) as HTMLButtonElement;
 
 describe('DoctorOverlay', () => {
   test('runs at once for its target, shows the stage while it runs, Cancel cancels', async () => {
@@ -113,6 +115,69 @@ describe('DoctorOverlay', () => {
     await user.click(runAgain());
     await waitFor(() => expect(h.of('op_start_doctor')).toHaveLength(2));
     expect(await screen.findByText('3 pass')).toBeDefined();
+  });
+
+  test('Copy report writes the report text, and says so', async () => {
+    h.read('op_start_doctor', [completed(doctorReport())]);
+    const { user } = renderDoctor('prod-eu');
+    await screen.findByText('3 pass');
+    await user.click(copyReport());
+    const written = h.of('plugin:clipboard-manager|write_text').map((c) => String(c.args.text));
+    expect(written).toHaveLength(1);
+    const [head, ...body] = (written[0] ?? '').split('\n');
+    expect(head).toMatch(/^AppRafter doctor · prod-eu · \d{4}-\d\d-\d\d \d\d:\d\d$/);
+    // The rows, fixes and totals are the report's; only the header carries the time.
+    expect(body).toEqual(reportText(doctorReport(), new Date()).split('\n').slice(1));
+    expect(await screen.findByText('Report copied')).toBeDefined();
+  });
+
+  test('Copy report waits for a report: not after a run that did not end in one, nor while one runs', async () => {
+    h.read('op_start_doctor', [cancelled()]);
+    h.read('op_start_doctor', [
+      failed(uiError('apprafter::desktop::internal', 'the doctor broke')),
+    ]);
+    h.read('op_start_doctor', [stage(1, 3, 'Target')]); // keeps running
+    const { user } = renderDoctor('prod-eu');
+    expect(await screen.findByText('Doctor was cancelled.')).toBeDefined();
+    expect(copyReport().disabled).toBe(true);
+    await user.click(runAgain());
+    expect(await screen.findByText('the doctor broke')).toBeDefined();
+    expect(copyReport().disabled).toBe(true);
+    await user.click(runAgain());
+    expect(await screen.findByText('Target · 1 of 3')).toBeDefined();
+    expect(copyReport().disabled).toBe(true);
+    expect(h.of('plugin:clipboard-manager|write_text')).toHaveLength(0);
+  });
+
+  test("the copied report carries the core's warnings too", async () => {
+    h.read('op_start_doctor', [
+      { kind: 'warning', message: 'cannot remove old kubeconfig copies' },
+      completed(doctorReport()),
+    ]);
+    const { user } = renderDoctor('prod-eu');
+    await screen.findByText('3 pass');
+    await user.click(copyReport());
+    const [text] = h.of('plugin:clipboard-manager|write_text').map((c) => String(c.args.text));
+    expect(text?.split('\n').slice(1, 3)).toEqual([
+      '',
+      '  WARN  cannot remove old kubeconfig copies',
+    ]);
+  });
+
+  test('a copy the system refuses says so, in its words', async () => {
+    h.read('op_start_doctor', [completed(doctorReport())]);
+    h.answer('plugin:clipboard-manager|write_text', () =>
+      Promise.reject('Unknown error while interacting with the clipboard: no display'),
+    );
+    const { user } = renderDoctor('prod-eu');
+    await screen.findByText('3 pass');
+    await user.click(copyReport());
+    expect(
+      await screen.findByText(
+        'Not copied: Unknown error while interacting with the clipboard: no display',
+      ),
+    ).toBeDefined();
+    expect(screen.queryByText('Report copied')).toBeNull();
   });
 
   test("a missing tool's fix opens the toolchain", async () => {

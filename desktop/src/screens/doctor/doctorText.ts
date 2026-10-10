@@ -13,6 +13,7 @@ import type { DoctorReport } from '../../ipc/generated/DoctorReport';
 import type { GroupId } from '../../ipc/generated/GroupId';
 import type { KubeErrorKind } from '../../ipc/generated/KubeErrorKind';
 import type { RenewWhy } from '../../ipc/generated/RenewWhy';
+import type { OpNote } from '../../ipc/plans';
 
 export const GROUP_TITLES: Record<GroupId, string> = {
   target: 'Target',
@@ -159,9 +160,15 @@ export const stamp = (at: Date) =>
 
 const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
 
-/** The plain-text report Copy report writes: a header, each group's rows and fixes, the totals. */
-export function reportText(report: DoctorReport, at: Date): string {
+/**
+ * The plain-text report Copy report writes: a header, what the core warned of while it ran (the
+ * overlay's notes), each group's rows and fixes, the totals.
+ */
+export function reportText(report: DoctorReport, at: Date, notes: readonly OpNote[] = []): string {
   const lines = [`AppRafter doctor · ${report.target ?? 'no target'} · ${stamp(at)}`];
+  if (notes.length > 0) {
+    lines.push('', ...notes.map((n) => `  ${n.kind === 'warning' ? 'WARN' : 'NOTE'}  ${n.text}`));
+  }
   for (const group of report.groups) {
     lines.push('', GROUP_TITLES[group.id]);
     for (const c of group.checks) {
