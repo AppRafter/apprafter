@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 // The design's openForm (brief §3), with its three corrections: `required` counts visible
 // fields only and hidden values stay out of the submission; the dialog stays open while
-// onSubmit runs and shows a rejection inline; a backdrop click never dismisses it.
+// onSubmit runs (its submit waiting, focusable) and shows a rejection inline; a backdrop click
+// never dismisses it.
 import { type FormEvent, useId, useState } from 'react';
 import { uiErrorOf } from '../ipc/api';
 import type { UiError } from '../ipc/generated/UiError';
@@ -175,11 +176,14 @@ export function FormDialog({
           <Button size={32} onClick={onClose} disabled={busy}>
             Cancel
           </Button>
+          {/* While onSubmit runs it waits, focusable: it has the focus it was pressed with, and a
+              browser drops the focus of a control it disables onto the page. */}
           <Button
             size={32}
             type="submit"
             variant={danger ? 'danger-solid' : 'primary'}
-            disabled={blocked || busy}
+            disabled={blocked && !busy}
+            pending={busy}
           >
             {submit}
           </Button>

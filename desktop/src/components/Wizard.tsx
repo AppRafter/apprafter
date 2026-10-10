@@ -2,16 +2,18 @@
 // The design's wizard frame (880 px): title, the stepper (a check for a step done), the body, and
 // a footer with a mono hint, Back and the step's Next. The body and footer are one form, so Enter
 // in a field goes next, unless Next is disabled. While busy (a verify or a save running),
-// nothing closes it and Back and Next wait.
+// nothing closes it, Back waits disabled and Next waits focusable (`pending`): it has the focus
+// it was pressed with, and a browser drops the focus of a control it disables onto the page,
+// out of reach of Esc and Tab.
 //
 // The focus never falls out of the dialog. Each step is a new body (keyed by the step), and it
 // takes the focus to its first control (a radio group's chosen radio), unless a control of the
 // step took it already. While busy, the focus moves to the dialog if busy disabled the control
-// that had it: a browser drops the focus of a control it disables onto the page, out of reach
-// of Esc and Tab. When busy ends, a focus parked on the dialog, or lost to the page, goes back
-// to the step. A control of the step that goes while it has the focus ("Use another token", a
-// Try again replaced by what it started) hands it to the step's first control, or the dialog. A
-// polite status says which step is shown.
+// that had it. When busy ends, a focus parked on the dialog, lost to the page, or on a control
+// now disabled (Next, when the step cannot go on), goes back to the step. A control of the step
+// that goes while it has the focus ("Use another token", a Try again replaced by what it
+// started) hands it to the step's first control, or the dialog. A polite status says which step
+// is shown.
 //
 // One activation is one Next: Next is one button for every step, so the second click of a double
 // click, or a held Enter's repeat, would be the next step's Next (Save, after Continue) without
@@ -173,7 +175,8 @@ export function Wizard({
             size={32}
             type="submit"
             variant="primary"
-            disabled={nextDisabled || busy}
+            disabled={nextDisabled && !busy}
+            pending={busy}
             onClick={(event) => {
               // A submit button's click submits: its default is cancelled for a repeated click.
               if (event.detail > 1) event.preventDefault();

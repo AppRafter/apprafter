@@ -167,6 +167,28 @@ describe('ConfirmDialog', () => {
   });
 });
 
+describe('ConfirmDialog while onConfirm runs', () => {
+  test('Confirm keeps the focus it was pressed with: it waits, it is not disabled', async () => {
+    let finish = () => {};
+    const onConfirm = mock(() => new Promise<void>((resolve) => (finish = resolve)));
+    const { user, onClose } = open({ planClass: 'bounded', onConfirm });
+    await user.click(confirm());
+    // A browser drops the focus of a control it disables onto the page, out of reach of Esc
+    // and Tab (happy-dom does not, GOTCHA-90): so the button waits instead.
+    expect(confirm().disabled).toBe(false);
+    expect(confirm().getAttribute('aria-disabled')).toBe('true');
+    expect(document.activeElement === confirm()).toBe(true);
+    await user.click(confirm());
+    await user.keyboard('{Enter}');
+    expect(onConfirm).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      finish();
+      await Promise.resolve();
+    });
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('ConfirmDialog where the OS cannot prompt: the password field', () => {
   const password = () => screen.getByLabelText('System password') as HTMLInputElement;
 
@@ -224,6 +246,21 @@ describe('ConfirmDialog where the OS cannot prompt: the password field', () => {
     expect(onClose).not.toHaveBeenCalled();
   });
 
+  test('a wrong password after a press of Confirm: the focus goes to the emptied field', async () => {
+    const { user } = open({
+      auth: pam,
+      onConfirm: () =>
+        Promise.reject(refusal(DESKTOP_ERROR_CODES.AUTH_FAILED, { exhausted: false })),
+    });
+    await user.type(password(), 'guess');
+    await user.click(confirm());
+    await screen.findByRole('alert');
+    // Emptied, the field makes Confirm unready (disabled): had it kept the focus, a browser
+    // would drop it onto the page.
+    expect(confirm().disabled).toBe(true);
+    expect(document.activeElement === password()).toBe(true);
+  });
+
   test('a refusal marks the field until the owner types again, as the lock screen does', async () => {
     const { user } = open({
       auth: pam,
@@ -261,7 +298,8 @@ describe('ConfirmDialog where the OS cannot prompt: the password field', () => {
         'Too many failed attempts. Try again in 2 s.',
       );
       expect(password().disabled).toBe(true);
-      expect(confirm().disabled).toBe(true);
+      // Confirm waits out the back-off focusable: pressed, it does nothing.
+      expect(confirm().getAttribute('aria-disabled')).toBe('true');
       loseFocus();
       act(() => jest.advanceTimersByTime(500));
       expect(screen.getByRole('alert').textContent).toBe(
@@ -275,6 +313,26 @@ describe('ConfirmDialog where the OS cannot prompt: the password field', () => {
       await user.type(password(), 'hunter2{Enter}');
       await settled();
       expect(onClose).toHaveBeenCalledTimes(1);
+    }));
+
+  test('a back-off after a press of Confirm: Confirm keeps the focus, waiting it out', () =>
+    onFakeTime(async () => {
+      const { user } = open({
+        auth: pam,
+        onConfirm: () =>
+          Promise.reject(
+            refusal(DESKTOP_ERROR_CODES.AUTH_FAILED, { exhausted: true, retryInMs: 1_500 }),
+          ),
+      });
+      await user.type(password(), 'guess');
+      await user.click(confirm());
+      await settled();
+      expect(password().disabled).toBe(true);
+      // Not the field: the back-off disables it, and a browser drops the focus of a disabled
+      // control onto the page (happy-dom keeps it there, GOTCHA-90).
+      expect(document.activeElement === confirm()).toBe(true);
+      act(() => jest.advanceTimersByTime(1_500));
+      expect(document.activeElement === password()).toBe(true);
     }));
 
   test('a retry after a wrong password confirms the same plan: the same opId, in place', async () => {

@@ -107,13 +107,21 @@ export function ConfirmDialog({
       await (field ? onConfirm(password) : onConfirm());
     } catch (reason) {
       const refused = uiErrorOf(reason);
+      let backoffStarts = false;
       if (AUTH_REFUSALS.has(refused.code)) {
         const said = authRefusal(refused, field);
         setRefusal(said.lines);
-        if (said.retryInMs !== null) startRetry(said.retryInMs);
+        if (said.retryInMs !== null) {
+          startRetry(said.retryInMs);
+          backoffStarts = true;
+        }
       } else {
         setError(refused);
       }
+      // The field is emptied (below), so Confirm is unready again: disabled, and a browser drops
+      // the focus of a control it disables onto the page. The owner types again in the field —
+      // unless a back-off disables that too: then Confirm keeps the focus, waiting it out.
+      if (field && !backoffStarts) passwordInput.current?.focus();
       setBusy(false);
       return;
     } finally {
@@ -200,11 +208,15 @@ export function ConfirmDialog({
           <Button size={32} onClick={onClose} disabled={busy}>
             Cancel
           </Button>
+          {/* While onConfirm runs, or a back-off counts down, it waits, focusable: it has the
+              focus it was pressed with, and a browser drops the focus of a control it disables
+              onto the page, out of reach of Esc and Tab. */}
           <Button
             type="submit"
             size={32}
             variant={danger ? 'danger-solid' : 'primary'}
-            disabled={!ready || busy || backoff}
+            disabled={!ready && !busy && !backoff}
+            pending={busy || backoff}
           >
             {confirmLabel}
           </Button>

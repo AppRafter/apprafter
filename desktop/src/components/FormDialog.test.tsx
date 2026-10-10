@@ -276,7 +276,11 @@ describe('FormDialog', () => {
     );
     await user.click(submit());
     expect(screen.getByRole('dialog')).toBeDefined();
-    expect(submit().disabled).toBe(true);
+    // Save waits but keeps the focus it was pressed with: a browser drops the focus of a control
+    // it disables onto the page, out of reach of Esc and Tab (happy-dom does not, GOTCHA-90).
+    expect(submit().disabled).toBe(false);
+    expect(submit().getAttribute('aria-disabled')).toBe('true');
+    expect(document.activeElement).toBe(submit());
     expect((screen.getByRole('button', { name: 'Cancel' }) as HTMLButtonElement).disabled).toBe(
       true,
     );
@@ -287,6 +291,28 @@ describe('FormDialog', () => {
       await new Promise((r) => setTimeout(r, 0));
     });
     expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  test('busy: a second press of Save, or Enter, submits nothing more', async () => {
+    const running = deferred();
+    const onSubmit = mock(() => running.promise);
+    const user = userEvent.setup();
+    render(
+      <FormDialog
+        title="Rename"
+        fields={[{ key: 'name', label: 'Name', def: 'x' }]}
+        onSubmit={onSubmit}
+        onClose={mock()}
+      />,
+    );
+    await user.click(submit());
+    await user.click(submit());
+    await user.keyboard('{Enter}');
+    expect(onSubmit).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      running.resolve();
+      await new Promise((r) => setTimeout(r, 0));
+    });
   });
 
   test('a rejection is shown inline and the dialog stays, ready to try again', async () => {
@@ -311,6 +337,8 @@ describe('FormDialog', () => {
     expect(screen.getByRole('alert').textContent).toContain('A backup is running.');
     expect(onClose).not.toHaveBeenCalled();
     expect(submit().disabled).toBe(false);
+    expect(submit().hasAttribute('aria-disabled')).toBe(false);
+    expect(document.activeElement).toBe(submit());
   });
 
   test('a backdrop click never dismisses it (typed secrets would go)', async () => {

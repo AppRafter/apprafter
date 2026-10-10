@@ -508,7 +508,9 @@ describe('details and save', () => {
     await user.type(screen.getByLabelText('Target name'), 'lab-2');
     await user.click(saveButton());
     const saving = (await screen.findByRole('button', { name: 'Saving…' })) as HTMLButtonElement;
-    expect(saving.disabled).toBe(true);
+    // It waits, focusable (the Wizard's Next while busy): a press saves nothing more.
+    expect(saving.getAttribute('aria-disabled')).toBe('true');
+    expect(saving.disabled).toBe(false);
     expect((screen.getByRole('button', { name: 'Close' }) as HTMLButtonElement).disabled).toBe(
       true,
     );

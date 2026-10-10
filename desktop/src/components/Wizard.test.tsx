@@ -119,11 +119,16 @@ describe('Wizard', () => {
     }
   });
 
-  test('busy: Back, Next and Close are disabled and Esc does not close', async () => {
-    const { user, onClose } = wizard({ busy: true });
-    for (const name of ['Back', 'Continue', 'Close']) {
+  test('busy: Back and Close are disabled, Next waits, and Esc does not close', async () => {
+    const { user, onClose, onNext } = wizard({ busy: true });
+    for (const name of ['Back', 'Close']) {
       expect(button(name).disabled).toBe(true);
     }
+    // Next keeps a focus it was pressed with: it waits (aria-disabled), a press does nothing.
+    expect(button('Continue').disabled).toBe(false);
+    expect(button('Continue').getAttribute('aria-disabled')).toBe('true');
+    await user.click(button('Continue'));
+    expect(onNext).not.toHaveBeenCalled();
     await user.keyboard('{Escape}');
     expect(onClose).not.toHaveBeenCalled();
     expect(screen.getByRole('dialog').querySelector('form')?.getAttribute('aria-busy')).toBe(
@@ -208,15 +213,32 @@ describe('Wizard focus', () => {
     expect(document.activeElement).toBe(dialog);
   });
 
-  test('busy keeps the focus in the dialog; once done it goes back to the step', async () => {
+  test('busy: Next keeps the focus it was pressed with, through busy and after', async () => {
     const { user, update } = stepping();
     await user.click(button('Continue'));
-    expect(document.activeElement).toBe(button('Continue'));
-    // A browser takes the focus away from the button busy disables (happy-dom does not).
+    expect(document.activeElement === button('Continue')).toBe(true);
     update({ busy: true });
-    expect(document.activeElement).toBe(screen.getByRole('dialog'));
+    expect(button('Continue').disabled).toBe(false);
+    expect(document.activeElement === button('Continue')).toBe(true);
     update({ busy: false });
-    expect(document.activeElement).toBe(screen.getByLabelText('Field'));
+    expect(document.activeElement === button('Continue')).toBe(true);
+  });
+
+  test('…and when busy ends on the next step, the focus goes to that step', async () => {
+    const { user, update } = stepping({ step: 0 });
+    await user.click(button('Continue'));
+    update({ busy: true });
+    update({ busy: false, step: 1, children: <input aria-label="Name" /> });
+    expect(document.activeElement === screen.getByLabelText('Name')).toBe(true);
+  });
+
+  test('…and when busy ends with Next unable to go on, the focus goes to the step', async () => {
+    const { user, update } = stepping();
+    await user.click(button('Continue'));
+    update({ busy: true });
+    update({ busy: false, nextDisabled: true });
+    expect(button('Continue').disabled).toBe(true);
+    expect(document.activeElement === screen.getByLabelText('Field')).toBe(true);
   });
 
   test('busy: a focus lost to the page comes back to the step when it ends', () => {
