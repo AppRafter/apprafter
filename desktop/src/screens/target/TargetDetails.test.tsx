@@ -52,6 +52,23 @@ test('the rows the CLI prints, with its "not set", and no token anywhere', () =>
   expect(document.body.textContent).not.toContain('encrypted');
 });
 
+test('the values that can be cut short in a narrow card carry their whole text as a title', () => {
+  render(
+    <TargetDetails
+      report={targetReport()}
+      os="linux"
+      secretBackend="file"
+      actions={noop()}
+      onChangeMachine={null}
+    />,
+  );
+  const titleOf = (label: string) =>
+    row(label).querySelector('.row-value [title]')?.getAttribute('title');
+  expect(titleOf('SSH key')).toBe('~/.ssh/id_ed25519.pub · ssh-ed25519');
+  expect(titleOf('Config file')).toBe('~/.config/apprafter/targets/prod-eu/config.yaml');
+  expect(titleOf('Credentials file')).toBe('~/.config/apprafter/targets/prod-eu/credentials.yaml');
+});
+
 test('what is not stored reads "not set"; a key file that went is "missing"', () => {
   const report = targetReport({
     region: null,

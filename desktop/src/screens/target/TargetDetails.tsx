@@ -53,7 +53,8 @@ const sshKeyValue = (key: SshKeyInfo | null) => {
   return `${key.display}${key.algo === null ? '' : ` · ${key.algo}`}${key.exists ? '' : ' (missing)'}`;
 };
 
-const path = (file: string) => <span title={file}>{file}</span>;
+/** A value the card may cut short (a path, a key): its whole text shows on hover. */
+const titled = (text: string) => <span title={text}>{text}</span>;
 
 export function TargetDetails({
   report,
@@ -126,7 +127,7 @@ export function TargetDetails({
       <Group label="SSH key">
         <CardRow
           label="SSH key"
-          value={sshKeyValue(report.sshKey)}
+          value={titled(sshKeyValue(report.sshKey))}
           control={
             <Button size={26} onClick={actions.changeSshKey}>
               Change
@@ -135,10 +136,10 @@ export function TargetDetails({
         />
       </Group>
       <Group label="Config file">
-        <CardRow label="Config file" value={path(report.configFile)} />
+        <CardRow label="Config file" value={titled(report.configFile)} />
       </Group>
       <Group label="Credentials file">
-        <CardRow label="Credentials file" value={path(report.credentialsFile)} />
+        <CardRow label="Credentials file" value={titled(report.credentialsFile)} />
       </Group>
     </Card>
   );

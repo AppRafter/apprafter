@@ -573,8 +573,7 @@
 }
 
 .row[data-layout="card"] {
-  flex-wrap: wrap;
-  gap: 8px 14px;
+  gap: 14px;
   padding: 10px 16px;
 }
 
@@ -598,6 +597,19 @@
 
 .row[data-tone="danger"] .row-label {
   color: var(--err);
+}
+
+/*
+ * A card row's label stays on one line: the text column is never narrower than the label, and a
+ * long value beside it (a file path, an SSH key) gives way and ellipsises instead. The row does
+ * not wrap either, so the value never drops below the label.
+ */
+.row[data-layout="card"] .row-text {
+  min-width: min-content;
+}
+
+.row[data-layout="card"] .row-label {
+  white-space: nowrap;
 }
 
 .row-sub {
