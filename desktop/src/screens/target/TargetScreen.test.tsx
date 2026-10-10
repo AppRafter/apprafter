@@ -3,12 +3,22 @@
 // default at once, rename / renew / the SSH key a plain confirm listing the changes (the SSH key
 // alone, no token), remove the full plan with the typed name and the gesture.
 import { afterEach, beforeEach, expect, mock, test } from 'bun:test';
+import { QueryClientProvider } from '@tanstack/react-query';
 import { clearMocks } from '@tauri-apps/api/mocks';
-import { screen, waitFor, within } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { Activity } from 'react';
+import { ToastProvider } from '../../components/Toast';
 import * as api from '../../ipc/api';
 import { installMockIpc } from '../../ipc/mock';
 import { resetOperations } from '../../ipc/operations';
 import { startPlan } from '../../ipc/plans';
+import { AppOverlayContext, useAppOverlayHost } from '../../shell/AppOverlays';
+import { ViewFrame } from '../../shell/ViewFrame';
+import { PlatformContext } from '../../state/platform';
+import { createQueryClient } from '../../state/queryClient';
+import { appInfo } from '../../test/fixtures';
+import { uiError } from '../../test/ipc';
 import { renderScreen } from '../../test/screens';
 import { settleIpc } from '../../test/settle';
 import { TargetScreen } from './TargetScreen';
@@ -333,4 +343,138 @@ test("a provisioned target has no Change, and D.3d's refusal text stays", async 
   const machine = await screen.findByRole('group', { name: 'Machine' });
   expect(within(machine).queryByRole('button', { name: 'Change' })).toBeNull();
   expect(machine.textContent).toContain('apprafter backup create');
+});
+
+// D.3e review #12: the app's own overlays (the toolchain, the wizard) open beside the views, so
+// the view's heading is not their host's child. Opened by an ErrorPanel action, which goes with
+// the panel, they closed with the focus on <body>, where the next Tab starts over from the title
+// bar. Their fallback is the heading of the view that is shown.
+for (const [code, action, dialog] of [
+  ['apprafter::env::tool_not_found', 'Show the toolchain', 'Toolchain'],
+  ['apprafter::target::not_found', 'Add a target', 'Add target'],
+] as const) {
+  test(`the panel's ${action}: closed, the focus goes to the page's heading`, async () => {
+    const internals = (
+      window as unknown as { __TAURI_INTERNALS__: { invoke: (...args: unknown[]) => unknown } }
+    ).__TAURI_INTERNALS__;
+    const invoke = internals.invoke;
+    internals.invoke = (...args: unknown[]) =>
+      args[0] === 'op_plan_target_use'
+        ? Promise.reject(uiError(code))
+        : invoke.apply(internals, args);
+    const user = screenOf('staging');
+    const row = await screen.findByRole('group', { name: 'CLI default' });
+    await user.click(within(row).getByRole('button', { name: 'Make default' }));
+    const panel = await screen.findByRole('alert');
+    await user.click(within(panel).getByRole('button', { name: action }));
+    const opened = await screen.findByRole('dialog', { name: dialog });
+    expect(opened.contains(document.activeElement)).toBe(true);
+    await user.keyboard('{Escape}');
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    expect(document.activeElement).toBe(screen.getByRole('heading', { level: 1, name: 'Target' }));
+  });
+}
+
+/** Two tabs as the Shell hosts them: prod-eu's hidden before staging's, the app's overlays beside. */
+function TwoTabs() {
+  const app = useAppOverlayHost();
+  return (
+    <AppOverlayContext value={app.show}>
+      <Activity mode="hidden">
+        <ViewFrame>
+          <TargetScreen name="prod-eu" onRenamed={() => {}} onRemoved={() => {}} />
+        </ViewFrame>
+      </Activity>
+      <Activity mode="visible">
+        <ViewFrame>
+          <TargetScreen name="staging" onRenamed={() => {}} onRemoved={() => {}} />
+        </ViewFrame>
+      </Activity>
+      {app.overlays}
+    </AppOverlayContext>
+  );
+}
+
+test("with a tab hidden before it, the fallback is the shown tab's heading", async () => {
+  const internals = (
+    window as unknown as { __TAURI_INTERNALS__: { invoke: (...args: unknown[]) => unknown } }
+  ).__TAURI_INTERNALS__;
+  const invoke = internals.invoke;
+  internals.invoke = (...args: unknown[]) =>
+    args[0] === 'op_plan_target_use'
+      ? Promise.reject(uiError('apprafter::env::tool_not_found'))
+      : invoke.apply(internals, args);
+  render(
+    <QueryClientProvider client={createQueryClient()}>
+      <PlatformContext value={appInfo()}>
+        <ToastProvider>
+          <TwoTabs />
+        </ToastProvider>
+      </PlatformContext>
+    </QueryClientProvider>,
+  );
+  const user = userEvent.setup();
+  const row = await screen.findByRole('group', { name: 'CLI default' });
+  const view = row.closest('.view');
+  await user.click(within(row).getByRole('button', { name: 'Make default' }));
+  const panel = await screen.findByRole('alert');
+  await user.click(within(panel).getByRole('button', { name: 'Show the toolchain' }));
+  await screen.findByRole('dialog', { name: 'Toolchain' });
+  await user.keyboard('{Escape}');
+  await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+  expect(document.activeElement?.tagName).toBe('H1');
+  expect(view?.contains(document.activeElement)).toBe(true);
+});
+
+test("the doctor's Add a target: the wizard it opens closes onto the page's heading", async () => {
+  const user = screenOf('staging');
+  await screen.findByRole('group', { name: 'CLI default' });
+  // The target goes behind the screen's back (the CLI removed it): its doctor offers to add it.
+  const removal = await api.opPlanTargetRemove('staging');
+  await (await startPlan(removal.opId)).ended;
+  // Clicked as WKWebView clicks a button, which never takes the focus: no opener to go back to.
+  fireEvent.click(screen.getByRole('button', { name: 'Run doctor' }));
+  const doctor = await screen.findByRole('dialog', { name: 'Doctor · staging' });
+  fireEvent.click(await within(doctor).findByRole('button', { name: 'Add a target' }));
+  const wizard = await screen.findByRole('dialog', { name: 'Add target' });
+  expect(wizard.contains(document.activeElement)).toBe(true);
+  await user.keyboard('{Escape}');
+  await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+  expect(document.activeElement).toBe(screen.getByRole('heading', { level: 1, name: 'Target' }));
+});
+
+// D.3e review #13: a view's form whose reads come back after the doctor opened over the view
+// opens under the doctor, in the view the doctor made inert, and gets no focus there (happy-dom,
+// as every engine, focuses nothing under [inert]). Closing the doctor must hand it the focus: the
+// doctor's opener sits behind the form now.
+test('a form that opened under the doctor gets the focus when the doctor closes; Esc closes it', async () => {
+  const internals = (
+    window as unknown as { __TAURI_INTERNALS__: { invoke: (...args: unknown[]) => unknown } }
+  ).__TAURI_INTERNALS__;
+  const invoke = internals.invoke;
+  let release = () => {};
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  internals.invoke = async (...args: unknown[]) => {
+    if (args[0] === 'ssh_key_candidates') await held;
+    return invoke.apply(internals, args);
+  };
+  const user = screenOf('staging');
+  const row = await screen.findByRole('group', { name: 'SSH key' });
+  await user.click(within(row).getByRole('button', { name: 'Change' }));
+  await user.click(screen.getByRole('button', { name: 'Run doctor' }));
+  const doctor = await screen.findByRole('dialog', { name: 'Doctor · staging' });
+  expect(doctor.contains(document.activeElement)).toBe(true);
+  release();
+  const form = await screen.findByRole('dialog', { name: 'Change SSH key' });
+  expect(form.closest('[inert]')).not.toBeNull();
+  expect(doctor.contains(document.activeElement)).toBe(true);
+  await user.keyboard('{Escape}');
+  await waitFor(() => expect(screen.queryByRole('dialog', { name: /Doctor/ })).toBeNull());
+  expect(form.closest('[inert]')).toBeNull();
+  expect(form.contains(document.activeElement)).toBe(true);
+  await user.keyboard('{Escape}');
+  await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+  expect(document.activeElement).toBe(screen.getByRole('heading', { level: 1, name: 'Target' }));
 });

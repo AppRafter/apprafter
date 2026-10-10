@@ -19,14 +19,44 @@ const FOCUSABLE =
   'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), ' +
   'textarea:not([disabled]), details > summary:first-of-type, [tabindex]';
 
+const HEADING = ':scope > .view-content h1[tabindex="-1"]';
+
 /**
  * Where the focus goes when a dialog closes and the control that opened it is gone (an error
- * panel's action that cleared the panel, a screen that re-rendered): the page heading of the
- * view the dialog belongs to (`.view` > `.view-content`), never <body>, where the next Tab
- * starts over from the title bar. An app-level dialog (Settings) has no view, and no fallback.
+ * panel's action that cleared the panel, a screen that re-rendered, a WKWebView button, which
+ * never takes the focus on a click): the page heading of the view the dialog belongs to (`.view`
+ * > `.view-content`), never <body>, where the next Tab starts over from the title bar. An app
+ * dialog's host holds the views themselves (`.shell-body`, D.3e review #12): its view is the one
+ * shown — <Activity> hides the others with `display: none`.
  */
 function headingOf(host: Element | null | undefined): HTMLElement | null {
-  return host?.querySelector<HTMLElement>(':scope > .view-content h1[tabindex="-1"]') ?? null;
+  if (host === null || host === undefined) return null;
+  const own = host.querySelector<HTMLElement>(HEADING);
+  if (own !== null) return own;
+  const shown = [...host.querySelectorAll<HTMLElement>(':scope > .view')].find(
+    (view) => getComputedStyle(view).display !== 'none',
+  );
+  return shown?.querySelector<HTMLElement>(HEADING) ?? null;
+}
+
+/** Inside an `inert` subtree: an engine gives it no focus and no input. */
+const isInert = (element: Element) => element.closest('[inert]') !== null;
+
+/**
+ * The topmost other dialog still open: where the focus goes when a dialog closes and its opener
+ * is gone or sits behind another dialog — a view's form whose reads came back while an app
+ * overlay covered the view opens under it, and closing that overlay leaves its own opener under
+ * the form (D.3e review #13). The last in the document: the app's overlays follow the views, and
+ * a view's or the app's later overlay follows an earlier one. Its first control, else its panel.
+ */
+function topDialog(own: Element | null): HTMLElement | null {
+  const open = [...document.querySelectorAll<HTMLElement>('.modal-layer > [role="dialog"]')].filter(
+    (panel) => !own?.contains(panel),
+  );
+  const top = open.at(-1);
+  if (top === undefined) return null;
+  const body = top.querySelector<HTMLElement>('[data-modal-body]');
+  return focusables(body)[0] ?? focusables(top)[0] ?? top;
 }
 
 const isRadio = (element: Element): element is HTMLInputElement =>
@@ -114,10 +144,12 @@ export interface ModalFrameProps {
 /**
  * The behaviour every overlay shares: focus moves in (to the first control of the body, else the
  * first control, else the panel), Tab and Shift+Tab wrap inside, Esc closes, the background is
- * inert, and on close the focus returns to where it was — or, that control gone, to its view's
- * page heading. A control that goes while it has the focus (a Cancel its run's end removes)
- * leaves it on the panel, never on the page, where Esc no longer reaches the dialog (review #7);
- * a frame with a better place for it (the Wizard's step) moves it on from there.
+ * inert, and on close the focus returns to where it was — or, that control gone or behind a
+ * dialog, to the topmost dialog still open, else its view's page heading. A dialog that opens
+ * under another's layer gets the focus when that one closes. A control that goes while it has
+ * the focus (a Cancel its run's end removes) leaves it on the panel, never on the page, where Esc
+ * no longer reaches the dialog (review #7); a frame with a better place for it (the Wizard's
+ * step) moves it on from there.
  */
 export function ModalFrame({
   labelledBy,
@@ -155,10 +187,16 @@ export function ModalFrame({
     }
     const panel = panelRef.current;
     const body = panel?.querySelector<HTMLElement>('[data-modal-body]') ?? null;
+    // Opened under another dialog's layer (a view's form under an app overlay), it gets no focus
+    // here — no engine focuses an element under [inert] — and that dialog hands it over when it
+    // closes (below).
     (focusables(body)[0] ?? focusables(panel)[0] ?? panel)?.focus();
     return () => {
       for (const element of madeInert) element.removeAttribute('inert');
-      (opener?.isConnected ? opener : headingOf(host))?.focus();
+      // Its opener, while it is there to take the focus; else a dialog still open, else the
+      // page heading of its view.
+      const back = opener?.isConnected && !isInert(opener) ? opener : null;
+      (back ?? topDialog(own ?? null) ?? headingOf(host))?.focus();
     };
   }, []);
 
