@@ -2,14 +2,17 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
 import { QueryClientProvider } from '@tanstack/react-query';
 import { clearMocks } from '@tauri-apps/api/mocks';
-import { act, cleanup, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { ToastProvider, ToastViewport } from '../../components/Toast';
+import { endedAwaySnapshot, resetEndedAway } from '../../ipc/away';
 import type { UiError } from '../../ipc/generated/UiError';
+import { newScope, sessionScope } from '../../ipc/lifecycle';
 import { resetOperations } from '../../ipc/operations';
 import { ViewFrame } from '../../shell/ViewFrame';
 import { PlatformContext } from '../../state/platform';
 import { createQueryClient } from '../../state/queryClient';
+import { ScopeContext } from '../../state/scope';
 import { appInfo } from '../../test/fixtures';
 import { check, doctorReport } from '../../test/flows';
 import {
@@ -33,6 +36,7 @@ afterEach(async () => {
   cleanup();
   await settleIpc();
   resetOperations();
+  resetEndedAway();
   clearMocks();
 });
 
@@ -63,6 +67,43 @@ function renderDoctor(target: string, strict = false, fixFailure: UiError | null
   );
   return { user: userEvent.setup(), onClose, onAddTarget, onToolchain, onChangeSshKey };
 }
+
+/**
+ * The doctor in an overlay scope of its own, as the app's overlay host opens it: `close` ends
+ * the scope (its close button's path) and takes it off the screen.
+ */
+function renderDoctorInOverlay(target: string) {
+  const overlay = newScope(sessionScope());
+  const { unmount } = render(
+    <QueryClientProvider client={createQueryClient()}>
+      <PlatformContext value={appInfo()}>
+        <ToastProvider>
+          <ScopeContext value={overlay.scope}>
+            <ViewFrame>
+              <DoctorOverlay
+                target={target}
+                onClose={mock()}
+                onAddTarget={mock()}
+                onToolchain={mock()}
+                onChangeSshKey={mock()}
+              />
+            </ViewFrame>
+          </ScopeContext>
+        </ToastProvider>
+      </PlatformContext>
+    </QueryClientProvider>,
+  );
+  const close = () =>
+    act(() => {
+      overlay.end();
+      unmount();
+    });
+  return { close };
+}
+
+/** The start-of-run warning the core sends before any check: decrypted copies left on disk. */
+const SWEEP =
+  'cannot remove old kubeconfig copies from /run/apprafter: Permission denied (os error 13)';
 
 const runAgain = () => screen.getByRole('button', { name: 'Run again' }) as HTMLButtonElement;
 const copyReport = () => screen.getByRole('button', { name: 'Copy report' }) as HTMLButtonElement;
@@ -339,6 +380,66 @@ describe('DoctorOverlay', () => {
     await waitFor(() => expect(h.of('op_discard')).toHaveLength(3));
     expect(screen.getAllByText(SWEEP)).toHaveLength(1);
     expect(screen.getByText(SLOW)).toBeDefined();
+  });
+
+  // Review #6: the warning came at the run's start but showed only at its end, so a doctor
+  // closed while its Cluster group still probed never showed it.
+  test("the core's warning shows as soon as it is sent, while the run goes on", async () => {
+    h.read('op_start_doctor', [{ kind: 'warning', message: SWEEP }, stage(2, 3, 'Cluster')]);
+    renderDoctor('prod-eu');
+    expect(await screen.findByText('Cluster · 2 of 3')).toBeDefined();
+    const warnings = screen.getByRole('list', { name: 'Warnings' });
+    expect(within(warnings).getByText(SWEEP)).toBeDefined();
+  });
+
+  test("closed before a warning reached the screen: the warning goes to the app's notices", async () => {
+    let answer = (_opId: number) => {};
+    h.answer(
+      'op_start_doctor',
+      () =>
+        new Promise<number>((resolve) => {
+          answer = resolve;
+        }),
+    );
+    const { close } = renderDoctorInOverlay('prod-eu');
+    await waitFor(() => expect(h.of('op_start_doctor')).toHaveLength(1));
+    await close();
+    // Rust answers once the doctor is gone: the read is cancelled, and ends with the warning.
+    const opId = h.newOperation([{ kind: 'warning', message: SWEEP }, cancelled()]);
+    await act(async () => {
+      answer(opId);
+      await settleIpc();
+    });
+    expect(h.of('op_cancel').map((c) => c.args)).toEqual([{ opId }]);
+    expect(h.of('op_discard').map((c) => c.args)).toEqual([{ opId }]);
+    expect(endedAwaySnapshot()).toEqual([
+      { opId: null, text: `Doctor · prod-eu: ${SWEEP}`, failed: true },
+    ]);
+  });
+
+  test('closed after its warning was on screen: the app is not told it again', async () => {
+    const opId = h.newOperation([]);
+    let channel = -1;
+    h.answer('op_start_doctor', opId);
+    h.answer('op_subscribe', ({ onEvent }: Record<string, unknown>) => {
+      channel = (onEvent as { id: number }).id;
+      return {
+        subscription: 1,
+        replay: [{ kind: 'warning', message: SWEEP }, stage(2, 3, 'Cluster')],
+      };
+    });
+    const { close } = renderDoctorInOverlay('prod-eu');
+    expect(await screen.findByText(SWEEP)).toBeDefined();
+    await close();
+    const internals = (
+      window as unknown as { __TAURI_INTERNALS__: { runCallback(id: number, data: unknown): void } }
+    ).__TAURI_INTERNALS__;
+    await act(async () => {
+      internals.runCallback(channel, { index: 0, message: cancelled() });
+      await settleIpc();
+    });
+    expect(h.of('op_discard').map((c) => c.args)).toEqual([{ opId }]);
+    expect(endedAwaySnapshot()).toEqual([]);
   });
 
   test('a warning of a run that failed or was cancelled is shown too', async () => {

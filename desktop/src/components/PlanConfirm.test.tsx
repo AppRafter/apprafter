@@ -2,7 +2,7 @@
 import { afterEach, beforeEach, expect, mock, test } from 'bun:test';
 import { QueryClientProvider } from '@tanstack/react-query';
 import { Channel } from '@tauri-apps/api/core';
-import { clearMocks } from '@tauri-apps/api/mocks';
+import { clearMocks, mockIPC } from '@tauri-apps/api/mocks';
 import { act, cleanup, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import * as api from '../ipc/api';
@@ -12,9 +12,10 @@ import { DESKTOP_ERROR_CODES } from '../ipc/generated/errors';
 import type { OpEvent } from '../ipc/generated/OpEvent';
 import type { PlanView } from '../ipc/generated/PlanView';
 import type { UiError } from '../ipc/generated/UiError';
+import { holdPlan } from '../ipc/heldPlans';
 import { resetLifecycle } from '../ipc/lifecycle';
 import { installMockIpc, mockOps } from '../ipc/mock';
-import type { MockResult } from '../ipc/mock/ops';
+import { createMockOps, type MockResult } from '../ipc/mock/ops';
 import { resetOperations } from '../ipc/operations';
 import { PlatformContext } from '../state/platform';
 import { createQueryClient } from '../state/queryClient';
@@ -249,4 +250,83 @@ test('its tab closed while the plan runs: the end shows at the app level', async
     { opId: view.opId, text: 'Rename prod: done.', failed: false },
   ]);
   expect(handles.onDone).not.toHaveBeenCalled();
+});
+
+/**
+ * Rust leaves a plan alone while its OS prompt is open (OperationManager::discard), and a
+ * refusal it may retry (a wrong password, the back-off, the other way to ask) puts it back to
+ * wait. So a tab closed during the prompt sends its hold's discard to a plan Rust keeps: the
+ * confirm discards it once the refusal comes, as no retry can come from a screen that is gone.
+ */
+test('its tab closed while the OS prompt is open, then refused: the plan is discarded after the refusal', async () => {
+  clearMocks();
+  let refuse: (reason: unknown) => void = () => {};
+  const engine = createMockOps({
+    delayMs: 0,
+    gesture: () =>
+      new Promise<void>((_, reject) => {
+        refuse = reject;
+      }),
+  });
+  const calls: { readonly cmd: string; readonly args: Record<string, unknown> }[] = [];
+  mockIPC((cmd, args) => {
+    calls.push({ cmd, args: (args ?? {}) as Record<string, unknown> });
+    const handler = (engine.handlers as Record<string, (a: unknown) => unknown>)[cmd];
+    return handler === undefined ? null : handler(args);
+  });
+  const view = engine.registerPlan(
+    { class: 'destructive', title: 'Remove prod', changes: CHANGES, target: 'prod' },
+    { end: () => ({ result: { name: 'prod' } }) },
+  );
+  const discards = () => calls.filter((c) => c.cmd === 'op_discard').map((c) => c.args.opId);
+  const tab = tabHost('prod');
+  holdPlan(tab.scope, view.opId); // as the screen that opened the confirm does
+  const handles = handlers();
+  render(
+    <QueryClientProvider client={createQueryClient()}>
+      <PlatformContext value={appInfo()}>
+        <ToastProvider>
+          <tab.Tab>
+            <PlanConfirm
+              view={view}
+              title="Remove prod?"
+              confirmLabel="Remove"
+              auth={null}
+              {...handles}
+            />
+          </tab.Tab>
+        </ToastProvider>
+      </PlatformContext>
+    </QueryClientProvider>,
+  );
+  await userEvent.setup().click(screen.getByRole('button', { name: 'Remove' }));
+  await act(async () => {
+    await settleIpc();
+  });
+  expect(calls.filter((c) => c.cmd === 'op_execute')).toHaveLength(1);
+  // The owner closes the tab while the OS prompt is up: the hold discards, Rust ignores it.
+  tab.close();
+  await act(async () => {
+    await settleIpc();
+  });
+  expect(discards()).toEqual([view.opId]);
+  // The prompt answers: not verified. Rust would keep the plan for another try.
+  await act(async () => {
+    refuse({
+      code: DESKTOP_ERROR_CODES.AUTH_FAILED,
+      message: 'Authentication failed',
+      help: null,
+      causes: [],
+      fields: { exhausted: false, retryInMs: null },
+    });
+    await settleIpc();
+  });
+  expect(discards()).toEqual([view.opId, view.opId]);
+  // Nothing waits in Rust: a second execute finds no plan.
+  const again = api.opExecute(view.opId, new Channel<OpEvent>());
+  await expect(again).rejects.toMatchObject({
+    error: { code: DESKTOP_ERROR_CODES.PLAN_NOT_FOUND },
+  });
+  expect(handles.onDone).not.toHaveBeenCalled();
+  expect(handles.onFailed).not.toHaveBeenCalled();
 });

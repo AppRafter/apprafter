@@ -5,7 +5,9 @@
 // A fix that has a screen offers it: a missing tool the toolchain, a missing target the wizard
 // (the doctor closes first: the wizard's layer is below the doctor's), a target with no SSH key
 // the key change (the Target screen's, which reads the key in use itself; its form opens above
-// the doctor, which stays for Run again).
+// the doctor, which stays for Run again). What the core warns of shows as it arrives, while the
+// run goes; a warning that never reached the screen, its doctor closed first, goes to the app's
+// notices (review #6).
 import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
 import { Button } from '../../components/Button';
 import { ErrorPanel } from '../../components/ErrorPanel';
@@ -22,14 +24,16 @@ import { ModalFrame } from '../../components/Modal';
 import { StatePanel } from '../../components/StatePanel';
 import { Tag } from '../../components/Tag';
 import * as api from '../../ipc/api';
+import { keepEndedAway } from '../../ipc/away';
 import type { CheckFix } from '../../ipc/generated/CheckFix';
 import type { DoctorReport } from '../../ipc/generated/DoctorReport';
 import type { OpId } from '../../ipc/generated/OpId';
 import type { UiError } from '../../ipc/generated/UiError';
 import { useOperation } from '../../ipc/operations';
-import type { OpNote } from '../../ipc/plans';
+import { notesIn, type OpNote } from '../../ipc/plans';
 import { useCopy } from '../../state/copy';
 import { useRead } from '../../state/read';
+import { useScope } from '../../state/scope';
 import { DoctorCheckRow } from './DoctorCheckRow';
 import { type CheckCounts, checkCounts, GROUP_TITLES, reportText, stamp } from './doctorText';
 
@@ -65,6 +69,16 @@ function SummaryChips({ counts }: { counts: CheckCounts }) {
   );
 }
 
+/** `kept`, then each of `more` whose text is not among them yet: every note once. */
+function withNotes(kept: readonly OpNote[], more: readonly OpNote[]): readonly OpNote[] {
+  const all = [...kept];
+  for (const note of more) if (!all.some((k) => k.text === note.text)) all.push(note);
+  return all;
+}
+
+/** No operation has this id: what the live notes follow while no run goes. */
+const NO_RUN: OpId = -1;
+
 /** The running stage, from the operations store that follows the run: "Cluster · 2 of 3". */
 function StageLine({ opId }: { opId: OpId }) {
   const stage = useOperation(opId)?.stage ?? null;
@@ -81,25 +95,36 @@ export function DoctorOverlay({
 }: DoctorOverlayProps) {
   const id = useId();
   const copy = useCopy();
+  const scope = useScope();
   const read = useRead<DoctorReport>();
   const [at, setAt] = useState<Date | null>(null);
-  // What the core warned of while a run went (a failed sweep of decrypted kubeconfig copies):
+  // What the core warned of in an ended run (a failed sweep of decrypted kubeconfig copies):
   // kept, each once, until the overlay closes (review #5).
   const [notes, setNotes] = useState<readonly OpNote[]>([]);
+  // The texts this overlay has put on the screen: a note it never showed goes to the app.
+  const shown = useRef(new Set<string>());
   const { run } = read;
   const start = useCallback(() => {
     void run(
       () => api.opStartDoctor(target),
       undefined,
-      (more) =>
-        setNotes((kept) => [
-          ...kept,
-          ...more.filter((note) => !kept.some((k) => k.text === note.text)),
-        ]),
+      (more) => {
+        // The overlay went before the run ended (closed, or the lock): a warning it never
+        // showed — the sweep's comes before any check — goes to the app's notices, not lost
+        // with the operation. A notice only informs, and goes with the overlay.
+        if (scope.gone()) {
+          for (const note of more) {
+            if (note.kind !== 'warning' || shown.current.has(note.text)) continue;
+            keepEndedAway({ opId: null, text: `Doctor · ${target}: ${note.text}`, failed: true });
+          }
+          return;
+        }
+        setNotes((kept) => withNotes(kept, more));
+      },
     ).then((report) => {
       if (report !== null) setAt(new Date());
     });
-  }, [run, target]);
+  }, [run, target, scope]);
   useEffect(() => {
     start();
   }, [start]);
@@ -119,6 +144,13 @@ export function DoctorOverlay({
   };
 
   const s = read.state;
+  // The run's warnings as they arrive (the core sends the sweep's before any check), beside
+  // those kept from ended runs: on the screen while the run goes, not only once it ends.
+  const live = useOperation(s.status === 'running' ? (s.opId ?? NO_RUN) : NO_RUN);
+  const onScreen = withNotes(notes, notesIn(live?.lines ?? []));
+  useEffect(() => {
+    for (const note of onScreen) shown.current.add(note.text);
+  });
   // Cancel goes with the run: had it the focus, the focus goes to Run again (review #7).
   const cancelFocused = useRef(false);
   const runAgainRef = useRef<HTMLButtonElement>(null);
@@ -148,9 +180,9 @@ export function DoctorOverlay({
       </div>
       <div className="modal-body doctor-body" data-modal-body>
         {fixFailure !== null && <ErrorPanel error={fixFailure} />}
-        {notes.length > 0 && (
+        {onScreen.length > 0 && (
           <ul className="doctor-notes" aria-label="Warnings">
-            {notes.map((note) => (
+            {onScreen.map((note) => (
               <li key={note.text} data-kind={note.kind}>
                 <WarningCircleIcon aria-hidden="true" />
                 <span>{note.text}</span>

@@ -32,7 +32,8 @@ const ALLOWED_LOCKED = [
   'window_ready',
   'plugin:window|is_maximized',
 ];
-let calls: string[];
+/** What the page asked, with its arguments: a lock's cancel and discard are checked by id. */
+let calls: { readonly cmd: string; readonly args: Record<string, unknown> }[];
 let locked: boolean;
 /** How the verify ends: running, or verified as draft 7 (then the catalogue read runs). */
 let verifyEnds: boolean;
@@ -57,7 +58,7 @@ beforeEach(() => {
   mockWindows('main');
   mockIPC(
     (cmd, args) => {
-      calls.push(cmd);
+      calls.push({ cmd, args: (args ?? {}) as Record<string, unknown> });
       if (cmd === 'lock_status') return lockState({ locked });
       if (locked && !cmd.startsWith('plugin:') && !ALLOWED_LOCKED.includes(cmd)) {
         return Promise.reject({
@@ -113,6 +114,9 @@ function renderShell() {
   return userEvent.setup();
 }
 
+/** The arguments of every `cmd` the page asked, in order. */
+const argsOf = (cmd: string) => calls.filter((call) => call.cmd === cmd).map((call) => call.args);
+
 /** console.error calls that mention `what`. */
 const reported = (errors: ReturnType<typeof spyOn>, what: string) =>
   errors.mock.calls.filter((call: unknown[]) => call.some((part) => String(part).includes(what)));
@@ -147,7 +151,8 @@ test('a lock unmounts the wizard with its token; the verify it ran is cancelled;
   await changed(true);
   expect(screen.queryByRole('dialog', { name: 'Add target' })).toBeNull();
   expect(document.body.innerHTML).not.toContain(TOKEN);
-  expect(calls).toContain('op_cancel');
+  // This wizard's verify, by its id: nothing else is cancelled (no other file's leftovers either).
+  expect(argsOf('op_cancel')).toEqual([{ opId: verifyOp }]);
   expect(reported(errors, 'op_cancel')).toEqual([]);
 
   await changed(false);
@@ -162,12 +167,12 @@ test('a lock after the verify drops the draft and cancels the catalogue read; bo
   await user.type(await screen.findByLabelText('API token'), TOKEN);
   await user.click(screen.getByRole('button', { name: 'Verify and continue' }));
   expect(await screen.findByText("Reading the provider's catalogue…")).toBeDefined();
-  expect(calls).toContain('op_start_machine_catalogue');
+  expect(argsOf('op_start_machine_catalogue')).toHaveLength(1);
 
   await changed(true);
   expect(screen.queryByRole('dialog', { name: 'Add target' })).toBeNull();
-  expect(calls).toContain('target_draft_discard');
-  expect(calls).toContain('op_cancel');
+  expect(argsOf('target_draft_discard')).toEqual([{ draftId: 7 }]);
+  expect(argsOf('op_cancel')).toEqual([{ opId: catalogueOp }]);
   expect(reported(errors, 'target_draft_discard')).toEqual([]);
   expect(reported(errors, 'op_cancel')).toEqual([]);
 

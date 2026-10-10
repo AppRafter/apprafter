@@ -10,7 +10,8 @@
 // runs a confirmed plan on; ipc/lifecycle.ts), it leaves the end to the app, which shows it and
 // only then discards it (ipc/away.ts): held covers a plan not yet started, away one that started,
 // so no plan is discarded twice. Only hidden (its tab's <Activity>), it keeps the end and applies
-// it when it is shown again.
+// it when it is shown again. Its screen gone while Rust asks a destructive plan's gesture, a
+// refusal discards the plan the prompt kept from the hold's discard.
 import { type ReactNode, useRef } from 'react';
 import * as api from '../ipc/api';
 import { keepEndedAway } from '../ipc/away';
@@ -20,7 +21,7 @@ import type { JsonValue } from '../ipc/generated/serde_json/JsonValue';
 import type { UiError } from '../ipc/generated/UiError';
 import { releasePlan } from '../ipc/heldPlans';
 import type { OpEnd } from '../ipc/operations';
-import { awayText, OperationFailed, resultOf, startPlan } from '../ipc/plans';
+import { awayText, OperationFailed, reportUnlessLocked, resultOf, startPlan } from '../ipc/plans';
 import { useScope } from '../state/scope';
 import { useWhenShown } from '../state/whenShown';
 import { ConfirmDialog } from './ConfirmDialog';
@@ -83,6 +84,16 @@ export function PlanConfirm({
     const run = await startPlan(view.opId, password, {
       title: view.title,
       shown: () => !scope.gone(),
+    }).catch((reason: unknown) => {
+      // Refused, its screen gone meanwhile: its tab closed while Rust asked the OS gesture (a
+      // busy confirm's own Close, Cancel and Esc are off), or the lock. The hold's discard came
+      // while the plan was in the prompt, which Rust leaves alone, and a refusal it may retry
+      // puts the plan back to wait for a try that cannot come now: it goes here. A refusal that
+      // spent the plan leaves nothing to discard; after a lock the discard is refused as locked.
+      if (scope.gone()) {
+        api.opDiscard(view.opId).catch(reportUnlessLocked(`op_discard ${view.opId}`));
+      }
+      throw reason;
     });
     started.current = true;
     releasePlan(view.opId);

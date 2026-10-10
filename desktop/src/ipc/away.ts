@@ -2,12 +2,14 @@
 // The ends of confirmed plans whose screen was gone when they ended: a lock unmounted it (Rust
 // runs a confirmed plan on through a lock), or its tab closed. Each waits here, outside the shell
 // a lock unmounts, until the shell shows it (shell/EndedAway.tsx), and its operation is discarded
-// only then: an end is never dropped unseen.
+// only then: an end is never dropped unseen. And what a read warned of that its screen went before
+// showing (the doctor's sweep of decrypted kubeconfig copies): its operation is gone already.
 import { useSyncExternalStore } from 'react';
 import type { OpId } from './generated/OpId';
 
 export interface EndedAway {
-  readonly opId: OpId;
+  /** The operation to discard once it is shown; null for a read's warning, whose is gone. */
+  readonly opId: OpId | null;
   /** What happened, in a line: "Add target lab failed: …", "Rename prod: done.". */
   readonly text: string;
   /** A failure or a cancel: the notice is not a success. */
@@ -27,8 +29,8 @@ export function keepEndedAway(entry: EndedAway): void {
 }
 
 /** The shell showed it: it goes. */
-export function takeEndedAway(opId: OpId): void {
-  publish(list.filter((entry) => entry.opId !== opId));
+export function takeEndedAway(shown: EndedAway): void {
+  publish(list.filter((entry) => entry !== shown));
 }
 
 export function endedAwaySnapshot(): readonly EndedAway[] {

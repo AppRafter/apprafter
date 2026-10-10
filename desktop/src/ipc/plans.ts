@@ -18,6 +18,7 @@ import {
   discard,
   execute,
   type OpEnd,
+  type OpLine,
   operationsSnapshot,
   watchOperations,
 } from './operations';
@@ -138,12 +139,16 @@ export interface OpNote {
   readonly text: string;
 }
 
-/** The warnings and notices the store kept of `opId`, in order. */
-function notesOf(opId: OpId): OpNote[] {
-  const lines = operationsSnapshot().get(opId)?.lines ?? [];
+/** The warnings and notices among an operation's lines, in order. */
+export function notesIn(lines: readonly OpLine[]): OpNote[] {
   return lines.flatMap((line) =>
     line.kind === 'warning' || line.kind === 'notice' ? [{ kind: line.kind, text: line.text }] : [],
   );
+}
+
+/** The warnings and notices the store kept of `opId`, in order. */
+function notesOf(opId: OpId): OpNote[] {
+  return notesIn(operationsSnapshot().get(opId)?.lines ?? []);
 }
 
 /**

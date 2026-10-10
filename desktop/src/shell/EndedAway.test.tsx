@@ -185,3 +185,21 @@ test('each notice is given its time: the next waits for the spacing, and so does
   expect(await screen.findByText('Rename prod failed: taken', {}, { timeout: 2000 })).toBeDefined();
   expect(discarded()).toEqual([41, 42]);
 });
+
+test('a note with no operation of its own shows like an end, and nothing is discarded for it', async () => {
+  // A read's warnings its screen went before it showed (the doctor's): their operation is gone.
+  keepEndedAway({ opId: null, text: 'Doctor · prod: copies left on disk', failed: true });
+  keepEndedAway({ opId: null, text: 'Doctor · prod: another', failed: true });
+  keepEndedAway({ opId: 51, text: 'Add target lab: done.', failed: false });
+  render(
+    <ToastProvider>
+      <EndedAwayNotices spacingMs={0} />
+      <ToastViewport />
+    </ToastProvider>,
+  );
+  expect(await screen.findByText('Doctor · prod: copies left on disk')).toBeDefined();
+  expect(await screen.findByText('Doctor · prod: another')).toBeDefined();
+  expect(await screen.findByText('Add target lab: done.')).toBeDefined();
+  expect(discarded()).toEqual([51]);
+  expect(endedAwaySnapshot()).toEqual([]);
+});
