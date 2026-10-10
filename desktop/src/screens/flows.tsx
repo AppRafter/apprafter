@@ -27,24 +27,26 @@ export interface TargetFlows {
 interface DoctorFlowProps {
   readonly target: string;
   readonly onClose: () => void;
+  /** Opens the wizard at the app's level: the doctor closes first, and the wizard stays. */
   readonly onAddTarget: () => void;
-  readonly onToolchain: () => void;
 }
 
 /**
  * Doctor with the Target screen's SSH key change bound to its three key fixes (none set, file
  * gone, not a public key): the form opens as an app overlay above the doctor, which stays for
- * Run again, and a refusal it cannot show itself is shown in the doctor.
+ * Run again, and a refusal it cannot show itself is shown in the doctor. The form, its confirm
+ * and the toolchain a missing tool's fix opens are the doctor's own overlays: they go with it.
  */
-function DoctorFlow({ target, onClose, onAddTarget, onToolchain }: DoctorFlowProps) {
+function DoctorFlow({ target, onClose, onAddTarget }: DoctorFlowProps) {
   const [keyFailure, setKeyFailure] = useState<UiError | null>(null);
   const changeSshKey = useChangeSshKey(target, setKeyFailure);
+  const here = useAppOverlay();
   return (
     <DoctorOverlay
       target={target}
       onClose={onClose}
       onAddTarget={onAddTarget}
-      onToolchain={onToolchain}
+      onToolchain={() => here((close) => <ToolchainPanel onClose={close} />)}
       onChangeSshKey={() => {
         setKeyFailure(null);
         void changeSshKey();
@@ -64,14 +66,7 @@ export function useTargetFlows(): TargetFlows {
       addTarget,
       toolchain,
       doctor: (target) =>
-        app((close) => (
-          <DoctorFlow
-            target={target}
-            onClose={close}
-            onAddTarget={addTarget}
-            onToolchain={toolchain}
-          />
-        )),
+        app((close) => <DoctorFlow target={target} onClose={close} onAddTarget={addTarget} />),
       changeMachine: (target, now) =>
         view((close) => <ChangeMachineDialog target={target} now={now} onClose={close} />),
       errorAction: (action) => {

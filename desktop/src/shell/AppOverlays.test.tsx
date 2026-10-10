@@ -8,6 +8,7 @@ import { QueryClientProvider } from '@tanstack/react-query';
 import { clearMocks } from '@tauri-apps/api/mocks';
 import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import { useState } from 'react';
 import { ToastProvider } from '../components/Toast';
 import * as api from '../ipc/api';
 import { resetEndedAway } from '../ipc/away';
@@ -17,10 +18,14 @@ import { installMockIpc } from '../ipc/mock';
 import { resetOperations } from '../ipc/operations';
 import { PlatformContext } from '../state/platform';
 import { createQueryClient } from '../state/queryClient';
+import { useScope } from '../state/scope';
 import { appInfo } from '../test/fixtures';
+import { renderScreen } from '../test/screens';
 import { settleIpc } from '../test/settle';
+import { useAppOverlay } from './AppOverlays';
 import { LockGate } from './LockGate';
 import { Shell } from './Shell';
+import { type ShowOverlay, useOverlay } from './ViewFrame';
 
 const TOKEN = 'A1'.repeat(32);
 
@@ -170,4 +175,102 @@ test('a lock takes the doctor too', async () => {
   });
   expect(await screen.findByRole('button', { name: 'Open a cluster' })).toBeDefined();
   expect(screen.queryByRole('dialog', { name: 'Doctor · staging' })).toBeNull();
+});
+
+// Nested app overlays: one opened from inside another (the doctor's toolchain, its SSH key change
+// and its confirm) lives in a scope under its opener's, so it goes when its opener goes.
+
+/** An overlay that writes down when its scope ends (registered once, never in an effect). */
+function Child({ name, ended }: { name: string; ended: string[] }) {
+  const scope = useScope();
+  useState(() => scope.onGone(() => ended.push(name)));
+  return <div role="dialog" aria-label={name} />;
+}
+
+interface Opened {
+  close: () => void;
+  /** The parent's way to open an app overlay, and a view overlay, from inside it. */
+  app: ShowOverlay;
+  view: ShowOverlay;
+}
+
+function Parent({ name, close, seen }: { name: string; close: () => void; seen: Opened[] }) {
+  const app = useAppOverlay();
+  const view = useOverlay();
+  useState(() => seen.push({ close, app, view }));
+  return <div role="dialog" aria-label={name} />;
+}
+
+/** Opens a parent overlay from outside every overlay, as a view does. */
+function Opener({ seen, names }: { seen: Opened[]; names: string[] }) {
+  const app = useAppOverlay();
+  return (
+    <>
+      {names.map((name) => (
+        <button
+          key={name}
+          type="button"
+          onClick={() => app((close) => <Parent name={name} close={close} seen={seen} />)}
+        >
+          {`Open ${name}`}
+        </button>
+      ))}
+    </>
+  );
+}
+
+const dialogNamed = (name: string) => screen.queryByRole('dialog', { name }) !== null;
+
+test('an overlay opened from inside an app overlay goes when its opener goes', async () => {
+  const seen: Opened[] = [];
+  const ended: string[] = [];
+  const user = renderScreen(<Opener seen={seen} names={['Doctor']} />);
+  await user.click(screen.getByRole('button', { name: 'Open Doctor' }));
+  const [doctor] = seen;
+  if (doctor === undefined) throw new Error('the parent did not open');
+  act(() => {
+    doctor.app(() => <Child name="Toolchain" ended={ended} />);
+    doctor.view(() => <Child name="Change SSH key" ended={ended} />);
+  });
+  expect(dialogNamed('Toolchain') && dialogNamed('Change SSH key')).toBe(true);
+  act(() => doctor.close());
+  expect(dialogNamed('Doctor') || dialogNamed('Toolchain') || dialogNamed('Change SSH key')).toBe(
+    false,
+  );
+  expect(ended.sort()).toEqual(['Change SSH key', 'Toolchain']);
+});
+
+test('…and a child of a child with it; an overlay opened beside it, from a view, stays', async () => {
+  const seen: Opened[] = [];
+  const ended: string[] = [];
+  const user = renderScreen(<Opener seen={seen} names={['Doctor', 'Wizard']} />);
+  await user.click(screen.getByRole('button', { name: 'Open Doctor' }));
+  await user.click(screen.getByRole('button', { name: 'Open Wizard' }));
+  const [doctor] = seen;
+  if (doctor === undefined) throw new Error('the parent did not open');
+  act(() => doctor.app((close) => <Parent name="Key change" close={close} seen={seen} />));
+  const keyChange = seen[2];
+  if (keyChange === undefined) throw new Error('the child did not open');
+  act(() => keyChange.app(() => <Child name="Confirm" ended={ended} />));
+  act(() => doctor.close());
+  expect(dialogNamed('Key change') || dialogNamed('Confirm')).toBe(false);
+  expect(ended).toEqual(['Confirm']);
+  expect(dialogNamed('Wizard')).toBe(true);
+});
+
+test('an overlay opened from one that has gone opens nothing', async () => {
+  const seen: Opened[] = [];
+  const user = renderScreen(<Opener seen={seen} names={['Doctor']} />);
+  await user.click(screen.getByRole('button', { name: 'Open Doctor' }));
+  const [doctor] = seen;
+  if (doctor === undefined) throw new Error('the parent did not open');
+  act(() => doctor.close());
+  let rendered = false;
+  act(() =>
+    doctor.app(() => {
+      rendered = true;
+      return <Child name="Late" ended={[]} />;
+    }),
+  );
+  expect(rendered || dialogNamed('Late')).toBe(false);
 });

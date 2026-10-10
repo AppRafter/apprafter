@@ -8,8 +8,11 @@
 //
 // Each overlay has a scope (ipc/lifecycle.ts) under the session's: its close ends it — the
 // wizard's draft is discarded, what it reads cancelled — and the lock ends them all as it
-// unmounts the Shell. An overlay a flow opens from inside one (the doctor's SSH key change, its
-// confirm) is an app overlay too: beside it, never inside its form (GOTCHA-144), and above it.
+// unmounts the Shell. An overlay a flow opens from inside one (the doctor's toolchain, its SSH key
+// change and that change's confirm) is an app overlay too: beside it, never inside its form
+// (GOTCHA-144), and above it — and its scope is under its opener's, so it goes when its opener
+// goes, however that goes. Inside an overlay, useAppOverlay and useOverlay open such children;
+// one opened through an overlay that has gone opens nothing.
 import { createContext, type ReactNode, useCallback, useContext, useRef, useState } from 'react';
 import { newScope, type Scope, sessionScope } from '../ipc/lifecycle';
 import { ScopeContext } from '../state/scope';
@@ -36,27 +39,34 @@ interface Overlay {
   readonly id: number;
   readonly scope: Scope;
   readonly node: ReactNode;
+  /** Opens an overlay of this one's: above it, and gone with it. */
+  readonly showHere: ShowOverlay;
 }
 
 export function useAppOverlayHost(): AppOverlayHost {
   const [open, setOpen] = useState<readonly Overlay[]>([]);
   const next = useRef(0);
-  const show = useCallback<ShowOverlay>((render) => {
+  const openUnder = useCallback((parent: Scope, render: Parameters<ShowOverlay>[0]) => {
+    const own = newScope(parent);
+    // Opened through an overlay that has gone: nothing opens.
+    if (own.scope.gone()) return;
     next.current += 1;
     const id = next.current;
-    const own = newScope(sessionScope());
-    const close = () => {
-      own.end();
-      setOpen((all) => all.filter((overlay) => overlay.id !== id));
-    };
-    setOpen((all) => [...all, { id, scope: own.scope, node: render(close) }]);
+    // Off the screen when its scope ends: its close, its opener's going, or the lock.
+    own.scope.onGone(() => setOpen((all) => all.filter((overlay) => overlay.id !== id)));
+    const showHere: ShowOverlay = (child) => openUnder(own.scope, child);
+    setOpen((all) => [...all, { id, scope: own.scope, node: render(own.end), showHere }]);
   }, []);
+  // From the views: under the session that is unlocked when it opens.
+  const show = useCallback<ShowOverlay>((render) => openUnder(sessionScope(), render), [openUnder]);
   return {
     show,
     open: open.length > 0,
     overlays: open.map((overlay) => (
       <ScopeContext key={overlay.id} value={overlay.scope}>
-        <OverlayContext value={show}>{overlay.node}</OverlayContext>
+        <AppOverlayContext value={overlay.showHere}>
+          <OverlayContext value={overlay.showHere}>{overlay.node}</OverlayContext>
+        </AppOverlayContext>
       </ScopeContext>
     )),
   };

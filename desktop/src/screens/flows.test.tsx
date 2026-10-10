@@ -134,3 +134,34 @@ test('a refusal the key change cannot show in a form is shown in the doctor', as
   expect(await within(doctor).findByText('target `prod-eu` was not found')).toBeDefined();
   expect(screen.queryByRole('dialog', { name: 'Change SSH key' })).toBeNull();
 });
+
+test("the toolchain the doctor opens is the doctor's: when the doctor goes, it goes too", async () => {
+  clearMocks();
+  const h = installHarness();
+  // doctorReport's helm row offers the toolchain; a missing target row offers Add a target.
+  const report = doctorReport('prod-eu');
+  report.groups[0]?.checks.push({
+    id: 'target_exists',
+    tool: null,
+    status: 'fail',
+    title: 'Target `prod-eu` exists',
+    detail: null,
+    fix: { kind: 'add_target', name: 'prod-eu', available: [] },
+  });
+  h.read('op_start_doctor', [completed(report)]);
+  h.answer('toolchain_status', { tools: [], searchPath: [], searchPathSource: 'explicit' });
+  h.answer('ssh_key_candidates', []);
+  h.answer('target_list', { targets: [], unreadable: [], cliDefault: { status: 'unset' } });
+  const { flows, user } = probe();
+  act(() => flows().doctor('prod-eu'));
+  const doctor = await screen.findByRole('dialog', { name: 'Doctor · prod-eu' });
+  await user.click(await within(doctor).findByRole('button', { name: 'Show the toolchain' }));
+  expect(hostOf(await screen.findByRole('dialog', { name: 'Toolchain' }))).toBe('app');
+  // The doctor closes itself (its Add target does, then opens the wizard). The doctor is inert
+  // under the toolchain's layer, which happy-dom does not honour: the click reaches it.
+  await user.click(within(doctor).getByRole('button', { name: 'Add a target', hidden: true }));
+  expect(screen.queryByRole('dialog', { name: 'Doctor · prod-eu' }) === null).toBe(true);
+  expect(screen.queryByRole('dialog', { name: 'Toolchain' }) === null).toBe(true);
+  // The wizard it opens after it went is the app's, not the doctor's: it stays.
+  expect(hostOf(await screen.findByRole('dialog', { name: 'Add target' }))).toBe('app');
+});
