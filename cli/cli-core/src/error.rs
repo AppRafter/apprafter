@@ -206,6 +206,18 @@ fn ssh_key_not_public_help(source: &crate::ssh_key::KeySource) -> String {
     format!("{what} {fix}")
 }
 
+/// A provider request that got no answer — the name did not resolve, the connection was
+/// refused or dropped, the request timed out — as [`CliError::ProviderApiUnreachable`] carries
+/// it. `detail` is the HTTP client's account without the URL, which `endpoint` already names.
+/// No code and no help of its own: the variant carrying it has both, so a rendered chain shows
+/// it as one line under them, not as a second diagnostic with the catch-all's "file an issue".
+#[derive(Debug, Error, Diagnostic)]
+#[error("transport error talking to {endpoint}: {detail}")]
+pub struct TransportFailure {
+    pub endpoint: String,
+    pub detail: String,
+}
+
 #[derive(Debug, Error, Diagnostic)]
 pub enum CliError {
     /// The `cue` binary was not found on `PATH`.
@@ -520,24 +532,28 @@ pub enum CliError {
         cause: Box<dyn miette::Diagnostic + Send + Sync + 'static>,
     },
 
-    /// Token validation ping during `target add` failed for a
-    /// non-auth reason — transport error, 429, 5xx, etc. We can't
-    /// rotate the user's way out of these, so the help points at
-    /// `apprafter doctor` + `--no-ping`.
-    #[error("provider `{provider}` API was unreachable during token validation")]
+    /// The provider's API could not serve a request, for a reason no other token fixes. The
+    /// Hetzner client raises it for every request that got no answer (a failed lookup, a
+    /// refused or dropped connection, a timeout), the cause a [`TransportFailure`]; the token
+    /// ping (`apprafter_core::provider::ping`) also for any other non-401 failure — 429, 5xx —
+    /// the raw error as the cause. One code for a dead API, whichever request found it
+    /// (WI-453). The help points at `apprafter doctor`, the status page and, for the commands
+    /// that have it, `--no-ping`.
+    #[error("provider `{provider}` API was unreachable")]
     #[diagnostic(
         code(apprafter::target::provider_unreachable),
         help(
-            "The credential check could not complete because the provider's API was \
-             unreachable. This is NOT a credentials problem — the token may still be valid \
-             once the API recovers.\n\
+            "The request could not complete because the provider's API was unreachable. This \
+             is NOT a credentials problem — the token may still be valid once the API \
+             recovers.\n\
              • Run `apprafter doctor` to confirm reachability + DNS.\n\
              • Check the provider's status page (https://status.hetzner.com/ for \
                hetzner-cloud).\n\
              • If you're behind a VPN / corporate proxy, ensure `https://api.hetzner.cloud/` is \
                reachable.\n\
-             • Pass `--no-ping` to skip the round-trip and save the target offline; you can \
-               re-verify later with `apprafter doctor`."
+             • Pass `--no-ping` to skip the provider round-trip and save offline (`target \
+               add`, also with `--renew`, and `target machine` take it); you can re-verify \
+               later with `apprafter doctor`."
         )
     )]
     ProviderApiUnreachable {
@@ -1197,16 +1213,25 @@ mod tests {
 
     #[test]
     fn provider_api_unreachable_targets_outage_path_not_rotation() {
-        // Transport-error case (no HTTP status), wrapped as a
-        // generic `Other`. The classifier treats this as
-        // unreachable, not rejected.
-        let inner = CliError::Other("connection refused".into());
+        // Transport-error case (no HTTP status): the Hetzner client's
+        // classification of a request that got no answer.
+        let inner = TransportFailure {
+            endpoint: "https://api.hetzner.cloud/v1/servers".into(),
+            detail: "Connection Failed: Connect error: Connection refused".into(),
+        };
         let err = CliError::ProviderApiUnreachable {
             provider: "hetzner-cloud".into(),
             cause: Box::new(inner),
         };
         assert_eq!(code_of(&err), "apprafter::target::provider_unreachable");
+        // WI-453: every request that gets no answer lands here — `apply`, a catalogue read —
+        // so neither the message nor the help may say it was the token check.
+        assert_eq!(
+            err.to_string(),
+            "provider `hetzner-cloud` API was unreachable"
+        );
         let help = help_of(&err);
+        assert!(!help.contains("credential check could not"), "{help}");
         // Help points operator at doctor + status page + --no-ping,
         // NOT at credential rotation.
         assert!(

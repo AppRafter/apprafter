@@ -248,11 +248,15 @@ refuses it first (`apprafter::target::invalid_token`).
 
 ### `apprafter::target::provider_unreachable`
 
-The credential check ping failed for a **non-401** reason —
-transport error (`connection refused`, DNS failure), 5xx
-provider-side outage, or 429 rate limit. The token may still
-be valid once the API recovers — the help text intentionally
-avoids any rotation suggestion that would misdirect operators.
+The provider's API could not serve a request, for a reason no
+other token fixes. Any request that gets **no answer** — the
+connection is refused, the name does not resolve, the request
+times out — reports this code, whether it was the credential
+check, a machine catalogue read or `apply`. The credential check
+also reports it for any other **non-401** failure: a 5xx
+provider-side outage or a 429 rate limit. The token may still be
+valid once the API recovers — the help text intentionally avoids
+any rotation suggestion that would misdirect operators.
 
 **Fix.**
 
@@ -261,7 +265,8 @@ avoids any rotation suggestion that would misdirect operators.
   (https://status.hetzner.com/ for hetzner-cloud).
 - VPN / corporate proxy: ensure `https://api.hetzner.cloud/`
   is reachable.
-- `--no-ping` to save the target offline and verify later.
+- `--no-ping` (on `target add`, also with `--renew`, and on
+  `target machine`) to save offline and verify later.
 
 ### `apprafter::io::error` / `apprafter::io::json` / `apprafter::io::yaml`
 

@@ -87,9 +87,7 @@ impl HetznerCloudClient {
                     message: envelope.error.message,
                 })
             }
-            Err(ureq::Error::Transport(t)) => Err(CliError::Other(format!(
-                "transport error talking to {endpoint}: {t}"
-            ))),
+            Err(ureq::Error::Transport(t)) => Err(transport_error(&endpoint, t)),
         }
     }
 
@@ -128,9 +126,7 @@ impl HetznerCloudClient {
                     message: envelope.error.message,
                 })
             }
-            Err(ureq::Error::Transport(t)) => Err(CliError::Other(format!(
-                "transport error talking to {endpoint}: {t}"
-            ))),
+            Err(ureq::Error::Transport(t)) => Err(transport_error(&endpoint, t)),
         }
     }
 
@@ -152,9 +148,7 @@ impl HetznerCloudClient {
             Err(ureq::Error::Status(status, response)) => {
                 Err(api_error("GET", &endpoint, status, response))
             }
-            Err(ureq::Error::Transport(t)) => Err(CliError::Other(format!(
-                "transport error talking to {endpoint}: {t}"
-            ))),
+            Err(ureq::Error::Transport(t)) => Err(transport_error(&endpoint, t)),
         }
     }
 
@@ -183,9 +177,7 @@ impl HetznerCloudClient {
                 return Err(api_error("GET", &endpoint, status, response));
             }
             Err(ureq::Error::Transport(t)) => {
-                return Err(CliError::Other(format!(
-                    "transport error talking to {endpoint}: {t}"
-                )));
+                return Err(transport_error(&endpoint, t));
             }
         };
 
@@ -242,9 +234,7 @@ impl HetznerCloudClient {
                     message: envelope.error.message,
                 })
             }
-            Err(ureq::Error::Transport(t)) => Err(CliError::Other(format!(
-                "transport error talking to {endpoint}: {t}"
-            ))),
+            Err(ureq::Error::Transport(t)) => Err(transport_error(&endpoint, t)),
         }
     }
 
@@ -277,9 +267,7 @@ impl HetznerCloudClient {
                     message: envelope.error.message,
                 })
             }
-            Err(ureq::Error::Transport(t)) => Err(CliError::Other(format!(
-                "transport error talking to {endpoint}: {t}"
-            ))),
+            Err(ureq::Error::Transport(t)) => Err(transport_error(&endpoint, t)),
         }
     }
 
@@ -316,9 +304,7 @@ impl HetznerCloudClient {
                     message: envelope.error.message,
                 })
             }
-            Err(ureq::Error::Transport(t)) => Err(CliError::Other(format!(
-                "transport error talking to {endpoint}: {t}"
-            ))),
+            Err(ureq::Error::Transport(t)) => Err(transport_error(&endpoint, t)),
         }
     }
 
@@ -361,9 +347,7 @@ impl HetznerCloudClient {
                     message: envelope.error.message,
                 })
             }
-            Err(ureq::Error::Transport(t)) => Err(CliError::Other(format!(
-                "transport error talking to {endpoint}: {t}"
-            ))),
+            Err(ureq::Error::Transport(t)) => Err(transport_error(&endpoint, t)),
         }
     }
 
@@ -400,9 +384,7 @@ impl HetznerCloudClient {
                     message: envelope.error.message,
                 })
             }
-            Err(ureq::Error::Transport(t)) => Err(CliError::Other(format!(
-                "transport error talking to {endpoint}: {t}"
-            ))),
+            Err(ureq::Error::Transport(t)) => Err(transport_error(&endpoint, t)),
         }
     }
 
@@ -440,9 +422,7 @@ impl HetznerCloudClient {
                     message: envelope.error.message,
                 })
             }
-            Err(ureq::Error::Transport(t)) => Err(CliError::Other(format!(
-                "transport error talking to {endpoint}: {t}"
-            ))),
+            Err(ureq::Error::Transport(t)) => Err(transport_error(&endpoint, t)),
         }
     }
 
@@ -484,9 +464,7 @@ impl HetznerCloudClient {
                     message: envelope.error.message,
                 })
             }
-            Err(ureq::Error::Transport(t)) => Err(CliError::Other(format!(
-                "transport error talking to {endpoint}: {t}"
-            ))),
+            Err(ureq::Error::Transport(t)) => Err(transport_error(&endpoint, t)),
         }
     }
 
@@ -523,9 +501,7 @@ impl HetznerCloudClient {
                     message: envelope.error.message,
                 })
             }
-            Err(ureq::Error::Transport(t)) => Err(CliError::Other(format!(
-                "transport error talking to {endpoint}: {t}"
-            ))),
+            Err(ureq::Error::Transport(t)) => Err(transport_error(&endpoint, t)),
         }
     }
 
@@ -558,9 +534,7 @@ impl HetznerCloudClient {
                     message: envelope.error.message,
                 })
             }
-            Err(ureq::Error::Transport(t)) => Err(CliError::Other(format!(
-                "transport error talking to {endpoint}: {t}"
-            ))),
+            Err(ureq::Error::Transport(t)) => Err(transport_error(&endpoint, t)),
         }
     }
 
@@ -597,9 +571,7 @@ impl HetznerCloudClient {
                     message: envelope.error.message,
                 })
             }
-            Err(ureq::Error::Transport(t)) => Err(CliError::Other(format!(
-                "transport error talking to {endpoint}: {t}"
-            ))),
+            Err(ureq::Error::Transport(t)) => Err(transport_error(&endpoint, t)),
         }
     }
 
@@ -632,9 +604,7 @@ impl HetznerCloudClient {
                     message: envelope.error.message,
                 })
             }
-            Err(ureq::Error::Transport(t)) => Err(CliError::Other(format!(
-                "transport error talking to {endpoint}: {t}"
-            ))),
+            Err(ureq::Error::Transport(t)) => Err(transport_error(&endpoint, t)),
         }
     }
 
@@ -671,9 +641,7 @@ impl HetznerCloudClient {
                     message: envelope.error.message,
                 })
             }
-            Err(ureq::Error::Transport(t)) => Err(CliError::Other(format!(
-                "transport error talking to {endpoint}: {t}"
-            ))),
+            Err(ureq::Error::Transport(t)) => Err(transport_error(&endpoint, t)),
         }
     }
 
@@ -720,9 +688,7 @@ impl HetznerCloudClient {
                     message: envelope.error.message,
                 })
             }
-            Err(ureq::Error::Transport(t)) => Err(CliError::Other(format!(
-                "transport error talking to {endpoint}: {t}"
-            ))),
+            Err(ureq::Error::Transport(t)) => Err(transport_error(&endpoint, t)),
         }
     }
 
@@ -744,6 +710,26 @@ impl HetznerCloudClient {
                 .set("Authorization", &auth)
                 .set("Accept", "application/json")
         })
+    }
+}
+
+/// Every request's transport failure, classified here once (WI-453): a request that got no
+/// answer is [`CliError::ProviderApiUnreachable`], whichever request it was, so the core's
+/// catalogue read and its token ping no longer tell the same refused connection apart; what
+/// ureq refused to send, or an answer it could not read, stays the catch-all. Either way the
+/// message names `endpoint` once.
+fn transport_error(endpoint: &str, t: ureq::Transport) -> CliError {
+    let failure = cli_core::TransportFailure {
+        endpoint: endpoint.to_string(),
+        detail: crate::transport::detail(&t),
+    };
+    if crate::transport::no_answer(t.kind()) {
+        CliError::ProviderApiUnreachable {
+            provider: "hetzner-cloud".to_string(),
+            cause: Box::new(failure),
+        }
+    } else {
+        CliError::Other(failure.to_string())
     }
 }
 
@@ -826,11 +812,7 @@ where
                     message: envelope.error.message,
                 });
             }
-            Err(ureq::Error::Transport(t)) => {
-                return Err(CliError::Other(format!(
-                    "transport error talking to {endpoint}: {t}"
-                )))
-            }
+            Err(ureq::Error::Transport(t)) => return Err(transport_error(endpoint, t)),
         }
     }
 }

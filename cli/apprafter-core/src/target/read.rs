@@ -109,9 +109,10 @@ pub fn hetzner_token(ctx: &Context, target: &TargetRef) -> CoreResult<SecretStri
 /// The node's public IPv4 and IPv6 (`<prefix>::1`) from `GET /v1/servers/{id}` of the server
 /// `state.json` records — one request, so an account with more than one page of servers is
 /// answered right. No recorded server is [`CoreError::NotProvisioned`] (nothing is asked);
-/// a 404 is [`CoreError::ServerMissing`]; an API status passes through as
-/// `CliError::Hetzner` (its `status` projects); anything else (transport, timeout, parse) is
-/// [`CoreError::ProviderRequestFailed`].
+/// a 404 is [`CoreError::ServerMissing`]; any other failure is classified as every provider
+/// read's is (`provider::read_error`): an API status passes through as `CliError::Hetzner` (its
+/// `status` projects), no answer as `CliError::ProviderApiUnreachable`, an answer that does not
+/// parse is [`CoreError::ProviderRequestFailed`].
 pub fn public_address(
     ctx: &Context,
     target: &TargetRef,
@@ -141,12 +142,7 @@ pub fn public_address(
             name: target.name().to_string(),
             server_id: server.server_id,
         }),
-        Err(e @ cli_core::CliError::Hetzner { .. }) => Err(CoreError::Cli(e)),
-        Err(e) => Err(CoreError::ProviderRequestFailed {
-            provider: "hetzner-cloud".into(),
-            endpoint,
-            cause: Box::new(e.into()),
-        }),
+        Err(e) => Err(crate::provider::read_error(e, &endpoint)),
     }
 }
 
@@ -239,7 +235,7 @@ mod tests {
     }
 
     #[test]
-    fn an_api_status_passes_through_and_a_transport_error_is_wrapped() {
+    fn an_api_status_passes_through_a_dead_api_is_unreachable_and_a_bad_answer_is_wrapped() {
         let mut s = mockito::Server::new();
         s.mock("GET", "/v1/servers/42")
             .with_status(401)
@@ -249,7 +245,22 @@ mod tests {
         let t = TargetRef::named(&ctx, "prod").unwrap();
         let e = public_address(&ctx, &t, &CancellationToken::new()).unwrap_err();
         assert_eq!(UiError::from(&e).fields["status"], serde_json::json!(401));
+        // WI-453: the code every other core path gives a dead API.
         let (_d, ctx) = store("http://127.0.0.1:1", Some("tok"), true);
+        let t = TargetRef::named(&ctx, "prod").unwrap();
+        let e = public_address(&ctx, &t, &CancellationToken::new()).unwrap_err();
+        assert_eq!(
+            UiError::from(&e).code.as_deref(),
+            Some("apprafter::target::provider_unreachable"),
+            "{e:?}"
+        );
+        // An answer that does not parse names the endpoint.
+        let mut s = mockito::Server::new();
+        s.mock("GET", "/v1/servers/42")
+            .with_status(200)
+            .with_body(r#"{"nope":1}"#)
+            .create();
+        let (_d, ctx) = store(&s.url(), Some("tok"), true);
         let t = TargetRef::named(&ctx, "prod").unwrap();
         assert!(
             matches!(public_address(&ctx, &t, &CancellationToken::new()),

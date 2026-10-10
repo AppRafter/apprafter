@@ -809,12 +809,15 @@ pub fn unique_locations(offers: &[cli_providers::machine::MachineOffer]) -> Vec<
 }
 
 /// Whether a failed catalogue read is worth retrying: a provider request that failed (an API
-/// status, or a transport / timeout / parse failure). Anything else — an unsupported provider,
-/// a cancelled operation — would fail the same way again.
+/// status, no answer at all — WI-453's `provider_unreachable` — or an answer that did not
+/// parse). Anything else — an unsupported provider, a cancelled operation — would fail the same
+/// way again.
 fn is_request_failure(e: &CoreError) -> bool {
     matches!(
         e,
-        CoreError::ProviderRequestFailed { .. } | CoreError::Cli(CliError::Hetzner { .. })
+        CoreError::ProviderRequestFailed { .. }
+            | CoreError::Cli(CliError::Hetzner { .. })
+            | CoreError::Cli(CliError::ProviderApiUnreachable { .. })
     )
 }
 
@@ -1021,6 +1024,10 @@ fn inline_ping_error(e: &CoreError) -> String {
     };
     // Upcast `dyn Diagnostic` to `dyn Error` (stable trait upcasting) to downcast the cause.
     let raw_error: &(dyn std::error::Error + 'static) = &**raw;
+    // A request that got no answer, as the client classifies it (WI-453).
+    if let Some(no_answer) = raw_error.downcast_ref::<cli_core::TransportFailure>() {
+        return format!("could not reach the provider: {no_answer}");
+    }
     match raw_error.downcast_ref::<CliError>() {
         Some(CliError::Hetzner {
             status: 401,
@@ -1191,6 +1198,17 @@ mod tests {
             endpoint: "GET /v1/locations".into(),
             cause: Box::new(CoreError::Cli(CliError::Other("reset".into()))),
         }));
+        // WI-453: a dead API is `provider_unreachable` on the catalogue read too; the retry
+        // offer is for it above all.
+        assert!(is_request_failure(&CoreError::Cli(
+            CliError::ProviderApiUnreachable {
+                provider: "hetzner-cloud".into(),
+                cause: Box::new(cli_core::TransportFailure {
+                    endpoint: "http://127.0.0.1:1/v1/locations".into(),
+                    detail: "Connection Failed".into(),
+                }),
+            }
+        )));
         assert!(is_request_failure(&CoreError::Cli(CliError::Hetzner {
             endpoint: "GET /v1/server_types".into(),
             status: 503,
@@ -1246,6 +1264,19 @@ mod tests {
             cause: Box::new(CliError::Other("connection reset".into())),
         }));
         assert_eq!(transport, "could not reach the provider: connection reset");
+        // The client's own classification of a request that got no answer (WI-453).
+        let no_answer = inline_ping_error(&CoreError::Cli(CliError::ProviderApiUnreachable {
+            provider: "hetzner-cloud".into(),
+            cause: Box::new(cli_core::TransportFailure {
+                endpoint: "http://127.0.0.1:1/v1/locations".into(),
+                detail: "Connection Failed: Connect error: Connection refused".into(),
+            }),
+        }));
+        assert_eq!(
+            no_answer,
+            "could not reach the provider: transport error talking to \
+             http://127.0.0.1:1/v1/locations: Connection Failed: Connect error: Connection refused"
+        );
 
         let unknown = inline_ping_error(&CoreError::Cli(CliError::ProviderApiUnreachable {
             provider: "hetzner-cloud".into(),

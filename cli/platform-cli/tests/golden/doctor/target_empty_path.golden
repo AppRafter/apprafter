@@ -6,7 +6,7 @@ Checking target `prod`...
   ✓ Credentials file present (mode 0600) (<SANDBOX>/apprafter-config/targets/prod/credentials.yaml)
   ✓ Provider `hetzner-cloud` supported
   ✓ Token format valid (64 chars, alphanumeric)
-  ✗ Token verified against provider API (transport error talking to <HCLOUD>/v1/locations: <HCLOUD>/v1/locations: Connection Failed: Connect error: Connection refused (os error <N>))
+  ✗ Token verified against provider API (transport error talking to <HCLOUD>/v1/locations: Connection Failed: Connect error: Connection refused (os error <N>))
       hint: could not reach the provider API — check DNS / network / proxy, or rerun with `--no-ping` to skip this check
   ✓ SSH key readable (<SANDBOX>/home/id_ed25519.pub (ssh-ed25519))
 

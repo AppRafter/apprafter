@@ -23,7 +23,7 @@ pub use credentials::{
     read_ssh_public_key_body, resolve_hetzner_ssh_public_key, resolve_hetzner_token,
     HCLOUD_TOKEN_ENV, SSH_PUBLIC_KEY_ENV,
 };
-pub use error::{CliError, Result, SkuCheckFor, UnavailableKind};
+pub use error::{CliError, Result, SkuCheckFor, TransportFailure, UnavailableKind};
 pub use fsutil::atomic_replace;
 pub use target::{
     config_root_from_override, default_config_root, list_target_names, load_active_target_config,

@@ -10,7 +10,7 @@ use cli_providers::hetzner_cloud::HetznerCloudClient;
 use serde::Serialize;
 
 use crate::context::{Context, SecretString};
-use crate::error::{CoreError, CoreResult};
+use crate::error::CoreResult;
 use crate::target_ref::TargetRef;
 use crate::CancellationToken;
 
@@ -138,19 +138,6 @@ fn view(o: &cli_providers::machine::MachineOffer) -> MachineOfferView {
     }
 }
 
-/// `CliError::Hetzner` passes through (its status reaches the UI, bug 11); anything else of a
-/// provider read is `ProviderRequestFailed` naming the endpoint (overview §3.6.1).
-pub(crate) fn provider_read_error(e: cli_core::CliError, endpoint: &str) -> CoreError {
-    match e {
-        e @ cli_core::CliError::Hetzner { .. } => CoreError::Cli(e),
-        other => CoreError::ProviderRequestFailed {
-            provider: "hetzner-cloud".into(),
-            endpoint: endpoint.into(),
-            cause: Box::new(CoreError::from(other)),
-        },
-    }
-}
-
 /// `/v1/server_types`, page by page, `cancel` checked before each request.
 fn server_types(
     client: &HetznerCloudClient,
@@ -161,7 +148,7 @@ fn server_types(
         cancel.check()?;
         let (types, next) = client
             .list_server_types_page(page)
-            .map_err(|e| provider_read_error(e, "GET /v1/server_types"))?;
+            .map_err(|e| crate::provider::read_error(e, "GET /v1/server_types"))?;
         all.extend(types);
         match next {
             Some(n) => page = n,
@@ -208,7 +195,7 @@ pub fn catalogue(
     cancel.check()?;
     let mut regions: Vec<RegionView> = client
         .list_locations()
-        .map_err(|e| provider_read_error(e, "GET /v1/locations"))?
+        .map_err(|e| crate::provider::read_error(e, "GET /v1/locations"))?
         .locations
         .into_iter()
         .map(|l| RegionView {
@@ -247,7 +234,8 @@ pub fn region_latencies_with(
 /// TCP connect to `<region>-speed.hetzner.com:443`, each bounded by [`LATENCY_PROBE_TIMEOUT`]
 /// (DNS included, `net::tcp_probe`). A probe the token cut short answers like a region that did
 /// not, so the token is looked at once they are done: cancelled, the read is
-/// [`CoreError::Cancelled`], never a list of regions that "did not answer".
+/// [`CoreError::Cancelled`](crate::error::CoreError::Cancelled), never a list of regions that
+/// "did not answer".
 pub fn region_latencies(
     _ctx: &Context,
     regions: &[String],
@@ -270,7 +258,7 @@ pub fn region_latencies(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::UiError;
+    use crate::error::{CoreError, UiError};
     use crate::target::testkit::*;
 
     fn token_source(token: &SecretString) -> CatalogueSource<'_> {
@@ -327,7 +315,7 @@ mod tests {
     }
 
     #[test]
-    fn a_rejected_token_passes_through_with_its_status_and_a_dead_api_is_a_typed_request_failure() {
+    fn a_rejected_token_passes_through_with_its_status_and_a_dead_api_is_unreachable() {
         let mut s = mockito::Server::new();
         let _l = route(
             &mut s,
@@ -347,11 +335,67 @@ mod tests {
             ),
             "{e:?}"
         );
+        // WI-453: the token check's code for the same refused connection, not `request_failed`.
         let dead = Context::for_desktop("/unused".into(), "http://127.0.0.1:1");
         let e = catalogue(&dead, token_source(&token), &CancellationToken::new()).unwrap_err();
         assert_eq!(
             UiError::from(&e).code.as_deref(),
+            Some("apprafter::target::provider_unreachable")
+        );
+    }
+
+    /// The core's own agent: a lookup that fails (its resolver) and a request that never gets
+    /// an answer (its timeout) are no answer, as a refused connection is.
+    #[test]
+    fn a_failed_lookup_and_a_timeout_are_unreachable_too() {
+        let token = SecretString::new(TOKEN_A);
+        let unreachable = |ctx: &Context| {
+            let e = catalogue(ctx, token_source(&token), &CancellationToken::new()).unwrap_err();
+            assert_eq!(
+                UiError::from(&e).code.as_deref(),
+                Some("apprafter::target::provider_unreachable"),
+                "{e:?}"
+            );
+        };
+        {
+            let _stub = crate::net::stub_lookup(|_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "no such host",
+                ))
+            });
+            unreachable(&Context::for_desktop(
+                "/unused".into(),
+                "http://api.example.test",
+            ));
+        }
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); // accepts, never answers
+        unreachable(
+            &Context::for_desktop(
+                "/unused".into(),
+                format!("http://{}", silent.local_addr().unwrap()),
+            )
+            .with_request_timeout(Duration::from_millis(300)),
+        );
+    }
+
+    /// An answer the core cannot read is not "unreachable": it stays a typed request failure
+    /// naming the endpoint (doctor's reachability check passes for it).
+    #[test]
+    fn an_answer_that_does_not_parse_is_a_request_failure() {
+        let mut s = mockito::Server::new();
+        let _l = route(&mut s, "/v1/locations", 200, r#"{"nope":1}"#, TOKEN_A).create();
+        let ctx = Context::for_desktop("/unused".into(), s.url());
+        let token = SecretString::new(TOKEN_A);
+        let e = catalogue(&ctx, token_source(&token), &CancellationToken::new()).unwrap_err();
+        let ui = UiError::from(&e);
+        assert_eq!(
+            ui.code.as_deref(),
             Some("apprafter::provider::request_failed")
+        );
+        assert_eq!(
+            ui.fields["endpoint"],
+            serde_json::json!("GET /v1/locations")
         );
     }
 

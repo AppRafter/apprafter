@@ -147,10 +147,12 @@ pub enum CoreError {
         server_name: String,
     },
 
-    /// A provider read failed for a reason other than an API status (transport, timeout,
-    /// parse); `CliError::Hetzner` passes through unwrapped so its `status` projects. The cause
-    /// is a plain `#[source]`: miette-derive borrows a `diagnostic_source` as `&dyn Diagnostic`
-    /// through `Borrow`, which `Box<CoreError>` does not provide.
+    /// A provider read failed for a reason other than an API status or no answer — an answer
+    /// that does not parse, a request the HTTP client refused to send; `CliError::Hetzner` and
+    /// `CliError::ProviderApiUnreachable` pass through unwrapped (`provider::read_error`), so a
+    /// status projects and a dead API has one code on every path (WI-453). The cause is a plain
+    /// `#[source]`: miette-derive borrows a `diagnostic_source` as `&dyn Diagnostic` through
+    /// `Borrow`, which `Box<CoreError>` does not provide.
     #[error("the {provider} API request {endpoint} failed")]
     #[diagnostic(code(apprafter::provider::request_failed))]
     ProviderRequestFailed {
@@ -426,10 +428,11 @@ fn neutral_help(e: &cli_core::CliError) -> Option<String> {
              & Write)."
                 .into()
         }
+        // Any request that got no answer (WI-453), not only the credential check.
         C::ProviderApiUnreachable { .. } => {
-            "The credential check could not complete because the provider's API was \
-             unreachable. This is not a credentials problem: the token may still be valid once \
-             the API recovers.\n\
+            "The request could not complete because the provider's API was unreachable. This \
+             is not a credentials problem: the token may still be valid once the API \
+             recovers.\n\
              • Check the provider's status page (https://status.hetzner.com/ for \
                hetzner-cloud).\n\
              • Behind a VPN or a corporate proxy, make sure https://api.hetzner.cloud/ is \
@@ -661,8 +664,10 @@ pub mod samples {
             CoreError::ProviderRequestFailed {
                 provider: s("hetzner-cloud"),
                 endpoint: s("GET /v1/locations"),
+                // No answer is `ProviderApiUnreachable` (WI-453): what is left is an answer
+                // that does not parse.
                 cause: Box::new(CoreError::Cli(cli_core::CliError::Other(s(
-                    "connection refused",
+                    "parse list_locations response: missing field `locations`",
                 )))),
             },
             CoreError::ToolUnsupported {
@@ -1394,6 +1399,26 @@ mod tests {
             assert!(!rejected.contains(not_why), "{not_why}: {rejected}");
         }
         assert!(rejected.contains("only once"), "{rejected}");
+        // WI-453: every core read that gets no answer is `provider_unreachable` now, a
+        // catalogue's as much as the token check's, so its help may not say it was the check.
+        let unreachable = help(cli_core::CliError::ProviderApiUnreachable {
+            provider: "hetzner-cloud".into(),
+            cause: Box::new(cli_core::TransportFailure {
+                endpoint: "https://api.hetzner.cloud/v1/server_types".into(),
+                detail: "Dns Failed".into(),
+            }),
+        });
+        assert!(
+            !unreachable.contains("credential check could not"),
+            "{unreachable}"
+        );
+        for why in [
+            "unreachable",
+            "not a credentials problem",
+            "status.hetzner.com",
+        ] {
+            assert!(unreachable.contains(why), "{why}: {unreachable}");
+        }
         let hetzner = help(cli_core::CliError::Hetzner {
             endpoint: "e".into(),
             status: 401,

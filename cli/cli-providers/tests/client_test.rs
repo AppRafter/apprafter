@@ -1096,3 +1096,110 @@ fn a_server_type_page_reports_only_a_next_page_that_advances() {
     assert!(types.is_empty());
     assert_eq!(next, None, "a page that does not advance ends the listing");
 }
+
+/// What a request that got no answer must come back as (WI-453): `ProviderApiUnreachable`,
+/// its cause naming the URL once — ureq's own text starts with the URL too.
+fn assert_unreachable(err: CliError, url: &str, account: &str) {
+    match err {
+        CliError::ProviderApiUnreachable { provider, cause } => {
+            assert_eq!(provider, "hetzner-cloud");
+            let text = cause.to_string();
+            assert!(
+                text.starts_with(&format!("transport error talking to {url}: {account}")),
+                "{text}"
+            );
+            assert_eq!(text.matches(url).count(), 1, "the URL twice: {text}");
+        }
+        other => panic!("expected ProviderApiUnreachable, got {other:?}"),
+    }
+}
+
+/// WI-453: a refused connection got `apprafter::cli::other` from every request, which each
+/// caller then classified its own way (the catalogue `request_failed`, the ping
+/// `provider_unreachable`). The client classifies it once, the same for every request.
+#[test]
+fn a_refused_connection_is_provider_unreachable_on_every_request() {
+    let base = "http://127.0.0.1:1";
+    let client = HetznerCloudClient::new(base, "t");
+    let refused = "Connection Failed: Connect error: ";
+    assert_unreachable(
+        client.list_locations().map(|_| ()).unwrap_err(),
+        &format!("{base}/v1/locations"),
+        refused,
+    );
+    assert_unreachable(
+        client.list_server_types_page(1).map(|_| ()).unwrap_err(),
+        &format!("{base}/v1/server_types"),
+        refused,
+    );
+    assert_unreachable(
+        client.get_server(7).map(|_| ()).unwrap_err(),
+        &format!("{base}/v1/servers/7"),
+        refused,
+    );
+    assert_unreachable(
+        client.list_servers().map(|_| ()).unwrap_err(),
+        &format!("{base}/v1/servers"),
+        refused,
+    );
+    // The DELETE retry loop has its own match: the same classification.
+    assert_unreachable(
+        client.delete_firewall(3).unwrap_err(),
+        &format!("{base}/v1/firewalls/3"),
+        refused,
+    );
+}
+
+/// A name that does not resolve is no answer too.
+#[test]
+fn a_failed_lookup_is_provider_unreachable() {
+    let agent = ureq::AgentBuilder::new()
+        .resolver(|_: &str| -> std::io::Result<Vec<std::net::SocketAddr>> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no such host",
+            ))
+        })
+        .build();
+    let client = HetznerCloudClient::with_agent("http://api.example.test", "t", agent);
+    assert_unreachable(
+        client.list_locations().map(|_| ()).unwrap_err(),
+        "http://api.example.test/v1/locations",
+        "Dns Failed: ",
+    );
+}
+
+/// A request the API never answers within the agent's bound is no answer too.
+#[test]
+fn a_timeout_is_provider_unreachable() {
+    let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); // accepts, never answers
+    let url = format!("http://{}", silent.local_addr().unwrap());
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_millis(200))
+        .build();
+    let client = HetznerCloudClient::with_agent(url.clone(), "t", agent);
+    assert_unreachable(
+        client.list_locations().map(|_| ()).unwrap_err(),
+        &format!("{url}/v1/locations"),
+        "Network Error: ",
+    );
+    drop(silent);
+}
+
+/// What ureq refuses before it sends anything (here a scheme it does not speak) is not "the API
+/// did not answer": it stays the catch-all, and names the URL once as well.
+#[test]
+fn a_request_ureq_refuses_to_send_is_not_unreachable() {
+    let client = HetznerCloudClient::new("ftp://127.0.0.1:1", "t");
+    match client.list_locations().map(|_| ()).unwrap_err() {
+        CliError::Other(text) => {
+            let url = "ftp://127.0.0.1:1/v1/locations";
+            assert!(
+                text.starts_with(&format!("transport error talking to {url}: Unknown Scheme")),
+                "{text}"
+            );
+            assert_eq!(text.matches(url).count(), 1, "the URL twice: {text}");
+        }
+        other => panic!("expected the catch-all, got {other:?}"),
+    }
+}

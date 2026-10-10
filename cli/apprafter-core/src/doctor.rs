@@ -930,9 +930,13 @@ fn node_ssh(
 }
 
 /// The node row when the provider could not say where the server is: 401 (renew), another
-/// status, no answer, or — `ServerMissing` and anything else — the core's own sentence.
+/// status, no answer (the transport failure as the detail, as on the token row), an answer it
+/// could not read, or — `ServerMissing` and anything else — the core's own sentence.
 fn provider_failure(base: Check, name: &str, e: CoreError) -> Check {
-    let text = e.to_string();
+    let text = match &e {
+        CoreError::Cli(CliError::ProviderApiUnreachable { cause, .. }) => cause.to_string(),
+        _ => e.to_string(),
+    };
     let fix = match &e {
         CoreError::Cli(CliError::Hetzner { status: 401, .. }) => CheckFix::RenewToken {
             target: name.to_string(),
@@ -941,7 +945,8 @@ fn provider_failure(base: Check, name: &str, e: CoreError) -> Check {
         CoreError::Cli(CliError::Hetzner { status, .. }) => {
             CheckFix::ProviderError { status: *status }
         }
-        CoreError::ProviderRequestFailed { .. } => CheckFix::ProviderUnreachable,
+        CoreError::Cli(CliError::ProviderApiUnreachable { .. })
+        | CoreError::ProviderRequestFailed { .. } => CheckFix::ProviderUnreachable,
         _ => {
             return Check {
                 status: CheckStatus::Fail,
@@ -1421,6 +1426,16 @@ mod tests {
             "{:?}",
             v.detail
         );
+        // WI-453: the detail named the URL twice ("talking to X: X: Connection Failed").
+        let detail = v.detail.as_deref().unwrap();
+        let url = format!("{OFFLINE}/v1/locations");
+        assert!(
+            detail.starts_with(&format!(
+                "transport error talking to {url}: Connection Failed"
+            )),
+            "{detail}"
+        );
+        assert_eq!(detail.matches(&url).count(), 1, "{detail}");
     }
 
     #[test]
@@ -2303,6 +2318,26 @@ mod tests {
                 why: RenewWhy::TokenRejected
             })
         );
+    }
+
+    /// WI-453: a dead API fails the node row as it fails the token row — `ProviderUnreachable`,
+    /// the transport failure as the detail — not as a request failure with no cause.
+    #[test]
+    fn a_dead_api_fails_the_node_check_as_unreachable() {
+        let f = fx();
+        let (ctx, target) = provisioned(&f, OFFLINE, Some(TOKEN));
+        let c = node_ssh(&ctx, &target, &CancellationToken::new(), 22).unwrap();
+        assert_eq!(c.status, CheckStatus::Fail);
+        assert_eq!(c.fix, Some(CheckFix::ProviderUnreachable), "{c:?}");
+        let detail = c.detail.as_deref().unwrap();
+        let url = format!("{OFFLINE}/v1/servers/7");
+        assert!(
+            detail.starts_with(&format!(
+                "transport error talking to {url}: Connection Failed"
+            )),
+            "{detail}"
+        );
+        assert_eq!(detail.matches(&url).count(), 1, "{detail}");
     }
 
     #[test]
