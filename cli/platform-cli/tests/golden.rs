@@ -551,6 +551,31 @@ fn target_use_switches_active() {
     sb.golden("target/use_staging", &["target", "use", "staging"]);
 }
 
+/// WI-458 review #4: `use` refuses a target it cannot load — credentials or config that do not
+/// parse — with that file's error, and the default stays. The refusal moved from the CLI into
+/// the core, which the desktop's Make default calls too; recorded before the move, this pins
+/// that the CLI prints what it printed.
+#[test]
+fn target_use_refuses_a_target_whose_files_cannot_be_read() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.add_target("staging");
+    sb.add_target("test");
+    sb.seed_store_file(
+        "targets/staging/credentials.yaml",
+        "hetzner_token: [unclosed\n",
+    );
+    sb.seed_store_file("targets/test/config.yaml", "provider: [unclosed\n");
+    sb.golden_steps(
+        "target/use_unreadable",
+        &[
+            &["target", "use", "staging"],
+            &["target", "use", "test"],
+            &["target", "list"],
+        ],
+    );
+}
+
 #[test]
 fn target_use_unknown_is_refused() {
     let sb = Sandbox::new();

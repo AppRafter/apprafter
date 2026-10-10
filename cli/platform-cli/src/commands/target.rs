@@ -2061,7 +2061,6 @@ pub(crate) fn use_target(name: &str) -> miette::Result<()> {
     info!(target = %name, "target use invoked");
     let ctx = crate::context::cli_context()?;
     let tref = TargetRef::named(&ctx, name).map_err(report)?;
-    require_loadable(&ctx, name)?;
     let plan = core_target::plan_use(&ctx, &tref).map_err(report)?;
     let used = completed(
         core_target::execute_use(&ctx, plan, &CliReporter, &CancellationToken::new())
@@ -2077,9 +2076,10 @@ pub(crate) fn use_target(name: &str) -> miette::Result<()> {
     Ok(())
 }
 
-/// Today's `target use` / `machine` found the target with `load_target`, which reads both of its
-/// files: a target whose `config.yaml` or `credentials.yaml` cannot be read is refused as before.
-/// (The core checks only that the target exists.) `remove` takes such a target (WI-458).
+/// Today's `target machine` found the target with `load_target`, which reads both of its files: a
+/// target whose `config.yaml` or `credentials.yaml` cannot be read is refused as before. (The
+/// core's machine plan checks only that the target exists.) `use` gets the same refusal from the
+/// core's plan (WI-458 review #4), and `remove` takes such a target (WI-458).
 pub(crate) fn require_loadable(ctx: &Context, name: &str) -> miette::Result<()> {
     cli_core::load_target(&ctx.store(), name)
         .map(drop)

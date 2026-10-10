@@ -4,7 +4,7 @@
 use crate::op::{ChangeAction, Outcome, Plan, PlanClass};
 use crate::report::Reporter;
 use crate::target::{cancelled, change, cli_default, lock_store_if_present, TargetUsed};
-use crate::{ActivePointerChange, CancellationToken, Context, CoreResult, TargetRef};
+use crate::{ActivePointerChange, CancellationToken, Context, CoreError, CoreResult, TargetRef};
 
 /// What [`execute_use`] needs from its plan.
 #[derive(Debug)]
@@ -14,8 +14,14 @@ pub struct UsePayload {
 
 /// Reversible: `SetDefault CliDefault <name>` ("a → b", or "none → b" when `config.yaml` is
 /// absent — R1); no change when `target` already is the default.
+///
+/// A target whose `config.yaml` or `credentials.yaml` cannot be read is refused with that file's
+/// error, as the CLI's `use` always refused it: every command that names no target reads the
+/// default's two files, so such a default fails them all (WI-458 review #4; `remove` passes such
+/// a target over for the same reason). The desktop's Make default gets the same refusal.
 pub fn plan_use(ctx: &Context, target: &TargetRef) -> CoreResult<Plan<UsePayload>> {
     let name = target.name().to_string();
+    require_loadable(ctx, &name)?;
     let current = cli_default(ctx)?;
     let changes = if current.as_deref() == Some(name.as_str()) {
         Vec::new()
@@ -35,8 +41,16 @@ pub fn plan_use(ctx: &Context, target: &TargetRef) -> CoreResult<Plan<UsePayload
     })
 }
 
-/// Re-reads the pointer under the lock; writes `config.yaml` only when it moves. The CLI calls
-/// it even for an empty plan, so a read-only store still reports its lock warning.
+/// Both of target `name`'s files, read as `cli_core::load_target` reads them.
+fn require_loadable(ctx: &Context, name: &str) -> CoreResult<()> {
+    cli_core::load_target(&ctx.store(), name)
+        .map(drop)
+        .map_err(CoreError::from)
+}
+
+/// Re-reads the pointer under the lock, and the target's files (refused as [`plan_use`] refuses
+/// them); writes `config.yaml` only when it moves. The CLI calls it even for an empty plan, so a
+/// read-only store still reports its lock warning.
 pub fn execute_use(
     ctx: &Context,
     plan: Plan<UsePayload>,
@@ -49,6 +63,7 @@ pub fn execute_use(
     let name = plan.payload.name;
     let _lock = lock_store_if_present(ctx, reporter)?;
     TargetRef::named(ctx, &name)?;
+    require_loadable(ctx, &name)?;
     let from = cli_default(ctx)?;
     if from.as_deref() == Some(name.as_str()) {
         return Ok(Outcome::Completed {
@@ -77,7 +92,7 @@ pub fn execute_use(
 mod tests {
     use super::super::testkit::*;
     use super::*;
-    use crate::{CoreError, NullReporter};
+    use crate::NullReporter;
 
     #[test]
     fn use_without_a_config_yaml_moves_the_pointer_from_none() {
@@ -132,6 +147,52 @@ mod tests {
         let plan = plan_use(&ctx, &TargetRef::named(&ctx, "b").unwrap()).unwrap();
         let got = execute_use(&ctx, plan, &NullReporter, &cancelled_token());
         assert!(matches!(got, Ok(Outcome::Cancelled { .. })), "{got:?}");
+        assert_eq!(cli_default(&ctx).unwrap().as_deref(), Some("a"));
+    }
+
+    /// WI-458 review #4: the CLI's commands that name no target read the default's two files, so
+    /// one that cannot be read is never made the default: the plan is refused with that file's
+    /// error, as the CLI always refused it — the desktop's Make default calls the plan too.
+    #[test]
+    fn a_target_that_cannot_be_read_is_never_made_default() {
+        let (_d, ctx) = store(&["prod", "staging", "test"], Some("prod"));
+        let store = ctx.store();
+        std::fs::write(
+            store.target_credentials_file("staging"),
+            format!("hetzner_token:{TOKEN_A}\n"),
+        )
+        .unwrap();
+        std::fs::write(store.target_config_file("test"), "provider: [\n").unwrap();
+        for (name, file) in [
+            ("staging", store.target_credentials_file("staging")),
+            ("test", store.target_config_file("test")),
+        ] {
+            let err = plan_use(&ctx, &TargetRef::named(&ctx, name).unwrap()).unwrap_err();
+            match &err {
+                CoreError::Cli(cli_core::CliError::InvalidTargetConfig {
+                    path, target, ..
+                }) => {
+                    assert_eq!((path, target.as_deref()), (&file, Some(name)));
+                }
+                other => panic!("expected invalid_config, got {other:?}"),
+            }
+            assert!(!format!("{err:?}").contains(TOKEN_A));
+        }
+        assert_eq!(cli_default(&ctx).unwrap().as_deref(), Some("prod"));
+    }
+
+    /// The same under the lock: a target whose file broke after the plan is not made default.
+    #[test]
+    fn a_target_that_became_unreadable_after_the_plan_is_not_made_default() {
+        let (_d, ctx) = store(&["a", "b"], Some("a"));
+        let plan = plan_use(&ctx, &TargetRef::named(&ctx, "b").unwrap()).unwrap();
+        std::fs::write(ctx.store().target_config_file("b"), "provider: [\n").unwrap();
+        assert!(matches!(
+            execute_use(&ctx, plan, &NullReporter, &CancellationToken::new()),
+            Err(CoreError::Cli(
+                cli_core::CliError::InvalidTargetConfig { .. }
+            ))
+        ));
         assert_eq!(cli_default(&ctx).unwrap().as_deref(), Some("a"));
     }
 

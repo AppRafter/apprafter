@@ -765,6 +765,29 @@ mod tests {
         assert_eq!(pointer.as_deref(), Some("staging"));
     }
 
+    /// WI-458 review #4: Make default on a target whose credentials cannot be read (a readable
+    /// card: the list reads config.yaml only) is refused as `apprafter target use` refuses it,
+    /// before any plan, with the code and fields the page shows; the default stays.
+    #[test]
+    fn use_refuses_a_target_whose_credentials_cannot_be_read() {
+        let s = store(&["prod", "staging"], Some("prod"));
+        let store = s.shell.context.store();
+        std::fs::write(
+            store.target_credentials_file("staging"),
+            "hetzner_token: [\n",
+        )
+        .unwrap();
+        let ui = plan_target_use(&s.shell, "staging").unwrap_err().to_ui();
+        assert_eq!(
+            ui.code.as_deref(),
+            Some("apprafter::target::invalid_config")
+        );
+        assert_eq!(ui.fields["target"], json!("staging"));
+        assert!(s.shell.ops.list().is_empty(), "no plan registered");
+        let pointer = cli_core::resolve_active_target_name(&store, None).unwrap();
+        assert_eq!(pointer.as_deref(), Some("prod"));
+    }
+
     #[test]
     fn rename_is_bounded_and_takes_the_default_along() {
         let s = store(&["prod"], Some("prod"));
