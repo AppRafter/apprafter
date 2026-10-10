@@ -193,33 +193,6 @@ export const MOCK_TOOLCHAIN: ToolchainReport = {
   searchPathSource: 'login_shell',
 };
 
-/**
- * Every tool the core runs found, as on a Mac with Homebrew (`?tools=found`): the toolchain with
- * nothing to install, whose rows hold no control — at the smallest window its body scrolls.
- */
-export const MOCK_TOOLCHAIN_FOUND: ToolchainReport = {
-  tools: (
-    [
-      ['kubectl', true, 'talks to the cluster', '/opt/homebrew/bin', 'Client Version: v1.33.1'],
-      ['helm', true, 'installs charts', '/opt/homebrew/bin', 'v3.18.2+g04cad46'],
-      ['restic', false, 'backs up and restores', '/opt/homebrew/bin', 'restic 0.18.0'],
-      ['git', false, 'reads the platform repository', '/usr/bin', 'git version 2.50.1'],
-      ['ssh', false, 'reaches the nodes', '/usr/bin', 'OpenSSH_10.0p2'],
-      ['cue', true, 'renders the manifests', '/opt/homebrew/bin', 'cue version v0.17.1'],
-    ] as const
-  ).map(([tool, required, purpose, dir, version]) => ({
-    tool,
-    required,
-    purpose,
-    path: `${dir}/${tool}`,
-    version,
-    problem: null,
-    install: [],
-  })),
-  searchPath: ['/opt/homebrew/bin', '/usr/bin', '/bin'],
-  searchPathSource: 'login_shell',
-};
-
 /** Two regions and three offers. */
 export const MOCK_CATALOGUE: MachineCatalogue = {
   regions: [

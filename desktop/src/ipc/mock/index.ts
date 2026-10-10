@@ -12,8 +12,10 @@
 // the settings' lock-on-sleep row. Operations run on ops.ts's engine (Rust's OperationManager):
 // a destructive plan asks the gesture the way unlocking does, by the same route and back-off.
 // The D.3 commands answer from targets.ts's store (three targets and an unreadable one), whose
-// verified-token drafts go on every lock and unlock, as Rust's do. The toolchain (`?tools=`): by
-// default a tool is missing; `found`, every tool is (the panel with nothing to install).
+// verified-token drafts go on every lock and unlock, as Rust's do; flows.ts replaces four of its
+// read answers with richer data (the catalogue, the latencies, Doctor, the toolchain) and answers
+// the clipboard. The toolchain (`?tools=`): by default helm is missing; `found`, every tool is
+// (the panel with nothing to install).
 import { emit } from '@tauri-apps/api/event';
 import { mockIPC, mockWindows } from '@tauri-apps/api/mocks';
 import type { AppInfo } from '../generated/AppInfo';
@@ -29,9 +31,9 @@ import type { Settings } from '../generated/Settings';
 import type { Theme } from '../generated/Theme';
 import type { UiError } from '../generated/UiError';
 import type { UnavailableReason } from '../generated/UnavailableReason';
-import { MOCK_TOOLCHAIN_FOUND } from './fixtures';
+import { flowHandlers, MOCK_TOOLCHAIN_FOUND } from './flows';
 import { createMockOps, type Handler, type MockOps } from './ops';
-import { mockStore, targetHandlers } from './targets';
+import { type MockStore, mockStore, targetHandlers } from './targets';
 
 /** The one password the mock's password field accepts: a demo value, nobody's password. */
 export const MOCK_PASSWORD = 'apprafter';
@@ -182,10 +184,22 @@ const unavailable = (reason: UnavailableReason): UiError => ({
 /** The engine of the last installMockIpc. */
 let current: MockOps | null = null;
 
+/** The target store of the last installMockIpc. */
+let currentStore: MockStore | null = null;
+
 /** The engine of the last installMockIpc; tests register plans and reads through it. */
 export function mockOps(): MockOps {
   if (current === null) throw new Error('mock IPC: installMockIpc() has not run');
   return current;
+}
+
+/**
+ * The target store of the last installMockIpc: tests change a target there as the CLI would
+ * behind the app's back (a key path pointed elsewhere, a target removed).
+ */
+export function mockTargetStore(): MockStore {
+  if (currentStore === null) throw new Error('mock IPC: installMockIpc() has not run');
+  return currentStore;
 }
 
 export function installMockIpc(options: MockOptions = {}): void {
@@ -287,6 +301,8 @@ export function installMockIpc(options: MockOptions = {}): void {
   });
   current = engine;
   const store = mockStore();
+  currentStore = store;
+  const d3 = targetHandlers(engine, store);
 
   const handlers: Record<string, Handler> = {
     app_info: appInfo,
@@ -321,7 +337,9 @@ export function installMockIpc(options: MockOptions = {}): void {
     ...engine.handlers,
     window_ready: () => null,
     theme_apply: () => null,
-    ...targetHandlers(engine, store),
+    ...d3,
+    // Replaces exactly four of D.3d's read answers and adds the clipboard (flows.ts).
+    ...flowHandlers(engine, store, d3),
     ...(options.tools === 'found' && {
       toolchain_status: () => structuredClone(MOCK_TOOLCHAIN_FOUND),
     }),

@@ -19,6 +19,7 @@ import {
   resetOperations,
   watchOperations,
 } from '../operations';
+import { MOCK_CATALOGUE } from './flows';
 import { installMockIpc } from './index';
 
 beforeEach(async () => {
@@ -254,9 +255,8 @@ test('the catalogue of an unknown draft or target is refused at the command, bef
   expect(await refused({ kind: 'target', name: 'ghost' })).toBe(CORE_ERROR_CODES.TARGET_NOT_FOUND);
   expect(await api.opList()).toEqual([]);
   const read = await api.opStartMachineCatalogue({ kind: 'target', name: 'prod-eu' });
-  expect(result(await runRead(read))).toMatchObject({
-    regions: [{ code: 'hel1' }, { code: 'nbg1' }],
-  });
+  // The catalogue installMockIpc answers with is flows.ts's (D.3e deviation 5).
+  expect(result(await runRead(read))).toEqual(MOCK_CATALOGUE);
   expect((await api.opList())[0]).toMatchObject({
     title: 'Machine catalogue · prod-eu',
     target: 'prod-eu',

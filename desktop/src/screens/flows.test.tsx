@@ -5,7 +5,8 @@ import { clearMocks } from '@tauri-apps/api/mocks';
 import { act, cleanup, screen, within } from '@testing-library/react';
 import * as api from '../ipc/api';
 import { resetLifecycle } from '../ipc/lifecycle';
-import { installMockIpc } from '../ipc/mock';
+import { installMockIpc, mockTargetStore } from '../ipc/mock';
+import { MOCK_NOT_KEYS } from '../ipc/mock/fixtures';
 import { resetOperations } from '../ipc/operations';
 import { targetReport } from '../test/fixtures';
 import { doctorReport } from '../test/flows';
@@ -97,7 +98,59 @@ test("the doctor's Add target closes the doctor, then opens the wizard", async (
   expect(hostOf(await screen.findByRole('dialog', { name: 'Add target' }))).toBe('app');
 });
 
-/** The doctor on the IPC harness: D.3d's mock engine's doctor has no SSH key fix to offer. */
+// The same cases on the mock engine, whose doctor reads each target's stored key as the core
+// does (ipc/mock/flows.ts): lab's file is gone; staging's key is set to none, or to the private
+// half behind the app's back, as the CLI could.
+for (const [kind, prepare] of [
+  ['ssh_key_missing', () => 'lab'],
+  [
+    'configure_ssh_key',
+    () => {
+      const staging = mockTargetStore().reports.get('staging');
+      if (staging !== undefined)
+        mockTargetStore().reports.set('staging', { ...staging, sshKey: null });
+      return 'staging';
+    },
+  ],
+  [
+    'ssh_key_not_public',
+    () => {
+      const staging = mockTargetStore().reports.get('staging');
+      const privateKey = MOCK_NOT_KEYS.find((key) => key.problem === 'private_key') ?? null;
+      if (staging !== undefined) {
+        mockTargetStore().reports.set('staging', { ...staging, sshKey: privateKey });
+      }
+      return 'staging';
+    },
+  ],
+] as const) {
+  test(`on the mock engine, the doctor's ${kind} fix opens the key change above the doctor`, async () => {
+    const target = prepare();
+    const { flows, user } = probe();
+    act(() => flows().doctor(target));
+    const doctor = await screen.findByRole('dialog', { name: `Doctor · ${target}` });
+    await user.click(await within(doctor).findByRole('button', { name: 'Change SSH key' }));
+    const form = await screen.findByRole('dialog', { name: 'Change SSH key' });
+    expect(hostOf(form)).toBe('app');
+    expect(doctor.contains(form)).toBe(false);
+    await user.click(within(form).getByRole('button', { name: 'Cancel' }));
+    expect(screen.getByRole('dialog', { name: `Doctor · ${target}` })).toBeDefined();
+  });
+}
+
+test('on the mock engine, a target gone before the key change opens: the doctor says so', async () => {
+  const { flows, user } = probe();
+  act(() => flows().doctor('lab'));
+  const doctor = await screen.findByRole('dialog', { name: 'Doctor · lab' });
+  const change = await within(doctor).findByRole('button', { name: 'Change SSH key' });
+  // Removed by the CLI meanwhile.
+  mockTargetStore().reports.delete('lab');
+  await user.click(change);
+  expect(await within(doctor).findByText(/target `lab`/)).toBeDefined();
+  expect(screen.queryByRole('dialog', { name: 'Change SSH key' })).toBeNull();
+});
+
+/** The doctor on the IPC harness, where a test decides every answer. */
 function doctorOnHarness() {
   clearMocks();
   const h = installHarness();
