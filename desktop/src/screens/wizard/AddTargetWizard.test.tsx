@@ -375,7 +375,7 @@ describe('details and save', () => {
     h.plan('op_plan_target_add', planParts({ class: 'bounded', title: 'Add target lab-2' }), [
       completed(targetAdded({ name: 'lab-2', cliDefault: { from: null, to: 'lab-2' } })),
     ]);
-    const { user, onClose } = renderWizard();
+    const { user, onClose, unmount } = renderWizard();
     await toDetails(user);
     await user.type(screen.getByLabelText('Target name'), 'lab-2');
     await user.click(screen.getByRole('radio', { name: /Team \(T2\)/ }));
@@ -396,9 +396,11 @@ describe('details and save', () => {
       },
     });
     expect(h.of('op_execute')).toHaveLength(1);
-    expect(screen.queryByRole('dialog', { name: /confirm/i })).toBeNull();
+    // No confirm: PlanConfirm's dialog would be named by the plan's title.
+    expect(screen.queryByRole('dialog', { name: 'Add target lab-2' })).toBeNull();
     await waitFor(() => expect(h.of('target_list').length).toBeGreaterThan(1)); // invalidated: read again
-    expect(h.of('target_draft_discard')).toHaveLength(0); // the plan took the draft
+    unmount(); // the overlay closes: the plan took the draft, so nothing is left to discard
+    expect(h.of('target_draft_discard')).toHaveLength(0);
   });
 
   test('a Destructive plan is never run without its dialog (guard)', async () => {
@@ -448,6 +450,77 @@ describe('details and save', () => {
     await user.click(saveButton());
     expect(await screen.findByText('target `prod-eu` already exists')).toBeDefined();
     expect(saveButton().disabled).toBe(false);
+    expect(h.of('target_draft_discard')).toHaveLength(0);
+    await user.click(saveButton());
+    await waitFor(() => expect(h.of('op_plan_target_add')).toHaveLength(2));
+    expect((h.of('op_plan_target_add')[1]?.args.args as { draftId: number }).draftId).toBe(7);
+  });
+
+  test('a plan refused for a lost draft goes back to the token, the draft discarded', async () => {
+    h.answer('op_plan_target_add', () =>
+      Promise.reject(uiError(DESKTOP_ERROR_CODES.DRAFT_EXPIRED)),
+    );
+    const { user } = renderWizard();
+    await toDetails(user);
+    await user.type(screen.getByLabelText('Target name'), 'lab-2');
+    await user.click(saveButton());
+    expect(await screen.findByText(DRAFT_GONE)).toBeDefined();
+    expect(currentStep()).toContain('Provider');
+    expect(h.of('target_draft_discard').map((c) => c.args)).toEqual([{ draftId: 7 }]);
+  });
+
+  test('a plan refused for an invalid token goes back to the token with the core message', async () => {
+    h.answer('op_plan_target_add', () =>
+      Promise.reject(uiError('apprafter::target::invalid_token', 'The token is not 64 characters')),
+    );
+    const { user } = renderWizard();
+    await toDetails(user);
+    await user.type(screen.getByLabelText('Target name'), 'lab-2');
+    await user.click(saveButton());
+    expect(await screen.findByText('The token is not 64 characters')).toBeDefined();
+    expect(currentStep()).toContain('Provider');
+    expect(h.of('target_draft_discard').map((c) => c.args)).toEqual([{ draftId: 7 }]);
+  });
+
+  test('while the save runs the frame is busy: Close, Esc and Back wait', async () => {
+    h.plan('op_plan_target_add', planParts({}), []); // the run never ends
+    const { user, onClose } = renderWizard();
+    await toDetails(user);
+    await user.type(screen.getByLabelText('Target name'), 'lab-2');
+    await user.click(saveButton());
+    const saving = (await screen.findByRole('button', { name: 'Saving…' })) as HTMLButtonElement;
+    expect(saving.disabled).toBe(true);
+    expect((screen.getByRole('button', { name: 'Close' }) as HTMLButtonElement).disabled).toBe(
+      true,
+    );
+    expect((screen.getByRole('button', { name: 'Back' }) as HTMLButtonElement).disabled).toBe(true);
+    await user.keyboard('{Escape}');
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  test('a save cancelled elsewhere says nothing was saved', async () => {
+    h.plan('op_plan_target_add', planParts({}), [cancelled()]);
+    const { user } = renderWizard();
+    await toDetails(user);
+    await user.type(screen.getByLabelText('Target name'), 'lab-2');
+    await user.click(saveButton());
+    expect(await screen.findByText('Saving was cancelled; nothing was saved.')).toBeDefined();
+    expect(screen.getByRole('button', { name: 'Enter the token again' })).toBeDefined();
+  });
+
+  test('a Destructive save cancelled after its confirm says nothing was saved', async () => {
+    h.plan(
+      'op_plan_target_add',
+      planParts({ class: 'destructive', title: 'Replace target lab-2' }),
+      [cancelled()],
+    );
+    const { user } = renderWizard();
+    await toDetails(user);
+    await user.type(screen.getByLabelText('Target name'), 'lab-2');
+    await user.click(saveButton());
+    const dialog = await screen.findByRole('dialog', { name: 'Replace target lab-2' });
+    await user.click(within(dialog).getByRole('button', { name: 'Save target' }));
+    expect(await screen.findByText('Saving was cancelled; nothing was saved.')).toBeDefined();
   });
 
   test('a failed save needs the token again: the button says so and goes there', async () => {
@@ -464,6 +537,17 @@ describe('details and save', () => {
     await user.click(screen.getByRole('button', { name: 'Enter the token again' }));
     expect(screen.getByLabelText('API token')).toBeDefined();
     expect(screen.queryByLabelText('Target name')).toBeNull();
+    // A new token makes a new draft, which reads its own catalogue.
+    h.read('op_start_verify_token', [completed({ draftId: 8, elapsedMs: 150 })]);
+    h.read('op_start_machine_catalogue', [completed(catalogue())]);
+    h.read('op_start_region_latencies', [completed([{ region: 'nbg1', latencyMs: 38 }])]);
+    await user.type(screen.getByLabelText('API token'), TOKEN);
+    await user.click(screen.getByRole('button', { name: 'Verify and continue' }));
+    await waitFor(() => expect(h.of('op_start_machine_catalogue')).toHaveLength(2));
+    expect(h.of('op_start_machine_catalogue')[1]?.args).toEqual({
+      source: { kind: 'draft', draftId: 8 },
+    });
+    expect(await screen.findByRole('table', { name: 'Machines in nbg1' })).toBeDefined();
   });
 
   test('a double click on Continue goes to Details once and never saves', async () => {
@@ -635,6 +719,30 @@ describe('details and save', () => {
     await user.type(field, 'prod-eu');
     expect(await screen.findByText('A target named prod-eu exists.')).toBeDefined();
     expect(saveButton().disabled).toBe(true);
+  });
+
+  test("Other path: the typed path goes to the core as typed, ~/ included; the plan gets the core's path", async () => {
+    h.answer('ssh_key_inspect', () => ({
+      path: '/home/alex/.ssh/work.pub',
+      display: '~/.ssh/work.pub',
+      exists: true,
+      algo: 'ssh-ed25519',
+    }));
+    h.plan('op_plan_target_add', planParts({}), [completed(targetAdded({ name: 'lab-2' }))]);
+    const { user } = renderWizard();
+    await toDetails(user);
+    await user.type(screen.getByLabelText('Target name'), 'lab-2');
+    await user.click(screen.getByRole('radio', { name: 'Other path…' }));
+    await user.type(screen.getByLabelText('Path to a public key'), '~/.ssh/work.pub');
+    await user.tab();
+    expect(await screen.findByText('Found · ssh-ed25519')).toBeDefined();
+    // The expansion of ~/ is the core's (a later Rust change); the page sends what was typed.
+    expect(h.of('ssh_key_inspect').map((c) => c.args)).toEqual([{ path: '~/.ssh/work.pub' }]);
+    await user.click(saveButton());
+    await screen.findByText('Target “lab-2” saved.');
+    expect((h.of('op_plan_target_add')[0]?.args.args as { sshKey: unknown }).sshKey).toBe(
+      '/home/alex/.ssh/work.pub',
+    );
   });
 
   test('SSH: the first key is chosen; Other path is checked on leaving the field; Skip sends none', async () => {
