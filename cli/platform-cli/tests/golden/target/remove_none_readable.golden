@@ -1,0 +1,21 @@
+$ apprafter target remove prod --yes
+[exit 0]
+[stdout]
+target `prod` removed; no target that can be read is left (`broken` cannot be read), active pointer cleared
+[stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m target remove invoked <ESC>[3mtarget<ESC>[0m<ESC>[2m=<ESC>[0mprod <ESC>[3myes<ESC>[0m<ESC>[2m=<ESC>[0mtrue
+$ apprafter target remove broken --yes
+[exit 0]
+[stdout]
+target `broken` removed
+[stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m target remove invoked <ESC>[3mtarget<ESC>[0m<ESC>[2m=<ESC>[0mbroken <ESC>[3myes<ESC>[0m<ESC>[2m=<ESC>[0mtrue
+warning: target `broken` cannot be read (config.yaml cannot be read: provider: invalid type: sequence, expected a string at line 1 column 11); removing it deletes its files without reading them.
+$ apprafter target list
+[exit 0]
+[stdout]
+No targets configured. Run `apprafter target add` to create one — or `apprafter target add <name>` to skip the wizard's name prompt.
+[stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m target list invoked
+[file config.yaml: absent]
+[file targets/broken/config.yaml: absent]

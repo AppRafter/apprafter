@@ -1805,6 +1805,89 @@ fn target_remove_of_a_provisioned_target() {
     );
 }
 
+/// WI-458: a target whose `config.yaml` cannot be read is removed with `--yes`. The warnings say
+/// what cannot be read, and that the server its state records keeps running and cannot be
+/// checked or destroyed through it; its directory and state go, and the default moves to the
+/// target that can be read.
+#[test]
+fn target_remove_of_a_target_whose_config_cannot_be_read() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.add_target("staging");
+    sb.seed_config("prod", "provider: [hetzner-cloud\n");
+    sb.seed_state("prod", PROVISIONED_STATE);
+    sb.golden_with_files(
+        "target/remove_unreadable",
+        &[&["target", "remove", "prod", "--yes"], &["target", "list"]],
+        &[
+            "targets/prod/config.yaml",
+            "targets/prod/credentials.yaml",
+            "state/prod/.apprafter/state.json",
+        ],
+    );
+}
+
+/// WI-458: a good `config.yaml` beside a `credentials.yaml` that cannot be read takes the same
+/// path, and its text (the token) is never printed: only where it stopped parsing.
+#[test]
+fn target_remove_of_a_target_whose_credentials_cannot_be_read() {
+    let seeded = || {
+        let sb = Sandbox::new();
+        sb.add_target("prod");
+        sb.add_target("staging");
+        sb.seed_store_file(
+            "targets/prod/credentials.yaml",
+            &format!("hetzner_token:{TOKEN_A}\n"),
+        );
+        sb
+    };
+    let steps: &[&[&str]] = &[&["target", "remove", "prod", "--yes"]];
+    seeded().assert_steps_never_print(steps, TOKEN_A);
+    seeded().golden_with_files(
+        "target/remove_unreadable_credentials",
+        steps,
+        &["targets/prod/credentials.yaml"],
+    );
+}
+
+/// WI-458 (from D.3d): removing the default moves it to the alphabetically first target that
+/// can be read — both files — passing over one whose config cannot be read and one whose
+/// credentials cannot, and the line names them.
+#[test]
+fn target_remove_of_the_default_passes_over_targets_that_cannot_be_read() {
+    let sb = Sandbox::new();
+    for name in ["alpha", "beta", "staging", "prod"] {
+        sb.add_target(name);
+    }
+    sb.seed_pointer("prod");
+    sb.seed_config("alpha", "provider: [hetzner-cloud\n");
+    sb.seed_store_file("targets/beta/credentials.yaml", "hetzner_token: [\n");
+    sb.golden_with_files(
+        "target/remove_skips_unreadable",
+        &[&["target", "remove", "prod", "--yes"], &["target", "list"]],
+        &["config.yaml"],
+    );
+}
+
+/// WI-458: when no target that can be read is left, the default is cleared and the line says
+/// why; the one left can then be removed too.
+#[test]
+fn target_remove_of_the_default_with_no_readable_target_left() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.add_target("broken");
+    sb.seed_config("broken", "provider: [hetzner-cloud\n");
+    sb.golden_with_files(
+        "target/remove_none_readable",
+        &[
+            &["target", "remove", "prod", "--yes"],
+            &["target", "remove", "broken", "--yes"],
+            &["target", "list"],
+        ],
+        &["config.yaml", "targets/broken/config.yaml"],
+    );
+}
+
 #[test]
 fn target_show_of_a_provisioned_target() {
     let sb = Sandbox::new();

@@ -991,7 +991,8 @@ mod tests {
     fn the_force_texts_name_commands_that_exist() {
         let yaml = CliError::from(serde_yaml::from_str::<u8>("[").unwrap_err());
         let help = miette::Diagnostic::help(&yaml).unwrap().to_string();
-        assert_eq!(assert_commands_parse(&help), 1, "{help}");
+        // `target remove <name>` (WI-458), then `target add <name> …`.
+        assert_eq!(assert_commands_parse(&help), 2, "{help}");
         let cli = <crate::cli::Cli as clap::CommandFactory>::command();
         let force_doc = cli
             .find_subcommand("target")
@@ -1295,6 +1296,7 @@ mod tests {
                 server_name: "platform-1".into(),
                 server_type: None,
             },
+            true,
         );
         assert_eq!(
             w,
@@ -1313,6 +1315,96 @@ mod tests {
         );
     }
 
+    /// WI-458: removing a target whose files cannot be read says which cannot, and that its
+    /// files go as they are; a server its state records keeps running, nothing here can check
+    /// it, and `destroy --target` cannot read its token until the files are fixed — the
+    /// commands it names exist.
+    #[test]
+    fn the_unreadable_remove_warnings_say_what_cannot_be_read_or_checked() {
+        let w = unreadable_target_warning(
+            "prod",
+            &[
+                "config.yaml cannot be read: expected a mapping",
+                "credentials.yaml cannot be read: not a valid target credentials map (line 1, column 1)",
+            ],
+        );
+        assert_eq!(
+            w,
+            "warning: target `prod` cannot be read (config.yaml cannot be read: expected a \
+             mapping; credentials.yaml cannot be read: not a valid target credentials map (line \
+             1, column 1)); removing it deletes its files without reading them."
+        );
+        let s = orphaned_server_warning(
+            "prod",
+            &apprafter_core::target::ProvisionedServer {
+                server_id: 42,
+                server_name: "platform-1".into(),
+                server_type: None,
+            },
+            false,
+        );
+        assert_eq!(
+            s,
+            "warning: target `prod` records server `platform-1` (id 42); removing the target \
+             does not delete it, and it keeps running (and billing) at the provider. The \
+             target's files cannot be read, so nothing here can check the server, and \
+             `apprafter destroy --target prod` cannot read its token. To delete it first, fix \
+             or restore those files and run that command, which deletes every `apprafter=true` \
+             resource in the token's Hetzner project, not only this cluster; or delete server 42 \
+             in the Hetzner Cloud Console."
+        );
+        assert_eq!(assert_commands_parse(&s), 1, "{s}");
+    }
+
+    /// The files the plan cannot read are its `Target` and `Credentials` details; a readable
+    /// target's plan has none (its other lines' details are not about its files).
+    #[test]
+    fn the_unreadable_files_are_the_plans_target_and_credentials_details() {
+        use apprafter_core::{ChangeAction, PlannedChange};
+        let line = |kind: &str, detail: Option<&str>| PlannedChange {
+            kind: kind.into(),
+            object: "prod".into(),
+            action: ChangeAction::Delete,
+            detail: detail.map(str::to_string),
+        };
+        let readable = [
+            line("Target", None),
+            line("Credentials", None),
+            line("LocalState", Some("cached state")),
+            line("CliDefault", Some("prod → staging")),
+        ];
+        assert!(unreadable_files(&readable).is_empty());
+        let unreadable = [
+            line("Target", Some("config.yaml is missing")),
+            line("Credentials", Some("credentials.yaml cannot be read: x")),
+            line("LocalState", Some("cached state")),
+        ];
+        assert_eq!(
+            unreadable_files(&unreadable),
+            [
+                "config.yaml is missing",
+                "credentials.yaml cannot be read: x"
+            ]
+        );
+    }
+
+    /// The help for a target file that cannot be read, and for a YAML error, sends the reader to
+    /// commands that exist: `target remove` (WI-458), then `target add`.
+    #[test]
+    fn the_unreadable_target_helps_name_commands_that_exist() {
+        let config = CliError::InvalidTargetConfig {
+            path: "/s/targets/prod/config.yaml".into(),
+            message: "m".into(),
+            target: Some("prod".into()),
+        };
+        let yaml = CliError::from(serde_yaml::from_str::<u8>("[").unwrap_err());
+        for e in [config, yaml] {
+            let h = miette::Diagnostic::help(&e).unwrap().to_string();
+            assert!(h.contains("target remove"), "{h}");
+            assert_eq!(assert_commands_parse(&h), 2, "{h}");
+        }
+    }
+
     /// R6 after the removal: the server the core found under the lock is warned about unless
     /// the warning before the prompt already named it — a server recorded in between, or a
     /// different one, is not left unmentioned; no server, no warning.
@@ -1327,13 +1419,24 @@ mod tests {
                 server_type: None,
             }),
             cli_default: None,
+            skipped_unreadable: Vec::new(),
         };
-        let late = |warned, id| late_orphaned_server_warning("prod", warned, &done(id));
+        let late = |warned, id| late_orphaned_server_warning("prod", warned, &done(id), true);
         assert_eq!(
             late(None, Some(42)),
             Some(orphaned_server_warning(
                 "prod",
-                done(Some(42)).orphaned_server.as_ref().unwrap()
+                done(Some(42)).orphaned_server.as_ref().unwrap(),
+                true
+            ))
+        );
+        // WI-458: the late warning says what the early one would of a target it cannot read.
+        assert_eq!(
+            late_orphaned_server_warning("prod", None, &done(Some(42)), false),
+            Some(orphaned_server_warning(
+                "prod",
+                done(Some(42)).orphaned_server.as_ref().unwrap(),
+                false
             ))
         );
         assert_eq!(late(Some(42), Some(42)), None, "already warned");
@@ -1621,6 +1724,7 @@ mod tests {
             state_removed: false,
             orphaned_server: None,
             cli_default,
+            skipped_unreadable: Vec::new(),
         };
         assert_eq!(remove_done_line(&removed(None)), "target `prod` removed");
         assert_eq!(
@@ -1636,6 +1740,24 @@ mod tests {
                 to: None,
             }))),
             "target `prod` removed; no targets left, active pointer cleared"
+        );
+        // WI-458: the default passes over targets that cannot be read, and says so.
+        let passed_over = |to: Option<&str>| TargetRemoved {
+            skipped_unreadable: vec!["alpha".into(), "beta".into()],
+            ..removed(Some(ActivePointerChange {
+                from: Some("prod".into()),
+                to: to.map(str::to_string),
+            }))
+        };
+        assert_eq!(
+            remove_done_line(&passed_over(Some("staging"))),
+            "target `prod` removed; active switched to `staging` (alphabetically next that can \
+             be read; `alpha`, `beta` cannot be read)"
+        );
+        assert_eq!(
+            remove_done_line(&passed_over(None)),
+            "target `prod` removed; no target that can be read is left (`alpha`, `beta` cannot \
+             be read), active pointer cleared"
         );
     }
 
@@ -1954,9 +2076,9 @@ pub(crate) fn use_target(name: &str) -> miette::Result<()> {
     Ok(())
 }
 
-/// Today's `target use` / `remove` / `machine` found the target with `load_target`, which reads
-/// both of its files: a target whose `config.yaml` or `credentials.yaml` cannot be read is
-/// refused as before. (The core checks only that the target exists.)
+/// Today's `target use` / `machine` found the target with `load_target`, which reads both of its
+/// files: a target whose `config.yaml` or `credentials.yaml` cannot be read is refused as before.
+/// (The core checks only that the target exists.) `remove` takes such a target (WI-458).
 pub(crate) fn require_loadable(ctx: &Context, name: &str) -> miette::Result<()> {
     cli_core::load_target(&ctx.store(), name)
         .map(drop)
@@ -2093,17 +2215,22 @@ pub(crate) fn rename(from: &str, to: &str) -> miette::Result<()> {
 }
 
 /// `target remove` on the core. The confirmation stays the CLI's: `--yes`, else a TTY prompt
-/// (never a lock held across it — `execute_remove` takes the lock after it).
+/// (never a lock held across it — `execute_remove` takes the lock after it). A target whose files
+/// cannot be read is removed too (WI-458): the warnings say what the plan cannot read or check.
 pub(crate) fn remove(name: &str, yes: bool) -> miette::Result<()> {
     info!(target = %name, yes, "target remove invoked");
     let ctx = crate::context::cli_context()?;
     let tref = TargetRef::named(&ctx, name).map_err(report)?;
-    require_loadable(&ctx, name)?;
     let plan = core_target::plan_remove(&ctx, &tref).map_err(report)?;
     // R6: before any confirmation, so a terminal user reads it before answering.
+    let unreadable = unreadable_files(&plan.changes);
+    if !unreadable.is_empty() {
+        eprintln!("{}", unreadable_target_warning(name, &unreadable));
+    }
+    let readable = unreadable.is_empty();
     let warned = match core_target::provisioned(&ctx, &tref) {
         Ok(Some(server)) => {
-            eprintln!("{}", orphaned_server_warning(name, &server));
+            eprintln!("{}", orphaned_server_warning(name, &server, readable));
             Some(server.server_id)
         }
         Ok(None) => None,
@@ -2131,11 +2258,32 @@ pub(crate) fn remove(name: &str, yes: bool) -> miette::Result<()> {
         core_target::execute_remove(&ctx, plan, &CliReporter, &CancellationToken::new())
             .map_err(report)?,
     )?;
-    if let Some(w) = late_orphaned_server_warning(name, warned, &done) {
+    if let Some(w) = late_orphaned_server_warning(name, warned, &done, readable) {
         eprintln!("{w}");
     }
     println!("{}", remove_done_line(&done));
     Ok(())
+}
+
+/// What the remove plan says cannot be read of a target's own files: its `Target` and
+/// `Credentials` lines carry a detail only then (WI-458). Empty for a target that can be read.
+pub(crate) fn unreadable_files(changes: &[apprafter_core::PlannedChange]) -> Vec<&str> {
+    changes
+        .iter()
+        .filter(|c| matches!(c.kind.as_str(), "Target" | "Credentials"))
+        .filter_map(|c| c.detail.as_deref())
+        .collect()
+}
+
+/// `target remove` of a target whose files cannot be read (WI-458): which, and that the removal
+/// deletes them as they are. A credentials file is never quoted (its text is the token): the
+/// core gives only where it stopped parsing.
+pub(crate) fn unreadable_target_warning(name: &str, problems: &[&str]) -> String {
+    format!(
+        "warning: target `{name}` cannot be read ({}); removing it deletes its files without \
+         reading them.",
+        problems.join("; ")
+    )
 }
 
 /// R6 after the removal: the warning for the server `execute_remove` found under the lock, unless
@@ -2146,28 +2294,44 @@ pub(crate) fn late_orphaned_server_warning(
     name: &str,
     warned: Option<u64>,
     done: &TargetRemoved,
+    readable: bool,
 ) -> Option<String> {
     done.orphaned_server
         .as_ref()
         .filter(|s| Some(s.server_id) != warned)
-        .map(|s| orphaned_server_warning(name, s))
+        .map(|s| orphaned_server_warning(name, s, readable))
 }
 
 /// `target remove` of a target whose state records a server (R6): the server is not deleted
 /// and keeps running. `destroy` is the teardown, with its real scope — the token's whole Hetzner
-/// project, not only this cluster (operator guide, target store: the destroy scope).
+/// project, not only this cluster (operator guide, target store: the destroy scope). When the
+/// target's files cannot be read (`readable: false`, WI-458) nothing here can check the server,
+/// and `destroy --target` cannot read the token either: the files are fixed or restored first.
 pub(crate) fn orphaned_server_warning(
     name: &str,
     server: &apprafter_core::target::ProvisionedServer,
+    readable: bool,
 ) -> String {
-    format!(
-        "warning: target `{name}` records server `{}` (id {}); removing the target does not \
-         delete it, and it keeps running (and billing) at the provider. To delete it first, run \
-         `apprafter destroy --target {name}`, which deletes every `apprafter=true` resource in \
-         the token's Hetzner project, not only this cluster; or delete server {} in the Hetzner \
-         Cloud Console.",
-        server.server_name, server.server_id, server.server_id
-    )
+    let (id, server_name) = (server.server_id, &server.server_name);
+    let left = format!(
+        "warning: target `{name}` records server `{server_name}` (id {id}); removing the target \
+         does not delete it, and it keeps running (and billing) at the provider."
+    );
+    let scope = "which deletes every `apprafter=true` resource in the token's Hetzner project, \
+                 not only this cluster";
+    if readable {
+        format!(
+            "{left} To delete it first, run `apprafter destroy --target {name}`, {scope}; or \
+             delete server {id} in the Hetzner Cloud Console."
+        )
+    } else {
+        format!(
+            "{left} The target's files cannot be read, so nothing here can check the server, \
+             and `apprafter destroy --target {name}` cannot read its token. To delete it first, \
+             fix or restore those files and run that command, {scope}; or delete server {id} in \
+             the Hetzner Cloud Console."
+        )
+    }
 }
 
 /// `target remove` of a target whose state cannot be read: whether it records a server is
@@ -2179,15 +2343,32 @@ pub(crate) fn unreadable_state_warning(name: &str, error: &str) -> String {
     )
 }
 
-/// The line `target remove` ends with: where the CLI default went, when it named the target.
+/// The line `target remove` ends with: where the CLI default went, when it named the target —
+/// the alphabetically next target that can be read, naming those it passed over (WI-458).
 pub(crate) fn remove_done_line(r: &TargetRemoved) -> String {
+    let skipped = r
+        .skipped_unreadable
+        .iter()
+        .map(|n| format!("`{n}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
     match &r.cli_default {
-        Some(ActivePointerChange { to: Some(next), .. }) => format!(
+        Some(ActivePointerChange { to: Some(next), .. }) if skipped.is_empty() => format!(
             "target `{}` removed; active switched to `{next}` (alphabetically next)",
             r.name
         ),
-        Some(ActivePointerChange { to: None, .. }) => format!(
+        Some(ActivePointerChange { to: Some(next), .. }) => format!(
+            "target `{}` removed; active switched to `{next}` (alphabetically next that can be \
+             read; {skipped} cannot be read)",
+            r.name
+        ),
+        Some(ActivePointerChange { to: None, .. }) if skipped.is_empty() => format!(
             "target `{}` removed; no targets left, active pointer cleared",
+            r.name
+        ),
+        Some(ActivePointerChange { to: None, .. }) => format!(
+            "target `{}` removed; no target that can be read is left ({skipped} cannot be \
+             read), active pointer cleared",
             r.name
         ),
         None => format!("target `{}` removed", r.name),

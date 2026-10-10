@@ -321,6 +321,28 @@ as a first run and auto-activates what it creates:
 target `dev` removed; no targets left, active pointer cleared
 ```
 
+The pointer only moves to a target whose `config.yaml` and
+`credentials.yaml` can both be read, because every command that names
+no target reads them. Targets that cannot be read are passed over, and
+the line names them; when no other target can be read, the pointer is
+cleared:
+
+```text
+target `prod` removed; active switched to `staging` (alphabetically next that can be read; `alpha` cannot be read)
+```
+
+**A target that cannot be read can still be removed.** When a target's
+`config.yaml` or `credentials.yaml` does not parse, `target remove`
+still removes it. Before it asks, it warns which file cannot be read,
+and it deletes the files without reading them. A credentials file is
+never quoted, because its text is the token: the warning gives only the
+line and column where parsing stopped. If the target's state records a
+server, the server warning adds that nothing can check that server
+through this target, and that `apprafter destroy --target <name>`
+cannot read its token until the files are fixed or restored. So fix
+them first if you mean to destroy that server, or delete it in the
+Hetzner Cloud Console.
+
 ## Anti-patterns
 
 - **Committing `credentials.yaml` to a dotfiles repo.** Plaintext

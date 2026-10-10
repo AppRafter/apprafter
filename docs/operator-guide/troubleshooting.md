@@ -195,11 +195,15 @@ that text is the API token.
 **Fix.** Fix the file by hand (these files are small), or restore it
 from a backup. Otherwise, it depends on whose file it is:
 
-- **A target's `config.yaml` or `credentials.yaml`**: delete that
-  target's directory (`targets/<name>/`, named in the help) and add
-  the target again with
+- **A target's `config.yaml` or `credentials.yaml`**: remove the
+  target with `apprafter target remove <name>` and add it again with
   `apprafter target add <name> --provider hetzner-cloud …`, its token
-  included. `apprafter target remove` refuses a target it cannot read.
+  included. `target remove` takes a target it cannot read: it warns
+  which file cannot be read and deletes the target's files without
+  reading them. If the target's state records a server, the warning
+  also says that the server keeps running and that
+  `apprafter destroy --target <name>` cannot read the token until the
+  files are fixed, so fix them first if you mean to destroy it.
 - **The store's own `config.yaml`**: no target's removal or re-add
   repairs it. It records only which target is the default, so you can
   delete it and choose the default again with
@@ -281,10 +285,10 @@ encode/decode error on `state.json` (JSON) /
 socket. Common cases: missing directory, wrong permissions
 (`chmod 0600` on credentials), full disk. For decode failures on
 target-store files, fix the YAML by hand (they are small files),
-or delete that target's directory under the target store and add
-it again with `apprafter target add`. `target add --force` cannot
-rewrite such a target: it keeps the stored values, so it needs a
-readable config.
+or remove that target with `apprafter target remove <name>`, which
+takes a target it cannot read, and add it again with
+`apprafter target add`. `target add --force` cannot rewrite such a
+target: it keeps the stored values, so it needs a readable config.
 
 ### `apprafter::backup::job_active`
 

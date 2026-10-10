@@ -20,6 +20,7 @@ test('each outcome says what moved: the CLI default and a running server include
       stateRemoved: true,
       orphanedServer: null,
       cliDefault: { from: 'prod', to: null },
+      skippedUnreadable: [],
     }),
   ).toBe('Removed prod from this computer · no CLI default now');
   expect(
@@ -28,12 +29,19 @@ test('each outcome says what moved: the CLI default and a running server include
       stateRemoved: true,
       cliDefault: { from: 'prod', to: 'lab' },
       orphanedServer: { serverId: 4711, serverName: 'prod-1', serverType: 'cx22' },
+      skippedUnreadable: [],
     }),
   ).toBe(
     'Removed prod from this computer · server prod-1 keeps running at the provider · the CLI default is now lab',
   );
   expect(
-    removedMessage({ name: 'prod', stateRemoved: false, orphanedServer: null, cliDefault: null }),
+    removedMessage({
+      name: 'prod',
+      stateRemoved: false,
+      orphanedServer: null,
+      cliDefault: null,
+      skippedUnreadable: [],
+    }),
   ).toBe('Removed prod from this computer');
   expect(usedMessage({ name: 'lab', pointer: { from: 'prod', to: 'lab' } })).toBe(
     'lab is the CLI default now',

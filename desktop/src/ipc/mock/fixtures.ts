@@ -95,16 +95,19 @@ export const MOCK_REPORTS: readonly TargetReport[] = [
   },
 ];
 
-/** A target whose files could not be read: listed apart, never hidden. */
+/**
+ * A target whose files could not be read: listed apart, never hidden. Its error is the core's
+ * for a target's own config.yaml: the message, the neutral help and the fields Rust sends.
+ */
 export const MOCK_UNREADABLE: readonly UnreadableTarget[] = [
   {
     name: 'broken',
     error: {
       code: 'apprafter::target::invalid_config',
-      message: 'targets/broken/config.yaml: expected a mapping',
-      help: null,
+      message: `target config at ${targetFiles('broken').configFile}: expected a mapping`,
+      help: `${targetFiles('broken').configFile} could not be read as a target configuration: it was edited by hand or written by an incompatible version. Fix it by hand (it is a small YAML file), or restore it from a backup. Otherwise remove target \`broken\` and add it again, its token included: the removal deletes both of its files.`,
       causes: [],
-      fields: { path: 'targets/broken/config.yaml' },
+      fields: { path: targetFiles('broken').configFile, target: 'broken' },
     },
   },
 ];

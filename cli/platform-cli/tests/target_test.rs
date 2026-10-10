@@ -1008,12 +1008,13 @@ fn says_the_credentials_do_not_parse() -> impl predicates::Predicate<str> {
     })
 }
 
-/// `use` and `remove` find their target by reading both of its files, as they always have: a
-/// target whose credentials file cannot be parsed is refused and left in place, and the CLI
-/// default does not move onto it. (The core checks only that a target exists; the CLI keeps
-/// this check so moving onto the core changes nothing here.)
+/// `use` finds its target by reading both of its files, as it always has: a target whose
+/// credentials file cannot be parsed is refused and left in place, and the CLI default does not
+/// move onto it. (The core checks only that a target exists; the CLI keeps this check so moving
+/// onto the core changes nothing here.) `remove` takes that target (WI-458): it says which file
+/// cannot be read, never what it holds, and deletes it; the default stays where it was.
 #[test]
-fn target_use_and_remove_refuse_a_target_whose_files_cannot_be_read() {
+fn target_use_refuses_and_remove_removes_a_target_whose_files_cannot_be_read() {
     let dir = tempfile::tempdir().unwrap();
     seed_two_targets(dir.path());
     std::fs::write(
@@ -1022,20 +1023,26 @@ fn target_use_and_remove_refuse_a_target_whose_files_cannot_be_read() {
     )
     .unwrap();
 
-    for args in [
-        &["target", "use", "second"][..],
-        &["target", "remove", "second", "--yes"][..],
-    ] {
-        cli()
-            .env("APPRAFTER_CONFIG_DIR", dir.path())
-            .env("APPRAFTER_NO_PING", "1")
-            .args(args)
-            .assert()
-            .failure()
-            .stderr(contains(UNREADABLE_CODE))
-            .stderr(says_the_credentials_do_not_parse());
-    }
+    cli()
+        .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_NO_PING", "1")
+        .args(["target", "use", "second"])
+        .assert()
+        .failure()
+        .stderr(contains(UNREADABLE_CODE))
+        .stderr(says_the_credentials_do_not_parse());
     assert!(dir.path().join("targets/second/config.yaml").exists());
+
+    cli()
+        .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_NO_PING", "1")
+        .args(["target", "remove", "second", "--yes"])
+        .assert()
+        .success()
+        .stderr(says_the_credentials_do_not_parse())
+        .stderr(contains("[unclosed").not())
+        .stdout(contains("target `second` removed"));
+    assert!(!dir.path().join("targets/second").exists());
     let global = std::fs::read_to_string(dir.path().join("config.yaml")).unwrap();
     assert!(global.contains("active_target: first"), "{global}");
 }

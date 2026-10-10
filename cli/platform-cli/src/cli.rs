@@ -1451,7 +1451,11 @@ pub enum TargetCommand {
     },
     /// Remove a target. Interactive runs prompt for confirmation
     /// unless `--yes` is passed; non-interactive runs always
-    /// require `--yes` (no silent destruction).
+    /// require `--yes` (no silent destruction). A target whose
+    /// `config.yaml` or `credentials.yaml` cannot be read is removed
+    /// too, its files deleted without being read; a warning names
+    /// the file first, and the active pointer moves only to a target
+    /// that can be read.
     #[command(alias = "rm")]
     Remove {
         /// Target name to remove.

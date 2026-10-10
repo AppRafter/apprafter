@@ -135,14 +135,62 @@ test("a rename's refusals: a bad name, the same name, a taken one", async () => 
 test('removing prod-eu names the server it leaves running and repoints as Rust does', async () => {
   const view = await api.opPlanTargetRemove('prod-eu');
   expect(view.class).toBe('destructive');
-  // Rust repoints to the alphabetically first remaining target in the store, unreadable ones
-  // included (target::remove's next_default over cli_core::list_target_names).
+  // Rust repoints to the alphabetically first remaining target that can be read, passing over
+  // broken (WI-458: target::remove's next_default); its plan line is the one
+  // the_mock_store_default_moves_past_broken_to_lab asserts in apprafter-core.
+  expect(view.changes.find((c) => c.kind === 'CliDefault')).toEqual({
+    kind: 'CliDefault',
+    object: 'lab',
+    action: 'set_default',
+    detail: 'prod-eu → lab, passing over broken, which cannot be read',
+  });
   expect(result(await runPlan(view))).toMatchObject({
     name: 'prod-eu',
     orphanedServer: { serverId: 4711, serverName: 'prod-eu-1' },
-    cliDefault: { from: 'prod-eu', to: 'broken' },
+    cliDefault: { from: 'prod-eu', to: 'lab' },
+    skippedUnreadable: ['broken'],
   });
   expect((await api.targetList()).targets.map((t) => t.name)).toEqual(['lab', 'staging']);
+});
+
+test('an unreadable target is removed through the same destructive plan, naming its file', async () => {
+  const view = await api.opPlanTargetRemove('broken');
+  expect(view.class).toBe('destructive');
+  expect(view.changes).toEqual([
+    {
+      kind: 'Target',
+      object: 'broken',
+      action: 'delete',
+      detail: 'config.yaml cannot be read: expected a mapping',
+    },
+    { kind: 'Credentials', object: 'broken', action: 'delete', detail: null },
+  ]);
+  expect(result(await runPlan(view))).toEqual({
+    name: 'broken',
+    stateRemoved: false,
+    orphanedServer: null,
+    cliDefault: null,
+    skippedUnreadable: [],
+  });
+  const list = await api.targetList();
+  expect(list.unreadable).toEqual([]);
+  expect(list.targets.map((t) => t.name)).toEqual(['lab', 'prod-eu', 'staging']);
+});
+
+test('with only unreadable targets left the default is cleared, and the line says why', async () => {
+  for (const name of ['lab', 'staging']) await runPlan(await api.opPlanTargetRemove(name));
+  const view = await api.opPlanTargetRemove('prod-eu');
+  expect(view.changes.at(-1)).toEqual({
+    kind: 'CliDefault',
+    object: 'prod-eu',
+    action: 'clear_default',
+    detail: 'no readable target left: broken cannot be read',
+  });
+  expect(result(await runPlan(view))).toMatchObject({
+    cliDefault: { from: 'prod-eu', to: null },
+    skippedUnreadable: ['broken'],
+  });
+  expect((await api.targetList()).cliDefault).toEqual({ status: 'unset' });
 });
 
 test('use is reversible and moves the pointer; on the default it changes nothing', async () => {

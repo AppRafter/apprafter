@@ -648,25 +648,30 @@ pub fn load_target_config(paths: &TargetStorePaths, name: &str) -> Result<Target
 /// helpful without an extra round-trip.
 pub fn load_target(paths: &TargetStorePaths, name: &str) -> Result<Target> {
     let config = load_target_config(paths, name)?;
-
-    let creds_path = paths.target_credentials_file(name);
-    let credentials = if creds_path.exists() {
-        let bytes = fs::read(&creds_path)?;
-        serde_yaml::from_slice::<TargetCredentials>(&bytes).map_err(|err| {
-            CliError::InvalidTargetConfig {
-                path: creds_path.clone(),
-                message: credentials_parse_message(&err),
-                target: Some(name.to_string()),
-            }
-        })?
-    } else {
-        TargetCredentials::default()
-    };
-
+    let credentials = load_target_credentials(paths, name)?;
     Ok(Target {
         name: name.to_string(),
         config,
         credentials,
+    })
+}
+
+/// Read one target's `credentials.yaml` only, as [`load_target`] reads it: no file is no
+/// credentials, and a file that does not parse is `CliError::InvalidTargetConfig` whose message
+/// never quotes it (it holds the token). Whether the target exists is not checked: `target
+/// remove` reads each file of a target it cannot load on its own (WI-458).
+pub fn load_target_credentials(paths: &TargetStorePaths, name: &str) -> Result<TargetCredentials> {
+    let creds_path = paths.target_credentials_file(name);
+    if !creds_path.exists() {
+        return Ok(TargetCredentials::default());
+    }
+    let bytes = fs::read(&creds_path)?;
+    serde_yaml::from_slice::<TargetCredentials>(&bytes).map_err(|err| {
+        CliError::InvalidTargetConfig {
+            path: creds_path.clone(),
+            message: credentials_parse_message(&err),
+            target: Some(name.to_string()),
+        }
     })
 }
 

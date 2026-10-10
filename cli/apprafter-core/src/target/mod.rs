@@ -227,6 +227,10 @@ pub struct TargetRemoved {
     pub state_removed: bool,
     pub orphaned_server: Option<ProvisionedServer>,
     pub cli_default: Option<ActivePointerChange>,
+    /// The targets the CLI default passed over, alphabetically, because their files cannot be
+    /// read: it moves to the first one that can be, or is cleared when none can (WI-458).
+    /// Empty when it did not move, or passed over none.
+    pub skipped_unreadable: Vec<String>,
 }
 
 /// What `target machine` set.

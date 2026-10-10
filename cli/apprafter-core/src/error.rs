@@ -212,6 +212,9 @@ pub mod codes {
     pub const PROVIDER_UNREACHABLE: &str = "apprafter::target::provider_unreachable";
     /// A key file add and renew refuse (`ssh::check_readable`, GOTCHA-149).
     pub const SSH_KEY_NOT_PUBLIC: &str = "apprafter::target::ssh_key_not_public";
+    /// A target store file that cannot be read; `fields.target` names the target whose own file
+    /// it is (the desktop then offers to remove it, WI-458).
+    pub const INVALID_TARGET_CONFIG: &str = "apprafter::target::invalid_config";
 
     /// Every code above.
     pub const ALL: &[&str] = &[
@@ -244,6 +247,7 @@ pub mod codes {
         TOKEN_REJECTED,
         PROVIDER_UNREACHABLE,
         SSH_KEY_NOT_PUBLIC,
+        INVALID_TARGET_CONFIG,
     ];
 }
 
@@ -500,14 +504,24 @@ fn neutral_help(e: &cli_core::CliError) -> Option<String> {
             };
             format!("{what} {fix}")
         }
-        // Not "remove the target and add it again": the GUI cannot remove a target it cannot
-        // read (WI-458), and no removal repairs the store's own config.yaml (D.3d review #9).
-        C::InvalidTargetConfig { path, .. } => format!(
-            "{} could not be read as a target configuration: it was edited by hand or written \
-             by an incompatible version. Fix it by hand (it is a small YAML file), or restore it \
-             from a backup.",
-            path.display()
-        ),
+        // A target's own file: or remove the target and add it again, which works on a target
+        // that cannot be read (WI-458). No removal repairs the store's own config.yaml (D.3d
+        // review #9), so its help offers none.
+        C::InvalidTargetConfig { path, target, .. } => {
+            let fix = format!(
+                "{} could not be read as a target configuration: it was edited by hand or \
+                 written by an incompatible version. Fix it by hand (it is a small YAML file), \
+                 or restore it from a backup.",
+                path.display()
+            );
+            match target {
+                Some(name) => format!(
+                    "{fix} Otherwise remove target `{name}` and add it again, its token \
+                     included: the removal deletes both of its files."
+                ),
+                None => fix,
+            }
+        }
         C::Io(_) => "A filesystem or network error. The OS message above usually names the \
              failing path or socket: a missing directory, wrong permissions, a full disk, or a \
              closed socket."
@@ -586,9 +600,13 @@ fn project_cli(e: &cli_core::CliError, put: &mut impl FnMut(&str, serde_json::Va
             put("purpose", json!(purpose));
         }
         C::CueNotFound => put("tool", json!("cue")),
-        C::InvalidTargetConfig { path, .. } | C::InvalidState { path, .. } => {
-            put("path", json!(path.display().to_string()))
+        C::InvalidTargetConfig { path, target, .. } => {
+            put("path", json!(path.display().to_string()));
+            if let Some(name) = target {
+                put("target", json!(name));
+            }
         }
+        C::InvalidState { path, .. } => put("path", json!(path.display().to_string())),
         C::SshKeyNotPublic {
             origin,
             private_key,
@@ -1019,6 +1037,14 @@ mod tests {
             target: Some("prod".into()),
         }));
         assert_eq!(config.fields["path"], json!("/s/targets/prod/config.yaml"));
+        // WI-458: whose file it is, so the desktop offers the removal only for a target's own.
+        assert_eq!(config.fields["target"], json!("prod"));
+        let store = UiError::from(&CoreError::from(cli_core::CliError::InvalidTargetConfig {
+            path: "/s/config.yaml".into(),
+            message: "m".into(),
+            target: None,
+        }));
+        assert_eq!(store.fields.get("target"), None);
         assert_eq!(
             UiError::from(&CoreError::from(cli_core::CliError::CueNotFound)).fields["tool"],
             json!("cue")
@@ -1244,6 +1270,14 @@ mod tests {
                 },
                 codes::SSH_KEY_NOT_PUBLIC,
             ),
+            (
+                C::InvalidTargetConfig {
+                    path: "/s/targets/prod/config.yaml".into(),
+                    message: "m".into(),
+                    target: Some("prod".into()),
+                },
+                codes::INVALID_TARGET_CONFIG,
+            ),
         ] {
             assert_eq!(miette::Diagnostic::code(&e).unwrap().to_string(), code);
         }
@@ -1373,7 +1407,7 @@ mod tests {
             codes::STATE_CORRUPT,
             codes::BACKUP_JOB_ACTIVE,
             codes::SSH_KEY_NOT_PUBLIC,
-            "apprafter::target::invalid_config",
+            codes::INVALID_TARGET_CONFIG,
             "apprafter::io::error",
         ] {
             assert!(helped.contains(code), "{code} has no neutral help");
@@ -1488,11 +1522,12 @@ mod tests {
         }
     }
 
-    /// D.3d review #9: the GUI cannot remove a target it cannot read (WI-458), and removing a
-    /// target never repairs the store's own `config.yaml`: the help names the file and says to
-    /// fix it by hand or restore it.
+    /// A target's own file is fixed by hand, restored, or — WI-458: a target that cannot be read
+    /// is removed like any other — the target is removed and added again; the help names the
+    /// file. Removing a target never repairs the store's own `config.yaml` (D.3d review #9), so
+    /// its help offers no removal.
     #[test]
-    fn an_unreadable_target_file_is_fixed_by_hand_or_restored() {
+    fn an_unreadable_target_file_is_fixed_restored_or_removed_and_added_again() {
         let ui = UiError::from(&CoreError::Cli(cli_core::CliError::InvalidTargetConfig {
             path: "/s/targets/prod/credentials.yaml".into(),
             message: "not a valid target credentials map (line 1, column 1)".into(),
@@ -1502,6 +1537,20 @@ mod tests {
         assert!(help.contains("/s/targets/prod/credentials.yaml"), "{help}");
         assert!(
             help.contains("by hand") && help.contains("restore"),
+            "{help}"
+        );
+        assert!(
+            help.contains("remove target `prod`") && help.contains("add it again"),
+            "{help}"
+        );
+        let store = UiError::from(&CoreError::Cli(cli_core::CliError::InvalidTargetConfig {
+            path: "/s/config.yaml".into(),
+            message: "missing field `version`".into(),
+            target: None,
+        }));
+        let help = store.help.unwrap();
+        assert!(
+            help.contains("/s/config.yaml") && help.contains("restore"),
             "{help}"
         );
         assert!(

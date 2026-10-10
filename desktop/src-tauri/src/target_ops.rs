@@ -805,6 +805,42 @@ mod tests {
         assert!(!s.shell.context.store().target_dir("prod").exists());
     }
 
+    /// WI-458: the Targets page's unreadable card removes through the same plan: Destructive,
+    /// its lines naming the file that cannot be read, the owner asked inside `op_execute`; the
+    /// default moves past it to a target that can be read.
+    #[test]
+    fn an_unreadable_target_is_removed_through_the_same_destructive_plan() {
+        let s = store(&["broken", "lab", "prod"], Some("prod"));
+        let store = s.shell.context.store();
+        std::fs::write(store.target_config_file("broken"), "provider: [").unwrap();
+        let view = plan_target_remove(&s.shell, "broken").unwrap();
+        assert_eq!(view.class, PlanClass::Destructive);
+        let target = view.changes.iter().find(|c| c.kind == "Target").unwrap();
+        assert!(
+            target
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.starts_with("config.yaml cannot be read: ")),
+            "{target:?}"
+        );
+        let out = run(&s.shell, &view);
+        assert_eq!(out["name"], "broken");
+        assert_eq!(
+            s.auth.asked(),
+            vec![AuthPurpose::Confirm {
+                target: Some("broken".into()),
+                verb: "remove".into()
+            }]
+        );
+        assert!(!store.target_dir("broken").exists());
+        // The default (prod) going next passes over nothing now; with broken back, it would.
+        std::fs::create_dir_all(store.target_dir("broken")).unwrap();
+        let view = plan_target_remove(&s.shell, "prod").unwrap();
+        let out = run(&s.shell, &view);
+        assert_eq!(out["cliDefault"], json!({ "from": "prod", "to": "lab" }));
+        assert_eq!(out["skippedUnreadable"], json!(["broken"]));
+    }
+
     #[test]
     fn machine_on_a_provisioned_target_is_refused_before_any_plan() {
         let s = store(&["prod"], None);

@@ -6,4 +6,10 @@ import type { ProvisionedServer } from "./ProvisionedServer";
 /**
  * What `target remove` did; `orphaned_server` keeps running at the provider.
  */
-export type TargetRemoved = { name: string, stateRemoved: boolean, orphanedServer: ProvisionedServer | null, cliDefault: ActivePointerChange | null, };
+export type TargetRemoved = { name: string, stateRemoved: boolean, orphanedServer: ProvisionedServer | null, cliDefault: ActivePointerChange | null, 
+/**
+ * The targets the CLI default passed over, alphabetically, because their files cannot be
+ * read: it moves to the first one that can be, or is cleared when none can (WI-458).
+ * Empty when it did not move, or passed over none.
+ */
+skippedUnreadable: Array<string>, };

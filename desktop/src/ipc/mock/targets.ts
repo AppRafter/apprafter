@@ -147,6 +147,19 @@ const change = (
   detail: string | null = null,
 ): PlannedChange => ({ kind, object, action, detail });
 
+/**
+ * What Rust's remove plan says of an unreadable target's two files (target::remove's
+ * TargetFiles): the file its error names, and why — the message after Rust's `target config at
+ * <path>: `. The mock knows one error per target, so the other file reads.
+ */
+function unreadableFiles(target: UnreadableTarget) {
+  const path = String(target.error.fields.path ?? '');
+  const reason = target.error.message.replace(`target config at ${path}: `, '');
+  const line = (file: string) =>
+    path.endsWith(`/${file}`) ? `${file} cannot be read: ${reason}` : null;
+  return { config: line('config.yaml'), credentials: line('credentials.yaml') };
+}
+
 const stage = (index: number, total: number, title: string): OpEvent => ({
   kind: 'stage',
   index,
@@ -338,8 +351,53 @@ export function targetHandlers(ops: MockOps, store: MockStore): Record<string, H
     return { identity, cliDefault };
   };
 
-  /** The default moves off `name` (removed): to the first other name, or nowhere. */
-  const nextDefault = (name: string) => namesIn(store).find((other) => other !== name) ?? null;
+  /**
+   * Where the default goes off `name` (removed), as Rust's target::remove next_default: the
+   * alphabetically first other target that can be read, passing over those that cannot; or
+   * nowhere.
+   */
+  const nextDefault = (name: string): { to: string | null; skipped: string[] } => {
+    const skipped: string[] = [];
+    for (const other of namesIn(store)) {
+      if (other === name) continue;
+      if (store.reports.has(other)) return { to: other, skipped };
+      skipped.push(other);
+    }
+    return { to: null, skipped };
+  };
+
+  /** The plan's CliDefault line for removing the default `name`, worded as Rust words it. */
+  const defaultLine = (name: string): PlannedChange => {
+    const { to, skipped } = nextDefault(name);
+    const passed = skipped.join(', ');
+    if (to === null) {
+      return change(
+        'CliDefault',
+        name,
+        'clear_default',
+        skipped.length === 0 ? null : `no readable target left: ${passed} cannot be read`,
+      );
+    }
+    return change(
+      'CliDefault',
+      to,
+      'set_default',
+      skipped.length === 0
+        ? `${name} → ${to}`
+        : `${name} → ${to}, passing over ${passed}, which cannot be read`,
+    );
+  };
+
+  /** Removing `name` moves the default when it named it; what the outcome reports of that. */
+  const moveDefault = (name: string) => {
+    if (store.cliDefault !== name) return { cliDefault: null, skippedUnreadable: [] };
+    const { to, skipped } = nextDefault(name);
+    store.cliDefault = to;
+    return {
+      cliDefault: { from: name, to } satisfies ActivePointerChange,
+      skippedUnreadable: skipped,
+    };
+  };
 
   return {
     target_list: (): TargetListReport => ({
@@ -678,9 +736,40 @@ export function targetHandlers(ops: MockOps, store: MockStore): Record<string, H
 
     op_plan_target_remove: refusing((args) => {
       const { name } = args as { name: string };
+      const unreadable = store.unreadable.find((target) => target.name === name);
+      if (unreadable !== undefined) {
+        // Rust plans it too (WI-458): the lines name the file it cannot read. The mock keeps no
+        // state for such a target, so it has no LocalState line.
+        const files = unreadableFiles(unreadable);
+        return ops.registerPlan(
+          {
+            class: 'destructive',
+            title: `Remove target ${name} from this computer`,
+            changes: [
+              change('Target', name, 'delete', files.config),
+              change('Credentials', name, 'delete', files.credentials),
+              ...(store.cliDefault === name ? [defaultLine(name)] : []),
+            ],
+            target: name,
+          },
+          {
+            end: () => {
+              if (!store.unreadable.some((target) => target.name === name)) {
+                return { error: notFound(store, name) };
+              }
+              store.unreadable = store.unreadable.filter((target) => target.name !== name);
+              return result({
+                name,
+                stateRemoved: false,
+                orphanedServer: null,
+                ...moveDefault(name),
+              } satisfies TargetRemoved);
+            },
+          },
+        );
+      }
       const report = named(name);
       const server = provisionedServer(report);
-      const next = nextDefault(name);
       const changes = [
         change('Target', name, 'delete'),
         change('Credentials', name, 'delete'),
@@ -694,13 +783,7 @@ export function targetHandlers(ops: MockOps, store: MockStore): Record<string, H
                 `records server ${server.serverName} (id ${server.serverId}); the server keeps running at the provider`,
               ),
             ]),
-        ...(store.cliDefault === name
-          ? [
-              next === null
-                ? change('CliDefault', name, 'clear_default')
-                : change('CliDefault', next, 'set_default', `${name} → ${next}`),
-            ]
-          : []),
+        ...(store.cliDefault === name ? [defaultLine(name)] : []),
       ];
       return ops.registerPlan(
         {
@@ -715,17 +798,11 @@ export function targetHandlers(ops: MockOps, store: MockStore): Record<string, H
             if (current === undefined) return { error: notFound(store, name) };
             store.reports.delete(name);
             const orphanedServer = provisionedServer(current);
-            let cliDefault: ActivePointerChange | null = null;
-            if (store.cliDefault === name) {
-              const to = nextDefault(name);
-              store.cliDefault = to;
-              cliDefault = { from: name, to };
-            }
             return result({
               name,
               stateRemoved: orphanedServer !== null,
               orphanedServer,
-              cliDefault,
+              ...moveDefault(name),
             } satisfies TargetRemoved);
           },
         },

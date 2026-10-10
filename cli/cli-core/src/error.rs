@@ -146,24 +146,21 @@ fn server_type_help(
 }
 
 /// `InvalidTargetConfig`'s help: the file, and the fixes that repair it. A target's own file
-/// (`target`) can also be re-created by adding the target again, its directory deleted first
-/// (`target remove` refuses a target it cannot read); the store's own `config.yaml` belongs to no
-/// target, so no removal or re-add repairs it — it records only the default target, which
-/// `target use` writes again once it is deleted (D.3d follow-up).
+/// (`target`) can also be re-created by removing the target and adding it again (`target remove`
+/// takes a target it cannot read, WI-458); the store's own `config.yaml` belongs to no target,
+/// so no removal or re-add repairs it — it records only the default target, which `target use`
+/// writes again once it is deleted (D.3d follow-up).
 fn invalid_config_help(path: &Path, target: Option<&str>) -> String {
     let file = path.display();
     let why = "it was edited by hand or written by an incompatible CLI version. Fix it by hand \
                (it is a small YAML file), or restore it from a backup.";
     match target {
-        Some(name) => {
-            let dir = path.parent().unwrap_or(path).display();
-            format!(
-                "{file} could not be read as target `{name}`'s configuration: {why} Otherwise \
-                 delete the target's directory, {dir}, and add the target again with \
-                 `apprafter target add {name} --provider hetzner-cloud …` (its token too: the \
-                 directory holds both its files)."
-            )
-        }
+        Some(name) => format!(
+            "{file} could not be read as target `{name}`'s configuration: {why} Otherwise \
+             remove the target with `apprafter target remove {name}`, which takes a target it \
+             cannot read, and add it again with `apprafter target add {name} --provider \
+             hetzner-cloud …` (its token too: the removal deletes both of its files)."
+        ),
         None => format!(
             "{file} could not be read as the target store's configuration: {why} It records \
              only which target is the default, so deleting it and choosing the default again \
@@ -592,10 +589,10 @@ pub enum CliError {
         help(
             "YAML decode/encode error — most often raised by a target store file under \
              `$XDG_CONFIG_HOME/apprafter/`. Fix the YAML by hand (target store files are \
-             small), or delete that target's directory under \
-             `$XDG_CONFIG_HOME/apprafter/targets/<name>/` and add it again with `apprafter \
-             target add <name> --provider hetzner-cloud …`. `target add --force` cannot \
-             rewrite it: it keeps the stored values, so it needs a readable config."
+             small), or remove that target with `apprafter target remove <name>`, which takes \
+             a target it cannot read, and add it again with `apprafter target add <name> \
+             --provider hetzner-cloud …`. `target add --force` cannot rewrite it: it keeps the \
+             stored values, so it needs a readable config."
         )
     )]
     Yaml(#[from] serde_yaml::Error),
@@ -777,9 +774,8 @@ mod tests {
     }
 
     /// D.3d follow-up: a target's own file names the file, says to fix it by hand or restore
-    /// it, and — the directory holding only that target — offers its re-creation, by the
-    /// directory the file is in (an `APPRAFTER_CONFIG_DIR` store is not under
-    /// `$XDG_CONFIG_HOME`).
+    /// it, and offers the target's re-creation: since WI-458 `target remove` takes a target it
+    /// cannot read, so the help names that, never deleting a directory by hand.
     #[test]
     fn an_unreadable_target_file_names_it_and_offers_re_adding_that_target() {
         let dir = PathBuf::from("/s/targets/prod");
@@ -799,12 +795,14 @@ mod tests {
                 help.contains("by hand") && help.contains("restore"),
                 "{help}"
             );
-            assert!(help.contains(&dir.display().to_string()), "{help}");
+            assert!(help.contains("`apprafter target remove prod`"), "{help}");
             assert!(
                 help.contains("`apprafter target add prod --provider hetzner-cloud …`"),
                 "{help}"
             );
-            assert!(!help.contains("$XDG_CONFIG_HOME"), "{help}");
+            for not_this in ["$XDG_CONFIG_HOME", "directory"] {
+                assert!(!help.contains(not_this), "{not_this}: {help}");
+            }
         }
     }
 
@@ -870,7 +868,8 @@ mod tests {
     }
 
     /// Bug 8: `--force` now keeps the stored values, so it refuses an unreadable target (it
-    /// always did since it read both files) and cannot be the way to rewrite one.
+    /// always did since it read both files) and cannot be the way to rewrite one. WI-458:
+    /// `target remove` can, so the help names it rather than deleting a directory by hand.
     #[test]
     fn yaml_help_never_sends_the_reader_to_force() {
         let err = CliError::from(serde_yaml::from_str::<u8>("[").unwrap_err());
@@ -878,7 +877,8 @@ mod tests {
         let help = help_of(&err);
         assert!(!help.contains("<name> --force"), "{help}");
         assert!(help.contains("by hand"), "{help}");
-        assert!(help.contains("targets/<name>/"), "{help}");
+        assert!(help.contains("`apprafter target remove <name>`"), "{help}");
+        assert!(!help.contains("directory"), "{help}");
     }
 
     #[test]

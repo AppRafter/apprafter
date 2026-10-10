@@ -16,6 +16,7 @@ export const CORE_ERROR_CODES = {
   SECRETS_AGE_KEY_MISSING: 'apprafter::secrets::age_key_missing',
   STATE_CORRUPT: 'apprafter::state::corrupt',
   TARGET_EXISTS: 'apprafter::target::exists',
+  TARGET_INVALID_CONFIG: 'apprafter::target::invalid_config',
   TARGET_INVALID_NAME: 'apprafter::target::invalid_name',
   TARGET_INVALID_TOKEN: 'apprafter::target::invalid_token',
   TARGET_NOT_FOUND: 'apprafter::target::not_found',
