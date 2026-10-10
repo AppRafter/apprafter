@@ -290,10 +290,16 @@ encode/decode error on `state.json` (JSON) /
 **Fix.** The captured OS message names the failing path or
 socket. Common cases: missing directory, wrong permissions
 (`chmod 0600` on credentials), full disk. For decode failures on
-target-store files, fix the YAML by hand (they are small files),
-or remove that target with `apprafter target remove <name>`, which
-takes a target it cannot read, and add it again with
-`apprafter target add`. `target add --force` cannot rewrite such a
+target-store files, fix the YAML by hand (they are small files), or
+restore the file from a backup. Otherwise remove that target with
+`apprafter target remove <name>`, which takes a target it cannot
+read, and add it again with `apprafter target add`. The removal
+also deletes the target's local state: the record of its server,
+the cached kubeconfig and the Argo CD password. If a server is
+recorded, fix or restore the file first. After adding the target
+again, `apprafter import --target <name>` rebuilds the record from
+the provider; the kubeconfig and the Argo CD password are fetched
+again on first use. `target add --force` cannot rewrite such a
 target: it keeps the stored values, so it needs a readable config.
 
 ### `apprafter::backup::job_active`

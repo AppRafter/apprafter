@@ -1007,8 +1007,9 @@ mod tests {
     fn the_force_texts_name_commands_that_exist() {
         let yaml = CliError::from(serde_yaml::from_str::<u8>("[").unwrap_err());
         let help = miette::Diagnostic::help(&yaml).unwrap().to_string();
-        // `target remove <name>` (WI-458), then `target add <name> …`.
-        assert_eq!(assert_commands_parse(&help), 2, "{help}");
+        // `target remove <name>` (WI-458), then `target add <name> …`, then `import --target
+        // <name>`, which rebuilds the state the removal deletes (WI-458 review #0/#2).
+        assert_eq!(assert_commands_parse(&help), 3, "{help}");
         let cli = <crate::cli::Cli as clap::CommandFactory>::command();
         let force_doc = cli
             .find_subcommand("target")
@@ -1405,8 +1406,8 @@ mod tests {
     }
 
     /// The help for a target file that cannot be read, and for a YAML error, sends the reader to
-    /// commands that exist: `target remove` (WI-458), then `target add`; a target's own file also
-    /// `import --target`, which rebuilds the state the removal deletes (WI-458 review #0/#2).
+    /// commands that exist: `target remove` (WI-458), then `target add`, then `import --target`,
+    /// which rebuilds the state the removal deletes (WI-458 review #0/#2).
     #[test]
     fn the_unreadable_target_helps_name_commands_that_exist() {
         let config = CliError::InvalidTargetConfig {
@@ -1415,7 +1416,7 @@ mod tests {
             target: Some("prod".into()),
         };
         let yaml = CliError::from(serde_yaml::from_str::<u8>("[").unwrap_err());
-        for (e, commands) in [(config, 3), (yaml, 2)] {
+        for (e, commands) in [(config, 3), (yaml, 3)] {
             let h = miette::Diagnostic::help(&e).unwrap().to_string();
             assert!(h.contains("target remove"), "{h}");
             assert_eq!(assert_commands_parse(&h), commands, "{h}");

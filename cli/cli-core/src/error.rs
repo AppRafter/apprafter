@@ -603,17 +603,24 @@ pub enum CliError {
     )]
     Json(#[from] serde_json::Error),
 
-    /// YAML encode/decode error (target store files use YAML).
+    /// YAML encode/decode error (target store files use YAML). The removal it offers deletes
+    /// the target's local state too, so the help says so as `invalid_config`'s does (WI-458
+    /// review #0/#2).
     #[error("yaml error: {0}")]
     #[diagnostic(
         code(apprafter::io::yaml),
         help(
             "YAML decode/encode error — most often raised by a target store file under \
              `$XDG_CONFIG_HOME/apprafter/`. Fix the YAML by hand (target store files are \
-             small), or remove that target with `apprafter target remove <name>`, which takes \
-             a target it cannot read, and add it again with `apprafter target add <name> \
-             --provider hetzner-cloud …`. `target add --force` cannot rewrite it: it keeps the \
-             stored values, so it needs a readable config."
+             small), or restore it from a backup. Otherwise remove that target with \
+             `apprafter target remove <name>`, which takes a target it cannot read, and add it \
+             again with `apprafter target add <name> --provider hetzner-cloud …`. The removal \
+             also deletes the target's local state: the record of its server, the cached \
+             kubeconfig and the Argo CD password. If a server is recorded, fix or restore the \
+             file first. After adding the target again, `apprafter import --target <name>` \
+             rebuilds the record from the provider; the kubeconfig and the password are \
+             fetched again on first use. `target add --force` cannot rewrite such a target: \
+             it keeps the stored values, so it needs a readable config."
         )
     )]
     Yaml(#[from] serde_yaml::Error),
@@ -924,16 +931,31 @@ mod tests {
 
     /// Bug 8: `--force` now keeps the stored values, so it refuses an unreadable target (it
     /// always did since it read both files) and cannot be the way to rewrite one. WI-458:
-    /// `target remove` can, so the help names it rather than deleting a directory by hand.
+    /// `target remove` can, so the help names it rather than deleting a directory by hand, and
+    /// says what `invalid_config`'s help says of that removal: it deletes the target's local
+    /// state too, the only local record of its server (review #0/#2).
     #[test]
     fn yaml_help_never_sends_the_reader_to_force() {
         let err = CliError::from(serde_yaml::from_str::<u8>("[").unwrap_err());
         assert_eq!(code_of(&err), "apprafter::io::yaml");
         let help = help_of(&err);
         assert!(!help.contains("<name> --force"), "{help}");
-        assert!(help.contains("by hand"), "{help}");
+        assert!(
+            help.contains("by hand") && help.contains("restore it from a backup"),
+            "{help}"
+        );
         assert!(help.contains("`apprafter target remove <name>`"), "{help}");
         assert!(!help.contains("directory"), "{help}");
+        for says in [
+            "local state",
+            "record of its server",
+            "cached kubeconfig",
+            "Argo CD password",
+            "If a server is recorded, fix or restore the file first",
+            "`apprafter import --target <name>`",
+        ] {
+            assert!(help.contains(says), "{says}: {help}");
+        }
     }
 
     #[test]
