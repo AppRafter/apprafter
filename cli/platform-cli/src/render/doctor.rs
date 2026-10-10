@@ -138,6 +138,21 @@ pub(crate) fn hint(c: &Check) -> Option<String> {
             "file does not exist; the path stored in target config may be stale — point it at \
              an existing key with `apprafter target add {target} --renew --ssh-key <path>`"
         ),
+        // GOTCHA-149: `apply` sends the key file to the provider as is, so it refuses this one.
+        CheckFix::SshKeyNotPublic {
+            target,
+            private_key: true,
+            ..
+        } => format!(
+            "this is a private key, which `apply` never sends to the provider — point the \
+             target at its public half, the `.pub` file next to it, with `apprafter target add \
+             {target} --renew --ssh-key <path>`"
+        ),
+        CheckFix::SshKeyNotPublic { target, .. } => format!(
+            "not an OpenSSH public key (one line: `<type> <base64> [comment]`), so `apply` \
+             refuses to send it — point the target at a public key with `apprafter target add \
+             {target} --renew --ssh-key <path>`"
+        ),
         // The tool's own row: what it is needed for and how to install it. A detail means the
         // resolver found something it cannot run (a `.cmd` shim on Windows).
         CheckFix::InstallTool { tool } if c.id == CheckId::Tool => {
@@ -471,6 +486,26 @@ mod tests {
                 "file does not exist; the path stored in target config may be stale — point it \
                  at an existing key with `apprafter target add p --renew --ssh-key <path>`",
             ),
+            (
+                CheckFix::SshKeyNotPublic {
+                    target: "p".into(),
+                    path: "/k".into(),
+                    private_key: true,
+                },
+                "this is a private key, which `apply` never sends to the provider — point the \
+                 target at its public half, the `.pub` file next to it, with `apprafter target \
+                 add p --renew --ssh-key <path>`",
+            ),
+            (
+                CheckFix::SshKeyNotPublic {
+                    target: "p".into(),
+                    path: "/k".into(),
+                    private_key: false,
+                },
+                "not an OpenSSH public key (one line: `<type> <base64> [comment]`), so `apply` \
+                 refuses to send it — point the target at a public key with `apprafter target \
+                 add p --renew --ssh-key <path>`",
+            ),
             (CheckFix::Explain { text: "as is".into() }, "as is"),
         ];
         for (fix, want) in cases {
@@ -498,6 +533,16 @@ mod tests {
             CheckFix::SshKeyMissing {
                 target: "prod".into(),
                 path: "/k".into(),
+            },
+            CheckFix::SshKeyNotPublic {
+                target: "prod".into(),
+                path: "/k".into(),
+                private_key: true,
+            },
+            CheckFix::SshKeyNotPublic {
+                target: "prod".into(),
+                path: "/k".into(),
+                private_key: false,
             },
         ] {
             let c = check(CheckId::SshKey, CheckStatus::Warn, "t", None, Some(fix));

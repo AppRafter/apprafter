@@ -69,6 +69,34 @@ test('the values that can be cut short in a narrow card carry their whole text a
   expect(titleOf('Credentials file')).toBe('~/.config/apprafter/targets/prod-eu/credentials.yaml');
 });
 
+test('a stored key file the core reads no public key in says so, with no type (GOTCHA-149)', () => {
+  for (const [problem, said] of [
+    ['private_key', '~/.ssh/id_ed25519 (a private key: not used)'],
+    ['not_public_key', '~/.ssh/id_ed25519 (not a public key)'],
+    ['unreadable', '~/.ssh/id_ed25519 (cannot be read)'],
+  ] as const) {
+    const { unmount } = render(
+      <TargetDetails
+        report={targetReport({
+          sshKey: {
+            path: '/home/alex/.ssh/id_ed25519',
+            display: '~/.ssh/id_ed25519',
+            exists: true,
+            algo: null,
+            problem,
+          },
+        })}
+        os="linux"
+        secretBackend="file"
+        actions={noop()}
+        onChangeMachine={null}
+      />,
+    );
+    expect(row('SSH key').textContent).toContain(said);
+    unmount();
+  }
+});
+
 test('what is not stored reads "not set"; a key file that went is "missing"', () => {
   const report = targetReport({
     region: null,
@@ -81,6 +109,7 @@ test('what is not stored reads "not set"; a key file that went is "missing"', ()
       display: '~/.ssh/gone.pub',
       exists: false,
       algo: null,
+      problem: 'missing',
     },
   });
   render(

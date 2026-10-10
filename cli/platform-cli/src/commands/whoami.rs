@@ -100,16 +100,21 @@ pub(crate) fn verification_text(v: &Verification) -> String {
 
 /// `~/.ssh/...` instead of an absolute path when the key lives under the home directory, plus a
 /// `(loaded)` / `(missing!)` marker so a stale config (a deleted key file still referenced in
-/// `config.yaml`) shows at a glance; `not set` for no key.
+/// `config.yaml`) shows at a glance; `not set` for no key. A file `apply` would refuse to send
+/// says so (GOTCHA-149): `(private key!)`, `(not a public key!)`, `(unreadable!)`.
 pub(crate) fn ssh_line(k: Option<&SshKeyInfo>) -> String {
+    use apprafter_core::ssh::SshKeyProblem;
     k.map_or_else(
         || "not set".into(),
         |k| {
-            format!(
-                "{} ({})",
-                k.display,
-                if k.exists { "loaded" } else { "missing!" }
-            )
+            let state = match k.problem {
+                None => "loaded",
+                Some(SshKeyProblem::Missing) => "missing!",
+                Some(SshKeyProblem::Unreadable) => "unreadable!",
+                Some(SshKeyProblem::PrivateKey) => "private key!",
+                Some(SshKeyProblem::NotPublicKey) => "not a public key!",
+            };
+            format!("{} ({state})", k.display)
         },
     )
 }
@@ -160,18 +165,36 @@ mod tests {
     }
 
     #[test]
-    fn the_ssh_line_marks_a_missing_key() {
+    fn the_ssh_line_marks_a_missing_key_and_one_apply_would_refuse() {
+        use apprafter_core::ssh::SshKeyProblem;
         let k = SshKeyInfo {
             path: "/h/.ssh/k.pub".into(),
             display: "~/.ssh/k.pub".into(),
             exists: false,
             algo: None,
+            problem: Some(SshKeyProblem::Missing),
         };
         assert_eq!(ssh_line(Some(&k)), "~/.ssh/k.pub (missing!)");
+        let found = |algo: Option<&str>, problem| SshKeyInfo {
+            exists: true,
+            algo: algo.map(String::from),
+            problem,
+            ..k.clone()
+        };
         assert_eq!(
-            ssh_line(Some(&SshKeyInfo { exists: true, ..k })),
+            ssh_line(Some(&found(Some("ssh-ed25519"), None))),
             "~/.ssh/k.pub (loaded)"
         );
+        for (problem, state) in [
+            (SshKeyProblem::Unreadable, "unreadable!"),
+            (SshKeyProblem::PrivateKey, "private key!"),
+            (SshKeyProblem::NotPublicKey, "not a public key!"),
+        ] {
+            assert_eq!(
+                ssh_line(Some(&found(None, Some(problem)))),
+                format!("~/.ssh/k.pub ({state})")
+            );
+        }
         assert_eq!(ssh_line(None), "not set");
     }
 

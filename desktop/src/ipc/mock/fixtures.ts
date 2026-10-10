@@ -6,6 +6,7 @@
 import type { DoctorReport } from '../generated/DoctorReport';
 import type { MachineCatalogue } from '../generated/MachineCatalogue';
 import type { SshKeyCandidate } from '../generated/SshKeyCandidate';
+import type { SshKeyInfo } from '../generated/SshKeyInfo';
 import type { TargetReport } from '../generated/TargetReport';
 import type { ToolchainReport } from '../generated/ToolchainReport';
 import type { UnreadableTarget } from '../generated/UnreadableTarget';
@@ -41,6 +42,7 @@ export const MOCK_REPORTS: readonly TargetReport[] = [
       display: '~/.ssh/id_ed25519.pub',
       exists: true,
       algo: 'ssh-ed25519',
+      problem: null,
     },
     token: { set: true, chars: 64 },
     ...targetFiles('prod-eu'),
@@ -63,6 +65,7 @@ export const MOCK_REPORTS: readonly TargetReport[] = [
       display: '~/.ssh/id_ed25519.pub',
       exists: true,
       algo: 'ssh-ed25519',
+      problem: null,
     },
     token: { set: true, chars: 64 },
     ...targetFiles('staging'),
@@ -82,6 +85,7 @@ export const MOCK_REPORTS: readonly TargetReport[] = [
       display: '~/.ssh/lab.pub',
       exists: false,
       algo: null,
+      problem: 'missing',
     },
     token: { set: true, chars: 64 },
     ...targetFiles('lab'),
@@ -103,13 +107,43 @@ export const MOCK_UNREADABLE: readonly UnreadableTarget[] = [
   },
 ];
 
-/** The public keys the key picker finds under `~/.ssh`. */
+/**
+ * Files under the demo's home that are not public keys, as `ssh_key_inspect` reads them: the
+ * private half of id_ed25519 (one dropped `.pub` away from it), and a note.
+ */
+export const MOCK_NOT_KEYS: readonly SshKeyInfo[] = [
+  {
+    path: `${HOME}/.ssh/id_ed25519`,
+    display: '~/.ssh/id_ed25519',
+    exists: true,
+    algo: null,
+    problem: 'private_key',
+  },
+  {
+    path: `${HOME}/notes.txt`,
+    display: '~/notes.txt',
+    exists: true,
+    algo: null,
+    problem: 'not_public_key',
+  },
+];
+
+/**
+ * The `.pub` files the key picker finds under `~/.ssh`, by path: two public keys, and old.pub,
+ * which holds none (the core names no type for it).
+ */
 export const MOCK_SSH_KEYS: readonly SshKeyCandidate[] = [
   {
     path: `${HOME}/.ssh/id_ed25519.pub`,
     display: '~/.ssh/id_ed25519.pub',
     algo: 'ssh-ed25519',
     comment: 'alex@workstation',
+  },
+  {
+    path: `${HOME}/.ssh/old.pub`,
+    display: '~/.ssh/old.pub',
+    algo: null,
+    comment: null,
   },
   {
     path: `${HOME}/.ssh/work.pub`,
@@ -276,6 +310,7 @@ export const MOCK_WHOAMI: WhoamiReport = {
         display: '~/.ssh/id_ed25519.pub',
         exists: true,
         algo: 'ssh-ed25519',
+        problem: null,
       },
     },
   },

@@ -12,6 +12,7 @@ pub mod paths;
 pub mod quantity;
 pub mod resolve;
 pub mod secrets;
+pub mod ssh_key;
 pub mod style;
 pub mod target;
 pub mod tier;

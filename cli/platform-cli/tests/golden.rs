@@ -1505,6 +1505,99 @@ fn target_renew_without_a_token_or_a_key() {
     );
 }
 
+/// A private key as `ssh-keygen` writes it next to the `.pub` (OpenSSH's PEM format); the
+/// body is a placeholder.
+const PRIVATE_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQ==\n-----END OPENSSH PRIVATE KEY-----\n";
+/// The private key's body, letters and digits only (`assert_steps_never_print` searches so).
+const PRIVATE_KEY_BODY: &str = "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQ";
+
+/// `body` at `<sandbox>/home/<name>`.
+fn key_file(sb: &Sandbox, name: &str, body: &str) -> String {
+    let p = sb.path(&format!("home/{name}"));
+    fs::write(&p, body).expect("key file");
+    p.display().to_string()
+}
+
+/// GOTCHA-149: `--ssh-key` names the file `apply` sends the provider as the target's key, so a
+/// private key (the file next to the `.pub`, one dropped suffix away) is refused by name, its
+/// text never shown, and nothing is saved.
+#[test]
+fn target_add_refuses_a_private_key_as_the_ssh_key() {
+    let sb = Sandbox::new();
+    let key = key_file(&sb, "id_ed25519", PRIVATE_KEY);
+    let steps: &[&[&str]] = &[&[
+        "target",
+        "add",
+        "prod",
+        "--provider",
+        "hetzner-cloud",
+        "--token",
+        TOKEN_A,
+        "--ssh-key",
+        &key,
+        "--no-ping",
+        "--no-interactive",
+    ]];
+    sb.assert_steps_never_print(steps, PRIVATE_KEY_BODY);
+    sb.golden_with_files(
+        "target/add_ssh_key_private",
+        steps,
+        &["targets/prod/config.yaml"],
+    );
+}
+
+/// The same for a key-only renewal onto an RSA private key in the classic PEM format: the stored
+/// key stays.
+#[test]
+fn target_renew_refuses_a_pem_private_key_as_the_ssh_key() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    let key = key_file(
+        &sb,
+        "id_rsa",
+        "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAgoldenplaceholder\n-----END RSA PRIVATE KEY-----\n",
+    );
+    let steps: &[&[&str]] = &[&[
+        "target",
+        "add",
+        "prod",
+        "--renew",
+        "--ssh-key",
+        &key,
+        "--no-interactive",
+    ]];
+    sb.assert_steps_never_print(steps, "MIIEowIBAAKCAQEAgoldenplaceholder");
+    sb.golden_with_files(
+        "target/renew_ssh_key_pem",
+        steps,
+        &["targets/prod/config.yaml"],
+    );
+}
+
+/// A file that is not an OpenSSH public key line at all is refused too.
+#[test]
+fn target_add_refuses_a_file_that_is_not_a_public_key() {
+    let sb = Sandbox::new();
+    let key = key_file(&sb, "notes.pub", "not-a-key\n");
+    sb.golden_with_files(
+        "target/add_ssh_key_not_public",
+        &[&[
+            "target",
+            "add",
+            "prod",
+            "--provider",
+            "hetzner-cloud",
+            "--token",
+            TOKEN_A,
+            "--ssh-key",
+            &key,
+            "--no-ping",
+            "--no-interactive",
+        ]],
+        &["targets/prod/config.yaml"],
+    );
+}
+
 #[test]
 fn target_rename_to_an_existing_name() {
     let sb = Sandbox::new();

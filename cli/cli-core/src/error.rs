@@ -563,6 +563,32 @@ pub enum CliError {
     #[diagnostic(code(apprafter::cli::usage_refused), help("{help}"))]
     UsageRefused { message: String, help: String },
 
+    /// A target's SSH key — the file at a path given or stored, `APPRAFTER_SSH_PUBLIC_KEY`, or
+    /// a manifest's `sshKeys` entry — is not one OpenSSH public key line (GOTCHA-149). Refused
+    /// before a path is saved and before anything is sent to the provider: the private key sits
+    /// next to its `.pub`, one dropped suffix away, and would otherwise leave the machine.
+    /// `origin` names the key as shown (`crate::ssh_key::file_origin` for a file).
+    #[error(
+        "{origin} is {}",
+        if *private_key {
+            "a private key: AppRafter never sends a private key to the provider"
+        } else {
+            "not an OpenSSH public key"
+        }
+    )]
+    #[diagnostic(
+        code(apprafter::target::ssh_key_not_public),
+        help(
+            "AppRafter sends a target's SSH key to the provider, so it takes one OpenSSH public \
+             key line, `<type> <base64> [comment]`, of type ssh-ed25519, ssh-rsa, an ecdsa-sha2 \
+             curve, or a security-key (sk-) type. A private key's public half is the `.pub` \
+             file next to it (`ssh-keygen -y -f <private key>` prints it again). Point the \
+             target at it with `apprafter target add <name> --renew --ssh-key <path>.pub`, or \
+             set `APPRAFTER_SSH_PUBLIC_KEY` to that line. Nothing was saved or sent."
+        )
+    )]
+    SshKeyNotPublic { origin: String, private_key: bool },
+
     /// Catch-all, free-form message. New call sites should prefer
     /// promoting recurring messages to dedicated variants with
     /// stable diagnostic codes. The miette `code()` here remains

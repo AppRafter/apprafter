@@ -2,11 +2,15 @@
 //! SSH public keys (D.3 overview §3.7.4): the shapes a target's key and the key picker show,
 //! [`public_key_candidates`] (what the picker offers), [`inspect_key`] (what a stored key path
 //! holds) and [`check_readable`] (the check before a key path is saved). The key body is never
-//! stored, only its path.
+//! stored, only its path. A key is an OpenSSH public key line or nothing
+//! (`cli_core::ssh_key`, GOTCHA-149): the provider is sent whatever the file holds, so a
+//! private key is refused by name and never shown as a key.
 
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
+
+use cli_core::ssh_key::{parse_public_key, NotAPublicKey};
 
 use crate::context::Context;
 use crate::error::{CoreError, CoreResult};
@@ -20,8 +24,11 @@ pub struct SshKeyInfo {
     /// The path with the home directory shown as `~/`.
     pub display: String,
     pub exists: bool,
-    /// The key type, e.g. `ssh-ed25519`, when the file reads as a public key.
+    /// The key type, e.g. `ssh-ed25519`, when the file reads as an OpenSSH public key; never
+    /// otherwise.
     pub algo: Option<String>,
+    /// Why the file cannot be the target's key; `None` when it is a public key.
+    pub problem: Option<SshKeyProblem>,
 }
 
 /// A public key found under `~/.ssh`, offered by the key picker.
@@ -35,11 +42,19 @@ pub struct SshKeyCandidate {
     pub comment: Option<String>,
 }
 
-/// Why an SSH key path cannot be used.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Why an SSH key path cannot be used. [`CoreError::SshKeyUnreadable`] carries the first two
+/// (a key file `check_readable` cannot read); a file it reads that is not a public key is
+/// `CliError::SshKeyNotPublic`. [`inspect_key`] reports any of the four.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
 pub enum SshKeyProblem {
     Missing,
     Unreadable,
+    /// A private key: its public half is the `.pub` file next to it.
+    PrivateKey,
+    /// Readable, and not one OpenSSH public key line.
+    NotPublicKey,
 }
 
 impl SshKeyProblem {
@@ -48,10 +63,12 @@ impl SshKeyProblem {
         match self {
             Self::Missing => "missing",
             Self::Unreadable => "unreadable",
+            Self::PrivateKey => "private_key",
+            Self::NotPublicKey => "not_public_key",
         }
     }
 
-    /// The CLI's `verify_ssh_key_readable` texts.
+    /// The CLI's `verify_ssh_key_readable` texts, and `CliError::SshKeyNotPublic`'s.
     pub fn message(self, path: &str, error: Option<&str>) -> String {
         match self {
             Self::Missing => format!("SSH key path `{path}` does not exist"),
@@ -59,27 +76,36 @@ impl SshKeyProblem {
                 "SSH key `{path}` is not readable: {}",
                 error.unwrap_or("unknown error")
             ),
+            Self::PrivateKey | Self::NotPublicKey => not_public(self, Path::new(path)).to_string(),
         }
     }
 }
 
-/// The first line of an OpenSSH public key: `<algo> <base64> [comment…]` → the algo and the
-/// comment; neither when the line has fewer than two fields.
-fn parse_key(body: &str) -> (Option<String>, Option<String>) {
-    let parts: Vec<&str> = body
-        .lines()
-        .next()
-        .unwrap_or("")
-        .split_whitespace()
-        .collect();
-    if parts.len() < 2 {
-        return (None, None);
+/// The refusal of a readable key file at `path` that is not a public key.
+fn not_public(problem: SshKeyProblem, path: &Path) -> cli_core::CliError {
+    let why = if problem == SshKeyProblem::PrivateKey {
+        NotAPublicKey::PrivateKey
+    } else {
+        NotAPublicKey::Other
+    };
+    why.refusal(cli_core::ssh_key::file_origin(path))
+}
+
+impl From<NotAPublicKey> for SshKeyProblem {
+    fn from(why: NotAPublicKey) -> Self {
+        match why {
+            NotAPublicKey::PrivateKey => Self::PrivateKey,
+            NotAPublicKey::Other => Self::NotPublicKey,
+        }
     }
-    let comment = parts[2..].join(" ");
-    (
-        Some(parts[0].to_string()),
-        (!comment.is_empty()).then_some(comment),
-    )
+}
+
+/// An OpenSSH public key's algo and comment; neither for anything else.
+fn parse_key(body: &str) -> (Option<String>, Option<String>) {
+    match parse_public_key(body) {
+        Ok(line) => (Some(line.algo), line.comment),
+        Err(_) => (None, None),
+    }
 }
 
 /// `<home>/.ssh/*.pub` (files only, no recursion), sorted by path. No home, no directory, or a
@@ -113,22 +139,30 @@ pub fn public_key_candidates(ctx: &Context) -> CoreResult<Vec<SshKeyCandidate>> 
         .collect())
 }
 
-/// What the key file at `path` holds. Never fails on a missing or unreadable file: `exists`
-/// and `algo` say what was found.
+/// What the key file at `path` holds. Never fails on a missing, unreadable or wrong file:
+/// `exists`, `algo` and `problem` say what was found — `algo` only for a public key.
 pub fn inspect_key(ctx: &Context, path: &Path) -> CoreResult<SshKeyInfo> {
-    let (algo, _) = std::fs::read_to_string(path)
-        .map(|b| parse_key(&b))
-        .unwrap_or((None, None));
+    let (algo, problem) = match std::fs::read_to_string(path) {
+        Ok(body) => match parse_public_key(&body) {
+            Ok(line) => (Some(line.algo), None),
+            Err(why) => (None, Some(why.into())),
+        },
+        Err(_) if !path.exists() => (None, Some(SshKeyProblem::Missing)),
+        Err(_) => (None, Some(SshKeyProblem::Unreadable)),
+    };
     Ok(SshKeyInfo {
         path: path.display().to_string(),
         display: cli_core::paths::abbreviate_home(path, ctx.home_dir()),
         exists: path.exists(),
         algo,
+        problem,
     })
 }
 
 /// The check `target add` and renew make before saving a key path (the body is never stored):
-/// [`CoreError::SshKeyUnreadable`] when the file is missing or cannot be read.
+/// [`CoreError::SshKeyUnreadable`] when the file is missing or cannot be read, and
+/// `CliError::SshKeyNotPublic` when it is a private key or anything but one OpenSSH public key
+/// line — that file would be sent to the provider as is (GOTCHA-149).
 pub fn check_readable(path: &Path) -> CoreResult<()> {
     if !path.exists() {
         return Err(CoreError::SshKeyUnreadable {
@@ -137,13 +171,14 @@ pub fn check_readable(path: &Path) -> CoreResult<()> {
             error: None,
         });
     }
-    std::fs::read_to_string(path)
+    let body = std::fs::read_to_string(path).map_err(|e| CoreError::SshKeyUnreadable {
+        path: path.display().to_string(),
+        problem: SshKeyProblem::Unreadable,
+        error: Some(e.to_string()),
+    })?;
+    parse_public_key(&body)
         .map(|_| ())
-        .map_err(|e| CoreError::SshKeyUnreadable {
-            path: path.display().to_string(),
-            problem: SshKeyProblem::Unreadable,
-            error: Some(e.to_string()),
-        })
+        .map_err(|why| CoreError::Cli(not_public(why.into(), path)))
 }
 
 #[cfg(test)]
@@ -221,8 +256,78 @@ mod tests {
             .with_home_dir(Some("/home/op".into()));
         let k = inspect_key(&ctx, std::path::Path::new("/home/op/.ssh/gone.pub")).unwrap();
         assert_eq!(
-            (k.display.as_str(), k.exists, k.algo),
-            ("~/.ssh/gone.pub", false, None)
+            (k.display.as_str(), k.exists, k.algo, k.problem),
+            ("~/.ssh/gone.pub", false, None, Some(SshKeyProblem::Missing))
         );
+    }
+
+    const PRIVATE: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjE=\n-----END OPENSSH PRIVATE KEY-----\n";
+
+    /// GOTCHA-149: a private key's first line split into fields read as the type
+    /// `-----BEGIN`, and the desktop showed it as a key. Only a public key has a type now, and
+    /// the problem says why any other file is not one.
+    #[test]
+    fn inspect_key_names_a_type_only_for_a_public_key_and_says_why_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = Context::for_desktop("/unused".into(), "http://unused")
+            .with_home_dir(Some(dir.path().into()));
+        let file = |name: &str, body: &str| {
+            let p = dir.path().join(name);
+            std::fs::write(&p, body).unwrap();
+            p
+        };
+        let seen = |p: &std::path::Path| {
+            let k = inspect_key(&ctx, p).unwrap();
+            (k.exists, k.algo, k.problem)
+        };
+        assert_eq!(
+            seen(&file("id_ed25519", PRIVATE)),
+            (true, None, Some(SshKeyProblem::PrivateKey))
+        );
+        assert_eq!(
+            seen(&file("notes.pub", "not-a-key\n")),
+            (true, None, Some(SshKeyProblem::NotPublicKey))
+        );
+        assert_eq!(
+            seen(&file("id_ed25519.pub", "ssh-ed25519 AAAA me@host\n")),
+            (true, Some("ssh-ed25519".into()), None)
+        );
+        assert_eq!(
+            seen(dir.path()),
+            (true, None, Some(SshKeyProblem::Unreadable)),
+            "a directory cannot be read as a key"
+        );
+    }
+
+    /// GOTCHA-149: add and renew refuse to save a path whose file is a private key (by name,
+    /// pointing at the public half) or not a public key at all; the file is never quoted.
+    #[test]
+    fn check_readable_refuses_a_private_key_and_anything_but_a_public_key() {
+        let dir = tempfile::tempdir().unwrap();
+        for (body, private) in [(PRIVATE, true), ("ssh-dss AAAA old\n", false)] {
+            let p = dir.path().join("key");
+            std::fs::write(&p, body).unwrap();
+            let err = check_readable(&p).unwrap_err();
+            let ui = crate::error::UiError::from(&err);
+            assert_eq!(
+                ui.code.as_deref(),
+                Some("apprafter::target::ssh_key_not_public")
+            );
+            assert_eq!(
+                ui.fields["privateKey"],
+                serde_json::json!(private),
+                "{body}"
+            );
+            assert!(!ui.message.contains(body.lines().nth(1).unwrap_or("AAAA")));
+            assert!(
+                ui.message
+                    .starts_with(&format!("SSH key `{}` is ", p.display())),
+                "{}",
+                ui.message
+            );
+        }
+        let p = dir.path().join("key.pub");
+        std::fs::write(&p, "ssh-ed25519 AAAA me@host\n").unwrap();
+        check_readable(&p).unwrap();
     }
 }

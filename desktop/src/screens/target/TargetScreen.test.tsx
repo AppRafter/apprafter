@@ -220,6 +220,46 @@ test('SSH key: Other path… is looked up first; a path with no file says so in 
   expect(confirm.textContent).toContain('ssh key: ~/.ssh/lab.pub → ~/.ssh/work.pub');
 });
 
+test('SSH key: Other path… refuses a private key by name, and a file that is no key (GOTCHA-149)', async () => {
+  const renews = sentArgs('op_plan_target_renew');
+  const user = screenOf('staging');
+  await user.click(
+    within(await screen.findByRole('group', { name: 'SSH key' })).getByRole('button', {
+      name: 'Change',
+    }),
+  );
+  const form = await screen.findByRole('dialog', { name: 'Change SSH key' });
+  await user.click(within(form).getByRole('radio', { name: 'Other path…' }));
+  const path = within(form).getByLabelText('Path to a public key');
+  await user.type(path, '/home/alex/.ssh/id_ed25519');
+  await user.click(within(form).getByRole('button', { name: 'Continue' }));
+  expect((await within(form).findByRole('alert')).textContent).toContain(
+    '~/.ssh/id_ed25519 is a private key: choose its public half, the .pub file next to it.',
+  );
+  await user.clear(path);
+  await user.type(path, '/home/alex/notes.txt');
+  await user.click(within(form).getByRole('button', { name: 'Continue' }));
+  expect((await within(form).findByRole('alert')).textContent).toContain(
+    '~/notes.txt is not an SSH public key.',
+  );
+  // Refused from the lookup: no plan was asked for.
+  expect(renews).toEqual([]);
+  expect(screen.queryByRole('dialog', { name: /Change the SSH key of/ })).toBeNull();
+});
+
+test('SSH key: a .pub in ~/.ssh that holds no public key is listed and cannot be chosen', async () => {
+  const user = screenOf('staging');
+  await user.click(
+    within(await screen.findByRole('group', { name: 'SSH key' })).getByRole('button', {
+      name: 'Change',
+    }),
+  );
+  const form = await screen.findByRole('dialog', { name: 'Change SSH key' });
+  const old = within(form).getByRole('radio', { name: '~/.ssh/old.pub' }) as HTMLInputElement;
+  expect(old.disabled).toBe(true);
+  expect(old.closest('label')?.textContent).toContain('not an SSH public key');
+});
+
 test('SSH key: the key in use typed as another path is refused in the form', async () => {
   const user = screenOf('staging');
   await user.click(

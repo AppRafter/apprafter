@@ -41,6 +41,7 @@ import {
   MOCK_CLI_DEFAULT,
   MOCK_DOCTOR,
   MOCK_LATENCIES,
+  MOCK_NOT_KEYS,
   MOCK_REPORTS,
   MOCK_SSH_KEYS,
   MOCK_TOOLCHAIN,
@@ -170,12 +171,27 @@ export function catalogueSourceRefusal(
 }
 
 /**
- * The key at `path` (a candidate's path or its `~` form), as `ssh_key_inspect` reports it; Rust's
- * `SshKeyUnreadable` for any other path.
+ * What the file at `path` (a candidate's path or its `~` form) holds, as `ssh_key_inspect`
+ * reports it: a public key in `~/.ssh`, a file that is not one (MOCK_NOT_KEYS), or nothing.
+ */
+function inspectKey(path: string): SshKeyInfo {
+  const key = MOCK_SSH_KEYS.find((k) => k.path === path || k.display === path);
+  if (key !== undefined) {
+    const problem = key.algo === null ? 'not_public_key' : null;
+    return { path: key.path, display: key.display, exists: true, algo: key.algo, problem };
+  }
+  const other = MOCK_NOT_KEYS.find((k) => k.path === path || k.display === path);
+  return other ?? { path, display: path, exists: false, algo: null, problem: 'missing' };
+}
+
+/**
+ * The key at `path` for a plan, as the core's `check_readable` takes it: a public key, or Rust's
+ * refusal — `SshKeyUnreadable` for no file, `SshKeyNotPublic` for one that is not a public key
+ * (GOTCHA-149: a private key by name).
  */
 function keyAt(path: string): SshKeyInfo {
-  const key = MOCK_SSH_KEYS.find((k) => k.path === path || k.display === path);
-  if (key === undefined) {
+  const key = inspectKey(path);
+  if (key.problem === 'missing') {
     throw error(
       CORE_ERROR_CODES.TARGET_SSH_KEY_UNREADABLE,
       `SSH key path \`${path}\` does not exist`,
@@ -185,7 +201,18 @@ function keyAt(path: string): SshKeyInfo {
       },
     );
   }
-  return { path: key.path, display: key.display, exists: true, algo: key.algo };
+  if (key.problem !== null) {
+    const origin = `SSH key \`${key.path}\``;
+    const privateKey = key.problem === 'private_key';
+    throw error(
+      CORE_ERROR_CODES.TARGET_SSH_KEY_NOT_PUBLIC,
+      privateKey
+        ? `${origin} is a private key: AppRafter never sends a private key to the provider`
+        : `${origin} is not an OpenSSH public key`,
+      { origin, privateKey },
+    );
+  }
+  return key;
 }
 
 /** As a JSON result of a mock operation. */
@@ -275,13 +302,7 @@ export function targetHandlers(ops: MockOps, store: MockStore): Record<string, H
 
     ssh_key_candidates: () => [...MOCK_SSH_KEYS],
 
-    ssh_key_inspect: (args): SshKeyInfo => {
-      const path = (args as { path: string }).path;
-      const key = MOCK_SSH_KEYS.find((k) => k.path === path || k.display === path);
-      return key === undefined
-        ? { path, display: path, exists: false, algo: null }
-        : { path: key.path, display: key.display, exists: true, algo: key.algo };
-    },
+    ssh_key_inspect: (args): SshKeyInfo => inspectKey((args as { path: string }).path),
 
     toolchain_status: () => structuredClone(MOCK_TOOLCHAIN),
 

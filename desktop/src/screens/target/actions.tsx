@@ -25,6 +25,7 @@ import { usePlatform } from '../../state/platform';
 import { refreshTargets } from '../../state/targets';
 import { nameMessage, nameProblem, tokenMessage } from '../targets/rules';
 import { removedMessage, renamedMessage, renewedMessage, usedMessage } from './outcomes';
+import { keyRefusal } from './sshKey';
 
 /** Whatever a plan or its run was refused or failed with, as the UiError the caller shows. */
 const refusalOf = (reason: unknown): UiError =>
@@ -84,14 +85,22 @@ function useConfirm(onFailed: (error: UiError) => void) {
 const OTHER = 'other';
 const KEY = 'key:';
 
-/** A key in `~/.ssh` as a row: its `~` path, its type and comment, and whether it is in use. */
+/**
+ * A key in `~/.ssh` as a row: its `~` path, its type and comment, and whether it is in use. A
+ * `.pub` the core read no public key in (no type) is shown, and cannot be chosen.
+ */
 function keyOption(candidate: SshKeyCandidate, inUse: boolean): RadioOpt {
   const detail = [
-    candidate.algo ?? 'unknown type',
+    candidate.algo ?? 'not an SSH public key',
     ...(candidate.comment === null ? [] : [candidate.comment]),
     ...(inUse ? ['in use now'] : []),
   ].join(' · ');
-  return { value: `${KEY}${candidate.path}`, label: candidate.display, detail, disabled: inUse };
+  return {
+    value: `${KEY}${candidate.path}`,
+    label: candidate.display,
+    detail,
+    disabled: inUse || candidate.algo === null,
+  };
 }
 
 /**
@@ -122,14 +131,15 @@ export function useChangeSshKey(
       return;
     }
     const inUse = (path: string) => current !== null && path === current.path;
-    const first = candidates.find((candidate) => !inUse(candidate.path));
+    const first = candidates.find((candidate) => !inUse(candidate.path) && candidate.algo !== null);
 
     /** The chosen key's path, as the core reads it; a refusal shown in the form. */
     const chosen = async (values: FormValues): Promise<string> => {
       let path: string;
       if (values.key === OTHER) {
         const info = await api.sshKeyInspect(String(values.path ?? '').trim());
-        if (!info.exists) throw plainError(`No file at ${info.display}.`);
+        const refusal = keyRefusal(info);
+        if (refusal !== null) throw plainError(refusal);
         path = info.path;
       } else {
         path = String(values.key).slice(KEY.length);

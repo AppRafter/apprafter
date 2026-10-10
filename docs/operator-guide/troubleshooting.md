@@ -408,34 +408,41 @@ the node at provision time, so a change only takes effect on the next
 `apprafter target add <name> --renew --ssh-key <path>`, which changes
 the key and keeps everything else, the token included.
 
-**What checks what, exactly** — because the obvious check does less
-than it looks:
+**What checks what, exactly**
 
-- `apprafter target add --ssh-key <path>` **refuses at add time** if
-  the path does not exist: `SSH key path '<path>' does not exist`
-  (code `apprafter::target::ssh_key_unreadable`). So a bad path never gets stored in
-  the first place.
-- `apprafter doctor`'s check is named **`SSH key readable`** — not
-  "SSH public key readable" — and that is all it verifies. It FAILs
-  when the stored path has since disappeared or cannot be read, and
-  otherwise PASSes, printing the file's first whitespace-delimited
-  token as the algorithm. It does **not** validate that the file is a
-  public key: pointed at a file containing `not-a-key` it reports
+The key file is sent to Hetzner as it is, so every place that takes it
+checks that it holds one OpenSSH public key line, `<type> <base64>
+[comment]`, of type `ssh-ed25519`, `ssh-rsa`, an `ecdsa-sha2` curve, or
+a security-key (`sk-`) type. A private key is refused by name, and its
+contents are never printed.
+
+- `apprafter target add --ssh-key <path>` (and `--renew --ssh-key`)
+  **refuses at add time** if the path does not exist (`SSH key path
+  '<path>' does not exist`, code `apprafter::target::ssh_key_unreadable`)
+  or if the file is not a public key (`SSH key '<path>' is a private
+  key: …` or `… is not an OpenSSH public key`, code
+  `apprafter::target::ssh_key_not_public`). So neither a bad path nor a
+  private key gets stored in the first place.
+- `apprafter apply` / `up` check the key body again before anything is
+  sent to the provider: the stored path's file, an inline
+  `APPRAFTER_SSH_PUBLIC_KEY`, or a manifest's `sshKeys` entry. A target
+  stored before this check existed can still name a private key; `apply`
+  then stops with `apprafter::target::ssh_key_not_public` and sends
+  nothing.
+- `apprafter doctor`'s **`SSH key readable`** row FAILs when the stored
+  path has disappeared, cannot be read, or does not hold a public key (a
+  private key is named as one), and otherwise PASSes, printing the key
+  type:
 
     ```text
-      ✓ SSH key readable (/path/to/fake.pub (not-a-key))
+      ✓ SSH key readable (/home/you/.ssh/id_ed25519.pub (ssh-ed25519))
     ```
 
-    and pointed at a *private* key it passes just as happily, printing
-    `✓ SSH key readable (…/id_ed25519 (-----BEGIN))`. A green tick here
-    means "a file is there", not "the key is right".
 - With no key configured at all the check is a **WARN**, `SSH key path
   configured`, not a FAIL — provisioning is what refuses.
 
-So if provisioning fails on SSH and `doctor` is green, compare the
-stored path's contents against the key the node actually has: `head -c
-20 <path>` should start with `ssh-ed25519` / `ssh-rsa` / `ecdsa-`, not
-`-----BEGIN`.
+A private key's public half is the `.pub` file next to it; `ssh-keygen
+-y -f <private key>` prints it again if the `.pub` is lost.
 
 ### App stuck on `ImagePullBackOff` (registry auth) {#registry-auth}
 

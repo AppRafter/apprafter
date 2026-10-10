@@ -126,6 +126,14 @@ pub enum CheckFix {
         target: String,
         path: String,
     },
+    /// The stored key file is not an OpenSSH public key — a private key (`private_key`), or
+    /// anything else — so `apply` refuses to send it to the provider (GOTCHA-149): the target
+    /// it is stored on and the path as stored, for the key-only renewal that fixes it.
+    SshKeyNotPublic {
+        target: String,
+        path: String,
+        private_key: bool,
+    },
     InstallTool {
         tool: ToolId,
     },
@@ -640,15 +648,23 @@ fn ssh_key(target: &Target) -> Check {
         };
     }
     match std::fs::read_to_string(path) {
-        // The first whitespace-delimited token, as today: presence, not validity (the
-        // operator troubleshooting page documents exactly this).
-        Ok(body) => {
-            let algo = body.split_whitespace().next().unwrap_or("(unknown)");
-            Check {
-                detail: Some(format!("{shown} ({algo})")),
+        // What `apply` would send the provider: one OpenSSH public key line, or the row fails
+        // as `apply` would refuse (GOTCHA-149) — a private key by name.
+        Ok(body) => match cli_core::ssh_key::parse_public_key(&body) {
+            Ok(key) => Check {
+                detail: Some(format!("{shown} ({})", key.algo)),
                 ..row(CheckId::SshKey, CheckStatus::Pass, TITLE_SSH_KEY)
-            }
-        }
+            },
+            Err(why) => Check {
+                detail: Some(shown.clone()),
+                fix: Some(CheckFix::SshKeyNotPublic {
+                    target: target.name.clone(),
+                    path: shown,
+                    private_key: why == cli_core::ssh_key::NotAPublicKey::PrivateKey,
+                }),
+                ..row(CheckId::SshKey, CheckStatus::Fail, TITLE_SSH_KEY)
+            },
+        },
         Err(e) => Check {
             detail: Some(shown),
             fix: Some(CheckFix::Explain {
@@ -1463,6 +1479,49 @@ mod tests {
                 path: f.root.join("home/nope.pub").display().to_string(),
             })
         );
+    }
+
+    /// GOTCHA-149: the row passed for any readable file, printing a private key's `-----BEGIN`
+    /// as its type; `apply` now refuses to send such a file, so the row fails as `apply` would,
+    /// a private key by name, and passes only a public key.
+    #[test]
+    fn the_ssh_key_row_fails_a_private_key_and_anything_but_a_public_key() {
+        let f = fx();
+        let ctx = ctx(&f, OFFLINE).with_no_ping(true);
+        let cases = [
+            ("private", "-----BEGIN OPENSSH PRIVATE KEY-----\nb3Blbg==\n-----END OPENSSH PRIVATE KEY-----\n", Some(true)),
+            ("junk", "not-a-key\n", Some(false)),
+            ("good", "ssh-ed25519 AAAA me@host\n", None),
+        ];
+        for (name, body, private_key) in cases {
+            let key = f.root.join(format!("keys/{name}"));
+            std::fs::create_dir_all(key.parent().unwrap()).unwrap();
+            std::fs::write(&key, body).unwrap();
+            add(&ctx, name, "hetzner-cloud", Some(TOKEN), Some(key.clone()));
+            let rows = group(&doctor(&ctx, named(name)), GroupId::Target);
+            let shown = key.display().to_string();
+            match private_key {
+                Some(private_key) => {
+                    assert_eq!(rows[5].status, CheckStatus::Fail, "{name}");
+                    assert_eq!(rows[5].detail.as_deref(), Some(shown.as_str()));
+                    assert_eq!(
+                        rows[5].fix,
+                        Some(CheckFix::SshKeyNotPublic {
+                            target: name.into(),
+                            path: shown,
+                            private_key,
+                        })
+                    );
+                }
+                None => {
+                    assert_eq!(rows[5].status, CheckStatus::Pass);
+                    assert_eq!(
+                        rows[5].detail.as_deref(),
+                        Some(format!("{shown} (ssh-ed25519)").as_str())
+                    );
+                }
+            }
+        }
     }
 
     #[test]

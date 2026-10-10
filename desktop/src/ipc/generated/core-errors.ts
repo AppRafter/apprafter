@@ -27,6 +27,7 @@ export const CORE_ERROR_CODES = {
   TARGET_RENEW_TOKEN_UNCHANGED: 'apprafter::target::renew_token_unchanged',
   TARGET_SAME_NAME: 'apprafter::target::same_name',
   TARGET_SERVER_MISSING: 'apprafter::target::server_missing',
+  TARGET_SSH_KEY_NOT_PUBLIC: 'apprafter::target::ssh_key_not_public',
   TARGET_SSH_KEY_UNREADABLE: 'apprafter::target::ssh_key_unreadable',
   TARGET_TOKEN_MISSING: 'apprafter::target::token_missing',
   TARGET_TOKEN_REJECTED: 'apprafter::target::token_rejected',

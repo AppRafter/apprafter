@@ -208,6 +208,8 @@ pub mod codes {
     pub const BACKUP_JOB_ACTIVE: &str = "apprafter::backup::job_active";
     pub const TOKEN_REJECTED: &str = "apprafter::target::token_rejected";
     pub const PROVIDER_UNREACHABLE: &str = "apprafter::target::provider_unreachable";
+    /// A key file add and renew refuse (`ssh::check_readable`, GOTCHA-149).
+    pub const SSH_KEY_NOT_PUBLIC: &str = "apprafter::target::ssh_key_not_public";
 
     /// Every code above.
     pub const ALL: &[&str] = &[
@@ -239,6 +241,7 @@ pub mod codes {
         BACKUP_JOB_ACTIVE,
         TOKEN_REJECTED,
         PROVIDER_UNREACHABLE,
+        SSH_KEY_NOT_PUBLIC,
     ];
 }
 
@@ -457,6 +460,15 @@ fn neutral_help(e: &cli_core::CliError) -> Option<String> {
              unreadable file aside rather than deleting it."
                 .into()
         }
+        C::SshKeyNotPublic { private_key, .. } => if *private_key {
+            "AppRafter sends a target's SSH key to the provider, so it never takes a private \
+             key: choose its public half, the `.pub` file next to it. Nothing was saved or sent."
+        } else {
+            "AppRafter sends a target's SSH key to the provider as an OpenSSH public key: one \
+             line `<type> <base64> [comment]`, of type ssh-ed25519, ssh-rsa, an ecdsa-sha2 \
+             curve, or a security-key (sk-) type. Nothing was saved or sent."
+        }
+        .into(),
         C::InvalidTargetConfig { .. } => {
             "The target store file named above failed to parse: it was edited by hand or \
              written by an incompatible version. Fix the YAML by hand (it is a small file), or \
@@ -543,6 +555,13 @@ fn project_cli(e: &cli_core::CliError, put: &mut impl FnMut(&str, serde_json::Va
         C::CueNotFound => put("tool", json!("cue")),
         C::InvalidTargetConfig { path, .. } | C::InvalidState { path, .. } => {
             put("path", json!(path.display().to_string()))
+        }
+        C::SshKeyNotPublic {
+            origin,
+            private_key,
+        } => {
+            put("origin", json!(origin));
+            put("privateKey", json!(private_key));
         }
         _ => {}
     }
@@ -766,6 +785,14 @@ pub mod samples {
             C::UsageRefused {
                 message: s("m"),
                 help: s("h"),
+            },
+            C::SshKeyNotPublic {
+                origin: s("SSH key `/home/a/.ssh/id_ed25519`"),
+                private_key: true,
+            },
+            C::SshKeyNotPublic {
+                origin: s("SSH key `/home/a/notes.pub`"),
+                private_key: false,
             },
             C::Other(s("o")),
         ];
@@ -1158,6 +1185,13 @@ mod tests {
                 },
                 codes::PROVIDER_UNREACHABLE,
             ),
+            (
+                C::SshKeyNotPublic {
+                    origin: "SSH key `/k`".into(),
+                    private_key: true,
+                },
+                codes::SSH_KEY_NOT_PUBLIC,
+            ),
         ] {
             assert_eq!(miette::Diagnostic::code(&e).unwrap().to_string(), code);
         }
@@ -1286,6 +1320,7 @@ mod tests {
             codes::CUE_NOT_FOUND,
             codes::STATE_CORRUPT,
             codes::BACKUP_JOB_ACTIVE,
+            codes::SSH_KEY_NOT_PUBLIC,
             "apprafter::target::invalid_config",
             "apprafter::io::error",
         ] {

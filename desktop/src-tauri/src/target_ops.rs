@@ -813,6 +813,64 @@ mod tests {
         );
     }
 
+    /// GOTCHA-149: a private key is the file next to the `.pub`, and a provider is sent whatever
+    /// the key file holds. Inspected, it has no type and says why; the renew and add plans refuse
+    /// it before any plan, by name, and the draft stays for the corrected form.
+    #[test]
+    fn a_private_key_is_inspected_as_one_and_no_plan_takes_it() {
+        let s = store(&["prod"], None);
+        let key = s._dir.path().join("id_ed25519");
+        std::fs::write(
+            &key,
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaA==\n-----END OPENSSH PRIVATE KEY-----\n",
+        )
+        .unwrap();
+        let info = ssh_key_inspect(&s.shell, key.to_str().unwrap()).unwrap();
+        assert_eq!(
+            (info.exists, info.algo, info.problem),
+            (true, None, Some(ssh::SshKeyProblem::PrivateKey))
+        );
+        let refused = |ui: apprafter_core::UiError| {
+            assert_eq!(
+                ui.code.as_deref(),
+                Some("apprafter::target::ssh_key_not_public")
+            );
+            assert_eq!(ui.fields["privateKey"], json!(true));
+            assert!(!ui.message.contains("b3Blbn"), "{}", ui.message);
+        };
+        refused(
+            plan_target_renew(&s.shell, "prod", None, Some(key.clone()))
+                .unwrap_err()
+                .to_ui(),
+        );
+        let draft = s
+            .shell
+            .drafts
+            .insert(s.shell.drafts.epoch(), "hetzner-cloud".into(), a_token('k'))
+            .unwrap();
+        refused(
+            plan_target_add(
+                &s.shell,
+                TargetAddArgs {
+                    name: "lab".into(),
+                    provider: "hetzner-cloud".into(),
+                    draft_id: draft,
+                    ssh_key: Some(key.display().to_string()),
+                    region: None,
+                    tier: None,
+                    server_type: None,
+                },
+            )
+            .unwrap_err()
+            .to_ui(),
+        );
+        assert!(
+            s.shell.drafts.get(draft).is_ok(),
+            "a refused plan takes nothing"
+        );
+        assert!(s.shell.ops.list().is_empty());
+    }
+
     /// WI-452: the SSH key row's renewal carries no token: the plan lists only the key, the
     /// run asks the provider nothing and keeps the credentials, and the result says so.
     #[test]

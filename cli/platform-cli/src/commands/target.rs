@@ -1134,7 +1134,8 @@ mod tests {
                 path: "/h/.ssh/k.pub".into(),
                 display: "~/.ssh/k.pub".into(),
                 exists: true,
-                algo: None,
+                algo: Some("ssh-ed25519".into()),
+                problem: None,
             }),
             token: TokenPresence {
                 set: false,

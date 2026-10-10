@@ -9,12 +9,12 @@ import { CardRow } from '../../components/SettingRow';
 import { Tag } from '../../components/Tag';
 import type { Os } from '../../ipc/generated/Os';
 import type { SecretBackend } from '../../ipc/generated/SecretBackend';
-import type { SshKeyInfo } from '../../ipc/generated/SshKeyInfo';
 import type { TargetReport } from '../../ipc/generated/TargetReport';
 import type { TokenPresence } from '../../ipc/generated/TokenPresence';
 import { secretCopy } from '../../state/secretCopy';
 import { providerLabel, tierLabel } from '../targets/labels';
 import { MachineRow } from './MachineRow';
+import { keyValue } from './sshKey';
 
 export interface TargetDetailActions {
   rename: () => void;
@@ -46,11 +46,6 @@ function Group({ label, children }: { label: string; children: ReactNode }) {
 const tokenValue = (token: TokenPresence) => {
   if (!token.set) return 'not set';
   return token.chars === null ? 'set' : `set · ${token.chars} characters`;
-};
-
-const sshKeyValue = (key: SshKeyInfo | null) => {
-  if (key === null) return 'not set';
-  return `${key.display}${key.algo === null ? '' : ` · ${key.algo}`}${key.exists ? '' : ' (missing)'}`;
 };
 
 /** A value the card may cut short (a path, a key): its whole text shows on hover. */
@@ -127,7 +122,7 @@ export function TargetDetails({
       <Group label="SSH key">
         <CardRow
           label="SSH key"
-          value={titled(sshKeyValue(report.sshKey))}
+          value={titled(keyValue(report.sshKey))}
           control={
             <Button size={26} onClick={actions.changeSshKey}>
               Change

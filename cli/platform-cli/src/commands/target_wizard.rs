@@ -664,13 +664,16 @@ fn candidate_label(c: &SshKeyCandidate) -> String {
 }
 
 /// Accept/reject rule for the free-text SSH-key path: an empty
-/// answer means "skip", anything else must already exist on disk
-/// (after `~/` expansion against `home`). Pure — extracted from the
-/// `inquire` validator closure in `prompt_ssh_key_text_fallback`.
+/// answer means "skip", anything else must be an OpenSSH public key
+/// file (after `~/` expansion against `home`) — a private key is
+/// refused by name, since the file is what the provider is sent
+/// (GOTCHA-149). Pure but for the read — extracted from the `inquire`
+/// validator closure in `prompt_ssh_key_text_fallback`.
 fn validate_ssh_key_path_input(
     input: &str,
     home: Option<&Path>,
 ) -> std::result::Result<(), String> {
+    use cli_core::ssh_key::{parse_public_key, NotAPublicKey};
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return Ok(());
@@ -679,7 +682,19 @@ fn validate_ssh_key_path_input(
     if !expanded.exists() {
         return Err(format!("path `{}` does not exist", expanded.display()));
     }
-    Ok(())
+    let body = std::fs::read_to_string(&expanded)
+        .map_err(|e| format!("cannot read `{}`: {e}", expanded.display()))?;
+    match parse_public_key(&body) {
+        Ok(_) => Ok(()),
+        Err(NotAPublicKey::PrivateKey) => Err(format!(
+            "`{}` is a private key: choose its public half, the `.pub` file next to it",
+            expanded.display()
+        )),
+        Err(NotAPublicKey::Other) => Err(format!(
+            "`{}` is not an OpenSSH public key (one line: `<type> <base64> [comment]`)",
+            expanded.display()
+        )),
+    }
 }
 
 /// Turn an accepted free-text answer into the wizard's
@@ -1885,6 +1900,30 @@ mod tests {
         let err = validate_ssh_key_path_input(missing.to_str().unwrap(), Some(dir.path()))
             .expect_err("a non-existent path must be rejected");
         assert!(err.contains("does not exist"), "{err}");
+    }
+
+    /// GOTCHA-149: the typed path is the file the provider is sent, so the prompt refuses a
+    /// private key by name (pointing at its `.pub`) and any other file that is not a public
+    /// key, and never quotes it.
+    #[test]
+    fn validate_ssh_key_path_input_refuses_a_private_key_and_a_non_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let private = dir.path().join("id_ed25519");
+        std::fs::write(
+            &private,
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nb3Blbg==\n-----END OPENSSH PRIVATE KEY-----\n",
+        )
+        .unwrap();
+        let err = validate_ssh_key_path_input(private.to_str().unwrap(), None).unwrap_err();
+        assert!(
+            err.contains("is a private key") && err.contains(".pub"),
+            "{err}"
+        );
+        assert!(!err.contains("b3Blbg"), "{err}");
+        let junk = dir.path().join("notes.pub");
+        std::fs::write(&junk, "not-a-key\n").unwrap();
+        let err = validate_ssh_key_path_input(junk.to_str().unwrap(), None).unwrap_err();
+        assert!(err.contains("is not an OpenSSH public key"), "{err}");
     }
 
     /// Blank means "no key", not an empty path; a `~/` answer is

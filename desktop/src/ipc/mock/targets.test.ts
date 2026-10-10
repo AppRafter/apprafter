@@ -238,6 +238,7 @@ test('add with an SSH key: an unreadable one is refused and keeps the draft; a f
     display: '~/.ssh/work.pub',
     exists: true,
     algo: 'ssh-rsa',
+    problem: null,
   });
 });
 
@@ -321,6 +322,7 @@ test('renew with an SSH key: an unreadable key is refused; a new one is planned 
     display: '~/.ssh/work.pub',
     exists: true,
     algo: 'ssh-rsa',
+    problem: null,
   });
   // The key it has now, with another new token: only the token changes, as the core leaves an
   // equal path out.
@@ -330,6 +332,32 @@ test('renew with an SSH key: an unreadable key is refused; a new one is planned 
     '/home/alex/.ssh/work.pub',
   );
   expect(same.changes.map((c) => c.kind)).toEqual(['Credentials']);
+});
+
+test('a file that is not a public key: inspected with no type and why; refused by the plans (GOTCHA-149)', async () => {
+  expect(await api.sshKeyInspect('/home/alex/.ssh/id_ed25519')).toEqual({
+    path: '/home/alex/.ssh/id_ed25519',
+    display: '~/.ssh/id_ed25519',
+    exists: true,
+    algo: null,
+    problem: 'private_key',
+  });
+  expect((await api.sshKeyInspect('/home/alex/notes.txt')).problem).toBe('not_public_key');
+  expect((await api.sshKeyInspect('/home/alex/.ssh/nothing.pub')).problem).toBe('missing');
+  const privateKey = await refusalOf(
+    api.opPlanTargetRenew('lab', null, '/home/alex/.ssh/id_ed25519'),
+  );
+  expect(privateKey.code).toBe(CORE_ERROR_CODES.TARGET_SSH_KEY_NOT_PUBLIC);
+  expect(privateKey.message).toBe(
+    'SSH key `/home/alex/.ssh/id_ed25519` is a private key: AppRafter never sends a private key to the provider',
+  );
+  expect(privateKey.fields).toEqual({
+    origin: 'SSH key `/home/alex/.ssh/id_ed25519`',
+    privateKey: true,
+  });
+  const note = await refusalOf(api.opPlanTargetRenew('lab', null, '/home/alex/notes.txt'));
+  expect(note.fields).toMatchObject({ privateKey: false });
+  expect((await api.targetShow('lab')).sshKey?.path).toBe('/home/alex/.ssh/lab.pub');
 });
 
 test('renew with a key and no token: only the key is planned and saved, the token kept', async () => {

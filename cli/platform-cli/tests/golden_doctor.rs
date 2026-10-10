@@ -63,6 +63,31 @@ fn doctor_with_credentials_missing_the_space_after_the_colon() {
     sb.golden("doctor/credentials_no_space", &args);
 }
 
+/// GOTCHA-149: a target whose stored key path names a private key (written before add refused
+/// one, or by hand): the row fails as `apply` would refuse, by name, never quoting the file.
+#[test]
+fn doctor_with_a_private_key_stored_as_the_ssh_key() {
+    let sb = Sandbox::new().with_stand_in_tools();
+    sb.add_target("prod");
+    let key = sb.path("home/id_ed25519");
+    std::fs::write(
+        &key,
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaGdvbGRlbg==\n-----END OPENSSH PRIVATE KEY-----\n",
+    )
+    .expect("key file");
+    sb.seed_config(
+        "prod",
+        &format!(
+            "provider: hetzner-cloud\nregion: nbg1\ndefault_tier: solo\ncluster_name: null\n\
+             ssh_key_path: {}\nfirewall: null\nserver_type: null\n",
+            key.display()
+        ),
+    );
+    let args = ["doctor", "--no-ping"];
+    sb.assert_steps_never_print(&[&args], "b3BlbnNzaGdvbGRlbg");
+    sb.golden("doctor/ssh_key_private", &args);
+}
+
 #[test]
 fn doctor_with_a_rejected_token() {
     let mut server = mockito::Server::new();
