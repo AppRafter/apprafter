@@ -100,21 +100,24 @@ impl From<NotAPublicKey> for SshKeyProblem {
     }
 }
 
-/// A typed key path with a leading `~/` expanded into `home` (the context's home directory), as
-/// a shell would before the CLI saw it: the CLI wizard's typed path and the desktop's (whose
-/// field suggests `~/.ssh/id_ed25519.pub`) both pass through here before a key is inspected or
-/// saved, so the stored path is the absolute one. Other tilde forms (`~user/`) are left as
-/// typed, so the path stays predictable; with no home, the input is returned as typed.
+/// A typed key path with a leading `~/` (and on Windows `~\`, PowerShell's spelling) expanded
+/// into `home` (the context's home directory), as a shell would before the CLI saw it: the CLI
+/// wizard's typed path and the desktop's (whose field suggests `~/.ssh/id_ed25519.pub`) both pass
+/// through here before a key is inspected or saved, so the stored path is the absolute one.
+/// Other tilde forms (`~user/`) are left as typed, so the path stays predictable; with no home,
+/// the input is returned as typed. A separator is what [`std::path::is_separator`] says: `/`, and
+/// on Windows `\` too — on Unix a `\` is a filename character.
 pub fn expand_tilde(input: &str, home: Option<&Path>) -> PathBuf {
-    if let Some(rest) = input.strip_prefix("~/") {
-        if let Some(home) = home {
-            // One component per `join`, so the platform's separator sits between each of them:
-            // the saved path reads `C:\Users\a\.ssh\id.pub` on Windows, not `…\.ssh/id.pub`.
-            return rest
-                .split('/')
-                .filter(|part| !part.is_empty())
-                .fold(home.to_path_buf(), |path, part| path.join(part));
-        }
+    let rest = input
+        .strip_prefix('~')
+        .filter(|rest| rest.starts_with(std::path::is_separator));
+    if let (Some(rest), Some(home)) = (rest, home) {
+        // One component per `join`, so the platform's separator sits between each of them: the
+        // saved path reads `C:\Users\a\.ssh\id.pub` on Windows, not `…\.ssh/id.pub`.
+        return rest
+            .split(std::path::is_separator)
+            .filter(|part| !part.is_empty())
+            .fold(home.to_path_buf(), |path, part| path.join(part));
     }
     PathBuf::from(input)
 }
@@ -294,6 +297,47 @@ mod tests {
                 .display()
                 .to_string(),
             home.join(".ssh").join("k.pub").display().to_string()
+        );
+    }
+
+    /// D.3d follow-up: `~\` is how a path under the home is typed on Windows (PowerShell's
+    /// spelling); there it expands as `~/` does, every component joined with the platform's
+    /// separator, whichever separator the input used.
+    #[cfg(windows)]
+    #[test]
+    fn a_backslash_after_the_tilde_expands_on_windows() {
+        let home = Path::new(r"C:\Users\op");
+        let expected = home.join(".ssh").join("k.pub").display().to_string();
+        for typed in [
+            r"~\.ssh\k.pub",
+            r"~\.ssh/k.pub",
+            r"~/.ssh\k.pub",
+            r"~\.ssh\\k.pub",
+        ] {
+            assert_eq!(
+                expand_tilde(typed, Some(home)).display().to_string(),
+                expected,
+                "{typed}"
+            );
+        }
+        assert_eq!(
+            expand_tilde(r"~\.ssh\k.pub", None),
+            PathBuf::from(r"~\.ssh\k.pub")
+        );
+    }
+
+    /// On Unix a `\` is a filename character, never a separator: `~\…` is left as typed.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_backslash_after_the_tilde_stays_literal_off_windows() {
+        let home = Path::new("/home/op");
+        assert_eq!(
+            expand_tilde(r"~\.ssh\k.pub", Some(home)),
+            PathBuf::from(r"~\.ssh\k.pub")
+        );
+        assert_eq!(
+            expand_tilde(r"~/.ssh\k.pub", Some(home)),
+            home.join(r".ssh\k.pub")
         );
     }
 
