@@ -74,20 +74,37 @@ test('a closed slice has no planned leaf left', () => {
   }
 });
 
-test('the target leaves the Targets page and the Target screen act on are covered', () => {
-  for (const [leaf, id] of [
-    ['target list', 'target.list'],
-    ['target show', 'target.show'],
-    ['target use', 'target.use'],
-    ['target rename', 'target.rename'],
-    ['target remove', 'target.remove'],
-  ] as const) {
-    expect({ leaf, action: entries[leaf]?.action, slice: entries[leaf]?.slice }).toEqual({
+/** D.3's nine leaves, each with the action that covers it (docs/status.md names them). */
+const D3_LEAVES = [
+  ['target add', 'target.add'],
+  ['target list', 'target.list'],
+  ['target show', 'target.show'],
+  ['target use', 'target.use'],
+  ['target rename', 'target.rename'],
+  ['target remove', 'target.remove'],
+  ['target machine', 'target.machine'],
+  ['doctor', 'doctor.run'],
+  ['whoami', 'whoami.show'],
+] as const;
+
+// The closed-slice check above sees only the leaves of a slice it is told is closed: D.3 must
+// stay closed, and its nine leaves stay actions in it — re-planned under a later slice, or
+// back to planned, a leaf the app shows would no longer be held to its action.
+test('D.3 stays closed, and its nine leaves stay actions in it', () => {
+  expect(CLOSED_SLICES).toContain('D.3');
+  for (const [leaf, id] of D3_LEAVES) {
+    expect({
       leaf,
-      action: id,
-      slice: 'D.3',
-    });
+      action: entries[leaf]?.action,
+      slice: entries[leaf]?.slice,
+      status: entries[leaf]?.status ?? null,
+    }).toEqual({ leaf, action: id, slice: 'D.3', status: null });
   }
+  const inD3 = Object.entries(entries)
+    .filter(([, e]) => e.slice === 'D.3')
+    .map(([leaf]) => leaf)
+    .sort();
+  expect(inD3).toEqual(D3_LEAVES.map(([leaf]) => leaf).sort());
 });
 
 test('the fixed markers stay what the spec decided', () => {

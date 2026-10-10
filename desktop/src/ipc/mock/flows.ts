@@ -144,8 +144,26 @@ type ToolSpec = readonly [
   install: readonly (readonly [HintOs, string])[],
 ];
 
-/** The core's tool specs (cli-core tools.rs), in its probe order, as found on a Mac. */
+/**
+ * The core's tool specs (cli-core tools.rs), in its probe order (`ToolId::ALL`), with every
+ * install line, as found on a Mac; flows.test.ts reads tools.rs and holds the two equal.
+ */
 const TOOLS: readonly ToolSpec[] = [
+  [
+    'restic',
+    false,
+    'backup and restore',
+    '/opt/homebrew/bin',
+    'restic 0.18.0',
+    [
+      ['macos', 'brew install restic'],
+      ['debian', 'apt install restic'],
+      ['arch', 'pacman -S restic'],
+      ['nix', 'nix profile install nixpkgs#restic'],
+      ['windows', 'winget install restic.restic'],
+      ['other', 'https://restic.readthedocs.io/en/stable/020_installation.html'],
+    ],
+  ],
   [
     'kubectl',
     true,
@@ -175,19 +193,6 @@ const TOOLS: readonly ToolSpec[] = [
     ],
   ],
   [
-    'restic',
-    false,
-    'backup and restore',
-    '/opt/homebrew/bin',
-    'restic 0.18.0',
-    [
-      ['macos', 'brew install restic'],
-      ['debian', 'apt install restic'],
-      ['windows', 'winget install restic.restic'],
-      ['other', 'https://restic.readthedocs.io/en/stable/020_installation.html'],
-    ],
-  ],
-  [
     'git',
     false,
     'reading the application repository',
@@ -195,6 +200,8 @@ const TOOLS: readonly ToolSpec[] = [
     'git version 2.50.1',
     [
       ['macos', 'xcode-select --install'],
+      ['debian', 'apt install git'],
+      ['nix', 'nix profile install nixpkgs#git'],
       ['windows', 'winget install Git.Git'],
       ['other', 'https://git-scm.com/downloads'],
     ],
@@ -207,6 +214,8 @@ const TOOLS: readonly ToolSpec[] = [
     'OpenSSH_10.0p2',
     [
       ['macos', 'preinstalled'],
+      ['debian', 'apt install openssh-client'],
+      ['nix', 'nix profile install nixpkgs#openssh'],
       ['windows', 'built into Windows 10/11: Settings › Optional features › OpenSSH Client'],
     ],
   ],
@@ -218,6 +227,8 @@ const TOOLS: readonly ToolSpec[] = [
     'cue version v0.17.1',
     [
       ['macos', 'brew install cue'],
+      ['arch', 'pacman -S cue'],
+      ['nix', 'nix profile install nixpkgs#cue'],
       ['windows', 'winget install CueLang.Cue'],
       ['other', 'https://cuelang.org/docs/introduction/installation/'],
     ],
@@ -265,7 +276,10 @@ const row = (check: Pick<Check, 'id' | 'status' | 'title'> & Partial<Check>): Ch
   ...check,
 });
 
-/** The SSH key row as the core's doctor reads the stored key (apprafter-core doctor.rs). */
+/**
+ * The SSH key row as the core's doctor reads the stored key (apprafter-core doctor.rs `ssh_key`):
+ * the stored path as the detail and in the fix, never the `~/` form.
+ */
 function sshKeyRow(report: TargetReport): Check {
   const key = report.sshKey;
   const target = report.name;
@@ -278,7 +292,7 @@ function sshKeyRow(report: TargetReport): Check {
       fix: { kind: 'configure_ssh_key', target },
     });
   }
-  const detail = key.display;
+  const detail = key.path;
   switch (key.problem) {
     case null:
       return row({ id: 'ssh_key', status: 'pass', title, detail: `${detail} (${key.algo})` });
@@ -312,6 +326,65 @@ function sshKeyRow(report: TargetReport): Check {
         },
       });
   }
+}
+
+/**
+ * The Target group as the core's doctor writes it (doctor.rs `target_group`): the config, the
+ * credentials file, the provider, the token's format (or its absence), its check, the SSH key.
+ * The token rows follow what the store says it holds.
+ */
+function targetRows(report: TargetReport): Check[] {
+  const target = report.name;
+  const token: Check[] = report.token.set
+    ? [
+        row({
+          id: 'token_format',
+          status: 'pass',
+          title: 'Token format valid',
+          detail: `${report.token.chars ?? 0} chars, alphanumeric`,
+        }),
+        row({
+          id: 'token_verified',
+          status: 'pass',
+          title: 'Token verified against provider API',
+          detail: 'Hetzner Cloud /v1/locations, 182 ms',
+        }),
+      ]
+    : [
+        row({
+          id: 'token_present',
+          status: 'fail',
+          title: 'Hetzner token present',
+          fix: { kind: 'renew_token', target, why: 'token_missing' },
+        }),
+        row({
+          id: 'token_verified',
+          status: 'skipped',
+          title: 'Token verified against provider API',
+          detail: 'no token stored',
+        }),
+      ];
+  return [
+    row({
+      id: 'config_readable',
+      status: 'pass',
+      title: 'Config file readable',
+      detail: report.configFile,
+    }),
+    row({
+      id: 'credentials_file',
+      status: 'pass',
+      title: 'Credentials file present (mode 0600)',
+      detail: report.credentialsFile,
+    }),
+    row({
+      id: 'provider_supported',
+      status: 'pass',
+      title: `Provider \`${report.provider}\` supported`,
+    }),
+    ...token,
+    sshKeyRow(report),
+  ];
 }
 
 /**
@@ -367,24 +440,7 @@ export function mockDoctorReport(report: TargetReport): DoctorReport {
   return {
     target,
     groups: [
-      {
-        id: 'target',
-        checks: [
-          row({
-            id: 'config_readable',
-            status: 'pass',
-            title: 'Config file readable',
-            detail: report.configFile,
-          }),
-          row({
-            id: 'token_verified',
-            status: 'pass',
-            title: 'Token verified against provider API',
-            detail: 'Hetzner Cloud /v1/locations, 182 ms',
-          }),
-          sshKeyRow(report),
-        ],
-      },
+      { id: 'target', checks: targetRows(report) },
       { id: 'cluster', checks: cluster },
       {
         id: 'this_computer',

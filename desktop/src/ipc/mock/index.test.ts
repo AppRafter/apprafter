@@ -278,9 +278,9 @@ describe('installMockIpc', () => {
 
 /** Every tool the core runs, in its probe order (ToolId::ALL); the type check keeps it whole. */
 const TOOL_IDS = [
+  'restic',
   'kubectl',
   'helm',
-  'restic',
   'git',
   'ssh',
   'cue',

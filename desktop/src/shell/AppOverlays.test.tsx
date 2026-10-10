@@ -132,12 +132,19 @@ test('a lock takes the wizard with what was typed; Rust drops its draft; an unlo
   await waitFor(() =>
     expect(screen.queryByRole('dialog', { name: 'Add target' }) === null).toBe(true),
   );
-  expect(document.body.textContent?.includes(TOKEN)).toBe(false);
+  // Nowhere in the page: an input's value is in no text node, so not in textContent (review #8).
+  const tokenNowhere = () => {
+    expect(document.body.innerHTML).not.toContain(TOKEN);
+    const inputs = [...document.querySelectorAll('input')];
+    expect(inputs.some((input) => input.value.includes(TOKEN))).toBe(false);
+  };
+  tokenNowhere();
   await act(async () => {
     await api.unlock();
   });
   expect(await screen.findByRole('button', { name: 'Open a cluster' })).toBeDefined();
   expect(screen.queryByRole('dialog', { name: 'Add target' })).toBeNull();
+  tokenNowhere();
   // The lock's own discard of the draft was refused as locked: Rust drops it on the lock.
   const draftId = discards[0]?.draftId as number | undefined;
   expect(draftId).toBeDefined();

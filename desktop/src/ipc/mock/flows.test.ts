@@ -15,7 +15,7 @@ import type { TokenVerified } from '../generated/TokenVerified';
 import { HETZNER_TOKEN_LEN } from '../generated/target';
 import { operationsSnapshot, resetOperations, watchOperations } from '../operations';
 import { failureOf, resultOf, runRead, startPlan } from '../plans';
-import { MOCK_NOT_KEYS } from './fixtures';
+import { MOCK_HOME, MOCK_NOT_KEYS } from './fixtures';
 import { MOCK_CATALOGUE, MOCK_LATENCIES, MOCK_REJECTED_TOKEN } from './flows';
 import { installMockIpc, mockTargetStore } from './index';
 
@@ -147,16 +147,104 @@ test('doctor on a provisioned target: three stages, then a report with every sta
   });
 });
 
+// Review #16: the core's target group has six rows (doctor.rs target_group); the mock wrote three.
+test("doctor's Target group is the core's, row for row", async () => {
+  const report = await doctorOf('prod-eu');
+  const store = mockTargetStore().reports.get('prod-eu');
+  if (store === undefined) throw new Error('no prod-eu');
+  expect(
+    report.groups[0]?.checks.map(({ id, status, title, detail, fix }) => ({
+      id,
+      status,
+      title,
+      detail,
+      fix,
+    })),
+  ).toEqual([
+    {
+      id: 'config_readable',
+      status: 'pass',
+      title: 'Config file readable',
+      detail: store.configFile,
+      fix: null,
+    },
+    {
+      id: 'credentials_file',
+      status: 'pass',
+      title: 'Credentials file present (mode 0600)',
+      detail: store.credentialsFile,
+      fix: null,
+    },
+    {
+      id: 'provider_supported',
+      status: 'pass',
+      title: 'Provider `hetzner-cloud` supported',
+      detail: null,
+      fix: null,
+    },
+    {
+      id: 'token_format',
+      status: 'pass',
+      title: 'Token format valid',
+      detail: '64 chars, alphanumeric',
+      fix: null,
+    },
+    {
+      id: 'token_verified',
+      status: 'pass',
+      title: 'Token verified against provider API',
+      detail: 'Hetzner Cloud /v1/locations, 182 ms',
+      fix: null,
+    },
+    {
+      id: 'ssh_key',
+      status: 'pass',
+      title: 'SSH key readable',
+      detail: `${MOCK_HOME}/.ssh/id_ed25519.pub (ssh-ed25519)`,
+      fix: null,
+    },
+  ]);
+});
+
+test('doctor on a target with no token stored: present fails with its renewal, verify is skipped', async () => {
+  const store = mockTargetStore();
+  const staging = store.reports.get('staging');
+  if (staging === undefined) throw new Error('no staging');
+  store.reports.set('staging', { ...staging, token: { set: false, chars: null } });
+  const rows = (await doctorOf('staging')).groups[0]?.checks ?? [];
+  expect(rows.map((c) => c.id)).toEqual([
+    'config_readable',
+    'credentials_file',
+    'provider_supported',
+    'token_present',
+    'token_verified',
+    'ssh_key',
+  ]);
+  expect(rows[3]).toMatchObject({
+    status: 'fail',
+    title: 'Hetzner token present',
+    fix: { kind: 'renew_token', target: 'staging', why: 'token_missing' },
+  });
+  expect(rows[4]).toMatchObject({ status: 'skipped', detail: 'no token stored', fix: null });
+});
+
 test('doctor on a target with no server: the cluster checks are skipped', async () => {
   const report = await doctorOf('staging');
   expect(report.groups[1]?.checks.map((c) => c.status)).toEqual(['skipped', 'skipped', 'skipped']);
 });
 
 test("doctor's SSH key row says what the store holds: each of the three fixes", async () => {
+  // The key as the core's row shows it: the stored path, absolute, in the detail as in the fix
+  // (review #15: the detail was the `~/` form, beside a fix naming the absolute path).
+  expect(sshRow(await doctorOf('prod-eu'))).toMatchObject({
+    status: 'pass',
+    detail: `${MOCK_HOME}/.ssh/id_ed25519.pub (ssh-ed25519)`,
+  });
   // lab's key file is gone (fixtures.ts).
   expect(sshRow(await doctorOf('lab'))).toMatchObject({
     status: 'fail',
-    fix: { kind: 'ssh_key_missing', target: 'lab', path: '/home/alex/.ssh/lab.pub' },
+    detail: `${MOCK_HOME}/.ssh/lab.pub`,
+    fix: { kind: 'ssh_key_missing', target: 'lab', path: `${MOCK_HOME}/.ssh/lab.pub` },
   });
   // A target saved with no key (the wizard's Skip).
   const store = mockTargetStore();
@@ -173,6 +261,7 @@ test("doctor's SSH key row says what the store holds: each of the three fixes", 
   store.reports.set('staging', { ...staging, sshKey: privateKey ?? null });
   expect(sshRow(await doctorOf('staging'))).toMatchObject({
     status: 'fail',
+    detail: privateKey?.path,
     fix: {
       kind: 'ssh_key_not_public',
       target: 'staging',
@@ -187,12 +276,59 @@ test("doctor on a target the store does not hold is D.3d's: Add a target", async
   expect(report.groups[0]?.checks[0]?.fix).toMatchObject({ kind: 'add_target', name: 'nowhere' });
 });
 
+/**
+ * The core's tool specs as cli-core/src/tools.rs writes them, in its `ALL` order — the probe
+ * order (apprafter-core's `ToolId::ALL` is pinned to it there): each tool's name, purpose,
+ * whether it is required, and its install lines.
+ */
+async function coreToolSpecs() {
+  const text = await Bun.file(
+    new URL('../../../../cli/cli-core/src/tools.rs', import.meta.url),
+  ).text();
+  const all = /pub const ALL: &\[Tool\] = &\[([^\]]*)\];/.exec(text)?.[1] ?? '';
+  return all
+    .split(',')
+    .map((name) => name.trim())
+    .filter((name) => name !== '')
+    .map((name) => {
+      const start = text.indexOf(`pub const ${name}: Tool = Tool {`);
+      const block = text.slice(start, text.indexOf('\n};', start));
+      return {
+        tool: /name: "([^"]+)"/.exec(block)?.[1],
+        required: /required: (true|false)/.exec(block)?.[1] === 'true',
+        purpose: /purpose: "([^"]+)"/.exec(block)?.[1],
+        install: [...block.matchAll(/os: InstallOs::(\w+),\s*text: "([^"]*)"/g)].map(
+          ([, os, command]) => ({ os: os?.toLowerCase(), command }),
+        ),
+      };
+    });
+}
+
+// Review #14: the mock's tools were in the enum's order with some install lines missing, so
+// dev:mock and every walk showed a toolchain the real app never shows.
+test("the toolchain is the core's: its probe order, and every tool's purpose and install lines", async () => {
+  const core = await coreToolSpecs();
+  // The read found the specs: six tools, restic first, each with its lines.
+  expect(core.map((spec) => spec.tool)).toEqual(['restic', 'kubectl', 'helm', 'git', 'ssh', 'cue']);
+  for (const spec of core) expect(spec.install.length).toBeGreaterThan(3);
+  const tools = await api.toolchainStatus();
+  // The parsed specs are plain strings: compared as data, not as the IPC's own types.
+  expect(
+    tools.tools.map(({ tool, required, purpose, install }) => ({
+      tool,
+      required,
+      purpose,
+      install,
+    })) as unknown,
+  ).toEqual(core);
+});
+
 test('the toolchain: helm is missing, with a line for each system', async () => {
   const tools = await api.toolchainStatus();
   expect(tools.tools.map((t) => t.tool)).toEqual([
+    'restic',
     'kubectl',
     'helm',
-    'restic',
     'git',
     'ssh',
     'cue',
