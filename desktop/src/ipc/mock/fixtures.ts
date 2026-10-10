@@ -105,7 +105,7 @@ export const MOCK_UNREADABLE: readonly UnreadableTarget[] = [
     error: {
       code: 'apprafter::target::invalid_config',
       message: `target config at ${targetFiles('broken').configFile}: expected a mapping`,
-      help: `${targetFiles('broken').configFile} could not be read as a target configuration: it was edited by hand or written by an incompatible version. Fix it by hand (it is a small YAML file), or restore it from a backup. Otherwise remove target \`broken\` and add it again, its token included: the removal deletes both of its files.`,
+      help: `${targetFiles('broken').configFile} could not be read as a target configuration: it was edited by hand or written by an incompatible version. Fix it by hand (it is a small YAML file), or restore it from a backup. Otherwise remove target \`broken\` and add it again, its token included. The removal also deletes the target's local state: the record of its server, the cached kubeconfig and the Argo CD password. If a server is recorded, fix or restore the file first. After the target is added again, the record of its server can be rebuilt from the provider.`,
       causes: [],
       fields: { path: targetFiles('broken').configFile, target: 'broken' },
     },

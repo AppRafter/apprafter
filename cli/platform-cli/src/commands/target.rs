@@ -1389,7 +1389,8 @@ mod tests {
     }
 
     /// The help for a target file that cannot be read, and for a YAML error, sends the reader to
-    /// commands that exist: `target remove` (WI-458), then `target add`.
+    /// commands that exist: `target remove` (WI-458), then `target add`; a target's own file also
+    /// `import --target`, which rebuilds the state the removal deletes (WI-458 review #0/#2).
     #[test]
     fn the_unreadable_target_helps_name_commands_that_exist() {
         let config = CliError::InvalidTargetConfig {
@@ -1398,10 +1399,10 @@ mod tests {
             target: Some("prod".into()),
         };
         let yaml = CliError::from(serde_yaml::from_str::<u8>("[").unwrap_err());
-        for e in [config, yaml] {
+        for (e, commands) in [(config, 3), (yaml, 2)] {
             let h = miette::Diagnostic::help(&e).unwrap().to_string();
             assert!(h.contains("target remove"), "{h}");
-            assert_eq!(assert_commands_parse(&h), 2, "{h}");
+            assert_eq!(assert_commands_parse(&h), commands, "{h}");
         }
     }
 

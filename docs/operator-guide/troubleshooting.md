@@ -200,10 +200,16 @@ from a backup. Otherwise, it depends on whose file it is:
   `apprafter target add <name> --provider hetzner-cloud …`, its token
   included. `target remove` takes a target it cannot read: it warns
   which file cannot be read and deletes the target's files without
-  reading them. If the target's state records a server, the warning
-  also says that the server keeps running and that
+  reading them. The removal also deletes the target's local state:
+  the record of its server, the cached kubeconfig and the Argo CD
+  password. If a server is recorded, fix or restore the file first:
+  the warning names the server, which keeps running, and
   `apprafter destroy --target <name>` cannot read the token until the
-  files are fixed, so fix them first if you mean to destroy it.
+  files are fixed. If you remove it anyway, add the target again with
+  the same token and region, and
+  `apprafter import --target <name>` rebuilds the record from the
+  provider; the kubeconfig and the Argo CD password are fetched again
+  on first use.
 - **The store's own `config.yaml`**: no target's removal or re-add
   repairs it. It records only which target is the default, so you can
   delete it and choose the default again with

@@ -505,8 +505,8 @@ fn neutral_help(e: &cli_core::CliError) -> Option<String> {
             format!("{what} {fix}")
         }
         // A target's own file: or remove the target and add it again, which works on a target
-        // that cannot be read (WI-458). No removal repairs the store's own config.yaml (D.3d
-        // review #9), so its help offers none.
+        // that cannot be read (WI-458), and deletes its local state too (review #0/#2). No
+        // removal repairs the store's own config.yaml (D.3d review #9), so its help offers none.
         C::InvalidTargetConfig { path, target, .. } => {
             let fix = format!(
                 "{} could not be read as a target configuration: it was edited by hand or \
@@ -517,7 +517,10 @@ fn neutral_help(e: &cli_core::CliError) -> Option<String> {
             match target {
                 Some(name) => format!(
                     "{fix} Otherwise remove target `{name}` and add it again, its token \
-                     included: the removal deletes both of its files."
+                     included. The removal also deletes the target's local state: the record \
+                     of its server, the cached kubeconfig and the Argo CD password. If a server \
+                     is recorded, fix or restore the file first. After the target is added \
+                     again, the record of its server can be rebuilt from the provider."
                 ),
                 None => fix,
             }
@@ -1543,6 +1546,20 @@ mod tests {
             help.contains("remove target `prod`") && help.contains("add it again"),
             "{help}"
         );
+        // WI-458 review #0/#2: what the removal deletes beside the two files, to fix or restore
+        // the file first when a server is recorded, and that the record can be rebuilt — in
+        // words the GUI stands behind (no CLI command: the guard above).
+        for says in [
+            "local state",
+            "record of its server",
+            "cached kubeconfig",
+            "Argo CD password",
+            "If a server is recorded, fix or restore the file first",
+            "rebuilt from the provider",
+        ] {
+            assert!(help.contains(says), "{says}: {help}");
+        }
+        assert!(!help.contains("both of its files"), "{help}");
         let store = UiError::from(&CoreError::Cli(cli_core::CliError::InvalidTargetConfig {
             path: "/s/config.yaml".into(),
             message: "missing field `version`".into(),

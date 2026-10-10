@@ -147,9 +147,11 @@ fn server_type_help(
 
 /// `InvalidTargetConfig`'s help: the file, and the fixes that repair it. A target's own file
 /// (`target`) can also be re-created by removing the target and adding it again (`target remove`
-/// takes a target it cannot read, WI-458); the store's own `config.yaml` belongs to no target,
-/// so no removal or re-add repairs it — it records only the default target, which `target use`
-/// writes again once it is deleted (D.3d follow-up).
+/// takes a target it cannot read, WI-458); the removal deletes the target's local state too, the
+/// only local record of its server, so the help says so, and how `import` rebuilds the record
+/// (WI-458 review #0/#2). The store's own `config.yaml` belongs to no target, so no removal or
+/// re-add repairs it — it records only the default target, which `target use` writes again once
+/// it is deleted (D.3d follow-up).
 fn invalid_config_help(path: &Path, target: Option<&str>) -> String {
     let file = path.display();
     let why = "it was edited by hand or written by an incompatible CLI version. Fix it by hand \
@@ -159,7 +161,11 @@ fn invalid_config_help(path: &Path, target: Option<&str>) -> String {
             "{file} could not be read as target `{name}`'s configuration: {why} Otherwise \
              remove the target with `apprafter target remove {name}`, which takes a target it \
              cannot read, and add it again with `apprafter target add {name} --provider \
-             hetzner-cloud …` (its token too: the removal deletes both of its files)."
+             hetzner-cloud …`, its token too. The removal also deletes the target's local \
+             state: the record of its server, the cached kubeconfig and the Argo CD password. \
+             If a server is recorded, fix or restore the file first. After adding the target \
+             again, `apprafter import --target {name}` rebuilds the record from the provider; \
+             the kubeconfig and the password are fetched again on first use."
         ),
         None => format!(
             "{file} could not be read as the target store's configuration: {why} It records \
@@ -800,7 +806,20 @@ mod tests {
                 help.contains("`apprafter target add prod --provider hetzner-cloud …`"),
                 "{help}"
             );
-            for not_this in ["$XDG_CONFIG_HOME", "directory"] {
+            // WI-458 review #0/#2: the removal deletes the target's local state too — the only
+            // local record of its server — so the help says what goes, to fix or restore the
+            // file first when a server is recorded, and how the record comes back.
+            for says in [
+                "local state",
+                "record of its server",
+                "cached kubeconfig",
+                "Argo CD password",
+                "If a server is recorded, fix or restore the file first",
+                "`apprafter import --target prod`",
+            ] {
+                assert!(help.contains(says), "{says}: {help}");
+            }
+            for not_this in ["$XDG_CONFIG_HOME", "directory", "both of its files"] {
                 assert!(!help.contains(not_this), "{not_this}: {help}");
             }
         }
