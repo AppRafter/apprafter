@@ -56,6 +56,40 @@ describe('sessionReducer', () => {
     expect(state.tabs[1]).toEqual({ key: 'key-staging', target: 'stage', section: 'overview' });
   });
 
+  // Review #21: X removed in a terminal leaves its tab open (not found); renaming Y onto X is
+  // then allowed, and used to leave two tabs for X — a remove closed the stale one and left the
+  // acting tab on a removed target.
+  test('a rename onto a name a stale tab holds leaves one tab for it: the renamed one', () => {
+    let state = open(open(INITIAL_SESSION, 'x', 'key-x'), 'y', 'key-y');
+    state = sessionReducer(state, { type: 'targetRenamed', from: 'y', to: 'x' });
+    expect(state.tabs).toEqual([{ key: 'key-y', target: 'x', section: 'overview' }]);
+    expect(state.view).toEqual({ kind: 'tab', key: 'key-y' });
+    state = sessionReducer(state, { type: 'targetRemoved', target: 'x' });
+    expect(state).toEqual({ tabs: [], view: { kind: 'targets' } });
+  });
+
+  test('the stale tab shown when the rename lands: the renamed tab is shown in its place', () => {
+    let state = open(open(INITIAL_SESSION, 'x', 'key-x'), 'y', 'key-y');
+    state = sessionReducer(state, { type: 'show', view: { kind: 'tab', key: 'key-x' } });
+    state = sessionReducer(state, { type: 'targetRenamed', from: 'y', to: 'x' });
+    expect(state.view).toEqual({ kind: 'tab', key: 'key-y' });
+    expect(state.tabs.map((tab) => tab.key)).toEqual(['key-y']);
+  });
+
+  test('a remove closes every tab of the target', () => {
+    const state: Session = {
+      tabs: [
+        { key: 'a', target: 'x', section: 'overview' },
+        { key: 'b', target: 'y', section: 'overview' },
+        { key: 'c', target: 'x', section: 'target' },
+      ],
+      view: { kind: 'tab', key: 'c' },
+    };
+    const next = sessionReducer(state, { type: 'targetRemoved', target: 'x' });
+    expect(next.tabs.map((tab) => tab.key)).toEqual(['b']);
+    expect(next.view).toEqual({ kind: 'tab', key: 'b' });
+  });
+
   test('removing a target closes its tab', () => {
     const state = sessionReducer(three(), { type: 'targetRemoved', target: 'lab' });
     expect(state.tabs.map((t) => t.target)).toEqual(['prod-eu', 'staging']);

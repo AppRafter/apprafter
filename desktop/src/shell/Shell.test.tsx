@@ -371,6 +371,9 @@ describe('Shell, the Target section on the mock IPC', () => {
     await waitFor(() => expect(tab('staging-2').getAttribute('aria-selected')).toBe('true'));
     expect(screen.queryByRole('tab', { name: 'staging' })).toBeNull();
     expect(pageTitle()).toBe('Target');
+    // Review #14: the screen keeps its cards across the rename (no spinner while the new name
+    // is read), so the focus goes back to the Rename button that started it.
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Rename' }));
     expect(await screen.findByText('hetzner-cloud · fsn1 · T1')).toBeDefined();
     expect((await screen.findByRole('group', { name: 'Name' })).textContent).toContain('staging-2');
 

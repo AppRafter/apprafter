@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 // The Targets view: every target in the local target store (target_list), each opening in its
-// own tab; an unreadable one gets a card saying why; a CLI default that names no target says so.
-// Make default for the CLI runs the reversible use plan at once.
+// own tab; an unreadable one gets a card saying why; a CLI default that names no target, or one
+// that cannot be read, says so. Make default for the CLI runs the reversible use plan at once.
 import { useCallback, useState } from 'react';
 import { ErrorPanel } from '../../components/ErrorPanel';
 import { SpinnerGapIcon } from '../../components/icons';
@@ -69,11 +69,20 @@ function Store({
   onMakeDefault: (name: string) => void;
 }) {
   const empty = report.targets.length === 0 && report.unreadable.length === 0;
+  const pointer = report.cliDefault;
+  const cliDefault = pointer.status === 'unset' ? null : pointer.name;
+  const unreadableDefault =
+    pointer.status === 'set' && report.unreadable.some((target) => target.name === pointer.name);
   return (
     <>
-      {report.cliDefault.status === 'missing' && (
+      {pointer.status === 'missing' && (
         <p className="page-notice">
-          {`The CLI default points at ${report.cliDefault.name}, which is not in the store.`}
+          {`The CLI default points at ${pointer.name}, which is not in the store.`}
+        </p>
+      )}
+      {unreadableDefault && (
+        <p className="page-notice">
+          {`The CLI default points at ${cliDefault}, which cannot be read: CLI commands that name no target fail until it is fixed.`}
         </p>
       )}
       {empty && (
@@ -94,7 +103,11 @@ function Store({
           />
         ))}
         {report.unreadable.map((target) => (
-          <UnreadableCard key={target.name} target={target} />
+          <UnreadableCard
+            key={target.name}
+            target={target}
+            isCliDefault={target.name === cliDefault}
+          />
         ))}
         <AddTargetCard />
       </div>

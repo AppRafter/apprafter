@@ -91,6 +91,39 @@ test('an empty store says how to add one, and a dangling CLI default is named', 
   ).toBeDefined();
 });
 
+test('a CLI default that names an unreadable target: its card is tagged, and the page says so (review #12)', async () => {
+  // In a terminal: broken (unreadable) became the CLI default.
+  clearMocks();
+  mockIPC((cmd) =>
+    cmd === 'target_list'
+      ? {
+          targets: [],
+          unreadable: [
+            {
+              name: 'broken',
+              error: {
+                code: 'apprafter::target::invalid_config',
+                message: 'targets/broken/config.yaml: expected a mapping',
+                help: null,
+                causes: [],
+                fields: {},
+              },
+            },
+          ],
+          cliDefault: { status: 'set', name: 'broken' },
+        }
+      : null,
+  );
+  renderScreen(<TargetsPage onOpen={() => {}} openTargets={new Set()} />);
+  const card = await screen.findByRole('article', { name: 'broken' });
+  expect(within(card).getByText('CLI default')).toBeDefined();
+  expect(
+    screen.getByText(
+      'The CLI default points at broken, which cannot be read: CLI commands that name no target fail until it is fixed.',
+    ),
+  ).toBeDefined();
+});
+
 test('a store that cannot be read says why', async () => {
   clearMocks();
   mockIPC((cmd) =>

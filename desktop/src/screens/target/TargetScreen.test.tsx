@@ -109,6 +109,10 @@ test('a rejected token shows on the screen, with Renew token to try again', asyn
   await user.click(within(panel).getByRole('button', { name: 'Renew token' }));
   expect(screen.getByRole('dialog', { name: 'Renew API token' })).toBeDefined();
   expect(screen.queryByRole('alert')).toBeNull();
+  // Review #14: the button that opened the form went with the panel. Closed, the form leaves
+  // the focus on the page's heading — in this view, not on <body> (where Tab starts over).
+  await user.click(screen.getByRole('button', { name: 'Cancel' }));
+  expect(document.activeElement).toBe(screen.getByRole('heading', { level: 1, name: 'Target' }));
 });
 
 test('remove: the full plan, the typed name, then the gesture; the tab closes', async () => {

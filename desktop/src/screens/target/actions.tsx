@@ -16,6 +16,7 @@ import type { SshKeyInfo } from '../../ipc/generated/SshKeyInfo';
 import type { TargetRemoved } from '../../ipc/generated/TargetRemoved';
 import type { TargetRenamed } from '../../ipc/generated/TargetRenamed';
 import type { TargetRenewed } from '../../ipc/generated/TargetRenewed';
+import type { TargetReport } from '../../ipc/generated/TargetReport';
 import type { TargetUsed } from '../../ipc/generated/TargetUsed';
 import { HETZNER_TOKEN_LEN } from '../../ipc/generated/target';
 import type { UiError } from '../../ipc/generated/UiError';
@@ -24,7 +25,7 @@ import { OperationFailed, resultOf, startPlan } from '../../ipc/plans';
 import { useOverlay } from '../../shell/ViewFrame';
 import { usePlatform } from '../../state/platform';
 import { useTab } from '../../state/tab';
-import { refreshTargets } from '../../state/targets';
+import { refreshTargets, targetKey } from '../../state/targets';
 import { nameMessage, nameProblem, tokenMessage } from '../targets/rules';
 import { removedMessage, renamedMessage, renewedMessage, usedMessage } from './outcomes';
 import { keyRefusal } from './sshKey';
@@ -264,6 +265,12 @@ export function useTargetActions({
               icon: PencilSimpleIcon,
               onDone: (result) => {
                 const out = result as unknown as TargetRenamed;
+                // The report under its new name until the store is read again: the screen keeps
+                // its cards, and the Rename button the focus returns to, instead of a spinner.
+                const before = client.getQueryData<TargetReport>(targetKey(out.from));
+                if (before !== undefined) {
+                  client.setQueryData(targetKey(out.to), { ...before, name: out.to });
+                }
                 onRenamed(out.from, out.to);
                 refreshTargets(client, name);
                 toast({ message: renamedMessage(out), icon: PencilSimpleIcon });

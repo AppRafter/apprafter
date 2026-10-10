@@ -66,6 +66,56 @@ describe('FormDialog', () => {
     expect(onSubmit).toHaveBeenCalledWith({ key: 'b' });
   });
 
+  // Review #15: a browser tabs into a radio group once, at its checked radio, so the dialog's
+  // Tab trap counts the group as one stop. Shift+Tab from a checked radio that is not the first
+  // enabled one used to escape the dialog (the trap compared it with the first radio).
+  test('a radio group is one Tab stop: Shift+Tab from its checked radio wraps inside', async () => {
+    const { user } = open({
+      fields: [
+        {
+          key: 'key',
+          label: 'SSH public key',
+          kind: 'radio',
+          options: [
+            { value: 'a', label: '~/.ssh/a.pub', disabled: true },
+            { value: 'b', label: '~/.ssh/b.pub' },
+            { value: 'other', label: 'Other path…' },
+          ],
+          def: 'other',
+        },
+      ],
+    });
+    const other = screen.getByRole('radio', { name: 'Other path…' });
+    // Entered at the checked radio, as a browser would.
+    expect(document.activeElement).toBe(other);
+    act(() => other.focus());
+    await user.tab({ shift: true });
+    expect(document.activeElement).toBe(submit());
+    await user.tab();
+    expect(document.activeElement).toBe(other);
+  });
+
+  test('a radio group with none checked is entered at its first enabled radio', async () => {
+    const { user } = open({
+      fields: [
+        {
+          key: 'key',
+          label: 'SSH public key',
+          kind: 'radio',
+          options: [
+            { value: 'a', label: '~/.ssh/a.pub', disabled: true },
+            { value: 'b', label: '~/.ssh/b.pub' },
+            { value: 'c', label: '~/.ssh/c.pub' },
+          ],
+        },
+      ],
+    });
+    const b = screen.getByRole('radio', { name: '~/.ssh/b.pub' });
+    expect(document.activeElement).toBe(b);
+    await user.tab({ shift: true });
+    expect(document.activeElement).toBe(submit());
+  });
+
   test('a radio field starts from its default', () => {
     open({
       fields: [

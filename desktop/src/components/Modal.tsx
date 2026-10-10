@@ -17,12 +17,39 @@ const FOCUSABLE =
   'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), ' +
   'textarea:not([disabled]), [tabindex]';
 
+/**
+ * Where the focus goes when a dialog closes and the control that opened it is gone (an error
+ * panel's action that cleared the panel, a screen that re-rendered): the page heading of the
+ * view the dialog belongs to (`.view` > `.view-content`), never <body>, where the next Tab
+ * starts over from the title bar. An app-level dialog (Settings) has no view, and no fallback.
+ */
+function headingOf(host: Element | null | undefined): HTMLElement | null {
+  return host?.querySelector<HTMLElement>(':scope > .view-content h1[tabindex="-1"]') ?? null;
+}
+
+const isRadio = (element: Element): element is HTMLInputElement =>
+  element instanceof HTMLInputElement && element.type === 'radio';
+
+/**
+ * The Tab stops inside `root`, in order. A radio group is one stop, as a browser tabs through it:
+ * its checked radio, or its first enabled one when none is checked (review #15) — so the trap's
+ * first and last are the stops the browser really moves between.
+ */
 function focusables(root: HTMLElement | null): HTMLElement[] {
   if (root === null) return [];
-  return [...root.querySelectorAll<HTMLElement>(FOCUSABLE)].filter(
+  const all = [...root.querySelectorAll<HTMLElement>(FOCUSABLE)].filter(
     (element) =>
       element.getAttribute('tabindex') !== '-1' &&
       !(element instanceof HTMLButtonElement && element.disabled),
+  );
+  const stopOf = new Map<string, HTMLInputElement>();
+  for (const element of all) {
+    if (!isRadio(element) || element.name === '') continue;
+    const stop = stopOf.get(element.name);
+    if (stop === undefined || (element.checked && !stop.checked)) stopOf.set(element.name, element);
+  }
+  return all.filter(
+    (element) => !isRadio(element) || element.name === '' || stopOf.get(element.name) === element,
   );
 }
 
@@ -45,7 +72,8 @@ export interface ModalFrameProps {
 /**
  * The behaviour every overlay shares: focus moves in (to the first control of the body, else the
  * first control, else the panel), Tab and Shift+Tab wrap inside, Esc closes, the background is
- * inert, and on close the focus returns to where it was.
+ * inert, and on close the focus returns to where it was — or, that control gone, to its view's
+ * page heading.
  */
 export function ModalFrame({
   labelledBy,
@@ -66,8 +94,12 @@ export function ModalFrame({
   };
 
   useLayoutEffect(() => {
-    const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const opener =
+      document.activeElement instanceof HTMLElement && document.activeElement !== document.body
+        ? document.activeElement
+        : null;
     const own = layerRef.current;
+    const host = own?.parentElement;
     const madeInert: Element[] = [];
     for (const sibling of own?.parentElement?.children ?? []) {
       // A live region (the toasts) stays live: what it announces must be heard over the dialog
@@ -82,7 +114,7 @@ export function ModalFrame({
     (focusables(body)[0] ?? focusables(panel)[0] ?? panel)?.focus();
     return () => {
       for (const element of madeInert) element.removeAttribute('inert');
-      if (opener?.isConnected) opener.focus();
+      (opener?.isConnected ? opener : headingOf(host))?.focus();
     };
   }, []);
 
