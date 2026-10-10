@@ -341,7 +341,7 @@ server, the server warning adds that nothing can check that server
 through this target, and that `apprafter destroy --target <name>`
 cannot read its token until the files are fixed or restored. So fix
 them first if you mean to destroy that server, or delete it in the
-Hetzner Cloud Console.
+Hetzner Console.
 
 ## Anti-patterns
 

@@ -1320,7 +1320,7 @@ mod tests {
              does not delete it, and it keeps running (and billing) at the provider. To delete \
              it first, run `apprafter destroy --target prod`, which deletes every \
              `apprafter=true` resource in the token's Hetzner project, not only this cluster; \
-             or delete server 42 in the Hetzner Cloud Console."
+             or delete server 42 in the Hetzner Console."
         );
         assert_eq!(assert_commands_parse(&w), 1, "{w}");
         let u = unreadable_state_warning("prod", "state file at /s: expected value");
@@ -1367,7 +1367,7 @@ mod tests {
              `apprafter destroy --target prod` cannot read its token. To delete it first, fix \
              or restore those files and run that command, which deletes every `apprafter=true` \
              resource in the token's Hetzner project, not only this cluster; or delete server 42 \
-             in the Hetzner Cloud Console."
+             in the Hetzner Console."
         );
         assert_eq!(assert_commands_parse(&s), 1, "{s}");
     }
@@ -2339,14 +2339,14 @@ pub(crate) fn orphaned_server_warning(
     if readable {
         format!(
             "{left} To delete it first, run `apprafter destroy --target {name}`, {scope}; or \
-             delete server {id} in the Hetzner Cloud Console."
+             delete server {id} in the Hetzner Console."
         )
     } else {
         format!(
             "{left} The target's files cannot be read, so nothing here can check the server, \
              and `apprafter destroy --target {name}` cannot read its token. To delete it first, \
              fix or restore those files and run that command, {scope}; or delete server {id} in \
-             the Hetzner Cloud Console."
+             the Hetzner Console."
         )
     }
 }

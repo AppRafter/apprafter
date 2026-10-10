@@ -16,8 +16,7 @@
 //!    one) is not this console and passes ([`OTHER_VENDORS`]). `api.hetzner.cloud` and
 //!    `docs.hetzner.cloud` are the API and its reference, which kept their addresses.
 //!
-//! Only [`HISTORY`] is exempt, each entry with its reason, plus the temporary
-//! [`PENDING_REMOVE_WARNING`], which fails the test once nothing is left for it to cover.
+//! Only [`HISTORY`] is exempt, each entry with its reason.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -50,17 +49,6 @@ const HISTORY: &[(&str, &str)] = &[
         "cli/platform-cli/tests/hetzner_console_wording_test.rs",
         "this file: its matchers' own cases spell the old wordings out",
     ),
-];
-
-/// TEMPORARY. `target remove`'s warning, its tests, its goldens and its guide page say "delete
-/// server <id> in the Hetzner Cloud Console" (or "delete it in …"). WI-458 is rewriting that
-/// warning on `feat/desktop-d3`, so those sites are aligned after WI-458 lands, not here. An
-/// old-name hit in one of these files that follows one of those two phrases passes. Once none is
-/// left the test fails until this list is deleted, so the exemption cannot outlive its sites.
-const PENDING_REMOVE_WARNING: &[&str] = &[
-    "cli/platform-cli/src/commands/target.rs",
-    "cli/platform-cli/tests/golden/target/remove_",
-    "docs/operator-guide/target-store.md",
 ];
 
 /// Vendors whose own product is called a Cloud Console: "Google Cloud Console" is not the old
@@ -228,15 +216,6 @@ fn around(text: &str, at: usize, before: usize, after: usize) -> &str {
     &text[from..to]
 }
 
-/// An old-name hit that [`PENDING_REMOVE_WARNING`] covers: in one of its files, right after
-/// "delete server <id> in the Hetzner" or "delete it in the Hetzner".
-fn pending(path: &str, text: &str, at: usize) -> bool {
-    let before = around(text, at, 40, 0);
-    PENDING_REMOVE_WARNING.iter().any(|p| path.starts_with(p))
-        && before.ends_with("in the Hetzner ")
-        && (before.contains("delete server ") || before.contains("delete it in the"))
-}
-
 #[test]
 fn the_hetzner_console_is_named_one_way_everywhere() {
     let root = repo_root();
@@ -251,7 +230,6 @@ fn the_hetzner_console_is_named_one_way_everywhere() {
         .find("Security")
         .expect("the constant names the Security page");
     let mut carriers = Vec::new();
-    let mut pending_hits = 0;
     let mut problems = Vec::new();
     for rel in files.iter().filter(|f| !exempt(f)) {
         // Not UTF-8 (an image, a font): no prose to check.
@@ -280,14 +258,10 @@ fn the_hetzner_console_is_named_one_way_everywhere() {
             }
         }
         for at in old_console_names(&text) {
-            if pending(rel, &text, at) {
-                pending_hits += 1;
-            } else {
-                problems.push(format!(
-                    "{rel}: the console's old name or address: …{}…",
-                    around(&text, at, 60, 40)
-                ));
-            }
+            problems.push(format!(
+                "{rel}: the console's old name or address: …{}…",
+                around(&text, at, 60, 40)
+            ));
         }
     }
     assert!(
@@ -304,11 +278,6 @@ fn the_hetzner_console_is_named_one_way_everywhere() {
              reads that kind of file"
         );
     }
-    assert!(
-        pending_hits > 0,
-        "nothing left for PENDING_REMOVE_WARNING to exempt: the remove warning is aligned, so \
-         delete that list and its use"
-    );
 }
 
 #[test]
@@ -383,41 +352,5 @@ fn old_console_names_finds_the_old_name_and_address_only() {
         "a Hetzner-Console resize",
     ] {
         assert!(old_console_names(fine).is_empty(), "{fine}");
-    }
-}
-
-#[test]
-fn the_pending_exemption_covers_only_the_remove_warning() {
-    let target_rs = "cli/platform-cli/src/commands/target.rs";
-    let first = |s: &str| old_console_names(s)[0];
-    for warning in [
-        "or delete server 42 in the Hetzner Cloud Console.",
-        "or delete server {id} in the Hetzner Cloud Console.",
-        "fix them first if you mean to destroy that server, or delete it in the Hetzner Cloud \
-         Console.",
-    ] {
-        assert!(pending(target_rs, warning, first(warning)), "{warning}");
-        assert!(pending(
-            "cli/platform-cli/tests/golden/target/remove_provisioned.golden",
-            warning,
-            first(warning)
-        ));
-        // The same sentence anywhere else is not pending.
-        assert!(!pending(
-            "cli/platform-cli/src/render/core_error.rs",
-            warning,
-            first(warning)
-        ));
-    }
-    // Another sentence in a pending file is not pending either.
-    for other in [
-        "Check the Hetzner Cloud Console for the cause.",
-        "delete this one's server by ID in the Cloud Console and run",
-        "The only safe teardown of one of them is by ID in the Hetzner Cloud Console.",
-    ] {
-        assert!(
-            !pending("docs/operator-guide/target-store.md", other, first(other)),
-            "{other}"
-        );
     }
 }
