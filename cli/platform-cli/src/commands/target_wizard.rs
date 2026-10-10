@@ -594,12 +594,13 @@ fn prompt_ssh_key(
     // when the directory is empty / unreadable (and there is no
     // stored key to keep).
     let candidates = apprafter_core::ssh::public_key_candidates(ctx)?;
-
-    if candidates.is_empty() && keep.is_none() {
-        return prompt_ssh_key_text_fallback(ctx.home_dir());
+    let (rows, notes) = ssh_key_picker(candidates, keep);
+    for note in notes {
+        eprintln!("{note}");
     }
-
-    let options = build_ssh_key_choices(candidates, keep);
+    let Some(options) = rows else {
+        return prompt_ssh_key_text_fallback(ctx.home_dir());
+    };
 
     let selected = Select::new("SSH public key:", options)
         .with_help_message("Used for server provisioning; can be added/changed later.")
@@ -624,6 +625,26 @@ fn prompt_ssh_key_text_fallback(home: Option<&Path>) -> CoreResult<Option<PathBu
         .prompt()
         .map_err(map_inquire_err)?;
     Ok(ssh_key_answer_to_path(&answer, home))
+}
+
+/// The SSH-key picker for the `.pub` files found under `~/.ssh`: its rows
+/// ([`build_ssh_key_choices`]) over the files that hold a public key, and one note per file
+/// left out because it holds none — an OpenSSH certificate (`*-cert.pub`: it certifies a key and
+/// is not one), an ssh-dss key, junk. A terminal picker has no disabled row, so such
+/// a file is named, as the desktop labels it, rather than offered: picked, the plan would refuse
+/// it only after every later prompt (D.3d verification). `None` rows when no key is left and
+/// there is no keep row: the text prompt is asked instead.
+fn ssh_key_picker(
+    candidates: Vec<SshKeyCandidate>,
+    keep: Option<Option<String>>,
+) -> (Option<Vec<SshKeyChoice>>, Vec<String>) {
+    let (keys, not_keys): (Vec<_>, Vec<_>) = candidates.into_iter().partition(|c| c.algo.is_some());
+    let notes = not_keys
+        .iter()
+        .map(|c| format!("  ℹ Not offered: {} (not an SSH public key)", c.display))
+        .collect();
+    let rows = (!keys.is_empty() || keep.is_some()).then(|| build_ssh_key_choices(keys, keep));
+    (rows, notes)
 }
 
 /// Build the SSH-key picker rows: one `Path` row per found key
@@ -1853,6 +1874,56 @@ mod tests {
         assert_eq!(empty.len(), 2);
         assert_eq!(empty[0].to_string(), "Other (type a path)");
         assert_eq!(empty[1].to_string(), "Skip (don't attach an SSH key now)");
+    }
+
+    /// D.3d verification (finding D): a `.pub` under `~/.ssh` that holds no public key (an
+    /// OpenSSH certificate `*-cert.pub`, an ssh-dss key, junk) is never a row: the plan would
+    /// refuse it only after every later prompt. A note names it with the desktop's words, and
+    /// with no key left and no keep row the text prompt is asked instead of a picker.
+    #[test]
+    fn a_pub_file_that_holds_no_public_key_is_noted_never_offered() {
+        let key = SshKeyCandidate {
+            path: "/h/.ssh/a.pub".into(),
+            display: "~/.ssh/a.pub".into(),
+            algo: Some("ssh-ed25519".into()),
+            comment: None,
+        };
+        let cert = SshKeyCandidate {
+            path: "/h/.ssh/a-cert.pub".into(),
+            display: "~/.ssh/a-cert.pub".into(),
+            algo: None,
+            comment: None,
+        };
+        let note = "  ℹ Not offered: ~/.ssh/a-cert.pub (not an SSH public key)".to_string();
+        let shown = |rows: &Option<Vec<SshKeyChoice>>| {
+            rows.as_ref()
+                .map(|rows| rows.iter().map(ToString::to_string).collect::<Vec<_>>())
+        };
+        let (rows, notes) = ssh_key_picker(vec![key.clone(), cert.clone()], None);
+        assert_eq!(
+            shown(&rows),
+            Some(vec![
+                "~/.ssh/a.pub  (ssh-ed25519)".to_string(),
+                "Other (type a path)".to_string(),
+                "Skip (don't attach an SSH key now)".to_string(),
+            ])
+        );
+        assert_eq!(notes, std::slice::from_ref(&note));
+        // Nothing left to pick: the text prompt, the note still said.
+        let (rows, notes) = ssh_key_picker(vec![cert.clone()], None);
+        assert!(rows.is_none(), "{:?}", shown(&rows));
+        assert_eq!(notes, std::slice::from_ref(&note));
+        // A `--force` overwrite keeps its keep row, so the picker stays.
+        let (rows, _) = ssh_key_picker(vec![cert], Some(None));
+        assert_eq!(
+            shown(&rows),
+            Some(vec![
+                "Keep: no SSH key (none is stored)".to_string(),
+                "Other (type a path)".to_string(),
+            ])
+        );
+        let (rows, notes) = ssh_key_picker(Vec::new(), None);
+        assert!(rows.is_none() && notes.is_empty());
     }
 
     /// The free-text SSH-key path accepts "nothing" (the documented
