@@ -109,6 +109,12 @@ test('a rename of the CLI default moves the pointer; the old name is then not fo
     cliDefault: { from: 'prod-eu', to: 'prod-us' },
   });
   expect((await api.targetList()).cliDefault).toEqual({ status: 'set', name: 'prod-us' });
+  // Its files moved with it, as the core's rename moves the target's directory.
+  expect(await api.targetShow('prod-us')).toMatchObject({
+    name: 'prod-us',
+    configFile: '~/.config/apprafter/targets/prod-us/config.yaml',
+    credentialsFile: '~/.config/apprafter/targets/prod-us/credentials.yaml',
+  });
   const gone = await refusalOf(api.targetShow('prod-eu'));
   expect(gone.code).toBe(CORE_ERROR_CODES.TARGET_NOT_FOUND);
 });

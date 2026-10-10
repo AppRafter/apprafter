@@ -45,6 +45,7 @@ import {
   MOCK_SSH_KEYS,
   MOCK_TOOLCHAIN,
   MOCK_UNREADABLE,
+  targetFiles,
 } from './fixtures';
 import type { Handler, MockOps, MockResult } from './ops';
 
@@ -443,8 +444,7 @@ export function targetHandlers(ops: MockOps, store: MockStore): Record<string, H
               clusterName: null,
               sshKey: key,
               token: { set: true, chars: 64 },
-              configFile: `~/.config/apprafter/targets/${name}/config.yaml`,
-              credentialsFile: `~/.config/apprafter/targets/${name}/credentials.yaml`,
+              ...targetFiles(name),
               provisioned: { status: 'not_provisioned' },
             });
             if (becomesDefault) store.cliDefault = name;
@@ -585,7 +585,7 @@ export function targetHandlers(ops: MockOps, store: MockStore): Record<string, H
             if (current === undefined) return { error: notFound(store, from) };
             if (namesIn(store).includes(to)) return { error: exists(to) };
             store.reports.delete(from);
-            store.reports.set(to, { ...current, name: to });
+            store.reports.set(to, { ...current, name: to, ...targetFiles(to) });
             const movedDefault = store.cliDefault === from;
             if (movedDefault) store.cliDefault = to;
             return result({

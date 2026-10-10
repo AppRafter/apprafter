@@ -15,7 +15,8 @@ import type { WhoamiReport } from '../generated/WhoamiReport';
 export const MOCK_CLI_DEFAULT = 'prod-eu';
 
 const HOME = '/home/alex';
-const files = (name: string) => ({
+/** A target's two files in the store, as `target_show` reports them: they follow its name. */
+export const targetFiles = (name: string) => ({
   configFile: `~/.config/apprafter/targets/${name}/config.yaml`,
   credentialsFile: `~/.config/apprafter/targets/${name}/credentials.yaml`,
 });
@@ -42,7 +43,7 @@ export const MOCK_REPORTS: readonly TargetReport[] = [
       algo: 'ssh-ed25519',
     },
     token: { set: true, chars: 64 },
-    ...files('prod-eu'),
+    ...targetFiles('prod-eu'),
     provisioned: {
       status: 'provisioned',
       server: { serverId: 4711, serverName: 'prod-eu-1', serverType: 'cpx22' },
@@ -64,7 +65,7 @@ export const MOCK_REPORTS: readonly TargetReport[] = [
       algo: 'ssh-ed25519',
     },
     token: { set: true, chars: 64 },
-    ...files('staging'),
+    ...targetFiles('staging'),
     provisioned: { status: 'not_provisioned' },
   },
   {
@@ -83,7 +84,7 @@ export const MOCK_REPORTS: readonly TargetReport[] = [
       algo: null,
     },
     token: { set: true, chars: 64 },
-    ...files('lab'),
+    ...targetFiles('lab'),
     provisioned: { status: 'not_provisioned' },
   },
 ];
