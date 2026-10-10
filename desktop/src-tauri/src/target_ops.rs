@@ -127,17 +127,26 @@ pub fn ssh_key_candidates(shell: &Shell) -> Result<Vec<SshKeyCandidate>, Desktop
 
 /// The key a typed path names, `~/` expanded against the context's home as a shell would for
 /// the CLI (the field suggests `~/.ssh/id_ed25519.pub`); its `path` is the expanded one, which is
-/// what a plan is then given.
+/// what a plan is then given. A relative path is refused ([`typed_key_path`]).
 pub fn ssh_key_inspect(shell: &Shell, path: &str) -> Result<SshKeyInfo, DesktopError> {
     Ok(ssh::inspect_key(
         &shell.context,
-        &typed_key_path(shell, path),
+        &typed_key_path(shell, path)?,
     )?)
 }
 
-/// A key path the page typed, as the core is given it: `~/` expanded against the context's home.
-fn typed_key_path(shell: &Shell, path: &str) -> PathBuf {
-    ssh::expand_tilde(path, shell.context.home_dir())
+/// A key path the page typed, as the core is given it: `~/` expanded against the context's home,
+/// and refused unless it is then a full path. A relative one would resolve against the app's
+/// working directory, which no window shows and means nothing to whoever typed it; the CLI keeps
+/// resolving against its cwd, the directory its user is in. A typed refusal, not an
+/// `SshKeyInfo` problem: nothing was looked at, so there is no `exists` to report.
+fn typed_key_path(shell: &Shell, path: &str) -> Result<PathBuf, DesktopError> {
+    let expanded = ssh::expand_tilde(path, shell.context.home_dir());
+    if expanded.is_absolute() {
+        Ok(expanded)
+    } else {
+        Err(DesktopError::RelativePath { path: path.into() })
+    }
 }
 
 /// Bounded by the core: the probes run concurrently, each killed after 5 s (R14) — and, the
@@ -276,7 +285,10 @@ pub fn plan_target_add(shell: &Shell, args: TargetAddArgs) -> Result<PlanView, D
             name: args.name,
             provider,
             token,
-            ssh_key: args.ssh_key.map(|p| typed_key_path(shell, &p)),
+            ssh_key: args
+                .ssh_key
+                .map(|p| typed_key_path(shell, &p))
+                .transpose()?,
             region: args.region,
             tier: args.tier,
             cluster_name: None,
@@ -294,7 +306,8 @@ pub fn plan_target_add(shell: &Shell, args: TargetAddArgs) -> Result<PlanView, D
 /// key row). The core changes what differs from what is stored: a key alone (`token: None`)
 /// keeps the credentials and asks the provider nothing; a new token is checked with the provider
 /// when the plan runs, and only then saved. An unreadable key, or a renewal that would change
-/// nothing, is refused before any plan. The key path is typed: `~/` expands against the home.
+/// nothing, is refused before any plan. The key path is typed: `~/` expands against the home, and
+/// a relative path is refused.
 pub fn plan_target_renew(
     shell: &Shell,
     name: &str,
@@ -302,7 +315,7 @@ pub fn plan_target_renew(
     ssh_key: Option<String>,
 ) -> Result<PlanView, DesktopError> {
     let named = TargetRef::named(&shell.context, name)?;
-    let ssh_key = ssh_key.map(|p| typed_key_path(shell, &p));
+    let ssh_key = ssh_key.map(|p| typed_key_path(shell, &p)).transpose()?;
     let verb = if token.is_some() {
         "renew the token of"
     } else {
@@ -927,6 +940,92 @@ mod tests {
         result_of(ended(&shell, view.op_id));
         let saved = cli_core::load_target(&shell.context.store(), "lab").unwrap();
         assert_eq!(saved.config.ssh_key_path.as_deref(), Some(key.as_path()));
+    }
+
+    /// D.3d follow-up: a relative path typed in the GUI would resolve against the app's working
+    /// directory, which means nothing to whoever typed it. Inspected or planned (renew, add),
+    /// it is refused by name before anything is read or planned, and the draft stays for the
+    /// corrected form; a full path and a `~/` path are taken (the CLI keeps its cwd rule).
+    #[test]
+    fn a_relative_key_path_is_refused_never_resolved_against_the_apps_folder() {
+        let s = store(&["prod"], None);
+        let home = s._dir.path().join("home");
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::fs::write(home.join(".ssh").join("id.pub"), "ssh-ed25519 AAAA a@b\n").unwrap();
+        let shell = Shell::new(
+            SettingsStore::load(s._dir.path(), &SystemClock),
+            Arc::new(FakeAuthenticator::new()),
+            Arc::new(SystemClock),
+            s.shell.context.clone().with_home_dir(Some(home.clone())),
+            ToolSearchPath::known(OsString::new(), PathSource::Explicit),
+            false,
+            |_| {},
+        );
+        shell.unlock().unwrap();
+        // `Cargo.toml` exists in the tests' working directory: a relative lookup would find it.
+        let mut relative = vec![
+            "Cargo.toml",
+            "id.pub",
+            ".ssh/id.pub",
+            "~",
+            "~alex/.ssh/id.pub",
+        ];
+        // A filename character on Unix: `~\…` is relative there (it expands on Windows).
+        if cfg!(not(windows)) {
+            relative.push(r"~\.ssh\id.pub");
+        }
+        let refused = |typed: &str, ui: apprafter_core::UiError| {
+            assert_eq!(
+                ui.code.as_deref(),
+                Some(errors::RELATIVE_PATH),
+                "{typed}: {ui:?}"
+            );
+            assert_eq!(ui.fields["path"], json!(typed), "{typed}");
+            assert!(ui.message.contains(typed), "{typed}: {}", ui.message);
+            let help = ui.help.unwrap_or_default();
+            assert!(help.contains("full path") && help.contains("~/"), "{help}");
+        };
+        let draft = shell
+            .drafts
+            .insert(shell.drafts.epoch(), "hetzner-cloud".into(), a_token('k'))
+            .unwrap();
+        for typed in relative {
+            refused(typed, ssh_key_inspect(&shell, typed).unwrap_err().to_ui());
+            refused(
+                typed,
+                plan_target_renew(&shell, "prod", None, Some(typed.into()))
+                    .unwrap_err()
+                    .to_ui(),
+            );
+            refused(
+                typed,
+                plan_target_add(
+                    &shell,
+                    TargetAddArgs {
+                        name: "lab".into(),
+                        provider: "hetzner-cloud".into(),
+                        draft_id: draft,
+                        ssh_key: Some(typed.into()),
+                        region: None,
+                        tier: None,
+                        server_type: None,
+                    },
+                )
+                .unwrap_err()
+                .to_ui(),
+            );
+        }
+        assert!(
+            shell.drafts.get(draft).is_ok(),
+            "a refused plan takes nothing"
+        );
+        assert!(shell.ops.list().is_empty(), "no plan was made");
+        // A full path and a `~/` path are inspected.
+        let key = home.join(".ssh").join("id.pub");
+        for typed in [path_of(&key), "~/.ssh/id.pub".to_string()] {
+            let info = ssh_key_inspect(&shell, &typed).unwrap();
+            assert_eq!((info.path, info.exists), (path_of(&key), true), "{typed}");
+        }
     }
 
     /// GOTCHA-149: a private key is the file next to the `.pub`, and a provider is sent whatever

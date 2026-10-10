@@ -342,16 +342,18 @@ test('a typed key path: `~/` expands against the home as Rust does, then the pat
     algo: 'ssh-rsa',
     problem: null,
   });
-  // No `~user/`, and no relative path: Rust looks for that path as typed, and the mock does too.
-  for (const typed of ['~alex/.ssh/work.pub', '.ssh/work.pub']) {
-    expect(await api.sshKeyInspect(typed)).toEqual({
-      path: typed,
-      display: typed,
-      exists: false,
-      algo: null,
-      problem: 'missing',
-    });
+  // As Rust joins the rest one component at a time, empty ones dropped (69546a1d): a doubled
+  // or trailing `/` finds the same key, and `~/` alone is the home, a directory: unreadable.
+  for (const typed of ['~/.ssh//work.pub', '~/.ssh/work.pub/', '~//.ssh/work.pub']) {
+    expect((await api.sshKeyInspect(typed)).path, typed).toBe('/home/alex/.ssh/work.pub');
   }
+  expect(await api.sshKeyInspect('~/')).toEqual({
+    path: '/home/alex',
+    display: '~/',
+    exists: true,
+    algo: null,
+    problem: 'unreadable',
+  });
   const missing = await api.sshKeyInspect('~/.ssh/nothing.pub');
   expect([missing.path, missing.display]).toEqual([
     '/home/alex/.ssh/nothing.pub',
@@ -360,6 +362,59 @@ test('a typed key path: `~/` expands against the home as Rust does, then the pat
   // The plan saves the expanded path.
   await runPlan(await api.opPlanTargetRenew('lab', null, '~/.ssh/work.pub'));
   expect((await api.targetShow('lab')).sshKey?.path).toBe('/home/alex/.ssh/work.pub');
+});
+
+// As target_ops' typed_key_path: what is not a full path once `~/` is expanded would resolve
+// against the app's working directory, so it is refused, as typed, before anything is looked at
+// or planned. `~user/` is not expanded, and a `\` is a filename character on the Unix home the
+// mock models (`~\` expands on Windows only).
+test('a relative key path is refused by the lookup and both plans, and the draft stays', async () => {
+  const relative = ['.ssh/work.pub', 'work.pub', '~', '~alex/.ssh/work.pub', '~\\.ssh\\work.pub'];
+  const refused = async (typed: string, call: Promise<unknown>) => {
+    const e = await refusalOf(call);
+    expect(e.code, typed).toBe(DESKTOP_ERROR_CODES.RELATIVE_PATH);
+    expect(e.message).toBe(`\`${typed}\` is not a full path`);
+    expect(e.help).toBe('Give the full path, or start it with ~/ for a path in your home folder.');
+    expect(e.fields).toEqual({ path: typed });
+  };
+  const { draftId } = result(
+    await runRead(await api.opStartVerifyToken('hetzner-cloud', goodToken())),
+  ) as { draftId: number };
+  for (const typed of relative) {
+    await refused(typed, api.sshKeyInspect(typed));
+    await refused(typed, api.opPlanTargetRenew('lab', null, typed));
+    await refused(
+      typed,
+      api.opPlanTargetAdd({
+        name: 'lab-2',
+        provider: 'hetzner-cloud',
+        draftId,
+        sshKey: typed,
+        region: null,
+        tier: null,
+        serverType: null,
+      }),
+    );
+  }
+  // Before the name and the token are looked at, as Rust refuses it before planning.
+  await refused('work.pub', api.opPlanTargetRenew('lab', 'short', 'work.pub'));
+  // The draft stays for the corrected form.
+  const view = await api.opPlanTargetAdd({
+    name: 'lab-2',
+    provider: 'hetzner-cloud',
+    draftId,
+    sshKey: '~/.ssh/work.pub',
+    region: null,
+    tier: null,
+    serverType: null,
+  });
+  expect(view.class).toBe('bounded');
+});
+
+test('the home itself as the key: inspected as unreadable, refused by a plan as Rust does', async () => {
+  const e = await refusalOf(api.opPlanTargetRenew('lab', null, '~/'));
+  expect(e.code).toBe(CORE_ERROR_CODES.TARGET_SSH_KEY_UNREADABLE);
+  expect(e.fields).toEqual({ path: '/home/alex', problem: 'unreadable' });
 });
 
 test('a file that is not a public key: inspected with no type and why; refused by the plans (GOTCHA-149)', async () => {

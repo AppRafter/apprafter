@@ -23,8 +23,9 @@ What works today:
   - Rename it. Its config, credentials and local state move to the new name, and the tab
     follows.
   - Renew its API token. The app checks the new token with the provider before it saves it.
-  - Change its SSH key, picked from the public keys in `~/.ssh` or given as a path. Only the key
-    changes: the app does not ask for the API token and leaves it as it is.
+  - Change its SSH key, picked from the public keys in `~/.ssh` or given as a full path (or one
+    that starts with `~/`). Only the key changes: the app does not ask for the API token and
+    leaves it as it is.
   - Make it the CLI default.
   - Remove it from this computer. You type the target's name, then the operating system
     confirms that it is you. Nothing changes at the provider: a server keeps running. Where

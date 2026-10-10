@@ -171,21 +171,52 @@ export function catalogueSourceRefusal(
   return namesIn(store).includes(source.name) ? null : notFound(store, source.name);
 }
 
-/** Rust's `ssh::expand_tilde`: a leading `~/` into the home, nothing else. */
-const expandTilde = (path: string) =>
-  path.startsWith('~/') ? `${MOCK_HOME}/${path.slice(2)}` : path;
+/**
+ * Rust's `ssh::expand_tilde` on the Unix home the mock models: a leading `~/` into the home, the
+ * rest joined one component at a time with empty ones dropped, so `~/.ssh//k.pub` and
+ * `~/.ssh/k.pub/` name `~/.ssh/k.pub` and `~/` the home itself. `~user/` is left as typed, and so
+ * is `~\` (a `\` is a filename character on Unix; it expands on Windows only).
+ */
+function expandTilde(path: string): string {
+  if (!path.startsWith('~/')) return path;
+  const rest = path
+    .slice(2)
+    .split('/')
+    .filter((part) => part !== '');
+  return [MOCK_HOME, ...rest].join('/');
+}
 
 /** Rust's `abbreviate_home`: a path under the home shown with `~/`. */
 const abbreviated = (path: string) =>
   path.startsWith(`${MOCK_HOME}/`) ? `~/${path.slice(MOCK_HOME.length + 1)}` : path;
 
 /**
- * What the file at a typed `path` holds, as `ssh_key_inspect` reports it: `~/` expanded against
- * the home as Rust does, then the file found by that path alone — a public key in `~/.ssh`, a
- * file that is not one (MOCK_NOT_KEYS), or nothing.
+ * target_ops' `typed_key_path`: a key path the page typed, `~/` expanded, refused unless it is
+ * then a full path — a relative one would resolve against the app's working directory. Before
+ * anything is looked at, and before a plan looks at its other arguments.
+ */
+function typedKeyPath(typed: string): string {
+  const path = expandTilde(typed);
+  if (!path.startsWith('/')) {
+    throw {
+      code: DESKTOP_ERROR_CODES.RELATIVE_PATH,
+      message: `\`${typed}\` is not a full path`,
+      help: 'Give the full path, or start it with ~/ for a path in your home folder.',
+      causes: [],
+      fields: { path: typed },
+    } satisfies UiError;
+  }
+  return path;
+}
+
+/**
+ * What the file at a typed `path` holds, as `ssh_key_inspect` reports it: refused unless it is a
+ * full path once `~/` is expanded as Rust does, then the file found by that path alone — a
+ * public key in `~/.ssh`, something that is not one (MOCK_NOT_KEYS), or nothing. The lookup is
+ * by the exact path: an absolute path spelled with a doubled `/` is not modelled.
  */
 function inspectKey(typed: string): SshKeyInfo {
-  const path = expandTilde(typed);
+  const path = typedKeyPath(typed);
   const key = MOCK_SSH_KEYS.find((k) => k.path === path);
   if (key !== undefined) {
     const problem = key.algo === null ? 'not_public_key' : null;
@@ -198,9 +229,10 @@ function inspectKey(typed: string): SshKeyInfo {
 }
 
 /**
- * The key at a typed `path` for a plan (`~/` expanded, as target_ops does), as the core's
- * `check_readable` takes it: a public key, or Rust's refusal — `SshKeyUnreadable` for no file,
- * `SshKeyNotPublic` for one that is not a public key (GOTCHA-149: a private key by name).
+ * The key at a typed `path` for a plan (`~/` expanded and a relative path refused, as target_ops
+ * does), as the core's `check_readable` takes it: a public key, or Rust's refusal —
+ * `SshKeyUnreadable` for no file or one that cannot be read (a directory), `SshKeyNotPublic` for
+ * one that is not a public key (GOTCHA-149: a private key by name).
  */
 function keyAt(path: string): SshKeyInfo {
   const key = inspectKey(path);
@@ -212,6 +244,13 @@ function keyAt(path: string): SshKeyInfo {
         path: key.path,
         problem: 'missing',
       },
+    );
+  }
+  if (key.problem === 'unreadable') {
+    throw error(
+      CORE_ERROR_CODES.TARGET_SSH_KEY_UNREADABLE,
+      `SSH key \`${key.path}\` is not readable: Is a directory (os error 21)`,
+      { path: key.path, problem: 'unreadable' },
     );
   }
   if (key.problem !== null) {
@@ -315,7 +354,7 @@ export function targetHandlers(ops: MockOps, store: MockStore): Record<string, H
 
     ssh_key_candidates: () => [...MOCK_SSH_KEYS],
 
-    ssh_key_inspect: (args): SshKeyInfo => inspectKey((args as { path: string }).path),
+    ssh_key_inspect: refusing((args): SshKeyInfo => inspectKey((args as { path: string }).path)),
 
     toolchain_status: () => structuredClone(MOCK_TOOLCHAIN),
 
@@ -443,9 +482,11 @@ export function targetHandlers(ops: MockOps, store: MockStore): Record<string, H
           `internal error: draft ${draftId} was verified for ${drafted}, not ${provider}`,
         );
       }
+      // Rust expands and checks the typed path while it builds the core's arguments.
+      const typedKey = sshKey === null ? null : typedKeyPath(sshKey);
       const problem = nameProblem(name);
       if (problem !== null) throw invalidName(name, problem);
-      const key = sshKey === null ? null : keyAt(sshKey);
+      const key = typedKey === null ? null : keyAt(typedKey);
       if (namesIn(store).includes(name)) throw exists(name);
       // Planned: the plan holds the token now (overview §3.12.1).
       store.drafts.delete(draftId);
@@ -513,6 +554,8 @@ export function targetHandlers(ops: MockOps, store: MockStore): Record<string, H
         sshKey?: string | null;
       };
       const report = named(name);
+      // Before the core's plan_renew looks at the token, as target_ops checks the typed path.
+      const typedKey = sshKey === undefined || sshKey === null ? null : typedKeyPath(sshKey);
       if (token !== null) {
         const problem = tokenProblem(token);
         if (problem !== null) throw invalidToken(problem);
@@ -520,7 +563,7 @@ export function targetHandlers(ops: MockOps, store: MockStore): Record<string, H
       // The token is checked with the provider when the plan runs; only the verdict is kept.
       const rejected = token?.startsWith('x') ?? false;
       const rotates = token !== null;
-      const key = sshKey === undefined || sshKey === null ? null : keyAt(sshKey);
+      const key = typedKey === null ? null : keyAt(typedKey);
       // A key path the plan changes: a new one; the one stored now is left out, as the core does.
       const newKey = key !== null && key.path !== report.sshKey?.path ? key : null;
       if (!rotates && newKey === null) throw nothingToChange(name);

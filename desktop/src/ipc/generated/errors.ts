@@ -14,5 +14,6 @@ export const DESKTOP_ERROR_CODES = {
   LOCKED: 'apprafter::desktop::locked',
   PLAN_EXPIRED: 'apprafter::desktop::plan_expired',
   PLAN_NOT_FOUND: 'apprafter::desktop::plan_not_found',
+  RELATIVE_PATH: 'apprafter::desktop::relative_path',
   SETTINGS_IO: 'apprafter::desktop::settings_io',
 } as const;

@@ -110,10 +110,13 @@ export const MOCK_UNREADABLE: readonly UnreadableTarget[] = [
 ];
 
 /**
- * Files under the demo's home that are not public keys, as `ssh_key_inspect` reads them: the
- * private half of id_ed25519 (one dropped `.pub` away from it), and a note.
+ * What under the demo's home is not a public key, as `ssh_key_inspect` reads it: the private half
+ * of id_ed25519 (one dropped `.pub` away from it), a note, and the two directories a typed path
+ * can name (`~/` is the home itself), which cannot be read as a file.
  */
 export const MOCK_NOT_KEYS: readonly SshKeyInfo[] = [
+  { path: HOME, display: '~/', exists: true, algo: null, problem: 'unreadable' },
+  { path: `${HOME}/.ssh`, display: '~/.ssh', exists: true, algo: null, problem: 'unreadable' },
   {
     path: `${HOME}/.ssh/id_ed25519`,
     display: '~/.ssh/id_ed25519',

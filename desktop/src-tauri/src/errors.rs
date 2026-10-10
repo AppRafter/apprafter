@@ -94,6 +94,16 @@ pub enum DesktopError {
     )]
     DraftExpired { draft_id: DraftId },
 
+    /// A path typed in a form that is not a full path: it would resolve against the app's
+    /// working directory, which means nothing to whoever typed it (the CLI keeps resolving
+    /// against its own). `path` is the text as typed.
+    #[error("`{path}` is not a full path")]
+    #[diagnostic(
+        code(apprafter::desktop::relative_path),
+        help("Give the full path, or start it with ~/ for a path in your home folder.")
+    )]
+    RelativePath { path: String },
+
     #[error(transparent)]
     #[diagnostic(transparent)]
     Core(#[from] CoreError),
@@ -139,6 +149,9 @@ impl DesktopError {
             DesktopError::AuthUnavailable { reason } => {
                 ui.fields
                     .insert("reason".into(), serde_json::json!(wire_name(reason)));
+            }
+            DesktopError::RelativePath { path } => {
+                ui.fields.insert("path".into(), serde_json::json!(path));
             }
             DesktopError::Locked
             | DesktopError::AuthCancelled
@@ -223,6 +236,9 @@ mod tests {
             DesktopError::DraftExpired {
                 draft_id: DraftId(3),
             },
+            DesktopError::RelativePath {
+                path: "id.pub".into(),
+            },
         ]
     }
 
@@ -240,6 +256,7 @@ mod tests {
             DesktopError::Closing => errors::CLOSING,
             DesktopError::DraftNotFound { .. } => errors::DRAFT_NOT_FOUND,
             DesktopError::DraftExpired { .. } => errors::DRAFT_EXPIRED,
+            DesktopError::RelativePath { .. } => errors::RELATIVE_PATH,
             DesktopError::Core(_) => return None,
         })
     }
@@ -295,6 +312,22 @@ mod tests {
             assert!(ui.message.contains('3'), "{}", ui.message);
             assert!(ui.help.is_some());
         }
+    }
+
+    /// The typed text, as `fields.path`; the help says what is taken instead.
+    #[test]
+    fn a_relative_path_carries_what_was_typed_and_says_what_is_taken() {
+        let ui = DesktopError::RelativePath {
+            path: ".ssh/id.pub".into(),
+        }
+        .to_ui();
+        assert_eq!(ui.fields["path"], json!(".ssh/id.pub"));
+        assert_eq!(ui.fields.len(), 1, "{ui:?}");
+        assert_eq!(ui.message, "`.ssh/id.pub` is not a full path");
+        assert_eq!(
+            ui.help.as_deref(),
+            Some("Give the full path, or start it with ~/ for a path in your home folder.")
+        );
     }
 
     #[test]

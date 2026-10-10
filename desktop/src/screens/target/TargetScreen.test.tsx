@@ -251,6 +251,25 @@ test('SSH key: Other path… refuses a private key by name, and a file that is n
   expect(screen.queryByRole('dialog', { name: /Change the SSH key of/ })).toBeNull();
 });
 
+test('SSH key: Other path… refuses a relative path in the form: the full path, or ~/', async () => {
+  const renews = sentArgs('op_plan_target_renew');
+  const user = screenOf('staging');
+  await user.click(
+    within(await screen.findByRole('group', { name: 'SSH key' })).getByRole('button', {
+      name: 'Change',
+    }),
+  );
+  const form = await screen.findByRole('dialog', { name: 'Change SSH key' });
+  await user.click(within(form).getByRole('radio', { name: 'Other path…' }));
+  await user.type(within(form).getByLabelText('Path to a public key'), '.ssh/work.pub');
+  await user.click(within(form).getByRole('button', { name: 'Continue' }));
+  const alert = await within(form).findByRole('alert');
+  expect(alert.textContent).toContain('`.ssh/work.pub` is not a full path');
+  expect(alert.textContent).toContain('Give the full path, or start it with ~/');
+  expect(renews).toEqual([]);
+  expect(screen.queryByRole('dialog', { name: /Change the SSH key of/ })).toBeNull();
+});
+
 test('SSH key: a .pub in ~/.ssh that holds no public key is listed and cannot be chosen', async () => {
   const user = screenOf('staging');
   await user.click(
