@@ -8,8 +8,7 @@ Error: apprafter::target::invalid_token
   × invalid Hetzner Cloud token: Hetzner Cloud tokens are 64 ASCII
   │ alphanumeric characters; got 5
   help: Paste the whole token again from where you saved it: 64 ASCII letters
-        and digits, no prefix, no trailing newline. The Hetzner Cloud Console
-        shows a token only once, when it is created; if you no longer have it,
-        generate a new one there (open the project, then Security → API
-        tokens).
+        and digits, no prefix, no trailing newline. A token is shown only
+        once, when it is created; if you no longer have it, generate a new one
+        in the Hetzner Console (open the project, then Security → API tokens).
 

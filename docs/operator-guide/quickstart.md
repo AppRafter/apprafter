@@ -68,7 +68,9 @@ saves the most typing on the deeply nested ones such as
 
 You will also need:
 
-- A Hetzner Cloud API token with Read+Write access.
+- A Hetzner Cloud API token with Read & Write permission, created in
+  the Hetzner Console (open the project, then Security → API tokens).
+  The console shows a token only once, so keep it somewhere safe.
 - An SSH key whose **public** half you will hand to the provider for
   the new node. The CLI never touches the private half.
 - **`kubectl` on your `PATH`.** Not optional: the CLI shells out to it

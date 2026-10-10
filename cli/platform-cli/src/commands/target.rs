@@ -273,8 +273,10 @@ pub(crate) fn provider_required() -> miette::Report {
 pub(crate) fn token_required(provider: &str) -> miette::Report {
     usage(
         format!("`--token` is required for provider `{provider}` (or set `HCLOUD_TOKEN` env var)"),
-        "Pass `--token <64 characters>` or set `HCLOUD_TOKEN`; create a token in the Hetzner \
-         Cloud Console → Security → API Tokens.",
+        format!(
+            "Pass `--token <64 characters>` or set `HCLOUD_TOKEN`; create a token in {}.",
+            cli_core::target::HETZNER_API_TOKENS_PAGE
+        ),
     )
 }
 
@@ -884,6 +886,20 @@ mod tests {
             removal_needs_yes("prod").to_string(),
             "non-interactive invocation: pass `--yes` to confirm removing target `prod` \
              (refusing silent destruction)"
+        );
+    }
+
+    /// No token and no wizard to ask for one: the help says where a token is created, in the
+    /// one shared wording (WI-454).
+    #[test]
+    fn a_missing_token_points_at_the_token_page() {
+        let h = help(&token_required("hetzner-cloud"));
+        assert!(
+            h.contains(&format!(
+                "create a token in {}",
+                cli_core::target::HETZNER_API_TOKENS_PAGE
+            )),
+            "{h}"
         );
     }
 

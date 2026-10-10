@@ -21,7 +21,7 @@ fn cli() -> Command {
 }
 
 /// 64-char synthetic Hetzner token (canonical alphanumeric, no
-/// prefix — matches what Hetzner Cloud Console actually issues
+/// prefix — matches what the Hetzner Console actually issues
 /// per `cli-dx-task.md` §11 as amended in v0.1.74). Lets tests
 /// stay 100 % offline — no Hetzner API ping happens until Track
 /// A.4 validator integration.
@@ -391,8 +391,8 @@ fn target_add_renew_rejects_identical_token_with_rotation_hint() {
     // The v0.1.77 walk surfaced that `--renew` happily "rotated"
     // a target to the exact same token bytes — green checkmark,
     // zero actual change in Hetzner. v0.1.78 makes that case
-    // fail loudly so the operator hits the Hetzner Cloud Console
-    // and generates a fresh token instead of having a silent
+    // fail loudly so the operator generates a new token in the
+    // Hetzner Console instead of having a silent
     // no-op.
     let dir = tempfile::tempdir().unwrap();
     let token = synthetic_hetzner_token();
@@ -421,7 +421,14 @@ fn target_add_renew_rejects_identical_token_with_rotation_hint() {
         .assert()
         .failure()
         .stderr(contains("apprafter::target::renew_token_unchanged"))
-        .stderr(contains("Hetzner Cloud Console"));
+        // Where a new token is created (WI-454), with miette's wrapping taken out.
+        .stderr(predicates::function::function(|stderr: &str| {
+            stderr
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .contains(cli_core::target::HETZNER_API_TOKENS_PAGE)
+        }));
 
     // On-disk credentials must still reflect the original token,
     // not be wiped or corrupted by the failed renew attempt.

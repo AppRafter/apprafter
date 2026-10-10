@@ -106,9 +106,10 @@ pub(crate) fn hint(c: &Check) -> Option<String> {
                     format!("run `apprafter target add {target} --renew --token <X>` with a fresh token")
                 }
                 RenewWhy::TokenRejected => format!(
-                "token rejected; run `apprafter target add {target} --renew` with a fresh token \
-                 from Hetzner Cloud Console → Security → API Tokens"
-            ),
+                    "token rejected; run `apprafter target add {target} --renew` with a new token \
+                 from {}",
+                    cli_core::target::HETZNER_API_TOKENS_PAGE
+                ),
             }
         }
         CheckFix::Chmod { path, mode } => {
@@ -411,6 +412,11 @@ mod tests {
 
     #[test]
     fn todays_hints_keep_todays_words() {
+        // WI-454: where a new token comes from, in the one shared wording.
+        let rejected = format!(
+            "token rejected; run `apprafter target add p --renew` with a new token from {}",
+            cli_core::target::HETZNER_API_TOKENS_PAGE
+        );
         let cases: Vec<(CheckFix, &str)> =
             vec![
             (
@@ -454,8 +460,7 @@ mod tests {
                     target: "p".into(),
                     why: RenewWhy::TokenRejected,
                 },
-                "token rejected; run `apprafter target add p --renew` with a fresh token from \
-                 Hetzner Cloud Console → Security → API Tokens",
+                rejected.as_str(),
             ),
             (
                 CheckFix::Chmod {

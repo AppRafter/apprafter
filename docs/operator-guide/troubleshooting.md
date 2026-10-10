@@ -251,10 +251,10 @@ refuses it first (`apprafter::target::invalid_token`).
 
 **Fix.**
 
-- The Hetzner Cloud Console shows a token only once, when it is
-  created: paste it again from where you saved it, or create a new
-  one in the project under Security → API tokens (AppRafter needs
-  Read & Write).
+- A token is shown only once, when it is created: paste it again
+  from where you saved it, or create a new one with Read & Write
+  permission in the Hetzner Console (open the project, then
+  Security → API tokens).
 - If you're rotating, use `apprafter target add <name> --renew
   --token <new>` instead of re-creating the target.
 
@@ -639,7 +639,7 @@ Error: apprafter::target::token_rejected
   help: The provider's read-only credential check returned 401
         unauthorized: the token was mistyped, or it was revoked or
         rotated, or its project was deleted.
-        • The Hetzner Cloud Console shows a token only once, …
+        • A token is shown only once, when it is created: …
         • If you're rotating, run `apprafter target add <name>
         --renew --token <new>` …
 ```

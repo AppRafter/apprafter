@@ -82,8 +82,9 @@ pub(crate) fn cli_help(e: &CoreError) -> Option<String> {
              rotate only its token; `apprafter target show {name}` shows what is stored."
         ),
         CoreError::RenewTokenUnchanged { name } => format!(
-            "Generate a fresh token in the Hetzner Cloud Console → Security → API Tokens, then \
-             re-run `apprafter target add {name} --renew` with the new value."
+            "Generate a new token in {}, then re-run `apprafter target add {name} --renew` \
+             with the new value.",
+            cli_core::target::HETZNER_API_TOKENS_PAGE
         ),
         // Beside a typed `--ssh-key`, `HCLOUD_TOKEN` is not used (D.3d review #0): it rotates
         // only a renewal that names no key.
@@ -104,15 +105,14 @@ pub(crate) fn cli_help(e: &CoreError) -> Option<String> {
             "Supported providers: {}. Pass one of them with `--provider`.",
             supported.join(", ")
         ),
-        // The console shows a token's value only once, when it is created; its labels are the
-        // project's Security → API tokens (docs.hetzner.com, "Generating an API token").
-        CoreError::InvalidToken { .. } => {
+        // The console shows a token's value only once, when it is created (docs.hetzner.com,
+        // "Generating an API token"): a new one comes from `HETZNER_API_TOKENS_PAGE`.
+        CoreError::InvalidToken { .. } => format!(
             "Paste the whole token again from where you saved it: 64 ASCII letters and digits, \
-             no prefix, no trailing newline. The Hetzner Cloud Console shows a token only once, \
-             when it is created; if you no longer have it, generate a new one there (open the \
-             project, then Security → API tokens)."
-                .into()
-        }
+             no prefix, no trailing newline. A token is shown only once, when it is created; if \
+             you no longer have it, generate a new one in {}.",
+            cli_core::target::HETZNER_API_TOKENS_PAGE
+        ),
         CoreError::TokenNotStored { name } => format!(
             "Run `apprafter target add {name} --renew --token <X>` to store one, or set \
              `HCLOUD_TOKEN` for this invocation."
@@ -264,8 +264,7 @@ mod tests {
 
     /// The console shows a token's value only once, when it is created: the help for a
     /// malformed token sends the reader back to where they saved it, or to generate a new one
-    /// under the project's Security → API tokens (the console's labels), and never to copy an
-    /// existing token out of the console.
+    /// in `HETZNER_API_TOKENS_PAGE`, and never to copy an existing token out of the console.
     #[test]
     fn a_malformed_token_is_pasted_again_or_generated_anew() {
         let help = report(CoreError::InvalidToken {
@@ -275,13 +274,39 @@ mod tests {
         .unwrap()
         .to_string();
         assert!(help.contains("from where you saved it"), "{help}");
-        assert!(help.contains("shows a token only once"), "{help}");
+        assert!(help.contains("shown only once"), "{help}");
         assert!(
-            help.contains("generate a new one") && help.contains("Security → API tokens"),
+            help.contains(&format!(
+                "generate a new one in {}",
+                cli_core::target::HETZNER_API_TOKENS_PAGE
+            )),
             "{help}"
         );
-        assert!(!help.contains("from the Hetzner Cloud Console"), "{help}");
+        assert!(!help.contains("from the Hetzner"), "{help}");
         assert!(help.contains("64 ASCII letters and digits"), "{help}");
+    }
+
+    /// A renewal with the token already stored: the way forward is a new token, created where
+    /// every other help says tokens are created (WI-454).
+    #[test]
+    fn an_unchanged_token_is_replaced_by_a_new_one_from_the_token_page() {
+        let help = report(CoreError::RenewTokenUnchanged {
+            name: "prod".into(),
+        })
+        .help()
+        .unwrap()
+        .to_string();
+        assert!(
+            help.contains(&format!(
+                "Generate a new token in {}",
+                cli_core::target::HETZNER_API_TOKENS_PAGE
+            )),
+            "{help}"
+        );
+        assert!(
+            help.contains("`apprafter target add prod --renew`"),
+            "{help}"
+        );
     }
 
     #[test]

@@ -8,7 +8,7 @@ Error: apprafter::cli::usage_refused
   × `--token` is required for provider `hetzner-cloud` (or set `HCLOUD_TOKEN`
   │ env var)
   help: Pass `--token <64 characters>` or set `HCLOUD_TOKEN`; create a token
-        in the Hetzner Cloud Console → Security → API Tokens.
+        in the Hetzner Console (open the project, then Security → API tokens).
 
 [file targets/prod/config.yaml]
 provider: hetzner-cloud

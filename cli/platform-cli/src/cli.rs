@@ -1345,8 +1345,9 @@ pub enum TargetCommand {
         provider: Option<String>,
         /// Hetzner Cloud API token. Required when `--provider
         /// hetzner-cloud`. Exactly 64 ASCII alphanumeric characters,
-        /// with no prefix — copy it whole out of the Cloud Console's
-        /// Security → API Tokens panel. Passed via `--token` or env
+        /// with no prefix: the whole token, which is shown only once,
+        /// when it is created in the Hetzner Console (open the project,
+        /// then Security → API tokens). Passed via `--token` or env
         /// `HCLOUD_TOKEN` (the env fallback is for CI ergonomics —
         /// interactive use should prefer the flag so the token
         /// doesn't linger in shell history's env-leak surface).
@@ -2105,6 +2106,30 @@ pub enum BackupAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `target add --token` says where a token is created in the one shared wording, and never
+    /// to copy an existing token out of the console, which shows it only once (WI-454).
+    #[test]
+    fn target_add_token_help_points_at_the_token_page() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let add = cmd
+            .find_subcommand("target")
+            .and_then(|t| t.find_subcommand("add"))
+            .expect("`target add` is a subcommand");
+        let help = add
+            .get_arguments()
+            .find(|a| a.get_id() == "token")
+            .and_then(|a| a.get_long_help().or_else(|| a.get_help()))
+            .map(|h| h.to_string())
+            .expect("`--token` has help");
+        assert!(
+            help.contains(cli_core::target::HETZNER_API_TOKENS_PAGE),
+            "{help}"
+        );
+        assert!(help.contains("only once"), "{help}");
+        assert!(!help.contains("copy it whole"), "{help}");
+    }
 
     /// `backup enable --check` says how much of the data the weekly check
     /// reads, and it is the platform chart's own default. The help used to

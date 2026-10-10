@@ -527,11 +527,11 @@ pub enum CliError {
         help(
             "The provider's read-only credential check returned 401 unauthorized: the token \
              was mistyped, or it was revoked or rotated, or its project was deleted.\n\
-             • The Hetzner Cloud Console shows a token only once, when it is created: paste it \
-               again from where you saved it, or create a new one in the project under \
-               Security → API tokens (AppRafter needs Read & Write).\n\
+             • A token is shown only once, when it is created: paste it again from where you \
+               saved it, or create a new one with Read & Write permission in {}.\n\
              • If you're rotating, run `apprafter target add <name> --renew --token <new>` \
-               instead of re-creating the target."
+               instead of re-creating the target.",
+            crate::target::HETZNER_API_TOKENS_PAGE
         )
     )]
     ProviderTokenRejected {
@@ -1252,6 +1252,11 @@ mod tests {
         ] {
             assert!(help.contains(why), "{why}: {help}");
         }
+        // Where a new token comes from, in the one shared wording.
+        assert!(
+            help.contains(crate::target::HETZNER_API_TOKENS_PAGE),
+            "the token page: {help}"
+        );
         for not_why in ["scope", "newline", "Copy the token again", "--no-ping"] {
             assert!(!help.contains(not_why), "{not_why}: {help}");
         }

@@ -13,6 +13,7 @@ import type { DoctorReport } from '../../ipc/generated/DoctorReport';
 import type { GroupId } from '../../ipc/generated/GroupId';
 import type { KubeErrorKind } from '../../ipc/generated/KubeErrorKind';
 import type { RenewWhy } from '../../ipc/generated/RenewWhy';
+import { HETZNER_API_TOKENS_PAGE } from '../../ipc/generated/target';
 import type { OpNote } from '../../ipc/plans';
 
 export const GROUP_TITLES: Record<GroupId, string> = {
@@ -38,7 +39,7 @@ const RENEW_WHY: Record<RenewWhy, string> = {
   credentials_file_missing: `The credentials file is missing. Renew the token to write a new one, ${RENEW}`,
   token_missing: `No token is stored. Add one ${RENEW}`,
   token_malformed: `The stored token is malformed. Renew it with a fresh one ${RENEW}`,
-  token_rejected: `The provider rejected the stored token. Create a new one in the Hetzner Cloud Console (Security › API tokens), then renew it ${RENEW}`,
+  token_rejected: `The provider rejected the stored token. Create a new one in ${HETZNER_API_TOKENS_PAGE}, then renew it ${RENEW}`,
 };
 
 const TOOLCHAIN = 'The toolchain lists how for this computer.';

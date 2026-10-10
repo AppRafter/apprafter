@@ -4,8 +4,11 @@ import { HETZNER_TOKEN_LEN } from '../../ipc/generated/target';
 import { tokenMessage } from '../targets/rules';
 import { tokenHint } from './tokenHint';
 
-test('empty: where the token comes from', () => {
-  expect(tokenHint('')).toBe('Cloud Console → Security → API Tokens, read & write.');
+test("empty: where the token comes from, in the CLI's words", () => {
+  expect(tokenHint('')).toBe(
+    'Create one with Read & Write permission in ' +
+      'the Hetzner Console (open the project, then Security → API tokens).',
+  );
 });
 
 test('while typing: the byte count, as the core counts', () => {

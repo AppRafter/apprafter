@@ -18,6 +18,9 @@ export const TARGET_NAME_MAX_LEN = 64;
 /** A Hetzner Cloud API token's length. */
 export const HETZNER_TOKEN_LEN = 64;
 
+/** Where a Hetzner Cloud API token is created, in the console's own labels: the CLI's wording. */
+export const HETZNER_API_TOKENS_PAGE = 'the Hetzner Console (open the project, then Security → API tokens)';
+
 /**
  * The rebuild of the provisioned target `name` on another machine, one command per line:
  * the CLI's own recipe (`apprafter_core::target::rebuild_recipe`).

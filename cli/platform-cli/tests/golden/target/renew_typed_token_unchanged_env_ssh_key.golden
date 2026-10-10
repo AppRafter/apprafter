@@ -6,9 +6,9 @@ $ apprafter target add prod --renew --token aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 Error: apprafter::target::renew_token_unchanged
 
   × the new token for `prod` is the one already stored
-  help: Generate a fresh token in the Hetzner Cloud Console → Security → API
-        Tokens, then re-run `apprafter target add prod --renew` with the new
-        value.
+  help: Generate a new token in the Hetzner Console (open the project, then
+        Security → API tokens), then re-run `apprafter target add prod
+        --renew` with the new value.
 
 [file targets/prod/config.yaml]
 provider: hetzner-cloud

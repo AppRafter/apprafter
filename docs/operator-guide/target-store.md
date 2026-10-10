@@ -127,8 +127,8 @@ key on its own.
 
 The token bytes are byte-compared against the stored value —
 identical input with nothing else to change is rejected with a hint
-pointing at the Hetzner Cloud Console to confirm rotation actually
-happened.
+to create a new token in the Hetzner Console (open the project, then
+Security → API tokens) and renew with that one.
 
 ### Per-machine target with stricter perms
 

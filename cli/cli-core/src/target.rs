@@ -108,14 +108,27 @@ pub fn config_root_from_override(custom: Option<String>) -> Result<PathBuf> {
 /// The length of a Hetzner Cloud API token: 64 ASCII alphanumeric characters.
 pub const HETZNER_TOKEN_LEN: usize = 64;
 
+/// Where a Hetzner Cloud API token is created, in the console's own name and labels
+/// (docs.hetzner.com, "Generating an API token", read 2026-10-10: in the Hetzner Console, open
+/// the project, then Security in the left menu, API tokens in the upper one, then Generate API
+/// token). The console shows a token only once, when it is created, so a pointer here sends the
+/// reader to create a new token, never to copy an existing one.
+///
+/// Every help and page that says where a token comes from uses this text: the CLI's helps and
+/// doctor hint, the core's client-neutral help, the `--token` flag's help, the desktop's own
+/// hints (exported as `HETZNER_API_TOKENS_PAGE`) and the operator guide.
+/// `platform-cli/tests/hetzner_token_page_test.rs` fails on any other spelling of the path.
+pub const HETZNER_API_TOKENS_PAGE: &str =
+    "the Hetzner Console (open the project, then Security → API tokens)";
+
 /// Validate a Hetzner Cloud API token's surface format. Cheap
 /// pre-flight before the real `GET /v1/locations` ping that
 /// arrives in Track A.4 — here we only catch obvious typos and
 /// wrong-credential-pasted-into-wrong-field mistakes (e.g. AWS
 /// access key landed in `--token`).
 ///
-/// **Format.** Hetzner Cloud tokens copied from the Cloud Console
-/// → Security → API Tokens panel are 64 ASCII alphanumeric
+/// **Format.** Hetzner Cloud API tokens, created in
+/// [`HETZNER_API_TOKENS_PAGE`], are 64 ASCII alphanumeric
 /// characters with no fixed prefix. The `HCLOUD_TOKEN` env var
 /// name is a Hetzner convention; the value inside it is just the
 /// bare 64 chars. `cli-dx-task.md` §11 originally documented an
@@ -1782,7 +1795,7 @@ mod tests {
 
     #[test]
     fn validate_hetzner_token_format_accepts_canonical_64_char_token() {
-        // Canonical Hetzner Cloud Console token shape: 64 ASCII
+        // Canonical Hetzner Cloud API token shape: 64 ASCII
         // alphanumeric, no prefix. Without this case passing the
         // CLI rejected every real-world token (v0.1.74 regression
         // fix — v0.1.73 had wrongly required an `hcloud_` prefix

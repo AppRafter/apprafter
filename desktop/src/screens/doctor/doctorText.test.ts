@@ -65,8 +65,9 @@ describe('fixText', () => {
 
   test('a token to renew names the Target screen, and for a rejected one where to get another', () => {
     expect(fixed({ kind: 'renew_token', target: 'prod-eu', why: 'token_rejected' })).toBe(
-      'The provider rejected the stored token. Create a new one in the Hetzner Cloud Console ' +
-        '(Security › API tokens), then renew it on the Target screen: API token › Renew.',
+      'The provider rejected the stored token. Create a new one in ' +
+        'the Hetzner Console (open the project, then Security → API tokens), then renew it ' +
+        'on the Target screen: API token › Renew.',
     );
     for (const why of ['credentials_file_missing', 'token_missing', 'token_malformed'] as const) {
       expect(fixed({ kind: 'renew_token', target: 'prod-eu', why })).toEndWith(

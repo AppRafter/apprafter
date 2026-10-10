@@ -428,14 +428,13 @@ fn neutral_help(e: &cli_core::CliError) -> Option<String> {
             .into(),
         // The check is a read (GET /v1/locations): a Read-only token passes it, and a token
         // with a trailing newline never reaches it (the format check refuses that first).
-        C::ProviderTokenRejected { .. } => {
+        C::ProviderTokenRejected { .. } => format!(
             "The provider did not accept this token (401 unauthorized): it was mistyped, or it \
-             was revoked or rotated, or its project was deleted. The Hetzner Cloud Console shows \
-             a token only once, when it is created: paste it again from where you saved it, or \
-             create a new one in the project under Security → API tokens (AppRafter needs Read \
-             & Write)."
-                .into()
-        }
+             was revoked or rotated, or its project was deleted. A token is shown only once, \
+             when it is created: paste it again from where you saved it, or create a new one \
+             with Read & Write permission in {}.",
+            cli_core::target::HETZNER_API_TOKENS_PAGE
+        ),
         // Any request that got no answer (WI-453), not only the credential check.
         C::ProviderApiUnreachable { .. } => {
             "The request could not complete because the provider's API was unreachable. This \
@@ -1464,6 +1463,11 @@ mod tests {
             assert!(!rejected.contains(not_why), "{not_why}: {rejected}");
         }
         assert!(rejected.contains("only once"), "{rejected}");
+        // Where a new token comes from, in the one shared wording (WI-454).
+        assert!(
+            rejected.contains(cli_core::target::HETZNER_API_TOKENS_PAGE),
+            "{rejected}"
+        );
         // WI-453: every core read that gets no answer is `provider_unreachable` now, a
         // catalogue's as much as the token check's, so its help may not say it was the check.
         let unreachable = help(cli_core::CliError::ProviderApiUnreachable {

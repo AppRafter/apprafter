@@ -356,6 +356,9 @@ fn target_ts() -> String {
          /** A Hetzner Cloud API token's length. */\n\
          export const HETZNER_TOKEN_LEN = {};\n\
          \n\
+         /** Where a Hetzner Cloud API token is created, in the console's own labels: the CLI's wording. */\n\
+         export const HETZNER_API_TOKENS_PAGE = {};\n\
+         \n\
          /**\n \
          * The rebuild of the provisioned target `name` on another machine, one command per line:\n \
          * the CLI's own recipe (`apprafter_core::target::rebuild_recipe`).\n \
@@ -364,6 +367,7 @@ fn target_ts() -> String {
         ts_array("SUPPORTED_PROVIDERS", SUPPORTED_PROVIDERS),
         target_name_max_len(),
         hetzner_token_len(),
+        ts_text(cli_core::target::HETZNER_API_TOKENS_PAGE),
         rebuild_recipe_ts(),
     )
 }
@@ -480,6 +484,19 @@ fn ts_array(name: &str, items: &[&str]) -> String {
 
 /// A single-quoted TypeScript string (desktop/biome.json `quoteStyle`). The names are plain
 /// identifiers; anything that would need escaping is refused rather than escaped.
+/// `value` as a single-quoted TypeScript string, for prose: spaces and non-ASCII letters pass,
+/// anything that would need escaping does not.
+fn ts_text(value: &str) -> String {
+    assert!(
+        !value.is_empty()
+            && !value
+                .chars()
+                .any(|c| c.is_control() || c == '\'' || c == '\\' || c == '`'),
+        "{value:?} needs escaping"
+    );
+    format!("'{value}'")
+}
+
 fn ts_string(value: &str) -> String {
     assert!(
         !value.is_empty()

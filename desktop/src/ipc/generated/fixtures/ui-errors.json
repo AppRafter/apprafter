@@ -51,7 +51,7 @@
       "provider": "hetzner-cloud",
       "status": 401
     },
-    "help": "The provider did not accept this token (401 unauthorized): it was mistyped, or it was revoked or rotated, or its project was deleted. The Hetzner Cloud Console shows a token only once, when it is created: paste it again from where you saved it, or create a new one in the project under Security → API tokens (AppRafter needs Read & Write).",
+    "help": "The provider did not accept this token (401 unauthorized): it was mistyped, or it was revoked or rotated, or its project was deleted. A token is shown only once, when it is created: paste it again from where you saved it, or create a new one with Read & Write permission in the Hetzner Console (open the project, then Security → API tokens).",
     "message": "provider `hetzner-cloud` rejected the supplied token"
   },
   "toolNotFound": {
