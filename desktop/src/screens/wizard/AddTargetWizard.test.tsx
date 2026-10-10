@@ -645,7 +645,8 @@ describe('details and save', () => {
       path,
       display: String(path),
       exists: true,
-      algo: '-----BEGIN',
+      algo: null,
+      problem: 'not_public_key',
     }));
     const { user } = renderWizard();
     await toDetails(user);
@@ -653,7 +654,9 @@ describe('details and save', () => {
     await user.click(screen.getByRole('radio', { name: 'Other path…' }));
     await user.type(screen.getByLabelText('Path to a public key'), '/home/alex/.ssh/id_ed25519');
     await user.tab();
-    expect(await screen.findByText('This file does not read as an SSH public key.')).toBeDefined();
+    expect(
+      await screen.findByText('/home/alex/.ssh/id_ed25519 is not an SSH public key.'),
+    ).toBeDefined();
     expect(screen.queryByText(/^Found/)).toBeNull();
     expect(saveButton().disabled).toBe(true);
   });
@@ -673,6 +676,47 @@ describe('details and save', () => {
     expect(saveButton().disabled).toBe(true);
   });
 
+  test('a .pub with no key in it is never the default: the first public key is', async () => {
+    const { user } = renderWizard();
+    h.answer('ssh_key_candidates', [
+      { path: '/home/alex/.ssh/old.pub', display: '~/.ssh/old.pub', algo: null, comment: null },
+      {
+        path: '/home/alex/.ssh/id.pub',
+        display: '~/.ssh/id.pub',
+        algo: 'ssh-ed25519',
+        comment: null,
+      },
+    ]);
+    await toMachine(user);
+    await screen.findByRole('table', { name: 'Machines in nbg1' });
+    await user.click(screen.getByRole('button', { name: 'Continue' }));
+    await waitFor(() =>
+      expect(
+        (screen.getByRole('radio', { name: '~/.ssh/id.pub' }) as HTMLInputElement).checked,
+      ).toBe(true),
+    );
+    expect(
+      (screen.getByRole('radio', { name: '~/.ssh/old.pub' }) as HTMLInputElement).disabled,
+    ).toBe(true);
+    expect(screen.queryByText(/No public key was found/)).toBeNull();
+  });
+
+  test('only .pub files with no key in them: none is chosen, and the no-key line shows', async () => {
+    const { user } = renderWizard();
+    h.answer('ssh_key_candidates', [
+      { path: '/home/alex/.ssh/old.pub', display: '~/.ssh/old.pub', algo: null, comment: null },
+    ]);
+    await toMachine(user);
+    await screen.findByRole('table', { name: 'Machines in nbg1' });
+    await user.click(screen.getByRole('button', { name: 'Continue' }));
+    expect(
+      await screen.findByText('No public key was found in ~/.ssh: choose Other path… or Skip.'),
+    ).toBeDefined();
+    expect(
+      (screen.getByRole('radio', { name: '~/.ssh/old.pub' }) as HTMLInputElement).checked,
+    ).toBe(false);
+  });
+
   test('leaving the path field again checks the path again', async () => {
     let exists = false;
     h.answer('ssh_key_inspect', ({ path }: Record<string, unknown>) => ({
@@ -680,6 +724,7 @@ describe('details and save', () => {
       display: String(path),
       exists,
       algo: exists ? 'ssh-ed25519' : null,
+      problem: exists ? null : 'missing',
     }));
     const { user } = renderWizard();
     await toDetails(user);
@@ -687,7 +732,7 @@ describe('details and save', () => {
     const field = screen.getByLabelText('Path to a public key');
     await user.type(field, '/home/alex/.ssh/new.pub');
     await user.tab();
-    expect(await screen.findByText('No file at that path.')).toBeDefined();
+    expect(await screen.findByText('No file at /home/alex/.ssh/new.pub.')).toBeDefined();
     exists = true; // the owner ran ssh-keygen meanwhile
     await user.click(field);
     await user.tab();
@@ -722,12 +767,13 @@ describe('details and save', () => {
     expect(saveButton().disabled).toBe(true);
   });
 
-  test("Other path: the typed path goes to the core as typed, ~/ included; the plan gets the core's path", async () => {
+  test("Other path: the typed text goes to Rust, which expands ~/; the plan gets Rust's full path", async () => {
     h.answer('ssh_key_inspect', () => ({
       path: '/home/alex/.ssh/work.pub',
       display: '~/.ssh/work.pub',
       exists: true,
       algo: 'ssh-ed25519',
+      problem: null,
     }));
     h.plan('op_plan_target_add', planParts({}), [completed(targetAdded({ name: 'lab-2' }))]);
     const { user } = renderWizard();
@@ -737,7 +783,7 @@ describe('details and save', () => {
     await user.type(screen.getByLabelText('Path to a public key'), '~/.ssh/work.pub');
     await user.tab();
     expect(await screen.findByText('Found · ssh-ed25519')).toBeDefined();
-    // The expansion of ~/ is the core's (a later Rust change); the page sends what was typed.
+    // Rust expands ~/ (and refuses a relative path); the page sends what was typed.
     expect(h.of('ssh_key_inspect').map((c) => c.args)).toEqual([{ path: '~/.ssh/work.pub' }]);
     await user.click(saveButton());
     await screen.findByText('Target “lab-2” saved.');
@@ -751,6 +797,7 @@ describe('details and save', () => {
       display: String(path),
       exists: false,
       algo: null,
+      problem: 'missing',
     }));
     h.plan('op_plan_target_add', planParts({}), [completed(targetAdded({ name: 'lab-2' }))]);
     const { user } = renderWizard();
@@ -762,7 +809,7 @@ describe('details and save', () => {
     await user.click(screen.getByRole('radio', { name: 'Other path…' }));
     await user.type(screen.getByLabelText('Path to a public key'), '/nowhere/key.pub');
     await user.tab();
-    expect(await screen.findByText('No file at that path.')).toBeDefined();
+    expect(await screen.findByText('No file at /nowhere/key.pub.')).toBeDefined();
     expect(h.of('ssh_key_inspect')[0]?.args).toEqual({ path: '/nowhere/key.pub' });
     expect(saveButton().disabled).toBe(true);
     await user.click(screen.getByRole('radio', { name: 'Skip' }));

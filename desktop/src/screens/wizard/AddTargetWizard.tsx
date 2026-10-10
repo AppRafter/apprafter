@@ -35,6 +35,7 @@ import { secretCopy } from '../../state/secretCopy';
 import { refreshTargets, TARGETS_KEY } from '../../state/targets';
 import { choosable, latencyView, offerIn } from '../machine/catalogue';
 import { MachinePicker } from '../machine/MachinePicker';
+import { keyRefusal } from '../target/sshKey';
 import { providerLabel, tierLabel } from '../targets/labels';
 import { nameMessage, nameProblem, tokenProblem } from '../targets/rules';
 import { addArgs, addedMessage, initialWizard, type SshChoice, wizardReducer } from './state';
@@ -50,13 +51,6 @@ const VERIFY_CANCELLED = 'Verifying the token was cancelled. Verify it again.';
 const NAMES_UNREAD =
   'The existing target names could not be read, so a taken name is not caught here; saving still checks it.';
 const NO_KEYS = 'No public key was found in ~/.ssh: choose Other path… or Skip.';
-
-/**
- * Whether the core read an OpenSSH public key's type: its first word (ssh-…, ecdsa-sha2-…,
- * sk-…). A private key reads as "-----BEGIN", a directory or an unreadable file as no type.
- */
-export const isPublicKeyType = (algo: string | null): boolean =>
-  algo !== null && /^(ssh-|ecdsa-sha2-|sk-)/.test(algo);
 
 export const isDraftGone = (e: UiError) =>
   e.code === DESKTOP_ERROR_CODES.DRAFT_EXPIRED || e.code === DESKTOP_ERROR_CODES.DRAFT_NOT_FOUND;
@@ -234,8 +228,10 @@ export function AddTargetWizard({ onClose }: { onClose: () => void }) {
     enabled: checkedPath !== null && checkedPath !== '',
   });
 
-  // The first key found is the default, as the CLI's picker's first row is.
-  const firstKey = candidates.data?.[0]?.path;
+  // The first public key found is the default, as the CLI's picker's first row is; a `.pub` the
+  // core read no key in (no type) is listed but cannot be chosen.
+  const keys = candidates.data?.filter((k) => k.algo !== null);
+  const firstKey = keys?.[0]?.path;
   useEffect(() => {
     if (state.ssh === null && firstKey !== undefined) {
       dispatch({ type: 'ssh', value: { kind: 'key', path: firstKey } });
@@ -260,7 +256,7 @@ export function AddTargetWizard({ onClose }: { onClose: () => void }) {
         ? ssh.path
         : ssh.kind === 'skip'
           ? null
-          : otherChecked && inspected.data?.exists === true && isPublicKeyType(inspected.data.algo)
+          : otherChecked && inspected.data?.problem === null
             ? inspected.data.path
             : undefined;
   const args = sshKey === undefined || problem !== null || taken ? null : addArgs(state, sshKey);
@@ -271,11 +267,11 @@ export function AddTargetWizard({ onClose }: { onClose: () => void }) {
       ? { text: 'Checking…', tone: 'faint' }
       : inspected.isError
         ? { text: uiErrorOf(inspected.error).message, tone: 'err' }
-        : inspected.data?.exists !== true
-          ? { text: 'No file at that path.', tone: 'err' }
-          : isPublicKeyType(inspected.data.algo)
-            ? { text: `Found · ${inspected.data.algo}`, tone: 'ok' }
-            : { text: 'This file does not read as an SSH public key.', tone: 'err' };
+        : inspected.data === undefined
+          ? null
+          : inspected.data.problem === null
+            ? { text: `Found · ${inspected.data.algo ?? 'public key'}`, tone: 'ok' }
+            : { text: keyRefusal(inspected.data) ?? '', tone: 'err' };
 
   const finishAdded = (added: TargetAdded) => {
     refreshTargets(client); // D.3d's: the Targets page and list read again
@@ -349,7 +345,8 @@ export function AddTargetWizard({ onClose }: { onClose: () => void }) {
       value: `key:${k.path}`,
       ariaLabel: k.display,
       label: k.display,
-      detail: k.algo ?? 'unknown type',
+      detail: k.algo ?? 'not an SSH public key',
+      disabled: k.algo === null,
       ...(k.comment !== null && { meta: k.comment }),
     })),
     {
@@ -501,7 +498,7 @@ export function AddTargetWizard({ onClose }: { onClose: () => void }) {
         items={sshItems}
         onChange={chooseSsh}
       />
-      {candidates.data?.length === 0 && (
+      {keys?.length === 0 && (
         <p className="wizard-notice" role="note">
           {NO_KEYS}
         </p>
