@@ -9,6 +9,7 @@ export const CORE_ERROR_CODES = {
   ENV_TOOL_NOT_FOUND: 'apprafter::env::tool_not_found',
   ENV_TOOL_UNSUPPORTED: 'apprafter::env::tool_unsupported',
   ENV_UNSAFE_OVERRIDE: 'apprafter::env::unsafe_override',
+  IO_ERROR: 'apprafter::io::error',
   OP_CANCELLED: 'apprafter::op::cancelled',
   PROVIDER_HETZNER_API_ERROR: 'apprafter::provider::hetzner_api_error',
   PROVIDER_REQUEST_FAILED: 'apprafter::provider::request_failed',

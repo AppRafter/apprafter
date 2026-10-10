@@ -624,17 +624,18 @@ pub fn load_active_target_config(
 // ---------------------------------------------------------------
 
 /// Read one target's `config.yaml` only — never its credentials, so a listing reads no secret.
-/// Missing target → `CliError::TargetNotFound` with the names present, as [`load_target`].
+/// Missing target → `CliError::TargetNotFound` with the names present, as [`load_target`]; a
+/// file that cannot be read, or checked for, → `CliError::TargetFileIo` naming the target.
 pub fn load_target_config(paths: &TargetStorePaths, name: &str) -> Result<TargetConfig> {
     let cfg_path = paths.target_config_file(name);
-    if !cfg_path.exists() {
+    if !target_file_exists(&cfg_path, name)? {
         let available = list_target_names(paths).unwrap_or_default().join(", ");
         return Err(CliError::TargetNotFound {
             name: name.to_string(),
             available,
         });
     }
-    let cfg_bytes = fs::read(&cfg_path)?;
+    let cfg_bytes = read_target_file(&cfg_path, name)?;
     serde_yaml::from_slice(&cfg_bytes).map_err(|err| CliError::InvalidTargetConfig {
         path: cfg_path.clone(),
         message: err.to_string(),
@@ -662,10 +663,10 @@ pub fn load_target(paths: &TargetStorePaths, name: &str) -> Result<Target> {
 /// remove` reads each file of a target it cannot load on its own (WI-458).
 pub fn load_target_credentials(paths: &TargetStorePaths, name: &str) -> Result<TargetCredentials> {
     let creds_path = paths.target_credentials_file(name);
-    if !creds_path.exists() {
+    if !target_file_exists(&creds_path, name)? {
         return Ok(TargetCredentials::default());
     }
-    let bytes = fs::read(&creds_path)?;
+    let bytes = read_target_file(&creds_path, name)?;
     serde_yaml::from_slice::<TargetCredentials>(&bytes).map_err(|err| {
         CliError::InvalidTargetConfig {
             path: creds_path.clone(),
@@ -673,6 +674,31 @@ pub fn load_target_credentials(paths: &TargetStorePaths, name: &str) -> Result<T
             target: Some(name.to_string()),
         }
     })
+}
+
+/// Whether `path`, one of target `name`'s own files, exists. Not `Path::exists`, which says no on
+/// any error: a target directory this user cannot search read as a target without its
+/// `config.yaml` and without credentials (WI-458 review #3). A check that fails is an I/O error
+/// on that file, naming the target (`CliError::TargetFileIo`). A path through a regular file is
+/// missing, as before: a file under `targets/` is not a target (`list_target_names` skips it).
+fn target_file_exists(path: &Path, name: &str) -> Result<bool> {
+    match path.try_exists() {
+        Err(e) if e.kind() == std::io::ErrorKind::NotADirectory => Ok(false),
+        checked => checked.map_err(|source| target_file_io(path, name, source)),
+    }
+}
+
+/// `path`, one of target `name`'s own files, read; an error names the target (review #6).
+fn read_target_file(path: &Path, name: &str) -> Result<Vec<u8>> {
+    fs::read(path).map_err(|source| target_file_io(path, name, source))
+}
+
+fn target_file_io(path: &Path, name: &str, source: std::io::Error) -> CliError {
+    CliError::TargetFileIo {
+        path: path.to_path_buf(),
+        target: name.to_string(),
+        source,
+    }
 }
 
 /// What a credentials file that does not parse is said to be: where it failed, never serde's
@@ -1485,6 +1511,100 @@ mod tests {
         let (_dir, paths) = make_paths();
         let err = remove_target(&paths, "ghost").expect_err("missing target");
         assert!(matches!(err, CliError::TargetNotFound { .. }));
+    }
+
+    /// A hetzner-cloud target `name` with both of its files.
+    fn saved(paths: &TargetStorePaths, name: &str) {
+        let target = Target {
+            name: name.into(),
+            config: TargetConfig {
+                provider: "hetzner-cloud".into(),
+                ..Default::default()
+            },
+            credentials: TargetCredentials::default(),
+        };
+        save_target(paths, &target).unwrap();
+    }
+
+    /// `err` is an I/O error on target `prod`'s file `path`, of `kind`.
+    #[cfg(unix)]
+    fn assert_target_file_io(err: &CliError, path: &Path, kind: std::io::ErrorKind) {
+        match err {
+            CliError::TargetFileIo {
+                path: p,
+                target,
+                source,
+            } => {
+                assert_eq!((p.as_path(), target.as_str()), (path, "prod"));
+                assert_eq!(source.kind(), kind);
+            }
+            other => panic!("expected TargetFileIo on {}, got {other:?}", path.display()),
+        }
+    }
+
+    /// WI-458 review #3: `Path::exists` says no on any error, so a target directory this user
+    /// cannot search read as a target without its config.yaml (`TargetNotFound`) and without
+    /// credentials (`Ok(default)`). Each is an I/O error on that target's file now, naming the
+    /// target (review #6). A 000 directory: the tests run as a user its mode binds.
+    #[cfg(unix)]
+    #[test]
+    fn a_target_directory_that_cannot_be_searched_is_an_io_error_never_missing() {
+        use std::io::ErrorKind::PermissionDenied;
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, paths) = make_paths();
+        saved(&paths, "prod");
+        fs::set_permissions(paths.target_dir("prod"), fs::Permissions::from_mode(0o000)).unwrap();
+        let _restore = ModeGuard(paths.target_dir("prod"));
+        let config = load_target_config(&paths, "prod").expect_err("cannot be searched");
+        assert_target_file_io(&config, &paths.target_config_file("prod"), PermissionDenied);
+        let credentials = load_target_credentials(&paths, "prod").expect_err("cannot be searched");
+        assert_target_file_io(
+            &credentials,
+            &paths.target_credentials_file("prod"),
+            PermissionDenied,
+        );
+        let both = load_target(&paths, "prod").expect_err("cannot be searched");
+        assert_target_file_io(&both, &paths.target_config_file("prod"), PermissionDenied);
+    }
+
+    /// Review #6: a target's own file that cannot be read is an I/O error naming the target, so
+    /// the desktop can tell it from a store-level one. The other file still reads.
+    #[cfg(unix)]
+    #[test]
+    fn a_target_file_that_cannot_be_read_is_an_io_error_naming_its_target() {
+        use std::io::ErrorKind::PermissionDenied;
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, paths) = make_paths();
+        saved(&paths, "prod");
+        let creds = paths.target_credentials_file("prod");
+        fs::set_permissions(&creds, fs::Permissions::from_mode(0o000)).unwrap();
+        load_target_config(&paths, "prod").expect("config.yaml reads");
+        let err = load_target_credentials(&paths, "prod").expect_err("cannot be read");
+        assert_target_file_io(&err, &creds, PermissionDenied);
+        fs::set_permissions(&creds, fs::Permissions::from_mode(0o600)).unwrap();
+        let cfg = paths.target_config_file("prod");
+        fs::set_permissions(&cfg, fs::Permissions::from_mode(0o000)).unwrap();
+        let err = load_target_config(&paths, "prod").expect_err("cannot be read");
+        assert_target_file_io(&err, &cfg, PermissionDenied);
+    }
+
+    /// A regular file under `targets/` is not a target (`list_target_names` skips it): a path
+    /// through it is missing, as it was under `Path::exists`, not an I/O error.
+    #[test]
+    fn a_file_where_a_target_directory_would_be_is_not_a_target() {
+        let (_dir, paths) = make_paths();
+        saved(&paths, "prod");
+        fs::write(paths.targets_dir().join("notes"), b"x").unwrap();
+        match load_target_config(&paths, "notes") {
+            Err(CliError::TargetNotFound { name, available }) => {
+                assert_eq!((name.as_str(), available.as_str()), ("notes", "prod"));
+            }
+            other => panic!("expected TargetNotFound, got {other:?}"),
+        }
+        assert_eq!(
+            load_target_credentials(&paths, "notes").unwrap(),
+            TargetCredentials::default()
+        );
     }
 
     #[test]

@@ -114,7 +114,8 @@ impl TargetFiles {
     fn read(store: &TargetStorePaths, name: &str) -> Self {
         let config = match cli_core::target::load_target_config(store, name) {
             Ok(_) => None,
-            // The directory is listed (`TargetRef::named`) without its config.yaml.
+            // The directory is listed (`TargetRef::named`) without its config.yaml; one this
+            // user cannot search is an I/O error, never missing (WI-458 review #3).
             Err(CliError::TargetNotFound { .. }) => Some("config.yaml is missing".to_string()),
             Err(e) => Some(format!("config.yaml cannot be read: {}", reason(&e))),
         };
@@ -441,6 +442,32 @@ mod tests {
             Outcome::Completed { .. }
         ));
         assert!(!ctx.store().target_dir("prod").exists());
+    }
+
+    /// WI-458 review #3: a target directory this user cannot search is not a target without its
+    /// config.yaml. The plan says that each file cannot be read, and why (a 000 directory: the
+    /// tests run as a user its mode binds).
+    #[cfg(unix)]
+    #[test]
+    fn a_target_directory_that_cannot_be_searched_is_unreadable_never_missing() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_d, ctx) = store(&["prod"], None);
+        let dir = ctx.store().target_dir("prod");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let plan = TargetRef::named(&ctx, "prod").and_then(|t| plan_remove(&ctx, &t));
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let plan = plan.unwrap();
+        for (kind, file) in [
+            ("Target", "config.yaml"),
+            ("Credentials", "credentials.yaml"),
+        ] {
+            let line = detail(&plan, kind).unwrap();
+            assert!(
+                line.starts_with(&format!("{file} cannot be read: io error: "))
+                    && line.contains("Permission denied"),
+                "{line}"
+            );
+        }
     }
 
     /// An unreadable target whose state cannot be read either: the plan says a server it might

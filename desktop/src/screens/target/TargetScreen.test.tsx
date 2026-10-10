@@ -10,6 +10,7 @@ import userEvent from '@testing-library/user-event';
 import { Activity } from 'react';
 import { ToastProvider } from '../../components/Toast';
 import * as api from '../../ipc/api';
+import { CORE_ERROR_CODES } from '../../ipc/errors';
 import { installMockIpc } from '../../ipc/mock';
 import { resetOperations } from '../../ipc/operations';
 import { startPlan } from '../../ipc/plans';
@@ -331,21 +332,53 @@ test('a target that cannot be shown says why, and its Danger zone still removes 
   await waitFor(() => expect(onRemoved).toHaveBeenCalledWith('broken'));
 });
 
+// Review #6: a file of the target's own that cannot be read for an I/O error (its permissions)
+// names the target as a parse error does, so the Danger zone removes it the same way.
+test('an I/O error on a file of the target offers its removal too', async () => {
+  const internals = (
+    window as unknown as {
+      __TAURI_INTERNALS__: { invoke: (cmd: string, args?: unknown, options?: unknown) => unknown };
+    }
+  ).__TAURI_INTERNALS__;
+  const invoke = internals.invoke;
+  internals.invoke = (cmd, args, options) =>
+    cmd === 'target_show'
+      ? Promise.reject(
+          uiError(CORE_ERROR_CODES.IO_ERROR, 'io error: Permission denied (os error 13)', {
+            path: '~/.config/apprafter/targets/lab/credentials.yaml',
+            target: 'lab',
+          }),
+        )
+      : invoke(cmd, args, options);
+  const onRemoved = mock();
+  const user = screenOf('lab', { onRemoved });
+  expect((await screen.findByRole('alert')).textContent).toContain('Permission denied');
+  await user.click(
+    within(screen.getByRole('region', { name: 'Danger zone' })).getByRole('button', {
+      name: 'Remove…',
+    }),
+  );
+  const confirm = await screen.findByRole('dialog', { name: 'Remove target lab?' });
+  await user.type(within(confirm).getByLabelText(/Type lab to confirm/), 'lab');
+  await user.click(within(confirm).getByRole('button', { name: 'Remove target' }));
+  await waitFor(() => expect(onRemoved).toHaveBeenCalledWith('lab'));
+});
+
 // The store's own config.yaml belongs to no target: removing this one would not repair it (and
-// its plan is refused with the same error), so no Danger zone is offered; nor for any other
-// error, such as a target removed behind the screen's back.
+// its plan is refused with the same error), so no Danger zone is offered; nor for an error on
+// another target's file, or one that names no target at all — parse error and I/O error alike.
 test('a target that cannot be shown for another reason offers no removal', async () => {
-  for (const fields of [{ path: '~/.config/apprafter/config.yaml' }, { target: 'lab' }]) {
-    clearMocks();
-    mockIPC((cmd) =>
-      cmd === 'target_show'
-        ? Promise.reject(uiError('apprafter::target::invalid_config', 'cannot be read', fields))
-        : null,
-    );
-    screenOf('staging');
-    expect((await screen.findByRole('alert')).textContent).toContain('cannot be read');
-    expect(screen.queryByRole('region', { name: 'Danger zone' })).toBeNull();
-    cleanup();
+  for (const code of [CORE_ERROR_CODES.TARGET_INVALID_CONFIG, CORE_ERROR_CODES.IO_ERROR]) {
+    for (const fields of [{ path: '~/.config/apprafter/config.yaml' }, { target: 'lab' }, {}]) {
+      clearMocks();
+      mockIPC((cmd) =>
+        cmd === 'target_show' ? Promise.reject(uiError(code, 'cannot be read', fields)) : null,
+      );
+      screenOf('staging');
+      expect((await screen.findByRole('alert')).textContent).toContain('cannot be read');
+      expect(screen.queryByRole('region', { name: 'Danger zone' })).toBeNull();
+      cleanup();
+    }
   }
 });
 

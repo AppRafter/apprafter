@@ -145,6 +145,12 @@ fn server_type_help(
     format!("{why}\n{what}")
 }
 
+/// The help of an I/O error, [`CliError::Io`] and [`CliError::TargetFileIo`] alike.
+const IO_HELP: &str = "Low-level filesystem / network IO error. The captured OS message above \
+                       usually names the failing path or socket. Common cases: missing \
+                       directory, wrong permissions (`chmod 0600` on credentials), full disk, \
+                       or a closed socket.";
+
 /// `InvalidTargetConfig`'s help: the file, and the fixes that repair it. A target's own file
 /// (`target`) can also be re-created by removing the target and adding it again (`target remove`
 /// takes a target it cannot read, WI-458); the removal deletes the target's local state too, the
@@ -567,15 +573,24 @@ pub enum CliError {
 
     /// Pass-through for `std::io::Error`.
     #[error("io error: {0}")]
-    #[diagnostic(
-        code(apprafter::io::error),
-        help(
-            "Low-level filesystem / network IO error. The captured OS message above usually \
-             names the failing path or socket. Common cases: missing directory, wrong \
-             permissions (`chmod 0600` on credentials), full disk, or a closed socket."
-        )
-    )]
+    #[diagnostic(code(apprafter::io::error), help("{}", IO_HELP))]
     Io(#[from] io::Error),
+
+    /// An I/O error on one target's own file, its `config.yaml` or `credentials.yaml`: reading
+    /// it, or checking that it exists (a target directory this user cannot search). [`Io`]'s
+    /// code, message, cause and help, so the CLI shows it as it showed the plain `Io`, plus
+    /// whose file it is: the desktop offers that target's removal for it, as for a file that
+    /// does not parse (WI-458 review #6).
+    ///
+    /// [`Io`]: CliError::Io
+    #[error("io error: {source}")]
+    #[diagnostic(code(apprafter::io::error), help("{}", IO_HELP))]
+    TargetFileIo {
+        path: PathBuf,
+        target: String,
+        #[source]
+        source: io::Error,
+    },
 
     /// JSON encode/decode error.
     #[error("json error: {0}")]
@@ -884,6 +899,27 @@ mod tests {
         for wrong in ["--renew", "target add", "file next to it", "set `APPRAFTER"] {
             assert!(!manifest.contains(wrong), "{wrong}: {manifest}");
         }
+    }
+
+    /// WI-458 review #6: an I/O error on a target's own file shows as a plain I/O error did —
+    /// code, message, cause and help — so the CLI prints what it printed; only whose file it is
+    /// is new, for the desktop.
+    #[test]
+    fn a_target_file_io_error_shows_as_a_plain_io_error() {
+        let os = || io::Error::new(io::ErrorKind::PermissionDenied, "denied");
+        let plain = CliError::Io(os());
+        let target = CliError::TargetFileIo {
+            path: PathBuf::from("/s/targets/prod/config.yaml"),
+            target: "prod".into(),
+            source: os(),
+        };
+        assert_eq!(code_of(&target), "apprafter::io::error");
+        assert_eq!(code_of(&target), code_of(&plain));
+        assert_eq!(target.to_string(), plain.to_string());
+        assert_eq!(help_of(&target), help_of(&plain));
+        let cause = |e: &CliError| std::error::Error::source(e).map(ToString::to_string);
+        assert_eq!(cause(&target), cause(&plain));
+        assert_eq!(cause(&target).as_deref(), Some("denied"));
     }
 
     /// Bug 8: `--force` now keeps the stored values, so it refuses an unreadable target (it

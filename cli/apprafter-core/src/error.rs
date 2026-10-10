@@ -215,6 +215,9 @@ pub mod codes {
     /// A target store file that cannot be read; `fields.target` names the target whose own file
     /// it is (the desktop then offers to remove it, WI-458).
     pub const INVALID_TARGET_CONFIG: &str = "apprafter::target::invalid_config";
+    /// A filesystem error. On one of a target's own files `fields.target` names the target and
+    /// `fields.path` the file (the desktop then offers to remove it, WI-458 review #6).
+    pub const IO_ERROR: &str = "apprafter::io::error";
 
     /// Every code above.
     pub const ALL: &[&str] = &[
@@ -248,6 +251,7 @@ pub mod codes {
         PROVIDER_UNREACHABLE,
         SSH_KEY_NOT_PUBLIC,
         INVALID_TARGET_CONFIG,
+        IO_ERROR,
     ];
 }
 
@@ -529,6 +533,12 @@ fn neutral_help(e: &cli_core::CliError) -> Option<String> {
              failing path or socket: a missing directory, wrong permissions, a full disk, or a \
              closed socket."
             .into(),
+        // The OS message names no file here: the help does (WI-458 review #6).
+        C::TargetFileIo { path, target, .. } => format!(
+            "{} is a file of target `{target}`, and it could not be read: most often its \
+             permissions, or its folder's, do not let this user read it.",
+            path.display()
+        ),
         C::Json(_) => "A JSON file could not be read or written, most often a target's state \
              file. If it was edited by hand or copied across versions, rebuilding the state \
              from the provider replaces it."
@@ -608,6 +618,10 @@ fn project_cli(e: &cli_core::CliError, put: &mut impl FnMut(&str, serde_json::Va
             if let Some(name) = target {
                 put("target", json!(name));
             }
+        }
+        C::TargetFileIo { path, target, .. } => {
+            put("path", json!(path.display().to_string()));
+            put("target", json!(target));
         }
         C::InvalidState { path, .. } => put("path", json!(path.display().to_string())),
         C::SshKeyNotPublic {
@@ -836,6 +850,11 @@ pub mod samples {
                 cause: Box::new(hetzner()),
             },
             C::Io(std::io::Error::other("denied")),
+            C::TargetFileIo {
+                path: "/s/targets/prod/credentials.yaml".into(),
+                target: s("prod"),
+                source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            },
             C::Json(serde_json::from_str::<u8>("x").unwrap_err()),
             C::CompletionInstall(s("no destination")),
             C::ConfirmationRequired {
@@ -1281,6 +1300,15 @@ mod tests {
                 },
                 codes::INVALID_TARGET_CONFIG,
             ),
+            (C::Io(std::io::Error::other("x")), codes::IO_ERROR),
+            (
+                C::TargetFileIo {
+                    path: "/s/targets/prod/config.yaml".into(),
+                    target: "prod".into(),
+                    source: std::io::Error::other("x"),
+                },
+                codes::IO_ERROR,
+            ),
         ] {
             assert_eq!(miette::Diagnostic::code(&e).unwrap().to_string(), code);
         }
@@ -1411,7 +1439,7 @@ mod tests {
             codes::BACKUP_JOB_ACTIVE,
             codes::SSH_KEY_NOT_PUBLIC,
             codes::INVALID_TARGET_CONFIG,
-            "apprafter::io::error",
+            codes::IO_ERROR,
         ] {
             assert!(helped.contains(code), "{code} has no neutral help");
         }
@@ -1635,6 +1663,33 @@ mod tests {
         assert_eq!(ui.code.as_deref(), Some("apprafter::io::error"));
         assert_eq!(ui.message, "io error: denied: /x");
         assert_eq!(ui.causes, vec!["denied: /x".to_string()]);
+        assert!(ui.fields.is_empty(), "{:?}", ui.fields);
+    }
+
+    /// WI-458 review #6: an I/O error on one of a target's own files is the same code and
+    /// message as any I/O error, and its fields name the target and the file — what the desktop
+    /// offers that target's removal on — and its help names the file, which the OS message does
+    /// not.
+    #[test]
+    fn an_io_error_on_a_targets_own_file_names_the_target() {
+        let source = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        let ui = UiError::from(&CoreError::from(cli_core::CliError::TargetFileIo {
+            path: "/s/targets/prod/credentials.yaml".into(),
+            target: "prod".into(),
+            source,
+        }));
+        assert_eq!(ui.code.as_deref(), Some(codes::IO_ERROR));
+        assert_eq!(ui.message, "io error: denied");
+        assert_eq!(ui.causes, vec!["denied".to_string()]);
+        assert_eq!(
+            json!(ui.fields),
+            json!({"path": "/s/targets/prod/credentials.yaml", "target": "prod"})
+        );
+        let help = ui.help.unwrap();
+        assert!(
+            help.contains("/s/targets/prod/credentials.yaml") && help.contains("`prod`"),
+            "{help}"
+        );
     }
 
     #[test]

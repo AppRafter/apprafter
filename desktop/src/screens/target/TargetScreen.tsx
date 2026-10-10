@@ -4,7 +4,7 @@
 // renew the token, change the SSH key, make it the CLI's default, remove it from this computer —
 // each by its plan class (actions.tsx). A target whose own file cannot be read shows why, and its
 // Danger zone still removes it (WI-458): the Targets page lists by config.yaml alone, so a target
-// whose credentials do not parse opens here. A plan refused, or a run that failed or was cancelled,
+// whose credentials do not parse, or cannot be read, opens here. A plan refused, or a run that failed or was cancelled,
 // shows above the cards with what it offers; an action that starts again clears it. Run doctor
 // (the page header) and the Machine row's Change open the D.3 flows (screens/flows.tsx): Doctor
 // over every view, Change machine in this tab, on the machine the report says the target is set
@@ -124,11 +124,17 @@ export function TargetScreen({ name, onRenamed, onRemoved, onChangeMachine }: Ta
   );
 }
 
+/** The errors the core says are about one of a target's own files when `fields.target` names it. */
+const OWN_FILE_CODES: readonly string[] = [
+  CORE_ERROR_CODES.TARGET_INVALID_CONFIG,
+  CORE_ERROR_CODES.IO_ERROR,
+];
+
 /**
  * Why the target cannot be shown; when it is one of its own files (`fields.target` names it, as
- * the core projects it), the Danger zone too: removing it works on a target that cannot be read
- * (WI-458), and the error's help offers it. Never for the store's own config.yaml, which no
- * removal repairs.
+ * the core projects it for a file that does not parse and for one it cannot read, WI-458 review
+ * #6), the Danger zone too: removing it works on a target that cannot be read (WI-458). Never for
+ * the store's own config.yaml, which no removal repairs, nor for another target's file.
  */
 function Unreadable({
   error,
@@ -140,7 +146,7 @@ function Unreadable({
   onRemove: () => void;
 }) {
   const ownFile =
-    error.code === CORE_ERROR_CODES.TARGET_INVALID_CONFIG && error.fields.target === name;
+    error.code !== null && OWN_FILE_CODES.includes(error.code) && error.fields.target === name;
   return (
     <>
       <ErrorPanel error={error} />
