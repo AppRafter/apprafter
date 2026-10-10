@@ -190,3 +190,83 @@ fn the_token_crosses_ipc_once_and_comes_back_in_nothing() {
         "the renewed token is stored"
     );
 }
+
+/// D.3d review #5: a credentials file a hand edit broke — no space after the colon
+/// (`hetzner_token:<token>`), or the bare token — is one YAML scalar, which serde quotes when it
+/// refuses it. Every desktop path that reads the file says where it failed, never what it holds:
+/// the Target screen's show, whoami, doctor's row, a renew plan, and the target's catalogue.
+#[test]
+fn a_credentials_file_that_does_not_parse_never_brings_its_token_back() {
+    let stored = "m".repeat(64);
+    let renew = "n".repeat(64);
+    for body in [format!("hetzner_token:{stored}\n"), format!("{stored}\n")] {
+        let rig = rig_with_api(lock_off(), "http://127.0.0.1:9");
+        let store = rig.shell.context.store();
+        cli_core::save_target(
+            &store,
+            &cli_core::Target {
+                name: "prod".into(),
+                config: cli_core::TargetConfig {
+                    provider: "hetzner-cloud".into(),
+                    ..Default::default()
+                },
+                credentials: cli_core::TargetCredentials::default(),
+            },
+        )
+        .unwrap();
+        cli_core::save_global_config(
+            &store,
+            &cli_core::GlobalConfig {
+                active_target: "prod".into(),
+                version: cli_core::TARGET_STORE_VERSION,
+            },
+        )
+        .unwrap();
+        std::fs::write(store.target_credentials_file("prod"), &body).unwrap();
+        let mut seen = Seen::default();
+        for (cmd, args) in [
+            ("target_show", json!({ "name": "prod" })),
+            ("whoami", json!({})),
+            (
+                "op_plan_target_renew",
+                json!({ "name": "prod", "token": renew, "sshKey": null }),
+            ),
+        ] {
+            let error = invoke(&rig, cmd, args).expect_err(cmd);
+            assert_eq!(
+                error["code"],
+                json!("apprafter::target::invalid_config"),
+                "{cmd}: {error}"
+            );
+            seen.0.push(error.to_string());
+        }
+        for (cmd, args) in [
+            ("op_start_doctor", json!({ "target": "prod" })),
+            (
+                "op_start_machine_catalogue",
+                json!({ "source": { "kind": "target", "name": "prod" } }),
+            ),
+        ] {
+            let id = seen.reply(invoke(&rig, cmd, args));
+            seen.follow(&rig, &id);
+        }
+        let doctor = seen
+            .0
+            .iter()
+            .find(|text| text.contains("config_readable"))
+            .cloned()
+            .expect("doctor reported the config row");
+        assert!(
+            doctor.contains("not a valid target credentials map"),
+            "{doctor}"
+        );
+        for (i, text) in seen.0.iter().enumerate() {
+            for token in [&stored, &renew] {
+                assert!(
+                    !text.contains(token.as_str()),
+                    "item {i} carries a token: {text}"
+                );
+            }
+        }
+    }
+}

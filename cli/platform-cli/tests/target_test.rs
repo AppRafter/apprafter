@@ -993,9 +993,20 @@ fn target_remove_on_missing_target_surfaces_available_hint() {
 /// Windows path (`\` allows no line break before a letter) is split inside a word, so asserting
 /// on the path would fail on the Windows runner only.
 const UNREADABLE_CODE: &str = "apprafter::target::invalid_config";
-/// The key a seeded `credentials.yaml` fails on, as its parse error names it: it says which file
-/// was read, path-free and too short to be split.
-const CREDENTIALS_KEY: &str = "hetzner_token:";
+/// What the error for a `credentials.yaml` that does not parse says, path-free: which file was
+/// read. It never quotes the file (the D.3d review's #5: that text is the token), so the
+/// phrase is matched with miette's wrapping (a line break and the `│` gutter between two words)
+/// taken out.
+fn says_the_credentials_do_not_parse() -> impl predicates::Predicate<str> {
+    predicates::function::function(|stderr: &str| {
+        stderr
+            .split_whitespace()
+            .filter(|word| *word != "│")
+            .collect::<Vec<_>>()
+            .join(" ")
+            .contains("not a valid target credentials map")
+    })
+}
 
 /// `use` and `remove` find their target by reading both of its files, as they always have: a
 /// target whose credentials file cannot be parsed is refused and left in place, and the CLI
@@ -1022,7 +1033,7 @@ fn target_use_and_remove_refuse_a_target_whose_files_cannot_be_read() {
             .assert()
             .failure()
             .stderr(contains(UNREADABLE_CODE))
-            .stderr(contains(CREDENTIALS_KEY));
+            .stderr(says_the_credentials_do_not_parse());
     }
     assert!(dir.path().join("targets/second/config.yaml").exists());
     let global = std::fs::read_to_string(dir.path().join("config.yaml")).unwrap();
@@ -1069,7 +1080,7 @@ fn target_add_and_renew_refuse_a_target_whose_credentials_cannot_be_read() {
             .assert()
             .failure()
             .stderr(contains(UNREADABLE_CODE))
-            .stderr(contains(CREDENTIALS_KEY))
+            .stderr(says_the_credentials_do_not_parse())
             .stderr(contains("already exists").not())
             .stderr(contains("only updates credentials").not());
     }

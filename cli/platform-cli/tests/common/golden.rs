@@ -338,6 +338,28 @@ impl Sandbox {
         check(case, &doc);
     }
 
+    /// Fails when any step's output carries `secret` (ASCII letters and digits, as a token is):
+    /// searched with everything else taken out, so a message miette wrapped mid-token, with
+    /// its `│` gutter in between, still counts.
+    pub fn assert_steps_never_print(&self, steps: &[&[&str]], secret: &str) {
+        let squeeze = |bytes: &[u8]| -> String {
+            String::from_utf8_lossy(bytes)
+                .chars()
+                .filter(char::is_ascii_alphanumeric)
+                .collect()
+        };
+        for args in steps {
+            let out = self.cmd(args).output().expect("run apprafter");
+            for (stream, bytes) in [("stdout", &out.stdout), ("stderr", &out.stderr)] {
+                assert!(
+                    !squeeze(bytes).contains(secret),
+                    "`apprafter {}` printed the secret on {stream}",
+                    args.join(" ")
+                );
+            }
+        }
+    }
+
     /// Fails when `doc` still names the sandbox root's own directory: a spelling of the root
     /// the harness does not know, or a root a wrapped message split before its last component.
     /// Checked before the comparison, so update mode cannot record it either.

@@ -653,7 +653,7 @@ pub fn load_target(paths: &TargetStorePaths, name: &str) -> Result<Target> {
         serde_yaml::from_slice::<TargetCredentials>(&bytes).map_err(|err| {
             CliError::InvalidTargetConfig {
                 path: creds_path.clone(),
-                message: err.to_string(),
+                message: credentials_parse_message(&err),
             }
         })?
     } else {
@@ -665,6 +665,20 @@ pub fn load_target(paths: &TargetStorePaths, name: &str) -> Result<Target> {
         config,
         credentials,
     })
+}
+
+/// What a credentials file that does not parse is said to be: where it failed, never serde's
+/// own text, which quotes the scalar it could not read — in this file, the token (a hand edit
+/// with no space after the colon, `hetzner_token:<token>`, is one plain scalar).
+fn credentials_parse_message(err: &serde_yaml::Error) -> String {
+    match err.location() {
+        Some(at) => format!(
+            "not a valid target credentials map (line {}, column {})",
+            at.line(),
+            at.column()
+        ),
+        None => "not a valid target credentials map".to_string(),
+    }
 }
 
 /// Persist both halves of a target. `config.yaml` is mode 0644
@@ -888,6 +902,54 @@ mod tests {
         assert_eq!(paths.auth_dir(), root.join("auth"));
         assert_eq!(paths.auth_keep_file(), root.join("auth/.keep"));
         assert_eq!(paths.state_dir("work"), root.join("state/work"));
+    }
+
+    /// D.3d review #5: serde_yaml's text quotes the scalar it could not read, and in a
+    /// credentials file that scalar is the token — a hand edit with no space after the colon
+    /// (`hetzner_token:<token>`) is one plain scalar, and so is a bare token line. The error
+    /// names the file and where in it, never what it holds; it reaches a terminal, the desktop's
+    /// error panel, and doctor's row.
+    #[test]
+    fn a_credentials_file_that_does_not_parse_is_named_by_its_place_never_its_text() {
+        let (_dir, paths) = make_paths();
+        let token = "t0k3n".repeat(13);
+        save_target(
+            &paths,
+            &Target {
+                name: "prod".into(),
+                config: TargetConfig {
+                    provider: "hetzner-cloud".into(),
+                    ..Default::default()
+                },
+                credentials: TargetCredentials::default(),
+            },
+        )
+        .unwrap();
+        let creds = paths.target_credentials_file("prod");
+        for (body, line, column) in [
+            (format!("hetzner_token:{token}\n"), 1, 1),
+            (format!("{token}\n"), 1, 1),
+            (format!("hetzner_token: [{token}]\n"), 1, 16),
+            (format!("# a token\nhetzner_token: [{token}\n"), 2, 16),
+        ] {
+            fs::write(&creds, &body).unwrap();
+            let err = load_target(&paths, "prod").expect_err(&body);
+            let shown = err.to_string();
+            assert!(!shown.contains(&token), "the token is quoted: {shown}");
+            match err {
+                CliError::InvalidTargetConfig { path, message } => {
+                    assert_eq!(path, creds);
+                    assert_eq!(
+                        message,
+                        format!(
+                            "not a valid target credentials map (line {line}, column {column})"
+                        ),
+                        "{body}"
+                    );
+                }
+                other => panic!("{other:?}"),
+            }
+        }
     }
 
     #[test]

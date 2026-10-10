@@ -47,6 +47,22 @@ fn doctor_of_a_target_that_does_not_exist() {
     );
 }
 
+/// D.3d review #5: doctor's row for a credentials file that does not parse names the file and
+/// where in it; serde's own text would quote the token (`hetzner_token:<token>`, no space, is
+/// one scalar).
+#[test]
+fn doctor_with_credentials_missing_the_space_after_the_colon() {
+    let sb = Sandbox::new().with_stand_in_tools();
+    sb.add_target("prod");
+    sb.seed_store_file(
+        "targets/prod/credentials.yaml",
+        &format!("hetzner_token:{TOKEN_A}\n"),
+    );
+    let args = ["doctor", "--no-ping"];
+    sb.assert_steps_never_print(&[&args], TOKEN_A);
+    sb.golden("doctor/credentials_no_space", &args);
+}
+
 #[test]
 fn doctor_with_a_rejected_token() {
     let mut server = mockito::Server::new();

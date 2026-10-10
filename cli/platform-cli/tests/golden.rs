@@ -946,6 +946,33 @@ fn target_list_with_a_dangling_pointer() {
     sb.golden("target/list_dangling", &["target", "list"]);
 }
 
+/// D.3d review #5: a hand edit with no space after the colon (`hetzner_token:<token>`) makes
+/// the whole line one YAML scalar, which serde quotes when it refuses it. The error names the
+/// file and where in it, never what it holds.
+#[test]
+fn target_show_and_whoami_with_credentials_missing_the_space_after_the_colon() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.seed_store_file(
+        "targets/prod/credentials.yaml",
+        &format!("hetzner_token:{TOKEN_A}\n"),
+    );
+    let steps: &[&[&str]] = &[&["target", "show"], &["whoami", "--no-ping"]];
+    sb.assert_steps_never_print(steps, TOKEN_A);
+    sb.golden_steps("target/show_credentials_no_space", steps);
+}
+
+/// The same for a credentials file that holds only the token, as `echo $TOKEN > …` leaves it.
+#[test]
+fn target_show_with_credentials_that_hold_only_the_token() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.seed_store_file("targets/prod/credentials.yaml", &format!("{TOKEN_A}\n"));
+    let steps: &[&[&str]] = &[&["target", "show"]];
+    sb.assert_steps_never_print(steps, TOKEN_A);
+    sb.golden_steps("target/show_credentials_bare_token", steps);
+}
+
 #[test]
 fn target_show_with_a_dangling_pointer() {
     dangling_pointer_sandbox().golden("target/show_dangling", &["target", "show"]);

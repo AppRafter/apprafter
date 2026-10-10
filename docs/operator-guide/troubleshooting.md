@@ -184,7 +184,10 @@ apprafter import --target <target>
 ### `apprafter::target::invalid_config`
 
 A YAML file under `$XDG_CONFIG_HOME/apprafter/` failed to parse.
-Either hand-edited or written by an incompatible CLI version.
+Either hand-edited or written by an incompatible CLI version. For a
+target's `credentials.yaml` the message gives only the line and column
+where parsing stopped, never the file's text, because that text is the
+API token.
 
 **Fix.** Either fix the YAML by hand (these files are small), or
 nuke just the offending target's directory under
