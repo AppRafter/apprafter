@@ -334,6 +334,34 @@ test('renew with an SSH key: an unreadable key is refused; a new one is planned 
   expect(same.changes.map((c) => c.kind)).toEqual(['Credentials']);
 });
 
+test('a typed key path: `~/` expands against the home as Rust does, then the path alone finds the file', async () => {
+  expect(await api.sshKeyInspect('~/.ssh/work.pub')).toEqual({
+    path: '/home/alex/.ssh/work.pub',
+    display: '~/.ssh/work.pub',
+    exists: true,
+    algo: 'ssh-rsa',
+    problem: null,
+  });
+  // No `~user/`, and no relative path: Rust looks for that path as typed, and the mock does too.
+  for (const typed of ['~alex/.ssh/work.pub', '.ssh/work.pub']) {
+    expect(await api.sshKeyInspect(typed)).toEqual({
+      path: typed,
+      display: typed,
+      exists: false,
+      algo: null,
+      problem: 'missing',
+    });
+  }
+  const missing = await api.sshKeyInspect('~/.ssh/nothing.pub');
+  expect([missing.path, missing.display]).toEqual([
+    '/home/alex/.ssh/nothing.pub',
+    '~/.ssh/nothing.pub',
+  ]);
+  // The plan saves the expanded path.
+  await runPlan(await api.opPlanTargetRenew('lab', null, '~/.ssh/work.pub'));
+  expect((await api.targetShow('lab')).sshKey?.path).toBe('/home/alex/.ssh/work.pub');
+});
+
 test('a file that is not a public key: inspected with no type and why; refused by the plans (GOTCHA-149)', async () => {
   expect(await api.sshKeyInspect('/home/alex/.ssh/id_ed25519')).toEqual({
     path: '/home/alex/.ssh/id_ed25519',

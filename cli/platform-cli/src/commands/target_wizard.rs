@@ -678,7 +678,7 @@ fn validate_ssh_key_path_input(
     if trimmed.is_empty() {
         return Ok(());
     }
-    let expanded = expand_tilde(trimmed, home);
+    let expanded = apprafter_core::ssh::expand_tilde(trimmed, home);
     if !expanded.exists() {
         return Err(format!("path `{}` does not exist", expanded.display()));
     }
@@ -706,7 +706,7 @@ fn ssh_key_answer_to_path(answer: &str, home: Option<&Path>) -> Option<PathBuf> 
     if trimmed.is_empty() {
         None
     } else {
-        Some(expand_tilde(trimmed, home))
+        Some(apprafter_core::ssh::expand_tilde(trimmed, home))
     }
 }
 
@@ -1018,19 +1018,6 @@ fn inline_ping_error(e: &CoreError) -> String {
 // Tiny helpers
 // ---------------------------------------------------------------
 
-/// Expand a leading `~/` into `home` (the context's home directory).
-/// Other tilde forms (`~user/`) are left unexpanded so the path
-/// stays predictable — operators who need that can pass an
-/// absolute path explicitly. No home: the input as typed.
-pub fn expand_tilde(input: &str, home: Option<&Path>) -> PathBuf {
-    if let Some(rest) = input.strip_prefix("~/") {
-        if let Some(home) = home {
-            return home.join(rest);
-        }
-    }
-    PathBuf::from(input)
-}
-
 fn default_ssh_key_hint(home: Option<&Path>) -> String {
     // ~/.ssh/id_ed25519.pub matches the modern OpenSSH default
     // and is what apprafter init / apply scaffolding already
@@ -1095,26 +1082,6 @@ mod tests {
         // ssh-key/tier still get prompted; v0.1.76 short-circuit
         // dropped in v0.1.77).
         assert!(should_use_wizard(false, true, true));
-    }
-
-    /// `~/` expands against the context's home and nothing else: no home leaves the input as
-    /// typed, and `~user/` is never expanded.
-    #[test]
-    fn tilde_expands_against_the_contexts_home_only() {
-        let home = Path::new("/home/op");
-        assert_eq!(
-            expand_tilde("~/.ssh/k.pub", Some(home)),
-            PathBuf::from("/home/op/.ssh/k.pub")
-        );
-        assert_eq!(
-            expand_tilde("~/.ssh/k.pub", None),
-            PathBuf::from("~/.ssh/k.pub")
-        );
-        assert_eq!(expand_tilde("~bob/k", Some(home)), PathBuf::from("~bob/k"));
-        assert_eq!(
-            expand_tilde("/etc/ssh/host_key.pub", Some(home)),
-            PathBuf::from("/etc/ssh/host_key.pub")
-        );
     }
 
     /// The picker row for a found key: the `~/` path, then the key type and its comment when

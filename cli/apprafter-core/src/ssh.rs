@@ -100,6 +100,20 @@ impl From<NotAPublicKey> for SshKeyProblem {
     }
 }
 
+/// A typed key path with a leading `~/` expanded into `home` (the context's home directory), as
+/// a shell would before the CLI saw it: the CLI wizard's typed path and the desktop's (whose
+/// field suggests `~/.ssh/id_ed25519.pub`) both pass through here before a key is inspected or
+/// saved, so the stored path is the absolute one. Other tilde forms (`~user/`) are left as
+/// typed, so the path stays predictable; with no home, the input is returned as typed.
+pub fn expand_tilde(input: &str, home: Option<&Path>) -> PathBuf {
+    if let Some(rest) = input.strip_prefix("~/") {
+        if let Some(home) = home {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(input)
+}
+
 /// An OpenSSH public key's algo and comment; neither for anything else.
 fn parse_key(body: &str) -> (Option<String>, Option<String>) {
     match parse_public_key(body) {
@@ -248,6 +262,26 @@ mod tests {
         let empty = tempfile::tempdir().unwrap();
         let ctx = ctx.with_home_dir(Some(empty.path().into()));
         assert!(public_key_candidates(&ctx).unwrap().is_empty());
+    }
+
+    /// `~/` expands against the context's home and nothing else: no home leaves the input as
+    /// typed, and `~user/` is never expanded.
+    #[test]
+    fn tilde_expands_against_the_contexts_home_only() {
+        let home = Path::new("/home/op");
+        assert_eq!(
+            expand_tilde("~/.ssh/k.pub", Some(home)),
+            PathBuf::from("/home/op/.ssh/k.pub")
+        );
+        assert_eq!(
+            expand_tilde("~/.ssh/k.pub", None),
+            PathBuf::from("~/.ssh/k.pub")
+        );
+        assert_eq!(expand_tilde("~bob/k", Some(home)), PathBuf::from("~bob/k"));
+        assert_eq!(
+            expand_tilde("/etc/ssh/host_key.pub", Some(home)),
+            PathBuf::from("/etc/ssh/host_key.pub")
+        );
     }
 
     #[test]

@@ -19,7 +19,7 @@
 //! network step) both end the operation cancelled, with what it cleaned and left when the core
 //! names them ([`crate::ops::Executor`]).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use apprafter_core::doctor::{self, DoctorArgs, DoctorTarget};
@@ -125,8 +125,19 @@ pub fn ssh_key_candidates(shell: &Shell) -> Result<Vec<SshKeyCandidate>, Desktop
     Ok(ssh::public_key_candidates(&shell.context)?)
 }
 
+/// The key a typed path names, `~/` expanded against the context's home as a shell would for
+/// the CLI (the field suggests `~/.ssh/id_ed25519.pub`); its `path` is the expanded one, which is
+/// what a plan is then given.
 pub fn ssh_key_inspect(shell: &Shell, path: &str) -> Result<SshKeyInfo, DesktopError> {
-    Ok(ssh::inspect_key(&shell.context, Path::new(path))?)
+    Ok(ssh::inspect_key(
+        &shell.context,
+        &typed_key_path(shell, path),
+    )?)
+}
+
+/// A key path the page typed, as the core is given it: `~/` expanded against the context's home.
+fn typed_key_path(shell: &Shell, path: &str) -> PathBuf {
+    ssh::expand_tilde(path, shell.context.home_dir())
 }
 
 /// Bounded by the core: the probes run concurrently, each killed after 5 s (R14) — and, the
@@ -260,7 +271,7 @@ pub fn plan_target_add(shell: &Shell, args: TargetAddArgs) -> Result<PlanView, D
             name: args.name,
             provider,
             token,
-            ssh_key: args.ssh_key.map(PathBuf::from),
+            ssh_key: args.ssh_key.map(|p| typed_key_path(shell, &p)),
             region: args.region,
             tier: args.tier,
             cluster_name: None,
@@ -278,14 +289,15 @@ pub fn plan_target_add(shell: &Shell, args: TargetAddArgs) -> Result<PlanView, D
 /// key row). The core changes what differs from what is stored: a key alone (`token: None`)
 /// keeps the credentials and asks the provider nothing; a new token is checked with the provider
 /// when the plan runs, and only then saved. An unreadable key, or a renewal that would change
-/// nothing, is refused before any plan.
+/// nothing, is refused before any plan. The key path is typed: `~/` expands against the home.
 pub fn plan_target_renew(
     shell: &Shell,
     name: &str,
     token: Option<SecretString>,
-    ssh_key: Option<PathBuf>,
+    ssh_key: Option<String>,
 ) -> Result<PlanView, DesktopError> {
     let named = TargetRef::named(&shell.context, name)?;
+    let ssh_key = ssh_key.map(|p| typed_key_path(shell, &p));
     let verb = if token.is_some() {
         "renew the token of"
     } else {
@@ -501,6 +513,11 @@ mod tests {
 
     fn a_token(c: char) -> SecretString {
         SecretString::new(c.to_string().repeat(64))
+    }
+
+    /// A key path as the page sends it.
+    fn path_of(path: &std::path::Path) -> String {
+        path.display().to_string()
     }
 
     /// A provider API on loopback: each request it gets is told on `asked`, and answered — 200,
@@ -774,7 +791,7 @@ mod tests {
         let key = s._dir.path().join("id_ed25519.pub");
         std::fs::write(&key, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5 alex@workstation\n").unwrap();
         let view =
-            plan_target_renew(&s.shell, "prod", Some(a_token('k')), Some(key.clone())).unwrap();
+            plan_target_renew(&s.shell, "prod", Some(a_token('k')), Some(path_of(&key))).unwrap();
         assert_eq!(view.class, PlanClass::Bounded);
         assert!(
             view.changes.iter().any(|c| c.kind == "Target"
@@ -804,13 +821,77 @@ mod tests {
     fn renew_with_an_unreadable_ssh_key_is_refused_before_any_plan() {
         let s = store(&["prod"], None);
         let missing = s._dir.path().join("nothing-here.pub");
-        let ui = plan_target_renew(&s.shell, "prod", Some(a_token('k')), Some(missing))
-            .unwrap_err()
-            .to_ui();
+        let ui = plan_target_renew(
+            &s.shell,
+            "prod",
+            Some(a_token('k')),
+            Some(path_of(&missing)),
+        )
+        .unwrap_err()
+        .to_ui();
         assert_eq!(
             ui.code.as_deref(),
             Some("apprafter::target::ssh_key_unreadable")
         );
+    }
+
+    /// D.3d review #2/#7/#11/#16: the SSH key field suggests `~/.ssh/id_ed25519.pub`, and in the
+    /// CLI the shell expands it. A typed `~/` path expands against the context's home: inspected,
+    /// it is found and answered absolute, and the renew and add plans save the absolute path.
+    #[test]
+    fn a_typed_key_path_expands_against_the_home() {
+        let api = api();
+        let s = unlocked_store_on(&["prod"], &api);
+        let home = s._dir.path().join("home");
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        let key = home.join(".ssh").join("work.pub");
+        std::fs::write(&key, "ssh-ed25519 AAAA alex@work\n").unwrap();
+        let shell = Shell::new(
+            SettingsStore::load(s._dir.path(), &SystemClock),
+            Arc::new(FakeAuthenticator::new()),
+            Arc::new(SystemClock),
+            s.shell.context.clone().with_home_dir(Some(home.clone())),
+            ToolSearchPath::known(OsString::new(), PathSource::Explicit),
+            false,
+            |_| {},
+        );
+        shell.unlock().unwrap();
+        let info = ssh_key_inspect(&shell, "~/.ssh/work.pub").unwrap();
+        assert_eq!(
+            (info.path.as_str(), info.exists, info.algo.as_deref()),
+            (path_of(&key).as_str(), true, Some("ssh-ed25519"))
+        );
+        let view = plan_target_renew(&shell, "prod", None, Some("~/.ssh/work.pub".into())).unwrap();
+        run(&shell, &view);
+        let saved = cli_core::load_target(&shell.context.store(), "prod").unwrap();
+        assert_eq!(saved.config.ssh_key_path.as_deref(), Some(key.as_path()));
+        let draft = shell
+            .drafts
+            .insert(shell.drafts.epoch(), "hetzner-cloud".into(), a_token('k'))
+            .unwrap();
+        let view = plan_target_add(
+            &shell,
+            TargetAddArgs {
+                name: "lab".into(),
+                provider: "hetzner-cloud".into(),
+                draft_id: draft,
+                ssh_key: Some("~/.ssh/work.pub".into()),
+                region: None,
+                tier: None,
+                server_type: None,
+            },
+        )
+        .unwrap();
+        shell
+            .execute(view.op_id, Arc::new(Recorder::default()))
+            .unwrap();
+        api.asked
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the add pings the token");
+        api.answer.send(()).unwrap();
+        result_of(ended(&shell, view.op_id));
+        let saved = cli_core::load_target(&shell.context.store(), "lab").unwrap();
+        assert_eq!(saved.config.ssh_key_path.as_deref(), Some(key.as_path()));
     }
 
     /// GOTCHA-149: a private key is the file next to the `.pub`, and a provider is sent whatever
@@ -839,7 +920,7 @@ mod tests {
             assert!(!ui.message.contains("b3Blbn"), "{}", ui.message);
         };
         refused(
-            plan_target_renew(&s.shell, "prod", None, Some(key.clone()))
+            plan_target_renew(&s.shell, "prod", None, Some(path_of(&key)))
                 .unwrap_err()
                 .to_ui(),
         );
@@ -879,7 +960,7 @@ mod tests {
         let s = unlocked_store_on(&["prod"], &api);
         let key = s._dir.path().join("id_ed25519.pub");
         std::fs::write(&key, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5 alex@workstation\n").unwrap();
-        let view = plan_target_renew(&s.shell, "prod", None, Some(key.clone())).unwrap();
+        let view = plan_target_renew(&s.shell, "prod", None, Some(path_of(&key))).unwrap();
         assert_eq!(
             (view.class, view.title.as_str()),
             (PlanClass::Bounded, "Change the SSH key of prod")

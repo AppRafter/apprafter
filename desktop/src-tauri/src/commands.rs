@@ -17,7 +17,6 @@
 //! The D.3 commands (targets, doctor, whoami) are thin wrappers over [`target_ops`], which
 //! holds their bodies and their tests.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use apprafter_core::session::WhoamiReport;
@@ -399,7 +398,7 @@ pub async fn op_plan_target_renew(
 ) -> Result<PlanView, UiError> {
     let token = token.map(|t| SecretString::from(Zeroizing::new(t)));
     on_shell(&shell, move |shell| {
-        target_ops::plan_target_renew(shell, &name, token, ssh_key.map(PathBuf::from))
+        target_ops::plan_target_renew(shell, &name, token, ssh_key)
     })
     .await
 }

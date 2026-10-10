@@ -40,6 +40,7 @@ import {
   MOCK_CATALOGUE,
   MOCK_CLI_DEFAULT,
   MOCK_DOCTOR,
+  MOCK_HOME,
   MOCK_LATENCIES,
   MOCK_NOT_KEYS,
   MOCK_REPORTS,
@@ -170,33 +171,45 @@ export function catalogueSourceRefusal(
   return namesIn(store).includes(source.name) ? null : notFound(store, source.name);
 }
 
+/** Rust's `ssh::expand_tilde`: a leading `~/` into the home, nothing else. */
+const expandTilde = (path: string) =>
+  path.startsWith('~/') ? `${MOCK_HOME}/${path.slice(2)}` : path;
+
+/** Rust's `abbreviate_home`: a path under the home shown with `~/`. */
+const abbreviated = (path: string) =>
+  path.startsWith(`${MOCK_HOME}/`) ? `~/${path.slice(MOCK_HOME.length + 1)}` : path;
+
 /**
- * What the file at `path` (a candidate's path or its `~` form) holds, as `ssh_key_inspect`
- * reports it: a public key in `~/.ssh`, a file that is not one (MOCK_NOT_KEYS), or nothing.
+ * What the file at a typed `path` holds, as `ssh_key_inspect` reports it: `~/` expanded against
+ * the home as Rust does, then the file found by that path alone — a public key in `~/.ssh`, a
+ * file that is not one (MOCK_NOT_KEYS), or nothing.
  */
-function inspectKey(path: string): SshKeyInfo {
-  const key = MOCK_SSH_KEYS.find((k) => k.path === path || k.display === path);
+function inspectKey(typed: string): SshKeyInfo {
+  const path = expandTilde(typed);
+  const key = MOCK_SSH_KEYS.find((k) => k.path === path);
   if (key !== undefined) {
     const problem = key.algo === null ? 'not_public_key' : null;
     return { path: key.path, display: key.display, exists: true, algo: key.algo, problem };
   }
-  const other = MOCK_NOT_KEYS.find((k) => k.path === path || k.display === path);
-  return other ?? { path, display: path, exists: false, algo: null, problem: 'missing' };
+  const other = MOCK_NOT_KEYS.find((k) => k.path === path);
+  return (
+    other ?? { path, display: abbreviated(path), exists: false, algo: null, problem: 'missing' }
+  );
 }
 
 /**
- * The key at `path` for a plan, as the core's `check_readable` takes it: a public key, or Rust's
- * refusal — `SshKeyUnreadable` for no file, `SshKeyNotPublic` for one that is not a public key
- * (GOTCHA-149: a private key by name).
+ * The key at a typed `path` for a plan (`~/` expanded, as target_ops does), as the core's
+ * `check_readable` takes it: a public key, or Rust's refusal — `SshKeyUnreadable` for no file,
+ * `SshKeyNotPublic` for one that is not a public key (GOTCHA-149: a private key by name).
  */
 function keyAt(path: string): SshKeyInfo {
   const key = inspectKey(path);
   if (key.problem === 'missing') {
     throw error(
       CORE_ERROR_CODES.TARGET_SSH_KEY_UNREADABLE,
-      `SSH key path \`${path}\` does not exist`,
+      `SSH key path \`${key.path}\` does not exist`,
       {
-        path,
+        path: key.path,
         problem: 'missing',
       },
     );
@@ -442,7 +455,7 @@ export function targetHandlers(ops: MockOps, store: MockStore): Record<string, H
         ...(region === null ? [] : [`region ${region}`]),
         ...(tier === null ? [] : [`tier ${tier}`]),
         ...(serverType === null ? [] : [`server type ${serverType}`]),
-        ...(sshKey === null ? [] : [`ssh key ${sshKey}`]),
+        ...(key === null ? [] : [`ssh key ${key.display}`]),
       ].join(', ');
       const changes = [
         change('Target', name, 'create', detail),

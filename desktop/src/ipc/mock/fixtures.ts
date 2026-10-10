@@ -15,7 +15,9 @@ import type { WhoamiReport } from '../generated/WhoamiReport';
 /** The CLI's default target in a fresh mock store. */
 export const MOCK_CLI_DEFAULT = 'prod-eu';
 
-const HOME = '/home/alex';
+/** The demo's home directory, the context's `home_dir`: what a typed `~/` expands into. */
+export const MOCK_HOME = '/home/alex';
+const HOME = MOCK_HOME;
 /** A target's two files in the store, as `target_show` reports them: they follow its name. */
 export const targetFiles = (name: string) => ({
   configFile: `~/.config/apprafter/targets/${name}/config.yaml`,
