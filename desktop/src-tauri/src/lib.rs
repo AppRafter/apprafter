@@ -104,7 +104,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             window::show_and_focus(app)
         }))
-        // The capability lets the page open three URLs with it, nothing else.
+        // The capability lets the page open the app's links and the core's install pages with
+        // it, each exactly as written (capabilities/main.json5), nothing else.
         .plugin(app::opener_plugin())
         // The capability lets the page write text to the clipboard, nothing else.
         .plugin(app::clipboard_plugin())

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 // The app's three links (sidebar footer, Settings › About), opened in the browser through the
 // opener. The capability allows exactly these URLs and the install pages the core's tool specs
-// name (capabilities/main.json5; tests/ipc_mock.rs pins both).
+// name (capabilities/main.json5; tests/ipc_mock.rs reads LINKS from this file and pins both).
 import { openUrl } from '@tauri-apps/plugin-opener';
 
 export const LINKS = {

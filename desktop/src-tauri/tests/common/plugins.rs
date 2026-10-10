@@ -15,8 +15,9 @@
 //! (`generate_context!`), not taken from the plugin a test registers — and then reach a stand-in
 //! that writes down what it was asked and touches nothing outside this process. The rig checks,
 //! for every test, that neither real plugin set up (`common::rig_on`); tests/plugin_guard.rs
-//! checks that nothing else in `src/` or `tests/` builds one; the real opener's own scope check
-//! runs in tests/opener_scope.rs, in a child process that has nothing it could start.
+//! checks that nothing else in `src/` or `tests/` builds one; the real opener's own scope check,
+//! and the handles that check looks for, run in tests/sealed_plugins.rs, in a child process that
+//! has nothing it could reach.
 
 use std::sync::{Arc, Mutex};
 

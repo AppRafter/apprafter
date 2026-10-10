@@ -52,7 +52,8 @@ rustls                = { version = "0.23", default-features = false, features =
 serde                 = { workspace = true }
 serde_json            = { workspace = true }
 tauri                 = { workspace = true }
-# Website, Docs and GitHub open in the browser; the capability scopes it to those three URLs.
+# Website, Docs, GitHub and the tools' install pages open in the browser; the capability lists
+# each URL exactly (capabilities/main.json5).
 tauri-plugin-opener   = "~2.7"
 # Copy report and the toolchain's Copy buttons: write text only (the capability grants nothing else).
 tauri-plugin-clipboard-manager = "~2.4"

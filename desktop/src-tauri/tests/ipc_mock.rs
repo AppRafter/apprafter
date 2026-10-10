@@ -26,8 +26,8 @@ use apprafter_desktop::env::ToolSearchPath;
 use apprafter_desktop::ops::{Executor, PlanParts};
 use apprafter_desktop_ipc::{errors, Settings, Theme, ALLOWED_WHILE_LOCKED, COMMANDS, QUITTING};
 use common::{
-    code, install_pages, invoke, lock_off, rig, rig_by, rig_with_tools, wait_for, watch, Log, Rig,
-    Route, APP_LINKS, PAM_SAYS, PASSWORD, WATCH_DROPPED,
+    app_links, code, install_pages, invoke, lock_off, rig, rig_by, rig_with_tools, wait_for, watch,
+    Log, Rig, Route, PAM_SAYS, PASSWORD, WATCH_DROPPED,
 };
 use serde_json::{json, Value};
 use tauri::Listener;
@@ -190,19 +190,16 @@ fn the_clipboard_and_the_opener_a_test_reaches_are_stand_ins() {
         ),
         Ok(Value::Null)
     );
+    let link = app_links().into_iter().next().unwrap();
     assert_eq!(
-        invoke(
-            &rig,
-            "plugin:opener|open_url",
-            json!({ "url": APP_LINKS[0] })
-        ),
+        invoke(&rig, "plugin:opener|open_url", json!({ "url": link })),
         Ok(Value::Null)
     );
     assert_eq!(
         rig.asked.all(),
         [
             ("clipboard-manager|write_text".to_owned(), text.to_owned()),
-            ("opener|open_url".to_owned(), APP_LINKS[0].to_owned()),
+            ("opener|open_url".to_owned(), link),
         ]
     );
     // What the stand-in answers for a read the ACL refuses never comes: the ACL stops it first.
@@ -308,7 +305,8 @@ fn a_quit_with_nothing_running_says_nothing() {
 }
 
 /// The capability, read as Tauri reads it: exactly the pinned core permissions, the opener
-/// scoped to the app's three links and the install pages of the core's tool specs, and the
+/// scoped to the app's links (read from the page's src/shell/links.ts) and the install pages of
+/// the core's tool specs, and the
 /// generated `allow-<command>` of every app command — nothing more, nothing less, once each. A
 /// permission added for a later step must be added here too, with its reason in the file.
 #[test]
@@ -365,7 +363,7 @@ fn the_capability_grants_the_pinned_permissions_and_every_app_command_only() {
             "a pattern: {url}"
         );
     }
-    let mut expected_urls: BTreeSet<String> = APP_LINKS.map(String::from).into();
+    let mut expected_urls: BTreeSet<String> = app_links();
     expected_urls.extend(install_pages());
     assert_eq!(url_set, expected_urls);
     // The toolchain has something to open: the core names install pages.

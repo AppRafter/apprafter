@@ -9,6 +9,8 @@
 pub mod plugins;
 
 use std::collections::BTreeSet;
+use std::fs;
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -243,13 +245,32 @@ pub fn invoke_on(
     .map(|body| body.deserialize::<Value>().unwrap())
 }
 
-/// The app's own links, as the page shows them (src/shell/links.ts).
+/// The app's own links, read from the page's list (src/shell/links.ts `LINKS`), so the
+/// capability is pinned to what the page opens, not to a copy of it: every single-quoted
+/// address between `export const LINKS = {` and its closing brace. Each must be one https
+/// address, and there are the page's three (Website, Docs, GitHub).
 #[allow(dead_code)]
-pub const APP_LINKS: [&str; 3] = [
-    "https://apprafter.dev",
-    "https://docs.apprafter.dev",
-    "https://github.com/AppRafter/apprafter",
-];
+pub fn app_links() -> BTreeSet<String> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../src/shell/links.ts");
+    let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let start = "export const LINKS = {";
+    let at = text
+        .find(start)
+        .unwrap_or_else(|| panic!("{}: no `{start}`", path.display()));
+    let body = &text[at + start.len()..];
+    let body = &body[..body.find('}').expect("LINKS closes")];
+    let links: Vec<&str> = body.split('\'').skip(1).step_by(2).collect();
+    for link in &links {
+        assert!(
+            link.starts_with("https://") && !link.contains(char::is_whitespace),
+            "a link must be one https address: {link}"
+        );
+    }
+    let set: BTreeSet<String> = links.iter().map(|l| l.to_string()).collect();
+    assert_eq!(set.len(), 3, "the page's three links: {links:?}");
+    assert_eq!(set.len(), links.len(), "a link twice: {links:?}");
+    set
+}
 
 /// The install pages the toolchain panel can open: every install line of the core's tool specs
 /// that is an address. Each must be https; an http one fails here rather than being left out.

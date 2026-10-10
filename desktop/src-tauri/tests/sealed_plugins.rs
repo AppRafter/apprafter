@@ -1,22 +1,31 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
-//! The opener's scope as the real plugin applies it (`app::opener_plugin()`, behind the app's
-//! capability): its URLs exactly as the capability writes them, and nothing near them.
+//! The real plugins, built as the app builds them (`app::opener_plugin()`,
+//! `app::clipboard_plugin()`), in a process that cannot reach the owner's session: the opener's
+//! scope as the plugin applies it behind the app's capability — its URLs exactly as the
+//! capability writes them, and nothing near them — and the handle each plugin manages when it
+//! sets up, which is what the rig's check for a real plugin looks for (`common::rig_on`): a
+//! plugin release that managed another type would leave that check finding nothing, and fails
+//! here instead.
 //!
-//! The plugin checks the scope inside its own `open_url`, so only the real plugin can show it —
+//! The opener checks the scope inside its own `open_url`, so only the real plugin can show it —
 //! and the real plugin starts a browser for every URL it lets through: `xdg-open`, or `gio open`,
 //! which needs no display, only the session bus (GOTCHA-156). A test of it in the test process
 //! would open the owner's browser the day the scope lets one URL too many through (a widened
-//! entry, or a mutant of one). So the plugin runs in a child process, this binary again made to
-//! run [`opener_probe`] alone, with an environment the parent builds from nothing: a `PATH` of one
-//! empty directory, so no launcher can be found, and no display, session bus or runtime
-//! directory. There a URL the scope allows ends in "No such file or directory" from the last
-//! launcher the plugin tried, and one it refuses in "Not allowed to open url". The probe checks
-//! that seal itself before it builds anything, and refuses to run otherwise.
+//! entry, or a mutant of one). The clipboard plugin's setup connects to the display's clipboard.
+//! So each plugin runs in a child process, this binary again made to run one probe alone
+//! ([`opener_probe`], [`clipboard_probe`]), with an environment the parent builds from nothing: a
+//! `PATH` of one empty directory, so no launcher can be found, and no display, session bus or
+//! runtime directory. There a URL the scope allows ends in "No such file or directory" from the
+//! last launcher the plugin tried, one it refuses in "Not allowed to open url", and the clipboard
+//! finds no display to connect to (the plugin keeps that failure and manages its handle all the
+//! same). Each probe checks that seal itself before it builds anything, and refuses to run
+//! otherwise; tests/plugin_guard.rs lets only these two functions name a builder, and only after
+//! that check.
 //!
 //! Linux only: macOS opens through `/usr/bin/open`, an absolute path no `PATH` hides, and
-//! Windows through the shell (under wine, `winebrowser`). The scope check is the plugin's own
-//! code, the same on every OS; the capability's URL set is pinned on every OS in
-//! tests/ipc_mock.rs.
+//! Windows through the shell (under wine, `winebrowser`); neither system's clipboard needs a
+//! session to be reached. The scope check is the plugin's own code, the same on every OS; the
+//! capability's URL set is pinned on every OS in tests/ipc_mock.rs.
 #![cfg(target_os = "linux")]
 
 // The rig's other helpers serve the other targets.
@@ -28,10 +37,10 @@ use std::process::Command;
 use std::{env, fs, io};
 
 use apprafter_desktop::app::{self, ShellCell};
-use common::{install_pages, invoke_on, APP_LINKS};
+use common::{app_links, install_pages, invoke_on};
 use serde_json::{json, Value};
-use tauri::test::mock_builder;
-use tauri::{WebviewUrl, WebviewWindowBuilder};
+use tauri::test::{mock_builder, MockRuntime};
+use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 
 /// Set only in the child process the parent test starts.
 const PROBE: &str = "APPRAFTER_TEST_OPENER_PROBE";
@@ -109,6 +118,12 @@ fn opener_probe() {
         .plugin(app::opener_plugin())
         .build(tauri::generate_context!())
         .unwrap();
+    assert!(
+        app.try_state::<tauri_plugin_opener::Opener<MockRuntime>>()
+            .is_some(),
+        "the opener's handle is what the rig's check looks for"
+    );
+    println!("ok: the opener manages its handle");
     let window = WebviewWindowBuilder::new(&app, "main", WebviewUrl::default())
         .build()
         .unwrap();
@@ -126,7 +141,7 @@ fn opener_probe() {
     println!("ok: refused {} near misses", NEAR_MISSES.len());
     // Every listed URL passes the scope and reaches the launchers, none of which can be found.
     let no_launcher = io::Error::from_raw_os_error(2).to_string();
-    let mut listed: BTreeSet<String> = APP_LINKS.map(String::from).into();
+    let mut listed: BTreeSet<String> = app_links();
     listed.extend(install_pages());
     for url in &listed {
         assert_eq!(
@@ -138,12 +153,27 @@ fn opener_probe() {
     println!("ok: let through {} listed URLs", listed.len());
 }
 
-/// The opener's scope is its URLs exactly as the capability writes them: each near miss is
-/// refused by the plugin's own scope check, reached past the ACL that grants `open_url` with
-/// that scope, and each URL the capability lists passes it — shown, where the plugin would start
-/// a browser, by a launch that finds no launcher (see the module docs).
+/// The child's half: the real clipboard plugin, as the app builds it. With no display it cannot
+/// connect to a clipboard, and keeps that failure; its handle is managed all the same.
 #[test]
-fn the_opener_opens_the_listed_urls_only_and_only_as_written() {
+#[ignore = "run by the_clipboard_plugin_manages_the_handle_the_rig_looks_for, sealed"]
+fn clipboard_probe() {
+    sealed();
+    let app = app::builder(mock_builder(), ShellCell::default())
+        .plugin(app::clipboard_plugin())
+        .build(tauri::generate_context!())
+        .unwrap();
+    assert!(
+        app.try_state::<tauri_plugin_clipboard_manager::Clipboard<MockRuntime>>()
+            .is_some(),
+        "the clipboard's handle is what the rig's check looks for"
+    );
+    println!("ok: the clipboard manages its handle");
+}
+
+/// Run `probe` alone in a child of this binary, sealed (see the module docs): its stdout, once
+/// it passed.
+fn run_sealed(probe: &str) -> String {
     assert!(
         env::var_os(PROBE).is_none(),
         "the probe ran more than itself"
@@ -157,7 +187,7 @@ fn the_opener_opens_the_listed_urls_only_and_only_as_written() {
     command
         .args([
             "--exact",
-            "opener_probe",
+            probe,
             "--ignored",
             "--nocapture",
             "--test-threads=1",
@@ -172,11 +202,37 @@ fn the_opener_opens_the_listed_urls_only_and_only_as_written() {
         command.env("LD_LIBRARY_PATH", libraries);
     }
     let output = command.output().unwrap();
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stdout}\n{stderr}");
     // libtest prints `running 1 test` for the probe: a filter that matched nothing passes too.
     assert!(stdout.contains("running 1 test"), "{stdout}");
+    stdout
+}
+
+/// The opener's scope is its URLs exactly as the capability writes them: each near miss is
+/// refused by the plugin's own scope check, reached past the ACL that grants `open_url` with
+/// that scope, and each URL the capability lists passes it — shown, where the plugin would start
+/// a browser, by a launch that finds no launcher (see the module docs). And the opener manages
+/// the handle the rig's check asks the app for.
+#[test]
+fn the_opener_opens_the_listed_urls_only_and_only_as_written() {
+    let stdout = run_sealed("opener_probe");
+    assert!(
+        stdout.contains("ok: the opener manages its handle"),
+        "{stdout}"
+    );
     assert!(stdout.contains("ok: refused 16 near misses"), "{stdout}");
     assert!(stdout.contains("ok: let through"), "{stdout}");
+}
+
+/// The real clipboard plugin manages the handle the rig's check asks the app for, even where it
+/// cannot reach a clipboard: so that check, which finds no handle in every rig, can fail.
+#[test]
+fn the_clipboard_plugin_manages_the_handle_the_rig_looks_for() {
+    let stdout = run_sealed("clipboard_probe");
+    assert!(
+        stdout.contains("ok: the clipboard manages its handle"),
+        "{stdout}"
+    );
 }

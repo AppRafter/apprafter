@@ -2,31 +2,58 @@
 //! Only the app builds a real plugin (GOTCHA-156). The plugins reach the owner's session — the
 //! clipboard plugin's setup connects to the display's clipboard, the opener starts a browser,
 //! the single-instance plugin claims a name on the session bus — and Tauri's mock runtime runs a
-//! plugin's setup like the app does. So outside the app itself (`src/app.rs`, which builds them,
-//! and `src/lib.rs`, which registers them) no file under `src/` or `tests/` may name a plugin
-//! crate (`tauri_plugin_*`) or the app's builders of one (`clipboard_plugin`, `opener_plugin`).
-//! The rig registers stand-ins instead (tests/common/plugins.rs) and checks every app it builds
-//! (`common::rig_on`); two exceptions are named here:
+//! plugin's setup like the app does. So outside the app's own code (`src/app.rs`, which builds
+//! them, and `src/lib.rs`, which registers them — their `#[cfg(test)]` modules are not the app,
+//! and are scanned like any test) no file under `src/` or `tests/` may name a plugin crate
+//! (`tauri_plugin_*`) or the app's builders of one (`clipboard_plugin`, `opener_plugin`). The
+//! rig registers stand-ins instead (tests/common/plugins.rs) and checks every app it builds
+//! (`common::rig_on`); the exceptions are named here:
 //!
 //! - the plugins' handle types, `tauri_plugin_clipboard_manager::Clipboard` and
 //!   `tauri_plugin_opener::Opener`, which the rig asks the app for to show that neither set up;
-//! - tests/opener_scope.rs's `opener_plugin`, built in a child process with no way to start
-//!   anything (its docs).
+//! - the functions in [`ALLOWED`], each for one builder: an app test that builds the opener
+//!   without setting it up, and tests/sealed_plugins.rs's probes, which build a real plugin in a
+//!   child process with no way to reach anything (its docs) and must start by checking that seal.
 //!
 //! The scan reads tokens (`proc_macro2`), so a comment never counts and a string never hides a
-//! name; a `use` of a plugin crate, renamed, grouped or globbed, is a name of it too.
+//! name; a `use` of a plugin crate, renamed, grouped or globbed, is a name of it too, and so is a
+//! raw identifier (`r#tauri_plugin_opener`), which rustc reads as the plain one.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use proc_macro2::{Delimiter, Spacing, TokenStream, TokenTree};
 
-/// The files that build or register the real plugins: the app.
+/// The files that build or register the real plugins: the app. Only their `#[cfg(test)]`
+/// modules are scanned.
 const APP: [&str; 2] = ["src/app.rs", "src/lib.rs"];
 
-/// The app's builders of a real plugin; and the one other file that may name one, with that one.
+/// The app's builders of a real plugin.
 const BUILDERS: [&str; 2] = ["clipboard_plugin", "opener_plugin"];
-const SEALED: (&str, &str) = ("tests/opener_scope.rs", "opener_plugin");
+
+/// Who may name a builder: the file, the function, the builder, and whether the function must
+/// start with `sealed();` (the probe's check that its process cannot reach the session).
+const ALLOWED: [(&str, &str, &str, bool); 3] = [
+    // Reads the opener's scripts; nothing builds an app with it, so no setup runs.
+    (
+        "src/app.rs",
+        "the_opener_plugin_injects_no_script",
+        "opener_plugin",
+        false,
+    ),
+    (
+        "tests/sealed_plugins.rs",
+        "opener_probe",
+        "opener_plugin",
+        true,
+    ),
+    (
+        "tests/sealed_plugins.rs",
+        "clipboard_probe",
+        "clipboard_plugin",
+        true,
+    ),
+];
 
 /// What a file may name a plugin crate for: its handle type, as `<crate>::<type>`.
 const HANDLES: [(&str, &str); 2] = [
@@ -37,23 +64,88 @@ const HANDLES: [(&str, &str); 2] = [
 /// Every name of a real plugin in `src` that `file` (relative to the crate) may not make, with
 /// its line.
 fn hits(file: &str, src: &str) -> Vec<(usize, String)> {
+    let tokens: TokenStream = src.parse().unwrap_or_else(|e| panic!("{file}: {e}"));
     let mut out = Vec::new();
     if APP.contains(&file) {
-        return out;
+        for module in test_modules(tokens) {
+            walk(file, None, module, &mut out);
+        }
+    } else {
+        walk(file, None, tokens, &mut out);
     }
-    let tokens: TokenStream = src.parse().unwrap_or_else(|e| panic!("{file}: {e}"));
-    walk(file, tokens, &mut out);
     out
 }
 
-fn walk(file: &str, tokens: TokenStream, out: &mut Vec<(usize, String)>) {
+/// The bodies of the `#[cfg(test)] mod <name> { … }` items at the top of a file.
+fn test_modules(tokens: TokenStream) -> Vec<TokenStream> {
     let tokens: Vec<TokenTree> = tokens.into_iter().collect();
+    let mut out = Vec::new();
+    for window in tokens.windows(5) {
+        if let [TokenTree::Punct(hash), TokenTree::Group(attr), TokenTree::Ident(kw), TokenTree::Ident(_), TokenTree::Group(body)] =
+            window
+        {
+            if hash.as_char() == '#'
+                && attr.delimiter() == Delimiter::Bracket
+                && is_cfg_test(attr.stream())
+                && kw == "mod"
+                && body.delimiter() == Delimiter::Brace
+            {
+                out.push(body.stream());
+            }
+        }
+    }
+    out
+}
+
+/// `cfg(test)`, the inside of the attribute.
+fn is_cfg_test(attr: TokenStream) -> bool {
+    let tokens: Vec<TokenTree> = attr.into_iter().collect();
+    match tokens.as_slice() {
+        [TokenTree::Ident(cfg), TokenTree::Group(args)] => {
+            let args: Vec<TokenTree> = args.stream().into_iter().collect();
+            cfg == "cfg" && matches!(args.as_slice(), [TokenTree::Ident(test)] if test == "test")
+        }
+        _ => false,
+    }
+}
+
+/// An identifier as rustc reads it: `r#name` is `name`.
+fn plain(ident: &proc_macro2::Ident) -> String {
+    let name = ident.to_string();
+    name.strip_prefix("r#").map(str::to_string).unwrap_or(name)
+}
+
+/// Scan `tokens`, inside the function `within` (the nearest `fn` around them, if any).
+fn walk(file: &str, within: Option<&Body>, tokens: TokenStream, out: &mut Vec<(usize, String)>) {
+    let tokens: Vec<TokenTree> = tokens.into_iter().collect();
+    // The function whose body the next brace group is: `fn <name>` seen, its body not yet.
+    let mut next_fn: Option<String> = None;
     for (i, token) in tokens.iter().enumerate() {
         match token {
-            TokenTree::Group(group) => walk(file, group.stream(), out),
+            TokenTree::Group(group) => {
+                if group.delimiter() == Delimiter::Brace {
+                    if let Some(name) = next_fn.take() {
+                        let body = Body {
+                            name,
+                            sealed_first: starts_sealed(group.stream()),
+                        };
+                        walk(file, Some(&body), group.stream(), out);
+                        continue;
+                    }
+                }
+                walk(file, within, group.stream(), out);
+            }
+            // A declaration with no body (`fn f();`) leaves no body to wait for.
+            TokenTree::Punct(p) if p.as_char() == ';' => next_fn = None,
             TokenTree::Ident(ident) => {
-                let name = ident.to_string();
-                let builder = BUILDERS.contains(&name.as_str()) && (file, name.as_str()) != SEALED;
+                if ident == "fn" {
+                    if let Some(TokenTree::Ident(f)) = tokens.get(i + 1) {
+                        next_fn = Some(plain(f));
+                    }
+                    continue;
+                }
+                let name = plain(ident);
+                let builder = BUILDERS.contains(&name.as_str()) && !allowed(file, within, &name);
                 let krate =
                     name.starts_with("tauri_plugin_") && !names_a_handle(&name, &tokens[i + 1..]);
                 if builder || krate {
@@ -63,6 +155,35 @@ fn walk(file: &str, tokens: TokenStream, out: &mut Vec<(usize, String)>) {
             _ => {}
         }
     }
+}
+
+/// A function body being scanned: its function's name, and whether it starts with `sealed();`.
+struct Body {
+    name: String,
+    sealed_first: bool,
+}
+
+/// Whether [`ALLOWED`] lets the function `within`, in `file`, name `builder`.
+fn allowed(file: &str, within: Option<&Body>, builder: &str) -> bool {
+    let Some(body) = within else {
+        return false;
+    };
+    ALLOWED.iter().any(|&(f, function, b, sealed)| {
+        f == file && function == body.name && b == builder && (!sealed || body.sealed_first)
+    })
+}
+
+/// A body whose first statement is `sealed();`.
+fn starts_sealed(body: TokenStream) -> bool {
+    let tokens: Vec<TokenTree> = body.into_iter().take(3).collect();
+    matches!(
+        tokens.as_slice(),
+        [TokenTree::Ident(f), TokenTree::Group(args), TokenTree::Punct(semi)]
+            if f == "sealed"
+                && args.delimiter() == Delimiter::Parenthesis
+                && args.stream().is_empty()
+                && semi.as_char() == ';'
+    )
 }
 
 /// `crate` followed by `::<its handle type>` (and nothing that makes it a group or a glob).
@@ -75,7 +196,7 @@ fn names_a_handle(krate: &str, rest: &[TokenTree]) -> bool {
             a.as_char() == ':'
                 && a.spacing() == Spacing::Joint
                 && b.as_char() == ':'
-                && *ty == handle
+                && plain(ty) == handle
                 && !matches!(after.first(), Some(TokenTree::Punct(p)) if p.as_char() == ':')
                 && !matches!(after.first(), Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Brace)
         }
@@ -117,15 +238,26 @@ fn only_the_app_builds_a_real_plugin() {
         "a real plugin outside the app:\n{}",
         found.join("\n")
     );
-    // The scan saw the files it guards: the rig, and the app's own.
+    // The scan saw the files it guards: the rig, the probes, and the app's own.
     for file in [
         "tests/common/mod.rs",
         "tests/common/plugins.rs",
+        "tests/sealed_plugins.rs",
         "src/app.rs",
+        "src/lib.rs",
     ] {
         assert!(
             files.iter().any(|p| p.ends_with(file)),
             "{file} not scanned"
+        );
+    }
+    // Each allowance names a function that exists where it says: one renamed away would leave
+    // its builder unguarded under the new name, so it fails here instead.
+    for (file, function, _, _) in ALLOWED {
+        let src = fs::read_to_string(root.join(file)).unwrap();
+        assert!(
+            src.contains(&format!("fn {function}(")),
+            "{file}: no fn {function}"
         );
     }
 }
@@ -183,6 +315,24 @@ fn the_scan_finds_every_way_to_build_a_plugin_and_nothing_else() {
             "macro_rules! m { () => { tauri_plugin_opener::init() } }",
             "tauri_plugin_opener",
         ),
+        // A raw identifier is the plain one to rustc.
+        (
+            "fn f() { r#tauri_plugin_opener::init(); }",
+            "tauri_plugin_opener",
+        ),
+        (
+            "fn f() { b.plugin(app::r#clipboard_plugin()); }",
+            "clipboard_plugin",
+        ),
+        (
+            "use r#tauri_plugin_clipboard_manager as c;",
+            "tauri_plugin_clipboard_manager",
+        ),
+        // An allowed function's name does not carry into another file.
+        (
+            "fn opener_probe() { sealed(); b.plugin(app::opener_plugin()); }",
+            "opener_plugin",
+        ),
     ] {
         assert_eq!(found(src), [name], "{src}");
     }
@@ -192,15 +342,69 @@ fn the_scan_finds_every_way_to_build_a_plugin_and_nothing_else() {
         r#"const S: &str = "tauri_plugin_clipboard_manager::init clipboard_plugin";"#,
         "fn f(a: &App) { a.try_state::<tauri_plugin_clipboard_manager::Clipboard<MockRuntime>>(); }",
         "fn f(a: &App) { a.try_state::<tauri_plugin_opener::Opener<MockRuntime>>(); }",
+        "fn f(a: &App) { a.try_state::<r#tauri_plugin_opener::Opener<MockRuntime>>(); }",
     ] {
         assert_eq!(found(src), Vec::<String>::new(), "{src}");
     }
-    // The app's files and the sealed probe may.
-    assert!(hits(
+    let none = |file: &str, src: &str| {
+        assert_eq!(hits(file, src), Vec::new(), "{file}: {src}");
+    };
+    let some = |file: &str, src: &str| {
+        assert!(!hits(file, src).is_empty(), "{file}: {src}");
+    };
+    // The app's own code may.
+    none(
         "src/lib.rs",
-        "fn f() { b.plugin(app::clipboard_plugin()); }"
-    )
-    .is_empty());
-    assert!(hits(SEALED.0, "fn f() { b.plugin(app::opener_plugin()); }").is_empty());
-    assert!(!hits(SEALED.0, "fn f() { b.plugin(app::clipboard_plugin()); }").is_empty());
+        "fn f() { b.plugin(app::clipboard_plugin()); }",
+    );
+    none(
+        "src/app.rs",
+        "pub fn clipboard_plugin() -> P { tauri_plugin_clipboard_manager::init() }",
+    );
+    // Its test modules may not, but for the one allowance.
+    let app_test = |body: &str| format!("fn app() {{}}\n#[cfg(test)]\nmod tests {{ {body} }}");
+    some(
+        "src/app.rs",
+        &app_test("#[test] fn t() { builder(mock_builder()).plugin(clipboard_plugin()); }"),
+    );
+    some(
+        "src/lib.rs",
+        &app_test("fn t() { tauri_plugin_opener::init(); }"),
+    );
+    some(
+        "src/app.rs",
+        &app_test("fn the_opener_plugin_injects_no_script() { super::clipboard_plugin(); }"),
+    );
+    none(
+        "src/app.rs",
+        &app_test("fn the_opener_plugin_injects_no_script() { super::opener_plugin::<M>(); }"),
+    );
+    // The sealed probes may, each its own builder and only after `sealed();`.
+    let sealed = "tests/sealed_plugins.rs";
+    none(
+        sealed,
+        "fn opener_probe() { sealed(); b.plugin(app::opener_plugin()); }",
+    );
+    none(
+        sealed,
+        "fn clipboard_probe() { sealed(); let c = || b.plugin(app::clipboard_plugin()); }",
+    );
+    some(
+        sealed,
+        "fn opener_probe() { b.plugin(app::opener_plugin()); sealed(); }",
+    );
+    some(
+        sealed,
+        "fn opener_probe() { sealed(); b.plugin(app::clipboard_plugin()); }",
+    );
+    some(
+        sealed,
+        "fn another() { sealed(); b.plugin(app::opener_plugin()); }",
+    );
+    some(sealed, "fn f() { b.plugin(app::opener_plugin()); }");
+    // A function nested in an allowed one is not the allowed one.
+    some(
+        sealed,
+        "fn opener_probe() { sealed(); fn inner() { b.plugin(app::opener_plugin()); } }",
+    );
 }
