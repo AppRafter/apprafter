@@ -202,6 +202,7 @@ dependencies = [
  "apprafter-core",
  "apprafter-desktop-ipc",
  "apprafter-os-auth",
+ "async-io",
  "cli-core",
  "dunce",
  "futures-lite",

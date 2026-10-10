@@ -3,17 +3,23 @@
 //! clipboard plugin's setup connects to the display's clipboard, the opener starts a browser,
 //! the single-instance plugin claims a name on the session bus — and Tauri's mock runtime runs a
 //! plugin's setup like the app does. So outside the app's own code (`src/app.rs`, which builds
-//! them, and `src/lib.rs`, which registers them — their `#[cfg(test)]` modules are not the app,
-//! and are scanned like any test) no file under `src/` or `tests/` may name a plugin crate
-//! (`tauri_plugin_*`) or the app's builders of one (`clipboard_plugin`, `opener_plugin`). The
-//! rig registers stand-ins instead (tests/common/plugins.rs) and checks every app it builds
-//! (`common::rig_on`); the exceptions are named here:
+//! them, `src/lib.rs`, which registers them, and `src/single_instance.rs`, which builds and
+//! registers the single-instance plugin behind its check of the session bus — their
+//! `#[cfg(test)]` and `#[cfg(all(test, …))]` modules are not the app, and are scanned like any
+//! test) no file under `src/` or `tests/` may name a plugin crate (`tauri_plugin_*`) or the
+//! app's builders of one (`clipboard_plugin`, `opener_plugin`, and `SingleInstance`, whose
+//! `register` builds the single-instance plugin). The rig registers stand-ins instead
+//! (tests/common/plugins.rs) and checks every app it builds (`common::rig_on`); the exceptions
+//! are named here:
 //!
 //! - the plugins' handle types, `tauri_plugin_clipboard_manager::Clipboard` and
 //!   `tauri_plugin_opener::Opener`, which the rig asks the app for to show that neither set up;
 //! - the functions in [`ALLOWED`], each for one builder: an app test that builds the opener
-//!   without setting it up, and tests/sealed_plugins.rs's probes, which build a real plugin in a
-//!   child process with no way to reach anything (its docs) and must start by checking that seal.
+//!   without setting it up, tests/sealed_plugins.rs's probes, which build a real plugin in a
+//!   child process with no way to reach anything (its docs) and must start by checking that
+//!   seal, tests/single_instance.rs's probe, which runs the lock's wiring in a child process
+//!   whose only bus is one its parent test gave it (its docs), and src/single_instance.rs's
+//!   tests of the decision, which register nothing.
 //!
 //! The scan reads tokens (`proc_macro2`), so a comment never counts and a string never hides a
 //! name; a `use` of a plugin crate, renamed, grouped or globbed, is a name of it too, and so is a
@@ -24,16 +30,19 @@ use std::path::{Path, PathBuf};
 
 use proc_macro2::{Delimiter, Spacing, TokenStream, TokenTree};
 
-/// The files that build or register the real plugins: the app. Only their `#[cfg(test)]`
-/// modules are scanned.
-const APP: [&str; 2] = ["src/app.rs", "src/lib.rs"];
+/// The files that build or register the real plugins: the app. Only their test modules
+/// (`#[cfg(test)]`, `#[cfg(all(test, …))]`) are scanned.
+const APP: [&str; 3] = ["src/app.rs", "src/lib.rs", "src/single_instance.rs"];
 
-/// The app's builders of a real plugin.
-const BUILDERS: [&str; 2] = ["clipboard_plugin", "opener_plugin"];
+/// The app's builders of a real plugin. For the single-instance plugin, the type whose
+/// `register` builds it: the method's name is too common to scan for (signals.rs's
+/// `low_level::register`, target_ops.rs's own), and a value to call it on is reached only
+/// through the type (`SingleInstance::for_this_launch`, `on_session_bus`, `On`).
+const BUILDERS: [&str; 3] = ["clipboard_plugin", "opener_plugin", "SingleInstance"];
 
 /// Who may name a builder: the file, the function, the builder, and whether the function must
 /// start with `sealed();` (the probe's check that its process cannot reach the session).
-const ALLOWED: [(&str, &str, &str, bool); 3] = [
+const ALLOWED: [(&str, &str, &str, bool); 6] = [
     // Reads the opener's scripts; nothing builds an app with it, so no setup runs.
     (
         "src/app.rs",
@@ -52,6 +61,29 @@ const ALLOWED: [(&str, &str, &str, bool); 3] = [
         "clipboard_probe",
         "clipboard_plugin",
         true,
+    ),
+    // The lock's wiring, the real plugin included, in a child process its parent test starts
+    // with the environment cleared, `HOME` and `XDG_RUNTIME_DIR` in a temporary directory, and
+    // a bus address that is no bus, a socket in that directory or a private dbus-daemon (its
+    // docs). It needs that bus, so it cannot be sealed; it starts by checking it is that child.
+    (
+        "tests/single_instance.rs",
+        "wiring_probe",
+        "SingleInstance",
+        false,
+    ),
+    // The decision alone, on stub connects: nothing builds an app, so nothing registers.
+    (
+        "src/single_instance.rs",
+        "an_address_that_does_not_parse_is_off_without_connecting",
+        "SingleInstance",
+        false,
+    ),
+    (
+        "src/single_instance.rs",
+        "an_address_that_parses_is_on_exactly_when_the_bus_answers",
+        "SingleInstance",
+        false,
     ),
 ];
 
@@ -76,7 +108,8 @@ fn hits(file: &str, src: &str) -> Vec<(usize, String)> {
     out
 }
 
-/// The bodies of the `#[cfg(test)] mod <name> { … }` items at the top of a file.
+/// The bodies of the `#[cfg(test)] mod <name> { … }` items at the top of a file (and of those
+/// behind `cfg(all(test, …))`).
 fn test_modules(tokens: TokenStream) -> Vec<TokenStream> {
     let tokens: Vec<TokenTree> = tokens.into_iter().collect();
     let mut out = Vec::new();
@@ -97,13 +130,23 @@ fn test_modules(tokens: TokenStream) -> Vec<TokenStream> {
     out
 }
 
-/// `cfg(test)`, the inside of the attribute.
+/// `cfg(test)`, or `cfg(all(…))` with `test` among its predicates: the inside of the attribute.
 fn is_cfg_test(attr: TokenStream) -> bool {
     let tokens: Vec<TokenTree> = attr.into_iter().collect();
+    let is_test =
+        |tokens: &[TokenTree]| matches!(tokens, [TokenTree::Ident(test)] if test == "test");
     match tokens.as_slice() {
-        [TokenTree::Ident(cfg), TokenTree::Group(args)] => {
+        [TokenTree::Ident(cfg), TokenTree::Group(args)] if cfg == "cfg" => {
             let args: Vec<TokenTree> = args.stream().into_iter().collect();
-            cfg == "cfg" && matches!(args.as_slice(), [TokenTree::Ident(test)] if test == "test")
+            match args.as_slice() {
+                [TokenTree::Ident(all), TokenTree::Group(predicates)] if all == "all" => {
+                    let predicates: Vec<TokenTree> = predicates.stream().into_iter().collect();
+                    predicates
+                        .split(|t| matches!(t, TokenTree::Punct(p) if p.as_char() == ','))
+                        .any(is_test)
+                }
+                args => is_test(args),
+            }
         }
         _ => false,
     }
@@ -243,8 +286,10 @@ fn only_the_app_builds_a_real_plugin() {
         "tests/common/mod.rs",
         "tests/common/plugins.rs",
         "tests/sealed_plugins.rs",
+        "tests/single_instance.rs",
         "src/app.rs",
         "src/lib.rs",
+        "src/single_instance.rs",
     ] {
         assert!(
             files.iter().any(|p| p.ends_with(file)),
@@ -333,6 +378,23 @@ fn the_scan_finds_every_way_to_build_a_plugin_and_nothing_else() {
             "fn opener_probe() { sealed(); b.plugin(app::opener_plugin()); }",
             "opener_plugin",
         ),
+        // The single-instance plugin's builder is reached through its type.
+        (
+            "fn f() { SingleInstance::for_this_launch().register(b); }",
+            "SingleInstance",
+        ),
+        (
+            "use apprafter_desktop::single_instance::SingleInstance;",
+            "SingleInstance",
+        ),
+        (
+            "use apprafter_desktop::single_instance::SingleInstance as S;",
+            "SingleInstance",
+        ),
+        (
+            "fn wiring_probe() { SingleInstance::On.register(b); }",
+            "SingleInstance",
+        ),
     ] {
         assert_eq!(found(src), [name], "{src}");
     }
@@ -361,6 +423,11 @@ fn the_scan_finds_every_way_to_build_a_plugin_and_nothing_else() {
         "src/app.rs",
         "pub fn clipboard_plugin() -> P { tauri_plugin_clipboard_manager::init() }",
     );
+    none(
+        "src/single_instance.rs",
+        "impl SingleInstance { pub fn register(&self, b: B) -> B { \
+         b.plugin(tauri_plugin_single_instance::init(|_, _, _| {})) } }",
+    );
     // Its test modules may not, but for the one allowance.
     let app_test = |body: &str| format!("fn app() {{}}\n#[cfg(test)]\nmod tests {{ {body} }}");
     some(
@@ -378,6 +445,34 @@ fn the_scan_finds_every_way_to_build_a_plugin_and_nothing_else() {
     none(
         "src/app.rs",
         &app_test("fn the_opener_plugin_injects_no_script() { super::opener_plugin::<M>(); }"),
+    );
+    // A test module behind `all(test, …)` is a test module; one that is not only a test's is
+    // the app's.
+    let linux_test = |body: &str| {
+        format!("fn app() {{}}\n#[cfg(all(target_os = \"linux\", test))]\nmod tests {{ {body} }}")
+    };
+    some(
+        "src/single_instance.rs",
+        &linux_test("fn t() { SingleInstance::On.register(mock_builder()); }"),
+    );
+    some(
+        "src/single_instance.rs",
+        &linux_test("fn t() { tauri_plugin_single_instance::init(|_, _, _| {}); }"),
+    );
+    none(
+        "src/single_instance.rs",
+        &linux_test(
+            "fn an_address_that_does_not_parse_is_off_without_connecting() { \
+             SingleInstance::on_session_bus(a, never); }",
+        ),
+    );
+    none(
+        "src/lib.rs",
+        "#[cfg(any(test, windows))]\nmod m { fn f() { tauri_plugin_opener::init(); } }",
+    );
+    none(
+        "src/lib.rs",
+        "#[cfg(not(test))]\nmod m { fn f() { tauri_plugin_opener::init(); } }",
     );
     // The sealed probes may, each its own builder and only after `sealed();`.
     let sealed = "tests/sealed_plugins.rs";
@@ -406,5 +501,23 @@ fn the_scan_finds_every_way_to_build_a_plugin_and_nothing_else() {
     some(
         sealed,
         "fn opener_probe() { sealed(); fn inner() { b.plugin(app::opener_plugin()); } }",
+    );
+    // The single-instance probe may name the lock's type, inside itself only.
+    let single = "tests/single_instance.rs";
+    none(
+        single,
+        "fn wiring_probe() { let s = SingleInstance::for_this_launch(); s.register(b); }",
+    );
+    some(
+        single,
+        "use apprafter_desktop::single_instance::SingleInstance;\nfn wiring_probe() {}",
+    );
+    some(
+        single,
+        "fn another() { SingleInstance::for_this_launch(); }",
+    );
+    some(
+        single,
+        "fn wiring_probe() { tauri_plugin_single_instance::init(|_, _, _| {}); }",
     );
 }

@@ -363,6 +363,13 @@ app shares.
   - A `the desktop's colour scheme cannot be followed (…)` line instead when the app could not
     reach the session bus or subscribe on it, for example when `DBUS_SESSION_BUS_ADDRESS` names
     a bus that is gone.
+- **Launching the app again opens a second app instead of bringing the first to the front.**
+  On Linux the app keeps that lock as a name on the session bus. When it cannot use the bus,
+  it starts without the lock, and its log has a `single-instance is off` warning that says
+  why. This happens when `DBUS_SESSION_BUS_ADDRESS` is set but empty or is not a D-Bus address,
+  when no bus is at that address, or when the bus does not answer within 2 seconds. Start the
+  app from your desktop session, or with `DBUS_SESSION_BUS_ADDRESS` unset, so the bus at
+  `$XDG_RUNTIME_DIR/bus` is used.
 - **Only the password field, never the system dialog.** Check that the policy is installed
   (`pkaction`, as above), that polkitd is installed and running, that a polkit agent runs in
   your session, and that you run the app as yourself (not with `sudo`) in a local desktop

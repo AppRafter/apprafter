@@ -124,7 +124,7 @@ pub fn is_app_url(url: &Url, debug: bool) -> bool {
 /// and nothing else. The second process's arguments and working directory are never read, so
 /// nothing outside the app can make it act (ADR 0036). Without a main window (a quit is
 /// waiting for its operations) it does nothing.
-pub fn show_and_focus(app: &tauri::AppHandle) {
+pub fn show_and_focus<R: Runtime>(app: &tauri::AppHandle<R>) {
     if let Some(window) = app.get_webview_window(MAIN) {
         let _ = window.unminimize();
         let _ = window.show();
