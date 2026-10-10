@@ -329,8 +329,10 @@ describe('machine step', () => {
     expect(await screen.findByText('Latency could not be measured: the probe broke')).toBeDefined();
     // No chip shows a latency: not "–" (a region the probes did not cover), not "…".
     expect(document.querySelectorAll('.chip-option-meta')).toHaveLength(0);
-    h.answer('op_start_region_latencies', 79);
-    h.operation(79, [completed([{ region: 'nbg1', latencyMs: 38 }])]);
+    h.answer(
+      'op_start_region_latencies',
+      h.newOperation([completed([{ region: 'nbg1', latencyMs: 38 }])]),
+    );
     await user.click(screen.getByRole('button', { name: 'Try again' }));
     expect(await screen.findByText('38 ms')).toBeDefined();
     expect(screen.queryByText(/Latency could not be measured/)).toBeNull();
@@ -338,8 +340,7 @@ describe('machine step', () => {
 
   test('a latency read cancelled elsewhere says so', async () => {
     const { user } = renderWizard();
-    h.answer('op_start_region_latencies', 80);
-    h.operation(80, [cancelled()]);
+    h.answer('op_start_region_latencies', h.newOperation([cancelled()]));
     await toMachine(user);
     expect(await screen.findByText('Measuring latency was cancelled.')).toBeDefined();
     expect(screen.getByRole('button', { name: 'Try again' })).toBeDefined();

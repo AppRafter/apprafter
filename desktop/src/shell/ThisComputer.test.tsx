@@ -198,8 +198,7 @@ describe('This computer', () => {
     const user = renderRow();
     await user.click(await screen.findByRole('button', { name: 'Verify' }));
     expect(await screen.findByText('the ping broke')).toBeDefined();
-    h.answer('op_start_whoami', 77);
-    h.operation(77, [cancelled()]);
+    h.answer('op_start_whoami', h.newOperation([cancelled()]));
     await user.click(screen.getByRole('button', { name: 'Verify' }));
     expect(await screen.findByText('The check was cancelled.')).toBeDefined();
   });

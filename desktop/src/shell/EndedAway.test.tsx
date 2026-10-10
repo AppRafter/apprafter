@@ -166,3 +166,22 @@ test('ends kept away show one at a time, each discarded once shown', async () =>
   expect(discarded()).toEqual([31, 32]);
   expect(endedAwaySnapshot()).toEqual([]);
 });
+
+test('each notice is given its time: the next waits for the spacing, and so does its discard', async () => {
+  keepEndedAway({ opId: 41, text: 'Add target lab: done.', failed: false });
+  keepEndedAway({ opId: 42, text: 'Rename prod failed: taken', failed: true });
+  render(
+    <ToastProvider schedule={() => () => {}}>
+      <EndedAwayNotices spacingMs={300} />
+      <ToastViewport />
+    </ToastProvider>,
+  );
+  expect(await screen.findByText('Add target lab: done.')).toBeDefined();
+  // Within the spacing: the first still shows, the second waits, unshown and not discarded.
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  expect(screen.queryByText('Rename prod failed: taken') === null).toBe(true);
+  expect(screen.queryByText('Add target lab: done.') === null).toBe(false);
+  expect(discarded()).toEqual([41]);
+  expect(await screen.findByText('Rename prod failed: taken', {}, { timeout: 2000 })).toBeDefined();
+  expect(discarded()).toEqual([41, 42]);
+});

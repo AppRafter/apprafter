@@ -4,6 +4,7 @@
 // reportUnlessLocked.
 import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test';
 import { clearMocks } from '@tauri-apps/api/mocks';
+import { waitFor } from '@testing-library/react';
 import {
   cancelled,
   completed,
@@ -17,7 +18,7 @@ import { settleIpc } from '../test/settle';
 import { IpcError } from './api';
 import { endedAwaySnapshot, resetEndedAway } from './away';
 import { DESKTOP_ERROR_CODES } from './generated/errors';
-import { operationsSnapshot, resetOperations } from './operations';
+import { clearLive, operationsSnapshot, reattachAll, resetOperations } from './operations';
 import {
   failureOf,
   isCancelled,
@@ -39,29 +40,31 @@ afterEach(async () => {
 });
 
 test('runRead hands over the op id as soon as Rust answers, then resolves; the op is forgotten', async () => {
-  h.operation(7, [stage(1, 3, 'Target'), completed({ target: 'x', groups: [] })]);
+  const id = h.newOperation([stage(1, 3, 'Target'), completed({ target: 'x', groups: [] })]);
   const seen: number[] = [];
   const report = await runRead<{ target: string; groups: unknown[] }>(
-    async () => 7,
+    async () => id,
     (opId) => seen.push(opId),
   );
   expect(report).toEqual({ target: 'x', groups: [] });
-  expect(seen).toEqual([7]);
-  expect(h.of('op_discard').map((c) => c.args)).toEqual([{ opId: 7 }]);
-  expect(operationsSnapshot().has(7)).toBe(false);
+  expect(seen).toEqual([id]);
+  expect(h.of('op_discard').map((c) => c.args)).toEqual([{ opId: id }]);
+  expect(operationsSnapshot().has(id)).toBe(false);
 });
 
 test('a failed read is OperationFailed carrying the UiError, and not a cancellation', async () => {
-  h.operation(8, [failed(uiError('apprafter::target::token_rejected', 'rejected (HTTP 401)'))]);
-  const error = await runRead(async () => 8).catch((e: unknown) => e);
+  const id = h.newOperation([
+    failed(uiError('apprafter::target::token_rejected', 'rejected (HTTP 401)')),
+  ]);
+  const error = await runRead(async () => id).catch((e: unknown) => e);
   expect(error).toBeInstanceOf(OperationFailed);
   expect(failureOf(error).code).toBe('apprafter::target::token_rejected');
   expect(isCancelled(error)).toBe(false);
 });
 
 test('a cancelled read is isCancelled', async () => {
-  h.operation(9, [cancelled()]);
-  expect(isCancelled(await runRead(async () => 9).catch((e: unknown) => e))).toBe(true);
+  const id = h.newOperation([cancelled()]);
+  expect(isCancelled(await runRead(async () => id).catch((e: unknown) => e))).toBe(true);
 });
 
 test('failureOf passes an IpcError through and wraps anything else', () => {
@@ -78,15 +81,16 @@ test('failureOf passes an IpcError through and wraps anything else', () => {
 });
 
 test('runPlan executes, resolves with the completed result and discards the op', async () => {
-  h.operation(10, [completed({ name: 'lab' })]);
-  expect(await runPlan<{ name: string }>(10)).toEqual({ name: 'lab' });
+  const id = h.newOperation([completed({ name: 'lab' })]);
+  expect(await runPlan<{ name: string }>(id)).toEqual({ name: 'lab' });
   expect(h.of('op_execute')).toHaveLength(1);
-  expect(h.of('op_discard').map((c) => c.args)).toEqual([{ opId: 10 }]);
+  expect(h.of('op_discard').map((c) => c.args)).toEqual([{ opId: id }]);
 });
 
 test('a follow Rust refuses ends the read with that refusal instead of waiting forever', async () => {
   h.answer('op_subscribe', () => Promise.reject(uiError('apprafter::desktop::plan_not_found')));
-  const error = await runRead(async () => 11).catch((e: unknown) => e);
+  const id = h.newOperation([]);
+  const error = await runRead(async () => id).catch((e: unknown) => e);
   expect(failureOf(error).code).toBe('apprafter::desktop::plan_not_found');
 });
 
@@ -100,33 +104,55 @@ test('reportUnlessLocked stays quiet for the lock refusal only', () => {
 });
 
 test('a plan whose screen went keeps its end for the app: not discarded, kept with its words', async () => {
-  h.operation(14, [failed(uiError('apprafter::provider::sku_unavailable', 'cx22 is sold out'))]);
-  const error = await runPlan(14, undefined, {
+  const id = h.newOperation([
+    failed(uiError('apprafter::provider::sku_unavailable', 'cx22 is sold out')),
+  ]);
+  const error = await runPlan(id, undefined, {
     title: 'Add target lab',
     shown: () => false,
   }).catch((e: unknown) => e);
   expect(failureOf(error).message).toBe('cx22 is sold out');
   expect(h.of('op_discard')).toHaveLength(0);
   expect(endedAwaySnapshot()).toEqual([
-    { opId: 14, text: 'Add target lab failed: cx22 is sold out', failed: true },
+    { opId: id, text: 'Add target lab failed: cx22 is sold out', failed: true },
+  ]);
+});
+
+test('a plan whose screen went keeps a refused follow for the app too (review #14)', async () => {
+  const id = h.newOperation([]); // runs on
+  const ended = runPlan(id, undefined, { title: 'Add target lab', shown: () => false }).catch(
+    (e: unknown) => e,
+  );
+  await waitFor(() => expect(h.of('op_execute')).toHaveLength(1));
+  // A lock and an unlock: Rust dropped the subscription, the store follows again, and Rust
+  // refuses that follow for a reason other than the lock.
+  h.answer('op_subscribe', () =>
+    Promise.reject(uiError('apprafter::desktop::plan_not_found', 'gone')),
+  );
+  clearLive();
+  reattachAll();
+  expect(failureOf(await ended).message).toBe('gone');
+  expect(h.of('op_discard')).toHaveLength(0);
+  expect(endedAwaySnapshot()).toEqual([
+    { opId: id, text: 'Add target lab failed: gone', failed: true },
   ]);
 });
 
 test('a plan whose screen is still there is discarded and kept nowhere', async () => {
-  h.operation(15, [completed({ name: 'lab' })]);
-  await runPlan(15, undefined, { title: 'Add target lab', shown: () => true });
-  expect(h.of('op_discard').map((c) => c.args)).toEqual([{ opId: 15 }]);
+  const id = h.newOperation([completed({ name: 'lab' })]);
+  await runPlan(id, undefined, { title: 'Add target lab', shown: () => true });
+  expect(h.of('op_discard').map((c) => c.args)).toEqual([{ opId: id }]);
   expect(endedAwaySnapshot()).toEqual([]);
 });
 
 test('an end kept for the app says what happened: done, or cancelled', async () => {
-  h.operation(16, [completed({ name: 'lab' })]);
-  h.operation(17, [cancelled()]);
+  const done = h.newOperation([completed({ name: 'lab' })]);
+  const stopped = h.newOperation([cancelled()]);
   const gone = { title: 'Rename prod', shown: () => false };
-  await runPlan(16, undefined, gone);
-  await runPlan(17, undefined, gone).catch(() => {});
+  await runPlan(done, undefined, gone);
+  await runPlan(stopped, undefined, gone).catch(() => {});
   expect(endedAwaySnapshot()).toEqual([
-    { opId: 16, text: 'Rename prod: done.', failed: false },
-    { opId: 17, text: 'Rename prod was cancelled.', failed: true },
+    { opId: done, text: 'Rename prod: done.', failed: false },
+    { opId: stopped, text: 'Rename prod was cancelled.', failed: true },
   ]);
 });

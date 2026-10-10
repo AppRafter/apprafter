@@ -30,10 +30,10 @@ afterEach(async () => {
 });
 
 test('run goes idle → running (no id) → running (id) → done', async () => {
-  h.operation(7, [completed({ ok: true })]);
+  const id = h.newOperation([completed({ ok: true })]);
   let release = () => {};
   const started = new Promise<number>((resolve) => {
-    release = () => resolve(7);
+    release = () => resolve(id);
   });
   const { result } = renderHook(() => useRead<{ ok: boolean }>());
   expect(result.current.state).toEqual({ status: 'idle' });
@@ -50,10 +50,10 @@ test('run goes idle → running (no id) → running (id) → done', async () => 
 });
 
 test('a failed run ends failed with the UiError', async () => {
-  h.operation(8, [failed(uiError('apprafter::target::token_rejected', 'rejected'))]);
+  const id = h.newOperation([failed(uiError('apprafter::target::token_rejected', 'rejected'))]);
   const { result } = renderHook(() => useRead<unknown>());
   await act(async () => {
-    await result.current.run(async () => 8);
+    await result.current.run(async () => id);
   });
   expect(result.current.state).toEqual({
     status: 'failed',
@@ -62,28 +62,28 @@ test('a failed run ends failed with the UiError', async () => {
 });
 
 test('cancel while running calls op_cancel with the op id', async () => {
-  h.operation(9, []); // keeps running (the harness cannot push onto a live subscription)
+  const id = h.newOperation([]); // keeps running (the harness cannot push onto a live subscription)
   const { result } = renderHook(() => useRead<unknown>());
   act(() => {
-    void result.current.run(async () => 9);
+    void result.current.run(async () => id);
   });
-  await waitFor(() => expect(result.current.state).toEqual({ status: 'running', opId: 9 }));
+  await waitFor(() => expect(result.current.state).toEqual({ status: 'running', opId: id }));
   act(() => result.current.cancel());
-  expect(h.of('op_cancel').map((c) => c.args)).toEqual([{ opId: 9 }]);
+  expect(h.of('op_cancel').map((c) => c.args)).toEqual([{ opId: id }]);
 });
 
 test("a second run cancels the first, and the first one's late end changes nothing", async () => {
-  h.operation(10, []);
-  h.operation(11, [completed('second')]);
+  const first = h.newOperation([]);
+  const second = h.newOperation([completed('second')]);
   const { result } = renderHook(() => useRead<string>());
   act(() => {
-    void result.current.run(async () => 10);
+    void result.current.run(async () => first);
   });
-  await waitFor(() => expect(result.current.state).toEqual({ status: 'running', opId: 10 }));
+  await waitFor(() => expect(result.current.state).toEqual({ status: 'running', opId: first }));
   await act(async () => {
-    await result.current.run(async () => 11);
+    await result.current.run(async () => second);
   });
-  expect(h.of('op_cancel').map((c) => c.args)).toEqual([{ opId: 10 }]);
+  expect(h.of('op_cancel').map((c) => c.args)).toEqual([{ opId: first }]);
   expect(result.current.state).toEqual({ status: 'done', data: 'second' });
 });
 
@@ -196,9 +196,9 @@ function heldStart(opId: number) {
 }
 
 test("a superseded run's late end changes nothing; its result goes to onUnused", async () => {
-  h.operation(10, [completed('first')]);
-  h.operation(11, [completed('second')]);
-  const first = heldStart(10);
+  const firstId = h.newOperation([completed('first')]);
+  const secondId = h.newOperation([completed('second')]);
+  const first = heldStart(firstId);
   const unused = mock();
   const { result } = renderHook(() => useRead<string>());
   let firstDone: Promise<string | null> = Promise.resolve(null);
@@ -206,7 +206,7 @@ test("a superseded run's late end changes nothing; its result goes to onUnused",
     firstDone = result.current.run(first.start, unused);
   });
   await act(async () => {
-    await result.current.run(async () => 11);
+    await result.current.run(async () => secondId);
   });
   expect(result.current.state).toEqual({ status: 'done', data: 'second' });
   let late: string | null = 'not yet';
@@ -216,22 +216,24 @@ test("a superseded run's late end changes nothing; its result goes to onUnused",
   });
   expect(late).toBeNull();
   // Stopped before Rust answered: cancelled once its id arrived.
-  expect(h.of('op_cancel').map((c) => c.args)).toEqual([{ opId: 10 }]);
+  expect(h.of('op_cancel').map((c) => c.args)).toEqual([{ opId: firstId }]);
+  // Each op discarded once, by its own run (review #12: no earlier test's leftover acts here).
+  expect(h.of('op_discard').map((c) => c.args.opId)).toEqual([secondId, firstId]);
   expect(unused.mock.calls).toEqual([['first']]);
   expect(result.current.state).toEqual({ status: 'done', data: 'second' });
 });
 
 test('a superseded run that ends cancelled does not overwrite the run that replaced it', async () => {
-  h.operation(10, [cancelled()]);
-  h.operation(11, [completed('second')]);
-  const first = heldStart(10);
+  const firstId = h.newOperation([cancelled()]);
+  const secondId = h.newOperation([completed('second')]);
+  const first = heldStart(firstId);
   const { result } = renderHook(() => useRead<string>());
   let firstDone: Promise<string | null> = Promise.resolve(null);
   act(() => {
     firstDone = result.current.run(first.start);
   });
   await act(async () => {
-    await result.current.run(async () => 11);
+    await result.current.run(async () => secondId);
   });
   await act(async () => {
     first.release();

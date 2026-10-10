@@ -302,17 +302,18 @@ describe('DoctorOverlay', () => {
   });
 
   test('under StrictMode the double mount still ends on a report', async () => {
-    // The first mount's run is cancelled by the simulated unmount and never answers.
+    // StrictMode runs the mount effect twice: the second run supersedes (and cancels) the
+    // first, which never answers.
+    const first = h.newOperation([]);
+    const second = h.newOperation([completed(doctorReport())]);
     let started = 0;
     h.answer('op_start_doctor', () => {
       started += 1;
-      return started === 1 ? 81 : 82;
+      return started === 1 ? first : second;
     });
-    h.operation(81, []);
-    h.operation(82, [completed(doctorReport())]);
     renderDoctor('prod-eu', true);
     expect(await screen.findByText('3 pass')).toBeDefined();
-    expect(h.of('op_cancel').map((c) => c.args)).toEqual([{ opId: 81 }]);
+    expect(h.of('op_cancel').map((c) => c.args)).toEqual([{ opId: first }]);
   });
 
   test('Cancel before Rust answered cancels the run once it has an id', async () => {
@@ -324,11 +325,11 @@ describe('DoctorOverlay', () => {
           answer = resolve;
         }),
     );
-    h.operation(90, []);
+    const id = h.newOperation([]);
     const { user } = renderDoctor('prod-eu');
     await user.click(await screen.findByRole('button', { name: 'Cancel' }));
     expect(h.of('op_cancel')).toHaveLength(0);
-    answer(90);
-    await waitFor(() => expect(h.of('op_cancel').map((c) => c.args)).toEqual([{ opId: 90 }]));
+    answer(id);
+    await waitFor(() => expect(h.of('op_cancel').map((c) => c.args)).toEqual([{ opId: id }]));
   });
 });

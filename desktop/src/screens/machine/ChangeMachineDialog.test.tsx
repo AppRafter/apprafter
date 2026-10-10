@@ -98,18 +98,18 @@ test('a type sold out in its region opens on the recommended one, which can be a
 });
 
 test('under StrictMode the double mount still ends on the catalogue', async () => {
-  // The first mount's read is cancelled by the simulated unmount and never answers; only the
-  // read the second mount starts can bring the catalogue.
+  // StrictMode runs the mount effect twice: the second read supersedes (and cancels) the first,
+  // which never answers; only the second can bring the catalogue.
+  const first = h.newOperation([]);
+  const second = h.newOperation([completed(catalogue())]);
   let started = 0;
   h.answer('op_start_machine_catalogue', () => {
     started += 1;
-    return started === 1 ? 81 : 82;
+    return started === 1 ? first : second;
   });
-  h.operation(81, []);
-  h.operation(82, [completed(catalogue())]);
   renderChange('staging', STAGING, true);
   await waitFor(() => expect(radio('cx22').checked).toBe(true));
-  expect(h.of('op_cancel').map((c) => c.args)).toEqual([{ opId: 81 }]);
+  expect(h.of('op_cancel').map((c) => c.args)).toEqual([{ opId: first }]);
 });
 
 test('a catalogue read the tab hides runs on: its end shows when the tab is back, nothing started again', async () => {
@@ -240,15 +240,13 @@ test('a catalogue that cannot be read says why, and Try again reads again', asyn
   const { user } = renderChange('staging', STAGING);
   expect(await screen.findByText('target `staging` was not found')).toBeDefined();
   expect(apply().disabled).toBe(true);
-  h.answer('op_start_machine_catalogue', 77);
-  h.operation(77, [completed(catalogue())]);
+  h.answer('op_start_machine_catalogue', h.newOperation([completed(catalogue())]));
   await user.click(screen.getByRole('button', { name: 'Try again' }));
   await waitFor(() => expect(radio('cx22').checked).toBe(true));
 });
 
 test('a catalogue read cancelled elsewhere says so, with Try again', async () => {
-  h.answer('op_start_machine_catalogue', 78);
-  h.operation(78, [cancelled()]);
+  h.answer('op_start_machine_catalogue', h.newOperation([cancelled()]));
   renderChange('staging', STAGING);
   expect(await screen.findByText('Reading the catalogue was cancelled.')).toBeDefined();
   expect(screen.getByRole('button', { name: 'Try again' })).toBeDefined();
@@ -260,8 +258,10 @@ test('a latency read that fails says why, with Try again', async () => {
   );
   const { user } = renderChange('staging', STAGING);
   expect(await screen.findByText('Latency could not be measured: the probe broke')).toBeDefined();
-  h.answer('op_start_region_latencies', 79);
-  h.operation(79, [completed([{ region: 'nbg1', latencyMs: 38 }])]);
+  h.answer(
+    'op_start_region_latencies',
+    h.newOperation([completed([{ region: 'nbg1', latencyMs: 38 }])]),
+  );
   await user.click(screen.getByRole('button', { name: 'Try again' }));
   expect(await screen.findByText('38 ms')).toBeDefined();
 });
