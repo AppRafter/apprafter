@@ -24,13 +24,21 @@
     // data-tauri-drag-region: the title bar moves the window, a double-click maximizes it.
     "core:window:allow-start-dragging",
     "core:window:allow-internal-toggle-maximize",
-    // Website, Docs and GitHub (sidebar footer, About) in the browser: these three URLs only.
+    // In the browser, these URLs exactly as written, nothing else: Website, Docs and GitHub
+    // (sidebar footer, About), and the install page of each tool the core's specs name (the
+    // toolchain panel's "Open"; cli-core tools.rs). tests/ipc_mock.rs pins this list equal to
+    // the app's links and the specs' pages.
     {
       identifier: "opener:allow-open-url",
       allow: [
         { url: "https://apprafter.dev" },
         { url: "https://docs.apprafter.dev" },
         { url: "https://github.com/AppRafter/apprafter" },
+        { url: "https://restic.readthedocs.io/en/stable/020_installation.html" },
+        { url: "https://kubernetes.io/docs/tasks/tools/" },
+        { url: "https://helm.sh/docs/intro/install/" },
+        { url: "https://git-scm.com/downloads" },
+        { url: "https://cuelang.org/docs/introduction/installation/" },
       ],
     },
     // Copy report (Doctor) and the toolchain's Copy buttons: write text, never read. A plugin

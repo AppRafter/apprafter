@@ -5,6 +5,7 @@
 
 export { ArchiveIcon } from '@phosphor-icons/react/dist/csr/Archive';
 export { ArrowRightIcon } from '@phosphor-icons/react/dist/csr/ArrowRight';
+export { ArrowSquareOutIcon } from '@phosphor-icons/react/dist/csr/ArrowSquareOut';
 export { ArrowsClockwiseIcon } from '@phosphor-icons/react/dist/csr/ArrowsClockwise';
 export { BookOpenIcon } from '@phosphor-icons/react/dist/csr/BookOpen';
 export { CaretDownIcon } from '@phosphor-icons/react/dist/csr/CaretDown';

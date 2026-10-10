@@ -270,10 +270,38 @@ fn a_quit_with_nothing_running_says_nothing() {
     assert!(heard.recv_timeout(Duration::from_millis(200)).is_err());
 }
 
-/// The opener's scope is the three URLs exactly as the capability writes them: a URL the page
-/// does not show, a trailing slash on one it does, and a host that only starts like ours are
-/// each refused by the plugin's own scope check — reached past the ACL, which grants
-/// `open_url` with that scope. (A listed URL would open the browser, so none is tried here.)
+/// The app's own links, as the page shows them (src/shell/links.ts).
+const APP_LINKS: [&str; 3] = [
+    "https://apprafter.dev",
+    "https://docs.apprafter.dev",
+    "https://github.com/AppRafter/apprafter",
+];
+
+/// The install pages the toolchain panel can open: every install line of the core's tool specs
+/// that is an address. Each must be https; an http one fails here rather than being left out.
+fn install_pages() -> BTreeSet<String> {
+    let mut pages = BTreeSet::new();
+    for tool in apprafter_core::tools::ToolId::ALL {
+        for hint in tool.spec().hints {
+            if hint.text.contains("://") {
+                assert!(
+                    hint.text.starts_with("https://") && !hint.text.contains(char::is_whitespace),
+                    "{}: an install page must be one https address: {}",
+                    tool.name(),
+                    hint.text
+                );
+                pages.insert(hint.text.to_string());
+            }
+        }
+    }
+    pages
+}
+
+/// The opener's scope is its URLs exactly as the capability writes them: a URL the page does not
+/// show, a trailing slash added or missing, a path beyond one, another scheme, and a host that
+/// only starts like ours are each refused by the plugin's own scope check — reached past the
+/// ACL, which grants `open_url` with that scope. (A listed URL would open the browser, so none
+/// is tried here.)
 #[test]
 fn the_opener_opens_the_listed_urls_only_and_only_as_written() {
     let rig = rig(lock_off());
@@ -286,6 +314,15 @@ fn the_opener_opens_the_listed_urls_only_and_only_as_written() {
         "https://docs.apprafter.dev/../x",
         "https://github.com/AppRafter/apprafter/",
         "https://github.com/AppRafter/apprafter-evil",
+        // The install pages, as the core's specs name them, and nothing near them.
+        "https://helm.sh/docs/intro/install",
+        "https://helm.sh/docs/intro/install/x",
+        "http://helm.sh/docs/intro/install/",
+        "https://helm.sh/",
+        "https://kubernetes.io/docs/tasks/tools/../../x",
+        "https://git-scm.com/downloads/",
+        "https://restic.readthedocs.io/en/stable/020_installation.html?x",
+        "https://cuelang.org/docs/introduction/installation",
     ] {
         match invoke(&rig, "plugin:opener|open_url", json!({ "url": url })) {
             Err(Value::String(error)) => assert_eq!(
@@ -299,9 +336,9 @@ fn the_opener_opens_the_listed_urls_only_and_only_as_written() {
 }
 
 /// The capability, read as Tauri reads it: exactly the pinned core permissions, the opener
-/// scoped to the three links the app shows, and the generated `allow-<command>` of every app
-/// command — nothing more, nothing less, once each. A permission added for a later step must
-/// be added here too, with its reason in the file.
+/// scoped to the app's three links and the install pages of the core's tool specs, and the
+/// generated `allow-<command>` of every app command — nothing more, nothing less, once each. A
+/// permission added for a later step must be added here too, with its reason in the file.
 #[test]
 fn the_capability_grants_the_pinned_permissions_and_every_app_command_only() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("capabilities/main.json5");
@@ -332,16 +369,35 @@ fn the_capability_grants_the_pinned_permissions_and_every_app_command_only() {
             .map(|cmd| format!("allow-{}", cmd.replace('_', "-"))),
     );
     assert_eq!(set, expected);
-    // The one scoped permission: the opener, for exactly these URLs, no pattern.
-    let links = json!({
-        "identifier": "opener:allow-open-url",
-        "allow": [
-            { "url": "https://apprafter.dev" },
-            { "url": "https://docs.apprafter.dev" },
-            { "url": "https://github.com/AppRafter/apprafter" },
-        ],
-    });
-    assert_eq!(scoped, [&links]);
+    // The one scoped permission: the opener, for exactly the app's links and the install pages
+    // the core's tool specs name — a tool added without its page, or a page no spec names,
+    // fails here. Each URL as written: no glob pattern (the plugin matches them as globs).
+    let [opener] = scoped.as_slice() else {
+        panic!("one scoped permission: {scoped:?}")
+    };
+    assert_eq!(opener["identifier"], json!("opener:allow-open-url"));
+    let allow = opener["allow"].as_array().expect("an allow list");
+    let urls: Vec<&str> = allow
+        .iter()
+        .map(|entry| {
+            assert_eq!(entry.as_object().map(|o| o.len()), Some(1), "{entry}");
+            entry["url"].as_str().expect("a url")
+        })
+        .collect();
+    let url_set: BTreeSet<String> = urls.iter().map(|u| u.to_string()).collect();
+    assert_eq!(url_set.len(), urls.len(), "a URL twice: {urls:?}");
+    for url in &urls {
+        assert!(url.starts_with("https://"), "{url}");
+        assert!(
+            !url.contains(['*', '?', '[', ']', '{', '}']),
+            "a pattern: {url}"
+        );
+    }
+    let mut expected_urls: BTreeSet<String> = APP_LINKS.map(String::from).into();
+    expected_urls.extend(install_pages());
+    assert_eq!(url_set, expected_urls);
+    // The toolchain has something to open: the core names install pages.
+    assert!(install_pages().len() >= 5, "{:?}", install_pages());
     assert_eq!(capability["windows"], json!(["main"]));
     assert_eq!(capability.get("remote"), None, "no remote origin");
 }

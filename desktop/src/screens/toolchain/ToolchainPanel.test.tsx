@@ -106,19 +106,39 @@ test("Windows: the missing tool's winget line", async () => {
   expect(screen.queryByText('brew install helm')).toBeNull();
 });
 
-test("Linux: every distribution's line, each labelled; a link is shown as its address", async () => {
-  renderPanel('linux');
+test("Linux: every distribution's line, each labelled; an install page opens through the opener", async () => {
+  const { user } = renderPanel('linux');
   await screen.findByText('Client Version: v1.34.1');
   const helm = toolRow('helm');
   for (const label of ['Debian / Ubuntu', 'Nix', 'Other']) {
     expect(within(helm).getByText(label)).toBeDefined();
   }
   expect(within(helm).getByText('apt install helm').tagName).toBe('CODE');
-  // The opener may open only the app's own three URLs, so an install page is shown, not linked.
   const link = within(helm).getByText('https://helm.sh/docs/intro/install/');
   expect(link.tagName).toBe('CODE');
-  expect(link.closest('a')).toBeNull();
   expect(within(helm).queryByText(/brew|winget/)).toBeNull();
+  // Never a link the webview would follow itself: the opener opens it in the browser.
+  expect(screen.getByRole('dialog', { name: 'Toolchain' }).querySelector('a')).toBeNull();
+  await user.click(
+    within(helm).getByRole('button', { name: 'Open https://helm.sh/docs/intro/install/' }),
+  );
+  expect(h.of('plugin:opener|open_url').map((c) => c.args.url)).toEqual([
+    'https://helm.sh/docs/intro/install/',
+  ]);
+  // A command has no Open.
+  expect(within(helm).queryByRole('button', { name: /^Open apt/ })).toBeNull();
+});
+
+test('an install page the system cannot open says why', async () => {
+  h.answer('plugin:opener|open_url', () => Promise.reject('Not allowed to open url https://x'));
+  const { user } = renderPanel('linux');
+  await screen.findByText('Client Version: v1.34.1');
+  await user.click(
+    within(toolRow('helm')).getByRole('button', {
+      name: 'Open https://helm.sh/docs/intro/install/',
+    }),
+  );
+  expect(await screen.findByText('Not opened: Not allowed to open url https://x')).toBeDefined();
 });
 
 test('a found tool shows no install lines; required or optional, and the state tone', async () => {

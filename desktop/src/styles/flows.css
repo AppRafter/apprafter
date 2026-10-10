@@ -356,10 +356,17 @@
 /* An install line: the OS it is for, then the command or address in mono, or a note. */
 .tool-hint {
   display: grid;
-  grid-template-columns: 110px minmax(0, 1fr);
+  grid-template-columns: 110px minmax(0, 1fr) auto;
   align-items: baseline;
   gap: 8px;
   font-size: var(--fs-12-5);
+}
+
+/* Open (an install page) and Copy, at the line's end. */
+.tool-hint-actions {
+  display: inline-flex;
+  gap: 2px;
+  align-self: center;
 }
 
 .tool-hint-os {
