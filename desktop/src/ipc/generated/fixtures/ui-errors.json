@@ -7,7 +7,7 @@
       "endpoint": "GET /v1/locations",
       "status": 401
     },
-    "help": "The Hetzner Cloud API returned a non-2xx response. Common causes:\n• 401 unauthorized — the stored API token was rotated or revoked: renew the target's token.\n• 403 forbidden — the token's project lacks permission for this resource type.\n• 429 rate limit — back off and retry; if it persists, the project may need a quota increase.\n• 5xx — an outage at the provider; check https://status.hetzner.com/.",
+    "help": "The Hetzner Cloud API refused the request:\n• 401 unauthorized — the token is wrong, or it was revoked or rotated: use a current one.\n• 403 forbidden — the token lacks Read & Write (it is Read-only), or the project forbids the call, for example at one of its limits.\n• 429 rate limit — too many requests: wait, then try again.\n• 5xx — an outage at the provider; check https://status.hetzner.com/.",
     "message": "hetzner-cloud GET /v1/locations failed (status 401): unauthorized: unable to authenticate"
   },
   "hetzner403": {
@@ -18,7 +18,7 @@
       "endpoint": "GET /v1/locations",
       "status": 403
     },
-    "help": "The Hetzner Cloud API returned a non-2xx response. Common causes:\n• 401 unauthorized — the stored API token was rotated or revoked: renew the target's token.\n• 403 forbidden — the token's project lacks permission for this resource type.\n• 429 rate limit — back off and retry; if it persists, the project may need a quota increase.\n• 5xx — an outage at the provider; check https://status.hetzner.com/.",
+    "help": "The Hetzner Cloud API refused the request:\n• 401 unauthorized — the token is wrong, or it was revoked or rotated: use a current one.\n• 403 forbidden — the token lacks Read & Write (it is Read-only), or the project forbids the call, for example at one of its limits.\n• 429 rate limit — too many requests: wait, then try again.\n• 5xx — an outage at the provider; check https://status.hetzner.com/.",
     "message": "hetzner-cloud GET /v1/locations failed (status 403): forbidden: insufficient permissions"
   },
   "serverTypeUnavailable": {
@@ -51,7 +51,7 @@
       "provider": "hetzner-cloud",
       "status": 401
     },
-    "help": "The provider's read-only credential check returned 401 / unauthorized. Either the token was mistyped, never had the right scopes, or has been rotated / revoked since you copied it.\n• Verify the token at https://console.hetzner.cloud/projects → Security → API Tokens. It must say `Read & Write` next to the project.\n• Copy the token again (it is 64 ASCII characters, no prefix) — a common cause is a trailing newline from a clipboard manager.",
+    "help": "The provider did not accept this token (401 unauthorized): it was mistyped, or it was revoked or rotated, or its project was deleted. The Hetzner Cloud Console shows a token only once, when it is created: paste it again from where you saved it, or create a new one in the project under Security → API tokens (AppRafter needs Read & Write).",
     "message": "provider `hetzner-cloud` rejected the supplied token"
   },
   "toolNotFound": {

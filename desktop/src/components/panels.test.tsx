@@ -55,7 +55,7 @@ describe('ErrorPanel', () => {
     }
     render(<ErrorPanel error={UI_ERRORS.tokenRejected as UiError} onAction={() => {}} />);
     const panel = screen.getByRole('alert');
-    expect(panel.textContent).toContain('mistyped, never had the right scopes');
+    expect(panel.textContent).toContain('it was mistyped, or it was revoked or rotated');
     expect(screen.getByRole('button', { name: 'Renew token' })).toBeDefined();
   });
 

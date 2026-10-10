@@ -406,22 +406,24 @@ fn neutral_help(e: &cli_core::CliError) -> Option<String> {
     use cli_core::CliError as C;
     use cli_core::SkuCheckFor;
     Some(match e {
-        C::Hetzner { .. } => "The Hetzner Cloud API returned a non-2xx response. Common causes:\n\
-             • 401 unauthorized — the stored API token was rotated or revoked: renew the \
-               target's token.\n\
-             • 403 forbidden — the token's project lacks permission for this resource type.\n\
-             • 429 rate limit — back off and retry; if it persists, the project may need a quota \
-               increase.\n\
+        // Each status with only what can cause it (D.3d review #10), and no target assumed: a
+        // wizard's token belongs to none yet.
+        C::Hetzner { .. } => "The Hetzner Cloud API refused the request:\n\
+             • 401 unauthorized — the token is wrong, or it was revoked or rotated: use a \
+               current one.\n\
+             • 403 forbidden — the token lacks Read & Write (it is Read-only), or the project \
+               forbids the call, for example at one of its limits.\n\
+             • 429 rate limit — too many requests: wait, then try again.\n\
              • 5xx — an outage at the provider; check https://status.hetzner.com/."
             .into(),
+        // The check is a read (GET /v1/locations): a Read-only token passes it, and a token
+        // with a trailing newline never reaches it (the format check refuses that first).
         C::ProviderTokenRejected { .. } => {
-            "The provider's read-only credential check returned 401 / unauthorized. Either the \
-             token was mistyped, never had the right scopes, or has been rotated / revoked \
-             since you copied it.\n\
-             • Verify the token at https://console.hetzner.cloud/projects → Security → API \
-               Tokens. It must say `Read & Write` next to the project.\n\
-             • Copy the token again (it is 64 ASCII characters, no prefix) — a common cause is \
-               a trailing newline from a clipboard manager."
+            "The provider did not accept this token (401 unauthorized): it was mistyped, or it \
+             was revoked or rotated, or its project was deleted. The Hetzner Cloud Console shows \
+             a token only once, when it is created: paste it again from where you saved it, or \
+             create a new one in the project under Security → API tokens (AppRafter needs Read \
+             & Write)."
                 .into()
         }
         C::ProviderApiUnreachable { .. } => {
@@ -469,12 +471,14 @@ fn neutral_help(e: &cli_core::CliError) -> Option<String> {
              curve, or a security-key (sk-) type. Nothing was saved or sent."
         }
         .into(),
-        C::InvalidTargetConfig { .. } => {
-            "The target store file named above failed to parse: it was edited by hand or \
-             written by an incompatible version. Fix the YAML by hand (it is a small file), or \
-             remove the target and add it again."
-                .into()
-        }
+        // Not "remove the target and add it again": the GUI cannot remove a target it cannot
+        // read (WI-458), and no removal repairs the store's own config.yaml (D.3d review #9).
+        C::InvalidTargetConfig { path, .. } => format!(
+            "{} could not be read as a target configuration: it was edited by hand or written \
+             by an incompatible version. Fix it by hand (it is a small YAML file), or restore it \
+             from a backup.",
+            path.display()
+        ),
         C::Io(_) => "A filesystem or network error. The OS message above usually names the \
              failing path or socket: a missing directory, wrong permissions, a full disk, or a \
              closed socket."
@@ -1337,9 +1341,16 @@ mod tests {
             provider: "hetzner-cloud".into(),
             cause: Box::new(cli_core::CliError::Other("401".into())),
         });
-        for why in ["mistyped", "scopes", "rotated", "revoked", "Read & Write"] {
+        for why in ["mistyped", "rotated", "revoked", "create a new one"] {
             assert!(rejected.contains(why), "{why}: {rejected}");
         }
+        // D.3d review #10: nothing that cannot produce a 401 on the read-only ping — a token's
+        // scope (a Read-only token passes it), a trailing newline (the format check refuses it
+        // first) — and no step that cannot be done (the console shows a token only once).
+        for not_why in ["scope", "newline", "Copy the token again"] {
+            assert!(!rejected.contains(not_why), "{not_why}: {rejected}");
+        }
+        assert!(rejected.contains("only once"), "{rejected}");
         let hetzner = help(cli_core::CliError::Hetzner {
             endpoint: "e".into(),
             status: 401,
@@ -1349,6 +1360,18 @@ mod tests {
         for status in ["401", "403", "429", "5xx"] {
             assert!(hetzner.contains(status), "{status}: {hetzner}");
         }
+        // 403 is the token's permission (Read-only) or the project's; no target to renew is
+        // assumed (a wizard's token has none yet), and a quota is no 429 matter.
+        let line = |status: &str| {
+            hetzner
+                .lines()
+                .find(|l| l.contains(status))
+                .unwrap_or_else(|| panic!("{status}: {hetzner}"))
+                .to_string()
+        };
+        assert!(line("403").contains("Read & Write"), "{hetzner}");
+        assert!(!hetzner.contains("target's token"), "{hetzner}");
+        assert!(!line("429").contains("quota"), "{hetzner}");
         let sku = help(cli_core::CliError::ServerTypeUnavailable {
             requested: "cx22".into(),
             location: "nbg1".into(),
@@ -1361,6 +1384,27 @@ mod tests {
         assert_eq!(
             sku,
             "Hetzner no longer sells `cx22`; pick another type. Nothing was saved."
+        );
+    }
+
+    /// D.3d review #9: the GUI cannot remove a target it cannot read (WI-458), and removing a
+    /// target never repairs the store's own `config.yaml`: the help names the file and says to
+    /// fix it by hand or restore it.
+    #[test]
+    fn an_unreadable_target_file_is_fixed_by_hand_or_restored() {
+        let ui = UiError::from(&CoreError::Cli(cli_core::CliError::InvalidTargetConfig {
+            path: "/s/targets/prod/credentials.yaml".into(),
+            message: "not a valid target credentials map (line 1, column 1)".into(),
+        }));
+        let help = ui.help.unwrap();
+        assert!(help.contains("/s/targets/prod/credentials.yaml"), "{help}");
+        assert!(
+            help.contains("by hand") && help.contains("restore"),
+            "{help}"
+        );
+        assert!(
+            !help.contains("remove") && !help.contains("add it again"),
+            "{help}"
         );
     }
 
