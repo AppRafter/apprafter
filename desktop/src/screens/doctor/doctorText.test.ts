@@ -161,6 +161,29 @@ describe('fixText', () => {
     );
   });
 
+  test('a key file that is not a public key: a private key names its public half', () => {
+    expect(
+      fixed({
+        kind: 'ssh_key_not_public',
+        target: 'prod-eu',
+        path: '/home/alex/.ssh/id_ed25519',
+        privateKey: true,
+      }),
+    ).toBe(
+      '/home/alex/.ssh/id_ed25519 is a private key, which is never sent to the provider: set its public half, the .pub file next to it.',
+    );
+    expect(
+      fixed({
+        kind: 'ssh_key_not_public',
+        target: 'prod-eu',
+        path: '/notes.txt',
+        privateKey: false,
+      }),
+    ).toBe(
+      '/notes.txt is not an OpenSSH public key, so it is never sent to the provider: set a public key.',
+    );
+  });
+
   test('a fix names a screen or a fact, never a CLI flag, but for the kubeconfig fetch (D.12)', () => {
     const fixes: CheckFix[] = [
       { kind: 'add_target', name: 'prod', available: ['lab'] },
@@ -170,7 +193,8 @@ describe('fixText', () => {
       { kind: 'provider_error', status: 500 },
       { kind: 'provider_unreachable' },
       { kind: 'configure_ssh_key', target: 'prod-eu' },
-      { kind: 'ssh_key_missing', path: '/k.pub' },
+      { kind: 'ssh_key_missing', target: 'prod-eu', path: '/k.pub' },
+      { kind: 'ssh_key_not_public', target: 'prod-eu', path: '/k', privateKey: true },
       { kind: 'install_tool', tool: 'helm' },
       { kind: 'age_key_missing', path: '/k' },
       { kind: 'cluster_unreachable', reason: 'unreachable' },

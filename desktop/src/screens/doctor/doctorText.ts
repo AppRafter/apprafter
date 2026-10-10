@@ -87,6 +87,11 @@ export function fixText(check: Check, target: string | null): string | null {
       return 'No SSH key is set for this target: provisioning its server is refused until it has one.';
     case 'ssh_key_missing':
       return `There is no file at ${fix.path}: the stored path may be stale.`;
+    case 'ssh_key_not_public':
+      // GOTCHA-149: apply sends the key file as it is, so the core refuses one that is not a key.
+      return fix.privateKey
+        ? `${fix.path} is a private key, which is never sent to the provider: set its public half, the .pub file next to it.`
+        : `${fix.path} is not an OpenSSH public key, so it is never sent to the provider: set a public key.`;
     case 'install_tool':
       // On the tool's own row a detail means it was found only as something it cannot run (a
       // `.cmd` shim); on another row the tool is what that check needs.

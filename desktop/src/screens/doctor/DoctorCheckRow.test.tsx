@@ -121,9 +121,29 @@ describe('DoctorCheckRow', () => {
 
   test('a stored key path with no file offers to change the key, passing its fix', async () => {
     const onAction = mock();
-    const fix: CheckFix = { kind: 'ssh_key_missing', path: '/home/alex/.ssh/gone.pub' };
+    const fix: CheckFix = {
+      kind: 'ssh_key_missing',
+      target: 'prod-eu',
+      path: '/home/alex/.ssh/gone.pub',
+    };
     const { user } = row(
       check({ id: 'ssh_key', status: 'fail', title: 'SSH key file exists', fix }),
+      onAction,
+    );
+    await user.click(screen.getByRole('button', { name: 'Change SSH key' }));
+    expect(onAction).toHaveBeenLastCalledWith(fix);
+  });
+
+  test('a key file that is not a public key offers to change the key, passing its fix', async () => {
+    const onAction = mock();
+    const fix: CheckFix = {
+      kind: 'ssh_key_not_public',
+      target: 'prod-eu',
+      path: '/home/alex/.ssh/id_ed25519',
+      privateKey: true,
+    };
+    const { user } = row(
+      check({ id: 'ssh_key', status: 'fail', title: 'SSH key is a public key', fix }),
       onAction,
     );
     await user.click(screen.getByRole('button', { name: 'Change SSH key' }));

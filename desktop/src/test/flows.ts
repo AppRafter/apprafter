@@ -315,6 +315,7 @@ export function whoamiReport(verification: Verification): WhoamiReport {
           display: '~/.ssh/id_ed25519.pub',
           exists: true,
           algo: 'ssh-ed25519',
+          problem: null,
         },
       },
     },

@@ -140,7 +140,11 @@ describe('DoctorOverlay', () => {
                 id: 'ssh_key',
                 status: 'fail',
                 title: 'SSH key file exists',
-                fix: { kind: 'ssh_key_missing', path: '/home/alex/.ssh/gone.pub' },
+                fix: {
+                  kind: 'ssh_key_missing',
+                  target: 'prod-eu',
+                  path: '/home/alex/.ssh/gone.pub',
+                },
               }),
             ],
           },
@@ -151,6 +155,35 @@ describe('DoctorOverlay', () => {
     await user.click(await screen.findByRole('button', { name: 'Change SSH key' }));
     expect(onChangeSshKey).toHaveBeenCalledTimes(1);
     expect(onClose).not.toHaveBeenCalled();
+  });
+
+  test('a key file that is not a public key: its fix opens the key change too', async () => {
+    h.read('op_start_doctor', [
+      completed({
+        target: 'prod-eu',
+        groups: [
+          {
+            id: 'target',
+            checks: [
+              check({
+                id: 'ssh_key',
+                status: 'fail',
+                title: 'SSH key is a public key',
+                fix: {
+                  kind: 'ssh_key_not_public',
+                  target: 'prod-eu',
+                  path: '/home/alex/.ssh/id_ed25519',
+                  privateKey: true,
+                },
+              }),
+            ],
+          },
+        ],
+      }),
+    ]);
+    const { user, onChangeSshKey } = renderDoctor('prod-eu');
+    await user.click(await screen.findByRole('button', { name: 'Change SSH key' }));
+    expect(onChangeSshKey).toHaveBeenCalledTimes(1);
   });
 
   test("a missing target's fix closes the doctor, then opens the wizard", async () => {
