@@ -137,6 +137,17 @@ describe('provider and token', () => {
     expect(document.activeElement).toBe(screen.getByLabelText('API token'));
   });
 
+  test('a verify cancelled elsewhere says so', async () => {
+    h.read('op_start_verify_token', [cancelled()]);
+    const { user } = renderWizard();
+    await user.type(screen.getByLabelText('API token'), TOKEN);
+    await user.click(screen.getByRole('button', { name: 'Verify and continue' }));
+    expect(
+      await screen.findByText('Verifying the token was cancelled. Verify it again.'),
+    ).toBeDefined();
+    expect(currentStep()).toContain('Provider');
+  });
+
   test('while verifying the frame is busy: Close and Next wait', async () => {
     h.read('op_start_verify_token', []); // keeps running
     const { user } = renderWizard();
@@ -504,6 +515,99 @@ describe('details and save', () => {
     expect(h.of('op_discard').map((c) => c.args.opId)).not.toContain(
       h.started('op_plan_target_add')[0],
     );
+  });
+
+  test('the store names that cannot be read: the name check says it is off, and why', async () => {
+    h.answer('target_list', () =>
+      Promise.reject(
+        uiError('apprafter::target::store_unreadable', 'the target store cannot be read'),
+      ),
+    );
+    const { user } = renderWizard();
+    await toDetails(user);
+    expect(
+      await screen.findByText(
+        'The existing target names could not be read, so a taken name is not caught here; saving still checks it.',
+      ),
+    ).toBeDefined();
+    expect(screen.getByText('the target store cannot be read')).toBeDefined();
+  });
+
+  test('a name of a target that cannot be read says so, with the reason', async () => {
+    h.answer('target_list', {
+      targets: [],
+      unreadable: [
+        {
+          name: 'lab',
+          error: uiError('apprafter::target::config_unreadable', 'config.yaml is not valid YAML'),
+        },
+      ],
+      cliDefault: { status: 'unset' },
+    });
+    const { user } = renderWizard();
+    await toDetails(user);
+    await user.type(screen.getByLabelText('Target name'), 'lab');
+    expect(
+      await screen.findByText(
+        'A target named lab exists but cannot be read: config.yaml is not valid YAML',
+      ),
+    ).toBeDefined();
+    expect(saveButton().disabled).toBe(true);
+  });
+
+  test('a file that is not an SSH public key is said as such, and cannot be saved', async () => {
+    h.answer('ssh_key_inspect', ({ path }: Record<string, unknown>) => ({
+      path,
+      display: String(path),
+      exists: true,
+      algo: '-----BEGIN',
+    }));
+    const { user } = renderWizard();
+    await toDetails(user);
+    await user.type(screen.getByLabelText('Target name'), 'lab-2');
+    await user.click(screen.getByRole('radio', { name: 'Other path…' }));
+    await user.type(screen.getByLabelText('Path to a public key'), '/home/alex/.ssh/id_ed25519');
+    await user.tab();
+    expect(await screen.findByText('This file does not read as an SSH public key.')).toBeDefined();
+    expect(screen.queryByText(/^Found/)).toBeNull();
+    expect(saveButton().disabled).toBe(true);
+  });
+
+  test('no key in ~/.ssh says so and points at Other path; the footer says what Save waits for', async () => {
+    const { user } = renderWizard();
+    h.answer('ssh_key_candidates', []);
+    await toMachine(user);
+    await screen.findByRole('table', { name: 'Machines in nbg1' });
+    await user.click(screen.getByRole('button', { name: 'Continue' }));
+    await waitFor(() => expect(currentStep()).toContain('Details'));
+    expect(
+      await screen.findByText('No public key was found in ~/.ssh: choose Other path… or Skip.'),
+    ).toBeDefined();
+    await user.type(screen.getByLabelText('Target name'), 'lab-2');
+    expect(screen.getByText('SSH key: choose one, give a path to one, or Skip.')).toBeDefined();
+    expect(saveButton().disabled).toBe(true);
+  });
+
+  test('leaving the path field again checks the path again', async () => {
+    let exists = false;
+    h.answer('ssh_key_inspect', ({ path }: Record<string, unknown>) => ({
+      path,
+      display: String(path),
+      exists,
+      algo: exists ? 'ssh-ed25519' : null,
+    }));
+    const { user } = renderWizard();
+    await toDetails(user);
+    await user.click(screen.getByRole('radio', { name: 'Other path…' }));
+    const field = screen.getByLabelText('Path to a public key');
+    await user.type(field, '/home/alex/.ssh/new.pub');
+    await user.tab();
+    expect(await screen.findByText('No file at that path.')).toBeDefined();
+    exists = true; // the owner ran ssh-keygen meanwhile
+    await user.click(field);
+    await user.tab();
+    expect(await screen.findByText('Found · ssh-ed25519')).toBeDefined();
+    expect(h.of('ssh_key_inspect')).toHaveLength(2);
   });
 
   test('name rules inline, a taken name inline (target_list), Save disabled meanwhile', async () => {

@@ -46,6 +46,17 @@ export const DRAFT_GONE =
 const TOKEN_USED = 'The token was used by the attempt that failed. Enter it again to retry.';
 const SAVE_CANCELLED = 'Saving was cancelled; nothing was saved.';
 const NAME_HINT = 'Letters, digits and dashes.';
+const VERIFY_CANCELLED = 'Verifying the token was cancelled. Verify it again.';
+const NAMES_UNREAD =
+  'The existing target names could not be read, so a taken name is not caught here; saving still checks it.';
+const NO_KEYS = 'No public key was found in ~/.ssh: choose Other path… or Skip.';
+
+/**
+ * Whether the core read an OpenSSH public key's type: its first word (ssh-…, ecdsa-sha2-…,
+ * sk-…). A private key reads as "-----BEGIN", a directory or an unreadable file as no type.
+ */
+export const isPublicKeyType = (algo: string | null): boolean =>
+  algo !== null && /^(ssh-|ecdsa-sha2-|sk-)/.test(algo);
 
 export const isDraftGone = (e: UiError) =>
   e.code === DESKTOP_ERROR_CODES.DRAFT_EXPIRED || e.code === DESKTOP_ERROR_CODES.DRAFT_NOT_FOUND;
@@ -232,9 +243,9 @@ export function AddTargetWizard({ onClose }: { onClose: () => void }) {
   }, [state.ssh, firstKey]);
 
   const problem = nameProblem(state.name);
+  const unreadable = targets.data?.unreadable.find((t) => t.name === state.name);
   const taken =
-    targets.data?.targets.some((t) => t.name === state.name) === true ||
-    targets.data?.unreadable.some((t) => t.name === state.name) === true;
+    targets.data?.targets.some((t) => t.name === state.name) === true || unreadable !== undefined;
   const ssh = state.ssh;
   // The Other path counts once the core has looked at what the field holds now.
   const otherChecked =
@@ -249,7 +260,7 @@ export function AddTargetWizard({ onClose }: { onClose: () => void }) {
         ? ssh.path
         : ssh.kind === 'skip'
           ? null
-          : otherChecked && inspected.data?.exists === true
+          : otherChecked && inspected.data?.exists === true && isPublicKeyType(inspected.data.algo)
             ? inspected.data.path
             : undefined;
   const args = sshKey === undefined || problem !== null || taken ? null : addArgs(state, sshKey);
@@ -260,9 +271,11 @@ export function AddTargetWizard({ onClose }: { onClose: () => void }) {
       ? { text: 'Checking…', tone: 'faint' }
       : inspected.isError
         ? { text: uiErrorOf(inspected.error).message, tone: 'err' }
-        : inspected.data?.exists === true
-          ? { text: `Found · ${inspected.data.algo ?? 'unknown type'}`, tone: 'ok' }
-          : { text: 'No file at that path.', tone: 'err' };
+        : inspected.data?.exists !== true
+          ? { text: 'No file at that path.', tone: 'err' }
+          : isPublicKeyType(inspected.data.algo)
+            ? { text: `Found · ${inspected.data.algo}`, tone: 'ok' }
+            : { text: 'This file does not read as an SSH public key.', tone: 'err' };
 
   const finishAdded = (added: TargetAdded) => {
     refreshTargets(client); // D.3d's: the Targets page and list read again
@@ -350,12 +363,17 @@ export function AddTargetWizard({ onClose }: { onClose: () => void }) {
           onText={(text) =>
             dispatch({ type: 'ssh', value: { kind: 'other', text, checked: null } })
           }
-          onLeave={() =>
-            dispatch({
-              type: 'ssh',
-              value: { kind: 'other', text: otherText, checked: otherText.trim() },
-            })
-          }
+          onLeave={() => {
+            // The same path left again: the file may have changed meanwhile, so look again.
+            if (ssh?.kind === 'other' && ssh.checked === otherText.trim() && ssh.checked !== '') {
+              void inspected.refetch();
+            } else {
+              dispatch({
+                type: 'ssh',
+                value: { kind: 'other', text: otherText, checked: otherText.trim() },
+              });
+            }
+          }}
         />
       ),
     },
@@ -401,6 +419,11 @@ export function AddTargetWizard({ onClose }: { onClose: () => void }) {
           {notice}
         </p>
       )}
+      {verify.state.status === 'cancelled' && (
+        <p className="wizard-notice" role="note">
+          {VERIFY_CANCELLED}
+        </p>
+      )}
       {verify.state.status === 'failed' && <ErrorPanel error={verify.state.error} />}
     </>
   );
@@ -441,9 +464,11 @@ export function AddTargetWizard({ onClose }: { onClose: () => void }) {
       ? NAME_HINT
       : problem !== null
         ? (nameMessage(problem) ?? '')
-        : taken
-          ? `A target named ${state.name} exists.`
-          : NAME_HINT;
+        : unreadable !== undefined
+          ? `A target named ${state.name} exists but cannot be read: ${unreadable.error.message}`
+          : taken
+            ? `A target named ${state.name} exists.`
+            : NAME_HINT;
   const step2 = (
     <div className="wizard-details">
       <TextField
@@ -454,6 +479,14 @@ export function AddTargetWizard({ onClose }: { onClose: () => void }) {
         hint={nameHint}
         onChange={(value) => dispatch({ type: 'name', value })}
       />
+      {targets.isError && (
+        <>
+          <p className="wizard-notice" role="note">
+            {NAMES_UNREAD}
+          </p>
+          <ErrorPanel error={uiErrorOf(targets.error)} />
+        </>
+      )}
       <ChoiceCardGroup
         legend="Default tier"
         columns={4}
@@ -468,6 +501,11 @@ export function AddTargetWizard({ onClose }: { onClose: () => void }) {
         items={sshItems}
         onChange={chooseSsh}
       />
+      {candidates.data?.length === 0 && (
+        <p className="wizard-notice" role="note">
+          {NO_KEYS}
+        </p>
+      )}
       {candidates.isError && <ErrorPanel error={uiErrorOf(candidates.error)} />}
       {saveError !== null && <ErrorPanel error={saveError} />}
     </div>
@@ -500,7 +538,11 @@ export function AddTargetWizard({ onClose }: { onClose: () => void }) {
                 ? 'Enter the token again'
                 : 'Save target',
             disabled: state.draft !== null && args === null,
-            hint: 'Name: letters, digits and dashes',
+            // What Save waits for, when it is not the name.
+            hint:
+              state.draft !== null && problem === null && !taken && sshKey === undefined
+                ? 'SSH key: choose one, give a path to one, or Skip.'
+                : 'Name: letters, digits and dashes',
             go: () => {
               if (state.draft === null) enterTokenAgain();
               else void save();
