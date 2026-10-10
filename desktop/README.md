@@ -14,8 +14,27 @@ What works today:
   use. It unlocks only after the operating system's own sign-in confirms that you are the
   person signed in to this computer.
 - If nothing on the computer can confirm you, the lock stays off and a banner says so.
+- The Targets page: the target store the CLI uses, every target with its provider, region,
+  server type and tier, the CLI default marked, and targets whose files cannot be read shown
+  with the reason. Each target opens in its own tab, and **Make default for the CLI** makes it
+  the CLI default.
+- The Target screen: what `apprafter target show` prints for the tab's target, and these
+  changes to it:
+  - Rename it. Its config, credentials and local state move to the new name, and the tab
+    follows.
+  - Renew its API token. The app checks the new token with the provider before it saves it.
+  - Change its SSH key, picked from the public keys in `~/.ssh` or given as a path. Only the key
+    changes: the app does not ask for the API token and leaves it as it is.
+  - Make it the CLI default.
+  - Remove it from this computer. You type the target's name, then the operating system
+    confirms that it is you. Nothing changes at the provider: a server keeps running. Where
+    nothing on the computer can confirm you, the app cannot remove a target;
+    `apprafter target remove <name>` in a terminal still can.
 
-The cluster screens are not connected yet, so the app lists no targets.
+  The Machine row shows the server type the target is set to. For a target with a server it
+  also names the server and gives the CLI commands that move it to another machine.
+
+The cluster screens are not connected yet.
 
 ## Get the source
 
@@ -387,6 +406,28 @@ The app unlocks with Windows Hello, or with your Windows password when Hello is 
 dialog stands in. CI tests the app on Windows and builds it there in Git Bash, as a debug
 build (`bun run tauri build --debug --no-bundle`) that it does not start. It builds no
 installer for Windows yet.
+
+## Trying it without your own targets
+
+Point the app at a scratch target store and data directory. A new store is empty, so add a
+target to it with the CLI first:
+
+```sh
+export APPRAFTER_CONFIG_DIR=$(mktemp -d)
+apprafter target add lab --provider hetzner-cloud --region nbg1 --tier solo \
+  --token <token> --no-ping --no-interactive
+APPRAFTER_DESKTOP_DATA_DIR=$(mktemp -d) just desktop-dev
+```
+
+`APPRAFTER_CONFIG_DIR` is the target store, for the CLI and the app alike;
+`APPRAFTER_DESKTOP_DATA_DIR` holds the app's own settings and logs. With `--no-ping` the CLI
+stores the token without checking it with the provider. A `HCLOUD_TOKEN` exported for the CLI
+has no effect on the app: [Files and logs](#files-and-logs) lists what the app reads from its
+environment.
+
+To see the interface in a browser with made-up targets (`prod-eu`, `staging`, `lab`, and
+`broken`, whose files cannot be read) and no Rust build, use the browser preview under
+[Development and tests](#development-and-tests).
 
 ## Sign-in messages
 
