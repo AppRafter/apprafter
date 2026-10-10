@@ -5,7 +5,7 @@
 // PlanConfirm first. A provisioned target never gets here (D.3d's Machine row offers the rebuild
 // recipe instead); if one was provisioned meanwhile, the core's refusal is shown as it is.
 import { useQueryClient } from '@tanstack/react-query';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Button } from '../../components/Button';
 import { ErrorPanel } from '../../components/ErrorPanel';
 import { HardDrivesIcon, SpinnerGapIcon } from '../../components/icons';
@@ -64,6 +64,14 @@ export function ChangeMachineDialog({ target, now, onClose }: ChangeMachineDialo
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<UiError | null>(null);
   const [confirm, setConfirm] = useState<PlanView | null>(null);
+  // Whether the dialog is still there to show the end (a lock or a closed tab takes it).
+  const alive = useRef(true);
+  useEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
+    };
+  }, []);
 
   // The target's catalogue, read when the dialog opens and again after Try again (reset → idle).
   const idle = catalogueRead.state.status === 'idle';
@@ -118,8 +126,14 @@ export function ChangeMachineDialog({ target, now, onClose }: ChangeMachineDialo
         setConfirm(plan); // its dialog first
         return;
       }
-      done(await runPlan<MachineSet>(plan.opId)); // Bounded: the Apply click was its plain confirm
+      // Bounded: the Apply click was its plain confirm.
+      const set = await runPlan<MachineSet>(plan.opId, undefined, {
+        title: plan.title,
+        shown: () => alive.current,
+      });
+      if (alive.current) done(set);
     } catch (reason) {
+      if (!alive.current) return;
       setSaving(false);
       setError(failureOf(reason)); // a refused plan (IpcError) or a failed run (OperationFailed)
     }

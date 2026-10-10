@@ -2,9 +2,10 @@
 import { afterEach, beforeEach, expect, mock, spyOn, test } from 'bun:test';
 import { QueryClientProvider } from '@tanstack/react-query';
 import { clearMocks } from '@tauri-apps/api/mocks';
-import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { ToastProvider, ToastViewport } from '../../components/Toast';
+import { endedAwaySnapshot, resetEndedAway } from '../../ipc/away';
 import { resetOperations } from '../../ipc/operations';
 import { ViewFrame } from '../../shell/ViewFrame';
 import { PlatformContext } from '../../state/platform';
@@ -30,6 +31,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   resetOperations();
+  resetEndedAway();
   clearMocks();
 });
 
@@ -37,7 +39,7 @@ function renderChange(target: string, now: MachineNow, strict = false) {
   const onClose = mock();
   const client = createQueryClient();
   const invalidated = spyOn(client, 'invalidateQueries');
-  render(
+  const view = render(
     <QueryClientProvider client={client}>
       <PlatformContext value={appInfo()}>
         <ToastProvider>
@@ -50,7 +52,7 @@ function renderChange(target: string, now: MachineNow, strict = false) {
     </QueryClientProvider>,
     { reactStrictMode: strict },
   );
-  return { user: userEvent.setup(), onClose, invalidated };
+  return { user: userEvent.setup(), onClose, invalidated, unmount: view.unmount };
 }
 const radio = (name: string) => screen.getByRole('radio', { name }) as HTMLInputElement;
 const apply = () => screen.getByRole('button', { name: 'Apply machine' }) as HTMLButtonElement;
@@ -201,6 +203,36 @@ test('a latency read that fails says why, with Try again', async () => {
   h.operation(79, [completed([{ region: 'nbg1', latencyMs: 38 }])]);
   await user.click(screen.getByRole('button', { name: 'Try again' }));
   expect(await screen.findByText('38 ms')).toBeDefined();
+});
+
+test('a change that ends after the dialog went keeps its end for the app', async () => {
+  let channel: { id: number } | null = null;
+  h.plan('op_plan_target_machine', planParts({ title: 'Set the machine of staging' }), []);
+  h.answer('op_execute', ({ onEvent }: Record<string, unknown>) => {
+    channel = onEvent as { id: number };
+    return 2;
+  });
+  const { user, unmount } = renderChange('staging', STAGING);
+  await waitFor(() => expect(radio('cx22').checked).toBe(true));
+  await user.click(radio('cpx22'));
+  await user.click(apply());
+  await waitFor(() => expect(channel).not.toBeNull());
+  unmount();
+  const internals = (
+    window as unknown as { __TAURI_INTERNALS__: { runCallback(id: number, data: unknown): void } }
+  ).__TAURI_INTERNALS__;
+  act(() => {
+    internals.runCallback(channel?.id ?? -1, { index: 0, message: completed(machineSet()) });
+  });
+  await waitFor(() =>
+    expect(endedAwaySnapshot()).toEqual([
+      {
+        opId: h.started('op_plan_target_machine')[0] ?? -1,
+        text: 'Set the machine of staging: done.',
+        failed: false,
+      },
+    ]),
+  );
 });
 
 test("a Destructive plan opens D.3d's PlanConfirm first (guard)", async () => {

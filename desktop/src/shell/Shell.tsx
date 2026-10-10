@@ -20,6 +20,7 @@ import { useSettings } from '../state/settings';
 import { shortcutFor } from '../state/shortcuts';
 import { TabContext } from '../state/tab';
 import { ClusterMeta } from './ClusterMeta';
+import { EndedAwayNotices } from './EndedAway';
 import { ScreenShown } from './reveal';
 import { SettingsDialog } from './SettingsDialog';
 import { Sidebar } from './Sidebar';
@@ -163,6 +164,7 @@ export function Shell() {
           </ViewFrame>
         </Activity>
         {settingsOpen && <SettingsDialog onClose={() => setSettingsOpen(false)} />}
+        <EndedAwayNotices />
         <ToastViewport />
       </div>
       <ScreenShown />

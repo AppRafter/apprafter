@@ -118,6 +118,15 @@ export function AddTargetWizard({ onClose }: { onClose: () => void }) {
   // Rust (the discard is then refused as locked, which is expected).
   const draft = useRef<DraftId | null>(null);
   draft.current = state.draft;
+  // Whether the wizard is still there to show a save's end: a lock or a closed tab unmounts it
+  // while Rust runs the plan on, and the end then shows at the app level (ipc/away.ts).
+  const alive = useRef(true);
+  useEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
+    };
+  }, []);
   useEffect(
     () => () => {
       if (draft.current !== null) discardDraft(draft.current);
@@ -265,8 +274,13 @@ export function AddTargetWizard({ onClose }: { onClose: () => void }) {
   const runPlanned = async (plan: PlanView) => {
     setSaving(true);
     try {
-      finishAdded(await runPlan<TargetAdded>(plan.opId));
+      const added = await runPlan<TargetAdded>(plan.opId, undefined, {
+        title: plan.title,
+        shown: () => alive.current,
+      });
+      if (alive.current) finishAdded(added);
     } catch (reason) {
+      if (!alive.current) return;
       setSaving(false);
       setSaveError(isCancelled(reason) ? plainError(SAVE_CANCELLED) : failureOf(reason));
     }

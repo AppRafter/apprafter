@@ -3,8 +3,11 @@
 // reach whoever follows the op (the operations sheet, a dialog), and the caller awaits the end.
 // A cancelled end is one thing however the core said it (an `Ok(Outcome::Cancelled)` or an
 // `Err(Cancelled)`, which Rust ends alike): OperationFailed with `OP_CANCELLED`. A follow Rust
-// refuses ends the wait with that refusal, so no caller waits forever.
+// refuses ends the wait with that refusal, so no caller waits forever. A confirmed plan's end
+// that arrives when the screen that ran it is gone (a lock, a closed tab) is kept for the app
+// (ipc/away.ts) instead of being discarded unseen.
 import { IpcError, uiErrorOf } from './api';
+import { keepEndedAway } from './away';
 import { CORE_ERROR_CODES } from './generated/core-errors';
 import { DESKTOP_ERROR_CODES } from './generated/errors';
 import type { OpId } from './generated/OpId';
@@ -69,6 +72,22 @@ export function resultOf(end: OpEnd): JsonValue {
   return end.outcome.result;
 }
 
+/** The screen that shows a plan's end, and what the end is about when it shows elsewhere. */
+export interface PlanOwner {
+  /** The plan's title ("Add target lab"). */
+  readonly title: string;
+  /** Whether the screen is still there to show the end. */
+  readonly shown: () => boolean;
+}
+
+/** An end in a line, for when it shows away from its screen. */
+function awayText(title: string, end: OpEnd): { text: string; failed: boolean } {
+  if (end.state === 'failed')
+    return { text: `${title} failed: ${end.error.message}`, failed: true };
+  if (end.outcome.status !== 'completed') return { text: `${title} was cancelled.`, failed: true };
+  return { text: `${title}: done.`, failed: false };
+}
+
 export interface Started {
   /** The operation's end; the op is released and discarded once it is here. */
   readonly ended: Promise<OpEnd>;
@@ -78,12 +97,30 @@ export interface Started {
  * Run the confirmed plan; resolves once Rust started it. Rejects as op_execute does: some
  * refusals (a wrong password, a busy prompt) leave the plan waiting for another try.
  */
-export async function startPlan(opId: OpId, password?: string): Promise<Started> {
+export async function startPlan(
+  opId: OpId,
+  password?: string,
+  owner?: PlanOwner,
+): Promise<Started> {
   const release = await execute(opId, password);
-  const ended = endOf(opId).finally(() => {
-    release();
-    discard(opId).catch(reportDiscard(opId));
-  });
+  const gone = () => owner !== undefined && !owner.shown();
+  const ended = endOf(opId).then(
+    (end) => {
+      release();
+      // Its screen went: the end waits for the app to show it, and is discarded only then.
+      if (gone() && owner !== undefined) keepEndedAway({ opId, ...awayText(owner.title, end) });
+      else discard(opId).catch(reportDiscard(opId));
+      return end;
+    },
+    (reason: unknown) => {
+      release();
+      if (gone() && owner !== undefined) {
+        const text = `${owner.title} failed: ${uiErrorOf(reason).message}`;
+        keepEndedAway({ opId, text, failed: true });
+      } else discard(opId).catch(reportDiscard(opId));
+      throw reason;
+    },
+  );
   return { ended };
 }
 
@@ -110,8 +147,8 @@ export async function runRead<T>(
  * Run the confirmed plan to its end: its result, or OperationFailed (failed or cancelled). A
  * refused op_execute (a wrong password) rejects as startPlan does, the plan kept.
  */
-export async function runPlan<T>(opId: OpId, password?: string): Promise<T> {
-  return resultOf(await (await startPlan(opId, password)).ended) as T;
+export async function runPlan<T>(opId: OpId, password?: string, owner?: PlanOwner): Promise<T> {
+  return resultOf(await (await startPlan(opId, password, owner)).ended) as T;
 }
 
 /** Whether `reason` is the end of a cancelled operation (resultOf's CANCELLED). */

@@ -14,6 +14,7 @@ import {
   uiError,
 } from '../test/ipc';
 import { IpcError } from './api';
+import { endedAwaySnapshot, resetEndedAway } from './away';
 import { DESKTOP_ERROR_CODES } from './generated/errors';
 import { operationsSnapshot, resetOperations } from './operations';
 import {
@@ -31,6 +32,7 @@ beforeEach(() => {
 });
 afterEach(() => {
   resetOperations();
+  resetEndedAway();
   clearMocks();
 });
 
@@ -93,4 +95,36 @@ test('reportUnlessLocked stays quiet for the lock refusal only', () => {
   reportUnlessLocked('op_cancel 7')(new Error('boom'));
   expect(spy).toHaveBeenCalledTimes(1);
   spy.mockRestore();
+});
+
+test('a plan whose screen went keeps its end for the app: not discarded, kept with its words', async () => {
+  h.operation(14, [failed(uiError('apprafter::provider::sku_unavailable', 'cx22 is sold out'))]);
+  const error = await runPlan(14, undefined, {
+    title: 'Add target lab',
+    shown: () => false,
+  }).catch((e: unknown) => e);
+  expect(failureOf(error).message).toBe('cx22 is sold out');
+  expect(h.of('op_discard')).toHaveLength(0);
+  expect(endedAwaySnapshot()).toEqual([
+    { opId: 14, text: 'Add target lab failed: cx22 is sold out', failed: true },
+  ]);
+});
+
+test('a plan whose screen is still there is discarded and kept nowhere', async () => {
+  h.operation(15, [completed({ name: 'lab' })]);
+  await runPlan(15, undefined, { title: 'Add target lab', shown: () => true });
+  expect(h.of('op_discard').map((c) => c.args)).toEqual([{ opId: 15 }]);
+  expect(endedAwaySnapshot()).toEqual([]);
+});
+
+test('an end kept for the app says what happened: done, or cancelled', async () => {
+  h.operation(16, [completed({ name: 'lab' })]);
+  h.operation(17, [cancelled()]);
+  const gone = { title: 'Rename prod', shown: () => false };
+  await runPlan(16, undefined, gone);
+  await runPlan(17, undefined, gone).catch(() => {});
+  expect(endedAwaySnapshot()).toEqual([
+    { opId: 16, text: 'Rename prod: done.', failed: false },
+    { opId: 17, text: 'Rename prod was cancelled.', failed: true },
+  ]);
 });

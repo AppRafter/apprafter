@@ -6,8 +6,10 @@
 // hands over the result or the failure (a cancelled run is a failure with OP_CANCELLED). Closed
 // before it ran, it discards the plan in Rust, and with it whatever the plan holds (a renew
 // plan's token); a plan its tab held (heldPlans) is released either way, so the tab's closing
-// does not discard it again.
-import { type ReactNode, useRef } from 'react';
+// does not discard it again. Gone while its plan runs (a lock, a closed tab: Rust runs a confirmed
+// plan on), it leaves the end to the app, which shows it and only then discards it (ipc/away.ts):
+// held covers a plan not yet started, away one that started, so no plan is discarded twice.
+import { type ReactNode, useEffect, useRef } from 'react';
 import * as api from '../ipc/api';
 import type { AuthInfo } from '../ipc/generated/AuthInfo';
 import type { PlanView } from '../ipc/generated/PlanView';
@@ -48,6 +50,13 @@ export function PlanConfirm({
   onClose,
 }: PlanConfirmProps) {
   const started = useRef(false);
+  const alive = useRef(true);
+  useEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
+    };
+  }, []);
   const planClass = view.class;
   if (planClass === 'reversible') {
     throw new Error(`plan ${view.opId} is reversible: run it without a confirm`);
@@ -56,10 +65,14 @@ export function PlanConfirm({
   const changes = <PlanChanges changes={view.changes} />;
 
   const confirm = async (password?: string) => {
-    const run = await startPlan(view.opId, password);
+    const run = await startPlan(view.opId, password, {
+      title: view.title,
+      shown: () => alive.current,
+    });
     started.current = true;
     releasePlan(view.opId);
     const end = await run.ended;
+    if (!alive.current) return;
     let result: JsonValue;
     try {
       result = resultOf(end);

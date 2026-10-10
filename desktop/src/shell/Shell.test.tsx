@@ -6,6 +6,7 @@ import { act, cleanup, render, screen, waitFor, within } from '@testing-library/
 import userEvent from '@testing-library/user-event';
 import { ToastProvider } from '../components/Toast';
 import * as api from '../ipc/api';
+import { keepEndedAway, resetEndedAway } from '../ipc/away';
 import type { AppInfo } from '../ipc/generated/AppInfo';
 import type { OpSummary } from '../ipc/generated/OpSummary';
 import type { PlanView } from '../ipc/generated/PlanView';
@@ -89,6 +90,7 @@ afterEach(async () => {
   cleanup();
   await new Promise((resolve) => setTimeout(resolve, 0));
   resetOperations();
+  resetEndedAway();
   clearMocks();
 });
 
@@ -109,6 +111,13 @@ const tab = (name: string | RegExp) => screen.getByRole('tab', { name });
 const pageTitle = () => screen.getByRole('heading', { level: 1 }).textContent;
 
 describe('Shell', () => {
+  test('the end of a plan whose screen went shows in the shell, and its operation goes', async () => {
+    keepEndedAway({ opId: 41, text: 'Add target lab failed: cx22 is sold out', failed: true });
+    shell();
+    expect(await screen.findByText('Add target lab failed: cx22 is sold out')).toBeDefined();
+    expect(calls).toContain('op_discard');
+  });
+
   test('Settings opens from the sidebar footer and with Ctrl+,', async () => {
     const user = shell();
     await user.click(screen.getByRole('button', { name: 'Settings Ctrl+,' }));

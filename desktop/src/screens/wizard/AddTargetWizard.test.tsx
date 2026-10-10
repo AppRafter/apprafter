@@ -2,9 +2,10 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
 import { QueryClientProvider } from '@tanstack/react-query';
 import { clearMocks } from '@tauri-apps/api/mocks';
-import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { ToastProvider, ToastViewport } from '../../components/Toast';
+import { endedAwaySnapshot, resetEndedAway } from '../../ipc/away';
 import { DESKTOP_ERROR_CODES } from '../../ipc/generated/errors';
 import type { OpEvent } from '../../ipc/generated/OpEvent';
 import { resetOperations } from '../../ipc/operations';
@@ -32,6 +33,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   resetOperations();
+  resetEndedAway();
   clearMocks();
 });
 
@@ -465,6 +467,43 @@ describe('details and save', () => {
     expect(h.of('op_plan_target_add')).toHaveLength(0);
     expect(h.of('op_execute')).toHaveLength(0);
     expect(saveButton().disabled).toBe(false);
+  });
+
+  test('a save that ends after the wizard went keeps its end for the app, not discarded', async () => {
+    let channel: { id: number } | null = null;
+    h.plan('op_plan_target_add', planParts({ title: 'Add target lab-2' }), []);
+    h.answer('op_execute', ({ onEvent }: Record<string, unknown>) => {
+      channel = onEvent as { id: number };
+      return 2;
+    });
+    const { user, unmount } = renderWizard();
+    await toDetails(user);
+    await user.type(screen.getByLabelText('Target name'), 'lab-2');
+    await user.click(saveButton());
+    await waitFor(() => expect(channel).not.toBeNull());
+    unmount();
+    const internals = (
+      window as unknown as { __TAURI_INTERNALS__: { runCallback(id: number, data: unknown): void } }
+    ).__TAURI_INTERNALS__;
+    act(() => {
+      internals.runCallback(channel?.id ?? -1, {
+        index: 0,
+        message: failed(uiError('apprafter::provider::sku_unavailable', 'cx22 is sold out')),
+      });
+    });
+    await waitFor(() =>
+      expect(endedAwaySnapshot()).toEqual([
+        {
+          opId: h.started('op_plan_target_add')[0] ?? -1,
+          text: 'Add target lab-2 failed: cx22 is sold out',
+          failed: true,
+        },
+      ]),
+    );
+    // The reads it ran are discarded as they end; the plan's operation waits to be shown.
+    expect(h.of('op_discard').map((c) => c.args.opId)).not.toContain(
+      h.started('op_plan_target_add')[0],
+    );
   });
 
   test('name rules inline, a taken name inline (target_list), Save disabled meanwhile', async () => {
