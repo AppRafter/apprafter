@@ -66,19 +66,19 @@ the diagnostic body usually points at the offending expression.
 
 ### `apprafter::provider::hetzner_api_error`
 
-The Hetzner Cloud API returned a non-2xx response.
+The Hetzner Cloud API refused the request.
 
-**Fix.** Read the inner help — it enumerates the four most common
-failure families:
+**Fix.** Read the inner help. It lists what each status means:
 
-- **401 unauthorized** — the stored token was rotated or revoked.
-  Run `apprafter target add <name> --renew --token <new>` to
-  refresh it.
-- **403 forbidden** — the token's project lacks permission for
-  this resource type.
-- **429 rate limit** — back off and retry; if persistent, the
-  project may need a quota increase.
-- **5xx** — provider-side outage. Check
+- **401 unauthorized** — the token is wrong, or it was revoked or
+  rotated. For a target's stored token,
+  `apprafter target add <name> --renew --token <new>` replaces it.
+  An `HCLOUD_TOKEN` in the environment outranks the stored token.
+- **403 forbidden** — the token lacks Read & Write (it is
+  Read-only), or the project forbids the call, for example at one
+  of its limits.
+- **429 rate limit** — too many requests: wait, then try again.
+- **5xx** — an outage at the provider. Check
   https://status.hetzner.com/.
 
 After fixing the root cause, run `apprafter doctor` to confirm
@@ -183,18 +183,25 @@ apprafter import --target <target>
 
 ### `apprafter::target::invalid_config`
 
-A YAML file under `$XDG_CONFIG_HOME/apprafter/` failed to parse.
-Either hand-edited or written by an incompatible CLI version. For a
-target's `credentials.yaml` the message gives only the line and column
-where parsing stopped, never the file's text, because that text is the
-API token.
+A YAML file in the target store (`$XDG_CONFIG_HOME/apprafter/`, or
+`APPRAFTER_CONFIG_DIR`) failed to parse: it was edited by hand or
+written by an incompatible CLI version. The message and the help name
+the file. For a target's `credentials.yaml` the message gives only the
+line and column where parsing stopped, never the file's text, because
+that text is the API token.
 
-**Fix.** Either fix the YAML by hand (these files are small), or
-nuke just the offending target's directory under
-`$XDG_CONFIG_HOME/apprafter/targets/<name>/` and re-create with
-`apprafter target add <name> --provider hetzner-cloud …`. The
-global `config.yaml` is the only file shared across targets;
-treat it as the last line of defence.
+**Fix.** Fix the file by hand (these files are small), or restore it
+from a backup. Otherwise, it depends on whose file it is:
+
+- **A target's `config.yaml` or `credentials.yaml`**: delete that
+  target's directory (`targets/<name>/`, named in the help) and add
+  the target again with
+  `apprafter target add <name> --provider hetzner-cloud …`, its token
+  included. `apprafter target remove` refuses a target it cannot read.
+- **The store's own `config.yaml`**: no target's removal or re-add
+  repairs it. It records only which target is the default, so you can
+  delete it and choose the default again with
+  `apprafter target use <name>`.
 
 ### `apprafter::target::no_active`
 
@@ -219,23 +226,25 @@ nothing, you're seeing the empty-store first-run case.
 
 ### `apprafter::target::token_rejected`
 
-The provider's read-only credential check returned 401 /
+The provider's read-only credential check returned 401
 unauthorized. **Distinct from** the generic Hetzner API error —
 this fires only on the explicit `target add` ping path, so the
 help text targets the rotation flow specifically.
 
-**Fix.** Read the layered help:
+The token was mistyped, or it was revoked or rotated, or its
+project was deleted. Its permissions are not the cause: the check
+only reads, so a Read-only token passes it. A token with stray
+whitespace never reaches the check either; the format check
+refuses it first (`apprafter::target::invalid_token`).
 
-- Verify the token at https://console.hetzner.cloud/projects →
-  Security → API Tokens. It must say `Read & Write` next to
-  the project.
-- Copy the token again — the most common cause is a trailing
-  newline from a clipboard manager (Hetzner tokens are 64
-  ASCII chars, no prefix).
+**Fix.**
+
+- The Hetzner Cloud Console shows a token only once, when it is
+  created: paste it again from where you saved it, or create a new
+  one in the project under Security → API tokens (AppRafter needs
+  Read & Write).
 - If you're rotating, use `apprafter target add <name> --renew
   --token <new>` instead of re-creating the target.
-- For offline / CI seeding, pass `--no-ping` to skip the
-  network round-trip and save the target anyway.
 
 ### `apprafter::target::provider_unreachable`
 
@@ -594,19 +603,18 @@ Error: apprafter::target::token_rejected
 
         × hetzner-cloud GET /v1/locations failed (status 401):
         │ unauthorized: the token you have provided is invalid
-        help: The Hetzner Cloud API returned a non-2xx response. …
+        help: The Hetzner Cloud API refused the request:
               • 401 unauthorized — …
               • 403 forbidden — …
               • 429 rate limit — …
               • 5xx — …
 
-  help: The provider's read-only credential check returned 401 /
-        unauthorized. …
-        • Verify the token at https://console.hetzner.cloud/projects → …
-        • Copy the token again …
+  help: The provider's read-only credential check returned 401
+        unauthorized: the token was mistyped, or it was revoked or
+        rotated, or its project was deleted.
+        • The Hetzner Cloud Console shows a token only once, …
         • If you're rotating, run `apprafter target add <name>
         --renew --token <new>` …
-        • Pass `--no-ping` to skip the check …
 ```
 
 The OUTER `Error:` line names the operator-facing scenario. The

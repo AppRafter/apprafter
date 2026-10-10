@@ -973,6 +973,27 @@ fn target_show_with_credentials_that_hold_only_the_token() {
     sb.golden_steps("target/show_credentials_bare_token", steps);
 }
 
+/// D.3d follow-up: the store's own `config.yaml` belongs to no target, so no removal or re-add
+/// repairs it. The help names it, says to fix it by hand or restore it, and that deleting it and
+/// choosing the default again (`target use`, which then writes it) works too.
+#[test]
+fn target_list_and_use_with_an_unreadable_store_config() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.seed_store_file("config.yaml", "active_target: [prod\n");
+    sb.golden_steps(
+        "target/list_store_config_unreadable",
+        &[&["target", "list"], &["target", "use", "prod"]],
+    );
+    // What the help says works: with the file deleted, `target use` writes it again.
+    sb.clear_pointer();
+    sb.cmd(&["target", "use", "prod"]).assert().success();
+    assert_eq!(
+        fs::read_to_string(sb.path("apprafter-config/config.yaml")).unwrap(),
+        "active_target: prod\nversion: 1\n"
+    );
+}
+
 #[test]
 fn target_show_with_a_dangling_pointer() {
     dangling_pointer_sandbox().golden("target/show_dangling", &["target", "show"]);

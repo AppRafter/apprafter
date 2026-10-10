@@ -562,6 +562,7 @@ pub fn load_global_config(paths: &TargetStorePaths) -> Result<Option<GlobalConfi
         serde_yaml::from_slice(&bytes).map_err(|err| CliError::InvalidTargetConfig {
             path: path.clone(),
             message: err.to_string(),
+            target: None,
         })?;
     Ok(Some(cfg))
 }
@@ -637,6 +638,7 @@ pub fn load_target_config(paths: &TargetStorePaths, name: &str) -> Result<Target
     serde_yaml::from_slice(&cfg_bytes).map_err(|err| CliError::InvalidTargetConfig {
         path: cfg_path.clone(),
         message: err.to_string(),
+        target: Some(name.to_string()),
     })
 }
 
@@ -654,6 +656,7 @@ pub fn load_target(paths: &TargetStorePaths, name: &str) -> Result<Target> {
             CliError::InvalidTargetConfig {
                 path: creds_path.clone(),
                 message: credentials_parse_message(&err),
+                target: Some(name.to_string()),
             }
         })?
     } else {
@@ -937,8 +940,13 @@ mod tests {
             let shown = err.to_string();
             assert!(!shown.contains(&token), "the token is quoted: {shown}");
             match err {
-                CliError::InvalidTargetConfig { path, message } => {
+                CliError::InvalidTargetConfig {
+                    path,
+                    message,
+                    target,
+                } => {
                     assert_eq!(path, creds);
+                    assert_eq!(target.as_deref(), Some("prod"), "the file's target");
                     assert_eq!(
                         message,
                         format!(
@@ -1019,10 +1027,32 @@ mod tests {
         fs::write(paths.global_config_file(), b"not: valid: yaml: : :").unwrap();
         let err = load_global_config(&paths).expect_err("corrupt yaml must error");
         match err {
-            CliError::InvalidTargetConfig { path, .. } => {
+            CliError::InvalidTargetConfig { path, target, .. } => {
                 assert_eq!(path, paths.global_config_file());
+                assert_eq!(target, None, "the store's own file belongs to no target");
             }
             other => panic!("expected InvalidTargetConfig, got {other:?}"),
+        }
+    }
+
+    /// A target's own `config.yaml` that does not parse names its target, so the help can offer
+    /// re-adding that target (the store's `config.yaml` names none).
+    #[test]
+    fn a_corrupt_target_config_names_its_target() {
+        let (_dir, paths) = make_paths();
+        fs::create_dir_all(paths.target_dir("prod")).unwrap();
+        fs::write(paths.target_config_file("prod"), b"not: valid: yaml: : :").unwrap();
+        for err in [
+            load_target_config(&paths, "prod").unwrap_err(),
+            load_target(&paths, "prod").unwrap_err(),
+        ] {
+            match err {
+                CliError::InvalidTargetConfig { path, target, .. } => {
+                    assert_eq!(path, paths.target_config_file("prod"));
+                    assert_eq!(target.as_deref(), Some("prod"));
+                }
+                other => panic!("expected InvalidTargetConfig, got {other:?}"),
+            }
         }
     }
 

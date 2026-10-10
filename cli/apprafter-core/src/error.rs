@@ -766,6 +766,7 @@ pub mod samples {
             C::InvalidTargetConfig {
                 path: "/s/targets/prod/config.yaml".into(),
                 message: s("m"),
+                target: Some(s("prod")),
             },
             C::TargetNotFound {
                 name: s("ghost"),
@@ -970,6 +971,7 @@ mod tests {
         let config = UiError::from(&CoreError::from(cli_core::CliError::InvalidTargetConfig {
             path: "/s/targets/prod/config.yaml".into(),
             message: "m".into(),
+            target: Some("prod".into()),
         }));
         assert_eq!(config.fields["path"], json!("/s/targets/prod/config.yaml"));
         assert_eq!(
@@ -1395,6 +1397,7 @@ mod tests {
         let ui = UiError::from(&CoreError::Cli(cli_core::CliError::InvalidTargetConfig {
             path: "/s/targets/prod/credentials.yaml".into(),
             message: "not a valid target credentials map (line 1, column 1)".into(),
+            target: Some("prod".into()),
         }));
         let help = ui.help.unwrap();
         assert!(help.contains("/s/targets/prod/credentials.yaml"), "{help}");

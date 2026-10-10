@@ -22,7 +22,7 @@
 //! variant with its own code + help text.
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use miette::Diagnostic;
 use thiserror::Error;
@@ -143,6 +143,33 @@ fn server_type_help(
         ),
     };
     format!("{why}\n{what}")
+}
+
+/// `InvalidTargetConfig`'s help: the file, and the fixes that repair it. A target's own file
+/// (`target`) can also be re-created by adding the target again, its directory deleted first
+/// (`target remove` refuses a target it cannot read); the store's own `config.yaml` belongs to no
+/// target, so no removal or re-add repairs it — it records only the default target, which
+/// `target use` writes again once it is deleted (D.3d follow-up).
+fn invalid_config_help(path: &Path, target: Option<&str>) -> String {
+    let file = path.display();
+    let why = "it was edited by hand or written by an incompatible CLI version. Fix it by hand \
+               (it is a small YAML file), or restore it from a backup.";
+    match target {
+        Some(name) => {
+            let dir = path.parent().unwrap_or(path).display();
+            format!(
+                "{file} could not be read as target `{name}`'s configuration: {why} Otherwise \
+                 delete the target's directory, {dir}, and add the target again with \
+                 `apprafter target add {name} --provider hetzner-cloud …` (its token too: the \
+                 directory holds both its files)."
+            )
+        }
+        None => format!(
+            "{file} could not be read as the target store's configuration: {why} It records \
+             only which target is the default, so deleting it and choosing the default again \
+             with `apprafter target use <name>` works too."
+        ),
+    }
 }
 
 #[derive(Debug, Error, Diagnostic)]
@@ -299,14 +326,18 @@ pub enum CliError {
     #[error("hetzner-cloud {endpoint} failed (status {status}): {code}: {message}")]
     #[diagnostic(
         code(apprafter::provider::hetzner_api_error),
+        // Each status with only what can cause it (D.3d follow-up). The token of a 401 need not
+        // be a stored one: `target add` pings with the one it was given, and an `HCLOUD_TOKEN`
+        // outranks the stored token.
         help(
-            "The Hetzner Cloud API returned a non-2xx response. Common causes:\n\
-             • 401 unauthorized — the stored API token was rotated or revoked. \
-               Run `apprafter target add <name> --renew --token <new>` to refresh it.\n\
-             • 403 forbidden — the token's project lacks permission for this resource type.\n\
-             • 429 rate limit — back off and retry; if persistent, the project may need a quota \
-               increase.\n\
-             • 5xx — provider-side outage; check https://status.hetzner.com/.\n\
+            "The Hetzner Cloud API refused the request:\n\
+             • 401 unauthorized — the token is wrong, or it was revoked or rotated. For a \
+               target's stored token, `apprafter target add <name> --renew --token <new>` \
+               replaces it; an `HCLOUD_TOKEN` in the environment outranks the stored token.\n\
+             • 403 forbidden — the token lacks Read & Write (it is Read-only), or the project \
+               forbids the call, for example at one of its limits.\n\
+             • 429 rate limit — too many requests: wait, then try again.\n\
+             • 5xx — an outage at the provider; check https://status.hetzner.com/.\n\
              Re-run `apprafter doctor` to confirm reachability after fixing the root cause."
         )
     )]
@@ -371,21 +402,20 @@ pub enum CliError {
 
     /// Target config / credentials / global-config file present but
     /// unparseable. Distinct from `InvalidState` so error messages
-    /// can point users at `apprafter target add <name> --renew`
-    /// instead of `apprafter init`.
+    /// can point users at the target store instead of `apprafter init`.
+    /// The help depends on whose file it is ([`invalid_config_help`]).
     #[error("target config at {path}: {message}")]
     #[diagnostic(
         code(apprafter::target::invalid_config),
-        help(
-            "The target store YAML at the path above failed to parse. The file was either \
-             hand-edited or written by an incompatible CLI version. To fix:\n\
-             • If the target is recoverable, fix the YAML by hand (it's a small file).\n\
-             • If not, remove just this target's directory under \
-               `$XDG_CONFIG_HOME/apprafter/targets/<name>/` and re-create it with \
-               `apprafter target add <name> --provider hetzner-cloud …`."
-        )
+        help("{}", invalid_config_help(path, target.as_deref()))
     )]
-    InvalidTargetConfig { path: PathBuf, message: String },
+    InvalidTargetConfig {
+        path: PathBuf,
+        message: String,
+        /// The target the file belongs to (`targets/<name>/config.yaml` or `credentials.yaml`);
+        /// `None` for the store's own `config.yaml`, which no target's removal or re-add repairs.
+        target: Option<String>,
+    },
 
     /// A subcommand asked for target `name`, but the target store
     /// has no such target. `available` lists what *is* configured
@@ -436,18 +466,17 @@ pub enum CliError {
     #[error("provider `{provider}` rejected the supplied token")]
     #[diagnostic(
         code(apprafter::target::token_rejected),
+        // The check is a read (GET /v1/locations): a Read-only token passes it, and a token
+        // with a trailing newline never reaches it (the format check refuses that first). No
+        // `--no-ping`: it would save the token the provider just refused (D.3d follow-up).
         help(
-            "The provider's read-only credential check returned 401 / unauthorized. Either the \
-             token was mistyped, never had the right scopes, or has been rotated / revoked \
-             since you copied it.\n\
-             • Verify the token at https://console.hetzner.cloud/projects → Security → API \
-               Tokens. It must say `Read & Write` next to the project.\n\
-             • Copy the token again (it's 64 ASCII chars, no prefix) — common cause: trailing \
-               newline from a clipboard manager.\n\
+            "The provider's read-only credential check returned 401 unauthorized: the token \
+             was mistyped, or it was revoked or rotated, or its project was deleted.\n\
+             • The Hetzner Cloud Console shows a token only once, when it is created: paste it \
+               again from where you saved it, or create a new one in the project under \
+               Security → API tokens (AppRafter needs Read & Write).\n\
              • If you're rotating, run `apprafter target add <name> --renew --token <new>` \
-               instead of re-creating the target.\n\
-             • Pass `--no-ping` to skip the check if you're seeding a target offline (CI \
-               sandbox, intermittent network)."
+               instead of re-creating the target."
         )
     )]
     ProviderTokenRejected {
@@ -699,24 +728,59 @@ mod tests {
         );
     }
 
+    /// D.3d follow-up: a target's own file names the file, says to fix it by hand or restore
+    /// it, and — the directory holding only that target — offers its re-creation, by the
+    /// directory the file is in (an `APPRAFTER_CONFIG_DIR` store is not under
+    /// `$XDG_CONFIG_HOME`).
     #[test]
-    fn invalid_target_config_diagnostic_points_at_target_directory() {
+    fn an_unreadable_target_file_names_it_and_offers_re_adding_that_target() {
+        let dir = PathBuf::from("/s/targets/prod");
+        for file in ["config.yaml", "credentials.yaml"] {
+            let err = CliError::InvalidTargetConfig {
+                path: dir.join(file),
+                message: "missing field `provider`".into(),
+                target: Some("prod".into()),
+            };
+            assert_eq!(code_of(&err), "apprafter::target::invalid_config");
+            let help = help_of(&err);
+            assert!(
+                help.contains(&dir.join(file).display().to_string()),
+                "{help}"
+            );
+            assert!(
+                help.contains("by hand") && help.contains("restore"),
+                "{help}"
+            );
+            assert!(help.contains(&dir.display().to_string()), "{help}");
+            assert!(
+                help.contains("`apprafter target add prod --provider hetzner-cloud …`"),
+                "{help}"
+            );
+            assert!(!help.contains("$XDG_CONFIG_HOME"), "{help}");
+        }
+    }
+
+    /// D.3d follow-up: no removal or re-add repairs the store's own `config.yaml`. Its help
+    /// names it, says to fix it by hand or restore it, and — it holds only the default target —
+    /// that deleting it and choosing the default again does too.
+    #[test]
+    fn an_unreadable_store_config_is_fixed_by_hand_restored_or_chosen_again() {
         let err = CliError::InvalidTargetConfig {
-            path: PathBuf::from("/tmp/cfg.yaml"),
-            message: "missing field `provider`".into(),
+            path: PathBuf::from("/s/config.yaml"),
+            message: "missing field `version`".into(),
+            target: None,
         };
         assert_eq!(code_of(&err), "apprafter::target::invalid_config");
         let help = help_of(&err);
-        // Help should walk the operator through a recoverable path
-        // without nuking the entire target store.
+        assert!(help.contains("/s/config.yaml"), "{help}");
         assert!(
-            help.contains("$XDG_CONFIG_HOME/apprafter/targets/"),
-            "missing per-target path hint: {help}"
+            help.contains("by hand") && help.contains("restore"),
+            "{help}"
         );
-        assert!(
-            help.contains("apprafter target add"),
-            "missing recreate hint: {help}"
-        );
+        assert!(help.contains("`apprafter target use <name>`"), "{help}");
+        for not_this in ["target add", "targets/", "remove"] {
+            assert!(!help.contains(not_this), "{not_this}: {help}");
+        }
     }
 
     /// Bug 8: `--force` now keeps the stored values, so it refuses an unreadable target (it
@@ -753,6 +817,22 @@ mod tests {
         ] {
             assert!(help.contains(token), "missing `{token}` in help: {help}");
         }
+        // D.3d follow-up: each status with only what can cause it. 401 is the token (wrong,
+        // revoked, rotated), whoever stored it; 403 is its permission or the project's; 429 is
+        // waiting, never a quota (a 403 matter).
+        let line = |status: &str| {
+            help.lines()
+                .find(|l| l.contains(status))
+                .unwrap_or_else(|| panic!("{status}: {help}"))
+                .to_string()
+        };
+        for why in ["wrong", "revoked", "rotated", "--renew --token"] {
+            assert!(line("401").contains(why), "{why}: {help}");
+        }
+        assert!(!line("401").contains("stored API token was"), "{help}");
+        assert!(line("403").contains("Read & Write"), "{help}");
+        assert!(line("429").contains("wait"), "{help}");
+        assert!(!help.contains("quota"), "{help}");
     }
 
     fn unavailable(kind: UnavailableKind, context: SkuCheckFor) -> CliError {
@@ -1017,10 +1097,23 @@ mod tests {
             help.contains("--renew --token"),
             "missing rotation hint: {help}"
         );
-        assert!(
-            help.contains("--no-ping"),
-            "missing offline-fallback hint: {help}"
-        );
+        // D.3d follow-up: the check is a read (GET /v1/locations) that a Read-only token
+        // passes, and the format check refuses a token with a trailing newline before it, so
+        // neither a token's scope nor a newline can be why it answered 401. The console shows
+        // a token only once, so "copy it again" is no step; `--no-ping` would save the token
+        // the provider just refused.
+        for why in [
+            "mistyped",
+            "revoked",
+            "rotated",
+            "only once",
+            "create a new one",
+        ] {
+            assert!(help.contains(why), "{why}: {help}");
+        }
+        for not_why in ["scope", "newline", "Copy the token again", "--no-ping"] {
+            assert!(!help.contains(not_why), "{not_why}: {help}");
+        }
         // The diagnostic source chain reaches the inner Hetzner
         // variant — miette walks this when rendering.
         let source = miette::Diagnostic::diagnostic_source(&err)
