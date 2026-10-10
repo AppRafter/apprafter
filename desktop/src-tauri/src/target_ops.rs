@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use apprafter_core::doctor::{self, DoctorArgs, DoctorTarget};
-use apprafter_core::machine::{self, CatalogueSource};
+use apprafter_core::machine::{self, CatalogueSource, RegionLatency};
 use apprafter_core::session::{self, WhoamiReport};
 use apprafter_core::ssh::{self, SshKeyCandidate, SshKeyInfo};
 use apprafter_core::target::{
@@ -231,12 +231,26 @@ pub fn start_machine_catalogue(
     }
 }
 
+/// The core's probes (`machine::region_latencies`): a read cancelled while they run ends
+/// cancelled, never completed with every latency null (D.3d review #1).
 pub fn start_region_latencies(shell: &Shell, regions: Vec<String>) -> Result<OpId, DesktopError> {
+    start_region_latencies_with(shell, regions, machine::region_latencies)
+}
+
+/// [`start_region_latencies`] over `latencies`, so a test can hold the read at the door of the
+/// core's probes until it has cancelled it.
+fn start_region_latencies_with(
+    shell: &Shell,
+    regions: Vec<String>,
+    latencies: impl FnOnce(&Context, &[String], &CancellationToken) -> CoreResult<Vec<RegionLatency>>
+        + Send
+        + 'static,
+) -> Result<OpId, DesktopError> {
     read(
         shell,
         "Region latency".into(),
         None,
-        move |ctx, _, cancel| machine::region_latencies(ctx, &regions, cancel),
+        move |ctx, _, cancel| latencies(ctx, &regions, cancel),
     )
 }
 
@@ -1233,6 +1247,46 @@ mod tests {
             s.shell.drafts.get(id),
             Err(DesktopError::DraftNotFound { .. })
         ));
+    }
+
+    /// D.3d review #1, at the desktop: a latency read the page cancels (`op_cancel`) ends
+    /// Cancelled, not Completed with every latency null. The read waits at the door of the
+    /// core's `region_latencies` until the token is tripped — held and tripped here
+    /// (ops::test_trips), so it is tripped before the probes run however the scheduler runs —
+    /// and the core's own probes and check then answer, with nothing sent anywhere.
+    #[test]
+    fn a_latency_read_cancelled_by_the_page_ends_cancelled_not_with_null_answers() {
+        let s = store(&[], None);
+        let (started_tx, started) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel::<()>();
+        let id = start_region_latencies_with(
+            &s.shell,
+            vec!["fsn1".into(), "nbg1".into()],
+            move |ctx, regions, cancel| {
+                started_tx.send(()).unwrap();
+                release_rx
+                    .recv_timeout(Duration::from_secs(30))
+                    .expect("released");
+                machine::region_latencies(ctx, regions, cancel)
+            },
+        )
+        .unwrap();
+        started
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the read started");
+        let ((), held) = crate::ops::test_trips::held(|| s.shell.ops.cancel(id).unwrap());
+        assert_eq!(held.len(), 1, "the read's token");
+        held.iter().for_each(CancellationToken::cancel);
+        release.send(()).unwrap();
+        assert_eq!(
+            ended(&s.shell, id),
+            OpEvent::Finished {
+                outcome: Outcome::Cancelled {
+                    cleaned: Vec::new(),
+                    left: Vec::new()
+                }
+            }
+        );
     }
 
     #[test]
