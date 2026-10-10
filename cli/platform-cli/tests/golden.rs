@@ -2137,10 +2137,15 @@ fn kubeconfig_with_the_age_key_lost() {
 }
 
 /// Without a terminal and without `--yes`, `--refresh` lists what a new key leaves unreadable
-/// and refuses: no key, no read of the node, no write.
+/// and refuses: no key, no read of the node, no write. The node is reachable — the address is
+/// mocked and the stand-in `ssh` answers — so a bypassed consent would read it, and both the
+/// address lookup and the `ssh` call are asserted absent on their own (review #4).
 #[test]
 fn kubeconfig_refresh_with_the_age_key_lost_needs_yes() {
-    let server = mockito::Server::new();
+    let mut server = mockito::Server::new();
+    let servers = json_route(&mut server, "/v1/servers", 200, SERVERS_42, TOKEN_A)
+        .expect(0)
+        .create();
     let (sb, _lost) = lost_key_sandbox(&server);
     let tools = stand_in_tools(&sb);
     let sb = sb.with_path(tools);
@@ -2149,9 +2154,155 @@ fn kubeconfig_refresh_with_the_age_key_lost_needs_yes() {
         "kubeconfig/age_key_lost_refresh_needs_yes",
         &["kubeconfig", "--refresh"],
     );
+    servers.assert();
     assert!(!age_key(&sb).exists(), "no key without consent");
     assert!(!sb.path("ssh.log").exists(), "the node is not read");
     assert_eq!(hetzner_state(&sb, "prod"), before);
+}
+
+/// Review #5/#12: at a terminal, no, Esc and Ctrl-C at the new-key question are one refusal: exit
+/// 1 with `apprafter::secrets::new_key_declined`, nothing on stdout — the kubeconfig's channel,
+/// redirected to a file as in `apprafter kubeconfig > kc && …` — and nothing created, read or
+/// written. stdin and stderr are a pseudo-terminal, as the question needs; stdout is a pipe.
+#[test]
+fn a_declined_new_age_key_exits_non_zero_with_nothing_on_stdout() {
+    let mut server = mockito::Server::new();
+    let servers = json_route(&mut server, "/v1/servers", 200, SERVERS_42, TOKEN_A)
+        .expect(0)
+        .create();
+    let (sb, _lost) = lost_key_sandbox(&server);
+    let tools = stand_in_tools(&sb);
+    let sb = sb.with_path(tools);
+    let before = hetzner_state(&sb, "prod");
+    for (how, keys) in [("no", "n\r"), ("Esc", "\x1b"), ("Ctrl-C", "\x03")] {
+        let run = run_at_a_terminal(
+            sb.std_cmd(&["kubeconfig", "--refresh"]),
+            "Create a new age key?",
+            keys.as_bytes(),
+        );
+        assert_eq!(run.status.code(), Some(1), "{how}:\n{}", run.terminal);
+        assert_eq!(run.stdout, "", "{how}: stdout is the kubeconfig's");
+        assert!(
+            run.terminal
+                .contains("apprafter::secrets::new_key_declined"),
+            "{how}:\n{}",
+            run.terminal
+        );
+    }
+    servers.assert();
+    assert!(!age_key(&sb).exists(), "no key after a decline");
+    assert!(!sb.path("ssh.log").exists(), "the node is not read");
+    assert_eq!(hetzner_state(&sb, "prod"), before);
+}
+
+/// What a child run at a pseudo-terminal left: its exit, its stdout (a pipe), and everything it
+/// drew on the terminal (stderr, the prompt included).
+struct TerminalRun {
+    status: std::process::ExitStatus,
+    stdout: String,
+    terminal: String,
+}
+
+/// Run `cmd` with stdin and stderr on a pseudo-terminal of 24x100 and stdout on a pipe; once
+/// the terminal shows `prompt`, type `keys`. Panics if the prompt or the exit takes over 30 s.
+fn run_at_a_terminal(mut cmd: std::process::Command, prompt: &str, keys: &[u8]) -> TerminalRun {
+    use std::io::{Read, Write};
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::process::Stdio;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    // posix_openpt, not openpty: it is in every libc without -lutil.
+    // SAFETY: plain libc calls on fds this function owns; `ptsname`'s static buffer is copied
+    // before anything else runs on this thread.
+    let (master, slave) = unsafe {
+        let m = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+        assert!(m >= 0, "posix_openpt: {}", std::io::Error::last_os_error());
+        assert_eq!(libc::grantpt(m), 0, "grantpt");
+        assert_eq!(libc::unlockpt(m), 0, "unlockpt");
+        let name = libc::ptsname(m);
+        assert!(!name.is_null(), "ptsname");
+        let name = std::ffi::CStr::from_ptr(name).to_owned();
+        let ws = libc::winsize {
+            ws_row: 24,
+            ws_col: 100,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        assert_eq!(libc::ioctl(m, libc::TIOCSWINSZ, &ws), 0, "TIOCSWINSZ");
+        let s = libc::open(name.as_ptr(), libc::O_RDWR | libc::O_NOCTTY);
+        assert!(
+            s >= 0,
+            "open the slave: {}",
+            std::io::Error::last_os_error()
+        );
+        (OwnedFd::from_raw_fd(m), OwnedFd::from_raw_fd(s))
+    };
+    let mut child = cmd
+        .stdin(Stdio::from(slave.try_clone().expect("dup slave")))
+        .stderr(Stdio::from(slave))
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn apprafter");
+    // The command holds the slave's fds until it drops: drop it, so the terminal closes when
+    // the child exits and the reader below sees the end.
+    drop(cmd);
+    let mut stdout = child.stdout.take().expect("stdout");
+    let out_reader = std::thread::spawn(move || {
+        let mut out = String::new();
+        stdout.read_to_string(&mut out).expect("read stdout");
+        out
+    });
+    let mut writer = std::fs::File::from(master.try_clone().expect("dup master"));
+    let mut reader = std::fs::File::from(master);
+    let seen = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let sink = Arc::clone(&seen);
+    let (closed, drained) = std::sync::mpsc::channel::<()>();
+    // Reads until the child's side closes (EIO on Linux, EOF elsewhere).
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = reader.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            sink.lock().unwrap().extend_from_slice(&buf[..n]);
+        }
+        let _ = closed.send(());
+    });
+    let text =
+        |seen: &Arc<Mutex<Vec<u8>>>| String::from_utf8_lossy(&seen.lock().unwrap()).into_owned();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !text(&seen).contains(prompt) {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            panic!("exited {status} before asking:\n{}", text(&seen));
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no prompt within 30 s:\n{}",
+            text(&seen)
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    writer.write_all(keys).expect("type");
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("no exit within 30 s:\n{}", text(&seen));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let stdout = out_reader.join().expect("stdout reader");
+    drained
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the terminal closes once the child has exited");
+    TerminalRun {
+        status,
+        stdout,
+        terminal: text(&seen),
+    }
 }
 
 /// GOTCHA-121: `--refresh --yes` reads the node over SSH (only that: `cat` of the kubeconfig),

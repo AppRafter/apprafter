@@ -366,8 +366,20 @@ It reads `/etc/rancher/k3s/k3s.yaml` from the target's node over SSH,
 as the first fetch did, and changes nothing on the node or in the
 cluster. Before it creates the key it lists everything else cached
 under the lost key, which the new key cannot read, and asks; without a
-terminal it refuses unless you pass `--yes`. The key is created only
-once the node has answered, so a failed fetch leaves none behind.
+terminal it refuses unless you pass `--yes`. Answering no, or pressing
+Esc or Ctrl-C, creates, fetches and writes nothing: the command exits 1
+with `apprafter::secrets::new_key_declined` and prints nothing on
+stdout, so `apprafter kubeconfig > kc && …` stops there. The key is
+created only once the node has answered, so a failed fetch leaves none
+behind.
+
+Only the targets of the current config root (`APPRAFTER_CONFIG_DIR`)
+are checked for secrets cached under the lost key. The key is shared
+by every config root on the machine, so the list leaves out the targets
+of another root, and in a root whose targets cache nothing the first
+fetch creates the key without asking, as on a first use. Their caches
+then fail with
+[`apprafter::secrets::cache_undecryptable`](#cache-undecryptable).
 
 What the new key leaves behind, and the way back for each:
 

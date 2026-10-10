@@ -208,7 +208,16 @@ impl Sandbox {
     }
 
     pub fn cmd(&self, args: &[&str]) -> Command {
-        let mut c = Command::cargo_bin("apprafter").expect("apprafter binary");
+        let mut c = Command::from_std(self.std_cmd(args));
+        c.timeout(RUN_TIMEOUT);
+        c
+    }
+
+    /// [`Sandbox::cmd`] as a `std::process::Command`, for a case that wires the child's
+    /// stdio itself (a terminal: `golden.rs`'s pseudo-terminal cases). No timeout: the case
+    /// bounds its own wait.
+    pub fn std_cmd(&self, args: &[&str]) -> std::process::Command {
+        let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_apprafter"));
         c.env_clear()
             .env(
                 "PATH",
@@ -232,9 +241,7 @@ impl Sandbox {
         for (k, v) in &self.extra_env {
             c.env(k, v);
         }
-        c.current_dir(self.path("home"))
-            .timeout(RUN_TIMEOUT)
-            .args(args);
+        c.current_dir(self.path("home")).args(args);
         c
     }
 

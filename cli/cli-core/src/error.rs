@@ -756,6 +756,26 @@ pub enum CliError {
         detail: String,
     },
 
+    /// The user declined the new age key `apprafter kubeconfig` asks for when the key the cache
+    /// was encrypted under is lost (WI-457): answered no, or pressed Esc or Ctrl-C at the
+    /// question. Nothing was created, fetched or written. An error rather than a quiet exit: the
+    /// command's stdout is the kubeconfig, and a caller capturing it (`apprafter kubeconfig >
+    /// kc && …`) must not take an empty one for success.
+    #[error(
+        "no new age key was created at {path}, so the kubeconfig of target `{target}` was not \
+         fetched"
+    )]
+    #[diagnostic(
+        code(apprafter::secrets::new_key_declined),
+        help(
+            "Nothing was created, fetched or written. If you still have the lost key, put it \
+             back, or set `APPRAFTER_AGE_KEY` to where it is. To go on with a new key, run \
+             `apprafter kubeconfig --refresh --target {target}` again and agree, or pass `--yes` \
+             where there is no terminal to ask at."
+        )
+    )]
+    NewAgeKeyDeclined { path: String, target: String },
+
     /// Catch-all, free-form message. New call sites should prefer
     /// promoting recurring messages to dedicated variants with
     /// stable diagnostic codes. The miette `code()` here remains
@@ -1585,6 +1605,33 @@ mod tests {
             help.contains("`apprafter argocd-password --refresh`") && !help.contains("--target"),
             "{help}"
         );
+    }
+
+    /// WI-457 review #5/#12: a declined new key is an error, so a caller capturing the
+    /// kubeconfig on stdout never takes an empty one for success. It says what did not happen and
+    /// both ways on: the old key back, or the same command agreed to.
+    #[test]
+    fn a_declined_new_age_key_says_nothing_was_fetched_and_names_both_ways_on() {
+        let err = CliError::NewAgeKeyDeclined {
+            path: "/k/age.key".into(),
+            target: "prod".into(),
+        };
+        assert_eq!(code_of(&err), "apprafter::secrets::new_key_declined");
+        assert_eq!(
+            err.to_string(),
+            "no new age key was created at /k/age.key, so the kubeconfig of target `prod` was \
+             not fetched"
+        );
+        let help = help_of(&err);
+        for part in [
+            "Nothing was created, fetched or written.",
+            "`APPRAFTER_AGE_KEY`",
+            "`apprafter kubeconfig --refresh --target prod`",
+            "`--yes`",
+        ] {
+            assert!(help.contains(part), "{part:?} missing: {help}");
+        }
+        assert!(!help.contains("file an issue"), "{help}");
     }
 
     #[test]

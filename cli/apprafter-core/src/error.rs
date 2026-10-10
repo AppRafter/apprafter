@@ -562,6 +562,7 @@ fn neutral_help(e: &cli_core::CliError) -> Option<String> {
         | C::NoActiveTarget
         | C::AgeKeyMissing { .. }
         | C::CacheUndecryptable { .. }
+        | C::NewAgeKeyDeclined { .. }
         | C::Yaml(_)
         | C::CompletionInstall(_)
         | C::ConfirmationRequired { .. }
@@ -896,6 +897,10 @@ pub mod samples {
                 target: s("prod"),
                 path: s("/home/a/.config/apprafter/age.key"),
                 detail: s("age decrypt: No matching keys found"),
+            },
+            C::NewAgeKeyDeclined {
+                path: s("/home/a/.config/apprafter/age.key"),
+                target: s("prod"),
             },
             C::Other(s("o")),
         ];

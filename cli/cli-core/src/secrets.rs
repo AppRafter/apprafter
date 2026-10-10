@@ -79,40 +79,56 @@ pub fn load_identity(path: &Path) -> Result<Option<Identity>> {
 /// it (parent dir created, file mode 0600 on Unix) when the file
 /// is absent.
 pub fn load_or_create_identity(path: &Path) -> Result<Identity> {
+    load_or_create_identity_reporting(path).map(|(identity, _)| identity)
+}
+
+/// [`load_or_create_identity`], and whether this call created the key (WI-457 review #10).
+///
+/// The file is created with `create_new`, so a key that appears between the check and the
+/// create — the lost one put back, or another process's — is loaded, never overwritten, and
+/// `false` says this call made none: a caller that reports "a new key was created" asks this.
+pub fn load_or_create_identity_reporting(path: &Path) -> Result<(Identity, bool)> {
     if let Some(identity) = load_identity(path)? {
-        return Ok(identity);
+        return Ok((identity, false));
     }
+    match create_identity(path)? {
+        Some(identity) => Ok((identity, true)),
+        None => {
+            let identity = load_identity(path)?.ok_or_else(|| {
+                CliError::Other(format!("age key {path:?} vanished while it was created"))
+            })?;
+            Ok((identity, false))
+        }
+    }
+}
+
+/// Generate an identity and write it to `path` (parent dir created, mode 0600 on Unix), or
+/// `None` when a file is already there: it is left as it was.
+fn create_identity(path: &Path) -> Result<Option<Identity>> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| CliError::Other(format!("mkdir {parent:?}: {e}")))?;
     }
     let identity = Identity::generate();
     let serialised = identity.to_string();
-    write_secret_file(path, serialised.expose_secret().as_bytes())?;
-    Ok(identity)
+    match write_secret_file(path, serialised.expose_secret().as_bytes()) {
+        Ok(()) => Ok(Some(identity)),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+        Err(e) => Err(CliError::Other(format!("create age key {path:?}: {e}"))),
+    }
 }
 
-#[cfg(unix)]
-fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|e| CliError::Other(format!("create age key {path:?}: {e}")))?;
-    f.write_all(bytes)
-        .map_err(|e| CliError::Other(format!("write age key {path:?}: {e}")))?;
-    f.write_all(b"\n").ok();
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut f = std::fs::File::create(path)
-        .map_err(|e| CliError::Other(format!("create age key {path:?}: {e}")))?;
-    f.write_all(bytes)
-        .map_err(|e| CliError::Other(format!("write age key {path:?}: {e}")))?;
+/// Write a new secret file; `AlreadyExists` when there is one (never replaced).
+fn write_secret_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut f = options.open(path)?;
+    f.write_all(bytes)?;
     f.write_all(b"\n").ok();
     Ok(())
 }
@@ -280,6 +296,36 @@ mod tests {
         assert_eq!(
             loaded.to_public().to_string(),
             created.to_public().to_string()
+        );
+    }
+
+    /// WI-457 review #10: whether the call created the key, for a caller that reports it.
+    #[test]
+    fn load_or_create_reports_whether_it_created_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("k/age.key");
+        let (made, created) = load_or_create_identity_reporting(&path).unwrap();
+        assert!(created && path.exists());
+        let (loaded, created) = load_or_create_identity_reporting(&path).unwrap();
+        assert!(!created, "a key already there is loaded, not created");
+        assert_eq!(loaded.to_public().to_string(), made.to_public().to_string());
+    }
+
+    /// The create itself never replaces a key that appeared after the check (`create_new`): it
+    /// reports `None`, and the key there is left as it was.
+    #[test]
+    fn creating_where_a_key_appeared_leaves_it_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("age.key");
+        let there = load_or_create_identity(&path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(create_identity(&path).unwrap().is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let (loaded, created) = load_or_create_identity_reporting(&path).unwrap();
+        assert!(!created);
+        assert_eq!(
+            loaded.to_public().to_string(),
+            there.to_public().to_string()
         );
     }
 
