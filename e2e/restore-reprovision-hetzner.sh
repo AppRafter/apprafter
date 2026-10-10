@@ -291,7 +291,7 @@ cleanup() {
             if [ "$n" = "0" ]; then
                 printf 'ok: project has ZERO servers after destroy (API-verified)\n' >&2
             else
-                printf 'LEAK WARNING: project reports %s server(s) after destroy — INSPECT https://console.hetzner.cloud AND DELETE STRAGGLERS BY HAND\n' "$n" >&2
+                printf 'LEAK WARNING: project reports %s server(s) after destroy — INSPECT https://console.hetzner.com AND DELETE STRAGGLERS BY HAND\n' "$n" >&2
             fi
         fi
         rm -rf "$TMPDIR_WORK"

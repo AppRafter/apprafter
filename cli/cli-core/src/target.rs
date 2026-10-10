@@ -117,7 +117,7 @@ pub const HETZNER_TOKEN_LEN: usize = 64;
 /// Every help and page that says where a token comes from uses this text: the CLI's helps and
 /// doctor hint, the core's client-neutral help, the `--token` flag's help, the desktop's own
 /// hints (exported as `HETZNER_API_TOKENS_PAGE`) and the operator guide.
-/// `platform-cli/tests/hetzner_token_page_test.rs` fails on any other spelling of the path.
+/// `platform-cli/tests/hetzner_console_wording_test.rs` fails on any other spelling of the path.
 pub const HETZNER_API_TOKENS_PAGE: &str =
     "the Hetzner Console (open the project, then Security → API tokens)";
 

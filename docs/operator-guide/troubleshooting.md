@@ -393,7 +393,7 @@ If you see `> 60 s` consistently on `k3s-ready`:
   to port 22 of the node's public IPv4, and FAILs naming the address
   when nothing accepts the connection.
 - Try `apprafter kubeconfig --refresh` once the cluster reports
-  ready in the Hetzner Cloud Console (the Web Console gives you
+  ready in the Hetzner Console (the Web Console gives you
   out-of-band access to the boot log).
 
 ### Cilium pods did not pick up a config change
@@ -418,9 +418,10 @@ The common ones:
   `(region × SKU)` pair is invalid or unavailable. See the section
   above for the four `UnavailableKind` variants and their fixes.
 - A `403 forbidden` with a quota message — your Hetzner project
-  has hit its server / IP / volume limit. Raise the limit in the
-  Hetzner Cloud Console (Project → Limits) or free up resources,
-  then re-run. `apprafter destroy --yes` clears any half-built
+  has hit its server / IP / volume limit. Request a higher limit
+  from the [limits overview](https://console.hetzner.com/limits) in
+  the Hetzner Console (Request change → Limit increase) or free up
+  resources, then re-run. `apprafter destroy --yes` clears any half-built
   resources before you retry — but it removes **every** resource
   tagged `apprafter=true` in that project, running clusters included,
   so only reach for it when the project holds nothing else

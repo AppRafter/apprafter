@@ -772,7 +772,7 @@ cleanup() {
     if [ "$n" = "0" ]; then
         printf '  ok: project has ZERO servers after teardown (Hetzner API-verified)\n' >&2
     else
-        printf 'FAILED: LEAK WARNING — project reports %s server(s) after teardown. INSPECT https://console.hetzner.cloud AND DELETE STRAGGLERS BY HAND\n' "$n" >&2
+        printf 'FAILED: LEAK WARNING — project reports %s server(s) after teardown. INSPECT https://console.hetzner.com AND DELETE STRAGGLERS BY HAND\n' "$n" >&2
         exit_code=1
     fi
     # shellcheck disable=SC2086 # $HZ is "python3 <path>" — word-splitting is intended

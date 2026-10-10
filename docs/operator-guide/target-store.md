@@ -74,7 +74,7 @@ and nothing else. So:
   means what it looks like;
 - **two clusters in one project** and `destroy --target X` removes both.
   There is no flag that narrows it. The only safe teardown of one of them
-  is by ID in the Hetzner Cloud Console.
+  is by ID in the Hetzner Console.
 
 Note also that `HCLOUD_TOKEN` sits **above** the target store in the
 [resolution chain](../how-it-works/the-target-store.md#credential-resolution-chain): an exported variable,
@@ -277,7 +277,7 @@ apprafter target remove prod --yes
 The first line is the one to be sure about: it empties `prod`'s whole
 Hetzner project, not just `prod`'s cluster — see [the destroy
 scope](#destroy-scope). If another AppRafter cluster shares that project,
-delete this one's server by ID in the Cloud Console and run only the
+delete this one's server by ID in the Hetzner Console and run only the
 second line.
 
 If you did it the other way round, you have lost the record and not

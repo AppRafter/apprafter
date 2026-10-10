@@ -130,7 +130,7 @@ pub(crate) fn cli_help(e: &CoreError) -> Option<String> {
         // so it answers only the recreated-elsewhere case. `up` creates a server when none of
         // that name exists and `persist_state` records its id.
         CoreError::ServerMissing { name, .. } => format!(
-            "Check the Hetzner Cloud Console for the cause. If the server was deleted, \
+            "Check the Hetzner Console for the cause. If the server was deleted, \
              `apprafter up --target {name}` provisions a replacement and records it. If the \
              token belongs to another Hetzner project, `apprafter target add {name} --renew \
              --token <X>` stores one from the server's project (an `HCLOUD_TOKEN` in the \

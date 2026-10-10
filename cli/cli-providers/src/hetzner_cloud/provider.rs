@@ -107,7 +107,7 @@ impl HetznerCloudProvider {
                 return Err(CliError::Other(format!(
                     "server {id} still listed by Hetzner 60s after delete; \
                      async-cleanup unusually slow — re-run `destroy --yes` \
-                     in a minute, or check the Hetzner Cloud Console."
+                     in a minute, or check the Hetzner Console."
                 )));
             }
             sleep(delay);

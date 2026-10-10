@@ -222,7 +222,7 @@ redirect the command at whichever project it names.
 
     Then `apprafter destroy` is not the teardown for this: it has no flag
     that narrows it to one cluster, and running it removes both. Delete
-    the old machine **by ID in the Hetzner Cloud Console** instead — the
+    the old machine **by ID in the Hetzner Console** instead — the
     server first, then its floating IP, firewall and network if nothing
     else uses them — and then `apprafter target remove <old-name> --yes`
     to drop the local record that now points at nothing.
@@ -318,7 +318,7 @@ on whenever you are ready.
 `restore` reports success once it has replayed the artifact. That is not the
 same as the upgrade having worked. Six checks, each earning its place:
 
-1. **The server type, read from the provider.** Take it from the Hetzner Cloud
+1. **The server type, read from the provider.** Take it from the Hetzner
    Console or the provider API rather than from local records: only the
    provider says what it actually got. `apprafter target show` should agree —
    the target adopts the machine it provisioned — and a disagreement between

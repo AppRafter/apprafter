@@ -43,7 +43,7 @@ at `/mnt/disk`.
 
 ### 1. Enable Rescue Mode
 
-In the [Hetzner Cloud Console](https://console.hetzner.cloud):
+In the [Hetzner Console](https://console.hetzner.com):
 
 - **Project** → server `platform-1` → **Rescue** tab.
 - Linux 64-bit, add your SSH public key (the same one you use
