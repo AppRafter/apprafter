@@ -210,12 +210,14 @@ cluster stays an ordinary AppRafter install on your own infrastructure.
 |---|---|---|---|
 | Post-launch | 🚧 | A desktop app for Linux, macOS and Windows that works with the same targets as the CLI | — |
 | Post-launch | 🚧 | The desktop app locks itself, and unlocks with the operating system's own sign-in — Windows Hello or the Windows password, Touch ID or the Mac password, the Linux system password | — |
-| Post-launch | ☐ | Every CLI command available from the desktop app | — |
+| Post-launch | 🚧 | Every CLI command available from the desktop app | — |
 
 > **The desktop app is `🚧`.** Its window, settings and app lock are built and tested on all
-> three systems in CI, and both clients read one target store. No installer is published yet,
-> the cluster screens are still to come, and the system sign-in has not yet been checked by hand
-> on real Windows, Mac and Linux machines. Where a computer does not report screen locks or
+> three systems in CI, and both clients read one target store. The target commands (add, list,
+> show, use, rename, remove, machine), `doctor` and `whoami` are in the app; the other commands
+> arrive with later releases. No installer is published yet, the cluster screens are still to
+> come, and the system sign-in has not yet been checked by hand on real Windows, Mac and Linux
+> machines. Where a computer does not report screen locks or
 > sleep — Windows Subsystem for Linux, or a Linux desktop without a screen saver or logind —
 > the app's settings say so next to the lock-on-sleep option.
 
