@@ -13,6 +13,12 @@
 //!    moves its env reads behind `Context`. The count is exact, so a drop
 //!    must lower [`ENV_READ_BASELINE`] in the same commit and can never
 //!    creep back up.
+//! 4. **No TypeScript export.** Nothing in `apprafter-core/src` or
+//!    `apprafter-core/tests`, test code included, asks ts-rs to write a
+//!    binding — neither a `ts(export)` attribute, with any delimiter, nor a
+//!    direct `TS::export` / `TS::export_all` call ([`ts_exports`]): under
+//!    cli/'s `cargo test --all-features` it would write files into this
+//!    crate. The desktop exports the core's types from its own tests.
 //!
 //! The scan reads syntax trees (`syn`), not text, so neither a comment nor
 //! a string can hide or fake a hit, and nothing depends on where an item
@@ -35,7 +41,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use proc_macro2::{Span, TokenStream, TokenTree};
+use proc_macro2::{Delimiter, Span, TokenStream, TokenTree};
 use syn::punctuated::Punctuated;
 use syn::visit::{self, Visit};
 use syn::{Attribute, Expr, ImplItem, Item, Meta, Stmt, TraitItem, UseTree};
@@ -97,12 +103,14 @@ const FORBIDDEN_CALLEES: &[&str] = &[
     "cli_providers::k8s::HelmCli",
 ];
 
-/// Callees the core may reach from the one function named beside them, and
-/// from nowhere else. `config_root_from_override` takes the override value
-/// explicitly, but without one it consults the platform config directory
-/// through `dirs` (HOME / XDG on Unix, the Known Folder API on Windows): that
-/// is the CLI's own environment, read for the CLI's context. The desktop
-/// passes its root explicitly (`Context::for_desktop`). `dirs::*` inside
+/// Callees the core may reach from the functions paired with them, and from
+/// nowhere else; a callee may be paired with several sites, one entry each.
+/// `config_root_from_override` takes the override value explicitly, but
+/// without one it consults the platform config directory through `dirs`
+/// (HOME / XDG on Unix, the Known Folder API on Windows). Both clients'
+/// context builders resolve the store root through it — the CLI in
+/// `Context::from_cli_env`, the desktop in `Context::from_desktop_env` — so
+/// both open the same default target store. `dirs::*` inside
 /// `apprafter-core/src` itself stays forbidden.
 const SANCTIONED: &[(&str, &str)] = &[
     (
@@ -112,6 +120,14 @@ const SANCTIONED: &[(&str, &str)] = &[
     (
         "cli_core::config_root_from_override",
         "Context::from_cli_env",
+    ),
+    (
+        "cli_core::target::config_root_from_override",
+        "Context::from_desktop_env",
+    ),
+    (
+        "cli_core::config_root_from_override",
+        "Context::from_desktop_env",
     ),
 ];
 
@@ -152,6 +168,9 @@ enum Kind {
     Print,
     /// One of [`FORBIDDEN_CALLEES`], or a [`SANCTIONED`] callee off its site.
     ForbiddenCallee,
+    /// A `ts(export)` / `ts(export_to = …)` attribute, or a direct
+    /// `TS::export*` call ([`ts_exports`]).
+    TsExport,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -457,14 +476,15 @@ impl<'f> Scanner<'f> {
         if let Some(entry) = FORBIDDEN_CALLEES.iter().find(|e| path_matches(path, e)) {
             return Some((Kind::ForbiddenCallee, entry.to_string()));
         }
+        // A sanctioned callee is allowed when ANY entry pairs it with the
+        // current site, and forbidden everywhere else.
         let site = self.fns.last().map(String::as_str);
-        if let Some((entry, _)) = SANCTIONED
-            .iter()
-            .find(|(e, allowed)| path_matches(path, e) && site != Some(*allowed))
-        {
-            return Some((Kind::ForbiddenCallee, entry.to_string()));
+        let mut pairs = SANCTIONED.iter().filter(|(e, _)| path_matches(path, e));
+        let (entry, _) = pairs.clone().next()?;
+        if pairs.any(|(_, allowed)| site == Some(*allowed)) {
+            return None;
         }
-        None
+        Some((Kind::ForbiddenCallee, entry.to_string()))
     }
 
     fn check_path(&mut self, segs: &[String], span: Span) {
@@ -805,6 +825,116 @@ fn scan_tree(src: &Path) -> Vec<Finding> {
     findings
 }
 
+/// The ts-rs functions that write a binding to disk: `TS::export` and
+/// `TS::export_all`, and `export_all_to` of earlier ts-rs releases.
+const TS_EXPORT_FNS: &[&str] = &["export", "export_all", "export_all_to"];
+
+/// Every place in `src` that asks ts-rs to write a binding, as (line, what
+/// matched):
+///
+/// - an attribute (`#[…]` / `#![…]`) carrying a `ts` followed by a group
+///   that names the ident `export` or `export_to`, at any nesting and with
+///   any delimiter ([`ts_export_in`]): `#[ts(export)]`, `#[ts{export}]`,
+///   `#[ts(rename = "x", export)]`,
+///   `#[cfg_attr(feature = "ts", ts(export_to = "x.ts"))]`.
+///   `#[ts(rename = "export")]` names a string, not the ident, and passes;
+/// - a `::` followed by one of [`TS_EXPORT_FNS`], a direct call
+///   (`UiError::export_all(&cfg)`, `<T as TS>::export(&cfg)`). The core
+///   has no item of those names, so any such path is ts-rs's; an item that
+///   wants one must take another name, as telling the two apart would take
+///   type resolution. `x.export()` (a method) and `fn export_report()` pass.
+///
+/// The file is read as tokens, not as items: a test module and a macro's
+/// input are covered too, because an exported binding writes its file
+/// whenever the test that ts-rs generates for it runs. A comment never
+/// reaches the tokens and a string (a doc comment's text included) is one
+/// literal, so neither fakes a hit — this file's own cases sit in strings
+/// and never flag it.
+fn ts_exports(src: &str) -> Vec<(usize, String)> {
+    let tokens: TokenStream = src.parse().unwrap_or_else(|e| panic!("tokenize: {e:?}"));
+    let mut hits = Vec::new();
+    collect_ts_exports(tokens, &mut hits);
+    hits
+}
+
+fn collect_ts_exports(tokens: TokenStream, hits: &mut Vec<(usize, String)>) {
+    let tts: Vec<TokenTree> = tokens.into_iter().collect();
+    let is_punct =
+        |i: usize, c: char| matches!(tts.get(i), Some(TokenTree::Punct(p)) if p.as_char() == c);
+    for (i, tt) in tts.iter().enumerate() {
+        match tt {
+            TokenTree::Group(g) => {
+                let attribute = g.delimiter() == Delimiter::Bracket
+                    && i > 0
+                    && (is_punct(i - 1, '#')
+                        || (i > 1 && is_punct(i - 1, '!') && is_punct(i - 2, '#')));
+                if attribute {
+                    if let Some(line) = ts_export_in(g.stream()) {
+                        hits.push((line, "ts(export)".into()));
+                    }
+                }
+                collect_ts_exports(g.stream(), hits);
+            }
+            TokenTree::Ident(id)
+                if i > 1
+                    && is_punct(i - 2, ':')
+                    && is_punct(i - 1, ':')
+                    && TS_EXPORT_FNS.contains(&id.to_string().as_str()) =>
+            {
+                hits.push((line_of(id.span()), format!("::{id}")));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The line of the first `ts` in an attribute's tokens that is followed by
+/// a group naming `export` or `export_to`, whatever the group's delimiter:
+/// syn's `MetaList`, which ts-rs parses its attributes with, takes `( … )`,
+/// `[ … ]` and `{ … }` alike, and ts-rs honours all three.
+fn ts_export_in(tokens: TokenStream) -> Option<usize> {
+    let tts: Vec<TokenTree> = tokens.into_iter().collect();
+    tts.iter().enumerate().find_map(|(i, tt)| match tt {
+        TokenTree::Ident(id) if id == "ts" => match tts.get(i + 1) {
+            Some(TokenTree::Group(g)) if names_export(g.stream()) => Some(line_of(id.span())),
+            _ => None,
+        },
+        TokenTree::Group(g) => ts_export_in(g.stream()),
+        _ => None,
+    })
+}
+
+fn names_export(tokens: TokenStream) -> bool {
+    tokens.into_iter().any(|tt| match tt {
+        TokenTree::Ident(id) => id == "export" || id == "export_to",
+        TokenTree::Group(g) => names_export(g.stream()),
+        _ => false,
+    })
+}
+
+/// [`ts_exports`] over every `.rs` file under the crate's `src` and
+/// `tests`, test modules included: an integration test is compiled and run
+/// by the same `cargo test --all-features`, so an export there writes into
+/// the crate as surely as one in `src`. This file is scanned with the rest.
+fn ts_export_crate(krate: &Path) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    let files = ["src", "tests"]
+        .into_iter()
+        .flat_map(|dir| rust_files(&krate.join(dir)));
+    for file in files {
+        let text = fs::read_to_string(&file).unwrap_or_else(|e| panic!("read {file:?}: {e}"));
+        for (line, callee) in ts_exports(&text) {
+            findings.push(Finding {
+                file: file.clone(),
+                line,
+                kind: Kind::TsExport,
+                callee,
+            });
+        }
+    }
+    findings
+}
+
 /// The dependencies of a member manifest that [`FORBIDDEN_DEPS`] names,
 /// by their real package name: a `package = "…"` rename counts, in the
 /// member or in the workspace entry a `workspace = true` points at, and so
@@ -909,10 +1039,13 @@ fn rust_files(dir: &Path) -> Vec<PathBuf> {
 
 #[test]
 fn the_core_never_prints_exits_or_reads_the_environment() {
-    let hits = scan_tree(&crate_dir("apprafter-core").join("src"));
+    let core = crate_dir("apprafter-core");
+    let mut hits = scan_tree(&core.join("src"));
+    hits.extend(ts_export_crate(&core));
+    hits.sort();
     assert!(
         hits.is_empty(),
-        "apprafter-core must stay pure (ADR 0067 §2):\n{}",
+        "apprafter-core must stay pure (ADR 0067 §2) and export no TypeScript:\n{}",
         hits.iter()
             .map(|h| h.to_string())
             .collect::<Vec<_>>()
@@ -1280,6 +1413,7 @@ fn f() {
 struct Context;
 impl Context {
     fn from_cli_env() { let _ = cli_core::target::config_root_from_override(None); }
+    fn from_desktop_env() { let _ = cli_core::target::config_root_from_override(None); }
     fn for_desktop() { let _ = cli_core::target::config_root_from_override(None); }
 }
 ";
@@ -1288,9 +1422,66 @@ impl Context {
             vec![(
                 Kind::ForbiddenCallee,
                 "cli_core::target::config_root_from_override".into(),
-                4
+                5
             )]
         );
+    }
+
+    #[test]
+    fn ts_export_is_forbidden_in_the_core() {
+        for (src, bad) in [
+            ("#[derive(ts_rs::TS)] #[ts(export)] struct A;", true),
+            ("#[ts(rename = \"B\", export)] struct B;", true),
+            (
+                "#[cfg_attr(feature = \"ts\", ts(export_to = \"x.ts\"))] struct C;",
+                true,
+            ),
+            (
+                "#[cfg_attr(feature = \"ts\", derive(ts_rs::TS))] struct D;",
+                false,
+            ),
+            ("#[ts(rename = \"export\")] struct E;", false),
+            // syn's `MetaList` takes any delimiter, and ts-rs honours each.
+            ("#[ts{export}] struct F;", true),
+            ("#[ts[export]] struct G;", true),
+            ("#[cfg_attr(feature = \"ts\", ts{export})] struct H;", true),
+        ] {
+            assert_eq!(!ts_exports(src).is_empty(), bad, "{src}");
+        }
+    }
+
+    #[test]
+    fn a_direct_ts_rs_export_call_is_forbidden_in_the_core() {
+        for (src, bad) in [
+            ("UiError::export_all(&cfg)", true),
+            ("<UiError as ts_rs::TS>::export(&cfg).unwrap();", true),
+            ("ts_rs::TS::export_all_to(\"out\")", true),
+            ("fn export_report() {}", false),
+            ("report.export()", false),
+            ("let s = \"::export\";", false),
+        ] {
+            assert_eq!(!ts_exports(src).is_empty(), bad, "{src}");
+        }
+    }
+
+    #[test]
+    fn the_ts_export_scan_covers_the_crates_tests_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |rel: &str, body: &str| {
+            let p = dir.path().join(rel);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, body).unwrap();
+        };
+        write("src/lib.rs", "pub struct A;\n");
+        write(
+            "tests/ipc.rs",
+            "#[test]\nfn t() {\n    A::export_all(&cfg).unwrap();\n}\n",
+        );
+        let got: Vec<(PathBuf, usize)> = ts_export_crate(dir.path())
+            .into_iter()
+            .map(|f| (f.file, f.line))
+            .collect();
+        assert_eq!(got, vec![(dir.path().join("tests/ipc.rs"), 3)]);
     }
 
     #[test]

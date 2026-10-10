@@ -45,6 +45,12 @@ jobs:
               - 'landing/**'
               - '.github/workflows/**'
               - 'cue.mod/**'
+              - 'desktop/**'
+              - 'flake.nix'
+              - 'Justfile'
+              - 'lefthook.yml'
+              - 'mise.toml'
+              - '.devcontainer/**'
 
   spdx:
     name: SPDX headers

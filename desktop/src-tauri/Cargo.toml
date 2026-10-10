@@ -1,0 +1,105 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+[package]
+name        = "apprafter-desktop"
+description = "AppRafter Desktop: the AppRafter command line, as a desktop app."
+# The desktop release stream's version authority (design spec §6.1). Unpublished until D.13;
+# tauri.conf.json5 carries no version and falls back to this one.
+version     = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "apprafter_desktop"
+
+[[bin]]
+name = "apprafter-desktop"
+path = "src/main.rs"
+
+# No libtest: on macOS muda builds a menu item on the main thread only, and libtest runs every
+# test on a thread of its own. The target's `main` runs its checks on the main thread itself.
+[[test]]
+name    = "app_menu"
+path    = "tests/app_menu.rs"
+harness = false
+
+[features]
+# Walks and CI only: the scripted FakeAuthenticator in place of the OS (and, from later tasks,
+# the loopback provider override and a TEST BUILD banner). Never in a release; D.13 asserts it.
+test-build = []
+
+[build-dependencies]
+tauri-build = { workspace = true }
+
+[dependencies]
+apprafter-core        = { workspace = true }
+apprafter-desktop-ipc = { path = "../ipc" }
+# Device-owner authentication through the OS, and its lock and sleep signals.
+apprafter-os-auth     = { path = "../os-auth" }
+# `atomic_replace` for settings.json, the helper the CLI writes its own files with.
+cli-core              = { workspace = true }
+# The data-dir override, canonical without Windows' `\\?\` prefix (env::prepare_data_dir):
+# the version Tauri resolves its own paths with, already in the lock.
+dunce                 = "1"
+
+# The versions cli/Cargo.toml pins, already in the lock.
+miette                = "7"
+# The one crypto provider (as cli/Cargo.toml pins it): runtime.rs installs ring.
+rustls                = { version = "0.23", default-features = false, features = ["ring", "std"] }
+serde                 = { workspace = true }
+serde_json            = { workspace = true }
+tauri                 = { workspace = true }
+# Website, Docs and GitHub open in the browser; the capability scopes it to those three URLs.
+tauri-plugin-opener   = "~2.7"
+# A second launch focuses the first window instead of starting another app.
+tauri-plugin-single-instance = "~2.5"
+thiserror             = "2"
+# The async runtime Tauri runs commands on, built here with 8 MiB thread stacks.
+tokio                 = { version = "1", features = ["rt-multi-thread"] }
+# The version cli/Cargo.toml pins, already in the lock (cli-core logs through it).
+tracing               = "0.1"
+# The log file in the app's log directory, rotated daily, the last few kept.
+tracing-appender      = "~0.2"
+tracing-subscriber    = { version = "0.3", features = ["fmt"] }
+# The account and host name the title bar shows (`app_info`).
+whoami                = "~2.1"
+# The password from the app's own field, wiped when dropped: the version apprafter-os-auth
+# takes it in, already in the lock.
+zeroize               = "~1.9"
+
+[target.'cfg(unix)'.dependencies]
+# SIGTERM, SIGHUP and SIGINT run the quit (src/signals.rs), as cli/platform-cli handles them.
+# `signal-hook`: new to this lock but not to the repo — the version cli/Cargo.lock pins, its
+# registry crate already here through zbus. `libc`: the one `sigaction` query std has no form
+# of, whether a signal was ignored when the process started; already in the lock.
+libc        = "0.2"
+signal-hook = "0.3"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# GTK's preference for a dark theme at start (src/theme.rs): the version tao and wry use, already
+# in the lock.
+gtk  = "0.18"
+# The XDG desktop portal's colour scheme and its changes (src/theme/portal.rs): the zbus os-auth
+# and the single-instance plugin use, the same minor and default features.
+zbus = "~5.19"
+# The portal's signal and its name's owner read together on zbus's executor: the version zbus
+# already pulls in, as os-auth's session watch uses it.
+futures-lite = "2"
+# The bound on the session bus check before the single-instance plugin (src/single_instance.rs):
+# the timer of the executor zbus runs on, the version zbus already pulls in.
+async-io = "2"
+
+[dev-dependencies]
+# The mock runtime for tests/ipc_mock.rs and tests/app_menu.rs.
+tauri       = { workspace = true, features = ["test"] }
+# tests/ipc_mock.rs reads capabilities/main.json5 as Tauri does: the version tauri-utils parses
+# it with (`config-json5`), already in the lock.
+json5       = "0.4"
+# tests/env_guard.rs reads src/ as syntax trees, not text: versions already in the lock (as in
+# apprafter-core's guard); `span-locations` gives its findings their line numbers.
+proc-macro2 = { version = "1", features = ["span-locations"] }
+syn         = { version = "2", features = ["full", "visit"] }
+tempfile    = "3"

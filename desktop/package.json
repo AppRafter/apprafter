@@ -1,0 +1,40 @@
+{
+  "name": "apprafter-desktop",
+  "private": true,
+  "type": "module",
+  "license": "FSL-1.1-Apache-2.0",
+  "scripts": {
+    "dev": "vite",
+    "dev:mock": "VITE_MOCK_IPC=1 vite",
+    "build": "tsc --noEmit && NODE_ENV=production vite build",
+    "lint": "biome check . && tsc --noEmit",
+    "test": "bun test",
+    "e2e": "npx --no-install playwright test -c e2e/playwright.config.ts",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@phosphor-icons/react": "~2.1.10",
+    "@tanstack/react-query": "~5.104.1",
+    "@tauri-apps/api": "~2.12.1",
+    "@tauri-apps/plugin-opener": "~2.7.0",
+    "react": "~19.3.0",
+    "react-dom": "~19.3.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.15",
+    "@fontsource/roboto": "~5.3.0",
+    "@fontsource/roboto-mono": "~5.3.0",
+    "@happy-dom/global-registrator": "~20.14.5",
+    "@playwright/test": "~1.64.0",
+    "@tauri-apps/cli": "~2.12.1",
+    "@testing-library/dom": "~10.4.2",
+    "@testing-library/react": "~16.3.3",
+    "@testing-library/user-event": "~14.6.7",
+    "@types/bun": "~1.4.2",
+    "@types/react": "~19.3.0",
+    "@types/react-dom": "~19.3.0",
+    "@vitejs/plugin-react": "~6.1.2",
+    "typescript": "~7.0.2",
+    "vite": "~8.3.4"
+  }
+}

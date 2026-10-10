@@ -1,0 +1,117 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+[package]
+name        = "apprafter-os-auth"
+description = "Device-owner authentication through the OS for AppRafter Desktop: Windows Hello, macOS LocalAuthentication, Linux polkit and PAM."
+# Not a version authority: desktop/src-tauri/Cargo.toml is (design spec §6.1).
+version     = "0.0.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+# Tauri-free: src-tauri depends on this crate, never the other way round.
+[dependencies]
+# CancellationToken: what closes an open prompt (lock-on-sleep, quit).
+apprafter-core        = { workspace = true }
+# AuthOutcome: the one answer every backend gives.
+apprafter-desktop-ipc = { path = "../ipc" }
+# A session source the OS does not offer is logged at info and skipped: the version the shell
+# logs through, already in the lock.
+tracing               = "0.1"
+
+# Windows Hello and the Windows credential dialog.
+[target.'cfg(windows)'.dependencies]
+# The windows already in this workspace's graph (tauri, tao, wry, webview2-com): the same minor,
+# so the lock keeps one windows. Features: UserConsentVerifier (Security_Credentials_UI) and its
+# window interop (Win32_System_WinRT); CredUI (Win32_Security_Credentials, whose CREDUI_INFOW
+# needs Win32_Graphics_Gdi for its banner field); GetUserNameExW
+# (Win32_Security_Authentication_Identity); LogonUserW (Win32_Security); CloseHandle and the
+# Win32 errors (Win32_Foundation); CoTaskMemFree and the dialog thread's apartment
+# (Win32_System_Com). The session watch's message-only window (Win32_UI_WindowsAndMessaging,
+# Win32_System_LibraryLoader), its lock notification (Win32_System_RemoteDesktop) and its
+# suspend notification (Win32_System_Power).
+windows = { version = "0.62", features = [
+    "Foundation",
+    "Security_Credentials_UI",
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Security_Authentication_Identity",
+    "Win32_Security_Credentials",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Power",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_WinRT",
+    "Win32_UI_WindowsAndMessaging",
+] }
+# IAsyncOperation, which windows 0.62 takes from windows-future without re-exporting it: the
+# copy windows already depends on.
+windows-future = "0.3"
+# The password the credential dialog returns, wiped when dropped.
+zeroize = "~1.9"
+
+# LocalAuthentication, and the notifications the session watch listens to.
+[target.'cfg(target_os = "macos")'.dependencies]
+# LAContext's reply block, and the workspace observers' blocks.
+block2 = "0.6"
+# The objc2 already in this workspace's graph (tauri, tao, wry): the same minor, so the lock
+# keeps one objc2.
+objc2 = "0.6"
+# The Mac's frameworks at the versions tao and wry already resolve. NSWorkspace for its sleep
+# notifications; Core Foundation's distributed centre (CFNotificationCenter, a feature nothing
+# else in the graph turns on), which delivers the screen lock at once.
+objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "NSWorkspace",
+] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "CFDictionary",
+    "CFNotificationCenter",
+    "CFString",
+] }
+# NSString for the reason, NSError for the reply; NSNotification and NSOperation for the
+# block observers (`addObserverForName:object:queue:usingBlock:` is gated on NSOperation,
+# another feature new to the graph).
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "block2",
+    "NSError",
+    "NSNotification",
+    "NSOperation",
+    "NSString",
+] }
+objc2-local-authentication = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "block2",
+    "LAContext",
+    "LAError",
+] }
+
+# polkit, and PAM where polkit cannot prompt.
+[target.'cfg(target_os = "linux")'.dependencies]
+# The zbus already in this workspace's graph (tauri-plugin-single-instance): the same minor and
+# its default features (async-io, blocking-api), so the lock keeps one zbus.
+zbus        = "~5.19"
+# >= 5.1.0: below it `Subject::new_for_owner` is the PID-reuse bypass RUSTSEC-2026-0278. The
+# backend never builds that subject (it asks about its own bus name), but no older copy may land.
+zbus_polkit = "~5.1"
+# PAM through libpam-sys, which declares the functions itself (no bindgen) and links `-lpam`:
+# libpam0g-dev on CI, linux-pam in the nix desktop shell.
+nonstick = "~0.1.2"
+# The account PAM checks (`getpwuid_r(getuid())`); the polkit container test also drives
+# pkttyagent through a pseudo-terminal with it.
+libc = "0.2"
+# The password the PAM conversation answers with, wiped when dropped.
+zeroize = "~1.9"
+# The session watch reads the logind and screen-saver streams together on zbus's executor and
+# stops on a closed channel: the versions zbus already pulls in.
+async-channel = "2"
+futures-lite  = "2"
+
+# The PAM service probe's tests build their own /etc/pam.d and /usr/lib/pam.d.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+tempfile = "3"

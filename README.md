@@ -78,6 +78,7 @@ Boring, proven components, plus a thin layer of our own code only where no ready
 | -------------------------------------------- | -------------------------------------------------------------- |
 | [`cli/`](./cli/)                             | `apprafter` — Rust CLI for provisioning, bootstrap, lifecycle  |
 | [`operator/`](./operator/)                   | In-cluster Rust operator and admission webhook (kube-rs)       |
+| [`desktop/`](./desktop/)                     | AppRafter Desktop — the GUI twin of the CLI ([ADR 0067](./docs/adr/0067-desktop-app-and-apprafter-core.md)); unreleased |
 | [`schemas/`](./schemas/)                     | CUE schemas for every CRD                                      |
 | [`providers/`](./providers/)                 | Built-in `ServiceProvider`s (Postgres, JetStream, ClickHouse, Redis, S3) |
 | [`backstage-plugins/`](./backstage-plugins/) | TypeScript plugins for the developer portal                    |
@@ -144,7 +145,7 @@ Three setup paths (Nix flake, Dev Container, manual via `mise`) are documented i
 
 AppRafter's core is **source-available**; its plugins and documentation are openly licensed:
 
-- **Platform core** (`cli/`, `operator/`, `schemas/`, `manifests/`) — **FSL-1.1-Apache-2.0**: the Functional Source License, which auto-converts to **Apache 2.0** two years after each release. It permits any use — personal, internal business, and commercial workloads — **except offering AppRafter itself as a managed service to third parties**. Once a release reaches its two-year conversion date, that restriction lifts.
+- **Platform core** (`cli/`, `operator/`, `schemas/`, `manifests/`, `desktop/`) — **FSL-1.1-Apache-2.0**: the Functional Source License, which auto-converts to **Apache 2.0** two years after each release. It permits any use — personal, internal business, and commercial workloads — **except offering AppRafter itself as a managed service to third parties**. Once a release reaches its two-year conversion date, that restriction lifts.
 - **Plugins** (`providers/*`, `backstage-plugins/*`, community SDKs) — **MIT** from day one.
 - **Documentation** (`docs/`) — **CC-BY-4.0** for prose, **Apache-2.0** for code samples in guides. See [Licensing](./docs/license.md).
 

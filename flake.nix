@@ -107,112 +107,163 @@
           dontConfigure = true;
           installPhase = "install -Dm755 cue $out/bin/cue";
         };
+
+        # AppRafter Desktop (ADR 0067). A SEPARATE shell so the default one does not
+        # pull a WebKitGTK/GTK closure. x86_64-linux only — macOS/Windows desktop work
+        # uses rustup + bun (design spec §6.1). The Tauri CLI comes from desktop/bun.lock
+        # (`bun run tauri`), NOT nixpkgs' cargo-tauri (one minor behind): tauri-cli
+        # refuses a build whose crate and @tauri-apps/api minors disagree. Rust comes
+        # from rustup (desktop/rust-toolchain.toml), which nixpkgs' rustc would ignore.
+        # bun comes from mise (mise.toml pins 1.4) or the user's own install, the same
+        # way: nixpkgs' bun is 1.3 at the locked rev and cannot read desktop/bun.lock
+        # (lockfileVersion 2, written by bun 1.4). The shellHook warns, never fails,
+        # when the bun on PATH is not 1.4.x.
+        desktopShell = pkgs.mkShell {
+          name = "apprafter-desktop";
+          nativeBuildInputs = with pkgs; [ pkg-config wrapGAppsHook3 ];
+          # linux-pam: desktop/os-auth's PAM fallback links -lpam (nonstick's libpam-sys).
+          # No appindicator: the app has no tray yet, and nothing in its graph links or loads
+          # one (`cargo tree -i libappindicator` prints nothing); it returns with the tray.
+          buildInputs = with pkgs; [
+            webkitgtk_4_1 gtk3 libsoup_3 librsvg glib-networking
+            gsettings-desktop-schemas dbus linux-pam
+          ];
+          packages = with pkgs; [ cuePinned just jq git xvfb-run ];
+          shellHook = ''
+            # GTK file chooser and HiDPI scale need the schemas (NixOS wiki, Tauri).
+            export XDG_DATA_DIRS="$GSETTINGS_SCHEMAS_PATH''${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}"
+            export GIO_MODULE_DIR="${pkgs.glib-networking}/lib/gio/modules/"
+            # Every library the app loads, PREPENDED. Rust >= 1.90 links x86_64-linux-gnu
+            # with its bundled rust-lld, which bypasses nixpkgs' ld-wrapper, so a binary
+            # built in this shell gets no RUNPATH into /nix/store and dies with
+            # `libgobject-2.0.so.0: cannot open shared object file`. Prepended, not
+            # appended: an ambient LD_LIBRARY_PATH (a NixOS user profile) can carry a
+            # DIFFERENT webkitgtk build, and that one must not win. (atk ships inside
+            # at-spi2-core.) linux-pam: every desktop/os-auth binary links libpam.
+            export LD_LIBRARY_PATH="${
+              pkgs.lib.makeLibraryPath (
+                with pkgs;
+                [
+                  webkitgtk_4_1 gtk3 libsoup_3 glib cairo pango gdk-pixbuf harfbuzz
+                  at-spi2-core librsvg dbus linux-pam
+                ]
+              )
+            }''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            case "$(bun --version 2>/dev/null)" in
+              1.4.*) ;;
+              *) echo "apprafter-desktop: desktop/bun.lock needs bun 1.4.x, found '$(bun --version 2>/dev/null || echo none)' — install it with mise (mise.toml) or from bun.sh" >&2 ;;
+            esac
+          '';
+        };
       in
       {
-        devShells.default = pkgs.lib.warnIf (resticWarning != null) resticWarning (pkgs.mkShell {
-          name = "apprafter";
+        devShells = {
+          default = pkgs.lib.warnIf (resticWarning != null) resticWarning (pkgs.mkShell {
+            name = "apprafter";
 
-          packages = with pkgs; [
-            # Configuration language — the version pinned above, NOT nixpkgs'.
-            # See the `cuePinned` comment for why.
-            cuePinned
+            packages = with pkgs; [
+              # Configuration language — the version pinned above, NOT nixpkgs'.
+              # See the `cuePinned` comment for why.
+              cuePinned
 
-            # Argo CD ships custom resource health as Lua in `argocd-cm`, and a
-            # broken script fails SILENTLY — Argo logs it and falls back. This
-            # is what `scripts/check-argocd-health-lua.sh` runs them under.
-            lua
+              # Argo CD ships custom resource health as Lua in `argocd-cm`, and a
+              # broken script fails SILENTLY — Argo logs it and falls back. This
+              # is what `scripts/check-argocd-health-lua.sh` runs them under.
+              lua
 
-            # Rust toolchain
-            cargo
-            rustc
-            rustfmt
-            clippy
-            rust-analyzer
+              # Rust toolchain
+              cargo
+              rustc
+              rustfmt
+              clippy
+              rust-analyzer
 
-            # Dependency health, which the version watcher cannot see: an
-            # abandoned crate sits on its own final release forever and so is
-            # never "behind". `scripts/cargo-deny.sh` falls back to
-            # `nix run nixpkgs#cargo-deny` without this, but having it in the
-            # shell keeps the dev-loop run fast.
-            cargo-deny
+              # Dependency health, which the version watcher cannot see: an
+              # abandoned crate sits on its own final release forever and so is
+              # never "behind". `scripts/cargo-deny.sh` falls back to
+              # `nix run nixpkgs#cargo-deny` without this, but having it in the
+              # shell keeps the dev-loop run fast.
+              cargo-deny
 
-            # JavaScript / TypeScript runtime (for Backstage tooling)
-            bun
+              # JavaScript / TypeScript runtime (for Backstage tooling)
+              bun
 
-            # Kubernetes tooling
-            kubectl
-            k9s
-            kubernetes-helm
-            k3d
-            kind # local e2e cluster on podman (rootless) — k3d needs docker
-            argocd
-            cilium-cli
+              # Kubernetes tooling
+              kubectl
+              k9s
+              kubernetes-helm
+              k3d
+              kind # local e2e cluster on podman (rootless) — k3d needs docker
+              argocd
+              cilium-cli
 
-            # Talos / bare-metal
-            talosctl
+              # Talos / bare-metal
+              talosctl
 
-            # Container build / supply-chain
-            cosign
-            syft
-            trivy
-            grype
+              # Container build / supply-chain
+              cosign
+              syft
+              trivy
+              grype
 
-            # Repo tooling
-            just
-            lefthook
-            age
-            sops
-            jq
-            git
+              # Repo tooling
+              just
+              lefthook
+              age
+              sops
+              jq
+              git
 
-            # Backups: `apprafter backup create/list/show/check/prune`,
-            # `restore` and `export` run restic locally. Held to the runner's
-            # minor by `resticWarning` above.
-            restic
+              # Backups: `apprafter backup create/list/show/check/prune`,
+              # `restore` and `export` run restic locally. Held to the runner's
+              # minor by `resticWarning` above.
+              restic
 
-            # Documentation site. ONE python env — `nix shell
-            # nixpkgs#python3Packages.mkdocs-material` ships no `mkdocs`
-            # binary, and adding `python3Packages.mkdocs` alongside it
-            # yields a second env whose site-packages lacks the theme
-            # ("Unrecognised theme name: 'material'"). literate-nav
-            # renders the generated CLI reference nav (docsgen SUMMARY.md);
-            # redirects is installed for the W5 IA move.
-            (python3.withPackages (ps: [
-              ps.mkdocs-material
-              ps.mkdocs-literate-nav
-              ps.mkdocs-redirects
-            ]))
-          ];
+              # Documentation site. ONE python env — `nix shell
+              # nixpkgs#python3Packages.mkdocs-material` ships no `mkdocs`
+              # binary, and adding `python3Packages.mkdocs` alongside it
+              # yields a second env whose site-packages lacks the theme
+              # ("Unrecognised theme name: 'material'"). literate-nav
+              # renders the generated CLI reference nav (docsgen SUMMARY.md);
+              # redirects is installed for the W5 IA move.
+              (python3.withPackages (ps: [
+                ps.mkdocs-material
+                ps.mkdocs-literate-nav
+                ps.mkdocs-redirects
+              ]))
+            ];
 
-          # mkdocs-material 9.7.6 prints a red MkDocs-2.0 advocacy banner on
-          # EVERY mkdocs invocation (material/templates/__init__.py gates it
-          # on this variable). It is upstream's opinion of a framework
-          # release this site does not run — the line readers react to,
-          # "Currently unlicensed - unsuitable for production use", is about
-          # MkDocs 2.0 and not about the theme here.
-          #
-          # Silenced in the devShell rather than in the Justfile because
-          # every call site goes through `nix develop`: `just docs-serve`,
-          # `just docs-build`, `scripts/docs-check.sh` and release-docs.yml.
-          # Three prefixed recipes would leave the CI logs noisy and would
-          # miss any future `nix develop --command mkdocs ...` typed by hand.
-          #
-          # It also shrinks a real hazard: scripts/docs-check.sh tees mkdocs
-          # stderr into a file it then pattern-matches, so third-party output
-          # in that stream is one grep collision away from a false failure.
-          NO_MKDOCS_2_WARNING = "1";
+            # mkdocs-material 9.7.6 prints a red MkDocs-2.0 advocacy banner on
+            # EVERY mkdocs invocation (material/templates/__init__.py gates it
+            # on this variable). It is upstream's opinion of a framework
+            # release this site does not run — the line readers react to,
+            # "Currently unlicensed - unsuitable for production use", is about
+            # MkDocs 2.0 and not about the theme here.
+            #
+            # Silenced in the devShell rather than in the Justfile because
+            # every call site goes through `nix develop`: `just docs-serve`,
+            # `just docs-build`, `scripts/docs-check.sh` and release-docs.yml.
+            # Three prefixed recipes would leave the CI logs noisy and would
+            # miss any future `nix develop --command mkdocs ...` typed by hand.
+            #
+            # It also shrinks a real hazard: scripts/docs-check.sh tees mkdocs
+            # stderr into a file it then pattern-matches, so third-party output
+            # in that stream is one grep collision away from a false failure.
+            NO_MKDOCS_2_WARNING = "1";
 
-          shellHook = ''
-            echo "AppRafter dev shell ready."
-            echo
-            echo "Useful commands:"
-            echo "  just --list      # available targets"
-            echo "  just bootstrap   # install git hooks"
-            echo "  just lint        # CUE + SPDX + docs + conditional Rust/TS"
-            echo "  just e2e-up      # local k3d cluster"
-            echo
-          '';
-        });
+            shellHook = ''
+              echo "AppRafter dev shell ready."
+              echo
+              echo "Useful commands:"
+              echo "  just --list      # available targets"
+              echo "  just bootstrap   # install git hooks"
+              echo "  just lint        # CUE + SPDX + docs + conditional Rust/TS"
+              echo "  just e2e-up      # local k3d cluster"
+              echo
+            '';
+          });
+        }
+        // pkgs.lib.optionalAttrs (system == "x86_64-linux") { desktop = desktopShell; };
 
         # Exposed so `scripts/cue` can reach the pinned binary WITHOUT
         # `nix develop`, whose shellHook prints a banner onto stdout and would

@@ -10,8 +10,10 @@
 # user-facing strings, where they render as garbage to operators.
 #
 # Scope (allowlist, so intentional Russian never trips a false positive):
-#   * Code:        *.rs *.cue *.hbs *.sh *.ts/.tsx *.js/.jsx *.toml
-#                  *.yml/.yaml, Dockerfile*
+#   * Code:        *.rs *.cue *.hbs *.sh *.ts/.tsx *.js/.jsx/.mjs *.toml
+#                  *.yml/.yaml *.json5 *.css *.html *.svg, Dockerfile*
+#                  (.svg is text; a binary file under any scanned suffix
+#                  fails to decode as UTF-8 and is skipped, see below)
 #   * Public docs: README* / CONTRIBUTING* / CODE_OF_CONDUCT* (.md),
 #                  spec.md, docs/**/*.md
 #
@@ -43,7 +45,7 @@ CYRILLIC = re.compile("[\\u0400-\\u04FF\\u0500-\\u052F]")
 
 CODE_SUFFIXES = (
     ".rs", ".cue", ".hbs", ".sh", ".ts", ".tsx", ".js", ".jsx",
-    ".toml", ".yml", ".yaml",
+    ".toml", ".yml", ".yaml", ".json5", ".css", ".html", ".mjs", ".svg",
 )
 PUBLIC_DOC_PREFIXES = ("README", "CONTRIBUTING", "CODE_OF_CONDUCT")
 

@@ -34,6 +34,8 @@ jobs:
       rust_operator: ${{ steps.filter.outputs.rust_operator }}
       bun: ${{ steps.filter.outputs.bun }}
       e2e_lib: ${{ steps.filter.outputs.e2e_lib }}
+      desktop: ${{ steps.filter.outputs.desktop }}
+      desktop_web: ${{ steps.filter.outputs.desktop_web }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
@@ -77,6 +79,35 @@ jobs:
               # The check pins lib.sh's deadline grep to ReconcileTimedOut's
               # Display text, so a reword on the Rust side must wake it too.
               - 'operator/operator-core/src/deadline.rs'
+              - '.github/workflows/lint.yml'
+            # AppRafter Desktop (ADR 0067). The Rust side builds apprafter-core by
+            # path, so its whole path-crate closure wakes it (`cargo tree -p
+            # apprafter-core -e normal,build` in cli/: apprafter-core, cli-core,
+            # cli-providers, backup-core); cli-providers/build.rs runs `cue export`
+            # over platform-stack/cue with the repo-root cue.mod/ and reads both
+            # operator Chart.yaml files.
+            desktop:
+              - 'desktop/**'
+              - 'cli/apprafter-core/**'
+              - 'cli/cli-core/**'
+              - 'cli/cli-providers/**'
+              - 'cli/backup-core/**'
+              - 'cli/Cargo.toml'
+              - 'cli/Cargo.lock'
+              - 'platform-stack/cue/**'
+              - 'cue.mod/**'
+              - 'scripts/cue'
+              - 'operator/charts/*/Chart.yaml'
+              - 'deny.toml'
+              - 'scripts/cargo-deny.sh'
+              - 'scripts/check-desktop-core-lock.sh'
+              - 'scripts/check-desktop-ipc-types.sh'
+              - '.github/workflows/lint.yml'
+            # The desktop's bun package; its CLI-coverage gate reads the
+            # generated CLI reference.
+            desktop_web:
+              - 'desktop/**'
+              - 'docs/reference/cli/commands.json'
               - '.github/workflows/lint.yml'
 
   # The version guards and the workflow linter, on EVERY pull request and push
@@ -255,10 +286,43 @@ jobs:
           cargo fmt --all -- --check
           cargo clippy --all-targets --all-features -- -D warnings
 
+  # AppRafter Desktop (ADR 0067): its own Cargo workspace, linted on Linux here;
+  # test.yml's rust-desktop matrix runs clippy on macOS and Windows.
+  rust-desktop:
+    name: Rust desktop/ (fmt + clippy + core lock closure)
+    needs: changes
+    if: needs.changes.outputs.desktop == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # libpam0g-dev: desktop/os-auth's PAM fallback links -lpam.
+      - name: Install WebKitGTK / GTK (Tauri 2 Linux prerequisites) and libpam
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential pkg-config file \
+            libwebkit2gtk-4.1-dev librsvg2-dev libpam0g-dev
+      # cli/cli-providers/build.rs runs `cue export` — same reason as the rust-cli job.
+      - uses: cue-lang/setup-cue@b0e30e540a2dae47304ebf16586a5b2db023b61c # v2.0.0
+        with:
+          version: v0.17.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: "1.98"
+          components: rustfmt, clippy
+      - name: cargo fmt + clippy
+        working-directory: desktop
+        # NOT `cargo fmt --all`: --all would also format the ../cli path dependencies.
+        run: |
+          cargo fmt -- --check
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: apprafter-core resolves the same in cli/ and desktop/
+        run: bash scripts/check-desktop-core-lock.sh
+
   bun:
     name: Bun / TypeScript (lint)
     needs: changes
-    if: needs.changes.outputs.bun == 'true'
+    if: needs.changes.outputs.bun == 'true' || needs.changes.outputs.desktop_web == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -271,6 +335,8 @@ jobs:
           # / Biome / `bun test` from the workspace root walk into
           # them recursively. Iterating each child separately would
           # re-run the same checks (and re-install deps) for no gain.
+          # desktop/design-source/ is the design export, kept verbatim:
+          # nothing there is a package of ours.
           dirs=""
           while IFS= read -r pkg; do
             d="$(dirname "$pkg")"
@@ -282,6 +348,7 @@ jobs:
           done < <(find . -maxdepth 4 -name package.json \
               -not -path '*/node_modules/*' \
               -not -path '*/skeleton/*' \
+              -not -path './desktop/design-source/*' \
               | sort -u)
           dirs="$(echo "$dirs" | xargs)"
           if [ -n "$dirs" ]; then

@@ -47,6 +47,29 @@ PATTERNS=(
   'providers/**/*.rs'
   'backstage-plugins/**/*.ts'
   'backstage-plugins/**/*.tsx'
+  # AppRafter Desktop (ADR 0067) — core licence. ONE `*`, on purpose: in a git pathspec
+  # without :(glob) magic `*` crosses `/`, so `desktop/*.ts` covers desktop/vite.config.ts AND
+  # desktop/src/**, while `desktop/**/*.ts` would skip every top-level file. Generated ts-rs
+  # files under desktop/src/ipc/generated/ carry the header (the export prepends it).
+  # JSON (package.json, tsconfig.json, biome.json) cannot carry one; json5 can. The SVG
+  # icon source is hand-written and carries one; the rasters generated from it cannot.
+  'desktop/*.rs'
+  'desktop/*.ts'
+  'desktop/*.tsx'
+  'desktop/*.js'
+  'desktop/*.mjs'
+  'desktop/*.css'
+  'desktop/*.html'
+  'desktop/*.toml'
+  'desktop/*.json5'
+  'desktop/*.svg'
+  # The Windows application manifest: an XML comment after the declaration.
+  'desktop/*.xml'
+  # polkit action files (desktop/packaging/linux/): XML too, and the XML declaration must be
+  # line 1, so the SPDX comment is line 2.
+  'desktop/*.policy'
+  # The committed Claude Design export is upstream's file, kept verbatim.
+  ':(exclude)desktop/design-source/*'
   # Platform manifests
   'manifests/**/*.yaml'
   'manifests/**/*.yml'
@@ -70,8 +93,10 @@ PATTERNS=(
   # about markdown pages, so name them explicitly rather than widening
   # the exclusion's meaning.
   'docs/hooks/*.py'
-  'cli/**/Cargo.toml'
-  'cli/**/rust-toolchain.toml'
+  # A single `*` crosses `/` (no :(glob) magic), so these match cli/Cargo.toml and
+  # cli/rust-toolchain.toml as well as every crate's; `cli/**/…` needs a directory level.
+  'cli/*Cargo.toml'
+  'cli/*rust-toolchain.toml'
 )
 
 # Collect tracked files matching any pattern. `git ls-files` honours

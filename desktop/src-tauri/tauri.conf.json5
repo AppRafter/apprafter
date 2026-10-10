@@ -1,0 +1,82 @@
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
+// AppRafter Desktop (ADR 0067). JSON5 so this header fits (`config-json5` on tauri and
+// tauri-build). No "version": desktop/src-tauri/Cargo.toml is the authority (spec §6.1).
+{
+  $schema: "https://schema.tauri.app/config/2",
+  // Space-free: on Linux the badge / .desktop key is "<productName>.desktop" (Linux overrides
+  // productName in tauri.linux.conf.json5).
+  productName: "AppRafter",
+  mainBinaryName: "apprafter-desktop",
+  // Fixes the app-data directories for good; must not end in ".app".
+  identifier: "dev.apprafter.desktop",
+  build: {
+    beforeDevCommand: "bun run dev",
+    beforeBuildCommand: "bun run build",
+    devUrl: "http://localhost:1420",
+    frontendDist: "../dist",
+    removeUnusedCommands: true,
+  },
+  app: {
+    withGlobalTauri: false,
+    // The main window is built in Rust (src/window.rs): its navigation guard and per-OS
+    // chrome need code.
+    windows: [],
+    security: {
+      freezePrototype: true,
+      capabilities: ["main"],
+      csp: {
+        "default-src": "'self'",
+        "script-src": "'self'",
+        "style-src": "'self'",
+        "img-src": "'self' data: blob:",
+        "font-src": "'self'",
+        "connect-src": "ipc: http://ipc.localhost",
+        "object-src": "'none'",
+        "base-uri": "'none'",
+        "form-action": "'none'",
+      },
+      devCsp: {
+        "default-src": "'self'",
+        // React refresh preamble and Vite's injected CSS during `tauri dev` only.
+        "script-src": "'self' 'unsafe-inline'",
+        "style-src": "'self' 'unsafe-inline'",
+        "img-src": "'self' data: blob:",
+        "font-src": "'self'",
+        "connect-src": "ipc: http://ipc.localhost ws://localhost:1420",
+        "object-src": "'none'",
+        "base-uri": "'none'",
+        "form-action": "'none'",
+      },
+    },
+  },
+  bundle: {
+    active: true,
+    icon: ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico"],
+    macOS: { minimumSystemVersion: "13.0" },
+    // What the deb and rpm packages and the launcher say about the app.
+    shortDescription: "AppRafter Desktop: the AppRafter command line, as a desktop app.",
+    longDescription: "AppRafter Desktop works with the same targets as the apprafter\ncommand line. It locks itself and unlocks with the operating\nsystem's own sign-in.",
+    // The menu category (Development on Linux; the Developer Tools category on macOS).
+    category: "DeveloperTool",
+    // Tauri adds WebKitGTK and GTK to `depends` itself; PAM is the app's own (its password
+    // field links -lpam), named by soname for rpm as Tauri names its own. The polkit policy
+    // goes where every polkit version reads actions. polkitd is recommended, not required:
+    // without it the app's password field checks through PAM.
+    linux: {
+      deb: {
+        depends: ["libpam0g"],
+        recommends: ["polkitd"],
+        files: {
+          "/usr/share/polkit-1/actions/dev.apprafter.desktop.policy": "../packaging/linux/dev.apprafter.desktop.policy",
+        },
+      },
+      rpm: {
+        depends: ["libpam.so.0()(64bit)"],
+        recommends: ["polkit"],
+        files: {
+          "/usr/share/polkit-1/actions/dev.apprafter.desktop.policy": "../packaging/linux/dev.apprafter.desktop.policy",
+        },
+      },
+    },
+  },
+}

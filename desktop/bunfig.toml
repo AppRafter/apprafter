@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+# CI calls `bun test` directly (not `bun run test`), so the DOM preload must live here.
+[test]
+preload = ["./src/test/dom.ts"]
+pathIgnorePatterns = ["src-tauri/**", "design-source/**", "dist/**", "target/**", "node_modules/**", "e2e/**"]

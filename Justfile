@@ -112,9 +112,60 @@ test:
         fi
     done
     if find . -name package.json -not -path '*/node_modules/*' | head -1 | grep -q .; then
-        bun test
+        # desktop/'s tests need its own bunfig.toml preload (happy-dom), which a
+        # run from the root does not load; `just desktop-check` runs them.
+        bun test --path-ignore-patterns 'desktop/**'
     else
         echo "==> no package.json — skipping bun test"
+    fi
+
+# AppRafter Desktop (ADR 0067): its own Cargo workspace (desktop/) + bun package.
+# cli/cli-providers/build.rs needs the pinned cue: export CUE_BIN when the PATH cue is not v0.17.1.
+
+# Run the desktop app with hot reload.
+desktop-dev: _desktop-sysdeps
+    cd desktop && bun install --frozen-lockfile && bun run tauri dev
+
+# A debug build of the app, no installer (nothing is published before D.13).
+desktop-build: _desktop-sysdeps
+    cd desktop && bun install --frozen-lockfile && bun run tauri build --debug --no-bundle
+
+# Run after changing a type or a constant in desktop/ipc, and commit the result;
+# scripts/check-desktop-ipc-types.sh (desktop-check, CI) fails on a stale copy. Needs no
+# WebKitGTK: the ipc crate is Tauri-free.
+#
+# Regenerate the TypeScript IPC types in desktop/src/ipc/generated/.
+desktop-ipc-types:
+    cd desktop && cargo test --locked -p apprafter-desktop-ipc --features ts --test export
+
+# Every desktop gate CI runs.
+desktop-check: _desktop-sysdeps
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ( cd desktop && cargo fmt -- --check \
+        && cargo clippy --locked --all-targets --all-features -- -D warnings \
+        && cargo test --locked --all-features )
+    ./scripts/check-desktop-core-lock.sh
+    ./scripts/check-desktop-ipc-types.sh
+    ( cd desktop && bun install --frozen-lockfile && bun run lint && bun test )
+
+# What the Linux build links: WebKitGTK, GTK and their libraries, and PAM (desktop/os-auth's
+# password field links -lpam). No appindicator: the app has no tray yet.
+_desktop-sysdeps:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    [ "$(uname -s)" = Linux ] || exit 0
+    missing=()
+    for m in webkit2gtk-4.1 javascriptcoregtk-4.1 libsoup-3.0 gtk+-3.0 librsvg-2.0 pam; do
+        pkg-config --exists "$m" 2>/dev/null || missing+=("$m")
+    done
+    if [ ${#missing[@]} -gt 0 ]; then
+        echo "ERROR: the desktop build needs WebKitGTK/GTK and PAM development files (pkg-config); missing: ${missing[*]}" >&2
+        echo "  NixOS:          nix develop .#desktop" >&2
+        echo "  Debian, Ubuntu: sudo apt-get install build-essential pkg-config file libwebkit2gtk-4.1-dev librsvg2-dev libpam0g-dev" >&2
+        echo "  Fedora:         sudo dnf group install c-development && sudo dnf install pkgconf-pkg-config file webkit2gtk4.1-devel librsvg2-devel pam-devel" >&2
+        echo "  Arch:           sudo pacman -S --needed base-devel webkit2gtk-4.1 librsvg pam" >&2
+        exit 1
     fi
 
 # Generate the operator chart CRDs from the v1alpha1 CUE schemas (ADR 0047).

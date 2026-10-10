@@ -82,13 +82,13 @@ jobs:
         with:
           version: v4.3.0
 
-      # For the two cargo aggregate entries.
+      # For the three cargo aggregate entries.
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
           toolchain: "1.98"
 
-      # For the two bun aggregate entries.
+      # For the three bun aggregate entries.
       - name: Install bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
 

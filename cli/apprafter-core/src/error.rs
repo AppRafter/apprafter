@@ -47,6 +47,14 @@ pub enum CoreError {
     #[diagnostic(code(apprafter::op::cancelled))]
     Cancelled,
 
+    /// The environment asked for something the client's policy forbids, e.g.
+    /// a non-loopback provider API base in a desktop test build. Refused
+    /// rather than ignored: a walk that silently fell back to the real API
+    /// would send whatever token the store holds there.
+    #[error("{var} is not allowed here: {reason}")]
+    #[diagnostic(code(apprafter::env::unsafe_override))]
+    UnsafeOverride { var: &'static str, reason: String },
+
     /// An error from the CLI's shared crates, passed through unchanged —
     /// except `TargetNotFound` and `NoActiveTarget`, which [`From`] maps
     /// onto the core's own.
@@ -93,6 +101,7 @@ impl From<Cancelled> for CoreError {
 /// `fields` carries the structured data some variants have, so the UI never
 /// parses prose.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct UiError {
     pub code: Option<String>,
     pub message: String,
@@ -135,10 +144,16 @@ impl UiError {
 impl From<&CoreError> for UiError {
     fn from(e: &CoreError) -> Self {
         let mut ui = UiError::from_diagnostic(e);
-        if let CoreError::TargetNotFound { name, available } = e {
-            ui.fields.insert("name".into(), serde_json::json!(name));
-            ui.fields
-                .insert("available".into(), serde_json::json!(available));
+        match e {
+            CoreError::TargetNotFound { name, available } => {
+                ui.fields.insert("name".into(), serde_json::json!(name));
+                ui.fields
+                    .insert("available".into(), serde_json::json!(available));
+            }
+            CoreError::UnsafeOverride { var, .. } => {
+                ui.fields.insert("var".into(), serde_json::json!(var));
+            }
+            _ => {}
         }
         ui
     }
@@ -295,6 +310,40 @@ mod tests {
             UiError::from(&e).code.as_deref(),
             Some("apprafter::op::cancelled")
         );
+    }
+
+    #[test]
+    fn an_unsafe_override_names_its_variable_as_a_field() {
+        let e = CoreError::UnsafeOverride {
+            var: "APPRAFTER_HCLOUD_BASE_URL",
+            reason: "not loopback".into(),
+        };
+        assert_eq!(
+            e.to_string(),
+            "APPRAFTER_HCLOUD_BASE_URL is not allowed here: not loopback"
+        );
+        let ui = UiError::from(&e);
+        assert_eq!(ui.code.as_deref(), Some("apprafter::env::unsafe_override"));
+        assert_eq!(
+            ui.fields["var"],
+            serde_json::json!("APPRAFTER_HCLOUD_BASE_URL")
+        );
+    }
+
+    #[cfg(feature = "ts")]
+    #[test]
+    fn ui_error_has_a_typescript_declaration() {
+        use ts_rs::TS;
+        let decl = UiError::decl(&ts_rs::Config::new().with_large_int("number"));
+        for field in [
+            "code: string | null",
+            "message: string",
+            "help: string | null",
+            "causes: Array<string>",
+        ] {
+            assert!(decl.contains(field), "{field} missing from {decl}");
+        }
+        assert!(decl.contains("fields:"), "{decl}");
     }
 
     #[test]

@@ -7817,22 +7817,33 @@ apprafter-backup` зелёный на ubuntu / macos / windows; в core нет �
 
 > 🏁 SR: трек D
 
-- [ ] `desktop/` (Tauri 2 + React 19 + TS strict + Vite, Biome, `bun test`), `rust-toolchain.toml`
+- [x] `desktop/` (Tauri 2 + React 19 + TS strict + Vite, Biome, `bun test`), `rust-toolchain.toml`
       1.98, лицензия FSL, SPDX-паттерны, CI-фильтр `desktop` (desktop/**, cli/**,
       platform-stack/cue/**, chart'ы оператора, commands.json), cargo-deny, `devShells.desktop`,
-      рецепты `Justfile`, пины в `upstream-pins.json`.
-- [ ] Токены и темы (system / light / dark), раскладка A, вкладки + sidebar, примитивы (форма,
+      рецепты `Justfile`, пины в `upstream-pins.json`. — `bece8e5e`…`f9f57b53`, `d4b1277f` (лицензии в доках).
+- [x] Токены и темы (system / light / dark), раскладка A, вкладки + sidebar, примитивы (форма,
       подтверждение, info, toast), `OperationManager`, настройки (спек §4.6), шорткаты Mod+T /
-      Mod+, / Mod+L.
-- [ ] Гейты: покрытие (`coverage.toml`), дрейф `ts-rs`, замыкание зависимостей `apprafter-core`
-      в двух lock-файлах.
+      Mod+, / Mod+L. — `c8dff346`, `3f70198a`, `439efc69`, `5f569f38`, `a623f742`, `6032a18b`.
+- [x] Гейты: покрытие (`coverage.toml`), дрейф `ts-rs`, замыкание зависимостей `apprafter-core`
+      в двух lock-файлах. — `e1342696`, `490d45f6`, `6cc8c1bc`.
 - [ ] Spike системной аутентификации на трёх ОС (Windows Hello / LocalAuthentication / polkit +
       PAM для AppImage) → экран замка: одна кнопка Unlock, текст по бэкенду секретов.
-- [ ] Исходник дизайна и скриншоты → `desktop/design-source/`.
+      🚧 Код и probe готовы (`desktop/os-auth`, `e81cd3ef`, `d35a6c74`, `512aa272`, `56061e4a`,
+      `c4beaad8`; подключение `dfaf0a1f`…`7bb4ac0f`), Linux-пути проверены в контейнере с
+      настоящим polkitd/PAM (28 кейсов), все три ОС собираются и проходят тесты в CI. Открыто:
+      ручная матрица на железе владельца (`docs/superpowers/plans/2026-10-08-d2d-manual-matrix.md`,
+      локально). Поправка к тексту: поле пароля появляется везде, где polkit не может спросить,
+      не только в AppImage (спека rev 3 §9.1).
+- [x] Исходник дизайна и скриншоты → `desktop/design-source/`. — `f8d25ec3`.
 
 **Acceptance:** приложение запускается на трёх ОС, замок снимается системной аутентификацией,
 гейт покрытия перечисляет все leaf, CI зелёный.
 **Зависит от:** D.0. **Размер:** L.
+
+> 🚧 **D.2 — код готов 2026-10-09** (draft PR #8 поверх #7, CI зелёный на ubuntu/macOS/Windows,
+> включая Playwright-смоук). Не закрыто: первый пункт acceptance — «замок снимается системной
+> аутентификацией» на трёх ОС — ждёт ручной матрицы на железе владельца. До её результатов
+> строки в `docs/status.md` остаются 🚧.
 
 ---
 

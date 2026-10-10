@@ -24,6 +24,8 @@ jobs:
       rust_cli: ${{ steps.filter.outputs.rust_cli }}
       rust_operator: ${{ steps.filter.outputs.rust_operator }}
       bun: ${{ steps.filter.outputs.bun }}
+      desktop: ${{ steps.filter.outputs.desktop }}
+      desktop_web: ${{ steps.filter.outputs.desktop_web }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
@@ -39,6 +41,37 @@ jobs:
             bun:
               - 'landing/**'
               - 'backstage-plugins/**'
+              - '.github/workflows/test.yml'
+            # AppRafter Desktop (ADR 0067). The Rust side builds apprafter-core by
+            # path, so its whole path-crate closure wakes it (`cargo tree -p
+            # apprafter-core -e normal,build` in cli/: apprafter-core, cli-core,
+            # cli-providers, backup-core); cli-providers/build.rs runs `cue export`
+            # over platform-stack/cue with the repo-root cue.mod/ and reads both
+            # operator Chart.yaml files.
+            desktop:
+              - 'desktop/**'
+              - 'cli/apprafter-core/**'
+              - 'cli/cli-core/**'
+              - 'cli/cli-providers/**'
+              - 'cli/backup-core/**'
+              - 'cli/Cargo.toml'
+              - 'cli/Cargo.lock'
+              - 'platform-stack/cue/**'
+              - 'cue.mod/**'
+              - 'scripts/cue'
+              - 'operator/charts/*/Chart.yaml'
+              - 'deny.toml'
+              - 'scripts/cargo-deny.sh'
+              - 'scripts/check-desktop-core-lock.sh'
+              - 'scripts/check-desktop-ipc-types.sh'
+              - 'scripts/test-osauth-linux.sh'
+              - 'scripts/test-desktop-packages.sh'
+              - '.github/workflows/test.yml'
+            # The desktop's bun package; its CLI-coverage gate reads the
+            # generated CLI reference.
+            desktop_web:
+              - 'desktop/**'
+              - 'docs/reference/cli/commands.json'
               - '.github/workflows/test.yml'
 
   rust-cli:
@@ -150,6 +183,177 @@ jobs:
             *) exit 1 ;;
           esac
 
+  # AppRafter Desktop (ADR 0067) ships for Linux, macOS and Windows, so it is
+  # tested and built on all three. fail-fast off for the reason rust-cli gives.
+  rust-desktop:
+    name: cargo test desktop/ (${{ matrix.os }})
+    needs: changes
+    if: needs.changes.outputs.desktop == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    # A cold Tauri build on Windows takes 15–25 minutes.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # libpam0g-dev: desktop/os-auth's PAM fallback links -lpam. dbus-daemon:
+      # desktop/src-tauri/tests/theme_portal.rs starts a private bus of its own.
+      - if: runner.os == 'Linux'
+        name: Install WebKitGTK / GTK (Tauri 2 Linux prerequisites), libpam and dbus-daemon
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential pkg-config file \
+            libwebkit2gtk-4.1-dev librsvg2-dev libpam0g-dev dbus-daemon
+      # cli/cli-providers/build.rs runs `cue export` — same reason as rust-cli.
+      - uses: cue-lang/setup-cue@b0e30e540a2dae47304ebf16586a5b2db023b61c # v2.0.0
+        with:
+          version: v0.17.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: "1.98"
+          components: clippy
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.4.x"
+      # Clippy runs here on macOS and Windows because lint.yml lints on Linux only.
+      - if: runner.os != 'Linux'
+        name: cargo clippy (macOS, Windows)
+        working-directory: desktop
+        shell: bash
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: cargo test
+        working-directory: desktop
+        shell: bash
+        run: cargo test --locked --all-features --no-fail-fast
+      # The committed TypeScript IPC types match a fresh export. One leg is enough: the
+      # export writes the same bytes on every OS.
+      - if: runner.os == 'Linux'
+        name: TypeScript IPC types are current
+        run: bash scripts/check-desktop-ipc-types.sh
+      # Evidence that the app builds on this OS: a debug binary, no installer.
+      - name: tauri build --debug --no-bundle
+        working-directory: desktop
+        shell: bash
+        run: |
+          bun install --frozen-lockfile
+          bun run tauri build --debug --no-bundle
+
+  # The Linux backends (desktop/os-auth) against a real polkitd and a real PAM stack, and the
+  # session watch against real D-Bus daemons: every case of
+  # desktop/os-auth/tests/{polkit,pam,session}_container.rs in a fresh Debian container,
+  # through the same script a developer runs. Rootful podman: each case puts the test in a
+  # logind-style session cgroup, and a rootless podman can write the cgroup tree only under a
+  # systemd user session, which the runner does not have. The script fails, never skips, when
+  # podman is missing.
+  osauth-linux:
+    name: OS authentication on Linux (polkit and PAM containers)
+    needs: changes
+    if: needs.changes.outputs.desktop == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The tests link -lpam (desktop/os-auth's PAM fallback).
+      - name: Install libpam
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libpam0g-dev
+      # The test links apprafter-core, so cli/cli-providers/build.rs runs `cue export`.
+      - uses: cue-lang/setup-cue@b0e30e540a2dae47304ebf16586a5b2db023b61c # v2.0.0
+        with:
+          version: v0.17.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: "1.98"
+      - name: polkit and PAM cases
+        env:
+          PODMAN: sudo podman
+        run: bash scripts/test-osauth-linux.sh
+
+  # The desktop's Linux packages: a release build bundled as a deb and an rpm, each installed
+  # into a fresh container of a distribution it targets (Debian 13, Fedora 44) by
+  # scripts/test-desktop-packages.sh, which checks the polkit policy the package carries
+  # (pkaction), that every library resolves, and that the binary starts. Built on ubuntu-24.04
+  # (glibc 2.39), so they run on distributions at least that new. Unsigned test builds, kept as
+  # the `apprafter-desktop-linux-packages` artifact only when every check passed; nothing
+  # publishes them. No appindicator package: the app has no tray, and this build proves it
+  # needs none. Rootful podman, as osauth-linux runs it.
+  desktop-linux-packages:
+    name: desktop Linux packages (deb, rpm)
+    needs: changes
+    if: needs.changes.outputs.desktop == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install WebKitGTK / GTK (Tauri 2 Linux prerequisites) and libpam
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential pkg-config file \
+            libwebkit2gtk-4.1-dev librsvg2-dev libpam0g-dev
+      # cli/cli-providers/build.rs runs `cue export` — same reason as rust-cli.
+      - uses: cue-lang/setup-cue@b0e30e540a2dae47304ebf16586a5b2db023b61c # v2.0.0
+        with:
+          version: v0.17.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: "1.98"
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.4.x"
+      - name: tauri build --bundles deb,rpm
+        working-directory: desktop
+        run: |
+          bun install --frozen-lockfile
+          bun run tauri build --bundles deb,rpm
+      - name: install and check the packages (Debian 13, Fedora 44)
+        env:
+          PODMAN: sudo podman
+        run: |
+          bash scripts/test-desktop-packages.sh \
+            desktop/target/release/bundle/deb/*.deb desktop/target/release/bundle/rpm/*.rpm
+      - name: upload the packages
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: apprafter-desktop-linux-packages
+          path: |
+            desktop/target/release/bundle/deb/*.deb
+            desktop/target/release/bundle/rpm/*.rpm
+          if-no-files-found: error
+          retention-days: 30
+
+  # One check under the fixed name `cargo test desktop/`, whatever the matrix
+  # does — the same reasoning and logic as rust-cli-result above. It also
+  # stands for osauth-linux and desktop-linux-packages, the desktop's other
+  # test jobs.
+  rust-desktop-result:
+    name: cargo test desktop/
+    needs: [changes, rust-desktop, osauth-linux, desktop-linux-packages]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: every desktop test job passed
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          RESULT: ${{ needs.rust-desktop.result }}
+          OSAUTH: ${{ needs.osauth-linux.result }}
+          PACKAGES: ${{ needs.desktop-linux-packages.result }}
+        run: |
+          echo "changes: $CHANGES, rust-desktop: $RESULT, osauth-linux: $OSAUTH," \
+            "desktop-linux-packages: $PACKAGES"
+          if [ "$CHANGES" != success ]; then
+            exit 1
+          fi
+          for result in "$RESULT" "$OSAUTH" "$PACKAGES"; do
+            case "$result" in
+              success | skipped) ;;
+              *) exit 1 ;;
+            esac
+          done
+
   rust-operator:
     name: cargo test operator/
     needs: changes
@@ -181,7 +385,7 @@ jobs:
   cargo-deny:
     name: cargo-deny (advisories, licences, sources)
     needs: changes
-    if: needs.changes.outputs.rust_cli == 'true' || needs.changes.outputs.rust_operator == 'true'
+    if: needs.changes.outputs.rust_cli == 'true' || needs.changes.outputs.rust_operator == 'true' || needs.changes.outputs.desktop == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -201,7 +405,7 @@ jobs:
   bun:
     name: bun test
     needs: changes
-    if: needs.changes.outputs.bun == 'true'
+    if: needs.changes.outputs.bun == 'true' || needs.changes.outputs.desktop_web == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -213,6 +417,8 @@ jobs:
           # walks the whole tree from the workspace root — running
           # again per child re-discovers the same suite and re-
           # installs deps for no gain.
+          # desktop/design-source/ is the design export, kept verbatim:
+          # nothing there is a package of ours.
           dirs=""
           while IFS= read -r pkg; do
             d="$(dirname "$pkg")"
@@ -224,6 +430,7 @@ jobs:
           done < <(find . -maxdepth 4 -name package.json \
               -not -path '*/node_modules/*' \
               -not -path '*/skeleton/*' \
+              -not -path './desktop/design-source/*' \
               | sort -u)
           dirs="$(echo "$dirs" | xargs)"
           if [ -n "$dirs" ]; then
@@ -240,3 +447,40 @@ jobs:
             (cd "$dir" && bun install --frozen-lockfile && bun test)
             echo "::endgroup::"
           done
+
+  # A browser smoke of the desktop shell on the mock IPC (desktop/e2e/): Chromium and
+  # WebKit, both themes, and Windows chrome once. Playwright's runner runs under node, so
+  # node is set up beside bun; `--no-install` keeps npx on the locked @playwright/test,
+  # whose version picks the browser builds it installs. Screenshots are attached to the
+  # report, not compared.
+  desktop-e2e:
+    name: desktop e2e (playwright)
+    needs: changes
+    if: needs.changes.outputs.desktop_web == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.4.x"
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+      - name: bun install
+        working-directory: desktop
+        run: bun install --frozen-lockfile
+      - name: install Chromium and WebKit
+        working-directory: desktop
+        run: npx --no-install playwright install --with-deps chromium webkit
+      - name: playwright test
+        working-directory: desktop
+        run: bun run e2e
+      - name: upload the HTML report
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: desktop-e2e-report-${{ github.run_attempt }}
+          path: desktop/e2e/playwright-report
+          if-no-files-found: ignore
+          retention-days: 14

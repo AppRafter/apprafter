@@ -1,0 +1,144 @@
+/* SPDX-License-Identifier: FSL-1.1-Apache-2.0 */
+
+/* Design tokens. The colour blocks are the design file's THEMES (27 keys per theme); twelve of
+   them, plus --code-border, equal the landing page's tokens (tokens.test.ts pins both). Dark is
+   the default. JS resolves the `system` setting and sets data-theme on <html>, so there is no
+   prefers-color-scheme query here and the native window theme follows the same answer. */
+
+/* Constant in both themes. */
+:root {
+  --font-sans: "Roboto", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "Roboto Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+
+  /* Landing's code border; the desktop borders code blocks with --border. */
+  --code-border: #1e293b;
+  --code-comment: #64748b;
+  /* Text on the solid danger button, and the Windows close caption on hover. */
+  --danger-fg: #ffffff;
+  --caption-close-bg: #e81123;
+  --caption-close-fg: #ffffff;
+  /* The log viewer sits on the dark --code-bg in both themes. */
+  --log-ts: #64748b;
+  --log-pod: #5eead4;
+  --log-info: #94a3b8;
+  --log-warn: #fbbf24;
+  --log-error: #f87171;
+  --log-debug: #64748b;
+  --log-msg: var(--code-fg);
+  --log-msg-error: #fca5a5;
+  /* The design removes every outline; keyboard focus gets this ring instead. An outline value
+     (base.css), so it never replaces an element's own box-shadow. */
+  --focus-ring: 2px solid var(--accent);
+
+  /* Type scale. */
+  --fs-10: 10px;
+  --fs-10-5: 10.5px;
+  --fs-11: 11px;
+  --fs-11-5: 11.5px;
+  --fs-12: 12px;
+  --fs-12-5: 12.5px;
+  --fs-13: 13px;
+  --fs-13-5: 13.5px;
+  --fs-14: 14px;
+  --fs-15: 15px;
+  --fs-16: 16px;
+  /* State panel titles. */
+  --fs-18: 18px;
+  --fs-20: 20px;
+  --fs-22: 22px;
+
+  /* Radii. */
+  --r-1: 1px;
+  --r-2: 2px;
+  --r-3: 3px;
+  --r-4: 4px;
+  --r-6: 6px;
+  --r-full: 999px;
+
+  /* Control heights. */
+  --h-20: 20px;
+  --h-22: 22px;
+  --h-24: 24px;
+  --h-26: 26px;
+  --h-28: 28px;
+  --h-30: 30px;
+  --h-32: 32px;
+  --h-34: 34px;
+  --h-36: 36px;
+  --h-38: 38px;
+
+  /* Stacking: row menu, then the overlays from wizard to toast. */
+  --z-menu: 20;
+  --z-dialog: 50;
+  --z-doctor: 55;
+  --z-form: 58;
+  --z-confirm: 60;
+  --z-toast: 70;
+
+  /* Motion: the switch knob, and a meter's width. */
+  --t-fast: 120ms;
+  --t-meter: 400ms;
+}
+
+:root,
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #0a0e1a;
+  --surface: #111827;
+  --surface-2: #161f30;
+  --fg: #f1f5f9;
+  --fg-muted: #94a3b8;
+  --fg-faint: #64748b;
+  --accent: #14b8a6;
+  --accent-2: #0d9488;
+  --accent-text: #2dd4bf;
+  --accent-fg: #03110e;
+  --accent-tint: rgba(20, 184, 166, 0.12);
+  --border: #1e293b;
+  --border-strong: #2a3a55;
+  --code-bg: #0c1322;
+  --code-fg: #cbd5e1;
+  --titlebar: #070a13;
+  --ok: #2dd4bf;
+  --ok-tint: rgba(20, 184, 166, 0.14);
+  --warn: #fbbf24;
+  --warn-tint: rgba(245, 158, 11, 0.12);
+  --err: #f87171;
+  --err-tint: rgba(239, 68, 68, 0.13);
+  --seg-platform: #475569;
+  --seg-data: #0f766e;
+  --seg-apps: #14b8a6;
+  --overlay: rgba(3, 6, 14, 0.66);
+  --shadow: 0 24px 64px rgba(0, 0, 0, 0.55);
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #fafafa;
+  --surface: #ffffff;
+  --surface-2: #f1f5f9;
+  --fg: #0f172a;
+  --fg-muted: #475569;
+  --fg-faint: #64748b;
+  --accent: #14b8a6;
+  --accent-2: #0d9488;
+  --accent-text: #0f766e;
+  --accent-fg: #03110e;
+  --accent-tint: rgba(20, 184, 166, 0.1);
+  --border: #e2e8f0;
+  --border-strong: #cbd5e1;
+  --code-bg: #0f172a;
+  --code-fg: #cbd5e1;
+  --titlebar: #f1f5f9;
+  --ok: #0f766e;
+  --ok-tint: rgba(20, 184, 166, 0.12);
+  --warn: #b45309;
+  --warn-tint: rgba(245, 158, 11, 0.14);
+  --err: #dc2626;
+  --err-tint: rgba(239, 68, 68, 0.09);
+  --seg-platform: #94a3b8;
+  --seg-data: #0f766e;
+  --seg-apps: #2dd4bf;
+  --overlay: rgba(15, 23, 42, 0.32);
+  --shadow: 0 24px 64px rgba(15, 23, 42, 0.18);
+}

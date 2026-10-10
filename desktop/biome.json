@@ -1,0 +1,65 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.5.15/schema.json",
+  "files": {
+    "includes": [
+      "**",
+      "!!target",
+      "!!src-tauri/target",
+      "!!src-tauri/gen",
+      "!!dist",
+      "!!e2e/playwright-report",
+      "!!e2e/test-results",
+      "!!design-source",
+      "!src/ipc/generated"
+    ]
+  },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "preset": "recommended",
+      "style": {
+        "useNamingConvention": "off",
+        "noRestrictedImports": {
+          "level": "error",
+          "options": {
+            "paths": {
+              "@phosphor-icons/react": "Import icons from src/components/icons.ts: the barrel loads all 1,512 icon modules."
+            }
+          }
+        },
+        "noRestrictedGlobals": {
+          "level": "error",
+          "options": {
+            "deniedGlobals": {
+              "localStorage": "State lives in Rust; WKWebView storage ignores the data-dir override.",
+              "sessionStorage": "State lives in Rust; WKWebView storage ignores the data-dir override.",
+              "indexedDB": "State lives in Rust; WKWebView storage ignores the data-dir override."
+            }
+          }
+        }
+      },
+      "suspicious": {
+        "noExplicitAny": "warn"
+      }
+    }
+  },
+  "formatter": {
+    "enabled": true,
+    "indentStyle": "space",
+    "indentWidth": 2,
+    "lineWidth": 100,
+    "lineEnding": "lf"
+  },
+  "javascript": {
+    "formatter": {
+      "quoteStyle": "single",
+      "trailingCommas": "all",
+      "semicolons": "always"
+    }
+  },
+  "json": {
+    "formatter": {
+      "indentWidth": 2
+    }
+  }
+}

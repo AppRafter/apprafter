@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+# AppRafter Desktop (ADR 0067) — its own Cargo workspace, separate from cli/ so the Tauri graph
+# never enters cli/Cargo.lock (design spec §3.4). The shared closure of apprafter-core must
+# resolve to the same versions here as in cli/ (scripts/check-desktop-core-lock.sh): this lock
+# was seeded from cli/Cargo.lock — never run a bare `cargo update` here, only
+# `cargo update -p <desktop-only crate>`; a newer shared crate moves cli/Cargo.lock first.
+[workspace]
+resolver = "2"
+members = ["src-tauri", "ipc", "os-auth"]
+
+[workspace.package]
+edition      = "2021"
+rust-version = "1.90"
+license      = "FSL-1.1-Apache-2.0"
+publish      = false
+authors      = ["AppRafter Authors"]
+repository   = "https://github.com/apprafter/apprafter"
+
+[workspace.dependencies]
+apprafter-core = { path = "../cli/apprafter-core" }
+cli-core       = { path = "../cli/cli-core" }
+serde          = { version = "1", features = ["derive"] }
+serde_json     = "1"
+# Tauri's default features but `dbus`, which makes tao read the XDG portal's colour scheme itself:
+# once at window creation, blocking the main thread for up to 5 s, and again on every change,
+# forcing it over the app's own theme. src-tauri/src/theme.rs owns the theme on Linux instead
+# (GOTCHA-107). Keep it off: Cargo unifies features, so any crate in the graph that takes tauri,
+# tauri-runtime-wry or tao with their default features turns it back on, which theme.rs's
+# `tao_has_no_portal_reading_of_its_own` catches in this lock. tao's taskbar badge does not need
+# it (tao loads libunity at run time); the D.5 tray badge needs a LauncherEntry of its own (WI-433).
+tauri          = { version = "~2.12", default-features = false, features = [
+    "config-json5",
+    "wry",
+    "compression",
+    "common-controls-v6",
+    "dynamic-acl",
+    "x11",
+] }
+tauri-build    = { version = "~2.7", features = ["config-json5"] }
+
+[profile.release]
+# Panics in spawn_blocking must stay catchable (D.2c maps a JoinError to
+# apprafter::desktop::internal); `abort` would make that mapping dead code.
+panic = "unwind"

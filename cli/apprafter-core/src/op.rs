@@ -10,6 +10,7 @@ use serde::Serialize;
 
 /// How much a mutation can lose, which decides the confirmation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum PlanClass {
     /// Undone by running the opposite operation; no confirmation.
@@ -22,6 +23,7 @@ pub enum PlanClass {
 
 /// One object a plan changes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct PlannedChange {
     /// What kind of object, e.g. `Target`, `ResourceClaim`.
     pub kind: String,
@@ -51,6 +53,7 @@ pub struct Plan<T> {
 
 /// How an executed operation ended.
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum Outcome<T> {
     Completed {
@@ -93,6 +96,29 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&stopped).unwrap()["status"],
             "cancelled"
+        );
+    }
+
+    #[cfg(feature = "ts")]
+    #[test]
+    fn plan_parts_and_outcome_have_typescript_declarations() {
+        use ts_rs::TS;
+        let cfg = ts_rs::Config::new().with_large_int("number");
+        let class = PlanClass::decl(&cfg);
+        assert!(
+            class.contains("\"reversible\"") && class.contains("\"destructive\""),
+            "{class}"
+        );
+        let change = PlannedChange::decl(&cfg);
+        assert!(
+            change.contains("kind: string") && change.contains("change: string"),
+            "{change}"
+        );
+        let outcome = Outcome::<()>::decl(&cfg);
+        assert!(
+            outcome.contains("\"status\": \"completed\"")
+                || outcome.contains("status: \"completed\""),
+            "{outcome}"
         );
     }
 
