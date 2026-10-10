@@ -119,6 +119,17 @@ describe('DoctorCheckRow', () => {
     expect(onAction).toHaveBeenLastCalledWith(fix);
   });
 
+  test('a stored key path with no file offers to change the key, passing its fix', async () => {
+    const onAction = mock();
+    const fix: CheckFix = { kind: 'ssh_key_missing', path: '/home/alex/.ssh/gone.pub' };
+    const { user } = row(
+      check({ id: 'ssh_key', status: 'fail', title: 'SSH key file exists', fix }),
+      onAction,
+    );
+    await user.click(screen.getByRole('button', { name: 'Change SSH key' }));
+    expect(onAction).toHaveBeenLastCalledWith(fix);
+  });
+
   test('a fix with no screen has no button; without onAction no fix has one', () => {
     row(
       check({

@@ -32,7 +32,7 @@ export interface DoctorOverlayProps {
   readonly onClose: () => void;
   readonly onAddTarget: () => void;
   readonly onToolchain: () => void;
-  /** The `configure_ssh_key` fix: the Target screen's key change for this target. */
+  /** The `configure_ssh_key` and `ssh_key_missing` fixes: the Target screen's key change. */
   readonly onChangeSshKey: () => void;
 }
 
@@ -85,7 +85,7 @@ export function DoctorOverlay({
 
   const onAction = (fix: CheckFix) => {
     if (fix.kind === 'install_tool') onToolchain();
-    else if (fix.kind === 'configure_ssh_key') onChangeSshKey();
+    else if (fix.kind === 'configure_ssh_key' || fix.kind === 'ssh_key_missing') onChangeSshKey();
     else if (fix.kind === 'add_target') {
       onClose();
       onAddTarget();

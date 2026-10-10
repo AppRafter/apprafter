@@ -2,7 +2,7 @@
 // One doctor row (the design's): a tinted status badge, the core's title, its detail (a skipped
 // row's detail is why it did not run), and the fix line, with the screen that fixes it when the
 // app has one: a missing tool the toolchain, a missing target the add-target wizard, a target with
-// no SSH key the key change.
+// no SSH key, or a key file that is gone, the key change.
 import { Button } from '../../components/Button';
 import { ArrowRightIcon } from '../../components/icons';
 import { Tag } from '../../components/Tag';
@@ -32,6 +32,7 @@ const ACTIONS: Partial<Record<CheckFix['kind'], string>> = {
   install_tool: 'Show the toolchain',
   add_target: 'Add a target',
   configure_ssh_key: 'Change SSH key',
+  ssh_key_missing: 'Change SSH key',
 };
 
 export interface DoctorCheckRowProps {
