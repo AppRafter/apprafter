@@ -18,6 +18,7 @@ import { useToast } from '../../components/Toast';
 import { Wizard } from '../../components/Wizard';
 import * as api from '../../ipc/api';
 import { uiErrorOf } from '../../ipc/api';
+import { keepEndedAway } from '../../ipc/away';
 import { CORE_ERROR_CODES } from '../../ipc/generated/core-errors';
 import type { DraftId } from '../../ipc/generated/DraftId';
 import { DESKTOP_ERROR_CODES } from '../../ipc/generated/errors';
@@ -28,11 +29,13 @@ import type { TargetAdded } from '../../ipc/generated/TargetAdded';
 import type { TokenVerified } from '../../ipc/generated/TokenVerified';
 import { HETZNER_TOKEN_LEN, SUPPORTED_PROVIDERS, TIERS } from '../../ipc/generated/target';
 import type { UiError } from '../../ipc/generated/UiError';
-import { failureOf, isCancelled, reportUnlessLocked, runPlan } from '../../ipc/plans';
+import { awayLine, failureOf, isCancelled, reportUnlessLocked, runPlan } from '../../ipc/plans';
 import { usePlatform } from '../../state/platform';
 import { useRead } from '../../state/read';
+import { useScope } from '../../state/scope';
 import { secretCopy } from '../../state/secretCopy';
 import { refreshTargets, TARGETS_KEY } from '../../state/targets';
+import { useWhenShown } from '../../state/whenShown';
 import { choosable, latencyView, offerIn } from '../machine/catalogue';
 import { MachinePicker } from '../machine/MachinePicker';
 import { keyRefusal } from '../target/sshKey';
@@ -62,6 +65,12 @@ const plainError = (message: string): UiError => ({
   causes: [],
   fields: {},
 });
+
+/** A save's end, and the plan it ran. */
+type SaveEnded = { readonly plan: PlanView } & (
+  | { readonly added: TargetAdded }
+  | { readonly error: UiError }
+);
 
 function discardDraft(draftId: DraftId) {
   api.targetDraftDiscard(draftId).catch(reportUnlessLocked(`target_draft_discard ${draftId}`));
@@ -119,25 +128,19 @@ export function AddTargetWizard({ onClose }: { onClose: () => void }) {
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<UiError | null>(null);
   const [confirm, setConfirm] = useState<PlanView | null>(null);
-  // The draft in Rust when the wizard goes: closed by hand it is discarded; a lock drops it in
-  // Rust (the discard is then refused as locked, which is expected).
-  const draft = useRef<DraftId | null>(null);
-  draft.current = state.draft;
-  // Whether the wizard is still there to show a save's end: a lock or a closed tab unmounts it
-  // while Rust runs the plan on, and the end then shows at the app level (ipc/away.ts).
-  const alive = useRef(true);
+  // The draft the wizard holds is held in its scope (ipc/lifecycle.ts): when the wizard goes —
+  // closed by its owner, or the lock (Rust drops it too; the discard is then refused as locked,
+  // which is expected) — it is discarded. Never on an unmount: a hidden screen keeps its draft.
+  // Synced after each render the draft changed in; a draft a plan took is released, not
+  // discarded.
+  const scope = useScope();
+  const held = useRef<{ readonly id: DraftId; readonly off: () => void } | null>(null);
   useEffect(() => {
-    alive.current = true;
-    return () => {
-      alive.current = false;
-    };
-  }, []);
-  useEffect(
-    () => () => {
-      if (draft.current !== null) discardDraft(draft.current);
-    },
-    [],
-  );
+    if (held.current?.id === state.draft) return;
+    held.current?.off();
+    const id = state.draft;
+    held.current = id === null ? null : { id, off: scope.onGone(() => discardDraft(id)) };
+  });
 
   const forgetDraft = (message: string | null) => {
     dispatch({ type: 'forgetDraft' });
@@ -279,19 +282,38 @@ export function AddTargetWizard({ onClose }: { onClose: () => void }) {
     onClose();
   };
 
-  // The Save click confirmed it: run it here and show a failure inline.
+  /** A save's end: shown when the wizard is; if it went first, the app shows it. */
+  const saveEnded = useWhenShown(
+    (end: SaveEnded) => {
+      if ('added' in end) {
+        finishAdded(end.added);
+      } else {
+        setSaving(false);
+        setSaveError(end.error);
+      }
+    },
+    (end) => {
+      const error = 'added' in end ? null : end.error;
+      keepEndedAway({ opId: end.plan.opId, ...awayLine(end.plan.title, error) });
+    },
+  );
+
+  // The Save click confirmed it: run it here and show a failure inline. Its screen gone while it
+  // runs (the lock), the end shows at the app level (startPlan keeps it away).
   const runPlanned = async (plan: PlanView) => {
     setSaving(true);
     try {
       const added = await runPlan<TargetAdded>(plan.opId, undefined, {
         title: plan.title,
-        shown: () => alive.current,
+        shown: () => !scope.gone(),
       });
-      if (alive.current) finishAdded(added);
+      if (!scope.gone()) saveEnded({ plan, added });
     } catch (reason) {
-      if (!alive.current) return;
-      setSaving(false);
-      setSaveError(isCancelled(reason) ? plainError(SAVE_CANCELLED) : failureOf(reason));
+      if (scope.gone()) return;
+      saveEnded({
+        plan,
+        error: isCancelled(reason) ? plainError(SAVE_CANCELLED) : failureOf(reason),
+      });
     }
   };
 

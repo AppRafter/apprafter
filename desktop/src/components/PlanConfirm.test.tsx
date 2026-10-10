@@ -1,28 +1,42 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 import { afterEach, beforeEach, expect, mock, test } from 'bun:test';
+import { QueryClientProvider } from '@tanstack/react-query';
 import { Channel } from '@tauri-apps/api/core';
 import { clearMocks } from '@tauri-apps/api/mocks';
-import { screen, waitFor } from '@testing-library/react';
+import { act, cleanup, render, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import * as api from '../ipc/api';
+import { endedAwaySnapshot, resetEndedAway } from '../ipc/away';
 import { CORE_ERROR_CODES } from '../ipc/generated/core-errors';
 import { DESKTOP_ERROR_CODES } from '../ipc/generated/errors';
 import type { OpEvent } from '../ipc/generated/OpEvent';
 import type { PlanView } from '../ipc/generated/PlanView';
 import type { UiError } from '../ipc/generated/UiError';
+import { resetLifecycle } from '../ipc/lifecycle';
 import { installMockIpc, mockOps } from '../ipc/mock';
 import type { MockResult } from '../ipc/mock/ops';
 import { resetOperations } from '../ipc/operations';
+import { PlatformContext } from '../state/platform';
+import { createQueryClient } from '../state/queryClient';
+import { appInfo } from '../test/fixtures';
+import { planParts } from '../test/flows';
+import { completed, failed, installHarness, uiError as uiErrorOf } from '../test/ipc';
 import { renderScreen } from '../test/screens';
 import { settleIpc } from '../test/settle';
+import { tabHost } from '../test/tab';
 import { PlanConfirm } from './PlanConfirm';
+import { ToastProvider } from './Toast';
 
 beforeEach(async () => {
   installMockIpc({ opDelayMs: 0 });
   await api.unlock();
 });
 afterEach(async () => {
+  cleanup();
   await settleIpc();
   resetOperations();
+  resetEndedAway();
+  resetLifecycle();
   clearMocks();
 });
 
@@ -142,4 +156,97 @@ test('a reversible plan has no dialog: it is refused', () => {
   } finally {
     console.error = quiet;
   }
+});
+
+/**
+ * A confirm in a tab (test/tab.tsx), its plan run waiting on the IPC harness until `end(event)`;
+ * the tab can be hidden, shown and closed as the Shell does.
+ */
+async function confirmedInTab() {
+  clearMocks();
+  const h = installHarness();
+  let channel: { id: number } | null = null;
+  h.answer('op_execute', ({ onEvent }: Record<string, unknown>) => {
+    channel = onEvent as { id: number };
+    return 2;
+  });
+  const view: PlanView = { ...planParts({ title: 'Rename prod' }), opId: h.newOperation([]) };
+  const handles = handlers();
+  const tab = tabHost('prod');
+  render(
+    <QueryClientProvider client={createQueryClient()}>
+      <PlatformContext value={appInfo()}>
+        <ToastProvider>
+          <tab.Tab>
+            <PlanConfirm
+              view={view}
+              title="Rename prod?"
+              confirmLabel="Rename"
+              auth={null}
+              {...handles}
+            />
+          </tab.Tab>
+        </ToastProvider>
+      </PlatformContext>
+    </QueryClientProvider>,
+  );
+  await userEvent.setup().click(screen.getByRole('button', { name: 'Rename' }));
+  await waitFor(() => expect(channel).not.toBeNull());
+  const internals = (
+    window as unknown as { __TAURI_INTERNALS__: { runCallback(id: number, data: unknown): void } }
+  ).__TAURI_INTERNALS__;
+  const end = async (message: OpEvent) => {
+    await act(async () => {
+      internals.runCallback(channel?.id ?? -1, { index: 0, message });
+      await settleIpc();
+    });
+  };
+  return { h, view, handles, tab, end };
+}
+
+test('a plan that ends while its tab is hidden: onDone once the tab is back, nothing kept away', async () => {
+  const { handles, tab, end } = await confirmedInTab();
+  tab.hide();
+  await end(completed({ from: 'prod', to: 'lab' }));
+  expect(handles.onDone).not.toHaveBeenCalled();
+  tab.show();
+  await waitFor(() => expect(handles.onDone).toHaveBeenCalledWith({ from: 'prod', to: 'lab' }));
+  expect(handles.onDone).toHaveBeenCalledTimes(1);
+  await waitFor(() => expect(handles.onClose).toHaveBeenCalledTimes(1));
+  expect(endedAwaySnapshot()).toEqual([]);
+});
+
+test('a plan that fails while its tab is hidden: onFailed once the tab is back', async () => {
+  const { handles, tab, end } = await confirmedInTab();
+  tab.hide();
+  await end(failed(uiErrorOf('apprafter::target::busy', 'prod is busy')));
+  tab.show();
+  await waitFor(() =>
+    expect(handles.onFailed.mock.calls.map(([e]) => (e as UiError).message)).toEqual([
+      'prod is busy',
+    ]),
+  );
+  expect(handles.onDone).not.toHaveBeenCalled();
+  expect(endedAwaySnapshot()).toEqual([]);
+});
+
+test('its tab closed before it was back, the end it got while hidden shows at the app level', async () => {
+  const { view, handles, tab, end } = await confirmedInTab();
+  tab.hide();
+  await end(completed({ from: 'prod', to: 'lab' }));
+  tab.close();
+  expect(endedAwaySnapshot()).toEqual([
+    { opId: view.opId, text: 'Rename prod: done.', failed: false },
+  ]);
+  expect(handles.onDone).not.toHaveBeenCalled();
+});
+
+test('its tab closed while the plan runs: the end shows at the app level', async () => {
+  const { view, handles, tab, end } = await confirmedInTab();
+  tab.close();
+  await end(completed({ from: 'prod', to: 'lab' }));
+  expect(endedAwaySnapshot()).toEqual([
+    { opId: view.opId, text: 'Rename prod: done.', failed: false },
+  ]);
+  expect(handles.onDone).not.toHaveBeenCalled();
 });

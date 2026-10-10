@@ -172,13 +172,17 @@ describe('provider and token', () => {
     );
   });
 
-  test('the wizard going away discards the draft it holds', async () => {
+  test('the wizard going away discards the draft it holds, once; an unmount alone does not', async () => {
     h.read('op_start_verify_token', [completed({ draftId: 7, elapsedMs: 182 })]);
-    const { user, unmount } = renderWizard();
+    const { user, unmount, gone } = renderWizard();
     await user.type(screen.getByLabelText('API token'), TOKEN);
     await user.click(screen.getByRole('button', { name: 'Verify and continue' }));
     await waitFor(() => expect(currentStep()).toContain('Machine'));
+    // An unmount with no lifecycle event (an Activity hide runs the same cleanups) keeps it.
     unmount();
+    expect(h.of('target_draft_discard')).toEqual([]);
+    gone();
+    gone();
     expect(h.of('target_draft_discard').map((c) => c.args)).toEqual([{ draftId: 7 }]);
   });
 });
@@ -585,12 +589,12 @@ describe('details and save', () => {
       channel = onEvent as { id: number };
       return 2;
     });
-    const { user, unmount } = renderWizard();
+    const { user, gone } = renderWizard();
     await toDetails(user);
     await user.type(screen.getByLabelText('Target name'), 'lab-2');
     await user.click(saveButton());
     await waitFor(() => expect(channel).not.toBeNull());
-    unmount();
+    gone();
     const internals = (
       window as unknown as { __TAURI_INTERNALS__: { runCallback(id: number, data: unknown): void } }
     ).__TAURI_INTERNALS__;

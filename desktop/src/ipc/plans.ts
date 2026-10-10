@@ -81,11 +81,19 @@ export interface PlanOwner {
 }
 
 /** An end in a line, for when it shows away from its screen. */
-function awayText(title: string, end: OpEnd): { text: string; failed: boolean } {
-  if (end.state === 'failed')
-    return { text: `${title} failed: ${end.error.message}`, failed: true };
-  if (end.outcome.status !== 'completed') return { text: `${title} was cancelled.`, failed: true };
-  return { text: `${title}: done.`, failed: false };
+export function awayText(title: string, end: OpEnd): { text: string; failed: boolean } {
+  if (end.state === 'failed') return awayLine(title, end.error);
+  if (end.outcome.status !== 'completed') return awayLine(title, CANCELLED);
+  return awayLine(title, null);
+}
+
+/** A run's end in a line: done (`null`), cancelled, or failed with its error. */
+export function awayLine(title: string, error: UiError | null): { text: string; failed: boolean } {
+  if (error === null) return { text: `${title}: done.`, failed: false };
+  if (error.code === CORE_ERROR_CODES.OP_CANCELLED) {
+    return { text: `${title} was cancelled.`, failed: true };
+  }
+  return { text: `${title} failed: ${error.message}`, failed: true };
 }
 
 export interface Started {

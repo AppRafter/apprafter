@@ -6,6 +6,7 @@ import { act, cleanup, render, screen, waitFor, within } from '@testing-library/
 import userEvent from '@testing-library/user-event';
 import { ToastProvider, ToastViewport } from '../../components/Toast';
 import { endedAwaySnapshot, resetEndedAway } from '../../ipc/away';
+import type { OpEvent } from '../../ipc/generated/OpEvent';
 import { resetHeldPlans } from '../../ipc/heldPlans';
 import { resetOperations } from '../../ipc/operations';
 import { PlatformContext } from '../../state/platform';
@@ -265,34 +266,85 @@ test('a latency read that fails says why, with Try again', async () => {
   expect(await screen.findByText('38 ms')).toBeDefined();
 });
 
-test('a change that ends after the dialog went keeps its end for the app', async () => {
+/** Apply on cpx22 with a Bounded plan whose run waits; `end(event)` ends it on its channel. */
+async function applyRunning(user: ReturnType<typeof userEvent.setup>) {
   let channel: { id: number } | null = null;
   h.plan('op_plan_target_machine', planParts({ title: 'Set the machine of staging' }), []);
   h.answer('op_execute', ({ onEvent }: Record<string, unknown>) => {
     channel = onEvent as { id: number };
     return 2;
   });
-  const { user, unmount } = renderChange('staging', STAGING);
   await waitFor(() => expect(radio('cx22').checked).toBe(true));
   await user.click(radio('cpx22'));
   await user.click(apply());
   await waitFor(() => expect(channel).not.toBeNull());
-  unmount();
   const internals = (
     window as unknown as { __TAURI_INTERNALS__: { runCallback(id: number, data: unknown): void } }
   ).__TAURI_INTERNALS__;
-  act(() => {
-    internals.runCallback(channel?.id ?? -1, { index: 0, message: completed(machineSet()) });
-  });
-  await waitFor(() =>
-    expect(endedAwaySnapshot()).toEqual([
-      {
-        opId: h.started('op_plan_target_machine')[0] ?? -1,
-        text: 'Set the machine of staging: done.',
-        failed: false,
-      },
-    ]),
-  );
+  return {
+    end: async (message: OpEvent) => {
+      await act(async () => {
+        internals.runCallback(channel?.id ?? -1, { index: 0, message });
+        await settleIpc();
+      });
+    },
+  };
+}
+
+test('a change that ends after its tab closed keeps its end for the app', async () => {
+  const { user, tab } = renderChange('staging', STAGING);
+  const run = await applyRunning(user);
+  tab.close();
+  await run.end(completed(machineSet()));
+  expect(endedAwaySnapshot()).toEqual([
+    {
+      opId: h.started('op_plan_target_machine')[0] ?? -1,
+      text: 'Set the machine of staging: done.',
+      failed: false,
+    },
+  ]);
+});
+
+test('a change that ends while its tab is hidden shows when the tab is back: toast, refresh, close', async () => {
+  const { user, tab, onClose, invalidated } = renderChange('staging', STAGING);
+  const run = await applyRunning(user);
+  tab.hide();
+  await run.end(completed(machineSet()));
+  expect(onClose).not.toHaveBeenCalled();
+  tab.show();
+  expect(await screen.findByText('Machine for “staging”: cpx22 in nbg1.')).toBeDefined();
+  expect(onClose).toHaveBeenCalledTimes(1);
+  expect(invalidated).toHaveBeenCalledTimes(2);
+  expect(endedAwaySnapshot()).toEqual([]);
+});
+
+test('a change that fails while its tab is hidden shows its failure when the tab is back', async () => {
+  const { user, tab, onClose } = renderChange('staging', STAGING);
+  const run = await applyRunning(user);
+  tab.hide();
+  await run.end(failed(uiError('apprafter::provider::sku_unavailable', 'cpx22 is sold out')));
+  tab.show();
+  expect(await screen.findByText('cpx22 is sold out')).toBeDefined();
+  expect(apply().textContent).toBe('Apply machine');
+  expect(apply().disabled).toBe(false);
+  expect(onClose).not.toHaveBeenCalled();
+  expect(endedAwaySnapshot()).toEqual([]);
+});
+
+test('a change that ended while its tab was hidden, the tab then closed: the app shows it', async () => {
+  const { user, tab, onClose } = renderChange('staging', STAGING);
+  const run = await applyRunning(user);
+  tab.hide();
+  await run.end(completed(machineSet()));
+  tab.close();
+  expect(endedAwaySnapshot()).toEqual([
+    {
+      opId: h.started('op_plan_target_machine')[0] ?? -1,
+      text: 'Set the machine of staging: done.',
+      failed: false,
+    },
+  ]);
+  expect(onClose).not.toHaveBeenCalled();
 });
 
 test("in a tab, a Destructive plan's confirm is held by the tab: closing the tab discards it", async () => {

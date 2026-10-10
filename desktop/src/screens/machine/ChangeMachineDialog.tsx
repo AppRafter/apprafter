@@ -2,11 +2,13 @@
 // Target › Machine › Change (spec §7, target machine): the machine picker on the target's own
 // catalogue (read with its stored token), opened on the machine the target is set to. "Apply
 // machine" is the Bounded plan's plain confirm (spec §4.4); a Destructive plan would open D.3d's
-// PlanConfirm first, through D.3d's useConfirm: in a tab, the tab holds that plan until it runs,
-// so closing the tab discards it (heldPlans). A provisioned target never gets here (D.3d's Machine row offers the rebuild
-// recipe instead); if one was provisioned meanwhile, the core's refusal is shown as it is.
+// PlanConfirm first, through D.3d's useConfirm: the dialog's screen holds that plan until it
+// runs, so closing the tab discards it (heldPlans). A provisioned target never gets here (D.3d's
+// Machine row offers the rebuild recipe instead); if one was provisioned meanwhile, the core's
+// refusal is shown as it is. A run that ends while the tab is hidden is shown when the tab is
+// back; one that ends after the tab closed, or a lock, shows at the app level (ipc/away.ts).
 import { useQueryClient } from '@tanstack/react-query';
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Button } from '../../components/Button';
 import { ErrorPanel } from '../../components/ErrorPanel';
 import { HardDrivesIcon, SpinnerGapIcon } from '../../components/icons';
@@ -14,13 +16,17 @@ import { StatePanel } from '../../components/StatePanel';
 import { useToast } from '../../components/Toast';
 import { Wizard } from '../../components/Wizard';
 import * as api from '../../ipc/api';
+import { keepEndedAway } from '../../ipc/away';
 import type { MachineCatalogue } from '../../ipc/generated/MachineCatalogue';
 import type { MachineSet } from '../../ipc/generated/MachineSet';
+import type { OpId } from '../../ipc/generated/OpId';
 import type { RegionLatency } from '../../ipc/generated/RegionLatency';
 import type { UiError } from '../../ipc/generated/UiError';
-import { failureOf, runPlan } from '../../ipc/plans';
+import { awayLine, failureOf, runPlan } from '../../ipc/plans';
 import { useRead } from '../../state/read';
+import { useScope } from '../../state/scope';
 import { TARGETS_KEY, targetKey } from '../../state/targets';
+import { useWhenShown } from '../../state/whenShown';
 import { useConfirm } from '../target/actions';
 import { choosable, defaultRegion, defaultSku, latencyView, offerIn } from './catalogue';
 import { MachinePicker } from './MachinePicker';
@@ -30,6 +36,12 @@ export interface MachineNow {
   readonly region: string | null;
   readonly serverType: string | null;
 }
+
+/** What Apply ended with, and the run it was, if one started. */
+type Ended = { readonly run: { readonly opId: OpId; readonly title: string } | null } & (
+  | { readonly set: MachineSet }
+  | { readonly error: UiError }
+);
 
 interface Choice {
   readonly region: string | null;
@@ -62,14 +74,7 @@ export function ChangeMachineDialog({ target, now, onClose }: ChangeMachineDialo
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<UiError | null>(null);
   const confirmPlan = useConfirm(setError);
-  // Whether the dialog is still there to show the end (a lock or a closed tab takes it).
-  const alive = useRef(true);
-  useEffect(() => {
-    alive.current = true;
-    return () => {
-      alive.current = false;
-    };
-  }, []);
+  const scope = useScope();
 
   // The target's catalogue, read when the dialog opens and again after Try again (reset → idle).
   const idle = catalogueRead.state.status === 'idle';
@@ -102,21 +107,44 @@ export function ChangeMachineDialog({ target, now, onClose }: ChangeMachineDialo
   const chosen = cat !== null && region !== null && choosable(offerIn(cat, region, sku));
   const unchanged = sku === now.serverType && region === now.region;
 
-  const done = (set: MachineSet) => {
-    // D.3d's keys, never literals: the Targets list and this target's report read again.
+  // D.3d's keys, never literals: the Targets list and this target's report read again.
+  const refresh = () => {
     void client.invalidateQueries({ queryKey: TARGETS_KEY });
     void client.invalidateQueries({ queryKey: targetKey(target) });
+  };
+  /** The machine is set (and the reads refreshed): say so and close. */
+  const done = (set: MachineSet) => {
     toast({
       message: `Machine for “${set.name}”: ${set.sku}${set.region === null ? '' : ` in ${set.region}`}.`,
       icon: HardDrivesIcon,
     });
     onClose();
   };
+  /**
+   * Apply's end: shown when the dialog is (its tab may be hidden meanwhile). A run's end whose
+   * tab closed before it was shown goes to the app; a refusal before anything ran goes with it.
+   */
+  const ended = useWhenShown(
+    (end: Ended) => {
+      if ('set' in end) {
+        done(end.set);
+      } else {
+        setSaving(false);
+        setError(end.error); // a refused plan (IpcError) or a failed run (OperationFailed)
+      }
+    },
+    (end) => {
+      if (end.run === null) return;
+      const error = 'set' in end ? null : end.error;
+      keepEndedAway({ opId: end.run.opId, ...awayLine(end.run.title, error) });
+    },
+  );
 
   const apply = async () => {
     if (!chosen || sku === null || region === null) return;
     setSaving(true);
     setError(null);
+    let run: Ended['run'] = null;
     try {
       const plan = await api.opPlanTargetMachine(target, sku, region);
       if (plan.class === 'destructive') {
@@ -126,20 +154,24 @@ export function ChangeMachineDialog({ target, now, onClose }: ChangeMachineDialo
           view: plan,
           title: plan.title,
           confirmLabel: 'Apply machine',
-          onDone: (result) => done(result as MachineSet),
+          onDone: (result) => {
+            refresh();
+            done(result as MachineSet);
+          },
         });
         return;
       }
       // Bounded: the Apply click was its plain confirm.
+      run = { opId: plan.opId, title: plan.title };
       const set = await runPlan<MachineSet>(plan.opId, undefined, {
         title: plan.title,
-        shown: () => alive.current,
+        shown: () => !scope.gone(),
       });
-      if (alive.current) done(set);
+      refresh();
+      // Its screen gone already, the app shows the end (startPlan kept it away).
+      if (!scope.gone()) ended({ run, set });
     } catch (reason) {
-      if (!alive.current) return;
-      setSaving(false);
-      setError(failureOf(reason)); // a refused plan (IpcError) or a failed run (OperationFailed)
+      if (!scope.gone()) ended({ run, error: failureOf(reason) });
     }
   };
 

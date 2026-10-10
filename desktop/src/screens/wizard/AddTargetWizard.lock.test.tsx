@@ -38,12 +38,22 @@ let locked: boolean;
 let verifyEnds: boolean;
 /** The wizard opens in the first shell only: after the unlock the shell mounts afresh. */
 let opened: boolean;
+/**
+ * This test's verify and catalogue ops: new ids in every test (as Rust's are in a process), so a
+ * read an earlier test left waiting never wakes on this test's op (GOTCHA-148).
+ */
+let nextOpId = 4100;
+let verifyOp: number;
+let catalogueOp: number;
 
 beforeEach(() => {
   calls = [];
   locked = false;
   verifyEnds = false;
   opened = false;
+  nextOpId += 2;
+  verifyOp = nextOpId;
+  catalogueOp = nextOpId + 1;
   mockWindows('main');
   mockIPC(
     (cmd, args) => {
@@ -58,13 +68,13 @@ beforeEach(() => {
           fields: {},
         });
       }
-      if (cmd === 'op_start_verify_token') return 41;
-      if (cmd === 'op_start_machine_catalogue') return 42;
+      if (cmd === 'op_start_verify_token') return verifyOp;
+      if (cmd === 'op_start_machine_catalogue') return catalogueOp;
       if (cmd === 'op_subscribe') {
         const opId = (args as { opId: number }).opId;
         // The verify keeps running unless it is to end; the catalogue read keeps running.
         const replay =
-          opId === 41 && verifyEnds
+          opId === verifyOp && verifyEnds
             ? [
                 {
                   kind: 'finished',
