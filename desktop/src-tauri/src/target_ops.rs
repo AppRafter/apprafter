@@ -657,7 +657,12 @@ mod tests {
         api.asked
             .recv_timeout(Duration::from_secs(10))
             .expect("the provider was asked");
-        s.shell.ops.cancel(id).unwrap();
+        // `cancel` trips the token on a thread of its own; trip it here instead, so it is
+        // tripped before the provider answers however the scheduler runs (it was not, under a
+        // loaded wine run).
+        let ((), held) = crate::ops::test_trips::held(|| s.shell.ops.cancel(id).unwrap());
+        assert_eq!(held.len(), 1, "the read's token");
+        held.iter().for_each(CancellationToken::cancel);
         api.answer.send(()).unwrap();
         assert_eq!(
             ended(&s.shell, id),

@@ -108,7 +108,12 @@ impl From<NotAPublicKey> for SshKeyProblem {
 pub fn expand_tilde(input: &str, home: Option<&Path>) -> PathBuf {
     if let Some(rest) = input.strip_prefix("~/") {
         if let Some(home) = home {
-            return home.join(rest);
+            // One component per `join`, so the platform's separator sits between each of them:
+            // the saved path reads `C:\Users\a\.ssh\id.pub` on Windows, not `…\.ssh/id.pub`.
+            return rest
+                .split('/')
+                .filter(|part| !part.is_empty())
+                .fold(home.to_path_buf(), |path, part| path.join(part));
         }
     }
     PathBuf::from(input)
@@ -281,6 +286,14 @@ mod tests {
         assert_eq!(
             expand_tilde("/etc/ssh/host_key.pub", Some(home)),
             PathBuf::from("/etc/ssh/host_key.pub")
+        );
+        // Written with the platform's separator throughout (the display a GUI shows and a
+        // config file keeps), whatever separator the input used after `~`.
+        assert_eq!(
+            expand_tilde("~/.ssh//k.pub", Some(home))
+                .display()
+                .to_string(),
+            home.join(".ssh").join("k.pub").display().to_string()
         );
     }
 
