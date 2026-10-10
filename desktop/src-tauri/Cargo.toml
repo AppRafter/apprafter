@@ -88,6 +88,9 @@ zbus = "~5.19"
 # The portal's signal and its name's owner read together on zbus's executor: the version zbus
 # already pulls in, as os-auth's session watch uses it.
 futures-lite = "2"
+# The bound on the session bus check before the single-instance plugin (src/single_instance.rs):
+# the timer of the executor zbus runs on, the version zbus already pulls in.
+async-io = "2"
 
 [dev-dependencies]
 # The mock runtime for tests/ipc_mock.rs and tests/app_menu.rs.

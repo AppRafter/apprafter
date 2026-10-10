@@ -13,6 +13,7 @@ pub mod ops;
 pub mod runtime;
 pub mod settings;
 pub mod signals;
+pub mod single_instance;
 pub mod theme;
 pub mod window;
 
@@ -30,6 +31,7 @@ use tauri::{Manager, RunEvent};
 use crate::env::AllowListEnv;
 use crate::ops::{Clock, SystemClock};
 use crate::settings::SettingsStore;
+use crate::single_instance::SingleInstance;
 
 /// Build and run the app. Returns only when it could not start; once running, the process
 /// exits from the event loop.
@@ -41,10 +43,13 @@ use crate::settings::SettingsStore;
 /// the app's identity and directories (a data-directory override moves every app directory and
 /// keys the single-instance lock on it; one set but empty or not Unicode stops the start,
 /// [`exit_code`] 2), the authenticator ([`auth::choice`]: the OS's in a release, the fake in a
-/// test build), the app itself (the single-instance plugin first: a second launch only focuses
-/// the first window and exits; on macOS, the app menu), then the log, the settings and the
-/// shell, on Linux the window's theme and the desktop's colour scheme ([`theme::start`]), the
-/// tickers, the OS session watch (lock-on-sleep) and, on Linux and macOS, the quit signals. On Windows the prompts are parented to the main window as soon as it is built.
+/// test build), the single-instance lock ([`single_instance`]: on Linux only when the session
+/// bus answers; without it the app starts all the same, and its log says why), the app itself
+/// (the lock's plugin first: a second launch only focuses the first window and exits; on
+/// macOS, the app menu), then the log, the settings and the shell, on Linux the window's theme
+/// and the desktop's colour scheme ([`theme::start`]), the tickers, the OS session watch
+/// (lock-on-sleep) and, on Linux and macOS, the quit signals. On Windows the prompts are
+/// parented to the main window as soon as it is built.
 ///
 /// The log starts once the app is built, so a second launch, which exits while the plugins
 /// start, writes nothing to the running app's log. It is still up before the window: Tauri
@@ -86,12 +91,13 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let auth = auth::authenticator(auth::choice(&env), clock.clone());
+    // Linux: the plugin panics on a session bus address that does not parse, so the bus is
+    // checked first, and the app starts without the lock when it cannot keep it.
+    let single_instance = SingleInstance::for_this_launch();
 
     let cell = app::ShellCell::default();
-    let builder = app::builder(tauri::Builder::default(), cell.clone())
-        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            window::show_and_focus(app)
-        }))
+    let builder = single_instance
+        .register(app::builder(tauri::Builder::default(), cell.clone()))
         // The capability lets the page open three URLs with it, nothing else.
         .plugin(app::opener_plugin())
         .setup({
@@ -132,6 +138,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     );
     #[cfg(target_os = "linux")]
     dmabuf_renderer.log();
+    single_instance.log();
 
     let settings = SettingsStore::load(&app.path().app_config_dir()?, &SystemClock);
     if let Some(notice) = settings.notice() {
@@ -312,6 +319,73 @@ mod tests {
             names,
             ["env", "turn_off_dmabuf_renderer_on_nvidia_wayland"],
             "run's first statement"
+        );
+    }
+
+    /// Every path in `run`, and every method call on a plain name (`builder.build`), in source
+    /// order, each with its line.
+    #[derive(Default)]
+    struct Calls(Vec<(usize, String)>);
+
+    impl<'ast> syn::visit::Visit<'ast> for Calls {
+        fn visit_path(&mut self, path: &'ast syn::Path) {
+            let names: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
+            let line = path
+                .segments
+                .first()
+                .map_or(0, |s| s.ident.span().start().line);
+            self.0.push((line, names.join("::")));
+            syn::visit::visit_path(self, path);
+        }
+
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            if let syn::Expr::Path(receiver) = &*call.receiver {
+                if let Some(receiver) = receiver.path.get_ident() {
+                    let line = call.method.span().start().line;
+                    self.0.push((line, format!("{receiver}.{}", call.method)));
+                }
+            }
+            syn::visit::visit_expr_method_call(self, call);
+        }
+    }
+
+    /// The single-instance plugin panics while the app is built on a session bus address that
+    /// does not parse (WI-456), and tests/single_instance.rs runs the lock's wiring, not `run`.
+    /// So `run` is held to that wiring: it never names the plugin's crate, which only
+    /// `single_instance` registers, and only behind its check; it makes the decision
+    /// (`SingleInstance::for_this_launch`), registers through it (`single_instance.register`)
+    /// before the app is built, and logs it (`single_instance.log`) once the log has started.
+    #[test]
+    fn run_registers_the_single_instance_plugin_only_behind_its_check() {
+        let mut calls = Calls::default();
+        syn::visit::Visit::visit_item_fn(&mut calls, &run_fn());
+        let calls = calls.0;
+        let plugin: Vec<_> = calls
+            .iter()
+            .filter(|(_, path)| path.contains("tauri_plugin_single_instance"))
+            .collect();
+        assert!(
+            plugin.is_empty(),
+            "run names the plugin's crate: {plugin:?}"
+        );
+        let line = |name: &str| {
+            let found: Vec<usize> = calls
+                .iter()
+                .filter(|(_, call)| call == name)
+                .map(|(line, _)| *line)
+                .collect();
+            assert_eq!(found.len(), 1, "run calls {name} once: {found:?}");
+            found[0]
+        };
+        let decided = line("SingleInstance::for_this_launch");
+        let registered = line("single_instance.register");
+        let built = line("builder.build");
+        let logging = line("runtime::init_logging");
+        let logged = line("single_instance.log");
+        assert!(
+            decided < registered && registered < built && built < logging && logging < logged,
+            "decided at {decided}, registered at {registered}, built at {built}, the log \
+             started at {logging}, logged at {logged}"
         );
     }
 
