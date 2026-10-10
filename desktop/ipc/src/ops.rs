@@ -130,6 +130,7 @@ pub struct OpSummary {
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
+    use apprafter_core::ChangeAction;
     use serde_json::json;
 
     use super::*;
@@ -260,7 +261,8 @@ mod tests {
             changes: vec![PlannedChange {
                 kind: "Target".into(),
                 object: "prod".into(),
-                change: "delete".into(),
+                action: ChangeAction::Delete,
+                detail: None,
             }],
             target: Some("prod".into()),
             expires_at_ms: 600_000,
@@ -273,7 +275,7 @@ mod tests {
         );
         assert_eq!(v["opId"], 7);
         assert_eq!(v["class"], "destructive");
-        assert_eq!(v["changes"][0]["change"], "delete");
+        assert_eq!(v["changes"][0]["action"], "delete");
         assert_eq!(v["target"], "prod");
         assert_eq!(v["expiresAtMs"], 600_000);
     }

@@ -28,9 +28,9 @@ pub use types::{
     FloatingIpCreateRequest, FloatingIpCreateResponse, FloatingIpListResponse, HomeLocation,
     Location, LocationListResponse, Network, NetworkCreateRequest, NetworkCreateResponse,
     NetworkListResponse, PublicIpv4, PublicIpv6, PublicNet, Server, ServerCreateRequest,
-    ServerCreateResponse, ServerListResponse, ServerStatus, ServerType, ServerTypeListResponse,
-    ServerTypeLocation, SshKey, SshKeyCreateRequest, SshKeyCreateResponse, SshKeyListResponse,
-    Subnet,
+    ServerCreateResponse, ServerListResponse, ServerResponse, ServerStatus, ServerType,
+    ServerTypeListResponse, ServerTypeLocation, SshKey, SshKeyCreateRequest, SshKeyCreateResponse,
+    SshKeyListResponse, Subnet,
 };
 pub use user_data::{
     build_k3s_user_data, swap_eligible_from_env, K3sBootstrapOptions, CLUSTER_CIDR_DUAL_STACK,

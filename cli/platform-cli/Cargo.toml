@@ -25,11 +25,29 @@ path = "src/main.rs"
 name = "platform-cli"
 path = "src/bin/platform-cli.rs"
 
+# Test-only: the Windows stand-in for the tools `doctor` probes (tests/common/stand_in.rs).
+# Behind `tool-stand-in`, so a release build and `cargo install` never build it; the test
+# runs pass `--all-features` (CI) or `--features tool-stand-in`. It lives under tests/ so its
+# own env reads (the hang and pid-file knobs) stay out of the env-read ratchet in
+# apprafter-core/tests/guards.rs, which counts product code under src/.
+[[bin]]
+name              = "apprafter-tool-stand-in"
+path              = "tests/support/apprafter_tool_stand_in.rs"
+required-features = ["tool-stand-in"]
+test              = false
+doc               = false
+
+[features]
+tool-stand-in = []
+
 [dependencies]
 age           = { workspace = true }
 arboard       = { workspace = true }
 base64        = { workspace = true }
 backup-core   = { path = "../backup-core" }
+# The shared CLI domain (ADR 0067): `target ip` is its first consumer (D.3a); from here on the
+# core ships in this binary.
+apprafter-core = { path = "../apprafter-core" }
 chrono        = { workspace = true }
 iana-time-zone = { workspace = true }
 terminal_size = { workspace = true }
@@ -69,6 +87,9 @@ libc          = "0.2"
 windows-sys   = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Threading"] }
 
 [dev-dependencies]
+# `error::samples` (one value of every CoreError variant) for the renderer's exhaustiveness
+# test. Under resolver 2 a dev-dependency's features never reach the shipped binary.
+apprafter-core = { path = "../apprafter-core", features = ["test-support"] }
 assert_cmd = { workspace = true }
 mockito    = { workspace = true }
 predicates = { workspace = true }

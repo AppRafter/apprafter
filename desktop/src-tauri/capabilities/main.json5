@@ -24,15 +24,26 @@
     // data-tauri-drag-region: the title bar moves the window, a double-click maximizes it.
     "core:window:allow-start-dragging",
     "core:window:allow-internal-toggle-maximize",
-    // Website, Docs and GitHub (sidebar footer, About) in the browser: these three URLs only.
+    // In the browser, these URLs exactly as written, nothing else: Website, Docs and GitHub
+    // (sidebar footer, About), and the install page of each tool the core's specs name (the
+    // toolchain panel's "Open"; cli-core tools.rs). tests/ipc_mock.rs pins this list equal to
+    // the app's links and the specs' pages.
     {
       identifier: "opener:allow-open-url",
       allow: [
         { url: "https://apprafter.dev" },
         { url: "https://docs.apprafter.dev" },
         { url: "https://github.com/AppRafter/apprafter" },
+        { url: "https://restic.readthedocs.io/en/stable/020_installation.html" },
+        { url: "https://kubernetes.io/docs/tasks/tools/" },
+        { url: "https://helm.sh/docs/intro/install/" },
+        { url: "https://git-scm.com/downloads" },
+        { url: "https://cuelang.org/docs/introduction/installation/" },
       ],
     },
+    // Copy report (Doctor) and the toolchain's Copy buttons: write text, never read. A plugin
+    // command skips the lock gate; writing to the clipboard while locked discloses nothing.
+    "clipboard-manager:allow-write-text",
     // The page has painted: the window, created hidden, shows (also while locked).
     "allow-window-ready",
     // Versions, OS, account, auth support: the About line, title bar and lock screen.
@@ -69,5 +80,42 @@
     // The native window follows the theme setting, the lock screen's included (answered while
     // locked). In place of the window plugin's set-theme, whose null forces light on Linux.
     "allow-theme-apply",
+    // D.3: targets, doctor, whoami. None is answered while locked.
+    // The Targets page: every target in the store, unreadable ones included.
+    "allow-target-list",
+    // The Target screen: one target in full.
+    "allow-target-show",
+    // The add wizard's key picker: the public keys under ~/.ssh.
+    "allow-ssh-key-candidates",
+    // The key picker reads the key file it was given (its type, whether it exists).
+    "allow-ssh-key-inspect",
+    // The tools panel: each tool the app runs, where it was looked for.
+    "allow-toolchain-status",
+    // The About row: who the app acts as and the CLI's default target, without a ping.
+    "allow-whoami",
+    // The add wizard verifies a Hetzner token: the one time it crosses IPC.
+    "allow-op-start-verify-token",
+    // The machine picker reads the provider's regions and machines (a draft's or a target's token).
+    "allow-op-start-machine-catalogue",
+    // The machine picker measures how far each region is.
+    "allow-op-start-region-latencies",
+    // Doctor on one named target.
+    "allow-op-start-doctor",
+    // whoami with a ping of the CLI default's stored token, on request.
+    "allow-op-start-whoami",
+    // Add a target with a verified token's draft (Bounded).
+    "allow-op-plan-target-add",
+    // Renew a target's token (Bounded; the new token is checked when the plan runs).
+    "allow-op-plan-target-renew",
+    // Make a target the CLI's default (Reversible).
+    "allow-op-plan-target-use",
+    // Rename a target (Bounded).
+    "allow-op-plan-target-rename",
+    // Remove a target from this computer (Destructive: the OS gesture runs inside op_execute).
+    "allow-op-plan-target-remove",
+    // Change a target's machine (Bounded; refused once it is provisioned).
+    "allow-op-plan-target-machine",
+    // The add wizard closed: its verified token's draft goes.
+    "allow-target-draft-discard",
   ],
 }

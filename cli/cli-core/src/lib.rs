@@ -8,9 +8,11 @@ pub mod error;
 pub mod fsutil;
 pub mod logging;
 pub mod manifest;
+pub mod paths;
 pub mod quantity;
 pub mod resolve;
 pub mod secrets;
+pub mod ssh_key;
 pub mod style;
 pub mod target;
 pub mod tier;
@@ -21,14 +23,16 @@ pub use credentials::{
     read_ssh_public_key_body, resolve_hetzner_ssh_public_key, resolve_hetzner_token,
     HCLOUD_TOKEN_ENV, SSH_PUBLIC_KEY_ENV,
 };
-pub use error::{CliError, Result, UnavailableKind};
+pub use error::{
+    age_key_missing_help, CliError, Result, SkuCheckFor, TransportFailure, UnavailableKind,
+};
 pub use fsutil::atomic_replace;
 pub use target::{
     config_root_from_override, default_config_root, list_target_names, load_active_target_config,
-    load_global_config, load_target, remove_target, rename_target, resolve_active_target_name,
-    save_global_config, save_target, validate_hetzner_token_format, GlobalConfig, StoreLock,
-    StoreLockEvent, Target, TargetConfig, TargetCredentials, TargetStorePaths, CONFIG_DIR_ENV,
-    TARGET_STORE_VERSION,
+    load_global_config, load_target, load_target_config, remove_target, rename_target,
+    resolve_active_target_name, save_global_config, save_target, save_target_config,
+    validate_hetzner_token_format, GlobalConfig, StoreLock, StoreLockEvent, Target, TargetConfig,
+    TargetCredentials, TargetStorePaths, CONFIG_DIR_ENV, TARGET_STORE_VERSION,
 };
 pub use tier::Tier;
 

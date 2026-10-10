@@ -210,6 +210,13 @@ impl Running {
 /// and keep waiting; released, it must finish successfully. Returns its
 /// output.
 fn waits_for_the_lock(sandbox: &Sandbox, args: &[&str]) -> Output {
+    waits_for_the_lock_while(sandbox, args, || {})
+}
+
+/// [`waits_for_the_lock`], running `meanwhile` while the command waits —
+/// another process's edit landing between the command's plan and its
+/// execution.
+fn waits_for_the_lock_while(sandbox: &Sandbox, args: &[&str], meanwhile: impl FnOnce()) -> Output {
     let held = StoreLock::exclusive(&sandbox.store()).unwrap();
     assert!(held.is_held());
     let mut run = Running::spawn(sandbox, args);
@@ -236,6 +243,7 @@ fn waits_for_the_lock(sandbox: &Sandbox, args: &[&str]) -> Output {
             "ended ({status}) while the test still held the store lock"
         ));
     }
+    meanwhile();
 
     drop(held);
     let out = run.finish();
@@ -294,6 +302,35 @@ fn target_remove_waits_for_the_store_lock() {
         stdout(&out)
     );
     assert!(!sb.store().target_dir("b").exists());
+}
+
+/// R6 under a race: `target remove` warns about the server it leaves running
+/// even when the server was recorded after its first look at the state —
+/// here while it waits for the lock, as an `apply` in another terminal
+/// would (`apply` writes the state without the lock). The warning is the
+/// one `remove` prints before it asks, and it is printed once.
+#[test]
+fn target_remove_warns_about_a_server_recorded_while_it_waited() {
+    let sb = Sandbox::new();
+    let state = cli_state::StatePaths::for_active_target(&sb.store(), "b");
+    let out = waits_for_the_lock_while(&sb, &["target", "remove", "b", "--yes"], || {
+        std::fs::create_dir_all(state.state_dir()).unwrap();
+        std::fs::write(
+            state.state_file(),
+            r#"{"hetzner_cloud":{"server_id":42,"server_name":"b-node","server_type":"cx22"}}"#,
+        )
+        .unwrap();
+    });
+    assert!(
+        stdout(&out).contains("target `b` removed"),
+        "{}",
+        stdout(&out)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let warning = "warning: target `b` records server `b-node` (id 42); removing the target does \
+                   not delete it";
+    assert_eq!(stderr.matches(warning).count(), 1, "{stderr}");
+    assert!(!sb.store().state_dir("b").exists());
 }
 
 #[test]

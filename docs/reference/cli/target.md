@@ -48,16 +48,16 @@ Usage: apprafter target add [OPTIONS] [NAME]
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
 | `--cluster-name` | — | — | no | Default cluster name; falls back to `platform-1` |
-| `--force` | flag | — | no | Overwrite an existing target. Without `--force`, the command fails when the target name is taken |
+| `--force` | flag | — | no | Overwrite an existing target: the flags you pass replace their stored values, every field you do not pass keeps its stored value (the Cloudflare origin firewall toggle always does), and the token is replaced. On a target with a provisioned server, `--force` refuses a region or server-type change (rebuild from a backup instead). To start from scratch, run `apprafter target remove <name>`, then `apprafter target add <name>`. Without `--force`, the command fails when the target name is taken |
 | `--no-interactive` | flag | — | no | Skip the interactive wizard even when stdin + stdout are TTYs. The wizard fires by default on TTY shells and asks for any field not supplied via flag |
 | `--no-ping` | flag | — | no | Skip the Hetzner Cloud API ping that confirms the token authenticates (`GET /v1/locations`). Useful in CI when the network sandbox blocks outbound calls, or when pre-seeding a target store offline. Also settable via `APPRAFTER_NO_PING`, which takes a boolish value: `1` `true` `yes` `y` `t` `on` skip the ping, `0` `false` `no` `n` `f` `off` keep it. Any other value, including the empty string, is an error rather than a no-op. Env: `APPRAFTER_NO_PING`. |
 | `--provider` | — | — | no | Provider identifier. Only `hetzner-cloud` is wired today; AWS / Managed Cloud are planned for later |
 | `--region` | — | — | no | Default provider region (e.g. Hetzner `nbg1`) |
-| `--renew` | flag | — | no | Update only the credentials of an existing target. Errors when the target does not exist. Mutually exclusive with `--force` (use `--force` if you want to replace the whole target, not just rotate the token) |
+| `--renew` | flag | — | no | Update only the token and the SSH key of an existing target: a new `--token` replaces the credentials, and `--ssh-key` changes the key; whatever equals the stored value is left as it is. `--ssh-key` without `--token` changes only the key and keeps the credentials (an `HCLOUD_TOKEN` is not used then). With neither, the new token comes from the wizard on a terminal, else from `HCLOUD_TOKEN`. Errors when the target does not exist or when nothing would change. Mutually exclusive with `--force` (use `--force` to change the target's other fields as well as the token) |
 | `--server-type` | — | — | no | Preferred server type SKU for this target (e.g. `cx22`, `cx32`). Saved as the "target preference" rung in the resolution chain — below an explicit `--server-type` flag or manifest value, above `APPRAFTER_SERVER_TYPE`. Omit to leave the slot empty (the chain continues down to the env var; there is NO implicit default — a fresh provision without any rung set fails with `apprafter::provider::server_type_not_selected`). When set and `--no-ping` is NOT passed, the SKU is validated against the live Hetzner API for the target's region |
 | `--ssh-key` | — | — | no | Path to the SSH public key used for server provisioning. Stays a path (not the key body) so the user's `~/.ssh/` remains the source of truth. Env: `APPRAFTER_SSH_PUBLIC_KEY_PATH`. |
 | `--tier` | — | — | no | Default tier identifier (`solo` / `team` / `prod` / `regulated`). Hint for `init` / `bootstrap-all`; can always be overridden per-command |
-| `--token` | — | — | no | Hetzner Cloud API token. Required when `--provider hetzner-cloud`. Exactly 64 ASCII alphanumeric characters, with no prefix — copy it whole out of the Cloud Console's Security → API Tokens panel. Passed via `--token` or env `HCLOUD_TOKEN` (the env fallback is for CI ergonomics — interactive use should prefer the flag so the token doesn't linger in shell history's env-leak surface). Env: `HCLOUD_TOKEN`. |
+| `--token` | — | — | no | Hetzner Cloud API token. Required when `--provider hetzner-cloud`. Exactly 64 ASCII alphanumeric characters, with no prefix: the whole token, which is shown only once, when it is created in the Hetzner Console (open the project, then Security → API tokens). Passed via `--token` or env `HCLOUD_TOKEN` (the env fallback is for CI ergonomics — interactive use should prefer the flag so the token doesn't linger in shell history's env-leak surface). Env: `HCLOUD_TOKEN`. |
 
 Examples:
 
@@ -244,7 +244,7 @@ apprafter target list
 
 ## `apprafter target machine`
 
-Set or change the server type (and region) on a target via the machine picker. This is the ONLY way to change the server type on an existing target — `target add <existing>` errors, and `--renew` is credentials-only
+Set or change the server type (and region) on a target via the machine picker. This is the ONLY way to change the server type on an existing target — `target add <existing>` errors, and `--renew` changes only the token and the SSH key
 
 ```text
 Usage: apprafter target machine [OPTIONS]
@@ -266,7 +266,7 @@ apprafter target machine --server-type cx32 --no-ping
 
 ## `apprafter target remove`
 
-Remove a target. Interactive runs prompt for confirmation unless `--yes` is passed; non-interactive runs always require `--yes` (no silent destruction)
+Remove a target. Interactive runs prompt for confirmation unless `--yes` is passed; non-interactive runs always require `--yes` (no silent destruction). A target whose `config.yaml` or `credentials.yaml` cannot be read is removed too, its files deleted without being read; a warning names the file first, and the active pointer moves only to a target that can be read
 
 ```text
 Usage: apprafter target remove [OPTIONS] <NAME>

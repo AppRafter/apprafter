@@ -1,0 +1,514 @@
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
+import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
+import { QueryClientProvider } from '@tanstack/react-query';
+import { clearMocks } from '@tauri-apps/api/mocks';
+import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { ToastProvider, ToastViewport } from '../../components/Toast';
+import { endedAwaySnapshot, resetEndedAway } from '../../ipc/away';
+import type { UiError } from '../../ipc/generated/UiError';
+import { newScope, sessionScope } from '../../ipc/lifecycle';
+import { resetOperations } from '../../ipc/operations';
+import { ViewFrame } from '../../shell/ViewFrame';
+import { PlatformContext } from '../../state/platform';
+import { createQueryClient } from '../../state/queryClient';
+import { ScopeContext } from '../../state/scope';
+import { appInfo } from '../../test/fixtures';
+import { check, doctorReport } from '../../test/flows';
+import {
+  cancelled,
+  completed,
+  failed,
+  type Harness,
+  installHarness,
+  stage,
+  uiError,
+} from '../../test/ipc';
+import { settleIpc } from '../../test/settle';
+import { DoctorOverlay } from './DoctorOverlay';
+import { reportText } from './doctorText';
+
+let h: Harness;
+beforeEach(() => {
+  h = installHarness();
+});
+afterEach(async () => {
+  cleanup();
+  await settleIpc();
+  resetOperations();
+  resetEndedAway();
+  clearMocks();
+});
+
+function renderDoctor(target: string, strict = false, fixFailure: UiError | null = null) {
+  const onClose = mock();
+  const onAddTarget = mock();
+  const onToolchain = mock();
+  const onChangeSshKey = mock();
+  render(
+    <QueryClientProvider client={createQueryClient()}>
+      <PlatformContext value={appInfo()}>
+        <ToastProvider>
+          <ViewFrame>
+            <DoctorOverlay
+              target={target}
+              onClose={onClose}
+              onAddTarget={onAddTarget}
+              onToolchain={onToolchain}
+              onChangeSshKey={onChangeSshKey}
+              fixFailure={fixFailure}
+            />
+          </ViewFrame>
+          <ToastViewport />
+        </ToastProvider>
+      </PlatformContext>
+    </QueryClientProvider>,
+    { reactStrictMode: strict },
+  );
+  return { user: userEvent.setup(), onClose, onAddTarget, onToolchain, onChangeSshKey };
+}
+
+/**
+ * The doctor in an overlay scope of its own, as the app's overlay host opens it: `close` ends
+ * the scope (its close button's path) and takes it off the screen.
+ */
+function renderDoctorInOverlay(target: string) {
+  const overlay = newScope(sessionScope());
+  const { unmount } = render(
+    <QueryClientProvider client={createQueryClient()}>
+      <PlatformContext value={appInfo()}>
+        <ToastProvider>
+          <ScopeContext value={overlay.scope}>
+            <ViewFrame>
+              <DoctorOverlay
+                target={target}
+                onClose={mock()}
+                onAddTarget={mock()}
+                onToolchain={mock()}
+                onChangeSshKey={mock()}
+              />
+            </ViewFrame>
+          </ScopeContext>
+        </ToastProvider>
+      </PlatformContext>
+    </QueryClientProvider>,
+  );
+  const close = () =>
+    act(() => {
+      overlay.end();
+      unmount();
+    });
+  return { close };
+}
+
+/** The start-of-run warning the core sends before any check: decrypted copies left on disk. */
+const SWEEP =
+  'cannot remove old kubeconfig copies from /run/apprafter: Permission denied (os error 13)';
+
+const runAgain = () => screen.getByRole('button', { name: 'Run again' }) as HTMLButtonElement;
+const copyReport = () => screen.getByRole('button', { name: 'Copy report' }) as HTMLButtonElement;
+
+describe('DoctorOverlay', () => {
+  test('runs at once for its target, shows the stage while it runs, Cancel cancels', async () => {
+    h.read('op_start_doctor', [stage(2, 3, 'Cluster')]); // keeps running
+    const { user } = renderDoctor('prod-eu');
+    expect(screen.getByRole('dialog', { name: 'Doctor · prod-eu' })).toBeDefined();
+    expect(await screen.findByText('Cluster · 2 of 3')).toBeDefined();
+    expect(h.of('op_start_doctor')[0]?.args).toEqual({ target: 'prod-eu' });
+    // Waiting, not disabled: a disabled button drops the focus onto the page (review #1).
+    expect(runAgain().getAttribute('aria-disabled')).toBe('true');
+    expect(runAgain().disabled).toBe(false);
+    await user.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(h.of('op_cancel').map((c) => c.args)).toEqual([
+      { opId: h.started('op_start_doctor')[0] },
+    ]);
+  });
+
+  test('the report: summary chips, the groups in order, rows, footer', async () => {
+    h.read('op_start_doctor', [completed(doctorReport())]);
+    renderDoctor('prod-eu');
+    expect(await screen.findByText('3 pass')).toBeDefined();
+    for (const chip of ['2 warn', '1 fail', '1 skipped']) {
+      expect(screen.getByText(chip)).toBeDefined();
+    }
+    expect(screen.getAllByRole('heading', { level: 3 }).map((e) => e.textContent)).toEqual([
+      'Target',
+      'Cluster',
+      'This computer',
+    ]);
+    // A skipped check counts in no total (R8): 3 + 2 + 1 ran.
+    expect(screen.getByText(/^6 checks · \d\d:\d\d$/)).toBeDefined();
+  });
+
+  test('a count of zero has no chip', async () => {
+    h.read('op_start_doctor', [
+      completed({ target: 'prod-eu', groups: [{ id: 'target', checks: [check()] }] }),
+    ]);
+    renderDoctor('prod-eu');
+    expect(await screen.findByText('1 pass')).toBeDefined();
+    expect(screen.queryByText(/\d+ (warn|fail|skipped)/)).toBeNull();
+    expect(screen.getByText(/^1 check · /)).toBeDefined();
+  });
+
+  test('Run again starts a new run', async () => {
+    h.read('op_start_doctor', [completed(doctorReport())]);
+    h.read('op_start_doctor', [completed(doctorReport())]);
+    const { user } = renderDoctor('prod-eu');
+    await screen.findByText('3 pass');
+    await user.click(runAgain());
+    await waitFor(() => expect(h.of('op_start_doctor')).toHaveLength(2));
+    expect(await screen.findByText('3 pass')).toBeDefined();
+  });
+
+  test('Copy report writes the report text, and says so', async () => {
+    h.read('op_start_doctor', [completed(doctorReport())]);
+    const { user } = renderDoctor('prod-eu');
+    await screen.findByText('3 pass');
+    await user.click(copyReport());
+    const written = h.of('plugin:clipboard-manager|write_text').map((c) => String(c.args.text));
+    expect(written).toHaveLength(1);
+    const [head, ...body] = (written[0] ?? '').split('\n');
+    expect(head).toMatch(/^AppRafter doctor · prod-eu · \d{4}-\d\d-\d\d \d\d:\d\d$/);
+    // The rows, fixes and totals are the report's; only the header carries the time.
+    expect(body).toEqual(reportText(doctorReport(), new Date()).split('\n').slice(1));
+    expect(await screen.findByText('Report copied')).toBeDefined();
+  });
+
+  test('Copy report waits for a report: not after a run that did not end in one, nor while one runs', async () => {
+    h.read('op_start_doctor', [cancelled()]);
+    h.read('op_start_doctor', [
+      failed(uiError('apprafter::desktop::internal', 'the doctor broke')),
+    ]);
+    h.read('op_start_doctor', [stage(1, 3, 'Target')]); // keeps running
+    const { user } = renderDoctor('prod-eu');
+    expect(await screen.findByText('Doctor was cancelled.')).toBeDefined();
+    expect(copyReport().disabled).toBe(true);
+    await user.click(runAgain());
+    expect(await screen.findByText('the doctor broke')).toBeDefined();
+    expect(copyReport().disabled).toBe(true);
+    await user.click(runAgain());
+    expect(await screen.findByText('Target · 1 of 3')).toBeDefined();
+    expect(copyReport().disabled).toBe(true);
+    expect(h.of('plugin:clipboard-manager|write_text')).toHaveLength(0);
+  });
+
+  test("the copied report carries the core's warnings too", async () => {
+    h.read('op_start_doctor', [
+      { kind: 'warning', message: 'cannot remove old kubeconfig copies' },
+      completed(doctorReport()),
+    ]);
+    const { user } = renderDoctor('prod-eu');
+    await screen.findByText('3 pass');
+    await user.click(copyReport());
+    const [text] = h.of('plugin:clipboard-manager|write_text').map((c) => String(c.args.text));
+    expect(text?.split('\n').slice(1, 3)).toEqual([
+      '',
+      '  WARN  cannot remove old kubeconfig copies',
+    ]);
+  });
+
+  test('a copy the system refuses says so, in its words', async () => {
+    h.read('op_start_doctor', [completed(doctorReport())]);
+    h.answer('plugin:clipboard-manager|write_text', () =>
+      Promise.reject('Unknown error while interacting with the clipboard: no display'),
+    );
+    const { user } = renderDoctor('prod-eu');
+    await screen.findByText('3 pass');
+    await user.click(copyReport());
+    expect(
+      await screen.findByText(
+        'Not copied: Unknown error while interacting with the clipboard: no display',
+      ),
+    ).toBeDefined();
+    expect(screen.queryByText('Report copied')).toBeNull();
+  });
+
+  test("a missing tool's fix opens the toolchain", async () => {
+    h.read('op_start_doctor', [completed(doctorReport())]);
+    const { user, onToolchain, onClose } = renderDoctor('prod-eu');
+    await user.click(await screen.findByRole('button', { name: 'Show the toolchain' }));
+    expect(onToolchain).toHaveBeenCalledTimes(1);
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  test('a target with no SSH key: its fix opens the key change over the doctor, which stays', async () => {
+    // test/flows' doctorReport(): the ssh_key row's fix is configure_ssh_key.
+    h.read('op_start_doctor', [completed(doctorReport())]);
+    const { user, onChangeSshKey, onClose } = renderDoctor('prod-eu');
+    await user.click(await screen.findByRole('button', { name: 'Change SSH key' }));
+    expect(onChangeSshKey).toHaveBeenCalledTimes(1);
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  test('a stored key path with no file: its fix opens the key change too', async () => {
+    h.read('op_start_doctor', [
+      completed({
+        target: 'prod-eu',
+        groups: [
+          {
+            id: 'target',
+            checks: [
+              check({
+                id: 'ssh_key',
+                status: 'fail',
+                title: 'SSH key file exists',
+                fix: {
+                  kind: 'ssh_key_missing',
+                  target: 'prod-eu',
+                  path: '/home/alex/.ssh/gone.pub',
+                },
+              }),
+            ],
+          },
+        ],
+      }),
+    ]);
+    const { user, onChangeSshKey, onClose } = renderDoctor('prod-eu');
+    await user.click(await screen.findByRole('button', { name: 'Change SSH key' }));
+    expect(onChangeSshKey).toHaveBeenCalledTimes(1);
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  test('a key file that is not a public key: its fix opens the key change too', async () => {
+    h.read('op_start_doctor', [
+      completed({
+        target: 'prod-eu',
+        groups: [
+          {
+            id: 'target',
+            checks: [
+              check({
+                id: 'ssh_key',
+                status: 'fail',
+                title: 'SSH key is a public key',
+                fix: {
+                  kind: 'ssh_key_not_public',
+                  target: 'prod-eu',
+                  path: '/home/alex/.ssh/id_ed25519',
+                  privateKey: true,
+                },
+              }),
+            ],
+          },
+        ],
+      }),
+    ]);
+    const { user, onChangeSshKey } = renderDoctor('prod-eu');
+    await user.click(await screen.findByRole('button', { name: 'Change SSH key' }));
+    expect(onChangeSshKey).toHaveBeenCalledTimes(1);
+  });
+
+  test("a missing target's fix closes the doctor, then opens the wizard", async () => {
+    h.read('op_start_doctor', [
+      completed({
+        target: 'gone',
+        groups: [
+          {
+            id: 'target',
+            checks: [
+              check({
+                id: 'target_exists',
+                status: 'fail',
+                title: 'Target exists',
+                fix: { kind: 'add_target', name: 'gone', available: [] },
+              }),
+            ],
+          },
+        ],
+      }),
+    ]);
+    const { user, onClose, onAddTarget } = renderDoctor('gone');
+    await user.click(await screen.findByRole('button', { name: 'Add a target' }));
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(onAddTarget).toHaveBeenCalledTimes(1);
+    expect(onClose.mock.invocationCallOrder[0]).toBeLessThan(
+      onAddTarget.mock.invocationCallOrder[0] ?? 0,
+    );
+  });
+
+  test('Run again waits while a run goes: a press starts nothing, and it keeps the focus', async () => {
+    h.read('op_start_doctor', [stage(1, 3, 'Target')]);
+    const { user } = renderDoctor('prod-eu');
+    await screen.findByText('Target · 1 of 3');
+    runAgain().focus();
+    await user.keyboard('{Enter}');
+    await user.click(runAgain());
+    expect(h.of('op_start_doctor')).toHaveLength(1);
+    expect(document.activeElement).toBe(runAgain());
+  });
+
+  for (const end of ['completed', 'cancelled'] as const) {
+    test(`Cancel had the focus when the run ended (${end}): it goes to Run again, and Esc closes`, async () => {
+      let answer = (_opId: number) => {};
+      h.answer(
+        'op_start_doctor',
+        () =>
+          new Promise<number>((resolve) => {
+            answer = resolve;
+          }),
+      );
+      const { user, onClose } = renderDoctor('prod-eu');
+      const cancel = await screen.findByRole('button', { name: 'Cancel' });
+      cancel.focus();
+      await act(async () => {
+        answer(h.newOperation([end === 'completed' ? completed(doctorReport()) : cancelled()]));
+        await settleIpc();
+      });
+      expect(screen.queryByRole('button', { name: 'Cancel' })).toBeNull();
+      expect(document.activeElement).toBe(runAgain());
+      await user.keyboard('{Escape}');
+      expect(onClose).toHaveBeenCalledTimes(1);
+    });
+  }
+
+  test("the core's warnings during a run are shown with the report, and stay until it closes", async () => {
+    const SWEEP = 'cannot remove old kubeconfig copies from /run/apprafter: Permission denied';
+    const SLOW = 'kubectl answered slowly';
+    h.read('op_start_doctor', [{ kind: 'warning', message: SWEEP }, completed(doctorReport())]);
+    h.read('op_start_doctor', [{ kind: 'notice', message: SLOW }, completed(doctorReport())]);
+    h.read('op_start_doctor', [{ kind: 'warning', message: SWEEP }, completed(doctorReport())]);
+    const { user } = renderDoctor('prod-eu');
+    await screen.findByText('3 pass');
+    expect(screen.getByText(SWEEP)).toBeDefined();
+    // Run again brings another: the first is kept beside it.
+    await user.click(runAgain());
+    await waitFor(() => expect(h.of('op_discard')).toHaveLength(2));
+    await waitFor(() => expect(screen.queryByText(SLOW) === null).toBe(false));
+    expect(screen.getByText(SWEEP)).toBeDefined();
+    // And the first again: still shown once.
+    await user.click(runAgain());
+    await waitFor(() => expect(h.of('op_discard')).toHaveLength(3));
+    expect(screen.getAllByText(SWEEP)).toHaveLength(1);
+    expect(screen.getByText(SLOW)).toBeDefined();
+  });
+
+  // Review #6: the warning came at the run's start but showed only at its end, so a doctor
+  // closed while its Cluster group still probed never showed it.
+  test("the core's warning shows as soon as it is sent, while the run goes on", async () => {
+    h.read('op_start_doctor', [{ kind: 'warning', message: SWEEP }, stage(2, 3, 'Cluster')]);
+    renderDoctor('prod-eu');
+    expect(await screen.findByText('Cluster · 2 of 3')).toBeDefined();
+    const warnings = screen.getByRole('list', { name: 'Warnings' });
+    expect(within(warnings).getByText(SWEEP)).toBeDefined();
+  });
+
+  test("closed before a warning reached the screen: the warning goes to the app's notices", async () => {
+    let answer = (_opId: number) => {};
+    h.answer(
+      'op_start_doctor',
+      () =>
+        new Promise<number>((resolve) => {
+          answer = resolve;
+        }),
+    );
+    const { close } = renderDoctorInOverlay('prod-eu');
+    await waitFor(() => expect(h.of('op_start_doctor')).toHaveLength(1));
+    await close();
+    // Rust answers once the doctor is gone: the read is cancelled, and ends with the warning.
+    const opId = h.newOperation([{ kind: 'warning', message: SWEEP }, cancelled()]);
+    await act(async () => {
+      answer(opId);
+      await settleIpc();
+    });
+    expect(h.of('op_cancel').map((c) => c.args)).toEqual([{ opId }]);
+    expect(h.of('op_discard').map((c) => c.args)).toEqual([{ opId }]);
+    expect(endedAwaySnapshot()).toEqual([
+      { opId: null, text: `Doctor · prod-eu: ${SWEEP}`, failed: true },
+    ]);
+  });
+
+  test('closed after its warning was on screen: the app is not told it again', async () => {
+    const opId = h.newOperation([]);
+    let channel = -1;
+    h.answer('op_start_doctor', opId);
+    h.answer('op_subscribe', ({ onEvent }: Record<string, unknown>) => {
+      channel = (onEvent as { id: number }).id;
+      return {
+        subscription: 1,
+        replay: [{ kind: 'warning', message: SWEEP }, stage(2, 3, 'Cluster')],
+      };
+    });
+    const { close } = renderDoctorInOverlay('prod-eu');
+    expect(await screen.findByText(SWEEP)).toBeDefined();
+    await close();
+    const internals = (
+      window as unknown as { __TAURI_INTERNALS__: { runCallback(id: number, data: unknown): void } }
+    ).__TAURI_INTERNALS__;
+    await act(async () => {
+      internals.runCallback(channel, { index: 0, message: cancelled() });
+      await settleIpc();
+    });
+    expect(h.of('op_discard').map((c) => c.args)).toEqual([{ opId }]);
+    expect(endedAwaySnapshot()).toEqual([]);
+  });
+
+  test('a warning of a run that failed or was cancelled is shown too', async () => {
+    h.read('op_start_doctor', [
+      { kind: 'notice', message: 'kubectl answered slowly' },
+      failed(uiError('apprafter::desktop::internal', 'the doctor broke')),
+    ]);
+    renderDoctor('prod-eu');
+    expect(await screen.findByText('the doctor broke')).toBeDefined();
+    expect(screen.getByText('kubectl answered slowly')).toBeDefined();
+  });
+
+  test("a fix's flow that failed is shown above the report, the report kept", async () => {
+    h.read('op_start_doctor', [completed(doctorReport())]);
+    renderDoctor(
+      'prod-eu',
+      false,
+      uiError('apprafter::target::not_found', 'target `prod-eu` was not found'),
+    );
+    expect(await screen.findByText('target `prod-eu` was not found')).toBeDefined();
+    expect(screen.getByText('3 pass')).toBeDefined();
+  });
+
+  test('a failed run shows its error and Run again', async () => {
+    h.read('op_start_doctor', [
+      failed(uiError('apprafter::desktop::internal', 'the doctor broke')),
+    ]);
+    renderDoctor('prod-eu');
+    expect(await screen.findByText('the doctor broke')).toBeDefined();
+    expect(runAgain().disabled).toBe(false);
+  });
+
+  test('a cancelled run says so and offers Run again', async () => {
+    h.read('op_start_doctor', [cancelled()]);
+    renderDoctor('prod-eu');
+    expect(await screen.findByText('Doctor was cancelled.')).toBeDefined();
+    expect(runAgain().disabled).toBe(false);
+    expect(screen.queryByText(/\d+ pass/)).toBeNull();
+  });
+
+  test('under StrictMode the double mount still ends on a report', async () => {
+    // StrictMode runs the mount effect twice: the second run supersedes (and cancels) the
+    // first, which never answers.
+    const first = h.newOperation([]);
+    const second = h.newOperation([completed(doctorReport())]);
+    let started = 0;
+    h.answer('op_start_doctor', () => {
+      started += 1;
+      return started === 1 ? first : second;
+    });
+    renderDoctor('prod-eu', true);
+    expect(await screen.findByText('3 pass')).toBeDefined();
+    expect(h.of('op_cancel').map((c) => c.args)).toEqual([{ opId: first }]);
+  });
+
+  test('Cancel before Rust answered cancels the run once it has an id', async () => {
+    let answer = (_opId: number) => {};
+    h.answer(
+      'op_start_doctor',
+      () =>
+        new Promise<number>((resolve) => {
+          answer = resolve;
+        }),
+    );
+    const id = h.newOperation([]);
+    const { user } = renderDoctor('prod-eu');
+    await user.click(await screen.findByRole('button', { name: 'Cancel' }));
+    expect(h.of('op_cancel')).toHaveLength(0);
+    answer(id);
+    await waitFor(() => expect(h.of('op_cancel').map((c) => c.args)).toEqual([{ opId: id }]));
+  });
+});

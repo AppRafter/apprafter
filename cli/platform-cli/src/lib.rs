@@ -13,8 +13,10 @@
 
 pub(crate) mod cli;
 pub(crate) mod commands;
+mod context;
 mod dispatch;
 pub(crate) mod examples;
+mod render;
 mod startup;
 
 use clap::{CommandFactory, FromArgMatches};
@@ -96,6 +98,8 @@ pub fn run() -> Result<()> {
     // is what `parse()` does internally.
     let mut command = examples::attach(Cli::command());
     let mut matches = command.get_matches_mut();
+    // Before `from_arg_matches_mut`, which takes the values (and their sources) out.
+    let typed = dispatch::Typed::of(&matches);
     let args = match Cli::from_arg_matches_mut(&mut matches) {
         Ok(args) => args,
         Err(error) => error.format(&mut command).exit(),
@@ -108,5 +112,5 @@ pub fn run() -> Result<()> {
     // command that goes beyond this machine itself (`startup`).
     startup::run_startup_checks(&args.command);
 
-    dispatch(args).map_err(miette::Report::new)
+    dispatch(args, typed)
 }

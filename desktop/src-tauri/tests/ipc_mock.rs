@@ -20,13 +20,14 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
 
-use apprafter_core::{CoreError, Outcome, PlanClass};
+use apprafter_core::{CoreError, Outcome, PathSource, PlanClass};
 use apprafter_desktop::app;
+use apprafter_desktop::env::ToolSearchPath;
 use apprafter_desktop::ops::{Executor, PlanParts};
 use apprafter_desktop_ipc::{errors, Settings, Theme, ALLOWED_WHILE_LOCKED, COMMANDS, QUITTING};
 use common::{
-    code, invoke, lock_off, rig, rig_by, wait_for, watch, Log, Rig, Route, PAM_SAYS, PASSWORD,
-    WATCH_DROPPED,
+    app_links, code, install_pages, invoke, lock_off, rig, rig_by, rig_with_tools, wait_for, watch,
+    Log, Rig, Route, PAM_SAYS, PASSWORD, WATCH_DROPPED,
 };
 use serde_json::{json, Value};
 use tauri::Listener;
@@ -137,6 +138,75 @@ fn plugin_commands_beyond_the_granted_ones_are_refused_by_the_acl() {
     );
 }
 
+/// The page may write text to the clipboard (Copy report, Copy command) and nothing else: reading
+/// what another program put there, writing HTML or an image, and clearing are refused by the ACL
+/// (D.3 overview R11). Plugin commands never pass the lock gate, so this grant must be harmless
+/// while locked — it only ever writes.
+#[test]
+fn the_clipboard_takes_text_and_gives_nothing_back() {
+    let rig = rig(lock_off());
+    for cmd in [
+        "plugin:clipboard-manager|read_text",
+        "plugin:clipboard-manager|read_image",
+        "plugin:clipboard-manager|write_html",
+        "plugin:clipboard-manager|write_image",
+        "plugin:clipboard-manager|clear",
+    ] {
+        match invoke(&rig, cmd, json!({})) {
+            Err(Value::String(error)) => assert!(
+                error.contains("not allowed"),
+                "{cmd} was not refused by the ACL: {error}"
+            ),
+            other => panic!("{cmd} was not refused by the ACL: {other:?}"),
+        }
+    }
+    // Empty arguments: past the ACL, refused for the missing text only — nothing is written.
+    match invoke(&rig, "plugin:clipboard-manager|write_text", json!({})) {
+        Err(Value::String(error)) => {
+            assert!(
+                !error.contains("not allowed"),
+                "write_text was refused: {error}"
+            );
+            assert!(error.contains("invalid args"), "{error}");
+        }
+        other => panic!("write_text with no arguments: {other:?}"),
+    }
+}
+
+/// No test reaches the owner's clipboard or browser (GOTCHA-156), whatever session the test
+/// process inherited: the rig registers stand-ins under the plugins' names (common/plugins.rs),
+/// and every rig checks that neither real plugin set up. Here a page's write, with a text, and
+/// an open of a URL the scope lists — each of which the real plugin would carry out — pass the
+/// app's ACL and land in the stand-ins' log, and nowhere else.
+#[test]
+fn the_clipboard_and_the_opener_a_test_reaches_are_stand_ins() {
+    let rig = rig(lock_off());
+    let text = "written by a test, never to a clipboard";
+    assert_eq!(
+        invoke(
+            &rig,
+            "plugin:clipboard-manager|write_text",
+            json!({ "text": text })
+        ),
+        Ok(Value::Null)
+    );
+    let link = app_links().into_iter().next().unwrap();
+    assert_eq!(
+        invoke(&rig, "plugin:opener|open_url", json!({ "url": link })),
+        Ok(Value::Null)
+    );
+    assert_eq!(
+        rig.asked.all(),
+        [
+            ("clipboard-manager|write_text".to_owned(), text.to_owned()),
+            ("opener|open_url".to_owned(), link),
+        ]
+    );
+    // What the stand-in answers for a read the ACL refuses never comes: the ACL stops it first.
+    assert!(invoke(&rig, "plugin:clipboard-manager|read_text", json!({})).is_err());
+    assert_eq!(rig.asked.all().len(), 2, "{:?}", rig.asked.all());
+}
+
 /// A quit that has operations to wait for tells the page, which then shows that it is stopping
 /// them instead of a page whose every command is refused: `quitting`, with how many and the
 /// longest wait. The page hears it through `core:event:allow-listen`, no new permission.
@@ -179,6 +249,49 @@ fn a_quit_with_operations_running_tells_the_page_what_it_waits_for() {
     );
 }
 
+/// WI-452: a slow login shell (macOS asks one for the tools' `PATH`) delays neither the shell
+/// nor the window: the app is built, and `window_ready` shows the window, while the shell has
+/// not answered — the context meanwhile has the fallback — and the first lookup of a tool
+/// waits for the answer.
+#[test]
+fn a_slow_login_shell_does_not_delay_window_ready() {
+    let (release, released) = mpsc::channel::<()>();
+    let tools = ToolSearchPath::probe(
+        move || {
+            // The slow shell: it answers when the test lets it.
+            let _ = released.recv_timeout(Duration::from_secs(60));
+            Some("/from/the/login/shell".into())
+        },
+        PathSource::LoginShell,
+        ("/usr/bin:/bin".into(), PathSource::Fallback),
+        Duration::from_secs(60),
+    );
+    let rig = rig_with_tools(lock_off(), Route::Prompt, tools.clone());
+    assert_eq!(invoke(&rig, "window_ready", json!({})), Ok(Value::Null));
+    assert_eq!(
+        tools.now().1,
+        PathSource::Fallback,
+        "the window showed before the login shell answered"
+    );
+    let lookup = {
+        let shell = rig.shell.clone();
+        thread::spawn(move || {
+            let context = shell.tool_context();
+            (
+                context.tool_search_path().to_owned(),
+                context.tool_search_path_source(),
+            )
+        })
+    };
+    thread::sleep(Duration::from_millis(50));
+    assert!(!lookup.is_finished(), "the lookup waits for the answer");
+    release.send(()).unwrap();
+    assert_eq!(
+        lookup.join().unwrap(),
+        ("/from/the/login/shell".into(), PathSource::LoginShell)
+    );
+}
+
 /// A quit with nothing running exits at once: there is nothing to say, and nothing is said.
 #[test]
 fn a_quit_with_nothing_running_says_nothing() {
@@ -191,38 +304,11 @@ fn a_quit_with_nothing_running_says_nothing() {
     assert!(heard.recv_timeout(Duration::from_millis(200)).is_err());
 }
 
-/// The opener's scope is the three URLs exactly as the capability writes them: a URL the page
-/// does not show, a trailing slash on one it does, and a host that only starts like ours are
-/// each refused by the plugin's own scope check — reached past the ACL, which grants
-/// `open_url` with that scope. (A listed URL would open the browser, so none is tried here.)
-#[test]
-fn the_opener_opens_the_listed_urls_only_and_only_as_written() {
-    let rig = rig(lock_off());
-    for url in [
-        "https://example.com",
-        "https://apprafter.dev/",
-        "https://apprafter.dev.evil",
-        "https://apprafter.dev.evil/",
-        "http://apprafter.dev",
-        "https://docs.apprafter.dev/../x",
-        "https://github.com/AppRafter/apprafter/",
-        "https://github.com/AppRafter/apprafter-evil",
-    ] {
-        match invoke(&rig, "plugin:opener|open_url", json!({ "url": url })) {
-            Err(Value::String(error)) => assert_eq!(
-                error,
-                format!("Not allowed to open url {url}"),
-                "{url} was not refused by the opener's scope"
-            ),
-            other => panic!("{url} was not refused by the opener's scope: {other:?}"),
-        }
-    }
-}
-
 /// The capability, read as Tauri reads it: exactly the pinned core permissions, the opener
-/// scoped to the three links the app shows, and the generated `allow-<command>` of every app
-/// command — nothing more, nothing less, once each. A permission added for a later step must
-/// be added here too, with its reason in the file.
+/// scoped to the app's links (read from the page's src/shell/links.ts) and the install pages of
+/// the core's tool specs, and the
+/// generated `allow-<command>` of every app command — nothing more, nothing less, once each. A
+/// permission added for a later step must be added here too, with its reason in the file.
 #[test]
 fn the_capability_grants_the_pinned_permissions_and_every_app_command_only() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("capabilities/main.json5");
@@ -243,6 +329,7 @@ fn the_capability_grants_the_pinned_permissions_and_every_app_command_only() {
         "core:window:allow-is-maximized",
         "core:window:allow-start-dragging",
         "core:window:allow-internal-toggle-maximize",
+        "clipboard-manager:allow-write-text",
     ]
     .map(String::from)
     .into();
@@ -252,16 +339,35 @@ fn the_capability_grants_the_pinned_permissions_and_every_app_command_only() {
             .map(|cmd| format!("allow-{}", cmd.replace('_', "-"))),
     );
     assert_eq!(set, expected);
-    // The one scoped permission: the opener, for exactly these URLs, no pattern.
-    let links = json!({
-        "identifier": "opener:allow-open-url",
-        "allow": [
-            { "url": "https://apprafter.dev" },
-            { "url": "https://docs.apprafter.dev" },
-            { "url": "https://github.com/AppRafter/apprafter" },
-        ],
-    });
-    assert_eq!(scoped, [&links]);
+    // The one scoped permission: the opener, for exactly the app's links and the install pages
+    // the core's tool specs name — a tool added without its page, or a page no spec names,
+    // fails here. Each URL as written: no glob pattern (the plugin matches them as globs).
+    let [opener] = scoped.as_slice() else {
+        panic!("one scoped permission: {scoped:?}")
+    };
+    assert_eq!(opener["identifier"], json!("opener:allow-open-url"));
+    let allow = opener["allow"].as_array().expect("an allow list");
+    let urls: Vec<&str> = allow
+        .iter()
+        .map(|entry| {
+            assert_eq!(entry.as_object().map(|o| o.len()), Some(1), "{entry}");
+            entry["url"].as_str().expect("a url")
+        })
+        .collect();
+    let url_set: BTreeSet<String> = urls.iter().map(|u| u.to_string()).collect();
+    assert_eq!(url_set.len(), urls.len(), "a URL twice: {urls:?}");
+    for url in &urls {
+        assert!(url.starts_with("https://"), "{url}");
+        assert!(
+            !url.contains(['*', '?', '[', ']', '{', '}']),
+            "a pattern: {url}"
+        );
+    }
+    let mut expected_urls: BTreeSet<String> = app_links();
+    expected_urls.extend(install_pages());
+    assert_eq!(url_set, expected_urls);
+    // The toolchain has something to open: the core names install pages.
+    assert!(install_pages().len() >= 5, "{:?}", install_pages());
     assert_eq!(capability["windows"], json!(["main"]));
     assert_eq!(capability.get("remote"), None, "no remote origin");
 }
@@ -604,4 +710,78 @@ fn a_quit_signal_drops_the_session_watch_once_the_operations_stopped() {
     signal_hook::low_level::raise(SIGUSR1).unwrap();
     wait_for(&log, WATCH_DROPPED);
     assert_eq!(*log.lock().unwrap(), [OP_STOPPED, WATCH_DROPPED]);
+}
+
+/// The renew command hands its `sshKey` to the core (the Target screen's SSH key row, WI-452):
+/// a key the core cannot read is refused before any plan, and without one the same renew plans.
+#[test]
+fn the_renew_command_hands_its_ssh_key_to_the_core() {
+    let rig = rig(lock_off());
+    let target = cli_core::target::Target {
+        name: "prod".into(),
+        config: cli_core::target::TargetConfig {
+            provider: "hetzner-cloud".into(),
+            ..Default::default()
+        },
+        credentials: Default::default(),
+    };
+    cli_core::save_target(&rig.shell.context.store(), &target).unwrap();
+    let token = "k".repeat(64);
+    let missing = rig.shell.context.config_root().join("nothing-here.pub");
+    let refused = invoke(
+        &rig,
+        "op_plan_target_renew",
+        json!({ "name": "prod", "token": token, "sshKey": missing }),
+    );
+    assert_eq!(
+        code(&refused),
+        Some("apprafter::target::ssh_key_unreadable"),
+        "{refused:?}"
+    );
+    let planned = invoke(
+        &rig,
+        "op_plan_target_renew",
+        json!({ "name": "prod", "token": token, "sshKey": null }),
+    )
+    .unwrap();
+    assert_eq!(planned["class"], "bounded");
+}
+
+/// WI-452: the token is optional on the wire. A key with `token: null` plans the key alone (the
+/// SSH key row: no token field); neither is the core's nothing-to-change refusal.
+#[test]
+fn the_renew_command_takes_a_key_without_a_token() {
+    let rig = rig(lock_off());
+    let target = cli_core::target::Target {
+        name: "prod".into(),
+        config: cli_core::target::TargetConfig {
+            provider: "hetzner-cloud".into(),
+            ..Default::default()
+        },
+        credentials: Default::default(),
+    };
+    cli_core::save_target(&rig.shell.context.store(), &target).unwrap();
+    let key = rig.shell.context.config_root().join("id_ed25519.pub");
+    std::fs::write(&key, "ssh-ed25519 AAAA k\n").unwrap();
+    let planned = invoke(
+        &rig,
+        "op_plan_target_renew",
+        json!({ "name": "prod", "token": null, "sshKey": key }),
+    )
+    .unwrap();
+    assert_eq!(
+        (planned["class"].clone(), planned["title"].clone()),
+        (json!("bounded"), json!("Change the SSH key of prod"))
+    );
+    assert_eq!(planned["changes"].as_array().map(Vec::len), Some(1));
+    let refused = invoke(
+        &rig,
+        "op_plan_target_renew",
+        json!({ "name": "prod", "token": null, "sshKey": null }),
+    );
+    assert_eq!(
+        code(&refused),
+        Some("apprafter::target::renew_nothing_to_change"),
+        "{refused:?}"
+    );
 }

@@ -10,30 +10,33 @@
 //!     adding a provider later is a one-line surface change).
 //!  3. Provider token (Password, masked; inline format check +
 //!     API ping — unless `--no-ping` was passed).
-//!  4. SSH public key (Text, default `~/.ssh/id_ed25519.pub`,
-//!     skip with empty).
-//!  5. Default region (Select, populated by
-//!     `validator.list_regions()`).
-//!  6. Default tier (Select; copies the kubectl-style one-of list
+//!  4. SSH public key (Select over `~/.ssh/*.pub`, or Text with
+//!     default `~/.ssh/id_ed25519.pub`; skip with empty).
+//!  5. Default tier (Select; copies the kubectl-style one-of list
 //!     from the spec).
+//!  6. Machine matrix (region × server type, from the provider's
+//!     catalogue with each region's latency); under `--no-ping` a
+//!     Text region prompt instead.
+//!
+//! The provider and filesystem reads (token ping, catalogue,
+//! latencies, SSH key candidates, the home directory) are
+//! apprafter-core's, through the command's `Context`.
 //!
 //! Validators run inline on each prompt so the user gets immediate
 //! "✓ Token verified" / "✗ Hetzner Cloud rejected the token"
 //! feedback instead of discovering the error after entering five
 //! more fields.
 
-use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
 
+use apprafter_core::machine::{CatalogueSource, MachineCatalogue, MachineOfferView};
+use apprafter_core::ssh::SshKeyCandidate;
+use apprafter_core::{CancellationToken, Context, CoreError, CoreResult, SecretString};
 use cli_core::target::validate_hetzner_token_format;
-use cli_core::{CliError, Result};
-use cli_providers::{HetznerCloudValidator, ProviderValidator, RegionInfo};
+use cli_core::CliError;
 use inquire::validator::Validation;
 use inquire::{InquireError, Password, PasswordDisplayMode, Select, Text};
 
-use crate::commands::hcloud::hcloud_base_url;
 use crate::commands::machine_picker::{pick_machine, MachineRow};
 use crate::commands::target::AddArgs;
 
@@ -51,7 +54,7 @@ pub enum TokenSource {
     Flag,
     /// Picked up from the env var bound by clap's
     /// `#[arg(env = "HCLOUD_TOKEN")]`. Distinguishable from `Flag`
-    /// by comparing the value to `std::env::var(HCLOUD_TOKEN_ENV)`.
+    /// by comparing the value to the context's `HCLOUD_TOKEN` override.
     Env,
     /// No prefill at all — wizard prompts.
     Prompt,
@@ -66,8 +69,6 @@ const TIER_CHOICES: &[(&str, &str)] = &[
     ("prod", "Tier 3 — bare-metal Talos, EPYC"),
     ("regulated", "Tier 4 — confidential compute"),
 ];
-
-const PROVIDER_CHOICES: &[&str] = &["hetzner-cloud"];
 
 const DEFAULT_TARGET_NAME: &str = "default";
 
@@ -109,44 +110,85 @@ pub struct WizardOutput {
     /// `--server-type` flag was given.
     pub server_type: Option<String>,
     /// Set to `true` when the wizard already ran a successful API
-    /// ping (default) — caller can skip a second ping in
-    /// `ping_provider`. `false` when `--no-ping` flowed through.
+    /// ping (default). `target add` pings again at save time anyway
+    /// (R2). `false` when `--no-ping` flowed through.
     pub token_already_verified: bool,
 }
 
 /// Render the wizard prompts. Reads from stdin via `inquire`,
 /// writes prompts to stderr (inquire's default), only returns
-/// once every required field has a valid value.
+/// once every required field has a valid value. The provider reads
+/// (token ping, machine catalogue, region latencies, SSH key
+/// candidates) are apprafter-core's, through `ctx`.
 ///
 /// Prompt order (v0.2.42+):
 ///  1. name → 2. provider → 3. token → 4. ssh-key → 5. tier
 ///     → 6. machine matrix (region × SKU, replaces the old region step)
-pub fn run_add_wizard(initial: &AddArgs) -> Result<WizardOutput> {
+///
+/// With `--force` on a stored target (bug 8) the wizard starts from that target
+/// (`ForceBase`): each optional prompt offers "keep the stored value" as its default, so
+/// Enter changes nothing, and a target whose state records a server skips the machine step —
+/// its region and server type cannot change, the guard `plan_add` applies. A kept field comes
+/// back `None`, which `target add` treats as a flag not passed: the core keeps the stored value.
+pub fn run_add_wizard(ctx: &Context, initial: &AddArgs) -> CoreResult<WizardOutput> {
     eprintln!();
     eprintln!("Welcome to AppRafter. Let's set up a deployment target.");
     eprintln!();
 
     let name = prompt_name(initial.name.as_deref(), "positional argument")?;
+    let base = ForceBase::load(ctx, &name, initial.force)?;
+    if base.is_some() {
+        eprintln!(
+            "  ℹ Target `{name}` exists: --force keeps each stored value you do not change \
+             (Enter keeps it)"
+        );
+    }
     let provider = prompt_provider(initial.provider.as_deref(), "--provider flag")?;
-    let token_source = classify_token_source(initial.token.as_deref());
+    let token_source = classify_token_source(ctx, initial.token.as_deref());
     let (token, token_already_verified) = prompt_token(
+        ctx,
         &provider,
         initial.token.as_deref(),
         token_source,
         initial.no_ping,
     )?;
     let ssh_key_source = classify_ssh_key_source(initial.ssh_key.as_deref());
-    let ssh_key = prompt_ssh_key(initial.ssh_key.as_ref(), ssh_key_source)?;
+    let ssh_key = prompt_ssh_key(
+        ctx,
+        initial.ssh_key.as_ref(),
+        ssh_key_source,
+        base.as_ref().map(|b| b.ssh_key_shown(ctx)),
+    )?;
     // Tier comes BEFORE the machine matrix so a future tier-aware
     // filter can use the chosen tier to narrow the offer list.
-    let tier = prompt_tier(initial.tier.as_deref(), "--tier flag")?;
-    let (region, server_type) = prompt_machine(
-        &provider,
-        &token,
+    let tier = prompt_tier(
+        initial.tier.as_deref(),
+        "--tier flag",
+        base.as_ref().map(|b| b.config.default_tier.as_deref()),
+    )?;
+    let secret = SecretString::new(token.clone());
+    let step = force_machine_step(
+        base.as_ref(),
         initial.region.as_deref(),
         initial.server_type.as_deref(),
-        initial.no_ping,
-    )?;
+    );
+    let (region, server_type) = match (step, &base) {
+        (ForceMachineStep::Skip(line), _) => {
+            eprintln!("{line}");
+            (None, None)
+        }
+        (ForceMachineStep::OfferKeep, Some(b)) => {
+            prompt_machine_keeping(ctx, &provider, &secret, &b.config, initial.no_ping)?
+        }
+        (ForceMachineStep::Ask, _) | (ForceMachineStep::OfferKeep, None) => prompt_machine(
+            ctx,
+            &provider,
+            &secret,
+            initial.region.as_deref(),
+            initial.server_type.as_deref(),
+            initial.no_ping,
+        )?,
+    };
 
     Ok(WizardOutput {
         name,
@@ -158,6 +200,168 @@ pub fn run_add_wizard(initial: &AddArgs) -> Result<WizardOutput> {
         server_type,
         token_already_verified,
     })
+}
+
+/// What `target add <name> --force` overwrites, read before the optional prompts so each can
+/// offer to keep its stored value (bug 8: the wizard's defaults used to replace them).
+struct ForceBase {
+    name: String,
+    config: cli_core::TargetConfig,
+    server: StoredServer,
+}
+
+/// Whether the stored target's state records a server.
+enum StoredServer {
+    None,
+    Recorded(apprafter_core::target::ProvisionedServer),
+    /// The state cannot be read (the error, as shown).
+    Unreadable(String),
+}
+
+impl ForceBase {
+    /// The stored target `--force` overwrites. `None` without `--force`, for a name that is
+    /// not stored, or for an invalid name (refused after the wizard, as today). A target whose
+    /// files cannot be read is that error now: `plan_add` reads both files and would refuse it
+    /// with the same error after the whole wizard.
+    fn load(ctx: &Context, name: &str, force: bool) -> CoreResult<Option<ForceBase>> {
+        if !force || apprafter_core::target::validate_name(name).is_err() {
+            return Ok(None);
+        }
+        let config = match cli_core::load_target(&ctx.store(), name) {
+            Ok(t) => t.config,
+            Err(CliError::TargetNotFound { .. }) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let server = match apprafter_core::TargetRef::named(ctx, name)
+            .and_then(|t| apprafter_core::target::provisioned(ctx, &t))
+        {
+            Ok(None) => StoredServer::None,
+            Ok(Some(s)) => StoredServer::Recorded(s),
+            Err(e) => StoredServer::Unreadable(e.to_string()),
+        };
+        Ok(Some(ForceBase {
+            name: name.to_string(),
+            config,
+            server,
+        }))
+    }
+
+    /// The stored SSH key as the prompts show paths (`~/…`), or `None` when none is stored.
+    fn ssh_key_shown(&self, ctx: &Context) -> Option<String> {
+        self.config
+            .ssh_key_path
+            .as_deref()
+            .map(|p| cli_core::paths::abbreviate_home(p, ctx.home_dir()))
+    }
+
+    /// "region hel1, server type cx32", each "not set" when unset.
+    fn machine_shown(&self) -> String {
+        stored_machine(&self.config)
+    }
+}
+
+/// "region hel1, server type cx32", each "not set" when unset.
+fn stored_machine(c: &cli_core::TargetConfig) -> String {
+    format!(
+        "region {}, server type {}",
+        c.region.as_deref().unwrap_or("not set"),
+        c.server_type.as_deref().unwrap_or("not set")
+    )
+}
+
+/// The machine step of the add wizard.
+#[derive(Debug, PartialEq, Eq)]
+enum ForceMachineStep {
+    /// Today's step: no stored target, or `--region` / `--server-type` passed.
+    Ask,
+    /// A provisioned target (or one whose state cannot be read): no prompt; the line says why.
+    Skip(String),
+    /// A stored target that has not provisioned: keeping its machine is the default.
+    OfferKeep,
+}
+
+/// Which machine step a `--force` overwrite gets. A target whose state records a server keeps
+/// its machine (no in-place resize: the guard `plan_add` and `target machine` apply), so the
+/// step is skipped; a flag that moves it is refused by `plan_add` with that guard's error.
+fn force_machine_step(
+    base: Option<&ForceBase>,
+    flag_region: Option<&str>,
+    flag_sku: Option<&str>,
+) -> ForceMachineStep {
+    let Some(b) = base else {
+        return ForceMachineStep::Ask;
+    };
+    match &b.server {
+        StoredServer::Recorded(s) => ForceMachineStep::Skip(format!(
+            "  ℹ Machine: kept ({}) — target `{}` records server `{}` (id {}), and a \
+             provisioned target's region and server type cannot change",
+            b.machine_shown(),
+            b.name,
+            s.server_name,
+            s.server_id
+        )),
+        StoredServer::Unreadable(e) => ForceMachineStep::Skip(format!(
+            "  ℹ Machine: kept ({}) — the state of target `{}` cannot be read ({e}), so \
+             whether it records a server is unknown",
+            b.machine_shown(),
+            b.name
+        )),
+        StoredServer::None if flag_region.is_some() || flag_sku.is_some() => ForceMachineStep::Ask,
+        StoredServer::None => ForceMachineStep::OfferKeep,
+    }
+}
+
+/// The machine step of a `--force` overwrite of a target that has not provisioned, with no
+/// `--region` / `--server-type`: keeping the stored machine is the default, and picking another
+/// is today's step. Under `--no-ping` the region prompt defaults to the stored region and the
+/// stored server type is kept.
+fn prompt_machine_keeping(
+    ctx: &Context,
+    provider: &str,
+    token: &SecretString,
+    stored: &cli_core::TargetConfig,
+    no_ping: bool,
+) -> CoreResult<(Option<String>, Option<String>)> {
+    if no_ping {
+        match &stored.server_type {
+            Some(sku) => eprintln!(
+                "  machine picker skipped (--no-ping); the stored server type {sku} is kept"
+            ),
+            None => eprintln!(
+                "  machine picker skipped (--no-ping); no server type is stored — pass \
+                 --server-type or set one via `apprafter target machine`, or a fresh provision \
+                 will fail"
+            ),
+        }
+        return Ok((prompt_region(None, "", stored.region.as_deref())?, None));
+    }
+    let choices = vec![
+        MachineKeepChoice::Keep(stored_machine(stored)),
+        MachineKeepChoice::Pick,
+    ];
+    match Select::new("Machine (region × server type):", choices)
+        .prompt()
+        .map_err(map_inquire_err)?
+    {
+        MachineKeepChoice::Keep(_) => Ok((None, None)),
+        MachineKeepChoice::Pick => prompt_machine(ctx, provider, token, None, None, false),
+    }
+}
+
+/// The two rows of [`prompt_machine_keeping`]'s Select, keeping first (the default).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MachineKeepChoice {
+    Keep(String),
+    Pick,
+}
+
+impl std::fmt::Display for MachineKeepChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Keep(m) => write!(f, "Keep the stored machine: {m}"),
+            Self::Pick => f.write_str("Pick another machine"),
+        }
+    }
 }
 
 /// Whether the SSH-key prefill came in via the `--ssh-key` flag or
@@ -178,18 +382,20 @@ pub fn classify_ssh_key_source_with(
     }
 }
 
+/// The env var is read through the CLI's one counted environment reader (`ProcessEnv`).
 fn classify_ssh_key_source(prefill: Option<&Path>) -> &'static str {
+    use apprafter_core::EnvSource;
     classify_ssh_key_source_with(
         prefill,
-        std::env::var("APPRAFTER_SSH_PUBLIC_KEY_PATH")
-            .ok()
+        crate::context::ProcessEnv
+            .var("APPRAFTER_SSH_PUBLIC_KEY_PATH")
             .as_deref(),
     )
 }
 
 /// Classify how the token reached us: clap's `#[arg(env)]` blends
 /// `--token` flag and `HCLOUD_TOKEN` env into the same `Option`.
-/// We probe the env separately and compare to disambiguate, so
+/// We compare with the env value separately to disambiguate, so
 /// the wizard can print a friendly "Using HCLOUD_TOKEN from env"
 /// notice. Pure on inputs — testable without touching real env.
 pub fn classify_token_source_with(prefill: Option<&str>, env_value: Option<&str>) -> TokenSource {
@@ -200,8 +406,12 @@ pub fn classify_token_source_with(prefill: Option<&str>, env_value: Option<&str>
     }
 }
 
-fn classify_token_source(prefill: Option<&str>) -> TokenSource {
-    classify_token_source_with(prefill, std::env::var(HCLOUD_TOKEN_ENV).ok().as_deref())
+/// The env value is the context's `HCLOUD_TOKEN` override, as `Context::from_cli_env` read it.
+fn classify_token_source(ctx: &Context, prefill: Option<&str>) -> TokenSource {
+    classify_token_source_with(
+        prefill,
+        ctx.overrides().hetzner_token.as_ref().map(|t| t.expose()),
+    )
 }
 
 // ---------------------------------------------------------------
@@ -209,7 +419,11 @@ fn classify_token_source(prefill: Option<&str>) -> TokenSource {
 // else is preserved from the existing target.
 // ---------------------------------------------------------------
 
-pub fn run_renew_wizard(provider: &str, no_ping: bool) -> Result<(String, bool)> {
+pub fn run_renew_wizard(
+    ctx: &Context,
+    provider: &str,
+    no_ping: bool,
+) -> CoreResult<(String, bool)> {
     eprintln!();
     eprintln!(
         "Rotating credentials. The target's config (provider, region, tier, ...) stays as-is."
@@ -218,14 +432,14 @@ pub fn run_renew_wizard(provider: &str, no_ping: bool) -> Result<(String, bool)>
     // Renew deliberately ignores `HCLOUD_TOKEN` — the env var
     // probably holds the OLD token that's being rotated. Always
     // prompt for the new one.
-    prompt_token(provider, None, TokenSource::Prompt, no_ping)
+    prompt_token(ctx, provider, None, TokenSource::Prompt, no_ping)
 }
 
 // ---------------------------------------------------------------
 // Individual prompts
 // ---------------------------------------------------------------
 
-fn prompt_name(prefill: Option<&str>, source: &str) -> Result<String> {
+fn prompt_name(prefill: Option<&str>, source: &str) -> CoreResult<String> {
     if let Some(name) = prefill {
         // Don't re-prompt for a pre-supplied name — the v0.1.76
         // behaviour of asking with `<name>` as the default was
@@ -236,16 +450,16 @@ fn prompt_name(prefill: Option<&str>, source: &str) -> Result<String> {
     }
     let answer = Text::new("Target name:")
         .with_default(DEFAULT_TARGET_NAME)
-        .with_validator(|v: &str| match super::target::check_target_name(v) {
+        .with_validator(|v: &str| match apprafter_core::target::validate_name(v) {
             Ok(()) => Ok(Validation::Valid),
-            Err(msg) => Ok(Validation::Invalid(msg.into())),
+            Err(problem) => Ok(Validation::Invalid(problem.reason(v).into())),
         })
         .prompt()
         .map_err(map_inquire_err)?;
     Ok(answer)
 }
 
-fn prompt_provider(prefill: Option<&str>, source: &str) -> Result<String> {
+fn prompt_provider(prefill: Option<&str>, source: &str) -> CoreResult<String> {
     // Single-entry Select today — kept as a Select so adding a
     // provider in the future doesn't reshape the wizard surface.
     if let Some(p) = prefill {
@@ -253,27 +467,26 @@ fn prompt_provider(prefill: Option<&str>, source: &str) -> Result<String> {
         // is otherwise prompting for other fields. Skipping the
         // prompt entirely matches the "wizard only fills missing
         // bits" contract.
-        if PROVIDER_CHOICES.contains(&p) {
-            eprintln!("  ℹ Provider: {p} (from {source})");
-            return Ok(p.to_string());
-        }
-        return Err(CliError::Other(format!(
-            "provider `{p}` is not supported (wizard surface: {})",
-            PROVIDER_CHOICES.join(", ")
-        )));
+        crate::commands::target::check_provider(p)?;
+        eprintln!("  ℹ Provider: {p} (from {source})");
+        return Ok(p.to_string());
     }
-    let answer = Select::new("Provider:", PROVIDER_CHOICES.to_vec())
-        .prompt()
-        .map_err(map_inquire_err)?;
+    let answer = Select::new(
+        "Provider:",
+        apprafter_core::provider::SUPPORTED_PROVIDERS.to_vec(),
+    )
+    .prompt()
+    .map_err(map_inquire_err)?;
     Ok(answer.to_string())
 }
 
 fn prompt_token(
+    ctx: &Context,
     provider: &str,
     prefill: Option<&str>,
     source: TokenSource,
     no_ping: bool,
-) -> Result<(String, bool)> {
+) -> CoreResult<(String, bool)> {
     if let Some(tok) = prefill {
         // Surface where the token came from so the user doesn't
         // wonder "where did that token come from?" — especially
@@ -297,14 +510,23 @@ fn prompt_token(
 
         // Validate up-front so the user gets the error attached to
         // the flag (`--token` or `HCLOUD_TOKEN` env) rather than a
-        // surprise mid-wizard prompt.
-        if let Err(reason) = validate_for_provider(provider, tok) {
-            return Err(CliError::Other(reason));
-        }
+        // surprise mid-wizard prompt — the flag path's own checks
+        // (`plan_add`), so the refusal is the same typed
+        // `apprafter::target::invalid_token` with the same text.
+        crate::commands::target::check_provider(provider)?;
+        apprafter_core::provider::TokenProblem::check(tok)
+            .map_err(|problem| CoreError::InvalidToken { problem })?;
         let verified = if no_ping {
             false
         } else {
-            ping_for_provider(provider, tok).map_err(|e| classify_ping_error(provider, e))?;
+            // Already classified by the core: 401 → token rejected, no answer → unreachable,
+            // another status the API error, an unreadable answer a request failure.
+            apprafter_core::provider::ping(
+                ctx,
+                provider,
+                &SecretString::new(tok),
+                &CancellationToken::new(),
+            )?;
             eprintln!("  ✓ Token verified");
             true
         };
@@ -312,14 +534,20 @@ fn prompt_token(
     }
 
     let provider_owned = provider.to_string();
+    // `Password` validators are `'static`: the closure owns a clone of the context.
+    let ctx = ctx.clone();
     let validator = move |v: &str| -> std::result::Result<Validation, inquire::CustomUserError> {
         if let Err(reason) = validate_for_provider(&provider_owned, v) {
             return Ok(Validation::Invalid(reason.into()));
         }
         if !no_ping {
-            if let Err(e) = ping_for_provider(&provider_owned, v) {
-                let summary = inline_ping_error(&e);
-                return Ok(Validation::Invalid(summary.into()));
+            if let Err(e) = apprafter_core::provider::ping(
+                &ctx,
+                &provider_owned,
+                &SecretString::new(v),
+                &CancellationToken::new(),
+            ) {
+                return Ok(Validation::Invalid(inline_ping_error(&e).into()));
             }
         }
         Ok(Validation::Valid)
@@ -346,9 +574,17 @@ fn prompt_token(
     Ok((answer, !no_ping))
 }
 
-fn prompt_ssh_key(prefill: Option<&PathBuf>, source: &str) -> Result<Option<PathBuf>> {
+/// `keep` is a `--force` overwrite's stored key (`Some(None)`: none is stored): keeping it is
+/// the first row and the default, and returns `None` — the flag not passed, so the core keeps
+/// the stored value.
+fn prompt_ssh_key(
+    ctx: &Context,
+    prefill: Option<&PathBuf>,
+    source: &str,
+    keep: Option<Option<String>>,
+) -> CoreResult<Option<PathBuf>> {
     if let Some(path) = prefill {
-        let abbrev = abbreviate_home_path(path);
+        let abbrev = cli_core::paths::abbreviate_home(path, ctx.home_dir());
         eprintln!("  ℹ SSH public key: {abbrev} (from {source})");
         return Ok(Some(path.clone()));
     }
@@ -356,14 +592,16 @@ fn prompt_ssh_key(prefill: Option<&PathBuf>, source: &str) -> Result<Option<Path
     // Inventory ~/.ssh/*.pub so users with multiple keys (work +
     // personal + per-host) get a real picker rather than a Text
     // input with a blind default. Falls back to the Text path
-    // when the directory is empty / unreadable.
-    let candidates = scan_ssh_pub_keys();
-
-    if candidates.is_empty() {
-        return prompt_ssh_key_text_fallback();
+    // when the directory is empty / unreadable (and there is no
+    // stored key to keep).
+    let candidates = apprafter_core::ssh::public_key_candidates(ctx)?;
+    let (rows, notes) = ssh_key_picker(candidates, keep);
+    for note in notes {
+        eprintln!("{note}");
     }
-
-    let options = build_ssh_key_choices(candidates);
+    let Some(options) = rows else {
+        return prompt_ssh_key_text_fallback(ctx.home_dir());
+    };
 
     let selected = Select::new("SSH public key:", options)
         .with_help_message("Used for server provisioning; can be added/changed later.")
@@ -372,68 +610,125 @@ fn prompt_ssh_key(prefill: Option<&PathBuf>, source: &str) -> Result<Option<Path
 
     match selected {
         SshKeyChoice::Path { path, .. } => Ok(Some(path)),
-        SshKeyChoice::Other => prompt_ssh_key_text_fallback(),
-        SshKeyChoice::Skip => Ok(None),
+        SshKeyChoice::Other => prompt_ssh_key_text_fallback(ctx.home_dir()),
+        SshKeyChoice::Skip | SshKeyChoice::Keep(_) => Ok(None),
     }
 }
 
-fn prompt_ssh_key_text_fallback() -> Result<Option<PathBuf>> {
-    let default = default_ssh_key_hint();
+fn prompt_ssh_key_text_fallback(home: Option<&Path>) -> CoreResult<Option<PathBuf>> {
+    let default = default_ssh_key_hint(home);
     let answer = Text::new("SSH public key path (leave empty to skip):")
         .with_default(&default)
-        .with_validator(|v: &str| match validate_ssh_key_path_input(v) {
+        .with_validator(move |v: &str| match validate_ssh_key_path_input(v, home) {
             Ok(()) => Ok(Validation::Valid),
             Err(msg) => Ok(Validation::Invalid(msg.into())),
         })
         .prompt()
         .map_err(map_inquire_err)?;
-    Ok(ssh_key_answer_to_path(&answer))
+    Ok(ssh_key_answer_to_path(&answer, home))
 }
 
-/// Build the SSH-key picker rows: one `Path` row per scanned key
-/// in scan order, then the two escape hatches pinned to the
-/// bottom (`Other` before `Skip`). Pure — extracted from
-/// `prompt_ssh_key` so the row set and the sentinel placement are
-/// testable without a terminal.
-fn build_ssh_key_choices(candidates: Vec<PathBuf>) -> Vec<SshKeyChoice> {
-    let mut options: Vec<SshKeyChoice> = candidates
-        .into_iter()
-        .map(|p| {
-            let label = ssh_key_label(&p);
-            SshKeyChoice::Path { path: p, label }
-        })
+/// The SSH-key picker for the `.pub` files found under `~/.ssh`: its rows
+/// ([`build_ssh_key_choices`]) over the files that hold a public key, and one note per file
+/// left out because it holds none — an OpenSSH certificate (`*-cert.pub`: it certifies a key and
+/// is not one), an ssh-dss key, junk. A terminal picker has no disabled row, so such
+/// a file is named, as the desktop labels it, rather than offered: picked, the plan would refuse
+/// it only after every later prompt (D.3d verification). `None` rows when no key is left and
+/// there is no keep row: the text prompt is asked instead.
+fn ssh_key_picker(
+    candidates: Vec<SshKeyCandidate>,
+    keep: Option<Option<String>>,
+) -> (Option<Vec<SshKeyChoice>>, Vec<String>) {
+    let (keys, not_keys): (Vec<_>, Vec<_>) = candidates.into_iter().partition(|c| c.algo.is_some());
+    let notes = not_keys
+        .iter()
+        .map(|c| format!("  ℹ Not offered: {} (not an SSH public key)", c.display))
         .collect();
+    let rows = (!keys.is_empty() || keep.is_some()).then(|| build_ssh_key_choices(keys, keep));
+    (rows, notes)
+}
+
+/// Build the SSH-key picker rows: one `Path` row per found key
+/// in the core's order, then the two escape hatches pinned to the
+/// bottom (`Other` before `Skip`). With `keep` (a `--force`
+/// overwrite's stored key) its `Keep` row comes first — the
+/// default — and `Skip` is left out: a forced overwrite cannot
+/// clear a stored key, so "don't attach one" would only keep it
+/// under another name. Pure — extracted from `prompt_ssh_key` so
+/// the row set and the sentinel placement are testable without a
+/// terminal.
+fn build_ssh_key_choices(
+    candidates: Vec<SshKeyCandidate>,
+    keep: Option<Option<String>>,
+) -> Vec<SshKeyChoice> {
+    let forced = keep.is_some();
+    let mut options: Vec<SshKeyChoice> = keep.map(SshKeyChoice::Keep).into_iter().collect();
+    options.extend(candidates.into_iter().map(|c| SshKeyChoice::Path {
+        label: candidate_label(&c),
+        path: PathBuf::from(c.path),
+    }));
     options.push(SshKeyChoice::Other);
-    options.push(SshKeyChoice::Skip);
+    if !forced {
+        options.push(SshKeyChoice::Skip);
+    }
     options
 }
 
+/// A picker row's label: the `~/` path, plus the key type and its comment when the file reads
+/// as an OpenSSH public key (`<algo> <base64> [comment…]`). Compact enough to fit on one
+/// terminal row even for verbose `~/.ssh/...` paths.
+fn candidate_label(c: &SshKeyCandidate) -> String {
+    match (&c.algo, &c.comment) {
+        (Some(algo), Some(comment)) => format!("{}  ({algo}, {comment})", c.display),
+        (Some(algo), None) => format!("{}  ({algo})", c.display),
+        (None, _) => c.display.clone(),
+    }
+}
+
 /// Accept/reject rule for the free-text SSH-key path: an empty
-/// answer means "skip", anything else must already exist on disk
-/// (after `~/` expansion). Pure — extracted from the `inquire`
+/// answer means "skip", anything else must be an OpenSSH public key
+/// file (after `~/` expansion against `home`) — a private key is
+/// refused by name, since the file is what the provider is sent
+/// (GOTCHA-149). Pure but for the read — extracted from the `inquire`
 /// validator closure in `prompt_ssh_key_text_fallback`.
-fn validate_ssh_key_path_input(input: &str) -> std::result::Result<(), String> {
+fn validate_ssh_key_path_input(
+    input: &str,
+    home: Option<&Path>,
+) -> std::result::Result<(), String> {
+    use cli_core::ssh_key::{parse_public_key, NotAPublicKey};
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return Ok(());
     }
-    let expanded = expand_tilde(trimmed);
+    let expanded = apprafter_core::ssh::expand_tilde(trimmed, home);
     if !expanded.exists() {
         return Err(format!("path `{}` does not exist", expanded.display()));
     }
-    Ok(())
+    let body = std::fs::read_to_string(&expanded)
+        .map_err(|e| format!("cannot read `{}`: {e}", expanded.display()))?;
+    match parse_public_key(&body) {
+        Ok(_) => Ok(()),
+        Err(NotAPublicKey::PrivateKey) => Err(format!(
+            "`{}` is a private key: choose its public half, the `.pub` file next to it",
+            expanded.display()
+        )),
+        Err(NotAPublicKey::Other) => Err(format!(
+            "`{}` is not an OpenSSH public key (one line: `<type> <base64> [comment]`)",
+            expanded.display()
+        )),
+    }
 }
 
 /// Turn an accepted free-text answer into the wizard's
 /// `Option<PathBuf>`: empty (or whitespace-only) is "no key at
 /// all", not an empty path. Pure — extracted from
 /// `prompt_ssh_key_text_fallback`.
-fn ssh_key_answer_to_path(answer: &str) -> Option<PathBuf> {
+fn ssh_key_answer_to_path(answer: &str, home: Option<&Path>) -> Option<PathBuf> {
     let trimmed = answer.trim();
     if trimmed.is_empty() {
         None
     } else {
-        Some(expand_tilde(trimmed))
+        Some(apprafter_core::ssh::expand_tilde(trimmed, home))
     }
 }
 
@@ -442,7 +737,12 @@ fn ssh_key_answer_to_path(answer: &str) -> Option<PathBuf> {
 /// doesn't have to re-read the file on every redraw.
 #[derive(Clone)]
 enum SshKeyChoice {
-    Path { path: PathBuf, label: String },
+    /// A `--force` overwrite's stored key (as shown), or `None` when none is stored.
+    Keep(Option<String>),
+    Path {
+        path: PathBuf,
+        label: String,
+    },
     Other,
     Skip,
 }
@@ -450,6 +750,8 @@ enum SshKeyChoice {
 impl std::fmt::Display for SshKeyChoice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Keep(Some(key)) => write!(f, "Keep the stored key: {key}"),
+            Self::Keep(None) => f.write_str("Keep: no SSH key (none is stored)"),
             Self::Path { label, .. } => f.write_str(label),
             Self::Other => f.write_str("Other (type a path)"),
             Self::Skip => f.write_str("Skip (don't attach an SSH key now)"),
@@ -457,108 +759,26 @@ impl std::fmt::Display for SshKeyChoice {
     }
 }
 
-/// Scan `~/.ssh/` for `*.pub` files. Returns paths sorted
-/// alphabetically; empty Vec on any IO error (we fall back to a
-/// Text input in that case rather than failing the wizard).
-pub fn scan_ssh_pub_keys() -> Vec<PathBuf> {
-    scan_ssh_pub_keys_in(dirs::home_dir().map(|h| h.join(".ssh")).as_deref())
-}
-
-/// Testable scan: caller picks the dir. `None` or a non-existent
-/// dir yields an empty Vec.
-pub fn scan_ssh_pub_keys_in(dir: Option<&Path>) -> Vec<PathBuf> {
-    let Some(dir) = dir else { return Vec::new() };
-    if !dir.is_dir() {
-        return Vec::new();
-    }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut keys: Vec<PathBuf> = entries
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.is_file())
-        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("pub"))
-        .collect();
-    keys.sort();
-    keys
-}
-
-/// Build a Select label for `path`: the path itself plus the
-/// public-key comment when the file looks like OpenSSH format.
-/// Compact enough to fit on one terminal row even for verbose
-/// `~/.ssh/...` paths.
-pub fn ssh_key_label(path: &Path) -> String {
-    let pretty = abbreviate_home_path(path);
-    let Ok(body) = std::fs::read_to_string(path) else {
-        return pretty;
-    };
-    let first_line = body.lines().next().unwrap_or("");
-    let parts: Vec<&str> = first_line.split_whitespace().collect();
-    // OpenSSH layout: <algo> <base64-key> [comment ...]
-    if parts.len() >= 2 {
-        let algo = parts[0];
-        let comment: String = if parts.len() > 2 {
-            parts[2..].join(" ")
-        } else {
-            String::new()
-        };
-        if comment.is_empty() {
-            return format!("{pretty}  ({algo})");
-        }
-        return format!("{pretty}  ({algo}, {comment})");
-    }
-    pretty
-}
-
-/// Render `path` with `$HOME` collapsed to `~` so picker rows
-/// stay readable. Pure on `home` for testability.
-fn abbreviate_home_path_with(path: &Path, home: Option<&Path>) -> String {
-    if let Some(home) = home {
-        if let Ok(rest) = path.strip_prefix(home) {
-            return format!("~/{}", rest.display());
-        }
-    }
-    path.display().to_string()
-}
-
-fn abbreviate_home_path(path: &Path) -> String {
-    abbreviate_home_path_with(path, dirs::home_dir().as_deref())
-}
-
+/// The `--no-ping` region prompt: a Text input with `default` (the spec's `nbg1` for a new
+/// target; a `--force` overwrite's stored region, so Enter keeps it — or none, when none is
+/// stored, so Enter keeps it unset), since the API cannot be asked for the region list. (It had
+/// a network branch, which nothing could reach: its one caller passed `no_ping = true`.)
 fn prompt_region(
-    provider: &str,
-    token: &str,
     prefill: Option<&str>,
     source: &str,
-    no_ping: bool,
-) -> Result<Option<String>> {
+    default: Option<&str>,
+) -> CoreResult<Option<String>> {
     if let Some(r) = prefill {
         eprintln!("  ℹ Default region: {r} (from {source})");
         return Ok(Some(r.to_string()));
     }
-    if no_ping {
-        // Can't query the API to populate the picker; fall back
-        // to a Text input with the spec's default `nbg1`.
-        let answer = Text::new("Default region:")
-            .with_default("nbg1")
-            .prompt()
-            .map_err(map_inquire_err)?;
-        return Ok(region_text_answer(&answer));
-    }
-    let regions = fetch_regions(provider, token)?;
-    if regions.is_empty() {
-        return Ok(None);
-    }
-    eprintln!(
-        "  ⏳ Measuring latency to {} region(s)... (best-effort, ≤2s)",
-        regions.len()
-    );
-    let measured = measure_region_latencies(regions, Duration::from_millis(2000));
-    let selected = Select::new("Default region (sorted by latency):", measured)
-        .prompt()
-        .map_err(map_inquire_err)?;
-    Ok(Some(selected.info.name))
+    let prompt = Text::new("Default region:");
+    let prompt = match default {
+        Some(d) => prompt.with_default(d),
+        None => prompt.with_help_message("leave empty to keep it unset"),
+    };
+    let answer = prompt.prompt().map_err(map_inquire_err)?;
+    Ok(region_text_answer(&answer))
 }
 
 /// An empty answer at the `--no-ping` region prompt means "leave
@@ -572,124 +792,6 @@ fn region_text_answer(answer: &str) -> Option<String> {
     } else {
         Some(trimmed.to_string())
     }
-}
-
-/// `RegionInfo` decorated with a measured TCP latency. `None`
-/// means the probe didn't resolve / timed out — those entries
-/// sort to the end of the Select so they don't crowd the
-/// top-of-list reachable options.
-#[derive(Clone)]
-pub struct RegionWithLatency {
-    pub info: RegionInfo,
-    pub latency_ms: Option<u32>,
-}
-
-impl std::fmt::Display for RegionWithLatency {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.latency_ms {
-            Some(ms) => write!(f, "{:>10}  ({:>4} ms)", self.info, ms),
-            None => write!(f, "{:>10}  (  n/a   )", self.info),
-        }
-    }
-}
-
-/// Probe each region in parallel, return sorted ascending by
-/// latency (`None` last). Bounded by `overall_timeout` so a
-/// network outage doesn't hang the wizard — entries that didn't
-/// report in time end up as `None`.
-pub fn measure_region_latencies(
-    regions: Vec<RegionInfo>,
-    overall_timeout: Duration,
-) -> Vec<RegionWithLatency> {
-    if regions.is_empty() {
-        return Vec::new();
-    }
-    let (tx, rx) = mpsc::channel::<RegionWithLatency>();
-    let originals: Vec<RegionInfo> = regions.clone();
-    let expected = regions.len();
-    for r in regions {
-        let tx = tx.clone();
-        std::thread::spawn(move || {
-            let latency_ms = probe_region_latency(&r.name, overall_timeout);
-            // Send may fail if the receiver was dropped (overall
-            // timeout hit) — ignore, the receiver has already
-            // moved on.
-            let _ = tx.send(RegionWithLatency {
-                info: r,
-                latency_ms,
-            });
-        });
-    }
-    drop(tx);
-
-    let deadline = Instant::now() + overall_timeout;
-    let mut results: Vec<RegionWithLatency> = Vec::with_capacity(expected);
-    while results.len() < expected {
-        let now = Instant::now();
-        if now >= deadline {
-            break;
-        }
-        let remaining = deadline - now;
-        match rx.recv_timeout(remaining) {
-            Ok(r) => results.push(r),
-            Err(_) => break,
-        }
-    }
-    // Latecomers that finished after the deadline but before we
-    // returned still get picked up cheaply.
-    while let Ok(r) = rx.try_recv() {
-        results.push(r);
-    }
-
-    finalize_latency_rows(originals, results)
-}
-
-/// Reconcile what the probes reported against the full region
-/// list, then sort fastest-first.
-///
-/// Synthesizes a `None`-latency entry for any region that never
-/// reported within the overall timeout — the user still sees it in
-/// the Select picker (sorted to the end), they just can't compare
-/// latency. Without this, a run where every probe hangs would
-/// silently shrink the picker to zero entries and the wizard would
-/// offer the operator no region at all.
-///
-/// Pure — extracted from `measure_region_latencies` so the
-/// reconcile + sort rule is testable without spawning probe
-/// threads or waiting on a real timeout.
-fn finalize_latency_rows(
-    originals: Vec<RegionInfo>,
-    mut results: Vec<RegionWithLatency>,
-) -> Vec<RegionWithLatency> {
-    let reported: std::collections::HashSet<String> =
-        results.iter().map(|r| r.info.name.clone()).collect();
-    for orig in originals {
-        if !reported.contains(&orig.name) {
-            results.push(RegionWithLatency {
-                info: orig,
-                latency_ms: None,
-            });
-        }
-    }
-
-    results.sort_by_key(|r| r.latency_ms.unwrap_or(u32::MAX));
-    results
-}
-
-/// TCP-connect to the per-Hetzner-DC speedtest endpoint
-/// (`<region>-speed.hetzner.com:443`) and return the round-trip
-/// of the connect handshake in ms. Returns `None` if DNS fails,
-/// connect times out, or any other IO error fires. Pure on the
-/// `region` name — exposed as `pub` so tests can call it (they
-/// won't actually probe in unit-tests, but the function isn't
-/// hidden behind the `prompt_region` glue).
-pub fn probe_region_latency(region: &str, timeout: Duration) -> Option<u32> {
-    let host = format!("{region}-speed.hetzner.com:443");
-    let addrs: Vec<_> = host.to_socket_addrs().ok()?.collect();
-    let addr = *addrs.first()?;
-    let start = Instant::now();
-    std::net::TcpStream::connect_timeout(&addr, timeout).ok()?;
-    Some(start.elapsed().as_millis().min(u32::MAX as u128) as u32)
 }
 
 /// Return the distinct `location` values from a slice of `MachineOffer`s,
@@ -707,19 +809,43 @@ pub fn unique_locations(offers: &[cli_providers::machine::MachineOffer]) -> Vec<
     out
 }
 
-/// Fetch the machine catalog with an interactive retry loop on failure.
+/// Whether a failed catalogue read is worth retrying: a provider request that failed (an API
+/// status, no answer at all — WI-453's `provider_unreachable` — or an answer that did not
+/// parse). Anything else — an unsupported provider, a cancelled operation — would fail the same
+/// way again.
+fn is_request_failure(e: &CoreError) -> bool {
+    matches!(
+        e,
+        CoreError::ProviderRequestFailed { .. }
+            | CoreError::Cli(CliError::Hetzner { .. })
+            | CoreError::Cli(CliError::ProviderApiUnreachable { .. })
+    )
+}
+
+/// `e` and its causes on one line, as the retry notice shows them.
+fn with_causes(e: &CoreError) -> String {
+    let mut line = e.to_string();
+    let mut cause = std::error::Error::source(e);
+    while let Some(c) = cause {
+        line.push_str(&format!(": {c}"));
+        cause = c.source();
+    }
+    line
+}
+
+/// Fetch the machine catalog with an interactive retry loop on a failed request.
 ///
-/// If the API call fails, prints the error and asks the user whether to
+/// If the request fails, prints the error and asks the user whether to
 /// retry. Returning `false` from the prompt aborts with the original
-/// error (no silent fallback).
-fn fetch_offers_with_retry(
-    validator: &HetznerCloudValidator,
-) -> Result<Vec<cli_providers::machine::MachineOffer>> {
+/// error (no silent fallback). Any other error returns at once.
+fn fetch_catalogue_with_retry(
+    fetch: impl Fn() -> CoreResult<MachineCatalogue>,
+) -> CoreResult<MachineCatalogue> {
     loop {
-        match validator.list_machine_offers() {
-            Ok(o) => return Ok(o),
-            Err(e) => {
-                eprintln!("  could not fetch the machine catalog: {e}");
+        match fetch() {
+            Ok(c) => return Ok(c),
+            Err(e) if is_request_failure(&e) => {
+                eprintln!("  could not fetch the machine catalog: {}", with_causes(&e));
                 let retry = inquire::Confirm::new("Retry fetching the machine catalog?")
                     .with_default(true)
                     .prompt()
@@ -728,6 +854,7 @@ fn fetch_offers_with_retry(
                     return Err(e);
                 }
             }
+            Err(e) => return Err(e),
         }
     }
 }
@@ -736,17 +863,20 @@ fn fetch_offers_with_retry(
 ///
 /// Returns `(region, server_type)`:
 /// - Under `--no-ping`: skips the API entirely, falls back to the text
-///   prompt with the `nbg1` default (reuses `prompt_region`), and returns
+///   prompt with the `nbg1` default (`prompt_region`), and returns
 ///   `(that_region, None)` so `server_type` stays unset.
-/// - Normal path: fetches the full catalog, measures latency to each unique
-///   location once, builds `MachineRow`s, and delegates to `pick_machine`.
+/// - Normal path: fetches the full catalog (`machine::catalogue`, the token
+///   given), measures latency to each unique location once
+///   (`machine::region_latencies`), builds `MachineRow`s, and delegates to
+///   `pick_machine`.
 pub fn prompt_machine(
+    ctx: &Context,
     provider: &str,
-    token: &str,
+    token: &SecretString,
     prefill_region: Option<&str>,
     prefill_sku: Option<&str>,
     no_ping: bool,
-) -> Result<(Option<String>, Option<String>)> {
+) -> CoreResult<(Option<String>, Option<String>)> {
     // H1: --no-ping shunt — do NOT hit the API.
     if no_ping {
         eprintln!(
@@ -754,7 +884,11 @@ pub fn prompt_machine(
              pass --server-type or set one via `apprafter target machine`, \
              or a fresh provision will fail"
         );
-        let region = prompt_region(provider, token, prefill_region, "--region flag", true)?;
+        let region = prompt_region(
+            prefill_region,
+            "--region flag",
+            Some(apprafter_core::machine::DEFAULT_REGION),
+        )?;
         return Ok((region, None));
     }
 
@@ -766,16 +900,16 @@ pub fn prompt_machine(
         return Ok((Some(r.to_string()), Some(s.to_string())));
     }
 
-    // Build the validator and fetch the catalog (with retry on failure).
-    let validator = match provider {
-        "hetzner-cloud" => HetznerCloudValidator::new(hcloud_base_url(), token),
-        other => {
-            return Err(CliError::Other(format!(
-                "no machine catalog for provider `{other}` — pass `--no-ping` to fall back to text entry"
-            )));
-        }
-    };
-    let offers = fetch_offers_with_retry(&validator)?;
+    // Fetch the catalog (with retry on a failed request).
+    let cancel = CancellationToken::new();
+    let catalogue = fetch_catalogue_with_retry(|| {
+        apprafter_core::machine::catalogue(ctx, CatalogueSource::Token { provider, token }, &cancel)
+    })?;
+    let offers: Vec<cli_providers::machine::MachineOffer> = catalogue
+        .offers
+        .iter()
+        .map(MachineOfferView::to_offer)
+        .collect();
 
     // Measure latency to each unique location once.
     let locations = unique_locations(&offers);
@@ -783,18 +917,11 @@ pub fn prompt_machine(
         "  ⏳ Measuring latency to {} location(s)... (best-effort, ≤2s)",
         locations.len()
     );
-    let region_infos: Vec<RegionInfo> = locations
-        .iter()
-        .map(|name| RegionInfo {
-            name: name.clone(),
-            description: name.clone(),
-        })
-        .collect();
-    let measured = measure_region_latencies(region_infos, Duration::from_millis(2000));
-    let latency_map: std::collections::HashMap<String, Option<u32>> = measured
-        .into_iter()
-        .map(|r| (r.info.name.clone(), r.latency_ms))
-        .collect();
+    let latency_map: std::collections::HashMap<String, Option<u32>> =
+        apprafter_core::machine::region_latencies(ctx, &locations, &cancel)?
+            .into_iter()
+            .map(|r| (r.region, r.latency_ms))
+            .collect();
 
     // Build MachineRow vec: pair each offer with its location's latency.
     let rows: Vec<MachineRow> = offers
@@ -809,45 +936,72 @@ pub fn prompt_machine(
     Ok((Some(region), Some(sku)))
 }
 
-fn prompt_tier(prefill: Option<&str>, source: &str) -> Result<Option<String>> {
+/// `keep` is a `--force` overwrite's stored tier (`Some(None)`: none is stored): keeping it is
+/// the first row and the default, and returns `None` — the flag not passed, so the core keeps
+/// the stored value.
+fn prompt_tier(
+    prefill: Option<&str>,
+    source: &str,
+    keep: Option<Option<&str>>,
+) -> CoreResult<Option<String>> {
     if let Some(t) = prefill {
         eprintln!("  ℹ Default tier: {t} (from {source})");
         return Ok(Some(t.to_string()));
     }
-    let options = build_tier_choices();
+    let options = build_tier_choices(keep);
     let selected = Select::new("Default tier:", options)
         .prompt()
         .map_err(map_inquire_err)?;
-    Ok(Some(selected.key))
+    Ok(selected.tier())
 }
 
-/// Materialise the tier picker rows from `TIER_CHOICES`. Pure —
-/// extracted from `prompt_tier` so the offered set and its order
-/// (price ladder, cheapest first) are testable without a terminal.
-fn build_tier_choices() -> Vec<TierChoice> {
-    TIER_CHOICES
-        .iter()
-        .map(|(k, label)| TierChoice {
+/// Materialise the tier picker rows from `TIER_CHOICES`, after a
+/// `Keep` row (the default) when `keep` is a `--force` overwrite's
+/// stored tier. Pure — extracted from `prompt_tier` so the offered
+/// set and its order (price ladder, cheapest first) are testable
+/// without a terminal.
+fn build_tier_choices(keep: Option<Option<&str>>) -> Vec<TierChoice> {
+    let keep = keep.map(|k| TierChoice::Keep(k.map(str::to_string)));
+    keep.into_iter()
+        .chain(TIER_CHOICES.iter().map(|(k, label)| TierChoice::Tier {
             key: (*k).to_string(),
             label: (*label).to_string(),
-        })
+        }))
         .collect()
 }
 
-#[derive(Clone)]
-struct TierChoice {
-    key: String,
-    label: String,
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TierChoice {
+    /// A `--force` overwrite's stored tier, or `None` when none is stored.
+    Keep(Option<String>),
+    Tier {
+        key: String,
+        label: String,
+    },
+}
+
+impl TierChoice {
+    /// What the prompt answers: a tier, or `None` to keep the stored one.
+    fn tier(self) -> Option<String> {
+        match self {
+            TierChoice::Keep(_) => None,
+            TierChoice::Tier { key, .. } => Some(key),
+        }
+    }
 }
 
 impl std::fmt::Display for TierChoice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} — {}", self.key, self.label)
+        match self {
+            Self::Keep(Some(t)) => write!(f, "Keep the stored tier: {t}"),
+            Self::Keep(None) => f.write_str("Keep: no tier (none is stored)"),
+            Self::Tier { key, label } => write!(f, "{key} — {label}"),
+        }
     }
 }
 
 // ---------------------------------------------------------------
-// Per-provider routing for validation + ping
+// Per-provider token format check, and the inline ping summary
 // ---------------------------------------------------------------
 
 fn validate_for_provider(provider: &str, token: &str) -> std::result::Result<(), String> {
@@ -859,63 +1013,40 @@ fn validate_for_provider(provider: &str, token: &str) -> std::result::Result<(),
     }
 }
 
-fn ping_for_provider(provider: &str, token: &str) -> Result<()> {
-    match provider {
-        "hetzner-cloud" => {
-            let validator = HetznerCloudValidator::new(hcloud_base_url(), token);
-            validator.validate_credentials()
-        }
-        other => Err(CliError::Other(format!(
-            "no validator for provider `{other}` — pass `--no-ping` to skip"
-        ))),
-    }
-}
-
-/// Sort a credential-validation error into the right typed variant.
-/// 401 → `ProviderTokenRejected` (operator can rotate); everything
-/// else → `ProviderApiUnreachable` (operator can `doctor` or wait
-/// out the outage). Both wrappers carry the original error as a
-/// cause chain so miette renders both layers — top-level summary
-/// plus the underlying API envelope.
-fn classify_ping_error(provider: &str, err: CliError) -> CliError {
-    match err {
-        CliError::Hetzner { status: 401, .. } => CliError::ProviderTokenRejected {
-            provider: provider.to_string(),
-            cause: Box::new(err),
-        },
-        _ => CliError::ProviderApiUnreachable {
-            provider: provider.to_string(),
-            cause: Box::new(err),
-        },
-    }
-}
-
-fn fetch_regions(provider: &str, token: &str) -> Result<Vec<RegionInfo>> {
-    match provider {
-        "hetzner-cloud" => {
-            let validator = HetznerCloudValidator::new(hcloud_base_url(), token);
-            validator.list_regions()
-        }
-        other => Err(CliError::Other(format!(
-            "no validator for provider `{other}` — region picker unavailable"
-        ))),
-    }
-}
-
 /// One-line error string for inline rendering inside an inquire
-/// validator. The full multi-line message from `CliError` would
-/// fight the prompt UX, so we collapse it.
-fn inline_ping_error(err: &CliError) -> String {
-    match err {
-        CliError::Hetzner {
-            status: 401,
+/// validator. The full multi-line message would fight the prompt
+/// UX, so we collapse it, one line for each way the core classifies
+/// a failed ping: a 401, a 429, another status, no answer, an answer
+/// it could not read.
+fn inline_ping_error(e: &CoreError) -> String {
+    match e {
+        CoreError::Cli(CliError::ProviderTokenRejected { cause, .. }) => {
+            // Upcast `dyn Diagnostic` to `dyn Error` (stable trait upcasting) to downcast it.
+            let raw: &(dyn std::error::Error + 'static) = &**cause;
+            match raw.downcast_ref::<CliError>() {
+                Some(CliError::Hetzner { message, .. }) => {
+                    format!("Hetzner Cloud rejected the token (HTTP 401): {message}")
+                }
+                _ => format!("Hetzner Cloud rejected the token: {cause}"),
+            }
+        }
+        CoreError::Cli(CliError::Hetzner {
+            status: 429,
             message,
             ..
-        } => format!("Hetzner Cloud rejected the token (HTTP 401): {message}"),
-        CliError::Hetzner {
+        }) => format!(
+            "Hetzner Cloud is rate-limiting requests (HTTP 429): {message}; wait, then try again"
+        ),
+        CoreError::Cli(CliError::Hetzner {
             status, message, ..
-        } => format!("Hetzner Cloud API ping failed (HTTP {status}): {message}"),
-        CliError::Other(msg) => format!("could not reach the provider: {msg}"),
+        }) => format!("Hetzner Cloud API ping failed (HTTP {status}): {message}"),
+        // A request that got no answer, as the client classifies it (WI-453).
+        CoreError::Cli(CliError::ProviderApiUnreachable { cause, .. }) => {
+            format!("could not reach the provider: {cause}")
+        }
+        CoreError::ProviderRequestFailed { cause, .. } => {
+            format!("the provider request failed: {cause}")
+        }
         other => format!("ping failed: {other}"),
     }
 }
@@ -924,28 +1055,17 @@ fn inline_ping_error(err: &CliError) -> String {
 // Tiny helpers
 // ---------------------------------------------------------------
 
-/// Expand a leading `~/` into `$HOME` (best-effort cross-platform).
-/// Other tilde forms (`~user/`) are left unexpanded so the path
-/// stays predictable — operators who need that can pass an
-/// absolute path explicitly.
-pub fn expand_tilde(input: &str) -> PathBuf {
-    if let Some(rest) = input.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
-        }
-    }
-    PathBuf::from(input)
-}
-
-fn default_ssh_key_hint() -> String {
+fn default_ssh_key_hint(home: Option<&Path>) -> String {
     // ~/.ssh/id_ed25519.pub matches the modern OpenSSH default
     // and is what apprafter init / apply scaffolding already
     // expects. If the file doesn't exist, the validator gives the
     // user a clear "path does not exist" prompt without erroring
     // out the wizard — they can paste a different path.
-    if let Some(home) = dirs::home_dir() {
+    // One component per `join`, so the platform's separator sits between each of them.
+    if let Some(home) = home {
         return home
-            .join(".ssh/id_ed25519.pub")
+            .join(".ssh")
+            .join("id_ed25519.pub")
             .to_string_lossy()
             .into_owned();
     }
@@ -971,12 +1091,19 @@ fn map_inquire_err(err: InquireError) -> CliError {
 //
 // inquire prompts read from a real terminal so end-to-end wizard
 // tests would need a PTY harness (overkill for the current MVP).
-// Manual walks cover the prompt UX; what we pin here is the pure
-// decision logic + helpers.
+// Manual walks and the scripted `expect` run cover the prompt UX;
+// what we pin here is the pure decision logic + helpers.
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use apprafter_core::UiError;
+
+    /// A context that reaches no network (`127.0.0.1:1` refuses) and whose home is `home`.
+    fn ctx_with_home(home: &Path) -> Context {
+        Context::for_desktop("/unused".into(), "http://127.0.0.1:1")
+            .with_home_dir(Some(home.into()))
+    }
 
     #[test]
     fn should_use_wizard_fires_on_tty_unless_no_interactive() {
@@ -994,43 +1121,197 @@ mod tests {
         assert!(should_use_wizard(false, true, true));
     }
 
+    /// The picker row for a found key: the `~/` path, then the key type and its comment when
+    /// the file reads as an OpenSSH public key — exactly the row the wizard always showed.
     #[test]
-    fn expand_tilde_replaces_leading_tilde_slash_only() {
-        let h = dirs::home_dir().expect("home_dir resolves in test env");
+    fn a_candidate_label_is_the_path_then_algo_and_comment() {
+        let c = SshKeyCandidate {
+            path: "/h/.ssh/w.pub".into(),
+            display: "~/.ssh/w.pub".into(),
+            algo: Some("ssh-ed25519".into()),
+            comment: Some("me@w".into()),
+        };
+        assert_eq!(candidate_label(&c), "~/.ssh/w.pub  (ssh-ed25519, me@w)");
         assert_eq!(
-            expand_tilde("~/.ssh/id_ed25519.pub"),
-            h.join(".ssh/id_ed25519.pub")
+            candidate_label(&SshKeyCandidate {
+                comment: None,
+                ..c.clone()
+            }),
+            "~/.ssh/w.pub  (ssh-ed25519)"
         );
-        // Without leading `~/` we pass through verbatim.
         assert_eq!(
-            expand_tilde("/etc/ssh/host_key.pub"),
-            PathBuf::from("/etc/ssh/host_key.pub")
+            candidate_label(&SshKeyCandidate {
+                algo: None,
+                comment: None,
+                ..c
+            }),
+            "~/.ssh/w.pub"
         );
-        // `~user/foo` form intentionally NOT expanded.
-        assert_eq!(expand_tilde("~bob/key"), PathBuf::from("~bob/key"));
     }
 
+    /// The "from the environment" label compares the prefilled token with the CLI's
+    /// `HCLOUD_TOKEN` override as the context read it, never with the process environment.
     #[test]
-    fn inline_ping_error_summarises_401_separately_from_other_http_errors() {
-        let e = CliError::Hetzner {
-            endpoint: "GET /v1/locations".into(),
-            status: 401,
-            code: "unauthorized".into(),
-            message: "unable to authenticate".into(),
-        };
-        let s = inline_ping_error(&e);
-        assert!(s.contains("HTTP 401"), "{s}");
-        assert!(s.to_lowercase().contains("rejected the token"), "{s}");
+    fn the_token_source_compares_against_the_cli_override_not_the_process_env() {
+        let env = apprafter_core::MapEnv::new()
+            .with("APPRAFTER_CONFIG_DIR", "/tmp/x")
+            .with("HCLOUD_TOKEN", "t".repeat(64).as_str());
+        let ctx = Context::from_cli_env(&env).unwrap();
+        assert_eq!(
+            classify_token_source(&ctx, Some(&"t".repeat(64))),
+            TokenSource::Env
+        );
+        assert_eq!(
+            classify_token_source(&ctx, Some(&"u".repeat(64))),
+            TokenSource::Flag
+        );
+        assert_eq!(classify_token_source(&ctx, None), TokenSource::Prompt);
+    }
 
-        let e = CliError::Hetzner {
+    /// No catalogue exists for a provider the core does not support: the core's typed
+    /// refusal, at once — retrying cannot change it, so no retry prompt.
+    #[test]
+    fn prompt_machine_refuses_an_unsupported_provider_with_the_typed_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = SecretString::new("a".repeat(64));
+        let err = prompt_machine(&ctx_with_home(dir.path()), "aws", &token, None, None, false)
+            .unwrap_err();
+        assert_eq!(
+            UiError::from(&err).code.as_deref(),
+            Some("apprafter::target::unknown_provider")
+        );
+    }
+
+    /// Only a failed provider request is offered a retry; anything else returns at once, and a
+    /// catalogue that arrives is returned as is.
+    #[test]
+    fn only_a_failed_request_is_worth_a_retry() {
+        let calls = std::cell::Cell::new(0);
+        let err = fetch_catalogue_with_retry(|| {
+            calls.set(calls.get() + 1);
+            Err(CoreError::Cancelled)
+        })
+        .unwrap_err();
+        assert!(matches!(err, CoreError::Cancelled), "{err:?}");
+        assert_eq!(calls.get(), 1);
+
+        let empty = MachineCatalogue {
+            regions: Vec::new(),
+            offers: Vec::new(),
+        };
+        let got = fetch_catalogue_with_retry(|| Ok(empty.clone())).unwrap();
+        assert_eq!(got, empty);
+
+        assert!(is_request_failure(&CoreError::ProviderRequestFailed {
+            provider: "hetzner-cloud".into(),
             endpoint: "GET /v1/locations".into(),
+            cause: Box::new(CoreError::Cli(CliError::Other("reset".into()))),
+        }));
+        // WI-453: a dead API is `provider_unreachable` on the catalogue read too; the retry
+        // offer is for it above all.
+        assert!(is_request_failure(&CoreError::Cli(
+            CliError::ProviderApiUnreachable {
+                provider: "hetzner-cloud".into(),
+                cause: Box::new(cli_core::TransportFailure {
+                    endpoint: "http://127.0.0.1:1/v1/locations".into(),
+                    detail: "Connection Failed".into(),
+                }),
+            }
+        )));
+        assert!(is_request_failure(&CoreError::Cli(CliError::Hetzner {
+            endpoint: "GET /v1/server_types".into(),
             status: 503,
             code: "unavailable".into(),
             message: "try later".into(),
+        })));
+        assert!(!is_request_failure(&CoreError::UnknownProvider {
+            provider: "aws".into(),
+            supported: vec!["hetzner-cloud".into()],
+        }));
+    }
+
+    fn rejected(status: u16, message: &str) -> CoreError {
+        let raw = CliError::Hetzner {
+            endpoint: "GET /v1/locations".into(),
+            status,
+            code: "x".into(),
+            message: message.into(),
         };
-        let s = inline_ping_error(&e);
-        assert!(s.contains("HTTP 503"), "{s}");
-        assert!(s.to_lowercase().contains("api ping failed"), "{s}");
+        // The core's ping (WI-453 follow-up): a 401 is the token rejected, any other status the
+        // API error itself.
+        CoreError::Cli(if status == 401 {
+            CliError::ProviderTokenRejected {
+                provider: "hetzner-cloud".into(),
+                cause: Box::new(raw),
+            }
+        } else {
+            raw
+        })
+    }
+
+    /// The inline line under the token prompt reads the raw API error inside the core's
+    /// classified one: a 401 is "rejected", any other status "ping failed (HTTP n)".
+    #[test]
+    fn inline_ping_error_summarises_401_separately_from_other_http_errors() {
+        assert_eq!(
+            inline_ping_error(&rejected(401, "unable to authenticate")),
+            "Hetzner Cloud rejected the token (HTTP 401): unable to authenticate"
+        );
+        assert_eq!(
+            inline_ping_error(&rejected(503, "try later")),
+            "Hetzner Cloud API ping failed (HTTP 503): try later"
+        );
+        // A 429 is the provider rate-limiting, not a failure of the token or the network.
+        assert_eq!(
+            inline_ping_error(&rejected(429, "slow down")),
+            "Hetzner Cloud is rate-limiting requests (HTTP 429): slow down; wait, then try again"
+        );
+    }
+
+    /// No answer reads as "could not reach", an answer that does not parse as a failed request,
+    /// anything else as a generic one-liner; all stay on one line — a multi-line message fights
+    /// the `inquire` prompt redraw.
+    #[test]
+    fn inline_ping_error_summarises_transport_and_unknown_failures_on_one_line() {
+        // An answer the check cannot read is not "could not reach" (WI-453 follow-up).
+        let unreadable = inline_ping_error(&CoreError::ProviderRequestFailed {
+            provider: "hetzner-cloud".into(),
+            endpoint: "GET /v1/locations".into(),
+            cause: Box::new(CoreError::Cli(CliError::Other(
+                "parse list_locations response: missing field `locations`".into(),
+            ))),
+        });
+        assert_eq!(
+            unreadable,
+            "the provider request failed: parse list_locations response: missing field \
+             `locations`"
+        );
+        // The client's own classification of a request that got no answer (WI-453).
+        let no_answer = inline_ping_error(&CoreError::Cli(CliError::ProviderApiUnreachable {
+            provider: "hetzner-cloud".into(),
+            cause: Box::new(cli_core::TransportFailure {
+                endpoint: "http://127.0.0.1:1/v1/locations".into(),
+                detail: "Connection Failed: Connect error: Connection refused".into(),
+            }),
+        }));
+        assert_eq!(
+            no_answer,
+            "could not reach the provider: transport error talking to \
+             http://127.0.0.1:1/v1/locations: Connection Failed: Connect error: Connection refused"
+        );
+
+        let unknown = inline_ping_error(&CoreError::Cli(CliError::TargetNotFound {
+            name: "ghost".into(),
+            available: "dev".into(),
+        }));
+        assert!(unknown.starts_with("ping failed:"), "{unknown}");
+        assert!(!unknown.contains('\n'), "{unknown}");
+
+        let unsupported = inline_ping_error(&CoreError::UnknownProvider {
+            provider: "aws".into(),
+            supported: vec!["hetzner-cloud".into()],
+        });
+        assert!(unsupported.starts_with("ping failed:"), "{unsupported}");
     }
 
     #[test]
@@ -1045,7 +1326,7 @@ mod tests {
 
     #[test]
     fn tier_choice_display_includes_both_key_and_label() {
-        let c = TierChoice {
+        let c = TierChoice::Tier {
             key: "solo".into(),
             label: "Tier 1 — €5".into(),
         };
@@ -1079,111 +1360,6 @@ mod tests {
     }
 
     #[test]
-    fn scan_ssh_pub_keys_in_returns_empty_for_missing_or_empty_dirs() {
-        assert!(scan_ssh_pub_keys_in(None).is_empty());
-        let dir = tempfile::tempdir().unwrap();
-        // Non-existent subdir.
-        assert!(scan_ssh_pub_keys_in(Some(&dir.path().join("nope"))).is_empty());
-        // Empty existing dir.
-        assert!(scan_ssh_pub_keys_in(Some(dir.path())).is_empty());
-    }
-
-    #[test]
-    fn scan_ssh_pub_keys_in_returns_only_pub_files_sorted_alphabetically() {
-        let dir = tempfile::tempdir().unwrap();
-        // Mix `.pub`, private keys (no extension), other files,
-        // and a subdirectory to make sure we don't recurse.
-        std::fs::write(dir.path().join("id_ed25519.pub"), "ssh-ed25519 AAA me@x").unwrap();
-        std::fs::write(dir.path().join("id_ed25519"), "private not for scan").unwrap();
-        std::fs::write(dir.path().join("work.pub"), "ssh-rsa BBB me@work").unwrap();
-        std::fs::write(dir.path().join("config"), "Host *\n  User me").unwrap();
-        std::fs::create_dir(dir.path().join("subdir")).unwrap();
-        std::fs::write(dir.path().join("subdir/nested.pub"), "should not appear").unwrap();
-
-        let keys = scan_ssh_pub_keys_in(Some(dir.path()));
-        let names: Vec<String> = keys
-            .iter()
-            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(names, vec!["id_ed25519.pub", "work.pub"]);
-    }
-
-    #[test]
-    fn ssh_key_label_emits_path_algo_and_comment_when_present() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("id_ed25519.pub");
-        std::fs::write(&path, "ssh-ed25519 AAAAfakebody me@laptop\n").unwrap();
-        let label = ssh_key_label(&path);
-        assert!(
-            label.contains("id_ed25519.pub"),
-            "label should carry filename: {label}"
-        );
-        assert!(label.contains("ssh-ed25519"), "{label}");
-        assert!(label.contains("me@laptop"), "{label}");
-    }
-
-    #[test]
-    fn ssh_key_label_falls_back_to_path_when_file_is_unreadable() {
-        let label = ssh_key_label(std::path::Path::new("/this/does/not/exist/key.pub"));
-        // Path string is preserved verbatim; we just don't crash
-        // on the missing file.
-        assert!(label.contains("key.pub"), "{label}");
-    }
-
-    #[test]
-    fn abbreviate_home_path_collapses_home_to_tilde() {
-        let home = std::path::Path::new("/home/operator");
-        assert_eq!(
-            abbreviate_home_path_with(
-                std::path::Path::new("/home/operator/.ssh/id_ed25519.pub"),
-                Some(home)
-            ),
-            "~/.ssh/id_ed25519.pub"
-        );
-        // Path outside $HOME stays absolute.
-        assert_eq!(
-            abbreviate_home_path_with(std::path::Path::new("/etc/ssh/host_key.pub"), Some(home)),
-            "/etc/ssh/host_key.pub"
-        );
-        // No home → verbatim.
-        assert_eq!(
-            abbreviate_home_path_with(std::path::Path::new("/foo/bar"), None),
-            "/foo/bar"
-        );
-    }
-
-    #[test]
-    fn measure_region_latencies_sorts_unreachable_last_and_preserves_known() {
-        // Use a deterministic region list with hostnames that
-        // can't resolve (`.invalid` is reserved by RFC 6761 for
-        // exactly this — DNS never answers). Probes will all
-        // return `None`; the sort just has to put them in stable
-        // input order without panicking.
-        let regions = vec![
-            RegionInfo {
-                name: "z-fake.invalid".into(),
-                description: "Z".into(),
-            },
-            RegionInfo {
-                name: "a-fake.invalid".into(),
-                description: "A".into(),
-            },
-        ];
-        let measured = measure_region_latencies(regions, Duration::from_millis(200));
-        // All probes failed → all latency_ms = None; order
-        // amongst equals follows whatever the sort does (stable
-        // by latency, equal latency → input order preserved by
-        // Rust's stable sort).
-        assert_eq!(measured.len(), 2);
-        for m in &measured {
-            assert!(
-                m.latency_ms.is_none(),
-                "synthetic .invalid hosts shouldn't resolve"
-            );
-        }
-    }
-
-    #[test]
     fn classify_ssh_key_source_prefers_env_label_when_path_matches_env_value() {
         let p = PathBuf::from("/home/me/.ssh/id_ed25519.pub");
         // Path matches env-var value byte-for-byte → labelled
@@ -1207,26 +1383,6 @@ mod tests {
         // the fallback is still "--ssh-key flag" (callers gate
         // the call on prefill.is_some() anyway).
         assert_eq!(classify_ssh_key_source_with(None, None), "--ssh-key flag");
-    }
-
-    #[test]
-    fn region_with_latency_display_marks_unreachable_distinctly() {
-        let info = RegionInfo {
-            name: "nbg1".into(),
-            description: "Nuremberg".into(),
-        };
-        let reachable = RegionWithLatency {
-            info: info.clone(),
-            latency_ms: Some(24),
-        };
-        let dead = RegionWithLatency {
-            info,
-            latency_ms: None,
-        };
-        let s_reach = reachable.to_string();
-        let s_dead = dead.to_string();
-        assert!(s_reach.contains("24 ms"), "{s_reach}");
-        assert!(s_dead.contains("n/a"), "{s_dead}");
     }
 
     // ---------------------------------------------------------------
@@ -1318,6 +1474,10 @@ mod tests {
             no_interactive: false,
             no_ping: true,
             server_type: Some("cx22".into()),
+            typed: crate::dispatch::Typed {
+                token: true,
+                ssh_key: true,
+            },
         }
     }
 
@@ -1331,8 +1491,10 @@ mod tests {
     /// individual prompt still "works".
     #[test]
     fn run_add_wizard_returns_every_supplied_flag_unchanged_and_prompts_for_nothing() {
+        let dir = tempfile::tempdir().unwrap();
         let args = add_args_fully_supplied();
-        let out = run_add_wizard(&args).expect("a fully prefilled wizard must not prompt");
+        let out = run_add_wizard(&ctx_with_home(dir.path()), &args)
+            .expect("a fully prefilled wizard must not prompt");
 
         assert_eq!(out.name, "prod");
         assert_eq!(out.provider, "hetzner-cloud");
@@ -1356,6 +1518,273 @@ mod tests {
         assert!(!out.token_already_verified);
     }
 
+    /// A store holding target `prod` as an operator would have it after a provision: tier team,
+    /// region hel1, server type cx32, an SSH key, a Cloudflare firewall — and, when `server` is
+    /// set, a state that records server 42.
+    fn stored_prod(server: bool) -> (tempfile::TempDir, Context, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = Context::for_desktop(dir.path().join("store"), "http://127.0.0.1:1")
+            .with_home_dir(Some(dir.path().join("home")));
+        let key = dir.path().join("home").join(".ssh").join("prod.pub");
+        std::fs::create_dir_all(key.parent().unwrap()).unwrap();
+        std::fs::write(&key, "ssh-ed25519 AAAA op@prod\n").unwrap();
+        cli_core::save_target(
+            &ctx.store(),
+            &cli_core::Target {
+                name: "prod".into(),
+                config: cli_core::TargetConfig {
+                    provider: "hetzner-cloud".into(),
+                    region: Some("hel1".into()),
+                    default_tier: Some("team".into()),
+                    cluster_name: None,
+                    ssh_key_path: Some(key.clone()),
+                    firewall: Some(cli_core::target::FirewallConfig {
+                        cloudflare_origin: true,
+                    }),
+                    server_type: Some("cx32".into()),
+                },
+                credentials: cli_core::TargetCredentials {
+                    hetzner_token: Some("a".repeat(64)),
+                },
+            },
+        )
+        .unwrap();
+        if server {
+            let state = cli_state::StatePaths::for_active_target(&ctx.store(), "prod");
+            std::fs::create_dir_all(state.state_dir()).unwrap();
+            std::fs::write(
+                state.state_file(),
+                r#"{"hetzner_cloud":{"server_id":42,"server_name":"prod-node","server_type":"cx32"}}"#,
+            )
+            .unwrap();
+        }
+        (dir, ctx, key)
+    }
+
+    /// `target add prod --force` with every optional flag left out but `--ssh-key` / `--tier`
+    /// (so no Select opens in a test), as a terminal user rotating only the token would run it.
+    fn force_args(key: &Path) -> AddArgs {
+        AddArgs {
+            name: Some("prod".into()),
+            provider: Some("hetzner-cloud".into()),
+            token: Some("b".repeat(64)),
+            ssh_key: Some(key.to_path_buf()),
+            region: None,
+            tier: Some("team".into()),
+            cluster_name: None,
+            force: true,
+            renew: false,
+            no_interactive: false,
+            no_ping: true,
+            server_type: None,
+            typed: crate::dispatch::Typed {
+                token: true,
+                ssh_key: true,
+            },
+        }
+    }
+
+    /// The `--force` wizard and its merge, through to the core's plan: what the wizard hands
+    /// back, merged as `target add` merges it, must plan no change the operator did not make.
+    fn plan_of(
+        ctx: &Context,
+        mut args: AddArgs,
+    ) -> apprafter_core::CoreResult<Vec<(String, String)>> {
+        let out = run_add_wizard(ctx, &args)?;
+        crate::commands::target::merge_wizard_output(&mut args, out);
+        let plan = apprafter_core::target::plan_add(
+            ctx,
+            apprafter_core::target::AddArgs {
+                name: args.name.unwrap(),
+                provider: args.provider.unwrap(),
+                token: SecretString::new(args.token.unwrap()),
+                ssh_key: args.ssh_key,
+                region: args.region,
+                tier: args.tier,
+                cluster_name: args.cluster_name,
+                server_type: args.server_type,
+                force: args.force,
+            },
+        )?;
+        Ok(plan
+            .changes
+            .iter()
+            .filter(|c| c.kind == "Target")
+            .map(|c| {
+                (
+                    format!("{:?}", c.action),
+                    c.detail.clone().unwrap_or_default(),
+                )
+            })
+            .collect())
+    }
+
+    /// Bug 8 on a terminal: with `--force` each optional Select opens on "keep the stored
+    /// value", so Enter changes nothing. The tier row keeps the stored tier (or its absence) and
+    /// answers `None` — the flag not passed — and the four tiers follow in price order.
+    #[test]
+    fn a_forced_tier_prompt_opens_on_keeping_the_stored_tier() {
+        let rows = build_tier_choices(Some(Some("team")));
+        assert_eq!(rows[0], TierChoice::Keep(Some("team".into())));
+        assert_eq!(rows[0].to_string(), "Keep the stored tier: team");
+        assert_eq!(rows[0].clone().tier(), None, "keeping is no flag");
+        assert_eq!(
+            rows[1..]
+                .iter()
+                .cloned()
+                .filter_map(TierChoice::tier)
+                .collect::<Vec<_>>(),
+            ["solo", "team", "prod", "regulated"]
+        );
+        let unset = build_tier_choices(Some(None));
+        assert_eq!(unset[0].to_string(), "Keep: no tier (none is stored)");
+        assert_eq!(unset[0].clone().tier(), None);
+        assert!(
+            !build_tier_choices(None)
+                .iter()
+                .any(|c| matches!(c, TierChoice::Keep(_))),
+            "a new target has nothing to keep"
+        );
+    }
+
+    /// The same for the SSH key: keeping the stored key is the first row and answers `None`,
+    /// and `Skip` is gone — a forced overwrite cannot clear a stored key, so "don't attach one"
+    /// would only have kept it under another name. A new target's rows are unchanged.
+    #[test]
+    fn a_forced_ssh_key_prompt_opens_on_keeping_the_stored_key() {
+        let candidate = SshKeyCandidate {
+            path: "/h/.ssh/a.pub".into(),
+            display: "~/.ssh/a.pub".into(),
+            algo: None,
+            comment: None,
+        };
+        let rows = build_ssh_key_choices(
+            vec![candidate.clone()],
+            Some(Some("~/.ssh/prod.pub".into())),
+        );
+        assert_eq!(
+            rows.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
+            [
+                "Keep the stored key: ~/.ssh/prod.pub",
+                "~/.ssh/a.pub",
+                "Other (type a path)"
+            ]
+        );
+        let none_stored = build_ssh_key_choices(Vec::new(), Some(None));
+        assert_eq!(
+            none_stored
+                .iter()
+                .map(|r| r.to_string())
+                .collect::<Vec<_>>(),
+            ["Keep: no SSH key (none is stored)", "Other (type a path)"]
+        );
+        let fresh = build_ssh_key_choices(vec![candidate], None);
+        assert_eq!(
+            fresh.last().unwrap().to_string(),
+            "Skip (don't attach an SSH key now)"
+        );
+    }
+
+    /// The machine step of `--force`: a provisioned target (or one whose state cannot be read)
+    /// skips it with a line that says why and what is kept; a target that has not provisioned
+    /// offers to keep its machine unless `--region` / `--server-type` was passed; no stored
+    /// target is today's step.
+    #[test]
+    fn the_forced_machine_step_follows_the_provisioned_guard() {
+        let (_d, ctx, _) = stored_prod(true);
+        let base = ForceBase::load(&ctx, "prod", true).unwrap().unwrap();
+        let ForceMachineStep::Skip(line) = force_machine_step(Some(&base), None, None) else {
+            panic!("a provisioned target skips the machine step")
+        };
+        assert_eq!(
+            line,
+            "  ℹ Machine: kept (region hel1, server type cx32) — target `prod` records server \
+             `prod-node` (id 42), and a provisioned target's region and server type cannot change"
+        );
+        assert!(matches!(
+            force_machine_step(Some(&base), Some("fsn1"), None),
+            ForceMachineStep::Skip(_)
+        ));
+
+        let (_d, ctx, _) = stored_prod(false);
+        let base = ForceBase::load(&ctx, "prod", true).unwrap().unwrap();
+        assert_eq!(
+            force_machine_step(Some(&base), None, None),
+            ForceMachineStep::OfferKeep
+        );
+        assert_eq!(
+            force_machine_step(Some(&base), None, Some("cx22")),
+            ForceMachineStep::Ask
+        );
+        assert_eq!(force_machine_step(None, None, None), ForceMachineStep::Ask);
+        assert_eq!(
+            MachineKeepChoice::Keep(base.machine_shown()).to_string(),
+            "Keep the stored machine: region hel1, server type cx32"
+        );
+
+        let state = cli_state::StatePaths::for_active_target(&ctx.store(), "prod");
+        std::fs::create_dir_all(state.state_dir()).unwrap();
+        std::fs::write(state.state_file(), "{").unwrap();
+        let base = ForceBase::load(&ctx, "prod", true).unwrap().unwrap();
+        let ForceMachineStep::Skip(line) = force_machine_step(Some(&base), None, None) else {
+            panic!("an unreadable state skips the machine step")
+        };
+        assert!(line.contains("cannot be read"), "{line}");
+    }
+
+    /// The base is the stored target only under `--force`, for a valid stored name; a target
+    /// whose files cannot be read is that error before any prompt (`plan_add` would give it
+    /// after the whole wizard).
+    #[test]
+    fn the_force_base_is_the_stored_target_or_its_read_error() {
+        let (_d, ctx, _) = stored_prod(false);
+        assert!(ForceBase::load(&ctx, "prod", false).unwrap().is_none());
+        assert!(ForceBase::load(&ctx, "fresh", true).unwrap().is_none());
+        assert!(ForceBase::load(&ctx, "../prod", true).unwrap().is_none());
+        let base = ForceBase::load(&ctx, "prod", true).unwrap().unwrap();
+        assert_eq!(base.config.default_tier.as_deref(), Some("team"));
+        assert_eq!(
+            base.ssh_key_shown(&ctx).as_deref(),
+            Some(&*format!(
+                "~/{}",
+                Path::new(".ssh").join("prod.pub").display()
+            ))
+        );
+
+        std::fs::write(
+            ctx.store().target_credentials_file("prod"),
+            "hetzner_token: [unclosed",
+        )
+        .unwrap();
+        let err = ForceBase::load(&ctx, "prod", true)
+            .err()
+            .expect("unreadable");
+        assert_eq!(
+            UiError::from(&err).code.as_deref(),
+            Some("apprafter::target::invalid_config")
+        );
+    }
+
+    /// Bug 8 on a terminal: `--force` on a target whose state records a server skips the
+    /// machine step (no prompt opens — under `--no-ping` it used to ask for a region with
+    /// `nbg1` as the default), so the stored machine is kept, the plan is not refused as a
+    /// machine change after the whole wizard, and every field reads as kept.
+    #[test]
+    fn a_forced_wizard_keeps_the_machine_of_a_provisioned_target() {
+        let (_d, ctx, key) = stored_prod(true);
+        let changes = plan_of(&ctx, force_args(&key)).expect("no prompt, no refusal");
+        assert!(
+            changes.iter().all(|(action, _)| action == "Keep"),
+            "{changes:?}"
+        );
+        for kept in ["region: hel1", "tier: team", "server type: cx32"] {
+            assert!(
+                changes.iter().any(|(_, d)| d == kept),
+                "{kept}: {changes:?}"
+            );
+        }
+    }
+
     /// A pre-supplied name is announced and accepted verbatim —
     /// v0.1.76 re-prompted with the name as the default, which was
     /// pure noise.
@@ -1369,33 +1798,46 @@ mod tests {
     /// The provider prefill is honoured only when it is a provider
     /// the wizard can actually drive. An unknown one has to fail
     /// here, at the flag, rather than later inside a validator that
-    /// has no client wired for it.
+    /// has no client wired for it — with the core's code and its one
+    /// provider list (bug 5: the wizard had a second list and wording).
     #[test]
-    fn prompt_provider_accepts_a_supported_prefill_and_rejects_an_unknown_one() {
-        let got = prompt_provider(Some("hetzner-cloud"), "--provider flag")
-            .expect("supported provider must be accepted");
-        assert_eq!(got, "hetzner-cloud");
-
-        let err = prompt_provider(Some("aws"), "--provider flag")
-            .expect_err("unsupported provider must be rejected");
-        let msg = err.to_string();
-        assert!(msg.contains("aws"), "{msg}");
-        // The error has to name what IS supported, otherwise the
-        // operator is left guessing.
-        assert!(msg.contains("hetzner-cloud"), "{msg}");
+    fn prompt_provider_takes_the_core_list_and_refuses_with_the_core_code() {
+        assert_eq!(
+            prompt_provider(Some("hetzner-cloud"), "--provider flag").unwrap(),
+            "hetzner-cloud"
+        );
+        let err =
+            prompt_provider(Some("aws"), "--provider flag").expect_err("aws is not supported");
+        let ui = apprafter_core::UiError::from(&err);
+        assert_eq!(
+            ui.code.as_deref(),
+            Some("apprafter::target::unknown_provider")
+        );
+        assert_eq!(ui.fields["provider"], serde_json::json!("aws"));
+        assert_eq!(
+            ui.fields["supported"],
+            serde_json::json!(apprafter_core::provider::SUPPORTED_PROVIDERS)
+        );
     }
 
     /// Under `--no-ping` a well-formed prefilled token is accepted
     /// without a round-trip, and `token_already_verified` stays
-    /// false so the save-time check in `run_add` still runs. All
+    /// false so the save-time check in `target add` still runs. All
     /// three `TokenSource` values take the same accept path — the
     /// source only changes the acknowledgement line.
     #[test]
     fn prompt_token_accepts_a_well_formed_prefill_under_no_ping_without_claiming_verification() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx_with_home(dir.path());
         for source in [TokenSource::Env, TokenSource::Flag, TokenSource::Prompt] {
-            let (token, verified) =
-                prompt_token("hetzner-cloud", Some(&well_formed_token()), source, true)
-                    .expect("well-formed prefill must be accepted under --no-ping");
+            let (token, verified) = prompt_token(
+                &ctx,
+                "hetzner-cloud",
+                Some(&well_formed_token()),
+                source,
+                true,
+            )
+            .expect("well-formed prefill must be accepted under --no-ping");
             assert_eq!(token, well_formed_token(), "source={source:?}");
             assert!(
                 !verified,
@@ -1404,94 +1846,196 @@ mod tests {
         }
     }
 
-    /// A malformed prefilled token is rejected up front, attached
-    /// to the flag that carried it, instead of surviving into the
-    /// target store or surfacing as a confusing mid-wizard prompt.
+    /// A malformed prefilled token (`--token` or `HCLOUD_TOKEN`) is rejected up front, before
+    /// any API call, with the refusal the flag-driven path gives: the core's
+    /// `apprafter::target::invalid_token`, the same message (bugs 2: the wizard gave the
+    /// catch-all `apprafter::cli::other` with its "file an issue" help).
     #[test]
-    fn prompt_token_rejects_a_malformed_prefill_before_any_api_call() {
-        let err = prompt_token("hetzner-cloud", Some("too-short"), TokenSource::Flag, true)
-            .expect_err("a 9-char token is not a Hetzner token");
-        let msg = err.to_string();
-        assert!(msg.contains("64"), "{msg}");
+    fn prompt_token_refuses_a_malformed_prefill_as_the_flag_path_does() {
+        let dir = tempfile::tempdir().unwrap();
+        for (token, source) in [
+            ("too-short", TokenSource::Flag),
+            ("too-short", TokenSource::Env),
+            (&*format!("{}-", "a".repeat(63)), TokenSource::Flag),
+        ] {
+            let err = prompt_token(
+                &ctx_with_home(dir.path()),
+                "hetzner-cloud",
+                Some(token),
+                source,
+                false,
+            )
+            .expect_err("not a Hetzner token");
+            assert_eq!(
+                UiError::from(&err).code.as_deref(),
+                Some("apprafter::target::invalid_token"),
+                "{source:?}: {err:?}"
+            );
+            let flag_path = CoreError::InvalidToken {
+                problem: apprafter_core::provider::TokenProblem::check(token).unwrap_err(),
+            };
+            assert_eq!(err.to_string(), flag_path.to_string(), "{source:?}");
+        }
     }
 
     /// A supplied SSH key is taken as-is: no `~/.ssh` scan, no
-    /// picker, and crucially no existence probe — `run_add`
+    /// picker, and crucially no existence probe — `target add`
     /// verifies readability later with a better error.
     #[test]
     fn prompt_ssh_key_accepts_a_supplied_path_without_scanning() {
+        let dir = tempfile::tempdir().unwrap();
         let p = PathBuf::from("/nowhere/on/this/disk/id_ed25519.pub");
-        let got = prompt_ssh_key(Some(&p), "--ssh-key flag").expect("prefill must not prompt");
+        let got = prompt_ssh_key(&ctx_with_home(dir.path()), Some(&p), "--ssh-key flag", None)
+            .expect("prefill must not prompt");
         assert_eq!(got, Some(p));
     }
 
-    /// The scanned keys come first in scan order and the two escape
+    /// The found keys come first in their order and the two escape
     /// hatches are pinned below them, `Other` before `Skip`. Order
     /// matters: `Skip` sitting anywhere but last puts "attach no
     /// key" under the cursor's natural resting place.
     #[test]
     fn build_ssh_key_choices_pins_other_then_skip_below_the_scanned_keys() {
-        let dir = tempfile::tempdir().unwrap();
-        let a = dir.path().join("a.pub");
-        let b = dir.path().join("b.pub");
-        std::fs::write(&a, "ssh-ed25519 AAAA me@a\n").unwrap();
-        std::fs::write(&b, "ssh-rsa BBBB me@b\n").unwrap();
-
-        let opts = build_ssh_key_choices(vec![a.clone(), b.clone()]);
+        let candidate = |n: &str| SshKeyCandidate {
+            path: format!("/h/.ssh/{n}.pub"),
+            display: format!("~/.ssh/{n}.pub"),
+            algo: Some("ssh-ed25519".into()),
+            comment: Some(format!("me@{n}")),
+        };
+        let opts = build_ssh_key_choices(vec![candidate("a"), candidate("b")], None);
         assert_eq!(opts.len(), 4);
         match &opts[0] {
-            SshKeyChoice::Path { path, .. } => assert_eq!(path, &a),
-            other => panic!("first row must be the first scanned key, got {other}"),
+            SshKeyChoice::Path { path, label } => {
+                assert_eq!(path, &PathBuf::from("/h/.ssh/a.pub"));
+                assert_eq!(label, "~/.ssh/a.pub  (ssh-ed25519, me@a)");
+            }
+            other => panic!("first row must be the first found key, got {other}"),
         }
         match &opts[1] {
-            SshKeyChoice::Path { path, .. } => assert_eq!(path, &b),
-            other => panic!("second row must be the second scanned key, got {other}"),
+            SshKeyChoice::Path { path, .. } => assert_eq!(path, &PathBuf::from("/h/.ssh/b.pub")),
+            other => panic!("second row must be the second found key, got {other}"),
         }
         assert_eq!(opts[2].to_string(), "Other (type a path)");
         assert_eq!(opts[3].to_string(), "Skip (don't attach an SSH key now)");
 
-        // With nothing scanned the escape hatches are still the
+        // With nothing found the escape hatches are still the
         // whole list — an empty Select would trap the operator.
-        let empty = build_ssh_key_choices(Vec::new());
+        let empty = build_ssh_key_choices(Vec::new(), None);
         assert_eq!(empty.len(), 2);
         assert_eq!(empty[0].to_string(), "Other (type a path)");
         assert_eq!(empty[1].to_string(), "Skip (don't attach an SSH key now)");
     }
 
+    /// D.3d verification (finding D): a `.pub` under `~/.ssh` that holds no public key (an
+    /// OpenSSH certificate `*-cert.pub`, an ssh-dss key, junk) is never a row: the plan would
+    /// refuse it only after every later prompt. A note names it with the desktop's words, and
+    /// with no key left and no keep row the text prompt is asked instead of a picker.
+    #[test]
+    fn a_pub_file_that_holds_no_public_key_is_noted_never_offered() {
+        let key = SshKeyCandidate {
+            path: "/h/.ssh/a.pub".into(),
+            display: "~/.ssh/a.pub".into(),
+            algo: Some("ssh-ed25519".into()),
+            comment: None,
+        };
+        let cert = SshKeyCandidate {
+            path: "/h/.ssh/a-cert.pub".into(),
+            display: "~/.ssh/a-cert.pub".into(),
+            algo: None,
+            comment: None,
+        };
+        let note = "  ℹ Not offered: ~/.ssh/a-cert.pub (not an SSH public key)".to_string();
+        let shown = |rows: &Option<Vec<SshKeyChoice>>| {
+            rows.as_ref()
+                .map(|rows| rows.iter().map(ToString::to_string).collect::<Vec<_>>())
+        };
+        let (rows, notes) = ssh_key_picker(vec![key.clone(), cert.clone()], None);
+        assert_eq!(
+            shown(&rows),
+            Some(vec![
+                "~/.ssh/a.pub  (ssh-ed25519)".to_string(),
+                "Other (type a path)".to_string(),
+                "Skip (don't attach an SSH key now)".to_string(),
+            ])
+        );
+        assert_eq!(notes, std::slice::from_ref(&note));
+        // Nothing left to pick: the text prompt, the note still said.
+        let (rows, notes) = ssh_key_picker(vec![cert.clone()], None);
+        assert!(rows.is_none(), "{:?}", shown(&rows));
+        assert_eq!(notes, std::slice::from_ref(&note));
+        // A `--force` overwrite keeps its keep row, so the picker stays.
+        let (rows, _) = ssh_key_picker(vec![cert], Some(None));
+        assert_eq!(
+            shown(&rows),
+            Some(vec![
+                "Keep: no SSH key (none is stored)".to_string(),
+                "Other (type a path)".to_string(),
+            ])
+        );
+        let (rows, notes) = ssh_key_picker(Vec::new(), None);
+        assert!(rows.is_none() && notes.is_empty());
+    }
+
     /// The free-text SSH-key path accepts "nothing" (the documented
     /// way to skip) but refuses a path that isn't there — catching
-    /// the typo at the prompt rather than at provisioning time.
+    /// the typo at the prompt rather than at provisioning time. A
+    /// `~/` answer is checked under the context's home.
     #[test]
     fn validate_ssh_key_path_input_accepts_blank_or_existing_and_rejects_missing() {
-        assert!(validate_ssh_key_path_input("").is_ok());
-        assert!(validate_ssh_key_path_input("   ").is_ok());
-
         let dir = tempfile::tempdir().unwrap();
-        let key = dir.path().join("id_ed25519.pub");
+        assert!(validate_ssh_key_path_input("", Some(dir.path())).is_ok());
+        assert!(validate_ssh_key_path_input("   ", None).is_ok());
+
+        std::fs::create_dir(dir.path().join(".ssh")).unwrap();
+        let key = dir.path().join(".ssh/id_ed25519.pub");
         std::fs::write(&key, "ssh-ed25519 AAAA me@host\n").unwrap();
-        assert!(validate_ssh_key_path_input(key.to_str().unwrap()).is_ok());
+        assert!(validate_ssh_key_path_input(key.to_str().unwrap(), None).is_ok());
+        assert!(validate_ssh_key_path_input("~/.ssh/id_ed25519.pub", Some(dir.path())).is_ok());
 
         let missing = dir.path().join("absent.pub");
-        let err = validate_ssh_key_path_input(missing.to_str().unwrap())
+        let err = validate_ssh_key_path_input(missing.to_str().unwrap(), Some(dir.path()))
             .expect_err("a non-existent path must be rejected");
         assert!(err.contains("does not exist"), "{err}");
     }
 
+    /// GOTCHA-149: the typed path is the file the provider is sent, so the prompt refuses a
+    /// private key by name (pointing at its `.pub`) and any other file that is not a public
+    /// key, and never quotes it.
+    #[test]
+    fn validate_ssh_key_path_input_refuses_a_private_key_and_a_non_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let private = dir.path().join("id_ed25519");
+        std::fs::write(
+            &private,
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nb3Blbg==\n-----END OPENSSH PRIVATE KEY-----\n",
+        )
+        .unwrap();
+        let err = validate_ssh_key_path_input(private.to_str().unwrap(), None).unwrap_err();
+        assert!(
+            err.contains("is a private key") && err.contains(".pub"),
+            "{err}"
+        );
+        assert!(!err.contains("b3Blbg"), "{err}");
+        let junk = dir.path().join("notes.pub");
+        std::fs::write(&junk, "not-a-key\n").unwrap();
+        let err = validate_ssh_key_path_input(junk.to_str().unwrap(), None).unwrap_err();
+        assert!(err.contains("is not an OpenSSH public key"), "{err}");
+    }
+
     /// Blank means "no key", not an empty path; a `~/` answer is
-    /// expanded before it reaches the target store, because nothing
-    /// downstream re-expands it.
+    /// expanded (against the context's home) before it reaches the
+    /// target store, because nothing downstream re-expands it.
     #[test]
     fn ssh_key_answer_to_path_maps_blank_to_none_and_expands_tilde() {
-        assert_eq!(ssh_key_answer_to_path(""), None);
-        assert_eq!(ssh_key_answer_to_path("   "), None);
-
-        let home = dirs::home_dir().expect("home_dir resolves in test env");
+        let home = Path::new("/home/op");
+        assert_eq!(ssh_key_answer_to_path("", Some(home)), None);
+        assert_eq!(ssh_key_answer_to_path("   ", Some(home)), None);
         assert_eq!(
-            ssh_key_answer_to_path("  ~/.ssh/id_ed25519.pub  "),
+            ssh_key_answer_to_path("  ~/.ssh/id_ed25519.pub  ", Some(home)),
             Some(home.join(".ssh/id_ed25519.pub"))
         );
         assert_eq!(
-            ssh_key_answer_to_path("/etc/ssh/host_key.pub"),
+            ssh_key_answer_to_path("/etc/ssh/host_key.pub", Some(home)),
             Some(PathBuf::from("/etc/ssh/host_key.pub"))
         );
     }
@@ -1506,20 +2050,11 @@ mod tests {
         assert_eq!(region_text_answer("  hel1 "), Some("hel1".to_string()));
     }
 
-    /// `--region` wins over the latency picker. This one is called
-    /// with `no_ping = false` on purpose: the prefill branch has to
-    /// return *before* the region list is fetched, so a supplied
-    /// region works offline too.
+    /// `--region` skips the region prompt.
     #[test]
-    fn prompt_region_returns_a_supplied_region_without_fetching_the_region_list() {
-        let got = prompt_region(
-            "hetzner-cloud",
-            "unused-token",
-            Some("hel1"),
-            "--region flag",
-            false,
-        )
-        .expect("prefilled region must short-circuit before the API call");
+    fn prompt_region_returns_a_supplied_region_without_prompting() {
+        let got = prompt_region(Some("hel1"), "--region flag", Some("nbg1"))
+            .expect("prefilled region must not prompt");
         assert_eq!(got, Some("hel1".to_string()));
     }
 
@@ -1529,9 +2064,11 @@ mod tests {
     /// fetched to validate one against.
     #[test]
     fn prompt_machine_under_no_ping_keeps_the_region_and_leaves_the_sku_unset() {
+        let dir = tempfile::tempdir().unwrap();
         let (region, sku) = prompt_machine(
+            &ctx_with_home(dir.path()),
             "hetzner-cloud",
-            "unused-token",
+            &SecretString::new("unused-token"),
             Some("hel1"),
             Some("cx22"),
             true,
@@ -1546,9 +2083,11 @@ mod tests {
     /// (and fail offline) building a picker it is about to discard.
     #[test]
     fn prompt_machine_returns_both_prefills_without_fetching_the_catalog() {
+        let dir = tempfile::tempdir().unwrap();
         let (region, sku) = prompt_machine(
+            &ctx_with_home(dir.path()),
             "hetzner-cloud",
-            "unused-token",
+            &SecretString::new("unused-token"),
             Some("hel1"),
             Some("cx22"),
             false,
@@ -1558,112 +2097,25 @@ mod tests {
         assert_eq!(sku, Some("cx22".to_string()));
     }
 
-    /// There is no machine catalog for a provider we haven't wired,
-    /// and the error has to hand the operator the escape hatch
-    /// (`--no-ping` → text entry) rather than just saying "no".
-    #[test]
-    fn prompt_machine_refuses_an_unwired_provider_and_points_at_the_escape_hatch() {
-        let err = prompt_machine("aws", "unused-token", None, None, false)
-            .expect_err("no catalog exists for aws");
-        let msg = err.to_string();
-        assert!(msg.contains("aws"), "{msg}");
-        assert!(msg.contains("--no-ping"), "{msg}");
-    }
-
     /// The tier picker offers all four hardware tiers in price
     /// order, cheapest first — `<Up>` from the resting cursor is
     /// meant to land on the next tier up, and `solo` is the
     /// spec-blessed default.
     #[test]
     fn build_tier_choices_offers_all_four_tiers_cheapest_first() {
-        let keys: Vec<String> = build_tier_choices().into_iter().map(|c| c.key).collect();
+        let keys: Vec<String> = build_tier_choices(None)
+            .into_iter()
+            .filter_map(TierChoice::tier)
+            .collect();
         assert_eq!(keys, vec!["solo", "team", "prod", "regulated"]);
     }
 
     /// `--tier` skips the picker.
     #[test]
     fn prompt_tier_accepts_a_supplied_tier_verbatim() {
-        let got = prompt_tier(Some("regulated"), "--tier flag").expect("prefill must not prompt");
+        let got =
+            prompt_tier(Some("regulated"), "--tier flag", None).expect("prefill must not prompt");
         assert_eq!(got, Some("regulated".to_string()));
-    }
-
-    // ---------------------------------------------------------------
-    // Error classification + remaining pure helpers.
-    // ---------------------------------------------------------------
-
-    /// A 401 is the operator's problem (rotate the token); anything
-    /// else is the API's (retry / `doctor`). The two land on
-    /// different typed variants because they carry different help
-    /// text — collapsing them would send someone rotating a
-    /// perfectly good token during a Hetzner outage.
-    #[test]
-    fn classify_ping_error_splits_401_from_every_other_failure() {
-        let unauthorized = CliError::Hetzner {
-            endpoint: "GET /v1/locations".into(),
-            status: 401,
-            code: "unauthorized".into(),
-            message: "unable to authenticate".into(),
-        };
-        match classify_ping_error("hetzner-cloud", unauthorized) {
-            CliError::ProviderTokenRejected { provider, .. } => {
-                assert_eq!(provider, "hetzner-cloud")
-            }
-            other => panic!("401 must classify as ProviderTokenRejected, got {other:?}"),
-        }
-
-        let outage = CliError::Hetzner {
-            endpoint: "GET /v1/locations".into(),
-            status: 503,
-            code: "unavailable".into(),
-            message: "try later".into(),
-        };
-        match classify_ping_error("hetzner-cloud", outage) {
-            CliError::ProviderApiUnreachable { provider, .. } => {
-                assert_eq!(provider, "hetzner-cloud")
-            }
-            other => panic!("503 must classify as ProviderApiUnreachable, got {other:?}"),
-        }
-
-        // A non-HTTP failure (DNS, TLS, ...) is also "unreachable",
-        // never "token rejected".
-        match classify_ping_error("hetzner-cloud", CliError::Other("dns failure".into())) {
-            CliError::ProviderApiUnreachable { .. } => {}
-            other => panic!("a transport error must classify as unreachable, got {other:?}"),
-        }
-    }
-
-    /// The non-Hetzner arms of the inline summary: a transport
-    /// error reads as "could not reach", anything else falls back
-    /// to a generic one-liner. Both must stay single-line — a
-    /// multi-line message fights the `inquire` prompt redraw.
-    #[test]
-    fn inline_ping_error_summarises_transport_and_unknown_failures_on_one_line() {
-        let transport = inline_ping_error(&CliError::Other("connection reset".into()));
-        assert!(
-            transport.starts_with("could not reach the provider:"),
-            "{transport}"
-        );
-        assert!(!transport.contains('\n'), "{transport}");
-
-        let unknown = inline_ping_error(&CliError::TargetNotFound {
-            name: "ghost".into(),
-            available: "dev".into(),
-        });
-        assert!(unknown.starts_with("ping failed:"), "{unknown}");
-        assert!(!unknown.contains('\n'), "{unknown}");
-    }
-
-    /// Ping / region lookup for a provider with no client wired must
-    /// fail loudly rather than silently succeeding with nothing —
-    /// a silent `Ok` would save an unvalidated token and an empty
-    /// region list.
-    #[test]
-    fn ping_and_region_lookup_refuse_an_unwired_provider() {
-        let ping = ping_for_provider("aws", "unused-token").expect_err("no client wired for aws");
-        assert!(ping.to_string().contains("aws"), "{ping}");
-
-        let regions = fetch_regions("aws", "unused-token").expect_err("no client wired for aws");
-        assert!(regions.to_string().contains("aws"), "{regions}");
     }
 
     /// Esc / Ctrl-C is a user decision, not a crash: it maps to a
@@ -1683,71 +2135,22 @@ mod tests {
         assert!(other.starts_with("wizard prompt failed:"), "{other}");
     }
 
-    /// The offered default is the modern OpenSSH key name. It is
-    /// the value most operators will accept with a single Return,
-    /// so pointing it at a stale name (`id_rsa.pub`) would push
-    /// people onto a weaker key or an empty prompt.
+    /// The offered default is the modern OpenSSH key name under the
+    /// context's home. It is the value most operators will accept
+    /// with a single Return, so pointing it at a stale name
+    /// (`id_rsa.pub`) would push people onto a weaker key or an
+    /// empty prompt. No home: the `~/` form. The path is shown as the platform renders it —
+    /// on Windows `\` between every component, never `C:\Users\op\.ssh/id_ed25519.pub`.
     #[test]
     fn default_ssh_key_hint_offers_the_modern_openssh_key_name() {
-        let hint = default_ssh_key_hint();
-        assert!(hint.ends_with(".ssh/id_ed25519.pub"), "{hint}");
-    }
-
-    /// A key file with no trailing comment renders with the algo
-    /// alone — no dangling ", " separator. A file that isn't in
-    /// OpenSSH layout at all degrades to the bare path instead of
-    /// showing half-parsed junk in the picker.
-    #[test]
-    fn ssh_key_label_omits_the_comment_clause_when_the_key_has_none() {
-        let dir = tempfile::tempdir().unwrap();
-
-        let bare = dir.path().join("nocomment.pub");
-        std::fs::write(&bare, "ssh-ed25519 AAAAfakebody\n").unwrap();
-        let label = ssh_key_label(&bare);
-        assert!(label.ends_with("(ssh-ed25519)"), "{label}");
-
-        let junk = dir.path().join("junk.pub");
-        std::fs::write(&junk, "not-a-key\n").unwrap();
-        let junk_label = ssh_key_label(&junk);
-        assert_eq!(junk_label, abbreviate_home_path(&junk));
-    }
-
-    /// Regions whose probe never reported still appear in the
-    /// picker, at the end, with `n/a` latency. Dropping them would
-    /// shrink the picker — in the worst case (every probe hung) to
-    /// nothing at all, leaving the operator no region to choose.
-    #[test]
-    fn finalize_latency_rows_keeps_unreported_regions_and_sorts_them_last() {
-        let region = |n: &str| RegionInfo {
-            name: n.into(),
-            description: n.to_uppercase(),
-        };
-        let originals = vec![region("fsn1"), region("hel1"), region("nbg1")];
-        // Only two of the three probes came back, and the slower
-        // one reported first.
-        let reported = vec![
-            RegionWithLatency {
-                info: region("nbg1"),
-                latency_ms: Some(42),
-            },
-            RegionWithLatency {
-                info: region("hel1"),
-                latency_ms: Some(7),
-            },
-        ];
-
-        let rows = finalize_latency_rows(originals, reported);
-        let order: Vec<(String, Option<u32>)> = rows
-            .into_iter()
-            .map(|r| (r.info.name, r.latency_ms))
-            .collect();
+        let home = Path::new("/home/op");
         assert_eq!(
-            order,
-            vec![
-                ("hel1".to_string(), Some(7)),
-                ("nbg1".to_string(), Some(42)),
-                ("fsn1".to_string(), None),
-            ]
+            default_ssh_key_hint(Some(home)),
+            home.join(".ssh")
+                .join("id_ed25519.pub")
+                .display()
+                .to_string()
         );
+        assert_eq!(default_ssh_key_hint(None), "~/.ssh/id_ed25519.pub");
     }
 }

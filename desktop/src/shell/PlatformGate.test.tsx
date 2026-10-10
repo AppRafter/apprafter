@@ -9,6 +9,7 @@ import { DESKTOP_ERROR_CODES } from '../ipc/generated/errors';
 import { rereadAppInfo, usePlatform } from '../state/platform';
 import { createQueryClient } from '../state/queryClient';
 import { appInfo, authInfo } from '../test/fixtures';
+import { settleIpc } from '../test/settle';
 import { PlatformGate } from './PlatformGate';
 
 let calls: string[];
@@ -55,7 +56,10 @@ beforeEach(() => {
   });
 });
 
-afterEach(() => clearMocks());
+afterEach(async () => {
+  await settleIpc();
+  clearMocks();
+});
 
 const settle = () => act(() => new Promise((resolve) => setTimeout(resolve, 10)));
 const reads = () => calls.filter((c) => c === 'app_info').length;

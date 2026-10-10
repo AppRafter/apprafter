@@ -1,0 +1,26 @@
+$ apprafter target add prod --provider hetzner-cloud --token bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb --force --no-ping --no-interactive
+[exit 0]
+[stdout]
+target `prod` overwritten (it stays the active target) (token NOT verified against the API — `--no-ping` was passed)
+  kept region: nbg1
+  kept tier: solo
+  kept ssh key: ~/id_ed25519.pub
+[stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m target add invoked <ESC>[3mtarget<ESC>[0m<ESC>[2m=<ESC>[0mprod <ESC>[3mrenew<ESC>[0m<ESC>[2m=<ESC>[0mfalse <ESC>[3mforce<ESC>[0m<ESC>[2m=<ESC>[0mtrue
+$ apprafter target show
+[exit 0]
+[stdout]
+Target: prod (active)
+  Provider:    hetzner-cloud
+  Region:      nbg1
+  Server type: not set
+  Default tier: solo
+  Cluster name: not set
+  SSH key:     <SANDBOX>/home/id_ed25519.pub
+  Hetzner token: set (64 chars; read credentials.yaml for the raw value)
+  Server:      prod-node (id 42, type cx22)
+
+Config:      <SANDBOX>/apprafter-config/targets/prod/config.yaml
+Credentials: <SANDBOX>/apprafter-config/targets/prod/credentials.yaml (mode 0600)
+[stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m target show invoked <ESC>[3mtarget<ESC>[0m<ESC>[2m=<ESC>[0mprod

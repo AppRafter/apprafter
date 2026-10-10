@@ -13,184 +13,213 @@
 //! so the command stays predictable in shell prompts and CI
 //! status banners.
 
-use std::path::Path;
-
-use cli_core::target::{
-    default_config_root, load_global_config, load_target, Target, TargetStorePaths,
-};
-use cli_core::{CliError, Result};
-use cli_providers::{HetznerCloudValidator, ProviderValidator};
+use apprafter_core::provider::{SkipReason, Verification};
+use apprafter_core::session::{self, CliDefaultTarget, Identity};
+use apprafter_core::ssh::SshKeyInfo;
+use apprafter_core::{CancellationToken, CoreError};
 use tracing::info;
 
-use crate::commands::hcloud::hcloud_base_url;
+use crate::render::core_error::report;
 
-pub fn run(no_ping: bool) -> Result<()> {
+/// `apprafter whoami` on the core's report. The ping is best-effort: a failing one does NOT
+/// fail the command — operators running `whoami` on a flaky network shouldn't get an exit 1
+/// when the rest of the info is still useful; it reads `verification failed ✗ — <hint>`.
+pub fn run(no_ping: bool) -> miette::Result<()> {
     info!(no_ping, "whoami invoked");
-
-    let paths = TargetStorePaths::for_root(default_config_root()?);
-    let active_name = load_global_config(&paths)?
-        .map(|g| g.active_target)
-        .filter(|s| !s.is_empty());
-
-    // Identity is hardcoded to "anonymous (self-hosted)" until
-    // Track A.10+ wires AppRafter Cloud auth; the line is kept
-    // here so future work is purely additive (just swap the
-    // string source).
-    println!("Identity:     anonymous (self-hosted mode)");
-
-    let Some(name) = active_name else {
-        println!();
-        println!(
-            "No active target. Run `apprafter target add` to create one — `apprafter target list` to see what's configured."
-        );
-        return Ok(());
-    };
-
-    let target = load_target(&paths, &name)?;
-
-    println!("Target:       {name} (active)");
-    let verified = verified_status(&target, no_ping);
-    println!("Provider:     {} ({verified})", target.config.provider);
-    println!(
-        "Region:       {}",
-        target.config.region.as_deref().unwrap_or("not set")
-    );
-    println!(
-        "Server type:  {}",
-        target.config.server_type.as_deref().unwrap_or("not set")
-    );
-    println!(
-        "Default tier: {}",
-        target.config.default_tier.as_deref().unwrap_or("not set")
-    );
-    println!(
-        "Cluster name: {}",
-        target.config.cluster_name.as_deref().unwrap_or("not set")
-    );
-    println!(
-        "SSH key:      {}",
-        ssh_key_status(target.config.ssh_key_path.as_deref())
-    );
-    println!();
-    println!(
-        "Run `apprafter target show` for the full target config; `apprafter target list` for all configured targets."
-    );
+    let ctx = crate::context::cli_context()?.with_no_ping(no_ping);
+    // Today's order: a pointer file that cannot be read fails before the identity line.
+    cli_core::resolve_active_target_name(&ctx.store(), None).map_err(miette::Report::new)?;
+    let result = session::whoami(&ctx, &CancellationToken::new());
+    // The identity line comes first even when the target cannot be read (today's order).
+    let identity = result
+        .as_ref()
+        .map_or(Identity::AnonymousSelfHosted, |r| r.identity);
+    println!("Identity:     {}", identity_text(&identity));
+    match result.map_err(report)?.cli_default {
+        CliDefaultTarget::None => {
+            println!();
+            println!(
+                "No active target. Run `apprafter target add` to create one — `apprafter target list` to see what's configured."
+            );
+        }
+        CliDefaultTarget::Missing { name, available } => {
+            return Err(report(CoreError::TargetNotFound { name, available }));
+        }
+        CliDefaultTarget::Found { target: t } => {
+            let or = |v: &Option<String>| v.clone().unwrap_or_else(|| "not set".into());
+            println!("Target:       {} (active)", t.name);
+            println!(
+                "Provider:     {} ({})",
+                t.provider,
+                verification_text(&t.verification)
+            );
+            println!("Region:       {}", or(&t.region));
+            println!("Server type:  {}", or(&t.server_type));
+            println!("Default tier: {}", or(&t.default_tier));
+            println!("Cluster name: {}", or(&t.cluster_name));
+            println!("SSH key:      {}", ssh_line(t.ssh_key.as_ref()));
+            println!();
+            println!(
+                "Run `apprafter target show` for the full target config; `apprafter target list` for all configured targets."
+            );
+        }
+    }
     Ok(())
 }
 
-/// Render the per-line verified status. Best-effort: a failing
-/// ping does NOT fail the whoami command itself — operators
-/// running `whoami` on a flaky network shouldn't get an exit-1
-/// when the rest of the info is still useful. Failures show as
-/// `verification failed ✗ — <hint>`.
-fn verified_status(target: &Target, no_ping: bool) -> String {
-    if no_ping {
-        return "verification skipped — --no-ping".to_string();
-    }
-    let Some(token) = target.credentials.hetzner_token.as_deref() else {
-        return "verification skipped — no token stored".to_string();
-    };
-    match ping_target(target, token) {
-        Ok(()) => "verified ✓".to_string(),
-        Err(CliError::Hetzner { status: 401, .. }) => {
-            "verification failed ✗ — token rejected (HTTP 401). Run `apprafter target add <name> --renew` to rotate.".to_string()
-        }
-        Err(CliError::Hetzner { status, .. }) => {
-            format!("verification failed ✗ — HTTP {status} from provider API")
-        }
-        Err(_) => "verification failed ✗ — provider unreachable (network?)".to_string(),
+/// Identity is "anonymous (self-hosted)" until AppRafter Cloud auth lands; the report carries
+/// it so that work is purely additive.
+fn identity_text(i: &Identity) -> &'static str {
+    match i {
+        Identity::AnonymousSelfHosted => "anonymous (self-hosted mode)",
     }
 }
 
-fn ping_target(target: &Target, token: &str) -> Result<()> {
-    match target.config.provider.as_str() {
-        "hetzner-cloud" => {
-            let v = HetznerCloudValidator::new(hcloud_base_url(), token);
-            v.validate_credentials()
+/// The verified status on the provider line.
+pub(crate) fn verification_text(v: &Verification) -> String {
+    match v {
+        Verification::Verified { .. } => "verified ✓".into(),
+        Verification::Skipped {
+            reason: SkipReason::NoPing,
+        } => "verification skipped — --no-ping".into(),
+        Verification::Skipped {
+            reason: SkipReason::NoToken,
+        } => "verification skipped — no token stored".into(),
+        Verification::Skipped {
+            reason: SkipReason::UnsupportedProvider,
+        } => "verification skipped — provider not supported".into(),
+        Verification::Rejected => "verification failed ✗ — token rejected (HTTP 401). Run `apprafter target add <name> --renew` to rotate.".into(),
+        Verification::HttpError { http_status } => {
+            format!("verification failed ✗ — HTTP {http_status} from provider API")
         }
-        other => Err(CliError::Other(format!(
-            "no validator wired for provider `{other}`"
-        ))),
+        Verification::RateLimited => "verification failed ✗ — rate-limited by the provider API \
+             (HTTP 429); wait, then try again"
+            .into(),
+        Verification::Unreachable => {
+            "verification failed ✗ — provider unreachable (network?)".into()
+        }
+        Verification::RequestFailed => "verification failed ✗ — the provider API request failed; \
+             `apprafter doctor` shows why"
+            .into(),
     }
 }
 
-/// Render `~/.ssh/...` instead of an absolute path when the key
-/// lives under `$HOME`, plus a `(loaded)` / `(missing!)` marker
-/// so the operator can spot a stale config (deleted key file
-/// that's still referenced in `config.yaml`) at a glance. `(not
-/// set)` for the no-key case.
-fn ssh_key_status(path: Option<&Path>) -> String {
-    let Some(p) = path else {
-        return "not set".to_string();
-    };
-    let display = abbreviate_home(p);
-    if p.exists() {
-        format!("{display} (loaded)")
-    } else {
-        format!("{display} (missing!)")
-    }
-}
-
-fn abbreviate_home(path: &Path) -> String {
-    if let Some(home) = dirs::home_dir() {
-        if let Ok(rest) = path.strip_prefix(&home) {
-            return format!("~/{}", rest.display());
-        }
-    }
-    path.display().to_string()
+/// `~/.ssh/...` instead of an absolute path when the key lives under the home directory, plus a
+/// `(loaded)` / `(missing!)` marker so a stale config (a deleted key file still referenced in
+/// `config.yaml`) shows at a glance; `not set` for no key. A file `apply` would refuse to send
+/// says so (GOTCHA-149): `(private key!)`, `(not a public key!)`, `(unreadable!)`.
+pub(crate) fn ssh_line(k: Option<&SshKeyInfo>) -> String {
+    use apprafter_core::ssh::SshKeyProblem;
+    k.map_or_else(
+        || "not set".into(),
+        |k| {
+            let state = match k.problem {
+                None => "loaded",
+                Some(SshKeyProblem::Missing) => "missing!",
+                Some(SshKeyProblem::Unreadable) => "unreadable!",
+                Some(SshKeyProblem::PrivateKey) => "private key!",
+                Some(SshKeyProblem::NotPublicKey) => "not a public key!",
+            };
+            format!("{} ({state})", k.display)
+        },
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cli_core::target::{TargetConfig, TargetCredentials};
+    use apprafter_core::provider::{SkipReason, Verification};
+    use apprafter_core::ssh::SshKeyInfo;
 
-    fn target_with_token(token: Option<&str>) -> Target {
-        Target {
-            name: "t".into(),
-            config: TargetConfig {
-                provider: "hetzner-cloud".into(),
-                ..Default::default()
-            },
-            credentials: TargetCredentials {
-                hetzner_token: token.map(String::from),
-            },
+    #[test]
+    fn every_verification_reads_as_today() {
+        assert_eq!(
+            verification_text(&Verification::Skipped {
+                reason: SkipReason::NoPing
+            }),
+            "verification skipped — --no-ping"
+        );
+        assert_eq!(
+            verification_text(&Verification::Skipped {
+                reason: SkipReason::NoToken
+            }),
+            "verification skipped — no token stored"
+        );
+        assert_eq!(
+            verification_text(&Verification::Verified { elapsed_ms: 3 }),
+            "verified ✓"
+        );
+        assert_eq!(
+            verification_text(&Verification::Rejected),
+            "verification failed ✗ — token rejected (HTTP 401). Run `apprafter target add <name> \
+             --renew` to rotate."
+        );
+        assert_eq!(
+            verification_text(&Verification::HttpError { http_status: 503 }),
+            "verification failed ✗ — HTTP 503 from provider API"
+        );
+        assert_eq!(
+            verification_text(&Verification::Unreachable),
+            "verification failed ✗ — provider unreachable (network?)"
+        );
+        // A provider that answered is not unreachable (WI-453 follow-up).
+        assert_eq!(
+            verification_text(&Verification::RateLimited),
+            "verification failed ✗ — rate-limited by the provider API (HTTP 429); wait, then \
+             try again"
+        );
+        assert_eq!(
+            verification_text(&Verification::RequestFailed),
+            "verification failed ✗ — the provider API request failed; `apprafter doctor` shows \
+             why"
+        );
+        assert_eq!(
+            verification_text(&Verification::Skipped {
+                reason: SkipReason::UnsupportedProvider
+            }),
+            "verification skipped — provider not supported"
+        );
+    }
+
+    #[test]
+    fn the_ssh_line_marks_a_missing_key_and_one_apply_would_refuse() {
+        use apprafter_core::ssh::SshKeyProblem;
+        let k = SshKeyInfo {
+            path: "/h/.ssh/k.pub".into(),
+            display: "~/.ssh/k.pub".into(),
+            exists: false,
+            algo: None,
+            problem: Some(SshKeyProblem::Missing),
+        };
+        assert_eq!(ssh_line(Some(&k)), "~/.ssh/k.pub (missing!)");
+        let found = |algo: Option<&str>, problem| SshKeyInfo {
+            exists: true,
+            algo: algo.map(String::from),
+            problem,
+            ..k.clone()
+        };
+        assert_eq!(
+            ssh_line(Some(&found(Some("ssh-ed25519"), None))),
+            "~/.ssh/k.pub (loaded)"
+        );
+        for (problem, state) in [
+            (SshKeyProblem::Unreadable, "unreadable!"),
+            (SshKeyProblem::PrivateKey, "private key!"),
+            (SshKeyProblem::NotPublicKey, "not a public key!"),
+        ] {
+            assert_eq!(
+                ssh_line(Some(&found(None, Some(problem)))),
+                format!("~/.ssh/k.pub ({state})")
+            );
         }
+        assert_eq!(ssh_line(None), "not set");
     }
 
     #[test]
-    fn verified_status_honours_no_ping_flag_without_hitting_network() {
-        let t = target_with_token(Some("aaaaaaaaaaaaaaaa"));
-        let s = verified_status(&t, true);
-        assert!(s.contains("skipped"), "{s}");
-        assert!(s.contains("--no-ping"), "{s}");
-    }
-
-    #[test]
-    fn verified_status_reports_no_token_path_when_credentials_empty() {
-        let t = target_with_token(None);
-        let s = verified_status(&t, false);
-        assert!(s.contains("no token stored"), "{s}");
-    }
-
-    #[test]
-    fn ssh_key_status_shows_loaded_for_existing_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let key = dir.path().join("id_ed25519.pub");
-        std::fs::write(&key, "ssh-ed25519 AAAA").unwrap();
-        let s = ssh_key_status(Some(&key));
-        assert!(s.contains("(loaded)"), "{s}");
-    }
-
-    #[test]
-    fn ssh_key_status_flags_missing_path_loudly() {
-        let p = std::path::Path::new("/does/not/exist/key.pub");
-        let s = ssh_key_status(Some(p));
-        assert!(s.contains("(missing!)"), "{s}");
-    }
-
-    #[test]
-    fn ssh_key_status_returns_not_set_for_none() {
-        assert_eq!(ssh_key_status(None), "not set");
+    fn the_identity_line_names_the_self_hosted_mode() {
+        assert_eq!(
+            identity_text(&Identity::AnonymousSelfHosted),
+            "anonymous (self-hosted mode)"
+        );
     }
 }

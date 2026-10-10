@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import { clearMocks, mockIPC } from '@tauri-apps/api/mocks';
 import { IpcError } from '../ipc/api';
 import type { Theme } from '../ipc/generated/Theme';
+import { settleIpc } from '../test/settle';
 import { applyTheme, followTheme, resolveTheme, watchSystemTheme } from './theme';
 
 const QUERY = '(prefers-color-scheme: dark)';
@@ -48,7 +49,8 @@ beforeEach(() => {
   });
 });
 
-afterEach(() => {
+afterEach(async () => {
+  await settleIpc();
   clearMocks();
   window.matchMedia = originalMatchMedia;
   delete document.documentElement.dataset.theme;

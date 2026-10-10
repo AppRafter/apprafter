@@ -1,0 +1,14 @@
+$ apprafter target add prod --renew --no-interactive
+[exit 0]
+[stdout]
+target `prod` credentials rotated and SSH key updated (token verified against Hetzner Cloud)
+[stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m target add invoked <ESC>[3mtarget<ESC>[0m<ESC>[2m=<ESC>[0mprod <ESC>[3mrenew<ESC>[0m<ESC>[2m=<ESC>[0mtrue <ESC>[3mforce<ESC>[0m<ESC>[2m=<ESC>[0mfalse
+[file targets/prod/config.yaml]
+provider: hetzner-cloud
+region: nbg1
+default_tier: solo
+cluster_name: null
+ssh_key_path: <SANDBOX>/home/work.pub
+firewall: null
+server_type: null

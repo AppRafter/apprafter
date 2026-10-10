@@ -68,14 +68,17 @@ saves the most typing on the deeply nested ones such as
 
 You will also need:
 
-- A Hetzner Cloud API token with Read+Write access.
+- A Hetzner Cloud API token with Read & Write permission, created in
+  the Hetzner Console (open the project, then Security → API tokens).
+  The console shows a token only once, so keep it somewhere safe.
 - An SSH key whose **public** half you will hand to the provider for
   the new node. The CLI never touches the private half.
 - **`kubectl` on your `PATH`.** Not optional: the CLI shells out to it
   for every cluster-facing command, and `apprafter doctor` reports a
   missing `kubectl` as a failure rather than a warning.
 - **`helm`** for `cluster-bootstrap`, **`restic`** for backup and
-  restore, **`git`** for reading an application repository, and an
+  restore, **`git`** for reading an application repository, **`cue`**
+  for checking an application manifest with `app validate`, and an
   **SSH client** for node preparation. Each is needed only by the
   commands that use it, so `doctor` reports a missing one as a warning
   naming the capability you will not have.
@@ -84,7 +87,7 @@ Any command that needs a tool checks for it **before** it prompts for
 anything, contacts a cluster or creates a billable resource, and names
 the install steps when it is absent.
 
-Confirm all five now, before step 1 and before anything is billable:
+Confirm all six now, before step 1 and before anything is billable:
 
 ```sh
 apprafter doctor
@@ -92,7 +95,7 @@ apprafter doctor
 
 With no target configured it reports `active target: none configured` as
 a warning and exits 0, and still prints one line per tool —
-`kubectl` `helm` `git` `ssh` `restic` — plus a DNS reachability check. A
+`restic` `kubectl` `helm` `git` `ssh` `cue` — plus a DNS reachability check. A
 missing `kubectl` is the only FAIL; the rest warn and name the capability
 you would lose. Step 3 runs it a second time, when there is a target for
 its six target-side checks to read.
@@ -140,9 +143,9 @@ apprafter target add prod \
     The wizard above already made this choice. `apprafter target machine`
     is how you set it on a target created non-interactively, or change it
     later — and it is the only way to change it: `target add <existing>`
-    errors and `--renew` is credentials-only. It refuses once a server has
-    been provisioned, because changing the machine of a live cluster is a
-    rebuild, not an edit.
+    errors and `--renew` changes only the token and the SSH key. It
+    refuses once a server has been provisioned, because changing the
+    machine of a live cluster is a rebuild, not an edit.
 
     ```sh
     apprafter target machine          # the same matrix, on its own
@@ -217,11 +220,14 @@ apprafter cb                    # alias for cluster-bootstrap
 apprafter doctor                # self-diagnostic, exits 1 on FAIL
 ```
 
-The second run is the one that exercises the six target-side checks the
-Prerequisites run could not: the config file, the credentials file and its
-mode, the provider, the token format, a token ping, and the SSH key. Each
-check reports PASS / WARN / FAIL with a hint pointing at the right next
-command.
+The second run is the one that exercises what the Prerequisites run could
+not: six target-side checks (the config file, the credentials file and its
+mode, the provider, the token format, a token ping and the SSH key) and
+three cluster checks (the kubeconfig `apprafter up` cached, the Kubernetes
+API answering through it within the request timeout, and the node
+accepting a connection on port 22). Each check reports PASS / WARN / FAIL
+with a hint pointing at the right next command, and `–` for a check it did
+not run: `--no-ping` skips the token ping and the SSH port.
 
 Then ask whether anything is wrong with the cluster:
 
@@ -318,12 +324,10 @@ diagnostic code and a multi-line `help:` block. Examples:
 Error: apprafter::target::not_found
 
   × target `ghost` not found (available: prod)
-  help: Either the `--target` flag was given a name that's not in the store,
-        or no target has been created yet. List existing targets with
-        `apprafter target list`; create a new one with `apprafter target add
-        <name> --provider hetzner-cloud …`. If the store is empty (`available:
-        ` shows nothing), this is your first run — start with `apprafter
-        target add`.
+  help: No target named `ghost` is configured here. `apprafter target list`
+        lists the targets that are; `apprafter target add ghost --provider
+        hetzner-cloud …` creates it. An empty `available:` list means this
+        store has no targets yet — start with `apprafter target add`.
 ```
 
 Set `NO_COLOR=1` for CI / pipe consumers. Output stays

@@ -52,8 +52,11 @@ rustls                = { version = "0.23", default-features = false, features =
 serde                 = { workspace = true }
 serde_json            = { workspace = true }
 tauri                 = { workspace = true }
-# Website, Docs and GitHub open in the browser; the capability scopes it to those three URLs.
+# Website, Docs, GitHub and the tools' install pages open in the browser; the capability lists
+# each URL exactly (capabilities/main.json5).
 tauri-plugin-opener   = "~2.7"
+# Copy report and the toolchain's Copy buttons: write text only (the capability grants nothing else).
+tauri-plugin-clipboard-manager = "~2.4"
 # A second launch focuses the first window instead of starting another app.
 tauri-plugin-single-instance = "~2.5"
 thiserror             = "2"
@@ -98,6 +101,8 @@ tauri       = { workspace = true, features = ["test"] }
 # tests/ipc_mock.rs reads capabilities/main.json5 as Tauri does: the version tauri-utils parses
 # it with (`config-json5`), already in the lock.
 json5       = "0.4"
+# tests/token_secrecy.rs mocks the Hetzner API on loopback: the version cli/Cargo.lock pins.
+mockito     = "1.7"
 # tests/env_guard.rs reads src/ as syntax trees, not text: versions already in the lock (as in
 # apprafter-core's guard); `span-locations` gives its findings their line numbers.
 proc-macro2 = { version = "1", features = ["span-locations"] }

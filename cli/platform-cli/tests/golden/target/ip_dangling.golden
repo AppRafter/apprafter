@@ -1,0 +1,12 @@
+$ apprafter target ip
+[exit 1]
+[stdout]
+[stderr]
+Error: apprafter::target::not_found
+
+  × target `gone` not found (available: prod, staging)
+  help: No target named `gone` is configured here. `apprafter target list`
+        lists the targets that are; `apprafter target add gone --provider
+        hetzner-cloud …` creates it. An empty `available:` list means this
+        store has no targets yet — start with `apprafter target add`.
+

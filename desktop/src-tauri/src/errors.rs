@@ -10,7 +10,7 @@
 //! projection every command returns.
 
 use apprafter_core::{CoreError, UiError};
-use apprafter_desktop_ipc::{OpId, UnavailableReason};
+use apprafter_desktop_ipc::{DraftId, OpId, UnavailableReason};
 use miette::Diagnostic;
 use thiserror::Error;
 
@@ -80,6 +80,30 @@ pub enum DesktopError {
     )]
     Closing,
 
+    #[error("no verified token waits as draft {}", draft_id.0)]
+    #[diagnostic(
+        code(apprafter::desktop::draft_not_found),
+        help("It was used, discarded, or dropped when AppRafter locked; verify the token again.")
+    )]
+    DraftNotFound { draft_id: DraftId },
+
+    #[error("the verified token of draft {} expired", draft_id.0)]
+    #[diagnostic(
+        code(apprafter::desktop::draft_expired),
+        help("A verified token waits 10 minutes; verify it again.")
+    )]
+    DraftExpired { draft_id: DraftId },
+
+    /// A path typed in a form that is not a full path: it would resolve against the app's
+    /// working directory, which means nothing to whoever typed it (the CLI keeps resolving
+    /// against its own). `path` is the text as typed.
+    #[error("`{path}` is not a full path")]
+    #[diagnostic(
+        code(apprafter::desktop::relative_path),
+        help("Give the full path, or start it with ~/ for a path in your home folder.")
+    )]
+    RelativePath { path: String },
+
     #[error(transparent)]
     #[diagnostic(transparent)]
     Core(#[from] CoreError),
@@ -96,9 +120,9 @@ fn wire_name(reason: &UnavailableReason) -> String {
 
 impl DesktopError {
     /// What a command returns: the diagnostic's code, message, help and causes, plus the
-    /// structured `fields` the webview acts on (`opId`, `reason`, `exhausted`, and `retryInMs`
-    /// when the back-off says how long it still refuses — camelCase, as every other key on the
-    /// wire). A core error keeps the core's own projection.
+    /// structured `fields` the webview acts on (`opId`, `draftId`, `reason`, `exhausted`, and
+    /// `retryInMs` when the back-off says how long it still refuses — camelCase, as every other
+    /// key on the wire). A core error keeps the core's own projection.
     pub fn to_ui(&self) -> UiError {
         if let DesktopError::Core(core) = self {
             return UiError::from(core);
@@ -107,6 +131,10 @@ impl DesktopError {
         match self {
             DesktopError::PlanNotFound { op_id } | DesktopError::PlanExpired { op_id } => {
                 ui.fields.insert("opId".into(), serde_json::json!(op_id.0));
+            }
+            DesktopError::DraftNotFound { draft_id } | DesktopError::DraftExpired { draft_id } => {
+                ui.fields
+                    .insert("draftId".into(), serde_json::json!(draft_id.0));
             }
             DesktopError::AuthFailed {
                 exhausted,
@@ -121,6 +149,9 @@ impl DesktopError {
             DesktopError::AuthUnavailable { reason } => {
                 ui.fields
                     .insert("reason".into(), serde_json::json!(wire_name(reason)));
+            }
+            DesktopError::RelativePath { path } => {
+                ui.fields.insert("path".into(), serde_json::json!(path));
             }
             DesktopError::Locked
             | DesktopError::AuthCancelled
@@ -175,7 +206,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use apprafter_core::{CoreError, UiError};
-    use apprafter_desktop_ipc::{errors, OpId, UnavailableReason};
+    use apprafter_desktop_ipc::{errors, DraftId, OpId, UnavailableReason};
     use serde_json::json;
 
     use super::{DesktopError, Refusal};
@@ -199,6 +230,15 @@ mod tests {
             DesktopError::SettingsIo("disk full".into()),
             DesktopError::Internal("bug".into()),
             DesktopError::Closing,
+            DesktopError::DraftNotFound {
+                draft_id: DraftId(3),
+            },
+            DesktopError::DraftExpired {
+                draft_id: DraftId(3),
+            },
+            DesktopError::RelativePath {
+                path: "id.pub".into(),
+            },
         ]
     }
 
@@ -214,6 +254,9 @@ mod tests {
             DesktopError::SettingsIo(_) => errors::SETTINGS_IO,
             DesktopError::Internal(_) => errors::INTERNAL,
             DesktopError::Closing => errors::CLOSING,
+            DesktopError::DraftNotFound { .. } => errors::DRAFT_NOT_FOUND,
+            DesktopError::DraftExpired { .. } => errors::DRAFT_EXPIRED,
+            DesktopError::RelativePath { .. } => errors::RELATIVE_PATH,
             DesktopError::Core(_) => return None,
         })
     }
@@ -247,6 +290,44 @@ mod tests {
             assert!(ui.message.contains("42"), "{}", ui.message);
             assert!(ui.help.is_some());
         }
+    }
+
+    #[test]
+    fn draft_errors_carry_the_draft_id_as_a_number() {
+        for e in [
+            DesktopError::DraftNotFound {
+                draft_id: DraftId(3),
+            },
+            DesktopError::DraftExpired {
+                draft_id: DraftId(3),
+            },
+        ] {
+            let ui = e.to_ui();
+            assert_eq!(ui.fields["draftId"], json!(3), "{ui:?}");
+            assert_eq!(
+                ui.fields.len(),
+                1,
+                "camelCase like every other wire key: {ui:?}"
+            );
+            assert!(ui.message.contains('3'), "{}", ui.message);
+            assert!(ui.help.is_some());
+        }
+    }
+
+    /// The typed text, as `fields.path`; the help says what is taken instead.
+    #[test]
+    fn a_relative_path_carries_what_was_typed_and_says_what_is_taken() {
+        let ui = DesktopError::RelativePath {
+            path: ".ssh/id.pub".into(),
+        }
+        .to_ui();
+        assert_eq!(ui.fields["path"], json!(".ssh/id.pub"));
+        assert_eq!(ui.fields.len(), 1, "{ui:?}");
+        assert_eq!(ui.message, "`.ssh/id.pub` is not a full path");
+        assert_eq!(
+            ui.help.as_deref(),
+            Some("Give the full path, or start it with ~/ for a path in your home folder.")
+        );
     }
 
     #[test]

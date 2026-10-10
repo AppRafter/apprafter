@@ -1,0 +1,59 @@
+$ apprafter target use staging
+[exit 1]
+[stdout]
+[stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m target use invoked <ESC>[3mtarget<ESC>[0m<ESC>[2m=<ESC>[0mstaging
+Error: apprafter::target::invalid_config
+
+  × target config at <SANDBOX>/apprafter-config/targets/staging/
+  │ credentials.yaml: not a valid target credentials map (line 1, column 16)
+  help: <SANDBOX>/apprafter-config/targets/staging/credentials.yaml
+        could not be read as target `staging`'s configuration: it was edited
+        by hand or written by an incompatible CLI version. Fix it by hand (it
+        is a small YAML file), or restore it from a backup. Otherwise remove
+        the target with `apprafter target remove staging`, which takes a
+        target it cannot read, and add it again with `apprafter target add
+        staging --provider hetzner-cloud …`, its token too. The removal also
+        deletes the target's local state: the record of its server, the cached
+        kubeconfig and the Argo CD password. If a server is recorded, fix or
+        restore the file first. After adding the target again, `apprafter
+        import --target staging` rebuilds the record from the provider; the
+        kubeconfig and the password are fetched again on first use.
+
+$ apprafter target use test
+[exit 1]
+[stdout]
+[stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m target use invoked <ESC>[3mtarget<ESC>[0m<ESC>[2m=<ESC>[0mtest
+Error: apprafter::target::invalid_config
+
+  × target config at <SANDBOX>/apprafter-config/targets/test/
+  │ config.yaml: provider: invalid type: sequence, expected a string at line 1
+  │ column 11
+  help: <SANDBOX>/apprafter-config/targets/test/config.yaml could not be
+        read as target `test`'s configuration: it was edited by hand or
+        written by an incompatible CLI version. Fix it by hand (it is a small
+        YAML file), or restore it from a backup. Otherwise remove the target
+        with `apprafter target remove test`, which takes a target it cannot
+        read, and add it again with `apprafter target add test --provider
+        hetzner-cloud …`, its token too. The removal also deletes the target's
+        local state: the record of its server, the cached kubeconfig and the
+        Argo CD password. If a server is recorded, fix or restore the file
+        first. After adding the target again, `apprafter import --target test`
+        rebuilds the record from the provider; the kubeconfig and the password
+        are fetched again on first use.
+
+$ apprafter target list
+[exit 0]
+[stdout]
+┌────────┬─────────┬───────────────┬────────┬──────┐
+│ Active │ Name    │ Provider      │ Region │ Tier │
+├────────┼─────────┼───────────────┼────────┼──────┤
+│ *      │ prod    │ hetzner-cloud │ nbg1   │ solo │
+│        │ staging │ hetzner-cloud │ nbg1   │ solo │
+└────────┴─────────┴───────────────┴────────┴──────┘
+
+2 targets configured. Active: 'prod'.
+[stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m target list invoked
+<ESC>[2m<TS><ESC>[0m <ESC>[33m WARN<ESC>[0m skipping unreadable target in list <ESC>[3mtarget<ESC>[0m<ESC>[2m=<ESC>[0mtest <ESC>[3merror<ESC>[0m<ESC>[2m=<ESC>[0mtarget config at <SANDBOX>/apprafter-config/targets/test/config.yaml: provider: invalid type: sequence, expected a string at line 1 column 11

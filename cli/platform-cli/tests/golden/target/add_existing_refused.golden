@@ -3,12 +3,10 @@ $ apprafter target add prod --provider hetzner-cloud --token bbbbbbbbbbbbbbbbbbb
 [stdout]
 [stderr]
 <ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m target add invoked <ESC>[3mtarget<ESC>[0m<ESC>[2m=<ESC>[0mprod <ESC>[3mrenew<ESC>[0m<ESC>[2m=<ESC>[0mfalse <ESC>[3mforce<ESC>[0m<ESC>[2m=<ESC>[0mfalse
-Error: apprafter::cli::other
+Error: apprafter::target::exists
 
-  × target `prod` already exists — pass `--force` to overwrite or `--renew` to
-  │ rotate credentials only
-  help: This is the catch-all CLI error. The message above is the only
-        context. If you see this often with the same wording, please file an
-        issue — recurring messages should be promoted to a typed `CliError`
-        variant with its own help text.
+  × target `prod` already exists
+  help: Pass `--force` to replace it (fields you do not pass are kept) or
+        `--renew` to rotate only its token; `apprafter target show prod` shows
+        what is stored.
 

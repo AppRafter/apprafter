@@ -1,0 +1,434 @@
+/* SPDX-License-Identifier: FSL-1.1-Apache-2.0 */
+/* The D.3 flows' screens: the add-target wizard, the machine picker, the doctor, the
+   toolchain. Primitives live in components.css. */
+
+/* Add-target wizard ---------------------------------------------------------------------- */
+
+/* The provider step after a verify: the draft stands for the token, and the field is gone. */
+.token-verified {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--ok);
+}
+
+/* Why the wizard came back to the token: a draft dropped, or used by a failed attempt. */
+.wizard-notice {
+  margin: 0;
+  font-size: var(--fs-12-5);
+  color: var(--warn);
+}
+
+/* The details step: name, tier cards and the key list, one column. */
+.wizard-details {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 14px;
+}
+
+/* What the core found at the path typed under "Other path…". */
+.ssh-path-status[data-tone="ok"] {
+  color: var(--ok);
+}
+
+.ssh-path-status[data-tone="err"] {
+  color: var(--err);
+}
+
+.ssh-path-status[data-tone="faint"] {
+  color: var(--fg-faint);
+}
+
+/* Machine picker ------------------------------------------------------------------------- */
+
+/* The design's step 2: region row, tools row, table and summary, 16 px apart as in the body. */
+.machine-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 0;
+}
+
+.machine-tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+/* The "Machine" eyebrow, as wide as the region row's "Region", so the two rows line up. */
+.machine-tools-legend {
+  flex: none;
+  min-width: 64px;
+}
+
+.machine-caption {
+  flex: 1;
+  min-width: 0;
+  color: var(--fg-faint);
+  font-size: var(--fs-12);
+}
+
+/* The design's toggle: an outline chip, tinted while on. */
+.machine-hide {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 6px;
+  height: var(--h-28);
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-4);
+  background: transparent;
+  color: var(--fg-muted);
+  font: 400 var(--fs-12) var(--font-sans);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.machine-hide:hover {
+  color: var(--fg);
+}
+
+.machine-hide[aria-pressed="true"] {
+  border-color: var(--accent);
+  background: var(--accent-tint);
+  color: var(--accent-text);
+}
+
+.machine-sku {
+  font-weight: 500;
+}
+
+.machine-muted {
+  color: var(--fg-muted);
+}
+
+.machine-note {
+  font-size: var(--fs-11-5);
+}
+
+.machine-note[data-tone="accent"] {
+  color: var(--accent-text);
+}
+
+.machine-note[data-tone="warn"] {
+  color: var(--warn);
+}
+
+.machine-note[data-tone="faint"] {
+  color: var(--fg-faint);
+}
+
+/* Why the regions show no latency: the reading failed or was cancelled, with Try again. */
+.machine-latency-note {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: -8px;
+  color: var(--warn);
+  font-size: var(--fs-12-5);
+}
+
+.machine-summary {
+  margin: 0;
+  color: var(--fg-muted);
+  font-size: var(--fs-12-5);
+}
+
+/* Doctor --------------------------------------------------------------------------------- */
+
+/* The overlay: the stethoscope, the title taking the head's room, then the summary chips. */
+.doctor-icon {
+  color: var(--accent-text);
+}
+
+.doctor-heading {
+  flex: 1;
+}
+
+.doctor-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-self: center;
+}
+
+/* The groups scroll inside the overlay; its head and foot stay. */
+.doctor-body {
+  max-height: 560px;
+  overflow: auto;
+}
+
+.doctor-group > .eyebrow {
+  margin: 14px 0 6px;
+}
+
+.doctor-group:first-child > .eyebrow {
+  margin-top: 0;
+}
+
+.doctor-rows {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.doctor-note {
+  margin: 0;
+  color: var(--fg-muted);
+}
+
+/* "6 checks · 14:02": the count of checks that ran and when. */
+.doctor-foot {
+  flex: 1;
+  font: 400 var(--fs-11-5) var(--font-mono);
+  color: var(--fg-faint);
+}
+
+/* The design's row: a 44 px badge, then the title, the detail and the fix, under a rule. */
+.doctor-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 9px 0;
+  border-top: 1px solid var(--border);
+  list-style: none;
+}
+
+.doctor-row > .tag {
+  flex: none;
+  justify-content: center;
+  width: 44px;
+  padding: 0;
+  font-weight: 500;
+}
+
+.doctor-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.doctor-title {
+  font-weight: 500;
+}
+
+.doctor-title code,
+.doctor-fix code {
+  font-family: var(--font-mono);
+  font-size: 0.95em;
+}
+
+/* A command's word wraps whole, onto the next line (never "--" here, "target" there); one wider
+   than the line is capped at it and breaks anywhere rather than overflow. */
+.code-word {
+  display: inline-block;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+.doctor-detail {
+  margin-top: 2px;
+  color: var(--fg-muted);
+  font: 400 var(--fs-12) var(--font-mono);
+  overflow-wrap: anywhere;
+}
+
+.doctor-fix {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin-top: 4px;
+  color: var(--accent-text);
+  font-size: var(--fs-12-5);
+}
+
+/* The arrow sits on the first line of a fix that wraps. */
+.doctor-fix > svg {
+  flex: none;
+  margin-top: 3px;
+}
+
+/* What the core warned of during a run, above the groups until the overlay closes. */
+.doctor-notes {
+  display: grid;
+  gap: 4px;
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  list-style: none;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: var(--fs-12-5);
+}
+
+.doctor-notes li {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 6px;
+  align-items: baseline;
+  overflow-wrap: anywhere;
+}
+
+.doctor-notes li[data-kind="warning"] svg {
+  color: var(--warn);
+}
+
+.doctor-fix-text {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.doctor-fix > .btn {
+  flex: none;
+  align-self: center;
+}
+
+/* Toolchain ------------------------------------------------------------------------------ */
+
+.tool-rows {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* One tool: its name, required or optional and what it is for; then what the probe found. */
+.tool-row {
+  display: grid;
+  gap: 3px;
+  padding: 10px 0;
+  border-top: 1px solid var(--border);
+}
+
+.tool-row:first-child {
+  border-top: none;
+  padding-top: 0;
+}
+
+.tool-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.tool-name {
+  font: 500 var(--fs-12-5) var(--font-mono);
+}
+
+.tool-purpose {
+  color: var(--fg-muted);
+  font-size: var(--fs-12-5);
+}
+
+.tool-state {
+  font-size: var(--fs-12-5);
+}
+
+.tool-state[data-tone="ok"] {
+  color: var(--ok);
+}
+
+.tool-state[data-tone="warn"] {
+  color: var(--warn);
+}
+
+.tool-state[data-tone="err"] {
+  color: var(--err);
+}
+
+/* The tool's or the system's own words, and the path it was found at: as they are. */
+.tool-detail,
+.tool-path {
+  font: 400 var(--fs-11-5) var(--font-mono);
+  color: var(--fg-faint);
+  overflow-wrap: anywhere;
+}
+
+/* A check again runs: the rows below are the last check's until it ends. */
+.tool-checking {
+  margin: 0 0 8px;
+  font-size: var(--fs-12-5);
+  color: var(--fg-muted);
+}
+
+.tool-rows[data-stale] {
+  opacity: 0.6;
+}
+
+.tool-hints {
+  display: grid;
+  gap: 4px;
+  margin-top: 4px;
+}
+
+/* An install line: the OS it is for, then the command or address in mono, or a note. */
+.tool-hint {
+  display: grid;
+  grid-template-columns: 110px minmax(0, 1fr) auto;
+  align-items: baseline;
+  gap: 8px;
+  font-size: var(--fs-12-5);
+}
+
+/* Open (an install page) and Copy, at the line's end. */
+.tool-hint-actions {
+  display: inline-flex;
+  gap: 2px;
+  align-self: center;
+}
+
+.tool-hint-os {
+  color: var(--fg-muted);
+}
+
+.tool-hint code {
+  font: 400 var(--fs-12-5) var(--font-mono);
+  overflow-wrap: anywhere;
+}
+
+/* "Searched 2 directories of …", which opens to the directories. */
+.tool-foot {
+  flex: 1;
+  min-width: 0;
+  align-self: center;
+  font-size: var(--fs-12-5);
+  color: var(--fg-muted);
+}
+
+.tool-search-path {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  font: 400 var(--fs-11-5) var(--font-mono);
+  color: var(--fg-faint);
+}
+
+/* Settings › About › This computer -------------------------------------------------------- */
+
+.this-computer {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+/* The default target's machine and key, as the CLI prints them. */
+/* What to do about a refusal; and the line before what an earlier read found. */
+.this-computer-help,
+.this-computer-earlier {
+  color: var(--fg-muted);
+}
+
+.this-computer-machine {
+  font: 400 var(--fs-11-5) var(--font-mono);
+}
+
+.this-computer [data-tone="ok"] {
+  color: var(--ok);
+}
+
+.this-computer [data-tone="warn"] {
+  color: var(--warn);
+}
+
+.this-computer [data-tone="err"] {
+  color: var(--err);
+}

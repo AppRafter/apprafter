@@ -105,14 +105,30 @@ pub fn config_root_from_override(custom: Option<String>) -> Result<PathBuf> {
         })
 }
 
+/// The length of a Hetzner Cloud API token: 64 ASCII alphanumeric characters.
+pub const HETZNER_TOKEN_LEN: usize = 64;
+
+/// Where a Hetzner Cloud API token is created, in the console's own name and labels
+/// (docs.hetzner.com, "Generating an API token", read 2026-10-10: in the Hetzner Console, open
+/// the project, then Security in the left menu, API tokens in the upper one, then Generate API
+/// token). The console shows a token only once, when it is created, so a pointer here sends the
+/// reader to create a new token, never to copy an existing one.
+///
+/// Every help and page that says where a token comes from uses this text: the CLI's helps and
+/// doctor hint, the core's client-neutral help, the `--token` flag's help, the desktop's own
+/// hints (exported as `HETZNER_API_TOKENS_PAGE`) and the operator guide.
+/// `platform-cli/tests/hetzner_console_wording_test.rs` fails on any other spelling of the path.
+pub const HETZNER_API_TOKENS_PAGE: &str =
+    "the Hetzner Console (open the project, then Security → API tokens)";
+
 /// Validate a Hetzner Cloud API token's surface format. Cheap
 /// pre-flight before the real `GET /v1/locations` ping that
 /// arrives in Track A.4 — here we only catch obvious typos and
 /// wrong-credential-pasted-into-wrong-field mistakes (e.g. AWS
 /// access key landed in `--token`).
 ///
-/// **Format.** Hetzner Cloud tokens copied from the Cloud Console
-/// → Security → API Tokens panel are 64 ASCII alphanumeric
+/// **Format.** Hetzner Cloud API tokens, created in
+/// [`HETZNER_API_TOKENS_PAGE`], are 64 ASCII alphanumeric
 /// characters with no fixed prefix. The `HCLOUD_TOKEN` env var
 /// name is a Hetzner convention; the value inside it is just the
 /// bare 64 chars. `cli-dx-task.md` §11 originally documented an
@@ -127,10 +143,9 @@ pub fn config_root_from_override(custom: Option<String>) -> Result<PathBuf> {
 /// best how to phrase the surrounding error ("invalid token for
 /// --token flag" vs. "invalid token in credentials.yaml").
 pub fn validate_hetzner_token_format(token: &str) -> std::result::Result<(), String> {
-    const EXPECTED_LEN: usize = 64;
-    if token.len() != EXPECTED_LEN {
+    if token.len() != HETZNER_TOKEN_LEN {
         return Err(format!(
-            "Hetzner Cloud tokens are {EXPECTED_LEN} ASCII alphanumeric characters; got {}",
+            "Hetzner Cloud tokens are {HETZNER_TOKEN_LEN} ASCII alphanumeric characters; got {}",
             token.len()
         ));
     }
@@ -560,6 +575,7 @@ pub fn load_global_config(paths: &TargetStorePaths) -> Result<Option<GlobalConfi
         serde_yaml::from_slice(&bytes).map_err(|err| CliError::InvalidTargetConfig {
             path: path.clone(),
             message: err.to_string(),
+            target: None,
         })?;
     Ok(Some(cfg))
 }
@@ -620,44 +636,96 @@ pub fn load_active_target_config(
 // Per-target IO
 // ---------------------------------------------------------------
 
-/// Read both halves (`config.yaml` + `credentials.yaml`) of one
-/// target. Missing target → `CliError::TargetNotFound` with the
-/// list of names currently present so error messages can be
-/// helpful without an extra round-trip.
-pub fn load_target(paths: &TargetStorePaths, name: &str) -> Result<Target> {
+/// Read one target's `config.yaml` only — never its credentials, so a listing reads no secret.
+/// Missing target → `CliError::TargetNotFound` with the names present, as [`load_target`]; a
+/// file that cannot be read, or checked for, → `CliError::TargetFileIo` naming the target.
+pub fn load_target_config(paths: &TargetStorePaths, name: &str) -> Result<TargetConfig> {
     let cfg_path = paths.target_config_file(name);
-    if !cfg_path.exists() {
+    if !target_file_exists(&cfg_path, name)? {
         let available = list_target_names(paths).unwrap_or_default().join(", ");
         return Err(CliError::TargetNotFound {
             name: name.to_string(),
             available,
         });
     }
-    let cfg_bytes = fs::read(&cfg_path)?;
-    let config: TargetConfig =
-        serde_yaml::from_slice(&cfg_bytes).map_err(|err| CliError::InvalidTargetConfig {
-            path: cfg_path.clone(),
-            message: err.to_string(),
-        })?;
+    let cfg_bytes = read_target_file(&cfg_path, name)?;
+    serde_yaml::from_slice(&cfg_bytes).map_err(|err| CliError::InvalidTargetConfig {
+        path: cfg_path.clone(),
+        message: err.to_string(),
+        target: Some(name.to_string()),
+    })
+}
 
-    let creds_path = paths.target_credentials_file(name);
-    let credentials = if creds_path.exists() {
-        let bytes = fs::read(&creds_path)?;
-        serde_yaml::from_slice::<TargetCredentials>(&bytes).map_err(|err| {
-            CliError::InvalidTargetConfig {
-                path: creds_path.clone(),
-                message: err.to_string(),
-            }
-        })?
-    } else {
-        TargetCredentials::default()
-    };
-
+/// Read both halves (`config.yaml` + `credentials.yaml`) of one
+/// target. Missing target → `CliError::TargetNotFound` with the
+/// list of names currently present so error messages can be
+/// helpful without an extra round-trip.
+pub fn load_target(paths: &TargetStorePaths, name: &str) -> Result<Target> {
+    let config = load_target_config(paths, name)?;
+    let credentials = load_target_credentials(paths, name)?;
     Ok(Target {
         name: name.to_string(),
         config,
         credentials,
     })
+}
+
+/// Read one target's `credentials.yaml` only, as [`load_target`] reads it: no file is no
+/// credentials, and a file that does not parse is `CliError::InvalidTargetConfig` whose message
+/// never quotes it (it holds the token). Whether the target exists is not checked: `target
+/// remove` reads each file of a target it cannot load on its own (WI-458).
+pub fn load_target_credentials(paths: &TargetStorePaths, name: &str) -> Result<TargetCredentials> {
+    let creds_path = paths.target_credentials_file(name);
+    if !target_file_exists(&creds_path, name)? {
+        return Ok(TargetCredentials::default());
+    }
+    let bytes = read_target_file(&creds_path, name)?;
+    serde_yaml::from_slice::<TargetCredentials>(&bytes).map_err(|err| {
+        CliError::InvalidTargetConfig {
+            path: creds_path.clone(),
+            message: credentials_parse_message(&err),
+            target: Some(name.to_string()),
+        }
+    })
+}
+
+/// Whether `path`, one of target `name`'s own files, exists. Not `Path::exists`, which says no on
+/// any error: a target directory this user cannot search read as a target without its
+/// `config.yaml` and without credentials (WI-458 review #3). A check that fails is an I/O error
+/// on that file, naming the target (`CliError::TargetFileIo`). A path through a regular file is
+/// missing, as before: a file under `targets/` is not a target (`list_target_names` skips it).
+fn target_file_exists(path: &Path, name: &str) -> Result<bool> {
+    match path.try_exists() {
+        Err(e) if e.kind() == std::io::ErrorKind::NotADirectory => Ok(false),
+        checked => checked.map_err(|source| target_file_io(path, name, source)),
+    }
+}
+
+/// `path`, one of target `name`'s own files, read; an error names the target (review #6).
+fn read_target_file(path: &Path, name: &str) -> Result<Vec<u8>> {
+    fs::read(path).map_err(|source| target_file_io(path, name, source))
+}
+
+fn target_file_io(path: &Path, name: &str, source: std::io::Error) -> CliError {
+    CliError::TargetFileIo {
+        path: path.to_path_buf(),
+        target: name.to_string(),
+        source,
+    }
+}
+
+/// What a credentials file that does not parse is said to be: where it failed, never serde's
+/// own text, which quotes the scalar it could not read — in this file, the token (a hand edit
+/// with no space after the colon, `hetzner_token:<token>`, is one plain scalar).
+fn credentials_parse_message(err: &serde_yaml::Error) -> String {
+    match err.location() {
+        Some(at) => format!(
+            "not a valid target credentials map (line {}, column {})",
+            at.line(),
+            at.column()
+        ),
+        None => "not a valid target credentials map".to_string(),
+    }
 }
 
 /// Persist both halves of a target. `config.yaml` is mode 0644
@@ -667,16 +735,7 @@ pub fn load_target(paths: &TargetStorePaths, name: &str) -> Result<Target> {
 /// no race window where the credentials are briefly readable by
 /// other local users.
 pub fn save_target(paths: &TargetStorePaths, target: &Target) -> Result<()> {
-    fs::create_dir_all(paths.target_dir(&target.name))?;
-    ensure_auth_placeholder(paths)?;
-
-    let cfg_yaml = serde_yaml::to_string(&target.config)?;
-    atomic_write(
-        &paths.target_config_file(&target.name),
-        cfg_yaml.as_bytes(),
-        false,
-    )?;
-
+    save_target_config(paths, &target.name, &target.config)?;
     let creds_yaml = serde_yaml::to_string(&target.credentials)?;
     atomic_write(
         &paths.target_credentials_file(&target.name),
@@ -684,6 +743,20 @@ pub fn save_target(paths: &TargetStorePaths, target: &Target) -> Result<()> {
         true,
     )?;
     Ok(())
+}
+
+/// Persist a target's `config.yaml` (mode 0644) and nothing else: its `credentials.yaml` is
+/// neither read nor written, so a change that keeps the token leaves that file as it was,
+/// byte for byte (`target add --renew --ssh-key` without a new token).
+pub fn save_target_config(
+    paths: &TargetStorePaths,
+    name: &str,
+    config: &TargetConfig,
+) -> Result<()> {
+    fs::create_dir_all(paths.target_dir(name))?;
+    ensure_auth_placeholder(paths)?;
+    let cfg_yaml = serde_yaml::to_string(config)?;
+    atomic_write(&paths.target_config_file(name), cfg_yaml.as_bytes(), false)
 }
 
 /// Names of every target directory under `<root>/targets/`,
@@ -878,11 +951,89 @@ mod tests {
         assert_eq!(paths.state_dir("work"), root.join("state/work"));
     }
 
+    /// D.3d review #5: serde_yaml's text quotes the scalar it could not read, and in a
+    /// credentials file that scalar is the token — a hand edit with no space after the colon
+    /// (`hetzner_token:<token>`) is one plain scalar, and so is a bare token line. The error
+    /// names the file and where in it, never what it holds; it reaches a terminal, the desktop's
+    /// error panel, and doctor's row.
+    #[test]
+    fn a_credentials_file_that_does_not_parse_is_named_by_its_place_never_its_text() {
+        let (_dir, paths) = make_paths();
+        let token = "t0k3n".repeat(13);
+        save_target(
+            &paths,
+            &Target {
+                name: "prod".into(),
+                config: TargetConfig {
+                    provider: "hetzner-cloud".into(),
+                    ..Default::default()
+                },
+                credentials: TargetCredentials::default(),
+            },
+        )
+        .unwrap();
+        let creds = paths.target_credentials_file("prod");
+        for (body, line, column) in [
+            (format!("hetzner_token:{token}\n"), 1, 1),
+            (format!("{token}\n"), 1, 1),
+            (format!("hetzner_token: [{token}]\n"), 1, 16),
+            (format!("# a token\nhetzner_token: [{token}\n"), 2, 16),
+        ] {
+            fs::write(&creds, &body).unwrap();
+            let err = load_target(&paths, "prod").expect_err(&body);
+            let shown = err.to_string();
+            assert!(!shown.contains(&token), "the token is quoted: {shown}");
+            match err {
+                CliError::InvalidTargetConfig {
+                    path,
+                    message,
+                    target,
+                } => {
+                    assert_eq!(path, creds);
+                    assert_eq!(target.as_deref(), Some("prod"), "the file's target");
+                    assert_eq!(
+                        message,
+                        format!(
+                            "not a valid target credentials map (line {line}, column {column})"
+                        ),
+                        "{body}"
+                    );
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn load_global_config_returns_none_on_fresh_store() {
         let (_dir, paths) = make_paths();
         let loaded = load_global_config(&paths).expect("missing file is not an error");
         assert!(loaded.is_none());
+    }
+
+    /// A config-only save rewrites `config.yaml` and leaves `credentials.yaml` exactly as it
+    /// was, a hand-written comment included, and creates none where there was none.
+    #[test]
+    fn a_config_only_save_never_touches_the_credentials_file() {
+        let (_dir, paths) = make_paths();
+        let config = |key: &str| TargetConfig {
+            provider: "hetzner-cloud".into(),
+            ssh_key_path: Some(key.into()),
+            ..Default::default()
+        };
+        save_target_config(&paths, "work", &config("/k/old.pub")).unwrap();
+        assert!(!paths.target_credentials_file("work").exists());
+        let creds = "# rotated by hand\nhetzner_token: 'abc'\n";
+        fs::write(paths.target_credentials_file("work"), creds).unwrap();
+        save_target_config(&paths, "work", &config("/k/new.pub")).unwrap();
+        assert_eq!(
+            fs::read_to_string(paths.target_credentials_file("work")).unwrap(),
+            creds
+        );
+        assert_eq!(
+            load_target_config(&paths, "work").unwrap().ssh_key_path,
+            Some("/k/new.pub".into())
+        );
     }
 
     #[test]
@@ -920,10 +1071,32 @@ mod tests {
         fs::write(paths.global_config_file(), b"not: valid: yaml: : :").unwrap();
         let err = load_global_config(&paths).expect_err("corrupt yaml must error");
         match err {
-            CliError::InvalidTargetConfig { path, .. } => {
+            CliError::InvalidTargetConfig { path, target, .. } => {
                 assert_eq!(path, paths.global_config_file());
+                assert_eq!(target, None, "the store's own file belongs to no target");
             }
             other => panic!("expected InvalidTargetConfig, got {other:?}"),
+        }
+    }
+
+    /// A target's own `config.yaml` that does not parse names its target, so the help can offer
+    /// re-adding that target (the store's `config.yaml` names none).
+    #[test]
+    fn a_corrupt_target_config_names_its_target() {
+        let (_dir, paths) = make_paths();
+        fs::create_dir_all(paths.target_dir("prod")).unwrap();
+        fs::write(paths.target_config_file("prod"), b"not: valid: yaml: : :").unwrap();
+        for err in [
+            load_target_config(&paths, "prod").unwrap_err(),
+            load_target(&paths, "prod").unwrap_err(),
+        ] {
+            match err {
+                CliError::InvalidTargetConfig { path, target, .. } => {
+                    assert_eq!(path, paths.target_config_file("prod"));
+                    assert_eq!(target.as_deref(), Some("prod"));
+                }
+                other => panic!("expected InvalidTargetConfig, got {other:?}"),
+            }
         }
     }
 
@@ -1353,6 +1526,100 @@ mod tests {
         assert!(matches!(err, CliError::TargetNotFound { .. }));
     }
 
+    /// A hetzner-cloud target `name` with both of its files.
+    fn saved(paths: &TargetStorePaths, name: &str) {
+        let target = Target {
+            name: name.into(),
+            config: TargetConfig {
+                provider: "hetzner-cloud".into(),
+                ..Default::default()
+            },
+            credentials: TargetCredentials::default(),
+        };
+        save_target(paths, &target).unwrap();
+    }
+
+    /// `err` is an I/O error on target `prod`'s file `path`, of `kind`.
+    #[cfg(unix)]
+    fn assert_target_file_io(err: &CliError, path: &Path, kind: std::io::ErrorKind) {
+        match err {
+            CliError::TargetFileIo {
+                path: p,
+                target,
+                source,
+            } => {
+                assert_eq!((p.as_path(), target.as_str()), (path, "prod"));
+                assert_eq!(source.kind(), kind);
+            }
+            other => panic!("expected TargetFileIo on {}, got {other:?}", path.display()),
+        }
+    }
+
+    /// WI-458 review #3: `Path::exists` says no on any error, so a target directory this user
+    /// cannot search read as a target without its config.yaml (`TargetNotFound`) and without
+    /// credentials (`Ok(default)`). Each is an I/O error on that target's file now, naming the
+    /// target (review #6). A 000 directory: the tests run as a user its mode binds.
+    #[cfg(unix)]
+    #[test]
+    fn a_target_directory_that_cannot_be_searched_is_an_io_error_never_missing() {
+        use std::io::ErrorKind::PermissionDenied;
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, paths) = make_paths();
+        saved(&paths, "prod");
+        fs::set_permissions(paths.target_dir("prod"), fs::Permissions::from_mode(0o000)).unwrap();
+        let _restore = ModeGuard(paths.target_dir("prod"));
+        let config = load_target_config(&paths, "prod").expect_err("cannot be searched");
+        assert_target_file_io(&config, &paths.target_config_file("prod"), PermissionDenied);
+        let credentials = load_target_credentials(&paths, "prod").expect_err("cannot be searched");
+        assert_target_file_io(
+            &credentials,
+            &paths.target_credentials_file("prod"),
+            PermissionDenied,
+        );
+        let both = load_target(&paths, "prod").expect_err("cannot be searched");
+        assert_target_file_io(&both, &paths.target_config_file("prod"), PermissionDenied);
+    }
+
+    /// Review #6: a target's own file that cannot be read is an I/O error naming the target, so
+    /// the desktop can tell it from a store-level one. The other file still reads.
+    #[cfg(unix)]
+    #[test]
+    fn a_target_file_that_cannot_be_read_is_an_io_error_naming_its_target() {
+        use std::io::ErrorKind::PermissionDenied;
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, paths) = make_paths();
+        saved(&paths, "prod");
+        let creds = paths.target_credentials_file("prod");
+        fs::set_permissions(&creds, fs::Permissions::from_mode(0o000)).unwrap();
+        load_target_config(&paths, "prod").expect("config.yaml reads");
+        let err = load_target_credentials(&paths, "prod").expect_err("cannot be read");
+        assert_target_file_io(&err, &creds, PermissionDenied);
+        fs::set_permissions(&creds, fs::Permissions::from_mode(0o600)).unwrap();
+        let cfg = paths.target_config_file("prod");
+        fs::set_permissions(&cfg, fs::Permissions::from_mode(0o000)).unwrap();
+        let err = load_target_config(&paths, "prod").expect_err("cannot be read");
+        assert_target_file_io(&err, &cfg, PermissionDenied);
+    }
+
+    /// A regular file under `targets/` is not a target (`list_target_names` skips it): a path
+    /// through it is missing, as it was under `Path::exists`, not an I/O error.
+    #[test]
+    fn a_file_where_a_target_directory_would_be_is_not_a_target() {
+        let (_dir, paths) = make_paths();
+        saved(&paths, "prod");
+        fs::write(paths.targets_dir().join("notes"), b"x").unwrap();
+        match load_target_config(&paths, "notes") {
+            Err(CliError::TargetNotFound { name, available }) => {
+                assert_eq!((name.as_str(), available.as_str()), ("notes", "prod"));
+            }
+            other => panic!("expected TargetNotFound, got {other:?}"),
+        }
+        assert_eq!(
+            load_target_credentials(&paths, "notes").unwrap(),
+            TargetCredentials::default()
+        );
+    }
+
     #[test]
     fn rename_target_moves_dir_and_per_target_state_cache() {
         let (_dir, paths) = make_paths();
@@ -1528,7 +1795,7 @@ mod tests {
 
     #[test]
     fn validate_hetzner_token_format_accepts_canonical_64_char_token() {
-        // Canonical Hetzner Cloud Console token shape: 64 ASCII
+        // Canonical Hetzner Cloud API token shape: 64 ASCII
         // alphanumeric, no prefix. Without this case passing the
         // CLI rejected every real-world token (v0.1.74 regression
         // fix — v0.1.73 had wrongly required an `hcloud_` prefix
@@ -1666,5 +1933,36 @@ mod tests {
     fn config_root_from_override_without_value_uses_the_platform_dir() {
         let root = config_root_from_override(None).unwrap();
         assert!(root.ends_with("apprafter"), "got {root:?}");
+    }
+
+    #[test]
+    fn the_config_loads_without_reading_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = TargetStorePaths::for_root(dir.path().to_path_buf());
+        save_target(
+            &paths,
+            &Target {
+                name: "prod".into(),
+                config: TargetConfig {
+                    provider: "hetzner-cloud".into(),
+                    ..Default::default()
+                },
+                credentials: TargetCredentials::default(),
+            },
+        )
+        .unwrap();
+        std::fs::write(paths.target_credentials_file("prod"), "{not yaml").unwrap();
+        assert_eq!(
+            load_target_config(&paths, "prod").unwrap().provider,
+            "hetzner-cloud"
+        );
+        assert!(
+            load_target(&paths, "prod").is_err(),
+            "the full load still reads credentials"
+        );
+        assert!(matches!(
+            load_target_config(&paths, "ghost"),
+            Err(CliError::TargetNotFound { .. })
+        ));
     }
 }

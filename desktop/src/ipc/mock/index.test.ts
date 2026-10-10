@@ -2,6 +2,7 @@
 import { afterEach, describe, expect, jest, test } from 'bun:test';
 import { Channel } from '@tauri-apps/api/core';
 import { clearMocks } from '@tauri-apps/api/mocks';
+import { settleIpc } from '../../test/settle';
 import * as api from '../api';
 import { IpcError } from '../api';
 import { onLockChanged } from '../events';
@@ -9,6 +10,8 @@ import { ALLOWED_WHILE_LOCKED, type COMMANDS } from '../generated/commands';
 import { DESKTOP_ERROR_CODES } from '../generated/errors';
 import type { LockState } from '../generated/LockState';
 import type { OpEvent } from '../generated/OpEvent';
+import type { ToolId } from '../generated/ToolId';
+import { HETZNER_TOKEN_LEN } from '../generated/target';
 import {
   installMockIpc,
   MOCK_BACKOFF,
@@ -17,7 +20,10 @@ import {
   mockOptionsFromUrl,
 } from './index';
 
-afterEach(() => clearMocks());
+afterEach(async () => {
+  await settleIpc();
+  clearMocks();
+});
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -42,6 +48,36 @@ function callEach(): Record<(typeof COMMANDS)[number], () => Promise<unknown>> {
     unlock_with_password: () => api.unlockWithPassword(MOCK_PASSWORD),
     window_ready: () => api.windowReady(),
     theme_apply: () => api.themeApply('system'),
+    target_list: () => api.targetList(),
+    target_show: () => api.targetShow('prod-eu'),
+    ssh_key_candidates: () => api.sshKeyCandidates(),
+    ssh_key_inspect: () => api.sshKeyInspect('~/.ssh/id_ed25519.pub'),
+    toolchain_status: () => api.toolchainStatus(),
+    whoami: () => api.whoami(),
+    op_start_verify_token: () =>
+      api.opStartVerifyToken('hetzner-cloud', 'k'.repeat(HETZNER_TOKEN_LEN)),
+    op_start_machine_catalogue: () =>
+      api.opStartMachineCatalogue({ kind: 'target', name: 'prod-eu' }),
+    op_start_region_latencies: () => api.opStartRegionLatencies(['nbg1', 'hel1']),
+    op_start_doctor: () => api.opStartDoctor('prod-eu'),
+    op_start_whoami: () => api.opStartWhoami(),
+    op_plan_target_add: () =>
+      api.opPlanTargetAdd({
+        name: 'lab-2',
+        provider: 'hetzner-cloud',
+        draftId: 3,
+        sshKey: null,
+        region: 'nbg1',
+        tier: 'solo',
+        serverType: 'cx22',
+      }),
+    op_plan_target_renew: () =>
+      api.opPlanTargetRenew('prod-eu', 'k'.repeat(HETZNER_TOKEN_LEN), null),
+    op_plan_target_use: () => api.opPlanTargetUse('prod-eu'),
+    op_plan_target_rename: () => api.opPlanTargetRename('prod-eu', 'prod-us'),
+    op_plan_target_remove: () => api.opPlanTargetRemove('prod-eu'),
+    op_plan_target_machine: () => api.opPlanTargetMachine('lab', 'cx32', null),
+    target_draft_discard: () => api.targetDraftDiscard(3),
   };
 }
 
@@ -70,13 +106,18 @@ describe('installMockIpc', () => {
     }
   });
 
-  test('unlocked, every command has an answer (an unknown operation is plan_not_found)', async () => {
+  test('unlocked, every command has an answer (an unknown operation or draft is not found)', async () => {
     installMockIpc();
     await api.unlock();
     for (const [name, call] of Object.entries(callEach())) {
       // It would lock the app for the calls after it; the lock-changed test covers it.
       if (name === 'lock_now') continue;
-      const fine: (string | null)[] = ['answered', DESKTOP_ERROR_CODES.PLAN_NOT_FOUND];
+      // A call naming a draft no verify made is refused at the command, as Rust refuses it.
+      const fine: (string | null)[] = [
+        'answered',
+        DESKTOP_ERROR_CODES.PLAN_NOT_FOUND,
+        DESKTOP_ERROR_CODES.DRAFT_NOT_FOUND,
+      ];
       expect(fine, name).toContain(await outcome(call));
     }
   });
@@ -231,7 +272,35 @@ describe('installMockIpc', () => {
   test('an unknown command is refused as Tauri refuses it, not answered', async () => {
     installMockIpc();
     const { invoke } = await import('@tauri-apps/api/core');
-    await expect(invoke('target_list')).rejects.toContain('target_list');
+    await expect(invoke('not_a_command')).rejects.toContain('not_a_command');
+  });
+});
+
+/** Every tool the core runs, in its probe order (ToolId::ALL); the type check keeps it whole. */
+const TOOL_IDS = [
+  'restic',
+  'kubectl',
+  'helm',
+  'git',
+  'ssh',
+  'cue',
+] as const satisfies readonly ToolId[];
+const everyTool: Exclude<ToolId, (typeof TOOL_IDS)[number]> extends never ? true : never = true;
+
+describe('the toolchain the mock reports', () => {
+  test('by default one tool is missing; with ?tools=found, every tool the core runs is found', async () => {
+    installMockIpc({ opDelayMs: 0 });
+    await api.unlock();
+    expect((await api.toolchainStatus()).tools.some((tool) => tool.problem !== null)).toBe(true);
+    clearMocks();
+    installMockIpc({ opDelayMs: 0, tools: 'found' });
+    await api.unlock();
+    const found = await api.toolchainStatus();
+    expect(everyTool && found.tools.map((tool) => tool.tool)).toEqual([...TOOL_IDS]);
+    for (const tool of found.tools) {
+      expect(tool.problem).toBeNull();
+      expect(tool.path).not.toBeNull();
+    }
   });
 });
 
@@ -240,6 +309,7 @@ describe('mockOptionsFromUrl', () => {
     expect(mockOptionsFromUrl('?os=macos&theme=system')).toEqual({ os: 'macos', theme: 'system' });
     expect(mockOptionsFromUrl('?auth=pam')).toEqual({ auth: 'pam' });
     expect(mockOptionsFromUrl('?session=none')).toEqual({ session: 'none' });
+    expect(mockOptionsFromUrl('?tools=found')).toEqual({ tools: 'found' });
     expect(mockOptionsFromUrl('')).toEqual({});
   });
 
@@ -248,5 +318,6 @@ describe('mockOptionsFromUrl', () => {
     expect(() => mockOptionsFromUrl('?theme=sepia')).toThrow('theme');
     expect(() => mockOptionsFromUrl('?auth=fingerprint')).toThrow('auth');
     expect(() => mockOptionsFromUrl('?session=hibernate')).toThrow('session');
+    expect(() => mockOptionsFromUrl('?tools=some')).toThrow('tools');
   });
 });

@@ -9,20 +9,105 @@
 use crate::cli::{
     AppCommand, AutoscaleCommand, BackupAction, Cli, Commands, EgressCommand, EnvCommand,
     MigrationCommand, OpenUi, PlatformCommand, RepoCommand, RepoCredsCommand, SecretCommand,
+    TargetCommand,
 };
 use crate::commands;
 
-/// Pure dispatch over the parsed CLI. Returns `cli_core::Result`
-/// so the typed `CliError -> miette::Report` conversion happens
-/// exactly once at the crate's entry point ([`crate::run`]) and the
-/// inner code keeps using the original `?` ergonomics over
-/// `cli_core::Result<T>`.
-pub(crate) fn dispatch(args: Cli) -> cli_core::Result<()> {
+/// Which of `target add`'s env-backed values were typed on the command line, as clap's
+/// `value_source` tells it — read from the matches before `Cli::from_arg_matches_mut` takes the
+/// values out. `--renew` treats a value typed here differently from one an environment variable
+/// supplied (D.3d review #0/#3/#8): an env token or key never changes what an explicit command
+/// means.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Typed {
+    /// `--token`, not `HCLOUD_TOKEN`.
+    pub token: bool,
+    /// `--ssh-key`, not `APPRAFTER_SSH_PUBLIC_KEY_PATH`.
+    pub ssh_key: bool,
+}
+
+impl Typed {
+    pub(crate) fn of(matches: &clap::ArgMatches) -> Self {
+        let add = matches
+            .subcommand_matches("target")
+            .and_then(|target| target.subcommand_matches("add"));
+        let typed = |id: &str| {
+            add.and_then(|m| m.value_source(id)) == Some(clap::parser::ValueSource::CommandLine)
+        };
+        Typed {
+            token: typed("token"),
+            ssh_key: typed("ssh_key"),
+        }
+    }
+}
+
+/// Commands on `apprafter-core` convert their own errors at the arm boundary
+/// (`crate::render::core_error::report`); every other command goes through [`dispatch_cli`],
+/// mapped once. `typed` says which env-backed values of `target add` were typed.
+pub(crate) fn dispatch(args: Cli, typed: Typed) -> miette::Result<()> {
     match args.command {
-        Commands::Target { action } => commands::target::run(action)?,
-        Commands::Whoami { no_ping } => commands::whoami::run(no_ping)?,
+        Commands::Target { action } => match action {
+            TargetCommand::Add {
+                name,
+                provider,
+                token,
+                ssh_key,
+                region,
+                tier,
+                cluster_name,
+                force,
+                renew,
+                no_interactive,
+                no_ping,
+                server_type,
+            } => commands::target::add(commands::target::AddArgs {
+                name,
+                provider,
+                token,
+                ssh_key,
+                region,
+                tier,
+                cluster_name,
+                force,
+                renew,
+                no_interactive,
+                no_ping,
+                server_type,
+                typed,
+            }),
+            TargetCommand::List => commands::target::list(),
+            TargetCommand::Show { name } => commands::target::show(name.as_deref()),
+            TargetCommand::Use { name } => commands::target::use_target(&name),
+            TargetCommand::Rename { from, to } => commands::target::rename(&from, &to),
+            TargetCommand::Remove { name, yes } => commands::target::remove(&name, yes),
+            TargetCommand::Machine {
+                target,
+                server_type,
+                no_ping,
+            } => commands::target_machine::run_machine(commands::target_machine::MachineArgs {
+                target,
+                server_type,
+                no_ping,
+            }),
+            // `cert`, `domain`, `firewall` and `ip`.
+            other => commands::target::run(other),
+        },
+        Commands::Whoami { no_ping } => commands::whoami::run(no_ping),
+        Commands::Doctor { target, no_ping } => commands::doctor::run(target.as_deref(), no_ping),
+        command => dispatch_cli(Cli { command }).map_err(miette::Report::new),
+    }
+}
+
+/// The commands not on the core yet: pure dispatch over the parsed CLI, returning
+/// `cli_core::Result` so the inner code keeps the original `?` ergonomics over
+/// `cli_core::Result<T>` and the typed `CliError -> miette::Report` conversion happens once,
+/// in [`dispatch`].
+fn dispatch_cli(args: Cli) -> cli_core::Result<()> {
+    match args.command {
+        Commands::Target { .. } | Commands::Whoami { .. } | Commands::Doctor { .. } => {
+            unreachable!("`dispatch` runs `target`, `whoami` and `doctor` on the core")
+        }
         Commands::Auth { action } => commands::auth::run(action)?,
-        Commands::Doctor { target, no_ping } => commands::doctor::run(target.as_deref(), no_ping)?,
         Commands::Init {
             provider,
             tier,
@@ -42,15 +127,19 @@ pub(crate) fn dispatch(args: Cli) -> cli_core::Result<()> {
             dry_run,
             target,
         } => commands::import::run(force, dry_run, target.as_deref())?,
-        Commands::Kubeconfig { refresh, target } => {
-            commands::kubeconfig::run(refresh, target.as_deref())?
-        }
+        Commands::Kubeconfig {
+            refresh,
+            yes,
+            target,
+        } => commands::kubeconfig::run(refresh, yes, target.as_deref())?,
         // `None`: the standalone subcommand carries no `--target` flag,
         // so it runs against the active target. The parameter exists
         // for `bootstrap-all --target X`, which must not fall back to
         // the active pointer at phase 3 (finding C1).
         Commands::ClusterBootstrap => commands::cluster_bootstrap::run(None)?,
-        Commands::ArgocdPassword { refresh } => commands::argocd_password::run(refresh)?,
+        Commands::ArgocdPassword { refresh, target } => {
+            commands::argocd_password::run(refresh, target.as_deref())?
+        }
         Commands::BootstrapAll {
             target,
             dry_run,

@@ -13,44 +13,35 @@
 //! | yes         | Some(sku)       | Patch mode — save without API validation |
 //! | yes         | None            | Error — picker needs the API |
 //! | no          | Some(sku)       | Validate SKU via API, then save |
-//! | no          | None (TTY)      | Interactive picker (fetch + latency + pick_machine) |
+//! | no          | None (TTY)      | Interactive picker (fetch + latency + pick_machine), then validate and save |
 //! | no          | None (no TTY)   | Error — need `--server-type` in non-interactive |
 //!
 //! **Provisioned guard**: when the resolved target already has a live server
 //! (`state.hetzner_cloud` is `Some`), the command hard-refuses BEFORE writing
 //! anything. There is no in-place machine resize; the rebuild path is
-//! `apprafter backup create` + `apprafter restore --reprovision --server-type <sku>`.
+//! `backup create`, `destroy`, then `restore <repo> --reprovision --server-type <sku>`
+//! (`render::core_error::resize_recipe`).
+//!
+//! The work is apprafter-core's (`target::plan_machine` / `execute_machine`: the SKU check,
+//! then the store lock, a re-check, and a patch of the machine fields only). This module keeps
+//! the CLI's part: the legacy cwd migration, the flag matrix, the TTY picker and the output.
 
 use std::io::IsTerminal;
 
-use cli_core::target::{
-    default_config_root, load_target, save_target, TargetConfig, TargetStorePaths,
-};
+use apprafter_core::target::{MachineChoice, SkuCheck};
+use apprafter_core::{CancellationToken, CoreError, TargetRef};
 use cli_core::{CliError, Result};
-use cli_providers::hetzner_cloud::validate_server_type;
-use cli_providers::HetznerCloudClient;
 
-use crate::commands::hcloud::hcloud_base_url;
 use crate::commands::state_paths::resolve_state_paths;
+use crate::commands::target::{completed, require_loadable};
+use crate::render::core_error::report;
+use crate::render::reporter::CliReporter;
 
 /// Arguments extracted from the `TargetCommand::Machine` variant.
 pub struct MachineArgs {
     pub target: Option<String>,
     pub server_type: Option<String>,
     pub no_ping: bool,
-}
-
-/// Region assumed when the target has none recorded yet. Server-type
-/// availability is per-location on Hetzner, so validation needs *some* region.
-pub const DEFAULT_REGION: &str = "nbg1";
-
-/// Pure helper: returns `true` when the state indicates a server has been
-/// provisioned (i.e. `state.hetzner_cloud` is `Some`).
-///
-/// Used to gate `target machine` so it refuses on a live cluster rather than
-/// silently recording a preference that will never take effect without a rebuild.
-pub fn is_provisioned(state: &cli_state::State) -> bool {
-    state.hetzner_cloud.is_some()
 }
 
 /// The branch `run_machine` takes, decided before any IO happens.
@@ -77,38 +68,25 @@ pub(crate) fn decide_machine_action(
 ) -> Result<MachineAction> {
     match (no_ping, server_type) {
         (true, Some(sku)) => Ok(MachineAction::RecordUnvalidated(sku.to_string())),
-        (true, None) => Err(CliError::Other(
-            "`target machine` needs the provider API to show the picker — \
-             drop `--no-ping` or pass `--server-type <sku>`"
+        (true, None) => Err(CliError::UsageRefused {
+            message: "`target machine` needs the provider API to show the picker — \
+                      drop `--no-ping` or pass `--server-type <sku>`"
                 .to_string(),
-        )),
+            help: "The picker reads the provider's catalogue: drop `--no-ping`, or pass \
+                   `--server-type <sku>` to record a type without checking it."
+                .to_string(),
+        }),
         (false, Some(sku)) => Ok(MachineAction::ValidateThenRecord(sku.to_string())),
         (false, None) if interactive => Ok(MachineAction::Picker),
-        (false, None) => Err(CliError::Other(
-            "non-interactive shell: pass `--server-type <sku>` to set the machine type \
-             without the interactive picker"
+        (false, None) => Err(CliError::UsageRefused {
+            message: "non-interactive shell: pass `--server-type <sku>` to set the machine type \
+                      without the interactive picker"
                 .to_string(),
-        )),
+            help: "Pass `--server-type <sku>`, or run `apprafter target machine` in a terminal to \
+                   open the picker."
+                .to_string(),
+        }),
     }
-}
-
-/// Refusal shown when the target already runs a provisioned cluster.
-///
-/// There is no in-place resize, so the message has to hand the operator the
-/// whole rebuild recipe — a bare "not allowed" leaves them stuck.
-pub(crate) fn provisioned_refusal_message(target_name: &str) -> String {
-    format!(
-        "`{target_name}` already runs a provisioned cluster — its machine type cannot be \
-         changed in place. To move to a different machine, rebuild from a backup:\n\n    \
-         apprafter backup create\n    \
-         apprafter restore --reprovision --server-type <sku>\n\n\
-         (`target machine` only sets the type on a target that has NOT provisioned yet.)"
-    )
-}
-
-/// The region a SKU is validated against: the target's own, else the default.
-pub(crate) fn region_for_validation(current_region: Option<&str>) -> String {
-    current_region.unwrap_or(DEFAULT_REGION).to_string()
 }
 
 /// How the SKU that just got saved was arrived at. Drives the confirmation, so
@@ -138,254 +116,76 @@ pub(crate) fn saved_message(target_name: &str, sku: &str, via: SavedVia<'_>) -> 
     }
 }
 
-/// Everything `run_machine` needs from the outside world: the target record it
-/// patches, the provider catalogue it validates against, the picker, the
-/// confirmation prompt and stdout.
-///
-/// Inverting these lets the whole decision body ([`machine_core`]) run under a
-/// fake in tests, so the ordering guarantees that matter — refuse BEFORE any
-/// write, validate BEFORE any write, save BEFORE reporting success — are
-/// checked rather than assumed.
-pub(crate) trait MachineEnv {
-    /// Does this target already run a live server?
-    fn is_provisioned(&mut self) -> bool;
-    /// The target's current config.
-    fn config(&mut self) -> TargetConfig;
-    /// Record the machine choice — `sku`, and `region` when the picker
-    /// moved it — on the target as it is when this runs, not as
-    /// [`Self::config`] read it before the validation or the picker
-    /// ([`record_machine`]).
-    fn save(&mut self, sku: &str, region: Option<&str>) -> Result<()>;
-    /// Check the SKU exists in `region` per the provider catalogue.
-    fn validate_sku(&mut self, sku: &str, region: &str) -> Result<()>;
-    /// Run the interactive machine picker; returns `(region, sku)`.
-    fn pick_machine(&mut self) -> Result<(Option<String>, Option<String>)>;
-    /// Ask a yes/no question; `false` means the operator declined.
-    fn confirm(&mut self, prompt: &str) -> Result<bool>;
-    /// Emit one line to the operator.
-    fn report(&mut self, line: &str);
-}
-
-/// The whole `target machine` decision body, free of direct IO.
-///
-/// Behaviour is identical to the pre-extraction inline body; only the effects
-/// are routed through [`MachineEnv`].
-pub(crate) fn machine_core(
-    env: &mut dyn MachineEnv,
-    target_name: &str,
-    args: &MachineArgs,
-    interactive: bool,
-) -> Result<()> {
-    // ── Provisioned guard (before any write) ─────────────────────────────
-    // There is no in-place machine resize. Attempting to change the type on
-    // a running cluster would silently record a preference that apply() would
-    // shadow with the recorded-fact value. Hard-refuse and guide to the
-    // rebuild path instead.
-    if env.is_provisioned() {
-        return Err(CliError::Other(provisioned_refusal_message(target_name)));
+/// Run `apprafter target machine`: the legacy cwd migration (CLI-only), the provisioned refusal
+/// before the flag matrix (today's order), the picker on a TTY, then the core's plan and
+/// execute. A machine picked in the picker is validated again by `execute_machine` (one more
+/// `/v1/server_types` request, deviation 4).
+pub fn run_machine(args: MachineArgs) -> miette::Result<()> {
+    let resolved = resolve_state_paths(args.target.as_deref()).map_err(miette::Report::new)?;
+    let ctx = crate::context::cli_context()?.with_no_ping(args.no_ping);
+    let tref = TargetRef::named(&ctx, &resolved.target_name).map_err(report)?;
+    require_loadable(&ctx, tref.name())?;
+    if let Some(s) = apprafter_core::target::provisioned(&ctx, &tref).map_err(report)? {
+        return Err(report(CoreError::TargetProvisioned {
+            name: resolved.target_name.clone(),
+            server_id: s.server_id,
+            server_name: s.server_name,
+        }));
     }
-
-    let config = env.config();
-    match decide_machine_action(args.no_ping, args.server_type.as_deref(), interactive)? {
-        // (A) --no-ping + --server-type  → patch without validation
-        MachineAction::RecordUnvalidated(sku) => {
-            env.save(&sku, None)?;
-            env.report(&saved_message(target_name, &sku, SavedVia::Unvalidated));
-        }
-
-        // (C) --server-type without --no-ping → API-validate then patch
-        MachineAction::ValidateThenRecord(sku) => {
-            let current_region = region_for_validation(config.region.as_deref());
-            env.validate_sku(&sku, &current_region)?;
-            env.save(&sku, None)?;
-            env.report(&saved_message(
-                target_name,
-                &sku,
-                SavedVia::ValidatedForRegion(&current_region),
-            ));
-        }
-
-        // (D) Interactive (no --server-type, no --no-ping)
-        MachineAction::Picker => {
-            // Reuse the wizard's machine-matrix step verbatim: fetch
-            // catalog → measure latency → pick_machine.
-            let (region, sku) = env.pick_machine()?;
-            // picked_region and picked_sku are Some(_) because no-ping=false
-            // and prompt_machine only returns (None, None) in the no-ping branch.
-            let (picked_region, picked_sku) = normalize_picker_result(region, sku)?;
-
-            // Region-change confirm: only when a server is already provisioned
-            // AND the picked region differs from the target's current region.
-            // Note: the provisioned guard above already refused when a server
-            // exists, so `server_provisioned` is always false here in practice.
-            // The `needs_region_confirm` call is kept for symmetry / future
-            // use if this path ever runs after a destroy with the state wiped.
-            let server_provisioned = false; // guard above ensures no live server
-
-            if needs_region_confirm(config.region.as_deref(), &picked_region, server_provisioned)
-                && !env.confirm(&region_change_prompt(
-                    config.region.as_deref(),
-                    &picked_region,
-                ))?
-            {
-                env.report(&aborted_message(target_name));
-                return Ok(());
-            }
-
-            env.save(&picked_sku, Some(&picked_region))?;
-            env.report(&saved_message(
-                target_name,
-                &picked_sku,
-                SavedVia::Picked(&picked_region),
-            ));
-        }
-    }
-
-    Ok(())
-}
-
-/// The production [`MachineEnv`]: the real target store, the real Hetzner
-/// catalogue, the real `inquire` prompt and the real stdout.
-struct CliMachineEnv<'a> {
-    store: &'a TargetStorePaths,
-    /// The target's state, re-read by the save ([`record_machine`]).
-    state: &'a cli_state::StatePaths,
-    /// The target as read before anything else ran: what the decision
-    /// reads (its config, its provider). Never written back.
-    target: &'a cli_core::target::Target,
-    provisioned: bool,
-    target_name: &'a str,
-}
-
-impl MachineEnv for CliMachineEnv<'_> {
-    fn is_provisioned(&mut self) -> bool {
-        self.provisioned
-    }
-
-    fn config(&mut self) -> TargetConfig {
-        self.target.config.clone()
-    }
-
-    fn save(&mut self, sku: &str, region: Option<&str>) -> Result<()> {
-        record_machine(self.store, self.state, self.target_name, sku, region)
-    }
-
-    fn validate_sku(&mut self, sku: &str, region: &str) -> Result<()> {
-        let token = cli_core::resolve_hetzner_token(None, self.store, Some(self.target_name))?;
-        let client = HetznerCloudClient::new(hcloud_base_url(), &token);
-        let types = client.list_server_types()?.server_types;
-        validate_server_type(&types, sku, region)
-    }
-
-    fn pick_machine(&mut self) -> Result<(Option<String>, Option<String>)> {
-        let token = cli_core::resolve_hetzner_token(None, self.store, Some(self.target_name))?;
-        crate::commands::target_wizard::prompt_machine(
-            &self.target.config.provider,
-            &token,
-            None, // no prefill region — let the user pick
-            None, // no prefill sku
-            false,
-        )
-    }
-
-    fn confirm(&mut self, prompt: &str) -> Result<bool> {
-        inquire::Confirm::new(prompt)
-            .with_default(false)
-            .prompt()
-            .map_err(map_confirm_error)
-    }
-
-    fn report(&mut self, line: &str) {
-        println!("{line}");
-    }
-}
-
-/// Run `apprafter target machine`.
-pub fn run_machine(args: MachineArgs) -> Result<()> {
-    // We need both the TargetStorePaths (for the target store) and the
-    // State (for the provisioned-server check). Re-use resolve_state_paths
-    // to get the state, but we also need the raw target record to patch it.
-    let resolved = resolve_state_paths(args.target.as_deref())?;
-    let store = TargetStorePaths::for_root(default_config_root()?);
-    // Read without the store lock: the validation and the picker below can
-    // take as long as the network, or the operator, does. The save takes the
-    // lock and re-reads ([`record_machine`]).
-    let target = load_target(&store, &resolved.target_name)?;
-    let state = cli_state::State::load_or_default(&resolved.paths)?;
     let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-
-    let mut env = CliMachineEnv {
-        store: &store,
-        state: &resolved.paths,
-        provisioned: is_provisioned(&state),
-        target_name: &resolved.target_name,
-        target: &target,
+    let (choice, picked) =
+        match decide_machine_action(args.no_ping, args.server_type.as_deref(), interactive)
+            .map_err(miette::Report::new)?
+        {
+            MachineAction::RecordUnvalidated(sku) | MachineAction::ValidateThenRecord(sku) => {
+                (MachineChoice { sku, region: None }, false)
+            }
+            MachineAction::Picker => {
+                let token = apprafter_core::target::hetzner_token(&ctx, &tref).map_err(report)?;
+                let provider = cli_core::target::load_target_config(&ctx.store(), tref.name())
+                    .map_err(miette::Report::new)?
+                    .provider;
+                // No prefill: the operator picks both. `report`, never `Report::new`: a picker
+                // failure keeps the CLI's help (overview §3.6.4).
+                let (region, sku) = crate::commands::target_wizard::prompt_machine(
+                    &ctx, &provider, &token, None, None, false,
+                )
+                .map_err(report)?;
+                let (region, sku) =
+                    normalize_picker_result(region, sku).map_err(miette::Report::new)?;
+                (
+                    MachineChoice {
+                        sku,
+                        region: Some(region),
+                    },
+                    true,
+                )
+            }
+        };
+    let plan = apprafter_core::target::plan_machine(&ctx, &tref, choice).map_err(report)?;
+    let set = completed(
+        apprafter_core::target::execute_machine(
+            &ctx,
+            plan,
+            &CliReporter,
+            &CancellationToken::new(),
+        )
+        .map_err(report)?,
+    )?;
+    let via = match (&set.sku_check, &set.region) {
+        (_, Some(r)) if picked => SavedVia::Picked(r),
+        (SkuCheck::Validated { region, .. }, _) => SavedVia::ValidatedForRegion(region),
+        (SkuCheck::NotValidated { .. }, _) => SavedVia::Unvalidated,
     };
-    machine_core(&mut env, &resolved.target_name, &args, interactive)
-}
-
-/// Record `sku` — and `region`, when the picker moved it — on target
-/// `name`, under the store lock. The target and its state are read again
-/// there, and what [`machine_core`] checked before its validation or picker
-/// ran is checked again (the target still exists, and has still not
-/// provisioned), because either can change while the operator picks. Only
-/// the machine fields of the target as it is now change: writing back the
-/// copy read before the picker would undo an edit made meanwhile, such as a
-/// `target add --renew` rotating its token.
-pub(crate) fn record_machine(
-    store: &TargetStorePaths,
-    state: &cli_state::StatePaths,
-    name: &str,
-    sku: &str,
-    region: Option<&str>,
-) -> Result<()> {
-    let _store_lock = crate::commands::target::store_lock_if_present(store)?;
-    let mut target = load_target(store, name)?;
-    if is_provisioned(&cli_state::State::load_or_default(state)?) {
-        return Err(CliError::Other(provisioned_refusal_message(name)));
-    }
-    target.config = with_machine(target.config, sku, region);
-    save_target(store, &target)
-}
-
-/// Whether picking a new region needs a confirmation prompt.
-///
-/// Only returns `true` when:
-/// - A server is already provisioned (`server_provisioned == true`), AND
-/// - A current region is known AND it differs from the newly-picked region.
-///
-/// Rationale: the running server stays in the old region after a
-/// metadata-only patch; the user needs to understand that before we save.
-pub fn needs_region_confirm(
-    current_region: Option<&str>,
-    picked_region: &str,
-    server_provisioned: bool,
-) -> bool {
-    server_provisioned && current_region.is_some_and(|c| c != picked_region)
-}
-
-/// Record a machine choice on a target's config.
-///
-/// `region` is `Some` only for the picker (which also moves the region);
-/// the SKU-flag paths pass `None` so an existing region is preserved rather
-/// than blanked. Everything else on the config is carried through untouched.
-pub(crate) fn with_machine(
-    mut config: TargetConfig,
-    sku: &str,
-    region: Option<&str>,
-) -> TargetConfig {
-    config.server_type = Some(sku.to_string());
-    if let Some(r) = region {
-        config.region = Some(r.to_string());
-    }
-    config
+    println!("{}", saved_message(&resolved.target_name, &set.sku, via));
+    Ok(())
 }
 
 /// Normalise what the picker handed back.
 ///
 /// A missing SKU is a hard error: silently substituting a default would
 /// provision a machine the operator never chose. A missing region falls back to
-/// [`DEFAULT_REGION`], which is what the picker itself defaults to.
+/// [`apprafter_core::machine::DEFAULT_REGION`], which is what the picker itself defaults to.
 pub(crate) fn normalize_picker_result(
     picked_region: Option<String>,
     picked_sku: Option<String>,
@@ -394,118 +194,18 @@ pub(crate) fn normalize_picker_result(
         CliError::Other("machine picker did not return a server type — please retry".to_string())
     })?;
     Ok((
-        picked_region.unwrap_or_else(|| DEFAULT_REGION.to_string()),
+        picked_region.unwrap_or_else(|| apprafter_core::machine::DEFAULT_REGION.to_string()),
         sku,
     ))
 }
 
-/// Translate an `inquire` prompt failure.
-///
-/// A Ctrl-C / Esc is a deliberate abort and must read like one; anything else
-/// is a genuine terminal problem and keeps its underlying detail.
-pub(crate) fn map_confirm_error(err: inquire::InquireError) -> CliError {
-    match err {
-        inquire::InquireError::OperationCanceled | inquire::InquireError::OperationInterrupted => {
-            CliError::Other("aborted by user".to_string())
-        }
-        other => CliError::Other(format!("confirmation prompt failed: {other}")),
-    }
-}
-
-/// Message for a declined region-change confirmation. It must state that
-/// NOTHING was written — the operator declined mid-command.
-pub(crate) fn aborted_message(target_name: &str) -> String {
-    format!("aborted; target `{target_name}` left intact")
-}
-
-/// The region-change confirmation text.
-///
-/// It has to spell out that the RUNNING server does not move — the whole risk
-/// of saying yes is that the metadata and the live machine end up in different
-/// locations until a re-provision.
-pub(crate) fn region_change_prompt(current_region: Option<&str>, picked_region: &str) -> String {
-    let old_region = current_region.unwrap_or("(unset)");
-    format!(
-        "This also changes the region `{old_region}` → `{picked_region}`; \
-         the running server stays in `{old_region}` until you re-provision. \
-         Continue?"
-    )
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{is_provisioned, needs_region_confirm};
-    use cli_state::{HetznerCloudState, State};
-
-    // ── is_provisioned ───────────────────────────────────────────────────
-
-    fn state_with_server() -> State {
-        State {
-            hetzner_cloud: Some(HetznerCloudState {
-                server_id: 42,
-                server_name: "platform-1".into(),
-                server_type: Some("cx22".into()),
-                ssh_key_ids: vec![],
-                network_id: None,
-                firewall_id: None,
-                floating_ip_ids: vec![],
-                kubeconfig_yaml: None,
-                kubeconfig_age: None,
-                argocd_admin_password_age: None,
-            }),
-            ..State::default()
-        }
-    }
-
-    fn state_without_server() -> State {
-        State::default()
-    }
-
-    #[test]
-    fn is_provisioned_returns_true_when_hetzner_cloud_present() {
-        assert!(is_provisioned(&state_with_server()));
-    }
-
-    #[test]
-    fn is_provisioned_returns_false_when_hetzner_cloud_absent() {
-        assert!(!is_provisioned(&state_without_server()));
-    }
-
-    // ── needs_region_confirm ─────────────────────────────────────────────
-
-    #[test]
-    fn provisioned_different_region_needs_confirm() {
-        assert!(needs_region_confirm(Some("nbg1"), "hel1", true));
-    }
-
-    #[test]
-    fn provisioned_same_region_no_confirm() {
-        assert!(!needs_region_confirm(Some("nbg1"), "nbg1", true));
-    }
-
-    #[test]
-    fn not_provisioned_different_region_no_confirm() {
-        assert!(!needs_region_confirm(Some("nbg1"), "hel1", false));
-    }
-
-    #[test]
-    fn no_current_region_no_confirm() {
-        // When the target has no region set yet, no confirmation is needed
-        // regardless of what the picker chose or whether a server is running.
-        assert!(!needs_region_confirm(None, "hel1", true));
-        assert!(!needs_region_confirm(None, "nbg1", false));
-    }
+    use super::{
+        decide_machine_action, normalize_picker_result, saved_message, MachineAction, SavedVia,
+    };
 
     // ── decide_machine_action ────────────────────────────────────────────
-
-    use super::{
-        aborted_message, decide_machine_action, machine_core, map_confirm_error,
-        normalize_picker_result, provisioned_refusal_message, region_change_prompt,
-        region_for_validation, saved_message, with_machine, MachineAction, MachineArgs, MachineEnv,
-        SavedVia, DEFAULT_REGION,
-    };
-    use cli_core::target::TargetConfig;
-    use cli_core::{CliError, Result};
 
     /// `--no-ping --server-type` is the ONLY combination that may write a SKU
     /// without asking the API. If any other row of the matrix landed here, a
@@ -561,6 +261,17 @@ mod tests {
         let msg = format!("{no_tty}");
         assert!(msg.contains("non-interactive"), "{msg}");
         assert!(msg.contains("--server-type"), "{msg}");
+
+        // Bug 2: a usage refusal with its own code and a way forward, never the catch-all.
+        for err in [no_api, no_tty] {
+            let code = miette::Diagnostic::code(&err).map(|c| c.to_string());
+            assert_eq!(code.as_deref(), Some("apprafter::cli::usage_refused"));
+            let help = miette::Diagnostic::help(&err)
+                .map(|h| h.to_string())
+                .unwrap_or_default();
+            assert!(help.contains("--server-type <sku>"), "{help}");
+            crate::commands::target::assert_commands_parse(&help);
+        }
     }
 
     /// `--no-ping` on a non-TTY still records rather than tripping the
@@ -570,32 +281,6 @@ mod tests {
     fn a_non_tty_shell_is_not_refused_when_a_sku_is_supplied() {
         assert!(decide_machine_action(true, Some("cx32"), false).is_ok());
         assert!(decide_machine_action(false, Some("cx32"), false).is_ok());
-    }
-
-    // ── region_for_validation ────────────────────────────────────────────
-
-    #[test]
-    fn validation_uses_the_targets_region_and_falls_back_to_the_default() {
-        assert_eq!(region_for_validation(Some("hel1")), "hel1");
-        assert_eq!(region_for_validation(None), DEFAULT_REGION);
-        assert_eq!(DEFAULT_REGION, "nbg1");
-    }
-
-    // ── provisioned_refusal_message ──────────────────────────────────────
-
-    /// The refusal is the operator's only pointer to the rebuild path; it has
-    /// to carry both commands, in order, plus the name it refused.
-    #[test]
-    fn the_provisioned_refusal_hands_over_the_whole_rebuild_recipe() {
-        let m = provisioned_refusal_message("prod-eu");
-        assert!(m.contains("prod-eu"), "{m}");
-        let backup = m
-            .find("apprafter backup create")
-            .expect("names the backup step");
-        let restore = m
-            .find("apprafter restore --reprovision --server-type")
-            .expect("names the reprovision step");
-        assert!(backup < restore, "the steps must be listed in order: {m}");
     }
 
     // ── saved_message ────────────────────────────────────────────────────
@@ -626,48 +311,6 @@ mod tests {
         assert!(picked.contains("work"), "{picked}");
     }
 
-    // ── with_machine ─────────────────────────────────────────────────────
-
-    /// The SKU-flag paths pass `region: None` and must LEAVE the recorded
-    /// region alone — blanking it there would silently move the next
-    /// provision to the default location.
-    #[test]
-    fn recording_a_sku_alone_preserves_the_region_and_the_rest_of_the_config() {
-        let before = TargetConfig {
-            provider: "hetzner-cloud".to_string(),
-            region: Some("hel1".to_string()),
-            server_type: Some("cx22".to_string()),
-            cluster_name: Some("platform-7".to_string()),
-            ..TargetConfig::default()
-        };
-        let after = with_machine(before.clone(), "cx42", None);
-        assert_eq!(after.server_type.as_deref(), Some("cx42"));
-        assert_eq!(after.region.as_deref(), Some("hel1"));
-        assert_eq!(
-            TargetConfig {
-                server_type: before.server_type.clone(),
-                ..after
-            },
-            before,
-            "only `server_type` may change when no region is supplied"
-        );
-    }
-
-    /// The picker path supplies a region and must move BOTH fields together —
-    /// a SKU saved without its region would be validated against the wrong
-    /// location on the next run.
-    #[test]
-    fn the_picker_path_moves_the_server_type_and_the_region_together() {
-        let before = TargetConfig {
-            region: Some("hel1".to_string()),
-            server_type: Some("cx22".to_string()),
-            ..TargetConfig::default()
-        };
-        let after = with_machine(before, "cx42", Some("fsn1"));
-        assert_eq!(after.server_type.as_deref(), Some("cx42"));
-        assert_eq!(after.region.as_deref(), Some("fsn1"));
-    }
-
     // ── normalize_picker_result ──────────────────────────────────────────
 
     /// A picker that returned no SKU is a bug, not a default: substituting one
@@ -684,478 +327,10 @@ mod tests {
     fn a_picked_sku_without_a_region_falls_back_to_the_default_region() {
         let (region, sku) = normalize_picker_result(None, Some("cx42".to_string())).unwrap();
         assert_eq!(sku, "cx42");
-        assert_eq!(region, DEFAULT_REGION);
+        assert_eq!(region, apprafter_core::machine::DEFAULT_REGION);
 
         let (region, sku) =
             normalize_picker_result(Some("fsn1".to_string()), Some("cx42".to_string())).unwrap();
         assert_eq!((region.as_str(), sku.as_str()), ("fsn1", "cx42"));
-    }
-
-    // ── map_confirm_error ────────────────────────────────────────────────
-
-    /// Ctrl-C / Esc is a deliberate abort and must read as one. Rendering it
-    /// as "confirmation prompt failed" sends operators debugging a terminal
-    /// problem that does not exist.
-    #[test]
-    fn a_cancelled_prompt_reads_as_an_abort_not_a_failure() {
-        for cancel in [
-            inquire::InquireError::OperationCanceled,
-            inquire::InquireError::OperationInterrupted,
-        ] {
-            let msg = format!("{}", map_confirm_error(cancel));
-            assert_eq!(msg, "aborted by user");
-        }
-    }
-
-    /// A real terminal failure keeps its underlying detail — that is the only
-    /// clue the operator gets about what actually broke.
-    #[test]
-    fn a_genuine_prompt_failure_keeps_its_cause() {
-        let err = map_confirm_error(inquire::InquireError::InvalidConfiguration(
-            "no tty".to_string(),
-        ));
-        let msg = format!("{err}");
-        assert!(msg.contains("confirmation prompt failed"), "{msg}");
-        assert!(msg.contains("no tty"), "{msg}");
-    }
-
-    // ── aborted_message ──────────────────────────────────────────────────
-
-    /// Declining the confirmation must state that nothing was written; a bare
-    /// "aborted" leaves the operator unsure whether the target got half-saved.
-    #[test]
-    fn declining_says_the_target_was_left_intact() {
-        let m = aborted_message("prod-eu");
-        assert!(m.contains("prod-eu"), "{m}");
-        assert!(m.contains("left intact"), "{m}");
-    }
-
-    // ── machine_core (against a recording fake env) ──────────────────────
-
-    /// Records every effect `machine_core` asks for, in order, so tests can
-    /// assert on the SEQUENCE (guard → validate → save → report) and not just
-    /// on the final state.
-    #[derive(Default)]
-    struct FakeEnv {
-        provisioned: bool,
-        config: TargetConfig,
-        picker: Option<(Option<String>, Option<String>)>,
-        picker_error: bool,
-        confirm_answer: bool,
-        validate_rejects: bool,
-        /// Ordered effect log: "validate:<sku>@<region>", "save:<sku>@<region>",
-        /// "confirm", "pick", "report:<line>".
-        log: Vec<String>,
-    }
-
-    impl FakeEnv {
-        fn saved(&self) -> Option<&String> {
-            self.log.iter().find(|l| l.starts_with("save:"))
-        }
-        fn reports(&self) -> Vec<&str> {
-            self.log
-                .iter()
-                .filter_map(|l| l.strip_prefix("report:"))
-                .collect()
-        }
-        fn steps(&self) -> Vec<&str> {
-            self.log
-                .iter()
-                .map(|l| l.split(':').next().unwrap_or_default())
-                .collect()
-        }
-    }
-
-    impl MachineEnv for FakeEnv {
-        fn is_provisioned(&mut self) -> bool {
-            self.log.push("provisioned?".to_string());
-            self.provisioned
-        }
-        fn config(&mut self) -> TargetConfig {
-            self.config.clone()
-        }
-        fn save(&mut self, sku: &str, region: Option<&str>) -> Result<()> {
-            let config = with_machine(self.config.clone(), sku, region);
-            self.log.push(format!(
-                "save:{}@{}",
-                config.server_type.as_deref().unwrap_or("-"),
-                config.region.as_deref().unwrap_or("-")
-            ));
-            self.config = config;
-            Ok(())
-        }
-        fn validate_sku(&mut self, sku: &str, region: &str) -> Result<()> {
-            self.log.push(format!("validate:{sku}@{region}"));
-            if self.validate_rejects {
-                return Err(CliError::Other(format!("unknown server type `{sku}`")));
-            }
-            Ok(())
-        }
-        fn pick_machine(&mut self) -> Result<(Option<String>, Option<String>)> {
-            self.log.push("pick".to_string());
-            if self.picker_error {
-                return Err(CliError::Other("picker exploded".to_string()));
-            }
-            Ok(self.picker.clone().unwrap_or((None, None)))
-        }
-        fn confirm(&mut self, prompt: &str) -> Result<bool> {
-            self.log.push(format!("confirm:{prompt}"));
-            Ok(self.confirm_answer)
-        }
-        fn report(&mut self, line: &str) {
-            self.log.push(format!("report:{line}"));
-        }
-    }
-
-    fn args(no_ping: bool, server_type: Option<&str>) -> MachineArgs {
-        MachineArgs {
-            target: None,
-            server_type: server_type.map(str::to_string),
-            no_ping,
-        }
-    }
-
-    /// The provisioned guard has to fire BEFORE anything is written. A refusal
-    /// that still saved would leave the target claiming a machine type its
-    /// live server does not have.
-    #[test]
-    fn a_provisioned_target_is_refused_without_a_single_write() {
-        let mut env = FakeEnv {
-            provisioned: true,
-            ..FakeEnv::default()
-        };
-        let err = machine_core(&mut env, "prod-eu", &args(true, Some("cx42")), false)
-            .expect_err("a provisioned target must be refused");
-        let msg = format!("{err}");
-        assert!(msg.contains("prod-eu"), "{msg}");
-        assert!(msg.contains("apprafter restore --reprovision"), "{msg}");
-        assert_eq!(env.saved(), None, "nothing may be written: {:?}", env.log);
-        assert!(env.reports().is_empty(), "{:?}", env.log);
-    }
-
-    /// `--no-ping` must reach `save` without ever consulting the catalogue —
-    /// that is the entire point of the flag (CI / offline setups).
-    #[test]
-    fn the_no_ping_path_saves_without_touching_the_catalogue() {
-        let mut env = FakeEnv {
-            config: TargetConfig {
-                region: Some("hel1".to_string()),
-                ..TargetConfig::default()
-            },
-            ..FakeEnv::default()
-        };
-        machine_core(&mut env, "work", &args(true, Some("cx42")), false).unwrap();
-        assert_eq!(env.saved().map(String::as_str), Some("save:cx42@hel1"));
-        assert!(
-            !env.steps().contains(&"validate"),
-            "--no-ping must not validate: {:?}",
-            env.log
-        );
-    }
-
-    /// Validation happens BEFORE the write, and a rejected SKU leaves the
-    /// target untouched — otherwise a typo'd SKU would be persisted and only
-    /// blow up at the next `apply`.
-    #[test]
-    fn a_rejected_sku_is_never_written() {
-        let mut env = FakeEnv {
-            validate_rejects: true,
-            config: TargetConfig {
-                region: Some("hel1".to_string()),
-                server_type: Some("cx22".to_string()),
-                ..TargetConfig::default()
-            },
-            ..FakeEnv::default()
-        };
-        let err = machine_core(&mut env, "work", &args(false, Some("nope99")), false)
-            .expect_err("an unknown SKU must abort");
-        assert!(format!("{err}").contains("nope99"), "{err}");
-        assert_eq!(env.saved(), None, "{:?}", env.log);
-        assert_eq!(
-            env.config.server_type.as_deref(),
-            Some("cx22"),
-            "the previous server type must survive a failed validation"
-        );
-    }
-
-    /// The catalogue is consulted for the target's OWN region, then the write
-    /// lands, then the confirmation prints — in that order.
-    #[test]
-    fn validation_precedes_the_write_and_uses_the_targets_region() {
-        let mut env = FakeEnv {
-            config: TargetConfig {
-                region: Some("hel1".to_string()),
-                ..TargetConfig::default()
-            },
-            ..FakeEnv::default()
-        };
-        machine_core(&mut env, "work", &args(false, Some("cx42")), false).unwrap();
-        assert_eq!(
-            env.steps(),
-            vec!["provisioned?", "validate", "save", "report"],
-            "{:?}",
-            env.log
-        );
-        assert!(
-            env.log.contains(&"validate:cx42@hel1".to_string()),
-            "{:?}",
-            env.log
-        );
-    }
-
-    /// A target with no region yet still gets validated — against the default
-    /// location rather than an empty string the API would reject.
-    #[test]
-    fn a_target_without_a_region_validates_against_the_default_region() {
-        let mut env = FakeEnv::default();
-        machine_core(&mut env, "work", &args(false, Some("cx42")), false).unwrap();
-        assert!(
-            env.log.contains(&format!("validate:cx42@{DEFAULT_REGION}")),
-            "{:?}",
-            env.log
-        );
-    }
-
-    /// The picker writes both fields and reports the region it moved.
-    #[test]
-    fn the_picker_path_saves_the_picked_pair() {
-        let mut env = FakeEnv {
-            picker: Some((Some("fsn1".to_string()), Some("cx42".to_string()))),
-            ..FakeEnv::default()
-        };
-        machine_core(&mut env, "work", &args(false, None), true).unwrap();
-        assert_eq!(env.saved().map(String::as_str), Some("save:cx42@fsn1"));
-        let reported = env.reports().join(" ");
-        assert!(
-            reported.contains("cx42") && reported.contains("fsn1"),
-            "{reported}"
-        );
-    }
-
-    /// A picker that returns no SKU must abort before writing rather than
-    /// saving a default machine the operator never chose.
-    #[test]
-    fn a_picker_with_no_sku_aborts_before_writing() {
-        let mut env = FakeEnv {
-            picker: Some((Some("fsn1".to_string()), None)),
-            ..FakeEnv::default()
-        };
-        machine_core(&mut env, "work", &args(false, None), true)
-            .expect_err("a SKU-less pick must not be saved");
-        assert_eq!(env.saved(), None, "{:?}", env.log);
-    }
-
-    /// A refusal from the matrix must not reach any effect at all — in
-    /// particular it must not open the picker on a non-TTY.
-    #[test]
-    fn a_non_interactive_shell_never_reaches_the_picker() {
-        let mut env = FakeEnv::default();
-        machine_core(&mut env, "work", &args(false, None), false)
-            .expect_err("a non-interactive shell must be refused");
-        assert_eq!(env.steps(), vec!["provisioned?"], "{:?}", env.log);
-    }
-
-    // ── region_change_prompt ─────────────────────────────────────────────
-
-    /// The prompt has to name BOTH regions and warn that the live server does
-    /// not move — that consequence is the entire reason to ask.
-    #[test]
-    fn the_region_change_prompt_warns_the_server_does_not_move() {
-        let p = region_change_prompt(Some("nbg1"), "hel1");
-        assert!(p.contains("nbg1"), "{p}");
-        assert!(p.contains("hel1"), "{p}");
-        assert!(p.contains("stays in"), "{p}");
-
-        // No region recorded yet — the placeholder must not render an empty
-        // pair of backticks that reads like a corrupted config.
-        let unset = region_change_prompt(None, "hel1");
-        assert!(unset.contains("(unset)"), "{unset}");
-    }
-}
-
-/// The save under the store lock, against a real target store on disk:
-/// whatever changes between `machine_core`'s decision and its save — a
-/// concurrent `target add --renew`, a provision, a removal — the save sees.
-#[cfg(test)]
-mod locked_save_tests {
-    use super::{
-        machine_core, provisioned_refusal_message, CliMachineEnv, MachineArgs, MachineEnv,
-    };
-    use cli_core::target::{
-        load_target, remove_target, save_target, Target, TargetConfig, TargetCredentials,
-        TargetStorePaths,
-    };
-    use cli_core::{CliError, Result};
-    use cli_state::{HetznerCloudState, State, StatePaths};
-
-    const OLD_TOKEN: &str = "old-token";
-    const RENEWED_TOKEN: &str = "renewed-token";
-
-    struct Sandbox {
-        _dir: tempfile::TempDir,
-        store: TargetStorePaths,
-        state: StatePaths,
-    }
-
-    /// A store holding target `work` (region `hel1`, token [`OLD_TOKEN`]),
-    /// and its state, not provisioned.
-    fn sandbox() -> Sandbox {
-        let dir = tempfile::tempdir().unwrap();
-        let store = TargetStorePaths::for_root(dir.path().join("store"));
-        let state = StatePaths::for_root(&dir.path().join("state"));
-        save_target(
-            &store,
-            &Target {
-                name: "work".to_string(),
-                config: TargetConfig {
-                    provider: "hetzner-cloud".to_string(),
-                    region: Some("hel1".to_string()),
-                    ..TargetConfig::default()
-                },
-                credentials: TargetCredentials {
-                    hetzner_token: Some(OLD_TOKEN.to_string()),
-                },
-            },
-        )
-        .unwrap();
-        Sandbox {
-            _dir: dir,
-            store,
-            state,
-        }
-    }
-
-    /// The production env for everything `machine_core` writes and reads
-    /// back — `config`, `is_provisioned`, `save` — with the two slow steps
-    /// (the catalogue check and the picker) replaced by `meanwhile`: what
-    /// another process does to the store while they run.
-    struct Concurrent<'a> {
-        inner: CliMachineEnv<'a>,
-        meanwhile: Box<dyn FnMut() + 'a>,
-    }
-
-    impl MachineEnv for Concurrent<'_> {
-        fn is_provisioned(&mut self) -> bool {
-            self.inner.is_provisioned()
-        }
-        fn config(&mut self) -> TargetConfig {
-            self.inner.config()
-        }
-        fn save(&mut self, sku: &str, region: Option<&str>) -> Result<()> {
-            self.inner.save(sku, region)
-        }
-        fn validate_sku(&mut self, _sku: &str, _region: &str) -> Result<()> {
-            (self.meanwhile)();
-            Ok(())
-        }
-        fn pick_machine(&mut self) -> Result<(Option<String>, Option<String>)> {
-            (self.meanwhile)();
-            Ok((Some("fsn1".to_string()), Some("cx42".to_string())))
-        }
-        fn confirm(&mut self, _prompt: &str) -> Result<bool> {
-            Ok(true)
-        }
-        fn report(&mut self, _line: &str) {}
-    }
-
-    /// Run `target machine work` with `server_type` (else the picker), the
-    /// way `run_machine` does — the target and its state read first, without
-    /// the lock — and `meanwhile` run in place of the validation or picker.
-    fn run<'a>(
-        sb: &'a Sandbox,
-        server_type: Option<&str>,
-        meanwhile: impl FnMut() + 'a,
-    ) -> Result<()> {
-        let target = load_target(&sb.store, "work").unwrap();
-        let provisioned = super::is_provisioned(&State::load_or_default(&sb.state).unwrap());
-        let mut env = Concurrent {
-            inner: CliMachineEnv {
-                store: &sb.store,
-                state: &sb.state,
-                target: &target,
-                provisioned,
-                target_name: "work",
-            },
-            meanwhile: Box::new(meanwhile),
-        };
-        let args = MachineArgs {
-            target: None,
-            server_type: server_type.map(str::to_string),
-            no_ping: false,
-        };
-        machine_core(&mut env, "work", &args, server_type.is_none())
-    }
-
-    /// What `target add work --renew` writes.
-    fn renew(store: &TargetStorePaths) {
-        let mut target = load_target(store, "work").unwrap();
-        target.credentials.hetzner_token = Some(RENEWED_TOKEN.to_string());
-        save_target(store, &target).unwrap();
-    }
-
-    /// The defect the re-read fixes: the target read before the picker was
-    /// written back whole, credentials included, so a token rotated while
-    /// the operator picked was silently rotated back.
-    #[test]
-    fn a_token_renewed_while_the_machine_was_chosen_survives_the_save() {
-        for server_type in [Some("cx32"), None] {
-            let sb = sandbox();
-            run(&sb, server_type, || renew(&sb.store)).unwrap();
-            let saved = load_target(&sb.store, "work").unwrap();
-            assert_eq!(
-                saved.credentials.hetzner_token.as_deref(),
-                Some(RENEWED_TOKEN),
-                "{server_type:?}: the renewed token was written over"
-            );
-            let (sku, region) = match server_type {
-                Some(sku) => (sku, "hel1"),
-                None => ("cx42", "fsn1"),
-            };
-            assert_eq!(saved.config.server_type.as_deref(), Some(sku));
-            assert_eq!(saved.config.region.as_deref(), Some(region));
-        }
-    }
-
-    /// Provisioned while the machine was chosen: the save refuses as the
-    /// first check would have, and writes nothing.
-    #[test]
-    fn a_target_provisioned_meanwhile_is_refused_at_the_save() {
-        let sb = sandbox();
-        let err = run(&sb, Some("cx32"), || {
-            State {
-                hetzner_cloud: Some(HetznerCloudState {
-                    server_id: 1,
-                    server_name: "platform-1".to_string(),
-                    server_type: Some("cx22".to_string()),
-                    ssh_key_ids: vec![],
-                    network_id: None,
-                    firewall_id: None,
-                    floating_ip_ids: vec![],
-                    kubeconfig_yaml: None,
-                    kubeconfig_age: None,
-                    argocd_admin_password_age: None,
-                }),
-                ..State::default()
-            }
-            .save(&sb.state)
-            .unwrap();
-        })
-        .expect_err("a provisioned target is refused");
-        assert_eq!(err.to_string(), provisioned_refusal_message("work"));
-        let saved = load_target(&sb.store, "work").unwrap();
-        assert_eq!(saved.config.server_type, None, "nothing was written");
-    }
-
-    /// Removed while the machine was chosen: the save does not bring it
-    /// back as a target holding nothing but a machine type.
-    #[test]
-    fn a_target_removed_meanwhile_is_not_recreated_by_the_save() {
-        let sb = sandbox();
-        let err = run(&sb, Some("cx32"), || {
-            remove_target(&sb.store, "work").unwrap()
-        })
-        .expect_err("a removed target is refused");
-        assert!(matches!(err, CliError::TargetNotFound { .. }), "{err:?}");
-        assert!(!sb.store.target_dir("work").exists());
     }
 }

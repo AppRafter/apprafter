@@ -1,0 +1,15 @@
+$ apprafter whoami --no-ping
+[exit 0]
+[stdout]
+Identity:     anonymous (self-hosted mode)
+Target:       prod (active)
+Provider:     hetzner-cloud (verification skipped — --no-ping)
+Region:       nbg1
+Server type:  not set
+Default tier: solo
+Cluster name: not set
+SSH key:      ~/id_ed25519.pub (missing!)
+
+Run `apprafter target show` for the full target config; `apprafter target list` for all configured targets.
+[stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m whoami invoked <ESC>[3mno_ping<ESC>[0m<ESC>[2m=<ESC>[0mtrue

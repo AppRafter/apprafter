@@ -1,0 +1,166 @@
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
+// The toolchain (spec §5.1: tool_not_found / cue_not_found lead here; Settings › About opens it):
+// each tool the app runs, what the probe found and where, and for one that is missing or broken
+// the install lines for this OS. The probe is a plain command, each tool bounded by the core's
+// TOOL_PROBE_TIMEOUT (R14). A command or an install page's address has a Copy button (the
+// clipboard is write-only); a note ("preinstalled") has none. An install page also opens in the
+// browser through the opener, whose capability allows exactly the pages the core's tool specs
+// name; never as an <a href>, which would navigate the webview itself.
+import { useQuery } from '@tanstack/react-query';
+import { Button } from '../../components/Button';
+import { ErrorPanel } from '../../components/ErrorPanel';
+import { IconButton } from '../../components/IconButton';
+import {
+  ArrowSquareOutIcon,
+  ArrowsClockwiseIcon,
+  CopyIcon,
+  SpinnerGapIcon,
+  WarningCircleIcon,
+} from '../../components/icons';
+import { Modal } from '../../components/Modal';
+import { StatePanel } from '../../components/StatePanel';
+import { Tag } from '../../components/Tag';
+import { useToast } from '../../components/Toast';
+import * as api from '../../ipc/api';
+import { uiErrorOf } from '../../ipc/api';
+import type { InstallHint } from '../../ipc/generated/InstallHint';
+import type { ToolStatus } from '../../ipc/generated/ToolStatus';
+import { openInstallPage } from '../../shell/links';
+import { useCopy } from '../../state/copy';
+import { usePlatform } from '../../state/platform';
+import {
+  copyable,
+  HINT_LABELS,
+  hintKind,
+  hintsFor,
+  pathSourceLine,
+  toolStateLine,
+} from './toolchain';
+
+/** One install line: its OS, then the command or address in mono with Copy, or a note to read. */
+function HintLine({ hint }: { hint: InstallHint }) {
+  const copy = useCopy();
+  const toast = useToast();
+  const kind = hintKind(hint.command);
+  return (
+    <div className="tool-hint" data-kind={kind}>
+      <span className="tool-hint-os">{HINT_LABELS[hint.os]}</span>
+      {kind === 'note' ? <span>{hint.command}</span> : <code>{hint.command}</code>}
+      <span className="tool-hint-actions">
+        {kind === 'link' && (
+          <IconButton
+            label={`Open ${hint.command}`}
+            icon={ArrowSquareOutIcon}
+            size={22}
+            onClick={() => {
+              openInstallPage(hint.command).catch((reason: unknown) =>
+                toast({
+                  message: `Not opened: ${uiErrorOf(reason).message}`,
+                  icon: WarningCircleIcon,
+                }),
+              );
+            }}
+          />
+        )}
+        {copyable(hint.command) && (
+          <IconButton
+            label={`Copy ${hint.command}`}
+            icon={CopyIcon}
+            size={22}
+            onClick={() => copy(hint.command, `Copied: ${hint.command}`)}
+          />
+        )}
+      </span>
+    </div>
+  );
+}
+
+function ToolRow({ status }: { status: ToolStatus }) {
+  const { os } = usePlatform();
+  const line = toolStateLine(status);
+  return (
+    <li className="tool-row">
+      <div className="tool-head">
+        <span className="tool-name">{status.tool}</span>
+        <Tag variant="outline">{status.required ? 'required' : 'optional'}</Tag>
+        <span className="tool-purpose">{status.purpose}</span>
+      </div>
+      <div className="tool-state" data-tone={line.tone}>
+        {line.text}
+      </div>
+      {line.detail !== null && <div className="tool-detail">{line.detail}</div>}
+      {status.path !== null && <div className="tool-path">{status.path}</div>}
+      {status.problem !== null && (
+        <div className="tool-hints">
+          {hintsFor(status.install, os).map((hint) => (
+            <HintLine key={`${hint.os}-${hint.command}`} hint={hint} />
+          ))}
+        </div>
+      )}
+    </li>
+  );
+}
+
+export function ToolchainPanel({ onClose }: { onClose: () => void }) {
+  const query = useQuery({ queryKey: ['toolchain'], queryFn: api.toolchainStatus });
+  // What is shown is what the last read found: a refused read shows no footer of an older one.
+  const report = query.isError ? undefined : query.data;
+  // A check again, or the panel opened over a cached check: the rows are the last check's until
+  // this one ends, and say so (review #2).
+  const again = query.isFetching && !query.isPending;
+  return (
+    <Modal
+      title="Toolchain"
+      sub="The tools AppRafter runs on this computer, and how to install one that is missing."
+      width={620}
+      layer="form"
+      onClose={onClose}
+      footer={
+        <>
+          <span className="tool-foot">
+            {report !== undefined && (
+              <details>
+                <summary>
+                  {pathSourceLine(report.searchPathSource, report.searchPath.length)}
+                </summary>
+                <ul className="tool-search-path">
+                  {report.searchPath.map((dir) => (
+                    <li key={dir}>{dir}</li>
+                  ))}
+                </ul>
+              </details>
+            )}
+          </span>
+          <Button
+            icon={ArrowsClockwiseIcon}
+            pending={query.isFetching}
+            onClick={() => {
+              void query.refetch();
+            }}
+          >
+            Check again
+          </Button>
+        </>
+      }
+    >
+      {query.isPending ? (
+        <StatePanel icon={SpinnerGapIcon} spin title="Checking the tools…" />
+      ) : query.isError ? (
+        <ErrorPanel error={uiErrorOf(query.error)} />
+      ) : (
+        <>
+          {again && (
+            <p className="tool-checking" role="status">
+              Checking the tools again. These lines are from the last check.
+            </p>
+          )}
+          <ul className="tool-rows" aria-busy={again || undefined} data-stale={again || undefined}>
+            {query.data.tools.map((status) => (
+              <ToolRow key={status.tool} status={status} />
+            ))}
+          </ul>
+        </>
+      )}
+    </Modal>
+  );
+}

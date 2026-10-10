@@ -4,383 +4,17 @@
 //! D.1 moves the CLI onto a shared `apprafter-core` crate (ADR 0067). Its
 //! invariant is that, on Unix, the CLI prints exactly what it printed
 //! before, except for changes made on purpose. These cases pin that
-//! byte for byte.
-//!
-//! Every case runs the shipped binary in a hermetic sandbox:
-//! - a cleared environment, so the caller's env cannot change the result;
-//! - scratch `HOME`, XDG dirs and `APPRAFTER_CONFIG_DIR`;
-//! - `PATH` is one empty directory, so no real tool can run;
-//! - `KUBECONFIG` names a sandbox file that does not exist, so no cluster
-//!   can be reached;
-//! - startup checks off;
-//! - `APPRAFTER_HCLOUD_BASE_URL` is always set: to the case's `mockito`
-//!   server when it has one, else to a closed local port, so no call can
-//!   reach the real Hetzner API;
-//! - `TZ=UTC`. Code that asks the OS for its zone through `iana_time_zone`
-//!   (`backup.rs`) reads `/etc/localtime` and ignores `TZ`; no current case
-//!   reaches it;
-//! - a 60-second timeout per command, so a hang fails instead of blocking
-//!   the suite.
-//!
-//! `RUST_LOG` is deliberately left unset: the default tracing filter's
-//! INFO/WARN lines reach stderr exactly as users see them (with ANSI
-//! colour — tracing turns it off only for `NO_COLOR`). A refactor that
-//! drops one, for example by moving code into a crate the filter does not
-//! name, fails here.
-//!
-//! stdout and stderr are captured separately (non-TTY) and rendered with
-//! the command and exit code into one `tests/golden/<family>/<case>.golden`.
-//! A multi-step case renders every step's block, in order, into one file;
-//! each block starts with its own `$ apprafter …` line.
-//!
-//! The only normalisations are deterministic substitutions:
-//! - the sandbox path becomes `<SANDBOX>` (its raw and canonical spellings,
-//!   the longer one first);
-//! - the Hetzner base URL (the mockito URL, or the closed-port URL) becomes
-//!   `<HCLOUD>`;
-//! - the CLI version becomes `<VERSION>`, so a release bump does not
-//!   rewrite every file — only where it is not part of a longer number;
-//! - an RFC 3339 UTC timestamp `YYYY-MM-DDTHH:MM:SS[.fraction]Z` (tracing's
-//!   default timer) becomes `<TS>`;
-//! - the ESC byte becomes the text `<ESC>`, so golden files stay printable
-//!   and editor-safe.
-//!
-//! Recording: `APPRAFTER_GOLDEN_UPDATE=1 cargo test -p apprafter --test
-//! golden` (the variable must equal `1`) writes every file and then FAILS on
-//! purpose, so a run in update mode can never pass CI. Rerun without the
-//! variable to verify, review the diff, and commit. A missing golden is a
-//! failure, never a silent pass.
+//! byte for byte. The harness — the sandbox, the normalisations and how
+//! to record — and its rules are in `common/golden.rs`.
 #![cfg(unix)]
+
+mod common;
+use common::golden::*;
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Output;
-use std::time::Duration;
 
-use assert_cmd::Command;
 use tempfile::TempDir;
-
-const UPDATE_ENV: &str = "APPRAFTER_GOLDEN_UPDATE";
-const VERSION: &str = env!("CARGO_PKG_VERSION");
-/// Where Hetzner calls go when a case has no mock: a closed local port.
-const CLOSED_PORT_URL: &str = "http://127.0.0.1:1";
-/// Longest a single `apprafter` run may take before it counts as a hang.
-const RUN_TIMEOUT: Duration = Duration::from_secs(60);
-/// 64 ASCII alphanumerics: the shape `cli_core::target` accepts.
-const TOKEN_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const TOKEN_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-
-fn golden_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden")
-}
-
-/// One hermetic place to run `apprafter`.
-struct Sandbox {
-    dir: TempDir,
-    /// Every spelling of the sandbox root (raw, canonical), longest first.
-    roots: Vec<String>,
-    hcloud: Option<String>,
-}
-
-impl Sandbox {
-    fn new() -> Self {
-        let dir = TempDir::new().expect("tempdir");
-        for sub in ["home", "config", "cache", "apprafter-config", "bin"] {
-            fs::create_dir_all(dir.path().join(sub)).expect("sandbox dir");
-        }
-        // On some systems the tempdir is reached through a symlink and a
-        // command may print either spelling. Longest first, so a spelling
-        // that contains the other is never half-replaced.
-        let mut roots = vec![dir.path().display().to_string()];
-        if let Ok(canon) = dir.path().canonicalize() {
-            let canon = canon.display().to_string();
-            if !roots.contains(&canon) {
-                roots.push(canon);
-            }
-        }
-        roots.sort_by_key(|r| std::cmp::Reverse(r.len()));
-        Sandbox {
-            dir,
-            roots,
-            hcloud: None,
-        }
-    }
-
-    /// Point every Hetzner call at `url` (a mockito server).
-    fn with_hcloud(mut self, url: String) -> Self {
-        self.hcloud = Some(url);
-        self
-    }
-
-    fn path(&self, rel: &str) -> PathBuf {
-        self.dir.path().join(rel)
-    }
-
-    /// A readable SSH public key inside the sandbox; its body is never parsed.
-    fn ssh_key(&self) -> String {
-        let p = self.path("home/id_ed25519.pub");
-        if !p.exists() {
-            fs::write(&p, "ssh-ed25519 AAAA golden test key\n").expect("ssh key");
-        }
-        p.display().to_string()
-    }
-
-    fn cmd(&self, args: &[&str]) -> Command {
-        let mut c = Command::cargo_bin("apprafter").expect("apprafter binary");
-        c.env_clear()
-            .env("PATH", self.path("bin"))
-            .env("HOME", self.path("home"))
-            .env("XDG_CONFIG_HOME", self.path("config"))
-            .env("XDG_CACHE_HOME", self.path("cache"))
-            .env("APPRAFTER_CONFIG_DIR", self.path("apprafter-config"))
-            .env("APPRAFTER_SKIP_STARTUP_CHECKS", "1")
-            .env("KUBECONFIG", self.path("no-kubeconfig"))
-            .env(
-                "APPRAFTER_HCLOUD_BASE_URL",
-                self.hcloud.as_deref().unwrap_or(CLOSED_PORT_URL),
-            )
-            .env("TZ", "UTC")
-            .env("LANG", "C")
-            .env("USER", "golden")
-            .current_dir(self.path("home"))
-            .timeout(RUN_TIMEOUT)
-            .args(args);
-        c
-    }
-
-    /// A setup step: must succeed; its output is not a golden.
-    fn setup(&self, args: &[&str]) {
-        let out = self.cmd(args).output().expect("run apprafter");
-        assert!(
-            out.status.success(),
-            "setup `apprafter {}` failed (exit {:?}):\n{}",
-            args.join(" "),
-            out.status.code(),
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-
-    /// The local, no-ping `target add` most cases start from.
-    fn add_target(&self, name: &str) {
-        let key = self.ssh_key();
-        self.setup(&[
-            "target",
-            "add",
-            name,
-            "--provider",
-            "hetzner-cloud",
-            "--token",
-            TOKEN_A,
-            "--ssh-key",
-            &key,
-            "--region",
-            "nbg1",
-            "--tier",
-            "solo",
-            "--no-ping",
-            "--no-interactive",
-        ]);
-    }
-
-    fn normalize(&self, text: &str) -> String {
-        let mut s = text.to_string();
-        for root in &self.roots {
-            s = s.replace(root.as_str(), "<SANDBOX>");
-        }
-        // The mock URL first: the closed-port URL is a prefix of a mock URL
-        // whose port starts with `1`. Neither may be continued by a digit,
-        // so one is never half-replaced either way.
-        if let Some(url) = &self.hcloud {
-            s = replace_isolated(&s, url, "<HCLOUD>", |c| c.is_ascii_digit());
-        }
-        s = replace_isolated(&s, CLOSED_PORT_URL, "<HCLOUD>", |c| c.is_ascii_digit());
-        s = replace_bounded(&s, VERSION, "<VERSION>");
-        mask_timestamps(&s).replace('\x1b', "<ESC>")
-    }
-
-    fn render(&self, args: &[&str], out: &Output) -> String {
-        let stdout = std::str::from_utf8(&out.stdout).expect("stdout is UTF-8");
-        let stderr = std::str::from_utf8(&out.stderr).expect("stderr is UTF-8");
-        let mut doc = String::new();
-        doc.push_str(&format!(
-            "$ apprafter {}\n",
-            self.normalize(&args.join(" "))
-        ));
-        match out.status.code() {
-            Some(code) => doc.push_str(&format!("[exit {code}]\n")),
-            None => doc.push_str("[exit signal]\n"),
-        }
-        section(&mut doc, "stdout", &self.normalize(stdout));
-        section(&mut doc, "stderr", &self.normalize(stderr));
-        doc
-    }
-
-    /// Run `args` and compare against `<family>/<case>.golden`.
-    fn golden(&self, case: &str, args: &[&str]) {
-        self.golden_steps(case, &[args]);
-    }
-
-    /// Run each step in order and compare all their blocks, concatenated,
-    /// against `<family>/<case>.golden`. Each block starts with its own
-    /// `$ apprafter …` line, so the file shows the command and then the
-    /// state it left behind.
-    fn golden_steps(&self, case: &str, steps: &[&[&str]]) {
-        let mut doc = String::new();
-        for args in steps {
-            let out = self.cmd(args).output().expect("run apprafter");
-            doc.push_str(&self.render(args, &out));
-        }
-        check(case, &doc);
-    }
-}
-
-fn section(doc: &mut String, name: &str, body: &str) {
-    doc.push_str(&format!("[{name}]\n"));
-    doc.push_str(body);
-    if !body.is_empty() && !body.ends_with('\n') {
-        doc.push_str("\n[no newline at end]\n");
-    }
-}
-
-/// Replace each `needle` in `s` with `with`, except where the character
-/// just before or just after it `joins` it to a longer token.
-fn replace_isolated(s: &str, needle: &str, with: &str, joins: impl Fn(char) -> bool) -> String {
-    let mut out = String::with_capacity(s.len());
-    // Bytes of `s` already copied (or replaced) into `out`.
-    let mut copied = 0;
-    for (at, _) in s.match_indices(needle) {
-        let before = s[..at].chars().next_back();
-        let after = s[at + needle.len()..].chars().next();
-        if before.is_some_and(&joins) || after.is_some_and(&joins) {
-            continue;
-        }
-        out.push_str(&s[copied..at]);
-        out.push_str(with);
-        copied = at + needle.len();
-    }
-    out.push_str(&s[copied..]);
-    out
-}
-
-/// Replace `needle` (a version) only where it is not part of a longer
-/// number: no ASCII digit or `.` right before or after it.
-fn replace_bounded(s: &str, needle: &str, with: &str) -> String {
-    replace_isolated(s, needle, with, |c| c.is_ascii_digit() || c == '.')
-}
-
-/// Replace every RFC 3339 UTC timestamp, `YYYY-MM-DDTHH:MM:SS[.fraction]Z`
-/// (the shape tracing's default timer prints), with `<TS>`.
-fn mask_timestamps(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = String::with_capacity(s.len());
-    // Bytes of `s` already copied (or masked) into `out`.
-    let mut copied = 0;
-    let mut at = 0;
-    while at < bytes.len() {
-        // A timestamp never continues a longer digit run.
-        let starts_token = at == 0 || !bytes[at - 1].is_ascii_digit();
-        match timestamp_len(&bytes[at..]) {
-            Some(len) if starts_token => {
-                out.push_str(&s[copied..at]);
-                out.push_str("<TS>");
-                at += len;
-                copied = at;
-            }
-            _ => at += 1,
-        }
-    }
-    out.push_str(&s[copied..]);
-    out
-}
-
-/// The length of the `YYYY-MM-DDTHH:MM:SS[.fraction]Z` timestamp that
-/// `bytes` starts with, if it starts with one.
-fn timestamp_len(bytes: &[u8]) -> Option<usize> {
-    // `9` stands for any ASCII digit; everything else is literal.
-    const SHAPE: &[u8] = b"9999-99-99T99:99:99";
-    let head = bytes.get(..SHAPE.len())?;
-    let fits = head.iter().zip(SHAPE).all(|(b, want)| match want {
-        b'9' => b.is_ascii_digit(),
-        literal => b == literal,
-    });
-    if !fits {
-        return None;
-    }
-    let mut len = SHAPE.len();
-    if bytes.get(len) == Some(&b'.') {
-        let digits = bytes[len + 1..]
-            .iter()
-            .take_while(|b| b.is_ascii_digit())
-            .count();
-        if digits == 0 {
-            return None;
-        }
-        len += 1 + digits;
-    }
-    (bytes.get(len) == Some(&b'Z')).then_some(len + 1)
-}
-
-/// Why a golden comparison did not pass; each carries the full message.
-#[derive(Debug)]
-enum CheckError {
-    /// Verify mode and no file: a missing golden fails, never passes.
-    Missing(String),
-    /// Verify mode and the file differs from the output.
-    Differs(String),
-    /// Update mode wrote the file; the run fails on purpose.
-    Written(String),
-}
-
-impl CheckError {
-    fn message(&self) -> &str {
-        match self {
-            CheckError::Missing(m) | CheckError::Differs(m) | CheckError::Written(m) => m,
-        }
-    }
-}
-
-/// Update mode is on only when the variable is exactly `1`.
-fn update_mode() -> bool {
-    std::env::var(UPDATE_ENV).as_deref() == Ok("1")
-}
-
-fn check(case: &str, actual: &str) {
-    let path = golden_root().join(format!("{case}.golden"));
-    if let Err(e) = check_at(&path, actual, update_mode()) {
-        panic!("golden `{case}` {}", e.message());
-    }
-}
-
-/// Compare `actual` with the golden at `path`, or (in update mode) write it
-/// there and fail on purpose.
-fn check_at(path: &Path, actual: &str, update: bool) -> Result<(), CheckError> {
-    if update {
-        fs::create_dir_all(path.parent().expect("golden parent")).expect("golden dir");
-        fs::write(path, actual).expect("write golden");
-        return Err(CheckError::Written(format!(
-            "written to {} — rerun without {UPDATE_ENV} to verify, then review and commit it",
-            path.display()
-        )));
-    }
-    let expected = match fs::read_to_string(path) {
-        Ok(expected) => expected,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(CheckError::Missing(format!(
-                "is missing at {} ({e}). Record it deliberately: {UPDATE_ENV}=1 cargo test -p \
-                 apprafter --test golden, then review and commit",
-                path.display()
-            )));
-        }
-        Err(e) => panic!("cannot read golden {}: {e}", path.display()),
-    };
-    if expected != actual {
-        return Err(CheckError::Differs(format!(
-            "differs from the binary's output.\n--- expected ({})\n{expected}\n--- actual\n{actual}",
-            path.display()
-        )));
-    }
-    Ok(())
-}
 
 // ---------------------------------------------------------------------
 // The harness's own guarantees
@@ -390,8 +24,8 @@ fn check_at(path: &Path, actual: &str, update: bool) -> Result<(), CheckError> {
 fn harness_normalizes_sandbox_hcloud_and_version() {
     let sb = Sandbox::new().with_hcloud("http://127.0.0.1:41234".to_string());
     let raw = format!(
-        "{}/apprafter-config at http://127.0.0.1:41234 v{VERSION}",
-        sb.dir.path().display()
+        "{} at http://127.0.0.1:41234 v{VERSION}",
+        sb.path("apprafter-config").display()
     );
     assert_eq!(
         sb.normalize(&raw),
@@ -525,8 +159,116 @@ fn harness_check_at_update_mode_writes_and_fails() {
     assert_eq!(fs::read_to_string(&path).expect("read"), "fresh\n");
 }
 
-/// Every recorded file must belong to a case in this file; otherwise a
-/// renamed or deleted case would leave a golden that nothing checks.
+#[test]
+fn harness_masks_millisecond_timings() {
+    assert_eq!(
+        mask_millis("Hetzner Cloud /v1/locations, 182 ms)"),
+        "Hetzner Cloud /v1/locations, <MS> ms)"
+    );
+    assert_eq!(mask_millis("0 ms"), "<MS> ms");
+    assert_eq!(mask_millis("a 1 ms, b 22 ms."), "a <MS> ms, b <MS> ms.");
+}
+
+#[test]
+fn harness_leaves_other_ms_text_alone() {
+    for s in ["182ms", "x12 ms", "12 msgs", "v1.5 ms", "ms 12", "12  ms"] {
+        assert_eq!(mask_millis(s), s, "{s}");
+    }
+}
+
+#[test]
+fn harness_masks_os_error_numbers() {
+    assert_eq!(
+        mask_os_errors("Connection refused (os error 111) / (os error 61)"),
+        "Connection refused (os error <N>) / (os error <N>)"
+    );
+    for s in ["(os error )", "(os error x)", "(os error 2", "os error 2)"] {
+        assert_eq!(mask_os_errors(s), s, "{s}");
+    }
+}
+
+#[test]
+fn harness_normalize_applies_the_new_masks() {
+    let sb = Sandbox::new();
+    assert_eq!(
+        sb.normalize("ping 7 ms; refused (os error 111)"),
+        "ping <MS> ms; refused (os error <N>)"
+    );
+}
+
+#[test]
+fn harness_seed_helpers_write_into_the_store() {
+    let sb = Sandbox::new();
+    sb.seed_state("prod", "{}");
+    assert!(sb
+        .path("apprafter-config/state/prod/.apprafter/state.json")
+        .exists());
+    sb.seed_config("prod", "provider: hetzner-cloud\n");
+    assert!(sb
+        .path("apprafter-config/targets/prod/config.yaml")
+        .exists());
+    sb.seed_pointer("gone");
+    assert_eq!(
+        fs::read_to_string(sb.path("apprafter-config/config.yaml")).unwrap(),
+        "active_target: gone\nversion: 1\n"
+    );
+    sb.clear_pointer();
+    assert!(!sb.path("apprafter-config/config.yaml").exists());
+}
+
+#[test]
+fn harness_stand_in_tools_link_every_probed_tool() {
+    let sb = Sandbox::new().with_stand_in_tools();
+    let dir = sb.path_override().expect("stand-ins replace PATH");
+    for name in cli_core::tools::ALL.iter().map(|t| t.name) {
+        let file = dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+        assert!(file.is_file(), "{}", file.display());
+    }
+}
+
+/// miette wraps a `×` message at 80 columns, breaking inside a word, before the harness swaps
+/// the sandbox root for `<SANDBOX>`; so a case that prints a sandbox path in one matches only
+/// while the root keeps the length it was recorded with. macOS's `TMPDIR`
+/// (`/var/folders/<2>/<30>/T/`) is about 45 characters longer than Linux's `/tmp`. This re-runs
+/// such a case in a child of this test binary with a deliberately long `TMPDIR`: it must match.
+#[test]
+fn harness_a_long_tmpdir_changes_no_golden() {
+    let scratch = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("scratch dir");
+    let long = scratch
+        .path()
+        .join("a-temporary-directory-as-long-as-the-one-macos-hands-every-process");
+    fs::create_dir_all(&long).expect("long TMPDIR");
+    let case = "target_add_with_a_missing_ssh_key";
+    let out = std::process::Command::new(std::env::current_exe().expect("this test binary"))
+        .args(["--exact", case, "--test-threads=1"])
+        .env("TMPDIR", &long)
+        .env_remove(UPDATE_ENV)
+        .output()
+        .expect("re-run the case");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("1 passed"),
+        "`{case}` under TMPDIR={} failed:\n{stdout}\n{}",
+        long.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A spelling of the sandbox root the harness does not know, or a root a wrapped message split
+/// before its last component, leaves the root's own name in the normalised output: that fails
+/// with a clear message on every OS, in update mode too.
+#[test]
+#[should_panic(expected = "the sandbox root survived normalisation")]
+fn harness_refuses_output_that_still_names_the_sandbox_root() {
+    let sb = Sandbox::new();
+    let root = sb.path("").display().to_string();
+    let (head, tail) = root.split_at(3);
+    sb.assert_no_raw_root("harness/split", &format!("× {head}\n  │ {tail}/home\n"));
+}
+
+/// Every recorded file must belong to a case in this file or in
+/// `golden_doctor.rs`; otherwise a renamed or deleted case would leave a
+/// golden that nothing checks.
 #[test]
 fn every_golden_file_has_a_case() {
     fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -539,7 +281,7 @@ fn every_golden_file_has_a_case() {
             }
         }
     }
-    let source = include_str!("golden.rs");
+    let sources = [include_str!("golden.rs"), include_str!("golden_doctor.rs")];
     let root = golden_root();
     let mut files = Vec::new();
     collect(&root, &mut files);
@@ -557,12 +299,15 @@ fn every_golden_file_has_a_case() {
                 .display()
                 .to_string()
         })
-        .filter(|id| !source.contains(&format!("\"{id}\"")))
+        .filter(|id| {
+            let quoted = format!("\"{id}\"");
+            !sources.iter().any(|source| source.contains(&quoted))
+        })
         .collect();
     assert!(
         orphans.is_empty(),
-        "golden files with no case in golden.rs (restore the case or delete the file): \
-         {orphans:?}"
+        "golden files with no case in golden.rs or golden_doctor.rs (restore the case or \
+         delete the file): {orphans:?}"
     );
 }
 
@@ -680,6 +425,9 @@ fn target_add_force_overwrites() {
             &["target", "show"],
         ],
     );
+    // Bug 8: the tier the setup stored survives a `--force` that did not pass `--tier`.
+    let cfg = fs::read_to_string(sb.path("apprafter-config/targets/prod/config.yaml")).unwrap();
+    assert!(cfg.contains("default_tier: solo"), "{cfg}");
 }
 
 #[test]
@@ -803,6 +551,31 @@ fn target_use_switches_active() {
     sb.golden("target/use_staging", &["target", "use", "staging"]);
 }
 
+/// WI-458 review #4: `use` refuses a target it cannot load — credentials or config that do not
+/// parse — with that file's error, and the default stays. The refusal moved from the CLI into
+/// the core, which the desktop's Make default calls too; recorded before the move, this pins
+/// that the CLI prints what it printed.
+#[test]
+fn target_use_refuses_a_target_whose_files_cannot_be_read() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.add_target("staging");
+    sb.add_target("test");
+    sb.seed_store_file(
+        "targets/staging/credentials.yaml",
+        "hetzner_token: [unclosed\n",
+    );
+    sb.seed_store_file("targets/test/config.yaml", "provider: [unclosed\n");
+    sb.golden_steps(
+        "target/use_unreadable",
+        &[
+            &["target", "use", "staging"],
+            &["target", "use", "test"],
+            &["target", "list"],
+        ],
+    );
+}
+
 #[test]
 fn target_use_unknown_is_refused() {
     let sb = Sandbox::new();
@@ -897,6 +670,7 @@ fn target_machine_no_ping_records_unvalidated() {
     );
 }
 
+/// bug 4: exit 1 with `apprafter::target::not_provisioned`, nothing on stdout.
 #[test]
 fn target_ip_without_server() {
     let sb = Sandbox::new();
@@ -933,53 +707,6 @@ fn target_add_server_type_no_ping() {
 // ---------------------------------------------------------------------
 // Hetzner-backed (mockito)
 // ---------------------------------------------------------------------
-
-const LOCATIONS_OK: &str = r#"{"locations":[
-  {"id":1,"name":"fsn1","description":"Falkenstein DC Park 1","country":"DE","city":"Falkenstein","network_zone":"eu-central"},
-  {"id":2,"name":"nbg1","description":"Nuremberg DC Park 1","country":"DE","city":"Nuremberg","network_zone":"eu-central"}
-]}"#;
-
-const UNAUTHORIZED: &str =
-    r#"{"error":{"code":"unauthorized","message":"unable to authenticate"}}"#;
-
-/// Two SKUs in nbg1: cx22 (recommended) and cx32; cx32 is also sold in fsn1.
-const SERVER_TYPES: &str = r#"{"server_types":[
-  {"id":104,"name":"cx22","architecture":"x86","cpu_type":"shared","cores":2,"memory":4.0,"disk":40,"deprecation":null,
-   "locations":[{"name":"nbg1","available":true,"recommended":true}],
-   "prices":[{"location":"nbg1","price_monthly":{"net":"3.7900","gross":"4.5101"},"price_hourly":{"net":"0.0060","gross":"0.0071"}}]},
-  {"id":105,"name":"cx32","architecture":"x86","cpu_type":"shared","cores":4,"memory":8.0,"disk":80,"deprecation":null,
-   "locations":[{"name":"nbg1","available":true,"recommended":false},{"name":"fsn1","available":true,"recommended":false}],
-   "prices":[{"location":"nbg1","price_monthly":{"net":"6.8000","gross":"8.0920"},"price_hourly":{"net":"0.0109","gross":"0.0130"}},
-             {"location":"fsn1","price_monthly":{"net":"6.8000","gross":"8.0920"},"price_hourly":{"net":"0.0109","gross":"0.0130"}}]}
-],"meta":{"pagination":{"next_page":null}}}"#;
-
-/// A JSON `GET path` route that answers only requests carrying
-/// `Bearer {token}`; not yet created, so a case can add expectations.
-fn json_route(
-    server: &mut mockito::Server,
-    path: &str,
-    status: usize,
-    body: &str,
-    token: &str,
-) -> mockito::Mock {
-    server
-        .mock("GET", path)
-        .match_query(mockito::Matcher::Any)
-        .match_header("authorization", format!("Bearer {token}").as_str())
-        .with_status(status)
-        .with_header("content-type", "application/json")
-        .with_body(body)
-}
-
-fn json_mock(
-    server: &mut mockito::Server,
-    path: &str,
-    status: usize,
-    body: &str,
-    token: &str,
-) -> mockito::Mock {
-    json_route(server, path, status, body, token).create()
-}
 
 #[test]
 fn target_add_with_ping_verifies_token() {
@@ -1215,4 +942,1554 @@ fn status_with_no_target() {
 #[test]
 fn app_list_with_no_target() {
     Sandbox::new().golden("resolve/app_list_no_target", &["app", "list"]);
+}
+
+// ---------------------------------------------------------------------
+// target family — D.3 baselines
+//
+// Recorded on the binary as it was before D.3 moved any of these paths
+// onto `apprafter-core`, bugs included: every later change to one of
+// these files is deliberate and reviewed in its own commit.
+// ---------------------------------------------------------------------
+
+/// Two targets (`prod` active, then `staging`) and a pointer naming
+/// `gone`, which has no target directory.
+fn dangling_pointer_sandbox() -> Sandbox {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.add_target("staging");
+    sb.seed_pointer("gone");
+    sb
+}
+
+#[test]
+fn target_list_with_a_dangling_pointer() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.add_target("staging");
+    sb.seed_pointer("gone");
+    sb.golden("target/list_dangling", &["target", "list"]);
+}
+
+/// D.3d review #5: a hand edit with no space after the colon (`hetzner_token:<token>`) makes
+/// the whole line one YAML scalar, which serde quotes when it refuses it. The error names the
+/// file and where in it, never what it holds.
+#[test]
+fn target_show_and_whoami_with_credentials_missing_the_space_after_the_colon() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.seed_store_file(
+        "targets/prod/credentials.yaml",
+        &format!("hetzner_token:{TOKEN_A}\n"),
+    );
+    let steps: &[&[&str]] = &[&["target", "show"], &["whoami", "--no-ping"]];
+    sb.assert_steps_never_print(steps, TOKEN_A);
+    sb.golden_steps("target/show_credentials_no_space", steps);
+}
+
+/// The same for a credentials file that holds only the token, as `echo $TOKEN > …` leaves it.
+#[test]
+fn target_show_with_credentials_that_hold_only_the_token() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.seed_store_file("targets/prod/credentials.yaml", &format!("{TOKEN_A}\n"));
+    let steps: &[&[&str]] = &[&["target", "show"]];
+    sb.assert_steps_never_print(steps, TOKEN_A);
+    sb.golden_steps("target/show_credentials_bare_token", steps);
+}
+
+/// D.3d follow-up: the store's own `config.yaml` belongs to no target, so no removal or re-add
+/// repairs it. The help names it, says to fix it by hand or restore it, and that deleting it and
+/// choosing the default again (`target use`, which then writes it) works too.
+#[test]
+fn target_list_and_use_with_an_unreadable_store_config() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.seed_store_file("config.yaml", "active_target: [prod\n");
+    sb.golden_steps(
+        "target/list_store_config_unreadable",
+        &[&["target", "list"], &["target", "use", "prod"]],
+    );
+    // What the help says works: with the file deleted, `target use` writes it again.
+    sb.clear_pointer();
+    sb.cmd(&["target", "use", "prod"]).assert().success();
+    assert_eq!(
+        fs::read_to_string(sb.path("apprafter-config/config.yaml")).unwrap(),
+        "active_target: prod\nversion: 1\n"
+    );
+}
+
+#[test]
+fn target_show_with_a_dangling_pointer() {
+    dangling_pointer_sandbox().golden("target/show_dangling", &["target", "show"]);
+}
+
+#[test]
+fn target_use_with_a_dangling_pointer() {
+    dangling_pointer_sandbox().golden_steps(
+        "target/use_dangling",
+        &[&["target", "use", "prod"], &["target", "list"]],
+    );
+}
+
+#[test]
+fn target_remove_with_a_dangling_pointer() {
+    dangling_pointer_sandbox().golden_steps(
+        "target/remove_dangling",
+        &[&["target", "remove", "prod", "--yes"], &["target", "list"]],
+    );
+}
+
+#[test]
+fn target_machine_with_a_dangling_pointer() {
+    dangling_pointer_sandbox().golden(
+        "target/machine_dangling",
+        &["target", "machine", "--server-type", "cx32", "--no-ping"],
+    );
+}
+
+#[test]
+fn whoami_with_a_dangling_pointer() {
+    dangling_pointer_sandbox().golden("session/whoami_dangling", &["whoami", "--no-ping"]);
+}
+
+#[test]
+fn target_ip_with_a_dangling_pointer() {
+    dangling_pointer_sandbox().golden("target/ip_dangling", &["target", "ip"]);
+}
+
+#[test]
+fn target_use_without_a_config_file() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.clear_pointer();
+    sb.golden_steps(
+        "target/use_no_config",
+        &[&["target", "use", "prod"], &["target", "list"]],
+    );
+}
+
+#[test]
+fn target_use_of_the_active_target() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.golden("target/use_already_active", &["target", "use", "prod"]);
+}
+
+#[test]
+fn target_add_with_the_token_from_the_environment() {
+    let sb = Sandbox::new().with_env("HCLOUD_TOKEN", TOKEN_A);
+    let key = sb.ssh_key();
+    sb.golden_steps(
+        "target/add_env_token",
+        &[
+            &[
+                "target",
+                "add",
+                "prod",
+                "--provider",
+                "hetzner-cloud",
+                "--ssh-key",
+                &key,
+                "--no-ping",
+                "--no-interactive",
+            ],
+            &["target", "show"],
+        ],
+    );
+}
+
+#[test]
+fn target_add_with_the_api_unreachable() {
+    let sb = Sandbox::new();
+    let key = sb.ssh_key();
+    sb.golden(
+        "target/add_api_unreachable",
+        &[
+            "target",
+            "add",
+            "prod",
+            "--provider",
+            "hetzner-cloud",
+            "--token",
+            TOKEN_A,
+            "--ssh-key",
+            &key,
+            "--no-interactive",
+        ],
+    );
+}
+
+#[test]
+fn target_add_with_a_malformed_token() {
+    Sandbox::new().golden(
+        "target/add_malformed_token",
+        &[
+            "target",
+            "add",
+            "prod",
+            "--provider",
+            "hetzner-cloud",
+            "--token",
+            "short",
+            "--no-ping",
+            "--no-interactive",
+        ],
+    );
+}
+
+#[test]
+fn target_add_with_an_unknown_provider() {
+    Sandbox::new().golden(
+        "target/add_unknown_provider",
+        &[
+            "target",
+            "add",
+            "prod",
+            "--provider",
+            "aws",
+            "--token",
+            TOKEN_A,
+            "--no-ping",
+            "--no-interactive",
+        ],
+    );
+}
+
+#[test]
+fn target_add_with_a_missing_ssh_key() {
+    let sb = Sandbox::new();
+    let missing = sb.path("home/missing.pub").display().to_string();
+    sb.golden(
+        "target/add_missing_ssh_key",
+        &[
+            "target",
+            "add",
+            "prod",
+            "--provider",
+            "hetzner-cloud",
+            "--token",
+            TOKEN_A,
+            "--ssh-key",
+            &missing,
+            "--no-ping",
+            "--no-interactive",
+        ],
+    );
+}
+
+#[test]
+fn target_add_server_type_without_a_region() {
+    let mut server = mockito::Server::new();
+    let _loc = json_mock(&mut server, "/v1/locations", 200, LOCATIONS_OK, TOKEN_A);
+    let _st = json_mock(&mut server, "/v1/server_types", 200, SERVER_TYPES, TOKEN_A);
+    let sb = Sandbox::new().with_hcloud(server.url());
+    let key = sb.ssh_key();
+    sb.golden_steps(
+        "target/add_server_type_default_region",
+        &[
+            &[
+                "target",
+                "add",
+                "prod",
+                "--provider",
+                "hetzner-cloud",
+                "--token",
+                TOKEN_A,
+                "--ssh-key",
+                &key,
+                "--server-type",
+                "cx32",
+                "--no-interactive",
+            ],
+            &["target", "show"],
+        ],
+    );
+}
+
+#[test]
+fn target_add_force_on_an_inactive_target() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.add_target("staging");
+    sb.golden_steps(
+        "target/add_force_inactive",
+        &[
+            &[
+                "target",
+                "add",
+                "staging",
+                "--force",
+                "--provider",
+                "hetzner-cloud",
+                "--token",
+                TOKEN_B,
+                "--no-ping",
+                "--no-interactive",
+            ],
+            &["target", "show", "staging"],
+        ],
+    );
+}
+
+/// Bug 8: `--force` reset the Cloudflare origin firewall toggle (no `target add` flag sets it),
+/// so the next `apply` reopened 80/443. It is carried over now, with every field not passed.
+#[test]
+fn target_add_force_keeps_a_seeded_firewall_toggle() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.seed_config(
+        "prod",
+        "provider: hetzner-cloud\nregion: nbg1\ndefault_tier: solo\nfirewall:\n  cloudflare_origin: true\n",
+    );
+    sb.golden_with_files(
+        "target/add_force_firewall",
+        &[&[
+            "target",
+            "add",
+            "prod",
+            "--force",
+            "--provider",
+            "hetzner-cloud",
+            "--token",
+            TOKEN_B,
+            "--no-ping",
+            "--no-interactive",
+        ]],
+        &["targets/prod/config.yaml"],
+    );
+    let cfg = fs::read_to_string(sb.path("apprafter-config/targets/prod/config.yaml")).unwrap();
+    assert!(cfg.contains("cloudflare_origin: true"), "{cfg}");
+    assert!(cfg.contains("default_tier: solo"), "{cfg}");
+}
+
+/// Bug 8: on a target whose state records a server, `--force --region <other>` is refused
+/// (the guard `target machine` uses); nothing is written.
+#[test]
+fn target_add_force_region_on_a_provisioned_target() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.seed_state("prod", PROVISIONED_STATE);
+    sb.golden_with_files(
+        "target/add_force_provisioned",
+        &[
+            &[
+                "target",
+                "add",
+                "prod",
+                "--force",
+                "--provider",
+                "hetzner-cloud",
+                "--token",
+                TOKEN_B,
+                "--region",
+                "hel1",
+                "--no-ping",
+                "--no-interactive",
+            ],
+            &["target", "show"],
+        ],
+        &[
+            "targets/prod/config.yaml",
+            "state/prod/.apprafter/state.json",
+        ],
+    );
+}
+
+/// Bug 8: a `--force` that changes only the token is allowed on a provisioned target.
+#[test]
+fn target_add_force_keeps_a_provisioned_target_when_only_the_token_changes() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.seed_state("prod", PROVISIONED_STATE);
+    sb.golden_steps(
+        "target/add_force_provisioned_token_only",
+        &[
+            &[
+                "target",
+                "add",
+                "prod",
+                "--provider",
+                "hetzner-cloud",
+                "--token",
+                TOKEN_B,
+                "--force",
+                "--no-ping",
+                "--no-interactive",
+            ],
+            &["target", "show"],
+        ],
+    );
+}
+
+#[test]
+fn target_renew_with_a_verified_token() {
+    let mut server = mockito::Server::new();
+    let _loc = json_mock(&mut server, "/v1/locations", 200, LOCATIONS_OK, TOKEN_B);
+    let sb = Sandbox::new().with_hcloud(server.url());
+    sb.add_target("prod");
+    sb.golden(
+        "target/renew_ping_ok",
+        &[
+            "target",
+            "add",
+            "prod",
+            "--renew",
+            "--token",
+            TOKEN_B,
+            "--no-interactive",
+        ],
+    );
+}
+
+#[test]
+fn target_renew_with_a_rejected_token() {
+    let mut server = mockito::Server::new();
+    let _loc = json_mock(&mut server, "/v1/locations", 401, UNAUTHORIZED, TOKEN_B);
+    let sb = Sandbox::new().with_hcloud(server.url());
+    sb.add_target("prod");
+    sb.golden(
+        "target/renew_ping_rejected",
+        &[
+            "target",
+            "add",
+            "prod",
+            "--renew",
+            "--token",
+            TOKEN_B,
+            "--no-interactive",
+        ],
+    );
+}
+
+#[test]
+fn target_renew_of_a_missing_target() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.golden(
+        "target/renew_missing",
+        &[
+            "target",
+            "add",
+            "ghost",
+            "--renew",
+            "--token",
+            TOKEN_B,
+            "--no-ping",
+            "--no-interactive",
+        ],
+    );
+}
+
+#[test]
+fn target_renew_with_config_flags() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.golden(
+        "target/renew_config_flags",
+        &[
+            "target",
+            "add",
+            "prod",
+            "--renew",
+            "--token",
+            TOKEN_B,
+            "--region",
+            "hel1",
+            "--no-ping",
+            "--no-interactive",
+        ],
+    );
+}
+
+#[test]
+fn target_renew_with_a_server_type() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.golden_steps(
+        "target/renew_server_type",
+        &[
+            &[
+                "target",
+                "add",
+                "prod",
+                "--renew",
+                "--token",
+                TOKEN_B,
+                "--server-type",
+                "cx32",
+                "--no-ping",
+                "--no-interactive",
+            ],
+            &["target", "show"],
+        ],
+    );
+}
+
+/// A second readable public key in the sandbox, other than the one `add_target` stores.
+fn work_key(sb: &Sandbox) -> String {
+    let p = sb.path("home/work.pub");
+    fs::write(&p, "ssh-ed25519 AAAA golden work key\n").expect("ssh key");
+    p.display().to_string()
+}
+
+/// `prod`'s credentials file, hand-written: a comment the CLI never writes, so a renewal that
+/// rewrote the file would show.
+fn hand_written_credentials(sb: &Sandbox) -> String {
+    let creds = format!("# pasted by hand\nhetzner_token: {TOKEN_A}\n");
+    sb.seed_store_file("targets/prod/credentials.yaml", &creds);
+    creds
+}
+
+fn credentials_of_prod(sb: &Sandbox) -> String {
+    fs::read_to_string(sb.path("apprafter-config/targets/prod/credentials.yaml")).unwrap()
+}
+
+/// WI-452: `--renew --ssh-key` with no token changes only the key: no ping (the provider is a
+/// closed port and the ping is not skipped), the credentials file untouched, byte for byte.
+#[test]
+fn target_renew_with_only_an_ssh_key() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    let creds = hand_written_credentials(&sb);
+    let key = work_key(&sb);
+    sb.golden_with_files(
+        "target/renew_ssh_key_only",
+        &[&[
+            "target",
+            "add",
+            "prod",
+            "--renew",
+            "--ssh-key",
+            &key,
+            "--no-interactive",
+        ]],
+        &["targets/prod/config.yaml"],
+    );
+    assert_eq!(credentials_of_prod(&sb), creds);
+}
+
+/// WI-452: an `HCLOUD_TOKEN` holding the stored token is no new token: beside `--ssh-key` it is
+/// the key-only renewal, not the unchanged-token refusal.
+#[test]
+fn target_renew_with_an_ssh_key_and_the_stored_token_in_the_env() {
+    let sb = Sandbox::new().with_env("HCLOUD_TOKEN", TOKEN_A);
+    sb.add_target("prod");
+    let creds = hand_written_credentials(&sb);
+    let key = work_key(&sb);
+    sb.golden_with_files(
+        "target/renew_ssh_key_env_token_unchanged",
+        &[&[
+            "target",
+            "add",
+            "prod",
+            "--renew",
+            "--ssh-key",
+            &key,
+            "--no-interactive",
+        ]],
+        &["targets/prod/config.yaml"],
+    );
+    assert_eq!(credentials_of_prod(&sb), creds);
+}
+
+/// WI-452: no token and the stored key: nothing would change, and that is the refusal.
+#[test]
+fn target_renew_that_would_change_nothing() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    let key = sb.ssh_key();
+    sb.golden(
+        "target/renew_nothing_to_change",
+        &[
+            "target",
+            "add",
+            "prod",
+            "--renew",
+            "--ssh-key",
+            &key,
+            "--no-interactive",
+        ],
+    );
+}
+
+/// WI-452: a typed `--token` other than the stored one beside `--ssh-key`: the token is
+/// verified (the mock answers only it) and saved, and the key changes with it.
+#[test]
+fn target_renew_rotates_the_token_and_changes_the_ssh_key() {
+    let mut server = mockito::Server::new();
+    let _loc = json_mock(&mut server, "/v1/locations", 200, LOCATIONS_OK, TOKEN_B);
+    let sb = Sandbox::new().with_hcloud(server.url());
+    sb.add_target("prod");
+    let key = work_key(&sb);
+    sb.golden_with_files(
+        "target/renew_token_and_ssh_key",
+        &[&[
+            "target",
+            "add",
+            "prod",
+            "--renew",
+            "--token",
+            TOKEN_B,
+            "--ssh-key",
+            &key,
+            "--no-interactive",
+        ]],
+        &["targets/prod/config.yaml"],
+    );
+    assert!(credentials_of_prod(&sb).contains(TOKEN_B));
+}
+
+/// D.3d review #0/#8: `HCLOUD_TOKEN` is the hcloud CLI's own variable and may hold another
+/// project's token. Beside a typed `--ssh-key` with no typed `--token` it is not used: only the
+/// key changes (no ping — the provider is a closed port), the credentials stay byte for byte,
+/// and one note says the env token was not used and how to rotate as well.
+#[test]
+fn target_renew_with_an_ssh_key_ignores_another_token_in_the_env() {
+    let sb = Sandbox::new().with_env("HCLOUD_TOKEN", TOKEN_B);
+    sb.add_target("prod");
+    let creds = hand_written_credentials(&sb);
+    let key = work_key(&sb);
+    sb.golden_with_files(
+        "target/renew_ssh_key_env_token_differs",
+        &[&[
+            "target",
+            "add",
+            "prod",
+            "--renew",
+            "--ssh-key",
+            &key,
+            "--no-interactive",
+        ]],
+        &["targets/prod/config.yaml"],
+    );
+    assert_eq!(credentials_of_prod(&sb), creds);
+}
+
+/// D.3d review #3: a key from `APPRAFTER_SSH_PUBLIC_KEY_PATH` (set for every command in CI)
+/// never makes a renewal key-only by itself: with no token, it is today's refusal, and the
+/// stored key stays.
+#[test]
+fn target_renew_with_only_an_env_ssh_key_still_needs_a_token() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    let key = work_key(&sb);
+    let sb = sb.with_env("APPRAFTER_SSH_PUBLIC_KEY_PATH", &key);
+    sb.golden_with_files(
+        "target/renew_env_ssh_key_no_token",
+        &[&["target", "add", "prod", "--renew", "--no-interactive"]],
+        &["targets/prod/config.yaml"],
+    );
+}
+
+/// An env key is applied alongside an env token's rotation, as before WI-452.
+#[test]
+fn target_renew_with_an_env_token_applies_the_env_ssh_key_too() {
+    let mut server = mockito::Server::new();
+    let _loc = json_mock(&mut server, "/v1/locations", 200, LOCATIONS_OK, TOKEN_B);
+    let sb = Sandbox::new()
+        .with_hcloud(server.url())
+        .with_env("HCLOUD_TOKEN", TOKEN_B);
+    sb.add_target("prod");
+    let key = work_key(&sb);
+    let sb = sb.with_env("APPRAFTER_SSH_PUBLIC_KEY_PATH", &key);
+    sb.golden_with_files(
+        "target/renew_env_token_and_env_ssh_key",
+        &[&["target", "add", "prod", "--renew", "--no-interactive"]],
+        &["targets/prod/config.yaml"],
+    );
+    assert!(credentials_of_prod(&sb).contains(TOKEN_B));
+}
+
+/// D.3d review #3, rule 3: a key from `APPRAFTER_SSH_PUBLIC_KEY_PATH` rides only beside a real
+/// rotation. An `HCLOUD_TOKEN` holding the stored token rotates nothing, so the env key does not
+/// turn the renewal into a key-only one: it is the unchanged-token refusal, as before key-only
+/// renewals existed, and the stored key path and the credentials stay byte for byte.
+#[test]
+fn target_renew_with_the_stored_token_in_the_env_and_an_env_ssh_key() {
+    let sb = Sandbox::new().with_env("HCLOUD_TOKEN", TOKEN_A);
+    sb.add_target("prod");
+    let creds = hand_written_credentials(&sb);
+    let key = work_key(&sb);
+    let sb = sb.with_env("APPRAFTER_SSH_PUBLIC_KEY_PATH", &key);
+    sb.golden_with_files(
+        "target/renew_env_token_unchanged_env_ssh_key",
+        &[&["target", "add", "prod", "--renew", "--no-interactive"]],
+        &["targets/prod/config.yaml"],
+    );
+    assert_env_key_not_applied(&sb, &creds);
+}
+
+/// The same with the stored token typed: `--token` alone is typed, so the env key still rides
+/// only beside a rotation (a typed `--token <stored> --ssh-key <new>` stays key-only).
+#[test]
+fn target_renew_with_the_stored_token_typed_and_an_env_ssh_key() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    let creds = hand_written_credentials(&sb);
+    let key = work_key(&sb);
+    let sb = sb.with_env("APPRAFTER_SSH_PUBLIC_KEY_PATH", &key);
+    sb.golden_with_files(
+        "target/renew_typed_token_unchanged_env_ssh_key",
+        &[&[
+            "target",
+            "add",
+            "prod",
+            "--renew",
+            "--token",
+            TOKEN_A,
+            "--no-interactive",
+        ]],
+        &["targets/prod/config.yaml"],
+    );
+    assert_env_key_not_applied(&sb, &creds);
+}
+
+/// Typed, the stored token with a new `--ssh-key` is the key-only renewal (WI-452), whatever the
+/// env key says: the typed key changes, the credentials stay byte for byte, nothing is pinged.
+#[test]
+fn target_renew_with_the_stored_token_and_an_ssh_key_both_typed() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    let creds = hand_written_credentials(&sb);
+    let key = work_key(&sb);
+    let other = key_file(&sb, "env.pub", "ssh-ed25519 AAAA golden env key\n");
+    let sb = sb.with_env("APPRAFTER_SSH_PUBLIC_KEY_PATH", &other);
+    sb.golden_with_files(
+        "target/renew_typed_token_unchanged_typed_ssh_key",
+        &[&[
+            "target",
+            "add",
+            "prod",
+            "--renew",
+            "--token",
+            TOKEN_A,
+            "--ssh-key",
+            &key,
+            "--no-interactive",
+        ]],
+        &["targets/prod/config.yaml"],
+    );
+    assert_eq!(credentials_of_prod(&sb), creds);
+}
+
+/// `prod` keeps the key it was added with, and its credentials byte for byte.
+fn assert_env_key_not_applied(sb: &Sandbox, creds: &str) {
+    let config = fs::read_to_string(sb.path("apprafter-config/targets/prod/config.yaml")).unwrap();
+    assert!(
+        config.contains("id_ed25519.pub") && !config.contains("work.pub"),
+        "{config}"
+    );
+    assert_eq!(credentials_of_prod(sb), creds);
+}
+
+/// `--renew` with neither a token nor `--ssh-key` (and no terminal) is today's refusal.
+#[test]
+fn target_renew_without_a_token_or_a_key() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.golden(
+        "target/renew_no_token",
+        &["target", "add", "prod", "--renew", "--no-interactive"],
+    );
+}
+
+/// A private key as `ssh-keygen` writes it next to the `.pub` (OpenSSH's PEM format); the
+/// body is a placeholder.
+const PRIVATE_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQ==\n-----END OPENSSH PRIVATE KEY-----\n";
+/// The private key's body, letters and digits only (`assert_steps_never_print` searches so).
+const PRIVATE_KEY_BODY: &str = "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQ";
+
+/// `body` at `<sandbox>/home/<name>`.
+fn key_file(sb: &Sandbox, name: &str, body: &str) -> String {
+    let p = sb.path(&format!("home/{name}"));
+    fs::write(&p, body).expect("key file");
+    p.display().to_string()
+}
+
+/// GOTCHA-149: `--ssh-key` names the file `apply` sends the provider as the target's key, so a
+/// private key (the file next to the `.pub`, one dropped suffix away) is refused by name, its
+/// text never shown, and nothing is saved.
+#[test]
+fn target_add_refuses_a_private_key_as_the_ssh_key() {
+    let sb = Sandbox::new();
+    let key = key_file(&sb, "id_ed25519", PRIVATE_KEY);
+    let steps: &[&[&str]] = &[&[
+        "target",
+        "add",
+        "prod",
+        "--provider",
+        "hetzner-cloud",
+        "--token",
+        TOKEN_A,
+        "--ssh-key",
+        &key,
+        "--no-ping",
+        "--no-interactive",
+    ]];
+    sb.assert_steps_never_print(steps, PRIVATE_KEY_BODY);
+    sb.golden_with_files(
+        "target/add_ssh_key_private",
+        steps,
+        &["targets/prod/config.yaml"],
+    );
+}
+
+/// The same for a key-only renewal onto an RSA private key in the classic PEM format: the stored
+/// key stays.
+#[test]
+fn target_renew_refuses_a_pem_private_key_as_the_ssh_key() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    let key = key_file(
+        &sb,
+        "id_rsa",
+        "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAgoldenplaceholder\n-----END RSA PRIVATE KEY-----\n",
+    );
+    let steps: &[&[&str]] = &[&[
+        "target",
+        "add",
+        "prod",
+        "--renew",
+        "--ssh-key",
+        &key,
+        "--no-interactive",
+    ]];
+    sb.assert_steps_never_print(steps, "MIIEowIBAAKCAQEAgoldenplaceholder");
+    sb.golden_with_files(
+        "target/renew_ssh_key_pem",
+        steps,
+        &["targets/prod/config.yaml"],
+    );
+}
+
+/// A file that is not an OpenSSH public key line at all is refused too.
+#[test]
+fn target_add_refuses_a_file_that_is_not_a_public_key() {
+    let sb = Sandbox::new();
+    let key = key_file(&sb, "notes.pub", "not-a-key\n");
+    sb.golden_with_files(
+        "target/add_ssh_key_not_public",
+        &[&[
+            "target",
+            "add",
+            "prod",
+            "--provider",
+            "hetzner-cloud",
+            "--token",
+            TOKEN_A,
+            "--ssh-key",
+            &key,
+            "--no-ping",
+            "--no-interactive",
+        ]],
+        &["targets/prod/config.yaml"],
+    );
+}
+
+#[test]
+fn target_rename_to_an_existing_name() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.add_target("staging");
+    sb.golden(
+        "target/rename_to_existing",
+        &["target", "rename", "prod", "staging"],
+    );
+}
+
+#[test]
+fn target_rename_to_an_invalid_name() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.golden(
+        "target/rename_invalid",
+        &["target", "rename", "prod", "bad.name"],
+    );
+}
+
+#[test]
+fn target_rename_to_the_same_name() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.golden(
+        "target/rename_identical",
+        &["target", "rename", "prod", "prod"],
+    );
+}
+
+#[test]
+fn target_remove_of_a_provisioned_target() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.seed_state("prod", PROVISIONED_STATE);
+    sb.golden_with_files(
+        "target/remove_provisioned",
+        &[&["target", "remove", "prod", "--yes"]],
+        &["state/prod/.apprafter/state.json"],
+    );
+}
+
+/// WI-458: a target whose `config.yaml` cannot be read is removed with `--yes`. The warnings say
+/// what cannot be read, and that the server its state records keeps running and cannot be
+/// checked or destroyed through it; its directory and state go, and the default moves to the
+/// target that can be read.
+#[test]
+fn target_remove_of_a_target_whose_config_cannot_be_read() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.add_target("staging");
+    sb.seed_config("prod", "provider: [hetzner-cloud\n");
+    sb.seed_state("prod", PROVISIONED_STATE);
+    sb.golden_with_files(
+        "target/remove_unreadable",
+        &[&["target", "remove", "prod", "--yes"], &["target", "list"]],
+        &[
+            "targets/prod/config.yaml",
+            "targets/prod/credentials.yaml",
+            "state/prod/.apprafter/state.json",
+        ],
+    );
+}
+
+/// WI-458: a good `config.yaml` beside a `credentials.yaml` that cannot be read takes the same
+/// path, and its text (the token) is never printed: only where it stopped parsing.
+#[test]
+fn target_remove_of_a_target_whose_credentials_cannot_be_read() {
+    let seeded = || {
+        let sb = Sandbox::new();
+        sb.add_target("prod");
+        sb.add_target("staging");
+        sb.seed_store_file(
+            "targets/prod/credentials.yaml",
+            &format!("hetzner_token:{TOKEN_A}\n"),
+        );
+        sb
+    };
+    let steps: &[&[&str]] = &[&["target", "remove", "prod", "--yes"]];
+    seeded().assert_steps_never_print(steps, TOKEN_A);
+    seeded().golden_with_files(
+        "target/remove_unreadable_credentials",
+        steps,
+        &["targets/prod/credentials.yaml"],
+    );
+}
+
+/// WI-458 (from D.3d): removing the default moves it to the alphabetically first target that
+/// can be read — both files — passing over one whose config cannot be read and one whose
+/// credentials cannot, and the line names them.
+#[test]
+fn target_remove_of_the_default_passes_over_targets_that_cannot_be_read() {
+    let sb = Sandbox::new();
+    for name in ["alpha", "beta", "staging", "prod"] {
+        sb.add_target(name);
+    }
+    sb.seed_pointer("prod");
+    sb.seed_config("alpha", "provider: [hetzner-cloud\n");
+    sb.seed_store_file("targets/beta/credentials.yaml", "hetzner_token: [\n");
+    sb.golden_with_files(
+        "target/remove_skips_unreadable",
+        &[&["target", "remove", "prod", "--yes"], &["target", "list"]],
+        &["config.yaml"],
+    );
+}
+
+/// WI-458: when no target that can be read is left, the default is cleared and the line says
+/// why; the one left can then be removed too.
+#[test]
+fn target_remove_of_the_default_with_no_readable_target_left() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.add_target("broken");
+    sb.seed_config("broken", "provider: [hetzner-cloud\n");
+    sb.golden_with_files(
+        "target/remove_none_readable",
+        &[
+            &["target", "remove", "prod", "--yes"],
+            &["target", "remove", "broken", "--yes"],
+            &["target", "list"],
+        ],
+        &["config.yaml", "targets/broken/config.yaml"],
+    );
+}
+
+#[test]
+fn target_show_of_a_provisioned_target() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.seed_state("prod", PROVISIONED_STATE);
+    sb.golden("target/show_provisioned", &["target", "show"]);
+}
+
+#[test]
+fn target_machine_on_a_provisioned_target() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.seed_state("prod", PROVISIONED_STATE);
+    sb.golden(
+        "target/machine_provisioned",
+        &["target", "machine", "--server-type", "cx32", "--no-ping"],
+    );
+}
+
+#[test]
+fn target_machine_no_ping_without_a_server_type() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.golden(
+        "target/machine_no_ping_no_sku",
+        &["target", "machine", "--no-ping"],
+    );
+}
+
+#[test]
+fn target_machine_without_a_tty_or_a_server_type() {
+    // stdin is null under `output()`: not a TTY.
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.golden("target/machine_non_tty_no_sku", &["target", "machine"]);
+}
+
+#[test]
+fn target_machine_of_a_non_active_target() {
+    let mut server = mockito::Server::new();
+    let _st = json_mock(&mut server, "/v1/server_types", 200, SERVER_TYPES, TOKEN_A);
+    let sb = Sandbox::new().with_hcloud(server.url());
+    sb.add_target("prod");
+    sb.add_target("staging");
+    sb.golden_steps(
+        "target/machine_other_target",
+        &[
+            &[
+                "target",
+                "machine",
+                "--target",
+                "staging",
+                "--server-type",
+                "cx32",
+            ],
+            &["target", "show", "staging"],
+        ],
+    );
+}
+
+#[test]
+fn target_machine_with_the_token_from_the_environment() {
+    // The mock answers only TOKEN_B (the environment's); the stored
+    // token is TOKEN_A.
+    let mut server = mockito::Server::new();
+    let _st = json_mock(&mut server, "/v1/server_types", 200, SERVER_TYPES, TOKEN_B);
+    let sb = Sandbox::new()
+        .with_hcloud(server.url())
+        .with_env("HCLOUD_TOKEN", TOKEN_B);
+    sb.add_target("prod");
+    sb.golden(
+        "target/machine_env_token",
+        &["target", "machine", "--server-type", "cx32"],
+    );
+}
+
+#[test]
+fn target_ip_with_a_server() {
+    let mut server = mockito::Server::new();
+    let _server = json_mock(&mut server, "/v1/servers/42", 200, SERVER_42_BODY, TOKEN_A);
+    let sb = Sandbox::new().with_hcloud(server.url());
+    sb.add_target("prod");
+    sb.seed_state("prod", PROVISIONED_STATE);
+    sb.golden("target/ip_with_server", &["target", "ip"]);
+}
+
+#[test]
+fn target_ip_with_the_server_absent() {
+    let mut server = mockito::Server::new();
+    let _server = json_mock(
+        &mut server,
+        "/v1/servers/42",
+        404,
+        SERVER_NOT_FOUND,
+        TOKEN_A,
+    );
+    let sb = Sandbox::new().with_hcloud(server.url());
+    sb.add_target("prod");
+    sb.seed_state("prod", PROVISIONED_STATE);
+    sb.golden("target/ip_server_absent", &["target", "ip"]);
+}
+
+#[test]
+fn target_ip_without_a_stored_token() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.seed_state("prod", PROVISIONED_STATE);
+    sb.seed_store_file("targets/prod/credentials.yaml", "{}\n");
+    sb.golden("target/ip_no_token", &["target", "ip"]);
+}
+
+#[test]
+fn whoami_with_the_api_unreachable() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.golden("session/whoami_unreachable", &["whoami"]);
+}
+
+#[test]
+fn whoami_with_the_ssh_key_file_missing() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    fs::remove_file(sb.path("home/id_ed25519.pub")).expect("remove the ssh key");
+    sb.golden("session/whoami_ssh_key_missing", &["whoami", "--no-ping"]);
+}
+
+// ---------------------------------------------------------------------
+// kubeconfig — a lost age key (WI-457, GOTCHA-120, GOTCHA-121)
+//
+// `prod` and `staging` cache their kubeconfig and Argo CD password under a key that is gone
+// (made here, never written). The node is a stand-in `ssh` on an otherwise empty `PATH` that
+// logs its arguments and prints a k3s kubeconfig; the server's address comes from the mocked
+// Hetzner API. Nothing reaches a real node, cluster or provider.
+// ---------------------------------------------------------------------
+
+/// What the stand-in node serves at `/etc/rancher/k3s/k3s.yaml`.
+const NODE_KUBECONFIG: &str =
+    "apiVersion: v1\nclusters:\n- cluster:\n    server: https://127.0.0.1:6443\n  name: default\n";
+
+/// `GET /v1/servers`: the server `prod`'s state records, labelled and addressed.
+const SERVERS_42: &str = r#"{"servers":[{"id":42,"name":"prod-node","status":"running","labels":{"apprafter":"true"},"public_net":{"ipv4":{"ip":"203.0.113.10"}}}]}"#;
+
+/// `GET /v1/servers`: [`SERVERS_42`] and `staging`'s server, 43, at 203.0.113.11.
+const SERVERS_42_43: &str = r#"{"servers":[{"id":42,"name":"prod-node","status":"running","labels":{"apprafter":"true"},"public_net":{"ipv4":{"ip":"203.0.113.10"}}},{"id":43,"name":"staging-node","status":"running","labels":{"apprafter":"true"},"public_net":{"ipv4":{"ip":"203.0.113.11"}}}]}"#;
+
+/// `prod` (active) and `staging`, each caching both secrets under `lost`, which is on no disk.
+fn lost_key_sandbox(server: &mockito::Server) -> (Sandbox, age::x25519::Identity) {
+    let lost = age::x25519::Identity::generate();
+    let enc = |text: &str| {
+        cli_core::secrets::encrypt_for_recipient(text, &lost.to_public()).expect("encrypt")
+    };
+    let sb = Sandbox::new().with_hcloud(server.url());
+    sb.add_target("prod");
+    sb.add_target("staging");
+    for (target, id) in [("prod", 42), ("staging", 43)] {
+        sb.seed_state(
+            target,
+            &serde_json::json!({"hetzner_cloud": {
+                "server_id": id, "server_name": format!("{target}-node"),
+                "kubeconfig_age": enc("from: the lost key\n"),
+                "argocd_admin_password_age": enc("lost-password"),
+            }})
+            .to_string(),
+        );
+    }
+    (sb, lost)
+}
+
+/// The stand-ins, alone on `PATH`: the nodes — `ssh … root@203.0.113.10 cat
+/// /etc/rancher/k3s/k3s.yaml` (or `.11`, `staging`'s) prints [`NODE_KUBECONFIG`] — and the
+/// cluster — `kubectl get secret
+/// argocd-initial-admin-secret -n argocd …` prints the password `new-password`, base64 as the
+/// API holds it. Each logs its calls to `<sandbox>/<tool>.log`; anything else exits non-zero.
+fn stand_in_tools(sb: &Sandbox) -> PathBuf {
+    let bin = sb.path("tools-bin");
+    fs::create_dir_all(&bin).expect("tools bin");
+    let body: String = NODE_KUBECONFIG.lines().map(|l| format!(" '{l}'")).collect();
+    for (tool, call, answer) in [
+        (
+            "ssh",
+            "*' root@203.0.113.1'[01]' cat /etc/rancher/k3s/k3s.yaml'",
+            format!("printf '%s\\n'{body}"),
+        ),
+        (
+            "kubectl",
+            "'get secret argocd-initial-admin-secret -n argocd -o jsonpath={.data.password}'",
+            "printf '%s' 'bmV3LXBhc3N3b3Jk'".to_string(),
+        ),
+    ] {
+        common::stand_in::script(
+            &bin.join(tool),
+            &format!(
+                "echo \"$*\" >> '{log}'\n\
+                 case \"$*\" in\n\
+                 {call}) {answer} ;;\n\
+                 *) echo \"{tool} stand-in: unexpected arguments: $*\" >&2; exit 2 ;;\n\
+                 esac",
+                log = sb.path(&format!("{tool}.log")).display()
+            ),
+        );
+    }
+    bin
+}
+
+fn age_key(sb: &Sandbox) -> PathBuf {
+    sb.path("home/.config/apprafter/age.key")
+}
+
+fn hetzner_state(sb: &Sandbox, target: &str) -> serde_json::Value {
+    let raw = fs::read_to_string(sb.path(&format!(
+        "apprafter-config/state/{target}/.apprafter/state.json"
+    )))
+    .expect("state");
+    serde_json::from_str::<serde_json::Value>(&raw).expect("json")["hetzner_cloud"].clone()
+}
+
+/// GOTCHA-120: a read with the key gone names the way back, and never creates a key.
+#[test]
+fn kubeconfig_with_the_age_key_lost() {
+    let server = mockito::Server::new();
+    let (sb, _lost) = lost_key_sandbox(&server);
+    let before = hetzner_state(&sb, "prod");
+    sb.golden("kubeconfig/age_key_lost", &["kubeconfig"]);
+    assert!(!age_key(&sb).exists(), "a read never creates a key");
+    assert_eq!(hetzner_state(&sb, "prod"), before);
+}
+
+/// Without a terminal and without `--yes`, `--refresh` lists what a new key leaves unreadable
+/// and refuses: no key, no read of the node, no write. The node is reachable — the address is
+/// mocked and the stand-in `ssh` answers — so a bypassed consent would read it, and both the
+/// address lookup and the `ssh` call are asserted absent on their own (review #4).
+#[test]
+fn kubeconfig_refresh_with_the_age_key_lost_needs_yes() {
+    let mut server = mockito::Server::new();
+    let servers = json_route(&mut server, "/v1/servers", 200, SERVERS_42, TOKEN_A)
+        .expect(0)
+        .create();
+    let (sb, _lost) = lost_key_sandbox(&server);
+    let tools = stand_in_tools(&sb);
+    let sb = sb.with_path(tools);
+    let before = hetzner_state(&sb, "prod");
+    sb.golden(
+        "kubeconfig/age_key_lost_refresh_needs_yes",
+        &["kubeconfig", "--refresh"],
+    );
+    servers.assert();
+    assert!(!age_key(&sb).exists(), "no key without consent");
+    assert!(!sb.path("ssh.log").exists(), "the node is not read");
+    assert_eq!(hetzner_state(&sb, "prod"), before);
+}
+
+/// Review #5/#12: at a terminal, no, Esc and Ctrl-C at the new-key question are one refusal: exit
+/// 1 with `apprafter::secrets::new_key_declined`, nothing on stdout — the kubeconfig's channel,
+/// redirected to a file as in `apprafter kubeconfig > kc && …` — and nothing created, read or
+/// written. stdin and stderr are a pseudo-terminal, as the question needs; stdout is a pipe.
+#[test]
+fn a_declined_new_age_key_exits_non_zero_with_nothing_on_stdout() {
+    let mut server = mockito::Server::new();
+    let servers = json_route(&mut server, "/v1/servers", 200, SERVERS_42, TOKEN_A)
+        .expect(0)
+        .create();
+    let (sb, _lost) = lost_key_sandbox(&server);
+    let tools = stand_in_tools(&sb);
+    let sb = sb.with_path(tools);
+    let before = hetzner_state(&sb, "prod");
+    for (how, keys) in [("no", "n\r"), ("Esc", "\x1b"), ("Ctrl-C", "\x03")] {
+        let run = run_at_a_terminal(
+            sb.std_cmd(&["kubeconfig", "--refresh"]),
+            "Create a new age key?",
+            keys.as_bytes(),
+        );
+        assert_eq!(run.status.code(), Some(1), "{how}:\n{}", run.terminal);
+        assert_eq!(run.stdout, "", "{how}: stdout is the kubeconfig's");
+        assert!(
+            run.terminal
+                .contains("apprafter::secrets::new_key_declined"),
+            "{how}:\n{}",
+            run.terminal
+        );
+    }
+    servers.assert();
+    assert!(!age_key(&sb).exists(), "no key after a decline");
+    assert!(!sb.path("ssh.log").exists(), "the node is not read");
+    assert_eq!(hetzner_state(&sb, "prod"), before);
+}
+
+/// What a child run at a pseudo-terminal left: its exit, its stdout (a pipe), and everything it
+/// drew on the terminal (stderr, the prompt included).
+struct TerminalRun {
+    status: std::process::ExitStatus,
+    stdout: String,
+    terminal: String,
+}
+
+/// Run `cmd` with stdin and stderr on a pseudo-terminal of 24x100 and stdout on a pipe; once
+/// the terminal shows `prompt`, type `keys`. Panics if the prompt or the exit takes over 30 s.
+fn run_at_a_terminal(mut cmd: std::process::Command, prompt: &str, keys: &[u8]) -> TerminalRun {
+    use std::io::{Read, Write};
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::process::Stdio;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    // posix_openpt, not openpty: it is in every libc without -lutil.
+    // SAFETY: plain libc calls on fds this function owns; `ptsname`'s static buffer is copied
+    // before anything else runs on this thread.
+    let (master, slave) = unsafe {
+        let m = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+        assert!(m >= 0, "posix_openpt: {}", std::io::Error::last_os_error());
+        assert_eq!(libc::grantpt(m), 0, "grantpt");
+        assert_eq!(libc::unlockpt(m), 0, "unlockpt");
+        let name = libc::ptsname(m);
+        assert!(!name.is_null(), "ptsname");
+        let name = std::ffi::CStr::from_ptr(name).to_owned();
+        let ws = libc::winsize {
+            ws_row: 24,
+            ws_col: 100,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        assert_eq!(libc::ioctl(m, libc::TIOCSWINSZ, &ws), 0, "TIOCSWINSZ");
+        let s = libc::open(name.as_ptr(), libc::O_RDWR | libc::O_NOCTTY);
+        assert!(
+            s >= 0,
+            "open the slave: {}",
+            std::io::Error::last_os_error()
+        );
+        (OwnedFd::from_raw_fd(m), OwnedFd::from_raw_fd(s))
+    };
+    let mut child = cmd
+        .stdin(Stdio::from(slave.try_clone().expect("dup slave")))
+        .stderr(Stdio::from(slave))
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn apprafter");
+    // The command holds the slave's fds until it drops: drop it, so the terminal closes when
+    // the child exits and the reader below sees the end.
+    drop(cmd);
+    let mut stdout = child.stdout.take().expect("stdout");
+    let out_reader = std::thread::spawn(move || {
+        let mut out = String::new();
+        stdout.read_to_string(&mut out).expect("read stdout");
+        out
+    });
+    let mut writer = std::fs::File::from(master.try_clone().expect("dup master"));
+    let mut reader = std::fs::File::from(master);
+    let seen = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let sink = Arc::clone(&seen);
+    let (closed, drained) = std::sync::mpsc::channel::<()>();
+    // Reads until the child's side closes (EIO on Linux, EOF elsewhere).
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = reader.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            sink.lock().unwrap().extend_from_slice(&buf[..n]);
+        }
+        let _ = closed.send(());
+    });
+    let text =
+        |seen: &Arc<Mutex<Vec<u8>>>| String::from_utf8_lossy(&seen.lock().unwrap()).into_owned();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !text(&seen).contains(prompt) {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            panic!("exited {status} before asking:\n{}", text(&seen));
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no prompt within 30 s:\n{}",
+            text(&seen)
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    writer.write_all(keys).expect("type");
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("no exit within 30 s:\n{}", text(&seen));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let stdout = out_reader.join().expect("stdout reader");
+    drained
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the terminal closes once the child has exited");
+    TerminalRun {
+        status,
+        stdout,
+        terminal: text(&seen),
+    }
+}
+
+/// GOTCHA-121: `--refresh --yes` reads the node over SSH (only that: `cat` of the kubeconfig),
+/// caches it under a new key, drops `prod`'s password cached under the lost key, and says what
+/// is left: `staging`'s caches, each with its way back. The cache then reads under the new key,
+/// `staging`'s names its refetch, and `argocd-password` fetches the dropped password from the
+/// cluster again, caching it under the new key.
+#[test]
+fn kubeconfig_refresh_yes_recovers_from_a_lost_age_key() {
+    let mut server = mockito::Server::new();
+    let servers = json_route(&mut server, "/v1/servers", 200, SERVERS_42, TOKEN_A)
+        .expect(1)
+        .create();
+    let (sb, _lost) = lost_key_sandbox(&server);
+    let tools = stand_in_tools(&sb);
+    let sb = sb.with_path(tools);
+    let staging_before = hetzner_state(&sb, "staging");
+    sb.golden_steps(
+        "kubeconfig/age_key_lost_refresh_yes",
+        &[
+            &["kubeconfig", "--refresh", "--yes"],
+            &["kubeconfig"],
+            &["kubeconfig", "--target", "staging"],
+            &["argocd-password"],
+        ],
+    );
+    servers.assert();
+    let calls = |tool: &str| fs::read_to_string(sb.path(&format!("{tool}.log"))).expect(tool);
+    let ssh = calls("ssh");
+    assert_eq!(ssh.lines().count(), 1, "{ssh}");
+    assert!(
+        ssh.trim_end()
+            .ends_with(" root@203.0.113.10 cat /etc/rancher/k3s/k3s.yaml"),
+        "{ssh}"
+    );
+    assert_eq!(
+        calls("kubectl").lines().count(),
+        1,
+        "the password is read once"
+    );
+    let key = cli_core::secrets::load_identity(&age_key(&sb))
+        .expect("readable")
+        .expect("a new key");
+    let prod = hetzner_state(&sb, "prod");
+    let open = |slot: &str| {
+        cli_core::secrets::decrypt_with_identity(prod[slot].as_str().expect(slot), &key)
+            .expect("cached under the new key")
+    };
+    assert_eq!(
+        open("kubeconfig_age"),
+        NODE_KUBECONFIG.replace("127.0.0.1", "203.0.113.10")
+    );
+    assert_eq!(open("argocd_admin_password_age"), "new-password");
+    assert_eq!(hetzner_state(&sb, "staging"), staging_before);
+}
+
+/// A legacy plaintext kubeconfig needs no key, but the password fetched with it does: with
+/// another target's cache under a lost key, `argocd-password` refuses to create one (only
+/// `kubeconfig --refresh` does, after asking), before it reads the cluster's secret (review #1:
+/// a read whose result could not be cached is not made) and before it writes anything.
+#[test]
+fn argocd_password_beside_a_lost_age_key_creates_none() {
+    let server = mockito::Server::new();
+    let (sb, _lost) = lost_key_sandbox(&server);
+    sb.seed_state(
+        "prod",
+        &serde_json::json!({"hetzner_cloud": {
+            "server_id": 42, "server_name": "prod-node", "kubeconfig_yaml": NODE_KUBECONFIG,
+        }})
+        .to_string(),
+    );
+    let tools = stand_in_tools(&sb);
+    let sb = sb.with_path(tools);
+    let before = hetzner_state(&sb, "prod");
+    sb.golden(
+        "kubeconfig/age_key_lost_password_with_plaintext_kubeconfig",
+        &["argocd-password"],
+    );
+    assert!(!sb.path("kubectl.log").exists(), "the cluster is not read");
+    assert!(!age_key(&sb).exists(), "no key without asking");
+    assert_eq!(hetzner_state(&sb, "prod"), before);
+}
+
+/// Review #2: a first use — a legacy plaintext kubeconfig, no key, nothing encrypted anywhere —
+/// is no lost key: `argocd-password` reads the cluster, creates the key and caches the password
+/// under it.
+#[test]
+fn argocd_password_creates_the_key_on_a_first_use() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    sb.seed_state(
+        "prod",
+        &serde_json::json!({"hetzner_cloud": {
+            "server_id": 42, "server_name": "prod-node", "kubeconfig_yaml": NODE_KUBECONFIG,
+        }})
+        .to_string(),
+    );
+    let tools = stand_in_tools(&sb);
+    let sb = sb.with_path(tools);
+    sb.golden(
+        "kubeconfig/age_key_first_use_password",
+        &["argocd-password"],
+    );
+    let kubectl = fs::read_to_string(sb.path("kubectl.log")).expect("kubectl is called");
+    assert_eq!(kubectl.lines().count(), 1, "{kubectl}");
+    let key = cli_core::secrets::load_identity(&age_key(&sb))
+        .expect("readable")
+        .expect("the first use creates the key");
+    let cached = hetzner_state(&sb, "prod")["argocd_admin_password_age"]
+        .as_str()
+        .expect("the password is cached")
+        .to_string();
+    assert_eq!(
+        cli_core::secrets::decrypt_with_identity(&cached, &key).expect("under that key"),
+        "new-password"
+    );
+}
+
+/// Review #3: the way back the new-key summary prints for ANOTHER target's caches, walked as
+/// printed. After `prod`'s recovery, `staging`'s kubeconfig is fetched again under the new key
+/// without a question (the key exists); its password, still under the lost key, then fails
+/// naming itself and `argocd-password --refresh --target staging`, which fetches it from the
+/// cluster again. No step switches the active target.
+#[test]
+fn the_way_back_for_another_targets_argocd_password() {
+    let mut server = mockito::Server::new();
+    let servers = json_route(&mut server, "/v1/servers", 200, SERVERS_42_43, TOKEN_A)
+        .expect(2)
+        .create();
+    let (sb, _lost) = lost_key_sandbox(&server);
+    let tools = stand_in_tools(&sb);
+    let sb = sb.with_path(tools);
+    sb.golden_steps(
+        "kubeconfig/age_key_lost_password_of_another_target",
+        &[
+            &["kubeconfig", "--refresh", "--yes"],
+            &["kubeconfig", "--refresh", "--target", "staging"],
+            &["argocd-password", "--target", "staging"],
+            &["argocd-password", "--refresh", "--target", "staging"],
+        ],
+    );
+    servers.assert();
+    let ssh = fs::read_to_string(sb.path("ssh.log")).expect("ssh");
+    assert_eq!(ssh.lines().count(), 2, "{ssh}");
+    assert!(ssh.contains(" root@203.0.113.11 cat "), "{ssh}");
+    let key = cli_core::secrets::load_identity(&age_key(&sb))
+        .expect("readable")
+        .expect("the new key");
+    let staging = hetzner_state(&sb, "staging");
+    let open = |slot: &str| {
+        cli_core::secrets::decrypt_with_identity(staging[slot].as_str().expect(slot), &key)
+            .expect("cached under the new key")
+    };
+    assert_eq!(
+        open("kubeconfig_age"),
+        NODE_KUBECONFIG.replace("127.0.0.1", "203.0.113.11")
+    );
+    assert_eq!(open("argocd_admin_password_age"), "new-password");
+    assert!(
+        fs::read_to_string(sb.path("apprafter-config/config.yaml"))
+            .expect("pointer")
+            .contains("active_target: prod"),
+        "the active target is never switched"
+    );
+}
+
+/// GOTCHA-120 on every other command that reads a cache: each fails naming the way back, and
+/// none creates a key — not the password's read, not `--refresh` (which still needs the
+/// kubeconfig), not a command that talks to the cluster.
+#[test]
+fn reads_of_a_cache_with_the_age_key_lost() {
+    let server = mockito::Server::new();
+    let (sb, _lost) = lost_key_sandbox(&server);
+    let before = hetzner_state(&sb, "prod");
+    sb.golden_steps(
+        "kubeconfig/age_key_lost_reads",
+        &[
+            &["argocd-password"],
+            &["argocd-password", "--refresh"],
+            &["app", "list"],
+            &["cluster-bootstrap"],
+        ],
+    );
+    assert!(!age_key(&sb).exists(), "a read never creates a key");
+    assert_eq!(hetzner_state(&sb, "prod"), before);
 }

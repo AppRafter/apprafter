@@ -14,8 +14,36 @@ What works today:
   use. It unlocks only after the operating system's own sign-in confirms that you are the
   person signed in to this computer.
 - If nothing on the computer can confirm you, the lock stays off and a banner says so.
+- The Targets page: the target store the CLI uses, every target with its provider, region,
+  server type and tier, the CLI default marked, and targets whose `config.yaml` cannot be read
+  shown with the reason. Each target opens in its own tab, and **Make default for the CLI** makes
+  it the CLI default. A target whose `config.yaml` cannot be read cannot be opened, but its card
+  can remove it, with the same confirmation as the Target screen.
+- The Target screen: what `apprafter target show` prints for the tab's target, and these
+  changes to it:
+  - Rename it. Its config, credentials and local state move to the new name, and the tab
+    follows.
+  - Renew its API token. The app checks the new token with the provider before it saves it.
+  - Change its SSH key, picked from the public keys in `~/.ssh` or given as a full path (or one
+    that starts with `~/`). Only the key changes: the app does not ask for the API token and
+    leaves it as it is.
+  - Make it the CLI default.
+  - Remove it from this computer. You type the target's name, then the operating system
+    confirms that it is you. Nothing changes at the provider: a server keeps running. Where
+    nothing on the computer can confirm you, the app cannot remove a target;
+    `apprafter target remove <name>` in a terminal still can.
 
-The cluster screens are not connected yet, so the app lists no targets.
+  The Targets page reads only each target's `config.yaml`, so a target whose
+  `credentials.yaml` cannot be read has an ordinary card and opens here. The screen says why it
+  cannot show the target, and its Danger zone can still remove it. Until the file is fixed, the
+  target cannot be made the CLI default. When a target's files cannot be read, the confirmation
+  names the file. If the target's local state records a server, it also says that the app can
+  neither check nor destroy that server.
+
+  The Machine row shows the server type the target is set to. For a target with a server it
+  also names the server and gives the CLI commands that move it to another machine.
+
+The cluster screens are not connected yet.
 
 ## Get the source
 
@@ -395,6 +423,28 @@ dialog stands in. CI tests the app on Windows and builds it there in Git Bash, a
 build (`bun run tauri build --debug --no-bundle`) that it does not start. It builds no
 installer for Windows yet.
 
+## Trying it without your own targets
+
+Point the app at a scratch target store and data directory. A new store is empty, so add a
+target to it with the CLI first:
+
+```sh
+export APPRAFTER_CONFIG_DIR=$(mktemp -d)
+apprafter target add lab --provider hetzner-cloud --region nbg1 --tier solo \
+  --token <token> --no-ping --no-interactive
+APPRAFTER_DESKTOP_DATA_DIR=$(mktemp -d) just desktop-dev
+```
+
+`APPRAFTER_CONFIG_DIR` is the target store, for the CLI and the app alike;
+`APPRAFTER_DESKTOP_DATA_DIR` holds the app's own settings and logs. With `--no-ping` the CLI
+stores the token without checking it with the provider. A `HCLOUD_TOKEN` exported for the CLI
+has no effect on the app: [Files and logs](#files-and-logs) lists what the app reads from its
+environment.
+
+To see the interface in a browser with made-up targets (`prod-eu`, `staging`, `lab`, and
+`broken`, whose files cannot be read) and no Rust build, use the browser preview under
+[Development and tests](#development-and-tests).
+
 ## Sign-in messages
 
 What the lock screen, and the confirmation of an operation, can say when the system does not
@@ -420,14 +470,16 @@ On Linux, `XDG_CONFIG_HOME` and `XDG_DATA_HOME` move these as usual, and the win
 storage is in `~/.local/share/dev.apprafter.desktop/` too.
 
 `APPRAFTER_DESKTOP_DATA_DIR=<dir>` puts the settings in `<dir>` and the logs in `<dir>/logs`,
-and runs the app as a separate instance. The app's own code reads only that variable and
-`APPRAFTER_CONFIG_DIR` from its environment (a test build reads two more), so `HCLOUD_TOKEN`,
-`KUBECONFIG` and `RUST_LOG` have no effect on it. On Linux it also reads `WAYLAND_DISPLAY`,
+and runs the app as a separate instance. The app's own code reads only that variable,
+`APPRAFTER_CONFIG_DIR` and, on Linux and Windows, `PATH` from its environment (a test build
+reads two more), so `HCLOUD_TOKEN`, `KUBECONFIG` and `RUST_LOG` have no effect on it. `PATH` is
+where the app looks for the tools it runs (`kubectl`, `helm`, `restic`, `git`, `ssh`, `cue`);
+on macOS it asks your login shell for one instead. On Linux it also reads `WAYLAND_DISPLAY`,
 `XDG_SESSION_TYPE`, `GDK_BACKEND`, `WEBKIT_DISABLE_DMABUF_RENDERER` and its own
 `APPRAFTER_DESKTOP_DMABUF_RESTARTED`, only for the NVIDIA workaround under
-[Troubleshooting](#troubleshooting). Variables that the system and the
-libraries the app uses read still apply, such as `HOME`, `XDG_CONFIG_HOME` and the graphics
-ones under Troubleshooting. See
+[Troubleshooting](#troubleshooting). Variables that the system and the libraries the app uses
+read still apply, such as `HOME`, `XDG_CONFIG_HOME` and the graphics ones under
+Troubleshooting. See
 [Environment variables](../docs/reference/environment.md#apprafter-desktop).
 
 ### The log

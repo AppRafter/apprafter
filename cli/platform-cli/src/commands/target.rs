@@ -1,31 +1,28 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! `apprafter target …` subcommand handlers.
 //!
-//! v0.1.73 (Track A.3) ships **`target add`** in pure non-interactive
-//! mode. CRUD commands (`list / use / show / rename / remove`)
-//! arrive in Track A.5; the interactive wizard arrives in A.4.
+//! `add` (with `--force` and `--renew`), `list`, `show`, `use`, `rename`, `remove` and `ip` run
+//! on apprafter-core (`apprafter_core::target`); `machine` lives in `target_machine.rs`, the
+//! wizard in `target_wizard.rs`. The core does the work: the checks, the provider calls and
+//! the store edits, each mutation as a plan, then its execution under the store lock. This
+//! module keeps the CLI's part: the wizard and the inputs it requires, the CLI-only refusals,
+//! the confirmation prompt, the `info!` lines, and the output. Every core error is rendered
+//! through [`crate::render::core_error::report`], which adds the CLI's help.
 //!
-//! Resolution flow for `target add`:
-//!   1. Parse + validate flags (provider known, token regex, ssh-key
-//!      readable if provided, name shape).
-//!   2. Load existing target if any.
-//!   3. Apply create / renew / overwrite semantics.
-//!   4. Persist via `cli_core::target::save_target`.
-//!   5. If first target, set as active in `GlobalConfig`.
-//!   6. Print one-line confirmation.
+//! `cert`, `domain` and `firewall` are still the CLI's own code.
 
 use std::io::IsTerminal;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use cli_core::target::{
-    default_config_root, list_target_names, load_global_config, load_target, remove_target,
-    rename_target, save_global_config, save_target, validate_hetzner_token_format, GlobalConfig,
-    Target, TargetConfig, TargetCredentials, TargetStorePaths,
+use apprafter_core::target::{
+    self as core_target, CliDefaultPointer, SkuCheck, TargetRemoved, TargetReport,
 };
+use apprafter_core::{
+    ActivePointerChange, CancellationToken, Context, CoreError, CoreResult, Outcome, SecretString,
+    TargetRef,
+};
+use cli_core::target::TargetStorePaths;
 use cli_core::{CliError, Result};
-use cli_providers::hetzner_cloud::validate_server_type;
-use cli_providers::{HetznerCloudClient, HetznerCloudValidator, ProviderValidator};
-use cli_state::State;
 use tabled::{settings::Style, Table, Tabled};
 use tracing::info;
 
@@ -37,69 +34,33 @@ use cli_providers::cert::{
     build_tls_secret, expiry_status, parse_and_validate, validate_cert_name, ExpiryStatus,
 };
 
-use crate::commands::hcloud::hcloud_base_url;
 use crate::commands::state_paths::resolve_state_paths;
+use crate::render::core_error::report;
+use crate::render::reporter::CliReporter;
 
-/// Maximum length for a target name. Matches the spec
-/// (`cli-dx-task.md` §5.1 validation rules). A short cap keeps
-/// directory traversal and shell-history scenarios sane without
-/// being meaningfully restrictive.
-pub const MAX_TARGET_NAME_LEN: usize = 64;
-
-/// Only `hetzner-cloud` is wired in v0.1.73. AWS / Managed land in
-/// later phases; surface a clear error so users hit a typed wall
-/// instead of saving a half-working config.
-pub const SUPPORTED_PROVIDERS: &[&str] = &["hetzner-cloud"];
-
-pub fn run(action: TargetCommand) -> Result<()> {
+/// `apprafter target …` for the sub-commands `dispatch` does not route to a core-backed arm.
+/// `ip` runs on apprafter-core and renders its own errors
+/// ([`crate::render::core_error::report`]); every other sub-command here is today's code, its
+/// `CliError` mapped at this boundary.
+pub fn run(action: TargetCommand) -> miette::Result<()> {
     match action {
-        TargetCommand::Add {
-            name,
-            provider,
-            token,
-            ssh_key,
-            region,
-            tier,
-            cluster_name,
-            force,
-            renew,
-            no_interactive,
-            no_ping,
-            server_type,
-        } => run_add(AddArgs {
-            name,
-            provider,
-            token,
-            ssh_key,
-            region,
-            tier,
-            cluster_name,
-            force,
-            renew,
-            no_interactive,
-            no_ping,
-            server_type,
-        }),
-        TargetCommand::List => run_list(),
-        TargetCommand::Use { name } => run_use(&name),
-        TargetCommand::Show { name } => run_show(name.as_deref()),
-        TargetCommand::Rename { from, to } => run_rename(&from, &to),
-        TargetCommand::Remove { name, yes } => run_remove(&name, yes),
-        TargetCommand::Cert { action } => run_cert(action),
-        TargetCommand::Domain { action } => crate::commands::target_domain::run(action),
-        TargetCommand::Firewall { action } => crate::commands::target_firewall::run(action),
+        TargetCommand::Cert { action } => run_cert(action).map_err(miette::Report::new),
+        TargetCommand::Domain { action } => {
+            crate::commands::target_domain::run(action).map_err(miette::Report::new)
+        }
+        TargetCommand::Firewall { action } => {
+            crate::commands::target_firewall::run(action).map_err(miette::Report::new)
+        }
         TargetCommand::Ip => run_ip(),
-        TargetCommand::Machine {
-            target,
-            server_type,
-            no_ping,
-        } => crate::commands::target_machine::run_machine(
-            crate::commands::target_machine::MachineArgs {
-                target,
-                server_type,
-                no_ping,
-            },
-        ),
+        TargetCommand::Add { .. }
+        | TargetCommand::List
+        | TargetCommand::Show { .. }
+        | TargetCommand::Use { .. }
+        | TargetCommand::Rename { .. }
+        | TargetCommand::Remove { .. }
+        | TargetCommand::Machine { .. } => {
+            unreachable!("`dispatch` runs this sub-command on the core")
+        }
     }
 }
 
@@ -124,130 +85,233 @@ pub struct AddArgs {
     pub no_ping: bool,
     /// 2.16h: preferred server type SKU to persist in the target store.
     pub server_type: Option<String>,
+    /// Which of `token` / `ssh_key` were typed, not taken from `HCLOUD_TOKEN` /
+    /// `APPRAFTER_SSH_PUBLIC_KEY_PATH` ([`renew_token`]).
+    pub typed: crate::dispatch::Typed,
 }
 
-fn run_add(mut args: AddArgs) -> Result<()> {
-    // Decide before validating: the wizard is allowed to fill the
-    // missing inputs, so we shouldn't reject e.g. `apprafter target
-    // add` (no name) up front when the user is on a TTY. v0.1.77
-    // dropped the "skip when all required supplied" short-circuit —
-    // wizard now always fires on a TTY so optional fields
-    // (ssh-key, tier, region) get prompted too. Pre-supplied fields
-    // are silent through per-prompt prefill checks.
+/// `target add` (and `--renew`) on the core. The CLI keeps the wizard, the inputs it requires
+/// (name, `--provider`, `--token`) with today's texts and in today's order, the `info!` line
+/// and the output; the checks, the ping, the SKU check and the save are the core's
+/// (`plan_add` / `execute_add`). The save-time ping runs even after the wizard verified the
+/// token (R2).
+pub(crate) fn add(mut args: AddArgs) -> miette::Result<()> {
+    // Decide before validating: the wizard is allowed to fill the missing inputs, so `apprafter
+    // target add` (no name) is not rejected up front on a TTY. The wizard always fires on a TTY
+    // so the optional fields get prompted too; pre-supplied fields are silent through
+    // per-prompt prefill checks.
     let want_wizard = crate::commands::target_wizard::should_use_wizard(
         args.no_interactive,
         std::io::stdin().is_terminal(),
         std::io::stdout().is_terminal(),
     );
-    if want_wizard {
-        run_wizard_into_args(&mut args)?;
+    // The context is built before the wizard only when the wizard runs, so the flag-driven
+    // order (the `info!` line, then the context) is unchanged.
+    let early = if want_wizard {
+        Some(crate::context::cli_context()?)
+    } else {
+        None
+    };
+    if let Some(ctx) = &early {
+        run_wizard_into_args(ctx, &mut args).map_err(report)?;
     }
 
-    let name = args.name.clone().ok_or_else(|| {
-        CliError::Other(
-            "target name required — pass it as a positional argument (`apprafter target add <name>`) or run on a TTY to enter the wizard".to_string(),
-        )
-    })?;
+    let name = args.name.clone().ok_or_else(name_required)?;
     info!(target = %name, renew = args.renew, force = args.force, "target add invoked");
-    validate_target_name(&name)?;
-
-    let paths = TargetStorePaths::for_root(default_config_root()?);
+    core_target::validate_name(&name).map_err(|problem| {
+        report(CoreError::InvalidTargetName {
+            name: name.clone(),
+            problem,
+        })
+    })?;
+    let ctx = match early {
+        Some(c) => c,
+        None => crate::context::cli_context()?,
+    }
+    .with_no_ping(args.no_ping);
 
     if args.renew {
-        return run_renew(&paths, args, &name);
+        return renew(&ctx, args, &name);
     }
 
-    // Plain create / overwrite path.
-    let provider = require_known_provider(args.provider.as_deref())?;
-    let token = require_token(&provider, args.token.as_deref())?;
-    if let Some(path) = args.ssh_key.as_ref() {
-        verify_ssh_key_readable(path)?;
-    }
-
-    // Checked here, before the ping, so an add that cannot succeed fails at
-    // once; and again under the store lock, right before the save
-    // (`save_new_target`), where it decides.
-    check_name_free(&paths, &name, args.force)?;
-
-    // API ping confirms the token actually authenticates with the
-    // provider. Happens AFTER the existing-target check so a no-op
-    // run with `--no-ping` against an existing target still
-    // surfaces the "already exists" error immediately. `--no-ping`
-    // skips the round-trip for CI / offline setups. When the
-    // wizard already ran an inline ping the result is re-verified
-    // here on purpose — cheap (~200ms) and keeps the save-time
-    // check authoritative.
-    if !args.no_ping {
-        ping_provider(&provider, &token)?;
-    }
-
-    // 2.16h: if a server type SKU was supplied, validate it against the
-    // live API for the resolved region before saving. Skipped when
-    // `--no-ping` is set (same rationale as the token ping above).
-    if let Some(ref sku) = args.server_type {
-        if args.no_ping {
-            println!("{}", sku_not_validated_line(sku));
-        } else {
-            let resolved_region = region_for_sku_check(args.region.as_deref());
-            let client = HetznerCloudClient::new(hcloud_base_url(), &token);
-            let types = client.list_server_types()?.server_types;
-            validate_server_type(&types, sku, resolved_region)?;
-        }
-    }
-
-    let target = Target {
-        name: name.clone(),
-        config: TargetConfig {
+    let provider = args.provider.clone().ok_or_else(provider_required)?;
+    // Today's order: the provider is refused before the token is asked for.
+    check_provider(&provider).map_err(report)?;
+    let token = args
+        .token
+        .clone()
+        .ok_or_else(|| token_required(&provider))?;
+    let plan = core_target::plan_add(
+        &ctx,
+        core_target::AddArgs {
+            name: name.clone(),
             provider,
+            token: SecretString::new(token.clone()),
+            ssh_key: args.ssh_key,
             region: args.region,
-            default_tier: args.tier,
+            tier: args.tier,
             cluster_name: args.cluster_name,
-            ssh_key_path: args.ssh_key,
-            firewall: None,
             server_type: args.server_type,
+            force: args.force,
         },
-        credentials: TargetCredentials {
-            hetzner_token: Some(token),
-        },
-    };
-    let became_active = save_new_target(&paths, &target, args.force)?;
+    )
+    .map_err(report)?;
+    // What a forced overwrite changes and keeps, as planned (an edit made during the ping is
+    // merged too, but these lines describe the plan).
+    let fields = force_lines(&plan.changes);
+    let added = completed(
+        core_target::execute_add(&ctx, plan, &CliReporter, &CancellationToken::new())
+            .map_err(report)?,
+    )?;
 
-    let verified_suffix = add_verified_suffix(args.no_ping);
-    if became_active {
-        println!(
-            "target `{name}` saved and set as active (first target on fresh store){verified_suffix}"
-        );
-    } else {
-        println!(
-            "target `{name}` saved (active target unchanged — use `apprafter target use {name}` to switch){verified_suffix}"
-        );
+    if let Some(check) = &added.sku {
+        println!("{}", sku_line(check));
+    }
+    println!(
+        "{}",
+        add_saved_line(&added, add_verified_suffix(args.no_ping))
+    );
+    for line in fields {
+        println!("{line}");
     }
     Ok(())
 }
 
-/// Refuse to add `name` when the store already has it, unless `force`. A
-/// target that is there but unreadable is an error either way.
-fn check_name_free(paths: &TargetStorePaths, name: &str, force: bool) -> Result<()> {
-    match load_target(paths, name) {
-        Ok(_) if !force => Err(CliError::Other(format!(
-            "target `{name}` already exists — pass `--force` to overwrite or `--renew` to rotate credentials only"
-        ))),
-        Ok(_) | Err(CliError::TargetNotFound { .. }) => Ok(()),
-        Err(e) => Err(e),
+/// The line `target add` ends with, for each way the CLI default can stand after the save
+/// (bug 1: re-adding the active target with `--force` used to advise switching to it):
+/// - it moved to this target (a fresh store): "saved and set as active";
+/// - it already named this target, which was overwritten: "overwritten (it stays the active
+///   target)";
+/// - it already named this target, which did not exist until now: "saved (it is the active
+///   target)";
+/// - it names another target, or none: today's advice to `target use` it.
+pub(crate) fn add_saved_line(a: &core_target::TargetAdded, suffix: &str) -> String {
+    let name = &a.name;
+    match (&a.cli_default, a.is_cli_default, a.replaced) {
+        (Some(_), _, _) => {
+            format!("target `{name}` saved and set as active (first target on fresh store){suffix}")
+        }
+        (None, true, true) => {
+            format!("target `{name}` overwritten (it stays the active target){suffix}")
+        }
+        (None, true, false) => format!("target `{name}` saved (it is the active target){suffix}"),
+        (None, false, _) => format!(
+            "target `{name}` saved (active target unchanged — use `apprafter target use {name}` \
+             to switch){suffix}"
+        ),
     }
 }
 
-/// Save a new `target` and, on a fresh store, make it the active one;
-/// returns whether it became active. Under the store lock, and nothing slow
-/// inside it — the token ping and the SKU check ran before, unlocked — so
-/// the lock is held for a few file operations, never across the network.
-/// The name is checked again under the lock: another add may have created
-/// it since the first check, and only `force` overwrites it.
-fn save_new_target(paths: &TargetStorePaths, target: &Target, force: bool) -> Result<bool> {
-    let _store_lock = store_lock(paths)?;
-    check_name_free(paths, &target.name, force)?;
-    save_target(paths, target)?;
-    ensure_active_target(paths, &target.name)
+/// One line per field of a forced overwrite, in plan order, so no field changes without the
+/// CLI saying so (bug 8): `  updated <field>: <old> → <new>` for the plan's `Update Target`
+/// changes (a flag, or a wizard answer, that differs from the stored value), `  kept <field>:
+/// <value>` for its `Keep Target` ones (the fields not passed or passed unchanged, and the
+/// firewall toggle, which no flag sets).
+pub(crate) fn force_lines(changes: &[apprafter_core::PlannedChange]) -> Vec<String> {
+    use apprafter_core::ChangeAction;
+    changes
+        .iter()
+        .filter(|c| c.kind == "Target")
+        .filter_map(|c| {
+            let verb = match c.action {
+                ChangeAction::Update => "updated",
+                ChangeAction::Keep => "kept",
+                _ => return None,
+            };
+            c.detail.as_deref().map(|d| format!("  {verb} {d}"))
+        })
+        .collect()
+}
+
+/// `provider` is one of the core's supported providers (the one list,
+/// `apprafter_core::provider::SUPPORTED_PROVIDERS`); else the core's
+/// [`CoreError::UnknownProvider`]. The `add` arm and the wizard's provider prompt both ask it.
+pub(crate) fn check_provider(provider: &str) -> CoreResult<()> {
+    let supported = apprafter_core::provider::SUPPORTED_PROVIDERS;
+    if supported.contains(&provider) {
+        Ok(())
+    } else {
+        Err(CoreError::UnknownProvider {
+            provider: provider.to_string(),
+            supported: supported.iter().map(|p| p.to_string()).collect(),
+        })
+    }
+}
+
+/// A command line that cannot work as given — CLI-input policy, never a domain refusal (those
+/// are the core's): today's message, with the way forward as its help.
+pub(crate) fn usage(message: impl Into<String>, help: impl Into<String>) -> miette::Report {
+    miette::Report::new(CliError::UsageRefused {
+        message: message.into(),
+        help: help.into(),
+    })
+}
+
+/// `target add` with no name, and no wizard to ask for one.
+pub(crate) fn name_required() -> miette::Report {
+    usage(
+        "target name required — pass it as a positional argument (`apprafter target add <name>`) \
+         or run on a TTY to enter the wizard",
+        "Pass the name as the first argument (`apprafter target add <name> …`), or run the \
+         command in a terminal without `--no-interactive` to use the wizard.",
+    )
+}
+
+/// `target add` with no `--provider`, and no wizard to ask for one.
+pub(crate) fn provider_required() -> miette::Report {
+    let supported = apprafter_core::provider::SUPPORTED_PROVIDERS.join(", ");
+    usage(
+        format!("`--provider` is required (supported: {supported})"),
+        format!(
+            "Pass `--provider <provider>`, one of: {supported}. Or run the command in a terminal \
+             without `--no-interactive` to use the wizard."
+        ),
+    )
+}
+
+/// `target add` (or `--renew`) with no token, and no wizard to ask for one.
+pub(crate) fn token_required(provider: &str) -> miette::Report {
+    usage(
+        format!("`--token` is required for provider `{provider}` (or set `HCLOUD_TOKEN` env var)"),
+        format!(
+            "Pass `--token <64 characters>` or set `HCLOUD_TOKEN`; create a token in {}.",
+            cli_core::target::HETZNER_API_TOKENS_PAGE
+        ),
+    )
+}
+
+/// `--renew`'s errors: a target that does not exist is the not-found error with renew's way
+/// forward (drop `--renew`); anything else renders as [`report`] does.
+pub(crate) fn renew_missing(e: CoreError) -> miette::Report {
+    let help = match &e {
+        CoreError::TargetNotFound { name, .. } => format!(
+            "There is no target `{name}` to renew: drop `--renew` to create it fresh \
+             (`apprafter target add {name} --provider hetzner-cloud …`)."
+        ),
+        _ => return report(e),
+    };
+    crate::render::core_error::report_with_help(e, &help)
+}
+
+/// `target rename`'s errors: a destination that is taken gets rename's way forward (`target
+/// add`'s help names `--force` and `--renew`, which rename does not have); anything else renders
+/// as [`report`] does.
+pub(crate) fn rename_refused(e: CoreError) -> miette::Report {
+    let help = match &e {
+        CoreError::TargetExists { name } => format!(
+            "Pick another name, or remove the existing `{name}` first (`apprafter target remove \
+             {name}`); nothing was renamed."
+        ),
+        _ => return report(e),
+    };
+    crate::render::core_error::report_with_help(e, &help)
+}
+
+/// `target remove` with neither `--yes` nor a terminal to ask in.
+pub(crate) fn removal_needs_yes(name: &str) -> miette::Report {
+    miette::Report::new(CliError::ConfirmationRequired {
+        action: format!("removing target `{name}`"),
+    })
 }
 
 /// Same idea as [`add_verified_suffix`], for the `--renew` path — a rotation
@@ -260,18 +324,33 @@ pub(crate) fn renew_verified_suffix(no_ping: bool) -> &'static str {
     }
 }
 
+/// What the SKU check of `target add --server-type` found, printed after the save (bug 7: a
+/// validated type used to print nothing). A validated type names the region it was checked in,
+/// and says when that was the default region (no `--region` was passed, so the target stores
+/// none); an unchecked one is [`sku_not_validated_line`].
+pub(crate) fn sku_line(check: &SkuCheck) -> String {
+    match check {
+        SkuCheck::Validated {
+            sku,
+            region,
+            region_was_default,
+        } => format!(
+            "server type `{sku}` validated against Hetzner Cloud for region `{region}`{}",
+            if *region_was_default {
+                " (the default region; `--region` was not passed)"
+            } else {
+                ""
+            }
+        ),
+        SkuCheck::NotValidated { sku } => sku_not_validated_line(sku),
+    }
+}
+
 /// Notice printed when `--no-ping` skipped the SKU check. It has to be loud:
 /// the value lands in the target store either way, and only the next `apply`
 /// will find out it does not exist.
 pub(crate) fn sku_not_validated_line(sku: &str) -> String {
     format!("server type `{sku}` NOT validated against the Hetzner API (`--no-ping` was passed)")
-}
-
-/// Region a `--server-type` is checked against at `target add` time. Server
-/// types are per-location on Hetzner, so an unset `--region` still needs the
-/// same default the rest of the CLI provisions into.
-pub(crate) fn region_for_sku_check(region: Option<&str>) -> &str {
-    region.unwrap_or(crate::commands::target_machine::DEFAULT_REGION)
 }
 
 /// Suffix on the `target add` confirmation stating whether the token was
@@ -287,9 +366,10 @@ pub(crate) fn add_verified_suffix(no_ping: bool) -> &'static str {
 }
 
 /// Fill `args` from wizard prompts for whatever fields aren't
-/// already supplied. Split out so the main `run_add` body reads
-/// linearly.
-fn run_wizard_into_args(args: &mut AddArgs) -> Result<()> {
+/// already supplied, reading through `ctx` (the core's token ping,
+/// machine catalogue, region latencies and SSH key candidates).
+/// Split out so the main `add` body reads linearly.
+fn run_wizard_into_args(ctx: &Context, args: &mut AddArgs) -> CoreResult<()> {
     use crate::commands::target_wizard;
     if args.renew {
         // Renew wizard needs the existing target's provider, so
@@ -297,21 +377,26 @@ fn run_wizard_into_args(args: &mut AddArgs) -> Result<()> {
         // target so we know what provider's validator to wire.
         if args.name.is_none() {
             let n = inquire::Text::new("Target name to rotate credentials for:")
-                .with_validator(|v: &str| match check_target_name(v) {
+                .with_validator(|v: &str| match core_target::validate_name(v) {
                     Ok(()) => Ok(inquire::validator::Validation::Valid),
-                    Err(msg) => Ok(inquire::validator::Validation::Invalid(msg.into())),
+                    Err(problem) => Ok(inquire::validator::Validation::Invalid(
+                        problem.reason(v).into(),
+                    )),
                 })
                 .prompt()
                 .map_err(map_wizard_prompt_error)?;
             args.name = Some(n);
         }
-        let paths = TargetStorePaths::for_root(default_config_root()?);
-        let existing = load_target(&paths, args.name.as_deref().unwrap())?;
-        let (token, _verified) =
-            target_wizard::run_renew_wizard(&existing.config.provider, args.no_ping)?;
-        args.token = Some(token);
+        // Both of the target's files, as before: a missing target is the raw `TargetNotFound`,
+        // an unreadable one its file's error.
+        let existing = cli_core::load_target(&ctx.store(), args.name.as_deref().unwrap())?;
+        if renew_wizard_asks(args.typed) {
+            let (token, _verified) =
+                target_wizard::run_renew_wizard(ctx, &existing.config.provider, args.no_ping)?;
+            args.token = Some(token);
+        }
     } else {
-        let out = target_wizard::run_add_wizard(args)?;
+        let out = target_wizard::run_add_wizard(ctx, args)?;
         merge_wizard_output(args, out);
     }
     Ok(())
@@ -367,83 +452,130 @@ pub(crate) fn map_wizard_prompt_error(err: inquire::InquireError) -> CliError {
     }
 }
 
-fn run_renew(paths: &TargetStorePaths, args: AddArgs, name: &str) -> Result<()> {
-    // Read without the lock: the checks and the ping below take as long as
-    // the network does. The save re-reads under it (`save_renewed`).
-    let existing = load_renewable(paths, name)?;
-
-    // `--renew` deliberately ignores the config flags (provider,
-    // region, tier, etc.). Refusing them up front beats silently
-    // dropping a user-provided value.
+/// `target add --renew` on the core, in today's order: the target (both of its files, as
+/// `load_renewable` read them), the config-flag refusal, the token [`renew_token`] picks, then
+/// `plan_renew` (format, SSH key, "does anything change") and `execute_renew` (ping a new token,
+/// then the patch under the lock). Renew changes what differs from what is stored: a typed
+/// `--ssh-key` with no typed `--token` changes only the key and leaves the credentials as they
+/// are — an `HCLOUD_TOKEN` is not used then, and a note says so when it holds another token. A
+/// key from `APPRAFTER_SSH_PUBLIC_KEY_PATH` is applied only beside a new token.
+fn renew(ctx: &Context, args: AddArgs, name: &str) -> miette::Result<()> {
+    let tref = TargetRef::named(ctx, name).map_err(renew_missing)?;
+    let stored = cli_core::load_target(&ctx.store(), name).map_err(|e| renew_missing(e.into()))?;
+    let provider = stored.config.provider;
+    // `--renew` deliberately ignores the config flags; refusing them up front beats silently
+    // dropping a value the operator passed.
     reject_config_flags_on_renew(
         args.provider.as_deref(),
         args.region.as_deref(),
         args.tier.as_deref(),
         args.cluster_name.as_deref(),
+        args.server_type.as_deref(),
+    )
+    .map_err(miette::Report::new)?;
+    let mut token = args.token;
+    // A key-only renewal: `HCLOUD_TOKEN` is not this command's token. Kept for the note.
+    let unused_env_token = match renew_token(args.typed) {
+        RenewToken::KeyOnly => token
+            .take()
+            .filter(|env| stored.credentials.hetzner_token.as_ref() != Some(env)),
+        RenewToken::Typed | RenewToken::AskOrEnv => None,
+    };
+    if token.is_none() && renew_token(args.typed) != RenewToken::KeyOnly {
+        return Err(token_required(&provider));
+    }
+    // Rule 3: a key from `APPRAFTER_SSH_PUBLIC_KEY_PATH` rides only beside a real rotation. The
+    // core counts the stored token as no token, so beside one the env key alone would make the
+    // renewal key-only; without it the core refuses "token unchanged", as before key-only
+    // renewals existed. A typed `--ssh-key` is always applied (`--token <stored> --ssh-key
+    // <new>` is key-only on purpose).
+    let rotates = token
+        .as_ref()
+        .is_some_and(|t| stored.credentials.hetzner_token.as_ref() != Some(t));
+    let ssh_key = if args.typed.ssh_key || rotates {
+        args.ssh_key
+    } else {
+        None
+    };
+    let plan = core_target::plan_renew(
+        ctx,
+        &tref,
+        core_target::RenewArgs {
+            token: token.map(SecretString::new),
+            ssh_key,
+        },
+    )
+    .map_err(renew_missing)?;
+    let renewed = completed(
+        core_target::execute_renew(ctx, plan, &CliReporter, &CancellationToken::new())
+            .map_err(renew_missing)?,
     )?;
-
-    // Token is required for renew (whole point of the flag);
-    // ssh-key path is optional (user may renew only the token).
-    let token = require_token(&existing.config.provider, args.token.as_deref())?;
-
-    // Reject identical-token "rotations" loudly. The wizard happily
-    // accepts whatever the user types, the CLI happily accepts the
-    // env var — and an operator who pastes the OLD token by
-    // muscle-memory gets a green "credentials rotated" message
-    // without anything actually changing in Hetzner. That's the
-    // exact opposite of what `--renew` advertises. Match a token
-    // by raw bytes so even a single-char drift counts as "new".
-    reject_identical_token(existing.credentials.hetzner_token.as_deref(), &token, name)?;
-
-    if let Some(path) = args.ssh_key.as_ref() {
-        verify_ssh_key_readable(path)?;
+    if unused_env_token.is_some() {
+        eprintln!("{}", unused_env_token_note(name));
     }
-    if !args.no_ping {
-        ping_provider(&existing.config.provider, &token)?;
-    }
-
-    save_renewed(paths, name, token, args.ssh_key)?;
-
-    println!(
-        "target `{name}` credentials rotated{}",
-        renew_verified_suffix(args.no_ping)
-    );
+    println!("{}", renewed_line(&renewed));
     Ok(())
 }
 
-/// Target `name`, for `--renew`, which rotates the credentials of a target
-/// that exists.
-fn load_renewable(paths: &TargetStorePaths, name: &str) -> Result<Target> {
-    match load_target(paths, name) {
-        Ok(t) => Ok(t),
-        Err(CliError::TargetNotFound { .. }) => Err(CliError::Other(format!(
-            "target `{name}` does not exist — drop `--renew` to create it fresh"
-        ))),
-        Err(e) => Err(e),
+/// The note a key-only renewal prints when `HCLOUD_TOKEN` holds a token other than the stored
+/// one: it was not used, and how to rotate as well.
+pub(crate) fn unused_env_token_note(name: &str) -> String {
+    format!(
+        "note: `HCLOUD_TOKEN` holds a token other than the one stored for `{name}` and was not \
+         used: `--ssh-key` without `--token` changes only the key. Pass `--token <X>` to rotate \
+         the token as well."
+    )
+}
+
+/// The line `target add --renew` ends with: what changed, read off the outcome. A saved token
+/// says how it was checked ([`renew_verified_suffix`]); a key-only renewal says the credentials
+/// were kept.
+pub(crate) fn renewed_line(r: &core_target::TargetRenewed) -> String {
+    use apprafter_core::provider::Verification;
+    let name = &r.name;
+    match (&r.token, r.ssh_key_changed) {
+        (Some(v), key) => format!(
+            "target `{name}` credentials rotated{}{}",
+            if key { " and SSH key updated" } else { "" },
+            renew_verified_suffix(matches!(v, Verification::Skipped { .. }))
+        ),
+        (None, true) => format!("target `{name}` SSH key updated (credentials unchanged)"),
+        // The core refuses a renewal that changes nothing; said plainly all the same.
+        (None, false) => format!("target `{name}` unchanged"),
     }
 }
 
-/// Write the rotated `token` (and the new `ssh_key` path, if one was given)
-/// into target `name`, under the store lock: re-read, re-checked (the target
-/// still exists, and the token is still a new one), and only those fields
-/// changed, so an edit made while the token was being verified — a
-/// `target machine`, say — is kept rather than written over.
-fn save_renewed(
-    paths: &TargetStorePaths,
-    name: &str,
-    token: String,
-    ssh_key: Option<PathBuf>,
-) -> Result<()> {
-    let _store_lock = store_lock_if_present(paths)?;
-    let mut target = load_renewable(paths, name)?;
-    reject_identical_token(target.credentials.hetzner_token.as_deref(), &token, name)?;
-    if let Some(path) = ssh_key {
-        target.config.ssh_key_path = Some(path);
+/// Where `--renew` takes its token from (D.3d review #0/#3/#8). An environment variable never
+/// changes what an explicit command means: `HCLOUD_TOKEN` is the standard variable of the
+/// hcloud CLI and may hold another project's token, and `APPRAFTER_SSH_PUBLIC_KEY_PATH` may be
+/// set for every command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RenewToken {
+    /// `--token` typed: that token, and no wizard.
+    Typed,
+    /// `--ssh-key` typed and no `--token`: the key alone. `HCLOUD_TOKEN` is not used and no
+    /// wizard asks; the credentials stay as they are.
+    KeyOnly,
+    /// Neither typed: as before WI-452 — on a terminal the renew wizard asks (it ignores
+    /// `HCLOUD_TOKEN`, which may hold the old token), elsewhere `HCLOUD_TOKEN` or today's
+    /// refusal. A key from `APPRAFTER_SSH_PUBLIC_KEY_PATH` is applied alongside, and never
+    /// makes the renewal key-only by itself.
+    AskOrEnv,
+}
+
+pub(crate) fn renew_token(typed: crate::dispatch::Typed) -> RenewToken {
+    match (typed.token, typed.ssh_key) {
+        (true, _) => RenewToken::Typed,
+        (false, true) => RenewToken::KeyOnly,
+        (false, false) => RenewToken::AskOrEnv,
     }
-    target.credentials = TargetCredentials {
-        hetzner_token: Some(token),
-    };
-    save_target(paths, &target)
+}
+
+/// Whether the renew wizard asks for a token on a terminal: only when neither `--token` nor
+/// `--ssh-key` was typed. A typed token is the token; a typed key alone is a key-only renewal;
+/// a key from `APPRAFTER_SSH_PUBLIC_KEY_PATH` still asks.
+pub(crate) fn renew_wizard_asks(typed: crate::dispatch::Typed) -> bool {
+    renew_token(typed) == RenewToken::AskOrEnv
 }
 
 // ---------------------------------------------------------------
@@ -452,170 +584,32 @@ fn save_renewed(
 
 /// `--renew` rotates credentials and nothing else. Refusing the config flags
 /// up front beats silently dropping a value the operator clearly meant to
-/// change.
+/// change (R5: `--server-type` was dropped that way).
 pub(crate) fn reject_config_flags_on_renew(
     provider: Option<&str>,
     region: Option<&str>,
     tier: Option<&str>,
     cluster_name: Option<&str>,
+    server_type: Option<&str>,
 ) -> Result<()> {
-    if provider.is_some() || region.is_some() || tier.is_some() || cluster_name.is_some() {
-        return Err(CliError::Other(
-            "`--renew` only updates credentials — `--provider`, `--region`, `--tier`, `--cluster-name` are not allowed alongside it. Drop `--renew` if you want to change config too.".to_string(),
-        ));
+    if provider.is_some()
+        || region.is_some()
+        || tier.is_some()
+        || cluster_name.is_some()
+        || server_type.is_some()
+    {
+        return Err(CliError::UsageRefused {
+            message: "`--renew` only updates credentials — `--provider`, `--region`, `--tier`, \
+                      `--cluster-name`, `--server-type` are not allowed alongside it. Drop \
+                      `--renew` if you want to change config too."
+                .to_string(),
+            help: "`--renew` rotates the token (and `--ssh-key`). To change other fields, run \
+                   `apprafter target add <name> --force --provider hetzner-cloud --token <X>` \
+                   with the flags to change (the fields you do not pass are kept), or \
+                   `apprafter target machine --target <name>` for the server type."
+                .to_string(),
+        });
     }
-    Ok(())
-}
-
-/// Reject an identical-token "rotation" loudly.
-///
-/// The wizard happily accepts whatever the operator types and the CLI happily
-/// accepts the env var — so someone who pastes the OLD token by muscle memory
-/// otherwise gets a green "credentials rotated" with nothing rotated. Compared
-/// by raw bytes: a single-character drift counts as new.
-pub(crate) fn reject_identical_token(existing: Option<&str>, new: &str, name: &str) -> Result<()> {
-    if existing == Some(new) {
-        return Err(CliError::Other(format!(
-            "`--renew` requires a NEW token, but the value provided is identical to the one already saved for target `{name}`. Generate a fresh token in the Hetzner Cloud Console → Security → API Tokens, then re-run `apprafter target add {name} --renew` with the new value."
-        )));
-    }
-    Ok(())
-}
-
-/// Pure target-name validator. Returns `Result<(), String>` so
-/// callers can pick the right error wrapping (CliError for direct
-/// CLI surface; `inquire::Validation::Invalid` for wizard
-/// prompts). The string body is reused verbatim in both paths so
-/// error UX stays consistent.
-pub(crate) fn check_target_name(name: &str) -> std::result::Result<(), String> {
-    if name.is_empty() {
-        return Err("target name must not be empty".to_string());
-    }
-    if name.len() > MAX_TARGET_NAME_LEN {
-        return Err(format!(
-            "target name must be ≤ {MAX_TARGET_NAME_LEN} chars (got {})",
-            name.len()
-        ));
-    }
-    // Avoid filesystem-reserved characters and any path-traversal
-    // surface. The pattern matches Kubernetes resource names which
-    // are already familiar to operators.
-    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-        return Err(format!(
-            "target name `{name}` is invalid — allowed: alphanumeric + `-`"
-        ));
-    }
-    if name.starts_with('-') || name.ends_with('-') {
-        return Err(format!(
-            "target name `{name}` must not start or end with `-`"
-        ));
-    }
-    Ok(())
-}
-
-fn validate_target_name(name: &str) -> Result<()> {
-    check_target_name(name).map_err(CliError::Other)
-}
-
-fn require_known_provider(provider: Option<&str>) -> Result<String> {
-    let provider = provider.ok_or_else(|| {
-        CliError::Other(format!(
-            "`--provider` is required (supported: {})",
-            SUPPORTED_PROVIDERS.join(", ")
-        ))
-    })?;
-    if !SUPPORTED_PROVIDERS.contains(&provider) {
-        return Err(CliError::Other(format!(
-            "provider `{provider}` is not supported in v0.1.73 (supported: {})",
-            SUPPORTED_PROVIDERS.join(", ")
-        )));
-    }
-    Ok(provider.to_string())
-}
-
-fn require_token(provider: &str, token: Option<&str>) -> Result<String> {
-    let token = token.ok_or_else(|| {
-        CliError::Other(format!(
-            "`--token` is required for provider `{provider}` (or set `HCLOUD_TOKEN` env var)"
-        ))
-    })?;
-    if provider == "hetzner-cloud" {
-        validate_hetzner_token_format(token)
-            .map_err(|reason| CliError::Other(format!("invalid Hetzner Cloud token: {reason}")))?;
-    }
-    Ok(token.to_string())
-}
-
-/// Run the read-only `validate_credentials()` ping for the
-/// provider. For Hetzner Cloud this is `GET /v1/locations`
-/// against the production base URL (overridable via
-/// `APPRAFTER_HCLOUD_BASE_URL` through `hcloud_base_url()` —
-/// integration tests redirect against a `mockito::Server`).
-///
-/// v0.1.87: failures classify into one of two typed CliError
-/// variants (`ProviderTokenRejected` for 401, otherwise
-/// `ProviderApiUnreachable`) and carry the original error as a
-/// `#[source]` cause chain. Miette renders both layers — operator
-/// gets the high-level rotation / reachability help PLUS the raw
-/// API envelope underneath.
-fn ping_provider(provider: &str, token: &str) -> Result<()> {
-    match provider {
-        "hetzner-cloud" => {
-            let base = hcloud_base_url();
-            tracing::debug!(provider, base = %base, "running provider validator ping");
-            let validator = HetznerCloudValidator::new(base.clone(), token);
-            validator
-                .validate_credentials()
-                .map_err(|err| classify_ping_error(provider, err))
-        }
-        _ => {
-            // Defensive: require_known_provider already gates
-            // on the whitelist, so this arm should be
-            // unreachable. Surface a typed error rather than
-            // panic so a future regression in the whitelist
-            // doesn't blow up the user's shell.
-            Err(CliError::Other(format!(
-                "no validator wired for provider `{provider}` — pass `--no-ping` to skip"
-            )))
-        }
-    }
-}
-
-/// Sort a credential-validation error into the right typed variant.
-/// 401 → `ProviderTokenRejected` (operator can rotate); everything
-/// else → `ProviderApiUnreachable` (operator can run
-/// `apprafter doctor` or wait out the outage). Both wrappers carry
-/// the original error as a `#[source]` cause chain so miette
-/// renders both the top-level summary and the underlying API
-/// envelope. Shared with the wizard's classification path so both
-/// flows emit identical diagnostic codes.
-fn classify_ping_error(provider: &str, err: CliError) -> CliError {
-    match err {
-        CliError::Hetzner { status: 401, .. } => CliError::ProviderTokenRejected {
-            provider: provider.to_string(),
-            cause: Box::new(err),
-        },
-        _ => CliError::ProviderApiUnreachable {
-            provider: provider.to_string(),
-            cause: Box::new(err),
-        },
-    }
-}
-
-fn verify_ssh_key_readable(path: &Path) -> Result<()> {
-    if !path.exists() {
-        return Err(CliError::Other(format!(
-            "SSH key path `{}` does not exist",
-            path.display()
-        )));
-    }
-    // Surface unreadable file early — read_to_string is fine for
-    // a public key (small file). Don't keep the contents around;
-    // the path is what gets stored in `TargetConfig`, not the
-    // key body.
-    std::fs::read_to_string(path).map_err(|e| {
-        CliError::Other(format!("SSH key `{}` is not readable: {e}", path.display()))
-    })?;
     Ok(())
 }
 
@@ -645,42 +639,45 @@ pub(crate) fn report_store_lock_event(event: cli_core::StoreLockEvent<'_>) {
     eprintln!("{}", store_lock_event_line(&event));
 }
 
-/// The stderr line for a store-lock event.
+/// The stderr line for a store-lock event: the core's event as the CLI's reporter prints it,
+/// so the commands still on the old code (`apply`, `target firewall`) and the core-backed ones
+/// word a wait and a lock-less store the same way.
 pub(crate) fn store_lock_event_line(event: &cli_core::StoreLockEvent<'_>) -> String {
-    match event {
-        cli_core::StoreLockEvent::Waiting { sentinel } => format!(
-            "waiting for another AppRafter process to release the target store ({})…",
-            sentinel.display()
-        ),
-        cli_core::StoreLockEvent::Unlocked { sentinel, error } => format!(
-            "warning: cannot lock the target store ({}): {error}; continuing without the lock",
-            sentinel.display()
-        ),
-    }
+    crate::render::reporter::CliReporter::line(&apprafter_core::target::store_lock_event(event))
+        .unwrap_or_default()
 }
 
-/// Promote the supplied target to active when the store has no
-/// `GlobalConfig` yet (first-run case). Returns whether the active
-/// pointer changed — caller uses it to vary the confirmation
-/// message between "saved + active" and "saved, active unchanged".
-/// Existing stores keep their active target; users switch
-/// explicitly via `apprafter target use <name>` (Track A.5).
-fn ensure_active_target(paths: &TargetStorePaths, name: &str) -> Result<bool> {
-    match load_global_config(paths)? {
-        Some(_) => Ok(false),
-        None => {
-            // No global config yet — either we just created the
-            // very first target, or someone hand-deleted config.yaml.
-            // Either way, point active at the most-recently-saved
-            // target, which by definition exists on disk now.
-            let cfg = GlobalConfig {
-                active_target: name.to_string(),
-                version: cli_core::target::TARGET_STORE_VERSION,
-            };
-            save_global_config(paths, &cfg)?;
-            Ok(true)
+/// Every backticked `apprafter …` command in `text` parses with the CLI's clap tree, once each
+/// `<placeholder>` gets a sample value and a `…` is dropped; returns how many it checked. A help
+/// text may only send the reader to a command that exists.
+#[cfg(test)]
+pub(crate) fn assert_commands_parse(text: &str) -> usize {
+    use clap::Parser as _;
+    let mut checked = 0;
+    for span in text.split('`').skip(1).step_by(2) {
+        if !span.starts_with("apprafter ") {
+            continue;
         }
+        let mut sample = String::new();
+        let mut in_placeholder = false;
+        for c in span.chars() {
+            match c {
+                '<' => in_placeholder = true,
+                '>' if in_placeholder => {
+                    in_placeholder = false;
+                    sample.push('x');
+                }
+                _ if in_placeholder => {}
+                c => sample.push(c),
+            }
+        }
+        let argv: Vec<&str> = sample.split_whitespace().filter(|w| *w != "…").collect();
+        if let Err(e) = crate::cli::Cli::try_parse_from(&argv) {
+            panic!("`{span}` does not parse: {e}");
+        }
+        checked += 1;
     }
+    checked
 }
 
 // ---------------------------------------------------------------
@@ -693,6 +690,8 @@ fn ensure_active_target(paths: &TargetStorePaths, name: &str) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use apprafter_core::target::{ProvisionedState, TokenPresence};
+    use std::path::Path;
 
     // ── the store lock: what a wait and a lock-less store print ──────────
 
@@ -721,260 +720,48 @@ mod tests {
         );
     }
 
-    // ── the store lock: re-checked right before the save ─────────────────
-
-    /// A target store at a fresh temp root.
-    fn store() -> (tempfile::TempDir, TargetStorePaths) {
-        let dir = tempfile::tempdir().unwrap();
-        let paths = TargetStorePaths::for_root(dir.path().join("store"));
-        (dir, paths)
-    }
-
-    /// Target `name`, holding `token`.
-    fn target(name: &str, token: &str) -> Target {
-        Target {
-            name: name.to_string(),
-            config: TargetConfig {
-                provider: "hetzner-cloud".to_string(),
-                ..TargetConfig::default()
-            },
-            credentials: TargetCredentials {
-                hetzner_token: Some(token.to_string()),
-            },
-        }
-    }
-
-    fn token_of(paths: &TargetStorePaths, name: &str) -> Option<String> {
-        load_target(paths, name).unwrap().credentials.hetzner_token
-    }
-
-    /// `target add` checks the name, pings the provider unlocked, then
-    /// saves. Another add that created the same name in between is found
-    /// by the check under the lock and is not overwritten without
-    /// `--force` — the window the ping used to hold the lock across.
     #[test]
-    fn an_add_does_not_overwrite_a_target_created_since_its_first_check() {
-        let (_dir, paths) = store();
-        check_name_free(&paths, "work", false).expect("free at the first check");
-        // Meanwhile, during the ping, another add creates it.
-        assert!(save_new_target(&paths, &target("work", "first"), false).unwrap());
-
-        let err = save_new_target(&paths, &target("work", "second"), false)
-            .expect_err("taken since the first check");
-        assert!(err.to_string().contains("already exists"), "{err}");
-        assert_eq!(token_of(&paths, "work").as_deref(), Some("first"));
-
-        // `--force` is what overwrites, and an existing store keeps its
-        // active target.
-        assert!(!save_new_target(&paths, &target("work", "second"), true).unwrap());
-        assert_eq!(token_of(&paths, "work").as_deref(), Some("second"));
-    }
-
-    /// `--renew` writes only the token (and a new key path) into the
-    /// target as it is under the lock: an edit made while the new token
-    /// was being verified is kept, and a target removed meanwhile is not
-    /// brought back.
-    #[test]
-    fn a_renew_patches_the_target_as_it_is_at_the_save() {
-        let (_dir, paths) = store();
-        save_target(&paths, &target("work", "old")).unwrap();
-        let read_first = load_renewable(&paths, "work").unwrap();
-        // Meanwhile, during the ping, `target machine` records a SKU.
-        let mut machine = load_target(&paths, "work").unwrap();
-        machine.config.server_type = Some("cx32".to_string());
-        save_target(&paths, &machine).unwrap();
-
-        save_renewed(&paths, "work", "new".to_string(), None).unwrap();
-        let saved = load_target(&paths, "work").unwrap();
-        assert_eq!(saved.credentials.hetzner_token.as_deref(), Some("new"));
+    fn the_lock_lines_come_from_the_core_event_and_the_cli_reporter() {
+        let sentinel = std::path::Path::new("/s/.lock");
+        let waiting = cli_core::StoreLockEvent::Waiting { sentinel };
         assert_eq!(
-            saved.config.server_type.as_deref(),
-            Some("cx32"),
-            "the edit made meanwhile was written over by {read_first:?}"
+            store_lock_event_line(&waiting),
+            crate::render::reporter::CliReporter::line(&apprafter_core::target::store_lock_event(
+                &waiting
+            ))
+            .unwrap(),
         );
-
-        // The same token again is still refused under the lock.
-        let err =
-            save_renewed(&paths, "work", "new".to_string(), None).expect_err("identical token");
-        assert!(err.to_string().contains("NEW token"), "{err}");
-
-        remove_target(&paths, "work").unwrap();
-        let err =
-            save_renewed(&paths, "work", "newer".to_string(), None).expect_err("removed meanwhile");
-        assert!(err.to_string().contains("does not exist"), "{err}");
-        assert!(!paths.target_dir("work").exists());
     }
 
+    // ── the name rule (the core's `validate_name`) ───────────────────────
+
     #[test]
-    fn validate_target_name_accepts_kebab_lowercase() {
+    fn the_name_rule_accepts_kebab_names_and_refuses_the_rest() {
         for n in ["default", "work", "prod-eu", "team-2", "alpha9", "A-B-C"] {
-            validate_target_name(n).unwrap_or_else(|e| panic!("name `{n}` should be valid: {e}"));
+            assert_eq!(
+                core_target::validate_name(n),
+                Ok(()),
+                "`{n}` should be valid"
+            );
         }
-    }
-
-    #[test]
-    fn validate_target_name_rejects_empty() {
-        let err = validate_target_name("").expect_err("empty must error");
-        match err {
-            CliError::Other(msg) => assert!(msg.contains("must not be empty"), "{msg}"),
-            other => panic!("expected Other, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn validate_target_name_rejects_punctuation() {
+        let long = "a".repeat(core_target::TARGET_NAME_MAX_LEN + 1);
         for n in [
+            "",
             "foo.bar",
             "with space",
             "slash/path",
             "under_score",
             "@home",
+            "-leading",
+            "trailing-",
+            "--",
+            long.as_str(),
         ] {
             assert!(
-                validate_target_name(n).is_err(),
-                "name `{n}` should be rejected"
+                core_target::validate_name(n).is_err(),
+                "`{n}` should be refused"
             );
         }
-    }
-
-    #[test]
-    fn validate_target_name_rejects_leading_or_trailing_dash() {
-        assert!(validate_target_name("-leading").is_err());
-        assert!(validate_target_name("trailing-").is_err());
-        assert!(validate_target_name("--").is_err());
-    }
-
-    #[test]
-    fn validate_target_name_rejects_overlong() {
-        let long = "a".repeat(MAX_TARGET_NAME_LEN + 1);
-        let err = validate_target_name(&long).expect_err("too long");
-        assert!(matches!(err, CliError::Other(_)));
-    }
-
-    #[test]
-    fn require_known_provider_rejects_missing_flag() {
-        let err = require_known_provider(None).expect_err("missing provider");
-        match err {
-            CliError::Other(msg) => {
-                assert!(msg.contains("`--provider` is required"), "{msg}");
-                assert!(msg.contains("hetzner-cloud"), "{msg}");
-            }
-            other => panic!("expected Other, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn require_known_provider_rejects_unknown_value() {
-        let err = require_known_provider(Some("aws-bedrock")).expect_err("unknown provider");
-        match err {
-            CliError::Other(msg) => assert!(msg.contains("not supported"), "{msg}"),
-            other => panic!("expected Other, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn require_token_validates_hetzner_format() {
-        // Canonical 64-char alphanumeric, no prefix — what Hetzner
-        // Cloud Console actually issues.
-        let token = "a".repeat(64);
-        assert!(require_token("hetzner-cloud", Some(&token)).is_ok());
-
-        // Underscore is non-alphanumeric → rejected. Pinning this
-        // case to make sure the v0.1.73 regression (which required
-        // an `hcloud_` prefix) never sneaks back.
-        let bad = require_token("hetzner-cloud", Some("not_a_token")).expect_err("bad token");
-        match bad {
-            CliError::Other(msg) => assert!(msg.contains("invalid Hetzner Cloud token"), "{msg}"),
-            other => panic!("expected Other, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn verify_ssh_key_readable_errors_on_missing_path() {
-        let err = verify_ssh_key_readable(Path::new("/this/should/not/exist/anywhere/key.pub"))
-            .expect_err("missing path");
-        match err {
-            CliError::Other(msg) => assert!(msg.contains("does not exist"), "{msg}"),
-            other => panic!("expected Other, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn verify_ssh_key_readable_accepts_real_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("id_ed25519.pub");
-        std::fs::write(&path, "ssh-ed25519 AAAA...").unwrap();
-        assert!(verify_ssh_key_readable(&path).is_ok());
-    }
-
-    // ── ping_provider / classify_ping_error ──────────────────────────────
-
-    /// A 401 means the token is wrong and the operator can fix it by rotating;
-    /// anything else means the API could not be reached and rotating would be
-    /// a waste of time. The two must not collapse into one diagnostic.
-    #[test]
-    fn a_401_classifies_as_a_rejected_token_and_everything_else_as_unreachable() {
-        let rejected = classify_ping_error(
-            "hetzner-cloud",
-            CliError::Hetzner {
-                endpoint: "GET /v1/locations".to_string(),
-                status: 401,
-                code: "unauthorized".to_string(),
-                message: "unauthorized".to_string(),
-            },
-        );
-        assert!(
-            matches!(rejected, CliError::ProviderTokenRejected { .. }),
-            "{rejected:?}"
-        );
-
-        let unreachable = classify_ping_error(
-            "hetzner-cloud",
-            CliError::Hetzner {
-                endpoint: "GET /v1/locations".to_string(),
-                status: 503,
-                code: "unavailable".to_string(),
-                message: "maintenance".to_string(),
-            },
-        );
-        assert!(
-            matches!(unreachable, CliError::ProviderApiUnreachable { .. }),
-            "{unreachable:?}"
-        );
-
-        let offline = classify_ping_error("hetzner-cloud", CliError::Other("dns".to_string()));
-        assert!(
-            matches!(offline, CliError::ProviderApiUnreachable { .. }),
-            "{offline:?}"
-        );
-    }
-
-    /// The classified error keeps the original as its `#[source]` cause, so
-    /// miette renders the raw API envelope under the high-level help. Losing
-    /// it would leave the operator with advice and no evidence.
-    #[test]
-    fn a_classified_ping_error_keeps_the_original_as_its_cause() {
-        let classified = classify_ping_error(
-            "hetzner-cloud",
-            CliError::Hetzner {
-                endpoint: "GET /v1/locations".to_string(),
-                status: 401,
-                code: "unauthorized".to_string(),
-                message: "token invalid".to_string(),
-            },
-        );
-        let cause = std::error::Error::source(&classified).expect("a cause chain");
-        assert!(format!("{cause}").contains("token invalid"), "{cause}");
-    }
-
-    /// A provider that slips past the whitelist must surface a typed error
-    /// with a way forward, not panic the operator's shell.
-    #[test]
-    fn an_unwired_provider_errors_instead_of_panicking() {
-        let err = ping_provider("aws", "irrelevant").expect_err("no validator for aws");
-        let msg = format!("{err}");
-        assert!(msg.contains("aws"), "{msg}");
-        assert!(msg.contains("--no-ping"), "{msg}");
     }
 
     // ── renew guards ─────────────────────────────────────────────────────
@@ -984,37 +771,287 @@ mod tests {
     /// guard exists to prevent.
     #[test]
     fn every_config_flag_is_refused_alongside_renew() {
-        assert!(reject_config_flags_on_renew(None, None, None, None).is_ok());
-        for (p, r, t, c) in [
-            (Some("hetzner-cloud"), None, None, None),
-            (None, Some("hel1"), None, None),
-            (None, None, Some("1"), None),
-            (None, None, None, Some("platform-2")),
+        assert!(reject_config_flags_on_renew(None, None, None, None, None).is_ok());
+        for (p, r, t, c, s) in [
+            (Some("hetzner-cloud"), None, None, None, None),
+            (None, Some("hel1"), None, None, None),
+            (None, None, Some("1"), None, None),
+            (None, None, None, Some("platform-2"), None),
+            // R5: `--server-type` was silently dropped.
+            (None, None, None, None, Some("cx32")),
         ] {
-            let err = reject_config_flags_on_renew(p, r, t, c)
+            let err = reject_config_flags_on_renew(p, r, t, c, s)
                 .expect_err("a config flag alongside --renew must be refused");
+            let msg = format!("{err}");
+            assert!(msg.contains("only updates credentials"), "{msg}");
             assert!(
-                format!("{err}").contains("only updates credentials"),
-                "{err}"
+                msg.contains("`--server-type`"),
+                "the refusal lists every refused flag: {msg}"
             );
         }
     }
 
-    /// Re-pasting the SAME token must fail loudly. A green "credentials
-    /// rotated" that rotated nothing is worse than an error — the operator
-    /// believes the old, possibly leaked, token is out of use.
-    #[test]
-    fn re_pasting_the_same_token_is_refused_but_one_char_counts_as_new() {
-        let old = "a".repeat(64);
-        let err = reject_identical_token(Some(&old), &old, "work")
-            .expect_err("an identical token is not a rotation");
-        let msg = format!("{err}");
-        assert!(msg.contains("requires a NEW token"), "{msg}");
-        assert!(msg.contains("work"), "{msg}");
+    // ── bug 2: deliberate refusals have their own codes and help ─────────
 
-        let nearly = format!("{}b", &old[..63]);
-        assert!(reject_identical_token(Some(&old), &nearly, "work").is_ok());
-        assert!(reject_identical_token(None, &old, "work").is_ok());
+    fn help(r: &miette::Report) -> String {
+        r.help().map(|h| h.to_string()).unwrap_or_default()
+    }
+    fn code(r: &miette::Report) -> String {
+        r.code().map(|c| c.to_string()).unwrap_or_default()
+    }
+
+    #[test]
+    fn every_target_refusal_has_its_code_and_none_says_file_an_issue() {
+        let cases: Vec<(miette::Report, &str)> = vec![
+            (
+                report(CoreError::TargetExists { name: "p".into() }),
+                "apprafter::target::exists",
+            ),
+            (
+                report(CoreError::RenewTokenUnchanged { name: "p".into() }),
+                "apprafter::target::renew_token_unchanged",
+            ),
+            (
+                report(CoreError::RenewNothingToChange { name: "p".into() }),
+                "apprafter::target::renew_nothing_to_change",
+            ),
+            (
+                report(CoreError::InvalidTargetName {
+                    name: "a_b".into(),
+                    problem: core_target::validate_name("a_b").unwrap_err(),
+                }),
+                "apprafter::target::invalid_name",
+            ),
+            (
+                report(CoreError::SameTargetName { name: "p".into() }),
+                "apprafter::target::same_name",
+            ),
+            (
+                report(CoreError::TargetProvisioned {
+                    name: "p".into(),
+                    server_id: 1,
+                    server_name: "s".into(),
+                }),
+                "apprafter::target::provisioned",
+            ),
+            (
+                renew_missing(CoreError::TargetNotFound {
+                    name: "g".into(),
+                    available: vec![],
+                }),
+                "apprafter::target::not_found",
+            ),
+            (name_required(), "apprafter::cli::usage_refused"),
+            (provider_required(), "apprafter::cli::usage_refused"),
+            (
+                token_required("hetzner-cloud"),
+                "apprafter::cli::usage_refused",
+            ),
+            (
+                miette::Report::new(
+                    reject_config_flags_on_renew(Some("x"), None, None, None, None).unwrap_err(),
+                ),
+                "apprafter::cli::usage_refused",
+            ),
+            (
+                removal_needs_yes("p"),
+                "apprafter::cli::confirmation_required",
+            ),
+        ];
+        for (r, want) in cases {
+            assert_eq!(code(&r), want);
+            let h = help(&r);
+            assert!(!h.is_empty() && !h.contains("file an issue"), "{want}: {h}");
+            assert_commands_parse(&h);
+        }
+    }
+
+    /// The CLI-input refusals keep today's messages; only the code and the help are new.
+    #[test]
+    fn the_usage_refusals_keep_todays_messages() {
+        assert_eq!(
+            name_required().to_string(),
+            "target name required — pass it as a positional argument (`apprafter target add \
+             <name>`) or run on a TTY to enter the wizard"
+        );
+        assert_eq!(
+            provider_required().to_string(),
+            "`--provider` is required (supported: hetzner-cloud)"
+        );
+        assert_eq!(
+            token_required("hetzner-cloud").to_string(),
+            "`--token` is required for provider `hetzner-cloud` (or set `HCLOUD_TOKEN` env var)"
+        );
+        assert_eq!(
+            removal_needs_yes("prod").to_string(),
+            "non-interactive invocation: pass `--yes` to confirm removing target `prod` \
+             (refusing silent destruction)"
+        );
+    }
+
+    /// No token and no wizard to ask for one: the help says where a token is created, in the
+    /// one shared wording (WI-454).
+    #[test]
+    fn a_missing_token_points_at_the_token_page() {
+        let h = help(&token_required("hetzner-cloud"));
+        assert!(
+            h.contains(&format!(
+                "create a token in {}",
+                cli_core::target::HETZNER_API_TOKENS_PAGE
+            )),
+            "{h}"
+        );
+    }
+
+    #[test]
+    fn renew_on_a_missing_target_says_drop_renew() {
+        let r = renew_missing(CoreError::TargetNotFound {
+            name: "g".into(),
+            available: vec![],
+        });
+        assert!(help(&r).contains("drop `--renew`"), "{}", help(&r));
+        assert_eq!(r.to_string(), "target `g` not found (available: )");
+        // Anything else renders as `report` does.
+        let other = renew_missing(CoreError::RenewTokenUnchanged { name: "g".into() });
+        assert_eq!(
+            help(&other),
+            help(&report(CoreError::RenewTokenUnchanged { name: "g".into() }))
+        );
+    }
+
+    /// `target rename` has no `--force` or `--renew`: its taken-name refusal says what rename
+    /// can do instead of `target add`'s way forward.
+    #[test]
+    fn a_rename_onto_a_taken_name_offers_what_rename_can_do() {
+        let r = rename_refused(CoreError::TargetExists {
+            name: "staging".into(),
+        });
+        assert_eq!(code(&r), "apprafter::target::exists");
+        let h = help(&r);
+        assert!(!h.contains("--force") && !h.contains("--renew"), "{h}");
+        assert!(h.contains("`apprafter target remove staging`"), "{h}");
+        assert_eq!(assert_commands_parse(&h), 1, "{h}");
+        // Anything else renders as `report` does.
+        let other = rename_refused(CoreError::SameTargetName { name: "p".into() });
+        assert_eq!(
+            help(&other),
+            help(&report(CoreError::SameTargetName { name: "p".into() }))
+        );
+    }
+
+    #[test]
+    fn the_provisioned_refusal_hands_over_the_rebuild_recipe() {
+        let h = help(&report(CoreError::TargetProvisioned {
+            name: "p".into(),
+            server_id: 1,
+            server_name: "s".into(),
+        }));
+        // D.3a (WI-449 finding 3) fixed the recipe: `restore <repo> --reprovision`, after `destroy`.
+        assert!(
+            h.contains("apprafter backup create") && h.contains("restore <repo> --reprovision"),
+            "{h}"
+        );
+    }
+
+    // ── bug 1: the saved line tells the pointer outcomes apart ───────────
+
+    fn added(
+        cli_default: Option<ActivePointerChange>,
+        is_cli_default: bool,
+        replaced: bool,
+    ) -> core_target::TargetAdded {
+        core_target::TargetAdded {
+            name: "prod".into(),
+            replaced,
+            is_cli_default,
+            cli_default,
+            token: apprafter_core::provider::Verification::Skipped {
+                reason: apprafter_core::provider::SkipReason::NoPing,
+            },
+            sku: None,
+        }
+    }
+
+    #[test]
+    fn the_saved_line_tells_the_four_pointer_outcomes_apart() {
+        let s = "";
+        let became = Some(ActivePointerChange {
+            from: None,
+            to: Some("prod".into()),
+        });
+        assert_eq!(
+            add_saved_line(&added(became, true, false), s),
+            "target `prod` saved and set as active (first target on fresh store)"
+        );
+        assert_eq!(
+            add_saved_line(&added(None, true, true), s),
+            "target `prod` overwritten (it stays the active target)"
+        );
+        assert_eq!(
+            add_saved_line(&added(None, true, false), s),
+            "target `prod` saved (it is the active target)"
+        );
+        let other = add_saved_line(&added(None, false, true), s);
+        assert!(
+            other.contains("use `apprafter target use prod` to switch"),
+            "{other}"
+        );
+        assert!(!add_saved_line(&added(None, true, true), s).contains("target use"));
+        assert!(add_saved_line(&added(None, true, true), " (x)").ends_with("target) (x)"));
+    }
+
+    // ── --force: what it keeps ───────────────────────────────────────────
+
+    /// The texts that describe `--force` name only commands that exist.
+    #[test]
+    fn the_force_texts_name_commands_that_exist() {
+        let yaml = CliError::from(serde_yaml::from_str::<u8>("[").unwrap_err());
+        let help = miette::Diagnostic::help(&yaml).unwrap().to_string();
+        // `target remove <name>` (WI-458), then `target add <name> …`, then `import --target
+        // <name>`, which rebuilds the state the removal deletes (WI-458 review #0/#2).
+        assert_eq!(assert_commands_parse(&help), 3, "{help}");
+        let cli = <crate::cli::Cli as clap::CommandFactory>::command();
+        let force_doc = cli
+            .find_subcommand("target")
+            .and_then(|t| t.find_subcommand("add"))
+            .and_then(|a| a.get_arguments().find(|x| x.get_id() == "force"))
+            .and_then(|f| f.get_long_help().or(f.get_help()))
+            .map(|h| h.to_string())
+            .expect("`target add --force` is documented");
+        assert!(force_doc.contains("keeps its stored value"), "{force_doc}");
+        assert_eq!(assert_commands_parse(&force_doc), 2, "{force_doc}");
+    }
+
+    /// Bug 8: no field of a forced overwrite changes without the CLI saying so — the plan's
+    /// `Update Target` lines print beside its `Keep` lines, in plan order; nothing else does.
+    #[test]
+    fn force_lines_are_the_plans_kept_and_updated_target_fields_in_order() {
+        use apprafter_core::{ChangeAction, PlannedChange};
+        let c = |kind: &str, action, detail: &str| PlannedChange {
+            kind: kind.into(),
+            object: "prod".into(),
+            action,
+            detail: Some(detail.into()),
+        };
+        let changes = [
+            c("Target", ChangeAction::Update, "region: nbg1 → hel1"),
+            c("Target", ChangeAction::Keep, "tier: solo"),
+            c(
+                "Target",
+                ChangeAction::Keep,
+                "firewall: Cloudflare origin on",
+            ),
+            c("Credentials", ChangeAction::Replace, "API token"),
+            c("CliDefault", ChangeAction::Keep, "not a target field"),
+        ];
+        assert_eq!(
+            force_lines(&changes),
+            [
+                "  updated region: nbg1 → hel1",
+                "  kept tier: solo",
+                "  kept firewall: Cloudflare origin on"
+            ]
+        );
     }
 
     // ── verification suffixes ────────────────────────────────────────────
@@ -1032,6 +1069,124 @@ mod tests {
         assert!(!renew_verified_suffix(false).contains("NOT"));
     }
 
+    /// WI-452: the renew line says what changed — the token (and how it was checked), the SSH
+    /// key, or both — and, when no token was saved, that the credentials were kept.
+    #[test]
+    fn the_renew_line_says_what_changed_and_what_was_kept() {
+        use apprafter_core::provider::{SkipReason, Verification};
+        let r = |token, ssh_key_changed| core_target::TargetRenewed {
+            name: "prod".into(),
+            token,
+            ssh_key_changed,
+        };
+        let verified = || Some(Verification::Verified { elapsed_ms: 9 });
+        let skipped = || {
+            Some(Verification::Skipped {
+                reason: SkipReason::NoPing,
+            })
+        };
+        assert_eq!(
+            renewed_line(&r(verified(), false)),
+            "target `prod` credentials rotated (token verified against Hetzner Cloud)"
+        );
+        assert_eq!(
+            renewed_line(&r(skipped(), false)),
+            "target `prod` credentials rotated (token NOT verified — `--no-ping` was passed)"
+        );
+        assert_eq!(
+            renewed_line(&r(verified(), true)),
+            "target `prod` credentials rotated and SSH key updated (token verified against \
+             Hetzner Cloud)"
+        );
+        assert_eq!(
+            renewed_line(&r(None, true)),
+            "target `prod` SSH key updated (credentials unchanged)"
+        );
+    }
+
+    /// D.3d review #0/#3/#8: what a renewal's token is follows what was typed. A typed
+    /// `--token` is the token (no wizard); a typed `--ssh-key` alone is the key alone (no
+    /// wizard, `HCLOUD_TOKEN` unused); neither typed is today's flow — the wizard on a terminal
+    /// (it ignores `HCLOUD_TOKEN`), else the env token — whatever key the env names.
+    #[test]
+    fn a_renewals_token_follows_what_was_typed_never_the_environment() {
+        use crate::dispatch::Typed;
+        let typed = |token, ssh_key| renew_token(Typed { token, ssh_key });
+        assert_eq!(typed(true, false), RenewToken::Typed);
+        assert_eq!(typed(true, true), RenewToken::Typed);
+        assert_eq!(typed(false, true), RenewToken::KeyOnly);
+        assert_eq!(typed(false, false), RenewToken::AskOrEnv);
+        // On a terminal the wizard asks only then: never over a typed token or a typed key.
+        let asks = |token, ssh_key| renew_wizard_asks(Typed { token, ssh_key });
+        assert!(asks(false, false));
+        assert!(!asks(true, false) && !asks(true, true) && !asks(false, true));
+    }
+
+    /// The flags `Typed::of` reads off the matches: typed on the command line, or not.
+    #[test]
+    fn typed_reads_the_command_line_sources_of_target_add() {
+        use clap::CommandFactory;
+        let typed = |args: &[&str]| {
+            let matches = crate::cli::Cli::command()
+                .try_get_matches_from(std::iter::once("apprafter").chain(args.iter().copied()))
+                .unwrap();
+            crate::dispatch::Typed::of(&matches)
+        };
+        let both = typed(&[
+            "target",
+            "add",
+            "prod",
+            "--renew",
+            "--token",
+            "t",
+            "--ssh-key",
+            "/k.pub",
+        ]);
+        assert_eq!((both.token, both.ssh_key), (true, true));
+        let key = typed(&["target", "add", "prod", "--renew", "--ssh-key", "/k.pub"]);
+        assert!(key.ssh_key && !key.token);
+        assert_eq!(
+            typed(&["target", "list"]),
+            crate::dispatch::Typed::default()
+        );
+    }
+
+    #[test]
+    fn the_unused_env_token_note_names_the_target_and_the_way_to_rotate() {
+        let note = unused_env_token_note("prod");
+        assert!(note.starts_with("note: `HCLOUD_TOKEN`"), "{note}");
+        assert!(
+            note.contains("`prod`") && note.contains("--token <X>"),
+            "{note}"
+        );
+        assert!(!note.contains('\n'), "one line: {note}");
+    }
+
+    /// Bug 7: a server type checked against the API says so, and in which region — flagging
+    /// the default one, which the target does not store.
+    #[test]
+    fn the_sku_line_names_the_region_and_flags_the_default() {
+        let v = |d| SkuCheck::Validated {
+            sku: "cx32".into(),
+            region: "nbg1".into(),
+            region_was_default: d,
+        };
+        assert_eq!(
+            sku_line(&v(false)),
+            "server type `cx32` validated against Hetzner Cloud for region `nbg1`"
+        );
+        assert_eq!(
+            sku_line(&v(true)),
+            "server type `cx32` validated against Hetzner Cloud for region `nbg1` (the default \
+             region; `--region` was not passed)"
+        );
+        assert_eq!(
+            sku_line(&SkuCheck::NotValidated { sku: "cx32".into() }),
+            sku_not_validated_line("cx32")
+        );
+        assert!(!sku_line(&v(true)).contains("NOT"));
+    }
+
     /// Same contract for the unvalidated SKU notice.
     #[test]
     fn the_unvalidated_sku_notice_names_the_sku_and_the_flag() {
@@ -1041,29 +1196,288 @@ mod tests {
         assert!(line.contains("--no-ping"), "{line}");
     }
 
-    /// Server types are per-location, so an unset `--region` must fall back to
-    /// the same default the CLI provisions into — checking against a different
-    /// one would pass here and fail at `apply`.
+    // ── list / show over the core's reports ──────────────────────────────
+
+    fn report_with(name: &str, active: bool) -> TargetReport {
+        TargetReport {
+            name: name.into(),
+            is_cli_default: active,
+            provider: "hetzner-cloud".into(),
+            region: Some("nbg1".into()),
+            server_type: None,
+            default_tier: Some("solo".into()),
+            tier_level: Some(1),
+            cluster_name: None,
+            ssh_key: None,
+            token: TokenPresence {
+                set: true,
+                chars: Some(64),
+            },
+            config_file: "/s/targets/p/config.yaml".into(),
+            credentials_file: "/s/targets/p/credentials.yaml".into(),
+            provisioned: ProvisionedState::NotProvisioned,
+        }
+    }
+
+    /// Today's `target show` layout, line by line. The report carries the token's length, never
+    /// its bytes, so the summary cannot echo it.
     #[test]
-    fn the_sku_check_region_defaults_to_the_provisioning_default() {
-        assert_eq!(region_for_sku_check(Some("hel1")), "hel1");
+    fn show_lines_match_todays_layout() {
+        let lines = show_lines(&report_with("prod", true));
+        assert_eq!(lines[0], "Target: prod (active)");
+        assert_eq!(lines[1], "  Provider:    hetzner-cloud");
+        assert_eq!(lines[2], "  Region:      nbg1");
+        assert_eq!(lines[3], "  Server type: not set");
+        assert_eq!(lines[4], "  Default tier: solo");
+        assert_eq!(lines[5], "  Cluster name: not set");
+        assert_eq!(lines[6], "  SSH key:     not set");
         assert_eq!(
-            region_for_sku_check(None),
-            crate::commands::target_machine::DEFAULT_REGION
+            lines[7],
+            "  Hetzner token: set (64 chars; read credentials.yaml for the raw value)"
+        );
+        assert_eq!(lines[8], "");
+        assert_eq!(lines[9], "Config:      /s/targets/p/config.yaml");
+        assert_eq!(
+            lines.last().unwrap(),
+            "Credentials: /s/targets/p/credentials.yaml (mode 0600)"
+        );
+        assert_eq!(lines.len(), 11);
+
+        let inactive = TargetReport {
+            ssh_key: Some(apprafter_core::ssh::SshKeyInfo {
+                path: "/h/.ssh/k.pub".into(),
+                display: "~/.ssh/k.pub".into(),
+                exists: true,
+                algo: Some("ssh-ed25519".into()),
+                problem: None,
+            }),
+            token: TokenPresence {
+                set: false,
+                chars: None,
+            },
+            ..report_with("other", false)
+        };
+        let lines = show_lines(&inactive);
+        assert_eq!(lines[0], "Target: other");
+        assert_eq!(lines[6], "  SSH key:     /h/.ssh/k.pub");
+        assert_eq!(lines[7], "  Hetzner token: not set");
+    }
+
+    /// R6: `show` names the server the target's state records, and says when that state
+    /// cannot be read; nothing when there is none.
+    #[test]
+    fn show_names_a_recorded_server_and_an_unreadable_state() {
+        use apprafter_core::target::ProvisionedServer;
+        let mut r = report_with("prod", true);
+        r.provisioned = ProvisionedState::Provisioned {
+            server: ProvisionedServer {
+                server_id: 42,
+                server_name: "platform-1".into(),
+                server_type: Some("cx22".into()),
+            },
+        };
+        let lines = show_lines(&r);
+        assert_eq!(lines[8], "  Server:      platform-1 (id 42, type cx22)");
+        assert_eq!(lines.len(), 12);
+        r.provisioned = ProvisionedState::Provisioned {
+            server: ProvisionedServer {
+                server_id: 42,
+                server_name: "platform-1".into(),
+                server_type: None,
+            },
+        };
+        assert!(show_lines(&r).contains(&"  Server:      platform-1 (id 42)".to_string()));
+        r.provisioned = ProvisionedState::Unreadable {
+            error: apprafter_core::UiError::from(&CoreError::Cli(CliError::InvalidState {
+                path: "/s/state.json".into(),
+                message: "expected value".into(),
+            })),
+        };
+        assert!(show_lines(&r).contains(
+            &"  Server:      unknown — the state file cannot be read: state file at \
+              /s/state.json: expected value"
+                .to_string()
+        ));
+        r.provisioned = ProvisionedState::NotProvisioned;
+        assert!(!show_lines(&r).iter().any(|l| l.starts_with("  Server:")));
+    }
+
+    /// R6: `remove` of a target whose state records a server warns that the server keeps
+    /// running, and hands over the teardown with `destroy`'s real scope.
+    #[test]
+    fn the_remove_warning_names_the_server_and_the_destroy_scope() {
+        let w = orphaned_server_warning(
+            "prod",
+            &apprafter_core::target::ProvisionedServer {
+                server_id: 42,
+                server_name: "platform-1".into(),
+                server_type: None,
+            },
+            true,
+        );
+        assert_eq!(
+            w,
+            "warning: target `prod` records server `platform-1` (id 42); removing the target \
+             does not delete it, and it keeps running (and billing) at the provider. To delete \
+             it first, run `apprafter destroy --target prod`, which deletes every \
+             `apprafter=true` resource in the token's Hetzner project, not only this cluster; \
+             or delete server 42 in the Hetzner Console."
+        );
+        assert_eq!(assert_commands_parse(&w), 1, "{w}");
+        let u = unreadable_state_warning("prod", "state file at /s: expected value");
+        assert!(u.starts_with("warning: "), "{u}");
+        assert!(
+            u.contains("cannot be read") && u.contains("expected value"),
+            "{u}"
         );
     }
 
+    /// WI-458: removing a target whose files cannot be read says which cannot, and that its
+    /// files go as they are; a server its state records keeps running, nothing here can check
+    /// it, and `destroy --target` cannot read its token until the files are fixed — the
+    /// commands it names exist.
     #[test]
-    fn token_summary_renders_set_or_not_set_without_leaking_bytes() {
-        assert_eq!(token_summary(None), "not set");
-        let summary = token_summary(Some("aaaaaaaaaaaaaaaa"));
-        assert!(summary.contains("set"), "{summary}");
-        assert!(summary.contains("16 chars"), "{summary}");
-        // No literal token bytes in the rendered string.
-        assert!(
-            !summary.contains("aaaaaaaaaaaaaaaa"),
-            "summary must not echo the token: {summary}"
+    fn the_unreadable_remove_warnings_say_what_cannot_be_read_or_checked() {
+        let w = unreadable_target_warning(
+            "prod",
+            &[
+                "config.yaml cannot be read: expected a mapping",
+                "credentials.yaml cannot be read: not a valid target credentials map (line 1, column 1)",
+            ],
         );
+        assert_eq!(
+            w,
+            "warning: target `prod` cannot be read (config.yaml cannot be read: expected a \
+             mapping; credentials.yaml cannot be read: not a valid target credentials map (line \
+             1, column 1)); removing it deletes its files without reading them."
+        );
+        let s = orphaned_server_warning(
+            "prod",
+            &apprafter_core::target::ProvisionedServer {
+                server_id: 42,
+                server_name: "platform-1".into(),
+                server_type: None,
+            },
+            false,
+        );
+        assert_eq!(
+            s,
+            "warning: target `prod` records server `platform-1` (id 42); removing the target \
+             does not delete it, and it keeps running (and billing) at the provider. The \
+             target's files cannot be read, so nothing here can check the server, and \
+             `apprafter destroy --target prod` cannot read its token. To delete it first, fix \
+             or restore those files and run that command, which deletes every `apprafter=true` \
+             resource in the token's Hetzner project, not only this cluster; or delete server 42 \
+             in the Hetzner Console."
+        );
+        assert_eq!(assert_commands_parse(&s), 1, "{s}");
+    }
+
+    /// The files the plan cannot read are its `Target` and `Credentials` details; a readable
+    /// target's plan has none (its other lines' details are not about its files).
+    #[test]
+    fn the_unreadable_files_are_the_plans_target_and_credentials_details() {
+        use apprafter_core::{ChangeAction, PlannedChange};
+        let line = |kind: &str, detail: Option<&str>| PlannedChange {
+            kind: kind.into(),
+            object: "prod".into(),
+            action: ChangeAction::Delete,
+            detail: detail.map(str::to_string),
+        };
+        let readable = [
+            line("Target", None),
+            line("Credentials", None),
+            line("LocalState", Some("cached state")),
+            line("CliDefault", Some("prod → staging")),
+        ];
+        assert!(unreadable_files(&readable).is_empty());
+        let unreadable = [
+            line("Target", Some("config.yaml is missing")),
+            line("Credentials", Some("credentials.yaml cannot be read: x")),
+            line("LocalState", Some("cached state")),
+        ];
+        assert_eq!(
+            unreadable_files(&unreadable),
+            [
+                "config.yaml is missing",
+                "credentials.yaml cannot be read: x"
+            ]
+        );
+    }
+
+    /// The help for a target file that cannot be read, and for a YAML error, sends the reader to
+    /// commands that exist: `target remove` (WI-458), then `target add`, then `import --target`,
+    /// which rebuilds the state the removal deletes (WI-458 review #0/#2).
+    #[test]
+    fn the_unreadable_target_helps_name_commands_that_exist() {
+        let config = CliError::InvalidTargetConfig {
+            path: "/s/targets/prod/config.yaml".into(),
+            message: "m".into(),
+            target: Some("prod".into()),
+        };
+        let yaml = CliError::from(serde_yaml::from_str::<u8>("[").unwrap_err());
+        for (e, commands) in [(config, 3), (yaml, 3)] {
+            let h = miette::Diagnostic::help(&e).unwrap().to_string();
+            assert!(h.contains("target remove"), "{h}");
+            assert_eq!(assert_commands_parse(&h), commands, "{h}");
+        }
+    }
+
+    /// R6 after the removal: the server the core found under the lock is warned about unless
+    /// the warning before the prompt already named it — a server recorded in between, or a
+    /// different one, is not left unmentioned; no server, no warning.
+    #[test]
+    fn the_late_remove_warning_names_only_a_server_not_warned_about_yet() {
+        let done = |id: Option<u64>| TargetRemoved {
+            name: "prod".into(),
+            state_removed: true,
+            orphaned_server: id.map(|server_id| apprafter_core::target::ProvisionedServer {
+                server_id,
+                server_name: "platform-1".into(),
+                server_type: None,
+            }),
+            cli_default: None,
+            skipped_unreadable: Vec::new(),
+        };
+        let late = |warned, id| late_orphaned_server_warning("prod", warned, &done(id), true);
+        assert_eq!(
+            late(None, Some(42)),
+            Some(orphaned_server_warning(
+                "prod",
+                done(Some(42)).orphaned_server.as_ref().unwrap(),
+                true
+            ))
+        );
+        // WI-458: the late warning says what the early one would of a target it cannot read.
+        assert_eq!(
+            late_orphaned_server_warning("prod", None, &done(Some(42)), false),
+            Some(orphaned_server_warning(
+                "prod",
+                done(Some(42)).orphaned_server.as_ref().unwrap(),
+                false
+            ))
+        );
+        assert_eq!(late(Some(42), Some(42)), None, "already warned");
+        assert!(late(Some(42), Some(43)).is_some_and(|w| w.contains("(id 43)")));
+        assert_eq!(late(None, None), None);
+        assert_eq!(late(Some(42), None), None);
+    }
+
+    #[test]
+    fn the_list_footer_uses_the_pointer_even_when_it_dangles() {
+        assert_eq!(
+            list_pointer_name(&CliDefaultPointer::Missing {
+                name: "gone".into()
+            }),
+            "gone"
+        );
+        assert_eq!(
+            list_pointer_name(&CliDefaultPointer::Set {
+                name: "prod".into()
+            }),
+            "prod"
+        );
+        assert_eq!(list_pointer_name(&CliDefaultPointer::Unset), "");
     }
 
     // ── merge_wizard_output ──────────────────────────────────────────────
@@ -1095,6 +1509,7 @@ mod tests {
             no_interactive: false,
             no_ping: false,
             server_type: None,
+            typed: crate::dispatch::Typed::default(),
         }
     }
 
@@ -1244,22 +1659,124 @@ mod tests {
         assert!(help.contains("apprafter target list"), "{help}");
     }
 
-    /// A self-rename is refused rather than performed as a no-op that reports
-    /// success, and the DESTINATION name is shape-checked before the store is
-    /// touched (a rename to `../evil` must never reach the filesystem).
+    /// Bug 3: the not-found help, as every target arm renders it, sends the reader only to
+    /// commands that exist.
     #[test]
-    fn rename_refuses_a_self_rename_and_a_malformed_destination() {
-        assert!(check_rename("work", "prod-eu").is_ok());
+    fn the_not_found_help_names_commands_that_exist() {
+        let r = report(CoreError::TargetNotFound {
+            name: "ghost".into(),
+            available: vec!["dev".into()],
+        });
+        let help = r.help().map(|h| h.to_string()).unwrap_or_default();
+        assert_eq!(assert_commands_parse(&help), 3, "{help}");
+    }
 
-        let same = check_rename("work", "work").expect_err("a self-rename is a no-op");
-        assert!(format!("{same}").contains("identical"), "{same}");
-
-        for bad in ["../evil", "with space", "-leading", ""] {
-            assert!(
-                check_rename("work", bad).is_err(),
-                "destination `{bad}` must be rejected"
-            );
+    /// Bug 5: the unknown-provider refusal has its own code, names the provider and the one
+    /// supported list, and dates nothing.
+    #[test]
+    fn the_unknown_provider_refusal_has_its_code_and_no_version() {
+        assert!(check_provider("hetzner-cloud").is_ok());
+        let r = report(check_provider("aws").expect_err("aws is not supported"));
+        assert_eq!(
+            r.code().map(|c| c.to_string()).as_deref(),
+            Some("apprafter::target::unknown_provider")
+        );
+        let text = format!("{r}");
+        assert!(
+            text.contains("aws") && text.contains("hetzner-cloud"),
+            "{text}"
+        );
+        let help = r.help().map(|h| h.to_string()).unwrap_or_default();
+        for s in [&text, &help] {
+            assert!(!has_version_number(s), "{s}");
         }
+        assert!(has_version_number("not supported in v0.1.73 (x)"));
+    }
+
+    /// A `v<d>.<d>.<d>` anywhere in `s`.
+    fn has_version_number(s: &str) -> bool {
+        s.split(|c: char| !(c.is_ascii_alphanumeric() || c == '.'))
+            .any(|w| {
+                w.strip_prefix('v').is_some_and(|r| {
+                    let p: Vec<_> = r.split('.').collect();
+                    p.len() == 3
+                        && p.iter()
+                            .all(|x| !x.is_empty() && x.bytes().all(|b| b.is_ascii_digit()))
+                })
+            })
+    }
+
+    /// Bugs 6 + 10: each server-type refusal's help sends the reader to commands that exist.
+    #[test]
+    fn every_server_type_help_names_commands_that_exist() {
+        use cli_core::{SkuCheckFor, UnavailableKind};
+        for context in [
+            SkuCheckFor::Provision,
+            SkuCheckFor::TargetAdd { name: "p".into() },
+            SkuCheckFor::TargetMachine { name: "p".into() },
+        ] {
+            let e = CliError::ServerTypeUnavailable {
+                requested: "cx99".into(),
+                location: "nbg1".into(),
+                kind: UnavailableKind::Unknown,
+                alternatives: String::new(),
+                context: context.clone(),
+            };
+            let h = miette::Diagnostic::help(&e).unwrap().to_string();
+            assert!(assert_commands_parse(&h) >= 1, "{context:?}: {h}");
+        }
+    }
+
+    #[test]
+    fn the_command_check_refuses_a_command_that_does_not_exist() {
+        assert_eq!(assert_commands_parse("run `apprafter target list`"), 1);
+        let bad = std::panic::catch_unwind(|| assert_commands_parse("`apprafter target nope`"));
+        assert!(bad.is_err(), "a command clap rejects must fail the check");
+    }
+
+    /// `target remove`'s last line, for each way the CLI default can move.
+    #[test]
+    fn the_removal_line_says_where_the_cli_default_went() {
+        let removed = |cli_default| TargetRemoved {
+            name: "prod".into(),
+            state_removed: false,
+            orphaned_server: None,
+            cli_default,
+            skipped_unreadable: Vec::new(),
+        };
+        assert_eq!(remove_done_line(&removed(None)), "target `prod` removed");
+        assert_eq!(
+            remove_done_line(&removed(Some(ActivePointerChange {
+                from: Some("prod".into()),
+                to: Some("staging".into()),
+            }))),
+            "target `prod` removed; active switched to `staging` (alphabetically next)"
+        );
+        assert_eq!(
+            remove_done_line(&removed(Some(ActivePointerChange {
+                from: Some("prod".into()),
+                to: None,
+            }))),
+            "target `prod` removed; no targets left, active pointer cleared"
+        );
+        // WI-458: the default passes over targets that cannot be read, and says so.
+        let passed_over = |to: Option<&str>| TargetRemoved {
+            skipped_unreadable: vec!["alpha".into(), "beta".into()],
+            ..removed(Some(ActivePointerChange {
+                from: Some("prod".into()),
+                to: to.map(str::to_string),
+            }))
+        };
+        assert_eq!(
+            remove_done_line(&passed_over(Some("staging"))),
+            "target `prod` removed; active switched to `staging` (alphabetically next that can \
+             be read; `alpha`, `beta` cannot be read)"
+        );
+        assert_eq!(
+            remove_done_line(&passed_over(None)),
+            "target `prod` removed; no target that can be read is left (`alpha`, `beta` cannot \
+             be read), active pointer cleared"
+        );
     }
 
     // ── list / use readouts ──────────────────────────────────────────────
@@ -1276,6 +1793,21 @@ mod tests {
         let some = list_summary_line(3, "work");
         assert!(some.contains("work"), "{some}");
         assert!(!some.contains("No active target"), "{some}");
+    }
+
+    /// Bug 9: one target is "1 target", in both branches of the footer.
+    #[test]
+    fn the_list_footer_counts_one_target_in_the_singular() {
+        assert_eq!(
+            list_summary_line(1, ""),
+            "1 target configured. No active target — run `apprafter target use <name>` to pick one."
+        );
+        assert_eq!(
+            list_summary_line(1, "staging"),
+            "1 target configured. Active: 'staging'."
+        );
+        assert!(list_summary_line(2, "a").starts_with("2 targets configured."));
+        assert!(list_summary_line(0, "").starts_with("0 targets configured."));
     }
 
     /// Switching away names the target being left behind — walking off a
@@ -1430,29 +1962,20 @@ struct TargetListRow {
     tier: String,
 }
 
-fn run_ip() -> Result<()> {
-    let resolved = resolve_state_paths(None)?;
-    let store = resolved.store;
-    let state = State::load_or_default(&resolved.paths)?;
-
-    let Some(server_id) = state.hetzner_cloud.as_ref().map(|h| h.server_id) else {
-        println!("{NO_PROVISIONED_SERVER_HINT}");
-        return Ok(());
-    };
-
-    let token = cli_core::resolve_hetzner_token(None, &store, None)?;
-    let client = HetznerCloudClient::new(hcloud_base_url(), token);
-    let (v4, v6) = cli_providers::node_public_ips(&client, server_id)?;
-
-    for line in ip_report_lines(v4.as_deref(), v6.as_deref()) {
+/// `target ip` on apprafter-core (D.3a): the active target's server, read by id.
+fn run_ip() -> miette::Result<()> {
+    // The legacy `<cwd>/.apprafter/state.json` migration stays CLI-only (spec §3.1); it runs
+    // before the core reads state, and it answers "no active target" exactly as before.
+    resolve_state_paths(None).map_err(miette::Report::new)?;
+    let ctx = crate::context::cli_context()?;
+    let target = TargetRef::active(&ctx).map_err(report)?;
+    let address = apprafter_core::target::public_address(&ctx, &target, &CancellationToken::new())
+        .map_err(report)?;
+    for line in ip_report_lines(address.ipv4.as_deref(), address.ipv6.as_deref()) {
         println!("{line}");
     }
     Ok(())
 }
-
-/// Shown by `target ip` when the active target has never provisioned.
-const NO_PROVISIONED_SERVER_HINT: &str =
-    "No provisioned server for the active target — run `apprafter up` first.";
 
 /// Render the DNS records for `target ip`.
 ///
@@ -1476,52 +1999,54 @@ pub(crate) fn ip_report_lines(v4: Option<&str>, v6: Option<&str>) -> Vec<String>
     lines
 }
 
-fn run_list() -> Result<()> {
+/// `target list` on the core's report. A target whose `config.yaml` cannot be read stays a
+/// tracing warning here (R7) — the desktop shows it as a row.
+pub(crate) fn list() -> miette::Result<()> {
     info!("target list invoked");
-    let paths = TargetStorePaths::for_root(default_config_root()?);
-    let names = list_target_names(&paths)?;
-    if names.is_empty() {
+    let ctx = crate::context::cli_context()?;
+    let r = core_target::list(&ctx).map_err(report)?;
+    for u in &r.unreadable {
+        tracing::warn!(target = %u.name, error = %u.error.message, "skipping unreadable target in list");
+    }
+    if r.targets.is_empty() && r.unreadable.is_empty() {
         println!(
             "No targets configured. Run `apprafter target add` to create one — or `apprafter target add <name>` to skip the wizard's name prompt."
         );
         return Ok(());
     }
-    let active = load_global_config(&paths)?
-        .map(|g| g.active_target)
-        .unwrap_or_default();
-
-    let mut rows: Vec<TargetListRow> = Vec::with_capacity(names.len());
-    for name in &names {
-        // load_target needs both config.yaml and (optionally)
-        // credentials.yaml. We only care about config here; if
-        // either file is broken we skip the row with a tracing
-        // warning rather than erroring out the whole listing.
-        let cfg = match load_target(&paths, name) {
-            Ok(t) => t.config,
-            Err(e) => {
-                tracing::warn!(target = %name, error = %e, "skipping unreadable target in list");
-                continue;
-            }
-        };
-        rows.push(TargetListRow {
-            active: if *name == active {
+    let rows: Vec<TargetListRow> = r
+        .targets
+        .iter()
+        .map(|t| TargetListRow {
+            active: if t.is_cli_default {
                 "*".into()
             } else {
                 String::new()
             },
-            name: name.clone(),
-            provider: cfg.provider,
-            region: cfg.region.unwrap_or_else(|| "-".into()),
-            tier: cfg.default_tier.unwrap_or_else(|| "-".into()),
-        });
-    }
-
+            name: t.name.clone(),
+            provider: t.provider.clone(),
+            region: t.region.clone().unwrap_or_else(|| "-".into()),
+            tier: t.default_tier.clone().unwrap_or_else(|| "-".into()),
+        })
+        .collect();
     let mut table = Table::new(&rows);
     table.with(Style::sharp());
     println!("{table}");
     println!();
-    println!("{}", list_summary_line(rows.len(), &active));
+    println!(
+        "{}",
+        list_summary_line(rows.len(), list_pointer_name(&r.cli_default))
+    );
     Ok(())
+}
+
+/// The name the list footer shows as active: the pointer's value even when it dangles (today's
+/// footer), empty when there is none.
+pub(crate) fn list_pointer_name(p: &CliDefaultPointer) -> &str {
+    match p {
+        CliDefaultPointer::Unset => "",
+        CliDefaultPointer::Set { name } | CliDefaultPointer::Missing { name } => name,
+    }
 }
 
 /// Footer under `target list`.
@@ -1529,33 +2054,62 @@ fn run_list() -> Result<()> {
 /// With no active target the line has to say so AND name the command that sets
 /// one — an empty `Active:` field reads like a corrupted store.
 pub(crate) fn list_summary_line(count: usize, active: &str) -> String {
+    let count = target_count(count);
     if active.is_empty() {
         format!(
-            "{count} targets configured. No active target — run `apprafter target use <name>` to pick one."
+            "{count} configured. No active target — run `apprafter target use <name>` to pick one."
         )
     } else {
-        format!("{count} targets configured. Active: '{active}'.")
+        format!("{count} configured. Active: '{active}'.")
     }
 }
 
-fn run_use(name: &str) -> Result<()> {
-    info!(target = %name, "target use invoked");
-    let paths = TargetStorePaths::for_root(default_config_root()?);
-    let _store_lock = store_lock_if_present(&paths)?;
-    // `load_target` returns TargetNotFound with an `available`
-    // hint when the name doesn't exist — we let that surface
-    // verbatim.
-    let _ = load_target(&paths, name)?;
-
-    let mut global = load_global_config(&paths)?.unwrap_or_default();
-    if global.active_target == name {
-        println!("target `{name}` was already the active target");
-        return Ok(());
+/// "1 target", "2 targets".
+fn target_count(n: usize) -> String {
+    if n == 1 {
+        "1 target".into()
+    } else {
+        format!("{n} targets")
     }
-    let previous = std::mem::replace(&mut global.active_target, name.to_string());
-    save_global_config(&paths, &global)?;
-    println!("{}", switched_active_line(&previous, name));
+}
+
+/// `target use` on the core: plan, then execute (which re-reads the pointer under the lock).
+pub(crate) fn use_target(name: &str) -> miette::Result<()> {
+    info!(target = %name, "target use invoked");
+    let ctx = crate::context::cli_context()?;
+    let tref = TargetRef::named(&ctx, name).map_err(report)?;
+    let plan = core_target::plan_use(&ctx, &tref).map_err(report)?;
+    let used = completed(
+        core_target::execute_use(&ctx, plan, &CliReporter, &CancellationToken::new())
+            .map_err(report)?,
+    )?;
+    match used.pointer {
+        None => println!("target `{name}` was already the active target"),
+        Some(p) => println!(
+            "{}",
+            switched_active_line(p.from.as_deref().unwrap_or(""), name)
+        ),
+    }
     Ok(())
+}
+
+/// Today's `target machine` found the target with `load_target`, which reads both of its files: a
+/// target whose `config.yaml` or `credentials.yaml` cannot be read is refused as before. (The
+/// core's machine plan checks only that the target exists.) `use` gets the same refusal from the
+/// core's plan (WI-458 review #4), and `remove` takes such a target (WI-458).
+pub(crate) fn require_loadable(ctx: &Context, name: &str) -> miette::Result<()> {
+    cli_core::load_target(&ctx.store(), name)
+        .map(drop)
+        .map_err(miette::Report::new)
+}
+
+/// An outcome the CLI's never-tripped token cannot cancel; `Cancelled` still renders as the
+/// error, as an `Err(CoreError::Cancelled)` from the same call does.
+pub(crate) fn completed<T>(o: Outcome<T>) -> miette::Result<T> {
+    match o {
+        Outcome::Completed { result } => Ok(result),
+        Outcome::Cancelled { .. } => Err(report(CoreError::Cancelled)),
+    }
 }
 
 /// Confirmation for `target use`.
@@ -1571,60 +2125,79 @@ pub(crate) fn switched_active_line(previous: &str, name: &str) -> String {
     }
 }
 
-fn run_show(name: Option<&str>) -> Result<()> {
-    let paths = TargetStorePaths::for_root(default_config_root()?);
-    let active = load_global_config(&paths)?
-        .map(|g| g.active_target)
-        .unwrap_or_default();
-
-    let resolved = resolve_show_target(name, &active)?;
+/// `target show` on the core's report. The name is resolved here first, for the `info!` line
+/// (decision 5): the explicit one, else the CLI default.
+pub(crate) fn show(name: Option<&str>) -> miette::Result<()> {
+    let ctx = crate::context::cli_context()?;
+    let pointer =
+        cli_core::resolve_active_target_name(&ctx.store(), None).map_err(miette::Report::new)?;
+    let resolved =
+        resolve_show_target(name, pointer.as_deref().unwrap_or("")).map_err(miette::Report::new)?;
     info!(target = %resolved, "target show invoked");
-    let target = load_target(&paths, &resolved)?;
-
-    let is_active = resolved == active;
-    let active_marker = if is_active { " (active)" } else { "" };
-
-    println!("Target: {resolved}{active_marker}");
-    println!("  Provider:    {}", target.config.provider);
-    println!(
-        "  Region:      {}",
-        target.config.region.as_deref().unwrap_or("not set")
-    );
-    println!(
-        "  Server type: {}",
-        target.config.server_type.as_deref().unwrap_or("not set")
-    );
-    println!(
-        "  Default tier: {}",
-        target.config.default_tier.as_deref().unwrap_or("not set")
-    );
-    println!(
-        "  Cluster name: {}",
-        target.config.cluster_name.as_deref().unwrap_or("not set")
-    );
-    println!(
-        "  SSH key:     {}",
-        target
-            .config
-            .ssh_key_path
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "not set".to_string())
-    );
-    println!(
-        "  Hetzner token: {}",
-        token_summary(target.credentials.hetzner_token.as_deref())
-    );
-    println!();
-    println!(
-        "Config:      {}",
-        paths.target_config_file(&resolved).display()
-    );
-    println!(
-        "Credentials: {} (mode 0600)",
-        paths.target_credentials_file(&resolved).display()
-    );
+    let tref = TargetRef::named(&ctx, &resolved).map_err(report)?;
+    for line in show_lines(&core_target::show(&ctx, &tref).map_err(report)?) {
+        println!("{line}");
+    }
     Ok(())
+}
+
+/// The lines `target show` prints. The token is summarised by its length — the report never
+/// carries its bytes; read `credentials.yaml` for the raw value. A server the target's state
+/// records gets a `Server:` line after the token (R6), as does a state that cannot be read; no
+/// server, no line.
+pub(crate) fn show_lines(r: &TargetReport) -> Vec<String> {
+    let or = |v: &Option<String>| v.clone().unwrap_or_else(|| "not set".into());
+    let server = match &r.provisioned {
+        core_target::ProvisionedState::NotProvisioned => None,
+        core_target::ProvisionedState::Provisioned { server } => Some(format!(
+            "  Server:      {} (id {}{})",
+            server.server_name,
+            server.server_id,
+            server
+                .server_type
+                .as_deref()
+                .map(|t| format!(", type {t}"))
+                .unwrap_or_default()
+        )),
+        core_target::ProvisionedState::Unreadable { error } => Some(format!(
+            "  Server:      unknown — the state file cannot be read: {}",
+            error.message
+        )),
+    };
+    let mut lines = vec![
+        format!(
+            "Target: {}{}",
+            r.name,
+            if r.is_cli_default { " (active)" } else { "" }
+        ),
+        format!("  Provider:    {}", r.provider),
+        format!("  Region:      {}", or(&r.region)),
+        format!("  Server type: {}", or(&r.server_type)),
+        format!("  Default tier: {}", or(&r.default_tier)),
+        format!("  Cluster name: {}", or(&r.cluster_name)),
+        format!(
+            "  SSH key:     {}",
+            r.ssh_key
+                .as_ref()
+                .map_or_else(|| "not set".into(), |k| k.path.clone())
+        ),
+        format!(
+            "  Hetzner token: {}",
+            match r.token.chars {
+                Some(n) if r.token.set => {
+                    format!("set ({n} chars; read credentials.yaml for the raw value)")
+                }
+                _ => "not set".into(),
+            }
+        ),
+    ];
+    lines.extend(server);
+    lines.extend([
+        String::new(),
+        format!("Config:      {}", r.config_file),
+        format!("Credentials: {} (mode 0600)", r.credentials_file),
+    ]);
+    lines
 }
 
 /// Which target `target show` displays: the explicit name, else the active
@@ -1640,104 +2213,184 @@ pub(crate) fn resolve_show_target(name: Option<&str>, active: &str) -> Result<St
     }
 }
 
-/// Pre-flight for `target rename`: the DESTINATION name must be well-formed
-/// (the source is validated by the store lookup), and a self-rename is refused
-/// rather than performed as a no-op that reports success.
-pub(crate) fn check_rename(from: &str, to: &str) -> Result<()> {
-    // Validate the destination name shape here (cli_core layer
-    // stays IO-pure on names).
-    check_target_name(to).map_err(CliError::Other)?;
-    if from == to {
-        return Err(CliError::Other(
-            "source and destination target names are identical — nothing to rename".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-fn run_rename(from: &str, to: &str) -> Result<()> {
+/// `target rename` on the core; its refusals are the core's, with the CLI's help.
+pub(crate) fn rename(from: &str, to: &str) -> miette::Result<()> {
     info!(from = %from, to = %to, "target rename invoked");
-    check_rename(from, to)?;
-    let paths = TargetStorePaths::for_root(default_config_root()?);
-    let _store_lock = store_lock_if_present(&paths)?;
-
-    rename_target(&paths, from, to)?;
-
-    // Keep `GlobalConfig.active_target` pointed at the right name.
-    if let Some(mut global) = load_global_config(&paths)? {
-        if global.active_target == from {
-            global.active_target = to.to_string();
-            save_global_config(&paths, &global)?;
-            println!("target renamed: `{from}` → `{to}` (active pointer updated)");
-            return Ok(());
-        }
-    }
-    println!("target renamed: `{from}` → `{to}`");
+    let ctx = crate::context::cli_context()?;
+    let tref = TargetRef::named(&ctx, from).map_err(report)?;
+    let plan = core_target::plan_rename(&ctx, &tref, to).map_err(rename_refused)?;
+    let done = completed(
+        core_target::execute_rename(&ctx, plan, &CliReporter, &CancellationToken::new())
+            .map_err(rename_refused)?,
+    )?;
+    let suffix = if done.cli_default.is_some() {
+        " (active pointer updated)"
+    } else {
+        ""
+    };
+    println!("target renamed: `{from}` → `{to}`{suffix}");
     Ok(())
 }
 
-fn run_remove(name: &str, yes: bool) -> Result<()> {
+/// `target remove` on the core. The confirmation stays the CLI's: `--yes`, else a TTY prompt
+/// (never a lock held across it — `execute_remove` takes the lock after it). A target whose files
+/// cannot be read is removed too (WI-458): the warnings say what the plan cannot read or check.
+pub(crate) fn remove(name: &str, yes: bool) -> miette::Result<()> {
     info!(target = %name, yes, "target remove invoked");
-    let paths = TargetStorePaths::for_root(default_config_root()?);
-    // Load to verify existence early and surface the canonical
-    // "available targets" hint when the name is wrong.
-    let _ = load_target(&paths, name)?;
-
+    let ctx = crate::context::cli_context()?;
+    let tref = TargetRef::named(&ctx, name).map_err(report)?;
+    let plan = core_target::plan_remove(&ctx, &tref).map_err(report)?;
+    // R6: before any confirmation, so a terminal user reads it before answering.
+    let unreadable = unreadable_files(&plan.changes);
+    if !unreadable.is_empty() {
+        eprintln!("{}", unreadable_target_warning(name, &unreadable));
+    }
+    let readable = unreadable.is_empty();
+    let warned = match core_target::provisioned(&ctx, &tref) {
+        Ok(Some(server)) => {
+            eprintln!("{}", orphaned_server_warning(name, &server, readable));
+            Some(server.server_id)
+        }
+        Ok(None) => None,
+        Err(e) => {
+            eprintln!("{}", unreadable_state_warning(name, &e.to_string()));
+            None
+        }
+    };
     if !yes {
         let stdin_tty = std::io::stdin().is_terminal();
         let stdout_tty = std::io::stdout().is_terminal();
         if !(stdin_tty && stdout_tty) {
-            return Err(CliError::Other(format!(
-                "non-interactive invocation: pass `--yes` to confirm removing target `{name}` (refusing silent destruction)"
-            )));
+            return Err(removal_needs_yes(name));
         }
         let confirmed = inquire::Confirm::new(&remove_prompt(name))
             .with_default(false)
             .prompt()
-            .map_err(map_remove_prompt_error)?;
+            .map_err(|e| miette::Report::new(map_remove_prompt_error(e)))?;
         if !confirmed {
             println!("{}", remove_aborted_line(name));
             return Ok(());
         }
     }
-
-    // Taken after the confirmation, never across it: a prompt can wait on
-    // a human indefinitely. `remove_target` re-checks that the target
-    // still exists under the lock.
-    let _store_lock = store_lock_if_present(&paths)?;
-    remove_target(&paths, name)?;
-
-    // If the removed target was active, repoint the active marker
-    // at the first remaining target alphabetically. With no
-    // targets left, clear the active pointer entirely (delete
-    // config.yaml) so the next `target add` flips back to the
-    // "first target on fresh store" greeting.
-    let mut global = load_global_config(&paths)?.unwrap_or_default();
-    if global.active_target == name {
-        let remaining = list_target_names(&paths)?;
-        match remaining.into_iter().next() {
-            Some(next) => {
-                global.active_target = next.clone();
-                save_global_config(&paths, &global)?;
-                println!(
-                    "target `{name}` removed; active switched to `{next}` (alphabetically next)"
-                );
-            }
-            None => {
-                // No targets left — drop the global config file so
-                // `load_global_config` returns None again, which
-                // `target add` interprets as "fresh store".
-                let cfg_file = paths.global_config_file();
-                if cfg_file.exists() {
-                    std::fs::remove_file(cfg_file)?;
-                }
-                println!("target `{name}` removed; no targets left, active pointer cleared");
-            }
-        }
-    } else {
-        println!("target `{name}` removed");
+    let done = completed(
+        core_target::execute_remove(&ctx, plan, &CliReporter, &CancellationToken::new())
+            .map_err(report)?,
+    )?;
+    if let Some(w) = late_orphaned_server_warning(name, warned, &done, readable) {
+        eprintln!("{w}");
     }
+    println!("{}", remove_done_line(&done));
     Ok(())
+}
+
+/// What the remove plan says cannot be read of a target's own files: its `Target` and
+/// `Credentials` lines carry a detail only then (WI-458). Empty for a target that can be read.
+pub(crate) fn unreadable_files(changes: &[apprafter_core::PlannedChange]) -> Vec<&str> {
+    changes
+        .iter()
+        .filter(|c| matches!(c.kind.as_str(), "Target" | "Credentials"))
+        .filter_map(|c| c.detail.as_deref())
+        .collect()
+}
+
+/// `target remove` of a target whose files cannot be read (WI-458): which, and that the removal
+/// deletes them as they are. A credentials file is never quoted (its text is the token): the
+/// core gives only where it stopped parsing.
+pub(crate) fn unreadable_target_warning(name: &str, problems: &[&str]) -> String {
+    format!(
+        "warning: target `{name}` cannot be read ({}); removing it deletes its files without \
+         reading them.",
+        problems.join("; ")
+    )
+}
+
+/// R6 after the removal: the warning for the server `execute_remove` found under the lock, unless
+/// the warning printed before the prompt already named it. A server recorded in between — an
+/// `apply` in another terminal writes the state without the lock — would otherwise go unmentioned
+/// while its only local record is deleted.
+pub(crate) fn late_orphaned_server_warning(
+    name: &str,
+    warned: Option<u64>,
+    done: &TargetRemoved,
+    readable: bool,
+) -> Option<String> {
+    done.orphaned_server
+        .as_ref()
+        .filter(|s| Some(s.server_id) != warned)
+        .map(|s| orphaned_server_warning(name, s, readable))
+}
+
+/// `target remove` of a target whose state records a server (R6): the server is not deleted
+/// and keeps running. `destroy` is the teardown, with its real scope — the token's whole Hetzner
+/// project, not only this cluster (operator guide, target store: the destroy scope). When the
+/// target's files cannot be read (`readable: false`, WI-458) nothing here can check the server,
+/// and `destroy --target` cannot read the token either: the files are fixed or restored first.
+pub(crate) fn orphaned_server_warning(
+    name: &str,
+    server: &apprafter_core::target::ProvisionedServer,
+    readable: bool,
+) -> String {
+    let (id, server_name) = (server.server_id, &server.server_name);
+    let left = format!(
+        "warning: target `{name}` records server `{server_name}` (id {id}); removing the target \
+         does not delete it, and it keeps running (and billing) at the provider."
+    );
+    let scope = "which deletes every `apprafter=true` resource in the token's Hetzner project, \
+                 not only this cluster";
+    if readable {
+        format!(
+            "{left} To delete it first, run `apprafter destroy --target {name}`, {scope}; or \
+             delete server {id} in the Hetzner Console."
+        )
+    } else {
+        format!(
+            "{left} The target's files cannot be read, so nothing here can check the server, \
+             and `apprafter destroy --target {name}` cannot read its token. To delete it first, \
+             fix or restore those files and run that command, {scope}; or delete server {id} in \
+             the Hetzner Console."
+        )
+    }
+}
+
+/// `target remove` of a target whose state cannot be read: whether it records a server is
+/// unknown, so the reader is told rather than left to assume there is none.
+pub(crate) fn unreadable_state_warning(name: &str, error: &str) -> String {
+    format!(
+        "warning: the state of target `{name}` cannot be read ({error}); if it records a \
+         server, removing the target does not delete it, and it keeps running at the provider."
+    )
+}
+
+/// The line `target remove` ends with: where the CLI default went, when it named the target —
+/// the alphabetically next target that can be read, naming those it passed over (WI-458).
+pub(crate) fn remove_done_line(r: &TargetRemoved) -> String {
+    let skipped = r
+        .skipped_unreadable
+        .iter()
+        .map(|n| format!("`{n}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    match &r.cli_default {
+        Some(ActivePointerChange { to: Some(next), .. }) if skipped.is_empty() => format!(
+            "target `{}` removed; active switched to `{next}` (alphabetically next)",
+            r.name
+        ),
+        Some(ActivePointerChange { to: Some(next), .. }) => format!(
+            "target `{}` removed; active switched to `{next}` (alphabetically next that can be \
+             read; {skipped} cannot be read)",
+            r.name
+        ),
+        Some(ActivePointerChange { to: None, .. }) if skipped.is_empty() => format!(
+            "target `{}` removed; no targets left, active pointer cleared",
+            r.name
+        ),
+        Some(ActivePointerChange { to: None, .. }) => format!(
+            "target `{}` removed; no target that can be read is left ({skipped} cannot be \
+             read), active pointer cleared",
+            r.name
+        ),
+        None => format!("target `{}` removed", r.name),
+    }
 }
 
 /// The removal confirmation. It has to enumerate WHAT is destroyed: an
@@ -1880,18 +2533,4 @@ pub(crate) fn cert_import_lines(
         "(How to mint a Cloudflare Origin CA cert: docs → Public ingress → Cloudflare Origin CA cert.)"
             .to_string(),
     ]
-}
-
-/// One-line summary of a stored token suitable for `target show`.
-/// We intentionally do NOT echo any of the token bytes — even the
-/// last 4 chars are identifying. The user reads
-/// `credentials.yaml` directly when they need the raw value.
-fn token_summary(token: Option<&str>) -> String {
-    match token {
-        None => "not set".to_string(),
-        Some(t) => format!(
-            "set ({} chars; read credentials.yaml for the raw value)",
-            t.len()
-        ),
-    }
 }

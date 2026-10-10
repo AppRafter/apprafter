@@ -6,6 +6,7 @@ import { QueryClientProvider } from '@tanstack/react-query';
 import { invoke } from '@tauri-apps/api/core';
 import { clearMocks, mockIPC } from '@tauri-apps/api/mocks';
 import { act, cleanup, render } from '@testing-library/react';
+import { settleIpc } from '../test/settle';
 import { useLiveQuery } from './liveQuery';
 import { createQueryClient } from './queryClient';
 import { TabContext } from './tab';
@@ -20,8 +21,9 @@ beforeEach(() => {
   });
 });
 
-afterEach(() => {
+afterEach(async () => {
   cleanup();
+  await settleIpc();
   clearMocks();
 });
 

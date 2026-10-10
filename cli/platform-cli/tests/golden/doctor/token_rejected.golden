@@ -1,0 +1,29 @@
+$ apprafter doctor
+[exit 1]
+[stdout]
+Checking target `prod`...
+  ✓ Config file readable (<SANDBOX>/apprafter-config/targets/prod/config.yaml)
+  ✓ Credentials file present (mode 0600) (<SANDBOX>/apprafter-config/targets/prod/credentials.yaml)
+  ✓ Provider `hetzner-cloud` supported
+  ✓ Token format valid (64 chars, alphanumeric)
+  ✗ Token verified against provider API (HTTP 401: unable to authenticate)
+      hint: token rejected; run `apprafter target add prod --renew` with a new token from the Hetzner Console (open the project, then Security → API tokens)
+  ✓ SSH key readable (<SANDBOX>/home/id_ed25519.pub (ssh-ed25519))
+
+Checking cluster...
+  – Kubeconfig cached (no provisioned server)
+  – Kube API reachable (no provisioned server)
+  – Node reachable over SSH (no provisioned server)
+
+Checking environment...
+  ✓ `restic` on PATH (restic stand-in)
+  ✓ `kubectl` on PATH (kubectl stand-in)
+  ✓ `helm` on PATH (helm stand-in)
+  ✓ `git` on PATH (git stand-in)
+  ✓ `ssh` on PATH (ssh stand-in)
+  ✓ `cue` on PATH (cue stand-in)
+  ✓ DNS resolves `127.0.0.1` (443/tcp)
+
+13 checks for target `prod`: 12 passed, 0 warning(s), 1 FAIL — fix the FAILs and rerun `apprafter doctor`.
+[stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m doctor invoked <ESC>[3mno_ping<ESC>[0m<ESC>[2m=<ESC>[0mfalse

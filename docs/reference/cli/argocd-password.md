@@ -18,10 +18,12 @@ Usage: apprafter argocd-password [OPTIONS]
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
 | `--refresh` | flag | — | no | Force a re-fetch of the secret even if a cached password is already in state |
+| `--target` | — | — | no | Work on this target instead of the active one: its cached password, or its cluster through its cached kubeconfig |
 
 Examples:
 
 ```sh
 apprafter argocd-password
 apprafter argocd-password --refresh  # after the admin secret is rotated
+apprafter argocd-password --target staging  # another target's, not the active one
 ```

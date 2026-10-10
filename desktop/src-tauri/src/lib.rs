@@ -5,6 +5,7 @@ pub mod app;
 pub mod auth;
 pub mod auth_cache;
 pub mod commands;
+pub mod drafts;
 pub mod env;
 pub mod errors;
 pub mod lock;
@@ -14,6 +15,7 @@ pub mod runtime;
 pub mod settings;
 pub mod signals;
 pub mod single_instance;
+pub mod target_ops;
 pub mod theme;
 pub mod window;
 
@@ -39,17 +41,26 @@ use crate::single_instance::SingleInstance;
 /// In order: on Linux, WebKitGTK's DMA-BUF renderer turned off under Wayland on NVIDIA's driver
 /// ([`env::turn_off_dmabuf_renderer_on_nvidia_wayland`]: the process restarts with it off,
 /// before anything else starts; logged once the log starts), the async runtime and the crypto
-/// provider (before anything of Tauri's), the allow-listed environment and the core context,
-/// the app's identity and directories (a data-directory override moves every app directory and
-/// keys the single-instance lock on it; one set but empty or not Unicode stops the start,
+/// provider (before anything of Tauri's), the allow-listed environment, the app's identity and
+/// directories (a data-directory override moves every app directory and keys the
+/// single-instance lock on it; one set but empty or not Unicode stops the start,
 /// [`exit_code`] 2), the authenticator ([`auth::choice`]: the OS's in a release, the fake in a
 /// test build), the single-instance lock ([`single_instance`]: on Linux only when the session
 /// bus answers; without it the app starts all the same, and its log says why), the app itself
 /// (the lock's plugin first: a second launch only focuses the first window and exits; on
-/// macOS, the app menu), then the log, the settings and the shell, on Linux the window's theme
-/// and the desktop's colour scheme ([`theme::start`]), the tickers, the OS session watch
-/// (lock-on-sleep) and, on Linux and macOS, the quit signals. On Windows the prompts are
-/// parented to the main window as soon as it is built.
+/// macOS, the app menu), then the log, the settings, the core context, the shell, on Linux the
+/// window's theme and the desktop's colour scheme ([`theme::start`]), the tickers, the sweep of
+/// the kubeconfig copies a crash left in the runtime dir ([`app::sweep_runtime_dir`], on a
+/// thread of its own), the OS session watch (lock-on-sleep) and, on Linux and macOS, the quit
+/// signals. On Windows the prompts are parented to the main window as soon as it is built.
+///
+/// The core context is built once the app is: its runtime dir is `<app data dir>/run`, and
+/// Tauri resolves the app data dir — the override included — only then. So a refused
+/// `APPRAFTER_HCLOUD_BASE_URL` (a test build only) stops the start after the single-instance
+/// plugin has registered, when the lock is on. On macOS the login shell is asked for the tools'
+/// `PATH` once the log is up, on a thread of its own ([`env::tool_search_path`]): nothing on the
+/// way to the window waits for it — the context is built with what is known by then — and the
+/// first lookup of a tool waits for its answer, bounded ([`app::Shell::tool_context`]).
 ///
 /// The log starts once the app is built, so a second launch, which exits while the plugins
 /// start, writes nothing to the running app's log. It is still up before the window: Tauri
@@ -71,7 +82,6 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     runtime::init_runtime()?;
     runtime::install_crypto();
     let env = AllowListEnv::from_process(cfg!(feature = "test-build"));
-    let context = env::desktop_context(&env)?;
     // Created and canonical (absolute against the working directory, as the CLI reads
     // APPRAFTER_CONFIG_DIR — Tauri would resolve a relative one against the binary's
     // directory), so every spelling of one directory is one instance on one set of files. A
@@ -98,8 +108,11 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     let cell = app::ShellCell::default();
     let builder = single_instance
         .register(app::builder(tauri::Builder::default(), cell.clone()))
-        // The capability lets the page open three URLs with it, nothing else.
+        // The capability lets the page open the app's links and the core's install pages with
+        // it, each exactly as written (capabilities/main.json5), nothing else.
         .plugin(app::opener_plugin())
+        // The capability lets the page write text to the clipboard, nothing else.
+        .plugin(app::clipboard_plugin())
         .setup({
             let data_dir = data_dir.clone();
             #[cfg(windows)]
@@ -139,17 +152,22 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     #[cfg(target_os = "linux")]
     dmabuf_renderer.log();
     single_instance.log();
+    // macOS: the login shell is asked for the tools' PATH from here, on a thread of its own.
+    let tools = env::tool_search_path(&env);
 
     let settings = SettingsStore::load(&app.path().app_config_dir()?, &SystemClock);
     if let Some(notice) = settings.notice() {
         tracing::warn!("{notice}");
     }
+    let host = env::desktop_host(&tools, app.path().app_data_dir()?.join("run"));
+    let context = env::desktop_context(&env, host)?;
     let handle = app.handle().clone();
     let shell = app::Shell::new(
         settings,
         auth,
         clock,
         context,
+        tools,
         env.test_build(),
         move |state| app::emit_lock_changed(&handle, state),
     );
@@ -159,6 +177,18 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     #[cfg(target_os = "linux")]
     theme::start(app.handle(), &shell.appearance);
     app::start_tickers(&shell)?;
+    // R9: kubeconfig copies a crash left in the runtime dir go, off the start path.
+    let sweep = std::thread::Builder::new()
+        .name("runtime-sweep".into())
+        .spawn({
+            let context = shell.context.clone();
+            move || {
+                app::sweep_runtime_dir(&context);
+            }
+        });
+    if let Err(e) = sweep {
+        tracing::warn!("no thread to sweep the runtime dir on ({e}); the next start tries again");
+    }
     // The OS's lock and sleep signals, until a quit drops the watch. Started here, before the
     // event loop runs: macOS delivers them through it.
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
@@ -319,6 +349,100 @@ mod tests {
             names,
             ["env", "turn_off_dmabuf_renderer_on_nvidia_wayland"],
             "run's first statement"
+        );
+    }
+
+    /// Whether `stmt` names `ident` anywhere inside it, closures included.
+    fn mentions(stmt: &syn::Stmt, ident: &str) -> bool {
+        struct Finder<'a>(&'a str, bool);
+        impl<'ast> syn::visit::Visit<'ast> for Finder<'_> {
+            fn visit_ident(&mut self, ident: &'ast proc_macro2::Ident) {
+                self.1 |= ident == self.0;
+            }
+        }
+        let mut finder = Finder(ident, false);
+        syn::visit::visit_stmt(&mut finder, stmt);
+        finder.1
+    }
+
+    /// R9: the kubeconfig copies a crash left in the runtime dir go at start,
+    /// once, on a thread of its own (the window never waits for a slow disk), with the shell's
+    /// own context, once the shell is in place and before the event loop runs.
+    #[test]
+    fn run_sweeps_the_runtime_dir_once_on_a_thread_of_its_own() {
+        let run = run_fn();
+        let stmts = &run.block.stmts;
+        let sweeps: Vec<usize> = (0..stmts.len())
+            .filter(|&i| mentions(&stmts[i], "sweep_runtime_dir"))
+            .collect();
+        let [sweep] = sweeps.as_slice() else {
+            panic!("run sweeps the runtime dir once: {sweeps:?}");
+        };
+        let install = stmts
+            .iter()
+            .position(|stmt| called(stmt).is_some_and(|(path, _)| path == ["app", "install"]))
+            .expect("run calls app::install");
+        let window = stmts
+            .iter()
+            .position(|stmt| {
+                matches!(stmt, syn::Stmt::Expr(syn::Expr::MethodCall(call), _)
+                    if call.method == "run")
+            })
+            .expect("run ends in app.run");
+        assert!(
+            install < *sweep && *sweep < window,
+            "{install} < {sweep} < {window}"
+        );
+        for ident in ["Builder", "spawn", "context"] {
+            assert!(
+                mentions(&stmts[*sweep], ident),
+                "the sweep's statement names {ident}"
+            );
+        }
+    }
+
+    /// WI-452: nothing on the way to the window waits for the macOS login shell. `run` starts
+    /// asking it once the log is up ([`crate::env::tool_search_path`]), builds the context from
+    /// what is known by then ([`crate::env::desktop_host`], which never waits), and never asks
+    /// for the answer itself: no `tools.get()`, no `tool_context()`.
+    #[test]
+    fn run_starts_the_tool_path_probe_and_never_waits_for_it() {
+        let run = run_fn();
+        let stmts = &run.block.stmts;
+        let first = |ident: &str| {
+            stmts
+                .iter()
+                .position(|stmt| mentions(stmt, ident))
+                .unwrap_or_else(|| panic!("run names {ident}"))
+        };
+        let (logging, probe, host) = (
+            first("init_logging"),
+            first("tool_search_path"),
+            first("desktop_host"),
+        );
+        assert!(
+            logging < probe && probe < host,
+            "init_logging at {logging}, tool_search_path at {probe}, desktop_host at {host}"
+        );
+
+        /// Finds a wait for the answer: `tools.get()`, or the shell's `tool_context`.
+        struct Waits(Vec<String>);
+        impl<'ast> syn::visit::Visit<'ast> for Waits {
+            fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+                let on_tools =
+                    matches!(&*call.receiver, syn::Expr::Path(p) if p.path.is_ident("tools"));
+                if call.method == "tool_context" || (on_tools && call.method == "get") {
+                    self.0.push(call.method.to_string());
+                }
+                syn::visit::visit_expr_method_call(self, call);
+            }
+        }
+        let mut waits = Waits(Vec::new());
+        syn::visit::visit_block(&mut waits, &run.block);
+        assert!(
+            waits.0.is_empty(),
+            "run waits for the tool search path: {:?}",
+            waits.0
         );
     }
 

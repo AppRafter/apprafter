@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Subcommand handlers. Each module implements one verb.
 
+pub(crate) mod age_cache;
 pub mod app;
 pub(crate) mod app_index;
 pub mod app_open;

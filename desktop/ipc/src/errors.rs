@@ -26,6 +26,13 @@ pub const SETTINGS_IO: &str = "apprafter::desktop::settings_io";
 pub const INTERNAL: &str = "apprafter::desktop::internal";
 /// The app is quitting: nothing new starts, and a plan that would have is dropped.
 pub const CLOSING: &str = "apprafter::desktop::closing";
+/// No token draft has this id (`fields.draftId`): used by its plan, discarded, or dropped on lock.
+pub const DRAFT_NOT_FOUND: &str = "apprafter::desktop::draft_not_found";
+/// The draft (`fields.draftId`) outlived its ten minutes; verify the token again.
+pub const DRAFT_EXPIRED: &str = "apprafter::desktop::draft_expired";
+/// A typed path (`fields.path`, as typed) is not a full path: it would resolve against the
+/// app's working directory, which means nothing to whoever typed it. A `~/` path is a full one.
+pub const RELATIVE_PATH: &str = "apprafter::desktop::relative_path";
 
 /// Every code above, once.
 pub const ALL: &[&str] = &[
@@ -39,6 +46,9 @@ pub const ALL: &[&str] = &[
     SETTINGS_IO,
     INTERNAL,
     CLOSING,
+    DRAFT_NOT_FOUND,
+    DRAFT_EXPIRED,
+    RELATIVE_PATH,
 ];
 
 #[cfg(test)]
@@ -49,7 +59,7 @@ mod tests {
 
     #[test]
     fn every_code_is_listed_once_under_the_desktop_prefix() {
-        assert_eq!(ALL.len(), 10);
+        assert_eq!(ALL.len(), 13);
         let unique: BTreeSet<_> = ALL.iter().collect();
         assert_eq!(unique.len(), ALL.len(), "{ALL:?}");
         for code in ALL {
@@ -66,6 +76,9 @@ mod tests {
             SETTINGS_IO,
             INTERNAL,
             CLOSING,
+            DRAFT_NOT_FOUND,
+            DRAFT_EXPIRED,
+            RELATIVE_PATH,
         ] {
             assert!(ALL.contains(&code), "{code} is not in ALL");
         }

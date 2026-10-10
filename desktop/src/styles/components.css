@@ -54,7 +54,8 @@
   font-size: 1.15em;
 }
 
-.btn:disabled {
+.btn:disabled,
+.btn[aria-disabled="true"] {
   opacity: 0.45;
   cursor: default;
 }
@@ -90,7 +91,7 @@
   color: var(--accent-fg);
 }
 
-.btn[data-variant="primary"]:hover:not(:disabled) {
+.btn[data-variant="primary"]:hover:not(:disabled):not([aria-disabled="true"]) {
   background: var(--accent-2);
 }
 
@@ -100,7 +101,7 @@
   border-color: var(--border-strong);
 }
 
-.btn[data-variant="secondary"]:hover:not(:disabled) {
+.btn[data-variant="secondary"]:hover:not(:disabled):not([aria-disabled="true"]) {
   background: var(--surface-2);
 }
 
@@ -110,7 +111,7 @@
   border-color: var(--err);
 }
 
-.btn[data-variant="danger"]:hover:not(:disabled) {
+.btn[data-variant="danger"]:hover:not(:disabled):not([aria-disabled="true"]) {
   background: var(--err-tint);
 }
 
@@ -119,7 +120,7 @@
   color: var(--danger-fg);
 }
 
-.btn[data-variant="danger-solid"]:hover:not(:disabled) {
+.btn[data-variant="danger-solid"]:hover:not(:disabled):not([aria-disabled="true"]) {
   filter: brightness(1.08);
 }
 
@@ -136,12 +137,13 @@
   font-size: 14px;
 }
 
-.btn[data-variant="ghost"]:hover:not(:disabled) {
+.btn[data-variant="ghost"]:hover:not(:disabled):not([aria-disabled="true"]) {
   background: var(--border);
   color: var(--fg);
 }
 
-.btn[data-variant="ghost"]:disabled {
+.btn[data-variant="ghost"]:disabled,
+.btn[data-variant="ghost"][aria-disabled="true"] {
   opacity: 0.5;
 }
 
@@ -455,6 +457,122 @@
   cursor: default;
 }
 
+/* Card, PageHeader, PageGrid -------------------------------------------------------------- */
+
+/* The design's card(): a surface of rows under an eyebrow title. */
+.card {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--r-4);
+  background: var(--surface);
+}
+
+.card[data-tone="danger"] {
+  border-color: var(--err);
+}
+
+.card-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 16px 10px;
+}
+
+.card-title {
+  flex: 1;
+  margin: 0;
+  color: var(--fg-faint);
+  font: 500 var(--fs-11) var(--font-mono);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.card[data-tone="danger"] .card-title {
+  color: var(--err);
+}
+
+.card-note {
+  margin: 0;
+  color: var(--fg-faint);
+  font: 400 var(--fs-11-5) var(--font-mono);
+}
+
+.page-titles {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.page-header[data-actions] {
+  flex-direction: row;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.page-actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 8px;
+}
+
+/* The design's mainCols for the Target screen, used once its side column has cards. */
+.page-grid[data-layout="main-side"] {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr);
+  align-items: start;
+  gap: 12px;
+}
+
+/* One column of cards, the page's width: no side column has anything to show. */
+.page-grid[data-layout="single"],
+.page-grid-column {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+
+/* PlanChanges ----------------------------------------------------------------------------- */
+
+.plan-changes {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.plan-change {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 8px;
+}
+
+.plan-change .tag {
+  flex: none;
+}
+
+.plan-change-object {
+  font-weight: 500;
+}
+
+.plan-change-detail {
+  flex-basis: 100%;
+  color: var(--fg-muted);
+  font: 400 var(--fs-11-5) var(--font-mono);
+  overflow-wrap: anywhere;
+}
+
+.plan-changes-none {
+  margin: 0;
+  color: var(--fg-muted);
+}
+
 /* SettingRow / CardRow -------------------------------------------------------------------- */
 
 .row {
@@ -466,8 +584,7 @@
 }
 
 .row[data-layout="card"] {
-  flex-wrap: wrap;
-  gap: 8px 14px;
+  gap: 14px;
   padding: 10px 16px;
 }
 
@@ -491,6 +608,19 @@
 
 .row[data-tone="danger"] .row-label {
   color: var(--err);
+}
+
+/*
+ * A card row's label stays on one line: the text column is never narrower than the label, and a
+ * long value beside it (a file path, an SSH key) gives way and ellipsises instead. The row does
+ * not wrap either, so the value never drops below the label.
+ */
+.row[data-layout="card"] .row-text {
+  min-width: min-content;
+}
+
+.row[data-layout="card"] .row-label {
+  white-space: nowrap;
 }
 
 .row-sub {
@@ -575,6 +705,15 @@
 .field-hint {
   color: var(--fg-faint);
   font-size: var(--fs-12);
+}
+
+/* A value a field's check refuses: the hint says why (FormDialog). */
+.input[aria-invalid="true"] {
+  border-color: var(--err);
+}
+
+.field:has(.input[aria-invalid="true"]) .field-hint {
+  color: var(--err);
 }
 
 /* Modal, FormDialog, ConfirmDialog, InfoSheet --------------------------------------------- */
@@ -763,6 +902,51 @@
   align-items: center;
   gap: 10px;
   font-size: var(--fs-13);
+}
+
+/* One choice from a list of rows (FormDialog's radio field, the SSH key picker). */
+.form-radios {
+  min-inline-size: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.form-radio {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  padding: 3px 0;
+  cursor: pointer;
+}
+
+.form-radio[data-disabled] {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.form-radio-dot {
+  flex: none;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.form-radio-label {
+  overflow: hidden;
+  color: var(--fg);
+  font: 400 var(--fs-12-5) var(--font-mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.form-radio-detail {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--fg-faint);
+  font-size: var(--fs-12);
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .confirm-plan {
@@ -1004,4 +1188,459 @@
 
 .error-actions {
   margin-top: 4px;
+}
+
+/* ChoiceCardGroup, ChipSelect, RadioList: a group of native radios ------------------------ */
+
+/* A fieldset reset: no border, no padding, no min-content floor on its width. The fieldset stays
+   a block (flex on a fieldset is not the same in every engine); its legend is a field's label. */
+.choice-cards,
+.radio-list {
+  min-inline-size: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.choice-cards > legend,
+.radio-list > legend {
+  padding: 0;
+  margin-bottom: 6px;
+}
+
+.choice-cards-hint {
+  margin-top: 6px;
+}
+
+.choice-cards-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.choice-cards-grid[data-columns="2"] {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.choice-cards-grid[data-columns="4"] {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+/* The card is the label of a hidden radio; positioned, so the radio it holds stays inside it
+   and focusing the radio scrolls nothing. */
+.choice-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-4);
+  cursor: pointer;
+}
+
+.choice-card:has(input:checked) {
+  border-color: var(--accent);
+  background: var(--accent-tint);
+}
+
+.choice-card:has(input:focus-visible) {
+  outline: var(--focus-ring);
+  outline-offset: 1px;
+}
+
+.choice-card[data-disabled] {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.choice-card-label {
+  font-weight: 500;
+}
+
+.choice-card-sub {
+  color: var(--fg-faint);
+  font: 400 var(--fs-11) var(--font-mono);
+}
+
+/* The design's region row: the label inline at the start, then the chips, wrapping. */
+.chip-select {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.chip-select-legend {
+  flex: none;
+  min-width: 64px;
+}
+
+/* A chip is the label of a hidden radio; positioned, as a choice card is. */
+.chip-option {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: var(--h-28);
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-4);
+  color: var(--fg-muted);
+  font: 400 var(--fs-12-5) var(--font-sans);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.chip-option:hover:not([data-disabled]) {
+  color: var(--fg);
+}
+
+.chip-option:has(input:checked) {
+  border-color: var(--accent);
+  background: var(--accent-tint);
+  color: var(--fg);
+}
+
+.chip-option:has(input:focus-visible) {
+  outline: var(--focus-ring);
+  outline-offset: 1px;
+}
+
+.chip-option[data-disabled] {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.chip-option-label {
+  font-family: var(--font-mono);
+}
+
+.chip-option-secondary {
+  color: var(--fg-faint);
+}
+
+.chip-option-meta {
+  color: var(--fg-faint);
+  font: 400 var(--fs-11) var(--font-mono);
+}
+
+/* The design's radio: a 14 px ring, filled with a dot when chosen (RadioList, DataTable). */
+.radio-dot {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  border: 1.5px solid var(--border-strong);
+  border-radius: 50%;
+  background: transparent;
+  cursor: pointer;
+  appearance: none;
+}
+
+.radio-dot:checked {
+  border-color: var(--accent);
+  background: var(--accent);
+  box-shadow: inset 0 0 0 3px var(--surface);
+}
+
+.radio-dot:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: 1px;
+}
+
+.radio-dot:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* The rows' box clips a chosen row's tint to its rounded corners. */
+.radio-list-rows {
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--r-4);
+}
+
+.radio-row + .radio-row {
+  border-top: 1px solid var(--border);
+}
+
+.radio-row:hover:not([data-disabled]):not([data-checked]) {
+  background: var(--surface-2);
+}
+
+.radio-row[data-checked] {
+  background: var(--accent-tint);
+}
+
+.radio-row[data-disabled] {
+  opacity: 0.45;
+}
+
+/* The row is dimmed already; its radio is not dimmed twice. */
+.radio-row[data-disabled] .radio-dot:disabled {
+  opacity: 1;
+}
+
+/* Radio, label, detail, meta: the design's SSH key row without its fingerprint column. */
+.radio-row-main {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1.3fr) minmax(0, 0.7fr) minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  font: 400 var(--fs-12-5) var(--font-mono);
+  cursor: pointer;
+}
+
+.radio-row[data-disabled] .radio-row-main {
+  cursor: default;
+}
+
+.radio-row-label,
+.radio-row-detail,
+.radio-row-meta {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.radio-row-label {
+  font-weight: 500;
+}
+
+/* A row with no detail or meta: its text takes the columns they leave. */
+.radio-row-label:last-child {
+  grid-column: 2 / -1;
+}
+
+.radio-row-detail {
+  color: var(--fg-muted);
+}
+
+.radio-row-detail:last-child {
+  grid-column: 3 / -1;
+}
+
+.radio-row-meta {
+  color: var(--fg-faint);
+}
+
+/* Under the row's text: past the radio's 20 px column and the 10 px gap. */
+.radio-row-extra {
+  padding: 0 12px 10px 42px;
+}
+
+/* DataTable ------------------------------------------------------------------------------- */
+
+/* The scroll box; a row the keyboard moves to scrolls in below the sticky header. */
+.data-table-scroll {
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--r-4);
+  scroll-padding-top: var(--h-30);
+}
+
+/* Separate borders, not collapsed: a collapsed border belongs to the table, so a sticky header
+   would scroll away from its own bottom line. */
+.data-table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  table-layout: fixed;
+  font: 400 var(--fs-12-5) var(--font-mono);
+}
+
+.data-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  height: var(--h-30);
+  padding: 0 4px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--fg-faint);
+  font: 500 var(--fs-10-5) var(--font-mono);
+  letter-spacing: 0.08em;
+  text-align: start;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.data-table td {
+  overflow: hidden;
+  padding: 7px 4px;
+  border-bottom: 1px solid var(--border);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The design's 12 px at the row's ends and 8 px between columns. */
+.data-table th:first-child,
+.data-table td:first-child {
+  padding-left: 12px;
+}
+
+.data-table th:last-child,
+.data-table td:last-child {
+  padding-right: 12px;
+}
+
+.data-table [data-align="end"] {
+  text-align: end;
+}
+
+/* The box's border closes the last row; `after` draws its own line. */
+.data-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.th-sort {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  letter-spacing: inherit;
+  text-transform: inherit;
+  cursor: pointer;
+}
+
+.th-sort:hover,
+.data-table th[aria-sort="ascending"] .th-sort,
+.data-table th[aria-sort="descending"] .th-sort {
+  color: var(--fg);
+}
+
+.data-table tbody tr:hover:not([data-disabled]):not([data-chosen]) {
+  background: var(--surface-2);
+}
+
+.data-table[data-choose] tbody tr:not([data-disabled]) {
+  cursor: pointer;
+}
+
+.data-table tbody tr[data-chosen] {
+  background: var(--accent-tint);
+}
+
+.data-table tbody tr[data-disabled] td {
+  opacity: 0.45;
+}
+
+/* The cell is dimmed already; its radio is not dimmed twice. */
+.data-table tbody tr[data-disabled] .radio-dot:disabled {
+  opacity: 1;
+}
+
+.data-table td.data-table-empty {
+  padding-top: 16px;
+  padding-bottom: 16px;
+  color: var(--fg-faint);
+  text-align: center;
+  white-space: normal;
+}
+
+.data-table-after {
+  padding: 6px 8px;
+  border-top: 1px solid var(--border);
+}
+
+/* Wizard ---------------------------------------------------------------------------------- */
+
+/* The form fills the panel, so the body scrolls between a fixed head and foot. */
+.wizard {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
+}
+
+/* The design's head: title, stepper and close on one centred row. */
+.wizard-head {
+  align-items: center;
+  gap: 12px;
+}
+
+.wizard-head > .icon-btn {
+  margin-left: 6px;
+}
+
+.wizard-title {
+  flex: 1;
+  min-width: 0;
+}
+
+.stepper {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 12px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.stepper-step {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--fg-faint);
+  font-size: var(--fs-12);
+  white-space: nowrap;
+}
+
+.stepper-step[data-state="current"] {
+  color: var(--fg);
+}
+
+.stepper-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border: 1px solid var(--border-strong);
+  border-radius: 50%;
+  font: 500 var(--fs-11) var(--font-mono);
+}
+
+.stepper-step[data-state="current"] .stepper-mark {
+  border-color: var(--accent);
+  color: var(--accent-text);
+}
+
+.stepper-step[data-state="done"] .stepper-mark {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--accent-fg);
+}
+
+/* With the head and foot (about 120 px) it fits the smallest window's view: 640 px less the 38 px
+   title bar and the layer's 40 px of padding. Taller content scrolls in the body. */
+.wizard-body {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-height: 330px;
+  padding: 20px;
+}
+
+.wizard-foot {
+  align-items: center;
+}
+
+.wizard-hint {
+  flex: 1;
+  min-width: 0;
+  color: var(--fg-faint);
+  font: 400 var(--fs-11-5) var(--font-mono);
+}
+
+/* The design's Next is 16 px wide at the sides, Back 14. */
+.wizard-foot > .btn[data-variant="primary"] {
+  padding: 0 16px;
 }

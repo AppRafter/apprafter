@@ -277,17 +277,33 @@
 
 .cluster-header {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 8px;
+  gap: 2px 8px;
   padding: 16px 16px 14px;
   border-bottom: 1px solid var(--border);
 }
 
+/* The name takes the row; Run doctor sits at its end. */
 .cluster-name {
+  flex: 1;
+  min-width: 0;
   overflow: hidden;
   font-size: var(--fs-15);
   font-weight: 700;
   letter-spacing: -0.01em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Provider · region · tier, on a line of its own under the name, aligned with it. */
+.cluster-meta {
+  flex-basis: 100%;
+  min-width: 0;
+  padding-left: 16px;
+  overflow: hidden;
+  color: var(--fg-faint);
+  font: 400 var(--fs-11-5) var(--font-mono);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -446,6 +462,13 @@
 
 /* Targets page ---------------------------------------------------------------------------------- */
 
+/* A line about the store as a whole: a CLI default that names no target in it. */
+.page-notice {
+  margin: 0;
+  color: var(--warn);
+  font-size: var(--fs-12-5);
+}
+
 .target-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -468,11 +491,6 @@
 .target-card {
   border: 1px solid var(--border);
   background: var(--surface);
-  cursor: pointer;
-}
-
-.target-card:hover {
-  border-color: var(--border-strong);
 }
 
 .target-card-head {
@@ -502,6 +520,31 @@
   font-size: var(--fs-12);
 }
 
+/* Open (or switch to its tab) and make it the CLI default: the card itself is not a button. */
+.target-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+/* A target whose files cannot be read: listed, never hidden, nothing to open; its one action,
+   Remove, sits at the foot of the card as a readable card's do. */
+.target-card[data-state="unreadable"] {
+  border-color: var(--err);
+}
+
+.target-card[data-state="unreadable"] .target-card-actions {
+  margin-top: auto;
+}
+
+.target-card-error {
+  margin: 0;
+  color: var(--fg-muted);
+  font-size: var(--fs-12-5);
+  overflow-wrap: anywhere;
+}
+
 .add-target-card {
   align-items: center;
   justify-content: center;
@@ -514,9 +557,10 @@
   font-size: 24px;
 }
 
-.add-target-card:disabled {
-  cursor: default;
-  opacity: 0.6;
+.add-target-card:hover {
+  border-color: var(--fg-faint);
+  color: var(--fg);
+  cursor: pointer;
 }
 
 .add-target-title {
@@ -526,11 +570,6 @@
 
 .add-target-sub {
   font-size: var(--fs-12);
-}
-
-.add-target-when {
-  color: var(--fg-faint);
-  font: 400 var(--fs-11-5) var(--font-mono);
 }
 
 /* Lock screen ----------------------------------------------------------------------------------- */
@@ -701,4 +740,23 @@
   background: var(--warn-tint);
   color: var(--fg);
   font-size: var(--fs-12-5);
+}
+
+/* Target screen --------------------------------------------------------------------------------- */
+
+.target-row-sub code {
+  color: var(--fg);
+  font: 400 var(--fs-11-5) var(--font-mono);
+}
+
+/* The CLI's rebuild recipe under a provisioned machine: one command a line. */
+.target-recipe {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 6px 0;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-3);
+  background: var(--bg);
 }

@@ -275,7 +275,7 @@ cleanup() {
             if [ "$old_n" = "0" ]; then
                 printf 'ok: OLD project has ZERO servers after destroy (API-verified)\n' >&2
             else
-                printf 'LEAK WARNING: OLD project reports %s server(s) after destroy — INSPECT https://console.hetzner.cloud (token1 project) AND DELETE ANY STRAGGLERS BY HAND\n' \
+                printf 'LEAK WARNING: OLD project reports %s server(s) after destroy — INSPECT https://console.hetzner.com (token1 project) AND DELETE ANY STRAGGLERS BY HAND\n' \
                     "$old_n" >&2
             fi
         fi
@@ -284,7 +284,7 @@ cleanup() {
             if [ "$new_n" = "0" ]; then
                 printf 'ok: NEW project has ZERO servers after destroy (API-verified)\n' >&2
             else
-                printf 'LEAK WARNING: NEW project reports %s server(s) after destroy — INSPECT https://console.hetzner.cloud (token2 project) AND DELETE ANY STRAGGLERS BY HAND\n' \
+                printf 'LEAK WARNING: NEW project reports %s server(s) after destroy — INSPECT https://console.hetzner.com (token2 project) AND DELETE ANY STRAGGLERS BY HAND\n' \
                     "$new_n" >&2
             fi
         fi

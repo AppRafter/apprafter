@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 import { expect, test } from 'bun:test';
-import { ACTION_IDS } from './registry';
+import { API_COMMANDS } from '../ipc/api';
+import { ACTION_COMMANDS, ACTION_IDS, CLOSED_SLICES } from './registry';
 
 type Node = { path: string[]; hidden: boolean };
 type Entry = { action?: string; status?: string; slice?: string };
@@ -55,6 +56,55 @@ test('every action id exists in the registry', () => {
       expect({ leaf, known: known.has(e.action) }).toEqual({ leaf, known: true });
     }
   }
+});
+
+test('every action id runs a command the shell registers', () => {
+  expect(Object.keys(ACTION_COMMANDS).sort()).toEqual([...ACTION_IDS].sort());
+  const commands = new Set<string>(API_COMMANDS);
+  for (const id of ACTION_IDS) {
+    expect({ id, registered: commands.has(ACTION_COMMANDS[id]) }).toEqual({ id, registered: true });
+  }
+});
+
+test('a closed slice has no planned leaf left', () => {
+  for (const [leaf, e] of Object.entries(entries)) {
+    if (e.slice !== undefined && CLOSED_SLICES.includes(e.slice)) {
+      expect({ leaf, status: e.status ?? null }).not.toEqual({ leaf, status: 'planned' });
+    }
+  }
+});
+
+/** D.3's nine leaves, each with the action that covers it (docs/status.md names them). */
+const D3_LEAVES = [
+  ['target add', 'target.add'],
+  ['target list', 'target.list'],
+  ['target show', 'target.show'],
+  ['target use', 'target.use'],
+  ['target rename', 'target.rename'],
+  ['target remove', 'target.remove'],
+  ['target machine', 'target.machine'],
+  ['doctor', 'doctor.run'],
+  ['whoami', 'whoami.show'],
+] as const;
+
+// The closed-slice check above sees only the leaves of a slice it is told is closed: D.3 must
+// stay closed, and its nine leaves stay actions in it — re-planned under a later slice, or
+// back to planned, a leaf the app shows would no longer be held to its action.
+test('D.3 stays closed, and its nine leaves stay actions in it', () => {
+  expect(CLOSED_SLICES).toContain('D.3');
+  for (const [leaf, id] of D3_LEAVES) {
+    expect({
+      leaf,
+      action: entries[leaf]?.action,
+      slice: entries[leaf]?.slice,
+      status: entries[leaf]?.status ?? null,
+    }).toEqual({ leaf, action: id, slice: 'D.3', status: null });
+  }
+  const inD3 = Object.entries(entries)
+    .filter(([, e]) => e.slice === 'D.3')
+    .map(([leaf]) => leaf)
+    .sort();
+  expect(inD3).toEqual(D3_LEAVES.map(([leaf]) => leaf).sort());
 });
 
 test('the fixed markers stay what the spec decided', () => {

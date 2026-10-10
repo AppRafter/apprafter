@@ -1,0 +1,35 @@
+$ apprafter target add prod --renew --token bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb --no-interactive
+[exit 1]
+[stdout]
+[stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m target add invoked <ESC>[3mtarget<ESC>[0m<ESC>[2m=<ESC>[0mprod <ESC>[3mrenew<ESC>[0m<ESC>[2m=<ESC>[0mtrue <ESC>[3mforce<ESC>[0m<ESC>[2m=<ESC>[0mfalse
+Error: apprafter::target::token_rejected
+
+  × provider `hetzner-cloud` rejected the supplied token
+  ╰─▶ apprafter::provider::hetzner_api_error
+      
+        × hetzner-cloud GET <HCLOUD>/v1/locations failed (status
+        │ 401): unauthorized: unable to authenticate
+        help: The Hetzner Cloud API refused the request:
+              • 401 unauthorized — the token is wrong, or it was revoked or
+              rotated. For a target's stored token, `apprafter target add
+              <name> --renew --token <new>` replaces it; an `HCLOUD_TOKEN` in
+              the environment outranks the stored token.
+              • 403 forbidden — the token lacks Read & Write (it is Read-
+              only), or the project forbids the call, for example at one of
+              its limits.
+              • 429 rate limit — too many requests: wait, then try again.
+              • 5xx — an outage at the provider; check https://
+              status.hetzner.com/.
+              Re-run `apprafter doctor` to confirm reachability after fixing
+              the root cause.
+      
+  help: The provider's read-only credential check returned 401 unauthorized:
+        the token was mistyped, or it was revoked or rotated, or its project
+        was deleted.
+        • A token is shown only once, when it is created: paste it again from
+        where you saved it, or create a new one with Read & Write permission
+        in the Hetzner Console (open the project, then Security → API tokens).
+        • If you're rotating, run `apprafter target add <name> --renew --token
+        <new>` instead of re-creating the target.
+

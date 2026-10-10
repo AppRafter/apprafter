@@ -11,7 +11,7 @@
 // owner must be able to switch it off. Opening Settings reads app_info again, so a session watch
 // that answered late counts.
 import { useQueryClient } from '@tanstack/react-query';
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { Button } from '../components/Button';
 import { ErrorPanel } from '../components/ErrorPanel';
 import { Eyebrow } from '../components/Eyebrow';
@@ -23,6 +23,7 @@ import {
   LockSimpleIcon,
   MoonIcon,
   SunIcon,
+  WrenchIcon,
 } from '../components/icons';
 import { Modal } from '../components/Modal';
 import { SegmentedControl, type SegmentOption } from '../components/SegmentedControl';
@@ -33,12 +34,14 @@ import type { AutoLock } from '../ipc/generated/AutoLock';
 import type { SessionEvents } from '../ipc/generated/SessionEvents';
 import type { Settings } from '../ipc/generated/Settings';
 import type { Theme } from '../ipc/generated/Theme';
+import { ToolchainPanel } from '../screens/toolchain/ToolchainPanel';
 import { authPrompt } from '../state/auth';
 import { lockOff, NO_AUTH_NOTICE, useLockActions } from '../state/lock';
 import { osName, rereadAppInfo, usePlatform } from '../state/platform';
 import { useSaveSettings, useSettings } from '../state/settings';
 import { shortcutHint } from '../state/shortcuts';
 import { LINKS, openLink } from './links';
+import { ThisComputerRow } from './ThisComputer';
 
 const THEMES = [
   { value: 'system', label: 'System', icon: DesktopIcon },
@@ -67,18 +70,24 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
   // What app_info says may have changed since it was read: a session watch that answered late,
   // the authentication Rust found since.
   useEffect(() => rereadAppInfo(client, false), [client]);
+  const [tools, setTools] = useState(false);
+  // The toolchain beside Settings, never in its panel: its layer then covers the window and
+  // makes Settings inert, and Esc closes the toolchain only.
   return (
-    <Modal title="Settings" width={620} onClose={onClose} dismissOnBackdrop>
-      {settings.isPending ? null : settings.isError ? (
-        <ErrorPanel error={uiErrorOf(settings.error)} />
-      ) : (
-        <SettingsBody settings={settings.data} />
-      )}
-    </Modal>
+    <>
+      <Modal title="Settings" width={620} onClose={onClose} dismissOnBackdrop>
+        {settings.isPending ? null : settings.isError ? (
+          <ErrorPanel error={uiErrorOf(settings.error)} />
+        ) : (
+          <SettingsBody settings={settings.data} onToolchain={() => setTools(true)} />
+        )}
+      </Modal>
+      {tools && <ToolchainPanel onClose={() => setTools(false)} />}
+    </>
   );
 }
 
-function SettingsBody({ settings }: { settings: Settings }) {
+function SettingsBody({ settings, onToolchain }: { settings: Settings; onToolchain: () => void }) {
   const info = usePlatform();
   const save = useSaveSettings();
   const { lock } = useLockActions();
@@ -220,6 +229,16 @@ function SettingsBody({ settings }: { settings: Settings }) {
               GitHub
             </Button>
           </>
+        }
+      />
+      <ThisComputerRow />
+      <SettingRow
+        label="Toolchain"
+        sub="kubectl, helm, restic, git, ssh and cue on this computer."
+        control={
+          <Button size={28} icon={WrenchIcon} onClick={onToolchain}>
+            Show
+          </Button>
         }
       />
     </div>

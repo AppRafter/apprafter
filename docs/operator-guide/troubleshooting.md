@@ -66,19 +66,21 @@ the diagnostic body usually points at the offending expression.
 
 ### `apprafter::provider::hetzner_api_error`
 
-The Hetzner Cloud API returned a non-2xx response.
+The Hetzner Cloud API refused the request. The credential check
+reports this code too, for any status but 401
+(`apprafter::target::token_rejected`).
 
-**Fix.** Read the inner help — it enumerates the four most common
-failure families:
+**Fix.** Read the inner help. It lists what each status means:
 
-- **401 unauthorized** — the stored token was rotated or revoked.
-  Run `apprafter target add <name> --renew --token <new>` to
-  refresh it.
-- **403 forbidden** — the token's project lacks permission for
-  this resource type.
-- **429 rate limit** — back off and retry; if persistent, the
-  project may need a quota increase.
-- **5xx** — provider-side outage. Check
+- **401 unauthorized** — the token is wrong, or it was revoked or
+  rotated. For a target's stored token,
+  `apprafter target add <name> --renew --token <new>` replaces it.
+  An `HCLOUD_TOKEN` in the environment outranks the stored token.
+- **403 forbidden** — the token lacks Read & Write (it is
+  Read-only), or the project forbids the call, for example at one
+  of its limits.
+- **429 rate limit** — too many requests: wait, then try again.
+- **5xx** — an outage at the provider. Check
   https://status.hetzner.com/.
 
 After fixing the root cause, run `apprafter doctor` to confirm
@@ -183,15 +185,35 @@ apprafter import --target <target>
 
 ### `apprafter::target::invalid_config`
 
-A YAML file under `$XDG_CONFIG_HOME/apprafter/` failed to parse.
-Either hand-edited or written by an incompatible CLI version.
+A YAML file in the target store (`$XDG_CONFIG_HOME/apprafter/`, or
+`APPRAFTER_CONFIG_DIR`) failed to parse: it was edited by hand or
+written by an incompatible CLI version. The message and the help name
+the file. For a target's `credentials.yaml` the message gives only the
+line and column where parsing stopped, never the file's text, because
+that text is the API token.
 
-**Fix.** Either fix the YAML by hand (these files are small), or
-nuke just the offending target's directory under
-`$XDG_CONFIG_HOME/apprafter/targets/<name>/` and re-create with
-`apprafter target add <name> --provider hetzner-cloud …`. The
-global `config.yaml` is the only file shared across targets;
-treat it as the last line of defence.
+**Fix.** Fix the file by hand (these files are small), or restore it
+from a backup. Otherwise, it depends on whose file it is:
+
+- **A target's `config.yaml` or `credentials.yaml`**: remove the
+  target with `apprafter target remove <name>` and add it again with
+  `apprafter target add <name> --provider hetzner-cloud …`, its token
+  included. `target remove` takes a target it cannot read: it warns
+  which file cannot be read and deletes the target's files without
+  reading them. The removal also deletes the target's local state:
+  the record of its server, the cached kubeconfig and the Argo CD
+  password. If a server is recorded, fix or restore the file first:
+  the warning names the server, which keeps running, and
+  `apprafter destroy --target <name>` cannot read the token until the
+  files are fixed. If you remove it anyway, add the target again with
+  the same token and region, and
+  `apprafter import --target <name>` rebuilds the record from the
+  provider; the kubeconfig and the Argo CD password are fetched again
+  on first use.
+- **The store's own `config.yaml`**: no target's removal or re-add
+  repairs it. It records only which target is the default, so you can
+  delete it and choose the default again with
+  `apprafter target use <name>`.
 
 ### `apprafter::target::no_active`
 
@@ -216,31 +238,38 @@ nothing, you're seeing the empty-store first-run case.
 
 ### `apprafter::target::token_rejected`
 
-The provider's read-only credential check returned 401 /
+The provider's read-only credential check returned 401
 unauthorized. **Distinct from** the generic Hetzner API error —
 this fires only on the explicit `target add` ping path, so the
 help text targets the rotation flow specifically.
 
-**Fix.** Read the layered help:
+The token was mistyped, or it was revoked or rotated, or its
+project was deleted. Its permissions are not the cause: the check
+only reads, so a Read-only token passes it. A token with stray
+whitespace never reaches the check either; the format check
+refuses it first (`apprafter::target::invalid_token`).
 
-- Verify the token at https://console.hetzner.cloud/projects →
-  Security → API Tokens. It must say `Read & Write` next to
-  the project.
-- Copy the token again — the most common cause is a trailing
-  newline from a clipboard manager (Hetzner tokens are 64
-  ASCII chars, no prefix).
+**Fix.**
+
+- A token is shown only once, when it is created: paste it again
+  from where you saved it, or create a new one with Read & Write
+  permission in the Hetzner Console (open the project, then
+  Security → API tokens).
 - If you're rotating, use `apprafter target add <name> --renew
   --token <new>` instead of re-creating the target.
-- For offline / CI seeding, pass `--no-ping` to skip the
-  network round-trip and save the target anyway.
 
 ### `apprafter::target::provider_unreachable`
 
-The credential check ping failed for a **non-401** reason —
-transport error (`connection refused`, DNS failure), 5xx
-provider-side outage, or 429 rate limit. The token may still
-be valid once the API recovers — the help text intentionally
-avoids any rotation suggestion that would misdirect operators.
+The provider's API gave **no answer**: the connection was
+refused, the name did not resolve, or the request timed out. Any
+request reports this code, whether it was the credential check, a
+machine catalogue read or `apply`. A provider that answered is
+never reported this way: a 5xx outage or a 429 rate limit is
+`apprafter::provider::hetzner_api_error` with its status, and an
+answer AppRafter cannot read is `apprafter::provider::request_failed`.
+The token may still be valid once the API recovers — the help text
+intentionally avoids any rotation suggestion that would misdirect
+operators.
 
 **Fix.**
 
@@ -249,7 +278,8 @@ avoids any rotation suggestion that would misdirect operators.
   (https://status.hetzner.com/ for hetzner-cloud).
 - VPN / corporate proxy: ensure `https://api.hetzner.cloud/`
   is reachable.
-- `--no-ping` to save the target offline and verify later.
+- `--no-ping` (on `target add`, also with `--renew`, and on
+  `target machine`) to save offline and verify later.
 
 ### `apprafter::io::error` / `apprafter::io::json` / `apprafter::io::yaml`
 
@@ -260,8 +290,17 @@ encode/decode error on `state.json` (JSON) /
 **Fix.** The captured OS message names the failing path or
 socket. Common cases: missing directory, wrong permissions
 (`chmod 0600` on credentials), full disk. For decode failures on
-target-store files, re-create the offending target with
-`apprafter target add <name> --force`.
+target-store files, fix the YAML by hand (they are small files), or
+restore the file from a backup. Otherwise remove that target with
+`apprafter target remove <name>`, which takes a target it cannot
+read, and add it again with `apprafter target add`. The removal
+also deletes the target's local state: the record of its server,
+the cached kubeconfig and the Argo CD password. If a server is
+recorded, fix or restore the file first. After adding the target
+again, `apprafter import --target <name>` rebuilds the record from
+the provider; the kubeconfig and the Argo CD password are fetched
+again on first use. `target add --force` cannot rewrite such a
+target: it keeps the stored values, so it needs a readable config.
 
 ### `apprafter::backup::job_active`
 
@@ -303,6 +342,71 @@ own once the condition ends; run `apprafter backup run` again then. The
 whole case, including how to tell whether tonight's scheduled backup is
 stuck: [the backup runner's pod cannot be
 scheduled](backup-restore.md#runner-unschedulable).
+
+### `apprafter::secrets::age_key_missing` {#age-key-missing}
+
+The age key that the cached kubeconfig and Argo CD password are
+encrypted under is not at the path the error names —
+`APPRAFTER_AGE_KEY`, or `~/.config/apprafter/age.key` by default (see
+[Environment variables](../reference/environment.md)). A command that
+reads a cache never creates a key in its place: a new key cannot
+decrypt anything cached under the old one. `apprafter doctor` reports
+the same on its **Kube API reachable** row.
+
+**Fix.** If you still have the key, put it back at that path, or set
+`APPRAFTER_AGE_KEY` to where it is. Nothing else is needed.
+
+If the key is lost, fetch the kubeconfig again under a new key:
+
+```sh
+apprafter kubeconfig --refresh --target <name>
+```
+
+It reads `/etc/rancher/k3s/k3s.yaml` from the target's node over SSH,
+as the first fetch did, and changes nothing on the node or in the
+cluster. Before it creates the key it lists everything else cached
+under the lost key, which the new key cannot read, and asks; without a
+terminal it refuses unless you pass `--yes`. Answering no, or pressing
+Esc or Ctrl-C, creates, fetches and writes nothing: the command exits 1
+with `apprafter::secrets::new_key_declined` and prints nothing on
+stdout, so `apprafter kubeconfig > kc && …` stops there. The key is
+created only once the node has answered, so a failed fetch leaves none
+behind.
+
+Only the targets of the current config root (`APPRAFTER_CONFIG_DIR`)
+are checked for secrets cached under the lost key. The key is shared
+by every config root on the machine, so the list leaves out the targets
+of another root, and in a root whose targets cache nothing the first
+fetch creates the key without asking, as on a first use. Their caches
+then fail with
+[`apprafter::secrets::cache_undecryptable`](#cache-undecryptable).
+
+What the new key leaves behind, and the way back for each:
+
+| Cached under the lost key | After the new key |
+| --- | --- |
+| The target's kubeconfig | Fetched again by the command itself. |
+| The target's Argo CD admin password | Dropped from the cache: `apprafter argocd-password --target <name>` fetches it from the cluster again. It reads `argocd-initial-admin-secret`; if you deleted that secret after changing the password, use the password you set. |
+| Another target's kubeconfig | `apprafter kubeconfig --refresh --target <other>` fetches it again under the new key, without asking: the key exists now. |
+| Another target's Argo CD admin password | `apprafter argocd-password --refresh --target <other>` fetches it again, once that target's kubeconfig is fetched. |
+
+`apprafter up` never creates a key in place of a lost one: its
+`k3s-ready` step stops at once with this error, and runs through once
+the command above has created the new key.
+
+### `apprafter::secrets::cache_undecryptable` {#cache-undecryptable}
+
+A cached kubeconfig or Argo CD password does not decrypt with the age
+key there is. It was cached under another key — one that was lost and
+replaced, or one `APPRAFTER_AGE_KEY` no longer points at — or the
+cached copy is damaged.
+
+**Fix.** If you have the key it was cached under, set
+`APPRAFTER_AGE_KEY` to it. Otherwise fetch it again under the key
+there is: `apprafter kubeconfig --refresh --target <name>` for a
+kubeconfig, `apprafter argocd-password --refresh --target <name>` for
+an Argo CD admin password. Neither asks, since the key they cache under
+exists.
 
 ### `apprafter::cli::other`
 
@@ -355,11 +459,12 @@ If you see `> 60 s` consistently on `k3s-ready`:
   nothing, and because `RUST_LOG` **replaces** the default filter
   rather than adding to it, such a directive on its own turns the
   logging off instead of up.
-- Confirm the Hetzner Cloud Firewall has port 22 open
-  (`apprafter doctor` sanity-checks DNS + reachability, not
-  port-level connectivity).
+- Confirm the Hetzner Cloud Firewall has port 22 open:
+  `apprafter doctor`'s **`Node reachable over SSH`** check connects
+  to port 22 of the node's public IPv4, and FAILs naming the address
+  when nothing accepts the connection.
 - Try `apprafter kubeconfig --refresh` once the cluster reports
-  ready in the Hetzner Cloud Console (the Web Console gives you
+  ready in the Hetzner Console (the Web Console gives you
   out-of-band access to the boot log).
 
 ### Cilium pods did not pick up a config change
@@ -384,9 +489,10 @@ The common ones:
   `(region × SKU)` pair is invalid or unavailable. See the section
   above for the four `UnavailableKind` variants and their fixes.
 - A `403 forbidden` with a quota message — your Hetzner project
-  has hit its server / IP / volume limit. Raise the limit in the
-  Hetzner Cloud Console (Project → Limits) or free up resources,
-  then re-run. `apprafter destroy --yes` clears any half-built
+  has hit its server / IP / volume limit. Request a higher limit
+  from the [limits overview](https://console.hetzner.com/limits) in
+  the Hetzner Console (Request change → Limit increase) or free up
+  resources, then re-run. `apprafter destroy --yes` clears any half-built
   resources before you retry — but it removes **every** resource
   tagged `apprafter=true` in that project, running clusters included,
   so only reach for it when the project holds nothing else
@@ -397,37 +503,54 @@ The common ones:
 Point `--ssh-key` at a real **public** key file (e.g.
 `~/.ssh/id_ed25519.pub`, not the private key). The key is injected into
 the node at provision time, so a change only takes effect on the next
-`apply` / `up` — re-add the target with `--force --ssh-key <path>`
-first.
+`apply` / `up` — set it first with
+`apprafter target add <name> --renew --ssh-key <path>`, which changes
+the key and keeps everything else, the token included.
 
-**What checks what, exactly** — because the obvious check does less
-than it looks:
+**What checks what, exactly**
 
-- `apprafter target add --ssh-key <path>` **refuses at add time** if
-  the path does not exist: `SSH key path '<path>' does not exist`
-  (code `apprafter::cli::other`). So a bad path never gets stored in
-  the first place.
-- `apprafter doctor`'s check is named **`SSH key readable`** — not
-  "SSH public key readable" — and that is all it verifies. It FAILs
-  when the stored path has since disappeared or cannot be read, and
-  otherwise PASSes, printing the file's first whitespace-delimited
-  token as the algorithm. It does **not** validate that the file is a
-  public key: pointed at a file containing `not-a-key` it reports
+The key file is sent to Hetzner as it is, so every place that takes it
+checks that it holds one OpenSSH public key line, `<type> <base64>
+[comment]`, of type `ssh-ed25519`, `ssh-rsa`, an `ecdsa-sha2` curve, or
+a security-key (`sk-`) type. A private key is refused by name, and its
+contents are never printed.
+
+- `apprafter target add --ssh-key <path>` (and `--renew --ssh-key`)
+  **refuses at add time** if the path does not exist (`SSH key path
+  '<path>' does not exist`, code `apprafter::target::ssh_key_unreadable`)
+  or if the file is not a public key (`SSH key '<path>' is a private
+  key: …` or `… is not an OpenSSH public key`, code
+  `apprafter::target::ssh_key_not_public`). So neither a bad path nor a
+  private key gets stored in the first place.
+- `apprafter apply` / `up` check the key body again before anything is
+  sent to the provider: the stored path's file, an inline
+  `APPRAFTER_SSH_PUBLIC_KEY`, or a manifest's `sshKeys` entry. A target
+  stored before this check existed can still name a private key; `apply`
+  then stops with `apprafter::target::ssh_key_not_public` and sends
+  nothing.
+- `apprafter doctor`'s **`SSH key readable`** row FAILs when the stored
+  path has disappeared, cannot be read, or does not hold a public key (a
+  private key is named as one), and otherwise PASSes, printing the key
+  type:
 
     ```text
-      ✓ SSH key readable (/path/to/fake.pub (not-a-key))
+      ✓ SSH key readable (/home/you/.ssh/id_ed25519.pub (ssh-ed25519))
     ```
 
-    and pointed at a *private* key it passes just as happily, printing
-    `✓ SSH key readable (…/id_ed25519 (-----BEGIN))`. A green tick here
-    means "a file is there", not "the key is right".
 - With no key configured at all the check is a **WARN**, `SSH key path
   configured`, not a FAIL — provisioning is what refuses.
 
-So if provisioning fails on SSH and `doctor` is green, compare the
-stored path's contents against the key the node actually has: `head -c
-20 <path>` should start with `ssh-ed25519` / `ssh-rsa` / `ecdsa-`, not
-`-----BEGIN`.
+A private key's public half is the `.pub` file next to it; `ssh-keygen
+-y -f <private key>` prints it again if the `.pub` is lost.
+
+Fix the key where the message says it came from, as its help does. A
+manifest's `sshKeys[i]`: replace that entry's `public_key` with the
+public line. `APPRAFTER_SSH_PUBLIC_KEY`: set it to the public line, or
+unset it. A target's key file:
+`apprafter target add <name> --renew --ssh-key <path>.pub`, or, on a
+first `target add`, the same command with the `.pub`. `apply` takes the
+manifest's keys first, then the variable, then the target's key, so
+changing one further down does not change what is sent.
 
 ### App stuck on `ImagePullBackOff` (registry auth) {#registry-auth}
 
@@ -579,19 +702,18 @@ Error: apprafter::target::token_rejected
 
         × hetzner-cloud GET /v1/locations failed (status 401):
         │ unauthorized: the token you have provided is invalid
-        help: The Hetzner Cloud API returned a non-2xx response. …
+        help: The Hetzner Cloud API refused the request:
               • 401 unauthorized — …
               • 403 forbidden — …
               • 429 rate limit — …
               • 5xx — …
 
-  help: The provider's read-only credential check returned 401 /
-        unauthorized. …
-        • Verify the token at https://console.hetzner.cloud/projects → …
-        • Copy the token again …
+  help: The provider's read-only credential check returned 401
+        unauthorized: the token was mistyped, or it was revoked or
+        rotated, or its project was deleted.
+        • A token is shown only once, when it is created: …
         • If you're rotating, run `apprafter target add <name>
         --renew --token <new>` …
-        • Pass `--no-ping` to skip the check …
 ```
 
 The OUTER `Error:` line names the operator-facing scenario. The

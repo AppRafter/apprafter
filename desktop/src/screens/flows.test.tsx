@@ -1,0 +1,220 @@
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
+// The D.3 flows, opened as the views open them, on D.3d's mock engine.
+import { afterEach, beforeEach, expect, test } from 'bun:test';
+import { clearMocks } from '@tauri-apps/api/mocks';
+import { act, cleanup, screen, within } from '@testing-library/react';
+import * as api from '../ipc/api';
+import { resetLifecycle } from '../ipc/lifecycle';
+import { installMockIpc, mockTargetStore } from '../ipc/mock';
+import { MOCK_NOT_KEYS } from '../ipc/mock/fixtures';
+import { resetOperations } from '../ipc/operations';
+import { targetReport } from '../test/fixtures';
+import { doctorReport } from '../test/flows';
+import { completed, installHarness, uiError } from '../test/ipc';
+import { renderScreen } from '../test/screens';
+import { settleIpc } from '../test/settle';
+import { type TargetFlows, useTargetFlows } from './flows';
+
+beforeEach(async () => {
+  installMockIpc({ opDelayMs: 0 });
+  await api.unlock();
+});
+afterEach(async () => {
+  cleanup();
+  await settleIpc();
+  resetLifecycle();
+  resetOperations();
+  clearMocks();
+});
+
+/** A probe inside renderScreen; `flows()` is what `useTargetFlows` returned on its last render. */
+function probe(): { flows: () => TargetFlows; user: ReturnType<typeof renderScreen> } {
+  const seen: { flows: TargetFlows | null } = { flows: null };
+  function Probe() {
+    seen.flows = useTargetFlows();
+    return null;
+  }
+  const user = renderScreen(<Probe />);
+  return {
+    user,
+    flows: () => {
+      if (seen.flows === null) throw new Error('the probe did not render');
+      return seen.flows;
+    },
+  };
+}
+
+/** The overlay a dialog sits in: the app's own (outside the view) or the view's. */
+const hostOf = (dialog: HTMLElement) => (dialog.closest('.view') === null ? 'app' : 'view');
+
+test('addTarget opens the wizard, over the views', async () => {
+  const { flows } = probe();
+  act(() => flows().addTarget());
+  const wizard = await screen.findByRole('dialog', { name: 'Add target' });
+  expect(hostOf(wizard)).toBe('app');
+});
+
+test('doctor opens Doctor · <target>, over the views', async () => {
+  const { flows } = probe();
+  act(() => flows().doctor('prod-eu'));
+  const doctor = await screen.findByRole('dialog', { name: 'Doctor · prod-eu' });
+  expect(hostOf(doctor)).toBe('app');
+});
+
+test('changeMachine opens Change machine · <target>, in its view', async () => {
+  const { flows } = probe();
+  act(() => flows().changeMachine('staging', { region: 'nbg1', serverType: 'cx22' }));
+  const dialog = await screen.findByRole('dialog', { name: 'Change machine · staging' });
+  expect(hostOf(dialog)).toBe('view');
+});
+
+test('toolchain opens the panel, over the views', async () => {
+  const { flows } = probe();
+  act(() => flows().toolchain());
+  expect(hostOf(await screen.findByRole('dialog', { name: 'Toolchain' }))).toBe('app');
+});
+
+test('errorAction runs the actions these flows own, and only those', async () => {
+  const { flows } = probe();
+  let owned = true;
+  act(() => {
+    owned = flows().errorAction({ kind: 'renew-token' });
+  });
+  expect(owned).toBe(false);
+  expect(screen.queryByRole('dialog')).toBeNull();
+  act(() => {
+    owned = flows().errorAction({ kind: 'toolchain' });
+  });
+  expect(owned).toBe(true);
+  expect(await screen.findByRole('dialog', { name: 'Toolchain' })).toBeDefined();
+});
+
+test("the doctor's Add target closes the doctor, then opens the wizard", async () => {
+  const { flows, user } = probe();
+  act(() => flows().doctor('nowhere'));
+  const doctor = await screen.findByRole('dialog', { name: 'Doctor · nowhere' });
+  await user.click(await within(doctor).findByRole('button', { name: 'Add a target' }));
+  expect(screen.queryByRole('dialog', { name: 'Doctor · nowhere' })).toBeNull();
+  expect(hostOf(await screen.findByRole('dialog', { name: 'Add target' }))).toBe('app');
+});
+
+// The same cases on the mock engine, whose doctor reads each target's stored key as the core
+// does (ipc/mock/flows.ts): lab's file is gone; staging's key is set to none, or to the private
+// half behind the app's back, as the CLI could.
+for (const [kind, prepare] of [
+  ['ssh_key_missing', () => 'lab'],
+  [
+    'configure_ssh_key',
+    () => {
+      const staging = mockTargetStore().reports.get('staging');
+      if (staging !== undefined)
+        mockTargetStore().reports.set('staging', { ...staging, sshKey: null });
+      return 'staging';
+    },
+  ],
+  [
+    'ssh_key_not_public',
+    () => {
+      const staging = mockTargetStore().reports.get('staging');
+      const privateKey = MOCK_NOT_KEYS.find((key) => key.problem === 'private_key') ?? null;
+      if (staging !== undefined) {
+        mockTargetStore().reports.set('staging', { ...staging, sshKey: privateKey });
+      }
+      return 'staging';
+    },
+  ],
+] as const) {
+  test(`on the mock engine, the doctor's ${kind} fix opens the key change above the doctor`, async () => {
+    const target = prepare();
+    const { flows, user } = probe();
+    act(() => flows().doctor(target));
+    const doctor = await screen.findByRole('dialog', { name: `Doctor · ${target}` });
+    await user.click(await within(doctor).findByRole('button', { name: 'Change SSH key' }));
+    const form = await screen.findByRole('dialog', { name: 'Change SSH key' });
+    expect(hostOf(form)).toBe('app');
+    expect(doctor.contains(form)).toBe(false);
+    await user.click(within(form).getByRole('button', { name: 'Cancel' }));
+    expect(screen.getByRole('dialog', { name: `Doctor · ${target}` })).toBeDefined();
+  });
+}
+
+test('on the mock engine, a target gone before the key change opens: the doctor says so', async () => {
+  const { flows, user } = probe();
+  act(() => flows().doctor('lab'));
+  const doctor = await screen.findByRole('dialog', { name: 'Doctor · lab' });
+  const change = await within(doctor).findByRole('button', { name: 'Change SSH key' });
+  // Removed by the CLI meanwhile.
+  mockTargetStore().reports.delete('lab');
+  await user.click(change);
+  expect(await within(doctor).findByText(/target `lab`/)).toBeDefined();
+  expect(screen.queryByRole('dialog', { name: 'Change SSH key' })).toBeNull();
+});
+
+/** The doctor on the IPC harness, where a test decides every answer. */
+function doctorOnHarness() {
+  clearMocks();
+  const h = installHarness();
+  h.read('op_start_doctor', [completed(doctorReport('prod-eu'))]);
+  h.answer('ssh_key_candidates', []);
+  h.answer('target_show', targetReport({ name: 'prod-eu', sshKey: null }));
+  return h;
+}
+
+test("the doctor's SSH key fix opens the key change above the doctor, which stays", async () => {
+  doctorOnHarness();
+  const { flows, user } = probe();
+  act(() => flows().doctor('prod-eu'));
+  const doctor = await screen.findByRole('dialog', { name: 'Doctor · prod-eu' });
+  await user.click(await within(doctor).findByRole('button', { name: 'Change SSH key' }));
+  const form = await screen.findByRole('dialog', { name: 'Change SSH key' });
+  expect(hostOf(form)).toBe('app');
+  // Beside the doctor, never inside its panel; the doctor goes inert under it.
+  expect(doctor.contains(form)).toBe(false);
+  expect(doctor.closest('[inert]') === null).toBe(false);
+  await user.click(within(form).getByRole('button', { name: 'Cancel' }));
+  expect(screen.getByRole('dialog', { name: 'Doctor · prod-eu' })).toBeDefined();
+});
+
+test('a refusal the key change cannot show in a form is shown in the doctor', async () => {
+  const h = doctorOnHarness();
+  h.answer('target_show', () =>
+    Promise.reject(uiError('apprafter::target::not_found', 'target `prod-eu` was not found')),
+  );
+  const { flows, user } = probe();
+  act(() => flows().doctor('prod-eu'));
+  const doctor = await screen.findByRole('dialog', { name: 'Doctor · prod-eu' });
+  await user.click(await within(doctor).findByRole('button', { name: 'Change SSH key' }));
+  expect(await within(doctor).findByText('target `prod-eu` was not found')).toBeDefined();
+  expect(screen.queryByRole('dialog', { name: 'Change SSH key' })).toBeNull();
+});
+
+test("the toolchain the doctor opens is the doctor's: when the doctor goes, it goes too", async () => {
+  clearMocks();
+  const h = installHarness();
+  // doctorReport's helm row offers the toolchain; a missing target row offers Add a target.
+  const report = doctorReport('prod-eu');
+  report.groups[0]?.checks.push({
+    id: 'target_exists',
+    tool: null,
+    status: 'fail',
+    title: 'Target `prod-eu` exists',
+    detail: null,
+    fix: { kind: 'add_target', name: 'prod-eu', available: [] },
+  });
+  h.read('op_start_doctor', [completed(report)]);
+  h.answer('toolchain_status', { tools: [], searchPath: [], searchPathSource: 'explicit' });
+  h.answer('ssh_key_candidates', []);
+  h.answer('target_list', { targets: [], unreadable: [], cliDefault: { status: 'unset' } });
+  const { flows, user } = probe();
+  act(() => flows().doctor('prod-eu'));
+  const doctor = await screen.findByRole('dialog', { name: 'Doctor · prod-eu' });
+  await user.click(await within(doctor).findByRole('button', { name: 'Show the toolchain' }));
+  expect(hostOf(await screen.findByRole('dialog', { name: 'Toolchain' }))).toBe('app');
+  // The doctor closes itself (its Add target does, then opens the wizard). The doctor is inert
+  // under the toolchain's layer, which happy-dom does not honour: the click reaches it.
+  await user.click(within(doctor).getByRole('button', { name: 'Add a target', hidden: true }));
+  expect(screen.queryByRole('dialog', { name: 'Doctor · prod-eu' }) === null).toBe(true);
+  expect(screen.queryByRole('dialog', { name: 'Toolchain' }) === null).toBe(true);
+  // The wizard it opens after it went is the app's, not the doctor's: it stays.
+  expect(hostOf(await screen.findByRole('dialog', { name: 'Add target' }))).toBe('app');
+});

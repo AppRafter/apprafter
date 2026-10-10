@@ -1,0 +1,406 @@
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
+import { afterEach, beforeEach, expect, mock, spyOn, test } from 'bun:test';
+import { QueryClientProvider } from '@tanstack/react-query';
+import { clearMocks } from '@tauri-apps/api/mocks';
+import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { ToastProvider, ToastViewport } from '../../components/Toast';
+import { endedAwaySnapshot, resetEndedAway } from '../../ipc/away';
+import { CORE_ERROR_CODES } from '../../ipc/generated/core-errors';
+import type { OpEvent } from '../../ipc/generated/OpEvent';
+import { resetHeldPlans } from '../../ipc/heldPlans';
+import { resetOperations } from '../../ipc/operations';
+import { PlatformContext } from '../../state/platform';
+import { createQueryClient } from '../../state/queryClient';
+import { appInfo } from '../../test/fixtures';
+import { catalogue, machineSet, planParts } from '../../test/flows';
+import {
+  cancelled,
+  completed,
+  failed,
+  type Harness,
+  installHarness,
+  uiError,
+} from '../../test/ipc';
+import { settleIpc } from '../../test/settle';
+import { tabHost } from '../../test/tab';
+import { ChangeMachineDialog, type MachineNow } from './ChangeMachineDialog';
+
+/** What the core says when the provider's API gave no answer (WI-453: `provider_unreachable`). */
+const DEAD_API = 'provider `hetzner-cloud` API was unreachable';
+
+let h: Harness;
+beforeEach(() => {
+  h = installHarness();
+  h.read('op_start_machine_catalogue', [completed(catalogue())]);
+  h.read('op_start_region_latencies', [completed([{ region: 'nbg1', latencyMs: 38 }])]);
+});
+afterEach(async () => {
+  cleanup();
+  await settleIpc();
+  resetOperations();
+  resetEndedAway();
+  resetHeldPlans();
+  clearMocks();
+});
+
+/** The dialog in a tab view, as Task 21 opens it: the tab can be hidden, shown and closed. */
+function renderChange(target: string, now: MachineNow, strict = false) {
+  const onClose = mock();
+  const client = createQueryClient();
+  const invalidated = spyOn(client, 'invalidateQueries');
+  const tab = tabHost(target);
+  const view = render(
+    <QueryClientProvider client={client}>
+      <PlatformContext value={appInfo()}>
+        <ToastProvider>
+          <tab.Tab>
+            <ChangeMachineDialog target={target} now={now} onClose={onClose} />
+          </tab.Tab>
+          <ToastViewport />
+        </ToastProvider>
+      </PlatformContext>
+    </QueryClientProvider>,
+    { reactStrictMode: strict },
+  );
+  return { user: userEvent.setup(), onClose, invalidated, unmount: view.unmount, tab };
+}
+const radio = (name: string) => screen.getByRole('radio', { name }) as HTMLInputElement;
+const apply = () => screen.getByRole('button', { name: 'Apply machine' }) as HTMLButtonElement;
+const STAGING: MachineNow = { region: 'nbg1', serverType: 'cx22' };
+
+test("opens on the target's machine: its catalogue, no stepper, nothing to apply yet", async () => {
+  renderChange('staging', STAGING);
+  expect(screen.getByRole('dialog', { name: 'Change machine · staging' })).toBeDefined();
+  expect(document.querySelector('[aria-current="step"]')).toBeNull();
+  await waitFor(() => expect(radio('cx22').checked).toBe(true));
+  expect(h.of('op_start_machine_catalogue')[0]?.args).toEqual({
+    source: { kind: 'target', name: 'staging' },
+  });
+  expect(apply().disabled).toBe(true);
+});
+
+test('opens on the machine the target is set to, not the recommended one', async () => {
+  renderChange('staging', { region: 'nbg1', serverType: 'cpx22' });
+  await waitFor(() => expect(radio('cpx22').checked).toBe(true));
+  expect(radio('cx22').checked).toBe(false);
+  expect(apply().disabled).toBe(true);
+});
+
+test("opens in the target's region", async () => {
+  renderChange('staging', { region: 'hel1', serverType: 'cx22' });
+  expect(await screen.findByRole('table', { name: 'Machines in hel1' })).toBeDefined();
+  await waitFor(() => expect(radio('cx22').checked).toBe(true));
+  expect(apply().disabled).toBe(true);
+});
+
+test('a type sold out in its region opens on the recommended one, which can be applied', async () => {
+  // test/flows' catalogue(): cx32 is offered in nbg1 but not available.
+  renderChange('staging', { region: 'nbg1', serverType: 'cx32' });
+  await waitFor(() => expect(radio('cx22').checked).toBe(true));
+  expect(apply().disabled).toBe(false);
+});
+
+test('under StrictMode the double mount still ends on the catalogue', async () => {
+  // StrictMode runs the mount effect twice: the second read supersedes (and cancels) the first,
+  // which never answers; only the second can bring the catalogue.
+  const first = h.newOperation([]);
+  const second = h.newOperation([completed(catalogue())]);
+  let started = 0;
+  h.answer('op_start_machine_catalogue', () => {
+    started += 1;
+    return started === 1 ? first : second;
+  });
+  renderChange('staging', STAGING, true);
+  await waitFor(() => expect(radio('cx22').checked).toBe(true));
+  expect(h.of('op_cancel').map((c) => c.args)).toEqual([{ opId: first }]);
+});
+
+test('a catalogue read the tab hides runs on: its end shows when the tab is back, nothing started again', async () => {
+  let answer = (_opId: number) => {};
+  h.answer(
+    'op_start_machine_catalogue',
+    () =>
+      new Promise<number>((resolve) => {
+        answer = resolve;
+      }),
+  );
+  const { tab } = renderChange('staging', STAGING);
+  await waitFor(() => expect(h.of('op_start_machine_catalogue')).toHaveLength(1));
+  tab.hide();
+  await act(async () => {
+    answer(h.newOperation([completed(catalogue())]));
+    await settleIpc();
+  });
+  tab.show();
+  await waitFor(() => expect(radio('cx22').checked).toBe(true));
+  expect(h.of('op_cancel')).toEqual([]);
+  expect(h.of('op_start_machine_catalogue')).toHaveLength(1);
+});
+
+test('a latency read the tab hides runs on: its answer shows when the tab is back', async () => {
+  let answer = (_opId: number) => {};
+  h.answer(
+    'op_start_region_latencies',
+    () =>
+      new Promise<number>((resolve) => {
+        answer = resolve;
+      }),
+  );
+  const { tab } = renderChange('staging', STAGING);
+  await waitFor(() => expect(h.of('op_start_region_latencies')).toHaveLength(1));
+  tab.hide();
+  await act(async () => {
+    answer(h.newOperation([completed([{ region: 'nbg1', latencyMs: 38 }])]));
+    await settleIpc();
+  });
+  tab.show();
+  expect(await screen.findByText('38 ms')).toBeDefined();
+  expect(h.of('op_cancel')).toEqual([]);
+  expect(h.of('op_start_region_latencies')).toHaveLength(1);
+});
+
+test('closing the tab cancels the reads it started', async () => {
+  const keeps = h.newOperation([]);
+  h.answer('op_start_machine_catalogue', keeps);
+  const { tab } = renderChange('staging', STAGING);
+  await waitFor(() => expect(h.of('op_start_machine_catalogue')).toHaveLength(1));
+  tab.hide();
+  tab.close();
+  await waitFor(() => expect(h.of('op_cancel').map((c) => c.args)).toEqual([{ opId: keeps }]));
+});
+
+test('Apply plans, runs the Bounded plan at once, refreshes the target and closes', async () => {
+  h.plan(
+    'op_plan_target_machine',
+    planParts({ class: 'bounded', title: 'Set the machine of staging', target: 'staging' }),
+    [completed(machineSet())],
+  );
+  const { user, onClose, invalidated } = renderChange('staging', STAGING);
+  await waitFor(() => expect(radio('cx22').checked).toBe(true));
+  await user.click(radio('cpx22'));
+  expect(apply().disabled).toBe(false);
+  await user.click(apply());
+  expect(await screen.findByText('Machine for “staging”: cpx22 in nbg1.')).toBeDefined();
+  expect(onClose).toHaveBeenCalledTimes(1);
+  expect(h.of('op_plan_target_machine')[0]?.args).toEqual({
+    name: 'staging',
+    sku: 'cpx22',
+    region: 'nbg1',
+  });
+  expect(h.of('op_execute')).toHaveLength(1);
+  // D.3d's keys (state/targets.ts), pinned here by value.
+  expect(invalidated.mock.calls.map(([filters]) => filters?.queryKey)).toEqual([
+    ['targets'],
+    ['target', 'staging'],
+  ]);
+});
+
+test("a provisioned target's refusal is shown and nothing runs", async () => {
+  h.answer('op_plan_target_machine', () =>
+    Promise.reject(
+      uiError(
+        'apprafter::target::provisioned',
+        'target `staging` has a provisioned server, so its machine or region cannot change',
+      ),
+    ),
+  );
+  const { user } = renderChange('staging', STAGING);
+  await waitFor(() => expect(radio('cx22').checked).toBe(true));
+  await user.click(radio('cpx22'));
+  await user.click(apply());
+  expect(
+    await screen.findByText(
+      'target `staging` has a provisioned server, so its machine or region cannot change',
+    ),
+  ).toBeDefined();
+  expect(h.of('op_execute')).toHaveLength(0);
+  expect(apply().disabled).toBe(false);
+});
+
+test('a run that fails says why and the dialog stays open', async () => {
+  h.plan('op_plan_target_machine', planParts({ target: 'staging' }), [
+    failed(uiError(CORE_ERROR_CODES.TARGET_PROVIDER_UNREACHABLE, DEAD_API)),
+  ]);
+  const { user, onClose } = renderChange('staging', STAGING);
+  await waitFor(() => expect(radio('cx22').checked).toBe(true));
+  await user.click(radio('cpx22'));
+  await user.click(apply());
+  expect(await screen.findByText(DEAD_API)).toBeDefined();
+  expect(onClose).not.toHaveBeenCalled();
+});
+
+test("no region and no type yet: the CLI's default region and its recommended offer, Apply enabled", async () => {
+  renderChange('staging', { region: null, serverType: null });
+  expect(await screen.findByRole('table', { name: 'Machines in nbg1' })).toBeDefined();
+  await waitFor(() => expect(radio('cx22').checked).toBe(true)); // cx22 is nbg1's recommended offer
+  expect(apply().disabled).toBe(false);
+});
+
+test('a catalogue that cannot be read says why, and Try again reads again', async () => {
+  h.answer('op_start_machine_catalogue', () =>
+    Promise.reject(uiError('apprafter::target::not_found', 'target `staging` was not found')),
+  );
+  const { user } = renderChange('staging', STAGING);
+  expect(await screen.findByText('target `staging` was not found')).toBeDefined();
+  expect(apply().disabled).toBe(true);
+  h.answer('op_start_machine_catalogue', h.newOperation([completed(catalogue())]));
+  await user.click(screen.getByRole('button', { name: 'Try again' }));
+  await waitFor(() => expect(radio('cx22').checked).toBe(true));
+});
+
+test('a catalogue read cancelled elsewhere says so, with Try again', async () => {
+  h.answer('op_start_machine_catalogue', h.newOperation([cancelled()]));
+  renderChange('staging', STAGING);
+  expect(await screen.findByText('Reading the catalogue was cancelled.')).toBeDefined();
+  expect(screen.getByRole('button', { name: 'Try again' })).toBeDefined();
+});
+
+test('a latency read that fails says why, with Try again', async () => {
+  h.answer('op_start_region_latencies', () =>
+    Promise.reject(uiError('apprafter::desktop::internal', 'the probe broke')),
+  );
+  const { user } = renderChange('staging', STAGING);
+  expect(await screen.findByText('Latency could not be measured: the probe broke')).toBeDefined();
+  h.answer(
+    'op_start_region_latencies',
+    h.newOperation([completed([{ region: 'nbg1', latencyMs: 38 }])]),
+  );
+  await user.click(screen.getByRole('button', { name: 'Try again' }));
+  expect(await screen.findByText('38 ms')).toBeDefined();
+});
+
+/** Apply on cpx22 with a Bounded plan whose run waits; `end(event)` ends it on its channel. */
+async function applyRunning(user: ReturnType<typeof userEvent.setup>) {
+  let channel: { id: number } | null = null;
+  h.plan('op_plan_target_machine', planParts({ title: 'Set the machine of staging' }), []);
+  h.answer('op_execute', ({ onEvent }: Record<string, unknown>) => {
+    channel = onEvent as { id: number };
+    return 2;
+  });
+  await waitFor(() => expect(radio('cx22').checked).toBe(true));
+  await user.click(radio('cpx22'));
+  await user.click(apply());
+  await waitFor(() => expect(channel).not.toBeNull());
+  const internals = (
+    window as unknown as { __TAURI_INTERNALS__: { runCallback(id: number, data: unknown): void } }
+  ).__TAURI_INTERNALS__;
+  return {
+    end: async (message: OpEvent) => {
+      await act(async () => {
+        internals.runCallback(channel?.id ?? -1, { index: 0, message });
+        await settleIpc();
+      });
+    },
+  };
+}
+
+test('a change that ends after its tab closed keeps its end for the app', async () => {
+  const { user, tab } = renderChange('staging', STAGING);
+  const run = await applyRunning(user);
+  tab.close();
+  await run.end(completed(machineSet()));
+  expect(endedAwaySnapshot()).toEqual([
+    {
+      opId: h.started('op_plan_target_machine')[0] ?? -1,
+      text: 'Set the machine of staging: done.',
+      failed: false,
+    },
+  ]);
+});
+
+test('a change that ends while its tab is hidden shows when the tab is back: toast, refresh, close', async () => {
+  const { user, tab, onClose, invalidated } = renderChange('staging', STAGING);
+  const run = await applyRunning(user);
+  tab.hide();
+  await run.end(completed(machineSet()));
+  expect(onClose).not.toHaveBeenCalled();
+  tab.show();
+  expect(await screen.findByText('Machine for “staging”: cpx22 in nbg1.')).toBeDefined();
+  expect(onClose).toHaveBeenCalledTimes(1);
+  expect(invalidated).toHaveBeenCalledTimes(2);
+  expect(endedAwaySnapshot()).toEqual([]);
+});
+
+test('a change that fails while its tab is hidden shows its failure when the tab is back', async () => {
+  const { user, tab, onClose } = renderChange('staging', STAGING);
+  const run = await applyRunning(user);
+  tab.hide();
+  await run.end(failed(uiError('apprafter::provider::sku_unavailable', 'cpx22 is sold out')));
+  tab.show();
+  expect(await screen.findByText('cpx22 is sold out')).toBeDefined();
+  expect(apply().textContent).toBe('Apply machine');
+  expect(apply().disabled).toBe(false);
+  expect(onClose).not.toHaveBeenCalled();
+  expect(endedAwaySnapshot()).toEqual([]);
+});
+
+test('a change that ended while its tab was hidden, the tab then closed: the app shows it', async () => {
+  const { user, tab, onClose } = renderChange('staging', STAGING);
+  const run = await applyRunning(user);
+  tab.hide();
+  await run.end(completed(machineSet()));
+  tab.close();
+  expect(endedAwaySnapshot()).toEqual([
+    {
+      opId: h.started('op_plan_target_machine')[0] ?? -1,
+      text: 'Set the machine of staging: done.',
+      failed: false,
+    },
+  ]);
+  expect(onClose).not.toHaveBeenCalled();
+});
+
+test("in a tab, a Destructive plan's confirm is held by the tab: closing the tab discards it", async () => {
+  h.plan(
+    'op_plan_target_machine',
+    planParts({ class: 'destructive', title: 'Replace the machine of staging', target: 'staging' }),
+    [completed(machineSet())],
+  );
+  const { user, tab } = renderChange('staging', STAGING);
+  await waitFor(() => expect(radio('cx22').checked).toBe(true));
+  await user.click(radio('cpx22'));
+  await user.click(apply());
+  expect(
+    await screen.findByRole('dialog', { name: 'Replace the machine of staging' }),
+  ).toBeDefined();
+  tab.close(); // the Shell ends the tab's scope when it removes the tab
+  expect(h.of('op_discard').map((c) => c.args)).toContainEqual({
+    opId: h.started('op_plan_target_machine')[0],
+  });
+  expect(h.of('op_execute')).toHaveLength(0);
+});
+
+test("a Destructive plan opens D.3d's PlanConfirm first (guard)", async () => {
+  h.plan(
+    'op_plan_target_machine',
+    planParts({ class: 'destructive', title: 'Replace the machine of staging', target: 'staging' }),
+    [completed(machineSet())],
+  );
+  const { user } = renderChange('staging', STAGING);
+  await waitFor(() => expect(radio('cx22').checked).toBe(true));
+  await user.click(radio('cpx22'));
+  await user.click(apply());
+  expect(
+    await screen.findByRole('dialog', { name: 'Replace the machine of staging' }),
+  ).toBeDefined();
+  expect(h.of('op_execute')).toHaveLength(0);
+});
+
+test("confirmed in its dialog, a Destructive plan runs once; the dialog's submit is not the frame's Apply", async () => {
+  h.plan(
+    'op_plan_target_machine',
+    planParts({ class: 'destructive', title: 'Replace the machine of staging', target: 'staging' }),
+    [completed(machineSet())],
+  );
+  const { user, onClose } = renderChange('staging', STAGING);
+  await waitFor(() => expect(radio('cx22').checked).toBe(true));
+  await user.click(radio('cpx22'));
+  await user.click(apply());
+  const dialog = await screen.findByRole('dialog', { name: 'Replace the machine of staging' });
+  await user.click(within(dialog).getByRole('button', { name: 'Apply machine' }));
+  expect(await screen.findByText('Machine for “staging”: cpx22 in nbg1.')).toBeDefined();
+  expect(onClose).toHaveBeenCalledTimes(1);
+  expect(h.of('op_plan_target_machine')).toHaveLength(1);
+  expect(h.of('op_execute')).toHaveLength(1);
+});

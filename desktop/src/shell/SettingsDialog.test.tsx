@@ -11,6 +11,8 @@ import type { Settings } from '../ipc/generated/Settings';
 import { PlatformContext } from '../state/platform';
 import { createQueryClient } from '../state/queryClient';
 import { appInfo, authInfo, settings } from '../test/fixtures';
+import { toolchainReport, whoamiReport } from '../test/flows';
+import { settleIpc } from '../test/settle';
 import { PlatformGate } from './PlatformGate';
 import { SettingsDialog } from './SettingsDialog';
 
@@ -79,6 +81,8 @@ beforeEach(() => {
     calls.push({ cmd, args: args as Record<string, unknown> });
     if (cmd === 'app_info') return reads() > 1 && later !== null ? later : info;
     if (cmd === 'settings_get') return stored;
+    if (cmd === 'whoami') return whoamiReport({ status: 'skipped', reason: 'no_ping' });
+    if (cmd === 'toolchain_status') return toolchainReport();
     if (cmd === 'settings_set' && holding) {
       const request = (args as { settings: Settings }).settings;
       return new Promise((resolve, reject) => held.push({ request, resolve, reject }));
@@ -100,8 +104,9 @@ beforeEach(() => {
   });
 });
 
-afterEach(() => {
+afterEach(async () => {
   cleanup();
+  await settleIpc();
   clearMocks();
 });
 
@@ -379,6 +384,31 @@ describe('SettingsDialog', () => {
     expect(calls.find((c) => c.cmd === 'plugin:opener|open_url')?.args.url).toBe(
       'https://docs.apprafter.dev',
     );
+  });
+
+  test('About: This computer reads whoami without a ping', async () => {
+    await open();
+    expect(await screen.findByText('CLI default: prod-eu · hetzner-cloud · nbg1')).toBeDefined();
+    expect(screen.getByText('Not checked yet')).toBeDefined();
+    expect(calls.map((c) => c.cmd)).not.toContain('op_start_whoami');
+  });
+
+  test('About: Show opens the toolchain above Settings, which goes inert; Esc closes only it', async () => {
+    const { user, onClose } = await open();
+    const settingsDialog = screen.getByRole('dialog', { name: 'Settings' });
+    const toolchainRow = screen.getByText('Toolchain').closest('.row') as HTMLElement;
+    await user.click(within(toolchainRow).getByRole('button', { name: 'Show' }));
+    const toolchain = await screen.findByRole('dialog', { name: 'Toolchain' });
+    expect(await within(toolchain).findByText('Client Version: v1.34.1')).toBeDefined();
+    // Siblings, so the toolchain's layer covers the window and Settings cannot be reached.
+    expect(settingsDialog.isConnected).toBe(true);
+    expect(settingsDialog.closest('.modal-layer')?.hasAttribute('inert')).toBe(true);
+    expect(settingsDialog.contains(toolchain)).toBe(false);
+    await user.keyboard('{Escape}');
+    expect(screen.queryByRole('dialog', { name: 'Toolchain' })).toBeNull();
+    expect(screen.getByRole('dialog', { name: 'Settings' })).toBeDefined();
+    expect(settingsDialog.closest('.modal-layer')?.hasAttribute('inert')).toBe(false);
+    expect(onClose).not.toHaveBeenCalled();
   });
 
   test('opening Settings reads app_info again: what it says may have changed since', async () => {

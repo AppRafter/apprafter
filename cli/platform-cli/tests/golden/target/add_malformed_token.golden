@@ -1,0 +1,14 @@
+$ apprafter target add prod --provider hetzner-cloud --token short --no-ping --no-interactive
+[exit 1]
+[stdout]
+[stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m target add invoked <ESC>[3mtarget<ESC>[0m<ESC>[2m=<ESC>[0mprod <ESC>[3mrenew<ESC>[0m<ESC>[2m=<ESC>[0mfalse <ESC>[3mforce<ESC>[0m<ESC>[2m=<ESC>[0mfalse
+Error: apprafter::target::invalid_token
+
+  × invalid Hetzner Cloud token: Hetzner Cloud tokens are 64 ASCII
+  │ alphanumeric characters; got 5
+  help: Paste the whole token again from where you saved it: 64 ASCII letters
+        and digits, no prefix, no trailing newline. A token is shown only
+        once, when it is created; if you no longer have it, generate a new one
+        in the Hetzner Console (open the project, then Security → API tokens).
+

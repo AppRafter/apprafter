@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 // The design's openForm (brief §3), with its three corrections: `required` counts visible
 // fields only and hidden values stay out of the submission; the dialog stays open while
-// onSubmit runs and shows a rejection inline; a backdrop click never dismisses it.
+// onSubmit runs (its submit waiting, focusable) and shows a rejection inline; a backdrop click
+// never dismisses it.
 import { type FormEvent, useId, useState } from 'react';
 import { uiErrorOf } from '../ipc/api';
 import type { UiError } from '../ipc/generated/UiError';
@@ -21,6 +22,14 @@ export type FormValues = Readonly<Record<string, FormValue>>;
 /** An option: its value, or [value, label]. */
 export type Opt = string | readonly [value: string, label: string];
 
+/** A radio option: a row with its label, a line that describes it, and whether it can be chosen. */
+export interface RadioOpt {
+  readonly value: string;
+  readonly label: string;
+  readonly detail?: string;
+  readonly disabled?: boolean;
+}
+
 export type FormField = {
   readonly key: string;
   readonly label: string;
@@ -33,8 +42,15 @@ export type FormField = {
       readonly type?: 'text' | 'password';
       readonly def?: string;
       readonly placeholder?: string;
+      /**
+       * What is wrong with a non-empty value, or null: shown in place of the hint, and the
+       * submit waits until it is fixed.
+       */
+      readonly check?: (value: string) => string | null;
     }
   | { readonly kind: 'seg'; readonly options: readonly Opt[]; readonly def?: string }
+  /** One choice from a list of rows, as native radios (the SSH key picker); '' until chosen. */
+  | { readonly kind: 'radio'; readonly options: readonly RadioOpt[]; readonly def?: string }
   | {
       readonly kind: 'chips';
       readonly options: readonly string[];
@@ -92,9 +108,19 @@ export function FormDialog({
   const [error, setError] = useState<UiError | null>(null);
 
   const visible = fields.filter((field) => field.when === undefined || field.when(values));
-  const blocked = visible.some(
-    (field) => required.includes(field.key) && missing(values[field.key]),
-  );
+  const problems = new Map<string, string>();
+  for (const field of visible) {
+    if ((field.kind ?? 'text') !== 'text' || !('check' in field) || field.check === undefined) {
+      continue;
+    }
+    const value = values[field.key];
+    if (typeof value !== 'string' || value === '') continue;
+    const problem = field.check(value);
+    if (problem !== null) problems.set(field.key, problem);
+  }
+  const blocked =
+    problems.size > 0 ||
+    visible.some((field) => required.includes(field.key) && missing(values[field.key]));
   const set = (key: string, value: FormValue) => setValues({ ...values, [key]: value });
 
   const send = async (event: FormEvent) => {
@@ -140,6 +166,7 @@ export function FormDialog({
               id={`${id}-${field.key}`}
               field={field}
               value={values[field.key]}
+              problem={problems.get(field.key) ?? null}
               onChange={(value) => set(field.key, value)}
             />
           ))}
@@ -149,11 +176,14 @@ export function FormDialog({
           <Button size={32} onClick={onClose} disabled={busy}>
             Cancel
           </Button>
+          {/* While onSubmit runs it waits, focusable: it has the focus it was pressed with, and a
+              browser drops the focus of a control it disables onto the page. */}
           <Button
             size={32}
             type="submit"
             variant={danger ? 'danger-solid' : 'primary'}
-            disabled={blocked || busy}
+            disabled={blocked && !busy}
+            pending={busy}
           >
             {submit}
           </Button>
@@ -167,11 +197,14 @@ function Field({
   id,
   field,
   value,
+  problem,
   onChange,
 }: {
   id: string;
   field: FormField;
   value: FormValue;
+  /** What the field's check said of its value; text fields only. */
+  problem: string | null;
   onChange: (value: FormValue) => void;
 }) {
   const hint =
@@ -195,6 +228,41 @@ function Field({
           />
           {hint}
         </div>
+      );
+    case 'radio':
+      return (
+        <fieldset className="field form-radios">
+          <legend className="eyebrow">{field.label}</legend>
+          {field.options.map((option, index) => {
+            const detailId = `${id}-${index}-detail`;
+            return (
+              <label
+                key={option.value}
+                className="form-radio"
+                data-disabled={option.disabled || undefined}
+              >
+                <input
+                  type="radio"
+                  className="form-radio-dot"
+                  name={id}
+                  value={option.value}
+                  checked={value === option.value}
+                  disabled={option.disabled ?? false}
+                  aria-label={option.label}
+                  aria-describedby={option.detail === undefined ? undefined : detailId}
+                  onChange={() => onChange(option.value)}
+                />
+                <span className="form-radio-label">{option.label}</span>
+                {option.detail !== undefined && (
+                  <span className="form-radio-detail" id={detailId}>
+                    {option.detail}
+                  </span>
+                )}
+              </label>
+            );
+          })}
+          {hint}
+        </fieldset>
       );
     case 'chips': {
       const chosen = Array.isArray(value) ? (value as readonly string[]) : [];
@@ -240,12 +308,14 @@ function Field({
         </div>
       );
     default: {
+      const hintText = problem ?? field.hint;
       const text = {
         label: field.label,
         value: typeof value === 'string' ? value : '',
         onChange: (next: string) => onChange(next),
         ...(field.placeholder !== undefined && { placeholder: field.placeholder }),
-        ...(field.hint !== undefined && { hint: field.hint }),
+        ...(hintText !== undefined && { hint: hintText }),
+        ...(problem !== null && { 'aria-invalid': true as const }),
       };
       return field.type === 'password' ? <PasswordField {...text} /> : <TextField {...text} />;
     }

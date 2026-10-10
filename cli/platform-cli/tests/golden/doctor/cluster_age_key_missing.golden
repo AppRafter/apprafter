@@ -1,0 +1,71 @@
+$ apprafter doctor --no-ping
+[exit 1]
+[stdout]
+Checking target `prod`...
+  ✓ Config file readable (<SANDBOX>/apprafter-config/targets/prod/config.yaml)
+  ✓ Credentials file present (mode 0600) (<SANDBOX>/apprafter-config/targets/prod/credentials.yaml)
+  ✓ Provider `hetzner-cloud` supported
+  ✓ Token format valid (64 chars, alphanumeric)
+  – Token verified against provider API (not requested)
+  ✓ SSH key readable (<SANDBOX>/home/id_ed25519.pub (ssh-ed25519))
+
+Checking cluster...
+  ✓ Kubeconfig cached (encrypted)
+  ✗ Kube API reachable
+      hint: no age key at `<SANDBOX>/home/.config/apprafter/age.key`, so the cached kubeconfig cannot be decrypted: restore the key it was cached with, or point `APPRAFTER_AGE_KEY` at it. If it is lost, `apprafter kubeconfig --refresh --target <name>` fetches the kubeconfig again under a new key, after listing what the new key cannot read and asking
+  – Node reachable over SSH (not requested)
+
+Checking environment...
+  ⚠ `restic` on PATH
+      hint: not found — needed for backup and restore.
+Install restic (>= 0.14):
+  • macOS      brew install restic
+  • Debian     apt install restic
+  • Arch       pacman -S restic
+  • Nix        nix profile install nixpkgs#restic
+  • Windows    winget install restic.restic
+  • other      https://restic.readthedocs.io/en/stable/020_installation.html
+  ✗ `kubectl` on PATH
+      hint: not found — needed for talking to the cluster.
+Install kubectl:
+  • macOS      brew install kubectl
+  • Debian     apt install kubectl
+  • Nix        nix profile install nixpkgs#kubectl
+  • Windows    winget install Kubernetes.kubectl
+  • other      https://kubernetes.io/docs/tasks/tools/
+  ⚠ `helm` on PATH
+      hint: not found — needed for installing platform charts.
+Install helm:
+  • macOS      brew install helm
+  • Debian     apt install helm
+  • Nix        nix profile install nixpkgs#kubernetes-helm
+  • Windows    winget install Helm.Helm
+  • other      https://helm.sh/docs/intro/install/
+  ⚠ `git` on PATH
+      hint: not found — needed for reading the application repository.
+Install git:
+  • macOS      xcode-select --install
+  • Debian     apt install git
+  • Nix        nix profile install nixpkgs#git
+  • Windows    winget install Git.Git
+  • other      https://git-scm.com/downloads
+  ⚠ `ssh` on PATH
+      hint: not found — needed for reaching the node over SSH.
+Install an OpenSSH client:
+  • macOS      preinstalled
+  • Debian     apt install openssh-client
+  • Nix        nix profile install nixpkgs#openssh
+  • Windows    built into Windows 10/11: Settings › Optional features › OpenSSH Client
+  ⚠ `cue` on PATH
+      hint: not found — needed for validating application manifests.
+Install cue:
+  • macOS      brew install cue
+  • Arch       pacman -S cue
+  • Nix        nix profile install nixpkgs#cue
+  • Windows    winget install CueLang.Cue
+  • other      https://cuelang.org/docs/introduction/installation/
+  ✓ DNS resolves `127.0.0.1` (443/tcp)
+
+14 checks for target `prod`: 7 passed, 5 warning(s), 2 FAIL — fix the FAILs and rerun `apprafter doctor`.
+[stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m doctor invoked <ESC>[3mno_ping<ESC>[0m<ESC>[2m=<ESC>[0mtrue

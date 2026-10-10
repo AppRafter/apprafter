@@ -1,0 +1,468 @@
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
+//! `CoreError` → `miette::Report`, with the CLI's help for each code (overview §3.6.4), so the
+//! CLI's output changes only on purpose.
+
+use std::fmt;
+
+use apprafter_core::CoreError;
+use cli_core::CliError;
+use miette::Diagnostic;
+
+/// `e` as the CLI shows it. The pass-through `CliError`s render as themselves, and the two
+/// variants the core maps off `CliError` (`TargetNotFound`, `NoActiveTarget`) render through
+/// that `CliError` again, so their text and help are today's byte for byte; every other
+/// variant keeps the core's message, code and cause chain, with the CLI's help ([`cli_help`]).
+pub(crate) fn report(e: CoreError) -> miette::Report {
+    match e {
+        CoreError::Cli(inner) => miette::Report::new(inner),
+        CoreError::TargetNotFound { name, available } => {
+            miette::Report::new(CliError::TargetNotFound {
+                name,
+                available: available.join(", "),
+            })
+        }
+        CoreError::NoActiveTarget => miette::Report::new(CliError::NoActiveTarget),
+        other => {
+            let help = cli_help(&other).unwrap_or_default();
+            miette::Report::new(WithCliHelp {
+                inner: Box::new(other),
+                help,
+            })
+        }
+    }
+}
+
+/// [`report`] with `help` in place of the CLI's help — for a command whose way forward differs
+/// (renew's `TargetNotFound`: "drop `--renew` to create it fresh", overview §3.6.4). Message,
+/// code and cause chain stay exactly what `report` shows.
+pub(crate) fn report_with_help(e: CoreError, help: &str) -> miette::Report {
+    let inner: Box<dyn Diagnostic + Send + Sync> = match e {
+        CoreError::Cli(inner) => Box::new(inner),
+        CoreError::TargetNotFound { name, available } => Box::new(CliError::TargetNotFound {
+            name,
+            available: available.join(", "),
+        }),
+        CoreError::NoActiveTarget => Box::new(CliError::NoActiveTarget),
+        other => Box::new(other),
+    };
+    miette::Report::new(WithCliHelp {
+        inner,
+        help: help.to_string(),
+    })
+}
+
+/// The title of the operator guide's page on moving a cluster to another machine. By title,
+/// not URL: miette wraps a long URL at its hyphens, which breaks it for copying.
+pub(crate) const RESIZE_GUIDE: &str = "Moving to a bigger machine";
+
+/// The rebuild onto another machine for target `name` (the guide's Route A): the warning, then
+/// the core's recipe (`apprafter_core::target::rebuild_recipe`, which the desktop shows too),
+/// one indented command per line.
+pub(crate) fn resize_recipe(name: &str) -> String {
+    format!(
+        "`destroy` deletes every `apprafter=true` resource in the token's Hetzner project, not \
+         only this cluster: read the operator guide's \"{RESIZE_GUIDE}\" first.\n\n    {}",
+        apprafter_core::target::rebuild_recipe(name).join("\n    ")
+    )
+}
+
+/// The CLI's help for `e`; `None` for the three variants `report` renders through their own
+/// `CliError`. Exhaustive: a new variant does not compile until it has CLI help.
+pub(crate) fn cli_help(e: &CoreError) -> Option<String> {
+    Some(match e {
+        CoreError::Cli(_) | CoreError::TargetNotFound { .. } | CoreError::NoActiveTarget => {
+            return None
+        }
+        CoreError::Cancelled => "The command was interrupted; nothing after that point ran.".into(),
+        CoreError::UnsafeOverride { .. } => {
+            "Unset the variable, or give it a value the message above accepts.".into()
+        }
+        CoreError::TargetExists { name } => format!(
+            "Pass `--force` to replace it (fields you do not pass are kept) or `--renew` to \
+             rotate only its token; `apprafter target show {name}` shows what is stored."
+        ),
+        CoreError::RenewTokenUnchanged { name } => format!(
+            "Generate a new token in {}, then re-run `apprafter target add {name} --renew` \
+             with the new value.",
+            cli_core::target::HETZNER_API_TOKENS_PAGE
+        ),
+        // Beside a typed `--ssh-key`, `HCLOUD_TOKEN` is not used (D.3d review #0): it rotates
+        // only a renewal that names no key.
+        CoreError::RenewNothingToChange { name } => format!(
+            "Pass a new token with `--token <X>` (or, without `--ssh-key`, in `HCLOUD_TOKEN`) to \
+             rotate the credentials, or `--ssh-key <path>` with a key other than the stored one; \
+             `apprafter target show {name}` shows what is stored."
+        ),
+        CoreError::InvalidTargetName { .. } => format!(
+            "A target name is 1–{} characters of ASCII letters, digits and `-`, and does not \
+             start or end with `-`.",
+            apprafter_core::target::TARGET_NAME_MAX_LEN
+        ),
+        CoreError::SameTargetName { .. } => {
+            "Name a different destination; nothing was renamed.".into()
+        }
+        CoreError::UnknownProvider { supported, .. } => format!(
+            "Supported providers: {}. Pass one of them with `--provider`.",
+            supported.join(", ")
+        ),
+        // The console shows a token's value only once, when it is created (docs.hetzner.com,
+        // "Generating an API token"): a new one comes from `HETZNER_API_TOKENS_PAGE`.
+        CoreError::InvalidToken { .. } => format!(
+            "Paste the whole token again from where you saved it: 64 ASCII letters and digits, \
+             no prefix, no trailing newline. A token is shown only once, when it is created; if \
+             you no longer have it, generate a new one in {}.",
+            cli_core::target::HETZNER_API_TOKENS_PAGE
+        ),
+        CoreError::TokenNotStored { name } => format!(
+            "Run `apprafter target add {name} --renew --token <X>` to store one, or set \
+             `HCLOUD_TOKEN` for this invocation."
+        ),
+        CoreError::SshKeyUnreadable { .. } => {
+            "Point `--ssh-key` at a readable public key file (for example \
+             ~/.ssh/id_ed25519.pub), or leave it out."
+                .into()
+        }
+        CoreError::NotProvisioned { name } => {
+            format!("Target `{name}` has no server yet: `apprafter up` provisions one.")
+        }
+        // `import --force` records only a live labelled server named after the cluster
+        // (import.rs `build_snapshot`): after a deletion it finds nothing and writes nothing,
+        // so it answers only the recreated-elsewhere case. `up` creates a server when none of
+        // that name exists and `persist_state` records its id.
+        CoreError::ServerMissing { name, .. } => format!(
+            "Check the Hetzner Console for the cause. If the server was deleted, \
+             `apprafter up --target {name}` provisions a replacement and records it. If the \
+             token belongs to another Hetzner project, `apprafter target add {name} --renew \
+             --token <X>` stores one from the server's project (an `HCLOUD_TOKEN` in the \
+             environment outranks the stored token). If the cluster's server was recreated \
+             under a new id, `apprafter import --force --target {name}` records it."
+        ),
+        CoreError::TargetProvisioned { name, .. } => format!(
+            "There is no in-place resize: rebuild from a backup on a new machine. {}\n\n(`target \
+             machine` and `target add --force` change the machine only on a target that has \
+             not provisioned yet.)",
+            resize_recipe(name)
+        ),
+        // A 200 whose body does not deserialise, or a request ureq would not send (a malformed
+        // URL, an unknown scheme, a bad proxy setting) — from a read or the token check alike,
+        // so doctor may fail the same way. No answer is `provider_unreachable`, an error status
+        // `hetzner_api_error`, each with its own help (WI-453).
+        CoreError::ProviderRequestFailed { .. } => {
+            "The provider API answered with something this version of AppRafter cannot read, \
+             or the request could not be sent at all (a malformed URL or proxy setting); the \
+             cause above says which. Nothing was changed, and neither is a credentials problem. \
+             An answer that cannot be read comes from a proxy in between, or from a change in \
+             the provider's API that a newer AppRafter reads."
+                .into()
+        }
+        CoreError::ToolUnsupported { tool, .. } => format!(
+            "Install the `.exe` build of `{tool}`: a `.cmd` or `.bat` shim cannot be run \
+             directly."
+        ),
+        CoreError::Kube { .. } => {
+            "Check that the cluster is up; `apprafter kubeconfig --refresh` fetches its \
+             kubeconfig again."
+                .into()
+        }
+        // The CLI's own commands raise it with the target (`CliError::AgeKeyMissing`); the
+        // core's carries none. `kubeconfig --refresh` never decrypts the cache on its way to a
+        // refetch, so it is the way back from a lost key (WI-457, GOTCHA-121).
+        CoreError::AgeKeyMissing { .. } => cli_core::age_key_missing_help(None),
+    })
+}
+
+/// An error with the CLI's help: everything else — message, code, cause chain — is the inner
+/// diagnostic's own (a `CoreError`, or the `CliError` `report_with_help` maps it to).
+#[derive(Debug)]
+struct WithCliHelp {
+    inner: Box<dyn Diagnostic + Send + Sync>,
+    help: String,
+}
+
+impl fmt::Display for WithCliHelp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&*self.inner, f)
+    }
+}
+
+impl std::error::Error for WithCliHelp {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.inner.source()
+    }
+}
+
+impl Diagnostic for WithCliHelp {
+    fn code<'a>(&'a self) -> Option<Box<dyn fmt::Display + 'a>> {
+        self.inner.code()
+    }
+
+    fn help<'a>(&'a self) -> Option<Box<dyn fmt::Display + 'a>> {
+        Some(Box::new(&self.help))
+    }
+
+    fn diagnostic_source(&self) -> Option<&dyn Diagnostic> {
+        self.inner.diagnostic_source()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use apprafter_core::error::samples::{one_of_each, VARIANTS};
+
+    #[test]
+    fn every_variant_renders_with_a_code_and_cli_help() {
+        let samples = one_of_each();
+        assert_eq!(
+            samples.len(),
+            VARIANTS,
+            "the core's one list of samples (Task 12)"
+        );
+        for e in samples {
+            let shown = e.to_string();
+            let report = report(e);
+            let code = report.code().map(|c| c.to_string()).unwrap_or_default();
+            let help = report.help().map(|h| h.to_string()).unwrap_or_default();
+            assert!(code.starts_with("apprafter::"), "{shown}: {code}");
+            assert!(!help.is_empty(), "{code} has no help");
+            assert!(!help.contains("file an issue"), "{code}: {help}");
+        }
+    }
+
+    #[test]
+    fn not_found_and_no_active_keep_the_cli_text() {
+        let r = report(CoreError::TargetNotFound {
+            name: "ghost".into(),
+            available: vec!["a".into(), "b".into()],
+        });
+        assert_eq!(r.to_string(), "target `ghost` not found (available: a, b)");
+        assert!(r
+            .help()
+            .unwrap()
+            .to_string()
+            .contains("apprafter target list"));
+        let r = report(CoreError::NoActiveTarget);
+        assert!(r
+            .to_string()
+            .starts_with("no active target — run `apprafter target add"));
+    }
+
+    #[test]
+    fn a_cli_error_renders_as_itself() {
+        let r = report(CoreError::from(cli_core::CliError::BackupJobActive {
+            job: "j".into(),
+        }));
+        assert_eq!(
+            r.code().unwrap().to_string(),
+            "apprafter::backup::job_active"
+        );
+    }
+
+    /// The console shows a token's value only once, when it is created: the help for a
+    /// malformed token sends the reader back to where they saved it, or to generate a new one
+    /// in `HETZNER_API_TOKENS_PAGE`, and never to copy an existing token out of the console.
+    #[test]
+    fn a_malformed_token_is_pasted_again_or_generated_anew() {
+        let help = report(CoreError::InvalidToken {
+            problem: apprafter_core::provider::TokenProblem::WrongLength { got: 63 },
+        })
+        .help()
+        .unwrap()
+        .to_string();
+        assert!(help.contains("from where you saved it"), "{help}");
+        assert!(help.contains("shown only once"), "{help}");
+        assert!(
+            help.contains(&format!(
+                "generate a new one in {}",
+                cli_core::target::HETZNER_API_TOKENS_PAGE
+            )),
+            "{help}"
+        );
+        assert!(!help.contains("from the Hetzner"), "{help}");
+        assert!(help.contains("64 ASCII letters and digits"), "{help}");
+    }
+
+    /// A renewal with the token already stored: the way forward is a new token, created where
+    /// every other help says tokens are created (WI-454).
+    #[test]
+    fn an_unchanged_token_is_replaced_by_a_new_one_from_the_token_page() {
+        let help = report(CoreError::RenewTokenUnchanged {
+            name: "prod".into(),
+        })
+        .help()
+        .unwrap()
+        .to_string();
+        assert!(
+            help.contains(&format!(
+                "Generate a new token in {}",
+                cli_core::target::HETZNER_API_TOKENS_PAGE
+            )),
+            "{help}"
+        );
+        assert!(
+            help.contains("`apprafter target add prod --renew`"),
+            "{help}"
+        );
+    }
+
+    #[test]
+    fn the_help_names_the_target() {
+        let r = report(CoreError::NotProvisioned {
+            name: "prod".into(),
+        });
+        assert!(r.help().unwrap().to_string().contains("`prod`"));
+    }
+
+    #[test]
+    fn a_missing_server_is_sent_to_the_command_that_recovers_its_cause() {
+        // `import --force` records only a live labelled server named after the cluster, so
+        // after a deletion it changes nothing; `up` provisions a replacement and records it.
+        let help = report(CoreError::ServerMissing {
+            name: "prod".into(),
+            server_id: 42,
+        })
+        .help()
+        .unwrap()
+        .to_string();
+        let case = |cause: &str| {
+            help.split(". ")
+                .find(|s| s.contains(cause))
+                .unwrap_or_else(|| panic!("no sentence about {cause:?}: {help}"))
+        };
+        let deleted = case("deleted");
+        assert!(deleted.contains("`apprafter up --target prod`"), "{help}");
+        assert!(!deleted.contains("import"), "{help}");
+        let foreign = case("another Hetzner project");
+        assert!(
+            foreign.contains("`apprafter target add prod --renew --token <X>`"),
+            "{help}"
+        );
+        assert!(!foreign.contains("import"), "{help}");
+        assert!(
+            case("new id").contains("`apprafter import --force --target prod`"),
+            "{help}"
+        );
+    }
+
+    #[test]
+    fn a_failed_provider_request_covers_an_answer_it_cannot_read() {
+        // `public_address` wraps a 200 whose body does not parse (client.rs `get_server`) in
+        // this variant; a request that got no answer is `provider_unreachable` (WI-453), so the
+        // help may not say "did not answer".
+        let r = report(CoreError::ProviderRequestFailed {
+            provider: "hetzner-cloud".into(),
+            endpoint: "GET /v1/servers/42".into(),
+            cause: Box::new(CoreError::Cli(CliError::Other(
+                "parse get_server response: unknown variant `migrating`".into(),
+            ))),
+        });
+        let help = r.help().unwrap().to_string();
+        assert!(!help.contains("did not answer"), "{help}");
+        assert!(help.contains("cannot read"), "{help}");
+        // The token check reports an answer it cannot read here too (WI-453 follow-up), and
+        // doctor's token row then fails the same way: the help may not hang on doctor passing.
+        assert!(!help.contains("doctor` passes"), "{help}");
+        assert!(help.contains("neither is a credentials problem"), "{help}");
+        assert!(
+            r.chain()
+                .any(|e| e.to_string().contains("parse get_server response")),
+            "the cause the help points at is shown"
+        );
+    }
+
+    #[test]
+    fn the_resize_recipe_parses_and_frees_the_machine_before_it_reprovisions() {
+        // `restore --reprovision` runs `up`, which reuses a live server of the cluster's name
+        // (apply.rs ignores `--server-type` then): the old machine has to be gone first.
+        use clap::Parser as _;
+        let help = report(CoreError::TargetProvisioned {
+            name: "prod".into(),
+            server_id: 42,
+            server_name: "prod-node".into(),
+        })
+        .help()
+        .unwrap()
+        .to_string();
+        let steps: Vec<&str> = help
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with("apprafter "))
+            .collect();
+        for step in &steps {
+            let argv = step
+                .replace("<repo>", "/backups/prod")
+                .replace("<sku>", "cx33");
+            if let Err(e) = crate::cli::Cli::try_parse_from(argv.split_whitespace()) {
+                panic!("`{step}` does not parse: {e}");
+            }
+        }
+        let at = |prefix: &str| {
+            steps
+                .iter()
+                .position(|s| s.starts_with(prefix))
+                .unwrap_or_else(|| panic!("no `{prefix}` step: {help}"))
+        };
+        assert_eq!(at("apprafter target use prod"), 0, "{help}");
+        assert!(
+            at("apprafter backup create") < at("apprafter destroy"),
+            "{help}"
+        );
+        assert!(at("apprafter destroy") < at("apprafter restore"), "{help}");
+        // The page the help names by title exists under that title.
+        let page = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/operator-guide/moving-to-a-bigger-machine.md");
+        let text = std::fs::read_to_string(&page)
+            .unwrap_or_else(|e| panic!("{} must exist: {e}", page.display()));
+        assert!(
+            text.lines().any(|l| l == format!("# {RESIZE_GUIDE}")),
+            "{} is not titled {RESIZE_GUIDE:?}",
+            page.display()
+        );
+        assert!(help.contains(&format!("\"{RESIZE_GUIDE}\"")), "{help}");
+    }
+
+    /// WI-457: restore the key, or fetch the kubeconfig again under a new one.
+    #[test]
+    fn a_missing_age_key_names_restoring_it_and_the_recovery() {
+        let help = report(CoreError::AgeKeyMissing {
+            path: "/k/age.key".into(),
+        })
+        .help()
+        .unwrap()
+        .to_string();
+        assert!(help.contains("APPRAFTER_AGE_KEY"), "{help}");
+        assert!(
+            help.contains("`apprafter kubeconfig --refresh --target <name>`"),
+            "{help}"
+        );
+    }
+
+    #[test]
+    fn a_per_command_help_replaces_only_the_help() {
+        // renew's TargetNotFound (overview §3.6.4): same message and code, its own way forward
+        let missing = || CoreError::TargetNotFound {
+            name: "ghost".into(),
+            available: vec![],
+        };
+        let plain = report(missing());
+        let r = report_with_help(missing(), "drop `--renew` to create it fresh");
+        assert_eq!(r.to_string(), plain.to_string());
+        assert_eq!(
+            r.code().map(|c| c.to_string()),
+            plain.code().map(|c| c.to_string())
+        );
+        assert_eq!(
+            r.help().unwrap().to_string(),
+            "drop `--renew` to create it fresh"
+        );
+        let r = report_with_help(CoreError::TargetExists { name: "p".into() }, "h");
+        assert_eq!(r.code().unwrap().to_string(), "apprafter::target::exists");
+        assert_eq!(r.help().unwrap().to_string(), "h");
+        // The mapping onto the CLI's own error shows where the two messages differ: the core's
+        // `NoActiveTarget` says only "no active target". (Its `TargetNotFound` message is the
+        // CLI's byte for byte, so that arm cannot be told apart here.)
+        let r = report_with_help(CoreError::NoActiveTarget, "h");
+        assert_eq!(r.to_string(), report(CoreError::NoActiveTarget).to_string());
+        assert_eq!(r.help().unwrap().to_string(), "h");
+    }
+}

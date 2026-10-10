@@ -17,60 +17,118 @@ use age::x25519::{Identity, Recipient};
 
 use crate::{CliError, Result};
 
+/// The variable that overrides the age key path.
+pub const AGE_KEY_ENV: &str = "APPRAFTER_AGE_KEY";
+
+/// A secret a target's state caches age-encrypted, in `state.json`'s `hetzner_cloud`. Every
+/// one of them opens only with the key it was cached under: a new key reads none of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CachedSecret {
+    /// `kubeconfig_age`: the k3s kubeconfig, fetched from the node over SSH.
+    Kubeconfig,
+    /// `argocd_admin_password_age`: the Argo CD admin password, read from the cluster.
+    ArgocdPassword,
+}
+
+impl CachedSecret {
+    /// What it is, as a sentence names it.
+    pub fn noun(self) -> &'static str {
+        match self {
+            CachedSecret::Kubeconfig => "kubeconfig",
+            CachedSecret::ArgocdPassword => "Argo CD admin password",
+        }
+    }
+}
+
 /// Resolve the on-disk path for the age private key. Honours
 /// `APPRAFTER_AGE_KEY`; falls back to `~/.config/apprafter/age.key`,
 /// where `~` is [`dirs::home_dir`]: `$HOME` on Unix when it is set and
 /// non-empty, else the account's home from the password database; the
 /// user profile on Windows. `/` only when no home resolves at all.
 pub fn default_age_key_path() -> PathBuf {
-    if let Ok(p) = std::env::var("APPRAFTER_AGE_KEY") {
-        return PathBuf::from(p);
+    let override_path = std::env::var(AGE_KEY_ENV).ok().map(PathBuf::from);
+    age_key_path_from(override_path.as_deref(), dirs::home_dir().as_deref())
+}
+
+/// The age key path from explicit inputs: the override verbatim (even empty), else
+/// `<home>/.config/apprafter/age.key`, else `/.config/apprafter/age.key`.
+pub fn age_key_path_from(override_path: Option<&Path>, home: Option<&Path>) -> PathBuf {
+    if let Some(p) = override_path {
+        return p.to_path_buf();
     }
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
-    home.join(".config").join("apprafter").join("age.key")
+    home.unwrap_or(Path::new("/"))
+        .join(".config")
+        .join("apprafter")
+        .join("age.key")
+}
+
+/// The identity at `path`, or `None` when the file is absent. Never creates anything: a read
+/// (doctor, a kubeconfig probe) must not mint a key that matches no ciphertext.
+pub fn load_identity(path: &Path) -> Result<Option<Identity>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| CliError::Other(format!("read age key {path:?}: {e}")))?;
+    Identity::from_str(raw.trim())
+        .map(Some)
+        .map_err(|e| CliError::Other(format!("parse age key {path:?}: {e}")))
 }
 
 /// Load the identity at `path`, or generate a fresh one and persist
 /// it (parent dir created, file mode 0600 on Unix) when the file
 /// is absent.
 pub fn load_or_create_identity(path: &Path) -> Result<Identity> {
-    if path.exists() {
-        let raw = std::fs::read_to_string(path)
-            .map_err(|e| CliError::Other(format!("read age key {path:?}: {e}")))?;
-        return Identity::from_str(raw.trim())
-            .map_err(|e| CliError::Other(format!("parse age key {path:?}: {e}")));
+    load_or_create_identity_reporting(path).map(|(identity, _)| identity)
+}
+
+/// [`load_or_create_identity`], and whether this call created the key (WI-457 review #10).
+///
+/// The file is created with `create_new`, so a key that appears between the check and the
+/// create — the lost one put back, or another process's — is loaded, never overwritten, and
+/// `false` says this call made none: a caller that reports "a new key was created" asks this.
+pub fn load_or_create_identity_reporting(path: &Path) -> Result<(Identity, bool)> {
+    if let Some(identity) = load_identity(path)? {
+        return Ok((identity, false));
     }
+    match create_identity(path)? {
+        Some(identity) => Ok((identity, true)),
+        None => {
+            let identity = load_identity(path)?.ok_or_else(|| {
+                CliError::Other(format!("age key {path:?} vanished while it was created"))
+            })?;
+            Ok((identity, false))
+        }
+    }
+}
+
+/// Generate an identity and write it to `path` (parent dir created, mode 0600 on Unix), or
+/// `None` when a file is already there: it is left as it was.
+fn create_identity(path: &Path) -> Result<Option<Identity>> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| CliError::Other(format!("mkdir {parent:?}: {e}")))?;
     }
     let identity = Identity::generate();
     let serialised = identity.to_string();
-    write_secret_file(path, serialised.expose_secret().as_bytes())?;
-    Ok(identity)
+    match write_secret_file(path, serialised.expose_secret().as_bytes()) {
+        Ok(()) => Ok(Some(identity)),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+        Err(e) => Err(CliError::Other(format!("create age key {path:?}: {e}"))),
+    }
 }
 
-#[cfg(unix)]
-fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|e| CliError::Other(format!("create age key {path:?}: {e}")))?;
-    f.write_all(bytes)
-        .map_err(|e| CliError::Other(format!("write age key {path:?}: {e}")))?;
-    f.write_all(b"\n").ok();
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut f = std::fs::File::create(path)
-        .map_err(|e| CliError::Other(format!("create age key {path:?}: {e}")))?;
-    f.write_all(bytes)
-        .map_err(|e| CliError::Other(format!("write age key {path:?}: {e}")))?;
+/// Write a new secret file; `AlreadyExists` when there is one (never replaced).
+fn write_secret_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut f = options.open(path)?;
+    f.write_all(bytes)?;
     f.write_all(b"\n").ok();
     Ok(())
 }
@@ -196,6 +254,79 @@ mod tests {
         // compares components, so `/` separates them on Windows too).
         assert!(p.ends_with(".config/apprafter/age.key"), "{p:?}");
         assert!(p.is_absolute(), "{p:?}");
+    }
+
+    #[test]
+    fn the_age_key_path_is_the_override_or_under_the_home() {
+        assert_eq!(
+            age_key_path_from(Some(Path::new("/k/age.key")), Some(Path::new("/h"))),
+            PathBuf::from("/k/age.key")
+        );
+        assert_eq!(
+            age_key_path_from(None, Some(Path::new("/h"))),
+            PathBuf::from("/h/.config/apprafter/age.key")
+        );
+        assert_eq!(
+            age_key_path_from(None, None),
+            PathBuf::from("/.config/apprafter/age.key")
+        );
+        assert_eq!(
+            age_key_path_from(Some(Path::new("")), None),
+            PathBuf::from("")
+        );
+    }
+
+    #[test]
+    fn loading_an_absent_identity_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sub/age.key");
+        assert!(load_identity(&path).unwrap().is_none());
+        assert!(
+            !path.exists() && !path.parent().unwrap().exists(),
+            "a read never writes"
+        );
+    }
+
+    #[test]
+    fn a_present_identity_loads_as_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("age.key");
+        let created = load_or_create_identity(&path).unwrap();
+        let loaded = load_identity(&path).unwrap().expect("present");
+        assert_eq!(
+            loaded.to_public().to_string(),
+            created.to_public().to_string()
+        );
+    }
+
+    /// WI-457 review #10: whether the call created the key, for a caller that reports it.
+    #[test]
+    fn load_or_create_reports_whether_it_created_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("k/age.key");
+        let (made, created) = load_or_create_identity_reporting(&path).unwrap();
+        assert!(created && path.exists());
+        let (loaded, created) = load_or_create_identity_reporting(&path).unwrap();
+        assert!(!created, "a key already there is loaded, not created");
+        assert_eq!(loaded.to_public().to_string(), made.to_public().to_string());
+    }
+
+    /// The create itself never replaces a key that appeared after the check (`create_new`): it
+    /// reports `None`, and the key there is left as it was.
+    #[test]
+    fn creating_where_a_key_appeared_leaves_it_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("age.key");
+        let there = load_or_create_identity(&path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(create_identity(&path).unwrap().is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let (loaded, created) = load_or_create_identity_reporting(&path).unwrap();
+        assert!(!created);
+        assert_eq!(
+            loaded.to_public().to_string(),
+            there.to_public().to_string()
+        );
     }
 
     #[test]

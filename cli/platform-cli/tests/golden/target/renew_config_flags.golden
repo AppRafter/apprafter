@@ -1,0 +1,16 @@
+$ apprafter target add prod --renew --token bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb --region hel1 --no-ping --no-interactive
+[exit 1]
+[stdout]
+[stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m target add invoked <ESC>[3mtarget<ESC>[0m<ESC>[2m=<ESC>[0mprod <ESC>[3mrenew<ESC>[0m<ESC>[2m=<ESC>[0mtrue <ESC>[3mforce<ESC>[0m<ESC>[2m=<ESC>[0mfalse
+Error: apprafter::cli::usage_refused
+
+  × `--renew` only updates credentials — `--provider`, `--region`, `--tier`,
+  │ `--cluster-name`, `--server-type` are not allowed alongside it. Drop
+  │ `--renew` if you want to change config too.
+  help: `--renew` rotates the token (and `--ssh-key`). To change other fields,
+        run `apprafter target add <name> --force --provider hetzner-cloud
+        --token <X>` with the flags to change (the fields you do not pass are
+        kept), or `apprafter target machine --target <name>` for the server
+        type.
+

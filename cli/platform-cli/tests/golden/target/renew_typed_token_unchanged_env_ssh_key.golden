@@ -1,0 +1,20 @@
+$ apprafter target add prod --renew --token aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --no-interactive
+[exit 1]
+[stdout]
+[stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m target add invoked <ESC>[3mtarget<ESC>[0m<ESC>[2m=<ESC>[0mprod <ESC>[3mrenew<ESC>[0m<ESC>[2m=<ESC>[0mtrue <ESC>[3mforce<ESC>[0m<ESC>[2m=<ESC>[0mfalse
+Error: apprafter::target::renew_token_unchanged
+
+  × the new token for `prod` is the one already stored
+  help: Generate a new token in the Hetzner Console (open the project, then
+        Security → API tokens), then re-run `apprafter target add prod
+        --renew` with the new value.
+
+[file targets/prod/config.yaml]
+provider: hetzner-cloud
+region: nbg1
+default_tier: solo
+cluster_name: null
+ssh_key_path: <SANDBOX>/home/id_ed25519.pub
+firewall: null
+server_type: null

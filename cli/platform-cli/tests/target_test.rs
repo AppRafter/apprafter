@@ -21,7 +21,7 @@ fn cli() -> Command {
 }
 
 /// 64-char synthetic Hetzner token (canonical alphanumeric, no
-/// prefix — matches what Hetzner Cloud Console actually issues
+/// prefix — matches what the Hetzner Console actually issues
 /// per `cli-dx-task.md` §11 as amended in v0.1.74). Lets tests
 /// stay 100 % offline — no Hetzner API ping happens until Track
 /// A.4 validator integration.
@@ -189,6 +189,7 @@ fn target_add_errors_on_malformed_hetzner_token() {
         ])
         .assert()
         .failure()
+        .stderr(contains("apprafter::target::invalid_token"))
         .stderr(contains("invalid Hetzner Cloud token"));
 }
 
@@ -278,6 +279,8 @@ fn target_add_force_overwrites_existing_target_and_keeps_active_pointer() {
             &token1,
             "--region",
             "nbg1",
+            "--tier",
+            "solo",
         ])
         .assert()
         .success();
@@ -300,14 +303,16 @@ fn target_add_force_overwrites_existing_target_and_keeps_active_pointer() {
         ])
         .assert()
         .success()
-        // Second save is not the first target → message must NOT
-        // claim it became active. Pre-existing global config is
-        // preserved.
-        .stdout(contains("active target unchanged"));
+        // `work` is the active target and stays it: the line says so and does not advise
+        // switching to it (bug 1). Pre-existing global config is preserved.
+        .stdout(contains("it stays the active target"))
+        .stdout(contains("target use").not());
 
     // Region flag in the overwrite must land in the on-disk config.
     let cfg = std::fs::read_to_string(dir.path().join("targets/work/config.yaml")).unwrap();
     assert!(cfg.contains("region: fsn1"), "{cfg}");
+    // Bug 8: a field the overwrite did not pass keeps its stored value.
+    assert!(cfg.contains("default_tier: solo"), "{cfg}");
     // Token in the overwrite is the new one.
     let creds = std::fs::read_to_string(dir.path().join("targets/work/credentials.yaml")).unwrap();
     assert!(creds.contains(&token2));
@@ -376,7 +381,8 @@ fn target_add_renew_on_missing_target_errors_with_hint() {
         ])
         .assert()
         .failure()
-        .stderr(contains("does not exist"))
+        .stderr(contains("apprafter::target::not_found"))
+        .stderr(contains("not found"))
         .stderr(contains("drop `--renew`"));
 }
 
@@ -385,8 +391,8 @@ fn target_add_renew_rejects_identical_token_with_rotation_hint() {
     // The v0.1.77 walk surfaced that `--renew` happily "rotated"
     // a target to the exact same token bytes — green checkmark,
     // zero actual change in Hetzner. v0.1.78 makes that case
-    // fail loudly so the operator hits the Hetzner Cloud Console
-    // and generates a fresh token instead of having a silent
+    // fail loudly so the operator generates a new token in the
+    // Hetzner Console instead of having a silent
     // no-op.
     let dir = tempfile::tempdir().unwrap();
     let token = synthetic_hetzner_token();
@@ -414,8 +420,15 @@ fn target_add_renew_rejects_identical_token_with_rotation_hint() {
         .args(["target", "add", "rotate-me", "--token", &token, "--renew"])
         .assert()
         .failure()
-        .stderr(contains("requires a NEW token"))
-        .stderr(contains("Hetzner Cloud Console"));
+        .stderr(contains("apprafter::target::renew_token_unchanged"))
+        // Where a new token is created (WI-454), with miette's wrapping taken out.
+        .stderr(predicates::function::function(|stderr: &str| {
+            stderr
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .contains(cli_core::target::HETZNER_API_TOKENS_PAGE)
+        }));
 
     // On-disk credentials must still reflect the original token,
     // not be wiped or corrupted by the failed renew attempt.
@@ -571,6 +584,7 @@ fn target_add_errors_when_ssh_key_path_missing() {
         ])
         .assert()
         .failure()
+        .stderr(contains("apprafter::target::ssh_key_unreadable"))
         .stderr(contains("does not exist"));
 }
 
@@ -877,7 +891,7 @@ fn target_rename_refuses_identical_source_and_destination() {
         .args(["target", "rename", "first", "first"])
         .assert()
         .failure()
-        .stderr(contains("identical"));
+        .stderr(contains("apprafter::target::same_name"));
 }
 
 #[test]
@@ -979,6 +993,115 @@ fn target_remove_on_missing_target_surfaces_available_hint() {
         .assert()
         .failure()
         .stderr(contains("target `ghost` not found"));
+}
+
+/// The code of a target file that cannot be parsed. miette prints it on a line of its own,
+/// which it never wraps; the path is in the `×` message, which it wraps at 80 columns — and a
+/// Windows path (`\` allows no line break before a letter) is split inside a word, so asserting
+/// on the path would fail on the Windows runner only.
+const UNREADABLE_CODE: &str = "apprafter::target::invalid_config";
+/// What the error for a `credentials.yaml` that does not parse says, path-free: which file was
+/// read. It never quotes the file (the D.3d review's #5: that text is the token), so the
+/// phrase is matched with miette's wrapping (a line break and the `│` gutter between two words)
+/// taken out.
+fn says_the_credentials_do_not_parse() -> impl predicates::Predicate<str> {
+    predicates::function::function(|stderr: &str| {
+        stderr
+            .split_whitespace()
+            .filter(|word| *word != "│")
+            .collect::<Vec<_>>()
+            .join(" ")
+            .contains("not a valid target credentials map")
+    })
+}
+
+/// `use` finds its target by reading both of its files, as it always has: a target whose
+/// credentials file cannot be parsed is refused and left in place, and the CLI default does not
+/// move onto it. (The core checks only that a target exists; the CLI keeps this check so moving
+/// onto the core changes nothing here.) `remove` takes that target (WI-458): it says which file
+/// cannot be read, never what it holds, and deletes it; the default stays where it was.
+#[test]
+fn target_use_refuses_and_remove_removes_a_target_whose_files_cannot_be_read() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_two_targets(dir.path());
+    std::fs::write(
+        dir.path().join("targets/second/credentials.yaml"),
+        "hetzner_token: [unclosed",
+    )
+    .unwrap();
+
+    cli()
+        .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_NO_PING", "1")
+        .args(["target", "use", "second"])
+        .assert()
+        .failure()
+        .stderr(contains(UNREADABLE_CODE))
+        .stderr(says_the_credentials_do_not_parse());
+    assert!(dir.path().join("targets/second/config.yaml").exists());
+
+    cli()
+        .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_NO_PING", "1")
+        .args(["target", "remove", "second", "--yes"])
+        .assert()
+        .success()
+        .stderr(says_the_credentials_do_not_parse())
+        .stderr(contains("[unclosed").not())
+        .stdout(contains("target `second` removed"));
+    assert!(!dir.path().join("targets/second").exists());
+    let global = std::fs::read_to_string(dir.path().join("config.yaml")).unwrap();
+    assert!(global.contains("active_target: first"), "{global}");
+}
+
+/// `add` (with `--force` or without) and `add --renew` refuse a target whose credentials file
+/// cannot be parsed with that file's error, as they always have — never "already exists",
+/// never an overwrite — and `--renew` reports it before the config-flag refusal (today's
+/// order: the target is read first).
+#[test]
+fn target_add_and_renew_refuse_a_target_whose_credentials_cannot_be_read() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_two_targets(dir.path());
+    let creds = dir.path().join("targets/second/credentials.yaml");
+    std::fs::write(&creds, "hetzner_token: [unclosed").unwrap();
+    let token = "b".repeat(64);
+
+    for extra in [
+        &[][..],
+        &["--force"][..],
+        &["--renew", "--region", "hel1"][..],
+    ] {
+        let mut args = vec![
+            "target",
+            "add",
+            "second",
+            "--provider",
+            "hetzner-cloud",
+            "--token",
+            &token,
+            "--no-interactive",
+        ];
+        if extra.first() == Some(&"--renew") {
+            // `--renew` refuses `--provider` too; keep `--region` as the one config flag.
+            args.retain(|a| *a != "--provider" && *a != "hetzner-cloud");
+        }
+        args.extend_from_slice(extra);
+        cli()
+            .env("APPRAFTER_CONFIG_DIR", dir.path())
+            .env("APPRAFTER_NO_PING", "1")
+            .env_remove("HCLOUD_TOKEN")
+            .args(&args)
+            .assert()
+            .failure()
+            .stderr(contains(UNREADABLE_CODE))
+            .stderr(says_the_credentials_do_not_parse())
+            .stderr(contains("already exists").not())
+            .stderr(contains("only updates credentials").not());
+    }
+    assert_eq!(
+        std::fs::read_to_string(&creds).unwrap(),
+        "hetzner_token: [unclosed"
+    );
 }
 
 #[test]

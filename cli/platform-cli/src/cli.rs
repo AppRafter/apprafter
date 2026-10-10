@@ -60,21 +60,26 @@ pub enum Commands {
         #[command(subcommand)]
         action: AuthCommand,
     },
-    /// Self-diagnostic over the active target's config, credentials
-    /// and reachability plus the surrounding shell environment
-    /// (kubectl, helm, ssh, DNS). Prints PASS / WARN / FAIL per
-    /// check; exits 1 if any FAIL fires so CI gates can wire
-    /// `apprafter doctor` in directly.
+    /// Self-diagnostic over the active target's config and credentials,
+    /// its cluster (the cached kubeconfig, the Kubernetes API, the
+    /// node's SSH port) and this computer (restic, kubectl, helm, git,
+    /// ssh, cue, DNS). Prints PASS / WARN / FAIL per check, and `–` for
+    /// a check it did not run; exits 1 if any FAIL fires so CI gates
+    /// can wire `apprafter doctor` in directly.
     Doctor {
         /// Inspect a target other than the active one. Defaults
         /// to the active target.
         #[arg(long)]
         target: Option<String>,
-        /// Skip the Hetzner Cloud API ping. Also settable via
-        /// `APPRAFTER_NO_PING`, which takes a boolish value: `1`
-        /// `true` `yes` `y` `t` `on` skip the ping, `0` `false` `no`
-        /// `n` `f` `off` keep it. Any other value, including the
-        /// empty string, is an error rather than a no-op.
+        /// Skip two checks: the token's verification against the
+        /// Hetzner Cloud API, and the node's SSH port (which asks that
+        /// API for the node's address first). The Kubernetes API check
+        /// still runs when a kubeconfig is cached, and connects to the
+        /// cluster's API server; the DNS lookup runs too. Also settable
+        /// via `APPRAFTER_NO_PING`, which takes a boolish value: `1`
+        /// `true` `yes` `y` `t` `on` skip them, `0` `false` `no` `n` `f`
+        /// `off` keep them. Any other value, including the empty
+        /// string, is an error rather than a no-op.
         #[arg(
             long = "no-ping",
             env = "APPRAFTER_NO_PING",
@@ -207,9 +212,15 @@ pub enum Commands {
     #[command(alias = "kc")]
     Kubeconfig {
         /// Force a re-fetch over SSH even if a cached kubeconfig
-        /// is already in state.
+        /// is already in state. With the age key lost, it caches
+        /// the fresh copy under a new key, after listing what the
+        /// new key cannot read and asking.
         #[arg(long, default_value_t = false)]
         refresh: bool,
+        /// Agree to a new age key without asking, when the one the
+        /// cache was encrypted under is lost.
+        #[arg(long, default_value_t = false)]
+        yes: bool,
         /// Override the active target for the credential
         /// resolution chain (see `apprafter apply --target`).
         #[arg(long)]
@@ -234,6 +245,11 @@ pub enum Commands {
         /// password is already in state.
         #[arg(long, default_value_t = false)]
         refresh: bool,
+        /// Work on this target instead of the active one: its
+        /// cached password, or its cluster through its cached
+        /// kubeconfig.
+        #[arg(long)]
+        target: Option<String>,
     },
     /// Stand a cluster up in one command: runs `apply` → polls for the
     /// k3s kubeconfig to become SSH-reachable → runs
@@ -1340,8 +1356,9 @@ pub enum TargetCommand {
         provider: Option<String>,
         /// Hetzner Cloud API token. Required when `--provider
         /// hetzner-cloud`. Exactly 64 ASCII alphanumeric characters,
-        /// with no prefix — copy it whole out of the Cloud Console's
-        /// Security → API Tokens panel. Passed via `--token` or env
+        /// with no prefix: the whole token, which is shown only once,
+        /// when it is created in the Hetzner Console (open the project,
+        /// then Security → API tokens). Passed via `--token` or env
         /// `HCLOUD_TOKEN` (the env fallback is for CI ergonomics —
         /// interactive use should prefer the flag so the token
         /// doesn't linger in shell history's env-leak surface).
@@ -1363,15 +1380,25 @@ pub enum TargetCommand {
         /// Default cluster name; falls back to `platform-1`.
         #[arg(long = "cluster-name")]
         cluster_name: Option<String>,
-        /// Overwrite an existing target. Without `--force`, the
-        /// command fails when the target name is taken.
+        /// Overwrite an existing target: the flags you pass replace their stored values, every
+        /// field you do not pass keeps its stored value (the Cloudflare origin firewall toggle
+        /// always does), and the token is replaced. On a target with a provisioned server,
+        /// `--force` refuses a region or server-type change (rebuild from a backup instead). To
+        /// start from scratch, run `apprafter target remove <name>`, then `apprafter target add
+        /// <name>`. Without `--force`, the command fails when the target name is taken.
         #[arg(long, default_value_t = false)]
         force: bool,
-        /// Update only the credentials of an existing target.
-        /// Errors when the target does not exist. Mutually
-        /// exclusive with `--force` (use `--force` if you want
-        /// to replace the whole target, not just rotate the
-        /// token).
+        /// Update only the token and the SSH key of an existing
+        /// target: a new `--token` replaces the credentials, and
+        /// `--ssh-key` changes the key; whatever equals the stored
+        /// value is left as it is. `--ssh-key` without `--token`
+        /// changes only the key and keeps the credentials (an
+        /// `HCLOUD_TOKEN` is not used then). With neither, the new
+        /// token comes from the wizard on a terminal, else from
+        /// `HCLOUD_TOKEN`. Errors when the target does not exist or
+        /// when nothing would change. Mutually exclusive with
+        /// `--force` (use `--force` to change the target's other
+        /// fields as well as the token).
         #[arg(long, default_value_t = false, conflicts_with = "force")]
         renew: bool,
         /// Skip the interactive wizard even when stdin + stdout
@@ -1436,7 +1463,11 @@ pub enum TargetCommand {
     },
     /// Remove a target. Interactive runs prompt for confirmation
     /// unless `--yes` is passed; non-interactive runs always
-    /// require `--yes` (no silent destruction).
+    /// require `--yes` (no silent destruction). A target whose
+    /// `config.yaml` or `credentials.yaml` cannot be read is removed
+    /// too, its files deleted without being read; a warning names
+    /// the file first, and the active pointer moves only to a target
+    /// that can be read.
     #[command(alias = "rm")]
     Remove {
         /// Target name to remove.
@@ -1464,8 +1495,8 @@ pub enum TargetCommand {
     Ip,
     /// Set or change the server type (and region) on a target via the
     /// machine picker. This is the ONLY way to change the server type on an
-    /// existing target — `target add <existing>` errors, and `--renew` is
-    /// credentials-only.
+    /// existing target — `target add <existing>` errors, and `--renew`
+    /// changes only the token and the SSH key.
     Machine {
         /// Target to modify (defaults to the active target).
         #[arg(long)]
@@ -2086,6 +2117,30 @@ pub enum BackupAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `target add --token` says where a token is created in the one shared wording, and never
+    /// to copy an existing token out of the console, which shows it only once (WI-454).
+    #[test]
+    fn target_add_token_help_points_at_the_token_page() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let add = cmd
+            .find_subcommand("target")
+            .and_then(|t| t.find_subcommand("add"))
+            .expect("`target add` is a subcommand");
+        let help = add
+            .get_arguments()
+            .find(|a| a.get_id() == "token")
+            .and_then(|a| a.get_long_help().or_else(|| a.get_help()))
+            .map(|h| h.to_string())
+            .expect("`--token` has help");
+        assert!(
+            help.contains(cli_core::target::HETZNER_API_TOKENS_PAGE),
+            "{help}"
+        );
+        assert!(help.contains("only once"), "{help}");
+        assert!(!help.contains("copy it whole"), "{help}");
+    }
 
     /// `backup enable --check` says how much of the data the weekly check
     /// reads, and it is the platform chart's own default. The help used to

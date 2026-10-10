@@ -31,6 +31,110 @@ function open(spec: Partial<FormSpec> & Pick<FormSpec, 'fields'>, onClose = mock
 const submit = () => screen.getByRole('button', { name: 'Save' }) as HTMLButtonElement;
 
 describe('FormDialog', () => {
+  test('a radio field: one choice; a disabled option cannot be chosen; its detail describes it', async () => {
+    const { user, onSubmit } = open({
+      fields: [
+        {
+          key: 'key',
+          label: 'SSH public key',
+          kind: 'radio',
+          options: [
+            { value: 'a', label: '~/.ssh/a.pub', detail: 'ssh-ed25519 · alex@a', disabled: true },
+            { value: 'b', label: '~/.ssh/b.pub', detail: 'ssh-rsa' },
+            { value: 'other', label: 'Other path…' },
+          ],
+        },
+        { key: 'path', label: 'Path to a public key', when: (v) => v.key === 'other' },
+      ],
+      required: ['key', 'path'],
+    });
+    expect(screen.getByRole('group', { name: 'SSH public key' })).toBeDefined();
+    const a = screen.getByRole('radio', { name: '~/.ssh/a.pub' }) as HTMLInputElement;
+    expect(a.disabled).toBe(true);
+    expect(document.getElementById(a.getAttribute('aria-describedby') ?? '')?.textContent).toBe(
+      'ssh-ed25519 · alex@a',
+    );
+    expect(submit().disabled).toBe(true);
+    expect(screen.queryByLabelText('Path to a public key')).toBeNull();
+    await user.click(screen.getByRole('radio', { name: 'Other path…' }));
+    expect(submit().disabled).toBe(true);
+    await user.type(screen.getByLabelText('Path to a public key'), '~/.ssh/c.pub');
+    expect(submit().disabled).toBe(false);
+    await user.click(screen.getByRole('radio', { name: '~/.ssh/b.pub' }));
+    expect(screen.queryByLabelText('Path to a public key')).toBeNull();
+    await user.click(submit());
+    expect(onSubmit).toHaveBeenCalledWith({ key: 'b' });
+  });
+
+  // Review #15: a browser tabs into a radio group once, at its checked radio, so the dialog's
+  // Tab trap counts the group as one stop. Shift+Tab from a checked radio that is not the first
+  // enabled one used to escape the dialog (the trap compared it with the first radio).
+  test('a radio group is one Tab stop: Shift+Tab from its checked radio wraps inside', async () => {
+    const { user } = open({
+      fields: [
+        {
+          key: 'key',
+          label: 'SSH public key',
+          kind: 'radio',
+          options: [
+            { value: 'a', label: '~/.ssh/a.pub', disabled: true },
+            { value: 'b', label: '~/.ssh/b.pub' },
+            { value: 'other', label: 'Other path…' },
+          ],
+          def: 'other',
+        },
+      ],
+    });
+    const other = screen.getByRole('radio', { name: 'Other path…' });
+    // Entered at the checked radio, as a browser would.
+    expect(document.activeElement).toBe(other);
+    act(() => other.focus());
+    await user.tab({ shift: true });
+    expect(document.activeElement).toBe(submit());
+    await user.tab();
+    expect(document.activeElement).toBe(other);
+  });
+
+  test('a radio group with none checked is entered at its first enabled radio', async () => {
+    const { user } = open({
+      fields: [
+        {
+          key: 'key',
+          label: 'SSH public key',
+          kind: 'radio',
+          options: [
+            { value: 'a', label: '~/.ssh/a.pub', disabled: true },
+            { value: 'b', label: '~/.ssh/b.pub' },
+            { value: 'c', label: '~/.ssh/c.pub' },
+          ],
+        },
+      ],
+    });
+    const b = screen.getByRole('radio', { name: '~/.ssh/b.pub' });
+    expect(document.activeElement).toBe(b);
+    await user.tab({ shift: true });
+    expect(document.activeElement).toBe(submit());
+  });
+
+  test('a radio field starts from its default', () => {
+    open({
+      fields: [
+        {
+          key: 'key',
+          label: 'SSH public key',
+          kind: 'radio',
+          options: [
+            { value: 'a', label: 'A' },
+            { value: 'b', label: 'B' },
+          ],
+          def: 'b',
+        },
+      ],
+    });
+    expect((screen.getByRole('radio', { name: 'B' }) as HTMLInputElement).checked).toBe(true);
+    expect((screen.getByRole('radio', { name: 'A' }) as HTMLInputElement).checked).toBe(false);
+  });
+
   test('starts each kind from its default, and submits what it shows', async () => {
     const { user, onSubmit } = open({
       fields: [
@@ -94,6 +198,58 @@ describe('FormDialog', () => {
     expect(submit().disabled).toBe(true);
   });
 
+  test('a field check blocks the submit and says why, in place of the hint', async () => {
+    const onSubmit = mock();
+    render(
+      <FormDialog
+        title="Rename target"
+        fields={[
+          {
+            key: 'to',
+            label: 'New name',
+            hint: 'Letters, digits and dashes',
+            check: (v) => (v.includes(' ') ? 'No spaces.' : null),
+          },
+        ]}
+        required={['to']}
+        onSubmit={onSubmit}
+        onClose={() => {}}
+      />,
+    );
+    const user = userEvent.setup();
+    const input = screen.getByLabelText('New name');
+    expect(input.getAttribute('aria-invalid')).toBeNull();
+    await user.type(input, 'a b');
+    expect(screen.getByText('No spaces.')).toBeDefined();
+    expect(screen.queryByText('Letters, digits and dashes')).toBeNull();
+    expect(input.getAttribute('aria-invalid')).toBe('true');
+    expect(submit().disabled).toBe(true);
+    await user.clear(input);
+    await user.type(input, 'ab');
+    expect(screen.queryByText('No spaces.')).toBeNull();
+    expect(screen.getByText('Letters, digits and dashes')).toBeDefined();
+    expect(input.getAttribute('aria-invalid')).toBeNull();
+    expect(submit().disabled).toBe(false);
+    await user.click(submit());
+    expect(onSubmit).toHaveBeenCalledWith({ to: 'ab' });
+  });
+
+  test('a check is asked only of a non-empty value; an optional field with a problem still blocks', async () => {
+    const check = mock((v: string) => (v === 'bad' ? 'Not that one.' : null));
+    const { user } = open({
+      fields: [
+        { key: 'name', label: 'Name', def: 'x' },
+        { key: 'token', label: 'Token', type: 'password', check },
+      ],
+    });
+    expect(check).not.toHaveBeenCalled();
+    expect(submit().disabled).toBe(false);
+    await user.type(screen.getByLabelText('Token'), 'bad');
+    expect(screen.getByText('Not that one.')).toBeDefined();
+    expect(screen.getByLabelText('Token').getAttribute('aria-invalid')).toBe('true');
+    expect(submit().disabled).toBe(true);
+  });
+
   test('a password field reveals its own value only', async () => {
     const { user } = open({
       fields: [
@@ -120,7 +276,11 @@ describe('FormDialog', () => {
     );
     await user.click(submit());
     expect(screen.getByRole('dialog')).toBeDefined();
-    expect(submit().disabled).toBe(true);
+    // Save waits but keeps the focus it was pressed with: a browser drops the focus of a control
+    // it disables onto the page, out of reach of Esc and Tab (happy-dom does not, GOTCHA-90).
+    expect(submit().disabled).toBe(false);
+    expect(submit().getAttribute('aria-disabled')).toBe('true');
+    expect(document.activeElement).toBe(submit());
     expect((screen.getByRole('button', { name: 'Cancel' }) as HTMLButtonElement).disabled).toBe(
       true,
     );
@@ -131,6 +291,28 @@ describe('FormDialog', () => {
       await new Promise((r) => setTimeout(r, 0));
     });
     expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  test('busy: a second press of Save, or Enter, submits nothing more', async () => {
+    const running = deferred();
+    const onSubmit = mock(() => running.promise);
+    const user = userEvent.setup();
+    render(
+      <FormDialog
+        title="Rename"
+        fields={[{ key: 'name', label: 'Name', def: 'x' }]}
+        onSubmit={onSubmit}
+        onClose={mock()}
+      />,
+    );
+    await user.click(submit());
+    await user.click(submit());
+    await user.keyboard('{Enter}');
+    expect(onSubmit).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      running.resolve();
+      await new Promise((r) => setTimeout(r, 0));
+    });
   });
 
   test('a rejection is shown inline and the dialog stays, ready to try again', async () => {
@@ -155,6 +337,8 @@ describe('FormDialog', () => {
     expect(screen.getByRole('alert').textContent).toContain('A backup is running.');
     expect(onClose).not.toHaveBeenCalled();
     expect(submit().disabled).toBe(false);
+    expect(submit().hasAttribute('aria-disabled')).toBe(false);
+    expect(document.activeElement).toBe(submit());
   });
 
   test('a backdrop click never dismisses it (typed secrets would go)', async () => {

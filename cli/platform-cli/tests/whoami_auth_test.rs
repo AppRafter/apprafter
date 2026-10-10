@@ -62,6 +62,48 @@ fn whoami_on_empty_store_prints_onboarding_hint() {
         .stdout(contains("apprafter target add"));
 }
 
+/// The CLI-default pointer is read before anything prints: a `config.yaml` that cannot be
+/// parsed is the error alone, with no identity line in front of it. A target whose own files
+/// cannot be read fails after the identity line. Both orders are today's. Which file failed is
+/// told by what its error says, not by its path: miette wraps the path inside a word on
+/// Windows, where `\` allows no line break. A credentials file's error never quotes the file.
+#[test]
+fn whoami_reads_the_pointer_before_the_identity_line_and_the_target_after_it() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_target(dir.path());
+    std::fs::write(
+        dir.path().join("targets/primary/credentials.yaml"),
+        "hetzner_token: [unclosed",
+    )
+    .unwrap();
+    cli()
+        .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .args(["whoami", "--no-ping"])
+        .assert()
+        .failure()
+        .stdout(contains("Identity:"))
+        .stderr(contains("apprafter::target::invalid_config"))
+        .stderr(predicates::function::function(|stderr: &str| {
+            // miette's wrapping (a line break and the `│` gutter) taken out.
+            stderr
+                .split_whitespace()
+                .filter(|word| *word != "│")
+                .collect::<Vec<_>>()
+                .join(" ")
+                .contains("not a valid target credentials map")
+        }));
+
+    std::fs::write(dir.path().join("config.yaml"), "active_target: [unclosed").unwrap();
+    cli()
+        .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .args(["whoami", "--no-ping"])
+        .assert()
+        .failure()
+        .stdout(predicates::str::is_empty())
+        .stderr(contains("apprafter::target::invalid_config"))
+        .stderr(contains("active_target:"));
+}
+
 #[test]
 fn whoami_with_active_target_renders_summary_and_honours_no_ping() {
     let dir = tempfile::tempdir().unwrap();

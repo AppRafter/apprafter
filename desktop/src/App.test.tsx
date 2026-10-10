@@ -12,6 +12,7 @@ import type { Quitting } from './ipc/generated/Quitting';
 import type { Settings } from './ipc/generated/Settings';
 import { resetOperations } from './ipc/operations';
 import { appInfo, authInfo, lockState, settings } from './test/fixtures';
+import { settleIpc } from './test/settle';
 
 let calls: { cmd: string; args: unknown }[];
 let appInfoAnswer: () => unknown;
@@ -34,6 +35,8 @@ beforeEach(() => {
       if (cmd === 'lock_status') return lockAnswer();
       if (cmd === 'settings_get') return settingsAnswer();
       if (cmd === 'op_list') return [];
+      if (cmd === 'target_list')
+        return { targets: [], unreadable: [], cliDefault: { status: 'unset' } };
       if (cmd === 'window_ready') themeAtReveal = document.documentElement.dataset.theme;
       return null;
     },
@@ -43,7 +46,7 @@ beforeEach(() => {
 
 afterEach(async () => {
   cleanup();
-  await new Promise((resolve) => setTimeout(resolve, 0));
+  await settleIpc();
   resetOperations();
   clearMocks();
   delete document.documentElement.dataset.theme;
@@ -210,6 +213,8 @@ test('Linux without a polkit agent: the field comes after the refusal, and no lo
       if (cmd === 'lock_status') return lockAnswer();
       if (cmd === 'settings_get') return settingsAnswer();
       if (cmd === 'op_list') return [];
+      if (cmd === 'target_list')
+        return { targets: [], unreadable: [], cliDefault: { status: 'unset' } };
       return null;
     },
     { shouldMockEvents: true },

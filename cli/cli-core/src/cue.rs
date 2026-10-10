@@ -25,8 +25,11 @@ use crate::{CliError, Result};
 
 const DEFAULT_BIN: &str = "cue";
 
+/// The variable that overrides the `cue` binary path.
+pub const CUE_BIN_ENV: &str = "CUE_BIN";
+
 fn cue_bin() -> String {
-    std::env::var("CUE_BIN").unwrap_or_else(|_| DEFAULT_BIN.to_string())
+    std::env::var(CUE_BIN_ENV).unwrap_or_else(|_| DEFAULT_BIN.to_string())
 }
 
 /// Run `cue export <path> --out json` in the current directory.

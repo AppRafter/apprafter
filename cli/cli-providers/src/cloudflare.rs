@@ -29,8 +29,10 @@ impl CloudflareIpSource for UreqCloudflareIpSource {
             Err(ureq::Error::Status(status, _)) => Err(CliError::Other(format!(
                 "Cloudflare {url} returned HTTP {status}"
             ))),
+            // ureq's text names the URL too; `detail` drops its copy.
             Err(ureq::Error::Transport(t)) => Err(CliError::Other(format!(
-                "transport error fetching {url}: {t}"
+                "transport error fetching {url}: {}",
+                crate::transport::detail(&t)
             ))),
         }
     }

@@ -24,6 +24,25 @@ pub const COMMANDS: &[&str] = &[
     "op_execute",
     "window_ready",
     "theme_apply",
+    // D.3: targets, doctor, whoami (overview §3.12.1).
+    "target_list",
+    "target_show",
+    "ssh_key_candidates",
+    "ssh_key_inspect",
+    "toolchain_status",
+    "whoami",
+    "op_start_verify_token",
+    "op_start_machine_catalogue",
+    "op_start_region_latencies",
+    "op_start_doctor",
+    "op_start_whoami",
+    "op_plan_target_add",
+    "op_plan_target_renew",
+    "op_plan_target_use",
+    "op_plan_target_rename",
+    "op_plan_target_remove",
+    "op_plan_target_machine",
+    "target_draft_discard",
 ];
 
 /// What a locked app still answers; everything else is `apprafter::desktop::locked`.

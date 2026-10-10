@@ -322,18 +322,28 @@ fn build_ssh_specs(
     // Infrastructure manifest. Matches the pre-target-store
     // behaviour — operator who hand-edited the manifest meant
     // it.
+    // Every body is sent to the provider as is, so each must be one OpenSSH public key line: a
+    // private key is refused here, before any provider call (GOTCHA-149).
     if let Some(blocks) = manifest.and_then(|m| m.spec.ssh_keys.as_ref()) {
-        return Ok(blocks
+        return blocks
             .iter()
             .enumerate()
-            .map(|(i, b)| SshKeySpec {
-                name: b
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| format!("{cluster}-key-{i}")),
-                public_key: b.public_key.clone(),
+            .map(|(i, b)| {
+                cli_core::ssh_key::parse_public_key(&b.public_key).map_err(|e| {
+                    e.refusal(
+                        format!("the manifest's `sshKeys[{i}]`"),
+                        cli_core::ssh_key::KeySource::Manifest { index: i },
+                    )
+                })?;
+                Ok(SshKeySpec {
+                    name: b
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| format!("{cluster}-key-{i}")),
+                    public_key: b.public_key.clone(),
+                })
             })
-            .collect());
+            .collect();
     }
     // Otherwise the credential resolver picks up
     // APPRAFTER_SSH_PUBLIC_KEY env (legacy) or the active target's
@@ -1007,6 +1017,44 @@ mod tests {
         assert_eq!(specs[0].name, "cl-key-0");
         assert_eq!(specs[0].public_key, "ssh-ed25519 AAAA");
         assert_eq!(specs[1].name, "named");
+    }
+
+    /// GOTCHA-149: a manifest's key body goes to the provider as is, so a private key there is
+    /// refused before any provider call, naming the entry and never quoting it.
+    #[test]
+    fn build_ssh_specs_refuses_a_private_key_in_the_manifest() {
+        let private =
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaA==\n-----END OPENSSH PRIVATE KEY-----";
+        let m = manifest_from(json!({
+            "apiVersion": "apprafter.io/v1alpha1",
+            "kind": "Infrastructure",
+            "metadata": {"name": "p"},
+            "spec": {
+                "provider": "hetzner-cloud",
+                "sshKeys": [
+                    {"public_key": "ssh-ed25519 AAAA"},
+                    {"public_key": private}
+                ]
+            }
+        }));
+        let (_dir, paths) = empty_target_store();
+        let err = build_ssh_specs(Some(&m), "cl", &paths, None).expect_err("a private key");
+        assert_eq!(
+            err.to_string(),
+            "the manifest's `sshKeys[1]` is a private key: AppRafter never sends a private key \
+             to the provider"
+        );
+        // Its help sends the reader to that entry: the manifest outranks the env and the target.
+        assert!(
+            matches!(
+                err,
+                CliError::SshKeyNotPublic {
+                    from: cli_core::ssh_key::KeySource::Manifest { index: 1 },
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
     }
 
     #[test]

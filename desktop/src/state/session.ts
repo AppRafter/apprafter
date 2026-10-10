@@ -72,16 +72,36 @@ export function sessionReducer(state: Session, action: SessionAction): Session {
         ),
       };
     }
-    case 'targetRenamed':
+    case 'targetRenamed': {
+      // One tab per target: a tab still bound to the new name (that target removed in a
+      // terminal, its tab left open) goes, and the renamed tab takes its place if it was shown.
+      const renamed = state.tabs.find((tab) => tab.target === action.from);
+      const stale = new Set(
+        renamed === undefined
+          ? []
+          : state.tabs.filter((tab) => tab.target === action.to).map((tab) => tab.key),
+      );
+      const view: View =
+        renamed !== undefined && state.view.kind === 'tab' && stale.has(state.view.key)
+          ? { kind: 'tab', key: renamed.key }
+          : state.view;
       return {
-        ...state,
-        tabs: state.tabs.map((tab) =>
-          tab.target === action.from ? { ...tab, target: action.to } : tab,
-        ),
+        tabs: state.tabs
+          .filter((tab) => !stale.has(tab.key))
+          .map((tab) => (tab.target === action.from ? { ...tab, target: action.to } : tab)),
+        view,
       };
-    case 'targetRemoved': {
-      const tab = state.tabs.find((t) => t.target === action.target);
-      return tab === undefined ? state : close(state, tab.key);
     }
+    case 'targetRemoved':
+      // Every tab of the target, should there be more than one.
+      return state.tabs
+        .filter((tab) => tab.target === action.target)
+        .reduce((next, tab) => close(next, tab.key), state);
   }
+}
+
+/** The keys of the tabs in `before` that `after` no longer has. */
+export function closedTabs(before: readonly TargetTab[], after: readonly TargetTab[]): string[] {
+  const open = new Set(after.map((tab) => tab.key));
+  return before.filter((tab) => !open.has(tab.key)).map((tab) => tab.key);
 }

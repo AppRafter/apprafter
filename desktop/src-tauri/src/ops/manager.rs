@@ -25,6 +25,12 @@
 //! what an executor captured may do anything when it goes, calling back into the manager
 //! included.
 //!
+//! A read needs no plan: [`start`](OperationManager::start) runs it at once, on a thread of
+//! its own like a confirmed plan, and the page follows it with the same subscriptions and
+//! replay, and can [`cancel`](OperationManager::cancel) it. A lock stops every read
+//! ([`cancel_reads`](OperationManager::cancel_reads)) but no plan already running: a running
+//! plan was confirmed, a read was not, and what a locked page cannot see it must not wait for.
+//!
 //! Quitting [`close`](OperationManager::close)s the manager first: from then on no operation
 //! starts, decided under the same lock hold that would start it, so nothing begins between the
 //! quit's [`cancel_all_and_wait`](OperationManager::cancel_all_and_wait) and the exit.
@@ -219,6 +225,7 @@ struct Prompt {
 struct Op {
     title: String,
     target: Option<String>,
+    kind: OpKind,
     started_at_ms: u64,
     status: Status,
     replay: ReplayBuffer,
@@ -234,6 +241,22 @@ impl Op {
             Status::Ended(_) => None,
         }
     }
+}
+
+/// Started by `execute` (a confirmed plan) or by `start` (a read).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpKind {
+    Plan,
+    Read,
+}
+
+/// What [`OperationManager::launch`] inserts besides the executor.
+struct Launch {
+    title: String,
+    target: Option<String>,
+    kind: OpKind,
+    /// Pages that followed the plan before it ran; none for a read.
+    sinks: Vec<Subscriber>,
 }
 
 enum Status {
@@ -429,11 +452,74 @@ impl OperationManager {
                 }
             }
         }
-        // The same lock hold as the insert below: a quit that began while the prompt was
+        // The same lock hold as the insert in `launch`: a quit that began while the prompt was
         // open is seen here, and one that begins after it finds the operation running.
         if inner.closing {
             return spend(inner, plan, DesktopError::Closing);
         }
+        let launch = Launch {
+            title: plan.title,
+            target: plan.target,
+            kind: OpKind::Plan,
+            sinks: plan.sinks,
+        };
+        self.launch(inner, id, launch, plan.exec)
+            .map_err(Refusal::from)
+    }
+
+    /// Start a read now: no plan, no gesture. It runs on its own 8 MiB thread like an executed
+    /// plan, streams to subscribers (`subscribe`'s replay covers what came before), is listed by
+    /// `list`, and stops on `cancel(id)` or [`cancel_reads`](Self::cancel_reads). Once the
+    /// manager is closed it is refused with `Closing` — decided under the lock hold that would
+    /// start it — and the executor, with what it captured, is dropped at once, outside the lock.
+    pub fn start(
+        self: &Arc<Self>,
+        title: impl Into<String>,
+        target: Option<String>,
+        exec: Executor,
+    ) -> Result<OpId, DesktopError> {
+        let mut inner = self.lock();
+        if inner.closing {
+            drop(inner);
+            drop(exec);
+            return Err(DesktopError::Closing);
+        }
+        inner.next_id += 1;
+        let id = OpId(inner.next_id);
+        let launch = Launch {
+            title: title.into(),
+            target,
+            kind: OpKind::Read,
+            sinks: Vec::new(),
+        };
+        self.launch(inner, id, launch, exec)
+    }
+
+    /// The app locked or unlocked: every running read stops (its token trips on a thread of its
+    /// own, after the lock is released). Plans that already run were confirmed and go on.
+    pub fn cancel_reads(&self) {
+        let tokens: Vec<CancellationToken> = self
+            .lock()
+            .ops
+            .values()
+            .filter(|op| op.kind == OpKind::Read)
+            .filter_map(|op| op.run().map(|run| run.cancel.clone()))
+            .collect();
+        for token in tokens {
+            trip(token, CANCEL_THREAD);
+        }
+    }
+
+    /// Insert the running operation under `inner` — the caller checked `closing` in this same
+    /// hold — then start its thread. The shared tail of `execute_with` and `start`. A thread
+    /// that cannot start ends the operation failed, its pages told, and is `Internal`.
+    fn launch(
+        self: &Arc<Self>,
+        mut inner: MutexGuard<'_, Inner>,
+        id: OpId,
+        launch: Launch,
+        exec: Executor,
+    ) -> Result<OpId, DesktopError> {
         let cancel = CancellationToken::new();
         let reporter = {
             let manager = Arc::downgrade(self);
@@ -449,26 +535,26 @@ impl OperationManager {
         inner.ops.insert(
             id,
             Op {
-                title: plan.title,
-                target: plan.target,
+                title: launch.title,
+                target: launch.target,
+                kind: launch.kind,
                 started_at_ms: self.clock.now_ms(),
                 status: Status::Running(Run {
                     cancel: cancel.clone(),
                     reporter: reporter.clone(),
                 }),
                 replay: ReplayBuffer::new(REPLAY_CAP),
-                sinks: plan.sinks,
+                sinks: launch.sinks,
             },
         );
         drop(inner);
-        let exec = plan.exec;
         let manager = Arc::clone(self);
         if let Err(e) = spawn_op(id, move || manager.run_op(id, exec, &reporter, &cancel)) {
             // The pages that followed the plan wait for a final event: they get one.
             let message = format!("could not start the operation's thread: {e}");
             let error = DesktopError::Internal(message.clone()).to_ui();
             self.end(id, || (OpEvent::Failed { error }, OpState::Failed));
-            return Err(DesktopError::Internal(message).into());
+            return Err(DesktopError::Internal(message));
         }
         Ok(id)
     }
@@ -976,7 +1062,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use apprafter_core::{
-        CancellationToken, CoreError, CoreResult, Event, Outcome, PlanClass, PlannedChange, Stream,
+        CancellationToken, ChangeAction, CoreError, CoreResult, Event, Outcome, PlanClass,
+        PlannedChange, Stream,
     };
     use apprafter_desktop_ipc::{
         errors, AuthInfo, AuthOutcome, CancelledBy, OpEvent, OpId, OpState, OutputStream,
@@ -1014,7 +1101,8 @@ mod tests {
             changes: vec![PlannedChange {
                 kind: "Target".into(),
                 object: "prod".into(),
-                change: "delete".into(),
+                action: ChangeAction::Delete,
+                detail: None,
             }],
             ..PlanParts::new(class, "Remove target prod", "delete")
         }
@@ -3438,5 +3526,161 @@ mod tests {
                 error: DesktopError::AuthCancelled.to_ui()
             }]
         );
+    }
+
+    // 18. Reads: run at once, followed, cancelled one by one or all at once on a lock, refused
+    // once the manager is closed.
+
+    /// Sets its flag when dropped: an executor that went without running.
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, SeqCst);
+        }
+    }
+
+    /// A read that waits for its token, then ends cancelled — or, when the token never trips,
+    /// ends completed once `LONG` has passed, so a cancel that never came fails as the wrong end
+    /// rather than passing at the deadline.
+    fn until_cancelled(started: &Arc<AtomicBool>) -> Executor {
+        let started = started.clone();
+        Box::new(move |_, cancel| {
+            started.store(true, SeqCst);
+            let deadline = Instant::now() + LONG;
+            while !cancel.is_cancelled() {
+                if Instant::now() >= deadline {
+                    return complete(json!("never cancelled"));
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(CoreError::Cancelled)
+        })
+    }
+
+    #[test]
+    fn a_read_runs_at_once_and_a_late_subscriber_gets_its_whole_replay() {
+        let (_, mgr) = manager();
+        let exec: Executor = Box::new(|r, _| {
+            r.report(stage(1));
+            complete(json!({ "groups": [] }))
+        });
+        let id = mgr
+            .start("Doctor · prod", Some("prod".into()), exec)
+            .unwrap();
+        assert_eq!(wait_ended(&mgr, id), OpState::Finished);
+        let summary = mgr.list().into_iter().find(|s| s.op_id == id).unwrap();
+        assert_eq!(
+            (summary.title.as_str(), summary.target.as_deref()),
+            ("Doctor · prod", Some("prod"))
+        );
+        let page = VecSink::new("main");
+        let replay = mgr.subscribe(id, page.clone()).unwrap().replay;
+        assert_eq!(replay, vec![staged(1), completed(json!({ "groups": [] }))]);
+        assert!(page.events().is_empty(), "an ended read keeps no sink");
+    }
+
+    #[test]
+    fn cancel_stops_one_read_and_cancel_reads_every_read_but_no_confirmed_plan() {
+        let (_, mgr) = manager();
+        let (a, b) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let first = mgr.start("Catalogue", None, until_cancelled(&a)).unwrap();
+        let second = mgr.start("Latency", None, until_cancelled(&b)).unwrap();
+        let (open, gate) = gate();
+        let plan = mgr.register_plan(
+            parts(PlanClass::Bounded),
+            Box::new(move |_, _| {
+                gate.wait();
+                complete(json!(1))
+            }),
+        );
+        let op = mgr.execute(plan.op_id, &FakeAuthenticator::new()).unwrap();
+        mgr.cancel(first).unwrap();
+        assert_eq!(wait_ended(&mgr, first), OpState::Cancelled);
+        // Only the running read's token trips, never the confirmed plan's.
+        let ((), held) = test_trips::held(|| mgr.cancel_reads());
+        assert_eq!(held.len(), 1, "the one running read, and no plan");
+        for token in held {
+            token.cancel();
+        }
+        assert_eq!(wait_ended(&mgr, second), OpState::Cancelled);
+        assert_eq!(
+            state_of(&mgr, op),
+            Some(OpState::Running),
+            "a confirmed plan runs on"
+        );
+        open.send(()).unwrap();
+        assert_eq!(wait_ended(&mgr, op), OpState::Finished);
+        assert!(a.load(SeqCst) && b.load(SeqCst));
+    }
+
+    #[test]
+    fn dropping_the_plans_on_a_lock_leaves_the_reads_to_cancel_reads() {
+        let (_, mgr) = manager();
+        let started = Arc::new(AtomicBool::new(false));
+        let id = mgr
+            .start("Doctor", None, until_cancelled(&started))
+            .unwrap();
+        mgr.drop_all_plans();
+        thread::sleep(Duration::from_millis(20));
+        assert_eq!(state_of(&mgr, id), Some(OpState::Running));
+        mgr.cancel_reads();
+        assert_eq!(wait_ended(&mgr, id), OpState::Cancelled);
+    }
+
+    #[test]
+    fn once_closed_a_read_is_refused_and_its_executor_dropped_unrun() {
+        let (_, mgr) = manager();
+        mgr.close();
+        let ran = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let flag = DropFlag(dropped.clone());
+        let exec: Executor = {
+            let ran = ran.clone();
+            Box::new(move |_, _| {
+                let _held = &flag;
+                ran.fetch_add(1, SeqCst);
+                complete(json!(0))
+            })
+        };
+        assert!(matches!(
+            mgr.start("Doctor", None, exec),
+            Err(DesktopError::Closing)
+        ));
+        assert_eq!(ran.load(SeqCst), 0);
+        assert!(
+            dropped.load(SeqCst),
+            "what it captured (a token) goes at once"
+        );
+        assert!(mgr.list().is_empty());
+    }
+
+    #[test]
+    fn a_read_that_panics_fails_as_internal_and_the_manager_goes_on() {
+        let (_, mgr) = manager();
+        let id = mgr
+            .start("Doctor", None, Box::new(|_, _| panic!("the core broke")))
+            .unwrap();
+        assert_eq!(wait_ended(&mgr, id), OpState::Failed);
+        let ok = mgr.start("Doctor", None, returns(json!(1))).unwrap();
+        assert_eq!(wait_ended(&mgr, ok), OpState::Finished);
+    }
+
+    #[test]
+    fn a_read_whose_thread_cannot_start_ends_failed_and_says_so() {
+        let (_, mgr) = manager();
+        test_spawn::fail_next();
+        let err = mgr.start("Doctor", None, returns(json!(1))).unwrap_err();
+        assert_eq!(
+            err.to_ui().code.as_deref(),
+            Some(errors::INTERNAL),
+            "{err:?}"
+        );
+        let [summary] = mgr.list().try_into().expect("one op listed");
+        assert_eq!(summary.state, OpState::Failed);
+        assert_eq!(mgr.running(), 0);
     }
 }

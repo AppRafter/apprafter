@@ -108,6 +108,13 @@ pub fn resolve_hetzner_ssh_public_key(
     //    for both old + new CI scripts.
     if let Ok(body) = std::env::var(SSH_PUBLIC_KEY_ENV) {
         if !body.is_empty() {
+            // GOTCHA-149: whatever is returned here is sent to the provider as is.
+            crate::ssh_key::parse_public_key(&body).map_err(|e| {
+                e.refusal(
+                    format!("`{SSH_PUBLIC_KEY_ENV}`"),
+                    crate::ssh_key::KeySource::Env,
+                )
+            })?;
             return Ok(Some(body));
         }
     }
@@ -132,7 +139,10 @@ pub fn resolve_hetzner_ssh_public_key(
 
 /// Pure helper exposing the file read so callers wanting to
 /// validate the SSH key path without the full resolution chain
-/// (e.g. `apprafter doctor`) can reuse the same parser.
+/// (e.g. `apprafter doctor`) can reuse the same parser. The body is
+/// what the provider is sent, so it must be one OpenSSH public key
+/// line: a private key or anything else is refused before any upload
+/// (`CliError::SshKeyNotPublic`, GOTCHA-149), and never quoted.
 pub fn read_ssh_public_key_body(path: &Path) -> Result<String> {
     let body = std::fs::read_to_string(path).map_err(|e| {
         CliError::Other(format!(
@@ -147,6 +157,12 @@ pub fn read_ssh_public_key_body(path: &Path) -> Result<String> {
             path.display()
         )));
     }
+    crate::ssh_key::parse_public_key(&trimmed).map_err(|e| {
+        e.refusal(
+            crate::ssh_key::file_origin(path),
+            crate::ssh_key::KeySource::TargetFile,
+        )
+    })?;
     Ok(trimmed)
 }
 
@@ -377,7 +393,7 @@ mod tests {
             // Write a real key file but ALSO set the env var.
             let key_dir = tempdir().unwrap();
             let key_path = key_dir.path().join("file.pub");
-            std::fs::write(&key_path, "ssh-ed25519 AAAA-from-file me@file").unwrap();
+            std::fs::write(&key_path, "ssh-ed25519 AAAAZmlsZQ== me@file").unwrap();
             save_target(
                 &paths,
                 &Target {
@@ -399,10 +415,10 @@ mod tests {
                 },
             )
             .unwrap();
-            std::env::set_var(SSH_PUBLIC_KEY_ENV, "ssh-ed25519 AAAA-from-env me@env");
+            std::env::set_var(SSH_PUBLIC_KEY_ENV, "ssh-ed25519 AAAAZW52 me@env");
 
             let resolved = resolve_hetzner_ssh_public_key(&paths, None).unwrap();
-            assert_eq!(resolved.unwrap(), "ssh-ed25519 AAAA-from-env me@env");
+            assert_eq!(resolved.unwrap(), "ssh-ed25519 AAAAZW52 me@env");
             std::env::remove_var(SSH_PUBLIC_KEY_ENV);
         });
     }
@@ -413,7 +429,7 @@ mod tests {
             let (_dir, paths) = make_paths();
             let key_dir = tempdir().unwrap();
             let key_path = key_dir.path().join("file.pub");
-            std::fs::write(&key_path, "ssh-ed25519 AAAA-from-file me@file\n").unwrap();
+            std::fs::write(&key_path, "ssh-ed25519 AAAAZmlsZQ== me@file\n").unwrap();
             save_target(
                 &paths,
                 &Target {
@@ -438,7 +454,66 @@ mod tests {
 
             let resolved = resolve_hetzner_ssh_public_key(&paths, None).unwrap();
             // Trimmed — no trailing newline.
-            assert_eq!(resolved.unwrap(), "ssh-ed25519 AAAA-from-file me@file");
+            assert_eq!(resolved.unwrap(), "ssh-ed25519 AAAAZmlsZQ== me@file");
+        });
+    }
+
+    /// GOTCHA-149: what `apply` sends the provider as the target's SSH key is checked first. A
+    /// private key (the file next to the `.pub`) or anything that is not one OpenSSH public key
+    /// line is refused, by path, and its text is never quoted.
+    #[test]
+    fn the_body_sent_to_the_provider_must_be_a_public_key() {
+        let dir = tempdir().unwrap();
+        let private = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjE=\n-----END OPENSSH PRIVATE KEY-----\n";
+        for (body, private_key) in [(private, true), ("not-a-key\n", false)] {
+            let path = dir.path().join("id_ed25519");
+            std::fs::write(&path, body).unwrap();
+            let err = read_ssh_public_key_body(&path).expect_err(body);
+            assert!(!err.to_string().contains(body.trim()), "{err}");
+            match err {
+                CliError::SshKeyNotPublic {
+                    origin,
+                    private_key: p,
+                    from,
+                } => {
+                    assert_eq!(origin, format!("SSH key `{}`", path.display()));
+                    assert_eq!(p, private_key, "{body}");
+                    // The stored path of an existing target (apply, doctor).
+                    assert_eq!(from, crate::ssh_key::KeySource::TargetFile);
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        let path = dir.path().join("id_ed25519.pub");
+        std::fs::write(&path, "ssh-ed25519 AAAA me@host\n").unwrap();
+        assert_eq!(
+            read_ssh_public_key_body(&path).unwrap(),
+            "ssh-ed25519 AAAA me@host"
+        );
+    }
+
+    /// The same for a body carried inline in `APPRAFTER_SSH_PUBLIC_KEY`.
+    #[test]
+    fn an_inline_key_body_must_be_a_public_key_too() {
+        with_clean_env(|| {
+            let (_dir, paths) = make_paths();
+            std::env::set_var(
+                SSH_PUBLIC_KEY_ENV,
+                "-----BEGIN RSA PRIVATE KEY-----\nMIIE\n-----END RSA PRIVATE KEY-----",
+            );
+            match resolve_hetzner_ssh_public_key(&paths, None).expect_err("a private key") {
+                CliError::SshKeyNotPublic {
+                    origin,
+                    private_key,
+                    from,
+                } => {
+                    assert_eq!(origin, format!("`{SSH_PUBLIC_KEY_ENV}`"));
+                    assert!(private_key);
+                    assert_eq!(from, crate::ssh_key::KeySource::Env);
+                }
+                other => panic!("{other:?}"),
+            }
+            std::env::remove_var(SSH_PUBLIC_KEY_ENV);
         });
     }
 

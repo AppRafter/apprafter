@@ -1,0 +1,37 @@
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
+// Generated from apprafter-core's error::codes by `just desktop-ipc-types`. Do not edit.
+
+/** The codes the core raises or passes through as `UiError.code`. */
+export const CORE_ERROR_CODES = {
+  BACKUP_JOB_ACTIVE: 'apprafter::backup::job_active',
+  CLUSTER_KUBE_FAILED: 'apprafter::cluster::kube_failed',
+  ENV_CUE_NOT_FOUND: 'apprafter::env::cue_not_found',
+  ENV_TOOL_NOT_FOUND: 'apprafter::env::tool_not_found',
+  ENV_TOOL_UNSUPPORTED: 'apprafter::env::tool_unsupported',
+  ENV_UNSAFE_OVERRIDE: 'apprafter::env::unsafe_override',
+  IO_ERROR: 'apprafter::io::error',
+  OP_CANCELLED: 'apprafter::op::cancelled',
+  PROVIDER_HETZNER_API_ERROR: 'apprafter::provider::hetzner_api_error',
+  PROVIDER_REQUEST_FAILED: 'apprafter::provider::request_failed',
+  PROVIDER_SERVER_TYPE_UNAVAILABLE: 'apprafter::provider::server_type_unavailable',
+  SECRETS_AGE_KEY_MISSING: 'apprafter::secrets::age_key_missing',
+  STATE_CORRUPT: 'apprafter::state::corrupt',
+  TARGET_EXISTS: 'apprafter::target::exists',
+  TARGET_INVALID_CONFIG: 'apprafter::target::invalid_config',
+  TARGET_INVALID_NAME: 'apprafter::target::invalid_name',
+  TARGET_INVALID_TOKEN: 'apprafter::target::invalid_token',
+  TARGET_NOT_FOUND: 'apprafter::target::not_found',
+  TARGET_NOT_PROVISIONED: 'apprafter::target::not_provisioned',
+  TARGET_NO_ACTIVE: 'apprafter::target::no_active',
+  TARGET_PROVIDER_UNREACHABLE: 'apprafter::target::provider_unreachable',
+  TARGET_PROVISIONED: 'apprafter::target::provisioned',
+  TARGET_RENEW_NOTHING_TO_CHANGE: 'apprafter::target::renew_nothing_to_change',
+  TARGET_RENEW_TOKEN_UNCHANGED: 'apprafter::target::renew_token_unchanged',
+  TARGET_SAME_NAME: 'apprafter::target::same_name',
+  TARGET_SERVER_MISSING: 'apprafter::target::server_missing',
+  TARGET_SSH_KEY_NOT_PUBLIC: 'apprafter::target::ssh_key_not_public',
+  TARGET_SSH_KEY_UNREADABLE: 'apprafter::target::ssh_key_unreadable',
+  TARGET_TOKEN_MISSING: 'apprafter::target::token_missing',
+  TARGET_TOKEN_REJECTED: 'apprafter::target::token_rejected',
+  TARGET_UNKNOWN_PROVIDER: 'apprafter::target::unknown_provider',
+} as const;

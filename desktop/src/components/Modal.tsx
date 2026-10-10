@@ -13,17 +13,116 @@ import {
 import { IconButton } from './IconButton';
 import { type Icon, XIcon } from './icons';
 
+// Every element a dialog uses that the browser makes a Tab stop: a <details>' own <summary> is
+// one (review #0); left out, the trap took it for outside and sent Tab back to the start.
 const FOCUSABLE =
   'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), ' +
-  'textarea:not([disabled]), [tabindex]';
+  'textarea:not([disabled]), details > summary:first-of-type, [tabindex]';
 
-function focusables(root: HTMLElement | null): HTMLElement[] {
+const HEADING = ':scope > .view-content h1[tabindex="-1"]';
+
+/**
+ * Where the focus goes when a dialog closes and the control that opened it is gone (an error
+ * panel's action that cleared the panel, a screen that re-rendered, a WKWebView button, which
+ * never takes the focus on a click): the page heading of the view the dialog belongs to (`.view`
+ * > `.view-content`), never <body>, where the next Tab starts over from the title bar. An app
+ * dialog's host holds the views themselves (`.shell-body`, D.3e review #12): its view is the one
+ * shown — <Activity> hides the others with `display: none`.
+ */
+function headingOf(host: Element | null | undefined): HTMLElement | null {
+  if (host === null || host === undefined) return null;
+  const own = host.querySelector<HTMLElement>(HEADING);
+  if (own !== null) return own;
+  const shown = [...host.querySelectorAll<HTMLElement>(':scope > .view')].find(
+    (view) => getComputedStyle(view).display !== 'none',
+  );
+  return shown?.querySelector<HTMLElement>(HEADING) ?? null;
+}
+
+/** Inside an `inert` subtree: an engine gives it no focus and no input. */
+const isInert = (element: Element) => element.closest('[inert]') !== null;
+
+/**
+ * The topmost other dialog still open: where the focus goes when a dialog closes and its opener
+ * is gone or sits behind another dialog — a view's form whose reads came back while an app
+ * overlay covered the view opens under it, and closing that overlay leaves its own opener under
+ * the form (D.3e review #13). The last in the document: the app's overlays follow the views, and
+ * a view's or the app's later overlay follows an earlier one. Its first control, else its panel.
+ */
+function topDialog(own: Element | null): HTMLElement | null {
+  const open = [...document.querySelectorAll<HTMLElement>('.modal-layer > [role="dialog"]')].filter(
+    (panel) => !own?.contains(panel),
+  );
+  const top = open.at(-1);
+  if (top === undefined) return null;
+  const body = top.querySelector<HTMLElement>('[data-modal-body]');
+  return focusables(body)[0] ?? focusables(top)[0] ?? top;
+}
+
+const isRadio = (element: Element): element is HTMLInputElement =>
+  element instanceof HTMLInputElement && element.type === 'radio';
+
+/**
+ * The Tab stops inside `root`, in order. A radio group is one stop, as a browser tabs through it:
+ * its checked radio, or its first enabled one when none is checked (review #15) — so the trap's
+ * first and last are the stops the browser really moves between. Exported for the Wizard frame,
+ * which starts a step's focus at its first stop.
+ */
+export function focusables(root: HTMLElement | null): HTMLElement[] {
   if (root === null) return [];
-  return [...root.querySelectorAll<HTMLElement>(FOCUSABLE)].filter(
+  const all = [...root.querySelectorAll<HTMLElement>(FOCUSABLE)].filter(
     (element) =>
       element.getAttribute('tabindex') !== '-1' &&
       !(element instanceof HTMLButtonElement && element.disabled),
   );
+  const stopOf = new Map<string, HTMLInputElement>();
+  for (const element of all) {
+    if (!isRadio(element) || element.name === '') continue;
+    const stop = stopOf.get(element.name);
+    if (stop === undefined || (element.checked && !stop.checked)) stopOf.set(element.name, element);
+  }
+  return all.filter(
+    (element) => !isRadio(element) || element.name === '' || stopOf.get(element.name) === element,
+  );
+}
+
+/** Set on an element the trap made a Tab stop because it scrolls ([markScrollStops]). */
+const SCROLL_STOP = 'data-scroll-stop';
+
+const scrollable = (overflow: string) => overflow === 'auto' || overflow === 'scroll';
+
+/** `element` scrolls: its content overflows its box on an axis it lets scroll. */
+function scrolls(element: HTMLElement): boolean {
+  const y = element.scrollHeight > element.clientHeight;
+  const x = element.scrollWidth > element.clientWidth;
+  if (!y && !x) return false;
+  const style = getComputedStyle(element);
+  return (y && scrollable(style.overflowY)) || (x && scrollable(style.overflowX));
+}
+
+/**
+ * A scroll container with no Tab stop of its own is a Tab stop: Chromium makes it one, so a
+ * keyboard can scroll it (keyboard-focusable scrollers, Chromium 130 and later, WebView2 among
+ * them), and WebKit does not — the toolchain with every tool found is such a body, its rows
+ * holding no control. Left to the engines, the trap would not list it: on Chromium Tab from it
+ * went back to the start, and the footer was never reached. So before every Tab the trap gives
+ * each such element in `panel` `tabindex="0"` (marked as its own), and takes it from one that no
+ * longer is: the browser and the trap then agree on the stops, on every engine. An element whose
+ * tabindex the page set keeps it.
+ */
+function markScrollStops(panel: HTMLElement): void {
+  for (const element of panel.querySelectorAll<HTMLElement>('*')) {
+    const marked = element.hasAttribute(SCROLL_STOP);
+    if (!marked && element.hasAttribute('tabindex')) continue;
+    const stop = scrolls(element) && focusables(element).length === 0;
+    if (stop && !marked) {
+      element.setAttribute('tabindex', '0');
+      element.setAttribute(SCROLL_STOP, '');
+    } else if (!stop && marked && element !== document.activeElement) {
+      element.removeAttribute('tabindex');
+      element.removeAttribute(SCROLL_STOP);
+    }
+  }
 }
 
 export interface ModalFrameProps {
@@ -45,7 +144,12 @@ export interface ModalFrameProps {
 /**
  * The behaviour every overlay shares: focus moves in (to the first control of the body, else the
  * first control, else the panel), Tab and Shift+Tab wrap inside, Esc closes, the background is
- * inert, and on close the focus returns to where it was.
+ * inert, and on close the focus returns to where it was — or, that control gone or behind a
+ * dialog, to the topmost dialog still open, else its view's page heading. A dialog that opens
+ * under another's layer gets the focus when that one closes. A control that goes while it has
+ * the focus (a Cancel its run's end removes) leaves it on the panel, never on the page, where Esc
+ * no longer reaches the dialog (review #7); a frame with a better place for it (the Wizard's
+ * step) moves it on from there.
  */
 export function ModalFrame({
   labelledBy,
@@ -66,8 +170,12 @@ export function ModalFrame({
   };
 
   useLayoutEffect(() => {
-    const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const opener =
+      document.activeElement instanceof HTMLElement && document.activeElement !== document.body
+        ? document.activeElement
+        : null;
     const own = layerRef.current;
+    const host = own?.parentElement;
     const madeInert: Element[] = [];
     for (const sibling of own?.parentElement?.children ?? []) {
       // A live region (the toasts) stays live: what it announces must be heard over the dialog
@@ -79,12 +187,28 @@ export function ModalFrame({
     }
     const panel = panelRef.current;
     const body = panel?.querySelector<HTMLElement>('[data-modal-body]') ?? null;
+    // Opened under another dialog's layer (a view's form under an app overlay), it gets no focus
+    // here — no engine focuses an element under [inert] — and that dialog hands it over when it
+    // closes (below).
     (focusables(body)[0] ?? focusables(panel)[0] ?? panel)?.focus();
     return () => {
       for (const element of madeInert) element.removeAttribute('inert');
-      if (opener?.isConnected) opener.focus();
+      // Its opener, while it is there to take the focus; else a dialog still open, else the
+      // page heading of its view.
+      const back = opener?.isConnected && !isInert(opener) ? opener : null;
+      (back ?? topDialog(own ?? null) ?? headingOf(host))?.focus();
     };
   }, []);
+
+  // After every render: the focus fell out of the dialog onto the page (the control that had it
+  // went). Not while another dialog covers this one: that one has the focus.
+  useLayoutEffect(() => {
+    const active = document.activeElement;
+    if (active !== null && active !== document.body && active.isConnected) return;
+    const panel = panelRef.current;
+    if (panel === null || !panel.isConnected || layerRef.current?.closest('[inert]')) return;
+    panel.focus();
+  });
 
   const onKeyDown = (event: KeyboardEvent) => {
     if (event.key === 'Escape') {
@@ -93,18 +217,34 @@ export function ModalFrame({
       return;
     }
     if (event.key !== 'Tab') return;
-    const items = focusables(panelRef.current);
+    const panel = panelRef.current;
+    if (panel === null) return;
+    markScrollStops(panel);
+    const items = focusables(panel);
     const first = items[0];
     const last = items.at(-1);
     if (first === undefined || last === undefined) {
       event.preventDefault();
       return;
     }
-    const inside = items.includes(document.activeElement as HTMLElement);
-    if (event.shiftKey && (!inside || document.activeElement === first)) {
+    const active = document.activeElement;
+    if (!(active instanceof HTMLElement) || !items.includes(active)) {
+      // Not a stop of the list: the panel (a lost focus parked there), a heading the focus was
+      // moved to, or outside. Tab goes on from where it is in the document, or wraps.
+      event.preventDefault();
+      const inPanel = active instanceof HTMLElement && panel.contains(active);
+      const follows = (item: HTMLElement) =>
+        inPanel && (active.compareDocumentPosition(item) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+      const next = event.shiftKey
+        ? (items.filter((item) => inPanel && !follows(item) && item !== active).at(-1) ?? last)
+        : (items.find(follows) ?? first);
+      next.focus();
+      return;
+    }
+    if (event.shiftKey && active === first) {
       event.preventDefault();
       last.focus();
-    } else if (!event.shiftKey && (!inside || document.activeElement === last)) {
+    } else if (!event.shiftKey && active === last) {
       event.preventDefault();
       first.focus();
     }

@@ -61,7 +61,7 @@ use std::io::Write;
 use std::path::Path;
 
 use cli_core::manifest::{self, InfrastructureManifest};
-use cli_core::secrets::{decrypt_with_identity, default_age_key_path, load_or_create_identity};
+use cli_core::secrets::default_age_key_path;
 use cli_core::target::load_active_target_config;
 use cli_core::{CliError, Result};
 use cli_providers::k8s::{
@@ -74,6 +74,7 @@ use cli_state::State;
 use tempfile::NamedTempFile;
 use tracing::{info, warn};
 
+use crate::commands::age_cache;
 use crate::commands::state_paths::resolve_state_paths;
 
 /// Per-step timeouts. Generous enough that the loop survives a
@@ -278,7 +279,9 @@ pub(crate) fn run_with<H: HelmRunner, K: KubectlRunner>(
         )
     })?;
 
-    let plaintext = decrypt_cached_kubeconfig(&hetzner)?;
+    // A read: the age key is never created here (GOTCHA-120).
+    let plaintext =
+        age_cache::cached_kubeconfig(&hetzner, &resolved.target_name, &default_age_key_path())?;
     let kubeconfig_file = write_tempfile_with("apprafter-kubeconfig-", &plaintext)?;
 
     // Consult the target for its tier hint. Previously the store
@@ -1304,19 +1307,6 @@ fn platform_stack_version() -> String {
     cli_providers::k8s::resolve_latest_platform_stack_version()
 }
 
-fn decrypt_cached_kubeconfig(hetzner: &cli_state::HetznerCloudState) -> Result<String> {
-    if let Some(armored) = &hetzner.kubeconfig_age {
-        let identity = load_or_create_identity(&default_age_key_path())?;
-        return decrypt_with_identity(armored, &identity);
-    }
-    if let Some(plain) = &hetzner.kubeconfig_yaml {
-        return Ok(plain.clone());
-    }
-    Err(CliError::Other(
-        "no cached kubeconfig in state; run `apprafter kubeconfig` first".to_string(),
-    ))
-}
-
 fn write_tempfile_with(prefix: &str, contents: &str) -> Result<NamedTempFile> {
     let mut f = tempfile::Builder::new()
         .prefix(prefix)
@@ -2203,43 +2193,6 @@ mod tests {
     }
 
     #[test]
-    fn decrypt_cached_kubeconfig_prefers_age_then_falls_back_to_plaintext() {
-        let hetzner = cli_state::HetznerCloudState {
-            server_id: 1,
-            server_name: "n".into(),
-            server_type: None,
-            ssh_key_ids: vec![],
-            network_id: None,
-            firewall_id: None,
-            floating_ip_ids: vec![],
-            kubeconfig_yaml: Some("apiVersion: v1\nfrom: legacy\n".into()),
-            kubeconfig_age: None,
-            argocd_admin_password_age: None,
-        };
-        let out = decrypt_cached_kubeconfig(&hetzner).unwrap();
-        assert!(out.contains("from: legacy"), "{out}");
-    }
-
-    #[test]
-    fn decrypt_cached_kubeconfig_errors_when_neither_field_set() {
-        let hetzner = cli_state::HetznerCloudState {
-            server_id: 1,
-            server_name: "n".into(),
-            server_type: None,
-            ssh_key_ids: vec![],
-            network_id: None,
-            firewall_id: None,
-            floating_ip_ids: vec![],
-            kubeconfig_yaml: None,
-            kubeconfig_age: None,
-            argocd_admin_password_age: None,
-        };
-        let err = decrypt_cached_kubeconfig(&hetzner).unwrap_err();
-        let msg = format!("{err:?}");
-        assert!(msg.contains("kubeconfig"), "{msg}");
-    }
-
-    #[test]
     fn step_5_ssa_applies_platformstack_with_loader_field_manager() {
         let helm = FakeHelm::default();
         let kubectl = FakeKubectl::default();
@@ -2684,7 +2637,7 @@ mod tests {
             .expect("save target");
 
             // Plaintext kubeconfig, not the age-encrypted field: the
-            // plaintext branch of `decrypt_cached_kubeconfig` needs no
+            // plaintext branch of `age_cache::cached_kubeconfig` needs no
             // key material, so the fixture never touches the operator's
             // real `~/.config/apprafter/age.key`.
             let state = State {

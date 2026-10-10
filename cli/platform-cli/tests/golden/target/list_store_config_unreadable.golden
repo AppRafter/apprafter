@@ -1,0 +1,34 @@
+$ apprafter target list
+[exit 1]
+[stdout]
+[stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m target list invoked
+Error: apprafter::target::invalid_config
+
+  × target config at <SANDBOX>/apprafter-config/config.yaml:
+  │ active_target: invalid type: sequence, expected a string at line 1 column
+  │ 16
+  help: <SANDBOX>/apprafter-config/config.yaml could not be read as the
+        target store's configuration: it was edited by hand or written by an
+        incompatible CLI version. Fix it by hand (it is a small YAML file), or
+        restore it from a backup. It records only which target is the default,
+        so deleting it and choosing the default again with `apprafter target
+        use <name>` works too.
+
+$ apprafter target use prod
+[exit 1]
+[stdout]
+[stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m target use invoked <ESC>[3mtarget<ESC>[0m<ESC>[2m=<ESC>[0mprod
+Error: apprafter::target::invalid_config
+
+  × target config at <SANDBOX>/apprafter-config/config.yaml:
+  │ active_target: invalid type: sequence, expected a string at line 1 column
+  │ 16
+  help: <SANDBOX>/apprafter-config/config.yaml could not be read as the
+        target store's configuration: it was edited by hand or written by an
+        incompatible CLI version. Fix it by hand (it is a small YAML file), or
+        restore it from a backup. It records only which target is the default,
+        so deleting it and choosing the default again with `apprafter target
+        use <name>` works too.
+

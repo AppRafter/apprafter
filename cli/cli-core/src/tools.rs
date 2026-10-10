@@ -4,7 +4,7 @@
 //!
 //! # Why this exists
 //!
-//! The CLI spawns `restic`, `kubectl`, `helm`, `git` and `ssh`. When one
+//! The CLI spawns `restic`, `kubectl`, `helm`, `git`, `ssh` and `cue`. When one
 //! is missing the spawn fails with `os error 2`, and the audit recorded
 //! as D11 in `docs/measurements/day2-followups.md` found that the check
 //! for it runs *after* the expensive part of the command in eight
@@ -62,8 +62,14 @@ pub struct Tool {
     /// What the CLI uses it for — one clause, lowercase, no trailing
     /// stop. Rendered as "`{name}` is required by `{needed_by}`".
     pub purpose: &'static str,
-    /// Platform-agnostic install guidance, already wrapped.
+    /// Platform-agnostic install guidance, already wrapped: exactly
+    /// [`render_install`] of [`Tool::install_header`] and [`Tool::hints`]
+    /// (a unit test pins it), kept as text because the CLI prints it.
     pub install: &'static str,
+    /// The first line of [`Tool::install`], e.g. `"Install helm:"`.
+    pub install_header: &'static str,
+    /// The per-system lines of [`Tool::install`], in print order.
+    pub hints: &'static [InstallLine],
     /// Whether the CLI's core path is unusable without it.
     ///
     /// Only `kubectl` is `true`: every cluster-facing command spawns it,
@@ -76,9 +82,12 @@ pub struct Tool {
     /// This distinction is what `doctor` reports on; D11's complaint was
     /// that a missing `kubectl` printed "Ready to go" and exited 0.
     pub required: bool,
-    /// Arguments that make the tool print its version. `ssh -V` writes
-    /// to stderr and some tools exit non-zero, which `check_tool`
-    /// tolerates — any output at all counts as present.
+    /// Arguments that make the tool print its version, exiting 0 when the
+    /// tool works (`ssh -V` writes to stderr). The core's resolver
+    /// (`apprafter_core::tools::ToolResolver::probe`, which `doctor` uses)
+    /// takes the first line of a run that exited 0 as the version, and
+    /// reports any other run as having none, with the tool's own first line
+    /// as the reason: a shim with no version set prints an error and fails.
     ///
     /// PRESENCE ONLY. The version is asked for and then thrown away:
     /// nothing here declares or compares a minimum, and `RESTIC`'s
@@ -93,6 +102,48 @@ pub struct Tool {
     pub version_args: &'static [&'static str],
 }
 
+/// Which system an install line is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallOs {
+    Windows,
+    Macos,
+    Debian,
+    Arch,
+    Nix,
+    Other,
+}
+
+impl InstallOs {
+    /// The label printed before the line, e.g. `macOS`.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Windows => "Windows",
+            Self::Macos => "macOS",
+            Self::Debian => "Debian",
+            Self::Arch => "Arch",
+            Self::Nix => "Nix",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// One install line: a command, a URL, or "preinstalled".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InstallLine {
+    pub os: InstallOs,
+    pub text: &'static str,
+}
+
+/// `header`, then one `  • <label padded to 10> <text>` line per hint — the text `install`
+/// carries and the CLI prints.
+pub fn render_install(header: &str, hints: &[InstallLine]) -> String {
+    let mut out = header.to_string();
+    for h in hints {
+        out.push_str(&format!("\n  • {:<10} {}", h.os.label(), h.text));
+    }
+    out
+}
+
 /// Restic — every backup and restore path.
 pub const RESTIC: Tool = Tool {
     name: "restic",
@@ -102,7 +153,35 @@ pub const RESTIC: Tool = Tool {
               • Debian     apt install restic\n  \
               • Arch       pacman -S restic\n  \
               • Nix        nix profile install nixpkgs#restic\n  \
+              • Windows    winget install restic.restic\n  \
               • other      https://restic.readthedocs.io/en/stable/020_installation.html",
+    install_header: "Install restic (>= 0.14):",
+    hints: &[
+        InstallLine {
+            os: InstallOs::Macos,
+            text: "brew install restic",
+        },
+        InstallLine {
+            os: InstallOs::Debian,
+            text: "apt install restic",
+        },
+        InstallLine {
+            os: InstallOs::Arch,
+            text: "pacman -S restic",
+        },
+        InstallLine {
+            os: InstallOs::Nix,
+            text: "nix profile install nixpkgs#restic",
+        },
+        InstallLine {
+            os: InstallOs::Windows,
+            text: "winget install restic.restic",
+        },
+        InstallLine {
+            os: InstallOs::Other,
+            text: "https://restic.readthedocs.io/en/stable/020_installation.html",
+        },
+    ],
     required: false,
     version_args: &["version"],
 };
@@ -115,7 +194,31 @@ pub const KUBECTL: Tool = Tool {
               • macOS      brew install kubectl\n  \
               • Debian     apt install kubectl\n  \
               • Nix        nix profile install nixpkgs#kubectl\n  \
+              • Windows    winget install Kubernetes.kubectl\n  \
               • other      https://kubernetes.io/docs/tasks/tools/",
+    install_header: "Install kubectl:",
+    hints: &[
+        InstallLine {
+            os: InstallOs::Macos,
+            text: "brew install kubectl",
+        },
+        InstallLine {
+            os: InstallOs::Debian,
+            text: "apt install kubectl",
+        },
+        InstallLine {
+            os: InstallOs::Nix,
+            text: "nix profile install nixpkgs#kubectl",
+        },
+        InstallLine {
+            os: InstallOs::Windows,
+            text: "winget install Kubernetes.kubectl",
+        },
+        InstallLine {
+            os: InstallOs::Other,
+            text: "https://kubernetes.io/docs/tasks/tools/",
+        },
+    ],
     required: true,
     version_args: &["version", "--client"],
 };
@@ -128,7 +231,31 @@ pub const HELM: Tool = Tool {
               • macOS      brew install helm\n  \
               • Debian     apt install helm\n  \
               • Nix        nix profile install nixpkgs#kubernetes-helm\n  \
+              • Windows    winget install Helm.Helm\n  \
               • other      https://helm.sh/docs/intro/install/",
+    install_header: "Install helm:",
+    hints: &[
+        InstallLine {
+            os: InstallOs::Macos,
+            text: "brew install helm",
+        },
+        InstallLine {
+            os: InstallOs::Debian,
+            text: "apt install helm",
+        },
+        InstallLine {
+            os: InstallOs::Nix,
+            text: "nix profile install nixpkgs#kubernetes-helm",
+        },
+        InstallLine {
+            os: InstallOs::Windows,
+            text: "winget install Helm.Helm",
+        },
+        InstallLine {
+            os: InstallOs::Other,
+            text: "https://helm.sh/docs/intro/install/",
+        },
+    ],
     required: false,
     version_args: &["version", "--short"],
 };
@@ -141,7 +268,31 @@ pub const GIT: Tool = Tool {
               • macOS      xcode-select --install\n  \
               • Debian     apt install git\n  \
               • Nix        nix profile install nixpkgs#git\n  \
+              • Windows    winget install Git.Git\n  \
               • other      https://git-scm.com/downloads",
+    install_header: "Install git:",
+    hints: &[
+        InstallLine {
+            os: InstallOs::Macos,
+            text: "xcode-select --install",
+        },
+        InstallLine {
+            os: InstallOs::Debian,
+            text: "apt install git",
+        },
+        InstallLine {
+            os: InstallOs::Nix,
+            text: "nix profile install nixpkgs#git",
+        },
+        InstallLine {
+            os: InstallOs::Windows,
+            text: "winget install Git.Git",
+        },
+        InstallLine {
+            os: InstallOs::Other,
+            text: "https://git-scm.com/downloads",
+        },
+    ],
     required: false,
     version_args: &["--version"],
 };
@@ -153,7 +304,27 @@ pub const SSH: Tool = Tool {
     install: "Install an OpenSSH client:\n  \
               • macOS      preinstalled\n  \
               • Debian     apt install openssh-client\n  \
-              • Nix        nix profile install nixpkgs#openssh",
+              • Nix        nix profile install nixpkgs#openssh\n  \
+              • Windows    built into Windows 10/11: Settings › Optional features › OpenSSH Client",
+    install_header: "Install an OpenSSH client:",
+    hints: &[
+        InstallLine {
+            os: InstallOs::Macos,
+            text: "preinstalled",
+        },
+        InstallLine {
+            os: InstallOs::Debian,
+            text: "apt install openssh-client",
+        },
+        InstallLine {
+            os: InstallOs::Nix,
+            text: "nix profile install nixpkgs#openssh",
+        },
+        InstallLine {
+            os: InstallOs::Windows,
+            text: "built into Windows 10/11: Settings › Optional features › OpenSSH Client",
+        },
+    ],
     required: false,
     version_args: &["-V"],
 };
@@ -164,7 +335,44 @@ pub const SSH: Tool = Tool {
 /// own, so a new dependency cannot be added without appearing there —
 /// the gap D11 recorded, where `restic` had eight spawn sites, was fatal
 /// on all of them, and was checked nowhere.
-pub const ALL: &[Tool] = &[RESTIC, KUBECTL, HELM, GIT, SSH];
+pub const ALL: &[Tool] = &[RESTIC, KUBECTL, HELM, GIT, SSH, CUE];
+
+/// cue — `app validate`, which checks an application manifest locally.
+pub const CUE: Tool = Tool {
+    name: "cue",
+    purpose: "validating application manifests",
+    install: "Install cue:\n  \
+              • macOS      brew install cue\n  \
+              • Arch       pacman -S cue\n  \
+              • Nix        nix profile install nixpkgs#cue\n  \
+              • Windows    winget install CueLang.Cue\n  \
+              • other      https://cuelang.org/docs/introduction/installation/",
+    install_header: "Install cue:",
+    hints: &[
+        InstallLine {
+            os: InstallOs::Macos,
+            text: "brew install cue",
+        },
+        InstallLine {
+            os: InstallOs::Arch,
+            text: "pacman -S cue",
+        },
+        InstallLine {
+            os: InstallOs::Nix,
+            text: "nix profile install nixpkgs#cue",
+        },
+        InstallLine {
+            os: InstallOs::Windows,
+            text: "winget install CueLang.Cue",
+        },
+        InstallLine {
+            os: InstallOs::Other,
+            text: "https://cuelang.org/docs/introduction/installation/",
+        },
+    ],
+    required: false,
+    version_args: &["version"],
+};
 
 /// The file names `name` may have on disk: itself on Unix; on Windows
 /// `name.exe` when `name` has no `.` in it, else `name` as given. That is
@@ -399,6 +607,80 @@ mod tests {
     }
 
     #[test]
+    fn the_install_text_is_the_rendering_of_header_and_hints() {
+        for t in ALL {
+            assert_eq!(
+                t.install,
+                render_install(t.install_header, t.hints),
+                "`{}`",
+                t.name
+            );
+        }
+    }
+
+    #[test]
+    fn render_install_aligns_the_os_labels() {
+        let lines = [
+            InstallLine {
+                os: InstallOs::Macos,
+                text: "brew install x",
+            },
+            InstallLine {
+                os: InstallOs::Other,
+                text: "https://x",
+            },
+        ];
+        assert_eq!(
+            render_install("Install x:", &lines),
+            "Install x:\n  • macOS      brew install x\n  • other      https://x"
+        );
+    }
+
+    #[test]
+    fn every_tool_names_its_windows_install() {
+        // winget ids verified against microsoft/winget-pkgs manifests on 2026-10-09
+        // (manifests/{r/restic/restic,k/Kubernetes/kubectl,h/Helm/Helm,g/Git/Git,c/CueLang/Cue});
+        // a wrong id would be a published wrong instruction.
+        let expected = [
+            ("restic", "winget install restic.restic"),
+            ("kubectl", "winget install Kubernetes.kubectl"),
+            ("helm", "winget install Helm.Helm"),
+            ("git", "winget install Git.Git"),
+            (
+                "ssh",
+                "built into Windows 10/11: Settings › Optional features › OpenSSH Client",
+            ),
+            ("cue", "winget install CueLang.Cue"),
+        ];
+        assert_eq!(ALL.len(), expected.len());
+        for (tool, (name, line)) in ALL.iter().zip(expected) {
+            assert_eq!(tool.name, name);
+            let windows: Vec<&str> = tool
+                .hints
+                .iter()
+                .filter(|h| h.os == InstallOs::Windows)
+                .map(|h| h.text)
+                .collect();
+            assert_eq!(windows, vec![line], "`{}`", tool.name);
+            assert!(
+                tool.install.contains(&format!("• Windows    {line}")),
+                "`{}` install text lacks its Windows line:\n{}",
+                tool.name,
+                tool.install
+            );
+        }
+    }
+
+    #[test]
+    fn cue_is_checked_last_and_is_optional() {
+        // The doctor row order is ALL's order: restic, kubectl, helm, git, ssh, cue (overview §3.9).
+        assert_eq!(ALL.last(), Some(&CUE));
+        // Checked when the test compiles: a `required` cue would fail the build of the tests.
+        const { assert!(!CUE.required, "only `app validate` needs cue") };
+        assert_eq!(CUE.version_args, &["version"]);
+    }
+
+    #[test]
     fn a_missing_tool_names_the_command_that_needed_it() {
         // The failure the whole module exists for: the reader must
         // learn which command they typed is blocked, not which
@@ -408,6 +690,8 @@ mod tests {
                 name: "definitely-not-a-real-binary-9f3a",
                 purpose: "a test",
                 install: "install it",
+                install_header: "",
+                hints: &[],
                 required: true,
                 version_args: &["--version"],
             },
@@ -463,7 +747,7 @@ mod tests {
         // fatal on all of them, and appeared in no checked list. If a
         // new binary is introduced, it belongs here before it is spawned.
         let names: Vec<&str> = ALL.iter().map(|t| t.name).collect();
-        for expected in ["restic", "kubectl", "helm", "git", "ssh"] {
+        for expected in ["restic", "kubectl", "helm", "git", "ssh", "cue"] {
             assert!(names.contains(&expected), "`{expected}` missing from ALL");
         }
     }

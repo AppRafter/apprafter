@@ -10,28 +10,26 @@ Error: apprafter::target::token_rejected
       
         × hetzner-cloud GET <HCLOUD>/v1/locations failed (status
         │ 401): unauthorized: unable to authenticate
-        help: The Hetzner Cloud API returned a non-2xx response. Common
-              causes:
-              • 401 unauthorized — the stored API token was rotated or
-              revoked. Run `apprafter target add <name> --renew --token <new>`
-              to refresh it.
-              • 403 forbidden — the token's project lacks permission for this
-              resource type.
-              • 429 rate limit — back off and retry; if persistent, the
-              project may need a quota increase.
-              • 5xx — provider-side outage; check https://status.hetzner.com/.
+        help: The Hetzner Cloud API refused the request:
+              • 401 unauthorized — the token is wrong, or it was revoked or
+              rotated. For a target's stored token, `apprafter target add
+              <name> --renew --token <new>` replaces it; an `HCLOUD_TOKEN` in
+              the environment outranks the stored token.
+              • 403 forbidden — the token lacks Read & Write (it is Read-
+              only), or the project forbids the call, for example at one of
+              its limits.
+              • 429 rate limit — too many requests: wait, then try again.
+              • 5xx — an outage at the provider; check https://
+              status.hetzner.com/.
               Re-run `apprafter doctor` to confirm reachability after fixing
               the root cause.
       
-  help: The provider's read-only credential check returned 401 / unauthorized.
-        Either the token was mistyped, never had the right scopes, or has been
-        rotated / revoked since you copied it.
-        • Verify the token at https://console.hetzner.cloud/projects →
-        Security → API Tokens. It must say `Read & Write` next to the project.
-        • Copy the token again (it's 64 ASCII chars, no prefix) — common
-        cause: trailing newline from a clipboard manager.
+  help: The provider's read-only credential check returned 401 unauthorized:
+        the token was mistyped, or it was revoked or rotated, or its project
+        was deleted.
+        • A token is shown only once, when it is created: paste it again from
+        where you saved it, or create a new one with Read & Write permission
+        in the Hetzner Console (open the project, then Security → API tokens).
         • If you're rotating, run `apprafter target add <name> --renew --token
         <new>` instead of re-creating the target.
-        • Pass `--no-ping` to skip the check if you're seeding a target
-        offline (CI sandbox, intermittent network).
 

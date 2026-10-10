@@ -1,0 +1,15 @@
+$ apprafter target ip
+[exit 1]
+[stdout]
+[stderr]
+Error: apprafter::target::server_missing
+
+  × the server recorded for `prod` (id 42) no longer exists at the provider
+  help: Check the Hetzner Console for the cause. If the server was deleted,
+        `apprafter up --target prod` provisions a replacement and records it.
+        If the token belongs to another Hetzner project, `apprafter target add
+        prod --renew --token <X>` stores one from the server's project (an
+        `HCLOUD_TOKEN` in the environment outranks the stored token). If the
+        cluster's server was recreated under a new id, `apprafter import
+        --force --target prod` records it.
+

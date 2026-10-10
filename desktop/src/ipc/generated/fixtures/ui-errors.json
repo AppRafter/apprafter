@@ -1,0 +1,68 @@
+{
+  "hetzner401": {
+    "causes": [],
+    "code": "apprafter::provider::hetzner_api_error",
+    "fields": {
+      "apiCode": "unauthorized",
+      "endpoint": "GET /v1/locations",
+      "status": 401
+    },
+    "help": "The Hetzner Cloud API refused the request:\n• 401 unauthorized — the token is wrong, or it was revoked or rotated: use a current one.\n• 403 forbidden — the token lacks Read & Write (it is Read-only), or the project forbids the call, for example at one of its limits.\n• 429 rate limit — too many requests: wait, then try again.\n• 5xx — an outage at the provider; check https://status.hetzner.com/.",
+    "message": "hetzner-cloud GET /v1/locations failed (status 401): unauthorized: unable to authenticate"
+  },
+  "hetzner403": {
+    "causes": [],
+    "code": "apprafter::provider::hetzner_api_error",
+    "fields": {
+      "apiCode": "forbidden",
+      "endpoint": "GET /v1/locations",
+      "status": 403
+    },
+    "help": "The Hetzner Cloud API refused the request:\n• 401 unauthorized — the token is wrong, or it was revoked or rotated: use a current one.\n• 403 forbidden — the token lacks Read & Write (it is Read-only), or the project forbids the call, for example at one of its limits.\n• 429 rate limit — too many requests: wait, then try again.\n• 5xx — an outage at the provider; check https://status.hetzner.com/.",
+    "message": "hetzner-cloud GET /v1/locations failed (status 403): forbidden: insufficient permissions"
+  },
+  "serverTypeUnavailable": {
+    "causes": [],
+    "code": "apprafter::provider::server_type_unavailable",
+    "fields": {
+      "context": "target_add",
+      "kind": "retired",
+      "location": "nbg1",
+      "requested": "cx22"
+    },
+    "help": "Hetzner no longer sells `cx22`; pick another type. Nothing was saved.",
+    "message": "server type `cx22` is unavailable in region `nbg1`: retired (no longer orderable)\n  cpx22"
+  },
+  "targetExists": {
+    "causes": [],
+    "code": "apprafter::target::exists",
+    "fields": {
+      "name": "prod"
+    },
+    "help": null,
+    "message": "target `prod` already exists"
+  },
+  "tokenRejected": {
+    "causes": [
+      "hetzner-cloud GET /v1/locations failed (status 401): unauthorized: unable to authenticate"
+    ],
+    "code": "apprafter::target::token_rejected",
+    "fields": {
+      "provider": "hetzner-cloud",
+      "status": 401
+    },
+    "help": "The provider did not accept this token (401 unauthorized): it was mistyped, or it was revoked or rotated, or its project was deleted. A token is shown only once, when it is created: paste it again from where you saved it, or create a new one with Read & Write permission in the Hetzner Console (open the project, then Security → API tokens).",
+    "message": "provider `hetzner-cloud` rejected the supplied token"
+  },
+  "toolNotFound": {
+    "causes": [],
+    "code": "apprafter::env::tool_not_found",
+    "fields": {
+      "neededBy": "doctor",
+      "purpose": "talks to the cluster",
+      "tool": "kubectl"
+    },
+    "help": "Install kubectl.\n\nNothing was sent anywhere and no credential was used: this check runs before any work starts, so trying again after installing is safe.",
+    "message": "`kubectl` is required by `doctor` (talks to the cluster) but is not on PATH"
+  }
+}

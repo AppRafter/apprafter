@@ -287,16 +287,15 @@ Error: apprafter::provider::server_type_not_selected
         • interactive: `apprafter target machine` (opens the machine picker)
         • non-interactive / CI: `--server-type <sku>` or
         `APPRAFTER_SERVER_TYPE`
-        • declaratively: set `nodes[0].kind` in your Infrastructure manifest
+        • declaratively: set `spec.nodes[0].type` in your Infrastructure
+        manifest
 ```
 
-Two things about that message are worth knowing. The manifest field it
-names is written `type:` in the file — `spec.nodes[0].type`, as in the
-example above. And the check fires **only when a machine is about to be
-created**: `apprafter apply` against a cluster that already exists
-reconciles the firewall, the network and the kubeconfig without needing a
-type at all, which is why upgrading the CLI never breaks a running
-cluster.
+The manifest field it names is the one in the example above. The check
+fires **only when a machine is about to be created**: `apprafter apply`
+against a cluster that already exists reconciles the firewall, the
+network and the kubeconfig without needing a type at all, which is why
+upgrading the CLI never breaks a running cluster.
 
 Before the failing run, `apply` says the same thing in one line:
 
@@ -350,19 +349,26 @@ argocd-password` fetch again.
 
 There is no in-place resize. `apprafter target machine` refuses outright
 once the target has a provisioned cluster, rather than saving a
-preference that would never take effect:
+preference that would never take effect, and so does `apprafter target
+add --force` given a different `--region` or `--server-type`:
 
 ```text
-Error: apprafter::cli::other
+Error: apprafter::target::provisioned
 
-  × `<name>` already runs a provisioned cluster — its machine type cannot be
-  │ changed in place. To move to a different machine, rebuild from a backup:
-  │
-  │     apprafter backup create
-  │     apprafter restore --reprovision --server-type <sku>
-  │
-  │ (`target machine` only sets the type on a target that has NOT provisioned
-  │ yet.)
+  × target `<name>` has a provisioned server (`<server>`, id <id>), so its
+  │ machine or region cannot change
+  help: There is no in-place resize: rebuild from a backup on a new machine.
+        `destroy` deletes every `apprafter=true` resource in the token's
+        Hetzner project, not only this cluster: read the operator guide's
+        "Moving to a bigger machine" first.
+
+            apprafter target use <name>
+            apprafter backup create --repo <repo>
+            apprafter destroy --yes
+            apprafter restore <repo> --reprovision --server-type <sku>
+
+        (`target machine` and `target add --force` change the machine only on
+        a target that has not provisioned yet.)
 ```
 
 

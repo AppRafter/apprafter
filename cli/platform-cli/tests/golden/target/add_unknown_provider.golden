@@ -1,0 +1,11 @@
+$ apprafter target add prod --provider aws --token aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --no-ping --no-interactive
+[exit 1]
+[stdout]
+[stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m target add invoked <ESC>[3mtarget<ESC>[0m<ESC>[2m=<ESC>[0mprod <ESC>[3mrenew<ESC>[0m<ESC>[2m=<ESC>[0mfalse <ESC>[3mforce<ESC>[0m<ESC>[2m=<ESC>[0mfalse
+Error: apprafter::target::unknown_provider
+
+  × provider `aws` is not supported (supported: hetzner-cloud)
+  help: Supported providers: hetzner-cloud. Pass one of them with
+        `--provider`.
+

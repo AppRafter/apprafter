@@ -200,12 +200,12 @@ server-side regardless.
 | `apprafter` CLI | **Always** | see [Install](#install). |
 | `kubectl` ≥ 1.29 | **Always** | the CLI spawns it for every cluster-facing command; `apprafter doctor` checks it. |
 | `helm` ≥ 3 | **Always** | spawned by `cluster-bootstrap` (step 1) to install the Argo CD loader; `apprafter doctor` checks it. |
-| Hetzner Cloud API token | **Always (Tier 1)** | create one in the Hetzner Cloud console. |
+| Hetzner Cloud API token | **Always (Tier 1)** | create one, with Read & Write permission, in the Hetzner Console (open the project, then Security → API tokens). |
 | SSH public key | **Always (Tier 1)** | injected into the node for break-glass access. |
 | Docker ≥ 24 | To ship **your own** app | builds and pushes the container image (step 3). |
 | A container registry | To ship **your own** app | e.g. GHCR — where the image lives. See [private repos & registries](./private-repos-and-registries.md). |
 | Domain + Cloudflare account | **Public HTTPS only** | step 5 — skip it if you only want to evaluate. |
-| `cue` ≥ 0.10 | _Optional_ | only for `apprafter app validate` locally. |
+| `cue` ≥ 0.10 | _Optional_ | only for `apprafter app validate` locally; `apprafter doctor` checks it. |
 | Bun ≥ 1.x | _Optional_ | only to run the OneBun starter on your machine. |
 
 ## 1. Register a target and bring the cluster up

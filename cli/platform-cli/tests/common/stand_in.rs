@@ -1,0 +1,90 @@
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
+//! Stand-ins for the external tools `apprafter doctor` probes (GOTCHA-66): a `PATH` that holds
+//! nothing else, so no test depends on the tools the machine running it happens to carry (the
+//! macOS runners have no `kubectl`) and none ever runs a real one.
+
+use cli_core::tools::Tool;
+use tempfile::TempDir;
+
+/// A directory, for `PATH`, holding one stand-in per tool, named `<tool>{EXE_SUFFIX}`. Made
+/// under `CARGO_TARGET_TMPDIR`: a hard link cannot cross volumes, and the Windows runners keep
+/// `%TEMP%` and the checkout on different drives.
+///
+/// Unix: a `/bin/sh` script that answers the tool's version call (`Tool::version_args`) as the
+/// real tool does — one line, `<tool> stand-in`, and exit 0; on stderr for `ssh -V`, which
+/// writes its version there — and any other arguments with a usage error and exit 2. A real
+/// tool that exits non-zero on its version call is reported as having no version, so a
+/// stand-in that did would test that path instead of a working tool. Only shell builtins: the
+/// probed child's `PATH` is this directory alone (GOTCHA-104).
+///
+/// Windows: a hard link of `apprafter-tool-stand-in` (`tests/support/apprafter_tool_stand_in.rs`),
+/// which answers exactly as the script does, the tool being its own file name. Windows runs
+/// only real executables, and the core's resolver takes only `<tool>.exe`, so neither a
+/// script nor a `.cmd` will do. That binary is built only with the `tool-stand-in` feature;
+/// without it these tests fail and say so, they never pass on a missing stand-in.
+pub fn tool_stand_ins<'a>(tools: impl IntoIterator<Item = &'a Tool>) -> TempDir {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("stand-in tools dir");
+    for tool in tools {
+        let path = dir
+            .path()
+            .join(format!("{}{}", tool.name, std::env::consts::EXE_SUFFIX));
+        write_stand_in(&path, tool);
+    }
+    dir
+}
+
+#[cfg(unix)]
+fn write_stand_in(path: &std::path::Path, tool: &Tool) {
+    let name = tool.name;
+    let call = tool.version_args.join(" ");
+    let answer = if name == "ssh" {
+        format!("echo '{name} stand-in' >&2")
+    } else {
+        format!("echo '{name} stand-in'")
+    };
+    script(
+        path,
+        &format!(
+            "case \"$*\" in\n\
+             '{call}') {answer} ;;\n\
+             *) echo \"{name} stand-in: unexpected arguments: $*\" >&2; exit 2 ;;\n\
+             esac"
+        ),
+    );
+}
+
+/// Replace `path` with a `/bin/sh` script running `body`; `__probe` exits 0 before it. Only
+/// shell builtins, or an absolute path: the probed child's `PATH` is the stand-in directory
+/// alone (GOTCHA-104).
+#[cfg(unix)]
+pub fn script(path: &std::path::Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(
+        path,
+        format!("#!/bin/sh\ncase \"$*\" in __probe) exit 0 ;; esac\n{body}\n"),
+    )
+    .expect("write stand-in");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod stand-in");
+    // A sibling test thread that forked while the file was open for writing holds it open in
+    // its child until that child execs, and `execve` refuses with ETXTBSY until then: run the
+    // stand-in until it starts, so the command under test never meets that window.
+    for _ in 0..200 {
+        match std::process::Command::new(path).arg("__probe").status() {
+            Err(e) if e.raw_os_error() == Some(26) => {
+                std::thread::sleep(std::time::Duration::from_millis(5))
+            }
+            _ => break,
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn write_stand_in(path: &std::path::Path, _tool: &Tool) {
+    let Some(stand_in) = option_env!("CARGO_BIN_EXE_apprafter-tool-stand-in") else {
+        panic!(
+            "the Windows tool stand-ins are the `apprafter-tool-stand-in` binary: run the tests \
+             with `--features tool-stand-in` (CI passes `--all-features`)"
+        );
+    };
+    std::fs::hard_link(stand_in, path).expect("stand-in tool");
+}

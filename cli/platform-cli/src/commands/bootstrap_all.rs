@@ -298,7 +298,25 @@ fn print_target_block(
 /// success — the YAML itself is cached in state by `fetch_and_cache`,
 /// so no further plumbing is needed for Phase 3.
 fn wait_for_kubeconfig(target_override: Option<&str>, pb: &ProgressBar) -> Result<()> {
-    let deadline = Instant::now() + KUBECONFIG_POLL_TIMEOUT;
+    poll_kubeconfig(
+        pb,
+        KUBECONFIG_POLL_TIMEOUT,
+        KUBECONFIG_POLL_INTERVAL,
+        &mut || kubeconfig::fetch_and_cache(true, target_override),
+        &|addr| apiserver_listening(addr),
+    )
+}
+
+/// [`wait_for_kubeconfig`]'s loop, with the fetch, the apiserver probe and the timings given,
+/// so a test drives it without a node.
+fn poll_kubeconfig(
+    pb: &ProgressBar,
+    timeout: Duration,
+    interval: Duration,
+    fetch: &mut dyn FnMut() -> Result<String>,
+    listening: &dyn Fn(&str) -> bool,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
     let mut attempt = 0u32;
     loop {
         attempt += 1;
@@ -310,24 +328,27 @@ fn wait_for_kubeconfig(target_override: Option<&str>, pb: &ProgressBar) -> Resul
         // NOT "the cluster is reachable". Without the second gate, [3/3]
         // cluster-bootstrap races a slow-booting node and fails
         // "Kubernetes cluster unreachable … :6443 connect: connection refused".
-        let err = match kubeconfig::fetch_and_cache(true, target_override) {
+        let err = match fetch() {
             Ok(yaml) => match apiserver_addr(&yaml) {
-                Some(addr) if apiserver_listening(&addr) => return Ok(()),
+                Some(addr) if listening(&addr) => return Ok(()),
                 Some(addr) => format!("apiserver {addr} not accepting connections yet"),
                 None => "fetched kubeconfig has no server URL yet".to_string(),
             },
+            // A lost age key does not come back by waiting: its help names
+            // `apprafter kubeconfig --refresh`, which asks before it makes a new one (WI-457).
+            Err(e @ CliError::AgeKeyMissing { .. }) => return Err(e),
             Err(e) => format!("{e}"),
         };
         warn!(attempt, error = %err, "kubeconfig fetch failed; retrying");
         pb.set_message(format!(
             "attempt {attempt} — k3s not ready yet ({}); next retry in {}s",
             short_error(&err),
-            KUBECONFIG_POLL_INTERVAL.as_secs(),
+            interval.as_secs(),
         ));
         if Instant::now() >= deadline {
             return Err(timeout_error(attempt, &err));
         }
-        std::thread::sleep(KUBECONFIG_POLL_INTERVAL);
+        std::thread::sleep(interval);
         if Instant::now() >= deadline {
             return Err(timeout_error(attempt, &err));
         }
@@ -405,6 +426,52 @@ fn short_error(msg: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// WI-457: `up` never replaces a lost age key, and does not wait it out either — the first
+    /// attempt ends the phase with the error whose help names `kubeconfig --refresh`.
+    #[test]
+    fn a_lost_age_key_ends_the_wait_at_once() {
+        let mut calls = 0;
+        let mut fetch = || {
+            calls += 1;
+            Err(CliError::AgeKeyMissing {
+                path: "/k/age.key".into(),
+                target: "prod".into(),
+            })
+        };
+        let err = poll_kubeconfig(
+            &ProgressBar::hidden(),
+            Duration::from_millis(200),
+            Duration::from_millis(20),
+            &mut fetch,
+            &|_| true,
+        )
+        .unwrap_err();
+        assert!(matches!(err, CliError::AgeKeyMissing { .. }), "{err:?}");
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn any_other_failure_is_retried_until_the_apiserver_listens() {
+        let mut calls = 0;
+        let mut fetch = || {
+            calls += 1;
+            if calls < 3 {
+                Err(CliError::Other("ssh: connection refused".into()))
+            } else {
+                Ok("    server: https://10.0.0.5:6443\n".to_string())
+            }
+        };
+        poll_kubeconfig(
+            &ProgressBar::hidden(),
+            Duration::from_secs(30),
+            Duration::from_millis(1),
+            &mut fetch,
+            &|addr| addr == "10.0.0.5:6443",
+        )
+        .unwrap();
+        assert_eq!(calls, 3);
+    }
 
     #[test]
     fn apiserver_addr_parses_https_server_line() {

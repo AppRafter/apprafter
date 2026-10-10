@@ -1,0 +1,28 @@
+$ apprafter doctor
+[exit 0]
+[stdout]
+Checking target `prod`...
+  ✓ Config file readable (<SANDBOX>/apprafter-config/targets/prod/config.yaml)
+  ✓ Credentials file present (mode 0600) (<SANDBOX>/apprafter-config/targets/prod/credentials.yaml)
+  ✓ Provider `hetzner-cloud` supported
+  ✓ Token format valid (64 chars, alphanumeric)
+  ✓ Token verified against provider API (Hetzner Cloud /v1/locations, <MS> ms)
+  ✓ SSH key readable (<SANDBOX>/home/id_ed25519.pub (ssh-ed25519))
+
+Checking cluster...
+  – Kubeconfig cached (no provisioned server)
+  – Kube API reachable (no provisioned server)
+  – Node reachable over SSH (no provisioned server)
+
+Checking environment...
+  ✓ `restic` on PATH (restic stand-in)
+  ✓ `kubectl` on PATH (kubectl stand-in)
+  ✓ `helm` on PATH (helm stand-in)
+  ✓ `git` on PATH (git stand-in)
+  ✓ `ssh` on PATH (ssh stand-in)
+  ✓ `cue` on PATH (cue stand-in)
+  ✓ DNS resolves `127.0.0.1` (443/tcp)
+
+13 checks for target `prod`: 13 passed. All good — ready for `apprafter init` / `apprafter apply`.
+[stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m doctor invoked <ESC>[3mno_ping<ESC>[0m<ESC>[2m=<ESC>[0mfalse

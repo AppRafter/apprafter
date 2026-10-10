@@ -241,6 +241,7 @@ name = "apprafter"
 version = "0.2.80"
 dependencies = [
  "age",
+ "apprafter-core",
  "arboard",
  "assert_cmd",
  "backup-core",
@@ -298,7 +299,10 @@ version = "0.2.80"
 dependencies = [
  "cli-core",
  "cli-providers",
+ "cli-state",
+ "libc",
  "miette",
+ "mockito",
  "proc-macro2",
  "serde",
  "serde_json",
@@ -307,6 +311,9 @@ dependencies = [
  "thiserror 2.0.20",
  "toml",
  "ts-rs",
+ "ureq",
+ "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]

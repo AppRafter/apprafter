@@ -6,10 +6,8 @@ Error: apprafter::provider::server_type_unavailable
 
   × server type `cx99` is unavailable in region `nbg1`: unknown server type
   │   try one of: cx22 (2c/4g/40d, x86), cx32 (4c/8g/80d, x86)
-  │   (override via APPRAFTER_MANIFEST or `--server-type` once it lands)
-  help: Hetzner periodically retires server types (e.g. cx22 → cpx22 in early
-        2026). The Infrastructure manifest's `nodes[0].kind` must reference a
-        type that is still active in the chosen region. Pick one of the
-        suggested alternatives above, or set `APPRAFTER_MANIFEST` to a
-        manifest with a different `nodes[0].kind`.
+  help: Hetzner sells no server type called `cx99`; check its spelling.
+        Run `apprafter target machine --target prod --server-type <type>` with
+        another type, or run it in a terminal without `--server-type` to open
+        the picker. Nothing was saved.
 

@@ -74,7 +74,7 @@ and nothing else. So:
   means what it looks like;
 - **two clusters in one project** and `destroy --target X` removes both.
   There is no flag that narrows it. The only safe teardown of one of them
-  is by ID in the Hetzner Cloud Console.
+  is by ID in the Hetzner Console.
 
 Note also that `HCLOUD_TOKEN` sits **above** the target store in the
 [resolution chain](../how-it-works/the-target-store.md#credential-resolution-chain): an exported variable,
@@ -101,14 +101,34 @@ flow is preserved.
 apprafter target add prod --renew --token "$NEW_TOKEN"
 ```
 
-`--renew` updates only the credentials half of an existing
-target. Fails if the target doesn't exist (`--force` would
-replace the entire target). The wizard pings the new token
+`--renew` updates only the token and the SSH key of an existing
+target. Fails if the target doesn't exist (`--force` overwrites
+the token and the fields you pass, and keeps the rest). The wizard pings the new token
 before saving; pass `--no-ping` to skip the round-trip.
 
+To change only the SSH key, pass `--ssh-key` without `--token`:
+
+```sh
+apprafter target add prod --renew --ssh-key ~/.ssh/id_ed25519.pub
+```
+
+The credentials file is not touched and nothing is sent to the
+provider. `HCLOUD_TOKEN` is not used here, even when it is set: if it
+holds a token other than the stored one, a note says so, and
+`--token` rotates the token as well. A `--token` equal to the stored
+one counts as no new token. The key must be a public key file; a
+private key is refused.
+
+A key from `APPRAFTER_SSH_PUBLIC_KEY_PATH` is not a typed `--ssh-key`:
+it is applied only beside a new token. Without one, the renewal is
+refused (no token at all, or the stored one) and the stored key
+stays, so a variable set for every command never changes a target's
+key on its own.
+
 The token bytes are byte-compared against the stored value —
-identical input is rejected with a hint pointing at the Hetzner
-Cloud Console to confirm rotation actually happened.
+identical input with nothing else to change is rejected with a hint
+to create a new token in the Hetzner Console (open the project, then
+Security → API tokens) and renew with that one.
 
 ### Per-machine target with stricter perms
 
@@ -169,6 +189,11 @@ How to read it:
 - **The token line reports presence and length only.** The bytes are
   never printed, here or in `apprafter whoami`. Read
   `credentials.yaml` directly if a script needs the value.
+- **A `Server:` line appears once the target has a provisioned
+  server**, naming the server the target's local state records, for
+  example `Server:      prod-node (id 42, type cx22)`. A target with no
+  server has no such line; a state file that cannot be read shows
+  `Server:      unknown — the state file cannot be read: …`.
 - **The two paths at the foot** are the files every field above was
   read from — useful when you are not sure which store an
   `APPRAFTER_CONFIG_DIR` in your shell is pointing at.
@@ -238,7 +263,9 @@ Read this before you run it.
 > is where the CLI keeps the IDs of the server, network, firewall and
 > floating IPs it provisioned. Remove a target whose cluster is still
 > running and the machines keep running — and keep billing — with
-> nothing left on your machine pointing at them.
+> nothing left on your machine pointing at them. `target remove` warns
+> when the state it deletes records a server, naming it, before it asks
+> for confirmation.
 
 So the order is destroy, then remove:
 
@@ -250,7 +277,7 @@ apprafter target remove prod --yes
 The first line is the one to be sure about: it empties `prod`'s whole
 Hetzner project, not just `prod`'s cluster — see [the destroy
 scope](#destroy-scope). If another AppRafter cluster shares that project,
-delete this one's server by ID in the Cloud Console and run only the
+delete this one's server by ID in the Hetzner Console and run only the
 second line.
 
 If you did it the other way round, you have lost the record and not
@@ -293,6 +320,28 @@ as a first run and auto-activates what it creates:
 ```text
 target `dev` removed; no targets left, active pointer cleared
 ```
+
+The pointer only moves to a target whose `config.yaml` and
+`credentials.yaml` can both be read, because every command that names
+no target reads them. Targets that cannot be read are passed over, and
+the line names them; when no other target can be read, the pointer is
+cleared:
+
+```text
+target `prod` removed; active switched to `staging` (alphabetically next that can be read; `alpha` cannot be read)
+```
+
+**A target that cannot be read can still be removed.** When a target's
+`config.yaml` or `credentials.yaml` does not parse, `target remove`
+still removes it. Before it asks, it warns which file cannot be read,
+and it deletes the files without reading them. A credentials file is
+never quoted, because its text is the token: the warning gives only the
+line and column where parsing stopped. If the target's state records a
+server, the server warning adds that nothing can check that server
+through this target, and that `apprafter destroy --target <name>`
+cannot read its token until the files are fixed or restored. So fix
+them first if you mean to destroy that server, or delete it in the
+Hetzner Console.
 
 ## Anti-patterns
 

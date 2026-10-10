@@ -704,7 +704,7 @@ pub(crate) fn install(note: Option<&'static str>) -> StopGuard {
 /// Whether `signal` is ignored in this process right now — at install time,
 /// that is how it was started.
 #[cfg(unix)]
-fn ignored_at_start(signal: i32) -> bool {
+pub(crate) fn ignored_at_start(signal: i32) -> bool {
     // SAFETY: sigaction with a null new action only reads the current one
     // into `old`, which is a plain, zero-initialised struct.
     unsafe {

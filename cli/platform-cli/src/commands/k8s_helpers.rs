@@ -44,12 +44,12 @@ use std::io::Write;
 use std::path::Path;
 use std::process::Command;
 
-use age::x25519::Identity;
-use cli_core::secrets::{decrypt_with_identity, default_age_key_path, load_or_create_identity};
+use cli_core::secrets::default_age_key_path;
 use cli_core::{CliError, Result};
 use cli_state::State;
 use tempfile::NamedTempFile;
 
+use crate::commands::age_cache;
 use crate::commands::helper_interrupt::{refuse_if_interrupted, Noted as _};
 use crate::commands::state_paths::resolve_state_paths;
 
@@ -108,40 +108,10 @@ pub fn ensure_kubeconfig_tempfile_for_target(
             "state has no hetzner_cloud section; run `apprafter apply` first".to_string(),
         )
     })?;
-    let identity = load_or_create_identity(&default_age_key_path())?;
-    let kubeconfig = select_cached_kubeconfig(
-        hetzner.kubeconfig_age.as_deref(),
-        hetzner.kubeconfig_yaml.as_deref(),
-        &identity,
-    )?;
+    // A read: the age key is never created here (GOTCHA-120).
+    let kubeconfig =
+        age_cache::cached_kubeconfig(&hetzner, &resolved.target_name, &default_age_key_path())?;
     write_kubeconfig_tempfile(&kubeconfig)
-}
-
-/// Pick the cached kubeconfig body out of the state's two slots, decrypting
-/// the age-armored one when present. Extracted from
-/// [`ensure_kubeconfig_tempfile_for_target`] (which is otherwise pure IO) so
-/// the branch order is unit-testable without a state file on disk.
-///
-/// PRECEDENCE IS LOAD-BEARING: `kubeconfig_age` wins over `kubeconfig_yaml`.
-/// The plaintext slot is a legacy/plaintext fallback that older states may
-/// still carry alongside a freshly written encrypted one; preferring the
-/// plaintext there would silently hand back a STALE kubeconfig for a cluster
-/// that has since been re-provisioned. Neither slot set is a hard error with
-/// the `apprafter kubeconfig` remedy — never an empty config.
-fn select_cached_kubeconfig(
-    kubeconfig_age: Option<&str>,
-    kubeconfig_yaml: Option<&str>,
-    identity: &Identity,
-) -> Result<String> {
-    if let Some(armored) = kubeconfig_age {
-        decrypt_with_identity(armored, identity)
-    } else if let Some(plain) = kubeconfig_yaml {
-        Ok(plain.to_string())
-    } else {
-        Err(CliError::Other(
-            "no cached kubeconfig in state; run `apprafter kubeconfig` first".to_string(),
-        ))
-    }
 }
 
 /// Write `kubeconfig` to a fresh `NamedTempFile`. Extracted from
@@ -1026,66 +996,7 @@ mod tests {
     }
 
     // ---- cached-kubeconfig resolution ------------------------------------
-
-    #[test]
-    fn cached_kubeconfig_prefers_the_age_slot_over_the_plaintext_one() {
-        // INVARIANT: when both slots are populated the ENCRYPTED one wins.
-        // Older states can still carry a stale plaintext body next to a
-        // freshly written encrypted one; preferring the plaintext would hand
-        // kubectl a kubeconfig for a cluster that no longer exists.
-        use cli_core::secrets::encrypt_for_recipient;
-
-        let identity = Identity::generate();
-        let armored = encrypt_for_recipient(
-            "apiVersion: v1\nclusters: [current]\n",
-            &identity.to_public(),
-        )
-        .expect("encrypt");
-
-        let picked = select_cached_kubeconfig(
-            Some(&armored),
-            Some("apiVersion: v1\nclusters: [stale]\n"),
-            &identity,
-        )
-        .expect("age slot decrypts");
-        assert!(
-            picked.contains("current") && !picked.contains("stale"),
-            "the encrypted slot must win over the plaintext one: {picked}"
-        );
-    }
-
-    #[test]
-    fn cached_kubeconfig_falls_back_to_plaintext_and_errors_when_neither_is_set() {
-        let identity = Identity::generate();
-
-        let plain = select_cached_kubeconfig(None, Some("apiVersion: v1\n"), &identity)
-            .expect("plaintext fallback");
-        assert_eq!(plain, "apiVersion: v1\n");
-
-        // Neither slot: a hard error naming the remedy, NEVER an empty config
-        // (an empty KUBECONFIG makes kubectl silently fall back to ~/.kube).
-        let err = select_cached_kubeconfig(None, None, &identity).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("apprafter kubeconfig"),
-            "the empty-state error must name the remedy: {msg}"
-        );
-    }
-
-    #[test]
-    fn cached_kubeconfig_rejects_ciphertext_for_a_different_identity() {
-        // A key rotation must fail loudly rather than yielding garbage.
-        use cli_core::secrets::encrypt_for_recipient;
-
-        let owner = Identity::generate();
-        let stranger = Identity::generate();
-        let armored =
-            encrypt_for_recipient("apiVersion: v1\n", &owner.to_public()).expect("encrypt");
-        assert!(
-            select_cached_kubeconfig(Some(&armored), None, &stranger).is_err(),
-            "decrypting with the wrong identity must fail"
-        );
-    }
+    // The slot precedence and the age key's errors are `age_cache`'s tests.
 
     #[test]
     fn kubeconfig_tempfile_holds_exactly_the_resolved_body() {

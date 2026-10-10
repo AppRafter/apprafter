@@ -5,6 +5,7 @@ import { clearMocks, mockIPC, mockWindows } from '@tauri-apps/api/mocks';
 import { act, cleanup, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import type { Os } from '../ipc/generated/Os';
+import { settleIpc } from '../test/settle';
 import { TitleBar } from './TitleBar';
 
 let calls: string[];
@@ -29,7 +30,7 @@ const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
 // Unmount first, and let the caption buttons' unlisten reach the mocks before they go.
 afterEach(async () => {
   cleanup();
-  await settle();
+  await settleIpc();
   clearMocks();
 });
 

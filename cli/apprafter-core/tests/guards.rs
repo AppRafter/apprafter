@@ -3,9 +3,10 @@
 //!
 //! 1. **Purity.** `apprafter-core/src` never prints, ends the process,
 //!    takes a terminal handle, reads or writes the environment, or asks
-//!    `dirs` for a platform directory — neither through `std` nor through a
-//!    lower-crate function that does it on the core's behalf
-//!    ([`FORBIDDEN_CALLEES`]).
+//!    `dirs` for a platform directory — neither through `std`, nor through
+//!    `libc` or the Win32 environment API (the core links both for
+//!    `process::run_bounded`), nor through a lower-crate function that does
+//!    it on the core's behalf ([`FORBIDDEN_CALLEES`]).
 //! 2. **Dependencies.** `apprafter-core` depends on no prompt, progress,
 //!    table, colour or signal crate ([`FORBIDDEN_DEPS`]).
 //! 3. **Ratchet.** Env reads in the crates the core builds on, and in the
@@ -49,12 +50,14 @@ use syn::{Attribute, Expr, ImplItem, Item, Meta, Stmt, TraitItem, UseTree};
 /// Production env reads ([`Kind::EnvRead`] and [`Kind::Dirs`]) in
 /// [`RATCHETED_CRATES`]. Re-measure, with a per-crate and per-callee
 /// breakdown, with `cargo test -p apprafter-core --test guards -- --nocapture`.
-const ENV_READ_BASELINE: usize = 55;
+const ENV_READ_BASELINE: usize = 51;
 
 /// The crates the core builds on, and the CLI.
 const RATCHETED_CRATES: &[&str] = &["cli-core", "cli-state", "cli-providers", "platform-cli"];
 
-/// `std` functions that read the process environment.
+/// Functions that read the process environment: `std`'s, and `libc`'s.
+/// `home_dir` reads `HOME` (`USERPROFILE` on Windows), un-deprecated in Rust
+/// 1.87, so `-D warnings` no longer stops it.
 const ENV_READS: &[&str] = &[
     "std::env::var",
     "std::env::var_os",
@@ -62,10 +65,28 @@ const ENV_READS: &[&str] = &[
     "std::env::vars_os",
     "std::env::current_dir",
     "std::env::temp_dir",
+    "std::env::home_dir",
+    "libc::getenv",
+    "libc::secure_getenv",
 ];
 
-/// `std` functions that change the process environment.
-const ENV_WRITES: &[&str] = &["std::env::set_var", "std::env::remove_var"];
+/// Modules whose every item reads or writes the process environment,
+/// counted as [`Kind::EnvRead`]: the Win32 environment-block API
+/// (`GetEnvironmentVariableW`, `SetEnvironmentVariableW`,
+/// `GetEnvironmentStringsW`, `SetCurrentDirectoryW`, …).
+const ENV_MODULES: &[&str] = &["windows_sys::Win32::System::Environment"];
+
+/// Functions that change the process environment (the current directory
+/// included: [`ENV_READS`] counts reading it).
+const ENV_WRITES: &[&str] = &[
+    "std::env::set_var",
+    "std::env::remove_var",
+    "std::env::set_current_dir",
+    "libc::setenv",
+    "libc::unsetenv",
+    "libc::putenv",
+    "libc::clearenv",
+];
 
 /// `std` functions that end the process.
 const PROCESS_ENDS: &[&str] = &["std::process::exit", "std::process::abort"];
@@ -81,8 +102,9 @@ const PRINT_MACROS: &[&str] = &["print", "println", "eprint", "eprintln", "dbg"]
 /// `KubectlCli::default()` and a `KubectlCli` type both count. Paths resolve
 /// as written, so each re-export is listed beside its definition. Explicit
 /// `_from(..)` variants are added to the lower crates as each consumer needs
-/// one, and this list grows with the crates; every entry must name a real
-/// item ([`every_listed_callee_names_a_real_item`]).
+/// one, and this list grows with the crates (D.3a added the key-writing,
+/// `PATH`- and `CUE_BIN`-reading, SSH-identity and legacy-state entries);
+/// every entry must name a real item ([`every_listed_callee_names_a_real_item`]).
 const FORBIDDEN_CALLEES: &[&str] = &[
     // `HCLOUD_TOKEN` / `HETZNER_SSH_PUBLIC_KEY`, then the target store.
     "cli_core::credentials::resolve_hetzner_token",
@@ -101,6 +123,23 @@ const FORBIDDEN_CALLEES: &[&str] = &[
     "cli_providers::k8s::KubectlCli",
     "cli_providers::k8s::helm::HelmCli",
     "cli_providers::k8s::HelmCli",
+    // Writes a new key when none exists: a read never writes; key creation is D.4's.
+    "cli_core::secrets::load_or_create_identity",
+    // Read `PATH`: the core resolves tools on `Context::tool_search_path`.
+    "cli_core::tools::preflight_tool",
+    "cli_core::tools::preflight_tools",
+    // Read `CUE_BIN` and the current directory.
+    "cli_core::cue::export",
+    "cli_core::cue::export_in",
+    // `APPRAFTER_SSH_PRIVATE_KEY`, then `dirs`.
+    "cli_providers::hetzner_cloud::kubeconfig::default_ssh_identity_path",
+    "cli_providers::hetzner_cloud::default_ssh_identity_path",
+    // Prints; the legacy `<cwd>/.apprafter` migration is CLI-only (spec §3.1).
+    "cli_state::migrate_legacy_state_if_present",
+    "cli_state::state::migrate_legacy_state_if_present",
+    // `APPRAFTER_SKIP_NODE_SWAP`.
+    "cli_providers::hetzner_cloud::user_data::swap_eligible_from_env",
+    "cli_providers::hetzner_cloud::swap_eligible_from_env",
 ];
 
 /// Callees the core may reach from the functions paired with them, and from
@@ -129,6 +168,9 @@ const SANCTIONED: &[(&str, &str)] = &[
         "cli_core::config_root_from_override",
         "Context::from_desktop_env",
     ),
+    // `dirs::home_dir`: the age key's default and the `~/` of displayed paths.
+    ("cli_core::paths::home_dir", "Context::from_cli_env"),
+    ("cli_core::paths::home_dir", "Context::from_desktop_env"),
 ];
 
 /// Crates `apprafter-core` must not depend on: a client prompts, draws
@@ -154,7 +196,7 @@ const FORBIDDEN_DEPS: &[&str] = &[
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Kind {
-    /// One of [`ENV_READS`].
+    /// One of [`ENV_READS`], or anything under one of [`ENV_MODULES`].
     EnvRead,
     /// Any `dirs::*` function: it reads HOME / XDG (or asks Windows).
     Dirs,
@@ -469,6 +511,12 @@ impl<'f> Scanner<'f> {
             if list.contains(&joined.as_str()) {
                 return Some((kind, joined));
             }
+        }
+        if let Some(module) = ENV_MODULES
+            .iter()
+            .find(|m| path_matches(path, m) && path.len() > m.split("::").count())
+        {
+            return Some((Kind::EnvRead, module.to_string()));
         }
         if path.len() >= 2 && path[0] == "dirs" {
             return Some((Kind::Dirs, joined));
@@ -1380,6 +1428,52 @@ fn f() {
         );
     }
 
+    /// Review finding 3, and the `libc` / `windows-sys` dependencies `process::run_bounded`
+    /// brought into the core: every other way it could reach the environment.
+    #[test]
+    fn the_other_environment_doors_the_core_can_reach_are_caught() {
+        let src = "\
+use windows_sys::Win32::System::Environment as winenv;
+fn f(p: *mut i8) {
+    let _ = std::env::home_dir();
+    let _ = unsafe { libc::getenv(p) };
+    let _ = unsafe { libc::secure_getenv(p) };
+    let _ = winenv::GetEnvironmentVariableW(p, p, 0);
+    std::env::set_current_dir(\"/\").unwrap();
+    unsafe { libc::setenv(p, p, 1) };
+    unsafe { libc::unsetenv(p) };
+    unsafe { libc::putenv(p) };
+    unsafe { libc::clearenv() };
+    let _ = cli_providers::hetzner_cloud::swap_eligible_from_env(8);
+    let _ = cli_providers::hetzner_cloud::user_data::swap_eligible_from_env(8);
+}
+";
+        let got: Vec<(Kind, String)> = hits(src).into_iter().map(|(k, c, _)| (k, c)).collect();
+        let k = |kind: Kind, c: &str| (kind, c.to_string());
+        assert_eq!(
+            got,
+            vec![
+                k(Kind::EnvRead, "std::env::home_dir"),
+                k(Kind::EnvRead, "libc::getenv"),
+                k(Kind::EnvRead, "libc::secure_getenv"),
+                k(Kind::EnvRead, "windows_sys::Win32::System::Environment"),
+                k(Kind::EnvWrite, "std::env::set_current_dir"),
+                k(Kind::EnvWrite, "libc::setenv"),
+                k(Kind::EnvWrite, "libc::unsetenv"),
+                k(Kind::EnvWrite, "libc::putenv"),
+                k(Kind::EnvWrite, "libc::clearenv"),
+                k(
+                    Kind::ForbiddenCallee,
+                    "cli_providers::hetzner_cloud::swap_eligible_from_env"
+                ),
+                k(
+                    Kind::ForbiddenCallee,
+                    "cli_providers::hetzner_cloud::user_data::swap_eligible_from_env"
+                ),
+            ]
+        );
+    }
+
     #[test]
     fn forbidden_callees_resolve_through_reexports_and_imports() {
         let src = "\
@@ -1424,6 +1518,22 @@ impl Context {
                 "cli_core::target::config_root_from_override".into(),
                 5
             )]
+        );
+    }
+
+    #[test]
+    fn the_home_lookup_is_sanctioned_only_in_the_two_builders() {
+        let src = "\
+struct Context;
+impl Context {
+    fn from_cli_env() { let _ = cli_core::paths::home_dir(); }
+    fn from_desktop_env() { let _ = cli_core::paths::home_dir(); }
+    fn for_desktop() { let _ = cli_core::paths::home_dir(); }
+}
+";
+        assert_eq!(
+            hits(src),
+            vec![(Kind::ForbiddenCallee, "cli_core::paths::home_dir".into(), 5)]
         );
     }
 
