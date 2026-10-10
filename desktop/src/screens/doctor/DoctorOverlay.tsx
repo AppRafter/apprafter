@@ -5,7 +5,7 @@
 // (the doctor closes first: the wizard's layer is below the doctor's), a target with no SSH key
 // the key change (the Target screen's, which reads the key in use itself; its form opens above
 // the doctor, which stays for Run again).
-import { useCallback, useEffect, useId, useState } from 'react';
+import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
 import { Button } from '../../components/Button';
 import { ErrorPanel } from '../../components/ErrorPanel';
 import { IconButton } from '../../components/IconButton';
@@ -98,6 +98,15 @@ export function DoctorOverlay({
   };
 
   const s = read.state;
+  // Cancel goes with the run: had it the focus, the focus goes to Run again (review #7).
+  const cancelFocused = useRef(false);
+  const runAgainRef = useRef<HTMLButtonElement>(null);
+  const running = s.status === 'running';
+  useLayoutEffect(() => {
+    if (running || !cancelFocused.current) return;
+    cancelFocused.current = false;
+    runAgainRef.current?.focus();
+  }, [running]);
   const report = s.status === 'done' ? s.data : null;
   const counts = report === null ? null : checkCounts(report);
   return (
@@ -123,7 +132,19 @@ export function DoctorOverlay({
             spin
             title="Checking the target, its cluster and this computer…"
             text={s.opId === null ? undefined : <StageLine opId={s.opId} />}
-            actions={<Button onClick={read.cancel}>Cancel</Button>}
+            actions={
+              <Button
+                onClick={read.cancel}
+                onFocus={() => {
+                  cancelFocused.current = true;
+                }}
+                onBlur={() => {
+                  cancelFocused.current = false;
+                }}
+              >
+                Cancel
+              </Button>
+            }
           />
         )}
         {s.status === 'failed' && <ErrorPanel error={s.error} />}
@@ -157,7 +178,8 @@ export function DoctorOverlay({
         <Button
           variant="primary"
           icon={ArrowsClockwiseIcon}
-          disabled={s.status === 'running'}
+          ref={runAgainRef}
+          pending={running}
           onClick={start}
         >
           Run again

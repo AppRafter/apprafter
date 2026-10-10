@@ -13,9 +13,11 @@ import {
 import { IconButton } from './IconButton';
 import { type Icon, XIcon } from './icons';
 
+// Every element a dialog uses that the browser makes a Tab stop: a <details>' own <summary> is
+// one (review #0); left out, the trap took it for outside and sent Tab back to the start.
 const FOCUSABLE =
   'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), ' +
-  'textarea:not([disabled]), [tabindex]';
+  'textarea:not([disabled]), details > summary:first-of-type, [tabindex]';
 
 /**
  * Where the focus goes when a dialog closes and the control that opened it is gone (an error
@@ -74,7 +76,9 @@ export interface ModalFrameProps {
  * The behaviour every overlay shares: focus moves in (to the first control of the body, else the
  * first control, else the panel), Tab and Shift+Tab wrap inside, Esc closes, the background is
  * inert, and on close the focus returns to where it was — or, that control gone, to its view's
- * page heading.
+ * page heading. A control that goes while it has the focus (a Cancel its run's end removes)
+ * leaves it on the panel, never on the page, where Esc no longer reaches the dialog (review #7);
+ * a frame with a better place for it (the Wizard's step) moves it on from there.
  */
 export function ModalFrame({
   labelledBy,
@@ -118,6 +122,16 @@ export function ModalFrame({
       (opener?.isConnected ? opener : headingOf(host))?.focus();
     };
   }, []);
+
+  // After every render: the focus fell out of the dialog onto the page (the control that had it
+  // went). Not while another dialog covers this one: that one has the focus.
+  useLayoutEffect(() => {
+    const active = document.activeElement;
+    if (active !== null && active !== document.body && active.isConnected) return;
+    const panel = panelRef.current;
+    if (panel === null || !panel.isConnected || layerRef.current?.closest('[inert]')) return;
+    panel.focus();
+  });
 
   const onKeyDown = (event: KeyboardEvent) => {
     if (event.key === 'Escape') {

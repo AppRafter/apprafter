@@ -90,10 +90,13 @@ export function Wizard({
     if (was === null || was.isConnected) return;
     held.current = null;
     const active = document.activeElement;
-    if (active instanceof HTMLElement && active !== document.body && active.isConnected) return;
     const body = bodyRef.current;
     const panel = body?.closest<HTMLElement>('[role="dialog"]') ?? null;
     if (body === null || panel === null || panel.closest('[inert]') !== null) return;
+    // ModalFrame (whose effects run first) parks a lost focus on the panel: the step's first
+    // control is the better place.
+    const lost = active === null || active === document.body || active === panel;
+    if (!lost && active.isConnected) return;
     (firstStop(body) ?? panel).focus();
   });
 

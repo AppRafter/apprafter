@@ -111,7 +111,7 @@ export function ThisComputerRow() {
         found === null ? undefined : (
           <Button
             size={28}
-            disabled={running}
+            pending={running}
             onClick={() => {
               void verify.run(api.opStartWhoami);
             }}

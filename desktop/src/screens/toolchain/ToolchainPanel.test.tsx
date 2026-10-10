@@ -117,6 +117,33 @@ test('Check again reads the toolchain again', async () => {
   await waitFor(() => expect(h.of('toolchain_status')).toHaveLength(2));
 });
 
+test('Check again by keyboard keeps the focus while it reads: a press starts nothing more, Esc closes', async () => {
+  const { user, onClose } = renderPanel('macos');
+  await screen.findByText('Client Version: v1.34.1');
+  let answer = (_report: unknown) => {};
+  h.answer(
+    'toolchain_status',
+    () =>
+      new Promise((resolve) => {
+        answer = resolve;
+      }),
+  );
+  const again = screen.getByRole('button', { name: 'Check again' }) as HTMLButtonElement;
+  again.focus();
+  await user.keyboard('{Enter}');
+  await waitFor(() => expect(h.of('toolchain_status')).toHaveLength(2));
+  // Waiting, not disabled: a disabled button drops the focus onto the page (review #1).
+  expect(again.getAttribute('aria-disabled')).toBe('true');
+  expect(again.disabled).toBe(false);
+  expect(document.activeElement).toBe(again);
+  await user.keyboard('{Enter}');
+  expect(h.of('toolchain_status')).toHaveLength(2);
+  answer(toolchainReport());
+  await waitFor(() => expect(again.getAttribute('aria-disabled')).toBeNull());
+  await user.keyboard('{Escape}');
+  expect(onClose).toHaveBeenCalledTimes(1);
+});
+
 test('the footer names the search path and, opened, lists it', async () => {
   const { user } = renderPanel('macos');
   const summary = await screen.findByText(

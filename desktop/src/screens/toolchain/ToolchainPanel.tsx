@@ -83,7 +83,7 @@ export function ToolchainPanel({ onClose }: { onClose: () => void }) {
           </span>
           <Button
             icon={ArrowsClockwiseIcon}
-            disabled={query.isFetching}
+            pending={query.isFetching}
             onClick={() => {
               void query.refetch();
             }}

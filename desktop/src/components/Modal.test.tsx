@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, mock, test } from 'bun:test';
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { useState } from 'react';
@@ -91,5 +91,63 @@ describe('Modal', () => {
     expect(screen.queryByRole('dialog')).not.toBeNull();
     await user.click(document.querySelector('.modal-layer') as HTMLElement);
     expect(screen.queryByRole('dialog')).toBeNull();
+  });
+});
+
+describe('the focus never falls out of an open dialog (review #0, #7)', () => {
+  test("a footer's <summary> is a stop of the trap: Tab from it goes on, never back to the start", async () => {
+    const user = userEvent.setup();
+    const onClose = mock();
+    render(
+      <Modal
+        title="Toolchain"
+        width={620}
+        onClose={onClose}
+        footer={
+          <>
+            <details>
+              <summary>Searched 2 directories</summary>
+              <ul>
+                <li>/usr/bin</li>
+              </ul>
+            </details>
+            <button type="button">Check again</button>
+          </>
+        }
+      >
+        <p>No controls in the body.</p>
+      </Modal>,
+    );
+    const summary = screen.getByText('Searched 2 directories');
+    summary.focus();
+    await user.tab();
+    expect(document.activeElement).toBe(button('Check again'));
+    summary.focus();
+    await user.tab({ shift: true });
+    expect(document.activeElement).toBe(button('Close'));
+  });
+
+  test('a control that goes while it has the focus leaves it in the dialog, so Esc still closes it', async () => {
+    const onClose = mock();
+    function Gone() {
+      const [shown, setShown] = useState(true);
+      return (
+        <Modal title="Doctor" width={660} onClose={onClose}>
+          <p>Checking…</p>
+          {shown && (
+            <button type="button" onClick={() => setShown(false)}>
+              Cancel
+            </button>
+          )}
+        </Modal>
+      );
+    }
+    const user = userEvent.setup();
+    render(<Gone />);
+    await user.click(button('Cancel'));
+    const dialog = screen.getByRole('dialog', { name: 'Doctor' });
+    expect(dialog.contains(document.activeElement)).toBe(true);
+    await user.keyboard('{Escape}');
+    expect(onClose).toHaveBeenCalledTimes(1);
   });
 });

@@ -92,6 +92,21 @@ describe('This computer', () => {
     expect(h.of('op_start_whoami')).toHaveLength(1);
   });
 
+  test('Verify keeps the focus while it pings: waiting, not disabled; a press starts nothing more', async () => {
+    h.answer('whoami', whoamiReport({ status: 'skipped', reason: 'no_ping' }));
+    h.read('op_start_whoami', []); // keeps running
+    const user = renderRow();
+    const verify = (await screen.findByRole('button', { name: 'Verify' })) as HTMLButtonElement;
+    verify.focus();
+    await user.keyboard('{Enter}');
+    const running = await screen.findByRole('button', { name: 'Verifying…' });
+    expect(running.getAttribute('aria-disabled')).toBe('true');
+    expect((running as HTMLButtonElement).disabled).toBe(false);
+    expect(document.activeElement).toBe(running);
+    await user.keyboard('{Enter}');
+    expect(h.of('op_start_whoami')).toHaveLength(1);
+  });
+
   test('a rejected token reads as rejected, in the error tone', async () => {
     h.answer('whoami', whoamiReport({ status: 'skipped', reason: 'no_ping' }));
     h.read('op_start_whoami', [completed(whoamiReport({ status: 'rejected' }))]);

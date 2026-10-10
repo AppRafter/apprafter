@@ -2,7 +2,7 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
 import { QueryClientProvider } from '@tanstack/react-query';
 import { clearMocks } from '@tauri-apps/api/mocks';
-import { cleanup, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { ToastProvider, ToastViewport } from '../../components/Toast';
 import { resetOperations } from '../../ipc/operations';
@@ -70,7 +70,9 @@ describe('DoctorOverlay', () => {
     expect(screen.getByRole('dialog', { name: 'Doctor · prod-eu' })).toBeDefined();
     expect(await screen.findByText('Cluster · 2 of 3')).toBeDefined();
     expect(h.of('op_start_doctor')[0]?.args).toEqual({ target: 'prod-eu' });
-    expect(runAgain().disabled).toBe(true);
+    // Waiting, not disabled: a disabled button drops the focus onto the page (review #1).
+    expect(runAgain().getAttribute('aria-disabled')).toBe('true');
+    expect(runAgain().disabled).toBe(false);
     await user.click(screen.getByRole('button', { name: 'Cancel' }));
     expect(h.of('op_cancel').map((c) => c.args)).toEqual([
       { opId: h.started('op_start_doctor')[0] },
@@ -215,6 +217,41 @@ describe('DoctorOverlay', () => {
       onAddTarget.mock.invocationCallOrder[0] ?? 0,
     );
   });
+
+  test('Run again waits while a run goes: a press starts nothing, and it keeps the focus', async () => {
+    h.read('op_start_doctor', [stage(1, 3, 'Target')]);
+    const { user } = renderDoctor('prod-eu');
+    await screen.findByText('Target · 1 of 3');
+    runAgain().focus();
+    await user.keyboard('{Enter}');
+    await user.click(runAgain());
+    expect(h.of('op_start_doctor')).toHaveLength(1);
+    expect(document.activeElement).toBe(runAgain());
+  });
+
+  for (const end of ['completed', 'cancelled'] as const) {
+    test(`Cancel had the focus when the run ended (${end}): it goes to Run again, and Esc closes`, async () => {
+      let answer = (_opId: number) => {};
+      h.answer(
+        'op_start_doctor',
+        () =>
+          new Promise<number>((resolve) => {
+            answer = resolve;
+          }),
+      );
+      const { user, onClose } = renderDoctor('prod-eu');
+      const cancel = await screen.findByRole('button', { name: 'Cancel' });
+      cancel.focus();
+      await act(async () => {
+        answer(h.newOperation([end === 'completed' ? completed(doctorReport()) : cancelled()]));
+        await settleIpc();
+      });
+      expect(screen.queryByRole('button', { name: 'Cancel' })).toBeNull();
+      expect(document.activeElement).toBe(runAgain());
+      await user.keyboard('{Escape}');
+      expect(onClose).toHaveBeenCalledTimes(1);
+    });
+  }
 
   test('a failed run shows its error and Run again', async () => {
     h.read('op_start_doctor', [
