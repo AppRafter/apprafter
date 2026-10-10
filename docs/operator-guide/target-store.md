@@ -119,6 +119,12 @@ holds a token other than the stored one, a note says so, and
 one counts as no new token. The key must be a public key file; a
 private key is refused.
 
+A key from `APPRAFTER_SSH_PUBLIC_KEY_PATH` is not a typed `--ssh-key`:
+it is applied only beside a new token. Without one, the renewal is
+refused (no token at all, or the stored one) and the stored key
+stays, so a variable set for every command never changes a target's
+key on its own.
+
 The token bytes are byte-compared against the stored value —
 identical input with nothing else to change is rejected with a hint
 pointing at the Hetzner Cloud Console to confirm rotation actually

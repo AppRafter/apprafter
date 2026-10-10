@@ -455,7 +455,8 @@ pub(crate) fn map_wizard_prompt_error(err: inquire::InquireError) -> CliError {
 /// `plan_renew` (format, SSH key, "does anything change") and `execute_renew` (ping a new token,
 /// then the patch under the lock). Renew changes what differs from what is stored: a typed
 /// `--ssh-key` with no typed `--token` changes only the key and leaves the credentials as they
-/// are — an `HCLOUD_TOKEN` is not used then, and a note says so when it holds another token.
+/// are — an `HCLOUD_TOKEN` is not used then, and a note says so when it holds another token. A
+/// key from `APPRAFTER_SSH_PUBLIC_KEY_PATH` is applied only beside a new token.
 fn renew(ctx: &Context, args: AddArgs, name: &str) -> miette::Result<()> {
     let tref = TargetRef::named(ctx, name).map_err(renew_missing)?;
     let stored = cli_core::load_target(&ctx.store(), name).map_err(|e| renew_missing(e.into()))?;
@@ -481,12 +482,25 @@ fn renew(ctx: &Context, args: AddArgs, name: &str) -> miette::Result<()> {
     if token.is_none() && renew_token(args.typed) != RenewToken::KeyOnly {
         return Err(token_required(&provider));
     }
+    // Rule 3: a key from `APPRAFTER_SSH_PUBLIC_KEY_PATH` rides only beside a real rotation. The
+    // core counts the stored token as no token, so beside one the env key alone would make the
+    // renewal key-only; without it the core refuses "token unchanged", as before key-only
+    // renewals existed. A typed `--ssh-key` is always applied (`--token <stored> --ssh-key
+    // <new>` is key-only on purpose).
+    let rotates = token
+        .as_ref()
+        .is_some_and(|t| stored.credentials.hetzner_token.as_ref() != Some(t));
+    let ssh_key = if args.typed.ssh_key || rotates {
+        args.ssh_key
+    } else {
+        None
+    };
     let plan = core_target::plan_renew(
         ctx,
         &tref,
         core_target::RenewArgs {
             token: token.map(SecretString::new),
-            ssh_key: args.ssh_key,
+            ssh_key,
         },
     )
     .map_err(renew_missing)?;

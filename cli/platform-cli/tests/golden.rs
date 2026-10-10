@@ -1576,6 +1576,88 @@ fn target_renew_with_an_env_token_applies_the_env_ssh_key_too() {
     assert!(credentials_of_prod(&sb).contains(TOKEN_B));
 }
 
+/// D.3d review #3, rule 3: a key from `APPRAFTER_SSH_PUBLIC_KEY_PATH` rides only beside a real
+/// rotation. An `HCLOUD_TOKEN` holding the stored token rotates nothing, so the env key does not
+/// turn the renewal into a key-only one: it is the unchanged-token refusal, as before key-only
+/// renewals existed, and the stored key path and the credentials stay byte for byte.
+#[test]
+fn target_renew_with_the_stored_token_in_the_env_and_an_env_ssh_key() {
+    let sb = Sandbox::new().with_env("HCLOUD_TOKEN", TOKEN_A);
+    sb.add_target("prod");
+    let creds = hand_written_credentials(&sb);
+    let key = work_key(&sb);
+    let sb = sb.with_env("APPRAFTER_SSH_PUBLIC_KEY_PATH", &key);
+    sb.golden_with_files(
+        "target/renew_env_token_unchanged_env_ssh_key",
+        &[&["target", "add", "prod", "--renew", "--no-interactive"]],
+        &["targets/prod/config.yaml"],
+    );
+    assert_env_key_not_applied(&sb, &creds);
+}
+
+/// The same with the stored token typed: `--token` alone is typed, so the env key still rides
+/// only beside a rotation (a typed `--token <stored> --ssh-key <new>` stays key-only).
+#[test]
+fn target_renew_with_the_stored_token_typed_and_an_env_ssh_key() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    let creds = hand_written_credentials(&sb);
+    let key = work_key(&sb);
+    let sb = sb.with_env("APPRAFTER_SSH_PUBLIC_KEY_PATH", &key);
+    sb.golden_with_files(
+        "target/renew_typed_token_unchanged_env_ssh_key",
+        &[&[
+            "target",
+            "add",
+            "prod",
+            "--renew",
+            "--token",
+            TOKEN_A,
+            "--no-interactive",
+        ]],
+        &["targets/prod/config.yaml"],
+    );
+    assert_env_key_not_applied(&sb, &creds);
+}
+
+/// Typed, the stored token with a new `--ssh-key` is the key-only renewal (WI-452), whatever the
+/// env key says: the typed key changes, the credentials stay byte for byte, nothing is pinged.
+#[test]
+fn target_renew_with_the_stored_token_and_an_ssh_key_both_typed() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    let creds = hand_written_credentials(&sb);
+    let key = work_key(&sb);
+    let other = key_file(&sb, "env.pub", "ssh-ed25519 AAAA golden env key\n");
+    let sb = sb.with_env("APPRAFTER_SSH_PUBLIC_KEY_PATH", &other);
+    sb.golden_with_files(
+        "target/renew_typed_token_unchanged_typed_ssh_key",
+        &[&[
+            "target",
+            "add",
+            "prod",
+            "--renew",
+            "--token",
+            TOKEN_A,
+            "--ssh-key",
+            &key,
+            "--no-interactive",
+        ]],
+        &["targets/prod/config.yaml"],
+    );
+    assert_eq!(credentials_of_prod(&sb), creds);
+}
+
+/// `prod` keeps the key it was added with, and its credentials byte for byte.
+fn assert_env_key_not_applied(sb: &Sandbox, creds: &str) {
+    let config = fs::read_to_string(sb.path("apprafter-config/targets/prod/config.yaml")).unwrap();
+    assert!(
+        config.contains("id_ed25519.pub") && !config.contains("work.pub"),
+        "{config}"
+    );
+    assert_eq!(credentials_of_prod(sb), creds);
+}
+
 /// `--renew` with neither a token nor `--ssh-key` (and no terminal) is today's refusal.
 #[test]
 fn target_renew_without_a_token_or_a_key() {
