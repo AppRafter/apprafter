@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! The rig the IPC tests share: Tauri's mock runtime with the app's real config and capability
-//! (`generate_context!`), the opener and clipboard plugins as the app builds them, the shell
-//! installed, and the main window open. tests/ipc_mock.rs runs on libtest; tests/app_menu.rs is a
-//! `harness = false` target of its own, so its checks run on the process's main thread. Each
-//! target compiles its own copy of this module.
+//! (`generate_context!`), stand-ins for the clipboard and opener plugins (plugins.rs: the real
+//! ones reach the owner's session), the shell installed, and the main window open.
+//! tests/ipc_mock.rs runs on libtest; tests/app_menu.rs is a `harness = false` target of its own,
+//! so its checks run on the process's main thread. Each target compiles its own copy of this
+//! module.
 
+pub mod plugins;
+
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -23,7 +27,9 @@ use serde_json::Value;
 use tauri::ipc::{CallbackFn, InvokeBody};
 use tauri::test::{get_ipc_response, mock_builder, MockRuntime, INVOKE_KEY};
 use tauri::webview::InvokeRequest;
-use tauri::{WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+use tauri::{Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+
+use plugins::Asked;
 
 /// The password the PAM route's field accepts ([`Route::PasswordField`]).
 // Read by tests/ipc_mock.rs only; tests/app_menu.rs compiles this module too.
@@ -102,6 +108,10 @@ pub struct Rig {
     #[allow(dead_code)]
     pub auth: Arc<StandIn>,
     pub shell: Arc<Shell>,
+    /// What the clipboard and opener stand-ins were asked.
+    // Read by tests/ipc_mock.rs only; tests/app_menu.rs compiles this module too.
+    #[allow(dead_code)]
+    pub asked: Asked,
     pub _app: tauri::App<MockRuntime>,
     window: WebviewWindow<MockRuntime>,
 }
@@ -157,11 +167,13 @@ fn rig_on(settings: Settings, route: Route, tools: ToolSearchPath, api_base: &st
         "the authenticator never answered"
     );
     let cell = ShellCell::default();
+    let asked = Asked::default();
     let app = app::builder(mock_builder(), cell.clone())
-        .plugin(app::opener_plugin())
-        .plugin(app::clipboard_plugin())
+        .plugin(plugins::opener(asked.clone()))
+        .plugin(plugins::clipboard(asked.clone()))
         .build(tauri::generate_context!())
         .unwrap();
+    assert_no_session_plugin(&app);
     app::install(&app, &cell, shell.clone()).unwrap();
     let window = WebviewWindowBuilder::new(&app, "main", WebviewUrl::default())
         .build()
@@ -170,9 +182,27 @@ fn rig_on(settings: Settings, route: Route, tools: ToolSearchPath, api_base: &st
         _dir: dir,
         auth,
         shell,
+        asked,
         _app: app,
         window,
     }
+}
+
+/// Neither real plugin set up in `app`: each manages its handle when it does — the clipboard's
+/// holds the arboard connection to the session's clipboard, the opener's is what `open_url`
+/// starts a browser through. Every rig is checked, so a rig that registers either fails every
+/// test, before any test can ask it anything (GOTCHA-156).
+fn assert_no_session_plugin(app: &tauri::App<MockRuntime>) {
+    assert!(
+        app.try_state::<tauri_plugin_clipboard_manager::Clipboard<MockRuntime>>()
+            .is_none(),
+        "the real clipboard plugin is in the test rig: it reaches the session's clipboard"
+    );
+    assert!(
+        app.try_state::<tauri_plugin_opener::Opener<MockRuntime>>()
+            .is_none(),
+        "the real opener plugin is in the test rig: it starts the session's browser"
+    );
 }
 
 pub fn lock_off() -> Settings {
@@ -184,13 +214,22 @@ pub fn lock_off() -> Settings {
 
 /// What the webview gets back: `Ok` with the value, or `Err` with what was rejected.
 pub fn invoke(rig: &Rig, cmd: &str, args: Value) -> Result<Value, Value> {
+    invoke_on(&rig.window, cmd, args)
+}
+
+/// [`invoke`], on any window of a mock app.
+pub fn invoke_on(
+    window: &WebviewWindow<MockRuntime>,
+    cmd: &str,
+    args: Value,
+) -> Result<Value, Value> {
     let url = if cfg!(windows) {
         "http://tauri.localhost"
     } else {
         "tauri://localhost"
     };
     get_ipc_response(
-        &rig.window,
+        window,
         InvokeRequest {
             cmd: cmd.into(),
             callback: CallbackFn(0),
@@ -202,6 +241,35 @@ pub fn invoke(rig: &Rig, cmd: &str, args: Value) -> Result<Value, Value> {
         },
     )
     .map(|body| body.deserialize::<Value>().unwrap())
+}
+
+/// The app's own links, as the page shows them (src/shell/links.ts).
+#[allow(dead_code)]
+pub const APP_LINKS: [&str; 3] = [
+    "https://apprafter.dev",
+    "https://docs.apprafter.dev",
+    "https://github.com/AppRafter/apprafter",
+];
+
+/// The install pages the toolchain panel can open: every install line of the core's tool specs
+/// that is an address. Each must be https; an http one fails here rather than being left out.
+#[allow(dead_code)]
+pub fn install_pages() -> BTreeSet<String> {
+    let mut pages = BTreeSet::new();
+    for tool in apprafter_core::tools::ToolId::ALL {
+        for hint in tool.spec().hints {
+            if hint.text.contains("://") {
+                assert!(
+                    hint.text.starts_with("https://") && !hint.text.contains(char::is_whitespace),
+                    "{}: an install page must be one https address: {}",
+                    tool.name(),
+                    hint.text
+                );
+                pages.insert(hint.text.to_string());
+            }
+        }
+    }
+    pages
 }
 
 /// The `UiError.code` of a rejection, if it is one.

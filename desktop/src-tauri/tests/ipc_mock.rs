@@ -26,8 +26,8 @@ use apprafter_desktop::env::ToolSearchPath;
 use apprafter_desktop::ops::{Executor, PlanParts};
 use apprafter_desktop_ipc::{errors, Settings, Theme, ALLOWED_WHILE_LOCKED, COMMANDS, QUITTING};
 use common::{
-    code, invoke, lock_off, rig, rig_by, rig_with_tools, wait_for, watch, Log, Rig, Route,
-    PAM_SAYS, PASSWORD, WATCH_DROPPED,
+    code, install_pages, invoke, lock_off, rig, rig_by, rig_with_tools, wait_for, watch, Log, Rig,
+    Route, APP_LINKS, PAM_SAYS, PASSWORD, WATCH_DROPPED,
 };
 use serde_json::{json, Value};
 use tauri::Listener;
@@ -173,6 +173,43 @@ fn the_clipboard_takes_text_and_gives_nothing_back() {
     }
 }
 
+/// No test reaches the owner's clipboard or browser (GOTCHA-156), whatever session the test
+/// process inherited: the rig registers stand-ins under the plugins' names (common/plugins.rs),
+/// and every rig checks that neither real plugin set up. Here a page's write, with a text, and
+/// an open of a URL the scope lists — each of which the real plugin would carry out — pass the
+/// app's ACL and land in the stand-ins' log, and nowhere else.
+#[test]
+fn the_clipboard_and_the_opener_a_test_reaches_are_stand_ins() {
+    let rig = rig(lock_off());
+    let text = "written by a test, never to a clipboard";
+    assert_eq!(
+        invoke(
+            &rig,
+            "plugin:clipboard-manager|write_text",
+            json!({ "text": text })
+        ),
+        Ok(Value::Null)
+    );
+    assert_eq!(
+        invoke(
+            &rig,
+            "plugin:opener|open_url",
+            json!({ "url": APP_LINKS[0] })
+        ),
+        Ok(Value::Null)
+    );
+    assert_eq!(
+        rig.asked.all(),
+        [
+            ("clipboard-manager|write_text".to_owned(), text.to_owned()),
+            ("opener|open_url".to_owned(), APP_LINKS[0].to_owned()),
+        ]
+    );
+    // What the stand-in answers for a read the ACL refuses never comes: the ACL stops it first.
+    assert!(invoke(&rig, "plugin:clipboard-manager|read_text", json!({})).is_err());
+    assert_eq!(rig.asked.all().len(), 2, "{:?}", rig.asked.all());
+}
+
 /// A quit that has operations to wait for tells the page, which then shows that it is stopping
 /// them instead of a page whose every command is refused: `quitting`, with how many and the
 /// longest wait. The page hears it through `core:event:allow-listen`, no new permission.
@@ -268,71 +305,6 @@ fn a_quit_with_nothing_running_says_nothing() {
     });
     assert_eq!(invoke(&rig, "quit", json!({})), Ok(Value::Null));
     assert!(heard.recv_timeout(Duration::from_millis(200)).is_err());
-}
-
-/// The app's own links, as the page shows them (src/shell/links.ts).
-const APP_LINKS: [&str; 3] = [
-    "https://apprafter.dev",
-    "https://docs.apprafter.dev",
-    "https://github.com/AppRafter/apprafter",
-];
-
-/// The install pages the toolchain panel can open: every install line of the core's tool specs
-/// that is an address. Each must be https; an http one fails here rather than being left out.
-fn install_pages() -> BTreeSet<String> {
-    let mut pages = BTreeSet::new();
-    for tool in apprafter_core::tools::ToolId::ALL {
-        for hint in tool.spec().hints {
-            if hint.text.contains("://") {
-                assert!(
-                    hint.text.starts_with("https://") && !hint.text.contains(char::is_whitespace),
-                    "{}: an install page must be one https address: {}",
-                    tool.name(),
-                    hint.text
-                );
-                pages.insert(hint.text.to_string());
-            }
-        }
-    }
-    pages
-}
-
-/// The opener's scope is its URLs exactly as the capability writes them: a URL the page does not
-/// show, a trailing slash added or missing, a path beyond one, another scheme, and a host that
-/// only starts like ours are each refused by the plugin's own scope check — reached past the
-/// ACL, which grants `open_url` with that scope. (A listed URL would open the browser, so none
-/// is tried here.)
-#[test]
-fn the_opener_opens_the_listed_urls_only_and_only_as_written() {
-    let rig = rig(lock_off());
-    for url in [
-        "https://example.com",
-        "https://apprafter.dev/",
-        "https://apprafter.dev.evil",
-        "https://apprafter.dev.evil/",
-        "http://apprafter.dev",
-        "https://docs.apprafter.dev/../x",
-        "https://github.com/AppRafter/apprafter/",
-        "https://github.com/AppRafter/apprafter-evil",
-        // The install pages, as the core's specs name them, and nothing near them.
-        "https://helm.sh/docs/intro/install",
-        "https://helm.sh/docs/intro/install/x",
-        "http://helm.sh/docs/intro/install/",
-        "https://helm.sh/",
-        "https://kubernetes.io/docs/tasks/tools/../../x",
-        "https://git-scm.com/downloads/",
-        "https://restic.readthedocs.io/en/stable/020_installation.html?x",
-        "https://cuelang.org/docs/introduction/installation",
-    ] {
-        match invoke(&rig, "plugin:opener|open_url", json!({ "url": url })) {
-            Err(Value::String(error)) => assert_eq!(
-                error,
-                format!("Not allowed to open url {url}"),
-                "{url} was not refused by the opener's scope"
-            ),
-            other => panic!("{url} was not refused by the opener's scope: {other:?}"),
-        }
-    }
 }
 
 /// The capability, read as Tauri reads it: exactly the pinned core permissions, the opener
