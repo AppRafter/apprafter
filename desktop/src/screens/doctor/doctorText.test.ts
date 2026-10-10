@@ -148,6 +148,15 @@ describe('fixText', () => {
       'The provider answered with an unexpected error (HTTP 503). Try again; if it keeps ' +
         "failing, check the provider's status page.",
     );
+    // A provider that answered is never "unreachable" (WI-453 follow-up).
+    expect(fixed({ kind: 'provider_rate_limited' })).toBe(
+      'The provider is rate-limiting requests (HTTP 429): wait a little, then run Doctor again.',
+    );
+    expect(fixed({ kind: 'provider_request_failed' })).toBe(
+      "The provider's answer could not be read, or the request could not be sent; the detail " +
+        'says which. An answer that cannot be read comes from a proxy in between, or from a ' +
+        "change in the provider's API that a newer AppRafter reads.",
+    );
     expect(fixed({ kind: 'node_unreachable', address: '203.0.113.10' })).toBe(
       'Nothing accepted a connection on port 22 at 203.0.113.10: check that the server is ' +
         'running and that no firewall between this computer and it blocks port 22.',
@@ -191,7 +200,9 @@ describe('fixText', () => {
       { kind: 'chmod', path: '/c', mode: 0o600 },
       { kind: 'unsupported_provider', provider: 'aws', supported: ['hetzner-cloud'] },
       { kind: 'provider_error', status: 500 },
+      { kind: 'provider_rate_limited' },
       { kind: 'provider_unreachable' },
+      { kind: 'provider_request_failed' },
       { kind: 'configure_ssh_key', target: 'prod-eu' },
       { kind: 'ssh_key_missing', target: 'prod-eu', path: '/k.pub' },
       { kind: 'ssh_key_not_public', target: 'prod-eu', path: '/k', privateKey: true },

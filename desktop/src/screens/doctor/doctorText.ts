@@ -82,8 +82,16 @@ export function fixText(check: Check, target: string | null): string | null {
       return `The provider \`${fix.provider}\` is not supported by this build (supported: ${fix.supported.join(', ')}).`;
     case 'provider_error':
       return `The provider answered with an unexpected error (HTTP ${fix.status}). Try again; if it keeps failing, check the provider's status page.`;
+    case 'provider_rate_limited':
+      return 'The provider is rate-limiting requests (HTTP 429): wait a little, then run Doctor again.';
     case 'provider_unreachable':
       return "The provider's API could not be reached: check DNS, the network or a proxy.";
+    case 'provider_request_failed':
+      return (
+        "The provider's answer could not be read, or the request could not be sent; the detail " +
+        'says which. An answer that cannot be read comes from a proxy in between, or from a ' +
+        "change in the provider's API that a newer AppRafter reads."
+      );
     case 'configure_ssh_key':
       return 'No SSH key is set for this target: provisioning its server is refused until it has one.';
     case 'ssh_key_missing':

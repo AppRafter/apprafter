@@ -92,9 +92,15 @@ pub(crate) fn verification_text(v: &Verification) -> String {
         Verification::HttpError { http_status } => {
             format!("verification failed ✗ — HTTP {http_status} from provider API")
         }
+        Verification::RateLimited => "verification failed ✗ — rate-limited by the provider API \
+             (HTTP 429); wait, then try again"
+            .into(),
         Verification::Unreachable => {
             "verification failed ✗ — provider unreachable (network?)".into()
         }
+        Verification::RequestFailed => "verification failed ✗ — the provider API request failed; \
+             `apprafter doctor` shows why"
+            .into(),
     }
 }
 
@@ -155,6 +161,17 @@ mod tests {
         assert_eq!(
             verification_text(&Verification::Unreachable),
             "verification failed ✗ — provider unreachable (network?)"
+        );
+        // A provider that answered is not unreachable (WI-453 follow-up).
+        assert_eq!(
+            verification_text(&Verification::RateLimited),
+            "verification failed ✗ — rate-limited by the provider API (HTTP 429); wait, then \
+             try again"
+        );
+        assert_eq!(
+            verification_text(&Verification::RequestFailed),
+            "verification failed ✗ — the provider API request failed; `apprafter doctor` shows \
+             why"
         );
         assert_eq!(
             verification_text(&Verification::Skipped {

@@ -41,10 +41,18 @@ export function verificationLine(v: Verification): VerificationLine {
     case 'rejected':
       // The core's Rejected is the provider's 401 (provider.rs classify_ping_error).
       return { tone: 'err', text: 'Token rejected (HTTP 401)' };
+    case 'rate_limited':
+      return {
+        tone: 'err',
+        text: 'The provider is rate-limiting requests (HTTP 429): try again shortly',
+      };
     case 'http_error':
       return { tone: 'err', text: `The provider answered HTTP ${v.httpStatus}` };
     case 'unreachable':
+      // No answer at all: a provider that answered is one of the cases above or below.
       return { tone: 'err', text: 'Provider API unreachable' };
+    case 'request_failed':
+      return { tone: 'err', text: "The provider's answer could not be read: Doctor shows why" };
   }
 }
 

@@ -113,10 +113,17 @@ pub enum CheckFix {
         provider: String,
         supported: Vec<String>,
     },
+    /// Any HTTP error status but 401 (renew) and 429 (rate-limited).
     ProviderError {
         status: u16,
     },
+    /// The provider answered 429: it is rate-limiting requests.
+    ProviderRateLimited,
+    /// No answer: the name did not resolve, the connection failed or dropped, a timeout.
     ProviderUnreachable,
+    /// No status and not for want of an answer: an answer that does not parse, or a request the
+    /// HTTP client would not send; the detail says which.
+    ProviderRequestFailed,
     ConfigureSshKey {
         target: String,
     },
@@ -576,37 +583,61 @@ fn token_verified(ctx: &Context, target: &Target, cancel: &CancellationToken) ->
     }
 }
 
-/// Today's three failure rows: 401 (renew), another HTTP status, and no answer.
+/// The token row's failure, one for each way the ping classifies one (`provider::ping`): 401
+/// (renew), 429 (rate-limited), another status, no answer, and an answer it could not read — a
+/// provider that answered is never "unreachable" (WI-453 follow-up).
 fn ping_failure(name: &str, e: &CoreError) -> Check {
     let fail = row(
         CheckId::TokenVerified,
         CheckStatus::Fail,
         TITLE_TOKEN_VERIFIED,
     );
-    let cause = match e {
-        CoreError::Cli(CliError::ProviderTokenRejected { cause, .. })
-        | CoreError::Cli(CliError::ProviderApiUnreachable { cause, .. }) => Some(cause.as_ref()),
-        _ => None,
+    let (detail, fix) = match e {
+        CoreError::Cli(CliError::ProviderTokenRejected { cause, .. }) => (
+            hetzner_status(cause.as_ref()).map_or_else(
+                || cause.to_string(),
+                |(status, message)| format!("HTTP {status}: {message}"),
+            ),
+            status_fix(name, 401),
+        ),
+        CoreError::Cli(CliError::Hetzner {
+            status, message, ..
+        }) => (
+            format!("HTTP {status}: {message}"),
+            status_fix(name, *status),
+        ),
+        CoreError::Cli(CliError::ProviderApiUnreachable { cause, .. }) => {
+            (cause.to_string(), CheckFix::ProviderUnreachable)
+        }
+        CoreError::ProviderRequestFailed { cause, .. } => {
+            (format!("{e}: {cause}"), CheckFix::ProviderRequestFailed)
+        }
+        _ => {
+            return Check {
+                fix: Some(CheckFix::Explain {
+                    text: e.to_string(),
+                }),
+                ..fail
+            }
+        }
     };
-    match cause.and_then(hetzner_status) {
-        Some((401, message)) => Check {
-            detail: Some(format!("HTTP 401: {message}")),
-            fix: Some(CheckFix::RenewToken {
-                target: name.to_string(),
-                why: RenewWhy::TokenRejected,
-            }),
-            ..fail
+    Check {
+        detail: Some(detail),
+        fix: Some(fix),
+        ..fail
+    }
+}
+
+/// The fix for an HTTP error status from the provider, on the token row and the node row alike:
+/// 401 renews the token, 429 waits, any other is the provider's error.
+fn status_fix(name: &str, status: u16) -> CheckFix {
+    match status {
+        401 => CheckFix::RenewToken {
+            target: name.to_string(),
+            why: RenewWhy::TokenRejected,
         },
-        Some((status, message)) => Check {
-            detail: Some(format!("HTTP {status}: {message}")),
-            fix: Some(CheckFix::ProviderError { status }),
-            ..fail
-        },
-        None => Check {
-            detail: Some(cause.map_or_else(|| e.to_string(), |c| c.to_string())),
-            fix: Some(CheckFix::ProviderUnreachable),
-            ..fail
-        },
+        429 => CheckFix::ProviderRateLimited,
+        status => CheckFix::ProviderError { status },
     }
 }
 
@@ -929,28 +960,28 @@ fn node_ssh(
     }
 }
 
-/// The node row when the provider could not say where the server is: 401 (renew), another
-/// status, no answer (the transport failure as the detail, as on the token row), an answer it
-/// could not read, or — `ServerMissing` and anything else — the core's own sentence.
+/// The node row when the provider could not say where the server is: an HTTP status (401
+/// renews, 429 waits, any other is the provider's error), no answer (the transport failure as the
+/// detail, as on the token row), an answer it could not read (the parse error as the detail; WI-453
+/// follow-up: it was "unreachable"), or — `ServerMissing` and anything else — the core's own
+/// sentence.
 fn provider_failure(base: Check, name: &str, e: CoreError) -> Check {
-    let text = match &e {
-        CoreError::Cli(CliError::ProviderApiUnreachable { cause, .. }) => cause.to_string(),
-        _ => e.to_string(),
-    };
-    let fix = match &e {
-        CoreError::Cli(CliError::Hetzner { status: 401, .. }) => CheckFix::RenewToken {
-            target: name.to_string(),
-            why: RenewWhy::TokenRejected,
-        },
+    let (text, fix) = match &e {
         CoreError::Cli(CliError::Hetzner { status, .. }) => {
-            CheckFix::ProviderError { status: *status }
+            (e.to_string(), status_fix(name, *status))
         }
-        CoreError::Cli(CliError::ProviderApiUnreachable { .. })
-        | CoreError::ProviderRequestFailed { .. } => CheckFix::ProviderUnreachable,
+        CoreError::Cli(CliError::ProviderApiUnreachable { cause, .. }) => {
+            (cause.to_string(), CheckFix::ProviderUnreachable)
+        }
+        CoreError::ProviderRequestFailed { cause, .. } => {
+            (format!("{e}: {cause}"), CheckFix::ProviderRequestFailed)
+        }
         _ => {
             return Check {
                 status: CheckStatus::Fail,
-                fix: Some(CheckFix::Explain { text }),
+                fix: Some(CheckFix::Explain {
+                    text: e.to_string(),
+                }),
                 ..base
             }
         }
@@ -1410,6 +1441,47 @@ mod tests {
         assert_eq!(v.status, CheckStatus::Fail);
         assert_eq!(v.detail.as_deref(), Some("HTTP 503: maintenance"));
         assert_eq!(v.fix, Some(CheckFix::ProviderError { status: 503 }));
+    }
+
+    /// WI-453 follow-up: a provider that answered is not unreachable. A 429 is its own fix (wait,
+    /// then try again), an answer that does not parse a request failure with the parse error as
+    /// the detail; both were `ProviderUnreachable`.
+    #[test]
+    fn a_rate_limit_and_an_unreadable_answer_fail_with_their_own_fix() {
+        let token_row = |status: usize, body: &str| {
+            let mut server = mockito::Server::new();
+            server
+                .mock("GET", "/v1/locations")
+                .with_status(status)
+                .with_header("content-type", "application/json")
+                .with_body(body)
+                .create();
+            let f = fx();
+            let ctx = ctx(&f, &server.url());
+            add(&ctx, "prod", "hetzner-cloud", Some(TOKEN), None);
+            let t = group(&doctor(&ctx, named("prod")), GroupId::Target);
+            t.into_iter()
+                .find(|c| c.id == CheckId::TokenVerified)
+                .unwrap()
+        };
+        let limited = token_row(
+            429,
+            r#"{"error":{"code":"rate_limit_exceeded","message":"slow down"}}"#,
+        );
+        assert_eq!(limited.status, CheckStatus::Fail);
+        assert_eq!(limited.detail.as_deref(), Some("HTTP 429: slow down"));
+        assert_eq!(limited.fix, Some(CheckFix::ProviderRateLimited));
+        let unreadable = token_row(200, r#"{"nope":1}"#);
+        assert_eq!(unreadable.status, CheckStatus::Fail);
+        assert_eq!(unreadable.fix, Some(CheckFix::ProviderRequestFailed));
+        let detail = unreadable.detail.as_deref().unwrap();
+        assert!(
+            detail.starts_with(
+                "the hetzner-cloud API request GET /v1/locations failed: parse list_locations \
+                 response: "
+            ),
+            "{detail}"
+        );
     }
 
     #[test]
@@ -2317,6 +2389,58 @@ mod tests {
                 target: "prod".into(),
                 why: RenewWhy::TokenRejected
             })
+        );
+    }
+
+    /// WI-453 follow-up: the node row tells a provider that answered from one that did not, as
+    /// the token row does — an answer that does not parse is a request failure (it was
+    /// `ProviderUnreachable`), a 429 is the rate limit, another status the provider's error.
+    #[test]
+    fn an_answer_fails_the_node_check_with_its_own_fix() {
+        let node_row = |status: usize, body: &str| {
+            let mut server = mockito::Server::new();
+            server
+                .mock("GET", "/v1/servers/7")
+                .with_status(status)
+                .with_header("content-type", "application/json")
+                .with_body(body)
+                .create();
+            let f = fx();
+            let (ctx, target) = provisioned(&f, &server.url(), Some(TOKEN));
+            node_ssh(&ctx, &target, &CancellationToken::new(), 22).unwrap()
+        };
+        let unreadable = node_row(200, r#"{"nope":1}"#);
+        assert_eq!(unreadable.status, CheckStatus::Fail);
+        assert_eq!(
+            unreadable.fix,
+            Some(CheckFix::ProviderRequestFailed),
+            "{unreadable:?}"
+        );
+        let detail = unreadable.detail.as_deref().unwrap();
+        assert!(
+            detail.starts_with(
+                "the hetzner-cloud API request GET /v1/servers/7 failed: parse get_server \
+                 response: "
+            ),
+            "{detail}"
+        );
+        let limited = node_row(
+            429,
+            r#"{"error":{"code":"rate_limit_exceeded","message":"slow down"}}"#,
+        );
+        assert_eq!(
+            limited.fix,
+            Some(CheckFix::ProviderRateLimited),
+            "{limited:?}"
+        );
+        let outage = node_row(
+            503,
+            r#"{"error":{"code":"unavailable","message":"maintenance"}}"#,
+        );
+        assert_eq!(
+            outage.fix,
+            Some(CheckFix::ProviderError { status: 503 }),
+            "{outage:?}"
         );
     }
 

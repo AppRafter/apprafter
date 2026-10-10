@@ -519,7 +519,8 @@ fn prompt_token(
         let verified = if no_ping {
             false
         } else {
-            // Already classified by the core: 401 → token rejected, else unreachable.
+            // Already classified by the core: 401 → token rejected, no answer → unreachable,
+            // another status the API error, an unreadable answer a request failure.
             apprafter_core::provider::ping(
                 ctx,
                 provider,
@@ -1014,31 +1015,39 @@ fn validate_for_provider(provider: &str, token: &str) -> std::result::Result<(),
 
 /// One-line error string for inline rendering inside an inquire
 /// validator. The full multi-line message would fight the prompt
-/// UX, so we collapse it: today's one-liners over the raw error the
-/// core's classified ping error carries.
+/// UX, so we collapse it, one line for each way the core classifies
+/// a failed ping: a 401, a 429, another status, no answer, an answer
+/// it could not read.
 fn inline_ping_error(e: &CoreError) -> String {
-    let raw = match e {
-        CoreError::Cli(CliError::ProviderTokenRejected { cause, .. })
-        | CoreError::Cli(CliError::ProviderApiUnreachable { cause, .. }) => cause,
-        other => return format!("ping failed: {other}"),
-    };
-    // Upcast `dyn Diagnostic` to `dyn Error` (stable trait upcasting) to downcast the cause.
-    let raw_error: &(dyn std::error::Error + 'static) = &**raw;
-    // A request that got no answer, as the client classifies it (WI-453).
-    if let Some(no_answer) = raw_error.downcast_ref::<cli_core::TransportFailure>() {
-        return format!("could not reach the provider: {no_answer}");
-    }
-    match raw_error.downcast_ref::<CliError>() {
-        Some(CliError::Hetzner {
-            status: 401,
+    match e {
+        CoreError::Cli(CliError::ProviderTokenRejected { cause, .. }) => {
+            // Upcast `dyn Diagnostic` to `dyn Error` (stable trait upcasting) to downcast it.
+            let raw: &(dyn std::error::Error + 'static) = &**cause;
+            match raw.downcast_ref::<CliError>() {
+                Some(CliError::Hetzner { message, .. }) => {
+                    format!("Hetzner Cloud rejected the token (HTTP 401): {message}")
+                }
+                _ => format!("Hetzner Cloud rejected the token: {cause}"),
+            }
+        }
+        CoreError::Cli(CliError::Hetzner {
+            status: 429,
             message,
             ..
-        }) => format!("Hetzner Cloud rejected the token (HTTP 401): {message}"),
-        Some(CliError::Hetzner {
+        }) => format!(
+            "Hetzner Cloud is rate-limiting requests (HTTP 429): {message}; wait, then try again"
+        ),
+        CoreError::Cli(CliError::Hetzner {
             status, message, ..
         }) => format!("Hetzner Cloud API ping failed (HTTP {status}): {message}"),
-        Some(CliError::Other(msg)) => format!("could not reach the provider: {msg}"),
-        _ => format!("ping failed: {raw}"),
+        // A request that got no answer, as the client classifies it (WI-453).
+        CoreError::Cli(CliError::ProviderApiUnreachable { cause, .. }) => {
+            format!("could not reach the provider: {cause}")
+        }
+        CoreError::ProviderRequestFailed { cause, .. } => {
+            format!("the provider request failed: {cause}")
+        }
+        other => format!("ping failed: {other}"),
     }
 }
 
@@ -1228,16 +1237,15 @@ mod tests {
             code: "x".into(),
             message: message.into(),
         };
+        // The core's ping (WI-453 follow-up): a 401 is the token rejected, any other status the
+        // API error itself.
         CoreError::Cli(if status == 401 {
             CliError::ProviderTokenRejected {
                 provider: "hetzner-cloud".into(),
                 cause: Box::new(raw),
             }
         } else {
-            CliError::ProviderApiUnreachable {
-                provider: "hetzner-cloud".into(),
-                cause: Box::new(raw),
-            }
+            raw
         })
     }
 
@@ -1253,17 +1261,31 @@ mod tests {
             inline_ping_error(&rejected(503, "try later")),
             "Hetzner Cloud API ping failed (HTTP 503): try later"
         );
+        // A 429 is the provider rate-limiting, not a failure of the token or the network.
+        assert_eq!(
+            inline_ping_error(&rejected(429, "slow down")),
+            "Hetzner Cloud is rate-limiting requests (HTTP 429): slow down; wait, then try again"
+        );
     }
 
-    /// A transport failure reads as "could not reach", anything else as a generic one-liner;
-    /// both stay on one line — a multi-line message fights the `inquire` prompt redraw.
+    /// No answer reads as "could not reach", an answer that does not parse as a failed request,
+    /// anything else as a generic one-liner; all stay on one line — a multi-line message fights
+    /// the `inquire` prompt redraw.
     #[test]
     fn inline_ping_error_summarises_transport_and_unknown_failures_on_one_line() {
-        let transport = inline_ping_error(&CoreError::Cli(CliError::ProviderApiUnreachable {
+        // An answer the check cannot read is not "could not reach" (WI-453 follow-up).
+        let unreadable = inline_ping_error(&CoreError::ProviderRequestFailed {
             provider: "hetzner-cloud".into(),
-            cause: Box::new(CliError::Other("connection reset".into())),
-        }));
-        assert_eq!(transport, "could not reach the provider: connection reset");
+            endpoint: "GET /v1/locations".into(),
+            cause: Box::new(CoreError::Cli(CliError::Other(
+                "parse list_locations response: missing field `locations`".into(),
+            ))),
+        });
+        assert_eq!(
+            unreadable,
+            "the provider request failed: parse list_locations response: missing field \
+             `locations`"
+        );
         // The client's own classification of a request that got no answer (WI-453).
         let no_answer = inline_ping_error(&CoreError::Cli(CliError::ProviderApiUnreachable {
             provider: "hetzner-cloud".into(),
@@ -1278,12 +1300,9 @@ mod tests {
              http://127.0.0.1:1/v1/locations: Connection Failed: Connect error: Connection refused"
         );
 
-        let unknown = inline_ping_error(&CoreError::Cli(CliError::ProviderApiUnreachable {
-            provider: "hetzner-cloud".into(),
-            cause: Box::new(CliError::TargetNotFound {
-                name: "ghost".into(),
-                available: "dev".into(),
-            }),
+        let unknown = inline_ping_error(&CoreError::Cli(CliError::TargetNotFound {
+            name: "ghost".into(),
+            available: "dev".into(),
         }));
         assert!(unknown.starts_with("ping failed:"), "{unknown}");
         assert!(!unknown.contains('\n'), "{unknown}");

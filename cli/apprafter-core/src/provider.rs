@@ -39,12 +39,19 @@ pub enum Verification {
     },
     /// The provider answered 401.
     Rejected,
+    /// The provider answered 429: it is rate-limiting requests, so the token is neither
+    /// accepted nor refused yet.
+    RateLimited,
     /// Any other HTTP status; `httpStatus` on the wire, never a second `status` key (the tag).
     HttpError {
         http_status: u16,
     },
-    /// No answer: transport error or timeout.
+    /// No answer: the name did not resolve, the connection failed or dropped, a timeout
+    /// (`apprafter::target::provider_unreachable`).
     Unreachable,
+    /// The request failed with no status and not for want of an answer: an answer that does not
+    /// parse, or a request the HTTP client would not send (`apprafter::provider::request_failed`).
+    RequestFailed,
 }
 
 /// Why a token was not checked.
@@ -103,10 +110,10 @@ impl TokenProblem {
     }
 }
 
-/// `GET /v1/locations` with `token`: how long the provider took. 401 →
-/// `CliError::ProviderTokenRejected`, anything else → `CliError::ProviderApiUnreachable`, each
-/// carrying the raw error (today's classification: the add/renew goldens keep their codes) —
-/// except a request that got no answer, which the client already classified (WI-453).
+/// `GET /v1/locations` with `token`: how long the provider took. A failure is classified by
+/// [`classify_ping_error`]: 401 is `CliError::ProviderTokenRejected`; no answer
+/// `CliError::ProviderApiUnreachable`; any other status `CliError::Hetzner` with it; an answer
+/// that does not parse `CoreError::ProviderRequestFailed`.
 pub fn ping(
     ctx: &Context,
     provider: &str,
@@ -119,8 +126,11 @@ pub fn ping(
     ctx.hetzner_client(token)
         .list_locations()
         .map(|_| started.elapsed())
-        .map_err(|e| CoreError::from(classify_ping_error(provider, e)))
+        .map_err(|e| classify_ping_error(provider, e))
 }
+
+/// The request [`ping`] makes, as a failed one names it.
+const PING_ENDPOINT: &str = "GET /v1/locations";
 
 /// Unknown provider, then the token's format, then [`ping`]: nothing is sent for a token that
 /// cannot be right.
@@ -138,8 +148,9 @@ pub fn verify_token(
     })
 }
 
-/// whoami's and doctor's check: never an error. A cancelled ping reads as `Unreachable`; the
-/// caller checks its token right after and ends with `CoreError::Cancelled`.
+/// whoami's check: never an error, one [`Verification`] for each way [`ping`] classifies a
+/// failure. A cancelled ping reads as `Unreachable`; the caller checks its token right after
+/// and ends with `CoreError::Cancelled`.
 pub fn verification(
     ctx: &Context,
     provider: &str,
@@ -161,23 +172,20 @@ pub fn verification(
             reason: SkipReason::UnsupportedProvider,
         };
     }
+    use cli_core::CliError as C;
     match ping(ctx, provider, token, cancel) {
         Ok(d) => Verification::Verified {
             elapsed_ms: d.as_millis() as u64,
         },
-        Err(CoreError::Cli(cli_core::CliError::ProviderTokenRejected { .. })) => {
-            Verification::Rejected
+        Err(CoreError::Cli(C::ProviderTokenRejected { .. })) => Verification::Rejected,
+        Err(CoreError::Cli(C::Hetzner { status: 429, .. })) => Verification::RateLimited,
+        Err(CoreError::Cli(C::Hetzner { status, .. })) => Verification::HttpError {
+            http_status: status,
+        },
+        Err(CoreError::Cli(C::ProviderApiUnreachable { .. }) | CoreError::Cancelled) => {
+            Verification::Unreachable
         }
-        Err(CoreError::Cli(cli_core::CliError::ProviderApiUnreachable { cause, .. })) => {
-            let cause: &(dyn std::error::Error + 'static) = &*cause;
-            match cause.downcast_ref::<cli_core::CliError>() {
-                Some(cli_core::CliError::Hetzner { status, .. }) => Verification::HttpError {
-                    http_status: *status,
-                },
-                _ => Verification::Unreachable,
-            }
-        }
-        Err(_) => Verification::Unreachable,
+        Err(_) => Verification::RequestFailed,
     }
 }
 
@@ -194,28 +202,28 @@ pub(crate) fn require_supported(provider: &str) -> CoreResult<()> {
     }
 }
 
-/// The CLI's classification of a failed ping: 401 → `ProviderTokenRejected`, anything else →
-/// `ProviderApiUnreachable`, the original error as the cause. A request that got no answer
-/// arrives as `ProviderApiUnreachable` already — the client's classification, the one every
-/// provider request shares (WI-453) — and passes through, not wrapped a second time.
-fn classify_ping_error(provider: &str, err: cli_core::CliError) -> cli_core::CliError {
+/// The token check's classification of a failed ping. 401 is `ProviderTokenRejected`, the
+/// original error as the cause: the one answer that is about the token. Anything else is
+/// classified as every provider read is ([`read_error`], on the client's own classification of
+/// a request that got no answer): only no answer is `ProviderApiUnreachable`; a provider that
+/// answered keeps the code of its answer — another status `CliError::Hetzner` with it (a 429
+/// among them, whose help says to wait), an answer that does not parse `ProviderRequestFailed`
+/// naming the endpoint. A 429, a 5xx and an unreadable answer were all "unreachable" before,
+/// which said the provider never answered (WI-453 follow-up).
+fn classify_ping_error(provider: &str, err: cli_core::CliError) -> CoreError {
     match err {
         cli_core::CliError::Hetzner { status: 401, .. } => {
-            cli_core::CliError::ProviderTokenRejected {
+            CoreError::Cli(cli_core::CliError::ProviderTokenRejected {
                 provider: provider.to_string(),
                 cause: Box::new(err),
-            }
+            })
         }
-        e @ cli_core::CliError::ProviderApiUnreachable { .. } => e,
-        _ => cli_core::CliError::ProviderApiUnreachable {
-            provider: provider.to_string(),
-            cause: Box::new(err),
-        },
+        other => read_error(other, PING_ENDPOINT),
     }
 }
 
 /// The classification of a failed provider read (the catalogue, the SKU check, the node
-/// address). What the client typed passes through: an API status as `CliError::Hetzner` (its
+/// address, and the token check's ping past a 401). What the client typed passes through: an API status as `CliError::Hetzner` (its
 /// status reaches the UI, bug 11), a request that got no answer as
 /// `CliError::ProviderApiUnreachable` — the code the token check gives the same failure
 /// (WI-453). Anything else — an answer that does not parse, a request ureq refused to send —
@@ -255,6 +263,14 @@ mod tests {
         assert_eq!(
             serde_json::to_value(Verification::HttpError { http_status: 503 }).unwrap(),
             serde_json::json!({"status":"http_error","httpStatus":503})
+        );
+        assert_eq!(
+            serde_json::to_value(Verification::RateLimited).unwrap(),
+            serde_json::json!({"status":"rate_limited"})
+        );
+        assert_eq!(
+            serde_json::to_value(Verification::RequestFailed).unwrap(),
+            serde_json::json!({"status":"request_failed"})
         );
     }
 
@@ -314,33 +330,82 @@ mod tests {
         m.assert();
     }
 
+    /// The token check's classification. Only a 401 is about the token, and only no answer is
+    /// "unreachable": a provider that answered keeps the code of what it answered (WI-453
+    /// follow-up) — an error status is the Hetzner API error with its status (a 429 among them,
+    /// whose help says to wait), an answer that does not parse a request failure naming the
+    /// endpoint. They were all `provider_unreachable`, which said the provider never answered.
     #[test]
-    fn a_401_is_token_rejected_and_anything_else_unreachable() {
-        let mut s = mockito::Server::new();
-        let _m = locations(&mut s, 401);
-        let e = ping(
-            &ctx(&s.url()),
-            "hetzner-cloud",
-            &token(),
-            &CancellationToken::new(),
-        )
-        .unwrap_err();
-        assert_eq!(
-            UiError::from(&e).code.as_deref(),
-            Some(codes::TOKEN_REJECTED)
+    fn a_401_is_token_rejected_and_an_answer_keeps_its_own_code() {
+        let ping_with = |status: usize, body: &str| {
+            let mut s = mockito::Server::new();
+            let _m = s
+                .mock("GET", "/v1/locations")
+                .with_status(status)
+                .with_header("content-type", "application/json")
+                .with_body(body)
+                .create();
+            let e = ping(
+                &ctx(&s.url()),
+                "hetzner-cloud",
+                &token(),
+                &CancellationToken::new(),
+            )
+            .unwrap_err();
+            UiError::from(&e)
+        };
+        let error = |code: &str, message: &str| {
+            format!(r#"{{"error":{{"code":"{code}","message":"{message}"}}}}"#)
+        };
+        let rejected = ping_with(401, &error("unauthorized", "no"));
+        assert_eq!(rejected.code.as_deref(), Some(codes::TOKEN_REJECTED));
+        for (status, api_code) in [
+            (503, "unavailable"),
+            (500, "server_error"),
+            (403, "forbidden"),
+        ] {
+            let ui = ping_with(status, &error(api_code, "m"));
+            assert_eq!(
+                ui.code.as_deref(),
+                Some(codes::HETZNER_API_ERROR),
+                "{status}: {ui:?}"
+            );
+            assert_eq!(ui.fields["status"], serde_json::json!(status), "{ui:?}");
+            assert_eq!(ui.fields["apiCode"], serde_json::json!(api_code), "{ui:?}");
+            assert!(
+                !ui.help
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("unreachable"),
+                "{status}: {ui:?}"
+            );
+        }
+        // Rate-limited: the API error with its status, its help saying to wait.
+        let limited = ping_with(429, &error("rate_limit_exceeded", "slow down"));
+        assert_eq!(limited.code.as_deref(), Some(codes::HETZNER_API_ERROR));
+        assert_eq!(limited.fields["status"], serde_json::json!(429));
+        assert!(
+            limited
+                .help
+                .as_deref()
+                .unwrap_or_default()
+                .contains("429 rate limit — too many requests: wait"),
+            "{limited:?}"
         );
-        let mut s = mockito::Server::new();
-        let _m = locations(&mut s, 503);
-        let e = ping(
-            &ctx(&s.url()),
-            "hetzner-cloud",
-            &token(),
-            &CancellationToken::new(),
-        )
-        .unwrap_err();
+        // An answer the check cannot read: a request failure naming the endpoint, its cause the
+        // parse error.
+        let unreadable = ping_with(200, r#"{"nope":1}"#);
         assert_eq!(
-            UiError::from(&e).code.as_deref(),
-            Some(codes::PROVIDER_UNREACHABLE)
+            unreadable.code.as_deref(),
+            Some(codes::PROVIDER_REQUEST_FAILED)
+        );
+        assert_eq!(
+            unreadable.fields["endpoint"],
+            serde_json::json!("GET /v1/locations")
+        );
+        assert!(
+            unreadable.causes[0].starts_with("parse list_locations response: "),
+            "{unreadable:?}"
         );
     }
 
@@ -416,6 +481,24 @@ mod tests {
         assert_eq!(
             verification(&ctx(&s.url()), "hetzner-cloud", Some(&token()), &cancel),
             Verification::HttpError { http_status: 503 }
+        );
+        // A provider that answered is not unreachable (WI-453 follow-up): a 429 says it is
+        // rate-limiting, an answer that does not parse that the request failed.
+        let mut s = mockito::Server::new();
+        let _m = locations(&mut s, 429);
+        assert_eq!(
+            verification(&ctx(&s.url()), "hetzner-cloud", Some(&token()), &cancel),
+            Verification::RateLimited
+        );
+        let mut s = mockito::Server::new();
+        let _m = s
+            .mock("GET", "/v1/locations")
+            .with_status(200)
+            .with_body(r#"{"nope":1}"#)
+            .create();
+        assert_eq!(
+            verification(&ctx(&s.url()), "hetzner-cloud", Some(&token()), &cancel),
+            Verification::RequestFailed
         );
         assert_eq!(
             verification(

@@ -6,6 +6,7 @@ import { act, cleanup, render, screen, waitFor, within } from '@testing-library/
 import userEvent from '@testing-library/user-event';
 import { ToastProvider, ToastViewport } from '../../components/Toast';
 import { endedAwaySnapshot, resetEndedAway } from '../../ipc/away';
+import { CORE_ERROR_CODES } from '../../ipc/generated/core-errors';
 import type { OpEvent } from '../../ipc/generated/OpEvent';
 import { resetHeldPlans } from '../../ipc/heldPlans';
 import { resetOperations } from '../../ipc/operations';
@@ -24,6 +25,9 @@ import {
 import { settleIpc } from '../../test/settle';
 import { tabHost } from '../../test/tab';
 import { ChangeMachineDialog, type MachineNow } from './ChangeMachineDialog';
+
+/** What the core says when the provider's API gave no answer (WI-453: `provider_unreachable`). */
+const DEAD_API = 'provider `hetzner-cloud` API was unreachable';
 
 let h: Harness;
 beforeEach(() => {
@@ -216,13 +220,13 @@ test("a provisioned target's refusal is shown and nothing runs", async () => {
 
 test('a run that fails says why and the dialog stays open', async () => {
   h.plan('op_plan_target_machine', planParts({ target: 'staging' }), [
-    failed(uiError('apprafter::provider::request_failed', 'the Hetzner Cloud API did not answer')),
+    failed(uiError(CORE_ERROR_CODES.TARGET_PROVIDER_UNREACHABLE, DEAD_API)),
   ]);
   const { user, onClose } = renderChange('staging', STAGING);
   await waitFor(() => expect(radio('cx22').checked).toBe(true));
   await user.click(radio('cpx22'));
   await user.click(apply());
-  expect(await screen.findByText('the Hetzner Cloud API did not answer')).toBeDefined();
+  expect(await screen.findByText(DEAD_API)).toBeDefined();
   expect(onClose).not.toHaveBeenCalled();
 });
 

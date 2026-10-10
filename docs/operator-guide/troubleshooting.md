@@ -66,7 +66,9 @@ the diagnostic body usually points at the offending expression.
 
 ### `apprafter::provider::hetzner_api_error`
 
-The Hetzner Cloud API refused the request.
+The Hetzner Cloud API refused the request. The credential check
+reports this code too, for any status but 401
+(`apprafter::target::token_rejected`).
 
 **Fix.** Read the inner help. It lists what each status means:
 
@@ -248,15 +250,16 @@ refuses it first (`apprafter::target::invalid_token`).
 
 ### `apprafter::target::provider_unreachable`
 
-The provider's API could not serve a request, for a reason no
-other token fixes. Any request that gets **no answer** — the
-connection is refused, the name does not resolve, the request
-times out — reports this code, whether it was the credential
-check, a machine catalogue read or `apply`. The credential check
-also reports it for any other **non-401** failure: a 5xx
-provider-side outage or a 429 rate limit. The token may still be
-valid once the API recovers — the help text intentionally avoids
-any rotation suggestion that would misdirect operators.
+The provider's API gave **no answer**: the connection was
+refused, the name did not resolve, or the request timed out. Any
+request reports this code, whether it was the credential check, a
+machine catalogue read or `apply`. A provider that answered is
+never reported this way: a 5xx outage or a 429 rate limit is
+`apprafter::provider::hetzner_api_error` with its status, and an
+answer AppRafter cannot read is `apprafter::provider::request_failed`.
+The token may still be valid once the API recovers — the help text
+intentionally avoids any rotation suggestion that would misdirect
+operators.
 
 **Fix.**
 

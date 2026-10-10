@@ -43,8 +43,10 @@ describe('This computer', () => {
       { status: 'skipped', reason: 'no_token' },
       { status: 'skipped', reason: 'unsupported_provider' },
       { status: 'rejected' },
+      { status: 'rate_limited' },
       { status: 'http_error', httpStatus: 503 },
       { status: 'unreachable' },
+      { status: 'request_failed' },
     ];
     for (const v of notVerified) {
       const line = verificationLine(v);
@@ -61,6 +63,18 @@ describe('This computer', () => {
     expect(verificationLine({ status: 'http_error', httpStatus: 503 }).text).toBe(
       'The provider answered HTTP 503',
     );
+    // A provider that answered is never "unreachable" (WI-453 follow-up).
+    expect(verificationLine({ status: 'rate_limited' })).toEqual({
+      tone: 'err',
+      text: 'The provider is rate-limiting requests (HTTP 429): try again shortly',
+    });
+    expect(verificationLine({ status: 'request_failed' })).toEqual({
+      tone: 'err',
+      text: "The provider's answer could not be read: Doctor shows why",
+    });
+    for (const status of ['rate_limited', 'request_failed'] as const) {
+      expect(verificationLine({ status }).text).not.toMatch(/unreachable/i);
+    }
   });
 
   test('lines: identity, the CLI default found, missing or none', () => {

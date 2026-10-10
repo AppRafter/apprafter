@@ -532,13 +532,12 @@ pub enum CliError {
         cause: Box<dyn miette::Diagnostic + Send + Sync + 'static>,
     },
 
-    /// The provider's API could not serve a request, for a reason no other token fixes. The
-    /// Hetzner client raises it for every request that got no answer (a failed lookup, a
-    /// refused or dropped connection, a timeout), the cause a [`TransportFailure`]; the token
-    /// ping (`apprafter_core::provider::ping`) also for any other non-401 failure — 429, 5xx —
-    /// the raw error as the cause. One code for a dead API, whichever request found it
-    /// (WI-453). The help points at `apprafter doctor`, the status page and, for the commands
-    /// that have it, `--no-ping`.
+    /// The provider's API gave no answer: the Hetzner client raises it for every request that
+    /// got none (a failed lookup, a refused or dropped connection, a timeout), the cause a
+    /// [`TransportFailure`]. One code for a dead API, whichever request found it, the token
+    /// check's included (WI-453); a provider that answered is never this — an error status is
+    /// [`CliError::Hetzner`], a 429 or a 5xx among them. The help points at `apprafter doctor`,
+    /// the status page and, for the commands that have it, `--no-ping`.
     #[error("provider `{provider}` API was unreachable")]
     #[diagnostic(
         code(apprafter::target::provider_unreachable),

@@ -6,6 +6,7 @@ import { act, cleanup, render, screen, waitFor, within } from '@testing-library/
 import userEvent from '@testing-library/user-event';
 import { ToastProvider, ToastViewport } from '../../components/Toast';
 import { endedAwaySnapshot, resetEndedAway } from '../../ipc/away';
+import { CORE_ERROR_CODES } from '../../ipc/generated/core-errors';
 import { DESKTOP_ERROR_CODES } from '../../ipc/generated/errors';
 import type { OpEvent } from '../../ipc/generated/OpEvent';
 import { newScope, resetLifecycle, sessionScope } from '../../ipc/lifecycle';
@@ -28,6 +29,8 @@ import { settleIpc } from '../../test/settle';
 import { AddTargetWizard, DRAFT_GONE } from './AddTargetWizard';
 
 const TOKEN = 'A1'.repeat(32);
+/** What the core says when the provider's API gave no answer (WI-453: `provider_unreachable`). */
+const DEAD_API = 'provider `hetzner-cloud` API was unreachable';
 let h: Harness;
 beforeEach(() => {
   h = installHarness();
@@ -282,9 +285,7 @@ describe('machine step', () => {
   test('Try again keeps the focus in the dialog, so Esc still closes it', async () => {
     const { user, onClose } = renderWizard();
     await toMachine(user, [
-      failed(
-        uiError('apprafter::provider::request_failed', 'the Hetzner Cloud API did not answer'),
-      ),
+      failed(uiError(CORE_ERROR_CODES.TARGET_PROVIDER_UNREACHABLE, DEAD_API)),
     ]);
     const again = await screen.findByRole('button', { name: 'Try again' });
     h.read('op_start_machine_catalogue', []); // keeps reading: the step has no control meanwhile
@@ -300,11 +301,9 @@ describe('machine step', () => {
   test('another catalogue failure shows its message, and Try again reads again', async () => {
     const { user } = renderWizard();
     await toMachine(user, [
-      failed(
-        uiError('apprafter::provider::request_failed', 'the Hetzner Cloud API did not answer'),
-      ),
+      failed(uiError(CORE_ERROR_CODES.TARGET_PROVIDER_UNREACHABLE, DEAD_API)),
     ]);
-    expect(await screen.findByText('the Hetzner Cloud API did not answer')).toBeDefined();
+    expect(await screen.findByText(DEAD_API)).toBeDefined();
     h.read('op_start_machine_catalogue', [completed(catalogue())]);
     await user.click(screen.getByRole('button', { name: 'Try again' }));
     expect(await screen.findByRole('table', { name: 'Machines in nbg1' })).toBeDefined();

@@ -5,4 +5,4 @@ import type { SkipReason } from "./SkipReason";
 /**
  * What a token check found. Never fails: whoami and doctor show it as a row.
  */
-export type Verification = { "status": "verified", elapsedMs: number, } | { "status": "skipped", reason: SkipReason, } | { "status": "rejected" } | { "status": "http_error", httpStatus: number, } | { "status": "unreachable" };
+export type Verification = { "status": "verified", elapsedMs: number, } | { "status": "skipped", reason: SkipReason, } | { "status": "rejected" } | { "status": "rate_limited" } | { "status": "http_error", httpStatus: number, } | { "status": "unreachable" } | { "status": "request_failed" };

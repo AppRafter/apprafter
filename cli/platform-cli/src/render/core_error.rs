@@ -144,14 +144,15 @@ pub(crate) fn cli_help(e: &CoreError) -> Option<String> {
             resize_recipe(name)
         ),
         // A 200 whose body does not deserialise, or a request ureq would not send (a malformed
-        // URL, an unknown scheme, a bad proxy setting); doctor passes for the first. No answer
-        // is `provider_unreachable`, with its own help (WI-453).
+        // URL, an unknown scheme, a bad proxy setting) — from a read or the token check alike,
+        // so doctor may fail the same way. No answer is `provider_unreachable`, an error status
+        // `hetzner_api_error`, each with its own help (WI-453).
         CoreError::ProviderRequestFailed { .. } => {
             "The provider API answered with something this version of AppRafter cannot read, \
              or the request could not be sent at all (a malformed URL or proxy setting); the \
-             cause above says which. Nothing was changed. If `apprafter doctor` passes, the \
-             answer itself is the problem: a proxy in between, or a change in the provider's \
-             API."
+             cause above says which. Nothing was changed, and neither is a credentials problem. \
+             An answer that cannot be read comes from a proxy in between, or from a change in \
+             the provider's API that a newer AppRafter reads."
                 .into()
         }
         CoreError::ToolUnsupported { tool, .. } => format!(
@@ -337,6 +338,10 @@ mod tests {
         let help = r.help().unwrap().to_string();
         assert!(!help.contains("did not answer"), "{help}");
         assert!(help.contains("cannot read"), "{help}");
+        // The token check reports an answer it cannot read here too (WI-453 follow-up), and
+        // doctor's token row then fails the same way: the help may not hang on doctor passing.
+        assert!(!help.contains("doctor` passes"), "{help}");
+        assert!(help.contains("neither is a credentials problem"), "{help}");
         assert!(
             r.chain()
                 .any(|e| e.to_string().contains("parse get_server response")),

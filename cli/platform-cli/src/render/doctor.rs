@@ -122,9 +122,17 @@ pub(crate) fn hint(c: &Check) -> Option<String> {
             "provider API returned an unexpected error — retry, then check Hetzner status page"
                 .to_string()
         }
+        CheckFix::ProviderRateLimited => {
+            "the provider API is rate-limiting requests (HTTP 429) — wait, then rerun".to_string()
+        }
         CheckFix::ProviderUnreachable => {
             "could not reach the provider API — check DNS / network / proxy, or rerun with \
              `--no-ping` to skip this check"
+                .to_string()
+        }
+        CheckFix::ProviderRequestFailed => {
+            "the provider API answered with something this version cannot read, or the request \
+             could not be sent (a malformed URL or proxy setting) — the detail says which"
                 .to_string()
         }
         // `--renew --ssh-key` changes the key and keeps everything else, the token included;
@@ -471,6 +479,16 @@ mod tests {
                 CheckFix::ProviderUnreachable,
                 "could not reach the provider API — check DNS / network / proxy, or rerun with \
                  `--no-ping` to skip this check",
+            ),
+            (
+                CheckFix::ProviderRateLimited,
+                "the provider API is rate-limiting requests (HTTP 429) — wait, then rerun",
+            ),
+            (
+                CheckFix::ProviderRequestFailed,
+                "the provider API answered with something this version cannot read, or the \
+                 request could not be sent (a malformed URL or proxy setting) — the detail says \
+                 which",
             ),
             (
                 CheckFix::ConfigureSshKey { target: "p".into() },
