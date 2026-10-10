@@ -3,6 +3,8 @@
 // the Bounded plan's plain confirm (spec §4.4). The token is sent once, to verify it; Rust keeps it
 // as a draft and the field is emptied (decision 6). The catalogue and the plan name the draft.
 // No Paste (no clipboard read, R11), no --force, no --no-ping (decision 8), no provisioning (D.12).
+// It is an app overlay (shell/AppOverlays.tsx, opened through screens/flows.tsx): over every view,
+// never hidden by a tab switch; its close discards the draft it holds, the lock drops it.
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useEffect, useLayoutEffect, useReducer, useRef, useState } from 'react';
 import { Button } from '../../components/Button';

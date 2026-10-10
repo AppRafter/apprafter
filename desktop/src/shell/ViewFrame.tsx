@@ -13,7 +13,8 @@ import { ScopeContext, useScope } from '../state/scope';
 /** Opens an overlay; `render` gets the function that closes it. */
 export type ShowOverlay = (render: (close: () => void) => ReactNode) => void;
 
-const OverlayContext = createContext<ShowOverlay | null>(null);
+/** The overlay host `useOverlay` opens in: a ViewFrame's, or inside an app overlay the app's. */
+export const OverlayContext = createContext<ShowOverlay | null>(null);
 
 export function useOverlay(): ShowOverlay {
   const show = useContext(OverlayContext);

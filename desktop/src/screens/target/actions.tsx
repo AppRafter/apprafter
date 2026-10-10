@@ -74,9 +74,10 @@ export function useMakeDefault(
 }
 
 /**
- * A bounded or destructive plan's confirm, opened as an overlay of the current view. The screen
- * that opens it holds the plan until it runs or the confirm closes, so the screen's going (its
- * tab closed, the lock) discards it (heldPlans); a plan made after it went is discarded at once.
+ * A bounded or destructive plan's confirm, opened as an overlay beside the screen that asks for
+ * it (a view's, or inside an app overlay the app's: the doctor's key change). That screen holds
+ * the plan until it runs or the confirm closes, so its going (its tab closed, the lock) discards
+ * it (heldPlans); a plan made after it went is discarded at once.
  * Also Change machine's (D.3e): its own overlay, so its form is never inside the frame's
  * (GOTCHA-144).
  */

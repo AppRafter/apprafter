@@ -177,3 +177,13 @@ test('a store that cannot be read says why', async () => {
   expect((await screen.findByRole('alert')).textContent).toContain('cannot read the target store');
   expect(screen.queryByRole('heading', { name: 'No targets yet' })).toBeNull();
 });
+
+test('the Add target card is enabled and opens the wizard', async () => {
+  const user = renderScreen(<TargetsPage onOpen={() => {}} openTargets={new Set()} />);
+  const add = (await screen.findByRole('button', { name: /Add target/ })) as HTMLButtonElement;
+  expect(add.disabled).toBe(false);
+  expect(add.textContent).toContain('Hetzner Cloud token, region, machine');
+  expect(add.textContent).not.toContain('Arrives in D.3');
+  await user.click(add);
+  expect(await screen.findByRole('dialog', { name: 'Add target' })).toBeDefined();
+});

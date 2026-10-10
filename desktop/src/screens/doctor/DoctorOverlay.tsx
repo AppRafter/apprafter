@@ -25,6 +25,7 @@ import * as api from '../../ipc/api';
 import type { CheckFix } from '../../ipc/generated/CheckFix';
 import type { DoctorReport } from '../../ipc/generated/DoctorReport';
 import type { OpId } from '../../ipc/generated/OpId';
+import type { UiError } from '../../ipc/generated/UiError';
 import { useOperation } from '../../ipc/operations';
 import type { OpNote } from '../../ipc/plans';
 import { useCopy } from '../../state/copy';
@@ -39,6 +40,8 @@ export interface DoctorOverlayProps {
   readonly onToolchain: () => void;
   /** The SSH key fixes (none set, file gone, not a public key): the Target screen's key change. */
   readonly onChangeSshKey: () => void;
+  /** A fix's flow that failed where it could show nothing itself (the key change's reads). */
+  readonly fixFailure?: UiError | null;
 }
 
 /** The header's chips: one per status that has rows, in the order a reader triages them. */
@@ -74,6 +77,7 @@ export function DoctorOverlay({
   onAddTarget,
   onToolchain,
   onChangeSshKey,
+  fixFailure = null,
 }: DoctorOverlayProps) {
   const id = useId();
   const copy = useCopy();
@@ -143,6 +147,7 @@ export function DoctorOverlay({
         <IconButton label="Close" icon={XIcon} onClick={onClose} />
       </div>
       <div className="modal-body doctor-body" data-modal-body>
+        {fixFailure !== null && <ErrorPanel error={fixFailure} />}
         {notes.length > 0 && (
           <ul className="doctor-notes" aria-label="Warnings">
             {notes.map((note) => (

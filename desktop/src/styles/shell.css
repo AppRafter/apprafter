@@ -284,7 +284,10 @@
   border-bottom: 1px solid var(--border);
 }
 
+/* The name takes the row; Run doctor sits at its end. */
 .cluster-name {
+  flex: 1;
+  min-width: 0;
   overflow: hidden;
   font-size: var(--fs-15);
   font-weight: 700;
@@ -549,9 +552,10 @@
   font-size: 24px;
 }
 
-.add-target-card:disabled {
-  cursor: default;
-  opacity: 0.6;
+.add-target-card:hover {
+  border-color: var(--fg-faint);
+  color: var(--fg);
+  cursor: pointer;
 }
 
 .add-target-title {
@@ -561,11 +565,6 @@
 
 .add-target-sub {
   font-size: var(--fs-12);
-}
-
-.add-target-when {
-  color: var(--fg-faint);
-  font: 400 var(--fs-11-5) var(--font-mono);
 }
 
 /* Lock screen ----------------------------------------------------------------------------------- */

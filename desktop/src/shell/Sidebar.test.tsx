@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
 import { clearMocks, mockIPC } from '@tauri-apps/api/mocks';
-import { act, cleanup, render, screen, within } from '@testing-library/react';
-import userEvent from '@testing-library/user-event';
+import { act, cleanup, screen, within } from '@testing-library/react';
 import type { AppInfo } from '../ipc/generated/AppInfo';
 import type { OpSummary } from '../ipc/generated/OpSummary';
 import { refreshList, resetOperations } from '../ipc/operations';
 import type { TargetTab } from '../state/session';
+import { renderScreen } from '../test/screens';
 import { settleIpc } from '../test/settle';
 import { Sidebar, type SidebarProps } from './Sidebar';
-import { ViewFrame } from './ViewFrame';
 
 const INFO: AppInfo = {
   os: 'linux',
@@ -62,12 +61,8 @@ function sidebar(more: Partial<SidebarProps> = {}) {
     onLock: mock(),
     ...more,
   };
-  render(
-    <ViewFrame>
-      <Sidebar {...props} />
-    </ViewFrame>,
-  );
-  return { user: userEvent.setup(), ...props };
+  const user = renderScreen(<Sidebar {...props} />, { info: props.info });
+  return { user, ...props };
 }
 
 describe('Sidebar', () => {
@@ -80,6 +75,24 @@ describe('Sidebar', () => {
       false,
     );
     expect(screen.getByRole('button', { name: 'Target' })).toBeDefined();
+  });
+
+  test('on a target tab the cluster header has Run doctor; it opens Doctor · prod-eu', async () => {
+    clearMocks(); // a doctor read that keeps running
+    mockIPC((cmd) => {
+      if (cmd === 'op_start_doctor') return 5_000_005;
+      if (cmd === 'op_subscribe') return { subscription: 1, replay: [] };
+      return cmd === 'op_list' ? [] : null;
+    });
+    const { user } = sidebar();
+    const header = document.querySelector('.cluster-header') as HTMLElement;
+    await user.click(within(header).getByRole('button', { name: 'Run doctor' }));
+    expect(await screen.findByRole('dialog', { name: 'Doctor · prod-eu' })).toBeDefined();
+  });
+
+  test('the Targets view has no Run doctor', () => {
+    sidebar({ tab: null });
+    expect(screen.queryByRole('button', { name: 'Run doctor' })).toBeNull();
   });
 
   test('a nav item navigates', async () => {

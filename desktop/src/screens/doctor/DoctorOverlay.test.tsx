@@ -5,6 +5,7 @@ import { clearMocks } from '@tauri-apps/api/mocks';
 import { act, cleanup, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { ToastProvider, ToastViewport } from '../../components/Toast';
+import type { UiError } from '../../ipc/generated/UiError';
 import { resetOperations } from '../../ipc/operations';
 import { ViewFrame } from '../../shell/ViewFrame';
 import { PlatformContext } from '../../state/platform';
@@ -35,7 +36,7 @@ afterEach(async () => {
   clearMocks();
 });
 
-function renderDoctor(target: string, strict = false) {
+function renderDoctor(target: string, strict = false, fixFailure: UiError | null = null) {
   const onClose = mock();
   const onAddTarget = mock();
   const onToolchain = mock();
@@ -51,6 +52,7 @@ function renderDoctor(target: string, strict = false) {
               onAddTarget={onAddTarget}
               onToolchain={onToolchain}
               onChangeSshKey={onChangeSshKey}
+              fixFailure={fixFailure}
             />
           </ViewFrame>
           <ToastViewport />
@@ -347,6 +349,17 @@ describe('DoctorOverlay', () => {
     renderDoctor('prod-eu');
     expect(await screen.findByText('the doctor broke')).toBeDefined();
     expect(screen.getByText('kubectl answered slowly')).toBeDefined();
+  });
+
+  test("a fix's flow that failed is shown above the report, the report kept", async () => {
+    h.read('op_start_doctor', [completed(doctorReport())]);
+    renderDoctor(
+      'prod-eu',
+      false,
+      uiError('apprafter::target::not_found', 'target `prod-eu` was not found'),
+    );
+    expect(await screen.findByText('target `prod-eu` was not found')).toBeDefined();
+    expect(screen.getByText('3 pass')).toBeDefined();
   });
 
   test('a failed run shows its error and Run again', async () => {

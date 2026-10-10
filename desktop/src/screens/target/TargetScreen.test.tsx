@@ -308,3 +308,29 @@ test('a target that cannot be shown says why', async () => {
   );
   expect(screen.queryByRole('group', { name: 'Machine' })).toBeNull();
 });
+
+test('Run doctor in the page header opens Doctor · <name>', async () => {
+  const user = screenOf('prod-eu');
+  await user.click(await screen.findByRole('button', { name: 'Run doctor' }));
+  expect(await screen.findByRole('dialog', { name: 'Doctor · prod-eu' })).toBeDefined();
+});
+
+test("the Machine row's Change opens Change machine · <name> for a target with no server", async () => {
+  const user = screenOf('staging');
+  const machine = await screen.findByRole('group', { name: 'Machine' });
+  await user.click(within(machine).getByRole('button', { name: 'Change' }));
+  const dialog = await screen.findByRole('dialog', { name: 'Change machine · staging' });
+  // It opens on the machine the target is set to (its report: fsn1, cx22).
+  await waitFor(() =>
+    expect((within(dialog).getByRole('radio', { name: 'cx22' }) as HTMLInputElement).checked).toBe(
+      true,
+    ),
+  );
+});
+
+test("a provisioned target has no Change, and D.3d's refusal text stays", async () => {
+  screenOf('prod-eu');
+  const machine = await screen.findByRole('group', { name: 'Machine' });
+  expect(within(machine).queryByRole('button', { name: 'Change' })).toBeNull();
+  expect(machine.textContent).toContain('apprafter backup create');
+});
