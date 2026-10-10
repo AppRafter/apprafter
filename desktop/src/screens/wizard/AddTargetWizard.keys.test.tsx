@@ -18,6 +18,7 @@ import { ViewFrame } from '../../shell/ViewFrame';
 import { PlatformContext } from '../../state/platform';
 import { createQueryClient } from '../../state/queryClient';
 import { appInfo } from '../../test/fixtures';
+import { settleIpc } from '../../test/settle';
 import { AddTargetWizard } from './AddTargetWizard';
 
 const TOKEN = 'A1'.repeat(32);
@@ -26,8 +27,9 @@ beforeEach(async () => {
   installMockIpc({ opDelayMs: 0 });
   await api.unlock();
 });
-afterEach(() => {
+afterEach(async () => {
   cleanup();
+  await settleIpc();
   resetOperations();
   resetEndedAway();
   clearMocks();

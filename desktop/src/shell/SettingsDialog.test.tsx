@@ -12,6 +12,7 @@ import { PlatformContext } from '../state/platform';
 import { createQueryClient } from '../state/queryClient';
 import { appInfo, authInfo, settings } from '../test/fixtures';
 import { toolchainReport, whoamiReport } from '../test/flows';
+import { settleIpc } from '../test/settle';
 import { PlatformGate } from './PlatformGate';
 import { SettingsDialog } from './SettingsDialog';
 
@@ -103,8 +104,9 @@ beforeEach(() => {
   });
 });
 
-afterEach(() => {
+afterEach(async () => {
   cleanup();
+  await settleIpc();
   clearMocks();
 });
 

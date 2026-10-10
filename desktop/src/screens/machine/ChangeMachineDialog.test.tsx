@@ -22,6 +22,7 @@ import {
   installHarness,
   uiError,
 } from '../../test/ipc';
+import { settleIpc } from '../../test/settle';
 import { ChangeMachineDialog, type MachineNow } from './ChangeMachineDialog';
 
 let h: Harness;
@@ -30,8 +31,9 @@ beforeEach(() => {
   h.read('op_start_machine_catalogue', [completed(catalogue())]);
   h.read('op_start_region_latencies', [completed([{ region: 'nbg1', latencyMs: 38 }])]);
 });
-afterEach(() => {
+afterEach(async () => {
   cleanup();
+  await settleIpc();
   resetOperations();
   resetEndedAway();
   resetHeldPlans();

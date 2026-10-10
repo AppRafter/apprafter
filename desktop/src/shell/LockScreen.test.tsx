@@ -11,6 +11,7 @@ import type { JsonValue } from '../ipc/generated/serde_json/JsonValue';
 import { PlatformContext } from '../state/platform';
 import { createQueryClient } from '../state/queryClient';
 import { appInfo, authInfo, lockState } from '../test/fixtures';
+import { settleIpc } from '../test/settle';
 import { LockScreen } from './LockScreen';
 
 let calls: { cmd: string; args: unknown }[];
@@ -31,8 +32,9 @@ beforeEach(() => {
   });
 });
 
-afterEach(() => {
+afterEach(async () => {
   cleanup();
+  await settleIpc();
   clearMocks();
 });
 

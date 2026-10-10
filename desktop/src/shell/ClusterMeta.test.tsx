@@ -5,13 +5,17 @@ import { screen } from '@testing-library/react';
 import * as api from '../ipc/api';
 import { installMockIpc } from '../ipc/mock';
 import { renderScreen } from '../test/screens';
+import { settleIpc } from '../test/settle';
 import { ClusterMeta } from './ClusterMeta';
 
 beforeEach(async () => {
   installMockIpc({ opDelayMs: 0 });
   await api.unlock();
 });
-afterEach(() => clearMocks());
+afterEach(async () => {
+  await settleIpc();
+  clearMocks();
+});
 
 test("a target's provider · region · tier, from the store's list", async () => {
   renderScreen(<ClusterMeta target="prod-eu" />);

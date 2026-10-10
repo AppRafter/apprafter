@@ -17,6 +17,7 @@ import { resetOperations } from '../ipc/operations';
 import { PlatformContext } from '../state/platform';
 import { createQueryClient } from '../state/queryClient';
 import { appInfo, lockState, planView } from '../test/fixtures';
+import { settleIpc } from '../test/settle';
 import { EndedAwayNotices } from './EndedAway';
 import { LockGate } from './LockGate';
 import { useOverlay, ViewFrame } from './ViewFrame';
@@ -80,8 +81,9 @@ beforeEach(() => {
     { shouldMockEvents: true },
   );
 });
-afterEach(() => {
+afterEach(async () => {
   cleanup();
+  await settleIpc();
   resetOperations();
   resetEndedAway();
   clearMocks();

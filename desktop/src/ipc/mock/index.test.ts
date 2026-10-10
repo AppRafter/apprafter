@@ -2,6 +2,7 @@
 import { afterEach, describe, expect, jest, test } from 'bun:test';
 import { Channel } from '@tauri-apps/api/core';
 import { clearMocks } from '@tauri-apps/api/mocks';
+import { settleIpc } from '../../test/settle';
 import * as api from '../api';
 import { IpcError } from '../api';
 import { onLockChanged } from '../events';
@@ -18,7 +19,10 @@ import {
   mockOptionsFromUrl,
 } from './index';
 
-afterEach(() => clearMocks());
+afterEach(async () => {
+  await settleIpc();
+  clearMocks();
+});
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
 

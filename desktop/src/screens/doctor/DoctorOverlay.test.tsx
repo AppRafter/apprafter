@@ -20,14 +20,16 @@ import {
   stage,
   uiError,
 } from '../../test/ipc';
+import { settleIpc } from '../../test/settle';
 import { DoctorOverlay } from './DoctorOverlay';
 
 let h: Harness;
 beforeEach(() => {
   h = installHarness();
 });
-afterEach(() => {
+afterEach(async () => {
   cleanup();
+  await settleIpc();
   resetOperations();
   clearMocks();
 });

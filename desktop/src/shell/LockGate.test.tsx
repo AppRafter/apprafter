@@ -18,6 +18,7 @@ import { ACTIVITY_INTERVAL_MS } from '../state/lock';
 import { APP_INFO_KEY, PlatformContext } from '../state/platform';
 import { createQueryClient } from '../state/queryClient';
 import { appInfo, authInfo, lockState } from '../test/fixtures';
+import { settleIpc } from '../test/settle';
 import { LockGate } from './LockGate';
 import { PlatformGate } from './PlatformGate';
 
@@ -48,7 +49,7 @@ beforeEach(() => {
 afterEach(async () => {
   cleanup();
   notifyManager.setScheduler(defaultScheduler);
-  await settle();
+  await settleIpc();
   resetOperations();
   clearMocks();
 });

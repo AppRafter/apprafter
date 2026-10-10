@@ -5,13 +5,15 @@ import { act, renderHook, waitFor } from '@testing-library/react';
 import { DESKTOP_ERROR_CODES } from '../ipc/generated/errors';
 import { resetOperations } from '../ipc/operations';
 import { cancelled, completed, failed, type Harness, installHarness, uiError } from '../test/ipc';
+import { settleIpc } from '../test/settle';
 import { useRead } from './read';
 
 let h: Harness;
 beforeEach(() => {
   h = installHarness();
 });
-afterEach(() => {
+afterEach(async () => {
+  await settleIpc();
   resetOperations();
   clearMocks();
 });

@@ -8,13 +8,15 @@ import { installMockIpc } from '../../ipc/mock';
 import { resetOperations } from '../../ipc/operations';
 import { startPlan } from '../../ipc/plans';
 import { renderScreen } from '../../test/screens';
+import { settleIpc } from '../../test/settle';
 import { TargetsPage } from './TargetsPage';
 
 beforeEach(async () => {
   installMockIpc({ opDelayMs: 0 });
   await api.unlock();
 });
-afterEach(() => {
+afterEach(async () => {
+  await settleIpc();
   resetOperations();
   clearMocks();
 });

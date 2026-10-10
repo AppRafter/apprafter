@@ -12,6 +12,7 @@ import type { ReactNode } from 'react';
 import { LOCK_CHANGED } from '../ipc/generated/events';
 import type { LockState } from '../ipc/generated/LockState';
 import { lockState } from '../test/fixtures';
+import { settleIpc } from '../test/settle';
 import { useLockActions, useLockState } from './lock';
 import { createQueryClient } from './queryClient';
 
@@ -74,8 +75,9 @@ beforeEach(() => {
   });
 });
 
-afterEach(() => {
+afterEach(async () => {
   cleanup();
+  await settleIpc();
   clearMocks();
 });
 

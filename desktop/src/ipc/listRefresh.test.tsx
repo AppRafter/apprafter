@@ -3,6 +3,7 @@ import { afterEach, beforeEach, expect, test } from 'bun:test';
 import type { Channel } from '@tauri-apps/api/core';
 import { clearMocks, mockIPC } from '@tauri-apps/api/mocks';
 import { act, cleanup, renderHook } from '@testing-library/react';
+import { settleIpc } from '../test/settle';
 import type { OpEvent } from './generated/OpEvent';
 import type { OpSummary } from './generated/OpSummary';
 import { useListRefresh } from './listRefresh';
@@ -26,8 +27,9 @@ beforeEach(() => {
   });
 });
 
-afterEach(() => {
+afterEach(async () => {
   cleanup();
+  await settleIpc();
   resetOperations();
   clearMocks();
 });

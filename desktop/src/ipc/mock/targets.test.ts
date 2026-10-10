@@ -3,6 +3,7 @@
 // Rust does — the store, the drafts a verify leaves and the add plan takes, the refusals.
 import { afterEach, beforeEach, expect, test } from 'bun:test';
 import { clearMocks } from '@tauri-apps/api/mocks';
+import { settleIpc } from '../../test/settle';
 import * as api from '../api';
 import { CORE_ERROR_CODES } from '../generated/core-errors';
 import { DESKTOP_ERROR_CODES } from '../generated/errors';
@@ -24,7 +25,8 @@ beforeEach(async () => {
   installMockIpc({ opDelayMs: 0 });
   await api.unlock();
 });
-afterEach(() => {
+afterEach(async () => {
+  await settleIpc();
   resetOperations();
   clearMocks();
 });

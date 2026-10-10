@@ -4,6 +4,7 @@
 import { afterEach, beforeEach, expect, mock, setSystemTime, test } from 'bun:test';
 import { Channel } from '@tauri-apps/api/core';
 import { clearMocks } from '@tauri-apps/api/mocks';
+import { settleIpc } from '../../test/settle';
 import * as api from '../api';
 import { DESKTOP_ERROR_CODES } from '../generated/errors';
 import type { OpEvent } from '../generated/OpEvent';
@@ -30,7 +31,8 @@ const taken: UiError = {
 };
 
 beforeEach(() => resetOperations());
-afterEach(() => {
+afterEach(async () => {
+  await settleIpc();
   setSystemTime();
   clearMocks();
 });

@@ -11,14 +11,16 @@ import { createQueryClient } from '../state/queryClient';
 import { appInfo } from '../test/fixtures';
 import { whoamiReport } from '../test/flows';
 import { cancelled, completed, type Harness, installHarness, uiError } from '../test/ipc';
+import { settleIpc } from '../test/settle';
 import { cliDefaultLine, IDENTITY, ThisComputerRow, verificationLine } from './ThisComputer';
 
 let h: Harness;
 beforeEach(() => {
   h = installHarness();
 });
-afterEach(() => {
+afterEach(async () => {
   cleanup();
+  await settleIpc();
   resetOperations();
   clearMocks();
 });

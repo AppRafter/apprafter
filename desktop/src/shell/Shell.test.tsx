@@ -17,6 +17,7 @@ import { refreshList, resetOperations } from '../ipc/operations';
 import { PlatformContext } from '../state/platform';
 import { createQueryClient } from '../state/queryClient';
 import { lockState, settings, targetSummary } from '../test/fixtures';
+import { settleIpc } from '../test/settle';
 import { Shell } from './Shell';
 
 const INFO: AppInfo = {
@@ -88,7 +89,7 @@ beforeEach(() => {
 
 afterEach(async () => {
   cleanup();
-  await new Promise((resolve) => setTimeout(resolve, 0));
+  await settleIpc();
   resetOperations();
   resetEndedAway();
   clearMocks();

@@ -22,6 +22,7 @@ import {
   installHarness,
   uiError,
 } from '../../test/ipc';
+import { settleIpc } from '../../test/settle';
 import { AddTargetWizard, DRAFT_GONE } from './AddTargetWizard';
 
 const TOKEN = 'A1'.repeat(32);
@@ -30,8 +31,9 @@ beforeEach(() => {
   h = installHarness();
   h.answer('target_list', { targets: [], unreadable: [], cliDefault: { status: 'unset' } });
 });
-afterEach(() => {
+afterEach(async () => {
   cleanup();
+  await settleIpc();
   resetOperations();
   resetEndedAway();
   clearMocks();

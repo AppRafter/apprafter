@@ -13,6 +13,7 @@ import {
   stage,
   uiError,
 } from '../test/ipc';
+import { settleIpc } from '../test/settle';
 import { IpcError } from './api';
 import { endedAwaySnapshot, resetEndedAway } from './away';
 import { DESKTOP_ERROR_CODES } from './generated/errors';
@@ -30,7 +31,8 @@ let h: Harness;
 beforeEach(() => {
   h = installHarness();
 });
-afterEach(() => {
+afterEach(async () => {
+  await settleIpc();
   resetOperations();
   resetEndedAway();
   clearMocks();

@@ -2,6 +2,7 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { Channel } from '@tauri-apps/api/core';
 import { clearMocks, mockIPC } from '@tauri-apps/api/mocks';
+import { settleIpc } from '../test/settle';
 import * as api from './api';
 import { COMMANDS } from './generated/commands';
 import { DESKTOP_ERROR_CODES } from './generated/errors';
@@ -48,7 +49,10 @@ beforeEach(() => {
   });
 });
 
-afterEach(() => clearMocks());
+afterEach(async () => {
+  await settleIpc();
+  clearMocks();
+});
 
 test('API_COMMANDS is exactly the commands Rust registers', () => {
   expect(new Set(api.API_COMMANDS).size).toBe(api.API_COMMANDS.length);

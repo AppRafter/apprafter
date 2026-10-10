@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 import { afterEach, beforeEach, expect, test } from 'bun:test';
 import { clearMocks, mockIPC } from '@tauri-apps/api/mocks';
+import { settleIpc } from '../test/settle';
 import { discardPlansOf, holdPlan, releasePlan, resetHeldPlans } from './heldPlans';
 
 let discarded: number[];
@@ -13,7 +14,8 @@ beforeEach(() => {
     return null;
   });
 });
-afterEach(() => {
+afterEach(async () => {
+  await settleIpc();
   resetHeldPlans();
   clearMocks();
 });

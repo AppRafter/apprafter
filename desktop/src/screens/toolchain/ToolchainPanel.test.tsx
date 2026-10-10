@@ -12,6 +12,7 @@ import { createQueryClient } from '../../state/queryClient';
 import { appInfo } from '../../test/fixtures';
 import { toolchainReport } from '../../test/flows';
 import { type Harness, installHarness, uiError } from '../../test/ipc';
+import { settleIpc } from '../../test/settle';
 import { ToolchainPanel } from './ToolchainPanel';
 
 let h: Harness;
@@ -19,8 +20,9 @@ beforeEach(() => {
   h = installHarness();
   h.answer('toolchain_status', toolchainReport());
 });
-afterEach(() => {
+afterEach(async () => {
   cleanup();
+  await settleIpc();
   resetOperations();
   clearMocks();
 });

@@ -12,6 +12,7 @@ import type { Quitting } from './ipc/generated/Quitting';
 import type { Settings } from './ipc/generated/Settings';
 import { resetOperations } from './ipc/operations';
 import { appInfo, authInfo, lockState, settings } from './test/fixtures';
+import { settleIpc } from './test/settle';
 
 let calls: { cmd: string; args: unknown }[];
 let appInfoAnswer: () => unknown;
@@ -45,7 +46,7 @@ beforeEach(() => {
 
 afterEach(async () => {
   cleanup();
-  await new Promise((resolve) => setTimeout(resolve, 0));
+  await settleIpc();
   resetOperations();
   clearMocks();
   delete document.documentElement.dataset.theme;

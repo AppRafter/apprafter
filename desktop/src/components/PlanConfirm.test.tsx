@@ -13,13 +13,15 @@ import { installMockIpc, mockOps } from '../ipc/mock';
 import type { MockResult } from '../ipc/mock/ops';
 import { resetOperations } from '../ipc/operations';
 import { renderScreen } from '../test/screens';
+import { settleIpc } from '../test/settle';
 import { PlanConfirm } from './PlanConfirm';
 
 beforeEach(async () => {
   installMockIpc({ opDelayMs: 0 });
   await api.unlock();
 });
-afterEach(() => {
+afterEach(async () => {
+  await settleIpc();
   resetOperations();
   clearMocks();
 });

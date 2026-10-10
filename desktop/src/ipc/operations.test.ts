@@ -4,6 +4,7 @@ import type { Channel } from '@tauri-apps/api/core';
 import { clearMocks, mockIPC } from '@tauri-apps/api/mocks';
 import { act, cleanup, render, renderHook } from '@testing-library/react';
 import { createElement } from 'react';
+import { settleIpc } from '../test/settle';
 import { IpcError } from './api';
 import { DESKTOP_ERROR_CODES } from './generated/errors';
 import type { OpEvent } from './generated/OpEvent';
@@ -76,8 +77,9 @@ beforeEach(() => {
 });
 
 // Unmount first: a reset publishes, and a mounted hook would re-render outside act().
-afterEach(() => {
+afterEach(async () => {
   cleanup();
+  await settleIpc();
   resetOperations();
   clearMocks();
 });

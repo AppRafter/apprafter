@@ -7,6 +7,7 @@ import type { AppInfo } from '../ipc/generated/AppInfo';
 import type { OpSummary } from '../ipc/generated/OpSummary';
 import { refreshList, resetOperations } from '../ipc/operations';
 import type { TargetTab } from '../state/session';
+import { settleIpc } from '../test/settle';
 import { Sidebar, type SidebarProps } from './Sidebar';
 import { ViewFrame } from './ViewFrame';
 
@@ -44,8 +45,9 @@ beforeEach(() => {
 });
 
 // Unmount first: a reset publishes, and a mounted indicator would re-render outside act().
-afterEach(() => {
+afterEach(async () => {
   cleanup();
+  await settleIpc();
   resetOperations();
   clearMocks();
 });
