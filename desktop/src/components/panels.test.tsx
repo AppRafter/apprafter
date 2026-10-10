@@ -3,6 +3,7 @@
 import { describe, expect, mock, test } from 'bun:test';
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import UI_ERRORS from '../ipc/generated/fixtures/ui-errors.json';
 import type { UiError } from '../ipc/generated/UiError';
 import { Button } from './Button';
 import { ErrorPanel } from './ErrorPanel';
@@ -39,6 +40,23 @@ describe('ErrorPanel', () => {
     render(<ErrorPanel error={notFound} onAction={onAction} />);
     await userEvent.setup().click(screen.getByRole('button', { name: 'Add a target' }));
     expect(onAction).toHaveBeenCalledWith({ kind: 'add-target' });
+  });
+
+  // WI-452: the core's real projections carry a source-neutral help — the diagnosis, never a
+  // CLI command or flag the GUI does not have — and the panel shows it beside the action.
+  test('the real projections show a help with no CLI command or flag', () => {
+    for (const [name, ui] of Object.entries(UI_ERRORS as Record<string, UiError>)) {
+      const { unmount } = render(<ErrorPanel error={ui} onAction={() => {}} />);
+      const shown = screen.getByRole('alert').textContent ?? '';
+      expect(shown, name).not.toContain('apprafter ');
+      expect(shown, name).not.toMatch(/`[^`]*--/);
+      if (ui.help !== null) expect(shown, name).toContain(ui.help.split('\n')[0] ?? '');
+      unmount();
+    }
+    render(<ErrorPanel error={UI_ERRORS.tokenRejected as UiError} onAction={() => {}} />);
+    const panel = screen.getByRole('alert');
+    expect(panel.textContent).toContain('mistyped, never had the right scopes');
+    expect(screen.getByRole('button', { name: 'Renew token' })).toBeDefined();
   });
 
   test('an unknown code, or no handler, offers nothing', () => {

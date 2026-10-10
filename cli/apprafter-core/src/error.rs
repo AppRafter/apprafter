@@ -12,7 +12,9 @@
 //! `CliError` variants the core also raises (`TargetNotFound`,
 //! `NoActiveTarget`) are mapped onto the core's own on the way in. Messages carry no client
 //! wording ("pass `--yes`", "run `apprafter …`"): the CLI adds those hints
-//! when it renders, the desktop turns codes into actions.
+//! when it renders, the desktop turns codes into actions. Nor does [`UiError`]'s
+//! `help`: a pass-through `CliError`'s own help is the CLI's, so the projection
+//! carries a source-neutral one in its place (`neutral_help`), or none.
 //!
 //! [`codes`] names every code the core raises or the desktop acts on, and
 //! [`UiError`]'s `fields` carry each variant's structured data — the core's
@@ -321,6 +323,13 @@ impl UiError {
 impl From<&CoreError> for UiError {
     fn from(e: &CoreError) -> Self {
         let mut ui = UiError::from_diagnostic(e);
+        // A pass-through `CliError`'s own help names CLI commands and flags, which the GUI does
+        // not have: the projection carries a source-neutral help instead (decision 4: the CLI's
+        // renderer owns the CLI's help, and renders it from the diagnostic, never from here).
+        // The core's own variants declare no help.
+        if let CoreError::Cli(inner) = e {
+            ui.help = neutral_help(inner);
+        }
         let f = &mut ui.fields;
         let mut put = |k: &str, v: serde_json::Value| {
             f.insert(k.to_string(), v);
@@ -383,6 +392,107 @@ impl From<&CoreError> for UiError {
         }
         ui
     }
+}
+
+/// The help a pass-through `CliError` projects: the diagnosis its CLI help gives, without the
+/// commands and flags (`apprafter target add … --renew`, `--no-ping`), for the errors the
+/// desktop's flows reach — target, provider, token, catalogue, tool, doctor, whoami — and the
+/// codes it acts on. `None` where there is no neutral text: the message and the causes still
+/// show. Exhaustive, so a new `CliError` variant is decided here.
+fn neutral_help(e: &cli_core::CliError) -> Option<String> {
+    use cli_core::CliError as C;
+    use cli_core::SkuCheckFor;
+    Some(match e {
+        C::Hetzner { .. } => "The Hetzner Cloud API returned a non-2xx response. Common causes:\n\
+             • 401 unauthorized — the stored API token was rotated or revoked: renew the \
+               target's token.\n\
+             • 403 forbidden — the token's project lacks permission for this resource type.\n\
+             • 429 rate limit — back off and retry; if it persists, the project may need a quota \
+               increase.\n\
+             • 5xx — an outage at the provider; check https://status.hetzner.com/."
+            .into(),
+        C::ProviderTokenRejected { .. } => {
+            "The provider's read-only credential check returned 401 / unauthorized. Either the \
+             token was mistyped, never had the right scopes, or has been rotated / revoked \
+             since you copied it.\n\
+             • Verify the token at https://console.hetzner.cloud/projects → Security → API \
+               Tokens. It must say `Read & Write` next to the project.\n\
+             • Copy the token again (it is 64 ASCII characters, no prefix) — a common cause is \
+               a trailing newline from a clipboard manager."
+                .into()
+        }
+        C::ProviderApiUnreachable { .. } => {
+            "The credential check could not complete because the provider's API was \
+             unreachable. This is not a credentials problem: the token may still be valid once \
+             the API recovers.\n\
+             • Check the provider's status page (https://status.hetzner.com/ for \
+               hetzner-cloud).\n\
+             • Behind a VPN or a corporate proxy, make sure https://api.hetzner.cloud/ is \
+               reachable."
+                .into()
+        }
+        C::ServerTypeUnavailable {
+            requested,
+            location,
+            kind,
+            context,
+            ..
+        } => match context {
+            SkuCheckFor::Provision => kind.why(requested, location),
+            SkuCheckFor::TargetAdd { .. } | SkuCheckFor::TargetMachine { .. } => {
+                format!("{} Nothing was saved.", kind.why(requested, location))
+            }
+        },
+        C::ExternalToolNotFound { install, .. } => format!(
+            "{install}\n\nNothing was sent anywhere and no credential was used: this check runs \
+             before any work starts, so trying again after installing is safe."
+        ),
+        C::CueNotFound => {
+            "AppRafter runs `cue` to read manifests and could not find it on PATH: install CUE."
+                .into()
+        }
+        C::InvalidState { .. } => {
+            "The state file named above failed to parse; an earlier provision or import wrote \
+             it. Rebuilding it from the provider's resources labelled `apprafter=true` moves the \
+             unreadable file aside rather than deleting it."
+                .into()
+        }
+        C::InvalidTargetConfig { .. } => {
+            "The target store file named above failed to parse: it was edited by hand or \
+             written by an incompatible version. Fix the YAML by hand (it is a small file), or \
+             remove the target and add it again."
+                .into()
+        }
+        C::Io(_) => "A filesystem or network error. The OS message above usually names the \
+             failing path or socket: a missing directory, wrong permissions, a full disk, or a \
+             closed socket."
+            .into(),
+        C::Json(_) => "A JSON file could not be read or written, most often a target's state \
+             file. If it was edited by hand or copied across versions, rebuilding the state \
+             from the provider replaces it."
+            .into(),
+        C::BackupJobActive { job } => format!(
+            "{job} has not finished; start the next run once it has. Two runs at once do not \
+             both finish: two backups need the same helper pods, and a backup and a check each \
+             fail on the other's repository lock."
+        ),
+        // CLI input policy and CLI-only commands (their help is about the command line), and
+        // errors no desktop flow reaches yet, whose help names CLI commands. `TargetNotFound`
+        // and `NoActiveTarget` arrive as the core's own variants (`From`).
+        C::CueExport { .. }
+        | C::Restic { .. }
+        | C::BackupRepoProbe { .. }
+        | C::BackupRunnerUnschedulable { .. }
+        | C::Kubectl { .. }
+        | C::ServerTypeNotSelected
+        | C::TargetNotFound { .. }
+        | C::NoActiveTarget
+        | C::Yaml(_)
+        | C::CompletionInstall(_)
+        | C::ConfirmationRequired { .. }
+        | C::UsageRefused { .. }
+        | C::Other(_) => return None,
+    })
 }
 
 /// Fields of the pass-through `CliError`s the desktop acts on (D.3 overview §3.6.2). Keys are
@@ -517,6 +627,179 @@ pub mod samples {
                 path: s("/home/a/.config/apprafter/age.key"),
             },
         ]
+    }
+
+    /// The errors whose real projections the desktop exports as `fixtures/ui-errors.json`
+    /// (desktop/ipc/tests/export.rs), by fixture name: the frontend's rules are tested on these,
+    /// never on hand-made objects (bug 11). `tokenRejected` is what `provider::ping` makes of a
+    /// 401 (a verify, a renew), the Hetzner error as its cause.
+    pub fn ui_fixtures() -> Vec<(&'static str, CoreError)> {
+        use cli_core::{CliError, SkuCheckFor, UnavailableKind};
+        let hetzner = |status: u16, code: &str, message: &str| CliError::Hetzner {
+            endpoint: "GET /v1/locations".into(),
+            status,
+            code: code.into(),
+            message: message.into(),
+        };
+        vec![
+            (
+                "hetzner401",
+                hetzner(401, "unauthorized", "unable to authenticate").into(),
+            ),
+            (
+                "hetzner403",
+                hetzner(403, "forbidden", "insufficient permissions").into(),
+            ),
+            (
+                "tokenRejected",
+                CliError::ProviderTokenRejected {
+                    provider: "hetzner-cloud".into(),
+                    cause: Box::new(hetzner(401, "unauthorized", "unable to authenticate")),
+                }
+                .into(),
+            ),
+            (
+                "targetExists",
+                CoreError::TargetExists {
+                    name: "prod".into(),
+                },
+            ),
+            (
+                "serverTypeUnavailable",
+                CliError::ServerTypeUnavailable {
+                    requested: "cx22".into(),
+                    location: "nbg1".into(),
+                    kind: UnavailableKind::Retired,
+                    alternatives: "cpx22".into(),
+                    context: SkuCheckFor::TargetAdd {
+                        name: "prod".into(),
+                    },
+                }
+                .into(),
+            ),
+            (
+                "toolNotFound",
+                CliError::ExternalToolNotFound {
+                    tool: "kubectl".into(),
+                    needed_by: "doctor".into(),
+                    purpose: "talks to the cluster".into(),
+                    install: "Install kubectl.".into(),
+                }
+                .into(),
+            ),
+        ]
+    }
+
+    /// One `CliError` of every variant that can be built here (not `Yaml`: `serde_yaml` is not
+    /// a dependency of this crate, and its projection has no help), with every `(kind,
+    /// context)` of a server-type refusal and every tool's real install lines, for the guard
+    /// that no projected help names a CLI command or flag.
+    pub fn cli_errors() -> Vec<cli_core::CliError> {
+        use cli_core::{CliError as C, SkuCheckFor, UnavailableKind};
+        let s = |v: &str| v.to_string();
+        let hetzner = || C::Hetzner {
+            endpoint: s("GET /v1/locations"),
+            status: 401,
+            code: s("unauthorized"),
+            message: s("m"),
+        };
+        let mut out = vec![
+            C::CueNotFound,
+            C::CueExport {
+                exit: 1,
+                stderr: s("e"),
+            },
+            C::Restic {
+                verb: s("backup"),
+                exit: Some(1),
+                stderr: s("e"),
+                hint: s("h"),
+            },
+            C::BackupRepoProbe {
+                repo: s("r"),
+                cat_stderr: s("c"),
+                init_stderr: s("i"),
+                hint: s("h"),
+            },
+            C::BackupRunnerUnschedulable {
+                job: s("j"),
+                what: s("w"),
+                help: s("h"),
+            },
+            C::BackupJobActive { job: s("backup-1") },
+            C::Kubectl {
+                verb: s("get"),
+                resource: s("pods"),
+                exit: Some(1),
+                stderr: s("e"),
+                hint: s("h"),
+            },
+            hetzner(),
+            C::ServerTypeNotSelected,
+            C::InvalidState {
+                path: "/s/state.json".into(),
+                message: s("m"),
+            },
+            C::InvalidTargetConfig {
+                path: "/s/targets/prod/config.yaml".into(),
+                message: s("m"),
+            },
+            C::TargetNotFound {
+                name: s("ghost"),
+                available: s("prod"),
+            },
+            C::NoActiveTarget,
+            C::ProviderTokenRejected {
+                provider: s("hetzner-cloud"),
+                cause: Box::new(hetzner()),
+            },
+            C::ProviderApiUnreachable {
+                provider: s("hetzner-cloud"),
+                cause: Box::new(hetzner()),
+            },
+            C::Io(std::io::Error::other("denied")),
+            C::Json(serde_json::from_str::<u8>("x").unwrap_err()),
+            C::CompletionInstall(s("no destination")),
+            C::ConfirmationRequired {
+                action: s("removing target `prod`"),
+            },
+            C::UsageRefused {
+                message: s("m"),
+                help: s("h"),
+            },
+            C::Other(s("o")),
+        ];
+        for kind in [
+            UnavailableKind::Unknown,
+            UnavailableKind::NotOfferedInRegion,
+            UnavailableKind::Retired,
+            UnavailableKind::OutOfCapacity,
+        ] {
+            for context in [
+                SkuCheckFor::Provision,
+                SkuCheckFor::TargetAdd { name: s("prod") },
+                SkuCheckFor::TargetMachine { name: s("prod") },
+            ] {
+                out.push(C::ServerTypeUnavailable {
+                    requested: s("cx22"),
+                    location: s("nbg1"),
+                    kind,
+                    alternatives: s("cpx22"),
+                    context,
+                });
+            }
+        }
+        out.extend(
+            cli_core::tools::ALL
+                .iter()
+                .map(|t| C::ExternalToolNotFound {
+                    tool: s(t.name),
+                    needed_by: s("doctor"),
+                    purpose: s(t.purpose),
+                    install: s(t.install),
+                }),
+        );
+        out
     }
 
     /// No wildcard arm: adding a `CoreError` variant stops this from compiling until the variant
@@ -916,18 +1199,133 @@ mod tests {
     }
 
     #[test]
-    fn cli_errors_pass_through_with_their_code_and_help() {
+    fn cli_errors_pass_through_with_their_code_and_a_neutral_help() {
         let inner = cli_core::CliError::BackupJobActive {
             job: "nightly-1".into(),
         };
         let expected_message = inner.to_string();
+        let cli_help = miette::Diagnostic::help(&inner).unwrap().to_string();
         let e = CoreError::from(inner);
         let ui = UiError::from(&e);
         assert_eq!(ui.code.as_deref(), Some("apprafter::backup::job_active"));
         assert_eq!(ui.message, expected_message);
-        assert!(
-            ui.help.is_some(),
-            "the typed CliError help survives the wrap"
+        let help = ui.help.expect("a neutral help");
+        assert_ne!(help, cli_help, "the CLI's help stays the CLI's");
+        assert!(help.contains("nightly-1"), "{help}");
+    }
+
+    /// What a help the GUI shows may not say: a CLI command (`apprafter …`) or a flag (a
+    /// backticked `--…`, alone or inside a command) — the GUI has neither. The first offending
+    /// text, or `None`.
+    fn cli_wording(help: &str) -> Option<String> {
+        if help.contains("apprafter ") {
+            return Some("apprafter ".into());
+        }
+        if help.contains("`--") {
+            return Some("`--".into());
+        }
+        help.split('`')
+            .skip(1)
+            .step_by(2)
+            .find(|span| span.split_whitespace().any(|w| w.starts_with("--")))
+            .map(str::to_string)
+    }
+
+    #[test]
+    fn the_cli_wording_check_finds_commands_and_flags_and_nothing_else() {
+        for cli in [
+            "run `apprafter target add <name> --renew --token <new>` to refresh it",
+            "Pass `--no-ping` to skip the check",
+            "Re-run `apprafter doctor` to confirm",
+            "pass `x --flag`",
+        ] {
+            assert!(cli_wording(cli).is_some(), "{cli}");
+        }
+        for neutral in [
+            "It must say `Read & Write` next to the project.",
+            "resources labelled `apprafter=true`",
+            "AppRafter runs `cue` to read manifests",
+            "xcode-select --install",
+        ] {
+            assert_eq!(cli_wording(neutral), None, "{neutral}");
+        }
+    }
+
+    /// WI-452 (decision 4): no help the projection carries names a CLI command or flag — over
+    /// every `CoreError` variant, every desktop fixture, and every `CliError` the core passes
+    /// through. The codes the desktop's D.3 flows reach keep a help of their own.
+    #[test]
+    fn no_projected_help_names_a_cli_command_or_flag() {
+        let mut cases: Vec<(String, CoreError)> = samples::one_of_each()
+            .into_iter()
+            .map(|e| (variant_name(&e), e))
+            .collect();
+        cases.extend(
+            samples::ui_fixtures()
+                .into_iter()
+                .map(|(name, e)| (name.to_string(), e)),
+        );
+        cases.extend(samples::cli_errors().into_iter().map(|e| {
+            let code = miette::Diagnostic::code(&e).map(|c| c.to_string());
+            (format!("Cli {code:?}"), CoreError::Cli(e))
+        }));
+        let mut helped = std::collections::BTreeSet::new();
+        for (name, e) in &cases {
+            let ui = UiError::from(e);
+            if let Some(help) = &ui.help {
+                assert_eq!(cli_wording(help), None, "{name}: {help}");
+                helped.insert(ui.code.clone().unwrap_or_default());
+            }
+        }
+        for code in [
+            codes::HETZNER_API_ERROR,
+            codes::TOKEN_REJECTED,
+            codes::PROVIDER_UNREACHABLE,
+            codes::SERVER_TYPE_UNAVAILABLE,
+            codes::TOOL_NOT_FOUND,
+            codes::CUE_NOT_FOUND,
+            codes::STATE_CORRUPT,
+            codes::BACKUP_JOB_ACTIVE,
+            "apprafter::target::invalid_config",
+            "apprafter::io::error",
+        ] {
+            assert!(helped.contains(code), "{code} has no neutral help");
+        }
+    }
+
+    /// The neutral help keeps the CLI help's diagnosis: why a token is rejected, what each
+    /// Hetzner status means, why a server type cannot be ordered and that nothing was saved.
+    #[test]
+    fn a_neutral_help_keeps_the_diagnosis() {
+        let help = |e: cli_core::CliError| UiError::from(&CoreError::Cli(e)).help.unwrap();
+        let rejected = help(cli_core::CliError::ProviderTokenRejected {
+            provider: "hetzner-cloud".into(),
+            cause: Box::new(cli_core::CliError::Other("401".into())),
+        });
+        for why in ["mistyped", "scopes", "rotated", "revoked", "Read & Write"] {
+            assert!(rejected.contains(why), "{why}: {rejected}");
+        }
+        let hetzner = help(cli_core::CliError::Hetzner {
+            endpoint: "e".into(),
+            status: 401,
+            code: "c".into(),
+            message: "m".into(),
+        });
+        for status in ["401", "403", "429", "5xx"] {
+            assert!(hetzner.contains(status), "{status}: {hetzner}");
+        }
+        let sku = help(cli_core::CliError::ServerTypeUnavailable {
+            requested: "cx22".into(),
+            location: "nbg1".into(),
+            kind: cli_core::UnavailableKind::Retired,
+            alternatives: String::new(),
+            context: cli_core::SkuCheckFor::TargetMachine {
+                name: "prod".into(),
+            },
+        });
+        assert_eq!(
+            sku,
+            "Hetzner no longer sells `cx22`; pick another type. Nothing was saved."
         );
     }
 

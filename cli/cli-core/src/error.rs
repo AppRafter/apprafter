@@ -52,6 +52,27 @@ impl UnavailableKind {
         }
     }
 
+    /// Why `requested` cannot be ordered in `location`, and what that leaves: the first line of
+    /// `ServerTypeUnavailable`'s help. It names no command, so the desktop shows it as it is.
+    pub fn why(self, requested: &str, location: &str) -> String {
+        match self {
+            UnavailableKind::Unknown => {
+                format!("Hetzner sells no server type called `{requested}`; check its spelling.")
+            }
+            UnavailableKind::NotOfferedInRegion => format!(
+                "`{requested}` is sold, but not in `{location}`: pick another region or another \
+                 type."
+            ),
+            UnavailableKind::Retired => {
+                format!("Hetzner no longer sells `{requested}`; pick another type.")
+            }
+            UnavailableKind::OutOfCapacity => format!(
+                "`{requested}` is sold out in `{location}` right now; retry later or pick another \
+                 type or region."
+            ),
+        }
+    }
+
     /// Short human-readable reason clause used in the error `Display`.
     pub fn human_reason(self) -> &'static str {
         match self {
@@ -98,21 +119,7 @@ fn server_type_help(
     requested: &str,
     location: &str,
 ) -> String {
-    let why = match kind {
-        UnavailableKind::Unknown => {
-            format!("Hetzner sells no server type called `{requested}`; check its spelling.")
-        }
-        UnavailableKind::NotOfferedInRegion => format!(
-            "`{requested}` is sold, but not in `{location}`: pick another region or another type."
-        ),
-        UnavailableKind::Retired => {
-            format!("Hetzner no longer sells `{requested}`; pick another type.")
-        }
-        UnavailableKind::OutOfCapacity => format!(
-            "`{requested}` is sold out in `{location}` right now; retry later or pick another type \
-             or region."
-        ),
-    };
+    let why = kind.why(requested, location);
     let what = match context {
         // The order is `apply`'s (`resolve_precedence`); `target machine` sits below the
         // manifest and the state, and refuses a target whose state records a server.
