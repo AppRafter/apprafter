@@ -42,6 +42,6 @@ export const ACTION_COMMANDS: { readonly [K in ActionId]: ApiCommand } = {
 
 /**
  * Slices whose every leaf is covered: coverage.test.ts fails on a leaf still planned in one.
- * D.3 closes once its last four leaves (target add, target machine, doctor, whoami) are bound.
+ * D.3: the target commands, doctor and whoami.
  */
-export const CLOSED_SLICES: readonly string[] = [];
+export const CLOSED_SLICES: readonly string[] = ['D.3'];
