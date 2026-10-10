@@ -6,6 +6,7 @@ import { screen, waitFor, within } from '@testing-library/react';
 import * as api from '../../ipc/api';
 import { installMockIpc } from '../../ipc/mock';
 import { resetOperations } from '../../ipc/operations';
+import { startPlan } from '../../ipc/plans';
 import { renderScreen } from '../../test/screens';
 import { TargetsPage } from './TargetsPage';
 
@@ -46,6 +47,39 @@ test('make default runs the reversible plan at once: no dialog, the tag moves, a
     within(screen.getByRole('article', { name: 'prod-eu' })).queryByText('CLI default'),
   ).toBeNull();
   expect(screen.queryByRole('dialog')).toBeNull();
+});
+
+/** The args of every `cmd` the page sends from now on (the mock still answers it). */
+function sentArgs(cmd: string): Record<string, unknown>[] {
+  const internals = (
+    window as unknown as {
+      __TAURI_INTERNALS__: { invoke: (cmd: string, args?: unknown, options?: unknown) => unknown };
+    }
+  ).__TAURI_INTERNALS__;
+  const invoke = internals.invoke;
+  const sent: Record<string, unknown>[] = [];
+  internals.invoke = (c, args, options) => {
+    if (c === cmd) sent.push({ ...(args as Record<string, unknown>) });
+    return invoke(c, args, options);
+  };
+  return sent;
+}
+
+// Review #19: the card still offers Make default for a target that became the default since
+// the page read the store (in a terminal): the plan changes nothing, so it is discarded unrun.
+test('make default on a target that is the default already discards the plan unrun', async () => {
+  const user = renderScreen(<TargetsPage onOpen={() => {}} openTargets={new Set()} />);
+  const button = await screen.findByRole('button', { name: 'Make staging the CLI default' });
+  const meanwhile = await api.opPlanTargetUse('staging');
+  await (await startPlan(meanwhile.opId)).ended;
+  const plans = sentArgs('op_plan_target_use');
+  const runs = sentArgs('op_execute');
+  const discards = sentArgs('op_discard');
+  await user.click(button);
+  expect(await screen.findByText('staging is already the CLI default')).toBeDefined();
+  expect(plans).toHaveLength(1);
+  expect(runs).toEqual([]);
+  expect(discards).toHaveLength(1);
 });
 
 test('a refused make default is shown on the page', async () => {

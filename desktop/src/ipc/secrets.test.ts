@@ -6,7 +6,13 @@ import { expect, test } from 'bun:test';
 import { join } from 'node:path';
 
 const TOKEN_SHAPED = /[A-Za-z0-9]{64}/;
-const SECRET_FIELD = /\b(token|password|secret)\??\s*:\s*string\b/i;
+/**
+ * A property whose name holds token, password or secret anywhere — camelCase (`hetznerToken`),
+ * snake_case (`hetzner_token`), quoted or not, any case (review #17: the word boundary let
+ * `hetznerToken` through) — whose type has a `string` in it (`string | null`, `Array<string>`).
+ */
+const SECRET_FIELD =
+  /["']?[A-Za-z0-9_]*(?:token|password|secret)[A-Za-z0-9_]*["']?\??\s*:\s*[^,;}\n]*\bstring\b/i;
 
 async function hits(dir: string, pattern: string, rule: RegExp): Promise<string[]> {
   const found: string[] = [];
@@ -20,9 +26,29 @@ async function hits(dir: string, pattern: string, rule: RegExp): Promise<string[
 test('the rules see what they look for', () => {
   expect('a'.repeat(64)).toMatch(TOKEN_SHAPED);
   expect('a'.repeat(63)).not.toMatch(TOKEN_SHAPED);
-  expect('  token: string;').toMatch(SECRET_FIELD);
-  expect('  password?: string;').toMatch(SECRET_FIELD);
-  expect('  token: TokenPresence;').not.toMatch(SECRET_FIELD);
+  for (const leak of [
+    '  token: string;',
+    '  password?: string;',
+    'hetznerToken: string | null, ',
+    'hetzner_token: string',
+    '"apiToken"?: string,',
+    'HETZNER_TOKEN: string',
+    'clientSecret: Array<string>, ',
+    'accessTokens: string[];',
+    'region: string, tokenValue: string, ',
+  ]) {
+    expect(leak).toMatch(SECRET_FIELD);
+  }
+  for (const fine of [
+    '  token: TokenPresence;',
+    'passwordField: boolean, };',
+    'secretBackend: SecretBackend, account: string',
+    'tokenChars: number | null,',
+    '{ "kind": "renew_token", target: string, why: RenewWhy, }',
+    'token: Verification | null, sshKeyChanged: boolean,',
+  ]) {
+    expect(fine).not.toMatch(SECRET_FIELD);
+  }
 });
 
 test('the scan reads the files it names', async () => {

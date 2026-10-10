@@ -1228,7 +1228,70 @@ mod tests {
         );
         let started = start_doctor(&s.shell, "prod".into()).unwrap();
         assert!(matches!(ended(&s.shell, started), OpEvent::Finished { .. }));
+        doctor_finds_a_tool_only_the_learned_path_has();
     }
+
+    /// D.3d review #18: doctor finds a tool that only the learned search path holds — a
+    /// kubectl stand-in there, none in the context the shell was built with — so a doctor run
+    /// on that start context (its tools reported missing, as on macOS before the login shell
+    /// answered) fails here. Unix: the stand-in is a `/bin/sh` script; Windows runs only real
+    /// executables, and its tool search is covered by the CLI's goldens.
+    #[cfg(unix)]
+    fn doctor_finds_a_tool_only_the_learned_path_has() {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = tempfile::tempdir().unwrap();
+        let kubectl = bin.path().join("kubectl");
+        let call = cli_core::tools::KUBECTL.version_args.join(" ");
+        // Builtins only: the probe runs it with this directory alone as its PATH (GOTCHA-104).
+        std::fs::write(
+            &kubectl,
+            format!(
+                "#!/bin/sh\ncase \"$*\" in '{call}') echo 'kubectl stand-in' ;; *) exit 2 ;; esac\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&kubectl, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // A sibling test's fork may hold the file open for writing until it execs (ETXTBSY):
+        // run it until it starts, so doctor's probe never meets that window.
+        for _ in 0..200 {
+            match std::process::Command::new(&kubectl)
+                .args(["version", "--client"])
+                .status()
+            {
+                Err(e) if e.raw_os_error() == Some(26) => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                _ => break,
+            }
+        }
+        let s = store_with_tools(
+            &["prod"],
+            None,
+            ToolSearchPath::known(bin.path().as_os_str().to_owned(), PathSource::LoginShell),
+        );
+        assert!(s.shell.context.tool_search_path().is_empty());
+        let report = result_of(ended(
+            &s.shell,
+            start_doctor(&s.shell, "prod".into()).unwrap(),
+        ));
+        let row = report["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|g| g["id"] == "this_computer")
+            .and_then(|g| g["checks"].as_array())
+            .and_then(|checks| checks.iter().find(|c| c["tool"] == "kubectl"))
+            .cloned()
+            .expect("a kubectl row");
+        assert_eq!(
+            (row["status"].clone(), row["detail"].clone()),
+            (json!("pass"), json!("kubectl stand-in")),
+            "{row}"
+        );
+    }
+
+    #[cfg(not(unix))]
+    fn doctor_finds_a_tool_only_the_learned_path_has() {}
 
     /// The doctor read waits for the tool search path on its own thread: the command answers
     /// while the login shell has not, and the read then goes on to its end.
