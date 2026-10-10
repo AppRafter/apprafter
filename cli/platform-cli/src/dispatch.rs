@@ -13,10 +13,38 @@ use crate::cli::{
 };
 use crate::commands;
 
+/// Which of `target add`'s env-backed values were typed on the command line, as clap's
+/// `value_source` tells it — read from the matches before `Cli::from_arg_matches_mut` takes the
+/// values out. `--renew` treats a value typed here differently from one an environment variable
+/// supplied (D.3d review #0/#3/#8): an env token or key never changes what an explicit command
+/// means.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Typed {
+    /// `--token`, not `HCLOUD_TOKEN`.
+    pub token: bool,
+    /// `--ssh-key`, not `APPRAFTER_SSH_PUBLIC_KEY_PATH`.
+    pub ssh_key: bool,
+}
+
+impl Typed {
+    pub(crate) fn of(matches: &clap::ArgMatches) -> Self {
+        let add = matches
+            .subcommand_matches("target")
+            .and_then(|target| target.subcommand_matches("add"));
+        let typed = |id: &str| {
+            add.and_then(|m| m.value_source(id)) == Some(clap::parser::ValueSource::CommandLine)
+        };
+        Typed {
+            token: typed("token"),
+            ssh_key: typed("ssh_key"),
+        }
+    }
+}
+
 /// Commands on `apprafter-core` convert their own errors at the arm boundary
 /// (`crate::render::core_error::report`); every other command goes through [`dispatch_cli`],
-/// mapped once.
-pub(crate) fn dispatch(args: Cli) -> miette::Result<()> {
+/// mapped once. `typed` says which env-backed values of `target add` were typed.
+pub(crate) fn dispatch(args: Cli, typed: Typed) -> miette::Result<()> {
     match args.command {
         Commands::Target { action } => match action {
             TargetCommand::Add {
@@ -45,6 +73,7 @@ pub(crate) fn dispatch(args: Cli) -> miette::Result<()> {
                 no_interactive,
                 no_ping,
                 server_type,
+                typed,
             }),
             TargetCommand::List => commands::target::list(),
             TargetCommand::Show { name } => commands::target::show(name.as_deref()),

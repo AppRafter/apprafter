@@ -89,10 +89,12 @@ pub(crate) fn cli_help(e: &CoreError) -> Option<String> {
             "Generate a fresh token in the Hetzner Cloud Console → Security → API Tokens, then \
              re-run `apprafter target add {name} --renew` with the new value."
         ),
+        // Beside a typed `--ssh-key`, `HCLOUD_TOKEN` is not used (D.3d review #0): it rotates
+        // only a renewal that names no key.
         CoreError::RenewNothingToChange { name } => format!(
-            "Pass a new token (`--token <X>`, or `HCLOUD_TOKEN`) to rotate the credentials, or \
-             `--ssh-key <path>` with a key other than the stored one; `apprafter target show \
-             {name}` shows what is stored."
+            "Pass a new token with `--token <X>` (or, without `--ssh-key`, in `HCLOUD_TOKEN`) to \
+             rotate the credentials, or `--ssh-key <path>` with a key other than the stored one; \
+             `apprafter target show {name}` shows what is stored."
         ),
         CoreError::InvalidTargetName { .. } => format!(
             "A target name is 1–{} characters of ASCII letters, digits and `-`, and does not \

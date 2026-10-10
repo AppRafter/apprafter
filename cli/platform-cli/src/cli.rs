@@ -1377,13 +1377,16 @@ pub enum TargetCommand {
         #[arg(long, default_value_t = false)]
         force: bool,
         /// Update only the token and the SSH key of an existing
-        /// target: a new `--token` (or `HCLOUD_TOKEN`) replaces the
-        /// credentials, `--ssh-key` changes the key, and whatever
-        /// equals the stored value is left as it is — so `--ssh-key`
-        /// without a new token keeps the credentials. Errors when the
-        /// target does not exist or when nothing would change.
-        /// Mutually exclusive with `--force` (use `--force` to change
-        /// the target's other fields as well as the token).
+        /// target: a new `--token` replaces the credentials, and
+        /// `--ssh-key` changes the key; whatever equals the stored
+        /// value is left as it is. `--ssh-key` without `--token`
+        /// changes only the key and keeps the credentials (an
+        /// `HCLOUD_TOKEN` is not used then). With neither, the new
+        /// token comes from the wizard on a terminal, else from
+        /// `HCLOUD_TOKEN`. Errors when the target does not exist or
+        /// when nothing would change. Mutually exclusive with
+        /// `--force` (use `--force` to change the target's other
+        /// fields as well as the token).
         #[arg(long, default_value_t = false, conflicts_with = "force")]
         renew: bool,
         /// Skip the interactive wizard even when stdin + stdout

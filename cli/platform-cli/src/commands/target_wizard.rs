@@ -1403,6 +1403,10 @@ mod tests {
             no_interactive: false,
             no_ping: true,
             server_type: Some("cx22".into()),
+            typed: crate::dispatch::Typed {
+                token: true,
+                ssh_key: true,
+            },
         }
     }
 
@@ -1502,6 +1506,10 @@ mod tests {
             no_interactive: false,
             no_ping: true,
             server_type: None,
+            typed: crate::dispatch::Typed {
+                token: true,
+                ssh_key: true,
+            },
         }
     }
 

@@ -106,15 +106,18 @@ target. Fails if the target doesn't exist (`--force` overwrites
 the token and the fields you pass, and keeps the rest). The wizard pings the new token
 before saving; pass `--no-ping` to skip the round-trip.
 
-To change only the SSH key, pass `--ssh-key` without a new token:
+To change only the SSH key, pass `--ssh-key` without `--token`:
 
 ```sh
 apprafter target add prod --renew --ssh-key ~/.ssh/id_ed25519.pub
 ```
 
 The credentials file is not touched and nothing is sent to the
-provider. A token equal to the stored one (for example an
-`HCLOUD_TOKEN` that still holds it) counts as no new token.
+provider. `HCLOUD_TOKEN` is not used here, even when it is set: if it
+holds a token other than the stored one, a note says so, and
+`--token` rotates the token as well. A `--token` equal to the stored
+one counts as no new token. The key must be a public key file; a
+private key is refused.
 
 The token bytes are byte-compared against the stored value —
 identical input with nothing else to change is rejected with a hint

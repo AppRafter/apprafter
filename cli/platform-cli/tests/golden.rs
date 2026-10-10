@@ -1467,15 +1467,13 @@ fn target_renew_that_would_change_nothing() {
     );
 }
 
-/// WI-452: an `HCLOUD_TOKEN` other than the stored one beside `--ssh-key`: the token is
+/// WI-452: a typed `--token` other than the stored one beside `--ssh-key`: the token is
 /// verified (the mock answers only it) and saved, and the key changes with it.
 #[test]
 fn target_renew_rotates_the_token_and_changes_the_ssh_key() {
     let mut server = mockito::Server::new();
     let _loc = json_mock(&mut server, "/v1/locations", 200, LOCATIONS_OK, TOKEN_B);
-    let sb = Sandbox::new()
-        .with_hcloud(server.url())
-        .with_env("HCLOUD_TOKEN", TOKEN_B);
+    let sb = Sandbox::new().with_hcloud(server.url());
     sb.add_target("prod");
     let key = work_key(&sb);
     sb.golden_with_files(
@@ -1485,10 +1483,73 @@ fn target_renew_rotates_the_token_and_changes_the_ssh_key() {
             "add",
             "prod",
             "--renew",
+            "--token",
+            TOKEN_B,
             "--ssh-key",
             &key,
             "--no-interactive",
         ]],
+        &["targets/prod/config.yaml"],
+    );
+    assert!(credentials_of_prod(&sb).contains(TOKEN_B));
+}
+
+/// D.3d review #0/#8: `HCLOUD_TOKEN` is the hcloud CLI's own variable and may hold another
+/// project's token. Beside a typed `--ssh-key` with no typed `--token` it is not used: only the
+/// key changes (no ping — the provider is a closed port), the credentials stay byte for byte,
+/// and one note says the env token was not used and how to rotate as well.
+#[test]
+fn target_renew_with_an_ssh_key_ignores_another_token_in_the_env() {
+    let sb = Sandbox::new().with_env("HCLOUD_TOKEN", TOKEN_B);
+    sb.add_target("prod");
+    let creds = hand_written_credentials(&sb);
+    let key = work_key(&sb);
+    sb.golden_with_files(
+        "target/renew_ssh_key_env_token_differs",
+        &[&[
+            "target",
+            "add",
+            "prod",
+            "--renew",
+            "--ssh-key",
+            &key,
+            "--no-interactive",
+        ]],
+        &["targets/prod/config.yaml"],
+    );
+    assert_eq!(credentials_of_prod(&sb), creds);
+}
+
+/// D.3d review #3: a key from `APPRAFTER_SSH_PUBLIC_KEY_PATH` (set for every command in CI)
+/// never makes a renewal key-only by itself: with no token, it is today's refusal, and the
+/// stored key stays.
+#[test]
+fn target_renew_with_only_an_env_ssh_key_still_needs_a_token() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    let key = work_key(&sb);
+    let sb = sb.with_env("APPRAFTER_SSH_PUBLIC_KEY_PATH", &key);
+    sb.golden_with_files(
+        "target/renew_env_ssh_key_no_token",
+        &[&["target", "add", "prod", "--renew", "--no-interactive"]],
+        &["targets/prod/config.yaml"],
+    );
+}
+
+/// An env key is applied alongside an env token's rotation, as before WI-452.
+#[test]
+fn target_renew_with_an_env_token_applies_the_env_ssh_key_too() {
+    let mut server = mockito::Server::new();
+    let _loc = json_mock(&mut server, "/v1/locations", 200, LOCATIONS_OK, TOKEN_B);
+    let sb = Sandbox::new()
+        .with_hcloud(server.url())
+        .with_env("HCLOUD_TOKEN", TOKEN_B);
+    sb.add_target("prod");
+    let key = work_key(&sb);
+    let sb = sb.with_env("APPRAFTER_SSH_PUBLIC_KEY_PATH", &key);
+    sb.golden_with_files(
+        "target/renew_env_token_and_env_ssh_key",
+        &[&["target", "add", "prod", "--renew", "--no-interactive"]],
         &["targets/prod/config.yaml"],
     );
     assert!(credentials_of_prod(&sb).contains(TOKEN_B));

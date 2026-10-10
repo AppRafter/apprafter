@@ -85,6 +85,9 @@ pub struct AddArgs {
     pub no_ping: bool,
     /// 2.16h: preferred server type SKU to persist in the target store.
     pub server_type: Option<String>,
+    /// Which of `token` / `ssh_key` were typed, not taken from `HCLOUD_TOKEN` /
+    /// `APPRAFTER_SSH_PUBLIC_KEY_PATH` ([`renew_token`]).
+    pub typed: crate::dispatch::Typed,
 }
 
 /// `target add` (and `--renew`) on the core. The CLI keeps the wizard, the inputs it requires
@@ -385,10 +388,7 @@ fn run_wizard_into_args(ctx: &Context, args: &mut AddArgs) -> CoreResult<()> {
         // Both of the target's files, as before: a missing target is the raw `TargetNotFound`,
         // an unreadable one its file's error.
         let existing = cli_core::load_target(&ctx.store(), args.name.as_deref().unwrap())?;
-        if renew_asks_for_a_token(
-            args.ssh_key.as_deref(),
-            existing.config.ssh_key_path.as_deref(),
-        ) {
+        if renew_wizard_asks(args.typed) {
             let (token, _verified) =
                 target_wizard::run_renew_wizard(ctx, &existing.config.provider, args.no_ping)?;
             args.token = Some(token);
@@ -451,17 +451,15 @@ pub(crate) fn map_wizard_prompt_error(err: inquire::InquireError) -> CliError {
 }
 
 /// `target add --renew` on the core, in today's order: the target (both of its files, as
-/// `load_renewable` read them), the config-flag refusal, a token unless `--ssh-key` was given,
-/// then `plan_renew` (format, SSH key, "does anything change") and `execute_renew` (ping a new
-/// token, then the patch under the lock). Renew changes what differs from what is stored: with
-/// `--ssh-key` and no new token (none given, or `HCLOUD_TOKEN` holding the stored one) only the
-/// key changes and the credentials are left as they are.
+/// `load_renewable` read them), the config-flag refusal, the token [`renew_token`] picks, then
+/// `plan_renew` (format, SSH key, "does anything change") and `execute_renew` (ping a new token,
+/// then the patch under the lock). Renew changes what differs from what is stored: a typed
+/// `--ssh-key` with no typed `--token` changes only the key and leaves the credentials as they
+/// are — an `HCLOUD_TOKEN` is not used then, and a note says so when it holds another token.
 fn renew(ctx: &Context, args: AddArgs, name: &str) -> miette::Result<()> {
     let tref = TargetRef::named(ctx, name).map_err(renew_missing)?;
-    let provider = cli_core::load_target(&ctx.store(), name)
-        .map_err(|e| renew_missing(e.into()))?
-        .config
-        .provider;
+    let stored = cli_core::load_target(&ctx.store(), name).map_err(|e| renew_missing(e.into()))?;
+    let provider = stored.config.provider;
     // `--renew` deliberately ignores the config flags; refusing them up front beats silently
     // dropping a value the operator passed.
     reject_config_flags_on_renew(
@@ -472,14 +470,22 @@ fn renew(ctx: &Context, args: AddArgs, name: &str) -> miette::Result<()> {
         args.server_type.as_deref(),
     )
     .map_err(miette::Report::new)?;
-    if args.token.is_none() && args.ssh_key.is_none() {
+    let mut token = args.token;
+    // A key-only renewal: `HCLOUD_TOKEN` is not this command's token. Kept for the note.
+    let unused_env_token = match renew_token(args.typed) {
+        RenewToken::KeyOnly => token
+            .take()
+            .filter(|env| stored.credentials.hetzner_token.as_ref() != Some(env)),
+        RenewToken::Typed | RenewToken::AskOrEnv => None,
+    };
+    if token.is_none() && renew_token(args.typed) != RenewToken::KeyOnly {
         return Err(token_required(&provider));
     }
     let plan = core_target::plan_renew(
         ctx,
         &tref,
         core_target::RenewArgs {
-            token: args.token.map(SecretString::new),
+            token: token.map(SecretString::new),
             ssh_key: args.ssh_key,
         },
     )
@@ -488,8 +494,21 @@ fn renew(ctx: &Context, args: AddArgs, name: &str) -> miette::Result<()> {
         core_target::execute_renew(ctx, plan, &CliReporter, &CancellationToken::new())
             .map_err(renew_missing)?,
     )?;
+    if unused_env_token.is_some() {
+        eprintln!("{}", unused_env_token_note(name));
+    }
     println!("{}", renewed_line(&renewed));
     Ok(())
+}
+
+/// The note a key-only renewal prints when `HCLOUD_TOKEN` holds a token other than the stored
+/// one: it was not used, and how to rotate as well.
+pub(crate) fn unused_env_token_note(name: &str) -> String {
+    format!(
+        "note: `HCLOUD_TOKEN` holds a token other than the one stored for `{name}` and was not \
+         used: `--ssh-key` without `--token` changes only the key. Pass `--token <X>` to rotate \
+         the token as well."
+    )
 }
 
 /// The line `target add --renew` ends with: what changed, read off the outcome. A saved token
@@ -510,17 +529,37 @@ pub(crate) fn renewed_line(r: &core_target::TargetRenewed) -> String {
     }
 }
 
-/// Whether the renew wizard asks for a token: when the SSH key would not change (none given,
-/// or the stored one), as it always did, since then a token is all a renewal can change. A key
-/// other than the stored one is a change of its own, so the token comes from `--token` /
-/// `HCLOUD_TOKEN` or not at all (a key-only renewal keeps the credentials). The key may come
-/// from `APPRAFTER_SSH_PUBLIC_KEY_PATH`, which names the stored key when it is set for
-/// every command: that still asks.
-pub(crate) fn renew_asks_for_a_token(
-    given: Option<&std::path::Path>,
-    stored: Option<&std::path::Path>,
-) -> bool {
-    given.is_none() || given == stored
+/// Where `--renew` takes its token from (D.3d review #0/#3/#8). An environment variable never
+/// changes what an explicit command means: `HCLOUD_TOKEN` is the standard variable of the
+/// hcloud CLI and may hold another project's token, and `APPRAFTER_SSH_PUBLIC_KEY_PATH` may be
+/// set for every command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RenewToken {
+    /// `--token` typed: that token, and no wizard.
+    Typed,
+    /// `--ssh-key` typed and no `--token`: the key alone. `HCLOUD_TOKEN` is not used and no
+    /// wizard asks; the credentials stay as they are.
+    KeyOnly,
+    /// Neither typed: as before WI-452 — on a terminal the renew wizard asks (it ignores
+    /// `HCLOUD_TOKEN`, which may hold the old token), elsewhere `HCLOUD_TOKEN` or today's
+    /// refusal. A key from `APPRAFTER_SSH_PUBLIC_KEY_PATH` is applied alongside, and never
+    /// makes the renewal key-only by itself.
+    AskOrEnv,
+}
+
+pub(crate) fn renew_token(typed: crate::dispatch::Typed) -> RenewToken {
+    match (typed.token, typed.ssh_key) {
+        (true, _) => RenewToken::Typed,
+        (false, true) => RenewToken::KeyOnly,
+        (false, false) => RenewToken::AskOrEnv,
+    }
+}
+
+/// Whether the renew wizard asks for a token on a terminal: only when neither `--token` nor
+/// `--ssh-key` was typed. A typed token is the token; a typed key alone is a key-only renewal;
+/// a key from `APPRAFTER_SSH_PUBLIC_KEY_PATH` still asks.
+pub(crate) fn renew_wizard_asks(typed: crate::dispatch::Typed) -> bool {
+    renew_token(typed) == RenewToken::AskOrEnv
 }
 
 // ---------------------------------------------------------------
@@ -1033,19 +1072,62 @@ mod tests {
         );
     }
 
-    /// WI-452: `--renew --ssh-key <new>` without a token changes only the key, so the renew
-    /// wizard asks for a token only when the key would not change (today's flow).
+    /// D.3d review #0/#3/#8: what a renewal's token is follows what was typed. A typed
+    /// `--token` is the token (no wizard); a typed `--ssh-key` alone is the key alone (no
+    /// wizard, `HCLOUD_TOKEN` unused); neither typed is today's flow — the wizard on a terminal
+    /// (it ignores `HCLOUD_TOKEN`), else the env token — whatever key the env names.
     #[test]
-    fn the_renew_wizard_asks_for_a_token_only_when_the_key_would_not_change() {
-        let (old, new) = (
-            std::path::Path::new("/k/old.pub"),
-            std::path::Path::new("/k/new.pub"),
+    fn a_renewals_token_follows_what_was_typed_never_the_environment() {
+        use crate::dispatch::Typed;
+        let typed = |token, ssh_key| renew_token(Typed { token, ssh_key });
+        assert_eq!(typed(true, false), RenewToken::Typed);
+        assert_eq!(typed(true, true), RenewToken::Typed);
+        assert_eq!(typed(false, true), RenewToken::KeyOnly);
+        assert_eq!(typed(false, false), RenewToken::AskOrEnv);
+        // On a terminal the wizard asks only then: never over a typed token or a typed key.
+        let asks = |token, ssh_key| renew_wizard_asks(Typed { token, ssh_key });
+        assert!(asks(false, false));
+        assert!(!asks(true, false) && !asks(true, true) && !asks(false, true));
+    }
+
+    /// The flags `Typed::of` reads off the matches: typed on the command line, or not.
+    #[test]
+    fn typed_reads_the_command_line_sources_of_target_add() {
+        use clap::CommandFactory;
+        let typed = |args: &[&str]| {
+            let matches = crate::cli::Cli::command()
+                .try_get_matches_from(std::iter::once("apprafter").chain(args.iter().copied()))
+                .unwrap();
+            crate::dispatch::Typed::of(&matches)
+        };
+        let both = typed(&[
+            "target",
+            "add",
+            "prod",
+            "--renew",
+            "--token",
+            "t",
+            "--ssh-key",
+            "/k.pub",
+        ]);
+        assert_eq!((both.token, both.ssh_key), (true, true));
+        let key = typed(&["target", "add", "prod", "--renew", "--ssh-key", "/k.pub"]);
+        assert!(key.ssh_key && !key.token);
+        assert_eq!(
+            typed(&["target", "list"]),
+            crate::dispatch::Typed::default()
         );
-        assert!(renew_asks_for_a_token(None, Some(old)));
-        assert!(renew_asks_for_a_token(None, None));
-        assert!(renew_asks_for_a_token(Some(old), Some(old)));
-        assert!(!renew_asks_for_a_token(Some(new), Some(old)));
-        assert!(!renew_asks_for_a_token(Some(new), None));
+    }
+
+    #[test]
+    fn the_unused_env_token_note_names_the_target_and_the_way_to_rotate() {
+        let note = unused_env_token_note("prod");
+        assert!(note.starts_with("note: `HCLOUD_TOKEN`"), "{note}");
+        assert!(
+            note.contains("`prod`") && note.contains("--token <X>"),
+            "{note}"
+        );
+        assert!(!note.contains('\n'), "one line: {note}");
     }
 
     /// Bug 7: a server type checked against the API says so, and in which region — flagging
@@ -1292,6 +1374,7 @@ mod tests {
             no_interactive: false,
             no_ping: false,
             server_type: None,
+            typed: crate::dispatch::Typed::default(),
         }
     }
 

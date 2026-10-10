@@ -1,4 +1,4 @@
-$ apprafter target add prod --renew --token bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb --ssh-key <SANDBOX>/home/work.pub --no-interactive
+$ apprafter target add prod --renew --no-interactive
 [exit 0]
 [stdout]
 target `prod` credentials rotated and SSH key updated (token verified against Hetzner Cloud)
