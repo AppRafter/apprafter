@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 // The target screens on the mock IPC: the Targets page (an unreadable target shown, Make default),
-// then a target's Target screen — each row's label and value on one line, at the default and
-// the smallest window; rename (the tab follows), renew the token, change the SSH key alone,
-// remove (the typed name, the gesture; the tab closes).
+// then a target's Target screen — each row's label and value on one line, and the card's
+// sub-lines at a readable width, at the default and the smallest window; rename (the tab
+// follows), renew the token, change the SSH key alone, remove (the typed name, the gesture; the
+// tab closes).
 import { expect, type Locator, type Page, type TestInfo, test } from '@playwright/test';
 
 async function shot(page: Page, info: TestInfo, name: string) {
@@ -71,6 +72,13 @@ test('the Targets page and a target, from the list to removing it', async ({ pag
   const size = page.viewportSize();
   await page.setViewportSize({ width: 1024, height: 640 });
   expect(await crampedRows(card)).toEqual([]);
+  // The card is not squeezed into a narrow column beside an emptier one: its sub-lines (the
+  // API token's, the Machine row's rebuild recipe) keep a readable width at the smallest window.
+  const widthOf = async (locator: Locator) => (await locator.boundingBox())?.width ?? 0;
+  const tokenSub = card.getByRole('group', { name: 'API token' }).locator('.row-sub');
+  const recipe = card.getByRole('group', { name: 'Machine' }).locator('.target-recipe');
+  expect(await widthOf(tokenSub)).toBeGreaterThanOrEqual(240);
+  expect(await widthOf(recipe)).toBeGreaterThanOrEqual(320);
   await card.getByRole('group', { name: 'Credentials file' }).scrollIntoViewIfNeeded();
   await shot(page, info, 'target screen, smallest window');
   if (size !== null) await page.setViewportSize(size);

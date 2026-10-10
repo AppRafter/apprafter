@@ -66,21 +66,28 @@ export function TargetScreen({ name, onRenamed, onRemoved, onChangeMachine }: Ta
       ) : report.isError ? (
         <ErrorPanel error={uiErrorOf(report.error)} />
       ) : (
-        <PageGrid layout="main-side">
-          <TargetDetails
-            report={report.data}
-            os={info.os}
-            secretBackend={info.secretBackend}
-            actions={{
-              rename: fresh(actions.rename),
-              renew: fresh(actions.renew),
-              makeDefault: fresh(actions.makeDefault),
-              changeSshKey: fresh(actions.changeSshKey),
-            }}
-            onChangeMachine={onChangeMachine === undefined ? null : fresh(onChangeMachine)}
-          />
-          <DangerZone onRemove={fresh(actions.remove)} />
-        </PageGrid>
+        // The design's side column holds Cluster access (D.11) above the Danger zone. Until that
+        // card exists the Danger zone follows the Target card in one column, and the card keeps
+        // the page's width (plan deviation 8).
+        <PageGrid
+          main={
+            <>
+              <TargetDetails
+                report={report.data}
+                os={info.os}
+                secretBackend={info.secretBackend}
+                actions={{
+                  rename: fresh(actions.rename),
+                  renew: fresh(actions.renew),
+                  makeDefault: fresh(actions.makeDefault),
+                  changeSshKey: fresh(actions.changeSshKey),
+                }}
+                onChangeMachine={onChangeMachine === undefined ? null : fresh(onChangeMachine)}
+              />
+              <DangerZone onRemove={fresh(actions.remove)} />
+            </>
+          }
+        />
       )}
     </div>
   );

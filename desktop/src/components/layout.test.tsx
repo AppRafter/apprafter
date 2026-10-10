@@ -57,14 +57,17 @@ describe('PageHeader', () => {
 });
 
 describe('PageGrid', () => {
-  test('names its layout for the stylesheet', () => {
-    const { container } = render(
-      <PageGrid layout="main-side">
-        <div />
-        <div />
-      </PageGrid>,
+  test('two columns only with side cards: the layout follows the content', () => {
+    const { container, rerender } = render(
+      <PageGrid main={<div id="m" />} side={<div id="s" />} />,
     );
-    expect(container.querySelector('.page-grid')?.getAttribute('data-layout')).toBe('main-side');
+    const grid = () => container.querySelector('.page-grid');
+    expect(grid()?.getAttribute('data-layout')).toBe('main-side');
+    expect(grid()?.children).toHaveLength(2);
+    expect(grid()?.children[1]?.querySelector('#s')).not.toBeNull();
+    rerender(<PageGrid main={<div id="m" />} />);
+    expect(grid()?.getAttribute('data-layout')).toBe('single');
+    expect(grid()?.querySelector('#m')).not.toBeNull();
   });
 });
 

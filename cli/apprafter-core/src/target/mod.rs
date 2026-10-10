@@ -16,7 +16,7 @@ pub(crate) mod testkit;
 pub use add::{
     execute_add, execute_renew, plan_add, plan_renew, AddArgs, AddPayload, RenewArgs, RenewPayload,
 };
-pub use machine::{execute_machine, plan_machine, MachineChoice, MachinePayload};
+pub use machine::{execute_machine, plan_machine, rebuild_recipe, MachineChoice, MachinePayload};
 pub use name::{validate_name, NameProblem, TARGET_NAME_MAX_LEN};
 pub use pointer::{execute_use, plan_use, UsePayload};
 pub use read::{hetzner_token, list, public_address, show};

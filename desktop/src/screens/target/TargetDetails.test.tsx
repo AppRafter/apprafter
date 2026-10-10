@@ -4,6 +4,7 @@
 import { expect, mock, test } from 'bun:test';
 import { render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import { rebuildRecipe } from '../../ipc/generated/target';
 import { provisioned, targetReport } from '../../test/fixtures';
 import { UnreadableCard } from '../targets/UnreadableCard';
 import { DangerZone } from './DangerZone';
@@ -157,11 +158,13 @@ test('a provisioned target: no Change, the refusal and the rebuild path, the run
   expect(within(machine).queryByRole('button', { name: 'Change' })).toBeNull();
   expect(machine.textContent).toContain('cx22 · running cpx22');
   expect(machine.textContent).toContain('prod-eu-1 (id 4711)');
-  // The CLI's recipe (render::core_error::resize_recipe): restore needs its repo, after destroy.
-  expect(machine.textContent).toContain('apprafter target use prod-eu');
-  expect(machine.textContent).toContain('apprafter backup create --repo <repo>');
-  expect(machine.textContent).toContain('apprafter destroy --yes');
-  expect(machine.textContent).toContain('apprafter restore <repo> --reprovision --server-type');
+  // Review #20: the CLI's own recipe, from the core (generated rebuildRecipe), line for line —
+  // not a copy: the copy had drifted (`<type>` where the CLI prints `<sku>`).
+  const lines = [...machine.querySelectorAll('.target-recipe code')].map(
+    (code) => code.textContent,
+  );
+  expect(lines).toEqual([...rebuildRecipe('prod-eu')]);
+  expect(lines.at(-1)).toBe('apprafter restore <repo> --reprovision --server-type <sku>');
   expect(machine.textContent).toContain('not only this cluster');
 });
 

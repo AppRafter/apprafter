@@ -17,3 +17,14 @@ export const TARGET_NAME_MAX_LEN = 64;
 
 /** A Hetzner Cloud API token's length. */
 export const HETZNER_TOKEN_LEN = 64;
+
+/**
+ * The rebuild of the provisioned target `name` on another machine, one command per line:
+ * the CLI's own recipe (`apprafter_core::target::rebuild_recipe`).
+ */
+export const rebuildRecipe = (name: string): readonly string[] => [
+  `apprafter target use ${name}`,
+  `apprafter backup create --repo <repo>`,
+  `apprafter destroy --yes`,
+  `apprafter restore <repo> --reprovision --server-type <sku>`,
+];

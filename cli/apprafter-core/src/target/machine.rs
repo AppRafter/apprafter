@@ -9,6 +9,21 @@ use crate::target::{
 };
 use crate::{CancellationToken, Context, CoreError, CoreResult, TargetRef};
 
+/// The rebuild of the provisioned target `name` on another machine (the operator guide's Route
+/// A), one command per line — the one recipe the CLI prints under `TargetProvisioned` and the
+/// desktop shows in a provisioned target's Machine row (D.3d review #20: it was copied by hand
+/// and had drifted). `target use` first: `backup create` and `destroy` act on the active target,
+/// which need not be `name`. `destroy` before the restore: `restore --reprovision` runs `up`,
+/// which reuses a live server of the cluster's name and ignores `--server-type` on it.
+pub fn rebuild_recipe(name: &str) -> [String; 4] {
+    [
+        format!("apprafter target use {name}"),
+        "apprafter backup create --repo <repo>".to_string(),
+        "apprafter destroy --yes".to_string(),
+        "apprafter restore <repo> --reprovision --server-type <sku>".to_string(),
+    ]
+}
+
 /// The machine a `target machine` call picks (overview §3.7.3): a server type, and a region
 /// only when the picker moved it. `Debug` only: the payload derives `Debug` over it.
 #[derive(Debug)]

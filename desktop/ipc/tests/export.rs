@@ -354,11 +354,36 @@ fn target_ts() -> String {
          export const TARGET_NAME_MAX_LEN = {};\n\
          \n\
          /** A Hetzner Cloud API token's length. */\n\
-         export const HETZNER_TOKEN_LEN = {};\n",
+         export const HETZNER_TOKEN_LEN = {};\n\
+         \n\
+         /**\n \
+         * The rebuild of the provisioned target `name` on another machine, one command per line:\n \
+         * the CLI's own recipe (`apprafter_core::target::rebuild_recipe`).\n \
+         */\n\
+         {}",
         ts_array("SUPPORTED_PROVIDERS", SUPPORTED_PROVIDERS),
         target_name_max_len(),
         hetzner_token_len(),
+        rebuild_recipe_ts(),
     )
+}
+
+/// `apprafter_core::target::rebuild_recipe` as a TypeScript function of the target's name: the
+/// core's lines, rendered once with a marker for the name, each a template literal with the
+/// marker as `${name}` — so the desktop shows the CLI's text and never a copy of it.
+fn rebuild_recipe_ts() -> String {
+    const MARK: &str = "\u{0}";
+    let lines: String = apprafter_core::target::rebuild_recipe(MARK)
+        .iter()
+        .map(|line| {
+            assert!(
+                !line.contains('`') && !line.contains("${") && !line.contains('\\'),
+                "{line:?} does not fit a template literal"
+            );
+            format!("  `{}`,\n", line.replace(MARK, "${name}"))
+        })
+        .collect();
+    format!("export const rebuildRecipe = (name: string): readonly string[] => [\n{lines}];\n")
 }
 
 /// `validate_name` over cases that pin its order (length, then characters, then dashes) and its

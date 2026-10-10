@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 // The machine a target is set to, and the one its server runs on. A provisioned machine cannot
-// change here: the row gives the CLI's rebuild recipe (render::core_error::resize_recipe) in
-// place of Change. An unreadable local state says why and offers nothing either.
+// change here: the row gives the CLI's rebuild recipe in place of Change — the core's own lines
+// (apprafter_core::target::rebuild_recipe, generated as rebuildRecipe), never a copy. An
+// unreadable local state says why and offers nothing either.
 import { Button } from '../../components/Button';
 import { CardRow } from '../../components/SettingRow';
 import type { TargetReport } from '../../ipc/generated/TargetReport';
+import { rebuildRecipe } from '../../ipc/generated/target';
 
 export interface MachineRowProps {
   report: TargetReport;
@@ -30,10 +32,9 @@ export function MachineRow({ report, onChange }: MachineRowProps) {
             Provisioned as {state.server.serverName} (id {state.server.serverId}). Its machine
             cannot change in place: back it up and rebuild it on a new machine, in a terminal:
             <span className="target-recipe">
-              <code>{`apprafter target use ${report.name}`}</code>
-              <code>{'apprafter backup create --repo <repo>'}</code>
-              <code>{'apprafter destroy --yes'}</code>
-              <code>{'apprafter restore <repo> --reprovision --server-type <type>'}</code>
+              {rebuildRecipe(report.name).map((line) => (
+                <code key={line}>{line}</code>
+              ))}
             </span>
             <code>destroy</code> deletes every resource labelled <code>apprafter=true</code> in the
             token's Hetzner project, not only this cluster: read “Moving to a bigger machine” in the

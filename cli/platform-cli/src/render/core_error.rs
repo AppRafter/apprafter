@@ -55,18 +55,14 @@ pub(crate) fn report_with_help(e: CoreError, help: &str) -> miette::Report {
 /// not URL: miette wraps a long URL at its hyphens, which breaks it for copying.
 pub(crate) const RESIZE_GUIDE: &str = "Moving to a bigger machine";
 
-/// The rebuild onto another machine for target `name` (the guide's Route A). `destroy` comes
-/// before the restore because `restore --reprovision` runs `up`, which reuses a live server of
-/// the cluster's name and ignores `--server-type` on it. `target use` first: `backup create`
-/// and `destroy` act on the active target, which need not be `name`.
+/// The rebuild onto another machine for target `name` (the guide's Route A): the warning, then
+/// the core's recipe (`apprafter_core::target::rebuild_recipe`, which the desktop shows too),
+/// one indented command per line.
 pub(crate) fn resize_recipe(name: &str) -> String {
     format!(
         "`destroy` deletes every `apprafter=true` resource in the token's Hetzner project, not \
-         only this cluster: read the operator guide's \"{RESIZE_GUIDE}\" first.\n\n    \
-         apprafter target use {name}\n    \
-         apprafter backup create --repo <repo>\n    \
-         apprafter destroy --yes\n    \
-         apprafter restore <repo> --reprovision --server-type <sku>"
+         only this cluster: read the operator guide's \"{RESIZE_GUIDE}\" first.\n\n    {}",
+        apprafter_core::target::rebuild_recipe(name).join("\n    ")
     )
 }
 

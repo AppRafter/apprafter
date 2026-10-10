@@ -516,12 +516,21 @@
   gap: 8px;
 }
 
-/* The design's mainCols for the Target screen. */
+/* The design's mainCols for the Target screen, used once its side column has cards. */
 .page-grid[data-layout="main-side"] {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr);
   align-items: start;
   gap: 12px;
+}
+
+/* One column of cards, the page's width: no side column has anything to show. */
+.page-grid[data-layout="single"],
+.page-grid-column {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
 }
 
 /* PlanChanges ----------------------------------------------------------------------------- */
