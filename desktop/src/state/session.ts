@@ -85,3 +85,9 @@ export function sessionReducer(state: Session, action: SessionAction): Session {
     }
   }
 }
+
+/** The keys of the tabs in `before` that `after` no longer has. */
+export function closedTabs(before: readonly TargetTab[], after: readonly TargetTab[]): string[] {
+  const open = new Set(after.map((tab) => tab.key));
+  return before.filter((tab) => !open.has(tab.key)).map((tab) => tab.key);
+}

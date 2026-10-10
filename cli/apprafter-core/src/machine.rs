@@ -245,13 +245,15 @@ pub fn region_latencies_with(
 }
 
 /// TCP connect to `<region>-speed.hetzner.com:443`, each bounded by [`LATENCY_PROBE_TIMEOUT`]
-/// (DNS included, `net::tcp_probe`). A cancelled token answers `None` for every region.
+/// (DNS included, `net::tcp_probe`). A probe the token cut short answers like a region that did
+/// not, so the token is looked at once they are done: cancelled, the read is
+/// [`CoreError::Cancelled`], never a list of regions that "did not answer".
 pub fn region_latencies(
     _ctx: &Context,
     regions: &[String],
     cancel: &CancellationToken,
-) -> Vec<RegionLatency> {
-    region_latencies_with(regions, |r| {
+) -> CoreResult<Vec<RegionLatency>> {
+    let latencies = region_latencies_with(regions, |r| {
         crate::net::tcp_probe(
             &format!("{r}-speed.hetzner.com"),
             443,
@@ -260,7 +262,9 @@ pub fn region_latencies(
         )
         .ok()
         .map(|d| d.as_millis().min(u32::MAX as u128) as u32)
-    })
+    });
+    cancel.check()?;
+    Ok(latencies)
 }
 
 #[cfg(test)]
@@ -519,6 +523,22 @@ mod tests {
         );
         assert!(matches!(got, Err(CoreError::Cancelled)), "{got:?}");
         p2.assert();
+    }
+
+    /// D.3d review #1: a cancelled probe answers like a region that did not (`None`), so a read
+    /// cancelled — by its page or by a lock — ended "completed" with every latency null, the
+    /// cancel shown as data. It ends `Cancelled`.
+    #[test]
+    fn a_cancelled_latency_read_ends_cancelled_not_with_empty_answers() {
+        let ctx = Context::for_desktop("/unused".into(), "http://unused");
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let got = region_latencies(&ctx, &["fsn1".to_string(), "nbg1".to_string()], &cancel);
+        assert!(matches!(got, Err(CoreError::Cancelled)), "{got:?}");
+        assert_eq!(
+            region_latencies(&ctx, &[], &CancellationToken::new()).unwrap(),
+            []
+        );
     }
 
     #[test]

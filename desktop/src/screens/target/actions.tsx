@@ -19,9 +19,11 @@ import type { TargetRenewed } from '../../ipc/generated/TargetRenewed';
 import type { TargetUsed } from '../../ipc/generated/TargetUsed';
 import { HETZNER_TOKEN_LEN } from '../../ipc/generated/target';
 import type { UiError } from '../../ipc/generated/UiError';
+import { holdPlan } from '../../ipc/heldPlans';
 import { OperationFailed, resultOf, startPlan } from '../../ipc/plans';
 import { useOverlay } from '../../shell/ViewFrame';
 import { usePlatform } from '../../state/platform';
+import { useTab } from '../../state/tab';
 import { refreshTargets } from '../../state/targets';
 import { nameMessage, nameProblem, tokenMessage } from '../targets/rules';
 import { removedMessage, renamedMessage, renewedMessage, usedMessage } from './outcomes';
@@ -70,14 +72,21 @@ export function useMakeDefault(
   );
 }
 
-/** A bounded or destructive plan's confirm, opened as an overlay of the current view. */
+/**
+ * A bounded or destructive plan's confirm, opened as an overlay of the current view. In a tab,
+ * the tab holds the plan until it runs or the confirm closes, so the tab's closing discards it
+ * (heldPlans); a plan made after its tab closed is discarded at once.
+ */
 function useConfirm(onFailed: (error: UiError) => void) {
   const show = useOverlay();
   const { auth } = usePlatform();
+  const owner = useTab()?.tab.key ?? null;
   return useCallback(
-    (props: Omit<PlanConfirmProps, 'auth' | 'onFailed' | 'onClose'>) =>
-      show((close) => <PlanConfirm {...props} auth={auth} onFailed={onFailed} onClose={close} />),
-    [show, auth, onFailed],
+    (props: Omit<PlanConfirmProps, 'auth' | 'onFailed' | 'onClose'>) => {
+      if (owner !== null) holdPlan(owner, props.view.opId);
+      show((close) => <PlanConfirm {...props} auth={auth} onFailed={onFailed} onClose={close} />);
+    },
+    [show, auth, onFailed, owner],
   );
 }
 

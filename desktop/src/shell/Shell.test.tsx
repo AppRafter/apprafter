@@ -8,6 +8,7 @@ import { ToastProvider } from '../components/Toast';
 import * as api from '../ipc/api';
 import type { AppInfo } from '../ipc/generated/AppInfo';
 import type { OpSummary } from '../ipc/generated/OpSummary';
+import type { PlanView } from '../ipc/generated/PlanView';
 import type { Settings } from '../ipc/generated/Settings';
 import type { TargetListReport } from '../ipc/generated/TargetListReport';
 import { installMockIpc } from '../ipc/mock';
@@ -267,11 +268,83 @@ describe('Shell', () => {
   });
 });
 
+/** Every `cmd` the page sends from now on: its args, and the answer the mock gives. */
+function watch(cmd: string): { args: Record<string, unknown>[]; answers: Promise<unknown>[] } {
+  const internals = (
+    window as unknown as {
+      __TAURI_INTERNALS__: { invoke: (cmd: string, args?: unknown, options?: unknown) => unknown };
+    }
+  ).__TAURI_INTERNALS__;
+  const invoke = internals.invoke;
+  const seen = { args: [] as Record<string, unknown>[], answers: [] as Promise<unknown>[] };
+  internals.invoke = (c, args, options) => {
+    const answer = invoke(c, args, options);
+    if (c === cmd) {
+      seen.args.push({ ...(args as Record<string, unknown>) });
+      seen.answers.push(Promise.resolve(answer));
+    }
+    return answer;
+  };
+  return seen;
+}
+
 describe('Shell, the Target section on the mock IPC', () => {
   beforeEach(async () => {
     clearMocks();
     installMockIpc({ opDelayMs: 0 });
     await api.unlock();
+  });
+
+  /** staging's Target screen with the renew confirm open: the plan Rust holds, with a token. */
+  async function renewConfirmOnStaging(user: ReturnType<typeof userEvent.setup>) {
+    await user.click(await screen.findByRole('button', { name: 'Open staging' }));
+    await user.click(screen.getByRole('button', { name: 'Target' }));
+    await user.click(await screen.findByRole('button', { name: 'Renew' }));
+    const form = screen.getByRole('dialog', { name: 'Renew API token' });
+    await user.type(within(form).getByLabelText('Hetzner Cloud token'), 'k'.repeat(64));
+    await user.click(within(form).getByRole('button', { name: 'Continue' }));
+    await screen.findByRole('dialog', { name: 'Renew the API token of staging?' });
+  }
+
+  test('closing a tab discards the plan its confirm holds, and the token with it (review #13)', async () => {
+    const plans = watch('op_plan_target_renew');
+    const discards = watch('op_discard');
+    const user = shell();
+    await renewConfirmOnStaging(user);
+    const view = (await plans.answers[0]) as PlanView;
+    // Hidden with its tab, the confirm keeps its plan: a hidden Activity runs its effect
+    // cleanups, so nothing there may discard it.
+    await user.click(screen.getByRole('button', { name: 'Open a cluster' }));
+    await user.click(tab('staging'));
+    expect(screen.getByRole('dialog', { name: 'Renew the API token of staging?' })).toBeDefined();
+    expect(discards.args).toEqual([]);
+    await user.click(screen.getByRole('button', { name: 'Close staging' }));
+    await waitFor(() => expect(discards.args).toEqual([{ opId: view.opId }]));
+  });
+
+  test('a plan that ran, or that its confirm discarded, is discarded once: the tab closing adds none', async () => {
+    const plans = watch('op_plan_target_renew');
+    const discards = watch('op_discard');
+    const user = shell();
+    await renewConfirmOnStaging(user);
+    const cancelled = (await plans.answers[0]) as PlanView;
+    await user.click(screen.getByRole('button', { name: 'Cancel' }));
+    await waitFor(() => expect(discards.args).toEqual([{ opId: cancelled.opId }]));
+    await user.click(await screen.findByRole('button', { name: 'Renew' }));
+    const form = screen.getByRole('dialog', { name: 'Renew API token' });
+    await user.type(within(form).getByLabelText('Hetzner Cloud token'), 'k'.repeat(64));
+    await user.click(within(form).getByRole('button', { name: 'Continue' }));
+    const confirm = await screen.findByRole('dialog', { name: 'Renew the API token of staging?' });
+    const ran = (await plans.answers[1]) as PlanView;
+    await user.click(within(confirm).getByRole('button', { name: 'Renew' }));
+    expect(await screen.findByText(/Token renewed/)).toBeDefined();
+    // The run's end discards its record (plans.ts), once.
+    await waitFor(() =>
+      expect(discards.args).toEqual([{ opId: cancelled.opId }, { opId: ran.opId }]),
+    );
+    await user.click(screen.getByRole('button', { name: 'Close staging' }));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(discards.args).toEqual([{ opId: cancelled.opId }, { opId: ran.opId }]);
   });
 
   test('the Target section is the Target screen, and the sidebar says provider · region · tier', async () => {

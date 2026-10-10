@@ -893,7 +893,7 @@ pub fn prompt_machine(
         locations.len()
     );
     let latency_map: std::collections::HashMap<String, Option<u32>> =
-        apprafter_core::machine::region_latencies(ctx, &locations, &cancel)
+        apprafter_core::machine::region_latencies(ctx, &locations, &cancel)?
             .into_iter()
             .map(|r| (r.region, r.latency_ms))
             .collect();

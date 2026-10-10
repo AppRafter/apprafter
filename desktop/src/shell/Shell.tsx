@@ -4,9 +4,10 @@
 // scroll, open dialogs), its effects stop, and its overlays hide with it. Settings is the app's
 // own overlay, over every view. The shortcuts listen on the window. While the OS offers no way to
 // verify the owner, a notice under the title bar says the app lock is off, on every view.
-import { Activity, useCallback, useEffect, useMemo, useReducer, useState } from 'react';
+import { Activity, useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { WarningCircleIcon } from '../components/icons';
 import { ToastViewport, useToast } from '../components/Toast';
+import { discardPlansOf } from '../ipc/heldPlans';
 import { useListRefresh } from '../ipc/listRefresh';
 import { refreshList, useOperations } from '../ipc/operations';
 import { PlannedSection } from '../screens/placeholders/PlannedSection';
@@ -14,7 +15,7 @@ import { TargetScreen } from '../screens/target/TargetScreen';
 import { TargetsPage } from '../screens/targets/TargetsPage';
 import { lockOff, lockOffMessage, NO_AUTH_NOTICE, useLockActions } from '../state/lock';
 import { usePlatform } from '../state/platform';
-import { INITIAL_SESSION, sessionReducer, type TargetTab } from '../state/session';
+import { closedTabs, INITIAL_SESSION, sessionReducer, type TargetTab } from '../state/session';
 import { useSettings } from '../state/settings';
 import { shortcutFor } from '../state/shortcuts';
 import { TabContext } from '../state/tab';
@@ -66,6 +67,15 @@ export function Shell() {
   useEffect(() => {
     refreshList().catch(report('op_list'));
   }, []);
+
+  // A tab that closed, however (its close button, a remove, a rename onto another tab): the
+  // plans its confirms hold go in Rust, with what they hold. Here, in the Shell, because a
+  // hidden tab's Activity runs its own effect cleanups without closing.
+  const lastTabs = useRef(session.tabs);
+  useEffect(() => {
+    for (const key of closedTabs(lastTabs.current, session.tabs)) discardPlansOf(key);
+    lastTabs.current = session.tabs;
+  }, [session.tabs]);
   useListRefresh();
 
   useEffect(() => {

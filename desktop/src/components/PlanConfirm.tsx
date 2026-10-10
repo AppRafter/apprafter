@@ -5,13 +5,15 @@
 // page runs it at once. Confirmed, the dialog stays busy until the run ends, then closes and
 // hands over the result or the failure (a cancelled run is a failure with OP_CANCELLED). Closed
 // before it ran, it discards the plan in Rust, and with it whatever the plan holds (a renew
-// plan's token).
+// plan's token); a plan its tab held (heldPlans) is released either way, so the tab's closing
+// does not discard it again.
 import { type ReactNode, useRef } from 'react';
 import * as api from '../ipc/api';
 import type { AuthInfo } from '../ipc/generated/AuthInfo';
 import type { PlanView } from '../ipc/generated/PlanView';
 import type { JsonValue } from '../ipc/generated/serde_json/JsonValue';
 import type { UiError } from '../ipc/generated/UiError';
+import { releasePlan } from '../ipc/heldPlans';
 import { OperationFailed, resultOf, startPlan } from '../ipc/plans';
 import { ConfirmDialog } from './ConfirmDialog';
 import type { Icon } from './icons';
@@ -56,6 +58,7 @@ export function PlanConfirm({
   const confirm = async (password?: string) => {
     const run = await startPlan(view.opId, password);
     started.current = true;
+    releasePlan(view.opId);
     const end = await run.ended;
     let result: JsonValue;
     try {
@@ -72,6 +75,7 @@ export function PlanConfirm({
 
   const close = () => {
     if (!started.current) {
+      releasePlan(view.opId);
       api.opDiscard(view.opId).catch((e: unknown) => {
         console.error(`op_discard ${view.opId} failed:`, e);
       });

@@ -156,7 +156,9 @@ pub fn whoami(shell: &Shell) -> Result<WhoamiReport, DesktopError> {
 }
 
 /// Verify `token` with `provider` (a read): its result names the draft the token now waits in,
-/// never the token. A lock while it runs keeps nothing ([`crate::drafts::DraftEpoch`]).
+/// never the token. A lock while it runs keeps nothing ([`crate::drafts::DraftEpoch`]), nor does
+/// a cancel: the provider's request cannot be interrupted, so the token is looked at again once
+/// it answers, and a cancelled read drops the token with it.
 pub fn start_verify_token(
     shell: &Shell,
     provider: String,
@@ -167,6 +169,9 @@ pub fn start_verify_token(
     let title = format!("Verify the {provider} token");
     read(shell, title, None, move |ctx, _, cancel| {
         let check = apprafter_core::provider::verify_token(ctx, &provider, &token, cancel)?;
+        // Cancelled while the provider answered (the page cancelled, or the wizard closed): no
+        // page is waiting for this draft.
+        cancel.check()?;
         // A lock since the verify started dropped every draft; this one is not kept either.
         let draft_id = drafts
             .insert(epoch, provider, token)
@@ -222,7 +227,7 @@ pub fn start_region_latencies(shell: &Shell, regions: Vec<String>) -> Result<OpI
         shell,
         "Region latency".into(),
         None,
-        move |ctx, _, cancel| Ok(machine::region_latencies(ctx, &regions, cancel)),
+        move |ctx, _, cancel| machine::region_latencies(ctx, &regions, cancel),
     )
 }
 
@@ -628,6 +633,31 @@ mod tests {
             .recv_timeout(Duration::from_secs(10))
             .expect("the provider was asked");
         assert!(s.shell.lock_now().locked);
+        api.answer.send(()).unwrap();
+        assert_eq!(
+            ended(&s.shell, id),
+            OpEvent::Finished {
+                outcome: Outcome::Cancelled {
+                    cleaned: Vec::new(),
+                    left: Vec::new()
+                }
+            }
+        );
+        assert!(format!("{:?}", s.shell.drafts).contains("drafts: 0"));
+    }
+
+    /// D.3d review #4: the page cancels (or closes the wizard) while the provider is being
+    /// asked. The request cannot be interrupted and answers 200; the read still ends cancelled
+    /// and the verified token is not kept as a draft no page knows of.
+    #[test]
+    fn a_verify_cancelled_while_the_provider_answers_keeps_no_draft() {
+        let api = api();
+        let s = unlocked_store_on(&[], &api);
+        let id = start_verify_token(&s.shell, "hetzner-cloud".into(), a_token('k')).unwrap();
+        api.asked
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the provider was asked");
+        s.shell.ops.cancel(id).unwrap();
         api.answer.send(()).unwrap();
         assert_eq!(
             ended(&s.shell, id),
