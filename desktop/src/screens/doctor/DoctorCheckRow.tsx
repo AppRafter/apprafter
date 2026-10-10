@@ -11,6 +11,29 @@ import type { CheckFix } from '../../ipc/generated/CheckFix';
 import { fixText, inlineParts, STATUS_LABELS, STATUS_TONES } from './doctorText';
 
 /** Text whose backticks are code spans. */
+/**
+ * A command's words, each one unit (`.code-word`): a line breaks between them, never inside one
+ * at a hyphen ("--" at a line's end, "target" on the next). The spaces stay text, so the words
+ * copy as written.
+ */
+function CodeWords({ code }: { code: string }) {
+  return (
+    <>
+      {code.split(/(\s+)/).map((word, index) =>
+        // The words of one string, split once: the index is a stable key.
+        word === '' || /^\s+$/.test(word) ? (
+          word
+        ) : (
+          // biome-ignore lint/suspicious/noArrayIndexKey: see above
+          <span key={index} className="code-word">
+            {word}
+          </span>
+        ),
+      )}
+    </>
+  );
+}
+
 export function Inline({ text }: { text: string }) {
   return (
     <>
@@ -18,7 +41,9 @@ export function Inline({ text }: { text: string }) {
         // The parts of one string, split once: the index is a stable key.
         'code' in part ? (
           // biome-ignore lint/suspicious/noArrayIndexKey: see above
-          <code key={index}>{part.code}</code>
+          <code key={index}>
+            <CodeWords code={part.code} />
+          </code>
         ) : (
           // biome-ignore lint/suspicious/noArrayIndexKey: see above
           <span key={index}>{part.text}</span>

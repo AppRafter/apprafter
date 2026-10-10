@@ -36,6 +36,15 @@ test('a row the keyboard moves to scrolls into view below the header, not under 
   expect(await rule('components.css', '.data-table thead th')).toMatch(/height:\s*var\(--h-30\);/);
 });
 
+test("a command's word wraps whole, onto the next line, unless it is longer than a line", async () => {
+  // An inline-block as wide as its word: the line breaks around it, not inside it at a hyphen;
+  // one wider than the line is capped at it and breaks anywhere rather than overflow.
+  const word = await rule('flows.css', '.code-word');
+  expect(word).toMatch(/display:\s*inline-block;/);
+  expect(word).toMatch(/max-width:\s*100%;/);
+  expect(word).toMatch(/overflow-wrap:\s*anywhere;/);
+});
+
 test('every stylesheet is loaded: main.tsx imports each one', async () => {
   const main = await Bun.file(join(import.meta.dir, '..', 'main.tsx')).text();
   const sheets = [...new Bun.Glob('*.css').scanSync(import.meta.dir)].sort();

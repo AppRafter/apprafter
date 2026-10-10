@@ -5,7 +5,7 @@ import userEvent from '@testing-library/user-event';
 import type { Check } from '../../ipc/generated/Check';
 import type { CheckFix } from '../../ipc/generated/CheckFix';
 import { check } from '../../test/flows';
-import { DoctorCheckRow } from './DoctorCheckRow';
+import { DoctorCheckRow, Inline } from './DoctorCheckRow';
 
 function row(c: Check, onAction?: (fix: CheckFix) => void) {
   const { container } = render(
@@ -161,5 +161,28 @@ describe('DoctorCheckRow', () => {
     expect(screen.queryByRole('button')).toBeNull();
     row(helm);
     expect(screen.queryByRole('button')).toBeNull();
+  });
+});
+
+describe('Inline', () => {
+  test('a command breaks between its words only: each word is one unit, the text as it is', () => {
+    const { container } = render(
+      <p>
+        <Inline text="Replace it: `apprafter kubeconfig --refresh --target prod-eu`." />
+      </p>,
+    );
+    const code = container.querySelector('code');
+    // A browser may break a line after a hyphen: "--" at one line's end, "target" on the next.
+    expect([...(code?.querySelectorAll('.code-word') ?? [])].map((w) => w.textContent)).toEqual([
+      'apprafter',
+      'kubeconfig',
+      '--refresh',
+      '--target',
+      'prod-eu',
+    ]);
+    expect(code?.textContent).toBe('apprafter kubeconfig --refresh --target prod-eu');
+    expect(container.textContent).toBe(
+      'Replace it: apprafter kubeconfig --refresh --target prod-eu.',
+    );
   });
 });

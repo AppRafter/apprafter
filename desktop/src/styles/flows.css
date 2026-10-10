@@ -219,6 +219,14 @@
   font-size: 0.95em;
 }
 
+/* A command's word wraps whole, onto the next line (never "--" here, "target" there); one wider
+   than the line is capped at it and breaks anywhere rather than overflow. */
+.code-word {
+  display: inline-block;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
 .doctor-detail {
   margin-top: 2px;
   color: var(--fg-muted);
