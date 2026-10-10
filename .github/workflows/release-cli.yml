@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
 name: release-cli
 
-# Builds the `apprafter` CLI binary for linux + macOS on every
-# `v0.*` / `v1.*` tag, packages each into a tarball, and creates
-# a GitHub Release with the tarballs as assets.
+# Builds the `apprafter` CLI for Linux, macOS and Windows on every
+# `v0.*` / `v1.*` tag, packages each build (a tarball on Linux and macOS,
+# a zip on Windows, each with a `.sha256`), and creates a GitHub Release
+# with them as assets.
 #
 # The release is what `apprafter`'s built-in newer-version check
 # polls (`commands::version_check` GETs
@@ -14,9 +15,9 @@ name: release-cli
 # Security:
 #
 #   Every potentially-tainted GitHub Actions input
-#   (`inputs.tag`, `github.ref_name`, the changelog section
-#   extracted from the repo) flows through an `env:` binding
-#   before reaching any shell `run:` step. No `${{ }}`
+#   (`inputs.tag`, `inputs.dry_run`, `github.ref_name`, the
+#   changelog section extracted from the repo) flows through an
+#   `env:` binding before reaching any shell `run:` step. No `${{ }}`
 #   interpolation occurs inside `run:` body — eliminates the
 #   action-injection class of risks documented at
 #   https://github.blog/security/vulnerability-research/how-to-catch-github-actions-workflow-injections-before-attackers-do/.
@@ -24,6 +25,12 @@ name: release-cli
 #   The tag-glob trigger (`v0.*` / `v1.*`) further constrains
 #   `github.ref_name` to a known-safe shape; the workflow only
 #   fires on tag pushes whose name matches the version pattern.
+#   The build job's "Decide release or dry run" step also checks
+#   the tag and the version it reads from `cli/Cargo.toml` against
+#   the version shape before it writes them to `GITHUB_ENV`.
+#
+#   The token is read-only by default. Only the release job, which
+#   never runs for a pull request or a dry run, can write.
 #
 # Tag scope policy:
 #
@@ -44,6 +51,19 @@ name: release-cli
 #     this workflow runs once per tag and never regenerates, so
 #     a stub would be permanent.
 #
+# Dry runs:
+#
+#   A pull request that changes this file or what a release build is made
+#   from (the CLI's manifests and lock, its build scripts, its toolchain
+#   pin, the static-runtime guard), and a manual dispatch with `dry_run`
+#   set, run the build job only. Every leg is built, checked and packaged
+#   exactly as for a release, and the archives are kept as artefacts of
+#   the run, named after `cli/Cargo.toml`'s version. No tag is needed and
+#   no release is created. This is how a release build is proven before
+#   its tag exists (the release job needs every leg, so one red leg would
+#   withhold the release for every platform), and how the Windows archive
+#   reaches a hand test before anyone can download it.
+#
 # Cross-compile targets:
 #
 #   - `x86_64-unknown-linux-gnu` — the tier-1 substrate
@@ -54,6 +74,12 @@ name: release-cli
 #     Rust's standard Apple cross-compile.
 #   - `aarch64-apple-darwin` — Apple Silicon Macs. Native on
 #     `macos-latest`.
+#   - `x86_64-pc-windows-msvc` — Windows 10 and 11 on x86_64. Native on
+#     `windows-latest`. The C runtime is linked statically (`+crt-static`),
+#     so the binary starts on a PC without the Visual C++ Redistributable;
+#     scripts/check-windows-static-crt.sh proves it on the binary being
+#     published. Every step runs under bash (Git Bash on Windows). The
+#     binary is not code-signed yet.
 #
 # Linux aarch64 (Hetzner CAX cloud servers) is deliberately
 # absent for now — tier-1 ships on x86 only and adding cross-
@@ -66,21 +92,52 @@ on:
     tags:
       - 'v0.*'
       - 'v1.*'
+  # A dry run (see the header). Path-filtered to what changes how a release
+  # builds, so an ordinary CLI change does not build four release binaries.
+  pull_request:
+    paths:
+      - '.github/workflows/release-cli.yml'
+      - 'scripts/check-windows-static-crt.sh'
+      - 'cli/Cargo.toml'
+      - 'cli/Cargo.lock'
+      - 'cli/rust-toolchain.toml'
+      - 'cli/.cargo/**'
+      - 'cli/platform-cli/build.rs'
+      - 'cli/cli-providers/build.rs'
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag to build (e.g. v0.1.148). Must already exist.'
-        required: true
+        description: 'Tag to build and release (e.g. v0.1.148). Must already exist. Leave empty for a dry run.'
+        required: false
         type: string
+      dry_run:
+        description: 'Build the ref this run is dispatched on and keep the archives as artefacts; create no release.'
+        required: false
+        type: boolean
+        default: false
 
+# Read-only by default; only the release job writes, to create the release.
 permissions:
-  contents: write
+  contents: read
+
+# A newer push to the same pull request supersedes its dry run. Tag and
+# dispatch runs each get a group of their own, so a release is never cancelled.
+concurrency:
+  group: release-cli-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build:
     name: build ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 25
+    # Thin LTO with one codegen unit: about 3 minutes on Linux and 5 on
+    # macOS, longer on Windows.
+    timeout-minutes: 45
+    # Every step is bash — Git Bash on Windows, where pwsh is the default —
+    # so one script serves all four legs, as in test.yml's Windows legs.
+    defaults:
+      run:
+        shell: bash
 
     strategy:
       fail-fast: false
@@ -88,15 +145,87 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
+            exe: ''
+            archive: tar.gz
           - target: x86_64-apple-darwin
             runner: macos-latest
+            exe: ''
+            archive: tar.gz
           - target: aarch64-apple-darwin
             runner: macos-latest
+            exe: ''
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            exe: .exe
+            archive: zip
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.tag || github.ref_name }}
+          # A release dispatch builds its tag. Everything else leaves `ref`
+          # empty, so checkout takes the event's own commit (github.sha): a
+          # tag push its tag, a pull request its merge commit, a dry-run
+          # dispatch the head of its ref when the run was queued. Every leg
+          # then builds the same commit, even if the branch moves meanwhile.
+          ref: ${{ inputs.tag }}
+
+      - name: Decide release or dry run
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          # Everything that differs between a release and a dry run is decided
+          # here, once, from env bindings only (see Security above).
+          version="$(awk '/^\[workspace\.package\]/{f=1} f && /^version/{gsub(/[" ]/,"",$3); print $3; exit}' cli/Cargo.toml)"
+          # The version and the tag are written to GITHUB_ENV below, so each
+          # is held to the version shape first: a value carrying a newline
+          # or a path could set a variable of its own or move an archive.
+          semver='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
+          if ! [[ "$version" =~ $semver ]]; then
+            echo "::error::could not read a [workspace.package] version from cli/Cargo.toml (got '$version')"
+            exit 1
+          fi
+          case "$EVENT" in
+            push)
+              mode=release tag="$REF_NAME" ;;
+            pull_request)
+              mode=dry-run tag="" ;;
+            workflow_dispatch)
+              if [ "$DRY_RUN" = true ]; then
+                if [ -n "$INPUT_TAG" ]; then
+                  echo "::error::pass either the tag input (a release) or dry_run, not both"
+                  exit 1
+                fi
+                mode=dry-run tag=""
+              else
+                if [ -z "$INPUT_TAG" ]; then
+                  echo "::error::a release run needs the tag input; set dry_run to build without one"
+                  exit 1
+                fi
+                mode=release tag="$INPUT_TAG"
+              fi ;;
+            *)
+              echo "::error::release-cli does not run on $EVENT"
+              exit 1 ;;
+          esac
+          if [ "$mode" = release ]; then
+            if ! [[ "$tag" == v* && "${tag#v}" =~ $semver ]]; then
+              echo "::error::the tag is not a CLI version tag (vMAJOR.MINOR.PATCH)"
+              exit 1
+            fi
+            expected="${tag#v}" label="$tag"
+          else
+            expected="$version" label="v${version}"
+          fi
+          echo "mode: $mode, expected version: $expected, archive label: $label"
+          {
+            echo "RELEASE_MODE=$mode"
+            echo "EXPECTED_VERSION=$expected"
+            echo "ARCHIVE_LABEL=$label"
+          } >> "$GITHUB_ENV"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
@@ -112,6 +241,8 @@ jobs:
       # upstream action at the same commit and `version:` input
       # every other workflow pins, so all CI workflows share one
       # cue version.
+      # On Windows, `cli-providers/build.rs` cannot run the bash resolver
+      # `scripts/cue` and falls back to the bare `cue` this puts on PATH.
       - name: Install CUE
         uses: cue-lang/setup-cue@b0e30e540a2dae47304ebf16586a5b2db023b61c # v2.0.0
         with:
@@ -121,9 +252,17 @@ jobs:
         working-directory: cli
         env:
           TARGET: ${{ matrix.target }}
+          # Windows only (the variable names the target): link the MSVC C
+          # runtime into the binary, so it starts on a PC without the Visual
+          # C++ Redistributable. Set here, not in cli/.cargo, so test builds
+          # keep the default. The check step below proves it took.
+          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
         run: cargo build --release --locked --target "$TARGET" -p apprafter
 
+      # The release profile already strips symbols (cli/Cargo.toml); there is
+      # no GNU strip for an MSVC PE file, so Windows skips this step.
       - name: Strip binary
+        if: runner.os != 'Windows'
         env:
           TARGET: ${{ matrix.target }}
         run: |
@@ -134,40 +273,103 @@ jobs:
             strip --strip-unneeded "$binary"
           fi
 
-      - name: Verify binary matches tag version
+      - name: Check the Windows binary needs no C runtime DLL
+        if: runner.os == 'Windows'
         env:
-          EXPECTED_TAG: ${{ inputs.tag || github.ref_name }}
           TARGET: ${{ matrix.target }}
+          # Git Bash rewrites arguments that look like POSIX paths before a
+          # native program sees them, which turns a `/dependents` switch into
+          # a path. The switches below use `-`, and this turns the rewrite off.
+          MSYS_NO_PATHCONV: '1'
         run: |
-          # The CLI's `cli/Cargo.toml` `workspace.package.version`
-          # must match the tag minus the leading `v` per the
-          # CLAUDE.md versioning rule. A mismatch means the
-          # commit that received the tag forgot to bump the
-          # Cargo.toml version — the published binary would
-          # report a stale `--version` string, which the
-          # version_check banner relies on for comparison.
-          # Fail loudly so the operator catches the drift
-          # before publishing.
-          expected="${EXPECTED_TAG#v}"
-          actual=$(cli/target/"${TARGET}"/release/apprafter --version | awk '{print $2}')
-          if [ "$expected" != "$actual" ]; then
-            echo "::error::CLI --version output '$actual' does not match tag '$EXPECTED_TAG' (expected '$expected')"
+          # The guard first proves its own pattern against dumpbin's format.
+          bash scripts/check-windows-static-crt.sh --self-test
+          vswhere='/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe'
+          # sed -n 1p, not head: head exits early and pipefail would fail the
+          # pipeline when vswhere prints more than one toolset.
+          dumpbin="$("$vswhere" -latest -products '*' -find 'VC\Tools\MSVC\**\bin\Hostx64\x64\dumpbin.exe' | tr -d '\r' | sed -n 1p)"
+          if [ -z "$dumpbin" ]; then
+            echo "::error::vswhere found no dumpbin.exe; the static-runtime check cannot run"
             exit 1
           fi
-          echo "Binary version $actual matches tag $EXPECTED_TAG"
+          "$(cygpath -u "$dumpbin")" -nologo -dependents "cli/target/${TARGET}/release/apprafter.exe" > dumpbin-dependents.txt
+          cat dumpbin-dependents.txt
+          bash scripts/check-windows-static-crt.sh < dumpbin-dependents.txt
 
-      - name: Package tarball
+      - name: Verify the binary's version
         env:
-          TAG: ${{ inputs.tag || github.ref_name }}
           TARGET: ${{ matrix.target }}
+          EXE: ${{ matrix.exe }}
         run: |
-          stage=$(mktemp -d)
-          cp "cli/target/${TARGET}/release/apprafter" "$stage/"
+          # A release: `cli/Cargo.toml`'s workspace.package.version must match
+          # the tag minus its leading `v` (the CLAUDE.md versioning rule) — a
+          # mismatch means the tagged commit forgot the bump, and the published
+          # binary would report a stale `--version`, which the version_check
+          # banner compares against. A dry run: the binary must start and
+          # report the version it was built from.
+          bin="cli/target/${TARGET}/release/apprafter${EXE}"
+          actual="$("$bin" --version | tr -d '\r' | awk '{print $2}')"
+          if [ "$EXPECTED_VERSION" != "$actual" ]; then
+            echo "::error::CLI --version output '$actual' does not match the expected '$EXPECTED_VERSION' ($RELEASE_MODE)"
+            exit 1
+          fi
+          echo "Binary version $actual matches ($RELEASE_MODE)"
+
+      - name: Smoke-test the binary
+        env:
+          TARGET: ${{ matrix.target }}
+          EXE: ${{ matrix.exe }}
+        run: |
+          # The release profile (thin LTO, one codegen unit, the 8 MiB main
+          # stack on Windows) is built nowhere else, so run a real command on
+          # it: parse a subcommand and read an empty target store. A scratch
+          # store and no startup checks keep it away from every cluster and
+          # API. Its log line goes to stderr, which stays in the step log.
+          bin="cli/target/${TARGET}/release/apprafter${EXE}"
+          "$bin" --help > /dev/null
+          out="$(APPRAFTER_SKIP_STARTUP_CHECKS=1 APPRAFTER_CONFIG_DIR="$RUNNER_TEMP/apprafter-smoke" KUBECONFIG=/nonexistent "$bin" target list | tr -d '\r')"
+          case "$out" in
+            "No targets configured."*) echo "OK: target list on an empty store" ;;
+            *) echo "::error::unexpected 'target list' output: $out"; exit 1 ;;
+          esac
+
+      - name: Package the archive
+        env:
+          TARGET: ${{ matrix.target }}
+          EXE: ${{ matrix.exe }}
+          ARCHIVE_EXT: ${{ matrix.archive }}
+        run: |
+          bin="cli/target/${TARGET}/release/apprafter${EXE}"
+          stage="$(mktemp -d)"
+          cp "$bin" "$stage/"
           cp README.md "$stage/" 2>/dev/null || true
           cp LICENSE "$stage/" 2>/dev/null || true
-          archive="apprafter-${TAG}-${TARGET}.tar.gz"
-          tar -czf "$archive" -C "$stage" .
-          shasum -a 256 "$archive" > "${archive}.sha256"
+          archive="apprafter-${ARCHIVE_LABEL}-${TARGET}.${ARCHIVE_EXT}"
+          case "$ARCHIVE_EXT" in
+            tar.gz)
+              tar -czf "$archive" -C "$stage" .
+              shasum -a 256 "$archive" > "${archive}.sha256"
+              ;;
+            zip)
+              # 7-Zip ships on the Windows runners. The file names come from
+              # bash's glob inside the stage directory, so apprafter.exe sits
+              # at the zip's root, where the install steps expect it.
+              (cd "$stage" && 7z a -tzip -bd "$GITHUB_WORKSPACE/$archive" -- *)
+              listing="$(7z l -slt "$archive" | tr -d '\r')"
+              if ! grep -qx 'Path = apprafter.exe' <<<"$listing"; then
+                echo "::error::$archive has no apprafter.exe at its root"
+                exit 1
+              fi
+              # One format on every OS: `<hex>  <name>`, which sha256sum -c,
+              # shasum -c and PowerShell's Get-FileHash comparison all read.
+              sum="$(sha256sum "$archive" | cut -d' ' -f1)"
+              printf '%s  %s\n' "$sum" "$archive" > "${archive}.sha256"
+              sha256sum -c "${archive}.sha256"
+              ;;
+            *)
+              echo "::error::unknown archive format $ARCHIVE_EXT"
+              exit 1 ;;
+          esac
           {
             echo "ARCHIVE=$archive"
             echo "CHECKSUM=${archive}.sha256"
@@ -180,13 +382,18 @@ jobs:
           path: |
             ${{ env.ARCHIVE }}
             ${{ env.CHECKSUM }}
-          retention-days: 7
+          # A dry run's archive is what the hand test on Windows downloads.
+          retention-days: ${{ env.RELEASE_MODE == 'release' && 7 || 14 }}
 
   release:
     name: create GitHub Release
     needs: build
+    # A dry run stops after the build: no tag, no release.
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && !inputs.dry_run)
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: write
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -301,8 +508,18 @@ jobs:
           # `release-assets/` directory the `gh release` upload
           # step then consumes.
           mkdir -p release-assets
-          find artifacts -type f \( -name '*.tar.gz' -o -name '*.sha256' \) \
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.sha256' \) \
             -exec cp -v {} release-assets/ \;
+          # One archive and one checksum per build leg, or no release. A filter
+          # that missed a format would otherwise publish a release without that
+          # platform and stay green. Each leg uploads one artefact directory.
+          legs="$(find artifacts -mindepth 1 -maxdepth 1 -type d | wc -l)"
+          archives="$(find release-assets -type f \( -name '*.tar.gz' -o -name '*.zip' \) | wc -l)"
+          sums="$(find release-assets -type f -name '*.sha256' | wc -l)"
+          if [ "$legs" -eq 0 ] || [ "$archives" -ne "$legs" ] || [ "$sums" -ne "$legs" ]; then
+            echo "::error::$legs build legs but $archives archives and $sums checksums"
+            exit 1
+          fi
           # Recreate the release if it already exists (re-runs
           # via workflow_dispatch). `gh release create` errors
           # when the release already exists; delete + create
