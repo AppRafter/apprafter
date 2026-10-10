@@ -128,7 +128,7 @@ status = "planned"
 slice = "D.12"
 
 [leaf."doctor"]
-status = "planned"
+action = "doctor.run"
 slice = "D.3"
 
 [leaf."export"]
@@ -261,7 +261,7 @@ status = "planned"
 slice = "D.5"
 
 [leaf."target add"]
-status = "planned"
+action = "target.add"
 slice = "D.3"
 
 [leaf."target cert import"]
@@ -293,7 +293,7 @@ action = "target.list"
 slice = "D.3"
 
 [leaf."target machine"]
-status = "planned"
+action = "target.machine"
 slice = "D.3"
 
 [leaf."target remove"]
@@ -340,5 +340,5 @@ status = "planned"
 slice = "D.8"
 
 [leaf."whoami"]
-status = "planned"
+action = "whoami.show"
 slice = "D.3"

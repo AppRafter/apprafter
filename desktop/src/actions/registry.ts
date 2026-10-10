@@ -9,23 +9,35 @@ import type { ApiCommand } from '../ipc/api';
  * with the surface that uses them.
  */
 export const ACTION_IDS = [
+  'target.add',
   'target.list',
   'target.show',
   'target.use',
   'target.rename',
   'target.remove',
+  'target.machine',
   'target.renew',
+  'doctor.run',
+  'whoami.show',
 ] as const;
 
 export type ActionId = (typeof ACTION_IDS)[number];
 
 export const ACTION_COMMANDS: { readonly [K in ActionId]: ApiCommand } = {
+  // The add-target wizard's Save target.
+  'target.add': 'op_plan_target_add',
   'target.list': 'target_list',
   'target.show': 'target_show',
   'target.use': 'op_plan_target_use',
   'target.rename': 'op_plan_target_rename',
   'target.remove': 'op_plan_target_remove',
+  // Target › Machine › Change: Apply machine.
+  'target.machine': 'op_plan_target_machine',
   'target.renew': 'op_plan_target_renew',
+  // The Doctor overlay (the sidebar's stethoscope, the Target screen's Run doctor).
+  'doctor.run': 'op_start_doctor',
+  // Settings › About › This computer.
+  'whoami.show': 'whoami',
 };
 
 /**
