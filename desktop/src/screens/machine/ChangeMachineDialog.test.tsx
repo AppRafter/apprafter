@@ -6,12 +6,10 @@ import { act, cleanup, render, screen, waitFor, within } from '@testing-library/
 import userEvent from '@testing-library/user-event';
 import { ToastProvider, ToastViewport } from '../../components/Toast';
 import { endedAwaySnapshot, resetEndedAway } from '../../ipc/away';
-import { discardPlansOf, resetHeldPlans } from '../../ipc/heldPlans';
+import { resetHeldPlans } from '../../ipc/heldPlans';
 import { resetOperations } from '../../ipc/operations';
-import { ViewFrame } from '../../shell/ViewFrame';
 import { PlatformContext } from '../../state/platform';
 import { createQueryClient } from '../../state/queryClient';
-import { TabContext } from '../../state/tab';
 import { appInfo } from '../../test/fixtures';
 import { catalogue, machineSet, planParts } from '../../test/flows';
 import {
@@ -23,6 +21,7 @@ import {
   uiError,
 } from '../../test/ipc';
 import { settleIpc } from '../../test/settle';
+import { tabHost } from '../../test/tab';
 import { ChangeMachineDialog, type MachineNow } from './ChangeMachineDialog';
 
 let h: Harness;
@@ -40,37 +39,26 @@ afterEach(async () => {
   clearMocks();
 });
 
-function renderChange(
-  target: string,
-  now: MachineNow,
-  strict = false,
-  tabKey: string | null = null,
-) {
+/** The dialog in a tab view, as Task 21 opens it: the tab can be hidden, shown and closed. */
+function renderChange(target: string, now: MachineNow, strict = false) {
   const onClose = mock();
   const client = createQueryClient();
   const invalidated = spyOn(client, 'invalidateQueries');
+  const tab = tabHost(target);
   const view = render(
     <QueryClientProvider client={client}>
       <PlatformContext value={appInfo()}>
         <ToastProvider>
-          {tabKey === null ? (
-            <ViewFrame>
-              <ChangeMachineDialog target={target} now={now} onClose={onClose} />
-            </ViewFrame>
-          ) : (
-            <TabContext value={{ tab: { key: tabKey, target, section: 'target' }, active: true }}>
-              <ViewFrame>
-                <ChangeMachineDialog target={target} now={now} onClose={onClose} />
-              </ViewFrame>
-            </TabContext>
-          )}
+          <tab.Tab>
+            <ChangeMachineDialog target={target} now={now} onClose={onClose} />
+          </tab.Tab>
           <ToastViewport />
         </ToastProvider>
       </PlatformContext>
     </QueryClientProvider>,
     { reactStrictMode: strict },
   );
-  return { user: userEvent.setup(), onClose, invalidated, unmount: view.unmount };
+  return { user: userEvent.setup(), onClose, invalidated, unmount: view.unmount, tab };
 }
 const radio = (name: string) => screen.getByRole('radio', { name }) as HTMLInputElement;
 const apply = () => screen.getByRole('button', { name: 'Apply machine' }) as HTMLButtonElement;
@@ -121,6 +109,60 @@ test('under StrictMode the double mount still ends on the catalogue', async () =
   renderChange('staging', STAGING, true);
   await waitFor(() => expect(radio('cx22').checked).toBe(true));
   expect(h.of('op_cancel').map((c) => c.args)).toEqual([{ opId: 81 }]);
+});
+
+test('a catalogue read the tab hides runs on: its end shows when the tab is back, nothing started again', async () => {
+  let answer = (_opId: number) => {};
+  h.answer(
+    'op_start_machine_catalogue',
+    () =>
+      new Promise<number>((resolve) => {
+        answer = resolve;
+      }),
+  );
+  const { tab } = renderChange('staging', STAGING);
+  await waitFor(() => expect(h.of('op_start_machine_catalogue')).toHaveLength(1));
+  tab.hide();
+  await act(async () => {
+    answer(h.newOperation([completed(catalogue())]));
+    await settleIpc();
+  });
+  tab.show();
+  await waitFor(() => expect(radio('cx22').checked).toBe(true));
+  expect(h.of('op_cancel')).toEqual([]);
+  expect(h.of('op_start_machine_catalogue')).toHaveLength(1);
+});
+
+test('a latency read the tab hides runs on: its answer shows when the tab is back', async () => {
+  let answer = (_opId: number) => {};
+  h.answer(
+    'op_start_region_latencies',
+    () =>
+      new Promise<number>((resolve) => {
+        answer = resolve;
+      }),
+  );
+  const { tab } = renderChange('staging', STAGING);
+  await waitFor(() => expect(h.of('op_start_region_latencies')).toHaveLength(1));
+  tab.hide();
+  await act(async () => {
+    answer(h.newOperation([completed([{ region: 'nbg1', latencyMs: 38 }])]));
+    await settleIpc();
+  });
+  tab.show();
+  expect(await screen.findByText('38 ms')).toBeDefined();
+  expect(h.of('op_cancel')).toEqual([]);
+  expect(h.of('op_start_region_latencies')).toHaveLength(1);
+});
+
+test('closing the tab cancels the reads it started', async () => {
+  const keeps = h.newOperation([]);
+  h.answer('op_start_machine_catalogue', keeps);
+  const { tab } = renderChange('staging', STAGING);
+  await waitFor(() => expect(h.of('op_start_machine_catalogue')).toHaveLength(1));
+  tab.hide();
+  tab.close();
+  await waitFor(() => expect(h.of('op_cancel').map((c) => c.args)).toEqual([{ opId: keeps }]));
 });
 
 test('Apply plans, runs the Bounded plan at once, refreshes the target and closes', async () => {
@@ -259,14 +301,14 @@ test("in a tab, a Destructive plan's confirm is held by the tab: closing the tab
     planParts({ class: 'destructive', title: 'Replace the machine of staging', target: 'staging' }),
     [completed(machineSet())],
   );
-  const { user } = renderChange('staging', STAGING, false, 'tab-1');
+  const { user, tab } = renderChange('staging', STAGING);
   await waitFor(() => expect(radio('cx22').checked).toBe(true));
   await user.click(radio('cpx22'));
   await user.click(apply());
   expect(
     await screen.findByRole('dialog', { name: 'Replace the machine of staging' }),
   ).toBeDefined();
-  discardPlansOf('tab-1'); // the Shell tells it when the tab closes
+  tab.close(); // the Shell ends the tab's scope when it removes the tab
   expect(h.of('op_discard').map((c) => c.args)).toContainEqual({
     opId: h.started('op_plan_target_machine')[0],
   });

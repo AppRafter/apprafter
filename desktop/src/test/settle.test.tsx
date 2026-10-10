@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
-import { afterEach, expect, test } from 'bun:test';
+import { afterEach, expect, spyOn, test } from 'bun:test';
 import { readdirSync, readFileSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { invoke } from '@tauri-apps/api/core';
@@ -17,7 +17,7 @@ afterEach(async () => {
   clearMocks();
 });
 
-test('a read whose op_start is answered as its component goes cancels, follows and discards its op before the teardown', async () => {
+test('a read whose op_start is answered after a bare unmount follows and discards its op before the teardown', async () => {
   const h = installHarness();
   h.read('op_start_doctor', [completed({ target: 'prod-eu', groups: [] })]);
   // Rust's follow answers a turn later, as the CI runner's did: one turn is not enough.
@@ -34,13 +34,51 @@ test('a read whose op_start is answered as its component goes cancels, follows a
   act(() => {
     void result.current.run(() => api.opStartDoctor('prod-eu'));
   });
-  // The component goes before op_start's answer reaches the read: nothing followed yet.
+  // The component goes, with no lifecycle event (a re-keyed screen, a test's teardown), before
+  // op_start's answer reaches the read: nothing is followed yet, and nothing cancels the read.
   unmount();
-  expect(h.of('op_cancel')).toEqual([]);
+  expect(h.of('op_subscribe')).toEqual([]);
   await settleIpc();
   const [opId] = h.started('op_start_doctor');
-  for (const cmd of ['op_cancel', 'op_subscribe', 'op_discard']) {
+  expect(h.of('op_cancel')).toEqual([]);
+  for (const cmd of ['op_subscribe', 'op_discard']) {
     expect({ cmd, args: h.of(cmd).map((c) => c.args.opId) }).toEqual({ cmd, args: [opId] });
+  }
+});
+
+test('a read whose op_start is answered after the IPC is gone settles, with no unhandled error', async () => {
+  const h = installHarness();
+  let answer = (_opId: number) => {};
+  h.answer(
+    'op_start_doctor',
+    () =>
+      new Promise<number>((resolve) => {
+        answer = resolve;
+      }),
+  );
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown) => unhandled.push(reason);
+  process.on('unhandledRejection', onUnhandled);
+  // The op_discard that ends the read has no IPC either: logged, as any failed discard is.
+  const logged = spyOn(console, 'error').mockImplementation(() => {});
+  try {
+    const { result, unmount } = renderHook(() => useRead<unknown>());
+    let done: Promise<unknown> = Promise.resolve();
+    act(() => {
+      done = result.current.run(() => api.opStartDoctor('prod-eu'));
+    });
+    unmount();
+    clearMocks();
+    answer(h.newOperation([]));
+    expect(await done).toBeNull();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(unhandled).toEqual([]);
+    expect(logged.mock.calls.map((call) => String(call[0]))).toEqual([
+      expect.stringMatching(/^op_discard \d+ failed:$/),
+    ]);
+  } finally {
+    process.off('unhandledRejection', onUnhandled);
+    logged.mockRestore();
   }
 });
 

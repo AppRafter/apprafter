@@ -4,10 +4,13 @@
 // scroll, open dialogs), its effects stop, and its overlays hide with it. Settings is the app's
 // own overlay, over every view. The shortcuts listen on the window. While the OS offers no way to
 // verify the owner, a notice under the title bar says the app lock is off, on every view.
+// Each tab view has a scope (ipc/lifecycle.ts) that ends when the tab closes, however it closes,
+// and Settings one that ends when it closes: what their screens started goes with them. Never on
+// an effect cleanup: a hidden tab's Activity runs those without the tab closing.
 import { Activity, useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { WarningCircleIcon } from '../components/icons';
 import { ToastViewport, useToast } from '../components/Toast';
-import { discardPlansOf } from '../ipc/heldPlans';
+import { newScope, type ScopeHandle, sessionScope } from '../ipc/lifecycle';
 import { useListRefresh } from '../ipc/listRefresh';
 import { refreshList, useOperations } from '../ipc/operations';
 import { PlannedSection } from '../screens/placeholders/PlannedSection';
@@ -15,6 +18,7 @@ import { TargetScreen } from '../screens/target/TargetScreen';
 import { TargetsPage } from '../screens/targets/TargetsPage';
 import { lockOff, lockOffMessage, NO_AUTH_NOTICE, useLockActions } from '../state/lock';
 import { usePlatform } from '../state/platform';
+import { ScopeContext } from '../state/scope';
 import { closedTabs, INITIAL_SESSION, sessionReducer, type TargetTab } from '../state/session';
 import { useSettings } from '../state/settings';
 import { shortcutFor } from '../state/shortcuts';
@@ -50,13 +54,25 @@ export function Shell() {
   // The targets with a tab: their cards on the Targets view switch to it.
   const openTargets = useMemo(() => new Set(session.tabs.map((tab) => tab.target)), [session.tabs]);
 
-  const [settingsOpen, setSettingsOpen] = useState(false);
+  // Settings' scope while it is open: its close ends it.
+  const [settings, setSettings] = useState<ScopeHandle | null>(null);
+  const settingsRef = useRef<ScopeHandle | null>(null);
   const { lock: lockNow } = useLockActions();
   const toast = useToast();
   // Not in effect, the lock is not offered: Lock is disabled and Mod+L says why instead.
   const off = lockOff(info.auth.available, useSettings().data?.lockEnabled);
   const showTargets = useCallback(() => dispatch({ type: 'show', view: { kind: 'targets' } }), []);
-  const openSettings = useCallback(() => setSettingsOpen(true), []);
+  const openSettings = useCallback(() => {
+    if (settingsRef.current !== null) return;
+    const handle = newScope(sessionScope());
+    settingsRef.current = handle;
+    setSettings(handle);
+  }, []);
+  const closeSettings = useCallback(() => {
+    settingsRef.current?.end();
+    settingsRef.current = null;
+    setSettings(null);
+  }, []);
   const lock = useCallback(() => {
     if (off !== null) {
       toast({ message: lockOffMessage(off), icon: WarningCircleIcon });
@@ -69,12 +85,26 @@ export function Shell() {
     refreshList().catch(report('op_list'));
   }, []);
 
-  // A tab that closed, however (its close button, a remove, a rename onto another tab): the
-  // plans its confirms hold go in Rust, with what they hold. Here, in the Shell, because a
-  // hidden tab's Activity runs its own effect cleanups without closing.
+  // Each tab view's scope, made the first time the tab renders.
+  const tabScopes = useRef(new Map<string, ScopeHandle>());
+  const scopeOf = (key: string) => {
+    let handle = tabScopes.current.get(key);
+    if (handle === undefined) {
+      handle = newScope(sessionScope());
+      tabScopes.current.set(key, handle);
+    }
+    return handle.scope;
+  };
+  // A tab that closed, however (its close button, a remove, a rename onto another tab): its
+  // scope ends, and what its screens started goes — the reads cancelled, the plans its confirms
+  // hold discarded in Rust with what they hold. Here, in the Shell, because a hidden tab's
+  // Activity runs its own effect cleanups without closing.
   const lastTabs = useRef(session.tabs);
   useEffect(() => {
-    for (const key of closedTabs(lastTabs.current, session.tabs)) discardPlansOf(key);
+    for (const key of closedTabs(lastTabs.current, session.tabs)) {
+      tabScopes.current.get(key)?.end();
+      tabScopes.current.delete(key);
+    }
     lastTabs.current = session.tabs;
   }, [session.tabs]);
   useListRefresh();
@@ -131,22 +161,24 @@ export function Shell() {
           const shown = session.view.kind === 'tab' && session.view.key === tab.key;
           return (
             <Activity key={tab.key} mode={shown ? 'visible' : 'hidden'}>
-              <TabContext value={{ tab, active: shown }}>
-                <ViewFrame panel={{ id: tabPanelId(tab.key), labelledBy: tabId(tab.key) }}>
-                  {sidebar(tab)}
-                  <main className="main">
-                    {tab.section === 'target' ? (
-                      <TargetScreen
-                        name={tab.target}
-                        onRenamed={(from, to) => dispatch({ type: 'targetRenamed', from, to })}
-                        onRemoved={(target) => dispatch({ type: 'targetRemoved', target })}
-                      />
-                    ) : (
-                      <PlannedSection section={tab.section} target={tab.target} />
-                    )}
-                  </main>
-                </ViewFrame>
-              </TabContext>
+              <ScopeContext value={scopeOf(tab.key)}>
+                <TabContext value={{ tab, active: shown }}>
+                  <ViewFrame panel={{ id: tabPanelId(tab.key), labelledBy: tabId(tab.key) }}>
+                    {sidebar(tab)}
+                    <main className="main">
+                      {tab.section === 'target' ? (
+                        <TargetScreen
+                          name={tab.target}
+                          onRenamed={(from, to) => dispatch({ type: 'targetRenamed', from, to })}
+                          onRemoved={(target) => dispatch({ type: 'targetRemoved', target })}
+                        />
+                      ) : (
+                        <PlannedSection section={tab.section} target={tab.target} />
+                      )}
+                    </main>
+                  </ViewFrame>
+                </TabContext>
+              </ScopeContext>
             </Activity>
           );
         })}
@@ -163,7 +195,11 @@ export function Shell() {
             </main>
           </ViewFrame>
         </Activity>
-        {settingsOpen && <SettingsDialog onClose={() => setSettingsOpen(false)} />}
+        {settings !== null && (
+          <ScopeContext value={settings.scope}>
+            <SettingsDialog onClose={closeSettings} />
+          </ScopeContext>
+        )}
         <EndedAwayNotices />
         <ToastViewport />
       </div>

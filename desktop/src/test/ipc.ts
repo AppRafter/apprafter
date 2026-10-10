@@ -30,6 +30,8 @@ export interface Harness {
   plan(cmd: string, view: Omit<PlanView, 'opId'>, events: readonly OpEvent[]): void;
   /** An operation the test knows by id (op_subscribe replays its events). */
   operation(opId: OpId, events: readonly OpEvent[]): void;
+  /** A new operation, its id from the run-wide counter (never one a previous test used). */
+  newOperation(events: readonly OpEvent[]): OpId;
   of(cmd: string): Call[];
   /** The operation ids `cmd` was answered with by `read` or `plan`, in order. */
   started(cmd: string): OpId[];
@@ -126,6 +128,11 @@ export function installHarness(): Harness {
     },
     operation: (opId, list) => {
       events.set(opId, list);
+    },
+    newOperation: (list) => {
+      nextOpId += 1;
+      events.set(nextOpId, list);
+      return nextOpId;
     },
     of: (cmd) => calls.filter((c) => c.cmd === cmd),
     started: (cmd) => answered.get(cmd) ?? [],

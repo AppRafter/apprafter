@@ -14,6 +14,7 @@ import { ErrorPanel } from '../components/ErrorPanel';
 import { activity, IpcError, uiErrorOf } from '../ipc/api';
 import { DESKTOP_ERROR_CODES } from '../ipc/generated/errors';
 import type { LockState } from '../ipc/generated/LockState';
+import { sessionLocked } from '../ipc/lifecycle';
 import { clearLive, reattachAll } from '../ipc/operations';
 import { ACTIVITY_INTERVAL_MS, dropUnlockedData, useLockState } from '../state/lock';
 import {
@@ -60,6 +61,10 @@ export function LockGate({ children, now = Date.now }: LockGateProps) {
     if (before === undefined || before === locked) return;
     clearLive();
     if (locked) {
+      // Every screen of the session is gone (ipc/lifecycle.ts): what they started is cancelled or
+      // discarded — refused as locked, since Rust has done it already — and a plan that ends
+      // after the unlock shows at the app level.
+      sessionLocked();
       dropUnlockedData(client);
       rereadAppInfo(client, true);
     } else {

@@ -277,7 +277,16 @@ function refollow(entry: Entry, sub: Subscription) {
 }
 
 async function follow(entry: Entry) {
-  const sub = openChannel(entry);
+  let sub: Subscription;
+  try {
+    sub = openChannel(entry);
+  } catch (e) {
+    // No IPC to open a channel on (a test whose mock is gone): following failed, said as a
+    // refusal is, so whoever waits for the end hears it; never an unhandled rejection.
+    entry.view = { ...entry.view, attachError: uiErrorOf(e) };
+    publish();
+    return;
+  }
   entry.current = sub;
   let answer: Subscribed;
   try {

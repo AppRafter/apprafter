@@ -8,10 +8,12 @@ import { ToastProvider, ToastViewport } from '../../components/Toast';
 import { endedAwaySnapshot, resetEndedAway } from '../../ipc/away';
 import { DESKTOP_ERROR_CODES } from '../../ipc/generated/errors';
 import type { OpEvent } from '../../ipc/generated/OpEvent';
+import { newScope, resetLifecycle, sessionScope } from '../../ipc/lifecycle';
 import { resetOperations } from '../../ipc/operations';
 import { ViewFrame } from '../../shell/ViewFrame';
 import { PlatformContext } from '../../state/platform';
 import { createQueryClient } from '../../state/queryClient';
+import { ScopeContext } from '../../state/scope';
 import { appInfo } from '../../test/fixtures';
 import { catalogue, planParts, targetAdded } from '../../test/flows';
 import {
@@ -36,26 +38,35 @@ afterEach(async () => {
   await settleIpc();
   resetOperations();
   resetEndedAway();
+  resetLifecycle();
   clearMocks();
 });
 
 const currentStep = () => document.querySelector('[aria-current="step"]')?.textContent ?? '';
 
+/** The wizard in a screen of its own: `gone()` is its host closing it (the scope ends, it goes). */
 function renderWizard(os: 'linux' | 'windows' = 'linux') {
   const onClose = mock();
+  const own = newScope(sessionScope());
   const { unmount } = render(
     <QueryClientProvider client={createQueryClient()}>
       <PlatformContext value={appInfo({ os })}>
         <ToastProvider>
           <ViewFrame>
-            <AddTargetWizard onClose={onClose} />
+            <ScopeContext value={own.scope}>
+              <AddTargetWizard onClose={onClose} />
+            </ScopeContext>
           </ViewFrame>
           <ToastViewport />
         </ToastProvider>
       </PlatformContext>
     </QueryClientProvider>,
   );
-  return { user: userEvent.setup(), onClose, unmount };
+  const gone = () => {
+    own.end();
+    unmount();
+  };
+  return { user: userEvent.setup(), onClose, unmount, gone };
 }
 
 describe('provider and token', () => {
@@ -199,21 +210,21 @@ describe('after the wizard went', () => {
           answer = resolve;
         }),
     );
-    h.operation(77, [completed({ draftId: 9, elapsedMs: 182 })]);
-    const { user, unmount } = renderWizard();
+    const opId = h.newOperation([completed({ draftId: 9, elapsedMs: 182 })]);
+    const { user, gone } = renderWizard();
     await user.type(screen.getByLabelText('API token'), TOKEN);
     await user.click(screen.getByRole('button', { name: 'Verify and continue' }));
-    unmount();
-    answer(77);
+    gone();
+    answer(opId);
     await waitFor(() =>
       expect(h.of('target_draft_discard').map((c) => c.args)).toEqual([{ draftId: 9 }]),
     );
-    expect(h.of('op_cancel').map((c) => c.args)).toEqual([{ opId: 77 }]);
+    expect(h.of('op_cancel').map((c) => c.args)).toEqual([{ opId }]);
   });
 
   test('a catalogue that lands after the wizard is gone starts no latency read', async () => {
     let answer = (_opId: number) => {};
-    const { user, unmount } = renderWizard();
+    const { user, gone } = renderWizard();
     h.answer(
       'op_start_machine_catalogue',
       () =>
@@ -221,11 +232,11 @@ describe('after the wizard went', () => {
           answer = resolve;
         }),
     );
-    h.operation(78, [completed(catalogue())]);
+    const opId = h.newOperation([completed(catalogue())]);
     await toMachine(user, []);
-    unmount();
-    answer(78);
-    await waitFor(() => expect(h.of('op_discard').map((c) => c.args)).toContainEqual({ opId: 78 }));
+    gone();
+    answer(opId);
+    await waitFor(() => expect(h.of('op_discard').map((c) => c.args)).toContainEqual({ opId }));
     expect(h.of('op_start_region_latencies')).toHaveLength(0);
   });
 });

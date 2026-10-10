@@ -17,6 +17,7 @@ import { refreshList, resetOperations } from '../ipc/operations';
 import { PlatformContext } from '../state/platform';
 import { createQueryClient } from '../state/queryClient';
 import { lockState, settings, targetSummary } from '../test/fixtures';
+import { whoamiReport } from '../test/flows';
 import { settleIpc } from '../test/settle';
 import { Shell } from './Shell';
 
@@ -243,6 +244,45 @@ describe('Shell', () => {
     expect(screen.getByRole('dialog', { name: 'Settings' })).toBeDefined();
     await user.keyboard('{Control>}l{/Control}');
     expect(calls).toContain('lock_now');
+  });
+
+  test('closing Settings cancels the check it started: its scope ends with it', async () => {
+    const report = whoamiReport({ status: 'skipped', reason: 'no_ping' });
+    let ping = 0;
+    clearMocks();
+    mockWindows('main');
+    mockIPC(
+      (cmd, args) => {
+        calls.push(cmd);
+        if (cmd === 'op_cancel') cancels.push((args as { opId: number }).opId);
+        if (cmd === 'op_list') return [];
+        if (cmd === 'target_list') return TARGETS;
+        if (cmd === 'settings_get') return stored;
+        if (cmd === 'whoami') return report;
+        if (cmd === 'op_start_whoami') {
+          ping = 900_000 + calls.length;
+          return ping;
+        }
+        if (cmd === 'op_subscribe') return { subscription: 1, replay: [] }; // keeps running
+        if (cmd === 'plugin:window|is_maximized') return false;
+        return null;
+      },
+      { shouldMockEvents: true },
+    );
+    const cancels: number[] = [];
+    const user = shell();
+    await user.keyboard('{Control>}[Comma]{/Control}');
+    await user.click(await screen.findByRole('button', { name: 'Verify' }));
+    await waitFor(() => expect(calls).toContain('op_subscribe'));
+    // Hidden behind nothing and still open, it keeps running.
+    expect(cancels).toEqual([]);
+    await user.click(
+      within(screen.getByRole('dialog', { name: 'Settings' })).getByRole('button', {
+        name: 'Close',
+      }),
+    );
+    expect(screen.queryByRole('dialog', { name: 'Settings' })).toBeNull();
+    await waitFor(() => expect(cancels).toEqual([ping]));
   });
 
   test('closing the shown tab shows its neighbour, and the last one the Targets view', async () => {

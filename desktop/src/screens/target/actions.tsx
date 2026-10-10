@@ -24,7 +24,7 @@ import { holdPlan } from '../../ipc/heldPlans';
 import { OperationFailed, resultOf, startPlan } from '../../ipc/plans';
 import { useOverlay } from '../../shell/ViewFrame';
 import { usePlatform } from '../../state/platform';
-import { useTab } from '../../state/tab';
+import { useScope } from '../../state/scope';
 import { refreshTargets, targetKey } from '../../state/targets';
 import { nameMessage, nameProblem, tokenMessage } from '../targets/rules';
 import { removedMessage, renamedMessage, renewedMessage, usedMessage } from './outcomes';
@@ -74,21 +74,22 @@ export function useMakeDefault(
 }
 
 /**
- * A bounded or destructive plan's confirm, opened as an overlay of the current view. In a tab,
- * the tab holds the plan until it runs or the confirm closes, so the tab's closing discards it
- * (heldPlans); a plan made after its tab closed is discarded at once. Also Change machine's
- * (D.3e): its own overlay, so its form is never inside the frame's (GOTCHA-144).
+ * A bounded or destructive plan's confirm, opened as an overlay of the current view. The screen
+ * that opens it holds the plan until it runs or the confirm closes, so the screen's going (its
+ * tab closed, the lock) discards it (heldPlans); a plan made after it went is discarded at once.
+ * Also Change machine's (D.3e): its own overlay, so its form is never inside the frame's
+ * (GOTCHA-144).
  */
 export function useConfirm(onFailed: (error: UiError) => void) {
   const show = useOverlay();
   const { auth } = usePlatform();
-  const owner = useTab()?.tab.key ?? null;
+  const scope = useScope();
   return useCallback(
     (props: Omit<PlanConfirmProps, 'auth' | 'onFailed' | 'onClose'>) => {
-      if (owner !== null) holdPlan(owner, props.view.opId);
+      holdPlan(scope, props.view.opId);
       show((close) => <PlanConfirm {...props} auth={auth} onFailed={onFailed} onClose={close} />);
     },
-    [show, auth, onFailed, owner],
+    [show, auth, onFailed, scope],
   );
 }
 
