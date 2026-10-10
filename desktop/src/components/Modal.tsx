@@ -56,6 +56,45 @@ export function focusables(root: HTMLElement | null): HTMLElement[] {
   );
 }
 
+/** Set on an element the trap made a Tab stop because it scrolls ([markScrollStops]). */
+const SCROLL_STOP = 'data-scroll-stop';
+
+const scrollable = (overflow: string) => overflow === 'auto' || overflow === 'scroll';
+
+/** `element` scrolls: its content overflows its box on an axis it lets scroll. */
+function scrolls(element: HTMLElement): boolean {
+  const y = element.scrollHeight > element.clientHeight;
+  const x = element.scrollWidth > element.clientWidth;
+  if (!y && !x) return false;
+  const style = getComputedStyle(element);
+  return (y && scrollable(style.overflowY)) || (x && scrollable(style.overflowX));
+}
+
+/**
+ * A scroll container with no Tab stop of its own is a Tab stop: Chromium makes it one, so a
+ * keyboard can scroll it (keyboard-focusable scrollers, Chromium 130 and later, WebView2 among
+ * them), and WebKit does not — the toolchain with every tool found is such a body, its rows
+ * holding no control. Left to the engines, the trap would not list it: on Chromium Tab from it
+ * went back to the start, and the footer was never reached. So before every Tab the trap gives
+ * each such element in `panel` `tabindex="0"` (marked as its own), and takes it from one that no
+ * longer is: the browser and the trap then agree on the stops, on every engine. An element whose
+ * tabindex the page set keeps it.
+ */
+function markScrollStops(panel: HTMLElement): void {
+  for (const element of panel.querySelectorAll<HTMLElement>('*')) {
+    const marked = element.hasAttribute(SCROLL_STOP);
+    if (!marked && element.hasAttribute('tabindex')) continue;
+    const stop = scrolls(element) && focusables(element).length === 0;
+    if (stop && !marked) {
+      element.setAttribute('tabindex', '0');
+      element.setAttribute(SCROLL_STOP, '');
+    } else if (!stop && marked && element !== document.activeElement) {
+      element.removeAttribute('tabindex');
+      element.removeAttribute(SCROLL_STOP);
+    }
+  }
+}
+
 export interface ModalFrameProps {
   /** The id of the element that names the dialog. */
   labelledBy: string;
@@ -140,18 +179,34 @@ export function ModalFrame({
       return;
     }
     if (event.key !== 'Tab') return;
-    const items = focusables(panelRef.current);
+    const panel = panelRef.current;
+    if (panel === null) return;
+    markScrollStops(panel);
+    const items = focusables(panel);
     const first = items[0];
     const last = items.at(-1);
     if (first === undefined || last === undefined) {
       event.preventDefault();
       return;
     }
-    const inside = items.includes(document.activeElement as HTMLElement);
-    if (event.shiftKey && (!inside || document.activeElement === first)) {
+    const active = document.activeElement;
+    if (!(active instanceof HTMLElement) || !items.includes(active)) {
+      // Not a stop of the list: the panel (a lost focus parked there), a heading the focus was
+      // moved to, or outside. Tab goes on from where it is in the document, or wraps.
+      event.preventDefault();
+      const inPanel = active instanceof HTMLElement && panel.contains(active);
+      const follows = (item: HTMLElement) =>
+        inPanel && (active.compareDocumentPosition(item) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+      const next = event.shiftKey
+        ? (items.filter((item) => inPanel && !follows(item) && item !== active).at(-1) ?? last)
+        : (items.find(follows) ?? first);
+      next.focus();
+      return;
+    }
+    if (event.shiftKey && active === first) {
       event.preventDefault();
       last.focus();
-    } else if (!event.shiftKey && (!inside || document.activeElement === last)) {
+    } else if (!event.shiftKey && active === last) {
       event.preventDefault();
       first.focus();
     }

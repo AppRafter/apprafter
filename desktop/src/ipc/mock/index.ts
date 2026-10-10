@@ -12,7 +12,8 @@
 // the settings' lock-on-sleep row. Operations run on ops.ts's engine (Rust's OperationManager):
 // a destructive plan asks the gesture the way unlocking does, by the same route and back-off.
 // The D.3 commands answer from targets.ts's store (three targets and an unreadable one), whose
-// verified-token drafts go on every lock and unlock, as Rust's do.
+// verified-token drafts go on every lock and unlock, as Rust's do. The toolchain (`?tools=`): by
+// default a tool is missing; `found`, every tool is (the panel with nothing to install).
 import { emit } from '@tauri-apps/api/event';
 import { mockIPC, mockWindows } from '@tauri-apps/api/mocks';
 import type { AppInfo } from '../generated/AppInfo';
@@ -28,6 +29,7 @@ import type { Settings } from '../generated/Settings';
 import type { Theme } from '../generated/Theme';
 import type { UiError } from '../generated/UiError';
 import type { UnavailableReason } from '../generated/UnavailableReason';
+import { MOCK_TOOLCHAIN_FOUND } from './fixtures';
 import { createMockOps, type Handler, type MockOps } from './ops';
 import { mockStore, targetHandlers } from './targets';
 
@@ -53,12 +55,16 @@ export type MockAuth = 'os' | 'pam';
 /** Which of the session's signals reach the app: both, one of them, or none. */
 export type MockSession = 'both' | 'lock' | 'sleep' | 'none';
 
+/** The toolchain: a tool missing (the default), or every tool found. */
+export type MockTools = 'missing' | 'found';
+
 export interface MockOptions {
   readonly os?: Os;
   readonly theme?: Theme;
   /** `pam`: Linux's PAM route, whatever `os` says. */
   readonly auth?: MockAuth;
   readonly session?: MockSession;
+  readonly tools?: MockTools;
   /**
    * How long a mock operation takes before it reports, in milliseconds: long enough in dev
    * mode (150 by default) to see it running; tests pass 0.
@@ -70,6 +76,7 @@ const OSES: readonly Os[] = ['windows', 'macos', 'linux'];
 const THEMES: readonly Theme[] = ['system', 'light', 'dark'];
 const AUTHS: readonly MockAuth[] = ['os', 'pam'];
 const SESSIONS: readonly MockSession[] = ['both', 'lock', 'sleep', 'none'];
+const TOOLS: readonly MockTools[] = ['missing', 'found'];
 
 const SESSION_EVENTS: Record<MockSession, SessionEvents> = {
   both: { lock: true, sleep: true },
@@ -79,8 +86,8 @@ const SESSION_EVENTS: Record<MockSession, SessionEvents> = {
 };
 
 /**
- * `?os=windows|macos|linux&theme=system|light|dark&auth=os|pam&session=both|lock|sleep|none`;
- * an unknown value throws.
+ * `?os=windows|macos|linux&theme=system|light|dark&auth=os|pam&session=both|lock|sleep|none`
+ * `&tools=missing|found`; an unknown value throws.
  */
 export function mockOptionsFromUrl(search: string): MockOptions {
   const params = new URLSearchParams(search);
@@ -96,11 +103,13 @@ export function mockOptionsFromUrl(search: string): MockOptions {
   const theme = pick('theme', THEMES);
   const auth = pick('auth', AUTHS);
   const session = pick('session', SESSIONS);
+  const tools = pick('tools', TOOLS);
   return {
     ...(os && { os }),
     ...(theme && { theme }),
     ...(auth && { auth }),
     ...(session && { session }),
+    ...(tools && { tools }),
   };
 }
 
@@ -313,6 +322,9 @@ export function installMockIpc(options: MockOptions = {}): void {
     window_ready: () => null,
     theme_apply: () => null,
     ...targetHandlers(engine, store),
+    ...(options.tools === 'found' && {
+      toolchain_status: () => structuredClone(MOCK_TOOLCHAIN_FOUND),
+    }),
     'plugin:window|minimize': () => null,
     'plugin:window|toggle_maximize': toggleMaximize,
     'plugin:window|internal_toggle_maximize': toggleMaximize,

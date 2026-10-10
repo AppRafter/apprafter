@@ -10,6 +10,7 @@ import { ALLOWED_WHILE_LOCKED, type COMMANDS } from '../generated/commands';
 import { DESKTOP_ERROR_CODES } from '../generated/errors';
 import type { LockState } from '../generated/LockState';
 import type { OpEvent } from '../generated/OpEvent';
+import type { ToolId } from '../generated/ToolId';
 import { HETZNER_TOKEN_LEN } from '../generated/target';
 import {
   installMockIpc,
@@ -275,11 +276,40 @@ describe('installMockIpc', () => {
   });
 });
 
+/** Every tool the core runs, in its probe order (ToolId::ALL); the type check keeps it whole. */
+const TOOL_IDS = [
+  'kubectl',
+  'helm',
+  'restic',
+  'git',
+  'ssh',
+  'cue',
+] as const satisfies readonly ToolId[];
+const everyTool: Exclude<ToolId, (typeof TOOL_IDS)[number]> extends never ? true : never = true;
+
+describe('the toolchain the mock reports', () => {
+  test('by default one tool is missing; with ?tools=found, every tool the core runs is found', async () => {
+    installMockIpc({ opDelayMs: 0 });
+    await api.unlock();
+    expect((await api.toolchainStatus()).tools.some((tool) => tool.problem !== null)).toBe(true);
+    clearMocks();
+    installMockIpc({ opDelayMs: 0, tools: 'found' });
+    await api.unlock();
+    const found = await api.toolchainStatus();
+    expect(everyTool && found.tools.map((tool) => tool.tool)).toEqual([...TOOL_IDS]);
+    for (const tool of found.tools) {
+      expect(tool.problem).toBeNull();
+      expect(tool.path).not.toBeNull();
+    }
+  });
+});
+
 describe('mockOptionsFromUrl', () => {
   test('reads os, theme, auth and session', () => {
     expect(mockOptionsFromUrl('?os=macos&theme=system')).toEqual({ os: 'macos', theme: 'system' });
     expect(mockOptionsFromUrl('?auth=pam')).toEqual({ auth: 'pam' });
     expect(mockOptionsFromUrl('?session=none')).toEqual({ session: 'none' });
+    expect(mockOptionsFromUrl('?tools=found')).toEqual({ tools: 'found' });
     expect(mockOptionsFromUrl('')).toEqual({});
   });
 
@@ -288,5 +318,6 @@ describe('mockOptionsFromUrl', () => {
     expect(() => mockOptionsFromUrl('?theme=sepia')).toThrow('theme');
     expect(() => mockOptionsFromUrl('?auth=fingerprint')).toThrow('auth');
     expect(() => mockOptionsFromUrl('?session=hibernate')).toThrow('session');
+    expect(() => mockOptionsFromUrl('?tools=some')).toThrow('tools');
   });
 });
