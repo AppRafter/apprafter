@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 import { expect, test } from 'bun:test';
-import { ACTION_IDS } from './registry';
+import { API_COMMANDS } from '../ipc/api';
+import { ACTION_COMMANDS, ACTION_IDS, CLOSED_SLICES } from './registry';
 
 type Node = { path: string[]; hidden: boolean };
 type Entry = { action?: string; status?: string; slice?: string };
@@ -54,6 +55,38 @@ test('every action id exists in the registry', () => {
     if (e.action !== undefined) {
       expect({ leaf, known: known.has(e.action) }).toEqual({ leaf, known: true });
     }
+  }
+});
+
+test('every action id runs a command the shell registers', () => {
+  expect(Object.keys(ACTION_COMMANDS).sort()).toEqual([...ACTION_IDS].sort());
+  const commands = new Set<string>(API_COMMANDS);
+  for (const id of ACTION_IDS) {
+    expect({ id, registered: commands.has(ACTION_COMMANDS[id]) }).toEqual({ id, registered: true });
+  }
+});
+
+test('a closed slice has no planned leaf left', () => {
+  for (const [leaf, e] of Object.entries(entries)) {
+    if (e.slice !== undefined && CLOSED_SLICES.includes(e.slice)) {
+      expect({ leaf, status: e.status ?? null }).not.toEqual({ leaf, status: 'planned' });
+    }
+  }
+});
+
+test('the target leaves the Targets page and the Target screen act on are covered', () => {
+  for (const [leaf, id] of [
+    ['target list', 'target.list'],
+    ['target show', 'target.show'],
+    ['target use', 'target.use'],
+    ['target rename', 'target.rename'],
+    ['target remove', 'target.remove'],
+  ] as const) {
+    expect({ leaf, action: entries[leaf]?.action, slice: entries[leaf]?.slice }).toEqual({
+      leaf,
+      action: id,
+      slice: 'D.3',
+    });
   }
 });
 

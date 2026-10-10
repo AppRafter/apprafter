@@ -289,7 +289,7 @@ status = "planned"
 slice = "D.9"
 
 [leaf."target list"]
-status = "planned"
+action = "target.list"
 slice = "D.3"
 
 [leaf."target machine"]
@@ -297,19 +297,19 @@ status = "planned"
 slice = "D.3"
 
 [leaf."target remove"]
-status = "planned"
+action = "target.remove"
 slice = "D.3"
 
 [leaf."target rename"]
-status = "planned"
+action = "target.rename"
 slice = "D.3"
 
 [leaf."target show"]
-status = "planned"
+action = "target.show"
 slice = "D.3"
 
 [leaf."target use"]
-status = "planned"
+action = "target.use"
 slice = "D.3"
 
 [leaf."top"]
