@@ -329,8 +329,12 @@ fn build_ssh_specs(
             .iter()
             .enumerate()
             .map(|(i, b)| {
-                cli_core::ssh_key::parse_public_key(&b.public_key)
-                    .map_err(|e| e.refusal(format!("the manifest's `sshKeys[{i}]`")))?;
+                cli_core::ssh_key::parse_public_key(&b.public_key).map_err(|e| {
+                    e.refusal(
+                        format!("the manifest's `sshKeys[{i}]`"),
+                        cli_core::ssh_key::KeySource::Manifest { index: i },
+                    )
+                })?;
                 Ok(SshKeySpec {
                     name: b
                         .name
@@ -1039,6 +1043,17 @@ mod tests {
             err.to_string(),
             "the manifest's `sshKeys[1]` is a private key: AppRafter never sends a private key \
              to the provider"
+        );
+        // Its help sends the reader to that entry: the manifest outranks the env and the target.
+        assert!(
+            matches!(
+                err,
+                CliError::SshKeyNotPublic {
+                    from: cli_core::ssh_key::KeySource::Manifest { index: 1 },
+                    ..
+                }
+            ),
+            "{err:?}"
         );
     }
 

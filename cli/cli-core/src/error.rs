@@ -172,6 +172,40 @@ fn invalid_config_help(path: &Path, target: Option<&str>) -> String {
     }
 }
 
+/// `SshKeyNotPublic`'s help: what a key must be, then the fix its source takes (D.3d
+/// verification). `apply` takes the manifest's `sshKeys` first, then `APPRAFTER_SSH_PUBLIC_KEY`,
+/// then the target's path, so each of the first two is fixed where it is; a file is pointed at
+/// again — with `--renew` for an existing target, or the same `target add` for a new one.
+fn ssh_key_not_public_help(source: &crate::ssh_key::KeySource) -> String {
+    use crate::ssh_key::KeySource;
+    let what =
+        "AppRafter sends a target's SSH key to the provider, so it takes one OpenSSH public \
+                key line, `<type> <base64> [comment]`, of type ssh-ed25519, ssh-rsa, an \
+                ecdsa-sha2 curve, or a security-key (sk-) type.";
+    let fix = match source {
+        KeySource::TargetFile => "A private key's public half is the `.pub` file next to it \
+             (`ssh-keygen -y -f <private key>` prints it again). Point the target at it with \
+             `apprafter target add <name> --renew --ssh-key <path>.pub`, or set \
+             `APPRAFTER_SSH_PUBLIC_KEY` to that line. Nothing was saved or sent."
+            .to_string(),
+        KeySource::NewTargetFile => "A private key's public half is the `.pub` file next to it \
+             (`ssh-keygen -y -f <private key>` prints it again). Run the same `apprafter target \
+             add` again with `--ssh-key <path>.pub`. Nothing was saved or sent."
+            .to_string(),
+        KeySource::Env => "`APPRAFTER_SSH_PUBLIC_KEY` holds the key's text, and it outranks \
+             the target's key: set it to the public key line (`ssh-keygen -y -f <private key>` \
+             prints it), or unset it so that the target's key is used. Nothing was sent."
+            .to_string(),
+        KeySource::Manifest { index } => format!(
+            "The Infrastructure manifest's `sshKeys[{index}].public_key` holds the key's text: \
+             replace it with the public key line (`ssh-keygen -y -f <private key>` prints it). \
+             The manifest's keys outrank `APPRAFTER_SSH_PUBLIC_KEY` and the target's key, so \
+             changing either of those does not change what is sent. Nothing was sent."
+        ),
+    };
+    format!("{what} {fix}")
+}
+
 #[derive(Debug, Error, Diagnostic)]
 pub enum CliError {
     /// The `cue` binary was not found on `PATH`.
@@ -607,16 +641,15 @@ pub enum CliError {
     )]
     #[diagnostic(
         code(apprafter::target::ssh_key_not_public),
-        help(
-            "AppRafter sends a target's SSH key to the provider, so it takes one OpenSSH public \
-             key line, `<type> <base64> [comment]`, of type ssh-ed25519, ssh-rsa, an ecdsa-sha2 \
-             curve, or a security-key (sk-) type. A private key's public half is the `.pub` \
-             file next to it (`ssh-keygen -y -f <private key>` prints it again). Point the \
-             target at it with `apprafter target add <name> --renew --ssh-key <path>.pub`, or \
-             set `APPRAFTER_SSH_PUBLIC_KEY` to that line. Nothing was saved or sent."
-        )
+        help("{}", ssh_key_not_public_help(from))
     )]
-    SshKeyNotPublic { origin: String, private_key: bool },
+    SshKeyNotPublic {
+        origin: String,
+        private_key: bool,
+        /// Where the key came from, which decides what fixes it ([`ssh_key_not_public_help`]).
+        /// Not `source`: thiserror takes a field of that name for the error's cause.
+        from: crate::ssh_key::KeySource,
+    },
 
     /// Catch-all, free-form message. New call sites should prefer
     /// promoting recurring messages to dedicated variants with
@@ -780,6 +813,44 @@ mod tests {
         assert!(help.contains("`apprafter target use <name>`"), "{help}");
         for not_this in ["target add", "targets/", "remove"] {
             assert!(!help.contains(not_this), "{not_this}: {help}");
+        }
+    }
+
+    /// D.3d verification (finding C): what fixes a refused SSH key depends on where it came
+    /// from. The manifest's `sshKeys` outrank `APPRAFTER_SSH_PUBLIC_KEY`, which outranks the
+    /// target's key, so pointing the target at another key fixes neither of the first two; a
+    /// first `target add` has no target to `--renew`.
+    #[test]
+    fn the_ssh_key_help_offers_the_fix_its_source_takes() {
+        use crate::ssh_key::{KeySource, NotAPublicKey};
+        let help = |source: KeySource| {
+            let err = NotAPublicKey::PrivateKey.refusal("the key", source);
+            assert_eq!(code_of(&err), "apprafter::target::ssh_key_not_public");
+            help_of(&err)
+        };
+        let existing = help(KeySource::TargetFile);
+        for fix in ["--renew --ssh-key <path>.pub", "`.pub` file next to it"] {
+            assert!(existing.contains(fix), "{fix}: {existing}");
+        }
+        let first = help(KeySource::NewTargetFile);
+        assert!(first.contains("`--ssh-key <path>.pub`"), "{first}");
+        assert!(first.contains("`.pub` file next to it"), "{first}");
+        for wrong in ["--renew", "APPRAFTER_SSH_PUBLIC_KEY"] {
+            assert!(!first.contains(wrong), "{wrong}: {first}");
+        }
+        let env = help(KeySource::Env);
+        for fix in ["`APPRAFTER_SSH_PUBLIC_KEY`", "unset it", "ssh-keygen -y -f"] {
+            assert!(env.contains(fix), "{fix}: {env}");
+        }
+        for wrong in ["--renew", "target add", "file next to it"] {
+            assert!(!env.contains(wrong), "{wrong}: {env}");
+        }
+        let manifest = help(KeySource::Manifest { index: 3 });
+        for fix in ["`sshKeys[3].public_key`", "ssh-keygen -y -f", "outrank"] {
+            assert!(manifest.contains(fix), "{fix}: {manifest}");
+        }
+        for wrong in ["--renew", "target add", "file next to it", "set `APPRAFTER"] {
+            assert!(!manifest.contains(wrong), "{wrong}: {manifest}");
         }
     }
 

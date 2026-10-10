@@ -10,8 +10,7 @@ Error: apprafter::target::ssh_key_not_public
         OpenSSH public key line, `<type> <base64> [comment]`, of type ssh-
         ed25519, ssh-rsa, an ecdsa-sha2 curve, or a security-key (sk-) type. A
         private key's public half is the `.pub` file next to it (`ssh-keygen
-        -y -f <private key>` prints it again). Point the target at it with
-        `apprafter target add <name> --renew --ssh-key <path>.pub`, or set
-        `APPRAFTER_SSH_PUBLIC_KEY` to that line. Nothing was saved or sent.
+        -y -f <private key>` prints it again). Run the same `apprafter target
+        add` again with `--ssh-key <path>.pub`. Nothing was saved or sent.
 
 [file targets/prod/config.yaml: absent]

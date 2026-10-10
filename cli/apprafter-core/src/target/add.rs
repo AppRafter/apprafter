@@ -4,6 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
+use cli_core::ssh_key::KeySource;
 use cli_core::{GlobalConfig, Target, TargetConfig, TargetCredentials, TargetStorePaths};
 
 use crate::context::SecretString;
@@ -84,7 +85,14 @@ pub fn plan_add(ctx: &Context, args: AddArgs) -> CoreResult<Plan<AddPayload>> {
     crate::provider::TokenProblem::check(args.token.expose())
         .map_err(|problem| CoreError::InvalidToken { problem })?;
     if let Some(p) = &args.ssh_key {
-        crate::ssh::check_readable(p)?;
+        // A new target's key is fixed by running the same add again, an existing one's by
+        // `--renew`: the refusal's help says which (D.3d verification).
+        let source = if ctx.store().target_config_file(&args.name).exists() {
+            KeySource::TargetFile
+        } else {
+            KeySource::NewTargetFile
+        };
+        crate::ssh::check_readable(p, source)?;
     }
     let store = ctx.store();
     let stored = stored_config(&store, &args.name)?;
@@ -421,7 +429,7 @@ pub fn plan_renew(
             .map_err(|problem| CoreError::InvalidToken { problem })?;
     }
     if let Some(p) = &args.ssh_key {
-        crate::ssh::check_readable(p)?;
+        crate::ssh::check_readable(p, KeySource::TargetFile)?;
     }
     let token_given = args.token.is_some();
     let (token, ssh_key) = what_differs(&t, args.token, args.ssh_key);
@@ -1351,6 +1359,46 @@ mod tests {
         let creds = format!("# pasted by hand\nhetzner_token: {TOKEN_A}\n");
         std::fs::write(ctx.store().target_credentials_file("work"), &creds).unwrap();
         (dir, ctx, old, new, creds)
+    }
+
+    /// D.3d verification (finding C): a refused key file says whether it was for a new target
+    /// (fixed by the same add with the `.pub`) or an existing one (fixed by `--renew`): a first
+    /// add is NewTargetFile, an add over a stored target (`--force`, or refused as existing) and
+    /// a renewal are TargetFile.
+    #[test]
+    fn a_refused_key_file_says_whether_its_target_is_new() {
+        let (dir, ctx) = store(&["prod"], Some("prod"));
+        let private = dir.path().join("id_ed25519");
+        std::fs::write(
+            &private,
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nb3Blbg==\n-----END OPENSSH PRIVATE KEY-----\n",
+        )
+        .unwrap();
+        let source_of = |e: CoreError| match e {
+            CoreError::Cli(cli_core::CliError::SshKeyNotPublic { from, .. }) => from,
+            other => panic!("{other:?}"),
+        };
+        let add = |name: &str, force: bool| {
+            plan_add(
+                &ctx,
+                AddArgs {
+                    ssh_key: Some(private.clone()),
+                    force,
+                    ..args(name, TOKEN_A)
+                },
+            )
+            .unwrap_err()
+        };
+        assert_eq!(source_of(add("lab", false)), KeySource::NewTargetFile);
+        assert_eq!(source_of(add("prod", true)), KeySource::TargetFile);
+        assert_eq!(source_of(add("prod", false)), KeySource::TargetFile);
+        let renew = plan_renew(
+            &ctx,
+            &TargetRef::named(&ctx, "prod").unwrap(),
+            renew_args(None, Some(&private)),
+        )
+        .unwrap_err();
+        assert_eq!(source_of(renew), KeySource::TargetFile);
     }
 
     fn renew_args(token: Option<&str>, key: Option<&Path>) -> RenewArgs {

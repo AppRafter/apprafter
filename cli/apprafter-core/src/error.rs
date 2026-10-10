@@ -462,15 +462,41 @@ fn neutral_help(e: &cli_core::CliError) -> Option<String> {
              unreadable file aside rather than deleting it."
                 .into()
         }
-        C::SshKeyNotPublic { private_key, .. } => if *private_key {
-            "AppRafter sends a target's SSH key to the provider, so it never takes a private \
-             key: choose its public half, the `.pub` file next to it. Nothing was saved or sent."
-        } else {
-            "AppRafter sends a target's SSH key to the provider as an OpenSSH public key: one \
-             line `<type> <base64> [comment]`, of type ssh-ed25519, ssh-rsa, an ecdsa-sha2 \
-             curve, or a security-key (sk-) type. Nothing was saved or sent."
+        // The fix depends on where the key came from (D.3d verification): a file the reader
+        // chose is chosen again; the environment's key and a manifest's outrank the target's,
+        // so each is fixed where it is.
+        C::SshKeyNotPublic {
+            private_key, from, ..
+        } => {
+            use cli_core::ssh_key::KeySource;
+            let what = if *private_key {
+                "AppRafter sends a target's SSH key to the provider, so it never takes a private \
+                 key."
+            } else {
+                "AppRafter sends a target's SSH key to the provider as an OpenSSH public key: \
+                 one line `<type> <base64> [comment]`, of type ssh-ed25519, ssh-rsa, an \
+                 ecdsa-sha2 curve, or a security-key (sk-) type."
+            };
+            let fix = match from {
+                KeySource::NewTargetFile | KeySource::TargetFile => {
+                    "Choose the public key, the `.pub` file next to a private key. Nothing was \
+                     saved or sent."
+                        .to_string()
+                }
+                KeySource::Env => "`APPRAFTER_SSH_PUBLIC_KEY` in AppRafter's environment holds \
+                     the key's text, and it outranks the target's key: set it to the public key \
+                     line (`ssh-keygen -y -f <private key>` prints it), or unset it so that the \
+                     target's key is used. Nothing was sent."
+                    .to_string(),
+                KeySource::Manifest { index } => format!(
+                    "The Infrastructure manifest's `sshKeys[{index}].public_key` holds the key's \
+                     text: replace it with the public key line (`ssh-keygen -y -f <private key>` \
+                     prints it). The manifest's keys outrank the environment's and the target's. \
+                     Nothing was sent."
+                ),
+            };
+            format!("{what} {fix}")
         }
-        .into(),
         // Not "remove the target and add it again": the GUI cannot remove a target it cannot
         // read (WI-458), and no removal repairs the store's own config.yaml (D.3d review #9).
         C::InvalidTargetConfig { path, .. } => format!(
@@ -563,6 +589,7 @@ fn project_cli(e: &cli_core::CliError, put: &mut impl FnMut(&str, serde_json::Va
         C::SshKeyNotPublic {
             origin,
             private_key,
+            ..
         } => {
             put("origin", json!(origin));
             put("privateKey", json!(private_key));
@@ -718,6 +745,7 @@ pub mod samples {
     /// context)` of a server-type refusal and every tool's real install lines, for the guard
     /// that no projected help names a CLI command or flag.
     pub fn cli_errors() -> Vec<cli_core::CliError> {
+        use cli_core::ssh_key::KeySource;
         use cli_core::{CliError as C, SkuCheckFor, UnavailableKind};
         let s = |v: &str| v.to_string();
         let hetzner = || C::Hetzner {
@@ -794,10 +822,22 @@ pub mod samples {
             C::SshKeyNotPublic {
                 origin: s("SSH key `/home/a/.ssh/id_ed25519`"),
                 private_key: true,
+                from: KeySource::NewTargetFile,
             },
             C::SshKeyNotPublic {
                 origin: s("SSH key `/home/a/notes.pub`"),
                 private_key: false,
+                from: KeySource::TargetFile,
+            },
+            C::SshKeyNotPublic {
+                origin: s("`APPRAFTER_SSH_PUBLIC_KEY`"),
+                private_key: true,
+                from: KeySource::Env,
+            },
+            C::SshKeyNotPublic {
+                origin: s("the manifest's `sshKeys[1]`"),
+                private_key: true,
+                from: KeySource::Manifest { index: 1 },
             },
             C::Other(s("o")),
         ];
@@ -1195,6 +1235,7 @@ mod tests {
                 C::SshKeyNotPublic {
                     origin: "SSH key `/k`".into(),
                     private_key: true,
+                    from: cli_core::ssh_key::KeySource::TargetFile,
                 },
                 codes::SSH_KEY_NOT_PUBLIC,
             ),
@@ -1387,6 +1428,39 @@ mod tests {
             sku,
             "Hetzner no longer sells `cx22`; pick another type. Nothing was saved."
         );
+    }
+
+    /// D.3d verification (finding C), the GUI's half: the fix follows where the key came from.
+    /// A file is chosen again; the environment's key and a manifest's outrank the target's, so
+    /// each is fixed where it is, and choosing another file is never offered for them.
+    #[test]
+    fn the_neutral_ssh_key_help_offers_the_fix_its_source_takes() {
+        use cli_core::ssh_key::KeySource;
+        let help = |source: KeySource| {
+            UiError::from(&CoreError::Cli(cli_core::CliError::SshKeyNotPublic {
+                origin: "the key".into(),
+                private_key: true,
+                from: source,
+            }))
+            .help
+            .unwrap()
+        };
+        for source in [KeySource::NewTargetFile, KeySource::TargetFile] {
+            let h = help(source);
+            assert!(h.contains("`.pub` file next to a private key"), "{h}");
+            assert!(!h.contains("APPRAFTER_SSH_PUBLIC_KEY"), "{h}");
+        }
+        let env = help(KeySource::Env);
+        assert!(
+            env.contains("`APPRAFTER_SSH_PUBLIC_KEY`") && env.contains("unset it"),
+            "{env}"
+        );
+        let manifest = help(KeySource::Manifest { index: 2 });
+        assert!(manifest.contains("`sshKeys[2].public_key`"), "{manifest}");
+        for h in [&env, &manifest] {
+            assert!(!h.contains(".pub` file"), "{h}");
+            assert!(h.contains("ssh-keygen -y -f"), "{h}");
+        }
     }
 
     /// D.3d review #9: the GUI cannot remove a target it cannot read (WI-458), and removing a

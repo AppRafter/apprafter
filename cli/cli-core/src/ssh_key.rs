@@ -23,12 +23,29 @@ pub enum NotAPublicKey {
     Other,
 }
 
+/// Where a refused SSH key came from. Its refusal names it by `origin`; what fixes it depends on
+/// this (D.3d verification): `apply` takes the manifest's `sshKeys` first, then
+/// `APPRAFTER_SSH_PUBLIC_KEY`, then the target's stored path, so pointing the target at another
+/// key fixes neither of the first two, and a first `target add` has no target to `--renew`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeySource {
+    /// A key file given to `target add` for a target that does not exist yet.
+    NewTargetFile,
+    /// A key file given for an existing target (`--renew`, `--force`), or the one it stores.
+    TargetFile,
+    /// The key text in `APPRAFTER_SSH_PUBLIC_KEY`.
+    Env,
+    /// The Infrastructure manifest's `sshKeys[index]`.
+    Manifest { index: usize },
+}
+
 impl NotAPublicKey {
-    /// The refusal of the key `origin` names ([`file_origin`] for a file).
-    pub fn refusal(self, origin: impl Into<String>) -> CliError {
+    /// The refusal of the key `origin` names ([`file_origin`] for a file), from `source`.
+    pub fn refusal(self, origin: impl Into<String>, source: KeySource) -> CliError {
         CliError::SshKeyNotPublic {
             origin: origin.into(),
             private_key: self == Self::PrivateKey,
+            from: source,
         }
     }
 }

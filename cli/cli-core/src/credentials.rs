@@ -109,8 +109,12 @@ pub fn resolve_hetzner_ssh_public_key(
     if let Ok(body) = std::env::var(SSH_PUBLIC_KEY_ENV) {
         if !body.is_empty() {
             // GOTCHA-149: whatever is returned here is sent to the provider as is.
-            crate::ssh_key::parse_public_key(&body)
-                .map_err(|e| e.refusal(format!("`{SSH_PUBLIC_KEY_ENV}`")))?;
+            crate::ssh_key::parse_public_key(&body).map_err(|e| {
+                e.refusal(
+                    format!("`{SSH_PUBLIC_KEY_ENV}`"),
+                    crate::ssh_key::KeySource::Env,
+                )
+            })?;
             return Ok(Some(body));
         }
     }
@@ -153,8 +157,12 @@ pub fn read_ssh_public_key_body(path: &Path) -> Result<String> {
             path.display()
         )));
     }
-    crate::ssh_key::parse_public_key(&trimmed)
-        .map_err(|e| e.refusal(crate::ssh_key::file_origin(path)))?;
+    crate::ssh_key::parse_public_key(&trimmed).map_err(|e| {
+        e.refusal(
+            crate::ssh_key::file_origin(path),
+            crate::ssh_key::KeySource::TargetFile,
+        )
+    })?;
     Ok(trimmed)
 }
 
@@ -466,9 +474,12 @@ mod tests {
                 CliError::SshKeyNotPublic {
                     origin,
                     private_key: p,
+                    from,
                 } => {
                     assert_eq!(origin, format!("SSH key `{}`", path.display()));
                     assert_eq!(p, private_key, "{body}");
+                    // The stored path of an existing target (apply, doctor).
+                    assert_eq!(from, crate::ssh_key::KeySource::TargetFile);
                 }
                 other => panic!("{other:?}"),
             }
@@ -494,9 +505,11 @@ mod tests {
                 CliError::SshKeyNotPublic {
                     origin,
                     private_key,
+                    from,
                 } => {
                     assert_eq!(origin, format!("`{SSH_PUBLIC_KEY_ENV}`"));
                     assert!(private_key);
+                    assert_eq!(from, crate::ssh_key::KeySource::Env);
                 }
                 other => panic!("{other:?}"),
             }

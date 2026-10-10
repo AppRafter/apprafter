@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use cli_core::ssh_key::{parse_public_key, NotAPublicKey};
+use cli_core::ssh_key::{parse_public_key, KeySource, NotAPublicKey};
 
 use crate::context::Context;
 use crate::error::{CoreError, CoreResult};
@@ -76,19 +76,23 @@ impl SshKeyProblem {
                 "SSH key `{path}` is not readable: {}",
                 error.unwrap_or("unknown error")
             ),
-            Self::PrivateKey | Self::NotPublicKey => not_public(self, Path::new(path)).to_string(),
+            // The message names no source (only the help differs by it).
+            Self::PrivateKey | Self::NotPublicKey => {
+                not_public(self, Path::new(path), KeySource::TargetFile).to_string()
+            }
         }
     }
 }
 
-/// The refusal of a readable key file at `path` that is not a public key.
-fn not_public(problem: SshKeyProblem, path: &Path) -> cli_core::CliError {
+/// The refusal of a readable key file at `path` that is not a public key, given for a new or an
+/// existing target (`source`).
+fn not_public(problem: SshKeyProblem, path: &Path, source: KeySource) -> cli_core::CliError {
     let why = if problem == SshKeyProblem::PrivateKey {
         NotAPublicKey::PrivateKey
     } else {
         NotAPublicKey::Other
     };
-    why.refusal(cli_core::ssh_key::file_origin(path))
+    why.refusal(cli_core::ssh_key::file_origin(path), source)
 }
 
 impl From<NotAPublicKey> for SshKeyProblem {
@@ -184,8 +188,9 @@ pub fn inspect_key(ctx: &Context, path: &Path) -> CoreResult<SshKeyInfo> {
 /// The check `target add` and renew make before saving a key path (the body is never stored):
 /// [`CoreError::SshKeyUnreadable`] when the file is missing or cannot be read, and
 /// `CliError::SshKeyNotPublic` when it is a private key or anything but one OpenSSH public key
-/// line — that file would be sent to the provider as is (GOTCHA-149).
-pub fn check_readable(path: &Path) -> CoreResult<()> {
+/// line — that file would be sent to the provider as is (GOTCHA-149). `source` says whether the
+/// key is for a new target or an existing one, which decides the refusal's help.
+pub fn check_readable(path: &Path, source: KeySource) -> CoreResult<()> {
     if !path.exists() {
         return Err(CoreError::SshKeyUnreadable {
             path: path.display().to_string(),
@@ -200,7 +205,7 @@ pub fn check_readable(path: &Path) -> CoreResult<()> {
     })?;
     parse_public_key(&body)
         .map(|_| ())
-        .map_err(|why| CoreError::Cli(not_public(why.into(), path)))
+        .map_err(|why| CoreError::Cli(not_public(why.into(), path, source)))
 }
 
 #[cfg(test)]
@@ -211,7 +216,7 @@ mod tests {
     fn check_readable_types_missing_and_unreadable() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("nope.pub");
-        match check_readable(&missing).unwrap_err() {
+        match check_readable(&missing, KeySource::TargetFile).unwrap_err() {
             CoreError::SshKeyUnreadable {
                 problem: SshKeyProblem::Missing,
                 error: None,
@@ -220,7 +225,7 @@ mod tests {
             other => panic!("{other:?}"),
         }
         // a directory cannot be read as a key
-        match check_readable(dir.path()).unwrap_err() {
+        match check_readable(dir.path(), KeySource::TargetFile).unwrap_err() {
             CoreError::SshKeyUnreadable {
                 problem: SshKeyProblem::Unreadable,
                 error: Some(_),
@@ -398,7 +403,7 @@ mod tests {
         for (body, private) in [(PRIVATE, true), ("ssh-dss AAAA old\n", false)] {
             let p = dir.path().join("key");
             std::fs::write(&p, body).unwrap();
-            let err = check_readable(&p).unwrap_err();
+            let err = check_readable(&p, KeySource::NewTargetFile).unwrap_err();
             let ui = crate::error::UiError::from(&err);
             assert_eq!(
                 ui.code.as_deref(),
@@ -419,6 +424,6 @@ mod tests {
         }
         let p = dir.path().join("key.pub");
         std::fs::write(&p, "ssh-ed25519 AAAA me@host\n").unwrap();
-        check_readable(&p).unwrap();
+        check_readable(&p, KeySource::NewTargetFile).unwrap();
     }
 }

@@ -453,6 +453,15 @@ contents are never printed.
 A private key's public half is the `.pub` file next to it; `ssh-keygen
 -y -f <private key>` prints it again if the `.pub` is lost.
 
+Fix the key where the message says it came from, as its help does. A
+manifest's `sshKeys[i]`: replace that entry's `public_key` with the
+public line. `APPRAFTER_SSH_PUBLIC_KEY`: set it to the public line, or
+unset it. A target's key file:
+`apprafter target add <name> --renew --ssh-key <path>.pub`, or, on a
+first `target add`, the same command with the `.pub`. `apply` takes the
+manifest's keys first, then the variable, then the target's key, so
+changing one further down does not change what is sent.
+
 ### App stuck on `ImagePullBackOff` (registry auth) {#registry-auth}
 
 The Deployment can't pull your image. Almost always a private
