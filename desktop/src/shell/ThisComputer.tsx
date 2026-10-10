@@ -12,6 +12,7 @@ import type { Identity } from '../ipc/generated/Identity';
 import type { Verification } from '../ipc/generated/Verification';
 import type { WhoamiReport } from '../ipc/generated/WhoamiReport';
 import type { WhoamiTarget } from '../ipc/generated/WhoamiTarget';
+import { keyValue } from '../screens/target/sshKey';
 import { useRead } from '../state/read';
 
 export const IDENTITY: Record<Identity, string> = {
@@ -55,10 +56,12 @@ export function cliDefaultLine(c: CliDefaultTarget): string {
   }
 }
 
-/** The default target's machine and key: `cx22 · ~/.ssh/id_ed25519.pub`. */
+/**
+ * The default target's machine and key: `cx22 · ~/.ssh/id_ed25519.pub · ssh-ed25519`. The key
+ * in D.3d's words (keyValue): a file that is gone, unreadable or not a public key says so.
+ */
 function machineLine(t: WhoamiTarget): string {
-  const key =
-    t.sshKey === null ? 'no SSH key' : `${t.sshKey.display}${t.sshKey.exists ? '' : ' (missing)'}`;
+  const key = t.sshKey === null ? 'no SSH key' : keyValue(t.sshKey);
   return `${t.serverType ?? 'no server type'} · ${key}`;
 }
 

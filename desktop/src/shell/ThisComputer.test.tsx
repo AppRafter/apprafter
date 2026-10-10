@@ -83,7 +83,7 @@ describe('This computer', () => {
     const user = renderRow();
     expect(await screen.findByText('anonymous (self-hosted)')).toBeDefined();
     expect(screen.getByText('Not checked yet')).toBeDefined();
-    expect(screen.getByText('cx22 · ~/.ssh/id_ed25519.pub')).toBeDefined();
+    expect(screen.getByText('cx22 · ~/.ssh/id_ed25519.pub · ssh-ed25519')).toBeDefined();
     expect(h.of('op_start_whoami')).toHaveLength(0);
     await user.click(screen.getByRole('button', { name: 'Verify' }));
     expect(await screen.findByText('Token verified · 182 ms')).toBeDefined();
@@ -109,12 +109,43 @@ describe('This computer', () => {
         target: {
           ...report.cliDefault.target,
           serverType: null,
-          sshKey: { path: '/gone.pub', display: '/gone.pub', exists: false, algo: null },
+          sshKey: {
+            path: '/gone.pub',
+            display: '/gone.pub',
+            exists: false,
+            algo: null,
+            problem: 'missing',
+          },
         },
       },
     });
     renderRow();
     expect(await screen.findByText('no server type · /gone.pub (missing)')).toBeDefined();
+  });
+
+  test('a private key set as the key is said as such, never shown as the key in use', async () => {
+    const report = whoamiReport({ status: 'skipped', reason: 'no_ping' });
+    if (report.cliDefault.status !== 'found') throw new Error('fixture');
+    h.answer('whoami', {
+      ...report,
+      cliDefault: {
+        status: 'found',
+        target: {
+          ...report.cliDefault.target,
+          sshKey: {
+            path: '/home/alex/.ssh/id_ed25519',
+            display: '~/.ssh/id_ed25519',
+            exists: true,
+            algo: null,
+            problem: 'private_key',
+          },
+        },
+      },
+    });
+    renderRow();
+    expect(
+      await screen.findByText('cx22 · ~/.ssh/id_ed25519 (a private key: not used)'),
+    ).toBeDefined();
   });
 
   test('a ping that fails, or is cancelled, says so', async () => {
