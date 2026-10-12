@@ -404,7 +404,8 @@ of creating another, and goes on with cluster-bootstrap.
 A cached kubeconfig or Argo CD password does not decrypt with the age
 key there is. It was cached under another key — one that was lost and
 replaced, or one `APPRAFTER_AGE_KEY` no longer points at — or the
-cached copy is damaged.
+cached copy is damaged. For a kubeconfig, `apprafter doctor` reports
+the same on its **Kube API reachable** row.
 
 **Fix.** If you have the key it was cached under, set
 `APPRAFTER_AGE_KEY` to it. Otherwise fetch it again under the key

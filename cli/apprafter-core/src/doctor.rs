@@ -147,7 +147,17 @@ pub enum CheckFix {
     FetchKubeconfig {
         target: String,
     },
+    /// No age key at `path`: the target whose cache it is, for the refetch under a new key that
+    /// the fix names (WI-457 review #9).
     AgeKeyMissing {
+        target: String,
+        path: String,
+    },
+    /// The cached kubeconfig does not decrypt with the age key at `path`: it was cached under
+    /// another key (a lost one that a new key replaced) or is damaged. The target whose it is,
+    /// for the refetch under the key there is (WI-457 review #8).
+    CacheUndecryptable {
+        target: String,
         path: String,
     },
     /// `reason`, never `kind`: that is the tag.
@@ -818,7 +828,7 @@ fn kube_api(
     if s.kubeconfig_age.is_some() {
         match cli_core::secrets::load_identity(ctx.age_key_path()) {
             Ok(Some(_)) => {}
-            Ok(None) => return Ok(age_key_missing(base, ctx.age_key_path())),
+            Ok(None) => return Ok(age_key_missing(base, target, ctx.age_key_path())),
             Err(e) => {
                 return Ok(Check {
                     status: CheckStatus::Fail,
@@ -852,7 +862,23 @@ fn kube_api(
             })
         }
         Err(CoreError::AgeKeyMissing { .. }) => {
-            return Ok(age_key_missing(base, ctx.age_key_path()))
+            return Ok(age_key_missing(base, target, ctx.age_key_path()))
+        }
+        // A key that does not open the cache: its own fix, which names the refetch (review #8).
+        Err(CoreError::Cli(cli_core::CliError::CacheUndecryptable {
+            target: whose,
+            path,
+            ..
+        })) => {
+            return Ok(Check {
+                status: CheckStatus::Fail,
+                detail: None,
+                fix: Some(CheckFix::CacheUndecryptable {
+                    target: whose,
+                    path,
+                }),
+                ..base
+            })
         }
         Err(e) => {
             return Ok(Check {
@@ -900,11 +926,12 @@ fn kube_api(
     }
 }
 
-fn age_key_missing(base: Check, key: &Path) -> Check {
+fn age_key_missing(base: Check, target: &TargetRef, key: &Path) -> Check {
     Check {
         status: CheckStatus::Fail,
         detail: None,
         fix: Some(CheckFix::AgeKeyMissing {
+            target: target.name().to_string(),
             path: key.display().to_string(),
         }),
         ..base
@@ -2170,12 +2197,51 @@ mod tests {
         assert_eq!(
             c[1].fix,
             Some(CheckFix::AgeKeyMissing {
+                target: "prod".into(),
                 path: ctx.age_key_path().display().to_string()
             })
         );
         assert!(
             !ctx.age_key_path().exists(),
             "a Read never writes a key (decision 2)"
+        );
+    }
+
+    /// WI-457 review #8: a cache the key there does not open (cached under a lost key that a
+    /// new one replaced) fails with its own fix, naming the target whose kubeconfig to fetch
+    /// again under this key, instead of the age library's raw text; nothing is left behind.
+    #[cfg(unix)]
+    #[test]
+    fn a_cache_under_another_key_fails_with_the_target_to_fetch_again() {
+        let f = fx();
+        crate::kube::tests::fake_kubectl(
+            &f.root.join("bin"),
+            "case \"$1\" in version) echo 'Client Version: v1.31.0'; exit 0;; esac\nexit 1",
+        );
+        let ctx = ctx(&f, OFFLINE).with_no_ping(true);
+        add(&ctx, "prod", "hetzner-cloud", Some(TOKEN), None);
+        let other = cli_core::secrets::load_or_create_identity(&f.root.join("other.key")).unwrap();
+        let armored = cli_core::secrets::encrypt_for_recipient(YAML, &other.to_public()).unwrap();
+        cli_core::secrets::load_or_create_identity(ctx.age_key_path()).unwrap();
+        seed_state(
+            &ctx,
+            "prod",
+            serde_json::json!({"server_id": 7, "server_name": "n", "kubeconfig_age": armored}),
+        );
+        let c = cluster(&doctor(&ctx, named("prod")));
+        assert_eq!(c[1].id, CheckId::KubeApiReachable);
+        assert_eq!(c[1].status, CheckStatus::Fail);
+        assert_eq!(c[1].detail, None);
+        assert_eq!(
+            c[1].fix,
+            Some(CheckFix::CacheUndecryptable {
+                target: "prod".into(),
+                path: ctx.age_key_path().display().to_string()
+            })
+        );
+        assert!(
+            std::fs::read_dir(ctx.runtime_dir()).map_or(true, |mut d| d.next().is_none()),
+            "nothing is decrypted to disk"
         );
     }
 

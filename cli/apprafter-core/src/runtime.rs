@@ -53,7 +53,8 @@ impl Drop for MaterialisedKubeconfig {
 /// `None` when the state records no server or caches no kubeconfig. The encrypted slot wins over
 /// the legacy plaintext one (a plaintext copy beside it may be stale, as the CLI's
 /// `k8s_helpers::select_cached_kubeconfig` documents); decrypting it loads the age identity
-/// WITHOUT creating one — a missing key is [`CoreError::AgeKeyMissing`], never a new key.
+/// WITHOUT creating one — a missing key is [`CoreError::AgeKeyMissing`], never a new key — and
+/// a key that does not open it is `CliError::CacheUndecryptable` (as [`CoreError::Cli`]).
 pub fn materialise_kubeconfig(
     ctx: &Context,
     target: &TargetRef,
@@ -73,9 +74,18 @@ pub fn materialise_kubeconfig(
                 cli_core::secrets::load_identity(key)?.ok_or_else(|| CoreError::AgeKeyMissing {
                     path: key.display().to_string(),
                 })?;
-            Zeroizing::new(cli_core::secrets::decrypt_with_identity(
-                armored, &identity,
-            )?)
+            // A key that does not open the cache is the CLI's typed error, with the target, so
+            // a caller names the refetch instead of the age library's text (WI-457 review #8).
+            Zeroizing::new(
+                cli_core::secrets::decrypt_with_identity(armored, &identity).map_err(|e| {
+                    cli_core::CliError::CacheUndecryptable {
+                        secret: cli_core::secrets::CachedSecret::Kubeconfig,
+                        target: target.name().to_string(),
+                        path: key.display().to_string(),
+                        detail: e.to_string(),
+                    }
+                })?,
+            )
         }
         (None, Some(plain)) => Zeroizing::new(plain.to_string()),
         (None, None) => return Ok(None),
@@ -325,6 +335,35 @@ mod tests {
         }
         // A Read never writes: no key appears (load_or_create_identity would make one).
         assert!(!s.ctx.age_key_path().exists());
+        assert!(kubeconfig_files(&s.ctx).is_empty());
+    }
+
+    /// WI-457 review #8: a key that does not open the cache (it was cached under a lost key that
+    /// a new one replaced) is the CLI's `CacheUndecryptable`, with the target and the key's path,
+    /// so doctor can name the refetch; nothing is written.
+    #[test]
+    fn a_cache_under_another_key_is_cache_undecryptable_and_writes_nothing() {
+        let s = store(None);
+        cli_core::secrets::load_or_create_identity(s.ctx.age_key_path()).unwrap();
+        let other =
+            cli_core::secrets::load_or_create_identity(&s._dir.path().join("other.key")).unwrap();
+        let armored = cli_core::secrets::encrypt_for_recipient(YAML, &other.to_public()).unwrap();
+        seed(
+            &s.ctx,
+            serde_json::json!({"server_id": 7, "server_name": "n", "kubeconfig_age": armored}),
+        );
+        match materialise_kubeconfig(&s.ctx, &s.target) {
+            Err(CoreError::Cli(cli_core::CliError::CacheUndecryptable {
+                secret: cli_core::secrets::CachedSecret::Kubeconfig,
+                target,
+                path,
+                ..
+            })) => {
+                assert_eq!(target, "prod");
+                assert_eq!(path, s.ctx.age_key_path().display().to_string());
+            }
+            other => panic!("expected CacheUndecryptable, got {other:?}"),
+        }
         assert!(kubeconfig_files(&s.ctx).is_empty());
     }
 

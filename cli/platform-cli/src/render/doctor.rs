@@ -188,11 +188,18 @@ pub(crate) fn hint(c: &Check) -> Option<String> {
              copy with an encrypted one"
         ),
         // `--refresh` never decrypts the cached copy on its way to a refetch (WI-457).
-        CheckFix::AgeKeyMissing { path } => format!(
+        CheckFix::AgeKeyMissing { target, path } => format!(
             "no age key at `{path}`, so the cached kubeconfig cannot be decrypted: restore the \
              key it was cached with, or point `APPRAFTER_AGE_KEY` at it. If it is lost, \
-             `apprafter kubeconfig --refresh --target <name>` fetches the kubeconfig again under \
-             a new key, after listing what the new key cannot read and asking"
+             `apprafter kubeconfig --refresh --target {target}` fetches the kubeconfig again \
+             under a new key, after listing what the new key cannot read and asking"
+        ),
+        // A lost key replaced by a new one leaves every other target's cache like this.
+        CheckFix::CacheUndecryptable { target, path } => format!(
+            "the cached kubeconfig does not decrypt with the age key at `{path}`: it was cached \
+             under another key, or the copy is damaged. Point `APPRAFTER_AGE_KEY` at the key it \
+             was cached with, or run `apprafter kubeconfig --refresh --target {target}` to fetch \
+             it from the node again under this key"
         ),
         CheckFix::ClusterUnreachable { reason } => cluster_hint(*reason),
         CheckFix::NodeUnreachable { address } => format!(
@@ -634,6 +641,7 @@ mod tests {
         let age = hint(&fail(
             CheckId::KubeApiReachable,
             CheckFix::AgeKeyMissing {
+                target: "p".into(),
                 path: "/k/age.key".into(),
             },
         ))
@@ -642,10 +650,28 @@ mod tests {
             age.contains("/k/age.key") && age.contains("APPRAFTER_AGE_KEY"),
             "{age}"
         );
+        // Review #9: the target's own name, never a `<name>` a shell reads as a redirection.
         assert!(
-            age.contains("`apprafter kubeconfig --refresh --target <name>`"),
+            age.contains("`apprafter kubeconfig --refresh --target p`") && !age.contains('<'),
             "refresh recovers a lost key (WI-457): {age}"
         );
+        // Review #8: a cache under another key names the refetch under the key there is.
+        let other = hint(&fail(
+            CheckId::KubeApiReachable,
+            CheckFix::CacheUndecryptable {
+                target: "p".into(),
+                path: "/k/age.key".into(),
+            },
+        ))
+        .unwrap();
+        for part in [
+            "/k/age.key",
+            "another key",
+            "APPRAFTER_AGE_KEY",
+            "`apprafter kubeconfig --refresh --target p`",
+        ] {
+            assert!(other.contains(part), "{part:?} missing: {other}");
+        }
         let unreachable = hint(&fail(
             CheckId::KubeApiReachable,
             CheckFix::ClusterUnreachable {

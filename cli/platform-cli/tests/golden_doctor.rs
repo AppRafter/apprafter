@@ -195,6 +195,43 @@ fn doctor_cluster_age_key_missing() {
     );
 }
 
+/// WI-457 review #8: a kubeconfig cached under another key — a lost one, replaced by
+/// `kubeconfig --refresh` for a different target — fails the API row with the refetch for
+/// this target, not the age library's raw text. kubectl is never asked: the cache does not open.
+#[test]
+fn doctor_cluster_cache_undecryptable() {
+    let sb = Sandbox::new();
+    sb.add_target("prod");
+    let lost = age::x25519::Identity::generate();
+    let armored = cli_core::secrets::encrypt_for_recipient(KUBECONFIG_YAML, &lost.to_public())
+        .expect("encrypt");
+    let key = sb.path("home/.config/apprafter/age.key");
+    cli_core::secrets::load_or_create_identity(&key).expect("the key there is");
+    let key_before = std::fs::read(&key).expect("key");
+    sb.seed_state(
+        "prod",
+        &provisioned(Some(("kubeconfig_age", armored))).to_string(),
+    );
+    fake_kubectl(
+        &sb,
+        &format!(
+            "echo \"$*\" >> '{}'\nexit 1",
+            sb.path("kubectl.log").display()
+        ),
+    );
+    sb.golden(
+        "doctor/cluster_cache_undecryptable",
+        &["doctor", "--no-ping"],
+    );
+    assert!(!sb.path("kubectl.log").exists(), "the cluster is not asked");
+    assert_eq!(
+        std::fs::read(&key).expect("key"),
+        key_before,
+        "the key is kept"
+    );
+    no_runtime_kubeconfig_left(&sb);
+}
+
 #[test]
 fn doctor_cluster_api_ok() {
     let sb = Sandbox::new();

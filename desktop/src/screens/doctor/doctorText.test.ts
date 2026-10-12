@@ -162,11 +162,17 @@ describe('fixText', () => {
       'Nothing accepted a connection on port 22 at 203.0.113.10: check that the server is ' +
         'running and that no firewall between this computer and it blocks port 22.',
     );
-    expect(fixed({ kind: 'age_key_missing', path: '/k/age.key' })).toBe(
+    expect(fixed({ kind: 'age_key_missing', target: 'prod-eu', path: '/k/age.key' })).toBe(
       'There is no age key at /k/age.key, so the cached kubeconfig cannot be decrypted: ' +
         'restore the key it was cached with. If the key is lost, fetching the kubeconfig from ' +
         'the server again caches it under a new key, and what was cached under the lost one has ' +
         'to be fetched again too.',
+    );
+    // WI-457 review #8: the cache of a target the new key cannot open (a lost key replaced).
+    expect(fixed({ kind: 'cache_undecryptable', target: 'prod-eu', path: '/k/age.key' })).toBe(
+      'The cached kubeconfig does not decrypt with the age key at /k/age.key: it was cached ' +
+        'under another key, or the copy is damaged. Restore the key it was cached with, or ' +
+        'fetch the kubeconfig from the server again, which caches it under this key.',
     );
     expect(fixed({ kind: 'explain', text: '`helm` exited 1 without printing a version' })).toBe(
       '`helm` exited 1 without printing a version',
@@ -210,7 +216,8 @@ describe('fixText', () => {
       { kind: 'ssh_key_missing', target: 'prod-eu', path: '/k.pub' },
       { kind: 'ssh_key_not_public', target: 'prod-eu', path: '/k', privateKey: true },
       { kind: 'install_tool', tool: 'helm' },
-      { kind: 'age_key_missing', path: '/k' },
+      { kind: 'age_key_missing', target: 'prod-eu', path: '/k' },
+      { kind: 'cache_undecryptable', target: 'prod-eu', path: '/k' },
       { kind: 'cluster_unreachable', reason: 'unreachable' },
       { kind: 'node_unreachable', address: '203.0.113.10' },
       { kind: 'dns', host: 'api.hetzner.cloud' },
