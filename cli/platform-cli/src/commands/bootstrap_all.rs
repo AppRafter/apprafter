@@ -104,7 +104,7 @@ pub fn run(
     // Phase 2/3 — kubeconfig poll. Our retry loop, no inner
     // subcommand output, so we get a clean indicatif spinner with
     // a live attempt counter + truncated last error.
-    let p2 = run_kubeconfig_phase(target_override, by)?;
+    let p2 = run_kubeconfig_phase(target_override, &resolved.target_name, by)?;
 
     // Phase 3/3 — cluster-bootstrap. Same rationale as phase 1:
     // helm/kubectl print release notes, would clobber a spinner.
@@ -152,7 +152,12 @@ fn failed(num: u8, name: &str, elapsed: Duration, err: CliError) -> CliError {
     err
 }
 
-fn run_kubeconfig_phase(target_override: Option<&str>, by: ProvisionedBy) -> Result<Duration> {
+/// Phase 2 for `target` (`target_override` resolved), which `by` provisioned in phase 1.
+fn run_kubeconfig_phase(
+    target_override: Option<&str>,
+    target: &str,
+    by: ProvisionedBy,
+) -> Result<Duration> {
     let pb = ProgressBar::new_spinner();
     pb.set_style(
         ProgressStyle::with_template("{spinner:.cyan} [2/3] k3s-ready    {wide_msg}")
@@ -175,24 +180,58 @@ fn run_kubeconfig_phase(target_override: Option<&str>, by: ProvisionedBy) -> Res
         Err(e) => {
             let elapsed = start.elapsed();
             pb.finish_and_clear();
-            Err(failed(2, "k3s-ready", elapsed, after_provision(e, by)))
+            Err(failed(
+                2,
+                "k3s-ready",
+                elapsed,
+                after_provision(e, target, by),
+            ))
         }
     }
 }
 
-/// Phase 2's error once phase 1 has provisioned: a lost age key says what that leaves (a
-/// server that bills, no cluster-bootstrap) and that `by` is the command to run again, once
-/// the key is back or `kubeconfig --refresh` has made a new one (review #6). Any other error
-/// is unchanged. The check before phase 1 refuses a key lost before the run, so this is a key
-/// that went missing during it.
-fn after_provision(err: CliError, by: ProvisionedBy) -> CliError {
-    match err {
-        CliError::AgeKeyMissing { path, target, .. } => CliError::AgeKeyMissing {
+/// Why phase 2's wait for the node ended without a kubeconfig.
+#[derive(Debug)]
+enum Unready {
+    /// An error waiting does not cure: a lost age key (WI-457).
+    Failed(CliError),
+    /// The wait ran out, after `attempts` fetches; `last_error` is the last one's.
+    TimedOut {
+        waited: Duration,
+        attempts: u32,
+        last_error: String,
+    },
+}
+
+/// Phase 2's error once `by` has provisioned `target` in phase 1 (the target `run` resolved,
+/// which the fetch resolves too). Each says what that leaves (a server that bills, no
+/// cluster-bootstrap) and names `by` to run again (review #6):
+///
+/// - a lost age key, once the key is back or `kubeconfig --refresh` has made a new one. The
+///   check before phase 1 refuses a key lost before the run, so this is a key that went
+///   missing during it;
+/// - a wait that ran out ([`CliError::K3sNotReady`]), once the node is up.
+///
+/// Any other error is unchanged.
+fn after_provision(unready: Unready, target: &str, by: ProvisionedBy) -> CliError {
+    match unready {
+        Unready::Failed(CliError::AgeKeyMissing { path, .. }) => CliError::AgeKeyMissing {
             path,
-            target,
+            target: target.to_string(),
             stopped: Some(ProvisionStop::After { by }),
         },
-        other => other,
+        Unready::Failed(other) => other,
+        Unready::TimedOut {
+            waited,
+            attempts,
+            last_error,
+        } => CliError::K3sNotReady {
+            target: target.to_string(),
+            by,
+            waited_secs: waited.as_secs(),
+            attempts,
+            last_error,
+        },
     }
 }
 
@@ -333,7 +372,10 @@ fn print_target_block(
 /// systemd unit is still coming up). Returns `Ok(())` on the first
 /// success — the YAML itself is cached in state by `fetch_and_cache`,
 /// so no further plumbing is needed for Phase 3.
-fn wait_for_kubeconfig(target_override: Option<&str>, pb: &ProgressBar) -> Result<()> {
+fn wait_for_kubeconfig(
+    target_override: Option<&str>,
+    pb: &ProgressBar,
+) -> std::result::Result<(), Unready> {
     poll_kubeconfig(
         pb,
         KUBECONFIG_POLL_TIMEOUT,
@@ -351,7 +393,7 @@ fn poll_kubeconfig(
     interval: Duration,
     fetch: &mut dyn FnMut() -> Result<String>,
     listening: &dyn Fn(&str) -> bool,
-) -> Result<()> {
+) -> std::result::Result<(), Unready> {
     let deadline = Instant::now() + timeout;
     let mut attempt = 0u32;
     loop {
@@ -372,7 +414,7 @@ fn poll_kubeconfig(
             },
             // A lost age key does not come back by waiting: its help names
             // `apprafter kubeconfig --refresh`, which asks before it makes a new one (WI-457).
-            Err(e @ CliError::AgeKeyMissing { .. }) => return Err(e),
+            Err(e @ CliError::AgeKeyMissing { .. }) => return Err(Unready::Failed(e)),
             Err(e) => format!("{e}"),
         };
         warn!(attempt, error = %err, "kubeconfig fetch failed; retrying");
@@ -381,21 +423,19 @@ fn poll_kubeconfig(
             short_error(&err),
             interval.as_secs(),
         ));
+        let timed_out = |last_error| Unready::TimedOut {
+            waited: timeout,
+            attempts: attempt,
+            last_error,
+        };
         if Instant::now() >= deadline {
-            return Err(timeout_error(attempt, &err));
+            return Err(timed_out(err));
         }
         std::thread::sleep(interval);
         if Instant::now() >= deadline {
-            return Err(timeout_error(attempt, &err));
+            return Err(timed_out(err));
         }
     }
-}
-
-fn timeout_error(attempt: u32, last_err: &str) -> CliError {
-    CliError::Other(format!(
-        "kubeconfig did not become reachable within {}s ({attempt} attempts); last error: {last_err}. Run `apprafter kubeconfig --refresh` once the cluster reports ready.",
-        KUBECONFIG_POLL_TIMEOUT.as_secs(),
-    ))
 }
 
 /// Parse `HOST:PORT` from the kubeconfig's `server: https://HOST:PORT` line.
@@ -484,21 +524,26 @@ mod tests {
             &|_| true,
         )
         .unwrap_err();
-        assert!(matches!(err, CliError::AgeKeyMissing { .. }), "{err:?}");
+        assert!(
+            matches!(err, Unready::Failed(CliError::AgeKeyMissing { .. })),
+            "{err:?}"
+        );
         assert_eq!(calls, 1);
     }
 
-    /// Review #6: phase 2's lost key names the command that provisioned, so its help says what
-    /// is left and what to run again; any other error passes through as it was.
+    /// Review #6: phase 2's lost key names the target and the command that provisioned it, so
+    /// its help says what is left and what to run again; any other error passes through as it
+    /// was.
     #[test]
     fn a_lost_age_key_after_phase_1_names_the_command_to_run_again() {
         for by in [ProvisionedBy::Up, ProvisionedBy::RestoreReprovision] {
             let err = after_provision(
-                CliError::AgeKeyMissing {
+                Unready::Failed(CliError::AgeKeyMissing {
                     path: "/k/age.key".into(),
                     target: "prod".into(),
                     stopped: None,
-                },
+                }),
+                "prod",
                 by,
             );
             assert!(
@@ -508,7 +553,11 @@ mod tests {
                 "{err:?}"
             );
         }
-        let other = after_provision(CliError::Other("ssh: refused".into()), ProvisionedBy::Up);
+        let other = after_provision(
+            Unready::Failed(CliError::Other("ssh: refused".into())),
+            "prod",
+            ProvisionedBy::Up,
+        );
         assert!(
             matches!(&other, CliError::Other(m) if m == "ssh: refused"),
             "{other:?}"
@@ -535,6 +584,50 @@ mod tests {
         )
         .unwrap();
         assert_eq!(calls, 3);
+    }
+
+    /// WI-457 follow-up: a wait that runs out keeps the wait, the count of attempts and the
+    /// last error, and phase 2 then names the target and the command that provisioned it, whose
+    /// help says the server bills, cluster-bootstrap did not run, and to run the command again.
+    #[test]
+    fn a_wait_that_runs_out_names_the_target_the_command_and_the_last_error() {
+        let mut calls = 0u32;
+        let mut fetch = || {
+            calls += 1;
+            Err(CliError::Other("ssh: connection refused".into()))
+        };
+        let unready = poll_kubeconfig(
+            &ProgressBar::hidden(),
+            Duration::from_millis(60),
+            Duration::from_millis(10),
+            &mut fetch,
+            &|_| true,
+        )
+        .unwrap_err();
+        assert!(calls > 1, "retried until the wait ran out: {calls}");
+        assert!(
+            matches!(&unready, Unready::TimedOut { waited, attempts, last_error }
+                if *waited == Duration::from_millis(60) && *attempts == calls
+                    && last_error == "ssh: connection refused"),
+            "{unready:?}"
+        );
+        for by in [ProvisionedBy::Up, ProvisionedBy::RestoreReprovision] {
+            let err = after_provision(
+                Unready::TimedOut {
+                    waited: Duration::from_secs(300),
+                    attempts: 30,
+                    last_error: "ssh: connection refused".into(),
+                },
+                "prod",
+                by,
+            );
+            assert!(
+                matches!(&err, CliError::K3sNotReady {
+                    target, by: named, waited_secs: 300, attempts: 30, last_error,
+                } if target == "prod" && *named == by && last_error == "ssh: connection refused"),
+                "{err:?}"
+            );
+        }
     }
 
     #[test]

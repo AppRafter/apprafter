@@ -323,6 +323,23 @@ fn age_key_missing_help_for(target: &str, stopped: Option<&ProvisionStop>) -> St
     }
 }
 
+/// [`CliError::K3sNotReady`]'s help: what the stop leaves (a server that bills, no
+/// cluster-bootstrap) and how to go on: `by` again, which finds the server instead of creating
+/// another and waits for the node again.
+fn k3s_not_ready_help(target: &str, by: ProvisionedBy) -> String {
+    format!(
+        "{} stopped after provisioning: the server of target `{target}` exists, and Hetzner \
+         bills for it, but cluster-bootstrap did not run. The node may still be starting; the \
+         last error says how far it got. To go on, {}: it finds the server it provisioned \
+         instead of creating another, waits for the node again, and goes on with {}. \
+         `apprafter doctor --target {target}` checks whether the node's SSH port accepts \
+         connections.",
+        by.command(),
+        by.again(target),
+        by.goes_on()
+    )
+}
+
 /// `CacheUndecryptable`'s help: the key it was cached under, or the command that fetches it
 /// again under the key there is now, for `target`, whichever target is active.
 fn cache_undecryptable_help(secret: &crate::secrets::CachedSecret, target: &str) -> String {
@@ -874,6 +891,27 @@ pub enum CliError {
         )
     )]
     NewAgeKeyDeclined { path: String, target: String },
+
+    /// `up` or `restore --reprovision` provisioned the server, and in phase 2 (`k3s-ready`)
+    /// its kubeconfig did not become reachable within the wait: the node did not answer over
+    /// SSH, k3s had not written the file, or the apiserver did not accept connections.
+    /// `last_error` is the last of those. The help says what that leaves (a server that bills,
+    /// no cluster-bootstrap) and that the same command, run again, goes on.
+    #[error(
+        "the kubeconfig of target `{target}` did not become reachable within {waited_secs}s \
+         ({attempts} attempts); last error: {last_error}"
+    )]
+    #[diagnostic(
+        code(apprafter::cluster::k3s_not_ready),
+        help("{}", k3s_not_ready_help(target, *by))
+    )]
+    K3sNotReady {
+        target: String,
+        by: ProvisionedBy,
+        waited_secs: u64,
+        attempts: u32,
+        last_error: String,
+    },
 
     /// Catch-all, free-form message. New call sites should prefer
     /// promoting recurring messages to dedicated variants with
@@ -1812,6 +1850,55 @@ mod tests {
     /// WI-457 review #5/#12: a declined new key is an error, so a caller capturing the
     /// kubeconfig on stdout never takes an empty one for success. It says what did not happen and
     /// both ways on: the old key back, or the same command agreed to.
+    /// WI-457 follow-up: phase 2's wait for the node ran out after `up` or `restore
+    /// --reprovision` provisioned. The help says the server exists and bills, that
+    /// cluster-bootstrap did not run, and to run the same command again, which finds the server;
+    /// the message keeps the wait, the count and the last error.
+    #[test]
+    fn a_wait_for_the_node_that_ran_out_says_what_it_left_and_to_run_the_command_again() {
+        for (by, stopped, again, goes_on) in [
+            (
+                ProvisionedBy::Up,
+                "`apprafter up` stopped after provisioning",
+                "To go on, run `apprafter up --target prod` again",
+                "goes on with cluster-bootstrap.",
+            ),
+            (
+                ProvisionedBy::RestoreReprovision,
+                "`apprafter restore --reprovision` stopped after provisioning",
+                "To go on, run the same `apprafter restore` command again (the same repository \
+                 and options, with `--reprovision --target prod`)",
+                "goes on with cluster-bootstrap and the restore.",
+            ),
+        ] {
+            let err = CliError::K3sNotReady {
+                target: "prod".into(),
+                by,
+                waited_secs: 300,
+                attempts: 30,
+                last_error: "apiserver 203.0.113.10:6443 not accepting connections yet".into(),
+            };
+            assert_eq!(code_of(&err), "apprafter::cluster::k3s_not_ready");
+            assert_eq!(
+                err.to_string(),
+                "the kubeconfig of target `prod` did not become reachable within 300s (30 \
+                 attempts); last error: apiserver 203.0.113.10:6443 not accepting connections yet"
+            );
+            let help = help_of(&err);
+            for part in [
+                stopped,
+                "the server of target `prod` exists, and Hetzner bills for it",
+                "cluster-bootstrap did not run",
+                again,
+                "it finds the server it provisioned instead of creating another",
+                goes_on,
+                "`apprafter doctor --target prod`",
+            ] {
+                assert!(help.contains(part), "{by:?}: {part:?} missing: {help}");
+            }
+        }
+    }
+
     #[test]
     fn a_declined_new_age_key_says_nothing_was_fetched_and_names_both_ways_on() {
         let err = CliError::NewAgeKeyDeclined {

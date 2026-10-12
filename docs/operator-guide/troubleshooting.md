@@ -425,6 +425,24 @@ kubeconfig, `apprafter argocd-password --refresh --target <name>` for
 an Argo CD admin password. Neither asks, since the key they cache under
 exists.
 
+### `apprafter::cluster::k3s_not_ready` {#k3s-not-ready}
+
+`apprafter up` or `apprafter restore --reprovision` provisioned the
+server, then waited five minutes in its `k3s-ready` step for the
+node's kubeconfig, and the node did not get there: SSH did not reach
+it, k3s had not written the file yet, or the apiserver did not accept
+connections. The message ends with the last of those errors. The
+server exists and Hetzner bills for it, but cluster-bootstrap has not
+run.
+
+**Fix.** Run the same `up` or `restore` command again. It finds the
+server it provisioned instead of creating another, waits for the node
+again, and goes on with cluster-bootstrap. `apprafter kubeconfig
+--refresh` alone fetches the kubeconfig but bootstraps nothing. If the
+node still does not answer, see [The `k3s-ready` step of `up` takes
+longer than
+expected](#the-k3s-ready-step-of-bootstrap-all-takes-longer-than-expected).
+
 ### `apprafter::cli::other`
 
 Catch-all for messages that haven't been promoted to a typed
@@ -480,9 +498,13 @@ If you see `> 60 s` consistently on `k3s-ready`:
   `apprafter doctor`'s **`Node reachable over SSH`** check connects
   to port 22 of the node's public IPv4, and FAILs naming the address
   when nothing accepts the connection.
-- Try `apprafter kubeconfig --refresh` once the cluster reports
-  ready in the Hetzner Console (the Web Console gives you
-  out-of-band access to the boot log).
+- Read the node's boot log in the Hetzner Console: its Web Console
+  gives you out-of-band access to it.
+- If the step gives up after five minutes, it fails with
+  [`apprafter::cluster::k3s_not_ready`](#k3s-not-ready): the server
+  exists and bills, and cluster-bootstrap has not run. Once the node
+  is up, run the same `up` command again. It finds the server instead
+  of creating another and goes on with cluster-bootstrap.
 
 ### Cilium pods did not pick up a config change
 

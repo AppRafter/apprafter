@@ -563,6 +563,7 @@ fn neutral_help(e: &cli_core::CliError) -> Option<String> {
         | C::AgeKeyMissing { .. }
         | C::CacheUndecryptable { .. }
         | C::NewAgeKeyDeclined { .. }
+        | C::K3sNotReady { .. }
         | C::Yaml(_)
         | C::CompletionInstall(_)
         | C::ConfirmationRequired { .. }
@@ -917,6 +918,13 @@ pub mod samples {
             C::NewAgeKeyDeclined {
                 path: s("/home/a/.config/apprafter/age.key"),
                 target: s("prod"),
+            },
+            C::K3sNotReady {
+                target: s("prod"),
+                by: cli_core::ProvisionedBy::RestoreReprovision,
+                waited_secs: 300,
+                attempts: 30,
+                last_error: s("ssh: connect to host 203.0.113.10 port 22: Connection refused"),
             },
             C::Other(s("o")),
         ];
