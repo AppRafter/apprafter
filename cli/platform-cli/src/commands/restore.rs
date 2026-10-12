@@ -734,11 +734,9 @@ pub fn run_restore(
             // target (topology + cloud token come from the target's local config,
             // exactly as `apprafter up` — R2), then resolves the now-cached
             // kubeconfig. It is always first, and every later step needs kc.
+            // `bootstrap_all::run` prints this step's progress line itself, once
+            // its checks pass, so a refused run never says it began (WI-457).
             if let RestoreStep::Reprovision = step {
-                println!(
-                    "→ --reprovision: provisioning a fresh cluster in target '{}' before replay",
-                    target.unwrap_or("<active>")
-                );
                 crate::commands::bootstrap_all::run(
                     target,
                     false,

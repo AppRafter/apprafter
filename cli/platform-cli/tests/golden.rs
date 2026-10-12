@@ -2821,11 +2821,25 @@ fn assert_not_run(sb: &Sandbox, tools: &[&str]) {
     }
 }
 
+/// `restore --reprovision`'s progress line, printed once provisioning starts.
+const REPROVISIONING: &str =
+    "→ --reprovision: provisioning a fresh cluster in target 'prod' before replay";
+
+/// A run of `args` that passed the check says [`REPROVISIONING`] exactly when it is `restore
+/// --reprovision`.
+fn assert_reprovisioning_said(args: &[&str], stdout: &str) {
+    assert_eq!(
+        stdout.contains(REPROVISIONING),
+        args.contains(&"--reprovision"),
+        "{args:?}:\n{stdout}"
+    );
+}
+
 /// The first run of `up` or `restore --reprovision`, with the key already lost: it stops
-/// before provisioning (no `POST /v1/servers`, no `[1/3]` line, no state for `prod`) and says so
-/// — nothing was created, the way on is the key back or `kubeconfig --refresh --target staging`
-/// (`prod` has no server to fetch from), then `rerun`. No key is created, no node is read and
-/// nothing reaches a cluster.
+/// before provisioning (no `POST /v1/servers`, no `[1/3]` line, no [`REPROVISIONING`] line, no
+/// state for `prod`) and says so — nothing was created, the way on is the key back or
+/// `kubeconfig --refresh --target staging` (`prod` has no server to fetch from), then `rerun`.
+/// No key is created, no node is read and nothing reaches a cluster.
 fn refuse_before_provisioning(
     sb: &Sandbox,
     server: &mut mockito::Server,
@@ -2853,7 +2867,7 @@ fn refuse_before_provisioning(
             rerun,
         ],
     );
-    for not_said in ["[1/3]", "bills"] {
+    for not_said in ["[1/3]", REPROVISIONING, "bills"] {
         assert!(
             !stdout.contains(not_said) && !stderr.contains(not_said),
             "{not_said:?}:\n{stdout}\n{stderr}"
@@ -2889,6 +2903,7 @@ fn go_on_after_the_refusal(
         run.stderr
     );
     assert_says(&run.stdout, &["[1/3] apply done"]);
+    assert_reprovisioning_said(rerun, &run.stdout);
     assert_says(
         &run.stderr,
         &["apiserver 127.0.0.1:1 not accepting connections yet"],
@@ -2943,6 +2958,7 @@ fn provision_then_stop(
     creates.remove();
     assert_eq!(out.status.code(), Some(1), "{stdout}\n{stderr}");
     assert_says(&stdout, &["[1/3] apply done"]);
+    assert_reprovisioning_said(args, &stdout);
     assert_says(
         &stderr,
         &[
@@ -2990,6 +3006,7 @@ fn walk_the_way_back(
         &run.stdout,
         &["apply complete: 0 action(s)", "[1/3] apply done"],
     );
+    assert_reprovisioning_said(rerun, &run.stdout);
     assert_says(
         &run.stderr,
         &["apiserver 127.0.0.1:1 not accepting connections yet"],

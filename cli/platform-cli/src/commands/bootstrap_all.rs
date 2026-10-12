@@ -83,6 +83,16 @@ pub fn run(
         by,
     )?;
 
+    // `restore --reprovision` says it is provisioning here, past every check, and not before
+    // it calls this: a run the check refuses says nothing was created, so it must not have
+    // said it started (WI-457).
+    if by == ProvisionedBy::RestoreReprovision {
+        println!(
+            "→ --reprovision: provisioning a fresh cluster in target '{}' before replay",
+            resolved.target_name
+        );
+    }
+
     // Phase 1/3 — apply. No spinner: apply itself spends most of
     // its time inside `provider.apply()` calling the Hetzner REST
     // API, which logs through `tracing` to stderr; a spinner here
