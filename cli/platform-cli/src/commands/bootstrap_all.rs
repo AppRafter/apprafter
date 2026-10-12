@@ -21,16 +21,18 @@
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
+use cli_core::secrets::default_age_key_path;
 use cli_core::style;
 use cli_core::target::{
     default_config_root, load_active_target_config, resolve_active_target_name, TargetConfig,
     TargetStorePaths,
 };
-use cli_core::{CliError, ProvisionedBy, Result};
+use cli_core::{CliError, ProvisionStop, ProvisionedBy, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use tracing::{info, warn};
 
-use crate::commands::{apply, cluster_bootstrap, kubeconfig};
+use crate::commands::state_paths::resolve_state_paths;
+use crate::commands::{age_cache, apply, cluster_bootstrap, kubeconfig};
 
 /// Maximum time we wait for k3s + SSH to come up after `apply`
 /// before giving up on Phase 2. Hetzner Cloud cloud-init on a
@@ -43,7 +45,7 @@ const KUBECONFIG_POLL_TIMEOUT: Duration = Duration::from_secs(300);
 const KUBECONFIG_POLL_INTERVAL: Duration = Duration::from_secs(10);
 
 /// `by` is the command running it, `up` itself or `restore --reprovision`: the one a stop on a
-/// lost age key after phase 1 tells the user to run again (review #6).
+/// lost age key tells the user to run again, before phase 1 or after it (review #6).
 pub fn run(
     target_override: Option<&str>,
     dry_run: bool,
@@ -68,6 +70,17 @@ pub fn run(
     cli_core::tools::preflight_tools(
         &[&cli_core::tools::KUBECTL, &cli_core::tools::HELM],
         "apprafter bootstrap-all",
+    )?;
+
+    // WI-457. Phase 2/3 caches the new kubeconfig under the age key and never replaces a lost
+    // one, so a lost key would stop this run there, after phase 1/3 created a server that
+    // bills. Same lesson again: check it before spending anything.
+    let resolved = resolve_state_paths(target_override)?;
+    age_cache::check_before_provisioning(
+        &resolved.store,
+        &resolved.target_name,
+        &default_age_key_path(),
+        by,
     )?;
 
     // Phase 1/3 — apply. No spinner: apply itself spends most of
@@ -170,13 +183,14 @@ fn run_kubeconfig_phase(target_override: Option<&str>, by: ProvisionedBy) -> Res
 /// Phase 2's error once phase 1 has provisioned: a lost age key says what that leaves (a
 /// server that bills, no cluster-bootstrap) and that `by` is the command to run again, once
 /// the key is back or `kubeconfig --refresh` has made a new one (review #6). Any other error
-/// is unchanged.
+/// is unchanged. The check before phase 1 refuses a key lost before the run, so this is a key
+/// that went missing during it.
 fn after_provision(err: CliError, by: ProvisionedBy) -> CliError {
     match err {
         CliError::AgeKeyMissing { path, target, .. } => CliError::AgeKeyMissing {
             path,
             target,
-            after_provision: Some(by),
+            stopped: Some(ProvisionStop::After { by }),
         },
         other => other,
     }
@@ -459,7 +473,7 @@ mod tests {
             Err(CliError::AgeKeyMissing {
                 path: "/k/age.key".into(),
                 target: "prod".into(),
-                after_provision: None,
+                stopped: None,
             })
         };
         let err = poll_kubeconfig(
@@ -483,13 +497,14 @@ mod tests {
                 CliError::AgeKeyMissing {
                     path: "/k/age.key".into(),
                     target: "prod".into(),
-                    after_provision: None,
+                    stopped: None,
                 },
                 by,
             );
             assert!(
-                matches!(&err, CliError::AgeKeyMissing { path, target, after_provision }
-                    if path == "/k/age.key" && target == "prod" && *after_provision == Some(by)),
+                matches!(&err, CliError::AgeKeyMissing { path, target, stopped }
+                    if path == "/k/age.key" && target == "prod"
+                        && *stopped == Some(ProvisionStop::After { by })),
                 "{err:?}"
             );
         }

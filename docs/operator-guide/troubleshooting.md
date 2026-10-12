@@ -391,13 +391,24 @@ What the new key leaves behind, and the way back for each:
 | Another target's Argo CD admin password | `apprafter argocd-password --refresh --target <other>` fetches it again, once that target's kubeconfig is fetched. |
 
 `apprafter up` and `apprafter restore --reprovision` never create a
-key in place of a lost one. They meet it after provisioning, in the
-`k3s-ready` step, and stop at once with this error. The server then
+key in place of a lost one. They check for it before they provision
+anything: when the key is missing and anything in the config root is
+cached under it, they stop with this error, and nothing is created.
+The help names a target that has something cached under the lost key.
+Put the key back, or run the command above for that target: the target
+being provisioned has no server yet to fetch a kubeconfig from. Then
+run the same `up` or `restore` command again. With no key and nothing
+cached in the config root, there is no lost key: `up` goes on, and
+creates the key when it caches the new kubeconfig.
+
+If the key goes missing while the server is being created, they stop
+later, in the `k3s-ready` step, with the same error. The server then
 exists and Hetzner bills for it, but cluster-bootstrap has not run.
-Put the key back, or run the command above (the node may need a few
-minutes after provisioning before it answers). Then run the same `up`
-or `restore` command again: it finds the server it provisioned instead
-of creating another, and goes on with cluster-bootstrap.
+Put the key back, or run the command above for the target being
+provisioned (the node may need a few minutes after provisioning before
+it answers). Then run the same `up` or `restore` command again: it
+finds the server it provisioned instead of creating another, and goes
+on with cluster-bootstrap.
 
 ### `apprafter::secrets::cache_undecryptable` {#cache-undecryptable}
 

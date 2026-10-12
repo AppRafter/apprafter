@@ -230,9 +230,8 @@ pub fn age_key_missing_help(target: Option<&str>) -> String {
     )
 }
 
-/// The command that provisioned a server and then stopped on a lost age key, before
-/// cluster-bootstrap (WI-457 review #6). [`CliError::AgeKeyMissing`]'s help then says what that
-/// leaves and names this command to run again.
+/// The command that provisions a server and caches its kubeconfig under the age key: `up` or
+/// `restore --reprovision` (WI-457). An error that stops it names this command to run again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProvisionedBy {
     /// `apprafter up` (alias `bootstrap-all`).
@@ -241,39 +240,87 @@ pub enum ProvisionedBy {
     RestoreReprovision,
 }
 
-/// [`CliError::AgeKeyMissing`]'s help: [`age_key_missing_help`] for `target`, or, `after` a
-/// provision, what that leaves (a server that bills, no cluster-bootstrap) and how to go on: the
-/// key back or `kubeconfig --refresh`, then the same command again, which finds the server
-/// instead of creating another.
-fn age_key_missing_help_after(target: &str, after: Option<ProvisionedBy>) -> String {
-    let Some(by) = after else {
-        return age_key_missing_help(Some(target));
-    };
-    let (stopped, again, goes_on) = match by {
-        ProvisionedBy::Up => (
-            "`apprafter up`",
-            format!("run `apprafter up --target {target}` again"),
-            "cluster-bootstrap",
-        ),
-        ProvisionedBy::RestoreReprovision => (
-            "`apprafter restore --reprovision`",
-            format!(
+impl ProvisionedBy {
+    /// The command as the help names it.
+    fn command(self) -> &'static str {
+        match self {
+            ProvisionedBy::Up => "`apprafter up`",
+            ProvisionedBy::RestoreReprovision => "`apprafter restore --reprovision`",
+        }
+    }
+
+    /// How to run it again for `target`.
+    fn again(self, target: &str) -> String {
+        match self {
+            ProvisionedBy::Up => format!("run `apprafter up --target {target}` again"),
+            ProvisionedBy::RestoreReprovision => format!(
                 "run the same `apprafter restore` command again (the same repository and \
                  options, with `--reprovision --target {target}`)"
             ),
-            "cluster-bootstrap and the restore",
+        }
+    }
+
+    /// What it goes on with once the node answers.
+    fn goes_on(self) -> &'static str {
+        match self {
+            ProvisionedBy::Up => "cluster-bootstrap",
+            ProvisionedBy::RestoreReprovision => "cluster-bootstrap and the restore",
+        }
+    }
+}
+
+/// Where `up` or `restore --reprovision` stopped on a lost age key (WI-457). Both refuse to
+/// replace it; what that leaves depends on whether the server was created yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProvisionStop {
+    /// At the check before provisioning: the key is missing and something in this config root
+    /// is cached under it, so phase 2 would refuse. Nothing was created. `recover` is a target
+    /// with something cached under the lost key, whose `kubeconfig --refresh` creates the new
+    /// one.
+    Before { by: ProvisionedBy, recover: String },
+    /// In phase 2, after the server was created (review #6): the key was there at the check
+    /// before provisioning and went missing during the run. The server exists and bills, and
+    /// cluster-bootstrap did not run.
+    After { by: ProvisionedBy },
+}
+
+/// [`CliError::AgeKeyMissing`]'s help: [`age_key_missing_help`] for `target`, or, for `up` or
+/// `restore --reprovision`, what its stop leaves and how to go on.
+///
+/// - Before provisioning: nothing was created. The key back, or `kubeconfig --refresh` for a
+///   target that has something cached under it, then the same command again.
+/// - After provisioning: a server that bills, no cluster-bootstrap. The key back or
+///   `kubeconfig --refresh` for this target, then the same command again, which finds the
+///   server instead of creating another.
+fn age_key_missing_help_for(target: &str, stopped: Option<&ProvisionStop>) -> String {
+    match stopped {
+        None => age_key_missing_help(Some(target)),
+        Some(ProvisionStop::Before { by, recover }) => format!(
+            "{} stopped before provisioning, so nothing was created. It caches the new \
+             kubeconfig under the age key, and it does not create a new key in place of a \
+             missing one: a new key cannot read what target `{recover}` cached under the \
+             missing one. To go on, restore the age key file the cache was encrypted with, or \
+             set `APPRAFTER_AGE_KEY` to where it is. If the key is lost, `apprafter kubeconfig \
+             --refresh --target {recover}` fetches that target's kubeconfig from its node over \
+             SSH and caches it under a new key; it lists what the new key cannot read and asks \
+             first. Then {}.",
+            by.command(),
+            by.again(target)
         ),
-    };
-    format!(
-        "{stopped} stopped after provisioning: the server of target `{target}` exists, and \
-         Hetzner bills for it, but cluster-bootstrap did not run. To go on, restore the age key \
-         file the cache was encrypted with, or set `APPRAFTER_AGE_KEY` to where it is. If the key \
-         is lost, `apprafter kubeconfig --refresh --target {target}` fetches the kubeconfig from \
-         the node over SSH and caches it under a new key; it lists what the new key cannot read \
-         and asks first, and the node may need a few minutes after provisioning before it \
-         answers. Then {again}: it finds the server it provisioned instead of creating another, \
-         and goes on with {goes_on}."
-    )
+        Some(ProvisionStop::After { by }) => format!(
+            "{} stopped after provisioning: the server of target `{target}` exists, and Hetzner \
+             bills for it, but cluster-bootstrap did not run. To go on, restore the age key file \
+             the cache was encrypted with, or set `APPRAFTER_AGE_KEY` to where it is. If the key \
+             is lost, `apprafter kubeconfig --refresh --target {target}` fetches the kubeconfig \
+             from the node over SSH and caches it under a new key; it lists what the new key \
+             cannot read and asks first, and the node may need a few minutes after provisioning \
+             before it answers. Then {}: it finds the server it provisioned instead of creating \
+             another, and goes on with {}.",
+            by.command(),
+            by.again(target),
+            by.goes_on()
+        ),
+    }
 }
 
 /// `CacheUndecryptable`'s help: the key it was cached under, or the command that fetches it
@@ -780,14 +827,14 @@ pub enum CliError {
     #[error("no age key at {path}; the cached secrets cannot be decrypted")]
     #[diagnostic(
         code(apprafter::secrets::age_key_missing),
-        help("{}", age_key_missing_help_after(target, *after_provision))
+        help("{}", age_key_missing_help_for(target, stopped.as_ref()))
     )]
     AgeKeyMissing {
         path: String,
         target: String,
-        /// Set when `up` or `restore --reprovision` provisioned the server and then stopped on
-        /// the key (review #6): the help says what that leaves and how to go on.
-        after_provision: Option<ProvisionedBy>,
+        /// Set when `up` or `restore --reprovision` stopped on the key, before provisioning or
+        /// after: the help says what that leaves and how to go on.
+        stopped: Option<ProvisionStop>,
     },
 
     /// A cached secret the age key at `path` cannot decrypt: it was cached under another key,
@@ -1598,7 +1645,7 @@ mod tests {
         let err = CliError::AgeKeyMissing {
             path: "/k/age.key".into(),
             target: "prod".into(),
-            after_provision: None,
+            stopped: None,
         };
         assert_eq!(code_of(&err), "apprafter::secrets::age_key_missing");
         assert_eq!(
@@ -1622,6 +1669,62 @@ mod tests {
         );
     }
 
+    /// WI-457: before `up` or `restore --reprovision` provisions anything, a lost key stops it
+    /// with nothing created. The help says so, and how to go on: the key back, or `kubeconfig
+    /// --refresh` for a target with something cached under the lost key (`up`'s own target has
+    /// no server yet), then the command that stopped, again. It claims no server. The message
+    /// and the code stay the core's.
+    #[test]
+    fn a_missing_age_key_before_a_provision_says_nothing_was_created_and_how_to_go_on() {
+        let before = |by| CliError::AgeKeyMissing {
+            path: "/k/age.key".into(),
+            target: "prod".into(),
+            stopped: Some(ProvisionStop::Before {
+                by,
+                recover: "staging".into(),
+            }),
+        };
+        for (by, stopped, again) in [
+            (
+                ProvisionedBy::Up,
+                "`apprafter up` stopped before provisioning, so nothing was created",
+                "Then run `apprafter up --target prod` again.",
+            ),
+            (
+                ProvisionedBy::RestoreReprovision,
+                "`apprafter restore --reprovision` stopped before provisioning, so nothing was \
+                 created",
+                "Then run the same `apprafter restore` command again (the same repository and \
+                 options, with `--reprovision --target prod`).",
+            ),
+        ] {
+            let err = before(by);
+            assert_eq!(code_of(&err), "apprafter::secrets::age_key_missing");
+            assert_eq!(
+                err.to_string(),
+                "no age key at /k/age.key; the cached secrets cannot be decrypted"
+            );
+            let help = help_of(&err);
+            for part in [
+                stopped,
+                "`APPRAFTER_AGE_KEY`",
+                "`apprafter kubeconfig --refresh --target staging`",
+                "lists what the new key cannot read and asks first",
+                again,
+            ] {
+                assert!(help.contains(part), "{by:?}: {part:?} missing: {help}");
+            }
+            for wrong in [
+                "bills",
+                "exists",
+                "--refresh --target prod",
+                "finds the server",
+            ] {
+                assert!(!help.contains(wrong), "{by:?}: {wrong:?} in: {help}");
+            }
+        }
+    }
+
     /// WI-457 review #6: after `up` or `restore --reprovision` provisioned the server, the help
     /// says the server exists and bills, that cluster-bootstrap did not run, and how to go on:
     /// the key back or `kubeconfig --refresh`, then the command that stopped, again. The message
@@ -1631,7 +1734,7 @@ mod tests {
         let after = |by| CliError::AgeKeyMissing {
             path: "/k/age.key".into(),
             target: "prod".into(),
-            after_provision: Some(by),
+            stopped: Some(ProvisionStop::After { by }),
         };
         for (by, stopped, again) in [
             (

@@ -24,8 +24,8 @@ pub use credentials::{
     HCLOUD_TOKEN_ENV, SSH_PUBLIC_KEY_ENV,
 };
 pub use error::{
-    age_key_missing_help, CliError, ProvisionedBy, Result, SkuCheckFor, TransportFailure,
-    UnavailableKind,
+    age_key_missing_help, CliError, ProvisionStop, ProvisionedBy, Result, SkuCheckFor,
+    TransportFailure, UnavailableKind,
 };
 pub use fsutil::atomic_replace;
 pub use target::{

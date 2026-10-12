@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use age::x25519::Identity;
 use cli_core::secrets::{decrypt_with_identity, load_identity, CachedSecret};
 use cli_core::target::{list_target_names, TargetStorePaths};
-use cli_core::{CliError, Result};
+use cli_core::{CliError, ProvisionStop, ProvisionedBy, Result};
 use cli_state::{HetznerCloudState, State, StatePaths};
 
 /// The missing-key error for `target`'s cache.
@@ -28,7 +28,7 @@ pub(crate) fn missing(target: &str, key_path: &Path) -> CliError {
     CliError::AgeKeyMissing {
         path: key_path.display().to_string(),
         target: target.to_string(),
-        after_provision: None,
+        stopped: None,
     }
 }
 
@@ -95,6 +95,46 @@ pub(crate) fn key_for_new_secret(
         return Err(missing(target, key_path));
     }
     Ok(None)
+}
+
+/// The check `up` and `restore --reprovision` make before they provision anything, for
+/// `target`. Their phase 2 caches the new kubeconfig and never replaces a lost key
+/// ([`key_for_new_secret`]'s rule), so a lost key would stop them only after a billable server
+/// was created. Here it stops them first, with nothing created. A key at `key_path` that does
+/// not load fails here as it would there. A first use (no key, nothing cached anywhere)
+/// passes: phase 2 creates the key.
+pub(crate) fn check_before_provisioning(
+    store: &TargetStorePaths,
+    target: &str,
+    key_path: &Path,
+    by: ProvisionedBy,
+) -> Result<()> {
+    if load_identity(key_path)?.is_some() {
+        return Ok(());
+    }
+    let held = held(store)?;
+    let Some(recover) = recovery_target(&held, target) else {
+        return Ok(());
+    };
+    Err(CliError::AgeKeyMissing {
+        path: key_path.display().to_string(),
+        target: target.to_string(),
+        stopped: Some(ProvisionStop::Before { by, recover }),
+    })
+}
+
+/// The target whose `kubeconfig --refresh` makes the new key, from what is `held` under the
+/// lost one: `target` itself when it caches a secret, else the first target that does (its
+/// node answers the fetch), else the first whose state cannot be read (the refresh then names
+/// what is wrong with it). `None` when nothing is held.
+fn recovery_target(held: &[Held], target: &str) -> Option<String> {
+    let caches = |h: &&Held| matches!(h.what, Holding::Secret(_));
+    held.iter()
+        .filter(caches)
+        .find(|h| h.target == target)
+        .or_else(|| held.iter().find(caches))
+        .or_else(|| held.first())
+        .map(|h| h.target.clone())
 }
 
 /// One thing a target's state holds under the age key.
@@ -258,7 +298,7 @@ mod tests {
         let key = dir.path().join("cfg/age.key");
         let err = cached_kubeconfig(&hetzner(Some("armored"), None), "prod", &key).unwrap_err();
         assert!(
-            matches!(&err, CliError::AgeKeyMissing { path, target, after_provision: None }
+            matches!(&err, CliError::AgeKeyMissing { path, target, stopped: None }
                 if *path == key.display().to_string() && target == "prod"),
             "{err:?}"
         );
@@ -387,6 +427,65 @@ mod tests {
             "{err:?}"
         );
         assert!(!key.exists(), "a lost key is never replaced without asking");
+    }
+
+    /// Before `up` provisions: a key there, or a first use, passes and creates nothing. A lost
+    /// key refuses, naming a target whose `kubeconfig --refresh` makes the new key: the target
+    /// itself when it caches a secret, else the first that does, else the first whose state
+    /// cannot be read. A key that does not load fails as it would in phase 2.
+    #[test]
+    fn the_check_before_provisioning_refuses_a_lost_key_and_names_a_target_to_recover() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let key = dir.path().join("k/age.key");
+        let check = |target: &str| check_before_provisioning(&s, target, &key, ProvisionedBy::Up);
+        let recover = |target: &str| match check(target) {
+            Err(CliError::AgeKeyMissing {
+                path,
+                target: t,
+                stopped:
+                    Some(ProvisionStop::Before {
+                        by: ProvisionedBy::Up,
+                        recover,
+                    }),
+            }) if path == key.display().to_string() && t == target => recover,
+            other => panic!("{target}: {other:?}"),
+        };
+
+        seed(&s, "prod", None);
+        seed(
+            &s,
+            "a",
+            Some(r#"{"server_id":1,"server_name":"a","kubeconfig_yaml":"plain"}"#),
+        );
+        check("prod").expect("a first use: nothing cached anywhere");
+        assert!(!key.exists(), "the check creates no key");
+
+        seed(&s, "b", Some("not json"));
+        assert_eq!(recover("prod"), "b", "a state that cannot be read counts");
+        seed(
+            &s,
+            "c",
+            Some(r#"{"server_id":3,"server_name":"c","argocd_admin_password_age":"y"}"#),
+        );
+        assert_eq!(recover("prod"), "c", "a cached secret first");
+        seed(
+            &s,
+            "d",
+            Some(r#"{"server_id":4,"server_name":"d","kubeconfig_age":"x"}"#),
+        );
+        assert_eq!(recover("prod"), "c", "the first target that caches one");
+        assert_eq!(recover("d"), "d", "the target itself when it caches one");
+        assert!(!key.exists(), "a refusal creates no key");
+
+        load_or_create_identity(&key).unwrap();
+        check("prod").expect("the key is there");
+        std::fs::write(&key, "not a key\n").unwrap();
+        let err = check("prod").unwrap_err();
+        assert!(
+            matches!(&err, CliError::Other(m) if m.contains("parse age key")),
+            "{err:?}"
+        );
     }
 
     #[test]
