@@ -2502,3 +2502,418 @@ fn reads_of_a_cache_with_the_age_key_lost() {
     assert!(!age_key(&sb).exists(), "a read never creates a key");
     assert_eq!(hetzner_state(&sb, "prod"), before);
 }
+
+// ---------------------------------------------------------------------
+// `up` and `restore --reprovision` with the age key lost (WI-457 review #6, and #0 through the
+// command path)
+//
+// `prod` is a new target: `up` provisions its server in a fake Hetzner project (each `GET` lists
+// what the `POST`s made), then reaches phase 2 with the key lost, because `staging` caches under
+// it. The node is a stand-in `ssh` at 127.0.0.1 whose kubeconfig names port 1, where nothing
+// listens, so a rerun that gets as far as the apiserver waits there. The `kubectl`, `helm` and
+// `restic` stand-ins only log and fail: cluster-bootstrap or the restore itself would show in
+// their logs. These cases assert on the text instead of a golden, because the phase lines carry
+// timings.
+// ---------------------------------------------------------------------
+
+/// What the new node serves: an apiserver on a port nothing listens on.
+const NEW_NODE_KUBECONFIG: &str =
+    "apiVersion: v1\nclusters:\n- cluster:\n    server: https://127.0.0.1:1\n  name: default\n";
+
+/// A Hetzner project `apply` can provision in. `GET /v1/<kind>` lists what `POST /v1/<kind>`
+/// made, so a second `apply` finds each resource by name and makes none. A server comes up
+/// `running` at 127.0.0.1. `POST /v1/servers` is the case's route ([`FakeProject::servers`]), so
+/// the case sets its expectation.
+struct FakeProject {
+    made: Made,
+    _routes: Vec<mockito::Mock>,
+}
+
+/// What the project's `POST`s made, per kind (`servers`, `ssh_keys`, …).
+type Made = std::sync::Arc<
+    std::sync::Mutex<std::collections::BTreeMap<&'static str, Vec<serde_json::Value>>>,
+>;
+
+impl FakeProject {
+    fn new(server: &mut mockito::Server) -> Self {
+        let made = Made::default();
+        let mut routes = vec![
+            json_route(server, "/v1/server_types", 200, SERVER_TYPES, TOKEN_A).create(),
+            json_route(
+                server,
+                "/v1/floating_ips",
+                200,
+                r#"{"floating_ips":[]}"#,
+                TOKEN_A,
+            )
+            .create(),
+        ];
+        for kind in ["servers", "ssh_keys", "networks", "firewalls"] {
+            let made = std::sync::Arc::clone(&made);
+            routes.push(
+                Self::route(server, "GET", kind)
+                    .match_query(mockito::Matcher::Any)
+                    .with_status(200)
+                    .with_body_from_request(move |_| {
+                        let made = made.lock().expect("project");
+                        let listed = made.get(kind).cloned().unwrap_or_default();
+                        Self::wrapped(kind, serde_json::Value::Array(listed))
+                    })
+                    .create(),
+            );
+        }
+        for kind in ["ssh_keys", "networks", "firewalls"] {
+            routes.push(Self::post(server, kind, &made).create());
+        }
+        FakeProject {
+            made,
+            _routes: routes,
+        }
+    }
+
+    /// `POST /v1/servers`, not yet created.
+    fn servers(&self, server: &mut mockito::Server) -> mockito::Mock {
+        Self::post(server, "servers", &self.made)
+    }
+
+    fn route(server: &mut mockito::Server, method: &str, kind: &str) -> mockito::Mock {
+        server
+            .mock(method, format!("/v1/{kind}").as_str())
+            .match_header("authorization", format!("Bearer {TOKEN_A}").as_str())
+            .with_header("content-type", "application/json")
+    }
+
+    /// `{ "<key>": value }`, as the API wraps a list (`servers`) or one created object
+    /// (`server`).
+    fn wrapped(key: &str, value: serde_json::Value) -> Vec<u8> {
+        let mut body = serde_json::Map::new();
+        body.insert(key.to_string(), value);
+        serde_json::Value::Object(body).to_string().into_bytes()
+    }
+
+    /// `POST /v1/<kind>`: the request's object with an id (and, for a server, what Hetzner
+    /// adds: running, an address, its type and location as objects), kept for the `GET`.
+    fn post(server: &mut mockito::Server, kind: &'static str, made: &Made) -> mockito::Mock {
+        let made = std::sync::Arc::clone(made);
+        Self::route(server, "POST", kind)
+            .with_status(201)
+            .with_body_from_request(move |req| {
+                let mut it: serde_json::Value =
+                    serde_json::from_slice(req.body().expect("a body")).expect("a JSON body");
+                let mut made = made.lock().expect("project");
+                let list = made.entry(kind).or_default();
+                it["id"] = (50 + list.len()).into();
+                match kind {
+                    "servers" => {
+                        it["status"] = "running".into();
+                        it["public_net"] = serde_json::json!({"ipv4": {"ip": "127.0.0.1"}});
+                        it["server_type"] = serde_json::json!({"name": it["server_type"]});
+                        it["location"] = serde_json::json!({"name": it["location"]});
+                    }
+                    "ssh_keys" => it["fingerprint"] = "golden".into(),
+                    _ => {}
+                }
+                list.push(it.clone());
+                Self::wrapped(kind.strip_suffix('s').expect("a plural"), it)
+            })
+    }
+}
+
+/// `prod`, new, beside `staging`, which caches both secrets under a key that is gone; the
+/// stand-ins alone on `PATH` (see the section's note) and `RESTIC_PASSWORD` set for a restore.
+fn new_target_beside_a_lost_key(server: &mockito::Server) -> Sandbox {
+    let lost = age::x25519::Identity::generate();
+    let enc = |text: &str| {
+        cli_core::secrets::encrypt_for_recipient(text, &lost.to_public()).expect("encrypt")
+    };
+    let sb = Sandbox::new()
+        .with_hcloud(server.url())
+        .with_env("RESTIC_PASSWORD", "golden-passphrase");
+    sb.add_target("staging");
+    sb.add_target("prod");
+    sb.seed_state(
+        "staging",
+        &serde_json::json!({"hetzner_cloud": {
+            "server_id": 43, "server_name": "staging-node",
+            "kubeconfig_age": enc("from: the lost key\n"),
+            "argocd_admin_password_age": enc("lost-password"),
+        }})
+        .to_string(),
+    );
+    let bin = sb.path("tools-bin");
+    fs::create_dir_all(&bin).expect("tools bin");
+    let body: String = NEW_NODE_KUBECONFIG
+        .lines()
+        .map(|l| format!(" '{l}'"))
+        .collect();
+    let node =
+        format!("*' root@127.0.0.1 cat /etc/rancher/k3s/k3s.yaml') printf '%s\\n'{body} ;;\n");
+    for (tool, answers) in [
+        ("ssh", node.as_str()),
+        ("kubectl", ""),
+        ("helm", ""),
+        ("restic", ""),
+    ] {
+        common::stand_in::script(
+            &bin.join(tool),
+            &format!(
+                "echo \"$*\" >> '{log}'\n\
+                 case \"$*\" in\n\
+                 {answers}\
+                 *) echo \"{tool} stand-in: unexpected arguments: $*\" >&2; exit 2 ;;\n\
+                 esac",
+                log = sb.path(&format!("{tool}.log")).display()
+            ),
+        );
+    }
+    sb.with_path(bin)
+}
+
+/// `text` without whitespace, miette's `│` gutter or ANSI colour, so a phrase the help wrapped
+/// (at a space or after a hyphen) is still found: compare it with [`squeeze`] of the phrase.
+fn squeeze(text: &str) -> String {
+    let mut out = String::new();
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // CSI: ESC [ … final byte in @..~
+            for c in chars.by_ref() {
+                if ('@'..='~').contains(&c) && c != '[' {
+                    break;
+                }
+            }
+        } else if !c.is_whitespace() && c != '│' {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Each phrase is in `text` (both squeezed).
+fn assert_says(text: &str, phrases: &[&str]) {
+    let flat = squeeze(text);
+    for phrase in phrases {
+        assert!(
+            flat.contains(&squeeze(phrase)),
+            "{phrase:?} missing:\n{text}"
+        );
+    }
+}
+
+/// What a run left: stdout and stderr, and its exit, or `None` when it was stopped.
+struct Watched {
+    stdout: String,
+    stderr: String,
+    exited: Option<std::process::ExitStatus>,
+}
+
+/// Run `cmd` (stdin closed) until it exits or its stderr shows `until`, then stop it. Panics
+/// after 30 s.
+fn run_until(mut cmd: std::process::Command, until: &str) -> Watched {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn apprafter");
+    let drain = |mut from: Box<dyn Read + Send>| {
+        let into = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let sink = Arc::clone(&into);
+        let reader = std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = from.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                sink.lock().expect("sink").extend_from_slice(&buf[..n]);
+            }
+        });
+        (into, reader)
+    };
+    let (out, out_reader) = drain(Box::new(child.stdout.take().expect("stdout")));
+    let (err, err_reader) = drain(Box::new(child.stderr.take().expect("stderr")));
+    let text =
+        |b: &Arc<Mutex<Vec<u8>>>| String::from_utf8_lossy(&b.lock().expect("buf")).into_owned();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let exited = loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            break Some(status);
+        }
+        if squeeze(&text(&err)).contains(&squeeze(until)) {
+            child.kill().expect("stop the run");
+            child.wait().expect("reap");
+            break None;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("neither an exit nor {until:?} within 30 s:\n{}", text(&err));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    out_reader.join().expect("stdout reader");
+    err_reader.join().expect("stderr reader");
+    Watched {
+        stdout: text(&out),
+        stderr: text(&err),
+        exited,
+    }
+}
+
+/// The first run of `up` or `restore --reprovision`: provisions `prod` (one `POST
+/// /v1/servers`), then stops at phase 2 on the lost key and says so — the server exists and
+/// bills, cluster-bootstrap did not run, the way back is `kubeconfig --refresh --target prod`
+/// and then `rerun`. No key is created (`LostKeyPolicy::Refuse` through the command, review
+/// #0), the node is not read and nothing reaches the cluster.
+fn provision_then_stop(
+    sb: &Sandbox,
+    server: &mut mockito::Server,
+    project: &FakeProject,
+    args: &[&str],
+    stopped: &str,
+    rerun: &str,
+) {
+    let creates = project.servers(server).expect(1).create();
+    let out = sb.cmd(args).output().expect("run apprafter");
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    creates.assert();
+    creates.remove();
+    assert_eq!(out.status.code(), Some(1), "{stdout}\n{stderr}");
+    assert_says(&stdout, &["[1/3] apply done"]);
+    assert_says(
+        &stderr,
+        &[
+            "[2/3] k3s-ready FAILED",
+            "apprafter::secrets::age_key_missing",
+            stopped,
+            "the server of target `prod` exists, and Hetzner bills for it",
+            "cluster-bootstrap did not run",
+            "`apprafter kubeconfig --refresh --target prod`",
+            rerun,
+        ],
+    );
+    assert!(!stdout.contains("[3/3]"), "{stdout}");
+    assert!(
+        !age_key(sb).exists(),
+        "a lost key is never replaced unasked"
+    );
+    for tool in ["ssh", "kubectl", "helm", "restic"] {
+        assert!(
+            !sb.path(&format!("{tool}.log")).exists(),
+            "{tool} is not run"
+        );
+    }
+}
+
+/// The way back, walked as printed: `kubeconfig --refresh --target prod --yes` caches the
+/// kubeconfig under a new key, and `rerun` finds the server instead of creating another (`POST
+/// /v1/servers` expects nothing), passes phase 1, fetches the kubeconfig in phase 2 and waits for
+/// the apiserver, where the case stops it. `staging`'s caches are left as they were.
+fn walk_the_way_back(
+    sb: &Sandbox,
+    server: &mut mockito::Server,
+    project: &FakeProject,
+    rerun: &[&str],
+) {
+    let staging = hetzner_state(sb, "staging");
+    sb.setup(&["kubeconfig", "--refresh", "--target", "prod", "--yes"]);
+    let none = project.servers(server).expect(0).create();
+    let run = run_until(sb.std_cmd(rerun), "kubeconfig fetch failed; retrying");
+    none.assert();
+    assert!(
+        run.exited.is_none(),
+        "exited {:?}:\n{}\n{}",
+        run.exited,
+        run.stdout,
+        run.stderr
+    );
+    assert_says(
+        &run.stdout,
+        &["apply complete: 0 action(s)", "[1/3] apply done"],
+    );
+    assert_says(
+        &run.stderr,
+        &["apiserver 127.0.0.1:1 not accepting connections yet"],
+    );
+    let ssh = fs::read_to_string(sb.path("ssh.log")).expect("ssh");
+    assert_eq!(
+        ssh.lines().count(),
+        2,
+        "the recovery's read and the rerun's:\n{ssh}"
+    );
+    for tool in ["kubectl", "helm", "restic"] {
+        assert!(
+            !sb.path(&format!("{tool}.log")).exists(),
+            "{tool} is not run"
+        );
+    }
+    let key = cli_core::secrets::load_identity(&age_key(sb))
+        .expect("readable")
+        .expect("the new key");
+    let cached = hetzner_state(sb, "prod")["kubeconfig_age"]
+        .as_str()
+        .expect("cached")
+        .to_string();
+    assert_eq!(
+        cli_core::secrets::decrypt_with_identity(&cached, &key).expect("under the new key"),
+        NEW_NODE_KUBECONFIG
+    );
+    assert_eq!(hetzner_state(sb, "staging"), staging);
+}
+
+/// Review #6: `up` provisions, stops on the lost key, and says what that leaves and how to go
+/// on; going on as it says reuses the server.
+#[test]
+fn up_stops_on_a_lost_age_key_after_provisioning_and_says_how_to_go_on() {
+    let mut server = mockito::Server::new();
+    let project = FakeProject::new(&mut server);
+    let sb = new_target_beside_a_lost_key(&server);
+    provision_then_stop(
+        &sb,
+        &mut server,
+        &project,
+        &["up", "--target", "prod", "--server-type", "cx22"],
+        "`apprafter up` stopped after provisioning",
+        "run `apprafter up --target prod` again",
+    );
+    walk_the_way_back(&sb, &mut server, &project, &["up", "--target", "prod"]);
+}
+
+/// Review #6: `restore --reprovision` stops at the same place, before anything is restored,
+/// names itself, and its rerun reuses the server too.
+#[test]
+fn restore_reprovision_stops_on_a_lost_age_key_after_provisioning_and_says_how_to_go_on() {
+    let mut server = mockito::Server::new();
+    let project = FakeProject::new(&mut server);
+    let sb = new_target_beside_a_lost_key(&server);
+    let repo = sb.path("repo").display().to_string();
+    fs::create_dir_all(&repo).expect("repo dir");
+    provision_then_stop(
+        &sb,
+        &mut server,
+        &project,
+        &[
+            "restore",
+            &repo,
+            "--reprovision",
+            "--target",
+            "prod",
+            "--server-type",
+            "cx22",
+        ],
+        "`apprafter restore --reprovision` stopped after provisioning",
+        "run the same `apprafter restore` command again",
+    );
+    walk_the_way_back(
+        &sb,
+        &mut server,
+        &project,
+        &["restore", &repo, "--reprovision", "--target", "prod"],
+    );
+}

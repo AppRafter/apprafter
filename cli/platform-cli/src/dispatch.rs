@@ -144,7 +144,12 @@ fn dispatch_cli(args: Cli) -> cli_core::Result<()> {
             target,
             dry_run,
             server_type,
-        } => commands::bootstrap_all::run(target.as_deref(), dry_run, server_type.as_deref())?,
+        } => commands::bootstrap_all::run(
+            target.as_deref(),
+            dry_run,
+            server_type.as_deref(),
+            cli_core::ProvisionedBy::Up,
+        )?,
         Commands::Platform { action } => match action {
             PlatformCommand::Status { cached } => commands::platform::status(cached)?,
             PlatformCommand::Upgrade { to, cached } => {

@@ -891,6 +891,12 @@ pub mod samples {
             C::AgeKeyMissing {
                 path: s("/home/a/.config/apprafter/age.key"),
                 target: s("prod"),
+                after_provision: None,
+            },
+            C::AgeKeyMissing {
+                path: s("/home/a/.config/apprafter/age.key"),
+                target: s("prod"),
+                after_provision: Some(cli_core::ProvisionedBy::Up),
             },
             C::CacheUndecryptable {
                 secret: cli_core::secrets::CachedSecret::Kubeconfig,
@@ -1678,6 +1684,7 @@ mod tests {
         let e = CoreError::from(cli_core::CliError::AgeKeyMissing {
             path: "/k/age.key".into(),
             target: "prod".into(),
+            after_provision: None,
         });
         assert!(
             matches!(&e, CoreError::AgeKeyMissing { path } if path == "/k/age.key"),

@@ -230,6 +230,52 @@ pub fn age_key_missing_help(target: Option<&str>) -> String {
     )
 }
 
+/// The command that provisioned a server and then stopped on a lost age key, before
+/// cluster-bootstrap (WI-457 review #6). [`CliError::AgeKeyMissing`]'s help then says what that
+/// leaves and names this command to run again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProvisionedBy {
+    /// `apprafter up` (alias `bootstrap-all`).
+    Up,
+    /// `apprafter restore --reprovision`.
+    RestoreReprovision,
+}
+
+/// [`CliError::AgeKeyMissing`]'s help: [`age_key_missing_help`] for `target`, or, `after` a
+/// provision, what that leaves (a server that bills, no cluster-bootstrap) and how to go on: the
+/// key back or `kubeconfig --refresh`, then the same command again, which finds the server
+/// instead of creating another.
+fn age_key_missing_help_after(target: &str, after: Option<ProvisionedBy>) -> String {
+    let Some(by) = after else {
+        return age_key_missing_help(Some(target));
+    };
+    let (stopped, again, goes_on) = match by {
+        ProvisionedBy::Up => (
+            "`apprafter up`",
+            format!("run `apprafter up --target {target}` again"),
+            "cluster-bootstrap",
+        ),
+        ProvisionedBy::RestoreReprovision => (
+            "`apprafter restore --reprovision`",
+            format!(
+                "run the same `apprafter restore` command again (the same repository and \
+                 options, with `--reprovision --target {target}`)"
+            ),
+            "cluster-bootstrap and the restore",
+        ),
+    };
+    format!(
+        "{stopped} stopped after provisioning: the server of target `{target}` exists, and \
+         Hetzner bills for it, but cluster-bootstrap did not run. To go on, restore the age key \
+         file the cache was encrypted with, or set `APPRAFTER_AGE_KEY` to where it is. If the key \
+         is lost, `apprafter kubeconfig --refresh --target {target}` fetches the kubeconfig from \
+         the node over SSH and caches it under a new key; it lists what the new key cannot read \
+         and asks first, and the node may need a few minutes after provisioning before it \
+         answers. Then {again}: it finds the server it provisioned instead of creating another, \
+         and goes on with {goes_on}."
+    )
+}
+
 /// `CacheUndecryptable`'s help: the key it was cached under, or the command that fetches it
 /// again under the key there is now, for `target`, whichever target is active.
 fn cache_undecryptable_help(secret: &crate::secrets::CachedSecret, target: &str) -> String {
@@ -734,9 +780,15 @@ pub enum CliError {
     #[error("no age key at {path}; the cached secrets cannot be decrypted")]
     #[diagnostic(
         code(apprafter::secrets::age_key_missing),
-        help("{}", age_key_missing_help(Some(target)))
+        help("{}", age_key_missing_help_after(target, *after_provision))
     )]
-    AgeKeyMissing { path: String, target: String },
+    AgeKeyMissing {
+        path: String,
+        target: String,
+        /// Set when `up` or `restore --reprovision` provisioned the server and then stopped on
+        /// the key (review #6): the help says what that leaves and how to go on.
+        after_provision: Option<ProvisionedBy>,
+    },
 
     /// A cached secret the age key at `path` cannot decrypt: it was cached under another key,
     /// or the ciphertext is damaged. `detail` is the age library's own account.
@@ -1546,6 +1598,7 @@ mod tests {
         let err = CliError::AgeKeyMissing {
             path: "/k/age.key".into(),
             target: "prod".into(),
+            after_provision: None,
         };
         assert_eq!(code_of(&err), "apprafter::secrets::age_key_missing");
         assert_eq!(
@@ -1567,6 +1620,51 @@ mod tests {
             "{}",
             age_key_missing_help(None)
         );
+    }
+
+    /// WI-457 review #6: after `up` or `restore --reprovision` provisioned the server, the help
+    /// says the server exists and bills, that cluster-bootstrap did not run, and how to go on:
+    /// the key back or `kubeconfig --refresh`, then the command that stopped, again. The message
+    /// and the code stay the core's.
+    #[test]
+    fn a_missing_age_key_after_a_provision_says_what_it_left_and_how_to_go_on() {
+        let after = |by| CliError::AgeKeyMissing {
+            path: "/k/age.key".into(),
+            target: "prod".into(),
+            after_provision: Some(by),
+        };
+        for (by, stopped, again) in [
+            (
+                ProvisionedBy::Up,
+                "`apprafter up` stopped after provisioning",
+                "Then run `apprafter up --target prod` again",
+            ),
+            (
+                ProvisionedBy::RestoreReprovision,
+                "`apprafter restore --reprovision` stopped after provisioning",
+                "Then run the same `apprafter restore` command again (the same repository and \
+                 options, with `--reprovision --target prod`)",
+            ),
+        ] {
+            let err = after(by);
+            assert_eq!(code_of(&err), "apprafter::secrets::age_key_missing");
+            assert_eq!(
+                err.to_string(),
+                "no age key at /k/age.key; the cached secrets cannot be decrypted"
+            );
+            let help = help_of(&err);
+            for part in [
+                stopped,
+                "the server of target `prod` exists, and Hetzner bills for it",
+                "cluster-bootstrap did not run",
+                "`APPRAFTER_AGE_KEY`",
+                "`apprafter kubeconfig --refresh --target prod`",
+                again,
+                "it finds the server it provisioned instead of creating another",
+            ] {
+                assert!(help.contains(part), "{by:?}: {part:?} missing: {help}");
+            }
+        }
     }
 
     /// WI-457: a cached secret the key there cannot open names the command that fetches that

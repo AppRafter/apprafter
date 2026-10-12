@@ -739,7 +739,12 @@ pub fn run_restore(
                     "→ --reprovision: provisioning a fresh cluster in target '{}' before replay",
                     target.unwrap_or("<active>")
                 );
-                crate::commands::bootstrap_all::run(target, false, server_type)?;
+                crate::commands::bootstrap_all::run(
+                    target,
+                    false,
+                    server_type,
+                    cli_core::ProvisionedBy::RestoreReprovision,
+                )?;
                 kc = Some(ensure_kubeconfig_tempfile_for_target(target)?);
                 return Ok(());
             }
@@ -3859,7 +3864,7 @@ mod tests {
     //
     // The reprovision flow:
     //   restore --reprovision
-    //     → bootstrap_all::run(target, false, server_type)
+    //     → bootstrap_all::run(target, false, server_type, RestoreReprovision)
     //     → apply::run(target_override, server_type)
     //     → resolve_precedence(flag, manifest, state, target, env)
     //     → None (when all rungs absent) → ServerTypeNotSelected

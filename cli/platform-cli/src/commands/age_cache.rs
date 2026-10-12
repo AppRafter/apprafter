@@ -28,6 +28,7 @@ pub(crate) fn missing(target: &str, key_path: &Path) -> CliError {
     CliError::AgeKeyMissing {
         path: key_path.display().to_string(),
         target: target.to_string(),
+        after_provision: None,
     }
 }
 
@@ -257,7 +258,7 @@ mod tests {
         let key = dir.path().join("cfg/age.key");
         let err = cached_kubeconfig(&hetzner(Some("armored"), None), "prod", &key).unwrap_err();
         assert!(
-            matches!(&err, CliError::AgeKeyMissing { path, target }
+            matches!(&err, CliError::AgeKeyMissing { path, target, after_provision: None }
                 if *path == key.display().to_string() && target == "prod"),
             "{err:?}"
         );

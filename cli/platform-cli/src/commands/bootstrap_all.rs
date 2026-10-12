@@ -26,7 +26,7 @@ use cli_core::target::{
     default_config_root, load_active_target_config, resolve_active_target_name, TargetConfig,
     TargetStorePaths,
 };
-use cli_core::{CliError, Result};
+use cli_core::{CliError, ProvisionedBy, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use tracing::{info, warn};
 
@@ -42,7 +42,14 @@ const KUBECONFIG_POLL_TIMEOUT: Duration = Duration::from_secs(300);
 /// SSH with reconnects.
 const KUBECONFIG_POLL_INTERVAL: Duration = Duration::from_secs(10);
 
-pub fn run(target_override: Option<&str>, dry_run: bool, server_type: Option<&str>) -> Result<()> {
+/// `by` is the command running it, `up` itself or `restore --reprovision`: the one a stop on a
+/// lost age key after phase 1 tells the user to run again (review #6).
+pub fn run(
+    target_override: Option<&str>,
+    dry_run: bool,
+    server_type: Option<&str>,
+    by: ProvisionedBy,
+) -> Result<()> {
     info!(target_override, dry_run, "bootstrap-all invoked");
     let total_start = Instant::now();
 
@@ -84,7 +91,7 @@ pub fn run(target_override: Option<&str>, dry_run: bool, server_type: Option<&st
     // Phase 2/3 — kubeconfig poll. Our retry loop, no inner
     // subcommand output, so we get a clean indicatif spinner with
     // a live attempt counter + truncated last error.
-    let p2 = run_kubeconfig_phase(target_override)?;
+    let p2 = run_kubeconfig_phase(target_override, by)?;
 
     // Phase 3/3 — cluster-bootstrap. Same rationale as phase 1:
     // helm/kubectl print release notes, would clobber a spinner.
@@ -132,7 +139,7 @@ fn failed(num: u8, name: &str, elapsed: Duration, err: CliError) -> CliError {
     err
 }
 
-fn run_kubeconfig_phase(target_override: Option<&str>) -> Result<Duration> {
+fn run_kubeconfig_phase(target_override: Option<&str>, by: ProvisionedBy) -> Result<Duration> {
     let pb = ProgressBar::new_spinner();
     pb.set_style(
         ProgressStyle::with_template("{spinner:.cyan} [2/3] k3s-ready    {wide_msg}")
@@ -155,8 +162,23 @@ fn run_kubeconfig_phase(target_override: Option<&str>) -> Result<Duration> {
         Err(e) => {
             let elapsed = start.elapsed();
             pb.finish_and_clear();
-            Err(failed(2, "k3s-ready", elapsed, e))
+            Err(failed(2, "k3s-ready", elapsed, after_provision(e, by)))
         }
+    }
+}
+
+/// Phase 2's error once phase 1 has provisioned: a lost age key says what that leaves (a
+/// server that bills, no cluster-bootstrap) and that `by` is the command to run again, once
+/// the key is back or `kubeconfig --refresh` has made a new one (review #6). Any other error
+/// is unchanged.
+fn after_provision(err: CliError, by: ProvisionedBy) -> CliError {
+    match err {
+        CliError::AgeKeyMissing { path, target, .. } => CliError::AgeKeyMissing {
+            path,
+            target,
+            after_provision: Some(by),
+        },
+        other => other,
     }
 }
 
@@ -437,6 +459,7 @@ mod tests {
             Err(CliError::AgeKeyMissing {
                 path: "/k/age.key".into(),
                 target: "prod".into(),
+                after_provision: None,
             })
         };
         let err = poll_kubeconfig(
@@ -449,6 +472,32 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, CliError::AgeKeyMissing { .. }), "{err:?}");
         assert_eq!(calls, 1);
+    }
+
+    /// Review #6: phase 2's lost key names the command that provisioned, so its help says what
+    /// is left and what to run again; any other error passes through as it was.
+    #[test]
+    fn a_lost_age_key_after_phase_1_names_the_command_to_run_again() {
+        for by in [ProvisionedBy::Up, ProvisionedBy::RestoreReprovision] {
+            let err = after_provision(
+                CliError::AgeKeyMissing {
+                    path: "/k/age.key".into(),
+                    target: "prod".into(),
+                    after_provision: None,
+                },
+                by,
+            );
+            assert!(
+                matches!(&err, CliError::AgeKeyMissing { path, target, after_provision }
+                    if path == "/k/age.key" && target == "prod" && *after_provision == Some(by)),
+                "{err:?}"
+            );
+        }
+        let other = after_provision(CliError::Other("ssh: refused".into()), ProvisionedBy::Up);
+        assert!(
+            matches!(&other, CliError::Other(m) if m == "ssh: refused"),
+            "{other:?}"
+        );
     }
 
     #[test]
