@@ -2216,32 +2216,41 @@ fn run_at_a_terminal(mut cmd: std::process::Command, prompt: &str, keys: &[u8]) 
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    // posix_openpt, not openpty: it is in every libc without -lutil.
-    // SAFETY: plain libc calls on fds this function owns; `ptsname`'s static buffer is copied
-    // before anything else runs on this thread.
-    let (master, slave) = unsafe {
-        let m = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
-        assert!(m >= 0, "posix_openpt: {}", std::io::Error::last_os_error());
-        assert_eq!(libc::grantpt(m), 0, "grantpt");
-        assert_eq!(libc::unlockpt(m), 0, "unlockpt");
-        let name = libc::ptsname(m);
-        assert!(!name.is_null(), "ptsname");
-        let name = std::ffi::CStr::from_ptr(name).to_owned();
-        let ws = libc::winsize {
-            ws_row: 24,
-            ws_col: 100,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
-        assert_eq!(libc::ioctl(m, libc::TIOCSWINSZ, &ws), 0, "TIOCSWINSZ");
-        let s = libc::open(name.as_ptr(), libc::O_RDWR | libc::O_NOCTTY);
-        assert!(
-            s >= 0,
-            "open the slave: {}",
-            std::io::Error::last_os_error()
-        );
-        (OwnedFd::from_raw_fd(m), OwnedFd::from_raw_fd(s))
+    // `openpty` opens both sides and sets the size on the open slave, on Linux (glibc, musl) and
+    // macOS alike. Setting it by hand with TIOCSWINSZ on the master before the slave is open
+    // works on Linux only: macOS fails that ioctl (-1), which is how this helper first broke
+    // the macOS CI. `openpty` is in libc on glibc >= 2.34, musl and macOS, and std already links
+    // libutil on older glibc. The two platforms declare the pointers `*const` (Linux) and
+    // `*mut` (macOS): a `*mut` fits both (`&mut ws` would trip clippy's unnecessary_mut_passed
+    // on Linux).
+    let mut ws = libc::winsize {
+        ws_row: 24,
+        ws_col: 100,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
     };
+    let (mut m, mut s) = (-1, -1);
+    // SAFETY: `openpty` writes two fds into `m` and `s` and reads `ws`; nothing else is passed.
+    let opened = unsafe {
+        libc::openpty(
+            &mut m,
+            &mut s,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &raw mut ws,
+        )
+    };
+    assert_eq!(opened, 0, "openpty: {}", std::io::Error::last_os_error());
+    // Neither fd may leak into a child another test spawns meanwhile: a leaked slave would keep
+    // the terminal open after this child exits. `Stdio` dups the slave onto the child's own
+    // fds, which clears the flag there.
+    for fd in [m, s] {
+        // SAFETY: fcntl on an fd `openpty` just returned.
+        let set = unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+        assert_eq!(set, 0, "FD_CLOEXEC: {}", std::io::Error::last_os_error());
+    }
+    // SAFETY: both fds came from `openpty` and are owned here alone.
+    let (master, slave) = unsafe { (OwnedFd::from_raw_fd(m), OwnedFd::from_raw_fd(s)) };
     let mut child = cmd
         .stdin(Stdio::from(slave.try_clone().expect("dup slave")))
         .stderr(Stdio::from(slave))
