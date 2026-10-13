@@ -19,10 +19,11 @@
 //! - in test code (any file under a `tests/` directory): `current_exe`, and the controls the
 //!   spawn point owns — `env_clear`, `pre_exec`, `creation_flags`;
 //! - the spawn point's opt-ins — `with_startup_checks`, `sharing_console`, `std_at_terminal`,
-//!   `probe_program`, `probe_program_at_terminal` — `without_env` / `env_remove` of `HOME`,
-//!   `APPRAFTER_CONFIG_DIR`, `XDG_RUNTIME_DIR` or `APPRAFTER_SANDBOX`, and `with_env` / `env` of
-//!   `APPRAFTER_SANDBOX` (the fence dropped or redrawn); the fence's variable counts whether the
-//!   call spells it or names the constant `SANDBOX_ENV` (bare or by path);
+//!   `probe_program`, `probe_program_at_terminal`, `in_session` — `without_env` / `env_remove`
+//!   of `HOME`, `APPRAFTER_CONFIG_DIR`, `XDG_RUNTIME_DIR` or `APPRAFTER_SANDBOX`, and
+//!   `with_env` / `env` of `APPRAFTER_SANDBOX` (the fence dropped or redrawn); the fence's
+//!   variable counts whether the call spells it or names the constant `SANDBOX_ENV` (bare or
+//!   by path);
 //!
 //! unless [`ALLOWED`] names the file, the function (or `const`) and the rule, each with its reason.
 //! Every entry must name a function that exists in its file
@@ -58,6 +59,8 @@ enum Rule {
     AtTerminal,
     /// `Spawn::probe_program`, `Spawn::probe_program_at_terminal`.
     ProbeProgram,
+    /// `Spawn::in_session`.
+    InSession,
     /// `without_env` / `env_remove` of a variable the fence relies on.
     RemovesFence,
     /// `with_env` / `env` of `APPRAFTER_SANDBOX`: the fence redrawn.
@@ -235,6 +238,28 @@ const ALLOWED: &[(&str, &str, Rule)] = &[
         "a_root_that_is_relative_or_missing_is_refused",
         Rule::SetsFence,
     ),
+    // The holder's tests run each "terminal" as a session of its own (D.4a T3, T52).
+    (
+        "platform-cli/tests/holder_unix.rs",
+        "session",
+        Rule::InSession,
+    ),
+    (
+        "platform-cli/tests/holder_unix.rs",
+        "start",
+        Rule::InSession,
+    ),
+    (
+        "platform-cli/tests/holder_unix.rs",
+        "a_holder_without_an_init_frame_writes_nothing",
+        Rule::InSession,
+    ),
+    // `__holder` typed at a terminal (T47): the forced condition is the terminal.
+    (
+        "platform-cli/tests/holder_unix.rs",
+        "the_holder_refuses_a_terminal",
+        Rule::AtTerminal,
+    ),
 ];
 
 /// One rule broken at one line.
@@ -345,6 +370,7 @@ fn ident_rule(
         "sharing_console" => Rule::SharingConsole,
         "std_at_terminal" => Rule::AtTerminal,
         "probe_program" | "probe_program_at_terminal" => Rule::ProbeProgram,
+        "in_session" => Rule::InSession,
         "without_env" | "env_remove" => {
             return first_string_arg(tokens.get(i + 1))
                 .filter(|v| FENCED_VARS.contains(&v.as_str()))

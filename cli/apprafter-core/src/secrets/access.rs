@@ -96,6 +96,9 @@ pub struct KeySession {
     key: Arc<DataKey>,
     vault_id: VaultId,
     root: PathBuf,
+    /// The store whose vault alone this session opens ([`KeySession::for_store`]); `None`: the
+    /// caller read the vault through the secret store, which checked it (`locked::read_vault`).
+    store_id: Option<String>,
 }
 
 impl KeySession {
@@ -105,6 +108,23 @@ impl KeySession {
             key,
             vault_id,
             root,
+            store_id: None,
+        }
+    }
+
+    /// As [`KeySession::new`], for the store `store_id` only: a vault whose header names another
+    /// store is `vault_unreadable{other_store}`, checked before anything is opened (D.4a T50). A
+    /// terminal's holder reads no vault through the secret store, so it asks the core for this
+    /// check rather than parsing the vault itself.
+    pub fn for_store(
+        key: Arc<DataKey>,
+        vault_id: VaultId,
+        root: PathBuf,
+        store_id: String,
+    ) -> Self {
+        KeySession {
+            store_id: Some(store_id),
+            ..KeySession::new(key, vault_id, root)
         }
     }
 
@@ -116,7 +136,12 @@ impl KeySession {
     /// `vault`, authenticated with this key.
     pub(super) fn open(&self, vault: &[u8]) -> cli_core::Result<UnlockedVault> {
         VaultFile::parse(vault)
-            .and_then(|parsed| parsed.open_with_key(&self.key, self.vault_id))
+            .and_then(|parsed| {
+                if let Some(id) = &self.store_id {
+                    parsed.header().check_store_id(id)?;
+                }
+                parsed.open_with_key(&self.key, self.vault_id)
+            })
             .map_err(|e| vault_error(&self.root, e))
     }
 

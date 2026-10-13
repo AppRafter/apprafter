@@ -1626,3 +1626,39 @@ fn a_replaced_key_drops_the_other_cache_it_cannot_open() {
         );
     }
 }
+
+/// D.4a T50 (d4a-e): a key session for one store refuses a vault whose header names another
+/// store, before it opens anything, as `vault_unreadable{other_store}` — what a terminal's
+/// holder needs, since it reads no vault through the secret store; a session for no store, and
+/// one for this store, open it.
+#[test]
+fn a_key_session_for_a_store_refuses_another_stores_vault() {
+    let dir = tempfile::tempdir().unwrap();
+    let locked = locked_store(dir.path(), &[("prod", Some(TOKEN_A))]);
+    let vault = std::fs::read(dir.path().join(VAULT_FILE)).unwrap();
+    let key = || Arc::new(DataKey::from_bytes(locked.data_key().expose()));
+    let root = dir.path().to_path_buf();
+    let any = KeySession::new(key(), locked.vault_id, root.clone());
+    assert_eq!(
+        any.hetzner_token(&vault, "prod").unwrap().unwrap().expose(),
+        TOKEN_A
+    );
+    let own = KeySession::for_store(
+        key(),
+        locked.vault_id,
+        root.clone(),
+        locked.store_id.to_string(),
+    );
+    assert_eq!(
+        own.hetzner_token(&vault, "prod").unwrap().unwrap().expose(),
+        TOKEN_A
+    );
+    let other = KeySession::for_store(key(), locked.vault_id, root, OTHER.to_string());
+    match other.hetzner_token(&vault, "prod") {
+        Err(CliError::VaultUnreadable {
+            problem: VaultProblem::OtherStore,
+            ..
+        }) => {}
+        other => panic!("{other:?}"),
+    }
+}

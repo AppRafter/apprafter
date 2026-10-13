@@ -26,7 +26,9 @@
 //! tests (GOTCHA-179). A test that needs a terminal gives the child its own pseudo-terminal
 //! ([`Spawn::std_at_terminal`]); the Windows Ctrl-Break test shares the console
 //! ([`Spawn::sharing_console`]); the spawn point's self-tests run other programs under the same
-//! rules ([`Spawn::probe_program`]). Each opt-in is allow-listed in `tests/spawn_guard.rs`.
+//! rules ([`Spawn::probe_program`]). Holder and window tests run a session of their own
+//! ([`Spawn::in_session`]); a holder one of them leaves behind fails it when the `Spawn` drops.
+//! Each opt-in is allow-listed in `tests/spawn_guard.rs`.
 //!
 //! Keep the `Spawn` alive while its commands run: bind it (`let sp = Spawn::new();`) and let a
 //! helper build its command from a `&Spawn` it is given, never from one it makes and drops — the
@@ -296,6 +298,24 @@ impl Spawn {
         self.command(program.as_os_str(), args, Terminal::Pty(slave))
     }
 
+    /// `/bin/sh -c <script>` as the leader of a session of its own; `$1` in the script is this
+    /// Spawn's binary, `$2` the running test binary (whose inner tests act as commands). Every
+    /// command the script runs is a member of that session, as a person's terminal's commands
+    /// are, so a holder one of them starts outlives it and ends with the shell (D.4a T3, T52).
+    /// With `slave`, a pseudo-terminal is the session's controlling terminal and the shell's
+    /// stdin and stderr. Holder and window tests only (G1).
+    #[cfg(unix)]
+    pub fn in_session(&self, script: &str, slave: Option<OwnedFd>) -> StdCommand {
+        let terminal = match slave {
+            Some(slave) => Terminal::Pty(slave),
+            None => Terminal::None,
+        };
+        let mut c = self.command(OsStr::new("/bin/sh"), &["-c", script, "sh"], terminal);
+        c.arg(self.bin.path())
+            .arg(std::env::current_exe().expect("this test binary"));
+        c
+    }
+
     /// `text` with every spelling of the root (as made, and canonical: macOS `/tmp` is
     /// `/private/tmp`) replaced by `<SANDBOX>`, longest first, so two runs compare.
     pub fn mask_root(&self, text: &str) -> String {
@@ -421,6 +441,65 @@ impl Spawn {
         let roots =
             std::iter::once(self.root().to_path_buf()).chain(self.extra_roots.iter().cloned());
         std::env::join_paths(roots).expect("the sandbox roots join as a path list")
+    }
+}
+
+/// No holder outlives its test (D.4a G8): a holder records its pid in its lock file
+/// (`<runtime dir>/apprafter/h-<id>.lock`, or `<store>/run` without `XDG_RUNTIME_DIR`); one whose
+/// lock is still held when the test's `Spawn` drops is killed, and the test fails naming it.
+#[cfg(unix)]
+impl Drop for Spawn {
+    fn drop(&mut self) {
+        let leaked = self.reap_holders();
+        if !leaked.is_empty() && !std::thread::panicking() {
+            panic!(
+                "a holder outlived its test (pid {leaked:?}): end it (`End`, or its session's \
+                 end) before the test returns"
+            );
+        }
+    }
+}
+
+impl Spawn {
+    /// Kill every holder still holding a lock file under this root; their pids.
+    #[cfg(unix)]
+    fn reap_holders(&self) -> Vec<i32> {
+        use std::os::fd::AsRawFd;
+        let mut leaked = Vec::new();
+        for dir in [self.path("run").join("apprafter"), self.store().join("run")] {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if !(name.starts_with("h-") && name.ends_with(".lock")) {
+                    continue;
+                }
+                let Ok(f) = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&path)
+                else {
+                    continue;
+                };
+                // SAFETY: flock on a file this function opened; released when it closes.
+                if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                    continue;
+                }
+                let pid = std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<i32>().ok())
+                    .filter(|p| *p > 0);
+                if let Some(pid) = pid {
+                    // SAFETY: SIGKILL to the holder this root's lock file names.
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                    leaked.push(pid);
+                }
+            }
+        }
+        leaked
     }
 }
 

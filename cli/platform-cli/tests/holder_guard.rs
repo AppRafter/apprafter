@@ -223,6 +223,106 @@ fn hg5_only_the_codec_names_the_secret_bearing_kinds() {
     );
 }
 
+/// HG2 (T47): `HOLDER_ARG` is named only where it is defined, where the holder is spawned and
+/// where `main` dispatches on it; `run_holder` only where it is defined and in `main`; the
+/// literal `__holder` only in the definition; `current_exe` beside `HOLDER_ARG` only in the
+/// spawn — one way in, one way to start a holder.
+const ARG_FILES: [&str; 3] = [
+    "platform-cli/src/holder/mod.rs",
+    "platform-cli/src/holder/spawn.rs",
+    "platform-cli/src/main.rs",
+];
+const RUN_FILES: [&str; 2] = ["platform-cli/src/holder/mod.rs", "platform-cli/src/main.rs"];
+const SPAWN_FILE: &str = "platform-cli/src/holder/spawn.rs";
+
+fn hg2_hits(file: &str, src: &str) -> Vec<String> {
+    let s = seen(src);
+    let names = |n: &str| s.iter().any(|x| !x.literal && x.text == n);
+    let mut hits = Vec::new();
+    for x in &s {
+        if !x.literal && x.text == "HOLDER_ARG" && !ARG_FILES.contains(&file) {
+            hits.push(format!("{file}:{}: HOLDER_ARG", x.line));
+        }
+        if !x.literal && x.text == "run_holder" && !RUN_FILES.contains(&file) {
+            hits.push(format!("{file}:{}: run_holder", x.line));
+        }
+        if x.literal && x.text.contains("__holder") && file != "platform-cli/src/holder/mod.rs" {
+            hits.push(format!("{file}:{}: the literal {}", x.line, x.text));
+        }
+    }
+    if names("current_exe") && names("HOLDER_ARG") && file != SPAWN_FILE {
+        hits.push(format!("{file}: current_exe beside HOLDER_ARG"));
+    }
+    hits
+}
+
+#[test]
+fn hg2_one_way_in_and_one_way_to_start_a_holder() {
+    let files = sources(&cli_dir().join("platform-cli/src"));
+    let src = |f: &str| {
+        seen(
+            &files
+                .iter()
+                .find(|(p, _)| p == f)
+                .unwrap_or_else(|| panic!("{f} exists"))
+                .1,
+        )
+    };
+    let main = src("platform-cli/src/main.rs");
+    assert!(
+        main.iter().any(|x| x.text == "HOLDER_ARG") && main.iter().any(|x| x.text == "run_holder"),
+        "main dispatches on HOLDER_ARG"
+    );
+    let spawn = src(SPAWN_FILE);
+    assert!(
+        spawn.iter().any(|x| x.text == "current_exe")
+            && spawn.iter().any(|x| x.text == "HOLDER_ARG"),
+        "the spawn starts this binary as the holder"
+    );
+    let hits: Vec<String> = files.iter().flat_map(|(f, s)| hg2_hits(f, s)).collect();
+    assert!(
+        hits.is_empty(),
+        "a second way into or out to the holder (D.4a HG2):\n{}",
+        hits.join("\n")
+    );
+}
+
+#[test]
+fn hg2_sees_a_second_spawn_and_a_second_dispatch() {
+    assert_eq!(
+        hg2_hits(
+            "platform-cli/src/x.rs",
+            "fn f() { let _ = (std::env::current_exe(), HOLDER_ARG); }"
+        )
+        .len(),
+        2
+    );
+    assert_eq!(
+        hg2_hits("platform-cli/src/y.rs", r#"fn g() { h("__holder") }"#).len(),
+        1
+    );
+    // A message that spells the argument, inside a macro, outside `holder/mod.rs`: the
+    // servers print `NOT_A_COMMAND` instead (critic-d4a-e finding 2).
+    assert_eq!(
+        hg2_hits(
+            "platform-cli/src/holder/server/unix.rs",
+            r#"fn run() { eprintln!("error: `__holder` is not a command") }"#
+        )
+        .len(),
+        1
+    );
+    assert!(hg2_hits(
+        "platform-cli/src/holder/server/unix.rs",
+        r#"fn run() { eprintln!("{}", crate::holder::NOT_A_COMMAND) }"#
+    )
+    .is_empty());
+    assert!(hg2_hits(
+        "platform-cli/src/main.rs",
+        "fn main() { if a == HOLDER_ARG { run_holder() } }"
+    )
+    .is_empty());
+}
+
 /// The scanner itself, on a source of its own.
 #[test]
 fn the_scanner_sees_aliases_paths_and_enclosing_functions() {

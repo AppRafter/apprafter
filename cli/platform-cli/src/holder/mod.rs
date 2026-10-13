@@ -8,9 +8,36 @@
 //! it (T48).
 
 pub mod binding;
+#[cfg(unix)]
+pub mod client;
 pub mod endpoint;
 pub mod harden;
 pub mod memory;
 pub(crate) mod os;
 pub mod protocol;
+// Its only caller is the server: on Windows it waits for Task 7 (dead code under `-D warnings`).
+#[cfg(unix)]
+pub(crate) mod serve;
+#[cfg(unix)]
+mod server;
+#[cfg(unix)]
+pub mod spawn;
+pub mod watch;
 pub mod window;
+
+/// The argument that makes this binary a holder: matched in `main` before `apprafter::run()` —
+/// no clap parse, no startup checks, no logging, nothing docsgen projects (T47; HG2).
+pub const HOLDER_ARG: &str = "__holder";
+
+/// What a holder started at a terminal says before it exits 2 (T47). Spelled here, beside
+/// [`HOLDER_ARG`], because HG2 allows the text `__holder` in this file only: each OS's server
+/// prints this constant and names neither (critic-d4a-e finding 2).
+#[cfg(unix)]
+pub(crate) const NOT_A_COMMAND: &str =
+    "error: `__holder` is not a command: apprafter starts it itself";
+
+/// The holder process. Never returns.
+#[cfg(unix)]
+pub fn run_holder() -> ! {
+    std::process::exit(server::run())
+}
