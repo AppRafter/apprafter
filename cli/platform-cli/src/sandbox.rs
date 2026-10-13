@@ -141,8 +141,7 @@ fn roots(value: &OsStr) -> miette::Result<Vec<PathBuf>> {
 fn locations(ctx: &Context) -> miette::Result<Vec<(Location, PathBuf)>> {
     let mut out = vec![(Location::ConfigRoot, ctx.config_root().to_path_buf())];
     // The resolvers the commands outside the core still call read the same variables; a drift
-    // between the two would itself be an escape. (d4a-b deletes `default_age_key_path` and its
-    // line here.)
+    // between the two would itself be an escape.
     out.push((
         Location::ConfigRoot,
         cli_core::target::default_config_root().map_err(miette::Report::new)?,
@@ -160,7 +159,6 @@ fn locations(ctx: &Context) -> miette::Result<Vec<(Location, PathBuf)>> {
         }
     }
     out.push((Location::AgeKey, ctx.age_key_path().to_path_buf()));
-    out.push((Location::AgeKey, cli_core::secrets::default_age_key_path()));
     out.push((
         Location::SshIdentity,
         cli_providers::hetzner_cloud::default_ssh_identity_path(),

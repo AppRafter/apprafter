@@ -3,13 +3,9 @@
 //! over SSH on first use and caching the result in state.
 
 use std::io::IsTerminal;
-use std::path::Path;
 
-use cli_core::secrets::{
-    decrypt_with_identity, default_age_key_path, encrypt_for_recipient, load_identity,
-    load_or_create_identity_reporting,
-};
-use cli_core::target::TargetStorePaths;
+use apprafter_core::Context;
+use cli_core::secrets::{encrypt_for_recipient, load_or_create_identity_reporting, CachedSecret};
 use cli_core::{CliError, Result};
 use cli_providers::hetzner_cloud::{
     default_ssh_identity_path, rewrite_server_url, HetznerCloudClient, KubeconfigFetcher,
@@ -78,12 +74,11 @@ fn fetch_and_cache_outcome(
     // `resolve_state_paths` is no-cost after the first iteration —
     // the legacy file has already been moved.
     let resolved = resolve_state_paths(target_override)?;
-    let key_path = default_age_key_path();
+    let ctx = crate::context::legacy_context()?;
     let site = CacheSite {
         paths: &resolved.paths,
-        store: &resolved.store,
+        ctx: &ctx,
         target: &resolved.target_name,
-        key_path: &key_path,
     };
     let mut on_lost_key = |lost: &LostKey| answer_lost_key(policy, lost, &mut ask_at_terminal);
     // Cold path or --refresh: SSH-fetch from the live server. The token
@@ -154,12 +149,13 @@ fn prompt_answer(
     }
 }
 
-/// Where a target's kubeconfig is cached, and the age key it is cached under.
+/// Where a target's kubeconfig is cached, and the context whose secret store reads and caches
+/// it: a first use or an agreed replacement creates the shared age key at
+/// `ctx.age_key_path()`.
 pub(crate) struct CacheSite<'a> {
     pub paths: &'a StatePaths,
-    pub store: &'a TargetStorePaths,
+    pub ctx: &'a Context,
     pub target: &'a str,
-    pub key_path: &'a Path,
 }
 
 /// The kubeconfig of `site.target`: the cached copy, or (cold, or `refresh`) a fresh one from
@@ -168,18 +164,21 @@ pub(crate) struct CacheSite<'a> {
 /// The cached copy is read only to be printed, never on the way to a refetch, so a lost or
 /// different key cannot stop `--refresh` (GOTCHA-121). Reading it never creates a key
 /// (GOTCHA-120). A refetch caches under the key there is; with none, a first use creates one,
-/// and a lost one ([`age_cache::held`] is not empty) is replaced only when `on_lost_key` agrees
+/// and a lost one (`SecretStore::held` is not empty) is replaced only when `on_lost_key` agrees
 /// (`Ok`) — before anything is fetched, so a refusal or a decline (its error) costs nothing.
 /// The key is created only after the node answered, so a failed fetch leaves none behind; a
 /// key that appeared meanwhile is used, never replaced. After a lost key, this target's Argo CD
 /// password is dropped when the key used cannot open it (it was cached under the lost one), so
-/// `argocd-password` fetches it again instead of failing on it.
+/// `argocd-password` fetches it again instead of failing on it. Every read, open and the
+/// recipient go through the core's secret store; only the key's creation is the CLI's.
 pub(crate) fn fetch_and_cache_at(
     site: &CacheSite<'_>,
     refresh: bool,
     on_lost_key: &mut dyn FnMut(&LostKey) -> Result<()>,
     fetch: &mut dyn FnMut(&HetznerCloudState) -> Result<String>,
 ) -> Result<Fetched> {
+    let secrets = site.ctx.secrets();
+    let key_path = site.ctx.age_key_path();
     let mut state = State::load_or_default(site.paths)?;
     let hetzner = state.hetzner_cloud.clone().ok_or_else(|| {
         CliError::Other(
@@ -189,22 +188,22 @@ pub(crate) fn fetch_and_cache_at(
 
     let cached = hetzner.kubeconfig_age.is_some() || hetzner.kubeconfig_yaml.is_some();
     if cached && !refresh {
-        let yaml = age_cache::cached_kubeconfig(&hetzner, site.target, site.key_path)?;
+        let yaml = age_cache::cached_kubeconfig(&secrets, &hetzner, site.target)?;
         return Ok(Fetched {
-            yaml,
+            yaml: yaml.as_str().to_owned(),
             new_key: None,
         });
     }
 
-    let lost = match load_identity(site.key_path)? {
-        Some(_) => None,
-        None => {
-            let held = age_cache::held(site.store)?;
+    let lost = match secrets.cache_key(site.target) {
+        Ok(_) => None,
+        Err(CliError::AgeKeyMissing { .. }) => {
+            let held = secrets.held()?;
             if held.is_empty() {
                 None
             } else {
                 let lost = LostKey {
-                    key_path: site.key_path.to_path_buf(),
+                    key_path: key_path.to_path_buf(),
                     target: site.target.to_string(),
                     held,
                 };
@@ -212,6 +211,7 @@ pub(crate) fn fetch_and_cache_at(
                 Some(lost)
             }
         }
+        Err(e) => return Err(e),
     };
 
     let yaml = fetch(&hetzner)?;
@@ -219,13 +219,19 @@ pub(crate) fn fetch_and_cache_at(
     // Encrypt before writing back; clear the legacy plaintext slot
     // so future runs go through the age path exclusively. The key is the one at the path NOW:
     // the check above was before the fetch, and a key may have appeared since (review #10).
-    let (identity, created) = load_or_create_identity_reporting(site.key_path)?;
-    let armored = encrypt_for_recipient(&yaml, &identity.to_public())?;
+    // A first use or an agreed replacement creates it here; the store then reads it.
+    let (_, created) = load_or_create_identity_reporting(key_path)?;
+    let key = secrets.cache_key(site.target)?;
+    let armored = encrypt_for_recipient(&yaml, &key.recipient()?)?;
     let mut updated = hetzner;
     updated.kubeconfig_yaml = None;
     updated.kubeconfig_age = Some(armored);
     if lost.is_some() {
-        let opens = |armored: &str| decrypt_with_identity(armored, &identity).is_ok();
+        let opens = |armored: &str| {
+            secrets
+                .open_cache(&key, CachedSecret::ArgocdPassword, site.target, armored)
+                .is_ok()
+        };
         if !updated
             .argocd_admin_password_age
             .as_deref()
@@ -282,7 +288,9 @@ fn resolve_public_ip(client: &HetznerCloudClient, server_id: u64) -> Result<Stri
 mod tests {
     use super::*;
     use age::x25519::Identity;
-    use cli_core::secrets::{load_or_create_identity, CachedSecret};
+    use cli_core::secrets::{decrypt_with_identity, load_identity, load_or_create_identity};
+    use cli_core::target::TargetStorePaths;
+    use std::path::Path;
 
     struct FakeFetcher {
         body: String,
@@ -321,9 +329,11 @@ mod tests {
     const FETCHED: &str = "apiVersion: v1\nfrom: node\n";
 
     /// A store under a tempdir: targets `prod` (whose kubeconfig is fetched) and any others the
-    /// test seeds, the age key at `<dir>/key/age.key` (absent until a test makes it).
+    /// test seeds, and a context whose age key is `<dir>/home/.config/apprafter/age.key`
+    /// (absent until a test makes it).
     struct World {
         _dir: tempfile::TempDir,
+        ctx: Context,
         store: TargetStorePaths,
         key: std::path::PathBuf,
     }
@@ -331,10 +341,13 @@ mod tests {
     impl World {
         fn new() -> Self {
             let dir = tempfile::tempdir().unwrap();
-            let store = TargetStorePaths::for_root(dir.path().join("store"));
-            let key = dir.path().join("key/age.key");
+            let ctx = Context::for_desktop(dir.path().join("store"), "http://127.0.0.1:1")
+                .with_home_dir(Some(dir.path().join("home")));
+            let store = ctx.store();
+            let key = ctx.age_key_path().to_path_buf();
             Self {
                 _dir: dir,
+                ctx,
                 store,
                 key,
             }
@@ -399,9 +412,8 @@ mod tests {
             let paths = self.paths("prod");
             let site = CacheSite {
                 paths: &paths,
-                store: &self.store,
+                ctx: &self.ctx,
                 target: "prod",
-                key_path: &self.key,
             };
             let mut asked = Vec::new();
             let mut answer = Some(answer);

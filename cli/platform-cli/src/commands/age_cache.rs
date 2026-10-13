@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
-//! The secrets a target's state caches age-encrypted — its kubeconfig and its Argo CD admin
-//! password — and the one age key they all open with (`APPRAFTER_AGE_KEY`).
+//! The CLI's side of the secrets a target's state caches age-encrypted — its kubeconfig and its
+//! Argo CD admin password: the prose that explains a lost age key ([`LostKey`]) and the check
+//! `up` makes before it provisions. Reading and opening the caches is the shared core's
+//! secret store (`Context::secrets()`, D.4a b); this module decrypts nothing.
 //!
 //! Two rules (WI-457):
 //!
@@ -10,18 +12,21 @@
 //!   [`CliError::AgeKeyMissing`], a key that does not open the cache is
 //!   [`CliError::CacheUndecryptable`]; each names the way back.
 //! - **A key is created only where it costs nothing, or after the user agreed.** Nothing cached
-//!   anywhere ([`held`] is empty) is a first use, and the first secret cached creates the key.
-//!   Anything cached means the key it was cached under is lost: only `apprafter kubeconfig`
-//!   creates a new one then, after listing what that leaves unreadable ([`LostKey`]) and asking.
+//!   anywhere (`SecretStore::held` is empty) is a first use, and the first secret cached creates
+//!   the key. Anything cached means the key it was cached under is lost: only `apprafter
+//!   kubeconfig` creates a new one then, after listing what that leaves unreadable
+//!   ([`LostKey`]) and asking.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use age::x25519::Identity;
-use cli_core::secrets::{decrypt_with_identity, load_identity, CachedSecret};
-use cli_core::target::{list_target_names, TargetStorePaths};
+use apprafter_core::secrets::SecretStore;
+use apprafter_core::Zeroizing;
+use cli_core::secrets::CachedSecret;
 use cli_core::{CliError, ProvisionStop, ProvisionedBy, Result};
-use cli_state::{HetznerCloudState, State, StatePaths};
+use cli_state::HetznerCloudState;
+
+pub(crate) use apprafter_core::secrets::{Held, Holding};
 
 /// The missing-key error for `target`'s cache.
 pub(crate) fn missing(target: &str, key_path: &Path) -> CliError {
@@ -32,92 +37,44 @@ pub(crate) fn missing(target: &str, key_path: &Path) -> CliError {
     }
 }
 
-/// The key at `key_path`, which a read needs: never created.
-pub(crate) fn key_for_read(target: &str, key_path: &Path) -> Result<Identity> {
-    load_identity(key_path)?.ok_or_else(|| missing(target, key_path))
-}
-
-/// Decrypt `armored`, `target`'s cached `secret`, with the key at `key_path`.
-pub(crate) fn decrypt(
-    armored: &str,
-    secret: CachedSecret,
-    target: &str,
-    key_path: &Path,
-) -> Result<String> {
-    let identity = key_for_read(target, key_path)?;
-    decrypt_with_identity(armored, &identity).map_err(|e| CliError::CacheUndecryptable {
-        secret,
-        target: target.to_string(),
-        path: key_path.display().to_string(),
-        detail: e.to_string(),
-    })
-}
-
-/// `target`'s cached kubeconfig, for a command that talks to its cluster.
-///
-/// PRECEDENCE IS LOAD-BEARING: the encrypted slot wins over the plaintext one. The plaintext
-/// slot is a legacy fallback that older states may still carry beside a freshly written
-/// encrypted one; preferring it would silently hand back a STALE kubeconfig for a cluster that
-/// has since been re-provisioned. Neither slot set is a hard error naming `apprafter
-/// kubeconfig`, never an empty config: an empty `KUBECONFIG` makes kubectl fall back to
-/// `~/.kube`.
+/// `target`'s cached kubeconfig, through the store, for a command that talks to its cluster.
+/// The encrypted slot wins over the plaintext one; a missing or wrong key is the store's typed
+/// error. Neither slot set is a hard error naming `apprafter kubeconfig`, never an empty
+/// config: an empty `KUBECONFIG` makes kubectl fall back to `~/.kube`.
 pub(crate) fn cached_kubeconfig(
+    secrets: &SecretStore,
     hetzner: &HetznerCloudState,
     target: &str,
-    key_path: &Path,
-) -> Result<String> {
-    match (
-        hetzner.kubeconfig_age.as_deref(),
-        hetzner.kubeconfig_yaml.as_deref(),
-    ) {
-        (Some(armored), _) => decrypt(armored, CachedSecret::Kubeconfig, target, key_path),
-        (None, Some(plain)) => Ok(plain.to_string()),
-        (None, None) => Err(CliError::Other(
+) -> Result<Zeroizing<String>> {
+    secrets.cached_kubeconfig(hetzner, target)?.ok_or_else(|| {
+        CliError::Other(
             "no cached kubeconfig in state; run `apprafter kubeconfig` first".to_string(),
-        )),
-    }
-}
-
-/// The key to cache a new secret of `target` under, for a command that never asks, WITHOUT
-/// creating it: the key at `key_path`, or `None` on a first use (nothing cached anywhere), where
-/// the caller creates the key once it has something to cache. With anything cached anywhere the
-/// key it was cached under is lost, and the refusal names `apprafter kubeconfig --refresh`, which
-/// asks. Settled before the secret is read, so a refusal costs no read (review #1).
-pub(crate) fn key_for_new_secret(
-    store: &TargetStorePaths,
-    target: &str,
-    key_path: &Path,
-) -> Result<Option<Identity>> {
-    if let Some(identity) = load_identity(key_path)? {
-        return Ok(Some(identity));
-    }
-    if !held(store)?.is_empty() {
-        return Err(missing(target, key_path));
-    }
-    Ok(None)
+        )
+    })
 }
 
 /// The check `up` and `restore --reprovision` make before they provision anything, for
 /// `target`. Their phase 2 caches the new kubeconfig and never replaces a lost key
-/// ([`key_for_new_secret`]'s rule), so a lost key would stop them only after a billable server
-/// was created. Here it stops them first, with nothing created. A key at `key_path` that does
-/// not load fails here as it would there. A first use (no key, nothing cached anywhere)
+/// (`SecretStore::cache_key_for_new_secret`'s rule), so a lost key would stop them only after
+/// a billable server was created. Here it stops them first, with nothing created. A key that
+/// does not load fails here as it would there. A first use (no key, nothing cached anywhere)
 /// passes: phase 2 creates the key.
 pub(crate) fn check_before_provisioning(
-    store: &TargetStorePaths,
+    secrets: &SecretStore,
     target: &str,
-    key_path: &Path,
     by: ProvisionedBy,
 ) -> Result<()> {
-    if load_identity(key_path)?.is_some() {
-        return Ok(());
-    }
-    let held = held(store)?;
+    let path = match secrets.cache_key(target) {
+        Ok(_) => return Ok(()),
+        Err(CliError::AgeKeyMissing { path, .. }) => path,
+        Err(e) => return Err(e),
+    };
+    let held = secrets.held()?;
     let Some(recover) = recovery_target(&held, target) else {
         return Ok(());
     };
     Err(CliError::AgeKeyMissing {
-        path: key_path.display().to_string(),
+        path,
         target: target.to_string(),
         stopped: Some(ProvisionStop::Before { by, recover }),
     })
@@ -137,55 +94,8 @@ fn recovery_target(held: &[Held], target: &str) -> Option<String> {
         .map(|h| h.target.clone())
 }
 
-/// One thing a target's state holds under the age key.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Held {
-    pub target: String,
-    pub what: Holding,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Holding {
-    Secret(CachedSecret),
-    /// A state that cannot be read, which may hold either: counted as if it did, so a key is
-    /// never created on the guess that it holds nothing.
-    Unreadable(String),
-}
-
-/// Everything the store's targets hold encrypted, by target name, the kubeconfig before the
-/// password. Read-only.
-pub(crate) fn held(store: &TargetStorePaths) -> Result<Vec<Held>> {
-    let mut out = Vec::new();
-    for target in list_target_names(store)? {
-        let paths = StatePaths::for_active_target(store, &target);
-        match State::load_or_default(&paths) {
-            Ok(state) => {
-                let Some(h) = state.hetzner_cloud else {
-                    continue;
-                };
-                for (slot, secret) in [
-                    (&h.kubeconfig_age, CachedSecret::Kubeconfig),
-                    (&h.argocd_admin_password_age, CachedSecret::ArgocdPassword),
-                ] {
-                    if slot.is_some() {
-                        out.push(Held {
-                            target: target.clone(),
-                            what: Holding::Secret(secret),
-                        });
-                    }
-                }
-            }
-            Err(e) => out.push(Held {
-                target,
-                what: Holding::Unreadable(e.to_string()),
-            }),
-        }
-    }
-    Ok(out)
-}
-
 /// A key that is gone while something is still cached under it: what creating a new one for
-/// `target`'s kubeconfig leaves unreadable. `held` comes from [`held`].
+/// `target`'s kubeconfig leaves unreadable. `held` comes from `SecretStore::held`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LostKey {
     pub key_path: PathBuf,
@@ -266,10 +176,15 @@ impl LostKey {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cli_core::secrets::{encrypt_for_recipient, load_or_create_identity};
+    use apprafter_core::Context;
+    use cli_core::secrets::load_or_create_identity;
+    use cli_core::target::TargetStorePaths;
+    use cli_state::StatePaths;
 
-    fn store(dir: &Path) -> TargetStorePaths {
-        TargetStorePaths::for_root(dir.to_path_buf())
+    /// A store at `<dir>/store` and a context over it whose age key lives under `<dir>/home`.
+    fn ctx_at(dir: &Path) -> Context {
+        Context::for_desktop(dir.join("store"), "http://127.0.0.1:1")
+            .with_home_dir(Some(dir.join("home")))
     }
 
     /// A target `name` in the store, with `state` (a `hetzner_cloud` object) when given.
@@ -292,141 +207,29 @@ mod tests {
         .unwrap()
     }
 
+    /// None cached is a hard error naming `apprafter kubeconfig`, never an empty config: an
+    /// empty `KUBECONFIG` makes kubectl fall back to `~/.kube`. A plaintext slot needs no key.
     #[test]
-    fn a_read_with_no_key_names_the_recovery_and_creates_no_key() {
+    fn no_cached_kubeconfig_names_the_remedy_and_plaintext_needs_no_key() {
         let dir = tempfile::tempdir().unwrap();
-        let key = dir.path().join("cfg/age.key");
-        let err = cached_kubeconfig(&hetzner(Some("armored"), None), "prod", &key).unwrap_err();
+        let ctx = ctx_at(dir.path());
+        let err = cached_kubeconfig(&ctx.secrets(), &hetzner(None, None), "p").unwrap_err();
         assert!(
-            matches!(&err, CliError::AgeKeyMissing { path, target, stopped: None }
-                if *path == key.display().to_string() && target == "prod"),
+            matches!(&err, CliError::Other(m)
+                if m == "no cached kubeconfig in state; run `apprafter kubeconfig` first"),
             "{err:?}"
         );
-        assert!(
-            !key.exists() && !key.parent().unwrap().exists(),
-            "a read never writes"
-        );
-    }
-
-    #[test]
-    fn a_key_that_does_not_open_the_cache_says_which_secret_and_whose() {
-        let dir = tempfile::tempdir().unwrap();
-        let key = dir.path().join("age.key");
-        load_or_create_identity(&key).unwrap();
-        let other = Identity::generate();
-        let armored = encrypt_for_recipient("apiVersion: v1\n", &other.to_public()).unwrap();
-        let err = cached_kubeconfig(&hetzner(Some(&armored), None), "prod", &key).unwrap_err();
-        assert!(
-            matches!(&err, CliError::CacheUndecryptable { secret: CachedSecret::Kubeconfig, target, .. }
-                if target == "prod"),
-            "{err:?}"
-        );
-        let err = decrypt(&armored, CachedSecret::ArgocdPassword, "prod", &key).unwrap_err();
-        assert!(
-            matches!(
-                &err,
-                CliError::CacheUndecryptable {
-                    secret: CachedSecret::ArgocdPassword,
-                    ..
-                }
-            ),
-            "{err:?}"
-        );
-    }
-
-    #[test]
-    fn the_encrypted_slot_wins_over_the_plaintext_one() {
-        let dir = tempfile::tempdir().unwrap();
-        let key = dir.path().join("age.key");
-        let id = load_or_create_identity(&key).unwrap();
-        let armored = encrypt_for_recipient("clusters: [current]\n", &id.to_public()).unwrap();
-        let picked = cached_kubeconfig(
-            &hetzner(Some(&armored), Some("clusters: [stale]\n")),
-            "prod",
-            &key,
-        )
-        .unwrap();
-        assert_eq!(picked, "clusters: [current]\n");
-    }
-
-    #[test]
-    fn plaintext_needs_no_key_and_no_slot_names_the_remedy() {
-        let dir = tempfile::tempdir().unwrap();
-        let key = dir.path().join("age.key");
-        let plain = cached_kubeconfig(&hetzner(None, Some("apiVersion: v1\n")), "p", &key).unwrap();
-        assert_eq!(plain, "apiVersion: v1\n");
-        let err = cached_kubeconfig(&hetzner(None, None), "p", &key).unwrap_err();
-        assert!(err.to_string().contains("apprafter kubeconfig"), "{err}");
-        assert!(!key.exists());
-    }
-
-    #[test]
-    fn held_lists_every_targets_ciphertexts_in_order_and_an_unreadable_state() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = store(dir.path());
-        seed(
-            &s,
-            "b",
-            Some(
-                r#"{"server_id":2,"server_name":"b","kubeconfig_age":"x","argocd_admin_password_age":"y"}"#,
-            ),
-        );
-        seed(
-            &s,
-            "a",
-            Some(r#"{"server_id":1,"server_name":"a","kubeconfig_yaml":"plain"}"#),
-        );
-        seed(&s, "c", None);
-        seed(&s, "d", Some("not json"));
-        let held = held(&s).unwrap();
-        let secret = |t: &str, s| Held {
-            target: t.into(),
-            what: Holding::Secret(s),
-        };
-        assert_eq!(held.len(), 3, "{held:?}");
-        assert_eq!(held[0], secret("b", CachedSecret::Kubeconfig));
-        assert_eq!(held[1], secret("b", CachedSecret::ArgocdPassword));
-        assert!(
-            matches!(&held[2], Held { target, what: Holding::Unreadable(_) } if target == "d"),
-            "{held:?}"
-        );
-    }
-
-    #[test]
-    fn a_first_use_has_no_key_yet_and_anything_cached_refuses_naming_the_recovery() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = store(dir.path());
-        seed(&s, "prod", Some(r#"{"server_id":1,"server_name":"p"}"#));
-        let key = dir.path().join("k/age.key");
-        assert!(
-            key_for_new_secret(&s, "prod", &key).unwrap().is_none(),
-            "a first use: the caller creates the key once it has something to cache"
-        );
-        assert!(!key.exists(), "never created here");
-        let made = load_or_create_identity(&key).unwrap();
         assert_eq!(
-            key_for_new_secret(&s, "prod", &key)
-                .unwrap()
-                .expect("the key there")
-                .to_public()
-                .to_string(),
-            made.to_public().to_string(),
+            cached_kubeconfig(
+                &ctx.secrets(),
+                &hetzner(None, Some("apiVersion: v1\n")),
+                "p"
+            )
+            .unwrap()
+            .as_str(),
+            "apiVersion: v1\n"
         );
-
-        std::fs::remove_file(&key).unwrap();
-        seed(
-            &s,
-            "staging",
-            Some(r#"{"server_id":2,"server_name":"s","kubeconfig_age":"x"}"#),
-        );
-        let Err(err) = key_for_new_secret(&s, "prod", &key) else {
-            panic!("a lost key needs asking");
-        };
-        assert!(
-            matches!(&err, CliError::AgeKeyMissing { target, .. } if target == "prod"),
-            "{err:?}"
-        );
-        assert!(!key.exists(), "a lost key is never replaced without asking");
+        assert!(!ctx.age_key_path().exists());
     }
 
     /// Before `up` provisions: a key there, or a first use, passes and creates nothing. A lost
@@ -436,9 +239,11 @@ mod tests {
     #[test]
     fn the_check_before_provisioning_refuses_a_lost_key_and_names_a_target_to_recover() {
         let dir = tempfile::tempdir().unwrap();
-        let s = store(dir.path());
-        let key = dir.path().join("k/age.key");
-        let check = |target: &str| check_before_provisioning(&s, target, &key, ProvisionedBy::Up);
+        let ctx = ctx_at(dir.path());
+        let s = ctx.store();
+        let key = ctx.age_key_path().to_path_buf();
+        let check =
+            |target: &str| check_before_provisioning(&ctx.secrets(), target, ProvisionedBy::Up);
         let recover = |target: &str| match check(target) {
             Err(CliError::AgeKeyMissing {
                 path,

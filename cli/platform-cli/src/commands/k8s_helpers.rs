@@ -44,7 +44,6 @@ use std::io::Write;
 use std::path::Path;
 use std::process::Command;
 
-use cli_core::secrets::default_age_key_path;
 use cli_core::{CliError, Result};
 use cli_state::State;
 use tempfile::NamedTempFile;
@@ -108,9 +107,9 @@ pub fn ensure_kubeconfig_tempfile_for_target(
             "state has no hetzner_cloud section; run `apprafter apply` first".to_string(),
         )
     })?;
-    // A read: the age key is never created here (GOTCHA-120).
-    let kubeconfig =
-        age_cache::cached_kubeconfig(&hetzner, &resolved.target_name, &default_age_key_path())?;
+    // A read through the core's secret store: the age key is never created here (GOTCHA-120).
+    let ctx = crate::context::legacy_context()?;
+    let kubeconfig = age_cache::cached_kubeconfig(&ctx.secrets(), &hetzner, &resolved.target_name)?;
     write_kubeconfig_tempfile(&kubeconfig)
 }
 

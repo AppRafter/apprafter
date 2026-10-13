@@ -82,7 +82,8 @@ impl fmt::Debug for SecretString {
 pub struct CliOverrides {
     /// `HCLOUD_TOKEN`, when set and non-empty. Outranks the stored token.
     pub hetzner_token: Option<SecretString>,
-    /// `APPRAFTER_AGE_KEY` when set (even empty), as `default_age_key_path` reads it.
+    /// `APPRAFTER_AGE_KEY` when set (even empty): the age key path, verbatim
+    /// (`cli_core::secrets::age_key_path_from`).
     pub age_key: Option<PathBuf>,
     /// `CUE_BIN` when set (even empty), as `cue::cue_bin` reads it.
     pub cue_bin: Option<PathBuf>,

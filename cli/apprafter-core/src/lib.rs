@@ -24,7 +24,7 @@
 //! `std::env` read or write, any `dirs::*` call, and any call to a
 //! lower-crate function that reads the environment or touches the terminal
 //! on the core's behalf (the credential resolvers, `default_config_root`,
-//! `default_age_key_path`, `logging::init`, `KubectlCli` / `HelmCli`, the
+//! `logging::init`, `KubectlCli` / `HelmCli`, the
 //! `PATH`-reading tool preflights, `cue::export`, the SSH identity default,
 //! the legacy state migration) or writes a key (`load_or_create_identity`).
 //! The two sanctioned exceptions are `cli_core::target::config_root_from_override`

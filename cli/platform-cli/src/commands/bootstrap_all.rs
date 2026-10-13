@@ -21,7 +21,6 @@
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
-use cli_core::secrets::default_age_key_path;
 use cli_core::style;
 use cli_core::target::{
     default_config_root, load_active_target_config, resolve_active_target_name, TargetConfig,
@@ -77,9 +76,8 @@ pub fn run(
     // bills. Same lesson again: check it before spending anything.
     let resolved = resolve_state_paths(target_override)?;
     age_cache::check_before_provisioning(
-        &resolved.store,
+        &crate::context::legacy_context()?.secrets(),
         &resolved.target_name,
-        &default_age_key_path(),
         by,
     )?;
 

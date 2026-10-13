@@ -61,7 +61,6 @@ use std::io::Write;
 use std::path::Path;
 
 use cli_core::manifest::{self, InfrastructureManifest};
-use cli_core::secrets::default_age_key_path;
 use cli_core::target::load_active_target_config;
 use cli_core::{CliError, Result};
 use cli_providers::k8s::{
@@ -279,9 +278,9 @@ pub(crate) fn run_with<H: HelmRunner, K: KubectlRunner>(
         )
     })?;
 
-    // A read: the age key is never created here (GOTCHA-120).
-    let plaintext =
-        age_cache::cached_kubeconfig(&hetzner, &resolved.target_name, &default_age_key_path())?;
+    // A read through the core's secret store: the age key is never created here (GOTCHA-120).
+    let ctx = crate::context::legacy_context()?;
+    let plaintext = age_cache::cached_kubeconfig(&ctx.secrets(), &hetzner, &resolved.target_name)?;
     let kubeconfig_file = write_tempfile_with("apprafter-kubeconfig-", &plaintext)?;
 
     // Consult the target for its tier hint. Previously the store

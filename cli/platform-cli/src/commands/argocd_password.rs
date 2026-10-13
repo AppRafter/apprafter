@@ -5,9 +5,8 @@
 use std::io::Write;
 use std::path::Path;
 
-use cli_core::secrets::{
-    default_age_key_path, encrypt_for_recipient, load_or_create_identity, CachedSecret,
-};
+use apprafter_core::secrets::NewCacheKey;
+use cli_core::secrets::{encrypt_for_recipient, load_or_create_identity, CachedSecret};
 use cli_core::{CliError, Result};
 use cli_providers::k8s::{KubectlCli, KubectlRunner};
 use cli_state::State;
@@ -34,14 +33,17 @@ pub fn run(refresh: bool, target_override: Option<&str>) -> Result<()> {
             "state has no hetzner_cloud section; run `apprafter apply` first".to_string(),
         )
     })?;
-    let key_path = default_age_key_path();
+    let ctx = crate::context::legacy_context()?;
+    let secrets = ctx.secrets();
 
-    // Cached fast-path: a read, which never creates the age key (GOTCHA-120).
+    // Cached fast-path: a read through the core's secret store, which never creates the age
+    // key (GOTCHA-120).
     if let Some(armored) = &hetzner.argocd_admin_password_age {
         if !refresh {
+            let key = secrets.cache_key(target)?;
             let plaintext =
-                age_cache::decrypt(armored, CachedSecret::ArgocdPassword, target, &key_path)?;
-            print!("{plaintext}");
+                secrets.open_cache(&key, CachedSecret::ArgocdPassword, target, armored)?;
+            print!("{}", plaintext.as_str());
             return Ok(());
         }
     }
@@ -53,19 +55,24 @@ pub fn run(refresh: bool, target_override: Option<&str>) -> Result<()> {
     // a lost key (a plaintext kubeconfig needs none, another target's cache does) the read
     // would be thrown away (review #1). A lost key is `kubeconfig --refresh`'s to replace,
     // after it asks.
-    let key = age_cache::key_for_new_secret(&resolved.store, target, &key_path)?;
-    let kubeconfig = age_cache::cached_kubeconfig(&hetzner, target, &key_path)?;
+    let key = secrets.cache_key_for_new_secret(target)?;
+    let kubeconfig = age_cache::cached_kubeconfig(&secrets, &hetzner, target)?;
     let kubeconfig_file = write_tempfile_with("apprafter-kubeconfig-", &kubeconfig)?;
 
     let plaintext = compute_argocd_password(&KubectlCli, kubeconfig_file.path())?;
 
     // A first use (a plaintext kubeconfig, and nothing encrypted anywhere) creates the key now
-    // that there is something to cache.
-    let identity = match key {
-        Some(identity) => identity,
-        None => load_or_create_identity(&key_path)?,
+    // that there is something to cache; the store then reads it back, so the seal takes a
+    // CacheKey's recipient in the sealing expression, as `kubeconfig` does (T16's rule, which
+    // d4a-c extends to the CLI).
+    let key = match key {
+        NewCacheKey::Ready(key) => key,
+        NewCacheKey::FirstUse { path } => {
+            load_or_create_identity(&path)?;
+            secrets.cache_key(target)?
+        }
     };
-    let armored = encrypt_for_recipient(&plaintext, &identity.to_public())?;
+    let armored = encrypt_for_recipient(&plaintext, &key.recipient()?)?;
     let mut updated = hetzner.clone();
     updated.argocd_admin_password_age = Some(armored);
     state.hetzner_cloud = Some(updated);

@@ -87,11 +87,6 @@ fn per_user_defaults_resolve_under_the_profile_whatever_home_says() {
 
     // The lower crates, which every command the core does not own yet calls.
     assert_same_path(
-        "cli_core::secrets::default_age_key_path",
-        &cli_core::secrets::default_age_key_path(),
-        &age_key,
-    );
-    assert_same_path(
         "cli_providers::hetzner_cloud::default_ssh_identity_path",
         &cli_providers::hetzner_cloud::default_ssh_identity_path(),
         &ssh_identity,

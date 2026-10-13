@@ -50,7 +50,7 @@ use syn::{Attribute, Expr, ImplItem, Item, Meta, Stmt, TraitItem, UseTree};
 /// Production env reads ([`Kind::EnvRead`] and [`Kind::Dirs`]) in
 /// [`RATCHETED_CRATES`]. Re-measure, with a per-crate and per-callee
 /// breakdown, with `cargo test -p apprafter-core --test guards -- --nocapture`.
-const ENV_READ_BASELINE: usize = 50;
+const ENV_READ_BASELINE: usize = 48;
 
 /// The crates the core builds on, and the CLI.
 const RATCHETED_CRATES: &[&str] = &["cli-core", "cli-state", "cli-providers", "platform-cli"];
@@ -115,8 +115,6 @@ const FORBIDDEN_CALLEES: &[&str] = &[
     // `APPRAFTER_CONFIG_DIR`, then `dirs`.
     "cli_core::target::default_config_root",
     "cli_core::default_config_root",
-    // `APPRAFTER_AGE_KEY`, then `dirs`.
-    "cli_core::secrets::default_age_key_path",
     // `RUST_LOG`, and installs a stderr subscriber.
     "cli_core::logging::init",
     // Run kubectl / helm children with inherited stdio.
@@ -1254,7 +1252,6 @@ const REAL_ENV_BUILDERS: &[&[&str]] = &[
     &["Context", "from_cli_env"],
     &["Context", "from_desktop_env"],
     &["default_config_root"],
-    &["default_age_key_path"],
     &["default_ssh_identity_path"],
     &["home_dir"],
     &["AllowListEnv", "from_process"],
@@ -1374,11 +1371,7 @@ const REAL_ENV_TESTS: &[(&str, &str)] = &[
         "apprafter-core/src/target/machine.rs",
         "the_cli_override_token_validates_the_sku",
     ),
-    // The legacy resolvers' own tests (d4a-b deletes default_age_key_path and its test).
-    (
-        "cli-core/src/secrets.rs",
-        "default_age_key_path_honours_env_override",
-    ),
+    // The legacy resolvers' own tests.
     (
         "cli-core/src/target.rs",
         "default_config_root_points_at_user_config_dir_under_apprafter",
@@ -2289,11 +2282,11 @@ mod tests {
 
     #[test]
     fn a_whole_test_file_counts_and_macro_arguments_are_read() {
-        let src = "fn t() { assert_eq!(cli_core::secrets::default_age_key_path(), p); let _ = dirs::home_dir(); }";
+        let src = "fn t() { assert_eq!(cli_core::target::default_config_root(), p); let _ = dirs::home_dir(); }";
         assert_eq!(
             uses(src, true),
             vec![
-                row("t", false, "default_age_key_path"),
+                row("t", false, "default_config_root"),
                 row("t", false, "dirs::home_dir"),
             ]
         );

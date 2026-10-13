@@ -2,10 +2,12 @@
 //! Thin wrapper around the `age` crate for AppRafter's at-rest
 //! secret encryption.
 //!
-//! The CLI uses one X25519 identity per workstation. The private
-//! key is stored bech32-encoded at `$APPRAFTER_AGE_KEY` (default
-//! `~/.config/apprafter/age.key`, mode 0600). Ciphertext is
-//! ASCII-armored so it stays human-eyeable inside `state.json`.
+//! The CLI uses one X25519 identity per workstation for every target store
+//! whose secrets are in files. The private key is stored bech32-encoded at
+//! `$APPRAFTER_AGE_KEY` (default `~/.config/apprafter/age.key`, mode 0600;
+//! [`age_key_path_from`], which the shared core's `Context` resolves it
+//! with). Ciphertext is ASCII-armored so it stays human-eyeable inside
+//! `state.json`.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -40,16 +42,6 @@ impl CachedSecret {
             CachedSecret::ArgocdPassword => "Argo CD admin password",
         }
     }
-}
-
-/// Resolve the on-disk path for the age private key. Honours
-/// `APPRAFTER_AGE_KEY`; falls back to `~/.config/apprafter/age.key`,
-/// where `~` is [`dirs::home_dir`]: `$HOME` on Unix when it is set and
-/// non-empty, else the account's home from the password database; the
-/// user profile on Windows. `/` only when no home resolves at all.
-pub fn default_age_key_path() -> PathBuf {
-    let override_path = std::env::var(AGE_KEY_ENV).ok().map(PathBuf::from);
-    age_key_path_from(override_path.as_deref(), dirs::home_dir().as_deref())
 }
 
 /// The age key path from explicit inputs: the override verbatim (even empty), else
@@ -234,28 +226,6 @@ mod tests {
         load_or_create_identity(&path).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "got {mode:o}");
-    }
-
-    #[test]
-    fn default_age_key_path_honours_env_override() {
-        // Serialise with the crate-wide test mutex: sibling tests flip
-        // env vars the resolvers read.
-        let _guard = crate::TEST_ENV_MUTEX
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let prior = std::env::var_os("APPRAFTER_AGE_KEY");
-        std::env::set_var("APPRAFTER_AGE_KEY", "/tmp/custom-age");
-        let overridden = default_age_key_path();
-        std::env::remove_var("APPRAFTER_AGE_KEY");
-        let p = default_age_key_path();
-        if let Some(v) = prior {
-            std::env::set_var("APPRAFTER_AGE_KEY", v);
-        }
-        assert_eq!(overridden, PathBuf::from("/tmp/custom-age"));
-        // Unset: home-relative, on every platform (`Path::ends_with`
-        // compares components, so `/` separates them on Windows too).
-        assert!(p.ends_with(".config/apprafter/age.key"), "{p:?}");
-        assert!(p.is_absolute(), "{p:?}");
     }
 
     #[test]
