@@ -82,10 +82,11 @@ pub fn run() -> Result<()> {
 
     // The target's own configuration, for the fields the state file does
     // not carry. Best-effort: an unreadable target is not a reason to
-    // withhold the rest of the report.
-    let configured_tier = cli_core::target::load_target(&resolved.store, &resolved.target_name)
-        .ok()
-        .and_then(|t| t.config.default_tier);
+    // withhold the rest of the report. config.yaml only (D.4a b).
+    let configured_tier =
+        cli_core::target::load_target_config(&resolved.store, &resolved.target_name)
+            .ok()
+            .and_then(|c| c.default_tier);
 
     for line in target_header_lines(&resolved.target_name, &state, configured_tier.as_deref()) {
         println!("{line}");

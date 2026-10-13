@@ -1380,8 +1380,8 @@ fn origin_firewall_action(
 fn target_records_origin_firewall(target: Option<&str>) -> bool {
     crate::commands::state_paths::resolve_state_paths(target)
         .ok()
-        .and_then(|r| cli_core::target::load_target(&r.store, &r.target_name).ok())
-        .and_then(|t| t.config.firewall)
+        .and_then(|r| cli_core::target::load_target_config(&r.store, &r.target_name).ok())
+        .and_then(|c| c.firewall)
         .is_some_and(|f| f.cloudflare_origin)
 }
 

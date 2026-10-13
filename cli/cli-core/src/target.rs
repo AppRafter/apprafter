@@ -622,14 +622,15 @@ pub fn resolve_active_target_name(
 /// treat the target store strictly as a fallback, so a broken
 /// target file shouldn't take down operational commands that
 /// could otherwise succeed from env or state.json. Real errors
-/// surface through the credential resolver which IS allowed to
-/// fail.
+/// surface through the token read, which IS allowed to fail.
+/// Reads `config.yaml` only: the credentials file is the shared
+/// core's secret store's to read (D.4a b).
 pub fn load_active_target_config(
     paths: &TargetStorePaths,
     target_override: Option<&str>,
 ) -> Option<TargetConfig> {
     let name = resolve_active_target_name(paths, target_override).ok()??;
-    load_target(paths, &name).ok().map(|t| t.config)
+    load_target_config(paths, &name).ok()
 }
 
 // ---------------------------------------------------------------
@@ -1964,5 +1965,30 @@ mod tests {
             load_target_config(&paths, "ghost"),
             Err(CliError::TargetNotFound { .. })
         ));
+    }
+
+    /// D.4a b: the active target's config is read without its credentials, so a credentials
+    /// file that cannot be read hides nothing from the fallback read of `apply` / `import`.
+    #[test]
+    fn the_active_target_config_is_read_without_its_credentials() {
+        let (_dir, paths) = make_paths();
+        saved(&paths, "prod");
+        save_global_config(
+            &paths,
+            &GlobalConfig {
+                active_target: "prod".into(),
+                version: TARGET_STORE_VERSION,
+            },
+        )
+        .unwrap();
+        fs::write(paths.target_credentials_file("prod"), "{not yaml").unwrap();
+        for target in [None, Some("prod")] {
+            assert_eq!(
+                load_active_target_config(&paths, target).map(|c| c.provider),
+                Some("hetzner-cloud".to_string()),
+                "{target:?}"
+            );
+        }
+        assert!(load_active_target_config(&paths, Some("ghost")).is_none());
     }
 }

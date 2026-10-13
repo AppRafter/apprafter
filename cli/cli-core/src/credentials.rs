@@ -26,7 +26,7 @@
 
 use std::path::Path;
 
-use crate::target::{load_global_config, load_target, TargetStorePaths};
+use crate::target::{load_global_config, load_target, load_target_config, TargetStorePaths};
 use crate::{CliError, Result};
 
 /// Env-var name clap uses for the Hetzner Cloud API token on the
@@ -118,20 +118,20 @@ pub fn resolve_hetzner_ssh_public_key(
             return Ok(Some(body));
         }
     }
-    // 2. Target store path. Optional — apply works without one.
+    // 2. Target store path. Optional — apply works without one. The config alone: the
+    //    credentials file is the shared core's secret store's to read (D.4a b).
     let Some(name) = resolve_target_name(paths, target_override)? else {
         return Ok(None);
     };
-    let target = match load_target(paths, &name) {
-        Ok(t) => t,
-        // Missing target — caller already gets a clearer error
-        // from `resolve_hetzner_token` when it asks for the
-        // token first. Here we tolerate to keep the ssh-key
-        // path strictly optional.
+    let config = match load_target_config(paths, &name) {
+        Ok(c) => c,
+        // Missing target — the caller already gets a clearer error from
+        // the token read when it asks for the token first. Here we tolerate
+        // it to keep the ssh-key path strictly optional.
         Err(CliError::TargetNotFound { .. }) => return Ok(None),
         Err(e) => return Err(e),
     };
-    let Some(path) = target.config.ssh_key_path.as_ref() else {
+    let Some(path) = config.ssh_key_path.as_ref() else {
         return Ok(None);
     };
     read_ssh_public_key_body(path).map(Some)
@@ -563,6 +563,46 @@ mod tests {
                 }
                 other => panic!("expected Other, got {other:?}"),
             }
+        });
+    }
+
+    /// D.4a b: the key path comes from the target's config alone — a credentials file that
+    /// cannot be read (the secret store's to read) does not stop it.
+    #[test]
+    fn the_ssh_key_is_read_without_the_credentials() {
+        with_clean_env(|| {
+            let (_dir, paths) = make_paths();
+            let key_dir = tempdir().unwrap();
+            let key_path = key_dir.path().join("file.pub");
+            std::fs::write(&key_path, "ssh-ed25519 AAAAZmlsZQ== me@file\n").unwrap();
+            save_target(
+                &paths,
+                &Target {
+                    name: "default".into(),
+                    config: TargetConfig {
+                        provider: "hetzner-cloud".into(),
+                        ssh_key_path: Some(key_path),
+                        ..Default::default()
+                    },
+                    credentials: TargetCredentials::default(),
+                },
+            )
+            .unwrap();
+            save_global_config(
+                &paths,
+                &GlobalConfig {
+                    active_target: "default".into(),
+                    version: 1,
+                },
+            )
+            .unwrap();
+            std::fs::write(paths.target_credentials_file("default"), "{not yaml").unwrap();
+            assert_eq!(
+                resolve_hetzner_ssh_public_key(&paths, None)
+                    .unwrap()
+                    .as_deref(),
+                Some("ssh-ed25519 AAAAZmlsZQ== me@file")
+            );
         });
     }
 }

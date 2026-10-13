@@ -5,7 +5,8 @@ use std::path::Path;
 use cli_core::manifest::{self, InfrastructureManifest};
 use cli_core::resolve::resolve_precedence;
 use cli_core::target::{
-    load_active_target_config, load_target, save_target, TargetConfig, TargetStorePaths,
+    load_active_target_config, load_target_config, save_target_config, TargetConfig,
+    TargetStorePaths,
 };
 use cli_core::{resolve_hetzner_ssh_public_key, resolve_hetzner_token, CliError, Result};
 use cli_providers::backfill::{backfill_from, classify_guard, BackfillOutcome, Guard};
@@ -534,7 +535,8 @@ fn persist_state(
 /// fail `apply`.
 ///
 /// Both `server_type` and `region` backfills are combined into one
-/// `load_target` + `save_target` cycle to avoid redundant disk I/O.
+/// `load_target_config` + `save_target_config` cycle (config.yaml only: the
+/// credentials file is neither read nor written here, D.4a b).
 ///
 /// ### Why there is NO region drift guard
 ///
@@ -585,12 +587,12 @@ fn run_backfill_and_guard(
     if need_type_backfill || need_region_backfill {
         match backfill_store_lock(target_store, BACKFILL_LOCK_WAIT) {
             Err(why) => eprintln!("warning: could not persist baseline to target config: {why}"),
-            Ok(_store_lock) => match load_target(target_store, target_name) {
-                Ok(mut target) => {
+            Ok(_store_lock) => match load_target_config(target_store, target_name) {
+                Ok(mut config) => {
                     let mut changed = false;
-                    if need_type_backfill && target.config.server_type.is_none() {
+                    if need_type_backfill && config.server_type.is_none() {
                         let t = live_type_opt.as_deref().unwrap();
-                        target.config.server_type = Some(t.to_string());
+                        config.server_type = Some(t.to_string());
                         eprintln!(
                             "  server type baseline established: {t} \
                              (recorded from live server — run `apprafter target machine` \
@@ -598,8 +600,8 @@ fn run_backfill_and_guard(
                         );
                         changed = true;
                     }
-                    if let Some(r) = region_candidate.filter(|_| target.config.region.is_none()) {
-                        target.config.region = Some(r.to_string());
+                    if let Some(r) = region_candidate.filter(|_| config.region.is_none()) {
+                        config.region = Some(r.to_string());
                         eprintln!(
                             "  region baseline established: {r} \
                              (recorded from live server)"
@@ -607,7 +609,7 @@ fn run_backfill_and_guard(
                         changed = true;
                     }
                     if changed {
-                        if let Err(e) = save_target(target_store, &target) {
+                        if let Err(e) = save_target_config(target_store, target_name, &config) {
                             eprintln!("warning: could not persist baseline to target config: {e}");
                         }
                     }
@@ -708,8 +710,8 @@ fn adopt_provisioned_machine(
             return;
         }
     };
-    let mut target = match load_target(target_store, target_name) {
-        Ok(t) => t,
+    let mut config = match load_target_config(target_store, target_name) {
+        Ok(c) => c,
         Err(e) => {
             eprintln!(
                 "warning: could not load target config to record the provisioned machine: {e}"
@@ -720,32 +722,32 @@ fn adopt_provisioned_machine(
 
     let mut changed = false;
     if let Some(t) = live_type {
-        if target.config.server_type.as_deref() != Some(t.as_str()) {
-            match &target.config.server_type {
+        if config.server_type.as_deref() != Some(t.as_str()) {
+            match &config.server_type {
                 Some(prev) => eprintln!("  target machine updated: {prev} → {t} (provisioned)"),
                 None => eprintln!(
                     "  server type baseline established: {t} (recorded from the \
                      provisioned server)"
                 ),
             }
-            target.config.server_type = Some(t);
+            config.server_type = Some(t);
             changed = true;
         }
     }
     if let Some(r) = live_region {
-        if target.config.region.as_deref() != Some(r.as_str()) {
-            match &target.config.region {
+        if config.region.as_deref() != Some(r.as_str()) {
+            match &config.region {
                 Some(prev) => eprintln!("  target region updated: {prev} → {r} (provisioned)"),
                 None => eprintln!(
                     "  region baseline established: {r} (recorded from the provisioned server)"
                 ),
             }
-            target.config.region = Some(r);
+            config.region = Some(r);
             changed = true;
         }
     }
     if changed {
-        if let Err(e) = save_target(target_store, &target) {
+        if let Err(e) = save_target_config(target_store, target_name, &config) {
             eprintln!("warning: could not persist the provisioned machine to target config: {e}");
         }
     }
@@ -808,6 +810,7 @@ pub fn region_to_backfill<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cli_core::target::{load_target, save_target};
     use serde_json::json;
 
     // ── the backfill's store lock: bounded, never creating a store ───────
@@ -1433,6 +1436,38 @@ mod tests {
             Some("fsn1"),
             "the region actually provisioned is adopted in the same pass"
         );
+    }
+
+    /// D.4a b: the backfill and the adopt read and write `config.yaml` only. A credentials file
+    /// they cannot read does not stop them, and the one there is left as it was, byte for byte.
+    #[test]
+    fn the_backfill_and_the_adopt_write_the_config_alone() {
+        let (_tmp, store, name) = target_store_with(None, None);
+        let creds = store.target_credentials_file(&name);
+        let by_hand = "# by hand\nhetzner_token: [\n";
+        std::fs::write(&creds, by_hand).unwrap();
+        run_backfill_and_guard(
+            &[live_server(42, "cx22", "fsn1")],
+            42,
+            None,
+            None,
+            None,
+            &store,
+            &name,
+        );
+        let config = cli_core::target::load_target_config(&store, &name).unwrap();
+        assert_eq!(
+            (config.server_type.as_deref(), config.region.as_deref()),
+            (Some("cx22"), Some("fsn1"))
+        );
+        assert_eq!(std::fs::read_to_string(&creds).unwrap(), by_hand);
+        adopt_provisioned_machine(&[live_server(43, "cx33", "nbg1")], 43, &store, &name);
+        let config = cli_core::target::load_target_config(&store, &name).unwrap();
+        assert_eq!(
+            (config.server_type.as_deref(), config.region.as_deref()),
+            (Some("cx33"), Some("nbg1"))
+        );
+        assert_eq!(std::fs::read_to_string(&creds).unwrap(), by_hand);
     }
 
     #[test]
