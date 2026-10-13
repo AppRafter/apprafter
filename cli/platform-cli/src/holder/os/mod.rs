@@ -62,7 +62,15 @@ mod unix_common {
             let sid = unsafe { libc::getsid(pid) };
             (sid > 0).then_some(sid)
         }
+        /// `pid`'s start while it runs. A process that exited is gone though its parent has not
+        /// reaped it yet: Linux keeps a zombie's `/proc/<pid>/stat`, its start included, until
+        /// the reap, so its state is read first (a pid reused between the two reads shows
+        /// another start); macOS's `proc_pidinfo` answers nothing for an exited process.
         fn started(&self, pid: i32) -> Option<ProcStart> {
+            #[cfg(target_os = "linux")]
+            if super::current::exited(pid) {
+                return None;
+            }
             apprafter_core::process::started(u32::try_from(pid).ok()?)
         }
     }
@@ -309,5 +317,77 @@ mod unix_common {
         pub(crate) fn fd(&self) -> RawFd {
             self.read.as_raw_fd()
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    use super::{current, Wake};
+
+    /// T52, risk 6: with no pidfd (Linux) and no `EVFILT_PROC` (macOS) the holder looks at its
+    /// session's leader every second, and a leader that exited is gone even while its parent
+    /// has not reaped it. Linux keeps a zombie's `/proc/<pid>/stat`, its start included, until
+    /// the reap: by its start alone it would read as alive, and the window would outlive its
+    /// terminal for as long as the parent waits. macOS's `proc_pidinfo` answers nothing for a
+    /// process that exited (XNU marks it dead before it is a zombie; only a call that asks for
+    /// zombies finds it), so there the start alone already says gone.
+    #[test]
+    fn the_polling_look_counts_an_exited_unreaped_leader_gone() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "read _"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let start = apprafter_core::process::started(pid).expect("a running child's start");
+        // The shell's `read` meets the end of its input: it exits.
+        drop(child.stdin.take());
+        // SAFETY: an all-zero siginfo_t is a valid value to be overwritten.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: waits for this test's own child to exit and leaves it unreaped (WNOWAIT).
+        let waited = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        assert_eq!(waited, 0, "{}", std::io::Error::last_os_error());
+        let zombie_start = apprafter_core::process::started(pid);
+        let (listener, _peer) = UnixStream::pair().unwrap();
+        let (signal, _writer) = UnixStream::pair().unwrap();
+        let mut waiter = current::Waiter::new(
+            listener.as_raw_fd(),
+            signal.as_raw_fd(),
+            pid as i32,
+            start,
+            true,
+        )
+        .unwrap();
+        let woke = waiter.wait(Duration::from_secs(3)).unwrap();
+        child.wait().unwrap();
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            zombie_start,
+            Some(start),
+            "a zombie keeps its /proc/<pid>/stat"
+        );
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            zombie_start, None,
+            "proc_pidinfo answers nothing for an exited process"
+        );
+        assert!(
+            matches!(woke, Wake::Leader),
+            "the polling look took an exited, unreaped leader for alive"
+        );
     }
 }

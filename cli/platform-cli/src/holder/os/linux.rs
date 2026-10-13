@@ -53,6 +53,18 @@ pub(crate) fn peer_cred(s: &UnixStream) -> io::Result<PeerCred> {
     })
 }
 
+/// Whether `pid` exited and is not reaped yet: the state in its `/proc/<pid>/stat` (field 3, the
+/// first after `comm`'s last `)`) is `Z` (a zombie) or `X` / `x` (dead). A pid that is gone is
+/// not: it has no start either.
+pub(crate) fn exited(pid: i32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    stat.rfind(')')
+        .and_then(|end| stat[end + 1..].split_whitespace().next())
+        .is_some_and(|state| matches!(state, "Z" | "X" | "x"))
+}
+
 fn pidfd_open(pid: i32) -> io::Result<OwnedFd> {
     // SAFETY: pidfd_open(2) (Linux 5.3) through syscall: no glibc symbol needed.
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
