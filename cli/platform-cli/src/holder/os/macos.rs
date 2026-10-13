@@ -11,10 +11,13 @@ use apprafter_core::process::ProcStart;
 use super::{hung_up, leader_alive, OsProcs, Wake};
 use crate::holder::binding::{PeerCred, ProcLookup};
 
-/// Counts sleep on macOS (`clock_gettime(3)`); `Instant` reads `CLOCK_UPTIME_RAW`, which does
-/// not (holder finding 5).
-pub(crate) const WITH_SLEEP: libc::clockid_t = libc::CLOCK_MONOTONIC;
-/// Stops in sleep: the sleep detector's second clock (O4).
+/// Counts sleep (`clock_gettime(3)`: `mach_continuous_time`); `Instant` reads
+/// `CLOCK_UPTIME_RAW`, which does not (holder finding 5). Raw, as [`AWAKE`] is: the sleep
+/// detector compares the two (O4), and `CLOCK_MONOTONIC` is slewed by time adjustments, so its
+/// readings drift from a raw clock's and the two are not even ordered (CI, 2026-10-13: 0.57 s
+/// behind `CLOCK_UPTIME_RAW` after ten minutes of uptime).
+pub(crate) const WITH_SLEEP: libc::clockid_t = libc::CLOCK_MONOTONIC_RAW;
+/// Stops in sleep (`mach_absolute_time`): the sleep detector's second clock (O4).
 pub(crate) const AWAKE: libc::clockid_t = libc::CLOCK_UPTIME_RAW;
 
 pub(crate) fn clock_with_sleep() -> Duration {
@@ -205,7 +208,7 @@ mod tests {
     fn the_window_clocks_are_the_ones_that_count_suspend() {
         assert_eq!(
             (WITH_SLEEP, AWAKE),
-            (libc::CLOCK_MONOTONIC, libc::CLOCK_UPTIME_RAW)
+            (libc::CLOCK_MONOTONIC_RAW, libc::CLOCK_UPTIME_RAW)
         );
     }
 }

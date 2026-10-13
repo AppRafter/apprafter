@@ -14,7 +14,7 @@ pub const SLEEP_GAP: Duration = Duration::from_secs(5);
 
 /// What the window reads time from: [`SystemClock`] in a holder, a fake in tests.
 pub trait HolderClock {
-    /// Time since boot, suspend included (Linux `CLOCK_BOOTTIME`, macOS `CLOCK_MONOTONIC`,
+    /// Time since boot, suspend included (Linux `CLOCK_BOOTTIME`, macOS `CLOCK_MONOTONIC_RAW`,
     /// Windows `GetTickCount64`).
     fn with_sleep(&self) -> Duration;
     /// Time since boot, suspend excluded (Linux `CLOCK_MONOTONIC`, macOS `CLOCK_UPTIME_RAW`,
