@@ -231,3 +231,16 @@ test("the mock's plan lifetime is Rust's PLAN_TTL_MS", async () => {
     .reduce((product, factor) => product * factor, 1);
   expect(MOCK_PLAN_TTL_MS).toBe(value);
 });
+
+test('a plan view says which gesture op_execute asks: the OS prompt for a destructive plan (D.4a)', () => {
+  installMockIpc({ opDelayMs: 0 });
+  const run = { end: () => ({ result: null }) };
+  for (const [cls, gesture] of [
+    ['reversible', 'none'],
+    ['bounded', 'none'],
+    ['destructive', 'os'],
+  ] as const) {
+    const view = mockOps().registerPlan({ class: cls, title: 'x', changes: [], target: null }, run);
+    expect(view.gesture).toBe(gesture);
+  }
+});

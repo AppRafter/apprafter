@@ -119,6 +119,10 @@ describe('LockScreen', () => {
     [lockState({ reason: 'idle', autoLockMinutes: 30 }), 'Locked after 30 minutes of inactivity.'],
     [lockState({ reason: 'os_session' }), 'Locked when the computer locked or slept.'],
     [lockState({ reason: 'manual' }), 'Locked.'],
+    [
+      lockState({ reason: 'secrets_locked' }),
+      "Locked: this target store's secrets were locked from a terminal.",
+    ],
   ])('the reason line: %o', (state, line) => {
     lockScreen(state);
     expect(screen.getByText(line)).toBeDefined();
@@ -209,9 +213,12 @@ describe('LockScreen', () => {
       screen.getByText('Clusters keep running. Credentials are stored in files on this computer.'),
     ).toBeDefined();
     cleanup();
-    lockScreen(lockState(), appInfo({ secretBackend: 'keyring' }));
+    lockScreen(
+      lockState(),
+      appInfo({ secrets: { mode: 'locked', slots: ['password', 'recovery_key'] } }),
+    );
     expect(
-      screen.getByText('Clusters keep running. Credentials stay in the system keychain.'),
+      screen.getByText('Clusters keep running. Credentials stay encrypted until you unlock.'),
     ).toBeDefined();
   });
 

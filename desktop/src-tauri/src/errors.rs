@@ -104,6 +104,15 @@ pub enum DesktopError {
     )]
     RelativePath { path: String },
 
+    /// Require unlock, its start lock or its sleep lock switched off while the target store's
+    /// secrets are protected (D.4a T74, surface D24); the lock machine raises it from d4a-g.
+    #[error("Require unlock stays on while this target store's secrets are protected")]
+    #[diagnostic(
+        code(apprafter::desktop::lock_required),
+        help("Stop protecting the store's secrets in Settings › Lock to change it.")
+    )]
+    LockRequired,
+
     #[error(transparent)]
     #[diagnostic(transparent)]
     Core(#[from] CoreError),
@@ -159,6 +168,7 @@ impl DesktopError {
             | DesktopError::SettingsIo(_)
             | DesktopError::Internal(_)
             | DesktopError::Closing
+            | DesktopError::LockRequired
             | DesktopError::Core(_) => {}
         }
         ui
@@ -239,6 +249,7 @@ mod tests {
             DesktopError::RelativePath {
                 path: "id.pub".into(),
             },
+            DesktopError::LockRequired,
         ]
     }
 
@@ -257,6 +268,7 @@ mod tests {
             DesktopError::DraftNotFound { .. } => errors::DRAFT_NOT_FOUND,
             DesktopError::DraftExpired { .. } => errors::DRAFT_EXPIRED,
             DesktopError::RelativePath { .. } => errors::RELATIVE_PATH,
+            DesktopError::LockRequired => errors::LOCK_REQUIRED,
             DesktopError::Core(_) => return None,
         })
     }
@@ -415,5 +427,21 @@ mod tests {
         assert_eq!(ui.message, "internal error: the operation panicked: boom");
         let ui = DesktopError::SettingsIo("disk full".into()).to_ui();
         assert_eq!(ui.message, "settings could not be saved: disk full");
+    }
+
+    /// D.4a T74 / surface D24: what the settings refusal says, and where it changes.
+    #[test]
+    fn lock_required_says_why_and_where_it_changes() {
+        let ui = DesktopError::LockRequired.to_ui();
+        assert_eq!(ui.code.as_deref(), Some(errors::LOCK_REQUIRED));
+        assert_eq!(
+            ui.message,
+            "Require unlock stays on while this target store's secrets are protected"
+        );
+        assert_eq!(
+            ui.help.as_deref(),
+            Some("Stop protecting the store's secrets in Settings › Lock to change it.")
+        );
+        assert!(ui.fields.is_empty());
     }
 }

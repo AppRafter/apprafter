@@ -12,6 +12,7 @@ export const DESKTOP_ERROR_CODES = {
   DRAFT_NOT_FOUND: 'apprafter::desktop::draft_not_found',
   INTERNAL: 'apprafter::desktop::internal',
   LOCKED: 'apprafter::desktop::locked',
+  LOCK_REQUIRED: 'apprafter::desktop::lock_required',
   PLAN_EXPIRED: 'apprafter::desktop::plan_expired',
   PLAN_NOT_FOUND: 'apprafter::desktop::plan_not_found',
   RELATIVE_PATH: 'apprafter::desktop::relative_path',

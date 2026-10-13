@@ -46,7 +46,7 @@ use apprafter_core::{
     CancellationToken, CoreError, CoreResult, Outcome, PlanClass, PlannedChange, Reporter, UiError,
 };
 use apprafter_desktop_ipc::{
-    AuthOutcome, OpEvent, OpId, OpState, OpSummary, PlanView, Subscribed, SubscriptionId,
+    AuthOutcome, Gesture, OpEvent, OpId, OpState, OpSummary, PlanView, Subscribed, SubscriptionId,
     UnavailableReason,
 };
 
@@ -307,6 +307,12 @@ impl OperationManager {
         let registered = Stamp::now(&*self.clock);
         let expires_at_ms = registered.wall_ms.saturating_add(PLAN_TTL_MS);
         let needs_gesture = parts.requires_gesture || parts.class == PlanClass::Destructive;
+        // What the view tells the page `execute` will ask (D.4a §3.14); `StoreSecret` is d4a-g's.
+        let view_gesture = if needs_gesture {
+            Gesture::Os
+        } else {
+            Gesture::None
+        };
         let gesture = needs_gesture.then(|| AuthPurpose::Confirm {
             target: parts.target.clone(),
             verb: parts.verb,
@@ -335,6 +341,7 @@ impl OperationManager {
             changes: parts.changes,
             target: parts.target,
             expires_at_ms,
+            gesture: view_gesture,
         }
     }
 
@@ -1066,7 +1073,7 @@ mod tests {
         PlannedChange, Stream,
     };
     use apprafter_desktop_ipc::{
-        errors, AuthInfo, AuthOutcome, CancelledBy, OpEvent, OpId, OpState, OutputStream,
+        errors, AuthInfo, AuthOutcome, CancelledBy, Gesture, OpEvent, OpId, OpState, OutputStream,
         SubscriptionId, UnavailableReason,
     };
     use serde_json::json;
@@ -3682,5 +3689,26 @@ mod tests {
         let [summary] = mgr.list().try_into().expect("one op listed");
         assert_eq!(summary.state, OpState::Failed);
         assert_eq!(mgr.running(), 0);
+    }
+
+    /// D.4a §3.14: the view says what `execute` will ask — the OS prompt for a destructive plan
+    /// and an approval, nothing otherwise.
+    #[test]
+    fn the_view_says_which_gesture_execute_asks() {
+        let (_, mgr) = manager();
+        for (class, gesture) in [
+            (PlanClass::Reversible, Gesture::None),
+            (PlanClass::Bounded, Gesture::None),
+            (PlanClass::Destructive, Gesture::Os),
+        ] {
+            let view = mgr.register_plan(parts(class), returns(json!(1)));
+            assert_eq!(view.gesture, gesture, "{class:?}");
+        }
+        let approval = PlanParts {
+            requires_gesture: true,
+            ..PlanParts::new(PlanClass::Bounded, "Approve migration", "approve")
+        };
+        let view = mgr.register_plan(approval, returns(json!(1)));
+        assert_eq!(view.gesture, Gesture::Os);
     }
 }

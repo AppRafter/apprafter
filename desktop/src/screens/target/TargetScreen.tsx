@@ -106,7 +106,7 @@ export function TargetScreen({ name, onRenamed, onRemoved, onChangeMachine }: Ta
               <TargetDetails
                 report={report.data}
                 os={info.os}
-                secretBackend={info.secretBackend}
+                secretsMode={info.secrets.mode}
                 actions={{
                   rename: fresh(actions.rename),
                   renew: fresh(actions.renew),

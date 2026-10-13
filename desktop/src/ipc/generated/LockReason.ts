@@ -4,4 +4,4 @@
 /**
  * Why the app is locked.
  */
-export type LockReason = "startup" | "idle" | "os_session" | "manual";
+export type LockReason = "startup" | "idle" | "os_session" | "manual" | "secrets_locked";

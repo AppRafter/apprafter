@@ -266,7 +266,7 @@ export function installMockIpc(options: MockOptions = {}): void {
     os,
     desktopVersion: '0.0.0-mock',
     coreVersion: '0.0.0-mock',
-    secretBackend: 'file',
+    secrets: { mode: 'files', slots: [] },
     account: 'alex',
     host: 'workstation',
     auth,

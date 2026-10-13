@@ -49,7 +49,12 @@ type OpCommand =
   | 'op_execute';
 
 export interface MockOps {
-  registerPlan(view: Omit<PlanView, 'opId' | 'expiresAtMs'>, run: MockRun): PlanView;
+  /**
+   * The view's gesture follows the class: a destructive plan asks the OS. Rust's `register_plan` also asks it for a
+   * plan that requires a gesture (`requires_gesture`, an approval); the mock's views carry no such input, so a mock
+   * approval that is not destructive reads `none`.
+   */
+  registerPlan(view: Omit<PlanView, 'opId' | 'expiresAtMs' | 'gesture'>, run: MockRun): PlanView;
   startRead(title: string, target: string | null, run: MockRun): OpId;
   /** Rust's lock hook, on every lock and unlock. */
   transition(): void;
@@ -311,6 +316,7 @@ export function createMockOps(options: MockOpsOptions): MockOps {
         ...view,
         opId: nextOpId,
         expiresAtMs: Date.now() + MOCK_PLAN_TTL_MS,
+        gesture: view.class === 'destructive' ? 'os' : 'none',
       };
       plans.set(full.opId, { view: full, run, sinks: [] });
       return full;

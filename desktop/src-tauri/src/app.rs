@@ -62,7 +62,7 @@ use std::time::{Duration, Instant};
 
 use apprafter_core::Context;
 use apprafter_desktop_ipc::{
-    AppInfo, LockReason, LockState, OpId, Os, Quitting, SecretBackend, SessionEvents, Settings,
+    AppInfo, LockReason, LockState, OpId, Os, Quitting, SecretsInfo, SessionEvents, Settings,
     SubscriptionId, LOCK_CHANGED, QUITTING,
 };
 use apprafter_os_auth::{Listening, SessionEvent, SessionWatch};
@@ -441,7 +441,11 @@ impl Shell {
             os: current_os(),
             desktop_version: env!("CARGO_PKG_VERSION").into(),
             core_version: apprafter_core::VERSION.into(),
-            secret_backend: SecretBackend::File,
+            // Files until d4a-g reads the store's `store.yaml` here (D.4a §3.14, T74).
+            secrets: SecretsInfo {
+                mode: apprafter_core::secrets::SecretsMode::Files,
+                slots: Vec::new(),
+            },
             account: whoami::username().unwrap_or_else(|_| UNKNOWN.into()),
             host: whoami::hostname().unwrap_or_else(|_| UNKNOWN.into()),
             auth: self
@@ -1220,6 +1224,14 @@ mod tests {
         assert!(!info.test_build);
         assert!(!info.account.is_empty() && !info.host.is_empty());
         assert_eq!(info.settings_notice, None);
+        // Files until d4a-g reads the store's `store.yaml` here (D.4a §3.14, T74).
+        assert_eq!(
+            info.secrets,
+            apprafter_desktop_ipc::SecretsInfo {
+                mode: apprafter_core::secrets::SecretsMode::Files,
+                slots: Vec::new(),
+            }
+        );
     }
 
     #[test]

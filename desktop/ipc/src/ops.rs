@@ -86,6 +86,18 @@ pub enum OpEvent {
     },
 }
 
+/// What confirming a plan asks of the person beyond the dialog (D.4a §3.14): nothing, the OS's
+/// device-owner prompt (or the app's password field where the OS cannot prompt), or the target
+/// store's lock password or recovery key (a destructive plan on a locked store, d4a-g).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum Gesture {
+    None,
+    Os,
+    StoreSecret,
+}
+
 /// What the webview shows to confirm a mutation; the plan itself stays in Rust.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -100,6 +112,8 @@ pub struct PlanView {
     pub target: Option<String>,
     /// After this, in milliseconds since the Unix epoch, `op_execute` refuses the plan.
     pub expires_at_ms: u64,
+    /// What confirming it asks of the person: `op_execute` asks exactly this.
+    pub gesture: Gesture,
 }
 
 /// Where an operation is in its life.
@@ -266,18 +280,35 @@ mod tests {
             }],
             target: Some("prod".into()),
             expires_at_ms: 600_000,
+            gesture: Gesture::Os,
         };
         let v = serde_json::to_value(&view).unwrap();
         let keys: BTreeSet<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
         assert_eq!(
             keys,
-            BTreeSet::from(["opId", "class", "title", "changes", "expiresAtMs", "target"])
+            BTreeSet::from([
+                "opId",
+                "class",
+                "title",
+                "changes",
+                "expiresAtMs",
+                "target",
+                "gesture"
+            ])
         );
         assert_eq!(v["opId"], 7);
         assert_eq!(v["class"], "destructive");
         assert_eq!(v["changes"][0]["action"], "delete");
         assert_eq!(v["target"], "prod");
         assert_eq!(v["expiresAtMs"], 600_000);
+        assert_eq!(v["gesture"], "os");
+        for (gesture, wire) in [
+            (Gesture::None, "none"),
+            (Gesture::Os, "os"),
+            (Gesture::StoreSecret, "store_secret"),
+        ] {
+            assert_eq!(serde_json::to_value(gesture).unwrap(), wire);
+        }
     }
 
     #[test]
@@ -350,7 +381,12 @@ mod tests {
         }
         assert!(event.contains("\"kind\": \"output\"") || event.contains("kind: \"output\""));
         let view = PlanView::decl(&cfg);
-        for field in ["opId: OpId", "expiresAtMs: number", "class: PlanClass"] {
+        for field in [
+            "opId: OpId",
+            "expiresAtMs: number",
+            "class: PlanClass",
+            "gesture: Gesture",
+        ] {
             assert!(view.contains(field), "{field} missing from {view}");
         }
         let subscription = SubscriptionId::decl(&cfg);

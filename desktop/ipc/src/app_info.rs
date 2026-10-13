@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! What the webview learns about the app once, at start: OS, versions, who and where.
 
+use apprafter_core::secrets::{LockSlotKind, SecretsMode};
 use serde::Serialize;
 
 use crate::AuthInfo;
@@ -15,13 +16,15 @@ pub enum Os {
     Linux,
 }
 
-/// Where the target store keeps its secrets.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+/// Where the target store keeps its secrets, as the lock screen, the Target screen and Settings ›
+/// Lock show it (D.4a §3.14): in files, or in a vault and what opens it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[serde(rename_all = "lowercase")]
-pub enum SecretBackend {
-    File,
-    Keyring,
+#[serde(rename_all = "camelCase")]
+pub struct SecretsInfo {
+    pub mode: SecretsMode,
+    /// What opens the vault, as `store.yaml` lists it; empty in files.
+    pub slots: Vec<LockSlotKind>,
 }
 
 /// Which of the OS session's signals the app hears, so `lockOnSleep` has something to follow:
@@ -46,7 +49,8 @@ pub struct AppInfo {
     pub desktop_version: String,
     /// `apprafter_core::VERSION`.
     pub core_version: String,
-    pub secret_backend: SecretBackend,
+    /// Where the target store keeps its secrets. Files until d4a-g reads `store.yaml` here.
+    pub secrets: SecretsInfo,
     /// The OS user name.
     pub account: String,
     /// The host name, `unknown` when the OS does not say.
@@ -74,7 +78,10 @@ mod tests {
             os: Os::Linux,
             desktop_version: "0.1.0".into(),
             core_version: "0.2.80".into(),
-            secret_backend: SecretBackend::File,
+            secrets: SecretsInfo {
+                mode: SecretsMode::Files,
+                slots: Vec::new(),
+            },
             account: "rem".into(),
             host: "box".into(),
             auth: AuthInfo {
@@ -93,19 +100,22 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string(&info).unwrap(),
-            r#"{"os":"linux","desktopVersion":"0.1.0","coreVersion":"0.2.80","secretBackend":"file","account":"rem","host":"box","auth":{"available":false,"method":null,"unavailable":"no_backend","biometricsChoice":false,"passwordField":false},"sessionEvents":{"lock":true,"sleep":false},"testBuild":false,"settingsNotice":null}"#
+            r#"{"os":"linux","desktopVersion":"0.1.0","coreVersion":"0.2.80","secrets":{"mode":"files","slots":[]},"account":"rem","host":"box","auth":{"available":false,"method":null,"unavailable":"no_backend","biometricsChoice":false,"passwordField":false},"sessionEvents":{"lock":true,"sleep":false},"testBuild":false,"settingsNotice":null}"#
         );
     }
 
     #[test]
-    fn os_and_secret_backend_are_lowercase() {
+    fn os_is_lowercase_and_secrets_name_the_mode_and_its_slots() {
         assert_eq!(serde_json::to_value(Os::Windows).unwrap(), "windows");
         assert_eq!(serde_json::to_value(Os::Macos).unwrap(), "macos");
         assert_eq!(serde_json::to_value(Os::Linux).unwrap(), "linux");
-        assert_eq!(serde_json::to_value(SecretBackend::File).unwrap(), "file");
         assert_eq!(
-            serde_json::to_value(SecretBackend::Keyring).unwrap(),
-            "keyring"
+            serde_json::to_value(SecretsInfo {
+                mode: SecretsMode::Locked,
+                slots: vec![LockSlotKind::Password, LockSlotKind::RecoveryKey],
+            })
+            .unwrap(),
+            serde_json::json!({"mode": "locked", "slots": ["password", "recovery_key"]})
         );
     }
 }

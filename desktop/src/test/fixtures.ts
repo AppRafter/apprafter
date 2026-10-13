@@ -26,7 +26,7 @@ export function appInfo(more: Partial<AppInfo> = {}): AppInfo {
     os: 'linux',
     desktopVersion: '0.1.0',
     coreVersion: '0.2.80',
-    secretBackend: 'file',
+    secrets: { mode: 'files', slots: [] },
     account: 'alex',
     host: 'workstation',
     auth: authInfo(),
@@ -127,6 +127,7 @@ export function planView(more: Partial<PlanView> = {}): PlanView {
     ],
     target: 'prod-eu',
     expiresAtMs: 0,
+    gesture: 'none',
     ...more,
   };
 }

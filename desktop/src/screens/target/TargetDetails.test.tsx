@@ -18,7 +18,7 @@ test('the rows the CLI prints, with its "not set", and no token anywhere', () =>
     <TargetDetails
       report={targetReport()}
       os="linux"
-      secretBackend="file"
+      secretsMode="files"
       actions={noop()}
       onChangeMachine={null}
     />,
@@ -58,7 +58,7 @@ test('the values that can be cut short in a narrow card carry their whole text a
     <TargetDetails
       report={targetReport()}
       os="linux"
-      secretBackend="file"
+      secretsMode="files"
       actions={noop()}
       onChangeMachine={null}
     />,
@@ -88,7 +88,7 @@ test('a stored key file the core reads no public key in says so, with no type (G
           },
         })}
         os="linux"
-        secretBackend="file"
+        secretsMode="files"
         actions={noop()}
         onChangeMachine={null}
       />,
@@ -117,7 +117,7 @@ test('what is not stored reads "not set"; a key file that went is "missing"', ()
     <TargetDetails
       report={report}
       os="linux"
-      secretBackend="file"
+      secretsMode="files"
       actions={noop()}
       onChangeMachine={null}
     />,
@@ -134,7 +134,7 @@ test('Windows: the file backend does not claim "readable only by you"', () => {
     <TargetDetails
       report={targetReport()}
       os="windows"
-      secretBackend="file"
+      secretsMode="files"
       actions={noop()}
       onChangeMachine={null}
     />,
@@ -149,7 +149,7 @@ test('a provisioned target: no Change, the refusal and the rebuild path, the run
     <TargetDetails
       report={report}
       os="linux"
-      secretBackend="file"
+      secretsMode="files"
       actions={noop()}
       onChangeMachine={() => {}}
     />,
@@ -174,7 +174,7 @@ test('a server recorded with the configured type shows the type once', () => {
     <TargetDetails
       report={report}
       os="linux"
-      secretBackend="file"
+      secretsMode="files"
       actions={noop()}
       onChangeMachine={null}
     />,
@@ -189,7 +189,7 @@ test('not provisioned: Change only when a picker is given; unreadable state: nev
     <TargetDetails
       report={targetReport()}
       os="linux"
-      secretBackend="file"
+      secretsMode="files"
       actions={noop()}
       onChangeMachine={onChangeMachine}
     />,
@@ -200,7 +200,7 @@ test('not provisioned: Change only when a picker is given; unreadable state: nev
     <TargetDetails
       report={targetReport()}
       os="linux"
-      secretBackend="file"
+      secretsMode="files"
       actions={noop()}
       onChangeMachine={null}
     />,
@@ -222,7 +222,7 @@ test('not provisioned: Change only when a picker is given; unreadable state: nev
     <TargetDetails
       report={unreadable}
       os="linux"
-      secretBackend="file"
+      secretsMode="files"
       actions={noop()}
       onChangeMachine={() => {}}
     />,
@@ -237,7 +237,7 @@ test('the SSH key row offers Change, set or not', async () => {
     <TargetDetails
       report={targetReport()}
       os="linux"
-      secretBackend="file"
+      secretsMode="files"
       actions={actions}
       onChangeMachine={null}
     />,
@@ -249,7 +249,7 @@ test('the SSH key row offers Change, set or not', async () => {
     <TargetDetails
       report={targetReport({ sshKey: null })}
       os="linux"
-      secretBackend="file"
+      secretsMode="files"
       actions={actions}
       onChangeMachine={null}
     />,
@@ -265,7 +265,7 @@ test('Make default only on another target; Rename and Renew call back', async ()
     <TargetDetails
       report={targetReport({ isCliDefault: false })}
       os="linux"
-      secretBackend="file"
+      secretsMode="files"
       actions={actions}
       onChangeMachine={null}
     />,
@@ -282,7 +282,7 @@ test('Make default only on another target; Rename and Renew call back', async ()
     <TargetDetails
       report={targetReport()}
       os="linux"
-      secretBackend="file"
+      secretsMode="files"
       actions={actions}
       onChangeMachine={null}
     />,

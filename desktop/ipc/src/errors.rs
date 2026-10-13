@@ -33,6 +33,9 @@ pub const DRAFT_EXPIRED: &str = "apprafter::desktop::draft_expired";
 /// A typed path (`fields.path`, as typed) is not a full path: it would resolve against the
 /// app's working directory, which means nothing to whoever typed it. A `~/` path is a full one.
 pub const RELATIVE_PATH: &str = "apprafter::desktop::relative_path";
+/// Require unlock, its start lock or its sleep lock switched off while the target store's
+/// secrets are protected (D.4a T74): the app lock is what opens them.
+pub const LOCK_REQUIRED: &str = "apprafter::desktop::lock_required";
 
 /// Every code above, once.
 pub const ALL: &[&str] = &[
@@ -49,6 +52,7 @@ pub const ALL: &[&str] = &[
     DRAFT_NOT_FOUND,
     DRAFT_EXPIRED,
     RELATIVE_PATH,
+    LOCK_REQUIRED,
 ];
 
 #[cfg(test)]
@@ -59,7 +63,7 @@ mod tests {
 
     #[test]
     fn every_code_is_listed_once_under_the_desktop_prefix() {
-        assert_eq!(ALL.len(), 13);
+        assert_eq!(ALL.len(), 14);
         let unique: BTreeSet<_> = ALL.iter().collect();
         assert_eq!(unique.len(), ALL.len(), "{ALL:?}");
         for code in ALL {
@@ -79,6 +83,7 @@ mod tests {
             DRAFT_NOT_FOUND,
             DRAFT_EXPIRED,
             RELATIVE_PATH,
+            LOCK_REQUIRED,
         ] {
             assert!(ALL.contains(&code), "{code} is not in ALL");
         }

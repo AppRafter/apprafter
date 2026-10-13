@@ -20,7 +20,7 @@ import { PasswordField } from '../components/PasswordField';
 import { Tag } from '../components/Tag';
 import { uiErrorOf } from '../ipc/api';
 import type { LockState } from '../ipc/generated/LockState';
-import type { SecretBackend } from '../ipc/generated/SecretBackend';
+import type { SecretsMode } from '../ipc/generated/SecretsMode';
 import { authPrompt, authRefusal, retryLine, useRetryCountdown } from '../state/auth';
 import { useLockActions } from '../state/lock';
 import { osName, usePlatform } from '../state/platform';
@@ -37,15 +37,21 @@ function reasonLine({ reason, autoLockMinutes: minutes }: LockState): string {
         : `Locked after ${minutes} minutes of inactivity.`;
     case 'os_session':
       return 'Locked when the computer locked or slept.';
+    case 'secrets_locked':
+      return "Locked: this target store's secrets were locked from a terminal.";
     case 'manual':
     case null:
       return 'Locked.';
   }
 }
 
-const FOOTERS: Record<SecretBackend, string> = {
-  file: 'Clusters keep running. Credentials are stored in files on this computer.',
-  keyring: 'Clusters keep running. Credentials stay in the system keychain.',
+// D.4a surface §5.7: files as before; a protected store (D20). The keychain's line went with it.
+const PROTECTED_FOOTER = 'Clusters keep running. Credentials stay encrypted until you unlock.';
+const FOOTERS: Record<SecretsMode, string> = {
+  files: 'Clusters keep running. Credentials are stored in files on this computer.',
+  locking: PROTECTED_FOOTER,
+  locked: PROTECTED_FOOTER,
+  unlocking: PROTECTED_FOOTER,
 };
 
 /** "alex.morgan" → "AM": the first letters of the account's first two words. */
@@ -164,7 +170,7 @@ export function LockScreen({ state }: LockScreenProps) {
         )}
         {info.testBuild && <Tag tone="warn">TEST BUILD</Tag>}
       </div>
-      <footer className="lock-footer">{FOOTERS[info.secretBackend]}</footer>
+      <footer className="lock-footer">{FOOTERS[info.secrets.mode]}</footer>
     </main>
   );
 }

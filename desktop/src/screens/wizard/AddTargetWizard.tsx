@@ -538,7 +538,7 @@ export function AddTargetWizard({ onClose }: { onClose: () => void }) {
           label:
             state.draft !== null ? 'Continue' : verifying ? 'Verifying…' : 'Verify and continue',
           disabled: state.draft === null && tokenProblem(state.token) !== null,
-          hint: secretCopy(info.os, info.secretBackend),
+          hint: secretCopy(info.os, info.secrets.mode),
           go: () => {
             if (state.draft !== null) dispatch({ type: 'go', step: 1 });
             else void verifyToken();

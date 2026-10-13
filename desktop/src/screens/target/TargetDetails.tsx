@@ -8,7 +8,7 @@ import { Card } from '../../components/Card';
 import { CardRow } from '../../components/SettingRow';
 import { Tag } from '../../components/Tag';
 import type { Os } from '../../ipc/generated/Os';
-import type { SecretBackend } from '../../ipc/generated/SecretBackend';
+import type { SecretsMode } from '../../ipc/generated/SecretsMode';
 import type { TargetReport } from '../../ipc/generated/TargetReport';
 import type { TokenPresence } from '../../ipc/generated/TokenPresence';
 import { secretCopy } from '../../state/secretCopy';
@@ -27,7 +27,7 @@ export interface TargetDetailActions {
 export interface TargetDetailsProps {
   report: TargetReport;
   os: Os;
-  secretBackend: SecretBackend;
+  secretsMode: SecretsMode;
   actions: TargetDetailActions;
   /** Opens the machine picker (D.3e); null: no Change button. */
   onChangeMachine: (() => void) | null;
@@ -54,7 +54,7 @@ const titled = (text: string) => <span title={text}>{text}</span>;
 export function TargetDetails({
   report,
   os,
-  secretBackend,
+  secretsMode,
   actions,
   onChangeMachine,
 }: TargetDetailsProps) {
@@ -111,7 +111,7 @@ export function TargetDetails({
         <CardRow
           label="API token"
           value={tokenValue(report.token)}
-          {...(report.token.set && { sub: secretCopy(os, secretBackend) })}
+          {...(report.token.set && { sub: secretCopy(os, secretsMode) })}
           control={
             <Button size={26} onClick={actions.renew}>
               Renew

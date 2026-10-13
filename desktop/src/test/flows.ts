@@ -275,12 +275,15 @@ export function targetAdded(more: Partial<TargetAdded> = {}): TargetAdded {
  * different shapes invite the wrong import.
  */
 export function planParts(more: Partial<Omit<PlanView, 'opId'>> = {}): Omit<PlanView, 'opId'> {
+  const cls = more.class ?? 'bounded';
   return {
-    class: 'bounded',
+    class: cls,
     title: 'Add target lab',
     changes: [],
     target: 'lab',
     expiresAtMs: Date.now() + 600_000,
+    // As Rust's register_plan: a destructive plan asks the OS prompt (D.4a).
+    gesture: cls === 'destructive' ? 'os' : 'none',
     ...more,
   };
 }
