@@ -19,7 +19,24 @@
 //! failed authentication is a typed refusal, never "no such secret". The format's version rule
 //! is in `format.rs`.
 
+mod error;
+mod format;
+mod kdf;
+
 #[cfg(test)]
 mod kat;
 #[cfg(test)]
 mod testutil;
+
+pub use error::{
+    InputWhat, MalformedWhat, PasswordProblem, PayloadWhat, RecoveryKeyError, SizeWhat, VaultError,
+    VaultResult,
+};
+pub use format::{
+    SlotBody, SlotId, SlotKind, SlotRecord, VaultFile, VaultHeader, VaultId, FORMAT_V1, LABEL_MAX,
+    MAGIC, PAYLOAD_MAX, SLOT_AAD_DOMAIN, SLOT_MAX, STORE_ID_MAX, VAULT_FILE_MAX, WRITER_MAX,
+};
+pub use kdf::Argon2idParams;
+
+/// The vault's file name in a target store's root.
+pub const VAULT_FILE: &str = "vault";

@@ -23,3 +23,13 @@ pub(crate) fn unhex(text: &str) -> Vec<u8> {
 pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
+
+/// `n` bytes counting up from `start`, wrapping: the vectors' fixed "random" inputs.
+pub(crate) fn seq(start: u8, n: usize) -> Vec<u8> {
+    (0..n).map(|i| start.wrapping_add(i as u8)).collect()
+}
+
+/// [`seq`] as an array.
+pub(crate) fn seq_array<const N: usize>(start: u8) -> [u8; N] {
+    seq(start, N).try_into().expect("N bytes")
+}
