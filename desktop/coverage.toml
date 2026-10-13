@@ -146,6 +146,14 @@ status = "superseded"
 status = "planned"
 slice = "D.12"
 
+[leaf."lock off"]
+status = "planned"
+slice = "D.4"
+
+[leaf."lock on"]
+status = "planned"
+slice = "D.4"
+
 [leaf."login"]
 status = "unavailable"
 

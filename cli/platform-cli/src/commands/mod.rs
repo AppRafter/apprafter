@@ -27,6 +27,7 @@ pub mod import;
 pub mod init;
 pub mod k8s_helpers;
 pub mod kubeconfig;
+pub(crate) mod lock;
 pub mod login;
 pub mod machine_picker;
 pub mod migration;

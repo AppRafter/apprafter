@@ -789,8 +789,10 @@ pub fn vault_unreadable_help(path: &Path, problem: &VaultProblem) -> String {
 fn lock_incomplete_help(phase: LockPhase) -> String {
     match phase {
         LockPhase::Locking => "Run `apprafter lock on` again: it asks for the lock password \
-             and finishes, or `apprafter lock off` backs out of it. Until then commands that \
-             need the store's secrets refuse, because some may be only in the vault."
+             and the recovery key and finishes. Without one of them, `apprafter lock off` backs \
+             out of it with the other, and a new `apprafter lock on` makes a new recovery key. \
+             Until then commands that need the store's secrets refuse, because some may be only \
+             in the vault."
             .to_string(),
         LockPhase::Unlocking => "Run `apprafter lock off` again: it asks for the lock password \
              or the recovery key and finishes. Until then commands that need the store's \

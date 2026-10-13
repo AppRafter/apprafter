@@ -206,6 +206,13 @@ const ALLOWED: &[(&str, &str, Rule)] = &[
         "converse_with",
         Rule::AtTerminal,
     ),
+    // L5 (D.4a T23): a test build of `lock on` refuses a store outside APPRAFTER_SANDBOX; the
+    // case removes the fence to see it, every other variable still in the scratch root.
+    (
+        "platform-cli/tests/lock_test.rs",
+        "a_test_build_locks_no_store_outside_its_sandbox",
+        Rule::RemovesFence,
+    ),
     // The fence's own rows: a removed HOME, a removed store variable, no fence at all (it
     // changes nothing unless set), and roots the fence must refuse.
     (

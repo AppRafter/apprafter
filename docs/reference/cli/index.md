@@ -65,6 +65,7 @@ specific release rather than scraping these pages.
 | [`apprafter import`](import.md) | — | Rebuild local state from live Hetzner Cloud resources tagged with `apprafter=true`. |
 | [`apprafter init`](init.md) | — | Bootstrap a fresh cluster on the given provider/tier |
 | [`apprafter kubeconfig`](kubeconfig.md) | `kc` | Print the cached k3s kubeconfig (decrypted), fetching it over SSH on first use. |
+| [`apprafter lock`](lock.md) | — | Lock this target store's secrets in an encrypted vault, or put them back in files. |
 | [`apprafter login`](login.md) | — | Obtain an OIDC-backed kubeconfig — NOT IMPLEMENTED, it prints what it would do and writes nothing. |
 | [`apprafter migration`](migration.md) | — | Inspect and approve / reject MigrationPlans. |
 | [`apprafter node`](node.md) | — | Node-level operations on the active target's cluster node. |

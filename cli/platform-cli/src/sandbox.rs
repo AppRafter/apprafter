@@ -16,7 +16,8 @@
 //! the fence checks what the profile would otherwise supply — the age key and the SSH
 //! identity, which a caller names explicitly. D.4a adds `store.yaml` and the vault (c2) and
 //! the holder's base (e); on a store whose `store.yaml` says locked, locking or unlocking the
-//! age key is not fenced (d: the variable is refused there, and nothing reads the shared key).
+//! age key is not fenced (d: the variable is refused there, and nothing reads the shared key),
+//! except for `lock on` and `lock off`, which do.
 //!
 //! A location is inside a root when the canonical form of its deepest existing ancestor, with
 //! the rest appended, starts with the root's canonical form (macOS `/tmp` is `/private/tmp`;
@@ -115,7 +116,7 @@ impl std::error::Error for SandboxRootRefused {}
 
 /// Refuse to go on when `APPRAFTER_SANDBOX` is set and a location resolves outside it (module
 /// docs). Called once, by `run()`, between argument parsing and the startup checks.
-pub(crate) fn enforce(env: &dyn EnvSource) -> miette::Result<()> {
+pub(crate) fn enforce(env: &dyn EnvSource, command: &crate::cli::Commands) -> miette::Result<()> {
     let Some(value) = env.var_os(SANDBOX_ENV) else {
         return Ok(());
     };
@@ -130,7 +131,7 @@ pub(crate) fn enforce(env: &dyn EnvSource) -> miette::Result<()> {
         .ok()
         .flatten()
         .map(|f| f.secrets);
-    if fences_the_age_key(mode) {
+    if fences_the_age_key(command, mode) {
         for (location, path) in all.iter().filter(|(l, _)| *l == Location::AgeKey) {
             check(*location, path, &roots)?;
         }
@@ -138,16 +139,21 @@ pub(crate) fn enforce(env: &dyn EnvSource) -> miette::Result<()> {
     Ok(())
 }
 
-/// D.4a T5: whether the age key is fenced, for a store in `mode` (`None`: no lock state, or
-/// one that cannot be read — fenced). On a locked, locking or unlocking store nothing reads the
-/// shared key (`APPRAFTER_AGE_KEY` is refused, T35), so it is not; d4a-d's `lock on` and
-/// `lock off` read or write it and fence it whatever the state (Task 9 of its plan).
-pub(crate) fn fences_the_age_key(mode: Option<apprafter_core::secrets::SecretsMode>) -> bool {
+/// D.4a T5: whether the age key is fenced, for `command` on a store in `mode` (`None`: no lock
+/// state, or one that cannot be read — fenced). `lock on` and `lock off` read or write the
+/// shared key (`lock off` creates it where `APPRAFTER_AGE_KEY` points, O13): always fenced.
+/// Every other command on a locked, locking or unlocking store reads no shared key
+/// (`APPRAFTER_AGE_KEY` is refused there, T35): not fenced.
+pub(crate) fn fences_the_age_key(
+    command: &crate::cli::Commands,
+    mode: Option<apprafter_core::secrets::SecretsMode>,
+) -> bool {
     use apprafter_core::secrets::SecretsMode;
-    !matches!(
-        mode,
-        Some(SecretsMode::Locked | SecretsMode::Locking | SecretsMode::Unlocking)
-    )
+    matches!(command, crate::cli::Commands::Lock { .. })
+        || !matches!(
+            mode,
+            Some(SecretsMode::Locked | SecretsMode::Locking | SecretsMode::Unlocking)
+        )
 }
 
 /// The canonical roots `value` lists; a refusal for one that is relative or no directory.
@@ -335,18 +341,24 @@ mod tests {
     }
 
     /// T5: the age key is fenced unless the store's lock state says the shared key is never
-    /// read; a lock state that cannot be read is fenced.
+    /// read; a lock state that cannot be read is fenced; the lock leaves always fence it.
     #[test]
-    fn the_age_key_is_skipped_only_on_a_locked_locking_or_unlocking_store() {
+    fn the_age_key_is_skipped_only_on_a_locked_store_and_never_for_the_lock_leaves() {
+        use crate::cli::{Commands, LockCommand};
         use apprafter_core::secrets::SecretsMode;
-        assert!(fences_the_age_key(None));
-        assert!(fences_the_age_key(Some(SecretsMode::Files)));
+        let other = Commands::Top;
+        let lock_off = Commands::Lock {
+            action: LockCommand::Off,
+        };
+        assert!(fences_the_age_key(&other, None));
+        assert!(fences_the_age_key(&other, Some(SecretsMode::Files)));
         for mode in [
             SecretsMode::Locked,
             SecretsMode::Locking,
             SecretsMode::Unlocking,
         ] {
-            assert!(!fences_the_age_key(Some(mode)), "{mode:?}");
+            assert!(!fences_the_age_key(&other, Some(mode)), "{mode:?}");
+            assert!(fences_the_age_key(&lock_off, Some(mode)), "{mode:?}");
         }
     }
 }

@@ -16,8 +16,6 @@ pub(crate) mod commands;
 mod context;
 mod dispatch;
 pub(crate) mod examples;
-// Callers: d4a-d Task 5 (the prompt) and Task 9 (`Asker::answer`), which removes this allow.
-#[allow(dead_code)]
 mod prompt;
 mod render;
 mod sandbox;
@@ -115,7 +113,7 @@ pub fn run() -> Result<()> {
 
     // APPRAFTER_SANDBOX (tests, e2e walks, automated agents): refuse a location outside it
     // before anything reads or writes the store, the startup checks included. Inert unless set.
-    sandbox::enforce(&context::ProcessEnv)?;
+    sandbox::enforce(&context::ProcessEnv, &args.command)?;
 
     // The newer-release notice and the node-disk banner, both of which reach
     // outside this machine. Only now, after parsing: `--help`, `--version`

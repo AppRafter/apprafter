@@ -88,6 +88,15 @@ pub enum Commands {
         )]
         no_ping: bool,
     },
+    /// Lock this target store's secrets in an encrypted vault, or put them back in files. On a
+    /// locked store, a command that needs a Hetzner token or a cached kubeconfig asks for the
+    /// lock password in its terminal, and is refused where there is no terminal: an AI agent
+    /// that runs `apprafter` as you cannot use them without you. Other target stores on this
+    /// computer are not changed.
+    Lock {
+        #[command(subcommand)]
+        action: LockCommand,
+    },
     /// Bootstrap a fresh cluster on the given provider/tier.
     Init {
         /// Infrastructure provider identifier.
@@ -1609,6 +1618,26 @@ pub enum AuthCommand {
     /// Report current AppRafter Cloud (Managed) authentication
     /// status. Stub.
     Status,
+}
+
+#[derive(Debug, Subcommand)]
+/// `apprafter lock …` subcommands.
+pub enum LockCommand {
+    /// Move this target store's secrets into an encrypted vault: its targets' Hetzner tokens,
+    /// a new age key of its own, and the cached kubeconfigs and Argo CD passwords re-encrypted
+    /// to it. Asks for a new lock password twice and shows a recovery key once, which you type
+    /// back. Run it again to finish an interrupted run; on a locked store, `--timeout` changes
+    /// the default unlock window.
+    On {
+        /// Minutes an unlock window stays open by default, restarted by each command that uses
+        /// it; 0 makes every command ask. Default 5.
+        #[arg(long, value_name = "MINUTES", value_parser = clap::value_parser!(u32).range(0..=1440))]
+        timeout: Option<u32>,
+    },
+    /// Put this target store's secrets back on disk in clear — readable by any program running
+    /// as you — and delete the vault. Asks for the lock password or the recovery key, even
+    /// inside an unlock window. Also backs out of an interrupted `apprafter lock on`.
+    Off,
 }
 
 #[derive(Debug, Subcommand)]

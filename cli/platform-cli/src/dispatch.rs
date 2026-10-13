@@ -106,6 +106,7 @@ pub(crate) fn dispatch(args: Cli, typed: Typed) -> miette::Result<()> {
         },
         Commands::Whoami { no_ping } => commands::whoami::run(no_ping),
         Commands::Doctor { target, no_ping } => commands::doctor::run(target.as_deref(), no_ping),
+        Commands::Lock { action } => commands::lock::run(action),
         command => dispatch_cli(Cli { command }).map_err(miette::Report::new),
     }
 }
@@ -116,8 +117,11 @@ pub(crate) fn dispatch(args: Cli, typed: Typed) -> miette::Result<()> {
 /// in [`dispatch`].
 fn dispatch_cli(args: Cli) -> cli_core::Result<()> {
     match args.command {
-        Commands::Target { .. } | Commands::Whoami { .. } | Commands::Doctor { .. } => {
-            unreachable!("`dispatch` runs `target`, `whoami` and `doctor` on the core")
+        Commands::Target { .. }
+        | Commands::Whoami { .. }
+        | Commands::Doctor { .. }
+        | Commands::Lock { .. } => {
+            unreachable!("`dispatch` runs `target`, `whoami`, `doctor` and `lock` on the core")
         }
         Commands::Auth { action } => commands::auth::run(action)?,
         Commands::Init {

@@ -14,6 +14,7 @@
 * [apprafter import](import.md)
 * [apprafter init](init.md)
 * [apprafter kubeconfig](kubeconfig.md)
+* [apprafter lock](lock.md)
 * [apprafter login](login.md)
 * [apprafter migration](migration.md)
 * [apprafter node](node.md)

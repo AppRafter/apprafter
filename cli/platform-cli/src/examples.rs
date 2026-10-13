@@ -388,6 +388,14 @@ pub const EXAMPLES: &[CommandExamples] = &[
         ],
     },
     CommandExamples {
+        path: &["lock", "off"],
+        lines: &["apprafter lock off"],
+    },
+    CommandExamples {
+        path: &["lock", "on"],
+        lines: &["apprafter lock on", "apprafter lock on --timeout 15"],
+    },
+    CommandExamples {
         path: &["login"],
         lines: &["apprafter login"],
     },

@@ -120,11 +120,20 @@ pub(crate) fn ask_and_open(
 }
 
 /// `text` with its first letter capitalised: a refusal's message as a sentence.
-fn sentence(text: &str) -> String {
+pub(crate) fn sentence(text: &str) -> String {
     let mut chars = text.chars();
     match chars.next() {
         Some(first) => first.to_uppercase().chain(chars).collect(),
         None => String::new(),
+    }
+}
+
+/// T23 (critic finding 18): a test build (`insecure-fast-kdf`) says so on stderr — on `lock
+/// on` here, on `unlock` and `lock status` with d4a-e — in the overview's exact words, the line
+/// the golden harness drops. A release build prints nothing.
+pub(crate) fn insecure_kdf_note() {
+    if !KdfPolicy::active().is_release() {
+        eprintln!("INSECURE-FAST-KDF: this test build derives keys with weak parameters");
     }
 }
 
