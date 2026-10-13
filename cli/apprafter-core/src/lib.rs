@@ -58,6 +58,7 @@ pub mod ssh;
 pub mod target;
 pub mod target_ref;
 pub mod tools;
+pub mod vault;
 
 pub use cancel::{CancellationToken, Cancelled, Registration};
 pub use context::{

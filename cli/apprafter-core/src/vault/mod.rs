@@ -1,0 +1,25 @@
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
+//! The vault of a locked target store (ADR 0068 §2; D.4a overview §3.7, §3.8): its file
+//! format, its crypto and its writes.
+//!
+//! One random 256-bit data key encrypts the payload — the store's own age identity, each
+//! target's Hetzner token, the default unlock timeout — with XChaCha20-Poly1305. Each slot
+//! wraps that key under a key derived from its own secret: Argon2id over a lock password, or
+//! the 32 bytes of a recovery key, through HKDF-SHA256. The header is plain and parsed with a
+//! bound on everything; nothing in it is trusted until a slot or a held data key opens the
+//! payload, whose associated data is every byte before it.
+//!
+//! The module reads no environment, never prompts and takes every path as an argument. Plain
+//! text exists only inside `seal` and `open`, in pre-sized `Zeroizing` buffers; no type here
+//! derives `Serialize`, a secret is compared only in constant time, and Argon2's working
+//! memory is ours and zeroed (`tests/guards.rs`). Copies made inside the crates it calls are
+//! not wiped (T29's stated limit): the Blake2b state that absorbs a password and the stack
+//! buffers of Argon2's first blocks and `blake2b_long`, the `hkdf` HMAC state, bech32's encode
+//! buffer, and the old buffer `to_lowercase` leaves when typed recovery-key text grows. A
+//! failed authentication is a typed refusal, never "no such secret". The format's version rule
+//! is in `format.rs`.
+
+#[cfg(test)]
+mod kat;
+#[cfg(test)]
+mod testutil;
