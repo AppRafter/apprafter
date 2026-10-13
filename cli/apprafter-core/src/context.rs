@@ -18,7 +18,8 @@
 //!   ([`Context::with_vault_access`]);
 //! - the home directory (the age key's default, the `~/` of shown paths),
 //!   the age key path, the tool search path and where it came from
-//!   ([`PathSource`]), and a private runtime dir;
+//!   ([`PathSource`]), a private runtime dir, and on Linux and macOS where a
+//!   terminal's holder keeps its endpoint ([`Context::holder_base`]);
 //! - a request timeout, the `no_ping` switch, and the one HTTP agent every
 //!   network client is built on (connect, read and write bounded by the
 //!   request timeout, names resolved by a [`DeadlineResolver`]).
@@ -38,6 +39,7 @@ use crate::env::EnvSource;
 use crate::error::{CoreError, CoreResult};
 #[cfg(any(test, feature = "test-support"))]
 use crate::lock::FaultPoint;
+use crate::lock::{HolderBase, HolderBaseSource};
 use crate::net::DeadlineResolver;
 use crate::secrets::{NoVaultAccess, SecretStore, VaultAccess};
 use crate::tools::ToolResolver;
@@ -200,6 +202,9 @@ pub struct Context {
     no_ping: bool,
     /// How a locked store's secrets open here (D.4a T12): the client's, else `NoVaultAccess`.
     vault_access: Arc<dyn VaultAccess>,
+    /// Where a terminal's unlock holder keeps its endpoint (D.4a T49): the CLI's, from its
+    /// environment; `None` on Windows (a pipe) and for the desktop (no holder).
+    holder_base: Option<HolderBase>,
     /// Where an `insecure-fast-kdf` build may create a password slot (D.4a T23, critic S2).
     insecure_kdf_roots: Vec<PathBuf>,
     /// The KDF policy an in-process test runs the lock flows under (`test-support`).
@@ -238,6 +243,8 @@ impl Context {
     /// - `PATH` (raw, through [`EnvSource::var_os`]) as the tool search path.
     /// - `APPRAFTER_SANDBOX`, in an `insecure-fast-kdf` build only, as
     ///   [`Context::insecure_kdf_roots`].
+    /// - `XDG_RUNTIME_DIR` (Linux, macOS) and `TMPDIR` (macOS), when absolute, for the
+    ///   holder's base ([`Context::holder_base`]).
     ///
     /// The home directory comes from `cli_core::paths::home_dir()`; the
     /// runtime dir is `<config_root>/run`.
@@ -273,6 +280,11 @@ impl Context {
         };
         #[cfg(not(windows))]
         let runtime_dir = config_root.join("run");
+        #[cfg(target_os = "macos")]
+        let darwin = cli_core::paths::darwin_user_temp_dir;
+        #[cfg(not(target_os = "macos"))]
+        let darwin = || None;
+        let holder_base = holder_base_for(HolderOs::CURRENT, env, &config_root, darwin);
         let ctx = Self::assemble(
             config_root,
             hcloud_base_url,
@@ -292,7 +304,7 @@ impl Context {
                 .unwrap_or_default(),
             ..ctx
         };
-        Ok(ctx)
+        Ok(ctx.with_holder_base(holder_base))
     }
 
     /// The desktop's context, read from an allow-list of its environment.
@@ -385,6 +397,7 @@ impl Context {
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             no_ping: false,
             vault_access: Arc::new(NoVaultAccess),
+            holder_base: None,
             insecure_kdf_roots: Vec::new(),
             #[cfg(any(test, feature = "test-support"))]
             kdf_policy: None,
@@ -534,6 +547,19 @@ impl Context {
         &self.runtime_dir
     }
 
+    /// Where this CLI's terminal holders keep their endpoints (D.4a T49); `None` on Windows and
+    /// for the desktop.
+    pub fn holder_base(&self) -> Option<&HolderBase> {
+        self.holder_base.as_ref()
+    }
+
+    /// `from_cli_env`'s last step; also Task 11's limit tests, which build a CLI-like context
+    /// without the real environment (G3).
+    pub(crate) fn with_holder_base(mut self, base: Option<HolderBase>) -> Self {
+        self.holder_base = base;
+        self
+    }
+
     pub fn request_timeout(&self) -> Duration {
         self.request_timeout
     }
@@ -566,6 +592,62 @@ impl Context {
     }
 }
 
+/// The OS whose rules [`holder_base_for`] applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HolderOs {
+    Linux,
+    Macos,
+    Windows,
+}
+
+impl HolderOs {
+    /// The running OS's rules. `cfg!`, not one `#[cfg]` const per OS: every variant is then
+    /// built in every build, so the two the running OS never uses are no dead code there (the
+    /// resolver's tests use all three on every OS).
+    pub(crate) const CURRENT: HolderOs = if cfg!(target_os = "macos") {
+        HolderOs::Macos
+    } else if cfg!(windows) {
+        HolderOs::Windows
+    } else {
+        HolderOs::Linux
+    };
+}
+
+/// A terminal holder's base (D.4a T49): Linux `$XDG_RUNTIME_DIR/apprafter` when the variable is
+/// an absolute path, else `<config_root>/run`; macOS `$XDG_RUNTIME_DIR/apprafter`, else
+/// `$TMPDIR/apprafter`, else `darwin()/apprafter`; Windows none. Never derived from a uid, so a
+/// sandbox that sets these variables contains it. A directory that is not valid Unicode is no
+/// base (`None`): the holder then reports `no_runtime_dir`.
+pub(crate) fn holder_base_for(
+    os: HolderOs,
+    env: &dyn EnvSource,
+    config_root: &Path,
+    darwin: impl FnOnce() -> Option<PathBuf>,
+) -> Option<HolderBase> {
+    let absolute = |name: &str| env.var(name).map(PathBuf::from).filter(|p| p.is_absolute());
+    let (dir, source) = match os {
+        HolderOs::Windows => return None,
+        HolderOs::Linux => match absolute("XDG_RUNTIME_DIR") {
+            Some(run) => (run.join("apprafter"), HolderBaseSource::XdgRuntimeDir),
+            None => (config_root.join("run"), HolderBaseSource::StoreRuntimeDir),
+        },
+        HolderOs::Macos => {
+            if let Some(run) = absolute("XDG_RUNTIME_DIR") {
+                (run.join("apprafter"), HolderBaseSource::XdgRuntimeDir)
+            } else if let Some(tmp) = absolute("TMPDIR") {
+                (tmp.join("apprafter"), HolderBaseSource::Tmpdir)
+            } else {
+                (
+                    darwin()?.join("apprafter"),
+                    HolderBaseSource::DarwinUserTemp,
+                )
+            }
+        }
+    };
+    let dir = dir.into_os_string().into_string().ok()?;
+    Some(HolderBase { dir, source })
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
@@ -576,6 +658,7 @@ mod tests {
     use super::*;
     use crate::env::MapEnv;
     use crate::error::UiError;
+    use crate::lock::{HolderBase, HolderBaseSource};
 
     fn host() -> DesktopHost {
         DesktopHost {
@@ -999,5 +1082,110 @@ mod tests {
         assert!(!format!("{s:?}").contains("hunter2"));
         let ctx = Context::from_cli_env(&MapEnv::new().with("HCLOUD_TOKEN", "hunter2")).unwrap();
         assert!(!format!("{ctx:?}").contains("hunter2"));
+    }
+
+    // D.4a T49: where a terminal's holder keeps its endpoint, per OS, from the environment
+    // only (never a uid), so APPRAFTER_SANDBOX always contains it. `base` serves the Unix rows
+    // only (a Windows `PathBuf::join` writes `\\`).
+    #[cfg(unix)]
+    fn base(os: HolderOs, env: &MapEnv, darwin: Option<&str>) -> Option<HolderBase> {
+        holder_base_for(os, env, Path::new("/s/store"), || darwin.map(PathBuf::from))
+    }
+
+    fn at(dir: &str, source: HolderBaseSource) -> Option<HolderBase> {
+        Some(HolderBase {
+            dir: dir.into(),
+            source,
+        })
+    }
+
+    // The Unix rules on Unix (a Windows `PathBuf::join` writes `\\`); macOS's on Linux too.
+    #[cfg(unix)]
+    #[test]
+    fn linux_takes_an_absolute_runtime_dir_else_the_stores_own() {
+        let env = MapEnv::new().with("XDG_RUNTIME_DIR", "/run/x");
+        assert_eq!(
+            base(HolderOs::Linux, &env, None),
+            at("/run/x/apprafter", HolderBaseSource::XdgRuntimeDir)
+        );
+        for unset in [
+            MapEnv::new(),
+            MapEnv::new().with("XDG_RUNTIME_DIR", ""),
+            MapEnv::new().with("XDG_RUNTIME_DIR", "relative/run"),
+        ] {
+            assert_eq!(
+                base(HolderOs::Linux, &unset, Some("/var/folders/t")),
+                at("/s/store/run", HolderBaseSource::StoreRuntimeDir),
+                "an unset, empty or relative XDG_RUNTIME_DIR falls back to the store's run/"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn macos_takes_the_runtime_dir_then_tmpdir_then_the_per_user_temp_dir() {
+        let both = MapEnv::new()
+            .with("XDG_RUNTIME_DIR", "/r")
+            .with("TMPDIR", "/t/");
+        assert_eq!(
+            base(HolderOs::Macos, &both, Some("/d")),
+            at("/r/apprafter", HolderBaseSource::XdgRuntimeDir)
+        );
+        let tmp = MapEnv::new().with("TMPDIR", "/t/");
+        assert_eq!(
+            base(HolderOs::Macos, &tmp, Some("/d")),
+            at("/t/apprafter", HolderBaseSource::Tmpdir)
+        );
+        let rel = MapEnv::new().with("TMPDIR", "t");
+        assert_eq!(
+            base(HolderOs::Macos, &rel, Some("/d/")),
+            at("/d/apprafter", HolderBaseSource::DarwinUserTemp)
+        );
+        assert_eq!(
+            base(HolderOs::Macos, &MapEnv::new(), None),
+            None,
+            "nothing names a directory"
+        );
+    }
+
+    #[test]
+    fn windows_has_no_holder_base_and_never_asks_the_per_user_lookup() {
+        let env = MapEnv::new()
+            .with("XDG_RUNTIME_DIR", "/r")
+            .with("TMPDIR", "/t");
+        let asked = std::cell::Cell::new(false);
+        let got = holder_base_for(HolderOs::Windows, &env, Path::new("/s"), || {
+            asked.set(true);
+            Some(PathBuf::from("/d"))
+        });
+        assert_eq!(got, None);
+        assert!(!asked.get());
+        let linux = holder_base_for(HolderOs::Linux, &MapEnv::new(), Path::new("/s"), || {
+            asked.set(true);
+            None
+        });
+        assert!(
+            linux.is_some() && !asked.get(),
+            "only macOS asks the per-user lookup"
+        );
+    }
+
+    #[test]
+    fn the_clis_context_carries_its_holder_base_and_the_desktops_none() {
+        let env = MapEnv::new()
+            .with(cli_core::CONFIG_DIR_ENV, "/tmp/store")
+            .with("XDG_RUNTIME_DIR", "/tmp/run")
+            .with("TMPDIR", "/tmp/t");
+        let cli = Context::from_cli_env(&env).unwrap();
+        let want = if cfg!(windows) {
+            None
+        } else {
+            at("/tmp/run/apprafter", HolderBaseSource::XdgRuntimeDir)
+        };
+        assert_eq!(cli.holder_base().cloned(), want);
+        assert_eq!(
+            Context::for_desktop("/tmp/store".into(), "http://x").holder_base(),
+            None
+        );
     }
 }

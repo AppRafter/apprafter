@@ -15,7 +15,8 @@
 //! directory. Windows resolves the profile through a Known Folder no variable moves, so there
 //! the fence checks what the profile would otherwise supply — the age key and the SSH
 //! identity, which a caller names explicitly. D.4a adds `store.yaml` and the vault (c2) and
-//! the holder's base (e); on a store whose `store.yaml` says locked, locking or unlocking the
+//! the holder's base (e1: `XDG_RUNTIME_DIR`, and on macOS `TMPDIR`, or the per-user temporary
+//! directory); on a store whose `store.yaml` says locked, locking or unlocking the
 //! age key is not fenced (d: the variable is refused there, and nothing reads the shared key),
 //! except for `lock on` and `lock off`, which do.
 //!
@@ -49,6 +50,8 @@ pub(crate) enum Location {
     StoreFile,
     /// `<store>/vault` (D.4a c2).
     VaultFile,
+    /// Where a terminal's unlock holder keeps its endpoint (D.4a T49).
+    HolderBase,
 }
 
 impl Location {
@@ -62,6 +65,7 @@ impl Location {
             Location::RuntimeDir => "the runtime directory (<target store>/run)",
             Location::StoreFile => "the target store's lock state (<target store>/store.yaml)",
             Location::VaultFile => "the target store's vault (<target store>/vault)",
+            Location::HolderBase => "the holder's base directory (XDG_RUNTIME_DIR, TMPDIR)",
         }
     }
 }
@@ -200,6 +204,9 @@ fn locations(ctx: &Context) -> miette::Result<Vec<(Location, PathBuf)>> {
         cli_providers::hetzner_cloud::default_ssh_identity_path(),
     ));
     out.push((Location::RuntimeDir, ctx.runtime_dir().to_path_buf()));
+    if let Some(base) = ctx.holder_base() {
+        out.push((Location::HolderBase, PathBuf::from(&base.dir)));
+    }
     // A symlink from either out of the sandbox would be read or written outside it (D.4a c2).
     out.push((
         Location::StoreFile,

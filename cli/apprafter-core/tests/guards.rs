@@ -70,9 +70,10 @@ use syn::{Attribute, Expr, ImplItem, Item, Meta, Stmt, TraitItem, UseTree};
 
 /// Production env reads ([`Kind::EnvRead`] and [`Kind::Dirs`]) in
 /// [`RATCHETED_CRATES`]. Re-measure, with a per-crate and per-callee
-/// breakdown, with `cargo test -p apprafter-core --test guards -- --nocapture`. 49 since
-/// d4a-d: `cli_core::paths::local_data_dir`, the CLI's Windows runtime dir (T44).
-const ENV_READ_BASELINE: usize = 49;
+/// breakdown, with `cargo test -p apprafter-core --test guards -- --nocapture`. 50 since
+/// d4a-e: `cli_core::paths::darwin_user_temp_dir`, the holder's last macOS base (T49, W5); 49
+/// since d4a-d: `cli_core::paths::local_data_dir`, the CLI's Windows runtime dir (T44).
+const ENV_READ_BASELINE: usize = 50;
 
 /// The crates the core builds on, and the CLI.
 const RATCHETED_CRATES: &[&str] = &["cli-core", "cli-state", "cli-providers", "platform-cli"];
@@ -194,6 +195,12 @@ const SANCTIONED: &[(&str, &str)] = &[
     ("cli_core::paths::home_dir", "Context::from_desktop_env"),
     // `dirs::data_local_dir`: the CLI's runtime dir on Windows (D.4a T44).
     ("cli_core::paths::local_data_dir", "Context::from_cli_env"),
+    // `confstr(_CS_DARWIN_USER_TEMP_DIR)`: macOS's per-user temporary directory, the holder's
+    // last base (D.4a T49, W5), for the CLI's context only.
+    (
+        "cli_core::paths::darwin_user_temp_dir",
+        "Context::from_cli_env",
+    ),
 ];
 
 /// What reads or writes a target's `credentials.yaml`, reads the shared age key, or opens or
@@ -1671,6 +1678,12 @@ const REAL_ENV_TESTS: &[(&str, &str)] = &[
     (
         "apprafter-core/src/context.rs",
         "a_secret_never_shows_in_debug",
+    ),
+    // D.4a T49: the CLI's context carries the holder's base it read from a MapEnv; opens
+    // nothing.
+    (
+        "apprafter-core/src/context.rs",
+        "the_clis_context_carries_its_holder_base_and_the_desktops_none",
     ),
     // whoami pings with the stored token, not the CLI override: the override needs the CLI's
     // builder; the store is a tempdir it names.

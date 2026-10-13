@@ -239,3 +239,24 @@ fn a_root_that_is_relative_or_missing_is_refused() {
         "\"home\": {stderr}"
     );
 }
+
+/// D.4a T5, T49: the holder's base joins the fence — on Unix a runtime dir outside the sandbox
+/// is refused by name; inside it, nothing changes.
+#[cfg(unix)]
+#[test]
+fn a_holder_base_outside_is_refused() {
+    let out = outside();
+    refused(
+        &Spawn::new().with_env("XDG_RUNTIME_DIR", out.path()),
+        "the holder's base directory (XDG_RUNTIME_DIR, TMPDIR)",
+        out.path(),
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_holder_base_inside_runs() {
+    let sp = Spawn::new();
+    let out = list(&sp);
+    assert_eq!(out.status.code(), Some(0), "{}", squeeze(&out.stderr));
+}
