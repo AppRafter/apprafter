@@ -260,6 +260,28 @@ const ALLOWED: &[(&str, &str, Rule)] = &[
         "the_holder_refuses_a_terminal",
         Rule::AtTerminal,
     ),
+    // The OS probes of D.4a Task 6: this test binary re-run for an inner probe, one with a console
+    // of its own and one detached; they run no apprafter.
+    (
+        "platform-cli/tests/holder_probe.rs",
+        "rerun",
+        Rule::CurrentExe,
+    ),
+    (
+        "platform-cli/tests/holder_probe.rs",
+        "p5_macos_proc_pidpath_reads_a_process_that_denies_attach",
+        Rule::CurrentExe,
+    ),
+    (
+        "platform-cli/tests/holder_probe.rs",
+        "p1_windows_a_console_of_its_own_and_a_detached_child_attached_to_it",
+        Rule::CreationFlags,
+    ),
+    (
+        "platform-cli/tests/holder_probe.rs",
+        "inner_console_owner",
+        Rule::CreationFlags,
+    ),
 ];
 
 /// One rule broken at one line.
