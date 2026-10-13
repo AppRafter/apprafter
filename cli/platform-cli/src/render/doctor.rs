@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! `apprafter doctor`'s text from the core's report: one header per group, a line per check
-//! (`✓` `⚠` `✗`, and `–` for a check that did not run), the CLI's hint per fix, and the summary,
-//! whose totals leave skipped checks out (R8). The words of every hint that existed before the
-//! core are kept exactly; the desktop turns the same fixes into actions.
+//! (`✓` `⚠` `✗`, `–` for a check that did not run, and `ℹ` for a fact, D.4a T71), the CLI's hint
+//! per fix, and the summary, whose totals leave skipped checks and facts out (R8, T71). The words
+//! of every hint that existed before the core are kept exactly; the desktop turns the same fixes
+//! into actions.
 
 use std::fmt::Write as _;
 
@@ -10,6 +11,7 @@ use apprafter_core::doctor::{
     Check, CheckFix, CheckId, CheckStatus, DoctorReport, GroupId, RenewWhy,
 };
 use apprafter_core::kube::KubeErrorKind;
+use apprafter_core::secrets::{CacheKeyView, SecretsMode};
 use cli_core::diagnose::KubectlFailure;
 use cli_core::style;
 
@@ -41,6 +43,7 @@ fn line(out: &mut String, c: &Check) {
         CheckStatus::Warn => style::warn("⚠"),
         CheckStatus::Fail => style::fail("✗"),
         CheckStatus::Skipped => style::dim("–"),
+        CheckStatus::Info => style::info("ℹ"),
     };
     // `writeln!` into a String cannot fail.
     let _ = match &c.detail {
@@ -109,6 +112,15 @@ pub(crate) fn hint(c: &Check) -> Option<String> {
                     "token rejected; run `apprafter target add {target} --renew` with a new token \
                  from {}",
                     cli_core::target::HETZNER_API_TOKENS_PAGE
+                ),
+                RenewWhy::TokenOutsideVault => format!(
+                    "the token in credentials.yaml is in clear on a locked store and is not used: \
+                     run `apprafter target add {target} --renew --token <X>` to store it in the \
+                     vault"
+                ),
+                RenewWhy::TokenInAnotherVault => format!(
+                    "credentials.yaml points at another target store's vault: run `apprafter \
+                     target add {target} --renew --token <X>` to store the token here"
                 ),
             }
         }
@@ -194,8 +206,22 @@ pub(crate) fn hint(c: &Check) -> Option<String> {
              `apprafter kubeconfig --refresh --target {target}` fetches the kubeconfig again \
              under a new key, after listing what the new key cannot read and asking"
         ),
+        // A locked store's own key: the node is the authentic source (D.4a T38).
+        CheckFix::CacheUndecryptable {
+            target,
+            key: CacheKeyView::StoreVault,
+            ..
+        } => format!(
+            "the cached kubeconfig does not open with this store's own key (an older AppRafter or \
+             another program wrote it): run `apprafter kubeconfig --refresh --target {target}` to \
+             fetch it from the node again under the store's key"
+        ),
         // A lost key replaced by a new one leaves every other target's cache like this.
-        CheckFix::CacheUndecryptable { target, path } => format!(
+        CheckFix::CacheUndecryptable {
+            target,
+            path,
+            key: CacheKeyView::SharedFile,
+        } => format!(
             "the cached kubeconfig does not decrypt with the age key at `{path}`: it was cached \
              under another key, or the copy is damaged. Point `APPRAFTER_AGE_KEY` at the key it \
              was cached with, or run `apprafter kubeconfig --refresh --target {target}` to fetch \
@@ -211,6 +237,23 @@ pub(crate) fn hint(c: &Check) -> Option<String> {
             "the resolver could not answer for `{host}`: check your DNS settings, VPN or proxy"
         ),
         CheckFix::Explain { text } => text.clone(),
+        CheckFix::ProtectSecrets => "`apprafter lock on` encrypts them in a vault that opens only \
+             with your lock password or the recovery key"
+            .to_string(),
+        CheckFix::FinishLock {
+            phase: SecretsMode::Unlocking,
+        } => "run `apprafter lock off` again to finish it".to_string(),
+        // `locking`; a store in files or locked has nothing to finish, and no row names it.
+        CheckFix::FinishLock { .. } => "run `apprafter lock on` again to finish it, or \
+             `apprafter lock off` to back out of it"
+            .to_string(),
+        CheckFix::UnlockFirst => "run `apprafter unlock`, then `apprafter doctor` again for the \
+             token and cluster checks"
+            .to_string(),
+        CheckFix::ProtectSshKey { path } => format!(
+            "`{path}` reaches your nodes and stays outside the lock: give it a passphrase \
+             (`ssh-keygen -p -f {path}`) and keep it out of any ssh-agent an AI agent can reach"
+        ),
     })
 }
 
@@ -661,6 +704,7 @@ mod tests {
             CheckFix::CacheUndecryptable {
                 target: "p".into(),
                 path: "/k/age.key".into(),
+                key: CacheKeyView::SharedFile,
             },
         ))
         .unwrap();
@@ -713,6 +757,123 @@ mod tests {
             hint(&fail(CheckId::Dns, CheckFix::Dns { host: "h".into() }))
                 .unwrap()
                 .contains("`h`")
+        );
+    }
+
+    /// D.4a T71: an Info row is a fact — `ℹ`, and in no total.
+    #[test]
+    fn an_info_row_is_a_fact_in_no_total() {
+        let report = DoctorReport {
+            target: None,
+            groups: vec![CheckGroup {
+                id: GroupId::ThisComputer,
+                checks: vec![
+                    check(
+                        CheckId::Secrets,
+                        CheckStatus::Info,
+                        "Secrets in files (readable by any program running as you)",
+                        None,
+                        Some(CheckFix::ProtectSecrets),
+                    ),
+                    check(
+                        CheckId::Tool,
+                        CheckStatus::Pass,
+                        "`kubectl` on PATH",
+                        None,
+                        None,
+                    ),
+                ],
+            }],
+        };
+        let shown = plain(&render(&report));
+        assert!(
+            shown.contains(
+                "  ℹ Secrets in files (readable by any program running as you)\n      hint: \
+                 `apprafter lock on` encrypts them in a vault that opens only with your lock \
+                 password or the recovery key\n"
+            ),
+            "{shown}"
+        );
+        assert!(
+            shown.ends_with(
+                "1 checks: 1 passed. All good — ready for `apprafter init` / `apprafter apply`.\n"
+            ),
+            "{shown}"
+        );
+    }
+
+    /// D.4a §3.13: each lock fix names the command that applies it.
+    #[test]
+    fn the_lock_fixes_name_their_commands() {
+        let fail = |id, fix| check(id, CheckStatus::Fail, "t", None, Some(fix));
+        assert_eq!(
+            hint(&fail(
+                CheckId::Secrets,
+                CheckFix::FinishLock {
+                    phase: SecretsMode::Locking
+                }
+            ))
+            .unwrap(),
+            "run `apprafter lock on` again to finish it, or `apprafter lock off` to back out of it"
+        );
+        assert_eq!(
+            hint(&fail(
+                CheckId::Secrets,
+                CheckFix::FinishLock {
+                    phase: SecretsMode::Unlocking
+                }
+            ))
+            .unwrap(),
+            "run `apprafter lock off` again to finish it"
+        );
+        assert_eq!(
+            hint(&fail(CheckId::TokenPresent, CheckFix::UnlockFirst)).unwrap(),
+            "run `apprafter unlock`, then `apprafter doctor` again for the token and cluster checks"
+        );
+        let key = hint(&fail(
+            CheckId::SshKeyExposure,
+            CheckFix::ProtectSshKey {
+                path: "/home/a/.ssh/id_ed25519".into(),
+            },
+        ))
+        .unwrap();
+        assert!(
+            key.contains("`ssh-keygen -p -f /home/a/.ssh/id_ed25519`") && key.contains("ssh-agent"),
+            "{key}"
+        );
+        for (why, part) in [
+            (RenewWhy::TokenOutsideVault, "in clear on a locked store"),
+            (
+                RenewWhy::TokenInAnotherVault,
+                "another target store's vault",
+            ),
+        ] {
+            let h = hint(&fail(
+                CheckId::TokenPresent,
+                CheckFix::RenewToken {
+                    target: "p".into(),
+                    why,
+                },
+            ))
+            .unwrap();
+            assert!(
+                h.contains(part) && h.contains("`apprafter target add p --renew --token <X>`"),
+                "{h}"
+            );
+        }
+        let vault = hint(&fail(
+            CheckId::KubeApiReachable,
+            CheckFix::CacheUndecryptable {
+                target: "p".into(),
+                path: "/s/vault".into(),
+                key: CacheKeyView::StoreVault,
+            },
+        ))
+        .unwrap();
+        assert!(
+            vault.contains("`apprafter kubeconfig --refresh --target p`")
+                && !vault.contains("APPRAFTER_AGE_KEY"),
+            "{vault}"
         );
     }
 }

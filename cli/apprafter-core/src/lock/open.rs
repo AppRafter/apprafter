@@ -10,6 +10,22 @@
 pub use crate::vault::{PasswordProblem, MAX_PASSWORD_BYTES, RECOMMENDED_PASSWORD_CHARS};
 
 use crate::vault::RecoveryKeyError;
+use serde::Serialize;
+
+/// Advice on a new lock password, never a refusal: below [`RECOMMENDED_PASSWORD_CHARS`] Unicode
+/// scalar values (D.4a O2: anyone who copies the vault guesses it offline, where Argon2id only
+/// slows each guess) the CLI asks `Use it anyway? [y/N]`, the desktop shows its warning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum PasswordAdvice {
+    /// `chars` Unicode scalar values, fewer than `recommended`.
+    Short { chars: u32, recommended: u32 },
+}
 
 /// The wire name and the words of the vault's refusal of a new lock password; an inherent
 /// `impl` of the vault's type, in the same crate.

@@ -4,4 +4,4 @@
 /**
  * Why a token was not checked.
  */
-export type SkipReason = "no_ping" | "no_token" | "unsupported_provider";
+export type SkipReason = "no_ping" | "no_token" | "unsupported_provider" | "store_locked";

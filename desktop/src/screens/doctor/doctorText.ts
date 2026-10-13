@@ -26,12 +26,14 @@ export const STATUS_LABELS: Record<CheckStatus, string> = {
   warn: 'WARN',
   fail: 'FAIL',
   skipped: 'SKIP',
+  info: 'INFO',
 };
 export const STATUS_TONES = {
   pass: 'ok',
   warn: 'warn',
   fail: 'err',
   skipped: 'neutral',
+  info: 'neutral',
 } as const satisfies Record<CheckStatus, string>;
 
 const RENEW = 'on the Target screen: API token › Renew.';
@@ -40,6 +42,8 @@ const RENEW_WHY: Record<RenewWhy, string> = {
   token_missing: `No token is stored. Add one ${RENEW}`,
   token_malformed: `The stored token is malformed. Renew it with a fresh one ${RENEW}`,
   token_rejected: `The provider rejected the stored token. Create a new one in ${HETZNER_API_TOKENS_PAGE}, then renew it ${RENEW}`,
+  token_outside_vault: `The credentials file holds this token in clear on a locked store, so it is not used. Renew it ${RENEW}`,
+  token_in_another_vault: `The credentials file points at another target store's vault. Renew the token ${RENEW}`,
 };
 
 const TOOLCHAIN = 'The toolchain lists how for this computer.';
@@ -120,8 +124,11 @@ export function fixText(check: Check, target: string | null): string | null {
       return `There is no age key at ${fix.path}, so the cached kubeconfig cannot be decrypted: restore the key it was cached with. If the key is lost, fetching the kubeconfig from the server again caches it under a new key, and what was cached under the lost one has to be fetched again too.`;
     case 'cache_undecryptable':
       // No command either (WI-457 review #8): what a lost key replaced by a new one leaves on
-      // every other target, and the way back, described as what it does.
-      return `The cached kubeconfig does not decrypt with the age key at ${fix.path}: it was cached under another key, or the copy is damaged. Restore the key it was cached with, or fetch the kubeconfig from the server again, which caches it under this key.`;
+      // every other target, and the way back, described as what it does. On a locked store's own
+      // key the server is the authentic source (D.4a T38): only the fetch.
+      return fix.key === 'store_vault'
+        ? "The cached kubeconfig does not open with this target store's own key: an older AppRafter or another program wrote it. Fetch the kubeconfig from the server again, which caches it under the store's key."
+        : `The cached kubeconfig does not decrypt with the age key at ${fix.path}: it was cached under another key, or the copy is damaged. Restore the key it was cached with, or fetch the kubeconfig from the server again, which caches it under this key.`;
     case 'cluster_unreachable':
       return kubeText(fix.reason, target);
     case 'node_unreachable':
@@ -130,6 +137,17 @@ export function fixText(check: Check, target: string | null): string | null {
       return `The resolver could not answer for \`${fix.host}\`: check the DNS settings, a VPN or a proxy.`;
     case 'explain':
       return fix.text;
+    // D.4a: the lock's fixes (surface §4.2); the rows that raise them are d4a-e's and f's.
+    case 'protect_secrets':
+      return 'Settings › Lock › Protect secrets encrypts them.';
+    case 'finish_lock':
+      return fix.phase === 'unlocking'
+        ? "Unprotecting this target store's secrets did not finish: finish it in Settings › Lock."
+        : "Protecting this target store's secrets did not finish: finish it in Settings › Lock.";
+    case 'unlock_first':
+      return 'Unlock the app to run these checks.';
+    case 'protect_ssh_key':
+      return `${fix.path} reaches your servers and stays outside the lock: give it a passphrase, and keep it out of any ssh-agent other programs can reach.`;
   }
 }
 

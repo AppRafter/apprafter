@@ -16,6 +16,7 @@ const ACTION_LABEL: Record<ChangeAction, string> = {
   delete: 'Delete',
   set_default: 'Set default',
   clear_default: 'Clear default',
+  move: 'Move',
 };
 
 const ACTION_TONE: Record<ChangeAction, Tone> = {
@@ -27,6 +28,7 @@ const ACTION_TONE: Record<ChangeAction, Tone> = {
   delete: 'err',
   set_default: 'warn',
   clear_default: 'warn',
+  move: 'warn',
 };
 
 /** The core's object kinds (overview §3.5); another kind shows as it is. */

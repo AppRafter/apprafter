@@ -15,7 +15,7 @@ use crate::net;
 use crate::provider::{self, SUPPORTED_PROVIDERS};
 use crate::report::{Event, Reporter};
 use crate::runtime;
-use crate::secrets::SecretStore;
+use crate::secrets::{CacheKeyView, SecretStore, SecretsMode};
 use crate::target_ref::TargetRef;
 use crate::tools::{self, ToolId, ToolProblem, ToolStatus};
 
@@ -44,7 +44,8 @@ pub enum GroupId {
     ThisComputer,
 }
 
-/// One row's verdict. `Skipped` is a check that did not run; it counts in no total.
+/// One row's verdict. `Skipped` is a check that did not run, `Info` a fact that is no verdict (D.4a
+/// T71): neither counts in a total.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
@@ -53,6 +54,7 @@ pub enum CheckStatus {
     Warn,
     Fail,
     Skipped,
+    Info,
 }
 
 /// Which check a row is.
@@ -74,6 +76,18 @@ pub enum CheckId {
     NodeSshReachable,
     Tool,
     Dns,
+    // D.4a §3.13: the target-store lock's rows (d4a-e, d4a-f).
+    Secrets,
+    SshKeyExposure,
+    X11Keystrokes,
+    PtraceScope,
+    WindowsSameUser,
+    MacosTaskPort,
+    TerminalMultiplexer,
+    UnlockedTerminal,
+    WindowHardening,
+    SecretsInUse,
+    SleepUnreported,
 }
 
 /// Why a target's token should be renewed.
@@ -85,6 +99,10 @@ pub enum RenewWhy {
     TokenMissing,
     TokenMalformed,
     TokenRejected,
+    /// A clear token in a locked store's credentials file: never used (D.4a T42).
+    TokenOutsideVault,
+    /// A marker naming another store's vault (D.4a T34).
+    TokenInAnotherVault,
 }
 
 /// What would fix a row, as data: the CLI words it as today's hint, the desktop as an action.
@@ -154,10 +172,12 @@ pub enum CheckFix {
     },
     /// The cached kubeconfig does not decrypt with the age key at `path`: it was cached under
     /// another key (a lost one that a new key replaced) or is damaged. The target whose it is,
-    /// for the refetch under the key there is (WI-457 review #8).
+    /// for the refetch under the key there is (WI-457 review #8). `key` says which key (D.4a
+    /// §3.13).
     CacheUndecryptable {
         target: String,
         path: String,
+        key: CacheKeyView,
     },
     /// `reason`, never `kind`: that is the tag.
     ClusterUnreachable {
@@ -172,6 +192,20 @@ pub enum CheckFix {
     /// A neutral explanation (an OS error), printed verbatim.
     Explain {
         text: String,
+    },
+    /// The store's secrets are in files: locking them protects them (D.4a T72).
+    ProtectSecrets,
+    /// An earlier `lock on` (`locking`) or `lock off` (`unlocking`) did not finish.
+    FinishLock {
+        phase: SecretsMode,
+    },
+    /// The store is locked and nothing here holds its key: unlock, then run doctor again
+    /// (D.4a T66).
+    UnlockFirst,
+    /// The SSH key that reaches the nodes is outside the lock: no passphrase, or in an ssh-agent
+    /// (D.4a O1).
+    ProtectSshKey {
+        path: String,
     },
 }
 
@@ -234,6 +268,11 @@ impl DoctorReport {
     /// Rows that did not run; outside the pass / warn / fail totals.
     pub fn skipped(&self) -> usize {
         self.count(CheckStatus::Skipped)
+    }
+
+    /// Facts that are no verdict (D.4a T71); outside the pass / warn / fail totals.
+    pub fn informed(&self) -> usize {
+        self.count(CheckStatus::Info)
     }
 
     /// Whether any row failed (the CLI exits 1 on it).
@@ -886,6 +925,7 @@ fn kube_api(
         Err(CoreError::Cli(cli_core::CliError::CacheUndecryptable {
             target: whose,
             path,
+            key,
             ..
         })) => {
             return Ok(Check {
@@ -894,6 +934,7 @@ fn kube_api(
                 fix: Some(CheckFix::CacheUndecryptable {
                     target: whose,
                     path,
+                    key: key.into(),
                 }),
                 ..base
             })
@@ -2254,7 +2295,8 @@ mod tests {
             c[1].fix,
             Some(CheckFix::CacheUndecryptable {
                 target: "prod".into(),
-                path: ctx.age_key_path().display().to_string()
+                path: ctx.age_key_path().display().to_string(),
+                key: CacheKeyView::SharedFile,
             })
         );
         assert!(
@@ -2585,5 +2627,57 @@ mod tests {
             .unwrap();
         doctor(&ctx, DoctorTarget::CliDefault);
         assert!(!old.exists() && fresh.exists());
+    }
+
+    /// D.4a T71: an Info row is a fact, in no total.
+    #[test]
+    fn an_info_row_is_a_fact_in_no_total() {
+        let row = |status| Check {
+            id: CheckId::Secrets,
+            tool: None,
+            status,
+            title: "t".into(),
+            detail: None,
+            fix: Some(CheckFix::ProtectSecrets),
+        };
+        let report = DoctorReport {
+            target: None,
+            groups: vec![CheckGroup {
+                id: GroupId::ThisComputer,
+                checks: vec![
+                    row(CheckStatus::Info),
+                    row(CheckStatus::Pass),
+                    row(CheckStatus::Warn),
+                ],
+            }],
+        };
+        assert_eq!(
+            (
+                report.passed(),
+                report.warned(),
+                report.failed(),
+                report.skipped(),
+                report.informed()
+            ),
+            (1, 1, 0, 0, 1)
+        );
+        assert!(!report.has_failures());
+        assert_eq!(serde_json::to_value(CheckStatus::Info).unwrap(), "info");
+        assert_eq!(
+            serde_json::to_value(CheckFix::FinishLock {
+                phase: SecretsMode::Unlocking
+            })
+            .unwrap(),
+            serde_json::json!({"kind": "finish_lock", "phase": "unlocking"})
+        );
+        assert_eq!(
+            serde_json::to_value(CheckFix::CacheUndecryptable {
+                target: "p".into(),
+                path: "/s/vault".into(),
+                key: CacheKeyView::StoreVault,
+            })
+            .unwrap(),
+            serde_json::json!({"kind": "cache_undecryptable", "target": "p", "path": "/s/vault", "key": "store_vault"})
+        );
     }
 }

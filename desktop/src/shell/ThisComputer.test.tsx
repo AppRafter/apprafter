@@ -42,6 +42,7 @@ describe('This computer', () => {
       { status: 'skipped', reason: 'no_ping' },
       { status: 'skipped', reason: 'no_token' },
       { status: 'skipped', reason: 'unsupported_provider' },
+      { status: 'skipped', reason: 'store_locked' },
       { status: 'rejected' },
       { status: 'rate_limited' },
       { status: 'http_error', httpStatus: 503 },
@@ -56,6 +57,10 @@ describe('This computer', () => {
       });
       expect({ v, ok: line.tone === 'ok' }).toEqual({ v, ok: false });
     }
+    expect(verificationLine({ status: 'skipped', reason: 'store_locked' })).toEqual({
+      tone: 'neutral',
+      text: 'Not checked: the target store is locked',
+    });
     expect(verificationLine({ status: 'verified', elapsedMs: 182 })).toEqual({
       tone: 'ok',
       text: 'Token verified · 182 ms',

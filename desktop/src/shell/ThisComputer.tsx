@@ -37,7 +37,9 @@ export function verificationLine(v: Verification): VerificationLine {
         ? { tone: 'neutral', text: 'Not checked yet' }
         : v.reason === 'no_token'
           ? { tone: 'warn', text: 'No token stored' }
-          : { tone: 'neutral', text: 'No check exists for this provider' };
+          : v.reason === 'store_locked'
+            ? { tone: 'neutral', text: 'Not checked: the target store is locked' }
+            : { tone: 'neutral', text: 'No check exists for this provider' };
     case 'rejected':
       // The core's Rejected is the provider's 401 (provider.rs classify_ping_error).
       return { tone: 'err', text: 'Token rejected (HTTP 401)' };

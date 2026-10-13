@@ -4,4 +4,4 @@
 /**
  * Why a target's token should be renewed.
  */
-export type RenewWhy = "credentials_file_missing" | "token_missing" | "token_malformed" | "token_rejected";
+export type RenewWhy = "credentials_file_missing" | "token_missing" | "token_malformed" | "token_rejected" | "token_outside_vault" | "token_in_another_vault";

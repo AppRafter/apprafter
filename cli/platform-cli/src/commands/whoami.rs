@@ -88,6 +88,9 @@ pub(crate) fn verification_text(v: &Verification) -> String {
         Verification::Skipped {
             reason: SkipReason::UnsupportedProvider,
         } => "verification skipped — provider not supported".into(),
+        Verification::Skipped {
+            reason: SkipReason::StoreLocked,
+        } => "verification skipped — the target store is locked".into(),
         Verification::Rejected => "verification failed ✗ — token rejected (HTTP 401). Run `apprafter target add <name> --renew` to rotate.".into(),
         Verification::HttpError { http_status } => {
             format!("verification failed ✗ — HTTP {http_status} from provider API")
@@ -144,6 +147,12 @@ mod tests {
                 reason: SkipReason::NoToken
             }),
             "verification skipped — no token stored"
+        );
+        assert_eq!(
+            verification_text(&Verification::Skipped {
+                reason: SkipReason::StoreLocked
+            }),
+            "verification skipped — the target store is locked"
         );
         assert_eq!(
             verification_text(&Verification::Verified { elapsed_ms: 3 }),

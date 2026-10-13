@@ -2,9 +2,9 @@
 //! Writes `desktop/src/ipc/generated/`: the TypeScript declarations of every type that crosses
 //! IPC (ts-rs), the command, error-code and event names (`commands.ts`, `errors.ts`,
 //! `events.ts`) from this crate's constants, the core's error codes and target constants
-//! (`core-errors.ts`, `target.ts`), `fixtures/target-names.json`, the core's own answers to the
-//! target-name rule, and `fixtures/ui-errors.json`, the core's own projections of the errors the
-//! UI maps to actions.
+//! (`core-errors.ts`, `target.ts`), the lock's constants (`lock.ts`),
+//! `fixtures/target-names.json`, the core's own answers to the target-name rule, and
+//! `fixtures/ui-errors.json`, the core's own projections of the errors the UI maps to actions.
 //!
 //! Running it IS the regeneration: `just desktop-ipc-types`. The output is committed, and
 //! `scripts/check-desktop-ipc-types.sh` (CI, `just desktop-check`) fails when a fresh export
@@ -24,10 +24,16 @@ use apprafter_core::doctor::{
 };
 use apprafter_core::error::codes;
 use apprafter_core::kube::{KubeErrorKind, KubeVersion};
+use apprafter_core::lock::{
+    HolderBase, HolderBaseSource, HolderHardening, HolderUnavailableReason, LockReport,
+    MachineLimit, PasswordAdvice, SlotRefusalView, SlotView, UnlockWindow,
+    RECOMMENDED_PASSWORD_CHARS,
+};
 use apprafter_core::machine::{
     DeprecationView, MachineCatalogue, MachineOfferView, RegionLatency, RegionView,
 };
 use apprafter_core::provider::{SkipReason, TokenCheck, Verification, SUPPORTED_PROVIDERS};
+use apprafter_core::secrets::{CacheKeyView, LockSlotKind, SecretsMode, SlotInfo};
 use apprafter_core::session::{CliDefaultTarget, Identity, WhoamiReport, WhoamiTarget};
 use apprafter_core::ssh::{SshKeyCandidate, SshKeyInfo};
 use apprafter_core::target::{
@@ -103,12 +109,18 @@ fn export_the_typescript_bindings() {
         WhoamiTarget, CliDefaultTarget, WhoamiReport, ToolId, HintOs, InstallHint, ToolProblem,
         ToolStatus, ToolchainReport, GroupId, CheckStatus, CheckId, RenewWhy, CheckFix, Check,
         CheckGroup, DoctorReport, KubeErrorKind, KubeVersion,
+        // apprafter-core, D.4a (overview §3.4, §3.5, §3.9, §3.13, §3.14): the type freeze —
+        // every lock type the overview gives a `ts` derive
+        SecretsMode, LockSlotKind, SlotInfo, CacheKeyView, LockReport, SlotView, SlotRefusalView,
+        UnlockWindow, HolderHardening, HolderUnavailableReason, MachineLimit, HolderBase,
+        HolderBaseSource, PasswordAdvice,
     );
     fs::write(tmp.path().join("commands.ts"), commands_ts()).unwrap();
     fs::write(tmp.path().join("errors.ts"), errors_ts()).unwrap();
     fs::write(tmp.path().join("events.ts"), events_ts()).unwrap();
     fs::write(tmp.path().join("core-errors.ts"), core_errors_ts()).unwrap();
     fs::write(tmp.path().join("target.ts"), target_ts()).unwrap();
+    fs::write(tmp.path().join("lock.ts"), lock_ts()).unwrap();
     fs::create_dir_all(tmp.path().join("fixtures")).unwrap();
     fs::write(
         tmp.path().join("fixtures/target-names.json"),
@@ -369,6 +381,17 @@ fn target_ts() -> String {
         hetzner_token_len(),
         ts_text(cli_core::target::HETZNER_API_TOKENS_PAGE),
         rebuild_recipe_ts(),
+    )
+}
+
+/// apprafter-core's lock constants: the length below which a new lock password is warned about
+/// (D.4a O2), so the page's live warning counts as the core does.
+fn lock_ts() -> String {
+    format!(
+        "// Generated from apprafter-core's lock module by `just desktop-ipc-types`. Do not edit.\n\
+         \n\
+         /** Below this many Unicode code points a new lock password is warned about, never refused (D.4a O2). */\n\
+         export const RECOMMENDED_PASSWORD_CHARS = {RECOMMENDED_PASSWORD_CHARS};\n"
     )
 }
 

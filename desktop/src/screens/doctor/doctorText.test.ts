@@ -33,8 +33,20 @@ describe('counts and labels', () => {
       cluster: 'Cluster',
       this_computer: 'This computer',
     });
-    expect(STATUS_LABELS).toEqual({ pass: 'PASS', warn: 'WARN', fail: 'FAIL', skipped: 'SKIP' });
-    expect(STATUS_TONES).toEqual({ pass: 'ok', warn: 'warn', fail: 'err', skipped: 'neutral' });
+    expect(STATUS_LABELS).toEqual({
+      pass: 'PASS',
+      warn: 'WARN',
+      fail: 'FAIL',
+      skipped: 'SKIP',
+      info: 'INFO',
+    });
+    expect(STATUS_TONES).toEqual({
+      pass: 'ok',
+      warn: 'warn',
+      fail: 'err',
+      skipped: 'neutral',
+      info: 'neutral',
+    });
   });
 
   test('a local time stamp, minutes, zero-padded', () => {
@@ -169,7 +181,14 @@ describe('fixText', () => {
         'to be fetched again too.',
     );
     // WI-457 review #8: the cache of a target the new key cannot open (a lost key replaced).
-    expect(fixed({ kind: 'cache_undecryptable', target: 'prod-eu', path: '/k/age.key' })).toBe(
+    expect(
+      fixed({
+        kind: 'cache_undecryptable',
+        target: 'prod-eu',
+        path: '/k/age.key',
+        key: 'shared_file',
+      }),
+    ).toBe(
       'The cached kubeconfig does not decrypt with the age key at /k/age.key: it was cached ' +
         'under another key, or the copy is damaged. Restore the key it was cached with, or ' +
         'fetch the kubeconfig from the server again, which caches it under this key.',
@@ -202,6 +221,38 @@ describe('fixText', () => {
     );
   });
 
+  test('the lock fixes name Settings › Lock or the app, never a command (D.4a)', () => {
+    expect(fixed({ kind: 'protect_secrets' })).toBe(
+      'Settings › Lock › Protect secrets encrypts them.',
+    );
+    expect(fixed({ kind: 'finish_lock', phase: 'locking' })).toBe(
+      "Protecting this target store's secrets did not finish: finish it in Settings › Lock.",
+    );
+    expect(fixed({ kind: 'finish_lock', phase: 'unlocking' })).toBe(
+      "Unprotecting this target store's secrets did not finish: finish it in Settings › Lock.",
+    );
+    expect(fixed({ kind: 'unlock_first' })).toBe('Unlock the app to run these checks.');
+    expect(fixed({ kind: 'protect_ssh_key', path: '/home/alex/.ssh/id_ed25519' })).toBe(
+      '/home/alex/.ssh/id_ed25519 reaches your servers and stays outside the lock: give it a passphrase, and keep it out of any ssh-agent other programs can reach.',
+    );
+    expect(
+      fixed({ kind: 'renew_token', target: 'prod-eu', why: 'token_outside_vault' }),
+    ).toStartWith('The credentials file holds this token in clear');
+    expect(
+      fixed({ kind: 'renew_token', target: 'prod-eu', why: 'token_in_another_vault' }),
+    ).toStartWith("The credentials file points at another target store's vault");
+    expect(
+      fixed({
+        kind: 'cache_undecryptable',
+        target: 'prod-eu',
+        path: '/s/vault',
+        key: 'store_vault',
+      }),
+    ).toBe(
+      "The cached kubeconfig does not open with this target store's own key: an older AppRafter or another program wrote it. Fetch the kubeconfig from the server again, which caches it under the store's key.",
+    );
+  });
+
   test('a fix names a screen or a fact, never a CLI flag, but for the kubeconfig fetch (D.12)', () => {
     const fixes: CheckFix[] = [
       { kind: 'add_target', name: 'prod', available: ['lab'] },
@@ -217,10 +268,15 @@ describe('fixText', () => {
       { kind: 'ssh_key_not_public', target: 'prod-eu', path: '/k', privateKey: true },
       { kind: 'install_tool', tool: 'helm' },
       { kind: 'age_key_missing', target: 'prod-eu', path: '/k' },
-      { kind: 'cache_undecryptable', target: 'prod-eu', path: '/k' },
+      { kind: 'cache_undecryptable', target: 'prod-eu', path: '/k', key: 'shared_file' },
       { kind: 'cluster_unreachable', reason: 'unreachable' },
       { kind: 'node_unreachable', address: '203.0.113.10' },
       { kind: 'dns', host: 'api.hetzner.cloud' },
+      { kind: 'protect_secrets' },
+      { kind: 'finish_lock', phase: 'locking' },
+      { kind: 'unlock_first' },
+      { kind: 'protect_ssh_key', path: '/k' },
+      { kind: 'cache_undecryptable', target: 'prod-eu', path: '/k', key: 'store_vault' },
     ];
     for (const fix of fixes) {
       const text = fixed(fix);

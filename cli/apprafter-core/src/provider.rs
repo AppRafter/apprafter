@@ -63,6 +63,9 @@ pub enum SkipReason {
     NoPing,
     NoToken,
     UnsupportedProvider,
+    /// The target store is locked and nothing here holds its key (D.4a T66): a diagnostic never
+    /// prompts.
+    StoreLocked,
 }
 
 /// Why a Hetzner Cloud token is malformed (never the token itself).

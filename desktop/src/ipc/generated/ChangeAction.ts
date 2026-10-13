@@ -4,4 +4,4 @@
 /**
  * What a plan does to one object.
  */
-export type ChangeAction = "create" | "update" | "replace" | "keep" | "rename" | "delete" | "set_default" | "clear_default";
+export type ChangeAction = "create" | "update" | "replace" | "keep" | "rename" | "delete" | "set_default" | "clear_default" | "move";

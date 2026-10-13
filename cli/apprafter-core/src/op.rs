@@ -34,6 +34,8 @@ pub enum ChangeAction {
     Delete,
     SetDefault,
     ClearDefault,
+    /// Moved elsewhere: a token from `credentials.yaml` into the vault, or back (D.4a §3.14).
+    Move,
 }
 
 /// One object a plan changes.
@@ -139,6 +141,7 @@ mod tests {
             "set_default"
         );
         assert!(serde_json::to_value(&none).unwrap()["detail"].is_null());
+        assert_eq!(serde_json::to_value(ChangeAction::Move).unwrap(), "move");
     }
 
     #[cfg(feature = "ts")]
@@ -160,6 +163,7 @@ mod tests {
         );
         let action = ChangeAction::decl(&cfg);
         assert!(action.contains("\"clear_default\""), "{action}");
+        assert!(action.contains("\"move\""), "{action}");
         let pointer = crate::target_ref::ActivePointerChange::decl(&cfg);
         assert!(pointer.contains("from: string | null"), "{pointer}");
         let outcome = Outcome::<()>::decl(&cfg);
