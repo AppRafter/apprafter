@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Release gate for the Windows CLI (desktop design spec §6.5): on Windows the
-//! CLI's per-user defaults live under the signed-in user's profile and roaming
-//! application-data folder, whatever `HOME` says.
+//! CLI's per-user defaults live under the signed-in user's profile and its
+//! roaming and local application-data folders, whatever `HOME` says.
 //!
 //! Git Bash, MSYS2 and Cygwin export a `HOME` of their own, and a native
 //! Windows program inherits it. The CLI asks Windows for its Known Folders
@@ -10,13 +10,17 @@
 //! - the SSH identity for node round-trips is `%USERPROFILE%\.ssh\id_ed25519`;
 //! - the home directory the shared core reads (the add wizard's SSH key default
 //!   and candidate list are built from it) is `%USERPROFILE%`;
-//! - the target store is `%APPDATA%\apprafter`, with the core's runtime
-//!   directory under it.
+//! - the target store is `%APPDATA%\apprafter`;
+//! - the core's runtime directory, where a decrypted kubeconfig lives while a
+//!   command uses it, is `%LOCALAPPDATA%\apprafter\run\<tag>`: never roamed or
+//!   redirected to a share, one directory per store, `<tag>` eight hex digits
+//!   of a digest of the store's root (D.4a T44).
 //!
-//! `USERPROFILE` and `APPDATA` serve as the independent witness: the code under
-//! test never reads them, so a regression that starts trusting an environment
-//! variable shows up as a path somewhere else. A profile path with a space
-//! cannot be produced on a CI runner; the hand test on Windows covers it.
+//! `USERPROFILE`, `APPDATA` and `LOCALAPPDATA` serve as the independent
+//! witness: the code under test never reads them, so a regression that starts
+//! trusting an environment variable shows up as a path somewhere else. A
+//! profile path with a space cannot be produced on a CI runner; the hand test
+//! on Windows covers it.
 //!
 //! One test, because it changes this process's environment, in a file of its
 //! own, so nothing else runs in its test binary.
@@ -67,6 +71,7 @@ fn known_folder(var: &str) -> PathBuf {
 fn per_user_defaults_resolve_under_the_profile_whatever_home_says() {
     let profile = known_folder("USERPROFILE");
     let appdata = known_folder("APPDATA");
+    let local_appdata = known_folder("LOCALAPPDATA");
 
     // What Git Bash does, made deliberately wrong: a HOME outside the profile.
     // Every override the defaults honour is removed, so only defaults answer.
@@ -112,9 +117,20 @@ fn per_user_defaults_resolve_under_the_profile_whatever_home_says() {
     );
     assert_same_path("Context::age_key_path", ctx.age_key_path(), &age_key);
     assert_same_path("Context::config_root", ctx.config_root(), &store);
+    // D.4a T44: under Local AppData, never the roaming store; one directory per store.
+    let run = ctx.runtime_dir();
     assert_same_path(
-        "Context::runtime_dir",
-        ctx.runtime_dir(),
-        &store.join("run"),
+        "Context::runtime_dir's parent",
+        run.parent().expect("a runtime dir under its parent"),
+        &local_appdata.join("apprafter").join("run"),
+    );
+    let tag = run
+        .file_name()
+        .expect("a per-store directory")
+        .to_string_lossy()
+        .into_owned();
+    assert!(
+        tag.len() == 8 && tag.bytes().all(|b| b.is_ascii_hexdigit()),
+        "the per-store directory is eight hex digits: {tag:?}"
     );
 }

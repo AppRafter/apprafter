@@ -695,7 +695,7 @@ mod tests {
     /// interrupted lock it leaves. (A recovery-key slot only: no key derivation.)
     #[test]
     fn a_resume_asks_each_slot_and_enter_alone_names_the_way_out() {
-        let dir = tempfile::TempDir::new_in("/tmp").unwrap();
+        let dir = tempfile::tempdir().unwrap();
         let made = apprafter_core::secrets::testing::locked_store(dir.path(), &[("prod", None)]);
         let key = made.recovery_key().expose().replace('\n', " ");
         let question = resume_question(LockSlotKind::RecoveryKey, "~/store");
