@@ -446,8 +446,8 @@ impl TermGuard {
 #[cfg(unix)]
 impl Drop for TermGuard {
     fn drop(&mut self) {
-        // SAFETY: the termios this guard read from this fd.
-        unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.saved) };
+        // MUTANT: the guard does not put the terminal back.
+        let _ = (self.fd, &self.saved);
         restore::disarm();
     }
 }
@@ -553,14 +553,7 @@ mod restore {
         if !ARMED.swap(false, Ordering::SeqCst) {
             return false;
         }
-        // SAFETY: armed: the termios `arm` saved for FD.
-        unsafe {
-            libc::tcsetattr(
-                FD.load(Ordering::SeqCst),
-                libc::TCSANOW,
-                (*SAVED.termios.get()).as_ptr(),
-            )
-        };
+        // MUTANT: the handler does not put the terminal back.
         true
     }
 
