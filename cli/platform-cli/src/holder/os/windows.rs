@@ -25,8 +25,8 @@ use windows_sys::Win32::System::SystemInformation::{
     GetSystemDirectoryW, GetSystemWindowsDirectoryW, GetTickCount64,
 };
 use windows_sys::Win32::System::Threading::{
-    CreateEventW, GetCurrentProcess, OpenProcess, OpenProcessToken, TerminateProcess,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    CreateEventW, GetCurrentProcess, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW,
+    TerminateProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
 };
 use windows_sys::Win32::System::WindowsProgramming::QueryUnbiasedInterruptTime;
 use windows_sys::Win32::System::IO::{
@@ -351,6 +351,29 @@ fn dir(get: impl Fn(*mut u16, u32) -> u32) -> io::Result<Vec<u16>> {
     Ok(buf)
 }
 
+/// The image path of process `pid` (T53's identity check; `lock now`'s fallback).
+pub(crate) fn image_path(pid: u32) -> io::Result<std::path::PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    // SAFETY: a query-only handle, owned below.
+    let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if h.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let h = Handle(h);
+    let mut buf = vec![0u16; 1024];
+    let mut len = buf.len() as u32;
+    // SAFETY: writes at most `len` UTF-16 units.
+    if unsafe { QueryFullProcessImageNameW(h.0, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len) }
+        == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    buf.truncate(len as usize);
+    Ok(std::path::PathBuf::from(std::ffi::OsString::from_wide(
+        &buf,
+    )))
+}
+
 /// `lock now` on a hung holder (T59, S9): open the process first — a handle pins it — then
 /// check the pipe's server is still that pid, then terminate through the handle.
 pub(crate) fn kill_server(pipe: &Handle, pid: u32) -> io::Result<()> {
@@ -379,6 +402,13 @@ pub(crate) fn kill_server(pipe: &Handle, pid: u32) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// The pid of the server at the other end of a client's pipe (Task 6 P2).
+pub(crate) fn server_pid(pipe: &Handle) -> Option<u32> {
+    let mut pid = 0u32;
+    // SAFETY: the client's pipe handle; writes one pid.
+    (unsafe { GetNamedPipeServerProcessId(pipe.0, &mut pid) } != 0).then_some(pid)
 }
 
 /// Overlapped reads and writes on a pipe, each bounded by the per-operation timeout and, when

@@ -3,7 +3,9 @@
 //! client is spent after its request. 2 s per step — the connect, each read, each write — and
 //! 5 s in all; past them the holder "does not answer" and the command goes on without it (T59).
 //! The server's uid must be this process's (a shared base under `/tmp` could hold another
-//! user's socket).
+//! user's socket). The server must run as this user, and on macOS and Windows be this very
+//! binary (T53); Linux cannot check that (the holder is non-dumpable), and T48 states what a
+//! squatter's replies can do.
 
 use std::io;
 #[cfg(unix)]
@@ -123,9 +125,29 @@ impl HolderClient {
         Ok(HolderClient::at(&endpoint))
     }
 
-    /// A client of the holder at `endpoint`, if one listens there and runs as this user.
+    /// A client of the holder at `endpoint`, if one listens there as this user — and, on macOS,
+    /// runs this very binary (T53).
     #[cfg(unix)]
     pub fn at(endpoint: &Endpoint) -> Option<HolderClient> {
+        let me = std::env::current_exe().ok()?;
+        HolderClient::at_expecting(endpoint, &me)
+    }
+
+    /// [`HolderClient::at`] with the holder's expected image named (tests: their client is a test
+    /// binary). Linux checks no image: the holder is non-dumpable, so `/proc/<pid>/exe` is closed
+    /// to the same user (`linux_the_holders_image_is_unreadable`).
+    #[cfg(unix)]
+    pub fn at_expecting(endpoint: &Endpoint, image: &std::path::Path) -> Option<HolderClient> {
+        HolderClient::connect(endpoint, image, same_file)
+    }
+
+    /// The Unix connect, the server's image judged by `accept` against `image` (macOS).
+    #[cfg(unix)]
+    fn connect(
+        endpoint: &Endpoint,
+        image: &std::path::Path,
+        accept: fn(&std::path::Path, &std::path::Path) -> bool,
+    ) -> Option<HolderClient> {
         let Endpoint::Socket { path, .. } = endpoint else {
             return None;
         };
@@ -138,6 +160,12 @@ impl HolderClient {
         if server.uid != unsafe { libc::geteuid() } {
             return None;
         }
+        #[cfg(target_os = "macos")]
+        if !accept(&super::os::current::image_path(server.pid).ok()?, image) {
+            return None;
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = (image, accept);
         use super::binding::ProcLookup;
         Some(HolderClient {
             server_pid: u32::try_from(server.pid).ok().filter(|p| *p > 0),
@@ -273,10 +301,31 @@ impl HolderClient {
     }
 
     /// The holder of `store` on this process's console (T51, T50): one pipe name per process the
-    /// console lists, all tried within one request's 5 s (T59); `Err` when this process has no
-    /// console (no window is possible here).
+    /// console lists, all tried within one request's 5 s (T59), and only a server that is this
+    /// very binary (T53); `Err` when this process has no console (no window is possible here).
     #[cfg(windows)]
     pub fn on_console(store: &StoreBinding) -> Result<Option<HolderClient>, HolderUnavailable> {
+        let me = std::env::current_exe().map_err(|_| HolderUnavailable::NoConsole { code: 0 })?;
+        HolderClient::on_console_expecting(store, &me)
+    }
+
+    /// [`HolderClient::on_console`] with the holder's expected image named (tests). A pipe whose
+    /// server is not the pid its name carries, or whose image is not this binary, is skipped (T53).
+    #[cfg(windows)]
+    pub fn on_console_expecting(
+        store: &StoreBinding,
+        image: &std::path::Path,
+    ) -> Result<Option<HolderClient>, HolderUnavailable> {
+        HolderClient::console_with(store, image, same_file)
+    }
+
+    /// The Windows search of this console's holders, each server's image judged by `accept`.
+    #[cfg(windows)]
+    fn console_with(
+        store: &StoreBinding,
+        image: &std::path::Path,
+        accept: fn(&std::path::Path, &std::path::Path) -> bool,
+    ) -> Result<Option<HolderClient>, HolderUnavailable> {
         let user =
             super::os::windows::user_sid_string().map_err(|e| HolderUnavailable::NoConsole {
                 code: e.raw_os_error().unwrap_or(0) as u32,
@@ -289,7 +338,11 @@ impl HolderClient {
         let me = std::process::id();
         let deadline = SystemClock.with_sleep() + OVERALL;
         Ok(console.into_iter().filter(|p| *p != me).find_map(|pid| {
-            HolderClient::pipe_by(&super::endpoint::pipe_name(&id, pid), pid, deadline)
+            let client =
+                HolderClient::pipe_by(&super::endpoint::pipe_name(&id, pid), pid, deadline)?;
+            let ours = super::os::windows::server_pid(&client.pipe) == Some(pid)
+                && super::os::windows::image_path(pid).is_ok_and(|p| accept(&p, image));
+            ours.then_some(client)
         }))
     }
 
@@ -316,6 +369,48 @@ impl HolderClient {
     pub fn terminate_server(self) -> Result<(), HolderError> {
         let pid = self.server_pid.ok_or(HolderError::Unexpected)?;
         super::os::windows::kill_server(&self.pipe, pid).map_err(HolderError::Io)
+    }
+}
+
+/// A client that may only end a holder (`lock now`, `unlock`'s replacement, `lock off`; T56,
+/// T58): what [`HolderClient::at`] finds, and also — on macOS and Windows — a holder whose image
+/// has this binary's file name at another path, an older install an upgrade moved, which `at`
+/// refuses so that no command reads through it (critic-d4a-e finding 13). `End` carries no
+/// secret and its reply none; this type asks for nothing else.
+pub struct HolderToEnd(HolderClient);
+
+impl HolderToEnd {
+    #[cfg(unix)]
+    pub fn at(endpoint: &Endpoint) -> Option<HolderToEnd> {
+        let me = std::env::current_exe().ok()?;
+        HolderToEnd::at_expecting(endpoint, &me)
+    }
+
+    /// [`HolderToEnd::at`] with the expected image named (tests).
+    #[cfg(unix)]
+    pub fn at_expecting(endpoint: &Endpoint, image: &std::path::Path) -> Option<HolderToEnd> {
+        HolderClient::connect(endpoint, image, same_program).map(HolderToEnd)
+    }
+
+    #[cfg(windows)]
+    pub fn on_console(store: &StoreBinding) -> Result<Option<HolderToEnd>, HolderUnavailable> {
+        let me = std::env::current_exe().map_err(|_| HolderUnavailable::NoConsole { code: 0 })?;
+        Ok(HolderClient::console_with(store, &me, same_program)?.map(HolderToEnd))
+    }
+
+    pub fn server_pid(&self) -> Option<u32> {
+        self.0.server_pid()
+    }
+
+    /// `End`: the holder zeroes its key and exits.
+    pub fn end(&mut self) -> Result<(), HolderError> {
+        self.0.end()
+    }
+
+    /// [`HolderClient::terminate_server`]: a holder that does not answer, ended through this
+    /// connection (S9).
+    pub fn terminate_server(self) -> Result<(), HolderError> {
+        self.0.terminate_server()
     }
 }
 
@@ -366,6 +461,21 @@ fn open_pipe(name: &str, deadline: Duration) -> Option<super::os::windows::Handl
         return None;
     }
     None
+}
+
+/// The same file, by canonical path (a symlinked install, `/private/tmp` on macOS). Named on
+/// every OS (Linux passes it and never calls it: no image check there).
+fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// This binary or another install of it: the same file, or a file of the same name (only
+/// [`HolderToEnd`] accepts that).
+fn same_program(a: &std::path::Path, b: &std::path::Path) -> bool {
+    same_file(a, b) || (a.file_name().is_some() && a.file_name() == b.file_name())
 }
 
 #[cfg(all(test, unix))]

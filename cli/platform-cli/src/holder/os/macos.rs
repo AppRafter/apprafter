@@ -200,6 +200,19 @@ pub(crate) fn kill_server(
     }
 }
 
+/// A process's image path (`proc_pidpath`; Task 6 P5: it reads a `PT_DENY_ATTACH` process).
+pub(crate) fn image_path(pid: i32) -> io::Result<std::path::PathBuf> {
+    let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: writes at most `buf.len()` bytes.
+    let n = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    if n <= 0 {
+        return Err(io::Error::last_os_error());
+    }
+    buf.truncate(n as usize);
+    use std::os::unix::ffi::OsStringExt;
+    Ok(std::path::PathBuf::from(std::ffi::OsString::from_vec(buf)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -17,7 +17,7 @@ use std::process::{Child, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use apprafter::holder::client::{HolderClient, HolderError, IO_TIMEOUT};
+use apprafter::holder::client::{HolderClient, HolderError, HolderToEnd, IO_TIMEOUT};
 use apprafter::holder::endpoint::{session_endpoint, socket_endpoint, Endpoint, EndpointId};
 use apprafter::holder::protocol::{read_reply, HolderItem, InitHeader, Reply, StoreBinding};
 use apprafter::holder::spawn::{start_with, HolderStarted};
@@ -669,6 +669,68 @@ fn a_leaked_holder_fails_its_test() {
     );
 }
 
+/// T53 (macOS): a process that took the holder's socket — here this test binary, listening
+/// where this session's holder would — is no holder: the client finds none and the command
+/// would prompt. Without the check it would send its request there and wait. The client asks
+/// only once the squatter says it listens (shell builtins only: `Spawn`'s `PATH` is an empty
+/// directory, so there is no `sleep`), so the answer is the identity check's, never timing's.
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_a_squatter_at_the_holders_socket_is_no_holder() {
+    let st = store(Spawn::new());
+    let mut s = Live::start(&st.sp, "t inner_squat & read _; ask status; wait");
+    assert_eq!(s.next(), "squatting");
+    s.go();
+    assert_eq!(s.next(), "none");
+    assert!(s.finish().is_empty());
+}
+
+/// T53, T58 (macOS; critic-d4a-e finding 13): an upgrade that moved the binary leaves a holder
+/// of the old path. No command reads through it — its image is not this binary — but a client
+/// that only ends a holder (`lock now`, `unlock`, `lock off`) accepts an image of this binary's
+/// file name, so it is ended.
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_a_holder_an_upgrade_moved_is_read_by_none_and_ended() {
+    let st = store(Spawn::new());
+    let old = st.sp.path("old");
+    std::fs::create_dir_all(&old).unwrap();
+    let moved = old.join("apprafter");
+    std::fs::copy(Bin::Apprafter.path(), &moved).unwrap();
+    let script = format!(
+        "HOLDER_TEST_PROGRAM='{}'; export HOLDER_TEST_PROGRAM; t inner_start; \
+         unset HOLDER_TEST_PROGRAM; ask status; ask end-old; ask status",
+        moved.display()
+    );
+    let s = Live::start(&st.sp, &script);
+    started_pid(&s.next());
+    let lock = lock_of(&st.sp, &st.binding, s.sid());
+    assert_eq!(
+        s.next(),
+        "none",
+        "a command read through another install's holder"
+    );
+    assert_eq!(s.next(), "ended");
+    assert!(gone_within(&lock, Duration::from_secs(2)));
+    assert_eq!(s.next(), "none");
+    assert!(s.finish().is_empty());
+}
+
+/// T53 (Linux): no identity check is possible — the holder's image is unreadable to the same
+/// user (non-dumpable) — pinned so a kernel that allows it is noticed.
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_the_holders_image_is_unreadable() {
+    let st = store(Spawn::new());
+    let mut s = Live::start(&st.sp, "t inner_start; read _; ask end");
+    let pid = started_pid(&s.next());
+    let err = std::fs::read_link(format!("/proc/{pid}/exe")).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    s.go();
+    assert_eq!(s.next(), "ended");
+    s.finish();
+}
+
 // ---------------------------------------------------------------------
 // Inner tests: the commands of a session
 // ---------------------------------------------------------------------
@@ -736,7 +798,11 @@ fn inner_start() {
         poll_leader: std::env::var_os("HOLDER_TEST_POLL").is_some(),
         client_pid: std::process::id(),
     };
-    match start_with(Path::new(Bin::Apprafter.path()), &init, opened.data_key()) {
+    // The program a moved install would run (`HOLDER_TEST_PROGRAM`), else this build's.
+    let program = std::env::var_os("HOLDER_TEST_PROGRAM")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(Bin::Apprafter.path()));
+    match start_with(&program, &init, opened.data_key()) {
         Ok(HolderStarted::Started { pid }) => println!("holder: started {pid}"),
         Ok(HolderStarted::AlreadyRunning { pid }) => println!("holder: already {pid}"),
         Err(u) => println!("holder: unavailable {:?}", u.reason()),
@@ -776,7 +842,19 @@ fn inner_ask() {
         println!("holder: {said}");
         return;
     }
-    let Some(mut client) = HolderClient::at(&endpoint) else {
+    if std::env::var("HOLDER_TEST_ASK").as_deref() == Ok("end-old") {
+        let said = match HolderToEnd::at_expecting(&endpoint, Path::new(Bin::Apprafter.path())) {
+            Some(mut old) => match old.end() {
+                Ok(()) => "ended".to_string(),
+                Err(e) => format!("error {e:?}"),
+            },
+            None => "none".to_string(),
+        };
+        println!("holder: {said}");
+        return;
+    }
+    let Some(mut client) = HolderClient::at_expecting(&endpoint, Path::new(Bin::Apprafter.path()))
+    else {
         println!("holder: none");
         return;
     };
@@ -833,4 +911,28 @@ fn inner_ask() {
         other => format!("error {other:?}"),
     });
     println!("holder: {said}");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "a squatter in a session holder_unix's tests start"]
+fn inner_squat() {
+    let w = inner();
+    let Endpoint::Socket { path, .. } = session_endpoint(&w.base, &binding_of(&w.root)).unwrap()
+    else {
+        unreachable!()
+    };
+    let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    println!("holder: squatting");
+    std::io::stdout().flush().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let until = Instant::now() + Duration::from_secs(4);
+    let mut held = Vec::new();
+    while Instant::now() < until {
+        if let Ok((c, _)) = listener.accept() {
+            held.push(c);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = std::fs::remove_file(&path);
 }

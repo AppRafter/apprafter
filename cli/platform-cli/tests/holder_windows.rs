@@ -621,6 +621,14 @@ fn windows_the_holders_pid_file_lives_as_long_as_it() {
     );
 }
 
+/// T53 (Windows): a process on this console that took a holder's pipe name — this test binary,
+/// as the pipe of its own pid — is no holder: its image is not apprafter.
+#[test]
+fn windows_a_squatter_on_the_console_is_no_holder() {
+    let s = scratch();
+    assert_eq!(on_a_console(&s, "squatter"), ["squatting", "none"]);
+}
+
 // ---------------------------------------------------------------------
 // Inner tests
 // ---------------------------------------------------------------------
@@ -685,6 +693,36 @@ fn inner_leader() {
     // A Ctrl+C on this console (the ctrl_c scenario) must not end this leader.
     // SAFETY: ignore Ctrl+C in this process.
     unsafe { SetConsoleCtrlHandler(None, 1) };
+    if w.scenario == "squatter" {
+        let mut squatter = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "inner_squatter",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Its "holder: " line, after libtest's own (GOTCHA-217: maybe on the same line).
+        let mut out = BufReader::new(squatter.stdout.take().unwrap());
+        let mut line = String::new();
+        let first = loop {
+            line.clear();
+            if out.read_line(&mut line).unwrap() == 0 {
+                break "the squatter said nothing".to_string();
+            }
+            if let Some(s) = said(&line) {
+                break s.to_string();
+            }
+        };
+        println!("holder: {first}");
+        ask("status", false, &[]);
+        let _ = squatter.kill();
+        let _ = squatter.wait();
+        return;
+    }
     let bytes = std::fs::read(w.root.join("vault")).unwrap();
     let opened = VaultFile::parse(&bytes)
         .unwrap()
@@ -806,7 +844,9 @@ fn inner_ask() {
             &name,
             std::env::var("HOLDER_W_PIPE_PID").unwrap().parse().unwrap(),
         ),
-        Err(_) => HolderClient::on_console(&store).unwrap(),
+        Err(_) => {
+            HolderClient::on_console_expecting(&store, Path::new(Bin::Apprafter.path())).unwrap()
+        }
     };
     let Some(mut client) = client else {
         println!("holder: none");
@@ -849,4 +889,33 @@ fn inner_ask() {
             other => format!("error {other:?}"),
         })
     );
+}
+
+#[test]
+#[ignore = "a squatter on a holder_windows console"]
+fn inner_squatter() {
+    let w = inner();
+    let user = apprafter::holder::os_user_sid().unwrap();
+    let name = pipe_name(
+        &EndpointId::for_user(&user, &binding_of(&w.root)),
+        std::process::id(),
+    );
+    let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+    // SAFETY: a squatter's pipe under the holder's naming, served by nobody.
+    let h = unsafe {
+        CreateNamedPipeW(
+            wide.as_ptr(),
+            PIPE_ACCESS_DUPLEX,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+            1,
+            512,
+            512,
+            0,
+            std::ptr::null(),
+        )
+    };
+    assert_ne!(h, INVALID_HANDLE_VALUE);
+    println!("holder: squatting");
+    std::io::stdout().flush().unwrap();
+    std::thread::sleep(Duration::from_secs(10));
 }
