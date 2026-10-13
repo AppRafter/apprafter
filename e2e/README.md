@@ -20,6 +20,7 @@ and asserts the operator reconciles it to `Ready`, and destroys.
 ```sh
 export HCLOUD_TOKEN=...                          # Hetzner API token
 export APPRAFTER_SSH_PUBLIC_KEY="$(cat ~/.ssh/id_ed25519.pub)"
+export APPRAFTER_E2E_SSH_KEY=~/.ssh/id_ed25519   # its private half
 ./e2e/mvp.sh                                     # green in ~6-8 min
 ```
 
@@ -29,6 +30,7 @@ export APPRAFTER_SSH_PUBLIC_KEY="$(cat ~/.ssh/id_ed25519.pub)"
 | -------------------------------- | -------- | ------- | --------------------------------------------------- |
 | `HCLOUD_TOKEN`                   | yes      | —       | Hetzner Cloud API token (Read+Write).               |
 | `APPRAFTER_SSH_PUBLIC_KEY`       | yes      | —       | SSH public key (single-line OpenSSH format).        |
+| `APPRAFTER_E2E_SSH_KEY`          | yes      | —       | Path to its private half (the kubeconfig fetch).    |
 | `APPRAFTER_E2E_REGION`           | no       | `nbg1`  | Hetzner region.                                     |
 | `APPRAFTER_E2E_SKIP_DESTROY`     | no       | unset   | When `1`, keep the cluster up at the end.           |
 
@@ -56,15 +58,27 @@ generous.
 - Image-build + registry-push integration — out of scope for the
   smoke; operators handle this via their own CI.
 
-### Cleanup if the script crashes mid-run
+### Isolation and cleanup
+
+Every walk runs the CLI on a target store of its own: `e2e_isolate_store` (`e2e/lib.sh`) makes
+it, sets `APPRAFTER_SANDBOX` around it (the CLI refuses any store, home, key or runtime path
+outside), and the wrappers `apprafter`, `apprafter_in` and `apprafter_bin` give the CLI a scratch
+`HOME` for each call, with the CLI's startup checks off (`E2E_STARTUP_CHECKS=1` on a call turns
+them on, for a walk that asserts what they print). A walk that SSHes to a real node needs
+`APPRAFTER_E2E_SSH_KEY`: the private key whose public half it uploads, copied into that home for
+the run. `APPRAFTER_E2E_STORE=<dir>` runs a walk on a store you name instead (one in files, such
+as an agent playground).
+
+`mvp.sh` removes its store on exit. With `APPRAFTER_E2E_SKIP_DESTROY=1` it keeps the store and
+prints where it is; destroy the cluster from it:
 
 ```sh
-cd cli && cargo run --bin apprafter -- destroy --yes
+cd cli && APPRAFTER_CONFIG_DIR=<the printed store> APPRAFTER_AGE_KEY=<the printed key> \
+  cargo run --bin apprafter -- destroy --yes
 ```
 
-`destroy` is idempotent and label-driven — it'll clean up
-whatever's tagged `apprafter=true` regardless of the local state
-file.
+`destroy` is idempotent and label-driven: it removes whatever the token's project has tagged
+`apprafter=true`.
 
 ## needs-pg-walk.sh
 

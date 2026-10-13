@@ -23,6 +23,9 @@
 #                               read directly by apply's credential
 #                               resolver (cli-core credentials.rs §7,
 #                               SSH_PUBLIC_KEY_ENV="APPRAFTER_SSH_PUBLIC_KEY")
+#   APPRAFTER_E2E_SSH_KEY     — the private half of APPRAFTER_SSH_PUBLIC_KEY;
+#                               copied into the walk's sandbox home, where
+#                               the CLI's kubeconfig fetch looks for it
 #
 # Optional env:
 #   APPRAFTER_E2E_SKIP_DESTROY=1  — keep the cluster + state
@@ -65,6 +68,13 @@ cleanup_on_failure() {
     if [ -n "$_KUBECONFIG_FILE" ] && [ -f "$_KUBECONFIG_FILE" ]; then
         rm -f "$_KUBECONFIG_FILE"
     fi
+    if [ -n "${APPRAFTER_E2E_SKIP_DESTROY:-}" ]; then
+        printf 'Its target store is kept at %s (age key %s).\n' \
+            "${APPRAFTER_CONFIG_DIR:-}" "${APPRAFTER_AGE_KEY:-}" >&2
+        e2e_isolation_cleanup --keep-store
+    else
+        e2e_isolation_cleanup
+    fi
     exit "$exit_code"
 }
 # ---------------------------------------------------------------
@@ -73,7 +83,12 @@ cleanup_on_failure() {
 # instead of triggering a pointless `apprafter destroy` on a cluster
 # that was never provisioned (which itself errors "no active target").
 # ---------------------------------------------------------------
-require_env HCLOUD_TOKEN APPRAFTER_SSH_PUBLIC_KEY
+require_env HCLOUD_TOKEN APPRAFTER_SSH_PUBLIC_KEY APPRAFTER_E2E_SSH_KEY
+# The CLI runs on a target store of its own, with a scratch home per call (e2e/lib.sh), so the
+# node's kubeconfig is fetched with the key APPRAFTER_E2E_SSH_KEY names, copied into that home.
+e2e_isolate_store
+e2e_require_ssh_key --body "$APPRAFTER_SSH_PUBLIC_KEY"
+printf 'e2e: target store %s\n' "$APPRAFTER_CONFIG_DIR"
 
 trap cleanup_on_failure EXIT
 
@@ -272,9 +287,12 @@ printf '  child Deployment parser -> Available\n'
 if [ -z "${APPRAFTER_E2E_SKIP_DESTROY:-}" ]; then
     phase "Destroy"
     apprafter destroy --yes
+    e2e_isolation_cleanup
 else
     printf '\nAPPRAFTER_E2E_SKIP_DESTROY set — leaving the cluster up.\n'
-    printf 'Run: apprafter destroy --yes\n'
+    printf 'Its target store is kept at %s (age key %s): run apprafter destroy --yes with both set.\n' \
+        "$APPRAFTER_CONFIG_DIR" "$APPRAFTER_AGE_KEY"
+    e2e_isolation_cleanup --keep-store
 fi
 
 # ---------------------------------------------------------------

@@ -44,6 +44,10 @@
 #   AWS_ACCESS_KEY_ID               — S3 access key.
 #   AWS_SECRET_ACCESS_KEY           — S3 secret key.
 #   RESTIC_PASSWORD                 — restic repo passphrase.
+#   APPRAFTER_E2E_SSH_KEY           — the private half of the public key the walk
+#                                     uploads (APPRAFTER_DR_SSH_PUBLIC_KEY_PATH below);
+#                                     the CLI's SSH fetch of the kubeconfig uses it.
+#                                     Missing once the gates above pass: exit 2.
 # Env — OPTIONAL:
 #   AWS_DEFAULT_REGION              — S3 region (some providers need it).
 #   APPRAFTER_DR_SSH_PUBLIC_KEY_PATH — ssh public key path (default ~/.ssh/id_ed25519.pub).
@@ -327,11 +331,9 @@ deploy_cms() {
         --from-literal "${CMS_SECRET_KEY}=${CMS_SECRET_VALUE}" --namespace "$CMS_NS"
     wait_jsonpath secret "$CMS_NS" "$CMS_SECRET_NAME" '{.metadata.name}' "$CMS_SECRET_NAME" 180
     printf '  ok: FAKE PAYLOAD_SECRET sealed into ns %s\n' "$CMS_NS"
-    local bin="${REPO_ROOT}/cli/target/debug/apprafter"
-    [ -x "$bin" ] || ( cd "${REPO_ROOT}/cli" && cargo build --quiet --bin apprafter )
-    ( cd "${REPO_ROOT}/landing/cms" && "$bin" app add "$CMS_REPO" \
+    apprafter_in "${REPO_ROOT}/landing/cms" app add "$CMS_REPO" \
         --name "$CMS_APP" --branch master --path "$CMS_PATH" \
-        --namespace "$CMS_NS" --env "$CMS_ENV" --no-ping --no-interactive )
+        --namespace "$CMS_NS" --env "$CMS_ENV" --no-ping --no-interactive
     printf '  ok: CMS registered (public repo, --env %s)\n' "$CMS_ENV"
     wait_cms_ready
 }
@@ -374,7 +376,8 @@ wait_job_complete() {
 # operator's laptop creds, not the cluster's).
 # ---------------------------------------------------------------
 TMPDIR_WORK="$(mktemp -d)"
-APPRAFTER_CONFIG_DIR="${TMPDIR_WORK}/apprafter-config"; mkdir -p "$APPRAFTER_CONFIG_DIR"
+e2e_isolate_store "${TMPDIR_WORK}"
+e2e_require_ssh_key --file "$SSH_KEY_PATH"
 export APPRAFTER_CONFIG_DIR
 KC_FILE="${TMPDIR_WORK}/kubeconfig"
 CRED_FILE="${TMPDIR_WORK}/backup-creds.env"
@@ -435,6 +438,7 @@ cleanup() {
         printf '\nAPPRAFTER_HETZNER_SKIP_DESTROY set — leaving the cluster UP.\n' >&2
         [ "$BR_CREATED" -eq 1 ] && printf 'Destroy by hand: APPRAFTER_CONFIG_DIR=%s apprafter destroy --yes --target %s\n' "$APPRAFTER_CONFIG_DIR" "$BR_TARGET" >&2
     fi
+    e2e_isolation_cleanup
     exit "$exit_code"
 }
 trap cleanup EXIT

@@ -57,8 +57,7 @@ fi
 # dir + age key, cleaned up on exit. The CLI writes targets + per-target state
 # under here (APPRAFTER_CONFIG_DIR), so we can read state.json directly.
 WORK="$(mktemp -d -t mp-e2e.XXXXXX)"
-export APPRAFTER_CONFIG_DIR="${WORK}/config"
-export APPRAFTER_AGE_KEY="${WORK}/age.key"
+e2e_isolate_store "${WORK}"
 mkdir -p "$APPRAFTER_CONFIG_DIR"
 
 FAILED=0

@@ -68,6 +68,8 @@
 #   APPRAFTER_DR_SSH_PUBLIC_KEY_PATH — path to an SSH public key file used to
 #                                   provision both nodes (same key, both
 #                                   projects — passed as `target add --ssh-key`)
+#   APPRAFTER_E2E_SSH_KEY        — the private half of that public key (the
+#                                   CLI's SSH fetch of the kubeconfig uses it)
 #
 # Optional env:
 #   APPRAFTER_HETZNER_SKIP_DESTROY=1 — keep BOTH clusters up at the end (debug).
@@ -193,7 +195,8 @@ unset APPRAFTER_SSH_PUBLIC_KEY || true
 # ---------------------------------------------------------------
 
 TMPDIR_WORK="$(mktemp -d)"
-APPRAFTER_CONFIG_DIR="${TMPDIR_WORK}/apprafter-config"
+e2e_isolate_store "${TMPDIR_WORK}"
+e2e_require_ssh_key --file "$APPRAFTER_DR_SSH_PUBLIC_KEY_PATH"
 mkdir -p "$APPRAFTER_CONFIG_DIR"
 export APPRAFTER_CONFIG_DIR
 
@@ -293,9 +296,11 @@ cleanup() {
         [ "$OLD_CREATED" -eq 1 ] && printf 'Destroy OLD by hand: APPRAFTER_CONFIG_DIR=%s apprafter destroy --yes --target %s\n' "$APPRAFTER_CONFIG_DIR" "$OLD_TARGET" >&2
         [ "$NEW_CREATED" -eq 1 ] && printf 'Destroy NEW by hand: APPRAFTER_CONFIG_DIR=%s apprafter destroy --yes --target %s\n' "$APPRAFTER_CONFIG_DIR" "$NEW_TARGET" >&2
         # Do NOT rm the temp config dir here — the operator needs it to destroy.
+        e2e_isolation_cleanup
         exit "$exit_code"
     fi
 
+    e2e_isolation_cleanup
     rm -rf "$TMPDIR_WORK"
     [ -n "${RESTIC_WRAPPER_BIN_DIR:-}" ] && rm -rf "$RESTIC_WRAPPER_BIN_DIR" || true
     exit "$exit_code"
@@ -605,25 +610,21 @@ printf '  ok: FAKE PAYLOAD_SECRET sealed + unsealed into ns %s\n' "$CMS_NS"
 # `app add` reads the LOCAL `<cwd>/apprafter/Application.cue` (post-2.12 env
 # validation + derived name), even with an explicit git_url. The CMS manifest
 # lives at `landing/cms/apprafter/`, so run from `landing/cms` — exactly as a
-# user sitting in their repo checkout would. The apprafter() wrapper forces
-# cwd=cli (which breaks the `<cwd>/apprafter/Application.cue` lookup), so invoke
-# the BUILT binary directly from the manifest dir. The env (APPRAFTER_CONFIG_DIR
-# + the active target dr-old) is inherited by the subshell.
-APPRAFTER_BIN="${REPO_ROOT}/cli/target/debug/apprafter"
-[ -x "$APPRAFTER_BIN" ] || ( cd "${REPO_ROOT}/cli" && cargo build --quiet --bin apprafter )
+# user sitting in their repo checkout would. lib.sh's apprafter_in runs it from
+# that directory, on the walk's store.
 # --branch master: `app add` with an EXPLICIT git_url defaults targetRevision to
 # `main`, but the AppRafter repo's default branch is `master` — without this,
 # Argo fails with `unable to resolve 'main' to a commit SHA` (ComparisonError),
 # never renders the AppRafter Application CR, and no ResourceClaim is generated.
 # The CMS manifest lives on origin/master (verified).
-( cd "${REPO_ROOT}/landing/cms" && "$APPRAFTER_BIN" app add "$CMS_REPO" \
+apprafter_in "${REPO_ROOT}/landing/cms" app add "$CMS_REPO" \
     --name "$CMS_APP" \
     --branch master \
     --path "$CMS_PATH" \
     --namespace "$CMS_NS" \
     --env "$CMS_ENV" \
     --no-ping \
-    --no-interactive )
+    --no-interactive
 printf '  ok: CMS registered (public repo %s path %s, --env %s)\n' "$CMS_REPO" "$CMS_PATH" "$CMS_ENV"
 
 wait_cms_ready
