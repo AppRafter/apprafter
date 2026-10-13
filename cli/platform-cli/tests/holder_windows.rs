@@ -16,7 +16,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use apprafter::holder::client::{HolderClient, HolderError, IO_TIMEOUT};
+use apprafter::holder::client::{HolderClient, HolderError, Reached, IO_TIMEOUT};
 use apprafter::holder::endpoint::{pipe_name, EndpointId};
 use apprafter::holder::protocol::{HolderItem, InitHeader, StoreBinding};
 use apprafter::holder::spawn::{start_with, HolderStarted};
@@ -626,7 +626,22 @@ fn windows_the_holders_pid_file_lives_as_long_as_it() {
 #[test]
 fn windows_a_squatter_on_the_console_is_no_holder() {
     let s = scratch();
-    assert_eq!(on_a_console(&s, "squatter"), ["squatting", "none"]);
+    assert_eq!(
+        on_a_console(&s, "squatter"),
+        ["squatting", "reached none", "none"]
+    );
+}
+
+/// T59, rule 1 (Windows): a pipe of this store's name on this console whose one instance stays
+/// busy — a holder that hung while it served a client — is a holder that does not answer, named
+/// by the pid its pipe carries, never no holder; a reading client still takes none (it asks).
+#[test]
+fn windows_a_busy_holder_pipe_is_not_responding() {
+    let s = scratch();
+    assert_eq!(
+        on_a_console(&s, "busy"),
+        ["busy", "reached not responding (pid named)", "none"]
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -693,7 +708,7 @@ fn inner_leader() {
     // A Ctrl+C on this console (the ctrl_c scenario) must not end this leader.
     // SAFETY: ignore Ctrl+C in this process.
     unsafe { SetConsoleCtrlHandler(None, 1) };
-    if w.scenario == "squatter" {
+    if w.scenario == "squatter" || w.scenario == "busy" {
         let mut squatter = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -718,6 +733,7 @@ fn inner_leader() {
             }
         };
         println!("holder: {first}");
+        ask("reach", false, &[]);
         ask("status", false, &[]);
         let _ = squatter.kill();
         let _ = squatter.wait();
@@ -838,6 +854,21 @@ fn inner_ask() {
         }
     }
     let store = binding_of(&w.root);
+    if std::env::var("HOLDER_W_ASK").as_deref() == Ok("reach") {
+        let reached =
+            HolderClient::reach_console_expecting(&store, Path::new(Bin::Apprafter.path()));
+        let said = match reached {
+            Ok(Reached::Holder(_)) => "reached a holder".to_string(),
+            Ok(Reached::Nobody) => "reached none".to_string(),
+            Ok(Reached::NotResponding { pid: Some(_) }) => {
+                "reached not responding (pid named)".to_string()
+            }
+            Ok(Reached::NotResponding { pid: None }) => "reached not responding".to_string(),
+            Err(u) => format!("reached unavailable: {}", u.describe()),
+        };
+        println!("holder: {said}");
+        return;
+    }
     let vault = std::fs::read(w.root.join("vault")).unwrap();
     let client = match std::env::var("HOLDER_W_PIPE") {
         Ok(name) => HolderClient::at_pipe(
@@ -915,7 +946,26 @@ fn inner_squatter() {
         )
     };
     assert_ne!(h, INVALID_HANDLE_VALUE);
-    println!("holder: squatting");
+    if w.scenario == "busy" {
+        // The one instance taken by a client of its own that never lets go: a holder that hung
+        // while it served one.
+        // SAFETY: a client of the pipe above, held open until this process ends.
+        let held = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                0,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(held, INVALID_HANDLE_VALUE);
+        println!("holder: busy");
+    } else {
+        println!("holder: squatting");
+    }
     std::io::stdout().flush().unwrap();
     std::thread::sleep(Duration::from_secs(10));
 }

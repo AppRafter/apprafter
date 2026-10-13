@@ -5,7 +5,9 @@
 //! The server's uid must be this process's (a shared base under `/tmp` could hold another
 //! user's socket). The server must run as this user, and on macOS and Windows be this very
 //! binary (T53); Linux cannot check that (the holder is non-dumpable), and T48 states what a
-//! squatter's replies can do.
+//! squatter's replies can do. A holder that lives at the endpoint and takes no connection is
+//! told apart from none ([`Reached`]): a command then asks as if no window were open, while
+//! `lock status` and `lock now` say it does not answer (rule 1).
 
 use std::io;
 #[cfg(unix)]
@@ -41,6 +43,40 @@ pub enum HolderError {
     Spent,
     /// A reply of another kind than the request's.
     Unexpected,
+}
+
+/// What looking for this terminal's holder found (T59). A holder that lives here and takes no
+/// connection is not "no holder": `lock status` says it does not answer, and `lock now` that it
+/// could not end it, never that no window is open (rule 1).
+#[derive(Debug)]
+pub enum Reached<T> {
+    /// A holder took the connection.
+    Holder(T),
+    /// No holder serves here: no endpoint, a dead holder's, another user's, not this binary.
+    Nobody,
+    /// A holder lives here and takes no connection — Unix: its listen queue is full (Linux makes
+    /// the connect wait past its step; macOS turns it away at once, while the holder still holds
+    /// its lock); Windows: its one pipe instance stays busy past the wait. `pid` as its lock file
+    /// or its pipe's name gives it.
+    NotResponding { pid: Option<u32> },
+}
+
+impl<T> Reached<T> {
+    /// The holder, when one took the connection: a reading command asks either way.
+    pub fn holder(self) -> Option<T> {
+        match self {
+            Reached::Holder(t) => Some(t),
+            _ => None,
+        }
+    }
+
+    fn map<U>(self, f: impl FnOnce(T) -> U) -> Reached<U> {
+        match self {
+            Reached::Holder(t) => Reached::Holder(f(t)),
+            Reached::Nobody => Reached::Nobody,
+            Reached::NotResponding { pid } => Reached::NotResponding { pid },
+        }
+    }
 }
 
 pub struct HolderClient {
@@ -129,8 +165,17 @@ impl HolderClient {
     /// runs this very binary (T53).
     #[cfg(unix)]
     pub fn at(endpoint: &Endpoint) -> Option<HolderClient> {
-        let me = std::env::current_exe().ok()?;
-        HolderClient::at_expecting(endpoint, &me)
+        HolderClient::reach(endpoint).holder()
+    }
+
+    /// [`HolderClient::at`], a holder that lives at `endpoint` and takes no connection told
+    /// apart from none (T59).
+    #[cfg(unix)]
+    pub fn reach(endpoint: &Endpoint) -> Reached<HolderClient> {
+        match std::env::current_exe() {
+            Ok(me) => HolderClient::connect(endpoint, &me, same_file),
+            Err(_) => Reached::Nobody,
+        }
     }
 
     /// [`HolderClient::at`] with the holder's expected image named (tests: their client is a test
@@ -138,7 +183,7 @@ impl HolderClient {
     /// to the same user (`linux_the_holders_image_is_unreadable`).
     #[cfg(unix)]
     pub fn at_expecting(endpoint: &Endpoint, image: &std::path::Path) -> Option<HolderClient> {
-        HolderClient::connect(endpoint, image, same_file)
+        HolderClient::connect(endpoint, image, same_file).holder()
     }
 
     /// The Unix connect, the server's image judged by `accept` against `image` (macOS).
@@ -147,27 +192,33 @@ impl HolderClient {
         endpoint: &Endpoint,
         image: &std::path::Path,
         accept: fn(&std::path::Path, &std::path::Path) -> bool,
-    ) -> Option<HolderClient> {
-        let Endpoint::Socket { path, .. } = endpoint else {
-            return None;
+    ) -> Reached<HolderClient> {
+        let Endpoint::Socket { path, lock } = endpoint else {
+            return Reached::Nobody;
         };
         let deadline = SystemClock.with_sleep() + OVERALL;
-        // ENOENT or ECONNREFUSED: no holder (holder §2.4). A connect past its step — a holder
-        // that hung with its queue full — is none either: the command goes on without it (T59).
-        let conn = super::os::connect_within(path, IO_TIMEOUT).ok()?;
-        let server = super::os::current::peer_cred(&conn).ok()?;
+        // ENOENT or ECONNREFUSED: no holder (holder §2.4), unless one still holds the lock. A
+        // connect past its step — a holder that hung with its queue full — is a holder that does
+        // not answer: the command goes on without it (T59), `lock status` names it.
+        let conn = match super::os::connect_within(path, IO_TIMEOUT) {
+            Ok(conn) => conn,
+            Err(e) => return missed(&e, lock),
+        };
+        let Ok(server) = super::os::current::peer_cred(&conn) else {
+            return Reached::Nobody;
+        };
         // SAFETY: geteuid has no failure mode.
         if server.uid != unsafe { libc::geteuid() } {
-            return None;
+            return Reached::Nobody;
         }
         #[cfg(target_os = "macos")]
-        if !accept(&super::os::current::image_path(server.pid).ok()?, image) {
-            return None;
+        if !super::os::current::image_path(server.pid).is_ok_and(|p| accept(&p, image)) {
+            return Reached::Nobody;
         }
         #[cfg(not(target_os = "macos"))]
         let _ = (image, accept);
         use super::binding::ProcLookup;
-        Some(HolderClient {
+        Reached::Holder(HolderClient {
             server_pid: u32::try_from(server.pid).ok().filter(|p| *p > 0),
             server_started: super::os::OsProcs.started(server.pid),
             conn,
@@ -305,8 +356,14 @@ impl HolderClient {
     /// very binary (T53); `Err` when this process has no console (no window is possible here).
     #[cfg(windows)]
     pub fn on_console(store: &StoreBinding) -> Result<Option<HolderClient>, HolderUnavailable> {
+        HolderClient::reach_console(store).map(Reached::holder)
+    }
+
+    /// [`HolderClient::on_console`], a holder whose pipe stays busy told apart from none (T59).
+    #[cfg(windows)]
+    pub fn reach_console(store: &StoreBinding) -> Result<Reached<HolderClient>, HolderUnavailable> {
         let me = std::env::current_exe().map_err(|_| HolderUnavailable::NoConsole { code: 0 })?;
-        HolderClient::on_console_expecting(store, &me)
+        HolderClient::reach_console_expecting(store, &me)
     }
 
     /// [`HolderClient::on_console`] with the holder's expected image named (tests). A pipe whose
@@ -316,16 +373,27 @@ impl HolderClient {
         store: &StoreBinding,
         image: &std::path::Path,
     ) -> Result<Option<HolderClient>, HolderUnavailable> {
+        HolderClient::reach_console_expecting(store, image).map(Reached::holder)
+    }
+
+    /// [`HolderClient::reach_console`] with the holder's expected image named (tests).
+    #[cfg(windows)]
+    pub fn reach_console_expecting(
+        store: &StoreBinding,
+        image: &std::path::Path,
+    ) -> Result<Reached<HolderClient>, HolderUnavailable> {
         HolderClient::console_with(store, image, same_file)
     }
 
-    /// The Windows search of this console's holders, each server's image judged by `accept`.
+    /// The Windows search of this console's holders, each server's image judged by `accept`. A
+    /// pipe of this store's name that stays busy past its wait is a holder that does not answer,
+    /// unless another pipe's holder answers (T59).
     #[cfg(windows)]
     fn console_with(
         store: &StoreBinding,
         image: &std::path::Path,
         accept: fn(&std::path::Path, &std::path::Path) -> bool,
-    ) -> Result<Option<HolderClient>, HolderUnavailable> {
+    ) -> Result<Reached<HolderClient>, HolderUnavailable> {
         let user =
             super::os::windows::user_sid_string().map_err(|e| HolderUnavailable::NoConsole {
                 code: e.raw_os_error().unwrap_or(0) as u32,
@@ -337,30 +405,45 @@ impl HolderClient {
         }
         let me = std::process::id();
         let deadline = SystemClock.with_sleep() + OVERALL;
-        Ok(console.into_iter().filter(|p| *p != me).find_map(|pid| {
-            let client =
-                HolderClient::pipe_by(&super::endpoint::pipe_name(&id, pid), pid, deadline)?;
-            let ours = super::os::windows::server_pid(&client.pipe) == Some(pid)
-                && super::os::windows::image_path(pid).is_ok_and(|p| accept(&p, image));
-            ours.then_some(client)
-        }))
+        let mut busy = None;
+        for pid in console.into_iter().filter(|p| *p != me) {
+            match open_pipe(&super::endpoint::pipe_name(&id, pid), deadline) {
+                PipeOpen::Open(pipe) => {
+                    let ours = super::os::windows::server_pid(&pipe) == Some(pid)
+                        && super::os::windows::image_path(pid).is_ok_and(|p| accept(&p, image));
+                    if ours {
+                        return Ok(Reached::Holder(HolderClient::of_pipe(pipe, pid, deadline)));
+                    }
+                }
+                PipeOpen::Busy => busy = busy.or(Some(pid)),
+                PipeOpen::Absent => {}
+            }
+        }
+        Ok(match busy {
+            Some(pid) => Reached::NotResponding { pid: Some(pid) },
+            None => Reached::Nobody,
+        })
     }
 
     /// A client of the pipe `name` (the holder `pid`'s), if it opens.
     #[cfg(windows)]
     pub fn at_pipe(name: &str, pid: u32) -> Option<HolderClient> {
-        HolderClient::pipe_by(name, pid, SystemClock.with_sleep() + OVERALL)
+        let deadline = SystemClock.with_sleep() + OVERALL;
+        match open_pipe(name, deadline) {
+            PipeOpen::Open(pipe) => Some(HolderClient::of_pipe(pipe, pid, deadline)),
+            PipeOpen::Busy | PipeOpen::Absent => None,
+        }
     }
 
-    /// [`HolderClient::at_pipe`] within a request's `deadline`, the open included (T59).
+    /// A client of the holder `pid` over `pipe`, within a request's `deadline` (T59).
     #[cfg(windows)]
-    fn pipe_by(name: &str, pid: u32, deadline: Duration) -> Option<HolderClient> {
-        Some(HolderClient {
-            pipe: open_pipe(name, deadline)?,
+    fn of_pipe(pipe: super::os::windows::Handle, pid: u32, deadline: Duration) -> HolderClient {
+        HolderClient {
+            pipe,
             server_pid: Some(pid),
             spent: false,
             deadline,
-        })
+        }
     }
 
     /// `lock now` on a holder that does not answer (T59, S9): the process is opened first — a
@@ -382,18 +465,34 @@ pub struct HolderToEnd(HolderClient);
 impl HolderToEnd {
     #[cfg(unix)]
     pub fn at(endpoint: &Endpoint) -> Option<HolderToEnd> {
-        let me = std::env::current_exe().ok()?;
-        HolderToEnd::at_expecting(endpoint, &me)
+        HolderToEnd::reach(endpoint).holder()
+    }
+
+    /// [`HolderToEnd::at`], a holder that takes no connection told apart from none (T59).
+    #[cfg(unix)]
+    pub fn reach(endpoint: &Endpoint) -> Reached<HolderToEnd> {
+        match std::env::current_exe() {
+            Ok(me) => HolderClient::connect(endpoint, &me, same_program).map(HolderToEnd),
+            Err(_) => Reached::Nobody,
+        }
     }
 
     /// [`HolderToEnd::at`] with the expected image named (tests).
     #[cfg(unix)]
     pub fn at_expecting(endpoint: &Endpoint, image: &std::path::Path) -> Option<HolderToEnd> {
-        HolderClient::connect(endpoint, image, same_program).map(HolderToEnd)
+        HolderClient::connect(endpoint, image, same_program)
+            .map(HolderToEnd)
+            .holder()
     }
 
     #[cfg(windows)]
     pub fn on_console(store: &StoreBinding) -> Result<Option<HolderToEnd>, HolderUnavailable> {
+        HolderToEnd::reach_console(store).map(Reached::holder)
+    }
+
+    /// [`HolderToEnd::on_console`], a holder whose pipe stays busy told apart from none (T59).
+    #[cfg(windows)]
+    pub fn reach_console(store: &StoreBinding) -> Result<Reached<HolderToEnd>, HolderUnavailable> {
         let me = std::env::current_exe().map_err(|_| HolderUnavailable::NoConsole { code: 0 })?;
         Ok(HolderClient::console_with(store, &me, same_program)?.map(HolderToEnd))
     }
@@ -414,11 +513,41 @@ impl HolderToEnd {
     }
 }
 
+/// A connect that failed (T59): past its step — a listener whose queue is full, which Linux makes
+/// the connect wait on — or turned away while a process holds the endpoint's lock — macOS
+/// refuses a connect to a full queue at once, as it does one to no listener — is a holder that
+/// does not answer; anything else is no holder.
+#[cfg(unix)]
+fn missed<T>(e: &io::Error, lock: &std::path::Path) -> Reached<T> {
+    let lives = match e.kind() {
+        io::ErrorKind::TimedOut => true,
+        io::ErrorKind::ConnectionRefused => super::os::lock_held(lock),
+        _ => false,
+    };
+    if lives {
+        Reached::NotResponding {
+            pid: super::os::lock_pid(lock),
+        }
+    } else {
+        Reached::Nobody
+    }
+}
+
+/// What opening a holder's pipe came to.
+#[cfg(windows)]
+enum PipeOpen {
+    Open(super::os::windows::Handle),
+    /// Its one instance stayed busy past the wait: a server holds it and does not let go.
+    Busy,
+    /// No such pipe, or one this client may not open.
+    Absent,
+}
+
 /// Open the holder's pipe at identification level (T53): a squatting server learns who
 /// connected and can act as no one. A busy pipe is waited for once, within the step's 2 s and
 /// the request's `deadline` (T59): its open is a step like a read or a write.
 #[cfg(windows)]
-fn open_pipe(name: &str, deadline: Duration) -> Option<super::os::windows::Handle> {
+fn open_pipe(name: &str, deadline: Duration) -> PipeOpen {
     use windows_sys::Win32::Foundation::{
         GetLastError, ERROR_PIPE_BUSY, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE,
     };
@@ -442,25 +571,24 @@ fn open_pipe(name: &str, deadline: Duration) -> Option<super::os::windows::Handl
             )
         };
         if h != INVALID_HANDLE_VALUE {
-            return Some(super::os::windows::Handle(h));
+            return PipeOpen::Open(super::os::windows::Handle(h));
         }
         // SAFETY: the error of the call above.
-        if attempt == 0 && unsafe { GetLastError() } == ERROR_PIPE_BUSY {
-            let step = deadline
-                .saturating_sub(SystemClock.with_sleep())
-                .min(IO_TIMEOUT);
-            if step.is_zero() {
-                return None;
-            }
-            // 0 would be the pipe's own default wait: at least 1 ms.
-            let ms = u32::try_from(step.as_millis()).unwrap_or(u32::MAX).max(1);
-            // SAFETY: a NUL-terminated name; waits at most `ms`.
-            unsafe { WaitNamedPipeW(wide.as_ptr(), ms) };
-            continue;
+        if unsafe { GetLastError() } != ERROR_PIPE_BUSY {
+            return PipeOpen::Absent;
         }
-        return None;
+        let step = deadline
+            .saturating_sub(SystemClock.with_sleep())
+            .min(IO_TIMEOUT);
+        if attempt == 1 || step.is_zero() {
+            return PipeOpen::Busy;
+        }
+        // 0 would be the pipe's own default wait: at least 1 ms.
+        let ms = u32::try_from(step.as_millis()).unwrap_or(u32::MAX).max(1);
+        // SAFETY: a NUL-terminated name; waits at most `ms`.
+        unsafe { WaitNamedPipeW(wide.as_ptr(), ms) };
     }
-    None
+    PipeOpen::Busy
 }
 
 /// The same file, by canonical path (a symlinked install, `/private/tmp` on macOS). Named on

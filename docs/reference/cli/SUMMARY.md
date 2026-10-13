@@ -27,6 +27,7 @@
 * [apprafter status](status.md)
 * [apprafter target](target.md)
 * [apprafter top](top.md)
+* [apprafter unlock](unlock.md)
 * [apprafter up](up.md)
 * [apprafter upgrade-tier](upgrade-tier.md)
 * [apprafter volume](volume.md)

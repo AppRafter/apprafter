@@ -279,10 +279,12 @@ const FORBIDDEN_DEPS: &[&str] = &[
 /// G2 (D.4a T8): the holder's endpoint is derived in one function from `Context` inputs, never
 /// from a uid (`/run/user/<uid>`) or a fixed pipe prefix (`\\.\pipe\`). The functions (`fn` or
 /// `Type::fn`, as [`SANCTIONED`] names sites) allowed to spell one, in the ratcheted crates and
-/// the core: d4a-e's `pipe_name` is the one.
+/// the core: d4a-e's `pipe_name` and `ssh_agent_path`.
 const ENDPOINT_LITERALS: &[&str] = &[
     // The Windows holder's pipe (D.4a T50): `platform-cli/src/holder/endpoint.rs`.
     "pipe_name",
+    // The Windows OpenSSH agent's pipe (D.4a T72, O1): `platform-cli/src/limits_client.rs`.
+    "ssh_agent_path",
 ];
 
 /// A string literal G2 keeps in [`ENDPOINT_LITERALS`].

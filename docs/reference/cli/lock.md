@@ -17,8 +17,24 @@ Usage: apprafter lock <COMMAND>
 
 Subcommands:
 
+- [`apprafter lock now`](#apprafter-lock-now) — End the unlock window in this terminal now.
 - [`apprafter lock off`](#apprafter-lock-off) — Put this target store's secrets back on disk in clear — readable by any program running as you — and delete the vault.
 - [`apprafter lock on`](#apprafter-lock-on) — Move this target store's secrets into an encrypted vault: its targets' Hetzner tokens, a new age key of its own, and the cached kubeconfigs and Argo CD passwords re-encrypted to it.
+- [`apprafter lock status`](#apprafter-lock-status) — Whether this target store is locked, how it opens (its slots), the unlock window left in this terminal, and what this computer lets other programs running as you do
+
+## `apprafter lock now`
+
+End the unlock window in this terminal now. Asks nothing
+
+```text
+Usage: apprafter lock now
+```
+
+Examples:
+
+```sh
+apprafter lock now
+```
 
 ## `apprafter lock off`
 
@@ -51,4 +67,18 @@ Examples:
 ```sh
 apprafter lock on
 apprafter lock on --timeout 15
+```
+
+## `apprafter lock status`
+
+Whether this target store is locked, how it opens (its slots), the unlock window left in this terminal, and what this computer lets other programs running as you do
+
+```text
+Usage: apprafter lock status
+```
+
+Examples:
+
+```sh
+apprafter lock status
 ```

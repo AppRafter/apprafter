@@ -387,6 +387,10 @@ pub const EXAMPLES: &[CommandExamples] = &[
             "apprafter kubeconfig > /tmp/kc && export KUBECONFIG=/tmp/kc",
         ],
     },
+        CommandExamples {
+            path: &["lock", "now"],
+            lines: &["apprafter lock now"],
+        },
     CommandExamples {
         path: &["lock", "off"],
         lines: &["apprafter lock off"],
@@ -395,6 +399,10 @@ pub const EXAMPLES: &[CommandExamples] = &[
         path: &["lock", "on"],
         lines: &["apprafter lock on", "apprafter lock on --timeout 15"],
     },
+        CommandExamples {
+            path: &["lock", "status"],
+            lines: &["apprafter lock status"],
+        },
     CommandExamples {
         path: &["login"],
         lines: &["apprafter login"],
@@ -620,6 +628,10 @@ pub const EXAMPLES: &[CommandExamples] = &[
         path: &["top"],
         lines: &["apprafter top"],
     },
+        CommandExamples {
+            path: &["unlock"],
+            lines: &["apprafter unlock", "apprafter unlock --timeout 30"],
+        },
     CommandExamples {
         path: &["up"],
         lines: &["apprafter up --server-type cx22", "apprafter up --dry-run"],

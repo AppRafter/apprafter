@@ -150,7 +150,15 @@ slice = "D.12"
 status = "planned"
 slice = "D.4"
 
+[leaf."lock now"]
+status = "planned"
+slice = "D.4"
+
 [leaf."lock on"]
+status = "planned"
+slice = "D.4"
+
+[leaf."lock status"]
 status = "planned"
 slice = "D.4"
 
@@ -323,6 +331,10 @@ slice = "D.3"
 [leaf."top"]
 status = "planned"
 slice = "D.5"
+
+[leaf."unlock"]
+status = "planned"
+slice = "D.4"
 
 [leaf."up"]
 status = "planned"

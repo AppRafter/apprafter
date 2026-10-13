@@ -22,6 +22,8 @@ pub(crate) mod examples;
 /// outside this crate is meant to use it.
 #[doc(hidden)]
 pub mod holder;
+mod holder_window;
+mod limits_client;
 mod prompt;
 mod render;
 mod sandbox;

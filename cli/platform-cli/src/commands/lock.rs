@@ -11,23 +11,31 @@
 use std::path::Path;
 
 use apprafter_core::lock::{
-    self, check_password, LockOffPayload, LockOffStart, LockOnInput, LockOnPayload, LockOnStart,
-    LockedOff, LockedOn, PasswordAdvice, PasswordProblem, RecoveryKeyProblem, SlotOpened,
+    self, check_password, HolderHardening, HolderUnavailableReason, LockOffPayload, LockOffStart,
+    LockOnInput, LockOnPayload, LockOnStart, LockReport, LockedOff, LockedOn, MachineLimit,
+    PasswordAdvice, PasswordProblem, RecoveryKeyProblem, SlotOpened, SlotRefusalView, SlotView,
+    UnlockWindow,
 };
-use apprafter_core::secrets::{LockSlotKind, SecretsMode, StoreId};
-use apprafter_core::vault::{ConfirmedRecoveryKey, KdfPolicy, OsRandom, RecoveryKey};
+use apprafter_core::secrets::{LockSlotKind, SecretsMode, StoreId, STORE_FILE};
+use apprafter_core::vault::{
+    ConfirmedRecoveryKey, KdfPolicy, OsRandom, RecoveryKey, DEFAULT_UNLOCK_TIMEOUT_MIN,
+};
 use apprafter_core::{
     CancellationToken, ChangeAction, Context, CoreError, Event, Plan, PlannedChange, Reporter,
     SecretString, Zeroizing,
 };
-use cli_core::{CliError, LockPhase};
+use cli_core::{CliError, LockPhase, LockedWhy};
 
 use crate::cli::LockCommand;
 use crate::commands::target::completed;
+use crate::context::{cli_context, diagnostic_context, ProcessEnv};
+use crate::holder::protocol::HolderUnavailable;
+use crate::holder::spawn::HolderStarted;
 use crate::prompt::{Asker, PromptError, Terminal};
 use crate::render::core_error::report;
 use crate::render::reporter::CliReporter;
 use crate::vault_access::{ask_and_open, prompt_refusal, sentence, ATTEMPTS};
+use crate::{holder_window, limits_client};
 
 /// C11.
 const REPEAT: &str = "Repeat the lock password: ";
@@ -64,6 +72,8 @@ pub(crate) fn run(action: LockCommand) -> miette::Result<()> {
     match action {
         LockCommand::On { timeout } => on(&Terminal, timeout),
         LockCommand::Off => off(&Terminal),
+        LockCommand::Now => now(),
+        LockCommand::Status => status(),
     }
 }
 
@@ -539,6 +549,478 @@ fn off_result(done: &LockedOff, shown: &str) -> String {
     out
 }
 
+/// `apprafter lock status` (D.4a §3.13, T66, T72, T73): stdout, exit 0; never a prompt, never
+/// the vault opened. A diagnostic (T66), so it takes the diagnostic context: no read it makes,
+/// today's or a later one, can reach a prompt.
+pub(crate) fn status() -> miette::Result<()> {
+    let ctx = diagnostic_context()?;
+    let terminal = holder_window::terminal_present();
+    holder_window::fast_kdf_note();
+    let place = holder_window::HolderPlace::of(&ctx);
+    let window = holder_window::window_state(&ctx, &place, terminal).map_err(report)?;
+    let client = limits_client::cli_limit_client(&ProcessEnv, terminal);
+    let lock_report = apprafter_core::lock::status(&ctx, window, &client).map_err(report)?;
+    print!("{}", render_status(&lock_report));
+    Ok(())
+}
+
+/// `apprafter lock now` (T56, T59, T65, S9): `End` to this terminal's holder; one that does not
+/// answer is ended through its connection, and no other process. One that could not be ended
+/// is an error naming it, never "no window" (rule 1).
+pub(crate) fn now() -> miette::Result<()> {
+    let ctx = cli_context()?;
+    let said =
+        now_said(holder_window::end_window(&ctx).map_err(report)?).map_err(miette::Report::new)?;
+    eprintln!("{said}");
+    Ok(())
+}
+
+/// What `lock now` says of how ending the window went.
+fn now_said(ended: holder_window::Ended) -> Result<&'static str, NotEnded> {
+    Ok(match ended {
+        holder_window::Ended::Closed => "The unlock window in this terminal is closed.",
+        holder_window::Ended::Stopped => {
+            "The unlock window in this terminal is closed (its holder did not answer and was stopped)."
+        }
+        holder_window::Ended::StillOpen { pid } => return Err(NotEnded::new(pid)),
+        holder_window::Ended::None => "No unlock window is open in this terminal.",
+    })
+}
+
+/// `apprafter unlock [--timeout M]` (T56, T65, O3, O11): always asks, then replaces this
+/// terminal's holder.
+pub(crate) fn unlock(timeout: Option<u32>) -> miette::Result<()> {
+    let ctx = cli_context()?;
+    let root = cli_core::paths::abbreviate_home(ctx.config_root(), ctx.home_dir());
+    let incomplete = match ctx.secrets().mode().map_err(miette::Report::new)? {
+        SecretsMode::Files => {
+            eprintln!(
+                "The target store at {root} is not locked: its secrets are in files, readable \
+                 by any program running as you. `apprafter lock on` protects them."
+            );
+            return Ok(());
+        }
+        SecretsMode::Locking => Some(LockPhase::Locking),
+        SecretsMode::Unlocking => Some(LockPhase::Unlocking),
+        SecretsMode::Locked => None,
+    };
+    if let Some(phase) = incomplete {
+        return Err(miette::Report::new(CliError::LockIncomplete {
+            store: ctx.config_root().to_path_buf(),
+            phase,
+        }));
+    }
+    // T61, T69: nothing can be asked here, so nothing else is looked at.
+    if !holder_window::terminal_present() {
+        return Err(miette::Report::new(CliError::StoreLocked {
+            store: ctx.config_root().to_path_buf(),
+            reason: LockedWhy::NoTerminal,
+            stopped_before: None,
+        }));
+    }
+    holder_window::fast_kdf_note();
+    let file = ctx.secrets().store_file().map_err(miette::Report::new)?;
+    let Some(id) = file.as_ref().and_then(|f| f.id.clone()) else {
+        return Err(miette::Report::new(CliError::StoreFileUnreadable {
+            path: ctx.config_root().join(STORE_FILE),
+            detail: "it says the secrets are locked, and names no id".into(),
+        }));
+    };
+    let store = holder_window::binding(ctx.config_root(), id.as_str());
+    let place = holder_window::HolderPlace::of(&ctx);
+    place
+        .possible(&store)
+        .map_err(|u| miette::Report::new(NoWindow::from(&u)))?;
+    let mirror = file.as_ref().and_then(|f| f.unlock_timeout_min);
+    let zero = || {
+        eprintln!(
+            "The target store at {root} opens no unlock window: its window is 0 min, so every \
+             command asks. `apprafter unlock --timeout 5` opens one for 5 min."
+        );
+    };
+    if timeout.is_none() && mirror == Some(0) {
+        zero();
+        return Ok(());
+    }
+    let shown = timeout.or(mirror).unwrap_or(DEFAULT_UNLOCK_TIMEOUT_MIN);
+    let targets = cli_core::list_target_names(&ctx.store())
+        .map_err(miette::Report::new)?
+        .join(", ");
+    let intro = format!(
+        "Unlock the target store at {root} (targets: {targets}) in this terminal for {shown} min.\n"
+    );
+    let opened = holder_window::ask_and_open(&ctx, &id, &intro)?;
+    // T56: a new window replaces this terminal's old one — an older install's too (finding 13).
+    if let Ok(Some(mut old)) = place.find_to_end(&store) {
+        let _ = old.end();
+    }
+    // The vault's own default, which `store.yaml` only mirrors.
+    let minutes = timeout.unwrap_or(opened.default_minutes);
+    if minutes == 0 {
+        zero();
+        return Ok(());
+    }
+    match holder_window::start_window(&place, &store, &opened.key, opened.vault_id, minutes) {
+        Ok(HolderStarted::Started { .. }) => {}
+        Ok(HolderStarted::AlreadyRunning { pid }) => {
+            return Err(miette::Report::new(NoWindow::from(
+                &HolderUnavailable::NotResponding { pid: Some(pid) },
+            )))
+        }
+        Err(u) => return Err(miette::Report::new(NoWindow::from(&u))),
+    }
+    if holder_window::leads_own_session() {
+        eprintln!("This command leads its own session: the window ends with it.");
+    }
+    eprintln!("{}", holder_window::opened_note(minutes));
+    Ok(())
+}
+
+/// No unlock window is possible in this terminal (T49–T52, T59): `unlock`'s refusal. A CLI-local
+/// diagnostic, as the sandbox's are: the desktop has no terminal window to refuse
+/// (**Deviations** 15).
+#[derive(Debug, miette::Diagnostic)]
+#[diagnostic(
+    code(apprafter::lock::no_window),
+    help(
+        "every command in this terminal asks for the lock password instead; `apprafter lock \
+         status` says why"
+    )
+)]
+pub(crate) struct NoWindow {
+    why: String,
+}
+
+impl From<&HolderUnavailable> for NoWindow {
+    fn from(u: &HolderUnavailable) -> Self {
+        NoWindow { why: u.describe() }
+    }
+}
+
+impl std::fmt::Display for NoWindow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "no unlock window is possible in this terminal: {}",
+            self.why
+        )
+    }
+}
+
+impl std::error::Error for NoWindow {}
+
+/// `lock now` met this terminal's holder and could not end it: it does not answer, and takes no
+/// connection or could not be stopped (T59; rule 1: the window is still open, never "no
+/// window"). A CLI-local diagnostic, as `no_window` is.
+#[derive(Debug, miette::Diagnostic)]
+#[diagnostic(code(apprafter::lock::not_ended))]
+pub(crate) struct NotEnded {
+    pid: Option<u32>,
+    #[help]
+    help: String,
+}
+
+impl NotEnded {
+    fn new(pid: Option<u32>) -> NotEnded {
+        let help = match pid {
+            Some(pid) if cfg!(windows) => format!(
+                "Stop that process (`taskkill /F /PID {pid}`): until it ends it keeps this \
+                 store's key. Meanwhile every command asks at its prompt."
+            ),
+            Some(pid) => format!(
+                "Stop that process (`kill -9 {pid}`): until it ends it keeps this store's key. \
+                 Meanwhile every command asks at its prompt."
+            ),
+            None => "Stop this terminal's holder (an `apprafter` process): until it ends it \
+                     keeps this store's key. Meanwhile every command asks at its prompt."
+                .to_string(),
+        };
+        NotEnded { pid, help }
+    }
+}
+
+impl std::fmt::Display for NotEnded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.pid {
+            Some(pid) => write!(
+                f,
+                "the unlock window in this terminal is still open: its holder (pid {pid}) does \
+                 not answer and could not be ended from here"
+            ),
+            None => write!(
+                f,
+                "the unlock window in this terminal is still open: its holder does not answer \
+                 and could not be ended from here"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for NotEnded {}
+
+/// O1's sentence: what the lock covers and what it does not.
+const AT_REST: &str = "The lock protects secrets at rest. While a command or the app uses one, it \
+     is in that process's memory and, for a kubeconfig, in a file programs running as you can \
+     read; the SSH key that fetches kubeconfigs stays outside the lock.";
+
+/// The `lock status` text (§3.13).
+pub(crate) fn render_status(r: &LockReport) -> String {
+    let mut lines = Vec::new();
+    let targets = if r.targets.is_empty() {
+        "no targets".to_string()
+    } else {
+        format!("targets: {}", r.targets.join(", "))
+    };
+    lines.push(match &r.store_id {
+        Some(id) => format!("Target store:   {} (id {id}; {targets})", r.store),
+        None => format!("Target store:   {} ({targets})", r.store),
+    });
+    lines.push(format!("Secrets:        {}", secrets_text(r)));
+    if r.mode != SecretsMode::Files {
+        let slots: Vec<String> = r.slots.iter().map(slot_text).collect();
+        lines.push(format!("Slots:          {}", slots.join(" · ")));
+    }
+    lines.push(format!("This terminal:  {}", terminal_text(r)));
+    let mut rows: Vec<(bool, String)> = Vec::new();
+    if let UnlockWindow::Open { hardening, .. } = &r.window {
+        if let Some(weak) = weaker(hardening) {
+            rows.push((
+                true,
+                format!("The unlock window's key is less protected than usual: {weak}"),
+            ));
+        }
+    }
+    rows.extend(r.limits.iter().filter_map(limit_row));
+    // §3.13: the warnings first, each kind in the report's order (a stable sort).
+    rows.sort_by_key(|(warn, _)| !*warn);
+    if rows.is_empty() {
+        lines.push("This computer:  nothing to report".into());
+    } else {
+        lines.push("This computer:".into());
+        for (warn, text) in rows {
+            lines.push(format!("  {} {text}", if warn { "⚠" } else { "ℹ" }));
+        }
+    }
+    if r.mode != SecretsMode::Files {
+        lines.push(AT_REST.into());
+    }
+    lines.iter().map(|l| format!("{l}\n")).collect()
+}
+
+fn secrets_text(r: &LockReport) -> String {
+    match r.mode {
+        SecretsMode::Files => {
+            "in files — readable by any program running as you; `apprafter lock on` protects them"
+                .into()
+        }
+        SecretsMode::Locked => format!("locked — in the vault, opened by {}", opened_by(&r.slots)),
+        SecretsMode::Locking => "locking — an earlier `apprafter lock on` did not finish: run it \
+                                 again, or `apprafter lock off` to back out"
+            .into(),
+        SecretsMode::Unlocking => {
+            "unlocking — an earlier `apprafter lock off` did not finish: run it again".into()
+        }
+    }
+}
+
+/// "a password or the recovery key": each kind of slot once, in the vault's order.
+fn opened_by(slots: &[SlotView]) -> String {
+    let mut kinds: Vec<&str> = Vec::new();
+    for s in slots {
+        let kind = match s.kind {
+            LockSlotKind::Password => "a password",
+            LockSlotKind::RecoveryKey => "the recovery key",
+            LockSlotKind::OsPassword => "your OS password",
+            LockSlotKind::WindowsHello => "Windows Hello",
+            LockSlotKind::TouchId => "Touch ID",
+            LockSlotKind::Unknown => continue,
+        };
+        if !kinds.contains(&kind) {
+            kinds.push(kind);
+        }
+    }
+    kinds.join(" or ")
+}
+
+fn slot_text(s: &SlotView) -> String {
+    match s.refused {
+        Some(SlotRefusalView::KdfTooWeak) => {
+            format!("{} (refused by this build: kdf_too_weak)", s.label)
+        }
+        Some(SlotRefusalView::KdfOutOfRange) => {
+            format!("{} (refused by this build: kdf_out_of_range)", s.label)
+        }
+        None => s.label.clone(),
+    }
+}
+
+fn terminal_text(r: &LockReport) -> String {
+    let mut line = match &r.window {
+        UnlockWindow::Open {
+            left_secs,
+            minutes,
+            holder_version,
+            ..
+        } => {
+            let left = if *left_secs < 60 {
+                format!("{left_secs} s")
+            } else {
+                format!("{} min", left_secs.div_ceil(60))
+            };
+            let mut line = format!(
+                "unlocked, {left} left (a window lasts {minutes} min, restarted by each command \
+                 that uses it)"
+            );
+            if holder_version != env!("CARGO_PKG_VERSION") {
+                line.push_str(&format!("; its holder is apprafter {holder_version}"));
+            }
+            line
+        }
+        UnlockWindow::Closed => "no unlock window".into(),
+        UnlockWindow::NoTerminal => "not run from a terminal".into(),
+        UnlockWindow::EveryCommand => "every command asks (the store's window is 0 min)".into(),
+        // A holder that does not answer still holds the key: an open window, never "no window"
+        // (rule 1), and not one a command can use.
+        UnlockWindow::Unavailable {
+            reason: HolderUnavailableReason::NotResponding,
+        } => "open, but its holder does not answer: every command asks; `apprafter lock now` \
+              ends it, or names the process to stop"
+            .into(),
+        UnlockWindow::Unavailable { reason } => {
+            format!("no window possible here ({})", unavailable_text(*reason))
+        }
+        UnlockWindow::App => "unlocked in this app".into(),
+    };
+    let fallback = r.limits.iter().find_map(|l| match l {
+        MachineLimit::RuntimeDirFallback { path } => Some(path),
+        _ => None,
+    });
+    if let Some(path) = fallback {
+        line.push_str(&format!(
+            " (holder base: {path}, XDG_RUNTIME_DIR is not set)"
+        ));
+    }
+    line
+}
+
+fn unavailable_text(r: HolderUnavailableReason) -> &'static str {
+    match r {
+        HolderUnavailableReason::NoRuntimeDir => "no directory to keep it in",
+        HolderUnavailableReason::UnsafeRuntimeDir => "its directory is not private to you",
+        HolderUnavailableReason::PathTooLong => "its socket path would be too long for this OS",
+        HolderUnavailableReason::NoSessionLeader => "this terminal's session has no leader",
+        HolderUnavailableReason::NoConsole => "there is no console to bind it to",
+        HolderUnavailableReason::NotResponding => {
+            "its holder does not answer; `apprafter lock now` ends it"
+        }
+        HolderUnavailableReason::Timeout => "the holder did not start in time",
+    }
+}
+
+/// What a holder failed to do to protect its key (T54, T72); `None` when nothing failed.
+fn weaker(h: &HolderHardening) -> Option<String> {
+    let mut weak = Vec::new();
+    if !h.memory_locked {
+        weak.push("its memory is not locked against paging");
+    }
+    if h.non_dumpable == Some(false) {
+        weak.push("it can be dumped");
+    }
+    if h.deny_attach == Some(false) {
+        weak.push("a debugger may attach to it");
+    }
+    if !h.core_off {
+        weak.push("a crash may write it to a core file");
+    }
+    if h.process_dacl == Some(false) {
+        weak.push("its process keeps the default access list");
+    }
+    (!weak.is_empty()).then(|| weak.join(", "))
+}
+
+/// A limit's row: whether it is a warning, and its text; `None` for the one shown on the
+/// terminal line.
+fn limit_row(l: &MachineLimit) -> Option<(bool, String)> {
+    Some(match l {
+        MachineLimit::X11Session => (
+            true,
+            "X11 session: any program running as you sees what you type, the lock password included"
+                .into(),
+        ),
+        MachineLimit::Xwayland {
+            terminal_is_x_client: Some(true),
+        } => (
+            true,
+            "This terminal runs under Xwayland: other X programs see what you type into it, the \
+             lock password included"
+                .into(),
+        ),
+        MachineLimit::Xwayland { .. } => (
+            false,
+            "Xwayland is running: a terminal that runs under it shows what you type to other X \
+             programs"
+                .into(),
+        ),
+        MachineLimit::PtraceScope { value: Some(v) } => (
+            true,
+            format!("Yama ptrace_scope is {v}: programs running as you can attach to your shell"),
+        ),
+        MachineLimit::PtraceScope { value: None } => (
+            true,
+            "No Yama ptrace_scope: programs running as you can attach to your shell".into(),
+        ),
+        MachineLimit::WindowsSameUser => (
+            true,
+            "Unlock windows on Windows are open to every program running as you".into(),
+        ),
+        MachineLimit::MacosTaskPort => (
+            false,
+            "A program running as you with debugging rights can read an unlocked window's memory"
+                .into(),
+        ),
+        MachineLimit::Multiplexer { name } => (
+            false,
+            format!("This terminal runs inside {name}: programs running as you can type into it"),
+        ),
+        MachineLimit::InheritedWindow => (
+            false,
+            "Everything started from this terminal can use its window, an AI agent included"
+                .into(),
+        ),
+        MachineLimit::SleepUnreported => (
+            true,
+            "This computer does not tell the app when it sleeps or locks".into(),
+        ),
+        MachineLimit::Hibernation => (
+            false,
+            "Hibernation writes memory to disk, an open window's key included".into(),
+        ),
+        MachineLimit::SshKeyUsable {
+            path,
+            unencrypted,
+            in_agent,
+        } => (
+            true,
+            format!(
+                "The SSH key {path} that reaches your nodes {}",
+                match (unencrypted, in_agent) {
+                    (true, Some(true)) => "has no passphrase and is loaded in ssh-agent",
+                    (true, _) => "has no passphrase",
+                    (false, Some(true)) => "is loaded in ssh-agent",
+                    (false, _) => "may be loaded in ssh-agent, which did not answer within 2 s",
+                }
+            ),
+        ),
+        MachineLimit::RuntimeDirFallback { .. } => return None,
+        MachineLimit::SecretsInUse => (
+            false,
+            "While a command talks to a cluster, its kubeconfig is a file programs running as \
+             you can read"
+                .into(),
+        ),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use apprafter_core::vault::{OsRandom, RecoveryKey};
@@ -763,5 +1245,231 @@ mod tests {
         ));
         assert_eq!(s.told(), WAY_OUT);
         assert_eq!(s.asked(), vec![question]);
+    }
+}
+
+#[cfg(test)]
+mod status_render_tests {
+    use apprafter_core::lock::{
+        HolderHardening, HolderUnavailableReason, LockReport, MachineLimit, SlotRefusalView,
+        SlotView, UnlockWindow,
+    };
+    use apprafter_core::secrets::{LockSlotKind, SecretsMode};
+
+    use super::render_status;
+
+    fn slot(kind: LockSlotKind, label: &str) -> SlotView {
+        SlotView {
+            kind,
+            label: label.into(),
+            refused: None,
+        }
+    }
+
+    fn hardening(memory_locked: bool) -> HolderHardening {
+        HolderHardening {
+            non_dumpable: Some(true),
+            deny_attach: None,
+            core_off: true,
+            memory_locked,
+            process_dacl: None,
+        }
+    }
+
+    fn open(left_secs: u64, minutes: u32, version: &str, memory_locked: bool) -> UnlockWindow {
+        UnlockWindow::Open {
+            left_secs,
+            minutes,
+            holder_version: version.into(),
+            hardening: hardening(memory_locked),
+        }
+    }
+
+    fn locked(window: UnlockWindow, limits: Vec<MachineLimit>) -> LockReport {
+        LockReport {
+            store: "~/.config/apprafter".into(),
+            store_id: Some("3f9c0a1b7d2e4c56".into()),
+            targets: vec!["prod".into(), "staging".into()],
+            mode: SecretsMode::Locked,
+            slots: vec![
+                slot(LockSlotKind::Password, "lock password"),
+                slot(LockSlotKind::RecoveryKey, "recovery key"),
+            ],
+            window_minutes: 5,
+            window,
+            limits,
+        }
+    }
+
+    fn text(lines: &[&str]) -> String {
+        lines.iter().map(|l| format!("{l}\n")).collect()
+    }
+
+    /// D.4a §3.13: the sample, line for line — from a report whose limits come in another
+    /// order than the sample's (a warning after two infos): the warnings are listed first.
+    #[test]
+    fn a_locked_store_with_an_open_window_reads_as_the_sample() {
+        let r = locked(
+            open(170, 5, env!("CARGO_PKG_VERSION"), true),
+            vec![
+                MachineLimit::X11Session,
+                MachineLimit::PtraceScope { value: Some(0) },
+                MachineLimit::Multiplexer {
+                    name: "tmux".into(),
+                },
+                MachineLimit::InheritedWindow,
+                MachineLimit::SshKeyUsable {
+                    path: "~/.ssh/id_ed25519".into(),
+                    unencrypted: true,
+                    in_agent: Some(false),
+                },
+                MachineLimit::SecretsInUse,
+                MachineLimit::Hibernation,
+            ],
+        );
+        assert_eq!(
+            render_status(&r),
+            text(&[
+                "Target store:   ~/.config/apprafter (id 3f9c0a1b7d2e4c56; targets: prod, staging)",
+                "Secrets:        locked — in the vault, opened by a password or the recovery key",
+                "Slots:          lock password · recovery key",
+                "This terminal:  unlocked, 3 min left (a window lasts 5 min, restarted by each command that uses it)",
+                "This computer:",
+                "  ⚠ X11 session: any program running as you sees what you type, the lock password included",
+                "  ⚠ Yama ptrace_scope is 0: programs running as you can attach to your shell",
+                "  ⚠ The SSH key ~/.ssh/id_ed25519 that reaches your nodes has no passphrase",
+                "  ℹ This terminal runs inside tmux: programs running as you can type into it",
+                "  ℹ Everything started from this terminal can use its window, an AI agent included",
+                "  ℹ While a command talks to a cluster, its kubeconfig is a file programs running as you can read",
+                "  ℹ Hibernation writes memory to disk, an open window's key included",
+                "The lock protects secrets at rest. While a command or the app uses one, it is in that process's memory and, for a kubeconfig, in a file programs running as you can read; the SSH key that fetches kubeconfigs stays outside the lock.",
+            ])
+        );
+    }
+
+    /// §3.13's variants of the window line; a holder of another version; a holder whose key is
+    /// less protected than usual (T72, `window_hardening`); a slot this build refuses (L3 greps
+    /// `kdf_too_weak`); nothing to report; the fallback holder base.
+    #[test]
+    fn every_window_variant_has_its_line() {
+        for (window, line) in [
+            (UnlockWindow::Closed, "This terminal:  no unlock window\n"),
+            (UnlockWindow::NoTerminal, "This terminal:  not run from a terminal\n"),
+            (
+                UnlockWindow::EveryCommand,
+                "This terminal:  every command asks (the store's window is 0 min)\n",
+            ),
+            (
+                UnlockWindow::Unavailable {
+                    reason: HolderUnavailableReason::PathTooLong,
+                },
+                "This terminal:  no window possible here (its socket path would be too long for this OS)\n",
+            ),
+            (
+                UnlockWindow::Unavailable {
+                    reason: HolderUnavailableReason::NotResponding,
+                },
+                "This terminal:  open, but its holder does not answer: every command asks; `apprafter lock now` ends it, or names the process to stop\n",
+            ),
+            (
+                open(42, 1, "0.0.1", true),
+                "This terminal:  unlocked, 42 s left (a window lasts 1 min, restarted by each command that uses it); its holder is apprafter 0.0.1\n",
+            ),
+        ] {
+            let got = render_status(&locked(window.clone(), vec![]));
+            assert!(got.contains(line), "{window:?}:\n{got}");
+        }
+        let weak = render_status(&locked(
+            open(60, 5, env!("CARGO_PKG_VERSION"), false),
+            vec![],
+        ));
+        assert!(
+            weak.contains(
+                "  ⚠ The unlock window's key is less protected than usual: its memory is not locked against paging\n"
+            ),
+            "{weak}"
+        );
+        let mut refused = locked(UnlockWindow::Closed, vec![]);
+        refused.slots[0].refused = Some(SlotRefusalView::KdfTooWeak);
+        assert!(render_status(&refused).contains(
+            "Slots:          lock password (refused by this build: kdf_too_weak) · recovery key\n"
+        ));
+        assert!(render_status(&locked(UnlockWindow::Closed, vec![]))
+            .contains("This computer:  nothing to report\n"));
+        let fallback = render_status(&locked(
+            UnlockWindow::Closed,
+            vec![MachineLimit::RuntimeDirFallback {
+                path: "/s/run".into(),
+            }],
+        ));
+        assert!(
+            fallback.contains(
+                "This terminal:  no unlock window (holder base: /s/run, XDG_RUNTIME_DIR is not set)\n"
+            ),
+            "{fallback}"
+        );
+        assert!(
+            fallback.contains("This computer:  nothing to report\n"),
+            "{fallback}"
+        );
+    }
+
+    /// A store in files: no id, no slots, no promise; an interrupted lock names its state.
+    #[test]
+    fn a_store_in_files_and_an_interrupted_one_say_so() {
+        let mut files = locked(UnlockWindow::NoTerminal, vec![]);
+        files.mode = SecretsMode::Files;
+        files.store_id = None;
+        files.slots = vec![];
+        let got = render_status(&files);
+        assert!(
+            got.starts_with("Target store:   ~/.config/apprafter (targets: prod, staging)\n"),
+            "{got}"
+        );
+        assert!(got.contains(
+            "Secrets:        in files — readable by any program running as you; `apprafter lock on` protects them\n"
+        ));
+        assert!(
+            !got.contains("Slots:") && !got.contains("The lock protects"),
+            "{got}"
+        );
+        let mut locking = locked(UnlockWindow::Closed, vec![]);
+        locking.mode = SecretsMode::Locking;
+        assert!(render_status(&locking).contains(
+            "Secrets:        locking — an earlier `apprafter lock on` did not finish: run it again, or `apprafter lock off` to back out\n"
+        ));
+        let mut unlocking = locked(UnlockWindow::Closed, vec![]);
+        unlocking.mode = SecretsMode::Unlocking;
+        assert!(render_status(&unlocking).contains(
+            "Secrets:        unlocking — an earlier `apprafter lock off` did not finish: run it again\n"
+        ));
+    }
+}
+
+#[cfg(test)]
+mod now_tests {
+    use super::now_said;
+    use crate::holder_window::Ended;
+
+    /// T65, T59, rule 1: `lock now` says what came of the window, and a holder it could not end
+    /// is an error that names it — never "no unlock window is open".
+    #[test]
+    fn lock_now_never_reads_a_window_it_could_not_end_as_none() {
+        assert_eq!(
+            now_said(Ended::None).unwrap(),
+            "No unlock window is open in this terminal."
+        );
+        assert_eq!(
+            now_said(Ended::Closed).unwrap(),
+            "The unlock window in this terminal is closed."
+        );
+        let e = now_said(Ended::StillOpen { pid: Some(4242) }).unwrap_err();
+        let said = e.to_string();
+        assert!(
+            said.contains("still open") && said.contains("pid 4242"),
+            "{said}"
+        );
+        assert!(e.help.contains("4242"), "{}", e.help);
+        assert!(now_said(Ended::StillOpen { pid: None }).is_err());
     }
 }

@@ -304,6 +304,39 @@ mod unix_common {
         Ok(false)
     }
 
+    /// A process holds the holder lock at `lock`: a holder takes it `LOCK_EX` for its whole life
+    /// (`server::unix`), so a held lock is a living holder. Asked with a shared, non-blocking
+    /// `flock` given back at once; a holder that starts in that instant finds its lock taken and
+    /// answers `AlreadyRunning`, which its starter waits out.
+    pub(crate) fn lock_held(lock: &Path) -> bool {
+        use std::os::unix::fs::OpenOptionsExt;
+        let Ok(file) = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(lock)
+        else {
+            return false;
+        };
+        // SAFETY: flock on the file just opened; a lock taken here ends with it, below.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } == 0 {
+            return false;
+        }
+        io::Error::last_os_error().raw_os_error() == Some(libc::EWOULDBLOCK)
+    }
+
+    /// The pid a holder wrote into its lock file (`server::unix`), if it reads as one (a short,
+    /// bounded read: the file is this user's, not trusted for its size).
+    pub(crate) fn lock_pid(lock: &Path) -> Option<u32> {
+        use std::io::Read;
+        let mut text = String::new();
+        std::fs::File::open(lock)
+            .ok()?
+            .take(32)
+            .read_to_string(&mut text)
+            .ok()?;
+        text.trim().parse().ok()
+    }
+
     /// SIGTERM and SIGHUP, delivered as a readable byte (`signal_hook`'s self-pipe).
     pub(crate) struct Signals {
         read: UnixStream,

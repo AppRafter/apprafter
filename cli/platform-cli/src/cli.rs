@@ -97,6 +97,18 @@ pub enum Commands {
         #[command(subcommand)]
         action: LockCommand,
     },
+    /// Open an unlock window in this terminal: for `--timeout` minutes, restarted by each
+    /// command that uses it, commands started from this terminal use the target store's
+    /// secrets without asking. Every process started from this terminal can use the window, an
+    /// agent included; unlock in a terminal of its own, or end the window with
+    /// `apprafter lock now`. Asks for the lock password or the recovery key even when a window is
+    /// already open. (Not `apprafter backup unlock`, which clears stale backup-repository locks.)
+    Unlock {
+        /// Minutes the window stays open, restarted by each command that uses it. Defaults to
+        /// the store's own setting: 5, or what `apprafter lock on --timeout` chose.
+        #[arg(long, value_name = "MINUTES", value_parser = clap::value_parser!(u32).range(1..=1440))]
+        timeout: Option<u32>,
+    },
     /// Bootstrap a fresh cluster on the given provider/tier.
     Init {
         /// Infrastructure provider identifier.
@@ -1638,6 +1650,11 @@ pub enum LockCommand {
     /// as you — and delete the vault. Asks for the lock password or the recovery key, even
     /// inside an unlock window. Also backs out of an interrupted `apprafter lock on`.
     Off,
+    /// End the unlock window in this terminal now. Asks nothing.
+    Now,
+    /// Whether this target store is locked, how it opens (its slots), the unlock window left in
+    /// this terminal, and what this computer lets other programs running as you do.
+    Status,
 }
 
 #[derive(Debug, Subcommand)]
@@ -2005,6 +2022,7 @@ pub enum BackupAction {
     /// Remove STALE locks from an S3-backed restic repository
     /// (`restic unlock`; live locks are never touched). Run OUTSIDE the
     /// cluster with the operator's full S3 credentials.
+    /// (Not `apprafter unlock`, which opens a target store's unlock window.)
     Unlock {
         /// S3 restic repository URL. Defaults to `PlatformStack.spec.backup.bucket`.
         #[arg(long)]

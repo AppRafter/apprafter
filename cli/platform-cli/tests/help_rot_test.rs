@@ -806,3 +806,13 @@ fn the_guides_still_type_every_alias_this_table_claims() {
         );
     }
 }
+
+/// D.4a T60: `unlock` and `backup unlock` share a word and nothing else; each help names the
+/// other.
+#[test]
+fn unlock_and_backup_unlock_name_each_other() {
+    let unlock = short_help_for(&["unlock"]);
+    let backup = short_help_for(&["backup", "unlock"]);
+    assert!(unlock.contains("apprafter backup unlock"), "{unlock}");
+    assert!(backup.contains("apprafter unlock"), "{backup}");
+}
