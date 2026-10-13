@@ -41,8 +41,9 @@ pub(crate) fn legacy_context() -> cli_core::Result<Context> {
 }
 
 /// A core error as a legacy arm's `CliError`: a wrapped `CliError` as it was; the core's
-/// `TargetNotFound`, `NoActiveTarget` and `TokenNotStored` as the `CliError`s `CoreError::from`
-/// makes them from (the names joined back with ", "); any other as its message.
+/// `TargetNotFound`, `NoActiveTarget`, `TokenNotStored` and `Cancelled` as the `CliError`s
+/// `CoreError::from` makes them from (the names joined back with ", "); any other as its
+/// message.
 pub(crate) fn into_cli_error(e: CoreError) -> CliError {
     match e {
         CoreError::Cli(e) => e,
@@ -53,6 +54,7 @@ pub(crate) fn into_cli_error(e: CoreError) -> CliError {
         CoreError::NoActiveTarget => CliError::NoActiveTarget,
         // D.4a T15: the core's code on a legacy arm.
         CoreError::TokenNotStored { name } => CliError::TokenNotStored { name },
+        CoreError::Cancelled => CliError::Cancelled,
         other => CliError::Other(other.to_string()),
     }
 }
@@ -103,6 +105,16 @@ mod tests {
             Some("apprafter::target::token_missing")
         );
         assert_eq!(cli.to_string(), message);
+        assert_eq!(cli.help().map(|h| h.to_string()), Some(help));
+    }
+
+    /// D.4a T61: a cancel keeps its code and its CLI help on a legacy arm.
+    #[test]
+    fn a_cancel_keeps_the_cores_code_on_a_legacy_arm() {
+        use miette::Diagnostic;
+        let help = crate::render::core_error::cli_help(&CoreError::Cancelled).unwrap();
+        let cli = into_cli_error(CoreError::Cancelled);
+        assert!(matches!(cli, CliError::Cancelled));
         assert_eq!(cli.help().map(|h| h.to_string()), Some(help));
     }
 }

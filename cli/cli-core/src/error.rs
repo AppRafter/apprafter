@@ -1160,6 +1160,16 @@ pub enum CliError {
     )]
     TokenNotStored { name: String },
 
+    /// The person stopped a prompt (Ctrl-C at the controlling terminal, D.4a T61): the core's
+    /// `Cancelled`, for a command that still returns `cli_core::Result`. `CoreError::from` maps it
+    /// back onto the core's own variant.
+    #[error("operation cancelled")]
+    #[diagnostic(
+        code(apprafter::op::cancelled),
+        help("The command was interrupted; nothing after that point ran.")
+    )]
+    Cancelled,
+
     /// Token validation ping during `target add` rejected the
     /// supplied credentials. Distinct from the generic
     /// `Hetzner { status: 401, .. }` so the operator gets a
@@ -1718,6 +1728,18 @@ mod tests {
             help_of(&err),
             "Run `apprafter target add prod --renew --token <X>` to store one, or set \
              `HCLOUD_TOKEN` for this invocation."
+        );
+    }
+
+    /// D.4a T61: a prompt the person stopped is the core's `op::cancelled` on a legacy arm too.
+    #[test]
+    fn a_cancelled_prompt_has_the_cores_code() {
+        let err = CliError::Cancelled;
+        assert_eq!(code_of(&err), "apprafter::op::cancelled");
+        assert_eq!(err.to_string(), "operation cancelled");
+        assert_eq!(
+            help_of(&err),
+            "The command was interrupted; nothing after that point ran."
         );
     }
 

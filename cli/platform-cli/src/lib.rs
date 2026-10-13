@@ -16,6 +16,9 @@ pub(crate) mod commands;
 mod context;
 mod dispatch;
 pub(crate) mod examples;
+// Callers: d4a-d Task 5 (the prompt) and Task 9 (`Asker::answer`), which removes this allow.
+#[allow(dead_code)]
+mod prompt;
 mod render;
 mod sandbox;
 mod startup;
