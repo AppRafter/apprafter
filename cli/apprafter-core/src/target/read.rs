@@ -317,6 +317,36 @@ mod tests {
         );
     }
 
+    /// A locked store at `root`, made with no real-environment context (G3: the test below
+    /// builds one, so it calls no opener itself).
+    fn locked_at(root: &std::path::Path) {
+        let token = "c".repeat(64);
+        crate::secrets::testing::locked_store(root, &[("prod", Some(token.as_str()))]);
+    }
+
+    /// D.4a T35's fail-closed half: on a locked store `HCLOUD_TOKEN` is never the token — the
+    /// store's own refusal answers (`store_locked`, with no way to open it here); d4a-d refuses
+    /// the variable itself before any prompt.
+    #[test]
+    fn a_locked_store_never_takes_hcloud_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("store");
+        locked_at(&root);
+        let ctx = Context::from_cli_env(
+            &MapEnv::new()
+                .with("APPRAFTER_CONFIG_DIR", root.to_str().unwrap())
+                .with("HCLOUD_TOKEN", "env-tok"),
+        )
+        .unwrap()
+        .with_home_dir(Some(dir.path().join("home")));
+        let t = TargetRef::named(&ctx, "prod").unwrap();
+        let e = hetzner_token(&ctx, &t).unwrap_err();
+        assert!(
+            matches!(&e, CoreError::Cli(cli_core::CliError::StoreLocked { .. })),
+            "{e:?}"
+        );
+    }
+
     /// D.4a b: the token is read from its record alone, through the secret store, so a target
     /// whose `config.yaml` is gone still has the token it stores.
     #[test]

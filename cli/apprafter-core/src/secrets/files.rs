@@ -15,7 +15,7 @@ use cli_state::{State, StatePaths};
 use zeroize::Zeroizing;
 
 use super::marker::{self, Marker};
-use super::{CacheKey, NewCacheKey, StoredToken};
+use super::{CacheKey, KeyOf, NewCacheKey, StoredToken};
 use crate::context::SecretString;
 
 /// D.4a T6: in the core's own tests a door opens only what lies under the temp dir — the
@@ -93,10 +93,10 @@ pub(super) fn put_token(
 pub(super) fn cache_key(age_key_path: &Path, target: &str) -> Result<CacheKey> {
     under_temp(age_key_path);
     let identity = load_identity(age_key_path)?.ok_or_else(|| missing(target, age_key_path))?;
-    Ok(CacheKey {
+    Ok(CacheKey(KeyOf::SharedFile {
         identity,
         path: age_key_path.to_path_buf(),
-    })
+    }))
 }
 
 /// `age_cache::key_for_new_secret`'s rule (WI-457), moved: the key there is, a first use, or
@@ -108,10 +108,10 @@ pub(super) fn cache_key_for_new_secret(
 ) -> Result<NewCacheKey> {
     under_temp(age_key_path);
     if let Some(identity) = load_identity(age_key_path)? {
-        return Ok(NewCacheKey::Ready(CacheKey {
+        return Ok(NewCacheKey::Ready(CacheKey(KeyOf::SharedFile {
             identity,
             path: age_key_path.to_path_buf(),
-        }));
+        })));
     }
     if !held(store)?.is_empty() {
         return Err(missing(target, age_key_path));

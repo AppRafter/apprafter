@@ -13,6 +13,9 @@
 //!   `APPRAFTER_AGE_KEY`, `CUE_BIN`), never read for the desktop;
 //! - the one door to the store's secrets, [`Context::secrets`], built per call from the store
 //!   root and the age key path;
+//! - how a locked store's secrets open in this client ([`VaultAccess`], D.4a §3.3):
+//!   [`NoVaultAccess`] from every builder, which refuses, until the client injects its own
+//!   ([`Context::with_vault_access`]);
 //! - the home directory (the age key's default, the `~/` of shown paths),
 //!   the age key path, the tool search path and where it came from
 //!   ([`PathSource`]), and a private runtime dir;
@@ -23,6 +26,7 @@
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use cli_core::target::TargetStorePaths;
@@ -33,7 +37,7 @@ use zeroize::Zeroizing;
 use crate::env::EnvSource;
 use crate::error::{CoreError, CoreResult};
 use crate::net::DeadlineResolver;
-use crate::secrets::SecretStore;
+use crate::secrets::{NoVaultAccess, SecretStore, VaultAccess};
 use crate::tools::ToolResolver;
 
 /// Points every Hetzner call at another base URL (integration tests).
@@ -186,6 +190,8 @@ pub struct Context {
     runtime_dir: PathBuf,
     request_timeout: Duration,
     no_ping: bool,
+    /// How a locked store's secrets open here (D.4a T12): the client's, else `NoVaultAccess`.
+    vault_access: Arc<dyn VaultAccess>,
     /// Rebuilt by [`Context::with_request_timeout`].
     http: ureq::Agent,
 }
@@ -333,6 +339,7 @@ impl Context {
             runtime_dir,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             no_ping: false,
+            vault_access: Arc::new(NoVaultAccess),
             http: http_agent(DEFAULT_REQUEST_TIMEOUT),
         }
     }
@@ -371,6 +378,17 @@ impl Context {
         self
     }
 
+    /// How a locked store's secrets open in this client (D.4a §3.3): the CLI's prompt and its
+    /// terminal's window (d4a-d, d4a-e), the desktop's held key (d4a-g), a test's fixed key.
+    pub fn with_vault_access(mut self, access: Arc<dyn VaultAccess>) -> Self {
+        self.vault_access = access;
+        self
+    }
+
+    pub fn vault_access(&self) -> &Arc<dyn VaultAccess> {
+        &self.vault_access
+    }
+
     pub fn config_root(&self) -> &Path {
         &self.config_root
     }
@@ -380,10 +398,15 @@ impl Context {
         TargetStorePaths::for_root(self.config_root.clone())
     }
 
-    /// The one door to this store's secrets (ADR 0068 §5; D.4a b): every token and cached
-    /// secret is read through it. Cheap; opens nothing until one of its methods runs.
+    /// The one door to this store's secrets (ADR 0068 §5; D.4a b), with the store root, the
+    /// age key path and this context's vault access (D.4a c2): every token and cached secret is
+    /// read through it. Cheap; opens nothing until one of its methods runs.
     pub fn secrets(&self) -> SecretStore {
-        SecretStore::new(self.store(), self.age_key_path.clone())
+        SecretStore::new(
+            self.store(),
+            self.age_key_path.clone(),
+            self.vault_access.clone(),
+        )
     }
 
     pub fn hcloud_base_url(&self) -> &str {

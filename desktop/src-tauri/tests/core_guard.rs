@@ -236,6 +236,7 @@ const OPENERS: &[&[&str]] = &[
     &["read_store_file"],
     &["write_store_file"],
     &["write_marker"],
+    &["locked_store"],
 ];
 
 /// Openers called as a method of the context, by name (as `apprafter-core/tests/guards.rs`
@@ -482,6 +483,7 @@ mod tests {
         let ctx = Context::from_desktop_env(&env, policy, host()).unwrap();
         let _ = apprafter_core::secrets::read_store_file(ctx.config_root());
         let _ = apprafter_core::secrets::marker::write_marker(&ctx.store(), \"p\", &id);
+        let _ = apprafter_core::secrets::testing::locked_store(ctx.config_root(), &[]);
     }
 }
 ";
@@ -500,6 +502,7 @@ mod tests {
             ),
             ("t".to_string(), true, "read_store_file".to_string()),
             ("t".to_string(), true, "write_marker".to_string()),
+            ("t".to_string(), true, "locked_store".to_string()),
         ]
     );
 }

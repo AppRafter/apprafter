@@ -3,6 +3,18 @@
 //! secret store answers on a locked, a locking and an unlocking store, on scratch stores. The
 //! vault itself is Task 3's (`secrets::testing::locked_store`): here no vault is ever opened.
 
+use std::path::Path;
+use std::sync::Arc;
+
+use cli_core::secrets::{
+    encrypt_for_recipient, load_or_create_identity, CacheKeyKind, UndecryptableWhy,
+};
+use cli_core::{DamageKind, RefusedInput, VaultProblem, VaultWriteProblem};
+
+use super::locked::VAULT_WRITER;
+use super::testing::{locked_store, LockedTestStore};
+use crate::vault::{DataKey, KdfPolicy, RecoveryKey, SlotSecret, VaultFile, VaultId};
+
 use cli_core::secrets::CachedSecret;
 use cli_core::{CliError, LockPhase, LockedWhy, SecretsModeKind, StoreLock};
 
@@ -388,8 +400,8 @@ fn a_locked_store_reads_its_markers_without_a_vault() {
 }
 
 /// T42, rule 3: a locked store hands out no token but its vault's — never the clear one planted
-/// beside it, never another store's — and what needs the vault refuses while nothing here can
-/// open it.
+/// beside it, never another store's — and what needs the vault says the vault is missing, here
+/// where `store.yaml` says locked and no vault exists.
 #[test]
 fn a_locked_store_never_hands_out_a_clear_token() {
     let (_d, ctx) = store(&["prod", "bare", "copied", "none"], None);
@@ -398,10 +410,12 @@ fn a_locked_store_never_hands_out_a_clear_token() {
     write_marker(&ctx.store(), "copied", &id(OTHER)).unwrap();
     std::fs::remove_file(ctx.secrets().credentials_file("none")).unwrap();
     let s = ctx.secrets();
-    let root = ctx.config_root().to_path_buf();
-    assert!(matches!(s.stored_token("prod"),
-        Err(CliError::StoreLocked { store, reason: LockedWhy::NoTerminal, stopped_before: None })
-            if store == root));
+    let vault = ctx.config_root().join(VAULT_FILE);
+    let missing = |e: CliError| {
+        matches!(&e, CliError::VaultUnreadable { path, problem: VaultProblem::Missing, .. }
+            if *path == vault)
+    };
+    assert!(missing(s.stored_token("prod").unwrap_err()));
     assert!(matches!(s.stored_token("bare"),
         Err(CliError::TokenOutsideVault { target, path })
             if target == "bare" && path == s.credentials_file("bare")));
@@ -410,18 +424,9 @@ fn a_locked_store_never_hands_out_a_clear_token() {
         Err(CliError::TokenInAnotherVault { .. })
     ));
     assert!(s.stored_token("none").unwrap().is_none());
-    assert!(matches!(
-        s.cache_key("prod"),
-        Err(CliError::StoreLocked { .. })
-    ));
-    assert!(matches!(
-        s.cache_key_for_new_secret("prod"),
-        Err(CliError::StoreLocked { .. })
-    ));
-    assert!(matches!(
-        s.prepare_write(),
-        Err(CliError::StoreLocked { .. })
-    ));
+    assert!(missing(s.cache_key("prod").unwrap_err()));
+    assert!(missing(s.cache_key_for_new_secret("prod").unwrap_err()));
+    assert!(missing(s.prepare_write().unwrap_err()));
     let t = TargetRef::named(&ctx, "bare").unwrap();
     assert!(matches!(
         crate::target::hetzner_token(&ctx, &t),
@@ -561,4 +566,668 @@ fn the_frozen_v1_store_yaml_reads_as_its_lock_state() {
             unlock_timeout_min: Some(15),
         }
     );
+}
+
+// ---- The vault behind the markers (D.4a c2, the vault backend). ----
+
+/// A locked store at a fresh root with `targets`, and a context that opens it with its key.
+fn locked(targets: &[(&str, Option<&str>)]) -> (tempfile::TempDir, Context, LockedTestStore) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("store");
+    let made = locked_store(&root, targets);
+    let ctx = Context::for_desktop(root, "http://127.0.0.1:1")
+        .with_home_dir(Some(dir.path().join("home")))
+        .with_vault_access(made.access());
+    (dir, ctx, made)
+}
+
+/// `ctx`'s store, with no way to open its vault: the default of every context.
+fn without_access(ctx: &Context) -> Context {
+    Context::for_desktop(ctx.config_root().to_path_buf(), "http://127.0.0.1:1")
+        .with_home_dir(ctx.home_dir().map(Path::to_path_buf))
+}
+
+fn vault_bytes(ctx: &Context) -> Vec<u8> {
+    std::fs::read(ctx.config_root().join(VAULT_FILE)).unwrap()
+}
+
+/// `target`'s token as the vault holds it now, read with the test store's key.
+fn entry(ctx: &Context, made: &LockedTestStore, target: &str) -> Option<String> {
+    VaultFile::parse(&vault_bytes(ctx))
+        .unwrap()
+        .open_with_key(made.data_key(), made.vault_id)
+        .unwrap()
+        .payload()
+        .hetzner_token(target)
+        .map(|token| token.expose().to_string())
+}
+
+/// Every file under `dir`.
+fn walk(dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            out.extend(walk(&path));
+        } else {
+            out.push(path);
+        }
+    }
+    out
+}
+
+/// T12: a locked store's tokens open through the access its context was given.
+#[test]
+fn a_locked_store_opens_its_tokens_through_its_access() {
+    let (_d, ctx, _made) = locked(&[("prod", Some(TOKEN_A)), ("bare", None)]);
+    let s = ctx.secrets();
+    assert_eq!(s.mode().unwrap(), SecretsMode::Locked);
+    assert_eq!(s.token_presence("prod").unwrap(), StoredToken::InVault);
+    assert_eq!(s.stored_token("prod").unwrap().unwrap().expose(), TOKEN_A);
+    assert_eq!(s.token_presence("bare").unwrap(), StoredToken::None);
+    assert!(s.stored_token("bare").unwrap().is_none());
+    let t = TargetRef::named(&ctx, "prod").unwrap();
+    assert_eq!(
+        crate::target::hetzner_token(&ctx, &t).unwrap().expose(),
+        TOKEN_A
+    );
+}
+
+/// Rule 3: without a way to open it (`NoVaultAccess`, every context's default) a locked store
+/// refuses `store_locked` — never an empty answer — and its markers still read.
+#[test]
+fn without_access_a_locked_store_refuses_and_never_reads_as_empty() {
+    let (_d, ctx, _made) = locked(&[("prod", Some(TOKEN_A))]);
+    let bare = without_access(&ctx);
+    let s = bare.secrets();
+    for e in [
+        s.stored_token("prod").map(|_| ()).unwrap_err(),
+        s.cache_key("prod").map(|_| ()).unwrap_err(),
+        s.cache_key_for_new_secret("prod").map(|_| ()).unwrap_err(),
+        s.prepare_write().map(|_| ()).unwrap_err(),
+    ] {
+        assert!(
+            matches!(
+                &e,
+                CliError::StoreLocked {
+                    reason: LockedWhy::NoTerminal,
+                    stopped_before: None,
+                    ..
+                }
+            ),
+            "{e:?}"
+        );
+    }
+    assert_eq!(s.token_presence("prod").unwrap(), StoredToken::InVault);
+}
+
+/// T7: reading a token record never opens the vault — here a directory any read would fail on —
+/// and an unreadable vault is an error where the token is needed, never "no token".
+#[test]
+fn the_marker_read_never_opens_the_vault() {
+    let (_d, ctx, _made) = locked(&[("prod", Some(TOKEN_A))]);
+    let vault = ctx.config_root().join(VAULT_FILE);
+    std::fs::remove_file(&vault).unwrap();
+    std::fs::create_dir(&vault).unwrap();
+    assert_eq!(
+        ctx.secrets().token_presence("prod").unwrap(),
+        StoredToken::InVault
+    );
+    let t = TargetRef::named(&ctx, "prod").unwrap();
+    assert_eq!(
+        crate::target::show(&ctx, &t).unwrap().token,
+        TokenPresence {
+            set: true,
+            chars: None
+        }
+    );
+    assert!(ctx.secrets().stored_token("prod").is_err());
+}
+
+/// Rule 3: a key that does not open the payload, for the right vault, is damage — never "no token".
+#[test]
+fn a_wrong_key_is_damage_and_never_an_absent_token() {
+    let (_d, ctx, made) = locked(&[("prod", Some(TOKEN_A))]);
+    let wrong = ctx
+        .clone()
+        .with_vault_access(Arc::new(FixedVaultAccess::new(
+            Arc::new(DataKey::from_bytes(&[7; 32])),
+            made.vault_id,
+        )));
+    let e = wrong.secrets().stored_token("prod").unwrap_err();
+    assert!(
+        matches!(
+            &e,
+            CliError::VaultUnreadable {
+                problem: VaultProblem::Damaged {
+                    what: DamageKind::Tampered
+                },
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+}
+
+/// Rule 3, crypto §11: a key for another vault (the lock turned off and on meanwhile) is a
+/// changed store, never damage.
+#[test]
+fn a_key_for_another_vault_is_a_changed_store_never_damage() {
+    let (_d, ctx, made) = locked(&[("prod", Some(TOKEN_A))]);
+    let stale = ctx
+        .clone()
+        .with_vault_access(Arc::new(FixedVaultAccess::new(
+            made.data_key().clone(),
+            VaultId([9; 16]),
+        )));
+    let e = stale.secrets().stored_token("prod").unwrap_err();
+    assert!(
+        matches!(
+            &e,
+            CliError::StoreChanged {
+                prepared: SecretsModeKind::Locked,
+                now: SecretsModeKind::Locked,
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+}
+
+/// T29: a vault naming another store, or none, is said so before any key is asked for.
+#[test]
+fn a_vault_of_another_store_or_none_is_said_so_before_any_key() {
+    let (_d, ctx, _made) = locked(&[("prod", Some(TOKEN_A))]);
+    let other = tempfile::tempdir().unwrap();
+    locked_store(&other.path().join("store"), &[("prod", Some(TOKEN_B))]);
+    std::fs::copy(
+        other.path().join("store").join(VAULT_FILE),
+        ctx.config_root().join(VAULT_FILE),
+    )
+    .unwrap();
+    for c in [&ctx, &without_access(&ctx)] {
+        let e = c.secrets().stored_token("prod").unwrap_err();
+        assert!(
+            matches!(
+                &e,
+                CliError::VaultUnreadable {
+                    problem: VaultProblem::OtherStore,
+                    ..
+                }
+            ),
+            "{e:?}"
+        );
+    }
+    std::fs::remove_file(ctx.config_root().join(VAULT_FILE)).unwrap();
+    let e = ctx.secrets().stored_token("prod").unwrap_err();
+    assert!(
+        matches!(
+            &e,
+            CliError::VaultUnreadable {
+                problem: VaultProblem::Missing,
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+}
+
+/// Rule 3: a vault in a format this build does not read is "newer" only when its number is
+/// higher; a lower one (c1 refuses any version but 1) is damage, never "upgrade AppRafter".
+#[test]
+fn only_a_higher_vault_format_is_newer() {
+    let (_d, ctx, _made) = locked(&[("prod", Some(TOKEN_A))]);
+    let path = ctx.config_root().join(VAULT_FILE);
+    let good = std::fs::read(&path).unwrap();
+    // The format version: a little-endian u16 right after the 8-byte magic (c1's `format.rs`).
+    assert_eq!(&good[8..10], &[1, 0]);
+    for low_byte in [2u8, 0] {
+        let mut bytes = good.clone();
+        bytes[8] = low_byte;
+        std::fs::write(&path, &bytes).unwrap();
+        let e = ctx.secrets().stored_token("prod").unwrap_err();
+        let expected = match low_byte {
+            2 => VaultProblem::NewerFormat { version: 2 },
+            _ => VaultProblem::Damaged {
+                what: DamageKind::Malformed,
+            },
+        };
+        assert!(
+            matches!(&e, CliError::VaultUnreadable { problem, .. } if *problem == expected),
+            "format {low_byte}: {e:?}"
+        );
+    }
+}
+
+/// Rule 3: one bit flipped in the payload is tampering.
+#[test]
+fn a_flipped_bit_in_the_vault_is_tampering() {
+    let (_d, ctx, _made) = locked(&[("prod", Some(TOKEN_A))]);
+    let path = ctx.config_root().join(VAULT_FILE);
+    let mut bytes = std::fs::read(&path).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0x01;
+    std::fs::write(&path, &bytes).unwrap();
+    let e = ctx.secrets().stored_token("prod").unwrap_err();
+    assert!(
+        matches!(
+            &e,
+            CliError::VaultUnreadable {
+                problem: VaultProblem::Damaged {
+                    what: DamageKind::Tampered
+                },
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+}
+
+/// T43: a marker whose vault has no entry for its target is token_missing_from_vault.
+#[test]
+fn a_marker_without_an_entry_is_token_missing_from_vault() {
+    let (_d, ctx, made) = locked(&[("prod", None)]);
+    write_marker(&ctx.store(), "prod", &made.store_id).unwrap();
+    let e = ctx.secrets().stored_token("prod").unwrap_err();
+    assert!(
+        matches!(&e, CliError::TokenMissingFromVault { target, .. } if target == "prod"),
+        "{e:?}"
+    );
+}
+
+/// T26, T38: the store's own identity opens its caches and gives new ones their recipient; a
+/// cache under the shared age key — there, and readable — is never opened on a locked store.
+#[test]
+fn the_store_identity_opens_its_caches_and_the_shared_key_never_does() {
+    let (_d, ctx, made) = locked(&[("prod", Some(TOKEN_A))]);
+    let s = ctx.secrets();
+    let key = s.cache_key("prod").unwrap();
+    assert_eq!(key.kind(), CacheKeyView::StoreVault);
+    assert_eq!(
+        key.recipient().unwrap().to_string(),
+        made.recipient().to_string()
+    );
+    let sealed = encrypt_for_recipient(YAML, &key.recipient().unwrap()).unwrap();
+    let opened = s
+        .cached_kubeconfig(&hetzner(Some(&sealed), Some("clusters: [stale]\n")), "prod")
+        .unwrap()
+        .unwrap();
+    assert_eq!(opened.as_str(), YAML);
+    let shared = load_or_create_identity(ctx.age_key_path()).unwrap();
+    let foreign = encrypt_for_recipient(YAML, &shared.to_public()).unwrap();
+    let e = s
+        .cached_kubeconfig(&hetzner(Some(&foreign), None), "prod")
+        .unwrap_err();
+    assert!(
+        matches!(
+            &e,
+            CliError::CacheUndecryptable {
+                key: CacheKeyKind::StoreVault,
+                reason: UndecryptableWhy::NotForThisKey,
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+    assert!(matches!(s.cache_key_for_new_secret("prod").unwrap(),
+        NewCacheKey::Ready(k) if k.kind() == CacheKeyView::StoreVault));
+    let shown = format!("{key:?}");
+    assert!(
+        shown.contains("<in the vault>") && !shown.contains("AGE-SECRET-KEY"),
+        "{shown}"
+    );
+}
+
+/// T28, T34, rule 2: a write goes into the vault under the held lock and leaves a 0600 marker;
+/// no file of the store holds a token in clear, the vault included.
+#[test]
+fn writes_go_to_the_vault_and_leave_a_marker_and_no_clear_token() {
+    let (_d, ctx, made) = locked(&[("prod", Some(TOKEN_A))]);
+    let s = ctx.secrets();
+    let key = s.prepare_write().unwrap();
+    let held = StoreLock::exclusive(&ctx.store()).unwrap();
+    s.put_token(&key, &held, "prod", &SecretString::new(TOKEN_B))
+        .unwrap();
+    s.put_token(&key, &held, "staging", &SecretString::new(TOKEN_A))
+        .unwrap();
+    drop(held);
+    assert_eq!(s.stored_token("prod").unwrap().unwrap().expose(), TOKEN_B);
+    assert_eq!(
+        s.stored_token("staging").unwrap().unwrap().expose(),
+        TOKEN_A
+    );
+    assert_eq!(
+        classify(&std::fs::read(s.credentials_file("staging")).unwrap()),
+        Marker::Vault {
+            id: made.store_id.clone()
+        }
+    );
+    for file in walk(ctx.config_root()) {
+        let bytes = std::fs::read(&file).unwrap();
+        for token in [TOKEN_A, TOKEN_B] {
+            assert!(
+                !bytes.windows(token.len()).any(|w| w == token.as_bytes()),
+                "{} holds a token in clear",
+                file.display()
+            );
+        }
+    }
+    #[cfg(unix)]
+    assert_eq!(mode_of(&s.credentials_file("staging")), 0o600);
+    // c2's writes are the first callers of c1's `replace`: the vault stays owner-only (the
+    // Windows DACL is c1's `windows-latest` test).
+    #[cfg(unix)]
+    assert_eq!(mode_of(&ctx.config_root().join(VAULT_FILE)), 0o600);
+}
+
+/// T28: a vault write without the held write lock is refused, and the vault is unchanged —
+/// refused by the store before anything is read, even where the write would change nothing
+/// (`absent` has no entry, so c1's own check in `replace` is never reached).
+#[test]
+fn a_vault_write_needs_the_held_write_lock() {
+    let (_d, ctx, _made) = locked(&[("prod", Some(TOKEN_A))]);
+    let s = ctx.secrets();
+    let key = s.prepare_write().unwrap();
+    let before = vault_bytes(&ctx);
+    let unheld = StoreLock::unheld();
+    let refused = |r: cli_core::Result<()>| matches!(r, Err(CliError::VaultNeedsWriteLock { .. }));
+    assert!(refused(s.put_token(
+        &key,
+        &unheld,
+        "prod",
+        &SecretString::new(TOKEN_B)
+    )));
+    assert!(refused(s.remove_token(&key, &unheld, "prod").map(|_| ())));
+    assert!(refused(s.remove_token(&key, &unheld, "absent").map(|_| ())));
+    assert!(refused(s.copy_token(&key, &unheld, "prod", "next")));
+    assert!(refused(s.rename_token(&key, &unheld, "prod", "next")));
+    drop(unheld);
+    assert_eq!(vault_bytes(&ctx), before);
+}
+
+/// §3.12: a value the vault cannot hold is this write's refusal — never "the vault is
+/// damaged, restore it from a backup" — and nothing is written.
+#[test]
+fn a_token_the_vault_cannot_hold_is_refused_and_nothing_is_written() {
+    let (_d, ctx, _made) = locked(&[("prod", Some(TOKEN_A))]);
+    let s = ctx.secrets();
+    let key = s.prepare_write().unwrap();
+    let before = vault_bytes(&ctx);
+    let held = StoreLock::exclusive(&ctx.store()).unwrap();
+    for token in [String::new(), "x".repeat(16_385)] {
+        let e = s
+            .put_token(&key, &held, "prod", &SecretString::new(token))
+            .unwrap_err();
+        assert!(
+            matches!(
+                &e,
+                CliError::VaultUnwritable {
+                    problem: VaultWriteProblem::Refused {
+                        what: RefusedInput::Token
+                    },
+                    ..
+                }
+            ),
+            "{e:?}"
+        );
+    }
+    drop(held);
+    assert_eq!(vault_bytes(&ctx), before);
+    assert_eq!(s.stored_token("prod").unwrap().unwrap().expose(), TOKEN_A);
+}
+
+/// Overview §8 risk 10: a marker is written only once the vault it points into is on disk
+/// (c1's `replace` syncs the directory best effort): a failed fsync of the store root writes
+/// no marker.
+#[cfg(unix)]
+#[test]
+fn no_marker_is_written_before_the_vault_is_durable() {
+    let (_d, ctx, _made) = locked(&[("prod", Some(TOKEN_A))]);
+    let s = ctx.secrets();
+    let key = s.prepare_write().unwrap();
+    let held = StoreLock::exclusive(&ctx.store()).unwrap();
+    super::locked::ROOT_SYNC_FAILS.with(|fail| fail.set(true));
+    let e = s
+        .put_token(&key, &held, "staging", &SecretString::new(TOKEN_B))
+        .unwrap_err();
+    drop(held);
+    assert!(matches!(&e, CliError::Io(_)), "{e:?}");
+    assert!(!s.credentials_file("staging").exists());
+}
+
+/// §3.7: a vault write records its client as the writer — the core's `apprafter <version>`
+/// unless the client's access names itself, as the desktop's will (`apprafter-desktop
+/// <version>`, d4a-g).
+#[test]
+fn a_vault_write_records_the_clients_writer() {
+    #[derive(Debug)]
+    struct Desktop(Arc<dyn VaultAccess>);
+    impl VaultAccess for Desktop {
+        fn session(&self, req: &VaultRequest<'_>) -> cli_core::Result<Arc<dyn VaultSession>> {
+            self.0.session(req)
+        }
+        fn write_key(&self, req: &VaultRequest<'_>) -> cli_core::Result<KeySession> {
+            self.0.write_key(req)
+        }
+        fn writer(&self) -> String {
+            "apprafter-desktop 9.9.9".into()
+        }
+    }
+    let (_d, ctx, made) = locked(&[("prod", Some(TOKEN_A))]);
+    let writer = |c: &Context| {
+        VaultFile::parse(&vault_bytes(c))
+            .unwrap()
+            .header()
+            .writer
+            .clone()
+    };
+    assert_eq!(writer(&ctx), VAULT_WRITER);
+    let desktop = ctx
+        .clone()
+        .with_vault_access(Arc::new(Desktop(made.access())));
+    let s = desktop.secrets();
+    let key = s.prepare_write().unwrap();
+    let held = StoreLock::exclusive(&desktop.store()).unwrap();
+    s.put_token(&key, &held, "prod", &SecretString::new(TOKEN_B))
+        .unwrap();
+    drop(held);
+    assert_eq!(writer(&desktop), "apprafter-desktop 9.9.9");
+}
+
+/// T41, critic G3: a write prepared for one vault is refused once the store was locked again
+/// (a new store id) or put back in files under it.
+#[test]
+fn a_write_prepared_before_the_lock_changed_is_refused() {
+    let (_d, ctx, _made) = locked(&[("prod", Some(TOKEN_A))]);
+    let s = ctx.secrets();
+    let key = s.prepare_write().unwrap();
+    std::fs::remove_file(ctx.config_root().join(VAULT_FILE)).unwrap();
+    let _again = locked_store(ctx.config_root(), &[("prod", Some(TOKEN_A))]);
+    let held = StoreLock::exclusive(&ctx.store()).unwrap();
+    let e = s
+        .put_token(&key, &held, "prod", &SecretString::new(TOKEN_B))
+        .unwrap_err();
+    drop(held);
+    assert!(
+        matches!(
+            &e,
+            CliError::StoreChanged {
+                prepared: SecretsModeKind::Locked,
+                now: SecretsModeKind::Locked,
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+    std::fs::remove_file(ctx.config_root().join(VAULT_FILE)).unwrap();
+    lock_state(&ctx, SecretsMode::Files, None);
+    let held = StoreLock::exclusive(&ctx.store()).unwrap();
+    let e = s
+        .put_token(&key, &held, "prod", &SecretString::new(TOKEN_B))
+        .unwrap_err();
+    drop(held);
+    assert!(
+        matches!(
+            &e,
+            CliError::StoreChanged {
+                prepared: SecretsModeKind::Locked,
+                now: SecretsModeKind::Files,
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+}
+
+/// T41, T43: a rename puts the new entry (`copy_token`), the caller moves the directories,
+/// then the old entry goes (`rename_token`) — the store reads at every step, so a crash between
+/// them leaves both names, harmless — and a vault an older AppRafter left with only the new
+/// name's entry (it renamed the directories alone) is left as it is; remove deletes the entry
+/// once.
+#[test]
+fn remove_and_rename_move_the_vault_entries_and_tolerate_an_older_rename() {
+    let (_d, ctx, made) = locked(&[("prod", Some(TOKEN_A)), ("staging", Some(TOKEN_B))]);
+    let s = ctx.secrets();
+    let key = s.prepare_write().unwrap();
+    let held = StoreLock::exclusive(&ctx.store()).unwrap();
+    s.copy_token(&key, &held, "prod", "eu").unwrap();
+    assert_eq!(entry(&ctx, &made, "eu").as_deref(), Some(TOKEN_A));
+    assert_eq!(
+        s.stored_token("prod").unwrap().unwrap().expose(),
+        TOKEN_A,
+        "a crash here: prod reads"
+    );
+    let copied = vault_bytes(&ctx);
+    s.copy_token(&key, &held, "prod", "eu").unwrap();
+    assert_eq!(
+        vault_bytes(&ctx),
+        copied,
+        "copied already: a re-run writes nothing"
+    );
+    cli_core::rename_target(&ctx.store(), "prod", "eu").unwrap();
+    assert_eq!(
+        s.stored_token("eu").unwrap().unwrap().expose(),
+        TOKEN_A,
+        "a crash here: eu reads"
+    );
+    s.rename_token(&key, &held, "prod", "eu").unwrap();
+    assert_eq!(s.stored_token("eu").unwrap().unwrap().expose(), TOKEN_A);
+    assert_eq!(entry(&ctx, &made, "prod"), None);
+    let before = vault_bytes(&ctx);
+    s.copy_token(&key, &held, "prod", "eu").unwrap();
+    s.rename_token(&key, &held, "prod", "eu").unwrap();
+    assert_eq!(
+        vault_bytes(&ctx),
+        before,
+        "already under the new name: nothing is written"
+    );
+    assert!(s.remove_token(&key, &held, "staging").unwrap());
+    assert!(
+        !s.remove_token(&key, &held, "staging").unwrap(),
+        "nothing left to remove"
+    );
+    drop(held);
+    assert!(matches!(
+        s.stored_token("staging"),
+        Err(CliError::TokenMissingFromVault { .. })
+    ));
+}
+
+/// T43, §3.12: renaming onto a name an older AppRafter removed — its directory gone, its vault
+/// entry left — replaces the leftover: never "the new name already has entries", never a
+/// damaged vault.
+#[test]
+fn a_rename_onto_a_name_an_older_apprafter_removed_replaces_its_leftover() {
+    let (_d, ctx, made) = locked(&[("prod", Some(TOKEN_A)), ("eu", Some(TOKEN_B))]);
+    std::fs::remove_dir_all(ctx.store().target_dir("eu")).unwrap();
+    let s = ctx.secrets();
+    let key = s.prepare_write().unwrap();
+    let held = StoreLock::exclusive(&ctx.store()).unwrap();
+    s.copy_token(&key, &held, "prod", "eu").unwrap();
+    cli_core::rename_target(&ctx.store(), "prod", "eu").unwrap();
+    s.rename_token(&key, &held, "prod", "eu").unwrap();
+    drop(held);
+    assert_eq!(s.stored_token("eu").unwrap().unwrap().expose(), TOKEN_A);
+    assert_eq!(entry(&ctx, &made, "prod"), None);
+}
+
+/// In files, remove and rename are the caller's directory moves: nothing for the store to do.
+#[test]
+fn in_files_remove_and_rename_leave_the_files_to_the_caller() {
+    let (_d, ctx) = store(&["prod"], None);
+    let s = ctx.secrets();
+    let key = s.prepare_write().unwrap();
+    let held = StoreLock::exclusive(&ctx.store()).unwrap();
+    let before = std::fs::read(s.credentials_file("prod")).unwrap();
+    assert!(!s.remove_token(&key, &held, "prod").unwrap());
+    s.copy_token(&key, &held, "prod", "eu").unwrap();
+    s.rename_token(&key, &held, "prod", "eu").unwrap();
+    drop(held);
+    assert_eq!(std::fs::read(s.credentials_file("prod")).unwrap(), before);
+    assert!(!s.credentials_file("eu").exists());
+}
+
+/// The test store d4a-d's spawned tests open: one recovery-key slot, its key as shown opens it,
+/// `store.yaml` mirrors it.
+#[test]
+fn the_test_store_opens_with_its_recovery_key() {
+    let (_d, ctx, made) = locked(&[("prod", Some(TOKEN_A))]);
+    let bytes = vault_bytes(&ctx);
+    let parsed = VaultFile::parse(&bytes).unwrap();
+    assert_eq!(parsed.header().slots.len(), 1);
+    assert_eq!(parsed.header().store_id, made.store_id.as_str());
+    let key = RecoveryKey::parse(made.recovery_key().expose()).unwrap();
+    let opened = parsed
+        .open(&SlotSecret::RecoveryKey(key), KdfPolicy::active())
+        .unwrap();
+    assert_eq!(
+        opened.payload().hetzner_token("prod").unwrap().expose(),
+        TOKEN_A
+    );
+    let file = read_store_file(ctx.config_root()).unwrap().unwrap();
+    assert_eq!(file.id.as_ref(), Some(&made.store_id));
+    assert_eq!(
+        file.slots,
+        vec![SlotInfo {
+            kind: LockSlotKind::RecoveryKey,
+            label: "recovery key".into()
+        }]
+    );
+}
+
+/// Rule 9: no Debug output shows the data key or the recovery key.
+#[test]
+fn no_key_shows_in_a_debug_output() {
+    let (_d, ctx, made) = locked(&[("prod", Some(TOKEN_A))]);
+    let hex: String = made
+        .data_key()
+        .expose()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let groups = made
+        .recovery_key()
+        .expose()
+        .lines()
+        .nth(1)
+        .unwrap()
+        .trim()
+        .to_string();
+    let session = KeySession::new(
+        made.data_key().clone(),
+        made.vault_id,
+        ctx.config_root().to_path_buf(),
+    );
+    for shown in [
+        format!("{session:?}"),
+        format!(
+            "{:?}",
+            FixedVaultAccess::new(made.data_key().clone(), made.vault_id)
+        ),
+        format!("{made:?}"),
+        format!("{:?}", ctx.secrets().prepare_write().unwrap()),
+        format!("{:?}", ctx.secrets().cache_key("prod").unwrap()),
+    ] {
+        assert!(!shown.contains(&hex) && !shown.contains(&groups), "{shown}");
+    }
 }

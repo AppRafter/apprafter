@@ -1388,8 +1388,9 @@ const REAL_ENV_BUILDERS: &[&[&str]] = &[
 
 /// What reads or writes a store's secrets, a key or a cache, or runs a check that does: a test
 /// that built its context from the real environment calls none of them, or it would read the
-/// real store of whoever runs it. D.4a c2 adds the lock state's file and the marker; d4a's later
-/// steps add the `lock`, `vault` and `holder` openers; `Context::secrets` is a method, in [`OPENER_METHODS`].
+/// real store of whoever runs it. D.4a c2 adds the lock state's file, the marker and
+/// `secrets::testing::locked_store`; d4a's later steps add the `lock`, `vault` and `holder`
+/// openers; `Context::secrets` is a method, in [`OPENER_METHODS`].
 const OPENERS: &[&[&str]] = &[
     &["load_identity"],
     &["load_or_create_identity"],
@@ -1403,6 +1404,7 @@ const OPENERS: &[&[&str]] = &[
     &["read_store_file"],
     &["write_store_file"],
     &["write_marker"],
+    &["locked_store"],
 ];
 
 /// Openers called as a method of the context, matched by the method's name (a syntax scan does
@@ -1492,6 +1494,11 @@ const REAL_ENV_TESTS: &[(&str, &str)] = &[
     (
         "apprafter-core/src/target/read.rs",
         "the_token_is_the_cli_override_else_the_stored_one",
+    ),
+    // D.4a c2: HCLOUD_TOKEN set on a locked store (the store is made by a helper).
+    (
+        "apprafter-core/src/target/read.rs",
+        "a_locked_store_never_takes_hcloud_token",
     ),
     (
         "apprafter-core/src/target/machine.rs",
@@ -2560,6 +2567,19 @@ fn t() {
                 row("t", true, "read_store_file"),
                 row("t", true, "write_store_file"),
                 row("t", true, "write_marker"),
+            ]
+        );
+    }
+
+    /// D.4a c2: the test store is an opener: it writes a vault into the store it is given.
+    #[test]
+    fn the_test_store_is_an_opener() {
+        let src = "fn t() { let ctx = Context::from_cli_env(&MapEnv::new()).unwrap(); let _ = secrets::testing::locked_store(ctx.config_root(), &[]); }";
+        assert_eq!(
+            uses(src, true),
+            vec![
+                row("t", false, "Context::from_cli_env"),
+                row("t", true, "locked_store"),
             ]
         );
     }
