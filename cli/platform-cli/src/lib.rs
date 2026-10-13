@@ -7,7 +7,8 @@
 //! instead of re-implementing either.
 //!
 //! The modules themselves stay crate-private: the only surface a
-//! consumer may rely on is [`docs_api`] plus [`run`]. Publishing
+//! consumer may rely on is [`docs_api`] plus [`run`] (`holder` is
+//! public and hidden, for its own integration tests only). Publishing
 //! `commands` wholesale would export ~45 modules' worth of
 //! functions and make the facade decorative.
 
@@ -16,6 +17,11 @@ pub(crate) mod commands;
 mod context;
 mod dispatch;
 pub(crate) mod examples;
+/// The per-terminal unlock holder (D.4a §3.10): the `apprafter __holder` process, its client and
+/// its wire protocol. Public for the integration tests only (`tests/holder_*.rs`); nothing
+/// outside this crate is meant to use it.
+#[doc(hidden)]
+pub mod holder;
 mod prompt;
 mod render;
 mod sandbox;
