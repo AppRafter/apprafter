@@ -36,6 +36,9 @@ cli-state     = { path = "../cli-state" }
 miette        = { workspace = true }
 serde         = { workspace = true }
 serde_json    = { workspace = true }
+# store.yaml and the credentials marker (D.4a T31, T34) go through the YAML path every store file
+# takes. Already in both locks through cli-core: an edge, no package (WI-460 moves them all off).
+serde_yaml    = { workspace = true }
 thiserror     = { workspace = true }
 ts-rs         = { version = "12.0", optional = true, features = ["serde-json-impl"] }
 ureq          = { workspace = true }
@@ -81,3 +84,6 @@ toml          = "0.5"
 # A cli-only dev-dependency: a path crate's dev-dependencies are not resolved in
 # desktop/Cargo.lock, so this adds nothing there.
 mockito       = { workspace = true }
+# `StoreLock::unheld` (cli-core's test-support), for the write-lock refusals' tests (D.4a T28). A
+# path crate's dev-dependency reaches neither a shipped binary nor desktop/Cargo.lock.
+cli-core      = { path = "../cli-core", features = ["test-support"] }

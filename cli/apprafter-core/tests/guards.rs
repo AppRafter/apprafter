@@ -196,6 +196,8 @@ const SECRET_DOORS: &[&str] = &[
     "cli_core::target::load_target",
     "cli_core::load_target",
     "cli_core::target::load_target_credentials",
+    "cli_core::target::read_target_credentials_bytes",
+    "cli_core::target::parse_target_credentials",
     "cli_core::target::save_target",
     "cli_core::save_target",
     "cli_core::target::save_target_credentials",
@@ -1386,8 +1388,8 @@ const REAL_ENV_BUILDERS: &[&[&str]] = &[
 
 /// What reads or writes a store's secrets, a key or a cache, or runs a check that does: a test
 /// that built its context from the real environment calls none of them, or it would read the
-/// real store of whoever runs it. d4a's later steps add the `lock`, `vault` and `holder`
-/// openers; `Context::secrets` is a method, in [`OPENER_METHODS`].
+/// real store of whoever runs it. D.4a c2 adds the lock state's file and the marker; d4a's later
+/// steps add the `lock`, `vault` and `holder` openers; `Context::secrets` is a method, in [`OPENER_METHODS`].
 const OPENERS: &[&[&str]] = &[
     &["load_identity"],
     &["load_or_create_identity"],
@@ -1397,6 +1399,10 @@ const OPENERS: &[&[&str]] = &[
     &["materialise_kubeconfig"],
     &["cached_kubeconfig"],
     &["doctor", "run"],
+    // D.4a c2: the lock state's file and the credentials marker.
+    &["read_store_file"],
+    &["write_store_file"],
+    &["write_marker"],
 ];
 
 /// Openers called as a method of the context, matched by the method's name (a syntax scan does
@@ -2255,6 +2261,29 @@ fn f(store: &cli_core::TargetStorePaths, id: &Identity) {
         );
     }
 
+    /// D.4a c2: the credentials file's bytes and their parse are doors, like the read they split.
+    #[test]
+    fn the_credentials_bytes_and_their_parse_are_secret_doors() {
+        let src = "fn f(p: &TargetStorePaths) { let b = cli_core::target::read_target_credentials_bytes(p, \"x\"); let _ = cli_core::target::parse_target_credentials(p, \"x\", &b); }";
+        let mut got = hits(src);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    Kind::SecretDoor,
+                    "cli_core::target::parse_target_credentials".to_string(),
+                    1
+                ),
+                (
+                    Kind::SecretDoor,
+                    "cli_core::target::read_target_credentials_bytes".to_string(),
+                    1
+                ),
+            ]
+        );
+    }
+
     #[test]
     fn a_seal_takes_a_cache_keys_recipient_inline() {
         let src = "\
@@ -2508,6 +2537,29 @@ fn t() {
                 row("t", false, "Context::from_cli_env"),
                 row("t", true, "secrets"),
                 row("t", true, "secrets"),
+            ]
+        );
+    }
+
+    /// D.4a c2: the lock state's file and the marker are openers: a test that built its context
+    /// from the real environment and then read or wrote them would reach the real store.
+    #[test]
+    fn the_lock_files_are_openers() {
+        let src = "\
+fn t() {
+    let ctx = Context::from_cli_env(&MapEnv::new()).unwrap();
+    let _ = apprafter_core::secrets::read_store_file(ctx.config_root());
+    let _ = write_store_file(ctx.config_root(), &file, &held);
+    let _ = marker::write_marker(&ctx.store(), \"p\", &id);
+}
+";
+        assert_eq!(
+            uses(src, true),
+            vec![
+                row("t", false, "Context::from_cli_env"),
+                row("t", true, "read_store_file"),
+                row("t", true, "write_store_file"),
+                row("t", true, "write_marker"),
             ]
         );
     }

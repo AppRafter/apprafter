@@ -10,6 +10,12 @@ publish.workspace      = true
 authors.workspace      = true
 repository.workspace   = true
 
+[features]
+# `StoreLock::unheld`, the guard of a store that cannot be locked, on demand: for the tests of
+# what refuses to write without the store's write lock (D.4a T28). Enabled only from
+# [dev-dependencies]; under resolver 2 it never reaches a shipped binary.
+test-support = []
+
 [dependencies]
 thiserror          = { workspace = true }
 miette             = { workspace = true }

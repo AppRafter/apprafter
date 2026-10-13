@@ -71,6 +71,16 @@ pub fn show(ctx: &Context, target: &TargetRef) -> CoreResult<TargetReport> {
             set: true,
             chars: Some(chars),
         },
+        // A locked store's own vault holds it; its length is the vault's (D.4a T66).
+        StoredToken::InVault => TokenPresence {
+            set: true,
+            chars: None,
+        },
+        // A clear token on a locked store, or another store's: no token this store uses (T42).
+        StoredToken::OutsideVault | StoredToken::InAnotherVault { .. } => TokenPresence {
+            set: false,
+            chars: None,
+        },
     };
     Ok(TargetReport {
         name: name.to_string(),
@@ -99,20 +109,23 @@ pub fn show(ctx: &Context, target: &TargetRef) -> CoreResult<TargetReport> {
     })
 }
 
-/// The Hetzner token for `target`, through the secret store: the CLI's `HCLOUD_TOKEN`
-/// override first, else the stored one (R4). The desktop has no override. The token needs
-/// only its record (D.4a b); d4a-c adds the locked modes here (overview §3.4).
+/// The Hetzner token for `target`, through the secret store. In files: the CLI's `HCLOUD_TOKEN`
+/// override first, else the stored one (R4); the desktop has no override. On a locked store
+/// only its vault's token, never the variable (D.4a T35; d4a-d refuses the variable there,
+/// before any prompt); an interrupted lock flow refuses (`lock_incomplete`).
 pub fn hetzner_token(ctx: &Context, target: &TargetRef) -> CoreResult<SecretString> {
     let secrets = ctx.secrets();
+    let not_stored = || CoreError::TokenNotStored {
+        name: target.name().to_string(),
+    };
     match secrets.mode()? {
         SecretsMode::Files => match &ctx.overrides().hetzner_token {
             Some(token) => Ok(token.clone()),
-            None => secrets
-                .stored_token(target.name())?
-                .ok_or_else(|| CoreError::TokenNotStored {
-                    name: target.name().to_string(),
-                }),
+            None => secrets.stored_token(target.name())?.ok_or_else(not_stored),
         },
+        SecretsMode::Locked | SecretsMode::Locking | SecretsMode::Unlocking => {
+            secrets.stored_token(target.name())?.ok_or_else(not_stored)
+        }
     }
 }
 

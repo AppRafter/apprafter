@@ -14,8 +14,8 @@
 //! directory on Linux and macOS, the age key (both resolvers), the SSH identity and the runtime
 //! directory. Windows resolves the profile through a Known Folder no variable moves, so there
 //! the fence checks what the profile would otherwise supply — the age key and the SSH
-//! identity, which a caller names explicitly. D.4a adds `store.yaml`, the vault and the
-//! holder's base.
+//! identity, which a caller names explicitly. D.4a adds `store.yaml` and the vault (c2) and
+//! the holder's base (e).
 //!
 //! A location is inside a root when the canonical form of its deepest existing ancestor, with
 //! the rest appended, starts with the root's canonical form (macOS `/tmp` is `/private/tmp`;
@@ -43,6 +43,10 @@ pub(crate) enum Location {
     AgeKey,
     SshIdentity,
     RuntimeDir,
+    /// `<store>/store.yaml`, the store's lock state (D.4a c2).
+    StoreFile,
+    /// `<store>/vault` (D.4a c2).
+    VaultFile,
 }
 
 impl Location {
@@ -54,6 +58,8 @@ impl Location {
             Location::AgeKey => "the age key (APPRAFTER_AGE_KEY)",
             Location::SshIdentity => "the SSH identity (APPRAFTER_SSH_PRIVATE_KEY)",
             Location::RuntimeDir => "the runtime directory (<target store>/run)",
+            Location::StoreFile => "the target store's lock state (<target store>/store.yaml)",
+            Location::VaultFile => "the target store's vault (<target store>/vault)",
         }
     }
 }
@@ -164,6 +170,15 @@ fn locations(ctx: &Context) -> miette::Result<Vec<(Location, PathBuf)>> {
         cli_providers::hetzner_cloud::default_ssh_identity_path(),
     ));
     out.push((Location::RuntimeDir, ctx.runtime_dir().to_path_buf()));
+    // A symlink from either out of the sandbox would be read or written outside it (D.4a c2).
+    out.push((
+        Location::StoreFile,
+        ctx.config_root().join(apprafter_core::secrets::STORE_FILE),
+    ));
+    out.push((
+        Location::VaultFile,
+        ctx.config_root().join(apprafter_core::vault::VAULT_FILE),
+    ));
     Ok(out)
 }
 

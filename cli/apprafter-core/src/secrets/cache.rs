@@ -5,34 +5,12 @@
 
 use cli_core::secrets::{decrypt_with_identity_reason, CacheKeyKind, CachedSecret};
 use cli_core::{CliError, Result};
-use cli_state::HetznerCloudState;
 use zeroize::Zeroizing;
 
-use super::{CacheKey, SecretStore};
+use super::CacheKey;
 
-/// `target`'s cached kubeconfig; `Ok(None)` when neither slot is set.
-///
-/// PRECEDENCE IS LOAD-BEARING: the encrypted slot wins over the plaintext one. The plaintext
-/// slot is a legacy fallback that older states may still carry beside a freshly written
-/// encrypted one; preferring it would silently hand back a STALE kubeconfig for a cluster
-/// that has since been re-provisioned.
-pub(super) fn cached_kubeconfig(
-    store: &SecretStore,
-    h: &HetznerCloudState,
-    target: &str,
-) -> Result<Option<Zeroizing<String>>> {
-    match (h.kubeconfig_age.as_deref(), h.kubeconfig_yaml.as_deref()) {
-        (Some(armored), _) => {
-            let key = store.cache_key(target)?;
-            open(&key, CachedSecret::Kubeconfig, target, armored).map(Some)
-        }
-        (None, Some(plain)) => Ok(Some(Zeroizing::new(plain.to_string()))),
-        (None, None) => Ok(None),
-    }
-}
-
-/// `armored`, `target`'s cached `secret`, opened with `key`: the shared age key here (the
-/// store's own key is d4a-c2's vault backend). A failure says which key and why (§3.12).
+/// `armored`, `target`'s cached `secret`, opened with `key`. A failure says which key and why
+/// (§3.12).
 pub(super) fn open(
     key: &CacheKey,
     secret: CachedSecret,

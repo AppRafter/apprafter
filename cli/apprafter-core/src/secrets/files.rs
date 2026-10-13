@@ -7,12 +7,14 @@ use std::path::Path;
 
 use cli_core::secrets::{load_identity, CachedSecret};
 use cli_core::target::{
-    list_target_names, load_target_credentials, save_target_credentials, TargetCredentials,
-    TargetStorePaths,
+    list_target_names, parse_target_credentials, read_target_credentials_bytes,
+    save_target_credentials, TargetCredentials, TargetStorePaths,
 };
 use cli_core::{CliError, Result};
 use cli_state::{State, StatePaths};
+use zeroize::Zeroizing;
 
+use super::marker::{self, Marker};
 use super::{CacheKey, NewCacheKey, StoredToken};
 use crate::context::SecretString;
 
@@ -21,7 +23,7 @@ use crate::context::SecretString;
 /// own store or age key, whatever its context. Compiled out of every other build (and skipped,
 /// as a `cfg(test)` item, by the purity guard that forbids `std::env::temp_dir`).
 #[cfg(test)]
-fn under_temp(path: &Path) {
+pub(super) fn under_temp(path: &Path) {
     let tmp = std::fs::canonicalize(std::env::temp_dir()).unwrap();
     let existing = path
         .ancestors()
@@ -34,13 +36,20 @@ fn under_temp(path: &Path) {
 }
 
 #[cfg(not(test))]
-fn under_temp(_: &Path) {}
+pub(super) fn under_temp(_: &Path) {}
 
-/// What `target`'s credentials file holds, without the token: its length only.
+/// What `target`'s credentials file holds, without the token: its length only. A marker here,
+/// on a store in files, names another store's vault (D.4a T34).
 pub(super) fn token_presence(store: &TargetStorePaths, target: &str) -> Result<StoredToken> {
     under_temp(&store.target_credentials_file(target));
+    let Some(bytes) = read_target_credentials_bytes(store, target)?.map(Zeroizing::new) else {
+        return Ok(StoredToken::None);
+    };
+    if let Marker::Vault { id } = marker::classify(&bytes) {
+        return Ok(StoredToken::InAnotherVault { id });
+    }
     Ok(
-        match load_target_credentials(store, target)?.hetzner_token {
+        match parse_target_credentials(store, target, &bytes)?.hetzner_token {
             Some(token) => StoredToken::InFile {
                 chars: token.len() as u32,
             },
@@ -51,7 +60,16 @@ pub(super) fn token_presence(store: &TargetStorePaths, target: &str) -> Result<S
 
 pub(super) fn stored_token(store: &TargetStorePaths, target: &str) -> Result<Option<SecretString>> {
     under_temp(&store.target_credentials_file(target));
-    Ok(load_target_credentials(store, target)?
+    let Some(bytes) = read_target_credentials_bytes(store, target)?.map(Zeroizing::new) else {
+        return Ok(None);
+    };
+    if let Marker::Vault { id } = marker::classify(&bytes) {
+        return Err(CliError::TokenInAnotherVault {
+            target: target.to_string(),
+            id: id.to_string(),
+        });
+    }
+    Ok(parse_target_credentials(store, target, &bytes)?
         .hetzner_token
         .map(SecretString::new))
 }

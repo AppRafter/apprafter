@@ -330,6 +330,13 @@ impl StoreLock {
         self.file.is_some()
     }
 
+    /// A guard that holds nothing, as [`StoreLock::exclusive`] gives on a store that cannot be
+    /// locked: for the tests of what must refuse to write without the lock (D.4a T28).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn unheld() -> StoreLock {
+        StoreLock::new(None)
+    }
+
     fn new(file: Option<fs::File>) -> StoreLock {
         LOCKS_ON_THIS_THREAD.with(|n| n.set(n.get() + 1));
         StoreLock { file }
@@ -676,14 +683,37 @@ pub fn load_target(paths: &TargetStorePaths, name: &str) -> Result<Target> {
 /// never quotes it (it holds the token). Whether the target exists is not checked: `target
 /// remove` reads each file of a target it cannot load on its own (WI-458).
 pub fn load_target_credentials(paths: &TargetStorePaths, name: &str) -> Result<TargetCredentials> {
+    match read_target_credentials_bytes(paths, name)? {
+        None => Ok(TargetCredentials::default()),
+        Some(bytes) => parse_target_credentials(paths, name, &bytes),
+    }
+}
+
+/// The bytes of target `name`'s `credentials.yaml`, read as [`load_target_credentials`] reads
+/// them: `None` when there is no file; a failure names the target (`CliError::TargetFileIo`).
+/// Only the shared core's secret store calls it (D.4a T16): the bytes hold the token, or a
+/// locked store's vault marker.
+pub fn read_target_credentials_bytes(
+    paths: &TargetStorePaths,
+    name: &str,
+) -> Result<Option<Vec<u8>>> {
     let creds_path = paths.target_credentials_file(name);
     if !target_file_exists(&creds_path, name)? {
-        return Ok(TargetCredentials::default());
+        return Ok(None);
     }
-    let bytes = read_target_file(&creds_path, name)?;
-    serde_yaml::from_slice::<TargetCredentials>(&bytes).map_err(|err| {
+    read_target_file(&creds_path, name).map(Some)
+}
+
+/// `bytes`, target `name`'s `credentials.yaml`, parsed as [`load_target_credentials`] parses
+/// it: a failure is `CliError::InvalidTargetConfig`, never quoting the file.
+pub fn parse_target_credentials(
+    paths: &TargetStorePaths,
+    name: &str,
+    bytes: &[u8],
+) -> Result<TargetCredentials> {
+    serde_yaml::from_slice::<TargetCredentials>(bytes).map_err(|err| {
         CliError::InvalidTargetConfig {
-            path: creds_path.clone(),
+            path: paths.target_credentials_file(name),
             message: credentials_parse_message(&err),
             target: Some(name.to_string()),
         }
@@ -2053,5 +2083,50 @@ mod tests {
                 & 0o777;
             assert_eq!(mode, 0o600, "got {mode:o}");
         }
+    }
+
+    /// D.4a c2: the credentials file's bytes and their parse, apart — what the secret store needs
+    /// to tell a vault marker from a token — read and refused exactly as `load_target_credentials`
+    /// reads and refuses them, never quoting the file.
+    #[test]
+    fn credentials_bytes_and_their_parse_are_load_target_credentials_in_two_steps() {
+        let (_dir, paths) = make_paths();
+        assert!(read_target_credentials_bytes(&paths, "work")
+            .unwrap()
+            .is_none());
+        let credentials = TargetCredentials {
+            hetzner_token: Some("hcloud_secret".into()),
+        };
+        save_target_credentials(&paths, "work", &credentials).unwrap();
+        let bytes = read_target_credentials_bytes(&paths, "work")
+            .unwrap()
+            .unwrap();
+        assert_eq!(bytes, b"hetzner_token: hcloud_secret\n");
+        assert_eq!(
+            parse_target_credentials(&paths, "work", &bytes).unwrap(),
+            credentials
+        );
+        assert_eq!(
+            load_target_credentials(&paths, "work").unwrap(),
+            credentials
+        );
+        let e =
+            parse_target_credentials(&paths, "work", b"hetzner_token:hcloud_secret\n").unwrap_err();
+        assert!(
+            matches!(&e, CliError::InvalidTargetConfig { target: Some(t), .. } if t == "work"),
+            "{e:?}"
+        );
+        assert!(!e.to_string().contains("hcloud_secret"), "{e}");
+    }
+
+    /// D.4a T28: an unheld guard, on demand, for the tests of what refuses without the lock; it
+    /// holds nothing and leaves the thread free once dropped.
+    #[test]
+    fn an_unheld_guard_holds_nothing() {
+        let lock = StoreLock::unheld();
+        assert!(!lock.is_held());
+        drop(lock);
+        let (_dir, paths) = make_paths();
+        assert!(StoreLock::exclusive(&paths).unwrap().is_held());
     }
 }

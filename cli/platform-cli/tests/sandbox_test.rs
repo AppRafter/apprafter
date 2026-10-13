@@ -166,6 +166,36 @@ fn a_store_that_links_outside_is_refused() {
     );
 }
 
+/// D.4a c2: `store.yaml` and the vault are fenced too: a symlink from either out of the sandbox
+/// is refused before anything reads it.
+#[cfg(unix)]
+#[test]
+fn a_lock_state_that_links_outside_is_refused() {
+    let out = outside();
+    let sp = Spawn::new();
+    std::fs::create_dir_all(sp.store()).unwrap();
+    std::os::unix::fs::symlink(out.path(), sp.store().join("store.yaml")).unwrap();
+    refused(
+        &sp,
+        "the target store's lock state (<target store>/store.yaml)",
+        out.path(),
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_vault_that_links_outside_is_refused() {
+    let out = outside();
+    let sp = Spawn::new();
+    std::fs::create_dir_all(sp.store()).unwrap();
+    std::os::unix::fs::symlink(out.path(), sp.store().join("vault")).unwrap();
+    refused(
+        &sp,
+        "the target store's vault (<target store>/vault)",
+        out.path(),
+    );
+}
+
 #[test]
 fn a_root_that_is_relative_or_missing_is_refused() {
     let gone = Spawn::new().path("not-there");

@@ -313,6 +313,7 @@ dependencies = [
  "proc-macro2",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sha2 0.10.9",
  "subtle",
  "syn 2.0.119",

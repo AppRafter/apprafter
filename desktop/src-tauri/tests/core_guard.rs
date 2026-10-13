@@ -232,6 +232,10 @@ const OPENERS: &[&[&str]] = &[
     &["materialise_kubeconfig"],
     &["cached_kubeconfig"],
     &["doctor", "run"],
+    // D.4a c2: the lock state's file and the credentials marker.
+    &["read_store_file"],
+    &["write_store_file"],
+    &["write_marker"],
 ];
 
 /// Openers called as a method of the context, by name (as `apprafter-core/tests/guards.rs`
@@ -463,6 +467,39 @@ mod tests {
                 "Context::from_desktop_env".to_string()
             ),
             ("t".to_string(), true, "secrets".to_string()),
+        ]
+    );
+}
+
+/// D.4a c2: the lock state's file and the marker are openers (as `apprafter-core/tests/guards.rs`
+/// lists them).
+#[test]
+fn g3_sees_the_lock_files_as_openers() {
+    let src = "\
+#[cfg(test)]
+mod tests {
+    fn t() {
+        let ctx = Context::from_desktop_env(&env, policy, host()).unwrap();
+        let _ = apprafter_core::secrets::read_store_file(ctx.config_root());
+        let _ = apprafter_core::secrets::marker::write_marker(&ctx.store(), \"p\", &id);
+    }
+}
+";
+    let got: Vec<(String, bool, String)> = real_env(src, false, &[])
+        .uses
+        .into_iter()
+        .map(|(site, _, opener, what)| (site, opener, what))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (
+                "t".to_string(),
+                false,
+                "Context::from_desktop_env".to_string()
+            ),
+            ("t".to_string(), true, "read_store_file".to_string()),
+            ("t".to_string(), true, "write_marker".to_string()),
         ]
     );
 }
