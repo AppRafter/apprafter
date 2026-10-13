@@ -1275,3 +1275,90 @@ fn no_key_shows_in_a_debug_output() {
         assert!(!shown.contains(&hex) && !shown.contains(&groups), "{shown}");
     }
 }
+
+/// T41: a rename on a locked store moves the target's vault entry with its directories.
+#[test]
+fn a_rename_on_a_locked_store_moves_its_vault_entry() {
+    let (_d, ctx, made) = locked(&[("prod", Some(TOKEN_A))]);
+    let from = TargetRef::named(&ctx, "prod").unwrap();
+    let plan = crate::target::plan_rename(&ctx, &from, "staging").unwrap();
+    crate::target::execute_rename(
+        &ctx,
+        plan,
+        &crate::NullReporter,
+        &crate::CancellationToken::new(),
+    )
+    .unwrap();
+    assert_eq!(entry(&ctx, &made, "staging").as_deref(), Some(TOKEN_A));
+    assert_eq!(entry(&ctx, &made, "prod"), None);
+    assert_eq!(
+        ctx.secrets()
+            .stored_token("staging")
+            .unwrap()
+            .unwrap()
+            .expose(),
+        TOKEN_A
+    );
+}
+
+/// T41: without the store's key a rename refuses before it moves anything.
+#[test]
+fn a_rename_on_a_locked_store_without_its_key_moves_nothing() {
+    let (_d, ctx, made) = locked(&[("prod", Some(TOKEN_A))]);
+    let bare = without_access(&ctx);
+    let from = TargetRef::named(&bare, "prod").unwrap();
+    let plan = crate::target::plan_rename(&bare, &from, "staging").unwrap();
+    let e = crate::target::execute_rename(
+        &bare,
+        plan,
+        &crate::NullReporter,
+        &crate::CancellationToken::new(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&e, CoreError::Cli(CliError::StoreLocked { .. })),
+        "{e:?}"
+    );
+    assert!(ctx.store().target_dir("prod").exists());
+    assert!(!ctx.store().target_dir("staging").exists());
+    assert_eq!(entry(&ctx, &made, "prod").as_deref(), Some(TOKEN_A));
+}
+
+/// T41: a remove on a locked store deletes the target's vault entry after its directories.
+#[test]
+fn a_remove_on_a_locked_store_drops_its_vault_entry() {
+    let (_d, ctx, made) = locked(&[("prod", Some(TOKEN_A)), ("staging", Some(TOKEN_B))]);
+    let target = TargetRef::named(&ctx, "prod").unwrap();
+    let plan = crate::target::plan_remove(&ctx, &target).unwrap();
+    crate::target::execute_remove(
+        &ctx,
+        plan,
+        &crate::NullReporter,
+        &crate::CancellationToken::new(),
+    )
+    .unwrap();
+    assert!(!ctx.store().target_dir("prod").exists());
+    assert_eq!(entry(&ctx, &made, "prod"), None);
+    assert_eq!(entry(&ctx, &made, "staging").as_deref(), Some(TOKEN_B));
+}
+
+/// T41: without the store's key a remove refuses before it deletes anything.
+#[test]
+fn a_remove_on_a_locked_store_without_its_key_deletes_nothing() {
+    let (_d, ctx, made) = locked(&[("prod", Some(TOKEN_A))]);
+    let bare = without_access(&ctx);
+    let target = TargetRef::named(&bare, "prod").unwrap();
+    let plan = crate::target::plan_remove(&bare, &target).unwrap();
+    assert!(matches!(
+        crate::target::execute_remove(
+            &bare,
+            plan,
+            &crate::NullReporter,
+            &crate::CancellationToken::new()
+        )
+        .unwrap_err(),
+        CoreError::Cli(CliError::StoreLocked { .. })
+    ));
+    assert!(ctx.store().target_dir("prod").exists());
+    assert_eq!(entry(&ctx, &made, "prod").as_deref(), Some(TOKEN_A));
+}

@@ -5,7 +5,7 @@
 use cli_core::CliError;
 
 use crate::op::{ChangeAction, Outcome, Plan, PlanClass};
-use crate::report::Reporter;
+use crate::report::{Event, Reporter};
 use crate::target::{
     cancelled, change, cli_default, lock_store_if_present, provisioned, readable_config,
     TargetRemoved,
@@ -178,7 +178,9 @@ fn next_default(ctx: &Context, removing: &str) -> CoreResult<NextDefault> {
 /// the alphabetically first remaining target that can be read or delete `config.yaml`. Reports
 /// what it actually did, including the server it leaves running and the targets the default
 /// passed over. A target whose files cannot be read takes the same steps: nothing here reads
-/// them.
+/// them. On a locked store (D.4a T41) the write key is taken first, before the lock (it may
+/// ask); the vault entries go after the directories, and a failure there is a warning: the
+/// target is gone, its entry unused, and a target added later under the name replaces it.
 pub fn execute_remove(
     ctx: &Context,
     plan: Plan<RemovePayload>,
@@ -190,11 +192,26 @@ pub fn execute_remove(
     }
     let name = plan.payload.name;
     let store = ctx.store();
-    let _lock = lock_store_if_present(ctx, reporter)?;
+    let secrets = ctx.secrets();
+    let key = secrets.prepare_write()?;
+    if cancel.is_cancelled() {
+        return Ok(cancelled());
+    }
+    let lock = lock_store_if_present(ctx, reporter)?;
     let target = TargetRef::named(ctx, &name)?;
     let orphaned_server = provisioned(ctx, &target).ok().flatten(); // unreadable: the plan said so
     let state_removed = store.state_dir(&name).exists();
     cli_core::remove_target(&store, &name)?;
+    if let Some(held) = lock.as_ref() {
+        if let Err(e) = secrets.remove_token(&key, held, &name) {
+            reporter.report(Event::Warning {
+                message: format!(
+                    "the target store's vault still holds the token of `{name}` ({e}); it is \
+                     unused, and a target added later under that name replaces it"
+                ),
+            });
+        }
+    }
     let mut skipped_unreadable = Vec::new();
     let cli_default = if cli_default(ctx)?.as_deref() == Some(name.as_str()) {
         let next = next_default(ctx, &name)?;

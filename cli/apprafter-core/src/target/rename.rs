@@ -63,7 +63,10 @@ pub fn plan_rename(ctx: &Context, from: &TargetRef, to: &str) -> CoreResult<Plan
 
 /// Under the lock: re-checks that `from` still exists and `to` is still free, renames the
 /// target (and its state, by `cli_core::rename_target`), and repoints the default when it named
-/// `from`. Reports what it actually did.
+/// `from`. Reports what it actually did. On a locked store (D.4a T41) the write key is taken
+/// first, before the lock (it may ask); then the new name's vault entry is put, the directories
+/// move, and the old name's entries move onto the new one — a crash between the steps leaves
+/// both names, each readable.
 pub fn execute_rename(
     ctx: &Context,
     plan: Plan<RenamePayload>,
@@ -75,13 +78,27 @@ pub fn execute_rename(
     }
     let RenamePayload { from, to } = plan.payload;
     let store = ctx.store();
-    let _lock = lock_store_if_present(ctx, reporter)?;
+    let secrets = ctx.secrets();
+    let key = secrets.prepare_write()?;
+    if cancel.is_cancelled() {
+        return Ok(cancelled());
+    }
+    let lock = lock_store_if_present(ctx, reporter)?;
     TargetRef::named(ctx, &from)?; // removed since the plan
     if store.target_dir(&to).exists() {
         return Err(CoreError::TargetExists { name: to });
     }
+    let Some(held) = lock.as_ref() else {
+        // A store with a target has a root, which `lock_store_if_present` locked.
+        return Err(CoreError::TargetNotFound {
+            name: from,
+            available: Vec::new(),
+        });
+    };
     let state_moved = store.state_dir(&from).exists();
+    secrets.copy_token(&key, held, &from, &to)?;
     cli_core::rename_target(&store, &from, &to)?;
+    secrets.rename_token(&key, held, &from, &to)?;
     let mut cli_default = None;
     if let Some(mut global) = cli_core::load_global_config(&store)? {
         if global.active_target == from {
