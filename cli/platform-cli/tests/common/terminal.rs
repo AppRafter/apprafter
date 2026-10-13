@@ -3,8 +3,8 @@
 //! d; GOTCHA-179, GOTCHA-180). The child's stdin and stderr are the pty's slave, made its
 //! controlling terminal by the spawn point ([`Spawn::std_at_terminal`]); stdout is a pipe. Each
 //! step waits for the text the terminal must show before it types — a key typed earlier would
-//! meet the terminal before the prompt made it raw — and the end reads back whether the
-//! terminal was put back (ECHO and ICANON set). Unix only.
+//! meet the terminal before the prompt made it raw — and the end reads back, through the
+//! master, whether the terminal was put back (ECHO and ICANON set). Unix only.
 
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
@@ -60,7 +60,6 @@ pub fn converse_with(
     wire: impl FnOnce(&mut Command),
 ) -> Ended {
     let (master, slave) = open_pty();
-    let probe = slave.try_clone().expect("dup the pty slave");
     let mut cmd = sp.std_at_terminal(args, slave);
     cmd.stdout(Stdio::piped());
     wire(&mut cmd);
@@ -140,15 +139,18 @@ pub fn converse_with(
     };
     let restored = {
         let mut t = std::mem::MaybeUninit::<libc::termios>::uninit();
-        // SAFETY: tcgetattr fills `t` when it returns 0; `probe` is our handle on the slave.
-        let read = unsafe { libc::tcgetattr(probe.as_raw_fd(), t.as_mut_ptr()) } == 0;
+        // Through the master, which reads the slave's termios on Linux and macOS alike. Not
+        // through a handle on the slave: the child led the terminal's session, and on macOS a
+        // session leader's exit revokes every handle on its controlling terminal, so a read
+        // there fails once the child has ended, put back or not.
+        // SAFETY: tcgetattr fills `t` when it returns 0; `writer` is our handle on the master.
+        let read = unsafe { libc::tcgetattr(writer.as_raw_fd(), t.as_mut_ptr()) } == 0;
         // SAFETY: filled when `read` is true.
         read && {
             let flags = unsafe { t.assume_init() }.c_lflag;
             flags & (libc::ECHO | libc::ICANON) == (libc::ECHO | libc::ICANON)
         }
     };
-    drop(probe);
     let stdout = out_reader.join().expect("stdout reader");
     drained
         .recv_timeout(Duration::from_secs(10))
