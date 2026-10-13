@@ -12,12 +12,16 @@ use serde::Serialize;
 use crate::secrets::{LockSlotKind, SecretsMode};
 
 pub mod faults;
+pub mod off;
+#[cfg(test)]
+mod off_tests;
 pub mod on;
 #[cfg(test)]
 mod on_tests;
 pub mod open;
 
 pub use faults::FaultPoint;
+pub use off::{execute_off, plan_off, LockOffPayload, LockOffStart, LockedOff};
 pub use on::{
     execute_on, plan_on, CacheDrop, DroppedCache, LockOnInput, LockOnPayload, LockOnStart,
     LockedOn, PASSWORD_LABEL, RECOVERY_LABEL,

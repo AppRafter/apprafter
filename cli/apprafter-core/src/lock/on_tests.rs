@@ -37,9 +37,6 @@ const TOKEN_C: &str = "ddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
 /// kubeconfig and a password no key here opens. The context runs the flows under the fast
 /// policy, its permit the scratch dir.
 pub(super) struct Files {
-    // Read by `off_tests` (d4a-d Task 8), which removes this allow; held here for the scratch
-    // dir's lifetime.
-    #[allow(dead_code)]
     pub dir: tempfile::TempDir,
     pub ctx: Context,
 }

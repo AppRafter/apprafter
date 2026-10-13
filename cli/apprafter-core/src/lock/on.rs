@@ -191,7 +191,7 @@ impl LockedOn {
     }
 }
 
-fn vault_err(root: &Path, e: VaultError) -> CoreError {
+pub(super) fn vault_err(root: &Path, e: VaultError) -> CoreError {
     CoreError::Cli(vault_error(root, e))
 }
 
@@ -203,7 +203,12 @@ fn stage(reporter: &dyn Reporter, index: u32, title: &str) {
     });
 }
 
-fn change(kind: &str, object: &str, action: ChangeAction, detail: &str) -> PlannedChange {
+pub(super) fn change(
+    kind: &str,
+    object: &str,
+    action: ChangeAction,
+    detail: &str,
+) -> PlannedChange {
     PlannedChange {
         kind: kind.to_string(),
         object: object.to_string(),
@@ -212,7 +217,7 @@ fn change(kind: &str, object: &str, action: ChangeAction, detail: &str) -> Plann
     }
 }
 
-fn dropped(target: &str, secret: CachedSecret, why: &str) -> DroppedCache {
+pub(super) fn dropped(target: &str, secret: CachedSecret, why: &str) -> DroppedCache {
     DroppedCache {
         target: target.to_string(),
         secret: secret.as_str().to_string(),
@@ -241,7 +246,7 @@ fn plan(
     }
 }
 
-fn title(lead: &str, root: &Path, targets: &[String]) -> String {
+pub(super) fn title(lead: &str, root: &Path, targets: &[String]) -> String {
     let named = if targets.is_empty() {
         "no targets".to_string()
     } else {
@@ -271,7 +276,7 @@ fn listed(keys: &[PathBuf]) -> String {
         .join(" or ")
 }
 
-fn refresh(secret: CachedSecret, target: &str) -> String {
+pub(super) fn refresh(secret: CachedSecret, target: &str) -> String {
     match secret {
         CachedSecret::Kubeconfig => format!("apprafter kubeconfig --refresh --target {target}"),
         CachedSecret::ArgocdPassword => {
@@ -916,7 +921,7 @@ fn reseal(
 }
 
 /// `plain` sealed to `key`, and opened again with it before it replaces anything.
-fn sealed_and_checked(
+pub(super) fn sealed_and_checked(
     store: &TargetStorePaths,
     key: &CacheKey,
     secret: CachedSecret,

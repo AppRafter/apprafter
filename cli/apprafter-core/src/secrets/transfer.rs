@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use cli_core::secrets::{
-    decrypt_with_identity_reason, encrypt_for_recipient, load_identity, CachedSecret, Identity,
+    decrypt_with_identity_reason, encrypt_for_recipient, load_identity,
+    load_or_create_identity_reporting, CachedSecret, Identity, UndecryptableWhy,
 };
 use cli_core::target::{parse_target_credentials, read_target_credentials_bytes, TargetStorePaths};
 use cli_core::Result;
@@ -94,4 +95,58 @@ pub(crate) fn opens(
     armored: &str,
 ) -> Option<Zeroizing<String>> {
     super::cache::open(key, secret, "", armored).ok()
+}
+
+/// The shared age key at `path` — `lock off`'s destination (O13) — loaded, or created when
+/// none is there (never replaced); whether this call created it.
+pub(crate) fn shared_identity_at(path: &Path) -> Result<(Identity, bool)> {
+    under_temp(path);
+    load_or_create_identity_reporting(path)
+}
+
+/// The shared age key `identity`, kept at `path`, as a cache key.
+pub(crate) fn shared_key(identity: Identity, path: PathBuf) -> CacheKey {
+    CacheKey(KeyOf::SharedFile { identity, path })
+}
+
+/// The refusal of a clear token in a locked store's credentials file (T42), naming that file.
+pub(crate) fn outside_vault(store: &TargetStorePaths, target: &str) -> cli_core::CliError {
+    cli_core::CliError::TokenOutsideVault {
+        target: target.to_string(),
+        path: store.target_credentials_file(target),
+    }
+}
+
+/// `token` in clear in `target`'s credentials file (mode 0600, atomically), as the files
+/// backend writes it.
+pub(crate) fn write_clear_token(
+    store: &TargetStorePaths,
+    target: &str,
+    token: &SecretString,
+) -> Result<()> {
+    super::files::put_token(store, target, token)
+}
+
+/// What a key makes of a cached secret (rule 3: a failed decryption is never "absent").
+pub(crate) enum Opened {
+    /// The key opens it.
+    Plain(Zeroizing<String>),
+    /// It is sealed to another key.
+    NotForThisKey,
+    /// It names this key and does not decrypt: damaged.
+    Damaged,
+}
+
+/// `armored` as `key` opens it: the plaintext, or why not. Any other failure (a vault key
+/// that cannot be used) is the error.
+pub(crate) fn opened_by(key: &CacheKey, secret: CachedSecret, armored: &str) -> Result<Opened> {
+    match super::cache::open(key, secret, "", armored) {
+        Ok(plain) => Ok(Opened::Plain(plain)),
+        Err(cli_core::CliError::CacheUndecryptable {
+            reason: UndecryptableWhy::Damaged,
+            ..
+        }) => Ok(Opened::Damaged),
+        Err(cli_core::CliError::CacheUndecryptable { .. }) => Ok(Opened::NotForThisKey),
+        Err(e) => Err(e),
+    }
 }

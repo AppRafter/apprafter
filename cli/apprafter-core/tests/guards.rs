@@ -1619,6 +1619,8 @@ const OPENERS: &[&[&str]] = &[
     &["open_at"],
     &["open_slot_at"],
     &["set_unlock_timeout"],
+    &["plan_off"],
+    &["execute_off"],
 ];
 
 /// Openers called as a method of the context, matched by the method's name (a syntax scan does
