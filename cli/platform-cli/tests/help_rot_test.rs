@@ -56,11 +56,13 @@
 //!   Re-deriving the set here would need a second invocation
 //!   tokeniser, and two tokenisers in one repository disagree.
 
+mod common;
+
 use std::path::PathBuf;
 
 use apprafter::docs_api::{examples_for, Cli, EXAMPLES};
-use assert_cmd::Command as ShippedBinary;
 use clap::{Command, CommandFactory};
+use common::spawn::Spawn;
 
 // ---------------------------------------------------------------- tree
 
@@ -457,12 +459,8 @@ fn projected_arguments(node: &serde_json::Value) -> Vec<String> {
 }
 
 fn short_help_for(path: &[&str]) -> String {
-    let output = ShippedBinary::cargo_bin("apprafter")
-        .unwrap()
-        .args(path)
-        .arg("-h")
-        .output()
-        .expect("the binary runs");
+    let sp = Spawn::new();
+    let output = sp.cmd(path).arg("-h").output().expect("the binary runs");
     assert!(
         output.status.success(),
         "`apprafter {} -h` exited {:?}:\n{}",
@@ -719,9 +717,9 @@ fn repo_root() -> PathBuf {
 }
 
 fn help_for(path: &[&str]) -> String {
-    let output = ShippedBinary::cargo_bin("apprafter")
-        .unwrap()
-        .args(path)
+    let sp = Spawn::new();
+    let output = sp
+        .cmd(path)
         .arg("--help")
         .output()
         .expect("the binary runs");

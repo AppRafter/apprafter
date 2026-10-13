@@ -26,13 +26,15 @@
 //! walks the WHOLE table in BOTH renderings so a hole cannot hide in
 //! the 71 commands nobody sampled.
 
+mod common;
+
 use apprafter::docs_api::{examples_for, EXAMPLES};
-use assert_cmd::Command;
+use common::spawn::Spawn;
 
 /// `path`'s help as the binary prints it, through the given flag.
 fn help_for(path: &[&str], flag: &str) -> String {
-    let mut command = Command::cargo_bin("apprafter").unwrap();
-    let output = command.args(path).arg(flag).assert().success();
+    let sp = Spawn::new();
+    let output = sp.cmd(path).arg(flag).assert().success();
     String::from_utf8(output.get_output().stdout.clone()).expect("help is UTF-8")
 }
 

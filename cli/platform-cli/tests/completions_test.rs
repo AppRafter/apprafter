@@ -36,6 +36,8 @@
 //! directories there as on Linux. On Windows `--install` refuses, and the
 //! test of that refusal runs there instead.
 
+mod common;
+
 use std::fs;
 use std::path::Path;
 
@@ -45,15 +47,14 @@ use clap_complete::Shell;
 
 use apprafter::docs_api::Cli;
 use assert_cmd::Command;
+use common::spawn::Spawn;
+#[cfg(unix)]
 use tempfile::TempDir;
 
 /// Run the real binary and hand back what it printed.
 fn script_for(shell: &str) -> String {
-    let output = Command::cargo_bin("apprafter")
-        .unwrap()
-        .args(["completion", shell])
-        .assert()
-        .success();
+    let sp = Spawn::new();
+    let output = sp.cmd(&["completion", shell]).assert().success();
     String::from_utf8(output.get_output().stdout.clone())
         .unwrap_or_else(|_| panic!("the {shell} script is not UTF-8"))
 }
@@ -134,19 +135,18 @@ const INSTALL_DESTINATIONS: &[(&str, &str)] = &[
     ("fish", ".config/fish/completions/apprafter.fish"),
 ];
 
-/// Run the real binary against a throwaway `HOME`.
-///
-/// `XDG_DATA_HOME` and `XDG_CONFIG_HOME` are cleared unless `env`
-/// sets them: either may be set in the environment running the suite,
-/// and a test that wrote into somebody's real `~/.config` would be a
-/// defect of its own rather than a check.
-fn run_in_home(args: &[&str], home: &Path, env: &[(&str, &str)]) -> Command {
-    let mut command = Command::cargo_bin("apprafter").unwrap();
-    command
-        .args(args)
-        .env("HOME", home)
-        .env_remove("XDG_DATA_HOME")
-        .env_remove("XDG_CONFIG_HOME");
+/// A sandbox whose home is where `--install` writes: `XDG_DATA_HOME` and `XDG_CONFIG_HOME` are
+/// left unset unless `env` sets them, so the install lands where it does under a home with no
+/// XDG overrides.
+fn home_spawn() -> Spawn {
+    Spawn::new()
+        .without_env("XDG_DATA_HOME")
+        .without_env("XDG_CONFIG_HOME")
+}
+
+/// Run the real binary in `home`'s sandbox, with `env` on top.
+fn run_in_home(args: &[&str], home: &Spawn, env: &[(&str, &str)]) -> Command {
+    let mut command = home.cmd(args);
     for (key, value) in env {
         command.env(key, value);
     }
@@ -157,7 +157,7 @@ fn run_in_home(args: &[&str], home: &Path, env: &[(&str, &str)]) -> Command {
 /// command wrote to stdout and stderr. Unix only: on Windows `--install`
 /// refuses (`install_is_refused_on_windows_and_the_refusal_is_the_whole_run`).
 #[cfg(unix)]
-fn install(shell: &str, home: &Path, env: &[(&str, &str)]) -> (String, String) {
+fn install(shell: &str, home: &Spawn, env: &[(&str, &str)]) -> (String, String) {
     let assert = run_in_home(&["completion", shell, "--install"], home, env)
         .assert()
         .success();
@@ -194,16 +194,16 @@ fn tree(root: &Path) -> Vec<String> {
 #[cfg(unix)]
 #[test]
 fn install_writes_each_shells_script_where_that_shell_reads_it() {
-    let home = TempDir::new().expect("a temp HOME");
+    let home = home_spawn();
     for (shell, relative) in INSTALL_DESTINATIONS {
-        let destination = home.path().join(relative);
+        let destination = home.home().join(relative);
         assert!(
             !destination.parent().expect("a parent").exists(),
             "{shell}: the directory exists before the command ran, so \
              creating it is not what is being tested"
         );
 
-        install(shell, home.path(), &[]);
+        install(shell, &home, &[]);
 
         let written = fs::read_to_string(&destination).unwrap_or_else(|error| {
             panic!("{shell}: nothing at {}: {error}", destination.display())
@@ -222,13 +222,13 @@ fn install_honours_the_xdg_directories_when_they_are_set() {
     // `~/.local/share` and `~/.config` are where these two land with
     // XDG unset; a reader who moved either has moved the place their
     // shell reads, so the destination has to move with it.
-    let home = TempDir::new().expect("a temp HOME");
+    let home = home_spawn();
     let data = TempDir::new().expect("a temp XDG_DATA_HOME");
     let config = TempDir::new().expect("a temp XDG_CONFIG_HOME");
 
     install(
         "bash",
-        home.path(),
+        &home,
         &[("XDG_DATA_HOME", &data.path().display().to_string())],
     );
     assert!(
@@ -241,7 +241,7 @@ fn install_honours_the_xdg_directories_when_they_are_set() {
 
     install(
         "fish",
-        home.path(),
+        &home,
         &[("XDG_CONFIG_HOME", &config.path().display().to_string())],
     );
     assert!(
@@ -261,8 +261,8 @@ fn install_still_prints_the_script_so_one_line_can_install_and_apply() {
     // one-liner, and it works only because stdout still carries the
     // script when something is reading it. Under a test harness stdout
     // is a pipe, which is exactly that case.
-    let home = TempDir::new().expect("a temp HOME");
-    let (stdout, _) = install("bash", home.path(), &[]);
+    let home = home_spawn();
+    let (stdout, _) = install("bash", &home, &[]);
     assert_eq!(
         stdout,
         script_for("bash"),
@@ -276,10 +276,10 @@ fn install_still_prints_the_script_so_one_line_can_install_and_apply() {
 fn the_install_report_goes_to_stderr_and_names_the_destination() {
     // On stderr rather than stdout because stdout is sourced: a report
     // in it would be fed to the shell as code.
-    let home = TempDir::new().expect("a temp HOME");
+    let home = home_spawn();
     for (shell, relative) in INSTALL_DESTINATIONS {
-        let (_, stderr) = install(shell, home.path(), &[]);
-        let destination = home.path().join(relative);
+        let (_, stderr) = install(shell, &home, &[]);
+        let destination = home.home().join(relative);
         assert!(
             stderr.contains(&destination.display().to_string()),
             "{shell}: the report does not name {}:\n{stderr}",
@@ -299,8 +299,8 @@ fn the_zsh_report_names_the_fpath_line_a_new_shell_needs() {
     // Writing `~/.zfunc/_apprafter` is half the job: zsh reads it only
     // if `~/.zfunc` is on `fpath`, and nothing this command can do from
     // outside the shell puts it there.
-    let home = TempDir::new().expect("a temp HOME");
-    let (_, stderr) = install("zsh", home.path(), &[]);
+    let home = home_spawn();
+    let (_, stderr) = install("zsh", &home, &[]);
     assert!(stderr.contains("fpath"), "{stderr}");
     assert!(stderr.contains("compinit"), "{stderr}");
 }
@@ -318,8 +318,8 @@ fn a_shell_with_no_published_destination_is_refused_and_nothing_is_written() {
     assert!(!others.is_empty(), "nothing left to refuse");
 
     for shell in others {
-        let home = TempDir::new().expect("a temp HOME");
-        let assert = run_in_home(&["completion", &shell, "--install"], home.path(), &[])
+        let home = home_spawn();
+        let assert = run_in_home(&["completion", &shell, "--install"], &home, &[])
             .assert()
             .failure();
         let stderr = String::from_utf8(assert.get_output().stderr.clone()).expect("UTF-8");
@@ -331,9 +331,9 @@ fn a_shell_with_no_published_destination_is_refused_and_nothing_is_written() {
             );
         }
         assert!(
-            tree(home.path()).is_empty(),
+            tree(&home.home()).is_empty(),
             "{shell}: refused and still wrote {:?}",
-            tree(home.path())
+            tree(&home.home())
         );
     }
 }
@@ -345,8 +345,8 @@ fn a_shell_with_no_published_destination_is_refused_and_nothing_is_written() {
 #[test]
 fn install_is_refused_on_windows_and_the_refusal_is_the_whole_run() {
     for (shell, _) in INSTALL_DESTINATIONS {
-        let home = TempDir::new().expect("a temp HOME");
-        let assert = run_in_home(&["completion", shell, "--install"], home.path(), &[])
+        let home = home_spawn();
+        let assert = run_in_home(&["completion", shell, "--install"], &home, &[])
             .assert()
             .failure();
         let output = assert.get_output();
@@ -369,9 +369,9 @@ fn install_is_refused_on_windows_and_the_refusal_is_the_whole_run() {
             "{shell}: refused, and still printed the script"
         );
         assert!(
-            tree(home.path()).is_empty(),
+            tree(&home.home()).is_empty(),
             "{shell}: refused and still wrote {:?}",
-            tree(home.path())
+            tree(&home.home())
         );
     }
 }
@@ -380,14 +380,14 @@ fn install_is_refused_on_windows_and_the_refusal_is_the_whole_run() {
 fn without_the_flag_nothing_is_written_anywhere() {
     // The default is still "print, install nothing" — the property the
     // flag exists to make optional.
-    let home = TempDir::new().expect("a temp HOME");
-    run_in_home(&["completion", "bash"], home.path(), &[])
+    let home = home_spawn();
+    run_in_home(&["completion", "bash"], &home, &[])
         .assert()
         .success();
     assert!(
-        tree(home.path()).is_empty(),
+        tree(&home.home()).is_empty(),
         "printing the script touched the filesystem: {:?}",
-        tree(home.path())
+        tree(&home.home())
     );
 }
 
@@ -396,11 +396,11 @@ fn without_the_flag_nothing_is_written_anywhere() {
 fn installing_twice_replaces_the_script_rather_than_appending_to_it() {
     // Upgrading is the common case: the script goes stale with the
     // binary, and the fix is to re-run this.
-    let home = TempDir::new().expect("a temp HOME");
-    install("bash", home.path(), &[]);
-    install("bash", home.path(), &[]);
+    let home = home_spawn();
+    install("bash", &home, &[]);
+    install("bash", &home, &[]);
     let destination = home
-        .path()
+        .home()
         .join(".local/share/bash-completion/completions/apprafter");
     assert_eq!(
         fs::read_to_string(&destination).expect("installed twice"),
@@ -413,11 +413,8 @@ fn installing_twice_replaces_the_script_rather_than_appending_to_it() {
 fn an_unsupported_shell_is_refused_and_the_real_ones_are_named() {
     // Proves the argument is still a closed set rather than a free
     // string that quietly emits nothing for a typo.
-    let output = Command::cargo_bin("apprafter")
-        .unwrap()
-        .args(["completion", "tcsh"])
-        .assert()
-        .failure();
+    let sp = Spawn::new();
+    let output = sp.cmd(&["completion", "tcsh"]).assert().failure();
     let stderr = String::from_utf8(output.get_output().stderr.clone()).expect("stderr is UTF-8");
     assert!(stderr.contains("tcsh"), "{stderr}");
     for shell in offered_shells() {
