@@ -239,11 +239,16 @@ fn inner_pipe_server() {
     unsafe { CloseHandle(h) };
 }
 
-/// P3: `SeDebugPrivilege` is not enabled in the runner's token (present or not), so a process
-/// DACL, not a privilege, decides who opens the holder.
+/// P3, pinned to what `windows-latest` showed (Task 6 Step 6; Deviations 9's pattern): the
+/// hosted runner's token is elevated, with `SeDebugPrivilege` enabled, so there a process DACL
+/// cannot keep a test out of the holder. The Windows holder tests therefore read the holder's
+/// process and thread DACLs back (`READ_CONTROL`, which `OWNER RIGHTS` grants) rather than
+/// assert that `PROCESS_VM_READ` and `THREAD_GET_CONTEXT` are refused; the refusals, from a
+/// non-elevated shell, are rows of the owner's Windows walk. A runner whose token has it
+/// disabled fails this probe on purpose: the refusals can then be asserted here.
 #[cfg(windows)]
 #[test]
-fn p3_windows_se_debug_privilege_is_not_enabled() {
+fn p3_windows_se_debug_privilege_is_enabled_on_the_runner() {
     use windows_sys::Win32::Foundation::{CloseHandle, LUID};
     use windows_sys::Win32::Security::{
         GetTokenInformation, LookupPrivilegeValueW, TokenPrivileges, SE_PRIVILEGE_ENABLED,
@@ -295,8 +300,9 @@ fn p3_windows_se_debug_privilege_is_not_enabled() {
     // SAFETY: the token above.
     unsafe { CloseHandle(token) };
     assert!(
-        !enabled,
-        "SeDebugPrivilege is enabled here: a DACL cannot keep this process out"
+        enabled,
+        "SeDebugPrivilege is not enabled here: a DACL keeps this process out, so the holder \
+         tests may assert the refusals themselves (Task 6 Step 6, P3)"
     );
 }
 
