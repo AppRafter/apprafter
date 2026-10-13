@@ -93,5 +93,8 @@ apprafter-core = { path = "../apprafter-core", features = ["test-support"] }
 assert_cmd = { workspace = true }
 mockito    = { workspace = true }
 predicates = { workspace = true }
+# tests/spawn_guard.rs reads every source of cli/ as tokens: the version already in the lock (as
+# in apprafter-core's guards); `span-locations` gives its findings their line numbers.
+proc-macro2 = { version = "1", features = ["span-locations"] }
 serde_json = { workspace = true }
 tempfile   = { workspace = true }

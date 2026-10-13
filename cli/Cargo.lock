@@ -260,6 +260,7 @@ dependencies = [
  "miette",
  "mockito",
  "predicates",
+ "proc-macro2",
  "semver",
  "serde",
  "serde_json",
