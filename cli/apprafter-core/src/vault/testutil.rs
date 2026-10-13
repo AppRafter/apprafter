@@ -2,6 +2,8 @@
 //! Helpers of the vault's unit tests: hex in and out, the vectors' fixed "random" bytes, and
 //! the v1 vector directory.
 
+use std::path::PathBuf;
+
 /// `text` as bytes; whitespace is ignored, so a long value can be laid out in lines.
 pub(crate) fn unhex(text: &str) -> Vec<u8> {
     let digits: Vec<u8> = text.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
@@ -32,4 +34,13 @@ pub(crate) fn seq(start: u8, n: usize) -> Vec<u8> {
 /// [`seq`] as an array.
 pub(crate) fn seq_array<const N: usize>(start: u8) -> [u8; N] {
     seq(start, N).try_into().expect("N bytes")
+}
+
+/// `cli/apprafter-core/tests/vault_vectors/v1/<rel>`.
+pub(crate) fn vector_path(rel: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("vault_vectors")
+        .join("v1")
+        .join(rel)
 }

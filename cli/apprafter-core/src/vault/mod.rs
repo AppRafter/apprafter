@@ -22,6 +22,8 @@
 mod error;
 mod format;
 mod kdf;
+mod recovery;
+mod rng;
 
 #[cfg(test)]
 mod kat;
@@ -39,6 +41,10 @@ pub use format::{
     MAGIC, PAYLOAD_MAX, SLOT_AAD_DOMAIN, SLOT_MAX, STORE_ID_MAX, VAULT_FILE_MAX, WRITER_MAX,
 };
 pub use kdf::{Argon2idParams, KdfPolicy};
+pub use recovery::{looks_like_recovery_key, ConfirmedRecoveryKey, RecoveryKey, RECOVERY_KEY_HRP};
+#[cfg(any(test, feature = "test-support"))]
+pub use rng::ScriptedRandom;
+pub use rng::{OsRandom, VaultRng};
 
 /// The vault's file name in a target store's root.
 pub const VAULT_FILE: &str = "vault";
