@@ -81,7 +81,7 @@ pub(crate) fn vault_path(root: &Path) -> PathBuf {
 /// The vault's bytes as they are now, checked to belong to the store `id` (its header names
 /// the store, T29) before anyone is asked for a key. Read without the store lock (R3): a
 /// session opens exactly these bytes.
-pub(super) fn read_vault(store: &TargetStorePaths, id: &StoreId) -> Result<Arc<[u8]>> {
+pub(crate) fn read_vault(store: &TargetStorePaths, id: &StoreId) -> Result<Arc<[u8]>> {
     let path = vault_path(store.root());
     under_temp(&path);
     let bytes = vault::file::read(&path).map_err(|e| vault_error(store.root(), e))?;

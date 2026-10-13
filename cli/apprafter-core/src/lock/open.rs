@@ -148,3 +148,172 @@ impl RecoveryKeyProblem {
         }
     }
 }
+
+use std::path::Path;
+use std::sync::Arc;
+
+use cli_core::target::TargetStorePaths;
+use cli_core::CliError;
+
+use crate::error::{CoreError, CoreResult};
+use crate::secrets::{read_vault, vault_error, StoreId};
+use crate::vault::{DataKey, KdfPolicy, SlotInput, SlotSecret, VaultError, VaultFile, VaultId};
+
+/// A vault opened in this process from one prompt's input (D.4a §3.9): its data key, for the
+/// vault it opens. Its `Debug` shows no key (`DataKey`'s own).
+#[derive(Debug)]
+pub struct OpenedVault {
+    pub key: Arc<DataKey>,
+    pub vault_id: VaultId,
+    /// The store's default unlock window, from the vault (T33).
+    pub unlock_timeout_min: u32,
+}
+
+/// Opens the vault of the store at `root`, whose `store.yaml` names `id`, with one prompt's
+/// `input` under `policy`, in this process (T62): a recovery key tries the recovery slots,
+/// anything else the password slots, and recovery-key-shaped input whose checksum fails is tried
+/// as a password too and, when that fails, is `recovery_key_invalid` naming its group. A secret
+/// no slot takes is one failed attempt (`unlock_failed`, `attempts: 1`), for the caller to
+/// count. The vault is read and checked to be this store's first (`vault_unreadable`, T29).
+pub fn open_at(
+    root: &Path,
+    id: &StoreId,
+    input: SlotInput,
+    policy: &KdfPolicy,
+) -> CoreResult<OpenedVault> {
+    let bytes = read_vault(&TargetStorePaths::for_root(root.to_path_buf()), id)?;
+    let parsed = VaultFile::parse(&bytes).map_err(|e| failed(root, e))?;
+    let opened = match input {
+        SlotInput::RecoveryKey(key) => parsed.open(&SlotSecret::RecoveryKey(key), policy),
+        SlotInput::Password(password) => parsed.open(&SlotSecret::Password(password), policy),
+        SlotInput::MistypedRecoveryKey { as_password, error } => {
+            match parsed.open(&SlotSecret::Password(as_password), policy) {
+                Err(VaultError::WrongSecret { .. } | VaultError::NoUsableSlot { .. }) => {
+                    return Err(CoreError::RecoveryKeyInvalid {
+                        reason: error.into(),
+                    })
+                }
+                other => other,
+            }
+        }
+    }
+    .map_err(|e| failed(root, e))?;
+    let unlock_timeout_min = opened
+        .payload()
+        .unlock_timeout_min()
+        .map_err(|e| failed(root, e))?;
+    Ok(OpenedVault {
+        key: opened.data_key().clone(),
+        vault_id: opened.header().vault_id,
+        unlock_timeout_min,
+    })
+}
+
+/// A vault failure as the secret store words it, but a kind of secret the vault has no slot
+/// for is a wrong secret (one attempt): the person typed something that opens nothing here.
+fn failed(root: &Path, e: VaultError) -> CoreError {
+    match e {
+        VaultError::NoUsableSlot { .. } => CoreError::Cli(CliError::UnlockFailed {
+            store: root.to_path_buf(),
+            attempts: 1,
+            stopped_before: None,
+        }),
+        other => CoreError::Cli(vault_error(root, other)),
+    }
+}
+
+#[cfg(test)]
+mod open_at_tests {
+    use super::*;
+    use crate::context::SecretString;
+    use crate::secrets::testing::locked_store;
+
+    const TOKEN: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+    /// The shown recovery key with its first data character swapped for another of the charset:
+    /// still recovery-key shaped, its checksum broken.
+    fn mistyped(shown: &str) -> String {
+        let (prefix, data) = shown.split_at(shown.find('\n').unwrap() + 1);
+        let mut chars: Vec<char> = data.chars().collect();
+        chars[0] = if chars[0] == 'Q' { 'P' } else { 'Q' };
+        format!("{prefix}{}", chars.into_iter().collect::<String>())
+    }
+
+    #[test]
+    fn the_recovery_key_opens_the_vault_of_its_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("store");
+        let made = locked_store(&root, &[("prod", Some(TOKEN))]);
+        let input = SlotInput::from_input(made.recovery_key().clone());
+        let opened = open_at(&root, &made.store_id, input, KdfPolicy::active()).unwrap();
+        assert_eq!(opened.vault_id, made.vault_id);
+        assert_eq!(opened.key.expose(), made.data_key().expose());
+        assert_eq!(opened.unlock_timeout_min, 5);
+    }
+
+    /// T62: a secret no slot takes — a wrong password, or a kind the vault has no slot of — is
+    /// one failed attempt, for the caller to count; never damage, never "absent".
+    #[test]
+    fn a_wrong_secret_is_one_failed_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("store");
+        let made = locked_store(&root, &[("prod", Some(TOKEN))]);
+        let input = SlotInput::from_input(SecretString::new("not the password"));
+        match open_at(&root, &made.store_id, input, KdfPolicy::active()).unwrap_err() {
+            CoreError::Cli(CliError::UnlockFailed {
+                attempts, store, ..
+            }) => assert_eq!((attempts, store), (1, root.clone())),
+            e => panic!("expected one failed attempt, got {e:?}"),
+        }
+    }
+
+    /// T62 (critic G4): a recovery key with a broken checksum names its group; it is one
+    /// attempt too.
+    #[test]
+    fn a_mistyped_recovery_key_names_its_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("store");
+        let made = locked_store(&root, &[("prod", Some(TOKEN))]);
+        let typed = SecretString::new(mistyped(made.recovery_key().expose()));
+        match open_at(
+            &root,
+            &made.store_id,
+            SlotInput::from_input(typed),
+            KdfPolicy::active(),
+        )
+        .unwrap_err()
+        {
+            CoreError::RecoveryKeyInvalid {
+                reason: RecoveryKeyProblem::Checksum { group: Some(_) },
+            } => {}
+            e => panic!("expected the group of the mistake, got {e:?}"),
+        }
+    }
+
+    /// T29: the vault is checked to be this store's before any secret is tried.
+    #[test]
+    fn another_stores_vault_or_none_is_said_so_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        let made_a = locked_store(&a, &[("prod", Some(TOKEN))]);
+        let made_b = locked_store(&b, &[("prod", Some(TOKEN))]);
+        std::fs::copy(b.join("vault"), a.join("vault")).unwrap();
+        let input = SlotInput::from_input(made_b.recovery_key().clone());
+        assert!(matches!(
+            open_at(&a, &made_a.store_id, input, KdfPolicy::active()).unwrap_err(),
+            CoreError::Cli(CliError::VaultUnreadable {
+                problem: cli_core::VaultProblem::OtherStore,
+                ..
+            })
+        ));
+        std::fs::remove_file(a.join("vault")).unwrap();
+        let input = SlotInput::from_input(made_a.recovery_key().clone());
+        assert!(matches!(
+            open_at(&a, &made_a.store_id, input, KdfPolicy::active()).unwrap_err(),
+            CoreError::Cli(CliError::VaultUnreadable {
+                problem: cli_core::VaultProblem::Missing,
+                ..
+            })
+        ));
+    }
+}

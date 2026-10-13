@@ -26,7 +26,7 @@ use crate::render::core_error::report;
 /// when the rest of the info is still useful; it reads `verification failed ✗ — <hint>`.
 pub fn run(no_ping: bool) -> miette::Result<()> {
     info!(no_ping, "whoami invoked");
-    let ctx = crate::context::cli_context()?.with_no_ping(no_ping);
+    let ctx = crate::context::diagnostic_context()?.with_no_ping(no_ping);
     // Today's order: a pointer file that cannot be read fails before the identity line.
     cli_core::resolve_active_target_name(&ctx.store(), None).map_err(miette::Report::new)?;
     let result = session::whoami(&ctx, &CancellationToken::new());

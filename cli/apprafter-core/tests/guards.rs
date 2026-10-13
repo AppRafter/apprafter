@@ -1458,6 +1458,8 @@ const REAL_ENV_BUILDERS: &[&[&str]] = &[
     &["AllowListEnv", "from_process"],
     &["ProcessEnv"],
     &["cli_context"],
+    // The context of `doctor` and `whoami`, which never asks for a secret (D.4a d).
+    &["diagnostic_context"],
     // The CLI's context for a legacy arm, and the legacy commands' token, read through it
     // (D.4a b; `token.rs` since d4a-d).
     &["legacy_context"],

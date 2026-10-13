@@ -13,6 +13,8 @@ use crate::secrets::{LockSlotKind, SecretsMode};
 
 pub mod open;
 
+pub use open::{open_at, OpenedVault};
+
 pub use open::{
     PasswordAdvice, PasswordProblem, RecoveryKeyProblem, MAX_PASSWORD_BYTES,
     RECOMMENDED_PASSWORD_CHARS,

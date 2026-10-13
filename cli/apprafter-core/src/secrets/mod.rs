@@ -58,6 +58,10 @@ pub use store_file::{
     STORE_FILE_FORMAT,
 };
 
+/// The vault boundary the lock flows share with the store (D.4a d): read a store's vault after
+/// checking it is this store's, and word a vault failure as the store does.
+pub(crate) use locked::{read_vault, vault_error};
+
 /// Where a store's secrets are; read from `<root>/store.yaml` on every call, never cached. No
 /// `store.yaml` is `Files` (D.4a T31).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]

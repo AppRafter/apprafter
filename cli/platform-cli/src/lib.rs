@@ -23,6 +23,7 @@ mod render;
 mod sandbox;
 mod startup;
 mod token;
+mod vault_access;
 
 use clap::{CommandFactory, FromArgMatches};
 use cli_core::logging;
@@ -105,6 +106,8 @@ pub fn run() -> Result<()> {
     let mut matches = command.get_matches_mut();
     // Before `from_arg_matches_mut`, which takes the values (and their sources) out.
     let typed = dispatch::Typed::of(&matches);
+    // What a secret prompt names: the clap path, never argv (D.4a T61).
+    vault_access::set_command(&dispatch::command_path(&matches));
     let args = match Cli::from_arg_matches_mut(&mut matches) {
         Ok(args) => args,
         Err(error) => error.format(&mut command).exit(),
@@ -121,5 +124,9 @@ pub fn run() -> Result<()> {
     // command that goes beyond this machine itself (`startup`).
     startup::run_startup_checks(&args.command);
 
-    dispatch(args, typed)
+    let result = dispatch(args, typed);
+    // D.4a T46: the store's key and the items this command opened go now, zeroed — the
+    // process's access is a static, which is never dropped (critic finding 13).
+    vault_access::forget_all();
+    result
 }

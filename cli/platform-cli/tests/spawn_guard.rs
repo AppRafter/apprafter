@@ -200,6 +200,12 @@ const ALLOWED: &[(&str, &str, Rule)] = &[
         "run_at_a_terminal",
         Rule::AtTerminal,
     ),
+    // D.4a d: the conversation harness of the lock's prompt tests.
+    (
+        "platform-cli/tests/common/terminal.rs",
+        "converse_with",
+        Rule::AtTerminal,
+    ),
     // The fence's own rows: a removed HOME, a removed store variable, no fence at all (it
     // changes nothing unless set), and roots the fence must refuse.
     (

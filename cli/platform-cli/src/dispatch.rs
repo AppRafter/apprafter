@@ -41,6 +41,18 @@ impl Typed {
     }
 }
 
+/// The command `matches` runs, as its subcommand names (`target add`, `up`) — what a secret
+/// prompt names (D.4a T61). Never argv: a flag can hold a token.
+pub(crate) fn command_path(matches: &clap::ArgMatches) -> String {
+    let mut parts = Vec::new();
+    let mut at = matches;
+    while let Some((name, sub)) = at.subcommand() {
+        parts.push(name.to_string());
+        at = sub;
+    }
+    parts.join(" ")
+}
+
 /// Commands on `apprafter-core` convert their own errors at the arm boundary
 /// (`crate::render::core_error::report`); every other command goes through [`dispatch_cli`],
 /// mapped once. `typed` says which env-backed values of `target add` were typed.
@@ -503,4 +515,32 @@ fn dispatch_cli(args: Cli) -> cli_core::Result<()> {
         Commands::Completion { shell, install } => commands::completions::run(shell, install)?,
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    use super::command_path;
+    use crate::cli::Cli;
+
+    fn path_of(argv: &[&str]) -> String {
+        let matches = Cli::command()
+            .try_get_matches_from(std::iter::once("apprafter").chain(argv.iter().copied()))
+            .unwrap();
+        command_path(&matches)
+    }
+
+    /// T61: the prompt names the command by its clap path — never argv, whose flags can hold a
+    /// token; an alias is the command's own name.
+    #[test]
+    fn the_command_path_is_the_subcommands_never_a_value() {
+        assert_eq!(
+            path_of(&["target", "add", "prod", "--token", "SECRET-VALUE"]),
+            "target add"
+        );
+        assert_eq!(path_of(&["bootstrap-all", "--dry-run"]), "up");
+        assert_eq!(path_of(&["kubeconfig", "--refresh"]), "kubeconfig");
+        assert!(!path_of(&["target", "add", "prod", "--token", "SECRET-VALUE"]).contains("SECRET"));
+    }
 }

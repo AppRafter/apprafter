@@ -2,7 +2,8 @@
 //! The CLI's `apprafter_core::Context`: its whole environment, read here and nowhere else in
 //! the core-backed arms (ADR 0067 §2). The core-backed arms build it with [`cli_context`]; an
 //! arm that still returns `cli_core::Result` (a legacy arm) with [`legacy_context`]. Both are
-//! one builder, so d4a-d gives both the CLI's vault access in one place.
+//! one builder, which gives every context the CLI's vault access (`crate::vault_access`);
+//! `doctor` and `whoami` take [`diagnostic_context`], which never asks (D.4a T66).
 
 use std::ffi::OsString;
 
@@ -23,9 +24,19 @@ impl EnvSource for ProcessEnv {
     }
 }
 
-/// The CLI's one `Context` builder.
+/// The CLI's one `Context` builder, with the CLI's vault access (D.4a d): a locked store's
+/// secrets are asked for at the controlling terminal, once per command.
 fn build() -> CoreResult<Context> {
-    Context::from_cli_env(&ProcessEnv)
+    let ctx = Context::from_cli_env(&ProcessEnv)?;
+    let access = crate::vault_access::process();
+    access.set_home(ctx.home_dir());
+    Ok(ctx.with_vault_access(access))
+}
+
+/// The context of a diagnostic — `doctor`, `whoami` — which never asks for a secret (D.4a
+/// T66): a locked store's secrets are `store_locked` there, terminal or not.
+pub(crate) fn diagnostic_context() -> miette::Result<Context> {
+    Context::from_cli_env(&ProcessEnv).map_err(crate::render::core_error::report)
 }
 
 /// Built by each core-backed arm, not once in `run()`: a command that never touches the core

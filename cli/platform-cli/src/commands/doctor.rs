@@ -29,14 +29,14 @@ use cli_core::CliError;
 use tracing::info;
 
 use crate::commands::state_paths::resolve_state_paths;
-use crate::context::cli_context;
+use crate::context::diagnostic_context;
 use crate::render;
 
 pub fn run(target_override: Option<&str>, no_ping: bool) -> miette::Result<()> {
     info!(target_override, no_ping, "doctor invoked");
     let cancel = CancellationToken::new();
     let interrupt = cancel_on_interrupt(&cancel);
-    let ctx = cli_context()?.with_no_ping(no_ping);
+    let ctx = diagnostic_context()?.with_no_ping(no_ping);
     migrate_legacy_state(&ctx, target_override).map_err(miette::Report::new)?;
     let target = match target_override {
         Some(name) => DoctorTarget::Named(name.to_string()),
