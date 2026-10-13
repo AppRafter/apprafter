@@ -3,21 +3,11 @@ $ apprafter destroy --yes
 [stdout]
 [stderr]
 <ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m destroy invoked <ESC>[3myes<ESC>[0m<ESC>[2m=<ESC>[0mtrue
-Error: apprafter::target::provider_unreachable
+Error: apprafter::target::not_found
 
-  × provider `hetzner-cloud` API was unreachable
-  ╰─▶   × transport error talking to <HCLOUD>/v1/servers: Connection
-        │ Failed: Connect error: Connection refused (os error <N>)
-      
-  help: The request could not complete because the provider's API was
-        unreachable. This is NOT a credentials problem — the token may still
-        be valid once the API recovers.
-        • Run `apprafter doctor` to confirm reachability + DNS.
-        • Check the provider's status page (https://status.hetzner.com/ for
-        hetzner-cloud).
-        • If you're behind a VPN / corporate proxy, ensure `https://
-        api.hetzner.cloud/` is reachable.
-        • Pass `--no-ping` to skip the provider round-trip and save offline
-        (`target add`, also with `--renew`, and `target machine` take it); you
-        can re-verify later with `apprafter doctor`.
+  × target `gone` not found (available: )
+  help: No target named `gone` is configured here. `apprafter target list`
+        lists the targets that are; `apprafter target add gone --provider
+        hetzner-cloud …` creates it. An empty `available:` list means this
+        store has no targets yet — start with `apprafter target add`.
 

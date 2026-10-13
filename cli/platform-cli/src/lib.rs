@@ -16,10 +16,10 @@ pub(crate) mod commands;
 mod context;
 mod dispatch;
 pub(crate) mod examples;
-mod legacy_token;
 mod render;
 mod sandbox;
 mod startup;
+mod token;
 
 use clap::{CommandFactory, FromArgMatches};
 use cli_core::logging;

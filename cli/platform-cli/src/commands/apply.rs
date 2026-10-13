@@ -101,10 +101,10 @@ pub fn run(target_override: Option<&str>, server_type_flag: Option<&str>) -> Res
         )));
     }
 
-    // Credential resolution (cli-dx-task.md §7), through the core's
-    // secret store: HCLOUD_TOKEN, else the stored token of `--target`
-    // or the active target (`legacy_token`, D.4a b).
-    let token = crate::legacy_token::hetzner_token(target_override)?;
+    // Credential resolution (cli-dx-task.md §7): HCLOUD_TOKEN, else the
+    // stored token of `--target` or the CLI default, through the core
+    // (`crate::token`, D.4a T15).
+    let token = crate::token::hetzner_token(target_override)?;
 
     // Optional manifest path. If APPRAFTER_MANIFEST is set, parse
     // and overlay onto the v0.1.4 defaults; otherwise keep the

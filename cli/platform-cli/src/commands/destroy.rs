@@ -41,7 +41,7 @@ pub fn run(yes: bool, target_override: Option<&str>) -> Result<()> {
     }
 
     // Resolution chain (cli-dx-task.md §7), through the core (D.4a b).
-    let token = crate::legacy_token::hetzner_token(target_override)?;
+    let token = crate::token::hetzner_token(target_override)?;
 
     if !yes {
         return Err(CliError::Other(

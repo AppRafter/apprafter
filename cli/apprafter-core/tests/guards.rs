@@ -1458,10 +1458,10 @@ const REAL_ENV_BUILDERS: &[&[&str]] = &[
     &["AllowListEnv", "from_process"],
     &["ProcessEnv"],
     &["cli_context"],
-    // The CLI's context for a legacy arm, and the legacy token adapter that reads through it
-    // (D.4a b; d4a-d deletes both).
+    // The CLI's context for a legacy arm, and the legacy commands' token, read through it
+    // (D.4a b; `token.rs` since d4a-d).
     &["legacy_context"],
-    &["legacy_token", "hetzner_token"],
+    &["token", "hetzner_token"],
     &["desktop_context"],
 ];
 
@@ -1495,7 +1495,8 @@ const OPENER_METHODS: &[&str] = &["secrets"];
 /// opens nothing — as (file under `cli/`, function; `Type::name` inside an `impl`). A listed
 /// function that is not itself a `#[test]` (a helper) hands what it built on: a call to it by
 /// path counts as a builder in its caller, which must then be listed too and open nothing
-/// (critic finding 10; none is listed here today, the desktop's `real_api_base` is one).
+/// (critic finding 10; `token.rs`'s `with_env_token` is one, the desktop's `real_api_base`
+/// another).
 const REAL_ENV_TESTS: &[(&str, &str)] = &[
     // The context builders' own tests: what each reads, and how the two clients agree.
     (
@@ -1605,15 +1606,21 @@ const REAL_ENV_TESTS: &[(&str, &str)] = &[
         "platform-cli/src/commands/target_wizard.rs",
         "the_token_source_compares_against_the_cli_override_not_the_process_env",
     ),
-    // The legacy token adapter's `HCLOUD_TOKEN` override needs the CLI's builder: a MapEnv
-    // over a tempdir store and home; opens nothing.
+    // The legacy commands' token: `HCLOUD_TOKEN` needs the CLI's builder, a MapEnv over a
+    // tempdir store and home, built by the listed helper `with_env_token` for the three tests
+    // below; opens nothing.
+    ("platform-cli/src/token.rs", "with_env_token"),
     (
-        "platform-cli/src/legacy_token.rs",
-        "hcloud_token_wins_before_any_target_is_looked_at",
+        "platform-cli/src/token.rs",
+        "hcloud_token_outranks_the_stored_one_of_a_named_target",
     ),
     (
-        "platform-cli/src/legacy_token.rs",
+        "platform-cli/src/token.rs",
         "an_empty_hcloud_token_is_unset",
+    ),
+    (
+        "platform-cli/src/token.rs",
+        "hcloud_token_no_longer_passes_an_unknown_default",
     ),
     // The Windows release gate: every per-user default resolves under the profile.
     (
@@ -2663,13 +2670,13 @@ fn t() {
         );
     }
 
-    /// D.4a b: the CLI's legacy context and the legacy token adapter build from the real
+    /// D.4a b, d: the CLI's legacy context and the legacy commands' token build from the real
     /// environment; the core's own `target::hetzner_token` does not (it takes a context).
     #[test]
-    fn the_legacy_context_and_token_adapter_are_builders() {
+    fn the_legacy_context_and_the_legacy_token_are_builders() {
         let src = "\
 fn t() {
-    let _ = crate::legacy_token::hetzner_token(None);
+    let _ = crate::token::hetzner_token(None);
     let _ = crate::context::legacy_context();
     let _ = apprafter_core::target::hetzner_token(&ctx, &target);
 }
@@ -2677,7 +2684,7 @@ fn t() {
         assert_eq!(
             uses(src, true),
             vec![
-                row("t", false, "legacy_token::hetzner_token"),
+                row("t", false, "token::hetzner_token"),
                 row("t", false, "legacy_context"),
             ]
         );

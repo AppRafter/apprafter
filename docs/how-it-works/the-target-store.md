@@ -165,9 +165,9 @@ first run produces:
 With a target configured but no token in its `credentials.yaml`:
 
 ```text
-  × target `prod` has no Hetzner Cloud token stored. Run `apprafter target add
-  │ prod --renew --token <X>` to add one, or pass `--token`/`HCLOUD_TOKEN` for
-  │ this invocation.
+  × target `prod` has no provider token stored
+  help: Run `apprafter target add prod --renew --token <X>` to store one, or
+        set `HCLOUD_TOKEN` for this invocation.
 ```
 
 And with `--target` pointing at a name that is not in the store — note

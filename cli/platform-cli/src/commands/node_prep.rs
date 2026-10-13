@@ -668,7 +668,7 @@ pub fn node_prep(yes: bool) -> Result<()> {
         return Err(no_provisioned_server_error());
     };
 
-    let token = crate::legacy_token::hetzner_token(None)?;
+    let token = crate::token::hetzner_token(None)?;
     let client = HetznerCloudClient::new(hcloud_base_url(), token);
     let (v4, _v6) = node_public_ips(&client, server_id)?;
     let host = v4.ok_or_else(no_public_ipv4_error)?;
@@ -1291,7 +1291,7 @@ pub fn status() -> Result<()> {
         return Err(no_provisioned_server_error());
     };
 
-    let token = crate::legacy_token::hetzner_token(None)?;
+    let token = crate::token::hetzner_token(None)?;
     let client = HetznerCloudClient::new(hcloud_base_url(), token);
     let (v4, _v6) = node_public_ips(&client, server_id)?;
     let host = v4.ok_or_else(no_public_ipv4_error)?;

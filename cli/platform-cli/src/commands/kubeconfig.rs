@@ -81,11 +81,11 @@ fn fetch_and_cache_outcome(
         target: &resolved.target_name,
     };
     let mut on_lost_key = |lost: &LostKey| answer_lost_key(policy, lost, &mut ask_at_terminal);
-    // Cold path or --refresh: SSH-fetch from the live server. The token
-    // comes through the core's secret store (`legacy_token`, D.4a b):
-    // HCLOUD_TOKEN, else the stored token of `--target` or the active one.
+    // Cold path or --refresh: SSH-fetch from the live server. The token:
+    // HCLOUD_TOKEN, else the stored token of `--target` or the CLI
+    // default, through the core (`crate::token`, D.4a T15).
     let mut fetch = |hetzner: &HetznerCloudState| {
-        let token = crate::legacy_token::hetzner_token(target_override)?;
+        let token = crate::token::hetzner_token(target_override)?;
         let client = HetznerCloudClient::new(hcloud_base_url(), token);
         let public_ip = resolve_public_ip(&client, hetzner.server_id)?;
         let fetcher = SshKubeconfigFetcher::new(

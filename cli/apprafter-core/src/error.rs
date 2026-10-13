@@ -10,8 +10,8 @@
 //! error type of the backup engine and reaches the in-cluster runner) and
 //! adds the variants the core itself raises. A code has one shape: the
 //! `CliError` variants the core also raises (`TargetNotFound`,
-//! `NoActiveTarget`) are mapped onto the core's own on the way in. Messages carry no client
-//! wording ("pass `--yes`", "run `apprafter …`"): the CLI adds those hints
+//! `NoActiveTarget`, `TokenNotStored`) are mapped onto the core's own on the way in.
+//! Messages carry no client wording ("pass `--yes`", "run `apprafter …`"): the CLI adds those hints
 //! when it renders, the desktop turns codes into actions. Nor does [`UiError`]'s
 //! `help`: a pass-through `CliError`'s own help is the CLI's, so the projection
 //! carries a source-neutral one in its place (`neutral_help`), or none.
@@ -338,6 +338,7 @@ impl From<cli_core::CliError> for CoreError {
                     .collect(),
             },
             cli_core::CliError::NoActiveTarget => CoreError::NoActiveTarget,
+            cli_core::CliError::TokenNotStored { name } => CoreError::TokenNotStored { name },
             // The CLI's own commands carry the target for their help; the core's shape has none.
             cli_core::CliError::AgeKeyMissing { path, .. } => CoreError::AgeKeyMissing { path },
             other => CoreError::Cli(other),
@@ -725,7 +726,8 @@ fn neutral_help(e: &cli_core::CliError) -> Option<String> {
             .into(),
         // CLI input policy and CLI-only commands (their help is about the command line), and
         // errors no desktop flow reaches yet, whose help names CLI commands. `TargetNotFound`,
-        // `NoActiveTarget` and `AgeKeyMissing` arrive as the core's own variants (`From`).
+        // `NoActiveTarget`, `TokenNotStored` and `AgeKeyMissing` arrive as the core's own
+        // variants (`From`).
         C::CueExport { .. }
         | C::Restic { .. }
         | C::BackupRepoProbe { .. }
@@ -734,6 +736,7 @@ fn neutral_help(e: &cli_core::CliError) -> Option<String> {
         | C::ServerTypeNotSelected
         | C::TargetNotFound { .. }
         | C::NoActiveTarget
+        | C::TokenNotStored { .. }
         | C::AgeKeyMissing { .. }
         | C::OverrideOnLockedStore { .. }
         | C::CacheUndecryptable { .. }
@@ -1115,6 +1118,7 @@ pub mod samples {
                 available: s("prod"),
             },
             C::NoActiveTarget,
+            C::TokenNotStored { name: s("prod") },
             C::ProviderTokenRejected {
                 provider: s("hetzner-cloud"),
                 cause: Box::new(hetzner()),
@@ -2413,6 +2417,17 @@ mod tests {
             !help.contains("remove") && !help.contains("add it again"),
             "{help}"
         );
+    }
+
+    /// D.4a T15: the CLI's twin of `TokenNotStored` arrives as the core's own variant.
+    #[test]
+    fn a_cli_token_not_stored_is_the_cores() {
+        match CoreError::from(cli_core::CliError::TokenNotStored {
+            name: "prod".into(),
+        }) {
+            CoreError::TokenNotStored { name } => assert_eq!(name, "prod"),
+            e => panic!("expected the core's TokenNotStored, got {e:?}"),
+        }
     }
 
     #[test]

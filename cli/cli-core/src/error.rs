@@ -1147,6 +1147,19 @@ pub enum CliError {
     )]
     NoActiveTarget,
 
+    /// The target stores no Hetzner token: the core's `TokenNotStored`, for a command that still
+    /// returns `cli_core::Result` (D.4a T15) — its code, message and CLI help. The shared core's
+    /// `CoreError::from` maps it back onto its own variant, so the core carries one shape.
+    #[error("target `{name}` has no provider token stored")]
+    #[diagnostic(
+        code(apprafter::target::token_missing),
+        help(
+            "Run `apprafter target add {name} --renew --token <X>` to store one, or set \
+             `HCLOUD_TOKEN` for this invocation."
+        )
+    )]
+    TokenNotStored { name: String },
+
     /// Token validation ping during `target add` rejected the
     /// supplied credentials. Distinct from the generic
     /// `Hetzner { status: 401, .. }` so the operator gets a
@@ -1687,6 +1700,25 @@ mod tests {
         ] {
             assert!(help.contains(hint), "missing `{hint}`: {help}");
         }
+    }
+
+    /// D.4a T15: the core's `token_missing`, for a command that still returns
+    /// `cli_core::Result` — the core's code, message and CLI help, word for word.
+    #[test]
+    fn a_target_without_a_token_has_the_cores_code_and_help() {
+        let err = CliError::TokenNotStored {
+            name: "prod".into(),
+        };
+        assert_eq!(code_of(&err), "apprafter::target::token_missing");
+        assert_eq!(
+            err.to_string(),
+            "target `prod` has no provider token stored"
+        );
+        assert_eq!(
+            help_of(&err),
+            "Run `apprafter target add prod --renew --token <X>` to store one, or set \
+             `HCLOUD_TOKEN` for this invocation."
+        );
     }
 
     #[test]

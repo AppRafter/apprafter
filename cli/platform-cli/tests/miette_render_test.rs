@@ -22,8 +22,9 @@ fn cli(sp: &Spawn) -> Command {
     sp.cmd(&[])
 }
 
-/// `apply` without any credentials → resolver fails through the
-/// 3-step chain → typed `Other` error with the chain mentioned.
+/// `apply` on a target that stores no token → the token read
+/// refuses with the core's typed `token_missing` (D.4a T15; the
+/// catch-all `Other` before).
 /// We assert the miette plumbing renders both the `help:` block
 /// and a recognisable diagnostic structure. Independent of which
 /// variant the underlying error is, miette's `fancy` reporter
@@ -35,8 +36,8 @@ fn unhandled_error_renders_with_miette_help_line() {
     let cfg_dir = tempfile::tempdir().unwrap();
     let sp = Spawn::new().with_store(cfg_dir.path());
     // Seed an active target without a token so the apply below
-    // fails at the credential resolver (the `Other` variant with
-    // the `apprafter::cli::other` code we're asserting on).
+    // fails at the token read (`TokenNotStored`, with the
+    // `apprafter::target::token_missing` code we're asserting on).
     cli(&sp)
         .args([
             "target",
@@ -81,11 +82,11 @@ fn unhandled_error_renders_with_miette_help_line() {
 
     // The `help:` line is miette's signature output — its
     // presence is the proof we're going through the fancy
-    // reporter, not eyre / Debug. Catch-all `Other` variant
-    // ships with the `apprafter::cli::other` code.
+    // reporter, not eyre / Debug. `TokenNotStored` ships with
+    // the core's `apprafter::target::token_missing` code.
     assert
         .stderr(contains("help:"))
-        .stderr(contains("apprafter::cli::other"));
+        .stderr(contains("apprafter::target::token_missing"));
 }
 
 /// `apply --target ghost` against a populated store → typed

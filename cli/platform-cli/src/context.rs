@@ -41,8 +41,8 @@ pub(crate) fn legacy_context() -> cli_core::Result<Context> {
 }
 
 /// A core error as a legacy arm's `CliError`: a wrapped `CliError` as it was; the core's
-/// `TargetNotFound` and `NoActiveTarget` as the `CliError`s `CoreError::from` makes them from
-/// (the names joined back with ", "); any other as its message.
+/// `TargetNotFound`, `NoActiveTarget` and `TokenNotStored` as the `CliError`s `CoreError::from`
+/// makes them from (the names joined back with ", "); any other as its message.
 pub(crate) fn into_cli_error(e: CoreError) -> CliError {
     match e {
         CoreError::Cli(e) => e,
@@ -51,6 +51,8 @@ pub(crate) fn into_cli_error(e: CoreError) -> CliError {
             available: available.join(", "),
         },
         CoreError::NoActiveTarget => CliError::NoActiveTarget,
+        // D.4a T15: the core's code on a legacy arm.
+        CoreError::TokenNotStored { name } => CliError::TokenNotStored { name },
         other => CliError::Other(other.to_string()),
     }
 }
@@ -80,7 +82,27 @@ mod tests {
         ));
         assert!(matches!(
             into_cli_error(CoreError::TokenNotStored { name: "p".into() }),
-            CliError::Other(m) if m == "target `p` has no provider token stored"
+            CliError::TokenNotStored { name } if name == "p"
         ));
+    }
+
+    /// D.4a T15: a legacy arm shows `token_missing` with the code, message and help the core's
+    /// own arms show (`render::core_error::cli_help`).
+    #[test]
+    fn a_missing_token_keeps_the_cores_code_on_a_legacy_arm() {
+        use miette::Diagnostic;
+        let core = CoreError::TokenNotStored {
+            name: "prod".into(),
+        };
+        let help = crate::render::core_error::cli_help(&core).unwrap();
+        let message = core.to_string();
+        let cli = into_cli_error(core);
+        assert!(matches!(&cli, CliError::TokenNotStored { name } if name == "prod"));
+        assert_eq!(
+            cli.code().map(|c| c.to_string()).as_deref(),
+            Some("apprafter::target::token_missing")
+        );
+        assert_eq!(cli.to_string(), message);
+        assert_eq!(cli.help().map(|h| h.to_string()), Some(help));
     }
 }
