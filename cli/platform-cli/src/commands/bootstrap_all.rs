@@ -392,19 +392,41 @@ fn wait_for_kubeconfig(
         KUBECONFIG_POLL_INTERVAL,
         &mut || kubeconfig::fetch_and_cache(true, target_override),
         &|addr| apiserver_listening(addr),
+        &SystemClock,
     )
 }
 
-/// [`wait_for_kubeconfig`]'s loop, with the fetch, the apiserver probe and the timings given,
-/// so a test drives it without a node.
+/// Where [`poll_kubeconfig`] reads the time and how it waits: [`SystemClock`] in the product; a
+/// clock its tests move themselves, so the attempts a wait allows are exact on any runner.
+trait Clock {
+    fn now(&self) -> Instant;
+    fn sleep(&self, d: Duration);
+}
+
+/// `Instant::now` and `std::thread::sleep`.
+struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn sleep(&self, d: Duration) {
+        std::thread::sleep(d);
+    }
+}
+
+/// [`wait_for_kubeconfig`]'s loop, with the fetch, the apiserver probe, the timings and the
+/// clock given, so a test drives it without a node or a real wait.
 fn poll_kubeconfig(
     pb: &ProgressBar,
     timeout: Duration,
     interval: Duration,
     fetch: &mut dyn FnMut() -> Result<String>,
     listening: &dyn Fn(&str) -> bool,
+    clock: &dyn Clock,
 ) -> std::result::Result<(), Unready> {
-    let deadline = Instant::now() + timeout;
+    let deadline = clock.now() + timeout;
     let mut attempt = 0u32;
     loop {
         attempt += 1;
@@ -438,11 +460,11 @@ fn poll_kubeconfig(
             attempts: attempt,
             last_error,
         };
-        if Instant::now() >= deadline {
+        if clock.now() >= deadline {
             return Err(timed_out(err));
         }
-        std::thread::sleep(interval);
-        if Instant::now() >= deadline {
+        clock.sleep(interval);
+        if clock.now() >= deadline {
             return Err(timed_out(err));
         }
     }
@@ -511,7 +533,48 @@ fn short_error(msg: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
+
+    /// A clock that moves only when [`poll_kubeconfig`] sleeps or a fetch says it took time, so
+    /// the attempts a wait allows are counted, never sampled from a runner's speed.
+    struct FakeClock {
+        start: Instant,
+        now: Cell<Instant>,
+        sleeps: Cell<u32>,
+    }
+
+    impl FakeClock {
+        fn new() -> Self {
+            let start = Instant::now();
+            Self {
+                start,
+                now: Cell::new(start),
+                sleeps: Cell::new(0),
+            }
+        }
+
+        /// A fetch that takes `d`.
+        fn advance(&self, d: Duration) {
+            self.now.set(self.now.get() + d);
+        }
+
+        fn elapsed(&self) -> Duration {
+            self.now.get() - self.start
+        }
+    }
+
+    impl Clock for FakeClock {
+        fn now(&self) -> Instant {
+            self.now.get()
+        }
+
+        fn sleep(&self, d: Duration) {
+            self.sleeps.set(self.sleeps.get() + 1);
+            self.advance(d);
+        }
+    }
 
     /// WI-457: `up` never replaces a lost age key, and does not wait it out either — the first
     /// attempt ends the phase with the error whose help names `kubeconfig --refresh`.
@@ -526,12 +589,14 @@ mod tests {
                 stopped: None,
             })
         };
+        let clock = FakeClock::new();
         let err = poll_kubeconfig(
             &ProgressBar::hidden(),
             Duration::from_millis(200),
             Duration::from_millis(20),
             &mut fetch,
             &|_| true,
+            &clock,
         )
         .unwrap_err();
         assert!(
@@ -539,6 +604,7 @@ mod tests {
             "{err:?}"
         );
         assert_eq!(calls, 1);
+        assert_eq!(clock.sleeps.get(), 0, "a lost key is not waited out");
     }
 
     /// Review #6: phase 2's lost key names the target and the command that provisioned it, so
@@ -585,15 +651,18 @@ mod tests {
                 Ok("    server: https://10.0.0.5:6443\n".to_string())
             }
         };
+        let clock = FakeClock::new();
         poll_kubeconfig(
             &ProgressBar::hidden(),
             Duration::from_secs(30),
             Duration::from_millis(1),
             &mut fetch,
             &|addr| addr == "10.0.0.5:6443",
+            &clock,
         )
         .unwrap();
         assert_eq!(calls, 3);
+        assert_eq!(clock.sleeps.get(), 2, "one sleep between two attempts");
     }
 
     /// WI-457 follow-up: a wait that runs out keeps the wait, the count of attempts and the
@@ -606,15 +675,20 @@ mod tests {
             calls += 1;
             Err(CliError::Other("ssh: connection refused".into()))
         };
+        let clock = FakeClock::new();
         let unready = poll_kubeconfig(
             &ProgressBar::hidden(),
             Duration::from_millis(60),
             Duration::from_millis(10),
             &mut fetch,
             &|_| true,
+            &clock,
         )
         .unwrap_err();
-        assert!(calls > 1, "retried until the wait ran out: {calls}");
+        // Attempts at 0, 10, 20, 30, 40 and 50 ms; the sleep after the sixth reaches the
+        // deadline, and no attempt starts at it.
+        assert_eq!(calls, 6, "one attempt per interval until the wait ran out");
+        assert_eq!(clock.elapsed(), Duration::from_millis(60));
         assert!(
             matches!(&unready, Unready::TimedOut { waited, attempts, last_error }
                 if *waited == Duration::from_millis(60) && *attempts == calls
@@ -638,6 +712,40 @@ mod tests {
                 "{err:?}"
             );
         }
+    }
+
+    /// The deadline's other side: an attempt that itself ends at the deadline is the last, and
+    /// no sleep follows it.
+    #[test]
+    fn an_attempt_that_ends_at_the_deadline_is_the_last_and_no_sleep_follows_it() {
+        let clock = FakeClock::new();
+        let mut calls = 0u32;
+        let mut fetch = || {
+            calls += 1;
+            clock.advance(Duration::from_millis(20));
+            Err(CliError::Other("ssh: connection refused".into()))
+        };
+        let unready = poll_kubeconfig(
+            &ProgressBar::hidden(),
+            Duration::from_millis(50),
+            Duration::from_millis(10),
+            &mut fetch,
+            &|_| true,
+            &clock,
+        )
+        .unwrap_err();
+        // Attempt 1 from 0 to 20 ms, a sleep to 30; attempt 2 from 30 to 50 ms, the deadline.
+        assert_eq!(calls, 2);
+        assert_eq!(
+            clock.sleeps.get(),
+            1,
+            "no sleep after the attempt that met the deadline"
+        );
+        assert_eq!(clock.elapsed(), Duration::from_millis(50));
+        assert!(
+            matches!(&unready, Unready::TimedOut { attempts: 2, .. }),
+            "{unready:?}"
+        );
     }
 
     #[test]
