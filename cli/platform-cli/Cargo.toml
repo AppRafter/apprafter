@@ -78,6 +78,8 @@ ureq          = { workspace = true }
 # process started (a background job's SIGINT stays ignored).
 signal-hook   = "0.3"
 libc          = "0.2"
+# The holder's endpoint id (D.4a T50): already in cli/Cargo.lock (apprafter-core's); an edge.
+sha2          = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 # SetConsoleCtrlHandler: the Windows form of the SIGINT/SIGTERM stop in

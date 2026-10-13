@@ -7,4 +7,7 @@
 //! ends. The data key reaches it only over the init pipe its starter hands it, and never leaves
 //! it (T48).
 
+pub mod binding;
+pub mod endpoint;
 pub mod protocol;
+pub mod window;

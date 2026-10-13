@@ -279,8 +279,11 @@ const FORBIDDEN_DEPS: &[&str] = &[
 /// G2 (D.4a T8): the holder's endpoint is derived in one function from `Context` inputs, never
 /// from a uid (`/run/user/<uid>`) or a fixed pipe prefix (`\\.\pipe\`). The functions (`fn` or
 /// `Type::fn`, as [`SANCTIONED`] names sites) allowed to spell one, in the ratcheted crates and
-/// the core; empty until d4a-e adds its endpoint function.
-const ENDPOINT_LITERALS: &[&str] = &[];
+/// the core: d4a-e's `pipe_name` is the one.
+const ENDPOINT_LITERALS: &[&str] = &[
+    // The Windows holder's pipe (D.4a T50): `platform-cli/src/holder/endpoint.rs`.
+    "pipe_name",
+];
 
 /// A string literal G2 keeps in [`ENDPOINT_LITERALS`].
 fn is_endpoint_literal(value: &str) -> bool {
