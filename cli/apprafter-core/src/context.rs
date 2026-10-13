@@ -11,6 +11,8 @@
 //! - the target store root and the Hetzner API base;
 //! - the CLI-only overrides ([`CliOverrides`]: `HCLOUD_TOKEN`,
 //!   `APPRAFTER_AGE_KEY`, `CUE_BIN`), never read for the desktop;
+//! - the one door to the store's secrets, [`Context::secrets`], built per call from the store
+//!   root and the age key path;
 //! - the home directory (the age key's default, the `~/` of shown paths),
 //!   the age key path, the tool search path and where it came from
 //!   ([`PathSource`]), and a private runtime dir;
@@ -31,6 +33,7 @@ use zeroize::Zeroizing;
 use crate::env::EnvSource;
 use crate::error::{CoreError, CoreResult};
 use crate::net::DeadlineResolver;
+use crate::secrets::SecretStore;
 use crate::tools::ToolResolver;
 
 /// Points every Hetzner call at another base URL (integration tests).
@@ -374,6 +377,12 @@ impl Context {
     /// The target store under [`Context::config_root`].
     pub fn store(&self) -> TargetStorePaths {
         TargetStorePaths::for_root(self.config_root.clone())
+    }
+
+    /// The one door to this store's secrets (ADR 0068 §5; D.4a b): every token and cached
+    /// secret is read through it. Cheap; opens nothing until one of its methods runs.
+    pub fn secrets(&self) -> SecretStore {
+        SecretStore::new(self.store(), self.age_key_path.clone())
     }
 
     pub fn hcloud_base_url(&self) -> &str {

@@ -234,6 +234,10 @@ const OPENERS: &[&[&str]] = &[
     &["doctor", "run"],
 ];
 
+/// Openers called as a method of the context, by name (as `apprafter-core/tests/guards.rs`
+/// lists them): `Context::secrets`.
+const OPENER_METHODS: &[&str] = &["secrets"];
+
 /// The desktop's tests allowed a real-environment builder: each compares values and opens nothing.
 /// `real_api_base` is a helper, not a `#[test]`: a call to it counts as a builder in its caller,
 /// which must be listed too and open nothing (critic finding 10).
@@ -363,6 +367,16 @@ impl<'ast> Visit<'ast> for RealEnv {
         visit::visit_expr_path(self, e);
     }
 
+    fn visit_expr_method_call(&mut self, m: &'ast syn::ExprMethodCall) {
+        let name = m.method.to_string();
+        if self.in_test() && OPENER_METHODS.contains(&name.as_str()) {
+            let site = self.fns.last().cloned().unwrap_or_default();
+            self.uses
+                .push((site, m.method.span().start().line, true, name));
+        }
+        visit::visit_expr_method_call(self, m);
+    }
+
     fn visit_macro(&mut self, mac: &'ast syn::Macro) {
         use syn::punctuated::Punctuated;
         if let Ok(args) =
@@ -418,6 +432,37 @@ mod tests {
             ),
             ("t".to_string(), true, "materialise_kubeconfig".to_string()),
             ("t".to_string(), false, "desktop_context".to_string()),
+        ]
+    );
+}
+
+/// D.4a b: the secret store is an opener here too, called as a method of the context.
+#[test]
+fn g3_sees_the_secret_store_called_as_a_method() {
+    let src = "\
+#[cfg(test)]
+mod tests {
+    fn t() {
+        let ctx = Context::from_desktop_env(&env, policy, host()).unwrap();
+        let _ = ctx.secrets().stored_token(\"p\");
+        let _ = ctx.store();
+    }
+}
+";
+    let got: Vec<(String, bool, String)> = real_env(src, false, &[])
+        .uses
+        .into_iter()
+        .map(|(site, _, opener, what)| (site, opener, what))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (
+                "t".to_string(),
+                false,
+                "Context::from_desktop_env".to_string()
+            ),
+            ("t".to_string(), true, "secrets".to_string()),
         ]
     );
 }

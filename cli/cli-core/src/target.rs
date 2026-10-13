@@ -729,21 +729,31 @@ fn credentials_parse_message(err: &serde_yaml::Error) -> String {
     }
 }
 
-/// Persist both halves of a target. `config.yaml` is mode 0644
-/// (world-readable, ok for non-secret data); `credentials.yaml`
-/// is mode 0600 on Unix — `atomic_write(..., true)` enforces it
-/// before publishing the file under its final name, so there is
-/// no race window where the credentials are briefly readable by
-/// other local users.
+/// Persist both halves of a target: `config.yaml` (mode 0644,
+/// world-readable, ok for non-secret data), then `credentials.yaml`
+/// ([`save_target_credentials`]).
 pub fn save_target(paths: &TargetStorePaths, target: &Target) -> Result<()> {
     save_target_config(paths, &target.name, &target.config)?;
-    let creds_yaml = serde_yaml::to_string(&target.credentials)?;
+    save_target_credentials(paths, &target.name, &target.credentials)
+}
+
+/// Persist a target's `credentials.yaml` and nothing else, mode 0600 on
+/// Unix — `atomic_write(..., true)` enforces it before publishing the file
+/// under its final name, so there is no window where the credentials are
+/// readable by other local users. The bytes are the ones [`save_target`]
+/// writes. Its one production caller is the shared core's secret store
+/// (D.4a b), the one door to a stored token.
+pub fn save_target_credentials(
+    paths: &TargetStorePaths,
+    name: &str,
+    credentials: &TargetCredentials,
+) -> Result<()> {
+    let creds_yaml = serde_yaml::to_string(credentials)?;
     atomic_write(
-        &paths.target_credentials_file(&target.name),
+        &paths.target_credentials_file(name),
         creds_yaml.as_bytes(),
         true,
-    )?;
-    Ok(())
+    )
 }
 
 /// Persist a target's `config.yaml` (mode 0644) and nothing else: its `credentials.yaml` is
@@ -1990,5 +2000,58 @@ mod tests {
             );
         }
         assert!(load_active_target_config(&paths, Some("ghost")).is_none());
+    }
+
+    /// D.4a b: the credentials file alone, written as `save_target` writes it (mode 0600,
+    /// the same bytes — pinned as a literal, since `save_target` now calls this very writer),
+    /// with `config.yaml` left as it was.
+    #[test]
+    fn credentials_alone_are_saved_as_save_target_saves_them() {
+        let (_a, whole) = make_paths();
+        let (_b, split) = make_paths();
+        let config = TargetConfig {
+            provider: "hetzner-cloud".into(),
+            ssh_key_path: Some("/k/id.pub".into()),
+            ..Default::default()
+        };
+        let credentials = TargetCredentials {
+            hetzner_token: Some("hcloud_secret".into()),
+        };
+        save_target(
+            &whole,
+            &Target {
+                name: "work".into(),
+                config: config.clone(),
+                credentials: credentials.clone(),
+            },
+        )
+        .unwrap();
+        save_target_config(&split, "work", &config).unwrap();
+        let config_bytes = fs::read(split.target_config_file("work")).unwrap();
+        save_target_credentials(&split, "work", &credentials).unwrap();
+        assert_eq!(
+            fs::read_to_string(split.target_credentials_file("work")).unwrap(),
+            "hetzner_token: hcloud_secret\n",
+            "the bytes serde_yaml 0.9 writes for TargetCredentials"
+        );
+        assert_eq!(
+            fs::read(split.target_credentials_file("work")).unwrap(),
+            fs::read(whole.target_credentials_file("work")).unwrap()
+        );
+        assert_eq!(
+            fs::read(split.target_config_file("work")).unwrap(),
+            config_bytes,
+            "config.yaml is not written"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(split.target_credentials_file("work"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "got {mode:o}");
+        }
     }
 }

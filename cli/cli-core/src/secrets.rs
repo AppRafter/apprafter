@@ -13,7 +13,9 @@ use std::str::FromStr;
 
 use age::armor::{ArmoredReader, ArmoredWriter, Format};
 use age::secrecy::ExposeSecret;
-use age::x25519::{Identity, Recipient};
+/// The age identity and recipient, re-exported so a crate that names them (the shared core's
+/// secret store) needs no `age` dependency of its own.
+pub use age::x25519::{Identity, Recipient};
 
 use crate::{CliError, Result};
 

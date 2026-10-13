@@ -1267,8 +1267,8 @@ const REAL_ENV_BUILDERS: &[&[&str]] = &[
 
 /// What reads or writes a store's secrets, a key or a cache, or runs a check that does: a test
 /// that built its context from the real environment calls none of them, or it would read the
-/// real store of whoever runs it. d4a's later steps add `Context::secrets` and the `lock`,
-/// `vault` and `holder` openers.
+/// real store of whoever runs it. d4a's later steps add the `lock`, `vault` and `holder`
+/// openers; `Context::secrets` is a method, in [`OPENER_METHODS`].
 const OPENERS: &[&[&str]] = &[
     &["load_identity"],
     &["load_or_create_identity"],
@@ -1279,6 +1279,11 @@ const OPENERS: &[&[&str]] = &[
     &["cached_kubeconfig"],
     &["doctor", "run"],
 ];
+
+/// Openers called as a method of the context, matched by the method's name (a syntax scan does
+/// not know the receiver's type): `Context::secrets`, the one door to a store's secrets
+/// (D.4a b). A path visitor never sees a method, so they are listed apart from [`OPENERS`].
+const OPENER_METHODS: &[&str] = &["secrets"];
 
 /// The test functions allowed a real-environment builder — each compares paths or values and
 /// opens nothing — as (file under `cli/`, function; `Type::name` inside an `impl`). A listed
@@ -1564,6 +1569,20 @@ impl<'ast> Visit<'ast> for RealEnvScanner<'_> {
             self.check(&segs, first.ident.span());
         }
         visit::visit_expr_path(self, e);
+    }
+
+    fn visit_expr_method_call(&mut self, m: &'ast syn::ExprMethodCall) {
+        let name = m.method.to_string();
+        if self.in_test() && OPENER_METHODS.contains(&name.as_str()) {
+            self.uses.push(EnvUse {
+                file: self.file.to_string(),
+                site: self.fns.last().cloned().unwrap_or_default(),
+                line: line_of(m.method.span()),
+                opener: true,
+                what: name,
+            });
+        }
+        visit::visit_expr_method_call(self, m);
     }
 
     fn visit_macro(&mut self, mac: &'ast syn::Macro) {
@@ -2284,6 +2303,27 @@ fn t(ctx: &Context) -> ProcessEnv { let _ = ctx.home_dir(); todo!() }
         let src =
             "#[cfg(test)]\nmod tests { struct S; impl S { fn build() { let _ = ProcessEnv; } } }";
         assert_eq!(uses(src, false), vec![row("S::build", false, "ProcessEnv")]);
+    }
+
+    /// D.4a b: the secret store is an opener, called as a method of the context.
+    #[test]
+    fn the_secret_store_is_an_opener_called_as_a_method() {
+        let src = "\
+fn t() {
+    let ctx = Context::from_cli_env(&MapEnv::new()).unwrap();
+    let _ = ctx.secrets().stored_token(\"p\");
+    assert!(ctx.secrets().held().is_ok());
+    let _ = ctx.store();
+}
+";
+        assert_eq!(
+            uses(src, true),
+            vec![
+                row("t", false, "Context::from_cli_env"),
+                row("t", true, "secrets"),
+                row("t", true, "secrets"),
+            ]
+        );
     }
 
     /// Critic finding 10: a listed helper hands what it built on, so a call to it (by path:

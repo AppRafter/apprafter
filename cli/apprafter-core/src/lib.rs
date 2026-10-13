@@ -50,6 +50,7 @@ pub mod process;
 pub mod provider;
 pub mod report;
 pub mod runtime;
+pub mod secrets;
 pub mod session;
 pub mod ssh;
 pub mod target;
@@ -66,6 +67,9 @@ pub use error::{CoreError, CoreResult, UiError};
 pub use op::{ChangeAction, Outcome, Plan, PlanClass, PlannedChange};
 pub use report::{CollectReporter, Event, NullReporter, Reporter, Stream};
 pub use target_ref::{ActivePointerChange, TargetRef};
+/// The secret store's plaintext type, so a client names it without a `zeroize` dependency of
+/// its own.
+pub use zeroize::Zeroizing;
 
 /// The core's version — what the desktop's About line shows as "core <ver>".
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
