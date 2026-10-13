@@ -80,6 +80,18 @@ impl Window {
     }
 }
 
+/// The running OS's two clocks (`os::current`).
+pub struct SystemClock;
+
+impl HolderClock for SystemClock {
+    fn with_sleep(&self) -> Duration {
+        super::os::current::clock_with_sleep()
+    }
+    fn awake_only(&self) -> Duration {
+        super::os::current::clock_awake()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
@@ -178,5 +190,22 @@ mod tests {
     fn the_length_is_minutes_or_a_tests_seconds() {
         assert_eq!(Window::length(1440, None), Duration::from_secs(86_400));
         assert_eq!(Window::length(5, Some(3)), Duration::from_secs(3));
+    }
+
+    /// T56, HG1: a holder's clocks — one that counts suspend, one that does not — both advance
+    /// as time passes awake, and the first is never behind the second. That they count
+    /// suspend as named is what the owner's suspend walk row proves (h); the constants are
+    /// pinned in `os::*`'s own tests.
+    #[test]
+    fn the_system_clocks_advance_together_while_awake() {
+        let c = SystemClock;
+        let (s0, a0) = (c.with_sleep(), c.awake_only());
+        std::thread::sleep(Duration::from_millis(50));
+        let (s1, a1) = (c.with_sleep(), c.awake_only());
+        assert!(s1 > s0 && a1 > a0);
+        // Suspend only adds to the first clock; 100 ms covers Windows' tick granularity.
+        assert!(s1 + Duration::from_millis(100) >= a1, "{s1:?} {a1:?}");
+        let gap = (s1 - s0).abs_diff(a1 - a0);
+        assert!(gap < SLEEP_GAP, "{gap:?}");
     }
 }

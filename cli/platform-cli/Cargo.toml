@@ -87,7 +87,11 @@ sha2          = { workspace = true }
 # (Threading; its tests also start a child in a new process group).
 # Diagnostics_ToolHelp: the parent process the secret prompt names (D.4a
 # T61). Already in the graph; no new crate.
-windows-sys   = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Threading"] }
+# The unlock holder (D.4a T52-T56): its key page (Memory), its clocks (SystemInformation's
+# GetTickCount64 counts suspend, WindowsProgramming's QueryUnbiasedInterruptTime does not), its
+# error mode (Diagnostics_Debug) and its restricted process DACL (Security,
+# Security_Authorization). Features of the version already in the graph; no new package.
+windows-sys   = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Memory", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_System_WindowsProgramming"] }
 
 [dev-dependencies]
 # `error::samples` (one value of every CoreError variant) for the renderer's exhaustiveness

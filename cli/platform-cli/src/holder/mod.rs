@@ -9,5 +9,8 @@
 
 pub mod binding;
 pub mod endpoint;
+pub mod harden;
+pub mod memory;
+pub(crate) mod os;
 pub mod protocol;
 pub mod window;
