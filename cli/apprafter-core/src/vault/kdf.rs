@@ -143,8 +143,6 @@ pub(crate) static HEAVY_KDF: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// `Argon2id(v0x13, password as typed, salt, params, 32 bytes)` (§3.7), after `policy.check`
 /// and into a working memory of ours that is zeroed before it is freed.
-// d4a-c1 Task 7 removes this `allow`: seal.rs's slots call it.
-#[allow(dead_code)]
 pub(crate) fn derive_password_material(
     password: &SecretString,
     salt: &[u8; SALT_LEN],
@@ -188,8 +186,6 @@ pub(crate) fn derive_password_material(
 /// A slot's two keys: `kek` wraps the data key; `key_check` tells a wrong secret
 /// (`WrongSecret`) from a damaged slot (`SlotCorrupt`) and commits the slot to one key. Both
 /// are zeroed on drop.
-// d4a-c1 Task 7 removes this `allow`: seal.rs's slots read them.
-#[allow(dead_code)]
 pub(crate) struct SlotKeys {
     pub(crate) kek: Zeroizing<[u8; 32]>,
     pub(crate) key_check: Zeroizing<[u8; 32]>,
@@ -198,8 +194,6 @@ pub(crate) struct SlotKeys {
 /// `HKDF-SHA256(salt = slot salt, ikm = material)`, expanded twice with the slot kind in the
 /// info (§3.7). The `Hkdf` value — its HMAC state is keyed with the PRK, which hkdf 0.12 cannot
 /// wipe (T29) — lives only until this function returns.
-// d4a-c1 Task 7 removes this `allow`: seal.rs's slots call it.
-#[allow(dead_code)]
 pub(crate) fn slot_keys(
     material: &[u8; MATERIAL_LEN],
     salt: &[u8; SALT_LEN],

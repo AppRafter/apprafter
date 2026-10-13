@@ -30,6 +30,10 @@
 //!    `desktop/` turns on `apprafter-core/insecure-fast-kdf` outside `[dev-dependencies]`,
 //!    except the desktop's `test-build` ([`INSECURE_KDF_FORWARDERS`]), and none of the
 //!    core's own features pulls it in (D.4a T23).
+//! 7. **The vault's code rules.** In `src/vault/`'s production code no `==` / `!=` touches
+//!    key material ([`VAULT_SECRET_NAMES`]; `subtle::ConstantTimeEq` only, at least
+//!    [`VAULT_CT_EQ_MIN`] times), no argon2 call allocates its own working memory
+//!    ([`UNZEROED_ARGON2`]), and no type derives `Serialize` or `Deserialize` (D.4a T17, T29).
 //!
 //! The scan reads syntax trees (`syn`), not text, so neither a comment nor
 //! a string can hide or fake a hit, and nothing depends on where an item
@@ -2747,5 +2751,237 @@ mod insecure_kdf {
         assert_eq!(edges("desktop/ipc/Cargo.toml", m), 1);
         let other = "[features]\nwalk = [\"apprafter-core/insecure-fast-kdf\"]\n";
         assert_eq!(edges("desktop/src-tauri/Cargo.toml", other), 1);
+    }
+}
+
+// ---------------------------------------------------------------------
+// The vault's code rules (D.4a T17, T29; crypto brief §10, §13 mutant 2)
+// ---------------------------------------------------------------------
+
+/// Names under `src/vault/` that hold key material or what it is compared with. An `==` or
+/// `!=` with one of them in an operand compares a secret in variable time: the vault compares
+/// them with `subtle::ConstantTimeEq::ct_eq`.
+const VAULT_SECRET_NAMES: &[&str] = &[
+    "key_check",
+    "kek",
+    "data_key",
+    "material",
+    "expose",
+    "key_bytes",
+];
+
+/// argon2's methods that bring their own working memory and free it unzeroed (argon2 0.6.0,
+/// `src/block.rs:190-200`): the vault calls `hash_password_into_with_memory` with a
+/// `Zeroizing` buffer instead.
+const UNZEROED_ARGON2: &[&str] = &[
+    "hash_password_into",
+    "hash_password",
+    "hash_password_customized",
+];
+
+/// The vault's constant-time comparisons today: a slot's key check (seal.rs), and the recovery
+/// key's canonical-text check and confirmation (recovery.rs). Fewer means one became `==`
+/// under a name this guard does not list.
+const VAULT_CT_EQ_MIN: usize = 3;
+
+#[derive(Default)]
+struct VaultRules {
+    file: String,
+    findings: Vec<String>,
+    ct_eq: usize,
+}
+
+impl VaultRules {
+    fn hit(&mut self, span: Span, what: &str) {
+        self.findings
+            .push(format!("{}:{}: {what}", self.file, line_of(span)));
+    }
+}
+
+/// Whether `e` names one of [`VAULT_SECRET_NAMES`] anywhere: a variable, a field, a method.
+fn names_vault_secret(e: &Expr) -> bool {
+    struct Find(bool);
+    impl<'a> Visit<'a> for Find {
+        fn visit_ident(&mut self, i: &'a proc_macro2::Ident) {
+            if VAULT_SECRET_NAMES.contains(&i.to_string().as_str()) {
+                self.0 = true;
+            }
+        }
+    }
+    let mut find = Find(false);
+    find.visit_expr(e);
+    find.0
+}
+
+impl<'ast> Visit<'ast> for VaultRules {
+    fn visit_item(&mut self, item: &'ast Item) {
+        if !cfg_implies_test(item_attrs(item)) {
+            visit::visit_item(self, item);
+        }
+    }
+
+    fn visit_impl_item(&mut self, item: &'ast ImplItem) {
+        if !cfg_implies_test(impl_item_attrs(item)) {
+            visit::visit_impl_item(self, item);
+        }
+    }
+
+    fn visit_expr_binary(&mut self, e: &'ast syn::ExprBinary) {
+        if matches!(e.op, syn::BinOp::Eq(_) | syn::BinOp::Ne(_))
+            && (names_vault_secret(&e.left) || names_vault_secret(&e.right))
+        {
+            let span = match &e.op {
+                syn::BinOp::Eq(t) => t.spans[0],
+                syn::BinOp::Ne(t) => t.spans[0],
+                _ => unreachable!("matched Eq or Ne above"),
+            };
+            self.hit(
+                span,
+                "`==` / `!=` on key material: compare with `ConstantTimeEq::ct_eq`",
+            );
+        }
+        visit::visit_expr_binary(self, e);
+    }
+
+    fn visit_expr_method_call(&mut self, m: &'ast syn::ExprMethodCall) {
+        let name = m.method.to_string();
+        if name == "ct_eq" {
+            self.ct_eq += 1;
+        }
+        if UNZEROED_ARGON2.contains(&name.as_str()) {
+            self.hit(
+                m.method.span(),
+                &format!("argon2's `{name}` frees its working memory unzeroed"),
+            );
+        }
+        visit::visit_expr_method_call(self, m);
+    }
+
+    fn visit_attribute(&mut self, a: &'ast Attribute) {
+        if a.path().is_ident("derive") {
+            if let Meta::List(list) = &a.meta {
+                let derives = list.tokens.to_string();
+                if derives.contains("Serialize") || derives.contains("Deserialize") {
+                    self.hit(
+                        a.pound_token.spans[0],
+                        "a vault type derives Serialize or Deserialize",
+                    );
+                }
+            }
+        }
+        visit::visit_attribute(self, a);
+    }
+}
+
+/// The findings and the `ct_eq` count of one source file of `src/vault/`.
+fn vault_rules_source(file: &str, src: &str) -> (Vec<String>, usize) {
+    let parsed = syn::parse_file(src).unwrap_or_else(|e| panic!("parse {file}: {e}"));
+    let mut rules = VaultRules {
+        file: file.to_string(),
+        ..VaultRules::default()
+    };
+    rules.visit_file(&parsed);
+    (rules.findings, rules.ct_eq)
+}
+
+/// The production files of `src/vault/`: every `.rs` but those of a `#[cfg(test)] mod x;` in
+/// `vault/mod.rs`.
+fn vault_production_files(dir: &Path) -> Vec<PathBuf> {
+    let mod_rs = fs::read_to_string(dir.join("mod.rs")).expect("vault/mod.rs");
+    let parsed = syn::parse_file(&mod_rs).expect("vault/mod.rs parses");
+    let test_only: HashSet<String> = parsed
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Mod(m) if m.content.is_none() && cfg_implies_test(&m.attrs) => {
+                Some(format!("{}.rs", m.ident))
+            }
+            _ => None,
+        })
+        .collect();
+    rust_files(dir)
+        .into_iter()
+        .filter(|p| {
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            !test_only.contains(name)
+        })
+        .collect()
+}
+
+#[test]
+fn the_vault_compares_secrets_in_constant_time_and_zeroes_argon2_memory() {
+    let dir = crate_dir("apprafter-core").join("src").join("vault");
+    let files = vault_production_files(&dir);
+    assert!(
+        files.iter().any(|p| p.ends_with("seal.rs")),
+        "no seal.rs among {files:?}"
+    );
+    let mut findings = Vec::new();
+    let mut ct_eq = 0;
+    for path in &files {
+        let rel = path.strip_prefix(cli_dir()).unwrap().display().to_string();
+        let (hits, count) = vault_rules_source(&rel, &fs::read_to_string(path).unwrap());
+        findings.extend(hits);
+        ct_eq += count;
+    }
+    assert!(
+        findings.is_empty(),
+        "the vault's code rules (D.4a T17, T29):\n{}",
+        findings.join("\n")
+    );
+    assert!(
+        ct_eq >= VAULT_CT_EQ_MIN,
+        "the vault makes {ct_eq} constant-time comparisons, at least {VAULT_CT_EQ_MIN} expected: \
+         did one become `==`?"
+    );
+}
+
+mod vault_rules {
+    use super::*;
+
+    fn rules(src: &str) -> (Vec<String>, usize) {
+        vault_rules_source("vault/x.rs", src)
+    }
+
+    #[test]
+    fn a_secret_compared_with_eq_is_found_and_ct_eq_is_counted() {
+        let (hits, ct_eq) = rules(
+            "\
+fn a(keys: &SlotKeys, stored: &[u8; 32]) -> bool { keys.key_check[..] == stored[..] }
+fn b(dk: &DataKey, other: &[u8; 32]) -> bool { dk.expose() != other }
+fn c(keys: &SlotKeys, stored: &[u8; 32]) -> bool { bool::from(keys.key_check[..].ct_eq(&stored[..])) }
+fn d(n: usize) -> bool { n == 0 }
+",
+        );
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert!(hits[0].starts_with("vault/x.rs:1:"), "{hits:?}");
+        assert!(hits[1].starts_with("vault/x.rs:2:"), "{hits:?}");
+        assert_eq!(ct_eq, 1);
+    }
+
+    #[test]
+    fn argon2s_allocating_calls_and_a_serialize_derive_are_found() {
+        let (hits, _) = rules(
+            "\
+fn f(argon: &Argon2) { argon.hash_password_into(b\"p\", b\"saltsalt\", &mut [0; 32]).unwrap(); }
+#[derive(Debug, serde::Serialize)]
+struct S;
+",
+        );
+        assert_eq!(hits.len(), 2, "{hits:?}");
+    }
+
+    #[test]
+    fn test_code_is_not_held_to_them() {
+        let (hits, ct_eq) = rules(
+            "\
+#[cfg(test)]
+mod tests {
+    fn t(kek: [u8; 32]) { assert!(kek == [0; 32]); let _ = kek[..].ct_eq(&[0; 32]); }
+}
+",
+        );
+        assert!(hits.is_empty(), "{hits:?}");
+        assert_eq!(ct_eq, 0);
     }
 }

@@ -44,3 +44,15 @@ pub(crate) fn vector_path(rel: &str) -> PathBuf {
         .join("v1")
         .join(rel)
 }
+
+/// A payload plaintext built by hand, entries in the order given.
+pub(crate) fn tlv(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut out = (entries.len() as u16).to_le_bytes().to_vec();
+    for (key, value) in entries {
+        out.push(key.len() as u8);
+        out.extend_from_slice(key.as_bytes());
+        out.extend_from_slice(&(value.len() as u16).to_le_bytes());
+        out.extend_from_slice(value);
+    }
+    out
+}

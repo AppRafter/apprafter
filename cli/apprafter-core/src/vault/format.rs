@@ -349,8 +349,6 @@ fn encode_slot(slot: &SlotRecord, out: &mut Vec<u8>) -> VaultResult<()> {
 /// A parsed vault, **not** authenticated: the header to show, and the payload to open.
 pub struct VaultFile {
     header: VaultHeader,
-    // d4a-c1 Task 7 removes this `allow`: seal.rs's `VaultFile::open` reads it.
-    #[allow(dead_code)]
     pub(super) payload_aad: Vec<u8>,
     pub(super) payload_nonce: [u8; NONCE_LEN],
     pub(super) payload_ct: Vec<u8>,

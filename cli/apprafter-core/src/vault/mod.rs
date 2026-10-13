@@ -22,9 +22,12 @@
 mod error;
 mod format;
 mod kdf;
+mod keys;
 mod password;
+mod payload;
 mod recovery;
 mod rng;
+mod seal;
 
 #[cfg(test)]
 mod kat;
@@ -42,13 +45,19 @@ pub use format::{
     MAGIC, PAYLOAD_MAX, SLOT_AAD_DOMAIN, SLOT_MAX, STORE_ID_MAX, VAULT_FILE_MAX, WRITER_MAX,
 };
 pub use kdf::{Argon2idParams, KdfPolicy};
+pub use keys::{DataKey, SlotInput, SlotSecret};
 pub use password::{
     check_new_password, AcceptedPassword, MAX_PASSWORD_BYTES, RECOMMENDED_PASSWORD_CHARS,
+};
+pub use payload::{
+    EntryKey, VaultPayload, DEFAULT_UNLOCK_TIMEOUT_MIN, ENTRY_MAX, KEY_MAX, MAX_UNLOCK_TIMEOUT_MIN,
+    VALUE_MAX,
 };
 pub use recovery::{looks_like_recovery_key, ConfirmedRecoveryKey, RecoveryKey, RECOVERY_KEY_HRP};
 #[cfg(any(test, feature = "test-support"))]
 pub use rng::ScriptedRandom;
 pub use rng::{OsRandom, VaultRng};
+pub use seal::{create, NewSlot, UnlockedVault};
 
 /// The vault's file name in a target store's root.
 pub const VAULT_FILE: &str = "vault";
