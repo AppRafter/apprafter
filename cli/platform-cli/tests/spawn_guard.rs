@@ -200,6 +200,28 @@ const ALLOWED: &[(&str, &str, Rule)] = &[
         "run_at_a_terminal",
         Rule::AtTerminal,
     ),
+    // The fence's own rows: a removed HOME, a removed store variable, no fence at all (it
+    // changes nothing unless set), and roots the fence must refuse.
+    (
+        "platform-cli/tests/sandbox_test.rs",
+        "a_removed_home_is_refused",
+        Rule::RemovesFence,
+    ),
+    (
+        "platform-cli/tests/sandbox_test.rs",
+        "an_xdg_config_home_outside_is_refused",
+        Rule::RemovesFence,
+    ),
+    (
+        "platform-cli/tests/sandbox_test.rs",
+        "without_the_variable_nothing_is_fenced",
+        Rule::RemovesFence,
+    ),
+    (
+        "platform-cli/tests/sandbox_test.rs",
+        "a_root_that_is_relative_or_missing_is_refused",
+        Rule::SetsFence,
+    ),
 ];
 
 /// One rule broken at one line.

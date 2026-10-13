@@ -17,6 +17,7 @@ mod context;
 mod dispatch;
 pub(crate) mod examples;
 mod render;
+mod sandbox;
 mod startup;
 
 use clap::{CommandFactory, FromArgMatches};
@@ -104,6 +105,10 @@ pub fn run() -> Result<()> {
         Ok(args) => args,
         Err(error) => error.format(&mut command).exit(),
     };
+
+    // APPRAFTER_SANDBOX (tests, e2e walks, automated agents): refuse a location outside it
+    // before anything reads or writes the store, the startup checks included. Inert unless set.
+    sandbox::enforce(&context::ProcessEnv)?;
 
     // The newer-release notice and the node-disk banner, both of which reach
     // outside this machine. Only now, after parsing: `--help`, `--version`

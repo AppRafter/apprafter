@@ -153,6 +153,7 @@ undocumented feature.
 | `APPRAFTER_CILIUM_IPV4_ONLY` | Disables Cilium IPv6 during bootstrap. For the k3d e2e, whose ULA IPv6 does not route; production Tier 1 is dual-stack per [ADR 0017](../adr/0017-ipv6-dual-stack.md). |
 | `APPRAFTER_BOOTSTRAP_SKIP_CILIUM` | Leaves the cluster's existing CNI alone during bootstrap. k3d-e2e only. |
 | `APPRAFTER_HCLOUD_E2E`, `APPRAFTER_K8S_SMOKE`, `APPRAFTER_E2E_*` | Gates for `#[ignore]`d integration tests and for `e2e/*.sh`. Read by the test harness, never by the shipped binary. |
+| `APPRAFTER_SANDBOX` | One or more directories, separated as in `PATH`. When it is set, even to an empty value, every command refuses to run — after its arguments are parsed, before it reads or writes anything — if the target store, the home directory (Linux and macOS), the age key, the SSH identity or the runtime directory resolves outside all of them (`apprafter::sandbox::escape`), or if one of the directories is not an existing absolute path (`apprafter::sandbox::bad_root`). It only refuses; it never moves a location. The test suite, the end-to-end walks and automated agents set it, so that a forgotten variable cannot reach a real target store. Read in `platform-cli/src/sandbox.rs` (`enforce`). |
 
 The `APPRAFTER_BACKUP_*` variables are also not CLI surface: they
 configure the separate in-cluster `apprafter-backup` runner through its
