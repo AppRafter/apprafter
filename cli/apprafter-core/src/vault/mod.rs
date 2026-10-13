@@ -26,6 +26,8 @@ mod kdf;
 #[cfg(test)]
 mod kat;
 #[cfg(test)]
+mod test_alloc;
+#[cfg(test)]
 mod testutil;
 
 pub use error::{
@@ -36,7 +38,7 @@ pub use format::{
     SlotBody, SlotId, SlotKind, SlotRecord, VaultFile, VaultHeader, VaultId, FORMAT_V1, LABEL_MAX,
     MAGIC, PAYLOAD_MAX, SLOT_AAD_DOMAIN, SLOT_MAX, STORE_ID_MAX, VAULT_FILE_MAX, WRITER_MAX,
 };
-pub use kdf::Argon2idParams;
+pub use kdf::{Argon2idParams, KdfPolicy};
 
 /// The vault's file name in a target store's root.
 pub const VAULT_FILE: &str = "vault";

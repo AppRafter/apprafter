@@ -20,6 +20,11 @@ ts = ["dep:ts-rs"]
 # CoreError renderer). Enabled only by platform-cli's [dev-dependencies]: under resolver 2 a
 # dev-dependency's features never reach the shipped binary.
 test-support = []
+# Tests and walks only (D.4a T23): `vault::KdfPolicy::active()` becomes the policy whose
+# Argon2id parameters a release build refuses. Nothing but [dev-dependencies] and the
+# desktop's `test-build` may turn it on (tests/guards.rs, L4); release-cli.yml checks the
+# shipped binary (L3, d4a-e).
+insecure-fast-kdf = []
 
 [dependencies]
 # `ureq` and `zeroize` are already in both locks (cli/ and desktop/) at the same versions, and

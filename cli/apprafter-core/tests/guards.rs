@@ -26,6 +26,10 @@
 //!    `apprafter-core/src` seals a cache to a recipient that is not a `CacheKey`'s ([`SEAL`]):
 //!    every token and cached secret goes through `Context::secrets()` (ADR 0068 §5; D.4a
 //!    T16). d4a-c extends both rules to `platform-cli` once its writers moved.
+//! 6. **Test-only key derivation stays in tests (L4).** No manifest under `cli/` or
+//!    `desktop/` turns on `apprafter-core/insecure-fast-kdf` outside `[dev-dependencies]`,
+//!    except the desktop's `test-build` ([`INSECURE_KDF_FORWARDERS`]), and none of the
+//!    core's own features pulls it in (D.4a T23).
 //!
 //! The scan reads syntax trees (`syn`), not text, so neither a comment nor
 //! a string can hide or fake a hit, and nothing depends on where an item
@@ -2529,5 +2533,219 @@ fn u() { let _ = Self::real_ctx(); let _ = other(); }
             ]
         );
         assert_eq!(uses(src, true), vec![row("t", true, "load_target")]);
+    }
+}
+
+// ---------------------------------------------------------------------
+// L4 (D.4a T23): the test-only key-derivation feature stays in tests
+// ---------------------------------------------------------------------
+
+/// The `apprafter-core` feature that makes `vault::KdfPolicy::active()` the test-only policy:
+/// Argon2id parameters a release build refuses.
+const INSECURE_KDF_FEATURE: &str = "insecure-fast-kdf";
+
+/// `(manifest, feature)` pairs allowed to forward it: the desktop's test build (d4a-g adds the
+/// edge; until then the entry names a feature that forwards nothing). Each entry must name a
+/// feature that exists.
+const INSECURE_KDF_FORWARDERS: &[(&str, &str)] = &[("desktop/src-tauri/Cargo.toml", "test-build")];
+
+/// Where a manifest turns `apprafter-core/insecure-fast-kdf` on outside `[dev-dependencies]`:
+/// a dependency edge on apprafter-core that lists it (in `[dependencies]`,
+/// `[build-dependencies]`, `[workspace.dependencies]` or a target table; renamed or not), a
+/// feature that forwards it (other than [`INSECURE_KDF_FORWARDERS`]), or — in apprafter-core's
+/// own manifest — another feature, `default` included, that pulls it in.
+fn insecure_kdf_edges(file: &str, manifest: &str) -> Vec<String> {
+    let doc: toml::Value = manifest
+        .parse()
+        .unwrap_or_else(|e| panic!("{file} does not parse: {e}"));
+    let is_core = doc
+        .get("package")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())
+        == Some("apprafter-core");
+    let mut tables: Vec<(String, &toml::Value)> = Vec::new();
+    for key in ["dependencies", "build-dependencies"] {
+        if let Some(table) = doc.get(key) {
+            tables.push((key.to_string(), table));
+        }
+    }
+    if let Some(table) = doc.get("workspace").and_then(|w| w.get("dependencies")) {
+        tables.push(("workspace.dependencies".to_string(), table));
+    }
+    if let Some(targets) = doc.get("target").and_then(|t| t.as_table()) {
+        for (cfg, target) in targets {
+            for key in ["dependencies", "build-dependencies"] {
+                if let Some(table) = target.get(key) {
+                    tables.push((format!("target.{cfg}.{key}"), table));
+                }
+            }
+        }
+    }
+    let mut hits = Vec::new();
+    for (place, table) in tables {
+        let Some(table) = table.as_table() else {
+            continue;
+        };
+        for (name, spec) in table {
+            let package = spec.get("package").and_then(|p| p.as_str()).unwrap_or(name);
+            let enables = spec
+                .get("features")
+                .and_then(|f| f.as_array())
+                .is_some_and(|list| {
+                    list.iter()
+                        .any(|f| f.as_str() == Some(INSECURE_KDF_FEATURE))
+                });
+            if package == "apprafter-core" && enables {
+                hits.push(format!(
+                    "{file}: [{place}] `{name}` enables {INSECURE_KDF_FEATURE}"
+                ));
+            }
+        }
+    }
+    if let Some(features) = doc.get("features").and_then(|f| f.as_table()) {
+        let forwarded = [
+            format!("apprafter-core/{INSECURE_KDF_FEATURE}"),
+            format!("apprafter-core?/{INSECURE_KDF_FEATURE}"),
+        ];
+        for (feature, list) in features {
+            let forwards = list.as_array().into_iter().flatten().any(|item| {
+                let item = item.as_str().unwrap_or_default();
+                forwarded.iter().any(|f| f == item) || (is_core && item == INSECURE_KDF_FEATURE)
+            });
+            let allowed = INSECURE_KDF_FORWARDERS
+                .iter()
+                .any(|(f, feat)| *f == file && *feat == feature.as_str());
+            if forwards && !allowed {
+                hits.push(format!(
+                    "{file}: feature `{feature}` enables {INSECURE_KDF_FEATURE}"
+                ));
+            }
+        }
+    }
+    hits
+}
+
+/// Every `Cargo.toml` under `dir`, build output, `node_modules` and dot-directories left out.
+fn manifests_under(dir: &Path, out: &mut Vec<PathBuf>) {
+    for entry in fs::read_dir(dir).unwrap_or_else(|e| panic!("read {dir:?}: {e}")) {
+        let path = entry.unwrap().path();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        if path.is_dir() {
+            if !(name == "target" || name == "node_modules" || name.starts_with('.')) {
+                manifests_under(&path, out);
+            }
+        } else if name == "Cargo.toml" {
+            out.push(path);
+        }
+    }
+}
+
+#[test]
+fn only_the_desktop_test_build_may_turn_on_the_insecure_kdf() {
+    let repo = cli_dir()
+        .parent()
+        .expect("cli/ sits in the repository")
+        .to_path_buf();
+    let mut manifests = Vec::new();
+    for dir in ["cli", "desktop"] {
+        manifests_under(&repo.join(dir), &mut manifests);
+    }
+    manifests.sort();
+    assert!(
+        manifests.len() >= 13,
+        "found only {} manifests under cli/ and desktop/: {manifests:?}",
+        manifests.len()
+    );
+    let mut hits = Vec::new();
+    for path in &manifests {
+        let rel = path
+            .strip_prefix(&repo)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        let text = fs::read_to_string(path).unwrap_or_else(|e| panic!("read {rel}: {e}"));
+        hits.extend(insecure_kdf_edges(&rel, &text));
+    }
+    assert!(
+        hits.is_empty(),
+        "the test-only key derivation must never reach a shipped build (D.4a T23, L4):\n{}",
+        hits.join("\n")
+    );
+    let core: toml::Value = fs::read_to_string(crate_dir("apprafter-core").join("Cargo.toml"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        core.get("features")
+            .and_then(|f| f.get(INSECURE_KDF_FEATURE))
+            .is_some(),
+        "apprafter-core declares no `{INSECURE_KDF_FEATURE}` feature: this guard would see nothing"
+    );
+    for (file, feature) in INSECURE_KDF_FORWARDERS {
+        let doc: toml::Value = fs::read_to_string(repo.join(file))
+            .unwrap_or_else(|e| panic!("read {file}: {e}"))
+            .parse()
+            .unwrap();
+        assert!(
+            doc.get("features").and_then(|f| f.get(*feature)).is_some(),
+            "{file} has no feature `{feature}`: a stale allow-list entry"
+        );
+    }
+}
+
+mod insecure_kdf {
+    use super::*;
+
+    fn edges(file: &str, manifest: &str) -> usize {
+        insecure_kdf_edges(file, manifest).len()
+    }
+
+    #[test]
+    fn a_dev_dependency_may_enable_it() {
+        let m = "[dev-dependencies]\napprafter-core = { path = \"x\", features = [\"insecure-fast-kdf\"] }\n";
+        assert_eq!(edges("cli/x/Cargo.toml", m), 0);
+    }
+
+    #[test]
+    fn every_other_edge_is_refused() {
+        for m in [
+            "[dependencies]\napprafter-core = { path = \"x\", features = [\"insecure-fast-kdf\"] }\n",
+            "[build-dependencies]\napprafter-core = { path = \"x\", features = [\"insecure-fast-kdf\"] }\n",
+            "[dependencies]\ncore = { package = \"apprafter-core\", path = \"x\", features = [\"insecure-fast-kdf\"] }\n",
+            "[target.'cfg(unix)'.dependencies]\napprafter-core = { path = \"x\", features = [\"insecure-fast-kdf\"] }\n",
+            "[workspace.dependencies]\napprafter-core = { path = \"x\", features = [\"insecure-fast-kdf\"] }\n",
+            "[features]\nfast = [\"apprafter-core/insecure-fast-kdf\"]\n",
+            "[features]\nfast = [\"apprafter-core?/insecure-fast-kdf\"]\n",
+        ] {
+            assert_eq!(edges("cli/x/Cargo.toml", m), 1, "{m}");
+        }
+    }
+
+    #[test]
+    fn the_core_pulls_it_in_from_no_feature_of_its_own() {
+        let core = "[package]\nname = \"apprafter-core\"\n[features]\ninsecure-fast-kdf = []\n";
+        assert_eq!(edges("cli/apprafter-core/Cargo.toml", core), 0);
+        for extra in [
+            "default = [\"insecure-fast-kdf\"]\n",
+            "test-support = [\"insecure-fast-kdf\"]\n",
+        ] {
+            assert_eq!(
+                edges("cli/apprafter-core/Cargo.toml", &format!("{core}{extra}")),
+                1,
+                "{extra}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_desktop_test_build_may_forward_it() {
+        let m = "[features]\ntest-build = [\"apprafter-core/insecure-fast-kdf\"]\n";
+        assert_eq!(edges("desktop/src-tauri/Cargo.toml", m), 0);
+        assert_eq!(edges("desktop/ipc/Cargo.toml", m), 1);
+        let other = "[features]\nwalk = [\"apprafter-core/insecure-fast-kdf\"]\n";
+        assert_eq!(edges("desktop/src-tauri/Cargo.toml", other), 1);
     }
 }
