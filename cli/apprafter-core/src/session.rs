@@ -6,7 +6,8 @@ use serde::Serialize;
 
 use crate::context::Context;
 use crate::error::{CoreError, CoreResult};
-use crate::provider::Verification;
+use crate::provider::{SkipReason, Verification};
+use crate::secrets::OpenToken;
 use crate::ssh::SshKeyInfo;
 use crate::CancellationToken;
 
@@ -87,8 +88,24 @@ pub fn whoami(ctx: &Context, cancel: &CancellationToken) -> CoreResult<WhoamiRep
             }
             Err(e) => return Err(e),
         };
-    let token = ctx.secrets().stored_token(&name)?;
-    let verification = crate::provider::verification(ctx, &config.provider, token.as_ref(), cancel);
+    let verification = if ctx.no_ping() {
+        // No ping, no token: what is stored is read as `target show` reads it, and no vault is
+        // opened for a value nobody uses (D.4a T66, T-lazy-3).
+        ctx.secrets().token_presence(&name)?;
+        Verification::Skipped {
+            reason: SkipReason::NoPing,
+        }
+    } else {
+        match ctx.secrets().open_token(&name)? {
+            OpenToken::Token(token) => {
+                crate::provider::verification(ctx, &config.provider, token.as_ref(), cancel)
+            }
+            // T66: a diagnostic never asks; nothing open here holds the store's key.
+            OpenToken::Locked => Verification::Skipped {
+                reason: SkipReason::StoreLocked,
+            },
+        }
+    };
     // `verification` reads a cancelled ping as `Unreachable`; its caller ends the read here.
     cancel.check()?;
     Ok(WhoamiReport {
@@ -162,6 +179,54 @@ mod tests {
             matches!(pinged.cli_default, CliDefaultTarget::Found { ref target }
             if matches!(target.verification, Verification::Verified { .. }))
         );
+        ok.assert();
+    }
+
+    /// T66: on a locked store whoami never asks. A ping reads the token only through a session
+    /// already open (here a key this process holds), else it is skipped as `StoreLocked`;
+    /// without a ping no session is asked for at all.
+    #[test]
+    fn a_locked_store_is_pinged_only_through_an_open_session() {
+        let mut s = mockito::Server::new();
+        let ok = route(&mut s, "/v1/locations", 200, LOCATIONS, TOKEN_A)
+            .expect(1)
+            .create();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("store");
+        let locked = crate::secrets::testing::locked_store(&root, &[("prod", Some(TOKEN_A))]);
+        cli_core::save_global_config(
+            &cli_core::TargetStorePaths::for_root(root.clone()),
+            &cli_core::GlobalConfig {
+                active_target: "prod".into(),
+                version: cli_core::TARGET_STORE_VERSION,
+            },
+        )
+        .unwrap();
+        let ctx = Context::for_desktop(root, s.url());
+        let c = CancellationToken::new();
+        let verification = |ctx: &Context| match whoami(ctx, &c).unwrap().cli_default {
+            CliDefaultTarget::Found { target } => target.verification,
+            other => panic!("{other:?}"),
+        };
+        let closed = ctx
+            .clone()
+            .with_vault_access(std::sync::Arc::new(crate::secrets::testing::NeverAsks));
+        assert_eq!(
+            verification(&closed),
+            Verification::Skipped {
+                reason: SkipReason::StoreLocked
+            }
+        );
+        assert_eq!(
+            verification(&closed.with_no_ping(true)),
+            Verification::Skipped {
+                reason: SkipReason::NoPing
+            }
+        );
+        assert!(matches!(
+            verification(&ctx.with_vault_access(locked.access())),
+            Verification::Verified { .. }
+        ));
         ok.assert();
     }
 

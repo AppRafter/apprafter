@@ -41,6 +41,17 @@ pub trait VaultAccess: Send + Sync + fmt::Debug {
     /// (d4a-d).
     fn session(&self, req: &VaultRequest<'_>) -> cli_core::Result<Arc<dyn VaultSession>>;
 
+    /// A read session only when one is open without asking — a terminal's unlock window, a key
+    /// this process holds — never a prompt (D.4a T66: diagnostics never ask). `Ok(None)`:
+    /// nothing is open, and the caller reports the store as locked.
+    fn open_session(
+        &self,
+        req: &VaultRequest<'_>,
+    ) -> cli_core::Result<Option<Arc<dyn VaultSession>>> {
+        let _ = req;
+        Ok(None)
+    }
+
     /// The key a vault write uses, never a holder's (T41): the CLI's from a prompt in this
     /// process, the desktop's while it is unlocked.
     fn write_key(&self, req: &VaultRequest<'_>) -> cli_core::Result<KeySession>;
@@ -251,7 +262,109 @@ impl VaultAccess for FixedVaultAccess {
         Ok(Arc::new(self.key_session(req.store_root)))
     }
 
+    fn open_session(
+        &self,
+        req: &VaultRequest<'_>,
+    ) -> cli_core::Result<Option<Arc<dyn VaultSession>>> {
+        self.session(req).map(Some)
+    }
+
     fn write_key(&self, req: &VaultRequest<'_>) -> cli_core::Result<KeySession> {
         Ok(self.key_session(req.store_root))
+    }
+}
+
+/// A client's access as a diagnostic uses it (D.4a T66): a locked store opens only through a
+/// session the client already has open — a terminal's unlock window, a key the app holds —
+/// and every other read is `store_locked`, never a prompt; a vault write through it is always
+/// refused. It holds nothing of its own. A read it serves through a terminal's window is a
+/// served item like any other, and restarts the window (T56): a diagnostic's ping uses the
+/// window, as T66 allows, and keeps it open as any command's read does — nothing here makes
+/// a read that does not count.
+#[derive(Debug, Clone)]
+pub struct DiagnosticAccess(Arc<dyn VaultAccess>);
+
+impl DiagnosticAccess {
+    /// `inner`, asked only for what it has open.
+    pub fn over(inner: Arc<dyn VaultAccess>) -> Self {
+        DiagnosticAccess(inner)
+    }
+}
+
+impl VaultAccess for DiagnosticAccess {
+    fn session(&self, req: &VaultRequest<'_>) -> cli_core::Result<Arc<dyn VaultSession>> {
+        self.0
+            .open_session(req)?
+            .ok_or_else(|| store_locked(req.store_root))
+    }
+
+    fn write_key(&self, req: &VaultRequest<'_>) -> cli_core::Result<KeySession> {
+        Err(store_locked(req.store_root))
+    }
+
+    fn open_session(
+        &self,
+        req: &VaultRequest<'_>,
+    ) -> cli_core::Result<Option<Arc<dyn VaultSession>>> {
+        self.0.open_session(req)
+    }
+
+    fn writer(&self) -> String {
+        self.0.writer()
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+    use crate::context::Context;
+    use crate::secrets::testing::{locked_store, NeverAsks};
+    use crate::secrets::OpenToken;
+
+    const TOKEN: &str = "abababababababababababababababababababababababababababababababab";
+
+    fn over(dir: &Path, inner: Arc<dyn VaultAccess>) -> Context {
+        Context::for_desktop(dir.to_path_buf(), "http://127.0.0.1:1")
+            .with_vault_access(Arc::new(DiagnosticAccess::over(inner)))
+    }
+
+    /// T66: over a client with nothing open, a read is `store_locked`, the never-asking read
+    /// (`open_token`, `whoami`'s) is `Locked`, and a write key is refused — and the client is
+    /// never asked for a session or a write key (`NeverAsks` panics if it is).
+    #[test]
+    fn with_nothing_open_a_read_is_store_locked_and_the_client_is_never_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        locked_store(dir.path(), &[("prod", Some(TOKEN))]);
+        let s = over(dir.path(), Arc::new(NeverAsks)).secrets();
+        assert!(matches!(s.open_token("prod").unwrap(), OpenToken::Locked));
+        assert!(matches!(
+            s.stored_token("prod"),
+            Err(CliError::StoreLocked { .. })
+        ));
+        assert!(matches!(
+            s.cache_key("prod"),
+            Err(CliError::StoreLocked { .. })
+        ));
+        assert!(matches!(
+            s.prepare_write(),
+            Err(CliError::StoreLocked { .. })
+        ));
+    }
+
+    /// T66: over a client with a session open, a read goes through it; a write never does.
+    #[test]
+    fn an_open_session_serves_reads_and_never_a_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let locked = locked_store(dir.path(), &[("prod", Some(TOKEN))]);
+        let s = over(dir.path(), locked.access()).secrets();
+        assert!(matches!(
+            s.open_token("prod").unwrap(),
+            OpenToken::Token(Some(_))
+        ));
+        assert_eq!(s.stored_token("prod").unwrap().unwrap().expose(), TOKEN);
+        assert!(matches!(
+            s.prepare_write(),
+            Err(CliError::StoreLocked { .. })
+        ));
     }
 }

@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! How a locked target store opens in the CLI (D.4a T41, T46, T61, T62; §3.4): `CliVaultAccess`,
-//! the `VaultAccess` every CLI context carries (`crate::context`). There is no unlock window yet
-//! (d4a-e adds the terminal's holder): every command that needs a locked store's secrets asks
-//! for the lock password or the recovery key at its controlling terminal — once.
+//! the `VaultAccess` every CLI context carries (`crate::context`). A read on a locked store is
+//! served by this terminal's unlock window when one is open (`crate::holder_window`, hook A at
+//! the top of `session`; never in a process that prompted or holds a key, rule 9); otherwise the
+//! command asks for the lock password or the recovery key at its controlling terminal — once —
+//! and its answer opens this terminal's window (hook B in `Inner::key_for`, D.4a T56).
 //!
 //! - **Where it asks.** Only at the controlling terminal (`crate::prompt`); anywhere else a
 //!   locked store is `store_locked{no_terminal}`. The prompt names the store, its targets, the
@@ -36,7 +38,8 @@ use crate::prompt::{Asker, PromptError, Terminal};
 /// How many wrong secrets one prompt takes (sudo's `passwd_tries`).
 pub(crate) const ATTEMPTS: u32 = 3;
 
-/// The inline prompt's question (surface C28; no window in d4a-d: the next command asks again).
+/// The inline prompt's question where its answer opens no window (surface C28: the next command
+/// asks again); `holder_window::inline_prompt` asks C28's other form when it will.
 pub(crate) const INLINE_PROMPT: &str =
     "Lock password or recovery key (asked again by the next command): ";
 
@@ -218,6 +221,20 @@ impl CliVaultAccess {
         let _ = self.inner.command.set(path.to_string());
     }
 
+    /// D4: this process's own read session for `req`'s store — d's `CliSession`: each item
+    /// from this command's kept items, else through this process's key, which may prompt
+    /// once (`Inner::key_for`). Never a holder (rule 9).
+    pub(crate) fn own_session(
+        &self,
+        req: &VaultRequest<'_>,
+    ) -> cli_core::Result<Arc<dyn VaultSession>> {
+        Ok(Arc::new(CliSession {
+            inner: self.inner.clone(),
+            root: req.store_root.to_path_buf(),
+            id: req.store_id.clone(),
+        }))
+    }
+
     /// Tests: whether the data key the last prompt opened is still alive anywhere — in the
     /// slot, or in a clone something kept.
     #[cfg(test)]
@@ -258,9 +275,16 @@ impl Inner {
             root,
             id,
             &self.intro(root),
-            INLINE_PROMPT,
+            &crate::holder_window::inline_prompt(root, INLINE_PROMPT),
             self.policy,
         )?;
+        crate::holder_window::after_prompt(
+            root,
+            id,
+            &opened.key,
+            opened.vault_id,
+            opened.unlock_timeout_min,
+        );
         #[cfg(test)]
         {
             *self.last_key.lock().unwrap_or_else(PoisonError::into_inner) =
@@ -327,11 +351,21 @@ impl fmt::Debug for Inner {
 
 impl VaultAccess for CliVaultAccess {
     fn session(&self, req: &VaultRequest<'_>) -> cli_core::Result<Arc<dyn VaultSession>> {
-        Ok(Arc::new(CliSession {
-            inner: self.inner.clone(),
-            root: req.store_root.to_path_buf(),
-            id: req.store_id.clone(),
-        }))
+        // D.4a T48, rule 9: a process that holds a key of its own never asks a holder.
+        if self.inner.current(req.store_root).is_none() {
+            if let Some(window) = crate::holder_window::window_session(req) {
+                return Ok(window);
+            }
+        }
+        self.own_session(req)
+    }
+
+    /// T66: a diagnostic's read — this terminal's window with no own path, never a prompt.
+    fn open_session(
+        &self,
+        req: &VaultRequest<'_>,
+    ) -> cli_core::Result<Option<Arc<dyn VaultSession>>> {
+        Ok(crate::holder_window::diagnostic_session(req))
     }
 
     fn write_key(&self, req: &VaultRequest<'_>) -> cli_core::Result<KeySession> {

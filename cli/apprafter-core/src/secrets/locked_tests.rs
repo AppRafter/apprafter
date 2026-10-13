@@ -1662,3 +1662,109 @@ fn a_key_session_for_a_store_refuses_another_stores_vault() {
         other => panic!("{other:?}"),
     }
 }
+
+/// T66: `open_token` never asks. With nothing open a locked store's token is `Locked`; through
+/// an open session (a key this process holds) it is the token; a target without one is
+/// `None` either way; a store in files reads as `stored_token` does.
+#[test]
+fn open_token_never_asks_and_reads_through_an_open_session_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let locked = locked_store(dir.path(), &[("prod", Some(TOKEN_A)), ("staging", None)]);
+    let ctx = |access: Arc<dyn VaultAccess>| {
+        Context::for_desktop(dir.path().to_path_buf(), "http://127.0.0.1:1")
+            .with_vault_access(access)
+    };
+    let closed = ctx(Arc::new(super::testing::NeverAsks)).secrets();
+    assert!(matches!(
+        closed.open_token("prod").unwrap(),
+        OpenToken::Locked
+    ));
+    assert!(matches!(
+        closed.open_token("staging").unwrap(),
+        OpenToken::Token(None)
+    ));
+    let open = ctx(locked.access()).secrets();
+    match open.open_token("prod").unwrap() {
+        OpenToken::Token(Some(t)) => assert_eq!(t.expose(), TOKEN_A),
+        other => panic!("{other:?}"),
+    }
+    let (_files, files) = store(&["prod"], None);
+    match files.secrets().open_token("prod").unwrap() {
+        OpenToken::Token(Some(t)) => assert_eq!(t.expose(), TOKEN_A),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// T66, T-lazy-2 (critic-d4a-e findings 5, 23): `open_token` reads the vault before it asks
+/// the client anything — a missing vault fails with no question asked — and a session that
+/// falls closed under it (a terminal's window that ended between its probe and the item) is
+/// `Locked`, never a prompt and never an error.
+#[test]
+fn open_token_reads_the_vault_first_and_a_window_that_closes_is_locked() {
+    #[derive(Debug)]
+    struct Closes;
+    impl VaultSession for Closes {
+        fn hetzner_token(
+            &self,
+            _: &[u8],
+            _: &str,
+        ) -> cli_core::Result<Option<crate::SecretString>> {
+            Err(CliError::StoreLocked {
+                store: "/closed".into(),
+                reason: LockedWhy::NoTerminal,
+                stopped_before: None,
+            })
+        }
+        fn open_cache(
+            &self,
+            _: &[u8],
+            _: CachedSecret,
+            _: &str,
+            _: &str,
+        ) -> cli_core::Result<crate::Zeroizing<String>> {
+            unreachable!("open_token opens no cache")
+        }
+        fn recipient(&self, _: &[u8]) -> cli_core::Result<cli_core::secrets::Recipient> {
+            unreachable!("open_token reads no recipient")
+        }
+    }
+    /// `open_session` answers `Closes` when `.0`, and must not be asked at all otherwise.
+    #[derive(Debug)]
+    struct Window(bool);
+    impl VaultAccess for Window {
+        fn session(&self, _: &VaultRequest<'_>) -> cli_core::Result<Arc<dyn VaultSession>> {
+            panic!("a diagnostic asked for the vault's key (D.4a T66)")
+        }
+        fn write_key(&self, _: &VaultRequest<'_>) -> cli_core::Result<KeySession> {
+            panic!("a diagnostic asked for a write key (D.4a T66)")
+        }
+        fn open_session(
+            &self,
+            _: &VaultRequest<'_>,
+        ) -> cli_core::Result<Option<Arc<dyn VaultSession>>> {
+            assert!(
+                self.0,
+                "the client was asked before the vault was read (T-lazy-2)"
+            );
+            Ok(Some(Arc::new(Closes)))
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let _locked = locked_store(dir.path(), &[("prod", Some(TOKEN_A))]);
+    let ctx = |w: Window| {
+        Context::for_desktop(dir.path().to_path_buf(), "http://127.0.0.1:1")
+            .with_vault_access(Arc::new(w))
+    };
+    assert!(matches!(
+        ctx(Window(true)).secrets().open_token("prod").unwrap(),
+        OpenToken::Locked
+    ));
+    std::fs::remove_file(dir.path().join(VAULT_FILE)).unwrap();
+    match ctx(Window(false)).secrets().open_token("prod") {
+        Err(CliError::VaultUnreadable {
+            problem: VaultProblem::Missing,
+            ..
+        }) => {}
+        other => panic!("{other:?}"),
+    }
+}

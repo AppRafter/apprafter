@@ -12,7 +12,7 @@ use cli_core::secrets::{Identity, Recipient};
 use cli_core::target::{TargetConfig, TargetStorePaths};
 use cli_core::StoreLock;
 
-use super::access::{FixedVaultAccess, VaultAccess};
+use super::access::{FixedVaultAccess, KeySession, VaultAccess, VaultRequest, VaultSession};
 use super::files::under_temp;
 use super::locked::{vault_path, VAULT_WRITER};
 use super::marker::write_marker;
@@ -168,5 +168,21 @@ impl VaultAccess for CountingAccess {
     ) -> cli_core::Result<super::access::KeySession> {
         self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Err(super::store_locked(req.store_root))
+    }
+}
+
+/// A client that must never be asked (D.4a T66): `session` and `write_key` would prompt in the
+/// CLI, so a diagnostic that reaches either panics here; nothing is open (`open_session`'s
+/// default).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NeverAsks;
+
+impl VaultAccess for NeverAsks {
+    fn session(&self, _: &VaultRequest<'_>) -> cli_core::Result<Arc<dyn VaultSession>> {
+        panic!("a diagnostic asked for the vault's key (D.4a T66)")
+    }
+
+    fn write_key(&self, _: &VaultRequest<'_>) -> cli_core::Result<KeySession> {
+        panic!("a diagnostic asked for a write key (D.4a T66)")
     }
 }

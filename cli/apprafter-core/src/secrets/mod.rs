@@ -52,7 +52,9 @@ pub(crate) mod transfer;
 
 #[cfg(any(test, feature = "test-support"))]
 pub use access::FixedVaultAccess;
-pub use access::{KeySession, NoVaultAccess, VaultAccess, VaultRequest, VaultSession};
+pub use access::{
+    DiagnosticAccess, KeySession, NoVaultAccess, VaultAccess, VaultRequest, VaultSession,
+};
 pub use files::{Held, Holding};
 pub use store_file::{
     read_store_file, write_store_file, LockSlotKind, SlotInfo, StoreFile, StoreId, STORE_FILE,
@@ -128,6 +130,15 @@ pub enum StoredToken {
     OutsideVault,
     /// A marker for another store's vault: the target's directory came from it (T34).
     InAnotherVault { id: StoreId },
+}
+
+/// What a diagnostic gets for a target's token without asking for it (D.4a T66).
+#[derive(Debug)]
+pub enum OpenToken {
+    /// The token, or `None` when none is stored.
+    Token(Option<SecretString>),
+    /// The store is locked, and nothing open here holds its key.
+    Locked,
 }
 
 /// The key a target's cached secrets are read with, and new ones sealed to (D.4a T26): the
@@ -449,6 +460,47 @@ impl SecretStore {
                             target: target.to_string(),
                             store: self.store.root().to_path_buf(),
                         }),
+                    }
+                }
+                locked::Placed::Clear => Err(CliError::TokenOutsideVault {
+                    target: target.to_string(),
+                    path: self.credentials_file(target),
+                }),
+                locked::Placed::Other(id) => Err(CliError::TokenInAnotherVault {
+                    target: target.to_string(),
+                    id: id.to_string(),
+                }),
+            },
+            StoreState::Incomplete(phase) => Err(self.incomplete(phase)),
+        }
+    }
+
+    /// `target`'s stored token if it can be had without asking (D.4a T66): in files as
+    /// [`SecretStore::stored_token`] reads it; on a locked store the vault is read first (as
+    /// `stored_token` and `session()` do, T-lazy-2), then the token only through a session
+    /// already open — a terminal's window, a key this process holds — else
+    /// [`OpenToken::Locked`]; a session that falls closed under it (`store_locked`: the window
+    /// ended, refused or fell silent between its probe and the item) is `Locked` too. The same
+    /// refusals as `stored_token` for a clear token, another store's marker and an unfinished
+    /// lock. Never a prompt.
+    pub fn open_token(&self, target: &str) -> cli_core::Result<OpenToken> {
+        match self.state()? {
+            StoreState::Files => files::stored_token(&self.store, target).map(OpenToken::Token),
+            StoreState::Locked { file, id } => match locked::placed(&self.store, &id, target)? {
+                locked::Placed::Absent => Ok(OpenToken::Token(None)),
+                locked::Placed::Own => {
+                    let vault = locked::read_vault(&self.store, &id)?;
+                    let Some(session) = self.access.open_session(&self.request(&file, &id))? else {
+                        return Ok(OpenToken::Locked);
+                    };
+                    match session.hetzner_token(&vault, target) {
+                        Ok(Some(token)) => Ok(OpenToken::Token(Some(token))),
+                        Ok(None) => Err(CliError::TokenMissingFromVault {
+                            target: target.to_string(),
+                            store: self.store.root().to_path_buf(),
+                        }),
+                        Err(CliError::StoreLocked { .. }) => Ok(OpenToken::Locked),
+                        Err(e) => Err(e),
                     }
                 }
                 locked::Placed::Clear => Err(CliError::TokenOutsideVault {

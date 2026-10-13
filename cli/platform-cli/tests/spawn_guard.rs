@@ -320,6 +320,13 @@ const ALLOWED: &[(&str, &str, Rule)] = &[
         "lock_status_at_a_terminal_asks_nothing",
         Rule::AtTerminal,
     ),
+    // The window's tests: each terminal is a session of its own at a pseudo-terminal (D.4a
+    // T52, G6).
+    (
+        "platform-cli/tests/lock_window_test.rs",
+        "start",
+        Rule::InSession,
+    ),
 ];
 
 /// One rule broken at one line.

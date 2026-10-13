@@ -21,8 +21,8 @@ use apprafter_core::vault::{
     ConfirmedRecoveryKey, KdfPolicy, OsRandom, RecoveryKey, DEFAULT_UNLOCK_TIMEOUT_MIN,
 };
 use apprafter_core::{
-    CancellationToken, ChangeAction, Context, CoreError, Event, Plan, PlannedChange, Reporter,
-    SecretString, Zeroizing,
+    CancellationToken, ChangeAction, Context, CoreError, CoreResult, Event, Plan, PlannedChange,
+    Reporter, SecretString, Zeroizing,
 };
 use cli_core::{CliError, LockPhase, LockedWhy};
 
@@ -203,6 +203,12 @@ fn off(asker: &dyn Asker) -> miette::Result<()> {
         ),
         _ => None,
     };
+    // D.4a T56: this terminal's window ends before the vault goes, so no holder of it keeps
+    // serving a copy of the vault (critic-d4a-e finding 14); one that does not answer and could
+    // not be ended is named, and never stops `lock off` (rule 1).
+    if let Some(said) = off_window_said(holder_window::end_window(&ctx)) {
+        eprintln!("{said}");
+    }
     eprintln!("Unlocking...");
     let done = completed(
         lock::execute_off(&ctx, plan, opened, &Progress, &CancellationToken::new())
@@ -210,6 +216,36 @@ fn off(asker: &dyn Asker) -> miette::Result<()> {
     )?;
     print!("{}", off_result(&done, &shown));
     Ok(())
+}
+
+/// What `lock off` says of this terminal's window, ended before the vault goes (D.4a T56): that
+/// it closed; or, rule 1, that its holder does not answer and could not be ended — the store
+/// goes back to files while that holder keeps the store's key until it is stopped. Never a
+/// reason to stop `lock off`: a holder that hung must not keep a person from leaving the lock.
+fn off_window_said(ended: CoreResult<holder_window::Ended>) -> Option<String> {
+    use holder_window::Ended;
+    match ended {
+        Ok(Ended::Closed | Ended::Stopped) => {
+            Some("The unlock window in this terminal is closed.".to_string())
+        }
+        Ok(Ended::StillOpen { pid: Some(pid) }) => {
+            let stop = if cfg!(windows) {
+                format!("taskkill /F /PID {pid}")
+            } else {
+                format!("kill -9 {pid}")
+            };
+            Some(format!(
+                "The unlock window in this terminal could not be ended: its holder (pid {pid}) \
+                 does not answer, and keeps this store's key until it is stopped (`{stop}`)."
+            ))
+        }
+        Ok(Ended::StillOpen { pid: None }) => Some(
+            "The unlock window in this terminal could not be ended: its holder (an `apprafter` \
+             process) does not answer, and keeps this store's key until it is stopped."
+                .to_string(),
+        ),
+        Ok(Ended::None) | Err(_) => None,
+    }
 }
 
 /// The new lock password (O2; surface C10–C13 as §3.11 amends them): asked, refused only when
@@ -1448,7 +1484,9 @@ mod status_render_tests {
 
 #[cfg(test)]
 mod now_tests {
-    use super::now_said;
+    use apprafter_core::CoreError;
+
+    use super::{now_said, off_window_said};
     use crate::holder_window::Ended;
 
     /// T65, T59, rule 1: `lock now` says what came of the window, and a holder it could not end
@@ -1471,5 +1509,29 @@ mod now_tests {
         );
         assert!(e.help.contains("4242"), "{}", e.help);
         assert!(now_said(Ended::StillOpen { pid: None }).is_err());
+    }
+
+    /// T56, rule 1: `lock off` says it ended this terminal's window, and names a holder
+    /// it could not end — the store goes back to files while that holder keeps the key until it
+    /// is stopped — and never stops for it (`off_window_said` only says).
+    #[test]
+    fn lock_off_names_a_window_it_could_not_end() {
+        let closed = Some("The unlock window in this terminal is closed.".to_string());
+        assert_eq!(off_window_said(Ok(Ended::Closed)), closed);
+        assert_eq!(off_window_said(Ok(Ended::Stopped)), closed);
+        assert_eq!(off_window_said(Ok(Ended::None)), None);
+        assert_eq!(off_window_said(Err(CoreError::NoActiveTarget)), None);
+        let said = off_window_said(Ok(Ended::StillOpen { pid: Some(4242) })).unwrap();
+        let stop = if cfg!(windows) {
+            "`taskkill /F /PID 4242`"
+        } else {
+            "`kill -9 4242`"
+        };
+        assert!(
+            said.contains("could not be ended") && said.contains("pid 4242") && said.contains(stop),
+            "{said}"
+        );
+        let said = off_window_said(Ok(Ended::StillOpen { pid: None })).unwrap();
+        assert!(said.contains("could not be ended"), "{said}");
     }
 }

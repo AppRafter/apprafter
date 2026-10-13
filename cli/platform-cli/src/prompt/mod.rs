@@ -48,6 +48,8 @@ impl Asker for Terminal {
     }
 
     fn ask(&self, prompt: &str) -> Result<SecretString, PromptError> {
+        // D.4a T57: not dumpable from before a secret is typed until this process exits.
+        crate::holder_window::harden_for_secrets();
         secret::Tty::open()?.read_secret(&printable(prompt), PROMPT_TIMEOUT)
     }
 
