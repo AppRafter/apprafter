@@ -142,7 +142,9 @@ mod unix_common {
     /// reached it — costs at most `limit`, never a command blocked for good: Linux answers such
     /// a connect `EAGAIN`, tried again every 10 ms until `limit`; macOS turns it away
     /// (`ECONNREFUSED`, as when no one listens). An `EINPROGRESS`, which neither gives for a
-    /// local socket, is waited for in `poll`. Past `limit`: `TimedOut`.
+    /// local socket, is waited for in `poll`. Past `limit`: `TimedOut`. `limit` also bounds every
+    /// read and write of the connection until the caller narrows it, set before the connect:
+    /// once the peer has closed, macOS refuses every socket option (`client::Timed`).
     pub(crate) fn connect_within(path: &Path, limit: Duration) -> io::Result<UnixStream> {
         let until = super::current::clock_with_sleep() + limit;
         let left = || {
@@ -155,9 +157,13 @@ mod unix_common {
         };
         let fd = local_socket()?;
         let (addr, len) = socket_address(path)?;
+        let conn = UnixStream::from(fd);
+        conn.set_read_timeout(Some(limit))?;
+        conn.set_write_timeout(Some(limit))?;
+        let fd = conn.as_raw_fd();
         loop {
             // SAFETY: the socket above and an address of `len` bytes.
-            if unsafe { libc::connect(fd.as_raw_fd(), (&raw const addr).cast(), len) } == 0 {
+            if unsafe { libc::connect(fd, (&raw const addr).cast(), len) } == 0 {
                 break;
             }
             let e = io::Error::last_os_error();
@@ -170,7 +176,7 @@ mod unix_common {
                         .unwrap_or(i32::MAX)
                         .max(1);
                     let mut p = libc::pollfd {
-                        fd: fd.as_raw_fd(),
+                        fd,
                         events: libc::POLLOUT,
                         revents: 0,
                     };
@@ -189,7 +195,7 @@ mod unix_common {
                             // SAFETY: SO_ERROR writes one int.
                             let rc = unsafe {
                                 libc::getsockopt(
-                                    fd.as_raw_fd(),
+                                    fd,
                                     libc::SOL_SOCKET,
                                     libc::SO_ERROR,
                                     (&raw mut err).cast(),
@@ -209,7 +215,6 @@ mod unix_common {
                 _ => return Err(e),
             }
         }
-        let conn = UnixStream::from(fd);
         conn.set_nonblocking(false)?;
         Ok(conn)
     }
@@ -336,6 +341,23 @@ mod tests {
     /// terminal for as long as the parent waits. macOS's `proc_pidinfo` answers nothing for a
     /// process that exited (XNU marks it dead before it is a zombie; only a call that asks for
     /// zombies finds it), so there the start alone already says gone.
+    /// T59: every read and write of a client's connection is bounded by its step from the
+    /// moment it is connected — set before the connect, since macOS refuses socket options once
+    /// the peer has closed, which a holder that answers at once may have done before the client
+    /// narrows its bound (`client::Timed`).
+    #[test]
+    fn a_connection_carries_its_step_bound_from_its_connect() {
+        let dir = tempfile::TempDir::new_in("/tmp").unwrap();
+        let path = dir.path().join("s.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let conn = super::connect_within(&path, Duration::from_millis(1500)).unwrap();
+        let step = Some(Duration::from_millis(1500));
+        assert_eq!(
+            (conn.read_timeout().unwrap(), conn.write_timeout().unwrap()),
+            (step, step)
+        );
+    }
+
     #[test]
     fn the_polling_look_counts_an_exited_unreaped_leader_gone() {
         let mut child = Command::new("/bin/sh")

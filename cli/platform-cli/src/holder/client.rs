@@ -69,12 +69,25 @@ impl Timed<'_> {
         }
         Ok(left.min(IO_TIMEOUT))
     }
+
+    /// Bound the next read or write by what is left of its step and of the request (`set`:
+    /// `set_read_timeout` or `set_write_timeout`). macOS refuses every socket option once the
+    /// socket is shut down both ways (`EINVAL`: XNU's `sosetoptlock`), which a holder that has
+    /// answered and closed leaves it in — before this client read the reply, or even sent its
+    /// request. Nothing blocks on such a socket, and the step's bound set before the connect
+    /// (`os::connect_within`) stays on it: the call goes on and reads what is there.
+    fn bound(&self, set: fn(&UnixStream, Option<Duration>) -> io::Result<()>) -> io::Result<()> {
+        match set(self.conn, Some(self.left()?)) {
+            Err(e) if e.kind() != io::ErrorKind::InvalidInput => Err(e),
+            _ => Ok(()),
+        }
+    }
 }
 
 #[cfg(unix)]
 impl Read for Timed<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.conn.set_read_timeout(Some(self.left()?))?;
+        self.bound(UnixStream::set_read_timeout)?;
         (&*self.conn).read(buf)
     }
 }
@@ -82,7 +95,7 @@ impl Read for Timed<'_> {
 #[cfg(unix)]
 impl Write for Timed<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.conn.set_write_timeout(Some(self.left()?))?;
+        self.bound(UnixStream::set_write_timeout)?;
         (&*self.conn).write(buf)
     }
     fn flush(&mut self) -> io::Result<()> {
@@ -353,4 +366,72 @@ fn open_pipe(name: &str, deadline: Duration) -> Option<super::os::windows::Handl
         return None;
     }
     None
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::unix::net::{UnixListener, UnixStream};
+
+    use super::*;
+    use crate::holder::protocol::write_reply;
+
+    /// macOS refuses every socket option once a socket is shut down both ways (`EINVAL`: XNU's
+    /// `sosetoptlock`), which a holder that has answered and closed leaves it in. Such a refusal
+    /// is no failure of the request — the reply is still there to read, and nothing blocks on
+    /// that socket — while any other refusal, and a request past its 5 s, still is.
+    #[test]
+    fn a_bound_the_os_refuses_on_a_shut_down_socket_is_no_failure() {
+        let (a, _b) = UnixStream::pair().unwrap();
+        let t = Timed {
+            conn: &a,
+            deadline: SystemClock.with_sleep() + OVERALL,
+        };
+        assert!(t
+            .bound(|_, _| Err(io::ErrorKind::InvalidInput.into()))
+            .is_ok());
+        assert_eq!(
+            t.bound(|_, _| Err(io::ErrorKind::PermissionDenied.into()))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        let spent = Timed {
+            conn: &a,
+            deadline: Duration::ZERO,
+        };
+        assert_eq!(
+            spent.bound(|_, _| Ok(())).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+    }
+
+    /// T53, T59 (found on macos-latest): a holder answers at once and closes — a refusal comes
+    /// before a byte of the request is read — and its reply is read, though the connection was
+    /// closed before the client asked anything. macOS then refuses the client's per-step bound;
+    /// the reply must still be read, as on Linux.
+    #[test]
+    fn a_reply_left_by_a_holder_that_already_closed_is_read() {
+        let dir = tempfile::TempDir::new_in("/tmp").unwrap();
+        let path = dir.path().join("h.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            write_reply(&mut s, &Reply::Refused(Refusal::NotThisTerminal)).unwrap();
+        });
+        let endpoint = Endpoint::Socket {
+            path,
+            lock: std::path::PathBuf::new(),
+        };
+        let mut client = HolderClient::at(&endpoint).expect("a client of the listener");
+        server.join().unwrap();
+        assert!(
+            client.closed_within(Duration::from_secs(2)),
+            "the fake holder closed its end"
+        );
+        let got = client.status();
+        assert!(
+            matches!(got, Err(HolderError::Refused(Refusal::NotThisTerminal))),
+            "{got:?}"
+        );
+    }
 }
