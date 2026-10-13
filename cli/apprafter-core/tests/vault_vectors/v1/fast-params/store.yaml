@@ -1,0 +1,9 @@
+format: 1
+secrets: locked
+id: 0123456789abcdef
+slots:
+  - kind: password
+    label: lock password
+  - kind: recovery_key
+    label: recovery key
+unlock_timeout_min: 15

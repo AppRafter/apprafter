@@ -32,9 +32,13 @@ mod seal;
 #[cfg(test)]
 mod kat;
 #[cfg(test)]
+mod tamper;
+#[cfg(test)]
 mod test_alloc;
 #[cfg(test)]
 mod testutil;
+#[cfg(test)]
+mod vectors;
 
 pub use error::{
     InputWhat, MalformedWhat, PasswordProblem, PayloadWhat, RecoveryKeyError, SizeWhat, VaultError,
