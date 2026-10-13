@@ -961,8 +961,20 @@ mod tests {
     fn default_config_root_points_at_user_config_dir_under_apprafter() {
         // Sanity guard: we never accidentally rebase the store on
         // some unrelated dir. Only assert that the leaf segment is
-        // `apprafter/` because the parent depends on host XDG.
-        let p = default_config_root().expect("dirs::config_dir should work in test env");
+        // `apprafter/` because the parent depends on host XDG. The
+        // override is cleared for the call, under the crate-wide test
+        // mutex: a sibling test sets it (the race windows-latest met),
+        // and so may the environment the tests run in.
+        let _guard = crate::TEST_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var(CONFIG_DIR_ENV).ok();
+        std::env::remove_var(CONFIG_DIR_ENV);
+        let resolved = default_config_root();
+        if let Some(v) = prior {
+            std::env::set_var(CONFIG_DIR_ENV, v);
+        }
+        let p = resolved.expect("dirs::config_dir should work in test env");
         assert_eq!(
             p.file_name().and_then(|s| s.to_str()),
             Some("apprafter"),
