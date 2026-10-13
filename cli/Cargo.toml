@@ -122,3 +122,12 @@ futures              = "0.3"
 lto         = "thin"
 codegen-units = 1
 strip       = "symbols"
+
+# The vault's Argon2id (D.4a T17): debug builds — every test — run the 256 MiB release
+# derivation optimised, about a second instead of tens of seconds. Profiles are
+# workspace-root only; desktop/Cargo.toml carries the same two tables.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3

@@ -35,6 +35,21 @@ thiserror     = { workspace = true }
 ts-rs         = { version = "12.0", optional = true, features = ["serde-json-impl"] }
 ureq          = { workspace = true }
 zeroize       = "1.9"
+# The vault (ADR 0068; D.4a T17). Only argon2 0.6.0 and the blake2 0.11.0 it hashes with are
+# new to both locks; the rest is already in both through age 0.12 or tempfile 3.27. argon2's
+# default features (password-hash, getrandom) stay off: the vault calls the raw hash, into a
+# working memory of its own (`vault/kdf.rs`). chacha20poly1305 0.10 and hkdf 0.12 are age's
+# generation and move with it; the known-answer tests and the frozen v1 vectors make that
+# move a checked change. Not used: `secrecy` (the core's `SecretString` is the one wrapper),
+# `rand`, a CBOR crate, argon2's `parallel`.
+age              = { workspace = true }
+argon2           = { version = "0.6", default-features = false, features = ["alloc", "zeroize"] }
+bech32           = "0.11"
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+getrandom        = "0.4"
+hkdf             = "0.12"
+sha2             = { workspace = true }
+subtle           = "2.6"
 
 [target.'cfg(unix)'.dependencies]
 # `process::run_bounded`: `setsid` before exec, and SIGKILL to the child's whole process group
