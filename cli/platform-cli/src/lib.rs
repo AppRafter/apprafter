@@ -16,6 +16,7 @@ pub(crate) mod commands;
 mod context;
 mod dispatch;
 pub(crate) mod examples;
+mod legacy_token;
 mod render;
 mod sandbox;
 mod startup;

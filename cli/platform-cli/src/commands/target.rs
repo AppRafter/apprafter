@@ -388,11 +388,12 @@ fn run_wizard_into_args(ctx: &Context, args: &mut AddArgs) -> CoreResult<()> {
             args.name = Some(n);
         }
         // Both of the target's files, as before: a missing target is the raw `TargetNotFound`,
-        // an unreadable one its file's error.
-        let existing = cli_core::load_target(&ctx.store(), args.name.as_deref().unwrap())?;
+        // an unreadable one its file's error — the token record through the core's secret
+        // store, never the token.
+        let existing = core_target::readable_config(ctx, args.name.as_deref().unwrap())?;
         if renew_wizard_asks(args.typed) {
             let (token, _verified) =
-                target_wizard::run_renew_wizard(ctx, &existing.config.provider, args.no_ping)?;
+                target_wizard::run_renew_wizard(ctx, &existing.provider, args.no_ping)?;
             args.token = Some(token);
         }
     } else {
@@ -461,8 +462,16 @@ pub(crate) fn map_wizard_prompt_error(err: inquire::InquireError) -> CliError {
 /// key from `APPRAFTER_SSH_PUBLIC_KEY_PATH` is applied only beside a new token.
 fn renew(ctx: &Context, args: AddArgs, name: &str) -> miette::Result<()> {
     let tref = TargetRef::named(ctx, name).map_err(renew_missing)?;
-    let stored = cli_core::load_target(&ctx.store(), name).map_err(|e| renew_missing(e.into()))?;
-    let provider = stored.config.provider;
+    // Both of the target's files, as `load_renewable` read them: the config, then the stored
+    // token through the core's secret store.
+    let provider = cli_core::target::load_target_config(&ctx.store(), name)
+        .map_err(|e| renew_missing(e.into()))?
+        .provider;
+    let stored_token = ctx
+        .secrets()
+        .stored_token(name)
+        .map_err(|e| renew_missing(e.into()))?;
+    let stored_token = stored_token.as_ref().map(SecretString::expose);
     // `--renew` deliberately ignores the config flags; refusing them up front beats silently
     // dropping a value the operator passed.
     reject_config_flags_on_renew(
@@ -478,7 +487,7 @@ fn renew(ctx: &Context, args: AddArgs, name: &str) -> miette::Result<()> {
     let unused_env_token = match renew_token(args.typed) {
         RenewToken::KeyOnly => token
             .take()
-            .filter(|env| stored.credentials.hetzner_token.as_ref() != Some(env)),
+            .filter(|env| stored_token != Some(env.as_str())),
         RenewToken::Typed | RenewToken::AskOrEnv => None,
     };
     if token.is_none() && renew_token(args.typed) != RenewToken::KeyOnly {
@@ -491,7 +500,7 @@ fn renew(ctx: &Context, args: AddArgs, name: &str) -> miette::Result<()> {
     // <new>` is key-only on purpose).
     let rotates = token
         .as_ref()
-        .is_some_and(|t| stored.credentials.hetzner_token.as_ref() != Some(t));
+        .is_some_and(|t| stored_token != Some(t.as_str()));
     let ssh_key = if args.typed.ssh_key || rotates {
         args.ssh_key
     } else {
@@ -2094,11 +2103,12 @@ pub(crate) fn use_target(name: &str) -> miette::Result<()> {
 }
 
 /// Today's `target machine` found the target with `load_target`, which reads both of its files: a
-/// target whose `config.yaml` or `credentials.yaml` cannot be read is refused as before. (The
-/// core's machine plan checks only that the target exists.) `use` gets the same refusal from the
-/// core's plan (WI-458 review #4), and `remove` takes such a target (WI-458).
+/// target whose `config.yaml` or `credentials.yaml` cannot be read is refused as before
+/// (`readable_config`; the token record through the core's secret store). The core's machine
+/// plan checks only that the target exists. `use` gets the same refusal from the core's plan
+/// (WI-458 review #4), and `remove` takes such a target (WI-458).
 pub(crate) fn require_loadable(ctx: &Context, name: &str) -> miette::Result<()> {
-    cli_core::load_target(&ctx.store(), name)
+    core_target::readable_config(ctx, name)
         .map(drop)
         .map_err(miette::Report::new)
 }

@@ -1,32 +1,16 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
-//! Credential resolution chain (cli-dx-task.md §7).
+//! The SSH public key a provisioning command sends (cli-dx-task.md §7):
+//! `APPRAFTER_SSH_PUBLIC_KEY` (the key body inline), else the key file the
+//! target's `config.yaml` names (`--target`, else the active target).
 //!
-//! Operational commands (`apprafter apply` / `destroy` / `import`
-//! / ...) need a Hetzner Cloud API token + (sometimes) an SSH
-//! public key. There are three places those values can come from,
-//! in priority order:
-//!
-//!   1. **CLI flag** — `--token <X>` / future `--ssh-key <path>`
-//!      flags. Highest priority: an operator typing the flag is
-//!      explicit about what they want for this one invocation.
-//!   2. **Env var** — `HCLOUD_TOKEN` / `APPRAFTER_SSH_PUBLIC_KEY`
-//!      (legacy). The pre-target-store workflow; preserved for CI
-//!      pipelines that already export these.
-//!   3. **Active target's credentials.yaml** — the post-target-
-//!      store path. Picks up the value the wizard or
-//!      `apprafter target add` wrote into
-//!      `~/.config/apprafter/targets/<active>/credentials.yaml`.
-//!      Honours `--target <name>` override.
-//!
-//! Resolution failure is a typed `CliError::Other` with a hint
-//! listing every path the user could take to fix it — no silent
-//! fallback to a placeholder. Future Track A.10 swaps the
-//! free-form messages for miette-shaped diagnostics; the
-//! resolver signatures stay the same.
+//! The Hetzner token is not resolved here any more: every command reads it
+//! through the shared core (`apprafter_core::target::hetzner_token`, through
+//! its secret store; D.4a b). `HCLOUD_TOKEN_ENV` stays the one name clap's
+//! `#[arg(env)]` annotations and the core's `Context` read.
 
 use std::path::Path;
 
-use crate::target::{load_global_config, load_target, load_target_config, TargetStorePaths};
+use crate::target::{load_global_config, load_target_config, TargetStorePaths};
 use crate::{CliError, Result};
 
 /// Env-var name clap uses for the Hetzner Cloud API token on the
@@ -39,55 +23,6 @@ pub const HCLOUD_TOKEN_ENV: &str = "HCLOUD_TOKEN";
 /// inline. Pre-target-store CI scripts export the literal `ssh-
 /// ed25519 AAAA…` string under this name.
 pub const SSH_PUBLIC_KEY_ENV: &str = "APPRAFTER_SSH_PUBLIC_KEY";
-
-/// Resolve the Hetzner Cloud API token through the §7 chain.
-///
-/// `cli_flag`: highest-priority override (e.g., future `--token`
-/// flag). Pass `None` when the command doesn't expose such a
-/// flag yet.
-///
-/// `paths`: target-store locator. Production callers build it
-/// from `default_config_root()?`; tests redirect via
-/// `APPRAFTER_CONFIG_DIR`.
-///
-/// `target_override`: per-invocation `--target <name>` override.
-/// `None` falls back to the active target.
-///
-/// Returns the resolved token string on success. When no token is
-/// found anywhere, the `CliError::Other` payload enumerates every
-/// path the user can take next (flag / env / `apprafter target
-/// add`); a target the store does not have is
-/// `CliError::TargetNotFound`.
-pub fn resolve_hetzner_token(
-    cli_flag: Option<&str>,
-    paths: &TargetStorePaths,
-    target_override: Option<&str>,
-) -> Result<String> {
-    if let Some(t) = cli_flag {
-        if !t.is_empty() {
-            return Ok(t.to_string());
-        }
-    }
-    if let Ok(t) = std::env::var(HCLOUD_TOKEN_ENV) {
-        if !t.is_empty() {
-            return Ok(t);
-        }
-    }
-    let Some(name) = resolve_target_name(paths, target_override)? else {
-        return Err(CliError::Other(format!(
-            "no Hetzner Cloud token available. Either pass `--token <X>`, set `{HCLOUD_TOKEN_ENV}` env var, or run `apprafter target add` to configure an active target."
-        )));
-    };
-    match load_target(paths, &name) {
-        Ok(t) => t.credentials.hetzner_token.ok_or_else(|| {
-            CliError::Other(format!(
-                "target `{name}` has no Hetzner Cloud token stored. Run `apprafter target add {name} --renew --token <X>` to add one, or pass `--token`/`{HCLOUD_TOKEN_ENV}` for this invocation."
-            ))
-        }),
-        // `TargetNotFound` among them: it carries its own code and help.
-        Err(e) => Err(e),
-    }
-}
 
 /// Resolve the SSH public key BODY (the `ssh-ed25519 AAAA… me@`
 /// string Hetzner expects) through the §7 chain.
@@ -197,31 +132,6 @@ mod tests {
         (dir, paths)
     }
 
-    fn seed_target(paths: &TargetStorePaths, name: &str, token: Option<&str>) {
-        save_target(
-            paths,
-            &Target {
-                name: name.into(),
-                config: TargetConfig {
-                    provider: "hetzner-cloud".into(),
-                    ..Default::default()
-                },
-                credentials: TargetCredentials {
-                    hetzner_token: token.map(String::from),
-                },
-            },
-        )
-        .unwrap();
-        save_global_config(
-            paths,
-            &GlobalConfig {
-                active_target: name.into(),
-                version: 1,
-            },
-        )
-        .unwrap();
-    }
-
     fn with_clean_env<F: FnOnce()>(body: F) {
         // Serialise with the crate-wide test mutex so other
         // modules (`target::tests`) that flip the same env vars
@@ -250,140 +160,6 @@ mod tests {
         if let Err(e) = result {
             std::panic::resume_unwind(e);
         }
-    }
-
-    #[test]
-    fn resolve_token_cli_flag_wins_over_env_and_store() {
-        with_clean_env(|| {
-            let (_dir, paths) = make_paths();
-            seed_target(&paths, "default", Some("store-token-value"));
-            std::env::set_var(HCLOUD_TOKEN_ENV, "env-token-value");
-            let resolved = resolve_hetzner_token(Some("flag-token-value"), &paths, None).unwrap();
-            assert_eq!(resolved, "flag-token-value");
-            std::env::remove_var(HCLOUD_TOKEN_ENV);
-        });
-    }
-
-    #[test]
-    fn resolve_token_env_wins_over_target_store_when_no_flag() {
-        with_clean_env(|| {
-            let (_dir, paths) = make_paths();
-            seed_target(&paths, "default", Some("store-token-value"));
-            std::env::set_var(HCLOUD_TOKEN_ENV, "env-token-value");
-            let resolved = resolve_hetzner_token(None, &paths, None).unwrap();
-            assert_eq!(resolved, "env-token-value");
-            std::env::remove_var(HCLOUD_TOKEN_ENV);
-        });
-    }
-
-    #[test]
-    fn resolve_token_falls_back_to_target_store_when_flag_and_env_absent() {
-        with_clean_env(|| {
-            let (_dir, paths) = make_paths();
-            seed_target(&paths, "default", Some("store-token-value"));
-            let resolved = resolve_hetzner_token(None, &paths, None).unwrap();
-            assert_eq!(resolved, "store-token-value");
-        });
-    }
-
-    #[test]
-    fn resolve_token_target_override_picks_named_target_not_active() {
-        with_clean_env(|| {
-            let (_dir, paths) = make_paths();
-            // Save TWO targets; active is `primary`, but the
-            // override asks for `secondary`.
-            save_target(
-                &paths,
-                &Target {
-                    name: "primary".into(),
-                    config: TargetConfig {
-                        provider: "hetzner-cloud".into(),
-                        ..Default::default()
-                    },
-                    credentials: TargetCredentials {
-                        hetzner_token: Some("primary-token".into()),
-                    },
-                },
-            )
-            .unwrap();
-            save_target(
-                &paths,
-                &Target {
-                    name: "secondary".into(),
-                    config: TargetConfig {
-                        provider: "hetzner-cloud".into(),
-                        ..Default::default()
-                    },
-                    credentials: TargetCredentials {
-                        hetzner_token: Some("secondary-token".into()),
-                    },
-                },
-            )
-            .unwrap();
-            save_global_config(
-                &paths,
-                &GlobalConfig {
-                    active_target: "primary".into(),
-                    version: 1,
-                },
-            )
-            .unwrap();
-
-            let resolved = resolve_hetzner_token(None, &paths, Some("secondary")).unwrap();
-            assert_eq!(resolved, "secondary-token");
-        });
-    }
-
-    #[test]
-    fn resolve_token_errors_with_three_paths_hint_when_nothing_configured() {
-        with_clean_env(|| {
-            let (_dir, paths) = make_paths();
-            // No target, no env, no flag.
-            let err = resolve_hetzner_token(None, &paths, None).expect_err("must error");
-            match err {
-                CliError::Other(msg) => {
-                    assert!(msg.contains("--token"), "{msg}");
-                    assert!(msg.contains("HCLOUD_TOKEN"), "{msg}");
-                    assert!(msg.contains("apprafter target add"), "{msg}");
-                }
-                other => panic!("expected Other, got {other:?}"),
-            }
-        });
-    }
-
-    #[test]
-    fn resolve_token_errors_when_target_exists_but_no_token_stored() {
-        with_clean_env(|| {
-            let (_dir, paths) = make_paths();
-            // Target with no token (e.g., partially-configured
-            // dotfiles drop).
-            seed_target(&paths, "default", None);
-            let err = resolve_hetzner_token(None, &paths, None).expect_err("must error");
-            match err {
-                CliError::Other(msg) => {
-                    assert!(msg.contains("has no Hetzner Cloud token stored"), "{msg}");
-                    assert!(msg.contains("--renew"), "{msg}");
-                }
-                other => panic!("expected Other, got {other:?}"),
-            }
-        });
-    }
-
-    #[test]
-    fn resolve_token_with_override_for_missing_target_is_target_not_found() {
-        with_clean_env(|| {
-            let (_dir, paths) = make_paths();
-            seed_target(&paths, "default", Some("token"));
-            let err =
-                resolve_hetzner_token(None, &paths, Some("ghost")).expect_err("missing target");
-            match err {
-                CliError::TargetNotFound { name, available } => {
-                    assert_eq!(name, "ghost");
-                    assert_eq!(available, "default");
-                }
-                other => panic!("expected TargetNotFound, got {other:?}"),
-            }
-        });
     }
 
     #[test]

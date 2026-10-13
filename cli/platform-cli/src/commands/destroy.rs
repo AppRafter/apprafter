@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 use std::collections::BTreeMap;
 
-use cli_core::{resolve_hetzner_token, CliError, Result};
+use cli_core::{CliError, Result};
 use cli_providers::hetzner_cloud::{HetznerCloudClient, HetznerCloudProvider, ServerSpec};
 use cli_providers::Provider;
 use cli_state::State;
@@ -14,12 +14,9 @@ pub fn run(yes: bool, target_override: Option<&str>) -> Result<()> {
     info!(yes, target_override, "destroy invoked");
 
     // State now lives under `<config>/state/<active-target>/`
-    // (v0.1.154 migration). Resolve once and reuse the same
-    // `TargetStorePaths` handle for the credential resolution
-    // below, mirroring `apply` / `import`.
+    // (v0.1.154 migration).
     let resolved = resolve_state_paths(target_override)?;
     let paths = resolved.paths;
-    let target_store = resolved.store;
     let mut state = State::load_or_default(&paths)?;
 
     let provider_id = state.provider.clone();
@@ -43,8 +40,8 @@ pub fn run(yes: bool, target_override: Option<&str>) -> Result<()> {
         return Ok(());
     }
 
-    // Resolution chain (cli-dx-task.md §7).
-    let token = resolve_hetzner_token(None, &target_store, target_override)?;
+    // Resolution chain (cli-dx-task.md §7), through the core (D.4a b).
+    let token = crate::legacy_token::hetzner_token(target_override)?;
 
     if !yes {
         return Err(CliError::Other(

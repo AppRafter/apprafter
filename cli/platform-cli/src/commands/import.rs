@@ -6,7 +6,7 @@
 //! `commands::state_paths`).
 
 use cli_core::target::load_active_target_config;
-use cli_core::{resolve_hetzner_token, CliError, Result};
+use cli_core::{CliError, Result};
 use cli_providers::hetzner_cloud::{HetznerCloudClient, APPRAFTER_LABEL, APPRAFTER_LABEL_VALUE};
 use cli_state::{HetznerCloudState, State};
 use tracing::info;
@@ -56,8 +56,8 @@ pub fn run(force: bool, dry_run: bool, target_override: Option<&str>) -> Result<
         )));
     }
 
-    // Credential resolution chain (cli-dx-task.md §7).
-    let token = resolve_hetzner_token(None, &target_store, target_override)?;
+    // Credential resolution chain (cli-dx-task.md §7), through the core (D.4a b).
+    let token = crate::legacy_token::hetzner_token(target_override)?;
 
     if state.hetzner_cloud.is_some() && !force {
         return Err(CliError::Other(

@@ -341,7 +341,7 @@ pub(crate) fn apply_cloudflare_origin(
         state.cluster_name.as_deref(),
         config.cluster_name.as_deref(),
     );
-    let token = cli_core::resolve_hetzner_token(None, &store, target_override)?;
+    let token = crate::legacy_token::hetzner_token(target_override)?;
     let client = HetznerCloudClient::new(hcloud_base_url(), token);
 
     // 3. Find the live firewall (cached id, else list+label+name).

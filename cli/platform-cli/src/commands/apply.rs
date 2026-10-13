@@ -8,7 +8,7 @@ use cli_core::target::{
     load_active_target_config, load_target_config, save_target_config, TargetConfig,
     TargetStorePaths,
 };
-use cli_core::{resolve_hetzner_ssh_public_key, resolve_hetzner_token, CliError, Result};
+use cli_core::{resolve_hetzner_ssh_public_key, CliError, Result};
 use cli_providers::backfill::{backfill_from, classify_guard, BackfillOutcome, Guard};
 use cli_providers::hetzner_cloud::types::Server;
 use cli_providers::hetzner_cloud::{
@@ -101,12 +101,10 @@ pub fn run(target_override: Option<&str>, server_type_flag: Option<&str>) -> Res
         )));
     }
 
-    // Credential resolution chain (cli-dx-task.md §7): --token
-    // flag (none wired on apply yet) → HCLOUD_TOKEN env → active
-    // target's credentials.yaml. `--target` (when supplied)
-    // overrides the active-pointer step. Backwards-compat
-    // preserved — env-var-only workflows keep working.
-    let token = resolve_hetzner_token(None, &target_store, target_override)?;
+    // Credential resolution (cli-dx-task.md §7), through the core's
+    // secret store: HCLOUD_TOKEN, else the stored token of `--target`
+    // or the active target (`legacy_token`, D.4a b).
+    let token = crate::legacy_token::hetzner_token(target_override)?;
 
     // Optional manifest path. If APPRAFTER_MANIFEST is set, parse
     // and overlay onto the v0.1.4 defaults; otherwise keep the

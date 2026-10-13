@@ -227,8 +227,8 @@ impl ForceBase {
         if !force || apprafter_core::target::validate_name(name).is_err() {
             return Ok(None);
         }
-        let config = match cli_core::load_target(&ctx.store(), name) {
-            Ok(t) => t.config,
+        let config = match apprafter_core::target::readable_config(ctx, name) {
+            Ok(config) => config,
             Err(CliError::TargetNotFound { .. }) => return Ok(None),
             Err(e) => return Err(e.into()),
         };

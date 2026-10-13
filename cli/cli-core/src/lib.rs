@@ -20,8 +20,7 @@ pub mod timefmt;
 pub mod tools;
 
 pub use credentials::{
-    read_ssh_public_key_body, resolve_hetzner_ssh_public_key, resolve_hetzner_token,
-    HCLOUD_TOKEN_ENV, SSH_PUBLIC_KEY_ENV,
+    read_ssh_public_key_body, resolve_hetzner_ssh_public_key, HCLOUD_TOKEN_ENV, SSH_PUBLIC_KEY_ENV,
 };
 pub use error::{
     age_key_missing_help, CliError, ProvisionStop, ProvisionedBy, Result, SkuCheckFor,

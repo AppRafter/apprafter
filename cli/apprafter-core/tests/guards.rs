@@ -50,7 +50,7 @@ use syn::{Attribute, Expr, ImplItem, Item, Meta, Stmt, TraitItem, UseTree};
 /// Production env reads ([`Kind::EnvRead`] and [`Kind::Dirs`]) in
 /// [`RATCHETED_CRATES`]. Re-measure, with a per-crate and per-callee
 /// breakdown, with `cargo test -p apprafter-core --test guards -- --nocapture`.
-const ENV_READ_BASELINE: usize = 51;
+const ENV_READ_BASELINE: usize = 50;
 
 /// The crates the core builds on, and the CLI.
 const RATCHETED_CRATES: &[&str] = &["cli-core", "cli-state", "cli-providers", "platform-cli"];
@@ -109,9 +109,7 @@ const PRINT_MACROS: &[&str] = &["print", "println", "eprint", "eprintln", "dbg"]
 /// `PATH`- and `CUE_BIN`-reading, SSH-identity and legacy-state entries);
 /// every entry must name a real item ([`every_listed_callee_names_a_real_item`]).
 const FORBIDDEN_CALLEES: &[&str] = &[
-    // `HCLOUD_TOKEN` / `HETZNER_SSH_PUBLIC_KEY`, then the target store.
-    "cli_core::credentials::resolve_hetzner_token",
-    "cli_core::resolve_hetzner_token",
+    // `APPRAFTER_SSH_PUBLIC_KEY`, then the target store.
     "cli_core::credentials::resolve_hetzner_ssh_public_key",
     "cli_core::resolve_hetzner_ssh_public_key",
     // `APPRAFTER_CONFIG_DIR`, then `dirs`.
@@ -1262,6 +1260,10 @@ const REAL_ENV_BUILDERS: &[&[&str]] = &[
     &["AllowListEnv", "from_process"],
     &["ProcessEnv"],
     &["cli_context"],
+    // The CLI's context for a legacy arm, and the legacy token adapter that reads through it
+    // (D.4a b; d4a-d deletes both).
+    &["legacy_context"],
+    &["legacy_token", "hetzner_token"],
     &["desktop_context"],
 ];
 
@@ -1397,6 +1399,16 @@ const REAL_ENV_TESTS: &[(&str, &str)] = &[
     (
         "platform-cli/src/commands/target_wizard.rs",
         "the_token_source_compares_against_the_cli_override_not_the_process_env",
+    ),
+    // The legacy token adapter's `HCLOUD_TOKEN` override needs the CLI's builder: a MapEnv
+    // over a tempdir store and home; opens nothing.
+    (
+        "platform-cli/src/legacy_token.rs",
+        "hcloud_token_wins_before_any_target_is_looked_at",
+    ),
+    (
+        "platform-cli/src/legacy_token.rs",
+        "an_empty_hcloud_token_is_unset",
     ),
     // The Windows release gate: every per-user default resolves under the profile.
     (
@@ -2029,10 +2041,10 @@ fn f(p: *mut i8) {
     #[test]
     fn forbidden_callees_resolve_through_reexports_and_imports() {
         let src = "\
-use cli_core::resolve_hetzner_token as token;
+use cli_core::resolve_hetzner_ssh_public_key as key;
 use cli_providers::k8s::KubectlCli;
 fn f() {
-    let _ = token();
+    let _ = key();
     let _k = KubectlCli;
     let _h = cli_providers::k8s::helm::HelmCli::default();
     let _l: cli_providers::k8s::HelmCli = Default::default();
@@ -2044,7 +2056,7 @@ fn f() {
         assert_eq!(
             got,
             vec![
-                fc("cli_core::resolve_hetzner_token"),
+                fc("cli_core::resolve_hetzner_ssh_public_key"),
                 fc("cli_providers::k8s::KubectlCli"),
                 fc("cli_providers::k8s::helm::HelmCli"),
                 fc("cli_providers::k8s::HelmCli"),
@@ -2322,6 +2334,26 @@ fn t() {
                 row("t", false, "Context::from_cli_env"),
                 row("t", true, "secrets"),
                 row("t", true, "secrets"),
+            ]
+        );
+    }
+
+    /// D.4a b: the CLI's legacy context and the legacy token adapter build from the real
+    /// environment; the core's own `target::hetzner_token` does not (it takes a context).
+    #[test]
+    fn the_legacy_context_and_token_adapter_are_builders() {
+        let src = "\
+fn t() {
+    let _ = crate::legacy_token::hetzner_token(None);
+    let _ = crate::context::legacy_context();
+    let _ = apprafter_core::target::hetzner_token(&ctx, &target);
+}
+";
+        assert_eq!(
+            uses(src, true),
+            vec![
+                row("t", false, "legacy_token::hetzner_token"),
+                row("t", false, "legacy_context"),
             ]
         );
     }

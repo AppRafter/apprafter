@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! The CLI's `apprafter_core::Context`: its whole environment, read here and nowhere else in
-//! the core-backed arms (ADR 0067 §2).
+//! the core-backed arms (ADR 0067 §2). The core-backed arms build it with [`cli_context`]; an
+//! arm that still returns `cli_core::Result` (a legacy arm) with [`legacy_context`]. Both are
+//! one builder, so d4a-d gives both the CLI's vault access in one place.
 
 use std::ffi::OsString;
 
-use apprafter_core::{Context, EnvSource};
+use apprafter_core::{Context, CoreError, CoreResult, EnvSource};
+use cli_core::CliError;
 
 /// The process environment. The one `std::env::var` + `std::env::var_os` pair the core-backed
 /// arms read through (counted by the core's env-read ratchet).
@@ -20,8 +23,64 @@ impl EnvSource for ProcessEnv {
     }
 }
 
+/// The CLI's one `Context` builder.
+fn build() -> CoreResult<Context> {
+    Context::from_cli_env(&ProcessEnv)
+}
+
 /// Built by each core-backed arm, not once in `run()`: a command that never touches the core
 /// cannot fail on it.
 pub(crate) fn cli_context() -> miette::Result<Context> {
-    Context::from_cli_env(&ProcessEnv).map_err(crate::render::core_error::report)
+    build().map_err(crate::render::core_error::report)
+}
+
+/// [`cli_context`] for a legacy arm: the same context, its one build error (no config root)
+/// as the `CliError` it wraps.
+pub(crate) fn legacy_context() -> cli_core::Result<Context> {
+    build().map_err(into_cli_error)
+}
+
+/// A core error as a legacy arm's `CliError`: a wrapped `CliError` as it was; the core's
+/// `TargetNotFound` and `NoActiveTarget` as the `CliError`s `CoreError::from` makes them from
+/// (the names joined back with ", "); any other as its message.
+pub(crate) fn into_cli_error(e: CoreError) -> CliError {
+    match e {
+        CoreError::Cli(e) => e,
+        CoreError::TargetNotFound { name, available } => CliError::TargetNotFound {
+            name,
+            available: available.join(", "),
+        },
+        CoreError::NoActiveTarget => CliError::NoActiveTarget,
+        other => CliError::Other(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_core_error_becomes_the_cli_error_it_was_made_from() {
+        assert!(matches!(
+            into_cli_error(CoreError::Cli(CliError::Other("x".into()))),
+            CliError::Other(m) if m == "x"
+        ));
+        match into_cli_error(CoreError::from(CliError::TargetNotFound {
+            name: "ghost".into(),
+            available: "a, b".into(),
+        })) {
+            CliError::TargetNotFound { name, available } => {
+                assert_eq!((name.as_str(), available.as_str()), ("ghost", "a, b"));
+            }
+            e => panic!("{e:?}"),
+        }
+        assert!(matches!(
+            into_cli_error(CoreError::NoActiveTarget),
+            CliError::NoActiveTarget
+        ));
+        assert!(matches!(
+            into_cli_error(CoreError::TokenNotStored { name: "p".into() }),
+            CliError::Other(m) if m == "target `p` has no provider token stored"
+        ));
+    }
 }

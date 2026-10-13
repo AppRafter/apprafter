@@ -10,7 +10,7 @@ use cli_core::secrets::{
     load_or_create_identity_reporting,
 };
 use cli_core::target::TargetStorePaths;
-use cli_core::{resolve_hetzner_token, CliError, Result};
+use cli_core::{CliError, Result};
 use cli_providers::hetzner_cloud::{
     default_ssh_identity_path, rewrite_server_url, HetznerCloudClient, KubeconfigFetcher,
     SshKubeconfigFetcher, APPRAFTER_LABEL, APPRAFTER_LABEL_VALUE,
@@ -86,11 +86,11 @@ fn fetch_and_cache_outcome(
         key_path: &key_path,
     };
     let mut on_lost_key = |lost: &LostKey| answer_lost_key(policy, lost, &mut ask_at_terminal);
-    // Cold path or --refresh: SSH-fetch from the live server.
-    // Credential resolution chain (cli-dx-task.md §7) — picks up
-    // the active target's token when `HCLOUD_TOKEN` isn't set.
+    // Cold path or --refresh: SSH-fetch from the live server. The token
+    // comes through the core's secret store (`legacy_token`, D.4a b):
+    // HCLOUD_TOKEN, else the stored token of `--target` or the active one.
     let mut fetch = |hetzner: &HetznerCloudState| {
-        let token = resolve_hetzner_token(None, &resolved.store, target_override)?;
+        let token = crate::legacy_token::hetzner_token(target_override)?;
         let client = HetznerCloudClient::new(hcloud_base_url(), token);
         let public_ip = resolve_public_ip(&client, hetzner.server_id)?;
         let fetcher = SshKubeconfigFetcher::new(
