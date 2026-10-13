@@ -22,6 +22,7 @@
 mod error;
 mod format;
 mod kdf;
+mod password;
 mod recovery;
 mod rng;
 
@@ -41,6 +42,9 @@ pub use format::{
     MAGIC, PAYLOAD_MAX, SLOT_AAD_DOMAIN, SLOT_MAX, STORE_ID_MAX, VAULT_FILE_MAX, WRITER_MAX,
 };
 pub use kdf::{Argon2idParams, KdfPolicy};
+pub use password::{
+    check_new_password, AcceptedPassword, MAX_PASSWORD_BYTES, RECOMMENDED_PASSWORD_CHARS,
+};
 pub use recovery::{looks_like_recovery_key, ConfirmedRecoveryKey, RecoveryKey, RECOVERY_KEY_HRP};
 #[cfg(any(test, feature = "test-support"))]
 pub use rng::ScriptedRandom;
