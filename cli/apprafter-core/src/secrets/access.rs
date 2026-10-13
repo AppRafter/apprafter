@@ -59,6 +59,13 @@ pub trait VaultAccess: Send + Sync + fmt::Debug {
 
     /// Drop whatever this process holds (the desktop's app lock, d4a-g).
     fn forget(&self) {}
+
+    /// A cache this command wrote on a locked store, sealed as `armored` from `plaintext`
+    /// (D.4a): a client that keeps opened items for the command's lifetime (the CLI, T46) keeps
+    /// it, so reading it back asks nothing. By default nothing is kept.
+    fn remember_cache(&self, armored: &str, plaintext: &str) {
+        let _ = (armored, plaintext);
+    }
 }
 
 /// Items of one vault, opened from bytes the caller read.

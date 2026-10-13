@@ -5,7 +5,7 @@
 use std::path::Path;
 
 use apprafter_core::secrets::NewCacheKey;
-use cli_core::secrets::{encrypt_for_recipient, load_or_create_identity, CachedSecret};
+use cli_core::secrets::CachedSecret;
 use cli_core::{CliError, Result};
 use cli_providers::k8s::{KubectlCli, KubectlRunner};
 use cli_state::State;
@@ -25,7 +25,7 @@ pub fn run(refresh: bool, target_override: Option<&str>) -> Result<()> {
     // the way back for another target's password never needs a switch of the active one).
     let resolved = resolve_state_paths(target_override)?;
     let target = resolved.target_name.as_str();
-    let mut state = State::load_or_default(&resolved.paths)?;
+    let state = State::load_or_default(&resolved.paths)?;
     let hetzner = state.hetzner_cloud.clone().ok_or_else(|| {
         CliError::Other(
             "state has no hetzner_cloud section; run `apprafter apply` first".to_string(),
@@ -54,28 +54,20 @@ pub fn run(refresh: bool, target_override: Option<&str>) -> Result<()> {
     // a lost key (a plaintext kubeconfig needs none, another target's cache does) the read
     // would be thrown away (review #1). A lost key is `kubeconfig --refresh`'s to replace,
     // after it asks.
-    let key = secrets.cache_key_for_new_secret(target)?;
+    let first_use = matches!(
+        secrets.cache_key_for_new_secret(target)?,
+        NewCacheKey::FirstUse { .. }
+    );
     let kubeconfig = age_cache::cached_kubeconfig(&secrets, &hetzner, target)?;
     let kubeconfig_file = crate::commands::k8s_helpers::materialise(&ctx, &kubeconfig)?;
 
     let plaintext = compute_argocd_password(&KubectlCli, kubeconfig_file.path())?;
 
     // A first use (a plaintext kubeconfig, and nothing encrypted anywhere) creates the key now
-    // that there is something to cache; the store then reads it back, so the seal takes a
-    // CacheKey's recipient in the sealing expression, as `kubeconfig` does (T16's rule, which
-    // d4a-c extends to the CLI).
-    let key = match key {
-        NewCacheKey::Ready(key) => key,
-        NewCacheKey::FirstUse { path } => {
-            load_or_create_identity(&path)?;
-            secrets.cache_key(target)?
-        }
-    };
-    let armored = encrypt_for_recipient(&plaintext, &key.recipient()?)?;
-    let mut updated = hetzner.clone();
-    updated.argocd_admin_password_age = Some(armored);
-    state.hetzner_cloud = Some(updated);
-    state.save(&resolved.paths)?;
+    // that there is something to cache, in files only; the write takes the store lock.
+    let new = secrets.new_cache(target, CachedSecret::ArgocdPassword, first_use)?;
+    let held = crate::commands::target::store_lock(&ctx.store())?;
+    secrets.write_cache(&held, &resolved.paths, new, &plaintext, false)?;
 
     print!("{plaintext}");
     age_cache::note_outside_lock(&ctx, "the Argo CD admin password");

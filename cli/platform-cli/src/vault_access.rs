@@ -340,6 +340,13 @@ impl VaultAccess for CliVaultAccess {
     fn forget(&self) {
         *self.inner.held() = Held::default();
     }
+
+    fn remember_cache(&self, armored: &str, plaintext: &str) {
+        self.inner
+            .held()
+            .caches
+            .push((armored.to_string(), Zeroizing::new(plaintext.to_string())));
+    }
 }
 
 /// A read session: each item from this command's kept items, else through the key (which may
@@ -719,5 +726,27 @@ mod tests {
                 .unwrap_err(),
         );
         assert_eq!(script.asked().len(), 1, "a kept refusal asks nothing");
+    }
+
+    /// D.4a: a cache this command wrote on a locked store is read back from the kept items,
+    /// with no key held and nothing asked.
+    #[test]
+    fn a_cache_this_command_wrote_is_read_back_without_asking() {
+        let dir = tempfile::tempdir().unwrap();
+        let made = locked_store(&dir.path().join("store"), &[("prod", None)]);
+        let access = CliVaultAccess::new(Box::new(Script::absent()), KdfPolicy::active());
+        access.remember_cache("ARMORED", "apiVersion: v1\n");
+        let session = access
+            .session(&VaultRequest {
+                store_root: &dir.path().join("store"),
+                store_id: &made.store_id,
+                slots: &[],
+            })
+            .unwrap();
+        let plain = session
+            .open_cache(b"vault", CachedSecret::Kubeconfig, "prod", "ARMORED")
+            .unwrap();
+        assert_eq!(plain.as_str(), "apiVersion: v1\n");
+        assert!(!access.holds_key());
     }
 }

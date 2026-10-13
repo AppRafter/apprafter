@@ -5,7 +5,7 @@
 use std::io::IsTerminal;
 
 use apprafter_core::Context;
-use cli_core::secrets::{encrypt_for_recipient, load_or_create_identity_reporting, CachedSecret};
+use cli_core::secrets::CachedSecret;
 use cli_core::{CliError, Result};
 use cli_providers::hetzner_cloud::{
     default_ssh_identity_path, rewrite_server_url, HetznerCloudClient, KubeconfigFetcher,
@@ -171,7 +171,8 @@ pub(crate) struct CacheSite<'a> {
 /// key that appeared meanwhile is used, never replaced. After a lost key, this target's Argo CD
 /// password is dropped when the key used cannot open it (it was cached under the lost one), so
 /// `argocd-password` fetches it again instead of failing on it. Every read, open and the
-/// recipient go through the core's secret store; only the key's creation is the CLI's.
+/// recipient go through the core's secret store; the key's creation and the write are the
+/// store's (`SecretStore::new_cache`, `write_cache`), under the store lock.
 pub(crate) fn fetch_and_cache_at(
     site: &CacheSite<'_>,
     refresh: bool,
@@ -180,7 +181,7 @@ pub(crate) fn fetch_and_cache_at(
 ) -> Result<Fetched> {
     let secrets = site.ctx.secrets();
     let key_path = site.ctx.age_key_path();
-    let mut state = State::load_or_default(site.paths)?;
+    let state = State::load_or_default(site.paths)?;
     let hetzner = state.hetzner_cloud.clone().ok_or_else(|| {
         CliError::Other(
             "state has no hetzner_cloud section; run `apprafter apply` first".to_string(),
@@ -217,35 +218,17 @@ pub(crate) fn fetch_and_cache_at(
 
     let yaml = fetch(&hetzner)?;
 
-    // Encrypt before writing back; clear the legacy plaintext slot
-    // so future runs go through the age path exclusively. The key is the one at the path NOW:
-    // the check above was before the fetch, and a key may have appeared since (review #10).
-    // A first use or an agreed replacement creates it here; the store then reads it.
-    let (_, created) = load_or_create_identity_reporting(key_path)?;
-    let key = secrets.cache_key(site.target)?;
-    let armored = encrypt_for_recipient(&yaml, &key.recipient()?)?;
-    let mut updated = hetzner;
-    updated.kubeconfig_yaml = None;
-    updated.kubeconfig_age = Some(armored);
-    if lost.is_some() {
-        let opens = |armored: &str| {
-            secrets
-                .open_cache(&key, CachedSecret::ArgocdPassword, site.target, armored)
-                .is_ok()
-        };
-        if !updated
-            .argocd_admin_password_age
-            .as_deref()
-            .is_some_and(opens)
-        {
-            updated.argocd_admin_password_age = None;
-        }
-    }
-    state.hetzner_cloud = Some(updated);
-    state.save(site.paths)?;
+    // The key is settled now, after the node answered (a failed fetch leaves no key behind)
+    // and before the store lock (a prompt never runs under it): a first use or the agreed
+    // replacement creates it, in files only; a key that appeared meanwhile is used, never
+    // replaced (review #10). The write takes the lock; after a replaced key the Argo CD
+    // password the new key cannot open is dropped, so `argocd-password` fetches it again.
+    let new = secrets.new_cache(site.target, CachedSecret::Kubeconfig, true)?;
+    let held = crate::commands::target::store_lock(&site.ctx.store())?;
+    let written = secrets.write_cache(&held, site.paths, new, &yaml, lost.is_some())?;
     Ok(Fetched {
         yaml,
-        new_key: lost.filter(|_| created),
+        new_key: lost.filter(|_| written.created_key),
     })
 }
 
@@ -289,7 +272,9 @@ fn resolve_public_ip(client: &HetznerCloudClient, server_id: u64) -> Result<Stri
 mod tests {
     use super::*;
     use age::x25519::Identity;
-    use cli_core::secrets::{decrypt_with_identity, load_identity, load_or_create_identity};
+    use cli_core::secrets::{
+        decrypt_with_identity, encrypt_for_recipient, load_identity, load_or_create_identity,
+    };
     use cli_core::target::TargetStorePaths;
     use std::path::Path;
 

@@ -28,9 +28,9 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use cli_core::secrets::{CacheKeyKind, CachedSecret, Identity, Recipient};
+use cli_core::secrets::{encrypt_for_recipient, CacheKeyKind, CachedSecret, Identity, Recipient};
 use cli_core::{CliError, LockPhase, LockedWhy, SecretsModeKind, StoreLock, TargetStorePaths};
-use cli_state::HetznerCloudState;
+use cli_state::{HetznerCloudState, State, StatePaths};
 use serde::Serialize;
 use zeroize::Zeroizing;
 
@@ -208,8 +208,9 @@ impl From<CacheKeyKind> for CacheKeyView {
 pub enum NewCacheKey {
     /// The key there is.
     Ready(CacheKey),
-    /// No key, and nothing is cached anywhere: a first use. The caller (the CLI) creates the
-    /// key at `path` once it has something to cache; the core never creates one.
+    /// No key, and nothing is cached anywhere: a first use. The key at `path` is created only
+    /// once there is something to cache, by [`SecretStore::new_cache`] when its caller allows
+    /// it; a read never creates one.
     FirstUse { path: PathBuf },
 }
 
@@ -233,6 +234,54 @@ impl WriteFor {
             WriteFor::Locked { .. } => SecretsModeKind::Locked,
         }
     }
+}
+
+/// A cache write's key, settled by [`SecretStore::new_cache`] BEFORE the store lock is taken
+/// (a prompt for a locked store's key never runs under the lock), with the lock state it was
+/// settled for: [`SecretStore::write_cache`] refuses another (`store_changed`).
+pub struct NewCache {
+    target: String,
+    secret: CachedSecret,
+    key: CacheKey,
+    settled: Settled,
+    created_key: bool,
+    /// T39: the target's other cached secret as `new_cache` found it, when the store's key
+    /// could not open it — dropped by the write if the slot still holds this very ciphertext.
+    drop_other: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Settled {
+    Files,
+    Locked(StoreId),
+}
+
+impl Settled {
+    fn kind(&self) -> SecretsModeKind {
+        match self {
+            Settled::Files => SecretsModeKind::Files,
+            Settled::Locked(_) => SecretsModeKind::Locked,
+        }
+    }
+}
+
+impl fmt::Debug for NewCache {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NewCache")
+            .field("target", &self.target)
+            .field("secret", &self.secret)
+            .field("key", &self.key)
+            .field("settled", &self.settled)
+            .field("drop_other", &self.drop_other.is_some())
+            .finish()
+    }
+}
+
+/// What [`SecretStore::write_cache`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheWritten {
+    /// The write created the shared age key (a first use, or an agreed replacement).
+    pub created_key: bool,
 }
 
 /// `store.yaml` as one call read it.
@@ -639,6 +688,153 @@ impl SecretStore {
         armored: &str,
     ) -> cli_core::Result<Zeroizing<String>> {
         cache::open(key, secret, target, armored)
+    }
+
+    /// The key a new cached `secret` of `target` is sealed to, settled before the store lock
+    /// is taken. In files: the shared key at the path now; with none there, `create_key`
+    /// creates it — a first use, or a lost key's replacement the caller agreed to — and
+    /// otherwise it is `age_key_missing`. On a locked store: the store's own key, its
+    /// recipient settled now (through this client's access, which may ask — here, never under
+    /// the lock); a shared key is never created for it, and `APPRAFTER_AGE_KEY` is refused
+    /// (T35). There the target's other cached secret is opened now too, and remembered for
+    /// the write to drop when the store's key cannot open it (T39).
+    pub fn new_cache(
+        &self,
+        target: &str,
+        secret: CachedSecret,
+        create_key: bool,
+    ) -> cli_core::Result<NewCache> {
+        let (key, settled, created_key, drop_other) = match self.state()? {
+            StoreState::Files => match files::cache_key(&self.age_key_path, target) {
+                Ok(key) => (key, Settled::Files, false, None),
+                Err(CliError::AgeKeyMissing { .. }) if create_key => {
+                    let created = files::create_shared_key(&self.age_key_path)?;
+                    let key = files::cache_key(&self.age_key_path, target)?;
+                    (key, Settled::Files, created, None)
+                }
+                Err(e) => return Err(e),
+            },
+            StoreState::Locked { id, .. } => {
+                let key = self.cache_key(target)?;
+                key.recipient()?;
+                let drop_other = self.unopenable_other(&key, target, secret)?;
+                (key, Settled::Locked(id), false, drop_other)
+            }
+            StoreState::Incomplete(phase) => return Err(self.incomplete(phase)),
+        };
+        Ok(NewCache {
+            target: target.to_string(),
+            secret,
+            key,
+            settled,
+            created_key,
+            drop_other,
+        })
+    }
+
+    /// `target`'s other cached secret (beside `secret`) when `key` cannot open it: its
+    /// ciphertext (T39). A state that cannot be read, or a failure that is not the cache's
+    /// own, is the error (rule 3).
+    fn unopenable_other(
+        &self,
+        key: &CacheKey,
+        target: &str,
+        secret: CachedSecret,
+    ) -> cli_core::Result<Option<String>> {
+        let other = match secret {
+            CachedSecret::Kubeconfig => CachedSecret::ArgocdPassword,
+            CachedSecret::ArgocdPassword => CachedSecret::Kubeconfig,
+        };
+        let state = State::load_or_default(&StatePaths::for_active_target(&self.store, target))?;
+        let Some(armored) = state.hetzner_cloud.and_then(|h| match other {
+            CachedSecret::Kubeconfig => h.kubeconfig_age,
+            CachedSecret::ArgocdPassword => h.argocd_admin_password_age,
+        }) else {
+            return Ok(None);
+        };
+        match cache::open(key, other, target, &armored) {
+            Ok(_) => Ok(None),
+            Err(CliError::CacheUndecryptable { .. }) => Ok(Some(armored)),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// `plaintext`, sealed to `new`'s key, written as `new`'s target's cached secret into the
+    /// state at `paths`, under the store lock `held` (D.4a: cache writers take the lock, so no
+    /// `lock on` or `lock off` runs between a seal and its write). The lock state is read again
+    /// under the lock — another than `new` was settled for is `store_changed`, nothing written
+    /// — and a locked store's write needs `held` held (T28). The state is read again too, so
+    /// what another writer put in the other slot stays; a kubeconfig clears the legacy
+    /// plaintext slot. `replaced_key` (the shared key was lost and replaced): the other cached
+    /// secret is dropped when this key cannot open it (WI-457). On a locked store this
+    /// client's access keeps the plaintext for the rest of the command (`remember_cache`).
+    pub fn write_cache(
+        &self,
+        held: &StoreLock,
+        paths: &StatePaths,
+        new: NewCache,
+        plaintext: &str,
+        replaced_key: bool,
+    ) -> cli_core::Result<CacheWritten> {
+        let now = self.state()?;
+        let same = match (&new.settled, &now) {
+            (Settled::Files, StoreState::Files) => true,
+            (Settled::Locked(id), StoreState::Locked { id: now_id, .. }) => id == now_id,
+            _ => false,
+        };
+        if !same {
+            return Err(CliError::StoreChanged {
+                store: self.store.root().to_path_buf(),
+                prepared: new.settled.kind(),
+                now: now.kind(),
+            });
+        }
+        let locked = matches!(new.settled, Settled::Locked(_));
+        if locked && !held.is_held() {
+            return Err(CliError::VaultNeedsWriteLock {
+                store: self.store.root().to_path_buf(),
+            });
+        }
+        let mut state = State::load_or_default(paths)?;
+        let mut hetzner = state.hetzner_cloud.clone().ok_or_else(|| {
+            CliError::Other(
+                "state has no hetzner_cloud section; run `apprafter apply` first".to_string(),
+            )
+        })?;
+        let sealed = encrypt_for_recipient(plaintext, &new.key.recipient()?)?;
+        let other = match new.secret {
+            CachedSecret::Kubeconfig => {
+                hetzner.kubeconfig_age = Some(sealed.clone());
+                hetzner.kubeconfig_yaml = None;
+                CachedSecret::ArgocdPassword
+            }
+            CachedSecret::ArgocdPassword => {
+                hetzner.argocd_admin_password_age = Some(sealed.clone());
+                CachedSecret::Kubeconfig
+            }
+        };
+        let slot = match other {
+            CachedSecret::Kubeconfig => &mut hetzner.kubeconfig_age,
+            CachedSecret::ArgocdPassword => &mut hetzner.argocd_admin_password_age,
+        };
+        if replaced_key {
+            let opens = |armored: &str| cache::open(&new.key, other, &new.target, armored).is_ok();
+            if slot.as_deref().is_some_and(|armored| !opens(armored)) {
+                *slot = None;
+            }
+        }
+        // T39: what `new_cache` found the store's key cannot open, if it is still there.
+        if new.drop_other.is_some() && *slot == new.drop_other {
+            *slot = None;
+        }
+        state.hetzner_cloud = Some(hetzner);
+        state.save(paths)?;
+        if locked {
+            self.access.remember_cache(&sealed, plaintext);
+        }
+        Ok(CacheWritten {
+            created_key: new.created_key,
+        })
     }
 
     /// Everything the store's targets cache under the shared age key, by target name, the

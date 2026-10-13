@@ -26,8 +26,8 @@
 //!    `apprafter-core/src` seals a cache to a recipient that is not a `CacheKey`'s ([`SEAL`]):
 //!    every token and cached secret goes through `Context::secrets()` (ADR 0068 §5; D.4a
 //!    T16), and the same holds in `platform-cli/src`, where only the seal itself is not a door
-//!    (its recipient must be a `CacheKey`'s) and the two loads of the shared key
-//!    [`CLI_KEY_CREATION_SITES`] lists are allowed once each, until d4a-d moves them.
+//!    (its recipient must be a `CacheKey`'s); the shared key is created only by the store
+//!    (`SecretStore::new_cache`, in files).
 //!    The vault's own doors ([`VAULT_DOORS`]) are named only in `src/secrets/`, `src/lock/` and
 //!    `src/vault/`, and never in `platform-cli` or the desktop; the lock flows' file doors
 //!    ([`TRANSFER_DOOR`]) only in `src/secrets/` and `src/lock/`.
@@ -1380,37 +1380,12 @@ fn only_the_secret_store_reads_credentials_and_opens_caches() {
     );
 }
 
-/// The CLI's calls that load or create the shared age key, as (file under `cli/`, the
-/// `SECRET_DOORS` entry), each allowed exactly once there: the key the two seals of D.4a b
-/// encrypt to. d4a-d moves both into the core (and gates the creation on a store in files),
-/// and empties this list.
-const CLI_KEY_CREATION_SITES: &[(&str, &str)] = &[
-    (
-        "platform-cli/src/commands/kubeconfig.rs",
-        "cli_core::secrets::load_or_create_identity_reporting",
-    ),
-    (
-        "platform-cli/src/commands/argocd_password.rs",
-        "cli_core::secrets::load_or_create_identity",
-    ),
-];
-
-/// T16 in the CLI (D.4a c2): `platform-cli/src` reaches a target's credentials file, the shared
-/// age key and the caches only through `apprafter_core::secrets` — every door but the seal and
-/// the listed key loads is forbidden there, each listed load occurs exactly once where it is
-/// listed, and every seal takes a `CacheKey`'s recipient in the same expression.
+/// T16 in the CLI (D.4a c2, d): `platform-cli/src` reaches a target's credentials file, the
+/// shared age key and the caches only through `apprafter_core::secrets` — every door but the
+/// seal is forbidden there (the shared key is created only by `SecretStore::new_cache`), and
+/// every seal takes a `CacheKey`'s recipient in the same expression.
 #[test]
 fn the_cli_reaches_credentials_and_caches_only_through_the_secret_store() {
-    let at = |f: &Finding| {
-        let file = f.file.strip_prefix(cli_dir()).unwrap_or(&f.file);
-        (file.to_string_lossy().replace('\\', "/"), f.callee.clone())
-    };
-    let listed = |f: &Finding| {
-        let (file, callee) = at(f);
-        CLI_KEY_CREATION_SITES
-            .iter()
-            .any(|(s, c)| *s == file && *c == callee)
-    };
     // A door the core forbids outright is classified by FORBIDDEN_CALLEES first
     // (`load_or_create_identity`: in the core a read never writes a key), so it comes back as a
     // ForbiddenCallee under its entry; in the CLI it is a door like the others.
@@ -1423,7 +1398,7 @@ fn the_cli_reaches_credentials_and_caches_only_through_the_secret_store() {
         .iter()
         .filter(|f| {
             if door(f) {
-                f.callee != SEAL && !listed(f)
+                f.callee != SEAL
             } else {
                 f.kind == Kind::ForeignRecipient
             }
@@ -1439,18 +1414,6 @@ fn the_cli_reaches_credentials_and_caches_only_through_the_secret_store() {
             .collect::<Vec<_>>()
             .join("\n")
     );
-    for (file, callee) in CLI_KEY_CREATION_SITES {
-        let n = findings
-            .iter()
-            .filter(|f| door(f) && at(f) == (file.to_string(), callee.to_string()))
-            .count();
-        assert_eq!(
-            n, 1,
-            "{file} calls `{callee}` {n} times: CLI_KEY_CREATION_SITES allows it once, where it \
-             is today (a second call would read or create the shared key outside the store; \
-             none means d4a-d moved it, so drop the entry)"
-        );
-    }
 }
 
 /// c1's hand-off, T16: a vault is read, written, parsed and opened only by the secret store,

@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use cli_core::secrets::{load_identity, CachedSecret};
+use cli_core::secrets::{load_identity, load_or_create_identity_reporting, CachedSecret};
 use cli_core::target::{
     list_target_names, parse_target_credentials, read_target_credentials_bytes,
     save_target_credentials, TargetCredentials, TargetStorePaths,
@@ -119,6 +119,15 @@ pub(super) fn cache_key_for_new_secret(
     Ok(NewCacheKey::FirstUse {
         path: age_key_path.to_path_buf(),
     })
+}
+
+/// The shared key at `age_key_path`, created when none is there — a first use, or a lost
+/// key's replacement the caller agreed to (WI-457): whether this call created it. A key that
+/// appeared meanwhile is used, never replaced (`create_new`). Files only: a locked store never
+/// gets one (c2's hand-off).
+pub(super) fn create_shared_key(age_key_path: &Path) -> Result<bool> {
+    under_temp(age_key_path);
+    load_or_create_identity_reporting(age_key_path).map(|(_, created)| created)
 }
 
 /// The missing-key error for `target`'s cache.

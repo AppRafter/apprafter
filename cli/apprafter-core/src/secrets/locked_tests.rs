@@ -7,9 +7,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 use cli_core::secrets::{
-    encrypt_for_recipient, load_or_create_identity, CacheKeyKind, UndecryptableWhy,
+    encrypt_for_recipient, load_or_create_identity, CacheKeyKind, Identity, UndecryptableWhy,
 };
 use cli_core::{DamageKind, RefusedInput, VaultProblem, VaultWriteProblem};
+use cli_state::{HetznerCloudState, State, StatePaths};
 
 use super::locked::VAULT_WRITER;
 use super::testing::{locked_store, LockedTestStore};
@@ -1361,4 +1362,267 @@ fn a_remove_on_a_locked_store_without_its_key_deletes_nothing() {
     ));
     assert!(ctx.store().target_dir("prod").exists());
     assert_eq!(entry(&ctx, &made, "prod").as_deref(), Some(TOKEN_A));
+}
+
+/// A store in files with `prod` provisioned (no cache yet) and its context.
+fn provisioned_in_files() -> (tempfile::TempDir, Context, StatePaths) {
+    let (dir, ctx) = store(&["prod"], Some("prod"));
+    let paths = StatePaths::for_active_target(&ctx.store(), "prod");
+    State {
+        hetzner_cloud: Some(hetzner(None, None)),
+        ..Default::default()
+    }
+    .save(&paths)
+    .unwrap();
+    (dir, ctx, paths)
+}
+
+fn held(ctx: &Context) -> StoreLock {
+    StoreLock::exclusive(&ctx.store()).unwrap()
+}
+
+/// A client access that records what it is asked to remember (D.4a: `remember_cache`).
+#[derive(Debug)]
+struct Remembering {
+    inner: Arc<dyn VaultAccess>,
+    kept: std::sync::Mutex<Vec<(String, String)>>,
+}
+
+impl VaultAccess for Remembering {
+    fn session(&self, req: &VaultRequest<'_>) -> cli_core::Result<Arc<dyn VaultSession>> {
+        self.inner.session(req)
+    }
+    fn write_key(&self, req: &VaultRequest<'_>) -> cli_core::Result<KeySession> {
+        self.inner.write_key(req)
+    }
+    fn remember_cache(&self, armored: &str, plaintext: &str) {
+        self.kept
+            .lock()
+            .unwrap()
+            .push((armored.to_string(), plaintext.to_string()));
+    }
+}
+
+/// In files: sealed to the shared key, the legacy plaintext slot cleared, the other slot kept
+/// as another writer left it under the lock.
+#[test]
+fn a_cache_write_in_files_seals_to_the_shared_key_and_keeps_the_other_slot() {
+    let (_d, ctx, paths) = provisioned_in_files();
+    let shared = load_or_create_identity(ctx.age_key_path()).unwrap();
+    let s = ctx.secrets();
+    let new = s
+        .new_cache("prod", CachedSecret::Kubeconfig, false)
+        .unwrap();
+    // Another writer, between the key and the lock: its slot must stay.
+    let pw = encrypt_for_recipient("pw", &shared.to_public()).unwrap();
+    State {
+        hetzner_cloud: Some(HetznerCloudState {
+            argocd_admin_password_age: Some(pw.clone()),
+            kubeconfig_yaml: Some("stale".into()),
+            ..hetzner(None, None)
+        }),
+        ..Default::default()
+    }
+    .save(&paths)
+    .unwrap();
+    let written = s
+        .write_cache(&held(&ctx), &paths, new, YAML, false)
+        .unwrap();
+    assert!(!written.created_key);
+    let h = State::load_or_default(&paths)
+        .unwrap()
+        .hetzner_cloud
+        .unwrap();
+    assert_eq!(h.argocd_admin_password_age.as_deref(), Some(pw.as_str()));
+    assert!(h.kubeconfig_yaml.is_none(), "the plaintext slot is cleared");
+    assert_eq!(
+        s.cached_kubeconfig(&h, "prod").unwrap().unwrap().as_str(),
+        YAML
+    );
+}
+
+/// A key is created only where the caller allows it (a first use, or an agreed replacement).
+#[test]
+fn a_shared_key_is_created_only_when_allowed() {
+    let (_d, ctx, paths) = provisioned_in_files();
+    let s = ctx.secrets();
+    assert!(matches!(
+        s.new_cache("prod", CachedSecret::Kubeconfig, false)
+            .unwrap_err(),
+        CliError::AgeKeyMissing { .. }
+    ));
+    assert!(!ctx.age_key_path().exists());
+    let new = s.new_cache("prod", CachedSecret::Kubeconfig, true).unwrap();
+    assert!(ctx.age_key_path().exists());
+    assert!(
+        s.write_cache(&held(&ctx), &paths, new, YAML, false)
+            .unwrap()
+            .created_key
+    );
+}
+
+/// c2's hand-off: on a locked store the cache is sealed to the store's own key — a shared key
+/// is never created — and this client keeps the plaintext for the rest of the command.
+#[test]
+fn a_locked_store_seals_to_its_own_key_and_remembers_the_plaintext() {
+    let (dir, ctx, _made) = locked(&[("prod", Some(TOKEN_A))]);
+    let remembering = Arc::new(Remembering {
+        inner: ctx.vault_access().clone(),
+        kept: std::sync::Mutex::new(Vec::new()),
+    });
+    let ctx = ctx.with_vault_access(remembering.clone());
+    let paths = StatePaths::for_active_target(&ctx.store(), "prod");
+    State {
+        hetzner_cloud: Some(hetzner(None, None)),
+        ..Default::default()
+    }
+    .save(&paths)
+    .unwrap();
+    let s = ctx.secrets();
+    let new = s.new_cache("prod", CachedSecret::Kubeconfig, true).unwrap();
+    let written = s
+        .write_cache(&held(&ctx), &paths, new, YAML, false)
+        .unwrap();
+    assert!(!written.created_key);
+    assert!(
+        !ctx.age_key_path().exists(),
+        "no shared key for a locked store"
+    );
+    let h = State::load_or_default(&paths)
+        .unwrap()
+        .hetzner_cloud
+        .unwrap();
+    assert_eq!(
+        s.cached_kubeconfig(&h, "prod").unwrap().unwrap().as_str(),
+        YAML
+    );
+    let kept = remembering.kept.lock().unwrap().clone();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].0.as_str(), h.kubeconfig_age.as_deref().unwrap());
+    assert_eq!(kept[0].1, YAML);
+    drop(dir);
+}
+
+/// D.4a: a cache write whose store was locked (or unlocked) after its key was settled writes
+/// nothing (`store_changed`).
+#[test]
+fn a_cache_write_after_the_lock_state_changed_writes_nothing() {
+    let (_d, ctx, paths) = provisioned_in_files();
+    load_or_create_identity(ctx.age_key_path()).unwrap();
+    let s = ctx.secrets();
+    let new = s
+        .new_cache("prod", CachedSecret::Kubeconfig, false)
+        .unwrap();
+    lock_state(&ctx, SecretsMode::Locked, Some(ID));
+    assert!(matches!(
+        s.write_cache(&held(&ctx), &paths, new, YAML, false)
+            .unwrap_err(),
+        CliError::StoreChanged { .. }
+    ));
+    let h = State::load_or_default(&paths)
+        .unwrap()
+        .hetzner_cloud
+        .unwrap();
+    assert!(h.kubeconfig_age.is_none());
+}
+
+/// T28: a locked store's cache write needs the held write lock.
+#[test]
+fn a_locked_cache_write_needs_the_held_lock() {
+    let (_d, ctx, _made) = locked(&[("prod", Some(TOKEN_A))]);
+    let paths = StatePaths::for_active_target(&ctx.store(), "prod");
+    State {
+        hetzner_cloud: Some(hetzner(None, None)),
+        ..Default::default()
+    }
+    .save(&paths)
+    .unwrap();
+    let s = ctx.secrets();
+    let new = s
+        .new_cache("prod", CachedSecret::Kubeconfig, false)
+        .unwrap();
+    assert!(matches!(
+        s.write_cache(&StoreLock::unheld(), &paths, new, YAML, false)
+            .unwrap_err(),
+        CliError::VaultNeedsWriteLock { .. }
+    ));
+}
+
+/// T39 (critic finding 6): on a locked store a cache write drops the target's other cached
+/// secret when the store's key cannot open it (an older AppRafter rewrote it under the shared
+/// key, T43) — judged before the lock; one the key opens stays.
+#[test]
+fn a_locked_refresh_drops_a_password_cache_its_key_cannot_open() {
+    for foreign in [true, false] {
+        let (dir, ctx, made) = locked(&[("prod", Some(TOKEN_A))]);
+        let paths = StatePaths::for_active_target(&ctx.store(), "prod");
+        let to = if foreign {
+            Identity::generate().to_public()
+        } else {
+            made.recipient().clone()
+        };
+        State {
+            hetzner_cloud: Some(HetznerCloudState {
+                argocd_admin_password_age: Some(encrypt_for_recipient("pw", &to).unwrap()),
+                ..hetzner(None, None)
+            }),
+            ..Default::default()
+        }
+        .save(&paths)
+        .unwrap();
+        let s = ctx.secrets();
+        let new = s
+            .new_cache("prod", CachedSecret::Kubeconfig, false)
+            .unwrap();
+        s.write_cache(&held(&ctx), &paths, new, YAML, false)
+            .unwrap();
+        let h = State::load_or_default(&paths)
+            .unwrap()
+            .hetzner_cloud
+            .unwrap();
+        assert_eq!(
+            h.argocd_admin_password_age.is_none(),
+            foreign,
+            "foreign: {foreign}"
+        );
+        assert_eq!(
+            s.cached_kubeconfig(&h, "prod").unwrap().unwrap().as_str(),
+            YAML
+        );
+        drop(dir);
+    }
+}
+
+/// WI-457's rule, moved: after a replaced key, the target's other cache the new key cannot
+/// open is dropped; without one it stays.
+#[test]
+fn a_replaced_key_drops_the_other_cache_it_cannot_open() {
+    for replaced in [true, false] {
+        let (_d, ctx, paths) = provisioned_in_files();
+        let lost = Identity::generate();
+        State {
+            hetzner_cloud: Some(HetznerCloudState {
+                argocd_admin_password_age: Some(
+                    encrypt_for_recipient("pw", &lost.to_public()).unwrap(),
+                ),
+                ..hetzner(None, None)
+            }),
+            ..Default::default()
+        }
+        .save(&paths)
+        .unwrap();
+        let s = ctx.secrets();
+        let new = s.new_cache("prod", CachedSecret::Kubeconfig, true).unwrap();
+        s.write_cache(&held(&ctx), &paths, new, YAML, replaced)
+            .unwrap();
+        let h = State::load_or_default(&paths)
+            .unwrap()
+            .hetzner_cloud
+            .unwrap();
+        assert_eq!(
+            h.argocd_admin_password_age.is_none(),
+            replaced,
+            "replaced: {replaced}"
+        );
+    }
 }
