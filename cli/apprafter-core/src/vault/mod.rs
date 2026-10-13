@@ -20,6 +20,7 @@
 //! is in `format.rs`.
 
 mod error;
+pub mod file;
 mod format;
 mod kdf;
 mod keys;
