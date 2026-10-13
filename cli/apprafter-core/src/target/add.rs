@@ -5,15 +5,15 @@
 use std::path::{Path, PathBuf};
 
 use cli_core::ssh_key::KeySource;
-use cli_core::{GlobalConfig, Target, TargetConfig, TargetCredentials, TargetStorePaths};
+use cli_core::{GlobalConfig, TargetConfig};
 
 use crate::context::SecretString;
 use crate::op::{ChangeAction, Outcome, Plan, PlanClass, PlannedChange};
 use crate::provider::{SkipReason, Verification};
 use crate::report::Reporter;
 use crate::target::{
-    cancelled, change, cli_default, lock_store, lock_store_if_present, provisioned, validate_name,
-    SkuCheck, TargetAdded, TargetRenewed,
+    cancelled, change, cli_default, lock_store, lock_store_for, provisioned, readable_config,
+    validate_name, SkuCheck, TargetAdded, TargetRenewed,
 };
 use crate::{ActivePointerChange, CancellationToken, Context, CoreError, CoreResult, TargetRef};
 
@@ -58,12 +58,12 @@ pub struct RenewPayload {
 }
 
 /// The stored `config.yaml` of `name`, or `None` when there is no such target. Both of the
-/// target's files are read, as the CLI's name check always read them: a target whose
-/// credentials file cannot be read is that error, `force` or not — never "exists", and never
-/// overwritten. (The token itself is dropped here.)
-fn stored_config(store: &TargetStorePaths, name: &str) -> CoreResult<Option<TargetConfig>> {
-    match cli_core::load_target(store, name) {
-        Ok(t) => Ok(Some(t.config)),
+/// target's files are read, as the CLI's name check always read them ([`readable_config`]):
+/// a target whose credentials file cannot be read is that error, `force` or not — never
+/// "exists", and never overwritten. The token itself is not read.
+fn stored_config(ctx: &Context, name: &str) -> CoreResult<Option<TargetConfig>> {
+    match readable_config(ctx, name) {
+        Ok(config) => Ok(Some(config)),
         Err(cli_core::CliError::TargetNotFound { .. }) => Ok(None),
         Err(e) => Err(e.into()),
     }
@@ -95,7 +95,7 @@ pub fn plan_add(ctx: &Context, args: AddArgs) -> CoreResult<Plan<AddPayload>> {
         crate::ssh::check_readable(p, source)?;
     }
     let store = ctx.store();
-    let stored = stored_config(&store, &args.name)?;
+    let stored = stored_config(ctx, &args.name)?;
     if stored.is_some() && !args.force {
         return Err(CoreError::TargetExists { name: args.name });
     }
@@ -300,8 +300,10 @@ fn force_changes(ctx: &Context, stored: &TargetConfig, a: &AddArgs) -> Vec<Plann
 
 /// Ping (unless `no_ping`; even after a wizard verify — R2), the SKU check (server types only,
 /// in the flag's region, else — with `force` — the stored one, else
-/// [`crate::machine::DEFAULT_REGION`]), then, under the lock (always taken, creating the root —
-/// this plan's deviation 1), re-check and save. A forced overwrite re-reads the stored target
+/// [`crate::machine::DEFAULT_REGION`]), then what the token write needs (before the lock: a
+/// slow step never runs under it, T41), then, under the lock (always taken, creating the root
+/// — D.3b's deviation 1), re-check, save `config.yaml` and store the token through the secret
+/// store. A forced overwrite re-reads the stored target
 /// under the lock, runs the provisioned guard again and merges onto it ([`merge_force`]), so an
 /// edit made during the ping is kept. The pointer moves only when `config.yaml` is absent; the
 /// outcome reports what happened.
@@ -330,7 +332,7 @@ pub fn execute_add(
         Some(sku) if ctx.no_ping() => Some(SkuCheck::NotValidated { sku: sku.clone() }),
         Some(sku) => {
             let stored_region = if a.force {
-                stored_config(&ctx.store(), &a.name)?.and_then(|c| c.region)
+                stored_config(ctx, &a.name)?.and_then(|c| c.region)
             } else {
                 None
             };
@@ -359,8 +361,10 @@ pub fn execute_add(
         return Ok(cancelled());
     }
     let store = ctx.store();
-    let _lock = lock_store(ctx, reporter)?;
-    let stored = stored_config(&store, &a.name)?;
+    let secrets = ctx.secrets();
+    let key = secrets.prepare_write()?;
+    let lock = lock_store(ctx, reporter)?;
+    let stored = stored_config(ctx, &a.name)?;
     let replaced = stored.is_some();
     if replaced && !a.force {
         return Err(CoreError::TargetExists { name: a.name });
@@ -372,16 +376,9 @@ pub fn execute_add(
         }
         None => new_config(&a),
     };
-    cli_core::save_target(
-        &store,
-        &Target {
-            name: a.name.clone(),
-            config,
-            credentials: TargetCredentials {
-                hetzner_token: Some(a.token.expose().to_string()),
-            },
-        },
-    )?;
+    // `config.yaml`, then the token: the order `save_target` wrote them in.
+    cli_core::target::save_target_config(&store, &a.name, &config)?;
+    secrets.put_token(&key, &lock, &a.name, &a.token)?;
     let pointer = if cli_core::load_global_config(&store)?.is_none() {
         cli_core::save_global_config(
             &store,
@@ -423,7 +420,8 @@ pub fn plan_renew(
     args: RenewArgs,
 ) -> CoreResult<Plan<RenewPayload>> {
     let name = target.name();
-    let t = cli_core::load_target(&ctx.store(), name)?;
+    let config = cli_core::target::load_target_config(&ctx.store(), name)?;
+    let stored = ctx.secrets().stored_token(name)?;
     if let Some(token) = &args.token {
         crate::provider::TokenProblem::check(token.expose())
             .map_err(|problem| CoreError::InvalidToken { problem })?;
@@ -432,7 +430,7 @@ pub fn plan_renew(
         crate::ssh::check_readable(p, KeySource::TargetFile)?;
     }
     let token_given = args.token.is_some();
-    let (token, ssh_key) = what_differs(&t, args.token, args.ssh_key);
+    let (token, ssh_key) = what_differs(&config, stored.as_ref(), args.token, args.ssh_key);
     if token.is_none() && ssh_key.is_none() {
         return Err(nothing_to_change(name, token_given));
     }
@@ -453,7 +451,7 @@ pub fn plan_renew(
             ChangeAction::Update,
             Some(format!(
                 "ssh key: {} → {}",
-                t.config
+                config
                     .ssh_key_path
                     .as_deref()
                     .map(show)
@@ -473,23 +471,24 @@ pub fn plan_renew(
         changes,
         payload: RenewPayload {
             name: name.into(),
-            provider: t.config.provider,
+            provider: config.provider,
             token,
             ssh_key,
         },
     })
 }
 
-/// The token and the key path of a renewal that differ from what `t` stores; `None` for each
-/// that does not (or was not given).
+/// The token and the key path of a renewal that differ from what is stored (`stored`, the
+/// token; `config`, the key path); `None` for each that does not (or was not given).
 fn what_differs(
-    t: &Target,
+    config: &TargetConfig,
+    stored: Option<&SecretString>,
     token: Option<SecretString>,
     ssh_key: Option<PathBuf>,
 ) -> (Option<SecretString>, Option<PathBuf>) {
     (
-        token.filter(|tok| t.credentials.hetzner_token.as_deref() != Some(tok.expose())),
-        ssh_key.filter(|p| t.config.ssh_key_path.as_ref() != Some(p)),
+        token.filter(|tok| stored.map(SecretString::expose) != Some(tok.expose())),
+        ssh_key.filter(|p| config.ssh_key_path.as_ref() != Some(p)),
     )
 }
 
@@ -503,8 +502,8 @@ fn nothing_to_change(name: &str, token_given: bool) -> CoreError {
     }
 }
 
-/// Ping the new token (only when there is one, and not with `no_ping`), then under the lock
-/// re-read the target and change only what still differs ([`plan_renew`]'s rules, refused the
+/// Ping the new token (only when there is one, and not with `no_ping`), then prepare the token
+/// write (before the lock, T41) and, under the lock, re-read the target and change only what still differs ([`plan_renew`]'s rules, refused the
 /// same way when nothing does): an edit made during the ping is kept. With no new token left
 /// only `config.yaml` is written, so the credentials file stays as it was, byte for byte, and
 /// the outcome's `token` is `None`.
@@ -536,29 +535,29 @@ pub fn execute_renew(
         return Ok(cancelled());
     }
     let store = ctx.store();
-    let _lock = lock_store_if_present(ctx, reporter)?;
-    let mut t = cli_core::load_target(&store, &name)?;
+    let secrets = ctx.secrets();
+    let key = secrets.prepare_write()?;
+    let lock = lock_store_for(ctx, reporter, &name)?;
+    let mut config = cli_core::target::load_target_config(&store, &name)?;
+    let stored = secrets.stored_token(&name)?;
     let token_given = token.is_some();
-    let (token, ssh_key) = what_differs(&t, token, ssh_key);
+    let (token, ssh_key) = what_differs(&config, stored.as_ref(), token, ssh_key);
     if token.is_none() && ssh_key.is_none() {
         return Err(nothing_to_change(&name, token_given));
     }
     let ssh_key_changed = ssh_key.is_some();
     if let Some(p) = ssh_key {
-        t.config.ssh_key_path = Some(p);
+        config.ssh_key_path = Some(p);
     }
+    // `config.yaml` first, then the token, as `save_target` wrote them; without a new token
+    // the credentials file is not written, so it stays as it was, byte for byte.
+    cli_core::target::save_target_config(&store, &name, &config)?;
     let token = match token {
         Some(token) => {
-            t.credentials = TargetCredentials {
-                hetzner_token: Some(token.expose().to_string()),
-            };
-            cli_core::save_target(&store, &t)?;
+            secrets.put_token(&key, &lock, &name, &token)?;
             verification
         }
-        None => {
-            cli_core::save_target_config(&store, &name, &t.config)?;
-            None
-        }
+        None => None,
     };
     Ok(Outcome::Completed {
         result: TargetRenewed {

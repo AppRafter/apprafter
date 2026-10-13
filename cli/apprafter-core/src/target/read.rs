@@ -4,6 +4,7 @@
 
 use crate::context::{Context, SecretString};
 use crate::error::{CoreError, CoreResult, UiError};
+use crate::secrets::{SecretsMode, StoredToken};
 use crate::ssh::inspect_key;
 use crate::target::{
     cli_default, provisioned, CliDefaultPointer, ProvisionedState, PublicAddress, TargetListReport,
@@ -53,34 +54,41 @@ fn tier_level(tier: Option<&str>) -> Option<u8> {
         .map(cli_core::Tier::level)
 }
 
-/// One target in full, never its token. `provisioned` comes from `state/<name>` only; a corrupt
-/// state is `Unreadable`, not an error, so the rest still shows. Lockless (R3).
+/// One target in full, never its token: its config, and what its token record says, read
+/// through the secret store. `provisioned` comes from `state/<name>` only; a corrupt state is
+/// `Unreadable`, not an error, so the rest still shows. Lockless (R3).
 pub fn show(ctx: &Context, target: &TargetRef) -> CoreResult<TargetReport> {
     let store = ctx.store();
+    let secrets = ctx.secrets();
     let name = target.name();
-    let t = cli_core::load_target(&store, name)?;
-    let token = t.credentials.hetzner_token.as_deref();
+    let config = cli_core::target::load_target_config(&store, name)?;
+    let token = match secrets.token_presence(name)? {
+        StoredToken::None => TokenPresence {
+            set: false,
+            chars: None,
+        },
+        StoredToken::InFile { chars } => TokenPresence {
+            set: true,
+            chars: Some(chars),
+        },
+    };
     Ok(TargetReport {
         name: name.to_string(),
         is_cli_default: cli_default(ctx)?.as_deref() == Some(name),
-        provider: t.config.provider,
-        tier_level: tier_level(t.config.default_tier.as_deref()),
-        region: t.config.region,
-        server_type: t.config.server_type,
-        default_tier: t.config.default_tier,
-        cluster_name: t.config.cluster_name,
-        ssh_key: t
-            .config
+        provider: config.provider,
+        tier_level: tier_level(config.default_tier.as_deref()),
+        region: config.region,
+        server_type: config.server_type,
+        default_tier: config.default_tier,
+        cluster_name: config.cluster_name,
+        ssh_key: config
             .ssh_key_path
             .as_deref()
             .map(|p| inspect_key(ctx, p))
             .transpose()?,
-        token: TokenPresence {
-            set: token.is_some(),
-            chars: token.map(|t| t.len() as u32),
-        },
+        token,
         config_file: store.target_config_file(name).display().to_string(),
-        credentials_file: store.target_credentials_file(name).display().to_string(),
+        credentials_file: secrets.credentials_file(name).display().to_string(),
         provisioned: match provisioned(ctx, target) {
             Ok(None) => ProvisionedState::NotProvisioned,
             Ok(Some(server)) => ProvisionedState::Provisioned { server },
@@ -91,19 +99,21 @@ pub fn show(ctx: &Context, target: &TargetRef) -> CoreResult<TargetReport> {
     })
 }
 
-/// The Hetzner token for `target`: the CLI's `HCLOUD_TOKEN` override first, else the stored
-/// one — today's `resolve_hetzner_token` order (R4). The desktop has no override.
+/// The Hetzner token for `target`, through the secret store: the CLI's `HCLOUD_TOKEN`
+/// override first, else the stored one (R4). The desktop has no override. The token needs
+/// only its record (D.4a b); d4a-c adds the locked modes here (overview §3.4).
 pub fn hetzner_token(ctx: &Context, target: &TargetRef) -> CoreResult<SecretString> {
-    if let Some(token) = &ctx.overrides().hetzner_token {
-        return Ok(token.clone());
+    let secrets = ctx.secrets();
+    match secrets.mode()? {
+        SecretsMode::Files => match &ctx.overrides().hetzner_token {
+            Some(token) => Ok(token.clone()),
+            None => secrets
+                .stored_token(target.name())?
+                .ok_or_else(|| CoreError::TokenNotStored {
+                    name: target.name().to_string(),
+                }),
+        },
     }
-    cli_core::load_target(&ctx.store(), target.name())?
-        .credentials
-        .hetzner_token
-        .map(SecretString::new)
-        .ok_or_else(|| CoreError::TokenNotStored {
-            name: target.name().to_string(),
-        })
 }
 
 /// The node's public IPv4 and IPv6 (`<prefix>::1`) from `GET /v1/servers/{id}` of the server
@@ -292,6 +302,16 @@ mod tests {
             hetzner_token(&cli(MapEnv::new()), &t).unwrap().expose(),
             "stored-tok"
         );
+    }
+
+    /// D.4a b: the token is read from its record alone, through the secret store, so a target
+    /// whose `config.yaml` is gone still has the token it stores.
+    #[test]
+    fn the_token_needs_only_its_record() {
+        let (_d, ctx) = store("http://unused", Some("stored-tok"), false);
+        let t = TargetRef::named(&ctx, "prod").unwrap();
+        std::fs::remove_file(ctx.store().target_config_file("prod")).unwrap();
+        assert_eq!(hetzner_token(&ctx, &t).unwrap().expose(), "stored-tok");
     }
 
     #[test]

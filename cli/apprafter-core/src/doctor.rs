@@ -2,9 +2,7 @@
 //! Doctor (D.3 overview §3.9): the report a run produces, grouped, with a typed fix per row,
 //! and [`run`], the Read that produces it.
 
-use std::path::Path;
-
-use cli_core::target::{load_target, validate_hetzner_token_format, Target, TargetStorePaths};
+use cli_core::target::{validate_hetzner_token_format, TargetConfig};
 use cli_core::CliError;
 use cli_state::{HetznerCloudState, State, StatePaths};
 use serde::Serialize;
@@ -17,6 +15,7 @@ use crate::net;
 use crate::provider::{self, SUPPORTED_PROVIDERS};
 use crate::report::{Event, Reporter};
 use crate::runtime;
+use crate::secrets::SecretStore;
 use crate::target_ref::TargetRef;
 use crate::tools::{self, ToolId, ToolProblem, ToolStatus};
 
@@ -397,7 +396,7 @@ fn target_group(
     let store = ctx.store();
     let name = target.name();
     let config_file = store.target_config_file(name).display().to_string();
-    let loaded = match load_target(&store, name) {
+    let loaded = match load(ctx, name) {
         Ok(t) => t,
         // Removed between the lookup and this read.
         Err(CliError::TargetNotFound { .. }) => {
@@ -421,7 +420,7 @@ fn target_group(
             detail: Some(config_file),
             ..row(CheckId::ConfigReadable, CheckStatus::Pass, TITLE_CONFIG)
         },
-        credentials_file(&store, name),
+        credentials_file(&ctx.secrets(), name),
         provider_supported(&loaded),
         token_format(&loaded),
         token_verified(ctx, &loaded, cancel)?,
@@ -429,8 +428,27 @@ fn target_group(
     ])
 }
 
-fn credentials_file(store: &TargetStorePaths, name: &str) -> Check {
-    let path = store.target_credentials_file(name);
+/// A target as doctor checks it: its config and its STORED token (never an override, R4).
+struct Loaded {
+    name: String,
+    config: TargetConfig,
+    token: Option<SecretString>,
+}
+
+/// Both of `name`'s files in `cli_core::load_target`'s order — the config, then the token
+/// through the secret store — so a file that cannot be read is the same row as before.
+fn load(ctx: &Context, name: &str) -> cli_core::Result<Loaded> {
+    let config = cli_core::target::load_target_config(&ctx.store(), name)?;
+    let token = ctx.secrets().stored_token(name)?;
+    Ok(Loaded {
+        name: name.to_string(),
+        config,
+        token,
+    })
+}
+
+fn credentials_file(secrets: &SecretStore, name: &str) -> Check {
+    let path = secrets.credentials_file(name);
     let shown = path.display().to_string();
     if !path.exists() {
         return Check {
@@ -501,7 +519,7 @@ fn credentials_file(store: &TargetStorePaths, name: &str) -> Check {
     }
 }
 
-fn provider_supported(target: &Target) -> Check {
+fn provider_supported(target: &Loaded) -> Check {
     let p = &target.config.provider;
     let title = format!("Provider `{p}` supported");
     if SUPPORTED_PROVIDERS.contains(&p.as_str()) {
@@ -516,8 +534,8 @@ fn provider_supported(target: &Target) -> Check {
     }
 }
 
-fn token_format(target: &Target) -> Check {
-    let Some(token) = target.credentials.hetzner_token.as_deref() else {
+fn token_format(target: &Loaded) -> Check {
+    let Some(token) = target.token.as_ref().map(SecretString::expose) else {
         return Check {
             fix: Some(CheckFix::RenewToken {
                 target: target.name.clone(),
@@ -555,7 +573,7 @@ fn token_format(target: &Target) -> Check {
     }
 }
 
-fn token_verified(ctx: &Context, target: &Target, cancel: &CancellationToken) -> CoreResult<Check> {
+fn token_verified(ctx: &Context, target: &Loaded, cancel: &CancellationToken) -> CoreResult<Check> {
     let skipped = |detail: String| Check {
         detail: Some(detail),
         ..row(
@@ -567,7 +585,7 @@ fn token_verified(ctx: &Context, target: &Target, cancel: &CancellationToken) ->
     if ctx.no_ping() {
         return Ok(skipped("not requested".into()));
     }
-    let Some(token) = target.credentials.hetzner_token.as_deref() else {
+    let Some(token) = target.token.as_ref() else {
         return Ok(skipped("no token stored".into()));
     };
     let provider = target.config.provider.as_str();
@@ -576,7 +594,7 @@ fn token_verified(ctx: &Context, target: &Target, cancel: &CancellationToken) ->
     }
     cancel.check()?;
     // `ping`, not `verification`: the failure row keeps the API's own message (deviation 1).
-    match provider::ping(ctx, provider, &SecretString::new(token), cancel) {
+    match provider::ping(ctx, provider, token, cancel) {
         Ok(elapsed) => Ok(Check {
             detail: Some(format!(
                 "Hetzner Cloud /v1/locations, {} ms",
@@ -664,7 +682,7 @@ fn hetzner_status(
     }
 }
 
-fn ssh_key(target: &Target) -> Check {
+fn ssh_key(target: &Loaded) -> Check {
     let Some(path) = target.config.ssh_key_path.as_ref() else {
         return Check {
             fix: Some(CheckFix::ConfigureSshKey {
@@ -804,8 +822,8 @@ fn kubeconfig_cached(name: &str, s: &HetznerCloudState) -> Check {
     }
 }
 
-/// Order: a cache to probe → the age key, read WITHOUT creating one (only for the encrypted
-/// slot) → kubectl resolves → decrypt into the runtime dir → `/version` within the bound. The
+/// Order: a cache to probe → the cache key, through the secret store, read WITHOUT creating one
+/// (only for the encrypted slot) → kubectl resolves → decrypt into the runtime dir → `/version` within the bound. The
 /// file is removed when `file` drops, at the end of this function; nothing is written when a
 /// step before the decrypt says the probe cannot run.
 fn kube_api(
@@ -826,9 +844,11 @@ fn kube_api(
         });
     }
     if s.kubeconfig_age.is_some() {
-        match cli_core::secrets::load_identity(ctx.age_key_path()) {
-            Ok(Some(_)) => {}
-            Ok(None) => return Ok(age_key_missing(base, target, ctx.age_key_path())),
+        match ctx.secrets().cache_key(target.name()) {
+            Ok(_) => {}
+            Err(CliError::AgeKeyMissing { path, .. }) => {
+                return Ok(age_key_missing(base, target, path))
+            }
             Err(e) => {
                 return Ok(Check {
                     status: CheckStatus::Fail,
@@ -861,9 +881,7 @@ fn kube_api(
                 ..base
             })
         }
-        Err(CoreError::AgeKeyMissing { .. }) => {
-            return Ok(age_key_missing(base, target, ctx.age_key_path()))
-        }
+        Err(CoreError::AgeKeyMissing { path }) => return Ok(age_key_missing(base, target, path)),
         // A key that does not open the cache: its own fix, which names the refetch (review #8).
         Err(CoreError::Cli(cli_core::CliError::CacheUndecryptable {
             target: whose,
@@ -926,13 +944,13 @@ fn kube_api(
     }
 }
 
-fn age_key_missing(base: Check, target: &TargetRef, key: &Path) -> Check {
+fn age_key_missing(base: Check, target: &TargetRef, path: String) -> Check {
     Check {
         status: CheckStatus::Fail,
         detail: None,
         fix: Some(CheckFix::AgeKeyMissing {
             target: target.name().to_string(),
-            path: key.display().to_string(),
+            path,
         }),
         ..base
     }
@@ -1152,7 +1170,7 @@ mod tests {
     use super::*;
     use crate::context::PathSource;
     use crate::report::{CollectReporter, NullReporter};
-    use cli_core::target::{GlobalConfig, TargetConfig, TargetCredentials};
+    use cli_core::target::{GlobalConfig, Target, TargetConfig, TargetCredentials};
     use cli_state::{HetznerCloudState, State, StatePaths};
     use std::path::PathBuf;
     use std::time::Duration;

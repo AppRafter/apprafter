@@ -2,12 +2,13 @@
 //! `target remove`: forget a target on this computer (the server, if any, keeps running at the
 //! provider), as plan and execute.
 
-use cli_core::{CliError, TargetStorePaths};
+use cli_core::CliError;
 
 use crate::op::{ChangeAction, Outcome, Plan, PlanClass};
 use crate::report::Reporter;
 use crate::target::{
-    cancelled, change, cli_default, lock_store_if_present, provisioned, TargetRemoved,
+    cancelled, change, cli_default, lock_store_if_present, provisioned, readable_config,
+    TargetRemoved,
 };
 use crate::{ActivePointerChange, CancellationToken, Context, CoreResult, TargetRef};
 
@@ -30,7 +31,7 @@ pub struct RemovePayload {
 pub fn plan_remove(ctx: &Context, target: &TargetRef) -> CoreResult<Plan<RemovePayload>> {
     let name = target.name();
     let store = ctx.store();
-    let files = TargetFiles::read(&store, name);
+    let files = TargetFiles::read(ctx, name);
     let mut changes = vec![
         change("Target", name, ChangeAction::Delete, files.config.clone()),
         change(
@@ -68,7 +69,7 @@ pub fn plan_remove(ctx: &Context, target: &TargetRef) -> CoreResult<Plan<RemoveP
         ));
     }
     if cli_default(ctx)?.as_deref() == Some(name) {
-        let next = next_default(&store, name)?;
+        let next = next_default(ctx, name)?;
         let skipped = next.skipped.join(", ");
         changes.push(match &next.to {
             Some(to) if next.skipped.is_empty() => change(
@@ -111,15 +112,18 @@ struct TargetFiles {
 }
 
 impl TargetFiles {
-    fn read(store: &TargetStorePaths, name: &str) -> Self {
-        let config = match cli_core::target::load_target_config(store, name) {
+    fn read(ctx: &Context, name: &str) -> Self {
+        let config = match cli_core::target::load_target_config(&ctx.store(), name) {
             Ok(_) => None,
             // The directory is listed (`TargetRef::named`) without its config.yaml; one this
             // user cannot search is an I/O error, never missing (WI-458 review #3).
             Err(CliError::TargetNotFound { .. }) => Some("config.yaml is missing".to_string()),
             Err(e) => Some(format!("config.yaml cannot be read: {}", reason(&e))),
         };
-        let credentials = cli_core::target::load_target_credentials(store, name)
+        // The token record through the secret store: never the token.
+        let credentials = ctx
+            .secrets()
+            .token_presence(name)
             .err()
             .map(|e| format!("credentials.yaml cannot be read: {}", reason(&e)));
         Self {
@@ -149,17 +153,17 @@ struct NextDefault {
     skipped: Vec<String>,
 }
 
-/// The alphabetically first target other than `removing` that `cli_core::load_target` loads —
-/// both files, as every command that falls back on the default reads them — and those passed
-/// over on the way (WI-458: a default that cannot be read fails every command that names no
-/// target).
-fn next_default(store: &TargetStorePaths, removing: &str) -> CoreResult<NextDefault> {
+/// The alphabetically first target other than `removing` that can be read — both files, as
+/// every command that falls back on the default reads them ([`readable_config`]) — and those
+/// passed over on the way (WI-458: a default that cannot be read fails every command that
+/// names no target).
+fn next_default(ctx: &Context, removing: &str) -> CoreResult<NextDefault> {
     let mut skipped = Vec::new();
-    for n in cli_core::list_target_names(store)? {
+    for n in cli_core::list_target_names(&ctx.store())? {
         if n == removing {
             continue;
         }
-        if cli_core::load_target(store, &n).is_ok() {
+        if readable_config(ctx, &n).is_ok() {
             return Ok(NextDefault {
                 to: Some(n),
                 skipped,
@@ -193,7 +197,7 @@ pub fn execute_remove(
     cli_core::remove_target(&store, &name)?;
     let mut skipped_unreadable = Vec::new();
     let cli_default = if cli_default(ctx)?.as_deref() == Some(name.as_str()) {
-        let next = next_default(&store, &name)?;
+        let next = next_default(ctx, &name)?;
         skipped_unreadable = next.skipped;
         match next.to {
             Some(next) => {

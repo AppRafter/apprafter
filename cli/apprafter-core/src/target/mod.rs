@@ -23,11 +23,11 @@ pub use read::{hetzner_token, list, public_address, show};
 pub use remove::{execute_remove, plan_remove, RemovePayload};
 pub use rename::{execute_rename, plan_rename, RenamePayload};
 
-use cli_core::{StoreLock, StoreLockEvent};
+use cli_core::{StoreLock, StoreLockEvent, TargetConfig};
 use serde::Serialize;
 
 use crate::context::Context;
-use crate::error::{CoreResult, UiError};
+use crate::error::{CoreError, CoreResult, UiError};
 use crate::op::{ChangeAction, Outcome, PlannedChange};
 use crate::provider::Verification;
 use crate::report::{Event, Reporter};
@@ -284,6 +284,31 @@ pub(crate) fn lock_store_if_present(
     }
 }
 
+/// The store lock for an edit of target `name`. A target lives in a store that exists, so no
+/// root is `TargetNotFound` with no names — the error reading the target gives — and locking
+/// never creates the root. A token write needs the lock to hand the secret store (D.4a b).
+pub(crate) fn lock_store_for(
+    ctx: &Context,
+    reporter: &dyn Reporter,
+    name: &str,
+) -> CoreResult<StoreLock> {
+    lock_store_if_present(ctx, reporter)?.ok_or_else(|| CoreError::TargetNotFound {
+        name: name.to_string(),
+        available: Vec::new(),
+    })
+}
+
+/// Target `name`'s `config.yaml`, read only when its token record can be read too: every
+/// command that names no target has always read both of a target's files (`cli_core::load_target`),
+/// so a target whose credentials file cannot be read is that file's error, and a missing one
+/// is `TargetNotFound` with the names present. The token itself is never read (on a locked
+/// store, d4a-c, the record is the vault marker).
+pub fn readable_config(ctx: &Context, name: &str) -> cli_core::Result<TargetConfig> {
+    let config = cli_core::target::load_target_config(&ctx.store(), name)?;
+    ctx.secrets().token_presence(name)?;
+    Ok(config)
+}
+
 /// What `state/<name>/.apprafter/state.json` records about a server. Reads only that file —
 /// the legacy `<cwd>/.apprafter` migration is the CLI's (spec §3.1). Lockless: state files are
 /// replaced atomically.
@@ -416,5 +441,41 @@ mod helper_tests {
             UiError::from(&e).code.as_deref(),
             Some("apprafter::state::corrupt")
         );
+    }
+
+    /// Both of a target's files, as every command that names no target reads them: the config,
+    /// and the token record through the secret store — never the token.
+    #[test]
+    fn a_readable_target_is_its_config_and_a_token_record_that_can_be_read() {
+        let (_d, ctx) = store(&["bad", "prod"], None);
+        assert_eq!(
+            readable_config(&ctx, "prod").unwrap().region.as_deref(),
+            Some("nbg1")
+        );
+        let creds = ctx.secrets().credentials_file("bad");
+        std::fs::write(&creds, "hetzner_token: [").unwrap();
+        assert!(matches!(readable_config(&ctx, "bad"),
+                Err(cli_core::CliError::InvalidTargetConfig { ref path, .. }) if *path == creds));
+        assert!(matches!(readable_config(&ctx, "ghost"),
+                Err(cli_core::CliError::TargetNotFound { ref name, ref available })
+                    if name == "ghost" && available == "bad, prod"));
+    }
+
+    /// A token write needs a lock to hand the store; a store that is gone has no target, which
+    /// is the error reading the target gives, and locking never creates the root.
+    #[test]
+    fn an_edit_in_a_store_that_is_gone_is_not_found_and_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = Context::for_desktop(dir.path().join("absent"), "http://unused");
+        assert!(matches!(
+            lock_store_for(&ctx, &crate::NullReporter, "prod"),
+            Err(CoreError::TargetNotFound { ref name, ref available })
+                if name == "prod" && available.is_empty()
+        ));
+        assert!(!dir.path().join("absent").exists());
+        let (_d, ctx) = store(&["prod"], None);
+        assert!(lock_store_for(&ctx, &crate::NullReporter, "prod")
+            .unwrap()
+            .is_held());
     }
 }

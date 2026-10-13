@@ -16,7 +16,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use cli_state::{State, StatePaths};
-use zeroize::Zeroizing;
 
 use crate::context::Context;
 use crate::error::{CoreError, CoreResult};
@@ -50,11 +49,12 @@ impl Drop for MaterialisedKubeconfig {
 
 /// The target's cached kubeconfig, written to `<runtime_dir>/kubeconfig-<pid>-<n>.yaml`.
 ///
-/// `None` when the state records no server or caches no kubeconfig. The encrypted slot wins over
-/// the legacy plaintext one (a plaintext copy beside it may be stale, as the CLI's
-/// `k8s_helpers::select_cached_kubeconfig` documents); decrypting it loads the age identity
-/// WITHOUT creating one — a missing key is [`CoreError::AgeKeyMissing`], never a new key — and
-/// a key that does not open it is `CliError::CacheUndecryptable` (as [`CoreError::Cli`]).
+/// `None` when the state records no server or caches no kubeconfig. The secret store opens
+/// it: the encrypted slot wins over the legacy plaintext one (a plaintext copy beside it may
+/// be stale), the age identity is read WITHOUT creating one — a missing key is
+/// [`CoreError::AgeKeyMissing`], never a new key — and a key that does not open it is
+/// `CliError::CacheUndecryptable` (as [`CoreError::Cli`]) with the target, so a caller names
+/// the refetch (WI-457 review #8).
 pub fn materialise_kubeconfig(
     ctx: &Context,
     target: &TargetRef,
@@ -64,31 +64,8 @@ pub fn materialise_kubeconfig(
     let Some(server) = state.hetzner_cloud else {
         return Ok(None);
     };
-    let body = match (
-        server.kubeconfig_age.as_deref(),
-        server.kubeconfig_yaml.as_deref(),
-    ) {
-        (Some(armored), _) => {
-            let key = ctx.age_key_path();
-            let identity =
-                cli_core::secrets::load_identity(key)?.ok_or_else(|| CoreError::AgeKeyMissing {
-                    path: key.display().to_string(),
-                })?;
-            // A key that does not open the cache is the CLI's typed error, with the target, so
-            // a caller names the refetch instead of the age library's text (WI-457 review #8).
-            Zeroizing::new(
-                cli_core::secrets::decrypt_with_identity(armored, &identity).map_err(|e| {
-                    cli_core::CliError::CacheUndecryptable {
-                        secret: cli_core::secrets::CachedSecret::Kubeconfig,
-                        target: target.name().to_string(),
-                        path: key.display().to_string(),
-                        detail: e.to_string(),
-                    }
-                })?,
-            )
-        }
-        (None, Some(plain)) => Zeroizing::new(plain.to_string()),
-        (None, None) => return Ok(None),
+    let Some(body) = ctx.secrets().cached_kubeconfig(&server, target.name())? else {
+        return Ok(None);
     };
     write_private(ctx.runtime_dir(), body.as_bytes()).map(Some)
 }

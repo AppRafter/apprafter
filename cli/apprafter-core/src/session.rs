@@ -4,7 +4,7 @@
 
 use serde::Serialize;
 
-use crate::context::{Context, SecretString};
+use crate::context::Context;
 use crate::error::{CoreError, CoreResult};
 use crate::provider::Verification;
 use crate::ssh::SshKeyInfo;
@@ -63,11 +63,11 @@ pub struct WhoamiReport {
     pub cli_default: CliDefaultTarget,
 }
 
-/// Who the operator is and what the CLI default is. Pings with the STORED token unless
-/// `ctx.no_ping()` — never the CLI's `HCLOUD_TOKEN` override (today's CLI; R4). A dangling
-/// pointer is `Missing`, never an error: the CLI turns it into `TargetNotFound`, the GUI shows a
-/// row. Lockless (R3). A token cancelled by the time the verification is over ends the read
-/// with [`CoreError::Cancelled`], never with a report.
+/// Who the operator is and what the CLI default is. Pings with the STORED token, read through
+/// the secret store, unless `ctx.no_ping()` — never the CLI's `HCLOUD_TOKEN` override (today's
+/// CLI; R4). A dangling pointer is `Missing`, never an error: the CLI turns it into
+/// `TargetNotFound`, the GUI shows a row. Lockless (R3). A token cancelled by the time the
+/// verification is over ends the read with [`CoreError::Cancelled`], never with a report.
 pub fn whoami(ctx: &Context, cancel: &CancellationToken) -> CoreResult<WhoamiReport> {
     let identity = Identity::AnonymousSelfHosted;
     let Some(name) = crate::target::cli_default(ctx)? else {
@@ -76,19 +76,19 @@ pub fn whoami(ctx: &Context, cancel: &CancellationToken) -> CoreResult<WhoamiRep
             cli_default: CliDefaultTarget::None,
         });
     };
-    let t = match cli_core::load_target(&ctx.store(), &name).map_err(CoreError::from) {
-        Ok(t) => t,
-        Err(CoreError::TargetNotFound { name, available }) => {
-            return Ok(WhoamiReport {
-                identity,
-                cli_default: CliDefaultTarget::Missing { name, available },
-            })
-        }
-        Err(e) => return Err(e),
-    };
-    let token = t.credentials.hetzner_token.clone().map(SecretString::new);
-    let verification =
-        crate::provider::verification(ctx, &t.config.provider, token.as_ref(), cancel);
+    let config =
+        match cli_core::target::load_target_config(&ctx.store(), &name).map_err(CoreError::from) {
+            Ok(config) => config,
+            Err(CoreError::TargetNotFound { name, available }) => {
+                return Ok(WhoamiReport {
+                    identity,
+                    cli_default: CliDefaultTarget::Missing { name, available },
+                })
+            }
+            Err(e) => return Err(e),
+        };
+    let token = ctx.secrets().stored_token(&name)?;
+    let verification = crate::provider::verification(ctx, &config.provider, token.as_ref(), cancel);
     // `verification` reads a cancelled ping as `Unreachable`; its caller ends the read here.
     cancel.check()?;
     Ok(WhoamiReport {
@@ -96,14 +96,13 @@ pub fn whoami(ctx: &Context, cancel: &CancellationToken) -> CoreResult<WhoamiRep
         cli_default: CliDefaultTarget::Found {
             target: WhoamiTarget {
                 name,
-                provider: t.config.provider,
+                provider: config.provider,
                 verification,
-                region: t.config.region,
-                server_type: t.config.server_type,
-                default_tier: t.config.default_tier,
-                cluster_name: t.config.cluster_name,
-                ssh_key: t
-                    .config
+                region: config.region,
+                server_type: config.server_type,
+                default_tier: config.default_tier,
+                cluster_name: config.cluster_name,
+                ssh_key: config
                     .ssh_key_path
                     .as_deref()
                     .map(|p| crate::ssh::inspect_key(ctx, p))

@@ -41,9 +41,10 @@ pub fn plan_use(ctx: &Context, target: &TargetRef) -> CoreResult<Plan<UsePayload
     })
 }
 
-/// Both of target `name`'s files, read as `cli_core::load_target` reads them.
+/// Both of target `name`'s files, as every command that names no target reads them
+/// ([`crate::target::readable_config`]): never the token.
 fn require_loadable(ctx: &Context, name: &str) -> CoreResult<()> {
-    cli_core::load_target(&ctx.store(), name)
+    crate::target::readable_config(ctx, name)
         .map(drop)
         .map_err(CoreError::from)
 }

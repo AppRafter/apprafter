@@ -5,7 +5,8 @@
 use crate::op::{ChangeAction, Outcome, Plan, PlanClass};
 use crate::report::Reporter;
 use crate::target::{
-    cancelled, change, hetzner_token, lock_store_if_present, provisioned, MachineSet, SkuCheck,
+    cancelled, change, hetzner_token, lock_store_if_present, provisioned, readable_config,
+    MachineSet, SkuCheck,
 };
 use crate::{CancellationToken, Context, CoreError, CoreResult, TargetRef};
 
@@ -145,13 +146,16 @@ pub fn execute_machine(
     }
     let store = ctx.store();
     let _lock = lock_store_if_present(ctx, reporter)?;
-    let mut t = cli_core::load_target(&store, &name)?;
+    // Both files are read, as `load_target` read them (a target whose credentials cannot be
+    // read is refused as before); only `config.yaml` is written, so a token renewed
+    // meanwhile stays as it is.
+    let mut config = readable_config(ctx, &name)?;
     refuse_if_provisioned(ctx, &target)?;
-    t.config.server_type = Some(choice.sku.clone());
+    config.server_type = Some(choice.sku.clone());
     if let Some(r) = &choice.region {
-        t.config.region = Some(r.clone());
+        config.region = Some(r.clone());
     }
-    cli_core::save_target(&store, &t)?;
+    cli_core::target::save_target_config(&store, &name, &config)?;
     Ok(Outcome::Completed {
         result: MachineSet {
             name,
