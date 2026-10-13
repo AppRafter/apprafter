@@ -29,7 +29,7 @@ use apprafter_core::secrets::{
 use apprafter_core::vault::{
     KdfPolicy, OsRandom, RecoveryKey, SlotSecret, VaultFile, VaultId, VAULT_FILE,
 };
-use common::spawn::{open_pty, Bin, Spawn};
+use common::spawn::{Bin, Spawn};
 
 /// 64 ASCII alphanumerics, the shape cli_core accepts.
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
@@ -623,28 +623,18 @@ fn a_hung_holder_is_ended_and_a_live_one_never() {
     s.finish();
 }
 
-/// T47: `apprafter __holder` typed at a terminal is no command: it says so and exits 2.
+/// T47: `apprafter __holder` typed at a terminal is no command: it says so and exits 2. The
+/// terminal is read while the child runs (`converse`): macOS drains a session leader's
+/// controlling terminal as the leader exits (XNU's `proc_exit` waits in `ttywait` until the
+/// master has read what the slave wrote), so a terminal nobody reads holds that exit for good.
 #[test]
 fn the_holder_refuses_a_terminal() {
-    let sp = Spawn::new();
-    let (master, slave) = open_pty();
-    let out = sp
-        .std_at_terminal(&["__holder"], slave)
-        .stdout(Stdio::piped())
-        .output()
-        .unwrap();
-    let mut seen = Vec::new();
-    let mut m = std::fs::File::from(master);
-    // SAFETY: fcntl on the master this test owns: its reads stop at "no more data".
-    unsafe {
-        let flags = libc::fcntl(m.as_raw_fd(), libc::F_GETFL);
-        libc::fcntl(m.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
-    }
-    let _ = std::io::Read::read_to_end(&mut m, &mut seen);
-    assert_eq!(out.status.code(), Some(2));
+    let ended = common::terminal::converse(&Spawn::new(), &["__holder"], &[]);
+    assert_eq!(ended.status.code(), Some(2), "{}", ended.terminal);
     assert!(
-        String::from_utf8_lossy(&seen).contains("not a command"),
-        "{seen:?}"
+        ended.terminal.contains("not a command"),
+        "{}",
+        ended.terminal
     );
 }
 

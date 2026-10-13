@@ -254,12 +254,6 @@ const ALLOWED: &[(&str, &str, Rule)] = &[
         "a_holder_without_an_init_frame_writes_nothing",
         Rule::InSession,
     ),
-    // `__holder` typed at a terminal (T47): the forced condition is the terminal.
-    (
-        "platform-cli/tests/holder_unix.rs",
-        "the_holder_refuses_a_terminal",
-        Rule::AtTerminal,
-    ),
     // The OS probes of D.4a Task 6: this test binary re-run for an inner probe, one with a console
     // of its own and one detached; they run no apprafter.
     (
