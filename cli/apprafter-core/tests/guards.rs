@@ -20,6 +20,12 @@
 //!    direct `TS::export` / `TS::export_all` call ([`ts_exports`]): under
 //!    cli/'s `cargo test --all-features` it would write files into this
 //!    crate. The desktop exports the core's types from its own tests.
+//! 5. **One door to the secrets.** No production code in `apprafter-core/src` outside
+//!    `src/secrets/` reads or writes a target's credentials file, reads the shared age key, or
+//!    opens or seals a cache ([`SECRET_DOORS`], [`SECRET_DOOR_METHODS`]), and nothing in
+//!    `apprafter-core/src` seals a cache to a recipient that is not a `CacheKey`'s ([`SEAL`]):
+//!    every token and cached secret goes through `Context::secrets()` (ADR 0068 §5; D.4a
+//!    T16). d4a-c extends both rules to `platform-cli` once its writers moved.
 //!
 //! The scan reads syntax trees (`syn`), not text, so neither a comment nor
 //! a string can hide or fake a hit, and nothing depends on where an item
@@ -172,6 +178,33 @@ const SANCTIONED: &[(&str, &str)] = &[
     ("cli_core::paths::home_dir", "Context::from_desktop_env"),
 ];
 
+/// What reads or writes a target's `credentials.yaml`, reads the shared age key, or opens or
+/// seals a cached secret. In `apprafter-core/src` only `src/secrets/` may reach them: every
+/// other module goes through `Context::secrets()` (ADR 0068 §5; D.4a T16). A path matches an
+/// entry when it starts with it; paths resolve as written, so each re-export is listed beside
+/// its definition, and every entry must name a real item
+/// (`every_listed_callee_names_a_real_item`).
+const SECRET_DOORS: &[&str] = &[
+    "cli_core::target::load_target",
+    "cli_core::load_target",
+    "cli_core::target::load_target_credentials",
+    "cli_core::target::save_target",
+    "cli_core::save_target",
+    "cli_core::target::save_target_credentials",
+    "cli_core::secrets::load_identity",
+    "cli_core::secrets::decrypt_with_identity",
+    "cli_core::secrets::encrypt_for_recipient",
+];
+
+/// Methods that name a credentials file. A method call is matched by its name: a syntax scan
+/// does not know the receiver's type, and no other method is called this.
+const SECRET_DOOR_METHODS: &[&str] = &["target_credentials_file"];
+
+/// The one function a cache is sealed with, and the one method its recipient may come from,
+/// in the same expression: `CacheKey::recipient` (D.4a T16).
+const SEAL: &str = "cli_core::secrets::encrypt_for_recipient";
+const RECIPIENT_METHOD: &str = "recipient";
+
 /// Crates `apprafter-core` must not depend on: a client prompts, draws
 /// progress, renders tables and colours, and handles signals.
 ///
@@ -223,6 +256,11 @@ enum Kind {
     /// A `ts(export)` / `ts(export_to = …)` attribute, or a direct
     /// `TS::export*` call ([`ts_exports`]).
     TsExport,
+    /// One of [`SECRET_DOORS`] or [`SECRET_DOOR_METHODS`]: allowed only under
+    /// `apprafter-core/src/secrets/`.
+    SecretDoor,
+    /// A call of [`SEAL`] whose recipient is not `<key>.recipient()` (a `CacheKey`'s), anywhere.
+    ForeignRecipient,
     /// A per-user runtime path or a Windows pipe name outside [`ENDPOINT_LITERALS`] (G2).
     EndpointLiteral,
 }
@@ -470,6 +508,19 @@ fn path_matches(path: &[String], entry: &str) -> bool {
     path.len() >= entry.len() && path.iter().zip(&entry).all(|(a, b)| a == b)
 }
 
+/// Whether `e` is a recipient a `CacheKey` gave — `<key>.recipient()`, behind any `&`, `?` and
+/// parentheses. One bound to a name first does not count: the rule is that the recipient is
+/// made in the very expression handed to [`SEAL`], where the guard can read it.
+fn from_cache_key(e: &Expr) -> bool {
+    match e {
+        Expr::Reference(r) => from_cache_key(&r.expr),
+        Expr::Try(t) => from_cache_key(&t.expr),
+        Expr::Paren(p) => from_cache_key(&p.expr),
+        Expr::MethodCall(m) => m.method == RECIPIENT_METHOD && m.args.is_empty(),
+        _ => false,
+    }
+}
+
 struct Scanner<'f> {
     file: &'f Path,
     scopes: Vec<Scope>,
@@ -537,6 +588,9 @@ impl<'f> Scanner<'f> {
         }
         if let Some(entry) = FORBIDDEN_CALLEES.iter().find(|e| path_matches(path, e)) {
             return Some((Kind::ForbiddenCallee, entry.to_string()));
+        }
+        if let Some(entry) = SECRET_DOORS.iter().find(|e| path_matches(path, e)) {
+            return Some((Kind::SecretDoor, entry.to_string()));
         }
         // A sanctioned callee is allowed when ANY entry pairs it with the
         // current site, and forbidden everywhere else.
@@ -849,6 +903,35 @@ impl<'ast, 'f> Visit<'ast> for Scanner<'f> {
         visit::visit_path(self, p);
     }
 
+    fn visit_expr_method_call(&mut self, m: &'ast syn::ExprMethodCall) {
+        let name = m.method.to_string();
+        if SECRET_DOOR_METHODS.contains(&name.as_str()) {
+            self.record(Kind::SecretDoor, name, m.method.span());
+        }
+        visit::visit_expr_method_call(self, m);
+    }
+
+    fn visit_expr_call(&mut self, c: &'ast syn::ExprCall) {
+        if let Expr::Path(p) = &*c.func {
+            let segs: Vec<String> = p
+                .path
+                .segments
+                .iter()
+                .map(|s| s.ident.to_string())
+                .collect();
+            let seals = self
+                .candidates(&segs, false)
+                .iter()
+                .any(|cand| cand.join("::") == SEAL);
+            if seals && !c.args.iter().nth(1).is_some_and(from_cache_key) {
+                if let Some(first) = p.path.segments.first() {
+                    self.record(Kind::ForeignRecipient, SEAL.to_string(), first.ident.span());
+                }
+            }
+        }
+        visit::visit_expr_call(self, c);
+    }
+
     fn visit_attribute(&mut self, a: &'ast Attribute) {
         let outer = std::mem::replace(&mut self.in_attribute, true);
         visit::visit_attribute(self, a);
@@ -1135,7 +1218,10 @@ fn rust_files(dir: &Path) -> Vec<PathBuf> {
 #[test]
 fn the_core_never_prints_exits_or_reads_the_environment() {
     let core = crate_dir("apprafter-core");
-    let mut hits = scan_tree(&core.join("src"));
+    let mut hits: Vec<Finding> = scan_tree(&core.join("src"))
+        .into_iter()
+        .filter(|h| !matches!(h.kind, Kind::SecretDoor | Kind::ForeignRecipient))
+        .collect();
     hits.extend(ts_export_crate(&core));
     hits.sort();
     assert!(
@@ -1165,6 +1251,7 @@ fn every_listed_callee_names_a_real_item() {
         .iter()
         .copied()
         .chain(SANCTIONED.iter().map(|(c, _)| *c))
+        .chain(SECRET_DOORS.iter().copied())
         .filter(|p| !item_exists(p))
         .collect();
     assert!(
@@ -1204,6 +1291,30 @@ fn env_reads_outside_the_core_only_go_down() {
     assert!(
         n == ENV_READ_BASELINE,
         "env reads fell to {n}: lower ENV_READ_BASELINE in this file to {n} in the same commit"
+    );
+}
+
+#[test]
+fn only_the_secret_store_reads_credentials_and_opens_caches() {
+    let src = crate_dir("apprafter-core").join("src");
+    let secrets = src.join("secrets");
+    let hits: Vec<Finding> = scan_tree(&src)
+        .into_iter()
+        .filter(|f| match f.kind {
+            Kind::SecretDoor => !f.file.starts_with(&secrets),
+            Kind::ForeignRecipient => true,
+            _ => false,
+        })
+        .collect();
+    assert!(
+        hits.is_empty(),
+        "a target's credentials file, the age key and the caches are reached only through \
+         apprafter-core/src/secrets/ (Context::secrets(), ADR 0068 §5), and a cache is sealed \
+         only to a CacheKey's recipient:\n{}",
+        hits.iter()
+            .map(|h| h.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
     );
 }
 
@@ -2092,6 +2203,53 @@ impl Context {
             hits(src),
             vec![(Kind::ForbiddenCallee, "cli_core::paths::home_dir".into(), 5)]
         );
+    }
+
+    #[test]
+    fn a_secret_door_is_caught_through_imports_reexports_and_methods() {
+        let src = "\
+use cli_core::load_target as load;
+use cli_core::target::save_target_credentials;
+fn f(store: &cli_core::TargetStorePaths, id: &Identity) {
+    let _ = load(store, \"a\");
+    let _ = save_target_credentials(store, \"a\", &Default::default());
+    let _ = cli_core::secrets::decrypt_with_identity(\"\", id);
+    let _ = store.target_credentials_file(\"a\");
+    let _ = cli_core::target::load_target_config(store, \"a\");
+    let _ = format!(\"{}\", store.target_credentials_file(\"b\").display());
+}
+";
+        let door = |c: &str, line| (Kind::SecretDoor, c.to_string(), line);
+        assert_eq!(
+            hits(src),
+            vec![
+                door("cli_core::load_target", 4),
+                door("cli_core::target::save_target_credentials", 5),
+                door("cli_core::secrets::decrypt_with_identity", 6),
+                door("target_credentials_file", 7),
+                door("target_credentials_file", 9),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_seal_takes_a_cache_keys_recipient_inline() {
+        let src = "\
+use cli_core::secrets::encrypt_for_recipient as seal;
+fn f(key: &CacheKey, other: &Identity) -> cli_core::Result<()> {
+    seal(\"a\", &key.recipient()?)?;
+    seal(\"b\", &other.to_public())?;
+    let r = key.recipient()?;
+    cli_core::secrets::encrypt_for_recipient(\"c\", &r)?;
+    Ok(())
+}
+";
+        let foreign: Vec<(Kind, String, usize)> = hits(src)
+            .into_iter()
+            .filter(|(k, _, _)| *k == Kind::ForeignRecipient)
+            .collect();
+        let seal = |line| (Kind::ForeignRecipient, SEAL.to_string(), line);
+        assert_eq!(foreign, vec![seal(4), seal(6)]);
     }
 
     #[test]

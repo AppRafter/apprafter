@@ -11,12 +11,14 @@
 //!   by the client from an [`EnvSource`] it supplies (the CLI from its whole
 //!   environment, the desktop from an allow-list of it under a
 //!   [`DesktopPolicy`]);
+//! - it reaches a target's stored secrets only through [`Context::secrets`]: no module
+//!   outside `secrets` reads a credentials file or the age key, or opens or seals a cache;
 //! - it never prompts: a mutation returns a [`Plan`] for the client to
 //!   confirm, then executes it;
 //! - cancellation is a [`CancellationToken`] per operation, never a process
 //!   signal handler.
 //!
-//! `tests/guards.rs` enforces the first three on the parsed source, not its
+//! `tests/guards.rs` enforces the first four on the parsed source, not its
 //! text, so production code after a test module, a renamed import
 //! (`use std::env::var as v`) and a call inside a macro's arguments are all
 //! seen. It fails on a print macro (`print!` … `dbg!`, any delimiter),
