@@ -111,8 +111,8 @@ pub fn show(ctx: &Context, target: &TargetRef) -> CoreResult<TargetReport> {
 
 /// The Hetzner token for `target`, through the secret store. In files: the CLI's `HCLOUD_TOKEN`
 /// override first, else the stored one (R4); the desktop has no override. On a locked store
-/// only its vault's token, never the variable (D.4a T35; d4a-d refuses the variable there,
-/// before any prompt); an interrupted lock flow refuses (`lock_incomplete`).
+/// only its vault's token: `HCLOUD_TOKEN` set there is `override_refused`, before any prompt
+/// (D.4a T35); an interrupted lock flow refuses (`lock_incomplete`).
 pub fn hetzner_token(ctx: &Context, target: &TargetRef) -> CoreResult<SecretString> {
     let secrets = ctx.secrets();
     let not_stored = || CoreError::TokenNotStored {
@@ -123,6 +123,13 @@ pub fn hetzner_token(ctx: &Context, target: &TargetRef) -> CoreResult<SecretStri
             Some(token) => Ok(token.clone()),
             None => secrets.stored_token(target.name())?.ok_or_else(not_stored),
         },
+        // T35: refused before the store is asked for anything (ADR 0068 §6).
+        SecretsMode::Locked if ctx.overrides().hetzner_token.is_some() => {
+            Err(CoreError::Cli(cli_core::CliError::OverrideOnLockedStore {
+                var: cli_core::HCLOUD_TOKEN_ENV,
+                store: ctx.config_root().to_path_buf(),
+            }))
+        }
         SecretsMode::Locked | SecretsMode::Locking | SecretsMode::Unlocking => {
             secrets.stored_token(target.name())?.ok_or_else(not_stored)
         }
@@ -324,27 +331,32 @@ mod tests {
         crate::secrets::testing::locked_store(root, &[("prod", Some(token.as_str()))]);
     }
 
-    /// D.4a T35's fail-closed half: on a locked store `HCLOUD_TOKEN` is never the token — the
-    /// store's own refusal answers (`store_locked`, with no way to open it here); d4a-d refuses
-    /// the variable itself before any prompt.
+    /// D.4a T35: on a locked store `HCLOUD_TOKEN` is refused, before the store's access is asked
+    /// anything — a token obtained elsewhere never passes the lock silently (ADR 0068 §6).
     #[test]
     fn a_locked_store_never_takes_hcloud_token() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("store");
         locked_at(&root);
+        let counting = std::sync::Arc::new(crate::secrets::testing::CountingAccess::default());
         let ctx = Context::from_cli_env(
             &MapEnv::new()
                 .with("APPRAFTER_CONFIG_DIR", root.to_str().unwrap())
                 .with("HCLOUD_TOKEN", "env-tok"),
         )
         .unwrap()
-        .with_home_dir(Some(dir.path().join("home")));
+        .with_home_dir(Some(dir.path().join("home")))
+        .with_vault_access(counting.clone());
         let t = TargetRef::named(&ctx, "prod").unwrap();
         let e = hetzner_token(&ctx, &t).unwrap_err();
-        assert!(
-            matches!(&e, CoreError::Cli(cli_core::CliError::StoreLocked { .. })),
-            "{e:?}"
-        );
+        match &e {
+            CoreError::Cli(cli_core::CliError::OverrideOnLockedStore { var, store }) => {
+                assert_eq!(*var, "HCLOUD_TOKEN");
+                assert_eq!(store, &root);
+            }
+            e => panic!("expected override_refused, got {e:?}"),
+        }
+        assert_eq!(counting.asked(), 0, "refused before anything was asked");
     }
 
     /// D.4a b: the token is read from its record alone, through the secret store, so a target

@@ -132,6 +132,19 @@ fn an_age_key_outside_is_refused() {
     );
 }
 
+/// T5: on a locked store the age key is not fenced for a command other than `lock on` /
+/// `lock off` — the variable is refused there and the shared key is never read (T35); a Windows
+/// test that omits `APPRAFTER_AGE_KEY` resolves the real profile's key, which must not stop it.
+#[test]
+fn an_age_key_outside_is_not_fenced_on_a_locked_store() {
+    let out = outside();
+    let sp = Spawn::new().with_env("APPRAFTER_AGE_KEY", out.path().join("age.key"));
+    apprafter_core::secrets::testing::locked_store(&sp.store(), &[("prod", None)]);
+    let run = list(&sp);
+    assert!(run.status.success(), "{}", squeeze(&run.stderr));
+    assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 0);
+}
+
 #[test]
 fn an_ssh_identity_outside_is_refused() {
     let out = outside();

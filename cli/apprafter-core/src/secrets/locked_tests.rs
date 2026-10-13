@@ -878,6 +878,50 @@ fn the_store_identity_opens_its_caches_and_the_shared_key_never_does() {
     );
 }
 
+/// D.4a T35: `APPRAFTER_AGE_KEY` set on a locked store is refused by every cache-key path,
+/// before the access is asked anything; in files the same variable is the key path (R4).
+#[test]
+fn apprafter_age_key_is_refused_on_a_locked_store_before_any_prompt() {
+    let (dir, ctx, _made) = locked(&[("prod", Some(TOKEN_A))]);
+    let counting = Arc::new(super::testing::CountingAccess::default());
+    let overridden = SecretStore::new(
+        ctx.store(),
+        dir.path().join("elsewhere").join("age.key"),
+        counting.clone(),
+        true,
+    );
+    let refused = |e: CliError| {
+        assert!(
+            matches!(&e, CliError::OverrideOnLockedStore { var, store }
+                if *var == "APPRAFTER_AGE_KEY" && store == ctx.config_root()),
+            "{e:?}"
+        );
+    };
+    refused(overridden.cache_key("prod").unwrap_err());
+    refused(overridden.cache_key_for_new_secret("prod").unwrap_err());
+    refused(
+        overridden
+            .cached_kubeconfig(
+                &hetzner(Some("-----BEGIN AGE ENCRYPTED FILE-----"), None),
+                "prod",
+            )
+            .unwrap_err(),
+    );
+    assert_eq!(counting.asked(), 0, "refused before anything was asked");
+    // The same variable on a store in files names the key the caches are read with.
+    let (_d, files) = store(&["prod"], None);
+    let in_files = SecretStore::new(
+        files.store(),
+        dir.path().join("elsewhere").join("age.key"),
+        counting.clone(),
+        true,
+    );
+    assert!(matches!(
+        in_files.cache_key("prod").unwrap_err(),
+        CliError::AgeKeyMissing { path, .. } if path.ends_with("age.key") && path.contains("elsewhere")
+    ));
+}
+
 /// T28, T34, rule 2: a write goes into the vault under the held lock and leaves a 0600 marker;
 /// no file of the store holds a token in clear, the vault included.
 #[test]

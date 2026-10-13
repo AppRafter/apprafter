@@ -264,6 +264,8 @@ pub(crate) fn store_locked(root: &Path) -> CliError {
 pub struct SecretStore {
     store: TargetStorePaths,
     age_key_path: PathBuf,
+    /// `APPRAFTER_AGE_KEY` is set (the CLI): refused on a locked store (T35).
+    age_key_overridden: bool,
     access: Arc<dyn VaultAccess>,
 }
 
@@ -272,11 +274,21 @@ impl SecretStore {
         store: TargetStorePaths,
         age_key_path: PathBuf,
         access: Arc<dyn VaultAccess>,
+        age_key_overridden: bool,
     ) -> Self {
         SecretStore {
             store,
             age_key_path,
+            age_key_overridden,
             access,
+        }
+    }
+
+    /// D.4a T35: `APPRAFTER_AGE_KEY` on a locked store, refused before anything is asked.
+    fn age_key_refused(&self) -> CliError {
+        CliError::OverrideOnLockedStore {
+            var: cli_core::secrets::AGE_KEY_ENV,
+            store: self.store.root().to_path_buf(),
         }
     }
 
@@ -519,12 +531,15 @@ impl SecretStore {
 
     /// The key `target`'s cached secrets are read with. Never creates one (GOTCHA-120). In
     /// files: the shared key, and no key is `CliError::AgeKeyMissing` naming its path and the
-    /// target. On a locked store: its own identity, through a session — never the shared key,
-    /// whatever `APPRAFTER_AGE_KEY` says (T35; d4a-d refuses the variable there).
+    /// target. On a locked store: its own identity, through a session — never the shared key:
+    /// `APPRAFTER_AGE_KEY` set is `override_refused`, before any prompt (T35).
     pub fn cache_key(&self, target: &str) -> cli_core::Result<CacheKey> {
         match self.state()? {
             StoreState::Files => files::cache_key(&self.age_key_path, target),
             StoreState::Locked { file, id } => {
+                if self.age_key_overridden {
+                    return Err(self.age_key_refused());
+                }
                 let (vault, session) = self.session(&file, &id)?;
                 Ok(CacheKey(KeyOf::StoreVault {
                     session,
@@ -541,7 +556,8 @@ impl SecretStore {
     /// cached anywhere, a first use ([`NewCacheKey::FirstUse`]); else the key everything was
     /// cached under is lost, which is `CliError::AgeKeyMissing` — only `apprafter kubeconfig
     /// --refresh` replaces a lost key, after it asks (WI-457). On a locked store: always the
-    /// store's own key (T26).
+    /// store's own key (T26) — through [`SecretStore::cache_key`], so `APPRAFTER_AGE_KEY` set is
+    /// `override_refused` there too, before any prompt (T35).
     pub fn cache_key_for_new_secret(&self, target: &str) -> cli_core::Result<NewCacheKey> {
         match self.state()? {
             StoreState::Files => {

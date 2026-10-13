@@ -68,8 +68,8 @@ fn a_command_that_needs_the_token_refuses_with_store_locked() {
     assert!(!stdout.contains(TOKEN) && !stderr.contains(TOKEN));
 }
 
-/// T35's fail-closed half: the variable is not the token of a locked store — the store's own
-/// refusal answers, never the provider (whose base is a closed port here).
+/// T35: the variable is refused on a locked store, before anything is asked — never the
+/// provider's answer (its base is a closed port here).
 #[test]
 fn hcloud_token_does_not_open_a_locked_store() {
     let sp = Spawn::new().with_env("HCLOUD_TOKEN", ENV_TOKEN);
@@ -77,9 +77,38 @@ fn hcloud_token_does_not_open_a_locked_store() {
     let (code, _, stderr) = run(&sp, &["target", "ip"]);
     assert_eq!(code, Some(1), "{stderr}");
     assert!(
-        stderr.contains("apprafter::secrets::store_locked"),
+        stderr.contains("apprafter::secrets::override_refused") && stderr.contains("HCLOUD_TOKEN"),
         "{stderr}"
     );
+}
+
+/// T35: `APPRAFTER_AGE_KEY` is refused where a locked store's cache is read; what needs no
+/// secret still runs with either variable set.
+#[test]
+fn apprafter_age_key_is_refused_where_a_cache_is_read() {
+    let sp = Spawn::new();
+    let key = sp.home().join("elsewhere").join("age.key");
+    let sp = sp.with_env("APPRAFTER_AGE_KEY", key);
+    locked(&sp);
+    let state = cli_state::StatePaths::for_active_target(
+        &cli_core::TargetStorePaths::for_root(sp.store()),
+        "prod",
+    );
+    std::fs::write(
+        state.state_file(),
+        r#"{"hetzner_cloud":{"server_id":7,"server_name":"n","kubeconfig_age":"-----BEGIN AGE ENCRYPTED FILE-----\nx\n-----END AGE ENCRYPTED FILE-----\n"}}"#,
+    )
+    .unwrap();
+    let (code, _, stderr) = run(&sp, &["kubeconfig"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("apprafter::secrets::override_refused")
+            && stderr.contains("APPRAFTER_AGE_KEY"),
+        "{stderr}"
+    );
+    let sp = sp.with_env("HCLOUD_TOKEN", ENV_TOKEN);
+    let (code, _, stderr) = run(&sp, &["target", "list"]);
+    assert_eq!(code, Some(0), "{stderr}");
 }
 
 /// T7: what needs no secret runs on a locked store and opens no vault — here a directory any

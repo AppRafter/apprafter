@@ -138,3 +138,35 @@ pub fn locked_store(root: &Path, targets: &[(&str, Option<&str>)]) -> LockedTest
         recipient: identity.to_public(),
     }
 }
+
+/// A `VaultAccess` that opens nothing and counts how often it was asked (D.4a T35): a refusal
+/// that must come before any prompt leaves the count at 0. Every question is `store_locked`.
+#[derive(Debug, Default)]
+pub struct CountingAccess {
+    asked: std::sync::atomic::AtomicUsize,
+}
+
+impl CountingAccess {
+    /// How many sessions and write keys were asked for.
+    pub fn asked(&self) -> usize {
+        self.asked.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl VaultAccess for CountingAccess {
+    fn session(
+        &self,
+        req: &super::access::VaultRequest<'_>,
+    ) -> cli_core::Result<Arc<dyn super::access::VaultSession>> {
+        self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(super::store_locked(req.store_root))
+    }
+
+    fn write_key(
+        &self,
+        req: &super::access::VaultRequest<'_>,
+    ) -> cli_core::Result<super::access::KeySession> {
+        self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(super::store_locked(req.store_root))
+    }
+}

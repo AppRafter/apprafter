@@ -15,7 +15,8 @@
 //! directory. Windows resolves the profile through a Known Folder no variable moves, so there
 //! the fence checks what the profile would otherwise supply — the age key and the SSH
 //! identity, which a caller names explicitly. D.4a adds `store.yaml` and the vault (c2) and
-//! the holder's base (e).
+//! the holder's base (e); on a store whose `store.yaml` says locked, locking or unlocking the
+//! age key is not fenced (d: the variable is refused there, and nothing reads the shared key).
 //!
 //! A location is inside a root when the canonical form of its deepest existing ancestor, with
 //! the rest appended, starts with the root's canonical form (macOS `/tmp` is `/private/tmp`;
@@ -120,10 +121,33 @@ pub(crate) fn enforce(env: &dyn EnvSource) -> miette::Result<()> {
     };
     let roots = roots(&value)?;
     let ctx = Context::from_cli_env(env).map_err(crate::render::core_error::report)?;
-    for (location, path) in locations(&ctx)? {
-        check(location, &path, &roots)?;
+    let all = locations(&ctx)?;
+    for (location, path) in all.iter().filter(|(l, _)| *l != Location::AgeKey) {
+        check(*location, path, &roots)?;
+    }
+    // Only now, with the store and its lock state inside the fence, is that state read (T5).
+    let mode = apprafter_core::secrets::read_store_file(ctx.config_root())
+        .ok()
+        .flatten()
+        .map(|f| f.secrets);
+    if fences_the_age_key(mode) {
+        for (location, path) in all.iter().filter(|(l, _)| *l == Location::AgeKey) {
+            check(*location, path, &roots)?;
+        }
     }
     Ok(())
+}
+
+/// D.4a T5: whether the age key is fenced, for a store in `mode` (`None`: no lock state, or
+/// one that cannot be read — fenced). On a locked, locking or unlocking store nothing reads the
+/// shared key (`APPRAFTER_AGE_KEY` is refused, T35), so it is not; d4a-d's `lock on` and
+/// `lock off` read or write it and fence it whatever the state (Task 9 of its plan).
+pub(crate) fn fences_the_age_key(mode: Option<apprafter_core::secrets::SecretsMode>) -> bool {
+    use apprafter_core::secrets::SecretsMode;
+    !matches!(
+        mode,
+        Some(SecretsMode::Locked | SecretsMode::Locking | SecretsMode::Unlocking)
+    )
 }
 
 /// The canonical roots `value` lists; a refusal for one that is relative or no directory.
@@ -308,5 +332,21 @@ mod tests {
             e.code().map(|c| c.to_string()).as_deref(),
             Some("apprafter::sandbox::escape")
         );
+    }
+
+    /// T5: the age key is fenced unless the store's lock state says the shared key is never
+    /// read; a lock state that cannot be read is fenced.
+    #[test]
+    fn the_age_key_is_skipped_only_on_a_locked_locking_or_unlocking_store() {
+        use apprafter_core::secrets::SecretsMode;
+        assert!(fences_the_age_key(None));
+        assert!(fences_the_age_key(Some(SecretsMode::Files)));
+        for mode in [
+            SecretsMode::Locked,
+            SecretsMode::Locking,
+            SecretsMode::Unlocking,
+        ] {
+            assert!(!fences_the_age_key(Some(mode)), "{mode:?}");
+        }
     }
 }

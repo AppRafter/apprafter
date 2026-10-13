@@ -406,6 +406,7 @@ impl Context {
             self.store(),
             self.age_key_path.clone(),
             self.vault_access.clone(),
+            self.overrides.age_key.is_some(),
         )
     }
 
