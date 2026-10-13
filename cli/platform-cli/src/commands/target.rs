@@ -463,14 +463,14 @@ pub(crate) fn map_wizard_prompt_error(err: inquire::InquireError) -> CliError {
 fn renew(ctx: &Context, args: AddArgs, name: &str) -> miette::Result<()> {
     let tref = TargetRef::named(ctx, name).map_err(renew_missing)?;
     // Both of the target's files, as `load_renewable` read them: the config, then the stored
-    // token through the core's secret store.
+    // token as the core's renewal reads it (`stored_for_renewal`, D.4a T42, T34, T43): a
+    // record this store never uses — a token in clear on a locked store, another store's
+    // marker, a marker without a vault entry — is no stored token, so the renewal every
+    // refusal of those three names replaces it instead of refusing again.
     let provider = cli_core::target::load_target_config(&ctx.store(), name)
         .map_err(|e| renew_missing(e.into()))?
         .provider;
-    let stored_token = ctx
-        .secrets()
-        .stored_token(name)
-        .map_err(|e| renew_missing(e.into()))?;
+    let stored_token = core_target::stored_for_renewal(ctx, name).map_err(renew_missing)?;
     let stored_token = stored_token.as_ref().map(SecretString::expose);
     // `--renew` deliberately ignores the config flags; refusing them up front beats silently
     // dropping a value the operator passed.
@@ -515,12 +515,17 @@ fn renew(ctx: &Context, args: AddArgs, name: &str) -> miette::Result<()> {
         },
     )
     .map_err(renew_missing)?;
+    let replaces = plan.payload.replaces();
     let renewed = completed(
         core_target::execute_renew(ctx, plan, &CliReporter, &CancellationToken::new())
             .map_err(renew_missing)?,
     )?;
     if unused_env_token.is_some() {
         eprintln!("{}", unused_env_token_note(name));
+    }
+    // A record the store never used is never replaced unseen (D.4a T42, T34, T43).
+    if let (Some(what), Some(_)) = (replaces, &renewed.token) {
+        eprintln!("note: the new token of `{name}` replaces {what}.");
     }
     println!("{}", renewed_line(&renewed));
     Ok(())

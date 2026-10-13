@@ -14,7 +14,8 @@ mod rename;
 pub(crate) mod testkit;
 
 pub use add::{
-    execute_add, execute_renew, plan_add, plan_renew, AddArgs, AddPayload, RenewArgs, RenewPayload,
+    execute_add, execute_renew, plan_add, plan_renew, stored_for_renewal, AddArgs, AddPayload,
+    RenewArgs, RenewPayload,
 };
 pub use machine::{execute_machine, plan_machine, rebuild_recipe, MachineChoice, MachinePayload};
 pub use name::{validate_name, NameProblem, TARGET_NAME_MAX_LEN};

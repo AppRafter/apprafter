@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use cli_core::ssh_key::KeySource;
-use cli_core::{GlobalConfig, TargetConfig};
+use cli_core::{CliError, GlobalConfig, TargetConfig};
 
 use crate::context::SecretString;
 use crate::op::{ChangeAction, Outcome, Plan, PlanClass, PlannedChange};
@@ -55,6 +55,23 @@ pub struct RenewPayload {
     provider: String,
     token: Option<SecretString>,
     ssh_key: Option<PathBuf>,
+    /// The record the new token replaces although this store never used it (D.4a T42, T34,
+    /// T43), when planned.
+    replaces: Option<Unused>,
+}
+
+impl RenewPayload {
+    /// What the new token replaces although this store never used it — a token kept in
+    /// clear on a locked store, another store's marker, a marker without a vault entry —
+    /// in words for a person: shown before and after the write, so a token planted in
+    /// clear is never replaced unseen. `None` for a renewal over a token the store uses, or
+    /// one that writes no token.
+    pub fn replaces(&self) -> Option<String> {
+        self.token
+            .as_ref()
+            .and(self.replaces.as_ref())
+            .map(Unused::what)
+    }
 }
 
 /// The stored `config.yaml` of `name`, or `None` when there is no such target. Both of the
@@ -421,7 +438,7 @@ pub fn plan_renew(
 ) -> CoreResult<Plan<RenewPayload>> {
     let name = target.name();
     let config = cli_core::target::load_target_config(&ctx.store(), name)?;
-    let stored = ctx.secrets().stored_token(name)?;
+    let (stored, replaces) = renewal_record(ctx, name)?;
     if let Some(token) = &args.token {
         crate::provider::TokenProblem::check(token.expose())
             .map_err(|problem| CoreError::InvalidToken { problem })?;
@@ -436,11 +453,16 @@ pub fn plan_renew(
     }
     let mut changes = Vec::new();
     if token.is_some() {
+        // D.4a T42, T34, T43: a record this store never used is named, never replaced unseen.
+        let detail = match &replaces {
+            Some(unused) => format!("API token, replacing {}", unused.what()),
+            None => "API token".to_string(),
+        };
         changes.push(change(
             "Credentials",
             name,
             ChangeAction::Replace,
-            Some("API token".into()),
+            Some(detail),
         ));
     }
     if let Some(p) = &ssh_key {
@@ -474,6 +496,7 @@ pub fn plan_renew(
             provider: config.provider,
             token,
             ssh_key,
+            replaces,
         },
     })
 }
@@ -502,6 +525,65 @@ fn nothing_to_change(name: &str, token_given: bool) -> CoreError {
     }
 }
 
+/// A record a renewal replaces although this store never used it (D.4a T42, T34, T43).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Unused {
+    /// A token in clear in a locked store's credentials file (T42).
+    InClear,
+    /// A marker naming another store's vault (T34; O8's way back, on a store in files).
+    OtherVault { id: String },
+    /// A marker of this store whose vault holds no entry for the target (T43).
+    NoVaultEntry,
+}
+
+impl Unused {
+    /// What the new token replaces, as a renewal names it.
+    fn what(&self) -> String {
+        match self {
+            Unused::InClear => {
+                "a token kept in clear, which this locked store never used".to_string()
+            }
+            Unused::OtherVault { id } => format!(
+                "a marker for the vault of the target store with id {id}, which this store \
+                 never used"
+            ),
+            Unused::NoVaultEntry => {
+                "a marker whose entry the vault of this store does not hold".to_string()
+            }
+        }
+    }
+}
+
+/// The stored token a renewal compares the new one with, and the record it replaces although
+/// this store never used it (see [`stored_for_renewal`]).
+fn renewal_record(ctx: &Context, name: &str) -> CoreResult<(Option<SecretString>, Option<Unused>)> {
+    match ctx.secrets().stored_token(name) {
+        Ok(stored) => Ok((stored, None)),
+        Err(CliError::TokenOutsideVault { .. }) => Ok((None, Some(Unused::InClear))),
+        Err(CliError::TokenInAnotherVault { id, .. }) => {
+            Ok((None, Some(Unused::OtherVault { id })))
+        }
+        Err(CliError::TokenMissingFromVault { .. }) => Ok((None, Some(Unused::NoVaultEntry))),
+        Err(other) => Err(other.into()),
+    }
+}
+
+/// The token stored for `name`, as a renewal compares the new one with it (D.4a T42, T34,
+/// T43): what [`plan_renew`], [`execute_renew`] and the CLI's `target add --renew` read.
+///
+/// A record this store refuses to use is no stored token here, so a renewal replaces it: a
+/// token in clear in a locked store's credentials file (`token_outside_vault`), a marker
+/// naming another store's vault (`token_in_another_vault`, also on a store in files, the
+/// state O8's manual way back leaves), or a marker of this store whose vault holds no entry
+/// for the target (`token_missing_from_vault`). Every help for those three sends the person
+/// to `target add <name> --renew`, which relies on this. Anything else the store says is the
+/// error it was — `store_locked`, `lock_incomplete`, `vault_unreadable`, an unreadable file —
+/// never "no token". The write that follows still takes the store's write key (on a locked
+/// store it asks, O11) and puts the vault entry on disk before the marker replaces the file.
+pub fn stored_for_renewal(ctx: &Context, name: &str) -> CoreResult<Option<SecretString>> {
+    renewal_record(ctx, name).map(|(stored, _)| stored)
+}
+
 /// Ping the new token (only when there is one, and not with `no_ping`), then prepare the token
 /// write (before the lock, T41) and, under the lock, re-read the target and change only what still differs ([`plan_renew`]'s rules, refused the
 /// same way when nothing does): an edit made during the ping is kept. With no new token left
@@ -521,6 +603,7 @@ pub fn execute_renew(
         provider,
         token,
         ssh_key,
+        replaces: _,
     } = plan.payload;
     let verification = match &token {
         None => None,
@@ -539,7 +622,7 @@ pub fn execute_renew(
     let key = secrets.prepare_write()?;
     let lock = lock_store_for(ctx, reporter, &name)?;
     let mut config = cli_core::target::load_target_config(&store, &name)?;
-    let stored = secrets.stored_token(&name)?;
+    let stored = stored_for_renewal(ctx, &name)?;
     let token_given = token.is_some();
     let (token, ssh_key) = what_differs(&config, stored.as_ref(), token, ssh_key);
     if token.is_none() && ssh_key.is_none() {
@@ -1589,5 +1672,200 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The Credentials change of a renewal plan, as it names what it writes.
+    fn credentials_detail(plan: &Plan<RenewPayload>) -> Option<String> {
+        plan.changes
+            .iter()
+            .find(|c| c.kind == "Credentials")
+            .and_then(|c| c.detail.clone())
+    }
+
+    /// A locked store at `<dir>/store` holding `targets`, a context that opens it with its key.
+    fn locked_ctx(
+        dir: &Path,
+        targets: &[(&str, Option<&str>)],
+    ) -> (Context, crate::secrets::testing::LockedTestStore) {
+        let root = dir.join("store");
+        let made = crate::secrets::testing::locked_store(&root, targets);
+        let ctx = Context::for_desktop(root, "http://127.0.0.1:1")
+            .with_home_dir(Some(dir.join("home")))
+            .with_vault_access(made.access())
+            .with_no_ping(true);
+        (ctx, made)
+    }
+
+    /// D.4a T42 (d4a-d Task 13b): a clear token in a locked store's credentials file is never
+    /// used — and a renewal replaces it, naming it in its plan: the vault takes the new token,
+    /// the file becomes the marker again, and neither token is left in clear.
+    #[test]
+    fn a_renewal_replaces_a_clear_token_on_a_locked_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, _made) = locked_ctx(dir.path(), &[("prod", None)]);
+        let creds = ctx.store().target_credentials_file("prod");
+        std::fs::write(&creds, format!("hetzner_token: {TOKEN_A}\n")).unwrap();
+        assert!(matches!(
+            ctx.secrets().stored_token("prod"),
+            Err(CliError::TokenOutsideVault { .. })
+        ));
+        assert!(stored_for_renewal(&ctx, "prod").unwrap().is_none());
+        let target = TargetRef::named(&ctx, "prod").unwrap();
+        let plan = plan_renew(&ctx, &target, renew_args(Some(TOKEN_B), None)).unwrap();
+        assert_eq!(
+            credentials_detail(&plan).as_deref(),
+            Some("API token, replacing a token kept in clear, which this locked store never used")
+        );
+        assert_eq!(
+            plan.payload.replaces().as_deref(),
+            Some("a token kept in clear, which this locked store never used")
+        );
+        renewed(&ctx, plan);
+        assert_eq!(
+            ctx.secrets()
+                .stored_token("prod")
+                .unwrap()
+                .unwrap()
+                .expose(),
+            TOKEN_B
+        );
+        assert_eq!(
+            ctx.secrets().token_presence("prod").unwrap(),
+            crate::secrets::StoredToken::InVault
+        );
+        let file = std::fs::read_to_string(&creds).unwrap();
+        assert!(!file.contains(TOKEN_A) && !file.contains(TOKEN_B), "{file}");
+    }
+
+    /// O8's manual way back (d4a-d Task 13b): a store whose vault and store.yaml were moved
+    /// aside is in files, and each credentials file still names the old vault; a renewal
+    /// replaces that marker with the token typed, and names the marker it replaces.
+    #[test]
+    fn a_renewal_replaces_another_stores_marker_in_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("store");
+        let made = crate::secrets::testing::locked_store(&root, &[("prod", Some(TOKEN_A))]);
+        std::fs::rename(
+            root.join(crate::vault::VAULT_FILE),
+            dir.path().join("vault.aside"),
+        )
+        .unwrap();
+        std::fs::rename(
+            root.join(crate::secrets::STORE_FILE),
+            dir.path().join("store.aside"),
+        )
+        .unwrap();
+        let ctx = Context::for_desktop(root, "http://127.0.0.1:1")
+            .with_home_dir(Some(dir.path().join("home")))
+            .with_no_ping(true);
+        assert!(matches!(
+            ctx.secrets().stored_token("prod"),
+            Err(CliError::TokenInAnotherVault { .. })
+        ));
+        let target = TargetRef::named(&ctx, "prod").unwrap();
+        let plan = plan_renew(&ctx, &target, renew_args(Some(TOKEN_B), None)).unwrap();
+        assert_eq!(
+            credentials_detail(&plan),
+            Some(format!(
+                "API token, replacing a marker for the vault of the target store with id {}, \
+                 which this store never used",
+                made.store_id
+            ))
+        );
+        renewed(&ctx, plan);
+        assert_eq!(
+            ctx.secrets()
+                .stored_token("prod")
+                .unwrap()
+                .unwrap()
+                .expose(),
+            TOKEN_B
+        );
+    }
+
+    /// D.4a T43 (d4a-d Task 13b): a marker of this store whose vault has no entry for the
+    /// target (an older AppRafter renamed it) — the renewal writes the entry.
+    #[test]
+    fn a_renewal_fills_a_vault_entry_an_older_rename_left_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, made) = locked_ctx(dir.path(), &[("prod", None)]);
+        crate::secrets::marker::write_marker(&ctx.store(), "prod", &made.store_id).unwrap();
+        assert!(matches!(
+            ctx.secrets().stored_token("prod"),
+            Err(CliError::TokenMissingFromVault { .. })
+        ));
+        let target = TargetRef::named(&ctx, "prod").unwrap();
+        let plan = plan_renew(&ctx, &target, renew_args(Some(TOKEN_B), None)).unwrap();
+        assert_eq!(
+            credentials_detail(&plan).as_deref(),
+            Some("API token, replacing a marker whose entry the vault of this store does not hold")
+        );
+        renewed(&ctx, plan);
+        assert_eq!(
+            ctx.secrets()
+                .stored_token("prod")
+                .unwrap()
+                .unwrap()
+                .expose(),
+            TOKEN_B
+        );
+    }
+
+    /// d4a-d Task 13b: only those three records are no stored token to a renewal; whatever
+    /// else the store says still refuses it — a locked store nothing here can open is
+    /// `store_locked` (never "no token", so a renewal never writes past a vault it could not
+    /// read), an interrupted lock is `lock_incomplete`. A normal renewal names nothing.
+    #[test]
+    fn a_renewal_still_refuses_what_the_store_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let (opened, _made) = locked_ctx(dir.path(), &[("prod", Some(TOKEN_A))]);
+        let target = TargetRef::named(&opened, "prod").unwrap();
+        let plan = plan_renew(&opened, &target, renew_args(Some(TOKEN_B), None)).unwrap();
+        assert_eq!(credentials_detail(&plan).as_deref(), Some("API token"));
+        assert_eq!(plan.payload.replaces(), None);
+        let bare = Context::for_desktop(opened.config_root().to_path_buf(), "http://127.0.0.1:1")
+            .with_home_dir(Some(dir.path().join("home")))
+            .with_no_ping(true);
+        let target = TargetRef::named(&bare, "prod").unwrap();
+        assert!(matches!(
+            plan_renew(&bare, &target, renew_args(Some(TOKEN_B), None)).unwrap_err(),
+            CoreError::Cli(CliError::StoreLocked { .. })
+        ));
+        assert!(matches!(
+            stored_for_renewal(&bare, "prod").unwrap_err(),
+            CoreError::Cli(CliError::StoreLocked { .. })
+        ));
+        let root = opened.config_root().to_path_buf();
+        let mut file = crate::secrets::read_store_file(&root).unwrap().unwrap();
+        file.secrets = crate::secrets::SecretsMode::Locking;
+        let held = cli_core::StoreLock::exclusive(&opened.store()).unwrap();
+        crate::secrets::write_store_file(&root, &file, &held).unwrap();
+        drop(held);
+        assert!(matches!(
+            plan_renew(&opened, &target, renew_args(Some(TOKEN_B), None)).unwrap_err(),
+            CoreError::Cli(CliError::LockIncomplete {
+                phase: cli_core::LockPhase::Locking,
+                ..
+            })
+        ));
+    }
+
+    /// d4a-d Task 13b: a key-only renewal over a record this store never used changes the key
+    /// alone — the record stays as it was, byte for byte, and nothing claims to replace it.
+    #[test]
+    fn a_key_only_renewal_leaves_a_record_the_store_never_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, _made) = locked_ctx(dir.path(), &[("prod", None)]);
+        let creds = ctx.store().target_credentials_file("prod");
+        let clear = format!("hetzner_token: {TOKEN_A}\n");
+        std::fs::write(&creds, &clear).unwrap();
+        let key = dir.path().join("new.pub");
+        std::fs::write(&key, "ssh-ed25519 AAAA me@x\n").unwrap();
+        let target = TargetRef::named(&ctx, "prod").unwrap();
+        let plan = plan_renew(&ctx, &target, renew_args(None, Some(&key))).unwrap();
+        assert_eq!(credentials_detail(&plan), None);
+        assert_eq!(plan.payload.replaces(), None);
+        renewed(&ctx, plan);
+        assert_eq!(std::fs::read_to_string(&creds).unwrap(), clear);
     }
 }

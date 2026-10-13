@@ -126,3 +126,52 @@ fn a_command_that_needs_no_secret_runs_and_opens_no_vault() {
         assert!(!stdout.contains(TOKEN), "{args:?}");
     }
 }
+
+/// O8's manual way back (d4a-d Task 13b): with the vault and `store.yaml` moved aside the store
+/// is in files, and the credentials file still names the old vault; `target add <t> --renew
+/// --token` replaces that marker with the new token, says so, and needs no terminal.
+#[test]
+fn a_renewal_replaces_another_stores_marker_on_a_store_in_files() {
+    const NEW: &str = "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn";
+    let sp = Spawn::new();
+    let root = sp.store();
+    let made = locked_store(&root, &[("prod", Some(TOKEN))]);
+    std::fs::rename(
+        root.join(apprafter_core::vault::VAULT_FILE),
+        sp.path("vault.aside"),
+    )
+    .unwrap();
+    std::fs::rename(
+        root.join(apprafter_core::secrets::STORE_FILE),
+        sp.path("store.yaml.aside"),
+    )
+    .unwrap();
+    let (code, stdout, stderr) = run(
+        &sp,
+        &[
+            "target",
+            "add",
+            "prod",
+            "--renew",
+            "--token",
+            NEW,
+            "--no-ping",
+        ],
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stdout.contains("target `prod` credentials rotated"),
+        "{stdout}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "note: the new token of `prod` replaces a marker for the vault of the target store \
+             with id {}, which this store never used.",
+            made.store_id
+        )),
+        "{stderr}"
+    );
+    let creds = std::fs::read_to_string(root.join("targets").join("prod").join("credentials.yaml"))
+        .unwrap();
+    assert!(creds.contains(&format!("hetzner_token: {NEW}")), "{creds}");
+}

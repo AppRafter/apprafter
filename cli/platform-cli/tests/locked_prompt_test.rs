@@ -283,3 +283,72 @@ fn doctor_and_whoami_never_ask() {
         assert!(end.restored);
     }
 }
+
+/// D.4a T42, O11 (d4a-d Task 13b): the way past a token planted in clear on a locked store is
+/// the one every refusal names, `target add <t> --renew`. It asks for the store's secret once —
+/// a vault write always asks — puts the new token in the vault, writes the marker over the clear
+/// file and says what it replaced; neither token is left in clear.
+#[test]
+fn a_renewal_replaces_a_clear_token_and_asks_once() {
+    const PLANTED: &str = "pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp";
+    const NEW: &str = "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn";
+    let sp = Spawn::new();
+    let made = locked(&sp);
+    let creds = sp
+        .store()
+        .join("targets")
+        .join("prod")
+        .join("credentials.yaml");
+    std::fs::write(&creds, format!("hetzner_token: {PLANTED}\n")).unwrap();
+    let end = converse(
+        &sp,
+        &[
+            "target",
+            "add",
+            "prod",
+            "--renew",
+            "--token",
+            NEW,
+            "--no-ping",
+        ],
+        &[
+            Step::Expect("is locked, and `apprafter target add` needs its secrets."),
+            Step::Expect(ASKED),
+            line(&key_of(&made)),
+        ],
+    );
+    assert!(end.status.success(), "{}", end.terminal);
+    assert_eq!(end.terminal.matches(ASKED).count(), 1, "{}", end.terminal);
+    assert!(
+        end.terminal.contains(
+            "note: the new token of `prod` replaces a token kept in clear, which this locked \
+             store never used."
+        ),
+        "{}",
+        end.terminal
+    );
+    assert!(
+        end.stdout.contains("target `prod` credentials rotated"),
+        "{}",
+        end.stdout
+    );
+    let file = std::fs::read(&creds).unwrap();
+    let text = String::from_utf8_lossy(&file);
+    assert!(!text.contains(PLANTED) && !text.contains(NEW), "{text}");
+    assert_eq!(
+        apprafter_core::secrets::marker::classify(&file),
+        apprafter_core::secrets::marker::Marker::Vault {
+            id: made.store_id.clone()
+        }
+    );
+    let vault = std::fs::read(sp.store().join(apprafter_core::vault::VAULT_FILE)).unwrap();
+    let entry = apprafter_core::vault::VaultFile::parse(&vault)
+        .unwrap()
+        .open_with_key(made.data_key(), made.vault_id)
+        .unwrap()
+        .payload()
+        .hetzner_token("prod")
+        .map(|t| t.expose().to_string());
+    assert_eq!(entry.as_deref(), Some(NEW));
+    assert!(end.restored);
+}
