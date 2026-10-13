@@ -34,6 +34,7 @@ jobs:
       rust_operator: ${{ steps.filter.outputs.rust_operator }}
       bun: ${{ steps.filter.outputs.bun }}
       e2e_lib: ${{ steps.filter.outputs.e2e_lib }}
+      e2e_isolation: ${{ steps.filter.outputs.e2e_isolation }}
       desktop: ${{ steps.filter.outputs.desktop }}
       desktop_web: ${{ steps.filter.outputs.desktop_web }}
     steps:
@@ -79,6 +80,13 @@ jobs:
               # The check pins lib.sh's deadline grep to ReconcileTimedOut's
               # Display text, so a reword on the Rust side must wake it too.
               - 'operator/operator-core/src/deadline.rs'
+              - '.github/workflows/lint.yml'
+            # Every e2e walk isolates its store (D.4a T9). cli/ is in: the
+            # self-test runs the CLI's fence through e2e/lib.sh.
+            e2e_isolation:
+              - 'e2e/**'
+              - 'scripts/**'
+              - 'cli/**'
               - '.github/workflows/lint.yml'
             # AppRafter Desktop (ADR 0067). The Rust side builds apprafter-core by
             # path, so its whole path-crate closure wakes it (`cargo tree -p
@@ -213,6 +221,34 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: check-dump-diagnostics.sh
         run: ./scripts/check-dump-diagnostics.sh
+
+  # Every e2e walk runs the CLI on a store of its own (D.4a T9, G6): the scan,
+  # then the self-test, whose live rows build the CLI and run an isolated
+  # walk's `apprafter target list` through e2e/lib.sh (the fence must admit
+  # it) and the same walk with its SSH identity outside (the fence must refuse
+  # it). Also the heredoc-backtick scan, which ran only in `just lint` and
+  # lefthook until now.
+  e2e-isolation:
+    name: e2e isolation + heredoc backticks
+    needs: changes
+    if: needs.changes.outputs.e2e_isolation == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: check-heredoc-backticks.sh
+        run: ./scripts/check-heredoc-backticks.sh
+      - name: check-e2e-isolation.sh
+        run: ./scripts/check-e2e-isolation.sh
+      # cli-providers' build script runs `cue export`.
+      - uses: cue-lang/setup-cue@b0e30e540a2dae47304ebf16586a5b2db023b61c # v2.0.0
+        with:
+          version: v0.17.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: "1.98"
+      - name: check-e2e-isolation.sh --self-test
+        run: ./scripts/check-e2e-isolation.sh --self-test
 
   cue:
     name: CUE (fmt + vet)
