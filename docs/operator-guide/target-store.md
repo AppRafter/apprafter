@@ -98,8 +98,12 @@ flow is preserved.
 ### Token rotation (no target re-creation)
 
 ```sh
-apprafter target add prod --renew --token "$NEW_TOKEN"
+apprafter target add prod --renew
 ```
+
+At a terminal it asks for the new token without showing it. A script
+passes it with `--token` instead; on the command line a token is
+visible to other processes and kept in the shell's history.
 
 `--renew` updates only the token and the SSH key of an existing
 target. Fails if the target doesn't exist (`--force` overwrites

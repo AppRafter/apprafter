@@ -115,8 +115,9 @@ pub(crate) fn cli_help(e: &CoreError) -> Option<String> {
             cli_core::target::HETZNER_API_TOKENS_PAGE
         ),
         CoreError::TokenNotStored { name } => format!(
-            "Run `apprafter target add {name} --renew --token <X>` to store one, or set \
-             `HCLOUD_TOKEN` for this invocation."
+            "Run `apprafter target add {name} --renew` to store one (at a terminal it asks for \
+             the new token without showing it; in a script, `--token`), or set `HCLOUD_TOKEN` \
+             for this invocation."
         ),
         CoreError::SshKeyUnreadable { .. } => {
             "Point `--ssh-key` at a readable public key file (for example \
@@ -133,9 +134,10 @@ pub(crate) fn cli_help(e: &CoreError) -> Option<String> {
         CoreError::ServerMissing { name, .. } => format!(
             "Check the Hetzner Console for the cause. If the server was deleted, \
              `apprafter up --target {name}` provisions a replacement and records it. If the \
-             token belongs to another Hetzner project, `apprafter target add {name} --renew \
-             --token <X>` stores one from the server's project (an `HCLOUD_TOKEN` in the \
-             environment outranks the stored token). If the cluster's server was recreated \
+             token belongs to another Hetzner project, `apprafter target add {name} --renew` \
+             stores one from the server's project (at a terminal it asks for the new token \
+             without showing it; in a script, `--token`); an `HCLOUD_TOKEN` in the environment \
+             outranks the stored token. If the cluster's server was recreated \
              under a new id, `apprafter import --force --target {name}` records it."
         ),
         CoreError::TargetProvisioned { name, .. } => format!(
@@ -275,6 +277,63 @@ mod tests {
         }
     }
 
+    /// d4a-d Task 13b: no help puts a Hetzner token on the command line, where other processes
+    /// can read it and the shell's history keeps it — neither the core's errors as the CLI
+    /// renders them nor cli-core's own: a renewal is `target add <name> --renew`, which asks
+    /// for the token at a terminal without showing it (`--token` only in a script).
+    #[test]
+    fn no_help_puts_a_token_on_the_command_line() {
+        use apprafter_core::error::samples::{cli_errors, lock_errors};
+        let flat = |h: String| h.split_whitespace().collect::<Vec<_>>().join(" ");
+        let mut helps: Vec<(String, String)> = Vec::new();
+        for e in one_of_each() {
+            let r = report(e);
+            let code = r.code().map(|c| c.to_string()).unwrap_or_default();
+            helps.push((
+                code,
+                flat(r.help().map(|h| h.to_string()).unwrap_or_default()),
+            ));
+        }
+        for e in cli_errors().into_iter().chain(lock_errors()) {
+            let code = miette::Diagnostic::code(&e)
+                .map(|c| c.to_string())
+                .unwrap_or_default();
+            let own = miette::Diagnostic::help(&e)
+                .map(|h| h.to_string())
+                .unwrap_or_default();
+            helps.push((code.clone(), flat(own)));
+            let r = report(CoreError::from(e));
+            helps.push((
+                code,
+                flat(r.help().map(|h| h.to_string()).unwrap_or_default()),
+            ));
+        }
+        let asking: Vec<&str> = helps
+            .iter()
+            .filter(|(_, h)| {
+                h.contains("--renew`") && h.contains("asks for the new token without showing it")
+            })
+            .map(|(c, _)| c.as_str())
+            .collect();
+        for code in [
+            "apprafter::target::token_missing",
+            "apprafter::target::token_rejected",
+            "apprafter::target::server_missing",
+            "apprafter::provider::hetzner_api_error",
+            "apprafter::secrets::token_outside_vault",
+            "apprafter::secrets::token_in_another_vault",
+            "apprafter::secrets::token_missing_from_vault",
+        ] {
+            assert!(
+                asking.contains(&code),
+                "{code} names no renewal that asks: {asking:?}"
+            );
+        }
+        for (code, help) in &helps {
+            assert!(!help.contains("--renew --token"), "{code}: {help}");
+        }
+    }
+
     #[test]
     fn not_found_and_no_active_keep_the_cli_text() {
         let r = report(CoreError::TargetNotFound {
@@ -380,9 +439,10 @@ mod tests {
         assert!(!deleted.contains("import"), "{help}");
         let foreign = case("another Hetzner project");
         assert!(
-            foreign.contains("`apprafter target add prod --renew --token <X>`"),
+            foreign.contains("`apprafter target add prod --renew` stores one from the server's"),
             "{help}"
         );
+        assert!(foreign.contains("in a script, `--token`"), "{help}");
         assert!(!foreign.contains("import"), "{help}");
         assert!(
             case("new id").contains("`apprafter import --force --target prod`"),

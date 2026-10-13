@@ -304,7 +304,7 @@ reserved for emergency overrides.
 | Re-fetch kubeconfig           | `apprafter kubeconfig --refresh` (alias: `apprafter kc --refresh`) |
 | Rebuild local state           | `apprafter import` (live Hetzner → state.json)           |
 | Switch active target          | `apprafter target use <name>` (alias: `apprafter t use`) |
-| Rotate the Hetzner token      | `apprafter target add <name> --renew --token <new>`      |
+| Rotate the Hetzner token      | `apprafter target add <name> --renew` (asks for the token) |
 | Inspect target config         | `apprafter target show` (alias: `apprafter t info`)      |
 | Platform version / status     | `apprafter platform status`                              |
 | Upgrade platform              | `apprafter platform upgrade --to <version>`              |

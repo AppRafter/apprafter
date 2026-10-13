@@ -82,6 +82,11 @@ fn summary(report: &DoctorReport) -> String {
     }
 }
 
+/// How a token fix asks for the token (d4a-d Task 13b): never on the command line at a
+/// terminal, where other processes can read it and the shell's history keeps it.
+const ASKS: &str =
+    "(at a terminal it asks for the new token without showing it; in a script, `--token`)";
+
 /// The CLI's words for a check's fix.
 pub(crate) fn hint(c: &Check) -> Option<String> {
     Some(match c.fix.as_ref()? {
@@ -97,33 +102,31 @@ pub(crate) fn hint(c: &Check) -> Option<String> {
             "available targets: {}. Run `apprafter target add {n}` to create.",
             available.join(", ")
         ),
-        CheckFix::RenewToken { target, why } => {
-            match why {
-                RenewWhy::CredentialsFileMissing => format!(
-                "run `apprafter target add {target} --renew --token <X>` to create credentials.yaml"
+        CheckFix::RenewToken { target, why } => match why {
+            RenewWhy::CredentialsFileMissing => format!(
+                "run `apprafter target add {target} --renew` to create credentials.yaml {ASKS}"
             ),
-                RenewWhy::TokenMissing => {
-                    format!("run `apprafter target add {target} --renew --token <X>` to add credentials")
-                }
-                RenewWhy::TokenMalformed => {
-                    format!("run `apprafter target add {target} --renew --token <X>` with a fresh token")
-                }
-                RenewWhy::TokenRejected => format!(
-                    "token rejected; run `apprafter target add {target} --renew` with a new token \
-                 from {}",
-                    cli_core::target::HETZNER_API_TOKENS_PAGE
-                ),
-                RenewWhy::TokenOutsideVault => format!(
-                    "the token in credentials.yaml is in clear on a locked store and is not used: \
-                     run `apprafter target add {target} --renew --token <X>` to store it in the \
-                     vault"
-                ),
-                RenewWhy::TokenInAnotherVault => format!(
-                    "credentials.yaml points at another target store's vault: run `apprafter \
-                     target add {target} --renew --token <X>` to store the token here"
-                ),
+            RenewWhy::TokenMissing => {
+                format!("run `apprafter target add {target} --renew` to add credentials {ASKS}")
             }
-        }
+            RenewWhy::TokenMalformed => {
+                format!("run `apprafter target add {target} --renew` with a fresh token {ASKS}")
+            }
+            RenewWhy::TokenRejected => format!(
+                "token rejected; run `apprafter target add {target} --renew` with a new token \
+                 from {}",
+                cli_core::target::HETZNER_API_TOKENS_PAGE
+            ),
+            RenewWhy::TokenOutsideVault => format!(
+                "the token in credentials.yaml is in clear on a locked store and is not used: \
+                     run `apprafter target add {target} --renew` to store a token in the vault \
+                     {ASKS}"
+            ),
+            RenewWhy::TokenInAnotherVault => format!(
+                "credentials.yaml points at another target store's vault: run `apprafter \
+                     target add {target} --renew` to store the token here {ASKS}"
+            ),
+        },
         CheckFix::Chmod { path, mode } => {
             format!("fix with `chmod {mode:o} {path}` so other local users can't read your token")
         }
@@ -469,8 +472,7 @@ mod tests {
             "token rejected; run `apprafter target add p --renew` with a new token from {}",
             cli_core::target::HETZNER_API_TOKENS_PAGE
         );
-        let cases: Vec<(CheckFix, &str)> =
-            vec![
+        let cases: Vec<(CheckFix, &str)> = vec![
             (
                 CheckFix::AddTarget {
                     name: Some("ghost".into()),
@@ -491,21 +493,24 @@ mod tests {
                     target: "p".into(),
                     why: RenewWhy::CredentialsFileMissing,
                 },
-                "run `apprafter target add p --renew --token <X>` to create credentials.yaml",
+                "run `apprafter target add p --renew` to create credentials.yaml (at a terminal it \
+                 asks for the new token without showing it; in a script, `--token`)",
             ),
             (
                 CheckFix::RenewToken {
                     target: "p".into(),
                     why: RenewWhy::TokenMissing,
                 },
-                "run `apprafter target add p --renew --token <X>` to add credentials",
+                "run `apprafter target add p --renew` to add credentials (at a terminal it asks \
+                 for the new token without showing it; in a script, `--token`)",
             ),
             (
                 CheckFix::RenewToken {
                     target: "p".into(),
                     why: RenewWhy::TokenMalformed,
                 },
-                "run `apprafter target add p --renew --token <X>` with a fresh token",
+                "run `apprafter target add p --renew` with a fresh token (at a terminal it asks \
+                 for the new token without showing it; in a script, `--token`)",
             ),
             (
                 CheckFix::RenewToken {
@@ -857,7 +862,13 @@ mod tests {
             ))
             .unwrap();
             assert!(
-                h.contains(part) && h.contains("`apprafter target add p --renew --token <X>`"),
+                h.contains(part)
+                    && h.contains("`apprafter target add p --renew`")
+                    && h.contains(
+                        "(at a terminal it asks for the new token without showing it; in a \
+                         script, `--token`)"
+                    )
+                    && !h.contains("--renew --token"),
                 "{h}"
             );
         }

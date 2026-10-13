@@ -64,7 +64,7 @@ Examples:
 ```sh
 apprafter target add <name> --provider hetzner-cloud --region nbg1 --tier solo
 apprafter target add <name> --ssh-key ~/.ssh/id_ed25519.pub --server-type cx22
-apprafter target add <name> --renew --token <token>
+apprafter target add <name> --renew
 ```
 
 ## `apprafter target cert`

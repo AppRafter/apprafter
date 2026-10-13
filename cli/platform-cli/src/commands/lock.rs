@@ -488,8 +488,9 @@ fn on_result(done: &LockedOn, shown: &str) -> String {
     for t in &done.tokens_left {
         out.push_str(&format!(
             "  `{t}`: its credentials file holds a token in clear that is not the vault's, \
-             written while this ran; it is not used. `apprafter target add {t} --renew --token \
-             <token>` stores a token in the vault.\n"
+             written while this ran; it is not used. `apprafter target add {t} --renew` stores \
+             a token in the vault (at a terminal it asks for the new token without showing it; \
+             in a script, `--token`).\n"
         ));
     }
     out
@@ -687,6 +688,33 @@ mod tests {
             "credentials.yaml → vault"
         )
         .ends_with("credentials.yaml → vault\n"));
+    }
+
+    /// d4a-d Task 13b: a token left in clear while `lock on` ran is named with the renewal
+    /// that replaces it — no token on the command line at a terminal.
+    #[test]
+    fn a_token_left_in_clear_names_a_renewal_that_asks() {
+        let done = LockedOn {
+            store: "/s".into(),
+            store_id: Some("0123456789abcdef".into()),
+            already_locked: false,
+            restarted: false,
+            tokens_moved: Vec::new(),
+            tokens_left: vec!["prod".into()],
+            caches_resealed: 0,
+            caches_dropped: Vec::new(),
+            caches_left: Vec::new(),
+            unlock_timeout_min: 5,
+        };
+        let out = on_result(&done, "/s");
+        assert!(
+            out.contains(
+                "`apprafter target add prod --renew` stores a token in the vault (at a terminal \
+                 it asks for the new token without showing it; in a script, `--token`).\n"
+            ),
+            "{out}"
+        );
+        assert!(!out.contains("--renew --token"), "{out}");
     }
 
     /// Rule 4 (team decision 2026-10-13): a resume asks each slot by its own question and opens

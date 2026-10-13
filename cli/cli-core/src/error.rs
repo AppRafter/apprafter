@@ -1025,8 +1025,9 @@ pub enum CliError {
         help(
             "The Hetzner Cloud API refused the request:\n\
              • 401 unauthorized — the token is wrong, or it was revoked or rotated. For a \
-               target's stored token, `apprafter target add <name> --renew --token <new>` \
-               replaces it; an `HCLOUD_TOKEN` in the environment outranks the stored token.\n\
+               target's stored token, `apprafter target add <name> --renew` replaces it (at a \
+               terminal it asks for the new token without showing it; in a script, \
+               `--token`); an `HCLOUD_TOKEN` in the environment outranks the stored token.\n\
              • 403 forbidden — the token lacks Read & Write (it is Read-only), or the project \
                forbids the call, for example at one of its limits.\n\
              • 429 rate limit — too many requests: wait, then try again.\n\
@@ -1156,8 +1157,9 @@ pub enum CliError {
     #[diagnostic(
         code(apprafter::target::token_missing),
         help(
-            "Run `apprafter target add {name} --renew --token <X>` to store one, or set \
-             `HCLOUD_TOKEN` for this invocation."
+            "Run `apprafter target add {name} --renew` to store one (at a terminal it asks for \
+             the new token without showing it; in a script, `--token`), or set `HCLOUD_TOKEN` \
+             for this invocation."
         )
     )]
     TokenNotStored { name: String },
@@ -1190,8 +1192,9 @@ pub enum CliError {
              was mistyped, or it was revoked or rotated, or its project was deleted.\n\
              • A token is shown only once, when it is created: paste it again from where you \
                saved it, or create a new one with Read & Write permission in {}.\n\
-             • If you're rotating, run `apprafter target add <name> --renew --token <new>` \
-               instead of re-creating the target.",
+             • If you're rotating, run `apprafter target add <name> --renew` instead of \
+               re-creating the target (at a terminal it asks for the new token without showing \
+               it; in a script, `--token`).",
             crate::target::HETZNER_API_TOKENS_PAGE
         )
     )]
@@ -1498,7 +1501,8 @@ pub enum CliError {
         help(
             "If an older AppRafter renamed this target, rename it back to its old name with this \
              AppRafter, then rename it again. Otherwise store its token again: `apprafter target \
-             add {target} --renew --token <token>`."
+             add {target} --renew` (at a terminal it asks for the new token without showing it; \
+             in a script, `--token`)."
         )
     )]
     TokenMissingFromVault { target: String, store: PathBuf },
@@ -1593,8 +1597,10 @@ pub enum CliError {
         code(apprafter::secrets::token_outside_vault),
         help(
             "A locked store takes tokens only from its vault; this one was written by an older \
-             AppRafter or by another program. `apprafter target add {target} --renew --token \
-             <token>` stores the token in the vault and replaces the file."
+             AppRafter or by another program. `apprafter target add {target} --renew` stores a \
+             token in the vault and replaces the file (at a terminal it asks for the new token \
+             without showing it; in a script, `--token`). That token was on disk in clear: if it \
+             is a real one, delete it in the Hetzner Console once the new one works."
         )
     )]
     TokenOutsideVault { target: String, path: PathBuf },
@@ -1605,8 +1611,8 @@ pub enum CliError {
         code(apprafter::secrets::token_in_another_vault),
         help(
             "The target's files came from the target store with id {id}, whose vault holds its \
-             token. Store the token here: `apprafter target add {target} --renew --token \
-             <token>`."
+             token. Store the token here: `apprafter target add {target} --renew` (at a \
+             terminal it asks for the new token without showing it; in a script, `--token`)."
         )
     )]
     TokenInAnotherVault { target: String, id: String },
@@ -1728,8 +1734,57 @@ mod tests {
         );
         assert_eq!(
             help_of(&err),
-            "Run `apprafter target add prod --renew --token <X>` to store one, or set \
-             `HCLOUD_TOKEN` for this invocation."
+            "Run `apprafter target add prod --renew` to store one (at a terminal it asks for the \
+             new token without showing it; in a script, `--token`), or set `HCLOUD_TOKEN` for \
+             this invocation."
+        );
+    }
+
+    /// d4a-d Task 13b: the three refusals for a token this store does not use name the renewal
+    /// with no token on the command line (other processes can read it there, and the shell's
+    /// history keeps it): at a terminal it asks without showing it. A token found in clear is
+    /// named for what it may be, a real one to delete once the new one works.
+    #[test]
+    fn the_unused_token_refusals_name_a_renewal_that_asks() {
+        let cases = [
+            CliError::TokenOutsideVault {
+                target: "prod".into(),
+                path: "/s/targets/prod/credentials.yaml".into(),
+            },
+            CliError::TokenInAnotherVault {
+                target: "prod".into(),
+                id: "0123456789abcdef".into(),
+            },
+            CliError::TokenMissingFromVault {
+                target: "prod".into(),
+                store: "/s".into(),
+            },
+        ];
+        for err in &cases {
+            let help = help_of(err)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(
+                help.contains("`apprafter target add prod --renew` "),
+                "{help}"
+            );
+            assert!(
+                help.contains(
+                    "(at a terminal it asks for the new token without showing it; in a script, \
+                     `--token`)"
+                ),
+                "{help}"
+            );
+            assert!(!help.contains("--renew --token"), "{help}");
+        }
+        assert!(
+            help_of(&cases[0]).contains(
+                "That token was on disk in clear: if it is a real one, delete it in the Hetzner \
+                 Console once the new one works."
+            ),
+            "{}",
+            help_of(&cases[0])
         );
     }
 
@@ -1971,9 +2026,17 @@ mod tests {
                 .unwrap_or_else(|| panic!("{status}: {help}"))
                 .to_string()
         };
-        for why in ["wrong", "revoked", "rotated", "--renew --token"] {
+        for why in [
+            "wrong",
+            "revoked",
+            "rotated",
+            "`apprafter target add <name> --renew` replaces it",
+            "in a script, `--token`",
+        ] {
             assert!(line("401").contains(why), "{why}: {help}");
         }
+        // d4a-d Task 13b: never a token on the command line, at a terminal.
+        assert!(!line("401").contains("--renew --token"), "{help}");
         assert!(!line("401").contains("stored API token was"), "{help}");
         assert!(line("403").contains("Read & Write"), "{help}");
         assert!(line("429").contains("wait"), "{help}");
@@ -2239,9 +2302,13 @@ mod tests {
         let help = help_of(&err);
         // Help leads with rotation guidance, not generic API blame.
         assert!(
-            help.contains("--renew --token"),
+            help.contains(
+                "`apprafter target add <name> --renew` instead of re-creating the target (at a \
+                 terminal it asks for the new token without showing it; in a script, `--token`)"
+            ),
             "missing rotation hint: {help}"
         );
+        assert!(!help.contains("--renew --token"), "{help}");
         // D.3d follow-up: the check is a read (GET /v1/locations) that a Read-only token
         // passes, and the format check refuses a token with a trailing newline before it, so
         // neither a token's scope nor a newline can be why it answered 401. The console shows
@@ -2759,7 +2826,7 @@ mod tests {
             (CliError::TokenOutsideVault { target: "prod".into(), path: "/s/targets/prod/credentials.yaml".into() },
              "apprafter::secrets::token_outside_vault",
              "the credentials file of target `prod` holds a token in clear, but this target store is locked: that token is not used (/s/targets/prod/credentials.yaml)",
-             "`apprafter target add prod --renew --token <token>`"),
+             "`apprafter target add prod --renew` stores a token in the vault and replaces the file"),
             (CliError::TokenInAnotherVault { target: "prod".into(), id: "0123456789abcdef".into() },
              "apprafter::secrets::token_in_another_vault",
              "the token of target `prod` is in the vault of another target store (id 0123456789abcdef)",

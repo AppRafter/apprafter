@@ -166,7 +166,8 @@ With a target configured but no token in its `credentials.yaml`:
 
 ```text
   × target `prod` has no provider token stored
-  help: Run `apprafter target add prod --renew --token <X>` to store one, or
+  help: Run `apprafter target add prod --renew` to store one (at a terminal it
+        asks for the new token without showing it; in a script, `--token`), or
         set `HCLOUD_TOKEN` for this invocation.
 ```
 

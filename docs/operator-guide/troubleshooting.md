@@ -74,7 +74,8 @@ reports this code too, for any status but 401
 
 - **401 unauthorized** — the token is wrong, or it was revoked or
   rotated. For a target's stored token,
-  `apprafter target add <name> --renew --token <new>` replaces it.
+  `apprafter target add <name> --renew` replaces it: at a terminal it
+  asks for the new token without showing it; in a script, pass `--token`.
   An `HCLOUD_TOKEN` in the environment outranks the stored token.
 - **403 forbidden** — the token lacks Read & Write (it is
   Read-only), or the project forbids the call, for example at one
@@ -255,8 +256,9 @@ refuses it first (`apprafter::target::invalid_token`).
   from where you saved it, or create a new one with Read & Write
   permission in the Hetzner Console (open the project, then
   Security → API tokens).
-- If you're rotating, use `apprafter target add <name> --renew
-  --token <new>` instead of re-creating the target.
+- If you're rotating, use `apprafter target add <name> --renew`
+  instead of re-creating the target. At a terminal it asks for the new
+  token without showing it; in a script, pass `--token`.
 
 ### `apprafter::target::provider_unreachable`
 
@@ -751,8 +753,8 @@ Error: apprafter::target::token_rejected
         unauthorized: the token was mistyped, or it was revoked or
         rotated, or its project was deleted.
         • A token is shown only once, when it is created: …
-        • If you're rotating, run `apprafter target add <name>
-        --renew --token <new>` …
+        • If you're rotating, run `apprafter target add <name> --renew`
+        instead of re-creating the target …
 ```
 
 The OUTER `Error:` line names the operator-facing scenario. The
