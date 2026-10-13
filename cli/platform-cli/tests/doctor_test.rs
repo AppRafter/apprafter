@@ -8,29 +8,20 @@
 //! there (the token ping against mockito); these tests cover what
 //! the CLI adds: the rendering, the exit code and Ctrl-C.
 
+mod common;
+
 use assert_cmd::Command;
+use common::spawn::Spawn;
 use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 
-/// `doctor` reaches beyond this machine (`startup.rs`), so without the bypass the startup
-/// checks would call the network from a test (overview §6.2).
-///
-/// Review finding 10 (GOTCHA-66): no doctor test runs a tool of the machine running it. `PATH`
-/// is [`NO_TOOLS`] until a test sets the stand-ins' directory, and `CUE_BIN`, an override the
-/// cue row takes before `PATH`, is removed.
-fn cli() -> Command {
-    let mut cmd = Command::cargo_bin("apprafter").unwrap();
-    cmd.env("APPRAFTER_SKIP_STARTUP_CHECKS", "1")
-        .env("PATH", NO_TOOLS)
-        .env_remove("CUE_BIN");
-    cmd
+/// `doctor` reaches beyond this machine (`startup.rs`); the spawn point turns the startup checks
+/// off. Review finding 10 (GOTCHA-66): no doctor test runs a tool of the machine running it —
+/// the sandbox's `PATH` is its empty `bin` until a test sets the stand-ins' directory, and no
+/// `CUE_BIN` reaches the child.
+fn cli(sp: &Spawn) -> Command {
+    sp.cmd(&[])
 }
-
-/// A `PATH` that finds nothing: a directory under the `apprafter` binary, which is a file, so
-/// it can never exist. Not an empty `PATH`, whose one empty entry means the current directory.
-const NO_TOOLS: &str = concat!(env!("CARGO_BIN_EXE_apprafter"), "/no-tools");
-
-mod common;
 
 /// A `PATH` holding nothing but a stand-in for every tool `doctor` probes.
 ///
@@ -77,16 +68,15 @@ fn the_stand_ins_answer_their_version_call_like_the_real_tools() {
     }
 }
 
-/// The default above holds: through `cli()` alone, doctor finds none of the tools it probes,
+/// The default above holds: through the sandbox alone, doctor finds none of the tools it probes,
 /// whatever the machine running the test has installed (`CUE_BIN` included).
 #[test]
 fn doctor_through_cli_finds_no_tool_of_the_machine_running_it() {
     let dir = tempfile::tempdir().unwrap();
-    let out = cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    let sp = Spawn::new().with_store(dir.path());
+    let out = cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
         .env("APPRAFTER_HCLOUD_BASE_URL", "http://127.0.0.1:1")
-        .env("KUBECONFIG", "/nonexistent")
         .arg("doctor")
         .output()
         .unwrap();
@@ -108,7 +98,7 @@ fn synthetic_hetzner_token() -> String {
     "a".repeat(64)
 }
 
-fn seed_target_with_ssh(dir: &std::path::Path, ssh_key: Option<&std::path::Path>) {
+fn seed_target_with_ssh(sp: &Spawn, ssh_key: Option<&std::path::Path>) {
     let token = synthetic_hetzner_token();
     let mut args: Vec<String> = vec![
         "target".into(),
@@ -127,10 +117,8 @@ fn seed_target_with_ssh(dir: &std::path::Path, ssh_key: Option<&std::path::Path>
         args.push("--ssh-key".into());
         args.push(k.to_string_lossy().into_owned());
     }
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir)
+    cli(sp)
         .env("APPRAFTER_NO_PING", "1")
-        .env_remove("HCLOUD_TOKEN")
         .args(args)
         .assert()
         .success();
@@ -151,9 +139,9 @@ fn doctor_on_empty_store_still_reports_the_environment() {
     // instead by the empty-PATH goldens (`golden/doctor/*_empty_path.golden`:
     // a missing kubectl is a FAIL and `[exit 1]`).
     let dir = tempfile::tempdir().unwrap();
+    let sp = Spawn::new().with_store(dir.path());
     let tools = tools_on_path();
-    let out = cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    let out = cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
         .env("PATH", tools.path())
         .arg("doctor")
@@ -176,19 +164,19 @@ fn doctor_on_empty_store_still_reports_the_environment() {
 #[test]
 fn doctor_renders_target_and_env_checks_with_summary() {
     let dir = tempfile::tempdir().unwrap();
+    let sp = Spawn::new().with_store(dir.path());
     let key_dir = tempfile::tempdir().unwrap();
     let key_path = key_dir.path().join("id_ed25519.pub");
     std::fs::write(&key_path, "ssh-ed25519 AAAA test@host").unwrap();
 
-    seed_target_with_ssh(dir.path(), Some(&key_path));
+    seed_target_with_ssh(&sp, Some(&key_path));
 
     let tools = tools_on_path();
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
         .env("PATH", tools.path())
         // Pins the production host: the DNS row names the host of the
-        // configured API base, so an inherited override would move it.
+        // configured API base, which the spawn point sets to a closed port.
         .env_remove("APPRAFTER_HCLOUD_BASE_URL")
         .arg("doctor")
         .assert()
@@ -218,11 +206,9 @@ fn doctor_renders_target_and_env_checks_with_summary() {
 #[test]
 fn doctor_resolves_the_host_of_the_configured_api_base() {
     let dir = tempfile::tempdir().unwrap();
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
-        .env("APPRAFTER_SKIP_STARTUP_CHECKS", "1")
+    let sp = Spawn::new().with_store(dir.path());
+    cli(&sp)
         .env("APPRAFTER_HCLOUD_BASE_URL", "http://127.0.0.1:1")
-        .env("KUBECONFIG", "/nonexistent")
         .arg("doctor")
         .assert()
         .stdout(contains("DNS resolves `127.0.0.1`"))
@@ -232,12 +218,11 @@ fn doctor_resolves_the_host_of_the_configured_api_base() {
 #[test]
 fn doctor_target_flag_inspects_non_active_target() {
     let dir = tempfile::tempdir().unwrap();
-    seed_target_with_ssh(dir.path(), None);
+    let sp = Spawn::new().with_store(dir.path());
+    seed_target_with_ssh(&sp, None);
     // Add a second target that isn't active.
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
-        .env_remove("HCLOUD_TOKEN")
         .args([
             "target",
             "add",
@@ -251,8 +236,7 @@ fn doctor_target_flag_inspects_non_active_target() {
         .success();
 
     let tools = tools_on_path();
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
         .env("PATH", tools.path())
         .args(["doctor", "--target", "secondary"])
@@ -266,18 +250,18 @@ fn doctor_ssh_key_missing_path_fails_the_run_with_exit_1() {
     // Configure a target with an ssh-key path, then delete the
     // file so the doctor's ssh-key check trips into FAIL.
     let dir = tempfile::tempdir().unwrap();
+    let sp = Spawn::new().with_store(dir.path());
     let key_dir = tempfile::tempdir().unwrap();
     let key_path = key_dir.path().join("id_ed25519.pub");
     std::fs::write(&key_path, "ssh-ed25519 AAAA test@host").unwrap();
-    seed_target_with_ssh(dir.path(), Some(&key_path));
+    seed_target_with_ssh(&sp, Some(&key_path));
 
     // Wipe the key file — its path stays in the target config,
     // doctor must surface this as a FAIL (stale config).
     std::fs::remove_file(&key_path).unwrap();
 
     let tools = tools_on_path();
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
         .env("PATH", tools.path())
         .arg("doctor")
@@ -295,10 +279,10 @@ fn doctor_ssh_key_missing_path_fails_the_run_with_exit_1() {
 #[test]
 fn doctor_target_not_found_fails_with_available_hint() {
     let dir = tempfile::tempdir().unwrap();
-    seed_target_with_ssh(dir.path(), None);
+    let sp = Spawn::new().with_store(dir.path());
+    seed_target_with_ssh(&sp, None);
 
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
         .args(["doctor", "--target", "ghost"])
         .assert()
@@ -314,14 +298,14 @@ fn doctor_summary_line_phrases_outcomes_clearly() {
     // token check skipped (`--no-ping`, not counted), the summary is "All
     // good" and contains neither "FAIL" nor "warning".
     let dir = tempfile::tempdir().unwrap();
+    let sp = Spawn::new().with_store(dir.path());
     let key_dir = tempfile::tempdir().unwrap();
     let key_path = key_dir.path().join("id_ed25519.pub");
     std::fs::write(&key_path, "ssh-ed25519 AAAA test@host").unwrap();
-    seed_target_with_ssh(dir.path(), Some(&key_path));
+    seed_target_with_ssh(&sp, Some(&key_path));
 
     let tools = tools_on_path();
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
         .env("PATH", tools.path())
         // The DNS row then resolves `127.0.0.1`, so the run is hermetic.
@@ -377,6 +361,7 @@ fn a_signal_stops_doctor_and_kills_the_tool_it_was_probing(signal: i32, code: i3
     }
 
     let dir = tempfile::tempdir().unwrap();
+    let sp = Spawn::new().with_store(dir.path());
     let tools = tools_on_path();
     let pid_file = tools.path().join("restic.pid");
     let host_path = std::env::var_os("PATH").unwrap_or_default();
@@ -393,7 +378,9 @@ fn a_signal_stops_doctor_and_kills_the_tool_it_was_probing(signal: i32, code: i3
         ),
     );
     let started = Instant::now();
-    let mut doctor = std::process::Command::new(env!("CARGO_BIN_EXE_apprafter"));
+    // The spawn point's `setsid` runs first (pre_exec closures run in registration order), the
+    // signal reset after it.
+    let mut doctor = sp.std(&["doctor"]);
     // SAFETY: `signal(2)` is async-signal-safe and touches no memory of this process.
     unsafe {
         doctor.pre_exec(move || {
@@ -404,14 +391,8 @@ fn a_signal_stops_doctor_and_kills_the_tool_it_was_probing(signal: i32, code: i3
         });
     }
     let mut doctor = doctor
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
-        .env("APPRAFTER_SKIP_STARTUP_CHECKS", "1")
         .env("APPRAFTER_NO_PING", "1")
-        .env("APPRAFTER_HCLOUD_BASE_URL", "http://127.0.0.1:1")
-        .env("KUBECONFIG", "/nonexistent")
         .env("PATH", tools.path())
-        .env_remove("CUE_BIN")
-        .arg("doctor")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -488,15 +469,13 @@ fn a_signal_stops_doctor_and_kills_the_tool_it_was_probing(signal: i32, code: i3
 #[cfg(windows)]
 #[test]
 fn ctrl_break_stops_doctor_and_kills_the_tool_it_was_probing() {
-    use std::os::windows::process::CommandExt as _;
     use std::time::{Duration, Instant};
 
     use apprafter_core::tools::TOOL_PROBE_TIMEOUT;
     use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
     use windows_sys::Win32::System::Console::{GenerateConsoleCtrlEvent, CTRL_BREAK_EVENT};
     use windows_sys::Win32::System::Threading::{
-        OpenProcess, TerminateProcess, WaitForSingleObject, CREATE_NEW_PROCESS_GROUP,
-        PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+        OpenProcess, TerminateProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
     };
 
     /// Whether process `pid` ends within `bound`; one still running then is terminated.
@@ -520,19 +499,14 @@ fn ctrl_break_stops_doctor_and_kills_the_tool_it_was_probing() {
     let dir = tempfile::tempdir().unwrap();
     let tools = tools_on_path();
     let pid_file = tools.path().join("restic.pid");
+    let sp = Spawn::new().with_store(dir.path()).sharing_console();
     let started = Instant::now();
-    let mut doctor = std::process::Command::new(env!("CARGO_BIN_EXE_apprafter"))
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
-        .env("APPRAFTER_SKIP_STARTUP_CHECKS", "1")
+    let mut doctor = sp
+        .std(&["doctor"])
         .env("APPRAFTER_NO_PING", "1")
-        .env("APPRAFTER_HCLOUD_BASE_URL", "http://127.0.0.1:1")
-        .env("KUBECONFIG", "/nonexistent")
         .env("PATH", tools.path())
-        .env_remove("CUE_BIN")
         .env("APPRAFTER_TOOL_STAND_IN_HANG", "restic")
         .env("APPRAFTER_TOOL_STAND_IN_PID_FILE", &pid_file)
-        .arg("doctor")
-        .creation_flags(CREATE_NEW_PROCESS_GROUP)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -598,13 +572,12 @@ fn ctrl_break_stops_doctor_and_kills_the_tool_it_was_probing() {
 #[test]
 fn doctor_prints_the_cluster_group_for_an_existing_target() {
     let dir = tempfile::tempdir().unwrap();
-    seed_target_with_ssh(dir.path(), None);
+    let sp = Spawn::new().with_store(dir.path());
+    seed_target_with_ssh(&sp, None);
     let tools = tools_on_path();
-    let out = cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    let out = cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
         .env("APPRAFTER_HCLOUD_BASE_URL", "http://127.0.0.1:1")
-        .env("KUBECONFIG", "/nonexistent")
         .env("PATH", tools.path())
         .arg("doctor")
         .output()
@@ -625,7 +598,8 @@ fn doctor_prints_the_cluster_group_for_an_existing_target() {
 #[test]
 fn doctor_migrates_a_legacy_cwd_state_before_reading_it() {
     let dir = tempfile::tempdir().unwrap();
-    seed_target_with_ssh(dir.path(), None);
+    let sp = Spawn::new().with_store(dir.path());
+    seed_target_with_ssh(&sp, None);
     let cwd = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(cwd.path().join(".apprafter")).unwrap();
     std::fs::write(
@@ -634,11 +608,9 @@ fn doctor_migrates_a_legacy_cwd_state_before_reading_it() {
     )
     .unwrap();
     let tools = tools_on_path();
-    let out = cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    let out = cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
         .env("APPRAFTER_HCLOUD_BASE_URL", "http://127.0.0.1:1")
-        .env("KUBECONFIG", "/nonexistent")
         .env("PATH", tools.path())
         .current_dir(cwd.path())
         .arg("doctor")
@@ -659,7 +631,8 @@ fn doctor_migrates_a_legacy_cwd_state_before_reading_it() {
 #[test]
 fn doctor_of_a_missing_target_creates_no_state_dir() {
     let dir = tempfile::tempdir().unwrap();
-    seed_target_with_ssh(dir.path(), None);
+    let sp = Spawn::new().with_store(dir.path());
+    seed_target_with_ssh(&sp, None);
     let cwd = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(cwd.path().join(".apprafter")).unwrap();
     std::fs::write(
@@ -668,11 +641,9 @@ fn doctor_of_a_missing_target_creates_no_state_dir() {
     )
     .unwrap();
     let tools = tools_on_path();
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
         .env("APPRAFTER_HCLOUD_BASE_URL", "http://127.0.0.1:1")
-        .env("KUBECONFIG", "/nonexistent")
         .env("PATH", tools.path())
         .current_dir(cwd.path())
         .args(["doctor", "--target", "ghost"])

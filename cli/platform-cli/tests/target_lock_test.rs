@@ -4,8 +4,8 @@
 //!
 //! The test process holds `cli_core::StoreLock` on a seeded store and runs
 //! one edit — `target use`, `rename`, `remove`, `machine`, `add --renew` —
-//! as a real process, in the cleared environment `target_concurrency_test.rs`
-//! uses. The edit must report the wait on stderr and still be running half a
+//! as a real process, through the spawn point (`tests/common/spawn.rs`).
+//! The edit must report the wait on stderr and still be running half a
 //! second later; released, it must finish, successfully, within 30 s. Each
 //! check fails if the command does not take the lock, and none depends on
 //! timing when it does: the wait is observed by its stderr line, not by a
@@ -15,8 +15,9 @@
 //! (read-only) is used without the lock, with a warning, instead of making
 //! a command that writes nothing fail.
 
+mod common;
+
 use std::io::Read;
-use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -26,6 +27,7 @@ use cli_core::target::{
     save_global_config, save_target, GlobalConfig, StoreLock, Target, TargetConfig,
     TargetCredentials, TargetStorePaths, TARGET_STORE_VERSION,
 };
+use common::spawn::Spawn;
 
 /// 64 ASCII alphanumerics: the shape `cli_core::target` accepts.
 const TOKEN_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -38,18 +40,14 @@ const STILL_WAITING: Duration = Duration::from_millis(500);
 
 /// A scratch sandbox with a seeded store: targets `a` (active) and `b`.
 struct Sandbox {
-    _dir: tempfile::TempDir,
-    root: PathBuf,
+    spawn: Spawn,
 }
 
 impl Sandbox {
     fn new() -> Sandbox {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().to_path_buf();
-        for sub in ["home", "config", "cache", "bin"] {
-            std::fs::create_dir_all(root.join(sub)).unwrap();
-        }
-        let sandbox = Sandbox { _dir: dir, root };
+        let sandbox = Sandbox {
+            spawn: Spawn::new(),
+        };
         let paths = sandbox.store();
         for name in ["a", "b"] {
             save_target(
@@ -80,29 +78,14 @@ impl Sandbox {
     }
 
     fn store(&self) -> TargetStorePaths {
-        TargetStorePaths::for_root(self.root.join("store"))
+        TargetStorePaths::for_root(self.spawn.store())
     }
 
     fn apprafter(&self, args: &[&str]) -> Command {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_apprafter"));
-        c.env_clear()
-            .env("PATH", self.root.join("bin"))
-            .env("HOME", self.root.join("home"))
-            .env("XDG_CONFIG_HOME", self.root.join("config"))
-            .env("XDG_CACHE_HOME", self.root.join("cache"))
-            .env("APPRAFTER_CONFIG_DIR", self.root.join("store"))
-            .env("APPRAFTER_SKIP_STARTUP_CHECKS", "1")
-            .env("KUBECONFIG", self.root.join("no-kubeconfig"))
-            .env("APPRAFTER_HCLOUD_BASE_URL", "http://127.0.0.1:1")
-            .current_dir(self.root.join("home"))
-            .stdin(Stdio::null())
+        let mut c = self.spawn.std(args);
+        c.stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .args(args);
-        // Windows cannot start a process without its system root.
-        if let Some(root) = std::env::var_os("SYSTEMROOT") {
-            c.env("SYSTEMROOT", root);
-        }
+            .stderr(Stdio::piped());
         c
     }
 
@@ -115,7 +98,7 @@ impl Sandbox {
     }
 
     fn read(&self, rel: &str) -> String {
-        std::fs::read_to_string(self.root.join("store").join(rel)).unwrap()
+        std::fs::read_to_string(self.spawn.store().join(rel)).unwrap()
     }
 }
 
@@ -377,7 +360,7 @@ fn target_add_renew_waits_for_the_store_lock() {
 /// Restores a directory's mode on drop, so a failed test still lets its
 /// `TempDir` clean up.
 #[cfg(unix)]
-struct ModeGuard(PathBuf);
+struct ModeGuard(std::path::PathBuf);
 
 #[cfg(unix)]
 impl Drop for ModeGuard {

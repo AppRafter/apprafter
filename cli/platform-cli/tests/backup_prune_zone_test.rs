@@ -22,17 +22,18 @@
 //! Unix only: the stand-ins are `#!/bin/sh` scripts.
 #![cfg(unix)]
 
+mod common;
+
 use std::fs;
 use std::path::PathBuf;
 
-use assert_cmd::Command;
-use tempfile::TempDir;
+use common::spawn::Spawn;
 
 /// A `kube-system` UID shaped like the ones Kubernetes stamps.
 const UID: &str = "11111111-2222-3333-4444-555555555555";
 
 struct Sandbox {
-    dir: TempDir,
+    spawn: Spawn,
 }
 
 /// What one invocation did.
@@ -48,12 +49,10 @@ struct Run {
 
 impl Sandbox {
     fn new() -> Self {
-        let dir = TempDir::new().unwrap();
-        let root = dir.path();
-        let bin = root.join("bin");
-        fs::create_dir_all(&bin).unwrap();
-        let restic_log = root.join("restic.log");
-        let kubectl_log = root.join("kubectl.log");
+        let spawn = Spawn::new();
+        let bin = spawn.path("bin");
+        let restic_log = spawn.path("restic.log");
+        let kubectl_log = spawn.path("kubectl.log");
         stub(
             &bin.join("restic"),
             &format!(
@@ -69,15 +68,15 @@ impl Sandbox {
             ),
         );
         fs::write(
-            root.join("operator-s3.env"),
+            spawn.path("operator-s3.env"),
             "S3_ACCESS_KEY_ID=AKIDEXAMPLE\nS3_SECRET_ACCESS_KEY=secret\nRESTIC_PASSWORD=pw\n",
         )
         .unwrap();
-        Sandbox { dir }
+        Sandbox { spawn }
     }
 
     fn path(&self, name: &str) -> PathBuf {
-        self.dir.path().join(name)
+        self.spawn.path(name)
     }
 
     /// `backup prune` in its offline form, plus `extra`.
@@ -100,19 +99,10 @@ impl Sandbox {
             UID,
         ];
         args.extend_from_slice(extra);
-        let output = Command::cargo_bin("apprafter")
-            .unwrap()
-            .env_clear()
-            .env("PATH", self.path("bin"))
-            .env("HOME", self.path("home"))
-            .env("XDG_CACHE_HOME", self.path("cache"))
-            .env("XDG_CONFIG_HOME", self.path("config"))
-            .env("APPRAFTER_CONFIG_DIR", self.path("apprafter-config"))
-            .env("APPRAFTER_AGE_KEY", self.path("age.key"))
-            .env("APPRAFTER_SKIP_STARTUP_CHECKS", "1")
-            .env("KUBECONFIG", "/nonexistent")
-            .current_dir(self.dir.path())
-            .args(&args)
+        let output = self
+            .spawn
+            .cmd(&args)
+            .current_dir(self.spawn.root())
             .output()
             .unwrap();
         Run {

@@ -10,16 +10,20 @@
 //! below seed a target named `default` (which becomes active on
 //! creation) and inspect the per-target file. Independence from
 //! the developer's real `~/.config/apprafter/` is enforced by
-//! always supplying `APPRAFTER_CONFIG_DIR` to the spawned
-//! processes.
+//! running every process through the spawn point
+//! (`tests/common/spawn.rs`) on the workspace's store.
+
+mod common;
+
+use common::spawn::Spawn;
 
 use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
 use predicates::str::contains;
 
-fn cli() -> Command {
-    Command::cargo_bin("apprafter").unwrap()
+fn cli(sp: &Spawn) -> Command {
+    sp.cmd(&[])
 }
 
 /// Path to the per-target `state.json` under a given config dir.
@@ -36,22 +40,23 @@ fn state_path(cfg_dir: &Path, target: &str) -> PathBuf {
 /// with the per-target state that `init` would write. Returns
 /// both temp dirs so callers can keep them alive for the test
 /// lifetime (drop = remove); returns the config dir explicitly
-/// since the state path lives under it, not under cwd.
+/// since the state path lives under it, not under cwd, and the
+/// sandbox every command of the test runs in.
 struct Workspace {
     cwd: tempfile::TempDir,
     cfg_dir: tempfile::TempDir,
+    spawn: Spawn,
 }
 
 fn workspace_with_state(cluster: &str) -> Workspace {
     let cwd = tempfile::tempdir().unwrap();
     let cfg_dir = tempfile::tempdir().unwrap();
+    let spawn = Spawn::new().with_store(cfg_dir.path());
 
     // Create an active target. `target add` writes
     // `GlobalConfig.active_target = "default"` on the first
     // call so subsequent `init` / `apply` resolve to it.
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", cfg_dir.path())
-        .env_remove("HCLOUD_TOKEN")
+    cli(&spawn)
         .args([
             "target",
             "add",
@@ -71,9 +76,8 @@ fn workspace_with_state(cluster: &str) -> Workspace {
         .success();
 
     // Init now writes to <cfg_dir>/state/default/.apprafter/state.json.
-    cli()
+    cli(&spawn)
         .current_dir(cwd.path())
-        .env("APPRAFTER_CONFIG_DIR", cfg_dir.path())
         .args([
             "init",
             "--provider",
@@ -93,7 +97,11 @@ fn workspace_with_state(cluster: &str) -> Workspace {
         state["cluster_name"] = serde_json::Value::String(cluster.into());
         std::fs::write(path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
     }
-    Workspace { cwd, cfg_dir }
+    Workspace {
+        cwd,
+        cfg_dir,
+        spawn,
+    }
 }
 
 /// Stand up mocks for every list endpoint `import` queries.
@@ -166,9 +174,8 @@ fn import_writes_state_for_matching_cluster() {
     mock_all_lists(&mut server, "platform-1", 1);
     let ws = workspace_with_state("platform-1");
 
-    cli()
+    cli(&ws.spawn)
         .current_dir(ws.cwd.path())
-        .env("APPRAFTER_CONFIG_DIR", ws.cfg_dir.path())
         .env("HCLOUD_TOKEN", "test-token")
         .env("APPRAFTER_HCLOUD_BASE_URL", server.url())
         .arg("import")
@@ -205,9 +212,8 @@ fn import_dry_run_prints_summary_but_does_not_write_state() {
     mock_all_lists(&mut server, "platform-1", 0);
     let ws = workspace_with_state("platform-1");
 
-    cli()
+    cli(&ws.spawn)
         .current_dir(ws.cwd.path())
-        .env("APPRAFTER_CONFIG_DIR", ws.cfg_dir.path())
         .env("HCLOUD_TOKEN", "test-token")
         .env("APPRAFTER_HCLOUD_BASE_URL", server.url())
         .args(["import", "--dry-run"])
@@ -256,9 +262,8 @@ fn import_with_no_matching_server_says_so_and_writes_nothing() {
         .create();
     let ws = workspace_with_state("platform-1");
 
-    cli()
+    cli(&ws.spawn)
         .current_dir(ws.cwd.path())
-        .env("APPRAFTER_CONFIG_DIR", ws.cfg_dir.path())
         .env("HCLOUD_TOKEN", "test-token")
         .env("APPRAFTER_HCLOUD_BASE_URL", server.url())
         .arg("import")
@@ -291,9 +296,8 @@ fn import_refuses_to_overwrite_existing_state_without_force() {
     });
     std::fs::write(&path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
 
-    cli()
+    cli(&ws.spawn)
         .current_dir(ws.cwd.path())
-        .env("APPRAFTER_CONFIG_DIR", ws.cfg_dir.path())
         .env("HCLOUD_TOKEN", "test-token")
         .env("APPRAFTER_HCLOUD_BASE_URL", server.url())
         .arg("import")
@@ -326,9 +330,8 @@ fn import_force_overwrites_existing_state() {
     });
     std::fs::write(&path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
 
-    cli()
+    cli(&ws.spawn)
         .current_dir(ws.cwd.path())
-        .env("APPRAFTER_CONFIG_DIR", ws.cfg_dir.path())
         .env("HCLOUD_TOKEN", "test-token")
         .env("APPRAFTER_HCLOUD_BASE_URL", server.url())
         .args(["import", "--force"])
@@ -381,9 +384,8 @@ fn import_skips_servers_without_apprafter_label() {
         .create();
     let ws = workspace_with_state("platform-1");
 
-    cli()
+    cli(&ws.spawn)
         .current_dir(ws.cwd.path())
-        .env("APPRAFTER_CONFIG_DIR", ws.cfg_dir.path())
         .env("HCLOUD_TOKEN", "test-token")
         .env("APPRAFTER_HCLOUD_BASE_URL", server.url())
         .arg("import")

@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Doctor's Cluster group against a real API server: a DISPOSABLE kind cluster, never the
 //! owner's. The cached kubeconfig is the kind one, age-encrypted under a scratch key in a
-//! scratch store; the child runs with `KUBECONFIG=/nonexistent`, so a PASS proves the probe
-//! used the materialised copy and nothing ambient. A second target with the same kubeconfig,
-//! its current context's cluster pointed at a closed port, proves the real kubectl's refusal
-//! is classified.
+//! scratch store; the child runs through the spawn point, its `KUBECONFIG` naming a file that
+//! does not exist, so a PASS proves the probe used the materialised copy and nothing ambient.
+//! A second target with the same kubeconfig, its current context's cluster pointed at a closed
+//! port, proves the real kubectl's refusal is classified.
 //!
 //! ```text
 //! APPRAFTER_K8S_SMOKE=1 KUBECONFIG=<kind kubeconfig> \
@@ -17,9 +17,10 @@
 //! never a skip.
 #![cfg(unix)]
 
-use std::path::Path;
+mod common;
 
 use assert_cmd::Command;
+use common::spawn::Spawn;
 use serde_yaml::Value;
 
 const TOKEN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -88,20 +89,14 @@ fn with_current_cluster_closed(doc: &Value) -> String {
     serde_yaml::to_string(&closed).unwrap()
 }
 
-fn apprafter(config: &Path, key: &Path) -> Command {
-    let mut c = Command::cargo_bin("apprafter").unwrap();
-    c.env("APPRAFTER_SKIP_STARTUP_CHECKS", "1")
-        .env("APPRAFTER_CONFIG_DIR", config)
-        .env("APPRAFTER_AGE_KEY", key)
-        .env("APPRAFTER_HCLOUD_BASE_URL", "http://127.0.0.1:1")
-        .env("KUBECONFIG", "/nonexistent")
-        .env_remove("HCLOUD_TOKEN");
-    c
+/// `apprafter` in `sp`, its age key at the sandbox's default (`sp.age_key()`).
+fn apprafter(sp: &Spawn) -> Command {
+    sp.cmd(&[])
 }
 
-/// A target whose state records a server and caches `kubeconfig`, encrypted to `key`.
-fn add_target(config: &Path, key: &Path, name: &str, kubeconfig: &str) {
-    apprafter(config, key)
+/// A target whose state records a server and caches `kubeconfig`, encrypted to the sandbox's key.
+fn add_target(sp: &Spawn, name: &str, kubeconfig: &str) {
+    apprafter(sp)
         .args([
             "target",
             "add",
@@ -115,9 +110,9 @@ fn add_target(config: &Path, key: &Path, name: &str, kubeconfig: &str) {
         ])
         .assert()
         .success();
-    let id = cli_core::secrets::load_or_create_identity(key).unwrap();
+    let id = cli_core::secrets::load_or_create_identity(&sp.age_key()).unwrap();
     let armored = cli_core::secrets::encrypt_for_recipient(kubeconfig, &id.to_public()).unwrap();
-    let state = config.join("state").join(name).join(".apprafter");
+    let state = sp.store().join("state").join(name).join(".apprafter");
     std::fs::create_dir_all(&state).unwrap();
     let body = serde_json::json!({"hetzner_cloud": {"server_id": 1, "server_name": name, "kubeconfig_age": armored}});
     std::fs::write(state.join("state.json"), body.to_string()).unwrap();
@@ -137,13 +132,15 @@ fn doctor_reaches_a_kind_cluster_through_its_cached_kubeconfig_only() {
     let doc: Value = serde_yaml::from_str(&yaml).unwrap();
     refuse_all_but_kind(&doc);
 
-    let scratch = tempfile::tempdir().unwrap();
-    let config = scratch.path().join("config");
-    let key = scratch.path().join("age.key");
-    add_target(&config, &key, "kind", &yaml);
-    add_target(&config, &key, "closed", &with_current_cluster_closed(&doc));
+    let host_path = std::env::var_os("PATH").unwrap_or_default();
+    let kubectl =
+        cli_core::tools::find_on_path("kubectl", &host_path, cli_core::tools::is_executable_file)
+            .expect("a real kubectl on PATH (the nix dev shell has one)");
+    let sp = Spawn::new().with_path(kubectl.parent().expect("kubectl's directory").to_path_buf());
+    add_target(&sp, "kind", &yaml);
+    add_target(&sp, "closed", &with_current_cluster_closed(&doc));
 
-    let out = apprafter(&config, &key)
+    let out = apprafter(&sp)
         .args(["doctor", "--target", "kind", "--no-ping"])
         .output()
         .unwrap();
@@ -162,7 +159,7 @@ fn doctor_reaches_a_kind_cluster_through_its_cached_kubeconfig_only() {
         "{stdout}"
     );
 
-    let out = apprafter(&config, &key)
+    let out = apprafter(&sp)
         .args(["doctor", "--target", "closed", "--no-ping"])
         .output()
         .unwrap();
@@ -175,7 +172,7 @@ fn doctor_reaches_a_kind_cluster_through_its_cached_kubeconfig_only() {
     );
     assert_eq!(out.status.code(), Some(1));
 
-    let run = config.join("run");
+    let run = sp.store().join("run");
     if let Ok(rd) = std::fs::read_dir(&run) {
         let left: Vec<_> = rd.map(|e| e.unwrap().file_name()).collect();
         assert!(
