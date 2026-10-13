@@ -106,42 +106,26 @@ fn lock_status_names_a_slot_by_this_builds_policy() {
     }
 }
 
-/// T66 at a terminal: `lock status` asks nothing, and still reports.
+/// T66 at a terminal: `lock status` asks nothing, and still reports. The terminal is read while
+/// the command runs (`converse`): on macOS a session leader's exit waits until its terminal's
+/// output is read (XNU's `ttywait`), so a test that reads the terminal only after the exit never
+/// sees one.
 #[cfg(unix)]
 #[test]
 fn lock_status_at_a_terminal_asks_nothing() {
-    use std::io::Read;
-    use std::os::fd::AsRawFd;
     let sp = Spawn::new();
     locked(&sp);
-    let (master, slave) = common::spawn::open_pty();
-    let out = sp
-        .std_at_terminal(&["lock", "status"], slave)
-        .stdout(std::process::Stdio::piped())
-        .output()
-        .unwrap();
-    let mut seen = Vec::new();
-    let mut m = std::fs::File::from(master);
-    // SAFETY: fcntl on the master this test owns: its reads stop at "no more data".
-    unsafe {
-        let flags = libc::fcntl(m.as_raw_fd(), libc::F_GETFL);
-        libc::fcntl(m.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
-    }
-    let _ = m.read_to_end(&mut seen);
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert_eq!(
-        out.status.code(),
-        Some(0),
+    let end = common::terminal::converse(&sp, &["lock", "status"], &[]);
+    assert_eq!(end.status.code(), Some(0), "{}", end.terminal);
+    assert!(
+        end.stdout.contains("This terminal:  no unlock window\n"),
         "{}",
-        String::from_utf8_lossy(&seen)
+        end.stdout
     );
     assert!(
-        stdout.contains("This terminal:  no unlock window\n"),
-        "{stdout}"
-    );
-    assert!(
-        !String::from_utf8_lossy(&seen).contains("recovery key:"),
-        "lock status asked for a secret"
+        !end.terminal.contains("recovery key:"),
+        "lock status asked for a secret:\n{}",
+        end.terminal
     );
 }
 

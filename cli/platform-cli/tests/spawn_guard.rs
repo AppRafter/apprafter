@@ -314,12 +314,6 @@ const ALLOWED: &[(&str, &str, Rule)] = &[
         "windows_the_holder_keeps_no_handle_of_its_starter",
         Rule::CreationFlags,
     ),
-    // `lock status` at a terminal asks nothing (D.4a T66): the forced condition is the terminal.
-    (
-        "platform-cli/tests/lock_commands_test.rs",
-        "lock_status_at_a_terminal_asks_nothing",
-        Rule::AtTerminal,
-    ),
     // The window's tests: each terminal is a session of its own at a pseudo-terminal (D.4a
     // T52, G6).
     (
