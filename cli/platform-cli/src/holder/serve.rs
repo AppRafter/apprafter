@@ -221,7 +221,7 @@ mod tests {
     }
 
     fn world(targets: &[(&str, Option<&str>)]) -> World {
-        let dir = tempfile::TempDir::new_in("/tmp").unwrap();
+        let dir = tempfile::tempdir().unwrap();
         let store = locked_store(dir.path(), targets);
         let init = InitHeader {
             store: StoreBinding {

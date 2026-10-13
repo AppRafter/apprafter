@@ -446,8 +446,9 @@ impl Spawn {
 
 /// No holder outlives its test (D.4a G8): a holder records its pid in its lock file
 /// (`<runtime dir>/apprafter/h-<id>.lock`, or `<store>/run` without `XDG_RUNTIME_DIR`); one whose
-/// lock is still held when the test's `Spawn` drops is killed, and the test fails naming it.
-#[cfg(unix)]
+/// lock is still held when the test's `Spawn` drops is killed, and the test fails naming it
+/// (Windows: the pid file `<store>\run\h-<id>-<pid>.pid`, for a living `apprafter.exe` only — a
+/// pid is reused there as anywhere).
 impl Drop for Spawn {
     fn drop(&mut self) {
         let leaked = self.reap_holders();
@@ -461,6 +462,58 @@ impl Drop for Spawn {
 }
 
 impl Spawn {
+    /// Kill every holder whose pid file (`<store>\run\h-<id>-<pid>.pid`) names a living
+    /// `apprafter`; their pids.
+    #[cfg(windows)]
+    fn reap_holders(&self) -> Vec<i32> {
+        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
+            PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+            PROCESS_TERMINATE,
+        };
+        let mut leaked = Vec::new();
+        let Ok(entries) = std::fs::read_dir(self.store().join("run")) else {
+            return leaked;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(pid) = name
+                .strip_prefix("h-")
+                .and_then(|n| n.strip_suffix(".pid"))
+                .and_then(|n| n.rsplit('-').next())
+                .and_then(|p| p.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            // SAFETY: a handle to check and end that process, closed below.
+            unsafe {
+                let h = OpenProcess(
+                    PROCESS_TERMINATE | PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+                    0,
+                    pid,
+                );
+                if h.is_null() {
+                    continue;
+                }
+                let mut buf = [0u16; 1024];
+                let mut len = buf.len() as u32;
+                let image =
+                    (QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len)
+                        != 0)
+                        .then(|| String::from_utf16_lossy(&buf[..len as usize]));
+                let alive = WaitForSingleObject(h, 0) == WAIT_TIMEOUT;
+                if alive && image.is_some_and(|i| i.to_ascii_lowercase().ends_with("apprafter.exe"))
+                {
+                    TerminateProcess(h, 1);
+                    leaked.push(pid as i32);
+                }
+                CloseHandle(h);
+            }
+        }
+        leaked
+    }
+
     /// Kill every holder still holding a lock file under this root; their pids.
     #[cfg(unix)]
     fn reap_holders(&self) -> Vec<i32> {

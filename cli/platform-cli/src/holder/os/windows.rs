@@ -2,10 +2,13 @@
 //! Windows calls of the holder (D.4a T51–T56; holder §1.4, §2.3, §4).
 
 use std::io;
+use std::path::Path;
 use std::ptr;
 use std::time::Duration;
 
-use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, HANDLE};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, GetLastError, LocalFree, ERROR_BROKEN_PIPE, ERROR_IO_PENDING, HANDLE, WAIT_TIMEOUT,
+};
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SetSecurityInfo,
     SDDL_REVISION_1, SE_KERNEL_OBJECT,
@@ -15,9 +18,20 @@ use windows_sys::Win32::Security::{
     DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
     TOKEN_GROUPS, TOKEN_QUERY, TOKEN_USER,
 };
-use windows_sys::Win32::System::SystemInformation::GetTickCount64;
-use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
+use windows_sys::Win32::System::Console::GetConsoleProcessList;
+use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
+use windows_sys::Win32::System::SystemInformation::{
+    GetSystemDirectoryW, GetSystemWindowsDirectoryW, GetTickCount64,
+};
+use windows_sys::Win32::System::Threading::{
+    CreateEventW, GetCurrentProcess, OpenProcess, OpenProcessToken, TerminateProcess,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+};
 use windows_sys::Win32::System::WindowsProgramming::QueryUnbiasedInterruptTime;
+use windows_sys::Win32::System::IO::{
+    CancelIoEx, GetOverlappedResult, GetOverlappedResultEx, OVERLAPPED,
+};
 
 /// Counts suspend (milliseconds since boot): the window's clock.
 pub(crate) fn clock_with_sleep() -> Duration {
@@ -152,6 +166,112 @@ pub(crate) fn process_sddl(user: &str) -> String {
     format!("D:P(A;;0x00101001;;;{user})(A;;RC;;;OW)")
 }
 
+/// The primary thread's: `SYNCHRONIZE | THREAD_QUERY_LIMITED_INFORMATION`; no
+/// `THREAD_GET_CONTEXT`.
+pub(crate) fn thread_sddl(user: &str) -> String {
+    format!("D:P(A;;0x00100800;;;{user})(A;;RC;;;OW)")
+}
+
+/// T54 for threads (critic-d4a-e finding 12): a same-user process that opens a thread of the
+/// holder with `THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME` can make it run
+/// code that reads the key page, whatever the process DACL says. So [`thread_sddl`]'s DACL goes
+/// on every thread this process has now — the loader's workers got the token's default — and
+/// becomes the token's default, so a thread this process makes later (a thread-pool worker)
+/// gets it too. The thread running this uses its pseudo handle, which needs no access right (its
+/// own DACL, set at creation, grants the owner no `WRITE_DAC`). A thread that is gone between
+/// the snapshot and the open is skipped. A thread another process makes in the holder (the
+/// console's control handler) takes its creator's default; `CTRL_CLOSE_EVENT`'s handler wipes
+/// the key page first.
+pub(crate) fn restrict_threads() -> io::Result<()> {
+    use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Security::{
+        SetTokenInformation, TokenDefaultDacl, TOKEN_ADJUST_DEFAULT, TOKEN_DEFAULT_DACL,
+    };
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcessId, GetCurrentThread, GetCurrentThreadId, OpenThread, THREAD_WRITE_DAC,
+    };
+    let sd = Sd::from_sddl(&thread_sddl(&user_sid_string()?))?;
+    let dacl = sd.dacl()?;
+    let apply = |thread: HANDLE| {
+        // SAFETY: a thread handle with WRITE_DAC (or the pseudo handle) and a DACL `sd` owns.
+        let rc = unsafe {
+            SetSecurityInfo(
+                thread,
+                SE_KERNEL_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                dacl,
+                ptr::null(),
+            )
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(rc as i32))
+        }
+    };
+    let mut token: HANDLE = ptr::null_mut();
+    // SAFETY: this process's pseudo handle; the token handle is owned below.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_DEFAULT, &mut token) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let token = Handle(token);
+    let default = TOKEN_DEFAULT_DACL { DefaultDacl: dacl };
+    // SAFETY: a TOKEN_DEFAULT_DACL whose DACL `sd` owns, for the call's length.
+    let set = unsafe {
+        SetTokenInformation(
+            token.0,
+            TokenDefaultDacl,
+            (&raw const default).cast(),
+            std::mem::size_of::<TOKEN_DEFAULT_DACL>() as u32,
+        )
+    };
+    if set == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a snapshot of the system's threads; owned below.
+    let snap = Handle(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) });
+    if snap.0 == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: no arguments.
+    let (me, this_thread) = unsafe { (GetCurrentProcessId(), GetCurrentThreadId()) };
+    // SAFETY: an all-zero THREADENTRY32 is valid; dwSize is set before use.
+    let mut e: THREADENTRY32 = unsafe { std::mem::zeroed() };
+    e.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+    // SAFETY: the snapshot above and an entry of the size it says.
+    let mut more = unsafe { Thread32First(snap.0, &mut e) } != 0;
+    while more {
+        if e.th32OwnerProcessID == me {
+            if e.th32ThreadID == this_thread {
+                // SAFETY: no arguments; a pseudo handle, never closed.
+                apply(unsafe { GetCurrentThread() })?;
+            } else {
+                // SAFETY: one of this process's threads; the handle is owned below.
+                let t = unsafe { OpenThread(THREAD_WRITE_DAC, 0, e.th32ThreadID) };
+                if t.is_null() {
+                    // SAFETY: this thread's last error.
+                    if unsafe { windows_sys::Win32::Foundation::GetLastError() }
+                        != ERROR_INVALID_PARAMETER
+                    {
+                        return Err(io::Error::last_os_error());
+                    }
+                } else {
+                    let t = Handle(t);
+                    apply(t.0)?;
+                }
+            }
+        }
+        // SAFETY: as above.
+        more = unsafe { Thread32Next(snap.0, &mut e) } != 0;
+    }
+    Ok(())
+}
+
 /// Apply [`process_sddl`] to this process (the spawn set it at creation too; holder §1.4).
 pub(crate) fn restrict_process() -> io::Result<()> {
     let sd = Sd::from_sddl(&process_sddl(&user_sid_string()?))?;
@@ -172,6 +292,207 @@ pub(crate) fn restrict_process() -> io::Result<()> {
         Ok(())
     } else {
         Err(io::Error::from_raw_os_error(rc as i32))
+    }
+}
+
+impl Handle {
+    /// The raw handle, no longer closed by this value.
+    pub(crate) fn into_raw(self) -> HANDLE {
+        let h = self.0;
+        std::mem::forget(self);
+        h
+    }
+}
+
+/// The processes attached to this process's console; empty when it has none (T51, T52).
+pub(crate) fn console_processes() -> Vec<u32> {
+    let mut pids = vec![0u32; 64];
+    loop {
+        // SAFETY: writes at most `pids.len()` pids and returns how many there are.
+        let n = unsafe { GetConsoleProcessList(pids.as_mut_ptr(), pids.len() as u32) } as usize;
+        if n == 0 {
+            return Vec::new();
+        }
+        if n <= pids.len() {
+            pids.truncate(n);
+            return pids;
+        }
+        pids.resize(n, 0);
+    }
+}
+
+/// A manual-reset event, unsignalled.
+pub(crate) fn event() -> io::Result<Handle> {
+    // SAFETY: an unnamed event, owned below.
+    let h = unsafe { CreateEventW(ptr::null(), 1, 0, ptr::null()) };
+    if h.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(Handle(h))
+}
+
+/// `%SystemRoot%` from the system, not the environment (the holder's only variable).
+pub(crate) fn windows_dir() -> io::Result<Vec<u16>> {
+    dir(|buf, len| unsafe { GetSystemWindowsDirectoryW(buf, len) })
+}
+
+/// `System32`, the holder's working directory (it pins no user directory).
+pub(crate) fn system_dir() -> io::Result<Vec<u16>> {
+    dir(|buf, len| unsafe { GetSystemDirectoryW(buf, len) })
+}
+
+fn dir(get: impl Fn(*mut u16, u32) -> u32) -> io::Result<Vec<u16>> {
+    let mut buf = vec![0u16; 260];
+    let n = get(buf.as_mut_ptr(), buf.len() as u32) as usize;
+    if n == 0 || n >= buf.len() {
+        return Err(io::Error::last_os_error());
+    }
+    buf.truncate(n);
+    Ok(buf)
+}
+
+/// `lock now` on a hung holder (T59, S9): open the process first — a handle pins it — then
+/// check the pipe's server is still that pid, then terminate through the handle.
+pub(crate) fn kill_server(pipe: &Handle, pid: u32) -> io::Result<()> {
+    // SAFETY: PROCESS_TERMINATE is the user's on a holder (T54's DACL); owned below.
+    let h = unsafe {
+        OpenProcess(
+            PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+            0,
+            pid,
+        )
+    };
+    if h.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let h = Handle(h);
+    let mut now = 0u32;
+    // SAFETY: the client's pipe handle; writes one pid (Task 6 P2).
+    if unsafe { GetNamedPipeServerProcessId(pipe.0, &mut now) } == 0 || now != pid {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "the holder already let go of this pipe",
+        ));
+    }
+    // SAFETY: the handle above.
+    if unsafe { TerminateProcess(h.0, 1) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Overlapped reads and writes on a pipe, each bounded by the per-operation timeout and, when
+/// set, a deadline on the window's clock.
+pub(crate) struct PipeIo {
+    pipe: HANDLE,
+    event: Handle,
+    per_op: Duration,
+    deadline: Option<Duration>,
+}
+
+impl PipeIo {
+    pub(crate) fn new(
+        pipe: HANDLE,
+        per_op: Duration,
+        deadline: Option<Duration>,
+    ) -> io::Result<PipeIo> {
+        Ok(PipeIo {
+            pipe,
+            event: event()?,
+            per_op,
+            deadline,
+        })
+    }
+
+    fn timeout_ms(&self) -> io::Result<u32> {
+        let mut t = self.per_op;
+        if let Some(d) = self.deadline {
+            let left = d.saturating_sub(clock_with_sleep());
+            if left.is_zero() {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            t = t.min(left);
+        }
+        Ok(u32::try_from(t.as_millis()).unwrap_or(u32::MAX))
+    }
+
+    fn op(&mut self, read: bool, buf: *mut u8, len: u32) -> io::Result<usize> {
+        let ms = self.timeout_ms()?;
+        // SAFETY: an all-zero OVERLAPPED is valid; it lives until the operation completes or is
+        // cancelled and waited for below.
+        let mut ov: OVERLAPPED = unsafe { std::mem::zeroed() };
+        ov.hEvent = self.event.0;
+        // SAFETY: `buf` holds `len` bytes for this call's duration.
+        let ok = unsafe {
+            if read {
+                ReadFile(self.pipe, buf, len, ptr::null_mut(), &mut ov)
+            } else {
+                WriteFile(self.pipe, buf, len, ptr::null_mut(), &mut ov)
+            }
+        };
+        if ok == 0 {
+            // SAFETY: the error of the call above.
+            match unsafe { GetLastError() } {
+                ERROR_IO_PENDING => {}
+                ERROR_BROKEN_PIPE => return Ok(0),
+                e => return Err(io::Error::from_raw_os_error(e as i32)),
+            }
+        }
+        let mut n = 0u32;
+        // SAFETY: the operation above, waited for at most `ms`.
+        if unsafe { GetOverlappedResultEx(self.pipe, &ov, &mut n, ms, 0) } == 0 {
+            // SAFETY: the error of the call above.
+            let e = unsafe { GetLastError() };
+            if e == WAIT_TIMEOUT {
+                // SAFETY: cancel, then wait for the cancellation so `ov` may go.
+                unsafe {
+                    CancelIoEx(self.pipe, &ov);
+                    GetOverlappedResult(self.pipe, &ov, &mut n, 1);
+                }
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            if e == ERROR_BROKEN_PIPE {
+                return Ok(0);
+            }
+            return Err(io::Error::from_raw_os_error(e as i32));
+        }
+        Ok(n as usize)
+    }
+}
+
+impl io::Read for PipeIo {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let len = buf.len().min(u32::MAX as usize) as u32;
+        self.op(true, buf.as_mut_ptr(), len)
+    }
+}
+
+impl io::Write for PipeIo {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let len = buf.len().min(u32::MAX as usize) as u32;
+        self.op(false, buf.as_ptr().cast_mut(), len)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A holder's record of itself where `Spawn`'s `Drop` and the CI step look (G8), removed when
+/// it ends.
+pub(crate) struct PidFile(std::path::PathBuf);
+
+impl PidFile {
+    pub(crate) fn write(base: &Path, id: &impl std::fmt::Display, pid: u32) -> io::Result<PidFile> {
+        std::fs::create_dir_all(base)?;
+        let path = base.join(format!("h-{id}-{pid}.pid"));
+        std::fs::write(&path, format!("{pid}\n"))?;
+        Ok(PidFile(path))
+    }
+}
+
+impl Drop for PidFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
     }
 }
 

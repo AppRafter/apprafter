@@ -184,6 +184,20 @@ pub fn endpoint_for(
     session_endpoint(Path::new(&base.dir), store)
 }
 
+/// Windows: this user's pipe id for `store` (T50; the pid completes the name per holder).
+#[cfg(windows)]
+pub fn endpoint_for(
+    _ctx: &apprafter_core::Context,
+    store: &StoreBinding,
+) -> Result<Endpoint, HolderUnavailable> {
+    let user = super::os::windows::user_sid_string().map_err(|e| HolderUnavailable::NoConsole {
+        code: e.raw_os_error().unwrap_or(0) as u32,
+    })?;
+    Ok(Endpoint::Pipe {
+        id: EndpointId::for_user(&user, store),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

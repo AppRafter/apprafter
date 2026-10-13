@@ -3,8 +3,13 @@
 
 #[cfg(unix)]
 mod unix;
+#[cfg(windows)]
+mod windows;
 
 /// The holder's exit code.
 pub(super) fn run() -> i32 {
-    unix::run()
+    #[cfg(unix)]
+    return unix::run();
+    #[cfg(windows)]
+    return windows::run();
 }

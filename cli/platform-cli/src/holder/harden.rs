@@ -4,6 +4,10 @@
 //! `window_hardening` row say when one failed (rule 1). `memory_locked` is the key page's, set
 //! by the caller once the page exists.
 //!
+//! On Windows the DACL also goes on every thread of the holder's own and becomes the token's
+//! default for threads it makes later; a thread another process makes in it takes its creator's
+//! default (the console's control handler, whose `CTRL_CLOSE_EVENT` wipes the key page first).
+//!
 //! It does not stop root, a process with `CAP_SYS_PTRACE` or `SeDebugPrivilege`, or a same-user
 //! process with the macOS debugging entitlement (the `macos_task_port` limit).
 
@@ -77,7 +81,8 @@ fn core_off() -> bool {
 
 #[cfg(windows)]
 fn process_dacl() -> Option<bool> {
-    Some(super::os::windows::restrict_process().is_ok())
+    let process = super::os::windows::restrict_process().is_ok();
+    Some(process && super::os::windows::restrict_threads().is_ok())
 }
 
 #[cfg(not(windows))]

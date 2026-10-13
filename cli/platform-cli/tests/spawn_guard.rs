@@ -276,6 +276,44 @@ const ALLOWED: &[(&str, &str, Rule)] = &[
         "inner_console_owner",
         Rule::CreationFlags,
     ),
+    // The Windows holder's tests (D.4a Task 7): a console of their own (CREATE_NEW_CONSOLE) for
+    // this test binary re-run as a console's leader and its commands; only `apprafter __holder`
+    // runs, keyed by a scratch store.
+    (
+        "platform-cli/tests/holder_windows.rs",
+        "rerun",
+        Rule::CurrentExe,
+    ),
+    (
+        "platform-cli/tests/holder_windows.rs",
+        "ask",
+        Rule::CurrentExe,
+    ),
+    (
+        "platform-cli/tests/holder_windows.rs",
+        "inner_leader",
+        Rule::CurrentExe,
+    ),
+    (
+        "platform-cli/tests/holder_windows.rs",
+        "on_a_console",
+        Rule::CreationFlags,
+    ),
+    (
+        "platform-cli/tests/holder_windows.rs",
+        "live",
+        Rule::CreationFlags,
+    ),
+    (
+        "platform-cli/tests/holder_windows.rs",
+        "ask",
+        Rule::CreationFlags,
+    ),
+    (
+        "platform-cli/tests/holder_windows.rs",
+        "windows_the_holder_keeps_no_handle_of_its_starter",
+        Rule::CreationFlags,
+    ),
 ];
 
 /// One rule broken at one line.

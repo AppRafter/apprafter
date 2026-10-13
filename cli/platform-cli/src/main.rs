@@ -11,7 +11,6 @@ use miette::Result;
 fn main() -> Result<()> {
     // The unlock holder (D.4a T47): this binary started by itself as `apprafter __holder`, before
     // clap, the startup checks, logging or anything that reads the environment.
-    #[cfg(unix)]
     if std::env::args_os().nth(1).as_deref()
         == Some(std::ffi::OsStr::new(apprafter::holder::HOLDER_ARG))
     {

@@ -323,6 +323,91 @@ fn hg2_sees_a_second_spawn_and_a_second_dispatch() {
     .is_empty());
 }
 
+/// The identifiers inside the argument list of each call of `callee` in `src`.
+fn call_args(src: &str, callee: &str) -> Vec<Vec<String>> {
+    fn idents(tokens: TokenStream, out: &mut Vec<String>) {
+        for t in tokens {
+            match t {
+                TokenTree::Ident(id) => out.push(id.to_string()),
+                TokenTree::Group(g) => idents(g.stream(), out),
+                _ => {}
+            }
+        }
+    }
+    fn walk(tokens: TokenStream, callee: &str, out: &mut Vec<Vec<String>>) {
+        let t: Vec<TokenTree> = tokens.into_iter().collect();
+        for (i, tt) in t.iter().enumerate() {
+            match tt {
+                TokenTree::Ident(id) if *id == callee => {
+                    if let Some(TokenTree::Group(g)) = t.get(i + 1) {
+                        if g.delimiter() == Delimiter::Parenthesis {
+                            let mut args = Vec::new();
+                            idents(g.stream(), &mut args);
+                            out.push(args);
+                        }
+                    }
+                }
+                TokenTree::Group(g) => walk(g.stream(), callee, out),
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(src.parse().expect("the source tokenizes"), callee, &mut out);
+    out
+}
+
+/// HG3 (T53): the holder's pipe is created first-instance-only and closed to remote clients; its
+/// client opens it at identification level, so a squatter can never act as the person.
+#[test]
+fn hg3_the_pipe_and_its_client_carry_their_security_flags() {
+    let files = holder_sources();
+    let src = |f: &str| {
+        files
+            .iter()
+            .find(|(p, _)| p == f)
+            .unwrap_or_else(|| panic!("{f}"))
+            .1
+            .clone()
+    };
+    let pipe = call_args(
+        &src("platform-cli/src/holder/server/windows.rs"),
+        "CreateNamedPipeW",
+    );
+    assert_eq!(pipe.len(), 1, "one CreateNamedPipeW: {pipe:?}");
+    for flag in [
+        "FILE_FLAG_FIRST_PIPE_INSTANCE",
+        "PIPE_REJECT_REMOTE_CLIENTS",
+    ] {
+        assert!(
+            pipe[0].iter().any(|a| a == flag),
+            "CreateNamedPipeW without {flag}: {:?}",
+            pipe[0]
+        );
+    }
+    let open = call_args(&src("platform-cli/src/holder/client.rs"), "CreateFileW");
+    assert_eq!(open.len(), 1, "one CreateFileW: {open:?}");
+    for flag in ["SECURITY_SQOS_PRESENT", "SECURITY_IDENTIFICATION"] {
+        assert!(
+            open[0].iter().any(|a| a == flag),
+            "CreateFileW without {flag}: {:?}",
+            open[0]
+        );
+    }
+}
+
+#[test]
+fn hg3_reads_the_arguments_of_a_call() {
+    let args = call_args(
+        "fn f() { let _ = CreateFileW(a, B | C, g(D)); }",
+        "CreateFileW",
+    );
+    assert_eq!(
+        args,
+        vec![["a", "B", "C", "g", "D"].map(String::from).to_vec()]
+    );
+}
+
 /// The scanner itself, on a source of its own.
 #[test]
 fn the_scanner_sees_aliases_paths_and_enclosing_functions() {

@@ -38,6 +38,13 @@ impl LockedKey {
         // SAFETY: as above, and `&mut self` is the only access.
         unsafe { &mut *(self.page as *mut [u8; 32]) }
     }
+
+    /// The page's address, for the Windows console handler that zeroes it on `CTRL_CLOSE_EVENT`
+    /// (`server/windows.rs`, its only user: on Unix it would be dead code under `-D warnings`).
+    #[cfg(windows)]
+    pub(crate) fn page(&self) -> *mut u8 {
+        self.page
+    }
 }
 
 impl Drop for LockedKey {

@@ -5,12 +5,15 @@
 //! The server's uid must be this process's (a shared base under `/tmp` could hold another
 //! user's socket).
 
-use std::io::{self, Read, Write};
+use std::io;
+#[cfg(unix)]
+use std::io::{Read, Write};
 use std::time::Duration;
 
 use apprafter_core::Zeroizing;
 use cli_core::secrets::CachedSecret;
 
+#[cfg(unix)]
 use super::endpoint::Endpoint;
 use super::protocol::{
     read_reply, write_request, FrameError, HolderItem, HolderStatus, HolderUnavailable, Refusal,
@@ -41,6 +44,8 @@ pub enum HolderError {
 pub struct HolderClient {
     #[cfg(unix)]
     conn: UnixStream,
+    #[cfg(windows)]
+    pipe: super::os::windows::Handle,
     server_pid: Option<u32>,
     #[cfg(unix)]
     server_started: Option<apprafter_core::process::ProcStart>,
@@ -155,10 +160,14 @@ impl HolderClient {
         if std::mem::replace(&mut self.spent, true) {
             return Err(HolderError::Spent);
         }
+        #[cfg(unix)]
         let mut io = Timed {
             conn: &self.conn,
             deadline: self.deadline,
         };
+        #[cfg(windows)]
+        let mut io = super::os::windows::PipeIo::new(self.pipe.0, IO_TIMEOUT, Some(self.deadline))
+            .map_err(HolderError::Io)?;
         // A holder that refused before reading the whole request has still sent its reply.
         let _ = write_request(&mut io, req);
         read_reply(&mut io).map_err(from_frame)
@@ -241,4 +250,107 @@ impl HolderClient {
         super::os::current::kill_server(&self.conn, pid, self.server_started)
             .map_err(HolderError::Io)
     }
+
+    #[cfg(windows)]
+    pub fn find(
+        _ctx: &apprafter_core::Context,
+        store: &StoreBinding,
+    ) -> Result<Option<HolderClient>, HolderUnavailable> {
+        HolderClient::on_console(store)
+    }
+
+    /// The holder of `store` on this process's console (T51, T50): one pipe name per process the
+    /// console lists, all tried within one request's 5 s (T59); `Err` when this process has no
+    /// console (no window is possible here).
+    #[cfg(windows)]
+    pub fn on_console(store: &StoreBinding) -> Result<Option<HolderClient>, HolderUnavailable> {
+        let user =
+            super::os::windows::user_sid_string().map_err(|e| HolderUnavailable::NoConsole {
+                code: e.raw_os_error().unwrap_or(0) as u32,
+            })?;
+        let id = super::endpoint::EndpointId::for_user(&user, store);
+        let console = super::os::windows::console_processes();
+        if console.is_empty() {
+            return Err(HolderUnavailable::NoConsole { code: 0 });
+        }
+        let me = std::process::id();
+        let deadline = SystemClock.with_sleep() + OVERALL;
+        Ok(console.into_iter().filter(|p| *p != me).find_map(|pid| {
+            HolderClient::pipe_by(&super::endpoint::pipe_name(&id, pid), pid, deadline)
+        }))
+    }
+
+    /// A client of the pipe `name` (the holder `pid`'s), if it opens.
+    #[cfg(windows)]
+    pub fn at_pipe(name: &str, pid: u32) -> Option<HolderClient> {
+        HolderClient::pipe_by(name, pid, SystemClock.with_sleep() + OVERALL)
+    }
+
+    /// [`HolderClient::at_pipe`] within a request's `deadline`, the open included (T59).
+    #[cfg(windows)]
+    fn pipe_by(name: &str, pid: u32, deadline: Duration) -> Option<HolderClient> {
+        Some(HolderClient {
+            pipe: open_pipe(name, deadline)?,
+            server_pid: Some(pid),
+            spent: false,
+            deadline,
+        })
+    }
+
+    /// `lock now` on a holder that does not answer (T59, S9): the process is opened first — a
+    /// handle pins it — then the pipe's server is checked to be still that pid, then it ends.
+    #[cfg(windows)]
+    pub fn terminate_server(self) -> Result<(), HolderError> {
+        let pid = self.server_pid.ok_or(HolderError::Unexpected)?;
+        super::os::windows::kill_server(&self.pipe, pid).map_err(HolderError::Io)
+    }
+}
+
+/// Open the holder's pipe at identification level (T53): a squatting server learns who
+/// connected and can act as no one. A busy pipe is waited for once, within the step's 2 s and
+/// the request's `deadline` (T59): its open is a step like a read or a write.
+#[cfg(windows)]
+fn open_pipe(name: &str, deadline: Duration) -> Option<super::os::windows::Handle> {
+    use windows_sys::Win32::Foundation::{
+        GetLastError, ERROR_PIPE_BUSY, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_OVERLAPPED, OPEN_EXISTING, SECURITY_IDENTIFICATION,
+        SECURITY_SQOS_PRESENT,
+    };
+    use windows_sys::Win32::System::Pipes::WaitNamedPipeW;
+    let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+    for attempt in 0..2 {
+        // SAFETY: a NUL-terminated name; the handle is owned below.
+        let h = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                0,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+                std::ptr::null_mut(),
+            )
+        };
+        if h != INVALID_HANDLE_VALUE {
+            return Some(super::os::windows::Handle(h));
+        }
+        // SAFETY: the error of the call above.
+        if attempt == 0 && unsafe { GetLastError() } == ERROR_PIPE_BUSY {
+            let step = deadline
+                .saturating_sub(SystemClock.with_sleep())
+                .min(IO_TIMEOUT);
+            if step.is_zero() {
+                return None;
+            }
+            // 0 would be the pipe's own default wait: at least 1 ms.
+            let ms = u32::try_from(step.as_millis()).unwrap_or(u32::MAX).max(1);
+            // SAFETY: a NUL-terminated name; waits at most `ms`.
+            unsafe { WaitNamedPipeW(wide.as_ptr(), ms) };
+            continue;
+        }
+        return None;
+    }
+    None
 }

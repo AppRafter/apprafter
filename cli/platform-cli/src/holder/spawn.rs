@@ -15,6 +15,8 @@ use super::HOLDER_ARG;
 
 #[cfg(unix)]
 mod unix;
+#[cfg(windows)]
+mod windows;
 
 /// How long a CLI waits for a new holder's ack (T59).
 pub const ACK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -26,7 +28,9 @@ pub enum HolderStarted {
 }
 
 /// Start this terminal's holder: this binary, as `apprafter __holder` (HG2: the one place both
-/// are named).
+/// are named). On Windows it must not run beside another spawn of this process: the holder's two
+/// pipe ends are inheritable for the `CreateProcessW` call, and a `std::process::Command` started
+/// by another thread in that instant would inherit them too (D.4a Deviations 30).
 pub fn start_holder(init: &InitHeader, key: &DataKey) -> Result<HolderStarted, HolderUnavailable> {
     let me = std::env::current_exe().map_err(|_| HolderUnavailable::Timeout)?;
     start_with(&me, init, key)
@@ -39,7 +43,10 @@ pub fn start_with(
     init: &InitHeader,
     key: &DataKey,
 ) -> Result<HolderStarted, HolderUnavailable> {
-    unix::start(program, HOLDER_ARG, init, key)
+    #[cfg(unix)]
+    return unix::start(program, HOLDER_ARG, init, key);
+    #[cfg(windows)]
+    return windows::start(program, HOLDER_ARG, init, key);
 }
 
 /// The ack, or `None` when none came within `timeout`.
