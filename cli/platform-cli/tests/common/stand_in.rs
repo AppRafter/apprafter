@@ -78,13 +78,20 @@ pub fn script(path: &std::path::Path, body: &str) {
     }
 }
 
-#[cfg(not(unix))]
-fn write_stand_in(path: &std::path::Path, _tool: &Tool) {
-    let Some(stand_in) = option_env!("CARGO_BIN_EXE_apprafter-tool-stand-in") else {
+/// The `apprafter-tool-stand-in` binary (`tests/support/apprafter_tool_stand_in.rs`): the Windows
+/// tool stand-ins are hard links of it, and the spawn point's Windows self-tests run its `__env`
+/// and `__console` modes. Built only with the `tool-stand-in` feature: without it this panics and
+/// says so, never passes on a missing binary.
+pub fn stand_in_binary() -> &'static str {
+    option_env!("CARGO_BIN_EXE_apprafter-tool-stand-in").unwrap_or_else(|| {
         panic!(
             "the Windows tool stand-ins are the `apprafter-tool-stand-in` binary: run the tests \
              with `--features tool-stand-in` (CI passes `--all-features`)"
-        );
-    };
-    std::fs::hard_link(stand_in, path).expect("stand-in tool");
+        )
+    })
+}
+
+#[cfg(not(unix))]
+fn write_stand_in(path: &std::path::Path, _tool: &Tool) {
+    std::fs::hard_link(stand_in_binary(), path).expect("stand-in tool");
 }

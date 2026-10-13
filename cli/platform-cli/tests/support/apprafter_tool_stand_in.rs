@@ -8,6 +8,8 @@
 //! - the tool's version call (`cli_core::tools::Tool::version_args`): `<tool> stand-in` and
 //!   exit 0, on stderr for `ssh -V` (ssh writes its version there);
 //! - `__probe`: exit 0;
+//! - `__env`: every variable of its environment, `NAME=value`, sorted, and exit 0;
+//! - `__console` (Windows): `console` or `no console`, whether it has one, and exit 0;
 //! - anything else: a usage error and exit 2.
 //!
 //! With `APPRAFTER_TOOL_STAND_IN_HANG=<tool>`, that tool's version call never answers, as a
@@ -39,6 +41,31 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args == ["__probe"] {
         return ExitCode::SUCCESS;
+    }
+    if args == ["__env"] {
+        let mut vars: Vec<String> = std::env::vars_os()
+            .map(|(k, v)| format!("{}={}", k.to_string_lossy(), v.to_string_lossy()))
+            .collect();
+        vars.sort();
+        for var in vars {
+            println!("{var}");
+        }
+        return ExitCode::SUCCESS;
+    }
+    if args == ["__console"] {
+        #[cfg(windows)]
+        {
+            // SAFETY: GetConsoleCP takes no argument and only reads this process's console; it
+            // fails (0) when the process has none.
+            let attached = unsafe { windows_sys::Win32::System::Console::GetConsoleCP() } != 0;
+            println!("{}", if attached { "console" } else { "no console" });
+            return ExitCode::SUCCESS;
+        }
+        #[cfg(not(windows))]
+        {
+            eprintln!("__console is a Windows probe");
+            return ExitCode::from(2);
+        }
     }
     match cli_core::tools::ALL.iter().find(|t| t.name == name) {
         Some(tool) if args == tool.version_args => {
