@@ -35,8 +35,10 @@ pub(crate) use unix_common::*;
 #[cfg(unix)]
 mod unix_common {
     use std::io;
-    use std::os::fd::{AsRawFd, RawFd};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
     use std::os::unix::net::UnixStream;
+    use std::path::Path;
+    use std::time::Duration;
 
     use apprafter_core::process::ProcStart;
 
@@ -124,6 +126,139 @@ mod unix_common {
                 libc::close(null);
             }
         }
+    }
+
+    /// Connect to the socket at `path`, waiting at most `limit` on the window's clock (T59: the
+    /// connect is a step like a read or a write). The socket is non-blocking until it is
+    /// connected, so a listener whose queue is full — a holder that hung, then other connects
+    /// reached it — costs at most `limit`, never a command blocked for good: Linux answers such
+    /// a connect `EAGAIN`, tried again every 10 ms until `limit`; macOS turns it away
+    /// (`ECONNREFUSED`, as when no one listens). An `EINPROGRESS`, which neither gives for a
+    /// local socket, is waited for in `poll`. Past `limit`: `TimedOut`.
+    pub(crate) fn connect_within(path: &Path, limit: Duration) -> io::Result<UnixStream> {
+        let until = super::current::clock_with_sleep() + limit;
+        let left = || {
+            let left = until.saturating_sub(super::current::clock_with_sleep());
+            if left.is_zero() {
+                Err(io::Error::from(io::ErrorKind::TimedOut))
+            } else {
+                Ok(left)
+            }
+        };
+        let fd = local_socket()?;
+        let (addr, len) = socket_address(path)?;
+        loop {
+            // SAFETY: the socket above and an address of `len` bytes.
+            if unsafe { libc::connect(fd.as_raw_fd(), (&raw const addr).cast(), len) } == 0 {
+                break;
+            }
+            let e = io::Error::last_os_error();
+            match e.raw_os_error() {
+                Some(libc::EINTR) => {}
+                Some(libc::EISCONN) => break,
+                Some(libc::EAGAIN) => std::thread::sleep(left()?.min(Duration::from_millis(10))),
+                Some(libc::EINPROGRESS | libc::EALREADY) => {
+                    let ms = i32::try_from(left()?.as_millis())
+                        .unwrap_or(i32::MAX)
+                        .max(1);
+                    let mut p = libc::pollfd {
+                        fd: fd.as_raw_fd(),
+                        events: libc::POLLOUT,
+                        revents: 0,
+                    };
+                    // SAFETY: one pollfd.
+                    match unsafe { libc::poll(&mut p, 1, ms) } {
+                        0 => return Err(io::ErrorKind::TimedOut.into()),
+                        n if n < 0 => {
+                            let e = io::Error::last_os_error();
+                            if e.kind() != io::ErrorKind::Interrupted {
+                                return Err(e);
+                            }
+                        }
+                        _ => {
+                            let mut err: libc::c_int = 0;
+                            let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+                            // SAFETY: SO_ERROR writes one int.
+                            let rc = unsafe {
+                                libc::getsockopt(
+                                    fd.as_raw_fd(),
+                                    libc::SOL_SOCKET,
+                                    libc::SO_ERROR,
+                                    (&raw mut err).cast(),
+                                    &mut len,
+                                )
+                            };
+                            if rc != 0 {
+                                return Err(io::Error::last_os_error());
+                            }
+                            if err != 0 {
+                                return Err(io::Error::from_raw_os_error(err));
+                            }
+                            break;
+                        }
+                    }
+                }
+                _ => return Err(e),
+            }
+        }
+        let conn = UnixStream::from(fd);
+        conn.set_nonblocking(false)?;
+        Ok(conn)
+    }
+
+    /// A local stream socket as `std` makes one — close-on-exec, and on macOS no `SIGPIPE` from
+    /// a write to a closed peer (`SO_NOSIGPIPE`) — but non-blocking.
+    fn local_socket() -> io::Result<OwnedFd> {
+        #[cfg(target_os = "linux")]
+        let kind = libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK;
+        #[cfg(not(target_os = "linux"))]
+        let kind = libc::SOCK_STREAM;
+        // SAFETY: socket(2) with plain values; the descriptor is owned below.
+        let fd = unsafe { libc::socket(libc::AF_UNIX, kind, 0) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: a new descriptor this process owns.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        #[cfg(not(target_os = "linux"))]
+        {
+            let one: libc::c_int = 1;
+            // SAFETY: fcntl and setsockopt on the descriptor above.
+            let ok = unsafe {
+                let flags = libc::fcntl(fd.as_raw_fd(), libc::F_GETFL);
+                flags >= 0
+                    && libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) == 0
+                    && libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) == 0
+                    && libc::setsockopt(
+                        fd.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        libc::SO_NOSIGPIPE,
+                        (&raw const one).cast(),
+                        std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                    ) == 0
+            };
+            if !ok {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(fd)
+    }
+
+    /// `path` as a `sockaddr_un` and its length (`std`'s: the path and its NUL).
+    fn socket_address(path: &Path) -> io::Result<(libc::sockaddr_un, libc::socklen_t)> {
+        use std::os::unix::ffi::OsStrExt;
+        // SAFETY: an all-zero sockaddr_un is valid; the path is copied in below.
+        let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        let bytes = path.as_os_str().as_bytes();
+        if bytes.len() >= addr.sun_path.len() || bytes.contains(&0) {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        for (d, s) in addr.sun_path.iter_mut().zip(bytes) {
+            *d = *s as libc::c_char;
+        }
+        let len = std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1;
+        Ok((addr, len as libc::socklen_t))
     }
 
     /// The other end of `conn` is closed: its server has ended or let the connection go.

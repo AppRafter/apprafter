@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! A client of this terminal's holder (D.4a §3.10, T53, T59). One request per connection: a
-//! client is spent after its request. 2 s per read or write and 5 s in all; past them the
-//! holder "does not answer" and the command goes on without it (T59). The server's uid must be
-//! this process's (a shared base under `/tmp` could hold another user's socket).
+//! client is spent after its request. 2 s per step — the connect, each read, each write — and
+//! 5 s in all; past them the holder "does not answer" and the command goes on without it (T59).
+//! The server's uid must be this process's (a shared base under `/tmp` could hold another
+//! user's socket).
 
 use std::io::{self, Read, Write};
 use std::time::Duration;
@@ -20,9 +21,9 @@ use super::window::{HolderClock, SystemClock};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 
-/// Per read or write.
+/// Per step: the connect, a read, a write.
 pub const IO_TIMEOUT: Duration = Duration::from_secs(2);
-/// For the whole request.
+/// For the whole request, the connect included.
 pub const OVERALL: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
@@ -110,8 +111,10 @@ impl HolderClient {
         let Endpoint::Socket { path, .. } = endpoint else {
             return None;
         };
-        // ENOENT or ECONNREFUSED: no holder (holder §2.4).
-        let conn = UnixStream::connect(path).ok()?;
+        let deadline = SystemClock.with_sleep() + OVERALL;
+        // ENOENT or ECONNREFUSED: no holder (holder §2.4). A connect past its step — a holder
+        // that hung with its queue full — is none either: the command goes on without it (T59).
+        let conn = super::os::connect_within(path, IO_TIMEOUT).ok()?;
         let server = super::os::current::peer_cred(&conn).ok()?;
         // SAFETY: geteuid has no failure mode.
         if server.uid != unsafe { libc::geteuid() } {
@@ -123,7 +126,7 @@ impl HolderClient {
             server_started: super::os::OsProcs.started(server.pid),
             conn,
             spent: false,
-            deadline: SystemClock.with_sleep() + OVERALL,
+            deadline,
         })
     }
 

@@ -17,7 +17,7 @@ use std::process::{Child, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use apprafter::holder::client::{HolderClient, HolderError};
+use apprafter::holder::client::{HolderClient, HolderError, IO_TIMEOUT};
 use apprafter::holder::endpoint::{session_endpoint, socket_endpoint, Endpoint, EndpointId};
 use apprafter::holder::protocol::{read_reply, HolderItem, InitHeader, Reply, StoreBinding};
 use apprafter::holder::spawn::{start_with, HolderStarted};
@@ -504,6 +504,96 @@ fn linux_the_holder_is_not_dumpable_and_refuses_ptrace() {
     {
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// A connect that never waits, to the socket at `path`: queued, or turned away at once — the
+/// listener's queue full is `EAGAIN` on Linux and `ECONNREFUSED` on macOS.
+fn queue_one(path: &Path) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    // SAFETY: a new socket, owned below.
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: a descriptor this function opened and nothing else owns.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    // SAFETY: fcntl on that descriptor.
+    unsafe {
+        let flags = libc::fcntl(fd.as_raw_fd(), libc::F_GETFL);
+        assert_eq!(
+            libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK),
+            0
+        );
+    }
+    // SAFETY: an all-zero sockaddr_un is valid; the path is copied in below.
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let bytes = path.as_os_str().as_bytes();
+    assert!(bytes.len() < addr.sun_path.len(), "{path:?} fits sun_path");
+    for (d, s) in addr.sun_path.iter_mut().zip(bytes) {
+        *d = *s as libc::c_char;
+    }
+    // SAFETY: connect with the address above and its size.
+    let rc = unsafe {
+        libc::connect(
+            fd.as_raw_fd(),
+            (&raw const addr).cast(),
+            std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(fd)
+}
+
+/// T59: the client's connect is a step like its read and its write. A holder that never
+/// accepts, its listen queue full (a hung holder that other connects reached first), holds the
+/// client no longer than a step: it finds no holder there, and the command goes on without one.
+/// Linux makes a connect to a full queue wait (`EAGAIN` when it may not); macOS turns it away.
+#[test]
+fn a_holder_whose_queue_is_full_holds_no_client_past_its_step() {
+    let dir = tempfile::TempDir::new_in("/tmp").unwrap();
+    let path = dir.path().join("h.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    // SAFETY: the listener's queue cut to the smallest one the OS keeps; it never accepts.
+    assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
+    let mut queued = Vec::new();
+    let full = loop {
+        match queue_one(&path) {
+            Ok(fd) => queued.push(fd),
+            Err(e) => break e,
+        }
+        assert!(queued.len() < 1024, "the listen queue never filled");
+    };
+    assert!(
+        !queued.is_empty(),
+        "the queue takes a connect first: {full}"
+    );
+    #[cfg(target_os = "linux")]
+    assert_eq!(full.kind(), std::io::ErrorKind::WouldBlock, "{full}");
+    #[cfg(target_os = "macos")]
+    assert_eq!(full.kind(), std::io::ErrorKind::ConnectionRefused, "{full}");
+    let endpoint = Endpoint::Socket {
+        path,
+        lock: PathBuf::new(),
+    };
+    let (tx, rx) = mpsc::channel();
+    let asked = Instant::now();
+    std::thread::spawn(move || {
+        let _ = tx.send(HolderClient::at(&endpoint).is_some());
+    });
+    let found = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the client's connect gave up within its step, never past the 5 s of a request");
+    let waited = asked.elapsed();
+    assert!(!found, "a holder that never accepts is no holder");
+    assert!(
+        waited < IO_TIMEOUT + Duration::from_secs(1),
+        "the connect took {waited:?}, past its {IO_TIMEOUT:?} step"
+    );
+    drop(queued);
+    drop(listener);
 }
 
 /// T59, S9: `lock now` ends a holder that does not answer — exactly the process the
