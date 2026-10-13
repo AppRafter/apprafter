@@ -71,12 +71,13 @@ pub fn run(
         "apprafter bootstrap-all",
     )?;
 
-    // WI-457. Phase 2/3 caches the new kubeconfig under the age key and never replaces a lost
-    // one, so a lost key would stop this run there, after phase 1/3 created a server that
-    // bills. Same lesson again: check it before spending anything.
+    // WI-457, D.4a T46: phase 0. Phase 2/3 caches the new kubeconfig and never replaces a
+    // lost key, so a lost key would stop this run there, after phase 1/3 created a server
+    // that bills; on a locked store the token and the store's recipient are asked for now,
+    // once. Same lesson again: check before spending anything.
     let resolved = resolve_state_paths(target_override)?;
     age_cache::check_before_provisioning(
-        &crate::context::legacy_context()?.secrets(),
+        &crate::context::legacy_context()?,
         &resolved.target_name,
         by,
     )?;

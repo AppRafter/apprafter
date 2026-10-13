@@ -54,16 +54,64 @@ pub(crate) fn cached_kubeconfig(
 }
 
 /// The check `up` and `restore --reprovision` make before they provision anything, for
-/// `target`. Their phase 2 caches the new kubeconfig and never replaces a lost key
-/// (`SecretStore::cache_key_for_new_secret`'s rule), so a lost key would stop them only after
-/// a billable server was created. Here it stops them first, with nothing created. A key that
-/// does not load fails here as it would there. A first use (no key, nothing cached anywhere)
-/// passes: phase 2 creates the key.
+/// `target` — their phase 0 (D.4a T46). On a locked store: the store's cache key (an
+/// `APPRAFTER_AGE_KEY` is refused before anything is asked), the token through the core (an
+/// `HCLOUD_TOKEN` likewise; else the one prompt), the store's recipient and the target's
+/// cached secrets (each opened or refused), kept by this process for the rest of the
+/// command; a refusal there names the command it stopped before, so its help says nothing
+/// was created (T69). In files (WI-457): their phase 2 caches the new
+/// kubeconfig and never replaces a lost key (`SecretStore::new_cache`'s rule), so a lost key
+/// would stop them only after a billable server was created. Here it stops them first, with
+/// nothing created. A key that does not load fails here as it would there. A first use (no
+/// key, nothing cached anywhere) passes: phase 2 creates the key.
 pub(crate) fn check_before_provisioning(
-    secrets: &SecretStore,
+    ctx: &apprafter_core::Context,
     target: &str,
     by: ProvisionedBy,
 ) -> Result<()> {
+    let secrets = ctx.secrets();
+    if secrets.mode()? == apprafter_core::secrets::SecretsMode::Locked {
+        let stopped = |e: CliError| match e {
+            CliError::StoreLocked { store, reason, .. } => CliError::StoreLocked {
+                store,
+                reason,
+                stopped_before: Some(by),
+            },
+            CliError::UnlockFailed {
+                store, attempts, ..
+            } => CliError::UnlockFailed {
+                store,
+                attempts,
+                stopped_before: Some(by),
+            },
+            other => other,
+        };
+        let key = secrets.cache_key(target).map_err(stopped)?;
+        let named = apprafter_core::TargetRef::named(ctx, target)
+            .map_err(crate::context::into_cli_error)?;
+        apprafter_core::target::hetzner_token(ctx, &named)
+            .map_err(|e| stopped(crate::context::into_cli_error(e)))?;
+        key.recipient().map_err(stopped)?;
+        // T46: the target's cached secrets too, while the key is in hand: a later phase that
+        // judges one (a cache write, T39) or reads it back finds it kept, opened or refused,
+        // and asks nothing after the secret phase ended.
+        let paths = cli_state::StatePaths::for_active_target(&ctx.store(), target);
+        if let Some(h) = cli_state::State::load_or_default(&paths)?.hetzner_cloud {
+            for (secret, armored) in [
+                (CachedSecret::Kubeconfig, h.kubeconfig_age),
+                (CachedSecret::ArgocdPassword, h.argocd_admin_password_age),
+            ] {
+                let Some(armored) = armored else {
+                    continue;
+                };
+                match secrets.open_cache(&key, secret, target, &armored) {
+                    Ok(_) | Err(CliError::CacheUndecryptable { .. }) => {}
+                    Err(e) => return Err(stopped(e)),
+                }
+            }
+        }
+        return Ok(());
+    }
     let path = match secrets.cache_key(target) {
         Ok(_) => return Ok(()),
         Err(CliError::AgeKeyMissing { path, .. }) => path,
@@ -262,8 +310,7 @@ mod tests {
         let ctx = ctx_at(dir.path());
         let s = ctx.store();
         let key = ctx.age_key_path().to_path_buf();
-        let check =
-            |target: &str| check_before_provisioning(&ctx.secrets(), target, ProvisionedBy::Up);
+        let check = |target: &str| check_before_provisioning(&ctx, target, ProvisionedBy::Up);
         let recover = |target: &str| match check(target) {
             Err(CliError::AgeKeyMissing {
                 path,
@@ -310,6 +357,39 @@ mod tests {
         assert!(
             matches!(&err, CliError::Other(m) if m.contains("parse age key")),
             "{err:?}"
+        );
+    }
+
+    /// T46, T69: on a locked store the check is phase 0 — the token and the store's recipient,
+    /// asked for once, before anything is provisioned. Where nothing can be asked it is
+    /// `store_locked` naming the command it stopped before, so its help says nothing was
+    /// created; with the store's key it passes and creates nothing.
+    #[test]
+    fn on_a_locked_store_the_check_asks_before_provisioning() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("store");
+        let made = apprafter_core::secrets::testing::locked_store(
+            &root,
+            &[(
+                "prod",
+                Some("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),
+            )],
+        );
+        let bare = ctx_at(dir.path());
+        for by in [ProvisionedBy::Up, ProvisionedBy::RestoreReprovision] {
+            match check_before_provisioning(&bare, "prod", by) {
+                Err(CliError::StoreLocked {
+                    stopped_before: Some(stopped),
+                    ..
+                }) => assert_eq!(stopped, by),
+                other => panic!("{other:?}"),
+            }
+        }
+        let opened = bare.clone().with_vault_access(made.access());
+        check_before_provisioning(&opened, "prod", ProvisionedBy::Up).unwrap();
+        assert!(
+            !opened.age_key_path().exists(),
+            "no shared key for a locked store"
         );
     }
 
