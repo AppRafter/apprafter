@@ -373,18 +373,8 @@ impl Spawn {
     fn detach(&self, c: &mut StdCommand, terminal: Terminal) {
         use std::os::unix::process::CommandExt as _;
         match terminal {
-            Terminal::None => {
-                // SAFETY: setsid(2) is async-signal-safe and the closure touches no memory of
-                // this process. Never with `process_group(0)`: a group leader's setsid fails.
-                unsafe {
-                    c.pre_exec(|| {
-                        if libc::setsid() == -1 {
-                            return Err(std::io::Error::last_os_error());
-                        }
-                        Ok(())
-                    });
-                }
-            }
+            // MUTANT #7 (d4a-a, do not merge): setsid dropped.
+            Terminal::None => {}
             Terminal::Pty(slave) => {
                 let stdin = slave.try_clone().expect("dup the pty slave");
                 c.stdin(std::process::Stdio::from(stdin))
@@ -406,14 +396,15 @@ impl Spawn {
     #[cfg(windows)]
     fn detach(&self, c: &mut StdCommand, terminal: Terminal) {
         use std::os::windows::process::CommandExt as _;
-        use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS};
+        use windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
         match terminal {
             Terminal::None => {}
         }
         c.creation_flags(if self.shared_console {
             CREATE_NEW_PROCESS_GROUP
         } else {
-            DETACHED_PROCESS
+            // MUTANT #9 (d4a-a, do not merge): DETACHED_PROCESS dropped.
+            0
         });
     }
 
