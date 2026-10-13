@@ -340,11 +340,10 @@ fn k3s_not_ready_help(target: &str, by: ProvisionedBy) -> String {
     )
 }
 
-/// `CacheUndecryptable`'s help: the key it was cached under, or the command that fetches it
-/// again under the key there is now, for `target`, whichever target is active.
-fn cache_undecryptable_help(secret: &crate::secrets::CachedSecret, target: &str) -> String {
+/// The command that fetches `secret` of `target` again, as a sentence starts with it.
+fn refetch(secret: &crate::secrets::CachedSecret, target: &str) -> String {
     use crate::secrets::CachedSecret;
-    let refetch = match secret {
+    match secret {
         CachedSecret::Kubeconfig => format!(
             "`apprafter kubeconfig --refresh --target {target}` fetches it from the node again"
         ),
@@ -352,12 +351,503 @@ fn cache_undecryptable_help(secret: &crate::secrets::CachedSecret, target: &str)
             "`apprafter argocd-password --refresh --target {target}` fetches it from the cluster \
              again"
         ),
+    }
+}
+
+/// `CacheUndecryptable`'s message: the shared key's file, or the store's own key in its vault.
+fn cache_undecryptable_message(
+    secret: &crate::secrets::CachedSecret,
+    target: &str,
+    path: &str,
+    detail: &str,
+    key: crate::secrets::CacheKeyKind,
+) -> String {
+    match key {
+        crate::secrets::CacheKeyKind::SharedFile => format!(
+            "the {} cached for target `{target}` cannot be decrypted with the age key at {path}: \
+             {detail}",
+            secret.noun()
+        ),
+        crate::secrets::CacheKeyKind::StoreVault => format!(
+            "the {} cached for target `{target}` cannot be decrypted with this target store's \
+             own key, in its vault {path}: {detail}",
+            secret.noun()
+        ),
+    }
+}
+
+/// `CacheUndecryptable`'s help: the key it was cached under, or the command that fetches it
+/// again under the key there is now, for `target`, whichever target is active. On a locked
+/// store the store's own key is the only one, so only the fetch (D.4a T38; ADR 0068 §6).
+fn cache_undecryptable_help(
+    secret: &crate::secrets::CachedSecret,
+    target: &str,
+    key: crate::secrets::CacheKeyKind,
+) -> String {
+    let refetch = refetch(secret, target);
+    match key {
+        crate::secrets::CacheKeyKind::SharedFile => format!(
+            "It was cached under a different age key (one that was lost and replaced), or the \
+             cached copy is damaged. If you still have the key it was cached under, set \
+             `APPRAFTER_AGE_KEY` to it. Otherwise {refetch} and caches it under the key at that \
+             path."
+        ),
+        crate::secrets::CacheKeyKind::StoreVault => format!(
+            "It was not encrypted to this target store's own key — an older AppRafter wrote it \
+             under the shared age key, or another program did — or the copy is damaged. \
+             {refetch} and caches it under the store's key."
+        ),
+    }
+}
+
+/// Why a locked target store could not be opened where a command needed its secrets (D.4a
+/// T61, T66, §3.12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockedWhy {
+    /// No unlock window reaches this process, and nothing can ask for the secret: no terminal
+    /// (a script, an AI agent's tool), or an app that holds no key.
+    NoTerminal,
+    /// The prompt was shown, and nobody answered it within 5 minutes.
+    TimedOut,
+}
+
+impl LockedWhy {
+    /// Its name on the wire (`fields.reason`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LockedWhy::NoTerminal => "no_terminal",
+            LockedWhy::TimedOut => "timed_out",
+        }
+    }
+}
+
+/// Where a target store's secrets are, as an error names it: the twin of the shared core's
+/// `apprafter_core::secrets::SecretsMode` (which crosses IPC; cli-core cannot name the core's
+/// types), mapped one to one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretsModeKind {
+    Files,
+    Locking,
+    Locked,
+    Unlocking,
+}
+
+impl SecretsModeKind {
+    /// Its name in `store.yaml` and on the wire.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SecretsModeKind::Files => "files",
+            SecretsModeKind::Locking => "locking",
+            SecretsModeKind::Locked => "locked",
+            SecretsModeKind::Unlocking => "unlocking",
+        }
+    }
+}
+
+/// Which lock flow an interrupted run left a store in (D.4a T31, T37).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockPhase {
+    /// `secrets: locking`: an earlier `lock on` did not finish.
+    Locking,
+    /// `secrets: unlocking`: an earlier `lock off` did not finish.
+    Unlocking,
+}
+
+impl LockPhase {
+    /// Its name on the wire (`fields.phase`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LockPhase::Locking => "locking",
+            LockPhase::Unlocking => "unlocking",
+        }
+    }
+
+    /// The command that left it.
+    fn command(self) -> &'static str {
+        match self {
+            LockPhase::Locking => "lock on",
+            LockPhase::Unlocking => "lock off",
+        }
+    }
+}
+
+/// What is wrong with a vault that cannot be read (D.4a §3.12). Damage is found only by a key
+/// that opened it or by its structure; a missing or foreign vault is said so before any key
+/// is asked for. Never "no such secret" (ADR 0068 Risks "Failures in the vault code").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VaultProblem {
+    /// `store.yaml` says the store is locked, and there is no vault.
+    Missing,
+    /// The file does not start like a vault (a text-mode copy reads as this too).
+    NotAVault,
+    /// A format this build does not read.
+    NewerFormat { version: u16 },
+    /// It fails a check of its structure or of its authentication.
+    Damaged { what: DamageKind },
+    /// It names another target store than `store.yaml` does.
+    OtherStore,
+}
+
+impl VaultProblem {
+    /// Its name on the wire (`fields.problem`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            VaultProblem::Missing => "missing",
+            VaultProblem::NotAVault => "not_a_vault",
+            VaultProblem::NewerFormat { .. } => "newer_format",
+            VaultProblem::Damaged { .. } => "damaged",
+            VaultProblem::OtherStore => "other_store",
+        }
+    }
+}
+
+/// Which check a damaged vault failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DamageKind {
+    /// A length, a cap, an order or a field the format refuses.
+    Malformed,
+    /// A slot's check value matched, and its wrapped key did not open.
+    SlotCorrupt,
+    /// The key was right, and the payload failed its authentication.
+    Tampered,
+    /// The payload authenticated and holds what the format refuses (no age identity).
+    PayloadInvalid,
+}
+
+impl DamageKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DamageKind::Malformed => "malformed",
+            DamageKind::SlotCorrupt => "slot_corrupt",
+            DamageKind::Tampered => "tampered",
+            DamageKind::PayloadInvalid => "payload_invalid",
+        }
+    }
+}
+
+/// Why a vault was not written; nothing was (D.4a §3.7, T27, critic W7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VaultWriteProblem {
+    /// It would hold more than `limit` bytes: a vault the format would refuse to read is never
+    /// written.
+    TooLarge { limit: u64 },
+    /// The filesystem cannot create a file without risking replacing one (no hard links:
+    /// exFAT, FAT); `fs` names it where the OS says.
+    NoReplaceUnsupported { fs: Option<String> },
+    /// A value the vault cannot hold, refused before anything was written — the write's
+    /// input, never a damaged vault.
+    Refused { what: RefusedInput },
+}
+
+impl VaultWriteProblem {
+    /// Its name on the wire (`fields.problem`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            VaultWriteProblem::TooLarge { .. } => "too_large",
+            VaultWriteProblem::NoReplaceUnsupported { .. } => "no_replace_unsupported",
+            VaultWriteProblem::Refused { .. } => "refused",
+        }
+    }
+}
+
+/// Which value a vault write refused (c1's `PayloadWhat::{TargetName, HetznerToken,
+/// TargetExists}` from its setters): cli-core's twin, as for `SecretsModeKind`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusedInput {
+    /// A target name the vault's entries cannot be keyed by (the callers check names first).
+    TargetName,
+    /// A Hetzner token that is empty or longer than 16384 bytes.
+    Token,
+    /// The new target name already has entries in the vault.
+    NameTaken,
+}
+
+impl RefusedInput {
+    /// Its name on the wire (`fields.what`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RefusedInput::TargetName => "target_name",
+            RefusedInput::Token => "token",
+            RefusedInput::NameTaken => "name_taken",
+        }
+    }
+
+    /// What the vault refused, for the message.
+    fn reason(self) -> &'static str {
+        match self {
+            RefusedInput::TargetName => {
+                "a target name is 1 to 64 ASCII letters, digits and `-`, not at either end"
+            }
+            RefusedInput::Token => "a Hetzner token is 1 to 16384 bytes",
+            RefusedInput::NameTaken => "the new target name already has entries in the vault",
+        }
+    }
+}
+
+/// Why a slot of a locked store was refused, before any key was derived (D.4a T22, T63).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotRefusal {
+    /// Key-derivation settings below this build's floor.
+    KdfTooWeak,
+    /// Settings beyond what this build computes (memory or time): refused before allocating.
+    KdfOutOfRange,
+    /// No slot of a kind this build opens with that secret (only newer kinds).
+    NoUsableSlot,
+    /// Removing it would leave the store without a recovery key (T63).
+    LastRecoverySlot,
+    /// Removing it would leave no slot this build's policy can open (T63's second rule, c1's
+    /// `NoUsableSlotLeft`).
+    NoUsableSlotLeft,
+}
+
+impl SlotRefusal {
+    /// Its name on the wire (`fields.reason`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SlotRefusal::KdfTooWeak => "kdf_too_weak",
+            SlotRefusal::KdfOutOfRange => "kdf_out_of_range",
+            SlotRefusal::NoUsableSlot => "no_usable_slot",
+            SlotRefusal::LastRecoverySlot => "last_recovery_slot",
+            SlotRefusal::NoUsableSlotLeft => "no_usable_slot_left",
+        }
+    }
+}
+
+fn store_locked_message(store: &Path, reason: LockedWhy) -> String {
+    match reason {
+        LockedWhy::NoTerminal => format!(
+            "the target store at {} is locked, and there is no unlock window here",
+            store.display()
+        ),
+        LockedWhy::TimedOut => format!(
+            "the target store at {} is locked, and nobody answered the unlock prompt within 5 \
+             minutes",
+            store.display()
+        ),
+    }
+}
+
+/// `store_locked`'s help (D.4a T69, T70): a person unlocks in their own terminal; `up` and
+/// `restore --reprovision` ask before they provision (T46), so nothing was created. Never the
+/// agent playground: a refusal shown to an agent does not say where else to look.
+fn store_locked_help(stopped_before: Option<ProvisionedBy>) -> String {
+    match stopped_before {
+        None => "A person must unlock it in their own terminal: run `apprafter unlock` there, \
+                 then run this command from that terminal while the window is open. A command \
+                 started without a terminal — a script, an AI agent's tool — cannot ask for the \
+                 lock password."
+            .to_string(),
+        Some(by) => format!(
+            "{0} stopped before provisioning, so nothing was created. A person must unlock the \
+             target store in their own terminal (`apprafter unlock`), then run {0} again from \
+             that terminal.",
+            by.command()
+        ),
+    }
+}
+
+/// `override_refused`'s help (D.4a T35, T70): unset it, or give the work a store of its own.
+fn override_refused_help(var: &str) -> String {
+    let what = match var {
+        crate::HCLOUD_TOKEN_ENV => "the token stored for the target",
+        crate::secrets::AGE_KEY_ENV => "the store's own age key, in its vault",
+        _ => "the secrets in the store's vault",
     };
     format!(
-        "It was cached under a different age key (one that was lost and replaced), or the \
-         cached copy is damaged. If you still have the key it was cached under, set \
-         `APPRAFTER_AGE_KEY` to it. Otherwise {refetch} and caches it under the key at that \
-         path."
+        "Unset {var} to use {what} (the command asks for the lock password at a terminal). To \
+         use a value from the environment on purpose, use a target store of its own that is not \
+         locked: `APPRAFTER_CONFIG_DIR=<dir>`."
+    )
+}
+
+fn unlock_failed_message(store: &Path, attempts: u32) -> String {
+    let tries = if attempts == 1 { "attempt" } else { "attempts" };
+    format!(
+        "{attempts} {tries} did not unlock the target store at {}",
+        store.display()
+    )
+}
+
+fn unlock_failed_help(stopped_before: Option<ProvisionedBy>) -> String {
+    let lead = "Nothing was unlocked. The recovery key opens the store at the same prompt if the \
+                lock password is lost.";
+    match stopped_before {
+        None => lead.to_string(),
+        Some(by) => format!(
+            "{lead} {} stopped before provisioning, so nothing was created: unlock in your \
+             terminal and run it again there.",
+            by.command()
+        ),
+    }
+}
+
+fn store_changed_message(store: &Path, prepared: SecretsModeKind, now: SecretsModeKind) -> String {
+    if prepared == now {
+        format!(
+            "the vault of the target store at {} was replaced while this command ran; nothing \
+             was written",
+            store.display()
+        )
+    } else {
+        format!(
+            "the lock state of the target store at {} changed while this command ran ({} → {}); \
+             nothing was written",
+            store.display(),
+            prepared.as_str(),
+            now.as_str()
+        )
+    }
+}
+
+fn vault_unwritable_message(path: &Path, problem: &VaultWriteProblem) -> String {
+    match problem {
+        VaultWriteProblem::TooLarge { limit } => format!(
+            "the vault {} would hold more than {limit} bytes, the most a vault may: nothing was \
+             written",
+            path.display()
+        ),
+        VaultWriteProblem::NoReplaceUnsupported { fs } => format!(
+            "a vault cannot be created in {}{}: this filesystem cannot create a file without \
+             risking replacing one, so nothing was written",
+            path.display(),
+            fs.as_deref().map(|f| format!(" ({f})")).unwrap_or_default()
+        ),
+        VaultWriteProblem::Refused { what } => format!(
+            "the vault {} cannot hold this write ({}): nothing was written",
+            path.display(),
+            what.reason()
+        ),
+    }
+}
+
+fn vault_unwritable_help(problem: &VaultWriteProblem) -> String {
+    match problem {
+        VaultWriteProblem::TooLarge { .. } => "A vault holds the tokens of a few thousand \
+             targets. Remove targets this store no longer needs (`apprafter target remove \
+             <name>`), or keep some in a target store of their own (`APPRAFTER_CONFIG_DIR`)."
+            .to_string(),
+        VaultWriteProblem::NoReplaceUnsupported { .. } => "Keep the target store on a \
+             filesystem with hard links (ext4, APFS, NTFS, btrfs, xfs): `APPRAFTER_CONFIG_DIR` \
+             moves it."
+            .to_string(),
+        VaultWriteProblem::Refused { what } => match what {
+            RefusedInput::Token => "A Hetzner API token is one line of text: check what was \
+                 pasted, then run the command again. The vault is as it was."
+                .to_string(),
+            RefusedInput::TargetName => "Choose a target name of ASCII letters, digits and \
+                 `-`. The vault is as it was."
+                .to_string(),
+            RefusedInput::NameTaken => "Remove the target that has that name first \
+                 (`apprafter target remove <name>`), or choose another name. The vault is as \
+                 it was."
+                .to_string(),
+        },
+    }
+}
+
+fn vault_unreadable_message(path: &Path, problem: &VaultProblem, detail: &str) -> String {
+    let p = path.display();
+    match problem {
+        VaultProblem::Missing => format!("the vault {p} is missing"),
+        VaultProblem::NotAVault => format!("{p} is not an AppRafter vault: {detail}"),
+        VaultProblem::NewerFormat { version } => format!(
+            "the vault {p} is in format {version}, which this AppRafter does not read: {detail}"
+        ),
+        VaultProblem::Damaged { .. } => format!("the vault {p} is damaged: {detail}"),
+        VaultProblem::OtherStore => {
+            format!("the vault {p} belongs to another target store: {detail}")
+        }
+    }
+}
+
+/// `vault_unreadable`'s help. It names no command, so the desktop shows it too (the shared
+/// core's `neutral_help`).
+pub fn vault_unreadable_help(path: &Path, problem: &VaultProblem) -> String {
+    let p = path.display();
+    match problem {
+        VaultProblem::Missing => format!(
+            "store.yaml says this target store is locked, but its vault is gone, and its \
+             secrets are nowhere else: restore {p} from a backup."
+        ),
+        VaultProblem::NotAVault => format!(
+            "Restore {p} from a backup. Never delete it while store.yaml says the store is \
+             locked: nothing else holds these secrets."
+        ),
+        VaultProblem::NewerFormat { .. } => {
+            "Upgrade AppRafter to the version that wrote it.".to_string()
+        }
+        VaultProblem::Damaged { .. } => format!(
+            "Its contents fail their integrity check. Restore {p} from a backup; never delete \
+             it: nothing else holds these secrets."
+        ),
+        VaultProblem::OtherStore => "The vault and store.yaml name different target stores: \
+             one of them was copied from another store. Restore both from the same backup."
+            .to_string(),
+    }
+}
+
+fn lock_incomplete_help(phase: LockPhase) -> String {
+    match phase {
+        LockPhase::Locking => "Run `apprafter lock on` again: it asks for the lock password \
+             and finishes, or `apprafter lock off` backs out of it. Until then commands that \
+             need the store's secrets refuse, because some may be only in the vault."
+            .to_string(),
+        LockPhase::Unlocking => "Run `apprafter lock off` again: it asks for the lock password \
+             or the recovery key and finishes. Until then commands that need the store's \
+             secrets refuse, because some may be only in the vault."
+            .to_string(),
+    }
+}
+
+fn slot_refused_message(store: &Path, reason: SlotRefusal) -> String {
+    let s = store.display();
+    match reason {
+        SlotRefusal::KdfTooWeak => format!(
+            "the lock password of the target store at {s} is kept with key-derivation settings \
+             weaker than this AppRafter accepts"
+        ),
+        SlotRefusal::KdfOutOfRange => format!(
+            "the lock password of the target store at {s} is kept with key-derivation settings \
+             beyond what this AppRafter computes"
+        ),
+        SlotRefusal::NoUsableSlot => {
+            format!("the target store at {s} has no slot this AppRafter can open with that secret")
+        }
+        SlotRefusal::LastRecoverySlot => {
+            format!("the recovery key slot of the target store at {s} is its last one")
+        }
+        SlotRefusal::NoUsableSlotLeft => format!(
+            "removing that slot would leave the target store at {s} with no slot this \
+             AppRafter can open"
+        ),
+    }
+}
+
+fn slot_refused_help(reason: SlotRefusal) -> String {
+    match reason {
+        SlotRefusal::KdfTooWeak | SlotRefusal::KdfOutOfRange => "Open the store with its \
+             recovery key (every prompt takes it), then run `apprafter lock off` and \
+             `apprafter lock on`, which sets a new lock password."
+            .to_string(),
+        SlotRefusal::NoUsableSlot => {
+            "Its slots were made by a newer AppRafter: upgrade AppRafter, or use the recovery \
+             key."
+                .to_string()
+        }
+        SlotRefusal::LastRecoverySlot => "A locked store always keeps a recovery key: add the \
+             new one before removing the old one."
+            .to_string(),
+        SlotRefusal::NoUsableSlotLeft => "A locked store always keeps a slot this AppRafter \
+             opens: add one before removing this one."
+            .to_string(),
+    }
+}
+
+fn cache_not_sealed_help(secret: &crate::secrets::CachedSecret, target: &str) -> String {
+    format!(
+        "An older AppRafter or another program wrote it unencrypted into this locked store. {} \
+         and caches it encrypted to the store's own key.",
+        refetch(secret, target)
     )
 }
 
@@ -854,22 +1344,22 @@ pub enum CliError {
         stopped: Option<ProvisionStop>,
     },
 
-    /// A cached secret the age key at `path` cannot decrypt: it was cached under another key,
-    /// or the ciphertext is damaged. `detail` is the age library's own account.
-    #[error(
-        "the {} cached for target `{target}` cannot be decrypted with the age key at {path}: \
-         {detail}",
-        secret.noun()
-    )]
+    /// A cached secret the key it was tried with cannot decrypt: it was cached under another key,
+    /// or the ciphertext is damaged. `detail` is the age library's own account; `key` says which
+    /// key (the shared file at `path`, or the store's own, in its vault at `path`) and `reason`
+    /// which failure (D.4a §3.12).
+    #[error("{}", cache_undecryptable_message(secret, target, path, detail, *key))]
     #[diagnostic(
         code(apprafter::secrets::cache_undecryptable),
-        help("{}", cache_undecryptable_help(secret, target))
+        help("{}", cache_undecryptable_help(secret, target, *key))
     )]
     CacheUndecryptable {
         secret: crate::secrets::CachedSecret,
         target: String,
         path: String,
         detail: String,
+        key: crate::secrets::CacheKeyKind,
+        reason: crate::secrets::UndecryptableWhy,
     },
 
     /// The user declined the new age key `apprafter kubeconfig` asks for when the key the cache
@@ -912,6 +1402,220 @@ pub enum CliError {
         attempts: u32,
         last_error: String,
     },
+
+    /// A locked target store whose secrets a command needs, and nothing that can open it: no
+    /// unlock window and no terminal to ask at, or a prompt nobody answered (D.4a T61, T69).
+    /// `stopped_before` is set when `up` or `restore --reprovision` stopped at their phase 0,
+    /// before anything was provisioned (T46; never `ProvisionStop`, critic C2).
+    #[error("{}", store_locked_message(store, *reason))]
+    #[diagnostic(
+        code(apprafter::secrets::store_locked),
+        help("{}", store_locked_help(*stopped_before))
+    )]
+    StoreLocked {
+        store: PathBuf,
+        reason: LockedWhy,
+        stopped_before: Option<ProvisionedBy>,
+    },
+
+    /// `HCLOUD_TOKEN` or `APPRAFTER_AGE_KEY` set for a command on a locked target store, which
+    /// uses only the secrets in its vault (ADR 0068 §6; D.4a T35); refused before any prompt.
+    #[error(
+        "{var} is set, but the target store at {} is locked: a locked store uses only the \
+         secrets in its vault",
+        store.display()
+    )]
+    #[diagnostic(
+        code(apprafter::secrets::override_refused),
+        help("{}", override_refused_help(var))
+    )]
+    OverrideOnLockedStore { var: &'static str, store: PathBuf },
+
+    /// Every attempt at the prompt failed (D.4a T61).
+    #[error("{}", unlock_failed_message(store, *attempts))]
+    #[diagnostic(
+        code(apprafter::secrets::unlock_failed),
+        help("{}", unlock_failed_help(*stopped_before))
+    )]
+    UnlockFailed {
+        store: PathBuf,
+        attempts: u32,
+        stopped_before: Option<ProvisionedBy>,
+    },
+
+    /// A write prepared for one lock state of the store found another under the store's write
+    /// lock — a `lock on` or `lock off` finished meanwhile — or a key for a vault that was
+    /// replaced (D.4a T41, critic G3). Nothing was written.
+    #[error("{}", store_changed_message(store, *prepared, *now))]
+    #[diagnostic(
+        code(apprafter::secrets::store_changed),
+        help(
+            "Another AppRafter process turned this store's lock on or off meanwhile (`apprafter \
+             lock on` / `apprafter lock off`). Run this command again: it reads the store as it \
+             is now."
+        )
+    )]
+    StoreChanged {
+        store: PathBuf,
+        prepared: SecretsModeKind,
+        now: SecretsModeKind,
+    },
+
+    /// A target's credentials file names this store's vault, which has no entry for it: an
+    /// older AppRafter renamed the target's directory and not its vault entry (D.4a T43, G10).
+    #[error(
+        "the vault of the target store at {} holds no token for `{target}`, although its \
+         credentials file says it does",
+        store.display()
+    )]
+    #[diagnostic(
+        code(apprafter::secrets::token_missing_from_vault),
+        help(
+            "If an older AppRafter renamed this target, rename it back to its old name with this \
+             AppRafter, then rename it again. Otherwise store its token again: `apprafter target \
+             add {target} --renew --token <token>`."
+        )
+    )]
+    TokenMissingFromVault { target: String, store: PathBuf },
+
+    /// A vault that was not written (D.4a T27, W7): too large, or no safe way to create it.
+    #[error("{}", vault_unwritable_message(path, problem))]
+    #[diagnostic(
+        code(apprafter::secrets::vault_unwritable),
+        help("{}", vault_unwritable_help(problem))
+    )]
+    VaultUnwritable {
+        path: PathBuf,
+        problem: VaultWriteProblem,
+    },
+
+    /// A vault that cannot be read: missing, not a vault, newer, damaged, or another store's.
+    #[error("{}", vault_unreadable_message(path, problem, detail))]
+    #[diagnostic(
+        code(apprafter::secrets::vault_unreadable),
+        help("{}", vault_unreadable_help(path, problem))
+    )]
+    VaultUnreadable {
+        path: PathBuf,
+        problem: VaultProblem,
+        detail: String,
+    },
+
+    /// `store.yaml` cannot be read, or says what no AppRafter writes — a newer format, an
+    /// unknown `secrets:` value, a lock without an id, a vault beside no lock (D.4a T31). The
+    /// store is then treated as locked: none of its secrets is used.
+    #[error(
+        "{} cannot be read, so whether this target store's secrets are locked is unknown: \
+         {detail}",
+        path.display()
+    )]
+    #[diagnostic(
+        code(apprafter::secrets::store_file_unreadable),
+        help(
+            "AppRafter treats the store as locked and uses none of its secrets until this file \
+             reads again. Fix it by hand (`secrets:` is `files`, `locking`, `locked` or \
+             `unlocking`) or restore it from a backup; never delete it while the store's \
+             `vault` exists."
+        )
+    )]
+    StoreFileUnreadable { path: PathBuf, detail: String },
+
+    /// An earlier `lock on` or `lock off` did not finish: every secret read refuses until one
+    /// finishes or backs out (D.4a T31, T37).
+    #[error(
+        "an earlier `{}` on the target store at {} did not finish",
+        phase.command(),
+        store.display()
+    )]
+    #[diagnostic(
+        code(apprafter::secrets::lock_incomplete),
+        help("{}", lock_incomplete_help(*phase))
+    )]
+    LockIncomplete { store: PathBuf, phase: LockPhase },
+
+    /// A slot refused before any key was derived (D.4a T22, T63).
+    #[error("{}", slot_refused_message(store, *reason))]
+    #[diagnostic(
+        code(apprafter::secrets::slot_refused),
+        help("{}", slot_refused_help(*reason))
+    )]
+    SlotRefused { store: PathBuf, reason: SlotRefusal },
+
+    /// A plaintext cached secret in a locked store's state (D.4a T38): an older AppRafter's
+    /// write, or a forgery; never used, never sealed later.
+    #[error(
+        "the {} cached for target `{target}` is not encrypted, but this target store is locked: \
+         it is not used",
+        secret.noun()
+    )]
+    #[diagnostic(
+        code(apprafter::secrets::cache_not_sealed),
+        help("{}", cache_not_sealed_help(secret, target))
+    )]
+    CacheNotSealed {
+        secret: crate::secrets::CachedSecret,
+        target: String,
+    },
+
+    /// A clear token in a locked store's `credentials.yaml` (an older AppRafter's `target add`,
+    /// or planted): never used, never adopted (D.4a T42).
+    #[error(
+        "the credentials file of target `{target}` holds a token in clear, but this target store \
+         is locked: that token is not used ({})",
+        path.display()
+    )]
+    #[diagnostic(
+        code(apprafter::secrets::token_outside_vault),
+        help(
+            "A locked store takes tokens only from its vault; this one was written by an older \
+             AppRafter or by another program. `apprafter target add {target} --renew --token \
+             <token>` stores the token in the vault and replaces the file."
+        )
+    )]
+    TokenOutsideVault { target: String, path: PathBuf },
+
+    /// A marker naming another store's vault: the target's directory came from it (D.4a T34).
+    #[error("the token of target `{target}` is in the vault of another target store (id {id})")]
+    #[diagnostic(
+        code(apprafter::secrets::token_in_another_vault),
+        help(
+            "The target's files came from the target store with id {id}, whose vault holds its \
+             token. Store the token here: `apprafter target add {target} --renew --token \
+             <token>`."
+        )
+    )]
+    TokenInAnotherVault { target: String, id: String },
+
+    /// A vault or `store.yaml` write without the store's held write lock (D.4a T28): a lost
+    /// race would overwrite the only copy of every token.
+    #[error(
+        "the vault of the target store at {} is written only under the store's write lock, and \
+         this filesystem gives none",
+        store.display()
+    )]
+    #[diagnostic(
+        code(apprafter::secrets::vault_needs_write_lock),
+        help(
+            "The vault holds the only copy of these secrets, so it is never written without the \
+             lock. Keep the target store on a local filesystem with file locks \
+             (`APPRAFTER_CONFIG_DIR` moves it)."
+        )
+    )]
+    VaultNeedsWriteLock { store: PathBuf },
+
+    /// The operating system's random numbers failed (D.4a §3.7): no key, no nonce, no write,
+    /// and no fallback generator.
+    #[error(
+        "the operating system's random number generator failed, so nothing was written: {detail}"
+    )]
+    #[diagnostic(
+        code(apprafter::secrets::random_unavailable),
+        help(
+            "AppRafter makes keys only from the operating system's random numbers, with no \
+             fallback. Try again; if it keeps failing, the system's entropy source is broken."
+        )
+    )]
+    RandomUnavailable { detail: String },
 
     /// Catch-all, free-form message. New call sites should prefer
     /// promoting recurring messages to dedicated variants with
@@ -1819,6 +2523,8 @@ mod tests {
             target: "prod".into(),
             path: "/k/age.key".into(),
             detail: "age decrypt: No matching keys found".into(),
+            key: crate::secrets::CacheKeyKind::SharedFile,
+            reason: crate::secrets::UndecryptableWhy::NotForThisKey,
         };
         let kube = err(CachedSecret::Kubeconfig);
         assert_eq!(code_of(&kube), "apprafter::secrets::cache_undecryptable");
@@ -1845,6 +2551,179 @@ mod tests {
             help.contains("`apprafter argocd-password --refresh --target prod`"),
             "{help}"
         );
+    }
+
+    /// D.4a T38, §3.12: on a locked store the only key is the store's own, and the way back is
+    /// the fetch alone — never `APPRAFTER_AGE_KEY`, which a locked store refuses (ADR 0068 §6).
+    #[test]
+    fn a_cache_the_store_key_cannot_open_names_only_the_refresh() {
+        use crate::secrets::{CacheKeyKind, CachedSecret, UndecryptableWhy};
+        let err = CliError::CacheUndecryptable {
+            secret: CachedSecret::Kubeconfig,
+            target: "prod".into(),
+            path: "/s/vault".into(),
+            detail: "age decrypt: No matching keys found".into(),
+            key: CacheKeyKind::StoreVault,
+            reason: UndecryptableWhy::NotForThisKey,
+        };
+        assert_eq!(code_of(&err), "apprafter::secrets::cache_undecryptable");
+        assert_eq!(
+            err.to_string(),
+            "the kubeconfig cached for target `prod` cannot be decrypted with this target \
+             store's own key, in its vault /s/vault: age decrypt: No matching keys found"
+        );
+        let help = help_of(&err);
+        assert!(
+            help.contains("`apprafter kubeconfig --refresh --target prod`")
+                && help.contains("the store's key"),
+            "{help}"
+        );
+        assert!(!help.contains("APPRAFTER_AGE_KEY"), "{help}");
+    }
+
+    /// D.4a §3.12: every lock refusal has its code, a message that names the store or the target
+    /// (never a secret), and a help that says what to do — no catch-all "file an issue".
+    #[test]
+    fn the_lock_refusals_have_their_codes_messages_and_helps() {
+        use crate::secrets::CachedSecret;
+        let s = || PathBuf::from("/s");
+        let cases: Vec<(CliError, &str, &str, &str)> = vec![
+            (CliError::StoreLocked { store: s(), reason: LockedWhy::NoTerminal, stopped_before: None },
+             "apprafter::secrets::store_locked",
+             "the target store at /s is locked, and there is no unlock window here",
+             "run `apprafter unlock` there"),
+            (CliError::StoreLocked { store: s(), reason: LockedWhy::TimedOut, stopped_before: None },
+             "apprafter::secrets::store_locked",
+             "the target store at /s is locked, and nobody answered the unlock prompt within 5 minutes",
+             "cannot ask for the lock password"),
+            (CliError::StoreLocked { store: s(), reason: LockedWhy::NoTerminal, stopped_before: Some(ProvisionedBy::Up) },
+             "apprafter::secrets::store_locked",
+             "the target store at /s is locked, and there is no unlock window here",
+             "`apprafter up` stopped before provisioning, so nothing was created"),
+            (CliError::OverrideOnLockedStore { var: crate::HCLOUD_TOKEN_ENV, store: s() },
+             "apprafter::secrets::override_refused",
+             "HCLOUD_TOKEN is set, but the target store at /s is locked: a locked store uses only the secrets in its vault",
+             "`APPRAFTER_CONFIG_DIR=<dir>`"),
+            (CliError::OverrideOnLockedStore { var: crate::secrets::AGE_KEY_ENV, store: s() },
+             "apprafter::secrets::override_refused",
+             "APPRAFTER_AGE_KEY is set, but the target store at /s is locked: a locked store uses only the secrets in its vault",
+             "the store's own age key, in its vault"),
+            (CliError::UnlockFailed { store: s(), attempts: 3, stopped_before: None },
+             "apprafter::secrets::unlock_failed",
+             "3 attempts did not unlock the target store at /s",
+             "The recovery key opens the store at the same prompt"),
+            (CliError::UnlockFailed { store: s(), attempts: 1, stopped_before: Some(ProvisionedBy::RestoreReprovision) },
+             "apprafter::secrets::unlock_failed",
+             "1 attempt did not unlock the target store at /s",
+             "`apprafter restore --reprovision` stopped before provisioning"),
+            (CliError::StoreChanged { store: s(), prepared: SecretsModeKind::Files, now: SecretsModeKind::Locked },
+             "apprafter::secrets::store_changed",
+             "the lock state of the target store at /s changed while this command ran (files → locked); nothing was written",
+             "Run this command again"),
+            (CliError::StoreChanged { store: s(), prepared: SecretsModeKind::Locked, now: SecretsModeKind::Locked },
+             "apprafter::secrets::store_changed",
+             "the vault of the target store at /s was replaced while this command ran; nothing was written",
+             "Run this command again"),
+            (CliError::TokenMissingFromVault { target: "prod".into(), store: s() },
+             "apprafter::secrets::token_missing_from_vault",
+             "the vault of the target store at /s holds no token for `prod`, although its credentials file says it does",
+             "rename it back to its old name"),
+            (CliError::VaultUnwritable { path: "/s/vault".into(), problem: VaultWriteProblem::TooLarge { limit: 2_097_152 } },
+             "apprafter::secrets::vault_unwritable",
+             "the vault /s/vault would hold more than 2097152 bytes, the most a vault may: nothing was written",
+             "`apprafter target remove <name>`"),
+            (CliError::VaultUnwritable { path: s(), problem: VaultWriteProblem::NoReplaceUnsupported { fs: Some("exfat".into()) } },
+             "apprafter::secrets::vault_unwritable",
+             "a vault cannot be created in /s (exfat): this filesystem cannot create a file without risking replacing one, so nothing was written",
+             "hard links"),
+            (CliError::VaultUnwritable { path: "/s/vault".into(), problem: VaultWriteProblem::Refused { what: RefusedInput::Token } },
+             "apprafter::secrets::vault_unwritable",
+             "the vault /s/vault cannot hold this write (a Hetzner token is 1 to 16384 bytes): nothing was written",
+             "check what was pasted"),
+            (CliError::VaultUnwritable { path: "/s/vault".into(), problem: VaultWriteProblem::Refused { what: RefusedInput::NameTaken } },
+             "apprafter::secrets::vault_unwritable",
+             "the vault /s/vault cannot hold this write (the new target name already has entries in the vault): nothing was written",
+             "choose another name"),
+            (CliError::VaultUnreadable { path: "/s/vault".into(), problem: VaultProblem::Missing, detail: String::new() },
+             "apprafter::secrets::vault_unreadable",
+             "the vault /s/vault is missing",
+             "restore /s/vault from a backup"),
+            (CliError::VaultUnreadable { path: "/s/vault".into(), problem: VaultProblem::NotAVault, detail: "x".into() },
+             "apprafter::secrets::vault_unreadable",
+             "/s/vault is not an AppRafter vault: x",
+             "nothing else holds these secrets"),
+            (CliError::VaultUnreadable { path: "/s/vault".into(), problem: VaultProblem::NewerFormat { version: 2 }, detail: "x".into() },
+             "apprafter::secrets::vault_unreadable",
+             "the vault /s/vault is in format 2, which this AppRafter does not read: x",
+             "Upgrade AppRafter"),
+            (CliError::VaultUnreadable { path: "/s/vault".into(), problem: VaultProblem::Damaged { what: DamageKind::Tampered }, detail: "x".into() },
+             "apprafter::secrets::vault_unreadable",
+             "the vault /s/vault is damaged: x",
+             "never delete it"),
+            (CliError::VaultUnreadable { path: "/s/vault".into(), problem: VaultProblem::OtherStore, detail: "x".into() },
+             "apprafter::secrets::vault_unreadable",
+             "the vault /s/vault belongs to another target store: x",
+             "from the same backup"),
+            (CliError::StoreFileUnreadable { path: "/s/store.yaml".into(), detail: "x".into() },
+             "apprafter::secrets::store_file_unreadable",
+             "/s/store.yaml cannot be read, so whether this target store's secrets are locked is unknown: x",
+             "never delete it while the store's `vault` exists"),
+            (CliError::LockIncomplete { store: s(), phase: LockPhase::Locking },
+             "apprafter::secrets::lock_incomplete",
+             "an earlier `lock on` on the target store at /s did not finish",
+             "`apprafter lock off` backs out of it"),
+            (CliError::LockIncomplete { store: s(), phase: LockPhase::Unlocking },
+             "apprafter::secrets::lock_incomplete",
+             "an earlier `lock off` on the target store at /s did not finish",
+             "Run `apprafter lock off` again"),
+            (CliError::SlotRefused { store: s(), reason: SlotRefusal::KdfTooWeak },
+             "apprafter::secrets::slot_refused",
+             "the lock password of the target store at /s is kept with key-derivation settings weaker than this AppRafter accepts",
+             "with its recovery key"),
+            (CliError::SlotRefused { store: s(), reason: SlotRefusal::KdfOutOfRange },
+             "apprafter::secrets::slot_refused",
+             "the lock password of the target store at /s is kept with key-derivation settings beyond what this AppRafter computes",
+             "with its recovery key"),
+            (CliError::SlotRefused { store: s(), reason: SlotRefusal::NoUsableSlot },
+             "apprafter::secrets::slot_refused",
+             "the target store at /s has no slot this AppRafter can open with that secret",
+             "upgrade AppRafter"),
+            (CliError::SlotRefused { store: s(), reason: SlotRefusal::LastRecoverySlot },
+             "apprafter::secrets::slot_refused",
+             "the recovery key slot of the target store at /s is its last one",
+             "add the new one before removing the old one"),
+            (CliError::SlotRefused { store: s(), reason: SlotRefusal::NoUsableSlotLeft },
+             "apprafter::secrets::slot_refused",
+             "removing that slot would leave the target store at /s with no slot this AppRafter can open",
+             "add one before removing this one"),
+            (CliError::CacheNotSealed { secret: CachedSecret::Kubeconfig, target: "prod".into() },
+             "apprafter::secrets::cache_not_sealed",
+             "the kubeconfig cached for target `prod` is not encrypted, but this target store is locked: it is not used",
+             "`apprafter kubeconfig --refresh --target prod`"),
+            (CliError::TokenOutsideVault { target: "prod".into(), path: "/s/targets/prod/credentials.yaml".into() },
+             "apprafter::secrets::token_outside_vault",
+             "the credentials file of target `prod` holds a token in clear, but this target store is locked: that token is not used (/s/targets/prod/credentials.yaml)",
+             "`apprafter target add prod --renew --token <token>`"),
+            (CliError::TokenInAnotherVault { target: "prod".into(), id: "0123456789abcdef".into() },
+             "apprafter::secrets::token_in_another_vault",
+             "the token of target `prod` is in the vault of another target store (id 0123456789abcdef)",
+             "the target store with id 0123456789abcdef"),
+            (CliError::VaultNeedsWriteLock { store: s() },
+             "apprafter::secrets::vault_needs_write_lock",
+             "the vault of the target store at /s is written only under the store's write lock, and this filesystem gives none",
+             "never written without the lock"),
+            (CliError::RandomUnavailable { detail: "getrandom: ENOSYS".into() },
+             "apprafter::secrets::random_unavailable",
+             "the operating system's random number generator failed, so nothing was written: getrandom: ENOSYS",
+             "with no fallback"),
+        ];
+        for (err, code, message, help) in cases {
+            assert_eq!(code_of(&err), code);
+            assert_eq!(err.to_string(), message);
+            let h = help_of(&err);
+            assert!(h.contains(help), "{code}: {h}");
+            assert!(!h.contains("file an issue"), "{code}: {h}");
+        }
     }
 
     /// WI-457 review #5/#12: a declined new key is an error, so a caller capturing the

@@ -201,6 +201,7 @@ const SECRET_DOORS: &[&str] = &[
     "cli_core::target::save_target_credentials",
     "cli_core::secrets::load_identity",
     "cli_core::secrets::decrypt_with_identity",
+    "cli_core::secrets::decrypt_with_identity_reason",
     "cli_core::secrets::encrypt_for_recipient",
 ];
 
@@ -2237,6 +2238,20 @@ fn f(store: &cli_core::TargetStorePaths, id: &Identity) {
                 door("target_credentials_file", 7),
                 door("target_credentials_file", 9),
             ]
+        );
+    }
+
+    /// D.4a c2: the decrypt that says why is a door, like the one it extends.
+    #[test]
+    fn the_decrypt_that_says_why_is_a_secret_door() {
+        let src = "fn f(k: &Identity) { let _ = cli_core::secrets::decrypt_with_identity_reason(\"a\", k); }";
+        assert_eq!(
+            hits(src),
+            vec![(
+                Kind::SecretDoor,
+                "cli_core::secrets::decrypt_with_identity_reason".to_string(),
+                1
+            )]
         );
     }
 

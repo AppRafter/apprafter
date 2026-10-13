@@ -45,6 +45,7 @@ pub mod doctor;
 pub mod env;
 pub mod error;
 pub mod kube;
+pub mod lock;
 pub mod machine;
 pub mod net;
 pub mod op;

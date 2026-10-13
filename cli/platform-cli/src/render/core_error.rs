@@ -4,6 +4,7 @@
 
 use std::fmt;
 
+use apprafter_core::lock::{PasswordProblem, RecoveryKeyProblem};
 use apprafter_core::CoreError;
 use cli_core::CliError;
 use miette::Diagnostic;
@@ -168,6 +169,51 @@ pub(crate) fn cli_help(e: &CoreError) -> Option<String> {
         // core's carries none. `kubeconfig --refresh` never decrypts the cache on its way to a
         // refetch, so it is the way back from a lost key (WI-457, GOTCHA-121).
         CoreError::AgeKeyMissing { .. } => cli_core::age_key_missing_help(None),
+        CoreError::LockPasswordRefused { reason } => match reason {
+            PasswordProblem::Empty => {
+                "Type a lock password: an empty one would protect nothing.".into()
+            }
+            PasswordProblem::TooLong { max } => format!(
+                "Choose one of at most {max} bytes: a phrase of a few words is long enough."
+            ),
+            PasswordProblem::RecoveryKeyShape => "Choose another: one prompt takes either the \
+                 lock password or the recovery key, so a password shaped like a recovery key \
+                 would be tried as one."
+                .into(),
+        },
+        CoreError::RecoveryKeyInvalid { reason } => match reason {
+            RecoveryKeyProblem::Checksum { .. } => "Compare that group with your copy of the \
+                 recovery key and type the key again. Nothing was changed."
+                .into(),
+            RecoveryKeyProblem::InvalidChar {
+                hint: Some(hint), ..
+            } => format!(
+                "`{hint}` may be what you meant: `1`, `b`, `i` and `o` are not used in a \
+                 recovery key. Nothing was changed."
+            ),
+            RecoveryKeyProblem::InvalidChar { hint: None, .. } => "A recovery key uses \
+                 letters and digits except `1`, `b`, `i` and `o` (`1` and `i` look like `l`, \
+                 `b` like `8`, `o` like `0`). Nothing was changed."
+                .into(),
+            RecoveryKeyProblem::Mismatch => "Type the whole key exactly as it was shown; the \
+                 APPRAFTER-RECOVERY-KEY-1 prefix may be left out, and dashes and spaces are \
+                 ignored. Nothing was changed."
+                .into(),
+            RecoveryKeyProblem::NotConfirmed => "Type the whole recovery key back when asked: \
+                 the store is locked only once the key is confirmed."
+                .into(),
+            RecoveryKeyProblem::Empty
+            | RecoveryKeyProblem::WrongPrefix
+            | RecoveryKeyProblem::WrongLength => "A recovery key is the two lines shown when \
+                 the store was locked: APPRAFTER-RECOVERY-KEY-1, then twelve groups of letters \
+                 and digits. Nothing was changed."
+                .into(),
+        },
+        CoreError::InsecureKdfRefused { root } => format!(
+            "This test build derives keys with weak parameters, so it creates a lock password \
+             only for a store under APPRAFTER_SANDBOX. Use a release build of AppRafter for {}.",
+            root.display()
+        ),
     })
 }
 
@@ -464,5 +510,42 @@ mod tests {
         let r = report_with_help(CoreError::NoActiveTarget, "h");
         assert_eq!(r.to_string(), report(CoreError::NoActiveTarget).to_string());
         assert_eq!(r.help().unwrap().to_string(), "h");
+    }
+
+    /// D.4a c2: the lock's own refusals say what to type, in the CLI's words.
+    #[test]
+    fn the_lock_refusals_say_what_to_type() {
+        use apprafter_core::lock::{PasswordProblem, RecoveryKeyProblem};
+        let help = |e| report(e).help().map(|h| h.to_string()).unwrap_or_default();
+        assert!(help(CoreError::LockPasswordRefused {
+            reason: PasswordProblem::RecoveryKeyShape
+        })
+        .contains("shaped like a recovery key"));
+        // An `o` typed: its look-alike, never a fixed guess (c1's `lookalike` says which, T24).
+        assert!(help(CoreError::RecoveryKeyInvalid {
+            reason: RecoveryKeyProblem::InvalidChar {
+                position: 9,
+                hint: Some('0')
+            }
+        })
+        .contains("`0` may be what you meant"));
+        let none = help(CoreError::RecoveryKeyInvalid {
+            reason: RecoveryKeyProblem::InvalidChar {
+                position: 9,
+                hint: None,
+            },
+        });
+        assert!(
+            none.contains("`1` and `i` look like `l`, `b` like `8`, `o` like `0`")
+                && !none.contains("may be what you meant"),
+            "{none}"
+        );
+        assert!(help(CoreError::RecoveryKeyInvalid {
+            reason: RecoveryKeyProblem::NotConfirmed
+        })
+        .contains("Type the whole recovery key back"));
+        assert!(
+            help(CoreError::InsecureKdfRefused { root: "/s".into() }).contains("APPRAFTER_SANDBOX")
+        );
     }
 }

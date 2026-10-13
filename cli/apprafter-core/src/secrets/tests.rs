@@ -5,7 +5,9 @@
 
 use std::path::Path;
 
-use cli_core::secrets::{encrypt_for_recipient, load_or_create_identity};
+use cli_core::secrets::{
+    encrypt_for_recipient, load_or_create_identity, CacheKeyKind, UndecryptableWhy,
+};
 use cli_core::CliError;
 
 use super::*;
@@ -161,7 +163,10 @@ fn a_key_that_does_not_open_the_cache_says_which_secret_and_whose() {
         .cached_kubeconfig(&hetzner(Some(&armored), None), "prod")
         .unwrap_err();
     assert!(
-        matches!(&err, CliError::CacheUndecryptable { secret: CachedSecret::Kubeconfig, target, path, .. }
+        matches!(&err, CliError::CacheUndecryptable {
+                secret: CachedSecret::Kubeconfig, target, path,
+                key: CacheKeyKind::SharedFile, reason: UndecryptableWhy::NotForThisKey, ..
+            }
             if target == "prod" && *path == ctx.age_key_path().display().to_string()),
         "{err:?}"
     );

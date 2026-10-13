@@ -3,7 +3,7 @@
 //! [`CacheKey`] and decrypted nowhere else in the core (D.4a T16). Moved from the CLI's
 //! `commands/age_cache.rs` (D.4a b).
 
-use cli_core::secrets::{decrypt_with_identity, CachedSecret};
+use cli_core::secrets::{decrypt_with_identity_reason, CacheKeyKind, CachedSecret};
 use cli_core::{CliError, Result};
 use cli_state::HetznerCloudState;
 use zeroize::Zeroizing;
@@ -31,19 +31,22 @@ pub(super) fn cached_kubeconfig(
     }
 }
 
-/// `armored`, `target`'s cached `secret`, opened with `key`.
+/// `armored`, `target`'s cached `secret`, opened with `key`: the shared age key here (the
+/// store's own key is d4a-c2's vault backend). A failure says which key and why (§3.12).
 pub(super) fn open(
     key: &CacheKey,
     secret: CachedSecret,
     target: &str,
     armored: &str,
 ) -> Result<Zeroizing<String>> {
-    decrypt_with_identity(armored, &key.identity)
+    decrypt_with_identity_reason(armored, &key.identity)
         .map(Zeroizing::new)
-        .map_err(|e| CliError::CacheUndecryptable {
+        .map_err(|u| CliError::CacheUndecryptable {
             secret,
             target: target.to_string(),
             path: key.path.display().to_string(),
-            detail: e.to_string(),
+            detail: u.detail,
+            key: CacheKeyKind::SharedFile,
+            reason: u.why,
         })
 }

@@ -21,6 +21,16 @@
     "help": "The Hetzner Cloud API refused the request:\n• 401 unauthorized — the token is wrong, or it was revoked or rotated: use a current one.\n• 403 forbidden — the token lacks Read & Write (it is Read-only), or the project forbids the call, for example at one of its limits.\n• 429 rate limit — too many requests: wait, then try again.\n• 5xx — an outage at the provider; check https://status.hetzner.com/.",
     "message": "hetzner-cloud GET /v1/locations failed (status 403): forbidden: insufficient permissions"
   },
+  "lockIncomplete": {
+    "causes": [],
+    "code": "apprafter::secrets::lock_incomplete",
+    "fields": {
+      "phase": "locking",
+      "store": "/home/a/stores/work"
+    },
+    "help": "Protecting this target store's secrets was interrupted. Finish it, or stop protecting them, in Settings › Lock.",
+    "message": "an earlier `lock on` on the target store at /home/a/stores/work did not finish"
+  },
   "serverTypeUnavailable": {
     "causes": [],
     "code": "apprafter::provider::server_type_unavailable",
@@ -32,6 +42,16 @@
     },
     "help": "Hetzner no longer sells `cx22`; pick another type. Nothing was saved.",
     "message": "server type `cx22` is unavailable in region `nbg1`: retired (no longer orderable)\n  cpx22"
+  },
+  "storeLocked": {
+    "causes": [],
+    "code": "apprafter::secrets::store_locked",
+    "fields": {
+      "reason": "no_terminal",
+      "store": "/home/a/stores/work"
+    },
+    "help": "This target store's secrets are encrypted, and the app holds no key for them: they were locked from a terminal while the app was open. Lock the app, then unlock it with the lock password.",
+    "message": "the target store at /home/a/stores/work is locked, and there is no unlock window here"
   },
   "targetExists": {
     "causes": [],
@@ -64,5 +84,15 @@
     },
     "help": "Install kubectl.\n\nNothing was sent anywhere and no credential was used: this check runs before any work starts, so trying again after installing is safe.",
     "message": "`kubectl` is required by `doctor` (talks to the cluster) but is not on PATH"
+  },
+  "vaultUnreadable": {
+    "causes": [],
+    "code": "apprafter::secrets::vault_unreadable",
+    "fields": {
+      "path": "/home/a/stores/work/vault",
+      "problem": "damaged"
+    },
+    "help": "Its contents fail their integrity check. Restore /home/a/stores/work/vault from a backup; never delete it: nothing else holds these secrets.",
+    "message": "the vault /home/a/stores/work/vault is damaged: the payload failed its authentication"
   }
 }

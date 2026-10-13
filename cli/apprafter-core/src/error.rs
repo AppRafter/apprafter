@@ -23,6 +23,7 @@
 //! a JSON number (D.3 overview R12).
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use miette::Diagnostic;
 use serde::Serialize;
@@ -31,6 +32,7 @@ use thiserror::Error;
 
 use crate::cancel::Cancelled;
 use crate::kube::KubeErrorKind;
+use crate::lock::{PasswordProblem, RecoveryKeyProblem};
 use crate::provider::TokenProblem;
 use crate::ssh::SshKeyProblem;
 use crate::target::NameProblem;
@@ -175,6 +177,28 @@ pub enum CoreError {
     #[error("no age key at {path}; the cached secrets cannot be decrypted")]
     #[diagnostic(code(apprafter::secrets::age_key_missing))]
     AgeKeyMissing { path: String },
+
+    /// A new lock password the core refuses (D.4a O2, T62): empty, too long, or shaped like a
+    /// recovery key — no minimum length (a short one is advice, `lock::PasswordAdvice`).
+    #[error("{}", reason.message())]
+    #[diagnostic(code(apprafter::secrets::password_refused))]
+    LockPasswordRefused { reason: PasswordProblem },
+
+    /// A typed recovery key the core refuses, or a lock-on plan executed before the key was
+    /// typed back (D.4a T24, T25).
+    #[error("{}", reason.message())]
+    #[diagnostic(code(apprafter::secrets::recovery_key_invalid))]
+    RecoveryKeyInvalid { reason: RecoveryKeyProblem },
+
+    /// An `insecure-fast-kdf` test build asked to create a password slot for a store outside
+    /// its sandbox roots (D.4a T23, critic S2). A release build never raises it.
+    #[error(
+        "this test build of AppRafter derives keys with weak parameters, so it creates no lock \
+         password outside its sandbox, and {} is outside it",
+        root.display()
+    )]
+    #[diagnostic(code(apprafter::secrets::insecure_kdf_refused))]
+    InsecureKdfRefused { root: PathBuf },
 }
 
 /// Every code the core raises or the desktop acts on: the core's own, and the pass-through
@@ -218,6 +242,27 @@ pub mod codes {
     /// A filesystem error. On one of a target's own files `fields.target` names the target and
     /// `fields.path` the file (the desktop then offers to remove it, WI-458 review #6).
     pub const IO_ERROR: &str = "apprafter::io::error";
+    /// D.4a §3.12: the target-store lock. The next fifteen are cli-core's `CliError` codes,
+    /// which pass through to the desktop with their own fields.
+    pub const STORE_LOCKED: &str = "apprafter::secrets::store_locked";
+    pub const OVERRIDE_REFUSED: &str = "apprafter::secrets::override_refused";
+    pub const UNLOCK_FAILED: &str = "apprafter::secrets::unlock_failed";
+    pub const STORE_CHANGED: &str = "apprafter::secrets::store_changed";
+    pub const TOKEN_MISSING_FROM_VAULT: &str = "apprafter::secrets::token_missing_from_vault";
+    pub const VAULT_UNWRITABLE: &str = "apprafter::secrets::vault_unwritable";
+    pub const VAULT_UNREADABLE: &str = "apprafter::secrets::vault_unreadable";
+    pub const STORE_FILE_UNREADABLE: &str = "apprafter::secrets::store_file_unreadable";
+    pub const LOCK_INCOMPLETE: &str = "apprafter::secrets::lock_incomplete";
+    pub const SLOT_REFUSED: &str = "apprafter::secrets::slot_refused";
+    pub const CACHE_NOT_SEALED: &str = "apprafter::secrets::cache_not_sealed";
+    pub const TOKEN_OUTSIDE_VAULT: &str = "apprafter::secrets::token_outside_vault";
+    pub const TOKEN_IN_ANOTHER_VAULT: &str = "apprafter::secrets::token_in_another_vault";
+    pub const VAULT_NEEDS_WRITE_LOCK: &str = "apprafter::secrets::vault_needs_write_lock";
+    pub const RANDOM_UNAVAILABLE: &str = "apprafter::secrets::random_unavailable";
+    /// The lock's three refusals the core raises itself (`CoreError`).
+    pub const PASSWORD_REFUSED: &str = "apprafter::secrets::password_refused";
+    pub const RECOVERY_KEY_INVALID: &str = "apprafter::secrets::recovery_key_invalid";
+    pub const INSECURE_KDF_REFUSED: &str = "apprafter::secrets::insecure_kdf_refused";
 
     /// Every code above.
     pub const ALL: &[&str] = &[
@@ -252,6 +297,24 @@ pub mod codes {
         SSH_KEY_NOT_PUBLIC,
         INVALID_TARGET_CONFIG,
         IO_ERROR,
+        STORE_LOCKED,
+        OVERRIDE_REFUSED,
+        UNLOCK_FAILED,
+        STORE_CHANGED,
+        TOKEN_MISSING_FROM_VAULT,
+        VAULT_UNWRITABLE,
+        VAULT_UNREADABLE,
+        STORE_FILE_UNREADABLE,
+        LOCK_INCOMPLETE,
+        SLOT_REFUSED,
+        CACHE_NOT_SEALED,
+        TOKEN_OUTSIDE_VAULT,
+        TOKEN_IN_ANOTHER_VAULT,
+        VAULT_NEEDS_WRITE_LOCK,
+        RANDOM_UNAVAILABLE,
+        PASSWORD_REFUSED,
+        RECOVERY_KEY_INVALID,
+        INSECURE_KDF_REFUSED,
     ];
 }
 
@@ -402,6 +465,31 @@ impl From<&CoreError> for UiError {
             }
             CoreError::Kube { kind, .. } => put("kind", json!(kind.as_str())),
             CoreError::AgeKeyMissing { path } => put("path", json!(path)),
+            CoreError::LockPasswordRefused { reason } => {
+                put("reason", json!(reason.as_str()));
+                if let PasswordProblem::TooLong { max } = reason {
+                    put("max", json!(max));
+                }
+            }
+            CoreError::RecoveryKeyInvalid { reason } => {
+                put("reason", json!(reason.as_str()));
+                match reason {
+                    // `hint` is a look-alike (`l`, `0`, `8`), never the typed character.
+                    RecoveryKeyProblem::InvalidChar { position, hint } => {
+                        put("position", json!(position));
+                        if let Some(hint) = hint {
+                            put("hint", json!(hint));
+                        }
+                    }
+                    RecoveryKeyProblem::Checksum { group: Some(group) } => {
+                        put("group", json!(group))
+                    }
+                    _ => {}
+                }
+            }
+            CoreError::InsecureKdfRefused { root } => {
+                put("root", json!(root.display().to_string()))
+            }
             CoreError::Cli(inner) => project_cli(inner, &mut put),
             CoreError::NoActiveTarget | CoreError::Cancelled => {}
         }
@@ -549,6 +637,92 @@ fn neutral_help(e: &cli_core::CliError) -> Option<String> {
              both finish: two backups need the same helper pods, and a backup and a check each \
              fail on the other's repository lock."
         ),
+        // D.4a §3.12: the lock refusals — the diagnosis, and the app's way on.
+        C::StoreLocked { .. } => "This target store's secrets are encrypted, and the app holds \
+             no key for them: they were locked from a terminal while the app was open. Lock the \
+             app, then unlock it with the lock password."
+            .into(),
+        C::UnlockFailed { .. } => {
+            "That is neither the lock password nor the recovery key of this target store.".into()
+        }
+        C::StoreChanged { .. } => "Another AppRafter process turned this target store's lock \
+             on or off meanwhile. Nothing was written; try again."
+            .into(),
+        C::TokenMissingFromVault { .. } => "The vault holds no token for this target, although \
+             its credentials file says it does. If an older AppRafter renamed the target, \
+             rename it back to its old name, then rename it again; otherwise renew its token."
+            .into(),
+        C::VaultUnwritable { problem, .. } => match problem {
+            cli_core::VaultWriteProblem::TooLarge { .. } => "This target store holds more than \
+                 its vault can: remove targets it no longer needs, or keep some in a target \
+                 store of their own."
+                .into(),
+            cli_core::VaultWriteProblem::NoReplaceUnsupported { .. } => "The target store's \
+                 filesystem cannot create the vault safely (it has no hard links): keep the \
+                 store on a filesystem that has them."
+                .into(),
+            cli_core::VaultWriteProblem::Refused { what } => match what {
+                cli_core::RefusedInput::Token => "A Hetzner API token is one line of text: \
+                     check what was pasted, and try again. The vault is as it was."
+                    .into(),
+                cli_core::RefusedInput::TargetName => "Choose a target name of ASCII \
+                     letters, digits and dashes. The vault is as it was."
+                    .into(),
+                cli_core::RefusedInput::NameTaken => "Another target already uses that name \
+                     in this store's vault: remove it first, or choose another name. The \
+                     vault is as it was."
+                    .into(),
+            },
+        },
+        C::VaultUnreadable { path, problem, .. } => cli_core::vault_unreadable_help(path, problem),
+        C::StoreFileUnreadable { .. } => "AppRafter treats this target store as locked and uses \
+             none of its secrets until this file reads again. Restore it from a backup, or fix \
+             it by hand; never delete it while the store's vault exists."
+            .into(),
+        C::LockIncomplete { phase, .. } => match phase {
+            cli_core::LockPhase::Locking => "Protecting this target store's secrets was \
+                 interrupted. Finish it, or stop protecting them, in Settings › Lock."
+                .into(),
+            cli_core::LockPhase::Unlocking => "Unprotecting this target store's secrets was \
+                 interrupted. Finish it in Settings › Lock."
+                .into(),
+        },
+        C::SlotRefused { reason, .. } => match reason {
+            cli_core::SlotRefusal::KdfTooWeak | cli_core::SlotRefusal::KdfOutOfRange => {
+                "This build will not use that lock password's key settings. Unlock with the \
+                 recovery key, then stop protecting the secrets and protect them again in \
+                 Settings › Lock, which sets a new lock password."
+                    .into()
+            }
+            cli_core::SlotRefusal::NoUsableSlot => "Its slots were made by a newer AppRafter: \
+                 upgrade it, or unlock with the recovery key."
+                .into(),
+            cli_core::SlotRefusal::LastRecoverySlot => "A locked target store always keeps a \
+                 recovery key: add the new one before removing the old one."
+                .into(),
+            cli_core::SlotRefusal::NoUsableSlotLeft => "A locked target store always keeps a \
+                 way this app can open it: add one before removing this one."
+                .into(),
+        },
+        C::CacheNotSealed { .. } => "An older AppRafter or another program wrote it \
+             unencrypted into a locked target store, so it is not used. Fetching it from the \
+             server again stores it encrypted."
+            .into(),
+        C::TokenOutsideVault { .. } => "A locked target store takes tokens only from its vault; \
+             this one was written in clear by an older AppRafter or another program, and is not \
+             used. Renew the target's token to store it in the vault."
+            .into(),
+        C::TokenInAnotherVault { .. } => "The target's files came from another target store, \
+             whose vault holds its token. Renew the target's token to store it here."
+            .into(),
+        C::VaultNeedsWriteLock { .. } => "The vault holds the only copy of these secrets, so it \
+             is never written without the target store's write lock, which this filesystem does \
+             not give. Keep the store on a local disk."
+            .into(),
+        C::RandomUnavailable { .. } => "AppRafter makes keys only from the operating system's \
+             random numbers, with no fallback. Try again; if it keeps failing, the system's \
+             entropy source is broken."
+            .into(),
         // CLI input policy and CLI-only commands (their help is about the command line), and
         // errors no desktop flow reaches yet, whose help names CLI commands. `TargetNotFound`,
         // `NoActiveTarget` and `AgeKeyMissing` arrive as the core's own variants (`From`).
@@ -561,6 +735,7 @@ fn neutral_help(e: &cli_core::CliError) -> Option<String> {
         | C::TargetNotFound { .. }
         | C::NoActiveTarget
         | C::AgeKeyMissing { .. }
+        | C::OverrideOnLockedStore { .. }
         | C::CacheUndecryptable { .. }
         | C::NewAgeKeyDeclined { .. }
         | C::K3sNotReady { .. }
@@ -637,6 +812,60 @@ fn project_cli(e: &cli_core::CliError, put: &mut impl FnMut(&str, serde_json::Va
             put("origin", json!(origin));
             put("privateKey", json!(private_key));
         }
+        C::StoreLocked { store, reason, .. } => {
+            put("store", json!(store.display().to_string()));
+            put("reason", json!(reason.as_str()));
+        }
+        C::OverrideOnLockedStore { var, store } => {
+            put("var", json!(var));
+            put("store", json!(store.display().to_string()));
+        }
+        C::UnlockFailed {
+            store, attempts, ..
+        } => {
+            put("store", json!(store.display().to_string()));
+            put("attempts", json!(attempts));
+        }
+        C::StoreChanged { store, .. } | C::VaultNeedsWriteLock { store } => {
+            put("store", json!(store.display().to_string()))
+        }
+        C::TokenMissingFromVault { target, .. } => put("target", json!(target)),
+        C::VaultUnwritable { path, problem } => {
+            put("path", json!(path.display().to_string()));
+            put("problem", json!(problem.as_str()));
+            if let cli_core::VaultWriteProblem::Refused { what } = problem {
+                put("what", json!(what.as_str()));
+            }
+        }
+        C::VaultUnreadable { path, problem, .. } => {
+            put("path", json!(path.display().to_string()));
+            put("problem", json!(problem.as_str()));
+        }
+        C::StoreFileUnreadable { path, .. } => put("path", json!(path.display().to_string())),
+        C::LockIncomplete { store, phase } => {
+            put("store", json!(store.display().to_string()));
+            put("phase", json!(phase.as_str()));
+        }
+        C::SlotRefused { store, reason } => {
+            put("store", json!(store.display().to_string()));
+            put("reason", json!(reason.as_str()));
+        }
+        C::CacheNotSealed { secret, target } => {
+            put("secret", json!(secret.as_str()));
+            put("target", json!(target));
+        }
+        C::TokenOutsideVault { target, path } => {
+            put("target", json!(target));
+            put("path", json!(path.display().to_string()));
+        }
+        C::TokenInAnotherVault { target, id } => {
+            put("target", json!(target));
+            put("id", json!(id));
+        }
+        C::CacheUndecryptable { key, reason, .. } => {
+            put("key", json!(key.as_str()));
+            put("reason", json!(reason.as_str()));
+        }
         _ => {}
     }
 }
@@ -654,7 +883,7 @@ pub mod samples {
 
     /// How many variants `CoreError` declares: checked against `error.rs`'s own syntax tree
     /// (`the_samples_are_exactly_the_declared_variants`), as is [`one_of_each`].
-    pub const VARIANTS: usize = 21;
+    pub const VARIANTS: usize = 24;
 
     pub fn one_of_each() -> Vec<CoreError> {
         let s = |v: &str| v.to_string();
@@ -721,6 +950,17 @@ pub mod samples {
             CoreError::AgeKeyMissing {
                 path: s("/home/a/.config/apprafter/age.key"),
             },
+            CoreError::LockPasswordRefused {
+                reason: crate::lock::PasswordProblem::TooLong {
+                    max: crate::lock::MAX_PASSWORD_BYTES,
+                },
+            },
+            CoreError::RecoveryKeyInvalid {
+                reason: crate::lock::RecoveryKeyProblem::Checksum { group: Some(7) },
+            },
+            CoreError::InsecureKdfRefused {
+                root: "/home/a/.config/apprafter".into(),
+            },
         ]
     }
 
@@ -779,6 +1019,35 @@ pub mod samples {
                     needed_by: "doctor".into(),
                     purpose: "talks to the cluster".into(),
                     install: "Install kubectl.".into(),
+                }
+                .into(),
+            ),
+            // D.4a: what the app turns into its own lock (T74) and into Settings › Lock.
+            (
+                "storeLocked",
+                CliError::StoreLocked {
+                    store: "/home/a/stores/work".into(),
+                    reason: cli_core::LockedWhy::NoTerminal,
+                    stopped_before: None,
+                }
+                .into(),
+            ),
+            (
+                "lockIncomplete",
+                CliError::LockIncomplete {
+                    store: "/home/a/stores/work".into(),
+                    phase: cli_core::LockPhase::Locking,
+                }
+                .into(),
+            ),
+            (
+                "vaultUnreadable",
+                CliError::VaultUnreadable {
+                    path: "/home/a/stores/work/vault".into(),
+                    problem: cli_core::VaultProblem::Damaged {
+                        what: cli_core::DamageKind::Tampered,
+                    },
+                    detail: "the payload failed its authentication".into(),
                 }
                 .into(),
             ),
@@ -914,6 +1183,8 @@ pub mod samples {
                 target: s("prod"),
                 path: s("/home/a/.config/apprafter/age.key"),
                 detail: s("age decrypt: No matching keys found"),
+                key: cli_core::secrets::CacheKeyKind::SharedFile,
+                reason: cli_core::secrets::UndecryptableWhy::NotForThisKey,
             },
             C::NewAgeKeyDeclined {
                 path: s("/home/a/.config/apprafter/age.key"),
@@ -958,6 +1229,156 @@ pub mod samples {
                     install: s(t.install),
                 }),
         );
+        out.extend(lock_errors());
+        out
+    }
+
+    /// One of each lock refusal of cli-core (D.4a §3.12), every shape whose help differs.
+    pub fn lock_errors() -> Vec<cli_core::CliError> {
+        use cli_core::secrets::{CacheKeyKind, CachedSecret, UndecryptableWhy};
+        use cli_core::{
+            CliError as C, DamageKind, LockPhase, LockedWhy, ProvisionedBy, RefusedInput,
+            SecretsModeKind, SlotRefusal, VaultProblem, VaultWriteProblem,
+        };
+        let s = |v: &str| v.to_string();
+        let store = || std::path::PathBuf::from("/s");
+        let vault = || std::path::PathBuf::from("/s/vault");
+        let mut out = vec![
+            C::StoreLocked {
+                store: store(),
+                reason: LockedWhy::NoTerminal,
+                stopped_before: None,
+            },
+            C::StoreLocked {
+                store: store(),
+                reason: LockedWhy::TimedOut,
+                stopped_before: Some(ProvisionedBy::Up),
+            },
+            C::OverrideOnLockedStore {
+                var: cli_core::HCLOUD_TOKEN_ENV,
+                store: store(),
+            },
+            C::OverrideOnLockedStore {
+                var: cli_core::secrets::AGE_KEY_ENV,
+                store: store(),
+            },
+            C::UnlockFailed {
+                store: store(),
+                attempts: 3,
+                stopped_before: None,
+            },
+            C::UnlockFailed {
+                store: store(),
+                attempts: 1,
+                stopped_before: Some(ProvisionedBy::RestoreReprovision),
+            },
+            C::StoreChanged {
+                store: store(),
+                prepared: SecretsModeKind::Files,
+                now: SecretsModeKind::Locked,
+            },
+            C::StoreChanged {
+                store: store(),
+                prepared: SecretsModeKind::Locked,
+                now: SecretsModeKind::Locked,
+            },
+            C::TokenMissingFromVault {
+                target: s("prod"),
+                store: store(),
+            },
+            C::VaultUnwritable {
+                path: vault(),
+                problem: VaultWriteProblem::TooLarge { limit: 2_097_152 },
+            },
+            C::VaultUnwritable {
+                path: store(),
+                problem: VaultWriteProblem::NoReplaceUnsupported {
+                    fs: Some(s("exfat")),
+                },
+            },
+            C::StoreFileUnreadable {
+                path: "/s/store.yaml".into(),
+                detail: s("format 2 is newer than this AppRafter reads (1)"),
+            },
+            C::LockIncomplete {
+                store: store(),
+                phase: LockPhase::Locking,
+            },
+            C::LockIncomplete {
+                store: store(),
+                phase: LockPhase::Unlocking,
+            },
+            C::CacheNotSealed {
+                secret: CachedSecret::Kubeconfig,
+                target: s("prod"),
+            },
+            C::TokenOutsideVault {
+                target: s("prod"),
+                path: "/s/targets/prod/credentials.yaml".into(),
+            },
+            C::TokenInAnotherVault {
+                target: s("prod"),
+                id: s("0123456789abcdef"),
+            },
+            C::VaultNeedsWriteLock { store: store() },
+            C::RandomUnavailable {
+                detail: s("getrandom: ENOSYS"),
+            },
+            C::CacheUndecryptable {
+                secret: CachedSecret::Kubeconfig,
+                target: s("prod"),
+                path: s("/s/vault"),
+                detail: s("age decrypt: No matching keys found"),
+                key: CacheKeyKind::StoreVault,
+                reason: UndecryptableWhy::NotForThisKey,
+            },
+        ];
+        for problem in [
+            VaultProblem::Missing,
+            VaultProblem::NotAVault,
+            VaultProblem::NewerFormat { version: 2 },
+            VaultProblem::Damaged {
+                what: DamageKind::Malformed,
+            },
+            VaultProblem::Damaged {
+                what: DamageKind::SlotCorrupt,
+            },
+            VaultProblem::Damaged {
+                what: DamageKind::Tampered,
+            },
+            VaultProblem::Damaged {
+                what: DamageKind::PayloadInvalid,
+            },
+            VaultProblem::OtherStore,
+        ] {
+            out.push(C::VaultUnreadable {
+                path: vault(),
+                problem,
+                detail: s("d"),
+            });
+        }
+        for reason in [
+            SlotRefusal::KdfTooWeak,
+            SlotRefusal::KdfOutOfRange,
+            SlotRefusal::NoUsableSlot,
+            SlotRefusal::LastRecoverySlot,
+            SlotRefusal::NoUsableSlotLeft,
+        ] {
+            out.push(C::SlotRefused {
+                store: store(),
+                reason,
+            });
+        }
+        for what in [
+            RefusedInput::TargetName,
+            RefusedInput::Token,
+            RefusedInput::NameTaken,
+        ] {
+            out.push(C::VaultUnwritable {
+                path: vault(),
+                problem: VaultWriteProblem::Refused { what },
+            });
+        }
         out
     }
 
@@ -987,7 +1408,10 @@ pub mod samples {
             | CoreError::ProviderRequestFailed { .. }
             | CoreError::ToolUnsupported { .. }
             | CoreError::Kube { .. }
-            | CoreError::AgeKeyMissing { .. } => {}
+            | CoreError::AgeKeyMissing { .. }
+            | CoreError::LockPasswordRefused { .. }
+            | CoreError::RecoveryKeyInvalid { .. }
+            | CoreError::InsecureKdfRefused { .. } => {}
         }
     }
 }
@@ -1237,6 +1661,18 @@ mod tests {
                 "AgeKeyMissing",
                 json!({"path": "/home/a/.config/apprafter/age.key"}),
             ),
+            (
+                "LockPasswordRefused",
+                json!({"reason": "too_long", "max": crate::lock::MAX_PASSWORD_BYTES}),
+            ),
+            (
+                "RecoveryKeyInvalid",
+                json!({"reason": "checksum", "group": 7}),
+            ),
+            (
+                "InsecureKdfRefused",
+                json!({"root": "/home/a/.config/apprafter"}),
+            ),
         ]
         .into_iter()
         .collect();
@@ -1354,6 +1790,320 @@ mod tests {
         ] {
             assert_eq!(miette::Diagnostic::code(&e).unwrap().to_string(), code);
         }
+    }
+
+    /// D.4a §3.12: every lock refusal of cli-core passes through with a listed code and a neutral
+    /// help — but `override_refused` (the desktop has no overrides) and `cache_undecryptable`,
+    /// which keeps its pre-D.4a projection — and no sample is missing.
+    #[test]
+    fn every_lock_refusal_has_a_listed_code_and_a_neutral_help() {
+        let undecryptable = "apprafter::secrets::cache_undecryptable";
+        let mut seen = std::collections::BTreeSet::new();
+        for e in samples::lock_errors() {
+            let code = miette::Diagnostic::code(&e).unwrap().to_string();
+            assert!(
+                codes::ALL.contains(&code.as_str()) || code == undecryptable,
+                "{code}"
+            );
+            let ui = UiError::from(&CoreError::Cli(e));
+            let without = code == codes::OVERRIDE_REFUSED || code == undecryptable;
+            assert_eq!(ui.help.is_none(), without, "{code}: {:?}", ui.help);
+            seen.insert(code);
+        }
+        for code in [
+            codes::STORE_LOCKED,
+            codes::OVERRIDE_REFUSED,
+            codes::UNLOCK_FAILED,
+            codes::STORE_CHANGED,
+            codes::TOKEN_MISSING_FROM_VAULT,
+            codes::VAULT_UNWRITABLE,
+            codes::VAULT_UNREADABLE,
+            codes::STORE_FILE_UNREADABLE,
+            codes::LOCK_INCOMPLETE,
+            codes::SLOT_REFUSED,
+            codes::CACHE_NOT_SEALED,
+            codes::TOKEN_OUTSIDE_VAULT,
+            codes::TOKEN_IN_ANOTHER_VAULT,
+            codes::VAULT_NEEDS_WRITE_LOCK,
+            codes::RANDOM_UNAVAILABLE,
+        ] {
+            assert!(
+                seen.contains(code),
+                "{code} has no sample in samples::lock_errors"
+            );
+        }
+    }
+
+    /// D.4a §3.12: the lock refusals project what the desktop reads, camelCase; the core's three
+    /// their reason and its detail.
+    #[test]
+    fn the_lock_refusals_project_their_fields() {
+        use crate::lock::{PasswordProblem, RecoveryKeyProblem};
+        use cli_core::secrets::{CacheKeyKind, CachedSecret, UndecryptableWhy};
+        use cli_core::{
+            CliError as C, DamageKind, LockPhase, LockedWhy, ProvisionedBy, RefusedInput,
+            SecretsModeKind, SlotRefusal, VaultProblem, VaultWriteProblem,
+        };
+        let cli = |e: C| json!(UiError::from(&CoreError::Cli(e)).fields);
+        let s = || std::path::PathBuf::from("/s");
+        assert_eq!(
+            cli(C::StoreLocked {
+                store: s(),
+                reason: LockedWhy::TimedOut,
+                stopped_before: Some(ProvisionedBy::Up)
+            }),
+            json!({"store": "/s", "reason": "timed_out"})
+        );
+        assert_eq!(
+            cli(C::OverrideOnLockedStore {
+                var: "HCLOUD_TOKEN",
+                store: s()
+            }),
+            json!({"var": "HCLOUD_TOKEN", "store": "/s"})
+        );
+        assert_eq!(
+            cli(C::UnlockFailed {
+                store: s(),
+                attempts: 3,
+                stopped_before: None
+            }),
+            json!({"store": "/s", "attempts": 3})
+        );
+        assert_eq!(
+            cli(C::StoreChanged {
+                store: s(),
+                prepared: SecretsModeKind::Files,
+                now: SecretsModeKind::Locked
+            }),
+            json!({"store": "/s"})
+        );
+        assert_eq!(
+            cli(C::TokenMissingFromVault {
+                target: "prod".into(),
+                store: s()
+            }),
+            json!({"target": "prod"})
+        );
+        assert_eq!(
+            cli(C::VaultUnwritable {
+                path: "/s/vault".into(),
+                problem: VaultWriteProblem::TooLarge { limit: 7 }
+            }),
+            json!({"path": "/s/vault", "problem": "too_large"})
+        );
+        assert_eq!(
+            cli(C::VaultUnwritable {
+                path: "/s/vault".into(),
+                problem: VaultWriteProblem::Refused {
+                    what: RefusedInput::Token
+                }
+            }),
+            json!({"path": "/s/vault", "problem": "refused", "what": "token"})
+        );
+        assert_eq!(
+            cli(C::VaultUnreadable {
+                path: "/s/vault".into(),
+                problem: VaultProblem::Damaged {
+                    what: DamageKind::Tampered
+                },
+                detail: "d".into()
+            }),
+            json!({"path": "/s/vault", "problem": "damaged"})
+        );
+        assert_eq!(
+            cli(C::StoreFileUnreadable {
+                path: "/s/store.yaml".into(),
+                detail: "d".into()
+            }),
+            json!({"path": "/s/store.yaml"})
+        );
+        assert_eq!(
+            cli(C::LockIncomplete {
+                store: s(),
+                phase: LockPhase::Unlocking
+            }),
+            json!({"store": "/s", "phase": "unlocking"})
+        );
+        assert_eq!(
+            cli(C::SlotRefused {
+                store: s(),
+                reason: SlotRefusal::KdfTooWeak
+            }),
+            json!({"store": "/s", "reason": "kdf_too_weak"})
+        );
+        assert_eq!(
+            cli(C::CacheNotSealed {
+                secret: CachedSecret::Kubeconfig,
+                target: "prod".into()
+            }),
+            json!({"secret": "kubeconfig", "target": "prod"})
+        );
+        assert_eq!(
+            cli(C::TokenOutsideVault {
+                target: "prod".into(),
+                path: "/s/c.yaml".into()
+            }),
+            json!({"target": "prod", "path": "/s/c.yaml"})
+        );
+        assert_eq!(
+            cli(C::TokenInAnotherVault {
+                target: "prod".into(),
+                id: "0123456789abcdef".into()
+            }),
+            json!({"target": "prod", "id": "0123456789abcdef"})
+        );
+        assert_eq!(
+            cli(C::VaultNeedsWriteLock { store: s() }),
+            json!({"store": "/s"})
+        );
+        assert_eq!(cli(C::RandomUnavailable { detail: "d".into() }), json!({}));
+        assert_eq!(
+            cli(C::CacheUndecryptable {
+                secret: CachedSecret::ArgocdPassword,
+                target: "prod".into(),
+                path: "/k".into(),
+                detail: "d".into(),
+                key: CacheKeyKind::StoreVault,
+                reason: UndecryptableWhy::Damaged,
+            }),
+            json!({"key": "store_vault", "reason": "damaged"})
+        );
+        let core = |e: CoreError| json!(UiError::from(&e).fields);
+        assert_eq!(
+            core(CoreError::LockPasswordRefused {
+                reason: PasswordProblem::RecoveryKeyShape
+            }),
+            json!({"reason": "recovery_key_shape"})
+        );
+        assert_eq!(
+            core(CoreError::RecoveryKeyInvalid {
+                reason: RecoveryKeyProblem::InvalidChar {
+                    position: 12,
+                    hint: Some('8')
+                }
+            }),
+            json!({"reason": "invalid_char", "position": 12, "hint": "8"})
+        );
+        assert_eq!(
+            core(CoreError::RecoveryKeyInvalid {
+                reason: RecoveryKeyProblem::InvalidChar {
+                    position: 12,
+                    hint: None
+                }
+            }),
+            json!({"reason": "invalid_char", "position": 12})
+        );
+        assert_eq!(
+            core(CoreError::RecoveryKeyInvalid {
+                reason: RecoveryKeyProblem::Checksum { group: None }
+            }),
+            json!({"reason": "checksum"})
+        );
+        assert_eq!(
+            core(CoreError::RecoveryKeyInvalid {
+                reason: RecoveryKeyProblem::NotConfirmed
+            }),
+            json!({"reason": "not_confirmed"})
+        );
+    }
+
+    /// D.4a O2, T25, T23: the core's own lock refusals, in words that name no secret.
+    #[test]
+    fn the_core_lock_refusals_say_why() {
+        use crate::lock::{PasswordProblem, RecoveryKeyProblem, MAX_PASSWORD_BYTES};
+        for (e, message, code) in [
+            (
+                CoreError::LockPasswordRefused {
+                    reason: PasswordProblem::Empty,
+                },
+                "a lock password cannot be empty",
+                codes::PASSWORD_REFUSED,
+            ),
+            (
+                CoreError::LockPasswordRefused {
+                    reason: PasswordProblem::TooLong {
+                        max: MAX_PASSWORD_BYTES,
+                    },
+                },
+                "a lock password can be at most 1024 bytes long",
+                codes::PASSWORD_REFUSED,
+            ),
+            (
+                CoreError::LockPasswordRefused {
+                    reason: PasswordProblem::RecoveryKeyShape,
+                },
+                "that password has the shape of a recovery key, and a lock password must not",
+                codes::PASSWORD_REFUSED,
+            ),
+            (
+                CoreError::RecoveryKeyInvalid {
+                    reason: RecoveryKeyProblem::Checksum { group: Some(4) },
+                },
+                "the recovery key is mistyped near group 4",
+                codes::RECOVERY_KEY_INVALID,
+            ),
+            // 1-based for a person; the field stays c1's 0-based count.
+            (
+                CoreError::RecoveryKeyInvalid {
+                    reason: RecoveryKeyProblem::InvalidChar {
+                        position: 0,
+                        hint: Some('l'),
+                    },
+                },
+                "character 1 of the recovery key is not one a recovery key uses",
+                codes::RECOVERY_KEY_INVALID,
+            ),
+            (
+                CoreError::RecoveryKeyInvalid {
+                    reason: RecoveryKeyProblem::Mismatch,
+                },
+                "that is not the recovery key shown",
+                codes::RECOVERY_KEY_INVALID,
+            ),
+            (
+                CoreError::RecoveryKeyInvalid {
+                    reason: RecoveryKeyProblem::NotConfirmed,
+                },
+                "the recovery key was not typed back, so nothing was locked",
+                codes::RECOVERY_KEY_INVALID,
+            ),
+            (
+                CoreError::InsecureKdfRefused { root: "/s".into() },
+                "this test build of AppRafter derives keys with weak parameters, so it creates no \
+              lock password outside its sandbox, and /s is outside it",
+                codes::INSECURE_KDF_REFUSED,
+            ),
+        ] {
+            assert_eq!(e.to_string(), message);
+            assert_eq!(e.code().unwrap().to_string(), code);
+        }
+        use crate::vault::RecoveryKeyError;
+        // The look-alike a person most likely meant, never the character typed (T24); c1
+        // names a typed character only when it is one of the four (`None` for any other).
+        for (lookalike, hint) in [
+            (Some('o'), Some('0')),
+            (Some('i'), Some('l')),
+            (Some('1'), Some('l')),
+            (Some('b'), Some('8')),
+            (None, None),
+        ] {
+            assert_eq!(
+                RecoveryKeyProblem::from(RecoveryKeyError::InvalidChar {
+                    position: 3,
+                    lookalike
+                }),
+                RecoveryKeyProblem::InvalidChar { position: 3, hint },
+                "{lookalike:?}"
+            );
+        }
+        assert_eq!(
+            RecoveryKeyProblem::from(RecoveryKeyError::Checksum { group: Some(2) }),
+            RecoveryKeyProblem::Checksum { group: Some(2) }
+        );
+        assert_eq!(
+            RecoveryKeyProblem::from(RecoveryKeyError::Mismatch),
+            RecoveryKeyProblem::Mismatch
+        );
     }
 
     #[test]
@@ -1482,6 +2232,20 @@ mod tests {
             codes::SSH_KEY_NOT_PUBLIC,
             codes::INVALID_TARGET_CONFIG,
             codes::IO_ERROR,
+            codes::STORE_LOCKED,
+            codes::UNLOCK_FAILED,
+            codes::STORE_CHANGED,
+            codes::TOKEN_MISSING_FROM_VAULT,
+            codes::VAULT_UNWRITABLE,
+            codes::VAULT_UNREADABLE,
+            codes::STORE_FILE_UNREADABLE,
+            codes::LOCK_INCOMPLETE,
+            codes::SLOT_REFUSED,
+            codes::CACHE_NOT_SEALED,
+            codes::TOKEN_OUTSIDE_VAULT,
+            codes::TOKEN_IN_ANOTHER_VAULT,
+            codes::VAULT_NEEDS_WRITE_LOCK,
+            codes::RANDOM_UNAVAILABLE,
         ] {
             assert!(helped.contains(code), "{code} has no neutral help");
         }

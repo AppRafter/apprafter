@@ -42,6 +42,59 @@ impl CachedSecret {
             CachedSecret::ArgocdPassword => "Argo CD admin password",
         }
     }
+
+    /// Its name on the wire (`fields.secret`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CachedSecret::Kubeconfig => "kubeconfig",
+            CachedSecret::ArgocdPassword => "argocd_password",
+        }
+    }
+}
+
+/// The key a cached secret was tried with (D.4a T26, T38): the one shared age key file every
+/// target store in files uses, or a locked store's own identity, which only its vault holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheKeyKind {
+    SharedFile,
+    StoreVault,
+}
+
+impl CacheKeyKind {
+    /// Its name on the wire (`fields.key`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CacheKeyKind::SharedFile => "shared_file",
+            CacheKeyKind::StoreVault => "store_vault",
+        }
+    }
+}
+
+/// Why a cached secret did not open (D.4a §3.12): it was not encrypted to the key it was tried
+/// with (age's `NoMatchingKeys`, or a passphrase-protected file), or it is damaged (anything
+/// else age refuses: an unreadable header, a wrong MAC, a broken payload).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UndecryptableWhy {
+    NotForThisKey,
+    Damaged,
+}
+
+impl UndecryptableWhy {
+    /// Its name on the wire (`fields.reason`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UndecryptableWhy::NotForThisKey => "not_for_this_key",
+            UndecryptableWhy::Damaged => "damaged",
+        }
+    }
+}
+
+/// A cached secret that did not open: why, and the age library's account, worded exactly as
+/// [`decrypt_with_identity`]'s error has always worded it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Undecryptable {
+    pub why: UndecryptableWhy,
+    pub detail: String,
 }
 
 /// The age key path from explicit inputs: the override verbatim (even empty), else
@@ -158,25 +211,47 @@ pub fn encrypt_for_recipient(plaintext: &str, recipient: &Recipient) -> Result<S
 
 /// Decrypt ASCII-armored ciphertext with the given identity.
 pub fn decrypt_with_identity(armored: &str, identity: &Identity) -> Result<String> {
+    decrypt_with_identity_reason(armored, identity).map_err(|u| CliError::Other(u.detail))
+}
+
+/// [`decrypt_with_identity`], telling a ciphertext for another key from a damaged one
+/// ([`UndecryptableWhy`]). Only the shared core's secret store calls it (D.4a T16,
+/// `apprafter-core/tests/guards.rs`).
+pub fn decrypt_with_identity_reason(
+    armored: &str,
+    identity: &Identity,
+) -> std::result::Result<String, Undecryptable> {
+    let damaged = |detail: String| Undecryptable {
+        why: UndecryptableWhy::Damaged,
+        detail,
+    };
     let reader = ArmoredReader::new(armored.as_bytes());
     // age 0.11 collapsed the `Decryptor::{Recipients,Passphrase}` enum into an
     // opaque struct; passphrase mode is now asked about rather than matched on.
     // `is_scrypt()` is the same question the old `Passphrase(_)` arm answered —
     // an scrypt recipient stanza IS the passphrase mode.
-    let decryptor = age::Decryptor::new(reader)
-        .map_err(|e| CliError::Other(format!("age decryptor init: {e}")))?;
+    let decryptor =
+        age::Decryptor::new(reader).map_err(|e| damaged(format!("age decryptor init: {e}")))?;
     if decryptor.is_scrypt() {
-        return Err(CliError::Other(
-            "age ciphertext is passphrase-protected; AppRafter expects recipient mode".to_string(),
-        ));
+        return Err(Undecryptable {
+            why: UndecryptableWhy::NotForThisKey,
+            detail: "age ciphertext is passphrase-protected; AppRafter expects recipient mode"
+                .to_string(),
+        });
     }
     let mut reader = decryptor
         .decrypt(std::iter::once(identity as &dyn age::Identity))
-        .map_err(|e| CliError::Other(format!("age decrypt: {e}")))?;
+        .map_err(|e| Undecryptable {
+            why: match &e {
+                age::DecryptError::NoMatchingKeys => UndecryptableWhy::NotForThisKey,
+                _ => UndecryptableWhy::Damaged,
+            },
+            detail: format!("age decrypt: {e}"),
+        })?;
     let mut out = String::new();
     reader
         .read_to_string(&mut out)
-        .map_err(|e| CliError::Other(format!("age read plaintext: {e}")))?;
+        .map_err(|e| damaged(format!("age read plaintext: {e}")))?;
     Ok(out)
 }
 
@@ -195,6 +270,69 @@ mod tests {
         );
         let plain = decrypt_with_identity(&armored, &identity).unwrap();
         assert_eq!(plain, "hello apprafter");
+    }
+
+    /// D.4a §3.12: a cache encrypted to another key is "not for this key", and its words are the
+    /// ones `decrypt_with_identity` has always given (the goldens that show them stay as they are).
+    #[test]
+    fn a_cache_for_another_key_is_not_for_this_key_and_reads_as_before() {
+        let a = Identity::generate();
+        let b = Identity::generate();
+        let armored = encrypt_for_recipient("x", &a.to_public()).unwrap();
+        let why = decrypt_with_identity_reason(&armored, &b).unwrap_err();
+        assert_eq!(why.why, UndecryptableWhy::NotForThisKey);
+        assert!(why.detail.starts_with("age decrypt: "), "{}", why.detail);
+        match decrypt_with_identity(&armored, &b) {
+            Err(CliError::Other(text)) => assert_eq!(text, why.detail),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(decrypt_with_identity_reason(&armored, &a).unwrap(), "x");
+    }
+
+    /// Anything age refuses but a missing key is damage: a file that is not age, and a payload
+    /// with one character of its armour changed.
+    #[test]
+    fn a_damaged_cache_is_damaged() {
+        let a = Identity::generate();
+        let not_age = decrypt_with_identity_reason("not an age file", &a).unwrap_err();
+        assert_eq!(not_age.why, UndecryptableWhy::Damaged);
+        assert!(
+            not_age.detail.starts_with("age decryptor init: "),
+            "{}",
+            not_age.detail
+        );
+        let armored = encrypt_for_recipient(&"x".repeat(600), &a.to_public()).unwrap();
+        let mut lines: Vec<String> = armored.lines().map(str::to_string).collect();
+        // The last armour line before `-----END …-----` is deep in the payload.
+        let at = lines.len() - 2;
+        let first = lines[at].remove(0);
+        lines[at].insert(0, if first == 'A' { 'B' } else { 'A' });
+        let broken = format!("{}\n", lines.join("\n"));
+        let e = decrypt_with_identity_reason(&broken, &a).unwrap_err();
+        assert_eq!(e.why, UndecryptableWhy::Damaged, "{}", e.detail);
+    }
+
+    /// A passphrase-protected file was not written by AppRafter: not for this key.
+    #[test]
+    fn a_passphrase_cache_is_not_for_this_key() {
+        let mut r = age::scrypt::Recipient::new(age::secrecy::SecretString::from("pw".to_string()));
+        r.set_work_factor(1);
+        let enc =
+            age::Encryptor::with_recipients(std::iter::once(&r as &dyn age::Recipient)).unwrap();
+        let mut out = Vec::new();
+        let mut w = enc
+            .wrap_output(ArmoredWriter::wrap_output(&mut out, Format::AsciiArmor).unwrap())
+            .unwrap();
+        w.write_all(b"x").unwrap();
+        w.finish().unwrap().finish().unwrap();
+        let e =
+            decrypt_with_identity_reason(std::str::from_utf8(&out).unwrap(), &Identity::generate())
+                .unwrap_err();
+        assert_eq!(e.why, UndecryptableWhy::NotForThisKey);
+        assert_eq!(
+            e.detail,
+            "age ciphertext is passphrase-protected; AppRafter expects recipient mode"
+        );
     }
 
     #[test]
