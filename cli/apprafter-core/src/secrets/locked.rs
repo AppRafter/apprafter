@@ -19,7 +19,7 @@ use zeroize::Zeroizing;
 use super::access::KeySession;
 use super::files::under_temp;
 use super::marker::{classify, write_marker, Marker};
-use super::store_file::StoreId;
+use super::store_file::{read_store_file, write_store_file, StoreId};
 use crate::context::SecretString;
 use crate::vault::{
     self, OsRandom, PayloadWhat, UnlockedVault, VaultError, VaultFile, FORMAT_V1, VAULT_FILE,
@@ -193,7 +193,7 @@ pub(crate) fn vault_error(root: &Path, e: VaultError) -> CliError {
 /// A setter's refusal of a value the vault cannot hold (c1's `PayloadInvalid` from
 /// `set_hetzner_token` and `rename_target`), refused before anything is written:
 /// `vault_unwritable{refused}`, never a damaged vault. Anything else is [`vault_error`]'s.
-fn vault_write_error(root: &Path, e: VaultError) -> CliError {
+pub(crate) fn vault_write_error(root: &Path, e: VaultError) -> CliError {
     let refused = |what: RefusedInput| CliError::VaultUnwritable {
         path: vault_path(root),
         problem: VaultWriteProblem::Refused { what },
@@ -216,7 +216,7 @@ fn vault_write_error(root: &Path, e: VaultError) -> CliError {
 /// marker or the caller's directory move relies on them (overview §8 risk 10): c1's `replace`
 /// syncs the directory best effort only. A failure is an error, and nothing that relies on the
 /// vault is written. Unix; Windows has no directory fsync (c1's Risks 5).
-fn sync_root(store: &TargetStorePaths) -> Result<()> {
+pub(crate) fn sync_root(store: &TargetStorePaths) -> Result<()> {
     #[cfg(unix)]
     {
         let root = store.root();
@@ -265,7 +265,7 @@ fn write_back(
 }
 
 /// A vault that, read back after a write, does not hold what was written.
-fn not_kept(store: &TargetStorePaths, what: &str) -> CliError {
+pub(crate) fn not_kept(store: &TargetStorePaths, what: &str) -> CliError {
     CliError::VaultUnreadable {
         path: vault_path(store.root()),
         problem: VaultProblem::Damaged {
@@ -398,6 +398,37 @@ pub(super) fn rename_token(
     );
     if from_now.is_some() || to_now.as_ref() != Some(&moved) {
         return Err(not_kept(store, "the rename"));
+    }
+    Ok(())
+}
+
+/// The store's default unlock window, `minutes` (D.4a T33): the vault's entry, then `store.yaml`'s
+/// display copy. The caller checked the lock state, that `held` is held and the range.
+pub(super) fn set_unlock_timeout(
+    store: &TargetStorePaths,
+    id: &StoreId,
+    key: &KeySession,
+    held: &StoreLock,
+    writer: &str,
+    minutes: u32,
+) -> Result<()> {
+    let mut opened = open_current(store, id, key)?;
+    opened
+        .payload_mut()
+        .set_unlock_timeout_min(minutes)
+        .map_err(|e| vault_write_error(store.root(), e))?;
+    write_back(store, &opened, held, writer)?;
+    let kept = open_current(store, id, key)?
+        .payload()
+        .unlock_timeout_min()
+        .map_err(|e| vault_error(store.root(), e))?;
+    if kept != minutes {
+        return Err(not_kept(store, "the new unlock window"));
+    }
+    sync_root(store)?;
+    if let Some(mut file) = read_store_file(store.root())? {
+        file.unlock_timeout_min = Some(minutes);
+        write_store_file(store.root(), &file, held)?;
     }
     Ok(())
 }

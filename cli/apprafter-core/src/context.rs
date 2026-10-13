@@ -36,9 +36,13 @@ use zeroize::Zeroizing;
 
 use crate::env::EnvSource;
 use crate::error::{CoreError, CoreResult};
+#[cfg(any(test, feature = "test-support"))]
+use crate::lock::FaultPoint;
 use crate::net::DeadlineResolver;
 use crate::secrets::{NoVaultAccess, SecretStore, VaultAccess};
 use crate::tools::ToolResolver;
+#[cfg(any(test, feature = "test-support"))]
+use crate::vault::KdfPolicy;
 
 /// Points every Hetzner call at another base URL (integration tests).
 pub const HCLOUD_BASE_URL_ENV: &str = "APPRAFTER_HCLOUD_BASE_URL";
@@ -49,6 +53,10 @@ pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The tool search path variable.
 pub const PATH_ENV: &str = "PATH";
+
+/// The fence the CLI's callers set (`platform-cli/src/sandbox.rs`): in an `insecure-fast-kdf`
+/// build its directories are also where a password slot may be created (D.4a T23).
+pub const SANDBOX_ENV: &str = "APPRAFTER_SANDBOX";
 
 /// A string whose `Debug` never shows the value and whose memory is zeroed on drop.
 #[derive(Clone, PartialEq, Eq)]
@@ -192,6 +200,14 @@ pub struct Context {
     no_ping: bool,
     /// How a locked store's secrets open here (D.4a T12): the client's, else `NoVaultAccess`.
     vault_access: Arc<dyn VaultAccess>,
+    /// Where an `insecure-fast-kdf` build may create a password slot (D.4a T23, critic S2).
+    insecure_kdf_roots: Vec<PathBuf>,
+    /// The KDF policy an in-process test runs the lock flows under (`test-support`).
+    #[cfg(any(test, feature = "test-support"))]
+    kdf_policy: Option<&'static KdfPolicy>,
+    /// The step an in-process test interrupts a lock flow at (`test-support`, critic G12).
+    #[cfg(any(test, feature = "test-support"))]
+    fault: Option<FaultPoint>,
     /// Rebuilt by [`Context::with_request_timeout`].
     http: ureq::Agent,
 }
@@ -220,6 +236,8 @@ impl Context {
     /// - `HCLOUD_TOKEN` when set and non-empty;
     /// - `APPRAFTER_AGE_KEY` and `CUE_BIN` when set, even empty;
     /// - `PATH` (raw, through [`EnvSource::var_os`]) as the tool search path.
+    /// - `APPRAFTER_SANDBOX`, in an `insecure-fast-kdf` build only, as
+    ///   [`Context::insecure_kdf_roots`].
     ///
     /// The home directory comes from `cli_core::paths::home_dir()`; the
     /// runtime dir is `<config_root>/run`.
@@ -239,7 +257,7 @@ impl Context {
         };
         let home_dir = cli_core::paths::home_dir();
         let runtime_dir = config_root.join("run");
-        Ok(Self::assemble(
+        let ctx = Self::assemble(
             config_root,
             hcloud_base_url,
             overrides,
@@ -247,7 +265,18 @@ impl Context {
             env.var_os(PATH_ENV).unwrap_or_default(),
             PathSource::Environment,
             runtime_dir,
-        ))
+        );
+        // D.4a T23: a feature build creates a password slot only under the CLI's fence; a
+        // release build reads nothing here, and its list stays empty.
+        #[cfg(feature = "insecure-fast-kdf")]
+        let ctx = Context {
+            insecure_kdf_roots: env
+                .var_os(SANDBOX_ENV)
+                .map(|v| std::env::split_paths(&v).collect())
+                .unwrap_or_default(),
+            ..ctx
+        };
+        Ok(ctx)
     }
 
     /// The desktop's context, read from an allow-list of its environment.
@@ -340,6 +369,11 @@ impl Context {
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             no_ping: false,
             vault_access: Arc::new(NoVaultAccess),
+            insecure_kdf_roots: Vec::new(),
+            #[cfg(any(test, feature = "test-support"))]
+            kdf_policy: None,
+            #[cfg(any(test, feature = "test-support"))]
+            fault: None,
             http: http_agent(DEFAULT_REQUEST_TIMEOUT),
         }
     }
@@ -387,6 +421,46 @@ impl Context {
 
     pub fn vault_access(&self) -> &Arc<dyn VaultAccess> {
         &self.vault_access
+    }
+
+    /// Where an `insecure-fast-kdf` build may create a password slot (D.4a T23, critic S2): the
+    /// CLI's `APPRAFTER_SANDBOX` (feature builds), the desktop test build's (d4a-g), or a test's
+    /// [`Context::with_insecure_kdf_root`]. Always empty in a release build.
+    pub fn insecure_kdf_roots(&self) -> &[PathBuf] {
+        &self.insecure_kdf_roots
+    }
+
+    /// Tests: `dir` may hold a store a weak policy creates a password slot for.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_insecure_kdf_root(mut self, dir: PathBuf) -> Self {
+        self.insecure_kdf_roots.push(dir);
+        self
+    }
+
+    /// Tests: the lock flows run under `policy` (`KdfPolicy::INSECURE_FAST` in core tests).
+    /// Never named by the CLI or the desktop (L6).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_kdf_policy(mut self, policy: &'static KdfPolicy) -> Self {
+        self.kdf_policy = Some(policy);
+        self
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn kdf_policy_override(&self) -> Option<&'static KdfPolicy> {
+        self.kdf_policy
+    }
+
+    /// Tests: the lock flows fail at `at` as if the process died there — the only way to arm a
+    /// [`FaultPoint`] (critic G12; L6).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_fault(mut self, at: FaultPoint) -> Self {
+        self.fault = Some(at);
+        self
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn fault(&self) -> Option<FaultPoint> {
+        self.fault
     }
 
     pub fn config_root(&self) -> &Path {

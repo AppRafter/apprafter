@@ -222,6 +222,142 @@ fn failed(root: &Path, e: VaultError) -> CoreError {
     }
 }
 
+/// O2 (decided 2026-10-13): a new lock password is refused only when it is empty, longer than
+/// [`MAX_PASSWORD_BYTES`] or shaped like a recovery key (`password_refused`); below
+/// [`RECOMMENDED_PASSWORD_CHARS`] Unicode scalar values it is advice ([`PasswordAdvice::Short`]),
+/// which the CLI asks about and the desktop shows — never a refusal.
+pub fn check_password(
+    password: &crate::context::SecretString,
+) -> CoreResult<Option<PasswordAdvice>> {
+    let accepted = crate::vault::check_new_password(password)
+        .map_err(|reason| CoreError::LockPasswordRefused { reason })?;
+    Ok(accepted.is_short().then(|| PasswordAdvice::Short {
+        chars: u32::try_from(accepted.chars()).unwrap_or(u32::MAX),
+        recommended: RECOMMENDED_PASSWORD_CHARS as u32,
+    }))
+}
+
+/// `lock on --timeout <minutes>` on a locked store (D.4a T33, O11): the store's default unlock
+/// window, written to its vault with a key this process opens — it asks even where a window is
+/// open — under the store's write lock. The minutes set.
+pub fn set_unlock_timeout(
+    ctx: &crate::context::Context,
+    minutes: u32,
+    reporter: &dyn crate::report::Reporter,
+) -> CoreResult<u32> {
+    super::check_timeout(minutes)?;
+    let secrets = ctx.secrets();
+    let key = secrets.prepare_write()?;
+    let held = crate::target::lock_store(ctx, reporter)?;
+    secrets.set_unlock_timeout(&key, &held, minutes)?;
+    Ok(minutes)
+}
+
+/// One slot of a store's vault, opened in this process by a secret of that slot's own kind
+/// (D.4a rule 4; team decision 2026-10-13): what a resumed `lock on` needs twice — the
+/// password slot and the recovery slot — before any clear datum goes. Made only by
+/// [`open_slot_at`], so its kind is the slot that opened, never a caller's claim.
+#[derive(Debug)]
+pub struct SlotOpened {
+    kind: crate::secrets::LockSlotKind,
+    opened: OpenedVault,
+}
+
+impl SlotOpened {
+    /// The kind of slot that opened the vault.
+    pub fn kind(&self) -> crate::secrets::LockSlotKind {
+        self.kind
+    }
+
+    /// The vault it opened: its data key, for that vault.
+    pub fn opened(&self) -> &OpenedVault {
+        &self.opened
+    }
+}
+
+/// Opens the vault of the store at `root` (`id`) with `secret` as the secret of a `kind` slot,
+/// and of no other kind: a lock password tries the password slots only, so a recovery key typed
+/// there opens nothing; a recovery key is parsed first (`recovery_key_invalid` naming its group,
+/// one attempt) and tries the recovery slots only. A secret no slot of that kind takes is
+/// `unlock_failed`, one attempt, for the caller to count. Any other kind is the caller's
+/// mistake: `usage_refused`.
+pub fn open_slot_at(
+    root: &Path,
+    id: &StoreId,
+    kind: crate::secrets::LockSlotKind,
+    secret: crate::context::SecretString,
+    policy: &KdfPolicy,
+) -> CoreResult<SlotOpened> {
+    use crate::secrets::LockSlotKind;
+    let input = match kind {
+        LockSlotKind::Password => SlotInput::Password(secret),
+        LockSlotKind::RecoveryKey => SlotInput::RecoveryKey(
+            crate::vault::RecoveryKey::parse(secret.expose())
+                .map_err(|e| CoreError::RecoveryKeyInvalid { reason: e.into() })?,
+        ),
+        other => {
+            return Err(CoreError::Cli(CliError::UsageRefused {
+                message: format!(
+                    "a `{}` slot is not opened with a typed secret",
+                    other.as_str()
+                ),
+                help: "Open the vault with the lock password or the recovery key.".to_string(),
+            }))
+        }
+    };
+    Ok(SlotOpened {
+        kind,
+        opened: open_at(root, id, input, policy)?,
+    })
+}
+
+#[cfg(test)]
+mod check_password_tests {
+    use super::*;
+    use crate::context::SecretString;
+
+    fn advice(text: &str) -> CoreResult<Option<PasswordAdvice>> {
+        check_password(&SecretString::new(text))
+    }
+
+    fn a_recovery_key() -> String {
+        crate::vault::RecoveryKey::generate(&mut crate::vault::OsRandom)
+            .unwrap()
+            .to_display()
+            .expose()
+            .to_string()
+    }
+
+    /// O2 (decided 2026-10-13): no minimum — under 15 Unicode scalar values is advice, never a
+    /// refusal; refused only empty, over 1024 bytes, or shaped like a recovery key. The same
+    /// table as the desktop's bun test (an emoji is one, a combining mark one more).
+    #[test]
+    fn a_short_password_is_advice_and_three_shapes_are_refused() {
+        let short = |chars: u32| {
+            Some(PasswordAdvice::Short {
+                chars,
+                recommended: 15,
+            })
+        };
+        assert_eq!(advice(&"a".repeat(14)).unwrap(), short(14));
+        assert_eq!(advice(&"a".repeat(15)).unwrap(), None);
+        assert_eq!(advice(&"\u{1F600}".repeat(14)).unwrap(), short(14));
+        assert_eq!(advice(&"e\u{301}".repeat(7)).unwrap(), short(14));
+        assert_eq!(advice(&format!("{}x", "e\u{301}".repeat(7))).unwrap(), None);
+        assert_eq!(advice("a").unwrap(), short(1));
+        for (text, reason) in [
+            (String::new(), PasswordProblem::Empty),
+            ("a".repeat(1025), PasswordProblem::TooLong { max: 1024 }),
+            (a_recovery_key(), PasswordProblem::RecoveryKeyShape),
+        ] {
+            assert!(
+                matches!(advice(&text).unwrap_err(), CoreError::LockPasswordRefused { reason: r } if r == reason),
+                "{reason:?}"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod open_at_tests {
     use super::*;

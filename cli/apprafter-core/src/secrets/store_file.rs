@@ -190,7 +190,7 @@ pub fn read_store_file(root: &Path) -> cli_core::Result<Option<StoreFile>> {
 }
 
 /// Whether `<root>/vault` exists; "no" is `NotFound` only (T31). A dangling link exists.
-fn vault_exists(root: &Path) -> cli_core::Result<bool> {
+pub(crate) fn vault_exists(root: &Path) -> cli_core::Result<bool> {
     let vault = root.join(VAULT_FILE);
     match std::fs::symlink_metadata(&vault) {
         Ok(_) => Ok(true),

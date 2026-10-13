@@ -11,9 +11,98 @@ use serde::Serialize;
 
 use crate::secrets::{LockSlotKind, SecretsMode};
 
+pub mod faults;
+pub mod on;
+#[cfg(test)]
+mod on_tests;
 pub mod open;
 
-pub use open::{open_at, OpenedVault};
+pub use faults::FaultPoint;
+pub use on::{
+    execute_on, plan_on, CacheDrop, DroppedCache, LockOnInput, LockOnPayload, LockOnStart,
+    LockedOn, PASSWORD_LABEL, RECOVERY_LABEL,
+};
+pub use open::{
+    check_password, open_at, open_slot_at, set_unlock_timeout, OpenedVault, SlotOpened,
+};
+
+use std::path::{Path, PathBuf};
+
+use crate::context::Context;
+use crate::error::{CoreError, CoreResult};
+use crate::vault::{KdfPolicy, MAX_UNLOCK_TIMEOUT_MIN};
+
+/// The KDF policy the lock flows run under: an in-process test's (`Context::with_kdf_policy`),
+/// else this build's.
+pub(crate) fn kdf_policy(ctx: &Context) -> &'static KdfPolicy {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(policy) = ctx.kdf_policy_override() {
+        return policy;
+    }
+    #[cfg(not(any(test, feature = "test-support")))]
+    let _ = ctx;
+    KdfPolicy::active()
+}
+
+/// Whether a password slot may be created for `ctx`'s store (D.4a T23, critic S2): always under
+/// release parameters; under weak ones only when the store's root lies under one of
+/// `Context::insecure_kdf_roots` — a test build never writes a slot guessable at microseconds
+/// per try into a real store.
+pub fn insecure_kdf_permitted(ctx: &Context) -> bool {
+    if kdf_policy(ctx).is_release() {
+        return true;
+    }
+    let Some(root) = canonical(ctx.config_root()) else {
+        return false;
+    };
+    ctx.insecure_kdf_roots()
+        .iter()
+        .filter_map(|r| r.canonicalize().ok())
+        .any(|r| root.starts_with(&r))
+}
+
+/// [`insecure_kdf_permitted`] as the refusal the flows raise, before anything is asked.
+pub(crate) fn permit(ctx: &Context) -> CoreResult<()> {
+    if insecure_kdf_permitted(ctx) {
+        Ok(())
+    } else {
+        Err(CoreError::InsecureKdfRefused {
+            root: ctx.config_root().to_path_buf(),
+        })
+    }
+}
+
+/// A window of more than a day is refused (O3), before anything is asked.
+pub(crate) fn check_timeout(minutes: u32) -> CoreResult<()> {
+    if minutes <= MAX_UNLOCK_TIMEOUT_MIN {
+        return Ok(());
+    }
+    Err(CoreError::Cli(cli_core::CliError::UsageRefused {
+        message: format!(
+            "an unlock window lasts at most {MAX_UNLOCK_TIMEOUT_MIN} minutes, and {minutes} \
+             were asked for"
+        ),
+        help: "Pass `--timeout` with a number of minutes from 0 to 1440.".to_string(),
+    }))
+}
+
+/// `path` with its deepest existing ancestor canonical and the rest appended: the root of a
+/// store that `lock on` creates may not exist yet.
+fn canonical(path: &Path) -> Option<PathBuf> {
+    let mut tail = Vec::new();
+    let mut at = path;
+    loop {
+        if let Ok(found) = at.canonicalize() {
+            let mut out = found;
+            for part in tail.iter().rev() {
+                out.push(part);
+            }
+            return Some(out);
+        }
+        tail.push(at.file_name()?.to_os_string());
+        at = at.parent()?;
+    }
+}
 
 pub use open::{
     PasswordAdvice, PasswordProblem, RecoveryKeyProblem, MAX_PASSWORD_BYTES,

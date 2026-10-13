@@ -48,6 +48,7 @@ pub mod store_file;
 pub mod testing;
 #[cfg(test)]
 mod tests;
+pub(crate) mod transfer;
 
 #[cfg(any(test, feature = "test-support"))]
 pub use access::FixedVaultAccess;
@@ -58,9 +59,11 @@ pub use store_file::{
     STORE_FILE_FORMAT,
 };
 
-/// The vault boundary the lock flows share with the store (D.4a d): read a store's vault after
-/// checking it is this store's, and word a vault failure as the store does.
-pub(crate) use locked::{read_vault, vault_error};
+/// The vault boundary the lock flows share with the store (D.4a d).
+pub(crate) use locked::{
+    not_kept, read_vault, sync_root, vault_error, vault_path, vault_write_error,
+};
+pub(crate) use store_file::vault_exists as vault_on_disk;
 
 /// Where a store's secrets are; read from `<root>/store.yaml` on every call, never cached. No
 /// `store.yaml` is `Files` (D.4a T31).
@@ -505,6 +508,28 @@ impl SecretStore {
             WriteFor::Locked { id, key } => {
                 let writer = self.access.writer();
                 locked::rename_token(&self.store, id, key, held, &writer, from, to)
+            }
+        }
+    }
+
+    /// The store's default unlock window, in its vault (authoritative, T33) and `store.yaml`'s
+    /// display copy: a vault write, with the key [`SecretStore::prepare_write`] gave.
+    pub fn set_unlock_timeout(
+        &self,
+        key: &WriteKey,
+        held: &StoreLock,
+        minutes: u32,
+    ) -> cli_core::Result<()> {
+        self.recheck(key, held)?;
+        match &key.0 {
+            WriteFor::Files => Err(CliError::Other(format!(
+                "the target store at {} is not locked: `apprafter lock on --timeout <minutes>` \
+                 sets its window as it locks it; nothing was written",
+                self.store.root().display()
+            ))),
+            WriteFor::Locked { id, key } => {
+                let writer = self.access.writer();
+                locked::set_unlock_timeout(&self.store, id, key, held, &writer, minutes)
             }
         }
     }

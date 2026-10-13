@@ -28,6 +28,9 @@
 //!    T16), and the same holds in `platform-cli/src`, where only the seal itself is not a door
 //!    (its recipient must be a `CacheKey`'s) and the two loads of the shared key
 //!    [`CLI_KEY_CREATION_SITES`] lists are allowed once each, until d4a-d moves them.
+//!    The vault's own doors ([`VAULT_DOORS`]) are named only in `src/secrets/`, `src/lock/` and
+//!    `src/vault/`, and never in `platform-cli` or the desktop; the lock flows' file doors
+//!    ([`TRANSFER_DOOR`]) only in `src/secrets/` and `src/lock/`.
 //! 6. **Test-only key derivation stays in tests (L4).** No manifest under `cli/` or
 //!    `desktop/` turns on `apprafter-core/insecure-fast-kdf` outside `[dev-dependencies]`,
 //!    except the desktop's `test-build` ([`INSECURE_KDF_FORWARDERS`]), and none of the
@@ -36,6 +39,8 @@
 //!    key material ([`VAULT_SECRET_NAMES`]; `subtle::ConstantTimeEq` only, at least
 //!    [`VAULT_CT_EQ_MIN`] times), no argon2 call allocates its own working memory
 //!    ([`UNZEROED_ARGON2`]), and no type derives `Serialize` or `Deserialize` (D.4a T17, T29).
+//! 8. **L6.** `platform-cli` and the desktop never name a lock flow's fault or its test KDF
+//!    policy ([`TEST_ONLY_LOCK_KNOBS`]).
 //!
 //! The scan reads syntax trees (`syn`), not text, so neither a comment nor
 //! a string can hide or fake a hit, and nothing depends on where an item
@@ -222,6 +227,28 @@ const SECRET_DOOR_METHODS: &[&str] = &["target_credentials_file"];
 const SEAL: &str = "cli_core::secrets::encrypt_for_recipient";
 const RECIPIENT_METHOD: &str = "recipient";
 
+/// The vault's own doors (c1's hand-off; D.4a T16): its file reads and writes, and the one type
+/// that parses and opens a vault. In `apprafter-core/src` only `secrets/`, `lock/` and `vault/`
+/// itself may name them; `platform-cli` and the desktop never do — they open a store through
+/// `lock::open_at` and `Context::secrets()`.
+const VAULT_DOORS: &[&str] = &[
+    "crate::vault::file",
+    "crate::vault::VaultFile",
+    "apprafter_core::vault::file",
+    "apprafter_core::vault::VaultFile",
+];
+
+/// What the lock flows move between a store's files and its vault (D.4a T16; critic finding
+/// 9): `secrets::transfer` reads credentials files, writes clear tokens and seals caches, so
+/// only the secret store and the lock flows name it. It is `pub(crate)`: outside the core it
+/// cannot be named at all.
+const TRANSFER_DOOR: &str = "crate::secrets::transfer";
+
+/// L6 (D.4a critic G12): what only an in-process core test may name — the fault a lock flow
+/// is interrupted at, and the weak KDF policy it runs under. The CLI and the desktop never do,
+/// in code or tests, so no build of them arms a fault or weakens a policy.
+const TEST_ONLY_LOCK_KNOBS: &[&str] = &["FaultPoint", "with_fault", "with_kdf_policy"];
+
 /// Crates `apprafter-core` must not depend on: a client prompts, draws
 /// progress, renders tables and colours, and handles signals.
 ///
@@ -276,6 +303,10 @@ enum Kind {
     /// One of [`SECRET_DOORS`] or [`SECRET_DOOR_METHODS`]: allowed only under
     /// `apprafter-core/src/secrets/`.
     SecretDoor,
+    /// One of [`VAULT_DOORS`]: allowed only under `apprafter-core/src/{secrets,lock,vault}/`.
+    VaultDoor,
+    /// [`TRANSFER_DOOR`]: allowed only under `apprafter-core/src/{secrets,lock}/`.
+    TransferDoor,
     /// A call of [`SEAL`] whose recipient is not `<key>.recipient()` (a `CacheKey`'s), anywhere.
     ForeignRecipient,
     /// A per-user runtime path or a Windows pipe name outside [`ENDPOINT_LITERALS`] (G2).
@@ -608,6 +639,12 @@ impl<'f> Scanner<'f> {
         }
         if let Some(entry) = SECRET_DOORS.iter().find(|e| path_matches(path, e)) {
             return Some((Kind::SecretDoor, entry.to_string()));
+        }
+        if let Some(entry) = VAULT_DOORS.iter().find(|e| path_matches(path, e)) {
+            return Some((Kind::VaultDoor, entry.to_string()));
+        }
+        if path_matches(path, TRANSFER_DOOR) {
+            return Some((Kind::TransferDoor, TRANSFER_DOOR.to_string()));
         }
         // A sanctioned callee is allowed when ANY entry pairs it with the
         // current site, and forbidden everywhere else.
@@ -1237,7 +1274,12 @@ fn the_core_never_prints_exits_or_reads_the_environment() {
     let core = crate_dir("apprafter-core");
     let mut hits: Vec<Finding> = scan_tree(&core.join("src"))
         .into_iter()
-        .filter(|h| !matches!(h.kind, Kind::SecretDoor | Kind::ForeignRecipient))
+        .filter(|h| {
+            !matches!(
+                h.kind,
+                Kind::SecretDoor | Kind::ForeignRecipient | Kind::VaultDoor | Kind::TransferDoor
+            )
+        })
         .collect();
     hits.extend(ts_export_crate(&core));
     hits.sort();
@@ -1408,6 +1450,91 @@ fn the_cli_reaches_credentials_and_caches_only_through_the_secret_store() {
     }
 }
 
+/// c1's hand-off, T16: a vault is read, written, parsed and opened only by the secret store,
+/// the lock flows and the vault module — never by another core module, the CLI or the desktop;
+/// and only the secret store and the lock flows move a credentials file, a clear token or a
+/// cache through `secrets::transfer` (critic finding 9).
+#[test]
+fn only_the_secret_store_and_the_lock_open_a_vault() {
+    let src = crate_dir("apprafter-core").join("src");
+    let allowed = [src.join("secrets"), src.join("lock"), src.join("vault")];
+    let transfer_allowed = [src.join("secrets"), src.join("lock")];
+    let desktop = cli_dir().parent().expect("the repo").join("desktop");
+    let mut hits: Vec<Finding> = scan_tree(&src)
+        .into_iter()
+        .filter(|f| match f.kind {
+            Kind::VaultDoor => !allowed.iter().any(|a| f.file.starts_with(a)),
+            Kind::TransferDoor => !transfer_allowed.iter().any(|a| f.file.starts_with(a)),
+            _ => false,
+        })
+        .collect();
+    for other in [
+        crate_dir("platform-cli").join("src"),
+        desktop.join("src-tauri").join("src"),
+        desktop.join("ipc").join("src"),
+    ] {
+        hits.extend(
+            scan_tree(&other)
+                .into_iter()
+                .filter(|f| f.kind == Kind::VaultDoor),
+        );
+    }
+    assert!(
+        hits.is_empty(),
+        "a vault is opened only through apprafter_core::lock and Context::secrets():\n{}",
+        hits.iter()
+            .map(|h| h.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+/// Every identifier of `tokens` with its line, comments and strings left out (proc-macro2
+/// turns a doc comment into a string literal).
+fn idents(tokens: TokenStream, out: &mut Vec<(String, usize)>) {
+    for t in tokens {
+        match t {
+            TokenTree::Ident(i) => out.push((i.to_string(), i.span().start().line)),
+            TokenTree::Group(g) => idents(g.stream(), out),
+            _ => {}
+        }
+    }
+}
+
+/// L6 (critic G12): the CLI and the desktop never name a lock flow's fault or test policy.
+#[test]
+fn the_cli_and_the_desktop_never_arm_a_lock_fault() {
+    let desktop = cli_dir().parent().expect("the repo").join("desktop");
+    let mut hits = Vec::new();
+    for dir in [
+        crate_dir("platform-cli").join("src"),
+        crate_dir("platform-cli").join("tests"),
+        desktop.join("src-tauri").join("src"),
+        desktop.join("src-tauri").join("tests"),
+        desktop.join("ipc").join("src"),
+        desktop.join("ipc").join("tests"),
+    ] {
+        for file in rust_files(&dir) {
+            let src = fs::read_to_string(&file).unwrap();
+            let tokens: TokenStream = src
+                .parse()
+                .unwrap_or_else(|e| panic!("{}: {e}", file.display()));
+            let mut found = Vec::new();
+            idents(tokens, &mut found);
+            for (ident, line) in found {
+                if TEST_ONLY_LOCK_KNOBS.contains(&ident.as_str()) {
+                    hits.push(format!("{}:{line}: {ident}", file.display()));
+                }
+            }
+        }
+    }
+    assert!(
+        hits.is_empty(),
+        "only an in-process core test arms a lock fault or a weak KDF policy (L6):\n{}",
+        hits.join("\n")
+    );
+}
+
 #[test]
 fn holder_endpoints_are_spelled_only_where_listed() {
     let mut hits = Vec::new();
@@ -1486,6 +1613,12 @@ const OPENERS: &[&[&str]] = &[
     &["write_store_file"],
     &["write_marker"],
     &["locked_store"],
+    // D.4a d: the lock flows and the store's window read or write the store's secrets.
+    &["plan_on"],
+    &["execute_on"],
+    &["open_at"],
+    &["open_slot_at"],
+    &["set_unlock_timeout"],
 ];
 
 /// Openers called as a method of the context, matched by the method's name (a syntax scan does
@@ -2397,6 +2530,60 @@ fn f(key: &CacheKey, other: &Identity) -> cli_core::Result<()> {
             .collect();
         let seal = |line| (Kind::ForeignRecipient, SEAL.to_string(), line);
         assert_eq!(foreign, vec![seal(4), seal(6)]);
+    }
+
+    /// The vault's doors are seen through imports, `self` included.
+    #[test]
+    fn a_vault_door_is_seen_through_its_import() {
+        let src = "\
+use crate::vault::{self, VaultFile};
+fn f(p: &std::path::Path, b: &[u8]) {
+    let _ = vault::file::read(p);
+    let _ = VaultFile::parse(b);
+}
+";
+        let doors: Vec<String> = scan_source(Path::new("x.rs"), src)
+            .findings
+            .into_iter()
+            .filter(|f| f.kind == Kind::VaultDoor)
+            .map(|f| f.callee)
+            .collect();
+        assert_eq!(doors, vec!["crate::vault::file", "crate::vault::VaultFile"]);
+    }
+
+    /// The lock flows' file doors are seen through `{self, …}` imports too (critic finding 9).
+    #[test]
+    fn a_transfer_door_is_seen_through_its_import() {
+        let src = "\
+use crate::secrets::transfer::{self, Credentials};
+fn f(s: &cli_core::target::TargetStorePaths) {
+    let _ = transfer::credentials(s, \"prod\");
+}
+";
+        let doors: Vec<String> = scan_source(Path::new("x.rs"), src)
+            .findings
+            .into_iter()
+            .filter(|f| f.kind == Kind::TransferDoor)
+            .map(|f| f.callee)
+            .collect();
+        assert_eq!(doors, vec!["crate::secrets::transfer"]);
+    }
+
+    /// L6's scan: a knob named in a doc comment or a string is no use of it.
+    #[test]
+    fn a_knob_named_in_a_comment_or_a_string_is_not_a_use() {
+        let mut found = Vec::new();
+        idents(
+            "/// FaultPoint\nfn f() {\n    let _ = \"with_fault\";\n    g::with_fault();\n}\n"
+                .parse()
+                .unwrap(),
+            &mut found,
+        );
+        let knobs: Vec<(String, usize)> = found
+            .into_iter()
+            .filter(|(i, _)| TEST_ONLY_LOCK_KNOBS.contains(&i.as_str()))
+            .collect();
+        assert_eq!(knobs, vec![("with_fault".to_string(), 4)]);
     }
 
     #[test]
