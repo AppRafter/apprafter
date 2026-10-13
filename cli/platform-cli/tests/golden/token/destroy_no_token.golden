@@ -1,0 +1,15 @@
+$ apprafter destroy --yes
+[exit 1]
+[stdout]
+[stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m destroy invoked <ESC>[3myes<ESC>[0m<ESC>[2m=<ESC>[0mtrue
+Error: apprafter::cli::other
+
+  × target `prod` has no Hetzner Cloud token stored. Run `apprafter target add
+  │ prod --renew --token <X>` to add one, or pass `--token`/`HCLOUD_TOKEN` for
+  │ this invocation.
+  help: This is the catch-all CLI error. The message above is the only
+        context. If you see this often with the same wording, please file an
+        issue — recurring messages should be promoted to a typed `CliError`
+        variant with its own help text.
+

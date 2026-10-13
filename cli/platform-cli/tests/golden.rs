@@ -2061,6 +2061,41 @@ fn target_ip_without_a_stored_token() {
     sb.golden("target/ip_no_token", &["target", "ip"]);
 }
 
+/// A state `destroy` acts on: a provider and a recorded server, so it reaches the token.
+const DESTROY_STATE: &str = r#"{"provider":"hetzner-cloud","hetzner_cloud":{"server_id":42,"server_name":"prod-node","server_type":"cx22"}}"#;
+
+/// D.4a T15: a legacy command's refusal for a target that stores no token. Recorded before
+/// `legacy_token.rs` goes (its prose, `apprafter::cli::other`); d4a-d moves it to the core's code.
+#[test]
+fn destroy_without_a_stored_token() {
+    let sb = Sandbox::new();
+    sb.seed_config("prod", "provider: hetzner-cloud\nregion: nbg1\n");
+    sb.seed_pointer("prod");
+    sb.seed_state("prod", DESTROY_STATE);
+    sb.golden("token/destroy_no_token", &["destroy", "--yes"]);
+}
+
+/// D.4a T15: `HCLOUD_TOKEN` with a CLI default naming a removed target. The legacy adapter
+/// returned the variable before it looked at any target, so the run went on to the provider
+/// (a closed port here); d4a-d resolves the target first, as every core command does.
+#[test]
+fn destroy_with_hcloud_token_and_a_dangling_default() {
+    let sb = Sandbox::new().with_env("HCLOUD_TOKEN", TOKEN_A);
+    sb.seed_pointer("gone");
+    sb.seed_state("gone", DESTROY_STATE);
+    sb.golden("token/destroy_dangling_env_token", &["destroy", "--yes"]);
+}
+
+/// D.4a T15: `node status`, another legacy reader, on a target that stores no token.
+#[test]
+fn node_status_without_a_stored_token() {
+    let sb = Sandbox::new();
+    sb.seed_config("prod", "provider: hetzner-cloud\nregion: nbg1\n");
+    sb.seed_pointer("prod");
+    sb.seed_state("prod", PROVISIONED_STATE);
+    sb.golden("token/node_status_no_token", &["node", "status"]);
+}
+
 #[test]
 fn whoami_with_the_api_unreachable() {
     let sb = Sandbox::new();
