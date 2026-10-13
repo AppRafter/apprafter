@@ -25,7 +25,9 @@
 //!    opens or seals a cache ([`SECRET_DOORS`], [`SECRET_DOOR_METHODS`]), and nothing in
 //!    `apprafter-core/src` seals a cache to a recipient that is not a `CacheKey`'s ([`SEAL`]):
 //!    every token and cached secret goes through `Context::secrets()` (ADR 0068 §5; D.4a
-//!    T16). d4a-c extends both rules to `platform-cli` once its writers moved.
+//!    T16), and the same holds in `platform-cli/src`, where only the seal itself is not a door
+//!    (its recipient must be a `CacheKey`'s) and the two loads of the shared key
+//!    [`CLI_KEY_CREATION_SITES`] lists are allowed once each, until d4a-d moves them.
 //! 6. **Test-only key derivation stays in tests (L4).** No manifest under `cli/` or
 //!    `desktop/` turns on `apprafter-core/insecure-fast-kdf` outside `[dev-dependencies]`,
 //!    except the desktop's `test-build` ([`INSECURE_KDF_FORWARDERS`]), and none of the
@@ -202,6 +204,10 @@ const SECRET_DOORS: &[&str] = &[
     "cli_core::save_target",
     "cli_core::target::save_target_credentials",
     "cli_core::secrets::load_identity",
+    // Read the shared age key, and create it when it is missing: a key file the lock of a
+    // locked store would not cover (D.4a c2).
+    "cli_core::secrets::load_or_create_identity",
+    "cli_core::secrets::load_or_create_identity_reporting",
     "cli_core::secrets::decrypt_with_identity",
     "cli_core::secrets::decrypt_with_identity_reason",
     "cli_core::secrets::encrypt_for_recipient",
@@ -1327,6 +1333,79 @@ fn only_the_secret_store_reads_credentials_and_opens_caches() {
             .collect::<Vec<_>>()
             .join("\n")
     );
+}
+
+/// The CLI's calls that load or create the shared age key, as (file under `cli/`, the
+/// `SECRET_DOORS` entry), each allowed exactly once there: the key the two seals of D.4a b
+/// encrypt to. d4a-d moves both into the core (and gates the creation on a store in files),
+/// and empties this list.
+const CLI_KEY_CREATION_SITES: &[(&str, &str)] = &[
+    (
+        "platform-cli/src/commands/kubeconfig.rs",
+        "cli_core::secrets::load_or_create_identity_reporting",
+    ),
+    (
+        "platform-cli/src/commands/argocd_password.rs",
+        "cli_core::secrets::load_or_create_identity",
+    ),
+];
+
+/// T16 in the CLI (D.4a c2): `platform-cli/src` reaches a target's credentials file, the shared
+/// age key and the caches only through `apprafter_core::secrets` — every door but the seal and
+/// the listed key loads is forbidden there, each listed load occurs exactly once where it is
+/// listed, and every seal takes a `CacheKey`'s recipient in the same expression.
+#[test]
+fn the_cli_reaches_credentials_and_caches_only_through_the_secret_store() {
+    let at = |f: &Finding| {
+        let file = f.file.strip_prefix(cli_dir()).unwrap_or(&f.file);
+        (file.to_string_lossy().replace('\\', "/"), f.callee.clone())
+    };
+    let listed = |f: &Finding| {
+        let (file, callee) = at(f);
+        CLI_KEY_CREATION_SITES
+            .iter()
+            .any(|(s, c)| *s == file && *c == callee)
+    };
+    // A door the core forbids outright is classified by FORBIDDEN_CALLEES first
+    // (`load_or_create_identity`: in the core a read never writes a key), so it comes back as a
+    // ForbiddenCallee under its entry; in the CLI it is a door like the others.
+    let door = |f: &Finding| {
+        f.kind == Kind::SecretDoor
+            || (f.kind == Kind::ForbiddenCallee && SECRET_DOORS.contains(&f.callee.as_str()))
+    };
+    let findings = scan_tree(&crate_dir("platform-cli").join("src"));
+    let hits: Vec<&Finding> = findings
+        .iter()
+        .filter(|f| {
+            if door(f) {
+                f.callee != SEAL && !listed(f)
+            } else {
+                f.kind == Kind::ForeignRecipient
+            }
+        })
+        .collect();
+    assert!(
+        hits.is_empty(),
+        "the CLI reaches a credentials file, the age key or a cache only through \
+         apprafter_core::secrets (Context::secrets(), ADR 0068 section 5), and seals a cache \
+         only to a CacheKey's recipient:\n{}",
+        hits.iter()
+            .map(|h| h.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    for (file, callee) in CLI_KEY_CREATION_SITES {
+        let n = findings
+            .iter()
+            .filter(|f| door(f) && at(f) == (file.to_string(), callee.to_string()))
+            .count();
+        assert_eq!(
+            n, 1,
+            "{file} calls `{callee}` {n} times: CLI_KEY_CREATION_SITES allows it once, where it \
+             is today (a second call would read or create the shared key outside the store; \
+             none means d4a-d moved it, so drop the entry)"
+        );
+    }
 }
 
 #[test]
