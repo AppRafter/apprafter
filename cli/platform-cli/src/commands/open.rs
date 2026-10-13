@@ -45,6 +45,8 @@ use crate::commands::port_forward::{open_in_browser, spawn_kubectl_port_forward,
 /// view.
 pub fn argocd(project_filter: Option<&str>) -> Result<()> {
     let kc = ensure_kubeconfig_tempfile()?;
+    // D.4a T46: everything this command reads of the store is in hand; the store's key goes.
+    crate::vault_access::end_secret_phase();
     let mut ui = KubectlArgocdUi {
         kubeconfig: kc,
         child: None,

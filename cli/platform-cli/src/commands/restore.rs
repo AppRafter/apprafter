@@ -648,6 +648,8 @@ pub fn run_restore(
     } else {
         Some(ensure_kubeconfig_tempfile_for_target(target)?)
     };
+    // D.4a T46: everything this command reads of the store is in hand; the store's key goes.
+    crate::vault_access::end_secret_phase();
 
     // Held across the whole restore: the restic restore unpacks the decrypted
     // secrets here and it must NOT be cleaned up until every step that reads

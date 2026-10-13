@@ -3969,6 +3969,8 @@ pub fn logs(
     workload: Option<String>,
 ) -> Result<()> {
     let kc = ensure_kubeconfig_tempfile()?;
+    // D.4a T46: everything this command reads of the store is in hand; the store's key goes.
+    crate::vault_access::end_secret_phase();
 
     let (app, argo_name) = resolve_app_for_command(name, env.as_deref(), kc.path())?;
 

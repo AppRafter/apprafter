@@ -1843,6 +1843,8 @@ pub fn run_export(namespaces: &[String], select: bool, out: Option<&str>) -> Res
     let resolved = resolve_state_paths(None)?;
     let cluster_id = resolved.target_name.clone();
     let kc = ensure_kubeconfig_tempfile()?;
+    // D.4a T46: everything this command reads of the store is in hand; the store's key goes.
+    crate::vault_access::end_secret_phase();
 
     let subset: &[String] = if select { namespaces } else { &[] };
     let apps = list_items("applications.apprafter.io", None, kc.path())?;
@@ -2041,6 +2043,8 @@ pub fn run_backup(
     // Keep the kubeconfig tempfile alive for the WHOLE sequence (every kubectl
     // shell-out below depends on it; dropping it deletes the file).
     let kc = ensure_kubeconfig_tempfile()?;
+    // D.4a T46: everything this command reads of the store is in hand; the store's key goes.
+    crate::vault_access::end_secret_phase();
 
     // Resolve ns_set BEFORE handing off to the engine (the engine's list_items
     // uses KubeExec which doesn't know about the "app-namespace set" concept —
@@ -2453,6 +2457,8 @@ fn cronjob_repo(cronjob: &Value) -> Option<String> {
 pub fn run_backup_trigger(wait: bool, timeout_minutes: u64) -> Result<()> {
     preflight_tools(&[&KUBECTL], "apprafter backup run")?;
     let kc = ensure_kubeconfig_tempfile()?;
+    // D.4a T46: everything this command reads of the store is in hand; the store's key goes.
+    crate::vault_access::end_secret_phase();
 
     let Some(cronjob) = kubectl_get_json(
         "cronjob",

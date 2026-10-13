@@ -81,6 +81,8 @@ pub fn run(
         &resolved.target_name,
         by,
     )?;
+    // D.4a T46: everything this command reads of the store is in hand; the store's key goes.
+    crate::vault_access::end_secret_phase();
 
     // `restore --reprovision` says it is provisioning here, past every check, and not before
     // it calls this: a run the check refuses says nothing was created, so it must not have

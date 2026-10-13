@@ -57,6 +57,11 @@ pub(crate) fn set_command(path: &str) {
     process().set_command(path);
 }
 
+/// The command's secret phase is over (T46): the in-process data key goes, the items stay.
+pub(crate) fn end_secret_phase() {
+    process().end_phase();
+}
+
 /// The command is over (T46: "or at exit"; critic finding 13): the key and every item go,
 /// zeroed by their drops — the process's access is a static, and a static is never dropped.
 pub(crate) fn forget_all() {
@@ -748,5 +753,77 @@ mod tests {
             .unwrap();
         assert_eq!(plain.as_str(), "apiVersion: v1\n");
         assert!(!access.holds_key());
+    }
+
+    /// T46 (critic finding 11): `up` on a locked store asks once, in phase 0, and nothing
+    /// after: the token again, the kubeconfig it caches (judging the Argo CD password cached
+    /// before, T39), the read back and that password — although the data key itself is gone
+    /// at the phase's end.
+    #[test]
+    fn up_asks_once_through_its_phases() {
+        const PW: &str = "argocd-admin-password";
+        const NEW_YAML: &str = "apiVersion: v1\nkind: Config\nclusters: [new]\n";
+        let s = store();
+        let (ctx, access, script) = context(&s, Script::new(vec![Ok(&key(&s))]));
+        let paths = cli_state::StatePaths::for_active_target(&ctx.store(), "prod");
+        let mut hetzner = s.hetzner.clone();
+        hetzner.argocd_admin_password_age =
+            Some(cli_core::secrets::encrypt_for_recipient(PW, s.made.recipient()).unwrap());
+        cli_state::State {
+            hetzner_cloud: Some(hetzner),
+            ..Default::default()
+        }
+        .save(&paths)
+        .unwrap();
+        // Phase 0, then the phase's end (Task 13's `end_secret_phase` after it).
+        crate::commands::age_cache::check_before_provisioning(
+            &ctx,
+            "prod",
+            cli_core::ProvisionedBy::Up,
+        )
+        .unwrap();
+        access.end_phase();
+        assert!(
+            !access.holds_key(),
+            "the data key itself is gone, not only its slot"
+        );
+        let secrets = ctx.secrets();
+        // Phase 1 needs the token again.
+        assert_eq!(
+            secrets.stored_token("prod").unwrap().unwrap().expose(),
+            TOKEN
+        );
+        // Phase 2 caches the new kubeconfig under the store's key.
+        let new = secrets
+            .new_cache("prod", CachedSecret::Kubeconfig, true)
+            .unwrap();
+        let held = cli_core::StoreLock::exclusive(&ctx.store()).unwrap();
+        secrets
+            .write_cache(&held, &paths, new, NEW_YAML, false)
+            .unwrap();
+        drop(held);
+        // Phase 3 reads it back, and the Argo CD password.
+        let h = cli_state::State::load_or_default(&paths)
+            .unwrap()
+            .hetzner_cloud
+            .unwrap();
+        assert_eq!(
+            secrets
+                .cached_kubeconfig(&h, "prod")
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            NEW_YAML
+        );
+        let pw = h.argocd_admin_password_age.as_deref().unwrap();
+        let cache_key = secrets.cache_key("prod").unwrap();
+        assert_eq!(
+            secrets
+                .open_cache(&cache_key, CachedSecret::ArgocdPassword, "prod", pw)
+                .unwrap()
+                .as_str(),
+            PW
+        );
+        assert_eq!(script.asked().len(), 1, "one prompt for the whole run");
     }
 }
