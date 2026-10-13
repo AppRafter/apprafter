@@ -111,6 +111,22 @@ impl LockSlotKind {
     }
 }
 
+/// A vault slot's kind as `store.yaml` and the reports name it; a reserved or unknown byte is
+/// `Unknown`.
+impl From<crate::vault::SlotKind> for LockSlotKind {
+    fn from(k: crate::vault::SlotKind) -> Self {
+        use crate::vault::SlotKind;
+        match k {
+            SlotKind::Password => LockSlotKind::Password,
+            SlotKind::RecoveryKey => LockSlotKind::RecoveryKey,
+            SlotKind::OsPassword => LockSlotKind::OsPassword,
+            SlotKind::WindowsHello => LockSlotKind::WindowsHello,
+            SlotKind::TouchId => LockSlotKind::TouchId,
+            SlotKind::Unknown(_) => LockSlotKind::Unknown,
+        }
+    }
+}
+
 /// `store.yaml`, read and checked: `id` is set whenever `secrets` is not `Files`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreFile {
