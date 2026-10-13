@@ -70,8 +70,9 @@ use syn::{Attribute, Expr, ImplItem, Item, Meta, Stmt, TraitItem, UseTree};
 
 /// Production env reads ([`Kind::EnvRead`] and [`Kind::Dirs`]) in
 /// [`RATCHETED_CRATES`]. Re-measure, with a per-crate and per-callee
-/// breakdown, with `cargo test -p apprafter-core --test guards -- --nocapture`.
-const ENV_READ_BASELINE: usize = 48;
+/// breakdown, with `cargo test -p apprafter-core --test guards -- --nocapture`. 49 since
+/// d4a-d: `cli_core::paths::local_data_dir`, the CLI's Windows runtime dir (T44).
+const ENV_READ_BASELINE: usize = 49;
 
 /// The crates the core builds on, and the CLI.
 const RATCHETED_CRATES: &[&str] = &["cli-core", "cli-state", "cli-providers", "platform-cli"];
@@ -191,6 +192,8 @@ const SANCTIONED: &[(&str, &str)] = &[
     // `dirs::home_dir`: the age key's default and the `~/` of displayed paths.
     ("cli_core::paths::home_dir", "Context::from_cli_env"),
     ("cli_core::paths::home_dir", "Context::from_desktop_env"),
+    // `dirs::data_local_dir`: the CLI's runtime dir on Windows (D.4a T44).
+    ("cli_core::paths::local_data_dir", "Context::from_cli_env"),
 ];
 
 /// What reads or writes a target's `credentials.yaml`, reads the shared age key, or opens or
@@ -1621,6 +1624,8 @@ const OPENERS: &[&[&str]] = &[
     &["set_unlock_timeout"],
     &["plan_off"],
     &["execute_off"],
+    &["materialise"],
+    &["sweep_stale"],
 ];
 
 /// Openers called as a method of the context, matched by the method's name (a syntax scan does
@@ -1659,6 +1664,10 @@ const REAL_ENV_TESTS: &[(&str, &str)] = &[
     (
         "apprafter-core/src/context.rs",
         "cli_env_defaults_without_variables",
+    ),
+    (
+        "apprafter-core/src/context.rs",
+        "a_windows_cli_without_a_store_variable_runs_under_local_app_data",
     ),
     (
         "apprafter-core/src/context.rs",

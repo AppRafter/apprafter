@@ -79,12 +79,11 @@ use cli_providers::backup::restic::restic_snapshots_argv;
 use cli_providers::k8s::kubectl::KubectlCli;
 use cli_providers::k8s::sealing::{build_sealed_secret, fetch_controller_public_key};
 use serde_json::Value;
-use tempfile::NamedTempFile;
 
 use crate::commands::helper_interrupt::{self, Noted as _};
 use crate::commands::k8s_helpers::{
     ensure_kubeconfig_tempfile, kubectl_apply_server_side, kubectl_delete, kubectl_get_json,
-    kubectl_get_json_cluster_wide, kubectl_merge_patch,
+    kubectl_get_json_cluster_wide, kubectl_merge_patch, KubeconfigFile,
 };
 use crate::commands::state_paths::resolve_state_paths;
 
@@ -5252,7 +5251,7 @@ fn kubeconfig_if_cluster_needed(
     retention: RetentionArgs,
     creds: CredSource,
     cluster_uid_override: Option<&str>,
-) -> Result<Option<NamedTempFile>> {
+) -> Result<Option<KubeconfigFile>> {
     if !backup_verb_needs_cluster(repo_override, retention, creds, cluster_uid_override) {
         return Ok(None);
     }

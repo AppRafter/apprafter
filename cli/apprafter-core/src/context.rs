@@ -256,6 +256,22 @@ impl Context {
             cue_bin: env.var(cli_core::cue::CUE_BIN_ENV).map(PathBuf::from),
         };
         let home_dir = cli_core::paths::home_dir();
+        // D.4a T44: on Windows, with no store variable, under Local AppData (never roamed or
+        // redirected to a share), one directory per store root; else `<root>/run`.
+        #[cfg(windows)]
+        let runtime_dir = match (
+            env.var(cli_core::CONFIG_DIR_ENV),
+            cli_core::paths::local_data_dir(),
+        ) {
+            (None, Some(local)) => {
+                use sha2::{Digest, Sha256};
+                let digest = Sha256::digest(config_root.as_os_str().to_string_lossy().as_bytes());
+                let tag: String = digest[..4].iter().map(|b| format!("{b:02x}")).collect();
+                local.join("apprafter").join("run").join(tag)
+            }
+            _ => config_root.join("run"),
+        };
+        #[cfg(not(windows))]
         let runtime_dir = config_root.join("run");
         let ctx = Self::assemble(
             config_root,
@@ -744,6 +760,23 @@ mod tests {
             cli_providers::hetzner_cloud::DEFAULT_BASE_URL
         );
         assert_eq!(ctx.overrides().hetzner_token, None);
+    }
+
+    /// T44: on Windows, with no store variable, the CLI's runtime dir is under Local AppData
+    /// (never roamed or redirected to a share), one per store root.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_cli_without_a_store_variable_runs_under_local_app_data() {
+        let ctx = Context::from_cli_env(&MapEnv::new()).unwrap();
+        let local = cli_core::paths::local_data_dir().unwrap();
+        let run = ctx.runtime_dir();
+        assert_eq!(
+            run.parent(),
+            Some(local.join("apprafter").join("run").as_path())
+        );
+        let tag = run.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(tag.len(), 8);
+        assert!(tag.bytes().all(|b| b.is_ascii_hexdigit()), "{tag}");
     }
 
     #[test]

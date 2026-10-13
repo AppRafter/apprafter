@@ -159,7 +159,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     if let Some(notice) = settings.notice() {
         tracing::warn!("{notice}");
     }
-    let host = env::desktop_host(&tools, app.path().app_data_dir()?.join("run"));
+    // Local, never roamed (D.4a T44): the same directory as before on Linux and macOS.
+    let host = env::desktop_host(&tools, app.path().app_local_data_dir()?.join("run"));
     let context = env::desktop_context(&env, host)?;
     let handle = app.handle().clone();
     let shell = app::Shell::new(
@@ -182,7 +183,21 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         .name("runtime-sweep".into())
         .spawn({
             let context = shell.context.clone();
+            // D.4a T44: before D.4a the runtime dir sat under the roaming app data dir on
+            // Windows; what a crash left there is swept too (critic finding 19).
+            #[cfg(windows)]
+            let roamed = app
+                .path()
+                .app_data_dir()
+                .ok()
+                .map(|dir| shell.context.clone().with_runtime_dir(dir.join("run")));
             move || {
+                // A statement, not the closure's tail: a `cfg` that removes a tail expression
+                // does not compile on the other OSes.
+                #[cfg(windows)]
+                if let Some(roamed) = &roamed {
+                    app::sweep_runtime_dir(roamed);
+                }
                 app::sweep_runtime_dir(&context);
             }
         });

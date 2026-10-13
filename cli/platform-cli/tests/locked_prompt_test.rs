@@ -78,6 +78,28 @@ fn kubeconfig_asks_once_and_the_recovery_key_opens_it() {
     assert!(end.restored);
 }
 
+/// T45: what `kubeconfig` printed went to a pipe, out of the store's lock: one note says so.
+#[test]
+fn a_kubeconfig_into_a_pipe_is_named_outside_the_lock() {
+    let sp = Spawn::new();
+    let made = locked(&sp);
+    let end = converse(
+        &sp,
+        &["kubeconfig"],
+        &[Step::Expect(ASKED), line(&key_of(&made))],
+    );
+    assert!(end.status.success(), "{}", end.terminal);
+    assert_eq!(end.stdout, YAML, "the note is never on stdout");
+    assert_eq!(
+        end.terminal
+            .matches("is outside the lock of the target store at")
+            .count(),
+        1,
+        "{}",
+        end.terminal
+    );
+}
+
 #[test]
 fn three_wrong_secrets_are_unlock_failed() {
     let sp = Spawn::new();

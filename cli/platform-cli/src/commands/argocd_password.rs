@@ -2,7 +2,6 @@
 //! Print the Argo CD admin password from the cluster, caching the
 //! result age-encrypted in state. See plan.md phase 1.5 (v0.1.14).
 
-use std::io::Write;
 use std::path::Path;
 
 use apprafter_core::secrets::NewCacheKey;
@@ -10,7 +9,6 @@ use cli_core::secrets::{encrypt_for_recipient, load_or_create_identity, CachedSe
 use cli_core::{CliError, Result};
 use cli_providers::k8s::{KubectlCli, KubectlRunner};
 use cli_state::State;
-use tempfile::NamedTempFile;
 use tracing::info;
 
 use crate::commands::age_cache;
@@ -44,6 +42,7 @@ pub fn run(refresh: bool, target_override: Option<&str>) -> Result<()> {
             let plaintext =
                 secrets.open_cache(&key, CachedSecret::ArgocdPassword, target, armored)?;
             print!("{}", plaintext.as_str());
+            age_cache::note_outside_lock(&ctx, "the Argo CD admin password");
             return Ok(());
         }
     }
@@ -57,7 +56,7 @@ pub fn run(refresh: bool, target_override: Option<&str>) -> Result<()> {
     // after it asks.
     let key = secrets.cache_key_for_new_secret(target)?;
     let kubeconfig = age_cache::cached_kubeconfig(&secrets, &hetzner, target)?;
-    let kubeconfig_file = write_tempfile_with("apprafter-kubeconfig-", &kubeconfig)?;
+    let kubeconfig_file = crate::commands::k8s_helpers::materialise(&ctx, &kubeconfig)?;
 
     let plaintext = compute_argocd_password(&KubectlCli, kubeconfig_file.path())?;
 
@@ -79,17 +78,8 @@ pub fn run(refresh: bool, target_override: Option<&str>) -> Result<()> {
     state.save(&resolved.paths)?;
 
     print!("{plaintext}");
+    age_cache::note_outside_lock(&ctx, "the Argo CD admin password");
     Ok(())
-}
-
-fn write_tempfile_with(prefix: &str, contents: &str) -> Result<NamedTempFile> {
-    let mut f = tempfile::Builder::new()
-        .prefix(prefix)
-        .tempfile()
-        .map_err(|e| CliError::Other(format!("create tempfile {prefix}: {e}")))?;
-    f.write_all(contents.as_bytes())
-        .map_err(|e| CliError::Other(format!("write tempfile {prefix}: {e}")))?;
-    Ok(f)
 }
 
 /// Pure orchestration: ask `kubectl` for the admin secret value

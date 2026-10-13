@@ -148,7 +148,7 @@ pub(crate) fn browser_line(opened: bool) -> &'static str {
 /// The production [`ArgocdUi`]: a decrypted kubeconfig, a real `kubectl
 /// port-forward` child, the system clipboard and the default browser.
 struct KubectlArgocdUi {
-    kubeconfig: tempfile::NamedTempFile,
+    kubeconfig: crate::commands::k8s_helpers::KubeconfigFile,
     child: Option<std::process::Child>,
 }
 

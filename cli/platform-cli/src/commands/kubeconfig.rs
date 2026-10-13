@@ -40,6 +40,7 @@ pub fn run(refresh: bool, yes: bool, target_override: Option<&str>) -> Result<()
         eprint!("{}", lost.after());
     }
     print!("{yaml}");
+    age_cache::note_outside_lock(&crate::context::legacy_context()?, "the kubeconfig");
     Ok(())
 }
 

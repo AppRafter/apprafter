@@ -335,6 +335,134 @@ mod tree {
 }
 
 /// `#[cfg(unix)]`: they need `sh` (listed in the plan's Gate for the Windows check).
+/// Whether process `pid` exists now (D.4a T44): `Some(false)` only when the OS says there is no
+/// such process; `None` when it cannot say — or for pid 0 and below `i32::MAX`'s complement,
+/// which `kill` reads as process groups.
+#[cfg(unix)]
+pub(crate) fn alive(pid: u32) -> Option<bool> {
+    let pid = libc::pid_t::try_from(pid).ok().filter(|p| *p > 0)?;
+    // SAFETY: signal 0 delivers nothing; it only asks whether `pid` exists.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return Some(true);
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::ESRCH) => Some(false),
+        Some(libc::EPERM) => Some(true),
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn alive(pid: u32) -> Option<bool> {
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GetLastError, ERROR_INVALID_PARAMETER, STILL_ACTIVE,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    // SAFETY: plain values in; the handle is closed below.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        // SAFETY: this thread's last error. Access denied means the process exists.
+        return match unsafe { GetLastError() } {
+            ERROR_INVALID_PARAMETER => Some(false),
+            _ => Some(true),
+        };
+    }
+    let mut code = 0u32;
+    // SAFETY: `handle` is open; `code` is a valid out pointer.
+    let read = unsafe { GetExitCodeProcess(handle, &mut code) } != 0;
+    // SAFETY: opened above, closed once.
+    unsafe { CloseHandle(handle) };
+    read.then_some(code == STILL_ACTIVE as u32)
+}
+
+/// When a process started, as the OS records it, unconverted: the Linux `starttime` field of
+/// `/proc/<pid>/stat` (clock ticks after boot), macOS `proc_pidinfo`'s start in microseconds,
+/// Windows the creation `FILETIME`. Only ever compared for equality with another reading of
+/// the same pid — a pid whose start moved is another process (pid reuse; sudo's rule) — and
+/// never turned into wall time: Linux's boot time moves with the clock, so a converted start
+/// would move with a clock step while a file's mtime stays (D.4a T44, critic finding 7).
+/// Shared by the runtime dir's sweep (T44) and a terminal holder's session binding (d4a-e,
+/// T51; its D7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ProcStart(u64);
+
+impl ProcStart {
+    /// The reading itself, as a kubeconfig copy's name records it (T44).
+    pub(crate) fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+/// `pid`'s start, or `None` when no such process exists or it cannot be read.
+pub fn started(pid: u32) -> Option<ProcStart> {
+    os_start(pid).map(ProcStart)
+}
+
+#[cfg(target_os = "linux")]
+fn os_start(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // `comm` (field 2) may hold spaces and parentheses: the fields after it start past the
+    // last `)`. Field 22, `starttime`, is the 20th of those (field 3, `state`, is the first).
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_whitespace().nth(19)?.parse().ok()
+}
+
+#[cfg(target_os = "macos")]
+fn os_start(pid: u32) -> Option<u64> {
+    let pid = libc::c_int::try_from(pid).ok().filter(|p| *p > 0)?;
+    let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    // SAFETY: proc_pidinfo writes at most `size` bytes into `info`.
+    let got = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if got != size {
+        return None;
+    }
+    // SAFETY: all `size` bytes were written.
+    let info = unsafe { info.assume_init() };
+    info.pbi_start_tvsec
+        .checked_mul(1_000_000)?
+        .checked_add(info.pbi_start_tvusec)
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn os_start(_pid: u32) -> Option<u64> {
+    None
+}
+
+#[cfg(windows)]
+fn os_start(pid: u32) -> Option<u64> {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    // SAFETY: plain values in; the handle is closed below.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return None;
+    }
+    let zero = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
+    // SAFETY: `handle` is open; the four are valid out pointers.
+    let read =
+        unsafe { GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) } != 0;
+    // SAFETY: opened above, closed once.
+    unsafe { CloseHandle(handle) };
+    read.then(|| (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -707,5 +835,39 @@ mod windows_tests {
             }
         };
         assert!(gone, "grandchild {pid} outlived the timeout");
+    }
+}
+
+/// The owner tests; `pub(crate)` so `runtime.rs`'s tests can name [`NO_SUCH_PID`] (a private
+/// module's items are not reachable from a sibling, whatever their own visibility: E0603).
+#[cfg(test)]
+pub(crate) mod owner_tests {
+    use super::{alive, started};
+
+    /// A pid far above every OS's limit (Linux 2^22, macOS 99 999), and a multiple of 4 as
+    /// Windows pids are: no process has it.
+    pub(crate) const NO_SUCH_PID: u32 = 0x3FFF_FFF0;
+
+    /// D.4a T44, T51: a living process has one start, the same at every reading, never 0.
+    #[test]
+    fn this_process_is_alive_and_has_one_start() {
+        let me = std::process::id();
+        assert_eq!(alive(me), Some(true));
+        let first = started(me).expect("Linux, macOS and Windows say when a process started");
+        assert_ne!(first.raw(), 0, "Linux: clock ticks after boot; never 0");
+        assert_eq!(started(me), Some(first));
+    }
+
+    #[test]
+    fn a_pid_no_process_has_is_dead() {
+        assert_eq!(alive(NO_SUCH_PID), Some(false));
+        assert_eq!(started(NO_SUCH_PID), None);
+    }
+
+    /// `kill(0, 0)` and a negative pid would ask about whole process groups: never asked.
+    #[cfg(unix)]
+    #[test]
+    fn pid_zero_is_never_asked_about() {
+        assert_eq!(alive(0), None);
     }
 }

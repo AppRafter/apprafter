@@ -322,7 +322,7 @@ pub fn run(
 ) -> CoreResult<DoctorReport> {
     cancel.check()?;
     // R9: leftovers of a crashed run go first; failing to sweep never fails the run.
-    if let Err(e) = runtime::sweep_stale(ctx, runtime::STALE_KUBECONFIG_AGE) {
+    if let Err(e) = runtime::sweep_stale(ctx) {
         reporter.report(Event::Warning {
             message: format!(
                 "cannot remove old kubeconfig copies from {}: {e}",
@@ -2610,23 +2610,32 @@ mod tests {
         m.assert();
     }
 
+    /// D.4a T44: doctor sweeps the copies a gone process left — by owner, never by age: a long
+    /// session's copy stays however old it is.
     #[test]
     fn stale_runtime_copies_are_swept_at_the_start_of_a_run() {
         let f = fx();
         let ctx = ctx(&f, OFFLINE).with_no_ping(true);
         std::fs::create_dir_all(ctx.runtime_dir()).unwrap();
-        let old = ctx.runtime_dir().join("kubeconfig-1-0.yaml");
-        let fresh = ctx.runtime_dir().join("kubeconfig-2-0.yaml");
-        std::fs::write(&old, "x").unwrap();
-        std::fs::write(&fresh, "x").unwrap();
+        let gone = ctx.runtime_dir().join(format!(
+            "kubeconfig-{}-1-0.yaml",
+            crate::process::owner_tests::NO_SUCH_PID
+        ));
+        let me = std::process::id();
+        let start = crate::process::started(me).unwrap().raw();
+        let live = ctx
+            .runtime_dir()
+            .join(format!("kubeconfig-{me}-{start}-0.yaml"));
+        std::fs::write(&gone, "x").unwrap();
+        std::fs::write(&live, "x").unwrap();
         std::fs::OpenOptions::new()
             .write(true)
-            .open(&old)
+            .open(&live)
             .unwrap()
             .set_modified(std::time::SystemTime::now() - Duration::from_secs(7200))
             .unwrap();
         doctor(&ctx, DoctorTarget::CliDefault);
-        assert!(!old.exists() && fresh.exists());
+        assert!(!gone.exists() && live.exists());
     }
 
     /// D.4a T71: an Info row is a fact, in no total.

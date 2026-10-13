@@ -79,16 +79,13 @@ fn kubectl_error(verb: &str, resource: &str, exit: Option<i32>, stderr: &str) ->
     }
 }
 
-/// Decrypt the cached kubeconfig from state and write it to a
-/// `NamedTempFile`. Callers MUST keep the returned file alive
-/// for the duration of the `kubectl` invocation — when the
-/// `NamedTempFile` drops, the file is deleted.
-///
-/// Centralises the boilerplate that
-/// `commands::argocd_password` carries; the thin-wrapper
-/// commands reuse it instead of re-implementing the chain
-/// across five modules.
-pub fn ensure_kubeconfig_tempfile() -> Result<NamedTempFile> {
+/// A decrypted kubeconfig in the store's runtime dir (D.4a T44): owner-only, removed when it
+/// drops, swept by its owner if a crash leaves it. Callers keep it alive for as long as
+/// `kubectl` / `helm` read it.
+pub type KubeconfigFile = apprafter_core::runtime::MaterialisedKubeconfig;
+
+/// The active target's cached kubeconfig, materialised for `kubectl` ([`KubeconfigFile`]).
+pub fn ensure_kubeconfig_tempfile() -> Result<KubeconfigFile> {
     ensure_kubeconfig_tempfile_for_target(None)
 }
 
@@ -99,7 +96,7 @@ pub fn ensure_kubeconfig_tempfile() -> Result<NamedTempFile> {
 /// target, identical to [`ensure_kubeconfig_tempfile`].
 pub fn ensure_kubeconfig_tempfile_for_target(
     target_override: Option<&str>,
-) -> Result<NamedTempFile> {
+) -> Result<KubeconfigFile> {
     let resolved = resolve_state_paths(target_override)?;
     let state = State::load_or_default(&resolved.paths)?;
     let hetzner = state.hetzner_cloud.clone().ok_or_else(|| {
@@ -110,20 +107,16 @@ pub fn ensure_kubeconfig_tempfile_for_target(
     // A read through the core's secret store: the age key is never created here (GOTCHA-120).
     let ctx = crate::context::legacy_context()?;
     let kubeconfig = age_cache::cached_kubeconfig(&ctx.secrets(), &hetzner, &resolved.target_name)?;
-    write_kubeconfig_tempfile(&kubeconfig)
+    materialise(&ctx, &kubeconfig)
 }
 
-/// Write `kubeconfig` to a fresh `NamedTempFile`. Extracted from
-/// [`ensure_kubeconfig_tempfile_for_target`] so the round-trip (the bytes
-/// `kubectl` will actually read through `KUBECONFIG`) is testable.
-fn write_kubeconfig_tempfile(kubeconfig: &str) -> Result<NamedTempFile> {
-    let mut f = tempfile::Builder::new()
-        .prefix("apprafter-kubeconfig-")
-        .tempfile()
-        .map_err(|e| CliError::Other(format!("create kubeconfig tempfile: {e}")))?;
-    f.write_all(kubeconfig.as_bytes())
-        .map_err(|e| CliError::Other(format!("write kubeconfig tempfile: {e}")))?;
-    Ok(f)
+/// `kubeconfig` in `ctx`'s runtime dir: the core's one materialiser (T44). Never the system
+/// temp dir, which no sweep reaches.
+pub(crate) fn materialise(
+    ctx: &apprafter_core::Context,
+    kubeconfig: &str,
+) -> Result<KubeconfigFile> {
+    apprafter_core::runtime::materialise(ctx, kubeconfig).map_err(crate::context::into_cli_error)
 }
 
 /// Run `kubectl get -o json ...` and return the parsed JSON
@@ -997,14 +990,37 @@ mod tests {
     // ---- cached-kubeconfig resolution ------------------------------------
     // The slot precedence and the age key's errors are `age_cache`'s tests.
 
+    /// T44: the file kubectl reads is the core's, in the store's runtime dir, holding exactly
+    /// the resolved body, and gone when its handle drops.
     #[test]
-    fn kubeconfig_tempfile_holds_exactly_the_resolved_body() {
-        // The tempfile IS what kubectl reads through KUBECONFIG, so a
-        // truncated or re-encoded write would break every wrapped command.
+    fn the_kubeconfig_is_materialised_in_the_runtime_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx =
+            apprafter_core::Context::for_desktop(dir.path().join("store"), "http://127.0.0.1:1");
         let body = "apiVersion: v1\nkind: Config\nclusters:\n- name: apprafter\n";
-        let f = write_kubeconfig_tempfile(body).expect("write");
-        let read = std::fs::read_to_string(f.path()).expect("read back");
-        assert_eq!(read, body);
+        let f = materialise(&ctx, body).expect("write");
+        assert!(
+            f.path().starts_with(dir.path().join("store").join("run")),
+            "{:?}",
+            f.path()
+        );
+        assert_eq!(std::fs::read_to_string(f.path()).unwrap(), body);
+        let path = f.path().to_path_buf();
+        drop(f);
+        assert!(!path.exists());
+    }
+
+    /// T44: no command writes a decrypted kubeconfig to the system temp dir any more.
+    #[test]
+    fn no_command_writes_a_kubeconfig_to_the_system_temp_dir() {
+        let prefix = concat!("apprafter-", "kubeconfig-");
+        for (file, src) in [
+            ("k8s_helpers.rs", include_str!("k8s_helpers.rs")),
+            ("argocd_password.rs", include_str!("argocd_password.rs")),
+            ("cluster_bootstrap.rs", include_str!("cluster_bootstrap.rs")),
+        ] {
+            assert!(!src.contains(prefix), "{file} still names {prefix}");
+        }
     }
 
     // ---- apply / delete / patch argv --------------------------------------

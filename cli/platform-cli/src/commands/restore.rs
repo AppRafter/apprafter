@@ -67,7 +67,7 @@ use crate::commands::backup::{
 };
 use crate::commands::k8s_helpers::{
     ensure_kubeconfig_tempfile_for_target, kubectl_apply_server_side, kubectl_get_json,
-    kubectl_merge_patch,
+    kubectl_merge_patch, KubeconfigFile,
 };
 
 // ---------------------------------------------------------------------------
@@ -643,7 +643,7 @@ pub fn run_restore(
     // kubeconfig into state), after which we resolve kc. For restore-into-running
     // / --data-only the cluster is already up, so resolve it now. Held alive for
     // the WHOLE flow: every kubectl/restic-adjacent shell-out below depends on it.
-    let mut kc: Option<tempfile::NamedTempFile> = if reprovision {
+    let mut kc: Option<KubeconfigFile> = if reprovision {
         None
     } else {
         Some(ensure_kubeconfig_tempfile_for_target(target)?)

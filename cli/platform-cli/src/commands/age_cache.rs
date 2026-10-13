@@ -173,6 +173,26 @@ impl LostKey {
     }
 }
 
+/// T45: on a locked store, a secret printed where no terminal is — a file, a pipe — is out of
+/// the store's lock; one stderr line says so. `what` names it ("the kubeconfig"). Nothing when
+/// stdout is a terminal, the store is in files, or its state cannot be read.
+pub(crate) fn note_outside_lock(ctx: &apprafter_core::Context, what: &str) {
+    use std::io::IsTerminal;
+    if std::io::stdout().is_terminal()
+        || !matches!(
+            ctx.secrets().mode(),
+            Ok(apprafter_core::secrets::SecretsMode::Locked)
+        )
+    {
+        return;
+    }
+    let shown = cli_core::paths::abbreviate_home(ctx.config_root(), ctx.home_dir());
+    eprintln!(
+        "note: {what} went to a file or a pipe, which is outside the lock of the target store \
+         at {shown}: whatever can read it can use it."
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

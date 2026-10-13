@@ -2,27 +2,28 @@
 //! The core's private runtime directory (spec §4.1, overview R9): where a decrypted kubeconfig
 //! lives while a probe uses it, and nowhere else.
 //!
-//! `Context::runtime_dir()` is `<config root>/run` for the CLI and `<desktop data dir>/run` for
+//! `Context::runtime_dir()` is `<config root>/run` for the CLI (on Windows with no store
+//! variable, `%LOCALAPPDATA%\apprafter\run\<tag>`) and `<desktop local data dir>/run` for
 //! the desktop, so one client never sweeps the other's live file. On Unix the directory is
 //! 0700 and each file 0600, created with `create_new`; on Windows it sits under the per-user
 //! profile (owner-only ACLs arrive with D.4). A [`MaterialisedKubeconfig`] removes its file when
-//! it drops; [`sweep_stale`] removes what a crashed process left behind. Reads here are
-//! lockless: `state.json` is replaced atomically (overview R3).
+//! it drops; [`sweep_stale`] removes what a crashed process left behind — by its owner, never by
+//! its age (D.4a T44): a copy's name records its writer's pid and start as the OS reports it,
+//! and the copy goes only when that pid is gone or now belongs to a process with another start,
+//! so a long session's copy (`top`, `open argocd`, `app logs -f`) stays however old it is, and
+//! a clock step changes nothing. Reads here are lockless: `state.json` is replaced atomically
+//! (overview R3).
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime};
 
 use cli_state::{State, StatePaths};
 
 use crate::context::Context;
 use crate::error::{CoreError, CoreResult};
 use crate::target_ref::TargetRef;
-
-/// A copy older than this is a leftover: no probe holds a kubeconfig for an hour.
-pub const STALE_KUBECONFIG_AGE: Duration = Duration::from_secs(60 * 60);
 
 const PREFIX: &str = "kubeconfig-";
 /// Fresh names to try when a crashed process with a reused pid left one behind.
@@ -47,7 +48,7 @@ impl Drop for MaterialisedKubeconfig {
     }
 }
 
-/// The target's cached kubeconfig, written to `<runtime_dir>/kubeconfig-<pid>-<n>.yaml`.
+/// The target's cached kubeconfig, written to `<runtime_dir>/kubeconfig-<pid>-<start>-<n>.yaml`.
 ///
 /// `None` when the state records no server or caches no kubeconfig. The secret store opens
 /// it: the encrypted slot wins over the legacy plaintext one (a plaintext copy beside it may
@@ -67,32 +68,75 @@ pub fn materialise_kubeconfig(
     let Some(body) = ctx.secrets().cached_kubeconfig(&server, target.name())? else {
         return Ok(None);
     };
-    write_private(ctx.runtime_dir(), body.as_bytes()).map(Some)
+    materialise(ctx, &body).map(Some)
 }
 
-/// Remove `kubeconfig-*` files in the runtime dir older than `older_than`; returns how many.
-/// A missing dir is zero and is not created.
-pub fn sweep_stale(ctx: &Context, older_than: Duration) -> CoreResult<usize> {
+/// `body`, a decrypted kubeconfig, written to `<runtime_dir>/kubeconfig-<pid>-<start>-<n>.yaml`
+/// (0600 in a 0700 dir), after [`sweep_stale`] — best effort: a sweep that fails never stops
+/// the write. The one materialiser of the CLI and the core (D.4a T44).
+pub fn materialise(ctx: &Context, body: &str) -> CoreResult<MaterialisedKubeconfig> {
+    let _ = sweep_stale(ctx);
+    write_private(ctx.runtime_dir(), body.as_bytes())
+}
+
+/// Whether a copy is a leftover, from what the OS says of the pid in its name: its process is
+/// gone, or the live one has another start than the one the name `recorded` (a reused pid).
+/// Unknown is never a leftover; neither is a copy that recorded no start while its pid lives;
+/// age and the clock never count.
+fn stale(
+    alive: Option<bool>,
+    now: Option<crate::process::ProcStart>,
+    recorded: Option<u64>,
+) -> bool {
+    match alive {
+        Some(false) => true,
+        Some(true) => match (now, recorded) {
+            (Some(now), Some(recorded)) => now.raw() != recorded,
+            _ => false,
+        },
+        None => false,
+    }
+}
+
+/// Remove the `kubeconfig-<pid>-<start>-<n>.yaml` copies in the runtime dir whose writer is
+/// gone (T44: by owner, never by age); returns how many. A copy named without a start (an
+/// older AppRafter's, or an OS that did not say) goes only when its pid is gone. A missing
+/// dir is zero and is not created; a name with no pid, a link and anything else are not ours
+/// to judge.
+pub fn sweep_stale(ctx: &Context) -> CoreResult<usize> {
     let entries = match fs::read_dir(ctx.runtime_dir()) {
         Ok(entries) => entries,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
         Err(e) => return Err(io_error(e)),
     };
-    let now = SystemTime::now();
     let mut removed = 0;
     for entry in entries {
         let entry = entry.map_err(io_error)?;
-        if !entry.file_name().to_string_lossy().starts_with(PREFIX) {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(parts) = name
+            .strip_prefix(PREFIX)
+            .and_then(|rest| rest.strip_suffix(".yaml"))
+            .map(|rest| rest.split('-').collect::<Vec<_>>())
+        else {
             continue;
-        }
+        };
+        let (pid, recorded) = match parts.as_slice() {
+            [pid, start, _n] => (pid.parse::<u32>().ok(), start.parse::<u64>().ok()),
+            [pid, _n] => (pid.parse::<u32>().ok(), None),
+            _ => continue,
+        };
+        let Some(pid) = pid else {
+            continue;
+        };
         // DirEntry::metadata does not follow a symlink: a link is never ours, never removed.
         let meta = entry.metadata().map_err(io_error)?;
-        let old = meta
-            .modified()
-            .ok()
-            .and_then(|m| now.duration_since(m).ok())
-            .is_some_and(|age| age >= older_than);
-        if !meta.is_file() || !old {
+        if !meta.is_file()
+            || !stale(
+                crate::process::alive(pid),
+                crate::process::started(pid),
+                recorded,
+            )
+        {
             continue;
         }
         match fs::remove_file(entry.path()) {
@@ -107,9 +151,15 @@ pub fn sweep_stale(ctx: &Context, older_than: Duration) -> CoreResult<usize> {
 fn write_private(dir: &Path, bytes: &[u8]) -> CoreResult<MaterialisedKubeconfig> {
     ensure_private_dir(dir)?;
     let pid = std::process::id();
+    let start = crate::process::started(pid).map(crate::process::ProcStart::raw);
     for _ in 0..NAME_ATTEMPTS {
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let path = dir.join(format!("{PREFIX}{pid}-{n}.yaml"));
+        // D.4a T44: the writer's pid and start, as the sweep reads them back; no start (an OS
+        // that does not say) is the name without one, kept while the pid lives.
+        let path = dir.join(match start {
+            Some(start) => format!("{PREFIX}{pid}-{start}-{n}.yaml"),
+            None => format!("{PREFIX}{pid}-{n}.yaml"),
+        });
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -187,6 +237,7 @@ mod tests {
     use super::*;
     use cli_core::target::{Target, TargetConfig, TargetCredentials};
     use cli_state::HetznerCloudState;
+    use std::time::{Duration, SystemTime};
 
     const YAML: &str = "apiVersion: v1\nkind: Config\nclusters: []\n";
 
@@ -396,35 +447,117 @@ mod tests {
         );
     }
 
+    /// T44, critic W2 and finding 7: a copy's fate is its owner's — gone, or another process
+    /// under its pid, told by the start its name records — and never its age or the clock.
     #[test]
-    fn sweep_removes_only_old_kubeconfig_copies() {
+    fn the_sweep_judges_a_copy_by_its_owner_never_by_its_age() {
+        let me = crate::process::started(std::process::id()).unwrap();
+        let other = me.raw().wrapping_add(1);
+        assert!(
+            !stale(Some(true), Some(me), Some(me.raw())),
+            "the writer's own copy stays"
+        );
+        assert!(
+            !stale(Some(true), None, Some(other)),
+            "an owner of unknown start stays"
+        );
+        assert!(
+            !stale(Some(true), Some(me), None),
+            "no recorded start: kept while it lives"
+        );
+        assert!(
+            !stale(None, None, Some(other)),
+            "an owner the OS will not name stays"
+        );
+        assert!(
+            stale(Some(false), None, Some(me.raw())),
+            "a gone owner's copy goes"
+        );
+        assert!(
+            stale(Some(false), None, None),
+            "with or without a recorded start"
+        );
+        assert!(
+            stale(Some(true), Some(me), Some(other)),
+            "a reused pid's copy goes"
+        );
+    }
+
+    #[test]
+    fn the_sweep_removes_what_a_gone_or_earlier_process_left() {
         let s = store(None);
         let dir = s.ctx.runtime_dir();
         fs::create_dir_all(dir).unwrap();
-        for name in ["kubeconfig-1-0.yaml", "kubeconfig-2-0.yaml", "notes.txt"] {
-            fs::write(dir.join(name), "x").unwrap();
-        }
-        aged(
-            &dir.join("kubeconfig-1-0.yaml"),
-            Duration::from_secs(2 * 3600),
-        );
-        aged(&dir.join("notes.txt"), Duration::from_secs(2 * 3600));
-        assert_eq!(sweep_stale(&s.ctx, STALE_KUBECONFIG_AGE).unwrap(), 1);
-        assert!(!dir.join("kubeconfig-1-0.yaml").exists());
+        let me = std::process::id();
+        let start = crate::process::started(me).unwrap().raw();
+        let dead = crate::process::owner_tests::NO_SUCH_PID;
+        let at = |name: &str| {
+            let path = dir.join(name);
+            fs::write(&path, "x").unwrap();
+            path
+        };
+        let mine = at(&format!("kubeconfig-{me}-{start}-1.yaml"));
+        // A long session, or a clock stepped by hours: the writer's own copy stays.
+        aged(&mine, Duration::from_secs(48 * 3600));
+        let earlier = at(&format!("kubeconfig-{me}-{}-2.yaml", start.wrapping_sub(1)));
+        let gone = at(&format!("kubeconfig-{dead}-{start}-1.yaml"));
+        let legacy_mine = at(&format!("kubeconfig-{me}-3.yaml"));
+        let legacy_gone = at(&format!("kubeconfig-{dead}-1.yaml"));
+        let notes = at("notes.txt");
+        aged(&notes, Duration::from_secs(48 * 3600));
+        let odd = at("kubeconfig-x-1.yaml");
+        assert_eq!(sweep_stale(&s.ctx).unwrap(), 3);
+        assert!(mine.exists(), "this process's copy is live, however old");
         assert!(
-            dir.join("kubeconfig-2-0.yaml").exists(),
-            "a live copy is never swept"
+            legacy_mine.exists(),
+            "no recorded start: kept while its pid lives"
         );
         assert!(
-            dir.join("notes.txt").exists(),
-            "only kubeconfig-* files are ours to sweep"
+            !earlier.exists(),
+            "an earlier process under this pid left it"
+        );
+        assert!(
+            !gone.exists() && !legacy_gone.exists(),
+            "its writer is gone"
+        );
+        assert!(
+            notes.exists() && odd.exists(),
+            "only kubeconfig-<pid>-…yaml is ours"
+        );
+    }
+
+    /// The materialiser sweeps before it writes (after the fence, never at every start), and
+    /// names its copy with this process's pid and start.
+    #[test]
+    fn materialising_sweeps_what_a_gone_process_left() {
+        let s = store(None);
+        fs::create_dir_all(s.ctx.runtime_dir()).unwrap();
+        let gone = s.ctx.runtime_dir().join(format!(
+            "kubeconfig-{}-1-1.yaml",
+            crate::process::owner_tests::NO_SUCH_PID
+        ));
+        fs::write(&gone, "x").unwrap();
+        let file = materialise(&s.ctx, YAML).unwrap();
+        assert!(!gone.exists());
+        assert_eq!(fs::read_to_string(file.path()).unwrap(), YAML);
+        let me = std::process::id();
+        let start = crate::process::started(me).unwrap().raw();
+        let name = file
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            name.starts_with(&format!("kubeconfig-{me}-{start}-")),
+            "{name}"
         );
     }
 
     #[test]
     fn sweeping_a_missing_dir_is_zero_and_creates_nothing() {
         let s = store(None);
-        assert_eq!(sweep_stale(&s.ctx, STALE_KUBECONFIG_AGE).unwrap(), 0);
+        assert_eq!(sweep_stale(&s.ctx).unwrap(), 0);
         assert!(!s.ctx.runtime_dir().exists());
     }
 }

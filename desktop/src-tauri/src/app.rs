@@ -866,13 +866,12 @@ fn idle_tick(shell: &Shell) {
     shell.drafts.sweep();
 }
 
-/// Remove the stale `kubeconfig-*` files from `context`'s runtime dir — older than the core's
-/// [`STALE_KUBECONFIG_AGE`](apprafter_core::runtime::STALE_KUBECONFIG_AGE) (R9): what a crash
-/// left; how many went. A failure is a logged warning, never fatal: the next start, and every
-/// doctor run, tries again.
+/// Remove the `kubeconfig-*` copies a gone process left in `context`'s runtime dir (by owner,
+/// never by age: D.4a T44); how many went. A failure is a logged warning, never fatal: the next
+/// start, and every doctor run, tries again.
 pub fn sweep_runtime_dir(context: &Context) -> usize {
-    use apprafter_core::runtime::{sweep_stale, STALE_KUBECONFIG_AGE};
-    match sweep_stale(context, STALE_KUBECONFIG_AGE) {
+    use apprafter_core::runtime::sweep_stale;
+    match sweep_stale(context) {
         Ok(removed) => {
             if removed > 0 {
                 tracing::info!(removed, "removed stale kubeconfigs from the runtime dir");
@@ -2084,26 +2083,22 @@ mod tests {
     }
 
     #[test]
-    fn the_runtime_sweep_removes_only_stale_kubeconfigs() {
+    fn the_runtime_sweep_removes_only_what_a_gone_process_left() {
         let dir = tempfile::tempdir().unwrap();
         let run = dir.path().join("run");
         std::fs::create_dir_all(&run).unwrap();
-        let old = std::time::SystemTime::now() - Duration::from_secs(2 * 60 * 60);
-        for (name, stale) in [
-            ("kubeconfig-1-1.yaml", true),
-            ("kubeconfig-1-2.yaml", false),
-            ("notes.txt", true),
-        ] {
-            let file = std::fs::File::create(run.join(name)).unwrap();
-            if stale {
-                file.set_modified(old).unwrap();
-            }
+        // Names without a recorded start, as a pre-D.4a client wrote them: judged by the pid
+        // alone (the core's tests cover the recorded start, `runtime.rs`).
+        let gone = format!("kubeconfig-{}-1.yaml", 0x3FFF_FFF0_u32);
+        let mine = format!("kubeconfig-{}-1.yaml", std::process::id());
+        for name in [gone.as_str(), mine.as_str(), "notes.txt"] {
+            std::fs::write(run.join(name), "x").unwrap();
         }
         let ctx = Context::for_desktop(dir.path().join("store"), "http://127.0.0.1:9")
             .with_runtime_dir(run.clone());
         assert_eq!(super::sweep_runtime_dir(&ctx), 1);
-        assert!(!run.join("kubeconfig-1-1.yaml").exists());
-        assert!(run.join("kubeconfig-1-2.yaml").exists() && run.join("notes.txt").exists());
+        assert!(!run.join(&gone).exists());
+        assert!(run.join(&mine).exists() && run.join("notes.txt").exists());
         // A runtime dir that cannot be read is a warning, never an error: none removed.
         let unreadable = Context::for_desktop(dir.path().join("store"), "http://127.0.0.1:9")
             .with_runtime_dir(run.join("notes.txt"));

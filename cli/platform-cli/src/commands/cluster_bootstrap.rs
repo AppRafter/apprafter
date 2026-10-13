@@ -281,7 +281,7 @@ pub(crate) fn run_with<H: HelmRunner, K: KubectlRunner>(
     // A read through the core's secret store: the age key is never created here (GOTCHA-120).
     let ctx = crate::context::legacy_context()?;
     let plaintext = age_cache::cached_kubeconfig(&ctx.secrets(), &hetzner, &resolved.target_name)?;
-    let kubeconfig_file = write_tempfile_with("apprafter-kubeconfig-", &plaintext)?;
+    let kubeconfig_file = crate::commands::k8s_helpers::materialise(&ctx, &plaintext)?;
 
     // Consult the target for its tier hint. Previously the store
     // handle was constructed inline (and tolerated a missing config
