@@ -68,6 +68,9 @@ const ENV_READS: &[&str] = &[
     "std::env::home_dir",
     "libc::getenv",
     "libc::secure_getenv",
+    // A per-user lookup that ignores the environment (macOS `_CS_DARWIN_USER_TEMP_DIR`): the
+    // holder's base reaches it only through one sanctioned cli-core wrapper (D.4a T8, G2).
+    "libc::confstr",
 ];
 
 /// Modules whose every item reads or writes the process environment,
@@ -190,6 +193,17 @@ const FORBIDDEN_DEPS: &[&str] = &[
     "owo-colors",
 ];
 
+/// G2 (D.4a T8): the holder's endpoint is derived in one function from `Context` inputs, never
+/// from a uid (`/run/user/<uid>`) or a fixed pipe prefix (`\\.\pipe\`). The functions (`fn` or
+/// `Type::fn`, as [`SANCTIONED`] names sites) allowed to spell one, in the ratcheted crates and
+/// the core; empty until d4a-e adds its endpoint function.
+const ENDPOINT_LITERALS: &[&str] = &[];
+
+/// A string literal G2 keeps in [`ENDPOINT_LITERALS`].
+fn is_endpoint_literal(value: &str) -> bool {
+    value.contains("/run/user") || value.contains(r"\\.\pipe\")
+}
+
 // ---------------------------------------------------------------------
 // The scanner
 // ---------------------------------------------------------------------
@@ -213,6 +227,8 @@ enum Kind {
     /// A `ts(export)` / `ts(export_to = …)` attribute, or a direct
     /// `TS::export*` call ([`ts_exports`]).
     TsExport,
+    /// A per-user runtime path or a Windows pipe name outside [`ENDPOINT_LITERALS`] (G2).
+    EndpointLiteral,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -467,6 +483,8 @@ struct Scanner<'f> {
     impl_types: Vec<String>,
     /// `Type::name` / `name` of the enclosing functions, innermost last.
     fns: Vec<String>,
+    /// Inside an attribute, a doc comment included: a literal there spells no endpoint.
+    in_attribute: bool,
     scan: Scan,
 }
 
@@ -571,6 +589,22 @@ impl<'f> Scanner<'f> {
         });
     }
 
+    /// G2: record `value` when it spells an endpoint outside [`ENDPOINT_LITERALS`].
+    fn check_literal(&mut self, value: &str, span: Span) {
+        if self.in_attribute || !is_endpoint_literal(value) {
+            return;
+        }
+        let site = self.fns.last().cloned().unwrap_or_default();
+        if ENDPOINT_LITERALS.contains(&site.as_str()) {
+            return;
+        }
+        self.record(
+            Kind::EndpointLiteral,
+            format!("{value:?} in `{site}`"),
+            span,
+        );
+    }
+
     fn skip_out_of_line(&mut self, m: &syn::ItemMod) {
         let explicit = m.attrs.iter().find_map(|a| match &a.meta {
             Meta::NameValue(nv) if nv.path.is_ident("path") => match &nv.value {
@@ -657,6 +691,12 @@ impl<'f> Scanner<'f> {
                         }
                     }
                     i = j;
+                }
+                TokenTree::Literal(lit) => {
+                    if let Ok(s) = syn::parse_str::<syn::LitStr>(&lit.to_string()) {
+                        self.check_literal(&s.value(), lit.span());
+                    }
+                    i += 1;
                 }
                 _ => i += 1,
             }
@@ -813,6 +853,16 @@ impl<'ast, 'f> Visit<'ast> for Scanner<'f> {
         visit::visit_path(self, p);
     }
 
+    fn visit_attribute(&mut self, a: &'ast Attribute) {
+        let outer = std::mem::replace(&mut self.in_attribute, true);
+        visit::visit_attribute(self, a);
+        self.in_attribute = outer;
+    }
+
+    fn visit_lit_str(&mut self, l: &'ast syn::LitStr) {
+        self.check_literal(&l.value(), l.span());
+    }
+
     fn visit_macro(&mut self, mac: &'ast syn::Macro) {
         let segs: Vec<String> = mac
             .path
@@ -837,6 +887,7 @@ fn scan_source(path: &Path, src: &str) -> Scan {
         inline_mods: Vec::new(),
         impl_types: Vec::new(),
         fns: Vec::new(),
+        in_attribute: false,
         scan: Scan::default(),
     };
     if cfg_implies_test(&file.attrs) {
@@ -1158,6 +1209,488 @@ fn env_reads_outside_the_core_only_go_down() {
         n == ENV_READ_BASELINE,
         "env reads fell to {n}: lower ENV_READ_BASELINE in this file to {n} in the same commit"
     );
+}
+
+#[test]
+fn holder_endpoints_are_spelled_only_where_listed() {
+    let mut hits = Vec::new();
+    for krate in RATCHETED_CRATES.iter().chain(&["apprafter-core"]) {
+        hits.extend(
+            scan_tree(&crate_dir(krate).join("src"))
+                .into_iter()
+                .filter(|f| f.kind == Kind::EndpointLiteral),
+        );
+    }
+    assert!(
+        hits.is_empty(),
+        "a per-user runtime path or a pipe name outside ENDPOINT_LITERALS (D.4a T8, G2): the \
+         holder's endpoint is derived in one function from Context inputs, never from a uid or a \
+         fixed pipe prefix:\n{}",
+        hits.iter()
+            .map(|h| h.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+// ---------------------------------------------------------------------
+// G3: real-environment contexts in tests (D.4a T6, T8)
+// ---------------------------------------------------------------------
+
+/// Every member of the `cli/` workspace: G3 reads the test code of each.
+const CLI_MEMBERS: &[&str] = &[
+    "platform-cli",
+    "docsgen",
+    "cli-core",
+    "cli-state",
+    "cli-providers",
+    "apprafter-core",
+    "backup-core",
+    "apprafter-backup",
+];
+
+/// What builds a context from, or looks a location up in, the real environment of whoever runs
+/// the tests, as the last segments of a value path (`a::Context::from_cli_env` matches
+/// `Context::from_cli_env`); any `dirs::*` too.
+const REAL_ENV_BUILDERS: &[&[&str]] = &[
+    &["Context", "from_cli_env"],
+    &["Context", "from_desktop_env"],
+    &["default_config_root"],
+    &["default_age_key_path"],
+    &["default_ssh_identity_path"],
+    &["home_dir"],
+    &["AllowListEnv", "from_process"],
+    &["ProcessEnv"],
+    &["cli_context"],
+    &["desktop_context"],
+];
+
+/// What reads or writes a store's secrets, a key or a cache, or runs a check that does: a test
+/// that built its context from the real environment calls none of them, or it would read the
+/// real store of whoever runs it. d4a's later steps add `Context::secrets` and the `lock`,
+/// `vault` and `holder` openers.
+const OPENERS: &[&[&str]] = &[
+    &["load_identity"],
+    &["load_or_create_identity"],
+    &["load_or_create_identity_reporting"],
+    &["save_target"],
+    &["load_target"],
+    &["materialise_kubeconfig"],
+    &["cached_kubeconfig"],
+    &["doctor", "run"],
+];
+
+/// The test functions allowed a real-environment builder — each compares paths or values and
+/// opens nothing — as (file under `cli/`, function; `Type::name` inside an `impl`). A listed
+/// function that is not itself a `#[test]` (a helper) hands what it built on: a call to it by
+/// path counts as a builder in its caller, which must then be listed too and open nothing
+/// (critic finding 10; none is listed here today, the desktop's `real_api_base` is one).
+const REAL_ENV_TESTS: &[(&str, &str)] = &[
+    // The context builders' own tests: what each reads, and how the two clients agree.
+    (
+        "apprafter-core/src/context.rs",
+        "cli_env_reads_every_cli_input",
+    ),
+    (
+        "apprafter-core/src/context.rs",
+        "empty_cli_overrides_are_kept_as_the_cli_reads_them",
+    ),
+    (
+        "apprafter-core/src/context.rs",
+        "the_age_key_defaults_under_the_home_unless_overridden",
+    ),
+    (
+        "apprafter-core/src/context.rs",
+        "the_desktop_takes_tool_path_and_runtime_dir_from_its_host",
+    ),
+    (
+        "apprafter-core/src/context.rs",
+        "cli_env_reads_store_root_api_base_and_token",
+    ),
+    (
+        "apprafter-core/src/context.rs",
+        "cli_env_defaults_without_variables",
+    ),
+    (
+        "apprafter-core/src/context.rs",
+        "an_empty_token_is_no_override",
+    ),
+    (
+        "apprafter-core/src/context.rs",
+        "an_empty_api_base_is_kept_as_the_cli_did",
+    ),
+    (
+        "apprafter-core/src/context.rs",
+        "the_desktop_ignores_every_cli_override_it_inherits",
+    ),
+    (
+        "apprafter-core/src/context.rs",
+        "the_desktop_store_root_defaults_like_the_cli",
+    ),
+    (
+        "apprafter-core/src/context.rs",
+        "a_release_build_ignores_an_inherited_non_loopback_api_base",
+    ),
+    (
+        "apprafter-core/src/context.rs",
+        "the_desktop_reads_only_its_allow_list",
+    ),
+    (
+        "apprafter-core/src/context.rs",
+        "a_test_build_honours_a_loopback_api_base_only",
+    ),
+    (
+        "apprafter-core/src/context.rs",
+        "a_test_build_still_ignores_the_token_override",
+    ),
+    (
+        "apprafter-core/src/context.rs",
+        "a_refused_api_base_never_shows_its_value",
+    ),
+    (
+        "apprafter-core/src/context.rs",
+        "a_secret_never_shows_in_debug",
+    ),
+    // whoami pings with the stored token, not the CLI override: the override needs the CLI's
+    // builder; the store is a tempdir it names.
+    (
+        "apprafter-core/src/session.rs",
+        "no_ping_skips_and_a_ping_uses_the_stored_token_even_with_an_override",
+    ),
+    // The token and the SKU check under the CLI override: the override needs the CLI's
+    // builder; the store is a tempdir the test names (critic finding 4).
+    (
+        "apprafter-core/src/target/read.rs",
+        "the_token_is_the_cli_override_else_the_stored_one",
+    ),
+    (
+        "apprafter-core/src/target/machine.rs",
+        "the_cli_override_token_validates_the_sku",
+    ),
+    // The legacy resolvers' own tests (d4a-b deletes default_age_key_path and its test).
+    (
+        "cli-core/src/secrets.rs",
+        "default_age_key_path_honours_env_override",
+    ),
+    (
+        "cli-core/src/target.rs",
+        "default_config_root_points_at_user_config_dir_under_apprafter",
+    ),
+    (
+        "cli-core/src/target.rs",
+        "default_config_root_honours_apprafter_config_dir_env_override",
+    ),
+    (
+        "cli-core/src/target.rs",
+        "default_config_root_ignores_empty_env_override",
+    ),
+    (
+        "cli-providers/src/hetzner_cloud/kubeconfig.rs",
+        "default_ssh_identity_path_honours_env_override",
+    ),
+    // The wizard's token source compares against the override the CLI's builder read.
+    (
+        "platform-cli/src/commands/target_wizard.rs",
+        "the_token_source_compares_against_the_cli_override_not_the_process_env",
+    ),
+    // The Windows release gate: every per-user default resolves under the profile.
+    (
+        "platform-cli/tests/windows_profile_paths_test.rs",
+        "per_user_defaults_resolve_under_the_profile_whatever_home_says",
+    ),
+];
+
+/// One builder or opener in test code.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct EnvUse {
+    file: String,
+    site: String,
+    line: usize,
+    opener: bool,
+    what: String,
+}
+
+/// G3's scan of one file: the builders and openers in its test code, with the function each sits
+/// in, and every function of its test code.
+struct RealEnvScanner<'f> {
+    file: &'f str,
+    /// The names of the listed functions: a call to one counts as a builder (`REAL_ENV_TESTS`).
+    helpers: &'f [&'f str],
+    /// The whole file is test code (under `tests/`, `#![cfg(test)]`, an out-of-line test module).
+    whole: bool,
+    /// `cfg(test)` items around the current node.
+    test_depth: usize,
+    impl_types: Vec<String>,
+    fns: Vec<String>,
+    uses: Vec<EnvUse>,
+    sites: HashSet<String>,
+}
+
+impl RealEnvScanner<'_> {
+    fn in_test(&self) -> bool {
+        self.whole || self.test_depth > 0
+    }
+
+    fn check(&mut self, segs: &[String], span: Span) {
+        if !self.in_test() {
+            return;
+        }
+        let ends = |pat: &[&str]| {
+            segs.len() >= pat.len()
+                && segs[segs.len() - pat.len()..]
+                    .iter()
+                    .zip(pat)
+                    .all(|(a, b)| a == b)
+        };
+        let last = segs.last();
+        let hit = if segs.len() >= 2 && segs[0] == "dirs" {
+            Some((false, segs.join("::")))
+        } else if let Some(p) = REAL_ENV_BUILDERS.iter().find(|p| ends(p)) {
+            Some((false, p.join("::")))
+        } else if let Some(h) = self.helpers.iter().find(|h| last.is_some_and(|l| l == **h)) {
+            Some((false, format!("{h} (a listed helper)")))
+        } else {
+            OPENERS
+                .iter()
+                .find(|p| ends(p))
+                .map(|p| (true, p.join("::")))
+        };
+        if let Some((opener, what)) = hit {
+            self.uses.push(EnvUse {
+                file: self.file.to_string(),
+                site: self.fns.last().cloned().unwrap_or_default(),
+                line: line_of(span),
+                opener,
+                what,
+            });
+        }
+    }
+
+    fn function(&mut self, name: String, f: impl FnOnce(&mut Self)) {
+        if self.in_test() {
+            self.sites.insert(name.clone());
+        }
+        self.fns.push(name);
+        f(self);
+        self.fns.pop();
+    }
+
+    /// A macro body that parses as neither expressions nor statements: every `a::b` run of
+    /// identifiers not after a `.`.
+    fn tokens(&mut self, tokens: TokenStream) {
+        let tts: Vec<TokenTree> = tokens.into_iter().collect();
+        let punct =
+            |i: usize, c: char| matches!(tts.get(i), Some(TokenTree::Punct(p)) if p.as_char() == c);
+        let mut i = 0;
+        while i < tts.len() {
+            match &tts[i] {
+                TokenTree::Group(g) => {
+                    self.tokens(g.stream());
+                    i += 1;
+                }
+                TokenTree::Ident(id) => {
+                    let after_dot = i > 0 && punct(i - 1, '.');
+                    let mut segs = vec![id.to_string()];
+                    let mut j = i + 1;
+                    while punct(j, ':') && punct(j + 1, ':') {
+                        match tts.get(j + 2) {
+                            Some(TokenTree::Ident(next)) => {
+                                segs.push(next.to_string());
+                                j += 3;
+                            }
+                            _ => break,
+                        }
+                    }
+                    if !after_dot {
+                        self.check(&segs, id.span());
+                    }
+                    i = j;
+                }
+                _ => i += 1,
+            }
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for RealEnvScanner<'_> {
+    fn visit_item(&mut self, item: &'ast Item) {
+        let test = usize::from(cfg_implies_test(item_attrs(item)));
+        self.test_depth += test;
+        visit::visit_item(self, item);
+        self.test_depth -= test;
+    }
+
+    fn visit_impl_item(&mut self, item: &'ast ImplItem) {
+        let test = usize::from(cfg_implies_test(impl_item_attrs(item)));
+        self.test_depth += test;
+        visit::visit_impl_item(self, item);
+        self.test_depth -= test;
+    }
+
+    fn visit_item_impl(&mut self, i: &'ast syn::ItemImpl) {
+        let name = match &*i.self_ty {
+            syn::Type::Path(tp) => tp
+                .path
+                .segments
+                .last()
+                .map(|s| s.ident.to_string())
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
+        self.impl_types.push(name);
+        visit::visit_item_impl(self, i);
+        self.impl_types.pop();
+    }
+
+    fn visit_impl_item_fn(&mut self, f: &'ast syn::ImplItemFn) {
+        let owner = self.impl_types.last().cloned().unwrap_or_default();
+        self.function(format!("{owner}::{}", f.sig.ident), |s| {
+            visit::visit_impl_item_fn(s, f)
+        });
+    }
+
+    fn visit_item_fn(&mut self, f: &'ast syn::ItemFn) {
+        self.function(f.sig.ident.to_string(), |s| visit::visit_item_fn(s, f));
+    }
+
+    fn visit_expr_path(&mut self, e: &'ast syn::ExprPath) {
+        let segs: Vec<String> = e
+            .path
+            .segments
+            .iter()
+            .map(|s| s.ident.to_string())
+            .collect();
+        if let Some(first) = e.path.segments.first() {
+            self.check(&segs, first.ident.span());
+        }
+        visit::visit_expr_path(self, e);
+    }
+
+    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        if let Ok(args) = mac.parse_body_with(Punctuated::<Expr, syn::Token![,]>::parse_terminated)
+        {
+            for e in &args {
+                self.visit_expr(e);
+            }
+        } else if let Ok(stmts) = mac.parse_body_with(syn::Block::parse_within) {
+            for s in &stmts {
+                self.visit_stmt(s);
+            }
+        } else {
+            self.tokens(mac.tokens.clone());
+        }
+    }
+}
+
+/// G3's scan of `src`, the file `file` (under `cli/`); `whole` when all of it is test code;
+/// `helpers` the names whose call counts as a builder.
+fn real_env_source(
+    file: &str,
+    src: &str,
+    whole: bool,
+    helpers: &[&str],
+) -> (Vec<EnvUse>, HashSet<String>) {
+    let parsed = syn::parse_file(src).unwrap_or_else(|e| panic!("parse {file}: {e}"));
+    let mut s = RealEnvScanner {
+        file,
+        helpers,
+        whole: whole || cfg_implies_test(&parsed.attrs),
+        test_depth: 0,
+        impl_types: Vec::new(),
+        fns: Vec::new(),
+        uses: Vec::new(),
+        sites: HashSet::new(),
+    };
+    s.visit_file(&parsed);
+    (s.uses, s.sites)
+}
+
+/// G3 over the workspace: every use, and every test function per file.
+fn real_env_scan() -> (Vec<EnvUse>, HashMap<String, HashSet<String>>) {
+    let mut uses = Vec::new();
+    let mut sites: HashMap<String, HashSet<String>> = HashMap::new();
+    // Every listed name, by its last segment: a `#[test]` is never called, so only a helper's
+    // name can match a call (REAL_ENV_TESTS).
+    let helpers: Vec<&str> = REAL_ENV_TESTS
+        .iter()
+        .map(|&(_, site)| site.rsplit("::").next().unwrap_or(site))
+        .collect();
+    for member in CLI_MEMBERS {
+        let krate = crate_dir(member);
+        let src_files = rust_files(&krate.join("src"));
+        // Out-of-line test modules, as the purity scan finds them.
+        let (mut test_files, mut test_dirs) = (Vec::new(), Vec::new());
+        for f in &src_files {
+            let scan = scan_source(f, &fs::read_to_string(f).unwrap());
+            test_files.extend(scan.test_module_files);
+            test_dirs.extend(scan.test_module_dirs);
+        }
+        let tests_dir = krate.join("tests");
+        let test_tree = if tests_dir.is_dir() {
+            rust_files(&tests_dir)
+        } else {
+            Vec::new()
+        };
+        for f in src_files.iter().chain(&test_tree) {
+            let whole = f.starts_with(&tests_dir)
+                || test_files.contains(f)
+                || test_dirs.iter().any(|d| f.starts_with(d));
+            let rel = f
+                .strip_prefix(cli_dir())
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            let (u, s) = real_env_source(&rel, &fs::read_to_string(f).unwrap(), whole, &helpers);
+            uses.extend(u);
+            sites.entry(rel).or_default().extend(s);
+        }
+    }
+    uses.sort();
+    (uses, sites)
+}
+
+#[test]
+fn real_environment_contexts_in_tests_stay_where_listed_and_open_nothing() {
+    let (uses, sites) = real_env_scan();
+    let listed =
+        |file: &str, site: &str| REAL_ENV_TESTS.iter().any(|(f, s)| *f == file && *s == site);
+    let show = |u: &EnvUse| format!("{}:{}: `{}` in `{}`", u.file, u.line, u.what, u.site);
+    let unlisted: Vec<String> = uses
+        .iter()
+        .filter(|u| !u.opener && !listed(&u.file, &u.site))
+        .map(show)
+        .collect();
+    assert!(
+        unlisted.is_empty(),
+        "a test builds a context from the real environment outside REAL_ENV_TESTS (D.4a T6, \
+         G3): build it with Context::for_desktop(<tempdir>) instead, or list the function if it \
+         only compares paths:\n{}",
+        unlisted.join("\n")
+    );
+    let opening: Vec<String> = uses
+        .iter()
+        .filter(|u| u.opener && listed(&u.file, &u.site))
+        .map(show)
+        .collect();
+    assert!(
+        opening.is_empty(),
+        "a test that builds from the real environment also opens a secret, a key or a cache: it \
+         would read the real store of whoever runs it:\n{}",
+        opening.join("\n")
+    );
+    for (file, site) in REAL_ENV_TESTS {
+        assert!(
+            sites.get(*file).is_some_and(|s| s.contains(*site)),
+            "REAL_ENV_TESTS names {file} `{site}`, which is no test function there: a rename \
+             left the guard blind"
+        );
+        assert!(
+            uses.iter()
+                .any(|u| !u.opener && u.file == *file && u.site == *site),
+            "REAL_ENV_TESTS names {file} `{site}`, which no longer builds from the real \
+             environment: drop the entry"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1643,5 +2176,135 @@ serde   = "1"
         let mut got = forbidden_deps(member, workspace);
         got.sort();
         assert_eq!(got, vec!["ctrlc", "inquire", "owo-colors"]);
+    }
+
+    #[test]
+    fn confstr_is_an_env_read() {
+        // A per-user lookup that ignores the environment (macOS `_CS_DARWIN_USER_TEMP_DIR`).
+        let src = "fn f() { unsafe { libc::confstr(65537, std::ptr::null_mut(), 0); } }";
+        assert_eq!(hits(src), vec![read("libc::confstr", 1)]);
+    }
+
+    #[test]
+    fn a_runtime_path_or_a_pipe_name_is_an_endpoint_literal() {
+        let src = r###"
+fn f() {
+    let _ = "/run/user/1000/apprafter";
+    let _ = r"\\.\pipe\apprafter-x";
+    let _ = format!("/run/user/{}", 1);
+}
+#[doc = "/run/user/1000 in a doc comment is no endpoint"]
+fn g() { let _ = "/var/run/apprafter"; }
+"###;
+        let got: Vec<(Kind, usize)> = hits(src)
+            .into_iter()
+            .map(|(kind, _, line)| (kind, line))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (Kind::EndpointLiteral, 3),
+                (Kind::EndpointLiteral, 4),
+                (Kind::EndpointLiteral, 5),
+            ]
+        );
+    }
+}
+
+// ---------------------------------------------------------------------
+// G3's scanner, on sources of its own
+// ---------------------------------------------------------------------
+
+mod real_env {
+    use super::*;
+
+    fn uses_with(src: &str, whole: bool, helpers: &[&str]) -> Vec<(String, bool, String)> {
+        real_env_source("x.rs", src, whole, helpers)
+            .0
+            .into_iter()
+            .map(|u| (u.site, u.opener, u.what))
+            .collect()
+    }
+
+    fn uses(src: &str, whole: bool) -> Vec<(String, bool, String)> {
+        uses_with(src, whole, &[])
+    }
+
+    fn row(site: &str, opener: bool, what: &str) -> (String, bool, String) {
+        (site.to_string(), opener, what.to_string())
+    }
+
+    #[test]
+    fn a_builder_and_an_opener_in_a_test_module_are_seen_with_their_function() {
+        let src = "\
+fn production() { let _ = Context::from_cli_env(&ProcessEnv); }
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn t() {
+        let ctx = apprafter_core::Context::from_cli_env(&MapEnv::new()).unwrap();
+        let _ = crate::runtime::materialise_kubeconfig(&ctx, &target);
+    }
+}
+";
+        assert_eq!(
+            uses(src, false),
+            vec![
+                row("t", false, "Context::from_cli_env"),
+                row("t", true, "materialise_kubeconfig"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_whole_test_file_counts_and_macro_arguments_are_read() {
+        let src = "fn t() { assert_eq!(cli_core::secrets::default_age_key_path(), p); let _ = dirs::home_dir(); }";
+        assert_eq!(
+            uses(src, true),
+            vec![
+                row("t", false, "default_age_key_path"),
+                row("t", false, "dirs::home_dir"),
+            ]
+        );
+    }
+
+    #[test]
+    fn methods_types_and_imports_are_no_builders() {
+        let src = "\
+use cli_core::paths::home_dir;
+struct ProcessEnv;
+impl EnvSource for ProcessEnv {}
+fn t(ctx: &Context) -> ProcessEnv { let _ = ctx.home_dir(); todo!() }
+";
+        assert_eq!(uses(src, true), Vec::<(String, bool, String)>::new());
+    }
+
+    #[test]
+    fn a_method_is_named_with_its_type() {
+        let src =
+            "#[cfg(test)]\nmod tests { struct S; impl S { fn build() { let _ = ProcessEnv; } } }";
+        assert_eq!(uses(src, false), vec![row("S::build", false, "ProcessEnv")]);
+    }
+
+    /// Critic finding 10: a listed helper hands what it built on, so a call to it (by path:
+    /// `real_ctx()`, `Self::real_ctx()`, `S::real_ctx()`) counts as a builder in its caller.
+    #[test]
+    fn a_call_to_a_listed_helper_counts_as_a_builder() {
+        let src = "\
+fn t() {
+    let ctx = real_ctx();
+    let _ = cli_core::load_target(&ctx.store(), \"x\");
+}
+fn u() { let _ = Self::real_ctx(); let _ = other(); }
+";
+        assert_eq!(
+            uses_with(src, true, &["real_ctx"]),
+            vec![
+                row("t", false, "real_ctx (a listed helper)"),
+                row("t", true, "load_target"),
+                row("u", false, "real_ctx (a listed helper)"),
+            ]
+        );
+        assert_eq!(uses(src, true), vec![row("t", true, "load_target")]);
     }
 }
