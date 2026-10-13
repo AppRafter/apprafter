@@ -226,6 +226,43 @@ fn harness_stand_in_tools_link_every_probed_tool() {
     }
 }
 
+/// D.4a S0.2: a golden case runs the CLI through the one spawn point (`common/spawn.rs`), so it
+/// gets the sandbox fence, a runtime and a temp directory of its own and no controlling terminal,
+/// like every other spawned test — and no golden moves (every case below is the proof).
+#[test]
+fn harness_runs_the_cli_through_the_spawn_point() {
+    use common::spawn::{Bin, SANDBOX_ENV};
+    let sb = Sandbox::new();
+    let c = sb.std_cmd(&["--version"]);
+    assert_eq!(c.get_program(), std::ffi::OsStr::new(Bin::Apprafter.path()));
+    let env: std::collections::BTreeMap<String, Option<String>> = c
+        .get_envs()
+        .map(|(k, v)| {
+            (
+                k.to_string_lossy().into_owned(),
+                v.map(|v| v.to_string_lossy().into_owned()),
+            )
+        })
+        .collect();
+    let set = |name: &str| env.get(name).cloned().flatten();
+    let through = "a golden case runs the CLI through the spawn point (common/spawn.rs)";
+    assert_eq!(
+        set(SANDBOX_ENV),
+        Some(sb.root().display().to_string()),
+        "{through}: the sandbox fence"
+    );
+    assert_eq!(
+        set("XDG_RUNTIME_DIR"),
+        Some(sb.path("run").display().to_string()),
+        "{through}: a runtime directory of its own"
+    );
+    assert_eq!(
+        set("TMPDIR"),
+        Some(sb.path("tmp").display().to_string()),
+        "{through}: a temp directory of its own"
+    );
+}
+
 /// miette wraps a `×` message at 80 columns, breaking inside a word, before the harness swaps
 /// the sandbox root for `<SANDBOX>`; so a case that prints a sandbox path in one matches only
 /// while the root keeps the length it was recorded with. macOS's `TMPDIR`
@@ -2180,7 +2217,8 @@ fn a_declined_new_age_key_exits_non_zero_with_nothing_on_stdout() {
     let before = hetzner_state(&sb, "prod");
     for (how, keys) in [("no", "n\r"), ("Esc", "\x1b"), ("Ctrl-C", "\x03")] {
         let run = run_at_a_terminal(
-            sb.std_cmd(&["kubeconfig", "--refresh"]),
+            &sb,
+            &["kubeconfig", "--refresh"],
             "Create a new age key?",
             keys.as_bytes(),
         );
@@ -2207,56 +2245,18 @@ struct TerminalRun {
     terminal: String,
 }
 
-/// Run `cmd` with stdin and stderr on a pseudo-terminal of 24x100 and stdout on a pipe; once
-/// the terminal shows `prompt`, type `keys`. Panics if the prompt or the exit takes over 30 s.
-fn run_at_a_terminal(mut cmd: std::process::Command, prompt: &str, keys: &[u8]) -> TerminalRun {
+/// Run `apprafter <args>` in `sb` with stdin and stderr on a pseudo-terminal of 24x100 — the
+/// child's controlling terminal (`Spawn::std_at_terminal`) — and stdout on a pipe; once the
+/// terminal shows `prompt`, type `keys`. Panics if the prompt or the exit takes over 30 s.
+fn run_at_a_terminal(sb: &Sandbox, args: &[&str], prompt: &str, keys: &[u8]) -> TerminalRun {
     use std::io::{Read, Write};
-    use std::os::fd::{FromRawFd, OwnedFd};
     use std::process::Stdio;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    // `openpty` opens both sides and sets the size on the open slave, on Linux (glibc, musl) and
-    // macOS alike. Setting it by hand with TIOCSWINSZ on the master before the slave is open
-    // works on Linux only: macOS fails that ioctl (-1), which is how this helper first broke
-    // the macOS CI. `openpty` is in libc on glibc >= 2.34, musl and macOS, and std already links
-    // libutil on older glibc. The two platforms declare the pointers `*const` (Linux) and
-    // `*mut` (macOS): a `*mut` fits both (`&mut ws` would trip clippy's unnecessary_mut_passed
-    // on Linux).
-    let mut ws = libc::winsize {
-        ws_row: 24,
-        ws_col: 100,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    let (mut m, mut s) = (-1, -1);
-    // SAFETY: `openpty` writes two fds into `m` and `s` and reads `ws`; nothing else is passed.
-    let opened = unsafe {
-        libc::openpty(
-            &mut m,
-            &mut s,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &raw mut ws,
-        )
-    };
-    assert_eq!(opened, 0, "openpty: {}", std::io::Error::last_os_error());
-    // Neither fd may leak into a child another test spawns meanwhile: a leaked slave would keep
-    // the terminal open after this child exits. `Stdio` dups the slave onto the child's own
-    // fds, which clears the flag there.
-    for fd in [m, s] {
-        // SAFETY: fcntl on an fd `openpty` just returned.
-        let set = unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
-        assert_eq!(set, 0, "FD_CLOEXEC: {}", std::io::Error::last_os_error());
-    }
-    // SAFETY: both fds came from `openpty` and are owned here alone.
-    let (master, slave) = unsafe { (OwnedFd::from_raw_fd(m), OwnedFd::from_raw_fd(s)) };
-    let mut child = cmd
-        .stdin(Stdio::from(slave.try_clone().expect("dup slave")))
-        .stderr(Stdio::from(slave))
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn apprafter");
+    let (master, slave) = common::spawn::open_pty();
+    let mut cmd = sb.std_at_terminal(args, slave);
+    let mut child = cmd.stdout(Stdio::piped()).spawn().expect("spawn apprafter");
     // The command holds the slave's fds until it drops: drop it, so the terminal closes when
     // the child exits and the reader below sees the end.
     drop(cmd);

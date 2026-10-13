@@ -8,8 +8,10 @@
 //! byte.
 //!
 //! Every case runs the shipped binary in a hermetic sandbox:
+//! - one `common::spawn::Spawn` per sandbox, the one way any test runs the CLI: the root, the
+//!   cleared environment, the fence and the missing controlling terminal are its (D.4a S0.2);
 //! - a root of one fixed length on every machine, `/tmp/.tmpXXXXXX`
-//!   ([`SANDBOX_PARENT`]), whatever `TMPDIR` says: miette wraps a `×`
+//!   (`common::spawn::SANDBOX_PARENT`), whatever `TMPDIR` says: miette wraps a `×`
 //!   message at 80 columns before the root becomes `<SANDBOX>`, so a path
 //!   printed in one would otherwise wrap where the root is longer (macOS's
 //!   `/var/folders/…/T/`);
@@ -69,22 +71,18 @@
 //! commit. A missing golden is a failure, never a silent pass.
 
 use std::fs;
+#[cfg(unix)]
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::process::Output;
-use std::time::Duration;
 
 use assert_cmd::Command;
 use tempfile::TempDir;
 
+use super::spawn::{Spawn, CLOSED_PORT_URL};
+
 pub const UPDATE_ENV: &str = "APPRAFTER_GOLDEN_UPDATE";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-/// Where Hetzner calls go when a case has no mock: a closed local port.
-pub const CLOSED_PORT_URL: &str = "http://127.0.0.1:1";
-/// Longest a single `apprafter` run may take before it counts as a hang.
-pub const RUN_TIMEOUT: Duration = Duration::from_secs(60);
-/// Where every sandbox is made, never `TMPDIR`: the root is `/tmp/.tmpXXXXXX`, 15 characters on
-/// every Unix machine, the length the goldens were recorded with (see the module docs).
-pub const SANDBOX_PARENT: &str = "/tmp";
 /// 64 ASCII alphanumerics: the shape `cli_core::target` accepts.
 pub const TOKEN_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 pub const TOKEN_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -93,54 +91,36 @@ pub fn golden_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden")
 }
 
-/// One hermetic place to run `apprafter`.
+/// One hermetic place to run `apprafter`: a [`Spawn`], plus what the harness normalises.
 pub struct Sandbox {
-    dir: TempDir,
-    /// Every spelling of the sandbox root (raw, canonical), longest first.
-    roots: Vec<String>,
+    spawn: Spawn,
+    /// The mock's URL, masked as `<HCLOUD>`.
     hcloud: Option<String>,
     /// Replaces the empty `bin` directory as `PATH` (stand-in tools, per-case dirs).
     path_override: Option<PathBuf>,
-    /// Extra variables every command of this sandbox gets (e.g. `HCLOUD_TOKEN`).
-    extra_env: Vec<(String, String)>,
     /// Keeps the stand-in tools alive as long as the sandbox.
     tools: Option<TempDir>,
 }
 
 impl Sandbox {
     pub fn new() -> Self {
-        let dir = TempDir::new_in(SANDBOX_PARENT).expect("sandbox root");
-        for sub in ["home", "config", "cache", "apprafter-config", "bin"] {
-            fs::create_dir_all(dir.path().join(sub)).expect("sandbox dir");
-        }
-        // On some systems the tempdir is reached through a symlink and a
-        // command may print either spelling. Longest first, so a spelling
-        // that contains the other is never half-replaced.
-        let mut roots = vec![dir.path().display().to_string()];
-        if let Ok(canon) = dir.path().canonicalize() {
-            let canon = canon.display().to_string();
-            if !roots.contains(&canon) {
-                roots.push(canon);
-            }
-        }
-        roots.sort_by_key(|r| std::cmp::Reverse(r.len()));
         Sandbox {
-            dir,
-            roots,
+            spawn: Spawn::new(),
             hcloud: None,
             path_override: None,
-            extra_env: Vec::new(),
             tools: None,
         }
     }
 
     /// Point every Hetzner call at `url` (a mockito server).
     pub fn with_hcloud(mut self, url: String) -> Self {
+        self.spawn = self.spawn.with_hcloud(url.clone());
         self.hcloud = Some(url);
         self
     }
 
     pub fn with_path(mut self, dir: PathBuf) -> Self {
+        self.spawn = self.spawn.with_path(dir.clone());
         self.path_override = Some(dir);
         self
     }
@@ -150,26 +130,31 @@ impl Sandbox {
     }
 
     pub fn with_env(mut self, key: &str, value: &str) -> Self {
-        self.extra_env.push((key.to_string(), value.to_string()));
+        self.spawn = self.spawn.with_env(key, value);
         self
     }
 
     /// GOTCHA-66: `PATH` holds only a stand-in per tool doctor probes (`cli_core::tools::ALL`),
     /// each answering its version call as the real tool does
     /// ([`super::stand_in::tool_stand_ins`]).
-    pub fn with_stand_in_tools(mut self) -> Self {
+    pub fn with_stand_in_tools(self) -> Self {
         let dir = super::stand_in::tool_stand_ins(cli_core::tools::ALL);
-        self.path_override = Some(dir.path().to_path_buf());
-        self.tools = Some(dir);
-        self
+        let mut sb = self.with_path(dir.path().to_path_buf());
+        sb.tools = Some(dir);
+        sb
+    }
+
+    /// The sandbox root (`/tmp/.tmpXXXXXX`).
+    pub fn root(&self) -> &Path {
+        self.spawn.root()
     }
 
     pub fn path(&self, rel: &str) -> PathBuf {
-        self.dir.path().join(rel)
+        self.spawn.path(rel)
     }
 
     fn store(&self) -> PathBuf {
-        self.path("apprafter-config")
+        self.spawn.store()
     }
 
     pub fn seed_store_file(&self, rel: &str, body: &str) {
@@ -208,41 +193,20 @@ impl Sandbox {
     }
 
     pub fn cmd(&self, args: &[&str]) -> Command {
-        let mut c = Command::from_std(self.std_cmd(args));
-        c.timeout(RUN_TIMEOUT);
-        c
+        self.spawn.cmd(args)
     }
 
-    /// [`Sandbox::cmd`] as a `std::process::Command`, for a case that wires the child's
-    /// stdio itself (a terminal: `golden.rs`'s pseudo-terminal cases). No timeout: the case
-    /// bounds its own wait.
+    /// [`Sandbox::cmd`] as a `std::process::Command`, for a case that wires the child's stdio
+    /// itself. No timeout: the case bounds its own wait.
     pub fn std_cmd(&self, args: &[&str]) -> std::process::Command {
-        let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_apprafter"));
-        c.env_clear()
-            .env(
-                "PATH",
-                self.path_override
-                    .clone()
-                    .unwrap_or_else(|| self.path("bin")),
-            )
-            .env("HOME", self.path("home"))
-            .env("XDG_CONFIG_HOME", self.path("config"))
-            .env("XDG_CACHE_HOME", self.path("cache"))
-            .env("APPRAFTER_CONFIG_DIR", self.path("apprafter-config"))
-            .env("APPRAFTER_SKIP_STARTUP_CHECKS", "1")
-            .env("KUBECONFIG", self.path("no-kubeconfig"))
-            .env(
-                "APPRAFTER_HCLOUD_BASE_URL",
-                self.hcloud.as_deref().unwrap_or(CLOSED_PORT_URL),
-            )
-            .env("TZ", "UTC")
-            .env("LANG", "C")
-            .env("USER", "golden");
-        for (k, v) in &self.extra_env {
-            c.env(k, v);
-        }
-        c.current_dir(self.path("home")).args(args);
-        c
+        self.spawn.std(args)
+    }
+
+    /// [`Sandbox::std_cmd`] with stdin and stderr on `slave`, the child's controlling terminal
+    /// (`golden.rs`'s pseudo-terminal cases).
+    #[cfg(unix)]
+    pub fn std_at_terminal(&self, args: &[&str], slave: OwnedFd) -> std::process::Command {
+        self.spawn.std_at_terminal(args, slave)
     }
 
     /// A setup step: must succeed; its output is not a golden.
@@ -280,10 +244,7 @@ impl Sandbox {
     }
 
     pub fn normalize(&self, text: &str) -> String {
-        let mut s = text.to_string();
-        for root in &self.roots {
-            s = s.replace(root.as_str(), "<SANDBOX>");
-        }
+        let mut s = self.spawn.mask_root(text);
         // The mock URL first: the closed-port URL is a prefix of a mock URL
         // whose port starts with `1`. Neither may be continued by a digit,
         // so one is never half-replaced either way.
@@ -371,7 +332,7 @@ impl Sandbox {
     /// the harness does not know, or a root a wrapped message split before its last component.
     /// Checked before the comparison, so update mode cannot record it either.
     pub fn assert_no_raw_root(&self, case: &str, doc: &str) {
-        let name = self.dir.path().file_name().expect("root name");
+        let name = self.spawn.root().file_name().expect("root name");
         let name = name.to_string_lossy();
         assert!(
             !doc.contains(name.as_ref()),
