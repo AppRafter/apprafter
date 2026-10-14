@@ -21,6 +21,7 @@ pub mod on;
 mod on_tests;
 pub mod open;
 mod status;
+pub mod text;
 pub use status::status;
 
 pub use faults::FaultPoint;

@@ -10,11 +10,11 @@
 
 use std::path::Path;
 
+use apprafter_core::lock::text;
 use apprafter_core::lock::{
-    self, check_password, HolderHardening, HolderUnavailableReason, LockOffPayload, LockOffStart,
-    LockOnInput, LockOnPayload, LockOnStart, LockReport, LockedOff, LockedOn, MachineLimit,
-    PasswordAdvice, PasswordProblem, RecoveryKeyProblem, SlotOpened, SlotRefusalView, SlotView,
-    UnlockWindow,
+    self, check_password, HolderUnavailableReason, LockOffPayload, LockOffStart, LockOnInput,
+    LockOnPayload, LockOnStart, LockReport, LockedOff, LockedOn, MachineLimit, PasswordAdvice,
+    PasswordProblem, RecoveryKeyProblem, SlotOpened, SlotRefusalView, SlotView, UnlockWindow,
 };
 use apprafter_core::secrets::{LockSlotKind, SecretsMode, StoreId, STORE_FILE};
 use apprafter_core::vault::{
@@ -819,14 +819,16 @@ pub(crate) fn render_status(r: &LockReport) -> String {
     lines.push(format!("This terminal:  {}", terminal_text(r)));
     let mut rows: Vec<(bool, String)> = Vec::new();
     if let UnlockWindow::Open { hardening, .. } = &r.window {
-        if let Some(weak) = weaker(hardening) {
-            rows.push((
-                true,
-                format!("The unlock window's key is less protected than usual: {weak}"),
-            ));
+        if let Some(line) = text::hardening_line(hardening) {
+            rows.push((true, line));
         }
     }
-    rows.extend(r.limits.iter().filter_map(limit_row));
+    rows.extend(
+        r.limits
+            .iter()
+            .filter_map(text::limit_line)
+            .map(|l| (l.warn, l.text)),
+    );
     // §3.13: the warnings first, each kind in the report's order (a stable sort).
     rows.sort_by_key(|(warn, _)| !*warn);
     if rows.is_empty() {
@@ -951,110 +953,6 @@ fn unavailable_text(r: HolderUnavailableReason) -> &'static str {
         }
         HolderUnavailableReason::Timeout => "the holder did not start in time",
     }
-}
-
-/// What a holder failed to do to protect its key (T54, T72); `None` when nothing failed.
-fn weaker(h: &HolderHardening) -> Option<String> {
-    let mut weak = Vec::new();
-    if !h.memory_locked {
-        weak.push("its memory is not locked against paging");
-    }
-    if h.non_dumpable == Some(false) {
-        weak.push("it can be dumped");
-    }
-    if h.deny_attach == Some(false) {
-        weak.push("a debugger may attach to it");
-    }
-    if !h.core_off {
-        weak.push("a crash may write it to a core file");
-    }
-    if h.process_dacl == Some(false) {
-        weak.push("its process keeps the default access list");
-    }
-    (!weak.is_empty()).then(|| weak.join(", "))
-}
-
-/// A limit's row: whether it is a warning, and its text; `None` for the one shown on the
-/// terminal line.
-fn limit_row(l: &MachineLimit) -> Option<(bool, String)> {
-    Some(match l {
-        MachineLimit::X11Session => (
-            true,
-            "X11 session: any program running as you sees what you type, the lock password included"
-                .into(),
-        ),
-        MachineLimit::Xwayland {
-            terminal_is_x_client: Some(true),
-        } => (
-            true,
-            "This terminal runs under Xwayland: other X programs see what you type into it, the \
-             lock password included"
-                .into(),
-        ),
-        MachineLimit::Xwayland { .. } => (
-            false,
-            "Xwayland is running: a terminal that runs under it shows what you type to other X \
-             programs"
-                .into(),
-        ),
-        MachineLimit::PtraceScope { value: Some(v) } => (
-            true,
-            format!("Yama ptrace_scope is {v}: programs running as you can attach to your shell"),
-        ),
-        MachineLimit::PtraceScope { value: None } => (
-            true,
-            "No Yama ptrace_scope: programs running as you can attach to your shell".into(),
-        ),
-        MachineLimit::WindowsSameUser => (
-            true,
-            "Unlock windows on Windows are open to every program running as you".into(),
-        ),
-        MachineLimit::MacosTaskPort => (
-            false,
-            "A program running as you with debugging rights can read an unlocked window's memory"
-                .into(),
-        ),
-        MachineLimit::Multiplexer { name } => (
-            false,
-            format!("This terminal runs inside {name}: programs running as you can type into it"),
-        ),
-        MachineLimit::InheritedWindow => (
-            false,
-            "Everything started from this terminal can use its window, an AI agent included"
-                .into(),
-        ),
-        MachineLimit::SleepUnreported => (
-            true,
-            "This computer does not tell the app when it sleeps or locks".into(),
-        ),
-        MachineLimit::Hibernation => (
-            false,
-            "Hibernation writes memory to disk, an open window's key included".into(),
-        ),
-        MachineLimit::SshKeyUsable {
-            path,
-            unencrypted,
-            in_agent,
-        } => (
-            true,
-            format!(
-                "The SSH key {path} that reaches your nodes {}",
-                match (unencrypted, in_agent) {
-                    (true, Some(true)) => "has no passphrase and is loaded in ssh-agent",
-                    (true, _) => "has no passphrase",
-                    (false, Some(true)) => "is loaded in ssh-agent",
-                    (false, _) => "may be loaded in ssh-agent, which did not answer within 2 s",
-                }
-            ),
-        ),
-        MachineLimit::RuntimeDirFallback { .. } => return None,
-        MachineLimit::SecretsInUse => (
-            false,
-            "While a command talks to a cluster, its kubeconfig is a file programs running as \
-             you can read"
-                .into(),
-        ),
-    })
 }
 
 #[cfg(test)]
