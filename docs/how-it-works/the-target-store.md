@@ -133,7 +133,14 @@ gives it instead a DACL that admits only your account and takes
 nothing from the folders above, so a store kept in a folder other
 accounts can read keeps the token from them. `state.json` and the
 vault get the same on every write, and the age key when it is
-created (`cli/cli-core/src/owner_only.rs`). The CLI redacts the value
+created (`cli/cli-core/src/owner_only.rs`). On Windows a file written
+before AppRafter gave it that DACL — or widened since — gets it the next
+time AppRafter reads the file: a command, or the app. `apprafter doctor`
+names any of these files another account may open — a mode wider than
+0600 on Linux and macOS, a DACL that is not yours alone on Windows — and
+changes nothing itself
+([troubleshooting](../operator-guide/troubleshooting.md#secret-file-wide)).
+The CLI redacts the value
 in `target show` / `whoami` output; read this file directly if
 you need the raw bytes for a one-off script.
 

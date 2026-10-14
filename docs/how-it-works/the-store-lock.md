@@ -210,10 +210,18 @@ it is in that process's memory. Beyond that:
   0600 in a 0700 directory on Linux and macOS; on Windows, a DACL that
   admits only your account and takes nothing from the folders above, set
   before the first byte is written. Other accounts without administrator
-  rights cannot read it; programs running as you can, meanwhile. The
-  cleanup a command runs after Ctrl-C uses a short-lived copy in the
-  system's temporary directory. `cli/apprafter-core/src/runtime.rs`,
-  `cli/cli-core/src/owner_only.rs`.
+  rights cannot read it; programs running as you can, meanwhile. A runtime
+  directory another account owns is refused: on Linux and macOS its mode
+  cannot be set; on Windows AppRafter checks its owner, who could give
+  itself access again and replace the kubeconfig before `kubectl` reads it
+  ([`runtime_dir_foreign`](../operator-guide/troubleshooting.md#runtime-dir-foreign)).
+  The cleanup a command runs after Ctrl-C uses a short-lived copy in the
+  system's temporary directory, your account's alone in the same way from
+  its first byte, whatever that directory lets other accounts do; so are
+  the manifests a command hands to `kubectl apply` or `helm` there, and the
+  directories a backup stages its export in and a restore unpacks into.
+  `kubectl` still reads the copy while the command holds it.
+  `cli/apprafter-core/src/runtime.rs`, `cli/cli-core/src/owner_only.rs`.
 - **`apprafter open argocd`** puts the Argo CD password on the clipboard,
   which programs running as you can read, and forwards a local port any
   program on this computer can connect to.

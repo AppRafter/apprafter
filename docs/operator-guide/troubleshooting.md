@@ -617,6 +617,24 @@ fallback.
 randomness is broken — a container or virtual machine without one, for
 example.
 
+### `apprafter::secrets::runtime_dir_foreign` {#runtime-dir-foreign}
+
+On Windows, the runtime directory — where a command writes the decrypted
+kubeconfig it hands to `kubectl` — belongs to another account. That account
+can give itself access to the directory whatever its permissions say, and
+replace the kubeconfig before `kubectl` reads it, pointing `kubectl` at a
+server of its choosing. AppRafter writes nothing there. The message names
+the directory: `<store>\run` when `APPRAFTER_CONFIG_DIR` is set, a folder
+under `%LOCALAPPDATA%\apprafter\run` when it is not; the app's own is in its
+local data folder. A directory your account, an administrator or the system
+owns is used.
+
+**Fix.** Remove the directory: AppRafter makes it again, owned by you. If
+Windows refuses, an administrator can remove it. When the store is in a
+folder other accounts can write to, set `APPRAFTER_CONFIG_DIR` to a folder
+only you can write. On Linux and macOS such a directory is refused too, as
+an I/O error: its mode cannot be set.
+
 ### `apprafter::lock::no_window` {#no-window}
 
 `apprafter unlock` cannot open an unlock window in this terminal: there is
@@ -671,6 +689,29 @@ variants in future releases.
 **Fix.** Read the message text. If you see the same wording often,
 file an issue — recurring catch-all messages should be promoted
 to a typed variant with its own help text.
+
+## Doctor: a secret file other accounts may open {#secret-file-wide}
+
+`apprafter doctor`, and the app's Doctor, warn about each of the target
+store's secret files that another account on this computer may be able to
+open: a target's `credentials.yaml` (on its own row for the target checked)
+and `state.json`, the age key, and the vault of a locked store. They read
+the file's permissions only, never its contents, and change nothing.
+
+- **Linux and macOS:** `<file> mode 0600 (got 644)`, with the
+  `chmod 600 <path>` that fixes it. AppRafter writes these files 0600; a
+  wider mode comes from a copy, a restore or a hand edit.
+- **Windows:** `<file> not restricted to your account`. A file AppRafter
+  wrote before it gave these files a DACL of their own, or one widened
+  since, keeps what its folder grants until AppRafter next reads it; each
+  read then restricts it to your account. Run a command that reads it —
+  with the target active, `apprafter whoami` reads its token and
+  `apprafter status` its state file and the age key; `apprafter lock
+  status` reads the vault — or use the app, and the warning goes. When the
+  fix says your account may not change who can open the file, another
+  account owns it, or its permissions keep even its owner from changing
+  them: an administrator can make your account its owner with full
+  control, and AppRafter restricts it at its next read.
 
 ## Every way into a locked store is lost {#locked-store-lost}
 

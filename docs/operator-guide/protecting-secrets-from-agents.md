@@ -305,6 +305,7 @@ store, only when the store is locked or a `lock on` did not finish:
 | A target's state file holds a kubeconfig in clear | doctor, beside a locked store | `apprafter kubeconfig --refresh --target <name>` |
 | The slot list in store.yaml differs; a slot uses key-derivation settings this AppRafter refuses; the vault has no recovery-key slot; the vault file's mode or owner | doctor, beside a locked store | as the row says |
 | `HCLOUD_TOKEN` or `APPRAFTER_AGE_KEY` is set | doctor, beside a locked store | unset it, or give that work a store of its own |
+| A target's credentials or state file, or the age key, that other accounts may open | doctor, on any store, when true | as the row says ([troubleshooting](troubleshooting.md#secret-file-wide)) |
 | The SSH key … has no passphrase, or is loaded in ssh-agent | when true, or when the ssh-agent does not answer | [The SSH key that reaches your nodes](#ssh-key) |
 | A kubeconfig in use is a file | always | — what the lock does not cover |
 | A program running as you that sets out to get past the lock | always | [A boundary for the agent](#a-boundary-for-the-agent) |
