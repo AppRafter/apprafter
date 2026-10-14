@@ -15,16 +15,16 @@ import type { PlanView } from '../../ipc/generated/PlanView';
 import type { Settings } from '../../ipc/generated/Settings';
 import type { UiError } from '../../ipc/generated/UiError';
 import { holdPlan } from '../../ipc/heldPlans';
+import { FinishProtectDialog } from '../../screens/security/FinishProtectDialog';
+import { ProtectDialog } from '../../screens/security/ProtectDialog';
+import { StopProtectingDialog } from '../../screens/security/StopProtectingDialog';
 import { useLockActions } from '../../state/lock';
 import { rereadLock, useLockInfo } from '../../state/lockInfo';
 import { type ProtectAction, STOP_TITLE, stopOutcome, stoppedSummary } from '../../state/lockText';
 import { usePlatform } from '../../state/platform';
 import { useScope } from '../../state/scope';
 import { useSaveSettings } from '../../state/settings';
-import { FinishProtectDialog } from './FinishProtectDialog';
 import { LockSection } from './LockSection';
-import { ProtectDialog } from './ProtectDialog';
-import { StopProtectingDialog } from './StopProtectingDialog';
 
 export interface LockSettingsProps {
   readonly settings: Settings;
