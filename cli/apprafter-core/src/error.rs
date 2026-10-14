@@ -694,17 +694,17 @@ fn neutral_help(e: &cli_core::CliError) -> Option<String> {
             .into(),
         C::LockIncomplete { phase, .. } => match phase {
             cli_core::LockPhase::Locking => "Protecting this target store's secrets was \
-                 interrupted. Finish it, or stop protecting them, in Settings › Lock."
+                 interrupted. Finish it, or stop protecting them, on the Security page."
                 .into(),
             cli_core::LockPhase::Unlocking => "Unprotecting this target store's secrets was \
-                 interrupted. Finish it in Settings › Lock."
+                 interrupted. Finish it on the Security page."
                 .into(),
         },
         C::SlotRefused { reason, .. } => match reason {
             cli_core::SlotRefusal::KdfTooWeak | cli_core::SlotRefusal::KdfOutOfRange => {
                 "This build will not use that lock password's key settings. Unlock with the \
-                 recovery key, then stop protecting the secrets and protect them again in \
-                 Settings › Lock, which sets a new lock password."
+                 recovery key, then stop protecting the secrets and protect them again on the \
+                 Security page, which sets a new lock password."
                     .into()
             }
             cli_core::SlotRefusal::NoUsableSlot => "Its slots were made by a newer AppRafter: \
@@ -1056,7 +1056,7 @@ pub mod samples {
                 }
                 .into(),
             ),
-            // D.4a: what the app turns into its own lock (T74) and into Settings › Lock.
+            // D.4a: what the app turns into its own lock (T74) and shows on its Security page.
             (
                 "storeLocked",
                 CliError::StoreLocked {
@@ -1885,6 +1885,46 @@ mod tests {
                 seen.contains(code),
                 "{code} has no sample in samples::lock_errors"
             );
+        }
+    }
+
+    /// WI-476: the desktop's help for an interrupted run and a refused lock password names the
+    /// page that holds Finish… and Stop protecting… — the Security page — never Settings.
+    #[test]
+    fn the_desktop_help_for_the_store_lock_names_the_security_page() {
+        let store = || std::path::PathBuf::from("/s");
+        let locking = "Protecting this target store's secrets was interrupted. Finish it, \
+                       or stop protecting them, on the Security page.";
+        let unlocking = "Unprotecting this target store's secrets was interrupted. Finish \
+                         it on the Security page.";
+        let weak = "This build will not use that lock password's key settings. Unlock with \
+                    the recovery key, then stop protecting the secrets and protect them again \
+                    on the Security page, which sets a new lock password.";
+        for (e, want) in [
+            (
+                cli_core::CliError::LockIncomplete {
+                    store: store(),
+                    phase: cli_core::LockPhase::Locking,
+                },
+                locking,
+            ),
+            (
+                cli_core::CliError::LockIncomplete {
+                    store: store(),
+                    phase: cli_core::LockPhase::Unlocking,
+                },
+                unlocking,
+            ),
+            (
+                cli_core::CliError::SlotRefused {
+                    store: store(),
+                    reason: cli_core::SlotRefusal::KdfTooWeak,
+                },
+                weak,
+            ),
+        ] {
+            let ui = UiError::from(&CoreError::Cli(e));
+            assert_eq!(ui.help.as_deref(), Some(want), "{:?}", ui.code);
         }
     }
 

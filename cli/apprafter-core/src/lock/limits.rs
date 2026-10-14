@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! What this computer lets other programs running as the person do (ADR 0068 §7, Risks; D.4a
 //! T72, O1, G13): the facts behind `lock status`'s "This computer" lines, doctor's machine-limit
-//! rows (d4a-f) and Settings › Lock (d4a-g). The core reads files — Yama's `ptrace_scope`, the SSH
-//! key's header and the `.pub` beside it — and asks an ssh-agent at the socket the client names;
-//! it reads no environment. What only a client can see comes in [`LimitClient`] (T73).
+//! rows (d4a-f) and the desktop's Security page (d4a-g, WI-476). The core reads files — Yama's
+//! `ptrace_scope`, the SSH key's header and the `.pub` beside it — and asks an ssh-agent at the
+//! socket the client names; it reads no environment. What only a client can see comes in
+//! [`LimitClient`] (T73).
 
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};

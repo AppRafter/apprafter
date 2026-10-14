@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
-//! The one lock report (D.4a T73): `lock status`, doctor's lock rows, `status`'s line and
-//! Settings › Lock all read it, so they cannot disagree. It never prompts and never opens the
-//! vault: the vault's header is parsed for its slots and for the refusal this build would give
-//! each before deriving (T22); the client supplies its window and what only it sees.
+//! The one lock report (D.4a T73): `lock status`, doctor's lock rows, `status`'s line and the
+//! desktop's Security page all read it, so they cannot disagree. It never prompts and never
+//! opens the vault: the vault's header is parsed for its slots and for the refusal this build
+//! would give each before deriving (T22); the client supplies its window and what only it sees.
 
 use cli_core::error::VaultProblem;
 use cli_core::CliError;

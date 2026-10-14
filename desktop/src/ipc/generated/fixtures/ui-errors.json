@@ -28,7 +28,7 @@
       "phase": "locking",
       "store": "/home/a/stores/work"
     },
-    "help": "Protecting this target store's secrets was interrupted. Finish it, or stop protecting them, in Settings › Lock.",
+    "help": "Protecting this target store's secrets was interrupted. Finish it, or stop protecting them, on the Security page.",
     "message": "an earlier `lock on` on the target store at /home/a/stores/work did not finish"
   },
   "serverTypeUnavailable": {

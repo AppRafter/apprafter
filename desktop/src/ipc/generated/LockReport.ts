@@ -6,7 +6,8 @@ import type { SlotView } from "./SlotView";
 import type { UnlockWindow } from "./UnlockWindow";
 
 /**
- * What `lock status`, doctor's lock rows, `status`'s line and Settings › Lock show (T73).
+ * What `lock status`, doctor's lock rows, `status`'s line and the desktop's Security page
+ * show (T73).
  */
 export type LockReport = { 
 /**

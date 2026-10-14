@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! The target-store lock (ADR 0068; D.4a §3.9, §3.13): turning it on and off, opening a locked
 //! store with one prompt's input, and the one report every surface shows — `lock status`,
-//! doctor's lock rows, `status`'s line and the desktop's Settings › Lock — from one function
+//! doctor's lock rows, `status`'s line and the desktop's Security page — from one function
 //! (`status`, d4a-e), so they cannot disagree (T73). The flows arrive with d4a-d and d4a-e;
-//! D.4a c2 freezes the types first, and the desktop's Lock section is built against them.
+//! D.4a c2 freezes the types first, and the desktop's Security page is built against them.
 //!
 //! Every type here is `Serialize` and exported to TypeScript, never `Deserialize` (D.3 §3.10).
 
@@ -117,7 +117,8 @@ pub use open::{
     RECOMMENDED_PASSWORD_CHARS,
 };
 
-/// What `lock status`, doctor's lock rows, `status`'s line and Settings › Lock show (T73).
+/// What `lock status`, doctor's lock rows, `status`'s line and the desktop's Security page
+/// show (T73).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
@@ -280,7 +281,7 @@ mod tests {
 
     use super::*;
 
-    /// The freeze (D.4a §5 c2): the wire shape Settings › Lock is built against.
+    /// The freeze (D.4a §5 c2): the wire shape the desktop's Security page is built against.
     #[test]
     fn a_lock_report_has_the_frozen_wire_shape() {
         let report = LockReport {
