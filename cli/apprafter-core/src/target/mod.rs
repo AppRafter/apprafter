@@ -251,13 +251,13 @@ pub fn store_lock_event(event: &StoreLockEvent<'_>) -> Event {
     match event {
         StoreLockEvent::Waiting { sentinel } => Event::Notice {
             message: format!(
-                "waiting for another AppRafter process to release the target store ({})…",
+                "waiting for another AppRafter process to finish writing the target store ({})…",
                 sentinel.display()
             ),
         },
         StoreLockEvent::Unlocked { sentinel, error } => Event::Warning {
             message: format!(
-                "cannot lock the target store ({}): {error}; continuing without the lock",
+                "cannot take the target store's write lock ({}): {error}; continuing without it",
                 sentinel.display()
             ),
         },
@@ -367,7 +367,7 @@ mod helper_tests {
             store_lock_event(&cli_core::StoreLockEvent::Waiting { sentinel }),
             Event::Notice {
                 message:
-                    "waiting for another AppRafter process to release the target store (/s/.lock)…"
+                    "waiting for another AppRafter process to finish writing the target store (/s/.lock)…"
                         .into()
             }
         );
@@ -378,9 +378,10 @@ mod helper_tests {
                 error: &error
             }),
             Event::Warning {
-                message: "cannot lock the target store (/s/.lock): Read-only file system; \
-                          continuing without the lock"
-                    .into()
+                message:
+                    "cannot take the target store's write lock (/s/.lock): Read-only file system; \
+                     continuing without it"
+                        .into()
             }
         );
     }

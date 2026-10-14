@@ -458,7 +458,10 @@ fn has_no_locks(e: &std::io::Error) -> bool {
 fn lock_error(sentinel: &Path, e: std::io::Error) -> CliError {
     CliError::Io(std::io::Error::new(
         e.kind(),
-        format!("cannot lock the target store ({}): {e}", sentinel.display()),
+        format!(
+            "cannot take the target store's write lock ({}): {e}",
+            sentinel.display()
+        ),
     ))
 }
 

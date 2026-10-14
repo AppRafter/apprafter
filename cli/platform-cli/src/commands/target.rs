@@ -716,7 +716,7 @@ mod tests {
         let line = store_lock_event_line(&cli_core::StoreLockEvent::Waiting { sentinel });
         assert_eq!(
             line,
-            "waiting for another AppRafter process to release the target store (/s/.lock)…"
+            "waiting for another AppRafter process to finish writing the target store (/s/.lock)…"
         );
     }
 
@@ -730,8 +730,8 @@ mod tests {
         });
         assert_eq!(
             line,
-            "warning: cannot lock the target store (/s/.lock): Read-only file system; \
-             continuing without the lock"
+            "warning: cannot take the target store's write lock (/s/.lock): Read-only file system; \
+             continuing without it"
         );
     }
 

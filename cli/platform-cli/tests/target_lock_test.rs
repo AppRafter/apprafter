@@ -92,7 +92,7 @@ impl Sandbox {
     /// The line a command prints while it waits for the store lock.
     fn waiting_line(&self) -> String {
         format!(
-            "waiting for another AppRafter process to release the target store ({})…",
+            "waiting for another AppRafter process to finish writing the target store ({})…",
             self.store().lock_file().display()
         )
     }
@@ -407,13 +407,13 @@ fn target_use_on_a_read_only_store_warns_and_succeeds() {
         stdout(&out)
     );
     let warning = format!(
-        "warning: cannot lock the target store ({}): ",
+        "warning: cannot take the target store's write lock ({}): ",
         sb.store().lock_file().display()
     );
     let line = stderr
         .lines()
         .find(|l| l.starts_with(&warning))
         .unwrap_or_else(|| panic!("no `{warning}…` line:\n{stderr}"));
-    assert!(line.ends_with("; continuing without the lock"), "{line}");
+    assert!(line.ends_with("; continuing without it"), "{line}");
     assert!(!sb.store().lock_file().exists());
 }
