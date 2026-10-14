@@ -72,6 +72,7 @@ fn lock_status_on_a_locked_store_names_its_slots_and_what_it_covers() {
         "This terminal:  not run from a terminal\n",
         "  ℹ While a command talks to a cluster, its kubeconfig is a file programs running as you can read\n",
         "  ℹ Hibernation writes memory to disk, an open window's key included\n",
+        "  ℹ A program running as you that sets out to get past the lock can read what you type, change what you run or use an unlocked window; run AI agents under a separate OS account or in a sandbox\n",
         "The lock protects secrets at rest.",
     ] {
         assert!(out.contains(line), "{line:?} in:\n{out}");

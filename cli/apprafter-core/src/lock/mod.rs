@@ -246,6 +246,11 @@ pub enum MachineLimit {
         path: String,
     },
     SecretsInUse,
+    /// A program running as the person that sets out to get past the lock — an AI agent
+    /// turned by a prompt injection, say — can read what they type, change what they run or
+    /// use an unlocked window: the lock slows it and an OS boundary stops it (ADR 0068 §1;
+    /// O1). Static: every computer.
+    SameUserPrograms,
 }
 
 /// Where a terminal's holder keeps its endpoint (T49), shown on `lock status`'s "This
@@ -421,5 +426,14 @@ mod tests {
         );
         let advice = PasswordAdvice::decl(&cfg);
         assert!(advice.contains("recommended: number"), "{advice}");
+    }
+
+    /// O1 (d4a-f): the wire name of the limit for programs that set out to get past the lock.
+    #[test]
+    fn the_same_user_programs_limit_has_its_wire_name() {
+        assert_eq!(
+            serde_json::to_value(MachineLimit::SameUserPrograms).unwrap(),
+            json!({"kind": "same_user_programs"})
+        );
     }
 }

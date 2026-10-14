@@ -93,6 +93,13 @@ pub fn limit_line(l: &MachineLimit) -> Option<LimitLine> {
              you can read"
                 .to_string(),
         ),
+        MachineLimit::SameUserPrograms => (
+            false,
+            "A program running as you that sets out to get past the lock can read what you \
+             type, change what you run or use an unlocked window; run AI agents under a \
+             separate OS account or in a sandbox"
+                .to_string(),
+        ),
     };
     Some(LimitLine { warn, text })
 }
@@ -149,7 +156,8 @@ mod tests {
             | MachineLimit::Hibernation
             | MachineLimit::SshKeyUsable { .. }
             | MachineLimit::RuntimeDirFallback { .. }
-            | MachineLimit::SecretsInUse => {}
+            | MachineLimit::SecretsInUse
+            | MachineLimit::SameUserPrograms => {}
         }
     }
 
@@ -176,6 +184,7 @@ mod tests {
             (L::SshKeyUsable { path: "~/k".into(), unencrypted: false, in_agent: None }, line(true, "The SSH key ~/k that reaches your nodes may be loaded in ssh-agent, which did not answer within 2 s")),
             (L::RuntimeDirFallback { path: "/s/run".into() }, None),
             (L::SecretsInUse, line(false, "While a command talks to a cluster, its kubeconfig is a file programs running as you can read")),
+            (L::SameUserPrograms, line(false, "A program running as you that sets out to get past the lock can read what you type, change what you run or use an unlocked window; run AI agents under a separate OS account or in a sandbox")),
         ];
         for (limit, want) in cases {
             assert_eq!(limit_line(&limit), want, "{limit:?}");

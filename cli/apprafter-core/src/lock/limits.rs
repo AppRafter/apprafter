@@ -144,6 +144,7 @@ pub fn detect_limits(
         }
     }
     out.push(MachineLimit::SecretsInUse);
+    out.push(MachineLimit::SameUserPrograms);
     out.push(MachineLimit::Hibernation);
     out
 }
@@ -720,5 +721,27 @@ ERERERERERERERERERERERERERERAAAAEAAAAAAAAAAAAAAAAAAAAAA=
                 ..
             })
         ));
+    }
+
+    /// O1 (d4a-f): a program running as you that sets out to get past the lock is a limit of
+    /// every computer, for the CLI and the desktop alike — listed always, as secrets in use are.
+    #[test]
+    fn programs_that_set_out_to_get_past_the_lock_are_always_a_limit() {
+        let ctx = ctx_with(MapEnv::new());
+        let cli = LimitClient::Cli {
+            terminal: None,
+            ssh: SshFacts::default(),
+        };
+        let desk = LimitClient::Desktop {
+            session_events: SessionEvents {
+                lock: true,
+                sleep: true,
+            },
+            display: DisplayKind::None,
+            ssh: SshFacts::default(),
+        };
+        for (client, window) in [(cli, UnlockWindow::Closed), (desk, UnlockWindow::App)] {
+            assert!(detect_limits(&ctx, &client, &window).contains(&MachineLimit::SameUserPrograms));
+        }
     }
 }

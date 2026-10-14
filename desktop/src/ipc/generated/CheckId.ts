@@ -4,4 +4,4 @@
 /**
  * Which check a row is.
  */
-export type CheckId = "active_target" | "target_exists" | "config_readable" | "credentials_file" | "provider_supported" | "token_present" | "token_format" | "token_verified" | "ssh_key" | "kubeconfig_cached" | "kube_api_reachable" | "node_ssh_reachable" | "tool" | "dns" | "secrets" | "ssh_key_exposure" | "x11_keystrokes" | "ptrace_scope" | "windows_same_user" | "macos_task_port" | "terminal_multiplexer" | "unlocked_terminal" | "window_hardening" | "secrets_in_use" | "sleep_unreported";
+export type CheckId = "active_target" | "target_exists" | "config_readable" | "credentials_file" | "provider_supported" | "token_present" | "token_format" | "token_verified" | "ssh_key" | "kubeconfig_cached" | "kube_api_reachable" | "node_ssh_reachable" | "tool" | "dns" | "secrets" | "ssh_key_exposure" | "x11_keystrokes" | "ptrace_scope" | "windows_same_user" | "macos_task_port" | "terminal_multiplexer" | "unlocked_terminal" | "window_hardening" | "secrets_in_use" | "sleep_unreported" | "same_user_programs" | "hibernation";

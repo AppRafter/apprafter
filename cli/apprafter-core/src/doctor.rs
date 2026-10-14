@@ -88,6 +88,12 @@ pub enum CheckId {
     WindowHardening,
     SecretsInUse,
     SleepUnreported,
+    /// A program running as you that sets out to get past the lock (O1, d4a-f): Info,
+    /// static, on a locked or locking store.
+    SameUserPrograms,
+    /// Hibernation writes an open window's key to disk (overview rule 1, d4a-f): Info,
+    /// static, on a locked or locking store.
+    Hibernation,
 }
 
 /// Why a target's token should be renewed.
@@ -2687,6 +2693,14 @@ mod tests {
             })
             .unwrap(),
             serde_json::json!({"kind": "cache_undecryptable", "target": "p", "path": "/s/vault", "key": "store_vault"})
+        );
+        assert_eq!(
+            serde_json::to_value(CheckId::SameUserPrograms).unwrap(),
+            "same_user_programs"
+        );
+        assert_eq!(
+            serde_json::to_value(CheckId::Hibernation).unwrap(),
+            "hibernation"
         );
     }
 }
