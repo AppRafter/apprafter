@@ -65,6 +65,19 @@ waiting for another AppRafter process to finish writing the target store (/home/
 A store whose write lock cannot be taken at all — a read-only directory, a
 filesystem without locks — is used without it, after a
 `warning: cannot take the target store's write lock (…): …; continuing without it` line.
+
+The store is used only while it is your account's alone. An account that
+owns one of its folders — the store itself, `targets` and each target's
+folder, `state` and each folder under it — or can write to one could put
+its own token, kubeconfig or vault there. So before a command uses or
+writes any of the store's secrets, and before any change under the write
+lock, AppRafter reads who owns each of those folders and who may write to
+it, and refuses the store if another account does
+([`store_not_private`](../operator-guide/troubleshooting.md#store-not-private)).
+`apprafter doctor` names each such folder, and each secret file another
+account owns, and changes nothing
+([troubleshooting](../operator-guide/troubleshooting.md#store-folder-foreign)).
+`cli/cli-core/src/store_privacy.rs`, `cli/cli-core/src/owner_only.rs`.
 Each file is replaced whole: a save writes a temporary file
 beside it and renames that into place, so a reader sees the old version
 or the new one, never a partial write.
@@ -133,7 +146,12 @@ gives it instead a DACL that admits only your account and takes
 nothing from the folders above, so a store kept in a folder other
 accounts can read keeps the token from them. `state.json` and the
 vault get the same on every write, and the age key when it is
-created (`cli/cli-core/src/owner_only.rs`). On Windows a file written
+created (`cli/cli-core/src/owner_only.rs`). The age key is written whole to
+a temporary file beside it and takes its name only if no key is there yet,
+so a write that fails leaves no part of a key behind, and two commands that
+make it at once end with the same key; a key file that does not parse is
+an error that names it, never replaced (`cli/cli-core/src/secrets.rs`). On
+Windows a file written
 before AppRafter gave it that DACL — or widened since — gets it the next
 time AppRafter reads the file: a command, or the app. `apprafter doctor`
 names any of these files another account may open — a mode wider than

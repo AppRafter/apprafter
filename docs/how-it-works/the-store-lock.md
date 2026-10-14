@@ -72,6 +72,15 @@ own. A cache in clear, or one the store's key does not open, is refused: fetch
 it again from its source. The shared `~/.config/apprafter/age.key` stays
 where it was, for the stores that are not locked.
 
+**Who else can change these files.** The lock relies on the store being
+your account's alone: another account that owns one of its folders, or can
+write to one, could put a `store.yaml`, a vault or a target's files of its
+own there. Such a store is refused before any of its secrets is used or
+written, locked or not
+([`store_not_private`](../operator-guide/troubleshooting.md#store-not-private)),
+and `apprafter doctor` names each folder concerned
+([The target store on disk](the-target-store.md#file-layout)).
+
 ## Slots {#slots}
 
 A slot is one way to open the vault: the data key, wrapped with a key derived

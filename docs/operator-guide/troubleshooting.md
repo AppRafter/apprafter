@@ -646,6 +646,37 @@ folder other accounts can write to, set `APPRAFTER_CONFIG_DIR` to a folder
 only you can write. On Linux and macOS such a directory is refused too, as
 an I/O error: its mode cannot be set.
 
+### `apprafter::secrets::store_not_private` {#store-not-private}
+
+A folder of the target store belongs to another account, or other accounts
+can write to it. Whoever can replace a file there can put a Hetzner token, a
+kubeconfig or a vault of their own in place of yours and send your next
+deploy to a project or a cluster of their choosing, so AppRafter neither uses
+nor writes any of the store's secrets until the folder is yours alone. The
+message names the folder: the store itself, `targets` or a target's folder in
+it, `state` or a folder under it. Commands that need no secret still run —
+`apprafter target list`, `apprafter target show`, `apprafter lock status` —
+and [`apprafter doctor`](#store-folder-foreign) lists every folder and secret
+file concerned.
+
+On Linux and macOS a folder counts as writable by others when its mode lets
+others write to it — a sticky bit does not change that, since they can still
+create files in it — or lets its group write, unless that group is your
+account's own: named after your account, your primary group, with no other
+member. On Windows it does when its permissions let another account create,
+change or delete files in it, or change its permissions or its owner, for
+the folder itself or for what is created in it. An owner other than your
+account counts too, except, on Windows, the Administrators group and the
+system.
+
+**Fix.** Keep the store in a folder only you can write: move it there and
+set `APPRAFTER_CONFIG_DIR` to it. Or fix the folder the message names. On
+Linux and macOS, `chmod go-w <folder>` removes the other accounts' write
+access, and an administrator can give a folder back to your account with
+`sudo chown`. On Windows, remove their write access in the folder's
+Properties › Security; an administrator can make your account its owner in
+Properties › Security › Advanced. Then run the command again.
+
 ### `apprafter::lock::no_window` {#no-window}
 
 `apprafter unlock` cannot open an unlock window in this terminal: there is
@@ -723,6 +754,30 @@ the file's permissions only, never its contents, and change nothing.
   account owns it, or its permissions keep even its owner from changing
   them: an administrator can make your account its owner with full
   control, and AppRafter restricts it at its next read.
+
+## Doctor: a store folder or a secret file another account owns or can write {#store-folder-foreign}
+
+`apprafter doctor`, and the app's Doctor, warn about each folder of the
+target store that another account owns or can write to — the store itself,
+`targets` and each target's folder, `state` and each folder under it — and
+about each secret file another account owns: a target's `credentials.yaml`
+and `state.json`, the age key, and on Windows the vault. They read owners and
+permissions only, and change nothing.
+
+- `Target store folder belongs to another account`, or
+  ``Target store folder `targets/prod` belongs to another account``.
+- ``Target store folder `targets` can be changed by other accounts``, with
+  the folder's mode on Linux and macOS (`(mode 777)`).
+- ``Credentials file of target `prod` belongs to another account``, and the
+  same for a state file, the age key or the vault file.
+
+While a folder is listed, the store's secrets are not used: the token and
+Kubernetes API rows are skipped with the refusal
+[`store_not_private`](#store-not-private), so doctor neither sends a token
+another account may have put there to the provider nor runs a kubeconfig it
+may have put there. The fix for a folder is that refusal's; a file another
+account owns can be given back to your account by an administrator, or
+replaced with a copy of your own.
 
 ## Every way into a locked store is lost {#locked-store-lost}
 
