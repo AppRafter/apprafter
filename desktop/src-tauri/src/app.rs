@@ -52,19 +52,30 @@
 //! [`SESSION_READY_WITHIN`] from the watch's start rather than answer early, so the page's first
 //! `app_info` normally has it and no event is needed. A watch that says later is still asked,
 //! every [`SESSION_LATE_POLL`], and counts once it has said: a later `app_info` reports it.
+//!
+//! # A protected store (D.4a T74)
+//!
+//! The shell's context carries [`DesktopVaultAccess`]: on a protected store the app is unlocked
+//! exactly while it holds the store's key. The lock hook drops the key on every lock, and so
+//! does a quit. [`Shell::recheck`] re-reads `store.yaml` on every `app_info` and unlock, on
+//! window focus, before `lock_info` and doctor, when a read finds no key, and when the idle
+//! tick sees the file change ([`Shell::recheck_if_changed`]), and follows it: protected
+//! without the key held, the app locks with `SecretsLocked`; back in files, the key goes and the
+//! lock's settings are no longer pinned. The lock screen's field opens the vault there.
 
 use std::io;
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use apprafter_core::lock::HolderHardening;
-use apprafter_core::Context;
+use apprafter_core::secrets::{VaultAccess, STORE_FILE};
+use apprafter_core::{Context, CoreError, SecretString};
 use apprafter_desktop_ipc::{
     AppInfo, LockReason, LockState, OpId, Os, Quitting, SessionEvents, Settings, SubscriptionId,
-    LOCK_CHANGED, QUITTING,
+    UnavailableReason, LOCK_CHANGED, QUITTING,
 };
 use apprafter_os_auth::{Listening, SessionEvent, SessionWatch};
 use tauri::ipc::Invoke;
@@ -84,6 +95,7 @@ use crate::ops::{panic_message, Clock, EventSink, Executor, OperationManager};
 use crate::protection::Protection;
 use crate::settings::SettingsStore;
 use crate::theme::Appearance;
+use crate::vault_access::DesktopVaultAccess;
 
 /// How long a quit waits for cancelled operations to stop before it exits anyway: the CLI's
 /// helper-pod stop bound.
@@ -133,6 +145,44 @@ impl Default for ShellExtras {
         ShellExtras {
             hardening: crate::harden::not_applied(),
         }
+    }
+}
+
+/// Held by a lock flow of the app's own — Protect, Finish, Stop protecting — while it runs:
+/// taken by its executor's first statement, dropped at its end (D.4a T74). The store changes
+/// as it runs, so the shell's re-read only reports meanwhile; the run's end re-reads. Never
+/// from the plan: a confirm can stay open until the plans' sweep (20 minutes), and the
+/// re-read must not be off for all of it (critic B finding 4). A run that panics skips its
+/// end's re-read, so the guard's drop asks for one while the thread unwinds (the Rust
+/// verifier's finding 11).
+pub struct FlowGuard {
+    flows: Arc<AtomicUsize>,
+    shell: Weak<Shell>,
+}
+
+impl Drop for FlowGuard {
+    fn drop(&mut self) {
+        self.flows.fetch_sub(1, SeqCst);
+        if thread::panicking() {
+            if let Some(shell) = self.shell.upgrade() {
+                shell.recheck_later();
+            }
+        }
+    }
+}
+
+/// What the idle tick compares to notice the store changed under the app (D.4a T74; critic
+/// B finding 19): `store.yaml`'s length and modification time, or its absence. A `stat`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreStamp(Option<(u64, Option<SystemTime>)>);
+
+impl StoreStamp {
+    pub fn read(root: &std::path::Path) -> StoreStamp {
+        StoreStamp(
+            std::fs::metadata(root.join(STORE_FILE))
+                .ok()
+                .map(|m| (m.len(), m.modified().ok())),
+        )
     }
 }
 
@@ -331,6 +381,19 @@ pub struct Shell {
     pub appearance: Arc<Appearance>,
     /// What only the running app knows of itself ([`ShellExtras`]).
     extras: ShellExtras,
+    /// The store's key while the app holds it (D.4a T74, `vault_access`); the context's
+    /// `VaultAccess` too.
+    pub vault: Arc<DesktopVaultAccess>,
+    /// Lock flows of the app's own while they run ([`FlowGuard`]).
+    flows: Arc<AtomicUsize>,
+    /// Re-reads asked of [`Shell::recheck_later`] that its thread has not answered yet; 0
+    /// while none runs.
+    recheck_asks: AtomicUsize,
+    /// One re-read acts at a time ([`Shell::recheck`]): a stale read never acts after a newer
+    /// one (the Rust verifier's finding 10).
+    rechecks: Mutex<()>,
+    /// `store.yaml` as the idle tick last saw it ([`Shell::recheck_if_changed`]).
+    store_seen: Mutex<StoreStamp>,
 }
 
 /// The tickers' stop signal: a ticker waits on it between ticks, so stopping wakes it at once.
@@ -439,10 +502,19 @@ impl Shell {
     ) -> Arc<Self> {
         let ops = OperationManager::new(clock.clone());
         let drafts = Arc::new(DraftStore::new(clock.clone()));
+        // D.4a T74: the key the app holds, behind the core's door to the secrets.
+        let vault = DesktopVaultAccess::new(clock.clone());
+        let context = context.with_vault_access(vault.clone());
+        let protection = Protection::read(context.config_root(), context.home_dir());
+        let store_seen = Mutex::new(StoreStamp::read(context.config_root()));
         let hook: LockHook = {
-            let (ops, drafts) = (ops.clone(), drafts.clone());
+            let (ops, drafts, vault) = (ops.clone(), drafts.clone(), vault.clone());
             Box::new(move |state: &LockState, change| {
                 if change == LockChange::Transition {
+                    // Every lock drops the store's key, before the page hears of it.
+                    if state.locked {
+                        vault.forget();
+                    }
                     ops.drop_all_plans();
                     ops.cancel_reads();
                     drafts.drop_all();
@@ -453,9 +525,15 @@ impl Shell {
         };
         let auth = AuthCache::new(auth);
         auth.apply_settings(&settings.get());
-        let lock = LockMachine::new(settings.get(), auth.clone(), clock, hook);
+        let lock = LockMachine::new_protected(
+            settings.get(),
+            auth.clone(),
+            clock,
+            hook,
+            protection.protected,
+        );
         let appearance = Arc::new(Appearance::new(settings.get().theme));
-        Arc::new(Self {
+        let shell = Arc::new(Self {
             settings,
             lock,
             ops,
@@ -470,7 +548,36 @@ impl Shell {
             session: Arc::default(),
             appearance,
             extras,
-        })
+            store_seen,
+            vault,
+            flows: Arc::default(),
+            recheck_asks: AtomicUsize::new(0),
+            rechecks: Mutex::new(()),
+        });
+        // A read that finds no key: the store may have been locked under the app.
+        let weak = Arc::downgrade(&shell);
+        shell.vault.on_missing(move || {
+            if let Some(shell) = weak.upgrade() {
+                shell.recheck();
+            }
+        });
+        // O4 between ticks (Task 14): every secret's use looks for a sleep the OS did not
+        // report first, so the first read after the wake is refused.
+        let weak = Arc::downgrade(&shell);
+        shell.vault.before_use(move || {
+            if let Some(shell) = weak.upgrade() {
+                shell.lock.check_sleep();
+            }
+        });
+        // A change waiting for the store's lock goes on while the app is unlocked, and is
+        // abandoned, nothing written, once it locks or quits (the final verifier's finding
+        // 12; Tasks 10a, 13).
+        let weak = Arc::downgrade(&shell);
+        shell.vault.may_wait(move || {
+            weak.upgrade()
+                .is_some_and(|shell| !shell.quitting.load(SeqCst) && !shell.lock.is_locked())
+        });
+        shell
     }
 
     /// The `app_info` answer. Its `auth` is asked of the authenticator afresh, waiting up to
@@ -485,9 +592,8 @@ impl Shell {
             os: current_os(),
             desktop_version: env!("CARGO_PKG_VERSION").into(),
             core_version: apprafter_core::VERSION.into(),
-            // D.4a T74: read from store.yaml on every call (Task 15 makes it the shell's
-            // re-read, which also pins and locks).
-            secrets: Protection::read(self.context.config_root(), self.context.home_dir()).info(),
+            // D.4a T74: the shell's re-read, which also pins, locks and forgets.
+            secrets: self.recheck().info(),
             account: whoami::username().unwrap_or_else(|_| UNKNOWN.into()),
             host: whoami::hostname().unwrap_or_else(|_| UNKNOWN.into()),
             auth: self
@@ -498,6 +604,138 @@ impl Shell {
             test_build: self.test_build,
             settings_notice: self.settings.notice(),
         }
+    }
+
+    /// Re-read where the store keeps its secrets, and follow it (D.4a T74): protected
+    /// without the key held — locked from a terminal under the app, or re-locked with a new
+    /// id — the key goes and the app locks with `SecretsLocked`; back in files, the key goes
+    /// and the pins lift. Protection itself is followed even while a lock flow of the app's
+    /// own runs ([`FlowGuard`]): the pins and the unlock's route then match the store, so the
+    /// OS cannot open a store the flow just protected (the final verifier's finding 10); only
+    /// the key's drop and the lock wait for the run, which re-reads as it ends. On a
+    /// protected store the decision is taken under the machine's lock
+    /// (`lock_unlocked_unless`), which an unlock's commit holds too, and the key is kept or
+    /// dropped in one step (`keep_only`): a key an unlock is keeping is never dropped by a
+    /// re-read, nor the app it opened re-locked (finding 8). On `app_info`, on window focus,
+    /// before `lock_info` and doctor, before Protect is planned, and when a read finds no
+    /// key; a file read, never on the main thread. One at a time. A key goes only when one is
+    /// held: a re-read of an unchanged store moves nothing, so a Protect plan waiting for its
+    /// confirm keeps its key at the end (T64).
+    pub fn recheck(&self) -> Protection {
+        let _one = self.rechecks.lock().unwrap_or_else(PoisonError::into_inner);
+        let now = Protection::read(self.context.config_root(), self.context.home_dir());
+        self.lock.set_protected(now.protected);
+        if self.flows.load(SeqCst) > 0 {
+            return now;
+        }
+        if now.protected {
+            let id = now.id.clone();
+            self.lock
+                .lock_unlocked_unless(LockReason::SecretsLocked, || {
+                    id.as_ref().is_some_and(|id| self.vault.keep_only(id))
+                });
+        } else {
+            self.vault.drop_key();
+        }
+        now
+    }
+
+    /// [`recheck`](Self::recheck) on a thread of its own: the window gained the focus, or a
+    /// lock flow's run panicked ([`FlowGuard`]). One thread at a time, and no ask is lost: an
+    /// ask that lands while the thread re-reads makes it read once more. (A panicking run's ask
+    /// can land just after a focus re-read found the run still going and acted on nothing; a
+    /// flag that dropped it would leave a store the run protected unfollowed.)
+    pub fn recheck_later(self: &Arc<Self>) {
+        if self.recheck_asks.fetch_add(1, SeqCst) > 0 {
+            return;
+        }
+        let shell = self.clone();
+        let spawned = thread::Builder::new()
+            .name("store-recheck".into())
+            .spawn(move || loop {
+                let asked = shell.recheck_asks.load(SeqCst);
+                if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| shell.recheck())) {
+                    tracing::error!(
+                        "the target store's re-read panicked: {}",
+                        panic_message(&*payload)
+                    );
+                }
+                // Done only when no ask came in since this re-read began.
+                if shell
+                    .recheck_asks
+                    .compare_exchange(asked, 0, SeqCst, SeqCst)
+                    .is_ok()
+                {
+                    break;
+                }
+            });
+        if let Err(e) = spawned {
+            self.recheck_asks.store(0, SeqCst);
+            tracing::warn!("no thread to re-read the target store on ({e})");
+        }
+    }
+
+    /// A lock flow of the app's own starts to run (its executor's first statement): the
+    /// re-read only reports until the guard goes.
+    pub fn flow(self: &Arc<Self>) -> FlowGuard {
+        self.flows.fetch_add(1, SeqCst);
+        FlowGuard {
+            flows: self.flows.clone(),
+            shell: Arc::downgrade(self),
+        }
+    }
+
+    /// The idle tick's look at the store (critic B finding 19): when `store.yaml` changed
+    /// since the last look — `lock on`, `lock off` or a re-lock from a terminal — a full
+    /// [`recheck`](Self::recheck). A `stat` every [`IDLE_TICK`].
+    pub fn recheck_if_changed(&self) {
+        let now = StoreStamp::read(self.context.config_root());
+        let changed = {
+            let mut seen = self
+                .store_seen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let changed = *seen != now;
+            *seen = now;
+            changed
+        };
+        if changed {
+            self.recheck();
+        }
+    }
+
+    /// The lock screen's field on a protected store (D.4a T75): the lock password or the
+    /// recovery key opens the vault through the gate, and its key is kept under the lock
+    /// machine's lock just before the unlock. `now` is the re-read the caller just made.
+    /// Back in files, the field's secret opens nothing (`use_system_prompt`: the OS is the
+    /// way again); an unreadable `store.yaml` is refused with why.
+    fn unlock_with_store_secret(
+        &self,
+        now: Protection,
+        secret: Zeroizing<String>,
+    ) -> Result<LockState, Refusal> {
+        let Some(id) = now.id.clone() else {
+            let root = self.context.config_root();
+            let error = match apprafter_core::secrets::read_store_file(root) {
+                Err(e) => DesktopError::Core(CoreError::Cli(e)),
+                Ok(_) => DesktopError::AuthUnavailable {
+                    reason: UnavailableReason::UseSystemPrompt,
+                },
+            };
+            return Err(error.into());
+        };
+        let root = self.context.config_root().to_path_buf();
+        let secret = SecretString::from(secret);
+        let kept = id.clone();
+        self.lock.unlock_with_store_secret(
+            |_| self.vault.open_typed(&root, &id, secret),
+            |opened| self.vault.keep(kept, opened),
+        )?;
+        // `id` came from a re-read made before a 0.7 s derivation: a terminal's re-lock
+        // meanwhile would leave a key for an id the store no longer has. Read again (the
+        // Rust verifier's finding 10).
+        self.recheck();
+        Ok(self.lock.state())
     }
 
     /// What the app's own process did to protect the store's key (D.4a T77), for `lock_info`.
@@ -535,13 +773,23 @@ impl Shell {
 
     /// Ask the owner and unlock (blocks while the OS prompt is open); the state that results.
     pub fn unlock(&self) -> Result<LockState, DesktopError> {
+        // D.4a T74 (critic B finding 19): the store may have been locked from a terminal
+        // while the app was locked; then the OS opens nothing.
+        self.recheck();
         self.lock.unlock()?;
         Ok(self.lock.state())
     }
 
     /// Unlock with the password from the lock screen's own field (blocks while it is checked);
-    /// the state that results.
+    /// the state that results. On a protected store the field's text is the lock password or
+    /// the recovery key, opened against the vault (D.4a T75).
     pub fn unlock_with_password(&self, password: Zeroizing<String>) -> Result<LockState, Refusal> {
+        // D.4a T74, T75: re-read first (the store may have changed while the app was
+        // locked); on a protected store the field takes the store's secret, on every OS.
+        let now = self.recheck();
+        if self.lock.protected() {
+            return self.unlock_with_store_secret(now, password);
+        }
         self.lock.unlock_with_password(password)?;
         Ok(self.lock.state())
     }
@@ -623,6 +871,8 @@ impl Shell {
         self.lock.close();
         self.ops.drop_all_plans();
         self.drafts.drop_all();
+        // D.4a T74: the quit drops the store's key too.
+        self.vault.forget();
         true
     }
 
@@ -764,6 +1014,7 @@ pub fn builder<R: Runtime>(base: tauri::Builder<R>, cell: ShellCell) -> tauri::B
         commands::target_draft_discard,
     ]);
     let gate = cell.clone();
+    let focus = cell.clone();
     base.invoke_handler(move |invoke| {
         // The one place the lock is enforced: no command can forget it.
         if let Err(e) = guard(&gate, invoke.message.command()) {
@@ -777,6 +1028,15 @@ pub fn builder<R: Runtime>(base: tauri::Builder<R>, cell: ShellCell) -> tauri::B
         if payload.event() == PageLoadEvent::Started {
             if let Some(shell) = cell.get() {
                 shell.ops.drop_subscribers_of(webview.label());
+            }
+        }
+    })
+    .on_window_event(move |_window, event| {
+        // D.4a T74: the store may have been locked or put back in files from a terminal
+        // while the window was away; the re-read runs off the main thread.
+        if matches!(event, tauri::WindowEvent::Focused(true)) {
+            if let Some(shell) = focus.get() {
+                shell.recheck_later();
             }
         }
     })
@@ -915,9 +1175,11 @@ pub fn start_tickers(shell: &Arc<Shell>) -> io::Result<()> {
 }
 
 /// The idle ticker's work: lock once the idle time has passed, drop the plans one time to live
-/// past their expiry, and the drafts past theirs.
+/// past their expiry, and the drafts past theirs, and re-read the store when `store.yaml` changed
+/// (D.4a T74).
 fn idle_tick(shell: &Shell) {
     shell.lock.tick();
+    shell.recheck_if_changed();
     shell.ops.sweep();
     shell.drafts.sweep();
 }
@@ -985,6 +1247,9 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
+    use apprafter_core::secrets::testing::{locked_store, LockedTestStore};
+    use apprafter_core::secrets::VaultRequest;
+    use apprafter_core::vault::VAULT_FILE;
     use apprafter_core::{
         CancellationToken, Context, CoreError, Event, Outcome, PathSource, PlanClass, SecretString,
     };
@@ -1050,6 +1315,10 @@ mod tests {
             lock_on_start: false,
             ..Settings::default()
         }
+    }
+
+    fn fake() -> Arc<dyn Authenticator> {
+        Arc::new(FakeAuthenticator::new())
     }
 
     fn plan(shell: &Shell, ran: &Arc<AtomicBool>) -> OpId {
@@ -2179,5 +2448,302 @@ mod tests {
         let unreadable = Context::for_desktop(dir.path().join("store"), "http://127.0.0.1:9")
             .with_runtime_dir(run.join("notes.txt"));
         assert_eq!(super::sweep_runtime_dir(&unreadable), 0);
+    }
+
+    /// The rig over a store `prepare` made before the app started (D.4a T74).
+    fn rig_with_store<T>(
+        settings: Settings,
+        auth: Arc<dyn Authenticator>,
+        prepare: impl FnOnce(&std::path::Path) -> T,
+    ) -> (Rig, T) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("store");
+        std::fs::create_dir_all(&root).unwrap();
+        let made = prepare(&root);
+        let clock = Arc::new(ManualClock::at(T0));
+        let store = SettingsStore::load(dir.path(), &*clock);
+        store.set(settings).unwrap();
+        let notified = Arc::new(Mutex::new(Vec::new()));
+        let shell = {
+            let notified = notified.clone();
+            Shell::new(
+                store,
+                auth,
+                clock.clone(),
+                Context::for_desktop(root, "http://127.0.0.1:9"),
+                ToolSearchPath::known(Default::default(), PathSource::Explicit),
+                false,
+                move |state| notified.lock().unwrap().push(state.clone()),
+            )
+        };
+        assert!(shell.auth.settled(LONG), "the authenticator never answered");
+        (
+            Rig {
+                _dir: dir,
+                clock,
+                shell,
+                notified,
+            },
+            made,
+        )
+    }
+
+    fn locked_rig() -> (Rig, LockedTestStore) {
+        rig_with_store(unlocked_at_start(), Arc::new(NoAuthenticator), |root| {
+            locked_store(root, &[])
+        })
+    }
+
+    fn secret(store: &LockedTestStore) -> Zeroizing<String> {
+        Zeroizing::new(store.recovery_key().expose().to_string())
+    }
+
+    #[test]
+    fn a_protected_store_starts_the_app_locked_and_its_secret_unlocks_it() {
+        let (r, store) = locked_rig();
+        assert!(r.shell.lock.state().locked && r.shell.lock.protected());
+        let wrong = r
+            .shell
+            .unlock_with_password(Zeroizing::new("not it".into()))
+            .unwrap_err();
+        assert!(
+            matches!(*wrong.error, DesktopError::AuthFailed { .. }),
+            "{wrong:?}"
+        );
+        assert!(!r.shell.vault.holds(&store.store_id));
+        let state = r.shell.unlock_with_password(secret(&store)).unwrap();
+        assert!(!state.locked);
+        assert!(r.shell.vault.holds(&store.store_id));
+    }
+
+    #[test]
+    fn every_lock_and_the_quit_drop_the_key() {
+        let (r, store) = locked_rig();
+        r.shell.unlock_with_password(secret(&store)).unwrap();
+        r.shell.lock_now();
+        assert!(!r.shell.vault.holds(&store.store_id));
+        r.shell.unlock_with_password(secret(&store)).unwrap();
+        assert!(r.shell.begin_quit());
+        assert!(!r.shell.vault.holds(&store.store_id));
+    }
+
+    #[test]
+    fn the_os_opens_nothing_on_a_protected_store() {
+        let (r, _store) =
+            rig_with_store(unlocked_at_start(), fake(), |root| locked_store(root, &[]));
+        let e = r.shell.unlock().unwrap_err();
+        assert!(
+            matches!(
+                e,
+                DesktopError::AuthUnavailable {
+                    reason: UnavailableReason::UsePasswordField
+                }
+            ),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn a_store_locked_under_the_app_locks_it_on_the_next_read() {
+        let r = rig(unlocked_at_start(), Arc::new(NoAuthenticator));
+        assert!(!r.shell.lock.state().locked);
+        locked_store(r.shell.context.config_root(), &[]);
+        let info = r.shell.app_info();
+        assert!(info.secrets.protected);
+        let state = r.shell.lock.state();
+        assert!(
+            state.locked && state.reason == Some(LockReason::SecretsLocked),
+            "{state:?}"
+        );
+    }
+
+    /// A secret read with no key for the store (the core asks the access) re-reads the store
+    /// and locks the app, before the read is refused.
+    #[test]
+    fn a_read_that_finds_no_key_locks_the_app() {
+        let r = rig(unlocked_at_start(), Arc::new(NoAuthenticator));
+        let store = locked_store(r.shell.context.config_root(), &[]);
+        let req = VaultRequest {
+            store_root: r.shell.context.config_root(),
+            store_id: &store.store_id,
+            slots: &[],
+        };
+        assert!(r.shell.context.vault_access().session(&req).is_err());
+        assert_eq!(r.shell.lock.state().reason, Some(LockReason::SecretsLocked));
+    }
+
+    #[test]
+    fn a_store_back_in_files_drops_the_key_and_unpins() {
+        let (r, store) = locked_rig();
+        r.shell.unlock_with_password(secret(&store)).unwrap();
+        let root = r.shell.context.config_root().to_path_buf();
+        std::fs::remove_file(root.join(VAULT_FILE)).unwrap();
+        std::fs::remove_file(root.join("store.yaml")).unwrap();
+        let info = r.shell.app_info();
+        assert!(!info.secrets.protected);
+        assert!(!r.shell.vault.holds(&store.store_id) && !r.shell.lock.protected());
+        assert!(!r.shell.lock.state().locked);
+    }
+
+    /// A lock flow of the app's own changes the store as it runs: the re-read only reports
+    /// until its guard goes (the run takes it: Task 17).
+    #[test]
+    fn during_a_lock_flow_the_re_read_neither_locks_nor_forgets() {
+        let r = rig(unlocked_at_start(), Arc::new(NoAuthenticator));
+        let flow = r.shell.flow();
+        locked_store(r.shell.context.config_root(), &[]);
+        assert!(r.shell.app_info().secrets.protected);
+        assert!(!r.shell.lock.state().locked);
+        drop(flow);
+        r.shell.app_info();
+        assert_eq!(r.shell.lock.state().reason, Some(LockReason::SecretsLocked));
+    }
+
+    #[test]
+    fn a_focus_re_reads_the_store_off_the_calling_thread() {
+        let r = rig(unlocked_at_start(), Arc::new(NoAuthenticator));
+        locked_store(r.shell.context.config_root(), &[]);
+        r.shell.recheck_later();
+        let deadline = Instant::now() + LONG;
+        while !r.shell.lock.state().locked && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(r.shell.lock.state().reason, Some(LockReason::SecretsLocked));
+    }
+
+    /// Critic B finding 19: a store locked from a terminal while the app was already locked
+    /// (by the person, in files) is re-read by the unlock: the OS no longer opens it.
+    #[test]
+    fn an_unlock_re_reads_the_store_first() {
+        let r = rig(unlocked_at_start(), fake());
+        r.shell.lock_now();
+        assert!(r.shell.lock.state().locked);
+        locked_store(r.shell.context.config_root(), &[]);
+        let e = r.shell.unlock().unwrap_err();
+        assert!(
+            matches!(
+                e,
+                DesktopError::AuthUnavailable {
+                    reason: UnavailableReason::UsePasswordField
+                }
+            ),
+            "{e:?}"
+        );
+        assert!(r.shell.lock.state().locked);
+    }
+
+    /// Critic B finding 19: a terminal's `lock off` (or `lock on`) under an unlocked app is
+    /// followed by no secret read; the idle tick sees `store.yaml` change and re-reads.
+    #[test]
+    fn the_idle_tick_follows_a_store_changed_from_a_terminal() {
+        let (r, store) = locked_rig();
+        r.shell.unlock_with_password(secret(&store)).unwrap();
+        let root = r.shell.context.config_root().to_path_buf();
+        std::fs::remove_file(root.join(VAULT_FILE)).unwrap();
+        std::fs::remove_file(root.join("store.yaml")).unwrap();
+        super::idle_tick(&r.shell);
+        assert!(!r.shell.vault.holds(&store.store_id) && !r.shell.lock.protected());
+        // And the other way: locked from a terminal under the unlocked app.
+        locked_store(&root, &[]);
+        super::idle_tick(&r.shell);
+        assert_eq!(r.shell.lock.state().reason, Some(LockReason::SecretsLocked));
+    }
+
+    /// T64 (the Rust verifier's finding 2): re-reads of an unchanged store — app_info, a
+    /// re-read, the idle tick — move no epoch, in files or with the key held, so a Protect
+    /// plan waiting for its confirm keeps its key at the end.
+    #[test]
+    fn a_re_read_of_an_unchanged_store_moves_no_epoch() {
+        let r = rig(unlocked_at_start(), Arc::new(NoAuthenticator));
+        let before = r.shell.vault.epoch();
+        r.shell.app_info();
+        r.shell.recheck();
+        super::idle_tick(&r.shell);
+        assert_eq!(r.shell.vault.epoch(), before);
+        let (r, store) = locked_rig();
+        r.shell.unlock_with_password(secret(&store)).unwrap();
+        let before = r.shell.vault.epoch();
+        r.shell.app_info();
+        r.shell.recheck();
+        assert_eq!(r.shell.vault.epoch(), before);
+        assert!(r.shell.vault.holds(&store.store_id));
+    }
+
+    /// O4 between ticks (the Rust verifier's finding 4): the first secret read after a sleep
+    /// the OS did not report finds the app locked and the key gone.
+    #[test]
+    fn the_first_read_after_an_unreported_sleep_is_refused() {
+        let (r, store) = locked_rig();
+        r.shell.unlock_with_password(secret(&store)).unwrap();
+        let root = r.shell.context.config_root().to_path_buf();
+        let req = VaultRequest {
+            store_root: &root,
+            store_id: &store.store_id,
+            slots: &[],
+        };
+        let session = r.shell.context.vault_access().session(&req).unwrap();
+        let vault = std::fs::read(root.join(VAULT_FILE)).unwrap();
+        assert!(session.recipient(&vault).is_ok());
+        r.clock.sleep(60_000);
+        assert!(session.recipient(&vault).is_err());
+        assert_eq!(r.shell.lock.state().reason, Some(LockReason::OsSession));
+        assert!(!r.shell.vault.holds(&store.store_id));
+    }
+
+    /// A lock flow's run that panics still re-reads as it ends (the Rust verifier's finding
+    /// 11): its guard asks for it while the thread unwinds.
+    #[test]
+    fn a_flow_that_panics_still_re_reads() {
+        let r = rig(unlocked_at_start(), Arc::new(NoAuthenticator));
+        let shell = r.shell.clone();
+        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = shell.flow();
+            let _ = locked_store(shell.context.config_root(), &[]);
+            panic!("the run broke");
+        }));
+        assert!(ran.is_err());
+        let deadline = Instant::now() + LONG;
+        while !r.shell.lock.state().locked && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(r.shell.lock.state().reason, Some(LockReason::SecretsLocked));
+    }
+
+    /// The final verifier's finding 10: during a lock flow the re-read still follows
+    /// protection — only the lock and the key's drop wait for the run — so after a Lock now
+    /// during the run the OS cannot open the store the flow just protected.
+    #[test]
+    fn during_a_lock_flow_the_os_opens_no_store_it_protected() {
+        let r = rig(unlocked_at_start(), fake());
+        let flow = r.shell.flow();
+        locked_store(r.shell.context.config_root(), &[]);
+        r.shell.lock_now();
+        let e = r.shell.unlock().unwrap_err();
+        assert!(
+            matches!(
+                e,
+                DesktopError::AuthUnavailable {
+                    reason: UnavailableReason::UsePasswordField
+                }
+            ),
+            "{e:?}"
+        );
+        assert!(r.shell.lock.state().locked && r.shell.lock.protected());
+        drop(flow);
+    }
+
+    /// The final verifier's finding 12 (Tasks 10a, 13): a change that holds a key and waits
+    /// for the store's lock goes on while the app is unlocked, and is abandoned once it locks.
+    #[test]
+    fn after_a_lock_a_change_waiting_for_the_store_is_abandoned() {
+        let r = rig(unlocked_at_start(), fake());
+        let access = r.shell.context.vault_access().clone();
+        let root = r.shell.context.config_root().to_path_buf();
+        assert!(access.store_wait_slice().is_some());
+        assert!(access.keep_waiting(&root).is_ok());
+        r.shell.lock_now();
+        assert!(r.shell.lock.state().locked);
+        let e = access.keep_waiting(&root).unwrap_err();
+        assert!(matches!(e, cli_core::CliError::StoreLocked { .. }), "{e:?}");
     }
 }
