@@ -5,7 +5,9 @@ description: "What apprafter lock on changes in a target store: the vault and it
 # How the store lock works
 
 What `apprafter lock on` changes in a target store, how a locked store's
-secrets are opened, and where the lock stops.
+secrets are opened, and where the lock stops. The recipe is [Protecting
+secrets from agents](../operator-guide/protecting-secrets-from-agents.md);
+none of this is needed to use it.
 
 Read it when you are deciding whether the lock answers the threat you have
 in mind, when an unlock window behaved in a way you did not expect, or when
@@ -13,8 +15,8 @@ you are backing up or moving a locked store.
 
 The decision is [ADR 0068](../adr/0068-target-store-lock.md): an opt-in lock
 per target store, with no operating-system keyring behind it. It stops an AI
-agent that oversteps, and only slows a program running as you that sets out
-to get past it.
+agent that oversteps, and only raises the bar for a program running as you
+that sets out to get past it.
 
 ## What a locked store keeps where {#layout}
 

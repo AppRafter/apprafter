@@ -232,6 +232,8 @@ nav:
       # 1-4: stand a cluster up.
       - Quickstart: operator-guide/quickstart.md
       - Managing targets: operator-guide/target-store.md
+      # 1-4 continued: once a target exists, keep its secrets from an agent.
+      - Protecting secrets from agents: operator-guide/protecting-secrets-from-agents.md
       # 5: firewall and domains. Both are about cluster-owned resources
       # (the zones on the platform Gateway and the certificate that
       # terminates TLS for them), which is operator work.

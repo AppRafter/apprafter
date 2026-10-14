@@ -93,7 +93,10 @@ apprafter up
 ```
 
 No target store touched. Backwards-compat with the pre-v0.1.69
-flow is preserved.
+flow is preserved. On a locked target store `HCLOUD_TOKEN` is refused:
+give CI a store of its own that is not locked — [Give an agent a store
+of its own](protecting-secrets-from-agents.md#playground) describes the
+layout.
 
 ### Token rotation (no target re-creation)
 
@@ -193,6 +196,10 @@ How to read it:
 - **The token line reports presence and length only.** The bytes are
   never printed, here or in `apprafter whoami`. Read
   `credentials.yaml` directly if a script needs the value.
+- **On a locked store** the token line reads `Hetzner token: in the
+  vault (<store>/vault)` and the foot names the vault in place of
+  `credentials.yaml`: see [Protecting secrets from
+  agents](protecting-secrets-from-agents.md).
 - **A `Server:` line appears once the target has a provisioned
   server**, naming the server the target's local state records, for
   example `Server:      prod-node (id 42, type cx22)`. A target with no
@@ -357,6 +364,9 @@ Hetzner Console.
 - **Symlinking `~/.config/apprafter/targets/*/credentials.yaml`
   to a shared file.** Each target needs its own; sharing breaks
   `apprafter target use` semantics.
+- **Leaving tokens in clear on a machine an AI agent works on.** Lock
+  the target store: [Protecting secrets from
+  agents](protecting-secrets-from-agents.md).
 
 ## See also
 
@@ -366,3 +376,5 @@ Hetzner Console.
   `apprafter target …` subcommand reference.
 - [The target store on disk](../how-it-works/the-target-store.md) — the file
   layout and the credential resolution chain, and the decision behind them.
+- [Protecting secrets from agents](protecting-secrets-from-agents.md) —
+  locking a store's secrets, and an agent's own store.

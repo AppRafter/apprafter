@@ -465,7 +465,8 @@ before it asks for anything. Commands that need neither still run.
 **Fix.** Unset the variable; the command then asks for the lock password at
 its terminal. To work with a value from the environment on purpose — in CI,
 say — use a target store of its own that is not locked, with its own
-`APPRAFTER_CONFIG_DIR`. `apprafter lock off` is the one command that takes
+`APPRAFTER_CONFIG_DIR` — [Give an agent a store of its
+own](protecting-secrets-from-agents.md#playground). `apprafter lock off` is the one command that takes
 `APPRAFTER_AGE_KEY` on a locked store: as the file the shared age key is
 written to, when a cached secret goes back under it.
 
@@ -677,7 +678,8 @@ AppRafter cannot open a locked store without its lock password or its
 recovery key, and the recovery key opens nothing without the vault file.
 There is no reset. If you have a backup of the store's `vault` and either
 secret, restore the vault and unlock. Otherwise rebuild the store's secrets
-from their sources; the clusters themselves keep running.
+from their sources; the clusters themselves keep running. How to keep this
+from happening: [Back it up](protecting-secrets-from-agents.md#backup).
 
 1. Move the vault and `store.yaml` aside. Keep them: a password found later
    still opens them. `STORE` is the target store's root, which the
