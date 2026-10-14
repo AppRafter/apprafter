@@ -104,12 +104,15 @@ pub enum DesktopError {
     )]
     RelativePath { path: String },
 
-    /// Require unlock, its start lock or its sleep lock switched off while the target store's
-    /// secrets are protected (D.4a T74, surface D24); the lock machine raises it from d4a-g.
-    #[error("Require unlock stays on while this target store's secrets are protected")]
+    /// Require unlock, its start lock or its sleep lock switched off, or Auto-lock set to
+    /// Never, while the target store's secrets are protected (D.4a T74, O7, surface D24).
+    #[error(
+        "the lock's settings stay on while this target store's secrets are protected: unlocking \
+         is what opens them"
+    )]
     #[diagnostic(
         code(apprafter::desktop::lock_required),
-        help("Stop protecting the store's secrets in Settings › Lock to change it.")
+        help("Stop protecting the store's secrets in Settings › Lock to change them.")
     )]
     LockRequired,
 
@@ -436,11 +439,12 @@ mod tests {
         assert_eq!(ui.code.as_deref(), Some(errors::LOCK_REQUIRED));
         assert_eq!(
             ui.message,
-            "Require unlock stays on while this target store's secrets are protected"
+            "the lock's settings stay on while this target store's secrets are protected: \
+             unlocking is what opens them"
         );
         assert_eq!(
             ui.help.as_deref(),
-            Some("Stop protecting the store's secrets in Settings › Lock to change it.")
+            Some("Stop protecting the store's secrets in Settings › Lock to change them.")
         );
         assert!(ui.fields.is_empty());
     }

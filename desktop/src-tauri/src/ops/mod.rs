@@ -34,6 +34,17 @@ pub trait Clock: Send + Sync {
     /// still while the machine sleeps, so a deadline is measured on both clocks: see
     /// [`elapsed_ms`].
     fn monotonic_ms(&self) -> u64;
+
+    /// Milliseconds since boot on a clock that counts suspend (Linux `CLOCK_BOOTTIME`, macOS
+    /// `CLOCK_MONOTONIC_RAW`, Windows `GetTickCount64`): the first of O4's pair (D.4a).
+    /// Never `SystemTime`, which steps, nor `Instant`, whose counting of suspend std leaves
+    /// unspecified. No default: every clock says what it reads (the final verifier's finding
+    /// 2 — a default of `monotonic_ms` would see no sleep, silently).
+    fn with_sleep_ms(&self) -> u64;
+
+    /// The same, suspend excluded (Linux `CLOCK_MONOTONIC`, macOS `CLOCK_UPTIME_RAW`, Windows
+    /// `QueryUnbiasedInterruptTime`): the second of O4's pair. No default either.
+    fn awake_ms(&self) -> u64;
 }
 
 /// The operating system's clocks.
@@ -52,10 +63,104 @@ impl Clock for SystemClock {
         static ANCHOR: OnceLock<Instant> = OnceLock::new();
         saturating_ms(ANCHOR.get_or_init(Instant::now).elapsed().as_millis())
     }
+
+    fn with_sleep_ms(&self) -> u64 {
+        sleep_clocks::with_sleep_ms()
+    }
+
+    fn awake_ms(&self) -> u64 {
+        sleep_clocks::awake_ms()
+    }
 }
 
 fn saturating_ms(ms: u128) -> u64 {
     u64::try_from(ms).unwrap_or(u64::MAX)
+}
+
+/// O4's rule, the CLI holder's (`window::SLEEP_GAP`): between two looks the clock that counts
+/// suspend ran more than this ahead of the one that does not — the machine slept.
+pub const SLEEP_GAP_MS: u64 = 5_000;
+
+/// One look at O4's two clocks ([`Clock::with_sleep_ms`], [`Clock::awake_ms`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClockPair {
+    pub with_sleep_ms: u64,
+    pub awake_ms: u64,
+}
+
+impl ClockPair {
+    pub fn now(clock: &dyn Clock) -> Self {
+        Self {
+            with_sleep_ms: clock.with_sleep_ms(),
+            awake_ms: clock.awake_ms(),
+        }
+    }
+
+    /// Whether the machine slept since `before`: more than [`SLEEP_GAP_MS`] passed on the clock
+    /// that counts suspend beyond the one that does not. Each look measures from the previous
+    /// one, so two short naps never add up (the holder's rule).
+    pub fn slept_since(&self, before: ClockPair) -> bool {
+        let passed = self.with_sleep_ms.saturating_sub(before.with_sleep_ms);
+        let awake = self.awake_ms.saturating_sub(before.awake_ms);
+        passed.saturating_sub(awake) > SLEEP_GAP_MS
+    }
+}
+
+/// The OS's two clocks for O4, read as the CLI's holder reads them (its `os::*`; HG4 keeps the
+/// desktop from naming that code, so it is mirrored here, with its tests).
+mod sleep_clocks {
+    #[cfg(target_os = "linux")]
+    pub(super) const WITH_SLEEP: libc::clockid_t = libc::CLOCK_BOOTTIME;
+    #[cfg(target_os = "linux")]
+    pub(super) const AWAKE: libc::clockid_t = libc::CLOCK_MONOTONIC;
+    /// Raw, as `AWAKE` is: `CLOCK_MONOTONIC` is slewed, and its readings drift from a raw
+    /// clock's (e's CI finding).
+    #[cfg(target_os = "macos")]
+    pub(super) const WITH_SLEEP: libc::clockid_t = libc::CLOCK_MONOTONIC_RAW;
+    #[cfg(target_os = "macos")]
+    pub(super) const AWAKE: libc::clockid_t = libc::CLOCK_UPTIME_RAW;
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn read(id: libc::clockid_t) -> u64 {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: clock_gettime writes one timespec; both clocks exist on this OS.
+        unsafe { libc::clock_gettime(id, &mut ts) };
+        (ts.tv_sec as u64)
+            .saturating_mul(1000)
+            .saturating_add(ts.tv_nsec as u64 / 1_000_000)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(super) fn with_sleep_ms() -> u64 {
+        read(WITH_SLEEP)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(super) fn awake_ms() -> u64 {
+        read(AWAKE)
+    }
+
+    /// Milliseconds since boot, suspend included, at the system tick's resolution (the
+    /// holder's reader; 15.6 ms is nothing against a 5 s gap).
+    #[cfg(windows)]
+    pub(super) fn with_sleep_ms() -> u64 {
+        // SAFETY: no arguments.
+        unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() }
+    }
+
+    /// The interrupt time the system spent in the working state, in 100 ns units.
+    #[cfg(windows)]
+    pub(super) fn awake_ms() -> u64 {
+        let mut t = 0u64;
+        // SAFETY: writes one u64.
+        unsafe {
+            windows_sys::Win32::System::WindowsProgramming::QueryUnbiasedInterruptTime(&mut t)
+        };
+        t / 10_000
+    }
 }
 
 /// What a caught panic said, for an error message or a log line.
@@ -172,6 +277,9 @@ pub(crate) mod test_clock {
     pub(crate) struct ManualClock {
         wall: AtomicU64,
         monotonic: AtomicU64,
+        /// O4's pair: the clock that counts suspend, and the one that does not.
+        with_sleep: AtomicU64,
+        awake: AtomicU64,
     }
 
     impl ManualClock {
@@ -179,10 +287,13 @@ pub(crate) mod test_clock {
             Self {
                 wall: AtomicU64::new(ms),
                 monotonic: AtomicU64::new(MONOTONIC_START),
+                with_sleep: AtomicU64::new(MONOTONIC_START),
+                awake: AtomicU64::new(MONOTONIC_START),
             }
         }
 
-        /// Time passes until the wall clock reads `ms`: the monotonic clock moves as far.
+        /// Time passes until the wall clock reads `ms`: the monotonic clock, and O4's two, move
+        /// as far.
         /// An `ms` in the past steps the wall clock back alone, as [`set_wall`] does.
         ///
         /// [`set_wall`]: Self::set_wall
@@ -190,18 +301,31 @@ pub(crate) mod test_clock {
             let was = self.wall.swap(ms, Ordering::SeqCst);
             self.monotonic
                 .fetch_add(ms.saturating_sub(was), Ordering::SeqCst);
+            self.with_sleep
+                .fetch_add(ms.saturating_sub(was), Ordering::SeqCst);
+            self.awake
+                .fetch_add(ms.saturating_sub(was), Ordering::SeqCst);
         }
 
-        /// `ms` pass, on both clocks.
+        /// `ms` pass, on every clock.
         pub(crate) fn advance(&self, ms: u64) {
             self.wall.fetch_add(ms, Ordering::SeqCst);
             self.monotonic.fetch_add(ms, Ordering::SeqCst);
+            self.with_sleep.fetch_add(ms, Ordering::SeqCst);
+            self.awake.fetch_add(ms, Ordering::SeqCst);
         }
 
         /// The wall clock steps to `ms` (a time sync, the owner changing the date) while no
         /// time passes.
         pub(crate) fn set_wall(&self, ms: u64) {
             self.wall.store(ms, Ordering::SeqCst);
+        }
+
+        /// The machine sleeps for `ms`: the wall clock and the clock that counts suspend move,
+        /// the monotonic and the awake ones stand still (O4's tests).
+        pub(crate) fn sleep(&self, ms: u64) {
+            self.wall.fetch_add(ms, Ordering::SeqCst);
+            self.with_sleep.fetch_add(ms, Ordering::SeqCst);
         }
     }
 
@@ -213,6 +337,14 @@ pub(crate) mod test_clock {
         fn monotonic_ms(&self) -> u64 {
             self.monotonic.load(Ordering::SeqCst)
         }
+
+        fn with_sleep_ms(&self) -> u64 {
+            self.with_sleep.load(Ordering::SeqCst)
+        }
+
+        fn awake_ms(&self) -> u64 {
+            self.awake.load(Ordering::SeqCst)
+        }
     }
 }
 
@@ -220,12 +352,13 @@ pub(crate) mod test_clock {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
     use std::sync::{mpsc, Arc};
+    use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use apprafter_core::CancellationToken;
 
     use super::test_clock::ManualClock;
-    use super::{elapsed_ms, test_trips, trip, Clock, Stamp, SystemClock};
+    use super::{elapsed_ms, test_trips, trip, Clock, ClockPair, Stamp, SystemClock, SLEEP_GAP_MS};
 
     const T0: u64 = 1_700_000_000_000;
     const DAY: u64 = 24 * 60 * 60 * 1000;
@@ -358,5 +491,160 @@ mod tests {
         });
         trip(other, "test-cancel");
         rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    }
+
+    /// D.4a O4: the pair O4 compares, read as the CLI's holder reads it (e's
+    /// `the_system_clocks_advance_together_while_awake`): both advance while awake, the one
+    /// that counts suspend is never behind, and they stay well under 5 s apart then. Which clock
+    /// each reads is the next three tests', and that the first counts suspend the walk's.
+    #[test]
+    fn the_sleep_clocks_advance_together_while_awake() {
+        let c = SystemClock;
+        let (s0, a0) = (c.with_sleep_ms(), c.awake_ms());
+        thread::sleep(Duration::from_millis(50));
+        let (s1, a1) = (c.with_sleep_ms(), c.awake_ms());
+        assert!(s1 > s0 && a1 > a0, "{s0} {s1} {a0} {a1}");
+        // 100 ms covers Windows' tick granularity (GetTickCount64).
+        assert!(s1 + 100 >= a1, "{s1} {a1}");
+        assert!((s1 - s0).abs_diff(a1 - a0) < SLEEP_GAP_MS);
+    }
+
+    /// The final verifier's finding 2: `SystemClock` reads the two clocks it names, each within
+    /// 50 ms of a direct read of that OS clock — never `Instant` (`monotonic_ms`, anchored at
+    /// this process's first reading) in their place. The clock ids are written out here, not
+    /// taken from `sleep_clocks`.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn the_system_clock_reads_the_named_clocks() {
+        fn direct(id: libc::clockid_t) -> u64 {
+            let mut ts = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            // SAFETY: clock_gettime writes one timespec.
+            assert_eq!(unsafe { libc::clock_gettime(id, &mut ts) }, 0);
+            ts.tv_sec as u64 * 1000 + ts.tv_nsec as u64 / 1_000_000
+        }
+        #[cfg(target_os = "linux")]
+        let (with_sleep, awake) = (libc::CLOCK_BOOTTIME, libc::CLOCK_MONOTONIC);
+        #[cfg(target_os = "macos")]
+        let (with_sleep, awake) = (libc::CLOCK_MONOTONIC_RAW, libc::CLOCK_UPTIME_RAW);
+        let c = SystemClock;
+        let (s, d) = (c.with_sleep_ms(), direct(with_sleep));
+        assert!(
+            s.abs_diff(d) < 50,
+            "with_sleep_ms {s}, the clock that counts suspend {d}"
+        );
+        let (a, d) = (c.awake_ms(), direct(awake));
+        assert!(
+            a.abs_diff(d) < 50,
+            "awake_ms {a}, the clock that does not {d}"
+        );
+    }
+
+    /// The same on Windows, on the holder's pair: the tick count since boot (suspend
+    /// included) and the unbiased interrupt time (100 ns units, suspend excluded).
+    #[cfg(windows)]
+    #[test]
+    fn the_system_clock_reads_the_named_clocks() {
+        use windows_sys::Win32::System::SystemInformation::GetTickCount64;
+        use windows_sys::Win32::System::WindowsProgramming::QueryUnbiasedInterruptTime;
+        let mut awake = 0u64;
+        // SAFETY: no arguments; then one u64 written.
+        let with_sleep = unsafe { GetTickCount64() };
+        unsafe { QueryUnbiasedInterruptTime(&mut awake) };
+        let c = SystemClock;
+        let s = c.with_sleep_ms();
+        assert!(
+            s.abs_diff(with_sleep) < 50,
+            "with_sleep_ms {s}, the tick count {with_sleep}"
+        );
+        let (a, d) = (c.awake_ms(), awake / 10_000);
+        assert!(
+            a.abs_diff(d) < 50,
+            "awake_ms {a}, the unbiased interrupt time {d}"
+        );
+    }
+
+    /// What a direct read cannot tell apart on a machine that has not slept since it booted —
+    /// the clock that counts suspend from the one that does not — is pinned in the source:
+    /// each reader of `sleep_clocks` reads the clock its name says, on every OS. It reads text,
+    /// so it runs on every OS, Windows' readers included (the final verifier's finding 2). The
+    /// needles are split with `concat!`, so this test's own text is never one of them.
+    #[test]
+    fn each_sleep_clock_reader_reads_the_clock_it_names() {
+        fn bodies<'a>(src: &'a str, signature: &str) -> Vec<&'a str> {
+            src.match_indices(signature)
+                .map(|(at, _)| {
+                    let rest = &src[at..];
+                    &rest[..rest.find("\n    }\n").unwrap_or(rest.len())]
+                })
+                .collect()
+        }
+        let src = include_str!("mod.rs");
+        let with_sleep = bodies(src, concat!("pub(super) fn with_", "sleep_ms() -> u64 {"));
+        let awake = bodies(src, concat!("pub(super) fn awake", "_ms() -> u64 {"));
+        assert_eq!(
+            (with_sleep.len(), awake.len()),
+            (2, 2),
+            "one reader each, Unix and Windows"
+        );
+        let counts = concat!("read(WITH", "_SLEEP)");
+        let counts_windows = concat!("GetTick", "Count64()");
+        let stands = concat!("read(AW", "AKE)");
+        let stands_windows = concat!("QueryUnbiasedInterrupt", "Time(&mut t)");
+        for body in &with_sleep {
+            assert!(
+                body.contains(counts) || body.contains(counts_windows),
+                "{body}"
+            );
+            assert!(
+                !body.contains(stands) && !body.contains(stands_windows),
+                "{body}"
+            );
+        }
+        for body in &awake {
+            assert!(
+                body.contains(stands) || body.contains(stands_windows),
+                "{body}"
+            );
+            assert!(
+                !body.contains(counts) && !body.contains(counts_windows),
+                "{body}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_sleep_clocks_are_the_ones_that_count_suspend() {
+        assert_eq!(
+            (super::sleep_clocks::WITH_SLEEP, super::sleep_clocks::AWAKE),
+            (libc::CLOCK_BOOTTIME, libc::CLOCK_MONOTONIC)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_sleep_clocks_are_the_ones_that_count_suspend() {
+        assert_eq!(
+            (super::sleep_clocks::WITH_SLEEP, super::sleep_clocks::AWAKE),
+            (libc::CLOCK_MONOTONIC_RAW, libc::CLOCK_UPTIME_RAW)
+        );
+    }
+
+    /// A test's sleep moves the wall clock and the clock that counts suspend, never the
+    /// monotonic or the awake one; a wall step moves the wall alone. A gap over 5 s is a sleep.
+    #[test]
+    fn a_manual_sleep_moves_only_the_clocks_that_count_it() {
+        let clock = ManualClock::at(T0);
+        let before = ClockPair::now(&clock);
+        clock.set_wall(T0 + DAY);
+        assert!(!ClockPair::now(&clock).slept_since(before));
+        clock.sleep(SLEEP_GAP_MS);
+        assert!(!ClockPair::now(&clock).slept_since(before));
+        clock.sleep(1);
+        assert!(ClockPair::now(&clock).slept_since(before));
+        assert_eq!(clock.monotonic_ms(), ManualClock::at(T0).monotonic_ms());
     }
 }

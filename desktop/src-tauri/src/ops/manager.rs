@@ -3177,6 +3177,14 @@ mod tests {
         fn monotonic_ms(&self) -> u64 {
             self.clock.monotonic_ms()
         }
+
+        fn with_sleep_ms(&self) -> u64 {
+            self.clock.with_sleep_ms()
+        }
+
+        fn awake_ms(&self) -> u64 {
+            self.clock.awake_ms()
+        }
     }
 
     #[test]
