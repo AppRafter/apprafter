@@ -742,6 +742,42 @@
   font-size: var(--fs-12-5);
 }
 
+/* Settings › Lock (D.4a): the notes under Protect secrets, the slots, this computer's limits. */
+.lock-notes {
+  margin: 0 0 8px;
+  color: var(--fg-muted);
+  font-size: var(--fs-12-5);
+}
+
+.lock-notes p {
+  margin: 4px 0;
+}
+
+.lock-slots {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.lock-limits-head {
+  padding: 10px 0 4px;
+  color: var(--fg);
+  font-size: var(--fs-12-5);
+}
+
+.lock-limits {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0 0 6px;
+  padding-left: 18px;
+}
+
+.lock-limits li[data-tone="warn"],
+.lock-notes p[data-tone="warn"] {
+  color: var(--warn);
+}
+
 /* Target screen --------------------------------------------------------------------------------- */
 
 .target-row-sub code {
