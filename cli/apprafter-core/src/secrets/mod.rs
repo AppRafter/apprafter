@@ -39,6 +39,8 @@ use crate::context::SecretString;
 mod access;
 mod cache;
 mod files;
+#[cfg(test)]
+mod lazy_tests;
 mod locked;
 #[cfg(test)]
 mod locked_tests;

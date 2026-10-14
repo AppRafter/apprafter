@@ -321,6 +321,13 @@ const ALLOWED: &[(&str, &str, Rule)] = &[
         "start",
         Rule::InSession,
     ),
+    // T-lazy-2: the rule-2 commands run in a session of their own, beside a tripwire at that
+    // session's holder endpoint (D.4a T7, G5).
+    (
+        "platform-cli/tests/holder_lazy_test.rs",
+        "start",
+        Rule::InSession,
+    ),
 ];
 
 /// One rule broken at one line.
