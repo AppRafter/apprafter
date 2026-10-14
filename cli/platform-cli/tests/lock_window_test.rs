@@ -68,25 +68,34 @@ struct Terminal {
     child: Child,
     keys: std::fs::File,
     screen: Arc<Mutex<String>>,
+    /// Reads the terminal into `screen` until it closes.
+    reader: std::thread::JoinHandle<()>,
     out: mpsc::Receiver<String>,
     stdout: Vec<String>,
 }
 
 impl Terminal {
     fn start(sp: &Spawn, script: &str) -> Terminal {
+        Terminal::start_reading_late(sp, script, Duration::ZERO)
+    }
+
+    /// [`Terminal::start`] with the terminal's reader starting `late`: the harness's own test
+    /// puts it behind a session that has already ended.
+    fn start_reading_late(sp: &Spawn, script: &str, late: Duration) -> Terminal {
         let (master, slave) = open_pty();
         let mut c = sp.in_session(script, Some(slave));
         c.stdout(Stdio::piped());
         let mut child = c.spawn().expect("start the session");
         drop(c);
         let keys = std::fs::File::from(master);
-        let mut reader = keys.try_clone().unwrap();
+        let mut from = keys.try_clone().unwrap();
         let screen = Arc::new(Mutex::new(String::new()));
         let shown = screen.clone();
-        std::thread::spawn(move || {
+        let reader = std::thread::spawn(move || {
+            std::thread::sleep(late);
             let mut buf = [0u8; 4096];
             // EIO once no process has the terminal open any more: the session is over.
-            while let Ok(n @ 1..) = reader.read(&mut buf) {
+            while let Ok(n @ 1..) = from.read(&mut buf) {
                 shown
                     .lock()
                     .unwrap()
@@ -106,6 +115,7 @@ impl Terminal {
             child,
             keys,
             screen,
+            reader,
             out,
             stdout: Vec::new(),
         }
@@ -155,10 +165,31 @@ impl Terminal {
         self.stdout.join("\n")
     }
 
-    /// Wait for the shell's end; what the terminal showed.
-    fn finish(mut self) -> String {
-        self.child.wait().unwrap();
-        self.screen()
+    /// Wait for the shell's end, then for the reader to read the terminal until it closes (no
+    /// process has it open any more): what the session wrote last can still be unread when the
+    /// shell is reaped (GOTCHA-259). What the terminal showed.
+    fn finish(self) -> String {
+        let Terminal {
+            mut child,
+            screen,
+            reader,
+            ..
+        } = self;
+        child.wait().unwrap();
+        let until = Instant::now() + LIMIT;
+        while !reader.is_finished() {
+            assert!(
+                Instant::now() < until,
+                "the terminal did not close within 30 s of the session's end:\n{}",
+                screen.lock().unwrap()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        reader.join().expect("the terminal's reader");
+        Arc::try_unwrap(screen)
+            .expect("the reader has let go of the screen")
+            .into_inner()
+            .unwrap()
     }
 }
 
@@ -187,6 +218,23 @@ fn holder_alive(lock: &Path) -> bool {
     };
     // SAFETY: flock on a file this function opened; released when it closes.
     unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) != 0 }
+}
+
+/// The harness itself (GOTCHA-259): the screen `finish` returns holds what the session wrote
+/// last, even when the reader is behind. Forced: the reader starts 2 s after a session that
+/// writes one line to its terminal and ends at once, so the shell is reaped before anything
+/// was read.
+#[test]
+fn finish_returns_what_the_session_wrote_last_when_the_reader_is_behind() {
+    let sp = Spawn::new();
+    let mut t = Terminal::start_reading_late(
+        &sp,
+        r#"echo "the session's last line" >&2; echo "step: wrote $?""#,
+        Duration::from_secs(2),
+    );
+    assert_eq!(t.step(), "wrote 0");
+    let screen = t.finish();
+    assert!(screen.contains("the session's last line"), "{screen:?}");
 }
 
 /// T56, T48, T66, O6: `unlock` asks once; then every command of this terminal — one with no

@@ -246,7 +246,7 @@ const ALLOWED: &[(&str, &str, Rule)] = &[
     ),
     (
         "platform-cli/tests/holder_unix.rs",
-        "start",
+        "start_reading_late",
         Rule::InSession,
     ),
     (
@@ -318,7 +318,7 @@ const ALLOWED: &[(&str, &str, Rule)] = &[
     // T52, G6).
     (
         "platform-cli/tests/lock_window_test.rs",
-        "start",
+        "start_reading_late",
         Rule::InSession,
     ),
     // T-lazy-2: the rule-2 commands run in a session of their own, beside a tripwire at that

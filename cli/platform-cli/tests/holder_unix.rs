@@ -102,16 +102,25 @@ fn session(sp: &Spawn, script: &str) -> Vec<String> {
 struct Live {
     child: Child,
     rx: mpsc::Receiver<String>,
+    /// Reads the session's output into `rx` until it ends.
+    reader: std::thread::JoinHandle<()>,
 }
 
 impl Live {
     fn start(sp: &Spawn, script: &str) -> Live {
+        Live::start_reading_late(sp, script, Duration::ZERO)
+    }
+
+    /// [`Live::start`] with the session's reader starting `late`: the harness's own test puts
+    /// it behind a session that has already ended.
+    fn start_reading_late(sp: &Spawn, script: &str, late: Duration) -> Live {
         let mut c = sp.in_session(&format!("{PRELUDE}{script}"), None);
         c.stdin(Stdio::piped()).stdout(Stdio::piped());
         let mut child = c.spawn().expect("start the session");
         let out = BufReader::new(child.stdout.take().unwrap());
         let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
+        let reader = std::thread::spawn(move || {
+            std::thread::sleep(late);
             for line in out.lines().map_while(Result::ok) {
                 if let Some(l) = said(&line) {
                     if tx.send(l.to_string()).is_err() {
@@ -120,7 +129,7 @@ impl Live {
                 }
             }
         });
-        Live { child, rx }
+        Live { child, rx, reader }
     }
 
     /// The session's id: its shell leads it.
@@ -138,12 +147,38 @@ impl Live {
         self.child.stdin.as_mut().unwrap().write_all(b"\n").unwrap();
     }
 
-    /// Close the shell's stdin (a `read _` returns, the script ends) and collect what is left.
-    fn finish(mut self) -> Vec<String> {
-        drop(self.child.stdin.take());
-        self.child.wait().unwrap();
-        self.rx.try_iter().collect()
+    /// Close the shell's stdin (a `read _` returns, the script ends) and collect what is left,
+    /// once the reader has read the output to its end: what the session said last can still be
+    /// unread when the shell is reaped (GOTCHA-259).
+    fn finish(self) -> Vec<String> {
+        let Live {
+            mut child,
+            rx,
+            reader,
+        } = self;
+        drop(child.stdin.take());
+        child.wait().unwrap();
+        let until = Instant::now() + LINE_TIMEOUT;
+        while !reader.is_finished() {
+            assert!(
+                Instant::now() < until,
+                "the session's output did not end within 30 s of the session"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        reader.join().expect("the session's reader");
+        rx.try_iter().collect()
     }
+}
+
+/// The harness itself (GOTCHA-259): the lines `finish` returns hold what the session said
+/// last, even when the reader is behind. Forced: the reader starts 2 s after a session that
+/// says one line and ends at once, so the shell is reaped before anything was read.
+#[test]
+fn finish_returns_what_the_session_said_last_when_the_reader_is_behind() {
+    let sp = Spawn::new();
+    let s = Live::start_reading_late(&sp, "echo 'holder: the last line'", Duration::from_secs(2));
+    assert_eq!(s.finish(), ["the last line"]);
 }
 
 fn started_pid(line: &str) -> i32 {
