@@ -107,6 +107,37 @@ fn doctor_of_a_provisioned_target() {
     sb.golden("doctor/provisioned", &["doctor", "--no-ping"]);
 }
 
+/// WI-473: the store's secret files that other accounts can read — another target's
+/// credentials, a state file, the age key — are a warning each with the chmod, after the lock's
+/// rows; doctor leaves them as they are.
+#[test]
+fn doctor_with_secret_files_other_accounts_can_read() {
+    use std::os::unix::fs::PermissionsExt;
+    let sb = Sandbox::new().with_stand_in_tools();
+    sb.add_target("prod");
+    sb.add_target("dev");
+    sb.seed_state("prod", PROVISIONED_STATE);
+    let key = sb.path("home/.config/apprafter/age.key");
+    cli_core::secrets::load_or_create_identity(&key).expect("age key");
+    let wide = [
+        sb.path("apprafter-config/targets/dev/credentials.yaml"),
+        sb.path("apprafter-config/state/prod/.apprafter/state.json"),
+        key,
+    ];
+    let mode =
+        |p: &std::path::Path| std::fs::metadata(p).expect("stat").permissions().mode() & 0o777;
+    for p in &wide {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+    }
+    sb.golden(
+        "doctor/secret_files_wide",
+        &["doctor", "--target", "prod", "--no-ping"],
+    );
+    for p in &wide {
+        assert_eq!(mode(p), 0o644, "doctor changes nothing: {p:?}");
+    }
+}
+
 #[test]
 fn doctor_with_a_dangling_pointer() {
     let sb = Sandbox::new().with_stand_in_tools();

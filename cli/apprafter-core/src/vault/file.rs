@@ -52,10 +52,12 @@ thread_local! {
     static STOP_BEFORE_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// The vault file's bytes, at most [`VAULT_FILE_MAX`]; `Missing` when there is none.
+/// The vault file's bytes, at most [`VAULT_FILE_MAX`]; `Missing` when there is none. On Windows
+/// a vault whose DACL is not owner-only (written before WI-472, or widened since) is made
+/// owner-only on the handle it is read through ([`cli_core::owner_only::open_secret`], WI-473).
 pub fn read(path: &Path) -> VaultResult<Vec<u8>> {
     under_temp(path);
-    let file = match File::open(path) {
+    let file = match cli_core::owner_only::open_secret(path) {
         Ok(file) => file,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             return Err(VaultError::Missing {
@@ -545,5 +547,24 @@ mod tests {
         testing::of_path(&vault)
             .unwrap()
             .assert_owner_only_file("the vault after replace");
+    }
+
+    /// WI-473: a vault other accounts can read — widened by hand, or copied in — is owner-only
+    /// once read, and reads the same.
+    #[cfg(windows)]
+    #[test]
+    fn a_wide_vault_is_owner_only_once_read() {
+        use cli_core::owner_only::testing;
+        let (_dir, lock, vault) = store();
+        write_new(&vault, b"first", &lock).unwrap();
+        testing::widen(&vault).unwrap();
+        assert!(
+            !testing::of_path(&vault).unwrap().is_owner_only(),
+            "the test's premise"
+        );
+        assert_eq!(read(&vault).unwrap(), b"first");
+        testing::of_path(&vault)
+            .unwrap()
+            .assert_owner_only_file("the vault, read");
     }
 }

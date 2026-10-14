@@ -695,7 +695,9 @@ pub fn load_target_credentials(paths: &TargetStorePaths, name: &str) -> Result<T
 /// The bytes of target `name`'s `credentials.yaml`, read as [`load_target_credentials`] reads
 /// them: `None` when there is no file; a failure names the target (`CliError::TargetFileIo`).
 /// Only the shared core's secret store calls it (D.4a T16): the bytes hold the token, or a
-/// locked store's vault marker.
+/// locked store's vault marker. On Windows a file whose DACL is not owner-only (written before
+/// WI-472) is made owner-only on the handle it is read through
+/// ([`crate::owner_only::read_secret`], WI-473).
 pub fn read_target_credentials_bytes(
     paths: &TargetStorePaths,
     name: &str,
@@ -704,7 +706,9 @@ pub fn read_target_credentials_bytes(
     if !target_file_exists(&creds_path, name)? {
         return Ok(None);
     }
-    read_target_file(&creds_path, name).map(Some)
+    crate::owner_only::read_secret(&creds_path)
+        .map(Some)
+        .map_err(|source| target_file_io(&creds_path, name, source))
 }
 
 /// `bytes`, target `name`'s `credentials.yaml`, parsed as [`load_target_credentials`] parses
@@ -1307,6 +1311,38 @@ mod tests {
                 .protected,
             "config.yaml is not secret: it keeps what its directory hands down"
         );
+    }
+
+    /// WI-473: on Windows a `credentials.yaml` other accounts can read — written before WI-472
+    /// into a folder that hands its DACL down, or widened since — is owner-only once read, and
+    /// reads the same.
+    #[cfg(windows)]
+    #[test]
+    fn a_wide_credentials_file_is_owner_only_once_read() {
+        use crate::owner_only::testing;
+        let (_dir, paths) = make_paths();
+        let target = Target {
+            name: "work".into(),
+            config: TargetConfig {
+                provider: "hetzner-cloud".into(),
+                ..Default::default()
+            },
+            credentials: TargetCredentials {
+                hetzner_token: Some("hcloud_secret".into()),
+            },
+        };
+        save_target(&paths, &target).expect("save ok");
+        let creds = paths.target_credentials_file("work");
+        testing::widen(&creds).unwrap();
+        assert!(
+            !testing::of_path(&creds).unwrap().is_owner_only(),
+            "the test's premise"
+        );
+        let read = load_target_credentials(&paths, "work").unwrap();
+        assert_eq!(read.hetzner_token.as_deref(), Some("hcloud_secret"));
+        testing::of_path(&creds)
+            .unwrap()
+            .assert_owner_only_file("credentials.yaml, read");
     }
 
     #[test]

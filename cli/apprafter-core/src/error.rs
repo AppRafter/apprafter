@@ -726,6 +726,12 @@ fn neutral_help(e: &cli_core::CliError) -> Option<String> {
              random numbers, with no fallback. Try again; if it keeps failing, the system's \
              entropy source is broken."
             .into(),
+        // WI-473: the desktop's runtime dir is its own (`<app local data>/run`), so only the
+        // removal applies there; the CLI's help also names a store of one's own.
+        C::RuntimeDirForeign { .. } => "Another account could replace a kubeconfig in it before \
+             it is used. Remove the directory, and AppRafter makes it again, owned by you; an \
+             administrator can remove it if Windows refuses you."
+            .into(),
         // CLI input policy and CLI-only commands (their help is about the command line), and
         // errors no desktop flow reaches yet, whose help names CLI commands. `TargetNotFound`,
         // `NoActiveTarget`, `TokenNotStored`, `Cancelled` and `AgeKeyMissing` arrive as the
@@ -1204,6 +1210,10 @@ pub mod samples {
                 waited_secs: 300,
                 attempts: 30,
                 last_error: s("ssh: connect to host 203.0.113.10 port 22: Connection refused"),
+            },
+            // WI-473: the runtime dir another account owns (Windows).
+            C::RuntimeDirForeign {
+                path: "/s/run".into(),
             },
             C::Other(s("o")),
         ];

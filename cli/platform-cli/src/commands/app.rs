@@ -6617,18 +6617,11 @@ fn source_path_file_refusal(normalised: &str, local: Option<LocalPathKind>) -> O
 }
 
 fn apply_application_manifest(manifest: &Value, kubeconfig_path: &Path) -> Result<()> {
-    use std::io::Write as _;
-    let mut file = tempfile::Builder::new()
-        .prefix("apprafter-app-")
-        .suffix(".json")
-        .tempfile()
-        .map_err(|e| CliError::Other(format!("create app manifest tempfile: {e}")))?;
+    // Owner-only from its first byte, as every manifest the CLI hands kubectl (WI-473).
     let body = serde_json::to_vec_pretty(manifest)
         .map_err(|e| CliError::Other(format!("serialise app manifest: {e}")))?;
-    file.write_all(&body)
+    let file = cli_core::owner_only::write_temp_file("apprafter-app-", ".json", &body)
         .map_err(|e| CliError::Other(format!("write app manifest tempfile: {e}")))?;
-    file.flush()
-        .map_err(|e| CliError::Other(format!("flush app manifest tempfile: {e}")))?;
 
     let out = Command::new("kubectl")
         .arg("apply")

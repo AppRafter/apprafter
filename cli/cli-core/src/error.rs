@@ -1648,6 +1648,24 @@ pub enum CliError {
     )]
     RandomUnavailable { detail: String },
 
+    /// The runtime directory, where a decrypted kubeconfig is written for kubectl, belongs to
+    /// another account (WI-473, Windows): that account can grant itself access to it whatever
+    /// DACL it has, and so replace the kubeconfig before kubectl reads it. Nothing is written.
+    #[error(
+        "{} belongs to another account, so AppRafter writes no decrypted kubeconfig there",
+        path.display()
+    )]
+    #[diagnostic(
+        code(apprafter::secrets::runtime_dir_foreign),
+        help(
+            "Another account could replace a kubeconfig in it before kubectl reads it. Remove \
+             the directory, and AppRafter makes it again, owned by you (an administrator can \
+             remove it if Windows refuses you); or set `APPRAFTER_CONFIG_DIR` to a folder only \
+             you can write."
+        )
+    )]
+    RuntimeDirForeign { path: PathBuf },
+
     /// Catch-all, free-form message. New call sites should prefer
     /// promoting recurring messages to dedicated variants with
     /// stable diagnostic codes. The miette `code()` here remains
@@ -2839,6 +2857,10 @@ mod tests {
              "apprafter::secrets::random_unavailable",
              "the operating system's random number generator failed, so nothing was written: getrandom: ENOSYS",
              "with no fallback"),
+            (CliError::RuntimeDirForeign { path: "/s/run".into() },
+             "apprafter::secrets::runtime_dir_foreign",
+             "/s/run belongs to another account, so AppRafter writes no decrypted kubeconfig there",
+             "Remove the directory, and AppRafter makes it again, owned by you"),
         ];
         for (err, code, message, help) in cases {
             assert_eq!(code_of(&err), code);

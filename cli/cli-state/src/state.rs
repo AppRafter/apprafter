@@ -329,10 +329,10 @@ const EXDEV: i32 = 18;
 /// failure are absorbed into a `false` answer — corrupt state
 /// is treated as "empty" so the richer legacy file wins.
 fn read_has_hetzner_cloud(path: &Path) -> bool {
-    let Ok(raw) = std::fs::read_to_string(path) else {
+    let Ok(raw) = cli_core::owner_only::read_secret(path) else {
         return false;
     };
-    let Ok(state) = serde_json::from_str::<State>(&raw) else {
+    let Ok(state) = serde_json::from_slice::<State>(&raw) else {
         return false;
     };
     state.hetzner_cloud.is_some()
@@ -389,7 +389,9 @@ impl State {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let bytes = std::fs::read(&path)?;
+        // WI-473: on Windows a file whose DACL is not owner-only (written before WI-472) is
+        // made owner-only on the handle it is read through.
+        let bytes = cli_core::owner_only::read_secret(&path)?;
         serde_json::from_slice(&bytes).map_err(|err| CliError::InvalidState {
             path,
             message: err.to_string(),
@@ -529,6 +531,29 @@ mod tests {
         cli_core::owner_only::testing::of_path(&paths.state_file())
             .unwrap()
             .assert_owner_only_file("state.json after a save");
+    }
+
+    /// WI-473: a `state.json` other accounts can read — written before WI-472 into a folder
+    /// that hands its DACL down — is owner-only once loaded, and loads the same.
+    #[cfg(windows)]
+    #[test]
+    fn a_wide_state_file_is_owner_only_once_loaded() {
+        use cli_core::owner_only::testing;
+        let dir = tempdir().unwrap();
+        let paths = StatePaths::for_root(dir.path());
+        std::fs::create_dir_all(paths.state_dir()).unwrap();
+        std::fs::write(paths.state_file(), br#"{"cluster_name":"wide"}"#).unwrap();
+        assert!(
+            !testing::of_path(&paths.state_file())
+                .unwrap()
+                .is_owner_only(),
+            "the test's premise"
+        );
+        let back = State::load_or_default(&paths).unwrap();
+        assert_eq!(back.cluster_name.as_deref(), Some("wide"));
+        testing::of_path(&paths.state_file())
+            .unwrap()
+            .assert_owner_only_file("state.json, loaded");
     }
 
     /// A reader holding `state.json` open — another CLI run, AppRafter

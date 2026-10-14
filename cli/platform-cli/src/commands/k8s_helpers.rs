@@ -436,20 +436,15 @@ pub fn kubectl_apply_json(manifest: &serde_json::Value, kubeconfig_path: &Path) 
 /// Serialise `manifest` to a temporary `.json` file for `kubectl apply -f`.
 /// Extracted from [`kubectl_apply_json`] so the bytes that actually reach the
 /// apiserver are testable — the manifest must survive the round-trip intact,
-/// which a silently-truncated or unflushed write would break.
+/// which a silently-truncated or unflushed write would break. A manifest can
+/// hold a Secret, so the file is owner-only from its first byte, whatever the
+/// system temp dir lets others do (WI-473,
+/// [`cli_core::owner_only::write_temp_file`]).
 fn write_apply_tempfile(manifest: &serde_json::Value) -> Result<NamedTempFile> {
-    let mut file = tempfile::Builder::new()
-        .prefix("apprafter-apply-")
-        .suffix(".json")
-        .tempfile()
-        .map_err(|e| CliError::Other(format!("create apply tempfile: {e}")))?;
     let body = serde_json::to_vec_pretty(manifest)
         .map_err(|e| CliError::Other(format!("serialise manifest: {e}")))?;
-    file.write_all(&body)
-        .map_err(|e| CliError::Other(format!("write apply tempfile: {e}")))?;
-    file.flush()
-        .map_err(|e| CliError::Other(format!("flush apply tempfile: {e}")))?;
-    Ok(file)
+    cli_core::owner_only::write_temp_file("apprafter-apply-", ".json", &body)
+        .map_err(|e| CliError::Other(format!("write apply tempfile: {e}")))
 }
 
 /// Build the args for `kubectl delete <resource> <name> -n <ns>
@@ -1042,6 +1037,30 @@ mod tests {
         let read: serde_json::Value =
             serde_json::from_slice(&std::fs::read(f.path()).expect("read back")).expect("parse");
         assert_eq!(read, manifest, "the manifest must survive the round-trip");
+    }
+
+    /// WI-473: a manifest can hold a Secret or a repository's credentials, so the file kubectl
+    /// reads is owner-only, whatever the system temp dir lets others do: mode 0600, or on
+    /// Windows the protected one-ACE DACL (set before its first byte: cli-core's
+    /// `write_temp_file` test).
+    #[test]
+    fn the_apply_file_is_owner_only() {
+        let manifest = serde_json::json!({"apiVersion": "v1", "kind": "Secret"});
+        let f = write_apply_tempfile(&manifest).expect("write");
+        assert!(f.path().starts_with(std::env::temp_dir()), "{:?}", f.path());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(f.path()).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "{mode:o}");
+        }
+        #[cfg(windows)]
+        {
+            use cli_core::owner_only::testing;
+            testing::of_path(f.path())
+                .unwrap()
+                .assert_owner_only_file("the apply manifest");
+        }
     }
 
     #[test]

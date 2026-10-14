@@ -2071,10 +2071,10 @@ pub fn run_backup(
     let pg_image = pg_helper_image(first_cnpg_image(&ns_set, kc.path()).as_deref());
     let platform_version = read_platform_version(kc.path())?;
 
-    // Stage everything under a tempdir; the engine writes data/ under this root.
-    let staging = tempfile::Builder::new()
-        .prefix("apprafter-backup-")
-        .tempdir()
+    // Stage everything under a tempdir; the engine writes data/ under this root. It holds the
+    // exported Secrets and database dumps before restic encrypts them: owner-only from its
+    // creation, whatever the system temp dir lets others do (WI-473).
+    let staging = cli_core::owner_only::temp_dir("apprafter-backup-")
         .map_err(|e| CliError::Other(format!("create staging dir: {e}")))?;
 
     let opts = local_pull_backup_opts(
@@ -6482,18 +6482,11 @@ fn enable_success_report(
 /// Reuses the same approach as `commands::secret::apply_manifest` but is
 /// inlined here to avoid a cross-module private function reference.
 fn apply_sealed_secret_manifest(manifest: &Value, kubeconfig_path: &Path) -> Result<()> {
-    use std::io::Write as _;
-    let mut file = tempfile::Builder::new()
-        .prefix("apprafter-sealed-")
-        .suffix(".json")
-        .tempfile()
-        .map_err(|e| CliError::Other(format!("create SealedSecret tempfile: {e}")))?;
+    // Owner-only from its first byte, as every manifest the CLI hands kubectl (WI-473).
     let body = serde_json::to_vec_pretty(manifest)
         .map_err(|e| CliError::Other(format!("serialise SealedSecret: {e}")))?;
-    file.write_all(&body)
+    let file = cli_core::owner_only::write_temp_file("apprafter-sealed-", ".json", &body)
         .map_err(|e| CliError::Other(format!("write SealedSecret tempfile: {e}")))?;
-    file.flush()
-        .map_err(|e| CliError::Other(format!("flush SealedSecret tempfile: {e}")))?;
 
     let out = std::process::Command::new("kubectl")
         .arg("apply")

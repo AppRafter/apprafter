@@ -188,7 +188,10 @@ fn write_private(dir: &Path, bytes: &[u8]) -> CoreResult<MaterialisedKubeconfig>
 /// one ACE its files inherit on Windows (WI-472) — and refuse anything that is not a plain
 /// directory (a symlink would put the decrypted file somewhere else). On Windows the DACL is set
 /// just after the directory is made; each file is restricted on its own handle as well, so a
-/// file made in that moment is no one else's to read.
+/// file made in that moment is no one else's to read. A directory another account owns is
+/// refused (WI-473): on Windows by name, `CliError::RuntimeDirForeign` — its owner could grant
+/// itself access again and replace a kubeconfig before kubectl reads it — and on Unix by the
+/// mode it may not set (EPERM), as before.
 fn ensure_private_dir(dir: &Path) -> CoreResult<()> {
     match fs::symlink_metadata(dir) {
         Ok(meta) if meta.is_dir() => {}
@@ -227,7 +230,14 @@ fn ensure_private_dir(dir: &Path) -> CoreResult<()> {
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(io_error)?;
     }
     #[cfg(windows)]
-    cli_core::owner_only::restrict_dir(dir).map_err(io_error)?;
+    cli_core::owner_only::restrict_dir(dir).map_err(|e| match e {
+        cli_core::owner_only::RestrictDirError::ForeignOwner => {
+            CoreError::from(cli_core::CliError::RuntimeDirForeign {
+                path: dir.to_path_buf(),
+            })
+        }
+        cli_core::owner_only::RestrictDirError::Io(e) => io_error(e),
+    })?;
     Ok(())
 }
 
@@ -474,6 +484,54 @@ mod tests {
         testing::of_path(s.ctx.runtime_dir())
             .unwrap()
             .assert_owner_only_dir("the existing runtime dir");
+    }
+
+    /// WI-473: a runtime dir another account owns is refused by name before anything is
+    /// written, and left as it was. The owner is pretended on a dir of the test's own: a system
+    /// directory is never handed to code that may set its DACL.
+    #[cfg(windows)]
+    #[test]
+    fn a_runtime_dir_another_account_owns_is_refused_by_name() {
+        use cli_core::owner_only::testing;
+        let s = store(Some(plain()));
+        let run = s.ctx.runtime_dir().to_path_buf();
+        fs::create_dir_all(&run).unwrap();
+        let before = testing::of_path(&run).unwrap();
+        {
+            let _foreign = testing::pretend_owner("S-1-5-21-1-2-3-1001").unwrap();
+            match write_private(&run, b"apiVersion: v1\n") {
+                Err(CoreError::Cli(cli_core::CliError::RuntimeDirForeign { path })) => {
+                    assert_eq!(path, run)
+                }
+                other => panic!("not refused by name: {other:?}"),
+            }
+        }
+        assert_eq!(fs::read_dir(&run).unwrap().count(), 0, "nothing written");
+        assert_eq!(testing::of_path(&run).unwrap(), before);
+    }
+
+    /// WI-473: Unix refuses a runtime dir another account owns as it always has — its mode
+    /// cannot be set. `/` stands for one; as root it is no other account's and its mode would
+    /// change, so the test refuses to run as root.
+    #[cfg(unix)]
+    #[test]
+    fn a_runtime_dir_another_account_owns_is_refused_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid has no failure mode.
+        assert_ne!(
+            unsafe { libc::geteuid() },
+            0,
+            "as root, `/` belongs to this account and its mode would be changed"
+        );
+        let root = Path::new("/");
+        let before = fs::metadata(root).unwrap().permissions().mode();
+        match ensure_private_dir(root) {
+            Err(CoreError::Cli(cli_core::CliError::Io(e))) => {
+                assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}")
+            }
+            other => panic!("not refused: {other:?}"),
+        }
+        assert_eq!(fs::metadata(root).unwrap().permissions().mode(), before);
     }
 
     #[cfg(unix)]

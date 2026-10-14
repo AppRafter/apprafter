@@ -17,7 +17,7 @@
 //! inferred automatically; other hosts get a git-only credential.
 
 use std::collections::BTreeMap;
-use std::io::{self, IsTerminal, Write as _};
+use std::io::{self, IsTerminal};
 use std::path::Path;
 use std::process::Command;
 
@@ -735,18 +735,13 @@ fn removal_gate(
 // kube-touching helpers.
 // =========================================================================
 
+/// `kubectl apply` of `manifest`, which holds the repository's credentials: through a file in
+/// the system temp dir that is owner-only from its first byte (WI-473).
 fn apply_manifest(manifest: &Value, kubeconfig_path: &Path) -> Result<()> {
-    let mut file = tempfile::Builder::new()
-        .prefix("apprafter-srccred-")
-        .suffix(".json")
-        .tempfile()
-        .map_err(|e| CliError::Other(format!("create manifest tempfile: {e}")))?;
     let body = serde_json::to_vec_pretty(manifest)
         .map_err(|e| CliError::Other(format!("serialise manifest: {e}")))?;
-    file.write_all(&body)
+    let file = cli_core::owner_only::write_temp_file("apprafter-srccred-", ".json", &body)
         .map_err(|e| CliError::Other(format!("write manifest tempfile: {e}")))?;
-    file.flush()
-        .map_err(|e| CliError::Other(format!("flush manifest tempfile: {e}")))?;
 
     let out = Command::new("kubectl")
         .arg("apply")

@@ -5,7 +5,7 @@
 //! one-way operation: the output is safe to print, commit, or apply.
 
 use std::collections::BTreeMap;
-use std::io::{IsTerminal, Write};
+use std::io::IsTerminal;
 use std::path::Path;
 use std::process::Command;
 
@@ -349,18 +349,13 @@ fn secret_exists(name: &str, namespace: &str, kubeconfig_path: &Path) -> Result<
     Ok(false)
 }
 
+/// `kubectl apply` of a SealedSecret `manifest`, through a file in the system temp dir that is
+/// owner-only from its first byte, as every manifest the CLI hands kubectl (WI-473).
 fn apply_manifest(manifest: &Value, kubeconfig_path: &Path) -> Result<()> {
-    let mut file = tempfile::Builder::new()
-        .prefix("apprafter-sealed-")
-        .suffix(".json")
-        .tempfile()
-        .map_err(|e| CliError::Other(format!("create SealedSecret tempfile: {e}")))?;
     let body = serde_json::to_vec_pretty(manifest)
         .map_err(|e| CliError::Other(format!("serialise SealedSecret: {e}")))?;
-    file.write_all(&body)
+    let file = cli_core::owner_only::write_temp_file("apprafter-sealed-", ".json", &body)
         .map_err(|e| CliError::Other(format!("write SealedSecret tempfile: {e}")))?;
-    file.flush()
-        .map_err(|e| CliError::Other(format!("flush SealedSecret tempfile: {e}")))?;
 
     let out = Command::new("kubectl")
         .arg("apply")

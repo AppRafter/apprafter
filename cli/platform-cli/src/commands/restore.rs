@@ -654,9 +654,8 @@ pub fn run_restore(
     // Held across the whole restore: the restic restore unpacks the decrypted
     // secrets here and it must NOT be cleaned up until every step that reads
     // `data/` is done (rev-5: tempfile::tempdir auto-cleanup on drop).
-    let restore_root = tempfile::Builder::new()
-        .prefix("apprafter-restore-")
-        .tempdir()
+    // Owner-only from its creation, whatever the system temp dir lets others do (WI-473).
+    let restore_root = cli_core::owner_only::temp_dir("apprafter-restore-")
         .map_err(|e| CliError::Other(format!("create restore tempdir: {e}")))?;
 
     // Lazily-populated after RestoreArtifact: the `data/` dir under the restic
@@ -998,7 +997,8 @@ fn restore_artifact_tree(
         );
     }
     for claim_snap in &run.claims {
-        let claim_root = tempfile::tempdir()
+        // Decrypted claim data: owner-only from its creation (WI-473).
+        let claim_root = cli_core::owner_only::temp_dir("apprafter-restore-claim-")
             .map_err(|e| CliError::Other(format!("temp dir for a per-claim snapshot: {e}")))?;
         restic.restore_snapshot(claim_snap, claim_root.path())?;
         match find_claim_data_dir(claim_root.path()) {

@@ -99,6 +99,10 @@ windows-sys   = { version = "0.61", features = ["Win32_Foundation", "Win32_Secur
 # test. Under resolver 2 a dev-dependency's features never reach the shipped binary.
 apprafter-core = { path = "../apprafter-core", features = ["test-support"] }
 assert_cmd = { workspace = true }
+# `owner_only::testing` (cli-core's test-support): reading back the DACLs of the files the CLI
+# hands kubectl from the temp dir (WI-473). A path crate's dev-dependency reaches neither a
+# shipped binary nor a lock.
+cli-core   = { path = "../cli-core", features = ["test-support"] }
 mockito    = { workspace = true }
 predicates = { workspace = true }
 # tests/spawn_guard.rs reads every source of cli/ as tokens: the version already in the lock (as

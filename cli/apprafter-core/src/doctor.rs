@@ -331,8 +331,21 @@ enum Lookup {
 /// Groups: Target always; Cluster only for a target that exists; This computer always. A Read
 /// that still writes in one place: the Cluster group decrypts the cached kubeconfig into the
 /// private runtime dir for the length of one probe and removes it, and a run starts by sweeping
-/// copies a crashed run left there (R9). It never creates an age key (decision 2).
+/// copies a crashed run left there (R9). It never creates an age key (decision 2), and it
+/// changes no secret file (WI-473): the store's own reads on Windows make a file other accounts
+/// can open owner-only, but not in a doctor run, which reports such a file instead
+/// (`cli_core::owner_only::without_tightening`).
 pub fn run(
+    ctx: &Context,
+    args: DoctorArgs,
+    reporter: &dyn Reporter,
+    cancel: &CancellationToken,
+) -> CoreResult<DoctorReport> {
+    cli_core::owner_only::without_tightening(|| run_reading_only(ctx, args, reporter, cancel))
+}
+
+/// [`run`], whose reads tighten nothing.
+fn run_reading_only(
     ctx: &Context,
     args: DoctorArgs,
     reporter: &dyn Reporter,
@@ -677,8 +690,12 @@ fn credentials_file(secrets: &SecretStore, name: &str) -> Check {
             )
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
+        // WI-473: its DACL, as Unix's row reads the mode.
+        if let Some(wide) = wide_file(CheckId::CredentialsFile, &path, "Credentials file") {
+            return wide;
+        }
         Check {
             detail: Some(shown),
             ..row(
@@ -688,6 +705,99 @@ fn credentials_file(secrets: &SecretStore, name: &str) -> Check {
             )
         }
     }
+}
+
+#[cfg(windows)]
+const RESTRICT_ON_READ_FIX: &str = "Other accounts on this computer may be able to open it. \
+     AppRafter makes it yours alone the next time it reads it; doctor only reports.";
+#[cfg(windows)]
+const RESTRICT_REFUSED_FIX: &str = "Other accounts on this computer may be able to open it, and \
+     your account may not change who can: another account owns it, or its permissions keep even \
+     its owner from changing them. An administrator can make your account its owner with full \
+     control; AppRafter then makes it yours alone the next time it reads it.";
+
+/// The row of a secret file other accounts may open (WI-473), a warning, or `None` when only
+/// this account can or there is no file. Unix: a mode that grants group or others anything,
+/// with the chmod; Windows: a DACL that is not owner-only (`cli_core::owner_only::exposure`),
+/// with whether the next read can make it so. Each read from the file's metadata or security
+/// descriptor alone: never its bytes, and nothing is changed. `what` names the file.
+#[cfg(unix)]
+fn wide_file(id: CheckId, path: &Path, what: &str) -> Option<Check> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(path).ok()?.permissions().mode() & 0o777;
+    if mode & 0o077 == 0 {
+        return None;
+    }
+    let shown = path.display().to_string();
+    Some(Check {
+        detail: Some(shown.clone()),
+        fix: Some(CheckFix::Chmod {
+            path: shown,
+            mode: 0o600,
+        }),
+        ..row(
+            id,
+            CheckStatus::Warn,
+            format!("{what} mode 0600 (got {mode:o})"),
+        )
+    })
+}
+
+/// The row of a secret file other accounts may open (WI-473), a warning, or `None` when only
+/// this account can or there is no file. Unix: a mode that grants group or others anything,
+/// with the chmod; Windows: a DACL that is not owner-only (`cli_core::owner_only::exposure`),
+/// with whether the next read can make it so. Each read from the file's metadata or security
+/// descriptor alone: never its bytes, and nothing is changed. `what` names the file.
+#[cfg(windows)]
+fn wide_file(id: CheckId, path: &Path, what: &str) -> Option<Check> {
+    use cli_core::owner_only::{exposure, Exposure};
+    let (title, fix) = match exposure(path) {
+        Ok(Exposure::OwnerOnly) => return None,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Ok(Exposure::Wide { restrictable }) => (
+            format!("{what} not restricted to your account"),
+            if restrictable {
+                RESTRICT_ON_READ_FIX.to_string()
+            } else {
+                RESTRICT_REFUSED_FIX.to_string()
+            },
+        ),
+        // Never-mask: a DACL that cannot be read is said so, not passed over.
+        Err(e) => (
+            format!("{what}: who can open it is unknown"),
+            format!("Its permissions could not be read: {e}"),
+        ),
+    };
+    Some(Check {
+        detail: Some(path.display().to_string()),
+        fix: Some(explain(&fix)),
+        ..row(id, CheckStatus::Warn, title)
+    })
+}
+
+/// The target store's secret files that other accounts may open (WI-473), a warning each, in
+/// this order: each target's `credentials.yaml` (the checked target's has its own row) and
+/// `state.json`, then the age key. The vault's are the lock's rows ([`vault_file_rows`]).
+fn secret_file_rows(ctx: &Context, checked: Option<&str>) -> Vec<Check> {
+    let store = ctx.store();
+    let secrets = ctx.secrets();
+    let mut rows = Vec::new();
+    for name in cli_core::list_target_names(&store).unwrap_or_default() {
+        if Some(name.as_str()) != checked {
+            rows.extend(wide_file(
+                CheckId::Secrets,
+                &secrets.credentials_file(&name),
+                &format!("Credentials file of target `{name}`"),
+            ));
+        }
+        rows.extend(wide_file(
+            CheckId::Secrets,
+            &StatePaths::for_active_target(&store, &name).state_file(),
+            &format!("State file of target `{name}`"),
+        ));
+    }
+    rows.extend(wide_file(CheckId::Secrets, ctx.age_key_path(), "Age key"));
+    rows
 }
 
 fn provider_supported(target: &Loaded) -> Check {
@@ -1328,6 +1438,7 @@ fn this_computer_group(
     // waits up to 2 s and cannot be interrupted: a Ctrl-C is honoured before it.
     cancel.check()?;
     out.extend(lock_rows(ctx, window, client, checked));
+    out.extend(secret_file_rows(ctx, checked));
     Ok(out)
 }
 
@@ -1516,7 +1627,6 @@ fn locked_facts(ctx: &Context, r: &LockReport, checked: Option<&str>) -> Vec<Che
         }
     }
     rows.extend(slot_facts(&r.slots, ctx.config_root()));
-    #[cfg(unix)]
     rows.extend(vault_file_rows(ctx));
     let o = ctx.overrides();
     rows.extend(override_rows(
@@ -1624,32 +1734,31 @@ fn slot_facts(slots: &[SlotView], store: &Path) -> Vec<Check> {
 }
 
 /// The vault file's mode and owner (T27: a wider mode or a foreign owner is a warning, never a
-/// refusal). The owner is compared with the store directory's: no process identity is read.
+/// refusal). The owner is compared with the store directory's: no process identity is read. On
+/// Windows its DACL, as every secret file's ([`wide_file`], WI-473).
+#[cfg(windows)]
+fn vault_file_rows(ctx: &Context) -> Vec<Check> {
+    let path = ctx.config_root().join(crate::vault::VAULT_FILE);
+    wide_file(CheckId::Secrets, &path, "Vault file")
+        .into_iter()
+        .collect()
+}
+
+/// The vault file's mode and owner (T27: a wider mode or a foreign owner is a warning, never a
+/// refusal). The owner is compared with the store directory's: no process identity is read. On
+/// Windows its DACL, as every secret file's ([`wide_file`], WI-473).
 #[cfg(unix)]
 fn vault_file_rows(ctx: &Context) -> Vec<Check> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::fs::MetadataExt;
     let path = ctx.config_root().join(crate::vault::VAULT_FILE);
     // Unreadable: the `secrets` row already says why.
     let Ok(meta) = std::fs::metadata(&path) else {
         return Vec::new();
     };
     let shown = path.display().to_string();
-    let mut rows = Vec::new();
-    let mode = meta.permissions().mode() & 0o777;
-    if mode & 0o077 != 0 {
-        rows.push(Check {
-            detail: Some(shown.clone()),
-            fix: Some(CheckFix::Chmod {
-                path: shown.clone(),
-                mode: 0o600,
-            }),
-            ..row(
-                CheckId::Secrets,
-                CheckStatus::Warn,
-                format!("Vault file mode 0600 (got {mode:o})"),
-            )
-        });
-    }
+    let mut rows: Vec<Check> = wide_file(CheckId::Secrets, &path, "Vault file")
+        .into_iter()
+        .collect();
     if let Ok(root) = std::fs::metadata(ctx.config_root()) {
         if root.uid() != meta.uid() {
             rows.push(Check {
@@ -2111,6 +2220,153 @@ mod tests {
                 mode: 0o600
             })
         );
+    }
+
+    /// WI-473 (Unix): the store's other secret files whose mode lets group or others in are a
+    /// warning each, with the chmod — another target's credentials, each state file, the age
+    /// key — read from their metadata, and left as they were. Owner-only files are no row.
+    #[cfg(unix)]
+    #[test]
+    fn wide_secret_files_are_a_warning_each_with_the_chmod() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = fx();
+        let ctx = ctx(&f, OFFLINE).with_no_ping(true);
+        add(&ctx, "prod", "hetzner-cloud", Some(TOKEN), None);
+        add(&ctx, "dev", "hetzner-cloud", Some(TOKEN), None);
+        add(&ctx, "qa", "hetzner-cloud", Some(TOKEN), None);
+        for t in ["dev", "prod", "qa"] {
+            State::default()
+                .save(&StatePaths::for_active_target(&ctx.store(), t))
+                .unwrap();
+        }
+        cli_core::secrets::load_or_create_identity(ctx.age_key_path()).unwrap();
+        let healthy = group(&doctor(&ctx, named("prod")), GroupId::ThisComputer);
+        assert!(
+            healthy.iter().all(|c| !c.title.contains("mode 0600")),
+            "{healthy:?}"
+        );
+        let wide = [
+            ctx.store().target_credentials_file("dev"),
+            StatePaths::for_active_target(&ctx.store(), "prod").state_file(),
+            ctx.age_key_path().to_path_buf(),
+        ];
+        for p in &wide {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let rows: Vec<Check> = group(&doctor(&ctx, named("prod")), GroupId::ThisComputer)
+            .into_iter()
+            .filter(|c| c.title.contains("mode 0600"))
+            .collect();
+        let expected = [
+            "Credentials file of target `dev` mode 0600 (got 644)",
+            "State file of target `prod` mode 0600 (got 644)",
+            "Age key mode 0600 (got 644)",
+        ];
+        assert_eq!(
+            rows.iter().map(|c| c.title.as_str()).collect::<Vec<_>>(),
+            expected
+        );
+        for (row, path) in rows.iter().zip(&wide) {
+            assert_eq!(row.id, CheckId::Secrets);
+            assert_eq!(row.status, CheckStatus::Warn);
+            let shown = path.display().to_string();
+            assert_eq!(row.detail.as_deref(), Some(shown.as_str()));
+            assert_eq!(
+                row.fix,
+                Some(CheckFix::Chmod {
+                    path: shown,
+                    mode: 0o600
+                })
+            );
+            let mode = std::fs::metadata(path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o644, "doctor changes nothing: {path:?}");
+        }
+    }
+
+    /// WI-473 (Windows): a secret file other accounts may open is a warning, the checked
+    /// target's credentials on their own row, the rest in This computer; the fix says whether
+    /// the next read can make it owner-only. Doctor reads the token and the state through the
+    /// store all the same, and leaves every DACL as it was.
+    #[cfg(windows)]
+    #[test]
+    fn wide_secret_files_are_a_warning_each_and_doctor_changes_none() {
+        use cli_core::owner_only::testing;
+        let f = fx();
+        let ctx = ctx(&f, OFFLINE).with_no_ping(true);
+        add(&ctx, "prod", "hetzner-cloud", Some(TOKEN), None);
+        add(&ctx, "dev", "hetzner-cloud", Some(TOKEN), None);
+        for t in ["dev", "prod"] {
+            State::default()
+                .save(&StatePaths::for_active_target(&ctx.store(), t))
+                .unwrap();
+        }
+        cli_core::secrets::load_or_create_identity(ctx.age_key_path()).unwrap();
+        let healthy = doctor(&ctx, named("prod"));
+        let creds = group(&healthy, GroupId::Target)[1].clone();
+        assert_eq!(
+            (creds.status, creds.title.as_str()),
+            (CheckStatus::Pass, TITLE_CREDENTIALS)
+        );
+        assert!(
+            group(&healthy, GroupId::ThisComputer)
+                .iter()
+                .all(|c| !c.title.contains("restricted")),
+            "{healthy:?}"
+        );
+        let prod_creds = ctx.store().target_credentials_file("prod");
+        let wide = [
+            ctx.store().target_credentials_file("dev"),
+            StatePaths::for_active_target(&ctx.store(), "prod").state_file(),
+        ];
+        for p in wide.iter().chain([&prod_creds]) {
+            testing::widen(p).unwrap();
+        }
+        testing::widen_for_good(ctx.age_key_path()).unwrap();
+        let before: Vec<_> = wide
+            .iter()
+            .chain([&prod_creds, &ctx.age_key_path().to_path_buf()])
+            .map(|p| testing::of_path(p).unwrap())
+            .collect();
+        let r = doctor(&ctx, named("prod"));
+        let creds = group(&r, GroupId::Target)[1].clone();
+        assert_eq!(creds.id, CheckId::CredentialsFile);
+        assert_eq!(creds.status, CheckStatus::Warn);
+        assert_eq!(
+            creds.title,
+            "Credentials file not restricted to your account"
+        );
+        assert_eq!(
+            creds.detail.as_deref(),
+            Some(prod_creds.display().to_string().as_str())
+        );
+        assert_eq!(creds.fix, Some(explain(RESTRICT_ON_READ_FIX)));
+        let rows: Vec<Check> = group(&r, GroupId::ThisComputer)
+            .into_iter()
+            .filter(|c| c.title.contains("restricted"))
+            .collect();
+        assert_eq!(
+            rows.iter().map(|c| c.title.as_str()).collect::<Vec<_>>(),
+            [
+                "Credentials file of target `dev` not restricted to your account",
+                "State file of target `prod` not restricted to your account",
+                "Age key not restricted to your account",
+            ]
+        );
+        assert!(rows
+            .iter()
+            .all(|c| c.id == CheckId::Secrets && c.status == CheckStatus::Warn));
+        assert_eq!(rows[0].fix, Some(explain(RESTRICT_ON_READ_FIX)));
+        assert_eq!(rows[2].fix, Some(explain(RESTRICT_REFUSED_FIX)));
+        assert_eq!(
+            rows[2].detail.as_deref(),
+            Some(ctx.age_key_path().display().to_string().as_str())
+        );
+        let after: Vec<_> = wide
+            .iter()
+            .chain([&prod_creds, &ctx.age_key_path().to_path_buf()])
+            .map(|p| testing::of_path(p).unwrap())
+            .collect();
+        assert_eq!(after, before, "doctor changes no DACL");
     }
 
     #[test]

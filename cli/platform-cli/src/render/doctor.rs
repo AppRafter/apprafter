@@ -130,8 +130,10 @@ pub(crate) fn hint(c: &Check) -> Option<String> {
                      target add {target} --renew` to store the token here {ASKS}"
             ),
         },
+        // Every secret file's row (WI-473): the token's, the vault's, a state file's, the age
+        // key's.
         CheckFix::Chmod { path, mode } => {
-            format!("fix with `chmod {mode:o} {path}` so other local users can't read your token")
+            format!("fix with `chmod {mode:o} {path}` so other local users can't read it")
         }
         CheckFix::UnsupportedProvider { supported, .. } => format!(
             "supported in this build: {}. Future plugins may add more.",
@@ -527,7 +529,7 @@ mod tests {
                     path: "/c".into(),
                     mode: 0o600,
                 },
-                "fix with `chmod 600 /c` so other local users can't read your token",
+                "fix with `chmod 600 /c` so other local users can't read it",
             ),
             (
                 CheckFix::UnsupportedProvider {

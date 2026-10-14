@@ -110,12 +110,22 @@ pub fn age_key_path_from(override_path: Option<&Path>, home: Option<&Path>) -> P
 }
 
 /// The identity at `path`, or `None` when the file is absent. Never creates anything: a read
-/// (doctor, a kubeconfig probe) must not mint a key that matches no ciphertext.
+/// (doctor, a kubeconfig probe) must not mint a key that matches no ciphertext. On Windows a key
+/// whose DACL is not owner-only (written before WI-472, or copied in) is made owner-only on the
+/// handle it is read through ([`crate::owner_only::read_secret`], WI-473).
 pub fn load_identity(path: &Path) -> Result<Option<Identity>> {
     if !path.exists() {
         return Ok(None);
     }
-    let raw = std::fs::read_to_string(path)
+    let raw = crate::owner_only::read_secret(path)
+        .and_then(|bytes| {
+            String::from_utf8(bytes).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "stream did not contain valid UTF-8",
+                )
+            })
+        })
         .map_err(|e| CliError::Other(format!("read age key {path:?}: {e}")))?;
     Identity::from_str(raw.trim())
         .map(Some)
@@ -380,6 +390,30 @@ mod tests {
         testing::of_path(&path)
             .unwrap()
             .assert_owner_only_file("age.key");
+    }
+
+    /// WI-473: on Windows an age key other accounts can read — written before WI-472, or
+    /// copied in from another computer — is owner-only once read, and loads the same key.
+    #[cfg(windows)]
+    #[test]
+    fn a_wide_age_key_is_owner_only_once_loaded() {
+        use crate::owner_only::testing;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("age.key");
+        let created = load_or_create_identity(&path).unwrap();
+        testing::widen(&path).unwrap();
+        assert!(
+            !testing::of_path(&path).unwrap().is_owner_only(),
+            "the test's premise"
+        );
+        let loaded = load_identity(&path).unwrap().expect("the key is there");
+        assert_eq!(
+            loaded.to_public().to_string(),
+            created.to_public().to_string()
+        );
+        testing::of_path(&path)
+            .unwrap()
+            .assert_owner_only_file("age.key, loaded");
     }
 
     #[test]

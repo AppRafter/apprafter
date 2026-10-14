@@ -57,7 +57,6 @@
 //!     CUE) and extracted into compile-time constants by
 //!     `build.rs` — one source of truth, no duplication.
 
-use std::io::Write;
 use std::path::Path;
 
 use cli_core::manifest::{self, InfrastructureManifest};
@@ -1306,14 +1305,11 @@ fn platform_stack_version() -> String {
     cli_providers::k8s::resolve_latest_platform_stack_version()
 }
 
+/// `contents` in a new file in the system temp dir, for helm or kubectl: owner-only from its
+/// first byte, as every file the CLI hands them (WI-473).
 fn write_tempfile_with(prefix: &str, contents: &str) -> Result<NamedTempFile> {
-    let mut f = tempfile::Builder::new()
-        .prefix(prefix)
-        .tempfile()
-        .map_err(|e| CliError::Other(format!("create tempfile {prefix}: {e}")))?;
-    f.write_all(contents.as_bytes())
-        .map_err(|e| CliError::Other(format!("write tempfile {prefix}: {e}")))?;
-    Ok(f)
+    cli_core::owner_only::write_temp_file(prefix, "", contents.as_bytes())
+        .map_err(|e| CliError::Other(format!("write tempfile {prefix}: {e}")))
 }
 
 #[cfg(test)]

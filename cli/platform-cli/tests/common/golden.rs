@@ -166,8 +166,17 @@ impl Sandbox {
         fs::write(file, body).expect("seed file");
     }
 
+    /// `state.json` as the CLI writes it: mode 0600 (`State::save`). WI-473's doctor row is
+    /// for a state file something else widened, which a case seeds on purpose.
     pub fn seed_state(&self, target: &str, json: &str) {
-        self.seed_store_file(&format!("state/{target}/.apprafter/state.json"), json);
+        let rel = format!("state/{target}/.apprafter/state.json");
+        self.seed_store_file(&rel, json);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(self.store().join(rel), fs::Permissions::from_mode(0o600))
+                .expect("state.json 0600");
+        }
     }
 
     pub fn seed_config(&self, target: &str, yaml: &str) {
