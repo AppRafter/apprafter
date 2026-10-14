@@ -321,8 +321,22 @@ store, only when the store is locked or a `lock on` did not finish:
 
 ## In the desktop app {#desktop}
 
-AppRafter Desktop has one **Lock** section in Settings: the app's own lock and
-the target store's lock are one mechanism.
+In AppRafter Desktop the app's own lock and the target store's lock are one
+mechanism, shown in two places:
+
+- **Security**, in the sidebar, is the target store's page. It names the
+  store's folder and every target in it — the lock is the whole store's: one
+  vault, and what opens it opens them all — and shows where the secrets are,
+  the actions below, what opens the vault and this computer's limits.
+  Another target store — another `APPRAFTER_CONFIG_DIR` — is protected on
+  its own (see [Give an agent a store of its own](#playground)).
+- **Settings › Lock** holds how the app locks: *Require unlock*, *Lock when
+  the app starts*, *Lock when the computer sleeps or locks*, *Prefer
+  biometrics* where the computer offers it, *Auto-lock after inactivity* and
+  **Lock now**. Its **Open Security** leads to the Security page.
+
+The Targets page says in one line which target store it lists and where its
+secrets are, with a link to the Security page.
 
 - **Protect…** turns the lock on in five steps: what it does, the lock
   password typed twice (15 characters or more is recommended; a shorter one is
@@ -350,9 +364,11 @@ the target store's lock are one mechanism.
   key it took once no other AppRafter program holds the store, or is
   abandoned with nothing written if it cannot start within 30 seconds; that
   key goes when the change ends.
-- Meanwhile *Require unlock*, *Lock when the app starts* and *Lock when the
-  computer sleeps or locks* stay on, and *Auto-lock after inactivity* offers no
-  *Never*. Your own choices are kept, and come back when you stop protecting.
+- Meanwhile, in Settings › Lock, *Require unlock*, *Lock when the app starts*
+  and *Lock when the computer sleeps or locks* stay on, and *Auto-lock after
+  inactivity* offers no *Never*; *Require unlock* also says how the app now
+  unlocks, and the row that leads to the Security page says where that
+  changes. Your own choices are kept, and come back when you stop protecting.
 - **Stop protecting…** asks for the lock password or the recovery key, even
   though the app is unlocked, and puts the Hetzner tokens back in their files.
   If the store has cached secrets, it re-encrypts them to the shared age key
@@ -360,17 +376,24 @@ the target store's lock are one mechanism.
   only then; a store without cached secrets never touches it. The app does
   not read `APPRAFTER_AGE_KEY`: to put cached secrets under another key, run
   `apprafter lock off` in a terminal.
-- After an interrupted run the section offers **Finish…**. An interrupted
-  Protect that wrote the vault asks for both the lock password and the
-  recovery key; one that did not starts over with a new recovery key, or
+- After an interrupted run the Security page offers **Finish…**. An
+  interrupted Protect that wrote the vault asks for both the lock password and
+  the recovery key; one that did not starts over with a new recovery key, or
   **Stop protecting…** backs it out with a plain confirmation, since nothing is
   encrypted yet.
-- If the target store's `store.yaml` cannot be read, or its vault is missing,
-  the app says so — on the lock screen and in Settings — with how to repair
-  it, and never calls the secrets encrypted.
-- The section lists what opens the vault and this computer's limits — the
-  lines `apprafter lock status` shows — including any protection the app's own
-  process could not take, which Doctor shows too.
+- If the target store's `store.yaml` cannot be read, the app stays locked,
+  and its lock screen says why and how to repair it. If its vault is missing,
+  the lock screen, the Security page and the Targets page's line say so, with
+  how to repair it. Neither is ever called encrypted.
+- If another account on this computer owns a folder of the target store or
+  can write to it, the app uses none of the store's secrets until that is
+  fixed. The lock screen, the Security page and the Targets page's line say
+  so, with how to fix it, and the Security page offers no **Protect…**,
+  **Finish…** or **Stop protecting…** meanwhile
+  ([`store_not_private`](troubleshooting.md#store-not-private)).
+- The Security page lists what opens the vault and this computer's limits —
+  the lines `apprafter lock status` shows — including any protection the
+  app's own process could not take, which Doctor shows too.
 
 While the app is unlocked, everything it runs can use the store's secrets:
 lock it when you step away. Terminals unlock on their own, with

@@ -502,8 +502,8 @@ back before it deletes the vault. A file did not hold what was written — the
 disk may be full, or another program changed the file — so the run stopped
 with the vault kept. Nothing was lost.
 
-**Fix.** Run `apprafter lock off` again, or choose **Finish…** in the desktop's
-Settings › Lock: either finishes from where the run stopped. If it stops here
+**Fix.** Run `apprafter lock off` again, or choose **Finish…** on the desktop's
+Security page: either finishes from where the run stopped. If it stops here
 again, check the disk the target store is on.
 
 ### `apprafter::secrets::store_changed` {#store-changed}
