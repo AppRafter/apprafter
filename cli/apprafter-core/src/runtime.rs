@@ -511,8 +511,9 @@ mod tests {
     }
 
     /// WI-473: Unix refuses a runtime dir another account owns as it always has — its mode
-    /// cannot be set. `/` stands for one; as root it is no other account's and its mode would
-    /// change, so the test refuses to run as root.
+    /// cannot be set (EPERM). A root-owned directory on a writable filesystem stands for one
+    /// (not `/`, which macOS mounts read-only: EROFS would answer first); as root it is no other
+    /// account's and its mode would change, so the test refuses to run as root.
     #[cfg(unix)]
     #[test]
     fn a_runtime_dir_another_account_owns_is_refused_on_unix() {
@@ -521,17 +522,51 @@ mod tests {
         assert_ne!(
             unsafe { libc::geteuid() },
             0,
-            "as root, `/` belongs to this account and its mode would be changed"
+            "as root, no directory belongs to another account and its mode would be changed"
         );
-        let root = Path::new("/");
-        let before = fs::metadata(root).unwrap().permissions().mode();
-        match ensure_private_dir(root) {
+        let foreign = foreign_writable_dir();
+        let before = fs::metadata(&foreign).unwrap().permissions().mode();
+        match ensure_private_dir(&foreign) {
             Err(CoreError::Cli(cli_core::CliError::Io(e))) => {
-                assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}")
+                assert_eq!(
+                    e.kind(),
+                    io::ErrorKind::PermissionDenied,
+                    "{foreign:?}: {e}"
+                )
             }
-            other => panic!("not refused: {other:?}"),
+            other => panic!("{foreign:?} not refused: {other:?}"),
         }
-        assert_eq!(fs::metadata(root).unwrap().permissions().mode(), before);
+        assert_eq!(fs::metadata(&foreign).unwrap().permissions().mode(), before);
+    }
+
+    /// The first of `/tmp`, `/private/tmp` (macOS, where `/tmp` is a link) and `/var/tmp` that
+    /// is a directory another account owns on a filesystem mounted read-write. None is a
+    /// failure, never a skip.
+    #[cfg(unix)]
+    fn foreign_writable_dir() -> PathBuf {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid has no failure mode.
+        let me = unsafe { libc::geteuid() };
+        const CANDIDATES: [&str; 3] = ["/tmp", "/private/tmp", "/var/tmp"];
+        for candidate in CANDIDATES {
+            let path = Path::new(candidate);
+            let Ok(meta) = fs::symlink_metadata(path) else {
+                continue;
+            };
+            if !meta.is_dir() || meta.uid() == me {
+                continue;
+            }
+            let c_path = std::ffi::CString::new(candidate).unwrap();
+            // SAFETY: statvfs is plain data the call fills in.
+            let mut vfs: libc::statvfs = unsafe { std::mem::zeroed() };
+            // SAFETY: a NUL-terminated path and a statvfs to fill.
+            if unsafe { libc::statvfs(c_path.as_ptr(), &mut vfs) } == 0
+                && vfs.f_flag & libc::ST_RDONLY == 0
+            {
+                return path.to_path_buf();
+            }
+        }
+        panic!("none of {CANDIDATES:?} is another account's directory on a read-write filesystem");
     }
 
     #[cfg(unix)]
