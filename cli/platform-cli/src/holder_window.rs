@@ -398,6 +398,10 @@ pub(crate) struct HolderSession {
     own: Option<OwnPath>,
     root: PathBuf,
     no_holder: Arc<AtomicBool>,
+    /// The window's own flag ([`Window`]'s `hung`): set when this holder falls silent at an
+    /// item, which names it (T59) — so the prompt that follows promises no window and starts
+    /// none, and the holder, which still holds the place, is not named a second time.
+    hung: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for HolderSession {
@@ -416,6 +420,7 @@ impl HolderSession {
         store: StoreBinding,
         req: &VaultRequest<'_>,
         no_holder: Arc<AtomicBool>,
+        hung: Arc<AtomicBool>,
         own: bool,
     ) -> HolderSession {
         let root = req.store_root.to_path_buf();
@@ -435,6 +440,7 @@ impl HolderSession {
             own,
             root,
             no_holder,
+            hung,
         }
     }
 
@@ -467,6 +473,7 @@ impl HolderSession {
             Ok(v) => Answer::Served(v),
             Err(e) => {
                 if let Some(note) = react(&e, pid, &*self.find, &self.no_holder) {
+                    self.hung.store(true, Ordering::SeqCst);
                     eprintln!("{note}");
                 }
                 Answer::Own
@@ -542,10 +549,11 @@ struct Window {
     /// Set once this process prompted, or found its holder refusing or silent: from then on it
     /// opens the vault itself and never asks a holder again (rule 9, critic S1).
     no_holder: Arc<AtomicBool>,
-    /// Set once this process named a holder of this terminal that does not answer (T59): it
-    /// still holds the place, so a prompt here promises no window and starts none — a start
-    /// could only meet it again, and name it twice.
-    hung: AtomicBool,
+    /// Set once this process named a holder of this terminal that does not answer (T59) — at
+    /// its connect, its `Status` or an item (its [`HolderSession`] shares the flag): it still
+    /// holds the place, so a prompt here promises no window and starts none — a start could
+    /// only meet it again, and name it twice.
+    hung: Arc<AtomicBool>,
     /// How a holder is started ([`start_window`]; a counter in the unit tests).
     start: StartFn,
     /// Whether this CLI leads its own session ([`leads_own_session`]; a constant in the unit
@@ -578,6 +586,7 @@ impl Window {
                         store,
                         req,
                         self.no_holder.clone(),
+                        self.hung.clone(),
                         own,
                     );
                     Some(Arc::new(session) as Arc<dyn VaultSession>)
@@ -681,7 +690,7 @@ pub(crate) fn install(place: HolderPlace) {
     let _ = WINDOW.set(Window {
         place,
         no_holder: Arc::new(AtomicBool::new(false)),
-        hung: AtomicBool::new(false),
+        hung: Arc::new(AtomicBool::new(false)),
         start: start_window,
         leads_session: leads_own_session,
     });
@@ -995,7 +1004,7 @@ mod tests {
         let w = Window {
             place: h.place.clone(),
             no_holder: Arc::new(AtomicBool::new(false)),
-            hung: AtomicBool::new(false),
+            hung: Arc::new(AtomicBool::new(false)),
             start: |_, _, _, _, _| unreachable!("a holder started over one that holds the place"),
             leads_session: || false,
         };
@@ -1169,7 +1178,7 @@ mod window_tests {
         let window = |leads: fn() -> bool, start: StartFn| Window {
             place: HolderPlace::of(&ctx),
             no_holder: Arc::new(AtomicBool::new(false)),
-            hung: AtomicBool::new(false),
+            hung: Arc::new(AtomicBool::new(false)),
             start,
             leads_session: leads,
         };
@@ -1343,6 +1352,7 @@ mod session_tests {
         vault: Vec<u8>,
         owns: Arc<AtomicUsize>,
         no_holder: Arc<AtomicBool>,
+        hung: Arc<AtomicBool>,
     }
 
     /// A session over the holder at `endpoint` whose own path opens the store with its key,
@@ -1354,6 +1364,7 @@ mod session_tests {
         let vault = std::fs::read(root.join("vault")).unwrap();
         let owns = Arc::new(AtomicUsize::new(0));
         let no_holder = Arc::new(AtomicBool::new(false));
+        let hung = Arc::new(AtomicBool::new(false));
         let file = read_store_file(&root).unwrap().unwrap();
         let access = store.access();
         let counted = owns.clone();
@@ -1370,6 +1381,7 @@ mod session_tests {
             })),
             root,
             no_holder: no_holder.clone(),
+            hung: hung.clone(),
         };
         (
             s,
@@ -1379,6 +1391,7 @@ mod session_tests {
                 vault,
                 owns,
                 no_holder,
+                hung,
             },
         )
     }
@@ -1430,6 +1443,10 @@ mod session_tests {
             assert_eq!(kinds(&seen), ["item", "end"], "{refusal:?}");
             assert_eq!(f.owns.load(Ordering::SeqCst), 2, "{refusal:?}");
             assert!(f.no_holder.load(Ordering::SeqCst));
+            assert!(
+                !f.hung.load(Ordering::SeqCst),
+                "an ended holder is taken as still holding the place: {refusal:?}"
+            );
         }
     }
 
@@ -1553,7 +1570,7 @@ mod session_tests {
         let window = Window {
             place: place.clone(),
             no_holder: Arc::new(AtomicBool::new(false)),
-            hung: AtomicBool::new(false),
+            hung: Arc::new(AtomicBool::new(false)),
             start: |_, _, _, _, _| unreachable!("a diagnostic starts no holder"),
             leads_session: || false,
         };
@@ -1572,12 +1589,12 @@ mod session_tests {
         };
         let flag = || Arc::new(AtomicBool::new(false));
         let diagnostic =
-            HolderSession::for_store(place.clone(), store.clone(), &req, flag(), false);
+            HolderSession::for_store(place.clone(), store.clone(), &req, flag(), flag(), false);
         assert!(
             diagnostic.own.is_none(),
             "a diagnostic's session could prompt"
         );
-        let command = HolderSession::for_store(place, store, &req, flag(), true);
+        let command = HolderSession::for_store(place, store, &req, flag(), flag(), true);
         assert!(command.own.is_some());
     }
 
@@ -1651,6 +1668,10 @@ mod session_tests {
         );
         assert_eq!(f.owns.load(Ordering::SeqCst), 1);
         assert!(f.no_holder.load(Ordering::SeqCst));
+        assert!(
+            f.hung.load(Ordering::SeqCst),
+            "a silent holder is not marked as holding the place"
+        );
     }
 
     /// T59: a holder that takes the connection and says nothing at its `Status` is
@@ -1674,7 +1695,7 @@ mod session_tests {
                 runtime_dir: root.join("run"),
             },
             no_holder: Arc::new(AtomicBool::new(false)),
-            hung: AtomicBool::new(false),
+            hung: Arc::new(AtomicBool::new(false)),
             start: |_, _, _, _, _| unreachable!("a holder started over one that holds the place"),
             leads_session: || false,
         };
@@ -1754,7 +1775,7 @@ mod session_tests {
                 runtime_dir: root.join("run"),
             },
             no_holder: Arc::new(AtomicBool::new(false)),
-            hung: AtomicBool::new(false),
+            hung: Arc::new(AtomicBool::new(false)),
             start: |_, _, _, _, _| unreachable!("a probe starts no holder"),
             leads_session: || false,
         };
@@ -1769,5 +1790,90 @@ mod session_tests {
         );
         assert!(w.session(&req, true).is_some());
         assert_eq!(kinds(&seen), ["status", "status"]);
+    }
+
+    /// T59, one naming per command (run E's residual): a holder that answers `Status` and then
+    /// falls silent at an item is named by the item's session — and from then on the window
+    /// knows it, as it knows one silent at its `Status`: the question promises no window and the
+    /// prompt that follows starts none, so its start never meets that holder (`AlreadyRunning`)
+    /// to name it a second time. A diagnostic's session, so the item is `store_locked` here
+    /// rather than a prompt.
+    #[test]
+    fn a_holder_silent_at_an_item_is_named_once_and_promises_no_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let locked = locked_store(&root, &[("prod", Some(TOKEN))]);
+        let base_dir = tempfile::TempDir::new_in("/tmp").unwrap();
+        let base = base_dir.path().join("apprafter");
+        let store = binding(&root, locked.store_id.as_str());
+        let Endpoint::Socket { path, .. } = session_endpoint(&base, &store).unwrap() else {
+            unreachable!("Unix")
+        };
+        let seen = fake_at(
+            &path,
+            vec![
+                Some(Reply::Status(HolderStatus {
+                    protocol: PROTOCOL,
+                    version: VERSION.into(),
+                    store_id: store.id.clone(),
+                    vault_id: locked.vault_id,
+                    left_secs: 60,
+                    minutes: 5,
+                    hardening: HolderHardening {
+                        non_dumpable: Some(true),
+                        deny_attach: None,
+                        core_off: true,
+                        memory_locked: true,
+                        process_dacl: None,
+                    },
+                })),
+                None,
+            ],
+        );
+        let w = Window {
+            place: HolderPlace {
+                base: Some(base),
+                runtime_dir: root.join("run"),
+            },
+            no_holder: Arc::new(AtomicBool::new(false)),
+            hung: Arc::new(AtomicBool::new(false)),
+            start: |_, _, _, _, _| unreachable!("a holder started over one that holds the place"),
+            leads_session: || false,
+        };
+        let req = VaultRequest {
+            store_root: &root,
+            store_id: &locked.store_id,
+            slots: &[],
+        };
+        let session = w
+            .session(&req, false)
+            .expect("the holder answers its Status");
+        assert_eq!(
+            w.would_open(&root),
+            Some(5),
+            "the forced condition: a window would open"
+        );
+        let vault = std::fs::read(root.join("vault")).unwrap();
+        assert!(matches!(
+            session.hetzner_token(&vault, "prod"),
+            Err(CliError::StoreLocked { .. })
+        ));
+        assert_eq!(kinds(&seen), ["status", "item"]);
+        assert!(
+            w.no_holder.load(Ordering::SeqCst),
+            "a holder is asked again"
+        );
+        assert_eq!(w.would_open(&root), None, "the question promises a window");
+        assert_eq!(
+            w.after_prompt(
+                &root,
+                &locked.store_id,
+                locked.data_key(),
+                locked.vault_id,
+                5
+            ),
+            None,
+            "the prompt names the holder again"
+        );
     }
 }
