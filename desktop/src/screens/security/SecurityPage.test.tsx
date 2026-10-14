@@ -28,12 +28,13 @@ import {
   STOP_FINISH_TITLE,
   STOP_TITLE,
   STOPPED_TOAST,
+  STORE_NOT_PRIVATE_SUB,
   STORE_PROBLEM_SUB,
   STORE_SECRET_FIELD,
 } from '../../state/lockText';
 import { PlatformContext } from '../../state/platform';
 import { createQueryClient } from '../../state/queryClient';
-import { appInfo, STORE_PROBLEMS } from '../../test/fixtures';
+import { appInfo, STORE_NOT_PRIVATE, STORE_PROBLEMS } from '../../test/fixtures';
 import { renderScreen, ScreenHost } from '../../test/screens';
 import { settleIpc } from '../../test/settle';
 import { LockFlow } from './LockFlow';
@@ -197,6 +198,27 @@ describe('the Security page (WI-476)', () => {
       expect(screen.getByText(STORE_PROBLEM_SUB)).toBeDefined();
       // protectSub('locked') is the one line of the page that says they are encrypted.
       expect(screen.queryByText(/^Secrets are encrypted/)).toBeNull();
+      for (const label of Object.values(ACTION_LABELS)) {
+        expect(screen.queryByRole('button', { name: label })).toBeNull();
+      }
+    },
+  );
+
+  // The controller's decision on critic M7 (WI-475): a store other accounts can change is said in
+  // the core's words, with the fix, and nothing the core would refuse is offered; it is never
+  // called protected, nor in files.
+  test.each(STORE_NOT_PRIVATE)(
+    'a store other accounts can change, %s: the core’s why and fix, and no Protect, Finish or Stop',
+    async (_state, secrets) => {
+      installMockIpc({ opDelayMs: 0 });
+      await api.unlock();
+      renderScreen(<SecurityPage />, { info: appInfo({ secrets }) });
+      const panel = await screen.findByRole('alert');
+      expect(panel.textContent).toContain(secrets.problem?.message ?? '?');
+      expect(panel.textContent).toContain(secrets.problem?.help ?? '?');
+      expect(screen.getByText(STORE_NOT_PRIVATE_SUB)).toBeDefined();
+      expect(screen.queryByText(STORE_PROBLEM_SUB)).toBeNull();
+      expect(screen.queryByText(/^Secrets are (encrypted|in files)/)).toBeNull();
       for (const label of Object.values(ACTION_LABELS)) {
         expect(screen.queryByRole('button', { name: label })).toBeNull();
       }

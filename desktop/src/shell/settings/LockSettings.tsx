@@ -4,6 +4,7 @@
 // are the Security page's (screens/security/SecurityPage.tsx), which `onOpenSecurity` shows.
 import type { Settings } from '../../ipc/generated/Settings';
 import { useLockActions } from '../../state/lock';
+import { storeProblemOf } from '../../state/lockText';
 import { usePlatform } from '../../state/platform';
 import { useSaveSettings } from '../../state/settings';
 import { LockSection } from './LockSection';
@@ -27,7 +28,7 @@ export function LockSettings({ settings, onOpenSecurity }: LockSettingsProps) {
       sessionEvents={info.sessionEvents}
       mode={info.secrets.mode}
       protectedStore={info.secrets.protected}
-      storeProblem={info.secrets.problem !== null}
+      storeProblem={storeProblemOf(info.secrets.problem)}
       onSave={(change) => save(change)}
       onLock={() => {
         lock().catch((error: unknown) => console.error('lock_now failed:', error));

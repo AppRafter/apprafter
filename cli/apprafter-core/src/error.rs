@@ -1085,6 +1085,16 @@ pub mod samples {
                 }
                 .into(),
             ),
+            // WI-476: a store folder other accounts can write (WI-475), as the Security page and
+            // the Targets page's line tell it from a lock state that cannot be used.
+            (
+                "storeNotPrivate",
+                CliError::StoreNotPrivate {
+                    path: "/home/a/stores/work/targets".into(),
+                    problem: cli_core::StoreFolderProblem::WritableByOthers,
+                }
+                .into(),
+            ),
         ]
     }
 

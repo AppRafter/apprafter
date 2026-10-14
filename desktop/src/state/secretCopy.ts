@@ -4,12 +4,16 @@
 // no owner-only ACL before D.4, so it is not called "readable only by you" there. A store whose
 // secrets are protected keeps the token in its vault, on every OS (D.4a surface D21).
 // An interrupted run, or a store whose lock state cannot be used, says so (D.4a critic B
-// finding 8).
+// finding 8); so does a store other accounts can change, whose secrets the core does not use
+// (WI-475; WI-476).
 import type { Os } from '../ipc/generated/Os';
 import type { SecretsMode } from '../ipc/generated/SecretsMode';
+import type { StoreProblem } from './lockText';
 
-export function secretCopy(os: Os, mode: SecretsMode, problem = false): string {
-  if (problem) return "Unavailable until this target store's lock state is repaired";
+export function secretCopy(os: Os, mode: SecretsMode, problem: StoreProblem | null = null): string {
+  if (problem === 'not_private')
+    return 'Unavailable while other accounts can change this target store';
+  if (problem !== null) return "Unavailable until this target store's lock state is repaired";
   switch (mode) {
     case 'files':
       return os === 'windows'

@@ -123,6 +123,9 @@ tauri       = { workspace = true, features = ["test"] }
 # The locked test store and `Context::with_insecure_kdf_root` (D.4a; `test-support` adds no
 # dependency, and a dev-dependency's feature never reaches the app).
 apprafter-core = { workspace = true, features = ["test-support"] }
+# The tests' seam over who owns a store folder (`cli_core::owner_only::pretend`, WI-476: a store
+# other accounts can change); a dev-dependency's feature never reaches the app.
+cli-core       = { workspace = true, features = ["test-support"] }
 # tests/ipc_mock.rs reads capabilities/main.json5 as Tauri does: the version tauri-utils parses
 # it with (`config-json5`), already in the lock.
 json5       = "0.4"

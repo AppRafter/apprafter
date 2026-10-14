@@ -12,6 +12,13 @@
 //! treats it (none of its secrets is used; fail closed, overview rule 3): the app stays locked
 //! until it is repaired, and `problem` says why. A lock whose vault is gone (O8) is not protected
 //! — nothing opens it — and `problem` says that too. Neither is ever shown as "encrypted".
+//!
+//! WI-476 (critic M7; WI-475): a folder of the store another account owns or can write is a
+//! problem too, said in the core's words (`store_not_private`) in place of any other: the core
+//! then neither uses nor writes any of the store's secrets, and whoever can change the store could
+//! have changed its `store.yaml` or removed its vault. It is read from the folders' owners and
+//! permissions only (`store_privacy::ensure_private`: nothing is opened, asked or tightened), and
+//! it changes nothing else of the read: a protected store stays protected, pins and all.
 
 use std::io;
 use std::path::Path;
@@ -20,7 +27,7 @@ use apprafter_core::secrets::{read_store_file, LockSlotKind, SecretsMode, StoreI
 use apprafter_core::vault::VAULT_FILE;
 use apprafter_core::{CoreError, UiError};
 use apprafter_desktop_ipc::SecretsInfo;
-use cli_core::{CliError, VaultProblem};
+use cli_core::{store_privacy, CliError, TargetStorePaths, VaultProblem};
 
 /// The store's state, as one read found it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,9 +45,20 @@ pub struct Protection {
 }
 
 impl Protection {
-    /// Reads `root`'s `store.yaml` and the vault's directory entry; `home` abbreviates the
-    /// root as the app shows paths.
+    /// Reads `root`'s `store.yaml`, the vault's directory entry and who else can change the
+    /// store's folders; `home` abbreviates the root as the app shows paths.
     pub fn read(root: &Path, home: Option<&Path>) -> Protection {
+        let mut now = Self::read_lock_state(root, home);
+        // A store another account can change (see the module docs): said in place of any other
+        // problem, and nothing else of the read moves (fail closed).
+        if let Err(e) = store_privacy::ensure_private(&TargetStorePaths::for_root(root.into())) {
+            now.problem = Some(UiError::from(&CoreError::Cli(e)));
+        }
+        now
+    }
+
+    /// `store.yaml` and the vault's directory entry, as [`read`](Self::read) reports them.
+    fn read_lock_state(root: &Path, home: Option<&Path>) -> Protection {
         let store = cli_core::paths::abbreviate_home(root, home);
         match read_store_file(root) {
             Ok(None) => Protection {
@@ -113,6 +131,7 @@ mod tests {
     use apprafter_core::secrets::testing::locked_store;
     use apprafter_core::secrets::{LockSlotKind, SecretsMode};
     use apprafter_core::vault::VAULT_FILE;
+    use cli_core::owner_only::pretend;
 
     use super::Protection;
 
@@ -184,6 +203,76 @@ mod tests {
         assert!(p.protected && p.id.is_none() && p.slots.is_empty());
         let problem = p.problem.expect("an unreadable store.yaml is said");
         assert_eq!(problem.code.as_deref(), Some(codes::STORE_FILE_UNREADABLE));
+    }
+
+    /// WI-476 (critic M7; WI-475): a folder of the store another account owns — pretended, in
+    /// a temp dir — is said in the core's words (`store_not_private`, naming the folder), in
+    /// files and on a protected store alike, and the lock state stays as read: a protected store
+    /// keeps its id and its pins (fail closed). Owned again, the problem is gone.
+    #[test]
+    fn a_store_another_account_can_change_is_said_and_keeps_its_lock_state() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("targets").join("prod")).unwrap();
+        let targets = dir.path().join("targets");
+        {
+            let _foreign = pretend::foreign_owner(&targets);
+            let p = Protection::read(dir.path(), None);
+            assert_eq!(p.mode, SecretsMode::Files);
+            assert!(!p.protected && p.id.is_none());
+            let problem = p
+                .problem
+                .expect("a store another account can change is said");
+            assert_eq!(problem.code.as_deref(), Some(codes::STORE_NOT_PRIVATE));
+            assert_eq!(problem.fields["problem"], "foreign_owner");
+            assert_eq!(problem.fields["path"], targets.display().to_string());
+        }
+        assert!(Protection::read(dir.path(), None).problem.is_none());
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = locked_store(dir.path(), &[("prod", None)]);
+        let _foreign = pretend::foreign_owner(dir.path());
+        let p = Protection::read(dir.path(), None);
+        assert_eq!(p.mode, SecretsMode::Locked);
+        assert!(p.protected);
+        assert_eq!(p.id.as_ref(), Some(&store.store_id));
+        assert_eq!(p.slots, vec![LockSlotKind::RecoveryKey]);
+        let problem = p
+            .problem
+            .expect("a protected store another account can change is said");
+        assert_eq!(problem.code.as_deref(), Some(codes::STORE_NOT_PRIVATE));
+    }
+
+    /// It is said in place of a lost vault: whoever can change the store could have removed
+    /// the vault, and the fix comes first.
+    #[test]
+    fn a_store_another_account_can_change_is_said_before_its_lost_vault() {
+        let dir = tempfile::tempdir().unwrap();
+        locked_store(dir.path(), &[]);
+        std::fs::remove_file(dir.path().join(VAULT_FILE)).unwrap();
+        let _foreign = pretend::foreign_owner(dir.path());
+        let p = Protection::read(dir.path(), None);
+        assert!(!p.protected && p.id.is_none());
+        let problem = p.problem.expect("said");
+        assert_eq!(problem.code.as_deref(), Some(codes::STORE_NOT_PRIVATE));
+    }
+
+    /// Unix, with no seam: a store folder others can write, as its real mode says, is said;
+    /// its mode put back, the problem is gone.
+    #[cfg(unix)]
+    #[test]
+    fn a_store_folder_others_can_write_is_said() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let targets = dir.path().join("targets");
+        std::fs::create_dir_all(&targets).unwrap();
+        std::fs::set_permissions(&targets, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let problem = Protection::read(dir.path(), None)
+            .problem
+            .expect("a folder others can write is said");
+        assert_eq!(problem.code.as_deref(), Some(codes::STORE_NOT_PRIVATE));
+        assert_eq!(problem.fields["problem"], "writable_by_others");
+        std::fs::set_permissions(&targets, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(Protection::read(dir.path(), None).problem.is_none());
     }
 
     #[test]

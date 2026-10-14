@@ -18,7 +18,7 @@ import {
 } from '../state/lockText';
 import { PlatformContext } from '../state/platform';
 import { createQueryClient } from '../state/queryClient';
-import { appInfo, authInfo, lockState, STORE_PROBLEMS } from '../test/fixtures';
+import { appInfo, authInfo, lockState, STORE_NOT_PRIVATE, STORE_PROBLEMS } from '../test/fixtures';
 import { settleIpc } from '../test/settle';
 import { LockScreen } from './LockScreen';
 
@@ -549,6 +549,21 @@ describe('LockScreen of a store whose lock state cannot be used (critic B findin
     expect(screen.queryByText(/locked from a terminal/)).toBeNull();
     expect(screen.getByText(secrets.problem?.message ?? '?')).toBeDefined();
     expect(screen.getByText(lockFooter('locked', true))).toBeDefined();
+    expect(screen.queryByText(/encrypted/i)).toBeNull();
+  });
+});
+
+// The controller's decision on critic M7 (WI-475; WI-476): a store other accounts can change says
+// that, in the core's words, never as its lock state and never "encrypted".
+describe('LockScreen of a store other accounts can change', () => {
+  test.each(STORE_NOT_PRIVATE)('%s: why and the fix, never "encrypted"', (_state, secrets) => {
+    lockScreen(lockState({ reason: 'secrets_locked' }), appInfo({ secrets }));
+    expect(
+      screen.getByText('Locked: other accounts on this computer can change this target store.'),
+    ).toBeDefined();
+    expect(screen.queryByText(STORE_PROBLEM_REASON)).toBeNull();
+    expect(screen.getByText(secrets.problem?.message ?? '?')).toBeDefined();
+    expect(screen.getByText(secrets.problem?.help ?? '?')).toBeDefined();
     expect(screen.queryByText(/encrypted/i)).toBeNull();
   });
 });

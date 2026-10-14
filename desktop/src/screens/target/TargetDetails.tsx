@@ -11,6 +11,7 @@ import type { Os } from '../../ipc/generated/Os';
 import type { SecretsMode } from '../../ipc/generated/SecretsMode';
 import type { TargetReport } from '../../ipc/generated/TargetReport';
 import type { TokenPresence } from '../../ipc/generated/TokenPresence';
+import type { StoreProblem } from '../../state/lockText';
 import { secretCopy } from '../../state/secretCopy';
 import { providerLabel, tierLabel } from '../targets/labels';
 import { MachineRow } from './MachineRow';
@@ -28,8 +29,11 @@ export interface TargetDetailsProps {
   report: TargetReport;
   os: Os;
   secretsMode: SecretsMode;
-  /** The store's lock state cannot be used (`AppInfo.secrets.problem`, D.4a critic B finding 8). */
-  secretsProblem?: boolean;
+  /**
+   * What is wrong with the store, if anything (`AppInfo.secrets.problem`, D.4a critic B finding 8;
+   * WI-476: other accounts can change it), as `storeProblemOf` tells it.
+   */
+  secretsProblem?: StoreProblem | null;
   actions: TargetDetailActions;
   /** Opens the machine picker (D.3e); null: no Change button. */
   onChangeMachine: (() => void) | null;
@@ -57,7 +61,7 @@ export function TargetDetails({
   report,
   os,
   secretsMode,
-  secretsProblem = false,
+  secretsProblem = null,
   actions,
   onChangeMachine,
 }: TargetDetailsProps) {

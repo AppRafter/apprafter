@@ -26,7 +26,7 @@ import { uiErrorOf } from '../ipc/api';
 import type { LockState } from '../ipc/generated/LockState';
 import { authPrompt, authRefusal, retryLine, useRetryCountdown } from '../state/auth';
 import { useLockActions } from '../state/lock';
-import { lockFooter, STORE_PROBLEM_REASON } from '../state/lockText';
+import { lockFooter, storeProblemOf, storeProblemReason } from '../state/lockText';
 import { osName, usePlatform } from '../state/platform';
 import { StoreSecretForm } from './StoreSecretForm';
 
@@ -67,6 +67,7 @@ export interface LockScreenProps {
 
 export function LockScreen({ state }: LockScreenProps) {
   const info = usePlatform();
+  const problem = storeProblemOf(info.secrets.problem);
   const { unlock, unlockWithPassword } = useLockActions();
   const [waiting, setWaiting] = useState(false);
   const [refusal, setRefusal] = useState<readonly string[]>([]);
@@ -133,11 +134,12 @@ export function LockScreen({ state }: LockScreenProps) {
         <Logo size={56} />
         <h1 className="lock-title">AppRafter is locked</h1>
         <p className="lock-reason">
-          {state.reason === 'secrets_locked' && info.secrets.problem !== null
-            ? STORE_PROBLEM_REASON
+          {state.reason === 'secrets_locked' && problem !== null
+            ? storeProblemReason(problem)
             : reasonLine(state)}
         </p>
-        {/* Why, in the core's words: store.yaml unreadable, or the vault gone (critic A 22). */}
+        {/* Why, in the core's words: store.yaml unreadable, the vault gone (critic A 22), or a
+            store other accounts can change (WI-475; WI-476). */}
         {info.secrets.problem !== null && <ErrorPanel error={info.secrets.problem} />}
         <div className="lock-account">
           <span className="lock-avatar" aria-hidden="true">

@@ -18,7 +18,7 @@ import { AppOverlayContext, useAppOverlayHost } from '../../shell/AppOverlays';
 import { ViewFrame } from '../../shell/ViewFrame';
 import { PlatformContext } from '../../state/platform';
 import { createQueryClient } from '../../state/queryClient';
-import { appInfo, STORE_PROBLEMS } from '../../test/fixtures';
+import { appInfo, STORE_NOT_PRIVATE, STORE_PROBLEMS } from '../../test/fixtures';
 import { uiError } from '../../test/ipc';
 import { renderScreen } from '../../test/screens';
 import { settleIpc } from '../../test/settle';
@@ -66,6 +66,22 @@ test.each(STORE_PROBLEMS)(
       "Unavailable until this target store's lock state is repaired",
     );
     expect(token.textContent).not.toMatch(/encrypted/i);
+  },
+);
+
+// The controller's decision on critic M7 (WI-475): the core uses no token of a store other
+// accounts can change, and the line says why.
+test.each(STORE_NOT_PRIVATE)(
+  "the token's line on a store other accounts can change: %s",
+  async (_state, secrets) => {
+    renderScreen(<TargetScreen name="prod-eu" onRenamed={() => {}} onRemoved={() => {}} />, {
+      info: appInfo({ secrets }),
+    });
+    const token = await screen.findByRole('group', { name: 'API token' });
+    expect(token.textContent).toContain(
+      'Unavailable while other accounts can change this target store',
+    );
+    expect(token.textContent).not.toMatch(/encrypted|readable only by you/i);
   },
 );
 

@@ -31,8 +31,9 @@ import {
   SLOT_REFUSALS,
   SLOTS_LABEL,
   SLOTS_LATER,
-  STORE_PROBLEM_SUB,
   storeLine,
+  storeProblemOf,
+  storeProblemSub,
   terminalsLine,
   unlockNote,
 } from '../../state/lockText';
@@ -57,7 +58,8 @@ export interface StoreProtectionProps {
   readonly error: UiError | null;
   /**
    * The store's lock state cannot be used (AppInfo.secrets.problem: an unreadable store.yaml, a
-   * lost vault; critic B finding 8): said, with why, in place of the state line and its actions.
+   * lost vault; critic B finding 8), or other accounts can change the store (WI-475; WI-476):
+   * said, with why and the fix, in place of the state line and its actions.
    */
   readonly problem: UiError | null;
   readonly onAction: (action: ProtectAction) => void;
@@ -90,11 +92,12 @@ export function StoreScope({ store, targets, error }: StoreScopeProps) {
 }
 
 export function StoreProtection(p: StoreProtectionProps) {
+  const problem = storeProblemOf(p.problem);
   return (
     <>
       <SettingRow
         label={PROTECT_LABEL}
-        sub={p.problem === null ? protectSub(p.mode) : STORE_PROBLEM_SUB}
+        sub={problem === null ? protectSub(p.mode) : storeProblemSub(problem)}
         control={(p.problem === null ? PROTECT_ACTIONS[p.mode] : []).map((action) => (
           <Button
             key={action}

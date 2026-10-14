@@ -36,8 +36,11 @@ pub struct SecretsInfo {
     pub store: String,
     /// Why this store's lock state cannot be used, in the core's words (rule 1): its
     /// `store.yaml` cannot be read (`store_file_unreadable`; the store counts as locked, fail
-    /// closed), or it is locked and its vault is gone (`vault_unreadable`, `missing`: O8). Never
-    /// shown as "encrypted". `None` otherwise, an interrupted run included.
+    /// closed), or it is locked and its vault is gone (`vault_unreadable`, `missing`: O8). Or,
+    /// in place of either, a folder of the store another account owns or can write
+    /// (`store_not_private`, WI-475; WI-476): the core then uses and writes none of its
+    /// secrets, and the rest of this report stays as read. Never shown as "encrypted". `None`
+    /// otherwise, an interrupted run included.
     pub problem: Option<UiError>,
 }
 

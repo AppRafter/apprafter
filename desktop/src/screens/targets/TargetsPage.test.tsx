@@ -8,7 +8,7 @@ import * as api from '../../ipc/api';
 import { installMockIpc } from '../../ipc/mock';
 import { resetOperations } from '../../ipc/operations';
 import { startPlan } from '../../ipc/plans';
-import { appInfo, STORE_PROBLEMS } from '../../test/fixtures';
+import { appInfo, STORE_NOT_PRIVATE, STORE_PROBLEMS } from '../../test/fixtures';
 import { renderScreen } from '../../test/screens';
 import { settleIpc } from '../../test/settle';
 import { tabHost } from '../../test/tab';
@@ -390,5 +390,30 @@ test.each(STORE_PROBLEMS)(
     expect(
       screen.getByText('Target store ~/.config/apprafter · Secrets: lock state cannot be used'),
     ).toBeDefined();
+  },
+);
+
+// The controller's decision on critic M7 (WI-475): the line says that other accounts can change
+// the store, never "protected" nor "in files", and still leads to the Security page.
+test.each(STORE_NOT_PRIVATE)(
+  'a store other accounts can change says so on the line, %s, and Security › is there',
+  async (_state, secrets) => {
+    const onSecurity = mock();
+    const user = renderScreen(
+      <TargetsPage
+        onSecurity={onSecurity}
+        onOpen={() => {}}
+        openTargets={new Set()}
+        onRemoved={() => {}}
+      />,
+      { info: appInfo({ secrets }) },
+    );
+    expect(
+      screen.getByText(
+        'Target store ~/.config/apprafter · Secrets: not used while other accounts can change this store',
+      ),
+    ).toBeDefined();
+    await user.click(screen.getByRole('button', { name: 'Security page' }));
+    expect(onSecurity).toHaveBeenCalledTimes(1);
   },
 );

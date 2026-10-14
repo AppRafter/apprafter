@@ -16,7 +16,7 @@ import { ViewFrame } from '../../shell/ViewFrame';
 import { PlatformContext } from '../../state/platform';
 import { createQueryClient } from '../../state/queryClient';
 import { ScopeContext } from '../../state/scope';
-import { appInfo, STORE_PROBLEMS } from '../../test/fixtures';
+import { appInfo, STORE_NOT_PRIVATE, STORE_PROBLEMS } from '../../test/fixtures';
 import { catalogue, planParts, targetAdded } from '../../test/flows';
 import {
   cancelled,
@@ -101,6 +101,19 @@ describe('provider and token', () => {
         screen.getByText("Unavailable until this target store's lock state is repaired"),
       ).toBeDefined();
       expect(screen.queryByText(/encrypted/i)).toBeNull();
+    },
+  );
+
+  // The controller's decision on critic M7 (WI-475): no token is saved where other accounts can
+  // change the store, and the hint says why.
+  test.each(STORE_NOT_PRIVATE)(
+    'the secret copy of a store other accounts can change: %s',
+    (_state, secrets) => {
+      renderWizard('linux', secrets);
+      expect(
+        screen.getByText('Unavailable while other accounts can change this target store'),
+      ).toBeDefined();
+      expect(screen.queryByText(/encrypted|readable only by you/i)).toBeNull();
     },
   );
 

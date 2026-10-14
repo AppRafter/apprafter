@@ -13,6 +13,7 @@
 // and the page where the lock password is typed is a web view that runs as a process of its
 // own, which no hardening of the app's process reaches (T78): the ptrace and Windows lines say
 // so. Plain text: the page shows these as they are, so no `backtick` marks a command.
+import { CORE_ERROR_CODES } from '../ipc/generated/core-errors';
 import type { HolderHardening } from '../ipc/generated/HolderHardening';
 import type { LockSlotKind } from '../ipc/generated/LockSlotKind';
 import { RECOMMENDED_PASSWORD_CHARS } from '../ipc/generated/lock';
@@ -21,6 +22,7 @@ import type { Os } from '../ipc/generated/Os';
 import type { SecretsMode } from '../ipc/generated/SecretsMode';
 import type { SlotRefusalView } from '../ipc/generated/SlotRefusalView';
 import type { JsonValue } from '../ipc/generated/serde_json/JsonValue';
+import type { UiError } from '../ipc/generated/UiError';
 
 /** D1: the section's eyebrow. */
 export const LOCK_EYEBROW = 'Lock';
@@ -484,6 +486,37 @@ export function lockFooter(mode: SecretsMode, problem: boolean): string {
 export const STORE_PROBLEM_SUB = "This target store's lock state cannot be used.";
 /** The lock screen's reason then, in place of "locked from a terminal" (critic A finding 22). */
 export const STORE_PROBLEM_REASON = "Locked: this target store's lock state cannot be used.";
+
+// WI-476 (the controller's decision on critic M7; WI-475): a target store whose folder another
+// account owns or can write is a problem of its own. The core then neither uses nor writes any of
+// its secrets (`store_not_private`), so wherever the app says where the secrets are it says that
+// instead — never "protected", never that the lock state is at fault — and offers nothing the
+// core would refuse.
+/** Which problem AppInfo.secrets.problem is, as the lock's words tell them apart. */
+export type StoreProblem = 'lock_state' | 'not_private';
+
+/** `problem` (AppInfo.secrets.problem) as the lock's words tell it; `null` when there is none. */
+export function storeProblemOf(problem: UiError | null): StoreProblem | null {
+  if (problem === null) return null;
+  return problem.code === CORE_ERROR_CODES.SECRETS_STORE_NOT_PRIVATE ? 'not_private' : 'lock_state';
+}
+
+/** The Security page's state line when other accounts can change the store; the core's follows. */
+export const STORE_NOT_PRIVATE_SUB =
+  'Other accounts on this computer can change this target store.';
+/** The lock screen's reason then. */
+export const STORE_NOT_PRIVATE_REASON =
+  'Locked: other accounts on this computer can change this target store.';
+
+/** The Security page's state line for a store problem; the core's why and fix follow it. */
+export function storeProblemSub(problem: StoreProblem): string {
+  return problem === 'not_private' ? STORE_NOT_PRIVATE_SUB : STORE_PROBLEM_SUB;
+}
+
+/** The lock screen's reason for a store problem, in place of "locked from a terminal". */
+export function storeProblemReason(problem: StoreProblem): string {
+  return problem === 'not_private' ? STORE_NOT_PRIVATE_REASON : STORE_PROBLEM_REASON;
+}
 /** The Security page's limits, and its line while lock_info is read (UI verifier minor 9). */
 export const LIMITS_TITLE = 'Limits on this computer';
 export const READING = 'Reading…';
@@ -507,9 +540,13 @@ export function coveredLine(names: readonly string[]): string {
   return `Covers ${count}: ${names.join(', ')}`;
 }
 
-/** Where the store's secrets are, in a few words; never "protected" for one that needs repair. */
-export function secretsWord(mode: SecretsMode, problem: boolean): string {
-  if (problem) return 'lock state cannot be used';
+/**
+ * Where the store's secrets are, in a few words; never "protected" for one that needs repair or
+ * that other accounts can change.
+ */
+export function secretsWord(mode: SecretsMode, problem: StoreProblem | null): string {
+  if (problem === 'not_private') return 'not used while other accounts can change this store';
+  if (problem !== null) return 'lock state cannot be used';
   switch (mode) {
     case 'files':
       return 'in files';
@@ -523,7 +560,11 @@ export function secretsWord(mode: SecretsMode, problem: boolean): string {
 }
 
 /** The Targets page's line about the store as a whole; SECURITY_LINK follows it. */
-export function storeIndicator(store: string, mode: SecretsMode, problem: boolean): string {
+export function storeIndicator(
+  store: string,
+  mode: SecretsMode,
+  problem: StoreProblem | null,
+): string {
   return `${storeLine(store)} · Secrets: ${secretsWord(mode, problem)}`;
 }
 /**
@@ -540,13 +581,20 @@ export const SECURITY_ROW_SUB =
 export const OPEN_SECURITY = 'Open Security';
 
 /**
- * The row's sub as the store stands (critic M2): a lock state that cannot be used, an
- * interrupted run, or, while the app's unlock opens the vault (`pinned`, from
- * AppInfo.secrets.protected), why the rows above stay on and where that changes. Settings ›
- * Lock otherwise says nothing of the store: the Security page has it.
+ * The row's sub as the store stands (critic M2): a store other accounts can change, a lock
+ * state that cannot be used, an interrupted run, or, while the app's unlock opens the vault
+ * (`pinned`, from AppInfo.secrets.protected), why the rows above stay on and where that
+ * changes. Settings › Lock otherwise says nothing of the store: the Security page has it.
  */
-export function securityRowSub(mode: SecretsMode, pinned: boolean, problem: boolean): string {
-  if (problem) {
+export function securityRowSub(
+  mode: SecretsMode,
+  pinned: boolean,
+  problem: StoreProblem | null,
+): string {
+  if (problem === 'not_private') {
+    return 'Other accounts on this computer can change this target store: the Security page says how to fix it.';
+  }
+  if (problem !== null) {
     return "This target store's lock state cannot be used: the Security page says why.";
   }
   if (mode === 'locking' || mode === 'unlocking') {

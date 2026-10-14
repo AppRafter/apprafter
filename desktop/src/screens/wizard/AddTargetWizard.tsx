@@ -32,6 +32,7 @@ import type { TokenVerified } from '../../ipc/generated/TokenVerified';
 import { HETZNER_TOKEN_LEN, SUPPORTED_PROVIDERS, TIERS } from '../../ipc/generated/target';
 import type { UiError } from '../../ipc/generated/UiError';
 import { awayLine, failureOf, isCancelled, reportUnlessLocked, runPlan } from '../../ipc/plans';
+import { storeProblemOf } from '../../state/lockText';
 import { usePlatform } from '../../state/platform';
 import { useRead } from '../../state/read';
 import { useScope } from '../../state/scope';
@@ -538,7 +539,7 @@ export function AddTargetWizard({ onClose }: { onClose: () => void }) {
           label:
             state.draft !== null ? 'Continue' : verifying ? 'Verifying…' : 'Verify and continue',
           disabled: state.draft === null && tokenProblem(state.token) !== null,
-          hint: secretCopy(info.os, info.secrets.mode, info.secrets.problem !== null),
+          hint: secretCopy(info.os, info.secrets.mode, storeProblemOf(info.secrets.problem)),
           go: () => {
             if (state.draft !== null) dispatch({ type: 'go', step: 1 });
             else void verifyToken();

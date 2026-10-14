@@ -27,7 +27,7 @@ function show(more: Partial<LockSectionProps> = {}) {
       sessionEvents={{ lock: true, sleep: true }}
       mode="files"
       protectedStore={false}
-      storeProblem={false}
+      storeProblem={null}
       onSave={onSave}
       onLock={onLock}
       onOpenSecurity={onOpenSecurity}
@@ -111,13 +111,16 @@ describe('LockSection', () => {
   // Critic M2: the pins stay here, so their reason and their remedy are said here too.
   test("the row's sub: why the rows above stay on and where that changes, per state", () => {
     show({ mode: 'locked', protectedStore: true });
-    expect(screen.getByText(securityRowSub('locked', true, false))).toBeDefined();
+    expect(screen.getByText(securityRowSub('locked', true, null))).toBeDefined();
     cleanup();
     show({ mode: 'locking', protectedStore: true });
-    expect(screen.getByText(securityRowSub('locking', true, false))).toBeDefined();
+    expect(screen.getByText(securityRowSub('locking', true, null))).toBeDefined();
     cleanup();
-    show({ mode: 'locked', protectedStore: false, storeProblem: true });
-    expect(screen.getByText(securityRowSub('locked', false, true))).toBeDefined();
+    show({ mode: 'locked', protectedStore: false, storeProblem: 'lock_state' });
+    expect(screen.getByText(securityRowSub('locked', false, 'lock_state'))).toBeDefined();
+    cleanup();
+    show({ mode: 'locked', protectedStore: true, storeProblem: 'not_private' });
+    expect(screen.getByText(securityRowSub('locked', true, 'not_private'))).toBeDefined();
     cleanup();
     show();
     expect(screen.getByText(SECURITY_ROW_SUB)).toBeDefined();

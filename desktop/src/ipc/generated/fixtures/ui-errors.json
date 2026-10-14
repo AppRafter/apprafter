@@ -53,6 +53,16 @@
     "help": "This target store's secrets are encrypted, and the app holds no key for them: they were locked from a terminal while the app was open. Lock the app, then unlock it with the lock password.",
     "message": "the target store at /home/a/stores/work is locked, and there is no unlock window here"
   },
+  "storeNotPrivate": {
+    "causes": [],
+    "code": "apprafter::secrets::store_not_private",
+    "fields": {
+      "path": "/home/a/stores/work/targets",
+      "problem": "writable_by_others"
+    },
+    "help": "Whoever can replace a file there can swap in a token, a kubeconfig or a vault of their own and send your next deploy to a project or a cluster of their choosing. Move the target store to a folder only you can write, or fix that folder's owner and permissions; Doctor lists every folder and file concerned.",
+    "message": "other accounts can write to /home/a/stores/work/targets, so they could replace the target store's files there: AppRafter neither uses nor writes this store's secrets until that is fixed"
+  },
   "targetExists": {
     "causes": [],
     "code": "apprafter::target::exists",

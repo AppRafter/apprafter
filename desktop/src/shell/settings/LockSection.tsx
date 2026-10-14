@@ -32,6 +32,7 @@ import {
   OPEN_SECURITY,
   PINNED_SUB,
   SECURITY_ROW,
+  type StoreProblem,
   securityRowSub,
   unlockNote,
 } from '../../state/lockText';
@@ -46,8 +47,11 @@ export interface LockSectionProps {
   readonly mode: SecretsMode;
   /** The app's unlock opens the store's vault (AppInfo.secrets.protected): the pins apply. */
   readonly protectedStore: boolean;
-  /** The store's lock state cannot be used (AppInfo.secrets.problem): the Security row says so. */
-  readonly storeProblem: boolean;
+  /**
+   * What is wrong with the store, if anything (AppInfo.secrets.problem, storeProblemOf): the
+   * Security row says so.
+   */
+  readonly storeProblem: StoreProblem | null;
   readonly onSave: (change: Partial<Settings>) => void;
   readonly onLock: () => void;
   /** Shows the Security page (Settings closes): the store's own protection is there. */

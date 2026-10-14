@@ -10,7 +10,7 @@ import { DESKTOP_ERROR_CODES } from '../ipc/generated/errors';
 import type { Settings } from '../ipc/generated/Settings';
 import { PlatformContext } from '../state/platform';
 import { createQueryClient } from '../state/queryClient';
-import { appInfo, authInfo, STORE_PROBLEMS, settings } from '../test/fixtures';
+import { appInfo, authInfo, STORE_NOT_PRIVATE, STORE_PROBLEMS, settings } from '../test/fixtures';
 import { toolchainReport, whoamiReport } from '../test/flows';
 import { settleIpc } from '../test/settle';
 import { PlatformGate } from './PlatformGate';
@@ -437,6 +437,19 @@ describe('SettingsDialog', () => {
       expect(
         screen.getByText(
           "This target store's lock state cannot be used: the Security page says why.",
+        ),
+      ).toBeDefined();
+    },
+  );
+
+  // The controller's decision on critic M7 (WI-475): the row says what is wrong, and where.
+  test.each(STORE_NOT_PRIVATE)(
+    'a store other accounts can change: the Security row says so (%s)',
+    async (_state, secrets) => {
+      await open(appInfo({ secrets }));
+      expect(
+        screen.getByText(
+          'Other accounts on this computer can change this target store: the Security page says how to fix it.',
         ),
       ).toBeDefined();
     },

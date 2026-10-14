@@ -296,7 +296,7 @@ test("the token's line says when the store's lock state cannot be used (critic B
       report={targetReport()}
       os="linux"
       secretsMode="locked"
-      secretsProblem
+      secretsProblem="lock_state"
       actions={noop()}
       onChangeMachine={null}
     />,

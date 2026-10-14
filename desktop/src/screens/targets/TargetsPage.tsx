@@ -15,7 +15,12 @@ import { StatePanel } from '../../components/StatePanel';
 import { uiErrorOf } from '../../ipc/api';
 import type { TargetListReport } from '../../ipc/generated/TargetListReport';
 import type { UiError } from '../../ipc/generated/UiError';
-import { SECURITY_LINK, SECURITY_LINK_NAME, storeIndicator } from '../../state/lockText';
+import {
+  SECURITY_LINK,
+  SECURITY_LINK_NAME,
+  storeIndicator,
+  storeProblemOf,
+} from '../../state/lockText';
 import { usePlatform } from '../../state/platform';
 import { useTargetList } from '../../state/targets';
 import { useMakeDefault, useRemoveTarget } from '../target/actions';
@@ -148,7 +153,7 @@ function StoreLine({ onSecurity }: { onSecurity: () => void }) {
   const { secrets } = usePlatform();
   return (
     <div className="store-line">
-      <span>{storeIndicator(secrets.store, secrets.mode, secrets.problem !== null)}</span>
+      <span>{storeIndicator(secrets.store, secrets.mode, storeProblemOf(secrets.problem))}</span>
       <span aria-hidden="true">·</span>
       <Button size={26} variant="ghost" aria-label={SECURITY_LINK_NAME} onClick={onSecurity}>
         {SECURITY_LINK}

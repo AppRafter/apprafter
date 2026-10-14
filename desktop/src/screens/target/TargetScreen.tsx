@@ -20,6 +20,7 @@ import { uiErrorOf } from '../../ipc/api';
 import { CORE_ERROR_CODES, type ErrorAction, errorAction } from '../../ipc/errors';
 import type { UiError } from '../../ipc/generated/UiError';
 import { sectionInfo } from '../../shell/sections';
+import { storeProblemOf } from '../../state/lockText';
 import { usePlatform } from '../../state/platform';
 import { useTargetReport } from '../../state/targets';
 import { useTargetFlows } from '../flows';
@@ -107,7 +108,7 @@ export function TargetScreen({ name, onRenamed, onRemoved, onChangeMachine }: Ta
                 report={report.data}
                 os={info.os}
                 secretsMode={info.secrets.mode}
-                secretsProblem={info.secrets.problem !== null}
+                secretsProblem={storeProblemOf(info.secrets.problem)}
                 actions={{
                   rename: fresh(actions.rename),
                   renew: fresh(actions.renew),

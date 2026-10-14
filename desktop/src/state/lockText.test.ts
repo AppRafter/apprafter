@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 import { describe, expect, test } from 'bun:test';
+import UI_ERRORS from '../ipc/generated/fixtures/ui-errors.json';
 import type { HolderHardening } from '../ipc/generated/HolderHardening';
 import type { MachineLimit } from '../ipc/generated/MachineLimit';
 import type { SecretsMode } from '../ipc/generated/SecretsMode';
+import type { UiError } from '../ipc/generated/UiError';
+import { STORE_PROBLEMS } from '../test/fixtures';
 import * as lockText from './lockText';
 import {
   AGENT_NOTE,
@@ -19,12 +22,17 @@ import {
   recoveryKeyLine,
   SECURITY_ROW_SUB,
   SECURITY_SUB,
+  STORE_PROBLEM_REASON,
+  STORE_PROBLEM_SUB,
   secretsWord,
   securityRowSub,
   shortWarning,
   stopOutcome,
   stoppedSummary,
   storeIndicator,
+  storeProblemOf,
+  storeProblemReason,
+  storeProblemSub,
   terminalsLine,
   unlockNote,
 } from './lockText';
@@ -164,15 +172,24 @@ describe("this computer's limits (rule 1)", () => {
     coveredLine: () => [coveredLine([]), coveredLine(['a']), coveredLine(['a', 'b'])],
     secretsWord: () =>
       (['files', 'locking', 'locked', 'unlocking'] as const).flatMap((m) => [
-        secretsWord(m, false),
-        secretsWord(m, true),
+        secretsWord(m, null),
+        secretsWord(m, 'lock_state'),
+        secretsWord(m, 'not_private'),
       ]),
-    storeIndicator: () => [storeIndicator('~/s', 'locked', false)],
+    storeIndicator: () => [storeIndicator('~/s', 'locked', null)],
+    storeProblemOf: () => [
+      storeProblemOf(null),
+      storeProblemOf(UI_ERRORS.storeNotPrivate as UiError),
+      storeProblemOf(UI_ERRORS.vaultUnreadable as UiError),
+    ],
+    storeProblemSub: () => [storeProblemSub('lock_state'), storeProblemSub('not_private')],
+    storeProblemReason: () => [storeProblemReason('lock_state'), storeProblemReason('not_private')],
     securityRowSub: () =>
       (['files', 'locking', 'locked', 'unlocking'] as const).flatMap((m) => [
-        securityRowSub(m, false, false),
-        securityRowSub(m, true, false),
-        securityRowSub(m, true, true),
+        securityRowSub(m, false, null),
+        securityRowSub(m, true, null),
+        securityRowSub(m, true, 'lock_state'),
+        securityRowSub(m, true, 'not_private'),
       ]),
     lockFooter: () =>
       (['files', 'locking', 'locked', 'unlocking'] as const).flatMap((m) => [
@@ -386,33 +403,59 @@ describe('the Security page’s words (WI-476)', () => {
 
   test('the Security row says why the rows above stay on, and where that changes', () => {
     const all = ['files', 'locking', 'locked', 'unlocking'] as const;
-    expect(securityRowSub('files', false, false)).toBe(SECURITY_ROW_SUB);
-    expect(securityRowSub('locked', true, false)).toBe(
+    expect(securityRowSub('files', false, null)).toBe(SECURITY_ROW_SUB);
+    expect(securityRowSub('locked', true, null)).toBe(
       "This target store's secrets are protected, so the settings above stay on until you stop protecting them on the Security page.",
     );
     for (const mode of ['locking', 'unlocking'] as const) {
-      expect(securityRowSub(mode, true, false)).toBe(
+      expect(securityRowSub(mode, true, null)).toBe(
         "Changing this target store's protection was interrupted: the Security page offers to finish it.",
       );
     }
     // Not pinned (no vault opens): no claim that the rows stay on.
-    expect(securityRowSub('locked', false, false)).toBe(SECURITY_ROW_SUB);
+    expect(securityRowSub('locked', false, null)).toBe(SECURITY_ROW_SUB);
     for (const mode of all) {
-      expect(securityRowSub(mode, true, true)).toBe(
+      expect(securityRowSub(mode, true, 'lock_state')).toBe(
         "This target store's lock state cannot be used: the Security page says why.",
       );
     }
   });
 
   test('the Targets page’s line: the store and where its secrets are, never protected when it needs repair', () => {
-    expect(storeIndicator('~/.config/apprafter', 'locked', false)).toBe(
+    expect(storeIndicator('~/.config/apprafter', 'locked', null)).toBe(
       'Target store ~/.config/apprafter · Secrets: protected',
     );
-    expect(storeIndicator('~/s', 'files', false)).toBe('Target store ~/s · Secrets: in files');
-    expect(secretsWord('locking', false)).toBe('protecting was interrupted');
-    expect(secretsWord('unlocking', false)).toBe('stopping protection was interrupted');
+    expect(storeIndicator('~/s', 'files', null)).toBe('Target store ~/s · Secrets: in files');
+    expect(secretsWord('locking', null)).toBe('protecting was interrupted');
+    expect(secretsWord('unlocking', null)).toBe('stopping protection was interrupted');
     for (const mode of ['files', 'locking', 'locked', 'unlocking'] as const) {
-      expect(secretsWord(mode, true)).toBe('lock state cannot be used');
+      expect(secretsWord(mode, 'lock_state')).toBe('lock state cannot be used');
     }
+  });
+
+  // The controller's decision on critic M7: a store other accounts can change (WI-475) is said as
+  // such wherever the store's secrets are said — never "protected", never as its lock state.
+  test('a store other accounts can change: said as such, never protected or a lock state', () => {
+    expect(storeProblemOf(UI_ERRORS.storeNotPrivate as UiError)).toBe('not_private');
+    expect(storeProblemOf(null)).toBeNull();
+    for (const [, secrets] of STORE_PROBLEMS) {
+      expect(storeProblemOf(secrets.problem)).toBe('lock_state');
+    }
+    for (const mode of ['files', 'locking', 'locked', 'unlocking'] as const) {
+      expect(storeIndicator('~/s', mode, 'not_private')).toBe(
+        'Target store ~/s · Secrets: not used while other accounts can change this store',
+      );
+      expect(securityRowSub(mode, true, 'not_private')).toBe(
+        'Other accounts on this computer can change this target store: the Security page says how to fix it.',
+      );
+    }
+    expect(storeProblemSub('not_private')).toBe(
+      'Other accounts on this computer can change this target store.',
+    );
+    expect(storeProblemSub('lock_state')).toBe(STORE_PROBLEM_SUB);
+    expect(storeProblemReason('not_private')).toBe(
+      'Locked: other accounts on this computer can change this target store.',
+    );
+    expect(storeProblemReason('lock_state')).toBe(STORE_PROBLEM_REASON);
   });
 });
