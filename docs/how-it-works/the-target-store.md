@@ -77,6 +77,19 @@ it, and refuses the store if another account does
 `apprafter doctor` names each such folder, and each secret file another
 account owns, and changes nothing
 ([troubleshooting](../operator-guide/troubleshooting.md#store-folder-foreign)).
+
+Every folder AppRafter creates in the store — the store itself, `targets`
+and each target's folder, `auth`, `state` and each folder under it, `run` —
+is your account's alone from the moment it exists, whatever the umask: mode
+0700 on Linux and macOS, so a shared group's umask such as 002 does not make
+it group-writable, and on Windows a DACL that admits only your account and
+takes nothing from the folders above. A store AppRafter creates therefore
+passes the check above, and `apprafter target add` on a fresh store is not
+refused after it asked for a token. The folders the store sits in, such as
+`~/.config` when AppRafter has to create it, are created with your umask as
+any program creates them, and are not checked. A folder that is already
+there is never changed: one another account can change is refused, not
+fixed.
 `cli/cli-core/src/store_privacy.rs`, `cli/cli-core/src/owner_only.rs`.
 Each file is replaced whole: a save writes a temporary file
 beside it and renames that into place, so a reader sees the old version
@@ -146,7 +159,8 @@ gives it instead a DACL that admits only your account and takes
 nothing from the folders above, so a store kept in a folder other
 accounts can read keeps the token from them. `state.json` and the
 vault get the same on every write, and the age key when it is
-created (`cli/cli-core/src/owner_only.rs`). The age key is written whole to
+created, along with its folder when AppRafter creates that too
+(`cli/cli-core/src/owner_only.rs`). The age key is written whole to
 a temporary file beside it and takes its name only if no key is there yet,
 so a write that fails leaves no part of a key behind, and two commands that
 make it at once end with the same key; a key file that does not parse is

@@ -677,6 +677,11 @@ repository token, a backup passphrase. Commands that need no secret still run �
 and [`apprafter doctor`](#store-folder-foreign) lists every folder and secret
 file concerned.
 
+AppRafter creates every folder of the store your account's alone, whatever
+the umask, and never changes a folder that is already there. So the folder
+the message names was there before: created by hand, by another program, or
+by an earlier AppRafter release under a umask such as 002.
+
 On Linux and macOS a folder counts as writable by others when its mode lets
 others write to it — a sticky bit does not change that, since they can still
 create files in it — or lets its group write, unless that group is your

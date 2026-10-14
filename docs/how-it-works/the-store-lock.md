@@ -82,7 +82,10 @@ off`, `apprafter unlock` or a command's own prompt, a new one for `apprafter
 lock on`, a token, a backup passphrase
 ([`store_not_private`](../operator-guide/troubleshooting.md#store-not-private)),
 and `apprafter doctor` names each folder concerned
-([The target store on disk](the-target-store.md#file-layout)).
+([The target store on disk](the-target-store.md#file-layout)). A store
+AppRafter creates is your account's alone from its first folder, whatever
+the umask, so a command that creates one, such as the `apprafter target add`
+wizard on a fresh store, is never refused after it asked.
 
 ## Slots {#slots}
 
