@@ -49,10 +49,10 @@ use apprafter_core::{
 };
 use apprafter_desktop_ipc::{
     errors, AppInfo, AuthInfo, AuthMethod, AuthOutcome, AutoLock, CancelledBy, CatalogueSourceArg,
-    DraftId, Gesture, LockOnPlan, LockReason, LockState, OpEvent, OpId, OpState, OpSummary, Os,
-    OutputStream, PlanView, Quitting, Refresh, SecretsInfo, SessionEvents, Settings, Subscribed,
-    SubscriptionId, TargetAddArgs, Theme, TokenVerified, UiError, UnavailableReason,
-    ALLOWED_WHILE_LOCKED, COMMANDS, LOCK_CHANGED, QUITTING,
+    DraftId, Gesture, LockOffPlan, LockOnPlan, LockReason, LockSectionInfo, LockState, OpEvent,
+    OpId, OpState, OpSummary, Os, OutputStream, PlanView, Quitting, Refresh, SecretsInfo,
+    SessionEvents, Settings, Subscribed, SubscriptionId, TargetAddArgs, Theme, TokenVerified,
+    UiError, UnavailableReason, ALLOWED_WHILE_LOCKED, COMMANDS, LOCK_CHANGED, QUITTING,
 };
 use cli_core::Tier;
 use ts_rs::TS;
@@ -87,7 +87,7 @@ fn export_the_typescript_bindings() {
         // settings.rs
         Settings, Theme, AutoLock, Refresh,
         // lock.rs
-        LockState, LockReason, LockOnPlan,
+        LockState, LockReason, LockOnPlan, LockSectionInfo, LockOffPlan,
         // auth.rs
         AuthInfo, AuthOutcome, AuthMethod, CancelledBy, UnavailableReason,
         // app_info.rs

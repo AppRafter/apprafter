@@ -25,7 +25,13 @@ const INFO: AppInfo = {
   os: 'windows',
   desktopVersion: '0.1.0',
   coreVersion: '0.2.80',
-  secrets: { mode: 'files', slots: [] },
+  secrets: {
+    mode: 'files',
+    slots: [],
+    protected: false,
+    store: '~/.config/apprafter',
+    problem: null,
+  },
   account: 'alex',
   host: 'workstation',
   auth: {

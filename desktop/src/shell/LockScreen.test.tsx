@@ -215,7 +215,15 @@ describe('LockScreen', () => {
     cleanup();
     lockScreen(
       lockState(),
-      appInfo({ secrets: { mode: 'locked', slots: ['password', 'recovery_key'] } }),
+      appInfo({
+        secrets: {
+          mode: 'locked',
+          slots: ['password', 'recovery_key'],
+          protected: true,
+          store: '~/.config/apprafter',
+          problem: null,
+        },
+      }),
     );
     expect(
       screen.getByText('Clusters keep running. Credentials stay encrypted until you unlock.'),

@@ -11,6 +11,7 @@ pub mod errors;
 pub mod lock;
 pub mod menu;
 pub mod ops;
+pub mod protection;
 pub mod runtime;
 pub mod settings;
 pub mod signals;

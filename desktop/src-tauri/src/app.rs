@@ -62,8 +62,8 @@ use std::time::{Duration, Instant};
 
 use apprafter_core::Context;
 use apprafter_desktop_ipc::{
-    AppInfo, LockReason, LockState, OpId, Os, Quitting, SecretsInfo, SessionEvents, Settings,
-    SubscriptionId, LOCK_CHANGED, QUITTING,
+    AppInfo, LockReason, LockState, OpId, Os, Quitting, SessionEvents, Settings, SubscriptionId,
+    LOCK_CHANGED, QUITTING,
 };
 use apprafter_os_auth::{Listening, SessionEvent, SessionWatch};
 use tauri::ipc::Invoke;
@@ -80,6 +80,7 @@ use crate::env::ToolSearchPath;
 use crate::errors::{DesktopError, Refusal};
 use crate::lock::{LockChange, LockHook, LockMachine};
 use crate::ops::{panic_message, Clock, EventSink, Executor, OperationManager};
+use crate::protection::Protection;
 use crate::settings::SettingsStore;
 use crate::theme::Appearance;
 
@@ -441,11 +442,9 @@ impl Shell {
             os: current_os(),
             desktop_version: env!("CARGO_PKG_VERSION").into(),
             core_version: apprafter_core::VERSION.into(),
-            // Files until d4a-g reads the store's `store.yaml` here (D.4a §3.14, T74).
-            secrets: SecretsInfo {
-                mode: apprafter_core::secrets::SecretsMode::Files,
-                slots: Vec::new(),
-            },
+            // D.4a T74: read from store.yaml on every call (Task 15 makes it the shell's
+            // re-read, which also pins and locks).
+            secrets: Protection::read(self.context.config_root(), self.context.home_dir()).info(),
             account: whoami::username().unwrap_or_else(|_| UNKNOWN.into()),
             host: whoami::hostname().unwrap_or_else(|_| UNKNOWN.into()),
             auth: self
@@ -1232,14 +1231,34 @@ mod tests {
         assert!(!info.test_build);
         assert!(!info.account.is_empty() && !info.host.is_empty());
         assert_eq!(info.settings_notice, None);
-        // Files until d4a-g reads the store's `store.yaml` here (D.4a §3.14, T74).
+        // The rig's store is in files (D.4a §3.14, T74).
         assert_eq!(
             info.secrets,
             apprafter_desktop_ipc::SecretsInfo {
                 mode: apprafter_core::secrets::SecretsMode::Files,
                 slots: Vec::new(),
+                protected: false,
+                store: r.shell.context.config_root().display().to_string(),
+                problem: None,
             }
         );
+    }
+
+    /// D.4a T74: app_info reads store.yaml — a locked store's mode, slots and protection.
+    #[test]
+    fn app_info_reads_where_the_store_keeps_its_secrets() {
+        let r = rig(unlocked_at_start(), Arc::new(NoAuthenticator));
+        apprafter_core::secrets::testing::locked_store(r.shell.context.config_root(), &[]);
+        let info = r.shell.app_info();
+        assert_eq!(
+            info.secrets.mode,
+            apprafter_core::secrets::SecretsMode::Locked
+        );
+        assert_eq!(
+            info.secrets.slots,
+            vec![apprafter_core::secrets::LockSlotKind::RecoveryKey]
+        );
+        assert!(info.secrets.protected && info.secrets.problem.is_none());
     }
 
     #[test]

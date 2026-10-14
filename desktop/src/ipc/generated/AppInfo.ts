@@ -14,7 +14,7 @@ export type AppInfo = { os: Os, desktopVersion: string,
  */
 coreVersion: string, 
 /**
- * Where the target store keeps its secrets. Files until d4a-g reads `store.yaml` here.
+ * Where the target store keeps its secrets, read from `store.yaml` on every call.
  */
 secrets: SecretsInfo, 
 /**
