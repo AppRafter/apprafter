@@ -16,7 +16,7 @@ Four parts of the record below no longer describe the plan:
   unlock opens the vault through a slot, and on Linux the app's own password field replaces the
   polkit prompt there, because polkit yields no key.
 - Alternatives, "Keep secrets as they are and lock the UI only": this is now the state of a store
-  that is not locked. The Lock section says the lock then covers only the app's window, and
+  that is not locked. The desktop says the lock then covers only the app's window, and
   *Protect secrets* (`lock on`) encrypts the secrets, so the lock screen does not promise
   protection the storage lacks.
 - Risks, "macOS Keychain and unsigned binaries": signing no longer decides where secrets are

@@ -5,7 +5,9 @@
 `Accepted` (2026-10-12).
 
 Date: 2026-10-12; amended in place 2026-10-13 before implementation, with the answers to the
-questions the D.4a plan raised. ADR for `plan.md` Phase D (sub-phase D.4). Amends
+questions the D.4a plan raised, and §8's wording, with the phrase of ADR 0067's Status that
+quotes it, on 2026-10-14 (where the desktop shows the store's protection; the decision is
+unchanged). ADR for `plan.md` Phase D (sub-phase D.4). Amends
 [ADR 0067](0067-desktop-app-and-apprafter-core.md): it replaces the keyring bullet of its §5 and
 qualifies the other parts that ADR 0067's Status lists; §10 below names each.
 
@@ -232,14 +234,20 @@ ADR 0067 §2 describes.
   and `secrets_in_use`, information that a secret in use is in a process's memory and a
   kubeconfig in a file that programs running as the user can read.
 
-### 8. The desktop: one Lock section
+### 8. The desktop: one lock, in Settings › Lock and on the Security page
 
-The application lock and the store lock become one mechanism under one Settings section, **Lock**:
+*Wording amended in place on 2026-10-14: where the desktop shows the store's protection. The
+decision is unchanged.*
 
-1. *Require unlock* and *Lock when the computer sleeps or locks*, as today.
-2. *Protect secrets*. Off: "Secrets are in files; the lock only covers this app's window", with
-   **Protect** (`lock on`). On: "Secrets are encrypted; unlocking opens them".
-3. The slots, shown while protection is on: list, add and remove, recovery key, password change.
+The application lock and the store lock become one mechanism. Settings › **Lock** holds how the
+app locks; the target store's protection has a page of its own, **Security**, in the sidebar,
+which names the store and every target in it, because the lock covers the whole store:
+
+1. Settings › Lock: *Require unlock* and *Lock when the computer sleeps or locks*, as today.
+2. Security, *Protect secrets*. Off: "Secrets are in files; the lock only covers this app's
+   window", with **Protect** (`lock on`). On: "Secrets are encrypted; unlocking opens them".
+3. Security, the slots, shown while protection is on: list, add and remove, recovery key,
+   password change.
 
 While protection is on, *Require unlock*, *Lock when the app starts* and *Lock when the computer
 sleeps or locks* cannot be turned off, and *Auto-lock after inactivity* offers no *Never*: the
@@ -248,8 +256,9 @@ window does. The person's own choices are kept and return when protection is tur
 locked store that unlock goes through a slot: Windows Hello, now yielding a key; Touch ID once
 signed; on Linux, the app's own password field, feeding the OS-password or lock-password slot.
 polkit's dialog yields no key, so on Linux the password field replaces it for a locked store, and
-the section says so. The desktop does not use the terminal holder: it keeps the data key in its
-own process while the app is unlocked, and the app lock or sleep drops it.
+the desktop says so, in Settings › Lock and on the Security page. The desktop does not use the
+terminal holder: it keeps the data key in its own process while the app is unlocked, and the app
+lock or sleep drops it.
 
 Until a gesture slot exists, only the password and recovery-key slots open a locked store. How the
 desktop opens one on Windows and macOS in D.4a, where the system prompt the app lock uses yields
@@ -258,7 +267,8 @@ no key, and whether the PAM check stays on Linux, is open.
 ### 9. Staging and the test safety net
 
 - **D.4a:** the vault; `lock on`, `lock off`, `unlock`, `lock now`, `lock status`; the holder; the
-  password and recovery-key slots; the `doctor` and `status` rows; the desktop Lock section.
+  password and recovery-key slots; the `doctor` and `status` rows; the desktop's Security page
+  and Settings › Lock.
 - **D.4b:** the OS-password slot (Linux, macOS), the Windows Hello slot, and slot management
   (`lock slot add`, `remove` and `list`; `lock rekey`; `lock recovery`).
 - **Later:** the Touch ID slot, staged until the CLI is signed with a Developer ID.
@@ -281,8 +291,8 @@ Keychain.
   app's own password field replaces polkit there. It also changes the Risks entry "macOS Keychain
   and unsigned binaries": signing no longer decides where secrets are stored, and the Touch ID
   slot is staged after it. The rejected alternative "Keep secrets as they are and lock the UI
-  only" becomes the state of a store in files, with the Lock section saying that the lock then
-  covers only the app's window. The rest of §5 stands.
+  only" becomes the state of a store in files, with the desktop's Security page saying that the
+  lock then covers only the app's window. The rest of §5 stands.
 - **ADR 0030.** ADR 0067 superseded its "encryption out of scope" note for the age identity and
   the provider tokens. This record narrows that: the note is superseded for locked stores, whose
   secrets are encrypted at rest, and stands for stores in files.
@@ -442,7 +452,8 @@ Also open for the D.4a and D.4b plans:
 ## Owner
 
 Project maintainers (AppRafter core). This record was amended in place on 2026-10-13, before any
-of it was implemented; later amendments go through a follow-up ADR.
+of it was implemented, and §8's wording on 2026-10-14 (where the desktop shows the store's
+protection; the decision is unchanged); later amendments go through a follow-up ADR.
 
 ## Re-evaluation
 
