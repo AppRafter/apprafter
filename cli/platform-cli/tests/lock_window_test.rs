@@ -473,3 +473,69 @@ fn the_cli_is_not_dumpable_while_its_prompt_waits() {
     assert_eq!(t.step(), "now 0", "{}", t.screen());
     t.finish();
 }
+
+/// D.4a T66, T56 (d4a-f): `doctor` in an unlocked terminal reads the token through the window
+/// for its ping — asking nothing, with no terminal of its own — and its `secrets` row names
+/// the window; `doctor --no-ping` reads no token through it (every served item restarts the
+/// window), only says where the token is; after `lock now` the same doctor skips the token,
+/// saying the store is locked, and pings nothing. No run shows the token, and nothing typed is
+/// shown.
+#[test]
+fn doctor_reads_through_the_window_and_asks_nothing() {
+    let mut api = mockito::Server::new();
+    let ping = json_route(&mut api, "/v1/locations", 200, LOCATIONS_OK, TOKEN)
+        .expect(1)
+        .create();
+    let (sp, key, _) = store(&api.url());
+    let mut t = Terminal::start(
+        &sp,
+        r#""$1" unlock; echo "step: unlock $?"
+"$1" doctor </dev/null; echo "step: doctor $?"
+"$1" doctor --no-ping </dev/null; echo "step: doctor-no-ping $?"
+"$1" lock now; echo "step: now $?"
+"$1" doctor </dev/null; echo "step: doctor-locked $?""#,
+    );
+    t.shows(PROMPT, 1);
+    t.type_line(&key);
+    assert_eq!(t.step(), "unlock 0", "{}", t.screen());
+    assert!(t.step().starts_with("doctor "), "{}", t.screen());
+    assert!(t.step().starts_with("doctor-no-ping "), "{}", t.screen());
+    assert!(t.step().starts_with("now 0"), "{}", t.screen());
+    assert!(t.step().starts_with("doctor-locked "), "{}", t.screen());
+    let out = t.stdout();
+    assert_eq!(
+        out.matches("Token format valid (64 chars, alphanumeric)")
+            .count(),
+        1,
+        "{out}"
+    );
+    assert!(
+        out.contains("Secrets locked (1 slot: recovery key) (unlocked in this terminal, "),
+        "{out}"
+    );
+    assert_eq!(
+        out.matches("Token format valid (in the vault; read only with the ping)")
+            .count(),
+        1,
+        "{out}"
+    );
+    assert_eq!(
+        out.matches("Token format valid (the target store is locked)")
+            .count(),
+        1,
+        "{out}"
+    );
+    assert!(!out.contains(TOKEN), "the token reached stdout:\n{out}");
+    let screen = t.finish();
+    assert_eq!(screen.matches(PROMPT).count(), 1, "doctor asked:\n{screen}");
+    assert!(
+        !screen.contains(TOKEN),
+        "the token reached the terminal:\n{screen}"
+    );
+    let typed = key.split_once(' ').map_or(key.as_str(), |(_, rest)| rest);
+    assert!(
+        !screen.contains(typed),
+        "the typed key was shown:\n{screen}"
+    );
+    ping.assert();
+}
