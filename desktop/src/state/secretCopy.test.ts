@@ -1,17 +1,16 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 import { expect, test } from 'bun:test';
 import type { Os } from '../ipc/generated/Os';
-import type { SecretsMode } from '../ipc/generated/SecretsMode';
 import { secretCopy } from './secretCopy';
 
 const OSES: readonly Os[] = ['linux', 'macos', 'windows'];
 
-test("a protected store's token reads the same on every OS (D.4a D21)", () => {
-  const protectedModes: readonly SecretsMode[] = ['locking', 'locked', 'unlocking'];
+test("a protected store's token reads the same on every OS (D.4a D21), an interrupted one says so", () => {
   for (const os of OSES) {
-    for (const mode of protectedModes) {
-      expect(secretCopy(os, mode)).toBe("Encrypted in this target store's vault");
-    }
+    expect(secretCopy(os, 'locked')).toBe("Encrypted in this target store's vault");
+    expect(secretCopy(os, 'locking')).toContain('protecting was interrupted');
+    expect(secretCopy(os, 'unlocking')).toContain('stopping protection was interrupted');
+    expect(secretCopy(os, 'locked', true)).not.toContain('Encrypted');
   }
 });
 
