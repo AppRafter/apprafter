@@ -57,6 +57,8 @@ Install cue:
   • Windows    winget install CueLang.Cue
   • other      https://cuelang.org/docs/introduction/installation/
   ✓ DNS resolves `127.0.0.1` (443/tcp)
+  ℹ Secrets in files (readable by any program running as you)
+      hint: `apprafter lock on` encrypts them in a vault that opens only with your lock password or the recovery key
 
 14 checks for target `prod`: 9 passed, 5 warning(s). Ready to go; review warnings if they apply to your use case.
 [stderr]

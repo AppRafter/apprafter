@@ -18,6 +18,8 @@ use cli_core::style;
 /// The whole report as `apprafter doctor` prints it.
 pub(crate) fn render(report: &DoctorReport) -> String {
     let mut out = String::new();
+    // D.4a T66: every row a locked store skipped carries the same fix: its hint, once.
+    let mut unlock_said = false;
     for group in &report.groups {
         match (&group.id, &report.target) {
             (GroupId::Target, Some(name)) => writeln!(out, "Checking target `{name}`..."),
@@ -27,7 +29,7 @@ pub(crate) fn render(report: &DoctorReport) -> String {
         }
         .expect("writing to a String cannot fail");
         for check in &group.checks {
-            line(&mut out, check);
+            line(&mut out, check, &mut unlock_said);
         }
         out.push('\n');
     }
@@ -37,7 +39,7 @@ pub(crate) fn render(report: &DoctorReport) -> String {
 
 /// `  <glyph> <title> (<detail>)`, then the hint on its own indented line. `owo-colors`
 /// colours the glyph only on a TTY, so piped output and the goldens are plain.
-fn line(out: &mut String, c: &Check) {
+fn line(out: &mut String, c: &Check, unlock_said: &mut bool) {
     let glyph = match c.status {
         CheckStatus::Pass => style::ok("✓"),
         CheckStatus::Warn => style::warn("⚠"),
@@ -50,7 +52,8 @@ fn line(out: &mut String, c: &Check) {
         Some(d) => writeln!(out, "  {glyph} {} ({d})", c.title),
         None => writeln!(out, "  {glyph} {}", c.title),
     };
-    if let Some(h) = hint(c) {
+    let repeat = c.fix == Some(CheckFix::UnlockFirst) && std::mem::replace(unlock_said, true);
+    if let Some(h) = hint(c).filter(|_| !repeat) {
         let _ = writeln!(out, "      hint: {h}");
     }
 }
@@ -885,6 +888,48 @@ mod tests {
             vault.contains("`apprafter kubeconfig --refresh --target p`")
                 && !vault.contains("APPRAFTER_AGE_KEY"),
             "{vault}"
+        );
+    }
+
+    /// D.4a T66 (d4a-f): every row a locked store skipped carries the unlock as its fix; its
+    /// hint is printed once per report.
+    #[test]
+    fn the_unlock_hint_is_said_once() {
+        let skipped = |id| {
+            check(
+                id,
+                CheckStatus::Skipped,
+                "t",
+                Some("the target store is locked"),
+                Some(CheckFix::UnlockFirst),
+            )
+        };
+        let report = DoctorReport {
+            target: Some("prod".into()),
+            groups: vec![
+                CheckGroup {
+                    id: GroupId::Target,
+                    checks: vec![skipped(CheckId::TokenFormat)],
+                },
+                CheckGroup {
+                    id: GroupId::Cluster,
+                    checks: vec![
+                        skipped(CheckId::KubeApiReachable),
+                        skipped(CheckId::NodeSshReachable),
+                    ],
+                },
+            ],
+        };
+        let shown = plain(&render(&report));
+        assert_eq!(
+            shown.matches("hint: run `apprafter unlock`").count(),
+            1,
+            "{shown}"
+        );
+        assert_eq!(
+            shown.matches("(the target store is locked)").count(),
+            3,
+            "{shown}"
         );
     }
 }

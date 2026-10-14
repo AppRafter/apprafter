@@ -458,6 +458,15 @@ impl Shell {
         }
     }
 
+    /// What the OS reports of the session (`AppInfo.sessionEvents`), for doctor's
+    /// `sleep_unreported` row (D.4a T72, G11), as a call to make later: it waits as `app_info`
+    /// does while the session watch has not said (up to `SESSION_READY_WITHIN`), so a read
+    /// makes it on its worker, never on the command's thread.
+    pub fn session_events_later(&self) -> impl FnOnce() -> SessionEvents + Send + 'static {
+        let session = self.session.clone();
+        move || session.events()
+    }
+
     /// Save `settings` and apply them, through the lock machine (which refuses switching the
     /// lock on with nothing to verify the owner), and give the authenticator the saved ones;
     /// the settings now in use. The authenticator hears of them within the machine's settings

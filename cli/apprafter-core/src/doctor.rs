@@ -2,10 +2,11 @@
 //! Doctor (D.3 overview §3.9): the report a run produces, grouped, with a typed fix per row,
 //! and [`run`], the Read that produces it.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use cli_core::target::{validate_hetzner_token_format, TargetConfig};
-use cli_core::CliError;
+use cli_core::{CliError, SlotRefusal};
 use cli_state::{HetznerCloudState, State, StatePaths};
 use serde::Serialize;
 
@@ -13,12 +14,15 @@ use crate::cancel::CancellationToken;
 use crate::context::{Context, SecretString};
 use crate::error::{CoreError, CoreResult};
 use crate::kube::{Kube, KubeErrorKind, KubectlKube};
+use crate::lock::limits::{LimitClient, SshFacts};
+use crate::lock::{self, text, LockReport, MachineLimit, SlotRefusalView, SlotView, UnlockWindow};
 use crate::net;
 use crate::provider::{self, SUPPORTED_PROVIDERS};
 use crate::report::{Event, Reporter};
 use crate::runtime;
 use crate::secrets::{
-    CacheKeyView, DiagnosticAccess, OpenToken, SecretStore, SecretsMode, StoredToken, VaultAccess,
+    CacheKeyView, DiagnosticAccess, LockSlotKind, OpenToken, SecretStore, SecretsMode, StoredToken,
+    VaultAccess,
 };
 use crate::target_ref::TargetRef;
 use crate::tools::{self, ToolId, ToolProblem, ToolStatus};
@@ -32,10 +36,14 @@ pub enum DoctorTarget {
     CliDefault,
 }
 
-/// What a doctor run checks; `no_ping` comes from the context.
+/// What a doctor run checks; `no_ping` comes from the context. `window` and `client` are what
+/// only the client knows (D.4a T73): its unlock window on the store, and the facts behind the
+/// machine-limit rows (its terminal, its display, the SSH key and agent).
 #[derive(Debug, Clone)]
 pub struct DoctorArgs {
     pub target: DoctorTarget,
+    pub window: UnlockWindow,
+    pub client: LimitClient,
 }
 
 /// The groups, in report and print order.
@@ -343,7 +351,12 @@ pub fn run(
             ),
         });
     }
-    let name = match args.target {
+    let DoctorArgs {
+        target,
+        window,
+        client,
+    } = args;
+    let name = match target {
         DoctorTarget::Named(name) => Some(name),
         // R1: no `config.yaml` is no CLI default.
         DoctorTarget::CliDefault => cli_core::resolve_active_target_name(&ctx.store(), None)?,
@@ -381,7 +394,16 @@ pub fn run(
     stage(reporter, total, total, "This computer");
     groups.push(CheckGroup {
         id: GroupId::ThisComputer,
-        checks: this_computer_group(ctx, cancel)?,
+        checks: this_computer_group(
+            ctx,
+            &window,
+            &client,
+            match &lookup {
+                Lookup::Found(t) => Some(t.name()),
+                _ => None,
+            },
+            cancel,
+        )?,
     });
     // A token that tripped while the last check ran, after its own look at it: the run is
     // cancelled all the same, and an interrupted run has no report.
@@ -1289,14 +1311,457 @@ fn provider_failure(base: Check, name: &str, e: CoreError) -> Check {
     }
 }
 
-fn this_computer_group(ctx: &Context, cancel: &CancellationToken) -> CoreResult<Vec<Check>> {
+fn this_computer_group(
+    ctx: &Context,
+    window: &UnlockWindow,
+    client: &LimitClient,
+    checked: Option<&str>,
+    cancel: &CancellationToken,
+) -> CoreResult<Vec<Check>> {
     // Concurrent probes, each killed at TOOL_PROBE_TIMEOUT, in ToolId::ALL order.
     let toolchain = tools::toolchain(ctx, cancel)?;
     let mut out: Vec<Check> = toolchain.tools.iter().map(tool_check).collect();
     cancel.check()?;
     // The lookup ends within 50 ms of a cancel; `run` turns the row it leaves into `Cancelled`.
     out.push(dns_check(ctx, cancel));
+    // D.4a §3.13: the lock's rows, after the tools and DNS. The ssh-agent query among them
+    // waits up to 2 s and cannot be interrupted: a Ctrl-C is honoured before it.
+    cancel.check()?;
+    out.extend(lock_rows(ctx, window, client, checked));
     Ok(out)
+}
+
+/// The lock's rows (D.4a §3.13, T71–T73, O1): the store's lock state, the facts beside a locked
+/// store, and — on a locked or locking store — what this computer lets other programs running
+/// as you do and what the lock does not cover. They read `store.yaml`, the vault's header
+/// (parsed, never opened), the targets' markers, the vault file's metadata and the client's
+/// facts: never a secret, never a prompt, never a key derived.
+fn lock_rows(
+    ctx: &Context,
+    window: &UnlockWindow,
+    client: &LimitClient,
+    checked: Option<&str>,
+) -> Vec<Check> {
+    let mode = match ctx.secrets().mode() {
+        Ok(mode) => mode,
+        Err(e) => {
+            // T31: a store whose `store.yaml` cannot be read is treated as locked, so this
+            // computer's limits show too (rule 1).
+            let limits = lock::limits::detect_limits(ctx, client, window);
+            return std::iter::once(store_file_unreadable(&e))
+                .chain(limits.iter().filter_map(limit_check))
+                .collect();
+        }
+    };
+    let shows_limits = matches!(mode, SecretsMode::Locked | SecretsMode::Locking);
+    // A store whose limits are not shown asks no ssh-agent (its 2 s bound is for a row).
+    let asked = if shows_limits {
+        client.clone()
+    } else {
+        without_ssh(client)
+    };
+    let report = lock::status(ctx, window.clone(), &asked);
+    let mut rows = vec![secrets_row(mode, &report, window)];
+    if let (SecretsMode::Locked, Ok(r)) = (mode, &report) {
+        rows.extend(locked_facts(ctx, r, checked));
+    }
+    if shows_limits {
+        if let UnlockWindow::Open { hardening, .. } = window {
+            if let Some(line) = text::hardening_line(hardening) {
+                rows.push(Check {
+                    fix: Some(explain(HARDENING_FIX)),
+                    ..row(CheckId::WindowHardening, CheckStatus::Warn, line)
+                });
+            }
+        }
+        let limits = match &report {
+            Ok(r) => r.limits.clone(),
+            // A vault that cannot be read hides none of this computer's limits (rule 1).
+            Err(_) => lock::limits::detect_limits(ctx, client, window),
+        };
+        rows.extend(limits.iter().filter_map(limit_check));
+    }
+    rows
+}
+
+/// `client` without its SSH facts: nothing asks the ssh-agent.
+fn without_ssh(client: &LimitClient) -> LimitClient {
+    match client {
+        LimitClient::Cli { terminal, .. } => LimitClient::Cli {
+            terminal: terminal.clone(),
+            ssh: SshFacts::default(),
+        },
+        LimitClient::Desktop {
+            session_events,
+            display,
+            ..
+        } => LimitClient::Desktop {
+            session_events: *session_events,
+            display: *display,
+            ssh: SshFacts::default(),
+        },
+    }
+}
+
+fn explain(text: &str) -> CheckFix {
+    CheckFix::Explain {
+        text: text.to_string(),
+    }
+}
+
+/// A refusal's own help, for a row's explanation: the store's words, never a secret.
+fn help_of(e: &CliError) -> String {
+    miette::Diagnostic::help(e)
+        .map(|h| h.to_string())
+        .unwrap_or_else(|| e.to_string())
+}
+
+/// The `secrets` row (§3.13).
+fn secrets_row(mode: SecretsMode, report: &CoreResult<LockReport>, window: &UnlockWindow) -> Check {
+    match (mode, report) {
+        (SecretsMode::Files, _) => Check {
+            fix: Some(CheckFix::ProtectSecrets),
+            ..row(
+                CheckId::Secrets,
+                CheckStatus::Info,
+                "Secrets in files (readable by any program running as you)",
+            )
+        },
+        (SecretsMode::Locking | SecretsMode::Unlocking, _) => Check {
+            fix: Some(CheckFix::FinishLock { phase: mode }),
+            ..row(
+                CheckId::Secrets,
+                CheckStatus::Fail,
+                if mode == SecretsMode::Locking {
+                    "Secrets: turning the lock on did not finish"
+                } else {
+                    "Secrets: turning the lock off did not finish"
+                },
+            )
+        },
+        (SecretsMode::Locked, Ok(r)) => Check {
+            detail: Some(text::window_words(window)),
+            ..row(
+                CheckId::Secrets,
+                CheckStatus::Pass,
+                format!("Secrets locked ({})", text::slot_count(&r.slots)),
+            )
+        },
+        (SecretsMode::Locked, Err(e)) => Check {
+            detail: Some(e.to_string()),
+            fix: Some(explain(&match e {
+                CoreError::Cli(cli) => help_of(cli),
+                other => other.to_string(),
+            })),
+            ..row(
+                CheckId::Secrets,
+                CheckStatus::Fail,
+                "Secrets locked, but the vault cannot be read",
+            )
+        },
+    }
+}
+
+/// `store.yaml` cannot be read (T31): the store is treated as locked, and this is why.
+fn store_file_unreadable(e: &CliError) -> Check {
+    Check {
+        detail: Some(e.to_string()),
+        fix: Some(explain(&help_of(e))),
+        ..row(
+            CheckId::Secrets,
+            CheckStatus::Fail,
+            "Secrets: whether they are locked cannot be read",
+        )
+    }
+}
+
+const SLOT_DRIFT_FIX: &str = "store.yaml only mirrors the vault's slots for display: the vault \
+     decides what opens it, so an edit there adds or removes no slot. `apprafter lock status` \
+     lists the vault's own.";
+#[cfg(unix)]
+const FOREIGN_OWNER_FIX: &str = "AppRafter running as you did not write a vault another account \
+     owns. Restore it from a backup you trust.";
+const NO_RECOVERY_FIX: &str = "Without a recovery key, a forgotten lock password loses every \
+     secret in the vault. While the lock password still opens it, run `apprafter lock off` and \
+     then `apprafter lock on`, which makes a new recovery key.";
+const HARDENING_FIX: &str = "The operating system refused one of the protections the unlock \
+     window's holder puts on its key; the window works without it. `apprafter lock now` ends \
+     the window.";
+
+/// The facts beside a locked store (§3.13), each a warning: a slot list in `store.yaml` unlike
+/// the vault's (T29), a slot this build refuses or no recovery-key slot (T22, O8), the vault
+/// file's mode or owner (T27), an override variable set (T35), another target's token this
+/// store never uses (T42, T34) and another target's kubeconfig in clear (T38, overview rule 2:
+/// never used, always reported). The target `checked` has its own token and kubeconfig rows.
+fn locked_facts(ctx: &Context, r: &LockReport, checked: Option<&str>) -> Vec<Check> {
+    let secrets = ctx.secrets();
+    let mut rows = Vec::new();
+    if let Ok(Some(file)) = secrets.store_file() {
+        let mirrored: Vec<(LockSlotKind, &str)> = file
+            .slots
+            .iter()
+            .map(|s| (s.kind, s.label.as_str()))
+            .collect();
+        let held: Vec<(LockSlotKind, &str)> =
+            r.slots.iter().map(|s| (s.kind, s.label.as_str())).collect();
+        if mirrored != held {
+            rows.push(Check {
+                fix: Some(explain(SLOT_DRIFT_FIX)),
+                ..row(
+                    CheckId::Secrets,
+                    CheckStatus::Warn,
+                    "The slot list in store.yaml differs from the vault's",
+                )
+            });
+        }
+    }
+    rows.extend(slot_facts(&r.slots, ctx.config_root()));
+    #[cfg(unix)]
+    rows.extend(vault_file_rows(ctx));
+    let o = ctx.overrides();
+    rows.extend(override_rows(
+        o.hetzner_token.is_some(),
+        o.age_key.is_some(),
+        ctx.config_root(),
+    ));
+    for name in cli_core::list_target_names(&ctx.store()).unwrap_or_default() {
+        if Some(name.as_str()) == checked {
+            continue;
+        }
+        let token = match secrets.token_presence(&name) {
+            Ok(StoredToken::OutsideVault) => Some((
+                RenewWhy::TokenOutsideVault,
+                "holds a token in clear, which this locked store never uses",
+            )),
+            Ok(StoredToken::InAnotherVault { .. }) => Some((
+                RenewWhy::TokenInAnotherVault,
+                "names another target store's vault",
+            )),
+            _ => None,
+        };
+        if let Some((why, what)) = token {
+            rows.push(Check {
+                fix: Some(CheckFix::RenewToken {
+                    target: name.clone(),
+                    why,
+                }),
+                ..row(
+                    CheckId::Secrets,
+                    CheckStatus::Warn,
+                    format!("Target `{name}`'s credentials file {what}"),
+                )
+            });
+        }
+        // A state file that cannot be read is that target's own doctor run's to report.
+        let paths = StatePaths::for_active_target(&ctx.store(), &name);
+        let clear_kubeconfig = State::load_or_default(&paths)
+            .ok()
+            .and_then(|state| state.hetzner_cloud)
+            .is_some_and(|s| s.kubeconfig_yaml.is_some());
+        if clear_kubeconfig {
+            rows.push(Check {
+                fix: Some(CheckFix::FetchKubeconfig {
+                    target: name.clone(),
+                }),
+                ..row(
+                    CheckId::Secrets,
+                    CheckStatus::Warn,
+                    format!(
+                        "Target `{name}`'s state file holds a kubeconfig in clear, which this \
+                         locked store never uses"
+                    ),
+                )
+            });
+        }
+    }
+    rows
+}
+
+/// A slot this build refuses (T22) and a vault with no recovery-key slot (O8), each a warning:
+/// a refused password slot is either faster to guess offline than this build allows or cannot
+/// open the vault, and without a recovery key a forgotten lock password loses the vault. Read
+/// from the report's slot views: nothing is derived.
+fn slot_facts(slots: &[SlotView], store: &Path) -> Vec<Check> {
+    let mut rows: Vec<Check> = slots
+        .iter()
+        .filter_map(|s| {
+            let (reason, what) = match s.refused? {
+                SlotRefusalView::KdfTooWeak => (
+                    SlotRefusal::KdfTooWeak,
+                    "weaker than this AppRafter accepts: a copy of the vault is faster to guess \
+                     than it allows",
+                ),
+                SlotRefusalView::KdfOutOfRange => (
+                    SlotRefusal::KdfOutOfRange,
+                    "beyond what this AppRafter computes: it cannot open the vault",
+                ),
+            };
+            let refusal = CliError::SlotRefused {
+                store: store.to_path_buf(),
+                reason,
+            };
+            Some(Check {
+                fix: Some(explain(&help_of(&refusal))),
+                ..row(
+                    CheckId::Secrets,
+                    CheckStatus::Warn,
+                    format!("The `{}` slot uses key-derivation settings {what}", s.label),
+                )
+            })
+        })
+        .collect();
+    if !slots.iter().any(|s| s.kind == LockSlotKind::RecoveryKey) {
+        rows.push(Check {
+            fix: Some(explain(NO_RECOVERY_FIX)),
+            ..row(
+                CheckId::Secrets,
+                CheckStatus::Warn,
+                "The vault has no recovery-key slot",
+            )
+        });
+    }
+    rows
+}
+
+/// The vault file's mode and owner (T27: a wider mode or a foreign owner is a warning, never a
+/// refusal). The owner is compared with the store directory's: no process identity is read.
+#[cfg(unix)]
+fn vault_file_rows(ctx: &Context) -> Vec<Check> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let path = ctx.config_root().join(crate::vault::VAULT_FILE);
+    // Unreadable: the `secrets` row already says why.
+    let Ok(meta) = std::fs::metadata(&path) else {
+        return Vec::new();
+    };
+    let shown = path.display().to_string();
+    let mut rows = Vec::new();
+    let mode = meta.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        rows.push(Check {
+            detail: Some(shown.clone()),
+            fix: Some(CheckFix::Chmod {
+                path: shown.clone(),
+                mode: 0o600,
+            }),
+            ..row(
+                CheckId::Secrets,
+                CheckStatus::Warn,
+                format!("Vault file mode 0600 (got {mode:o})"),
+            )
+        });
+    }
+    if let Ok(root) = std::fs::metadata(ctx.config_root()) {
+        if root.uid() != meta.uid() {
+            rows.push(Check {
+                detail: Some(shown),
+                fix: Some(explain(FOREIGN_OWNER_FIX)),
+                ..row(
+                    CheckId::Secrets,
+                    CheckStatus::Warn,
+                    "The vault file belongs to another account than its target store",
+                )
+            });
+        }
+    }
+    rows
+}
+
+/// `HCLOUD_TOKEN` / `APPRAFTER_AGE_KEY` set beside a locked store (T35): named, never shown,
+/// with the refusal's own help (T70: a store of its own for a value from the environment).
+fn override_rows(hcloud: bool, age_key: bool, store: &Path) -> Vec<Check> {
+    [
+        (hcloud, cli_core::HCLOUD_TOKEN_ENV),
+        (age_key, cli_core::secrets::AGE_KEY_ENV),
+    ]
+    .into_iter()
+    .filter(|(set, _)| *set)
+    .map(|(_, var)| {
+        let refusal = CliError::OverrideOnLockedStore {
+            var,
+            store: store.to_path_buf(),
+        };
+        Check {
+            fix: Some(explain(&help_of(&refusal))),
+            ..row(
+                CheckId::Secrets,
+                CheckStatus::Warn,
+                format!("{var} is set, and this locked store refuses it"),
+            )
+        }
+    })
+    .collect()
+}
+
+const X11_FIX: &str = "Under X11 any program running as you can read what you type, the lock \
+     password included. A Wayland session, with a Wayland-native terminal, closes this.";
+const PTRACE_FIX: &str = "Set the kernel.yama.ptrace_scope sysctl to 1, so that only a parent \
+     process can attach to another.";
+const WINDOWS_FIX: &str = "Any program running as you can attach itself to an unlocked console. \
+     Unlock in a console of its own, keep the window short, and run AI agents under a separate \
+     Standard Windows account.";
+const MACOS_FIX: &str = "Whether such a program can read another's memory depends on this \
+     Mac's debugging settings. Run AI agents under a separate Standard macOS account.";
+const INHERITED_FIX: &str = "Start AI agents in another terminal, or end the window with \
+     `apprafter lock now`.";
+const SLEEP_FIX: &str = "Lock the app yourself before the computer sleeps, and keep its \
+     auto-lock short.";
+const IN_USE_FIX: &str = "`apprafter open argocd` also puts the Argo CD password on the \
+     clipboard and forwards a local port any program on this computer can connect to, and a \
+     kubeconfig saved with `apprafter kubeconfig` stays where it was saved, outside the lock.";
+const SAME_USER_FIX: &str = "The lock stops an AI agent that oversteps; one that sets out to get \
+     past it — an agent turned by a prompt injection, for example — it only slows. Run AI agents \
+     under a separate OS account without administrator rights, or in a sandbox that cannot \
+     reach your terminals, files or ssh-agent.";
+const HIBERNATION_FIX: &str = "End every unlock window before this computer hibernates: run \
+     `apprafter lock now` in each terminal you unlocked, and lock the app.";
+
+/// A limit of this computer as a doctor row (§3.13): its id, the weight and the sentence of
+/// `lock status`'s line (`lock::text`), and its fix. The holder base's fallback is a `lock
+/// status` line only.
+fn limit_check(l: &MachineLimit) -> Option<Check> {
+    let fix = match l {
+        MachineLimit::X11Session | MachineLimit::Xwayland { .. } => explain(X11_FIX),
+        MachineLimit::PtraceScope { .. } => explain(PTRACE_FIX),
+        MachineLimit::WindowsSameUser => explain(WINDOWS_FIX),
+        MachineLimit::MacosTaskPort => explain(MACOS_FIX),
+        MachineLimit::Multiplexer { name } => CheckFix::Explain {
+            text: format!(
+                "Programs running as you can send keystrokes to this terminal through {name}'s \
+                 own commands, into an unlocked window too. Unlock in a terminal outside {name}."
+            ),
+        },
+        MachineLimit::InheritedWindow => explain(INHERITED_FIX),
+        MachineLimit::SleepUnreported => explain(SLEEP_FIX),
+        MachineLimit::SshKeyUsable { path, .. } => CheckFix::ProtectSshKey { path: path.clone() },
+        MachineLimit::SecretsInUse => explain(IN_USE_FIX),
+        MachineLimit::SameUserPrograms => explain(SAME_USER_FIX),
+        MachineLimit::Hibernation => explain(HIBERNATION_FIX),
+        MachineLimit::RuntimeDirFallback { .. } => return None,
+    };
+    let id = match l {
+        MachineLimit::X11Session | MachineLimit::Xwayland { .. } => CheckId::X11Keystrokes,
+        MachineLimit::PtraceScope { .. } => CheckId::PtraceScope,
+        MachineLimit::WindowsSameUser => CheckId::WindowsSameUser,
+        MachineLimit::MacosTaskPort => CheckId::MacosTaskPort,
+        MachineLimit::Multiplexer { .. } => CheckId::TerminalMultiplexer,
+        MachineLimit::InheritedWindow => CheckId::UnlockedTerminal,
+        MachineLimit::SleepUnreported => CheckId::SleepUnreported,
+        MachineLimit::SshKeyUsable { .. } => CheckId::SshKeyExposure,
+        MachineLimit::SecretsInUse => CheckId::SecretsInUse,
+        MachineLimit::SameUserPrograms => CheckId::SameUserPrograms,
+        MachineLimit::Hibernation => CheckId::Hibernation,
+        MachineLimit::RuntimeDirFallback { .. } => return None,
+    };
+    let line = text::limit_line(l)?;
+    let status = if line.warn {
+        CheckStatus::Warn
+    } else {
+        CheckStatus::Info
+    };
+    Some(Check {
+        fix: Some(fix),
+        ..row(id, status, line.text)
+    })
 }
 
 /// One tool row from the resolver's probe (D.3a semantics: a run that exited 0 has no
@@ -1426,6 +1891,9 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use crate::lock::limits::{DisplayKind, LimitClient, SshFacts, TerminalFacts};
+    use crate::lock::{HolderHardening, MachineLimit, UnlockWindow};
+
     const TOKEN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const OFFLINE: &str = "http://127.0.0.1:1";
 
@@ -1483,9 +1951,31 @@ mod tests {
     }
 
     fn doctor(ctx: &Context, target: DoctorTarget) -> DoctorReport {
+        doctor_with(ctx, target, UnlockWindow::NoTerminal, quiet())
+    }
+
+    /// The CLI's client with no terminal and no SSH facts: no limit row depends on the host
+    /// beyond what `detect_limits` reads itself (Yama, the OS).
+    fn quiet() -> LimitClient {
+        LimitClient::Cli {
+            terminal: None,
+            ssh: SshFacts::default(),
+        }
+    }
+
+    fn doctor_with(
+        ctx: &Context,
+        target: DoctorTarget,
+        window: UnlockWindow,
+        client: LimitClient,
+    ) -> DoctorReport {
         run(
             ctx,
-            DoctorArgs { target },
+            DoctorArgs {
+                target,
+                window,
+                client,
+            },
             &NullReporter,
             &CancellationToken::new(),
         )
@@ -1923,7 +2413,12 @@ mod tests {
         let cli: Vec<&str> = cli_core::tools::ALL.iter().map(|t| t.name).collect();
         assert_eq!(tools, cli, "every binary the CLI spawns is checked (D11)");
         assert_eq!(tools, ["restic", "kubectl", "helm", "git", "ssh", "cue"]);
-        assert_eq!(env.last().unwrap().id, CheckId::Dns);
+        // D.4a §3.13 (d4a-f): the lock's rows follow DNS, starting with `secrets`.
+        let dns = env
+            .iter()
+            .position(|c| c.id == CheckId::Dns)
+            .expect("a DNS row");
+        assert_eq!(env[dns + 1].id, CheckId::Secrets, "{env:?}");
         // Empty search path: the required tool fails, the rest warn.
         let kubectl = env
             .iter()
@@ -2058,7 +2553,10 @@ mod tests {
             &ctx(&f, OFFLINE).with_no_ping(true),
             DoctorTarget::CliDefault,
         );
-        let dns = group(&r, GroupId::ThisComputer).last().unwrap().clone();
+        let dns = group(&r, GroupId::ThisComputer)
+            .into_iter()
+            .find(|c| c.id == CheckId::Dns)
+            .expect("a DNS row");
         assert_eq!(dns.title, "DNS resolves `127.0.0.1`");
         assert_eq!(dns.status, CheckStatus::Pass);
         assert_eq!(dns.detail.as_deref(), Some("443/tcp"));
@@ -2072,7 +2570,10 @@ mod tests {
             &ctx(&f, "https://doctor-probe-host.invalid").with_no_ping(true),
             DoctorTarget::CliDefault,
         );
-        let dns = group(&r, GroupId::ThisComputer).last().unwrap().clone();
+        let dns = group(&r, GroupId::ThisComputer)
+            .into_iter()
+            .find(|c| c.id == CheckId::Dns)
+            .expect("a DNS row");
         assert_eq!(dns.status, CheckStatus::Fail);
         assert_eq!(
             dns.fix,
@@ -2090,7 +2591,11 @@ mod tests {
             let reporter = CollectReporter::new();
             run(
                 &ctx,
-                DoctorArgs { target },
+                DoctorArgs {
+                    target,
+                    window: UnlockWindow::NoTerminal,
+                    client: quiet(),
+                },
                 &reporter,
                 &CancellationToken::new(),
             )
@@ -2135,6 +2640,8 @@ mod tests {
             &ctx(&f, OFFLINE),
             DoctorArgs {
                 target: DoctorTarget::CliDefault,
+                window: UnlockWindow::NoTerminal,
+                client: quiet(),
             },
             &NullReporter,
             &cancel,
@@ -2158,6 +2665,8 @@ mod tests {
             &ctx,
             DoctorArgs {
                 target: DoctorTarget::CliDefault,
+                window: UnlockWindow::NoTerminal,
+                client: quiet(),
             },
             &NullReporter,
             cancel,
@@ -3253,6 +3762,522 @@ mod tests {
         assert!(
             tokens.load(std::sync::atomic::Ordering::SeqCst) >= 1,
             "the ping reads its token through the window"
+        );
+    }
+
+    /// The "This computer" rows from the `secrets` row on.
+    fn lock_part(r: &DoctorReport) -> Vec<Check> {
+        let all = group(r, GroupId::ThisComputer);
+        let at = all
+            .iter()
+            .position(|c| c.id == CheckId::Secrets)
+            .expect("a secrets row");
+        all[at..].to_vec()
+    }
+
+    fn open_window(left_secs: u64, memory_locked: bool) -> UnlockWindow {
+        UnlockWindow::Open {
+            left_secs,
+            minutes: 5,
+            holder_version: env!("CARGO_PKG_VERSION").into(),
+            hardening: HolderHardening {
+                non_dumpable: Some(true),
+                deny_attach: None,
+                core_off: true,
+                memory_locked,
+                process_dacl: None,
+            },
+        }
+    }
+
+    fn in_tmux() -> LimitClient {
+        LimitClient::Cli {
+            terminal: Some(TerminalFacts {
+                multiplexer: Some("tmux".into()),
+                x_client: None,
+                display: DisplayKind::None,
+            }),
+            ssh: SshFacts::default(),
+        }
+    }
+
+    fn locked_at(f: &Fx, targets: &[(&str, Option<&str>)]) -> PathBuf {
+        let root = f.root.join("config");
+        crate::secrets::testing::locked_store(&root, targets);
+        root
+    }
+
+    /// D.4a T71, §3.13: a store in files is one fact, not a verdict — Info, its fix `lock on`,
+    /// in no total — and no limit of this computer: those qualify a lock.
+    #[test]
+    fn a_store_in_files_is_one_fact_and_no_limit() {
+        let f = fx();
+        let ctx = ctx(&f, OFFLINE).with_no_ping(true);
+        add(&ctx, "prod", "hetzner-cloud", Some(TOKEN), None);
+        let r = doctor_with(&ctx, named("prod"), UnlockWindow::NoTerminal, in_tmux());
+        let rows = lock_part(&r);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(
+            (rows[0].status, rows[0].title.as_str(), rows[0].fix.clone()),
+            (
+                CheckStatus::Info,
+                "Secrets in files (readable by any program running as you)",
+                Some(CheckFix::ProtectSecrets)
+            )
+        );
+        assert_eq!(r.informed(), 1);
+    }
+
+    /// §3.13, T73, O1: a locked store names its slots and this terminal's window, and lists
+    /// what this computer lets programs running as you do and what the lock does not cover.
+    #[test]
+    fn a_locked_store_names_its_slots_its_window_and_its_limits() {
+        let f = fx();
+        locked_at(&f, &[("prod", Some(TOKEN))]);
+        let ctx = ctx(&f, OFFLINE).with_no_ping(true);
+        let rows = lock_part(&doctor_with(
+            &ctx,
+            named("prod"),
+            open_window(170, true),
+            in_tmux(),
+        ));
+        assert_eq!(
+            (
+                rows[0].status,
+                rows[0].title.as_str(),
+                rows[0].detail.as_deref()
+            ),
+            (
+                CheckStatus::Pass,
+                "Secrets locked (1 slot: recovery key)",
+                Some("unlocked in this terminal, 3 min left")
+            )
+        );
+        let by = |id| {
+            rows.iter()
+                .find(|c| c.id == id)
+                .unwrap_or_else(|| panic!("no {id:?} row: {rows:?}"))
+        };
+        assert_eq!(
+            by(CheckId::TerminalMultiplexer).title,
+            "This terminal runs inside tmux: programs running as you can type into it"
+        );
+        for id in [
+            CheckId::UnlockedTerminal,
+            CheckId::SecretsInUse,
+            CheckId::SameUserPrograms,
+            CheckId::Hibernation,
+        ] {
+            assert_eq!(by(id).status, CheckStatus::Info, "{id:?}");
+        }
+        assert!(rows.iter().all(|c| c.id != CheckId::WindowHardening));
+        #[cfg(windows)]
+        assert_eq!(by(CheckId::WindowsSameUser).status, CheckStatus::Warn);
+        #[cfg(target_os = "macos")]
+        assert_eq!(by(CheckId::MacosTaskPort).status, CheckStatus::Info);
+    }
+
+    /// §3.13: an interrupted `lock on` or `lock off` fails with the way to finish it; the
+    /// limits show while locking, not while unlocking (the store is going back to files).
+    #[test]
+    fn an_interrupted_lock_fails_with_the_way_to_finish_it() {
+        for (phase, title, limits) in [
+            (
+                SecretsMode::Locking,
+                "Secrets: turning the lock on did not finish",
+                true,
+            ),
+            (
+                SecretsMode::Unlocking,
+                "Secrets: turning the lock off did not finish",
+                false,
+            ),
+        ] {
+            let f = fx();
+            let root = locked_at(&f, &[("prod", Some(TOKEN))]);
+            let yaml = root.join(crate::secrets::STORE_FILE);
+            let text = std::fs::read_to_string(&yaml).unwrap();
+            assert!(text.contains("secrets: locked\n"), "{text}");
+            std::fs::write(
+                &yaml,
+                text.replace(
+                    "secrets: locked\n",
+                    &format!("secrets: {}\n", phase.as_str()),
+                ),
+            )
+            .unwrap();
+            let ctx = ctx(&f, OFFLINE).with_no_ping(true);
+            let rows = lock_part(&doctor_with(
+                &ctx,
+                named("prod"),
+                UnlockWindow::Closed,
+                quiet(),
+            ));
+            assert_eq!(
+                (rows[0].status, rows[0].title.as_str(), rows[0].fix.clone()),
+                (
+                    CheckStatus::Fail,
+                    title,
+                    Some(CheckFix::FinishLock { phase })
+                )
+            );
+            assert_eq!(
+                rows.iter().any(|c| c.id == CheckId::SecretsInUse),
+                limits,
+                "{phase:?}"
+            );
+        }
+    }
+
+    /// Rules 1 and 3, §3.13: a vault that cannot be read fails the `secrets` row with the
+    /// store's own help, and hides none of this computer's limits.
+    #[test]
+    fn a_vault_that_cannot_be_read_fails_and_the_limits_still_show() {
+        let f = fx();
+        let root = locked_at(&f, &[("prod", Some(TOKEN))]);
+        std::fs::write(root.join(crate::vault::VAULT_FILE), b"not a vault").unwrap();
+        let ctx = ctx(&f, OFFLINE).with_no_ping(true);
+        let rows = lock_part(&doctor_with(
+            &ctx,
+            named("prod"),
+            UnlockWindow::Closed,
+            quiet(),
+        ));
+        assert_eq!(
+            (rows[0].status, rows[0].title.as_str()),
+            (
+                CheckStatus::Fail,
+                "Secrets locked, but the vault cannot be read"
+            )
+        );
+        assert!(
+            matches!(&rows[0].fix, Some(CheckFix::Explain { text }) if text.contains("backup")),
+            "{:?}",
+            rows[0].fix
+        );
+        assert!(
+            rows.iter().any(|c| c.id == CheckId::SecretsInUse),
+            "{rows:?}"
+        );
+    }
+
+    /// T31, rule 1: a `store.yaml` that cannot be read fails the `secrets` row with the
+    /// store's own help — the store is treated as locked, so this computer's limits show too.
+    #[test]
+    fn a_store_file_that_cannot_be_read_fails_and_the_limits_still_show() {
+        let f = fx();
+        let root = locked_at(&f, &[("prod", Some(TOKEN))]);
+        std::fs::write(
+            root.join(crate::secrets::STORE_FILE),
+            b"secrets: [not yaml\n",
+        )
+        .unwrap();
+        let ctx = ctx(&f, OFFLINE).with_no_ping(true);
+        let rows = lock_part(&doctor_with(
+            &ctx,
+            named("prod"),
+            UnlockWindow::Closed,
+            quiet(),
+        ));
+        assert_eq!(
+            (rows[0].status, rows[0].title.as_str()),
+            (
+                CheckStatus::Fail,
+                "Secrets: whether they are locked cannot be read"
+            )
+        );
+        assert!(
+            matches!(&rows[0].fix, Some(CheckFix::Explain { text }) if text.contains("never delete it")),
+            "{:?}",
+            rows[0].fix
+        );
+        assert!(
+            rows.iter().any(|c| c.id == CheckId::SecretsInUse),
+            "{rows:?}"
+        );
+    }
+
+    /// §3.13: the facts beside a locked store, each a warning with its fix — a slot list in
+    /// store.yaml unlike the vault's, a vault file others can read, another target's clear
+    /// token or foreign marker, another target's clear kubeconfig — and the target checked is
+    /// its own rows', never repeated here. A healthy vault (its recovery-key slot, no refused
+    /// slot) adds no slot fact.
+    #[test]
+    fn a_locked_store_states_the_facts_beside_it() {
+        let f = fx();
+        let root = locked_at(&f, &[("prod", None), ("dev", None), ("qa", None)]);
+        let yaml = root.join(crate::secrets::STORE_FILE);
+        let text = std::fs::read_to_string(&yaml).unwrap();
+        assert!(text.contains("label: recovery key"), "{text}");
+        std::fs::write(
+            &yaml,
+            text.replace("label: recovery key", "label: spare key"),
+        )
+        .unwrap();
+        let ctx = ctx(&f, OFFLINE).with_no_ping(true);
+        for t in ["prod", "dev"] {
+            std::fs::write(
+                ctx.store().target_credentials_file(t),
+                format!("hetzner_token: {TOKEN}\n"),
+            )
+            .unwrap();
+            seed_state(
+                &ctx,
+                t,
+                serde_json::json!({"server_id": 7, "server_name": "n", "kubeconfig_yaml": YAML}),
+            );
+        }
+        let other = crate::secrets::StoreId::parse("0123456789abcdef").unwrap();
+        crate::secrets::marker::write_marker(&ctx.store(), "qa", &other).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                root.join(crate::vault::VAULT_FILE),
+                std::fs::Permissions::from_mode(0o644),
+            )
+            .unwrap();
+        }
+        let rows = lock_part(&doctor_with(
+            &ctx,
+            named("prod"),
+            UnlockWindow::Closed,
+            quiet(),
+        ));
+        let warns: Vec<&str> = rows
+            .iter()
+            .filter(|c| c.id == CheckId::Secrets && c.status == CheckStatus::Warn)
+            .map(|c| c.title.as_str())
+            .collect();
+        let fix_of = |title: &str| {
+            rows.iter()
+                .find(|c| c.title == title)
+                .unwrap_or_else(|| panic!("no row {title:?}: {warns:?}"))
+                .fix
+                .clone()
+        };
+        assert!(
+            warns.contains(&"The slot list in store.yaml differs from the vault's"),
+            "{warns:?}"
+        );
+        assert_eq!(
+            fix_of("Target `dev`'s credentials file holds a token in clear, which this locked store never uses"),
+            Some(CheckFix::RenewToken { target: "dev".into(), why: RenewWhy::TokenOutsideVault })
+        );
+        assert_eq!(
+            fix_of("Target `qa`'s credentials file names another target store's vault"),
+            Some(CheckFix::RenewToken {
+                target: "qa".into(),
+                why: RenewWhy::TokenInAnotherVault
+            })
+        );
+        assert_eq!(
+            fix_of("Target `dev`'s state file holds a kubeconfig in clear, which this locked store never uses"),
+            Some(CheckFix::FetchKubeconfig { target: "dev".into() })
+        );
+        #[cfg(unix)]
+        assert!(
+            warns.contains(&"Vault file mode 0600 (got 644)"),
+            "{warns:?}"
+        );
+        assert!(
+            warns
+                .iter()
+                .all(|w| !w.contains("key-derivation") && !w.contains("recovery-key slot")),
+            "{warns:?}"
+        );
+        assert!(rows.iter().all(|c| !c.title.contains("`prod`")), "{rows:?}");
+        assert!(rows.iter().all(
+            |c| !c.title.contains(TOKEN) && !c.detail.as_deref().unwrap_or("").contains(TOKEN)
+        ));
+    }
+
+    /// T22, O8 (d4a-f): a slot this build refuses is a warning saying what that means, with the
+    /// refusal's own help; a vault with no recovery-key slot is a warning; a vault with its
+    /// recovery key and no refused slot is no row. (A refused slot cannot be made here without
+    /// deriving a weak key: the rows are built from the report's slot views.)
+    #[test]
+    fn a_refused_slot_or_no_recovery_key_is_a_warning() {
+        use crate::lock::{SlotRefusalView as V, SlotView};
+        use crate::secrets::LockSlotKind as K;
+        let slot = |kind, label: &str, refused| SlotView {
+            kind,
+            label: label.into(),
+            refused,
+        };
+        let store = Path::new("/s");
+        let healthy = [
+            slot(K::Password, "lock password", None),
+            slot(K::RecoveryKey, "recovery key", None),
+        ];
+        assert!(slot_facts(&healthy, store).is_empty());
+        let weak = slot_facts(
+            &[
+                slot(K::Password, "lock password", Some(V::KdfTooWeak)),
+                slot(K::RecoveryKey, "recovery key", None),
+            ],
+            store,
+        );
+        assert_eq!(
+            weak.iter().map(|c| (c.status, c.title.as_str())).collect::<Vec<_>>(),
+            [(
+                CheckStatus::Warn,
+                "The `lock password` slot uses key-derivation settings weaker than this AppRafter accepts: a copy of the vault is faster to guess than it allows"
+            )]
+        );
+        assert!(
+            matches!(&weak[0].fix, Some(CheckFix::Explain { text }) if text.contains("`apprafter lock off`")),
+            "{:?}",
+            weak[0].fix
+        );
+        let lone = slot_facts(
+            &[slot(K::Password, "lock password", Some(V::KdfOutOfRange))],
+            store,
+        );
+        assert_eq!(
+            lone.iter().map(|c| c.title.as_str()).collect::<Vec<_>>(),
+            [
+                "The `lock password` slot uses key-derivation settings beyond what this AppRafter computes: it cannot open the vault",
+                "The vault has no recovery-key slot"
+            ]
+        );
+    }
+
+    /// T35, §3.13: an override variable set beside a locked store is a warning that names the
+    /// variable — never its value — with the refusal's own help.
+    #[test]
+    fn an_override_beside_a_locked_store_is_named_never_shown() {
+        let rows = override_rows(true, true, Path::new("/s"));
+        assert_eq!(
+            rows.iter().map(|c| c.title.as_str()).collect::<Vec<_>>(),
+            [
+                "HCLOUD_TOKEN is set, and this locked store refuses it",
+                "APPRAFTER_AGE_KEY is set, and this locked store refuses it"
+            ]
+        );
+        assert!(rows.iter().all(|c| matches!(&c.fix, Some(CheckFix::Explain { text }) if text.contains("APPRAFTER_CONFIG_DIR"))));
+        assert!(override_rows(false, false, Path::new("/s")).is_empty());
+    }
+
+    /// T54, T72: a holder that could not lock its key's page is a warning on a locked store.
+    #[test]
+    fn a_weakened_holder_is_a_warning() {
+        let f = fx();
+        locked_at(&f, &[("prod", Some(TOKEN))]);
+        let ctx = ctx(&f, OFFLINE).with_no_ping(true);
+        let rows = lock_part(&doctor_with(
+            &ctx,
+            named("prod"),
+            open_window(60, false),
+            quiet(),
+        ));
+        let row = rows
+            .iter()
+            .find(|c| c.id == CheckId::WindowHardening)
+            .expect("a window_hardening row");
+        assert_eq!(
+            (row.status, row.title.as_str()),
+            (
+                CheckStatus::Warn,
+                "The unlock window's key is less protected than usual: its memory is not locked against paging"
+            )
+        );
+    }
+
+    /// §3.13: every limit's row — its id, its weight (the line's) and a fix; the holder base's
+    /// fallback is a `lock status` line only.
+    #[test]
+    fn every_limit_becomes_its_row() {
+        use MachineLimit as L;
+        let ssh = L::SshKeyUsable {
+            path: "~/k".into(),
+            unencrypted: true,
+            in_agent: Some(false),
+        };
+        let cases = [
+            (
+                L::X11Session,
+                Some((CheckId::X11Keystrokes, CheckStatus::Warn)),
+            ),
+            (
+                L::Xwayland {
+                    terminal_is_x_client: Some(true),
+                },
+                Some((CheckId::X11Keystrokes, CheckStatus::Warn)),
+            ),
+            (
+                L::Xwayland {
+                    terminal_is_x_client: None,
+                },
+                Some((CheckId::X11Keystrokes, CheckStatus::Info)),
+            ),
+            (
+                L::PtraceScope { value: Some(0) },
+                Some((CheckId::PtraceScope, CheckStatus::Warn)),
+            ),
+            (
+                L::PtraceScope { value: None },
+                Some((CheckId::PtraceScope, CheckStatus::Warn)),
+            ),
+            (
+                L::WindowsSameUser,
+                Some((CheckId::WindowsSameUser, CheckStatus::Warn)),
+            ),
+            (
+                L::MacosTaskPort,
+                Some((CheckId::MacosTaskPort, CheckStatus::Info)),
+            ),
+            (
+                L::Multiplexer {
+                    name: "tmux".into(),
+                },
+                Some((CheckId::TerminalMultiplexer, CheckStatus::Info)),
+            ),
+            (
+                L::InheritedWindow,
+                Some((CheckId::UnlockedTerminal, CheckStatus::Info)),
+            ),
+            (
+                L::SleepUnreported,
+                Some((CheckId::SleepUnreported, CheckStatus::Warn)),
+            ),
+            (
+                ssh.clone(),
+                Some((CheckId::SshKeyExposure, CheckStatus::Warn)),
+            ),
+            (
+                L::SecretsInUse,
+                Some((CheckId::SecretsInUse, CheckStatus::Info)),
+            ),
+            (
+                L::SameUserPrograms,
+                Some((CheckId::SameUserPrograms, CheckStatus::Info)),
+            ),
+            (
+                L::Hibernation,
+                Some((CheckId::Hibernation, CheckStatus::Info)),
+            ),
+            (
+                L::RuntimeDirFallback {
+                    path: "/s/run".into(),
+                },
+                None,
+            ),
+        ];
+        for (limit, want) in cases {
+            let got = limit_check(&limit);
+            assert_eq!(got.as_ref().map(|c| (c.id, c.status)), want, "{limit:?}");
+            if let Some(c) = got {
+                assert_eq!(
+                    Some(c.title.clone()),
+                    crate::lock::text::limit_line(&limit).map(|l| l.text)
+                );
+                assert!(c.fix.is_some(), "{limit:?}");
+            }
+        }
+        assert_eq!(
+            limit_check(&ssh).unwrap().fix,
+            Some(CheckFix::ProtectSshKey { path: "~/k".into() })
         );
     }
 }

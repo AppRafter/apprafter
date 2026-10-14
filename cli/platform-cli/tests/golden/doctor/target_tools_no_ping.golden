@@ -22,6 +22,8 @@ Checking environment...
   ✓ `ssh` on PATH (ssh stand-in)
   ✓ `cue` on PATH (cue stand-in)
   ✓ DNS resolves `127.0.0.1` (443/tcp)
+  ℹ Secrets in files (readable by any program running as you)
+      hint: `apprafter lock on` encrypts them in a vault that opens only with your lock password or the recovery key
 
 12 checks for target `prod`: 12 passed. All good — ready for `apprafter init` / `apprafter apply`.
 [stderr]

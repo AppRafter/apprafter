@@ -24,13 +24,14 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 
 use apprafter_core::doctor::{self, DoctorArgs, DoctorTarget};
+use apprafter_core::lock::UnlockWindow;
 use apprafter_core::{CancellationToken, Context, CoreError};
 use cli_core::CliError;
 use tracing::info;
 
 use crate::commands::state_paths::resolve_state_paths;
-use crate::context::diagnostic_context;
-use crate::render;
+use crate::context::{diagnostic_context, ProcessEnv};
+use crate::{holder_window, limits_client, render};
 
 pub fn run(target_override: Option<&str>, no_ping: bool) -> miette::Result<()> {
     info!(target_override, no_ping, "doctor invoked");
@@ -42,9 +43,24 @@ pub fn run(target_override: Option<&str>, no_ping: bool) -> miette::Result<()> {
         Some(name) => DoctorTarget::Named(name.to_string()),
         None => DoctorTarget::CliDefault,
     };
+    // D.4a T73: what only the CLI sees — this terminal's window, asked of its holder by
+    // `Status` (which restarts nothing; a store whose state cannot be read is the `secrets`
+    // row's to report), and the facts behind the machine-limit rows.
+    let terminal = holder_window::terminal_present();
+    let place = holder_window::HolderPlace::of(&ctx);
+    let window = holder_window::window_state(&ctx, &place, terminal).unwrap_or(if terminal {
+        UnlockWindow::Closed
+    } else {
+        UnlockWindow::NoTerminal
+    });
+    let client = limits_client::cli_limit_client(&ProcessEnv, terminal);
     let report = match doctor::run(
         &ctx,
-        DoctorArgs { target },
+        DoctorArgs {
+            target,
+            window,
+            client,
+        },
         &render::reporter::CliReporter,
         &cancel,
     ) {

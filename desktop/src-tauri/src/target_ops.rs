@@ -23,6 +23,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use apprafter_core::doctor::{self, DoctorArgs, DoctorTarget};
+use apprafter_core::lock::limits::{
+    DisplayKind, LimitClient, SessionEvents as CoreSessionEvents, SshFacts,
+};
+use apprafter_core::lock::UnlockWindow;
 use apprafter_core::machine::{self, CatalogueSource, RegionLatency};
 use apprafter_core::session::{self, WhoamiReport};
 use apprafter_core::ssh::{self, SshKeyCandidate, SshKeyInfo};
@@ -259,15 +263,33 @@ fn start_region_latencies_with(
 /// a target that exists (Target, Cluster, This computer) and two otherwise.
 pub fn start_doctor(shell: &Shell, name: String) -> Result<OpId, DesktopError> {
     let title = format!("Doctor · {name}");
-    let args = DoctorArgs {
-        target: DoctorTarget::Named(name.clone()),
-    };
+    let target = DoctorTarget::Named(name.clone());
+    let events = shell.session_events_later();
     read_in(
         shell,
         title,
         Some(name),
         shell.tool_context_later(),
-        move |ctx, reporter, cancel| doctor::run(ctx, args, reporter, cancel),
+        move |ctx, reporter, cancel| {
+            // D.4a T73: the app's own facts, read here on the read's worker (the session watch
+            // may wait). Its session events now; its window (`App` while it holds a locked
+            // store's key), its display kind (from GDK) and its SSH facts arrive with the Lock
+            // section (d4a-g phase B) — until then it holds no key, so no window is open here.
+            let events = events();
+            let args = DoctorArgs {
+                target,
+                window: UnlockWindow::Closed,
+                client: LimitClient::Desktop {
+                    session_events: CoreSessionEvents {
+                        lock: events.lock,
+                        sleep: events.sleep,
+                    },
+                    display: DisplayKind::None,
+                    ssh: SshFacts::default(),
+                },
+            };
+            doctor::run(ctx, args, reporter, cancel)
+        },
     )
 }
 

@@ -4,7 +4,8 @@
 //! doctor's rows and `apprafter status`'s line, so that each limit reads the same wherever it is
 //! shown. The desktop words its own Settings section; its doctor overlay shows doctor's rows.
 
-use crate::lock::{HolderHardening, MachineLimit};
+use crate::lock::{HolderHardening, HolderUnavailableReason, MachineLimit, SlotView, UnlockWindow};
+use crate::secrets::LockSlotKind;
 
 /// One limit as a surface states it: a warning or a fact, and its sentence.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,6 +132,66 @@ pub fn hardening_line(h: &HolderHardening) -> Option<String> {
     })
 }
 
+/// The client's window on the store, as doctor's `secrets` row and `status`'s line say it.
+pub fn window_words(window: &UnlockWindow) -> String {
+    match window {
+        UnlockWindow::Open { left_secs, .. } => {
+            let left = if *left_secs < 60 {
+                format!("{left_secs} s")
+            } else {
+                format!("{} min", left_secs.div_ceil(60))
+            };
+            format!("unlocked in this terminal, {left} left")
+        }
+        UnlockWindow::Closed => "no unlock window in this terminal".into(),
+        UnlockWindow::NoTerminal => "not run from a terminal".into(),
+        UnlockWindow::EveryCommand => "every command asks (the store's window is 0 min)".into(),
+        // A holder that does not answer still holds the key: an open window, never "no window"
+        // (rule 1), and not one a command can use — as `lock status` says it.
+        UnlockWindow::Unavailable {
+            reason: HolderUnavailableReason::NotResponding,
+        } => "open in this terminal, but its holder does not answer: every command asks; \
+              `apprafter lock now` ends it"
+            .into(),
+        UnlockWindow::Unavailable { .. } => {
+            "no unlock window possible here (`apprafter lock status` says why)".into()
+        }
+        UnlockWindow::App => "unlocked in this app".into(),
+    }
+}
+
+/// The kinds of a store's slots, in the vault's order, a slot this build refuses marked so.
+pub fn slot_kinds(slots: &[SlotView]) -> String {
+    slots
+        .iter()
+        .map(|s| {
+            let kind = match s.kind {
+                LockSlotKind::Password => "password",
+                LockSlotKind::RecoveryKey => "recovery key",
+                LockSlotKind::OsPassword => "OS password",
+                LockSlotKind::WindowsHello => "Windows Hello",
+                LockSlotKind::TouchId => "Touch ID",
+                LockSlotKind::Unknown => "a slot this AppRafter does not know",
+            };
+            match s.refused {
+                Some(_) => format!("{kind} (refused by this build)"),
+                None => kind.to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// "2 slots: password, recovery key".
+pub fn slot_count(slots: &[SlotView]) -> String {
+    let n = slots.len();
+    format!(
+        "{n} {}: {}",
+        if n == 1 { "slot" } else { "slots" },
+        slot_kinds(slots)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,6 +274,58 @@ mod tests {
         assert_eq!(
             hardening_line(&hardening(false, Some(false))).as_deref(),
             Some("The unlock window's key is less protected than usual: its memory is not locked against paging, it can be dumped")
+        );
+    }
+
+    fn slot(kind: crate::secrets::LockSlotKind, refused: bool) -> crate::lock::SlotView {
+        crate::lock::SlotView {
+            kind,
+            label: "x".into(),
+            refused: refused.then_some(crate::lock::SlotRefusalView::KdfTooWeak),
+        }
+    }
+
+    /// D.4a §3.13: the window and the slots as doctor's `secrets` row and `status`'s line say
+    /// them.
+    #[test]
+    fn the_window_and_the_slots_in_words() {
+        use crate::lock::UnlockWindow as W;
+        use crate::secrets::LockSlotKind as K;
+        let open = |left_secs| W::Open {
+            left_secs,
+            minutes: 5,
+            holder_version: "0".into(),
+            hardening: hardening(true, Some(true)),
+        };
+        for (window, words) in [
+            (open(170), "unlocked in this terminal, 3 min left"),
+            (open(42), "unlocked in this terminal, 42 s left"),
+            (W::Closed, "no unlock window in this terminal"),
+            (W::NoTerminal, "not run from a terminal"),
+            (W::EveryCommand, "every command asks (the store's window is 0 min)"),
+            (
+                W::Unavailable { reason: crate::lock::HolderUnavailableReason::PathTooLong },
+                "no unlock window possible here (`apprafter lock status` says why)",
+            ),
+            // A holder that does not answer still holds the key: never "no window" (rule 1).
+            (
+                W::Unavailable { reason: crate::lock::HolderUnavailableReason::NotResponding },
+                "open in this terminal, but its holder does not answer: every command asks; `apprafter lock now` ends it",
+            ),
+            (W::App, "unlocked in this app"),
+        ] {
+            assert_eq!(window_words(&window), words, "{window:?}");
+        }
+        let both = [slot(K::Password, false), slot(K::RecoveryKey, false)];
+        assert_eq!(slot_kinds(&both), "password, recovery key");
+        assert_eq!(slot_count(&both), "2 slots: password, recovery key");
+        assert_eq!(
+            slot_count(&[slot(K::RecoveryKey, false)]),
+            "1 slot: recovery key"
+        );
+        assert_eq!(
+            slot_kinds(&[slot(K::Password, true), slot(K::RecoveryKey, false)]),
+            "password (refused by this build), recovery key"
         );
     }
 }
