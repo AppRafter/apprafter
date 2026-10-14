@@ -934,3 +934,29 @@ fn the_window_lives_in_the_vault_and_changes_there() {
         CoreError::Cli(CliError::UsageRefused { .. })
     ));
 }
+
+/// WI-475: `lock on` over a store another account can change is refused before anything is
+/// written — no vault, no `store.yaml`, every clear file as it was — naming the folder.
+#[test]
+fn a_store_another_account_can_change_is_not_locked() {
+    let f = files_store();
+    let plan = plan_on(&f.ctx, None).unwrap();
+    let before = crate::target::testkit::snapshot(f.ctx.config_root());
+    let staging = f.ctx.store().target_dir("staging");
+    let _foreign = cli_core::owner_only::pretend::foreign_owner(&staging);
+    let (input, _) = new_input();
+    match execute_on(
+        &f.ctx,
+        plan,
+        input,
+        &NullReporter,
+        &CancellationToken::new(),
+    ) {
+        Err(CoreError::Cli(CliError::StoreNotPrivate { path, .. })) => assert_eq!(path, staging),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        crate::target::testkit::snapshot(f.ctx.config_root()),
+        before
+    );
+}

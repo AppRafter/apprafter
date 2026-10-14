@@ -243,8 +243,8 @@ pub mod codes {
     /// A filesystem error. On one of a target's own files `fields.target` names the target and
     /// `fields.path` the file (the desktop then offers to remove it, WI-458 review #6).
     pub const IO_ERROR: &str = "apprafter::io::error";
-    /// D.4a §3.12: the target-store lock. The next sixteen are cli-core's `CliError` codes,
-    /// which pass through to the desktop with their own fields.
+    /// D.4a §3.12: the target-store lock. The next seventeen are cli-core's `CliError` codes,
+    /// which pass through to the desktop with their own fields (the last, WI-475's).
     pub const STORE_LOCKED: &str = "apprafter::secrets::store_locked";
     pub const OVERRIDE_REFUSED: &str = "apprafter::secrets::override_refused";
     pub const UNLOCK_FAILED: &str = "apprafter::secrets::unlock_failed";
@@ -262,6 +262,8 @@ pub mod codes {
     pub const TOKEN_IN_ANOTHER_VAULT: &str = "apprafter::secrets::token_in_another_vault";
     pub const VAULT_NEEDS_WRITE_LOCK: &str = "apprafter::secrets::vault_needs_write_lock";
     pub const RANDOM_UNAVAILABLE: &str = "apprafter::secrets::random_unavailable";
+    /// A folder of the target store another account owns or can write (WI-475).
+    pub const STORE_NOT_PRIVATE: &str = "apprafter::secrets::store_not_private";
     /// The lock's three refusals the core raises itself (`CoreError`).
     pub const PASSWORD_REFUSED: &str = "apprafter::secrets::password_refused";
     pub const RECOVERY_KEY_INVALID: &str = "apprafter::secrets::recovery_key_invalid";
@@ -316,6 +318,7 @@ pub mod codes {
         TOKEN_IN_ANOTHER_VAULT,
         VAULT_NEEDS_WRITE_LOCK,
         RANDOM_UNAVAILABLE,
+        STORE_NOT_PRIVATE,
         PASSWORD_REFUSED,
         RECOVERY_KEY_INVALID,
         INSECURE_KDF_REFUSED,
@@ -733,6 +736,13 @@ fn neutral_help(e: &cli_core::CliError) -> Option<String> {
              random numbers, with no fallback. Try again; if it keeps failing, the system's \
              entropy source is broken."
             .into(),
+        // WI-475: no command; the folder is in the message, and Doctor lists the rest.
+        C::StoreNotPrivate { .. } => "Whoever can replace a file there can swap in a token, a \
+             kubeconfig or a vault of their own and send your next deploy to a project or a \
+             cluster of their choosing. Move the target store to a folder only you can write, or \
+             fix that folder's owner and permissions; Doctor lists every folder and file \
+             concerned."
+            .into(),
         // WI-473: the desktop's runtime dir is its own (`<app local data>/run`), so only the
         // removal applies there; the CLI's help also names a store of one's own.
         C::RuntimeDirForeign { .. } => "Another account could replace a kubeconfig in it before \
@@ -862,6 +872,10 @@ fn project_cli(e: &cli_core::CliError, put: &mut impl FnMut(&str, serde_json::Va
             put("problem", json!(problem.as_str()));
         }
         C::StoreFileUnreadable { path, .. } => put("path", json!(path.display().to_string())),
+        C::StoreNotPrivate { path, problem } => {
+            put("path", json!(path.display().to_string()));
+            put("problem", json!(problem.as_str()));
+        }
         C::LockIncomplete { store, phase } => {
             put("store", json!(store.display().to_string()));
             put("phase", json!(phase.as_str()));
@@ -1353,6 +1367,14 @@ pub mod samples {
             C::VaultNeedsWriteLock { store: store() },
             C::RandomUnavailable {
                 detail: s("getrandom: ENOSYS"),
+            },
+            C::StoreNotPrivate {
+                path: store(),
+                problem: cli_core::StoreFolderProblem::ForeignOwner,
+            },
+            C::StoreNotPrivate {
+                path: "/s/targets".into(),
+                problem: cli_core::StoreFolderProblem::WritableByOthers,
             },
             C::CacheUndecryptable {
                 secret: CachedSecret::Kubeconfig,
@@ -1857,6 +1879,7 @@ mod tests {
             codes::TOKEN_IN_ANOTHER_VAULT,
             codes::VAULT_NEEDS_WRITE_LOCK,
             codes::RANDOM_UNAVAILABLE,
+            codes::STORE_NOT_PRIVATE,
         ] {
             assert!(
                 seen.contains(code),
@@ -1954,6 +1977,13 @@ mod tests {
                 detail: "d".into()
             }),
             json!({"path": "/s/store.yaml"})
+        );
+        assert_eq!(
+            cli(C::StoreNotPrivate {
+                path: "/s/targets".into(),
+                problem: cli_core::StoreFolderProblem::WritableByOthers
+            }),
+            json!({"path": "/s/targets", "problem": "writable_by_others"})
         );
         assert_eq!(
             cli(C::LockIncomplete {
@@ -2285,6 +2315,7 @@ mod tests {
             codes::TOKEN_IN_ANOTHER_VAULT,
             codes::VAULT_NEEDS_WRITE_LOCK,
             codes::RANDOM_UNAVAILABLE,
+            codes::STORE_NOT_PRIVATE,
         ] {
             assert!(helped.contains(code), "{code} has no neutral help");
         }

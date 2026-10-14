@@ -920,3 +920,33 @@ fn a_resume_reads_the_shared_key_only_for_a_cache_still_sealed_to_it() {
         );
     }
 }
+
+/// WI-475: `lock off` on a store another account can change is refused before anything is
+/// written: every token stays in the vault, and the vault stays.
+#[test]
+fn a_store_another_account_can_change_is_not_unlocked() {
+    let f = files_store();
+    lock(&f.ctx);
+    let plan = plan_off(&f.ctx).unwrap();
+    let opened = plan
+        .payload
+        .needs_secret()
+        .then(|| open_with(&f.ctx, PASSWORD));
+    let before = crate::target::testkit::snapshot(f.ctx.config_root());
+    let state = f.ctx.config_root().join("state");
+    let _foreign = cli_core::owner_only::pretend::foreign_owner(&state);
+    match execute_off(
+        &f.ctx,
+        plan,
+        opened,
+        &NullReporter,
+        &CancellationToken::new(),
+    ) {
+        Err(CoreError::Cli(CliError::StoreNotPrivate { path, .. })) => assert_eq!(path, state),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        crate::target::testkit::snapshot(f.ctx.config_root()),
+        before
+    );
+}

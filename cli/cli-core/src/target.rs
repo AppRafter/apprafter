@@ -284,6 +284,10 @@ thread_local! {
 /// locks — yields a guard that holds nothing ([`StoreLockEvent::Unlocked`],
 /// [`StoreLock::is_held`]): the edit goes ahead unlocked, and a read-only
 /// store fails at the save that needs writing, not at the lock.
+///
+/// A store another account owns or can write is no one's to change here
+/// (WI-475): once the lock is taken, a folder of the store another account
+/// owns or may write is `CliError::StoreNotPrivate`, and no guard is given.
 #[must_use = "the store is locked only while this value is alive"]
 pub struct StoreLock {
     /// The locked sentinel; `None` when the store could not be locked.
@@ -350,8 +354,29 @@ impl Drop for StoreLock {
 }
 
 /// Take the store lock, waiting for another process forever (`within:
-/// None`) or at most `within` (`Ok(None)` past it).
+/// None`) or at most `within` (`Ok(None)` past it) — refusing a store
+/// another account owns or can write (WI-475,
+/// [`crate::store_privacy::ensure_private`]) both before the root and the
+/// sentinel are made, so such a store is left as it was, and once the lock
+/// is taken, before the caller changes anything: a root made just now, or
+/// a folder changed meanwhile. A refused guard is dropped, and
+/// `CliError::StoreNotPrivate` names the folder. A guard that holds
+/// nothing (a store that cannot be locked) is refused the same way.
 fn acquire(
+    paths: &TargetStorePaths,
+    within: Option<std::time::Duration>,
+    on_event: &mut dyn FnMut(StoreLockEvent<'_>),
+) -> Result<Option<StoreLock>> {
+    crate::store_privacy::ensure_private(paths)?;
+    let lock = lock_sentinel(paths, within, on_event)?;
+    if lock.is_some() {
+        crate::store_privacy::ensure_private(paths)?;
+    }
+    Ok(lock)
+}
+
+/// The lock itself: [`acquire`] before its check.
+fn lock_sentinel(
     paths: &TargetStorePaths,
     within: Option<std::time::Duration>,
     on_event: &mut dyn FnMut(StoreLockEvent<'_>),
@@ -1370,6 +1395,64 @@ mod tests {
         let paths = TargetStorePaths::for_root(root.clone());
         let _g = StoreLock::exclusive(&paths).unwrap();
         assert!(root.join(".lock").is_file());
+    }
+
+    /// WI-475: a store another account owns (pretended, in a temp dir) or can write is refused
+    /// once the lock is taken, before anything is changed; the lock is let go, so the next
+    /// taker on this thread neither panics nor waits, and a fixed store is locked again.
+    #[test]
+    fn the_store_lock_refuses_a_store_another_account_can_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = TargetStorePaths::for_root(dir.path().join("store"));
+        fs::create_dir_all(paths.target_dir("prod")).unwrap();
+        {
+            let _foreign = crate::owner_only::pretend::foreign_owner(&paths.target_dir("prod"));
+            assert!(!paths.lock_file().exists(), "the test's premise");
+            for taken in [
+                StoreLock::exclusive(&paths).map(|_| ()),
+                StoreLock::try_exclusive_for(&paths, std::time::Duration::ZERO, |_| {}).map(|_| ()),
+            ] {
+                match taken {
+                    Err(CliError::StoreNotPrivate { path, problem }) => {
+                        assert_eq!(path, paths.target_dir("prod"));
+                        assert_eq!(problem, crate::StoreFolderProblem::ForeignOwner);
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
+            assert!(
+                !paths.lock_file().exists(),
+                "a refused store gets no sentinel either"
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(paths.root(), fs::Permissions::from_mode(0o777)).unwrap();
+            assert!(matches!(
+                StoreLock::exclusive(&paths),
+                Err(CliError::StoreNotPrivate {
+                    problem: crate::StoreFolderProblem::WritableByOthers,
+                    ..
+                })
+            ));
+            fs::set_permissions(paths.root(), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let held = StoreLock::exclusive(&paths).unwrap();
+        assert!(held.is_held());
+    }
+
+    /// WI-475: a root the lock makes is checked once made — here one another account would own
+    /// (pretended): nothing was there to check before.
+    #[test]
+    fn a_root_the_lock_makes_is_checked_once_made() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = TargetStorePaths::for_root(dir.path().join("fresh"));
+        let _foreign = crate::owner_only::pretend::foreign_owner(paths.root());
+        match StoreLock::exclusive(&paths) {
+            Err(CliError::StoreNotPrivate { path, .. }) => assert_eq!(path, paths.root()),
+            other => panic!("{:?}", other.map(|l| l.is_held())),
+        }
     }
 
     #[test]

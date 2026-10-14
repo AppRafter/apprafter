@@ -613,6 +613,69 @@ impl SlotRefusal {
     }
 }
 
+/// What another account can do to a folder of the target store (WI-475): one of the two ways
+/// it could replace the store's files there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreFolderProblem {
+    /// Another account owns the folder.
+    ForeignOwner,
+    /// Other accounts may write to it.
+    WritableByOthers,
+}
+
+impl StoreFolderProblem {
+    /// Its name on the wire (`fields.problem`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StoreFolderProblem::ForeignOwner => "foreign_owner",
+            StoreFolderProblem::WritableByOthers => "writable_by_others",
+        }
+    }
+}
+
+fn store_not_private_message(path: &Path, problem: StoreFolderProblem) -> String {
+    let who = match problem {
+        StoreFolderProblem::ForeignOwner => format!(
+            "{} belongs to another account, which could replace",
+            path.display()
+        ),
+        StoreFolderProblem::WritableByOthers => format!(
+            "other accounts can write to {}, so they could replace",
+            path.display()
+        ),
+    };
+    format!(
+        "{who} the target store's files there: AppRafter neither uses nor writes this store's \
+         secrets until that is fixed"
+    )
+}
+
+/// The fix for a store folder another account owns or can write, in this platform's terms.
+pub fn store_not_private_help(path: &Path, problem: StoreFolderProblem) -> String {
+    let fix = match (problem, cfg!(windows)) {
+        (StoreFolderProblem::ForeignOwner, false) => format!(
+            "have an administrator make your account its owner (`sudo chown <your user> {}`)",
+            path.display()
+        ),
+        (StoreFolderProblem::WritableByOthers, false) => format!(
+            "remove the other accounts' write access: `chmod go-w {}`",
+            path.display()
+        ),
+        (StoreFolderProblem::ForeignOwner, true) => "have an administrator make your account \
+             its owner (the folder's Properties › Security › Advanced)"
+            .to_string(),
+        (StoreFolderProblem::WritableByOthers, true) => "remove the other accounts' write \
+             access in the folder's Properties › Security"
+            .to_string(),
+    };
+    format!(
+        "Whoever can replace a file there can swap in a token, a kubeconfig or a vault of their \
+         own and send your next deploy to a project or a cluster of their choosing. Move the \
+         target store to a folder only you can write (set `APPRAFTER_CONFIG_DIR` to it), or {fix}. \
+         `apprafter doctor` lists every folder and file concerned."
+    )
+}
+
 fn store_locked_message(store: &Path, reason: LockedWhy) -> String {
     match reason {
         LockedWhy::NoTerminal => format!(
@@ -1683,6 +1746,19 @@ pub enum CliError {
         )
     )]
     RuntimeDirForeign { path: PathBuf },
+
+    /// A folder of the target store another account owns, or that other accounts can write
+    /// (WI-475): they could replace the store's files there — a token, a cached kubeconfig, the
+    /// vault — so no secret of the store is used or written.
+    #[error("{}", store_not_private_message(path, *problem))]
+    #[diagnostic(
+        code(apprafter::secrets::store_not_private),
+        help("{}", store_not_private_help(path, *problem))
+    )]
+    StoreNotPrivate {
+        path: PathBuf,
+        problem: StoreFolderProblem,
+    },
 
     /// Catch-all, free-form message. New call sites should prefer
     /// promoting recurring messages to dedicated variants with
@@ -2883,6 +2959,14 @@ mod tests {
              "apprafter::secrets::runtime_dir_foreign",
              "/s/run belongs to another account, so AppRafter writes no decrypted kubeconfig there",
              "Remove the directory, and AppRafter makes it again, owned by you"),
+            (CliError::StoreNotPrivate { path: s(), problem: StoreFolderProblem::ForeignOwner },
+             "apprafter::secrets::store_not_private",
+             "/s belongs to another account, which could replace the target store's files there: AppRafter neither uses nor writes this store's secrets until that is fixed",
+             "Move the target store to a folder only you can write (set `APPRAFTER_CONFIG_DIR` to it)"),
+            (CliError::StoreNotPrivate { path: "/s/targets".into(), problem: StoreFolderProblem::WritableByOthers },
+             "apprafter::secrets::store_not_private",
+             "other accounts can write to /s/targets, so they could replace the target store's files there: AppRafter neither uses nor writes this store's secrets until that is fixed",
+             "`apprafter doctor` lists every folder and file concerned"),
         ];
         for (err, code, message, help) in cases {
             assert_eq!(code_of(&err), code);
@@ -2891,6 +2975,40 @@ mod tests {
             assert!(h.contains(help), "{code}: {h}");
             assert!(!h.contains("file an issue"), "{code}: {h}");
         }
+    }
+
+    /// WI-475: the fix for a store folder another account owns or can write is in this
+    /// platform's terms.
+    #[test]
+    fn a_store_folder_others_can_change_is_fixed_in_this_platforms_terms() {
+        let help = |problem| {
+            help_of(&CliError::StoreNotPrivate {
+                path: "/s".into(),
+                problem,
+            })
+        };
+        let (owner, write) = (
+            help(StoreFolderProblem::ForeignOwner),
+            help(StoreFolderProblem::WritableByOthers),
+        );
+        if cfg!(windows) {
+            assert!(
+                owner.contains("Properties › Security › Advanced"),
+                "{owner}"
+            );
+            assert!(
+                write.contains("write access in the folder's Properties › Security"),
+                "{write}"
+            );
+        } else {
+            assert!(owner.contains("`sudo chown <your user> /s`"), "{owner}");
+            assert!(write.contains("`chmod go-w /s`"), "{write}");
+        }
+        assert_eq!(StoreFolderProblem::ForeignOwner.as_str(), "foreign_owner");
+        assert_eq!(
+            StoreFolderProblem::WritableByOthers.as_str(),
+            "writable_by_others"
+        );
     }
 
     /// WI-457 review #5/#12: a declined new key is an error, so a caller capturing the

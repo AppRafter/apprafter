@@ -123,8 +123,8 @@ pub(super) fn cache_key_for_new_secret(
 
 /// The shared key at `age_key_path`, created when none is there — a first use, or a lost
 /// key's replacement the caller agreed to (WI-457): whether this call created it. A key that
-/// appeared meanwhile is used, never replaced (`create_new`). Files only: a locked store never
-/// gets one (c2's hand-off).
+/// appeared meanwhile is used, never replaced (a no-replace move, WI-475). Files only: a locked
+/// store never gets one (c2's hand-off).
 pub(super) fn create_shared_key(age_key_path: &Path) -> Result<bool> {
     under_temp(age_key_path);
     load_or_create_identity_reporting(age_key_path).map(|(_, created)| created)

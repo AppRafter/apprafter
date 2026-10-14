@@ -328,3 +328,134 @@ fn an_age_key_outside_the_temp_dir_is_refused_in_tests() {
         .secrets()
         .cache_key("prod");
 }
+
+// ---- WI-475: a store another account can change ----
+
+/// Each way to have one of its folders refused: another account owns it (pretended, in this
+/// test's own temp dir) or, on Unix, other accounts may write it. The guard undoes it.
+enum Changeable {
+    /// Held for its drop.
+    Foreign {
+        _guard: cli_core::owner_only::pretend::ForeignOwner,
+    },
+    #[cfg(unix)]
+    Writable(std::path::PathBuf),
+}
+
+impl Drop for Changeable {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Changeable::Writable(path) = self {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+}
+
+fn changeable(path: &Path, foreign: bool) -> Changeable {
+    if foreign {
+        return Changeable::Foreign {
+            _guard: cli_core::owner_only::pretend::foreign_owner(path),
+        };
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o777)).unwrap();
+        Changeable::Writable(path.to_path_buf())
+    }
+    #[cfg(windows)]
+    unreachable!("the Windows cases are the DACL test's")
+}
+
+fn refused(e: CliError, path: &Path) {
+    assert!(
+        matches!(&e, CliError::StoreNotPrivate { path: named, .. } if named == path),
+        "{e:?}"
+    );
+}
+
+/// WI-475: no secret leaves a store another account can change, and none is settled for a
+/// write: the token (stored and as doctor opens it), a write's key, the cache key, the key for
+/// a new cache, the cached kubeconfig — the plaintext one too, which needs no key — and a new
+/// cache, which would create the shared age key. What hands out no secret still reads: the
+/// lock state and the token record. Each folder the store reads from, root to state.
+#[test]
+fn a_store_another_account_can_change_hands_out_no_secret() {
+    let (_d, ctx) = store(&["prod"], None);
+    seed_state_raw(
+        &ctx,
+        "prod",
+        r#"{"hetzner_cloud":{"server_id":1,"server_name":"n"}}"#,
+    );
+    let s = ctx.secrets();
+    let state_dir = cli_state::StatePaths::for_active_target(&ctx.store(), "prod").state_dir();
+    let plain = hetzner(None, Some(YAML));
+    let folders = [
+        ctx.config_root().to_path_buf(),
+        ctx.store().targets_dir(),
+        ctx.store().target_dir("prod"),
+        ctx.config_root().join("state"),
+        ctx.store().state_dir("prod"),
+        state_dir,
+    ];
+    // Foreign everywhere; writable by others on Unix (Windows: the DACL test below).
+    let ways: &[bool] = if cfg!(unix) { &[true, false] } else { &[true] };
+    let cases: Vec<(std::path::PathBuf, bool)> = ways
+        .iter()
+        .flat_map(|&foreign| folders.iter().map(move |f| (f.clone(), foreign)))
+        .collect();
+    for (folder, foreign) in cases {
+        let _changeable = changeable(&folder, foreign);
+        refused(s.stored_token("prod").unwrap_err(), &folder);
+        refused(s.open_token("prod").unwrap_err(), &folder);
+        refused(s.prepare_write().err().unwrap(), &folder);
+        refused(s.cache_key("prod").unwrap_err(), &folder);
+        refused(s.cache_key_for_new_secret("prod").err().unwrap(), &folder);
+        refused(s.cached_kubeconfig(&plain, "prod").unwrap_err(), &folder);
+        refused(
+            s.new_cache("prod", CachedSecret::Kubeconfig, true)
+                .err()
+                .unwrap(),
+            &folder,
+        );
+        assert!(
+            !ctx.age_key_path().exists(),
+            "{folder:?}: an age key was created for a store others can change"
+        );
+        assert_eq!(s.mode().unwrap(), SecretsMode::Files);
+        assert_eq!(
+            s.token_presence("prod").unwrap(),
+            StoredToken::InFile { chars: 64 }
+        );
+    }
+    assert_eq!(s.stored_token("prod").unwrap().unwrap().expose(), TOKEN_A);
+    assert_eq!(
+        s.cached_kubeconfig(&plain, "prod")
+            .unwrap()
+            .unwrap()
+            .as_str(),
+        YAML
+    );
+}
+
+/// WI-475 (Windows): a store folder whose DACL lets another account write hands out no
+/// secret either.
+#[cfg(windows)]
+#[test]
+fn a_store_folder_others_can_write_hands_out_no_secret() {
+    use cli_core::owner_only::testing;
+    let (_d, ctx) = store(&["prod"], None);
+    let s = ctx.secrets();
+    let me = testing::this_user_sid().unwrap();
+    let folder = ctx.store().target_dir("prod");
+    testing::set_dacl(
+        &folder,
+        &format!("D:P(A;OICI;FA;;;{me})(A;OICI;0x1301bf;;;AU)"),
+    )
+    .unwrap();
+    refused(s.stored_token("prod").unwrap_err(), &folder);
+    refused(s.prepare_write().err().unwrap(), &folder);
+    testing::set_dacl(&folder, &format!("D:P(A;OICI;FA;;;{me})")).unwrap();
+    assert_eq!(s.stored_token("prod").unwrap().unwrap().expose(), TOKEN_A);
+}

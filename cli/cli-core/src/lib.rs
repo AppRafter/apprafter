@@ -14,6 +14,7 @@ pub mod quantity;
 pub mod resolve;
 pub mod secrets;
 pub mod ssh_key;
+pub mod store_privacy;
 pub mod style;
 pub mod target;
 pub mod tier;
@@ -24,9 +25,10 @@ pub use credentials::{
     read_ssh_public_key_body, resolve_hetzner_ssh_public_key, HCLOUD_TOKEN_ENV, SSH_PUBLIC_KEY_ENV,
 };
 pub use error::{
-    age_key_missing_help, vault_unreadable_help, CliError, DamageKind, LockPhase, LockedWhy,
-    ProvisionStop, ProvisionedBy, RefusedInput, Result, SecretsModeKind, SkuCheckFor, SlotRefusal,
-    TransportFailure, UnavailableKind, VaultProblem, VaultWriteProblem,
+    age_key_missing_help, store_not_private_help, vault_unreadable_help, CliError, DamageKind,
+    LockPhase, LockedWhy, ProvisionStop, ProvisionedBy, RefusedInput, Result, SecretsModeKind,
+    SkuCheckFor, SlotRefusal, StoreFolderProblem, TransportFailure, UnavailableKind, VaultProblem,
+    VaultWriteProblem,
 };
 pub use fsutil::atomic_replace;
 pub use target::{

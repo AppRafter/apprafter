@@ -141,9 +141,11 @@ pub fn load_or_create_identity(path: &Path) -> Result<Identity> {
 
 /// [`load_or_create_identity`], and whether this call created the key (WI-457 review #10).
 ///
-/// The file is created with `create_new`, so a key that appears between the check and the
-/// create — the lost one put back, or another process's — is loaded, never overwritten, and
-/// `false` says this call made none: a caller that reports "a new key was created" asks this.
+/// The key is written whole beside its name and then given it by a move that refuses a name
+/// already taken (WI-475), so a key that appears between the check and the create — the lost
+/// one put back, or another process's — is loaded, never overwritten, and `false` says this
+/// call made none: a caller that reports "a new key was created" asks this. A key file that
+/// does not parse is the error that names it, whoever wrote it: never used, never replaced.
 pub fn load_or_create_identity_reporting(path: &Path) -> Result<(Identity, bool)> {
     if let Some(identity) = load_identity(path)? {
         return Ok((identity, false));
@@ -159,8 +161,9 @@ pub fn load_or_create_identity_reporting(path: &Path) -> Result<(Identity, bool)
     }
 }
 
-/// Generate an identity and write it to `path` (parent dir created, mode 0600 on Unix), or
-/// `None` when a file is already there: it is left as it was.
+/// Generate an identity and write it to `path` whole (parent dir created, owner-only before its
+/// first byte: [`write_secret_file`]), or `None` when a file is already there: it is left as it
+/// was.
 fn create_identity(path: &Path) -> Result<Option<Identity>> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -175,16 +178,61 @@ fn create_identity(path: &Path) -> Result<Option<Identity>> {
     }
 }
 
-/// Write a new secret file, owner-only before its first byte (mode 0600 on Unix, the protected
-/// one-ACE DACL on Windows: [`crate::owner_only::create_new`]); `AlreadyExists` when there is
-/// one (never replaced).
+/// Write a new secret file whole, owner-only before its first byte, and never over another
+/// (WI-475). The bytes go to a temp file beside `path` (`.<name>.<random>.tmp`), made by
+/// [`crate::owner_only::create_new`] — mode 0600 at its open on Unix, the protected one-ACE DACL
+/// on its handle on Windows — and synced; then the temp file takes `path`'s name by a move that
+/// refuses a name already taken (tempfile's `persist_noclobber`: `renameat2(RENAME_NOREPLACE)`
+/// on Linux, `renamex_np(RENAME_EXCL)` on macOS, else `link(2)`; `MoveFileExW` without
+/// `MOVEFILE_REPLACE_EXISTING` on Windows, which keeps the temp file's DACL). `AlreadyExists`
+/// when a file is there: it is left as it was. On any failure the temp file is removed and
+/// nothing has `path`'s name, so a reader finds no key or a whole one, never part of one.
 fn write_secret_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let mut f = crate::owner_only::create_new(path)?;
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut tmp = tempfile::Builder::new()
+        .prefix(&format!(".{name}."))
+        .suffix(".tmp")
+        .make_in(dir, crate::owner_only::create_new)?;
     #[cfg(all(test, windows))]
-    crate::owner_only::testing::record_before_first_byte(&f);
-    f.write_all(bytes)?;
-    f.write_all(b"\n").ok();
+    crate::owner_only::testing::record_before_first_byte(tmp.as_file());
+    tmp.write_all(bytes)?;
+    tmp.write_all(b"\n")?;
+    #[cfg(test)]
+    if KEY_WRITE_FAILS.with(std::cell::Cell::take) {
+        return Err(std::io::Error::other("a forced write error"));
+    }
+    tmp.as_file().sync_all()?;
+    #[cfg(test)]
+    SEEN_BEFORE_PLACED.with(|seen| seen.set(Some(path.exists())));
+    // Closed first: the move opens the file again, by name. A refused move hands the temp path
+    // back in its error, and dropping that removes the temp file.
+    tmp.into_temp_path()
+        .persist_noclobber(path)
+        .map_err(|e| e.error)?;
+    // The new name is durable once the directory entry is. Best effort: a filesystem that
+    // cannot sync a directory still made the move.
+    #[cfg(unix)]
+    if let Ok(dir) = std::fs::File::open(dir) {
+        let _ = dir.sync_all();
+    }
     Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's forced write error: this thread's next key write fails once its temp file holds
+    /// the bytes, as a write to a full disk does.
+    static KEY_WRITE_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether the key's own name existed once its bytes were written and synced, just before
+    /// the temp file took the name: recorded by this thread's last key write.
+    static SEEN_BEFORE_PLACED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// Encrypt `plaintext` for a single recipient. Returns ASCII-armored
@@ -487,6 +535,122 @@ mod tests {
             loaded.to_public().to_string(),
             there.to_public().to_string()
         );
+    }
+
+    /// Names in `dir`.
+    fn names_in(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// WI-475: a key whose write fails leaves no key behind, whole or partial, and no temp file;
+    /// the next first use makes a key that loads.
+    #[test]
+    fn a_failed_key_write_leaves_no_key_and_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("age.key");
+        KEY_WRITE_FAILS.with(|fails| fails.set(true));
+        let Err(err) = load_or_create_identity_reporting(&path) else {
+            panic!("a key whose write failed was handed out");
+        };
+        assert!(err.to_string().contains("a forced write error"), "{err}");
+        assert!(!path.exists(), "a partial key was left at {path:?}");
+        assert!(
+            names_in(dir.path()).is_empty(),
+            "{:?}",
+            names_in(dir.path())
+        );
+        let (made, created) = load_or_create_identity_reporting(&path).unwrap();
+        assert!(created);
+        assert_eq!(
+            load_identity(&path)
+                .unwrap()
+                .unwrap()
+                .to_public()
+                .to_string(),
+            made.to_public().to_string()
+        );
+        assert_eq!(names_in(dir.path()), ["age.key"]);
+    }
+
+    /// WI-475: the key's name appears only once the key is whole and on disk: until then the
+    /// bytes are in a temp file beside it.
+    #[test]
+    fn the_key_has_its_name_only_once_it_is_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("age.key");
+        SEEN_BEFORE_PLACED.with(|seen| seen.set(None));
+        load_or_create_identity(&path).unwrap();
+        assert_eq!(
+            SEEN_BEFORE_PLACED.with(|seen| seen.take()),
+            Some(false),
+            "the key's name existed before the key was whole (or the write site recorded nothing)"
+        );
+        assert_eq!(names_in(dir.path()), ["age.key"]);
+    }
+
+    /// WI-475: a key file that does not parse — a partial key, an empty file — is an error that
+    /// names it, and it is left as it was: never reused as a key, never replaced by a new one.
+    #[test]
+    fn a_key_that_does_not_parse_is_reported_and_left_as_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let whole = Identity::generate().to_string();
+        let partial = &whole.expose_secret()[..30];
+        for (name, bytes) in [("partial", partial.as_bytes()), ("empty", b"".as_slice())] {
+            let path = dir.path().join(name).join("age.key");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, bytes).unwrap();
+            let Err(err) = load_or_create_identity_reporting(&path) else {
+                panic!("{name}: a key that does not parse was used");
+            };
+            let err = err.to_string();
+            assert!(
+                err.contains("parse age key") && err.contains(&format!("{path:?}")),
+                "{name}: {err}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), bytes, "{name}: changed");
+            assert!(load_identity(&path).is_err(), "{name}");
+        }
+    }
+
+    /// WI-475: first uses that race all end with the one key one of them created: none sees a
+    /// key half written, and none replaces another's.
+    #[test]
+    fn first_uses_that_race_agree_on_one_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("age.key");
+        let start = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let runs: Vec<_> = (0..8)
+            .map(|_| {
+                let (path, start) = (path.clone(), start.clone());
+                std::thread::spawn(move || {
+                    start.wait();
+                    load_or_create_identity_reporting(&path)
+                        .map(|(id, created)| (id.to_public().to_string(), created))
+                        .map_err(|e| e.to_string())
+                })
+            })
+            .collect();
+        let results: Vec<_> = runs.into_iter().map(|r| r.join().unwrap()).collect();
+        let on_disk = load_identity(&path)
+            .unwrap()
+            .unwrap()
+            .to_public()
+            .to_string();
+        for r in &results {
+            assert_eq!(r.as_ref().map(|(key, _)| key), Ok(&on_disk), "{results:?}");
+        }
+        assert_eq!(
+            results
+                .iter()
+                .filter(|r| matches!(r, Ok((_, true))))
+                .count(),
+            1,
+            "{results:?}"
+        );
+        assert_eq!(names_in(dir.path()), ["age.key"]);
     }
 
     #[test]

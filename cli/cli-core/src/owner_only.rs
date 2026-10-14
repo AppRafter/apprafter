@@ -25,6 +25,10 @@
 //!   them; a directory there ([`temp_dir`]) is owner-only from its creation.
 //! - A directory another account owns is never restricted or used ([`restrict_dir`]): its owner
 //!   can grant itself access again whatever DACL is set on it.
+//! - Who other than this account can change a file or directory ([`control`], WI-475): its
+//!   owner, and whether other accounts may write it, read from its metadata or security
+//!   descriptor alone. The target store refuses a folder another account owns or can write
+//!   (`crate::store_privacy`), and doctor reports it.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -464,6 +468,74 @@ impl CurrentUser {
     }
 }
 
+/// The SIDs whose rights on a file are no other account's ([`Ace::trusted`], WI-475): the
+/// process token's user and default owner (in buffers that own them), LocalSystem, the
+/// Administrators group, OWNER RIGHTS and CREATOR OWNER.
+#[cfg(windows)]
+struct TrustedSids {
+    user: Vec<u64>,
+    default_owner: Vec<u64>,
+    /// SECURITY_MAX_SID_SIZE (68) bytes each, 8-aligned.
+    well_known: [[u64; 9]; 4],
+}
+
+#[cfg(windows)]
+impl TrustedSids {
+    fn current() -> io::Result<Self> {
+        use windows_sys::Win32::Security::{
+            CreateWellKnownSid, TokenOwner, TokenUser, WinBuiltinAdministratorsSid,
+            WinCreatorOwnerRightsSid, WinCreatorOwnerSid, WinLocalSystemSid,
+        };
+        let mut well_known = [[0u64; 9]; 4];
+        for (sid, kind) in well_known.iter_mut().zip([
+            WinLocalSystemSid,
+            WinBuiltinAdministratorsSid,
+            WinCreatorOwnerRightsSid,
+            WinCreatorOwnerSid,
+        ]) {
+            let mut len = std::mem::size_of_val(sid) as u32;
+            // SAFETY: `sid` holds `len` writable bytes; no domain SID for these.
+            if unsafe {
+                CreateWellKnownSid(
+                    kind,
+                    std::ptr::null_mut(),
+                    sid.as_mut_ptr().cast(),
+                    &mut len,
+                )
+            } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(TrustedSids {
+            user: token_information(TokenUser)?,
+            default_owner: token_information(TokenOwner)?,
+            well_known,
+        })
+    }
+
+    /// Whether `sid` (a valid SID) is one of them.
+    fn contains(&self, sid: windows_sys::Win32::Security::PSID) -> bool {
+        use windows_sys::Win32::Security::{EqualSid, PSID, TOKEN_OWNER, TOKEN_USER};
+        // SAFETY: the buffers hold the TOKEN_USER and TOKEN_OWNER GetTokenInformation wrote.
+        let (user, owner) = unsafe {
+            (
+                (*self.user.as_ptr().cast::<TOKEN_USER>()).User.Sid,
+                (*self.default_owner.as_ptr().cast::<TOKEN_OWNER>()).Owner,
+            )
+        };
+        let well_known = self
+            .well_known
+            .iter()
+            .map(|sid| -> PSID { sid.as_ptr().cast_mut().cast() });
+        // SAFETY: every SID compared is valid: `sid` from the caller, the others above.
+        std::iter::once(user)
+            .chain(std::iter::once(owner))
+            .chain(well_known)
+            .any(|trusted| unsafe { EqualSid(sid, trusted) } != 0)
+    }
+}
+
 // ---- The system temp dir: what the CLI hands to kubectl and helm (WI-473). ----
 
 /// A new file in the system temp dir, `<prefix><random><suffix>`, made by [`create_new_shared`]:
@@ -630,6 +702,273 @@ pub fn exposure(path: &Path) -> io::Result<Exposure> {
     Ok(Exposure::Wide { restrictable })
 }
 
+// ---- Who else can change a file or directory (WI-475). ----
+
+/// Who other than this account can change an existing file or directory, as its metadata or
+/// security descriptor says ([`control`]): nothing is read from its contents, and nothing is
+/// changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Control {
+    /// Another account owns it, and so can change it — on Windows, give itself the right to,
+    /// whatever its DACL says. Unix: an owner other than this process's effective user. Windows:
+    /// an owner [`restrict_dir`] does not accept (this account, the token's default owner,
+    /// LocalSystem and the Administrators group are accepted).
+    pub foreign_owner: bool,
+    /// Other accounts may write it: a directory's entries they can create, replace or remove, a
+    /// file's bytes. Unix: the write bit for others — a sticky bit does not undo it, since they
+    /// can still create names in it — or for its group, unless that group is this account's
+    /// own private group ([`group_is_only`]). Windows: no DACL at all, or an access-allowed ACE
+    /// that grants a right to write, to delete, or to change the DACL or the owner, to a SID
+    /// other than this account's, the token's default owner, LocalSystem, the Administrators
+    /// group, OWNER RIGHTS or CREATOR OWNER — on the object itself or for what is made in it,
+    /// which inherits it.
+    pub writable_by_others: bool,
+    /// Unix: the permission bits (`st_mode & 0o7777`), for display. `None` on Windows.
+    pub mode: Option<u32>,
+}
+
+impl Control {
+    /// Whether this account alone can change it.
+    pub fn is_private(&self) -> bool {
+        !self.foreign_owner && !self.writable_by_others
+    }
+}
+
+/// [`Control`] of the existing file or directory at `path`, a symlink followed.
+#[cfg(unix)]
+pub fn control(path: &Path) -> io::Result<Control> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path)?;
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    #[allow(unused_mut)] // Mutated only by the tests' seam.
+    let mut foreign_owner = meta.uid() != me;
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        foreign_owner |= pretend::is_foreign(path);
+    }
+    let mode = meta.mode() & 0o7777;
+    let writable_by_others =
+        mode & 0o002 != 0 || (mode & 0o020 != 0 && !group_is_only(meta.gid(), me));
+    Ok(Control {
+        foreign_owner,
+        writable_by_others,
+        mode: Some(mode),
+    })
+}
+
+/// [`Control`] of the existing file or directory at `path`, a reparse point followed. Opened
+/// with `READ_CONTROL` only.
+#[cfg(windows)]
+pub fn control(path: &Path) -> io::Result<Control> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, READ_CONTROL};
+    let file = OpenOptions::new()
+        .access_mode(READ_CONTROL)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
+    #[allow(unused_mut)] // Mutated only by the tests' seam.
+    let mut foreign_owner = !trusted_owner(&file)?;
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        foreign_owner |= pretend::is_foreign(path);
+    }
+    Ok(Control {
+        foreign_owner,
+        writable_by_others: dacl_of_file(&file)?.writable_by_others(),
+        mode: None,
+    })
+}
+
+/// Whether the group `gid` holds no account but `uid`: `uid`'s primary group, named as the
+/// account is, with no other member listed — a user private group, in which a umask of 002
+/// (the default for such groups on several distributions) makes every new folder
+/// group-writable to no one else. Read from the user and group databases (`getpwuid_r`,
+/// `getgrgid_r`); an account or a group that cannot be read counts as shared.
+#[cfg(unix)]
+fn group_is_only(gid: u32, uid: u32) -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(alone) = pretend::pretended_group_alone() {
+        return alone;
+    }
+    match (account(uid), group(gid)) {
+        (Some(account), Some(group)) => is_private_group(&account, gid, &group),
+        _ => false,
+    }
+}
+
+/// [`group_is_only`]'s judgement: `account`'s primary group is `gid`, `group` (gid's entry) has
+/// its name, and lists no member but it.
+#[cfg(unix)]
+fn is_private_group(account: &Account, gid: u32, group: &Group) -> bool {
+    account.gid == gid
+        && group.name == account.name
+        && group.members.iter().all(|m| *m == account.name)
+}
+
+/// An entry of the user database: the name and the primary group.
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Account {
+    name: Vec<u8>,
+    gid: u32,
+}
+
+/// An entry of the group database: the name and the members it lists (not the accounts whose
+/// primary group it is).
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Group {
+    name: Vec<u8>,
+    members: Vec<Vec<u8>>,
+}
+
+/// The largest buffer [`account`] and [`group`] grow to; a group listing more members than
+/// that holds counts as shared.
+#[cfg(unix)]
+const NSS_BUFFER_MAX: usize = 1 << 20;
+
+/// `uid`'s entry in the user database (`getpwuid_r`), or `None`.
+#[cfg(unix)]
+fn account(uid: u32) -> Option<Account> {
+    let mut buf = vec![0u8; 4096];
+    loop {
+        // SAFETY: plain C data; getpwuid_r fills every field it returns.
+        let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut found: *mut libc::passwd = std::ptr::null_mut();
+        // SAFETY: `buf` holds `buf.len()` writable bytes for the strings `entry` points into;
+        // `entry` and `found` are valid out-pointers.
+        let rc = unsafe {
+            libc::getpwuid_r(
+                uid,
+                &mut entry,
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                &mut found,
+            )
+        };
+        if rc == libc::ERANGE && buf.len() < NSS_BUFFER_MAX {
+            buf.resize(buf.len() * 2, 0);
+            continue;
+        }
+        if rc != 0 || found.is_null() || entry.pw_name.is_null() {
+            return None;
+        }
+        // SAFETY: a NUL-terminated string in `buf`, which outlives this use.
+        let name = unsafe { std::ffi::CStr::from_ptr(entry.pw_name) }
+            .to_bytes()
+            .to_vec();
+        return Some(Account {
+            name,
+            gid: entry.pw_gid,
+        });
+    }
+}
+
+/// `gid`'s entry in the group database (`getgrgid_r`), or `None`.
+#[cfg(unix)]
+fn group(gid: u32) -> Option<Group> {
+    let mut buf = vec![0u8; 4096];
+    loop {
+        // SAFETY: plain C data; getgrgid_r fills every field it returns.
+        let mut entry: libc::group = unsafe { std::mem::zeroed() };
+        let mut found: *mut libc::group = std::ptr::null_mut();
+        // SAFETY: as in `account`.
+        let rc = unsafe {
+            libc::getgrgid_r(
+                gid,
+                &mut entry,
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                &mut found,
+            )
+        };
+        if rc == libc::ERANGE && buf.len() < NSS_BUFFER_MAX {
+            buf.resize(buf.len() * 2, 0);
+            continue;
+        }
+        if rc != 0 || found.is_null() || entry.gr_name.is_null() {
+            return None;
+        }
+        // SAFETY: NUL-terminated strings in `buf`; `gr_mem` is a NULL-terminated array of them.
+        let (name, members) = unsafe {
+            let name = std::ffi::CStr::from_ptr(entry.gr_name).to_bytes().to_vec();
+            let mut members = Vec::new();
+            let mut at = entry.gr_mem;
+            while !at.is_null() && !(*at).is_null() {
+                members.push(std::ffi::CStr::from_ptr(*at).to_bytes().to_vec());
+                at = at.add(1);
+            }
+            (name, members)
+        };
+        return Some(Group { name, members });
+    }
+}
+
+/// What the tests of [`control`] — this crate's, and through the `test-support` feature the
+/// core's and the CLI's — pretend about a file or directory they made in their own temp dir:
+/// another account's, or a group that is this account's alone. Never a system directory, and
+/// never in a shipped binary (`test-support` is enabled only from `[dev-dependencies]`). Per
+/// thread, and only while the guard lives.
+#[cfg(any(test, feature = "test-support"))]
+pub mod pretend {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    thread_local! {
+        static FOREIGN: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+        static GROUP_ALONE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// While the guard lives, [`super::control`] on this thread reads `path` (exactly that
+    /// path) as owned by another account. Its permissions are read as they are.
+    pub fn foreign_owner(path: &Path) -> ForeignOwner {
+        FOREIGN.with(|f| f.borrow_mut().push(path.to_path_buf()));
+        ForeignOwner(path.to_path_buf())
+    }
+
+    /// [`foreign_owner`]'s guard.
+    pub struct ForeignOwner(PathBuf);
+
+    impl Drop for ForeignOwner {
+        fn drop(&mut self) {
+            FOREIGN.with(|f| {
+                let mut f = f.borrow_mut();
+                if let Some(at) = f.iter().position(|p| *p == self.0) {
+                    f.remove(at);
+                }
+            });
+        }
+    }
+
+    pub(super) fn is_foreign(path: &Path) -> bool {
+        FOREIGN.with(|f| f.borrow().iter().any(|p| p == path))
+    }
+
+    /// While the guard lives, [`super::control`] on this thread (Unix) judges a group-writable
+    /// file's group as this account's alone (`true`) or as shared (`false`), whatever the user
+    /// and group databases say: the machine running the tests may have user private groups
+    /// or not.
+    pub fn group_alone(alone: bool) -> GroupAlone {
+        GROUP_ALONE.with(|g| g.set(Some(alone)));
+        GroupAlone
+    }
+
+    /// [`group_alone`]'s guard.
+    pub struct GroupAlone;
+
+    impl Drop for GroupAlone {
+        fn drop(&mut self) {
+            GROUP_ALONE.with(|g| g.set(None));
+        }
+    }
+
+    #[cfg_attr(windows, allow(dead_code))] // Unix's group check reads it.
+    pub(super) fn pretended_group_alone() -> Option<bool> {
+        GROUP_ALONE.with(|g| g.get())
+    }
+}
+
 // ---- Reading a DACL. ----
 
 /// `ACCESS_ALLOWED_ACE_TYPE` and `ACCESS_DENIED_ACE_TYPE` (winnt.h; windows-sys has them only
@@ -663,7 +1002,34 @@ pub struct Ace {
     pub mask: u32,
     /// Whether the ACE's SID is the process token's user; only for those types too.
     pub for_this_user: bool,
+    /// Whether the ACE's SID is one whose rights are no other account's (WI-475): the process
+    /// token's user or default owner, LocalSystem, the Administrators group, OWNER RIGHTS (the
+    /// owner, which [`Control::foreign_owner`] judges) or CREATOR OWNER (whoever creates an
+    /// object that inherits it; on the object itself it matches no one). Only for those types
+    /// too.
+    pub trusted: bool,
 }
+
+/// The rights that let an account change a file or a directory's entries ([`Dacl::writable_by_others`]):
+/// write its data or create files in it (`FILE_WRITE_DATA`), append or create folders in it
+/// (`FILE_APPEND_DATA`), remove what is in it (`FILE_DELETE_CHILD`), remove or rename it
+/// (`DELETE`), change its DACL or its owner (`WRITE_DAC`, `WRITE_OWNER`), and the generic
+/// rights that include them. Not its attributes or extended attributes, which change no bytes.
+#[cfg(windows)]
+const WRITE_RIGHTS: u32 = {
+    use windows_sys::Win32::Foundation::{GENERIC_ALL, GENERIC_WRITE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_APPEND_DATA, FILE_DELETE_CHILD, FILE_WRITE_DATA, WRITE_DAC, WRITE_OWNER,
+    };
+    FILE_WRITE_DATA
+        | FILE_APPEND_DATA
+        | FILE_DELETE_CHILD
+        | DELETE
+        | WRITE_DAC
+        | WRITE_OWNER
+        | GENERIC_WRITE
+        | GENERIC_ALL
+};
 
 #[cfg(windows)]
 impl Dacl {
@@ -677,6 +1043,18 @@ impl Dacl {
                 ACCESS_ALLOWED => ace.for_this_user,
                 ACCESS_DENIED => true,
                 _ => false,
+            })
+    }
+
+    /// Whether another account may change the object (WI-475): there is no DACL, or an
+    /// access-allowed ACE grants one of [`WRITE_RIGHTS`] to a SID that is not
+    /// [`Ace::trusted`]. Its inheritance flags are not read: an ACE that only what is made in
+    /// the object inherits lets that account change the folders and files AppRafter makes
+    /// there. A deny ACE is not weighed against it.
+    pub fn writable_by_others(&self) -> bool {
+        self.null
+            || self.aces.iter().any(|ace| {
+                ace.kind == ACCESS_ALLOWED && !ace.trusted && ace.mask & WRITE_RIGHTS != 0
             })
     }
 }
@@ -788,6 +1166,7 @@ fn read_dacl(
             return Err(io::Error::last_os_error());
         }
         let user = CurrentUser::current()?;
+        let trusted = TrustedSids::current()?;
         let mut aces = Vec::new();
         for index in 0..info.AceCount {
             let mut ace = std::ptr::null_mut();
@@ -797,23 +1176,28 @@ fn read_dacl(
             }
             // SAFETY: every ACE starts with an ACE_HEADER.
             let header = unsafe { *ace.cast::<ACE_HEADER>() };
-            let (mask, for_this_user) =
+            let (mask, for_this_user, sid_trusted) =
                 if header.AceType == ACCESS_ALLOWED || header.AceType == ACCESS_DENIED {
                     // Access-allowed and access-denied share ACCESS_ALLOWED_ACE's layout.
                     let ace = ace.cast::<ACCESS_ALLOWED_ACE>();
                     // SAFETY: an ACE of that layout, told by its type byte.
                     unsafe {
                         let sid: PSID = std::ptr::addr_of_mut!((*ace).SidStart).cast();
-                        ((*ace).Mask, EqualSid(sid, user.sid()) != 0)
+                        (
+                            (*ace).Mask,
+                            EqualSid(sid, user.sid()) != 0,
+                            trusted.contains(sid),
+                        )
                     }
                 } else {
-                    (0, false)
+                    (0, false, false)
                 };
             aces.push(Ace {
                 kind: header.AceType,
                 flags: header.AceFlags,
                 mask,
                 for_this_user,
+                trusted: sid_trusted,
             });
         }
         Ok(Dacl {
@@ -1429,6 +1813,7 @@ mod tests {
             flags: 0,
             mask: 0x1f01ff,
             for_this_user,
+            trusted: for_this_user,
         };
         let dacl = |protected, null, aces| Dacl {
             protected,
@@ -1485,6 +1870,194 @@ mod tests {
         assert!(!testing::trusted_owner(Path::new(&system_root)).unwrap());
         let dir = tempfile::tempdir().unwrap();
         assert!(testing::trusted_owner(dir.path()).unwrap());
+    }
+
+    // ---- WI-475: who else can change a file or directory ----
+
+    /// A directory and a file this process made in its own temp dir are this account's alone.
+    #[test]
+    fn what_this_account_made_is_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"x").unwrap();
+        for path in [dir.path(), file.as_path()] {
+            let c = control(path).unwrap();
+            assert!(c.is_private(), "{path:?}: {c:?}");
+        }
+        assert_eq!(
+            control(&dir.path().join("missing")).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    /// Another account's directory (pretended, on a temp dir: never a system one) is foreign,
+    /// and only that path, only while the guard lives.
+    #[test]
+    fn a_folder_another_account_owns_is_foreign() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = dir.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        {
+            let _foreign = pretend::foreign_owner(&other);
+            let c = control(&other).unwrap();
+            assert!(c.foreign_owner && !c.writable_by_others, "{c:?}");
+            assert!(!c.is_private());
+            assert!(control(dir.path()).unwrap().is_private());
+        }
+        assert!(control(&other).unwrap().is_private());
+    }
+
+    /// The owner is read from the folder itself, not only through the tests' seam: a folder
+    /// another account owns on every system — `/`, root's (Unix), `%SystemRoot%`,
+    /// TrustedInstaller's (Windows) — is foreign; one this process made is not. `control` only
+    /// reads its metadata or security descriptor (it has no way to change anything), so
+    /// pointing it at a system folder changes nothing whatever the code under test does
+    /// (GOTCHA-255 is about code that may set a DACL).
+    #[test]
+    fn the_owner_is_read_from_the_folder() {
+        #[cfg(unix)]
+        let system = std::path::PathBuf::from("/");
+        #[cfg(windows)]
+        let system = std::path::PathBuf::from(
+            std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into()),
+        );
+        assert!(control(&system).unwrap().foreign_owner, "{system:?}");
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!control(dir.path()).unwrap().foreign_owner);
+    }
+
+    /// Unix: the write bit for others is never private, with the sticky bit too (others can
+    /// still create names); read and execute for others are.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_others_can_write_is_not_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("folder");
+        std::fs::create_dir(&folder).unwrap();
+        for (mode, writable) in [
+            (0o700, false),
+            (0o755, false),
+            (0o555, false),
+            (0o705, false),
+            (0o707, true),
+            (0o777, true),
+            (0o1777, true),
+            (0o703, true),
+        ] {
+            std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(mode)).unwrap();
+            let c = control(&folder).unwrap();
+            assert_eq!(c.writable_by_others, writable, "{mode:o}: {c:?}");
+            assert_eq!(c.mode, Some(mode), "{mode:o}");
+            assert!(!c.foreign_owner, "{mode:o}");
+        }
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    /// Unix: the group's write bit is private only when the group is this account's own.
+    #[cfg(unix)]
+    #[test]
+    fn a_group_writable_folder_is_private_only_in_a_group_of_this_account_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("folder");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o770)).unwrap();
+        {
+            let _shared = pretend::group_alone(false);
+            assert!(control(&folder).unwrap().writable_by_others);
+        }
+        {
+            let _alone = pretend::group_alone(true);
+            assert!(control(&folder).unwrap().is_private());
+            std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o772)).unwrap();
+            assert!(
+                control(&folder).unwrap().writable_by_others,
+                "others' write bit, whatever the group"
+            );
+        }
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    /// Unix: a user private group is the account's primary group, named as it is, listing no
+    /// one else.
+    #[cfg(unix)]
+    #[test]
+    fn a_private_group_is_the_accounts_own_and_names_no_one_else() {
+        let me = Account {
+            name: b"op".to_vec(),
+            gid: 1000,
+        };
+        let group = |name: &[u8], members: &[&[u8]]| Group {
+            name: name.to_vec(),
+            members: members.iter().map(|m| m.to_vec()).collect(),
+        };
+        assert!(is_private_group(&me, 1000, &group(b"op", &[])));
+        assert!(is_private_group(&me, 1000, &group(b"op", &[b"op"])));
+        assert!(!is_private_group(
+            &me,
+            1000,
+            &group(b"op", &[b"op", b"eve"])
+        ));
+        assert!(!is_private_group(&me, 1000, &group(b"users", &[])));
+        assert!(!is_private_group(&me, 100, &group(b"op", &[])));
+    }
+
+    /// Unix: the user and group databases are read for this process's own account and group.
+    #[cfg(unix)]
+    #[test]
+    fn this_accounts_entries_are_read() {
+        // SAFETY: no preconditions.
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        let me = account(uid).expect("this account's entry");
+        assert!(!me.name.is_empty());
+        assert!(group(gid).is_some_and(|g| !g.name.is_empty()));
+        assert_eq!(account(u32::MAX - 7), None);
+    }
+
+    /// Windows: an access-allowed ACE that lets another SID write, create, delete or change the
+    /// DACL makes a folder writable by others — on the folder or for what is made in it — and
+    /// so does no DACL at all; reading, a deny ACE and the trusted SIDs do not.
+    #[cfg(windows)]
+    #[test]
+    fn a_dacl_that_lets_another_account_write_is_not_private() {
+        let me = testing::this_user_sid().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("folder");
+        std::fs::create_dir(&folder).unwrap();
+        for (sddl, writable) in [
+            (format!("D:P(A;OICI;FA;;;{me})"), false),
+            (format!("D:P(A;OICI;FA;;;{me})(A;;FR;;;WD)"), false),
+            (format!("D:P(A;OICI;FA;;;{me})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;;FA;;;OW)(A;OICIIO;GA;;;CO)"), false),
+            (format!("D:P(D;;FA;;;WD)(A;OICI;FA;;;{me})"), false),
+            (format!("D:P(A;OICI;FA;;;{me})(A;;0x2;;;WD)"), true),
+            (format!("D:P(A;OICI;FA;;;{me})(A;;0x4;;;BU)"), true),
+            (format!("D:P(A;OICI;FA;;;{me})(A;;0x40;;;AU)"), true),
+            (format!("D:P(A;OICI;FA;;;{me})(A;;SD;;;WD)"), true),
+            (format!("D:P(A;OICI;FA;;;{me})(A;;WD;;;WD)"), true),
+            (format!("D:P(A;OICI;FA;;;{me})(A;;WO;;;WD)"), true),
+            (format!("D:P(A;OICI;FA;;;{me})(A;;GW;;;WD)"), true),
+            (format!("D:P(A;OICI;FA;;;{me})(A;OICIIO;GA;;;AU)"), true),
+            (format!("D:P(A;OICI;FA;;;{me})(A;OICI;FA;;;S-1-5-21-1-2-3-1001)"), true),
+            ("D:NO_ACCESS_CONTROL".to_string(), true),
+        ] {
+            testing::set_dacl(&folder, &sddl).unwrap();
+            let c = control(&folder).unwrap();
+            assert_eq!(c.writable_by_others, writable, "{sddl}: {c:?}");
+            assert!(!c.foreign_owner, "{sddl}");
+        }
+        testing::set_dacl(&folder, &format!("D:P(A;OICI;FA;;;{me})")).unwrap();
+    }
+
+    /// Windows: an owner `restrict_dir` would refuse makes the folder foreign (the WI-473 seam,
+    /// on a temp dir), the DACL read as it is.
+    #[cfg(windows)]
+    #[test]
+    fn a_folder_under_a_foreign_owner_sid_is_foreign() {
+        let dir = tempfile::tempdir().unwrap();
+        let _foreign = testing::pretend_owner("S-1-5-21-1-2-3-1001").unwrap();
+        let c = control(dir.path()).unwrap();
+        assert!(c.foreign_owner && !c.writable_by_others, "{c:?}");
     }
 
     /// A directory another account owns is refused as such and left as it was, whether or not

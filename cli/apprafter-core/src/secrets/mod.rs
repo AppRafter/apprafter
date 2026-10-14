@@ -22,7 +22,9 @@
 //! come from a [`CacheKey`] (`tests/guards.rs`, D.4a T16); a read never creates the age key
 //! (GOTCHA-120); a failure to decrypt is an error naming the key, never "none cached"; a locked
 //! store takes no token from a clear file or another store's marker (T42, T34), and its caches
-//! open only with its own identity (T26, T38).
+//! open only with its own identity (T26, T38); and no secret is handed out, or settled for a
+//! write, from a store a folder of which another account owns or can write (WI-475,
+//! `cli_core::store_privacy`).
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -361,6 +363,15 @@ impl SecretStore {
         }
     }
 
+    /// WI-475: before a secret of the store is handed out, or one is settled for a write, every
+    /// folder of the store must be this account's alone (`cli_core::store_privacy`): an account
+    /// that owns one, or may write to it, could have put its own token, kubeconfig or vault
+    /// there for this one to use. Changes are refused the same way under the store lock
+    /// (`StoreLock`).
+    fn ensure_private(&self) -> cli_core::Result<()> {
+        cli_core::store_privacy::ensure_private(&self.store)
+    }
+
     /// `store.yaml`, read now.
     fn state(&self) -> cli_core::Result<StoreState> {
         let Some(file) = read_store_file(self.store.root())? else {
@@ -450,6 +461,7 @@ impl SecretStore {
     /// store, through a session (which may prompt, in the CLI); never a clear token (T42) nor
     /// another store's; a marker with no vault entry is `token_missing_from_vault` (T43).
     pub fn stored_token(&self, target: &str) -> cli_core::Result<Option<SecretString>> {
+        self.ensure_private()?;
         match self.state()? {
             StoreState::Files => files::stored_token(&self.store, target),
             StoreState::Locked { file, id } => match locked::placed(&self.store, &id, target)? {
@@ -486,6 +498,7 @@ impl SecretStore {
     /// refusals as `stored_token` for a clear token, another store's marker and an unfinished
     /// lock. Never a prompt.
     pub fn open_token(&self, target: &str) -> cli_core::Result<OpenToken> {
+        self.ensure_private()?;
         match self.state()? {
             StoreState::Files => files::stored_token(&self.store, target).map(OpenToken::Token),
             StoreState::Locked { file, id } => match locked::placed(&self.store, &id, target)? {
@@ -521,6 +534,7 @@ impl SecretStore {
     /// What a token write needs. Call it BEFORE taking the store lock: on a locked store it
     /// asks the client for the key (which may prompt), after checking that the vault reads.
     pub fn prepare_write(&self) -> cli_core::Result<WriteKey> {
+        self.ensure_private()?;
         match self.state()? {
             StoreState::Files => Ok(WriteKey(WriteFor::Files)),
             StoreState::Locked { file, id } => {
@@ -666,6 +680,7 @@ impl SecretStore {
     /// target. On a locked store: its own identity, through a session — never the shared key:
     /// `APPRAFTER_AGE_KEY` set is `override_refused`, before any prompt (T35).
     pub fn cache_key(&self, target: &str) -> cli_core::Result<CacheKey> {
+        self.ensure_private()?;
         match self.state()? {
             StoreState::Files => files::cache_key(&self.age_key_path, target),
             StoreState::Locked { file, id } => {
@@ -691,6 +706,7 @@ impl SecretStore {
     /// store's own key (T26) — through [`SecretStore::cache_key`], so `APPRAFTER_AGE_KEY` set is
     /// `override_refused` there too, before any prompt (T35).
     pub fn cache_key_for_new_secret(&self, target: &str) -> cli_core::Result<NewCacheKey> {
+        self.ensure_private()?;
         match self.state()? {
             StoreState::Files => {
                 files::cache_key_for_new_secret(&self.store, &self.age_key_path, target)
@@ -711,6 +727,7 @@ impl SecretStore {
         hetzner: &HetznerCloudState,
         target: &str,
     ) -> cli_core::Result<Option<Zeroizing<String>>> {
+        self.ensure_private()?;
         match (
             hetzner.kubeconfig_age.as_deref(),
             hetzner.kubeconfig_yaml.as_deref(),
@@ -758,6 +775,7 @@ impl SecretStore {
         secret: CachedSecret,
         create_key: bool,
     ) -> cli_core::Result<NewCache> {
+        self.ensure_private()?;
         let (key, settled, created_key, drop_other) = match self.state()? {
             StoreState::Files => match files::cache_key(&self.age_key_path, target) {
                 Ok(key) => (key, Settled::Files, false, None),

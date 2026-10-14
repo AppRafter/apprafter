@@ -626,7 +626,8 @@ fn refusal(e: CliError) -> cli_core::Result<TokenRead> {
         | CliError::LockIncomplete { .. }
         | CliError::VaultUnreadable { .. }
         | CliError::SlotRefused { .. }
-        | CliError::StoreFileUnreadable { .. }) => Ok(TokenRead::Refused(e)),
+        | CliError::StoreFileUnreadable { .. }
+        | CliError::StoreNotPrivate { .. }) => Ok(TokenRead::Refused(e)),
         e => Err(e),
     }
 }
@@ -775,29 +776,165 @@ fn wide_file(id: CheckId, path: &Path, what: &str) -> Option<Check> {
     })
 }
 
-/// The target store's secret files that other accounts may open (WI-473), a warning each, in
-/// this order: each target's `credentials.yaml` (the checked target's has its own row) and
-/// `state.json`, then the age key. The vault's are the lock's rows ([`vault_file_rows`]).
+/// The target store's folders other accounts can change (WI-475), then its secret files that
+/// other accounts own or may open (WI-473, WI-475), a warning each, in this order: each folder
+/// ([`folder_rows`]); then each target's `credentials.yaml` (the checked target's mode or DACL
+/// has its own row) and `state.json`, then the age key, each its owner before its permissions.
+/// The vault's are the lock's rows ([`vault_file_rows`]). Read from metadata and security
+/// descriptors alone: nothing is changed.
 fn secret_file_rows(ctx: &Context, checked: Option<&str>) -> Vec<Check> {
     let store = ctx.store();
     let secrets = ctx.secrets();
-    let mut rows = Vec::new();
+    let mut rows = folder_rows(&store);
     for name in cli_core::list_target_names(&store).unwrap_or_default() {
+        let credentials = secrets.credentials_file(&name);
+        let what = format!("Credentials file of target `{name}`");
+        rows.extend(foreign_file(&credentials, &what));
         if Some(name.as_str()) != checked {
-            rows.extend(wide_file(
-                CheckId::Secrets,
-                &secrets.credentials_file(&name),
-                &format!("Credentials file of target `{name}`"),
-            ));
+            rows.extend(wide_file(CheckId::Secrets, &credentials, &what));
         }
-        rows.extend(wide_file(
-            CheckId::Secrets,
-            &StatePaths::for_active_target(&store, &name).state_file(),
-            &format!("State file of target `{name}`"),
-        ));
+        let state = StatePaths::for_active_target(&store, &name).state_file();
+        let what = format!("State file of target `{name}`");
+        rows.extend(foreign_file(&state, &what));
+        rows.extend(wide_file(CheckId::Secrets, &state, &what));
     }
+    rows.extend(foreign_file(ctx.age_key_path(), "Age key"));
     rows.extend(wide_file(CheckId::Secrets, ctx.age_key_path(), "Age key"));
     rows
+}
+
+#[cfg(unix)]
+const FOREIGN_FOLDER_FIX: &str = "Another account owns this folder of the target store, so it \
+     can replace the files in it: a token, a cached kubeconfig or a vault of its own would send \
+     your next deploy to a project or a cluster of its choosing. AppRafter uses and writes none \
+     of this store's secrets until it is fixed. Move the store to a folder only you can write \
+     (APPRAFTER_CONFIG_DIR), or have an administrator make your account its owner (`sudo \
+     chown`).";
+#[cfg(windows)]
+const FOREIGN_FOLDER_FIX: &str = "Another account owns this folder of the target store, so it \
+     can give itself the right to replace the files in it, whatever its permissions say: a \
+     token, a cached kubeconfig or a vault of its own would send your next deploy to a project \
+     or a cluster of its choosing. AppRafter uses and writes none of this store's secrets until \
+     it is fixed. Move the store to a folder only you can write (APPRAFTER_CONFIG_DIR), or have \
+     an administrator make your account its owner (the folder's Properties › Security › \
+     Advanced).";
+#[cfg(unix)]
+const WRITABLE_FOLDER_FIX: &str = "Other accounts can create, replace or remove files in this \
+     folder of the target store: a token, a cached kubeconfig or a vault of theirs would send \
+     your next deploy to a project or a cluster of their choosing. AppRafter uses and writes \
+     none of this store's secrets until it is fixed. Remove their write access with `chmod \
+     go-w` on the folder, or move the store to a folder only you can write \
+     (APPRAFTER_CONFIG_DIR).";
+#[cfg(windows)]
+const WRITABLE_FOLDER_FIX: &str = "Other accounts can create, replace or remove files in this \
+     folder of the target store: a token, a cached kubeconfig or a vault of theirs would send \
+     your next deploy to a project or a cluster of their choosing. AppRafter uses and writes \
+     none of this store's secrets until it is fixed. Remove their write access in the folder's \
+     Properties › Security, or move the store to a folder only you can write \
+     (APPRAFTER_CONFIG_DIR).";
+#[cfg(unix)]
+const FOREIGN_FILE_FIX: &str = "Another account owns this file, so it can change what AppRafter \
+     reads from it. Have an administrator make your account its owner (`sudo chown`), or put \
+     back a copy of your own.";
+#[cfg(windows)]
+const FOREIGN_FILE_FIX: &str = "Another account owns this file, so it can give itself the right \
+     to change what AppRafter reads from it, whatever its permissions say. Have an administrator \
+     make your account its owner (the file's Properties › Security › Advanced), or put back a \
+     copy of your own.";
+
+/// The rows of the store's folders another account owns or can write (WI-475), a warning each,
+/// in `cli_core::store_privacy::folders`' order: a folder may have both. A folder whose owner
+/// or permissions cannot be read is said so, never passed over (the store's refusal fails
+/// closed on it too). Nothing is changed.
+fn folder_rows(store: &cli_core::TargetStorePaths) -> Vec<Check> {
+    let folders = match cli_core::store_privacy::folders(store) {
+        Ok(folders) => folders,
+        Err(e) => {
+            return vec![unknown_folder(
+                store.root(),
+                "Target store folder",
+                &e.to_string(),
+            )]
+        }
+    };
+    let mut rows = Vec::new();
+    for folder in folders {
+        let what = if folder.is_root() {
+            "Target store folder".to_string()
+        } else {
+            format!("Target store folder `{}`", folder.rel)
+        };
+        let control = match cli_core::owner_only::control(&folder.path) {
+            Ok(control) => control,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                rows.push(unknown_folder(&folder.path, &what, &e.to_string()));
+                continue;
+            }
+        };
+        let shown = folder.path.display().to_string();
+        if control.foreign_owner {
+            rows.push(Check {
+                detail: Some(shown.clone()),
+                fix: Some(explain(FOREIGN_FOLDER_FIX)),
+                ..row(
+                    CheckId::Secrets,
+                    CheckStatus::Warn,
+                    format!("{what} belongs to another account"),
+                )
+            });
+        }
+        if control.writable_by_others {
+            let mode = control
+                .mode
+                .map(|m| format!(" (mode {m:o})"))
+                .unwrap_or_default();
+            rows.push(Check {
+                detail: Some(shown),
+                fix: Some(explain(WRITABLE_FOLDER_FIX)),
+                ..row(
+                    CheckId::Secrets,
+                    CheckStatus::Warn,
+                    format!("{what} can be changed by other accounts{mode}"),
+                )
+            });
+        }
+    }
+    rows
+}
+
+fn unknown_folder(path: &Path, what: &str, e: &str) -> Check {
+    Check {
+        detail: Some(path.display().to_string()),
+        fix: Some(explain(&format!(
+            "Its owner and permissions could not be read: {e}. AppRafter uses and writes none \
+             of this store's secrets until they can be."
+        ))),
+        ..row(
+            CheckId::Secrets,
+            CheckStatus::Warn,
+            format!("{what}: who can change it is unknown"),
+        )
+    }
+}
+
+/// The row of a secret file another account owns (WI-475), a warning, or `None` when this
+/// account does (or there is no file, or its owner cannot be read: [`wide_file`] says that on
+/// Windows). Read from its metadata or security descriptor alone; nothing is changed.
+fn foreign_file(path: &Path, what: &str) -> Option<Check> {
+    let control = cli_core::owner_only::control(path).ok()?;
+    if !control.foreign_owner {
+        return None;
+    }
+    Some(Check {
+        detail: Some(path.display().to_string()),
+        fix: Some(explain(FOREIGN_FILE_FIX)),
+        ..row(
+            CheckId::Secrets,
+            CheckStatus::Warn,
+            format!("{what} belongs to another account"),
+        )
+    })
 }
 
 fn provider_supported(target: &Loaded) -> Check {
@@ -1213,7 +1350,8 @@ fn kube_api(
                 e @ (CliError::LockIncomplete { .. }
                 | CliError::VaultUnreadable { .. }
                 | CliError::SlotRefused { .. }
-                | CliError::StoreFileUnreadable { .. }),
+                | CliError::StoreFileUnreadable { .. }
+                | CliError::StoreNotPrivate { .. }),
             ) => return Ok(refused_skip(base, &e)),
             Err(e) => {
                 return Ok(Check {
@@ -1249,6 +1387,10 @@ fn kube_api(
         }
         Err(CoreError::AgeKeyMissing { path }) => return Ok(age_key_missing(base, target, path)),
         Err(CoreError::Cli(CliError::StoreLocked { .. })) => return Ok(locked_skip(base)),
+        // WI-475: a kubeconfig another account could have put there is never run.
+        Err(CoreError::Cli(e @ CliError::StoreNotPrivate { .. })) => {
+            return Ok(refused_skip(base, &e))
+        }
         // A key that does not open the cache: its own fix, which names the refetch (review #8).
         Err(CoreError::Cli(cli_core::CliError::CacheUndecryptable {
             target: whose,
@@ -1361,7 +1503,8 @@ fn node_ssh(
             e @ (CliError::LockIncomplete { .. }
             | CliError::VaultUnreadable { .. }
             | CliError::SlotRefused { .. }
-            | CliError::StoreFileUnreadable { .. }),
+            | CliError::StoreFileUnreadable { .. }
+            | CliError::StoreNotPrivate { .. }),
         )) => return Ok(refused_skip(base.clone(), &e)),
         Err(e) => return Ok(provider_failure(base, target.name(), e)),
     };
@@ -1733,14 +1876,14 @@ fn slot_facts(slots: &[SlotView], store: &Path) -> Vec<Check> {
     rows
 }
 
-/// The vault file's mode and owner (T27: a wider mode or a foreign owner is a warning, never a
-/// refusal). The owner is compared with the store directory's: no process identity is read. On
-/// Windows its DACL, as every secret file's ([`wide_file`], WI-473).
+/// The vault file's owner and DACL on Windows, as every secret file's ([`foreign_file`],
+/// WI-475; [`wide_file`], WI-473): a warning each, never a refusal of the file (T27).
 #[cfg(windows)]
 fn vault_file_rows(ctx: &Context) -> Vec<Check> {
     let path = ctx.config_root().join(crate::vault::VAULT_FILE);
-    wide_file(CheckId::Secrets, &path, "Vault file")
+    foreign_file(&path, "Vault file")
         .into_iter()
+        .chain(wide_file(CheckId::Secrets, &path, "Vault file"))
         .collect()
 }
 
@@ -3133,6 +3276,240 @@ mod tests {
                 (CheckStatus::Skipped, Some("state unreadable"))
             );
         }
+    }
+
+    // ---- WI-475: a store another account can change ----
+
+    /// This computer's rows that name who else can change the store, in order.
+    fn store_rows(r: &DoctorReport) -> Vec<Check> {
+        group(r, GroupId::ThisComputer)
+            .into_iter()
+            .filter(|c| c.title.contains("another account") || c.title.contains("other accounts"))
+            .collect()
+    }
+
+    /// A store with targets `dev` and `prod`, each with a state file, and the age key.
+    fn two_targets(f: &Fx) -> Context {
+        let ctx = ctx(f, OFFLINE).with_no_ping(true);
+        for t in ["dev", "prod"] {
+            add(&ctx, t, "hetzner-cloud", Some(TOKEN), None);
+            State::default()
+                .save(&StatePaths::for_active_target(&ctx.store(), t))
+                .unwrap();
+        }
+        cli_core::secrets::load_or_create_identity(ctx.age_key_path()).unwrap();
+        ctx
+    }
+
+    /// WI-475: a store that is this account's alone has no such row (the goldens' stores).
+    #[test]
+    fn a_store_of_this_account_alone_has_no_owner_or_write_row() {
+        let f = fx();
+        let ctx = two_targets(&f);
+        let r = doctor(&ctx, named("prod"));
+        assert!(store_rows(&r).is_empty(), "{:?}", store_rows(&r));
+        assert_eq!(
+            group(&r, GroupId::Target)[3].status,
+            CheckStatus::Pass,
+            "the token is read"
+        );
+    }
+
+    /// WI-475: each folder of the store and each secret file another account owns (pretended,
+    /// in this test's own temp dir) is a warning naming it, the folders first; doctor reads no
+    /// token from such a store — the token rows are skipped with the refusal — and changes
+    /// nothing.
+    #[test]
+    fn what_another_account_owns_is_a_warning_each_and_no_token_is_read() {
+        let f = fx();
+        let ctx = two_targets(&f);
+        let store = ctx.store();
+        let foreign = [
+            ctx.config_root().to_path_buf(),
+            store.target_dir("prod"),
+            store.target_credentials_file("dev"),
+            StatePaths::for_active_target(&store, "prod").state_file(),
+            ctx.age_key_path().to_path_buf(),
+        ];
+        let before = crate::target::testkit::snapshot(&f.root);
+        let _guards: Vec<_> = foreign
+            .iter()
+            .map(|p| cli_core::owner_only::pretend::foreign_owner(p))
+            .collect();
+        let r = doctor(&ctx, named("prod"));
+        let rows = store_rows(&r);
+        assert_eq!(
+            rows.iter().map(|c| c.title.as_str()).collect::<Vec<_>>(),
+            [
+                "Target store folder belongs to another account",
+                "Target store folder `targets/prod` belongs to another account",
+                "Credentials file of target `dev` belongs to another account",
+                "State file of target `prod` belongs to another account",
+                "Age key belongs to another account",
+            ]
+        );
+        for (row, path) in rows.iter().zip(&foreign) {
+            assert_eq!((row.id, row.status), (CheckId::Secrets, CheckStatus::Warn));
+            assert_eq!(
+                row.detail.as_deref(),
+                Some(path.display().to_string().as_str())
+            );
+        }
+        assert_eq!(rows[0].fix, Some(explain(FOREIGN_FOLDER_FIX)));
+        assert_eq!(rows[2].fix, Some(explain(FOREIGN_FILE_FIX)));
+        let token = &group(&r, GroupId::Target)[3];
+        assert_eq!(
+            (token.id, token.status),
+            (CheckId::TokenFormat, CheckStatus::Skipped)
+        );
+        let refusal = CliError::StoreNotPrivate {
+            path: ctx.config_root().to_path_buf(),
+            problem: cli_core::StoreFolderProblem::ForeignOwner,
+        };
+        assert_eq!(token.detail, Some(refusal.to_string()));
+        assert_eq!(crate::target::testkit::snapshot(&f.root), before);
+    }
+
+    /// WI-475 (Unix): each folder others can write is a warning with its mode — the group's
+    /// write bit when the group is not this account's own — and doctor leaves every mode as
+    /// it was.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_others_can_write_is_a_warning_with_its_mode_and_is_left_as_it_was() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = fx();
+        let ctx = two_targets(&f);
+        let store = ctx.store();
+        let apprafter = StatePaths::for_active_target(&store, "prod").state_dir();
+        let wide = [
+            (ctx.config_root().to_path_buf(), 0o777, ""),
+            (store.target_dir("dev"), 0o775, " `targets/dev`"),
+            (apprafter.clone(), 0o1757, " `state/prod/.apprafter`"),
+        ];
+        for (path, mode, _) in &wide {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(*mode)).unwrap();
+        }
+        let _shared = cli_core::owner_only::pretend::group_alone(false);
+        let rows = store_rows(&doctor(&ctx, named("prod")));
+        let expected: Vec<String> = wide
+            .iter()
+            .map(|(_, mode, what)| {
+                format!(
+                    "Target store folder{what} can be changed by other accounts (mode {mode:o})"
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows.iter().map(|c| c.title.clone()).collect::<Vec<_>>(),
+            expected
+        );
+        for (row, (path, mode, _)) in rows.iter().zip(&wide) {
+            assert_eq!((row.id, row.status), (CheckId::Secrets, CheckStatus::Warn));
+            assert_eq!(
+                row.detail.as_deref(),
+                Some(path.display().to_string().as_str())
+            );
+            assert_eq!(row.fix, Some(explain(WRITABLE_FOLDER_FIX)));
+            let now = std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+            assert_eq!(now, *mode, "doctor changes nothing: {path:?}");
+        }
+        drop(_shared);
+        let _alone = cli_core::owner_only::pretend::group_alone(true);
+        let titles: Vec<String> = store_rows(&doctor(&ctx, named("prod")))
+            .into_iter()
+            .map(|c| c.title)
+            .collect();
+        assert_eq!(titles, [expected[0].clone(), expected[2].clone()]);
+        for (path, _, _) in &wide {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    /// WI-475 (Windows): a folder whose DACL lets another account write is a warning, with no
+    /// mode.
+    #[cfg(windows)]
+    #[test]
+    fn a_folder_others_can_write_is_a_warning_and_is_left_as_it_was() {
+        use cli_core::owner_only::testing;
+        let f = fx();
+        let ctx = two_targets(&f);
+        let me = testing::this_user_sid().unwrap();
+        let folder = ctx.store().target_dir("dev");
+        testing::set_dacl(
+            &folder,
+            &format!("D:P(A;OICI;FA;;;{me})(A;OICI;0x1301bf;;;BU)"),
+        )
+        .unwrap();
+        let before = testing::of_path(&folder).unwrap();
+        let rows = store_rows(&doctor(&ctx, named("prod")));
+        assert_eq!(
+            rows.iter().map(|c| c.title.as_str()).collect::<Vec<_>>(),
+            ["Target store folder `targets/dev` can be changed by other accounts"]
+        );
+        assert_eq!(
+            rows[0].detail.as_deref(),
+            Some(folder.display().to_string().as_str())
+        );
+        assert_eq!(rows[0].fix, Some(explain(WRITABLE_FOLDER_FIX)));
+        assert_eq!(
+            testing::of_path(&folder).unwrap(),
+            before,
+            "doctor changes nothing"
+        );
+        testing::set_dacl(&folder, &format!("D:P(A;OICI;FA;;;{me})")).unwrap();
+    }
+
+    /// WI-475: doctor never runs a kubeconfig another account could have put in the store —
+    /// encrypted or in clear — nor pings with its token: those rows are skipped with the
+    /// refusal, and nothing is decrypted to disk.
+    #[cfg(unix)]
+    #[test]
+    fn a_kubeconfig_in_a_store_others_can_change_is_never_run() {
+        let f = fx();
+        let ran = f.root.join("kubectl-ran");
+        crate::kube::tests::fake_kubectl(
+            &f.root.join("bin"),
+            &format!(
+                "case \"$1\" in version) echo 'Client Version: v1.31.0'; exit 0;; esac\n\
+                 touch {}\nprintf '%s' '{{\"gitVersion\":\"v1\"}}'",
+                ran.display()
+            ),
+        );
+        let ctx = ctx(&f, OFFLINE).with_no_ping(true);
+        for name in ["sealed", "clear"] {
+            add(&ctx, name, "hetzner-cloud", Some(TOKEN), None);
+        }
+        let armored = encrypt(&ctx);
+        seed_state(
+            &ctx,
+            "sealed",
+            serde_json::json!({"server_id": 1, "server_name": "a", "kubeconfig_age": armored}),
+        );
+        seed_state(
+            &ctx,
+            "clear",
+            serde_json::json!({"server_id": 2, "server_name": "b", "kubeconfig_yaml": YAML}),
+        );
+        let _foreign = cli_core::owner_only::pretend::foreign_owner(&ctx.store().targets_dir());
+        let refusal = CliError::StoreNotPrivate {
+            path: ctx.store().targets_dir(),
+            problem: cli_core::StoreFolderProblem::ForeignOwner,
+        }
+        .to_string();
+        for name in ["sealed", "clear"] {
+            let c = cluster(&doctor(&ctx, named(name)));
+            assert_eq!(c[1].id, CheckId::KubeApiReachable);
+            assert_eq!(
+                (c[1].status, c[1].detail.as_deref()),
+                (CheckStatus::Skipped, Some(refusal.as_str())),
+                "{name}"
+            );
+        }
+        assert!(!ran.exists(), "kubectl ran with the store's kubeconfig");
+        assert!(
+            std::fs::read_dir(ctx.runtime_dir()).map_or(true, |mut d| d.next().is_none()),
+            "nothing is decrypted to disk"
+        );
     }
 
     #[test]

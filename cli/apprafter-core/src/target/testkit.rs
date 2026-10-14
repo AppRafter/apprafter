@@ -152,3 +152,24 @@ pub(crate) fn edit_new(ctx: &Context, name: &str) {
     )
     .unwrap();
 }
+
+/// Every file and folder under `root`, a file with its bytes, a folder with none: what a test
+/// compares to say a refused change wrote nothing (WI-475).
+pub(crate) fn snapshot(
+    root: &std::path::Path,
+) -> std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                out.insert(path.clone(), None);
+                stack.push(path);
+            } else {
+                out.insert(path.clone(), Some(std::fs::read(&path).unwrap()));
+            }
+        }
+    }
+    out
+}

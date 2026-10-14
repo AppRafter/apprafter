@@ -749,6 +749,42 @@ mod tests {
         );
     }
 
+    /// WI-475: in a store another account can change (pretended, in this test's own temp dir),
+    /// an add and a renewal planned before are refused before anything is written — no new
+    /// target's folder, no pointer, no token — naming the folder.
+    #[test]
+    fn a_store_another_account_can_change_is_refused_before_anything_is_written() {
+        let (_d, ctx) = store(&["prod"], Some("prod"));
+        let ctx = ctx.with_no_ping(true);
+        let prod = TargetRef::named(&ctx, "prod").unwrap();
+        let add = plan_add(&ctx, args("dev", TOKEN_B)).unwrap();
+        let renew = plan_renew(
+            &ctx,
+            &prod,
+            RenewArgs {
+                token: Some(SecretString::new(TOKEN_B)),
+                ssh_key: None,
+            },
+        )
+        .unwrap();
+        let before = crate::target::testkit::snapshot(ctx.config_root());
+        let targets = ctx.store().targets_dir();
+        let _foreign = cli_core::owner_only::pretend::foreign_owner(&targets);
+        let cancel = CancellationToken::new();
+        for got in [
+            execute_add(&ctx, add, &NullReporter, &cancel).err(),
+            execute_renew(&ctx, renew, &NullReporter, &cancel).err(),
+        ] {
+            match got {
+                Some(CoreError::Cli(cli_core::CliError::StoreNotPrivate { path, .. })) => {
+                    assert_eq!(path, targets)
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(crate::target::testkit::snapshot(ctx.config_root()), before);
+    }
+
     #[test]
     fn a_first_add_is_bounded_and_takes_the_empty_pointer() {
         let dir = tempfile::tempdir().unwrap();

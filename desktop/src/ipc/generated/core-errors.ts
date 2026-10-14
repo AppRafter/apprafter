@@ -27,6 +27,7 @@ export const CORE_ERROR_CODES = {
   SECRETS_STORE_CHANGED: 'apprafter::secrets::store_changed',
   SECRETS_STORE_FILE_UNREADABLE: 'apprafter::secrets::store_file_unreadable',
   SECRETS_STORE_LOCKED: 'apprafter::secrets::store_locked',
+  SECRETS_STORE_NOT_PRIVATE: 'apprafter::secrets::store_not_private',
   SECRETS_TOKEN_IN_ANOTHER_VAULT: 'apprafter::secrets::token_in_another_vault',
   SECRETS_TOKEN_MISSING_FROM_VAULT: 'apprafter::secrets::token_missing_from_vault',
   SECRETS_TOKEN_OUTSIDE_VAULT: 'apprafter::secrets::token_outside_vault',
