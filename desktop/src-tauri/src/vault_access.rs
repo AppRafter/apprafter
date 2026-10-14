@@ -140,6 +140,9 @@ pub struct DesktopVaultAccess {
     gate: VaultGate,
     pager: Arc<dyn Pager>,
     on_missing: OnceLock<Box<dyn Fn() + Send + Sync>>,
+    /// Tests: every ask of the core's (T-lazy-3).
+    #[cfg(test)]
+    pub(crate) asks: std::sync::atomic::AtomicUsize,
     /// The shell's "may a change go on waiting for the store's lock?" (unlocked, not
     /// quitting); with none set, it may.
     may_wait: OnceLock<Box<dyn Fn() -> bool + Send + Sync>>,
@@ -161,6 +164,8 @@ impl DesktopVaultAccess {
             gate: VaultGate::new(clock),
             pager,
             on_missing: OnceLock::new(),
+            #[cfg(test)]
+            asks: std::sync::atomic::AtomicUsize::new(0),
             may_wait: OnceLock::new(),
             me: me.clone(),
         })
@@ -399,6 +404,8 @@ fn store_locked(root: &Path) -> cli_core::CliError {
 
 impl VaultAccess for DesktopVaultAccess {
     fn session(&self, req: &VaultRequest<'_>) -> cli_core::Result<Arc<dyn VaultSession>> {
+        #[cfg(test)]
+        self.asks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.look();
         match self.session_for(req) {
             Some(session) => Ok(Arc::new(session)),
@@ -415,6 +422,8 @@ impl VaultAccess for DesktopVaultAccess {
     /// [`STORE_WAIT_SLICE`] (`keep_waiting`). It is never handed out after a lock (the Rust
     /// verifier's finding 3, the final verifier's 12; Deviations 25 and the guide).
     fn write_key(&self, req: &VaultRequest<'_>) -> cli_core::Result<KeySession> {
+        #[cfg(test)]
+        self.asks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.look();
         let key = {
             let held = self.lock();
@@ -455,6 +464,8 @@ impl VaultAccess for DesktopVaultAccess {
         &self,
         req: &VaultRequest<'_>,
     ) -> cli_core::Result<Option<Arc<dyn VaultSession>>> {
+        #[cfg(test)]
+        self.asks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.look();
         Ok(self
             .session_for(req)

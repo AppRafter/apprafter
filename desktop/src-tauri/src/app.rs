@@ -2818,6 +2818,37 @@ mod tests {
         }
     }
 
+    /// T-lazy-3, the desktop's half (e's Deviations 20): app_info on a locked store asks the
+    /// vault's client nothing and reads no vault — its `vault` a directory here, which any read
+    /// would fail on — and reports the store protected.
+    #[test]
+    fn app_info_on_a_locked_store_asks_the_vault_for_nothing() {
+        let (r, store) = rig_with_store(unlocked_at_start(), Arc::new(NoAuthenticator), |root| {
+            let store = locked_store(root, &[("prod", None)]);
+            let vault = root.join(VAULT_FILE);
+            std::fs::remove_file(&vault).unwrap();
+            std::fs::create_dir(&vault).unwrap();
+            store
+        });
+        let info = r.shell.app_info();
+        assert!(info.secrets.protected);
+        assert_eq!(r.shell.vault.asks.load(SeqCst), 0);
+        // The control: each of the three asks counts — a doctor's open session, a secret's
+        // read, a write's key (each refused here: no key is held).
+        let req = VaultRequest {
+            store_root: r.shell.context.config_root(),
+            store_id: &store.store_id,
+            slots: &[],
+        };
+        let access = r.shell.context.vault_access();
+        let _ = access.open_session(&req);
+        assert_eq!(r.shell.vault.asks.load(SeqCst), 1);
+        assert!(access.session(&req).is_err());
+        assert_eq!(r.shell.vault.asks.load(SeqCst), 2);
+        assert!(access.write_key(&req).is_err());
+        assert_eq!(r.shell.vault.asks.load(SeqCst), 3);
+    }
+
     /// Critic B finding 19: a terminal's `lock off` (or `lock on`) under an unlocked app is
     /// followed by no secret read; the idle tick sees `store.yaml` change and re-reads.
     #[test]
