@@ -101,6 +101,9 @@ test('a protected store: its own field on the lock screen, the pins, Stop protec
   const never = settings.getByRole('radio', { name: 'Never' });
   await expect(never).toHaveAttribute('aria-disabled', 'true');
   await expect(never).toHaveAttribute('title', 'Not while secrets are protected.');
+  // And it looks unavailable, as a disabled option does: offered, it would read as a choice.
+  await expect(never).toHaveCSS('opacity', '0.45');
+  await expect(never).toHaveCSS('cursor', 'not-allowed');
   await shot(page, info, 'settings, lock pinned');
 
   await settings.getByRole('button', { name: 'Stop protecting…' }).click();

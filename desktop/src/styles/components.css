@@ -388,7 +388,7 @@
   color: var(--accent-text);
 }
 
-.seg > button:hover:not(:disabled):not([aria-checked="true"]) {
+.seg > button:hover:not(:disabled):not([aria-checked="true"]):not([aria-disabled="true"]) {
   color: var(--fg);
 }
 
@@ -400,6 +400,13 @@
 .seg > button:disabled {
   opacity: 0.45;
   cursor: default;
+}
+
+/* An option shown but not offered, its reason in a tooltip (O7: Auto-lock's Never while secrets
+   are protected): dimmed as a disabled one, yet not `disabled`, so the tooltip still shows. */
+.seg > button[aria-disabled="true"] {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 .seg[data-size="26"] > button {
