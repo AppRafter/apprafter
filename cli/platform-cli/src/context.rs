@@ -3,8 +3,8 @@
 //! the core-backed arms (ADR 0067 §2). The core-backed arms build it with [`cli_context`]; an
 //! arm that still returns `cli_core::Result` (a legacy arm) with [`legacy_context`]. Both are
 //! one builder, which gives every context the CLI's vault access (`crate::vault_access`);
-//! `doctor`, `whoami` and `lock status` take [`diagnostic_context`], which reads through this
-//! terminal's open window and never asks (D.4a T66).
+//! `doctor`, `whoami`, `lock status` and `status`'s `secrets:` line take [`diagnostic_context`],
+//! which reads through this terminal's open window and never asks (D.4a T66).
 
 use std::ffi::OsString;
 use std::sync::Arc;
@@ -37,10 +37,10 @@ fn build() -> CoreResult<Context> {
     Ok(ctx.with_vault_access(access))
 }
 
-/// The context of a diagnostic — `doctor`, `whoami`, `lock status` — which never asks for a
-/// secret (D.4a T66): a locked store opens there only through this terminal's open unlock
-/// window (the CLI's access, asked only for what it has open), never at a prompt; anything
-/// else is `store_locked`, terminal or not. What it reads through the window restarts the
+/// The context of a diagnostic — `doctor`, `whoami`, `lock status`, `status`'s `secrets:` line —
+/// which never asks for a secret (D.4a T66): a locked store opens there only through this
+/// terminal's open unlock window (the CLI's access, asked only for what it has open), never at
+/// a prompt; anything else is `store_locked`, terminal or not. What it reads through the window restarts the
 /// window, as any command's read does (T56).
 pub(crate) fn diagnostic_context() -> miette::Result<Context> {
     let ctx = Context::from_cli_env(&ProcessEnv).map_err(crate::render::core_error::report)?;

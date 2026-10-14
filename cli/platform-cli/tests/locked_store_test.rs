@@ -175,3 +175,67 @@ fn a_renewal_replaces_another_stores_marker_on_a_store_in_files() {
         .unwrap();
     assert!(creds.contains(&format!("hetzner_token: {NEW}")), "{creds}");
 }
+
+/// D.4a T66, §3.13 (d4a-f): `target show` names the vault, and opens nothing.
+#[test]
+fn target_show_names_the_vault() {
+    let sp = Spawn::new();
+    locked(&sp);
+    let vault = sp.store().join("vault");
+    let (code, stdout, stderr) = run(&sp, &["target", "show", "prod"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stdout.contains(&format!(
+            "  Hetzner token: in the vault ({})\n",
+            vault.display()
+        )),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "Credentials: in the vault ({})\n",
+            vault.display()
+        )),
+        "{stdout}"
+    );
+    assert!(!stdout.contains(TOKEN) && !stderr.contains(TOKEN));
+}
+
+/// O8, T34 (d4a-f): after the vault is moved aside, a store in files whose target file is the
+/// old store's marker says the file is not used — not "not set".
+#[test]
+fn target_show_names_another_stores_marker_on_a_store_in_files() {
+    let sp = Spawn::new();
+    let paths = cli_core::TargetStorePaths::for_root(sp.store());
+    let config = cli_core::target::TargetConfig {
+        provider: "hetzner-cloud".into(),
+        region: Some("nbg1".into()),
+        ..Default::default()
+    };
+    cli_core::target::save_target_config(&paths, "prod", &config).unwrap();
+    let other = apprafter_core::secrets::StoreId::parse("0123456789abcdef").unwrap();
+    apprafter_core::secrets::marker::write_marker(&paths, "prod", &other).unwrap();
+    let (code, stdout, stderr) = run(&sp, &["target", "show", "prod"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stdout.contains(
+            "  Hetzner token: not used — credentials.yaml names another target store's vault"
+        ),
+        "{stdout}"
+    );
+}
+
+/// D.4a T66, §3.13 (d4a-f): `status` names a locked store and this terminal's window under its
+/// header, asking for nothing; its cluster half degrades as it does without a kubeconfig.
+#[test]
+fn status_names_a_locked_store_without_asking() {
+    let sp = Spawn::new();
+    locked(&sp);
+    let (code, stdout, stderr) = run(&sp, &["status"]);
+    assert_eq!(code, Some(0), "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("  secrets:  locked (recovery key) · not run from a terminal\n"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains(TOKEN) && !stderr.contains(TOKEN));
+}

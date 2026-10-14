@@ -14,6 +14,7 @@
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
+use apprafter_core::secrets::{SecretsMode, StoredToken};
 use apprafter_core::target::{
     self as core_target, CliDefaultPointer, SkuCheck, TargetRemoved, TargetReport,
 };
@@ -1237,7 +1238,7 @@ mod tests {
     /// its bytes, so the summary cannot echo it.
     #[test]
     fn show_lines_match_todays_layout() {
-        let lines = show_lines(&report_with("prod", true));
+        let lines = show_lines(&report_with("prod", true), &TokenPlace::Files);
         assert_eq!(lines[0], "Target: prod (active)");
         assert_eq!(lines[1], "  Provider:    hetzner-cloud");
         assert_eq!(lines[2], "  Region:      nbg1");
@@ -1271,7 +1272,7 @@ mod tests {
             },
             ..report_with("other", false)
         };
-        let lines = show_lines(&inactive);
+        let lines = show_lines(&inactive, &TokenPlace::Files);
         assert_eq!(lines[0], "Target: other");
         assert_eq!(lines[6], "  SSH key:     /h/.ssh/k.pub");
         assert_eq!(lines[7], "  Hetzner token: not set");
@@ -1290,7 +1291,7 @@ mod tests {
                 server_type: Some("cx22".into()),
             },
         };
-        let lines = show_lines(&r);
+        let lines = show_lines(&r, &TokenPlace::Files);
         assert_eq!(lines[8], "  Server:      platform-1 (id 42, type cx22)");
         assert_eq!(lines.len(), 12);
         r.provisioned = ProvisionedState::Provisioned {
@@ -1300,20 +1301,23 @@ mod tests {
                 server_type: None,
             },
         };
-        assert!(show_lines(&r).contains(&"  Server:      platform-1 (id 42)".to_string()));
+        assert!(show_lines(&r, &TokenPlace::Files)
+            .contains(&"  Server:      platform-1 (id 42)".to_string()));
         r.provisioned = ProvisionedState::Unreadable {
             error: apprafter_core::UiError::from(&CoreError::Cli(CliError::InvalidState {
                 path: "/s/state.json".into(),
                 message: "expected value".into(),
             })),
         };
-        assert!(show_lines(&r).contains(
+        assert!(show_lines(&r, &TokenPlace::Files).contains(
             &"  Server:      unknown — the state file cannot be read: state file at \
               /s/state.json: expected value"
                 .to_string()
         ));
         r.provisioned = ProvisionedState::NotProvisioned;
-        assert!(!show_lines(&r).iter().any(|l| l.starts_with("  Server:")));
+        assert!(!show_lines(&r, &TokenPlace::Files)
+            .iter()
+            .any(|l| l.starts_with("  Server:")));
     }
 
     /// R6: `remove` of a target whose state records a server warns that the server keeps
@@ -1950,6 +1954,69 @@ mod tests {
         );
         assert!(text.contains("apprafter target domain add"), "{text}");
     }
+
+    /// D.4a T66, §3.13 (d4a-f): on a locked store the token line names the vault, or what the
+    /// target's file holds instead; a store in files reads as before.
+    #[test]
+    fn a_locked_store_names_its_vault() {
+        use apprafter_core::secrets::{StoreId, StoredToken};
+        let r = report_with("prod", true);
+        let vault = "/s/vault".to_string();
+        let lines = |stored| {
+            show_lines(
+                &r,
+                &TokenPlace::Locked {
+                    stored,
+                    vault: vault.clone(),
+                },
+            )
+        };
+        let in_vault = lines(StoredToken::InVault);
+        assert!(
+            in_vault.contains(&"  Hetzner token: in the vault (/s/vault)".to_string()),
+            "{in_vault:?}"
+        );
+        assert!(
+            in_vault.contains(&"Credentials: in the vault (/s/vault)".to_string()),
+            "{in_vault:?}"
+        );
+        let clear = lines(StoredToken::OutsideVault);
+        assert!(
+            clear.iter().any(|l| l
+                .starts_with("  Hetzner token: not used — credentials.yaml holds one in clear")),
+            "{clear:?}"
+        );
+        assert!(
+            clear
+                .iter()
+                .any(|l| l.starts_with("Credentials: ") && l.ends_with("(mode 0600)")),
+            "{clear:?}"
+        );
+        let other = lines(StoredToken::InAnotherVault {
+            id: StoreId::parse("0123456789abcdef").unwrap(),
+        });
+        assert!(
+            other.iter().any(|l| l.starts_with(
+                "  Hetzner token: not used — credentials.yaml names another target store's vault"
+            )),
+            "{other:?}"
+        );
+        assert!(lines(StoredToken::None).contains(&"  Hetzner token: not set".to_string()));
+        // O8's way back: a store in files, a target file that is another store's marker.
+        let foreign = show_lines(&r, &TokenPlace::FilesForeign);
+        assert!(
+            foreign.iter().any(|l| l.starts_with(
+                "  Hetzner token: not used — credentials.yaml names another target store's vault"
+            )),
+            "{foreign:?}"
+        );
+        assert!(
+            foreign
+                .iter()
+                .any(|l| l.starts_with("Credentials: ") && l.ends_with("(mode 0600)")),
+            "{foreign:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------
@@ -2150,17 +2217,55 @@ pub(crate) fn show(name: Option<&str>) -> miette::Result<()> {
         resolve_show_target(name, pointer.as_deref().unwrap_or("")).map_err(miette::Report::new)?;
     info!(target = %resolved, "target show invoked");
     let tref = TargetRef::named(&ctx, &resolved).map_err(report)?;
-    for line in show_lines(&core_target::show(&ctx, &tref).map_err(report)?) {
+    let place = token_place(&ctx, &resolved).map_err(miette::Report::new)?;
+    for line in show_lines(&core_target::show(&ctx, &tref).map_err(report)?, &place) {
         println!("{line}");
     }
     Ok(())
+}
+
+/// Where a target's token is, as `target show` words it (D.4a T66): a store in files keeps its
+/// lines, unless the target's file is another store's marker (O8's way back); a locked store
+/// names its vault, or what the target's file holds instead.
+pub(crate) enum TokenPlace {
+    Files,
+    FilesForeign,
+    Locked { stored: StoredToken, vault: String },
+}
+
+/// A clear token beside a locked store (T42).
+const CLEAR_TOKEN_WORDS: &str = "not used — credentials.yaml holds one in clear, which a locked \
+     store never uses (`apprafter doctor` says how to replace it)";
+/// Another store's marker, on a locked store or on one back in files (T34, O8).
+const FOREIGN_MARKER_WORDS: &str = "not used — credentials.yaml names another target store's \
+     vault (`apprafter doctor` says how to replace it)";
+
+/// Read from `store.yaml` and the target's file; the vault is never opened (T7). An
+/// interrupted lock is the core's `show` to refuse (`lock_incomplete`); on a store in files, a
+/// file that cannot be read is `show`'s to report, as before.
+fn token_place(ctx: &apprafter_core::Context, name: &str) -> cli_core::Result<TokenPlace> {
+    let secrets = ctx.secrets();
+    Ok(match secrets.mode()? {
+        SecretsMode::Locked => TokenPlace::Locked {
+            stored: secrets.token_presence(name)?,
+            vault: ctx
+                .config_root()
+                .join(apprafter_core::vault::VAULT_FILE)
+                .display()
+                .to_string(),
+        },
+        _ => match secrets.token_presence(name) {
+            Ok(StoredToken::InAnotherVault { .. }) => TokenPlace::FilesForeign,
+            _ => TokenPlace::Files,
+        },
+    })
 }
 
 /// The lines `target show` prints. The token is summarised by its length — the report never
 /// carries its bytes; read `credentials.yaml` for the raw value. A server the target's state
 /// records gets a `Server:` line after the token (R6), as does a state that cannot be read; no
 /// server, no line.
-pub(crate) fn show_lines(r: &TargetReport) -> Vec<String> {
+pub(crate) fn show_lines(r: &TargetReport, place: &TokenPlace) -> Vec<String> {
     let or = |v: &Option<String>| v.clone().unwrap_or_else(|| "not set".into());
     let server = match &r.provisioned {
         core_target::ProvisionedState::NotProvisioned => None,
@@ -2196,23 +2301,41 @@ pub(crate) fn show_lines(r: &TargetReport) -> Vec<String> {
                 .as_ref()
                 .map_or_else(|| "not set".into(), |k| k.path.clone())
         ),
-        format!(
-            "  Hetzner token: {}",
-            match r.token.chars {
-                Some(n) if r.token.set => {
-                    format!("set ({n} chars; read credentials.yaml for the raw value)")
-                }
-                _ => "not set".into(),
-            }
-        ),
+        format!("  Hetzner token: {}", token_words(r, place)),
     ];
     lines.extend(server);
     lines.extend([
         String::new(),
         format!("Config:      {}", r.config_file),
-        format!("Credentials: {} (mode 0600)", r.credentials_file),
+        match place {
+            TokenPlace::Locked {
+                stored: StoredToken::InVault,
+                vault,
+            } => format!("Credentials: in the vault ({vault})"),
+            _ => format!("Credentials: {} (mode 0600)", r.credentials_file),
+        },
     ]);
     lines
+}
+
+/// The token line's words: a store in files as before; a locked store's vault, or why the
+/// target's file holds no token this store uses (T42, T34).
+fn token_words(r: &TargetReport, place: &TokenPlace) -> String {
+    match place {
+        TokenPlace::Files => match r.token.chars {
+            Some(n) if r.token.set => {
+                format!("set ({n} chars; read credentials.yaml for the raw value)")
+            }
+            _ => "not set".into(),
+        },
+        TokenPlace::FilesForeign => FOREIGN_MARKER_WORDS.into(),
+        TokenPlace::Locked { stored, vault } => match stored {
+            StoredToken::InVault => format!("in the vault ({vault})"),
+            StoredToken::OutsideVault => CLEAR_TOKEN_WORDS.into(),
+            StoredToken::InAnotherVault { .. } => FOREIGN_MARKER_WORDS.into(),
+            StoredToken::None | StoredToken::InFile { .. } => "not set".into(),
+        },
+    }
 }
 
 /// Which target `target show` displays: the explicit name, else the active
