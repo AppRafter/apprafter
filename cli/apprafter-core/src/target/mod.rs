@@ -265,11 +265,35 @@ pub fn store_lock_event(event: &StoreLockEvent<'_>) -> Event {
 }
 
 /// The store lock, creating the root (an add on a fresh store must lock it). Never held across
-/// the network: every `execute_*` does its provider calls first.
+/// the network: every `execute_*` does its provider calls first. While another process holds
+/// it the call waits — as long as it takes, unless the context's client bounds the wait
+/// ([`VaultAccess::store_wait_slice`](crate::secrets::VaultAccess::store_wait_slice): the
+/// desktop's, d4a-g): then after each slice the store is still held the client's
+/// `keep_waiting` decides, and its refusal abandons the change before it wrote anything.
+/// `Waiting` is reported once either way.
 pub(crate) fn lock_store(ctx: &Context, reporter: &dyn Reporter) -> CoreResult<StoreLock> {
-    Ok(StoreLock::exclusive_or_wait(&ctx.store(), |e| {
-        reporter.report(store_lock_event(&e))
-    })?)
+    let access = ctx.vault_access();
+    let Some(slice) = access.store_wait_slice() else {
+        return Ok(StoreLock::exclusive_or_wait(&ctx.store(), |e| {
+            reporter.report(store_lock_event(&e))
+        })?);
+    };
+    let mut told = false;
+    loop {
+        let got = StoreLock::try_exclusive_for(&ctx.store(), slice, |e| {
+            // `Waiting` once for the whole wait, as the blocking wait reports it.
+            if matches!(e, cli_core::StoreLockEvent::Waiting { .. })
+                && std::mem::replace(&mut told, true)
+            {
+                return;
+            }
+            reporter.report(store_lock_event(&e));
+        })?;
+        if let Some(lock) = got {
+            return Ok(lock);
+        }
+        access.keep_waiting(ctx.config_root())?;
+    }
 }
 
 /// The store lock, or none when the root does not exist (a command that will fail on a missing
@@ -358,6 +382,8 @@ mod helper_tests {
     use super::testkit::*;
     use super::*;
     use crate::report::{CollectReporter, Event};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -479,5 +505,99 @@ mod helper_tests {
         assert!(lock_store_for(&ctx, &crate::NullReporter, "prod")
             .unwrap()
             .is_held());
+    }
+
+    /// D.4a (d4a-g; the final verifier's finding 12): a client that bounds the wait, in 100 ms
+    /// slices, going on while `go` holds.
+    #[derive(Debug)]
+    struct Bounded {
+        go: AtomicBool,
+        asked: AtomicUsize,
+    }
+
+    impl crate::secrets::VaultAccess for Bounded {
+        fn session(
+            &self,
+            req: &crate::secrets::VaultRequest<'_>,
+        ) -> cli_core::Result<Arc<dyn crate::secrets::VaultSession>> {
+            Err(crate::secrets::store_locked(req.store_root))
+        }
+
+        fn write_key(
+            &self,
+            req: &crate::secrets::VaultRequest<'_>,
+        ) -> cli_core::Result<crate::secrets::KeySession> {
+            Err(crate::secrets::store_locked(req.store_root))
+        }
+
+        fn store_wait_slice(&self) -> Option<Duration> {
+            Some(Duration::from_millis(100))
+        }
+
+        fn keep_waiting(&self, store: &std::path::Path) -> cli_core::Result<()> {
+            self.asked.fetch_add(1, SeqCst);
+            if self.go.load(SeqCst) {
+                Ok(())
+            } else {
+                Err(crate::secrets::store_locked(store))
+            }
+        }
+    }
+
+    fn bounded(go: bool) -> Arc<Bounded> {
+        Arc::new(Bounded {
+            go: AtomicBool::new(go),
+            asked: AtomicUsize::new(0),
+        })
+    }
+
+    /// A bounded client gives up after a slice its `keep_waiting` refuses: the change is
+    /// abandoned before it took the lock, so it wrote nothing, with the client's error. The
+    /// result is awaited with a deadline, so an unbounded wait fails here instead of hanging.
+    #[test]
+    fn a_bounded_wait_is_abandoned_when_its_client_says_so() {
+        let (_d, ctx) = store(&["prod"], Some("prod"));
+        let ctx = ctx.with_vault_access(bounded(false));
+        let held = cli_core::StoreLock::exclusive(&ctx.store()).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let c = ctx.clone();
+        let waiter = std::thread::spawn(move || {
+            let _ = tx.send(lock_store(&c, &crate::NullReporter).map(|_| ()));
+        });
+        let got = rx.recv_timeout(Duration::from_secs(10));
+        drop(held);
+        waiter.join().unwrap();
+        let e = got.expect("the bounded wait did not end").unwrap_err();
+        assert!(
+            matches!(e, CoreError::Cli(cli_core::CliError::StoreLocked { .. })),
+            "{e:?}"
+        );
+    }
+
+    /// While its client allows, the bounded wait goes on across slices and takes the lock
+    /// once it is free; `Waiting` is reported once for the whole wait, as the blocking wait
+    /// reports it.
+    #[test]
+    fn a_bounded_wait_goes_on_while_allowed_and_reports_waiting_once() {
+        let (_d, ctx) = store(&["prod"], Some("prod"));
+        let access = bounded(true);
+        let ctx = ctx.with_vault_access(access.clone());
+        let held = cli_core::StoreLock::exclusive(&ctx.store()).unwrap();
+        let reporter = Arc::new(CollectReporter::new());
+        let (r, c) = (reporter.clone(), ctx.clone());
+        let waiter = std::thread::spawn(move || lock_store(&c, &*r).map(|_| ()));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while access.asked.load(SeqCst) < 3 {
+            assert!(Instant::now() < deadline, "the client was never asked");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(held);
+        waiter.join().unwrap().unwrap();
+        let waiting = reporter
+            .take()
+            .into_iter()
+            .filter(|e| matches!(e, Event::Notice { .. }))
+            .count();
+        assert_eq!(waiting, 1);
     }
 }

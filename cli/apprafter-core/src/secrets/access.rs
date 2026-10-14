@@ -9,6 +9,7 @@
 //! Vault writes never go through a session (T41, O11): they take a [`KeySession`] from
 //! [`VaultAccess::write_key`] — a key this process holds — and write under the held write lock.
 
+use std::any::Any;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -71,6 +72,24 @@ pub trait VaultAccess: Send + Sync + fmt::Debug {
     /// Drop whatever this process holds (the desktop's app lock, d4a-g).
     fn forget(&self) {}
 
+    /// How a change that holds a key from this client waits for the target store's lock
+    /// (d4a-g; the final verifier's finding 12). `None`, the default: as long as another
+    /// process holds it — the CLI's key is its own command's, and Ctrl-C ends the wait — with
+    /// the blocking wait it always had. `Some(slice)`: the wait is cut into slices, and after
+    /// each one the store is still held [`VaultAccess::keep_waiting`] decides.
+    fn store_wait_slice(&self) -> Option<std::time::Duration> {
+        None
+    }
+
+    /// Asked after each [`store_wait_slice`](VaultAccess::store_wait_slice) the store's lock
+    /// is still another process's: an `Err` abandons the change, which has written nothing
+    /// yet, with that error (the desktop's: its app locked meanwhile). Never asked when the
+    /// slice is `None`.
+    fn keep_waiting(&self, store: &Path) -> cli_core::Result<()> {
+        let _ = store;
+        Ok(())
+    }
+
     /// A cache this command wrote on a locked store, sealed as `armored` from `plaintext`
     /// (D.4a): a client that keeps opened items for the command's lifetime (the CLI, T46) keeps
     /// it, so reading it back asks nothing. By default nothing is kept.
@@ -104,6 +123,10 @@ pub trait VaultSession: Send + Sync + fmt::Debug {
 /// `store_changed`, never damage (rule 3). Its `Debug` never shows the key.
 #[derive(Clone)]
 pub struct KeySession {
+    /// Dropped with the last clone of this session and **before** its key (fields drop in
+    /// order): what a client keeps alive exactly as long as the session — the desktop's pin
+    /// on the key's page while a write uses it (d4a-g). `None` from every core path.
+    guard: Option<Arc<dyn Any + Send + Sync>>,
     key: Arc<DataKey>,
     vault_id: VaultId,
     root: PathBuf,
@@ -116,6 +139,7 @@ impl KeySession {
     /// What `key` opens: the vault `vault_id` of the store at `root`.
     pub fn new(key: Arc<DataKey>, vault_id: VaultId, root: PathBuf) -> Self {
         KeySession {
+            guard: None,
             key,
             vault_id,
             root,
@@ -142,6 +166,13 @@ impl KeySession {
     /// The vault this key opens.
     pub fn vault_id(&self) -> VaultId {
         self.vault_id
+    }
+
+    /// This session, holding `guard` until its last clone goes, before the key (d4a-g: the
+    /// desktop's write pin).
+    pub fn with_guard(mut self, guard: Arc<dyn Any + Send + Sync>) -> Self {
+        self.guard = Some(guard);
+        self
     }
 
     /// `vault`, authenticated with this key.
@@ -366,5 +397,43 @@ mod diagnostic_tests {
             s.prepare_write(),
             Err(CliError::StoreLocked { .. })
         ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// D.4a (d4a-g; the final verifier's finding 12): a session's guard lives exactly as long
+    /// as its last clone, and goes before the session's key does — the desktop unpins the
+    /// key's page in it while the key is still there.
+    #[test]
+    fn a_session_s_guard_goes_with_its_last_clone_before_its_key() {
+        struct Probe {
+            key: std::sync::Weak<DataKey>,
+            saw: Arc<std::sync::Mutex<Option<bool>>>,
+        }
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                *self.saw.lock().unwrap() = Some(self.key.upgrade().is_some());
+            }
+        }
+        let key = Arc::new(DataKey::from_bytes(&[7; 32]));
+        let saw = Arc::new(std::sync::Mutex::new(None));
+        let probe = Probe {
+            key: Arc::downgrade(&key),
+            saw: saw.clone(),
+        };
+        let session =
+            KeySession::new(key, VaultId([1; 16]), PathBuf::from("/s")).with_guard(Arc::new(probe));
+        let copy = session.clone();
+        drop(session);
+        assert_eq!(*saw.lock().unwrap(), None, "a clone still holds it");
+        drop(copy);
+        assert_eq!(
+            *saw.lock().unwrap(),
+            Some(true),
+            "the key went before the guard"
+        );
     }
 }
