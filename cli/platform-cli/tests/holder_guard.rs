@@ -8,6 +8,8 @@
 //! - **HG3** — the pipe's and the client's security flags (T53; Task 7).
 //! - **HG5** — the two secret-bearing frame kinds, `Kind::Init` and `Kind::Secret`, are named only
 //!   by the codec's six functions (S6).
+//! - **HG6** — each reader of the window's two clocks makes the OS call its clock names (T56, O4):
+//!   on a machine that never slept the two read alike, so the source is what tells them apart.
 //!
 //! Tokens (`proc_macro2`), as G1 reads them: a comment never counts, attributes (doc comments
 //! included) are skipped, and a hit is attributed to the nearest enclosing `fn`. A string
@@ -426,4 +428,146 @@ impl X { fn from_byte() -> Kind { Self::Secret } }
         .map(|s| (s.line, s.within))
         .collect();
     assert_eq!(kinds, vec![(5, Some("other".to_string()))]);
+}
+
+// ---------------------------------------------------------------------------------------------
+// HG6 (T56, O4): each of the window's clocks reads the OS clock it names
+// ---------------------------------------------------------------------------------------------
+
+/// HG6: each reader of the window's two clocks, as it must read, in the file it lives in (the
+/// clocks `window::HolderClock`'s docs name). `SystemClock` asks `os::current`, the running OS's
+/// module; each OS's `clock_with_sleep` reads the clock that counts suspend and its
+/// `clock_awake` the one that does not; on Unix both go through `os::clock`, which reads the
+/// clock it is given. On a machine that has not slept the two clocks read alike, so only the
+/// source tells a swap apart; `window.rs`'s wiring tests prove, per OS, that `SystemClock`'s
+/// readings are those OS clocks. Every OS's reader is checked here on every OS.
+const CLOCK_READERS: [(&str, &str); 11] = [
+    (
+        "platform-cli/src/holder/window.rs",
+        "impl HolderClock for SystemClock {
+             fn with_sleep(&self) -> Duration { super::os::current::clock_with_sleep() }
+             fn awake_only(&self) -> Duration { super::os::current::clock_awake() }
+         }",
+    ),
+    (
+        "platform-cli/src/holder/os/mod.rs",
+        "#[cfg(target_os = \"linux\")] pub(crate) use linux as current;
+         #[cfg(target_os = \"macos\")] pub(crate) use macos as current;
+         #[cfg(windows)] pub(crate) use windows as current;",
+    ),
+    (
+        "platform-cli/src/holder/os/mod.rs",
+        "pub(crate) fn clock(id: libc::clockid_t) -> std::time::Duration {
+             let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0, };
+             unsafe { libc::clock_gettime(id, &mut ts) };
+             std::time::Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+         }",
+    ),
+    (
+        "platform-cli/src/holder/os/linux.rs",
+        "pub(crate) const WITH_SLEEP: libc::clockid_t = libc::CLOCK_BOOTTIME;",
+    ),
+    (
+        "platform-cli/src/holder/os/linux.rs",
+        "pub(crate) const AWAKE: libc::clockid_t = libc::CLOCK_MONOTONIC;",
+    ),
+    (
+        "platform-cli/src/holder/os/linux.rs",
+        "pub(crate) fn clock_with_sleep() -> Duration { super::clock(WITH_SLEEP) }
+         pub(crate) fn clock_awake() -> Duration { super::clock(AWAKE) }",
+    ),
+    (
+        "platform-cli/src/holder/os/macos.rs",
+        "pub(crate) const WITH_SLEEP: libc::clockid_t = libc::CLOCK_MONOTONIC_RAW;",
+    ),
+    (
+        "platform-cli/src/holder/os/macos.rs",
+        "pub(crate) const AWAKE: libc::clockid_t = libc::CLOCK_UPTIME_RAW;",
+    ),
+    (
+        "platform-cli/src/holder/os/macos.rs",
+        "pub(crate) fn clock_with_sleep() -> Duration { super::clock(WITH_SLEEP) }
+         pub(crate) fn clock_awake() -> Duration { super::clock(AWAKE) }",
+    ),
+    (
+        "platform-cli/src/holder/os/windows.rs",
+        "pub(crate) fn clock_with_sleep() -> Duration {
+             Duration::from_millis(unsafe { GetTickCount64() })
+         }",
+    ),
+    (
+        "platform-cli/src/holder/os/windows.rs",
+        "pub(crate) fn clock_awake() -> Duration {
+             let mut t = 0u64;
+             unsafe { QueryUnbiasedInterruptTime(&mut t) };
+             Duration::from_nanos(t.saturating_mul(100))
+         }",
+    ),
+];
+
+/// `src` as one line of tokens with a space before and after each: comments are gone, doc
+/// comments are attributes between items, and a layout or a comment changes nothing.
+fn token_line(src: &str) -> String {
+    fn flat(tokens: TokenStream, out: &mut String) {
+        for t in tokens {
+            match t {
+                TokenTree::Group(g) => {
+                    let (open, close) = match g.delimiter() {
+                        Delimiter::Parenthesis => ("(", ")"),
+                        Delimiter::Brace => ("{", "}"),
+                        Delimiter::Bracket => ("[", "]"),
+                        Delimiter::None => ("", ""),
+                    };
+                    out.push_str(open);
+                    out.push(' ');
+                    flat(g.stream(), out);
+                    out.push_str(close);
+                    out.push(' ');
+                }
+                other => {
+                    out.push_str(&other.to_string());
+                    out.push(' ');
+                }
+            }
+        }
+    }
+    let mut out = String::from(" ");
+    flat(src.parse().expect("the source tokenizes"), &mut out);
+    out
+}
+
+/// How many times `item`'s tokens run, whole and in order, in `src`'s.
+fn item_count(src: &str, item: &str) -> usize {
+    token_line(src).matches(&token_line(item)).count()
+}
+
+#[test]
+fn hg6_each_window_clock_reads_the_os_clock_it_names() {
+    let wrong: Vec<String> = CLOCK_READERS
+        .iter()
+        .filter_map(|(file, item)| {
+            let src = fs::read_to_string(cli_dir().join(file)).unwrap();
+            let n = item_count(&src, item);
+            (n != 1).then(|| format!("{file}: found {n} times, once expected:\n{item}"))
+        })
+        .collect();
+    assert!(
+        wrong.is_empty(),
+        "a reader of the window's clocks no longer makes the OS call its clock names (D.4a T56, \
+         O4: the clock that counts suspend, and the one that does not, read apart):\n{}",
+        wrong.join("\n\n")
+    );
+}
+
+/// HG6's reading: a layout, a comment or a doc comment changes nothing; another token does,
+/// and so does a token that only starts or ends like the one expected.
+#[test]
+fn hg6_reads_an_item_as_its_tokens() {
+    let src = "/// Reads it.\npub(crate) fn f() -> D {\n    // SAFETY: none.\n    g(A)\n}\nfn h() { g(AB) }\n";
+    assert_eq!(item_count(src, "pub(crate) fn f() -> D { g(A) }"), 1);
+    assert_eq!(item_count(src, "pub(crate) fn f() -> D { g(B) }"), 0);
+    assert_eq!(item_count(src, "g(A)"), 1);
+    assert_eq!(item_count(src, "g(AB)"), 1);
+    assert_eq!(item_count(src, "A"), 1, "AB is not A");
+    assert_eq!(item_count(src, "B"), 0);
 }

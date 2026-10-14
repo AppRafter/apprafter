@@ -195,7 +195,8 @@ mod tests {
     /// T56, HG1: a holder's clocks — one that counts suspend, one that does not — both advance
     /// as time passes awake, and the first is never behind the second. That they count
     /// suspend as named is what the owner's suspend walk row proves (h); the constants are
-    /// pinned in `os::*`'s own tests.
+    /// pinned in `os::*`'s own tests, and which OS clock each reading is by the wiring tests
+    /// below and HG6 (`tests/holder_guard.rs`).
     #[test]
     fn the_system_clocks_advance_together_while_awake() {
         let c = SystemClock;
@@ -207,5 +208,88 @@ mod tests {
         assert!(s1 + Duration::from_millis(100) >= a1, "{s1:?} {a1:?}");
         let gap = (s1 - s0).abs_diff(a1 - a0);
         assert!(gap < SLEEP_GAP, "{gap:?}");
+    }
+
+    /// `read` happened between `before` and `after`, two direct reads of the clock `name`.
+    fn read_between(name: &str, before: Duration, read: Duration, after: Duration) {
+        assert!(
+            before <= read && read <= after,
+            "SystemClock does not read {name}: {read:?} is not between {before:?} and {after:?}"
+        );
+    }
+
+    /// A Unix clock read straight from the OS, the clock named by the caller as libc names it:
+    /// the wiring tests share no reader with the code they test.
+    #[cfg(unix)]
+    fn os_clock(id: libc::clockid_t) -> Duration {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: clock_gettime writes one timespec.
+        assert_eq!(unsafe { libc::clock_gettime(id, &mut ts) }, 0);
+        Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+    }
+
+    /// T56, O4 (the wiring): each of `SystemClock`'s readings falls between two direct reads of
+    /// the OS clock its docs name — `with_sleep` `CLOCK_BOOTTIME`, `awake_only`
+    /// `CLOCK_MONOTONIC`. On a machine that has slept the two are apart by that sleep, and a
+    /// swapped or a wrong reader fails here; on one that never has they read alike, and HG6
+    /// (`tests/holder_guard.rs`) is what pins which call each reader makes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_the_system_clock_reads_boottime_and_monotonic() {
+        let before = (
+            os_clock(libc::CLOCK_BOOTTIME),
+            os_clock(libc::CLOCK_MONOTONIC),
+        );
+        let read = (SystemClock.with_sleep(), SystemClock.awake_only());
+        let after = (
+            os_clock(libc::CLOCK_BOOTTIME),
+            os_clock(libc::CLOCK_MONOTONIC),
+        );
+        read_between("CLOCK_BOOTTIME", before.0, read.0, after.0);
+        read_between("CLOCK_MONOTONIC", before.1, read.1, after.1);
+    }
+
+    /// T56, O4 (the wiring), macOS: `with_sleep` reads `CLOCK_MONOTONIC_RAW`, `awake_only`
+    /// `CLOCK_UPTIME_RAW` (as the Linux test says).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_the_system_clock_reads_monotonic_raw_and_uptime_raw() {
+        let before = (
+            os_clock(libc::CLOCK_MONOTONIC_RAW),
+            os_clock(libc::CLOCK_UPTIME_RAW),
+        );
+        let read = (SystemClock.with_sleep(), SystemClock.awake_only());
+        let after = (
+            os_clock(libc::CLOCK_MONOTONIC_RAW),
+            os_clock(libc::CLOCK_UPTIME_RAW),
+        );
+        read_between("CLOCK_MONOTONIC_RAW", before.0, read.0, after.0);
+        read_between("CLOCK_UPTIME_RAW", before.1, read.1, after.1);
+    }
+
+    /// T56, O4 (the wiring), Windows: `with_sleep` reads `GetTickCount64` (milliseconds, suspend
+    /// included), `awake_only` `QueryUnbiasedInterruptTime` (100 ns units, suspend excluded) —
+    /// what `os/windows.rs` calls (as the Linux test says).
+    #[cfg(windows)]
+    #[test]
+    fn windows_the_system_clock_reads_the_tick_count_and_the_unbiased_interrupt_time() {
+        use windows_sys::Win32::System::SystemInformation::GetTickCount64;
+        use windows_sys::Win32::System::WindowsProgramming::QueryUnbiasedInterruptTime;
+        // SAFETY: no arguments.
+        let ticks = || Duration::from_millis(unsafe { GetTickCount64() });
+        let unbiased = || {
+            let mut t = 0u64;
+            // SAFETY: writes one u64.
+            assert_ne!(unsafe { QueryUnbiasedInterruptTime(&mut t) }, 0);
+            Duration::from_nanos(t.saturating_mul(100))
+        };
+        let before = (ticks(), unbiased());
+        let read = (SystemClock.with_sleep(), SystemClock.awake_only());
+        let after = (ticks(), unbiased());
+        read_between("GetTickCount64", before.0, read.0, after.0);
+        read_between("QueryUnbiasedInterruptTime", before.1, read.1, after.1);
     }
 }
