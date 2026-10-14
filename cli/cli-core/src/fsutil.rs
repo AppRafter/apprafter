@@ -11,7 +11,8 @@ use std::path::Path;
 /// with POSIX rename semantics, so a reader holding `dest` open does not
 /// make the replace fail (tempfile's `persist` does not retry). On Unix the
 /// parent directory is fsynced afterwards (errors ignored). On error the
-/// temp file is removed.
+/// temp file is removed, on Windows too: the owner-only temp file's handle
+/// shares removal by name ([`crate::owner_only::create_new`]).
 ///
 /// `mode` is the file's mode on Unix, applied to the temp file before the
 /// rename; `None` keeps tempfile's 0600. A file that is owner-only on Unix
@@ -57,6 +58,10 @@ pub fn atomic_replace(
     #[cfg(all(test, windows))]
     crate::owner_only::testing::record_before_first_byte(tmp.as_file());
     tmp.write_all(bytes)?;
+    #[cfg(test)]
+    if WRITE_FAILS.with(std::cell::Cell::take) {
+        return Err(io::Error::other("a forced write error"));
+    }
     #[cfg(unix)]
     if let Some(mode) = mode {
         use std::os::unix::fs::PermissionsExt;
@@ -83,6 +88,13 @@ pub fn atomic_replace(
         let _ = dir.sync_all();
     }
     Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's forced write error: this thread's next [`atomic_replace`] fails once its temp
+    /// file holds the bytes, as a write to a full disk does.
+    static WRITE_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -130,6 +142,22 @@ mod tests {
             others(dir.path(), "occupied").is_empty(),
             "temp file left behind"
         );
+    }
+
+    /// WI-474: a write that fails leaves no temp file. On Windows the owner-only temp file
+    /// (`None`, 0600) is removed by tempfile's cleanup while its handle is still open, which
+    /// that handle must share; a wider mode's temp file is tempfile's own.
+    #[test]
+    fn a_failed_write_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, mode) in [("none", None), ("0600", Some(0o600)), ("0644", Some(0o644))] {
+            let dest = dir.path().join(name);
+            WRITE_FAILS.with(|fails| fails.set(true));
+            let err = atomic_replace(&dest, b"secret", ".f.", mode).expect_err(name);
+            assert_eq!(err.to_string(), "a forced write error", "{name}");
+            let left = others(dir.path(), "");
+            assert!(left.is_empty(), "{name}: left behind: {left:?}");
+        }
     }
 
     #[cfg(unix)]

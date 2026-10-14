@@ -32,9 +32,11 @@ use std::path::{Path, PathBuf};
 
 /// A new file at `path`, open for writing and owner-only before anything is written to it;
 /// `AlreadyExists` when the name is taken (never replaced). Unix: mode 0600 at `open`.
-/// Windows: opened unshared, with the right to set its DACL, and given the owner-only DACL
+/// Windows: opened with the right to set its DACL, and given the owner-only DACL
 /// ([`restrict_file`]) before it is returned; a file that cannot be restricted is removed and
-/// the error returned.
+/// the error returned. While it is held no one else opens it, to read or to write: the open
+/// shares only removal by name, which tempfile's cleanup needs when a write fails (it removes
+/// the file before it closes the handle).
 #[cfg(unix)]
 pub fn create_new(path: &Path) -> io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
@@ -47,13 +49,16 @@ pub fn create_new(path: &Path) -> io::Result<File> {
 
 /// A new file at `path`, open for writing and owner-only before anything is written to it;
 /// `AlreadyExists` when the name is taken (never replaced). Unix: mode 0600 at `open`.
-/// Windows: opened unshared, with the right to set its DACL, and given the owner-only DACL
+/// Windows: opened with the right to set its DACL, and given the owner-only DACL
 /// ([`restrict_file`]) before it is returned; a file that cannot be restricted is removed and
-/// the error returned.
+/// the error returned. While it is held no one else opens it, to read or to write: the open
+/// shares only removal by name, which tempfile's cleanup needs when a write fails (it removes
+/// the file before it closes the handle).
 #[cfg(windows)]
 pub fn create_new(path: &Path) -> io::Result<File> {
-    // No sharing while it is ours.
-    create_new_sharing(path, 0)
+    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE;
+    // No reader and no other writer while it is ours; removal by name, for tempfile's cleanup.
+    create_new_sharing(path, FILE_SHARE_DELETE)
 }
 
 /// [`create_new`], for a file that another process of this account reads while this one still
@@ -1178,6 +1183,45 @@ mod tests {
         assert!(refused(
             &|| dir_dacl.assert_owner_only_file("a directory read as a file")
         ));
+    }
+
+    /// WI-474: while it is held, a new file is no one else's to open, to read or to write; and
+    /// tempfile's cleanup, which removes it by name before it closes the handle (what a failed
+    /// write drops), leaves nothing behind.
+    #[cfg(windows)]
+    #[test]
+    fn a_new_file_is_opened_by_no_one_else_while_held_and_removed_when_dropped() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut file = tempfile::Builder::new()
+            .prefix("held-")
+            .make_in(dir.path(), create_new)
+            .unwrap();
+        file.write_all(b"secret").unwrap();
+        let every = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+        let reader = OpenOptions::new()
+            .read(true)
+            .share_mode(every)
+            .open(file.path());
+        let writer = OpenOptions::new()
+            .write(true)
+            .share_mode(every)
+            .open(file.path());
+        for (who, opened) in [("a reader", reader), ("a writer", writer)] {
+            assert_eq!(
+                opened.expect_err(who).raw_os_error(),
+                Some(ERROR_SHARING_VIOLATION as i32),
+                "{who}"
+            );
+        }
+        let path = file.path().to_path_buf();
+        drop(file);
+        assert!(!path.exists(), "removed when dropped");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     // ---- WI-473 ----
