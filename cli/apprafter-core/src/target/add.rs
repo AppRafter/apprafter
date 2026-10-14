@@ -86,8 +86,10 @@ fn stored_config(ctx: &Context, name: &str) -> CoreResult<Option<TargetConfig>> 
     }
 }
 
-/// Local checks only (R2), in today's order: name, provider, token format, SSH key, name free
-/// (unless `force`). A new name is Bounded (`Create Target`, `Create Credentials`, and
+/// Local checks only (R2), in today's order: name, provider, token format, then the store is
+/// this account's alone (WI-481: before any read of it, so a folder another account owns is
+/// refused by name, never a bare "Permission denied" from the first file read in it), SSH key,
+/// name free (unless `force`). A new name is Bounded (`Create Target`, `Create Credentials`, and
 /// `SetDefault CliDefault` when `config.yaml` is absent) — with `force` too (deviation 3). A
 /// forced overwrite of a stored target is Destructive: one `Update` or `Keep Target` per field
 /// ([`force_changes`]), then `Replace Credentials`; on a target whose state records a server it
@@ -101,6 +103,7 @@ pub fn plan_add(ctx: &Context, args: AddArgs) -> CoreResult<Plan<AddPayload>> {
     crate::provider::require_supported(&args.provider)?;
     crate::provider::TokenProblem::check(args.token.expose())
         .map_err(|problem| CoreError::InvalidToken { problem })?;
+    cli_core::store_privacy::ensure_private(&ctx.store())?;
     if let Some(p) = &args.ssh_key {
         // A new target's key is fixed by running the same add again, an existing one's by
         // `--renew`: the refusal's help says which (D.3d verification).
@@ -426,7 +429,9 @@ pub fn execute_add(
 
 /// Bounded. A renewal changes whatever differs from what is stored, and nothing else: a token
 /// equal to the stored one counts as no token (so a key change beside it is not refused), and a
-/// key path equal to the stored one is no change. Local checks, in order: the target exists (both
+/// key path equal to the stored one is no change. Local checks, in order: the store is this
+/// account's alone (WI-481: before its first read, so a target folder another account owns is
+/// refused by name, never a bare "Permission denied"), the target exists (both
 /// of its files), the token's format, the SSH key is readable, then something would change —
 /// else [`CoreError::RenewTokenUnchanged`] when a token was given (the stored one), or
 /// [`CoreError::RenewNothingToChange`] when none was. Changes: `Replace Credentials` ("API
@@ -437,6 +442,7 @@ pub fn plan_renew(
     args: RenewArgs,
 ) -> CoreResult<Plan<RenewPayload>> {
     let name = target.name();
+    cli_core::store_privacy::ensure_private(&ctx.store())?;
     let config = cli_core::target::load_target_config(&ctx.store(), name)?;
     let (stored, replaces) = renewal_record(ctx, name)?;
     if let Some(token) = &args.token {
@@ -783,6 +789,105 @@ mod tests {
             }
         }
         assert_eq!(crate::target::testkit::snapshot(ctx.config_root()), before);
+    }
+
+    /// Unix: `path` at `mode` while the guard lives, then 0700. `closed`: assert first that the
+    /// mode locks this account out (a run as root would open what the test needs closed).
+    #[cfg(unix)]
+    struct Mode(std::path::PathBuf);
+
+    #[cfg(unix)]
+    impl Mode {
+        fn set(path: &Path, mode: u32, closed: bool) -> Mode {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+            let guard = Mode(path.to_path_buf());
+            if closed {
+                assert!(
+                    std::fs::read_dir(path).is_err(),
+                    "mode {mode:o} does not lock this account out of {path:?}: not as root"
+                );
+            }
+            guard
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for Mode {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+
+    /// The renewal and the adds `target add` plans, for `prod` (stored) and `dev` (new).
+    #[cfg(unix)]
+    fn plans(ctx: &Context) -> Vec<(&'static str, CoreError)> {
+        let prod = TargetRef::named(ctx, "prod").unwrap();
+        vec![
+            (
+                "renew",
+                plan_renew(ctx, &prod, renew_args(Some(TOKEN_B), None)).unwrap_err(),
+            ),
+            (
+                "force",
+                plan_add(
+                    ctx,
+                    AddArgs {
+                        force: true,
+                        ..args("prod", TOKEN_B)
+                    },
+                )
+                .unwrap_err(),
+            ),
+            ("add", plan_add(ctx, args("dev", TOKEN_B)).unwrap_err()),
+        ]
+    }
+
+    /// WI-481 (d4a-h P-3), Unix: a target's folder another account owns (pretended) and this
+    /// account cannot open (mode 000, as such a folder made 0700 is to it): the renewal and
+    /// the adds are refused when planned, naming that folder — never a bare "Permission
+    /// denied" from reading the target's files.
+    #[cfg(unix)]
+    #[test]
+    fn a_target_folder_another_account_owns_and_keeps_closed_is_refused_by_name() {
+        let (_d, ctx) = store(&["prod"], Some("prod"));
+        let ctx = ctx.with_no_ping(true);
+        let folder = ctx.store().target_dir("prod");
+        let _foreign = cli_core::owner_only::pretend::foreign_owner(&folder);
+        let _closed = Mode::set(&folder, 0o000, true);
+        for (what, err) in plans(&ctx) {
+            match err {
+                CoreError::Cli(cli_core::CliError::StoreNotPrivate {
+                    path,
+                    problem: cli_core::StoreFolderProblem::ForeignOwner,
+                }) => assert_eq!(path, folder, "{what}"),
+                other => panic!("{what}: {other:?}"),
+            }
+        }
+    }
+
+    /// WI-481, Unix: a plan checks the store before it reads a file of it. With the store's
+    /// folder open to other accounts (mode 0777) and the target's folder closed to this one
+    /// (mode 000, its own), each plan refuses the store, naming its folder; read first, the
+    /// target's files would have been a bare "Permission denied" (or, for a new target, a plan).
+    #[cfg(unix)]
+    #[test]
+    fn a_plan_checks_the_store_before_it_reads_a_file_of_it() {
+        let (_d, ctx) = store(&["prod"], Some("prod"));
+        let ctx = ctx.with_no_ping(true);
+        let root = ctx.store().root().to_path_buf();
+        let _closed = Mode::set(&ctx.store().target_dir("prod"), 0o000, true);
+        let _open = Mode::set(&root, 0o777, false);
+        for (what, err) in plans(&ctx) {
+            match err {
+                CoreError::Cli(cli_core::CliError::StoreNotPrivate {
+                    path,
+                    problem: cli_core::StoreFolderProblem::WritableByOthers,
+                }) => assert_eq!(path, root, "{what}"),
+                other => panic!("{what}: {other:?}"),
+            }
+        }
     }
 
     #[test]

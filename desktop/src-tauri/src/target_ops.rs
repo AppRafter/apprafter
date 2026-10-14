@@ -1213,6 +1213,42 @@ mod tests {
         assert_eq!(saved.credentials.hetzner_token, None);
     }
 
+    /// WI-481 (d4a-h P-3), Unix: a target's folder another account owns (pretended) and the app
+    /// cannot open (mode 000, as such a folder made 0700 is to this account): the Target
+    /// screen's Renew token and SSH key row are refused before any plan with
+    /// `store_not_private` naming the folder, never a bare "Permission denied"; no op starts.
+    #[cfg(unix)]
+    #[test]
+    fn a_renew_in_a_folder_another_account_owns_is_refused_naming_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let s = store(&["prod"], None);
+        let folder = s.shell.context.store().target_dir("prod");
+        let _foreign = cli_core::owner_only::pretend::foreign_owner(&folder);
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(
+            std::fs::read_dir(&folder).is_err(),
+            "mode 000 must lock this user out"
+        );
+        let refused = [
+            plan_target_renew(&s.shell, "prod", Some(a_token('k')), None),
+            plan_target_renew(&s.shell, "prod", None, Some("/nowhere/key.pub".into())),
+        ];
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for got in refused {
+            let ui = got.unwrap_err().to_ui();
+            assert_eq!(
+                ui.code.as_deref(),
+                Some("apprafter::secrets::store_not_private")
+            );
+            assert!(
+                ui.message.contains(&folder.display().to_string()),
+                "{}",
+                ui.message
+            );
+        }
+        assert!(s.shell.ops.list().is_empty());
+    }
+
     #[test]
     fn a_renew_with_nothing_to_change_is_refused_before_any_plan() {
         let s = store(&["prod"], None);

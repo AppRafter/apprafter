@@ -131,8 +131,17 @@ pub(crate) fn add(mut args: AddArgs) -> miette::Result<()> {
         })
     })?;
     let ctx = match early {
+        // Checked before the wizard.
         Some(c) => c,
-        None => crate::context::cli_context()?,
+        None => {
+            let ctx = crate::context::cli_context()?;
+            // WI-481: the flag-driven path too refuses a store other accounts can change before
+            // it reads a file of it — a renewal reads the target's files first — so a target
+            // folder another account owns is refused by name, never a bare "Permission denied".
+            cli_core::store_privacy::ensure_private(&ctx.store())
+                .map_err(|e| report(CoreError::from(e)))?;
+            ctx
+        }
     }
     .with_no_ping(args.no_ping);
 

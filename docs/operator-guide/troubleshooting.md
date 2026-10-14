@@ -675,7 +675,10 @@ it asks for anything at its terminal: a lock password, a Hetzner or
 repository token, a backup passphrase. Commands that need no secret still run —
 `apprafter target list`, `apprafter target show`, `apprafter lock status` —
 and [`apprafter doctor`](#store-folder-foreign) lists every folder and secret
-file concerned.
+file concerned. A folder another account owns is often one your account
+cannot open either: a command that has to read a file in it, `apprafter
+target show` and doctor's `Config file readable` row included, then gives
+this message, naming the folder, rather than a bare permission error.
 
 AppRafter creates every folder of the store your account's alone, whatever
 the umask, and never changes a folder that is already there. So the folder
@@ -793,6 +796,10 @@ permissions only, and change nothing.
   the folder's mode on Linux and macOS (`(mode 777)`).
 - ``Credentials file of target `prod` belongs to another account``, and the
   same for a state file, the age key or the vault file.
+- ``Target store folder `state/prod`: who can change the folders in it is
+  unknown``, when the folders in it cannot be listed: one another account
+  owns is usually closed to you too. The store's secrets are not used until
+  they can be.
 
 While a folder is listed, the store's secrets are not used: the token and
 Kubernetes API rows are skipped with the refusal

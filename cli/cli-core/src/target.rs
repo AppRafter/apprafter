@@ -695,17 +695,19 @@ pub fn load_active_target_config(
 
 /// Read one target's `config.yaml` only — never its credentials, so a listing reads no secret.
 /// Missing target → `CliError::TargetNotFound` with the names present, as [`load_target`]; a
-/// file that cannot be read, or checked for, → `CliError::TargetFileIo` naming the target.
+/// file that cannot be read, or checked for, → `CliError::TargetFileIo` naming the target, or
+/// `CliError::StoreNotPrivate` naming the folder when one another account owns is why
+/// (WI-481, [`crate::store_privacy::foreign_folder_behind`]).
 pub fn load_target_config(paths: &TargetStorePaths, name: &str) -> Result<TargetConfig> {
     let cfg_path = paths.target_config_file(name);
-    if !target_file_exists(&cfg_path, name)? {
+    if !target_file_exists(paths, &cfg_path, name)? {
         let available = list_target_names(paths).unwrap_or_default().join(", ");
         return Err(CliError::TargetNotFound {
             name: name.to_string(),
             available,
         });
     }
-    let cfg_bytes = read_target_file(&cfg_path, name)?;
+    let cfg_bytes = read_target_file(paths, &cfg_path, name)?;
     serde_yaml::from_slice(&cfg_bytes).map_err(|err| CliError::InvalidTargetConfig {
         path: cfg_path.clone(),
         message: err.to_string(),
@@ -739,7 +741,8 @@ pub fn load_target_credentials(paths: &TargetStorePaths, name: &str) -> Result<T
 }
 
 /// The bytes of target `name`'s `credentials.yaml`, read as [`load_target_credentials`] reads
-/// them: `None` when there is no file; a failure names the target (`CliError::TargetFileIo`).
+/// them: `None` when there is no file; a failure names the target (`CliError::TargetFileIo`), or
+/// the folder another account owns that is why (`CliError::StoreNotPrivate`, WI-481).
 /// Only the shared core's secret store calls it (D.4a T16): the bytes hold the token, or a
 /// locked store's vault marker. On Windows a file whose DACL is not owner-only (written before
 /// WI-472) is made owner-only on the handle it is read through
@@ -749,12 +752,12 @@ pub fn read_target_credentials_bytes(
     name: &str,
 ) -> Result<Option<Vec<u8>>> {
     let creds_path = paths.target_credentials_file(name);
-    if !target_file_exists(&creds_path, name)? {
+    if !target_file_exists(paths, &creds_path, name)? {
         return Ok(None);
     }
     crate::owner_only::read_secret(&creds_path)
         .map(Some)
-        .map_err(|source| target_file_io(&creds_path, name, source))
+        .map_err(|source| target_file_io(paths, &creds_path, name, source))
 }
 
 /// `bytes`, target `name`'s `credentials.yaml`, parsed as [`load_target_credentials`] parses
@@ -778,19 +781,31 @@ pub fn parse_target_credentials(
 /// `config.yaml` and without credentials (WI-458 review #3). A check that fails is an I/O error
 /// on that file, naming the target (`CliError::TargetFileIo`). A path through a regular file is
 /// missing, as before: a file under `targets/` is not a target (`list_target_names` skips it).
-fn target_file_exists(path: &Path, name: &str) -> Result<bool> {
+fn target_file_exists(paths: &TargetStorePaths, path: &Path, name: &str) -> Result<bool> {
     match path.try_exists() {
         Err(e) if e.kind() == std::io::ErrorKind::NotADirectory => Ok(false),
-        checked => checked.map_err(|source| target_file_io(path, name, source)),
+        checked => checked.map_err(|source| target_file_io(paths, path, name, source)),
     }
 }
 
 /// `path`, one of target `name`'s own files, read; an error names the target (review #6).
-fn read_target_file(path: &Path, name: &str) -> Result<Vec<u8>> {
-    fs::read(path).map_err(|source| target_file_io(path, name, source))
+fn read_target_file(paths: &TargetStorePaths, path: &Path, name: &str) -> Result<Vec<u8>> {
+    fs::read(path).map_err(|source| target_file_io(paths, path, name, source))
 }
 
-fn target_file_io(path: &Path, name: &str, source: std::io::Error) -> CliError {
+/// An error on `path`, one of target `name`'s own files: the refusal of the folder another
+/// account owns when that is why it was denied (WI-481: such a folder, 0700, cannot be opened by
+/// this account, and was a bare "Permission denied"), else the I/O error naming the target.
+fn target_file_io(
+    paths: &TargetStorePaths,
+    path: &Path,
+    name: &str,
+    source: std::io::Error,
+) -> CliError {
+    let folder = path.parent().unwrap_or(path);
+    if let Some(refusal) = crate::store_privacy::foreign_folder_behind(paths, folder, &source) {
+        return refusal;
+    }
     CliError::TargetFileIo {
         path: path.to_path_buf(),
         target: name.to_string(),
@@ -862,14 +877,19 @@ pub fn save_target_config(
 /// Names of every target directory under `<root>/targets/`,
 /// sorted lexicographically so callers get a stable order without
 /// each one re-sorting. Returns `Ok(vec![])` if the directory
-/// doesn't exist yet.
+/// doesn't exist yet. A `targets/` another account owns and this
+/// account cannot open is that folder's refusal
+/// (`CliError::StoreNotPrivate`, WI-481), not a bare I/O error.
 pub fn list_target_names(paths: &TargetStorePaths) -> Result<Vec<String>> {
     let dir = paths.targets_dir();
     if !dir.exists() {
         return Ok(Vec::new());
     }
+    let entries = fs::read_dir(&dir).map_err(|e| {
+        crate::store_privacy::foreign_folder_behind(paths, &dir, &e).unwrap_or(CliError::Io(e))
+    })?;
     let mut names: Vec<String> = Vec::new();
-    for entry in fs::read_dir(&dir)? {
+    for entry in entries {
         let entry = entry?;
         if !entry.file_type()?.is_dir() {
             continue;
@@ -1828,6 +1848,49 @@ mod tests {
         );
         let both = load_target(&paths, "prod").expect_err("cannot be searched");
         assert_target_file_io(&both, &paths.target_config_file("prod"), PermissionDenied);
+    }
+
+    /// WI-481: a target's folder, or `targets/`, that another account owns (pretended) and this
+    /// account cannot open (mode 000, as such a folder made 0700 is to it) is that folder's
+    /// refusal, named — through every read of a target's files and the target list — never a
+    /// bare "Permission denied". The test asserts first that mode 000 locks it out (not root).
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_another_account_owns_and_keeps_closed_is_refused_by_every_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, paths) = make_paths();
+        saved(&paths, "prod");
+        let refused_naming = |err: CliError, folder: &Path| match err {
+            CliError::StoreNotPrivate {
+                path,
+                problem: crate::error::StoreFolderProblem::ForeignOwner,
+            } => assert_eq!(path, folder),
+            other => panic!("expected StoreNotPrivate naming {folder:?}, got {other:?}"),
+        };
+        let prod = paths.target_dir("prod");
+        {
+            let _foreign = crate::owner_only::pretend::foreign_owner(&prod);
+            fs::set_permissions(&prod, fs::Permissions::from_mode(0o000)).unwrap();
+            let _restore = ModeGuard(prod.clone());
+            assert!(
+                fs::read_dir(&prod).is_err(),
+                "mode 000 must lock this user out"
+            );
+            refused_naming(load_target_config(&paths, "prod").unwrap_err(), &prod);
+            refused_naming(load_target_credentials(&paths, "prod").unwrap_err(), &prod);
+            refused_naming(load_target(&paths, "prod").unwrap_err(), &prod);
+            refused_naming(
+                read_target_credentials_bytes(&paths, "prod").unwrap_err(),
+                &prod,
+            );
+            assert_eq!(list_target_names(&paths).unwrap(), ["prod"]);
+        }
+        let targets = paths.targets_dir();
+        let _foreign = crate::owner_only::pretend::foreign_owner(&targets);
+        fs::set_permissions(&targets, fs::Permissions::from_mode(0o000)).unwrap();
+        let _restore = ModeGuard(targets.clone());
+        refused_naming(list_target_names(&paths).unwrap_err(), &targets);
+        refused_naming(load_target_config(&paths, "prod").unwrap_err(), &targets);
     }
 
     /// Review #6: a target's own file that cannot be read is an I/O error naming the target, so

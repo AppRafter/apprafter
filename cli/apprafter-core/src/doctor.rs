@@ -321,6 +321,12 @@ enum Lookup {
         name: String,
         available: Vec<String>,
     },
+    /// The target list cannot be read because another account owns `targets/` (WI-481): the
+    /// refusal, naming the folder, is the target's row.
+    Refused {
+        name: String,
+        refusal: CliError,
+    },
 }
 
 /// Doctor (spec §3.1: a Read with a reporter). Every problem is a row, never an error; `Err`
@@ -381,6 +387,10 @@ fn run_reading_only(
             Err(CoreError::TargetNotFound { name, available }) => {
                 Lookup::Missing { name, available }
             }
+            Err(CoreError::Cli(refusal @ CliError::StoreNotPrivate { .. })) => Lookup::Refused {
+                name: n.clone(),
+                refusal,
+            },
             Err(e) => return Err(e),
         },
     };
@@ -518,6 +528,12 @@ fn target_group(
         Lookup::Missing { name, available } => {
             return Ok(vec![missing_target(name, available.clone())])
         }
+        Lookup::Refused { name, refusal } => {
+            return Ok(vec![unreadable_config(
+                ctx.store().target_config_file(name).display().to_string(),
+                refusal,
+            )])
+        }
         Lookup::Found(target) => target,
     };
     let store = ctx.store();
@@ -532,15 +548,9 @@ fn target_group(
                 cli_core::list_target_names(&store)?,
             )]);
         }
-        Err(e) => {
-            return Ok(vec![Check {
-                detail: Some(config_file),
-                fix: Some(CheckFix::Explain {
-                    text: e.to_string(),
-                }),
-                ..row(CheckId::ConfigReadable, CheckStatus::Fail, TITLE_CONFIG)
-            }]);
-        }
+        // WI-481: a folder another account owns that this account cannot open is its refusal,
+        // naming the folder (`store_privacy::foreign_folder_behind`), not "Permission denied".
+        Err(e) => return Ok(vec![unreadable_config(config_file, &e)]),
     };
     Ok(vec![
         Check {
@@ -553,6 +563,18 @@ fn target_group(
         token_verified(ctx, &loaded, cancel)?,
         ssh_key(&loaded),
     ])
+}
+
+/// The failed "Config file readable" row of a target whose config cannot be read: the error's
+/// own words as its fix.
+fn unreadable_config(config_file: String, e: &CliError) -> Check {
+    Check {
+        detail: Some(config_file),
+        fix: Some(CheckFix::Explain {
+            text: e.to_string(),
+        }),
+        ..row(CheckId::ConfigReadable, CheckStatus::Fail, TITLE_CONFIG)
+    }
 }
 
 /// A target as doctor checks it: its config and what reading its STORED token gave (never an
@@ -845,7 +867,8 @@ const FOREIGN_FILE_FIX: &str = "Another account owns this file, so it can give i
 /// The rows of the store's folders another account owns or can write (WI-475), a warning each,
 /// in `cli_core::store_privacy::folders`' order: a folder may have both. A folder whose owner
 /// or permissions cannot be read is said so, never passed over (the store's refusal fails
-/// closed on it too). Nothing is changed.
+/// closed on it too), and so is one whose folders cannot be listed, after its own rows (WI-481:
+/// it used to hide every row behind one about the store's root). Nothing is changed.
 fn folder_rows(store: &cli_core::TargetStorePaths) -> Vec<Check> {
     let folders = match cli_core::store_privacy::folders(store) {
         Ok(folders) => folders,
@@ -890,12 +913,27 @@ fn folder_rows(store: &cli_core::TargetStorePaths) -> Vec<Check> {
                 .map(|m| format!(" (mode {m:o})"))
                 .unwrap_or_default();
             rows.push(Check {
-                detail: Some(shown),
+                detail: Some(shown.clone()),
                 fix: Some(explain(WRITABLE_FOLDER_FIX)),
                 ..row(
                     CheckId::Secrets,
                     CheckStatus::Warn,
                     format!("{what} can be changed by other accounts{mode}"),
+                )
+            });
+        }
+        if let Some(why) = &folder.unlisted {
+            rows.push(Check {
+                detail: Some(shown),
+                fix: Some(explain(&format!(
+                    "The folders in it could not be listed: {}. Who can change them is unknown, \
+                     so AppRafter uses and writes none of this store's secrets until they can be.",
+                    why.message
+                ))),
+                ..row(
+                    CheckId::Secrets,
+                    CheckStatus::Warn,
+                    format!("{what}: who can change the folders in it is unknown"),
                 )
             });
         }
@@ -3368,6 +3406,136 @@ mod tests {
         };
         assert_eq!(token.detail, Some(refusal.to_string()));
         assert_eq!(crate::target::testkit::snapshot(&f.root), before);
+    }
+
+    /// WI-481 (Unix, d4a-h P-3): a folder another account owns (pretended) and this account
+    /// cannot open (mode 000, as such a folder made 0700 is to it) is reported, never an error
+    /// and never a bare "Permission denied": the target's config row is the refusal naming the
+    /// folder, and the folder rows name it — with a row for the folders in it that could not be
+    /// listed, where doctor used to show one row about the store's root instead of them all.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_another_account_owns_and_keeps_closed_is_named_in_its_rows() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = fx();
+        let ctx = two_targets(&f);
+        let store = ctx.store();
+        let folder_rows = |r: &DoctorReport| -> Vec<String> {
+            group(r, GroupId::ThisComputer)
+                .into_iter()
+                .filter(|c| c.id == CheckId::Secrets && c.title.starts_with("Target store folder"))
+                .map(|c| c.title)
+                .collect()
+        };
+        let refusal = |path: &Path| {
+            CliError::StoreNotPrivate {
+                path: path.to_path_buf(),
+                problem: cli_core::StoreFolderProblem::ForeignOwner,
+            }
+            .to_string()
+        };
+        let config_row = |r: &DoctorReport| {
+            let rows = group(r, GroupId::Target);
+            let row = rows[0].clone();
+            assert_eq!(
+                (row.id, row.status),
+                (CheckId::ConfigReadable, CheckStatus::Fail)
+            );
+            assert_eq!(
+                row.detail.as_deref(),
+                Some(
+                    store
+                        .target_config_file("prod")
+                        .display()
+                        .to_string()
+                        .as_str()
+                )
+            );
+            (rows.len(), row.fix)
+        };
+        let close = |path: &Path| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
+            assert!(
+                std::fs::read_dir(path).is_err(),
+                "mode 000 must lock this user out"
+            );
+        };
+        let open = |path: &Path| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        };
+
+        // A target's folder: its config row and its folder row name it.
+        let prod = store.target_dir("prod");
+        {
+            let _foreign = cli_core::owner_only::pretend::foreign_owner(&prod);
+            close(&prod);
+            let r = doctor(&ctx, named("prod"));
+            open(&prod);
+            assert_eq!(
+                config_row(&r),
+                (
+                    1,
+                    Some(CheckFix::Explain {
+                        text: refusal(&prod)
+                    })
+                )
+            );
+            assert_eq!(
+                folder_rows(&r),
+                ["Target store folder `targets/prod` belongs to another account"]
+            );
+        }
+
+        // `targets` itself: the target list cannot be read; the refusal is the target's row.
+        let targets = store.targets_dir();
+        {
+            let _foreign = cli_core::owner_only::pretend::foreign_owner(&targets);
+            close(&targets);
+            let r = doctor(&ctx, named("prod"));
+            open(&targets);
+            assert_eq!(
+                config_row(&r),
+                (
+                    1,
+                    Some(CheckFix::Explain {
+                        text: refusal(&targets)
+                    })
+                )
+            );
+            assert!(!r.groups.iter().any(|g| g.id == GroupId::Cluster));
+            assert_eq!(
+                folder_rows(&r),
+                [
+                    "Target store folder `targets` belongs to another account",
+                    "Target store folder `targets`: who can change the folders in it is unknown",
+                ]
+            );
+        }
+
+        // A target's state folder, which the walk lists: named, and the walk goes on past it.
+        let state = store.state_dir("dev");
+        let _foreign = cli_core::owner_only::pretend::foreign_owner(&state);
+        close(&state);
+        let r = doctor(&ctx, named("prod"));
+        open(&state);
+        assert_eq!(
+            folder_rows(&r),
+            [
+                "Target store folder `state/dev` belongs to another account",
+                "Target store folder `state/dev`: who can change the folders in it is unknown",
+            ]
+        );
+        let unlisted = group(&r, GroupId::ThisComputer)
+            .into_iter()
+            .find(|c| {
+                c.title
+                    .ends_with("who can change the folders in it is unknown")
+            })
+            .unwrap();
+        assert_eq!(
+            unlisted.detail.as_deref(),
+            Some(state.display().to_string().as_str())
+        );
     }
 
     /// WI-475 (Unix): each folder others can write is a warning with its mode — the group's

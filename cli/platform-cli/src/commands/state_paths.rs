@@ -73,9 +73,33 @@ pub struct ResolvedStatePaths {
 /// `CliError::TargetNotFound` when the override names a target the
 /// store does not have. Both are recoverable — `apprafter target
 /// add <name>` / `target use <name>` — and their help says how.
+///
+/// WI-481: first of all, before any file of the store is read, a
+/// store other accounts can change is refused
+/// (`CliError::StoreNotPrivate`, naming the folder): every command
+/// that resolves its state here goes on to the target's state and
+/// its secrets — a token, the cached kubeconfig, the SSH host key
+/// it pins — which such a store could have replaced. `status` and
+/// `doctor` report instead ([`resolve_state_paths_to_report`]).
 pub fn resolve_state_paths(target_override: Option<&str>) -> Result<ResolvedStatePaths> {
+    resolve(target_override, true)
+}
+
+/// [`resolve_state_paths`] without its check of who can change the
+/// store, for a report (`status`, `doctor`'s migration once it has
+/// checked for itself): it shows what it can read and reports what
+/// it cannot, and each secret it reads is refused by the store's own
+/// check. Not for a command that acts on the state.
+pub fn resolve_state_paths_to_report(target_override: Option<&str>) -> Result<ResolvedStatePaths> {
+    resolve(target_override, false)
+}
+
+fn resolve(target_override: Option<&str>, check: bool) -> Result<ResolvedStatePaths> {
     let store_root = default_config_root()?;
     let store = TargetStorePaths::for_root(store_root);
+    if check {
+        cli_core::store_privacy::ensure_private(&store)?;
+    }
     let target_name =
         resolve_active_target_name(&store, target_override)?.ok_or(CliError::NoActiveTarget)?;
 

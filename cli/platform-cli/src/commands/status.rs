@@ -56,7 +56,7 @@ use crate::commands::platform::{
     backup_summary_lines, render_conditions_table, unhealthy_condition_rows, version_summary_line,
     PLATFORMSTACK_NAME, PLATFORMSTACK_NAMESPACE,
 };
-use crate::commands::state_paths::resolve_state_paths;
+use crate::commands::state_paths::resolve_state_paths_to_report;
 
 /// What the PlatformStack read produced. Three outcomes, not two: an
 /// unreachable cluster and a cluster with no PlatformStack are
@@ -73,7 +73,9 @@ pub(crate) enum PlatformRead<'a> {
 }
 
 pub fn run() -> Result<()> {
-    let resolved = resolve_state_paths(None)?;
+    // A report: a store other accounts can change is not refused here (WI-481); the cluster
+    // half below reads the kubeconfig as every cluster command does, and is refused there.
+    let resolved = resolve_state_paths_to_report(None)?;
     let state = State::load_or_default(&resolved.paths)?;
     // The target NAME, never the state. `?state` was inherited from the
     // skeleton this command replaced, where the whole struct was the

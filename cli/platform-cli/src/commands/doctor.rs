@@ -29,7 +29,7 @@ use apprafter_core::{CancellationToken, Context, CoreError};
 use cli_core::CliError;
 use tracing::info;
 
-use crate::commands::state_paths::resolve_state_paths;
+use crate::commands::state_paths::resolve_state_paths_to_report;
 use crate::context::{diagnostic_context, ProcessEnv};
 use crate::{holder_window, limits_client, render};
 
@@ -87,14 +87,18 @@ pub fn run(target_override: Option<&str>, no_ping: bool) -> miette::Result<()> {
 /// The one-shot `<cwd>/.apprafter/state.json` migration every state-reading command runs first
 /// (CLI-only, spec §3.1; overview §3.11): the core reads state and never runs it. Only for a
 /// target that exists: doctor reports a missing one as a row and must not create a state
-/// directory for it (deviation 3).
+/// directory for it (deviation 3). Nor into a store other accounts can change (WI-481): doctor
+/// reports its folders, and a folder whose owner cannot be read, instead of failing on them.
 fn migrate_legacy_state(ctx: &Context, target_override: Option<&str>) -> cli_core::Result<()> {
+    if cli_core::store_privacy::ensure_private(&ctx.store()).is_err() {
+        return Ok(());
+    }
     let Some(name) = cli_core::resolve_active_target_name(&ctx.store(), target_override)? else {
         return Ok(());
     };
     // `Some(name)`: the existence check runs for the CLI default too, so a dangling pointer
     // migrates nothing.
-    match resolve_state_paths(Some(&name)) {
+    match resolve_state_paths_to_report(Some(&name)) {
         Ok(_) | Err(CliError::TargetNotFound { .. }) => Ok(()),
         Err(e) => Err(e),
     }

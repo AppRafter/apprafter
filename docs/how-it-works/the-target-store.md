@@ -74,6 +74,12 @@ writes any of the store's secrets, and before any change under the write
 lock, AppRafter reads who owns each of those folders and who may write to
 it, and refuses the store if another account does
 ([`store_not_private`](../operator-guide/troubleshooting.md#store-not-private)).
+`apprafter target add` and the commands that act on a target's state
+check this before they read any file of the store; the reports,
+`apprafter status` and `apprafter doctor`, show what they can read
+instead. A folder another account owns is often closed to you as well:
+whatever a command reads in it is then refused the same way, naming the
+folder.
 `apprafter doctor` names each such folder, and each secret file another
 account owns, and changes nothing
 ([troubleshooting](../operator-guide/troubleshooting.md#store-folder-foreign)).
