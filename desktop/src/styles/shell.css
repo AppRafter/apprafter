@@ -778,6 +778,43 @@
   color: var(--warn);
 }
 
+/*
+ * The recovery key, shown once (D.4a O12): mono, wrapped as the core splits it. Not selectable:
+ * the web view's own copy would carry no history hint, so only Rust's Copy copies it
+ * (ADR 0068 §3; ProtectDialog refuses a copy or cut of it too).
+ */
+.recovery-key {
+  margin: 8px 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-4);
+  background: var(--code-bg);
+  color: var(--code-fg);
+  font: 500 var(--fs-14) var(--font-mono);
+  white-space: pre-wrap;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.lock-finish {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.lock-run {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.lock-line {
+  margin: 6px 0 0;
+  color: var(--err);
+  font-size: var(--fs-12-5);
+}
+
 /* Target screen --------------------------------------------------------------------------------- */
 
 .target-row-sub code {
