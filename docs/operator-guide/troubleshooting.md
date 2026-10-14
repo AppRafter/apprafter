@@ -355,6 +355,10 @@ reads a cache never creates a key in its place: a new key cannot
 decrypt anything cached under the old one. `apprafter doctor` reports
 the same on its **Kube API reachable** row.
 
+On a target store that `apprafter lock on` has locked, this does not occur:
+its caches are encrypted to the store's own key, kept in its vault, and
+`APPRAFTER_AGE_KEY` does not apply there.
+
 **Fix.** If you still have the key, put it back at that path, or set
 `APPRAFTER_AGE_KEY` to where it is. Nothing else is needed.
 
@@ -427,6 +431,215 @@ kubeconfig, `apprafter argocd-password --refresh --target <name>` for
 an Argo CD admin password. Neither asks, since the key they cache under
 exists.
 
+On a target store that `apprafter lock on` has locked, the key is the
+store's own, in its vault: a cache it does not open was written by an older
+AppRafter or by another program, or the copy is damaged, and whoever holds
+the key it was written for can read it until it is replaced. Replace it
+with the same `--refresh` commands; on a locked store they ask for the lock
+password, unless an unlock window is open in this terminal.
+`APPRAFTER_AGE_KEY` is refused there.
+
+### `apprafter::secrets::store_locked` {#store-locked}
+
+The target store is locked (`apprafter lock on`), the command needs one of
+its secrets, and nothing here can open the vault: no unlock window is open in
+this terminal, and either the command has no terminal to ask at — a script, a
+CI job, an AI agent's tool — or nobody answered the prompt within five
+minutes. Nothing was changed. When `apprafter up` or
+`apprafter restore --reprovision` stops this way, it stops before
+provisioning, so no server was created.
+
+**Fix.** In your own terminal run `apprafter unlock`, then run the command
+from that terminal while the window is open. A command started without a
+terminal cannot ask for the lock password, by design.
+
+### `apprafter::secrets::override_refused` {#override-refused}
+
+`HCLOUD_TOKEN` or `APPRAFTER_AGE_KEY` is set, and the target store is
+locked. A locked store uses only the token and the age key in its vault, so a
+value from the environment would pass the lock unnoticed; the command refuses
+before it asks for anything. Commands that need neither still run.
+
+**Fix.** Unset the variable; the command then asks for the lock password at
+its terminal. To work with a value from the environment on purpose — in CI,
+say — use a target store of its own that is not locked, with its own
+`APPRAFTER_CONFIG_DIR`. `apprafter lock off` is the one command that takes
+`APPRAFTER_AGE_KEY` on a locked store: as the file the shared age key is
+written to, when a cached secret goes back under it.
+
+### `apprafter::secrets::unlock_failed` {#unlock-failed}
+
+Three answers at the prompt opened nothing. The prompt takes the lock
+password or the recovery key, either one.
+
+**Fix.** Run the command again with the lock password, or with the recovery
+key if the password is lost. If neither opens the store, see [Every way into
+a locked store is lost](#locked-store-lost).
+
+### `apprafter::secrets::lock_incomplete` {#lock-incomplete}
+
+An earlier `apprafter lock on` or `apprafter lock off` stopped before it
+finished — Ctrl-C, a closed terminal, a crash. Until one finishes or backs
+out, commands that need the store's secrets refuse, because some may be only
+in the vault. Nothing was lost: no copy in clear is removed before the vault
+has been written and checked.
+
+**Fix.** For an interrupted `lock on`, run `apprafter lock on` again. If it
+had written the vault, it asks for both the lock password and the recovery
+key it showed and finishes; if not, it starts over, and the recovery key
+shown before is not valid. Without one of the two, `apprafter lock off`
+backs out with the other, and a new `apprafter lock on` starts over. For an
+interrupted `lock off`, run `apprafter lock off` again. `apprafter doctor`
+names the state.
+
+### `apprafter::secrets::store_changed` {#store-changed}
+
+Another AppRafter process turned this store's lock on or off, or replaced
+its vault, while this command ran. Nothing was written.
+
+**Fix.** Run the command again: it reads the store as it is now.
+
+### `apprafter::secrets::store_file_unreadable` {#store-file-unreadable}
+
+`store.yaml`, at the root of the target store, says whether its secrets are
+locked, and it cannot be read — or it says something no AppRafter writes: a
+newer format, an unknown state, a lock without an id, or secrets in files
+with a `vault` beside it. A `vault` with no `store.yaml` beside it is
+refused the same way. AppRafter then treats the store as locked and uses
+none of its secrets.
+
+**Fix.** If a newer AppRafter wrote it, upgrade. Otherwise fix it by hand —
+`secrets:` is one of `files`, `locking`, `locked` or `unlocking` — or restore
+it from a backup. Never delete it while the store's `vault` exists.
+
+### `apprafter::secrets::vault_unreadable` {#vault-unreadable}
+
+The vault is missing, is not an AppRafter vault, was written in a newer
+format, fails its integrity check, or belongs to another target store. The
+message says which.
+
+**Fix.** A newer format: upgrade AppRafter. Any other case: restore the
+store's `vault` from a backup — with its `store.yaml`, when it belongs to
+another store. Never delete the vault while `store.yaml` says the store is
+locked: nothing else holds these secrets. Without a backup, see [Every way
+into a locked store is lost](#locked-store-lost).
+
+### `apprafter::secrets::vault_unwritable` {#vault-unwritable}
+
+A write to the vault did not happen, and the vault is as it was. The vault
+would grow past its limit (the tokens of a few thousand targets), the input
+cannot be stored (a token that is not one line, a target name a vault entry
+cannot hold, a name already taken), or the filesystem cannot create a file
+without risking replacing one (a filesystem without hard links, such as FAT
+or exFAT).
+
+**Fix.** The help names the case. For a filesystem without hard links, keep
+the target store elsewhere: `APPRAFTER_CONFIG_DIR` moves it.
+
+### `apprafter::secrets::vault_needs_write_lock` {#vault-needs-write-lock}
+
+The store's filesystem gives no file locks, and a vault is never written
+without the store's write lock: two writers racing could overwrite the only
+copy of every token.
+
+**Fix.** Keep the target store on a local filesystem with file locks;
+`APPRAFTER_CONFIG_DIR` moves it.
+
+### `apprafter::secrets::slot_refused` {#slot-refused}
+
+The vault's lock-password slot uses key-derivation settings this AppRafter
+refuses — weaker than it accepts, or beyond what it computes — or none of the
+vault's slots is one this AppRafter knows. `apprafter lock status` names a
+refused slot.
+
+**Fix.** Open the store with its recovery key instead — every prompt takes
+it — then run `apprafter lock off` and `apprafter lock on`, which sets a new
+lock password with current settings. Between the two the store's secrets
+are in files, in clear; `lock on` shows a new recovery key, and the old one
+stops working. For slots a newer AppRafter made, upgrade.
+
+### `apprafter::secrets::cache_not_sealed` {#cache-not-sealed}
+
+A target's cached kubeconfig in a locked store is not encrypted: an older
+AppRafter or another program wrote it. A locked store never uses it, and
+never encrypts it later — it cannot be told from a forgery.
+
+**Fix.** Fetch it again from the node, over SSH, which caches it encrypted
+to the store's own key: `apprafter kubeconfig --refresh --target <name>`.
+
+### `apprafter::secrets::token_outside_vault` {#token-outside-vault}
+
+A target of a locked store has a token in clear in its `credentials.yaml`,
+written by an older AppRafter's `target add` or by another program. A locked
+store takes tokens only from its vault, so this one is never used.
+`apprafter doctor` fails that target's token row, and warns for any other
+target with one.
+
+**Fix.** At a terminal, run `apprafter target add <name> --renew`: it asks
+for the new token without showing it (in a script, `--token`), then for the
+lock password, stores the token in the vault and puts the vault's marker
+back in the file. That token was on disk in clear: if it is a real one,
+delete it in the Hetzner Console once the new one works.
+`apprafter lock off` refuses while such a file exists.
+
+### `apprafter::secrets::token_in_another_vault` {#token-in-another-vault}
+
+The target's `credentials.yaml` names the vault of another target store: the
+target's files were copied from it, or this store's `vault` and `store.yaml`
+were moved aside. Its token is not here.
+
+**Fix.** At a terminal, run `apprafter target add <name> --renew`: it asks
+for the token without showing it (in a script, `--token`) and stores it
+here. The old token stays in the other store's vault.
+
+### `apprafter::secrets::token_missing_from_vault` {#token-missing-from-vault}
+
+The target's `credentials.yaml` says its token is in this store's vault, and
+the vault has no entry for it. An older AppRafter renames a target's files
+without its vault entry.
+
+**Fix.** If an older AppRafter renamed it, rename it back with this
+AppRafter (`apprafter target rename <new> <old>`), then rename it again.
+Otherwise store its token again: at a terminal, run
+`apprafter target add <name> --renew`, which asks for it without showing
+it (in a script, `--token`).
+
+### `apprafter::secrets::random_unavailable` {#random-unavailable}
+
+The operating system's random number generator failed, so no key was made
+and nothing was written. AppRafter makes keys only from it, with no
+fallback.
+
+**Fix.** Run the command again. If it keeps failing, the system's source of
+randomness is broken — a container or virtual machine without one, for
+example.
+
+### `apprafter::lock::no_window` {#no-window}
+
+`apprafter unlock` cannot open an unlock window in this terminal: there is
+no private directory for its socket, the socket's path would be too long,
+the terminal's session has no leader, or — on Windows — there is no console
+to bind it to. For these it refuses before asking for anything. The same
+code ends an `unlock` whose new window did not start after the lock
+password was accepted: a holder already running for this terminal does not
+answer, or a new one did not start within five seconds.
+
+**Fix.** `apprafter lock status` says why. Every command in this terminal
+still works: each asks for the lock password itself. On Linux and macOS,
+setting `XDG_RUNTIME_DIR` to a directory only you can open, with a short
+path, usually gives the window a place. A holder that does not answer is
+ended by `apprafter lock now`.
+
+### `apprafter::lock::not_ended` {#not-ended}
+
+`apprafter lock now` found this terminal's unlock window but could not end
+it: its holder does not answer, and it could not be stopped from here. The
+window is still open: until that process ends, it keeps the store's key.
+
+**Fix.** Stop the process the message names: `kill -9 <pid>` on Linux and
+macOS, `taskkill /F /PID <pid>` on Windows. Meanwhile every command asks
+for the lock password at its prompt.
+
 ### `apprafter::cluster::k3s_not_ready` {#k3s-not-ready}
 
 `apprafter up` or `apprafter restore --reprovision` provisioned the
@@ -455,6 +668,54 @@ variants in future releases.
 **Fix.** Read the message text. If you see the same wording often,
 file an issue — recurring catch-all messages should be promoted
 to a typed variant with its own help text.
+
+## Every way into a locked store is lost {#locked-store-lost}
+
+AppRafter cannot open a locked store without its lock password or its
+recovery key, and the recovery key opens nothing without the vault file.
+There is no reset. If you have a backup of the store's `vault` and either
+secret, restore the vault and unlock. Otherwise rebuild the store's secrets
+from their sources; the clusters themselves keep running.
+
+1. Move the vault and `store.yaml` aside. Keep them: a password found later
+   still opens them. `STORE` is the target store's root, which the
+   `Target store:` line of `apprafter lock status` names:
+
+   ```sh
+   STORE="$HOME/.config/apprafter"   # the root `apprafter lock status` names
+   mkdir -p ~/apprafter-locked-store
+   mv "$STORE/vault" "$STORE/store.yaml" ~/apprafter-locked-store/
+   ```
+
+   The store is in files again, and each target's `credentials.yaml` still
+   names the old vault, so its token is not used.
+
+2. For each target, create a new API token in the Hetzner Console (open the
+   project, then Security → API tokens), and at a terminal store it:
+
+   ```sh
+   apprafter target add prod --renew
+   ```
+
+   It asks for the token without showing it (in a script, `--token`). The
+   old token was only in the vault; delete it in the Console once the new
+   one works. Until step 4, the new tokens are in files, in clear.
+
+3. For each target, fetch the kubeconfig again from its node — this needs SSH
+   access to the node, with the key the target was provisioned with — and
+   then the Argo CD password from the cluster:
+
+   ```sh
+   apprafter kubeconfig --refresh --target prod
+   apprafter argocd-password --refresh --target prod
+   ```
+
+   With no shared age key on this computer yet, the first refresh asks
+   before it creates one, as
+   [`age_key_missing`](#age-key-missing) describes.
+
+4. Lock the store again with `apprafter lock on`: a new lock password, and a
+   new recovery key to keep somewhere other than this computer.
 
 ## Common failures found in end-to-end runs
 
