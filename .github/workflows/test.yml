@@ -161,6 +161,29 @@ jobs:
             skip=(-- --skip engine::tests::ensure_repo_initialises_a_missing_local_repo_and_creates_its_parent)
           fi
           cargo test --workspace --exclude apprafter-backup --exclude docsgen --all-features --no-fail-fast "${skip[@]}"
+      # D.4a G8: no unlock holder outlives the tests. Each holder test ends its holders and the
+      # spawn point's drop kills and fails on any it leaves; this is the backstop for one that
+      # slipped past both. `always()`: a red run is when a leak is likeliest. The script kills
+      # what it finds, so it runs here and never on a person's computer.
+      - if: always() && runner.os != 'Windows'
+        name: no holder outlives the tests (Linux, macOS)
+        shell: bash
+        run: |
+          bash scripts/check-no-holder-left.sh --self-test
+          bash scripts/check-no-holder-left.sh
+      - if: always() && runner.os == 'Windows'
+        name: no holder outlives the tests (Windows)
+        shell: pwsh
+        run: |
+          # Task 7 starts a holder as "<path>\apprafter.exe" __holder.
+          $left = @(Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'apprafter\.exe"? __holder( |$)' })
+          if ($left.Count -gt 0) {
+            $left | ForEach-Object { Write-Host "pid $($_.ProcessId): $($_.CommandLine)" }
+            $left | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+            Write-Host "::error::an apprafter __holder process outlived the tests (listed above)"
+            exit 1
+          }
+          Write-Host "OK: no holder is running"
 
   # One check under the fixed name `cargo test cli/`, whatever the matrix
   # does. The matrix reports a check per leg, `cargo test cli/ (<os>)`, so a
