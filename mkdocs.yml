@@ -285,6 +285,7 @@ nav:
       - Declared disk dependencies: how-it-works/needs-disk.md
       - Egress derived from declared dependencies: how-it-works/egress-policy.md
       - The target store on disk: how-it-works/the-target-store.md
+      - How the store lock works: how-it-works/the-store-lock.md
       - GitOps and the CUE plugin: how-it-works/gitops-and-the-cue-cmp.md
       - Node reservations and swap: how-it-works/node-reservations-and-swap.md
       - How the approval gate works: how-it-works/the-approval-gate.md

@@ -23,6 +23,8 @@ way — is
 $XDG_CONFIG_HOME/apprafter/          # ~/.config/apprafter on Linux
 ├── .lock                            # the store's write lock; always empty
 ├── config.yaml                      # GlobalConfig
+├── store.yaml                       # whether the secrets are locked (after apprafter lock on)
+├── vault                            # a locked store's secrets, encrypted; mode 0600
 ├── targets/
 │   ├── default/
 │   │   ├── config.yaml              # TargetConfig (non-secret)
@@ -32,11 +34,12 @@ $XDG_CONFIG_HOME/apprafter/          # ~/.config/apprafter on Linux
 │       └── credentials.yaml
 ├── auth/                            # reserved for `apprafter auth` (Managed; stub)
 │   └── .keep
-└── state/
-    └── <target>/
-        └── .apprafter/
-            ├── state.json           # provisioned resource IDs + cached kubeconfig, mode 0600
-            └── known_hosts          # per-cluster SSH known_hosts
+├── state/
+│   └── <target>/
+│       └── .apprafter/
+│           ├── state.json           # provisioned resource IDs + cached kubeconfig, mode 0600
+│           └── known_hosts          # per-cluster SSH known_hosts
+└── run/                             # private: decrypted kubeconfigs while a command uses them
 ```
 
 The `state/<target>/` half is not a scratch cache. It is the only
@@ -45,6 +48,10 @@ network, firewall and floating-IP IDs, plus the age-encrypted
 kubeconfig. Everything under it is keyed by target name, which is why
 [renaming a target](../operator-guide/target-store.md#inspecting-renaming-and-removing-a-target) moves
 it and removing one deletes it.
+
+A store that `apprafter lock on` has locked keeps every token and its own
+age key in `vault`, and each `credentials.yaml` holds a marker naming it
+instead of a token: [How the store lock works](the-store-lock.md#layout).
 
 Every command that changes the store takes its write lock, `.lock`,
 while it reads, changes and saves, so two processes editing one store
@@ -125,9 +132,10 @@ Mode 0600 is enforced on every write. The CLI redacts the value
 in `target show` / `whoami` output; read this file directly if
 you need the raw bytes for a one-off script.
 
-**Do not commit this file to dotfiles repos.** The token is a
-plaintext credential — the security boundary is filesystem
-permissions. The R1 mitigation in
+**Do not commit this file to dotfiles repos.** In a store in files the
+token is a plaintext credential, and the security boundary is filesystem
+permissions; `apprafter lock on` moves it into an encrypted vault, leaving
+a marker here. The R1 mitigation in
 [ADR 0030](../adr/0030-cli-target-store-and-credential-chain.md): `apprafter doctor`
 warns on mode != 0600.
 
@@ -143,6 +151,10 @@ Hetzner token in this order:
 2. **Environment variable `HCLOUD_TOKEN`**. Wins over the store.
 3. **Active target's `credentials.yaml`** — or `--target <name>`
    override for one-off runs against a non-active target.
+
+On a locked target store, rung 2 is refused — `HCLOUD_TOKEN` set is
+`apprafter::secrets::override_refused` — and rung 3 is the store's vault,
+opened as [How the store lock works](the-store-lock.md#opening) describes.
 
 SSH public key resolution is analogous (`APPRAFTER_SSH_PUBLIC_KEY`
 env → target store's `ssh_key_path` → read the file).
@@ -189,3 +201,5 @@ report.
   write what this page describes.
 - [Environment variables](../reference/environment.md) — every variable the
   chain above consults, with its default and the code that reads it.
+- [How the store lock works](the-store-lock.md) — what a locked store
+  keeps where, and how it is opened.

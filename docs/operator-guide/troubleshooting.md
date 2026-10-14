@@ -452,6 +452,8 @@ provisioning, so no server was created.
 **Fix.** In your own terminal run `apprafter unlock`, then run the command
 from that terminal while the window is open. A command started without a
 terminal cannot ask for the lock password, by design.
+How a locked store is opened, and in what order:
+[How the store lock works](../how-it-works/the-store-lock.md#opening).
 
 ### `apprafter::secrets::override_refused` {#override-refused}
 
