@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 import { describe, expect, test } from 'bun:test';
+import type { Check } from '../../ipc/generated/Check';
 import type { CheckFix } from '../../ipc/generated/CheckFix';
 import { check, doctorReport } from '../../test/flows';
 import {
@@ -333,5 +334,47 @@ describe('reportText', () => {
     );
     expect(text.startsWith('AppRafter doctor · no target · ')).toBe(true);
     expect(text.trimEnd().split('\n').at(-1)).toBe('1 check: 1 passed, 0 warnings, 0 failed.');
+  });
+});
+
+describe("the lock's limit rows, in the app's words (D.4a rule 1)", () => {
+  const row = (id: Check['id'], text = 'the core says a terminal command'): Check => ({
+    id,
+    tool: null,
+    status: 'info',
+    title: 't',
+    detail: null,
+    fix: { kind: 'explain', text },
+  });
+  test('each limit row says what to do in the app or on this computer, never in a terminal', () => {
+    for (const id of [
+      'x11_keystrokes',
+      'ptrace_scope',
+      'windows_same_user',
+      'macos_task_port',
+      'sleep_unreported',
+      'secrets_in_use',
+      'same_user_programs',
+      'hibernation',
+    ] as const) {
+      const said = fixText(row(id), null) ?? '';
+      expect({ id, said: said === 'the core says a terminal command' }).toEqual({
+        id,
+        said: false,
+      });
+      expect({ id, cli: /apprafter (lock|unlock)/.test(said) }).toEqual({ id, cli: false });
+    }
+    expect(fixText(row('same_user_programs'), null)).toContain('separate OS account');
+    expect(fixText(row('hibernation'), null)).toContain('Lock AppRafter');
+    // The app is the X11 program, also under Xwayland inside a Wayland session (Deviations 12).
+    expect(fixText(row('x11_keystrokes'), null)).toContain('AppRafter runs as an X11 program here');
+    expect(fixText(row('windows_same_user'), null)).toContain('threads');
+    // While it holds the key, which a change confirmed before a lock outlives (Rust verifier 3).
+    expect(fixText(row('windows_same_user'), null)).toContain("while it holds this store's key");
+    // A kernel without Yama has no ptrace_scope to set (UI verifier minor 15).
+    expect(fixText(row('ptrace_scope'), null)).toContain('A kernel without the Yama module');
+  });
+  test("any other row's explanation is the core's", () => {
+    expect(fixText(row('secrets', 'the vault decides'), null)).toBe('the vault decides');
   });
 });

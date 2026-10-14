@@ -8,6 +8,7 @@
 // GUI action is D.12's.
 import type { Check } from '../../ipc/generated/Check';
 import type { CheckFix } from '../../ipc/generated/CheckFix';
+import type { CheckId } from '../../ipc/generated/CheckId';
 import type { CheckStatus } from '../../ipc/generated/CheckStatus';
 import type { DoctorReport } from '../../ipc/generated/DoctorReport';
 import type { GroupId } from '../../ipc/generated/GroupId';
@@ -44,6 +45,30 @@ const RENEW_WHY: Record<RenewWhy, string> = {
   token_rejected: `The provider rejected the stored token. Create a new one in ${HETZNER_API_TOKENS_PAGE}, then renew it ${RENEW}`,
   token_outside_vault: `The credentials file holds this token in clear on a locked store, so it is not used. Renew it ${RENEW}`,
   token_in_another_vault: `The credentials file points at another target store's vault. Renew the token ${RENEW}`,
+};
+
+/**
+ * The lock's machine-limit rows (D.4a T72, rule 1), in the app's words: the core's explanation
+ * of each is written for a terminal (`apprafter lock now` in each one you unlocked); here the
+ * person acts in the app or on the computer. Any other row's explanation is the core's.
+ */
+const LOCK_FIXES: Partial<Record<CheckId, string>> = {
+  x11_keystrokes:
+    'AppRafter runs as an X11 program here, so any program running as you can see what you type into it, the lock password included. Run AppRafter natively on Wayland, in a Wayland session, to close this.',
+  ptrace_scope:
+    'Set the kernel.yama.ptrace_scope sysctl to 1, so that only a parent process can attach to another. A kernel without the Yama module has no such setting: there, run AI agents under a separate OS account.',
+  windows_same_user:
+    "Run AI agents under a separate Standard Windows account: programs running as you can attach to an unlocked terminal, read what you type into AppRafter, and take over AppRafter's threads to read its memory while it holds this store's key.",
+  macos_task_port:
+    "Whether such a program can read another's memory depends on this Mac's debugging settings. Run AI agents under a separate Standard macOS account.",
+  sleep_unreported:
+    'Lock AppRafter yourself before the computer sleeps, and keep its auto-lock short.',
+  secrets_in_use:
+    'A kubeconfig AppRafter or a command is using is a file until it is done; one you saved stays where you saved it, outside the lock.',
+  same_user_programs:
+    'The lock stops an AI agent that oversteps; one that sets out to get past it — an agent turned by a prompt injection, for example — it only slows. Run AI agents under a separate OS account without administrator rights, or in a sandbox that cannot reach your terminals, files or ssh-agent.',
+  hibernation:
+    "Lock AppRafter, and end every terminal's unlock window, before this computer hibernates.",
 };
 
 const TOOLCHAIN = 'The toolchain lists how for this computer.';
@@ -136,7 +161,7 @@ export function fixText(check: Check, target: string | null): string | null {
     case 'dns':
       return `The resolver could not answer for \`${fix.host}\`: check the DNS settings, a VPN or a proxy.`;
     case 'explain':
-      return fix.text;
+      return LOCK_FIXES[check.id] ?? fix.text;
     // D.4a: the lock's fixes (surface §4.2); the rows that raise them are d4a-e's and f's.
     case 'protect_secrets':
       return 'Settings › Lock › Protect secrets encrypts them.';

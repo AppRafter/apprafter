@@ -13,6 +13,12 @@ const TOKEN_SHAPED = /[A-Za-z0-9]{64}/;
  */
 const SECRET_FIELD =
   /["']?[A-Za-z0-9_]*(?:token|password|secret)[A-Za-z0-9_]*["']?\??\s*:\s*[^,;}\n]*\bstring\b/i;
+/**
+ * A property named for a recovery key whose type has a `string` in it (D.4a T79). Kept apart from
+ * SECRET_FIELD: one generated type carries the new recovery key to the page on purpose, once
+ * (`LockOnPlan`), and the test below holds it the only one.
+ */
+const RECOVERY_FIELD = /["']?[A-Za-z0-9_]*recovery[A-Za-z0-9_]*["']?\??\s*:\s*[^,;}\n]*\bstring\b/i;
 
 async function hits(dir: string, pattern: string, rule: RegExp): Promise<string[]> {
   const found: string[] = [];
@@ -39,6 +45,10 @@ test('the rules see what they look for', () => {
   ]) {
     expect(leak).toMatch(SECRET_FIELD);
   }
+  for (const leak of ['  recoveryKey: string,', 'newRecovery?: string;']) {
+    expect(leak).toMatch(RECOVERY_FIELD);
+  }
+  expect('recoveryKeyShape: boolean,').not.toMatch(RECOVERY_FIELD);
   for (const fine of [
     '  token: TokenPresence;',
     'passwordField: boolean, };',
@@ -66,4 +76,11 @@ test('nothing under src/ipc/mock is token-shaped', async () => {
 
 test('no generated IPC type has a string field named like a secret', async () => {
   expect(await hits(join(import.meta.dir, 'generated'), '**/*.ts', SECRET_FIELD)).toEqual([]);
+});
+
+test('the one generated type that carries a recovery key is LockOnPlan, by design (D.4a T79)', async () => {
+  const generated = join(import.meta.dir, 'generated');
+  expect(await hits(generated, '**/*.ts', RECOVERY_FIELD)).toEqual([
+    'LockOnPlan.ts: recoveryKey: string',
+  ]);
 });
