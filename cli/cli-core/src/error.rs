@@ -1507,6 +1507,24 @@ pub enum CliError {
     )]
     TokenMissingFromVault { target: String, store: PathBuf },
 
+    /// `lock off` read back what it wrote, and a file did not hold it (D.4a rule 4): the run
+    /// stopped with the vault kept, and the next one finishes.
+    #[error(
+        "read back after the lock was turned off, {what} does not hold what was written; the \
+         vault at {} was kept",
+        vault.display()
+    )]
+    #[diagnostic(
+        code(apprafter::secrets::files_not_kept),
+        help(
+            "Nothing was lost: the vault still holds every secret. Run `apprafter lock off` \
+             again: it finishes from where this run stopped. If it stops here again, check the \
+             disk the target store is on: it may be full, or another program may be writing \
+             these files."
+        )
+    )]
+    FilesNotKept { what: String, vault: PathBuf },
+
     /// A vault that was not written (D.4a T27, W7): too large, or no safe way to create it.
     #[error("{}", vault_unwritable_message(path, problem))]
     #[diagnostic(
@@ -2765,6 +2783,10 @@ mod tests {
              "apprafter::secrets::store_changed",
              "the vault of the target store at /s was replaced while this command ran; nothing was written",
              "Run this command again"),
+            (CliError::FilesNotKept { what: "the credentials file of `prod`".into(), vault: "/s/vault".into() },
+             "apprafter::secrets::files_not_kept",
+             "read back after the lock was turned off, the credentials file of `prod` does not hold what was written; the vault at /s/vault was kept",
+             "Run `apprafter lock off` again"),
             (CliError::TokenMissingFromVault { target: "prod".into(), store: s() },
              "apprafter::secrets::token_missing_from_vault",
              "the vault of the target store at /s holds no token for `prod`, although its credentials file says it does",

@@ -243,13 +243,15 @@ pub mod codes {
     /// A filesystem error. On one of a target's own files `fields.target` names the target and
     /// `fields.path` the file (the desktop then offers to remove it, WI-458 review #6).
     pub const IO_ERROR: &str = "apprafter::io::error";
-    /// D.4a §3.12: the target-store lock. The next fifteen are cli-core's `CliError` codes,
+    /// D.4a §3.12: the target-store lock. The next sixteen are cli-core's `CliError` codes,
     /// which pass through to the desktop with their own fields.
     pub const STORE_LOCKED: &str = "apprafter::secrets::store_locked";
     pub const OVERRIDE_REFUSED: &str = "apprafter::secrets::override_refused";
     pub const UNLOCK_FAILED: &str = "apprafter::secrets::unlock_failed";
     pub const STORE_CHANGED: &str = "apprafter::secrets::store_changed";
     pub const TOKEN_MISSING_FROM_VAULT: &str = "apprafter::secrets::token_missing_from_vault";
+    /// `lock off`'s read-back found a file that does not hold what was written (d's hand-off).
+    pub const FILES_NOT_KEPT: &str = "apprafter::secrets::files_not_kept";
     pub const VAULT_UNWRITABLE: &str = "apprafter::secrets::vault_unwritable";
     pub const VAULT_UNREADABLE: &str = "apprafter::secrets::vault_unreadable";
     pub const STORE_FILE_UNREADABLE: &str = "apprafter::secrets::store_file_unreadable";
@@ -303,6 +305,7 @@ pub mod codes {
         UNLOCK_FAILED,
         STORE_CHANGED,
         TOKEN_MISSING_FROM_VAULT,
+        FILES_NOT_KEPT,
         VAULT_UNWRITABLE,
         VAULT_UNREADABLE,
         STORE_FILE_UNREADABLE,
@@ -651,6 +654,10 @@ fn neutral_help(e: &cli_core::CliError) -> Option<String> {
         C::StoreChanged { .. } => "Another AppRafter process turned this target store's lock \
              on or off meanwhile. Nothing was written; try again."
             .into(),
+        C::FilesNotKept { .. } => "Nothing was lost: the vault still holds every secret. \
+             Turning the lock off again finishes from where this run stopped; if it stops here \
+             again, check the disk the target store is on."
+            .into(),
         C::TokenMissingFromVault { .. } => "The vault holds no token for this target, although \
              its credentials file says it does. If an older AppRafter renamed the target, \
              rename it back to its old name, then rename it again; otherwise renew its token."
@@ -842,6 +849,7 @@ fn project_cli(e: &cli_core::CliError, put: &mut impl FnMut(&str, serde_json::Va
             put("store", json!(store.display().to_string()))
         }
         C::TokenMissingFromVault { target, .. } => put("target", json!(target)),
+        C::FilesNotKept { vault, .. } => put("path", json!(vault.display().to_string())),
         C::VaultUnwritable { path, problem } => {
             put("path", json!(path.display().to_string()));
             put("problem", json!(problem.as_str()));
@@ -1303,6 +1311,10 @@ pub mod samples {
             C::TokenMissingFromVault {
                 target: s("prod"),
                 store: store(),
+            },
+            C::FilesNotKept {
+                what: s("the credentials file of `prod`"),
+                vault: vault(),
             },
             C::VaultUnwritable {
                 path: vault(),
@@ -1834,6 +1846,7 @@ mod tests {
             codes::UNLOCK_FAILED,
             codes::STORE_CHANGED,
             codes::TOKEN_MISSING_FROM_VAULT,
+            codes::FILES_NOT_KEPT,
             codes::VAULT_UNWRITABLE,
             codes::VAULT_UNREADABLE,
             codes::STORE_FILE_UNREADABLE,
@@ -1901,6 +1914,13 @@ mod tests {
                 store: s()
             }),
             json!({"target": "prod"})
+        );
+        assert_eq!(
+            cli(C::FilesNotKept {
+                what: "the credentials file of `prod`".into(),
+                vault: "/s/vault".into()
+            }),
+            json!({"path": "/s/vault"})
         );
         assert_eq!(
             cli(C::VaultUnwritable {
@@ -2254,6 +2274,7 @@ mod tests {
             codes::UNLOCK_FAILED,
             codes::STORE_CHANGED,
             codes::TOKEN_MISSING_FROM_VAULT,
+            codes::FILES_NOT_KEPT,
             codes::VAULT_UNWRITABLE,
             codes::VAULT_UNREADABLE,
             codes::STORE_FILE_UNREADABLE,

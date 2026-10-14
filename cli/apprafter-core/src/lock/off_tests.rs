@@ -491,6 +491,15 @@ fn the_files_are_read_back_before_the_vault_goes() {
     super::off::AFTER_FILES_WRITE.with(|h| *h.borrow_mut() = None);
     let e = e.unwrap_err();
     assert!(e.to_string().contains("the vault at"), "{e}");
+    // d's hand-off: its own code, never the catch-all whose help says to file an issue.
+    assert!(
+        matches!(&e, CoreError::Cli(CliError::FilesNotKept { what, .. }) if what.contains("`prod`")),
+        "{e:?}"
+    );
+    assert_eq!(
+        crate::error::UiError::from(&e).code.as_deref(),
+        Some(crate::error::codes::FILES_NOT_KEPT)
+    );
     assert!(f.ctx.config_root().join(VAULT_FILE).exists());
 }
 

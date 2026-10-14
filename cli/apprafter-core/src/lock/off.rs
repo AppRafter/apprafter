@@ -230,11 +230,10 @@ fn store_changed(root: &Path, prepared: SecretsMode, now: SecretsMode) -> CoreEr
 }
 
 fn files_not_kept(store: &TargetStorePaths, what: &str) -> CoreError {
-    CoreError::Cli(CliError::Other(format!(
-        "read back after `lock off` wrote it, {what} does not hold what was written; the vault \
-         at {} was kept, and `apprafter lock off` run again finishes",
-        vault_path(store.root()).display()
-    )))
+    CoreError::Cli(CliError::FilesNotKept {
+        what: what.to_string(),
+        vault: vault_path(store.root()),
+    })
 }
 
 /// The store lock, held: every write of `lock off` needs it (T28).

@@ -16,6 +16,7 @@ export const CORE_ERROR_CODES = {
   PROVIDER_SERVER_TYPE_UNAVAILABLE: 'apprafter::provider::server_type_unavailable',
   SECRETS_AGE_KEY_MISSING: 'apprafter::secrets::age_key_missing',
   SECRETS_CACHE_NOT_SEALED: 'apprafter::secrets::cache_not_sealed',
+  SECRETS_FILES_NOT_KEPT: 'apprafter::secrets::files_not_kept',
   SECRETS_INSECURE_KDF_REFUSED: 'apprafter::secrets::insecure_kdf_refused',
   SECRETS_LOCK_INCOMPLETE: 'apprafter::secrets::lock_incomplete',
   SECRETS_OVERRIDE_REFUSED: 'apprafter::secrets::override_refused',
