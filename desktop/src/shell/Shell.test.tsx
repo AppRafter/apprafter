@@ -488,6 +488,27 @@ describe('Shell', () => {
     // The page is shown, so its report is read again too.
     await waitFor(() => expect(count('lock_info') > lockInfos).toBe(true));
   });
+
+  test("the Targets page's Security › shows the Security view (WI-476)", async () => {
+    const user = shell();
+    expect(screen.getByText('Target store ~/.config/apprafter · Secrets: in files')).toBeDefined();
+    await user.click(screen.getByRole('button', { name: 'Security page' }));
+    const title = screen.getByRole('heading', { level: 1, name: 'Security' });
+    await waitFor(() => expect(document.activeElement === title).toBe(true));
+  });
+
+  // Finding F5 on the line that stays on screen: a terminal's `lock off` under the app.
+  test("the Targets page's line follows a terminal once the window has the focus again", async () => {
+    appInfoNow = { ...INFO, secrets: { ...INFO.secrets, mode: 'locked', protected: true } };
+    await gatedShell();
+    expect(screen.getByText('Target store ~/.config/apprafter · Secrets: protected')).toBeDefined();
+    await settleIpc();
+    appInfoNow = INFO;
+    await emit('tauri://focus', null);
+    expect(
+      await screen.findByText('Target store ~/.config/apprafter · Secrets: in files'),
+    ).toBeDefined();
+  });
 });
 
 /** Every `cmd` the page sends from now on: its args, and the answer the mock gives. */

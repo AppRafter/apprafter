@@ -475,6 +475,17 @@
   font-size: var(--fs-12-5);
 }
 
+/* WI-476: the store this page lists and where its secrets are, one line; Security has the rest. */
+.store-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  color: var(--fg-muted);
+  font-size: var(--fs-12-5);
+}
+
 .target-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));

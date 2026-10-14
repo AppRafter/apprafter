@@ -8,6 +8,7 @@ import * as api from '../../ipc/api';
 import { installMockIpc } from '../../ipc/mock';
 import { resetOperations } from '../../ipc/operations';
 import { startPlan } from '../../ipc/plans';
+import { appInfo, STORE_PROBLEMS } from '../../test/fixtures';
 import { renderScreen } from '../../test/screens';
 import { settleIpc } from '../../test/settle';
 import { tabHost } from '../../test/tab';
@@ -24,7 +25,14 @@ afterEach(async () => {
 });
 
 test('lists the store: cards, the unreadable one shown, the CLI default tagged', async () => {
-  renderScreen(<TargetsPage onOpen={() => {}} openTargets={new Set()} onRemoved={() => {}} />);
+  renderScreen(
+    <TargetsPage
+      onSecurity={() => {}}
+      onOpen={() => {}}
+      openTargets={new Set()}
+      onRemoved={() => {}}
+    />,
+  );
   expect(screen.getByRole('heading', { level: 1, name: 'Open a cluster' })).toBeDefined();
   expect(await screen.findByRole('article', { name: 'prod-eu' })).toBeDefined();
   expect(screen.getByRole('article', { name: 'broken' }).textContent).toContain('Cannot be read');
@@ -40,7 +48,12 @@ test('lists the store: cards, the unreadable one shown, the CLI default tagged',
 
 test('make default runs the reversible plan at once: no dialog, the tag moves, a toast', async () => {
   const user = renderScreen(
-    <TargetsPage onOpen={() => {}} openTargets={new Set()} onRemoved={() => {}} />,
+    <TargetsPage
+      onSecurity={() => {}}
+      onOpen={() => {}}
+      openTargets={new Set()}
+      onRemoved={() => {}}
+    />,
   );
   await user.click(await screen.findByRole('button', { name: 'Make staging the CLI default' }));
   expect(await screen.findByText('staging is the CLI default now')).toBeDefined();
@@ -75,7 +88,12 @@ function sentArgs(cmd: string): Record<string, unknown>[] {
 // the page read the store (in a terminal): the plan changes nothing, so it is discarded unrun.
 test('make default on a target that is the default already discards the plan unrun', async () => {
   const user = renderScreen(
-    <TargetsPage onOpen={() => {}} openTargets={new Set()} onRemoved={() => {}} />,
+    <TargetsPage
+      onSecurity={() => {}}
+      onOpen={() => {}}
+      openTargets={new Set()}
+      onRemoved={() => {}}
+    />,
   );
   const button = await screen.findByRole('button', { name: 'Make staging the CLI default' });
   const meanwhile = await api.opPlanTargetUse('staging');
@@ -92,7 +110,12 @@ test('make default on a target that is the default already discards the plan unr
 
 test('a refused make default is shown on the page', async () => {
   const user = renderScreen(
-    <TargetsPage onOpen={() => {}} openTargets={new Set()} onRemoved={() => {}} />,
+    <TargetsPage
+      onSecurity={() => {}}
+      onOpen={() => {}}
+      openTargets={new Set()}
+      onRemoved={() => {}}
+    />,
   );
   const button = await screen.findByRole('button', { name: 'Make lab the CLI default' });
   // Removed in a terminal meanwhile: the plan is refused with the names there are.
@@ -115,7 +138,12 @@ test('a refused make default is shown on the page', async () => {
 test('an open target switches to its tab; another opens one', async () => {
   const onOpen = mock();
   const user = renderScreen(
-    <TargetsPage onOpen={onOpen} openTargets={new Set(['lab'])} onRemoved={() => {}} />,
+    <TargetsPage
+      onSecurity={() => {}}
+      onOpen={onOpen}
+      openTargets={new Set(['lab'])}
+      onRemoved={() => {}}
+    />,
   );
   await user.click(await screen.findByRole('button', { name: 'Switch to lab' }));
   await user.click(screen.getByRole('button', { name: 'Open staging' }));
@@ -129,7 +157,14 @@ test('an empty store says how to add one, and a dangling CLI default is named', 
       ? { targets: [], unreadable: [], cliDefault: { status: 'missing', name: 'gone' } }
       : null,
   );
-  renderScreen(<TargetsPage onOpen={() => {}} openTargets={new Set()} onRemoved={() => {}} />);
+  renderScreen(
+    <TargetsPage
+      onSecurity={() => {}}
+      onOpen={() => {}}
+      openTargets={new Set()}
+      onRemoved={() => {}}
+    />,
+  );
   expect(await screen.findByRole('heading', { name: 'No targets yet' })).toBeDefined();
   expect(screen.getByText('apprafter target add')).toBeDefined();
   expect(
@@ -160,7 +195,14 @@ test('a CLI default that names an unreadable target: its card is tagged, and the
         }
       : null,
   );
-  renderScreen(<TargetsPage onOpen={() => {}} openTargets={new Set()} onRemoved={() => {}} />);
+  renderScreen(
+    <TargetsPage
+      onSecurity={() => {}}
+      onOpen={() => {}}
+      openTargets={new Set()}
+      onRemoved={() => {}}
+    />,
+  );
   const card = await screen.findByRole('article', { name: 'broken' });
   expect(within(card).getByText('CLI default')).toBeDefined();
   expect(
@@ -183,14 +225,26 @@ test('a store that cannot be read says why', async () => {
         })
       : null,
   );
-  renderScreen(<TargetsPage onOpen={() => {}} openTargets={new Set()} onRemoved={() => {}} />);
+  renderScreen(
+    <TargetsPage
+      onSecurity={() => {}}
+      onOpen={() => {}}
+      openTargets={new Set()}
+      onRemoved={() => {}}
+    />,
+  );
   expect((await screen.findByRole('alert')).textContent).toContain('cannot read the target store');
   expect(screen.queryByRole('heading', { name: 'No targets yet' })).toBeNull();
 });
 
 test('the Add target card is enabled and opens the wizard', async () => {
   const user = renderScreen(
-    <TargetsPage onOpen={() => {}} openTargets={new Set()} onRemoved={() => {}} />,
+    <TargetsPage
+      onSecurity={() => {}}
+      onOpen={() => {}}
+      openTargets={new Set()}
+      onRemoved={() => {}}
+    />,
   );
   const add = (await screen.findByRole('button', { name: /Add target/ })) as HTMLButtonElement;
   expect(add.disabled).toBe(false);
@@ -202,7 +256,14 @@ test('the Add target card is enabled and opens the wizard', async () => {
 
 /** The page, its removals told to `onRemoved`. */
 const page = (onRemoved: (name: string) => void = () => {}) =>
-  renderScreen(<TargetsPage onOpen={() => {}} openTargets={new Set()} onRemoved={onRemoved} />);
+  renderScreen(
+    <TargetsPage
+      onSecurity={() => {}}
+      onOpen={() => {}}
+      openTargets={new Set()}
+      onRemoved={onRemoved}
+    />,
+  );
 
 // WI-458: the card of a target that cannot be read removes it through the same destructive plan
 // as the Target screen's — its lines name the file, the name is typed, the run asks the owner —
@@ -271,7 +332,12 @@ test('a removal that ends while the page is hidden closes the tabs at once; the 
   const tab = tabHost();
   const user = renderScreen(
     <tab.Tab>
-      <TargetsPage onOpen={() => {}} openTargets={new Set()} onRemoved={onRemoved} />
+      <TargetsPage
+        onSecurity={() => {}}
+        onOpen={() => {}}
+        openTargets={new Set()}
+        onRemoved={onRemoved}
+      />
     </tab.Tab>,
   );
   const card = await screen.findByRole('article', { name: 'broken' });
@@ -291,3 +357,38 @@ test('a removal that ends while the page is hidden closes the tabs at once; the 
   expect(await screen.findByText('Removed broken from this computer')).toBeDefined();
   expect(onRemoved).toHaveBeenCalledTimes(1);
 });
+
+test('the line names the store and where its secrets are; Security › shows the Security page (WI-476)', async () => {
+  const onSecurity = mock();
+  const user = renderScreen(
+    <TargetsPage
+      onSecurity={onSecurity}
+      onOpen={() => {}}
+      openTargets={new Set()}
+      onRemoved={() => {}}
+    />,
+  );
+  expect(screen.getByText('Target store ~/.config/apprafter · Secrets: in files')).toBeDefined();
+  const link = screen.getByRole('button', { name: 'Security page' });
+  expect(link.textContent).toBe('Security ›');
+  await user.click(link);
+  expect(onSecurity).toHaveBeenCalledTimes(1);
+});
+
+test.each(STORE_PROBLEMS)(
+  'a store whose lock state cannot be used is never protected on the line: %s',
+  (_state, secrets) => {
+    renderScreen(
+      <TargetsPage
+        onSecurity={() => {}}
+        onOpen={() => {}}
+        openTargets={new Set()}
+        onRemoved={() => {}}
+      />,
+      { info: appInfo({ secrets }) },
+    );
+    expect(
+      screen.getByText('Target store ~/.config/apprafter · Secrets: lock state cannot be used'),
+    ).toBeDefined();
+  },
+);

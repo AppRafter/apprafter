@@ -247,6 +247,7 @@ export function Shell() {
               <main className="main">
                 <TargetsPage
                   openTargets={openTargets}
+                  onSecurity={showSecurity}
                   onOpen={(target) =>
                     dispatch({ type: 'openTarget', target, key: crypto.randomUUID() })
                   }

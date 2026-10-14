@@ -4,7 +4,10 @@
 // (WI-458: the same destructive plan as the Target screen's); a CLI default that names no target,
 // or one that cannot be read, says so. Make default for the CLI runs the reversible use plan at
 // once; the core refuses a target whose files cannot be read (WI-458 review #4), shown here.
+// Under the title one line names the store and where its secrets are, with a link to the
+// Security page (WI-476): the store's protection is the whole store's.
 import { useCallback, useState } from 'react';
+import { Button } from '../../components/Button';
 import { ErrorPanel } from '../../components/ErrorPanel';
 import { SpinnerGapIcon } from '../../components/icons';
 import { PageHeader } from '../../components/PageHeader';
@@ -12,6 +15,8 @@ import { StatePanel } from '../../components/StatePanel';
 import { uiErrorOf } from '../../ipc/api';
 import type { TargetListReport } from '../../ipc/generated/TargetListReport';
 import type { UiError } from '../../ipc/generated/UiError';
+import { SECURITY_LINK, SECURITY_LINK_NAME, storeIndicator } from '../../state/lockText';
+import { usePlatform } from '../../state/platform';
 import { useTargetList } from '../../state/targets';
 import { useMakeDefault, useRemoveTarget } from '../target/actions';
 import { AddTargetCard } from './AddTargetCard';
@@ -24,9 +29,11 @@ export interface TargetsPageProps {
   readonly openTargets: ReadonlySet<string>;
   /** A target was removed here: a tab still open on it closes. */
   readonly onRemoved: (name: string) => void;
+  /** Shows the Security page: the line's link (WI-476). */
+  readonly onSecurity: () => void;
 }
 
-export function TargetsPage({ onOpen, openTargets, onRemoved }: TargetsPageProps) {
+export function TargetsPage({ onOpen, openTargets, onRemoved, onSecurity }: TargetsPageProps) {
   const list = useTargetList();
   const [failure, setFailure] = useState<UiError | null>(null);
   const makeDefault = useMakeDefault(setFailure);
@@ -53,6 +60,7 @@ export function TargetsPage({ onOpen, openTargets, onRemoved }: TargetsPageProps
         size={22}
         sub="Targets live in your local target store. Each opens in its own tab."
       />
+      <StoreLine onSecurity={onSecurity} />
       {failure !== null && <ErrorPanel error={failure} />}
       {list.isPending ? (
         <StatePanel icon={SpinnerGapIcon} spin title="Reading the target store…" />
@@ -129,5 +137,22 @@ function Store({
         <AddTargetCard />
       </div>
     </>
+  );
+}
+
+/**
+ * WI-476: the store this page lists, and where its secrets are, in one line; then the link to
+ * the Security page, named for a screen reader as the page it opens.
+ */
+function StoreLine({ onSecurity }: { onSecurity: () => void }) {
+  const { secrets } = usePlatform();
+  return (
+    <div className="store-line">
+      <span>{storeIndicator(secrets.store, secrets.mode, secrets.problem !== null)}</span>
+      <span aria-hidden="true">·</span>
+      <Button size={26} variant="ghost" aria-label={SECURITY_LINK_NAME} onClick={onSecurity}>
+        {SECURITY_LINK}
+      </Button>
+    </div>
   );
 }
