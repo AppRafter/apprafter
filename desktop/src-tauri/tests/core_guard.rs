@@ -11,7 +11,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use proc_macro2::{Span, TokenStream, TokenTree};
+use proc_macro2::{Delimiter, Span, TokenStream, TokenTree};
 use syn::visit::{self, Visit};
 
 /// One way a file reaches the active pointer.
@@ -588,4 +588,211 @@ fn real_environment_contexts_in_the_desktops_tests_stay_where_listed_and_open_no
             "REAL_ENV_TESTS names {file} `{site}`, which no longer builds from the real environment"
         );
     }
+}
+
+// ---------------------------------------------------------------------
+// HG4 / G4 (D.4a T47): the desktop never links the CLI's holder
+// ---------------------------------------------------------------------
+
+/// The CLI's package (`cli/platform-cli`), which carries the holder.
+const CLI_PACKAGE: &str = "apprafter";
+
+/// The holder's items in the CLI's code: none has any business in the desktop's.
+const HOLDER_NAMES: &[&str] = &[
+    "HolderClient",
+    "HolderSession",
+    "HolderPlace",
+    "start_holder",
+    "run_holder",
+    "HOLDER_ARG",
+    "holder_window",
+];
+
+/// The package names a `Cargo.lock` lists.
+fn lock_packages(lock: &str) -> Vec<&str> {
+    lock.lines()
+        .filter_map(|l| l.strip_prefix("name = \"")?.strip_suffix('"'))
+        .collect()
+}
+
+/// Each manifest line (1-based, with its text) that makes the CLI's package a dependency: by
+/// its key (`apprafter = …`, `apprafter.workspace = …`), by its table (`[dependencies.apprafter]`),
+/// by `package = "apprafter"`, or by its path. A comment is no dependency.
+fn manifest_hits(manifest: &str) -> Vec<String> {
+    manifest
+        .lines()
+        .enumerate()
+        .filter_map(|(i, raw)| {
+            let line = raw.split('#').next().unwrap_or("").trim();
+            let key = line.split(['=', '.']).next().unwrap_or("").trim();
+            let squeezed: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+            let hit = key == CLI_PACKAGE
+                || line
+                    .trim_end_matches(']')
+                    .ends_with(&format!(".{CLI_PACKAGE}"))
+                || squeezed.contains(&format!("package=\"{CLI_PACKAGE}\""))
+                || line.contains("platform-cli");
+            hit.then(|| format!("{}: {}", i + 1, raw.trim()))
+        })
+        .collect()
+}
+
+/// Each place (`line: what`) a Rust file names the holder: one of [`HOLDER_NAMES`] as an
+/// identifier, a path into the CLI's crate (`apprafter::`), or the literal `"__holder"` — inside
+/// macro bodies too. Doc comments and other strings are literals, never identifiers.
+///
+/// Inside an attribute (`#[…]`, `#![…]`) `apprafter::…` is a diagnostic code's name, never a
+/// path: the desktop's errors carry miette codes such as `code(apprafter::desktop::locked)`. A
+/// real path into the CLI's crate needs it as a dependency, which the lock and manifest checks
+/// refuse; the holder's names and `"__holder"` count inside attributes as anywhere.
+fn holder_hits(src: &str) -> Vec<String> {
+    let tokens: TokenStream = src.parse().expect("the file tokenises");
+    let mut hits = Vec::new();
+    walk_holder(tokens, false, &mut hits);
+    hits.sort();
+    hits
+}
+
+/// Whether the group at `list[i]` is an attribute's body: `[…]` right after `#` or `#!`.
+fn attribute_body(list: &[TokenTree], i: usize) -> bool {
+    let punct_at = |back: usize, c: char| {
+        i.checked_sub(back)
+            .and_then(|j| list.get(j))
+            .is_some_and(|t| matches!(t, TokenTree::Punct(p) if p.as_char() == c))
+    };
+    let bracket = matches!(&list[i], TokenTree::Group(g) if g.delimiter() == Delimiter::Bracket);
+    bracket && (punct_at(1, '#') || punct_at(1, '!') && punct_at(2, '#'))
+}
+
+fn walk_holder(tokens: TokenStream, in_attribute: bool, hits: &mut Vec<String>) {
+    let list: Vec<TokenTree> = tokens.into_iter().collect();
+    for (i, t) in list.iter().enumerate() {
+        match t {
+            TokenTree::Group(g) => {
+                walk_holder(g.stream(), in_attribute || attribute_body(&list, i), hits)
+            }
+            TokenTree::Ident(id) => {
+                let name = id.to_string();
+                if HOLDER_NAMES.contains(&name.as_str()) {
+                    hits.push(format!("{}: {name}", id.span().start().line));
+                }
+                let path_follows = matches!(
+                    list.get(i + 1),
+                    Some(TokenTree::Punct(p))
+                        if p.as_char() == ':' && p.spacing() == proc_macro2::Spacing::Joint
+                );
+                if name == CLI_PACKAGE && path_follows && !in_attribute {
+                    hits.push(format!("{}: {name}::", id.span().start().line));
+                }
+            }
+            TokenTree::Literal(l) if l.to_string() == "\"__holder\"" => {
+                hits.push(format!("{}: \"__holder\"", l.span().start().line));
+            }
+            _ => {}
+        }
+    }
+}
+
+#[test]
+fn hg4_sees_the_holder_by_name_by_path_and_by_its_argument() {
+    assert_eq!(
+        holder_hits("fn f() { let c = HolderClient::find(); }").len(),
+        1
+    );
+    assert_eq!(holder_hits("use apprafter::holder::spawn;").len(), 1);
+    assert_eq!(holder_hits(r#"fn f() { run("__holder") }"#).len(), 1);
+    assert_eq!(holder_hits("m! { start_holder(x) }").len(), 1);
+    // An attribute's `apprafter::…` is a diagnostic code, not a path; nothing else in it is
+    // excused, and nothing after it.
+    assert!(holder_hits("#[diagnostic(code(apprafter::desktop::locked))] struct E;").is_empty());
+    assert!(holder_hits("#![doc(apprafter::desktop::x)]").is_empty());
+    assert_eq!(holder_hits("#[allow(start_holder)] fn f() {}").len(), 1);
+    assert_eq!(holder_hits("#[m(\"__holder\")] fn f() {}").len(), 1);
+    assert_eq!(
+        holder_hits("#[a(b)] fn f() { use apprafter::holder; }").len(),
+        1
+    );
+    assert_eq!(
+        holder_hits("fn f() { let v = vec![apprafter::holder::x()]; }").len(),
+        1
+    );
+    assert_eq!(holder_hits("quote! { #(apprafter::holder::x)* }").len(), 1);
+    assert!(holder_hits(
+        "/// HolderClient, in a comment\nfn f() { let s = \"HolderClient\"; let _ = apprafter_core::lock::status; }"
+    )
+    .is_empty());
+    assert_eq!(
+        manifest_hits("apprafter = { path = \"../../cli/platform-cli\" }").len(),
+        1
+    );
+    assert_eq!(
+        manifest_hits("cli = { path = \"../../cli/platform-cli\" }").len(),
+        1
+    );
+    assert_eq!(manifest_hits("[dependencies.apprafter]").len(), 1);
+    assert_eq!(manifest_hits("apprafter.workspace = true").len(), 1);
+    assert_eq!(
+        manifest_hits("cli = { package = \"apprafter\", path = \"x\" }").len(),
+        1
+    );
+    assert!(manifest_hits(
+        "apprafter-core = { workspace = true }\n# apprafter = { path = \"old\" }\n"
+    )
+    .is_empty());
+    assert_eq!(
+        lock_packages("[[package]]\nname = \"apprafter-core\"\nversion = \"0\"\n"),
+        ["apprafter-core"]
+    );
+}
+
+#[test]
+fn hg4_the_desktop_never_links_the_clis_holder() {
+    let tauri = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let desktop = tauri.parent().unwrap();
+    let lock = fs::read_to_string(desktop.join("Cargo.lock")).unwrap();
+    let packages = lock_packages(&lock);
+    assert!(
+        packages.contains(&"apprafter-core"),
+        "the lock's reader sees the core"
+    );
+    assert!(
+        !packages.contains(&CLI_PACKAGE),
+        "desktop/Cargo.lock lists the CLI's package `apprafter`, which carries the holder (D.4a HG4)"
+    );
+    let mut found = Vec::new();
+    for manifest in [
+        "Cargo.toml",
+        "src-tauri/Cargo.toml",
+        "ipc/Cargo.toml",
+        "os-auth/Cargo.toml",
+    ] {
+        let text = fs::read_to_string(desktop.join(manifest)).unwrap();
+        found.extend(
+            manifest_hits(&text)
+                .into_iter()
+                .map(|h| format!("desktop/{manifest}:{h}")),
+        );
+    }
+    let files: Vec<PathBuf> = ["src", "tests"]
+        .iter()
+        .flat_map(|d| rust_files(&tauri.join(d)))
+        .collect();
+    assert!(
+        files.iter().any(|f| f.ends_with("core_guard.rs")),
+        "the scan reaches the tests: {files:?}"
+    );
+    for path in files {
+        let text = fs::read_to_string(&path).unwrap();
+        found.extend(
+            holder_hits(&text)
+                .into_iter()
+                .map(|h| format!("{}:{h}", path.display())),
+        );
+    }
+    assert!(
+        found.is_empty(),
+        "the desktop names the CLI's holder (D.4a HG4): it opens a locked store with the key it \
+         holds while unlocked, never through a terminal's unlock window:\n{}",
+        found.join("\n")
+    );
 }
