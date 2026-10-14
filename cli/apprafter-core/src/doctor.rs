@@ -2,6 +2,8 @@
 //! Doctor (D.3 overview §3.9): the report a run produces, grouped, with a typed fix per row,
 //! and [`run`], the Read that produces it.
 
+use std::sync::Arc;
+
 use cli_core::target::{validate_hetzner_token_format, TargetConfig};
 use cli_core::CliError;
 use cli_state::{HetznerCloudState, State, StatePaths};
@@ -15,7 +17,9 @@ use crate::net;
 use crate::provider::{self, SUPPORTED_PROVIDERS};
 use crate::report::{Event, Reporter};
 use crate::runtime;
-use crate::secrets::{CacheKeyView, SecretStore, SecretsMode};
+use crate::secrets::{
+    CacheKeyView, DiagnosticAccess, OpenToken, SecretStore, SecretsMode, StoredToken, VaultAccess,
+};
 use crate::target_ref::TargetRef;
 use crate::tools::{self, ToolId, ToolProblem, ToolStatus};
 
@@ -327,6 +331,9 @@ pub fn run(
     cancel: &CancellationToken,
 ) -> CoreResult<DoctorReport> {
     cancel.check()?;
+    // D.4a T66: whatever the client's access, this run reads a locked store only through a
+    // session already open here; any other read is `store_locked`, reported as a skipped row.
+    let ctx = &diagnostic(ctx);
     // R9: leftovers of a crashed run go first; failing to sweep never fails the run.
     if let Err(e) = runtime::sweep_stale(ctx) {
         reporter.report(Event::Warning {
@@ -391,6 +398,46 @@ fn stage(reporter: &dyn Reporter, index: u32, total: u32, title: &str) {
         total,
         title: title.to_string(),
     });
+}
+
+/// `ctx` as doctor reads it (D.4a T66): its client's access behind e's `DiagnosticAccess`,
+/// asked only for a session already open — a terminal's unlock window, a key the app holds —
+/// never for a prompt or a write key. The CLI's diagnostic context is already wrapped; the
+/// desktop's is not, so the core wraps every run.
+fn diagnostic(ctx: &Context) -> Context {
+    let access: Arc<dyn VaultAccess> = Arc::new(DiagnosticAccess::over(ctx.vault_access().clone()));
+    ctx.clone().with_vault_access(access)
+}
+
+/// The detail of a row that needs a locked store's secret, with nothing open here.
+const STORE_LOCKED: &str = "the target store is locked";
+/// The detail of a row whose target has no token this store uses (T42, T34, T43).
+const NO_TOKEN_USED: &str = "no token this store uses";
+/// The detail of the token row of a locked store's token, located but not read: without a ping
+/// nothing is read through an unlock window (T56, T66).
+const NOT_READ: &str = "in the vault; read only with the ping";
+
+/// A row that needs a locked store's secret, with nothing open here (D.4a T66): skipped, with
+/// the unlock as its fix.
+fn locked_skip(base: Check) -> Check {
+    Check {
+        status: CheckStatus::Skipped,
+        detail: Some(STORE_LOCKED.into()),
+        fix: Some(CheckFix::UnlockFirst),
+        ..base
+    }
+}
+
+/// A row whose secret no lock state lets be read (an interrupted lock, a vault or
+/// `store.yaml` that cannot be read, a slot this build refuses): skipped, with the refusal's
+/// own words as its detail. The `secrets` row carries the way out; never a secret.
+fn refused_skip(base: Check, e: &CliError) -> Check {
+    Check {
+        status: CheckStatus::Skipped,
+        detail: Some(e.to_string()),
+        fix: None,
+        ..base
+    }
 }
 
 fn row(id: CheckId, status: CheckStatus, title: impl Into<String>) -> Check {
@@ -473,23 +520,80 @@ fn target_group(
     ])
 }
 
-/// A target as doctor checks it: its config and its STORED token (never an override, R4).
+/// A target as doctor checks it: its config and what reading its STORED token gave (never an
+/// override, R4).
 struct Loaded {
     name: String,
     config: TargetConfig,
-    token: Option<SecretString>,
+    token: TokenRead,
+}
+
+/// What doctor's read of a stored token gave (D.4a T66). Never a prompt.
+enum TokenRead {
+    /// The stored token, or none stored.
+    Stored(Option<SecretString>),
+    /// A locked store, and nothing open here holds its key.
+    Locked,
+    /// A locked store's token in its vault, located and not read: a run without a ping reads
+    /// nothing through an unlock window, whose every served item restarts it (T56, T66).
+    NotRead,
+    /// A record the store refuses to use (T42, T34, T43), or a lock state in which no secret
+    /// is read: the refusal says which.
+    Refused(CliError),
 }
 
 /// Both of `name`'s files in `cli_core::load_target`'s order — the config, then the token
-/// through the secret store — so a file that cannot be read is the same row as before.
+/// through the secret store — so a file that cannot be read is the same row as before. On a
+/// locked store the token is read only through a session already open (`open_token`), and
+/// only for the ping: without one it is located, never read through a window (T56).
 fn load(ctx: &Context, name: &str) -> cli_core::Result<Loaded> {
     let config = cli_core::target::load_target_config(&ctx.store(), name)?;
-    let token = ctx.secrets().stored_token(name)?;
+    let secrets = ctx.secrets();
+    let token = if ctx.no_ping() && matches!(secrets.mode(), Ok(SecretsMode::Locked)) {
+        match secrets.token_presence(name) {
+            Ok(StoredToken::None) => TokenRead::Stored(None),
+            Ok(StoredToken::OutsideVault) => TokenRead::Refused(CliError::TokenOutsideVault {
+                target: name.to_string(),
+                path: secrets.credentials_file(name),
+            }),
+            Ok(StoredToken::InAnotherVault { id }) => {
+                TokenRead::Refused(CliError::TokenInAnotherVault {
+                    target: name.to_string(),
+                    id: id.to_string(),
+                })
+            }
+            Ok(_) => TokenRead::NotRead,
+            Err(e) => refusal(e)?,
+        }
+    } else {
+        match secrets.open_token(name) {
+            Ok(OpenToken::Token(token)) => TokenRead::Stored(token),
+            Ok(OpenToken::Locked) => TokenRead::Locked,
+            Err(e) => refusal(e)?,
+        }
+    };
     Ok(Loaded {
         name: name.to_string(),
         config,
         token,
     })
+}
+
+/// A token read's error as doctor's rows report it: a locked store with nothing open, or a
+/// record the store refuses (T42, T34, T43), or a lock state in which no secret is read; any
+/// other error is the config row's, as before.
+fn refusal(e: CliError) -> cli_core::Result<TokenRead> {
+    match e {
+        CliError::StoreLocked { .. } => Ok(TokenRead::Locked),
+        e @ (CliError::TokenOutsideVault { .. }
+        | CliError::TokenInAnotherVault { .. }
+        | CliError::TokenMissingFromVault { .. }
+        | CliError::LockIncomplete { .. }
+        | CliError::VaultUnreadable { .. }
+        | CliError::SlotRefused { .. }
+        | CliError::StoreFileUnreadable { .. }) => Ok(TokenRead::Refused(e)),
+        e => Err(e),
+    }
 }
 
 fn credentials_file(secrets: &SecretStore, name: &str) -> Check {
@@ -580,18 +684,39 @@ fn provider_supported(target: &Loaded) -> Check {
 }
 
 fn token_format(target: &Loaded) -> Check {
-    let Some(token) = target.token.as_ref().map(SecretString::expose) else {
-        return Check {
-            fix: Some(CheckFix::RenewToken {
-                target: target.name.clone(),
-                why: RenewWhy::TokenMissing,
-            }),
-            ..row(
-                CheckId::TokenPresent,
-                CheckStatus::Fail,
-                "Hetzner token present",
-            )
-        };
+    let token = match &target.token {
+        TokenRead::Stored(Some(token)) => token.expose(),
+        TokenRead::Stored(None) => {
+            return Check {
+                fix: Some(CheckFix::RenewToken {
+                    target: target.name.clone(),
+                    why: RenewWhy::TokenMissing,
+                }),
+                ..row(
+                    CheckId::TokenPresent,
+                    CheckStatus::Fail,
+                    "Hetzner token present",
+                )
+            }
+        }
+        TokenRead::Locked => {
+            return locked_skip(row(
+                CheckId::TokenFormat,
+                CheckStatus::Skipped,
+                "Token format valid",
+            ))
+        }
+        TokenRead::NotRead => {
+            return Check {
+                detail: Some(NOT_READ.into()),
+                ..row(
+                    CheckId::TokenFormat,
+                    CheckStatus::Skipped,
+                    "Token format valid",
+                )
+            }
+        }
+        TokenRead::Refused(e) => return refused_token(target, e),
     };
     match validate_hetzner_token_format(token) {
         Ok(()) => Check {
@@ -618,6 +743,52 @@ fn token_format(target: &Loaded) -> Check {
     }
 }
 
+/// The token row of a record the store refuses to use (D.4a T42, T34, T43) — a failed
+/// presence, with the renewal that replaces it (`target add --renew`, d's Task 13b) — or of a
+/// lock state in which no secret is read, skipped with the refusal's words. Never the
+/// record's bytes.
+fn refused_token(target: &Loaded, e: &CliError) -> Check {
+    let present = |detail: &str, fix: CheckFix| Check {
+        detail: Some(detail.into()),
+        fix: Some(fix),
+        ..row(
+            CheckId::TokenPresent,
+            CheckStatus::Fail,
+            "Hetzner token present",
+        )
+    };
+    let renew = |why| CheckFix::RenewToken {
+        target: target.name.clone(),
+        why,
+    };
+    match e {
+        CliError::TokenOutsideVault { .. } => present(
+            "in clear in credentials.yaml, which a locked store never uses",
+            renew(RenewWhy::TokenOutsideVault),
+        ),
+        CliError::TokenInAnotherVault { .. } => present(
+            "credentials.yaml names another target store's vault",
+            renew(RenewWhy::TokenInAnotherVault),
+        ),
+        CliError::TokenMissingFromVault { .. } => present(
+            "the vault holds no token for this target",
+            CheckFix::Explain {
+                text: miette::Diagnostic::help(e)
+                    .map(|h| h.to_string())
+                    .unwrap_or_else(|| e.to_string()),
+            },
+        ),
+        _ => refused_skip(
+            row(
+                CheckId::TokenFormat,
+                CheckStatus::Skipped,
+                "Token format valid",
+            ),
+            e,
+        ),
+    }
+}
+
 fn token_verified(ctx: &Context, target: &Loaded, cancel: &CancellationToken) -> CoreResult<Check> {
     let skipped = |detail: String| Check {
         detail: Some(detail),
@@ -630,8 +801,18 @@ fn token_verified(ctx: &Context, target: &Loaded, cancel: &CancellationToken) ->
     if ctx.no_ping() {
         return Ok(skipped("not requested".into()));
     }
-    let Some(token) = target.token.as_ref() else {
-        return Ok(skipped("no token stored".into()));
+    let token = match &target.token {
+        TokenRead::Stored(Some(token)) => token,
+        TokenRead::Stored(None) => return Ok(skipped("no token stored".into())),
+        TokenRead::Locked => return Ok(skipped(STORE_LOCKED.into())),
+        // Only a run without a ping locates rather than reads, and it returned above.
+        TokenRead::NotRead => return Ok(skipped("not requested".into())),
+        TokenRead::Refused(
+            CliError::TokenOutsideVault { .. }
+            | CliError::TokenInAnotherVault { .. }
+            | CliError::TokenMissingFromVault { .. },
+        ) => return Ok(skipped(NO_TOKEN_USED.into())),
+        TokenRead::Refused(e) => return Ok(skipped(e.to_string())),
     };
     let provider = target.config.provider.as_str();
     if !SUPPORTED_PROVIDERS.contains(&provider) {
@@ -894,6 +1075,14 @@ fn kube_api(
             Err(CliError::AgeKeyMissing { path, .. }) => {
                 return Ok(age_key_missing(base, target, path))
             }
+            // D.4a T66: a locked store with nothing open here — skipped, never asked.
+            Err(CliError::StoreLocked { .. }) => return Ok(locked_skip(base)),
+            Err(
+                e @ (CliError::LockIncomplete { .. }
+                | CliError::VaultUnreadable { .. }
+                | CliError::SlotRefused { .. }
+                | CliError::StoreFileUnreadable { .. }),
+            ) => return Ok(refused_skip(base, &e)),
             Err(e) => {
                 return Ok(Check {
                     status: CheckStatus::Fail,
@@ -927,6 +1116,7 @@ fn kube_api(
             })
         }
         Err(CoreError::AgeKeyMissing { path }) => return Ok(age_key_missing(base, target, path)),
+        Err(CoreError::Cli(CliError::StoreLocked { .. })) => return Ok(locked_skip(base)),
         // A key that does not open the cache: its own fix, which names the refetch (review #8).
         Err(CoreError::Cli(cli_core::CliError::CacheUndecryptable {
             target: whose,
@@ -1028,6 +1218,19 @@ fn node_ssh(
         Err(CoreError::Cancelled) => return Err(CoreError::Cancelled),
         Err(CoreError::NotProvisioned { .. }) => return Ok(skipped("no provisioned server")),
         Err(CoreError::TokenNotStored { .. }) => return Ok(skipped("no token stored")),
+        // D.4a T66: the token is read only through a session already open here.
+        Err(CoreError::Cli(CliError::StoreLocked { .. })) => return Ok(locked_skip(base.clone())),
+        Err(CoreError::Cli(
+            CliError::TokenOutsideVault { .. }
+            | CliError::TokenInAnotherVault { .. }
+            | CliError::TokenMissingFromVault { .. },
+        )) => return Ok(skipped(NO_TOKEN_USED)),
+        Err(CoreError::Cli(
+            e @ (CliError::LockIncomplete { .. }
+            | CliError::VaultUnreadable { .. }
+            | CliError::SlotRefused { .. }
+            | CliError::StoreFileUnreadable { .. }),
+        )) => return Ok(refused_skip(base.clone(), &e)),
         Err(e) => return Ok(provider_failure(base, target.name(), e)),
     };
     let Some(ip) = address.ipv4 else {
@@ -1220,6 +1423,7 @@ mod tests {
     use cli_core::target::{GlobalConfig, Target, TargetConfig, TargetCredentials};
     use cli_state::{HetznerCloudState, State, StatePaths};
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::time::Duration;
 
     const TOKEN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -2701,6 +2905,354 @@ mod tests {
         assert_eq!(
             serde_json::to_value(CheckId::Hibernation).unwrap(),
             "hibernation"
+        );
+    }
+
+    const SEALED_STUB: &str =
+        "-----BEGIN AGE ENCRYPTED FILE-----\nx\n-----END AGE ENCRYPTED FILE-----\n";
+
+    /// No row's title or detail carries `secret`.
+    fn shows_no(r: &DoctorReport, secret: &str) -> bool {
+        r.groups.iter().flat_map(|g| g.checks.iter()).all(|c| {
+            !c.title.contains(secret) && !c.detail.as_deref().unwrap_or("").contains(secret)
+        })
+    }
+
+    /// D.4a T66 (d4a-f): on a locked store with nothing open, doctor asks its client for nothing
+    /// (`NeverAsks` panics if asked) and skips every row that needs a secret, saying why, with
+    /// the unlock as the fix; the rows that need none still run.
+    #[test]
+    fn a_locked_store_with_nothing_open_skips_what_needs_a_secret_and_asks_nothing() {
+        let f = fx();
+        crate::secrets::testing::locked_store(&f.root.join("config"), &[("prod", Some(TOKEN))]);
+        let ctx = ctx(&f, OFFLINE).with_vault_access(Arc::new(crate::secrets::testing::NeverAsks));
+        seed_state(
+            &ctx,
+            "prod",
+            serde_json::json!({"server_id": 7, "server_name": "n", "kubeconfig_age": SEALED_STUB}),
+        );
+        let r = doctor(&ctx, named("prod"));
+        let t = group(&r, GroupId::Target);
+        assert_eq!(
+            (t[0].id, t[0].status),
+            (CheckId::ConfigReadable, CheckStatus::Pass)
+        );
+        let format = t.iter().find(|c| c.id == CheckId::TokenFormat).unwrap();
+        assert_eq!(
+            (format.status, format.detail.as_deref(), format.fix.clone()),
+            (
+                CheckStatus::Skipped,
+                Some("the target store is locked"),
+                Some(CheckFix::UnlockFirst)
+            )
+        );
+        let verified = t.iter().find(|c| c.id == CheckId::TokenVerified).unwrap();
+        assert_eq!(
+            (verified.status, verified.detail.as_deref()),
+            (CheckStatus::Skipped, Some("the target store is locked"))
+        );
+        let c = cluster(&r);
+        for row in [&c[1], &c[2]] {
+            assert_eq!(
+                (row.status, row.detail.as_deref(), row.fix.clone()),
+                (
+                    CheckStatus::Skipped,
+                    Some("the target store is locked"),
+                    Some(CheckFix::UnlockFirst)
+                ),
+                "{:?}",
+                row.id
+            );
+        }
+        assert!(shows_no(&r, TOKEN));
+    }
+
+    /// T66: with a session open (a key this client holds), doctor reads the token through it
+    /// and pings with it, and the Kube API row gets the cache's key through it: it goes on to
+    /// look for `kubectl` (none on this fixture's search path), which it would not reach on a
+    /// store it could not open.
+    #[test]
+    fn a_locked_store_with_a_session_open_is_checked_through_it() {
+        let mut server = mockito::Server::new();
+        let m = server
+            .mock("GET", "/v1/locations")
+            .match_header("authorization", format!("Bearer {TOKEN}").as_str())
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"locations":[]}"#)
+            .create();
+        let f = fx();
+        let locked =
+            crate::secrets::testing::locked_store(&f.root.join("config"), &[("prod", Some(TOKEN))]);
+        let ctx = ctx(&f, &server.url()).with_vault_access(locked.access());
+        let sealed = cli_core::secrets::encrypt_for_recipient(YAML, locked.recipient()).unwrap();
+        seed_state(
+            &ctx,
+            "prod",
+            serde_json::json!({"server_id": 7, "server_name": "n", "kubeconfig_age": sealed}),
+        );
+        let r = doctor(&ctx, named("prod"));
+        let t = group(&r, GroupId::Target);
+        let format = t.iter().find(|c| c.id == CheckId::TokenFormat).unwrap();
+        assert_eq!(format.detail.as_deref(), Some("64 chars, alphanumeric"));
+        assert_eq!(
+            t.iter()
+                .find(|c| c.id == CheckId::TokenVerified)
+                .unwrap()
+                .status,
+            CheckStatus::Pass
+        );
+        let api = &cluster(&r)[1];
+        assert_eq!(
+            (api.id, api.status, api.detail.as_deref()),
+            (
+                CheckId::KubeApiReachable,
+                CheckStatus::Skipped,
+                Some("`kubectl` not found")
+            ),
+            "{api:?}"
+        );
+        assert!(shows_no(&r, TOKEN));
+        m.assert();
+    }
+
+    /// T42, T34, T43 (d4a-f): a record a locked store never uses — a clear token (`prod`),
+    /// another store's marker (`dev`), its own marker with no vault entry (`qa`) — fails the
+    /// token row with the way to replace it, and the ping and the node lookup are skipped as
+    /// "no token this store uses", before any network (this fixture's API answers nothing).
+    /// The clear token is never shown.
+    #[test]
+    fn a_token_the_locked_store_never_uses_fails_its_row_and_skips_the_ping() {
+        let f = fx();
+        let locked = crate::secrets::testing::locked_store(
+            &f.root.join("config"),
+            &[("prod", None), ("dev", None), ("qa", None)],
+        );
+        let ctx = ctx(&f, OFFLINE).with_vault_access(locked.access());
+        std::fs::write(
+            ctx.store().target_credentials_file("prod"),
+            format!("hetzner_token: {TOKEN}\n"),
+        )
+        .unwrap();
+        let other = crate::secrets::StoreId::parse("0123456789abcdef").unwrap();
+        crate::secrets::marker::write_marker(&ctx.store(), "dev", &other).unwrap();
+        crate::secrets::marker::write_marker(&ctx.store(), "qa", &locked.store_id).unwrap();
+        for name in ["prod", "dev", "qa"] {
+            seed_state(
+                &ctx,
+                name,
+                serde_json::json!({"server_id": 7, "server_name": "n"}),
+            );
+        }
+        let renew = |target: &str, why| {
+            Some(CheckFix::RenewToken {
+                target: target.into(),
+                why,
+            })
+        };
+        for (name, want) in [
+            ("prod", renew("prod", RenewWhy::TokenOutsideVault)),
+            ("dev", renew("dev", RenewWhy::TokenInAnotherVault)),
+            ("qa", None),
+        ] {
+            let r = doctor(&ctx, named(name));
+            let t = group(&r, GroupId::Target);
+            let present = t
+                .iter()
+                .find(|c| c.id == CheckId::TokenPresent)
+                .unwrap_or_else(|| panic!("{name}: no token row: {t:?}"));
+            assert_eq!(present.status, CheckStatus::Fail, "{name}");
+            match want {
+                Some(fix) => assert_eq!(present.fix, Some(fix), "{name}"),
+                None => assert!(
+                    matches!(&present.fix, Some(CheckFix::Explain { text }) if text.contains("rename it back")),
+                    "{name}: {:?}",
+                    present.fix
+                ),
+            }
+            let verified = t.iter().find(|c| c.id == CheckId::TokenVerified).unwrap();
+            assert_eq!(
+                (verified.status, verified.detail.as_deref()),
+                (CheckStatus::Skipped, Some("no token this store uses")),
+                "{name}"
+            );
+            let node = &cluster(&r)[2];
+            assert_eq!(
+                (node.id, node.status, node.detail.as_deref()),
+                (
+                    CheckId::NodeSshReachable,
+                    CheckStatus::Skipped,
+                    Some("no token this store uses")
+                ),
+                "{name}"
+            );
+            assert!(shows_no(&r, TOKEN), "{name}");
+        }
+        // Without a ping the token is only located (Step 3's (3)): the two records a file
+        // shows are refused alike; an own marker with no entry needs the vault, and reads
+        // "in the vault".
+        let quiet = ctx.clone().with_no_ping(true);
+        for (name, why) in [
+            ("prod", RenewWhy::TokenOutsideVault),
+            ("dev", RenewWhy::TokenInAnotherVault),
+        ] {
+            let t = group(&doctor(&quiet, named(name)), GroupId::Target);
+            let present = t.iter().find(|c| c.id == CheckId::TokenPresent).unwrap();
+            assert_eq!(present.fix, renew(name, why), "{name} --no-ping");
+        }
+    }
+
+    /// T66, §3.13 (d4a-f): an interrupted `lock on` lets no secret be read: the token, Kube API
+    /// and node rows are skipped with the refusal's own words — not a failure of theirs, and
+    /// not a pointer to a row that might read as a pass.
+    #[test]
+    fn an_interrupted_lock_skips_what_needs_a_secret_with_the_refusals_words() {
+        let f = fx();
+        let root = f.root.join("config");
+        crate::secrets::testing::locked_store(&root, &[("prod", Some(TOKEN))]);
+        let yaml = root.join(crate::secrets::STORE_FILE);
+        let text = std::fs::read_to_string(&yaml).unwrap();
+        assert!(text.contains("secrets: locked\n"), "{text}");
+        std::fs::write(
+            &yaml,
+            text.replace("secrets: locked\n", "secrets: locking\n"),
+        )
+        .unwrap();
+        let ctx = ctx(&f, OFFLINE).with_vault_access(Arc::new(crate::secrets::testing::NeverAsks));
+        seed_state(
+            &ctx,
+            "prod",
+            serde_json::json!({"server_id": 7, "server_name": "n", "kubeconfig_age": SEALED_STUB}),
+        );
+        let r = doctor(&ctx, named("prod"));
+        let t = group(&r, GroupId::Target);
+        let c = cluster(&r);
+        for row in [
+            t.iter().find(|c| c.id == CheckId::TokenFormat).unwrap(),
+            t.iter().find(|c| c.id == CheckId::TokenVerified).unwrap(),
+            &c[1],
+            &c[2],
+        ] {
+            assert_eq!(row.status, CheckStatus::Skipped, "{row:?}");
+            assert!(
+                row.detail
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("did not finish"),
+                "{row:?}"
+            );
+        }
+        assert!(shows_no(&r, TOKEN));
+    }
+
+    /// A client with a session open whose token reads are counted: each is an item a
+    /// terminal's window would serve, and so restart (T56). It never prompts: `session` and
+    /// `write_key` panic, so a doctor run that reached past `open_session` would fail here.
+    #[derive(Debug)]
+    struct CountingWindow {
+        inner: Arc<dyn crate::secrets::VaultAccess>,
+        tokens: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[derive(Debug)]
+    struct CountingSession {
+        inner: Arc<dyn crate::secrets::VaultSession>,
+        tokens: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl crate::secrets::VaultSession for CountingSession {
+        fn hetzner_token(
+            &self,
+            vault: &[u8],
+            target: &str,
+        ) -> cli_core::Result<Option<SecretString>> {
+            self.tokens
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.hetzner_token(vault, target)
+        }
+
+        fn open_cache(
+            &self,
+            vault: &[u8],
+            secret: cli_core::secrets::CachedSecret,
+            target: &str,
+            armored: &str,
+        ) -> cli_core::Result<crate::Zeroizing<String>> {
+            self.inner.open_cache(vault, secret, target, armored)
+        }
+
+        fn recipient(&self, vault: &[u8]) -> cli_core::Result<cli_core::secrets::Recipient> {
+            self.inner.recipient(vault)
+        }
+    }
+
+    impl crate::secrets::VaultAccess for CountingWindow {
+        fn session(
+            &self,
+            _: &crate::secrets::VaultRequest<'_>,
+        ) -> cli_core::Result<Arc<dyn crate::secrets::VaultSession>> {
+            panic!("a diagnostic asked for a session that is not open")
+        }
+
+        fn write_key(
+            &self,
+            _: &crate::secrets::VaultRequest<'_>,
+        ) -> cli_core::Result<crate::secrets::KeySession> {
+            panic!("a diagnostic asked for a write key")
+        }
+
+        fn open_session(
+            &self,
+            req: &crate::secrets::VaultRequest<'_>,
+        ) -> cli_core::Result<Option<Arc<dyn crate::secrets::VaultSession>>> {
+            Ok(self.inner.open_session(req)?.map(|inner| {
+                Arc::new(CountingSession {
+                    inner,
+                    tokens: self.tokens.clone(),
+                }) as Arc<dyn crate::secrets::VaultSession>
+            }))
+        }
+    }
+
+    /// T56, T66 (d4a-f; e's verifier, finding 4): every token read through a terminal's window
+    /// is an item it serves, and restarts it. Doctor reads the token through a window only
+    /// for its ping: without one it reads none — the token row says where the token is — and
+    /// with one it does.
+    #[test]
+    fn a_doctor_without_a_ping_reads_no_token_through_a_window() {
+        let f = fx();
+        let locked =
+            crate::secrets::testing::locked_store(&f.root.join("config"), &[("prod", Some(TOKEN))]);
+        let tokens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let window = Arc::new(CountingWindow {
+            inner: locked.access(),
+            tokens: tokens.clone(),
+        });
+        let quiet = ctx(&f, OFFLINE)
+            .with_vault_access(window.clone())
+            .with_no_ping(true);
+        let r = doctor(&quiet, named("prod"));
+        let format = group(&r, GroupId::Target)
+            .into_iter()
+            .find(|c| c.id == CheckId::TokenFormat)
+            .unwrap();
+        assert_eq!(
+            (format.status, format.detail.as_deref(), format.fix.clone()),
+            (
+                CheckStatus::Skipped,
+                Some("in the vault; read only with the ping"),
+                None
+            )
+        );
+        assert_eq!(
+            tokens.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a --no-ping doctor read a token through the window"
+        );
+        doctor(&ctx(&f, OFFLINE).with_vault_access(window), named("prod"));
+        assert!(
+            tokens.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "the ping reads its token through the window"
         );
     }
 }
