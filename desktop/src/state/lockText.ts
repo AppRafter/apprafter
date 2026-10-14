@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 // Every sentence the app shows about the target-store lock (D.4a surface §6, D1–D25, with the
-// overview's O2 / O7 / O12 amendments): Settings › Lock, the Protect, Finish and Stop dialogs, the
-// lock screen's field. One place, so each is said the same everywhere and a test reads each.
+// overview's O2 / O7 / O12 amendments; WI-476): Settings › Lock, the Security page, the Targets
+// page's line, the Protect, Finish and Stop dialogs, the lock screen's field. One place, so each
+// is said the same everywhere and a test reads each.
 //
 // Honest + separate user (owner, 2026-10-13): the lock stops an AI agent that oversteps — one
 // that runs AppRafter or reads its files as you; against a program that sets out to get past it
@@ -65,7 +66,10 @@ export const ACTION_LABELS: Record<ProtectAction, string> = {
   stop: 'Stop protecting…',
 };
 
-/** D7 (ADR 0068 §8, "the section says so"): why the app's unlock asks for the lock password. */
+/**
+ * D7 (ADR 0068 §8, "the desktop says so"): why the app's unlock asks for the lock password — on
+ * the Security page, and in Settings › Lock's pinned Require unlock (WI-476).
+ */
 export function unlockNote(os: Os): string {
   switch (os) {
     case 'linux':
@@ -473,10 +477,83 @@ export function lockFooter(mode: SecretsMode, problem: boolean): string {
       return 'Clusters keep running. Putting secrets back in files was interrupted: some credentials may be in files again.';
   }
 }
-/** The Lock section's state line when the store's lock state cannot be used; the problem follows. */
+/**
+ * The Security page's state line when the store's lock state cannot be used; the problem
+ * follows.
+ */
 export const STORE_PROBLEM_SUB = "This target store's lock state cannot be used.";
 /** The lock screen's reason then, in place of "locked from a terminal" (critic A finding 22). */
 export const STORE_PROBLEM_REASON = "Locked: this target store's lock state cannot be used.";
-/** The Lock section's limits, and its line while lock_info is read (UI verifier minor 9). */
+/** The Security page's limits, and its line while lock_info is read (UI verifier minor 9). */
 export const LIMITS_TITLE = 'Limits on this computer';
 export const READING = 'Reading…';
+
+// WI-476 (owner, 2026-10-14; the overview's O14): the target store's protection has a page of its
+// own, Security, in the sidebar; Settings › Lock keeps how the app locks. The page names the store
+// and every target in it, so the lock reads as the whole store's — one vault, and what opens it
+// opens them all — and never as one target's. A computer can hold other target stores; each is
+// protected on its own, as the Protect wizard's first step says (critic B1).
+/** The page's title and the sidebar's item. */
+export const SECURITY_TITLE = 'Security';
+export const SECURITY_SUB =
+  'Where this target store keeps its secrets, and what opens them. Protecting them covers every target in this store with one vault: what opens it opens them all. Another target store on this computer is protected on its own.';
+/** A store with no target: said as it is, in every state (in files nothing is covered; B2). */
+export const NO_TARGETS_YET = 'No targets in this store yet.';
+
+/** "Covers 3 targets: lab, prod-eu, staging": every target the store holds, unreadable ones too. */
+export function coveredLine(names: readonly string[]): string {
+  if (names.length === 0) return NO_TARGETS_YET;
+  const count = names.length === 1 ? '1 target' : `${names.length} targets`;
+  return `Covers ${count}: ${names.join(', ')}`;
+}
+
+/** Where the store's secrets are, in a few words; never "protected" for one that needs repair. */
+export function secretsWord(mode: SecretsMode, problem: boolean): string {
+  if (problem) return 'lock state cannot be used';
+  switch (mode) {
+    case 'files':
+      return 'in files';
+    case 'locking':
+      return 'protecting was interrupted';
+    case 'locked':
+      return 'protected';
+    case 'unlocking':
+      return 'stopping protection was interrupted';
+  }
+}
+
+/** The Targets page's line about the store as a whole; SECURITY_LINK follows it. */
+export function storeIndicator(store: string, mode: SecretsMode, problem: boolean): string {
+  return `${storeLine(store)} · Secrets: ${secretsWord(mode, problem)}`;
+}
+/**
+ * The line's link: "Security ›" on screen. Its accessible name says the page: the sidebar's own
+ * "Security" stays the one control of that name, and no "›" is read aloud (critic m9).
+ */
+export const SECURITY_LINK = 'Security ›';
+export const SECURITY_LINK_NAME = 'Security page';
+
+/** Settings › Lock's last row: the store's protection is on the Security page. */
+export const SECURITY_ROW = 'Target store protection';
+export const SECURITY_ROW_SUB =
+  'Protecting its secrets, what opens them and this computer’s limits are on the Security page.';
+export const OPEN_SECURITY = 'Open Security';
+
+/**
+ * The row's sub as the store stands (critic M2): a lock state that cannot be used, an
+ * interrupted run, or, while the app's unlock opens the vault (`pinned`, from
+ * AppInfo.secrets.protected), why the rows above stay on and where that changes. Settings ›
+ * Lock otherwise says nothing of the store: the Security page has it.
+ */
+export function securityRowSub(mode: SecretsMode, pinned: boolean, problem: boolean): string {
+  if (problem) {
+    return "This target store's lock state cannot be used: the Security page says why.";
+  }
+  if (mode === 'locking' || mode === 'unlocking') {
+    return "Changing this target store's protection was interrupted: the Security page offers to finish it.";
+  }
+  if (pinned) {
+    return "This target store's secrets are protected, so the settings above stay on until you stop protecting them on the Security page.";
+  }
+  return SECURITY_ROW_SUB;
+}

@@ -6,6 +6,7 @@ import type { SecretsMode } from '../ipc/generated/SecretsMode';
 import * as lockText from './lockText';
 import {
   AGENT_NOTE,
+  coveredLine,
   hardeningLine,
   limitText,
   lockFooter,
@@ -16,9 +17,14 @@ import {
   protectOutcome,
   protectSub,
   recoveryKeyLine,
+  SECURITY_ROW_SUB,
+  SECURITY_SUB,
+  secretsWord,
+  securityRowSub,
   shortWarning,
   stopOutcome,
   stoppedSummary,
+  storeIndicator,
   terminalsLine,
   unlockNote,
 } from './lockText';
@@ -155,6 +161,19 @@ describe("this computer's limits (rule 1)", () => {
       ),
     finishIntro: () => [lockText.finishIntro('~/s')],
     storeLine: () => [lockText.storeLine('~/s')],
+    coveredLine: () => [coveredLine([]), coveredLine(['a']), coveredLine(['a', 'b'])],
+    secretsWord: () =>
+      (['files', 'locking', 'locked', 'unlocking'] as const).flatMap((m) => [
+        secretsWord(m, false),
+        secretsWord(m, true),
+      ]),
+    storeIndicator: () => [storeIndicator('~/s', 'locked', false)],
+    securityRowSub: () =>
+      (['files', 'locking', 'locked', 'unlocking'] as const).flatMap((m) => [
+        securityRowSub(m, false, false),
+        securityRowSub(m, true, false),
+        securityRowSub(m, true, true),
+      ]),
     lockFooter: () =>
       (['files', 'locking', 'locked', 'unlocking'] as const).flatMap((m) => [
         lockFooter(m, false),
@@ -343,5 +362,57 @@ describe('the state of the store', () => {
       'That is too short or too long for a recovery key.',
     );
     expect(recoveryKeyLine({})).toBeNull();
+  });
+});
+
+describe('the Security page’s words (WI-476)', () => {
+  test('the covered line names every target, counted; a store with none claims nothing', () => {
+    expect(coveredLine(['lab', 'prod-eu', 'staging'])).toBe(
+      'Covers 3 targets: lab, prod-eu, staging',
+    );
+    expect(coveredLine(['prod'])).toBe('Covers 1 target: prod');
+    // In files nothing is covered, so the empty store says only that (critic B2).
+    expect(coveredLine([])).toBe('No targets in this store yet.');
+  });
+
+  test('the sub says the scope both ways: this store whole, another store on its own', () => {
+    expect(SECURITY_SUB).toContain('covers every target in this store with one vault');
+    expect(SECURITY_SUB).toContain('what opens it opens them all');
+    // A computer can hold other stores; the Protect wizard says they are not changed (B1).
+    expect(SECURITY_SUB).toContain(
+      'Another target store on this computer is protected on its own.',
+    );
+  });
+
+  test('the Security row says why the rows above stay on, and where that changes', () => {
+    const all = ['files', 'locking', 'locked', 'unlocking'] as const;
+    expect(securityRowSub('files', false, false)).toBe(SECURITY_ROW_SUB);
+    expect(securityRowSub('locked', true, false)).toBe(
+      "This target store's secrets are protected, so the settings above stay on until you stop protecting them on the Security page.",
+    );
+    for (const mode of ['locking', 'unlocking'] as const) {
+      expect(securityRowSub(mode, true, false)).toBe(
+        "Changing this target store's protection was interrupted: the Security page offers to finish it.",
+      );
+    }
+    // Not pinned (no vault opens): no claim that the rows stay on.
+    expect(securityRowSub('locked', false, false)).toBe(SECURITY_ROW_SUB);
+    for (const mode of all) {
+      expect(securityRowSub(mode, true, true)).toBe(
+        "This target store's lock state cannot be used: the Security page says why.",
+      );
+    }
+  });
+
+  test('the Targets page’s line: the store and where its secrets are, never protected when it needs repair', () => {
+    expect(storeIndicator('~/.config/apprafter', 'locked', false)).toBe(
+      'Target store ~/.config/apprafter · Secrets: protected',
+    );
+    expect(storeIndicator('~/s', 'files', false)).toBe('Target store ~/s · Secrets: in files');
+    expect(secretsWord('locking', false)).toBe('protecting was interrupted');
+    expect(secretsWord('unlocking', false)).toBe('stopping protection was interrupted');
+    for (const mode of ['files', 'locking', 'locked', 'unlocking'] as const) {
+      expect(secretsWord(mode, true)).toBe('lock state cannot be used');
+    }
   });
 });

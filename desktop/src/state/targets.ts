@@ -3,6 +3,7 @@
 // outside KEPT_WHILE_LOCKED, so a lock drops them with the rest.
 import type { QueryClient } from '@tanstack/react-query';
 import * as api from '../ipc/api';
+import type { TargetListReport } from '../ipc/generated/TargetListReport';
 import { useLiveQuery } from './liveQuery';
 
 export const TARGETS_KEY = ['targets'] as const;
@@ -12,6 +13,16 @@ export const targetKey = (name: string) => ['target', name] as const;
  * interval (D.5 feeds the setting). A local read of a few small files.
  */
 export const STORE_REFRESH_MS = 5_000;
+
+/**
+ * Every target the store holds, by name, as the core lists them (`list_target_names`, sorted):
+ * the readable and the unreadable alike. The Security page's covered line (WI-476): the lock is
+ * the store's, so a target whose config.yaml cannot be read is covered as much as any.
+ */
+export function storeTargetNames(report: TargetListReport): string[] {
+  const names = [...report.targets, ...report.unreadable].map((target) => target.name);
+  return names.sort();
+}
 
 export const useTargetList = () =>
   useLiveQuery({ queryKey: TARGETS_KEY, queryFn: api.targetList, intervalMs: STORE_REFRESH_MS });
