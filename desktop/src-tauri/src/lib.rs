@@ -19,6 +19,7 @@ pub mod signals;
 pub mod single_instance;
 pub mod target_ops;
 pub mod theme;
+pub mod vault_access;
 pub mod window;
 
 /// The product's name as people see it: the window title and the macOS app menu. Not Tauri's
