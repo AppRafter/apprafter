@@ -25,7 +25,7 @@ pub enum FaultPoint {
     AfterLocked,
     /// `lock off`: `store.yaml` says `unlocking`.
     AfterStoreFileUnlocking,
-    /// `lock off`: the shared age key is there.
+    /// `lock off`: step 2 is done (the shared age key is there when a cache needs one).
     AfterSharedKey,
     /// `lock off`: target `n`'s token and caches are in files.
     AfterFilesTarget(usize),

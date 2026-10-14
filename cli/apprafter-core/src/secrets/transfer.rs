@@ -65,6 +65,31 @@ pub(crate) fn shared_identities(paths: &[PathBuf]) -> Result<Vec<Identity>> {
     Ok(out)
 }
 
+/// The shared age identities at `paths`, read once, when first asked for (D.4a f Task 3): a
+/// run that meets no cache sealed to them never reads them.
+pub(crate) struct SharedKeys<'a> {
+    paths: &'a [PathBuf],
+    read: std::cell::OnceCell<Vec<Identity>>,
+}
+
+impl<'a> SharedKeys<'a> {
+    pub(crate) fn at(paths: &'a [PathBuf]) -> Self {
+        SharedKeys {
+            paths,
+            read: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// The identities, read now if they were not yet ([`shared_identities`]).
+    pub(crate) fn get(&self) -> Result<&[Identity]> {
+        if let Some(keys) = self.read.get() {
+            return Ok(keys.as_slice());
+        }
+        let keys = shared_identities(self.paths)?;
+        Ok(self.read.get_or_init(|| keys).as_slice())
+    }
+}
+
 /// `armored` opened with the first of `keys` that opens it.
 pub(crate) fn open_with_any(armored: &str, keys: &[Identity]) -> Option<Zeroizing<String>> {
     keys.iter().find_map(|id| {

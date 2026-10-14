@@ -444,7 +444,9 @@ fn on_plan_text(ctx: &Context, plan: &Plan<LockOnPayload>, shown: &str, targets:
         "  note    while a command or the app uses a secret, it is in that process's memory \
          and, for a kubeconfig, in a file programs running as you can read\n",
     );
-    if let Some(path) = &ctx.overrides().age_key {
+    // D.4a f Task 3: a plan that reads no shared key (no cache to move) names none.
+    let reads_key = !plan.payload.keys().is_empty();
+    if let (Some(path), true) = (&ctx.overrides().age_key, reads_key) {
         out.push_str(&format!(
             "The cached secrets are read with the age key at {} (APPRAFTER_AGE_KEY), and not \
              with the default one; once the store is locked the variable no longer applies.\n",
@@ -554,10 +556,9 @@ fn off_result(done: &LockedOff, shown: &str) -> String {
              deleted.\n"
         )
     };
-    if done.age_key_created {
+    if let (true, Some(key)) = (done.age_key_created, &done.age_key) {
         out.push_str(&format!(
-            "Created the shared age key at {}: the cached secrets are encrypted to it.\n",
-            done.age_key
+            "Created the shared age key at {key}: the cached secrets are encrypted to it.\n"
         ));
     }
     for t in &done.tokens_kept {

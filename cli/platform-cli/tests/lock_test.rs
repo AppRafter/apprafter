@@ -212,6 +212,23 @@ mod at_a_terminal {
         )
     }
 
+    const YAML: &str = "apiVersion: v1\nkind: Config\nclusters: []\n";
+
+    /// `seeded`, and `prod`'s kubeconfig cached under a shared age key made at `key`.
+    fn seeded_with_cache(sp: &Spawn, key: &std::path::Path) -> std::path::PathBuf {
+        seeded(sp);
+        let id = cli_core::secrets::load_or_create_identity(key).unwrap();
+        let sealed = cli_core::secrets::encrypt_for_recipient(YAML, &id.to_public()).unwrap();
+        let paths = cli_core::TargetStorePaths::for_root(sp.store());
+        let state = cli_state::StatePaths::for_active_target(&paths, "prod");
+        std::fs::create_dir_all(state.state_dir()).unwrap();
+        let body = serde_json::json!({
+            "hetzner_cloud": {"server_id": 7, "server_name": "n", "kubeconfig_age": sealed},
+        });
+        std::fs::write(state.state_file(), body.to_string()).unwrap();
+        state.state_file()
+    }
+
     /// T36, O12: the plan, the password twice, the key shown once at the terminal and typed
     /// back whole; the token leaves its file, the key never reaches stdout.
     #[test]
@@ -346,15 +363,19 @@ mod at_a_terminal {
     }
 
     /// T37, O13: `lock off` shows the plan, asks one slot's secret and puts the token back;
-    /// the caches' key is created where `APPRAFTER_AGE_KEY` points, and the plan says so.
+    /// with a cache to write back, the caches' key is created where `APPRAFTER_AGE_KEY`
+    /// points, and the plan says so.
     #[test]
     fn lock_off_puts_the_secrets_back_under_the_key_apprafter_age_key_names() {
         let _one = one_at_a_time();
         let sp = Spawn::new();
         let dest = sp.path("keys").join("age.key");
         let sp = sp.with_env("APPRAFTER_AGE_KEY", &dest);
-        seeded(&sp);
+        let state_file = seeded_with_cache(&sp, &dest);
         assert!(lock_at_terminal(&sp).status.success());
+        // The cache opens with the store's own key now; with the shared key gone, `lock off`
+        // creates one where APPRAFTER_AGE_KEY points (O13), says so, and seals the cache to it.
+        std::fs::remove_file(&dest).unwrap();
         let shown = dest.display().to_string();
         let end = converse(
             &sp,
@@ -371,6 +392,14 @@ mod at_a_terminal {
         assert!(end.terminal.contains(&shown), "{}", end.terminal);
         assert!(end.stdout.contains("Unlocked for good:"), "{}", end.stdout);
         assert!(dest.exists());
+        let id = cli_core::secrets::load_identity(&dest).unwrap().unwrap();
+        let state: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&state_file).unwrap()).unwrap();
+        let armored = state["hetzner_cloud"]["kubeconfig_age"].as_str().unwrap();
+        assert_eq!(
+            cli_core::secrets::decrypt_with_identity(armored, &id).unwrap(),
+            YAML
+        );
         assert!(!sp.store().join("vault").exists());
         let creds = std::fs::read_to_string(
             sp.store()
@@ -499,5 +528,37 @@ mod at_a_terminal {
         assert!(end.restored);
         assert_eq!(store_yaml(&sp), before, "nothing was written");
         assert!(sp.store().join("vault").exists());
+    }
+
+    /// D.4a f Task 3, O13: a store with no cache moves none, so neither `lock on` nor `lock
+    /// off` creates a shared age key — not where `APPRAFTER_AGE_KEY` points, not at the
+    /// default — and neither names one.
+    #[test]
+    fn lock_on_and_off_without_a_cache_never_touch_the_shared_key() {
+        let _one = one_at_a_time();
+        let sp = Spawn::new();
+        let dest = sp.path("keys").join("age.key");
+        let default = sp.home().join(".config").join("apprafter").join("age.key");
+        let sp = sp.with_env("APPRAFTER_AGE_KEY", &dest);
+        seeded(&sp);
+        let shown = dest.display().to_string();
+        let on = lock_at_terminal(&sp);
+        assert!(on.status.success(), "{}", on.terminal);
+        assert!(!on.terminal.contains(&shown), "{}", on.terminal);
+        let end = converse(
+            &sp,
+            &["lock", "off"],
+            &[
+                Step::Expect("Put the secrets of the target store at "),
+                Step::Expect("The secrets will be on disk in clear again"),
+                Step::Expect(SECRET),
+                line(PASSWORD),
+            ],
+        );
+        assert!(end.status.success(), "{}", end.terminal);
+        assert!(end.stdout.contains("Unlocked for good:"), "{}", end.stdout);
+        assert!(!end.terminal.contains("shared age key"), "{}", end.terminal);
+        assert!(!end.terminal.contains(&shown) && !end.stdout.contains(&shown));
+        assert!(!dest.exists() && !default.exists());
     }
 }

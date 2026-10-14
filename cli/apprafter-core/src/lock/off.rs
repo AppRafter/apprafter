@@ -7,7 +7,9 @@
 //!
 //! 1. `store.yaml` says `unlocking` (after a re-read under the lock: a run that won the race
 //!    finished meanwhile, and this one writes nothing);
-//! 2. the shared age key is there — loaded, or created when there is none, never replaced;
+//! 2. when a target has a cache to write back, the shared age key is there — loaded, or
+//!    created when there is none, never replaced; a store with no cache gets none (D.4a f
+//!    Task 3);
 //! 3. per target, the vault's token written in clear where the file holds no clear token (a
 //!    marker of this store, or no token) — a clear token is never overwritten (critic G2):
 //!    one that differs from the vault's is kept, and named — and each cache re-sealed to the
@@ -38,7 +40,9 @@ use cli_state::{State, StatePaths};
 use serde::Serialize;
 
 use super::faults::{self, FaultPoint};
-use super::on::{change, dropped, refresh, sealed_and_checked, title, vault_err, DroppedCache};
+use super::on::{
+    change, dropped, refresh, sealed_and_checked, sealed_cache_in, title, vault_err, DroppedCache,
+};
 use super::open::OpenedVault;
 use crate::context::{Context, SecretString};
 use crate::error::{CoreError, CoreResult};
@@ -85,6 +89,7 @@ pub struct LockOffPayload {
     start: LockOffStart,
     dest: PathBuf,
     dest_exists: bool,
+    needs_key: bool,
 }
 
 impl LockOffPayload {
@@ -97,9 +102,18 @@ impl LockOffPayload {
         &self.dest
     }
 
-    /// Whether a key is at [`LockOffPayload::dest`] already; else the run creates one.
+    /// Whether a key is at [`LockOffPayload::dest`] already; else a run that needs one
+    /// ([`LockOffPayload::needs_key`]) creates it.
     pub fn dest_exists(&self) -> bool {
         self.dest_exists
+    }
+
+    /// Whether the plan found a cache to write back under the shared key (D.4a f Task 3):
+    /// only then is the key at [`LockOffPayload::dest`] read, created or named — the run
+    /// decides again under the store's lock. [`LockOffPayload::dest_exists`] is `false` when
+    /// it was not read.
+    pub fn needs_key(&self) -> bool {
+        self.needs_key
     }
 
     /// Whether the run needs the vault opened with one slot's secret (`lock::open_at`).
@@ -139,13 +153,14 @@ pub struct LockedOff {
     /// The same, on a back-out of `lock on`, which had not touched them: left as they were
     /// (critic finding 10).
     pub caches_left: Vec<DroppedCache>,
-    /// The shared age key the caches are sealed to now.
-    pub age_key: String,
+    /// The shared age key the caches are sealed to now; `None` when the run moved no cache,
+    /// and so loaded and created no key (D.4a f Task 3).
+    pub age_key: Option<String>,
     pub age_key_created: bool,
 }
 
 impl LockedOff {
-    fn empty(ctx: &Context, dest: &Path) -> LockedOff {
+    fn empty(ctx: &Context) -> LockedOff {
         LockedOff {
             store: ctx.config_root().display().to_string(),
             store_id: None,
@@ -156,7 +171,7 @@ impl LockedOff {
             caches_resealed: 0,
             caches_dropped: Vec::new(),
             caches_left: Vec::new(),
-            age_key: dest.display().to_string(),
+            age_key: None,
             age_key_created: false,
         }
     }
@@ -252,24 +267,24 @@ fn write_files(store: &TargetStorePaths, held: &StoreLock) -> CoreResult<()> {
 }
 
 /// The plan of `lock off` (Destructive, T37): read-only, and without a secret — `store.yaml`,
-/// every target's credentials and state, the key at the destination (read, never created),
-/// and which caches it does not open. A key there that does not load stops the plan: it is
-/// never replaced.
+/// every target's credentials and state, the key at the destination when a cache goes back
+/// under it (read, never created), and which caches it does not open. A key there that does
+/// not load stops such a plan: it is never replaced.
 pub fn plan_off(ctx: &Context) -> CoreResult<Plan<LockOffPayload>> {
     let store = ctx.store();
     let root = ctx.config_root();
     let dest = ctx.age_key_path().to_path_buf();
-    let dest_keys = transfer::shared_identities(std::slice::from_ref(&dest))?;
-    let dest_exists = !dest_keys.is_empty();
     let targets = cli_core::list_target_names(&store)?;
-    let plan = |start, title: String, changes| Plan {
+    // D.4a f Task 3: only an unlock moves caches; the other starts read no key and no state.
+    let plan = |start, title: String, changes, dest_keys: &[Identity], needs_key| Plan {
         class: PlanClass::Destructive,
         title,
         changes,
         payload: LockOffPayload {
             start,
             dest: dest.clone(),
-            dest_exists,
+            dest_exists: !dest_keys.is_empty(),
+            needs_key,
         },
     };
     let Some(file) = read_store_file(root)?.filter(|f| f.secrets != SecretsMode::Files) else {
@@ -277,6 +292,8 @@ pub fn plan_off(ctx: &Context) -> CoreResult<Plan<LockOffPayload>> {
             LockOffStart::NotLocked,
             format!("The target store at {} is not locked", root.display()),
             Vec::new(),
+            &[],
+            false,
         ));
     };
     let Some(id) = file.id.clone() else {
@@ -302,6 +319,8 @@ pub fn plan_off(ctx: &Context) -> CoreResult<Plan<LockOffPayload>> {
                     ChangeAction::Update,
                     "back to `secrets: files`: the interrupted `lock on` had moved nothing",
                 )],
+                &[],
+                false,
             ))
         }
         SecretsMode::Unlocking if !vault => {
@@ -317,6 +336,8 @@ pub fn plan_off(ctx: &Context) -> CoreResult<Plan<LockOffPayload>> {
                     ChangeAction::Update,
                     "`secrets: files`: every secret is in files already",
                 )],
+                &[],
+                false,
             ))
         }
         from => {
@@ -325,11 +346,22 @@ pub fn plan_off(ctx: &Context) -> CoreResult<Plan<LockOffPayload>> {
                 SecretsMode::Unlocking => "Finish unlocking the secrets of",
                 _ => "Unlock the secrets of",
             };
-            let changes = survey(&store, root, &targets, &id, from, &dest, &dest_keys)?;
+            // D.4a f Task 3: the destination key is read only when a cache goes back under it.
+            let needs_key = sealed_cache_in(&store, &targets)?;
+            let dest_keys = if needs_key {
+                transfer::shared_identities(std::slice::from_ref(&dest))?
+            } else {
+                Vec::new()
+            };
+            let changes = survey(
+                &store, root, &targets, &id, from, &dest, &dest_keys, needs_key,
+            )?;
             Ok(plan(
                 LockOffStart::Unlock { id, from },
                 title(lead, root, &targets),
                 changes,
+                &dest_keys,
+                needs_key,
             ))
         }
     }
@@ -339,6 +371,7 @@ pub fn plan_off(ctx: &Context) -> CoreResult<Plan<LockOffPayload>> {
 /// stops the plan (T37, T42). Each cache the destination key (`dest_keys`, empty when none is
 /// there yet) does not open is named with what may become of it (critic finding 10): on an
 /// unlock dropped when the vault's key cannot open it either; on a back-out left as it was.
+/// The shared key is named only when a cache goes back under it (`needs_key`).
 #[allow(clippy::too_many_arguments)]
 fn survey(
     store: &TargetStorePaths,
@@ -348,6 +381,7 @@ fn survey(
     from: SecretsMode,
     dest: &Path,
     dest_keys: &[Identity],
+    needs_key: bool,
 ) -> CoreResult<Vec<PlannedChange>> {
     let dest_exists = !dest_keys.is_empty();
     let mut changes = Vec::new();
@@ -421,21 +455,24 @@ fn survey(
             ));
         }
     }
-    changes.push(if dest_exists {
-        change(
-            "AgeKey",
-            &dest.display().to_string(),
-            ChangeAction::Keep,
-            "used as it is: every target store in files shares it",
-        )
-    } else {
-        change(
-            "AgeKey",
-            &dest.display().to_string(),
-            ChangeAction::Create,
-            "created: the key every target store in files shares",
-        )
-    });
+    // D.4a f Task 3: a run that writes no cache back loads and creates no key: none is named.
+    if needs_key {
+        changes.push(if dest_exists {
+            change(
+                "AgeKey",
+                &dest.display().to_string(),
+                ChangeAction::Keep,
+                "used as it is: every target store in files shares it",
+            )
+        } else {
+            change(
+                "AgeKey",
+                &dest.display().to_string(),
+                ChangeAction::Create,
+                "created: the key every target store in files shares",
+            )
+        });
+    }
     changes.push(change(
         "Vault",
         &vault_path(root).display().to_string(),
@@ -464,7 +501,7 @@ pub fn execute_off(
     let payload = plan.payload;
     let store = ctx.store();
     let root = ctx.config_root();
-    let mut done = LockedOff::empty(ctx, &payload.dest);
+    let mut done = LockedOff::empty(ctx);
     match payload.start.clone() {
         LockOffStart::NotLocked => done.not_locked = true,
         LockOffStart::BackOutNoVault => {
@@ -575,14 +612,22 @@ fn unlock(
     write_store_file(root, &unlocking, &held)?;
     sync_root(&store)?;
     faults::hit(ctx, FaultPoint::AfterStoreFileUnlocking)?;
-    // Step 2: the shared key, never replaced.
-    let (identity, created) = transfer::shared_identity_at(&payload.dest)?;
-    done.age_key_created = created;
+    // Step 2: the shared key, never replaced — and only when a cache goes back under it,
+    // decided here under the held lock (D.4a f Task 3): a store with no cache gets no key, and
+    // none is read.
+    let shared = if sealed_cache_in(&store, &targets)? {
+        let (identity, created) = transfer::shared_identity_at(&payload.dest)?;
+        done.age_key = Some(payload.dest.display().to_string());
+        done.age_key_created = created;
+        Some(transfer::shared_key(identity, payload.dest.clone()))
+    } else {
+        None
+    };
     faults::hit(ctx, FaultPoint::AfterSharedKey)?;
     if cancel.is_cancelled() {
         write_store_file(root, &file, &held)?;
         sync_root(&store)?;
-        let left = if created {
+        let left = if done.age_key_created {
             vec![payload.dest.display().to_string()]
         } else {
             Vec::new()
@@ -599,7 +644,6 @@ fn unlock(
         KeySession::new(opened.key.clone(), opened.vault_id, root.to_path_buf()),
         disk,
     );
-    let shared = transfer::shared_key(identity, payload.dest.clone());
     let mut written: Vec<(String, SecretString)> = Vec::new();
     for (n, target) in targets.iter().enumerate() {
         let vaulted = vault.payload().hetzner_token(target);
@@ -621,7 +665,9 @@ fn unlock(
             done.tokens_restored.push(target.clone());
             written.push((target.clone(), token));
         }
-        reseal(&store, target, &vault_key, &shared, from, &mut done)?;
+        if let Some(shared) = &shared {
+            reseal(&store, target, &vault_key, shared, from, &mut done)?;
+        }
         faults::hit(ctx, FaultPoint::AfterFilesTarget(n))?;
     }
     #[cfg(test)]
@@ -649,10 +695,13 @@ fn unlock(
             &format!("the credentials file of `{target}`"),
         ));
     }
-    let reloaded = transfer::shared_identities(std::slice::from_ref(&payload.dest))?;
-    if reloaded.first().map(|k| k.to_public().to_string()) != Some(shared.recipient()?.to_string())
-    {
-        return Err(files_not_kept(&store, &payload.dest.display().to_string()));
+    if let Some(shared) = &shared {
+        let reloaded = transfer::shared_identities(std::slice::from_ref(&payload.dest))?;
+        if reloaded.first().map(|k| k.to_public().to_string())
+            != Some(shared.recipient()?.to_string())
+        {
+            return Err(files_not_kept(&store, &payload.dest.display().to_string()));
+        }
     }
     faults::hit(ctx, FaultPoint::AfterFilesVerified)?;
     // Step 5: the vault goes.

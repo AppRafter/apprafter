@@ -8,11 +8,12 @@ use cli_core::target::{save_target_credentials, TargetCredentials};
 use cli_core::{CliError, LockPhase, StoreLock, VaultProblem};
 
 use super::on_tests::{
-    files_store, hetzner_of, lock, new_input, opened, seed, token_of, CancelAt, PASSWORD, PW, YAML,
+    files_store, hetzner_of, lock, new_input, opened, seed, token_of, CancelAt, Files, PASSWORD,
+    PW, YAML,
 };
 use super::*;
 use crate::secrets::marker::{classify, write_marker, Marker};
-use crate::secrets::{read_store_file, SecretsMode};
+use crate::secrets::{read_store_file, LockSlotKind, SecretsMode};
 use crate::target::testkit::{TOKEN_A, TOKEN_B};
 use crate::vault::{KdfPolicy, SlotInput, VAULT_FILE};
 use crate::{
@@ -416,7 +417,10 @@ fn lock_off_seals_the_caches_to_the_key_this_context_names() {
         && c.action == ChangeAction::Create));
     let done = unlock(&elsewhere, PASSWORD);
     assert!(done.age_key_created);
-    assert_eq!(done.age_key, elsewhere.age_key_path().display().to_string());
+    assert_eq!(
+        done.age_key,
+        Some(elsewhere.age_key_path().display().to_string())
+    );
     assert_files_whole(&elsewhere);
     assert_eq!(std::fs::read(f.ctx.age_key_path()).unwrap(), first);
     let prod = hetzner_of(&f.ctx, "prod");
@@ -691,4 +695,219 @@ fn a_back_out_with_a_marker_and_no_vault_stops() {
         SecretsMode::Locking,
         "nothing written"
     );
+}
+
+/// A store in files with two targets' tokens (`prod` TOKEN_A, `staging` TOKEN_B) and no cache
+/// at all: no state file. The context runs the flows under the fast policy.
+fn bare_store() -> Files {
+    let (dir, ctx) = crate::target::testkit::store(&["prod", "staging"], Some("prod"));
+    let ctx = ctx
+        .with_kdf_policy(&KdfPolicy::INSECURE_FAST)
+        .with_insecure_kdf_root(dir.path().to_path_buf());
+    save_target_credentials(
+        &ctx.store(),
+        "staging",
+        &TargetCredentials {
+            hetzner_token: Some(TOKEN_B.into()),
+        },
+    )
+    .unwrap();
+    Files { dir, ctx }
+}
+
+/// What no AppRafter parses as an age key: a flow that reads the file fails on it, so a
+/// round trip that leaves it in place and succeeds read nothing (a read-counter the CLI's
+/// flows cannot get past).
+const NOT_A_KEY: &[u8] = b"not an age key\n";
+
+fn plant_unreadable_key(ctx: &Context) {
+    let path = ctx.age_key_path();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, NOT_A_KEY).unwrap();
+}
+
+/// D.4a f Task 3 (d4a-h's critic, blocker 1): a store with no cache moves none, so `lock on`
+/// and `lock off` neither create nor read the shared age key, and neither plan names it:
+/// absent, it stays absent; unreadable, it is never read.
+#[test]
+fn a_store_with_no_cache_never_reads_or_creates_the_shared_key() {
+    let f = bare_store();
+    assert!(!f.ctx.age_key_path().exists());
+    let plan = plan_on(&f.ctx, None).unwrap();
+    assert!(plan.payload.keys().is_empty(), "{:?}", plan.payload.keys());
+    assert!(
+        plan.changes
+            .iter()
+            .all(|c| !c.detail.as_deref().unwrap_or("").contains("age.key")),
+        "{:?}",
+        plan.changes
+    );
+    lock(&f.ctx);
+    assert!(
+        !f.ctx.age_key_path().exists(),
+        "lock on created the shared key"
+    );
+    let plan = plan_off(&f.ctx).unwrap();
+    assert!(!plan.payload.needs_key());
+    assert!(
+        plan.changes.iter().all(|c| c.kind != "AgeKey"),
+        "{:?}",
+        plan.changes
+    );
+    let done = unlock(&f.ctx, PASSWORD);
+    assert!(
+        !f.ctx.age_key_path().exists(),
+        "lock off created the shared key"
+    );
+    assert_eq!(
+        (done.age_key.as_deref(), done.age_key_created),
+        (None, false)
+    );
+    assert_eq!(
+        done.tokens_restored,
+        vec!["prod".to_string(), "staging".to_string()]
+    );
+    // Unreadable: every read of it would fail the flow.
+    let f = bare_store();
+    plant_unreadable_key(&f.ctx);
+    lock(&f.ctx);
+    unlock(&f.ctx, PASSWORD);
+    assert_eq!(std::fs::read(f.ctx.age_key_path()).unwrap(), NOT_A_KEY);
+    assert_eq!(f.ctx.secrets().mode().unwrap(), SecretsMode::Files);
+}
+
+/// D.4a f Task 3, rule 4: on a store with no cache, no interruption of `lock on` or of
+/// `lock off`, and no run that backs the one out or finishes the other, reads or creates the
+/// shared key; every token is where a whole run leaves it.
+#[test]
+fn no_interrupted_run_of_a_store_with_no_cache_touches_the_shared_key() {
+    for at in [
+        FaultPoint::AfterStoreFileLocking,
+        FaultPoint::AfterVaultWritten,
+        FaultPoint::AfterVaultVerified,
+        FaultPoint::AfterMarkerTarget(0),
+    ] {
+        let f = bare_store();
+        plant_unreadable_key(&f.ctx);
+        let plan = plan_on(&f.ctx, None).unwrap();
+        let (input, shown) = new_input();
+        execute_on(
+            &f.ctx.clone().with_fault(at),
+            plan,
+            input,
+            &NullReporter,
+            &CancellationToken::new(),
+        )
+        .unwrap_err();
+        let done = unlock(&f.ctx, &shown);
+        assert!(done.backed_out, "{at:?}");
+        assert_eq!(
+            std::fs::read(f.ctx.age_key_path()).unwrap(),
+            NOT_A_KEY,
+            "{at:?}"
+        );
+    }
+    for at in [
+        FaultPoint::AfterStoreFileUnlocking,
+        FaultPoint::AfterSharedKey,
+        FaultPoint::AfterFilesTarget(0),
+        FaultPoint::AfterFilesVerified,
+        FaultPoint::AfterVaultDeleted,
+    ] {
+        let f = bare_store();
+        lock(&f.ctx);
+        let plan = plan_off(&f.ctx).unwrap();
+        let opened = open_with(&f.ctx, PASSWORD);
+        execute_off(
+            &f.ctx.clone().with_fault(at),
+            plan,
+            Some(opened),
+            &NullReporter,
+            &CancellationToken::new(),
+        )
+        .unwrap_err();
+        unlock(&f.ctx, PASSWORD);
+        assert!(
+            !f.ctx.age_key_path().exists(),
+            "{at:?}: the shared key was created"
+        );
+        for (target, token) in [("prod", TOKEN_A), ("staging", TOKEN_B)] {
+            assert_eq!(
+                f.ctx
+                    .secrets()
+                    .stored_token(target)
+                    .unwrap()
+                    .unwrap()
+                    .expose(),
+                token,
+                "{at:?}"
+            );
+        }
+    }
+}
+
+/// D.4a f Task 3: a resume of `lock on` reads the shared key only for a cache still sealed to
+/// it. Interrupted once every cache was re-sealed to the store's key, it finishes with the
+/// shared key unreadable — it never reads it; interrupted before, it still needs it (and
+/// reads it: the unreadable file stops it, nothing lost).
+#[test]
+fn a_resume_reads_the_shared_key_only_for_a_cache_still_sealed_to_it() {
+    for (at, reads) in [
+        (FaultPoint::AfterCachesTarget(0), true),
+        (FaultPoint::AfterCachesTarget(1), false),
+        (FaultPoint::AfterMarkerTarget(0), false),
+    ] {
+        let f = files_store();
+        let plan = plan_on(&f.ctx, None).unwrap();
+        let (input, shown) = new_input();
+        execute_on(
+            &f.ctx.clone().with_fault(at),
+            plan,
+            input,
+            &NullReporter,
+            &CancellationToken::new(),
+        )
+        .unwrap_err();
+        std::fs::write(f.ctx.age_key_path(), NOT_A_KEY).unwrap();
+        let plan = plan_on(&f.ctx, None).unwrap();
+        let LockOnStart::Resume { id } = plan.payload.start().clone() else {
+            panic!("{at:?}: {:?}", plan.payload.start())
+        };
+        let slot = |kind, secret: &str| {
+            open_slot_at(
+                f.ctx.config_root(),
+                &id,
+                kind,
+                SecretString::new(secret),
+                &KdfPolicy::INSECURE_FAST,
+            )
+            .unwrap()
+        };
+        let run = execute_on(
+            &f.ctx,
+            plan,
+            LockOnInput::Resume {
+                password: slot(LockSlotKind::Password, PASSWORD),
+                recovery: slot(LockSlotKind::RecoveryKey, shown.as_str()),
+            },
+            &NullReporter,
+            &CancellationToken::new(),
+        );
+        assert_eq!(run.is_err(), reads, "{at:?}: {run:?}");
+        assert_eq!(
+            std::fs::read(f.ctx.age_key_path()).unwrap(),
+            NOT_A_KEY,
+            "{at:?}"
+        );
+        let mode = f.ctx.secrets().mode().unwrap();
+        assert_eq!(
+            mode,
+            if reads {
+                SecretsMode::Locking
+            } else {
+                SecretsMode::Locked
+            },
+            "{at:?}"
+        );
+    }
 }

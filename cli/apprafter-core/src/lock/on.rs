@@ -24,6 +24,9 @@
 //! Readers in between refuse (`lock_incomplete`). A cache no key of this run opens is dropped
 //! when the plan listed it; one that stops opening after the plan is left, and a read later
 //! says `cache_undecryptable` and names the refresh.
+//!
+//! The shared age key is read only when a cache sealed to it may exist (D.4a f Task 3): a
+//! store with no cache reads none, and its plan names none.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -111,7 +114,8 @@ impl LockOnPayload {
     }
 
     /// The shared age key the caches are read with: `APPRAFTER_AGE_KEY`, else the default —
-    /// one path (critic finding 3), a list so the plan can say there is none.
+    /// one path (critic finding 3), a list so the plan can say there is none: none when no
+    /// target has a cache sealed to a key (D.4a f Task 3), or no home.
     pub fn keys(&self) -> &[PathBuf] {
         &self.keys
     }
@@ -269,6 +273,36 @@ fn shared_key_paths(ctx: &Context) -> Vec<PathBuf> {
     }
 }
 
+/// Whether any of `targets` has a sealed cache — a kubeconfig or Argo CD password encrypted to
+/// some key — which a lock flow moves between keys (D.4a f Task 3). A plaintext kubeconfig
+/// needs no key to be read. Read from each target's state; no key is read.
+pub(super) fn sealed_cache_in(store: &TargetStorePaths, targets: &[String]) -> CoreResult<bool> {
+    for target in targets {
+        let state = State::load_or_default(&StatePaths::for_active_target(store, target))?;
+        if state
+            .hetzner_cloud
+            .is_some_and(|h| h.kubeconfig_age.is_some() || h.argocd_admin_password_age.is_some())
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The shared key paths a run of `lock on` may read (D.4a f Task 3): none when no target has a
+/// sealed cache — a store with no cache reads no shared key, and its plan names none.
+fn keys_for_caches(
+    ctx: &Context,
+    store: &TargetStorePaths,
+    targets: &[String],
+) -> CoreResult<Vec<PathBuf>> {
+    Ok(if sealed_cache_in(store, targets)? {
+        shared_key_paths(ctx)
+    } else {
+        Vec::new()
+    })
+}
+
 fn listed(keys: &[PathBuf]) -> String {
     keys.iter()
         .map(|k| k.display().to_string())
@@ -286,16 +320,15 @@ pub(super) fn refresh(secret: CachedSecret, target: &str) -> String {
 }
 
 /// The plan of `lock on` (Bounded, T36): read-only — `store.yaml`, every target's
-/// credentials and state, the shared keys (never created) — refusing a record it cannot read,
-/// which may hold the only copy of a secret. Under a weak KDF policy outside its roots it is
-/// `insecure_kdf_refused` before anything is asked (T23).
+/// credentials and state, the shared keys when a target has a sealed cache (never created) —
+/// refusing a record it cannot read, which may hold the only copy of a secret. Under a weak KDF
+/// policy outside its roots it is `insecure_kdf_refused` before anything is asked (T23).
 pub fn plan_on(ctx: &Context, timeout_min: Option<u32>) -> CoreResult<Plan<LockOnPayload>> {
     super::permit(ctx)?;
     let timeout = timeout_min.unwrap_or(DEFAULT_UNLOCK_TIMEOUT_MIN);
     super::check_timeout(timeout)?;
     let store = ctx.store();
     let root = ctx.config_root();
-    let keys = shared_key_paths(ctx);
     let file = read_store_file(root)?;
     let targets = cli_core::list_target_names(&store)?;
     match file.map(|f| (f.secrets, f.id)) {
@@ -304,7 +337,7 @@ pub fn plan_on(ctx: &Context, timeout_min: Option<u32>) -> CoreResult<Plan<LockO
             format!("The target store at {} is already locked", root.display()),
             Vec::new(),
             timeout,
-            keys,
+            Vec::new(),
             Vec::new(),
         )),
         Some((SecretsMode::Unlocking, _)) => Err(CoreError::Cli(CliError::LockIncomplete {
@@ -337,6 +370,7 @@ pub fn plan_on(ctx: &Context, timeout_min: Option<u32>) -> CoreResult<Plan<LockO
                 "written by the earlier run; opened with the lock password and with the \
                  recovery key before anything leaves the files",
             ));
+            let keys = keys_for_caches(ctx, &store, &targets)?;
             Ok(plan(
                 LockOnStart::Resume { id },
                 title("Finish locking the secrets of", root, &targets),
@@ -348,6 +382,7 @@ pub fn plan_on(ctx: &Context, timeout_min: Option<u32>) -> CoreResult<Plan<LockO
         }
         mode => {
             let restart = matches!(mode, Some((SecretsMode::Locking, _)));
+            let keys = keys_for_caches(ctx, &store, &targets)?;
             let (changes, drops) = survey(&store, root, &targets, &keys)?;
             Ok(plan(
                 LockOnStart::New { restart },
@@ -442,15 +477,16 @@ fn survey(
             ));
         }
     }
-    changes.push(change(
-        "AgeKey",
-        "this store",
-        ChangeAction::Create,
-        &format!(
+    // D.4a f Task 3: the shared key this run reads is named; with no cache, none is.
+    let own = if keys.is_empty() {
+        "its own, in the vault".to_string()
+    } else {
+        format!(
             "its own, in the vault ({} stays, for other target stores)",
             listed(keys)
-        ),
-    ));
+        )
+    };
+    changes.push(change("AgeKey", "this store", ChangeAction::Create, &own));
     changes.push(change(
         "Vault",
         &vault_path(root).display().to_string(),
@@ -807,7 +843,9 @@ fn finish(
     done: &mut LockedOn,
 ) -> CoreResult<()> {
     stage(reporter, 3, "Re-encrypting cached secrets");
-    let old = transfer::shared_identities(&payload.keys)?;
+    // D.4a f Task 3: the shared key is read when the first cache the store's key does not
+    // open is met — never when every cache is the store's already (a resume), or none is.
+    let old = transfer::SharedKeys::at(&payload.keys);
     let targets = cli_core::list_target_names(run.store)?;
     for (n, target) in targets.iter().enumerate() {
         reseal(run.store, target, key, &old, &payload.drops, resume, done)?;
@@ -844,7 +882,7 @@ fn reseal(
     store: &TargetStorePaths,
     target: &str,
     key: &CacheKey,
-    old: &[Identity],
+    old: &transfer::SharedKeys<'_>,
     agreed: &[CacheDrop],
     resume: bool,
     done: &mut LockedOn,
@@ -867,7 +905,7 @@ fn reseal(
         if transfer::opens(key, secret, &armored).is_some() {
             continue;
         }
-        match transfer::open_with_any(&armored, old) {
+        match transfer::open_with_any(&armored, old.get()?) {
             Some(plain) => {
                 *slot = Some(sealed_and_checked(store, key, secret, target, &plain)?);
                 changed = true;
