@@ -25,8 +25,8 @@ use apprafter_core::target::{TargetListReport, TargetReport};
 use apprafter_core::tools::ToolchainReport;
 use apprafter_core::{SecretString, UiError};
 use apprafter_desktop_ipc::{
-    AppInfo, CatalogueSourceArg, DraftId, LockState, OpEvent, OpId, OpSummary, PlanView, Settings,
-    Subscribed, SubscriptionId, TargetAddArgs, Theme,
+    AppInfo, CatalogueSourceArg, DraftId, LockOffPlan, LockOnPlan, LockSectionInfo, LockState,
+    OpEvent, OpId, OpSummary, PlanView, Settings, Subscribed, SubscriptionId, TargetAddArgs, Theme,
 };
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Runtime, State, Webview, WebviewWindow};
@@ -35,7 +35,7 @@ use zeroize::Zeroizing;
 use crate::app::{self, Shell};
 use crate::errors::{DesktopError, Refusal};
 use crate::ops::{panic_message, EventSink};
-use crate::{target_ops, window};
+use crate::{lock_ops, target_ops, window};
 
 type ShellState<'a> = State<'a, Arc<Shell>>;
 
@@ -458,6 +458,89 @@ pub async fn target_draft_discard(shell: ShellState<'_>, draft_id: DraftId) -> R
         target_ops::draft_discard(shell, draft_id)
     })
     .await
+}
+
+// D.4a: Settings › Lock (overview §3.14). Each on the blocking pool: a key derivation (about
+// 0.7 s, 256 MiB) and the limit rows' 2 s agent ask never run on the main thread. Every secret
+// is moved into a `SecretString` on the command's first line.
+
+/// Where the store keeps its secrets, its slots and this computer's limits, and the app's own
+/// protections; the store is re-read first.
+#[tauri::command]
+pub async fn lock_info(shell: ShellState<'_>) -> Result<LockSectionInfo, UiError> {
+    on_shell(&shell, |shell| lock_ops::lock_info(shell)).await
+}
+
+/// Plan Protect (Bounded): the lock password checked (only empty, too long or shaped like a
+/// recovery key refuse), a new recovery key made; both stay in Rust, the key shown once.
+#[tauri::command]
+pub async fn op_plan_lock_on(
+    shell: ShellState<'_>,
+    password: String,
+    timeout_minutes: Option<u32>,
+) -> Result<LockOnPlan, UiError> {
+    let password = SecretString::from(Zeroizing::new(password));
+    on_shell(&shell, move |shell| {
+        lock_ops::plan_lock_on(shell, password, timeout_minutes)
+    })
+    .await
+}
+
+/// The recovery key typed back in full for plan `op_id` (T25): compared in Rust.
+#[tauri::command]
+pub async fn op_confirm_recovery_key(
+    shell: ShellState<'_>,
+    op_id: OpId,
+    typed: String,
+) -> Result<(), UiError> {
+    let typed = SecretString::from(Zeroizing::new(typed));
+    on_shell(&shell, move |shell| {
+        lock_ops::confirm_recovery_key(shell, op_id, typed)
+    })
+    .await
+}
+
+/// Copy plan `op_id`'s recovery key from Rust (O12), marked to stay out of clipboard history;
+/// cleared after 60 s and on every lock and the quit. Refused once the key is saved.
+#[tauri::command]
+pub async fn copy_recovery_key(shell: ShellState<'_>, op_id: OpId) -> Result<(), UiError> {
+    on_shell(&shell, move |shell| {
+        lock_ops::copy_recovery_key(shell, op_id)
+    })
+    .await
+}
+
+/// "I saved it" for plan `op_id` (O12): Rust takes its copy of the recovery key off the
+/// clipboard, if it is still there, and copies the key no more.
+#[tauri::command]
+pub async fn op_recovery_key_saved(shell: ShellState<'_>, op_id: OpId) -> Result<(), UiError> {
+    on_shell(&shell, move |shell| {
+        lock_ops::recovery_key_saved(shell, op_id)
+    })
+    .await
+}
+
+/// Plan finishing an interrupted Protect (Bounded): the lock password and the recovery key each
+/// open their own slot first (rule 4).
+#[tauri::command]
+pub async fn op_plan_lock_finish(
+    shell: ShellState<'_>,
+    password: String,
+    recovery: String,
+) -> Result<PlanView, UiError> {
+    let password = SecretString::from(Zeroizing::new(password));
+    let recovery = SecretString::from(Zeroizing::new(recovery));
+    on_shell(&shell, move |shell| {
+        lock_ops::plan_lock_finish(shell, password, recovery)
+    })
+    .await
+}
+
+/// Plan Stop protecting (Destructive): its gesture is the store's secret when a vault must
+/// open (O11), given to `op_execute` as `password`.
+#[tauri::command]
+pub async fn op_plan_lock_off(shell: ShellState<'_>) -> Result<LockOffPlan, UiError> {
+    on_shell(&shell, lock_ops::plan_lock_off).await
 }
 
 #[cfg(test)]

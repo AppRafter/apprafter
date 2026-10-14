@@ -8,6 +8,9 @@ import type { CatalogueSourceArg } from './generated/CatalogueSourceArg';
 import type { COMMANDS } from './generated/commands';
 import type { DraftId } from './generated/DraftId';
 import { DESKTOP_ERROR_CODES } from './generated/errors';
+import type { LockOffPlan } from './generated/LockOffPlan';
+import type { LockOnPlan } from './generated/LockOnPlan';
+import type { LockSectionInfo } from './generated/LockSectionInfo';
 import type { LockState } from './generated/LockState';
 import type { OpEvent } from './generated/OpEvent';
 import type { OpId } from './generated/OpId';
@@ -64,6 +67,14 @@ export const API_COMMANDS = [
   'op_plan_target_remove',
   'op_plan_target_machine',
   'target_draft_discard',
+  // D.4a: Settings › Lock.
+  'lock_info',
+  'op_plan_lock_on',
+  'op_confirm_recovery_key',
+  'copy_recovery_key',
+  'op_recovery_key_saved',
+  'op_plan_lock_finish',
+  'op_plan_lock_off',
 ] as const satisfies readonly (typeof COMMANDS)[number][];
 
 export type ApiCommand = (typeof API_COMMANDS)[number];
@@ -246,3 +257,27 @@ export const opPlanTargetMachine = (name: string, sku: string, region: string | 
 /** The add wizard closed: its draft goes. An unknown draft is no error. */
 export const targetDraftDiscard = (draftId: DraftId) =>
   call<void>('target_draft_discard', { draftId });
+
+// D.4a: Settings › Lock. Every secret goes to Rust as a command argument and is never kept here;
+// the recovery key comes back once, in `LockOnPlan`, for the Protect dialog to show.
+
+/** Where the store keeps its secrets, its slots, this computer's limits and the app's protections. */
+export const lockInfo = () => call<LockSectionInfo>('lock_info');
+/** Plan Protect: the lock password checked in Rust, a new recovery key shown once. */
+export const opPlanLockOn = (password: string, timeoutMinutes: number | null) =>
+  call<LockOnPlan>('op_plan_lock_on', { password, timeoutMinutes });
+/** The recovery key typed back in full, compared in Rust; the plan runs only once it matches. */
+export const opConfirmRecoveryKey = (opId: OpId, typed: string) =>
+  call<void>('op_confirm_recovery_key', { opId, typed });
+/** Rust copies the plan's recovery key, marked to stay out of clipboard history, and clears it after 60 s. */
+export const copyRecoveryKey = (opId: OpId) => call<void>('copy_recovery_key', { opId });
+/** "I saved it": Rust takes the key off the clipboard, copies it no more, and only now takes it typed back. */
+export const opRecoveryKeySaved = (opId: OpId) => call<void>('op_recovery_key_saved', { opId });
+/** Plan finishing an interrupted Protect: both secrets open their slots first. */
+export const opPlanLockFinish = (password: string, recovery: string) =>
+  call<PlanView>('op_plan_lock_finish', { password, recovery });
+/**
+ * Plan Stop protecting: destructive; its gesture is the store's secret (`opExecute`'s password);
+ * `needsKey` whether it uses the shared age key (only for a cache).
+ */
+export const opPlanLockOff = () => call<LockOffPlan>('op_plan_lock_off');

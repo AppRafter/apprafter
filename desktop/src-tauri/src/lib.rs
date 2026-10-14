@@ -10,10 +10,12 @@ pub mod env;
 pub mod errors;
 pub mod harden;
 pub mod lock;
+pub mod lock_ops;
 pub mod menu;
 pub mod ops;
 pub mod protection;
 pub mod runtime;
+pub mod secret_clip;
 pub mod settings;
 pub mod signals;
 pub mod single_instance;
@@ -181,6 +183,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         env.test_build(),
         app::ShellExtras {
             hardening: hardened.hardening,
+            clipboard: Some(secret_clip::SystemClipboard::maker()),
+            ..app::ShellExtras::default()
         },
         move |state| app::emit_lock_changed(&handle, state),
     );

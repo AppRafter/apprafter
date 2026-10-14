@@ -35,6 +35,12 @@ export interface MockOpsOptions {
    * the other way to ask), so a rejection leaves the plan waiting for another try.
    */
   readonly gesture: (password: string | undefined) => Promise<void>;
+  /**
+   * A plan whose gesture is the target store's secret (D.4a T76): resolves when `password` opens
+   * the store, rejects as op_execute would — no field (`use_password_field`), a wrong secret, the
+   * back-off — and every refusal keeps the plan.
+   */
+  readonly storeSecret?: (password: string | undefined) => Promise<void>;
 }
 
 /** One mock command's answer; exported for `targets.ts` and D.3e's `flows.ts`, which return `Record<string, Handler>`. */
@@ -54,7 +60,12 @@ export interface MockOps {
    * plan that requires a gesture (`requires_gesture`, an approval); the mock's views carry no such input, so a mock
    * approval that is not destructive reads `none`.
    */
-  registerPlan(view: Omit<PlanView, 'opId' | 'expiresAtMs' | 'gesture'>, run: MockRun): PlanView;
+  registerPlan(
+    view: Omit<PlanView, 'opId' | 'expiresAtMs' | 'gesture'>,
+    run: MockRun,
+    /** `store_secret`: a destructive plan's gesture is the store's secret, as Rust registers it. */
+    gesture?: 'store_secret',
+  ): PlanView;
   startRead(title: string, target: string | null, run: MockRun): OpId;
   /** Rust's lock hook, on every lock and unlock. */
   transition(): void;
@@ -225,7 +236,11 @@ export function createMockOps(options: MockOpsOptions): MockOps {
     const prompt: Prompt = { plan, refused: false };
     prompts.set(opId, prompt);
     try {
-      await options.gesture(password);
+      const check =
+        plan.view.gesture === 'store_secret' && options.storeSecret !== undefined
+          ? options.storeSecret
+          : options.gesture;
+      await check(password);
     } catch (refusal) {
       prompts.delete(opId);
       if (!prompt.refused) {
@@ -254,7 +269,7 @@ export function createMockOps(options: MockOpsOptions): MockOps {
       fanOut(plan.sinks, { kind: 'failed', error: expired });
       throw expired;
     }
-    if (plan.view.class === 'destructive') await confirmed(plan, sink, password);
+    if (plan.view.gesture !== 'none') await confirmed(plan, sink, password);
     begin(opId, plan.view.title, plan.view.target, false, plan.sinks, plan.run);
     return sink.id;
   };
@@ -310,13 +325,18 @@ export function createMockOps(options: MockOpsOptions): MockOps {
       .sort((a, b) => b.startedAtMs - a.startedAtMs || b.opId - a.opId);
 
   return {
-    registerPlan(view, run) {
+    registerPlan(view, run, gesture) {
       nextOpId += 1;
       const full: PlanView = {
         ...view,
         opId: nextOpId,
         expiresAtMs: Date.now() + MOCK_PLAN_TTL_MS,
-        gesture: view.class === 'destructive' ? 'os' : 'none',
+        gesture:
+          view.class !== 'destructive'
+            ? 'none'
+            : gesture === 'store_secret'
+              ? 'store_secret'
+              : 'os',
       };
       plans.set(full.opId, { view: full, run, sinks: [] });
       return full;

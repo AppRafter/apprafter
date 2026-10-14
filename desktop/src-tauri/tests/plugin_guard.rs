@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Only the app builds a real plugin (GOTCHA-156). The plugins reach the owner's session — the
 //! clipboard plugin's setup connects to the display's clipboard, the opener starts a browser,
-//! the single-instance plugin claims a name on the session bus — and Tauri's mock runtime runs a
+//! the single-instance plugin claims a name on the session bus — and arboard, whose clipboard the
+//! recovery key's Copy builds (`src/secret_clip.rs`, D.4a T81) — and Tauri's mock runtime runs a
 //! plugin's setup like the app does. So outside the app's own code (`src/app.rs`, which builds
 //! them, `src/lib.rs`, which registers them, and `src/single_instance.rs`, which builds and
 //! registers the single-instance plugin behind its check of the session bus — their
@@ -32,13 +33,24 @@ use proc_macro2::{Delimiter, Spacing, TokenStream, TokenTree};
 
 /// The files that build or register the real plugins: the app. Only their test modules
 /// (`#[cfg(test)]`, `#[cfg(all(test, …))]`) are scanned.
-const APP: [&str; 3] = ["src/app.rs", "src/lib.rs", "src/single_instance.rs"];
+const APP: [&str; 4] = [
+    "src/app.rs",
+    "src/lib.rs",
+    "src/single_instance.rs",
+    // D.4a T81: the recovery key's Copy, which builds arboard's clipboard.
+    "src/secret_clip.rs",
+];
 
 /// The app's builders of a real plugin. For the single-instance plugin, the type whose
 /// `register` builds it: the method's name is too common to scan for (signals.rs's
 /// `low_level::register`, target_ops.rs's own), and a value to call it on is reached only
 /// through the type (`SingleInstance::for_this_launch`, `on_session_bus`, `On`).
-const BUILDERS: [&str; 3] = ["clipboard_plugin", "opener_plugin", "SingleInstance"];
+const BUILDERS: [&str; 4] = [
+    "clipboard_plugin",
+    "opener_plugin",
+    "SingleInstance",
+    "SystemClipboard",
+];
 
 /// Who may name a builder: the file, the function, the builder, and whether the function must
 /// start with `sealed();` (the probe's check that its process cannot reach the session).
@@ -189,8 +201,9 @@ fn walk(file: &str, within: Option<&Body>, tokens: TokenStream, out: &mut Vec<(u
                 }
                 let name = plain(ident);
                 let builder = BUILDERS.contains(&name.as_str()) && !allowed(file, within, &name);
-                let krate =
-                    name.starts_with("tauri_plugin_") && !names_a_handle(&name, &tokens[i + 1..]);
+                // D.4a T81: arboard reaches the owner's clipboard as the plugins do.
+                let krate = (name.starts_with("tauri_plugin_") || name == "arboard")
+                    && !names_a_handle(&name, &tokens[i + 1..]);
                 if builder || krate {
                     out.push((ident.span().start().line, name));
                 }
@@ -520,4 +533,18 @@ fn the_scan_finds_every_way_to_build_a_plugin_and_nothing_else() {
         single,
         "fn wiring_probe() { tauri_plugin_single_instance::init(|_, _, _| {}); }",
     );
+}
+
+/// D.4a T81: arboard reaches the owner's clipboard as the plugins do: only the app names it,
+/// and only the app builds `SystemClipboard`.
+#[test]
+fn arboard_is_the_app_s_alone() {
+    assert!(!hits("src/x.rs", "use arboard::Clipboard;").is_empty());
+    assert!(!hits("src/x.rs", "fn f() { let _ = SystemClipboard::maker(); }").is_empty());
+    assert!(hits("src/secret_clip.rs", "use arboard::Clipboard;\nfn f() {}").is_empty());
+    assert!(hits(
+        "src/lib.rs",
+        "fn run() { let _ = SystemClipboard::maker(); }"
+    )
+    .is_empty());
 }

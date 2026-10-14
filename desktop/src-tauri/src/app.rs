@@ -65,12 +65,16 @@
 
 use std::io;
 use std::panic::{self, AssertUnwindSafe};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-use apprafter_core::lock::HolderHardening;
+use apprafter_core::lock::limits::{
+    DisplayKind, LimitClient, SessionEvents as CoreSessionEvents, SshFacts,
+};
+use apprafter_core::lock::{HolderHardening, UnlockWindow};
 use apprafter_core::secrets::{VaultAccess, STORE_FILE};
 use apprafter_core::{Context, CoreError, SecretString};
 use apprafter_desktop_ipc::{
@@ -91,13 +95,15 @@ use crate::drafts::DraftStore;
 use crate::env::ToolSearchPath;
 use crate::errors::{DesktopError, Refusal};
 use crate::lock::{LockChange, LockHook, LockMachine};
+use crate::lock_ops::LockOnTable;
 use crate::ops::{
     panic_message, Clock, EventSink, Executor, OperationManager, PlanParts, SecretGesture,
 };
 use crate::protection::Protection;
+use crate::secret_clip::{ClipboardMaker, SecretClipboard};
 use crate::settings::SettingsStore;
 use crate::theme::Appearance;
-use crate::vault_access::{DesktopVaultAccess, OpenedSlot, StoreSecretGesture};
+use crate::vault_access::{DesktopVaultAccess, OpenedSlot, OsPager, Pager, StoreSecretGesture};
 
 /// How long a quit waits for cancelled operations to stop before it exits anyway: the CLI's
 /// helper-pod stop bound.
@@ -140,12 +146,26 @@ pub type SessionCallback = Box<dyn Fn(SessionEvent) + Send>;
 pub struct ShellExtras {
     /// What the process did to protect itself before any secret (D.4a T77, `harden`).
     pub hardening: HolderHardening,
+    /// The display the app's window is on, as GDK says on Linux (D.4a T72; `display`): what
+    /// the limit rows say of what other programs see of the app's keystrokes.
+    pub display: DisplayKind,
+    /// The ssh-agent the limit rows ask (D.4a O1; `env::ssh_agent`).
+    pub ssh_agent: Option<PathBuf>,
+    /// Opens the OS clipboard for the recovery key's Copy (D.4a O12; `secret_clip`); `None`:
+    /// no Copy here.
+    pub clipboard: Option<ClipboardMaker>,
+    /// Locks the held key's page in memory (D.4a T77; `vault_access`): the OS's, a test's.
+    pub pager: Arc<dyn Pager>,
 }
 
 impl Default for ShellExtras {
     fn default() -> Self {
         ShellExtras {
             hardening: crate::harden::not_applied(),
+            display: DisplayKind::None,
+            ssh_agent: None,
+            clipboard: None,
+            pager: Arc::new(OsPager),
         }
     }
 }
@@ -386,6 +406,10 @@ pub struct Shell {
     /// The store's key while the app holds it (D.4a T74, `vault_access`); the context's
     /// `VaultAccess` too.
     pub vault: Arc<DesktopVaultAccess>,
+    /// The new recovery keys of the Protect plans waiting to run (D.4a T25, `lock_ops`).
+    pub lock_ons: LockOnTable,
+    /// The recovery key's Copy (D.4a O12, `secret_clip`).
+    pub clipboard: Arc<SecretClipboard>,
     /// Lock flows of the app's own while they run ([`FlowGuard`]).
     flows: Arc<AtomicUsize>,
     /// Re-reads asked of [`Shell::recheck_later`] that its thread has not answered yet; 0
@@ -505,17 +529,25 @@ impl Shell {
         let ops = OperationManager::new(clock.clone());
         let drafts = Arc::new(DraftStore::new(clock.clone()));
         // D.4a T74: the key the app holds, behind the core's door to the secrets.
-        let vault = DesktopVaultAccess::new(clock.clone());
+        let vault = DesktopVaultAccess::with_pager(clock.clone(), extras.pager.clone());
+        let clipboard = SecretClipboard::new(extras.clipboard.clone(), clock.clone());
         let context = context.with_vault_access(vault.clone());
         let protection = Protection::read(context.config_root(), context.home_dir());
         let store_seen = Mutex::new(StoreStamp::read(context.config_root()));
         let hook: LockHook = {
-            let (ops, drafts, vault) = (ops.clone(), drafts.clone(), vault.clone());
+            let (ops, drafts, vault, clipboard) = (
+                ops.clone(),
+                drafts.clone(),
+                vault.clone(),
+                clipboard.clone(),
+            );
             Box::new(move |state: &LockState, change| {
                 if change == LockChange::Transition {
                     // Every lock drops the store's key, before the page hears of it.
                     if state.locked {
                         vault.forget();
+                        // The recovery key, if it is still on the clipboard (O12).
+                        clipboard.clear_soon();
                     }
                     ops.drop_all_plans();
                     ops.cancel_reads();
@@ -552,6 +584,8 @@ impl Shell {
             extras,
             store_seen,
             vault,
+            lock_ons: LockOnTable::default(),
+            clipboard,
             flows: Arc::default(),
             recheck_asks: AtomicUsize::new(0),
             rechecks: Mutex::new(()),
@@ -726,6 +760,43 @@ impl Shell {
             id,
             slot,
         )))
+    }
+
+    /// The app's unlock window (D.4a T73): `App` while it holds the protected store's key,
+    /// else `Closed`.
+    pub fn window(&self, now: &Protection) -> UnlockWindow {
+        let held = now.id.as_ref().is_some_and(|id| self.vault.holds(id));
+        if now.protected && held {
+            UnlockWindow::App
+        } else {
+            UnlockWindow::Closed
+        }
+    }
+
+    /// What the lock's limit rows are told of this app (D.4a T72, T73), made later — on a
+    /// read's own thread: the session watch's answer may wait. The fetch key is the default
+    /// `~/.ssh/id_ed25519` (the desktop reads no `APPRAFTER_SSH_PRIVATE_KEY`, ADR 0067 §2).
+    pub fn limit_client_later(&self) -> impl FnOnce() -> LimitClient + Send + 'static {
+        let events = self.session_events_later();
+        let display = self.extras.display;
+        let ssh = SshFacts {
+            key: self
+                .context
+                .home_dir()
+                .map(|home| home.join(".ssh").join("id_ed25519")),
+            agent: self.extras.ssh_agent.clone(),
+        };
+        move || {
+            let events = events();
+            LimitClient::Desktop {
+                session_events: CoreSessionEvents {
+                    lock: events.lock,
+                    sleep: events.sleep,
+                },
+                display,
+                ssh,
+            }
+        }
     }
 
     /// The idle tick's look at the store (critic B finding 19): when `store.yaml` changed
@@ -916,6 +987,8 @@ impl Shell {
         self.drafts.drop_all();
         // D.4a T74: the quit drops the store's key too.
         self.vault.forget();
+        // The recovery key off the clipboard, never waited for here (the main thread).
+        self.clipboard.clear_soon();
         true
     }
 
@@ -983,6 +1056,10 @@ impl Shell {
                 );
             }
         }
+        // The recovery key off the clipboard: on Windows and macOS it would outlive the
+        // process. On a thread of its own, waited for at most its bound.
+        self.clipboard
+            .clear_within(crate::secret_clip::CLEAR_ON_QUIT);
         self.stop_session_watch();
         self.stop_tickers();
     }
@@ -1055,6 +1132,13 @@ pub fn builder<R: Runtime>(base: tauri::Builder<R>, cell: ShellCell) -> tauri::B
         commands::op_plan_target_remove,
         commands::op_plan_target_machine,
         commands::target_draft_discard,
+        commands::lock_info,
+        commands::op_plan_lock_on,
+        commands::op_confirm_recovery_key,
+        commands::copy_recovery_key,
+        commands::op_recovery_key_saved,
+        commands::op_plan_lock_finish,
+        commands::op_plan_lock_off,
     ]);
     let gate = cell.clone();
     let focus = cell.clone();
@@ -1189,6 +1273,10 @@ fn drain_and_exit<R: Runtime>(app: &AppHandle<R>, shell: &Shell) {
     }
     // On this thread, which holds nothing the watch's callback takes.
     shell.stop_session_watch();
+    // The recovery key off the clipboard before the exit, waited for at most its bound.
+    shell
+        .clipboard
+        .clear_within(crate::secret_clip::CLEAR_ON_QUIT);
     shell.drained.store(true, SeqCst);
     app.exit(0);
 }
@@ -1290,6 +1378,8 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
+    use apprafter_core::lock::limits::{DisplayKind, LimitClient};
+    use apprafter_core::lock::UnlockWindow;
     use apprafter_core::secrets::testing::{locked_store, LockedTestStore};
     use apprafter_core::secrets::VaultRequest;
     use apprafter_core::vault::VAULT_FILE;
@@ -2881,5 +2971,96 @@ mod tests {
             Box::new(|_, _| Ok(Outcome::Completed { result: json!(0) })),
         );
         assert_eq!(view.gesture, apprafter_desktop_ipc::Gesture::Os);
+    }
+
+    /// D.4a T72, T73: the app's facts reach the limit rows as given; its window is `App` only
+    /// while it holds the protected store's key.
+    #[test]
+    fn the_limit_client_carries_the_app_s_facts_and_the_window_follows_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = Arc::new(ManualClock::at(T0));
+        let ctx = Context::for_desktop(dir.path().join("store"), "http://127.0.0.1:9")
+            .with_home_dir(Some(dir.path().to_path_buf()));
+        let shell = Shell::new_with(
+            SettingsStore::load(dir.path(), &*clock),
+            Arc::new(NoAuthenticator),
+            clock,
+            ctx,
+            ToolSearchPath::known(Default::default(), PathSource::Explicit),
+            false,
+            super::ShellExtras {
+                display: DisplayKind::X11,
+                ssh_agent: Some("/tmp/agent.sock".into()),
+                ..super::ShellExtras::default()
+            },
+            |_| {},
+        );
+        let LimitClient::Desktop { display, ssh, .. } = shell.limit_client_later()() else {
+            panic!("not the desktop's client")
+        };
+        assert_eq!(display, DisplayKind::X11);
+        assert_eq!(ssh.key, Some(dir.path().join(".ssh").join("id_ed25519")));
+        assert_eq!(ssh.agent, Some(std::path::PathBuf::from("/tmp/agent.sock")));
+        let now = shell.recheck();
+        assert_eq!(shell.window(&now), UnlockWindow::Closed);
+    }
+
+    /// D.4a O12: a lock clears the recovery key from the clipboard before its 60 s.
+    #[test]
+    fn a_lock_clears_the_recovery_key_from_the_clipboard() {
+        let board = Arc::new(Mutex::new(None::<String>));
+        struct Board(Arc<Mutex<Option<String>>>);
+        impl crate::secret_clip::ClipboardBackend for Board {
+            fn set_concealed(&mut self, text: &str) -> Result<(), String> {
+                *self.0.lock().unwrap() = Some(text.into());
+                Ok(())
+            }
+            fn text(&mut self) -> Result<Option<Zeroizing<String>>, String> {
+                Ok(self.0.lock().unwrap().clone().map(Zeroizing::new))
+            }
+            fn clear(&mut self) -> Result<(), String> {
+                *self.0.lock().unwrap() = None;
+                Ok(())
+            }
+        }
+        let maker: crate::secret_clip::ClipboardMaker = {
+            let board = board.clone();
+            Arc::new(move || {
+                Ok(Box::new(Board(board.clone())) as Box<dyn crate::secret_clip::ClipboardBackend>)
+            })
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let clock = Arc::new(ManualClock::at(T0));
+        let store = SettingsStore::load(dir.path(), &*clock);
+        store.set(unlocked_at_start()).unwrap();
+        let shell = Shell::new_with(
+            store,
+            Arc::new(FakeAuthenticator::new()),
+            clock,
+            Context::for_desktop(dir.path().join("store"), "http://127.0.0.1:9"),
+            ToolSearchPath::known(Default::default(), PathSource::Explicit),
+            false,
+            super::ShellExtras {
+                clipboard: Some(maker),
+                ..super::ShellExtras::default()
+            },
+            |_| {},
+        );
+        assert!(shell.auth.settled(LONG));
+        shell
+            .clipboard
+            .copy(&SecretString::new("APPRAFTER-RECOVERY-KEY-1\nQQQSY"))
+            .unwrap();
+        assert!(board.lock().unwrap().is_some());
+        assert!(shell.lock_now().locked);
+        let deadline = Instant::now() + LONG;
+        while board.lock().unwrap().is_some() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            *board.lock().unwrap(),
+            None,
+            "the lock left the key on the clipboard"
+        );
     }
 }

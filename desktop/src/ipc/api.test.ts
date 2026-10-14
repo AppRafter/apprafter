@@ -144,6 +144,25 @@ describe('each function sends its command with camelCase arguments', () => {
       { name: 'lab', sku: 'cx32', region: null },
     ],
     targetDraftDiscard: [() => api.targetDraftDiscard(3), 'target_draft_discard', { draftId: 3 }],
+    lockInfo: [() => api.lockInfo(), 'lock_info', {}],
+    opPlanLockOn: [
+      () => api.opPlanLockOn('a lock password', null),
+      'op_plan_lock_on',
+      { password: 'a lock password', timeoutMinutes: null },
+    ],
+    opConfirmRecoveryKey: [
+      () => api.opConfirmRecoveryKey(7, 'typed'),
+      'op_confirm_recovery_key',
+      { opId: 7, typed: 'typed' },
+    ],
+    copyRecoveryKey: [() => api.copyRecoveryKey(7), 'copy_recovery_key', { opId: 7 }],
+    opRecoveryKeySaved: [() => api.opRecoveryKeySaved(7), 'op_recovery_key_saved', { opId: 7 }],
+    opPlanLockFinish: [
+      () => api.opPlanLockFinish('a lock password', 'a key'),
+      'op_plan_lock_finish',
+      { password: 'a lock password', recovery: 'a key' },
+    ],
+    opPlanLockOff: [() => api.opPlanLockOff(), 'op_plan_lock_off', {}],
   });
 
   test('every exported function is covered, and together they call every command', async () => {

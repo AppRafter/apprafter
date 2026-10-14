@@ -78,6 +78,13 @@ function callEach(): Record<(typeof COMMANDS)[number], () => Promise<unknown>> {
     op_plan_target_remove: () => api.opPlanTargetRemove('prod-eu'),
     op_plan_target_machine: () => api.opPlanTargetMachine('lab', 'cx32', null),
     target_draft_discard: () => api.targetDraftDiscard(3),
+    lock_info: () => api.lockInfo(),
+    op_plan_lock_on: () => api.opPlanLockOn('a lock password', null),
+    op_confirm_recovery_key: () => api.opConfirmRecoveryKey(1, 'typed'),
+    copy_recovery_key: () => api.copyRecoveryKey(1),
+    op_recovery_key_saved: () => api.opRecoveryKeySaved(1),
+    op_plan_lock_finish: () => api.opPlanLockFinish('a lock password', 'a key'),
+    op_plan_lock_off: () => api.opPlanLockOff(),
   };
 }
 
@@ -117,6 +124,8 @@ describe('installMockIpc', () => {
         'answered',
         DESKTOP_ERROR_CODES.PLAN_NOT_FOUND,
         DESKTOP_ERROR_CODES.DRAFT_NOT_FOUND,
+        // A Finish where nothing was interrupted: Rust's usage words, with no listed code.
+        null,
       ];
       expect(fine, name).toContain(await outcome(call));
     }

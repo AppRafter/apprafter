@@ -60,6 +60,11 @@ tauri                 = { workspace = true }
 tauri-plugin-opener   = "~2.7"
 # Copy report and the toolchain's Copy buttons: write text only (the capability grants nothing else).
 tauri-plugin-clipboard-manager = "~2.4"
+# The recovery key's Copy (D.4a O12, T81): Rust copies the key, marked to stay out of clipboard
+# history, and clears it. The version the clipboard plugin already links (desktop/Cargo.lock),
+# so no package is new; text only (no `image-data`), with Wayland's data-control protocol as the
+# plugin takes it. Only the app builds it (tests/plugin_guard.rs).
+arboard = { version = "~3.6", default-features = false, features = ["wayland-data-control"] }
 # A second launch focuses the first window instead of starting another app.
 tauri-plugin-single-instance = "~2.5"
 thiserror             = "2"
@@ -103,6 +108,14 @@ async-io = "2"
 # Tauri's own crates already pull in (desktop/Cargo.lock), so no package is new.
 # SystemInformation and WindowsProgramming: O4's clock pair (`ops/mod.rs`, Task 14).
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Diagnostics_Debug", "Win32_System_Memory", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_System_WindowsProgramming"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# The recovery key's Copy on macOS (D.4a O12, T81; ADR 0068 §3): the general pasteboard written
+# for this Mac only, so Universal Clipboard (Handoff) does not carry the key, and marked
+# concealed for clipboard history apps (src/secret_clip.rs). The versions arboard already links
+# (desktop/Cargo.lock), so no package is new.
+objc2-app-kit    = { version = "~0.3", default-features = false, features = ["std", "NSPasteboard"] }
+objc2-foundation = { version = "~0.3", default-features = false, features = ["std", "NSString"] }
 
 [dev-dependencies]
 # The mock runtime for tests/ipc_mock.rs and tests/app_menu.rs.

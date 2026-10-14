@@ -117,5 +117,21 @@
     "allow-op-plan-target-machine",
     // The add wizard closed: its verified token's draft goes.
     "allow-target-draft-discard",
+    // D.4a: Settings › Lock. None is answered while locked.
+    // The section's report: where the secrets are, the slots, this computer's limits.
+    "allow-lock-info",
+    // Protect: the plan and the new recovery key, shown once.
+    "allow-op-plan-lock-on",
+    // The recovery key typed back in full, compared in Rust.
+    "allow-op-confirm-recovery-key",
+    // Copy: Rust copies the key it holds, marked to stay out of clipboard history; the page
+    // never has it to.
+    "allow-copy-recovery-key",
+    // "I saved it": Rust takes the key off the clipboard and copies it no more.
+    "allow-op-recovery-key-saved",
+    // Finish an interrupted Protect: both secrets opened first.
+    "allow-op-plan-lock-finish",
+    // Stop protecting (Destructive: the store's secret is its gesture).
+    "allow-op-plan-lock-off",
   ],
 }

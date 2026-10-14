@@ -43,6 +43,14 @@ pub const COMMANDS: &[&str] = &[
     "op_plan_target_remove",
     "op_plan_target_machine",
     "target_draft_discard",
+    // D.4a: Settings › Lock (overview §3.14).
+    "lock_info",
+    "op_plan_lock_on",
+    "op_confirm_recovery_key",
+    "copy_recovery_key",
+    "op_recovery_key_saved",
+    "op_plan_lock_finish",
+    "op_plan_lock_off",
 ];
 
 /// What a locked app still answers; everything else is `apprafter::desktop::locked`.

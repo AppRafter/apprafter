@@ -53,7 +53,7 @@ fn to_json<T: Serialize>(value: &T) -> serde_json::Value {
     serde_json::to_value(value).expect("a core report serialises")
 }
 
-fn json_outcome<T: Serialize>(outcome: Outcome<T>) -> Outcome<serde_json::Value> {
+pub(crate) fn json_outcome<T: Serialize>(outcome: Outcome<T>) -> Outcome<serde_json::Value> {
     match outcome {
         Outcome::Completed { result } => Outcome::Completed {
             result: to_json(&result),
