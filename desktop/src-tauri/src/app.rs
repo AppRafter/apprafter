@@ -74,8 +74,8 @@ use apprafter_core::lock::HolderHardening;
 use apprafter_core::secrets::{VaultAccess, STORE_FILE};
 use apprafter_core::{Context, CoreError, SecretString};
 use apprafter_desktop_ipc::{
-    AppInfo, LockReason, LockState, OpId, Os, Quitting, SessionEvents, Settings, SubscriptionId,
-    UnavailableReason, LOCK_CHANGED, QUITTING,
+    AppInfo, LockReason, LockState, OpId, Os, PlanView, Quitting, SessionEvents, Settings,
+    SubscriptionId, UnavailableReason, LOCK_CHANGED, QUITTING,
 };
 use apprafter_os_auth::{Listening, SessionEvent, SessionWatch};
 use tauri::ipc::Invoke;
@@ -91,11 +91,13 @@ use crate::drafts::DraftStore;
 use crate::env::ToolSearchPath;
 use crate::errors::{DesktopError, Refusal};
 use crate::lock::{LockChange, LockHook, LockMachine};
-use crate::ops::{panic_message, Clock, EventSink, Executor, OperationManager};
+use crate::ops::{
+    panic_message, Clock, EventSink, Executor, OperationManager, PlanParts, SecretGesture,
+};
 use crate::protection::Protection;
 use crate::settings::SettingsStore;
 use crate::theme::Appearance;
-use crate::vault_access::DesktopVaultAccess;
+use crate::vault_access::{DesktopVaultAccess, OpenedSlot, StoreSecretGesture};
 
 /// How long a quit waits for cancelled operations to stop before it exits anyway: the CLI's
 /// helper-pod stop bound.
@@ -683,6 +685,47 @@ impl Shell {
             flows: self.flows.clone(),
             shell: Arc::downgrade(self),
         }
+    }
+
+    /// Keep a plan ([`OperationManager::register_plan`]). On a protected store with no OS
+    /// authenticator a destructive plan's gesture is the store's secret (D.4a T76), typed into
+    /// the confirm dialog's field and opened against the vault, where D.2 refused the plan. A
+    /// plan that only `requires_gesture` keeps D.2's rule until its slice decides (critic B
+    /// finding 24): the manager gives the store's secret to a destructive plan only
+    /// ([`OperationManager::register_plan_with`]), so that rule has one place.
+    pub fn register_plan(&self, parts: PlanParts, exec: Executor) -> PlanView {
+        let secret = if self.lock.protected() && !self.auth.info().available {
+            self.store_secret_gesture(None)
+        } else {
+            None
+        };
+        self.ops.register_plan_with(parts, exec, secret)
+    }
+
+    /// Keep a plan whose gesture, when it needs one, is `secret` ([`register_plan`]).
+    ///
+    /// [`register_plan`]: Self::register_plan
+    pub fn register_plan_with(
+        &self,
+        parts: PlanParts,
+        exec: Executor,
+        secret: Option<Arc<dyn SecretGesture>>,
+    ) -> PlanView {
+        self.ops.register_plan_with(parts, exec, secret)
+    }
+
+    /// The store's secret as a gesture over the store as it is now; what it opens goes to
+    /// `slot` when given. `None` when there is no vault to open (in files, or `store.yaml`
+    /// unreadable).
+    pub fn store_secret_gesture(&self, slot: Option<OpenedSlot>) -> Option<Arc<dyn SecretGesture>> {
+        let now = Protection::read(self.context.config_root(), self.context.home_dir());
+        let id = now.id?;
+        Some(Arc::new(StoreSecretGesture::new(
+            self.vault.clone(),
+            self.context.config_root().to_path_buf(),
+            id,
+            slot,
+        )))
     }
 
     /// The idle tick's look at the store (critic B finding 19): when `store.yaml` changed
@@ -2745,5 +2788,98 @@ mod tests {
         assert!(r.shell.lock.state().locked);
         let e = access.keep_waiting(&root).unwrap_err();
         assert!(matches!(e, cli_core::CliError::StoreLocked { .. }), "{e:?}");
+    }
+
+    /// D.4a T76: on a protected store with no OS authenticator a destructive plan takes the
+    /// store's secret as its gesture (D.2 refused it there); with one, the OS's. A plan that
+    /// only `requires_gesture` (an approval) keeps the OS's there (critic B finding 24).
+    #[test]
+    fn on_a_protected_store_without_an_os_authenticator_a_destructive_plan_takes_the_store_s_secret(
+    ) {
+        let (r, store) = locked_rig();
+        r.shell.unlock_with_password(secret(&store)).unwrap();
+        let ran = Arc::new(AtomicBool::new(false));
+        let exec: Executor = {
+            let ran = ran.clone();
+            Box::new(move |_, _| {
+                ran.store(true, SeqCst);
+                Ok(Outcome::Completed { result: json!(0) })
+            })
+        };
+        let view = r.shell.register_plan(
+            PlanParts::new(PlanClass::Destructive, "Remove target prod", "remove"),
+            exec,
+        );
+        assert_eq!(view.gesture, apprafter_desktop_ipc::Gesture::StoreSecret);
+        // Checked against the vault through the gate: a wrong secret and a mistyped recovery
+        // key are refused, nothing runs, and the plan waits for the next try.
+        let tries = Arc::new(Sink::default());
+        let wrong = r
+            .shell
+            .execute_with(
+                view.op_id,
+                tries.clone(),
+                Some(Zeroizing::new("not it".into())),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(*wrong.error, DesktopError::AuthFailed { .. }),
+            "{wrong:?}"
+        );
+        let shown = secret(&store);
+        let mut chars: Vec<char> = shown.chars().collect();
+        let at = shown.rfind('\n').map_or(0, |i| i + 3);
+        chars[at] = if chars[at] == 'Q' { 'P' } else { 'Q' };
+        let mistyped = Zeroizing::new(chars.into_iter().collect::<String>());
+        let mistyped = r
+            .shell
+            .execute_with(view.op_id, tries, Some(mistyped))
+            .unwrap_err();
+        assert!(
+            matches!(
+                &*mistyped.error,
+                DesktopError::Core(CoreError::RecoveryKeyInvalid { .. })
+            ),
+            "{mistyped:?}"
+        );
+        assert!(!ran.load(SeqCst));
+        let sink = Arc::new(Sink::default());
+        r.shell
+            .execute_with(view.op_id, sink, Some(secret(&store)))
+            .unwrap();
+        let deadline = Instant::now() + LONG;
+        while !ran.load(SeqCst) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(ran.load(SeqCst));
+        // target_ops's plans are registered through the shell too.
+        let via_ops = crate::target_ops::register(
+            &r.shell,
+            apprafter_core::Plan {
+                class: PlanClass::Destructive,
+                title: "Remove target prod".into(),
+                changes: Vec::new(),
+                payload: (),
+            },
+            "prod".into(),
+            "remove",
+            |_, _, _, _| Ok(Outcome::Completed { result: 0 }),
+        );
+        assert_eq!(via_ops.gesture, apprafter_desktop_ipc::Gesture::StoreSecret);
+        let mut approval = PlanParts::new(PlanClass::Bounded, "Approve the plan", "approve");
+        approval.requires_gesture = true;
+        let approval = r.shell.register_plan(
+            approval,
+            Box::new(|_, _| Ok(Outcome::Completed { result: json!(0) })),
+        );
+        assert_eq!(approval.gesture, apprafter_desktop_ipc::Gesture::Os);
+
+        let (r, _store) =
+            rig_with_store(unlocked_at_start(), fake(), |root| locked_store(root, &[]));
+        let view = r.shell.register_plan(
+            PlanParts::new(PlanClass::Destructive, "Remove target prod", "remove"),
+            Box::new(|_, _| Ok(Outcome::Completed { result: json!(0) })),
+        );
+        assert_eq!(view.gesture, apprafter_desktop_ipc::Gesture::Os);
     }
 }

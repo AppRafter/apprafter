@@ -64,7 +64,8 @@ fn json_outcome<T: Serialize>(outcome: Outcome<T>) -> Outcome<serde_json::Value>
 
 /// Keep `plan` in the operation manager, `run` (the core's `execute_*`) its executor over a
 /// clone of the shell's context; the view is all the page gets. A destructive plan asks the
-/// owner inside `op_execute`, naming `verb` and `target`.
+/// owner inside `op_execute`, naming `verb` and `target` — the OS, or on a protected store with
+/// no OS authenticator the store's secret (D.4a T76).
 pub(crate) fn register<P: Send + 'static, T: Serialize>(
     shell: &Shell,
     plan: Plan<P>,
@@ -82,7 +83,7 @@ pub(crate) fn register<P: Send + 'static, T: Serialize>(
     let ctx = shell.context.clone();
     let executor: Executor =
         Box::new(move |reporter, cancel| run(&ctx, plan, reporter, cancel).map(json_outcome));
-    shell.ops.register_plan(parts, executor)
+    shell.register_plan(parts, executor)
 }
 
 /// Start `run` as a read the page follows (`op_subscribe`) and can cancel, over a clone of the

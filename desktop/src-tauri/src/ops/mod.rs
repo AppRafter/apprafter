@@ -20,7 +20,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use apprafter_core::CancellationToken;
 
-pub use manager::{EventSink, Executor, OperationManager, PlanParts, PLAN_TTL_MS};
+pub use manager::{EventSink, Executor, OperationManager, PlanParts, SecretGesture, PLAN_TTL_MS};
 pub use replay::ReplayBuffer;
 pub use reporter::OpReporter;
 pub use text::Utf8Stream;

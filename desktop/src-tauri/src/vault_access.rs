@@ -56,7 +56,7 @@ use zeroize::Zeroizing;
 
 use crate::errors::{DesktopError, Refusal};
 use crate::harden;
-use crate::ops::Clock;
+use crate::ops::{Clock, SecretGesture};
 
 /// How far `forget` has moved on: a key opened before a lock is not kept after it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -638,6 +638,47 @@ fn failed(exhausted: bool, retry_in_ms: Option<u64>) -> Refusal {
         retry_in_ms,
     }
     .into()
+}
+
+/// Where a confirmed plan finds the vault its gesture opened: Stop protecting's `execute_off`
+/// takes it.
+pub type OpenedSlot = Arc<Mutex<Option<OpenedVault>>>;
+
+/// The store's secret as a plan's gesture (D.4a T76): opened through the gate against the
+/// store `id`; what it opened goes to `slot` when the plan wants it, else it is dropped.
+pub struct StoreSecretGesture {
+    vault: Arc<DesktopVaultAccess>,
+    root: PathBuf,
+    id: StoreId,
+    slot: Option<OpenedSlot>,
+}
+
+impl StoreSecretGesture {
+    pub fn new(
+        vault: Arc<DesktopVaultAccess>,
+        root: PathBuf,
+        id: StoreId,
+        slot: Option<OpenedSlot>,
+    ) -> Self {
+        StoreSecretGesture {
+            vault,
+            root,
+            id,
+            slot,
+        }
+    }
+}
+
+impl SecretGesture for StoreSecretGesture {
+    fn check(&self, secret: Zeroizing<String>) -> Result<(), Refusal> {
+        let opened = self
+            .vault
+            .open_typed(&self.root, &self.id, SecretString::from(secret))?;
+        if let Some(slot) = &self.slot {
+            *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(opened);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
