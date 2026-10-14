@@ -7,11 +7,11 @@
 //! **Protected** — the app's unlock opens the store's vault, and the lock's settings are pinned
 //! (O7) — means `store.yaml` says the secrets are not in files and names the store's id, and
 //! the vault is there. A store whose interrupted `lock on` wrote no vault has nothing to open:
-//! its app lock stays D.2's, and Settings offers to finish or back out. A `store.yaml` that
-//! cannot be read is reported `locked` and counts as protected with no id, as the core treats
-//! it (none of its secrets is used; fail closed, overview rule 3): the app stays locked until it
-//! is repaired, and `problem` says why. A lock whose vault is gone (O8) is not protected —
-//! nothing opens it — and `problem` says that too. Neither is ever shown as "encrypted".
+//! its app lock stays D.2's, and the Security page offers to finish or back out. A `store.yaml`
+//! that cannot be read is reported `locked` and counts as protected with no id, as the core
+//! treats it (none of its secrets is used; fail closed, overview rule 3): the app stays locked
+//! until it is repaired, and `problem` says why. A lock whose vault is gone (O8) is not protected
+//! — nothing opens it — and `problem` says that too. Neither is ever shown as "encrypted".
 
 use std::io;
 use std::path::Path;
@@ -154,7 +154,7 @@ mod tests {
     }
 
     /// An interrupted `lock on` that wrote no vault: nothing to open, so the app lock stays
-    /// D.2's, and Settings offers to finish or back out — a state, not a problem.
+    /// D.2's, and the Security page offers to finish or back out — a state, not a problem.
     #[test]
     fn an_interrupted_protect_without_its_vault_is_not_protected_and_no_problem() {
         let dir = tempfile::tempdir().unwrap();

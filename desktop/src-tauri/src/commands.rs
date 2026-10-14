@@ -460,7 +460,7 @@ pub async fn target_draft_discard(shell: ShellState<'_>, draft_id: DraftId) -> R
     .await
 }
 
-// D.4a: Settings › Lock (overview §3.14). Each on the blocking pool: a key derivation (about
+// D.4a: the Security page (overview §3.14). Each on the blocking pool: a key derivation (about
 // 0.7 s, 256 MiB) and the limit rows' 2 s agent ask never run on the main thread. Every secret
 // is moved into a `SecretString` on the command's first line.
 

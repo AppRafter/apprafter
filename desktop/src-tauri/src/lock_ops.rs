@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
-//! Settings › Lock's commands (D.4a §3.14): the report, and the store lock's three flows —
+//! The Security page's commands (D.4a §3.14): the report, and the store lock's three flows —
 //! Protect (`lock on`), Finish (an interrupted `lock on` whose vault is written: rule 4, both
 //! slots opened first; team decision 2026-10-13), Stop protecting (`lock off`, the store's
 //! secret its gesture, O11). Each is a plan the page confirms, its secrets held in Rust: the
@@ -203,7 +203,7 @@ pub fn plan_lock_on(
         LockOnStart::AlreadyLocked => {
             return Err(refused(
                 "this target store's secrets are protected already",
-                "Settings › Lock shows what opens them.",
+                "The Security page shows what opens them.",
             ))
         }
     }
@@ -372,7 +372,7 @@ pub fn plan_lock_finish(
     let LockOnStart::Resume { id } = plan.payload.start().clone() else {
         return Err(refused(
             "there is no interrupted Protect to finish in this target store",
-            "Settings › Lock shows where its secrets are.",
+            "The Security page shows where its secrets are.",
         )
         .into());
     };
@@ -617,6 +617,33 @@ mod tests {
         assert_eq!(info.app, crate::harden::not_applied());
     }
 
+    /// WI-476: Protect refused on a protected store points to where what opens it is shown — the
+    /// Security page. (The page shows the message only: the projection gives `UsageRefused` no
+    /// help, the hand-off's F1; the words are checked where they live, in the diagnostic.)
+    #[test]
+    fn protect_on_a_protected_store_says_where_what_opens_it_is() {
+        let mut made = None;
+        let r = rig_with(
+            |root| made = Some(locked_store(root, &[])),
+            ShellExtras::default(),
+        );
+        let store = made.unwrap();
+        r.shell
+            .unlock_with_password(Zeroizing::new(store.recovery_key().expose().into()))
+            .unwrap();
+        let e = plan_lock_on(&r.shell, SecretString::new(PASSWORD), None).unwrap_err();
+        assert!(
+            e.to_ui().message.contains("protected already"),
+            "{:?}",
+            e.to_ui()
+        );
+        let help = miette::Diagnostic::help(&e).map(|h| h.to_string());
+        assert_eq!(
+            help.as_deref(),
+            Some("The Security page shows what opens them.")
+        );
+    }
+
     #[test]
     fn lock_info_names_the_app_s_window_while_it_holds_the_key() {
         let mut made = None;
@@ -829,6 +856,13 @@ mod tests {
             e.to_ui().message.contains("no interrupted Protect"),
             "{:?}",
             e.to_ui()
+        );
+        // WI-476: where the page shows the store's state. The help lives in the diagnostic: the
+        // projection gives `UsageRefused` none (the hand-off's F1).
+        let help = miette::Diagnostic::help(&*e.error).map(|h| h.to_string());
+        assert_eq!(
+            help.as_deref(),
+            Some("The Security page shows where its secrets are.")
         );
         // An interrupted Protect with its vault: the test store has a recovery slot only, so
         // the lock password opens nothing — refused through the gate, before any plan.

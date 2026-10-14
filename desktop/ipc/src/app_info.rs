@@ -17,8 +17,9 @@ pub enum Os {
     Linux,
 }
 
-/// Where the target store keeps its secrets, as the lock screen, the Target screen and Settings ›
-/// Lock show it (D.4a §3.14): in files, or in a vault and what opens it.
+/// Where the target store keeps its secrets, as the lock screen, the Target screen, the Targets
+/// page's line and the Security page show it (D.4a §3.14, WI-476): in files, or in a vault and
+/// what opens it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]

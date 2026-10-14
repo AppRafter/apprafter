@@ -112,7 +112,7 @@ pub enum DesktopError {
     )]
     #[diagnostic(
         code(apprafter::desktop::lock_required),
-        help("Stop protecting the store's secrets in Settings › Lock to change them.")
+        help("Stop protecting the store's secrets on the Security page to change them.")
     )]
     LockRequired,
 
@@ -444,7 +444,7 @@ mod tests {
         );
         assert_eq!(
             ui.help.as_deref(),
-            Some("Stop protecting the store's secrets in Settings › Lock to change them.")
+            Some("Stop protecting the store's secrets on the Security page to change them.")
         );
         assert!(ui.fields.is_empty());
     }

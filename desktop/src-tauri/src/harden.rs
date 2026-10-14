@@ -3,7 +3,7 @@
 //! store's state — a store can be locked from a terminal while the app runs — and in builds
 //! without `debug_assertions` only: a developer attaches a debugger to a debug build, which
 //! reports every measure not taken ([`not_applied`]). Each measure is best effort and reported,
-//! never fatal: Settings › Lock says which did not take (rule 1, `HolderHardening`).
+//! never fatal: the Security page says which did not take (rule 1, `HolderHardening`).
 //!
 //! - Linux: `PR_SET_DUMPABLE` 0 — no same-user `ptrace` attach, `/proc/<pid>/mem` closed;
 //! - macOS: `PT_DENY_ATTACH` — no later debugger attach;
@@ -30,7 +30,7 @@
 
 use apprafter_core::lock::HolderHardening;
 
-/// What [`harden_process`] did: the report Settings › Lock shows, and why a measure did not
+/// What [`harden_process`] did: the report the Security page shows, and why a measure did not
 /// take, for the log (the Rust verifier's finding 13: no subscriber exists while it runs).
 #[derive(Debug, Clone)]
 pub struct Hardened {
