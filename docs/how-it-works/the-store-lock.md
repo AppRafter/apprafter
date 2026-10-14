@@ -202,13 +202,18 @@ The lock protects secrets at rest. While a command or the app uses a secret,
 it is in that process's memory. Beyond that:
 
 - **A kubeconfig handed to `kubectl` or `helm`** is written, decrypted, to a
-  file in the runtime directory (`<store>/run`, mode 0600 in a 0700
-  directory on Linux and macOS; on Windows with `APPRAFTER_CONFIG_DIR` unset,
-  under `%LOCALAPPDATA%\apprafter\run`), for as long as the command runs,
-  and removed when it ends; a file whose process is gone is removed by the
-  next command that writes one. Programs running as you can read it
-  meanwhile. The cleanup a command runs after Ctrl-C uses a short-lived copy
-  in the system's temporary directory. `cli/apprafter-core/src/runtime.rs`.
+  file in the runtime directory (`<store>/run`; on Windows with
+  `APPRAFTER_CONFIG_DIR` unset, under `%LOCALAPPDATA%\apprafter\run`), for
+  as long as the command runs, and removed when it ends; a file whose
+  process is gone is removed by the next command that writes one. The file
+  and the directory are your account's alone wherever the store is: mode
+  0600 in a 0700 directory on Linux and macOS; on Windows, a DACL that
+  admits only your account and takes nothing from the folders above, set
+  before the first byte is written. Other accounts without administrator
+  rights cannot read it; programs running as you can, meanwhile. The
+  cleanup a command runs after Ctrl-C uses a short-lived copy in the
+  system's temporary directory. `cli/apprafter-core/src/runtime.rs`,
+  `cli/cli-core/src/owner_only.rs`.
 - **`apprafter open argocd`** puts the Argo CD password on the clipboard,
   which programs running as you can read, and forwards a local port any
   program on this computer can connect to.
