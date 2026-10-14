@@ -5,6 +5,7 @@ pub mod app;
 pub mod auth;
 pub mod auth_cache;
 pub mod commands;
+pub mod display;
 pub mod drafts;
 pub mod env;
 pub mod errors;
@@ -163,6 +164,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     dmabuf_renderer.log();
     single_instance.log();
     harden::log(&hardened);
+    // D.4a T72: the display GTK opened, asked here on the main thread, once (GTK is up now).
+    let display = display::current();
     // macOS: the login shell is asked for the tools' PATH from here, on a thread of its own.
     let tools = env::tool_search_path(&env);
 
@@ -183,6 +186,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         env.test_build(),
         app::ShellExtras {
             hardening: hardened.hardening,
+            display,
+            ssh_agent: env::ssh_agent(&env),
             clipboard: Some(secret_clip::SystemClipboard::maker()),
             ..app::ShellExtras::default()
         },
@@ -595,5 +600,42 @@ mod tests {
         assert_eq!(super::exit_code(&*refused), 2);
         let other: Box<dyn Error> = "the app could not be built".into();
         assert_eq!(super::exit_code(&*other), 1);
+    }
+
+    /// D.4a T72: GDK is asked once, on the main thread, after the app is built (GTK is up)
+    /// and before the event loop runs.
+    #[test]
+    fn run_asks_gdk_for_the_display_between_the_build_and_the_loop() {
+        let run = run_fn();
+        let stmts = &run.block.stmts;
+        let at = |name: [&str; 2]| {
+            stmts.iter().position(|stmt| match stmt {
+                syn::Stmt::Local(local) => local.init.as_ref().is_some_and(|init| {
+                    matches!(&*init.expr, syn::Expr::Call(call)
+                        if matches!(&*call.func, syn::Expr::Path(p)
+                            if p.path.segments.iter().map(|s| s.ident.to_string()).collect::<Vec<_>>() == name))
+                }),
+                _ => false,
+            })
+        };
+        let display = at(["display", "current"]).expect("run asks display::current");
+        let built = stmts
+            .iter()
+            .position(|stmt| {
+                matches!(stmt, syn::Stmt::Local(local)
+                    if local.init.as_ref().is_some_and(|init| matches!(&*init.expr,
+                        syn::Expr::Try(t) if matches!(&*t.expr, syn::Expr::MethodCall(call) if call.method == "build"))))
+            })
+            .expect("run builds the app");
+        let looped = stmts
+            .iter()
+            .position(|stmt| {
+                matches!(stmt, syn::Stmt::Expr(syn::Expr::MethodCall(call), _) if call.method == "run")
+            })
+            .expect("run ends in app.run");
+        assert!(
+            built < display && display < looped,
+            "{built} < {display} < {looped}"
+        );
     }
 }

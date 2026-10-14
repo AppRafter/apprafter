@@ -23,10 +23,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use apprafter_core::doctor::{self, DoctorArgs, DoctorTarget};
-use apprafter_core::lock::limits::{
-    DisplayKind, LimitClient, SessionEvents as CoreSessionEvents, SshFacts,
-};
-use apprafter_core::lock::UnlockWindow;
 use apprafter_core::machine::{self, CatalogueSource, RegionLatency};
 use apprafter_core::session::{self, WhoamiReport};
 use apprafter_core::ssh::{self, SshKeyCandidate, SshKeyInfo};
@@ -261,33 +257,31 @@ fn start_region_latencies_with(
 
 /// Doctor on the target called `name` (`DoctorTarget::Named`: a name the store does not hold is
 /// a FAIL row, not an error), with the tools the app has learned of. Its stages count three for
-/// a target that exists (Target, Cluster, This computer) and two otherwise.
+/// a target that exists (Target, Cluster, This computer) and two otherwise. The lock's rows see
+/// this app (D.4a T72, T73): its window — `App` while it holds the protected store's key, the
+/// store re-read first, and `locked` when that re-read locked the app — and the limit client
+/// the shell makes on the read's own thread (the session watch may wait), with the app's
+/// display and SSH facts.
 pub fn start_doctor(shell: &Shell, name: String) -> Result<OpId, DesktopError> {
     let title = format!("Doctor · {name}");
     let target = DoctorTarget::Named(name.clone());
-    let events = shell.session_events_later();
+    let now = shell.recheck();
+    // The re-read may have locked the app (critic A finding 21): a locked app starts nothing.
+    if shell.lock.is_locked() {
+        return Err(DesktopError::Locked);
+    }
+    let window = shell.window(&now);
+    let client = shell.limit_client_later();
     read_in(
         shell,
         title,
         Some(name),
         shell.tool_context_later(),
         move |ctx, reporter, cancel| {
-            // D.4a T73: the app's own facts, read here on the read's worker (the session watch
-            // may wait). Its session events now; its window (`App` while it holds a locked
-            // store's key), its display kind (from GDK) and its SSH facts arrive with the Lock
-            // section (d4a-g phase B) — until then it holds no key, so no window is open here.
-            let events = events();
             let args = DoctorArgs {
                 target,
-                window: UnlockWindow::Closed,
-                client: LimitClient::Desktop {
-                    session_events: CoreSessionEvents {
-                        lock: events.lock,
-                        sleep: events.sleep,
-                    },
-                    display: DisplayKind::None,
-                    ssh: SshFacts::default(),
-                },
+                window,
+                client: client(),
             };
             doctor::run(ctx, args, reporter, cancel)
         },
@@ -435,18 +429,21 @@ mod tests {
     use std::sync::{mpsc, Arc, Mutex};
     use std::time::{Duration, Instant};
 
+    use apprafter_core::lock::limits::DisplayKind;
+    use apprafter_core::secrets::testing::locked_store;
     use apprafter_core::{
         ChangeAction, Context, CoreError, Outcome, PathSource, Plan, PlanClass, SecretString,
     };
     use apprafter_desktop_ipc::{
-        errors, CatalogueSourceArg, DraftId, OpEvent, OpId, OpState, TargetAddArgs,
+        errors, CatalogueSourceArg, DraftId, OpEvent, OpId, OpState, Settings, TargetAddArgs,
     };
     use cli_core::target::{Target, TargetConfig, TargetCredentials};
     use serde_json::{json, Value};
+    use zeroize::Zeroizing;
 
     use super::*;
-    use crate::app::Shell;
-    use crate::auth::{AuthPurpose, FakeAuthenticator};
+    use crate::app::{Shell, ShellExtras};
+    use crate::auth::{AuthPurpose, FakeAuthenticator, NoAuthenticator};
     use crate::env::ToolSearchPath;
     use crate::ops::{EventSink, SystemClock};
     use crate::settings::SettingsStore;
@@ -1374,6 +1371,8 @@ mod tests {
     #[test]
     fn doctor_whoami_and_latencies_are_reads_that_end_with_their_report() {
         let s = store(&["prod"], Some("prod"));
+        // Doctor runs in an unlocked app only (the gate; a locked one is refused, Task 18).
+        s.shell.unlock().unwrap();
         let doctor = result_of(ended(
             &s.shell,
             start_doctor(&s.shell, "prod".into()).unwrap(),
@@ -1407,6 +1406,8 @@ mod tests {
     #[test]
     fn doctor_runs_on_the_named_target_in_three_stages_or_two() {
         let s = store(&["prod", "lab"], Some("lab"));
+        // Doctor runs in an unlocked app only (the gate; a locked one is refused, Task 18).
+        s.shell.unlock().unwrap();
         let stages = |events: &[OpEvent]| -> Vec<(u32, u32, String)> {
             events
                 .iter()
@@ -1466,6 +1467,8 @@ mod tests {
                 PathSource::LoginShell
             )
         );
+        // Doctor runs in an unlocked app only (the gate; a locked one is refused, Task 18).
+        s.shell.unlock().unwrap();
         let started = start_doctor(&s.shell, "prod".into()).unwrap();
         assert!(matches!(ended(&s.shell, started), OpEvent::Finished { .. }));
         doctor_finds_a_tool_only_the_learned_path_has();
@@ -1510,6 +1513,8 @@ mod tests {
             ToolSearchPath::known(bin.path().as_os_str().to_owned(), PathSource::LoginShell),
         );
         assert!(s.shell.context.tool_search_path().is_empty());
+        // Doctor runs in an unlocked app only (the gate; a locked one is refused, Task 18).
+        s.shell.unlock().unwrap();
         let report = result_of(ended(
             &s.shell,
             start_doctor(&s.shell, "prod".into()).unwrap(),
@@ -1549,6 +1554,8 @@ mod tests {
         );
         let s = store_with_tools(&["prod"], None, tools);
         let (started_tx, started) = mpsc::channel();
+        // Doctor runs in an unlocked app only (the gate; a locked one is refused, Task 18).
+        s.shell.unlock().unwrap();
         {
             let shell = s.shell.clone();
             std::thread::spawn(move || {
@@ -1638,5 +1645,91 @@ mod tests {
             (listed[0].title.as_str(), listed[0].target.as_deref()),
             ("Machine catalogue · prod", Some("prod"))
         );
+    }
+
+    /// D.4a T72, T73: doctor sees this app — its window while it holds the protected store's
+    /// key, and on Linux the display it is on.
+    #[test]
+    fn doctor_sees_the_app_s_window_and_display() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("store");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = locked_store(&root, &[("prod", None)]);
+        let settings = SettingsStore::load(dir.path(), &SystemClock);
+        settings
+            .set(Settings {
+                lock_on_start: false,
+                ..Settings::default()
+            })
+            .unwrap();
+        let shell = Shell::new_with(
+            settings,
+            Arc::new(NoAuthenticator),
+            Arc::new(SystemClock),
+            Context::for_desktop(root, "http://127.0.0.1:9"),
+            ToolSearchPath::known(OsString::new(), PathSource::Explicit),
+            false,
+            ShellExtras {
+                display: DisplayKind::X11,
+                ..ShellExtras::default()
+            },
+            |_| {},
+        );
+        shell
+            .unlock_with_password(Zeroizing::new(store.recovery_key().expose().into()))
+            .unwrap();
+        let report = result_of(ended(&shell, start_doctor(&shell, "prod".into()).unwrap()));
+        let checks: Vec<&Value> = report["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|g| g["checks"].as_array().unwrap())
+            .collect();
+        let secrets = checks
+            .iter()
+            .find(|c| c["id"] == "secrets")
+            .unwrap_or_else(|| panic!("no secrets row: {report}"));
+        assert!(
+            secrets["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("this app"),
+            "{secrets}"
+        );
+        #[cfg(target_os = "linux")]
+        assert!(
+            checks.iter().any(|c| c["id"] == "x11_keystrokes"),
+            "no x11 row: {report}"
+        );
+    }
+
+    /// Critic A finding 21: a store locked from a terminal under the unlocked app — the
+    /// re-read locks it, and doctor starts nothing for an app that is now locked.
+    #[test]
+    fn doctor_is_refused_once_its_re_read_locked_the_app() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("store");
+        std::fs::create_dir_all(&root).unwrap();
+        let settings = SettingsStore::load(dir.path(), &SystemClock);
+        settings
+            .set(Settings {
+                lock_on_start: false,
+                ..Settings::default()
+            })
+            .unwrap();
+        let shell = Shell::new_with(
+            settings,
+            Arc::new(NoAuthenticator),
+            Arc::new(SystemClock),
+            Context::for_desktop(root.clone(), "http://127.0.0.1:9"),
+            ToolSearchPath::known(OsString::new(), PathSource::Explicit),
+            false,
+            ShellExtras::default(),
+            |_| {},
+        );
+        assert!(!shell.lock.is_locked());
+        locked_store(&root, &[("prod", None)]);
+        let e = start_doctor(&shell, "prod".into()).unwrap_err();
+        assert!(matches!(e, DesktopError::Locked), "{e:?}");
     }
 }
