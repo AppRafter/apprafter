@@ -495,6 +495,17 @@ backs out with the other, and a new `apprafter lock on` starts over. For an
 interrupted `lock off`, run `apprafter lock off` again. `apprafter doctor`
 names the state.
 
+### `apprafter::secrets::files_not_kept` {#files-not-kept}
+
+Turning the lock off writes each secret back to its file, and reads each one
+back before it deletes the vault. A file did not hold what was written — the
+disk may be full, or another program changed the file — so the run stopped
+with the vault kept. Nothing was lost.
+
+**Fix.** Run `apprafter lock off` again, or choose **Finish…** in the desktop's
+Settings › Lock: either finishes from where the run stopped. If it stops here
+again, check the disk the target store is on.
+
 ### `apprafter::secrets::store_changed` {#store-changed}
 
 Another AppRafter process turned this store's lock on or off, or replaced

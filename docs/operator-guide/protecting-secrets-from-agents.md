@@ -318,6 +318,63 @@ store, only when the store is locked or a `lock on` did not finish:
 | A program with debugging rights can read an unlocked window's memory | macOS | run agents under another Standard account |
 | The unlock window's key is less protected than usual | the system refused one of its protections | — the window works without it |
 
+## In the desktop app {#desktop}
+
+AppRafter Desktop has one **Lock** section in Settings: the app's own lock and
+the target store's lock are one mechanism.
+
+- **Protect…** turns the lock on in five steps: what it does, the lock
+  password typed twice (15 characters or more is recommended; a shorter one is
+  accepted with a warning), the recovery key shown once, the key typed back in
+  full from where you saved it, and the run — which can be cancelled until it
+  starts re-encrypting the cached secrets. The app's **Copy** is the only way
+  to copy the recovery key: it puts the key on the clipboard marked to stay out
+  of clipboard history (on Windows, out of the cloud clipboard as well) and
+  clears it after 60 seconds, or sooner when the app locks or quits; on a Mac,
+  Handoff does not carry it to your other devices. Choosing **I saved it**
+  takes the key off the clipboard and ends the copies, so the key you type
+  back comes from where you saved it.
+- While the store's secrets are protected, unlocking the app opens them: the
+  lock screen asks for the lock password or the recovery key on every operating
+  system. Windows Hello, Touch ID and your system password cannot open the
+  vault yet. While the app is unlocked it holds the store's key. Locking it,
+  the idle timeout, quitting, and the computer sleeping or its screen locking
+  where the computer tells the app, end that: from then on the app starts no
+  new read of a secret. A read already decrypting ends, and an operation you
+  confirmed keeps what it already read but stops at its next secret. A sleep
+  the computer does not report still locks the app: it notices the sleep
+  from its own clocks when the computer wakes, before any secret is used. A
+  change you confirmed before the lock — protecting, finishing, stopping
+  protection, or saving, renaming or removing a token — finishes with the
+  key it took once no other AppRafter program holds the store, or is
+  abandoned with nothing written if it cannot start within 30 seconds; that
+  key goes when the change ends.
+- Meanwhile *Require unlock*, *Lock when the app starts* and *Lock when the
+  computer sleeps or locks* stay on, and *Auto-lock after inactivity* offers no
+  *Never*. Your own choices are kept, and come back when you stop protecting.
+- **Stop protecting…** asks for the lock password or the recovery key, even
+  though the app is unlocked, and puts the Hetzner tokens back in their files.
+  If the store has cached secrets, it re-encrypts them to the shared age key
+  in its default place, `~/.config/apprafter/age.key`, creating that file
+  only then; a store without cached secrets never touches it. The app does
+  not read `APPRAFTER_AGE_KEY`: to put cached secrets under another key, run
+  `apprafter lock off` in a terminal.
+- After an interrupted run the section offers **Finish…**. An interrupted
+  Protect that wrote the vault asks for both the lock password and the
+  recovery key; one that did not starts over with a new recovery key, or
+  **Stop protecting…** backs it out with a plain confirmation, since nothing is
+  encrypted yet.
+- If the target store's `store.yaml` cannot be read, or its vault is missing,
+  the app says so — on the lock screen and in Settings — with how to repair
+  it, and never calls the secrets encrypted.
+- The section lists what opens the vault and this computer's limits — the
+  lines `apprafter lock status` shows — including any protection the app's own
+  process could not take, which Doctor shows too.
+
+While the app is unlocked, everything it runs can use the store's secrets:
+lock it when you step away. Terminals unlock on their own, with
+`apprafter unlock`.
+
 ## See also
 
 - [How the store lock works](../how-it-works/the-store-lock.md) — the vault,
