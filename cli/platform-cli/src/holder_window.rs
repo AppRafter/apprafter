@@ -937,7 +937,10 @@ mod tests {
     }
 
     /// A dead holder's socket (no listener) is no window — unless a process still holds the
-    /// endpoint's lock: then a holder lives there and takes no connection.
+    /// endpoint's lock: then a holder lives there and takes no connection. A lock let go of
+    /// stays held while any process keeps a descriptor of it: a child another test thread forks
+    /// keeps one until its `exec` (GOTCHA-240). So the closed window is asked for once the lock
+    /// reads free, never before — and a child that keeps it 200 ms plays that race every run.
     #[test]
     fn a_dead_holders_socket_is_no_window_and_a_held_lock_is_a_living_holder() {
         let h = here();
@@ -958,12 +961,48 @@ mod tests {
             end_at(&h.place, &h.store),
             Ended::StillOpen { pid: Some(4343) }
         );
+        let mut child = keeps_it_a_moment(&held);
         drop(held);
+        let_go_within(&h.lock, Duration::from_secs(2));
         assert_eq!(
             window_state(&h.ctx, &h.place, true).unwrap(),
             UnlockWindow::Closed,
             "once its lock is let go"
         );
+        child.wait().unwrap();
+    }
+
+    /// A child that inherits `lock`'s descriptor and keeps it 200 ms: the lock stays held that
+    /// long after this process lets go of it, as a forked child keeps it until its `exec`.
+    fn keeps_it_a_moment(lock: &std::fs::File) -> std::process::Child {
+        use std::os::unix::process::CommandExt;
+        let fd = lock.as_raw_fd();
+        let mut keeper = std::process::Command::new("sleep");
+        keeper.arg("0.2");
+        // SAFETY: between fork and exec the child only clears close-on-exec on its own copy of a
+        // descriptor this process has open (async-signal-safe `fcntl`); the parent's keeps it.
+        unsafe {
+            keeper.pre_exec(move || {
+                if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        keeper.spawn().unwrap()
+    }
+
+    /// Wait, at most `limit`, until no process holds `lock` — failing if one still does.
+    fn let_go_within(lock: &Path, limit: Duration) {
+        let deadline = std::time::Instant::now() + limit;
+        while crate::holder::os::lock_held(lock) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{} is still held after {limit:?}",
+                lock.display()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// S9, rule 1: a holder that did not answer and was stopped; one that is gone already (it
