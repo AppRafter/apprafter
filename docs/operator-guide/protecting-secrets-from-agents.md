@@ -317,7 +317,7 @@ store, only when the store is locked or a `lock on` did not finish:
 | Everything started from this terminal can use its window | a window is open here | start agents elsewhere, or `apprafter lock now` |
 | Unlock windows on Windows are open to every program running as you | Windows | unlock in a console of its own, and keep windows short |
 | A program with debugging rights can read an unlocked window's memory | macOS | run agents under another Standard account |
-| The unlock window's key is less protected than usual | the system refused one of its protections | — the window works without it |
+| The unlock window's key is less protected than usual | the system refused one of its protections; on Windows always, since Windows Error Reporting may write a crash dump | — the window works without it |
 
 ## In the desktop app {#desktop}
 

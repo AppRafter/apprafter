@@ -57,6 +57,15 @@ fn deny_attach() -> Option<bool> {
     None
 }
 
+/// Whether a crash of this process can write none of its memory to disk, as `Status` reports it
+/// (`core_off`). Never on Windows: `SetErrorMode` only hides the fault dialog, and Windows Error
+/// Reporting may still write a dump that holds the key page (the app says the same of itself,
+/// d4a-g Deviations 26). On Unix, `RLIMIT_CORE` 0 decides; on Linux the key page is also
+/// `MADV_DONTDUMP` (`memory.rs`) and the process non-dumpable.
+fn core_off_claim(windows: bool, rlimit_zero: bool) -> bool {
+    !windows && rlimit_zero
+}
+
 #[cfg(unix)]
 fn core_off() -> bool {
     let zero = libc::rlimit {
@@ -64,11 +73,12 @@ fn core_off() -> bool {
         rlim_max: 0,
     };
     // SAFETY: setrlimit reads one rlimit.
-    unsafe { libc::setrlimit(libc::RLIMIT_CORE, &zero) == 0 }
+    let rlimit_zero = unsafe { libc::setrlimit(libc::RLIMIT_CORE, &zero) == 0 };
+    core_off_claim(false, rlimit_zero)
 }
 
-/// Windows: no fault dialog, no critical-error box (Windows Error Reporting may still collect a
-/// minidump: holder §4, UNVERIFIED whether one could hold the key page).
+/// Windows: no fault dialog, no critical-error box. A dump Windows Error Reporting writes may
+/// still hold the key, so the claim is false ([`core_off_claim`]).
 #[cfg(windows)]
 fn core_off() -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::{
@@ -76,7 +86,7 @@ fn core_off() -> bool {
     };
     // SAFETY: SetErrorMode only sets this process's mode.
     unsafe { SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX) };
-    true
+    core_off_claim(true, true)
 }
 
 #[cfg(windows)]
@@ -95,6 +105,19 @@ mod tests {
     use super::*;
 
     const INNER: &str = "APPRAFTER_HARDEN_INNER";
+
+    /// d4a-h Task 2 (g's Deviations 26): `core_off` says a crash writes none of the key to
+    /// disk only where the OS lets the holder say so.
+    #[test]
+    fn a_crash_writes_nothing_only_where_the_os_lets_us_say_so() {
+        // Windows: SetErrorMode hides the dialog, but Windows Error Reporting may still write a
+        // dump (g's Deviations 26: the app says the same of itself).
+        assert!(!core_off_claim(true, true));
+        assert!(!core_off_claim(true, false));
+        // Unix: RLIMIT_CORE 0 decides (on Linux the key page is also MADV_DONTDUMP).
+        assert!(core_off_claim(false, true));
+        assert!(!core_off_claim(false, false));
+    }
 
     /// T54: in a child (the measures change the process they run in), the report is what the
     /// OS then says: Linux not dumpable, macOS denying attach, no core dumps, a private umask;
@@ -163,10 +186,11 @@ mod tests {
             line,
             "nd=None da=Some(true) core=true dacl=None real_core=0 umask=77"
         );
+        // core=false: Windows Error Reporting may still write a dump (d4a-h Task 2).
         #[cfg(windows)]
         assert_eq!(
             line,
-            "nd=None da=None core=true dacl=Some(true) protected_aces=2"
+            "nd=None da=None core=false dacl=Some(true) protected_aces=2"
         );
     }
 

@@ -170,9 +170,10 @@ fn windows_a_command_on_the_holders_console_is_served() {
     let got = on_a_console(&s, "serve");
     started_pid(&got[0]);
     assert_eq!(got[1], format!("item {TOKEN}"));
+    // core=false: Windows Error Reporting may still write a dump (d4a-h Task 2).
     assert!(
         got[2].starts_with("status left=")
-            && got[2].ends_with(" nd=None da=None core=true mem=true dacl=Some(true)"),
+            && got[2].ends_with(" nd=None da=None core=false mem=true dacl=Some(true)"),
         "{}",
         got[2]
     );

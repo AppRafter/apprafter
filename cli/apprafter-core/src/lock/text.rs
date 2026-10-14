@@ -119,7 +119,7 @@ pub fn hardening_line(h: &HolderHardening) -> Option<String> {
         weak.push("a debugger may attach to it");
     }
     if !h.core_off {
-        weak.push("a crash may write it to a core file");
+        weak.push("a crash may write it to disk");
     }
     if h.process_dacl == Some(false) {
         weak.push("its process keeps the default access list");
@@ -274,6 +274,16 @@ mod tests {
         assert_eq!(
             hardening_line(&hardening(false, Some(false))).as_deref(),
             Some("The unlock window's key is less protected than usual: its memory is not locked against paging, it can be dumped")
+        );
+        // A crash dump the OS may still write (Windows Error Reporting; d4a-h Task 2): the same
+        // words on every OS, since Windows has no core file.
+        let crash = HolderHardening {
+            core_off: false,
+            ..hardening(true, Some(true))
+        };
+        assert_eq!(
+            hardening_line(&crash).as_deref(),
+            Some("The unlock window's key is less protected than usual: a crash may write it to disk")
         );
     }
 

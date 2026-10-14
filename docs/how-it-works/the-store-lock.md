@@ -178,7 +178,9 @@ It protects itself where the system allows, and reports each measure that
 failed (`apprafter lock status`, and a doctor row): not dumpable on Linux, no
 core files on Linux and macOS, no debugger attach on macOS, a process access
 list that admits only what it needs on Windows
-(`cli/platform-cli/src/holder/harden.rs`).
+(`cli/platform-cli/src/holder/harden.rs`). On Windows it always reports that a
+crash may write its key to disk: it turns the crash dialog off, but Windows
+Error Reporting may still write a dump.
 
 **Who it serves** (`cli/platform-cli/src/holder/binding.rs`). On Linux and
 macOS: a process of the same user in the same session as the shell where the
