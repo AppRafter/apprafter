@@ -1690,6 +1690,12 @@ const REAL_ENV_TESTS: &[(&str, &str)] = &[
         "apprafter-core/src/context.rs",
         "the_clis_context_carries_its_holder_base_and_the_desktops_none",
     ),
+    // D.4a T8 (d4a-g): the desktop's test-build fence, read from a MapEnv; compares paths and
+    // opens nothing.
+    (
+        "apprafter-core/src/context.rs",
+        "a_desktop_context_takes_the_sandbox_only_in_a_fast_kdf_test_build",
+    ),
     // whoami pings with the stored token, not the CLI override: the override needs the CLI's
     // builder; the store is a tempdir it names.
     (

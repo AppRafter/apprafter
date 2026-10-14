@@ -24,6 +24,11 @@
 //!   core then accepts only as a loopback `http://` URL ([`desktop_context`]), and
 //!   `APPRAFTER_DESKTOP_TEST_PASSWORD`, the password the fake authenticator's own field accepts,
 //!   so a walk can use the lock screen's password field ([`crate::auth::choice`]);
+//! - `SSH_AUTH_SOCK`: the ssh-agent the lock's limit rows ask whether the key that fetches
+//!   kubeconfigs is loaded, with a 2 s bound (D.4a O1a, the owner's of 2026-10-13:
+//!   [`ssh_agent`]); the app only lists the agent's keys and never asks it to sign;
+//! - in a test build only, `APPRAFTER_SANDBOX`: where the test build's fast key derivation may
+//!   create a password slot (D.4a T8; the core reads it into `Context::insecure_kdf_roots`);
 //!
 //! and `None` for every other name, however it is set. [`AllowListEnv::from_process`] is where the
 //! app reads its own variables.
@@ -50,7 +55,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use apprafter_core::context::{HCLOUD_BASE_URL_ENV, PATH_ENV};
+use apprafter_core::context::{HCLOUD_BASE_URL_ENV, PATH_ENV, SANDBOX_ENV};
 use apprafter_core::{Context, CoreResult, DesktopHost, DesktopPolicy, EnvSource, PathSource};
 use cli_core::CONFIG_DIR_ENV;
 
@@ -60,6 +65,9 @@ pub const DATA_DIR_ENV: &str = "APPRAFTER_DESKTOP_DATA_DIR";
 /// A test build's fake authenticator gets a password field accepting this password. Never read
 /// in a release: no owner's password is ever in the environment.
 pub const TEST_PASSWORD_ENV: &str = "APPRAFTER_DESKTOP_TEST_PASSWORD";
+
+/// The ssh-agent's socket (D.4a O1a): asked only whether the fetch key is listed, never to sign.
+pub const SSH_AUTH_SOCK_ENV: &str = "SSH_AUTH_SOCK";
 
 /// How an [`AllowListEnv`] reads a name it allows: the raw value, as the OS holds it.
 type Lookup = dyn Fn(&str) -> Option<OsString> + Send + Sync;
@@ -93,9 +101,9 @@ impl AllowListEnv {
         }
     }
 
-    /// Whether this is a test build's view: it then also answers `APPRAFTER_HCLOUD_BASE_URL` and
-    /// `APPRAFTER_DESKTOP_TEST_PASSWORD`, and [`desktop_context`] builds under
-    /// [`DesktopPolicy::TEST_BUILD`].
+    /// Whether this is a test build's view: it then also answers `APPRAFTER_HCLOUD_BASE_URL`,
+    /// `APPRAFTER_DESKTOP_TEST_PASSWORD` and `APPRAFTER_SANDBOX`, and [`desktop_context`] builds
+    /// under [`DesktopPolicy::TEST_BUILD`].
     pub fn test_build(&self) -> bool {
         self.test_build
     }
@@ -131,7 +139,9 @@ fn allows_on(key: &str, test_build: bool, macos: bool) -> bool {
     key == CONFIG_DIR_ENV
         || key == DATA_DIR_ENV
         || (key == PATH_ENV && !macos)
-        || (test_build && (key == HCLOUD_BASE_URL_ENV || key == TEST_PASSWORD_ENV))
+        || key == SSH_AUTH_SOCK_ENV
+        || (test_build
+            && (key == HCLOUD_BASE_URL_ENV || key == TEST_PASSWORD_ENV || key == SANDBOX_ENV))
 }
 
 impl EnvSource for AllowListEnv {
@@ -424,6 +434,17 @@ fn account_shell() -> Option<PathBuf> {
 /// can never be paired with the test-build policy, nor the other way round.
 pub fn desktop_context(env: &AllowListEnv, host: DesktopHost) -> CoreResult<Context> {
     Context::from_desktop_env(env, env.policy(), host)
+}
+
+/// The ssh-agent the lock's limit rows ask about (D.4a O1a): `SSH_AUTH_SOCK` when set and not
+/// empty, else on Windows the OpenSSH agent service's pipe; `None` elsewhere. Read once at start
+/// (the shell keeps it); the agent is asked only on a read's own thread, with its 2 s bound,
+/// and only to list its keys: the app never asks it to sign.
+pub fn ssh_agent(env: &AllowListEnv) -> Option<PathBuf> {
+    match env.var(SSH_AUTH_SOCK_ENV).filter(|v| !v.is_empty()) {
+        Some(sock) => Some(PathBuf::from(sock)),
+        None => cfg!(windows).then(|| PathBuf::from(r"\\.\pipe\openssh-ssh-agent")),
+    }
 }
 
 /// Why the data-directory override cannot be used: the app refuses to start (exit code 2)
@@ -780,6 +801,8 @@ mod tests {
         ("APPRAFTER_HCLOUD_BASE_URL", "http://127.0.0.1:9"),
         ("APPRAFTER_DESKTOP_TEST_PASSWORD", "open sesame"),
         ("PATH", "/usr/bin:/bin"),
+        ("SSH_AUTH_SOCK", "/tmp/agent.sock"),
+        ("APPRAFTER_SANDBOX", "/tmp/sandbox"),
         ("HCLOUD_TOKEN", "inherited-token"),
         ("APPRAFTER_AGE_KEY", "/tmp/age.key"),
         ("APPRAFTER_SSH_PRIVATE_KEY", "/tmp/id"),
@@ -810,8 +833,10 @@ mod tests {
     fn a_release_build_answers_only_the_store_root_the_data_dir_and_path() {
         let env = env_of(false, AMBIENT);
         for (key, value) in AMBIENT {
-            let expected = (matches!(*key, "APPRAFTER_CONFIG_DIR" | "APPRAFTER_DESKTOP_DATA_DIR")
-                || (*key == "PATH" && PATH_LISTED))
+            let expected = (matches!(
+                *key,
+                "APPRAFTER_CONFIG_DIR" | "APPRAFTER_DESKTOP_DATA_DIR" | "SSH_AUTH_SOCK"
+            ) || (*key == "PATH" && PATH_LISTED))
                 .then(|| value.to_string());
             assert_eq!(env.var(key), expected, "{key}");
         }
@@ -828,6 +853,8 @@ mod tests {
                     | "APPRAFTER_DESKTOP_DATA_DIR"
                     | "APPRAFTER_HCLOUD_BASE_URL"
                     | "APPRAFTER_DESKTOP_TEST_PASSWORD"
+                    | "APPRAFTER_SANDBOX"
+                    | "SSH_AUTH_SOCK"
             ) || (*key == "PATH" && PATH_LISTED))
                 .then(|| value.to_string());
             assert_eq!(env.var(key), expected, "{key}");
@@ -1126,16 +1153,22 @@ echo '/opt/homebrew/bin:/usr/bin:/bin'
                 asked.iter().all(|k| env.allows(k)),
                 "test_build={test_build}: {asked:?}"
             );
-            let mut expected = vec!["APPRAFTER_CONFIG_DIR", "APPRAFTER_DESKTOP_DATA_DIR"];
+            let mut expected = vec![
+                "APPRAFTER_CONFIG_DIR",
+                "APPRAFTER_DESKTOP_DATA_DIR",
+                "SSH_AUTH_SOCK",
+            ];
             if test_build {
                 expected.extend([
                     "APPRAFTER_DESKTOP_TEST_PASSWORD",
                     "APPRAFTER_HCLOUD_BASE_URL",
+                    "APPRAFTER_SANDBOX",
                 ]);
             }
             if PATH_LISTED {
                 expected.push("PATH");
             }
+            expected.sort();
             let mut asked_sorted = asked;
             asked_sorted.sort();
             assert_eq!(asked_sorted, expected, "test_build={test_build}");
@@ -1162,6 +1195,10 @@ echo '/opt/homebrew/bin:/usr/bin:/bin'
             assert_eq!(
                 env.var("PATH"),
                 PATH_LISTED.then(|| std::env::var("PATH").ok()).flatten()
+            );
+            assert_eq!(
+                env.var(SSH_AUTH_SOCK_ENV),
+                std::env::var(SSH_AUTH_SOCK_ENV).ok()
             );
             // `HOME` is set in any test process, so its `None` shows the list at work.
             assert!(std::env::var_os("HOME").is_some() || cfg!(windows));
@@ -1712,5 +1749,43 @@ echo '/opt/homebrew/bin:/usr/bin:/bin'
                 "{failed}"
             );
         }
+    }
+
+    /// D.4a T8: only a test build's view answers `APPRAFTER_SANDBOX`, and only a test build of
+    /// the app (whose `test-build` forwards the core's `insecure-fast-kdf`) reads it into the
+    /// context: the fence where a weak-KDF password slot may be created. Opens nothing.
+    #[test]
+    fn only_a_test_build_context_takes_the_sandbox_as_its_kdf_fence() {
+        let pairs = [
+            ("APPRAFTER_CONFIG_DIR", "/tmp/store"),
+            ("APPRAFTER_SANDBOX", "/tmp/sandbox"),
+        ];
+        let test = desktop_context(&env_of(true, &pairs), test_host()).unwrap();
+        let release = desktop_context(&env_of(false, &pairs), test_host()).unwrap();
+        let expected: Vec<PathBuf> = if cfg!(feature = "test-build") {
+            vec![PathBuf::from("/tmp/sandbox")]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(test.insecure_kdf_roots(), expected.as_slice());
+        assert!(release.insecure_kdf_roots().is_empty());
+        // L5's desktop half: a test build started without the variable has no fence.
+        let unfenced = env_of(true, &[("APPRAFTER_CONFIG_DIR", "/tmp/store")]);
+        assert!(desktop_context(&unfenced, test_host())
+            .unwrap()
+            .insecure_kdf_roots()
+            .is_empty());
+    }
+
+    /// O1a (owner, 2026-10-13): the ssh-agent the limit rows ask about — `SSH_AUTH_SOCK` when
+    /// set and not empty, else on Windows the OpenSSH agent's pipe; never a value off the list.
+    #[test]
+    fn the_ssh_agent_is_the_listed_socket() {
+        let env = env_of(false, &[("SSH_AUTH_SOCK", "/tmp/agent.sock")]);
+        assert_eq!(ssh_agent(&env), Some(PathBuf::from("/tmp/agent.sock")));
+        let none = env_of(false, &[("SSH_AUTH_SOCK", "")]);
+        let fallback = cfg!(windows).then(|| PathBuf::from(r"\\.\pipe\openssh-ssh-agent"));
+        assert_eq!(ssh_agent(&none), fallback);
+        assert_eq!(ssh_agent(&env_of(false, &[])), fallback);
     }
 }

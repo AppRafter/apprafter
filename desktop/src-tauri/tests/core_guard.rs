@@ -268,6 +268,10 @@ const REAL_ENV_TESTS: &[(&str, &str)] = &[
         "src/env.rs",
         "a_test_build_context_without_an_api_base_uses_the_real_one",
     ),
+    (
+        "src/env.rs",
+        "only_a_test_build_context_takes_the_sandbox_as_its_kdf_fence",
+    ),
 ];
 
 /// `cfg(test)`, or `cfg(all(…))` with `test` among its predicates.

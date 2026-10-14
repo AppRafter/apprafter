@@ -29,7 +29,10 @@ harness = false
 [features]
 # Walks and CI only: the scripted FakeAuthenticator in place of the OS (and, from later tasks,
 # the loopback provider override and a TEST BUILD banner). Never in a release; D.13 asserts it.
-test-build = []
+# D.4a T8: the fast key derivation, inside the fence `APPRAFTER_SANDBOX` names (env.rs), so a
+# walk creates a password slot in microseconds; the one forwarder apprafter-core's L4 guard
+# allows (INSECURE_KDF_FORWARDERS).
+test-build = ["apprafter-core/insecure-fast-kdf"]
 
 [build-dependencies]
 tauri-build = { workspace = true }
@@ -98,6 +101,9 @@ async-io = "2"
 [dev-dependencies]
 # The mock runtime for tests/ipc_mock.rs and tests/app_menu.rs.
 tauri       = { workspace = true, features = ["test"] }
+# The locked test store and `Context::with_insecure_kdf_root` (D.4a; `test-support` adds no
+# dependency, and a dev-dependency's feature never reaches the app).
+apprafter-core = { workspace = true, features = ["test-support"] }
 # tests/ipc_mock.rs reads capabilities/main.json5 as Tauri does: the version tauri-utils parses
 # it with (`config-json5`), already in the lock.
 json5       = "0.4"

@@ -140,14 +140,20 @@ pub struct DesktopHost {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DesktopPolicy {
     pub loopback_api_base: bool,
+    /// Whether `APPRAFTER_SANDBOX` is read as the fence of the fast key derivation (D.4a T8):
+    /// a test build's policy only, and only in an `insecure-fast-kdf` build; otherwise the
+    /// name is never looked up.
+    pub kdf_sandbox: bool,
 }
 
 impl DesktopPolicy {
     pub const RELEASE: DesktopPolicy = DesktopPolicy {
         loopback_api_base: false,
+        kdf_sandbox: false,
     };
     pub const TEST_BUILD: DesktopPolicy = DesktopPolicy {
         loopback_api_base: true,
+        kdf_sandbox: true,
     };
 }
 
@@ -319,7 +325,9 @@ impl Context {
     /// (`HCLOUD_TOKEN`, `APPRAFTER_AGE_KEY`, `CUE_BIN`, `APPRAFTER_SSH_*`,
     /// `APPRAFTER_SERVER_TYPE`) is ignored: a desktop started from a terminal
     /// inherits them, and every tab would then act on that one provider
-    /// project. The tool search path and the runtime dir come from `host`.
+    /// project. The tool search path and the runtime dir come from `host`. Under a policy with
+    /// [`DesktopPolicy::kdf_sandbox`], in an `insecure-fast-kdf` build (the desktop's test
+    /// build), it also reads `APPRAFTER_SANDBOX`, as [`Context::insecure_kdf_roots`] (D.4a T8).
     pub fn from_desktop_env(
         env: &dyn EnvSource,
         policy: DesktopPolicy,
@@ -345,7 +353,7 @@ impl Context {
             None => cli_providers::hetzner_cloud::DEFAULT_BASE_URL.to_string(),
         };
         let home_dir = cli_core::paths::home_dir();
-        Ok(Self::assemble(
+        let ctx = Self::assemble(
             config_root,
             hcloud_base_url,
             CliOverrides::default(),
@@ -353,7 +361,24 @@ impl Context {
             host.tool_search_path,
             host.tool_search_path_source,
             host.runtime_dir,
-        ))
+        );
+        // D.4a T8: the desktop's test build creates a password slot only under its fence,
+        // which its allow-list answers in a test build alone. The name is asked for only under
+        // a policy that wants it, so a release build never looks it up, and its list stays
+        // empty; a test build without it has no fence (L5).
+        #[cfg(feature = "insecure-fast-kdf")]
+        let ctx = if policy.kdf_sandbox {
+            Context {
+                insecure_kdf_roots: env
+                    .var_os(SANDBOX_ENV)
+                    .map(|v| std::env::split_paths(&v).collect())
+                    .unwrap_or_default(),
+                ..ctx
+            }
+        } else {
+            ctx
+        };
+        Ok(ctx)
     }
 
     /// A desktop context from an explicit store root and API base, and no
@@ -952,7 +977,15 @@ mod tests {
             (DesktopPolicy::RELEASE, vec!["APPRAFTER_CONFIG_DIR"]),
             (
                 DesktopPolicy::TEST_BUILD,
-                vec!["APPRAFTER_CONFIG_DIR", "APPRAFTER_HCLOUD_BASE_URL"],
+                if cfg!(feature = "insecure-fast-kdf") {
+                    vec![
+                        "APPRAFTER_CONFIG_DIR",
+                        "APPRAFTER_HCLOUD_BASE_URL",
+                        "APPRAFTER_SANDBOX",
+                    ]
+                } else {
+                    vec!["APPRAFTER_CONFIG_DIR", "APPRAFTER_HCLOUD_BASE_URL"]
+                },
             ),
         ] {
             let env = Recording {
@@ -1187,5 +1220,28 @@ mod tests {
             Context::for_desktop("/tmp/store".into(), "http://x").holder_base(),
             None
         );
+    }
+
+    /// D.4a T8: the desktop's test build (`insecure-fast-kdf`, forwarded by its `test-build`)
+    /// takes `APPRAFTER_SANDBOX` as the fence where a weak-KDF password slot may be created, as
+    /// the CLI's feature build does; a release policy, or a build without the feature, never
+    /// does; and a test build without the variable has no fence at all (L5's desktop half).
+    #[test]
+    fn a_desktop_context_takes_the_sandbox_only_in_a_fast_kdf_test_build() {
+        let env = MapEnv::new()
+            .with(cli_core::CONFIG_DIR_ENV, "/tmp/desk-store")
+            .with(SANDBOX_ENV, "/tmp/desk-sandbox");
+        let ctx = Context::from_desktop_env(&env, DesktopPolicy::TEST_BUILD, host()).unwrap();
+        let expected: Vec<PathBuf> = if cfg!(feature = "insecure-fast-kdf") {
+            vec![PathBuf::from("/tmp/desk-sandbox")]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(ctx.insecure_kdf_roots(), expected.as_slice());
+        let release = Context::from_desktop_env(&env, DesktopPolicy::RELEASE, host()).unwrap();
+        assert!(release.insecure_kdf_roots().is_empty());
+        let unfenced = MapEnv::new().with(cli_core::CONFIG_DIR_ENV, "/tmp/desk-store");
+        let ctx = Context::from_desktop_env(&unfenced, DesktopPolicy::TEST_BUILD, host()).unwrap();
+        assert!(ctx.insecure_kdf_roots().is_empty());
     }
 }
