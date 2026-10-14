@@ -282,6 +282,26 @@ unless `APPRAFTER_E2E_SKIP_DESTROY=1`, in about 5 minutes with the published
 operator and 9 to 16 with the working tree's, which first builds the operator
 and webhook images.
 
+## store-lock-walk.sh
+
+The target-store lock (ADR 0068) end to end against a bare kind cluster: `lock on` at a
+pseudo-terminal of the walk's own (the 15-character advice, the recovery key typed back whole),
+one terminal's unlock window used by `kubeconfig`, `doctor --no-ping` and `lock status` with no
+other prompt, another terminal asked, no terminal refused `store_locked`, `HCLOUD_TOKEN` and
+`APPRAFTER_AGE_KEY` refused `override_refused`, `lock on --timeout`, and `lock off` from a second
+terminal ending the first one's window. Every CLI call runs on a store of its own; nothing reaches
+a provider.
+
+### Usage
+
+```bash
+(cd cli && cargo build --release -p apprafter)
+APPRAFTER_BIN="$PWD/cli/target/release/apprafter" nix develop --command bash e2e/store-lock-walk.sh 2>&1 | tee walk.log
+```
+
+Read the log: it holds exactly one `WALK GREEN` line (kind's cleanup lines follow it) and no
+`FAILED`. `APPRAFTER_E2E_KEEP=1` keeps the cluster and the sandbox.
+
 ## Failure diagnostics
 
 Every walk the `.github/workflows/e2e-*.yml` workflows run calls
