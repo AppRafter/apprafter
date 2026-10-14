@@ -28,6 +28,8 @@ export interface TargetDetailsProps {
   report: TargetReport;
   os: Os;
   secretsMode: SecretsMode;
+  /** The store's lock state cannot be used (`AppInfo.secrets.problem`, D.4a critic B finding 8). */
+  secretsProblem?: boolean;
   actions: TargetDetailActions;
   /** Opens the machine picker (D.3e); null: no Change button. */
   onChangeMachine: (() => void) | null;
@@ -55,6 +57,7 @@ export function TargetDetails({
   report,
   os,
   secretsMode,
+  secretsProblem = false,
   actions,
   onChangeMachine,
 }: TargetDetailsProps) {
@@ -111,7 +114,7 @@ export function TargetDetails({
         <CardRow
           label="API token"
           value={tokenValue(report.token)}
-          {...(report.token.set && { sub: secretCopy(os, secretsMode) })}
+          {...(report.token.set && { sub: secretCopy(os, secretsMode, secretsProblem) })}
           control={
             <Button size={26} onClick={actions.renew}>
               Renew

@@ -20,7 +20,7 @@ import { refreshList, useOperations } from '../ipc/operations';
 import { PlannedSection } from '../screens/placeholders/PlannedSection';
 import { TargetScreen } from '../screens/target/TargetScreen';
 import { TargetsPage } from '../screens/targets/TargetsPage';
-import { lockOff, lockOffMessage, NO_AUTH_NOTICE, useLockActions } from '../state/lock';
+import { lockOff, lockOffMessage, noAuthNotice, useLockActions } from '../state/lock';
 import { usePlatform } from '../state/platform';
 import { ScopeContext } from '../state/scope';
 import { closedTabs, INITIAL_SESSION, sessionReducer, type TargetTab } from '../state/session';
@@ -66,7 +66,9 @@ export function Shell() {
   const { lock: lockNow } = useLockActions();
   const toast = useToast();
   // Not in effect, the lock is not offered: Lock is disabled and Mod+L says why instead.
-  const off = lockOff(info.auth.available, useSettings().data?.lockEnabled);
+  const off = lockOff(info.auth.available, useSettings().data?.lockEnabled, info.secrets.protected);
+  // D.4a D25: on a protected store the notice says confirmations ask for the lock password.
+  const notice = noAuthNotice(info.auth.available, info.secrets.protected);
   const showTargets = useCallback(() => dispatch({ type: 'show', view: { kind: 'targets' } }), []);
   const openSettings = useCallback(() => {
     if (settingsRef.current !== null) return;
@@ -167,9 +169,9 @@ export function Shell() {
             }}
           />
         </TitleBar>
-        {off === 'no_auth' && (
+        {notice !== null && (
           <p className="shell-notice" role="note">
-            {NO_AUTH_NOTICE}
+            {notice}
           </p>
         )}
         <div className="shell-body">

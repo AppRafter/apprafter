@@ -18,7 +18,7 @@ import { AppOverlayContext, useAppOverlayHost } from '../../shell/AppOverlays';
 import { ViewFrame } from '../../shell/ViewFrame';
 import { PlatformContext } from '../../state/platform';
 import { createQueryClient } from '../../state/queryClient';
-import { appInfo } from '../../test/fixtures';
+import { appInfo, STORE_PROBLEMS } from '../../test/fixtures';
 import { uiError } from '../../test/ipc';
 import { renderScreen } from '../../test/screens';
 import { settleIpc } from '../../test/settle';
@@ -53,6 +53,21 @@ test('shows the report; a provisioned target offers no machine change', async ()
   );
   expect(screen.getByRole('region', { name: 'Danger zone' })).toBeDefined();
 });
+
+// Nothing is called encrypted that is not (critic B finding 8; controller, d4a-g run 5).
+test.each(STORE_PROBLEMS)(
+  "the token's line on a store whose lock state cannot be used: %s",
+  async (_state, secrets) => {
+    renderScreen(<TargetScreen name="prod-eu" onRenamed={() => {}} onRemoved={() => {}} />, {
+      info: appInfo({ secrets }),
+    });
+    const token = await screen.findByRole('group', { name: 'API token' });
+    expect(token.textContent).toContain(
+      "Unavailable until this target store's lock state is repaired",
+    );
+    expect(token.textContent).not.toMatch(/encrypted/i);
+  },
+);
 
 test('rename: the form checks the name, a plain confirm lists the changes, the tab follows', async () => {
   const onRenamed = mock();

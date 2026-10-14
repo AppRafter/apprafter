@@ -17,7 +17,8 @@
 // the clipboard. The toolchain (`?tools=`): by default helm is missing; `found`, every tool is
 // (the panel with nothing to install). The target store's lock (`?secrets=`, lock.ts): in files
 // by default; a protected store's lock screen takes its lock password or recovery key, behind the
-// same back-off, and its Stop protecting asks for one.
+// same back-off, and its Stop protecting asks for one. A test locks the store from a terminal under
+// the app (mockLockFromTerminal), as Rust's re-read then finds it.
 import { emit } from '@tauri-apps/api/event';
 import { mockIPC, mockWindows } from '@tauri-apps/api/mocks';
 import type { AppInfo } from '../generated/AppInfo';
@@ -195,6 +196,9 @@ let current: MockOps | null = null;
 /** The target store of the last installMockIpc. */
 let currentStore: MockStore | null = null;
 
+/** The terminal lock of the last installMockIpc (mockLockFromTerminal). */
+let currentTerminalLock: (() => Promise<LockState>) | null = null;
+
 /** The engine of the last installMockIpc; tests register plans and reads through it. */
 export function mockOps(): MockOps {
   if (current === null) throw new Error('mock IPC: installMockIpc() has not run');
@@ -208,6 +212,16 @@ export function mockOps(): MockOps {
 export function mockTargetStore(): MockStore {
   if (currentStore === null) throw new Error('mock IPC: installMockIpc() has not run');
   return currentStore;
+}
+
+/**
+ * A terminal's `apprafter lock on` under the app (D.4a T74): the mock's store is protected from
+ * now, and the app locks as Rust's re-read locks it (`secrets_locked`), unless it is locked
+ * already. The answer is the lock state that results.
+ */
+export function mockLockFromTerminal(): Promise<LockState> {
+  if (currentTerminalLock === null) throw new Error('mock IPC: installMockIpc() has not run');
+  return currentTerminalLock();
 }
 
 export function installMockIpc(options: MockOptions = {}): void {
@@ -322,6 +336,10 @@ export function installMockIpc(options: MockOptions = {}): void {
   const lockStore = mockLock(engine, options.secrets ?? 'files');
   // Rust's gate for the store's secret: one back-off with the PAM field's, no PAM words.
   const verifyStoreSecret = verifyWith(lockStore.opens, []);
+  currentTerminalLock = async () => {
+    lockStore.lockFromTerminal();
+    return lock.locked ? lock : transition('secrets_locked');
+  };
 
   const handlers: Record<string, Handler> = {
     app_info: appInfo,

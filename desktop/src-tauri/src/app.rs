@@ -2765,6 +2765,59 @@ mod tests {
         assert!(r.shell.lock.state().locked);
     }
 
+    /// A store locked from a terminal under the unlocked app opens again in the app on every
+    /// route the shell has (controller, d4a-g run 5): the OS's own prompt (Windows Hello,
+    /// Touch ID, polkit), Linux's PAM field, and no system authentication at all. The app
+    /// locks (`SecretsLocked`), the OS opens nothing, the system password opens nothing, and
+    /// the store's secret, typed into the lock screen's field, does (D.4a T75).
+    #[test]
+    fn a_store_locked_from_a_terminal_opens_with_its_secret_on_every_route() {
+        let routes: [(&str, Arc<dyn Authenticator>); 3] = [
+            ("the OS's prompt", fake()),
+            (
+                "PAM's field",
+                Arc::new(FakeAuthenticator::new().with_password("system password".to_string())),
+            ),
+            ("no system authentication", Arc::new(NoAuthenticator)),
+        ];
+        for (route, auth) in routes {
+            let r = rig(unlocked_at_start(), auth);
+            assert!(!r.shell.lock.state().locked, "{route}: unlocked at start");
+            let store = locked_store(r.shell.context.config_root(), &[]);
+            r.shell.app_info();
+            let state = r.shell.lock.state();
+            assert!(
+                state.locked && state.reason == Some(LockReason::SecretsLocked),
+                "{route}: {state:?}"
+            );
+            let e = r.shell.unlock().unwrap_err();
+            assert!(
+                matches!(
+                    e,
+                    DesktopError::AuthUnavailable {
+                        reason: UnavailableReason::UsePasswordField
+                    }
+                ),
+                "{route}: {e:?}"
+            );
+            let wrong = r
+                .shell
+                .unlock_with_password(Zeroizing::new("system password".into()))
+                .unwrap_err();
+            assert!(
+                matches!(*wrong.error, DesktopError::AuthFailed { .. }),
+                "{route}: {wrong:?}"
+            );
+            assert!(r.shell.lock.state().locked, "{route}: still locked");
+            let state = r.shell.unlock_with_password(secret(&store)).unwrap();
+            assert!(!state.locked, "{route}: unlocked");
+            assert!(
+                r.shell.vault.holds(&store.store_id),
+                "{route}: the key held"
+            );
+        }
+    }
+
     /// Critic B finding 19: a terminal's `lock off` (or `lock on`) under an unlocked app is
     /// followed by no secret read; the idle tick sees `store.yaml` change and re-reads.
     #[test]

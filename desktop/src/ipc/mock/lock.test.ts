@@ -8,7 +8,7 @@ import { IpcError } from '../api';
 import { DESKTOP_ERROR_CODES } from '../generated/errors';
 import type { OpEvent } from '../generated/OpEvent';
 import type { OpId } from '../generated/OpId';
-import { installMockIpc } from './index';
+import { installMockIpc, mockLockFromTerminal } from './index';
 import { MOCK_RECOVERY_KEY, MOCK_STORE_PASSWORD } from './lock';
 
 // The settle rule (test/settle.ts; critic A finding 9): the engine's 0 ms events land before
@@ -91,6 +91,22 @@ describe('the mock store lock', () => {
     expect(end).toMatchObject({ kind: 'failed', error: { fields: { reason: 'not_confirmed' } } });
   });
 
+  test('a store in files: Stop protecting opens nothing, a plain confirm as Rust registers it', async () => {
+    installMockIpc({ opDelayMs: 0 });
+    await api.unlock();
+    const off = await api.opPlanLockOff();
+    // Rust's plan_lock_off: no vault to open, so Bounded and no gesture, never the OS's.
+    expect({ class: off.plan.class, gesture: off.plan.gesture }).toEqual({
+      class: 'bounded',
+      gesture: 'none',
+    });
+    expect(await ran(off.plan.opId)).toMatchObject({
+      kind: 'finished',
+      outcome: { status: 'completed', result: { notLocked: true, backedOut: false } },
+    });
+    expect((await api.appInfo()).secrets.mode).toBe('files');
+  });
+
   test('a protected store: the field takes its secret, and Stop protecting asks for it', async () => {
     installMockIpc({ opDelayMs: 0, secrets: 'locked' });
     expect(await code(api.unlock())).toBe(DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE);
@@ -102,5 +118,18 @@ describe('the mock store lock', () => {
     expect(await code(ran(off.plan.opId))).toBe(DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE);
     expect((await ran(off.plan.opId, MOCK_RECOVERY_KEY)).kind).toBe('finished');
     expect((await api.appInfo()).secrets.mode).toBe('files');
+  });
+
+  test("a terminal's lock on under the unlocked app locks it; its field opens it", async () => {
+    installMockIpc({ opDelayMs: 0 });
+    await api.unlock();
+    const state = await mockLockFromTerminal();
+    expect({ locked: state.locked, reason: state.reason }).toEqual({
+      locked: true,
+      reason: 'secrets_locked',
+    });
+    expect((await api.appInfo()).secrets).toMatchObject({ mode: 'locked', protected: true });
+    expect(await code(api.unlock())).toBe(DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE);
+    expect((await api.unlockWithPassword(MOCK_STORE_PASSWORD)).locked).toBe(false);
   });
 });

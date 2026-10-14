@@ -32,6 +32,8 @@ import type { UiError } from '../../ipc/generated/UiError';
 import { useOperation } from '../../ipc/operations';
 import { notesIn, type OpNote } from '../../ipc/plans';
 import { useCopy } from '../../state/copy';
+import { useLockInfo } from '../../state/lockInfo';
+import { hardeningLine } from '../../state/lockText';
 import { useRead } from '../../state/read';
 import { useScope } from '../../state/scope';
 import { DoctorCheckRow } from './DoctorCheckRow';
@@ -232,6 +234,7 @@ export function DoctorOverlay({
             </ul>
           </section>
         ))}
+        <AppHardeningNote />
       </div>
       <div className="modal-foot">
         <span className="doctor-foot">
@@ -261,5 +264,21 @@ export function DoctorOverlay({
         </Button>
       </div>
     </ModalFrame>
+  );
+}
+
+/**
+ * What the app's own process did not take of its protections (D.4a T77, rule 1): the doctor
+ * says it too, as the CLI's doctor does for a holder (`window_hardening`; critic B finding 13).
+ * Nothing while lock_info has not answered, or answers nothing.
+ */
+function AppHardeningNote() {
+  const { data } = useLockInfo();
+  if (data === undefined || data === null) return null;
+  const line = hardeningLine(data.app, data.report.window.status === 'app');
+  return line === null ? null : (
+    <p className="doctor-note" role="note">
+      {line}
+    </p>
   );
 }

@@ -290,6 +290,22 @@ test('Make default only on another target; Rename and Renew call back', async ()
   expect(within(row('CLI default')).queryByRole('button')).toBeNull();
 });
 
+test("the token's line says when the store's lock state cannot be used (critic B finding 8)", () => {
+  render(
+    <TargetDetails
+      report={targetReport()}
+      os="linux"
+      secretsMode="locked"
+      secretsProblem
+      actions={noop()}
+      onChangeMachine={null}
+    />,
+  );
+  expect(
+    screen.getByText("Unavailable until this target store's lock state is repaired"),
+  ).toBeDefined();
+});
+
 test('the danger zone removes from this computer and says the provider is untouched', async () => {
   const onRemove = mock();
   render(<DangerZone onRemove={onRemove} />);

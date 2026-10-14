@@ -9,13 +9,14 @@ import { endedAwaySnapshot, resetEndedAway } from '../../ipc/away';
 import { CORE_ERROR_CODES } from '../../ipc/generated/core-errors';
 import { DESKTOP_ERROR_CODES } from '../../ipc/generated/errors';
 import type { OpEvent } from '../../ipc/generated/OpEvent';
+import type { SecretsInfo } from '../../ipc/generated/SecretsInfo';
 import { newScope, resetLifecycle, sessionScope } from '../../ipc/lifecycle';
 import { resetOperations } from '../../ipc/operations';
 import { ViewFrame } from '../../shell/ViewFrame';
 import { PlatformContext } from '../../state/platform';
 import { createQueryClient } from '../../state/queryClient';
 import { ScopeContext } from '../../state/scope';
-import { appInfo } from '../../test/fixtures';
+import { appInfo, STORE_PROBLEMS } from '../../test/fixtures';
 import { catalogue, planParts, targetAdded } from '../../test/flows';
 import {
   cancelled,
@@ -48,12 +49,12 @@ afterEach(async () => {
 const currentStep = () => document.querySelector('[aria-current="step"]')?.textContent ?? '';
 
 /** The wizard in a screen of its own: `gone()` is its host closing it (the scope ends, it goes). */
-function renderWizard(os: 'linux' | 'windows' = 'linux') {
+function renderWizard(os: 'linux' | 'windows' = 'linux', secrets?: SecretsInfo) {
   const onClose = mock();
   const own = newScope(sessionScope());
   const { unmount } = render(
     <QueryClientProvider client={createQueryClient()}>
-      <PlatformContext value={appInfo({ os })}>
+      <PlatformContext value={appInfo({ os, ...(secrets !== undefined && { secrets }) })}>
         <ToastProvider>
           <ViewFrame>
             <ScopeContext value={own.scope}>
@@ -90,6 +91,18 @@ describe('provider and token', () => {
     renderWizard('windows');
     expect(screen.getByText('Saved in a file in your user profile')).toBeDefined();
   });
+
+  // Nothing is called encrypted that is not (critic B finding 8; controller, d4a-g run 5).
+  test.each(STORE_PROBLEMS)(
+    'the secret copy of a store whose lock state cannot be used: %s',
+    (_state, secrets) => {
+      renderWizard('linux', secrets);
+      expect(
+        screen.getByText("Unavailable until this target store's lock state is repaired"),
+      ).toBeDefined();
+      expect(screen.queryByText(/encrypted/i)).toBeNull();
+    },
+  );
 
   test('the token crosses IPC once, the field is emptied, and Machine is the next step', async () => {
     h.read('op_start_verify_token', [completed({ draftId: 7, elapsedMs: 182 })]);

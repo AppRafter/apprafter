@@ -6,6 +6,7 @@ import type { LockState } from '../ipc/generated/LockState';
 import type { PlanView } from '../ipc/generated/PlanView';
 import type { ProvisionedServer } from '../ipc/generated/ProvisionedServer';
 import type { ProvisionedState } from '../ipc/generated/ProvisionedState';
+import type { SecretsInfo } from '../ipc/generated/SecretsInfo';
 import type { Settings } from '../ipc/generated/Settings';
 import type { TargetReport } from '../ipc/generated/TargetReport';
 import type { TargetSummary } from '../ipc/generated/TargetSummary';
@@ -42,6 +43,48 @@ export function appInfo(more: Partial<AppInfo> = {}): AppInfo {
     ...more,
   };
 }
+
+/**
+ * The two stores whose lock state cannot be used, as Rust's `Protection` reports them (D.4a
+ * critic B finding 8): a `store.yaml` that cannot be read — `locked`, protected (the app stays
+ * locked, fail closed) with no id — and a lock whose vault is gone — `locked`, not protected
+ * (nothing opens it). Each carries the core's own words; neither is ever "encrypted".
+ */
+export const STORE_PROBLEMS: readonly (readonly [string, SecretsInfo])[] = [
+  [
+    'store.yaml cannot be read',
+    {
+      mode: 'locked',
+      slots: [],
+      protected: true,
+      store: '~/.config/apprafter',
+      problem: {
+        code: 'apprafter::secrets::store_file_unreadable',
+        message:
+          "~/.config/apprafter/store.yaml cannot be read, so whether this target store's secrets are locked is unknown: expected a mapping",
+        help: null,
+        causes: [],
+        fields: {},
+      },
+    },
+  ],
+  [
+    'the vault is gone',
+    {
+      mode: 'locked',
+      slots: ['password', 'recovery_key'],
+      protected: false,
+      store: '~/.config/apprafter',
+      problem: {
+        code: 'apprafter::secrets::vault_unreadable',
+        message: 'the vault ~/.config/apprafter/vault is missing',
+        help: 'store.yaml says this target store is locked, but its vault is gone, and its secrets are nowhere else: restore ~/.config/apprafter/vault from a backup.',
+        causes: [],
+        fields: { problem: 'missing' },
+      },
+    },
+  ],
+];
 
 /** Rust's Settings::default(), with overrides. */
 export function settings(more: Partial<Settings> = {}): Settings {

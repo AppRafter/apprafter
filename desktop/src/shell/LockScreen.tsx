@@ -4,7 +4,10 @@
 // for the owner. Where it cannot — Linux without a polkit agent or policy — the app's own
 // password field instead, checked by Rust (`unlock_with_password`); the plain button would only
 // ask for a prompt that cannot show. Whether the field shows is app_info's to say, read again on
-// every lock and after every refusal (state/platform.ts).
+// every lock and after every refusal (state/platform.ts). On a protected store
+// (`AppInfo.secrets.protected`) the field is the store's on every OS (D.4a T75): the lock password
+// or the recovery key, opened by Rust; the OS opens nothing there. A store whose lock state cannot
+// be used (`secrets.problem`) says why, and nothing calls it encrypted.
 //
 // The password lives in the field's state while it is typed, goes out with the request, and the
 // field is emptied when the answer comes, whatever it is: it is never cached, mutated through
@@ -14,16 +17,18 @@
 // long as Rust says its back-off refuses, counting it down, then give the field the focus back.
 import { type FormEvent, type ReactNode, useEffect, useRef, useState } from 'react';
 import { Button } from '../components/Button';
+import { ErrorPanel } from '../components/ErrorPanel';
 import { ArrowRightIcon, SpinnerGapIcon } from '../components/icons';
 import { Logo } from '../components/Logo';
 import { PasswordField } from '../components/PasswordField';
 import { Tag } from '../components/Tag';
 import { uiErrorOf } from '../ipc/api';
 import type { LockState } from '../ipc/generated/LockState';
-import type { SecretsMode } from '../ipc/generated/SecretsMode';
 import { authPrompt, authRefusal, retryLine, useRetryCountdown } from '../state/auth';
 import { useLockActions } from '../state/lock';
+import { lockFooter, STORE_PROBLEM_REASON } from '../state/lockText';
 import { osName, usePlatform } from '../state/platform';
+import { StoreSecretForm } from './StoreSecretForm';
 
 function reasonLine({ reason, autoLockMinutes: minutes }: LockState): string {
   switch (reason) {
@@ -44,15 +49,6 @@ function reasonLine({ reason, autoLockMinutes: minutes }: LockState): string {
       return 'Locked.';
   }
 }
-
-// D.4a surface §5.7: files as before; a protected store (D20). The keychain's line went with it.
-const PROTECTED_FOOTER = 'Clusters keep running. Credentials stay encrypted until you unlock.';
-const FOOTERS: Record<SecretsMode, string> = {
-  files: 'Clusters keep running. Credentials are stored in files on this computer.',
-  locking: PROTECTED_FOOTER,
-  locked: PROTECTED_FOOTER,
-  unlocking: PROTECTED_FOOTER,
-};
 
 /** "alex.morgan" → "AM": the first letters of the account's first two words. */
 function initials(account: string): string {
@@ -88,7 +84,11 @@ export function LockScreen({ state }: LockScreenProps) {
   }, [backoff]);
 
   const refused = (error: unknown, viaField: boolean) => {
-    const said = authRefusal(uiErrorOf(error), viaField);
+    const said = authRefusal(
+      uiErrorOf(error),
+      viaField,
+      info.secrets.protected ? 'store' : 'system',
+    );
     setRefusal(said.lines);
     if (said.retryInMs !== null) startRetry(said.retryInMs);
     setWaiting(false);
@@ -132,7 +132,13 @@ export function LockScreen({ state }: LockScreenProps) {
       <div className="lock-column">
         <Logo size={56} />
         <h1 className="lock-title">AppRafter is locked</h1>
-        <p className="lock-reason">{reasonLine(state)}</p>
+        <p className="lock-reason">
+          {state.reason === 'secrets_locked' && info.secrets.problem !== null
+            ? STORE_PROBLEM_REASON
+            : reasonLine(state)}
+        </p>
+        {/* Why, in the core's words: store.yaml unreadable, or the vault gone (critic A 22). */}
+        {info.secrets.problem !== null && <ErrorPanel error={info.secrets.problem} />}
         <div className="lock-account">
           <span className="lock-avatar" aria-hidden="true">
             {initials(info.account)}
@@ -142,7 +148,18 @@ export function LockScreen({ state }: LockScreenProps) {
             <span className="lock-account-meta">{`${osName(info.os)} account · ${info.host}`}</span>
           </span>
         </div>
-        {info.auth.passwordField ? (
+        {info.secrets.protected ? (
+          <StoreSecretForm
+            store={info.secrets.store}
+            checking={waiting}
+            backoff={backoff}
+            refused={refusal.length > 0}
+            onType={() => setRefusal((lines) => (lines.length === 0 ? lines : []))}
+            onSubmit={onPassword}
+          >
+            {said}
+          </StoreSecretForm>
+        ) : info.auth.passwordField ? (
           <PasswordForm
             account={info.account}
             checking={waiting}
@@ -170,7 +187,9 @@ export function LockScreen({ state }: LockScreenProps) {
         )}
         {info.testBuild && <Tag tone="warn">TEST BUILD</Tag>}
       </div>
-      <footer className="lock-footer">{FOOTERS[info.secrets.mode]}</footer>
+      <footer className="lock-footer">
+        {lockFooter(info.secrets.mode, info.secrets.problem !== null)}
+      </footer>
     </main>
   );
 }

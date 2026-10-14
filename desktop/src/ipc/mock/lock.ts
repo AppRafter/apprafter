@@ -70,6 +70,8 @@ export interface MockLock {
   /** Whether `secret` opens the store: the lock password or the recovery key, as one field takes either. */
   readonly opens: (secret: unknown) => boolean;
   readonly handlers: Readonly<Record<string, Handler>>;
+  /** A terminal's `apprafter lock on` under the app: the store is protected from now. */
+  readonly lockFromTerminal: () => void;
 }
 
 export function mockLock(engine: MockOps, initial: SecretsMode): MockLock {
@@ -237,6 +239,27 @@ export function mockLock(engine: MockOps, initial: SecretsMode): MockLock {
       );
     },
     op_plan_lock_off: (): LockOffPlan => {
+      // As Rust's plan_lock_off: a vault to open makes the plan destructive, its gesture the
+      // store's secret. With nothing to open — a store in files, which the core plans as not
+      // locked — it is a plain confirm (Bounded), as the CLI asks nothing there (critic B
+      // finding 25; d4a-g run 4's concern 3).
+      const vault = protectedNow();
+      if (!vault) {
+        const plan: PlanView = engine.registerPlan(
+          {
+            class: 'bounded',
+            title: `The target store at ${STORE} is not locked`,
+            changes: [],
+            target: null,
+          },
+          {
+            end: () => ({
+              result: { store: STORE, notLocked: true, backedOut: false, ageKey: null },
+            }),
+          },
+        );
+        return { plan, needsKey: false };
+      }
       // Stopping an interrupted Protect backs it out, as the core reports it (`backedOut`; the
       // page's toast says so: UI verifier M3).
       const backedOut = mode === 'locking';
@@ -268,7 +291,7 @@ export function mockLock(engine: MockOps, initial: SecretsMode): MockLock {
             return { result: { store: STORE, notLocked: false, backedOut, ageKey: null } };
           },
         },
-        protectedNow() ? 'store_secret' : undefined,
+        'store_secret',
       );
       return { plan, needsKey: false };
     },
@@ -284,5 +307,8 @@ export function mockLock(engine: MockOps, initial: SecretsMode): MockLock {
     }),
     opens,
     handlers,
+    lockFromTerminal: () => {
+      mode = 'locked';
+    },
   };
 }

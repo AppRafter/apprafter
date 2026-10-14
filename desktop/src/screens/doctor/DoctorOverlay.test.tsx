@@ -512,3 +512,31 @@ describe('DoctorOverlay', () => {
     await waitFor(() => expect(h.of('op_cancel').map((c) => c.args)).toEqual([{ opId: id }]));
   });
 });
+
+test("the app's own protections that did not take are said here too (D.4a T77)", async () => {
+  h.answer('lock_info', {
+    report: {
+      store: '~/s',
+      storeId: null,
+      targets: [],
+      mode: 'files',
+      slots: [],
+      windowMinutes: 5,
+      window: { status: 'closed' },
+      limits: [],
+    },
+    app: {
+      nonDumpable: false,
+      denyAttach: null,
+      coreOff: true,
+      memoryLocked: false,
+      processDacl: null,
+    },
+  });
+  renderDoctor('prod');
+  expect(
+    await screen.findByText(
+      "AppRafter's own protections are weaker here: other programs running as you may attach to it.",
+    ),
+  ).toBeDefined();
+});

@@ -14,6 +14,7 @@ import type { Settings } from '../ipc/generated/Settings';
 import type { TargetListReport } from '../ipc/generated/TargetListReport';
 import { installMockIpc } from '../ipc/mock';
 import { refreshList, resetOperations } from '../ipc/operations';
+import { NO_AUTH_PROTECTED_NOTICE } from '../state/lockText';
 import { PlatformContext } from '../state/platform';
 import { createQueryClient } from '../state/queryClient';
 import { lockState, settings, targetSummary } from '../test/fixtures';
@@ -188,6 +189,30 @@ describe('Shell', () => {
     cleanup();
     shell();
     expect(screen.queryByRole('note')).toBeNull();
+  });
+
+  test('on a protected store with no system authentication, the notice says confirmations ask for the lock password', async () => {
+    const user = shell({
+      ...INFO,
+      auth: { ...INFO.auth, available: false, method: null, unavailable: 'no_backend' },
+      secrets: {
+        mode: 'locked',
+        slots: ['password', 'recovery_key'],
+        protected: true,
+        store: '~/.config/apprafter',
+        problem: null,
+      },
+    });
+    expect(screen.getByText(NO_AUTH_PROTECTED_NOTICE)).toBeDefined();
+    expect(screen.queryByText(NO_AUTH_NOTICE)).toBeNull();
+    // The lock is in effect there (T74): its field opens it whatever the OS offers.
+    await waitFor(() =>
+      expect(
+        (screen.getByRole('button', { name: 'Lock Ctrl+L' }) as HTMLButtonElement).disabled,
+      ).toBe(false),
+    );
+    await user.keyboard('{Control>}l{/Control}');
+    expect(calls).toContain('lock_now');
   });
 
   test('with no system authentication Lock is disabled, and Ctrl+L says why instead', async () => {
