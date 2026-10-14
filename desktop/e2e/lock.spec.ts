@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
-// The target store's lock on the mock IPC (D.4a §3.14): Protect from Settings end to end, a
-// protected store's lock screen (its own field on every OS), the pinned settings (Auto-lock
-// without Never, O7) and Stop protecting with the store's secret (O11). The mock's secrets are
-// demo values: the lock password below and T24's first recovery-key test vector, nobody's.
+// The target store's lock on the mock IPC (D.4a §3.14; WI-476): the Security page — the store and
+// every target it covers, reached from the Targets page's line, the sidebar and Settings — Protect
+// from it end to end, a protected store's lock screen (its own field on every OS), the pinned
+// settings in Settings › Lock (Auto-lock without Never, O7) and Stop protecting with the store's
+// secret (O11). The mock's secrets are demo values: the lock password below and T24's first
+// recovery-key test vector, nobody's.
 import { expect, type Page, type TestInfo, test } from '@playwright/test';
 
 const STORE_PASSWORD = 'correct horse battery staple';
@@ -22,14 +24,21 @@ async function openSettings(page: Page) {
   return settings;
 }
 
-test('Protect: the password, the key shown, copied and typed back, the run', async ({
+/** The Security page from the sidebar's footer item; its view's main region. */
+async function openSecurity(page: Page) {
+  await page.getByRole('button', { name: 'Security', exact: true }).click();
+  await expect(page.getByRole('heading', { level: 1, name: 'Security' })).toBeVisible();
+  return page.getByRole('main');
+}
+
+test('Protect from the Security page: the password, the key shown, copied and typed back, the run', async ({
   page,
 }, info) => {
   await page.goto(`/${queryOf(info)}`);
   await page.getByRole('button', { name: 'Unlock' }).click();
-  const settings = await openSettings(page);
-  await expect(settings.getByText(/^Secrets are in files/)).toBeVisible();
-  await settings.getByRole('button', { name: 'Protect…' }).click();
+  const security = await openSecurity(page);
+  await expect(security.getByText(/^Secrets are in files/)).toBeVisible();
+  await security.getByRole('button', { name: 'Protect…' }).click();
   const wizard = page.getByRole('dialog', { name: 'Protect secrets' });
   await expect(wizard).toBeVisible();
   // The title on one line, clear of the five steps beside it: nothing overlaps.
@@ -75,11 +84,11 @@ test('Protect: the password, the key shown, copied and typed back, the run', asy
   await expect(
     page.getByText('Secrets protected. Unlocking AppRafter now opens them.'),
   ).toBeVisible();
-  await expect(settings.getByRole('button', { name: 'Stop protecting…' })).toBeVisible();
+  await expect(security.getByRole('button', { name: 'Stop protecting…' })).toBeVisible();
   await shot(page, info, 'protected');
 });
 
-test('a protected store: its own field on the lock screen, the pins, Stop protecting', async ({
+test('a protected store: its own field on the lock screen, the pins in Settings, Stop protecting on the Security page', async ({
   page,
 }, info) => {
   await page.goto(`/${queryOf(info)}&secrets=locked`);
@@ -98,6 +107,9 @@ test('a protected store: its own field on the lock screen, the pins, Stop protec
   await field.fill(STORE_PASSWORD);
   await field.press('Enter');
   await expect(page.getByRole('heading', { name: 'Open a cluster' })).toBeVisible();
+  await expect(
+    page.getByText('Target store ~/.config/apprafter · Secrets: protected'),
+  ).toBeVisible();
 
   const settings = await openSettings(page);
   await expect(settings.getByRole('switch', { name: 'Require unlock' })).toBeDisabled();
@@ -111,13 +123,68 @@ test('a protected store: its own field on the lock screen, the pins, Stop protec
   // And it looks unavailable, as a disabled option does: offered, it would read as a choice.
   await expect(never).toHaveCSS('opacity', '0.45');
   await expect(never).toHaveCSS('cursor', 'not-allowed');
+  // Nothing of the store's own protection is in Settings any more (WI-476).
+  await expect(settings.getByRole('button', { name: 'Stop protecting…' })).toHaveCount(0);
   await shot(page, info, 'settings, lock pinned');
 
-  await settings.getByRole('button', { name: 'Stop protecting…' }).click();
+  await settings.getByRole('button', { name: 'Open Security' }).click();
+  await expect(settings).toBeHidden();
+  await expect(page.getByRole('heading', { level: 1, name: 'Security' })).toBeVisible();
+  const security = page.getByRole('main');
+  await security.getByRole('button', { name: 'Stop protecting…' }).click();
   const confirm = page.getByRole('dialog', { name: 'Stop protecting secrets' });
   await confirm.getByLabel('Lock password or recovery key', { exact: true }).fill(STORE_PASSWORD);
   await shot(page, info, 'stop protecting, the store secret');
   await confirm.getByRole('button', { name: 'Stop protecting' }).click();
   await expect(page.getByText('Secrets are in files again.')).toBeVisible();
-  await expect(settings.getByRole('button', { name: 'Protect…' })).toBeVisible();
+  await expect(security.getByRole('button', { name: 'Protect…' })).toBeVisible();
+});
+
+test('the Security page: the store and every target it covers, three ways in', async ({
+  page,
+}, info) => {
+  const query = queryOf(info);
+  // The mock is a Mac unless told otherwise: Mod is Cmd there, Ctrl on Windows.
+  const mod = query.includes('os=windows') ? 'Control' : 'Meta';
+  await page.goto(`/${query}`);
+  await page.getByRole('button', { name: 'Unlock' }).click();
+
+  // 1. From the Targets page's line.
+  await expect(
+    page.getByText('Target store ~/.config/apprafter · Secrets: in files'),
+  ).toBeVisible();
+  await shot(page, info, 'targets, the store line');
+  await page.getByRole('button', { name: 'Security page' }).click();
+  const title = page.getByRole('heading', { level: 1, name: 'Security' });
+  await expect(title).toBeFocused();
+  const security = page.getByRole('main');
+  await expect(
+    security.getByText('Target store ~/.config/apprafter', { exact: true }),
+  ).toBeVisible();
+  await expect(security.getByText('Covers 4 targets: broken, lab, prod-eu, staging')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Security', exact: true })).toHaveAttribute(
+    'aria-current',
+    'page',
+  );
+  await shot(page, info, 'security, a store in files');
+
+  // 2. From a tab's sidebar: Enter on the focused item. That Tab reaches it is the bun Shell
+  // test's ("reached by the keyboard") and the walk's (D-16).
+  await page.keyboard.press(`${mod}+KeyT`);
+  await page.getByRole('button', { name: 'Open prod-eu' }).click();
+  await expect(page.getByRole('tab', { name: 'prod-eu' })).toHaveAttribute('aria-selected', 'true');
+  await page.getByRole('button', { name: 'Security', exact: true }).focus();
+  await page.keyboard.press('Enter');
+  await expect(title).toBeFocused();
+
+  // 3. From Settings, opened on the Security view itself: Open Security closes it, and the
+  // focus goes on to the title, past the Settings button its close hands it back to (F4).
+  const settings = await openSettings(page);
+  await settings.getByRole('button', { name: 'Open Security' }).click();
+  await expect(settings).toBeHidden();
+  await expect(title).toBeFocused();
+
+  // And Mod+L locks from the page, as from anywhere.
+  await page.keyboard.press(`${mod}+KeyL`);
+  await expect(page.getByRole('heading', { name: 'AppRafter is locked' })).toBeVisible();
 });
