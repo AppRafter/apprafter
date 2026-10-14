@@ -77,7 +77,7 @@ export interface ProtectDialogProps {
   readonly confirmKey: (opId: OpId, typed: string) => Promise<void>;
   /** `copy_recovery_key`: Rust copies the key it holds (O12). */
   readonly copyKey: (opId: OpId) => Promise<void>;
-  /** It ran (or was cancelled): what the section shows may have changed. */
+  /** It ran (or was cancelled): what the Security page shows may have changed. */
   readonly onDone: () => void;
   readonly onClose: () => void;
 }

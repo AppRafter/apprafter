@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { QueryClientProvider } from '@tanstack/react-query';
+import { emit } from '@tauri-apps/api/event';
 import { clearMocks, mockIPC, mockWindows } from '@tauri-apps/api/mocks';
 import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -20,6 +21,7 @@ import { createQueryClient } from '../state/queryClient';
 import { lockState, settings, targetSummary } from '../test/fixtures';
 import { whoamiReport } from '../test/flows';
 import { settleIpc } from '../test/settle';
+import { PlatformGate } from './PlatformGate';
 import { Shell } from './Shell';
 
 const INFO: AppInfo = {
@@ -75,11 +77,13 @@ const TARGETS: TargetListReport = {
 let calls: string[];
 let summaries: OpSummary[];
 let stored: Settings;
+let appInfoNow: AppInfo;
 
 beforeEach(() => {
   calls = [];
   summaries = [];
   stored = settings();
+  appInfoNow = INFO;
   mockWindows('main');
   mockIPC(
     (cmd) => {
@@ -87,6 +91,7 @@ beforeEach(() => {
       if (cmd === 'op_list') return summaries;
       if (cmd === 'target_list') return TARGETS;
       if (cmd === 'settings_get') return stored;
+      if (cmd === 'app_info') return appInfoNow;
       if (cmd === 'lock_now') return lockState({ reason: 'manual' });
       if (cmd === 'plugin:window|is_maximized') return false;
       return null;
@@ -115,6 +120,23 @@ function shell(info: AppInfo = INFO) {
   );
   return userEvent.setup();
 }
+
+/** The Shell under the platform gate, as the app has it: app_info is `appInfoNow`. */
+async function gatedShell() {
+  render(
+    <QueryClientProvider client={createQueryClient()}>
+      <PlatformGate>
+        <ToastProvider>
+          <Shell />
+        </ToastProvider>
+      </PlatformGate>
+    </QueryClientProvider>,
+  );
+  await screen.findByRole('heading', { level: 1, name: 'Open a cluster' });
+  return userEvent.setup();
+}
+
+const count = (cmd: string) => calls.filter((c) => c === cmd).length;
 
 const tab = (name: string | RegExp) => screen.getByRole('tab', { name });
 const pageTitle = () => screen.getByRole('heading', { level: 1 }).textContent;
@@ -346,6 +368,125 @@ describe('Shell', () => {
         'Upgrade platform',
       ),
     ).toBeDefined();
+  });
+
+  test("the sidebar's Security shows the Security view: the store, its targets, the focus on its title; Ctrl+T and Ctrl+L as anywhere", async () => {
+    const user = shell();
+    const targets = () => screen.getByRole('button', { name: /^Targets/ });
+    expect(targets().getAttribute('aria-current')).toBe('page');
+    await user.click(await screen.findByRole('button', { name: 'Security' }));
+    const title = screen.getByRole('heading', { level: 1, name: 'Security' });
+    expect(document.activeElement === title).toBe(true);
+    expect(screen.getByText('Target store ~/.config/apprafter')).toBeDefined();
+    expect(await screen.findByText('Covers 3 targets: lab, prod-eu, staging')).toBeDefined();
+    expect(screen.queryByRole('heading', { name: 'Open a cluster' })).toBeNull();
+    expect(screen.getByRole('button', { name: 'Security' }).getAttribute('aria-current')).toBe(
+      'page',
+    );
+    expect(targets().getAttribute('aria-current')).toBeNull();
+    await user.keyboard('{Control>}t{/Control}');
+    expect(screen.getByRole('heading', { name: 'Open a cluster' })).toBeDefined();
+    await user.click(screen.getByRole('button', { name: 'Security' }));
+    await user.keyboard('{Control>}l{/Control}');
+    expect(calls).toContain('lock_now');
+  });
+
+  test('hidden, the Security view reads nothing: no lock_info until it is shown', async () => {
+    const user = shell();
+    await screen.findByRole('button', { name: 'Open prod-eu' });
+    await settleIpc();
+    expect(calls).not.toContain('lock_info');
+    await user.click(screen.getByRole('button', { name: 'Security' }));
+    await waitFor(() => expect(calls.includes('lock_info')).toBe(true));
+  });
+
+  // Critic code 5: "each time it is shown", not only the first.
+  test('every request to show the Security view reads app_info and lock_info again, shown already or not', async () => {
+    const user = await gatedShell();
+    await user.click(screen.getByRole('button', { name: 'Security' }));
+    await waitFor(() => expect(count('lock_info') >= 1).toBe(true));
+    await settleIpc();
+    const first = { app: count('app_info'), lock: count('lock_info') };
+    // Shown already: the view's own sidebar item asks again.
+    await user.click(screen.getByRole('button', { name: 'Security' }));
+    await waitFor(() =>
+      expect(count('lock_info') > first.lock && count('app_info') > first.app).toBe(true),
+    );
+    await settleIpc();
+    const second = { app: count('app_info'), lock: count('lock_info') };
+    await user.keyboard('{Control>}t{/Control}');
+    await user.click(screen.getByRole('button', { name: 'Security' }));
+    await waitFor(() =>
+      expect(count('lock_info') > second.lock && count('app_info') > second.app).toBe(true),
+    );
+  });
+
+  test('a flow from the Security page opens over every view: the tab strip inert, Ctrl+L still locks', async () => {
+    const user = shell();
+    await user.click(await screen.findByRole('button', { name: 'Open prod-eu' }));
+    await user.click(screen.getByRole('button', { name: 'Security' }));
+    await user.click(screen.getByRole('button', { name: 'Protect…' }));
+    expect(await screen.findByRole('dialog', { name: 'Protect secrets' })).toBeDefined();
+    expect(document.querySelector('.tabstrip')?.hasAttribute('inert')).toBe(true);
+    await user.keyboard('{Control>}l{/Control}');
+    expect(calls).toContain('lock_now');
+  });
+
+  test("Settings' Open Security closes Settings and shows the Security view, the focus on its title", async () => {
+    const user = shell();
+    await user.keyboard('{Control>}[Comma]{/Control}');
+    const settings = await screen.findByRole('dialog', { name: 'Settings' });
+    // Settings' body renders once settings_get answers (critic code 12).
+    await user.click(await within(settings).findByRole('button', { name: 'Open Security' }));
+    expect(screen.queryByRole('dialog', { name: 'Settings' })).toBeNull();
+    const title = screen.getByRole('heading', { level: 1, name: 'Security' });
+    await waitFor(() => expect(document.activeElement === title).toBe(true));
+  });
+
+  // Finding F4 (critic code 1): Settings opened from the Security view's own sidebar keeps that
+  // Settings button as its opener, and its close gives the focus back to it. The view does not
+  // change, so only the page's new mount (its key) moves the focus on.
+  test('Open Security from Settings opened on the Security view itself: the focus goes to the title', async () => {
+    const user = shell();
+    await user.click(await screen.findByRole('button', { name: 'Security' }));
+    await user.click(screen.getByRole('button', { name: /^Settings/ }));
+    const settings = await screen.findByRole('dialog', { name: 'Settings' });
+    await user.click(await within(settings).findByRole('button', { name: 'Open Security' }));
+    expect(screen.queryByRole('dialog', { name: 'Settings' })).toBeNull();
+    const title = screen.getByRole('heading', { level: 1, name: 'Security' });
+    await waitFor(() => expect(document.activeElement === title).toBe(true));
+  });
+
+  // Critic m10: reached by Tab, not only by a focus() call.
+  test("the Security item is reached by the keyboard from a tab's sidebar, and Enter shows the page", async () => {
+    const user = shell();
+    await user.click(await screen.findByRole('button', { name: 'Open prod-eu' }));
+    const item = screen.getByRole('button', { name: 'Security' });
+    for (let i = 0; i < 60 && document.activeElement !== item; i += 1) {
+      await user.tab({ shift: true });
+    }
+    expect(document.activeElement === item).toBe(true);
+    await user.keyboard('{Enter}');
+    const title = screen.getByRole('heading', { level: 1, name: 'Security' });
+    await waitFor(() => expect(document.activeElement === title).toBe(true));
+  });
+
+  // Finding F5 (critic M1): a terminal's `lock off` under the unlocked app changes app_info with
+  // no lock transition; the window gaining the focus reads it again.
+  test('the window gaining the focus reads app_info again: the store line follows a terminal', async () => {
+    appInfoNow = { ...INFO, secrets: { ...INFO.secrets, mode: 'locked', protected: true } };
+    const user = await gatedShell();
+    await user.click(screen.getByRole('button', { name: 'Security' }));
+    expect(await screen.findByText('Secrets are encrypted; unlocking opens them.')).toBeDefined();
+    await settleIpc();
+    const lockInfos = count('lock_info');
+    appInfoNow = INFO;
+    await emit('tauri://focus', null);
+    expect(
+      await screen.findByText("Secrets are in files; the lock only covers this app's window."),
+    ).toBeDefined();
+    // The page is shown, so its report is read again too.
+    await waitFor(() => expect(count('lock_info') > lockInfos).toBe(true));
   });
 });
 

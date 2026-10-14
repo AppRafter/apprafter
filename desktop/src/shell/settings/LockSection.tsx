@@ -1,16 +1,18 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
-// Settings › Lock (D.4a §3.14, T74, T81; ADR 0068 §8): the app lock and the target-store lock as
-// one section. (1) The app lock's rows — and while the store's secrets are protected, Require
-// unlock, Lock when the app starts and Lock when the computer sleeps or locks shown on and not
-// offered, and Auto-lock without Never (O7): the app's unlock is what opens the vault, and its
-// unlocked time ends as a terminal's window does. The saved values stay as the person chose them
-// and come back when protection is off. (2) The store's protection — where its secrets are and
-// each state's way on, the slots, this computer — is StoreProtection (screens/security), on its
-// way to the Security page (WI-476). Presentational: the container (LockSettings) reads
-// lock_info, app_info and the settings, and runs the flows.
+// Settings › Lock (D.4a §3.14, T74; ADR 0068 §8, reworded 2026-10-14; WI-476): how the app locks.
+// The app lock and the target-store lock are one mechanism; this section holds the app lock's rows
+// — and while the store's secrets are protected, Require unlock, Lock when the app starts and Lock
+// when the computer sleeps or locks shown on and not offered, and Auto-lock without Never (O7):
+// the app's unlock is what opens the vault, and its unlocked time ends as a terminal's window
+// does. Require unlock then also says how that unlock works (the unlock note). The saved values
+// stay as the person chose them and come back when protection is off. The store's own
+// protection — where its secrets are, Protect, what opens it, this computer's limits — is the
+// Security page's (screens/security): the last row leads there, and its sub says why the rows
+// above stay on and where that changes. Presentational: the container (LockSettings) reads
+// app_info and the settings.
 import { Button } from '../../components/Button';
 import { Eyebrow } from '../../components/Eyebrow';
-import { LockSimpleIcon } from '../../components/icons';
+import { LockSimpleIcon, ShieldIcon } from '../../components/icons';
 import { SegmentedControl, type SegmentOption } from '../../components/SegmentedControl';
 import { SettingRow } from '../../components/SettingRow';
 import { Switch } from '../../components/Switch';
@@ -20,8 +22,6 @@ import type { Os } from '../../ipc/generated/Os';
 import type { SecretsMode } from '../../ipc/generated/SecretsMode';
 import type { SessionEvents } from '../../ipc/generated/SessionEvents';
 import type { Settings } from '../../ipc/generated/Settings';
-import type { UiError } from '../../ipc/generated/UiError';
-import { type LockInfoView, StoreProtection } from '../../screens/security/StoreProtection';
 import { authPrompt } from '../../state/auth';
 import { lockOff, noAuthNotice } from '../../state/lock';
 import {
@@ -29,8 +29,11 @@ import {
   LOCK_EYEBROW,
   NEVER_PROTECTED,
   NEVER_SAVED_NOTE,
+  OPEN_SECURITY,
   PINNED_SUB,
-  type ProtectAction,
+  SECURITY_ROW,
+  securityRowSub,
+  unlockNote,
 } from '../../state/lockText';
 import { shortcutHint } from '../../state/shortcuts';
 
@@ -39,21 +42,16 @@ export interface LockSectionProps {
   readonly os: Os;
   readonly auth: AuthInfo;
   readonly sessionEvents: SessionEvents;
-  /** Where the store keeps its secrets (AppInfo.secrets.mode). */
+  /** Where the store keeps its secrets (AppInfo.secrets.mode): the Security row's sub. */
   readonly mode: SecretsMode;
   /** The app's unlock opens the store's vault (AppInfo.secrets.protected): the pins apply. */
   readonly protectedStore: boolean;
-  /** lock_info's answer; `null` while it is read, or when `error` says why it is not there. */
-  readonly info: LockInfoView | null;
-  readonly error: UiError | null;
-  /**
-   * The store's lock state cannot be used (AppInfo.secrets.problem: an unreadable store.yaml, a
-   * lost vault; critic B finding 8): said, with why, in place of the state line and its actions.
-   */
-  readonly problem: UiError | null;
+  /** The store's lock state cannot be used (AppInfo.secrets.problem): the Security row says so. */
+  readonly storeProblem: boolean;
   readonly onSave: (change: Partial<Settings>) => void;
   readonly onLock: () => void;
-  readonly onAction: (action: ProtectAction) => void;
+  /** Shows the Security page (Settings closes): the store's own protection is there. */
+  readonly onOpenSecurity: () => void;
 }
 
 const AUTO_LOCK = [
@@ -84,7 +82,7 @@ export function LockSection(p: LockSectionProps) {
     o.value === 'never' && pinned ? { ...o, disabled: true, title: NEVER_PROTECTED } : o,
   );
   const requireSub = pinned
-    ? PINNED_SUB
+    ? `${PINNED_SUB} ${unlockNote(p.os)}`
     : method === null
       ? 'Ask for the computer’s owner before showing any cluster.'
       : `Ask for ${authPrompt(method)} before showing any cluster.`;
@@ -180,15 +178,14 @@ export function LockSection(p: LockSectionProps) {
           </Button>
         }
       />
-
-      <StoreProtection
-        os={p.os}
-        mode={p.mode}
-        protectedStore={p.protectedStore}
-        info={p.info}
-        error={p.error}
-        problem={p.problem}
-        onAction={p.onAction}
+      <SettingRow
+        label={SECURITY_ROW}
+        sub={securityRowSub(p.mode, pinned, p.storeProblem)}
+        control={
+          <Button size={28} icon={ShieldIcon} onClick={p.onOpenSecurity}>
+            {OPEN_SECURITY}
+          </Button>
+        }
       />
     </>
   );

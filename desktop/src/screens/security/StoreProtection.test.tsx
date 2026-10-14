@@ -6,7 +6,7 @@ import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import type { HolderHardening } from '../../ipc/generated/HolderHardening';
 import type { LockReport } from '../../ipc/generated/LockReport';
-import { StoreProtection, type StoreProtectionProps } from './StoreProtection';
+import { StoreProtection, type StoreProtectionProps, StoreScope } from './StoreProtection';
 
 const HARDENED: HolderHardening = {
   nonDumpable: true,
@@ -169,5 +169,36 @@ describe('StoreProtection', () => {
     };
     show({ info: null, error, mode: 'locked' });
     expect(screen.getByText('the vault cannot be read')).toBeDefined();
+  });
+});
+
+describe('StoreScope (WI-476)', () => {
+  test('the store, and every target it covers: counted, while read, none yet', () => {
+    const { rerender } = render(
+      <StoreScope
+        store="~/.config/apprafter"
+        targets={['broken', 'lab', 'prod-eu']}
+        error={null}
+      />,
+    );
+    expect(screen.getByText('Target store ~/.config/apprafter')).toBeDefined();
+    expect(screen.getByText('Covers 3 targets: broken, lab, prod-eu')).toBeDefined();
+    rerender(<StoreScope store="~/s" targets={null} error={null} />);
+    expect(screen.getByText('Reading…')).toBeDefined();
+    rerender(<StoreScope store="~/s" targets={[]} error={null} />);
+    expect(screen.getByText('No targets in this store yet.')).toBeDefined();
+  });
+
+  test('targets that cannot be listed say why, and the store is still named', () => {
+    const error = {
+      code: 'apprafter::io',
+      message: 'the targets cannot be read',
+      help: null,
+      causes: [],
+      fields: {},
+    };
+    render(<StoreScope store="~/s" targets={null} error={error} />);
+    expect(screen.getByText('Target store ~/s')).toBeDefined();
+    expect(screen.getByText('the targets cannot be read')).toBeDefined();
   });
 });

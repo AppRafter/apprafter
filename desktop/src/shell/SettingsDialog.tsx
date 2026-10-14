@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 // Settings (spec §4.6, brief §3), with the rows D.2 and D.4a have something behind: the theme; Lock
-// — the app lock and the target store's own, one mechanism in one section (D.4a §3.14,
-// LockSettings); the versions and links. Live data, notifications and the tray come with D.5, so
-// those rows are not shown. The Lock section's flows and the toolchain open beside Settings, never
-// in its panel: their layer then covers the window and makes Settings inert, and Esc closes them
-// only. Opening Settings reads app_info again: a session watch that answered late, the
-// authentication Rust found since, a store locked or put back in files from a terminal.
+// — how the app locks, and a row that leads to the Security page, where the target store's own
+// protection is (WI-476; LockSettings); the versions and links. Live data, notifications and the
+// tray come with D.5, so those rows are not shown. The toolchain opens beside Settings, never in
+// its panel: its layer then covers the window and makes Settings inert, and Esc closes it only.
+// Opening Settings reads app_info again: a session watch that answered late, the authentication
+// Rust found since, a store locked or put back in files from a terminal.
 import { useQueryClient } from '@tanstack/react-query';
 import { useEffect, useState } from 'react';
 import { Button } from '../components/Button';
@@ -27,11 +27,10 @@ import { uiErrorOf } from '../ipc/api';
 import type { Settings } from '../ipc/generated/Settings';
 import type { Theme } from '../ipc/generated/Theme';
 import { ToolchainPanel } from '../screens/toolchain/ToolchainPanel';
-import type { ProtectAction } from '../state/lockText';
 import { osName, rereadAppInfo, usePlatform } from '../state/platform';
 import { useSaveSettings, useSettings } from '../state/settings';
 import { LINKS, openLink } from './links';
-import { LockFlow, LockSettings } from './settings/LockSettings';
+import { LockSettings } from './settings/LockSettings';
 import { ThisComputerRow } from './ThisComputer';
 
 const THEMES = [
@@ -40,12 +39,17 @@ const THEMES = [
   { value: 'dark', label: 'Dark', icon: MoonIcon },
 ] as const satisfies readonly SegmentOption<Theme>[];
 
-export function SettingsDialog({ onClose }: { onClose: () => void }) {
+export interface SettingsDialogProps {
+  readonly onClose: () => void;
+  /** Settings' Security row: the shell closes Settings and shows the Security page (WI-476). */
+  readonly onSecurity: () => void;
+}
+
+export function SettingsDialog({ onClose, onSecurity }: SettingsDialogProps) {
   const settings = useSettings();
   const client = useQueryClient();
   useEffect(() => rereadAppInfo(client, false), [client]);
   const [tools, setTools] = useState(false);
-  const [flow, setFlow] = useState<ProtectAction | null>(null);
   return (
     <>
       <Modal title="Settings" width={620} onClose={onClose} dismissOnBackdrop>
@@ -55,12 +59,11 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
           <SettingsBody
             settings={settings.data}
             onToolchain={() => setTools(true)}
-            onLockAction={setFlow}
+            onSecurity={onSecurity}
           />
         )}
       </Modal>
       {tools && <ToolchainPanel onClose={() => setTools(false)} />}
-      {flow !== null && <LockFlow action={flow} onClose={() => setFlow(null)} />}
     </>
   );
 }
@@ -68,11 +71,11 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
 function SettingsBody({
   settings,
   onToolchain,
-  onLockAction,
+  onSecurity,
 }: {
   settings: Settings;
   onToolchain: () => void;
-  onLockAction: (action: ProtectAction) => void;
+  onSecurity: () => void;
 }) {
   const info = usePlatform();
   const save = useSaveSettings();
@@ -99,7 +102,7 @@ function SettingsBody({
         }
       />
 
-      <LockSettings settings={settings} onAction={onLockAction} />
+      <LockSettings settings={settings} onOpenSecurity={onSecurity} />
 
       <Eyebrow>About</Eyebrow>
       <SettingRow

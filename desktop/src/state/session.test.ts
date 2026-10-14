@@ -103,4 +103,17 @@ describe('sessionReducer', () => {
     expect(sessionReducer(state, { type: 'navigate', key: 'nope', section: 'apps' })).toBe(state);
     expect(sessionReducer(state, { type: 'targetRemoved', target: 'nope' })).toBe(state);
   });
+
+  test('the Security view is shown as the Targets view is, and a tab closing leaves it shown', () => {
+    const opened = sessionReducer(INITIAL_SESSION, {
+      type: 'openTarget',
+      target: 'prod',
+      key: 'a',
+    });
+    const security = sessionReducer(opened, { type: 'show', view: { kind: 'security' } });
+    expect(security.view).toEqual({ kind: 'security' });
+    expect(sessionReducer(security, { type: 'closeTab', key: 'a' }).view).toEqual({
+      kind: 'security',
+    });
+  });
 });

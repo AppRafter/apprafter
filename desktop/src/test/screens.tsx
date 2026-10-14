@@ -13,7 +13,8 @@ import { PlatformContext } from '../state/platform';
 import { createQueryClient } from '../state/queryClient';
 import { appInfo } from './fixtures';
 
-function Host({ children }: { children: ReactNode }) {
+/** A screen's host as the shell has it: a view frame, and the app's own overlays beside it. */
+export function ScreenHost({ children }: { children: ReactNode }) {
   const app = useAppOverlayHost();
   return (
     <AppOverlayContext value={app.show}>
@@ -28,7 +29,7 @@ export function renderScreen(ui: ReactNode, { info = appInfo() }: { info?: AppIn
     <QueryClientProvider client={createQueryClient()}>
       <PlatformContext value={info}>
         <ToastProvider>
-          <Host>{ui}</Host>
+          <ScreenHost>{ui}</ScreenHost>
           <ToastViewport />
         </ToastProvider>
       </PlatformContext>

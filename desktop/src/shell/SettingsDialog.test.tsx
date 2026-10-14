@@ -10,7 +10,7 @@ import { DESKTOP_ERROR_CODES } from '../ipc/generated/errors';
 import type { Settings } from '../ipc/generated/Settings';
 import { PlatformContext } from '../state/platform';
 import { createQueryClient } from '../state/queryClient';
-import { appInfo, authInfo, settings } from '../test/fixtures';
+import { appInfo, authInfo, STORE_PROBLEMS, settings } from '../test/fixtures';
 import { toolchainReport, whoamiReport } from '../test/flows';
 import { settleIpc } from '../test/settle';
 import { PlatformGate } from './PlatformGate';
@@ -112,18 +112,19 @@ afterEach(async () => {
 
 async function open(info: AppInfo = appInfo()) {
   const onClose = mock();
+  const onSecurity = mock();
   render(
     <QueryClientProvider client={createQueryClient()}>
       <PlatformContext value={info}>
         <ToastProvider>
-          <SettingsDialog onClose={onClose} />
+          <SettingsDialog onClose={onClose} onSecurity={onSecurity} />
           <ToastViewport />
         </ToastProvider>
       </PlatformContext>
     </QueryClientProvider>,
   );
   await screen.findByRole('radiogroup', { name: 'Theme' });
-  return { user: userEvent.setup(), onClose };
+  return { user: userEvent.setup(), onClose, onSecurity };
 }
 
 /** Settings under the PlatformGate, as the app has it: app_info read by the gate. */
@@ -132,7 +133,7 @@ async function openInGate() {
     <QueryClientProvider client={createQueryClient()}>
       <PlatformGate>
         <ToastProvider>
-          <SettingsDialog onClose={mock()} />
+          <SettingsDialog onClose={mock()} onSecurity={mock()} />
           <ToastViewport />
         </ToastProvider>
       </PlatformGate>
@@ -419,5 +420,35 @@ describe('SettingsDialog', () => {
   test('a notice about the settings file is shown when Rust has one', async () => {
     await open(appInfo({ settingsNotice: 'settings.json is newer than this app; using defaults' }));
     expect(screen.getByText('settings.json is newer than this app; using defaults')).toBeDefined();
+  });
+
+  test('the Security row asks for the Security page: the store’s protection is there (WI-476)', async () => {
+    const { user, onSecurity } = await open();
+    expect(screen.getByText('Target store protection')).toBeDefined();
+    await user.click(screen.getByRole('button', { name: 'Open Security' }));
+    expect(onSecurity).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole('button', { name: 'Protect…' })).toBeNull();
+  });
+
+  test.each(STORE_PROBLEMS)(
+    'a store whose lock state cannot be used: the Security row says so (%s)',
+    async (_state, secrets) => {
+      await open(appInfo({ secrets }));
+      expect(
+        screen.getByText(
+          "This target store's lock state cannot be used: the Security page says why.",
+        ),
+      ).toBeDefined();
+    },
+  );
+
+  test('an interrupted run: the Security row says where it finishes', async () => {
+    const files = appInfo().secrets;
+    await open(appInfo({ secrets: { ...files, mode: 'locking', protected: true } }));
+    expect(
+      screen.getByText(
+        "Changing this target store's protection was interrupted: the Security page offers to finish it.",
+      ),
+    ).toBeDefined();
   });
 });

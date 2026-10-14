@@ -87,7 +87,7 @@ const error = (code: string, message: string, fields: UiError['fields'] = {}): U
 });
 
 /** Every target in the store, unreadable ones included, sorted: the names Rust lists. */
-const namesIn = (store: MockStore) =>
+export const namesIn = (store: MockStore) =>
   [...store.reports.keys(), ...store.unreadable.map((target) => target.name)].sort();
 
 const notFound = (store: MockStore, name: string) => {

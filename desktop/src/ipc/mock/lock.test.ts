@@ -8,7 +8,7 @@ import { IpcError } from '../api';
 import { DESKTOP_ERROR_CODES } from '../generated/errors';
 import type { OpEvent } from '../generated/OpEvent';
 import type { OpId } from '../generated/OpId';
-import { installMockIpc, mockLockFromTerminal } from './index';
+import { installMockIpc, mockLockFromTerminal, mockTargetStore } from './index';
 import { MOCK_RECOVERY_KEY, MOCK_STORE_PASSWORD } from './lock';
 
 // The settle rule (test/settle.ts; critic A finding 9): the engine's 0 ms events land before
@@ -131,5 +131,26 @@ describe('the mock store lock', () => {
     expect((await api.appInfo()).secrets).toMatchObject({ mode: 'locked', protected: true });
     expect(await code(api.unlock())).toBe(DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE);
     expect((await api.unlockWithPassword(MOCK_STORE_PASSWORD)).locked).toBe(false);
+  });
+
+  test("lock_info's targets and the Protect plan's title are the store's, as Rust makes them (WI-476)", async () => {
+    installMockIpc({ opDelayMs: 0 });
+    await api.unlock();
+    const names = async () => {
+      const list = await api.targetList();
+      return [...list.targets, ...list.unreadable].map((target) => target.name).sort();
+    };
+    expect((await api.lockInfo()).report.targets).toEqual(await names());
+    // Rust reads the store on every call: a removed target is gone from both (critic code 8).
+    const store = mockTargetStore();
+    store.reports.delete('lab');
+    store.unreadable = [];
+    expect(await names()).toEqual(['prod-eu', 'staging']);
+    expect((await api.lockInfo()).report.targets).toEqual(['prod-eu', 'staging']);
+    const { plan } = await api.opPlanLockOn(MOCK_STORE_PASSWORD, null);
+    expect(plan.title).toBe(
+      'Protect the target store at ~/.config/apprafter (targets: prod-eu, staging)',
+    );
+    await api.opDiscard(plan.opId);
   });
 });

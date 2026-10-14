@@ -38,7 +38,7 @@ import type { UnavailableReason } from '../generated/UnavailableReason';
 import { flowHandlers, MOCK_TOOLCHAIN_FOUND } from './flows';
 import { mockLock } from './lock';
 import { createMockOps, type Handler, type MockOps } from './ops';
-import { type MockStore, mockStore, targetHandlers } from './targets';
+import { type MockStore, mockStore, namesIn, targetHandlers } from './targets';
 
 /** The one password the mock's password field accepts: a demo value, nobody's password. */
 export const MOCK_PASSWORD = 'apprafter';
@@ -333,7 +333,7 @@ export function installMockIpc(options: MockOptions = {}): void {
   const store = mockStore();
   currentStore = store;
   const d3 = targetHandlers(engine, store);
-  const lockStore = mockLock(engine, options.secrets ?? 'files');
+  const lockStore = mockLock(engine, options.secrets ?? 'files', () => namesIn(store));
   // Rust's gate for the store's secret: one back-off with the PAM field's, no PAM words.
   const verifyStoreSecret = verifyWith(lockStore.opens, []);
   currentTerminalLock = async () => {

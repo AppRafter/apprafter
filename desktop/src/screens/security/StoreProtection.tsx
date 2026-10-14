@@ -4,7 +4,7 @@
 // (3) the slots, read-only in D.4a; (4) this computer — every limit the core reports, in the app's
 // words, warnings first, what the lock does not cover, and what the app's own process could not
 // do to protect the key (rule 1: never mask). Presentational: a container reads lock_info and
-// app_info and runs the flows. Moved out of Settings › Lock's section by WI-476.
+// app_info and runs the flows. Shown on the Security page (WI-476), under StoreScope.
 import { Button } from '../../components/Button';
 import { ErrorPanel } from '../../components/ErrorPanel';
 import { SettingRow } from '../../components/SettingRow';
@@ -17,6 +17,7 @@ import {
   ACTION_LABELS,
   APP_HOLDS_KEY,
   AT_REST,
+  coveredLine,
   hardeningLine,
   LIMITS_TITLE,
   type LimitText,
@@ -31,6 +32,7 @@ import {
   SLOTS_LABEL,
   SLOTS_LATER,
   STORE_PROBLEM_SUB,
+  storeLine,
   terminalsLine,
   unlockNote,
 } from '../../state/lockText';
@@ -59,6 +61,32 @@ export interface StoreProtectionProps {
    */
   readonly problem: UiError | null;
   readonly onAction: (action: ProtectAction) => void;
+}
+
+export interface StoreScopeProps {
+  /** The store's root, home-abbreviated (AppInfo.secrets.store). */
+  readonly store: string;
+  /** Every target in the store (storeTargetNames); `null` while target_list is read. */
+  readonly targets: readonly string[] | null;
+  /** Why target_list did not answer; the store is still named. */
+  readonly error: UiError | null;
+}
+
+/**
+ * WI-476: which store, and every target in it. The lock is the whole store's — one vault, and
+ * what opens it opens them all — so the page never reads as one target's.
+ */
+export function StoreScope({ store, targets, error }: StoreScopeProps) {
+  return (
+    <div className="security-store">
+      <p>{storeLine(store)}</p>
+      {error !== null ? (
+        <ErrorPanel error={error} />
+      ) : (
+        <p>{targets === null ? READING : coveredLine(targets)}</p>
+      )}
+    </div>
+  );
 }
 
 export function StoreProtection(p: StoreProtectionProps) {

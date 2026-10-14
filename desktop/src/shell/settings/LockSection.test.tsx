@@ -1,42 +1,24 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 import { describe, expect, mock, test } from 'bun:test';
-import { render, screen } from '@testing-library/react';
+import { cleanup, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import type { HolderHardening } from '../../ipc/generated/HolderHardening';
-import type { LockReport } from '../../ipc/generated/LockReport';
 import type { Settings } from '../../ipc/generated/Settings';
+import {
+  ACTION_LABELS,
+  LIMITS_TITLE,
+  OPEN_SECURITY,
+  PINNED_SUB,
+  SECURITY_ROW_SUB,
+  securityRowSub,
+  unlockNote,
+} from '../../state/lockText';
 import { authInfo, settings } from '../../test/fixtures';
 import { LockSection, type LockSectionProps } from './LockSection';
-
-const HARDENED: HolderHardening = {
-  nonDumpable: true,
-  denyAttach: null,
-  coreOff: true,
-  memoryLocked: true,
-  processDacl: null,
-};
-
-function report(more: Partial<LockReport> = {}): LockReport {
-  return {
-    store: '~/.config/apprafter',
-    storeId: '3f9c0a1b7d2e4c56',
-    targets: ['prod'],
-    mode: 'locked',
-    slots: [
-      { kind: 'password', label: 'lock password', refused: null },
-      { kind: 'recovery_key', label: 'recovery key', refused: null },
-    ],
-    windowMinutes: 5,
-    window: { status: 'app' },
-    limits: [{ kind: 'secrets_in_use' }, { kind: 'x11_session' }, { kind: 'same_user_programs' }],
-    ...more,
-  };
-}
 
 function show(more: Partial<LockSectionProps> = {}) {
   const onSave = mock((_change: Partial<Settings>) => {});
   const onLock = mock();
-  const onAction = mock();
+  const onOpenSecurity = mock();
   render(
     <LockSection
       settings={settings()}
@@ -45,19 +27,14 @@ function show(more: Partial<LockSectionProps> = {}) {
       sessionEvents={{ lock: true, sleep: true }}
       mode="files"
       protectedStore={false}
-      info={{
-        report: report({ mode: 'files', storeId: null, slots: [], window: { status: 'closed' } }),
-        app: HARDENED,
-      }}
-      problem={null}
-      error={null}
+      storeProblem={false}
       onSave={onSave}
       onLock={onLock}
-      onAction={onAction}
+      onOpenSecurity={onOpenSecurity}
       {...more}
     />,
   );
-  return { user: userEvent.setup(), onSave, onLock, onAction };
+  return { user: userEvent.setup(), onSave, onLock, onOpenSecurity };
 }
 
 const pinnedSwitches = [
@@ -80,9 +57,7 @@ describe('LockSection', () => {
 
   test('protected: the three switches stay on, Never is not offered, the saved choices are kept', async () => {
     const { user, onSave } = show({
-      mode: 'locked',
       protectedStore: true,
-      info: { report: report(), app: HARDENED },
       settings: settings({
         lockEnabled: false,
         lockOnStart: false,
@@ -110,9 +85,7 @@ describe('LockSection', () => {
 
   test('protected with no system authentication: the lock is still on, and the banner says how it confirms', () => {
     show({
-      mode: 'locked',
       protectedStore: true,
-      info: { report: report(), app: HARDENED },
       auth: { ...authInfo(), available: false, method: null, unavailable: 'no_backend' },
     });
     expect(sw('Require unlock').getAttribute('aria-checked')).toBe('true');
@@ -124,9 +97,40 @@ describe('LockSection', () => {
     );
   });
 
-  test('the app lock rows work while the store’s report is still read', async () => {
-    const { user, onSave } = show({ info: null });
-    await user.click(sw('Lock when the app starts'));
-    expect(onSave).toHaveBeenCalled();
+  test('a row that opens the Security page, and nothing of the store here (WI-476)', async () => {
+    const { user, onOpenSecurity } = show({ mode: 'locked', protectedStore: true });
+    expect(screen.getByText('Target store protection')).toBeDefined();
+    await user.click(screen.getByRole('button', { name: OPEN_SECURITY }));
+    expect(onOpenSecurity).toHaveBeenCalledTimes(1);
+    for (const label of Object.values(ACTION_LABELS)) {
+      expect(screen.queryByRole('button', { name: label })).toBeNull();
+    }
+    expect(screen.queryByText(LIMITS_TITLE)).toBeNull();
+  });
+
+  // Critic M2: the pins stay here, so their reason and their remedy are said here too.
+  test("the row's sub: why the rows above stay on and where that changes, per state", () => {
+    show({ mode: 'locked', protectedStore: true });
+    expect(screen.getByText(securityRowSub('locked', true, false))).toBeDefined();
+    cleanup();
+    show({ mode: 'locking', protectedStore: true });
+    expect(screen.getByText(securityRowSub('locking', true, false))).toBeDefined();
+    cleanup();
+    show({ mode: 'locked', protectedStore: false, storeProblem: true });
+    expect(screen.getByText(securityRowSub('locked', false, true))).toBeDefined();
+    cleanup();
+    show();
+    expect(screen.getByText(SECURITY_ROW_SUB)).toBeDefined();
+  });
+
+  // Critic m4: how the app now unlocks is the app lock's own behaviour, so Settings says it.
+  test('protected: Require unlock says how the app unlocks now, on every OS', () => {
+    for (const os of ['linux', 'macos', 'windows'] as const) {
+      show({ os, mode: 'locked', protectedStore: true });
+      expect(screen.getByText(`${PINNED_SUB} ${unlockNote(os)}`)).toBeDefined();
+      cleanup();
+    }
+    show();
+    expect(screen.queryByText(/instead of your system password/)).toBeNull();
   });
 });

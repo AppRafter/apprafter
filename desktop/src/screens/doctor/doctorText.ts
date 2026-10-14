@@ -164,11 +164,11 @@ export function fixText(check: Check, target: string | null): string | null {
       return LOCK_FIXES[check.id] ?? fix.text;
     // D.4a: the lock's fixes (surface §4.2); the rows that raise them are d4a-e's and f's.
     case 'protect_secrets':
-      return 'Settings › Lock › Protect secrets encrypts them.';
+      return 'Security › Protect secrets encrypts them.';
     case 'finish_lock':
       return fix.phase === 'unlocking'
-        ? "Unprotecting this target store's secrets did not finish: finish it in Settings › Lock."
-        : "Protecting this target store's secrets did not finish: finish it in Settings › Lock.";
+        ? "Unprotecting this target store's secrets did not finish: finish it on the Security page."
+        : "Protecting this target store's secrets did not finish: finish it on the Security page.";
     case 'unlock_first':
       return 'Unlock the app to run these checks.';
     case 'protect_ssh_key':

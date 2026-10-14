@@ -113,15 +113,48 @@ describe('Sidebar', () => {
     expect(screen.getByRole('button', { name: /Targets/ })).toBeDefined();
   });
 
-  test('the footer: Targets and Lock with per-OS hints, Settings only when there is one', async () => {
+  test('the footer: Targets, Security, Settings and Lock — the shortcuts per OS, Security without one', async () => {
     const onSettings = mock();
-    const { user, onShowTargets, onLock } = sidebar({ os: 'macos', onSettings });
+    const onSecurity = mock();
+    const { user, onShowTargets, onLock } = sidebar({ os: 'macos', onSettings, onSecurity });
+    const footer = document.querySelector('.sidebar-footer') as HTMLElement;
+    expect(
+      within(footer)
+        .getAllByRole('button')
+        .slice(0, 4)
+        .map((button) => button.textContent),
+    ).toEqual(['Targets ⌘T', 'Security', 'Settings ⌘,', 'Lock ⌘L']);
+    const security = screen.getByRole('button', { name: 'Security' });
+    expect(security.hasAttribute('aria-keyshortcuts')).toBe(false);
     await user.click(screen.getByRole('button', { name: 'Targets ⌘T' }));
+    await user.click(security);
     await user.click(screen.getByRole('button', { name: 'Lock ⌘L' }));
     await user.click(screen.getByRole('button', { name: 'Settings ⌘,' }));
     expect(onShowTargets).toHaveBeenCalledTimes(1);
+    expect(onSecurity).toHaveBeenCalledTimes(1);
     expect(onLock).toHaveBeenCalledTimes(1);
     expect(onSettings).toHaveBeenCalledTimes(1);
+  });
+
+  test('no Security entry without a page to open', () => {
+    sidebar();
+    expect(screen.queryByRole('button', { name: 'Security' })).toBeNull();
+  });
+
+  test('the item of the view shown is marked current: Security on its page, Targets on its view', () => {
+    const currentOf = () =>
+      ['Security', /^Targets/].map((name) =>
+        screen.getByRole('button', { name }).getAttribute('aria-current'),
+      );
+    sidebar({ tab: null, onSecurity: mock(), view: 'security' });
+    expect(currentOf()).toEqual(['page', null]);
+    cleanup();
+    sidebar({ tab: null, onSecurity: mock(), view: 'targets' });
+    expect(currentOf()).toEqual([null, 'page']);
+    cleanup();
+    // A tab's sidebar: neither.
+    sidebar({ onSecurity: mock() });
+    expect(currentOf()).toEqual([null, null]);
   });
 
   test('no Settings entry without a dialog to open', () => {

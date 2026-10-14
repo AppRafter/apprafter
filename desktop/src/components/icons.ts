@@ -37,6 +37,7 @@ export { PlusIcon } from '@phosphor-icons/react/dist/csr/Plus';
 export { PlusCircleIcon } from '@phosphor-icons/react/dist/csr/PlusCircle';
 export { QuestionIcon } from '@phosphor-icons/react/dist/csr/Question';
 export { SealCheckIcon } from '@phosphor-icons/react/dist/csr/SealCheck';
+export { ShieldIcon } from '@phosphor-icons/react/dist/csr/Shield';
 export { SpinnerGapIcon } from '@phosphor-icons/react/dist/csr/SpinnerGap';
 export { SquareIcon } from '@phosphor-icons/react/dist/csr/Square';
 export { SquaresFourIcon } from '@phosphor-icons/react/dist/csr/SquaresFour';

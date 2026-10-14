@@ -20,7 +20,11 @@ export interface TargetTab {
   readonly section: Section;
 }
 
-export type View = { readonly kind: 'tab'; readonly key: string } | { readonly kind: 'targets' };
+/** What the window shows: a tab, the Targets view, or the Security view (WI-476). */
+export type View =
+  | { readonly kind: 'tab'; readonly key: string }
+  | { readonly kind: 'targets' }
+  | { readonly kind: 'security' };
 
 export interface Session {
   readonly tabs: readonly TargetTab[];

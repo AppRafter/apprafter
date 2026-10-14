@@ -67,7 +67,7 @@ export const API_COMMANDS = [
   'op_plan_target_remove',
   'op_plan_target_machine',
   'target_draft_discard',
-  // D.4a: Settings › Lock.
+  // D.4a: the Security page.
   'lock_info',
   'op_plan_lock_on',
   'op_confirm_recovery_key',
@@ -258,7 +258,7 @@ export const opPlanTargetMachine = (name: string, sku: string, region: string | 
 export const targetDraftDiscard = (draftId: DraftId) =>
   call<void>('target_draft_discard', { draftId });
 
-// D.4a: Settings › Lock. Every secret goes to Rust as a command argument and is never kept here;
+// D.4a: the Security page. Every secret goes to Rust as a command argument and is never kept here;
 // the recovery key comes back once, in `LockOnPlan`, for the Protect dialog to show.
 
 /** Where the store keeps its secrets, its slots, this computer's limits and the app's protections. */

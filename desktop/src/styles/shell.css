@@ -412,6 +412,12 @@
   font-size: var(--fs-11);
 }
 
+/* The footer item of the view shown: the Targets view or the Security page (WI-476). */
+.footer-item[aria-current="page"] {
+  background: var(--surface-2);
+  color: var(--fg);
+}
+
 .sidebar-links {
   display: flex;
   align-items: center;
@@ -742,7 +748,26 @@
   font-size: var(--fs-12-5);
 }
 
-/* Settings › Lock (D.4a): the notes under Protect secrets, the slots, this computer's limits. */
+/* Security page (WI-476): as wide as Settings' rows were; the store and every target it covers. */
+.security {
+  max-width: 720px;
+}
+
+.security-store {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0 0 6px;
+  color: var(--fg-muted);
+  font-size: var(--fs-12-5);
+}
+
+.security-store p {
+  margin: 0;
+}
+
+/* The Security page (D.4a, WI-476): the notes under Protect secrets, the slots, this computer's
+   limits. */
 .lock-notes {
   margin: 0 0 8px;
   color: var(--fg-muted);

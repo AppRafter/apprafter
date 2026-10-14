@@ -222,15 +222,13 @@ describe('fixText', () => {
     );
   });
 
-  test('the lock fixes name Settings › Lock or the app, never a command (D.4a)', () => {
-    expect(fixed({ kind: 'protect_secrets' })).toBe(
-      'Settings › Lock › Protect secrets encrypts them.',
-    );
+  test('the lock fixes name the Security page or the app, never a command (D.4a, WI-476)', () => {
+    expect(fixed({ kind: 'protect_secrets' })).toBe('Security › Protect secrets encrypts them.');
     expect(fixed({ kind: 'finish_lock', phase: 'locking' })).toBe(
-      "Protecting this target store's secrets did not finish: finish it in Settings › Lock.",
+      "Protecting this target store's secrets did not finish: finish it on the Security page.",
     );
     expect(fixed({ kind: 'finish_lock', phase: 'unlocking' })).toBe(
-      "Unprotecting this target store's secrets did not finish: finish it in Settings › Lock.",
+      "Unprotecting this target store's secrets did not finish: finish it on the Security page.",
     );
     expect(fixed({ kind: 'unlock_first' })).toBe('Unlock the app to run these checks.');
     expect(fixed({ kind: 'protect_ssh_key', path: '/home/alex/.ssh/id_ed25519' })).toBe(

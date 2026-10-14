@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 // The target store's lock on the mock (D.4a §3.14): where its secrets are (`?secrets=files|locking|
-// locked|unlocking`), Settings › Lock's report, and the three flows — Protect, Finish, Stop
+// locked|unlocking`), the Security page's report, and the three flows — Protect, Finish, Stop
 // protecting — on the ops engine, by Rust's rules where the page can tell: Protect runs only with its
 // recovery key typed back, Finish only where a Protect was interrupted, Stop protecting asks for the
 // store's secret. A protected store opens with MOCK_STORE_PASSWORD or MOCK_RECOVERY_KEY — T24's first
@@ -74,7 +74,19 @@ export interface MockLock {
   readonly lockFromTerminal: () => void;
 }
 
-export function mockLock(engine: MockOps, initial: SecretsMode): MockLock {
+/** As the core's `lock::on::title` names them: "targets: a, b", or "no targets". */
+const namedTargets = (targets: readonly string[]) =>
+  targets.length === 0 ? 'no targets' : `targets: ${targets.join(', ')}`;
+
+/**
+ * As Rust's core does, the report and the Protect plan's title name the store's targets as
+ * they are at each call: `names` reads the mock store (targets.ts `namesIn`).
+ */
+export function mockLock(
+  engine: MockOps,
+  initial: SecretsMode,
+  names: () => readonly string[],
+): MockLock {
   let mode: SecretsMode = initial;
   /** The recovery key of each Protect plan: whether it was saved, and typed back. */
   const keys = new Map<OpId, { saved: boolean; confirmed: boolean }>();
@@ -90,7 +102,8 @@ export function mockLock(engine: MockOps, initial: SecretsMode): MockLock {
   const report = (): LockReport => ({
     store: STORE,
     storeId: protectedNow() ? STORE_ID : null,
-    targets: ['prod-eu', 'staging', 'lab'],
+    // As Rust lists them (list_target_names): every name in the store, unreadable ones too, sorted.
+    targets: [...names()],
     mode,
     slots: protectedNow()
       ? [
@@ -138,7 +151,7 @@ export function mockLock(engine: MockOps, initial: SecretsMode): MockLock {
       const plan: PlanView = engine.registerPlan(
         {
           class: 'bounded',
-          title: `Protect the target store at ${STORE} (targets: prod-eu, staging, lab)`,
+          title: `Protect the target store at ${STORE} (${namedTargets(names())})`,
           changes: [
             {
               kind: 'Vault',
