@@ -4,13 +4,11 @@
 // unlock, Lock when the app starts and Lock when the computer sleeps or locks shown on and not
 // offered, and Auto-lock without Never (O7): the app's unlock is what opens the vault, and its
 // unlocked time ends as a terminal's window does. The saved values stay as the person chose them
-// and come back when protection is off. (2) Protect secrets: where the store's secrets are, and
-// each state's way on. (3) The slots, read-only in D.4a. (4) This computer: every limit the core
-// reports, in the app's words, warnings first, what the lock does not cover, and what the app's
-// own process could not do to protect the key (rule 1: never mask). Presentational: the
-// container (LockSettings) reads lock_info, app_info and the settings, and runs the flows.
+// and come back when protection is off. (2) The store's protection — where its secrets are and
+// each state's way on, the slots, this computer — is StoreProtection (screens/security), on its
+// way to the Security page (WI-476). Presentational: the container (LockSettings) reads
+// lock_info, app_info and the settings, and runs the flows.
 import { Button } from '../../components/Button';
-import { ErrorPanel } from '../../components/ErrorPanel';
 import { Eyebrow } from '../../components/Eyebrow';
 import { LockSimpleIcon } from '../../components/icons';
 import { SegmentedControl, type SegmentOption } from '../../components/SegmentedControl';
@@ -18,51 +16,23 @@ import { SettingRow } from '../../components/SettingRow';
 import { Switch } from '../../components/Switch';
 import type { AuthInfo } from '../../ipc/generated/AuthInfo';
 import type { AutoLock } from '../../ipc/generated/AutoLock';
-import type { HolderHardening } from '../../ipc/generated/HolderHardening';
-import type { LockReport } from '../../ipc/generated/LockReport';
 import type { Os } from '../../ipc/generated/Os';
 import type { SecretsMode } from '../../ipc/generated/SecretsMode';
 import type { SessionEvents } from '../../ipc/generated/SessionEvents';
 import type { Settings } from '../../ipc/generated/Settings';
 import type { UiError } from '../../ipc/generated/UiError';
+import { type LockInfoView, StoreProtection } from '../../screens/security/StoreProtection';
 import { authPrompt } from '../../state/auth';
 import { lockOff, noAuthNotice } from '../../state/lock';
 import {
-  ACTION_LABELS,
-  APP_HOLDS_KEY,
-  AT_REST,
   BIOMETRICS_PROTECTED_SUB,
-  hardeningLine,
-  LIMITS_TITLE,
-  type LimitText,
   LOCK_EYEBROW,
-  limitText,
   NEVER_PROTECTED,
   NEVER_SAVED_NOTE,
   PINNED_SUB,
-  PROTECT_ACTIONS,
-  PROTECT_LABEL,
   type ProtectAction,
-  protectSub,
-  READING,
-  SLOT_NAMES,
-  SLOT_REFUSALS,
-  SLOTS_LABEL,
-  SLOTS_LATER,
-  STORE_PROBLEM_SUB,
-  terminalsLine,
-  unlockNote,
 } from '../../state/lockText';
 import { shortcutHint } from '../../state/shortcuts';
-
-/**
- * What lock_info answers (the IPC type `LockSectionInfo`, Task 11): the report and the app's own
- * protections.
- */
-export interface LockInfoView {
-  readonly report: LockReport;
-  readonly app: HolderHardening;
-}
 
 export interface LockSectionProps {
   readonly settings: Settings;
@@ -211,77 +181,15 @@ export function LockSection(p: LockSectionProps) {
         }
       />
 
-      <SettingRow
-        label={PROTECT_LABEL}
-        sub={p.problem === null ? protectSub(p.mode) : STORE_PROBLEM_SUB}
-        control={(p.problem === null ? PROTECT_ACTIONS[p.mode] : []).map((action) => (
-          <Button
-            key={action}
-            size={28}
-            variant={action === 'stop' ? 'danger' : 'secondary'}
-            onClick={() => p.onAction(action)}
-          >
-            {ACTION_LABELS[action]}
-          </Button>
-        ))}
+      <StoreProtection
+        os={p.os}
+        mode={p.mode}
+        protectedStore={p.protectedStore}
+        info={p.info}
+        error={p.error}
+        problem={p.problem}
+        onAction={p.onAction}
       />
-      {p.problem !== null && <ErrorPanel error={p.problem} />}
-      {p.mode !== 'files' && (
-        <div className="lock-notes">
-          {pinned && <p>{unlockNote(p.os)}</p>}
-          {p.info !== null && <p>{terminalsLine(p.info.report.windowMinutes)}</p>}
-        </div>
-      )}
-      {p.info !== null && p.mode !== 'files' && p.info.report.slots.length > 0 && (
-        <SettingRow
-          label={SLOTS_LABEL}
-          sub={
-            <span className="lock-slots">
-              {p.info.report.slots.map((slot) => (
-                <span key={`${slot.kind}:${slot.label}`}>
-                  {slot.refused === null
-                    ? SLOT_NAMES[slot.kind]
-                    : `${SLOT_NAMES[slot.kind]} — ${SLOT_REFUSALS[slot.refused]}`}
-                </span>
-              ))}
-              <span>{SLOTS_LATER}</span>
-            </span>
-          }
-        />
-      )}
-
-      <div className="lock-limits-head">{LIMITS_TITLE}</div>
-      {p.error !== null ? (
-        <ErrorPanel error={p.error} />
-      ) : p.info === null ? (
-        <p className="lock-notes">{READING}</p>
-      ) : (
-        <Limits info={p.info} holdsKey={p.info.report.window.status === 'app'} />
-      )}
     </>
-  );
-}
-
-/** (4): the limits, warnings first, then what the lock does not cover and the app's own state. */
-function Limits({ info, holdsKey }: { info: LockInfoView; holdsKey: boolean }) {
-  const lines = info.report.limits
-    .map(limitText)
-    .filter((line): line is LimitText => line !== null);
-  // As `lock status` lists them: the warnings first, each group in the core's order.
-  const ordered = [...lines.filter((l) => l.warn), ...lines.filter((l) => !l.warn)];
-  const hardening = hardeningLine(info.app, holdsKey);
-  return (
-    <div className="lock-notes">
-      <ul className="lock-limits">
-        {ordered.map((line) => (
-          <li key={line.text} data-tone={line.warn ? 'warn' : 'neutral'}>
-            {line.text}
-          </li>
-        ))}
-      </ul>
-      <p>{AT_REST}</p>
-      {hardening !== null && <p data-tone="warn">{hardening}</p>}
-      {holdsKey && <p>{APP_HOLDS_KEY}</p>}
-    </div>
   );
 }
