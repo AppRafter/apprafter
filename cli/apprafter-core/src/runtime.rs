@@ -4,17 +4,20 @@
 //!
 //! `Context::runtime_dir()` is `<config root>/run` for the CLI (on Windows with no store
 //! variable, `%LOCALAPPDATA%\apprafter\run\<tag>`) and `<desktop local data dir>/run` for
-//! the desktop, so one client never sweeps the other's live file. On Unix the directory is
-//! 0700 and each file 0600, created with `create_new`; on Windows it sits under the per-user
-//! profile (owner-only ACLs arrive with D.4). A [`MaterialisedKubeconfig`] removes its file when
-//! it drops; [`sweep_stale`] removes what a crashed process left behind — by its owner, never by
+//! the desktop, so one client never sweeps the other's live file. The directory and its files
+//! are owner-only ([`cli_core::owner_only`], WI-472), so a store in a folder other users can
+//! read keeps them out: on Unix the directory is 0700 and each file 0600, created with
+//! `create_new`; on Windows the directory has a protected DACL whose one ACE, full access for
+//! this account, its files inherit, and each file gets its own protected one-ACE DACL on its
+//! handle before its first byte. A [`MaterialisedKubeconfig`] removes its file when it drops;
+//! [`sweep_stale`] removes what a crashed process left behind — by its owner, never by
 //! its age (D.4a T44): a copy's name records its writer's pid and start as the OS reports it,
 //! and the copy goes only when that pid is gone or now belongs to a process with another start,
 //! so a long session's copy (`top`, `open argocd`, `app logs -f`) stays however old it is, and
 //! a clock step changes nothing. Reads here are lockless: `state.json` is replaced atomically
 //! (overview R3).
 
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -72,8 +75,8 @@ pub fn materialise_kubeconfig(
 }
 
 /// `body`, a decrypted kubeconfig, written to `<runtime_dir>/kubeconfig-<pid>-<start>-<n>.yaml`
-/// (0600 in a 0700 dir), after [`sweep_stale`] — best effort: a sweep that fails never stops
-/// the write. The one materialiser of the CLI and the core (D.4a T44).
+/// (owner-only, in an owner-only dir), after [`sweep_stale`] — best effort: a sweep that fails
+/// never stops the write. The one materialiser of the CLI and the core (D.4a T44).
 pub fn materialise(ctx: &Context, body: &str) -> CoreResult<MaterialisedKubeconfig> {
     let _ = sweep_stale(ctx);
     write_private(ctx.runtime_dir(), body.as_bytes())
@@ -160,15 +163,10 @@ fn write_private(dir: &Path, bytes: &[u8]) -> CoreResult<MaterialisedKubeconfig>
             Some(start) => format!("{PREFIX}{pid}-{start}-{n}.yaml"),
             None => format!("{PREFIX}{pid}-{n}.yaml"),
         });
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        match options.open(&path) {
+        match cli_core::owner_only::create_new(&path) {
             Ok(mut file) => {
+                #[cfg(all(test, windows))]
+                cli_core::owner_only::testing::record_before_first_byte(&file);
                 let written = file.write_all(bytes);
                 // Close before the guard can remove it: Windows refuses to delete an open file.
                 drop(file);
@@ -186,8 +184,11 @@ fn write_private(dir: &Path, bytes: &[u8]) -> CoreResult<MaterialisedKubeconfig>
     )))
 }
 
-/// Create `dir` owner-only, or tighten an existing one; refuse anything that is not a plain
-/// directory (a symlink would put the decrypted file somewhere else).
+/// Create `dir` owner-only, or tighten an existing one — 0700 on Unix, the protected DACL whose
+/// one ACE its files inherit on Windows (WI-472) — and refuse anything that is not a plain
+/// directory (a symlink would put the decrypted file somewhere else). On Windows the DACL is set
+/// just after the directory is made; each file is restricted on its own handle as well, so a
+/// file made in that moment is no one else's to read.
 fn ensure_private_dir(dir: &Path) -> CoreResult<()> {
     match fs::symlink_metadata(dir) {
         Ok(meta) if meta.is_dir() => {}
@@ -225,6 +226,8 @@ fn ensure_private_dir(dir: &Path) -> CoreResult<()> {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(io_error)?;
     }
+    #[cfg(windows)]
+    cli_core::owner_only::restrict_dir(dir).map_err(io_error)?;
     Ok(())
 }
 
@@ -300,7 +303,7 @@ mod tests {
     }
 
     fn aged(path: &Path, age: Duration) {
-        let f = OpenOptions::new().write(true).open(path).unwrap();
+        let f = fs::OpenOptions::new().write(true).open(path).unwrap();
         f.set_modified(SystemTime::now() - age).unwrap();
     }
 
@@ -431,6 +434,46 @@ mod tests {
                 & 0o777,
             0o700
         );
+    }
+
+    /// WI-472: on Windows the runtime dir has the protected DACL whose one ACE (this user, full
+    /// access) its files inherit, and the decrypted kubeconfig its own protected one-ACE DACL,
+    /// set on its handle before its first byte.
+    #[cfg(windows)]
+    #[test]
+    fn materialised_file_and_dir_have_the_owner_only_dacl() {
+        use cli_core::owner_only::testing;
+        let s = store(Some(plain()));
+        let _ = testing::take_before_first_byte();
+        let file = materialise_kubeconfig(&s.ctx, &s.target).unwrap().unwrap();
+        testing::take_before_first_byte()
+            .expect("the write recorded the kubeconfig file's DACL")
+            .unwrap()
+            .assert_owner_only_file("the kubeconfig before its first byte");
+        testing::of_path(file.path())
+            .unwrap()
+            .assert_owner_only_file("the materialised kubeconfig");
+        testing::of_path(s.ctx.runtime_dir())
+            .unwrap()
+            .assert_owner_only_dir("the runtime dir");
+    }
+
+    /// WI-472: a runtime dir that exists already (made by an older AppRafter, or by hand) is
+    /// given the owner-only DACL before a kubeconfig is written into it.
+    #[cfg(windows)]
+    #[test]
+    fn an_existing_runtime_dir_gets_the_owner_only_dacl() {
+        use cli_core::owner_only::testing;
+        let s = store(Some(plain()));
+        fs::create_dir_all(s.ctx.runtime_dir()).unwrap();
+        assert!(
+            !testing::of_path(s.ctx.runtime_dir()).unwrap().protected,
+            "a directory made by hand inherits (the test's premise)"
+        );
+        let _file = materialise_kubeconfig(&s.ctx, &s.target).unwrap().unwrap();
+        testing::of_path(s.ctx.runtime_dir())
+            .unwrap()
+            .assert_owner_only_dir("the existing runtime dir");
     }
 
     #[cfg(unix)]

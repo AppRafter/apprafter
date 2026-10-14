@@ -165,16 +165,13 @@ fn create_identity(path: &Path) -> Result<Option<Identity>> {
     }
 }
 
-/// Write a new secret file; `AlreadyExists` when there is one (never replaced).
+/// Write a new secret file, owner-only before its first byte (mode 0600 on Unix, the protected
+/// one-ACE DACL on Windows: [`crate::owner_only::create_new`]); `AlreadyExists` when there is
+/// one (never replaced).
 fn write_secret_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let mut options = std::fs::OpenOptions::new();
-    options.create_new(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut f = options.open(path)?;
+    let mut f = crate::owner_only::create_new(path)?;
+    #[cfg(all(test, windows))]
+    crate::owner_only::testing::record_before_first_byte(&f);
     f.write_all(bytes)?;
     f.write_all(b"\n").ok();
     Ok(())
@@ -364,6 +361,25 @@ mod tests {
         load_or_create_identity(&path).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "got {mode:o}");
+    }
+
+    /// WI-472: on Windows the age key is owner-only by its DACL — protected, one ACE, this
+    /// user — before the key's first byte is written, whatever the folder hands down.
+    #[cfg(windows)]
+    #[test]
+    fn load_or_create_writes_the_owner_only_dacl_before_the_key() {
+        use crate::owner_only::testing;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("age.key");
+        let _ = testing::take_before_first_byte();
+        load_or_create_identity(&path).unwrap();
+        testing::take_before_first_byte()
+            .expect("the write recorded the key file's DACL")
+            .unwrap()
+            .assert_owner_only_file("age.key before its first byte");
+        testing::of_path(&path)
+            .unwrap()
+            .assert_owner_only_file("age.key");
     }
 
     #[test]

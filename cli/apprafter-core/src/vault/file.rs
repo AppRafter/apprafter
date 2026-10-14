@@ -13,15 +13,15 @@
 //!   same-volume move keeps the temp file's DACL and fails when the name exists.
 //! - [`replace`] writes every later vault by `std::fs::rename` (never `ReplaceFileW`, which keeps
 //!   the replaced file's DACL); the directory fsync is best effort.
-//! - The temp file is owner-only before its first byte: mode 0600 at `open` on Unix (never a
-//!   chmod afterwards); on Windows a protected DACL with one ACE, full access for the process
-//!   token's user (`D:P(A;;FA;;;<user SID>)`), set on the open handle before anything is
-//!   written. A wider mode or a foreign owner found later is a doctor warning, not a refusal:
-//!   the contents are authenticated.
+//! - The temp file is owner-only before its first byte ([`cli_core::owner_only::create_new`]):
+//!   mode 0600 at `open` on Unix (never a chmod afterwards); on Windows a protected DACL with
+//!   one ACE, full access for the process token's user (`D:P(A;;FA;;;<user SID>)`), set on the
+//!   open handle before anything is written. A wider mode or a foreign owner found later is a
+//!   doctor warning, not a refusal: the contents are authenticated.
 //! - Every write needs the target store's write lock, held (`WriteLockNotHeld`), and first
 //!   removes the `.vault.*.tmp` files an interrupted writer left (they hold ciphertext only).
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -178,7 +178,7 @@ fn create_temp(dir: &Path) -> VaultResult<(PathBuf, File)> {
         OsRandom.fill(&mut suffix)?;
         let hex: String = suffix.iter().map(|b| format!("{b:02x}")).collect();
         let path = dir.join(format!("{TEMP_PREFIX}{hex}{TEMP_SUFFIX}"));
-        match open_owner_only(&path) {
+        match cli_core::owner_only::create_new(&path) {
             Ok(file) => return Ok((path, file)),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(io_error(&path, e)),
@@ -188,36 +188,6 @@ fn create_temp(dir: &Path) -> VaultResult<(PathBuf, File)> {
         dir,
         io::Error::new(io::ErrorKind::AlreadyExists, "no free temporary vault name"),
     ))
-}
-
-#[cfg(unix)]
-fn open_owner_only(path: &Path) -> io::Result<File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-}
-
-#[cfg(windows)]
-fn open_owner_only(path: &Path) -> io::Result<File> {
-    use std::os::windows::fs::OpenOptionsExt;
-    use windows_sys::Win32::Foundation::GENERIC_WRITE;
-    use windows_sys::Win32::Storage::FileSystem::{READ_CONTROL, WRITE_DAC};
-    // No sharing while it is ours, and the right to set its DACL.
-    let file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .share_mode(0)
-        .access_mode(GENERIC_WRITE | WRITE_DAC | READ_CONTROL)
-        .open(path)?;
-    if let Err(e) = restrict_to_owner(&file) {
-        drop(file);
-        let _ = fs::remove_file(path);
-        return Err(e);
-    }
-    Ok(file)
 }
 
 #[cfg(unix)]
@@ -359,112 +329,6 @@ fn under_temp(path: &Path) {
 
 #[cfg(not(test))]
 fn under_temp(_: &Path) {}
-
-/// Replaces `file`'s DACL with one ACE — `FILE_ALL_ACCESS` for the process token's user — and
-/// protects it from inheritance: `D:P(A;;FA;;;<user SID>)`, the analogue of mode 0600. No
-/// SYSTEM or Administrators ACE: they can read it either way (ADR 0068 Risks).
-#[cfg(windows)]
-fn restrict_to_owner(file: &File) -> io::Result<()> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, HANDLE};
-    use windows_sys::Win32::Security::Authorization::{SetSecurityInfo, SE_FILE_OBJECT};
-    use windows_sys::Win32::Security::{
-        AddAccessAllowedAce, GetLengthSid, InitializeAcl, ACCESS_ALLOWED_ACE, ACL, ACL_REVISION,
-        DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
-    };
-    use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
-
-    let user = CurrentUser::current()?;
-    // SAFETY: the SID lives in `user`'s buffer for as long as `user` does.
-    let sid_len = unsafe { GetLengthSid(user.sid()) } as usize;
-    let acl_len = std::mem::size_of::<ACL>() + std::mem::size_of::<ACCESS_ALLOWED_ACE>()
-        - std::mem::size_of::<u32>()
-        + sid_len;
-    // u64s keep the ACL DWORD-aligned.
-    let mut acl_buf = vec![0u64; acl_len.div_ceil(8)];
-    let acl = acl_buf.as_mut_ptr().cast::<ACL>();
-    // SAFETY: `acl` points at `acl_len` writable, aligned bytes that outlive the calls below.
-    if unsafe { InitializeAcl(acl, acl_len as u32, ACL_REVISION) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: as above; the SID is valid (`user`).
-    if unsafe { AddAccessAllowedAce(acl, ACL_REVISION, FILE_ALL_ACCESS, user.sid()) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: the handle is this open file's, opened with WRITE_DAC; owner and group are left
-    // as they are (null), and `acl` is the DACL built above.
-    let status = unsafe {
-        SetSecurityInfo(
-            file.as_raw_handle() as HANDLE,
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            acl,
-            std::ptr::null(),
-        )
-    };
-    if status != ERROR_SUCCESS {
-        return Err(io::Error::from_raw_os_error(status as i32));
-    }
-    Ok(())
-}
-
-/// The process token's `TOKEN_USER`, in a buffer that owns the SID it points to.
-#[cfg(windows)]
-struct CurrentUser {
-    buf: Vec<u64>,
-}
-
-#[cfg(windows)]
-impl CurrentUser {
-    fn current() -> io::Result<Self> {
-        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-        use windows_sys::Win32::Security::TOKEN_QUERY;
-        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-
-        let mut token: HANDLE = std::ptr::null_mut();
-        // SAFETY: the current-process pseudo handle; `token` receives a new handle, closed below.
-        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let user = Self::of_token(token);
-        // SAFETY: `token` was opened above and is closed once, here.
-        unsafe { CloseHandle(token) };
-        user
-    }
-
-    fn of_token(token: windows_sys::Win32::Foundation::HANDLE) -> io::Result<Self> {
-        use windows_sys::Win32::Security::{GetTokenInformation, TokenUser};
-        let mut len = 0u32;
-        // SAFETY: a size query: no buffer; `len` receives the size needed.
-        unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut len) };
-        if len == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let mut buf = vec![0u64; (len as usize).div_ceil(8)];
-        // SAFETY: `buf` holds at least `len` writable bytes, 8-aligned.
-        let ok = unsafe {
-            GetTokenInformation(token, TokenUser, buf.as_mut_ptr().cast(), len, &mut len)
-        };
-        if ok == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(CurrentUser { buf })
-    }
-
-    fn sid(&self) -> windows_sys::Win32::Security::PSID {
-        // SAFETY: `buf` holds the TOKEN_USER that GetTokenInformation wrote.
-        unsafe {
-            (*self
-                .buf
-                .as_ptr()
-                .cast::<windows_sys::Win32::Security::TOKEN_USER>())
-            .User
-            .Sid
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -671,86 +535,15 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_vault_has_a_protected_dacl_with_one_ace_for_this_user() {
+        use cli_core::owner_only::testing;
         let (_dir, lock, vault) = store();
         write_new(&vault, b"first", &lock).unwrap();
-        assert_owner_only(&vault);
+        testing::of_path(&vault)
+            .unwrap()
+            .assert_owner_only_file("the vault after write_new");
         replace(&vault, b"second", &lock).unwrap();
-        assert_owner_only(&vault);
-    }
-
-    /// The file's DACL: protected (no inherited ACEs), exactly one ACE, access-allowed,
-    /// FILE_ALL_ACCESS, for the process token's user.
-    #[cfg(windows)]
-    fn assert_owner_only(path: &Path) {
-        use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS};
-        use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
-        use windows_sys::Win32::Security::{
-            AclSizeInformation, EqualSid, GetAce, GetAclInformation, GetSecurityDescriptorControl,
-            ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION, PSID,
-            SE_DACL_PROTECTED,
-        };
-        use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
-        const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
-
-        let wide: Vec<u16> = path
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-        let mut dacl: *mut ACL = std::ptr::null_mut();
-        let mut descriptor = std::ptr::null_mut();
-        // SAFETY: a NUL-terminated path; the out-pointers are valid; `descriptor` is freed below.
-        let status = unsafe {
-            GetNamedSecurityInfoW(
-                wide.as_ptr(),
-                SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                &mut dacl,
-                std::ptr::null_mut(),
-                &mut descriptor,
-            )
-        };
-        assert_eq!(status, ERROR_SUCCESS);
-        let (mut control, mut revision) = (0u16, 0u32);
-        // SAFETY: `descriptor` came from GetNamedSecurityInfoW.
-        assert_ne!(
-            unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) },
-            0
-        );
-        assert_ne!(control & SE_DACL_PROTECTED, 0, "the DACL inherits");
-        let mut info = ACL_SIZE_INFORMATION {
-            AceCount: 0,
-            AclBytesInUse: 0,
-            AclBytesFree: 0,
-        };
-        // SAFETY: `dacl` points into `descriptor`; `info` is the size class's struct.
-        assert_ne!(
-            unsafe {
-                GetAclInformation(
-                    dacl,
-                    (&mut info as *mut ACL_SIZE_INFORMATION).cast(),
-                    std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
-                    AclSizeInformation,
-                )
-            },
-            0
-        );
-        assert_eq!(info.AceCount, 1, "one ACE");
-        let mut ace = std::ptr::null_mut();
-        // SAFETY: index 0 exists (AceCount is 1).
-        assert_ne!(unsafe { GetAce(dacl, 0, &mut ace) }, 0);
-        let ace = ace.cast::<ACCESS_ALLOWED_ACE>();
-        // SAFETY: an ACE of the access-allowed layout, checked by its type byte first.
-        unsafe {
-            assert_eq!((*ace).Header.AceType, ACCESS_ALLOWED_ACE_TYPE);
-            assert_eq!((*ace).Mask, FILE_ALL_ACCESS);
-            let sid: PSID = std::ptr::addr_of_mut!((*ace).SidStart).cast();
-            let user = CurrentUser::current().unwrap();
-            assert_ne!(EqualSid(sid, user.sid()), 0, "the ACE is for this user");
-            LocalFree(descriptor);
-        }
+        testing::of_path(&vault)
+            .unwrap()
+            .assert_owner_only_file("the vault after replace");
     }
 }

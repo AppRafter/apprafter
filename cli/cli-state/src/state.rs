@@ -436,8 +436,9 @@ impl State {
     /// file. A reader (another CLI process, AppRafter Desktop) sees the
     /// old version or the new one, never a truncated file it would
     /// report as `state::corrupt`. The temp file, and so `state.json`,
-    /// is created owner-only (0600 on Unix): it carries the encrypted
-    /// kubeconfig and, from older releases, a plaintext one. A reader
+    /// is created owner-only (0600 on Unix, the protected one-ACE DACL
+    /// on Windows): it carries the encrypted kubeconfig and, from older
+    /// releases, a plaintext one. A reader
     /// holding `state.json` open does not make the save fail, on Windows
     /// either ([`cli_core::atomic_replace`]).
     pub fn save(&self, paths: &StatePaths) -> Result<()> {
@@ -513,6 +514,21 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600, "state.json is {mode:o} after a save");
+    }
+
+    /// WI-472: on Windows a save leaves `state.json` owner-only by its DACL — protected, one
+    /// ACE, this user — even when the file it replaces inherited its folder's.
+    #[cfg(windows)]
+    #[test]
+    fn save_over_an_inherited_file_leaves_the_owner_only_dacl() {
+        let dir = tempdir().unwrap();
+        let paths = StatePaths::for_root(dir.path());
+        std::fs::create_dir_all(paths.state_dir()).unwrap();
+        std::fs::write(paths.state_file(), b"{}").unwrap();
+        State::default().save(&paths).unwrap();
+        cli_core::owner_only::testing::of_path(&paths.state_file())
+            .unwrap()
+            .assert_owner_only_file("state.json after a save");
     }
 
     /// A reader holding `state.json` open — another CLI run, AppRafter

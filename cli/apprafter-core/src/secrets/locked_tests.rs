@@ -314,6 +314,10 @@ fn the_marker_names_the_store_and_a_released_cli_stops_at_it() {
     );
     #[cfg(unix)]
     assert_eq!(mode_of(&path), 0o600);
+    #[cfg(windows)]
+    cli_core::owner_only::testing::of_path(&path)
+        .unwrap()
+        .assert_owner_only_file("the marker");
     // An id YAML would read as a number is written so that it reads back as the id.
     write_marker(&ctx.store(), "prod", &id("1234567890123456")).unwrap();
     assert_eq!(
@@ -959,10 +963,18 @@ fn writes_go_to_the_vault_and_leave_a_marker_and_no_clear_token() {
     }
     #[cfg(unix)]
     assert_eq!(mode_of(&s.credentials_file("staging")), 0o600);
-    // c2's writes are the first callers of c1's `replace`: the vault stays owner-only (the
-    // Windows DACL is c1's `windows-latest` test).
+    // c2's writes are the first callers of c1's `replace`: the vault stays owner-only.
     #[cfg(unix)]
     assert_eq!(mode_of(&ctx.config_root().join(VAULT_FILE)), 0o600);
+    #[cfg(windows)]
+    for (file, what) in [
+        (s.credentials_file("staging"), "the marker"),
+        (ctx.config_root().join(VAULT_FILE), "the vault"),
+    ] {
+        cli_core::owner_only::testing::of_path(&file)
+            .unwrap()
+            .assert_owner_only_file(what);
+    }
 }
 
 /// T28: a vault write without the held write lock is refused, and the vault is unchanged —

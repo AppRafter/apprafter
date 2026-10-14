@@ -41,6 +41,14 @@ tempfile           = { workspace = true }
 # Already in the graph; no new crate.
 libc               = "0.2"
 
+[target.'cfg(windows)'.dependencies]
+# `owner_only` (WI-472): the protected one-ACE DACL of every owner-only file
+# and directory — the token's user (Security, System_Threading), the DACL set
+# and read back (Security_Authorization), the file rights and the directory
+# open (Storage_FileSystem). The version apprafter-core and platform-cli take,
+# already in both locks (cli/, desktop/): an edge, no package.
+windows-sys        = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
+
 [dev-dependencies]
 # Integration tests select a specific Application doc by name from a
 # multi-app `cue export` object (order-independent fixture assertions).

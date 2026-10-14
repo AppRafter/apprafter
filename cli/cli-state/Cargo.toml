@@ -20,3 +20,7 @@ thiserror  = { workspace = true }
 # Per-test state roots. `State::save` writes through
 # `cli_core::atomic_replace`, which owns the temp file.
 tempfile   = { workspace = true }
+# `cli_core::owner_only::testing`, to read state.json's Windows DACL back
+# (WI-472). A path crate's dev-dependency reaches neither a shipped binary
+# nor desktop/Cargo.lock.
+cli-core   = { path = "../cli-core", features = ["test-support"] }

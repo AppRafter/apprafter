@@ -69,9 +69,10 @@ libc          = "0.2"
 # terminated on timeout or cancellation), resuming it (ToolHelp), and CREATE_NO_WINDOW. The
 # version platform-cli takes, already in both locks; `Win32_Security` only because
 # `CreateJobObjectW` names SECURITY_ATTRIBUTES. The vault file (D.4a T27):
-# `Win32_Security_Authorization` sets its owner-only DACL, `Win32_Storage_FileSystem` moves a
-# new vault into place without replacing one. Features only: no package moves in either lock.
-windows-sys   = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_Threading"] }
+# `Win32_Storage_FileSystem` moves a new vault into place without replacing one; its owner-only
+# DACL, like the runtime dir's, is cli-core's (`cli_core::owner_only`, WI-472). Features only: no
+# package moves in either lock.
+windows-sys   = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [dev-dependencies]
 # tests/guards.rs reads the sources as syntax trees, not text. `syn` 2 and

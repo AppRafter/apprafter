@@ -8,6 +8,7 @@ pub mod error;
 pub mod fsutil;
 pub mod logging;
 pub mod manifest;
+pub mod owner_only;
 pub mod paths;
 pub mod quantity;
 pub mod resolve;

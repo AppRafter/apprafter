@@ -917,9 +917,11 @@ pub fn remove_target(paths: &TargetStorePaths, name: &str) -> Result<()> {
 /// the replace fail.
 ///
 /// `secret = true` enforces mode 0600 (owner read/write only) on
-/// Unix, `false` 0644. On Windows the mode is ignored (NTFS ACLs
-/// inherit from the parent; tightening per-file is out of scope
-/// for v0.1.72).
+/// Unix, `false` 0644. On Windows a secret file gets the protected
+/// one-ACE DACL instead, set on the temp file before its first byte
+/// ([`crate::owner_only`], WI-472): owner-only even in a store whose
+/// folder other users can read. A non-secret one keeps what it
+/// inherits from its directory.
 fn atomic_write(final_path: &Path, bytes: &[u8], secret: bool) -> Result<()> {
     let parent = final_path.parent().ok_or_else(|| {
         CliError::Other(format!(
@@ -1267,6 +1269,43 @@ mod tests {
         assert_eq!(
             cfg_mode, 0o644,
             "config.yaml must be 0644 (group/world readable), got {cfg_mode:o}"
+        );
+    }
+
+    /// WI-472: on Windows `credentials.yaml` is owner-only by its DACL — protected, one ACE,
+    /// this user — from the temp file's first byte (the token is never written into a file
+    /// that inherits its folder's DACL) through the rename; `config.yaml` is not secret and
+    /// keeps what it inherits.
+    #[cfg(windows)]
+    #[test]
+    fn credentials_file_lands_with_the_owner_only_dacl() {
+        use crate::owner_only::testing;
+        let (_dir, paths) = make_paths();
+        let target = Target {
+            name: "work".into(),
+            config: TargetConfig {
+                provider: "hetzner-cloud".into(),
+                ..Default::default()
+            },
+            credentials: TargetCredentials {
+                hetzner_token: Some("hcloud_secret".into()),
+            },
+        };
+        save_target(&paths, &target).expect("save ok");
+        let _ = testing::take_before_first_byte();
+        save_target_credentials(&paths, "work", &target.credentials).expect("save ok");
+        testing::take_before_first_byte()
+            .expect("the write recorded its temp file's DACL")
+            .unwrap()
+            .assert_owner_only_file("credentials.yaml's temp file before its first byte");
+        testing::of_path(&paths.target_credentials_file("work"))
+            .unwrap()
+            .assert_owner_only_file("credentials.yaml");
+        assert!(
+            !testing::of_path(&paths.target_config_file("work"))
+                .unwrap()
+                .protected,
+            "config.yaml is not secret: it keeps what its directory hands down"
         );
     }
 

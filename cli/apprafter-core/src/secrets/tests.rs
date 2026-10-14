@@ -129,6 +129,10 @@ fn a_token_is_written_as_save_target_wrote_it_and_nothing_else() {
             & 0o777;
         assert_eq!(mode, 0o600, "got {mode:o}");
     }
+    #[cfg(windows)]
+    cli_core::owner_only::testing::of_path(&s.credentials_file("prod"))
+        .unwrap()
+        .assert_owner_only_file("credentials.yaml");
 }
 
 /// GOTCHA-120: a read never creates the age key.
