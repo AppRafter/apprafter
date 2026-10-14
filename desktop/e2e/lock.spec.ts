@@ -32,6 +32,13 @@ test('Protect: the password, the key shown, copied and typed back, the run', asy
   await settings.getByRole('button', { name: 'Protect…' }).click();
   const wizard = page.getByRole('dialog', { name: 'Protect secrets' });
   await expect(wizard).toBeVisible();
+  // The title on one line, clear of the five steps beside it: nothing overlaps.
+  const fits = await wizard.getByRole('heading', { name: 'Protect secrets' }).evaluate((el) => {
+    const lines =
+      el.getBoundingClientRect().height / Number.parseFloat(getComputedStyle(el).lineHeight);
+    return { overflows: el.scrollWidth > el.clientWidth, lines: Math.round(lines) };
+  });
+  expect(fits).toEqual({ overflows: false, lines: 1 });
   await shot(page, info, 'protect, what it does');
   await wizard.getByRole('button', { name: 'Continue' }).click();
 

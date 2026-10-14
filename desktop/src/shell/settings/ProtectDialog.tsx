@@ -347,7 +347,6 @@ export function ProtectDialog(p: ProtectDialogProps) {
       title={PROTECT_TITLE}
       steps={PROTECT_STEPS}
       step={step}
-      width={620}
       {...(back !== undefined && { onBack: back })}
       nextLabel={
         ['Continue', 'Continue', SAVED_IT, PROTECT_BUTTON, PROTECT_BUTTON][step] ?? 'Continue'
