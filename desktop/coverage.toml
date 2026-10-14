@@ -147,20 +147,20 @@ status = "planned"
 slice = "D.12"
 
 [leaf."lock off"]
-status = "planned"
-slice = "D.4"
+action = "lock.unprotect"
+slice = "D.4a"
 
 [leaf."lock now"]
-status = "planned"
-slice = "D.4"
+action = "lock.now"
+slice = "D.4a"
 
 [leaf."lock on"]
-status = "planned"
-slice = "D.4"
+action = "lock.protect"
+slice = "D.4a"
 
 [leaf."lock status"]
-status = "planned"
-slice = "D.4"
+action = "lock.status"
+slice = "D.4a"
 
 [leaf."login"]
 status = "unavailable"
@@ -333,8 +333,8 @@ status = "planned"
 slice = "D.5"
 
 [leaf."unlock"]
-status = "planned"
-slice = "D.4"
+action = "lock.unlock"
+slice = "D.4a"
 
 [leaf."up"]
 status = "planned"

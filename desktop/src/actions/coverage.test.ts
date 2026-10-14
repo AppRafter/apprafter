@@ -107,6 +107,33 @@ test('D.3 stays closed, and its nine leaves stay actions in it', () => {
   expect(inD3).toEqual(D3_LEAVES.map(([leaf]) => leaf).sort());
 });
 
+/** D.4a's five leaves, each with the action that covers it (overview §3.15, T82). */
+const D4A_LEAVES = [
+  ['lock on', 'lock.protect'],
+  ['lock off', 'lock.unprotect'],
+  ['lock status', 'lock.status'],
+  ['lock now', 'lock.now'],
+  ['unlock', 'lock.unlock'],
+] as const;
+
+// D.4a closes in d4a-h, which adds it to CLOSED_SLICES; until then these five must already be
+// actions in it, so a leaf the app shows is held to its action.
+test('the five lock leaves are actions in D.4a', () => {
+  for (const [leaf, id] of D4A_LEAVES) {
+    expect({
+      leaf,
+      action: entries[leaf]?.action,
+      slice: entries[leaf]?.slice,
+      status: entries[leaf]?.status ?? null,
+    }).toEqual({ leaf, action: id, slice: 'D.4a', status: null });
+  }
+  const inD4a = Object.entries(entries)
+    .filter(([, e]) => e.slice === 'D.4a')
+    .map(([leaf]) => leaf)
+    .sort();
+  expect(inD4a).toEqual(D4A_LEAVES.map(([leaf]) => leaf).sort());
+});
+
 test('the fixed markers stay what the spec decided', () => {
   expect(entries.completion?.status).toBe('cli-only');
   for (const leaf of ['plan', 'login', 'upgrade-tier']) {

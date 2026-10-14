@@ -19,6 +19,12 @@ export const ACTION_IDS = [
   'target.renew',
   'doctor.run',
   'whoami.show',
+  // D.4a: Settings › Lock and the lock screen.
+  'lock.protect',
+  'lock.unprotect',
+  'lock.status',
+  'lock.now',
+  'lock.unlock',
 ] as const;
 
 export type ActionId = (typeof ACTION_IDS)[number];
@@ -38,6 +44,16 @@ export const ACTION_COMMANDS: { readonly [K in ActionId]: ApiCommand } = {
   'doctor.run': 'op_start_doctor',
   // Settings › About › This computer.
   'whoami.show': 'whoami',
+  // Settings › Lock: Protect…, its run.
+  'lock.protect': 'op_plan_lock_on',
+  // Settings › Lock: Stop protecting…
+  'lock.unprotect': 'op_plan_lock_off',
+  // Settings › Lock: the section's report (where the secrets are, the slots, the limits).
+  'lock.status': 'lock_info',
+  // Lock now (Mod+L, the Lock section's row).
+  'lock.now': 'lock_now',
+  // The lock screen's field, which opens a protected store's vault.
+  'lock.unlock': 'unlock_with_password',
 };
 
 /**
