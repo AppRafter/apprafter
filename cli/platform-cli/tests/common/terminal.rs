@@ -59,18 +59,42 @@ pub fn converse_with(
     steps: &[Step],
     wire: impl FnOnce(&mut Command),
 ) -> Ended {
+    converse_on(sp, args, steps, false, wire)
+}
+
+/// [`converse`] with stdout at the terminal too, as a shell runs a command: what asks only
+/// where stdin and stdout are both terminals — the `target add` and `repo creds add` wizards —
+/// asks here (WI-478). `Ended::stdout` is then empty: everything shows in `terminal`.
+pub fn converse_at_terminal(sp: &Spawn, args: &[&str], steps: &[Step]) -> Ended {
+    converse_on(sp, args, steps, true, |_| {})
+}
+
+/// The conversation: stdin and stderr at the pty, and stdout too when `stdout_at_terminal`,
+/// else a pipe read on its own thread.
+fn converse_on(
+    sp: &Spawn,
+    args: &[&str],
+    steps: &[Step],
+    stdout_at_terminal: bool,
+    wire: impl FnOnce(&mut Command),
+) -> Ended {
     let (master, slave) = open_pty();
+    let out = stdout_at_terminal.then(|| slave.try_clone().expect("dup the slave"));
     let mut cmd = sp.std_at_terminal(args, slave);
-    cmd.stdout(Stdio::piped());
+    match out {
+        Some(slave) => cmd.stdout(Stdio::from(slave)),
+        None => cmd.stdout(Stdio::piped()),
+    };
     wire(&mut cmd);
     let mut child = cmd.spawn().expect("spawn apprafter");
     // The command holds the slave until it drops: the terminal must close with the child.
     drop(cmd);
-    let mut stdout = child.stdout.take().expect("stdout");
-    let out_reader = std::thread::spawn(move || {
-        let mut out = String::new();
-        let _ = stdout.read_to_string(&mut out);
-        out
+    let out_reader = child.stdout.take().map(|mut stdout| {
+        std::thread::spawn(move || {
+            let mut out = String::new();
+            let _ = stdout.read_to_string(&mut out);
+            out
+        })
     });
     let mut writer = std::fs::File::from(master.try_clone().expect("dup the master"));
     let mut reader = std::fs::File::from(master);
@@ -151,7 +175,9 @@ pub fn converse_with(
             flags & (libc::ECHO | libc::ICANON) == (libc::ECHO | libc::ICANON)
         }
     };
-    let stdout = out_reader.join().expect("stdout reader");
+    let stdout = out_reader
+        .map(|r| r.join().expect("stdout reader"))
+        .unwrap_or_default();
     drained
         .recv_timeout(Duration::from_secs(10))
         .expect("the terminal closes once the child has exited");

@@ -2035,6 +2035,9 @@ pub fn run_backup(
 
     let resolved = resolve_state_paths(None)?;
     let cluster_id = resolved.target_name.clone();
+    // WI-478: the passphrase is asked before the kubeconfig is read from the target store,
+    // which refuses a store other accounts can change; refused here instead, before it is asked.
+    crate::context::refuse_a_store_others_can_change()?;
 
     let env_pass = std::env::var("RESTIC_PASSWORD").ok();
     let is_tty = std::io::stdin().is_terminal();

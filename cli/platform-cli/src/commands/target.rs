@@ -114,6 +114,11 @@ pub(crate) fn add(mut args: AddArgs) -> miette::Result<()> {
         None
     };
     if let Some(ctx) = &early {
+        // WI-478 (d4a-h F1's class): the wizard asks for a token, and the save refuses a store
+        // other accounts can change (`store_not_private`, under the store lock); so it is
+        // refused here, before the wizard asks anything. Read only.
+        cli_core::store_privacy::ensure_private(&ctx.store())
+            .map_err(|e| report(CoreError::from(e)))?;
         run_wizard_into_args(ctx, &mut args).map_err(report)?;
     }
 

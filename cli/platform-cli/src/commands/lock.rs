@@ -641,6 +641,10 @@ pub(crate) fn unlock(timeout: Option<u32>) -> miette::Result<()> {
         SecretsMode::Unlocking => Some(LockPhase::Unlocking),
         SecretsMode::Locked => None,
     };
+    // WI-478 (d4a-h F1's class): a store other accounts can change is refused before its lock
+    // password is asked, as `lock off` refuses it when planned, once it knows the store is not
+    // in files: the window would open a vault whose every secret is then refused. Read only.
+    cli_core::store_privacy::ensure_private(&ctx.store()).map_err(miette::Report::new)?;
     if let Some(phase) = incomplete {
         return Err(miette::Report::new(CliError::LockIncomplete {
             store: ctx.config_root().to_path_buf(),

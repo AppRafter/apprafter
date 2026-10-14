@@ -619,6 +619,10 @@ pub fn run_restore(
     // 0. External binaries, before the credential gate below (D11 / 2.22a —
     //    see [`tools_for_restore`]).
     cli_core::tools::preflight_tools(&tools_for_restore(reprovision), "apprafter restore")?;
+    // WI-478: the passphrase is asked before the target store is read (the cluster's cached
+    // kubeconfig, or the token `--reprovision` provisions with), which refuses a store other
+    // accounts can change; refused here instead, before it is asked.
+    crate::context::refuse_a_store_others_can_change()?;
 
     // 1. Passphrase + credentials (mandatory — the repo holds decrypted
     //    secrets). Gate FIRST, before touching any cluster/repo — a bad

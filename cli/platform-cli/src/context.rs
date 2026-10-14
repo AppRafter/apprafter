@@ -62,6 +62,14 @@ pub(crate) fn legacy_context() -> cli_core::Result<Context> {
     build().map_err(into_cli_error)
 }
 
+/// WI-478 (d4a-h F1's class): a legacy command that asks for a secret — a repository token, a
+/// backup passphrase — and only then reads the target store (its cached kubeconfig, a token)
+/// refuses a store other accounts can change before it asks, as that read would after the
+/// prompt (`store_not_private`). Read only: owners and permissions of the store's folders.
+pub(crate) fn refuse_a_store_others_can_change() -> cli_core::Result<()> {
+    cli_core::store_privacy::ensure_private(&legacy_context()?.store())
+}
+
 /// A core error as a legacy arm's `CliError`: a wrapped `CliError` as it was; the core's
 /// `TargetNotFound`, `NoActiveTarget`, `TokenNotStored` and `Cancelled` as the `CliError`s
 /// `CoreError::from` makes them from (the names joined back with ", "); any other as its

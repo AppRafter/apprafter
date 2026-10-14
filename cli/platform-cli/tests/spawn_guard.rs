@@ -203,10 +203,11 @@ const ALLOWED: &[(&str, &str, Rule)] = &[
         "run_at_a_terminal",
         Rule::AtTerminal,
     ),
-    // D.4a d: the conversation harness of the lock's prompt tests.
+    // D.4a d: the conversation harness of the lock's prompt tests (`converse_on`, behind
+    // `converse`, `converse_with` and WI-478's `converse_at_terminal`).
     (
         "platform-cli/tests/common/terminal.rs",
-        "converse_with",
+        "converse_on",
         Rule::AtTerminal,
     ),
     // L5 (D.4a T23): a test build of `lock on` refuses a store outside APPRAFTER_SANDBOX; the

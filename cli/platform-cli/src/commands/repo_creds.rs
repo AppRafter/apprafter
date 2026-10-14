@@ -61,6 +61,9 @@ pub fn add(
     // no cluster, or a duplicate name. `rotate` below already resolves
     // the cluster first — the correct order was one function away.
     cli_core::tools::preflight_tool(&cli_core::tools::KUBECTL, "apprafter repo creds add")?;
+    // WI-478: the token is asked before the kubeconfig is read from the target store, which
+    // refuses a store other accounts can change; refused here instead, before anything is asked.
+    crate::context::refuse_a_store_others_can_change()?;
 
     let stdin_is_tty = io::stdin().is_terminal();
     let stdout_is_tty = std::io::stdout().is_terminal();

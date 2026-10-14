@@ -670,7 +670,9 @@ kubeconfig or a vault of their own in place of yours and send your next
 deploy to a project or a cluster of their choosing, so AppRafter neither uses
 nor writes any of the store's secrets until the folder is yours alone. The
 message names the folder: the store itself, `targets` or a target's folder in
-it, `state` or a folder under it. Commands that need no secret still run —
+it, `state` or a folder under it. A command refused here is refused before
+it asks for anything at its terminal: a lock password, a Hetzner or
+repository token, a backup passphrase. Commands that need no secret still run —
 `apprafter target list`, `apprafter target show`, `apprafter lock status` —
 and [`apprafter doctor`](#store-folder-foreign) lists every folder and secret
 file concerned.
