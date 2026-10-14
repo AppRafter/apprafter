@@ -815,6 +815,19 @@
   font-size: var(--fs-12-5);
 }
 
+.lock-store {
+  margin: 0 0 6px;
+  color: var(--fg-muted);
+  font: 400 var(--fs-11-5) var(--font-mono);
+}
+
+.lock-or {
+  margin: 10px 0;
+  color: var(--fg-faint);
+  font-size: var(--fs-11-5);
+  text-align: center;
+}
+
 /* Target screen --------------------------------------------------------------------------------- */
 
 .target-row-sub code {
