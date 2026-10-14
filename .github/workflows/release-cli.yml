@@ -365,8 +365,12 @@ jobs:
           bin="cli/target/${TARGET}/release/apprafter${EXE}"
           bash scripts/check-kdf-policy.sh --self-test
           scratch="$RUNNER_TEMP/apprafter-kdf"
-          mkdir -p "$scratch/store" "$scratch/home"
-          mkdir -m 700 "$scratch/run"
+          mkdir -p "$scratch/store" "$scratch/home" "$scratch/run"
+          # A holder's base must be 0700 on Unix. Windows has none (its holder is a named pipe),
+          # and Git Bash cannot set the mode there: `mkdir -m 700` fails the step.
+          if [ "$RUNNER_OS" != "Windows" ]; then
+            chmod 700 "$scratch/run"
+          fi
           cp cli/apprafter-core/tests/vault_vectors/v1/fast-params/store.yaml \
              cli/apprafter-core/tests/vault_vectors/v1/fast-params/vault "$scratch/store/"
           APPRAFTER_SKIP_STARTUP_CHECKS=1 APPRAFTER_CONFIG_DIR="$scratch/store" \
