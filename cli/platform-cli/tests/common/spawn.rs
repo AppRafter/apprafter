@@ -28,7 +28,8 @@
 //! ([`Spawn::sharing_console`]); the spawn point's self-tests run other programs under the same
 //! rules ([`Spawn::probe_program`]). Holder and window tests run a session of their own
 //! ([`Spawn::in_session`]); a holder one of them leaves behind fails it when the `Spawn` drops.
-//! Each opt-in is allow-listed in `tests/spawn_guard.rs`.
+//! Each opt-in is allow-listed in `tests/spawn_guard.rs`. A child may also run under a umask of
+//! its own ([`Spawn::with_umask`], Unix: WI-479's stores made under a shared group's 002).
 //!
 //! Keep the `Spawn` alive while its commands run: bind it (`let sp = Spawn::new();`) and let a
 //! helper build its command from a `&Spawn` it is given, never from one it makes and drops — the
@@ -116,6 +117,9 @@ pub struct Spawn {
     removed: Vec<OsString>,
     cwd: Option<PathBuf>,
     startup_checks: bool,
+    /// The child's umask ([`Spawn::with_umask`]); the test's own otherwise.
+    #[cfg(unix)]
+    umask: Option<u32>,
     #[cfg(windows)]
     shared_console: bool,
 }
@@ -165,6 +169,8 @@ impl Spawn {
             removed: Vec::new(),
             cwd: None,
             startup_checks: false,
+            #[cfg(unix)]
+            umask: None,
             #[cfg(windows)]
             shared_console: false,
         }
@@ -235,6 +241,14 @@ impl Spawn {
     /// `APPRAFTER_SANDBOX` is a fence test's alone (G1).
     pub fn without_env(mut self, key: &str) -> Self {
         self.removed.push(OsString::from(key));
+        self
+    }
+
+    /// The child runs under `mask` as its umask (WI-479: a store made under a shared group's
+    /// 002), set between its fork and its exec, so this test process keeps its own.
+    #[cfg(unix)]
+    pub fn with_umask(mut self, mask: u32) -> Self {
+        self.umask = Some(mask);
         self
     }
 
@@ -385,6 +399,20 @@ impl Spawn {
         }
         c.current_dir(self.cwd.clone().unwrap_or_else(|| self.home()))
             .args(args);
+        #[cfg(unix)]
+        if let Some(mask) = self.umask {
+            use std::os::unix::process::CommandExt as _;
+            #[allow(clippy::unnecessary_cast)] // `mode_t` is u32 on Linux, u16 on macOS.
+            let mask = mask as libc::mode_t;
+            // SAFETY: umask(2) is async-signal-safe and cannot fail; the closure touches no
+            // memory of this process.
+            unsafe {
+                c.pre_exec(move || {
+                    libc::umask(mask);
+                    Ok(())
+                });
+            }
+        }
         self.detach(&mut c, terminal);
         c
     }

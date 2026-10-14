@@ -13,6 +13,10 @@
 //! - A file gets its DACL on its open handle, before anything is written to it, and a directory
 //!   at its creation. A same-volume rename (`std::fs::rename`, `MoveFileExW`) keeps it;
 //!   `ReplaceFileW`, which keeps the replaced file's DACL, is never used for these files.
+//! - Every folder of the target store is made owner-only from its root down
+//!   ([`create_dir_all_from`], WI-479): 0700 whatever the umask, the owner-only DACL on Windows.
+//!   The folders above the root are made as the umask or the parent says, and a folder already
+//!   there is left as it is: `crate::store_privacy` refuses one another account can change.
 //! - A secret file that is already there is tightened when it is read (WI-473, Windows):
 //!   [`open_secret`] gives a file whose DACL is not owner-only — written before WI-472, or
 //!   widened since — the owner-only DACL on the handle it reads through. A file whose DACL this
@@ -106,12 +110,22 @@ fn create_new_sharing(path: &Path, share: u32) -> io::Result<File> {
 }
 
 /// A new directory at `path`, owner-only from its creation; `AlreadyExists` when the name is
-/// taken. Unix: mode 0700 at `mkdir`. Windows: created with the protected DACL whose one ACE
+/// taken. Unix: mode 0700 at `mkdir`, which the umask can only take bits from, so it is never
+/// wider, not for a moment; then 0700 is set again (WI-479), which gives back what a umask such
+/// as 0277 takes from the owner and gives no one else anything. A directory that cannot be set
+/// so is removed and the error returned. Windows: created with the protected DACL whose one ACE
 /// the files and directories made in it inherit, so it never has another, not for a moment.
 #[cfg(unix)]
 pub fn create_dir(path: &Path) -> io::Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
-    std::fs::DirBuilder::new().mode(0o700).create(path)
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    std::fs::DirBuilder::new().mode(0o700).create(path)?;
+    #[cfg(test)]
+    made::record(path);
+    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)) {
+        let _ = std::fs::remove_dir(path);
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// A new directory at `path`, owner-only from its creation; `AlreadyExists` when the name is
@@ -158,6 +172,189 @@ pub fn create_dir(path: &Path) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// `dir`, made with every folder missing from `top` down to it, each owner-only from its
+/// creation ([`create_dir`]) whatever the umask (WI-479); a folder missing above `top` is made
+/// as `std::fs::create_dir_all` makes it: with the mode the umask gives on Unix, with what it
+/// inherits on Windows. A folder already there, at any level, is left as it is. `dir` must be
+/// `top` or a path under it (`InvalidInput` otherwise).
+///
+/// The target store is made so from its root down
+/// ([`crate::target::TargetStorePaths::create_dir_all`]): every folder in it is this account's
+/// alone, while the folders the root sits in (`~/.config`) are the account's own, made as it
+/// makes any other folder and never checked (`crate::store_privacy`).
+pub fn create_dir_all_from(top: &Path, dir: &Path) -> io::Result<()> {
+    let below = dir.strip_prefix(top).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not under {}", dir.display(), top.display()),
+        )
+    })?;
+    if is_dir(dir) {
+        return Ok(());
+    }
+    if let Some(parent) = top.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut at = top.to_path_buf();
+    create_dir_unless_there(&at)?;
+    for part in below.components() {
+        at.push(part);
+        create_dir_unless_there(&at)?;
+    }
+    Ok(())
+}
+
+/// [`create_dir`], a directory already at `path` (another process's, made meanwhile) left as
+/// it is.
+fn create_dir_unless_there(path: &Path) -> io::Result<()> {
+    match create_dir(path) {
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists && is_dir(path) => Ok(()),
+        other => other,
+    }
+}
+
+/// Whether a directory is at `path`, a symlink followed.
+fn is_dir(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|meta| meta.is_dir())
+}
+
+/// What [`create_dir`] made, with the mode `mkdir` gave it before it was set again: the tests'
+/// proof that a new folder is never wider than 0700, not for a moment. Per thread.
+#[cfg(all(test, unix))]
+pub(crate) mod made {
+    use std::cell::RefCell;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+
+    thread_local! {
+        static MADE: RefCell<Vec<(PathBuf, u32)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(crate) fn record(path: &Path) {
+        let mode = std::fs::symlink_metadata(path)
+            .map(|m| m.permissions().mode() & 0o7777)
+            .unwrap_or(u32::MAX);
+        MADE.with(|m| m.borrow_mut().push((path.to_path_buf(), mode)));
+    }
+
+    /// Everything recorded on this thread since the last call.
+    pub(crate) fn take() -> Vec<(PathBuf, u32)> {
+        MADE.with(|m| std::mem::take(&mut *m.borrow_mut()))
+    }
+}
+
+/// One test of the running test binary, run again in a child process under another umask
+/// (WI-479). A umask belongs to the whole process, so a test that set its own would change what
+/// every other test thread makes meanwhile. Unix; for the tests of this crate and, through the
+/// `test-support` feature, the core's and the CLI's.
+#[cfg(all(unix, any(test, feature = "test-support")))]
+pub mod under_umask {
+    use std::path::{Path, PathBuf};
+
+    /// How the child is handed its umask and scratch directory: a second filter after the
+    /// test's name, `apprafter-under-umask=<octal umask>:<scratch>`, which names no test
+    /// (`--exact`). An argument, not a variable: the child reads no environment for it (the
+    /// core's env-read ratchet counts this module, which `test-support` builds).
+    const PARAM: &str = "apprafter-under-umask=";
+
+    /// Held for writing while a child starts. From its fork to its exec a child holds a copy
+    /// of every descriptor this process has open, a store lock's sentinel included, and so
+    /// holds that lock a moment after the test that took it let it go.
+    static STARTING: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+    /// No child of [`run`] starts in this process while the guard lives: for a test that lets a
+    /// store lock go and takes it again at once, and must not find it held.
+    pub fn no_child_starting() -> std::sync::RwLockReadGuard<'static, ()> {
+        STARTING.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Runs the ignored test `name` (its path in this test binary) in a child of this test
+    /// binary whose umask is `mask`, alone (`--exact`, one thread), handing it `scratch`: a
+    /// temporary directory the caller made under its own umask, since one such as 0277 leaves
+    /// the child unable to make one it can write. Panics, with the child's output, unless
+    /// exactly that test ran and passed.
+    pub fn run(name: &str, mask: u32, scratch: &Path) {
+        use std::os::unix::process::CommandExt;
+        let scratch = scratch
+            .to_str()
+            .expect("a scratch directory named in UTF-8");
+        let param = format!("{PARAM}{mask:o}:{scratch}");
+        let mut child =
+            std::process::Command::new(std::env::current_exe().expect("this test binary"));
+        child.args([
+            "--exact",
+            name,
+            &param,
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ]);
+        #[allow(clippy::unnecessary_cast)] // `mode_t` is u32 on Linux, u16 on macOS.
+        let m = mask as libc::mode_t;
+        // SAFETY: umask(2) is async-signal-safe and cannot fail; the closure touches nothing
+        // else of this process.
+        unsafe {
+            child.pre_exec(move || {
+                libc::umask(m);
+                Ok(())
+            });
+        }
+        child
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        // `spawn` returns once the child has exec'd (or failed to), its copies closed.
+        let started = {
+            let _starting = STARTING.write().unwrap_or_else(|e| e.into_inner());
+            child.spawn().expect("run this test binary again")
+        };
+        let out = started.wait_with_output().expect("the child's output");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            out.status.success() && text.contains("test result: ok. 1 passed"),
+            "{name} under umask {mask:03o}:\n{text}"
+        );
+    }
+
+    /// What [`run`] handed its child; panics anywhere else: such a test means nothing outside
+    /// its child.
+    fn param() -> (u32, PathBuf) {
+        let param = std::env::args()
+            .find_map(|arg| arg.strip_prefix(PARAM).map(str::to_string))
+            .unwrap_or_else(|| panic!("run only by under_umask::run, in a child"));
+        let (mask, scratch) = param.split_once(':').expect("<umask>:<scratch>");
+        (
+            u32::from_str_radix(mask, 8).expect("an octal umask"),
+            PathBuf::from(scratch),
+        )
+    }
+
+    /// In a child [`run`] started: its umask, as the process has it (checked against what
+    /// [`run`] gave). Panics anywhere else.
+    pub fn mask() -> u32 {
+        let (given, _) = param();
+        // SAFETY: umask(2) sets and returns; the old value is put back at once, and the child
+        // runs one test on one thread.
+        let actual = unsafe {
+            let old = libc::umask(0o077);
+            libc::umask(old);
+            old
+        };
+        #[allow(clippy::unnecessary_cast)] // `mode_t` is u32 on Linux, u16 on macOS.
+        let actual = actual as u32;
+        assert_eq!(actual, given, "the child's umask");
+        given
+    }
+
+    /// In a child [`run`] started: the scratch directory it was handed. Panics anywhere else.
+    pub fn scratch() -> PathBuf {
+        param().1
+    }
 }
 
 /// Replaces `file`'s DACL with the owner-only one, protected from inheritance:
@@ -2079,5 +2276,152 @@ mod tests {
         testing::of_path(dir.path())
             .unwrap()
             .assert_owner_only_dir("the directory under its own owner");
+    }
+
+    // ---- WI-479: the folders AppRafter makes, owner-only whatever the umask. ----
+
+    /// The umasks the folder tests run under: a shared group's (002, NixOS's `users`), none at
+    /// all, the common one, and one that takes the owner's own write (0277).
+    #[cfg(unix)]
+    const UMASKS: [u32; 4] = [0o002, 0o000, 0o022, 0o277];
+
+    /// Unix, in a child per umask: a new folder is 0700 — at its `mkdir` too, never wider for a
+    /// moment (the recorder) — and so is every folder `create_dir_all_from` makes from its top
+    /// down, while the folders it makes above the top have the umask's mode.
+    #[cfg(unix)]
+    #[test]
+    fn new_folders_are_0700_whatever_the_umask_and_their_parents_follow_it() {
+        for mask in UMASKS {
+            let scratch = tempfile::tempdir().unwrap();
+            under_umask::run(
+                "owner_only::tests::new_folders_under_the_childs_umask",
+                mask,
+                scratch.path(),
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "runs only inside new_folders_are_0700_whatever_the_umask_and_their_parents_follow_it"]
+    fn new_folders_under_the_childs_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        let (mask, scratch) = (under_umask::mask(), under_umask::scratch());
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        let at_mkdir = 0o700 & !mask;
+
+        let one = scratch.join("one");
+        let _ = made::take();
+        create_dir(&one).unwrap();
+        assert_eq!(mode(&one), 0o700, "umask {mask:03o}");
+        assert_eq!(made::take(), [(one.clone(), at_mkdir)], "umask {mask:03o}");
+
+        // The top's parent is there: the top and everything under it are 0700.
+        let top = scratch.join("store");
+        let dir = top.join("targets").join("prod");
+        create_dir_all_from(&top, &dir).unwrap();
+        let levels = [top.clone(), top.join("targets"), dir.clone()];
+        for level in &levels {
+            assert_eq!(mode(level), 0o700, "{level:?} under umask {mask:03o}");
+        }
+        assert_eq!(
+            made::take(),
+            levels
+                .iter()
+                .map(|l| (l.clone(), at_mkdir))
+                .collect::<Vec<_>>(),
+            "umask {mask:03o}"
+        );
+
+        // Missing parents: made as the umask says. A umask that takes the owner's own write
+        // leaves a parent no folder can be made in, AppRafter's or any other program's.
+        if mask & 0o200 == 0 {
+            let top = scratch.join("a").join("b").join("store");
+            let dir = top.join("state").join("prod");
+            create_dir_all_from(&top, &dir).unwrap();
+            for parent in [scratch.join("a"), scratch.join("a").join("b")] {
+                assert_eq!(
+                    mode(&parent),
+                    0o777 & !mask,
+                    "{parent:?} under umask {mask:03o}"
+                );
+            }
+            for level in [top.clone(), top.join("state"), dir] {
+                assert_eq!(mode(&level), 0o700, "{level:?} under umask {mask:03o}");
+            }
+        }
+    }
+
+    /// A folder already there, at any level, is left as it is — never widened, never
+    /// tightened: a store folder others can change is `store_privacy`'s to refuse — and only
+    /// what is missing is made.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_already_there_is_left_as_it_is() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = tempfile::tempdir().unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        let top = scratch.path().join("store");
+        let targets = top.join("targets");
+        std::fs::create_dir_all(&targets).unwrap();
+        std::fs::set_permissions(&top, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&targets, std::fs::Permissions::from_mode(0o775)).unwrap();
+        create_dir_all_from(&top, &targets.join("prod")).unwrap();
+        assert_eq!(mode(&top), 0o755);
+        assert_eq!(mode(&targets), 0o775);
+        assert_eq!(mode(&targets.join("prod")), 0o700);
+        create_dir_all_from(&top, &targets).unwrap();
+        assert_eq!(mode(&targets), 0o775, "a folder that is `dir` itself");
+    }
+
+    /// Windows: every folder `create_dir_all_from` makes from its top down has the owner-only
+    /// DACL, the parents it makes above the top inherit theirs, and a folder already there
+    /// keeps its own, wide or not.
+    #[cfg(windows)]
+    #[test]
+    fn new_folders_are_owner_only_and_their_parents_inherit() {
+        let scratch = tempfile::tempdir().unwrap();
+        let top = scratch.path().join("a").join("b").join("store");
+        let dir = top.join("targets").join("prod");
+        create_dir_all_from(&top, &dir).unwrap();
+        for parent in [scratch.path().join("a"), scratch.path().join("a").join("b")] {
+            let dacl = testing::of_path(&parent).unwrap();
+            assert!(!dacl.protected, "{parent:?} inherits: {dacl:?}");
+        }
+        for level in [top.clone(), top.join("targets"), dir] {
+            testing::of_path(&level)
+                .unwrap()
+                .assert_owner_only_dir(&level.display().to_string());
+        }
+
+        let me = testing::this_user_sid().unwrap();
+        let wide = scratch.path().join("wide");
+        std::fs::create_dir(&wide).unwrap();
+        testing::set_dacl(
+            &wide,
+            &format!("D:P(A;OICI;FA;;;{me})(A;OICI;0x1301bf;;;BU)"),
+        )
+        .unwrap();
+        let before = testing::of_path(&wide).unwrap();
+        create_dir_all_from(&wide, &wide.join("targets")).unwrap();
+        assert_eq!(testing::of_path(&wide).unwrap(), before, "left as it was");
+        testing::of_path(&wide.join("targets"))
+            .unwrap()
+            .assert_owner_only_dir("a folder made in a wide one");
+    }
+
+    /// `dir` must be under `top`; a file in the way is the error, not a folder.
+    #[test]
+    fn create_dir_all_from_refuses_what_it_cannot_make() {
+        let scratch = tempfile::tempdir().unwrap();
+        let top = scratch.path().join("store");
+        let elsewhere = scratch.path().join("elsewhere");
+        let e = create_dir_all_from(&top, &elsewhere).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        assert!(!top.exists() && !elsewhere.exists());
+        std::fs::create_dir(&top).unwrap();
+        std::fs::write(top.join("targets"), b"x").unwrap();
+        assert!(create_dir_all_from(&top, &top.join("targets").join("prod")).is_err());
+        assert_eq!(std::fs::read(top.join("targets")).unwrap(), b"x");
     }
 }

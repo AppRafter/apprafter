@@ -223,6 +223,24 @@ impl TargetStorePaths {
     pub fn lock_file(&self) -> PathBuf {
         self.root.join(LOCK_FILE)
     }
+
+    /// Makes `dir`, a folder of the store, with the folders above it that are missing
+    /// (WI-479): each one from the root down owner-only from its creation — 0700 on Unix
+    /// whatever the umask, the owner-only DACL on Windows — so a store AppRafter makes passes
+    /// [`crate::store_privacy::ensure_private`] whatever the umask. The root's own parents
+    /// (`~/.config`) are made as the account makes any folder. A `dir` outside the store (a
+    /// runtime dir under Local AppData or the desktop's data dir) is made owner-only itself,
+    /// its parents likewise as the account makes them. A folder already there is left as it
+    /// is: one another account can change is `store_privacy`'s to refuse, never AppRafter's to
+    /// change ([`crate::owner_only::create_dir_all_from`]).
+    pub fn create_dir_all(&self, dir: &Path) -> std::io::Result<()> {
+        let top = if dir.starts_with(&self.root) {
+            self.root.as_path()
+        } else {
+            dir
+        };
+        crate::owner_only::create_dir_all_from(top, dir)
+    }
 }
 
 /// What taking a [`StoreLock`] reports, for the caller to show in its own
@@ -387,7 +405,9 @@ fn lock_sentinel(
     );
     let sentinel = paths.lock_file();
 
-    fs::create_dir_all(paths.root()).map_err(|e| lock_error(&sentinel, e))?;
+    paths
+        .create_dir_all(paths.root())
+        .map_err(|e| lock_error(&sentinel, e))?;
     let file = match fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -616,13 +636,14 @@ pub fn load_global_config(paths: &TargetStorePaths) -> Result<Option<GlobalConfi
 }
 
 /// Write `<root>/config.yaml` atomically. Creates `<root>/` first
-/// if missing (and the `auth/` placeholder so the directory tree
-/// matches the spec the moment any write happens).
+/// if missing, owner-only ([`TargetStorePaths::create_dir_all`]; and the
+/// `auth/` placeholder so the directory tree matches the spec the moment
+/// any write happens).
 pub fn save_global_config(paths: &TargetStorePaths, cfg: &GlobalConfig) -> Result<()> {
-    fs::create_dir_all(paths.root())?;
+    paths.create_dir_all(paths.root())?;
     ensure_auth_placeholder(paths)?;
     let yaml = serde_yaml::to_string(cfg)?;
-    atomic_write(&paths.global_config_file(), yaml.as_bytes(), false)
+    atomic_write(paths, &paths.global_config_file(), yaml.as_bytes(), false)
 }
 
 /// Best-effort: which target should non-credential code paths
@@ -812,6 +833,7 @@ pub fn save_target_credentials(
 ) -> Result<()> {
     let creds_yaml = serde_yaml::to_string(credentials)?;
     atomic_write(
+        paths,
         &paths.target_credentials_file(name),
         creds_yaml.as_bytes(),
         true,
@@ -826,10 +848,15 @@ pub fn save_target_config(
     name: &str,
     config: &TargetConfig,
 ) -> Result<()> {
-    fs::create_dir_all(paths.target_dir(name))?;
+    paths.create_dir_all(&paths.target_dir(name))?;
     ensure_auth_placeholder(paths)?;
     let cfg_yaml = serde_yaml::to_string(config)?;
-    atomic_write(&paths.target_config_file(name), cfg_yaml.as_bytes(), false)
+    atomic_write(
+        paths,
+        &paths.target_config_file(name),
+        cfg_yaml.as_bytes(),
+        false,
+    )
 }
 
 /// Names of every target directory under `<root>/targets/`,
@@ -901,7 +928,7 @@ pub fn rename_target(paths: &TargetStorePaths, from: &str, to: &str) -> Result<(
         // Ensure parent of `state_dir` exists; fs::rename refuses
         // when the parent of the destination is missing.
         if let Some(parent) = to_state.parent() {
-            fs::create_dir_all(parent)?;
+            paths.create_dir_all(parent)?;
         }
         fs::rename(&from_state, &to_state)?;
     }
@@ -937,8 +964,9 @@ pub fn remove_target(paths: &TargetStorePaths, name: &str) -> Result<()> {
 // Internal: atomic write + permission enforcement
 // ---------------------------------------------------------------
 
-/// Write `bytes` to `final_path` atomically, through
-/// [`crate::atomic_replace`]: a temp file in the same directory
+/// Write `bytes` to `final_path`, a file of the store `paths`, atomically
+/// (its folder made owner-only when missing: [`TargetStorePaths::create_dir_all`]),
+/// through [`crate::atomic_replace`]: a temp file in the same directory
 /// (`.apprafter-tgt-XXXXXX.tmp`), written, given its mode and fsynced
 /// under the temp name, then renamed over `final_path`. Readers see the
 /// old file or the new one, never a partial write or an over-permissive
@@ -951,21 +979,26 @@ pub fn remove_target(paths: &TargetStorePaths, name: &str) -> Result<()> {
 /// ([`crate::owner_only`], WI-472): owner-only even in a store whose
 /// folder other users can read. A non-secret one keeps what it
 /// inherits from its directory.
-fn atomic_write(final_path: &Path, bytes: &[u8], secret: bool) -> Result<()> {
+fn atomic_write(
+    paths: &TargetStorePaths,
+    final_path: &Path,
+    bytes: &[u8],
+    secret: bool,
+) -> Result<()> {
     let parent = final_path.parent().ok_or_else(|| {
         CliError::Other(format!(
             "internal: atomic_write called with rootless path {}",
             final_path.display()
         ))
     })?;
-    fs::create_dir_all(parent)?;
+    paths.create_dir_all(parent)?;
     let mode = if secret { 0o600 } else { 0o644 };
     crate::atomic_replace(final_path, bytes, ".apprafter-tgt-", Some(mode))?;
     Ok(())
 }
 
 fn ensure_auth_placeholder(paths: &TargetStorePaths) -> Result<()> {
-    fs::create_dir_all(paths.auth_dir())?;
+    paths.create_dir_all(&paths.auth_dir())?;
     let keep = paths.auth_keep_file();
     if !keep.exists() {
         // Empty marker so the reserved `auth/` directory shows up
@@ -1630,6 +1663,9 @@ mod tests {
     #[test]
     fn a_read_only_sentinel_is_still_locked() {
         use std::os::unix::fs::PermissionsExt;
+        // The lock is let go and taken again at once: no umask test's child may hold a copy of
+        // its descriptor meanwhile (WI-479).
+        let _no_fork = crate::owner_only::under_umask::no_child_starting();
         let (_dir, paths) = make_paths();
         drop(StoreLock::exclusive(&paths).unwrap());
         fs::set_permissions(paths.lock_file(), fs::Permissions::from_mode(0o444)).unwrap();
@@ -2301,5 +2337,210 @@ mod tests {
         drop(lock);
         let (_dir, paths) = make_paths();
         assert!(StoreLock::exclusive(&paths).unwrap().is_held());
+    }
+
+    // ---- WI-479: a store AppRafter makes is owner-only from its first folder. ----
+
+    /// Each way a store is first made, on a fresh store `<base>/<way>/parent/store` whose
+    /// parents are missing too, with the folders that way makes (by path under the root, the
+    /// root itself `""`).
+    fn fresh_stores(base: &Path) -> Vec<(&'static str, TargetStorePaths, Vec<&'static str>)> {
+        let fresh =
+            |way: &str| TargetStorePaths::for_root(base.join(way).join("parent").join("store"));
+        let config = TargetConfig {
+            provider: "hetzner-cloud".into(),
+            ..Default::default()
+        };
+        let credentials = TargetCredentials {
+            hetzner_token: Some("t".into()),
+        };
+        let lock = fresh("lock");
+        drop(StoreLock::exclusive(&lock).unwrap());
+        let global = fresh("global");
+        save_global_config(&global, &GlobalConfig::default()).unwrap();
+        let target = fresh("config");
+        save_target_config(&target, "prod", &config).unwrap();
+        let secret = fresh("credentials");
+        save_target_credentials(&secret, "prod", &credentials).unwrap();
+        vec![
+            ("the store lock", lock, vec![""]),
+            ("save_global_config", global, vec!["", "auth"]),
+            (
+                "save_target_config",
+                target,
+                vec!["", "auth", "targets", "targets/prod"],
+            ),
+            (
+                "save_target_credentials",
+                secret,
+                vec!["", "targets", "targets/prod"],
+            ),
+        ]
+    }
+
+    /// Every folder under `root` and `root` itself (`""`), `/`-separated, sorted.
+    fn folders_under(root: &Path) -> Vec<String> {
+        fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) {
+            let rel = dir.strip_prefix(root).unwrap();
+            out.push(
+                rel.components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("/"),
+            );
+            for entry in fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    walk(root, &entry.path(), out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, root, &mut out);
+        out.sort();
+        out
+    }
+
+    /// Unix, in a child per umask (a shared group's 002, and none): whatever makes a store
+    /// first — the lock, a global, target or credentials save — makes each of its folders 0700,
+    /// the root's missing parents with the umask's mode, and the store passes the privacy check
+    /// (P-2 of the d4a-h walk: `target add` under umask 002 on NixOS's `users` group).
+    #[cfg(unix)]
+    #[test]
+    fn a_fresh_store_is_owner_only_whatever_makes_it_and_whatever_the_umask() {
+        for mask in [0o002, 0o000] {
+            let scratch = tempdir().unwrap();
+            crate::owner_only::under_umask::run(
+                "target::tests::fresh_stores_under_the_childs_umask",
+                mask,
+                scratch.path(),
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "runs only inside a_fresh_store_is_owner_only_whatever_makes_it_and_whatever_the_umask"]
+    fn fresh_stores_under_the_childs_umask() {
+        use crate::owner_only::under_umask;
+        use std::os::unix::fs::PermissionsExt;
+        let (mask, scratch) = (under_umask::mask(), under_umask::scratch());
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        for (what, paths, made) in fresh_stores(&scratch) {
+            assert_eq!(folders_under(paths.root()), made, "{what}");
+            for rel in &made {
+                let folder = paths.root().join(rel);
+                assert_eq!(mode(&folder), 0o700, "{what}: {folder:?}, umask {mask:03o}");
+            }
+            let parent = paths.root().parent().unwrap();
+            for above in [parent, parent.parent().unwrap()] {
+                assert_eq!(
+                    mode(above),
+                    0o777 & !mask,
+                    "{what}: {above:?}, umask {mask:03o}"
+                );
+            }
+            crate::store_privacy::ensure_private(&paths).unwrap();
+        }
+    }
+
+    /// Windows: whatever makes a store first gives each of its folders the owner-only DACL,
+    /// and the root's missing parents inherit theirs.
+    #[cfg(windows)]
+    #[test]
+    fn a_fresh_store_is_owner_only_whatever_makes_it() {
+        use crate::owner_only::testing;
+        let scratch = tempdir().unwrap();
+        for (what, paths, made) in fresh_stores(scratch.path()) {
+            assert_eq!(folders_under(paths.root()), made, "{what}");
+            for rel in &made {
+                let folder = paths.root().join(rel);
+                testing::of_path(&folder)
+                    .unwrap()
+                    .assert_owner_only_dir(&format!("{what}: {}", folder.display()));
+            }
+            let parent = paths.root().parent().unwrap();
+            for above in [parent, parent.parent().unwrap()] {
+                let dacl = testing::of_path(above).unwrap();
+                assert!(!dacl.protected, "{what}: {above:?} inherits: {dacl:?}");
+            }
+            crate::store_privacy::ensure_private(&paths).unwrap();
+        }
+    }
+
+    /// A store folder that is already there and that its group may write (a group of others:
+    /// pretended) is refused by the lock before anything is made, and is never changed: not by
+    /// the refusal, nor by a save that makes a folder in it.
+    #[cfg(unix)]
+    #[test]
+    fn a_group_writable_folder_already_there_is_refused_and_left_as_it_was() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let paths = TargetStorePaths::for_root(dir.path().join("store"));
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        fs::create_dir_all(paths.targets_dir()).unwrap();
+        fs::set_permissions(paths.root(), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(paths.targets_dir(), fs::Permissions::from_mode(0o775)).unwrap();
+        let _shared = crate::owner_only::pretend::group_alone(false);
+        match StoreLock::exclusive(&paths) {
+            Err(CliError::StoreNotPrivate { path, problem }) => {
+                assert_eq!(path, paths.targets_dir());
+                assert_eq!(problem, crate::error::StoreFolderProblem::WritableByOthers);
+            }
+            other => panic!("{:?}", other.map(|l| l.is_held())),
+        }
+        assert_eq!(folders_under(paths.root()), ["", "targets"]);
+        assert!(!paths.lock_file().exists());
+        assert_eq!(
+            (mode(paths.root()), mode(&paths.targets_dir())),
+            (0o755, 0o775)
+        );
+        let config = TargetConfig {
+            provider: "hetzner-cloud".into(),
+            ..Default::default()
+        };
+        save_target_config(&paths, "prod", &config).unwrap();
+        assert_eq!(
+            (mode(paths.root()), mode(&paths.targets_dir())),
+            (0o755, 0o775)
+        );
+        assert_eq!(mode(&paths.target_dir("prod")), 0o700);
+        assert_eq!(mode(&paths.auth_dir()), 0o700);
+    }
+
+    /// Windows: a store folder whose DACL lets another account write is refused by the lock
+    /// before anything is made, and keeps that DACL, also when a save makes a folder in it.
+    #[cfg(windows)]
+    #[test]
+    fn a_folder_others_can_write_already_there_is_refused_and_left_as_it_was() {
+        use crate::owner_only::testing;
+        let dir = tempdir().unwrap();
+        let paths = TargetStorePaths::for_root(dir.path().join("store"));
+        fs::create_dir_all(paths.targets_dir()).unwrap();
+        let me = testing::this_user_sid().unwrap();
+        testing::set_dacl(
+            &paths.targets_dir(),
+            &format!("D:P(A;OICI;FA;;;{me})(A;OICI;0x1301bf;;;BU)"),
+        )
+        .unwrap();
+        let wide = testing::of_path(&paths.targets_dir()).unwrap();
+        match StoreLock::exclusive(&paths) {
+            Err(CliError::StoreNotPrivate { path, problem }) => {
+                assert_eq!(path, paths.targets_dir());
+                assert_eq!(problem, crate::error::StoreFolderProblem::WritableByOthers);
+            }
+            other => panic!("{:?}", other.map(|l| l.is_held())),
+        }
+        assert!(!paths.lock_file().exists());
+        assert_eq!(testing::of_path(&paths.targets_dir()).unwrap(), wide);
+        let config = TargetConfig {
+            provider: "hetzner-cloud".into(),
+            ..Default::default()
+        };
+        save_target_config(&paths, "prod", &config).unwrap();
+        assert_eq!(testing::of_path(&paths.targets_dir()).unwrap(), wide);
+        testing::of_path(&paths.target_dir("prod"))
+            .unwrap()
+            .assert_owner_only_dir("a folder made in a wide one");
     }
 }

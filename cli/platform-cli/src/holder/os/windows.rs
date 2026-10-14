@@ -512,8 +512,10 @@ impl io::Write for PipeIo {
 pub(crate) struct PidFile(std::path::PathBuf);
 
 impl PidFile {
+    /// Records `pid` in `base`, the runtime dir (`<store>\run`, or one under Local AppData),
+    /// made with the owner-only DACL when it is missing (WI-479), its parents as they inherit.
     pub(crate) fn write(base: &Path, id: &impl std::fmt::Display, pid: u32) -> io::Result<PidFile> {
-        std::fs::create_dir_all(base)?;
+        cli_core::owner_only::create_dir_all_from(base, base)?;
         let path = base.join(format!("h-{id}-{pid}.pid"));
         std::fs::write(&path, format!("{pid}\n"))?;
         Ok(PidFile(path))
@@ -572,4 +574,31 @@ pub(crate) fn own_dacl_aces() -> io::Result<u32> {
         return Ok(0);
     }
     Ok(info.AceCount)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// WI-479: a runtime dir the pid file makes has the owner-only DACL, its parents inherit
+    /// theirs, and the file goes with the holder.
+    #[test]
+    fn a_pid_file_makes_its_runtime_dir_owner_only() {
+        use cli_core::owner_only::testing;
+        let scratch = tempfile::tempdir().unwrap();
+        let base = scratch.path().join("apprafter").join("run");
+        let file = PidFile::write(&base, &"h", 7).unwrap();
+        testing::of_path(&base)
+            .unwrap()
+            .assert_owner_only_dir("the runtime dir");
+        assert!(
+            !testing::of_path(&scratch.path().join("apprafter"))
+                .unwrap()
+                .protected
+        );
+        let path = base.join("h-h-7.pid");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "7\n");
+        drop(file);
+        assert!(!path.exists());
+    }
 }

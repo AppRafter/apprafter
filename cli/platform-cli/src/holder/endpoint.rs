@@ -140,16 +140,17 @@ pub fn judge(facts: DirFacts, euid: u32) -> Result<(), String> {
     Ok(())
 }
 
-/// Unix: make `dir` (0700) when it is missing — its parent must exist — then judge it. The
+/// Unix: make `dir` when it is missing — 0700 whatever the umask
+/// (`cli_core::owner_only::create_dir`, WI-479); its parent must exist — then judge it. The
 /// holder runs it before `bind`, a client before `connect`.
 #[cfg(unix)]
 pub fn check_base(dir: &Path) -> Result<(), HolderUnavailable> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    use std::os::unix::fs::MetadataExt;
     let refuse = |reason: String| HolderUnavailable::UnsafeRuntimeDir {
         path: dir.to_path_buf(),
         reason,
     };
-    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+    match cli_core::owner_only::create_dir(dir) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(refuse(e.to_string())),
@@ -353,5 +354,34 @@ mod tests {
             check_base(&link),
             Err(HolderUnavailable::UnsafeRuntimeDir { .. })
         ));
+    }
+
+    /// WI-479, Unix, in a child per umask (a shared group's 002, and 0277, which takes the
+    /// owner's own write): the base `check_base` makes is 0700 — usable, and its socket made
+    /// in it — whatever the umask.
+    #[cfg(unix)]
+    #[test]
+    fn check_base_makes_its_directory_0700_whatever_the_umask() {
+        for mask in [0o002, 0o277] {
+            let scratch = tempfile::TempDir::new_in("/tmp").unwrap();
+            cli_core::owner_only::under_umask::run(
+                "holder::endpoint::tests::check_base_under_the_childs_umask",
+                mask,
+                scratch.path(),
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "runs only inside check_base_makes_its_directory_0700_whatever_the_umask"]
+    fn check_base_under_the_childs_umask() {
+        use cli_core::owner_only::under_umask;
+        use std::os::unix::fs::PermissionsExt;
+        let (mask, scratch) = (under_umask::mask(), under_umask::scratch());
+        let base = scratch.join("apprafter");
+        check_base(&base).unwrap();
+        let mode = std::fs::metadata(&base).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o700, "umask {mask:03o}");
     }
 }

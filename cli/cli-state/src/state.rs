@@ -81,6 +81,9 @@ const KNOWN_HOSTS_FILE: &str = "known_hosts";
 #[derive(Debug, Clone)]
 pub struct StatePaths {
     root: PathBuf,
+    /// The target store's root, for a per-target state: the folders [`Self::create_state_dir`]
+    /// makes are made owner-only from it down. `None` when hand-rooted.
+    store_root: Option<PathBuf>,
 }
 
 impl StatePaths {
@@ -93,6 +96,7 @@ impl StatePaths {
     pub fn for_root(root: &Path) -> Self {
         Self {
             root: root.to_path_buf(),
+            store_root: None,
         }
     }
 
@@ -109,11 +113,26 @@ impl StatePaths {
     pub fn for_active_target(store: &TargetStorePaths, name: &str) -> Self {
         Self {
             root: store.state_dir(name),
+            store_root: Some(store.root().to_path_buf()),
         }
     }
 
     pub fn state_dir(&self) -> PathBuf {
         self.root.join(STATE_DIR)
+    }
+
+    /// Makes [`Self::state_dir`] and the folders above it that are missing (WI-479): for a
+    /// per-target state, every folder from the store's root down — `state`, `state/<target>`,
+    /// its `.apprafter` — owner-only from its creation whatever the umask
+    /// ([`TargetStorePaths::create_dir_all`]); for a hand-rooted one, its `.apprafter` alone.
+    /// The folders above, and a folder already there, are left to the account's umask and as
+    /// they are.
+    pub fn create_state_dir(&self) -> std::io::Result<()> {
+        let dir = self.state_dir();
+        match &self.store_root {
+            Some(root) => TargetStorePaths::for_root(root.clone()).create_dir_all(&dir),
+            None => cli_core::owner_only::create_dir_all_from(&dir, &dir),
+        }
     }
 
     pub fn state_file(&self) -> PathBuf {
@@ -224,7 +243,7 @@ pub fn migrate_legacy_state_if_present(
         }
     }
 
-    std::fs::create_dir_all(target_paths.state_dir())?;
+    target_paths.create_state_dir()?;
     cross_fs_safe_rename(&legacy_state, &target_paths.state_file())?;
 
     // known_hosts is best-effort: a fresh cluster cache without
@@ -444,7 +463,7 @@ impl State {
     /// holding `state.json` open does not make the save fail, on Windows
     /// either ([`cli_core::atomic_replace`]).
     pub fn save(&self, paths: &StatePaths) -> Result<()> {
-        std::fs::create_dir_all(paths.state_dir())?;
+        paths.create_state_dir()?;
         let bytes = serde_json::to_vec_pretty(self)?;
         cli_core::atomic_replace(&paths.state_file(), &bytes, ".state.json.", None)?;
         Ok(())
@@ -902,5 +921,107 @@ mod tests {
         assert!(paths.known_hosts_file().exists());
         let kh = std::fs::read_to_string(paths.known_hosts_file()).unwrap();
         assert!(kh.contains("1.2.3.4"), "{kh}");
+    }
+
+    // ---- WI-479: the state folders AppRafter makes are owner-only. ----
+
+    /// Each way a state folder is first made, on a fresh store `<base>/<way>/parent/store`
+    /// whose parents are missing too: a save, and the move of a legacy per-cwd state.
+    fn fresh_states(base: &Path) -> Vec<(&'static str, TargetStorePaths)> {
+        let fresh =
+            |way: &str| TargetStorePaths::for_root(base.join(way).join("parent").join("store"));
+        let saved = fresh("save");
+        State::default()
+            .save(&StatePaths::for_active_target(&saved, "prod"))
+            .unwrap();
+        let moved = fresh("migrate");
+        let legacy = base.join("migrate").join("project");
+        std::fs::create_dir_all(legacy.join(STATE_DIR)).unwrap();
+        std::fs::write(legacy.join(STATE_DIR).join(STATE_FILE), b"{}").unwrap();
+        migrate_legacy_state_if_present(&legacy, &StatePaths::for_active_target(&moved, "prod"))
+            .unwrap();
+        assert!(StatePaths::for_active_target(&moved, "prod")
+            .state_file()
+            .exists());
+        vec![("a save", saved), ("a legacy state's move", moved)]
+    }
+
+    /// The store's folders a per-target state of `prod` sits in, from the root down.
+    fn state_folders(store: &TargetStorePaths) -> [PathBuf; 4] {
+        let target = store.state_dir("prod");
+        [
+            store.root().to_path_buf(),
+            store.root().join("state"),
+            target.clone(),
+            target.join(STATE_DIR),
+        ]
+    }
+
+    /// Unix, in a child per umask (a shared group's 002, and none): a save, or a legacy state's
+    /// move, makes every folder from the store's root down to `.apprafter` 0700, and the root's
+    /// missing parents with the umask's mode; a hand-rooted state's `.apprafter` is 0700 and
+    /// the folder it sits in is left as it was.
+    #[cfg(unix)]
+    #[test]
+    fn the_state_folders_are_0700_whatever_the_umask() {
+        for mask in [0o002, 0o000] {
+            let scratch = tempdir().unwrap();
+            cli_core::owner_only::under_umask::run(
+                "state::tests::state_folders_under_the_childs_umask",
+                mask,
+                scratch.path(),
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "runs only inside the_state_folders_are_0700_whatever_the_umask"]
+    fn state_folders_under_the_childs_umask() {
+        use cli_core::owner_only::under_umask;
+        use std::os::unix::fs::PermissionsExt;
+        let (mask, scratch) = (under_umask::mask(), under_umask::scratch());
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        for (what, store) in fresh_states(&scratch) {
+            for folder in state_folders(&store) {
+                assert_eq!(mode(&folder), 0o700, "{what}: {folder:?}, umask {mask:03o}");
+            }
+            let parent = store.root().parent().unwrap();
+            for above in [parent, parent.parent().unwrap()] {
+                assert_eq!(
+                    mode(above),
+                    0o777 & !mask,
+                    "{what}: {above:?}, umask {mask:03o}"
+                );
+            }
+            cli_core::store_privacy::ensure_private(&store).unwrap();
+        }
+        let cwd = scratch.join("cwd");
+        std::fs::create_dir(&cwd).unwrap();
+        State::default().save(&StatePaths::for_root(&cwd)).unwrap();
+        assert_eq!(mode(&cwd.join(STATE_DIR)), 0o700);
+        assert_eq!(mode(&cwd), 0o777 & !mask, "left as it was");
+    }
+
+    /// Windows: a save, or a legacy state's move, gives every folder from the store's root
+    /// down the owner-only DACL, and the root's missing parents inherit theirs.
+    #[cfg(windows)]
+    #[test]
+    fn the_state_folders_are_owner_only() {
+        use cli_core::owner_only::testing;
+        let scratch = tempdir().unwrap();
+        for (what, store) in fresh_states(scratch.path()) {
+            for folder in state_folders(&store) {
+                testing::of_path(&folder)
+                    .unwrap()
+                    .assert_owner_only_dir(&format!("{what}: {}", folder.display()));
+            }
+            let parent = store.root().parent().unwrap();
+            for above in [parent, parent.parent().unwrap()] {
+                let dacl = testing::of_path(above).unwrap();
+                assert!(!dacl.protected, "{what}: {above:?} inherits: {dacl:?}");
+            }
+            cli_core::store_privacy::ensure_private(&store).unwrap();
+        }
     }
 }

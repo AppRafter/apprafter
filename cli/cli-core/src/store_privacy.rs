@@ -12,8 +12,11 @@
 //!
 //! The folders are the store's root, `targets/` and each target's folder in it, and `state/`,
 //! each folder in it and each folder in those (a target's `.apprafter`). Only the folders that
-//! exist count: a folder AppRafter makes later is made by this account, in a folder it already
-//! checked. Their parents are not checked, nor any other file or folder at the root.
+//! exist count: a folder AppRafter makes later is made by this account, owner-only whatever the
+//! umask ([`TargetStorePaths::create_dir_all`], WI-479), in a folder it already checked — so a
+//! store AppRafter makes from nothing passes, and a command that asks before its first save
+//! (the `target add` wizard) is never refused after it asked. Their parents are not checked,
+//! nor any other file or folder at the root.
 
 use std::io;
 use std::path::{Path, PathBuf};

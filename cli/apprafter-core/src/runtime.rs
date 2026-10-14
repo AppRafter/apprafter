@@ -22,6 +22,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use cli_core::target::TargetStorePaths;
 use cli_state::{State, StatePaths};
 
 use crate::context::Context;
@@ -79,7 +80,7 @@ pub fn materialise_kubeconfig(
 /// never stops the write. The one materialiser of the CLI and the core (D.4a T44).
 pub fn materialise(ctx: &Context, body: &str) -> CoreResult<MaterialisedKubeconfig> {
     let _ = sweep_stale(ctx);
-    write_private(ctx.runtime_dir(), body.as_bytes())
+    write_private(&ctx.store(), ctx.runtime_dir(), body.as_bytes())
 }
 
 /// Whether a copy is a leftover, from what the OS says of the pid in its name: its process is
@@ -151,8 +152,12 @@ pub fn sweep_stale(ctx: &Context) -> CoreResult<usize> {
     Ok(removed)
 }
 
-fn write_private(dir: &Path, bytes: &[u8]) -> CoreResult<MaterialisedKubeconfig> {
-    ensure_private_dir(dir)?;
+fn write_private(
+    store: &TargetStorePaths,
+    dir: &Path,
+    bytes: &[u8],
+) -> CoreResult<MaterialisedKubeconfig> {
+    ensure_private_dir(store, dir)?;
     let pid = std::process::id();
     let start = crate::process::started(pid).map(crate::process::ProcStart::raw);
     for _ in 0..NAME_ATTEMPTS {
@@ -186,13 +191,15 @@ fn write_private(dir: &Path, bytes: &[u8]) -> CoreResult<MaterialisedKubeconfig>
 
 /// Create `dir` owner-only, or tighten an existing one — 0700 on Unix, the protected DACL whose
 /// one ACE its files inherit on Windows (WI-472) — and refuse anything that is not a plain
-/// directory (a symlink would put the decrypted file somewhere else). On Windows the DACL is set
-/// just after the directory is made; each file is restricted on its own handle as well, so a
-/// file made in that moment is no one else's to read. A directory another account owns is
-/// refused (WI-473): on Windows by name, `CliError::RuntimeDirForeign` — its owner could grant
-/// itself access again and replace a kubeconfig before kubectl reads it — and on Unix by the
-/// mode it may not set (EPERM), as before.
-fn ensure_private_dir(dir: &Path) -> CoreResult<()> {
+/// directory (a symlink would put the decrypted file somewhere else). A missing `dir` is made
+/// owner-only from its creation whatever the umask, and when it is the store's `run` so is
+/// every missing folder from the store's root down (WI-479,
+/// [`TargetStorePaths::create_dir_all`]); the folders above are made as the account makes any.
+/// A directory another account owns is refused (WI-473): on Windows by name,
+/// `CliError::RuntimeDirForeign` — its owner could grant itself access again and replace a
+/// kubeconfig before kubectl reads it — and on Unix by the mode it may not set (EPERM), as
+/// before.
+fn ensure_private_dir(store: &TargetStorePaths, dir: &Path) -> CoreResult<()> {
     match fs::symlink_metadata(dir) {
         Ok(meta) if meta.is_dir() => {}
         Ok(_) => {
@@ -202,25 +209,7 @@ fn ensure_private_dir(dir: &Path) -> CoreResult<()> {
             )))
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            if let Some(parent) = dir.parent() {
-                fs::create_dir_all(parent).map_err(io_error)?;
-            }
-            // Built per cfg: `create` takes `&self`, so a `let mut` that only Unix mutates is
-            // `unused_mut` on the Windows clippy leg.
-            #[cfg(unix)]
-            let builder = {
-                use std::os::unix::fs::DirBuilderExt;
-                let mut b = fs::DirBuilder::new();
-                b.mode(0o700);
-                b
-            };
-            #[cfg(not(unix))]
-            let builder = fs::DirBuilder::new();
-            match builder.create(dir) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(e) => return Err(io_error(e)),
-            }
+            store.create_dir_all(dir).map_err(io_error)?;
         }
         Err(e) => return Err(io_error(e)),
     }
@@ -499,7 +488,7 @@ mod tests {
         let before = testing::of_path(&run).unwrap();
         {
             let _foreign = testing::pretend_owner("S-1-5-21-1-2-3-1001").unwrap();
-            match write_private(&run, b"apiVersion: v1\n") {
+            match write_private(&s.ctx.store(), &run, b"apiVersion: v1\n") {
                 Err(CoreError::Cli(cli_core::CliError::RuntimeDirForeign { path })) => {
                     assert_eq!(path, run)
                 }
@@ -526,7 +515,8 @@ mod tests {
         );
         let foreign = foreign_writable_dir();
         let before = fs::metadata(&foreign).unwrap().permissions().mode();
-        match ensure_private_dir(&foreign) {
+        let store = TargetStorePaths::for_root(foreign.join("store"));
+        match ensure_private_dir(&store, &foreign) {
             Err(CoreError::Cli(cli_core::CliError::Io(e))) => {
                 assert_eq!(
                     e.kind(),
@@ -695,5 +685,86 @@ mod tests {
         let s = store(None);
         assert_eq!(sweep_stale(&s.ctx).unwrap(), 0);
         assert!(!s.ctx.runtime_dir().exists());
+    }
+
+    // ---- WI-479: a runtime dir made where nothing was. ----
+
+    /// `<base>/parent/store/run`, the store's own runtime dir, with the store and its parent
+    /// missing, and `<base>/local/apprafter/run/tag`, one outside the store (Local AppData's,
+    /// the desktop's), its parents missing: each made by `ensure_private_dir`.
+    fn runtime_dirs_where_nothing_was(base: &Path) -> (TargetStorePaths, PathBuf) {
+        let store = TargetStorePaths::for_root(base.join("parent").join("store"));
+        ensure_private_dir(&store, &store.root().join("run")).unwrap();
+        let outside = base.join("local").join("apprafter").join("run").join("tag");
+        ensure_private_dir(&store, &outside).unwrap();
+        (store, outside)
+    }
+
+    /// Unix, in a child under a shared group's umask (002): the store's `run` is made 0700 with
+    /// the store's root, the root's parent with the umask's mode; a runtime dir outside the
+    /// store is 0700 itself, its parents with the umask's mode.
+    #[cfg(unix)]
+    #[test]
+    fn a_runtime_dir_where_nothing_was_is_0700_with_the_store_whatever_the_umask() {
+        let scratch = tempfile::tempdir().unwrap();
+        cli_core::owner_only::under_umask::run(
+            "runtime::tests::runtime_dirs_under_the_childs_umask",
+            0o002,
+            scratch.path(),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "runs only inside a_runtime_dir_where_nothing_was_is_0700_with_the_store_whatever_the_umask"]
+    fn runtime_dirs_under_the_childs_umask() {
+        use cli_core::owner_only::under_umask;
+        use std::os::unix::fs::PermissionsExt;
+        let (mask, scratch) = (under_umask::mask(), under_umask::scratch());
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        let (store, outside) = runtime_dirs_where_nothing_was(&scratch);
+        for owner_only in [
+            store.root().to_path_buf(),
+            store.root().join("run"),
+            outside,
+        ] {
+            assert_eq!(mode(&owner_only), 0o700, "{owner_only:?}");
+        }
+        for parent in [
+            scratch.join("parent"),
+            scratch.join("local"),
+            scratch.join("local").join("apprafter"),
+            scratch.join("local").join("apprafter").join("run"),
+        ] {
+            assert_eq!(mode(&parent), 0o777 & !mask, "{parent:?}");
+        }
+    }
+
+    /// Windows: the store's `run` and the store's root it makes have the owner-only DACL, as
+    /// does a runtime dir outside the store; the parents it makes inherit theirs.
+    #[cfg(windows)]
+    #[test]
+    fn a_runtime_dir_where_nothing_was_is_owner_only_with_the_store() {
+        use cli_core::owner_only::testing;
+        let scratch = tempfile::tempdir().unwrap();
+        let (store, outside) = runtime_dirs_where_nothing_was(scratch.path());
+        for owner_only in [
+            store.root().to_path_buf(),
+            store.root().join("run"),
+            outside,
+        ] {
+            testing::of_path(&owner_only)
+                .unwrap()
+                .assert_owner_only_dir(&owner_only.display().to_string());
+        }
+        for parent in [
+            scratch.path().join("parent"),
+            scratch.path().join("local"),
+            scratch.path().join("local").join("apprafter"),
+            scratch.path().join("local").join("apprafter").join("run"),
+        ] {
+            let dacl = testing::of_path(&parent).unwrap();
+            assert!(!dacl.protected, "{parent:?} inherits: {dacl:?}");
+        }
     }
 }

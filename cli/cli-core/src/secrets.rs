@@ -182,12 +182,14 @@ pub fn load_or_create_identity_reporting(path: &Path) -> Result<(Identity, bool)
     }
 }
 
-/// Generate an identity and write it to `path` whole (parent dir created, owner-only before its
-/// first byte: [`write_secret_file`]), or `None` when a file is already there: it is left as it
-/// was.
+/// Generate an identity and write it to `path` whole (owner-only before its first byte:
+/// [`write_secret_file`]), or `None` when a file is already there: it is left as it was. A
+/// missing folder for it is made owner-only (WI-479, [`crate::owner_only::create_dir_all_from`]):
+/// by default it is `~/.config/apprafter`, the target store's root on Linux. Its own missing
+/// parents are made as the account makes any folder.
 fn create_identity(path: &Path) -> Result<Option<Identity>> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        crate::owner_only::create_dir_all_from(parent, parent)
             .map_err(|e| CliError::Other(format!("mkdir {parent:?}: {e}")))?;
     }
     let identity = Identity::generate();
@@ -440,6 +442,58 @@ mod tests {
         load_or_create_identity(&path).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "got {mode:o}");
+    }
+
+    /// WI-479, Unix, in a child under a shared group's umask (002): a missing folder for the
+    /// key — `~/.config/apprafter` by default, the store's root on Linux — is made 0700, its
+    /// own missing parent (`~/.config`) with the umask's mode; a folder already there is left
+    /// as it is.
+    #[cfg(unix)]
+    #[test]
+    fn the_keys_new_folder_is_0700_whatever_the_umask() {
+        let scratch = tempfile::tempdir().unwrap();
+        crate::owner_only::under_umask::run(
+            "secrets::tests::the_keys_folder_under_the_childs_umask",
+            0o002,
+            scratch.path(),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "runs only inside the_keys_new_folder_is_0700_whatever_the_umask"]
+    fn the_keys_folder_under_the_childs_umask() {
+        use crate::owner_only::under_umask;
+        use std::os::unix::fs::PermissionsExt;
+        let (mask, home) = (under_umask::mask(), under_umask::scratch());
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        let folder = home.join(".config").join("apprafter");
+        load_or_create_identity(&folder.join("age.key")).unwrap();
+        assert_eq!(mode(&folder), 0o700);
+        assert_eq!(mode(&home.join(".config")), 0o777 & !mask);
+        let there = home.join("there");
+        std::fs::create_dir(&there).unwrap();
+        load_or_create_identity(&there.join("age.key")).unwrap();
+        assert_eq!(mode(&there), 0o777 & !mask, "left as it was");
+    }
+
+    /// WI-479, Windows: a missing folder for the key is made with the owner-only DACL, its own
+    /// missing parent inheriting.
+    #[cfg(windows)]
+    #[test]
+    fn the_keys_new_folder_is_owner_only() {
+        use crate::owner_only::testing;
+        let home = tempfile::tempdir().unwrap();
+        let folder = home.path().join(".config").join("apprafter");
+        load_or_create_identity(&folder.join("age.key")).unwrap();
+        testing::of_path(&folder)
+            .unwrap()
+            .assert_owner_only_dir("the key's folder");
+        assert!(
+            !testing::of_path(&home.path().join(".config"))
+                .unwrap()
+                .protected
+        );
     }
 
     /// WI-472: on Windows the age key is owner-only by its DACL — protected, one ACE, this

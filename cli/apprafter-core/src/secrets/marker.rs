@@ -81,7 +81,8 @@ pub fn marker_bytes(id: &StoreId) -> cli_core::Result<String> {
 
 /// Write `target`'s marker for store `id` in place of its `credentials.yaml`: atomically, mode
 /// 0600 on Unix (Windows ignores the mode; the marker holds no secret), the target's directory
-/// created as the files backend creates it. The caller holds the store's write lock.
+/// created as the files backend creates it: owner-only, from the store's root down (WI-479,
+/// [`TargetStorePaths::create_dir_all`]). The caller holds the store's write lock.
 pub fn write_marker(store: &TargetStorePaths, target: &str, id: &StoreId) -> cli_core::Result<()> {
     let dest = store.target_credentials_file(target);
     under_temp(&dest);
@@ -91,6 +92,71 @@ pub fn write_marker(store: &TargetStorePaths, target: &str, id: &StoreId) -> cli
         target: target.to_string(),
         source,
     };
-    std::fs::create_dir_all(store.target_dir(target)).map_err(io)?;
+    store
+        .create_dir_all(&store.target_dir(target))
+        .map_err(io)?;
     cli_core::atomic_replace(&dest, bytes.as_bytes(), ".credentials", Some(0o600)).map_err(io)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A marker written for `prod` in a store at `<base>/store` whose `targets` was never
+    /// made: the store, after.
+    fn marker_in_a_store_without_targets(base: &std::path::Path) -> TargetStorePaths {
+        let store = TargetStorePaths::for_root(base.join("store"));
+        std::fs::create_dir(store.root()).unwrap();
+        let id = StoreId::parse("0123456789abcdef").unwrap();
+        write_marker(&store, "prod", &id).unwrap();
+        assert!(matches!(
+            classify(&std::fs::read(store.target_credentials_file("prod")).unwrap()),
+            Marker::Vault { .. }
+        ));
+        store
+    }
+
+    /// WI-479, Unix, in a child under a shared group's umask (002): the target's folders the
+    /// marker makes are 0700, and the root is left as it was.
+    #[cfg(unix)]
+    #[test]
+    fn a_marker_makes_its_targets_folders_0700_whatever_the_umask() {
+        let scratch = tempfile::tempdir().unwrap();
+        cli_core::owner_only::under_umask::run(
+            "secrets::marker::tests::marker_folders_under_the_childs_umask",
+            0o002,
+            scratch.path(),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "runs only inside a_marker_makes_its_targets_folders_0700_whatever_the_umask"]
+    fn marker_folders_under_the_childs_umask() {
+        use cli_core::owner_only::under_umask;
+        use std::os::unix::fs::PermissionsExt;
+        let (mask, scratch) = (under_umask::mask(), under_umask::scratch());
+        let mode =
+            |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        let store = marker_in_a_store_without_targets(&scratch);
+        assert_eq!(mode(&store.targets_dir()), 0o700);
+        assert_eq!(mode(&store.target_dir("prod")), 0o700);
+        assert_eq!(mode(store.root()), 0o777 & !mask, "left as it was");
+    }
+
+    /// WI-479, Windows: the target's folders the marker makes have the owner-only DACL, and
+    /// the root keeps what it inherits.
+    #[cfg(windows)]
+    #[test]
+    fn a_marker_makes_its_targets_folders_owner_only() {
+        use cli_core::owner_only::testing;
+        let dir = tempfile::tempdir().unwrap();
+        let store = marker_in_a_store_without_targets(dir.path());
+        for folder in [store.targets_dir(), store.target_dir("prod")] {
+            testing::of_path(&folder)
+                .unwrap()
+                .assert_owner_only_dir(&folder.display().to_string());
+        }
+        assert!(!testing::of_path(store.root()).unwrap().protected);
+    }
 }
