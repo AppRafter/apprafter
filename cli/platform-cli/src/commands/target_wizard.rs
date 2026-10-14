@@ -10,8 +10,9 @@
 //!     adding a provider later is a one-line surface change).
 //!  3. Provider token (Password, masked; inline format check +
 //!     API ping — unless `--no-ping` was passed).
-//!  4. SSH public key (Select over `~/.ssh/*.pub`, or Text with
-//!     default `~/.ssh/id_ed25519.pub`; skip with empty).
+//!  4. SSH public key (Select over `~/.ssh/*.pub`, or Text, whose
+//!     default `~/.ssh/id_ed25519.pub` is offered only when that file
+//!     holds a public key; skip with empty).
 //!  5. Default tier (Select; copies the kubectl-style one-of list
 //!     from the spec).
 //!  6. Machine matrix (region × server type, from the provider's
@@ -616,16 +617,31 @@ fn prompt_ssh_key(
 }
 
 fn prompt_ssh_key_text_fallback(home: Option<&Path>) -> CoreResult<Option<PathBuf>> {
-    let default = default_ssh_key_hint(home);
-    let answer = Text::new("SSH public key path (leave empty to skip):")
-        .with_default(&default)
-        .with_validator(move |v: &str| match validate_ssh_key_path_input(v, home) {
-            Ok(()) => Ok(Validation::Valid),
-            Err(msg) => Ok(Validation::Invalid(msg.into())),
-        })
-        .prompt()
-        .map_err(map_inquire_err)?;
+    let default = ssh_key_text_default(home);
+    let mut prompt =
+        Text::new("SSH public key path (leave empty to skip):").with_validator(move |v: &str| {
+            match validate_ssh_key_path_input(v, home) {
+                Ok(()) => Ok(Validation::Valid),
+                Err(msg) => Ok(Validation::Invalid(msg.into())),
+            }
+        });
+    if let Some(default) = default.as_deref() {
+        prompt = prompt.with_default(default);
+    }
+    let answer = prompt.prompt().map_err(map_inquire_err)?;
     Ok(ssh_key_answer_to_path(&answer, home))
+}
+
+/// The text prompt's default: `~/.ssh/id_ed25519.pub` ([`default_ssh_key_hint`]), only when that
+/// file holds a public key — when the prompt would accept it. inquire submits the default on an
+/// empty Enter, so a default that is not there (no key under `~/.ssh`) turned "leave empty to
+/// skip" into a prompt that refused the empty answer with "does not exist" and could be left
+/// only by typing a path (WI-480).
+fn ssh_key_text_default(home: Option<&Path>) -> Option<String> {
+    let hint = default_ssh_key_hint(home);
+    validate_ssh_key_path_input(&hint, home)
+        .is_ok()
+        .then_some(hint)
 }
 
 /// The SSH-key picker for the `.pub` files found under `~/.ssh`: its rows
@@ -1058,9 +1074,8 @@ fn inline_ping_error(e: &CoreError) -> String {
 fn default_ssh_key_hint(home: Option<&Path>) -> String {
     // ~/.ssh/id_ed25519.pub matches the modern OpenSSH default
     // and is what apprafter init / apply scaffolding already
-    // expects. If the file doesn't exist, the validator gives the
-    // user a clear "path does not exist" prompt without erroring
-    // out the wizard — they can paste a different path.
+    // expects. Offered as the text prompt's default only when it
+    // holds a public key (`ssh_key_text_default`, WI-480).
     // One component per `join`, so the platform's separator sits between each of them.
     if let Some(home) = home {
         return home
@@ -2152,5 +2167,33 @@ mod tests {
                 .to_string()
         );
         assert_eq!(default_ssh_key_hint(None), "~/.ssh/id_ed25519.pub");
+    }
+
+    /// WI-480: the text prompt offers `~/.ssh/id_ed25519.pub` as its default only when that file
+    /// holds a public key, since an empty Enter submits the default: with no key there, Enter
+    /// skips as the prompt says. A file there that the prompt would refuse (a private key, junk)
+    /// is not offered either, and no home offers nothing.
+    #[test]
+    fn the_text_prompts_default_is_offered_only_when_it_holds_a_public_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        assert_eq!(ssh_key_text_default(Some(home)), None, "no ~/.ssh");
+        let ssh = home.join(".ssh");
+        std::fs::create_dir(&ssh).unwrap();
+        assert_eq!(ssh_key_text_default(Some(home)), None, "an empty ~/.ssh");
+        let key = ssh.join("id_ed25519.pub");
+        for refused in [
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nb3Blbg==\n-----END OPENSSH PRIVATE KEY-----\n",
+            "not-a-key\n",
+        ] {
+            std::fs::write(&key, refused).unwrap();
+            assert_eq!(ssh_key_text_default(Some(home)), None, "{refused}");
+        }
+        std::fs::write(&key, "ssh-ed25519 AAAA me@host\n").unwrap();
+        assert_eq!(
+            ssh_key_text_default(Some(home)),
+            Some(key.display().to_string())
+        );
+        assert_eq!(ssh_key_text_default(None), None);
     }
 }

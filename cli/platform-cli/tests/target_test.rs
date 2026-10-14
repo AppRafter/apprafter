@@ -1275,3 +1275,89 @@ fn target_add_no_ping_env_var_also_skips_validator() {
         .success()
         .stdout(contains("token NOT verified"));
 }
+
+/// The `target add` wizard at a terminal of its own (`common::terminal`, stdout there too, as a
+/// shell runs it), with every input but the SSH key given: `--no-ping`, so nothing is sent.
+#[cfg(unix)]
+fn ssh_key_conversation(sp: &Spawn, steps: &[common::terminal::Step]) -> common::terminal::Ended {
+    let token = synthetic_hetzner_token();
+    let args = [
+        "target",
+        "add",
+        "dev",
+        "--provider",
+        "hetzner-cloud",
+        "--token",
+        &token,
+        "--region",
+        "nbg1",
+        "--tier",
+        "solo",
+        "--no-ping",
+    ];
+    common::terminal::converse_at_terminal(sp, &args, steps)
+}
+
+/// WI-480: with no SSH key under `~/.ssh` (a scratch home without `.ssh`) the wizard asks for
+/// a path, "leave empty to skip"; Enter on the empty line skips the key and the wizard goes on
+/// and saves. It used to submit a default `~/.ssh/id_ed25519.pub` that was not there, refuse
+/// it ("does not exist"), and keep asking until a path was typed: this conversation then ran
+/// into its deadline.
+#[cfg(unix)]
+#[test]
+fn the_wizard_skips_the_ssh_key_on_an_empty_answer_when_there_is_no_key() {
+    use common::terminal::{line, Step};
+    let sp = Spawn::new();
+    assert!(!sp.home().join(".ssh").exists());
+    let end = ssh_key_conversation(
+        &sp,
+        &[
+            Step::Expect("SSH public key path (leave empty to skip):"),
+            line(""),
+            Step::Expect("target `dev` saved and set as active"),
+        ],
+    );
+    let shown = &end.terminal;
+    assert_eq!(end.status.code(), Some(0), "{shown}");
+    assert!(!shown.contains("does not exist"), "{shown}");
+    assert!(
+        !shown.contains("id_ed25519.pub"),
+        "a default was offered:\n{shown}"
+    );
+    assert!(end.restored, "the terminal was not put back");
+    let config = std::fs::read_to_string(sp.store().join("targets/dev/config.yaml")).unwrap();
+    assert!(config.contains("ssh_key_path: null"), "{config}");
+}
+
+/// WI-480: with `~/.ssh/id_ed25519.pub` holding a public key, the picker lists it; its "Other"
+/// row's path prompt offers that file as the default, and Enter on the empty line takes it.
+#[cfg(unix)]
+#[test]
+fn the_wizards_path_prompt_takes_the_default_key_on_an_empty_answer_when_it_is_there() {
+    use common::terminal::{line, Step};
+    let sp = Spawn::new();
+    let ssh = sp.home().join(".ssh");
+    std::fs::create_dir_all(&ssh).unwrap();
+    let key = ssh.join("id_ed25519.pub");
+    std::fs::write(&key, "ssh-ed25519 AAAA test@host\n").unwrap();
+    let end = ssh_key_conversation(
+        &sp,
+        &[
+            Step::Expect("Other (type a path)"),
+            // Down to "Other", then the path prompt and its default.
+            Step::Type(b"\x1b[B".to_vec()),
+            line(""),
+            Step::Expect("SSH public key path (leave empty to skip):"),
+            line(""),
+            Step::Expect("target `dev` saved and set as active"),
+        ],
+    );
+    let shown = &end.terminal;
+    assert_eq!(end.status.code(), Some(0), "{shown}");
+    assert!(end.restored, "the terminal was not put back");
+    let config = std::fs::read_to_string(sp.store().join("targets/dev/config.yaml")).unwrap();
+    assert!(
+        config.contains(&format!("ssh_key_path: {}", key.display())),
+        "{config}"
+    );
+}
