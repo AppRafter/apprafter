@@ -743,6 +743,12 @@ fn neutral_help(e: &cli_core::CliError) -> Option<String> {
              fix that folder's owner and permissions; Doctor lists every folder and file \
              concerned."
             .into(),
+        // WI-478: the shared age key file a store in files reads its caches with.
+        C::AgeKeyIdentityCount { .. } => "An age key file holds one key, the line \
+             `AGE-SECRET-KEY-1…`; lines that start with `#` and blank lines are skipped. Keep \
+             only the key the cached secrets were encrypted with in this file. It was left as it \
+             is."
+        .into(),
         // WI-473: the desktop's runtime dir is its own (`<app local data>/run`), so only the
         // removal applies there; the CLI's help also names a store of one's own.
         C::RuntimeDirForeign { .. } => "Another account could replace a kubeconfig in it before \
@@ -1246,6 +1252,14 @@ pub mod samples {
             // WI-473: the runtime dir another account owns (Windows).
             C::RuntimeDirForeign {
                 path: "/s/run".into(),
+            },
+            C::AgeKeyIdentityCount {
+                path: "/k/age.key".into(),
+                found: 0,
+            },
+            C::AgeKeyIdentityCount {
+                path: "/k/age.key".into(),
+                found: 2,
             },
             C::Other(s("o")),
         ];
@@ -2273,6 +2287,27 @@ mod tests {
         let help = ui.help.expect("a neutral help");
         assert_ne!(help, cli_help, "the CLI's help stays the CLI's");
         assert!(help.contains("nightly-1"), "{help}");
+    }
+
+    /// WI-478: an age key file that does not hold one key reaches the app with its own code, the
+    /// file named, and a help of the app's: the format, never the CLI's `APPRAFTER_AGE_KEY`.
+    #[test]
+    fn an_age_key_file_that_is_not_one_key_passes_through_with_its_code() {
+        for found in [0, 2] {
+            let inner = cli_core::CliError::AgeKeyIdentityCount {
+                path: "/k/age.key".into(),
+                found,
+            };
+            let ui = UiError::from(&CoreError::from(inner));
+            assert_eq!(
+                ui.code.as_deref(),
+                Some("apprafter::secrets::age_key_identity_count")
+            );
+            assert!(ui.message.contains("/k/age.key"), "{}", ui.message);
+            let help = ui.help.expect("a neutral help");
+            assert!(help.contains("`AGE-SECRET-KEY-1…`"), "{help}");
+            assert!(!help.contains("APPRAFTER_AGE_KEY"), "{help}");
+        }
     }
 
     /// What a help the GUI shows may not say: a CLI command (`apprafter …`) or a flag (a

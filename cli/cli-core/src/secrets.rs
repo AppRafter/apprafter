@@ -6,8 +6,9 @@
 //! whose secrets are in files. The private key is stored bech32-encoded at
 //! `$APPRAFTER_AGE_KEY` (default `~/.config/apprafter/age.key`, mode 0600;
 //! [`age_key_path_from`], which the shared core's `Context` resolves it
-//! with). Ciphertext is ASCII-armored so it stays human-eyeable inside
-//! `state.json`.
+//! with): AppRafter writes the key line alone, and reads age-keygen's file
+//! too, its comment lines skipped ([`load_identity`]). Ciphertext is
+//! ASCII-armored so it stays human-eyeable inside `state.json`.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -110,9 +111,11 @@ pub fn age_key_path_from(override_path: Option<&Path>, home: Option<&Path>) -> P
 }
 
 /// The identity at `path`, or `None` when the file is absent. Never creates anything: a read
-/// (doctor, a kubeconfig probe) must not mint a key that matches no ciphertext. On Windows a key
-/// whose DACL is not owner-only (written before WI-472, or copied in) is made owner-only on the
-/// handle it is read through ([`crate::owner_only::read_secret`], WI-473).
+/// (doctor, a kubeconfig probe) must not mint a key that matches no ciphertext. The file is
+/// read as age-keygen writes it: comment and blank lines skipped, exactly one key line
+/// (`identity_in`, WI-478). On Windows a key whose DACL is not owner-only (written before
+/// WI-472, or copied in) is made owner-only on the handle it is read through
+/// ([`crate::owner_only::read_secret`], WI-473).
 pub fn load_identity(path: &Path) -> Result<Option<Identity>> {
     if !path.exists() {
         return Ok(None);
@@ -127,9 +130,27 @@ pub fn load_identity(path: &Path) -> Result<Option<Identity>> {
             })
         })
         .map_err(|e| CliError::Other(format!("read age key {path:?}: {e}")))?;
-    Identity::from_str(raw.trim())
-        .map(Some)
-        .map_err(|e| CliError::Other(format!("parse age key {path:?}: {e}")))
+    identity_in(path, &raw).map(Some)
+}
+
+/// The one identity in `text`, the age key file at `path`, read as age-keygen writes the file
+/// (WI-478): a line that is blank or starts with `#` — its `# created:` and `# public key:`
+/// lines — is skipped, and exactly one other line is the key. No such line, or more than one,
+/// is [`CliError::AgeKeyIdentityCount`]; a key line that does not parse is the error that names
+/// the file, in WI-475's words. AppRafter itself writes the key line alone.
+fn identity_in(path: &Path, text: &str) -> Result<Identity> {
+    let keys: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect();
+    let [key] = keys.as_slice() else {
+        return Err(CliError::AgeKeyIdentityCount {
+            path: path.to_path_buf(),
+            found: keys.len(),
+        });
+    };
+    Identity::from_str(key).map_err(|e| CliError::Other(format!("parse age key {path:?}: {e}")))
 }
 
 /// Load the identity at `path`, or generate a fresh one and persist
@@ -593,6 +614,8 @@ mod tests {
 
     /// WI-475: a key file that does not parse — a partial key, an empty file — is an error that
     /// names it, and it is left as it was: never reused as a key, never replaced by a new one.
+    /// A partial key line is still the catch-all in WI-475's words; an empty file holds no key
+    /// line at all, which WI-478 made `AgeKeyIdentityCount`.
     #[test]
     fn a_key_that_does_not_parse_is_reported_and_left_as_it_is() {
         let dir = tempfile::tempdir().unwrap();
@@ -605,14 +628,137 @@ mod tests {
             let Err(err) = load_or_create_identity_reporting(&path) else {
                 panic!("{name}: a key that does not parse was used");
             };
-            let err = err.to_string();
-            assert!(
-                err.contains("parse age key") && err.contains(&format!("{path:?}")),
-                "{name}: {err}"
-            );
+            // The catch-all's words name the path as `{:?}` prints it (`C:\\…` on Windows).
+            match (name, &err) {
+                ("partial", CliError::Other(text)) => assert!(
+                    text.starts_with(&format!("parse age key {path:?}: ")),
+                    "{name}: {text}"
+                ),
+                ("empty", CliError::AgeKeyIdentityCount { path: named, found }) => {
+                    assert_eq!((named, *found), (&path, 0), "{name}");
+                    assert!(
+                        err.to_string().contains(&path.display().to_string()),
+                        "{name}: {err}"
+                    );
+                }
+                _ => panic!("{name}: {err:?}"),
+            }
             assert_eq!(std::fs::read(&path).unwrap(), bytes, "{name}: changed");
             assert!(load_identity(&path).is_err(), "{name}");
         }
+    }
+
+    /// WI-478: the file age-keygen writes — `# created:` and `# public key:` lines, then the
+    /// key — loads, and so does one with blank lines, CRLF line ends, a comment after the key,
+    /// or spaces around a line. Loading it changes nothing: it is never rewritten or replaced.
+    #[test]
+    fn age_keygens_own_file_loads_as_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = Identity::generate();
+        let key = id.to_string();
+        let key = key.expose_secret();
+        let public = id.to_public().to_string();
+        for (name, text) in [
+            (
+                "keygen",
+                format!("# created: 2026-10-14T18:00:00+01:00\n# public key: {public}\n{key}\n"),
+            ),
+            (
+                "blank lines",
+                format!("\n# created: 2026-10-14T18:00:00+01:00\n\n{key}\n\n"),
+            ),
+            (
+                "crlf",
+                format!(
+                    "# created: 2026-10-14T18:00:00+01:00\r\n# public key: {public}\r\n{key}\r\n"
+                ),
+            ),
+            ("comment after", format!("{key}\n# kept for AppRafter\n")),
+            ("spaces", format!("  # public key: {public}\n\t{key}  \n")),
+            ("no newline", format!("# public key: {public}\n{key}")),
+        ] {
+            let path = dir.path().join(name.replace(' ', "-"));
+            std::fs::write(&path, &text).unwrap();
+            let loaded = load_identity(&path)
+                .unwrap_or_else(|e| panic!("{name}: {e:?}"))
+                .expect("present");
+            assert_eq!(loaded.to_public().to_string(), public, "{name}");
+            let (again, created) = load_or_create_identity_reporting(&path).unwrap();
+            assert!(!created, "{name}: a key that loads was replaced");
+            assert_eq!(again.to_public().to_string(), public, "{name}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "{name}");
+        }
+    }
+
+    /// WI-478: a file with no key line, or with more than one, is `AgeKeyIdentityCount` naming
+    /// it and how many it has — never the catch-all — and is left as it is: never used, never
+    /// replaced. A line that is neither blank nor a comment counts as a key line whatever it
+    /// holds, as age reads an identity file.
+    #[test]
+    fn a_file_with_no_key_or_two_is_refused_by_name_and_left_as_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = Identity::generate().to_string();
+        let b = Identity::generate().to_string();
+        let (a, b) = (a.expose_secret(), b.expose_secret());
+        for (name, text, found) in [
+            (
+                "comments only",
+                "# created: 2026-10-14\n# public key: age1x\n".to_string(),
+                0,
+            ),
+            ("blank only", "\n  \r\n\t\n".to_string(), 0),
+            ("two keys", format!("{a}\n{b}\n"), 2),
+            (
+                "two keygen files",
+                format!("# created: 1\n# public key: age1x\n{a}\n# created: 2\n{b}\n"),
+                2,
+            ),
+            (
+                "key and another line",
+                format!("{a}\nAGE-PLUGIN-YUBIKEY-1QQQ\n"),
+                2,
+            ),
+            ("three", format!("{a}\n{b}\n{a}\n"), 3),
+        ] {
+            let path = dir.path().join(name.replace(' ', "-")).join("age.key");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, &text).unwrap();
+            for err in [
+                load_identity(&path).map(|_| ()).unwrap_err(),
+                load_or_create_identity_reporting(&path)
+                    .map(|_| ())
+                    .unwrap_err(),
+            ] {
+                match &err {
+                    CliError::AgeKeyIdentityCount {
+                        path: named,
+                        found: n,
+                    } => {
+                        assert_eq!((named, *n), (&path, found), "{name}")
+                    }
+                    other => panic!("{name}: {other:?}"),
+                }
+                assert!(
+                    err.to_string().contains(&path.display().to_string()),
+                    "{name}: {err}"
+                );
+            }
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "{name}");
+            assert_eq!(names_in(path.parent().unwrap()), ["age.key"], "{name}");
+        }
+    }
+
+    /// WI-478: AppRafter still writes the key alone, one line: what it reads in age-keygen's
+    /// format, it never writes in it.
+    #[test]
+    fn a_created_key_is_the_key_line_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("age.key");
+        let id = load_or_create_identity(&path).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            format!("{}\n", id.to_string().expose_secret())
+        );
     }
 
     /// WI-475: first uses that race all end with the one key one of them created: none sees a

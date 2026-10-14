@@ -633,6 +633,21 @@ impl StoreFolderProblem {
     }
 }
 
+/// [`CliError::AgeKeyIdentityCount`]'s message: a file with no key line, or with `found` of them.
+fn age_key_identity_count_message(path: &Path, found: usize) -> String {
+    match found {
+        0 => format!(
+            "the age key file {} holds no key: every line in it is blank or a comment",
+            path.display()
+        ),
+        n => format!(
+            "the age key file {} has {n} lines that are neither blank nor a comment, and \
+             AppRafter takes a file with exactly one: the key",
+            path.display()
+        ),
+    }
+}
+
 fn store_not_private_message(path: &Path, problem: StoreFolderProblem) -> String {
     let who = match problem {
         StoreFolderProblem::ForeignOwner => format!(
@@ -1434,6 +1449,23 @@ pub enum CliError {
         /// after: the help says what that leaves and how to go on.
         stopped: Option<ProvisionStop>,
     },
+
+    /// An age key file that does not hold one key (WI-478). It is read as age-keygen writes it:
+    /// a line that is blank or starts with `#` is skipped, and exactly one other line is the key
+    /// (`AGE-SECRET-KEY-1…`). `found` is how many such lines it has: none, or more than one. The
+    /// file is never used, and never replaced. A key line that does not parse stays the
+    /// catch-all that names the file (WI-475's words).
+    #[error("{}", age_key_identity_count_message(path, *found))]
+    #[diagnostic(
+        code(apprafter::secrets::age_key_identity_count),
+        help(
+            "An age key file holds one key, the line `AGE-SECRET-KEY-1…`; lines that start with \
+             `#` and blank lines are skipped, as in the file `age-keygen -o <file>` writes. Keep \
+             only the key the cached secrets were encrypted with in this file, or set \
+             `APPRAFTER_AGE_KEY` to a file that holds only that key. The file was left as it is."
+        )
+    )]
+    AgeKeyIdentityCount { path: PathBuf, found: usize },
 
     /// A cached secret the key it was tried with cannot decrypt: it was cached under another key,
     /// or the ciphertext is damaged. `detail` is the age library's own account; `key` says which
@@ -2612,6 +2644,40 @@ mod tests {
         assert_eq!(code_of(&err), "apprafter::cli::usage_refused");
         assert_eq!(err.to_string(), "`--provider` is required");
         assert_eq!(help_of(&err), "Supported providers: hetzner-cloud.");
+    }
+
+    /// WI-478: an age key file with no key, or with more than one, is its own code: the message
+    /// names the file and what is wrong with it, and the help the format it is read in.
+    #[test]
+    fn an_age_key_file_with_no_key_or_more_than_one_says_so() {
+        let path = PathBuf::from("/k/age.key");
+        let none = CliError::AgeKeyIdentityCount {
+            path: path.clone(),
+            found: 0,
+        };
+        let two = CliError::AgeKeyIdentityCount { path, found: 2 };
+        for err in [&none, &two] {
+            assert_eq!(code_of(err), "apprafter::secrets::age_key_identity_count");
+            let help = help_of(err);
+            for part in [
+                "`AGE-SECRET-KEY-1…`",
+                "start with `#` and blank lines are skipped",
+                "`age-keygen -o <file>`",
+                "`APPRAFTER_AGE_KEY`",
+                "left as it is",
+            ] {
+                assert!(help.contains(part), "{part}: {help}");
+            }
+        }
+        assert_eq!(
+            none.to_string(),
+            "the age key file /k/age.key holds no key: every line in it is blank or a comment"
+        );
+        assert_eq!(
+            two.to_string(),
+            "the age key file /k/age.key has 2 lines that are neither blank nor a comment, and \
+             AppRafter takes a file with exactly one: the key"
+        );
     }
 
     /// WI-457: the CLI's own commands raise the core's code and message, and the help names

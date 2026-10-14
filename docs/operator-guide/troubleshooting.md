@@ -416,6 +416,22 @@ it answers). Then run the same `up` or `restore` command again: it
 finds the server it provisioned instead of creating another, and goes
 on with cluster-bootstrap.
 
+### `apprafter::secrets::age_key_identity_count` {#age-key-identity-count}
+
+The age key file the error names does not hold exactly one key. AppRafter
+reads it as `age-keygen -o <file>` writes it: lines that start with `#`
+(age-keygen's `# created:` and `# public key:` lines) and blank lines are
+skipped, and exactly one other line must be the key,
+`AGE-SECRET-KEY-1…`. The message says whether the file holds no such line
+or several. AppRafter itself writes the key line alone. The file is never
+used and never replaced: a command that would create a key on a first use
+stops here instead.
+
+**Fix.** Keep only the key the cached secrets were encrypted with in that
+file, or set `APPRAFTER_AGE_KEY` to a file that holds only that key. A key
+line that is cut short or mistyped is reported as `apprafter::cli::other`,
+with the words `parse age key` and the file's path.
+
 ### `apprafter::secrets::cache_undecryptable` {#cache-undecryptable}
 
 A cached kubeconfig or Argo CD password does not decrypt with the age
