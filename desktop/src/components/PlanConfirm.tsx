@@ -150,6 +150,7 @@ export function PlanConfirm({
       {...(destructive && { plan: changes })}
       {...(requireText !== undefined && { requireText })}
       {...(icon !== undefined && { icon })}
+      gesture={view.gesture}
       auth={auth}
       onConfirm={confirm}
       onClose={close}

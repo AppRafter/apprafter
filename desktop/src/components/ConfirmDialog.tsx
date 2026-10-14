@@ -7,14 +7,19 @@
 // hands to execute() and Rust checks. It refuses as the lock screen's does, and is shown the same
 // way: the OS's words or a plain line, the back-off counted down from what Rust says, busy; the
 // field is marked until the owner types again. The field is emptied after every answer; a wrong
-// password leaves the plan waiting in Rust, so the owner simply tries again.
+// password leaves the plan waiting in Rust, so the owner simply tries again. A plan's own gesture
+// (`PlanView.gesture`) decides when it is given; `store_secret` is the target store's lock password
+// or recovery key, in the dialog's own field on every OS (D.4a T76).
 import { type FormEvent, type ReactNode, useEffect, useId, useRef, useState } from 'react';
 import { uiErrorOf } from '../ipc/api';
 import type { AuthInfo } from '../ipc/generated/AuthInfo';
+import { CORE_ERROR_CODES } from '../ipc/generated/core-errors';
 import { DESKTOP_ERROR_CODES } from '../ipc/generated/errors';
+import type { Gesture } from '../ipc/generated/Gesture';
 import type { PlanClass } from '../ipc/generated/PlanClass';
 import type { UiError } from '../ipc/generated/UiError';
 import { authPrompt, authRefusal, retryLine, useRetryCountdown } from '../state/auth';
+import { STORE_SECRET_FIELD } from '../state/lockText';
 import { Button } from './Button';
 import { ErrorPanel } from './ErrorPanel';
 import { type Icon, QuestionIcon } from './icons';
@@ -46,6 +51,14 @@ export interface ConfirmDialogProps {
   requireText?: string;
   /** Whether Rust asks the OS for the owner next; by default a destructive plan does. */
   osGesture?: boolean;
+  /**
+   * What confirming asks, as the plan names it (`PlanView.gesture`, D.4a §3.14). Given, it
+   * decides and `osGesture` is not read: `os` the OS's gesture (or the dialog's own system
+   * password field where the OS cannot prompt), `store_secret` the target store's lock password
+   * or recovery key in the dialog's own field, which Rust checks against the vault, `none`
+   * nothing.
+   */
+  gesture?: Gesture;
   /** AppInfo.auth: names the prompt, or asks for the password here (`passwordField`). */
   auth: AuthInfo | null;
   /**
@@ -71,6 +84,7 @@ export function ConfirmDialog({
   plan,
   requireText,
   osGesture = planClass === 'destructive',
+  gesture,
   auth,
   onConfirm,
   onClose,
@@ -87,7 +101,9 @@ export function ConfirmDialog({
   const destructive = planClass === 'destructive';
   const guard = destructive ? requireText : undefined;
   const method = auth?.available ? auth.method : null;
-  const field = osGesture && method !== null && auth?.passwordField === true;
+  const storeSecret = gesture === 'store_secret';
+  const osAsked = gesture === undefined ? osGesture : gesture === 'os';
+  const field = storeSecret || (osAsked && method !== null && auth?.passwordField === true);
   const ready = (guard === undefined || typed === guard) && (!field || password !== '');
 
   // A field the back-off disabled lost the focus: it gets it back once the back-off ends.
@@ -108,8 +124,12 @@ export function ConfirmDialog({
     } catch (reason) {
       const refused = uiErrorOf(reason);
       let backoffStarts = false;
-      if (AUTH_REFUSALS.has(refused.code)) {
-        const said = authRefusal(refused, field);
+      // A mistyped recovery key in the store's field is a try the owner makes again, said in
+      // the words the Protect dialog uses (D.4a critic A finding 26).
+      const mistypedKey =
+        storeSecret && refused.code === CORE_ERROR_CODES.SECRETS_RECOVERY_KEY_INVALID;
+      if (AUTH_REFUSALS.has(refused.code) || mistypedKey) {
+        const said = authRefusal(refused, field, storeSecret ? 'store' : 'system');
         setRefusal(said.lines);
         if (said.retryInMs !== null) {
           startRetry(said.retryInMs);
@@ -175,7 +195,7 @@ export function ConfirmDialog({
           <div className="confirm-password" data-modal-body>
             <PasswordField
               ref={passwordInput}
-              label="System password"
+              label={storeSecret ? STORE_SECRET_FIELD : 'System password'}
               value={password}
               onChange={(value) => {
                 setPassword(value);
@@ -202,7 +222,7 @@ export function ConfirmDialog({
         )}
         {error !== null && <ErrorPanel error={error} />}
         <div className="alert-foot">
-          {osGesture && method !== null && !field && (
+          {osAsked && method !== null && !field && (
             <span className="confirm-gesture">{`Confirm with ${authPrompt(method)} next.`}</span>
           )}
           <Button size={32} onClick={onClose} disabled={busy}>

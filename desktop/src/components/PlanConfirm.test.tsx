@@ -375,3 +375,34 @@ test('its tab closed while the OS prompt is open, then refused: the plan is disc
   expect(handles.onDone).not.toHaveBeenCalled();
   expect(handles.onFailed).not.toHaveBeenCalled();
 });
+
+test("a store-secret plan's confirm sends the typed secret with op_execute (D.4a §3.14)", async () => {
+  clearMocks();
+  const h = installHarness();
+  const opId = h.newOperation([completed({ notLocked: false })]);
+  const view: PlanView = {
+    opId,
+    class: 'destructive',
+    title: 'Put the secrets back in files',
+    changes: CHANGES,
+    target: null,
+    expiresAtMs: Date.now() + 600_000,
+    gesture: 'store_secret',
+  };
+  const done = mock();
+  const user = renderScreen(
+    <PlanConfirm
+      view={view}
+      title="Stop protecting secrets"
+      confirmLabel="Stop protecting"
+      auth={appInfo().auth}
+      onDone={done}
+      onFailed={mock()}
+      onClose={mock()}
+    />,
+  );
+  await user.type(screen.getByLabelText('Lock password or recovery key'), 'the lock password');
+  await user.click(screen.getByRole('button', { name: 'Stop protecting' }));
+  await waitFor(() => expect(done).toHaveBeenCalled());
+  expect(h.of('op_execute').map((c) => c.args.password)).toEqual(['the lock password']);
+});

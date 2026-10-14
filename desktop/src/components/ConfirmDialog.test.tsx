@@ -4,6 +4,7 @@ import { clearMocks, mockIPC } from '@tauri-apps/api/mocks';
 import { act, cleanup as cleanupDialog, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import type { AuthInfo } from '../ipc/generated/AuthInfo';
+import { CORE_ERROR_CODES } from '../ipc/generated/core-errors';
 import { DESKTOP_ERROR_CODES } from '../ipc/generated/errors';
 import type { JsonValue } from '../ipc/generated/serde_json/JsonValue';
 import { execute, resetOperations } from '../ipc/operations';
@@ -498,5 +499,65 @@ describe('ConfirmDialog where the OS cannot prompt: the password field', () => {
     const alert = await screen.findByRole('alert');
     expect(alert.textContent).toContain(`Rust says ${DESKTOP_ERROR_CODES.PLAN_EXPIRED}`);
     expect(alert.textContent).toContain(DESKTOP_ERROR_CODES.PLAN_EXPIRED);
+  });
+});
+
+describe("the target store's secret as the gesture (D.4a T76, §3.14)", () => {
+  test('the field is there whatever the OS can do, and its value goes to onConfirm', async () => {
+    const { user, onConfirm } = open({ gesture: 'store_secret', auth: hello });
+    const field = screen.getByLabelText('Lock password or recovery key');
+    // Not the OS's prompt: nothing says one follows.
+    expect(screen.queryByText(/Confirm with/)).toBeNull();
+    expect((screen.getByRole('button', { name: 'Remove' }) as HTMLButtonElement).disabled).toBe(
+      true,
+    );
+    await user.type(field, 'a lock password');
+    await user.click(screen.getByRole('button', { name: 'Remove' }));
+    expect(onConfirm).toHaveBeenCalledWith('a lock password');
+  });
+
+  test('without any system authentication the field is still there', () => {
+    open({ gesture: 'store_secret', auth: null });
+    expect(screen.getByLabelText('Lock password or recovery key')).toBeDefined();
+  });
+
+  test('a wrong secret says it is neither the lock password nor the recovery key', async () => {
+    const { user, onConfirm } = open({ gesture: 'store_secret', auth: hello });
+    onConfirm.mockImplementation(() =>
+      Promise.reject(refusal(DESKTOP_ERROR_CODES.AUTH_FAILED, { exhausted: false })),
+    );
+    const field = screen.getByLabelText('Lock password or recovery key') as HTMLInputElement;
+    await user.type(field, 'wrong');
+    await user.click(screen.getByRole('button', { name: 'Remove' }));
+    await settled();
+    expect(screen.getByRole('alert').textContent).toBe(
+      'That is not the lock password or the recovery key.',
+    );
+    expect(field.value).toBe('');
+  });
+
+  test('a mistyped recovery key is said where it is wrong, as Protect says it, and the field emptied', async () => {
+    // The plan waits in Rust (D.4a Task 16): the owner types the key again in place.
+    const { user, onConfirm } = open({ gesture: 'store_secret', auth: hello });
+    onConfirm.mockImplementation(() =>
+      Promise.reject(
+        refusal(CORE_ERROR_CODES.SECRETS_RECOVERY_KEY_INVALID, { reason: 'checksum', group: 7 }),
+      ),
+    );
+    const field = screen.getByLabelText('Lock password or recovery key') as HTMLInputElement;
+    await user.type(field, 'QQQSY-QCYQ6');
+    await user.click(screen.getByRole('button', { name: 'Remove' }));
+    await settled();
+    expect(screen.getByRole('alert').textContent).toBe('That key is mistyped near group 7.');
+    expect(field.value).toBe('');
+  });
+
+  test('`none` asks nothing, even for a destructive plan; `os` asks as before', () => {
+    open({ gesture: 'none' });
+    expect(screen.queryByText(/Confirm with/)).toBeNull();
+    expect(screen.queryByLabelText('Lock password or recovery key')).toBeNull();
+    cleanupDialog();
+    open({ gesture: 'os' });
+    expect(screen.getByText('Confirm with Windows Hello next.')).toBeDefined();
   });
 });
