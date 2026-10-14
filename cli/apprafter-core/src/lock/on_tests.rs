@@ -935,6 +935,32 @@ fn the_window_lives_in_the_vault_and_changes_there() {
     ));
 }
 
+/// d4a-h F1: `lock on` over a store another account can change is refused when it is planned,
+/// before the CLI asks for a new lock password or shows a recovery key it could never write;
+/// on a locked store too, where `--timeout` would change `store.yaml`.
+#[test]
+fn a_store_another_account_can_change_is_refused_before_anything_is_asked() {
+    let f = files_store();
+    let staging = f.ctx.store().target_dir("staging");
+    {
+        let _foreign = cli_core::owner_only::pretend::foreign_owner(&staging);
+        for timeout in [None, Some(15)] {
+            match plan_on(&f.ctx, timeout) {
+                Err(CoreError::Cli(CliError::StoreNotPrivate { path, .. })) => {
+                    assert_eq!(path, staging)
+                }
+                other => panic!("{timeout:?}: {:?}", other.map(|p| p.title)),
+            }
+        }
+    }
+    lock(&f.ctx);
+    let _foreign = cli_core::owner_only::pretend::foreign_owner(&staging);
+    match plan_on(&f.ctx, Some(15)) {
+        Err(CoreError::Cli(CliError::StoreNotPrivate { path, .. })) => assert_eq!(path, staging),
+        other => panic!("{:?}", other.map(|p| p.title)),
+    }
+}
+
 /// WI-475: `lock on` over a store another account can change is refused before anything is
 /// written — no vault, no `store.yaml`, every clear file as it was — naming the folder.
 #[test]

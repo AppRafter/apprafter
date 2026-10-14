@@ -328,6 +328,10 @@ pub fn plan_on(ctx: &Context, timeout_min: Option<u32>) -> CoreResult<Plan<LockO
     let timeout = timeout_min.unwrap_or(DEFAULT_UNLOCK_TIMEOUT_MIN);
     super::check_timeout(timeout)?;
     let store = ctx.store();
+    // WI-475's refusal, when the change is planned (d4a-h F1): a store another account can
+    // change is refused before anything is asked, never after a new lock password and a
+    // recovery key that could never be written. Read only, as the plan is.
+    cli_core::store_privacy::ensure_private(&store)?;
     let root = ctx.config_root();
     let file = read_store_file(root)?;
     let targets = cli_core::list_target_names(&store)?;

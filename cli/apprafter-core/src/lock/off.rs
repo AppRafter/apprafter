@@ -295,6 +295,9 @@ pub fn plan_off(ctx: &Context) -> CoreResult<Plan<LockOffPayload>> {
             false,
         ));
     };
+    // WI-475's refusal, when the change is planned (d4a-h F1): a locked store another account
+    // can change is refused before its lock password is asked. Read only, as the plan is.
+    cli_core::store_privacy::ensure_private(&store)?;
     let Some(id) = file.id.clone() else {
         return Err(CoreError::Cli(CliError::StoreFileUnreadable {
             path: root.join(STORE_FILE),

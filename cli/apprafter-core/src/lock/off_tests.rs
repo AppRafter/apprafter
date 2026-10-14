@@ -921,6 +921,25 @@ fn a_resume_reads_the_shared_key_only_for_a_cache_still_sealed_to_it() {
     }
 }
 
+/// d4a-h F1: `lock off` on a locked store another account can change is refused when it is
+/// planned, before the lock password is asked; a store in files is still only "not locked".
+#[test]
+fn a_store_another_account_can_change_is_refused_before_its_secret_is_asked() {
+    let f = files_store();
+    let state = f.ctx.config_root().join("state");
+    {
+        let _foreign = cli_core::owner_only::pretend::foreign_owner(&state);
+        let plan = plan_off(&f.ctx).unwrap();
+        assert!(matches!(plan.payload.start(), LockOffStart::NotLocked));
+    }
+    lock(&f.ctx);
+    let _foreign = cli_core::owner_only::pretend::foreign_owner(&state);
+    match plan_off(&f.ctx) {
+        Err(CoreError::Cli(CliError::StoreNotPrivate { path, .. })) => assert_eq!(path, state),
+        other => panic!("{:?}", other.map(|p| p.title)),
+    }
+}
+
 /// WI-475: `lock off` on a store another account can change is refused before anything is
 /// written: every token stays in the vault, and the vault stays.
 #[test]

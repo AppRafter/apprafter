@@ -76,7 +76,8 @@ where it was, for the stores that are not locked.
 your account's alone: another account that owns one of its folders, or can
 write to one, could put a `store.yaml`, a vault or a target's files of its
 own there. Such a store is refused before any of its secrets is used or
-written, locked or not
+written, locked or not, and `apprafter lock on` and `apprafter lock off`
+refuse it before they ask for a password
 ([`store_not_private`](../operator-guide/troubleshooting.md#store-not-private)),
 and `apprafter doctor` names each folder concerned
 ([The target store on disk](the-target-store.md#file-layout)).
