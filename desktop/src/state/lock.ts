@@ -24,6 +24,7 @@ import { useEffect, useMemo } from 'react';
 import { lockNow, lockStatus, unlock, unlockWithPassword } from '../ipc/api';
 import { onLockChanged } from '../ipc/events';
 import type { LockState } from '../ipc/generated/LockState';
+import { NO_AUTH_PROTECTED_NOTICE } from './lockText';
 
 export const LOCK_KEY = ['lock'] as const;
 
@@ -155,12 +156,30 @@ const LOCK_OFF_MESSAGES: Record<LockOff, string> = {
 
 /**
  * Why the lock is not in effect — Rust locks only with both the setting on and a way to verify
- * the owner — or null when it is, or the settings are not read yet (Rust decides then).
+ * the owner — or null when it is, or the settings are not read yet (Rust decides then). On a
+ * protected store (`protectedStore`) it is always in effect.
  */
-export function lockOff(authAvailable: boolean, lockEnabled: boolean | undefined): LockOff | null {
+export function lockOff(
+  authAvailable: boolean,
+  lockEnabled: boolean | undefined,
+  protectedStore = false,
+): LockOff | null {
+  // D.4a T74: on a protected store the lock is in effect whatever the OS offers and whatever the
+  // saved switch says: the store's own field always opens it.
+  if (protectedStore) return null;
   if (!authAvailable) return 'no_auth';
   if (lockEnabled === false) return 'turned_off';
   return null;
+}
+
+/**
+ * What the shell says under its title bar while the OS offers no way to verify the owner, or
+ * nothing: on a protected store the app lock still works, and confirmations ask for the lock
+ * password (D25).
+ */
+export function noAuthNotice(authAvailable: boolean, protectedStore: boolean): string | null {
+  if (authAvailable) return null;
+  return protectedStore ? NO_AUTH_PROTECTED_NOTICE : NO_AUTH_NOTICE;
 }
 
 /** What Mod+L says instead of locking. */
