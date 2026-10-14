@@ -98,6 +98,12 @@ futures-lite = "2"
 # the timer of the executor zbus runs on, the version zbus already pulls in.
 async-io = "2"
 
+[target.'cfg(windows)'.dependencies]
+# D.4a T77: the process DACL, the fault dialog and the key's page (src/harden.rs). The version
+# Tauri's own crates already pull in (desktop/Cargo.lock), so no package is new.
+# SystemInformation and WindowsProgramming: O4's clock pair (`ops/mod.rs`, Task 14).
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Diagnostics_Debug", "Win32_System_Memory", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_System_WindowsProgramming"] }
+
 [dev-dependencies]
 # The mock runtime for tests/ipc_mock.rs and tests/app_menu.rs.
 tauri       = { workspace = true, features = ["test"] }

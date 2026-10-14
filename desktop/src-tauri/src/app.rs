@@ -60,6 +60,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use apprafter_core::lock::HolderHardening;
 use apprafter_core::Context;
 use apprafter_desktop_ipc::{
     AppInfo, LockReason, LockState, OpId, Os, Quitting, SessionEvents, Settings, SubscriptionId,
@@ -119,6 +120,21 @@ pub const SESSION_LATE_POLL: Duration = Duration::from_millis(250);
 
 /// What the OS session watch calls with each signal.
 pub type SessionCallback = Box<dyn Fn(SessionEvent) + Send>;
+
+/// What only the running app knows of itself, given to [`Shell::new_with`] (`lib.rs`); every
+/// test's shell takes the default — nothing hardened, so nothing claimed.
+pub struct ShellExtras {
+    /// What the process did to protect itself before any secret (D.4a T77, `harden`).
+    pub hardening: HolderHardening,
+}
+
+impl Default for ShellExtras {
+    fn default() -> Self {
+        ShellExtras {
+            hardening: crate::harden::not_applied(),
+        }
+    }
+}
 
 /// The OS session watch as the shell keeps it: `apprafter_os_auth::SessionWatch` in the app, a
 /// stand-in in the tests. Dropping it stops the watch, waiting for a callback in progress.
@@ -313,6 +329,8 @@ pub struct Shell {
     /// The native window's theme ([`crate::theme`]): `theme_apply`'s, and on Linux the
     /// desktop's colour scheme under System.
     pub appearance: Arc<Appearance>,
+    /// What only the running app knows of itself ([`ShellExtras`]).
+    extras: ShellExtras,
 }
 
 /// The tickers' stop signal: a ticker waits on it between ticks, so stopping wakes it at once.
@@ -395,6 +413,30 @@ impl Shell {
         test_build: bool,
         on_lock_change: impl Fn(&LockState) + Send + Sync + 'static,
     ) -> Arc<Self> {
+        Self::new_with(
+            settings,
+            auth,
+            clock,
+            context,
+            tools,
+            test_build,
+            ShellExtras::default(),
+            on_lock_change,
+        )
+    }
+
+    /// [`new`](Self::new), with what only the running app knows of itself (`extras`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with(
+        settings: SettingsStore,
+        auth: Arc<dyn Authenticator>,
+        clock: Arc<dyn Clock>,
+        context: Context,
+        tools: ToolSearchPath,
+        test_build: bool,
+        extras: ShellExtras,
+        on_lock_change: impl Fn(&LockState) + Send + Sync + 'static,
+    ) -> Arc<Self> {
         let ops = OperationManager::new(clock.clone());
         let drafts = Arc::new(DraftStore::new(clock.clone()));
         let hook: LockHook = {
@@ -427,6 +469,7 @@ impl Shell {
             stop: Stop::default(),
             session: Arc::default(),
             appearance,
+            extras,
         })
     }
 
@@ -455,6 +498,11 @@ impl Shell {
             test_build: self.test_build,
             settings_notice: self.settings.notice(),
         }
+    }
+
+    /// What the app's own process did to protect the store's key (D.4a T77), for `lock_info`.
+    pub fn app_hardening(&self) -> HolderHardening {
+        self.extras.hardening
     }
 
     /// What the OS reports of the session (`AppInfo.sessionEvents`), for doctor's

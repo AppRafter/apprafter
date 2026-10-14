@@ -8,6 +8,7 @@ pub mod commands;
 pub mod drafts;
 pub mod env;
 pub mod errors;
+pub mod harden;
 pub mod lock;
 pub mod menu;
 pub mod ops;
@@ -41,7 +42,9 @@ use crate::single_instance::SingleInstance;
 ///
 /// In order: on Linux, WebKitGTK's DMA-BUF renderer turned off under Wayland on NVIDIA's driver
 /// ([`env::turn_off_dmabuf_renderer_on_nvidia_wayland`]: the process restarts with it off,
-/// before anything else starts; logged once the log starts), the async runtime and the crypto
+/// before anything else starts; logged once the log starts), the process hardened
+/// ([`harden::harden_process`], D.4a T77: before anything of the app's, so before any secret), the
+/// async runtime and the crypto
 /// provider (before anything of Tauri's), the allow-listed environment, the app's identity and
 /// directories (a data-directory override moves every app directory and keys the
 /// single-instance lock on it; one set but empty or not Unicode stops the start,
@@ -80,6 +83,9 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     // with WebKitGTK's DMA-BUF renderer off, and nothing started before it would survive that.
     #[cfg(target_os = "linux")]
     let dmabuf_renderer = env::turn_off_dmabuf_renderer_on_nvidia_wayland();
+    // D.4a T77: before anything of the app's, so before any secret; after the restart above,
+    // which execs and would undo it.
+    let hardened = harden::harden_process();
     runtime::init_runtime()?;
     runtime::install_crypto();
     let env = AllowListEnv::from_process(cfg!(feature = "test-build"));
@@ -153,6 +159,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     #[cfg(target_os = "linux")]
     dmabuf_renderer.log();
     single_instance.log();
+    harden::log(&hardened);
     // macOS: the login shell is asked for the tools' PATH from here, on a thread of its own.
     let tools = env::tool_search_path(&env);
 
@@ -164,13 +171,16 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     let host = env::desktop_host(&tools, app.path().app_local_data_dir()?.join("run"));
     let context = env::desktop_context(&env, host)?;
     let handle = app.handle().clone();
-    let shell = app::Shell::new(
+    let shell = app::Shell::new_with(
         settings,
         auth,
         clock,
         context,
         tools,
         env.test_build(),
+        app::ShellExtras {
+            hardening: hardened.hardening,
+        },
         move |state| app::emit_lock_changed(&handle, state),
     );
     app::install(&app, &cell, shell.clone())?;
@@ -337,6 +347,51 @@ mod tests {
             _ => false,
         };
         assert!(appearance, "theme::start is given &shell.appearance");
+    }
+
+    /// D.4a T77: the process hardens itself before anything of the app's starts (after the
+    /// DMA-BUF restart, which execs and would undo it), so before any secret.
+    #[test]
+    fn run_hardens_the_process_first_and_logs_it_once_logging_is_up() {
+        let run = run_fn();
+        let stmts = &run.block.stmts;
+        let harden = stmts
+            .iter()
+            .position(|stmt| match stmt {
+                syn::Stmt::Local(local) => local.init.as_ref().is_some_and(|init| {
+                    matches!(&*init.expr, syn::Expr::Call(call)
+                        if matches!(&*call.func, syn::Expr::Path(p)
+                            if p.path.segments.iter().map(|s| s.ident.to_string()).collect::<Vec<_>>()
+                                == ["harden", "harden_process"]))
+                }),
+                _ => false,
+            })
+            .expect("run calls harden::harden_process");
+        let runtime = stmts
+            .iter()
+            .position(|stmt| {
+                called(stmt).is_some_and(|(path, _)| path == ["runtime", "init_runtime"])
+            })
+            .expect("run calls runtime::init_runtime");
+        assert!(
+            harden < runtime,
+            "harden at {harden}, init_runtime at {runtime}"
+        );
+        let logging = stmts
+            .iter()
+            .position(|stmt| {
+                matches!(stmt, syn::Stmt::Expr(syn::Expr::Match(m), _)
+                    if matches!(&*m.expr, syn::Expr::MethodCall(call) if call.method == "app_log_dir"))
+            })
+            .expect("run starts its log on app_log_dir");
+        let logged = stmts
+            .iter()
+            .position(|stmt| called(stmt).is_some_and(|(path, _)| path == ["harden", "log"]))
+            .expect("run logs the hardening");
+        assert!(
+            logging < logged,
+            "the log starts at {logging}, the hardening is logged at {logged}"
+        );
     }
 
     /// The DMA-BUF restart replaces the process: it is the first statement of `run`, before the
