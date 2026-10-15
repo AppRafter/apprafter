@@ -365,12 +365,20 @@ secrets are, with a link to the Security page.
   new read of a secret. A read already decrypting ends, and an operation you
   confirmed keeps what it already read but stops at its next secret. A sleep
   the computer does not report still locks the app: it notices the sleep
-  from its own clocks when the computer wakes, before any secret is used. A
-  change you confirmed before the lock — protecting, finishing, stopping
-  protection, or saving, renaming or removing a token — finishes with the
-  key it took once no other AppRafter program holds the store, or is
-  abandoned with nothing written if it cannot start within 30 seconds; that
-  key goes when the change ends.
+  from its own clocks when the computer wakes, before any secret is used.
+  Protecting, finishing or stopping protection that you confirmed before
+  the lock — with its secret typed, where it asks for one — finishes once no
+  other AppRafter program holds the store, or is abandoned with nothing
+  written if it cannot start within 30 seconds. A token change — saving,
+  renewing, renaming or removing a token — takes the store's key only when
+  it is about to write, after any check of a new token with Hetzner: a lock
+  before that, such as one while Hetzner is still checking the token,
+  abandons it with nothing written. One that has taken the key finishes as
+  protecting does, and that key goes when the change ends; a renewal
+  finishes only if the lock comes while it writes. A change still waiting
+  for a system prompt when the lock comes, confirmed at that very moment, or
+  confirmed with a wrong secret is not started. After you unlock, AppRafter
+  says how each one ended.
 - Meanwhile, in Settings › Lock, *Require unlock*, *Lock when the app starts*
   and *Lock when the computer sleeps or locks* stay on, and *Auto-lock after
   inactivity* offers no *Never*; *Require unlock* also says how the app now
