@@ -113,8 +113,14 @@ pub(super) fn cache_key_for_new_secret(
             path: age_key_path.to_path_buf(),
         })));
     }
-    if !held(store)?.is_empty() {
-        return Err(missing(target, age_key_path));
+    let held = held(store)?;
+    if !held.is_empty() {
+        return Err(CliError::AgeKeyMissing {
+            path: age_key_path.display().to_string(),
+            target: target.to_string(),
+            stopped: None,
+            lost_vault: lost_vaults(&held).map(|ids| ids.join(", ")),
+        });
     }
     Ok(NewCacheKey::FirstUse {
         path: age_key_path.to_path_buf(),
@@ -130,13 +136,58 @@ pub(super) fn create_shared_key(age_key_path: &Path) -> Result<bool> {
     load_or_create_identity_reporting(age_key_path).map(|(_, created)| created)
 }
 
-/// The missing-key error for `target`'s cache.
+/// The missing-key error for `target`'s cache, naming no vault: [`name_lost_vault`] does.
 fn missing(target: &str, age_key_path: &Path) -> CliError {
     CliError::AgeKeyMissing {
         path: age_key_path.display().to_string(),
         target: target.to_string(),
         stopped: None,
+        lost_vault: None,
     }
+}
+
+/// d4a-h F13's residue: an `age_key_missing` names the target store vaults what the store
+/// caches records it was encrypted to, when each cached secret records one ([`lost_vaults`], the
+/// rule `kubeconfig --refresh`'s explanation follows): no age key opens them, so its help names
+/// the vault, never the key file. Any other error, or a store whose caches cannot all be read,
+/// is left as it is: the general words never claim to know.
+pub(super) fn name_lost_vault(store: &TargetStorePaths, e: CliError) -> CliError {
+    match e {
+        CliError::AgeKeyMissing {
+            path,
+            target,
+            stopped,
+            lost_vault: None,
+        } => CliError::AgeKeyMissing {
+            path,
+            target,
+            stopped,
+            lost_vault: held(store)
+                .ok()
+                .and_then(|held| lost_vaults(&held).map(|ids| ids.join(", "))),
+        },
+        other => other,
+    }
+}
+
+/// F13: the ids of the target store vaults whose keys sealed what is `held`, when the state
+/// records one for every cached secret — `lock on` re-sealed them, and that vault is no longer
+/// here (the shared key is looked for only on a store in files). `None` when nothing is held,
+/// or any held item records nothing or its state cannot be read: then the general words, which
+/// never claim to know.
+pub fn lost_vaults(held: &[Held]) -> Option<Vec<&str>> {
+    let mut ids: Vec<&str> = Vec::new();
+    for h in held {
+        match (&h.what, &h.sealed_to) {
+            (Holding::Secret(_), Some(SealedTo::StoreVault { store_id })) => {
+                if !ids.contains(&store_id.as_str()) {
+                    ids.push(store_id);
+                }
+            }
+            _ => return None,
+        }
+    }
+    (!ids.is_empty()).then_some(ids)
 }
 
 /// One thing a target's state holds under the age key.

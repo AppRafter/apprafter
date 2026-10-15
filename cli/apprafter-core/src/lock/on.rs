@@ -448,16 +448,27 @@ fn survey(
                 target: target.clone(),
                 secret,
             });
+            // d4a-h F13's residue: a cache that records the vault it was sealed to — on a store
+            // in files, a vault that is gone — names it: no age key ever opened it.
+            let why = match h.sealed_to(secret) {
+                Some(SealedTo::StoreVault { store_id }) => format!(
+                    "it was encrypted to the key of a target store vault that is no longer here \
+                     (store id {store_id}), which no age key opens; if you still have that vault \
+                     and its `store.yaml`, put them back and unlock instead of going on"
+                ),
+                None => format!(
+                    "the age key at {} does not decrypt it (it was sealed to another key, or it \
+                     is damaged); put that key back and run `apprafter lock on` again",
+                    listed(keys)
+                ),
+            };
             changes.push(change(
                 "Cache",
                 target,
                 ChangeAction::Delete,
                 &format!(
-                    "its cached {}: the age key at {} does not decrypt it (it was sealed to \
-                     another key, or it is damaged); put that key back and run `apprafter lock \
-                     on` again, or go on: it is dropped, and `{}` fetches it again",
+                    "its cached {}: {why}, or go on: it is dropped, and `{}` fetches it again",
                     secret.noun(),
-                    listed(keys),
                     refresh(secret, target)
                 ),
             ));

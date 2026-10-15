@@ -226,10 +226,13 @@ enum Unready {
 /// Any other error is unchanged.
 fn after_provision(unready: Unready, target: &str, by: ProvisionedBy) -> CliError {
     match unready {
-        Unready::Failed(CliError::AgeKeyMissing { path, .. }) => CliError::AgeKeyMissing {
+        Unready::Failed(CliError::AgeKeyMissing {
+            path, lost_vault, ..
+        }) => CliError::AgeKeyMissing {
             path,
             target: target.to_string(),
             stopped: Some(ProvisionStop::After { by }),
+            lost_vault,
         },
         Unready::Failed(other) => other,
         Unready::TimedOut {
@@ -588,6 +591,7 @@ mod tests {
                 path: "/k/age.key".into(),
                 target: "prod".into(),
                 stopped: None,
+                lost_vault: None,
             })
         };
         let clock = FakeClock::new();
@@ -619,12 +623,13 @@ mod tests {
                     path: "/k/age.key".into(),
                     target: "prod".into(),
                     stopped: None,
+                    lost_vault: None,
                 }),
                 "prod",
                 by,
             );
             assert!(
-                matches!(&err, CliError::AgeKeyMissing { path, target, stopped }
+                matches!(&err, CliError::AgeKeyMissing { path, target, stopped, .. }
                     if path == "/k/age.key" && target == "prod"
                         && *stopped == Some(ProvisionStop::After { by })),
                 "{err:?}"

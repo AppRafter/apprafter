@@ -107,7 +107,11 @@ fn answer_lost_key(
     ask: &mut dyn FnMut(&LostKey) -> Result<()>,
 ) -> Result<()> {
     match policy {
-        LostKeyPolicy::Refuse => Err(age_cache::missing(&lost.target, &lost.key_path)),
+        LostKeyPolicy::Refuse => Err(age_cache::missing(
+            &lost.target,
+            &lost.key_path,
+            lost.lost_vaults().map(|ids| ids.join(", ")),
+        )),
         LostKeyPolicy::Ask { yes: true } => Ok(()),
         LostKeyPolicy::Ask { yes: false } => ask(lost),
     }
@@ -589,7 +593,7 @@ mod tests {
             serde_json::json!({"kubeconfig_age": armored_for(&Identity::generate(), "c\n")}),
         );
         let before = w.raw_state("prod");
-        let refusal = age_cache::missing("prod", &w.key);
+        let refusal = age_cache::missing("prod", &w.key, None);
         let (out, asked, fetched) = w.run(true, Err(refusal), Ok(FETCHED.into()));
         assert!(
             matches!(out.unwrap_err(), CliError::AgeKeyMissing { .. }),
@@ -786,6 +790,30 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, CliError::NewAgeKeyDeclined { .. }), "{err:?}");
         assert_eq!(asked, 1);
+    }
+
+    /// d4a-h F13's residue: `up`'s refusal of a lost key whose caches record the target store
+    /// vault they were sealed to names that vault, so its help never says "restore the age key
+    /// file".
+    #[test]
+    fn the_refusal_of_a_lost_key_names_a_lost_vault_its_caches_record() {
+        let lost = LostKey {
+            held: vec![age_cache::Held {
+                target: "prod".into(),
+                what: age_cache::Holding::Secret(CachedSecret::Kubeconfig),
+                sealed_to: Some(cli_state::SealedTo::StoreVault {
+                    store_id: "0123456789abcdef".into(),
+                }),
+            }],
+            ..lost_prod()
+        };
+        let mut never = |_: &LostKey| -> Result<()> { panic!("asked") };
+        let err = answer_lost_key(LostKeyPolicy::Refuse, &lost, &mut never).unwrap_err();
+        assert!(
+            matches!(&err, CliError::AgeKeyMissing { lost_vault: Some(id), .. }
+                if id == "0123456789abcdef"),
+            "{err:?}"
+        );
     }
 
     /// Review #5/#12: no, Esc and Ctrl-C at the question are one refusal, the typed decline;

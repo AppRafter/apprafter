@@ -254,6 +254,25 @@ fn a_refresh_after_a_lost_vault_names_the_vault_not_the_shared_key() {
         !doctor.contains("restore the key it was cached with"),
         "{doctor}"
     );
+    // d4a-h F13's residue (the re-walk's C-12 step 3): `argocd-password --refresh` reads the
+    // cached kubeconfig first, and its `age_key_missing` names the vault too, never "restore
+    // the age key file the cache was encrypted with".
+    let (code, _, stderr) = run(&sp, &["argocd-password", "--refresh", "--target", "prod"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    let said = stderr.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        said.contains("apprafter::secrets::age_key_missing"),
+        "{said}"
+    );
+    assert!(
+        said.contains(&format!(
+            "What this store caches was encrypted to the key of a target store vault that is no \
+             longer here (store id {}), not to an age key: no age key opens it.",
+            made.store_id
+        )),
+        "{said}"
+    );
+    assert!(!said.contains("Restore the age key file"), "{said}");
 }
 
 /// D.4a T66, §3.13 (d4a-f): `target show` names the vault, and opens nothing.

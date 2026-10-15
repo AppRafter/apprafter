@@ -145,7 +145,7 @@ fn a_read_with_no_key_is_age_key_missing_and_creates_no_key() {
         .cached_kubeconfig(&hetzner(Some("armored"), None), "prod")
         .unwrap_err();
     assert!(
-        matches!(&err, CliError::AgeKeyMissing { path, target, stopped: None }
+        matches!(&err, CliError::AgeKeyMissing { path, target, stopped: None, .. }
             if *path == key.display().to_string() && target == "prod"),
         "{err:?}"
     );
@@ -154,6 +154,44 @@ fn a_read_with_no_key_is_age_key_missing_and_creates_no_key() {
         Err(CliError::AgeKeyMissing { .. })
     ));
     assert!(absent(&key), "a read never writes");
+}
+
+/// d4a-h F13's residue (the re-walk's C-12 steps 3 and 4): with no shared key, a store whose
+/// every cached secret records the target store vault it was sealed to — on a store in files, a
+/// vault no longer here — names that vault in its `age_key_missing`, so the help never says
+/// "restore the age key file": a read (`cache_key`), the key for a new secret (`argocd-password
+/// --refresh`'s first step) and a new cache that may not create a key, alike. A cache that
+/// records nothing, beside it or alone, keeps the general words.
+#[test]
+fn a_missing_age_key_names_the_lost_vault_every_cache_records() {
+    let (_d, ctx) = store(&["prod"], None);
+    let s = ctx.secrets();
+    let vault = r#"{"kind":"store_vault","store_id":"0123456789abcdef"}"#;
+    let named = |e: cli_core::Result<()>| match e {
+        Err(CliError::AgeKeyMissing { lost_vault, .. }) => lost_vault,
+        other => panic!("{other:?}"),
+    };
+    let lost_vault = |body: &str| {
+        seed_state_raw(&ctx, "prod", body);
+        let read = named(s.cache_key("prod").map(drop));
+        let new = named(s.cache_key_for_new_secret("prod").map(drop));
+        let cache = named(
+            s.new_cache("prod", CachedSecret::ArgocdPassword, false)
+                .map(drop),
+        );
+        assert_eq!((&read, &new), (&cache, &cache), "{body}");
+        read
+    };
+    let both = format!(
+        r#"{{"hetzner_cloud":{{"server_id":1,"server_name":"p","kubeconfig_age":"a","kubeconfig_sealed_to":{vault},"argocd_admin_password_age":"b","argocd_admin_password_sealed_to":{vault}}}}}"#
+    );
+    assert_eq!(lost_vault(&both).as_deref(), Some("0123456789abcdef"));
+    let one = format!(
+        r#"{{"hetzner_cloud":{{"server_id":1,"server_name":"p","kubeconfig_age":"a","kubeconfig_sealed_to":{vault},"argocd_admin_password_age":"b"}}}}"#
+    );
+    assert_eq!(lost_vault(&one), None, "a cache that records nothing");
+    let none = r#"{"hetzner_cloud":{"server_id":1,"server_name":"p","kubeconfig_age":"a"}}"#;
+    assert_eq!(lost_vault(none), None);
 }
 
 #[test]

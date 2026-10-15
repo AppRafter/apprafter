@@ -225,7 +225,8 @@ fn ssh_key_not_public_help(source: &crate::ssh_key::KeySource) -> String {
 /// The help of `apprafter::secrets::age_key_missing` (WI-457): restore the key, or fetch the
 /// kubeconfig again under a new one. `target` is whose cache it is; `None` names a placeholder
 /// (the core's `AgeKeyMissing` carries no target). The CLI's help for the core's variant uses it
-/// too, so both say the same.
+/// too, so both say the same. A cache whose state records the target store vault it was
+/// encrypted to has [`age_key_missing_lost_vault_help`] instead.
 pub fn age_key_missing_help(target: Option<&str>) -> String {
     let target = target.unwrap_or("<name>");
     format!(
@@ -235,6 +236,36 @@ pub fn age_key_missing_help(target: Option<&str>) -> String {
          new key cannot read anything cached under the lost one, so the command lists those \
          secrets and asks before it creates the key."
     )
+}
+
+/// d4a-h F13's residue: `age_key_missing`'s help when every secret the store caches records the
+/// target store vault it was encrypted to (`vaults`, its store ids) — `lock on` re-sealed it
+/// there, and that vault is gone, since the shared key is looked for only on a store in files.
+/// No age key opens it, so the way back is that vault, or a new fetch for `target`: never
+/// "restore the age key file". The words are `kubeconfig --refresh`'s for the same case.
+pub fn age_key_missing_lost_vault_help(target: &str, vaults: &str) -> String {
+    format!(
+        "What this store caches was encrypted to the key of a target store vault that is no \
+         longer here (store id {vaults}), not to an age key: no age key opens it. If you still \
+         have that vault and its `store.yaml`, put them back and unlock. Otherwise `apprafter \
+         kubeconfig --refresh --target {target}` fetches the kubeconfig from the node again over \
+         SSH and caches it under a new key; it lists what the new key cannot read and asks first."
+    )
+}
+
+/// The way back a stopped `up` or `restore --reprovision` names first (WI-457), before the
+/// refetch: the age key file; or, when the caches record the target store vault they were
+/// encrypted to (`lost_vault`, F13's residue), that vault — no age key opens them.
+fn way_back(lost_vault: Option<&str>) -> String {
+    match lost_vault {
+        None => "restore the age key file the cache was encrypted with, or set \
+                 `APPRAFTER_AGE_KEY` to where it is. If the key is lost,"
+            .to_string(),
+        Some(vaults) => format!(
+            "put back the target store vault the cache was encrypted to (store id {vaults}) and \
+             its `store.yaml`, and unlock: no age key opens that cache. If that vault is lost,"
+        ),
+    }
 }
 
 /// The command that provisions a server and caches its kubeconfig under the age key: `up` or
@@ -299,31 +330,35 @@ pub enum ProvisionStop {
 /// - After provisioning: a server that bills, no cluster-bootstrap. The key back or
 ///   `kubeconfig --refresh` for this target, then the same command again, which finds the
 ///   server instead of creating another.
-fn age_key_missing_help_for(target: &str, stopped: Option<&ProvisionStop>) -> String {
-    match stopped {
-        None => age_key_missing_help(Some(target)),
-        Some(ProvisionStop::Before { by, recover }) => format!(
+fn age_key_missing_help_for(
+    target: &str,
+    stopped: Option<&ProvisionStop>,
+    lost_vault: Option<&str>,
+) -> String {
+    match (stopped, lost_vault) {
+        (None, None) => age_key_missing_help(Some(target)),
+        (None, Some(vaults)) => age_key_missing_lost_vault_help(target, vaults),
+        (Some(ProvisionStop::Before { by, recover }), _) => format!(
             "{} stopped before provisioning, so nothing was created. It caches the new \
              kubeconfig under the age key, and it does not create a new key in place of a \
-             missing one: a new key cannot read what target `{recover}` cached under the \
-             missing one. To go on, restore the age key file the cache was encrypted with, or \
-             set `APPRAFTER_AGE_KEY` to where it is. If the key is lost, `apprafter kubeconfig \
-             --refresh --target {recover}` fetches that target's kubeconfig from its node over \
-             SSH and caches it under a new key; it lists what the new key cannot read and asks \
-             first. Then {}.",
+             missing one: a new key cannot read what target `{recover}` cached before. To go \
+             on, {} `apprafter kubeconfig --refresh --target {recover}` fetches that target's \
+             kubeconfig from its node over SSH and caches it under a new key; it lists what the \
+             new key cannot read and asks first. Then {}.",
             by.command(),
+            way_back(lost_vault),
             by.again(target)
         ),
-        Some(ProvisionStop::After { by }) => format!(
+        (Some(ProvisionStop::After { by }), _) => format!(
             "{} stopped after provisioning: the server of target `{target}` exists, and Hetzner \
-             bills for it, but cluster-bootstrap did not run. To go on, restore the age key file \
-             the cache was encrypted with, or set `APPRAFTER_AGE_KEY` to where it is. If the key \
-             is lost, `apprafter kubeconfig --refresh --target {target}` fetches the kubeconfig \
-             from the node over SSH and caches it under a new key; it lists what the new key \
-             cannot read and asks first, and the node may need a few minutes after provisioning \
-             before it answers. Then {}: it finds the server it provisioned instead of creating \
-             another, and goes on with {}.",
+             bills for it, but cluster-bootstrap did not run. To go on, {} `apprafter \
+             kubeconfig --refresh --target {target}` fetches the kubeconfig from the node over \
+             SSH and caches it under a new key; it lists what the new key cannot read and asks \
+             first, and the node may need a few minutes after provisioning before it answers. \
+             Then {}: it finds the server it provisioned instead of creating another, and goes \
+             on with {}.",
             by.command(),
+            way_back(lost_vault),
             by.again(target),
             by.goes_on()
         ),
@@ -1462,7 +1497,10 @@ pub enum CliError {
     #[error("no age key at {path}; the cached secrets cannot be decrypted")]
     #[diagnostic(
         code(apprafter::secrets::age_key_missing),
-        help("{}", age_key_missing_help_for(target, stopped.as_ref()))
+        help(
+            "{}",
+            age_key_missing_help_for(target, stopped.as_ref(), lost_vault.as_deref())
+        )
     )]
     AgeKeyMissing {
         path: String,
@@ -1470,6 +1508,11 @@ pub enum CliError {
         /// Set when `up` or `restore --reprovision` stopped on the key, before provisioning or
         /// after: the help says what that leaves and how to go on.
         stopped: Option<ProvisionStop>,
+        /// d4a-h F13's residue: the store ids of the target store vaults the store's caches record
+        /// they were encrypted to, when each one records one (`SealedTo::StoreVault`). That vault is
+        /// gone — the shared key is looked for only on a store in files — so no age key opens
+        /// them, and the help names the vault, never "restore the age key file".
+        lost_vault: Option<String>,
     },
 
     /// An age key file that does not hold one key (WI-478). It is read as age-keygen writes it:
@@ -2734,6 +2777,7 @@ mod tests {
             path: "/k/age.key".into(),
             target: "prod".into(),
             stopped: None,
+            lost_vault: None,
         };
         assert_eq!(code_of(&err), "apprafter::secrets::age_key_missing");
         assert_eq!(
@@ -2771,6 +2815,7 @@ mod tests {
                 by,
                 recover: "staging".into(),
             }),
+            lost_vault: None,
         };
         for (by, stopped, again) in [
             (
@@ -2813,6 +2858,68 @@ mod tests {
         }
     }
 
+    /// d4a-h F13's residue (the re-walk's C-12 step 3): after a locked store's vault is lost, its
+    /// caches were encrypted to that vault, never to an age key. The help names the vault and
+    /// the way back — never "restore the age key file the cache was encrypted with" or
+    /// `APPRAFTER_AGE_KEY` — alone and when `up` or `restore --reprovision` stopped on it.
+    #[test]
+    fn a_missing_age_key_whose_caches_record_a_lost_vault_names_the_vault() {
+        let err = |stopped| CliError::AgeKeyMissing {
+            path: "/k/age.key".into(),
+            target: "prod".into(),
+            stopped,
+            lost_vault: Some("0123456789abcdef".into()),
+        };
+        let alone = help_of(&err(None));
+        assert_eq!(
+            alone,
+            age_key_missing_lost_vault_help("prod", "0123456789abcdef")
+        );
+        for part in [
+            "encrypted to the key of a target store vault that is no longer here (store id \
+             0123456789abcdef)",
+            "put them back and unlock",
+            "`apprafter kubeconfig --refresh --target prod`",
+        ] {
+            assert!(alone.contains(part), "{part:?} missing: {alone}");
+        }
+        let stops = [
+            Some(ProvisionStop::Before {
+                by: ProvisionedBy::Up,
+                recover: "prod".into(),
+            }),
+            Some(ProvisionStop::After {
+                by: ProvisionedBy::Up,
+            }),
+        ];
+        for stopped in &stops {
+            let help = help_of(&err(stopped.clone()));
+            assert!(
+                help.contains(
+                    "put back the target store vault the cache was encrypted to (store id \
+                     0123456789abcdef)"
+                ),
+                "{stopped:?}: {help}"
+            );
+            assert!(
+                help.contains("If that vault is lost"),
+                "{stopped:?}: {help}"
+            );
+        }
+        for help in [alone]
+            .into_iter()
+            .chain(stops.map(|stopped| help_of(&err(stopped))))
+        {
+            for wrong in [
+                "Restore the age key",
+                "restore the age key",
+                "APPRAFTER_AGE_KEY",
+            ] {
+                assert!(!help.contains(wrong), "{wrong:?} in: {help}");
+            }
+        }
+    }
+
     /// WI-457 review #6: after `up` or `restore --reprovision` provisioned the server, the help
     /// says the server exists and bills, that cluster-bootstrap did not run, and how to go on:
     /// the key back or `kubeconfig --refresh`, then the command that stopped, again. The message
@@ -2823,6 +2930,7 @@ mod tests {
             path: "/k/age.key".into(),
             target: "prod".into(),
             stopped: Some(ProvisionStop::After { by }),
+            lost_vault: None,
         };
         for (by, stopped, again) in [
             (

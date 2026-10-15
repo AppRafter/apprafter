@@ -24,16 +24,18 @@ use apprafter_core::secrets::SecretStore;
 use apprafter_core::Zeroizing;
 use cli_core::secrets::CachedSecret;
 use cli_core::{CliError, ProvisionStop, ProvisionedBy, Result};
-use cli_state::{HetznerCloudState, SealedTo};
+use cli_state::HetznerCloudState;
 
-pub(crate) use apprafter_core::secrets::{Held, Holding};
+pub(crate) use apprafter_core::secrets::{lost_vaults, Held, Holding};
 
-/// The missing-key error for `target`'s cache.
-pub(crate) fn missing(target: &str, key_path: &Path) -> CliError {
+/// The missing-key error for `target`'s cache; `lost_vault`, the target store vaults its caches
+/// record they were encrypted to (F13: then its help names them, never the key file).
+pub(crate) fn missing(target: &str, key_path: &Path, lost_vault: Option<String>) -> CliError {
     CliError::AgeKeyMissing {
         path: key_path.display().to_string(),
         target: target.to_string(),
         stopped: None,
+        lost_vault,
     }
 }
 
@@ -125,6 +127,7 @@ pub(crate) fn check_before_provisioning(
         path,
         target: target.to_string(),
         stopped: Some(ProvisionStop::Before { by, recover }),
+        lost_vault: lost_vaults(&held).map(|ids| ids.join(", ")),
     })
 }
 
@@ -157,19 +160,8 @@ impl LostKey {
     /// longer here (the shared key is looked for only on a store in files). `None` when any
     /// held item records nothing or its state cannot be read: then the general words, which
     /// never claim to know.
-    fn lost_vaults(&self) -> Option<Vec<&str>> {
-        let mut ids: Vec<&str> = Vec::new();
-        for h in &self.held {
-            match (&h.what, &h.sealed_to) {
-                (Holding::Secret(_), Some(SealedTo::StoreVault { store_id })) => {
-                    if !ids.contains(&store_id.as_str()) {
-                        ids.push(store_id);
-                    }
-                }
-                _ => return None,
-            }
-        }
-        (!ids.is_empty()).then_some(ids)
+    pub(crate) fn lost_vaults(&self) -> Option<Vec<&str>> {
+        lost_vaults(&self.held)
     }
 
     /// What the user reads before they agree: why the key matters, how to avoid a new one, and
@@ -282,6 +274,8 @@ pub(crate) fn note_outside_lock(ctx: &apprafter_core::Context, what: &str) {
 
 #[cfg(test)]
 mod tests {
+    use cli_state::SealedTo;
+
     use super::*;
     use apprafter_core::Context;
     use cli_core::secrets::load_or_create_identity;
@@ -359,6 +353,7 @@ mod tests {
                         by: ProvisionedBy::Up,
                         recover,
                     }),
+                lost_vault: None,
             }) if path == key.display().to_string() && t == target => recover,
             other => panic!("{target}: {other:?}"),
         };
@@ -388,6 +383,28 @@ mod tests {
         assert_eq!(recover("prod"), "c", "the first target that caches one");
         assert_eq!(recover("d"), "d", "the target itself when it caches one");
         assert!(!key.exists(), "a refusal creates no key");
+        // d4a-h F13's residue: caches that each record the target store vault they were sealed
+        // to name it in the refusal (its help: never "restore the age key file").
+        let lost_vault = || match check("prod") {
+            Err(CliError::AgeKeyMissing { lost_vault, .. }) => lost_vault,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            lost_vault(),
+            None,
+            "b's state cannot be read, c and d record nothing"
+        );
+        let vault = r#"{"kind":"store_vault","store_id":"0123456789abcdef"}"#;
+        for (name, n) in [("b", 2), ("c", 3), ("d", 4)] {
+            seed(
+                &s,
+                name,
+                Some(&format!(
+                    r#"{{"server_id":{n},"server_name":"{name}","kubeconfig_age":"x","kubeconfig_sealed_to":{vault}}}"#
+                )),
+            );
+        }
+        assert_eq!(lost_vault().as_deref(), Some("0123456789abcdef"));
 
         load_or_create_identity(&key).unwrap();
         check("prod").expect("the key is there");

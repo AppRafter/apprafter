@@ -1247,6 +1247,7 @@ pub mod samples {
                 path: s("/home/a/.config/apprafter/age.key"),
                 target: s("prod"),
                 stopped: None,
+                lost_vault: None,
             },
             C::AgeKeyMissing {
                 path: s("/home/a/.config/apprafter/age.key"),
@@ -1255,6 +1256,7 @@ pub mod samples {
                     by: cli_core::ProvisionedBy::RestoreReprovision,
                     recover: s("staging"),
                 }),
+                lost_vault: None,
             },
             C::AgeKeyMissing {
                 path: s("/home/a/.config/apprafter/age.key"),
@@ -1262,6 +1264,7 @@ pub mod samples {
                 stopped: Some(cli_core::ProvisionStop::After {
                     by: cli_core::ProvisionedBy::Up,
                 }),
+                lost_vault: None,
             },
             C::CacheUndecryptable {
                 secret: cli_core::secrets::CachedSecret::Kubeconfig,
@@ -2681,6 +2684,7 @@ mod tests {
             path: "/k/age.key".into(),
             target: "prod".into(),
             stopped: None,
+            lost_vault: None,
         });
         assert!(
             matches!(&e, CoreError::AgeKeyMissing { path } if path == "/k/age.key"),

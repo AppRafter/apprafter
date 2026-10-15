@@ -59,7 +59,7 @@ pub use access::FixedVaultAccess;
 pub use access::{
     DiagnosticAccess, KeySession, NoVaultAccess, VaultAccess, VaultRequest, VaultSession,
 };
-pub use files::{Held, Holding};
+pub use files::{lost_vaults, Held, Holding};
 pub use store_file::{
     read_store_file, write_store_file, LockSlotKind, SlotInfo, StoreFile, StoreId, STORE_FILE,
     STORE_FILE_FORMAT,
@@ -682,7 +682,8 @@ impl SecretStore {
     pub fn cache_key(&self, target: &str) -> cli_core::Result<CacheKey> {
         self.ensure_private()?;
         match self.state()? {
-            StoreState::Files => files::cache_key(&self.age_key_path, target),
+            StoreState::Files => files::cache_key(&self.age_key_path, target)
+                .map_err(|e| files::name_lost_vault(&self.store, e)),
             StoreState::Locked { file, id } => {
                 if self.age_key_overridden {
                     return Err(self.age_key_refused());
@@ -784,7 +785,7 @@ impl SecretStore {
                     let key = files::cache_key(&self.age_key_path, target)?;
                     (key, Settled::Files, created, None)
                 }
-                Err(e) => return Err(e),
+                Err(e) => return Err(files::name_lost_vault(&self.store, e)),
             },
             StoreState::Locked { id, .. } => {
                 let key = self.cache_key(target)?;

@@ -328,6 +328,50 @@ fn the_plan_lists_each_move_and_writes_nothing() {
     assert!(read_store_file(f.ctx.config_root()).unwrap().is_none());
 }
 
+/// d4a-h F13's residue (the re-walk's C-12 step 4): a cache no age key opens that records the
+/// target store vault it was sealed to — on a store in files, a vault no longer here — names that
+/// vault in the plan, never "put that key back" (no age key ever held it); one that records
+/// nothing keeps the general words.
+#[test]
+fn a_cache_sealed_to_a_lost_vault_names_the_vault_in_the_plan() {
+    let f = files_store();
+    let drop_of = |ctx: &Context| {
+        plan_on(ctx, None)
+            .unwrap()
+            .changes
+            .into_iter()
+            .find(|c| c.object == "staging" && c.action == ChangeAction::Delete)
+            .and_then(|c| c.detail)
+            .unwrap()
+    };
+    let named = drop_of(&f.ctx);
+    assert!(
+        named.contains(
+            "it was encrypted to the key of a target store vault that is no longer here (store \
+             id 0123456789abcdef), which no age key opens; if you still have that vault and its \
+             `store.yaml`, put them back and unlock instead of going on, or go on: it is \
+             dropped, and `apprafter argocd-password --refresh --target staging` fetches it again"
+        ),
+        "{named}"
+    );
+    assert!(!named.contains("put that key back"), "{named}");
+    assert!(!named.contains("does not decrypt it"), "{named}");
+    let mut h = hetzner_of(&f.ctx, "staging");
+    h.argocd_admin_password_sealed_to = None;
+    State {
+        hetzner_cloud: Some(h),
+        ..Default::default()
+    }
+    .save(&StatePaths::for_active_target(&f.ctx.store(), "staging"))
+    .unwrap();
+    let general = drop_of(&f.ctx);
+    assert!(
+        general.contains("does not decrypt it (it was sealed to another key, or it is damaged)"),
+        "{general}"
+    );
+    assert!(general.contains("put that key back"), "{general}");
+}
+
 /// T36: a credentials file or a state that cannot be read may hold the only copy of a secret:
 /// the plan stops at it.
 #[test]
