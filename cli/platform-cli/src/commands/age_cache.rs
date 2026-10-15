@@ -24,7 +24,7 @@ use apprafter_core::secrets::SecretStore;
 use apprafter_core::Zeroizing;
 use cli_core::secrets::CachedSecret;
 use cli_core::{CliError, ProvisionStop, ProvisionedBy, Result};
-use cli_state::HetznerCloudState;
+use cli_state::{HetznerCloudState, SealedTo};
 
 pub(crate) use apprafter_core::secrets::{Held, Holding};
 
@@ -152,21 +152,57 @@ pub(crate) struct LostKey {
 }
 
 impl LostKey {
+    /// F13: the ids of the target store vaults whose keys sealed what is held, when the state
+    /// records one for every cached secret — `lock on` re-sealed them, and that vault is no
+    /// longer here (the shared key is looked for only on a store in files). `None` when any
+    /// held item records nothing or its state cannot be read: then the general words, which
+    /// never claim to know.
+    fn lost_vaults(&self) -> Option<Vec<&str>> {
+        let mut ids: Vec<&str> = Vec::new();
+        for h in &self.held {
+            match (&h.what, &h.sealed_to) {
+                (Holding::Secret(_), Some(SealedTo::StoreVault { store_id })) => {
+                    if !ids.contains(&store_id.as_str()) {
+                        ids.push(store_id);
+                    }
+                }
+                _ => return None,
+            }
+        }
+        (!ids.is_empty()).then_some(ids)
+    }
+
     /// What the user reads before they agree: why the key matters, how to avoid a new one, and
     /// what a new one leaves unreadable.
     pub(crate) fn explain(&self) -> String {
         let key = self.key_path.display();
-        let mut out = format!(
-            "The age key at {key} is missing, so nothing cached under it can be decrypted.\n\
-             If you still have that key, put it back there, or set APPRAFTER_AGE_KEY to where \
-             it is, instead of going on.\n\
-             Going on creates a new age key at {key}, fetches the kubeconfig of target `{}` \
+        let mut out = match self.lost_vaults() {
+            Some(ids) => format!(
+                "What this store caches was encrypted to the key of a target store vault that is \
+                 no longer here (store id {}), not to the age key at {key}: no key put there \
+                 opens it.\n\
+                 If you still have that vault and its `store.yaml`, put them back and unlock \
+                 instead of going on.\n",
+                ids.join(", ")
+            ),
+            None => format!(
+                "The age key at {key} is missing, so nothing cached under it can be decrypted.\n\
+                 If you still have that key, put it back there, or set APPRAFTER_AGE_KEY to \
+                 where it is, instead of going on.\n"
+            ),
+        };
+        let _ = write!(
+            out,
+            "Going on creates a new age key at {key}, fetches the kubeconfig of target `{}` \
              from its node again over SSH, and caches it under the new key.",
             self.target
         );
         let lines = self.unreadable_lines();
         if !lines.is_empty() {
-            out.push_str(" The new key cannot read what the lost one encrypted:\n");
+            out.push_str(match self.lost_vaults() {
+                Some(_) => " The new key cannot read what the lost vault's key encrypted:\n",
+                None => " The new key cannot read what the lost one encrypted:\n",
+            });
             out.push_str(&lines);
         } else {
             out.push('\n');
@@ -183,7 +219,10 @@ impl LostKey {
         );
         let lines = self.unreadable_lines();
         if !lines.is_empty() {
-            out.push_str("Cached under the lost key, and unreadable now:\n");
+            out.push_str(match self.lost_vaults() {
+                Some(_) => "Cached under the lost vault's key, and unreadable now:\n",
+                None => "Cached under the lost key, and unreadable now:\n",
+            });
             out.push_str(&lines);
         }
         out
@@ -402,22 +441,27 @@ mod tests {
                 Held {
                     target: "prod".into(),
                     what: Holding::Secret(CachedSecret::Kubeconfig),
+                    sealed_to: None,
                 },
                 Held {
                     target: "prod".into(),
                     what: Holding::Secret(CachedSecret::ArgocdPassword),
+                    sealed_to: None,
                 },
                 Held {
                     target: "staging".into(),
                     what: Holding::Secret(CachedSecret::Kubeconfig),
+                    sealed_to: None,
                 },
                 Held {
                     target: "staging".into(),
                     what: Holding::Secret(CachedSecret::ArgocdPassword),
+                    sealed_to: None,
                 },
                 Held {
                     target: "x".into(),
                     what: Holding::Unreadable("bad json".into()),
+                    sealed_to: None,
                 },
             ],
         };
@@ -458,6 +502,7 @@ mod tests {
             held: vec![Held {
                 target: "prod".into(),
                 what: Holding::Secret(CachedSecret::Kubeconfig),
+                sealed_to: None,
             }],
             ..lost
         };
@@ -467,5 +512,73 @@ mod tests {
             "{}",
             alone.after()
         );
+    }
+    /// F13: every cached secret the store holds was sealed to a target store vault's key that
+    /// is no longer here (`#locked-store-lost`): the words say so, and never send the person
+    /// after a shared key that held none of it. One cache that records nothing — sealed to the
+    /// shared key — and the general words stand.
+    #[test]
+    fn a_lost_key_beside_caches_sealed_to_a_lost_vault_names_the_vault() {
+        let vault = || {
+            Some(SealedTo::StoreVault {
+                store_id: "3f9c0a1b7d2e4c56".into(),
+            })
+        };
+        let lost = LostKey {
+            key_path: PathBuf::from("/k/age.key"),
+            target: "h".into(),
+            held: vec![
+                Held {
+                    target: "h".into(),
+                    what: Holding::Secret(CachedSecret::Kubeconfig),
+                    sealed_to: vault(),
+                },
+                Held {
+                    target: "h".into(),
+                    what: Holding::Secret(CachedSecret::ArgocdPassword),
+                    sealed_to: vault(),
+                },
+            ],
+        };
+        let explain = lost.explain();
+        for part in [
+            "encrypted to the key of a target store vault that is no longer here (store id \
+             3f9c0a1b7d2e4c56), not to the age key at /k/age.key: no key put there opens it.",
+            "If you still have that vault and its `store.yaml`, put them back and unlock",
+            "Going on creates a new age key at /k/age.key",
+            "The new key cannot read what the lost vault's key encrypted:\n",
+            "  - target `h`: the Argo CD admin password",
+        ] {
+            assert!(explain.contains(part), "{part:?} missing:\n{explain}");
+        }
+        assert!(
+            !explain.contains("If you still have that key")
+                && !explain.contains("APPRAFTER_AGE_KEY"),
+            "{explain}"
+        );
+        assert!(
+            lost.after()
+                .contains("Cached under the lost vault's key, and unreadable now:\n"),
+            "{}",
+            lost.after()
+        );
+
+        let mixed = LostKey {
+            held: vec![
+                lost.held[0].clone(),
+                Held {
+                    sealed_to: None,
+                    ..lost.held[1].clone()
+                },
+            ],
+            ..lost.clone()
+        };
+        let general = mixed.explain();
+        assert!(
+            general.starts_with("The age key at /k/age.key is missing")
+                && general.contains("If you still have that key, put it back there"),
+            "{general}"
+        );
+        assert!(!general.contains("no longer here"), "{general}");
     }
 }

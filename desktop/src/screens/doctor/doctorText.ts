@@ -146,6 +146,10 @@ export function fixText(check: Check, target: string | null): string | null {
         : `Replace the unencrypted copy with an encrypted one: ${kubeconfigCommand(fix.target, true)}.`;
     case 'age_key_missing':
       // No command (WI-457): the way back from a lost key is the CLI's, described as what it does.
+      // F13: a cache sealed to a target store vault no longer here sends nobody after that key.
+      if (fix.sealedToLostVault) {
+        return `The cached kubeconfig was encrypted to the key of a target store vault that is no longer here, not to the age key at ${fix.path}: no key put there opens it. If you still have that vault and its store.yaml, put them back and unlock; otherwise fetching the kubeconfig from the server again caches it under a new key, and what was cached under the lost vault's key has to be fetched again too.`;
+      }
       return `There is no age key at ${fix.path}, so the cached kubeconfig cannot be decrypted: restore the key it was cached with. If the key is lost, fetching the kubeconfig from the server again caches it under a new key, and what was cached under the lost one has to be fetched again too.`;
     case 'cache_undecryptable':
       // No command either (WI-457 review #8): what a lost key replaced by a new one leaves on

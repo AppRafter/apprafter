@@ -34,8 +34,8 @@ const TOKEN_C: &str = "ddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
 
 /// A store in files: `prod` (TOKEN_A) caches its kubeconfig and password under the shared key,
 /// with a stale plaintext kubeconfig beside them; `staging` (TOKEN_B) caches a plaintext
-/// kubeconfig and a password no key here opens. The context runs the flows under the fast
-/// policy, its permit the scratch dir.
+/// kubeconfig and a password no key here opens, recorded as sealed to a vault no longer here
+/// (F13). The context runs the flows under the fast policy, its permit the scratch dir.
 pub(super) struct Files {
     pub dir: tempfile::TempDir,
     pub ctx: Context,
@@ -73,6 +73,7 @@ pub(super) fn files_store() -> Files {
             "server_id": 2, "server_name": "s",
             "kubeconfig_yaml": YAML,
             "argocd_admin_password_age": encrypt_for_recipient(PW, &foreign.to_public()).unwrap(),
+            "argocd_admin_password_sealed_to": {"kind": "store_vault", "store_id": "0123456789abcdef"},
         }),
     );
     Files { dir, ctx }
@@ -236,6 +237,26 @@ pub(super) fn assert_locked_whole(ctx: &Context, secret: &str) {
     assert!(
         staging.argocd_admin_password_age.is_none(),
         "the cache no key opens was dropped"
+    );
+    // F13: each cache sealed to the store's key says so; the dropped one has no record.
+    let vault = Some(cli_state::SealedTo::StoreVault {
+        store_id: file.id.as_ref().unwrap().as_str().to_string(),
+    });
+    assert_eq!(
+        (
+            &prod.kubeconfig_sealed_to,
+            &prod.argocd_admin_password_sealed_to
+        ),
+        (&vault, &vault),
+        "prod"
+    );
+    assert_eq!(
+        (
+            &staging.kubeconfig_sealed_to,
+            &staging.argocd_admin_password_sealed_to
+        ),
+        (&vault, &None),
+        "staging: its plaintext kubeconfig sealed, its password dropped"
     );
     for needle in [TOKEN_A, TOKEN_B, "apiVersion: v1", "clusters: [stale]", PW] {
         assert!(
@@ -419,6 +440,57 @@ fn an_interruption_at_every_step_loses_nothing_and_a_rerun_finishes() {
         };
         assert_locked_whole(&f.ctx, &secret);
     }
+}
+
+/// F13: a resume meets caches sealed to the store's key already — by the interrupted run, or by
+/// an older AppRafter that recorded nothing — and records them so all the same.
+#[test]
+fn a_resume_records_caches_already_sealed_to_the_store_s_key() {
+    let f = files_store();
+    let plan = plan_on(&f.ctx, None).unwrap();
+    let (input, shown) = new_input();
+    let e = execute_on(
+        &f.ctx.clone().with_fault(FaultPoint::AfterCachesTarget(1)),
+        plan,
+        input,
+        &NullReporter,
+        &CancellationToken::new(),
+    )
+    .unwrap_err();
+    assert!(e.to_string().contains("injected fault"), "{e}");
+    for target in ["prod", "staging"] {
+        let mut h = hetzner_of(&f.ctx, target);
+        assert!(h.kubeconfig_age.is_some(), "{target}");
+        h.kubeconfig_sealed_to = None;
+        h.argocd_admin_password_sealed_to = None;
+        seed(&f.ctx, target, serde_json::to_value(&h).unwrap());
+    }
+    let plan = plan_on(&f.ctx, None).unwrap();
+    let LockOnStart::Resume { id } = plan.payload.start().clone() else {
+        panic!("{:?}", plan.payload.start());
+    };
+    let slot = |kind, secret: &str| {
+        open_slot_at(
+            f.ctx.config_root(),
+            &id,
+            kind,
+            SecretString::new(secret),
+            &KdfPolicy::INSECURE_FAST,
+        )
+        .unwrap()
+    };
+    execute_on(
+        &f.ctx,
+        plan,
+        LockOnInput::Resume {
+            password: slot(LockSlotKind::Password, PASSWORD),
+            recovery: slot(LockSlotKind::RecoveryKey, shown.as_str()),
+        },
+        &NullReporter,
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    assert_locked_whole(&f.ctx, &shown);
 }
 
 /// Critic G2: a resume never writes a marker over a clear token the vault does not hold — one an

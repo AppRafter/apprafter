@@ -159,6 +159,8 @@ fn build_snapshot(client: &HetznerCloudClient, cluster: &str) -> Result<Option<H
         kubeconfig_yaml: None,
         kubeconfig_age: None,
         argocd_admin_password_age: None,
+        kubeconfig_sealed_to: None,
+        argocd_admin_password_sealed_to: None,
     }))
 }
 
@@ -431,6 +433,8 @@ mod tests {
             kubeconfig_yaml: None,
             kubeconfig_age: None,
             argocd_admin_password_age: None,
+            kubeconfig_sealed_to: None,
+            argocd_admin_password_sealed_to: None,
         };
         print_summary(true, "cl", &s);
         print_summary(false, "cl", &s);

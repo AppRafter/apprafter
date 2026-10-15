@@ -56,6 +56,13 @@ fn lock_state(ctx: &Context, secrets: SecretsMode, with_id: Option<&str>) {
     .unwrap();
 }
 
+/// F13: the record of a cache sealed to the vault of the store with `id`.
+fn vault_record(id: &str) -> cli_state::SealedTo {
+    cli_state::SealedTo::StoreVault {
+        store_id: id.to_string(),
+    }
+}
+
 fn hetzner(age: Option<&str>, yaml: Option<&str>) -> HetznerCloudState {
     serde_json::from_value(serde_json::json!({
         "server_id": 1, "server_name": "n", "kubeconfig_age": age, "kubeconfig_yaml": yaml,
@@ -1425,12 +1432,16 @@ fn a_cache_write_in_files_seals_to_the_shared_key_and_keeps_the_other_slot() {
     let new = s
         .new_cache("prod", CachedSecret::Kubeconfig, false)
         .unwrap();
-    // Another writer, between the key and the lock: its slot must stay.
+    // Another writer, between the key and the lock: its slot must stay. F13: the kubeconfig's
+    // record from a lock this store had once goes with the slot it replaces; the other slot's
+    // record stays with it.
     let pw = encrypt_for_recipient("pw", &shared.to_public()).unwrap();
     State {
         hetzner_cloud: Some(HetznerCloudState {
             argocd_admin_password_age: Some(pw.clone()),
+            argocd_admin_password_sealed_to: Some(vault_record("0123456789abcdef")),
             kubeconfig_yaml: Some("stale".into()),
+            kubeconfig_sealed_to: Some(vault_record("0123456789abcdef")),
             ..hetzner(None, None)
         }),
         ..Default::default()
@@ -1445,6 +1456,15 @@ fn a_cache_write_in_files_seals_to_the_shared_key_and_keeps_the_other_slot() {
         .unwrap()
         .hetzner_cloud
         .unwrap();
+    assert_eq!(
+        h.kubeconfig_sealed_to, None,
+        "the shared key records nothing"
+    );
+    assert_eq!(
+        h.argocd_admin_password_sealed_to,
+        Some(vault_record("0123456789abcdef")),
+        "the other slot's record stays with it"
+    );
     assert_eq!(h.argocd_admin_password_age.as_deref(), Some(pw.as_str()));
     assert!(h.kubeconfig_yaml.is_none(), "the plaintext slot is cleared");
     assert_eq!(
@@ -1477,7 +1497,7 @@ fn a_shared_key_is_created_only_when_allowed() {
 /// is never created — and this client keeps the plaintext for the rest of the command.
 #[test]
 fn a_locked_store_seals_to_its_own_key_and_remembers_the_plaintext() {
-    let (dir, ctx, _made) = locked(&[("prod", Some(TOKEN_A))]);
+    let (dir, ctx, made) = locked(&[("prod", Some(TOKEN_A))]);
     let remembering = Arc::new(Remembering {
         inner: ctx.vault_access().clone(),
         kept: std::sync::Mutex::new(Vec::new()),
@@ -1512,6 +1532,12 @@ fn a_locked_store_seals_to_its_own_key_and_remembers_the_plaintext() {
     assert_eq!(kept.len(), 1);
     assert_eq!(kept[0].0.as_str(), h.kubeconfig_age.as_deref().unwrap());
     assert_eq!(kept[0].1, YAML);
+    // F13: sealed to this store's vault, and recorded so.
+    assert_eq!(
+        h.kubeconfig_sealed_to,
+        Some(vault_record(made.store_id.as_str()))
+    );
+    assert_eq!(h.argocd_admin_password_sealed_to, None);
     drop(dir);
 }
 
@@ -1576,6 +1602,7 @@ fn a_locked_refresh_drops_a_password_cache_its_key_cannot_open() {
         State {
             hetzner_cloud: Some(HetznerCloudState {
                 argocd_admin_password_age: Some(encrypt_for_recipient("pw", &to).unwrap()),
+                argocd_admin_password_sealed_to: Some(vault_record(made.store_id.as_str())),
                 ..hetzner(None, None)
             }),
             ..Default::default()
@@ -1594,6 +1621,12 @@ fn a_locked_refresh_drops_a_password_cache_its_key_cannot_open() {
             .unwrap();
         assert_eq!(
             h.argocd_admin_password_age.is_none(),
+            foreign,
+            "foreign: {foreign}"
+        );
+        // F13: a dropped slot takes its record with it; a kept one keeps it.
+        assert_eq!(
+            h.argocd_admin_password_sealed_to.is_none(),
             foreign,
             "foreign: {foreign}"
         );
@@ -1617,6 +1650,8 @@ fn a_replaced_key_drops_the_other_cache_it_cannot_open() {
                 argocd_admin_password_age: Some(
                     encrypt_for_recipient("pw", &lost.to_public()).unwrap(),
                 ),
+                // F13: sealed to a vault no longer here (`#locked-store-lost`).
+                argocd_admin_password_sealed_to: Some(vault_record("0123456789abcdef")),
                 ..hetzner(None, None)
             }),
             ..Default::default()
@@ -1635,6 +1670,11 @@ fn a_replaced_key_drops_the_other_cache_it_cannot_open() {
             h.argocd_admin_password_age.is_none(),
             replaced,
             "replaced: {replaced}"
+        );
+        assert_eq!(
+            h.argocd_admin_password_sealed_to.is_none(),
+            replaced,
+            "the dropped slot's record goes with it: replaced {replaced}"
         );
     }
 }

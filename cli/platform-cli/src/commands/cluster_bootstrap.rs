@@ -2647,6 +2647,8 @@ mod tests {
                     kubeconfig_yaml: Some(format!("apiVersion: v1\nkind: Config\n# {marker}\n")),
                     kubeconfig_age: None,
                     argocd_admin_password_age: None,
+                    kubeconfig_sealed_to: None,
+                    argocd_admin_password_sealed_to: None,
                 }),
                 ..Default::default()
             };
@@ -2814,6 +2816,8 @@ mod tests {
                 kubeconfig_yaml: Some("apiVersion: v1\nkind: Config\n# SOLO-CLUSTER\n".into()),
                 kubeconfig_age: None,
                 argocd_admin_password_age: None,
+                kubeconfig_sealed_to: None,
+                argocd_admin_password_sealed_to: None,
             }),
             ..Default::default()
         }

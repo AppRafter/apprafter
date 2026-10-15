@@ -259,12 +259,13 @@ fn held_lists_every_targets_ciphertexts_in_order_and_an_unreadable_state() {
     let secret = |t: &str, s| Held {
         target: t.into(),
         what: Holding::Secret(s),
+        sealed_to: None,
     };
     assert_eq!(held.len(), 3, "{held:?}");
     assert_eq!(held[0], secret("b", CachedSecret::Kubeconfig));
     assert_eq!(held[1], secret("b", CachedSecret::ArgocdPassword));
     assert!(
-        matches!(&held[2], Held { target, what: Holding::Unreadable(_) } if target == "d"),
+        matches!(&held[2], Held { target, what: Holding::Unreadable(_), .. } if target == "d"),
         "{held:?}"
     );
 }

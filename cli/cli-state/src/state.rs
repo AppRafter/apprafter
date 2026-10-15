@@ -54,6 +54,7 @@
 
 use std::path::{Path, PathBuf};
 
+use cli_core::secrets::CachedSecret;
 use cli_core::{target::TargetStorePaths, CliError, Result, Tier};
 use serde::{Deserialize, Serialize};
 
@@ -400,6 +401,50 @@ pub struct HetznerCloudState {
     /// Populated by `apprafter argocd-password` on first call.
     #[serde(default)]
     pub argocd_admin_password_age: Option<String>,
+    /// What sealed `kubeconfig_age`, when not the shared age key (F13): set and cleared with
+    /// the slot by every writer, so a lost key's words can say which key that was. Absent is
+    /// the shared age key — and what an older AppRafter wrote, which records nothing; an older
+    /// one that rewrites this file drops it, and the words fall back to the general ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kubeconfig_sealed_to: Option<SealedTo>,
+    /// What sealed `argocd_admin_password_age`, as `kubeconfig_sealed_to`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub argocd_admin_password_sealed_to: Option<SealedTo>,
+}
+
+/// The key a cached secret was sealed to, when it was not the shared age key (F13). A store id
+/// only, never a key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SealedTo {
+    /// The key of the target store vault with this id: `lock on` re-sealed the cache to it, or
+    /// it was cached while that store was locked.
+    StoreVault { store_id: String },
+}
+
+impl HetznerCloudState {
+    /// `secret`'s cache slot and the record of what sealed it, together: a writer that changes
+    /// one has the other in hand (F13).
+    pub fn cache_mut(
+        &mut self,
+        secret: CachedSecret,
+    ) -> (&mut Option<String>, &mut Option<SealedTo>) {
+        match secret {
+            CachedSecret::Kubeconfig => (&mut self.kubeconfig_age, &mut self.kubeconfig_sealed_to),
+            CachedSecret::ArgocdPassword => (
+                &mut self.argocd_admin_password_age,
+                &mut self.argocd_admin_password_sealed_to,
+            ),
+        }
+    }
+
+    /// What sealed `secret`'s cache, as recorded (`None`: the shared age key, or not recorded).
+    pub fn sealed_to(&self, secret: CachedSecret) -> Option<&SealedTo> {
+        match secret {
+            CachedSecret::Kubeconfig => self.kubeconfig_sealed_to.as_ref(),
+            CachedSecret::ArgocdPassword => self.argocd_admin_password_sealed_to.as_ref(),
+        }
+    }
 }
 
 impl State {

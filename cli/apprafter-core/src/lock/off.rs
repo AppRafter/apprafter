@@ -723,7 +723,9 @@ fn unlock(
 /// never re-sealed by an interrupted `lock on`); one the vault's key opens re-sealed to the
 /// shared key and checked; one neither opens dropped and listed on an unlock (T37, as the plan
 /// said), but left and listed on a back-out of `lock on` (`phase` locking), which had not
-/// touched it (critic G5, finding 10). A damaged one is named so (rule 3).
+/// touched it (critic G5, finding 10). A damaged one is named so (rule 3). F13: a cache the
+/// shared key opens — re-sealed or skipped — records nothing (the shared key is the unrecorded
+/// default); a dropped one loses its record; a left one keeps whatever it had.
 fn reseal(
     store: &TargetStorePaths,
     target: &str,
@@ -739,20 +741,21 @@ fn reseal(
     };
     let mut changed = false;
     for secret in [CachedSecret::Kubeconfig, CachedSecret::ArgocdPassword] {
-        let slot = match secret {
-            CachedSecret::Kubeconfig => &mut h.kubeconfig_age,
-            CachedSecret::ArgocdPassword => &mut h.argocd_admin_password_age,
-        };
+        let (slot, record) = h.cache_mut(secret);
         let Some(armored) = slot.clone() else {
             continue;
         };
         let under_shared = transfer::opened_by(shared, secret, &armored)?;
         if let Opened::Plain(_) = under_shared {
+            if record.take().is_some() {
+                changed = true;
+            }
             continue;
         }
         let under_vault = transfer::opened_by(vault_key, secret, &armored)?;
         if let Opened::Plain(plain) = &under_vault {
             *slot = Some(sealed_and_checked(store, shared, secret, target, plain)?);
+            *record = None;
             changed = true;
             done.caches_resealed += 1;
             continue;
@@ -772,6 +775,7 @@ fn reseal(
             ));
         } else {
             *slot = None;
+            *record = None;
             changed = true;
             done.caches_dropped.push(dropped(
                 target,

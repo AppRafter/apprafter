@@ -80,6 +80,19 @@ fn assert_files_whole(ctx: &Context) {
             .as_str(),
         YAML
     );
+    // F13: under the shared key, which records nothing. staging's password, which no key
+    // here opens, is either gone with its record or left with it (a back-out).
+    assert_eq!(
+        (
+            &prod.kubeconfig_sealed_to,
+            &prod.argocd_admin_password_sealed_to,
+            &staging.kubeconfig_sealed_to
+        ),
+        (&None, &None, &None)
+    );
+    if staging.argocd_admin_password_age.is_none() {
+        assert_eq!(staging.argocd_admin_password_sealed_to, None);
+    }
 }
 
 #[test]
@@ -288,6 +301,14 @@ fn lock_off_backs_out_of_an_interrupted_lock_on() {
                 .argocd_admin_password_age
                 .is_none(),
             dropped_by_lock_on,
+            "{at:?}"
+        );
+        // F13: a cache the back-out leaves keeps its record; a dropped one lost it.
+        assert_eq!(
+            hetzner_of(&f.ctx, "staging").argocd_admin_password_sealed_to,
+            (!dropped_by_lock_on).then(|| cli_state::SealedTo::StoreVault {
+                store_id: "0123456789abcdef".into()
+            }),
             "{at:?}"
         );
         let left: Vec<(&str, &str)> = done
@@ -646,6 +667,28 @@ fn an_unlock_drops_a_cache_no_key_opens_and_the_plan_names_it() {
         .argocd_admin_password_age
         .is_none());
     assert!(hetzner_of(&f.ctx, "staging").kubeconfig_age.is_none());
+    // F13: a dropped cache takes its record with it.
+    assert_eq!(
+        hetzner_of(&f.ctx, "prod").argocd_admin_password_sealed_to,
+        None
+    );
+    assert_eq!(hetzner_of(&f.ctx, "staging").kubeconfig_sealed_to, None);
+}
+
+/// F13: a cache under the shared key already — an older `lock off` re-sealed it and was
+/// interrupted, or another program did — is skipped, and its record of the vault goes: the
+/// shared key records nothing.
+#[test]
+fn a_cache_under_the_shared_key_already_loses_its_vault_record() {
+    let f = files_store();
+    lock(&f.ctx);
+    let shared = cli_core::secrets::load_or_create_identity(f.ctx.age_key_path()).unwrap();
+    let mut prod = hetzner_of(&f.ctx, "prod");
+    assert!(prod.kubeconfig_sealed_to.is_some());
+    prod.kubeconfig_age = Some(encrypt_for_recipient(YAML, &shared.to_public()).unwrap());
+    seed(&f.ctx, "prod", serde_json::to_value(&prod).unwrap());
+    unlock(&f.ctx, PASSWORD);
+    assert_files_whole(&f.ctx);
 }
 
 /// Critic finding 16 (b): a `lock on` interrupted before its vault, whose store holds a marker

@@ -207,8 +207,21 @@ pub(crate) fn hint(c: &Check) -> Option<String> {
             "run `apprafter kubeconfig --refresh --target {target}` to replace the unencrypted \
              copy with an encrypted one"
         ),
+        // F13: sealed to a target store vault that is no longer here, never to the key at
+        // `path`: no key put there opens it.
+        CheckFix::AgeKeyMissing {
+            target,
+            path,
+            sealed_to_lost_vault: true,
+        } => format!(
+            "the cached kubeconfig was encrypted to the key of a target store vault that is no \
+             longer here, not to the age key at `{path}`: no key put there opens it. If you \
+             still have that vault and its `store.yaml`, put them back and unlock instead; \
+             otherwise `apprafter kubeconfig --refresh --target {target}` fetches the kubeconfig \
+             again under a new key, after listing what the new key cannot read and asking"
+        ),
         // `--refresh` never decrypts the cached copy on its way to a refetch (WI-457).
-        CheckFix::AgeKeyMissing { target, path } => format!(
+        CheckFix::AgeKeyMissing { target, path, .. } => format!(
             "no age key at `{path}`, so the cached kubeconfig cannot be decrypted: restore the \
              key it was cached with, or point `APPRAFTER_AGE_KEY` at it. If it is lost, \
              `apprafter kubeconfig --refresh --target {target}` fetches the kubeconfig again \
@@ -696,12 +709,36 @@ mod tests {
             CheckFix::AgeKeyMissing {
                 target: "p".into(),
                 path: "/k/age.key".into(),
+                sealed_to_lost_vault: false,
             },
         ))
         .unwrap();
         assert!(
             age.contains("/k/age.key") && age.contains("APPRAFTER_AGE_KEY"),
             "{age}"
+        );
+        // F13: a cache sealed to a vault no longer here sends nobody after the shared key.
+        let lost = hint(&fail(
+            CheckId::KubeApiReachable,
+            CheckFix::AgeKeyMissing {
+                target: "p".into(),
+                path: "/k/age.key".into(),
+                sealed_to_lost_vault: true,
+            },
+        ))
+        .unwrap();
+        for part in [
+            "target store vault that is no longer here",
+            "not to the age key at `/k/age.key`",
+            "put them back and unlock",
+            "`apprafter kubeconfig --refresh --target p`",
+        ] {
+            assert!(lost.contains(part), "{part:?} missing: {lost}");
+        }
+        assert!(
+            !lost.contains("restore the key it was cached with")
+                && !lost.contains("APPRAFTER_AGE_KEY"),
+            "{lost}"
         );
         // Review #9: the target's own name, never a `<name>` a shell reads as a redirection.
         assert!(

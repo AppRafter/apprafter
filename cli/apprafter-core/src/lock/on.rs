@@ -36,7 +36,7 @@ use age::secrecy::ExposeSecret;
 use cli_core::secrets::{CachedSecret, Identity};
 use cli_core::target::TargetStorePaths;
 use cli_core::{CliError, LockPhase, SecretsModeKind, StoreLock};
-use cli_state::{State, StatePaths};
+use cli_state::{SealedTo, State, StatePaths};
 use serde::Serialize;
 use zeroize::Zeroizing;
 
@@ -852,7 +852,15 @@ fn finish(
     let old = transfer::SharedKeys::at(&payload.keys);
     let targets = cli_core::list_target_names(run.store)?;
     for (n, target) in targets.iter().enumerate() {
-        reseal(run.store, target, key, &old, &payload.drops, resume, done)?;
+        reseal(
+            run.store,
+            target,
+            (key, run.id),
+            &old,
+            &payload.drops,
+            resume,
+            done,
+        )?;
         faults::hit(run.ctx, FaultPoint::AfterCachesTarget(n))?;
     }
     stage(reporter, 4, "Removing the secrets from files");
@@ -881,11 +889,13 @@ fn finish(
 /// Step 4 for one target (T36): a cache under an old key re-sealed to the store's and checked;
 /// one already the store's skipped (a resume); one no key of this run opens dropped when the
 /// plan listed it (or on a resume, whose plan says so), else left; a winning plaintext
-/// kubeconfig sealed, a shadowed one dropped.
+/// kubeconfig sealed, a shadowed one dropped. F13: each cache sealed to the store's key — a
+/// skipped one too — records it (`SealedTo::StoreVault` with the store's id); a dropped one
+/// loses its record; a left one keeps whatever it had.
 fn reseal(
     store: &TargetStorePaths,
     target: &str,
-    key: &CacheKey,
+    (key, id): (&CacheKey, &StoreId),
     old: &transfer::SharedKeys<'_>,
     agreed: &[CacheDrop],
     resume: bool,
@@ -896,22 +906,28 @@ fn reseal(
     let Some(mut h) = state.hetzner_cloud.clone() else {
         return Ok(());
     };
+    let vault = || SealedTo::StoreVault {
+        store_id: id.as_str().to_string(),
+    };
     let shadowed = h.kubeconfig_age.is_some();
     let mut changed = false;
     for secret in [CachedSecret::Kubeconfig, CachedSecret::ArgocdPassword] {
-        let slot = match secret {
-            CachedSecret::Kubeconfig => &mut h.kubeconfig_age,
-            CachedSecret::ArgocdPassword => &mut h.argocd_admin_password_age,
-        };
+        let (slot, record) = h.cache_mut(secret);
         let Some(armored) = slot.clone() else {
             continue;
         };
         if transfer::opens(key, secret, &armored).is_some() {
+            // A resume: sealed to the store's key already; recorded so, once.
+            if *record != Some(vault()) {
+                *record = Some(vault());
+                changed = true;
+            }
             continue;
         }
         match transfer::open_with_any(&armored, old.get()?) {
             Some(plain) => {
                 *slot = Some(sealed_and_checked(store, key, secret, target, &plain)?);
+                *record = Some(vault());
                 changed = true;
                 done.caches_resealed += 1;
             }
@@ -922,6 +938,7 @@ fn reseal(
                 }) =>
             {
                 *slot = None;
+                *record = None;
                 changed = true;
                 done.caches_dropped.push(dropped(
                     target,
@@ -952,6 +969,7 @@ fn reseal(
                 target,
                 &plain,
             )?);
+            h.kubeconfig_sealed_to = Some(vault());
             done.caches_resealed += 1;
         }
     }

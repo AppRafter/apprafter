@@ -491,21 +491,7 @@ fn persist_state(
             .as_ref()
             .and_then(|h| h.server_type.clone())
             .or_else(|| server.server_type.as_ref().map(|st| st.name.clone()));
-        // Preserve age-encrypted secrets across the state refresh — they are
-        // written by `kubeconfig` / `argocd-password` and must not be clobbered
-        // by an unrelated `apply`.
-        let (kube_yaml, kube_age, argocd_age) = state
-            .hetzner_cloud
-            .as_ref()
-            .map(|h| {
-                (
-                    h.kubeconfig_yaml.clone(),
-                    h.kubeconfig_age.clone(),
-                    h.argocd_admin_password_age.clone(),
-                )
-            })
-            .unwrap_or((None, None, None));
-        state.hetzner_cloud = Some(HetznerCloudState {
+        let mut refreshed = HetznerCloudState {
             server_id: server.id,
             server_name: server.name.clone(),
             server_type: recorded_type,
@@ -513,13 +499,31 @@ fn persist_state(
             network_id: net_id,
             firewall_id: fw_id,
             floating_ip_ids: fip_ids,
-            kubeconfig_yaml: kube_yaml,
-            kubeconfig_age: kube_age,
-            argocd_admin_password_age: argocd_age,
-        });
+            kubeconfig_yaml: None,
+            kubeconfig_age: None,
+            argocd_admin_password_age: None,
+            kubeconfig_sealed_to: None,
+            argocd_admin_password_sealed_to: None,
+        };
+        carry_caches(state.hetzner_cloud.as_ref(), &mut refreshed);
+        state.hetzner_cloud = Some(refreshed);
         state.save(paths)?;
     }
     Ok(all_servers)
+}
+
+/// The secrets `kubeconfig` and `argocd-password` cached, carried across `apply`'s state refresh
+/// with the record of what sealed each (F13): an unrelated `apply` clobbers neither, so a lost
+/// key's words still name the key on a store `apply` ran on.
+fn carry_caches(from: Option<&HetznerCloudState>, into: &mut HetznerCloudState) {
+    let Some(from) = from else {
+        return;
+    };
+    into.kubeconfig_yaml = from.kubeconfig_yaml.clone();
+    into.kubeconfig_age = from.kubeconfig_age.clone();
+    into.argocd_admin_password_age = from.argocd_admin_password_age.clone();
+    into.kubeconfig_sealed_to = from.kubeconfig_sealed_to.clone();
+    into.argocd_admin_password_sealed_to = from.argocd_admin_password_sealed_to.clone();
 }
 
 /// 2.16h: backfill + guard — runs once on the exists-path after persist_state.
@@ -810,6 +814,54 @@ mod tests {
     use super::*;
     use cli_core::target::{load_target, save_target};
     use serde_json::json;
+
+    // ── F13: the caches and their seal record survive the state refresh ──
+
+    fn bare(server_id: u64) -> HetznerCloudState {
+        HetznerCloudState {
+            server_id,
+            server_name: "n".into(),
+            server_type: None,
+            ssh_key_ids: Vec::new(),
+            network_id: None,
+            firewall_id: None,
+            floating_ip_ids: Vec::new(),
+            kubeconfig_yaml: None,
+            kubeconfig_age: None,
+            argocd_admin_password_age: None,
+            kubeconfig_sealed_to: None,
+            argocd_admin_password_sealed_to: None,
+        }
+    }
+
+    /// F13 (critic C-M-3): `apply` rebuilds the state's `hetzner_cloud` from the live API after
+    /// every run; what a lock sealed the caches to goes with them, or a lost key's words would
+    /// fall back to "put that key back" after any `apply` on a locked store.
+    #[test]
+    fn the_state_refresh_keeps_the_caches_and_what_sealed_them() {
+        let vault = || cli_state::SealedTo::StoreVault {
+            store_id: "3f9c0a1b7d2e4c56".into(),
+        };
+        let before = HetznerCloudState {
+            kubeconfig_age: Some("K".into()),
+            argocd_admin_password_age: Some("A".into()),
+            kubeconfig_sealed_to: Some(vault()),
+            argocd_admin_password_sealed_to: Some(vault()),
+            ..bare(1)
+        };
+        let mut after = bare(2);
+        carry_caches(Some(&before), &mut after);
+        assert_eq!(
+            after,
+            HetznerCloudState {
+                server_id: 2,
+                ..before.clone()
+            }
+        );
+        let mut first = bare(3);
+        carry_caches(None, &mut first);
+        assert_eq!(first, bare(3));
+    }
 
     // ── the backfill's store lock: bounded, never creating a store ───────
 

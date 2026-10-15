@@ -7,4 +7,4 @@
 
 pub mod state;
 
-pub use state::{migrate_legacy_state_if_present, HetznerCloudState, State, StatePaths};
+pub use state::{migrate_legacy_state_if_present, HetznerCloudState, SealedTo, State, StatePaths};

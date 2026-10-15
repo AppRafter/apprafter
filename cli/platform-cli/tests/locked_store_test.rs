@@ -176,6 +176,86 @@ fn a_renewal_replaces_another_stores_marker_on_a_store_in_files() {
     assert!(creds.contains(&format!("hetzner_token: {NEW}")), "{creds}");
 }
 
+/// F13 (`#locked-store-lost`, H-2): `lock on` re-sealed the caches to the store's own key and
+/// recorded so (`kubeconfig_sealed_to`, as core's `lock on` writes it); the vault and
+/// `store.yaml` were moved aside, and this computer never had a shared age key. The refresh
+/// with no terminal and no `--yes` names the lost vault, never "put that key back"; doctor's
+/// hint too.
+#[test]
+fn a_refresh_after_a_lost_vault_names_the_vault_not_the_shared_key() {
+    const YAML: &str = "apiVersion: v1\nkind: Config\nclusters: []\n";
+    let sp = Spawn::new();
+    let root = sp.store();
+    let made = locked_store(&root, &[("prod", Some(TOKEN))]);
+    let paths = cli_core::TargetStorePaths::for_root(root.clone());
+    cli_core::save_global_config(
+        &paths,
+        &cli_core::GlobalConfig {
+            active_target: "prod".into(),
+            version: cli_core::TARGET_STORE_VERSION,
+        },
+    )
+    .unwrap();
+    let state = cli_state::StatePaths::for_active_target(&paths, "prod");
+    std::fs::create_dir_all(state.state_dir()).unwrap();
+    let sealed =
+        |plain: &str| cli_core::secrets::encrypt_for_recipient(plain, made.recipient()).unwrap();
+    let record = serde_json::json!({"kind": "store_vault", "store_id": made.store_id.as_str()});
+    let body = serde_json::json!({"hetzner_cloud": {
+        "server_id": 7, "server_name": "n",
+        "kubeconfig_age": sealed(YAML), "kubeconfig_sealed_to": record,
+        "argocd_admin_password_age": sealed("pw"), "argocd_admin_password_sealed_to": record,
+    }});
+    std::fs::write(state.state_file(), body.to_string()).unwrap();
+    std::fs::rename(
+        root.join(apprafter_core::vault::VAULT_FILE),
+        sp.path("vault.aside"),
+    )
+    .unwrap();
+    std::fs::rename(
+        root.join(apprafter_core::secrets::STORE_FILE),
+        sp.path("store.yaml.aside"),
+    )
+    .unwrap();
+    let (code, _, stderr) = run(&sp, &["kubeconfig", "--refresh", "--target", "prod"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "What this store caches was encrypted to the key of a target store vault that is \
+             no longer here (store id {}), not to the age key at",
+            made.store_id
+        )),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "If you still have that vault and its `store.yaml`, put them back and unlock"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("If you still have that key"),
+        "the shared key never held these: {stderr}"
+    );
+    assert!(
+        stderr.contains("apprafter::cli::confirmation_required"),
+        "{stderr}"
+    );
+    let (_, stdout, stderr) = run(&sp, &["doctor", "--no-ping"]);
+    let doctor = format!("{stdout}\n{stderr}")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        doctor.contains("the cached kubeconfig was encrypted to the key of a target store vault that is no longer here"),
+        "{doctor}"
+    );
+    assert!(
+        !doctor.contains("restore the key it was cached with"),
+        "{doctor}"
+    );
+}
+
 /// D.4a T66, §3.13 (d4a-f): `target show` names the vault, and opens nothing.
 #[test]
 fn target_show_names_the_vault() {

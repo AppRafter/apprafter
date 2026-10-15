@@ -183,10 +183,14 @@ pub enum CheckFix {
         target: String,
     },
     /// No age key at `path`: the target whose cache it is, for the refetch under a new key that
-    /// the fix names (WI-457 review #9).
+    /// the fix names (WI-457 review #9). `sealed_to_lost_vault` (F13): the state records that
+    /// the cache was sealed to a target store vault's key, not to the key at `path` — a vault no
+    /// longer here, since only a store in files looks for that key — so no key put at `path`
+    /// opens it.
     AgeKeyMissing {
         target: String,
         path: String,
+        sealed_to_lost_vault: bool,
     },
     /// The cached kubeconfig does not decrypt with the age key at `path`: it was cached under
     /// another key (a lost one that a new key replaced) or is damaged. The target whose it is,
@@ -1380,7 +1384,7 @@ fn kube_api(
         match ctx.secrets().cache_key(target.name()) {
             Ok(_) => {}
             Err(CliError::AgeKeyMissing { path, .. }) => {
-                return Ok(age_key_missing(base, target, path))
+                return Ok(age_key_missing(base, target, path, s))
             }
             // D.4a T66: a locked store with nothing open here — skipped, never asked.
             Err(CliError::StoreLocked { .. }) => return Ok(locked_skip(base)),
@@ -1423,7 +1427,9 @@ fn kube_api(
                 ..base
             })
         }
-        Err(CoreError::AgeKeyMissing { path }) => return Ok(age_key_missing(base, target, path)),
+        Err(CoreError::AgeKeyMissing { path }) => {
+            return Ok(age_key_missing(base, target, path, s))
+        }
         Err(CoreError::Cli(CliError::StoreLocked { .. })) => return Ok(locked_skip(base)),
         // WI-475: a kubeconfig another account could have put there is never run.
         Err(CoreError::Cli(e @ CliError::StoreNotPrivate { .. })) => {
@@ -1493,13 +1499,17 @@ fn kube_api(
     }
 }
 
-fn age_key_missing(base: Check, target: &TargetRef, path: String) -> Check {
+fn age_key_missing(base: Check, target: &TargetRef, path: String, s: &HetznerCloudState) -> Check {
     Check {
         status: CheckStatus::Fail,
         detail: None,
         fix: Some(CheckFix::AgeKeyMissing {
             target: target.name().to_string(),
             path,
+            sealed_to_lost_vault: matches!(
+                s.kubeconfig_sealed_to,
+                Some(cli_state::SealedTo::StoreVault { .. })
+            ),
         }),
         ..base
     }
@@ -3783,12 +3793,40 @@ mod tests {
             c[1].fix,
             Some(CheckFix::AgeKeyMissing {
                 target: "prod".into(),
-                path: ctx.age_key_path().display().to_string()
+                path: ctx.age_key_path().display().to_string(),
+                sealed_to_lost_vault: false,
             })
         );
         assert!(
             !ctx.age_key_path().exists(),
             "a Read never writes a key (decision 2)"
+        );
+    }
+
+    /// F13: a cache the state records as sealed to a target store vault's key — `lock on`
+    /// re-sealed it, and the vault was moved aside since (`#locked-store-lost`) — says so, so
+    /// the fix does not send the person after a shared key that never held it.
+    #[test]
+    fn a_missing_age_key_beside_a_cache_sealed_to_a_lost_vault_says_so() {
+        let f = fx();
+        let ctx = ctx(&f, OFFLINE).with_no_ping(true);
+        add(&ctx, "prod", "hetzner-cloud", Some(TOKEN), None);
+        seed_state(
+            &ctx,
+            "prod",
+            serde_json::json!({"server_id": 7, "server_name": "n",
+                "kubeconfig_age": "-----BEGIN AGE ENCRYPTED FILE-----\n-----END AGE ENCRYPTED FILE-----\n",
+                "kubeconfig_sealed_to": {"kind": "store_vault", "store_id": "3f9c0a1b7d2e4c56"}}),
+        );
+        let c = cluster(&doctor(&ctx, named("prod")));
+        assert_eq!(c[1].status, CheckStatus::Fail);
+        assert_eq!(
+            c[1].fix,
+            Some(CheckFix::AgeKeyMissing {
+                target: "prod".into(),
+                path: ctx.age_key_path().display().to_string(),
+                sealed_to_lost_vault: true,
+            })
         );
     }
 

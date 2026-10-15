@@ -11,7 +11,7 @@ use cli_core::target::{
     save_target_credentials, TargetCredentials, TargetStorePaths,
 };
 use cli_core::{CliError, Result};
-use cli_state::{State, StatePaths};
+use cli_state::{SealedTo, State, StatePaths};
 use zeroize::Zeroizing;
 
 use super::marker::{self, Marker};
@@ -144,6 +144,9 @@ fn missing(target: &str, age_key_path: &Path) -> CliError {
 pub struct Held {
     pub target: String,
     pub what: Holding,
+    /// What the state records sealed it, when not the shared age key (F13); `None` for an
+    /// unreadable state, and for a cache that records nothing.
+    pub sealed_to: Option<SealedTo>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -174,6 +177,7 @@ pub(super) fn held(store: &TargetStorePaths) -> Result<Vec<Held>> {
                         out.push(Held {
                             target: target.clone(),
                             what: Holding::Secret(secret),
+                            sealed_to: h.sealed_to(secret).cloned(),
                         });
                     }
                 }
@@ -181,6 +185,7 @@ pub(super) fn held(store: &TargetStorePaths) -> Result<Vec<Held>> {
             Err(e) => out.push(Held {
                 target,
                 what: Holding::Unreadable(e.to_string()),
+                sealed_to: None,
             }),
         }
     }

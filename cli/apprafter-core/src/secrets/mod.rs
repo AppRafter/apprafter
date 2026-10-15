@@ -32,7 +32,7 @@ use std::sync::Arc;
 
 use cli_core::secrets::{encrypt_for_recipient, CacheKeyKind, CachedSecret, Identity, Recipient};
 use cli_core::{CliError, LockPhase, LockedWhy, SecretsModeKind, StoreLock, TargetStorePaths};
-use cli_state::{HetznerCloudState, State, StatePaths};
+use cli_state::{HetznerCloudState, SealedTo, State, StatePaths};
 use serde::Serialize;
 use zeroize::Zeroizing;
 
@@ -874,21 +874,25 @@ impl SecretStore {
             )
         })?;
         let sealed = encrypt_for_recipient(plaintext, &new.key.recipient()?)?;
+        // F13: what sealed it goes with it — the store's vault on a locked store, else nothing
+        // (the shared key).
+        let sealed_to = match &new.settled {
+            Settled::Locked(id) => Some(SealedTo::StoreVault {
+                store_id: id.as_str().to_string(),
+            }),
+            Settled::Files => None,
+        };
+        let (slot, record) = hetzner.cache_mut(new.secret);
+        *slot = Some(sealed.clone());
+        *record = sealed_to;
         let other = match new.secret {
             CachedSecret::Kubeconfig => {
-                hetzner.kubeconfig_age = Some(sealed.clone());
                 hetzner.kubeconfig_yaml = None;
                 CachedSecret::ArgocdPassword
             }
-            CachedSecret::ArgocdPassword => {
-                hetzner.argocd_admin_password_age = Some(sealed.clone());
-                CachedSecret::Kubeconfig
-            }
+            CachedSecret::ArgocdPassword => CachedSecret::Kubeconfig,
         };
-        let slot = match other {
-            CachedSecret::Kubeconfig => &mut hetzner.kubeconfig_age,
-            CachedSecret::ArgocdPassword => &mut hetzner.argocd_admin_password_age,
-        };
+        let (slot, record) = hetzner.cache_mut(other);
         if replaced_key {
             let opens = |armored: &str| cache::open(&new.key, other, &new.target, armored).is_ok();
             if slot.as_deref().is_some_and(|armored| !opens(armored)) {
@@ -898,6 +902,10 @@ impl SecretStore {
         // T39: what `new_cache` found the store's key cannot open, if it is still there.
         if new.drop_other.is_some() && *slot == new.drop_other {
             *slot = None;
+        }
+        // A dropped slot takes its record with it (F13).
+        if slot.is_none() {
+            *record = None;
         }
         state.hetzner_cloud = Some(hetzner);
         state.save(paths)?;
