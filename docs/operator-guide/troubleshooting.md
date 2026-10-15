@@ -359,6 +359,16 @@ On a target store that `apprafter lock on` has locked, this does not occur:
 its caches are encrypted to the store's own key, kept in its vault, and
 `APPRAFTER_AGE_KEY` does not apply there.
 
+A locked store whose vault is lost is the exception. Once its vault and
+`store.yaml` are moved aside ([every way into a locked store is
+lost](#locked-store-lost)), the store is in files again and looks for the
+shared key, which never held those caches: they were encrypted to the
+vault's own key. The error, and doctor's row, say so: the cached secrets
+were encrypted to the key of a target store vault that is no longer here,
+not to the age key at that path, and no key put there opens them. If you
+still have the vault and its `store.yaml`, put them back and unlock;
+otherwise fetch the kubeconfig again under a new key, as below.
+
 **Fix.** If you still have the key, put it back at that path, or set
 `APPRAFTER_AGE_KEY` to where it is. Nothing else is needed.
 
@@ -853,7 +863,9 @@ from happening: [Back it up](protecting-secrets-from-agents.md#backup).
 
    With no shared age key on this computer yet, the first refresh asks
    before it creates one, as
-   [`age_key_missing`](#age-key-missing) describes.
+   [`age_key_missing`](#age-key-missing) describes. It says the cached
+   secrets were encrypted to the key of the vault you moved aside, which no
+   key at the shared key's path opens: answer `y`.
 
 4. Lock the store again with `apprafter lock on`: a new lock password, and a
    new recovery key to keep somewhere other than this computer.
