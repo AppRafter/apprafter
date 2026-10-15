@@ -1320,12 +1320,12 @@ pub enum CliError {
 
     /// An I/O error on one target's own file, its `config.yaml` or `credentials.yaml`: reading
     /// it, or checking that it exists (a target directory this user cannot search). [`Io`]'s
-    /// code, message, cause and help, so the CLI shows it as it showed the plain `Io`, plus
-    /// whose file it is: the desktop offers that target's removal for it, as for a file that
-    /// does not parse (WI-458 review #6).
+    /// code, cause and help, plus whose file it is: the desktop offers that target's removal
+    /// for it, as for a file that does not parse (WI-458 review #6). Its message names the file,
+    /// which the OS message does not (WI-482).
     ///
     /// [`Io`]: CliError::Io
-    #[error("io error: {source}")]
+    #[error("io error: {}: {source}", path.display())]
     #[diagnostic(code(apprafter::io::error), help("{}", IO_HELP))]
     TargetFileIo {
         path: PathBuf,
@@ -2089,11 +2089,11 @@ mod tests {
         }
     }
 
-    /// WI-458 review #6: an I/O error on a target's own file shows as a plain I/O error did —
-    /// code, message, cause and help — so the CLI prints what it printed; only whose file it is
-    /// is new, for the desktop.
+    /// WI-458 review #6: an I/O error on a target's own file shows as a plain I/O error does —
+    /// code, cause and help — and says whose file it is, for the desktop. WI-482: its message
+    /// names the file too, which the OS message does not.
     #[test]
-    fn a_target_file_io_error_shows_as_a_plain_io_error() {
+    fn a_target_file_io_error_shows_as_a_plain_io_error_naming_its_file() {
         let os = || io::Error::new(io::ErrorKind::PermissionDenied, "denied");
         let plain = CliError::Io(os());
         let target = CliError::TargetFileIo {
@@ -2103,7 +2103,11 @@ mod tests {
         };
         assert_eq!(code_of(&target), "apprafter::io::error");
         assert_eq!(code_of(&target), code_of(&plain));
-        assert_eq!(target.to_string(), plain.to_string());
+        assert_eq!(plain.to_string(), "io error: denied");
+        assert_eq!(
+            target.to_string(),
+            "io error: /s/targets/prod/config.yaml: denied"
+        );
         assert_eq!(help_of(&target), help_of(&plain));
         let cause = |e: &CliError| std::error::Error::source(e).map(ToString::to_string);
         assert_eq!(cause(&target), cause(&plain));

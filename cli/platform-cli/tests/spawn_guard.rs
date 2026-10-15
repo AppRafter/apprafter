@@ -217,6 +217,14 @@ const ALLOWED: &[(&str, &str, Rule)] = &[
         "a_test_build_locks_no_store_outside_its_sandbox",
         Rule::RemovesFence,
     ),
+    // WI-482: the fence refuses a store root it cannot read before the command it guards (it
+    // fails closed), so the case runs its commands on the closed root without it, after the
+    // same commands passed it on the open root; every other variable still in the scratch root.
+    (
+        "platform-cli/tests/store_privacy_test.rs",
+        "a_store_root_this_account_cannot_search_is_named_never_an_empty_store",
+        Rule::RemovesFence,
+    ),
     // The fence's own rows: a removed HOME, a removed store variable, no fence at all (it
     // changes nothing unless set), and roots the fence must refuse.
     (

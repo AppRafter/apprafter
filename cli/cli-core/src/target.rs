@@ -619,13 +619,17 @@ pub struct Target {
 /// Read `<root>/config.yaml`. Returns `Ok(None)` when absent
 /// (first-run case); `Err` only on corrupt YAML or filesystem
 /// failure so the caller can distinguish "no store yet" from
-/// "store broken".
+/// "store broken". A file that cannot be read, or checked for, is never
+/// absent (WI-482): it is the refusal of a folder another account owns
+/// when that is why ([`crate::store_privacy::foreign_folder_behind`]),
+/// else an I/O error naming the file.
 pub fn load_global_config(paths: &TargetStorePaths) -> Result<Option<GlobalConfig>> {
     let path = paths.global_config_file();
-    if !path.exists() {
+    let folder = paths.root();
+    if !store_path_exists(paths, &path, folder)? {
         return Ok(None);
     }
-    let bytes = fs::read(&path)?;
+    let bytes = fs::read(&path).map_err(|e| store_io(paths, &path, folder, e))?;
     let cfg: GlobalConfig =
         serde_yaml::from_slice(&bytes).map_err(|err| CliError::InvalidTargetConfig {
             path: path.clone(),
@@ -788,6 +792,30 @@ fn target_file_exists(paths: &TargetStorePaths, path: &Path, name: &str) -> Resu
     }
 }
 
+/// Whether `path`, a file or folder of the store's own in `folder`, exists. Not `Path::exists`,
+/// which says no on any error: a store root this account cannot search read as an empty store
+/// (WI-482, GOTCHA-173). A path through a regular file is missing, as it was. A check that
+/// fails is [`store_io`]'s error.
+fn store_path_exists(paths: &TargetStorePaths, path: &Path, folder: &Path) -> Result<bool> {
+    match path.try_exists() {
+        Err(e) if e.kind() == std::io::ErrorKind::NotADirectory => Ok(false),
+        checked => checked.map_err(|e| store_io(paths, path, folder, e)),
+    }
+}
+
+/// An error reading `path`, in the store's `folder`: the refusal of the folder another account
+/// owns when that is why (WI-481), else an I/O error naming `path` (WI-482: it was a bare
+/// "Permission denied"), with the OS error's kind and the code of any I/O error.
+fn store_io(paths: &TargetStorePaths, path: &Path, folder: &Path, e: std::io::Error) -> CliError {
+    if let Some(refusal) = crate::store_privacy::foreign_folder_behind(paths, folder, &e) {
+        return refusal;
+    }
+    CliError::Io(std::io::Error::new(
+        e.kind(),
+        format!("cannot read {}: {e}", path.display()),
+    ))
+}
+
 /// `path`, one of target `name`'s own files, read; an error names the target (review #6).
 fn read_target_file(paths: &TargetStorePaths, path: &Path, name: &str) -> Result<Vec<u8>> {
     fs::read(path).map_err(|source| target_file_io(paths, path, name, source))
@@ -879,19 +907,23 @@ pub fn save_target_config(
 /// each one re-sorting. Returns `Ok(vec![])` if the directory
 /// doesn't exist yet. A `targets/` another account owns and this
 /// account cannot open is that folder's refusal
-/// (`CliError::StoreNotPrivate`, WI-481), not a bare I/O error.
+/// (`CliError::StoreNotPrivate`, WI-481), not a bare I/O error; so is a
+/// store root another account owns and this account cannot search,
+/// which `Path::exists` read as no `targets/` at all, an empty store
+/// (WI-482). Any other failure names the path it could not read.
 pub fn list_target_names(paths: &TargetStorePaths) -> Result<Vec<String>> {
     let dir = paths.targets_dir();
-    if !dir.exists() {
+    if !store_path_exists(paths, &dir, paths.root())? {
         return Ok(Vec::new());
     }
-    let entries = fs::read_dir(&dir).map_err(|e| {
-        crate::store_privacy::foreign_folder_behind(paths, &dir, &e).unwrap_or(CliError::Io(e))
-    })?;
+    let entries = fs::read_dir(&dir).map_err(|e| store_io(paths, &dir, &dir, e))?;
     let mut names: Vec<String> = Vec::new();
     for entry in entries {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
+        let entry = entry.map_err(|e| store_io(paths, &dir, &dir, e))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|e| store_io(paths, &entry.path(), &dir, e))?;
+        if !file_type.is_dir() {
             continue;
         }
         if let Some(name) = entry.file_name().to_str() {
@@ -1869,6 +1901,88 @@ mod tests {
         let _closed = ModeGuard::closed(&targets);
         refused_naming(list_target_names(&paths).unwrap_err(), &targets);
         refused_naming(load_target_config(&paths, "prod").unwrap_err(), &targets);
+    }
+
+    /// WI-482 (1): a store root another account owns (pretended) and this account cannot
+    /// search (mode 000, as such a root made 0700 is to it) is that root's refusal, named,
+    /// through the target list, the global config and the active target — never an empty store.
+    /// `Path::exists` said no on the denial (GOTCHA-173), so `target list` said "No targets
+    /// configured" and `target show` found no active target.
+    #[cfg(unix)]
+    #[test]
+    fn a_store_root_another_account_owns_and_keeps_closed_is_refused_never_empty() {
+        let (_dir, paths) = make_paths();
+        saved(&paths, "prod");
+        let global = GlobalConfig {
+            active_target: "prod".into(),
+            ..GlobalConfig::default()
+        };
+        save_global_config(&paths, &global).unwrap();
+        let root = paths.root().to_path_buf();
+        let refused = |err: CliError| match err {
+            CliError::StoreNotPrivate {
+                path,
+                problem: crate::error::StoreFolderProblem::ForeignOwner,
+            } => assert_eq!(path, root),
+            other => panic!("expected StoreNotPrivate naming {root:?}, got {other:?}"),
+        };
+        let _foreign = crate::owner_only::pretend::foreign_owner(&root);
+        let _closed = ModeGuard::closed(&root);
+        refused(list_target_names(&paths).unwrap_err());
+        refused(load_global_config(&paths).unwrap_err());
+        refused(resolve_active_target_name(&paths, None).unwrap_err());
+    }
+
+    /// A store root that is a regular file has no `targets` and no `config.yaml` under it: a
+    /// path through a file is missing (ENOTDIR), as under `Path::exists`, not an I/O error.
+    #[test]
+    fn a_store_root_that_is_a_file_holds_no_targets() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("store");
+        fs::write(&root, b"not a folder").unwrap();
+        let paths = TargetStorePaths::for_root(root);
+        assert_eq!(list_target_names(&paths).unwrap(), Vec::<String>::new());
+        assert_eq!(load_global_config(&paths).unwrap(), None);
+    }
+
+    /// WI-482 (2): a folder of this account's own that it closed (mode 000) is its own problem,
+    /// and the error names the path it could not read: `targets` when the root is closed (that
+    /// check is what fails) or when `targets` itself is, the root's `config.yaml` for the
+    /// global config, a target's file for its folder. They were a bare "io error: Permission
+    /// denied" with no path. Still `apprafter::io::error`, of kind `PermissionDenied`.
+    #[cfg(unix)]
+    #[test]
+    fn an_own_folder_closed_to_this_account_names_the_path_it_could_not_read() {
+        use std::io::ErrorKind::PermissionDenied;
+        let (_dir, paths) = make_paths();
+        saved(&paths, "prod");
+        save_global_config(&paths, &GlobalConfig::default()).unwrap();
+        let names = |err: CliError, path: &Path| {
+            let text = err.to_string();
+            let kind = match &err {
+                CliError::Io(e) => e.kind(),
+                CliError::TargetFileIo { source, .. } => source.kind(),
+                other => panic!("expected an I/O error naming {path:?}, got {other:?}"),
+            };
+            assert_eq!(kind, PermissionDenied, "{text}");
+            assert!(text.contains(&path.display().to_string()), "{text}");
+        };
+        {
+            let _closed = ModeGuard::closed(paths.root());
+            names(list_target_names(&paths).unwrap_err(), &paths.targets_dir());
+            names(
+                load_global_config(&paths).unwrap_err(),
+                &paths.global_config_file(),
+            );
+        }
+        {
+            let _closed = ModeGuard::closed(&paths.targets_dir());
+            names(list_target_names(&paths).unwrap_err(), &paths.targets_dir());
+        }
+        let _closed = ModeGuard::closed(&paths.target_dir("prod"));
+        let err = load_target_config(&paths, "prod").unwrap_err();
+        assert!(matches!(err, CliError::TargetFileIo { .. }), "{err:?}");
+        names(err, &paths.target_config_file("prod"));
     }
 
     /// Review #6: a target's own file that cannot be read is an I/O error naming the target, so

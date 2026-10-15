@@ -631,7 +631,7 @@ fn neutral_help(e: &cli_core::CliError) -> Option<String> {
              failing path or socket: a missing directory, wrong permissions, a full disk, or a \
              closed socket."
             .into(),
-        // The OS message names no file here: the help does (WI-458 review #6).
+        // The message names the file (WI-482); the help says whose it is (WI-458 review #6).
         C::TargetFileIo { path, target, .. } => format!(
             "{} is a file of target `{target}`, and it could not be read: most often its \
              permissions, or its folder's, do not let this user read it.",
@@ -2673,10 +2673,10 @@ mod tests {
         assert!(ui.fields.is_empty(), "{:?}", ui.fields);
     }
 
-    /// WI-458 review #6: an I/O error on one of a target's own files is the same code and
-    /// message as any I/O error, and its fields name the target and the file — what the desktop
-    /// offers that target's removal on — and its help names the file, which the OS message does
-    /// not.
+    /// WI-458 review #6: an I/O error on one of a target's own files is the same code as any I/O
+    /// error, and its fields name the target and the file — what the desktop offers that
+    /// target's removal on — and its help says whose file it is. WI-482: its message names the
+    /// file too, which the OS message does not.
     #[test]
     fn an_io_error_on_a_targets_own_file_names_the_target() {
         let source = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
@@ -2686,7 +2686,10 @@ mod tests {
             source,
         }));
         assert_eq!(ui.code.as_deref(), Some(codes::IO_ERROR));
-        assert_eq!(ui.message, "io error: denied");
+        assert_eq!(
+            ui.message,
+            "io error: /s/targets/prod/credentials.yaml: denied"
+        );
         assert_eq!(ui.causes, vec!["denied".to_string()]);
         assert_eq!(
             json!(ui.fields),

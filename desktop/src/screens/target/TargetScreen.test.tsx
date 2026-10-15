@@ -375,10 +375,14 @@ test('an I/O error on a file of the target offers its removal too', async () => 
   internals.invoke = (cmd, args, options) =>
     cmd === 'target_show'
       ? Promise.reject(
-          uiError(CORE_ERROR_CODES.IO_ERROR, 'io error: Permission denied (os error 13)', {
-            path: '~/.config/apprafter/targets/lab/credentials.yaml',
-            target: 'lab',
-          }),
+          uiError(
+            CORE_ERROR_CODES.IO_ERROR,
+            'io error: ~/.config/apprafter/targets/lab/credentials.yaml: Permission denied (os error 13)',
+            {
+              path: '~/.config/apprafter/targets/lab/credentials.yaml',
+              target: 'lab',
+            },
+          ),
         )
       : invoke(cmd, args, options);
   const onRemoved = mock();

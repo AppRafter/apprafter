@@ -288,3 +288,63 @@ fn doctor_moves_no_legacy_state_into_a_store_others_can_change() {
     );
     assert_eq!(snapshot(&sp.store()), before, "doctor changed the store");
 }
+
+/// WI-482, Unix: a store root this account closed (mode 000) is never an empty store. `target
+/// list` and `target show` fail with an I/O error naming the path whose check failed: the
+/// `targets` folder for the list, the root's `config.yaml` for the active target that `show`
+/// looks up first. `Path::exists` said no on the denial (GOTCHA-173), so the list said "No
+/// targets configured". A root another account owns is refused by name instead: cli-core's
+/// test pretends one, and the owner matrix's P-3 walks a real one (it needs root).
+///
+/// `APPRAFTER_SANDBOX` refuses a store root it cannot read before any command runs (it fails
+/// closed), so the commands on the closed root run without it (`spawn_guard.rs` `ALLOWED`):
+/// the same commands passed it on the open root first, and every other variable still points
+/// into the scratch root.
+#[cfg(unix)]
+#[test]
+fn a_store_root_this_account_cannot_search_is_named_never_an_empty_store() {
+    let sp = Spawn::new();
+    let add = ["target", "add", "prod", "--provider", "hetzner-cloud"];
+    let (code, _, stderr) = run(&sp, &[&add[..], &["--token", TOKEN]].concat(), false);
+    assert_eq!(code, Some(0), "{stderr}");
+    let store = sp.store();
+    let commands: [(&[&str], PathBuf); 3] = [
+        (&["target", "list"], store.join("targets")),
+        (&["target", "show"], store.join("config.yaml")),
+        (&["target", "show", "prod"], store.join("config.yaml")),
+    ];
+    for (args, _) in &commands {
+        let (code, stdout, stderr) = run(&sp, args, false);
+        assert_eq!(
+            code,
+            Some(0),
+            "{args:?} on the open root:\n{stdout}\n{stderr}"
+        );
+    }
+    let _closed = cli_core::owner_only::testing::ModeGuard::closed(&store);
+    let (code, _, stderr) = run(&sp, &["target", "list"], false);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("apprafter::sandbox::escape"), "{stderr}");
+    let mut wrong = Vec::new();
+    for (args, path) in &commands {
+        let out = sp
+            .cmd(args)
+            .env("APPRAFTER_NO_PING", "1")
+            .env_remove("APPRAFTER_SANDBOX")
+            .output()
+            .expect("run apprafter");
+        let (code, stdout, stderr) = (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            squeeze(&out.stderr),
+        );
+        if code != Some(1)
+            || stdout.contains("No targets configured")
+            || !stderr.contains("apprafter::io::error")
+            || !unwrapped(&stderr).contains(&unwrapped(&format!("cannot read {}", path.display())))
+        {
+            wrong.push(format!("{args:?} exited {code:?}:\n{stdout}\n{stderr}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
