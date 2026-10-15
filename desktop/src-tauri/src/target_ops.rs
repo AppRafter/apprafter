@@ -1788,6 +1788,13 @@ mod tests {
             Some("apprafter::secrets::store_locked"),
             "{error:?}"
         );
+        // d4a-h N4: in the app's words, as the toast after the unlock shows it.
+        assert!(
+            error
+                .message
+                .ends_with("is locked, and AppRafter holds no key for it"),
+            "{error:?}"
+        );
         assert_eq!(
             std::fs::read(&vault).unwrap(),
             before,

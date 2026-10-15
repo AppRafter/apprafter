@@ -50,8 +50,8 @@
       "reason": "no_terminal",
       "store": "/home/a/stores/work"
     },
-    "help": "This target store's secrets are encrypted, and the app holds no key for them: they were locked from a terminal while the app was open. Lock the app, then unlock it with the lock password.",
-    "message": "the target store at /home/a/stores/work is locked, and there is no unlock window here"
+    "help": "This target store's secrets are encrypted, and AppRafter holds no key for them: AppRafter locked, or the store was locked from a terminal while AppRafter was open. Unlock AppRafter with the lock password or the recovery key, then try again.",
+    "message": "the target store at /home/a/stores/work is locked, and AppRafter holds no key for it"
   },
   "storeNotPrivate": {
     "causes": [],

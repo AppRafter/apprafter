@@ -416,6 +416,9 @@ impl From<&CoreError> for UiError {
         // The core's own variants declare no help.
         if let CoreError::Cli(inner) = e {
             ui.help = neutral_help(inner);
+            if let Some(message) = app_message(inner) {
+                ui.message = message;
+            }
         }
         let f = &mut ui.fields;
         let mut put = |k: &str, v: serde_json::Value| {
@@ -503,6 +506,24 @@ impl From<&CoreError> for UiError {
             CoreError::NoActiveTarget | CoreError::Cancelled => {}
         }
         ui
+    }
+}
+
+/// The message of a pass-through `CliError` whose own speaks of the CLI's machinery, as the app
+/// meets it (d4a-h N4); `None` keeps the CLI's. The app has no unlock window: a store it holds no
+/// key for — after its own lock, or locked from a terminal under it — says that, never "there is
+/// no unlock window here". `no_terminal` is the app's only reason (its `VaultAccess` refuses so).
+fn app_message(e: &cli_core::CliError) -> Option<String> {
+    match e {
+        cli_core::CliError::StoreLocked {
+            store,
+            reason: cli_core::LockedWhy::NoTerminal,
+            ..
+        } => Some(format!(
+            "the target store at {} is locked, and AppRafter holds no key for it",
+            store.display()
+        )),
+        _ => None,
     }
 }
 
@@ -647,9 +668,11 @@ fn neutral_help(e: &cli_core::CliError) -> Option<String> {
              fail on the other's repository lock."
         ),
         // D.4a §3.12: the lock refusals — the diagnosis, and the app's way on.
-        C::StoreLocked { .. } => "This target store's secrets are encrypted, and the app holds \
-             no key for them: they were locked from a terminal while the app was open. Lock the \
-             app, then unlock it with the lock password."
+        // d4a-h N4: the app's own lock as well as a terminal's (the D-8 walk).
+        C::StoreLocked { .. } => "This target store's secrets are encrypted, and AppRafter holds \
+             no key for them: AppRafter locked, or the store was locked from a terminal while \
+             AppRafter was open. Unlock AppRafter with the lock password or the recovery key, \
+             then try again."
             .into(),
         C::UnlockFailed { .. } => {
             "That is neither the lock password nor the recovery key of this target store.".into()
@@ -2661,6 +2684,34 @@ mod tests {
             job: "nightly-1".into(),
         });
         assert!(matches!(e, CoreError::Cli(_)), "{e:?}");
+    }
+
+    /// d4a-h N4 (the walk's D-8): the app has no unlock window. A store it holds no key for —
+    /// after its own lock, or locked from a terminal under it — says so in the app's words,
+    /// never the CLI's "there is no unlock window here", which the CLI keeps.
+    #[test]
+    fn a_locked_store_the_app_holds_no_key_for_says_so_in_the_apps_words() {
+        let e = cli_core::CliError::StoreLocked {
+            store: PathBuf::from("/s"),
+            reason: cli_core::LockedWhy::NoTerminal,
+            stopped_before: None,
+        };
+        assert_eq!(
+            e.to_string(),
+            "the target store at /s is locked, and there is no unlock window here"
+        );
+        let ui = UiError::from(&CoreError::from(e));
+        assert_eq!(ui.code.as_deref(), Some("apprafter::secrets::store_locked"));
+        assert_eq!(
+            ui.message,
+            "the target store at /s is locked, and AppRafter holds no key for it"
+        );
+        let help = ui.help.unwrap();
+        assert!(
+            help.contains("AppRafter locked, or the store was locked from a terminal"),
+            "{help}"
+        );
+        assert!(!help.contains("unlock window"), "{help}");
     }
 
     #[test]
