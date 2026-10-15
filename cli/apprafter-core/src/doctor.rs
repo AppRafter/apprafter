@@ -2,7 +2,7 @@
 //! Doctor (D.3 overview §3.9): the report a run produces, grouped, with a typed fix per row,
 //! and [`run`], the Read that produces it.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use cli_core::target::{validate_hetzner_token_format, TargetConfig};
@@ -325,17 +325,25 @@ enum Lookup {
         name: String,
         available: Vec<String>,
     },
-    /// The target list cannot be read because another account owns `targets/` (WI-481): the
-    /// refusal, naming the folder, is the target's row.
+    /// The target list cannot be read: another account owns `targets/` (WI-481), or this
+    /// account cannot read the store there (d4a-h N6). The refusal, naming the folder, is the
+    /// target's row.
     Refused {
         name: String,
         refusal: CliError,
     },
+    /// The store's own file that would name a target cannot be read (d4a-h N6): its
+    /// `config.yaml`, which names the CLI default, or with no default the target list. The
+    /// refusal is the Target group's one row, about `path`.
+    Unreadable {
+        path: PathBuf,
+        refusal: CliError,
+    },
 }
 
-/// Doctor (spec §3.1: a Read with a reporter). Every problem is a row, never an error; `Err`
-/// is only cancellation or a store it cannot read at all (`config.yaml`, the target list).
-/// Lockless: the files it reads are replaced atomically (overview R3). The token row verifies
+/// Doctor (spec §3.1: a Read with a reporter). Every problem is a row, never an error, a store
+/// it cannot read at all included (d4a-h N6: its `config.yaml` or its target list is the
+/// `Config file readable` row, and the run goes on); `Err` is cancellation. Lockless: the files it reads are replaced atomically (overview R3). The token row verifies
 /// the STORED token (R4); a check that did not run is `Skipped` (R8).
 ///
 /// Groups: Target always; Cluster only for a target that exists; This computer always. A Read
@@ -365,7 +373,8 @@ fn run_reading_only(
     // D.4a T66: whatever the client's access, this run reads a locked store only through a
     // session already open here; any other read is `store_locked`, reported as a skipped row.
     let ctx = &diagnostic(ctx);
-    // R9: leftovers of a crashed run go first; failing to sweep never fails the run.
+    // R9: leftovers of a crashed run go first; failing to sweep never fails the run. The
+    // folder, then the OS error once (d4a-h N6).
     if let Err(e) = runtime::sweep_stale(ctx) {
         reporter.report(Event::Warning {
             message: format!(
@@ -379,24 +388,38 @@ fn run_reading_only(
         window,
         client,
     } = args;
+    let store = ctx.store();
     let name = match target {
-        DoctorTarget::Named(name) => Some(name),
+        DoctorTarget::Named(name) => Ok(Some(name)),
         // R1: no `config.yaml` is no CLI default.
-        DoctorTarget::CliDefault => cli_core::resolve_active_target_name(&ctx.store(), None)?,
+        DoctorTarget::CliDefault => cli_core::resolve_active_target_name(&store, None),
     };
-    let lookup = match &name {
-        None => Lookup::NoCliDefault,
-        Some(n) => match TargetRef::named(ctx, n) {
-            Ok(target) => Lookup::Found(target),
-            Err(CoreError::TargetNotFound { name, available }) => {
-                Lookup::Missing { name, available }
-            }
-            Err(CoreError::Cli(refusal @ CliError::StoreNotPrivate { .. })) => Lookup::Refused {
-                name: n.clone(),
+    let (name, lookup) = match name {
+        Ok(None) => (None, Lookup::NoCliDefault),
+        Ok(Some(n)) => {
+            let lookup = match TargetRef::named(ctx, &n) {
+                Ok(target) => Lookup::Found(target),
+                Err(CoreError::TargetNotFound { name, available }) => {
+                    Lookup::Missing { name, available }
+                }
+                // WI-481, d4a-h N6: the target list another account owns, or this one cannot
+                // read.
+                Err(CoreError::Cli(refusal)) => Lookup::Refused {
+                    name: n.clone(),
+                    refusal,
+                },
+                Err(e) => return Err(e),
+            };
+            (Some(n), lookup)
+        }
+        // d4a-h N6: the `config.yaml` that names the CLI default, unreadable.
+        Err(refusal) => (
+            None,
+            Lookup::Unreadable {
+                path: store.global_config_file(),
                 refusal,
             },
-            Err(e) => return Err(e),
-        },
+        ),
     };
     let total = if matches!(lookup, Lookup::Found(_)) {
         3
@@ -521,13 +544,26 @@ fn target_group(
 ) -> CoreResult<Vec<Check>> {
     let target = match lookup {
         Lookup::NoCliDefault => {
+            let available = match cli_core::list_target_names(&ctx.store()) {
+                Ok(available) => available,
+                // d4a-h N6: the list that would offer a target, unreadable, is the row.
+                Err(e) => {
+                    return Ok(vec![unreadable_config(
+                        ctx.store().targets_dir().display().to_string(),
+                        &e,
+                    )])
+                }
+            };
             return Ok(vec![Check {
                 fix: Some(CheckFix::AddTarget {
                     name: None,
-                    available: cli_core::list_target_names(&ctx.store())?,
+                    available,
                 }),
                 ..row(CheckId::ActiveTarget, CheckStatus::Warn, "active target")
             }]);
+        }
+        Lookup::Unreadable { path, refusal } => {
+            return Ok(vec![unreadable_config(path.display().to_string(), refusal)])
         }
         Lookup::Missing { name, available } => {
             return Ok(vec![missing_target(name, available.clone())])
@@ -547,10 +583,10 @@ fn target_group(
         Ok(t) => t,
         // Removed between the lookup and this read.
         Err(CliError::TargetNotFound { .. }) => {
-            return Ok(vec![missing_target(
-                name,
-                cli_core::list_target_names(&store)?,
-            )]);
+            return Ok(vec![match cli_core::list_target_names(&store) {
+                Ok(available) => missing_target(name, available),
+                Err(e) => unreadable_config(config_file, &e),
+            }]);
         }
         // WI-481: a folder another account owns that this account cannot open is its refusal,
         // naming the folder (`store_privacy::foreign_folder_behind`), not "Permission denied".
@@ -569,14 +605,17 @@ fn target_group(
     ])
 }
 
-/// The failed "Config file readable" row of a target whose config cannot be read: the error's
-/// own words as its fix.
+/// The failed "Config file readable" row of a store file that cannot be read: the error's own
+/// words as its fix. A path of the store this account cannot read (d4a-h N6) says it as a
+/// terminal shows that error: the path, the OS error once, then its help (`ls -ld`, d4a-h N3).
 fn unreadable_config(config_file: String, e: &CliError) -> Check {
+    let text = match e {
+        CliError::StorePathIo { source, .. } => format!("{e}: {source}. {}", help_of(e)),
+        e => e.to_string(),
+    };
     Check {
         detail: Some(config_file),
-        fix: Some(CheckFix::Explain {
-            text: e.to_string(),
-        }),
+        fix: Some(CheckFix::Explain { text }),
         ..row(CheckId::ConfigReadable, CheckStatus::Fail, TITLE_CONFIG)
     }
 }
@@ -4189,6 +4228,128 @@ mod tests {
             .unwrap();
         doctor(&ctx, DoctorTarget::CliDefault);
         assert!(!gone.exists() && live.exists());
+    }
+
+    /// d4a-h N6 (Unix): a store this account cannot read is reported, never a stop. With the
+    /// store's root closed (mode 000), `doctor` and `doctor --target prod` each fail the
+    /// `Config file readable` row in the store's words — the path, the OS error once, the
+    /// `ls -ld` help (d4a-h N3) — and This computer's rows still run; the sweep of the runtime
+    /// folder under the root warns with the OS error alone, never `io error:` (GOTCHA-314).
+    /// With only `targets` closed and no CLI default, the target list is that row.
+    #[cfg(unix)]
+    #[test]
+    fn a_store_this_account_cannot_read_is_a_row_and_doctor_goes_on() {
+        let f = fx();
+        let ctx = two_targets(&f);
+        set_default(&ctx, "prod");
+        std::fs::create_dir_all(ctx.runtime_dir()).unwrap();
+        let store = ctx.store();
+        // Every word of the report, and every warning, as one text each.
+        let words = |r: &DoctorReport| -> Vec<String> {
+            r.groups
+                .iter()
+                .flat_map(|g| &g.checks)
+                .map(|c| format!("{} | {:?} | {:?}", c.title, c.detail, c.fix))
+                .collect()
+        };
+        let warnings = |reporter: &CollectReporter| -> Vec<String> {
+            reporter
+                .take()
+                .into_iter()
+                .filter_map(|e| match e {
+                    Event::Warning { message } => Some(message),
+                    _ => None,
+                })
+                .collect()
+        };
+        // The one Target row: a failed `Config file readable` with `detail`, naming `path`.
+        let config_row = |r: &DoctorReport, detail: &Path, path: &Path, denied: &str| {
+            let rows = group(r, GroupId::Target);
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            let row = &rows[0];
+            assert_eq!(
+                (row.id, row.status, row.title.as_str()),
+                (CheckId::ConfigReadable, CheckStatus::Fail, TITLE_CONFIG)
+            );
+            assert_eq!(
+                row.detail.as_deref(),
+                Some(detail.display().to_string().as_str())
+            );
+            let Some(CheckFix::Explain { text }) = &row.fix else {
+                panic!("{row:?}");
+            };
+            assert!(
+                text.starts_with(&format!("cannot read {}: {denied}. ", path.display())),
+                "{text}"
+            );
+            assert_eq!(text.matches(denied).count(), 1, "{text}");
+            assert!(
+                text.contains("`ls -ld`") && !text.contains("chmod 0600"),
+                "{text}"
+            );
+        };
+        let run_on = |target: DoctorTarget| {
+            let reporter = CollectReporter::new();
+            let r = run(
+                &ctx,
+                DoctorArgs {
+                    target,
+                    window: UnlockWindow::NoTerminal,
+                    client: quiet(),
+                },
+                &reporter,
+                &CancellationToken::new(),
+            );
+            (r, warnings(&reporter))
+        };
+
+        // The store's root closed: the CLI default and a named target, each read closed.
+        let root = store.root().to_path_buf();
+        let (default, named_prod, denied) = {
+            let _closed = cli_core::owner_only::testing::ModeGuard::closed(&root);
+            let denied = std::fs::read_dir(&root).unwrap_err().to_string();
+            (
+                run_on(DoctorTarget::CliDefault),
+                run_on(named("prod")),
+                denied,
+            )
+        };
+        for (r, said) in [&default, &named_prod] {
+            let r = r.as_ref().expect("doctor reports a store it cannot read");
+            assert!(!r.groups.iter().any(|g| g.id == GroupId::Cluster));
+            assert!(!group(r, GroupId::ThisComputer).is_empty());
+            assert!(r.has_failures());
+            assert_eq!(
+                said,
+                &[format!(
+                    "cannot remove old kubeconfig copies from {}: {denied}",
+                    ctx.runtime_dir().display()
+                )]
+            );
+            let all = words(r);
+            assert!(!all.iter().any(|w| w.contains("io error")), "{all:#?}");
+        }
+        let r = default.0.unwrap();
+        assert_eq!(r.target, None);
+        let config = store.global_config_file();
+        config_row(&r, &config, &config, &denied);
+        let r = named_prod.0.unwrap();
+        assert_eq!(r.target.as_deref(), Some("prod"));
+        config_row(
+            &r,
+            &store.target_config_file("prod"),
+            &store.targets_dir(),
+            &denied,
+        );
+
+        // Only `targets` closed, and no CLI default: the list that would name the targets is
+        // the row.
+        set_default(&ctx, "");
+        let targets = store.targets_dir();
+        let _closed = cli_core::owner_only::testing::ModeGuard::closed(&targets);
+        let (r, _) = run_on(DoctorTarget::CliDefault);
+        let r = r.expect("doctor reports a target list it cannot read");
+        config_row(&r, &targets, &targets, &denied);
     }
 
     /// D.4a T71: an Info row is a fact, in no total.

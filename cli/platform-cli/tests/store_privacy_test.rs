@@ -352,3 +352,91 @@ fn a_store_root_this_account_cannot_search_is_named_never_an_empty_store() {
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+/// d4a-h N6, Unix: `doctor --no-ping` on a store this account cannot read reports, never stops.
+/// The store's root closed (the owner walk's P-3x): exit 1 for the failed `Config file
+/// readable` row, which names the root's `config.yaml` in the store's words (the OS error once,
+/// the `ls -ld` help), and This computer's rows after it; the sweep's warning names the runtime
+/// folder with the OS error alone. There it printed "warning: … io error: Permission denied",
+/// then stopped with "Error: apprafter::io::error … cannot read …/config.yaml". Only the
+/// root's `config.yaml` closed: the same row, and the CLI's own read of it (the legacy-state
+/// migration) no longer stops the run first. Never `io error:`, never an `Error:`.
+///
+/// The fence refuses a store root it cannot read before any command runs (as for
+/// `a_store_root_this_account_cannot_search_is_named_never_an_empty_store`), so the closed
+/// runs go without it, after the same command passed it on the open store.
+#[cfg(unix)]
+#[test]
+fn doctor_on_a_store_this_account_cannot_read_reports_its_rows() {
+    let sp = Spawn::new();
+    let add = ["target", "add", "prod", "--provider", "hetzner-cloud"];
+    let (code, _, stderr) = run(&sp, &[&add[..], &["--token", TOKEN]].concat(), false);
+    assert_eq!(code, Some(0), "{stderr}");
+    let store = sp.store();
+    let (_, stdout, stderr) = run(&sp, &["doctor", "--no-ping"], false);
+    assert!(
+        stdout.contains("Config file readable") && !stderr.contains("Error:"),
+        "doctor on the open store:\n{stdout}\n{stderr}"
+    );
+    let doctor = || {
+        let out = sp
+            .cmd(&["doctor", "--no-ping"])
+            .env("APPRAFTER_NO_PING", "1")
+            .env_remove("APPRAFTER_SANDBOX")
+            .output()
+            .expect("run apprafter");
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let config = store.join("config.yaml");
+    let mut wrong = Vec::new();
+    for (closed, swept) in [(store.clone(), true), (config.clone(), false)] {
+        let (code, stdout, stderr, denied) = {
+            let _closed = cli_core::owner_only::testing::ModeGuard::closed(&closed);
+            let denied = if swept {
+                std::fs::read_dir(&closed).unwrap_err()
+            } else {
+                std::fs::File::open(&closed).unwrap_err()
+            }
+            .to_string();
+            let (code, stdout, stderr) = doctor();
+            (code, stdout, stderr, denied)
+        };
+        let row = format!(
+            "cannot read {}: {denied}. This account cannot read this file or folder of the target \
+             store",
+            config.display()
+        );
+        let warning = format!(
+            "warning: cannot remove old kubeconfig copies from {}: {denied}",
+            store.join("run").display()
+        );
+        // The row, then its hint: the path, the OS error once, the help with `ls -ld`.
+        let lines: Vec<&str> = stdout.lines().collect();
+        let hint = lines
+            .iter()
+            .position(|l| *l == format!("  ✗ Config file readable ({})", config.display()))
+            .and_then(|at| lines.get(at + 1))
+            .copied()
+            .unwrap_or_default();
+        let said = format!("{stdout}\n{stderr}");
+        if code != Some(1)
+            || !unwrapped(hint).starts_with(&unwrapped(&format!("hint: {row}")))
+            || hint.matches(&denied).count() != 1
+            || !hint.contains("`ls -ld`")
+            || !stdout.contains("Checking environment...")
+            || stderr.contains(&warning) != swept
+            || said.contains("io error")
+            || stderr.contains("Error:")
+        {
+            wrong.push(format!(
+                "{} closed: exited {code:?}:\n{stdout}\n{stderr}",
+                closed.display()
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}

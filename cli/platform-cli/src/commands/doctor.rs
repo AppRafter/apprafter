@@ -89,11 +89,12 @@ pub fn run(target_override: Option<&str>, no_ping: bool) -> miette::Result<()> {
 /// target that exists: doctor reports a missing one as a row and must not create a state
 /// directory for it (deviation 3). Nor into a store other accounts can change (WI-481): doctor
 /// reports its folders, and a folder whose owner cannot be read, instead of failing on them.
+/// Nor when the store's `config.yaml` cannot be read (d4a-h N6): doctor reports it as a row.
 fn migrate_legacy_state(ctx: &Context, target_override: Option<&str>) -> cli_core::Result<()> {
     if cli_core::store_privacy::ensure_private(&ctx.store()).is_err() {
         return Ok(());
     }
-    let Some(name) = cli_core::resolve_active_target_name(&ctx.store(), target_override)? else {
+    let Ok(Some(name)) = cli_core::resolve_active_target_name(&ctx.store(), target_override) else {
         return Ok(());
     };
     // `Some(name)`: the existence check runs for the CLI default too, so a dangling pointer

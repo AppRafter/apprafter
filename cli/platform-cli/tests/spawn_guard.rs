@@ -225,6 +225,13 @@ const ALLOWED: &[(&str, &str, Rule)] = &[
         "a_store_root_this_account_cannot_search_is_named_never_an_empty_store",
         Rule::RemovesFence,
     ),
+    // d4a-h N6: doctor on the same closed root, and on a closed `config.yaml`, for the same
+    // reason; it passed the fence on the open store first.
+    (
+        "platform-cli/tests/store_privacy_test.rs",
+        "doctor_on_a_store_this_account_cannot_read_reports_its_rows",
+        Rule::RemovesFence,
+    ),
     // The fence's own rows: a removed HOME, a removed store variable, no fence at all (it
     // changes nothing unless set), and roots the fence must refuse.
     (

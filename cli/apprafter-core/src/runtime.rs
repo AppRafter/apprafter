@@ -106,16 +106,17 @@ fn stale(
 /// gone (T44: by owner, never by age); returns how many. A copy named without a start (an
 /// older AppRafter's, or an OS that did not say) goes only when its pid is gone. A missing
 /// dir is zero and is not created; a name with no pid, a link and anything else are not ours
-/// to judge.
-pub fn sweep_stale(ctx: &Context) -> CoreResult<usize> {
+/// to judge. Its error is the OS's own: a caller names the runtime dir beside it (d4a-h N6:
+/// wrapped as `CliError::Io`, doctor's warning read "…: io error: Permission denied").
+pub fn sweep_stale(ctx: &Context) -> io::Result<usize> {
     let entries = match fs::read_dir(ctx.runtime_dir()) {
         Ok(entries) => entries,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
-        Err(e) => return Err(io_error(e)),
+        Err(e) => return Err(e),
     };
     let mut removed = 0;
     for entry in entries {
-        let entry = entry.map_err(io_error)?;
+        let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
         let Some(parts) = name
             .strip_prefix(PREFIX)
@@ -133,7 +134,7 @@ pub fn sweep_stale(ctx: &Context) -> CoreResult<usize> {
             continue;
         };
         // DirEntry::metadata does not follow a symlink: a link is never ours, never removed.
-        let meta = entry.metadata().map_err(io_error)?;
+        let meta = entry.metadata()?;
         if !meta.is_file()
             || !stale(
                 crate::process::alive(pid),
@@ -146,7 +147,7 @@ pub fn sweep_stale(ctx: &Context) -> CoreResult<usize> {
         match fs::remove_file(entry.path()) {
             Ok(()) => removed += 1,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(io_error(e)),
+            Err(e) => return Err(e),
         }
     }
     Ok(removed)
