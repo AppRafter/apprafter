@@ -53,6 +53,7 @@ use apprafter_desktop_ipc::{
     OpId, OpState, OpSummary, Os, OutputStream, PlanView, Quitting, Refresh, SecretsInfo,
     SessionEvents, Settings, Subscribed, SubscriptionId, TargetAddArgs, Theme, TokenVerified,
     UiError, UnavailableReason, ALLOWED_WHILE_LOCKED, COMMANDS, LOCK_CHANGED, QUITTING,
+    STORE_CHANGED,
 };
 use cli_core::Tier;
 use ts_rs::TS;
@@ -475,15 +476,20 @@ fn ui_errors_json() -> String {
 
 fn events_ts() -> String {
     format!(
-        "// Generated from desktop/ipc/src/lock.rs and quit.rs by `just desktop-ipc-types`. Do \
-         not edit.\n\
+        "// Generated from desktop/ipc/src/lock.rs, app_info.rs and quit.rs by `just \
+         desktop-ipc-types`. Do not edit.\n\
          \n\
          /** Emitted on every lock transition, with the new `LockState`. */\n\
          export const LOCK_CHANGED = {} as const;\n\
          \n\
+         /** Emitted when a re-read finds the target store changed; no payload: read `app_info` \
+         again. */\n\
+         export const STORE_CHANGED = {} as const;\n\
+         \n\
          /** Emitted when a quit begins with operations running, with `Quitting`. */\n\
          export const QUITTING = {} as const;\n",
         ts_string(LOCK_CHANGED),
+        ts_string(STORE_CHANGED),
         ts_string(QUITTING),
     )
 }

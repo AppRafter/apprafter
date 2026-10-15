@@ -242,5 +242,7 @@ test('Linux without a polkit agent: the field comes after the refusal, and no lo
   await idle();
   expect(screen.queryByLabelText('System password')).toBeNull();
   expect(screen.getByRole('button', { name: 'Unlock' }).textContent).toBe('Unlock');
-  expect(count('app_info')).toBe(3);
+  // The start, the refusal, the unlock (D.4a F17: the first views after it read it again) and
+  // the lock.
+  expect(count('app_info')).toBe(4);
 });

@@ -6,13 +6,19 @@
 // (StoreSecretForm) is the way (D.4a T75).
 import { afterEach, expect, test } from 'bun:test';
 import { clearMocks } from '@tauri-apps/api/mocks';
-import { act, cleanup, render, screen } from '@testing-library/react';
+import { act, cleanup, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { App } from '../App';
 import * as api from '../ipc/api';
 import { resetEndedAway } from '../ipc/away';
 import { resetHeldPlans } from '../ipc/heldPlans';
-import { installMockIpc, MOCK_PASSWORD, type MockOptions, mockLockFromTerminal } from '../ipc/mock';
+import {
+  installMockIpc,
+  MOCK_PASSWORD,
+  type MockOptions,
+  mockLockFromTerminal,
+  mockUnlockFromTerminal,
+} from '../ipc/mock';
 import { MOCK_STORE_PASSWORD } from '../ipc/mock/lock';
 import { resetOperations } from '../ipc/operations';
 import { STORE_FIELD_PLACEHOLDER } from '../state/lockText';
@@ -55,3 +61,31 @@ test.each(ROUTES)('a store locked from a terminal opens in the app: %s', async (
   await userEvent.setup().type(field, `${MOCK_STORE_PASSWORD}{Enter}`);
   expect(await screen.findByRole('heading', { name: 'Open a cluster' })).toBeDefined();
 });
+
+// D.4a F17 (D-5's extra): the store locked from a terminal, then put back in files from one while
+// the app is still locked. Rust's re-read tells the page; the lock screen stops asking for a lock
+// password that no longer exists and offers the route's own way, with no focus and nothing typed.
+test.each(ROUTES)(
+  "a terminal's lock off under the locked app: the lock screen offers the system's way: %s",
+  async (_route, route) => {
+    installMockIpc({ opDelayMs: 0, secrets: 'locked', ...route });
+    render(<App />);
+    expect(await screen.findByPlaceholderText(STORE_FIELD_PLACEHOLDER)).toBeDefined();
+
+    await act(async () => {
+      await mockUnlockFromTerminal();
+    });
+    await waitFor(() =>
+      expect(screen.queryByPlaceholderText(STORE_FIELD_PLACEHOLDER) === null).toBe(true),
+    );
+    expect(screen.getByRole('heading', { name: 'AppRafter is locked' })).toBeDefined();
+    const user = userEvent.setup();
+    if ('auth' in route) {
+      await user.type(screen.getByLabelText('System password'), `${MOCK_PASSWORD}{Enter}`);
+    } else {
+      await user.click(screen.getByRole('button', { name: 'Unlock' }));
+    }
+    expect(await screen.findByRole('heading', { name: 'Open a cluster' })).toBeDefined();
+    expect(screen.getByText('Target store ~/.config/apprafter · Secrets: in files')).toBeDefined();
+  },
+);

@@ -140,6 +140,33 @@ test('a protected store: its own field on the lock screen, the pins in Settings,
   await expect(security.getByRole('button', { name: 'Protect…' })).toBeVisible();
 });
 
+// D.4a F17 (D-5's extra): a terminal's `lock off` under the locked app. The mock's terminal stands
+// in for the CLI (`window.__mockTerminal`), and its re-read tells the page, as Rust's idle tick
+// does: the lock screen stops asking for a lock password that no longer exists, with no focus.
+test("a terminal's lock off under the locked app: the lock screen offers the system's Unlock", async ({
+  page,
+}, info) => {
+  await page.goto(`/${queryOf(info)}&secrets=locked`);
+  const field = page.getByPlaceholder('Lock password or recovery key');
+  await expect(field).toBeVisible();
+  await page.evaluate(() =>
+    (window as unknown as { __mockTerminal: { lockOff: () => Promise<unknown> } }).__mockTerminal
+      .lockOff()
+      .then(() => undefined),
+  );
+  await expect(field).toBeHidden();
+  await expect(page.getByRole('heading', { name: 'AppRafter is locked' })).toBeVisible();
+  await expect(
+    page.getByText('Clusters keep running. Credentials are stored in files on this computer.'),
+  ).toBeVisible();
+  await shot(page, info, 'locked, the store back in files');
+  await page.getByRole('button', { name: 'Unlock' }).click();
+  await expect(page.getByRole('heading', { name: 'Open a cluster' })).toBeVisible();
+  await expect(
+    page.getByText('Target store ~/.config/apprafter · Secrets: in files'),
+  ).toBeVisible();
+});
+
 test('the Security page: the store and every target it covers, three ways in', async ({
   page,
 }, info) => {

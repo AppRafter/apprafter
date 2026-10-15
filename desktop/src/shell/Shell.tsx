@@ -11,7 +11,8 @@
 // outside the views' Activities; while one is open the tab strip is inert, a tab click or close
 // is ignored, and every shortcut but Lock waits, while the title bar's caption buttons stay
 // live. The window gaining the focus reads app_info again, and lock_info where the Security
-// page shows it: a terminal may have put the store back in files meanwhile.
+// page shows it: a terminal may have put the store back in files meanwhile. So does Rust's word
+// that its re-read found the store changed (STORE_CHANGED, D.4a F17), with no focus.
 // Each tab view has a scope (ipc/lifecycle.ts) that ends when the tab closes, however it closes,
 // and Settings one that ends when it closes: what their screens started goes with them. Never on
 // an effect cleanup: a hidden tab's Activity runs those without the tab closing.
@@ -20,6 +21,7 @@ import { getCurrentWindow } from '@tauri-apps/api/window';
 import { Activity, useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { WarningCircleIcon } from '../components/icons';
 import { ToastViewport, useToast } from '../components/Toast';
+import { onStoreChanged } from '../ipc/events';
 import { newScope, type ScopeHandle, sessionScope } from '../ipc/lifecycle';
 import { useListRefresh } from '../ipc/listRefresh';
 import { refreshList, useOperations } from '../ipc/operations';
@@ -127,8 +129,11 @@ export function Shell() {
     const unlisten = getCurrentWindow().onFocusChanged(({ payload: focused }) => {
       if (focused) rereadLock(client);
     });
+    // Rust's idle tick, or any re-read, found the store changed (D.4a F17).
+    const store = onStoreChanged(() => rereadLock(client));
     return () => {
       unlisten.then((off) => off()).catch(report('unlisten'));
+      store.then((off) => off()).catch(report('unlisten'));
     };
   }, [client]);
 

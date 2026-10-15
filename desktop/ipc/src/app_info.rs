@@ -17,6 +17,11 @@ pub enum Os {
     Linux,
 }
 
+/// The event a re-read of the target store emits when it finds the store's [`SecretsInfo`]
+/// changed since the shell last reported it (D.4a F17): a terminal's `lock on` or `lock off`, a
+/// store root others can now change. No payload: the page reads `app_info` again, locked or not.
+pub const STORE_CHANGED: &str = "store-changed";
+
 /// Where the target store keeps its secrets, as the lock screen, the Target screen, the Targets
 /// page's line and the Security page show it (D.4a §3.14, WI-476): in files, or in a vault and
 /// what opens it.
@@ -122,6 +127,11 @@ mod tests {
             serde_json::to_string(&info).unwrap(),
             r#"{"os":"linux","desktopVersion":"0.1.0","coreVersion":"0.2.80","secrets":{"mode":"files","slots":[],"protected":false,"store":"~/.config/apprafter","problem":null},"account":"rem","host":"box","auth":{"available":false,"method":null,"unavailable":"no_backend","biometricsChoice":false,"passwordField":false},"sessionEvents":{"lock":true,"sleep":false},"testBuild":false,"settingsNotice":null}"#
         );
+    }
+
+    #[test]
+    fn the_store_changed_event_has_its_wire_name() {
+        assert_eq!(STORE_CHANGED, "store-changed");
     }
 
     #[test]

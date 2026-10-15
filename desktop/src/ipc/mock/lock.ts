@@ -72,6 +72,8 @@ export interface MockLock {
   readonly handlers: Readonly<Record<string, Handler>>;
   /** A terminal's `apprafter lock on` under the app: the store is protected from now. */
   readonly lockFromTerminal: () => void;
+  /** A terminal's `apprafter lock off` under the app: the secrets are in files from now. */
+  readonly unlockFromTerminal: () => void;
 }
 
 /** As the core's `lock::on::title` names them: "targets: a, b", or "no targets". */
@@ -322,6 +324,9 @@ export function mockLock(
     handlers,
     lockFromTerminal: () => {
       mode = 'locked';
+    },
+    unlockFromTerminal: () => {
+      mode = 'files';
     },
   };
 }

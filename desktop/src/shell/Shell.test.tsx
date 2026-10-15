@@ -9,6 +9,7 @@ import { ToastProvider } from '../components/Toast';
 import * as api from '../ipc/api';
 import { keepEndedAway, resetEndedAway } from '../ipc/away';
 import type { AppInfo } from '../ipc/generated/AppInfo';
+import { STORE_CHANGED } from '../ipc/generated/events';
 import type { OpSummary } from '../ipc/generated/OpSummary';
 import type { PlanView } from '../ipc/generated/PlanView';
 import type { Settings } from '../ipc/generated/Settings';
@@ -486,6 +487,23 @@ describe('Shell', () => {
       await screen.findByText("Secrets are in files; the lock only covers this app's window."),
     ).toBeDefined();
     // The page is shown, so its report is read again too.
+    await waitFor(() => expect(count('lock_info') > lockInfos).toBe(true));
+  });
+
+  // D.4a F17: Rust's re-read says the store changed (the idle tick saw a terminal's `lock off`,
+  // a root others can now change): the page follows with no focus.
+  test("Rust's word that the store changed reads app_info and the shown Security page again", async () => {
+    appInfoNow = { ...INFO, secrets: { ...INFO.secrets, mode: 'locked', protected: true } };
+    const user = await gatedShell();
+    await user.click(screen.getByRole('button', { name: 'Security' }));
+    expect(await screen.findByText('Secrets are encrypted; unlocking opens them.')).toBeDefined();
+    await settleIpc();
+    const lockInfos = count('lock_info');
+    appInfoNow = INFO;
+    await emit(STORE_CHANGED, null);
+    expect(
+      await screen.findByText("Secrets are in files; the lock only covers this app's window."),
+    ).toBeDefined();
     await waitFor(() => expect(count('lock_info') > lockInfos).toBe(true));
   });
 

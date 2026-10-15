@@ -17,7 +17,7 @@ mod targets;
 pub mod commands;
 pub mod errors;
 
-pub use app_info::{AppInfo, Os, SecretsInfo, SessionEvents};
+pub use app_info::{AppInfo, Os, SecretsInfo, SessionEvents, STORE_CHANGED};
 pub use auth::{AuthInfo, AuthMethod, AuthOutcome, CancelledBy, UnavailableReason};
 pub use commands::{ALLOWED_WHILE_LOCKED, COMMANDS};
 pub use lock::{LockOffPlan, LockOnPlan, LockReason, LockSectionInfo, LockState, LOCK_CHANGED};

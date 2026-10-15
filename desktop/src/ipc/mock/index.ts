@@ -18,14 +18,16 @@
 // (the panel with nothing to install). The target store's lock (`?secrets=`, lock.ts): in files
 // by default; a protected store's lock screen takes its lock password or recovery key, behind the
 // same back-off, and its Stop protecting asks for one. A test locks the store from a terminal under
-// the app (mockLockFromTerminal), as Rust's re-read then finds it.
+// the app (mockLockFromTerminal), or puts it back in files (mockUnlockFromTerminal), as Rust's
+// re-read then finds it and tells the page (STORE_CHANGED, D.4a F17); the Playwright smoke reaches
+// both through `window.__mockTerminal`.
 import { emit } from '@tauri-apps/api/event';
 import { mockIPC, mockWindows } from '@tauri-apps/api/mocks';
 import type { AppInfo } from '../generated/AppInfo';
 import type { AuthInfo } from '../generated/AuthInfo';
 import { ALLOWED_WHILE_LOCKED } from '../generated/commands';
 import { DESKTOP_ERROR_CODES } from '../generated/errors';
-import { LOCK_CHANGED } from '../generated/events';
+import { LOCK_CHANGED, STORE_CHANGED } from '../generated/events';
 import type { LockReason } from '../generated/LockReason';
 import type { LockState } from '../generated/LockState';
 import type { Os } from '../generated/Os';
@@ -199,6 +201,9 @@ let currentStore: MockStore | null = null;
 /** The terminal lock of the last installMockIpc (mockLockFromTerminal). */
 let currentTerminalLock: (() => Promise<LockState>) | null = null;
 
+/** The terminal `lock off` of the last installMockIpc (mockUnlockFromTerminal). */
+let currentTerminalUnlock: (() => Promise<LockState>) | null = null;
+
 /** The engine of the last installMockIpc; tests register plans and reads through it. */
 export function mockOps(): MockOps {
   if (current === null) throw new Error('mock IPC: installMockIpc() has not run');
@@ -222,6 +227,23 @@ export function mockTargetStore(): MockStore {
 export function mockLockFromTerminal(): Promise<LockState> {
   if (currentTerminalLock === null) throw new Error('mock IPC: installMockIpc() has not run');
   return currentTerminalLock();
+}
+
+/**
+ * A terminal's `apprafter lock off` under the app (D.4a F17, D-5): the mock's store is in files
+ * from now, and Rust's re-read tells the page. A locked app stays locked while its lock is in
+ * effect — the system's way opens it now — and unlocks when it is not, as Rust's `set_protected`
+ * does. The answer is the lock state that results.
+ */
+export function mockUnlockFromTerminal(): Promise<LockState> {
+  if (currentTerminalUnlock === null) throw new Error('mock IPC: installMockIpc() has not run');
+  return currentTerminalUnlock();
+}
+
+/** What the Playwright smoke calls from the page: a terminal's `lock on` and `lock off`. */
+export interface MockTerminal {
+  readonly lockOn: () => Promise<LockState>;
+  readonly lockOff: () => Promise<LockState>;
 }
 
 export function installMockIpc(options: MockOptions = {}): void {
@@ -336,9 +358,23 @@ export function installMockIpc(options: MockOptions = {}): void {
   const lockStore = mockLock(engine, options.secrets ?? 'files', () => namesIn(store));
   // Rust's gate for the store's secret: one back-off with the PAM field's, no PAM words.
   const verifyStoreSecret = verifyWith(lockStore.opens, []);
+  // As Rust's re-read: the lock follows the store first, then the page is told it changed.
   currentTerminalLock = async () => {
     lockStore.lockFromTerminal();
-    return lock.locked ? lock : transition('secrets_locked');
+    const state = lock.locked ? lock : await transition('secrets_locked');
+    await emit(STORE_CHANGED, null);
+    return state;
+  };
+  currentTerminalUnlock = async () => {
+    lockStore.unlockFromTerminal();
+    const inEffect = settings.lockEnabled && auth.available;
+    const state = lock.locked && !inEffect ? await transition(null) : lock;
+    await emit(STORE_CHANGED, null);
+    return state;
+  };
+  (window as unknown as { __mockTerminal?: MockTerminal }).__mockTerminal = {
+    lockOn: mockLockFromTerminal,
+    lockOff: mockUnlockFromTerminal,
   };
 
   const handlers: Record<string, Handler> = {

@@ -177,6 +177,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     let host = env::desktop_host(&tools, app.path().app_local_data_dir()?.join("run"));
     let context = env::desktop_context(&env, host)?;
     let handle = app.handle().clone();
+    // D.4a F17: a re-read that finds the store changed tells the page, locked or not.
+    let store_handle = app.handle().clone();
     let shell = app::Shell::new_with(
         settings,
         auth,
@@ -189,6 +191,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             display,
             ssh_agent: env::ssh_agent(&env),
             clipboard: Some(secret_clip::SystemClipboard::maker()),
+            on_store_change: Box::new(move |_| app::emit_store_changed(&store_handle)),
             ..app::ShellExtras::default()
         },
         move |state| app::emit_lock_changed(&handle, state),

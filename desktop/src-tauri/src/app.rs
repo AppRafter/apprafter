@@ -62,6 +62,15 @@
 //! tick sees the file change ([`Shell::recheck_if_changed`]), and follows it: protected
 //! without the key held, the app locks with `SecretsLocked`; back in files, the key goes and the
 //! lock's settings are no longer pinned. The lock screen's field opens the vault there.
+//!
+//! A re-read that finds the store's `SecretsInfo` changed since the shell last reported it tells
+//! the page ([`ShellExtras::on_store_change`]; the app emits [`STORE_CHANGED`]), locked or not
+//! (D.4a F17): the lock screen lives outside the page's shell, whose own listeners stop while
+//! locked, and a terminal's `lock off` under a locked app would otherwise leave it asking for a
+//! lock password that no longer exists. The idle tick's look at the store
+//! ([`StoreStamp`]) also takes the root folder's mode and owner on Unix, so a root others can
+//! now change is noticed without a focus; a loosened folder below the root is noticed at the
+//! next focus or re-read.
 
 use std::io;
 use std::panic::{self, AssertUnwindSafe};
@@ -78,8 +87,8 @@ use apprafter_core::lock::{HolderHardening, UnlockWindow};
 use apprafter_core::secrets::{VaultAccess, STORE_FILE};
 use apprafter_core::{Context, CoreError, SecretString};
 use apprafter_desktop_ipc::{
-    AppInfo, LockReason, LockState, OpId, Os, PlanView, Quitting, SessionEvents, Settings,
-    SubscriptionId, UnavailableReason, LOCK_CHANGED, QUITTING,
+    AppInfo, LockReason, LockState, OpId, Os, PlanView, Quitting, SecretsInfo, SessionEvents,
+    Settings, SubscriptionId, UnavailableReason, LOCK_CHANGED, QUITTING, STORE_CHANGED,
 };
 use apprafter_os_auth::{Listening, SessionEvent, SessionWatch};
 use tauri::ipc::Invoke;
@@ -141,8 +150,13 @@ pub const SESSION_LATE_POLL: Duration = Duration::from_millis(250);
 /// What the OS session watch calls with each signal.
 pub type SessionCallback = Box<dyn Fn(SessionEvent) + Send>;
 
-/// What only the running app knows of itself, given to [`Shell::new_with`] (`lib.rs`); every
-/// test's shell takes the default — nothing hardened, so nothing claimed.
+/// What a re-read calls when it finds the store's `SecretsInfo` changed, with the new one
+/// ([`ShellExtras::on_store_change`]).
+pub type StoreNotice = Box<dyn Fn(&SecretsInfo) + Send + Sync>;
+
+/// What only the running app knows of itself, and how it tells the page the store changed, given
+/// to [`Shell::new_with`] (`lib.rs`); every test's shell takes the default — nothing hardened, so
+/// nothing claimed, and nobody told.
 pub struct ShellExtras {
     /// What the process did to protect itself before any secret (D.4a T77, `harden`).
     pub hardening: HolderHardening,
@@ -156,6 +170,10 @@ pub struct ShellExtras {
     pub clipboard: Option<ClipboardMaker>,
     /// Locks the held key's page in memory (D.4a T77; `vault_access`): the OS's, a test's.
     pub pager: Arc<dyn Pager>,
+    /// Called when a re-read finds the store's `SecretsInfo` changed since the last report
+    /// (D.4a F17; [`Shell::recheck`]): the app emits [`STORE_CHANGED`]. Never under the lock
+    /// machine's lock, nor under the re-read's own: it may call into the shell.
+    pub on_store_change: StoreNotice,
 }
 
 impl Default for ShellExtras {
@@ -166,6 +184,7 @@ impl Default for ShellExtras {
             ssh_agent: None,
             clipboard: None,
             pager: Arc::new(OsPager),
+            on_store_change: Box::new(|_| {}),
         }
     }
 }
@@ -194,17 +213,29 @@ impl Drop for FlowGuard {
 }
 
 /// What the idle tick compares to notice the store changed under the app (D.4a T74; critic
-/// B finding 19): `store.yaml`'s length and modification time, or its absence. A `stat`.
+/// B finding 19): `store.yaml`'s length and modification time, or its absence; on Unix also the
+/// root folder's mode and owner (D.4a F17), so a root others can now change — or that is the
+/// account's alone again — is noticed within a tick. The root only: a folder below it is
+/// noticed at the next focus or re-read. Two `stat`s.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StoreStamp(Option<(u64, Option<SystemTime>)>);
+pub struct StoreStamp {
+    file: Option<(u64, Option<SystemTime>)>,
+    #[cfg(unix)]
+    root: Option<(u32, u32)>,
+}
 
 impl StoreStamp {
     pub fn read(root: &std::path::Path) -> StoreStamp {
-        StoreStamp(
-            std::fs::metadata(root.join(STORE_FILE))
+        StoreStamp {
+            file: std::fs::metadata(root.join(STORE_FILE))
                 .ok()
                 .map(|m| (m.len(), m.modified().ok())),
-        )
+            #[cfg(unix)]
+            root: std::fs::metadata(root).ok().map(|m| {
+                use std::os::unix::fs::MetadataExt;
+                (m.mode(), m.uid())
+            }),
+        }
     }
 }
 
@@ -420,6 +451,9 @@ pub struct Shell {
     rechecks: Mutex<()>,
     /// `store.yaml` as the idle tick last saw it ([`Shell::recheck_if_changed`]).
     store_seen: Mutex<StoreStamp>,
+    /// The store's `SecretsInfo` as the page was last told it (at start: as the first read
+    /// found it); a re-read that finds another tells the page ([`ShellExtras::on_store_change`]).
+    reported: Mutex<SecretsInfo>,
 }
 
 /// The tickers' stop signal: a ticker waits on it between ticks, so stopping wakes it at once.
@@ -534,6 +568,7 @@ impl Shell {
         let context = context.with_vault_access(vault.clone());
         let protection = Protection::read(context.config_root(), context.home_dir());
         let store_seen = Mutex::new(StoreStamp::read(context.config_root()));
+        let reported = Mutex::new(protection.info());
         let hook: LockHook = {
             let (ops, drafts, vault, clipboard) = (
                 ops.clone(),
@@ -583,6 +618,7 @@ impl Shell {
             appearance,
             extras,
             store_seen,
+            reported,
             vault,
             lock_ons: LockOnTable::default(),
             clipboard,
@@ -657,21 +693,37 @@ impl Shell {
     /// key; a file read, never on the main thread. One at a time. A key goes only when one is
     /// held: a re-read of an unchanged store moves nothing, so a Protect plan waiting for its
     /// confirm keeps its key at the end (T64).
+    ///
+    /// A re-read whose `SecretsInfo` differs from the last one the page was told tells it
+    /// ([`ShellExtras::on_store_change`], D.4a F17), once, after the lock has followed the store:
+    /// a lock this re-read causes reaches the page first. Compared and recorded one re-read at a
+    /// time; told after both locks are let go.
     pub fn recheck(&self) -> Protection {
-        let _one = self.rechecks.lock().unwrap_or_else(PoisonError::into_inner);
-        let now = Protection::read(self.context.config_root(), self.context.home_dir());
-        self.lock.set_protected(now.protected);
-        if self.flows.load(SeqCst) > 0 {
-            return now;
-        }
-        if now.protected {
-            let id = now.id.clone();
-            self.lock
-                .lock_unlocked_unless(LockReason::SecretsLocked, || {
-                    id.as_ref().is_some_and(|id| self.vault.keep_only(id))
-                });
-        } else {
-            self.vault.drop_key();
+        let (now, changed) = {
+            let _one = self.rechecks.lock().unwrap_or_else(PoisonError::into_inner);
+            let now = Protection::read(self.context.config_root(), self.context.home_dir());
+            self.lock.set_protected(now.protected);
+            if self.flows.load(SeqCst) == 0 {
+                if now.protected {
+                    let id = now.id.clone();
+                    self.lock
+                        .lock_unlocked_unless(LockReason::SecretsLocked, || {
+                            id.as_ref().is_some_and(|id| self.vault.keep_only(id))
+                        });
+                } else {
+                    self.vault.drop_key();
+                }
+            }
+            let info = now.info();
+            let mut reported = self.reported.lock().unwrap_or_else(PoisonError::into_inner);
+            let changed = (*reported != info).then(|| {
+                *reported = info.clone();
+                info
+            });
+            (now, changed)
+        };
+        if let Some(info) = changed {
+            (self.extras.on_store_change)(&info);
         }
         now
     }
@@ -1217,6 +1269,14 @@ pub fn emit_lock_changed<R: Runtime>(app: &AppHandle<R>, state: &LockState) {
     }
 }
 
+/// A re-read's notice to the webview that the store changed ([`ShellExtras::on_store_change`]):
+/// no payload, the page reads `app_info` again (D.4a F17). Called under no lock of the shell's.
+pub fn emit_store_changed<R: Runtime>(app: &AppHandle<R>) {
+    if let Err(e) = app.emit(STORE_CHANGED, ()) {
+        tracing::warn!("{STORE_CHANGED} was not delivered: {e}");
+    }
+}
+
 /// Quit (see the module docs): returns at once; a `quit` thread waits for the running
 /// operations and then exits. Only the first call does anything.
 pub fn quit<R: Runtime>(app: &AppHandle<R>, shell: &Arc<Shell>) {
@@ -1381,16 +1441,17 @@ mod tests {
     use apprafter_core::lock::limits::{DisplayKind, LimitClient};
     use apprafter_core::lock::UnlockWindow;
     use apprafter_core::secrets::testing::{locked_store, LockedTestStore};
+    use apprafter_core::secrets::SecretsMode;
     use apprafter_core::secrets::VaultRequest;
     use apprafter_core::vault::VAULT_FILE;
     use apprafter_core::{
         CancellationToken, Context, CoreError, Event, Outcome, PathSource, PlanClass, SecretString,
     };
-    use apprafter_desktop_ipc::SessionEvents;
     use apprafter_desktop_ipc::{
         errors, AuthInfo, AuthOutcome, AutoLock, CancelledBy, LockReason, LockState, OpEvent, OpId,
         OpState, Settings, UnavailableReason,
     };
+    use apprafter_desktop_ipc::{SecretsInfo, SessionEvents};
     use apprafter_os_auth::{Listening, SessionEvent};
     use serde_json::json;
 
@@ -1414,23 +1475,38 @@ mod tests {
         clock: Arc<ManualClock>,
         shell: Arc<Shell>,
         notified: Arc<Mutex<Vec<LockState>>>,
+        /// What the page was told of the store, in order (D.4a F17).
+        stores: Arc<Mutex<Vec<SecretsInfo>>>,
     }
 
-    fn rig(settings: Settings, auth: Arc<dyn Authenticator>) -> Rig {
-        let dir = tempfile::tempdir().unwrap();
+    /// A shell over `root`, its settings in `dir`, every lock change and store notice recorded.
+    fn rig_at(
+        dir: tempfile::TempDir,
+        root: std::path::PathBuf,
+        settings: Settings,
+        auth: Arc<dyn Authenticator>,
+    ) -> Rig {
         let clock = Arc::new(ManualClock::at(T0));
         let store = SettingsStore::load(dir.path(), &*clock);
         store.set(settings).unwrap();
         let notified = Arc::new(Mutex::new(Vec::new()));
+        let stores = Arc::new(Mutex::new(Vec::new()));
         let shell = {
             let notified = notified.clone();
-            Shell::new(
+            let told = stores.clone();
+            Shell::new_with(
                 store,
                 auth,
                 clock.clone(),
-                Context::for_desktop(dir.path().join("store"), "http://127.0.0.1:9"),
+                Context::for_desktop(root, "http://127.0.0.1:9"),
                 ToolSearchPath::known(Default::default(), PathSource::Explicit),
                 false,
+                super::ShellExtras {
+                    on_store_change: Box::new(move |info: &SecretsInfo| {
+                        told.lock().unwrap().push(info.clone());
+                    }),
+                    ..super::ShellExtras::default()
+                },
                 move |state| notified.lock().unwrap().push(state.clone()),
             )
         };
@@ -1440,7 +1516,14 @@ mod tests {
             clock,
             shell,
             notified,
+            stores,
         }
+    }
+
+    fn rig(settings: Settings, auth: Arc<dyn Authenticator>) -> Rig {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("store");
+        rig_at(dir, root, settings, auth)
     }
 
     fn unlocked_at_start() -> Settings {
@@ -2593,32 +2676,7 @@ mod tests {
         let root = dir.path().join("store");
         std::fs::create_dir_all(&root).unwrap();
         let made = prepare(&root);
-        let clock = Arc::new(ManualClock::at(T0));
-        let store = SettingsStore::load(dir.path(), &*clock);
-        store.set(settings).unwrap();
-        let notified = Arc::new(Mutex::new(Vec::new()));
-        let shell = {
-            let notified = notified.clone();
-            Shell::new(
-                store,
-                auth,
-                clock.clone(),
-                Context::for_desktop(root, "http://127.0.0.1:9"),
-                ToolSearchPath::known(Default::default(), PathSource::Explicit),
-                false,
-                move |state| notified.lock().unwrap().push(state.clone()),
-            )
-        };
-        assert!(shell.auth.settled(LONG), "the authenticator never answered");
-        (
-            Rig {
-                _dir: dir,
-                clock,
-                shell,
-                notified,
-            },
-            made,
-        )
+        (rig_at(dir, root, settings, auth), made)
     }
 
     fn locked_rig() -> (Rig, LockedTestStore) {
@@ -2864,6 +2922,82 @@ mod tests {
         locked_store(&root, &[]);
         super::idle_tick(&r.shell);
         assert_eq!(r.shell.lock.state().reason, Some(LockReason::SecretsLocked));
+    }
+
+    /// D.4a F17 (D-5's extra): a terminal's `lock off` under the locked app — the lock still in
+    /// effect, so the app stays locked — reaches the page once, from the idle tick: its lock
+    /// screen otherwise asked for a lock password that no longer exists. Later re-reads of the
+    /// unchanged store, the page's own app_info included, tell it nothing more.
+    #[test]
+    fn a_terminal_lock_off_under_the_locked_app_tells_the_page_once() {
+        let (r, _store) =
+            rig_with_store(unlocked_at_start(), fake(), |root| locked_store(root, &[]));
+        assert!(r.shell.lock.state().locked);
+        let root = r.shell.context.config_root().to_path_buf();
+        std::fs::remove_file(root.join(VAULT_FILE)).unwrap();
+        std::fs::remove_file(root.join("store.yaml")).unwrap();
+        r.shell.recheck_if_changed();
+        assert!(r.shell.lock.state().locked, "the lock is still in effect");
+        {
+            let told = r.stores.lock().unwrap();
+            assert_eq!(told.len(), 1, "{told:?}");
+            assert_eq!(told[0].mode, SecretsMode::Files);
+            assert!(!told[0].protected && told[0].problem.is_none());
+        }
+        r.shell.recheck_if_changed();
+        r.shell.recheck();
+        assert!(!r.shell.app_info().secrets.protected);
+        assert_eq!(r.stores.lock().unwrap().len(), 1);
+    }
+
+    /// D.4a F17: re-reads of a store that did not change tell the page nothing — in files, and
+    /// protected with the key held — whichever way they come.
+    #[test]
+    fn a_re_read_of_an_unchanged_store_tells_the_page_nothing() {
+        let r = rig(unlocked_at_start(), Arc::new(NoAuthenticator));
+        r.shell.app_info();
+        r.shell.recheck();
+        r.shell.recheck_if_changed();
+        super::idle_tick(&r.shell);
+        assert!(r.stores.lock().unwrap().is_empty());
+        let (r, store) = locked_rig();
+        r.shell.unlock_with_password(secret(&store)).unwrap();
+        r.shell.app_info();
+        r.shell.recheck();
+        super::idle_tick(&r.shell);
+        assert!(r.stores.lock().unwrap().is_empty());
+    }
+
+    /// D.4a F17 (P-6, P-7): a store root others can change is noticed by the idle tick with no
+    /// focus — its mode is part of the stamp — and the page is told the problem; the root made
+    /// the account's alone again is told too.
+    #[cfg(unix)]
+    #[test]
+    fn a_store_root_others_can_change_reaches_the_page_from_the_idle_tick() {
+        use std::os::unix::fs::PermissionsExt;
+        let (r, _store) =
+            rig_with_store(unlocked_at_start(), fake(), |root| locked_store(root, &[]));
+        let root = r.shell.context.config_root().to_path_buf();
+        let mode = |m: u32| {
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(m)).unwrap();
+        };
+        mode(0o777);
+        r.shell.recheck_if_changed();
+        {
+            let told = r.stores.lock().unwrap();
+            assert_eq!(told.len(), 1, "{told:?}");
+            let problem = told[0].problem.as_ref().expect("the problem is told");
+            assert_eq!(
+                problem.code.as_deref(),
+                Some(apprafter_core::error::codes::STORE_NOT_PRIVATE),
+                "{problem:?}"
+            );
+        }
+        mode(0o700);
+        r.shell.recheck_if_changed();
+        let told = r.stores.lock().unwrap();
+        assert_eq!(told.len(), 2, "{told:?}");
+        assert!(told[1].problem.is_none() && told[1].protected);
     }
 
     /// T64 (the Rust verifier's finding 2): re-reads of an unchanged store — app_info, a
