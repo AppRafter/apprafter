@@ -275,7 +275,7 @@ impl Inner {
             root,
             id,
             &self.intro(root),
-            &crate::holder_window::inline_prompt(root, INLINE_PROMPT),
+            &crate::holder_window::inline_prompt(root, id, INLINE_PROMPT),
             self.policy,
         )?;
         crate::holder_window::after_prompt(

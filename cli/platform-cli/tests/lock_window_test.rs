@@ -348,6 +348,61 @@ fn the_inline_prompt_starts_a_window() {
     ip.assert();
 }
 
+/// d4a-h F3 (matrix C-10): a change to the store inside this terminal's open window —
+/// `lock on --timeout 15` — asks for the lock password anyway, with a question that promises no
+/// window, and once answered says nothing of the window: its holder still serves, so it is
+/// never called one that "does not answer". The window goes on as it was: `lock status` reports
+/// it, and the next command with no terminal of its own is served by it.
+#[test]
+fn a_change_inside_the_window_asks_and_leaves_the_window_alone() {
+    let mut api = mockito::Server::new();
+    let ip = json_route(&mut api, "/v1/servers/42", 200, SERVER_42_BODY, TOKEN)
+        .expect(1)
+        .create();
+    let (sp, key, _) = store(&api.url());
+    let mut t = Terminal::start(
+        &sp,
+        r#""$1" unlock; echo "step: unlock $?"
+"$1" lock on --timeout 15; echo "step: on $?"
+"$1" lock status </dev/null; echo "step: status $?"
+"$1" target ip </dev/null; echo "step: ip $?"
+"$1" lock now; echo "step: now $?""#,
+    );
+    t.shows(PROMPT, 1);
+    t.type_line(&key);
+    assert_eq!(t.step(), "unlock 0", "{}", t.screen());
+    t.shows(PROMPT, 2);
+    t.type_line(&key);
+    assert_eq!(t.step(), "on 0", "{}", t.screen());
+    assert!(t.stdout().contains("now last 15 min"), "{}", t.stdout());
+    assert_eq!(t.step(), "status 0", "{}", t.screen());
+    assert!(
+        t.stdout().contains("This terminal:  unlocked, "),
+        "{}",
+        t.stdout()
+    );
+    assert_eq!(t.step(), "ip 0", "{}", t.screen());
+    assert!(t.stdout().contains("203.0.113.10"), "{}", t.stdout());
+    assert_eq!(t.step(), "now 0", "{}", t.screen());
+    let screen = t.finish();
+    assert!(!screen.contains("does not answer"), "{screen}");
+    assert!(!screen.contains("(unlocks this terminal for"), "{screen}");
+    assert!(!screen.contains("No unlock window"), "{screen}");
+    assert!(
+        screen.contains(
+            "Lock password or recovery key (a change to the store asks even in an unlocked \
+             terminal): "
+        ),
+        "{screen}"
+    );
+    assert_eq!(
+        screen.matches(PROMPT).count(),
+        2,
+        "asked other than once by unlock and once by the change:\n{screen}"
+    );
+    ip.assert();
+}
+
 /// T51, T69: a process of another session — an agent's tool that is not this terminal's — gets
 /// `store_locked` and nothing from the window, which goes on serving this terminal. T35: inside
 /// the window, `HCLOUD_TOKEN` on the locked store is still refused before anything is read.

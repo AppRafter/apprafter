@@ -554,6 +554,11 @@ struct Window {
     /// holds the place, so a prompt here promises no window and starts none — a start could
     /// only meet it again, and name it twice.
     hung: Arc<AtomicBool>,
+    /// Set when this terminal's holder of the store answered `Status` right before this
+    /// process's own prompt ([`Window::serving_holder`]): a change to the store asks even
+    /// inside a window (d4a-h F3), and that window goes on as it is — the prompt promises none
+    /// and starts none, and the holder that keeps the place is no holder that "does not answer".
+    serving: AtomicBool,
     /// How a holder is started ([`start_window`]; a counter in the unit tests).
     start: StartFn,
     /// Whether this CLI leads its own session ([`leads_own_session`]; a constant in the unit
@@ -624,14 +629,17 @@ impl Window {
 
     /// The minutes a command's own prompt here would open a window for (C28, T52, T56): the
     /// store's mirror of the vault's (5 without one), unless they are 0, this CLI leads its own
-    /// session, or this CLI has nowhere to put a holder (no base). Looked at before the prompt
-    /// with no I/O beyond `store.yaml`: a start that then fails says so in T59's note.
+    /// session, or this CLI has nowhere to put a holder (no base), or this terminal's window is
+    /// open already (F3). Looked at before the prompt with no I/O beyond `store.yaml` — the
+    /// holder was asked before it, by [`Window::serving_holder`]: a start that then fails says
+    /// so in T59's note.
     fn would_open(&self, root: &Path) -> Option<u32> {
         if (self.leads_session)() || self.place.init_base().is_none() {
             return None;
         }
-        // T59: a holder of this terminal named as not answering holds the place.
-        if self.hung.load(Ordering::SeqCst) {
+        // T59: a holder of this terminal named as not answering holds the place; F3: one that
+        // serves keeps its window, which the prompt leaves as it is.
+        if self.hung.load(Ordering::SeqCst) || self.serving.load(Ordering::SeqCst) {
             return None;
         }
         let minutes = apprafter_core::secrets::read_store_file(root)
@@ -642,12 +650,69 @@ impl Window {
         (minutes != 0).then_some(minutes)
     }
 
+    /// A command's own prompt here (C28): T59's note to print before it, if any, and its
+    /// question — the window its answer opens; inside this terminal's open window, that a
+    /// change to the store asks there too (F3); else that the next command asks again.
+    fn ask_line(&self, root: &Path, id: &StoreId, asked_again: &str) -> (Option<String>, String) {
+        let note = self.serving_holder(root, id);
+        let question = match self.would_open(root) {
+            Some(n) => {
+                format!("Lock password or recovery key (unlocks this terminal for {n} min): ")
+            }
+            None if self.serving.load(Ordering::SeqCst) => {
+                "Lock password or recovery key (a change to the store asks even in an unlocked \
+                 terminal): "
+                    .to_string()
+            }
+            None => asked_again.to_string(),
+        };
+        (note, question)
+    }
+
+    /// Right before a command's own prompt (d4a-h F3): whether this terminal's holder of the
+    /// store serves here. A change to the store asks even inside a window and never asks the
+    /// holder, so without this its prompt would promise a window that is open already, and its
+    /// start would meet that holder (`AlreadyRunning`) and name it as one that does not answer.
+    /// Asked with `Status`, which restarts nothing, and only while this process may still ask a
+    /// holder (rule 9: never after a refusal or a prompt) and has named none (T59). A holder
+    /// that serves this store sets `serving`; one that takes no connection, or takes it and says
+    /// nothing, is named now — T59's note, returned to print before the question — as a read's
+    /// [`Window::session`] names it; anything else changes nothing.
+    fn serving_holder(&self, root: &Path, id: &StoreId) -> Option<String> {
+        if self.hung.load(Ordering::SeqCst) {
+            return None;
+        }
+        let store = binding(root, id.as_str());
+        holder_for(&self.no_holder, || {
+            let mut client = match self.probe(&store) {
+                Ok(found) => found?,
+                Err(note) => return Some(note),
+            };
+            let pid = client.server_pid();
+            match client.status() {
+                Ok(s) if s.store_id == store.id => {
+                    self.serving.store(true, Ordering::SeqCst);
+                    None
+                }
+                Err(e) if silent(&e) => {
+                    self.no_holder.store(true, Ordering::SeqCst);
+                    self.hung.store(true, Ordering::SeqCst);
+                    Some(no_window_note(&HolderUnavailable::NotResponding { pid }))
+                }
+                // Another store's holder, a refusal, a garbled reply: no window of ours that
+                // serves, and none named — the start after the prompt says what it meets.
+                Ok(_) | Err(_) => None,
+            }
+        })
+    }
+
     /// After a prompt opened the vault: no holder from now on (rule 9), and a window for the
-    /// vault's own minutes unless they are 0 or this CLI leads its own session (T56, T52). What
-    /// to say: C30 once a holder started (O6); T59's note when none could start, or when a
-    /// holder of this terminal this process could not use holds the place (`AlreadyRunning`:
-    /// an older install's, or a silent one — `lock now` ends it, critic-d4a-e finding 13);
-    /// nothing when no window was meant.
+    /// vault's own minutes unless they are 0, this CLI leads its own session (T56, T52), or this
+    /// terminal's window, which served right before the prompt, goes on as it is (F3). What to
+    /// say: C30 once a holder started (O6); T59's note when none could start, or when a holder
+    /// of this terminal this process could not use holds the place (`AlreadyRunning`: an older
+    /// install's, or a silent one — `lock now` ends it, critic-d4a-e finding 13); nothing when
+    /// no window was meant.
     fn after_prompt(
         &self,
         root: &Path,
@@ -660,8 +725,9 @@ impl Window {
         if default_minutes == 0 || (self.leads_session)() {
             return None;
         }
-        // T59: the holder already named as not answering holds the place.
-        if self.hung.load(Ordering::SeqCst) {
+        // T59: the holder already named as not answering holds the place; F3: the holder that
+        // serves keeps its window.
+        if self.hung.load(Ordering::SeqCst) || self.serving.load(Ordering::SeqCst) {
             return None;
         }
         let store = binding(root, id.as_str());
@@ -691,6 +757,7 @@ pub(crate) fn install(place: HolderPlace) {
         place,
         no_holder: Arc::new(AtomicBool::new(false)),
         hung: Arc::new(AtomicBool::new(false)),
+        serving: AtomicBool::new(false),
         start: start_window,
         leads_session: leads_own_session,
     });
@@ -709,13 +776,19 @@ pub(crate) fn diagnostic_session(req: &VaultRequest<'_>) -> Option<Arc<dyn Vault
 }
 
 /// The question of a command's own prompt (C28; d's `Inner::key_for` asks it): "(unlocks this
-/// terminal for <n> min)" when its answer will open a window here, else `asked_again`, d's
-/// "(asked again by the next command)" (critic-d4a-e finding 7).
-pub(crate) fn inline_prompt(root: &Path, asked_again: &str) -> String {
-    match WINDOW.get().and_then(|w| w.would_open(root)) {
-        Some(n) => format!("Lock password or recovery key (unlocks this terminal for {n} min): "),
-        None => asked_again.to_string(),
+/// terminal for <n> min)" when its answer will open a window here; that a change to the store
+/// asks even in an unlocked terminal when this terminal's window serves (F3); else
+/// `asked_again`, d's "(asked again by the next command)" (critic-d4a-e finding 7). A holder of
+/// this terminal that does not answer is named first, on stderr (T59).
+pub(crate) fn inline_prompt(root: &Path, id: &StoreId, asked_again: &str) -> String {
+    let Some(w) = WINDOW.get() else {
+        return asked_again.to_string();
+    };
+    let (note, question) = w.ask_line(root, id, asked_again);
+    if let Some(note) = note {
+        eprintln!("{note}");
     }
+    question
 }
 
 /// Hook B (d's `Inner::key_for`, right after its prompt opened the vault — for a read or a
@@ -854,7 +927,7 @@ mod tests {
 
     /// The endpoint's lock taken as a living holder takes it (`LOCK_EX`, its pid written), held
     /// while the returned file is open.
-    fn hold_lock(lock: &Path, pid: u32) -> std::fs::File {
+    pub(super) fn hold_lock(lock: &Path, pid: u32) -> std::fs::File {
         let f = std::fs::File::create(lock).unwrap();
         // SAFETY: flock on the file just made, held while it stays open.
         assert_eq!(
@@ -1044,6 +1117,7 @@ mod tests {
             place: h.place.clone(),
             no_holder: Arc::new(AtomicBool::new(false)),
             hung: Arc::new(AtomicBool::new(false)),
+            serving: AtomicBool::new(false),
             start: |_, _, _, _, _| unreachable!("a holder started over one that holds the place"),
             leads_session: || false,
         };
@@ -1218,6 +1292,7 @@ mod window_tests {
             place: HolderPlace::of(&ctx),
             no_holder: Arc::new(AtomicBool::new(false)),
             hung: Arc::new(AtomicBool::new(false)),
+            serving: AtomicBool::new(false),
             start,
             leads_session: leads,
         };
@@ -1610,6 +1685,7 @@ mod session_tests {
             place: place.clone(),
             no_holder: Arc::new(AtomicBool::new(false)),
             hung: Arc::new(AtomicBool::new(false)),
+            serving: AtomicBool::new(false),
             start: |_, _, _, _, _| unreachable!("a diagnostic starts no holder"),
             leads_session: || false,
         };
@@ -1735,6 +1811,7 @@ mod session_tests {
             },
             no_holder: Arc::new(AtomicBool::new(false)),
             hung: Arc::new(AtomicBool::new(false)),
+            serving: AtomicBool::new(false),
             start: |_, _, _, _, _| unreachable!("a holder started over one that holds the place"),
             leads_session: || false,
         };
@@ -1815,6 +1892,7 @@ mod session_tests {
             },
             no_holder: Arc::new(AtomicBool::new(false)),
             hung: Arc::new(AtomicBool::new(false)),
+            serving: AtomicBool::new(false),
             start: |_, _, _, _, _| unreachable!("a probe starts no holder"),
             leads_session: || false,
         };
@@ -1876,6 +1954,7 @@ mod session_tests {
             },
             no_holder: Arc::new(AtomicBool::new(false)),
             hung: Arc::new(AtomicBool::new(false)),
+            serving: AtomicBool::new(false),
             start: |_, _, _, _, _| unreachable!("a holder started over one that holds the place"),
             leads_session: || false,
         };
@@ -1914,5 +1993,200 @@ mod session_tests {
             None,
             "the prompt names the holder again"
         );
+    }
+
+    /// A locked store with `prod`, a base under `/tmp` and the store's endpoint there, where a
+    /// fake holder plays; `(socket, lock)` of that endpoint.
+    struct Endpointed {
+        _dir: tempfile::TempDir,
+        _base: tempfile::TempDir,
+        root: PathBuf,
+        locked: LockedTestStore,
+        store: StoreBinding,
+        place: HolderPlace,
+        socket: PathBuf,
+        lock: PathBuf,
+    }
+
+    fn endpointed() -> Endpointed {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let locked = locked_store(&root, &[("prod", Some(TOKEN))]);
+        let base_dir = tempfile::TempDir::new_in("/tmp").unwrap();
+        let base = base_dir.path().join("apprafter");
+        let store = binding(&root, locked.store_id.as_str());
+        let Endpoint::Socket { path, lock } = session_endpoint(&base, &store).unwrap() else {
+            unreachable!("Unix")
+        };
+        Endpointed {
+            place: HolderPlace {
+                base: Some(base),
+                runtime_dir: root.join("run"),
+            },
+            _dir: dir,
+            _base: base_dir,
+            root,
+            locked,
+            store,
+            socket: path,
+            lock,
+        }
+    }
+
+    /// The `Status` of this store's holder, its window 5 min long.
+    fn status_of(e: &Endpointed) -> HolderStatus {
+        HolderStatus {
+            protocol: PROTOCOL,
+            version: VERSION.into(),
+            store_id: e.store.id.clone(),
+            vault_id: e.locked.vault_id,
+            left_secs: 240,
+            minutes: 5,
+            hardening: HolderHardening {
+                non_dumpable: Some(true),
+                deny_attach: None,
+                core_off: true,
+                memory_locked: true,
+                process_dacl: None,
+            },
+        }
+    }
+
+    fn window_at(e: &Endpointed, start: StartFn) -> Window {
+        Window {
+            place: e.place.clone(),
+            no_holder: Arc::new(AtomicBool::new(false)),
+            hung: Arc::new(AtomicBool::new(false)),
+            serving: AtomicBool::new(false),
+            start,
+            leads_session: || false,
+        }
+    }
+
+    /// The question a command's own prompt asks inside this terminal's open window (F3).
+    const IN_WINDOW: &str =
+        "Lock password or recovery key (a change to the store asks even in an unlocked terminal): ";
+
+    /// d4a-h F3 (matrix C-9, C-10): a change to the store asks for the lock password even inside
+    /// this terminal's open window, whose holder answers its `Status`. The prompt promises no
+    /// window and, once answered, starts none and names no holder: the window goes on as it is,
+    /// and its healthy holder is never called one that "does not answer".
+    #[test]
+    fn a_write_inside_an_open_window_names_no_silent_holder_and_starts_none() {
+        static STARTS: AtomicUsize = AtomicUsize::new(0);
+        let e = endpointed();
+        let seen = fake_at(&e.socket, vec![Some(Reply::Status(status_of(&e)))]);
+        let w = window_at(&e, |_, _, _, _, _| {
+            STARTS.fetch_add(1, Ordering::SeqCst);
+            Ok(HolderStarted::Started { pid: 1 })
+        });
+        let asked = "(asked again by the next command)";
+        assert_eq!(
+            w.ask_line(&e.root, &e.locked.store_id, asked),
+            (None, IN_WINDOW.to_string())
+        );
+        assert_eq!(kinds(&seen), ["status"]);
+        assert_eq!(
+            w.after_prompt(
+                &e.root,
+                &e.locked.store_id,
+                e.locked.data_key(),
+                e.locked.vault_id,
+                5
+            ),
+            None,
+            "the prompt said something of the window it left alone"
+        );
+        assert_eq!(STARTS.load(Ordering::SeqCst), 0, "a holder was started");
+        assert!(
+            w.no_holder.load(Ordering::SeqCst),
+            "a holder is asked after a prompt"
+        );
+    }
+
+    /// T59 before a command's own prompt (F3, matrix L-10): a holder of this terminal that
+    /// takes the connection and says nothing at its `Status`, or lives here and takes no
+    /// connection, is named once before the question — which then promises no window — and the
+    /// prompt starts none.
+    #[test]
+    fn a_silent_or_unreachable_holder_is_named_before_the_prompt() {
+        let asked = "(asked again by the next command)";
+        let no_start: StartFn =
+            |_, _, _, _, _| unreachable!("a holder started over one that holds the place");
+        // Silent at its `Status`: the fake is this process.
+        let e = endpointed();
+        let seen = fake_at(&e.socket, vec![None]);
+        let w = window_at(&e, no_start);
+        assert_eq!(
+            w.ask_line(&e.root, &e.locked.store_id, asked),
+            (
+                Some(no_window_note(&HolderUnavailable::NotResponding {
+                    pid: Some(std::process::id())
+                })),
+                asked.to_string()
+            ),
+            "silent at its Status"
+        );
+        assert_eq!(kinds(&seen), ["status"]);
+        assert!(w.hung.load(Ordering::SeqCst), "silent: not marked hung");
+        assert!(w.no_holder.load(Ordering::SeqCst), "silent: asked again");
+        assert_eq!(
+            w.after_prompt(
+                &e.root,
+                &e.locked.store_id,
+                e.locked.data_key(),
+                e.locked.vault_id,
+                5
+            ),
+            None
+        );
+        // No connection taken, the lock held: as the no-connection test of `mod tests`.
+        let e = endpointed();
+        drop(UnixListener::bind(&e.socket).unwrap());
+        let _held = super::tests::hold_lock(&e.lock, 4343);
+        let w = window_at(&e, no_start);
+        assert_eq!(
+            w.ask_line(&e.root, &e.locked.store_id, asked),
+            (
+                Some(no_window_note(&HolderUnavailable::NotResponding {
+                    pid: Some(4343)
+                })),
+                asked.to_string()
+            ),
+            "taking no connection"
+        );
+        assert!(
+            w.hung.load(Ordering::SeqCst),
+            "unreachable: not marked hung"
+        );
+        assert_eq!(
+            w.after_prompt(
+                &e.root,
+                &e.locked.store_id,
+                e.locked.data_key(),
+                e.locked.vault_id,
+                5
+            ),
+            None
+        );
+    }
+
+    /// Rule 9 (critic S1) before a prompt (F3): a process that met a refusing holder asks no
+    /// holder again — not even the `Status` before its own prompt, which then promises the window
+    /// its answer opens.
+    #[test]
+    fn a_process_that_met_a_refusing_holder_asks_no_holder_before_its_prompt() {
+        let e = endpointed();
+        let seen = fake_at(&e.socket, vec![Some(Reply::Status(status_of(&e)))]);
+        let w = window_at(&e, |_, _, _, _, _| Ok(HolderStarted::Started { pid: 1 }));
+        w.no_holder.store(true, Ordering::SeqCst);
+        assert_eq!(
+            w.ask_line(&e.root, &e.locked.store_id, "(asked again)"),
+            (
+                None,
+                "Lock password or recovery key (unlocks this terminal for 5 min): ".to_string()
+            )
+        );
+        assert!(kinds(&seen).is_empty(), "{:?}", kinds(&seen));
     }
 }
