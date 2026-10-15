@@ -7,7 +7,9 @@
 Date: 2026-10-12; amended in place 2026-10-13 before implementation, with the answers to the
 questions the D.4a plan raised, and §8's wording, with the phrase of ADR 0067's Status that
 quotes it, on 2026-10-14 (where the desktop shows the store's protection; the decision is
-unchanged). ADR for `plan.md` Phase D (sub-phase D.4). Amends
+unchanged); and on 2026-10-15, before its first release, where what was built made the text
+false: §4's socket and pipe permissions, and what §8 and Consequences say a lock does to a change
+the person confirmed before it. ADR for `plan.md` Phase D (sub-phase D.4). Amends
 [ADR 0067](0067-desktop-app-and-apprafter-core.md): it replaces the keyring bullet of its §5 and
 qualifies the other parts that ADR 0067's Status lists; §10 below names each.
 
@@ -139,6 +141,9 @@ computer only through a device-independent slot.
 
 ### 4. The per-terminal holder
 
+*Two sentences amended in place on 2026-10-15, to what was built: the socket's sticky bit (Linux
+only) and the Windows pipe (the logon session, not the user). The decision is unchanged.*
+
 `apprafter unlock` reads a slot's secret from the terminal without echo (`/dev/tty`; the console
 on Windows), and so does the first command on a locked store that needs a secret while a terminal
 is present. The prompt names the store, the command that asks, and the process that started it
@@ -153,10 +158,12 @@ built without the `get-task-allow` entitlement and which a machine set up for de
 It locks the key's pages, best effort (`mlock`; `VirtualLock` on Windows), and zeroes the key on
 exit. It listens on a socket in `$XDG_RUNTIME_DIR/apprafter/`. When that variable is unset, Linux
 uses the store's own `<root>/run/` and macOS `$TMPDIR/apprafter/`, then the per-user temporary
-directory; `lock status` names the fallback. The directory is 0700, and the socket 0600 with the
-sticky bit set, which keeps a cleaner of `$XDG_RUNTIME_DIR` away from it. On Windows the holder
-listens on a named pipe restricted to the user's SID. These permissions keep out other users only
-(see Risks). The holder serves a client only when:
+directory; `lock status` names the fallback. The directory is 0700, and the socket 0600; on
+Linux the socket also has the sticky bit set, which keeps a cleaner of `$XDG_RUNTIME_DIR` away
+from it (macOS refuses that bit on a socket). On Windows the holder listens on a named pipe that
+admits only the logon session it was started in (its logon SID). These permissions keep out other
+users (on Windows, the user's other logon sessions too), not the user's own programs (see Risks).
+The holder serves a client only when:
 
 - **Linux and macOS:** the client runs under the same uid **and** in the same session as the
   shell where the secret was typed. The peer's uid and pid come from the socket: `SO_PEERCRED` on
@@ -237,7 +244,8 @@ ADR 0067 §2 describes.
 ### 8. The desktop: one lock, in Settings › Lock and on the Security page
 
 *Wording amended in place on 2026-10-14: where the desktop shows the store's protection. The
-decision is unchanged.*
+decision is unchanged. Amended in place on 2026-10-15: what a lock does to a change the person
+confirmed before it, as built.*
 
 The application lock and the store lock become one mechanism. Settings › **Lock** holds how the
 app locks; the target store's protection has a page of its own, **Security**, in the sidebar,
@@ -258,7 +266,11 @@ signed; on Linux, the app's own password field, feeding the OS-password or lock-
 polkit's dialog yields no key, so on Linux the password field replaces it for a locked store, and
 the desktop says so, in Settings › Lock and on the Security page. The desktop does not use the
 terminal holder: it keeps the data key in its own process while the app is unlocked, and the app
-lock or sleep drops it.
+lock or sleep drops it; from then on the app starts no new read of a secret. The exception is a
+change the person confirmed before the lock: protecting, finishing or stopping protection (with
+its secret typed where it asks for one), and a token change that has already taken the key, run to
+their end or are abandoned with nothing written, and after the unlock the app says how each one
+ended.
 
 Until a gesture slot exists, only the password and recovery-key slots open a locked store. How the
 desktop opens one on Windows and macOS in D.4a, where the system prompt the app lock uses yields
@@ -322,8 +334,10 @@ Keychain.
 - A short lock password is the person's choice, made after a warning; the documentation says
   what it costs.
 - On a locked store, scripts that rely on `HCLOUD_TOKEN` or `APPRAFTER_AGE_KEY` stop working.
-- While the desktop is locked, nothing in it can decrypt a locked store's secrets, background work
-  that needs a kubeconfig included, because the app lock drops the key.
+- While the desktop is locked, nothing in it starts to decrypt a locked store's secrets,
+  background work that needs a kubeconfig included, because the app lock drops the key; only a
+  change the person confirmed before the lock runs to its end (§8; amended in place on
+  2026-10-15).
 
 ## Alternatives considered
 
@@ -452,8 +466,10 @@ Also open for the D.4a and D.4b plans:
 ## Owner
 
 Project maintainers (AppRafter core). This record was amended in place on 2026-10-13, before any
-of it was implemented, and §8's wording on 2026-10-14 (where the desktop shows the store's
-protection; the decision is unchanged); later amendments go through a follow-up ADR.
+of it was implemented, §8's wording on 2026-10-14 (where the desktop shows the store's
+protection; the decision is unchanged), and on 2026-10-15, before its first release, the
+sentences what was built had made false (listed under Status); later amendments go through a
+follow-up ADR.
 
 ## Re-evaluation
 
