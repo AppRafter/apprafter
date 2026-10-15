@@ -340,11 +340,17 @@ impl Elsewhere {
                 match listener.accept() {
                     Ok((mut conn, _)) => {
                         count += 1;
-                        // macOS hands the listener's O_NONBLOCK to the connection.
-                        conn.set_nonblocking(false).unwrap();
-                        conn.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
                         // A macOS client that finds this server is not its binary sends
-                        // nothing and lets go: nothing to answer.
+                        // nothing and lets go — often before this accept, and macOS then
+                        // refuses socket options on the connection (EINVAL): nothing to
+                        // answer, and a read sees its end at once. Otherwise, as the client
+                        // waits: blocking (macOS hands the listener's O_NONBLOCK to the
+                        // connection), bounded.
+                        if conn.set_nonblocking(false).is_err()
+                            || conn.set_read_timeout(Some(Duration::from_secs(2))).is_err()
+                        {
+                            continue;
+                        }
                         if let Ok(Request::Status) = read_request(&mut conn) {
                             let _ = write_reply(&mut conn, &Reply::Status(status.clone()));
                         }
