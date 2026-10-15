@@ -7,7 +7,7 @@
 // with `plan` answers the PlanView, and op_execute of it sends its events on the execute's
 // channel. The rest answer null (op_list: []). Operation ids are unique across every harness of
 // a test run, as Rust's are in a process: a read a test left waiting never wakes on a later test's
-// operation.
+// operation. After `holdRuns`, op_execute's events wait for the test to let them go.
 import type { Channel, InvokeArgs } from '@tauri-apps/api/core';
 import { mockIPC } from '@tauri-apps/api/mocks';
 import type { OpEvent } from '../ipc/generated/OpEvent';
@@ -37,6 +37,12 @@ export interface Harness {
   of(cmd: string): Call[];
   /** The operation ids `cmd` was answered with by `read` or `plan`, in order. */
   started(cmd: string): OpId[];
+  /**
+   * From now on op_execute's events wait, as a run that has not ended, until `end()` sends
+   * them: the test decides when a run ends, never a timer (GOTCHA-332). Call `end()` inside
+   * `act`, with `settleIpc()`, and React has applied the end once that returns.
+   */
+  holdRuns(): { end(): void };
 }
 
 let nextOpId = 100;
@@ -75,6 +81,8 @@ export function installHarness(): Harness {
   const plans = new Map<string, { view: Omit<PlanView, 'opId'>; events: readonly OpEvent[] }[]>();
   const events = new Map<OpId, readonly OpEvent[]>();
   const answered = new Map<string, OpId[]>();
+  // The runs `holdRuns` keeps from ending: their events, sent by `end()`.
+  let held: (() => void)[] | null = null;
   const assign = (cmd: string): OpId => {
     nextOpId += 1;
     answered.set(cmd, [...(answered.get(cmd) ?? []), nextOpId]);
@@ -108,11 +116,13 @@ export function installHarness(): Harness {
       const sent = events.get(args.opId as OpId) ?? [];
       const internals = (window as unknown as { __TAURI_INTERNALS__: Internals })
         .__TAURI_INTERNALS__;
-      setTimeout(() => {
+      const send = () => {
         sent.forEach((message, index) => {
           internals.runCallback(channel.id, { index, message });
         });
-      }, 0);
+      };
+      if (held === null) setTimeout(send, 0);
+      else held.push(send);
       return 2;
     }
     return cmd === 'op_list' ? [] : null;
@@ -135,5 +145,13 @@ export function installHarness(): Harness {
     },
     of: (cmd) => calls.filter((c) => c.cmd === cmd),
     started: (cmd) => answered.get(cmd) ?? [],
+    holdRuns: () => {
+      held ??= [];
+      return {
+        end: () => {
+          for (const send of held?.splice(0) ?? []) send();
+        },
+      };
+    },
   };
 }

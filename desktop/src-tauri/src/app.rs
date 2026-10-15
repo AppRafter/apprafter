@@ -258,6 +258,10 @@ struct Session {
     state: Mutex<SessionState>,
     /// Notified when `readiness` leaves `Pending`.
     known: Condvar,
+    /// How many times `app_info` began to wait for the watch: how a test tells that it waits,
+    /// or that it did not, without reading a clock (GOTCHA-332).
+    #[cfg(test)]
+    waits: AtomicUsize,
 }
 
 #[derive(Default)]
@@ -376,6 +380,8 @@ impl Session {
             if left.is_zero() {
                 break;
             }
+            #[cfg(test)]
+            self.waits.fetch_add(1, SeqCst);
             state = self
                 .known
                 .wait_timeout(state, left)
@@ -465,6 +471,10 @@ pub struct Shell {
 struct Stop {
     stopped: Mutex<bool>,
     wake: Condvar,
+    /// How many times a waiter went to wait: asked under the lock, which a stop or a nudge
+    /// takes, so a test knows a ticker waits, never guesses it from a moment (GOTCHA-332).
+    #[cfg(test)]
+    waits: AtomicUsize,
 }
 
 impl Stop {
@@ -480,7 +490,14 @@ impl Stop {
         let stopped = self.stopped.lock().unwrap_or_else(PoisonError::into_inner);
         let (stopped, _) = self
             .wake
-            .wait_timeout_while(stopped, backstop, |stopped| !*stopped && !ready())
+            .wait_timeout_while(stopped, backstop, |stopped| {
+                let wait = !*stopped && !ready();
+                #[cfg(test)]
+                if wait {
+                    self.waits.fetch_add(1, SeqCst);
+                }
+                wait
+            })
             .unwrap_or_else(PoisonError::into_inner);
         *stopped
     }
@@ -1359,10 +1376,20 @@ pub fn on_exit_requested<R: Runtime>(app: &AppHandle<R>, shell: &Arc<Shell>, api
 /// it, and [`IDLE_TICK`] is its backstop. They stop once the event loop exits
 /// ([`Shell::stop_tickers`]). An `Err` means no idle lock, so the app must not start.
 pub fn start_tickers(shell: &Arc<Shell>) -> io::Result<()> {
-    spawn_ticker("idle-ticker", IDLE_TICK, shell, |_| true, idle_tick)?;
-    spawn_ticker("output-flusher", FLUSH_TICK, shell, running, |shell| {
-        shell.ops.flush_due()
-    })
+    start_tickers_every(shell, IDLE_TICK)
+}
+
+/// [`start_tickers`], the idle ticker ticking, and both waiting while idle, every `idle`.
+fn start_tickers_every(shell: &Arc<Shell>, idle: Duration) -> io::Result<()> {
+    spawn_ticker("idle-ticker", idle, idle, shell, |_| true, idle_tick)?;
+    spawn_ticker(
+        "output-flusher",
+        FLUSH_TICK,
+        idle,
+        shell,
+        running,
+        |shell| shell.ops.flush_due(),
+    )
 }
 
 /// The idle ticker's work: lock once the idle time has passed, drop the plans one time to live
@@ -1400,10 +1427,11 @@ fn running(shell: &Shell) -> bool {
 }
 
 /// A ticker that calls `tick` every `every` while `active` holds, and otherwise sleeps until
-/// it does (asked on a nudge, and at least every [`IDLE_TICK`]).
+/// it does (asked on a nudge, and at least every `backstop`: [`IDLE_TICK`] in the app).
 fn spawn_ticker(
     name: &str,
     every: Duration,
+    backstop: Duration,
     shell: &Arc<Shell>,
     active: fn(&Shell) -> bool,
     tick: fn(&Shell),
@@ -1413,7 +1441,7 @@ fn spawn_ticker(
     thread::Builder::new()
         .name(label.clone())
         .spawn(move || loop {
-            if shell.stop.wait_until(IDLE_TICK, || active(&shell)) {
+            if shell.stop.wait_until(backstop, || active(&shell)) {
                 break;
             }
             if !active(&shell) {
@@ -1464,6 +1492,7 @@ mod tests {
     use crate::env::ToolSearchPath;
     use crate::errors::DesktopError;
     use crate::ops::test_clock::ManualClock;
+    use crate::ops::test_wait::{within, YEAR};
     use crate::ops::{EventSink, Executor, PlanParts, PLAN_TTL_MS};
     use crate::settings::SettingsStore;
 
@@ -2052,17 +2081,13 @@ mod tests {
         let ran = Arc::new(AtomicBool::new(false));
         let pending = plan(&r.shell, &ran);
 
-        let started = Instant::now();
-        r.shell.on_exit();
-        let waited = started.elapsed();
-        assert!(
-            waited >= super::FORCED_STOP_BOUND,
-            "returned after {waited:?}"
-        );
-        assert!(
-            waited < super::FORCED_STOP_BOUND + Duration::from_secs(2),
-            "returned after {waited:?}"
-        );
+        {
+            let shell = r.shell.clone();
+            within("the exit", move || shell.on_exit());
+        }
+        // It waited with its short bound, and no other, and gave up: the op ends only once let
+        // go, below (GOTCHA-332: the record, not the clock).
+        assert_eq!(r.shell.ops.stop_bounds(), [super::FORCED_STOP_BOUND]);
         assert_eq!(super::FORCED_STOP_BOUND, Duration::from_secs(3));
         op.tripped
             .recv_timeout(LONG)
@@ -2097,9 +2122,15 @@ mod tests {
         let op = stubborn(&r.shell, Arc::new(Sink::default()));
         // As the quit thread leaves it, once its own wait is over.
         r.shell.drained.store(true, SeqCst);
-        let started = Instant::now();
-        r.shell.on_exit();
-        assert!(started.elapsed() < Duration::from_secs(1));
+        {
+            let shell = r.shell.clone();
+            within("the exit", move || shell.on_exit());
+        }
+        assert!(
+            r.shell.ops.stop_bounds().is_empty(),
+            "the exit waited for the operations again: {:?}",
+            r.shell.ops.stop_bounds()
+        );
         assert!(
             op.tripped.recv_timeout(Duration::from_millis(100)).is_err(),
             "the exit cancelled nothing more"
@@ -2150,9 +2181,12 @@ mod tests {
     #[test]
     fn the_output_flusher_sleeps_while_nothing_runs() {
         let r = rig(unlocked_at_start(), Arc::new(FakeAuthenticator::new()));
+        // Idle, it waits a year: only a start's nudge wakes it. It is waiting, without a tick,
+        // before the start (GOTCHA-332: its wait, not a moment).
         super::spawn_ticker(
             "test-flusher",
             Duration::from_millis(1),
+            YEAR,
             &r.shell,
             super::running,
             |_| {
@@ -2160,18 +2194,12 @@ mod tests {
             },
         )
         .unwrap();
-        thread::sleep(Duration::from_millis(100));
+        wait_until("the flusher waits", || r.shell.stop.waits.load(SeqCst) > 0);
         assert_eq!(FLUSHES.load(SeqCst), 0, "idle: not a tick");
 
         let (id, next) = two_stages(&r.shell);
-        let started = Instant::now();
         r.shell.execute(id, Arc::new(Sink::default())).unwrap();
-        wait_until("the flusher ticked", || FLUSHES.load(SeqCst) > 2);
-        assert!(
-            started.elapsed() < super::IDLE_TICK / 2,
-            "the start woke it, not the backstop: {:?}",
-            started.elapsed()
-        );
+        wait_until("the start woke the flusher", || FLUSHES.load(SeqCst) > 2);
 
         next.send(()).unwrap();
         wait_until("the operation ended", || r.shell.ops.running() == 0);
@@ -2184,22 +2212,17 @@ mod tests {
 
     #[test]
     fn the_tickers_stop_as_soon_as_the_event_loop_exits() {
-        // The ticker threads hold the shell; stopped, they let it go — without waiting out
-        // the idle ticker's five seconds.
+        // The ticker threads hold the shell; stopped, they let it go at once — without waiting
+        // out a tick: every wait of theirs is a year long here, so only the stop can end it
+        // (GOTCHA-332).
         let r = rig(unlocked_at_start(), Arc::new(NoAuthenticator));
         let weak = Arc::downgrade(&r.shell);
-        super::start_tickers(&r.shell).unwrap();
-        let started = Instant::now();
+        super::start_tickers_every(&r.shell, YEAR).unwrap();
+        // Both wait before the stop, so its wake is what ends their waits.
+        wait_until("the tickers wait", || r.shell.stop.waits.load(SeqCst) >= 2);
         r.shell.stop_tickers();
         drop(r);
-        while weak.strong_count() > 0 {
-            assert!(
-                started.elapsed() < super::IDLE_TICK,
-                "a ticker still holds the shell after {:?}",
-                started.elapsed()
-            );
-            thread::sleep(Duration::from_millis(5));
-        }
+        wait_until("the tickers let the shell go", || weak.strong_count() == 0);
     }
 
     /// The OS session watch as a test drives it: what it hears once set up (`None`: not set up
@@ -2240,15 +2263,6 @@ mod tests {
     impl Watched {
         fn signal(&self, event: SessionEvent) {
             (self.callback.lock().unwrap().as_ref().expect("a watch"))(event);
-        }
-
-        /// The watch is set up a moment from now, hearing `listening`.
-        fn set_up_after(&self, after: Duration, listening: Listening) {
-            let slot = self.listening.clone();
-            thread::spawn(move || {
-                thread::sleep(after);
-                *slot.lock().unwrap() = Some(listening);
-            });
         }
     }
 
@@ -2320,24 +2334,26 @@ mod tests {
     #[test]
     fn app_info_says_what_the_watch_hears_and_waits_for_it_within_its_bound() {
         let r = rig(unlocked_at_start(), Arc::new(FakeAuthenticator::new()));
-        let started = Instant::now();
         assert_eq!(
             r.shell.app_info().session_events,
             events(false, false),
             "no watch"
         );
-        assert!(started.elapsed() < Duration::from_millis(500), "no wait");
+        assert_eq!(r.shell.session.waits.load(SeqCst), 0, "no wait");
 
-        // Set up a moment after it starts: the first answer waits for it.
-        let watched = watch(&r.shell, None, LONG, None);
-        watched.set_up_after(Duration::from_millis(60), BOTH);
-        let started = Instant::now();
-        assert_eq!(r.shell.app_info().session_events, events(true, true));
-        let waited = started.elapsed();
-        assert!(
-            waited >= Duration::from_millis(40) && waited < LONG,
-            "{waited:?}"
-        );
+        // Set up once the first answer waits for it (GOTCHA-332: an event, not a moment): the
+        // answer waits for it, up to a year.
+        let watched = watch(&r.shell, None, YEAR, None);
+        let answer = {
+            let shell = r.shell.clone();
+            thread::spawn(move || shell.app_info().session_events)
+        };
+        wait_until("app_info waits for the watch", || {
+            r.shell.session.waits.load(SeqCst) > 0
+        });
+        *watched.listening.lock().unwrap() = Some(BOTH);
+        let answer = within("app_info", move || answer.join().unwrap());
+        assert_eq!(answer, events(true, true));
     }
 
     /// A watch that sets up nothing (no bus: WSL, a container) says so, and so does one that
@@ -2362,14 +2378,12 @@ mod tests {
             ),
             (BOTH, events(true, true)),
         ] {
+            // Answered once known: its bound a year away, only the watch's answer ends a wait.
             let r = rig(unlocked_at_start(), Arc::new(FakeAuthenticator::new()));
-            let _watched = watch(&r.shell, Some(listening), LONG, None);
-            let started = Instant::now();
-            assert_eq!(r.shell.app_info().session_events, expected, "{listening:?}");
-            assert!(
-                started.elapsed() < LONG / 2,
-                "{listening:?}: answered once known"
-            );
+            let _watched = watch(&r.shell, Some(listening), YEAR, None);
+            let shell = r.shell.clone();
+            let heard = within("app_info", move || shell.app_info().session_events);
+            assert_eq!(heard, expected, "{listening:?}");
         }
     }
 
@@ -2381,12 +2395,13 @@ mod tests {
         let bound = Duration::from_millis(150);
         let started = Instant::now();
         let watched = watch(&r.shell, None, bound, None);
+        // Not set up: the first answer waits no further than the bound, after which it is past.
         assert_eq!(r.shell.app_info().session_events, events(false, false));
-        assert!(started.elapsed() >= bound - Duration::from_millis(50));
-        let asked = Instant::now();
+        let waits = r.shell.session.waits.load(SeqCst);
         assert_eq!(r.shell.app_info().session_events, events(false, false));
-        assert!(
-            asked.elapsed() < Duration::from_millis(100),
+        assert_eq!(
+            r.shell.session.waits.load(SeqCst),
+            waits,
             "past the bound, no wait"
         );
         // Set up only once the watch was asked past the bound, when the readiness thread knows
@@ -2464,35 +2479,44 @@ mod tests {
 
     #[test]
     fn a_nudge_wakes_a_waiter_once_its_condition_holds_and_the_backstop_bounds_it() {
+        // The waiter's backstop a year away: only the nudge can end its wait. It is waiting
+        // once it has asked `ready` (a nudge takes the lock it asks under), not after a moment
+        // (GOTCHA-332).
         let stop = Arc::new(super::Stop::default());
         let ready = Arc::new(AtomicBool::new(false));
+        let (asked_tx, asked) = mpsc::channel();
         let waiter = {
             let (stop, ready) = (stop.clone(), ready.clone());
-            thread::spawn(move || stop.wait_until(LONG, || ready.load(SeqCst)))
+            thread::spawn(move || {
+                stop.wait_until(YEAR, || {
+                    let _ = asked_tx.send(());
+                    ready.load(SeqCst)
+                })
+            })
         };
-        thread::sleep(Duration::from_millis(20));
+        asked.recv_timeout(LONG).expect("the waiter asked");
         ready.store(true, SeqCst);
-        let started = Instant::now();
         stop.nudge();
-        assert!(!waiter.join().unwrap(), "woken, not stopped");
-        assert!(started.elapsed() < LONG);
-        let started = Instant::now();
-        assert!(!stop.wait_until(Duration::from_millis(20), || false));
-        assert!(started.elapsed() >= Duration::from_millis(20));
+        let stopped = within("the nudged waiter", move || waiter.join().unwrap());
+        assert!(!stopped, "woken, not stopped");
+        // Nothing to wake it: the backstop alone ends the wait.
+        let backstopped = stop.clone();
+        assert!(!within("a backstopped wait", move || {
+            backstopped.wait_until(Duration::from_millis(20), || false)
+        }));
         stop.stop();
         assert!(stop.wait_until(LONG, || false), "stopped");
     }
 
     #[test]
     fn a_stop_signal_waits_out_its_interval_until_stopped() {
-        let stop = super::Stop::default();
-        let started = Instant::now();
-        assert!(!stop.wait(Duration::from_millis(20)));
-        assert!(started.elapsed() >= Duration::from_millis(20));
+        let stop = Arc::new(super::Stop::default());
+        let waiting = stop.clone();
+        assert!(!within("an interval", move || waiting
+            .wait(Duration::from_millis(20))));
         stop.stop();
-        let started = Instant::now();
-        assert!(stop.wait(LONG), "stopped");
-        assert!(started.elapsed() < LONG);
+        // Stopped, a wait of a year ends at once (GOTCHA-332: not a bound on the clock).
+        assert!(within("a stopped wait", move || stop.wait(YEAR)), "stopped");
     }
 
     /// The opener as the app builds it puts no script in the page: the plugin's own
@@ -2618,13 +2642,13 @@ mod tests {
         let (woke_tx, woke) = mpsc::channel();
         {
             let (shell, asked) = (r.shell.clone(), asked.clone());
+            // Its backstop a year away: only the start's nudge can wake it (GOTCHA-332).
             thread::spawn(move || {
-                let started = Instant::now();
-                shell.stop.wait_until(LONG, || {
+                shell.stop.wait_until(YEAR, || {
                     asked.fetch_add(1, SeqCst);
                     super::running(&shell)
                 });
-                let _ = woke_tx.send(started.elapsed());
+                let _ = woke_tx.send(());
             });
         }
         // Forced, not sampled: the flusher asked once under the stop lock and found nothing, so
@@ -2634,11 +2658,8 @@ mod tests {
             .shell
             .start_read("Doctor", None, waits_for_cancel())
             .unwrap();
-        let waited = woke.recv_timeout(2 * LONG).expect("the flusher returned");
-        assert!(
-            waited < LONG / 2,
-            "the flusher slept through the read: {waited:?}"
-        );
+        woke.recv_timeout(LONG)
+            .expect("the flusher slept through the read");
         r.shell.ops.cancel(id).unwrap();
         wait_until("the read ended", || r.shell.ops.running() == 0);
     }

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 // A confirmed plan runs on through a lock (Rust keeps it; app.rs), while the lock unmounts the
 // screen that started it. Its end must still be shown: after the unlock, once it arrives.
-import { afterEach, beforeEach, expect, test } from 'bun:test';
+import { afterEach, beforeEach, expect, jest, test } from 'bun:test';
 import { QueryClientProvider } from '@tanstack/react-query';
 import { emit } from '@tauri-apps/api/event';
 import { clearMocks, mockIPC, mockWindows } from '@tauri-apps/api/mocks';
@@ -275,17 +275,44 @@ test('D.4a F18: a confirm the lock stopped before it began says after the unlock
   expect(endedAwaySnapshot()).toEqual([]);
 });
 
+/**
+ * Run `body` with the clock faked: the notices' spacing passes only as the test moves it, so no
+ * step waits for a time, nor fails for a slow machine (GOTCHA-332). The timers still pending
+ * run before the real clock is back: in bun 1.4 a fake 0 ms timer left pending stalls every
+ * real `setTimeout` after it, the teardown's included.
+ */
+async function onFakeTime(body: () => Promise<void> | void) {
+  jest.useFakeTimers();
+  try {
+    await body();
+  } finally {
+    act(() => {
+      jest.runOnlyPendingTimers();
+    });
+    jest.useRealTimers();
+  }
+}
+
+/** `ms` pass on the fake clock, and React applies what they brought. */
+const pass = (ms: number) =>
+  act(() => {
+    jest.advanceTimersByTime(ms);
+  });
+
 test('ends kept away show one at a time, each discarded once shown', async () => {
   keepEndedAway({ opId: 31, text: 'Add target lab: done.', failed: false });
   keepEndedAway({ opId: 32, text: 'Rename prod failed: taken', failed: true });
-  render(
-    <ToastProvider>
-      <EndedAwayNotices spacingMs={0} />
-      <ToastViewport />
-    </ToastProvider>,
-  );
-  expect(await screen.findByText('Add target lab: done.')).toBeDefined();
-  expect(await screen.findByText('Rename prod failed: taken')).toBeDefined();
+  await onFakeTime(async () => {
+    render(
+      <ToastProvider schedule={() => () => {}}>
+        <EndedAwayNotices spacingMs={0} />
+        <ToastViewport />
+      </ToastProvider>,
+    );
+    expect(screen.getByText('Add target lab: done.')).toBeDefined();
+    await pass(0);
+    expect(screen.getByText('Rename prod failed: taken')).toBeDefined();
+  });
   expect(discarded()).toEqual([31, 32]);
   expect(endedAwaySnapshot()).toEqual([]);
 });
@@ -293,20 +320,23 @@ test('ends kept away show one at a time, each discarded once shown', async () =>
 test('each notice is given its time: the next waits for the spacing, and so does its discard', async () => {
   keepEndedAway({ opId: 41, text: 'Add target lab: done.', failed: false });
   keepEndedAway({ opId: 42, text: 'Rename prod failed: taken', failed: true });
-  render(
-    <ToastProvider schedule={() => () => {}}>
-      <EndedAwayNotices spacingMs={300} />
-      <ToastViewport />
-    </ToastProvider>,
-  );
-  expect(await screen.findByText('Add target lab: done.')).toBeDefined();
-  // Within the spacing: the first still shows, the second waits, unshown and not discarded.
-  await new Promise((resolve) => setTimeout(resolve, 100));
-  expect(screen.queryByText('Rename prod failed: taken') === null).toBe(true);
-  expect(screen.queryByText('Add target lab: done.') === null).toBe(false);
-  expect(discarded()).toEqual([41]);
-  expect(await screen.findByText('Rename prod failed: taken', {}, { timeout: 2000 })).toBeDefined();
-  expect(discarded()).toEqual([41, 42]);
+  await onFakeTime(async () => {
+    render(
+      <ToastProvider schedule={() => () => {}}>
+        <EndedAwayNotices spacingMs={300} />
+        <ToastViewport />
+      </ToastProvider>,
+    );
+    expect(screen.getByText('Add target lab: done.')).toBeDefined();
+    // Within the spacing: the first still shows, the second waits, unshown and not discarded.
+    await pass(299);
+    expect(screen.queryByText('Rename prod failed: taken') === null).toBe(true);
+    expect(screen.queryByText('Add target lab: done.') === null).toBe(false);
+    expect(discarded()).toEqual([41]);
+    await pass(1);
+    expect(screen.getByText('Rename prod failed: taken')).toBeDefined();
+    expect(discarded()).toEqual([41, 42]);
+  });
 });
 
 test('a note with no operation of its own shows like an end, and nothing is discarded for it', async () => {

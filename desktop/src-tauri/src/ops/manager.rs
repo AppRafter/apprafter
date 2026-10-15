@@ -153,6 +153,11 @@ pub struct OperationManager {
     inner: Mutex<Inner>,
     /// Notified whenever an operation stops running.
     ended: Condvar,
+    /// The bound of every [`cancel_all_and_wait`](Self::cancel_all_and_wait), in order: how a
+    /// test tells which bound a quit waited with, and that an exit waited for nothing, without
+    /// reading a clock (GOTCHA-332).
+    #[cfg(test)]
+    stop_bounds: Mutex<Vec<Duration>>,
 }
 
 #[derive(Default)]
@@ -329,7 +334,18 @@ impl OperationManager {
             clock,
             inner: Mutex::default(),
             ended: Condvar::new(),
+            #[cfg(test)]
+            stop_bounds: Mutex::default(),
         })
+    }
+
+    /// The bounds the quits and exits waited with so far (see `stop_bounds`).
+    #[cfg(test)]
+    pub(crate) fn stop_bounds(&self) -> Vec<Duration> {
+        self.stop_bounds
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     /// Keep a plan for [`execute`](Self::execute); the view is all the webview gets. Its
@@ -910,6 +926,11 @@ impl OperationManager {
     /// token, then wait until no executor runs or `bound` has passed. `true` when all ended
     /// in time.
     pub fn cancel_all_and_wait(&self, bound: Duration) -> bool {
+        #[cfg(test)]
+        self.stop_bounds
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(bound);
         let deadline = Instant::now() + bound;
         let tokens: Vec<CancellationToken> = {
             let mut inner = self.lock();
@@ -2562,17 +2583,16 @@ mod tests {
         );
         mgr.execute(stubborn.op_id, &auth).unwrap();
         let bound = Duration::from_millis(200);
-        let started = Instant::now();
         let all_ended = {
             let mgr = mgr.clone();
             within("cancel_all_and_wait", move || {
                 mgr.cancel_all_and_wait(bound)
             })
         };
-        let waited = started.elapsed();
+        // It gave up, at its bound: the stubborn op ends only once let go, below, so a wait
+        // for it would never have returned (`within`), whatever the clock says (GOTCHA-332).
         assert!(!all_ended);
-        assert!(waited >= bound, "returned after {waited:?}");
-        assert!(waited < Duration::from_secs(5), "returned after {waited:?}");
+        assert_eq!(mgr.stop_bounds(), [bound]);
         // The bound says nothing about the polite one: it ends once its thread gets to it.
         assert_eq!(wait_ended(&mgr, polite.op_id), OpState::Cancelled);
         assert_eq!(mgr.running(), 1);

@@ -262,6 +262,42 @@ pub(crate) mod test_trips {
     }
 }
 
+/// Waiting in a test for what a test waits for, never for a time (GOTCHA-332): a wait the test
+/// needs to end is a [`YEAR`](test_wait::YEAR) long, so only what it waits for ends it, and the
+/// call runs [`within`](test_wait::within), so one that waits for ever fails instead of hanging.
+#[cfg(test)]
+pub(crate) mod test_wait {
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    use std::time::Duration;
+    use std::{panic, thread};
+
+    /// Longer than any wait a passing test makes.
+    pub(crate) const LONG: Duration = Duration::from_secs(10);
+
+    /// A wait no test outlasts.
+    pub(crate) const YEAR: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
+    /// `f` on a thread of its own, its value; a test whose `f` has not returned after [`LONG`]
+    /// fails (`what` did not return) rather than hang.
+    pub(crate) fn within<T: Send + 'static>(
+        what: &str,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (tx, rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        match rx.recv_timeout(LONG) {
+            Ok(value) => value,
+            Err(RecvTimeoutError::Timeout) => panic!("{what} did not return within {LONG:?}"),
+            Err(RecvTimeoutError::Disconnected) => match handle.join() {
+                Err(payload) => panic::resume_unwind(payload),
+                Ok(()) => panic!("{what} ended without a result"),
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod test_clock {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -495,18 +531,27 @@ mod tests {
 
     /// D.4a O4: the pair O4 compares, read as the CLI's holder reads it (e's
     /// `the_system_clocks_advance_together_while_awake`): both advance while awake, the one
-    /// that counts suspend is never behind, and they stay well under 5 s apart then. Which clock
-    /// each reads is the next three tests', and that the first counts suspend the walk's.
+    /// that counts suspend is never behind, and they move together then. Which clock each reads
+    /// is the next three tests', and that the first counts suspend the walk's.
+    ///
+    /// Together: each reading of the clock that counts suspend is bracketed by two of the other,
+    /// so what it moved lies between what the other moved inside and outside the brackets,
+    /// however long the machine kept this thread off the CPU between two reads (GOTCHA-332).
     #[test]
     fn the_sleep_clocks_advance_together_while_awake() {
-        let c = SystemClock;
-        let (s0, a0) = (c.with_sleep_ms(), c.awake_ms());
-        thread::sleep(Duration::from_millis(50));
-        let (s1, a1) = (c.with_sleep_ms(), c.awake_ms());
-        assert!(s1 > s0 && a1 > a0, "{s0} {s1} {a0} {a1}");
         // 100 ms covers Windows' tick granularity (GetTickCount64).
-        assert!(s1 + 100 >= a1, "{s1} {a1}");
-        assert!((s1 - s0).abs_diff(a1 - a0) < SLEEP_GAP_MS);
+        const TICK_MS: u64 = 100;
+        let c = SystemClock;
+        let (a0, s0, a0_after) = (c.awake_ms(), c.with_sleep_ms(), c.awake_ms());
+        thread::sleep(Duration::from_millis(300));
+        let (a1, s1, a1_after) = (c.awake_ms(), c.with_sleep_ms(), c.awake_ms());
+        assert!(s1 > s0 && a1 > a0, "{s0} {s1} {a0} {a1}");
+        assert!(s1 + TICK_MS >= a1, "{s1} {a1}");
+        let (moved, inside, outside) = (s1 - s0, a1 - a0_after, a1_after - a0);
+        assert!(
+            moved + TICK_MS >= inside && moved <= outside + TICK_MS,
+            "{moved} not within {inside}..={outside}"
+        );
     }
 
     /// The final verifier's finding 2: `SystemClock` reads the two clocks it names, each within

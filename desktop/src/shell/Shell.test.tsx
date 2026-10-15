@@ -604,7 +604,9 @@ describe('Shell, the Target section on the mock IPC', () => {
       expect(discards.args).toEqual([{ opId: cancelled.opId }, { opId: ran.opId }]),
     );
     await user.click(screen.getByRole('button', { name: 'Close staging' }));
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    // Whatever the close asked has been asked: a turn passed in which nothing new was
+    // (GOTCHA-332: not a moment of the clock).
+    await act(() => settleIpc());
     expect(discards.args).toEqual([{ opId: cancelled.opId }, { opId: ran.opId }]);
   });
 
