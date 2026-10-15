@@ -291,7 +291,13 @@ encode/decode error on `state.json` (JSON) /
 
 **Fix.** The captured OS message names the failing path or
 socket. Common cases: missing directory, wrong permissions
-(`chmod 0600` on credentials), full disk. For decode failures on
+(`chmod 0600` on credentials), full disk. When the message is
+`cannot read <path>` and the path is the target store's own — its
+root, `targets/` or a folder in it, its `config.yaml` — this account
+cannot read it: most often its permissions, or those of a folder above
+it, do not let it, and `ls -ld` on each shows them. A folder another
+account owns or can change is
+[`store_not_private`](#store-not-private) instead. For decode failures on
 target-store files, fix the YAML by hand (they are small files), or
 restore the file from a backup. Otherwise remove that target with
 `apprafter target remove <name>`, which takes a target it cannot
@@ -478,6 +484,11 @@ provisioning, so no server was created.
 **Fix.** In your own terminal run `apprafter unlock`, then run the command
 from that terminal while the window is open. A command started without a
 terminal cannot ask for the lock password, by design.
+
+In AppRafter the same code says that AppRafter holds no key for the store:
+AppRafter locked, or the store was locked from a terminal while AppRafter
+was open. Unlock AppRafter with the lock password or the recovery key, then
+try again.
 How a locked store is opened, and in what order:
 [How the store lock works](../how-it-works/the-store-lock.md#opening).
 
@@ -872,7 +883,10 @@ from happening: [Back it up](protecting-secrets-from-agents.md#backup).
    key at the shared key's path opens: answer `y`.
 
 4. Lock the store again with `apprafter lock on`: a new lock password, and a
-   new recovery key to keep somewhere other than this computer.
+   new recovery key to keep somewhere other than this computer. A cached
+   secret still encrypted to the vault you moved aside — one whose refresh
+   did not run — is named so in its plan and dropped; its refresh fetches it
+   again.
 
 ## Common failures found in end-to-end runs
 
