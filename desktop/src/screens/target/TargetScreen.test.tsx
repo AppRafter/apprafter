@@ -8,11 +8,13 @@ import { clearMocks, mockIPC } from '@tauri-apps/api/mocks';
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { Activity } from 'react';
-import { ToastProvider } from '../../components/Toast';
+import { type Schedule, ToastProvider } from '../../components/Toast';
 import * as api from '../../ipc/api';
 import { endedAwaySnapshot, resetEndedAway } from '../../ipc/away';
 import { CORE_ERROR_CODES } from '../../ipc/errors';
 import UI_ERRORS from '../../ipc/generated/fixtures/ui-errors.json';
+import type { OpEvent } from '../../ipc/generated/OpEvent';
+import type { OpId } from '../../ipc/generated/OpId';
 import { resetLifecycle, sessionLocked } from '../../ipc/lifecycle';
 import { installMockIpc, mockOps } from '../../ipc/mock';
 import { resetOperations } from '../../ipc/operations';
@@ -22,9 +24,10 @@ import { ViewFrame } from '../../shell/ViewFrame';
 import { PlatformContext } from '../../state/platform';
 import { createQueryClient } from '../../state/queryClient';
 import { appInfo, STORE_NOT_PRIVATE, STORE_PROBLEMS } from '../../test/fixtures';
-import { uiError } from '../../test/ipc';
+import { completed, failed, uiError } from '../../test/ipc';
 import { renderScreen } from '../../test/screens';
 import { settleIpc } from '../../test/settle';
+import { tabHost } from '../../test/tab';
 import { TargetScreen } from './TargetScreen';
 
 beforeEach(async () => {
@@ -39,13 +42,17 @@ afterEach(async () => {
   clearMocks();
 });
 
-const screenOf = (name: string, more: { onRenamed?: () => void; onRemoved?: () => void } = {}) =>
+const screenOf = (
+  name: string,
+  more: { onRenamed?: () => void; onRemoved?: () => void; schedule?: Schedule } = {},
+) =>
   renderScreen(
     <TargetScreen
       name={name}
       onRenamed={more.onRenamed ?? (() => {})}
       onRemoved={more.onRemoved ?? (() => {})}
     />,
+    { ...(more.schedule !== undefined && { schedule: more.schedule }) },
   );
 
 test('shows the report; a provisioned target offers no machine change', async () => {
@@ -248,6 +255,140 @@ test('WI-483: a make default whose run fails, still shown when the app locks, is
 });
 
 type Invoke = (cmd: string, args?: unknown, options?: unknown) => unknown;
+
+/** The toasts' clock, never run: a toast shown stays shown, so none can go unseen by a test. */
+const NEVER: Schedule = () => () => {};
+
+/** What the Target screen says when its make default ran. */
+const MADE_DEFAULT = 'staging is the CLI default now';
+
+/**
+ * The next run Rust starts, held where Rust runs it: op_execute answers as Rust does once it has
+ * started the run, and the run's end reaches the page on the execute's channel only when the test
+ * sends it — after the lock, or the tab's close, the test made first: forced, never sampled.
+ */
+function holdTheRun() {
+  const at = (
+    window as unknown as {
+      __TAURI_INTERNALS__: { invoke: Invoke; runCallback: (id: number, data: unknown) => void };
+    }
+  ).__TAURI_INTERNALS__;
+  const invoke = at.invoke;
+  let held: { readonly opId: OpId; readonly channel: number } | null = null;
+  at.invoke = (c, args, options) => {
+    if (c !== 'op_execute' || held !== null) return invoke(c, args, options);
+    const { opId, onEvent } = args as { opId: OpId; onEvent: { id: number } };
+    held = { opId, channel: onEvent.id };
+    return Promise.resolve(1);
+  };
+  return {
+    /** The run's operation, once Rust started it. */
+    opId: (): OpId | null => held?.opId ?? null,
+    /** Rust ends the run: its end, on the execute's channel. */
+    end: (message: OpEvent) => {
+      if (held === null) throw new Error('no run was started');
+      at.runCallback(held.channel, { index: 0, message });
+    },
+  };
+}
+
+/** Make default on `staging`'s row, and wait until Rust has started its run. */
+async function makeDefaultRuns(
+  user: ReturnType<typeof userEvent.setup>,
+  run: { opId: () => OpId | null },
+) {
+  const row = await screen.findByRole('group', { name: 'CLI default' });
+  await user.click(within(row).getByRole('button', { name: 'Make default' }));
+  await waitFor(() => expect(run.opId() !== null).toBe(true));
+}
+
+// WI-484 (WI-483's concern 1): make default runs at once, with no dialog, and nothing owned its
+// run: an end that came after a lock was discarded unseen, and its toast went to the shell the
+// lock had unmounted. The screen that ran it owns it now (its scope): an end that comes once the
+// screen is gone is kept for the app, which says it after the unlock, and the screen says nothing
+// of it. The lock here is the session's end, as LockGate ends it; the run's end comes after it,
+// sent by the test; the toasts' clock never runs.
+test('WI-484: a make default that ends after a lock is kept for after the unlock, and toasts nothing', async () => {
+  const run = holdTheRun();
+  const discards = sentArgs('op_discard');
+  const user = screenOf('staging', { schedule: NEVER });
+  await makeDefaultRuns(user, run);
+  act(() => {
+    sessionLocked();
+  });
+  await act(async () => {
+    run.end(completed({ name: 'staging', pointer: { from: 'prod-eu', to: 'staging' } }));
+    await settleIpc();
+  });
+  expect(endedAwaySnapshot()).toEqual([
+    { opId: run.opId(), text: 'Make staging the CLI default: done.', failed: false },
+  ]);
+  expect(screen.queryByText(MADE_DEFAULT)).toBeNull();
+  // Discarded only once the app has shown it (ipc/away.ts).
+  expect(discards).toEqual([]);
+});
+
+test('WI-484: a make default that fails after a lock is kept once, with its code', async () => {
+  const run = holdTheRun();
+  const discards = sentArgs('op_discard');
+  const code = 'apprafter::io::error';
+  const user = screenOf('staging', { schedule: NEVER });
+  await makeDefaultRuns(user, run);
+  act(() => {
+    sessionLocked();
+  });
+  await act(async () => {
+    run.end(failed(uiError(code, 'cannot write config.yaml: disk full')));
+    await settleIpc();
+  });
+  expect(endedAwaySnapshot()).toEqual([
+    {
+      opId: run.opId(),
+      text: 'Make staging the CLI default failed: cannot write config.yaml: disk full',
+      failed: true,
+      code,
+    },
+  ]);
+  expect(discards).toEqual([]);
+});
+
+// Its tab closed while it ran: the app says how it ended, once. The toasts' slot is the shell's,
+// still there after a tab closes: a toast as well would say it twice.
+test('WI-484: a make default whose tab closes while it runs is said once, by the app', async () => {
+  const run = holdTheRun();
+  const tab = tabHost();
+  const user = renderScreen(
+    <tab.Tab>
+      <TargetScreen name="staging" onRenamed={() => {}} onRemoved={() => {}} />
+    </tab.Tab>,
+    { schedule: NEVER },
+  );
+  await makeDefaultRuns(user, run);
+  tab.close();
+  await act(async () => {
+    run.end(completed({ name: 'staging', pointer: { from: 'prod-eu', to: 'staging' } }));
+    await settleIpc();
+  });
+  expect(endedAwaySnapshot()).toEqual([
+    { opId: run.opId(), text: 'Make staging the CLI default: done.', failed: false },
+  ]);
+  expect(screen.queryByText(MADE_DEFAULT)).toBeNull();
+});
+
+// And its screen shown when it ends: the screen says it, and the app keeps nothing.
+test('WI-484: a make default that ends with its screen shown is toasted, and nothing is kept', async () => {
+  const run = holdTheRun();
+  const discards = sentArgs('op_discard');
+  const user = screenOf('staging', { schedule: NEVER });
+  await makeDefaultRuns(user, run);
+  await act(async () => {
+    run.end(completed({ name: 'staging', pointer: { from: 'prod-eu', to: 'staging' } }));
+    await settleIpc();
+  });
+  expect(await screen.findByText(MADE_DEFAULT)).toBeDefined();
+  expect(endedAwaySnapshot()).toEqual([]);
+  expect(discards).toEqual([{ opId: run.opId() }]);
+});
 
 test('remove: the full plan, the typed name, then the gesture; the tab closes', async () => {
   const onRemoved = mock();

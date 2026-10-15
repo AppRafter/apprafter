@@ -49,10 +49,14 @@ const plainError = (message: string): UiError => ({
  * Make a target the CLI's default: the reversible `use` plan, run at once (no confirm). A plan
  * with nothing to change (it is the default already) is discarded unrun. Either way a toast says
  * what is true now and the store is read again; a refusal or a failure goes to `onFailed`.
+ * The run is its screen's (WI-484), as a confirm's is: one whose screen went before it ended —
+ * the lock, or its tab closed — has its end kept for the app, which says it (startPlan), so the
+ * screen says nothing of it; and one the lock stopped before it began is kept as not started.
  */
 export function useMakeDefault(onFailed: OnFailed): (name: string) => Promise<void> {
   const client = useQueryClient();
   const toast = useToast();
+  const scope = useScope();
   return useCallback(
     async (name: string) => {
       // The plan's title once it runs: its failure is then a change's end (WI-483).
@@ -63,17 +67,21 @@ export function useMakeDefault(onFailed: OnFailed): (name: string) => Promise<vo
           await api.opDiscard(view.opId);
           toast({ message: usedMessage({ name, pointer: null }), end: 'done' });
         } else {
-          const started = await startPlan(view.opId);
+          const started = await startPlan(view.opId, undefined, {
+            title: view.title,
+            shown: () => !scope.gone(),
+          });
           ran = view.title;
           const out = resultOf(await started.ended) as unknown as TargetUsed;
-          toast({ message: usedMessage(out), end: 'done' });
+          // Its screen went: the app says how it ended, and a toast would say it twice.
+          if (!scope.gone()) toast({ message: usedMessage(out), end: 'done' });
         }
         refreshTargets(client);
       } catch (reason) {
         onFailed(refusalOf(reason), ran);
       }
     },
-    [client, toast, onFailed],
+    [client, toast, onFailed, scope],
   );
 }
 

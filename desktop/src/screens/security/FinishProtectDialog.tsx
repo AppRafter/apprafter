@@ -4,9 +4,10 @@
 // own kind of slot — before any more secrets leave their files. Two password fields, emptied on
 // every answer whatever it is (T78, critic B finding 17), then the plan's plain confirm
 // (bounded). Without one of them, Stop protecting backs out and Protect starts over. The run's
-// failure is a toast marked as a change's end, its code under the message (WI-483): a lock while
-// it shows keeps both (N5).
-import { type FormEvent, useState } from 'react';
+// failure is said as Stop protecting says its own (WI-484): in the dialog's place, its message,
+// help and code, until the owner closes it; a lock while it shows keeps it for after the unlock
+// (state/shownFailure.ts).
+import { type FormEvent, useRef, useState } from 'react';
 import { Button } from '../../components/Button';
 import { ErrorPanel } from '../../components/ErrorPanel';
 import { Modal } from '../../components/Modal';
@@ -20,7 +21,6 @@ import { DESKTOP_ERROR_CODES } from '../../ipc/generated/errors';
 import type { PlanView } from '../../ipc/generated/PlanView';
 import type { UiError } from '../../ipc/generated/UiError';
 import { holdPlan } from '../../ipc/heldPlans';
-import { shownCode } from '../../ipc/plans';
 import { authRefusal, retryLine, useRetryCountdown } from '../../state/auth';
 import {
   FINISH_BUTTON,
@@ -33,6 +33,7 @@ import {
   RECOVERY_FIELD,
 } from '../../state/lockText';
 import { useScope } from '../../state/scope';
+import { useShownFailure } from '../../state/shownFailure';
 
 export interface FinishProtectDialogProps {
   readonly store: string;
@@ -76,6 +77,17 @@ export function FinishProtectDialog(p: FinishProtectDialogProps) {
   const [error, setError] = useState<UiError | null>(null);
   const [view, setView] = useState<PlanView | null>(null);
   const [retryIn, startRetry] = useRetryCountdown();
+  // The run's failure, in the dialog's place (WI-484).
+  const [failure, showFailure] = useShownFailure();
+  // The run failed: the confirm's own close that follows leaves the failure shown.
+  const failed = useRef(false);
+  if (failure !== null) {
+    return (
+      <Modal title={FINISH_TITLE} width={520} onClose={p.onClose}>
+        <ErrorPanel error={failure.error} />
+      </Modal>
+    );
+  }
   if (view !== null) {
     return (
       <PlanConfirm
@@ -88,10 +100,14 @@ export function FinishProtectDialog(p: FinishProtectDialogProps) {
           toast({ message: protectedSummary(protectOutcome(result), true), end: 'done' });
           p.onDone();
         }}
-        onFailed={(failure) =>
-          toast({ message: failure.message, ...shownCode(failure), end: 'failed' })
-        }
-        onClose={p.onClose}
+        onFailed={(error, change) => {
+          failed.current = true;
+          showFailure(error, change);
+        }}
+        onClose={() => {
+          // A run that failed shows why, in the dialog's place.
+          if (!failed.current) p.onClose();
+        }}
       />
     );
   }

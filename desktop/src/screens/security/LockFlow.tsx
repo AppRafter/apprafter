@@ -3,9 +3,9 @@
 // calls. The Security page opens each as the app's own overlay (shell/AppOverlays.tsx): over
 // every view, outside every view's <Activity> (GOTCHA-158), under a scope its close ends — and
 // the lock, which unmounts the Shell. A plan a flow holds goes with that scope, never on an
-// effect's cleanup. A run's failure Stop protecting shows in its place is kept for after the
-// unlock when a lock comes while it shows (WI-483, state/shownFailure.ts); Protect's is too,
-// and Finish's is a toast, which N5 keeps.
+// effect's cleanup. A run's failure Stop protecting and Finish show in their place (WI-484 for
+// Finish) is kept for after the unlock when a lock comes while it shows (WI-483,
+// state/shownFailure.ts); Protect's is too.
 import { useQueryClient } from '@tanstack/react-query';
 import { useEffect, useRef, useState } from 'react';
 import { ErrorPanel } from '../../components/ErrorPanel';

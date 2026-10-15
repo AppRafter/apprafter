@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 // A screen as the shell hosts it: a fresh query client, app_info, the toasts (with their
-// viewport), a view frame for its overlays, and the app's own overlays beside the view.
+// viewport; on the test's own clock where it gives one), a view frame for its overlays, and the
+// app's own overlays beside the view.
 import { QueryClientProvider } from '@tanstack/react-query';
 import { render } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import type { ReactNode } from 'react';
-import { ToastProvider, ToastViewport } from '../components/Toast';
+import { type Schedule, ToastProvider, ToastViewport } from '../components/Toast';
 import type { AppInfo } from '../ipc/generated/AppInfo';
 import { AppOverlayContext, useAppOverlayHost } from '../shell/AppOverlays';
 import { ViewFrame } from '../shell/ViewFrame';
@@ -24,11 +25,14 @@ export function ScreenHost({ children }: { children: ReactNode }) {
   );
 }
 
-export function renderScreen(ui: ReactNode, { info = appInfo() }: { info?: AppInfo } = {}) {
+export function renderScreen(
+  ui: ReactNode,
+  { info = appInfo(), schedule }: { info?: AppInfo; schedule?: Schedule } = {},
+) {
   render(
     <QueryClientProvider client={createQueryClient()}>
       <PlatformContext value={info}>
-        <ToastProvider>
+        <ToastProvider {...(schedule !== undefined && { schedule })}>
           <ScreenHost>{ui}</ScreenHost>
           <ToastViewport />
         </ToastProvider>

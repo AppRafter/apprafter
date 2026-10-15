@@ -15,6 +15,7 @@ import { endedAwaySnapshot, keepEndedAway, resetEndedAway } from '../ipc/away';
 import { DESKTOP_ERROR_CODES } from '../ipc/generated/errors';
 import { LOCK_CHANGED } from '../ipc/generated/events';
 import { resetOperations } from '../ipc/operations';
+import { useMakeDefault } from '../screens/target/actions';
 import { PlatformContext } from '../state/platform';
 import { createQueryClient } from '../state/queryClient';
 import { useShownFailure } from '../state/shownFailure';
@@ -38,6 +39,8 @@ let locked: boolean;
 let ended: boolean;
 /** D.4a F18: the end that replay carries, a failure unless a test says it completed. */
 let endedDone: boolean;
+/** WI-484: what a completed end carries: nothing, unless a test's run reports something. */
+let doneResult: unknown;
 /** D.4a F18: Rust's answer to op_execute, when a test holds it (else: the op runs). */
 let execute: (() => Promise<unknown>) | null;
 /** D.4a N5: the run completes at once, its end sent on op_execute's channel while it is shown. */
@@ -49,6 +52,7 @@ beforeEach(() => {
   locked = false;
   ended = false;
   endedDone = false;
+  doneResult = null;
   execute = null;
   endsAtOnce = false;
   opened = false;
@@ -65,6 +69,23 @@ beforeEach(() => {
           help: null,
           causes: [],
           fields: {},
+        });
+      }
+      // WI-484: make default's reversible plan, run at once.
+      if (cmd === 'op_plan_target_use') {
+        return planView({
+          opId: 900,
+          class: 'reversible',
+          title: 'Make staging the CLI default',
+          changes: [
+            {
+              kind: 'CliDefault',
+              object: 'staging',
+              action: 'set_default',
+              detail: 'prod-eu → staging',
+            },
+          ],
+          target: 'staging',
         });
       }
       if (cmd === 'op_execute') {
@@ -91,7 +112,7 @@ beforeEach(() => {
           subscription: 3,
           replay: ended
             ? endedDone
-              ? [{ kind: 'finished', outcome: { status: 'completed', result: null } }]
+              ? [{ kind: 'finished', outcome: { status: 'completed', result: doneResult } }]
               : [
                   {
                     kind: 'failed',
@@ -418,5 +439,81 @@ test('WI-483: a change’s failure its screen shows when the app locks is said a
   await changed(false);
   expect(await screen.findByText('Rename prod-eu failed: cx22 is sold out in nbg1')).toBeDefined();
   expect(screen.getByRole('status').textContent).toContain(SOLD_OUT_CODE);
+  expect(endedAwaySnapshot()).toEqual([]);
+});
+
+/** Make default as the Targets page and the Target screen run it: at once, with no dialog. */
+function MakeDefault() {
+  const [failure, showFailure] = useShownFailure();
+  const makeDefault = useMakeDefault(showFailure);
+  return (
+    <>
+      <button type="button" onClick={() => void makeDefault('staging')}>
+        Make default
+      </button>
+      {failure !== null && <ErrorPanel error={failure.error} />}
+    </>
+  );
+}
+
+/** The app with make default in its shell, under the lock gate, on the toasts' own clock. */
+function renderMakeDefault() {
+  const { schedule } = manualClock();
+  render(
+    <QueryClientProvider client={createQueryClient()}>
+      <PlatformContext value={appInfo()}>
+        <LockGate>
+          <ToastProvider schedule={schedule}>
+            <ViewFrame>
+              <MakeDefault />
+            </ViewFrame>
+            <EndedAwayNotices />
+            <ToastViewport />
+          </ToastProvider>
+        </LockGate>
+      </PlatformContext>
+    </QueryClientProvider>,
+  );
+  return userEvent.setup();
+}
+
+// WI-484 (WI-483's concern 1): make default runs at once, and nothing owned its run: an end after
+// a lock took its screen was discarded unseen, its toast sent to the shell the lock unmounted.
+// Its screen owns it now: after the unlock the app says how it ended.
+test('WI-484: a make default that ends after a lock took its screen says so after the unlock', async () => {
+  const user = renderMakeDefault();
+  await user.click(await screen.findByRole('button', { name: 'Make default' }));
+  expect(calls.map((c) => c.cmd)).toContain('op_execute');
+  await changed(true);
+  ended = true; // it completes in Rust while the app is locked
+  endedDone = true;
+  doneResult = { name: 'staging', pointer: { from: 'prod-eu', to: 'staging' } };
+  await changed(false);
+  expect(await screen.findByText('Make staging the CLI default: done.')).toBeDefined();
+  expect(discarded()).toEqual([900]);
+  expect(screen.queryByText('staging is the CLI default now')).toBeNull();
+  expect(endedAwaySnapshot()).toEqual([]);
+});
+
+// D.4a F18 for make default too: a run the lock stopped before it began is never silent.
+test('WI-484: a make default the lock stopped before it ran says after the unlock that it was not started', async () => {
+  // The lock landed between the plan and its run: Rust refuses the run as locked.
+  execute = () =>
+    Promise.reject({
+      code: DESKTOP_ERROR_CODES.LOCKED,
+      message: 'AppRafter is locked',
+      help: 'Unlock AppRafter to continue.',
+      causes: [],
+      fields: {},
+    });
+  const user = renderMakeDefault();
+  await user.click(await screen.findByRole('button', { name: 'Make default' }));
+  await changed(true);
+  await changed(false);
+  expect(
+    await screen.findByText(
+      'Make staging the CLI default was not started: AppRafter locked before it began.',
+    ),
+  ).toBeDefined();
   expect(endedAwaySnapshot()).toEqual([]);
 });

@@ -126,6 +126,29 @@ function stopFails(error: UiError): void {
   };
 }
 
+/** The Finish plan's title, as the mock's core names it. */
+const FINISH_PLAN = 'Finish protecting the target store at ~/.config/apprafter';
+
+/**
+ * op_plan_lock_finish, given both secrets, plans a Finish whose run ends in `error` (over the
+ * mock's invoke): the mock's own Finish always completes.
+ */
+function finishFails(error: UiError): void {
+  const at = internals();
+  const invoke = at.invoke;
+  at.invoke = (c, args, options) => {
+    if (c !== 'op_plan_lock_finish') return invoke(c, args, options);
+    const plan = mockOps().registerPlan(
+      { class: 'bounded', title: FINISH_PLAN, changes: [], target: null },
+      { end: () => ({ error }) },
+    );
+    return Promise.resolve(plan);
+  };
+}
+
+/** A toasts' clock that never runs: a toast shown stays shown. */
+const NEVER: Schedule = () => () => {};
+
 /**
  * The page as the shell hosts it, under the platform gate, on the mock with the store `secrets`;
  * `before` runs on the unlocked mock just before the page renders; `schedule`, the toasts' clock,
@@ -353,6 +376,62 @@ describe('the Security page (WI-476)', () => {
     );
     await waitFor(() =>
       expect(screen.queryByRole('dialog', { name: STOP_TITLE }) === null).toBe(true),
+    );
+    act(() => {
+      sessionLocked();
+    });
+    expect(endedAwaySnapshot()).toEqual([]);
+  });
+
+  // WI-484 (WI-483's concern 2; the controller's decision): Finish said its failure in a 3.4 s
+  // toast, without its help. It says it as Stop protecting does now: in the flow's own overlay,
+  // with its message, help and code, until it is closed, and kept for after the unlock when a lock
+  // comes while it shows.
+  async function finishThatFails() {
+    const { user } = await open('locking', () => finishFails(STORE_CHANGED), NEVER);
+    await user.click(await within(view()).findByRole('button', { name: ACTION_LABELS.finish }));
+    const form = await screen.findByRole('dialog', { name: FINISH_TITLE });
+    await user.type(within(form).getByLabelText('Lock password'), MOCK_STORE_PASSWORD);
+    // Its key's groups alone: the plan's run is what fails here, whatever opened it.
+    await user.type(within(form).getByLabelText('Recovery key'), 'QQQSY-QCYQ5');
+    await user.click(within(form).getByRole('button', { name: 'Continue' }));
+    await user.click(await screen.findByRole('button', { name: 'Finish' }));
+    const panel = await within(
+      await screen.findByRole('dialog', { name: FINISH_TITLE }),
+    ).findByRole('alert');
+    return { user, panel };
+  }
+
+  test('WI-484: Finish’s failure is said in its overlay, with its help and code, and kept when the app locks', async () => {
+    const { panel } = await finishThatFails();
+    expect(view().contains(panel)).toBe(false);
+    expect(panel.textContent).toContain(STORE_CHANGED.message);
+    expect(panel.textContent).toContain(STORE_CHANGED.help ?? '?');
+    expect(panel.textContent).toContain(STORE_CHANGED_CODE);
+    expect(screen.getByRole('status').textContent).toBe('');
+    expect(endedAwaySnapshot()).toEqual([]);
+    act(() => {
+      sessionLocked();
+    });
+    expect(endedAwaySnapshot()).toEqual([
+      {
+        opId: null,
+        text: `${FINISH_PLAN} failed: ${STORE_CHANGED.message}`,
+        failed: true,
+        code: STORE_CHANGED_CODE,
+      },
+    ]);
+  });
+
+  test('WI-484: Finish’s failure closed before the lock is not kept', async () => {
+    const { user } = await finishThatFails();
+    await user.click(
+      within(screen.getByRole('dialog', { name: FINISH_TITLE })).getByRole('button', {
+        name: 'Close',
+      }),
+    );
+    await waitFor(() =>
+      expect(screen.queryByRole('dialog', { name: FINISH_TITLE }) === null).toBe(true),
     );
     act(() => {
       sessionLocked();
