@@ -833,7 +833,8 @@ from happening: [Back it up](protecting-secrets-from-agents.md#backup).
 
 1. Move the vault and `store.yaml` aside. Keep them: a password found later
    still opens them. `STORE` is the target store's root, which the
-   `Target store:` line of `apprafter lock status` names:
+   `Target store:` line of `apprafter lock status` names (write a leading `~`
+   as `$HOME`: inside quotes the shell does not expand it):
 
    ```sh
    STORE="$HOME/.config/apprafter"   # the root `apprafter lock status` names

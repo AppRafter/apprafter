@@ -37,9 +37,12 @@ the store's files, to do something you did not ask for. On a locked store:
   CD passwords are encrypted to that key. A secret an older AppRafter or
   another program left in clear is never used, and `apprafter doctor`
   reports it;
-- `HCLOUD_TOKEN` and `APPRAFTER_AGE_KEY` are refused, so a token obtained
-  elsewhere cannot pass the lock unnoticed
-  ([`override_refused`](troubleshooting.md#override-refused)).
+- `HCLOUD_TOKEN` and `APPRAFTER_AGE_KEY` cannot stand in for the store's
+  secrets: a command that would read a token or a cache through them is
+  refused, so a token obtained elsewhere cannot pass the lock unnoticed
+  ([`override_refused`](troubleshooting.md#override-refused)). `target add`
+  still takes `HCLOUD_TOKEN` as the token it stores (a renewal at a terminal
+  asks for it instead).
 
 The exception is a terminal you have unlocked: everything started from it,
 an AI agent included, uses the store's secrets until the window ends —
@@ -117,7 +120,10 @@ for itself, and its answer opens the window too.
   starts it again. There is no other limit on its length. `apprafter doctor`
   and `apprafter whoami` use it when they ping — they read the token through
   it — and doctor's Kubernetes API check when it reads the cached
-  kubeconfig; `apprafter doctor --no-ping` reads no token through it.
+  kubeconfig; `apprafter doctor --no-ping` reads no token through it. Its
+  token row says "in the vault; read only with the ping" with a window or
+  without, and with no window its Kubernetes API row is still skipped: "the
+  target store is locked".
 - It ends when its time runs out, when the terminal closes or its shell
   exits, when the computer sleeps, when the store's lock is turned off, and
   with `apprafter lock now`.
@@ -300,8 +306,9 @@ store, only when the store is locked or a `lock on` did not finish:
 | Secrets locked, but the vault cannot be read | the vault is missing, damaged, from a newer AppRafter, or another store's | [`vault_unreadable`](troubleshooting.md#vault-unreadable) |
 | Secrets: whether they are locked cannot be read | `store.yaml` cannot be read | [`store_file_unreadable`](troubleshooting.md#store-file-unreadable) |
 | Secrets: turning the lock on (or off) did not finish | `lock on` or `lock off` was interrupted | run it again |
-| Token and cluster rows skipped: "the target store is locked" | doctor, with no unlock window open in this terminal | `apprafter unlock`, then `apprafter doctor` again |
-| A target's credentials file holds a token in clear, or names another store's vault | doctor, beside a locked store | renew that target's token, as the row says |
+| Token and cluster rows skipped: "the target store is locked" | doctor with the ping, with no unlock window open in this terminal (`doctor --no-ping` skips only the Kubernetes API row) | `apprafter unlock`, then `apprafter doctor` again |
+| A target's credentials file holds a token in clear | doctor, beside a locked store | renew that target's token, as the row says |
+| A target's credentials file names another target store's vault | doctor, on any store for the target it checks, and beside a locked store for every target | renew that target's token, as the row says |
 | A target's state file holds a kubeconfig in clear | doctor, beside a locked store | `apprafter kubeconfig --refresh --target <name>` |
 | The slot list in store.yaml differs; a slot uses key-derivation settings this AppRafter refuses; the vault has no recovery-key slot; the vault file's mode or owner | doctor, beside a locked store | as the row says |
 | `HCLOUD_TOKEN` or `APPRAFTER_AGE_KEY` is set | doctor, beside a locked store | unset it, or give that work a store of its own |
