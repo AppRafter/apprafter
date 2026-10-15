@@ -55,6 +55,20 @@ pub enum DisplayKind {
     None,
 }
 
+/// The session's display, from what a client reads of its environment: an X11 session, or
+/// Wayland — Xwayland when an X display is there too. `session` is `XDG_SESSION_TYPE`,
+/// `wayland` a non-empty `WAYLAND_DISPLAY`, `x` a non-empty `DISPLAY`. The CLI's rule for its
+/// terminal, and the desktop's for whether its X11 display is Xwayland (F21): one rule, here.
+pub fn display_kind(session: Option<&str>, wayland: bool, x: bool) -> DisplayKind {
+    match (session, wayland, x) {
+        (Some("x11"), _, _) => DisplayKind::X11,
+        (Some("wayland"), _, true) | (_, true, true) => DisplayKind::Xwayland,
+        (Some("wayland"), _, false) | (_, true, false) => DisplayKind::Wayland,
+        (_, false, true) => DisplayKind::X11,
+        _ => DisplayKind::None,
+    }
+}
+
 /// What the OS tells the desktop app (its `AppInfo.sessionEvents`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionEvents {
@@ -93,21 +107,31 @@ pub fn detect_limits(
     window: &UnlockWindow,
 ) -> Vec<MachineLimit> {
     let mut out = Vec::new();
+    // The display's row: an X11 session; Xwayland, about the terminal (CLI) or about the app
+    // itself (desktop, F21).
     let (display, ssh) = match client {
-        LimitClient::Cli { terminal, ssh } => {
-            (terminal.as_ref().map(|t| (t.display, t.x_client)), ssh)
-        }
-        LimitClient::Desktop { display, ssh, .. } => (Some((*display, None)), ssh),
+        LimitClient::Cli { terminal, ssh } => (
+            terminal.as_ref().and_then(|t| match t.display {
+                DisplayKind::X11 => Some(MachineLimit::X11Session),
+                DisplayKind::Xwayland => Some(MachineLimit::Xwayland {
+                    terminal_is_x_client: t.x_client,
+                }),
+                DisplayKind::Wayland | DisplayKind::None => None,
+            }),
+            ssh,
+        ),
+        LimitClient::Desktop { display, ssh, .. } => (
+            match display {
+                DisplayKind::X11 => Some(MachineLimit::X11Session),
+                DisplayKind::Xwayland => Some(MachineLimit::AppOnXwayland),
+                DisplayKind::Wayland | DisplayKind::None => None,
+            },
+            ssh,
+        ),
     };
     #[cfg(target_os = "linux")]
     {
-        match display {
-            Some((DisplayKind::X11, _)) => out.push(MachineLimit::X11Session),
-            Some((DisplayKind::Xwayland, x)) => out.push(MachineLimit::Xwayland {
-                terminal_is_x_client: x,
-            }),
-            _ => {}
-        }
+        out.extend(display);
         if let Some(value) = ptrace_scope_limit(std::fs::read_to_string(
             "/proc/sys/kernel/yama/ptrace_scope",
         )) {
@@ -640,6 +664,72 @@ ERERERERERERERERERERERERERERAAAAEAAAAAAAAAAAAAAAAAAAAAA=
         assert!(got.contains(&MachineLimit::WindowsSameUser));
         #[cfg(target_os = "macos")]
         assert!(got.contains(&MachineLimit::MacosTaskPort));
+    }
+
+    #[test]
+    fn the_display_is_read_from_the_session() {
+        for (session, wayland, x, want) in [
+            (Some("x11"), false, true, DisplayKind::X11),
+            (Some("x11"), true, true, DisplayKind::X11),
+            (Some("wayland"), true, true, DisplayKind::Xwayland),
+            (Some("wayland"), false, true, DisplayKind::Xwayland),
+            (Some("wayland"), true, false, DisplayKind::Wayland),
+            (None, true, true, DisplayKind::Xwayland),
+            (None, true, false, DisplayKind::Wayland),
+            (None, false, true, DisplayKind::X11),
+            (None, false, false, DisplayKind::None),
+            (Some("tty"), false, false, DisplayKind::None),
+        ] {
+            assert_eq!(
+                display_kind(session, wayland, x),
+                want,
+                "{session:?} {wayland} {x}"
+            );
+        }
+    }
+
+    /// F21 (Linux): the desktop app on Xwayland is its own warning, about the app; never the
+    /// CLI's terminal line, nor an X11 session the person is not in. On X11 it is the session's.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_app_on_xwayland_is_its_own_row() {
+        let ctx = ctx_with(MapEnv::new());
+        let desk = |display| LimitClient::Desktop {
+            session_events: SessionEvents {
+                lock: true,
+                sleep: true,
+            },
+            display,
+            ssh: SshFacts::default(),
+        };
+        let display_rows = |display| {
+            detect_limits(&ctx, &desk(display), &UnlockWindow::App)
+                .into_iter()
+                .filter(|l| {
+                    matches!(
+                        l,
+                        MachineLimit::X11Session
+                            | MachineLimit::Xwayland { .. }
+                            | MachineLimit::AppOnXwayland
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            display_rows(DisplayKind::Xwayland),
+            vec![MachineLimit::AppOnXwayland]
+        );
+        assert_eq!(
+            display_rows(DisplayKind::X11),
+            vec![MachineLimit::X11Session]
+        );
+        assert_eq!(display_rows(DisplayKind::Wayland), vec![]);
+        let xw = detect_limits(
+            &ctx,
+            &cli(DisplayKind::Xwayland, None, None, SshFacts::default()),
+            &UnlockWindow::Closed,
+        );
+        assert!(!xw.contains(&MachineLimit::AppOnXwayland), "{xw:?}");
     }
 
     /// T72 (Linux): an X11 session is a warning; Xwayland names whether the terminal is an X client.

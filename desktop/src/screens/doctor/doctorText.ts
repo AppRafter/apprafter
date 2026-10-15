@@ -54,7 +54,7 @@ const RENEW_WHY: Record<RenewWhy, string> = {
  */
 const LOCK_FIXES: Partial<Record<CheckId, string>> = {
   x11_keystrokes:
-    'AppRafter runs as an X11 program here, so any program running as you can see what you type into it, the lock password included. Run AppRafter natively on Wayland, in a Wayland session, to close this.',
+    'AppRafter runs as an X11 program here, so any program running as you can see what you type into it, the lock password included. Run AppRafter natively on Wayland — in a Wayland session, without `GDK_BACKEND=x11` — to close this.',
   ptrace_scope:
     'Set the kernel.yama.ptrace_scope sysctl to 1, so that only a parent process can attach to another. A kernel without the Yama module has no such setting: there, run AI agents under a separate OS account.',
   windows_same_user:

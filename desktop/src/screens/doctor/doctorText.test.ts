@@ -366,6 +366,9 @@ describe("the lock's limit rows, in the app's words (D.4a rule 1)", () => {
     expect(fixText(row('hibernation'), null)).toContain('Lock AppRafter');
     // The app is the X11 program, also under Xwayland inside a Wayland session (Deviations 12).
     expect(fixText(row('x11_keystrokes'), null)).toContain('AppRafter runs as an X11 program here');
+    // F21: under Xwayland the person is in a Wayland session already: the fix names the
+    // backend, not the session.
+    expect(fixText(row('x11_keystrokes'), null)).toContain('without `GDK_BACKEND=x11`');
     expect(fixText(row('windows_same_user'), null)).toContain('threads');
     // While it holds the key, which a change confirmed before a lock outlives (Rust verifier 3).
     expect(fixText(row('windows_same_user'), null)).toContain("while it holds this store's key");

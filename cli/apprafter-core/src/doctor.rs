@@ -1984,6 +1984,9 @@ fn override_rows(hcloud: bool, age_key: bool, store: &Path) -> Vec<Check> {
 
 const X11_FIX: &str = "Under X11 any program running as you can read what you type, the lock \
      password included. A Wayland session, with a Wayland-native terminal, closes this.";
+const APP_ON_XWAYLAND_FIX: &str = "AppRafter runs as an X11 program here, under Xwayland: \
+     other X programs running as you can read what you type into it, the lock password included. \
+     Start it natively on Wayland, without `GDK_BACKEND=x11`, to close this.";
 const PTRACE_FIX: &str = "Set the kernel.yama.ptrace_scope sysctl to 1, so that only a parent \
      process can attach to another.";
 const WINDOWS_FIX: &str = "Any program running as you can attach itself to an unlocked console. \
@@ -2011,6 +2014,7 @@ const HIBERNATION_FIX: &str = "End every unlock window before this computer hibe
 fn limit_check(l: &MachineLimit) -> Option<Check> {
     let fix = match l {
         MachineLimit::X11Session | MachineLimit::Xwayland { .. } => explain(X11_FIX),
+        MachineLimit::AppOnXwayland => explain(APP_ON_XWAYLAND_FIX),
         MachineLimit::PtraceScope { .. } => explain(PTRACE_FIX),
         MachineLimit::WindowsSameUser => explain(WINDOWS_FIX),
         MachineLimit::MacosTaskPort => explain(MACOS_FIX),
@@ -2029,7 +2033,9 @@ fn limit_check(l: &MachineLimit) -> Option<Check> {
         MachineLimit::RuntimeDirFallback { .. } => return None,
     };
     let id = match l {
-        MachineLimit::X11Session | MachineLimit::Xwayland { .. } => CheckId::X11Keystrokes,
+        MachineLimit::X11Session | MachineLimit::Xwayland { .. } | MachineLimit::AppOnXwayland => {
+            CheckId::X11Keystrokes
+        }
         MachineLimit::PtraceScope { .. } => CheckId::PtraceScope,
         MachineLimit::WindowsSameUser => CheckId::WindowsSameUser,
         MachineLimit::MacosTaskPort => CheckId::MacosTaskPort,
@@ -5011,6 +5017,10 @@ mod tests {
                     terminal_is_x_client: None,
                 },
                 Some((CheckId::X11Keystrokes, CheckStatus::Info)),
+            ),
+            (
+                L::AppOnXwayland,
+                Some((CheckId::X11Keystrokes, CheckStatus::Warn)),
             ),
             (
                 L::PtraceScope { value: Some(0) },

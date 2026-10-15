@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! What only the CLI can see of this computer's limits (D.4a T72, T73, O1): its terminal's
-//! multiplexer and display, and the SSH key and agent a kubeconfig fetch uses. Read through
-//! `EnvSource` (`ProcessEnv` in production), so the env-read ratchet does not move.
+//! multiplexer and display (by the core's `display_kind`), and the SSH key and agent a
+//! kubeconfig fetch uses. Read through `EnvSource` (`ProcessEnv` in production), so the
+//! env-read ratchet does not move.
 
 use std::path::PathBuf;
 
-use apprafter_core::lock::limits::{DisplayKind, LimitClient, SshFacts, TerminalFacts};
+use apprafter_core::lock::limits::{display_kind, LimitClient, SshFacts, TerminalFacts};
 use apprafter_core::EnvSource;
 
 /// The multiplexers `lock status` names, by the variable each sets (T72).
@@ -54,17 +55,6 @@ fn is_x_window_id(v: &str) -> bool {
     id.is_some_and(|id| id > 0 && id < 1 << 29)
 }
 
-/// The session's display: an X11 session, or Wayland — Xwayland when an X display is there too.
-pub(crate) fn display_kind(session: Option<&str>, wayland: bool, x: bool) -> DisplayKind {
-    match (session, wayland, x) {
-        (Some("x11"), _, _) => DisplayKind::X11,
-        (Some("wayland"), _, true) | (_, true, true) => DisplayKind::Xwayland,
-        (Some("wayland"), _, false) | (_, true, false) => DisplayKind::Wayland,
-        (_, false, true) => DisplayKind::X11,
-        _ => DisplayKind::None,
-    }
-}
-
 /// The ssh-agent: `SSH_AUTH_SOCK`, else on Windows the OpenSSH agent service's pipe. (G2: this
 /// function spells a pipe name; `ENDPOINT_LITERALS` lists it.)
 pub(crate) fn ssh_agent_path(env: &dyn EnvSource) -> Option<PathBuf> {
@@ -76,30 +66,10 @@ pub(crate) fn ssh_agent_path(env: &dyn EnvSource) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use apprafter_core::lock::limits::{DisplayKind, LimitClient};
+    use apprafter_core::lock::limits::LimitClient;
     use apprafter_core::MapEnv;
 
     use super::*;
-
-    #[test]
-    fn the_display_is_read_from_the_session() {
-        for (session, wayland, x, want) in [
-            (Some("x11"), false, true, DisplayKind::X11),
-            (Some("wayland"), true, true, DisplayKind::Xwayland),
-            (Some("wayland"), true, false, DisplayKind::Wayland),
-            (None, true, true, DisplayKind::Xwayland),
-            (None, true, false, DisplayKind::Wayland),
-            (None, false, true, DisplayKind::X11),
-            (None, false, false, DisplayKind::None),
-            (Some("tty"), false, false, DisplayKind::None),
-        ] {
-            assert_eq!(
-                display_kind(session, wayland, x),
-                want,
-                "{session:?} {wayland} {x}"
-            );
-        }
-    }
 
     /// T72: the multiplexer and the X-client hint come from the terminal's environment, an
     /// empty variable counting as unset; without a terminal there are no terminal facts.

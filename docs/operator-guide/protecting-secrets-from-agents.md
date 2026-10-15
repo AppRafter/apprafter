@@ -311,7 +311,7 @@ store, only when the store is locked or a `lock on` did not finish:
 | A kubeconfig in use is a file | always | — what the lock does not cover |
 | A program running as you that sets out to get past the lock | always | [A boundary for the agent](#a-boundary-for-the-agent) |
 | Hibernation writes memory to disk | always | `apprafter lock now` before hibernating |
-| X11 session, or Xwayland | Linux, when true | a Wayland session with a Wayland-native terminal |
+| X11 session, or Xwayland | Linux, when true | a Wayland session with a Wayland-native terminal, and AppRafter started natively on Wayland (not with `GDK_BACKEND=x11`) |
 | Yama `ptrace_scope` is 0, or no Yama | Linux, when true | set the `kernel.yama.ptrace_scope` sysctl to 1 |
 | This terminal runs inside a multiplexer | when true | unlock in a terminal outside it |
 | Everything started from this terminal can use its window | a window is open here | start agents elsewhere, or `apprafter lock now` |

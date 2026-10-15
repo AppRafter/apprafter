@@ -628,6 +628,20 @@ impl GraphicsFacts {
         };
         backend_allows && socket
     }
+
+    /// F21: whether this is a Wayland session, by the CLI's rule
+    /// ([`apprafter_core::lock::limits::display_kind`]) with an X display taken as there — the
+    /// one question is whether an X11 display GDK opened is Xwayland. `XDG_SESSION_TYPE`
+    /// `wayland`, or a non-empty `WAYLAND_DISPLAY` outside an `x11` session.
+    pub fn in_wayland_session(&self) -> bool {
+        use apprafter_core::lock::limits::{display_kind, DisplayKind};
+        let session = self.xdg_session_type.as_deref().and_then(|s| s.to_str());
+        let wayland = self
+            .wayland_display
+            .as_deref()
+            .is_some_and(|d| !d.is_empty());
+        display_kind(session, wayland, true) == DisplayKind::Xwayland
+    }
 }
 
 /// What the app does with WebKitGTK's DMA-BUF renderer at start ([`dmabuf_renderer`]).
@@ -1574,6 +1588,39 @@ echo '/opt/homebrew/bin:/usr/bin:/bin'
                 let decision = dmabuf_renderer(&facts);
                 let restart = decision == DmabufRenderer::Restart;
                 assert_eq!(restart, expected, "{facts:?}: {decision:?}");
+            }
+        }
+
+        /// F21: the session is Wayland's by the CLI's rule (`display_kind`): `XDG_SESSION_TYPE`
+        /// `wayland`, or a `WAYLAND_DISPLAY` outside an `x11` session. `GDK_BACKEND` does not
+        /// change the session, only the display GDK opens in it.
+        #[test]
+        fn the_session_is_wayland_s_by_the_cli_s_rule() {
+            #[rustfmt::skip]
+            let cases: &[Case] = &[
+                // WAYLAND_DISPLAY, XDG_SESSION_TYPE, GDK_BACKEND
+                (Some("wayland-0"), Some("wayland"), Some("x11"), true),
+                (Some("wayland-0"), Some("wayland"), None, true),
+                (None, Some("wayland"), Some("x11"), true),
+                (Some("wayland-1"), None, Some("x11"), true),
+                (Some(""), None, Some("x11"), false),
+                (Some("wayland-1"), Some("x11"), Some("x11"), false),
+                (None, Some("x11"), None, false),
+                (None, Some("tty"), None, false),
+                (None, None, None, false),
+            ];
+            for &(display, session, backend, expected) in cases {
+                let facts = GraphicsFacts {
+                    wayland_display: os(display),
+                    xdg_session_type: os(session),
+                    gdk_backend: os(backend),
+                    ..nvidia_wayland()
+                };
+                assert_eq!(
+                    facts.in_wayland_session(),
+                    expected,
+                    "WAYLAND_DISPLAY={display:?} XDG_SESSION_TYPE={session:?} GDK_BACKEND={backend:?}"
+                );
             }
         }
 

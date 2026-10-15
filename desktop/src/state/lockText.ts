@@ -123,6 +123,11 @@ export function limitText(l: MachineLimit): LimitText | null {
         warn: true,
         text: 'AppRafter runs as an X11 program here: other programs running as you can see what you type into it, the lock password included.',
       };
+    case 'app_on_xwayland':
+      return {
+        warn: true,
+        text: 'AppRafter runs under Xwayland here: other X programs running as you can see what you type into it, the lock password included.',
+      };
     case 'xwayland':
       return {
         warn: l.terminalIsXClient === true,

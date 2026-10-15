@@ -227,6 +227,10 @@ pub enum MachineLimit {
     Xwayland {
         terminal_is_x_client: Option<bool>,
     },
+    /// The desktop app is an X11 program inside a Wayland session (GDK opened Xwayland, as
+    /// `GDK_BACKEND=x11` makes it): other X programs see what is typed into it (F21). The CLI's
+    /// `Xwayland` is about a terminal; this one is about the app.
+    AppOnXwayland,
     PtraceScope {
         value: Option<u8>,
     },
@@ -384,6 +388,10 @@ mod tests {
             })
             .unwrap(),
             json!({"kind": "xwayland", "terminalIsXClient": true})
+        );
+        assert_eq!(
+            serde_json::to_value(MachineLimit::AppOnXwayland).unwrap(),
+            json!({"kind": "app_on_xwayland"})
         );
         assert_eq!(
             serde_json::to_value(SecretsMode::Unlocking).unwrap(),

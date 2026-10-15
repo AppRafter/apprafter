@@ -37,6 +37,12 @@ pub fn limit_line(l: &MachineLimit) -> Option<LimitLine> {
              programs"
                 .to_string(),
         ),
+        MachineLimit::AppOnXwayland => (
+            true,
+            "AppRafter runs under Xwayland: other X programs see what you type into it, the lock \
+             password included"
+                .to_string(),
+        ),
         MachineLimit::PtraceScope { value: Some(v) } => (
             true,
             format!("Yama ptrace_scope is {v}: programs running as you can attach to your shell"),
@@ -208,6 +214,7 @@ mod tests {
         match l {
             MachineLimit::X11Session
             | MachineLimit::Xwayland { .. }
+            | MachineLimit::AppOnXwayland
             | MachineLimit::PtraceScope { .. }
             | MachineLimit::WindowsSameUser
             | MachineLimit::MacosTaskPort
@@ -231,6 +238,7 @@ mod tests {
             (L::X11Session, line(true, "X11 session: any program running as you sees what you type, the lock password included")),
             (L::Xwayland { terminal_is_x_client: Some(true) }, line(true, "This terminal runs under Xwayland: other X programs see what you type into it, the lock password included")),
             (L::Xwayland { terminal_is_x_client: None }, line(false, "Xwayland is running: a terminal that runs under it shows what you type to other X programs")),
+            (L::AppOnXwayland, line(true, "AppRafter runs under Xwayland: other X programs see what you type into it, the lock password included")),
             (L::PtraceScope { value: Some(0) }, line(true, "Yama ptrace_scope is 0: programs running as you can attach to your shell")),
             (L::PtraceScope { value: None }, line(true, "No Yama ptrace_scope: programs running as you can attach to your shell")),
             (L::WindowsSameUser, line(true, "Unlock windows on Windows are open to every program running as you")),

@@ -41,6 +41,7 @@ import {
 const EVERY_LIMIT: readonly MachineLimit[] = [
   { kind: 'x11_session' },
   { kind: 'xwayland', terminalIsXClient: true },
+  { kind: 'app_on_xwayland' },
   { kind: 'ptrace_scope', value: 0 },
   { kind: 'windows_same_user' },
   { kind: 'macos_task_port' },
@@ -87,6 +88,7 @@ describe("this computer's limits (rule 1)", () => {
     expect(shown).toEqual([
       ['x11_session', true],
       ['xwayland', true],
+      ['app_on_xwayland', true],
       ['ptrace_scope', true],
       ['windows_same_user', true],
       ['macos_task_port', false],
@@ -99,6 +101,12 @@ describe("this computer's limits (rule 1)", () => {
       ['secrets_in_use', false],
       ['same_user_programs', false],
     ]);
+  });
+  test('AppRafter under Xwayland says so, not an X11 session (F21)', () => {
+    const said = limitText({ kind: 'app_on_xwayland' })?.text ?? '';
+    expect(said).toContain('AppRafter runs under Xwayland');
+    expect(said).toContain('the lock password included');
+    expect(said).not.toContain('X11 session');
   });
   test('Xwayland warns only when the program is an X client', () => {
     expect(limitText({ kind: 'xwayland', terminalIsXClient: null })?.warn).toBe(false);
