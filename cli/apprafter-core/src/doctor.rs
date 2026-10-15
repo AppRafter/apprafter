@@ -3432,7 +3432,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_folder_another_account_owns_and_keeps_closed_is_named_in_its_rows() {
-        use std::os::unix::fs::PermissionsExt;
         let f = fx();
         let ctx = two_targets(&f);
         let store = ctx.store();
@@ -3469,24 +3468,18 @@ mod tests {
             );
             (rows.len(), row.fix)
         };
-        let close = |path: &Path| {
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
-            assert!(
-                std::fs::read_dir(path).is_err(),
-                "mode 000 must lock this user out"
-            );
-        };
-        let open = |path: &Path| {
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // The report of a doctor run while `path` is closed to this account (mode 000), the
+        // folder's mode put back before anything is asserted.
+        let closed = |path: &Path| {
+            let _closed = cli_core::owner_only::testing::ModeGuard::closed(path);
+            doctor(&ctx, named("prod"))
         };
 
         // A target's folder: its config row and its folder row name it.
         let prod = store.target_dir("prod");
         {
             let _foreign = cli_core::owner_only::pretend::foreign_owner(&prod);
-            close(&prod);
-            let r = doctor(&ctx, named("prod"));
-            open(&prod);
+            let r = closed(&prod);
             assert_eq!(
                 config_row(&r),
                 (
@@ -3506,9 +3499,7 @@ mod tests {
         let targets = store.targets_dir();
         {
             let _foreign = cli_core::owner_only::pretend::foreign_owner(&targets);
-            close(&targets);
-            let r = doctor(&ctx, named("prod"));
-            open(&targets);
+            let r = closed(&targets);
             assert_eq!(
                 config_row(&r),
                 (
@@ -3531,9 +3522,7 @@ mod tests {
         // A target's state folder, which the walk lists: named, and the walk goes on past it.
         let state = store.state_dir("dev");
         let _foreign = cli_core::owner_only::pretend::foreign_owner(&state);
-        close(&state);
-        let r = doctor(&ctx, named("prod"));
-        open(&state);
+        let r = closed(&state);
         assert_eq!(
             folder_rows(&r),
             [

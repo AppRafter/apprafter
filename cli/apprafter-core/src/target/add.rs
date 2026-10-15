@@ -663,6 +663,8 @@ mod tests {
     use super::*;
     use crate::error::UiError;
     use crate::NullReporter;
+    #[cfg(unix)]
+    use cli_core::owner_only::testing::ModeGuard;
 
     fn args(name: &str, token: &str) -> AddArgs {
         AddArgs {
@@ -791,35 +793,6 @@ mod tests {
         assert_eq!(crate::target::testkit::snapshot(ctx.config_root()), before);
     }
 
-    /// Unix: `path` at `mode` while the guard lives, then 0700. `closed`: assert first that the
-    /// mode locks this account out (a run as root would open what the test needs closed).
-    #[cfg(unix)]
-    struct Mode(std::path::PathBuf);
-
-    #[cfg(unix)]
-    impl Mode {
-        fn set(path: &Path, mode: u32, closed: bool) -> Mode {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
-            let guard = Mode(path.to_path_buf());
-            if closed {
-                assert!(
-                    std::fs::read_dir(path).is_err(),
-                    "mode {mode:o} does not lock this account out of {path:?}: not as root"
-                );
-            }
-            guard
-        }
-    }
-
-    #[cfg(unix)]
-    impl Drop for Mode {
-        fn drop(&mut self) {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
-        }
-    }
-
     /// The renewal and the adds `target add` plans, for `prod` (stored) and `dev` (new).
     #[cfg(unix)]
     fn plans(ctx: &Context) -> Vec<(&'static str, CoreError)> {
@@ -855,7 +828,7 @@ mod tests {
         let ctx = ctx.with_no_ping(true);
         let folder = ctx.store().target_dir("prod");
         let _foreign = cli_core::owner_only::pretend::foreign_owner(&folder);
-        let _closed = Mode::set(&folder, 0o000, true);
+        let _closed = ModeGuard::closed(&folder);
         for (what, err) in plans(&ctx) {
             match err {
                 CoreError::Cli(cli_core::CliError::StoreNotPrivate {
@@ -877,8 +850,8 @@ mod tests {
         let (_d, ctx) = store(&["prod"], Some("prod"));
         let ctx = ctx.with_no_ping(true);
         let root = ctx.store().root().to_path_buf();
-        let _closed = Mode::set(&ctx.store().target_dir("prod"), 0o000, true);
-        let _open = Mode::set(&root, 0o777, false);
+        let _closed = ModeGuard::closed(&ctx.store().target_dir("prod"));
+        let _open = ModeGuard::set(&root, 0o777);
         for (what, err) in plans(&ctx) {
             match err {
                 CoreError::Cli(cli_core::CliError::StoreNotPrivate {

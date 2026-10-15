@@ -233,6 +233,8 @@ fn io_error(path: &Path, e: io::Error) -> CliError {
 mod tests {
     use super::*;
     use crate::owner_only::pretend;
+    #[cfg(unix)]
+    use crate::owner_only::testing::ModeGuard;
 
     fn store() -> (tempfile::TempDir, TargetStorePaths) {
         let dir = tempfile::tempdir().unwrap();
@@ -357,35 +359,6 @@ mod tests {
         std::fs::set_permissions(paths.root(), std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    /// Unix: `path` made unopenable (mode 000) while the guard lives, then 0700 again. Refuses
-    /// to go on where mode 000 does not lock this account out (root): the tests that use it
-    /// are about what cannot be opened, and would pass there without opening anything closed.
-    #[cfg(unix)]
-    struct Closed(PathBuf);
-
-    #[cfg(unix)]
-    impl Closed {
-        fn new(path: &Path) -> Closed {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
-            let closed = Closed(path.to_path_buf());
-            assert!(
-                std::fs::read_dir(path).is_err(),
-                "mode 000 does not lock this account out of {path:?}: run the tests as a user, \
-                 not as root"
-            );
-            closed
-        }
-    }
-
-    #[cfg(unix)]
-    impl Drop for Closed {
-        fn drop(&mut self) {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
-        }
-    }
-
     /// WI-481, Unix: a folder another account owns (pretended) and keeps closed (mode 000, as
     /// such a folder made 0700 is to this account) is refused by name — the folders the walk
     /// lists (`targets`, `state`, a target's state folder) as well as one it does not open (a
@@ -402,7 +375,7 @@ mod tests {
             paths.state_dir("prod"),
         ] {
             let _foreign = pretend::foreign_owner(&path);
-            let _closed = Closed::new(&path);
+            let _closed = ModeGuard::closed(&path);
             match ensure_private(&paths) {
                 Err(CliError::StoreNotPrivate {
                     path: named,
@@ -427,7 +400,7 @@ mod tests {
             &["targets/prod", "state/prod/.apprafter", "state/zed"],
         );
         let closed_path = paths.state_dir("prod");
-        let closed = Closed::new(&closed_path);
+        let closed = ModeGuard::closed(&closed_path);
         let all = folders(&paths).unwrap();
         assert_eq!(
             all.iter().map(|f| f.rel.as_str()).collect::<Vec<_>>(),

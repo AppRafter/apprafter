@@ -471,13 +471,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn writes_need_the_store_lock_held() {
-        use std::os::unix::fs::PermissionsExt;
         let readonly = tempfile::tempdir().unwrap();
-        fs::set_permissions(readonly.path(), fs::Permissions::from_mode(0o555)).unwrap();
-        let unheld =
+        let unheld = {
+            let _readonly = cli_core::owner_only::testing::ModeGuard::set(readonly.path(), 0o555);
             StoreLock::exclusive(&TargetStorePaths::for_root(readonly.path().to_path_buf()))
-                .unwrap();
-        fs::set_permissions(readonly.path(), fs::Permissions::from_mode(0o755)).unwrap();
+                .unwrap()
+        };
         assert!(
             !unheld.is_held(),
             "a 0555 store root was writable: run the tests as a user a directory mode binds"

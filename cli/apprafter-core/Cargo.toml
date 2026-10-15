@@ -85,6 +85,7 @@ toml          = "0.5"
 # A cli-only dev-dependency: a path crate's dev-dependencies are not resolved in
 # desktop/Cargo.lock, so this adds nothing there.
 mockito       = { workspace = true }
-# `StoreLock::unheld` (cli-core's test-support), for the write-lock refusals' tests (D.4a T28). A
-# path crate's dev-dependency reaches neither a shipped binary nor desktop/Cargo.lock.
+# `StoreLock::unheld` (cli-core's test-support), for the write-lock refusals' tests (D.4a T28),
+# and `owner_only::testing::ModeGuard`, which puts a folder's mode back (WI-482). A path crate's
+# dev-dependency reaches neither a shipped binary nor desktop/Cargo.lock.
 cli-core      = { path = "../cli-core", features = ["test-support"] }

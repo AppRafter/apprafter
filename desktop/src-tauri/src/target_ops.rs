@@ -1220,20 +1220,16 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_renew_in_a_folder_another_account_owns_is_refused_naming_it() {
-        use std::os::unix::fs::PermissionsExt;
         let s = store(&["prod"], None);
         let folder = s.shell.context.store().target_dir("prod");
         let _foreign = cli_core::owner_only::pretend::foreign_owner(&folder);
-        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o000)).unwrap();
-        assert!(
-            std::fs::read_dir(&folder).is_err(),
-            "mode 000 must lock this user out"
-        );
-        let refused = [
-            plan_target_renew(&s.shell, "prod", Some(a_token('k')), None),
-            plan_target_renew(&s.shell, "prod", None, Some("/nowhere/key.pub".into())),
-        ];
-        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let refused = {
+            let _closed = cli_core::owner_only::testing::ModeGuard::closed(&folder);
+            [
+                plan_target_renew(&s.shell, "prod", Some(a_token('k')), None),
+                plan_target_renew(&s.shell, "prod", None, Some("/nowhere/key.pub".into())),
+            ]
+        };
         for got in refused {
             let ui = got.unwrap_err().to_ui();
             assert_eq!(

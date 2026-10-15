@@ -182,7 +182,6 @@ fn a_store_others_can_write_is_refused_reported_and_used_again_once_fixed() {
 #[cfg(unix)]
 #[test]
 fn a_flag_driven_command_refuses_a_store_others_can_change_before_it_reads_it() {
-    use std::os::unix::fs::PermissionsExt;
     let sp = Spawn::new();
     let add = ["target", "add", "prod", "--provider", "hetzner-cloud"];
     let (code, _, stderr) = run(&sp, &[&add[..], &["--token", TOKEN]].concat(), false);
@@ -195,14 +194,8 @@ fn a_flag_driven_command_refuses_a_store_others_can_change_before_it_reads_it() 
         "hetzner_cloud": {"server_id": 7, "server_name": "n", "kubeconfig_yaml": "apiVersion: v1\n"},
     });
     std::fs::write(state.state_file(), body.to_string()).unwrap();
-    let closed = [paths.target_dir("prod"), paths.state_dir("prod")];
-    for folder in &closed {
-        std::fs::set_permissions(folder, std::fs::Permissions::from_mode(0o000)).unwrap();
-        assert!(
-            std::fs::read_dir(folder).is_err(),
-            "mode 000 does not lock this account out of {folder:?}: run as a user, not as root"
-        );
-    }
+    let _closed = [paths.target_dir("prod"), paths.state_dir("prod")]
+        .map(|folder| cli_core::owner_only::testing::ModeGuard::closed(&folder));
     others_may_write(&store, true);
     let shown = unwrapped(&format!("other accounts can write to {}", store.display()));
     let commands: &[&[&str]] = &[
@@ -258,9 +251,6 @@ fn a_flag_driven_command_refuses_a_store_others_can_change_before_it_reads_it() 
         );
     }
     others_may_write(&store, false);
-    for folder in &closed {
-        std::fs::set_permissions(folder, std::fs::Permissions::from_mode(0o700)).unwrap();
-    }
     assert!(
         wrong.is_empty(),
         "read before the check:\n{}",

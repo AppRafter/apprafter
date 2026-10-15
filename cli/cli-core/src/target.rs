@@ -1036,6 +1036,8 @@ fn ensure_auth_placeholder(paths: &TargetStorePaths) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use crate::owner_only::testing::ModeGuard;
     use tempfile::tempdir;
 
     fn make_paths() -> (tempfile::TempDir, TargetStorePaths) {
@@ -1700,19 +1702,6 @@ mod tests {
         ));
     }
 
-    /// Restores a directory's mode on drop, so a failed test still lets
-    /// its `TempDir` clean up.
-    #[cfg(unix)]
-    struct ModeGuard(PathBuf);
-
-    #[cfg(unix)]
-    impl Drop for ModeGuard {
-        fn drop(&mut self) {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
-        }
-    }
-
     /// A store this process cannot write, with no sentinel in it yet: there
     /// is nothing to lock, so the guard holds nothing and says why.
     ///
@@ -1721,11 +1710,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_store_that_cannot_hold_a_sentinel_is_used_unlocked_with_a_warning() {
-        use std::os::unix::fs::PermissionsExt;
         let (_dir, paths) = make_paths();
         save_global_config(&paths, &GlobalConfig::default()).unwrap();
-        fs::set_permissions(paths.root(), fs::Permissions::from_mode(0o555)).unwrap();
-        let _restore = ModeGuard(paths.root().to_path_buf());
+        let _restore = ModeGuard::set(paths.root(), 0o555);
         if fs::write(paths.root().join("probe"), b"").is_ok() {
             eprintln!(
                 "SKIPPED a_store_that_cannot_hold_a_sentinel_is_used_unlocked_with_a_warning: \
@@ -1833,11 +1820,9 @@ mod tests {
     #[test]
     fn a_target_directory_that_cannot_be_searched_is_an_io_error_never_missing() {
         use std::io::ErrorKind::PermissionDenied;
-        use std::os::unix::fs::PermissionsExt;
         let (_dir, paths) = make_paths();
         saved(&paths, "prod");
-        fs::set_permissions(paths.target_dir("prod"), fs::Permissions::from_mode(0o000)).unwrap();
-        let _restore = ModeGuard(paths.target_dir("prod"));
+        let _closed = ModeGuard::closed(&paths.target_dir("prod"));
         let config = load_target_config(&paths, "prod").expect_err("cannot be searched");
         assert_target_file_io(&config, &paths.target_config_file("prod"), PermissionDenied);
         let credentials = load_target_credentials(&paths, "prod").expect_err("cannot be searched");
@@ -1857,7 +1842,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_folder_another_account_owns_and_keeps_closed_is_refused_by_every_read() {
-        use std::os::unix::fs::PermissionsExt;
         let (_dir, paths) = make_paths();
         saved(&paths, "prod");
         let refused_naming = |err: CliError, folder: &Path| match err {
@@ -1870,12 +1854,7 @@ mod tests {
         let prod = paths.target_dir("prod");
         {
             let _foreign = crate::owner_only::pretend::foreign_owner(&prod);
-            fs::set_permissions(&prod, fs::Permissions::from_mode(0o000)).unwrap();
-            let _restore = ModeGuard(prod.clone());
-            assert!(
-                fs::read_dir(&prod).is_err(),
-                "mode 000 must lock this user out"
-            );
+            let _closed = ModeGuard::closed(&prod);
             refused_naming(load_target_config(&paths, "prod").unwrap_err(), &prod);
             refused_naming(load_target_credentials(&paths, "prod").unwrap_err(), &prod);
             refused_naming(load_target(&paths, "prod").unwrap_err(), &prod);
@@ -1887,8 +1866,7 @@ mod tests {
         }
         let targets = paths.targets_dir();
         let _foreign = crate::owner_only::pretend::foreign_owner(&targets);
-        fs::set_permissions(&targets, fs::Permissions::from_mode(0o000)).unwrap();
-        let _restore = ModeGuard(targets.clone());
+        let _closed = ModeGuard::closed(&targets);
         refused_naming(list_target_names(&paths).unwrap_err(), &targets);
         refused_naming(load_target_config(&paths, "prod").unwrap_err(), &targets);
     }
@@ -1899,17 +1877,17 @@ mod tests {
     #[test]
     fn a_target_file_that_cannot_be_read_is_an_io_error_naming_its_target() {
         use std::io::ErrorKind::PermissionDenied;
-        use std::os::unix::fs::PermissionsExt;
         let (_dir, paths) = make_paths();
         saved(&paths, "prod");
         let creds = paths.target_credentials_file("prod");
-        fs::set_permissions(&creds, fs::Permissions::from_mode(0o000)).unwrap();
-        load_target_config(&paths, "prod").expect("config.yaml reads");
-        let err = load_target_credentials(&paths, "prod").expect_err("cannot be read");
-        assert_target_file_io(&err, &creds, PermissionDenied);
-        fs::set_permissions(&creds, fs::Permissions::from_mode(0o600)).unwrap();
+        {
+            let _closed = ModeGuard::closed(&creds);
+            load_target_config(&paths, "prod").expect("config.yaml reads");
+            let err = load_target_credentials(&paths, "prod").expect_err("cannot be read");
+            assert_target_file_io(&err, &creds, PermissionDenied);
+        }
         let cfg = paths.target_config_file("prod");
-        fs::set_permissions(&cfg, fs::Permissions::from_mode(0o000)).unwrap();
+        let _closed = ModeGuard::closed(&cfg);
         let err = load_target_config(&paths, "prod").expect_err("cannot be read");
         assert_target_file_io(&err, &cfg, PermissionDenied);
     }

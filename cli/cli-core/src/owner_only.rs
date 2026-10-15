@@ -1166,6 +1166,154 @@ pub mod pretend {
     }
 }
 
+/// A Unix mode a test sets on a file or folder of its own temp dir, put back by a Drop guard
+/// (WI-482): this crate's tests, and through the `test-support` feature the core's, the CLI's
+/// and the desktop's. A folder left at mode 000 by a test that failed before its own restore
+/// line is one its `TempDir` cannot delete. Never in a shipped binary: `test-support` is
+/// enabled only from `[dev-dependencies]`.
+#[cfg(all(unix, any(test, feature = "test-support")))]
+pub mod testing {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+
+    /// The call [`ModeGuard::closed`] makes to check that a path is closed to this account.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Probe {
+        /// `read_dir`, for a folder.
+        ListFolder,
+        /// `File::open`, for anything else: listing a file fails at any mode, so it would
+        /// prove nothing.
+        OpenFile,
+    }
+
+    /// Which call checks whether `path` is closed to this account, and whether that call
+    /// failed (`true`: closed).
+    pub fn lockout_probe(path: &Path) -> (Probe, bool) {
+        if fs::metadata(path).is_ok_and(|m| m.is_dir()) {
+            (Probe::ListFolder, fs::read_dir(path).is_err())
+        } else {
+            (Probe::OpenFile, fs::File::open(path).is_err())
+        }
+    }
+
+    /// `path` at a mode of the test's choosing while the guard lives; the mode it had is put
+    /// back when the guard drops, a panic's unwinding included.
+    #[must_use = "the mode is put back when the guard drops"]
+    pub struct ModeGuard {
+        path: PathBuf,
+        found: u32,
+    }
+
+    impl ModeGuard {
+        /// `path` set to `mode`.
+        #[track_caller]
+        pub fn set(path: &Path, mode: u32) -> ModeGuard {
+            let found = fs::metadata(path)
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+                .permissions()
+                .mode()
+                & 0o7777;
+            fs::set_permissions(path, fs::Permissions::from_mode(mode))
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            ModeGuard {
+                path: path.to_path_buf(),
+                found,
+            }
+        }
+
+        /// `path` closed to this account: mode 000, checked with [`lockout_probe`]. Panics
+        /// where mode 000 does not lock this account out (root): the tests that use it are
+        /// about what cannot be opened, and would pass there without opening anything closed.
+        #[track_caller]
+        pub fn closed(path: &Path) -> ModeGuard {
+            let guard = ModeGuard::set(path, 0o000);
+            let (probe, closed) = lockout_probe(path);
+            assert!(
+                closed,
+                "mode 000 does not lock this account out of {} ({probe:?}): run the tests as \
+                 a user, not as root",
+                path.display()
+            );
+            guard
+        }
+    }
+
+    impl Drop for ModeGuard {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.path, fs::Permissions::from_mode(self.found));
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn mode(path: &Path) -> u32 {
+            fs::metadata(path).unwrap().permissions().mode() & 0o7777
+        }
+
+        /// A test that panics while a folder is closed leaves it at the mode it had, and its
+        /// temp dir deletable.
+        #[test]
+        fn a_closed_folder_gets_its_mode_back_after_a_panic() {
+            let dir = tempfile::tempdir().unwrap();
+            let folder = dir.path().join("closed");
+            fs::create_dir(&folder).unwrap();
+            fs::write(folder.join("inside"), b"x").unwrap();
+            fs::set_permissions(&folder, fs::Permissions::from_mode(0o750)).unwrap();
+            let unwound = std::panic::catch_unwind(|| {
+                let _closed = ModeGuard::closed(&folder);
+                panic!("a test that fails while the folder is closed");
+            });
+            assert!(unwound.is_err());
+            let left = mode(&folder);
+            // Open it whatever happened, so a failure here still leaves nothing undeletable.
+            fs::set_permissions(&folder, fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(left, 0o750);
+            dir.close().unwrap();
+        }
+
+        /// `set` puts back the mode it found, not a fixed one.
+        #[test]
+        fn a_set_mode_is_put_back_as_it_was() {
+            let dir = tempfile::tempdir().unwrap();
+            let folder = dir.path().join("f");
+            fs::create_dir(&folder).unwrap();
+            fs::set_permissions(&folder, fs::Permissions::from_mode(0o711)).unwrap();
+            {
+                let _guard = ModeGuard::set(&folder, 0o555);
+                assert_eq!(mode(&folder), 0o555);
+            }
+            assert_eq!(mode(&folder), 0o711);
+        }
+
+        /// A folder is checked by listing it, a file by opening it; at mode 000 both are closed
+        /// to this account, and both get their modes back.
+        #[test]
+        fn a_folder_is_listed_and_a_file_opened_to_check_it_is_closed() {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("file");
+            fs::write(&file, b"x").unwrap();
+            fs::set_permissions(&file, fs::Permissions::from_mode(0o640)).unwrap();
+            assert_eq!(lockout_probe(dir.path()), (Probe::ListFolder, false));
+            assert_eq!(lockout_probe(&file), (Probe::OpenFile, false));
+            {
+                let _closed = ModeGuard::closed(&file);
+                assert_eq!(lockout_probe(&file), (Probe::OpenFile, true));
+            }
+            assert_eq!(mode(&file), 0o640);
+            let folder = dir.path().join("folder");
+            fs::create_dir(&folder).unwrap();
+            {
+                let _closed = ModeGuard::closed(&folder);
+                assert_eq!(lockout_probe(&folder), (Probe::ListFolder, true));
+            }
+            assert!(fs::read_dir(&folder).is_ok());
+        }
+    }
+}
+
 // ---- Reading a DACL. ----
 
 /// `ACCESS_ALLOWED_ACE_TYPE` and `ACCESS_DENIED_ACE_TYPE` (winnt.h; windows-sys has them only

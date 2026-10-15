@@ -357,19 +357,6 @@ fn target_add_renew_waits_for_the_store_lock() {
     assert!(sb.read("targets/a/credentials.yaml").contains(TOKEN_B));
 }
 
-/// Restores a directory's mode on drop, so a failed test still lets its
-/// `TempDir` clean up.
-#[cfg(unix)]
-struct ModeGuard(std::path::PathBuf);
-
-#[cfg(unix)]
-impl Drop for ModeGuard {
-    fn drop(&mut self) {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
-    }
-}
-
 /// `target use` of the target that is already active writes nothing, so a
 /// store this process cannot write — no sentinel in it, and none can be
 /// created — must not make it fail: it runs without the lock and says so.
@@ -380,12 +367,10 @@ impl Drop for ModeGuard {
 #[cfg(unix)]
 #[test]
 fn target_use_on_a_read_only_store_warns_and_succeeds() {
-    use std::os::unix::fs::PermissionsExt;
     let sb = Sandbox::new();
     let root = sb.store().root().to_path_buf();
     assert!(!sb.store().lock_file().exists(), "seeding took no lock");
-    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o555)).unwrap();
-    let _restore = ModeGuard(root.clone());
+    let _restore = cli_core::owner_only::testing::ModeGuard::set(&root, 0o555);
     if std::fs::write(root.join("probe"), b"").is_ok() {
         eprintln!(
             "SKIPPED target_use_on_a_read_only_store_warns_and_succeeds: a 0555 directory is \

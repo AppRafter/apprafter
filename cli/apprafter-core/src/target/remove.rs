@@ -471,12 +471,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_target_directory_that_cannot_be_searched_is_unreadable_never_missing() {
-        use std::os::unix::fs::PermissionsExt;
         let (_d, ctx) = store(&["prod"], None);
-        let dir = ctx.store().target_dir("prod");
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let plan = TargetRef::named(&ctx, "prod").and_then(|t| plan_remove(&ctx, &t));
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let plan = {
+            let _closed =
+                cli_core::owner_only::testing::ModeGuard::closed(&ctx.store().target_dir("prod"));
+            TargetRef::named(&ctx, "prod").and_then(|t| plan_remove(&ctx, &t))
+        };
         let plan = plan.unwrap();
         for (kind, file) in [
             ("Target", "config.yaml"),
