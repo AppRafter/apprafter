@@ -233,6 +233,11 @@ struct ToolPathState {
     fallback: (OsString, PathSource),
     /// The fallback taken for want of an answer in time is logged once.
     warned: AtomicBool,
+    /// How long each [`ToolSearchPath::get`] could still wait when it began, in order: how a
+    /// test tells that a lookup waits, or that it did not, without reading a clock
+    /// (GOTCHA-332).
+    #[cfg(test)]
+    waits: Mutex<Vec<Duration>>,
 }
 
 impl ToolPathState {
@@ -247,6 +252,8 @@ impl ToolPathState {
             deadline: Instant::now() + wait,
             fallback,
             warned: AtomicBool::new(false),
+            #[cfg(test)]
+            waits: Mutex::default(),
         }
     }
 
@@ -257,6 +264,15 @@ impl ToolPathState {
     fn answer(&self, answer: (OsString, PathSource)) {
         *self.lock() = Some(answer);
         self.answered.notify_all();
+    }
+
+    /// What each lookup could still wait when it began (see `waits`).
+    #[cfg(test)]
+    fn waits(&self) -> Vec<Duration> {
+        self.waits
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 }
 
@@ -312,6 +328,12 @@ impl ToolSearchPath {
     pub fn get(&self) -> (OsString, PathSource) {
         let state = &*self.0;
         let remaining = state.deadline.saturating_duration_since(Instant::now());
+        #[cfg(test)]
+        state
+            .waits
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(remaining);
         let (answer, _) = state
             .answered
             .wait_timeout_while(state.lock(), remaining, |answer| answer.is_none())
@@ -386,9 +408,18 @@ fn login_shell_command(shell: &Path) -> std::process::Command {
 /// [`LOGIN_SHELL_TIMEOUT`]): the `PATH` it printed after the marker, or `None`.
 #[cfg(any(target_os = "macos", all(test, unix)))]
 fn probe_login_shell(cmd: std::process::Command) -> Option<OsString> {
+    probe_login_shell_within(cmd, LOGIN_SHELL_TIMEOUT)
+}
+
+/// [`probe_login_shell`], the shell killed after `bound`.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn probe_login_shell_within(
+    cmd: std::process::Command,
+    bound: std::time::Duration,
+) -> Option<OsString> {
     match apprafter_core::process::run_bounded(
         cmd,
-        LOGIN_SHELL_TIMEOUT,
+        bound,
         &apprafter_core::CancellationToken::new(),
     ) {
         Ok(out) if !out.timed_out => parse_login_shell_output(&out.stdout),
@@ -806,6 +837,9 @@ mod tests {
     use apprafter_core::{CliOverrides, CoreError, MapEnv};
 
     use super::*;
+    #[cfg(unix)]
+    use crate::ops::test_wait::LONG;
+    use crate::ops::test_wait::{within, YEAR};
 
     /// Everything a terminal might hand the app: the names on the list (`PATH` off macOS) and
     /// some it must never see.
@@ -953,17 +987,30 @@ echo '/opt/homebrew/bin:/usr/bin:/bin'
     }
 
     /// A login shell with a slow profile: it answers as the probe's script would, `/slow/bin`,
-    /// after `secs` seconds.
+    /// once `go` exists in `dir` — when the test lets it, never after a time of its own
+    /// (GOTCHA-332) — or once `dir` is gone.
     #[cfg(unix)]
-    fn slow_login_shell(dir: &Path, secs: u32) -> PathBuf {
-        let shell = dir.join("slow-login-shell");
+    fn held_login_shell(dir: &Path) -> PathBuf {
+        let shell = dir.join("held-login-shell");
+        let (go, dir) = (dir.join("go"), dir.display());
         install_script(
             &shell,
             &format!(
-                "#!/bin/sh\ncase \"$1\" in __probe) exit 0;; esac\nsleep {secs}\necho '{PATH_MARKER}'\necho /slow/bin\n"
+                "#!/bin/sh\ncase \"$1\" in __probe) exit 0;; esac\nwhile [ ! -e '{go}' ] && [ -d '{dir}' ]; do sleep 0.01; done\necho '{PATH_MARKER}'\necho /slow/bin\n",
+                go = go.display()
             ),
         );
         shell
+    }
+
+    /// Waits until `done` holds; a test that waits longer than `LONG` fails.
+    #[cfg(unix)]
+    fn wait_until(what: &str, done: impl Fn() -> bool) {
+        let deadline = Instant::now() + LONG;
+        while !done() {
+            assert!(Instant::now() < deadline, "{what} never happened");
+            thread::sleep(Duration::from_millis(2));
+        }
     }
 
     fn fallback() -> (OsString, PathSource) {
@@ -972,36 +1019,39 @@ echo '/opt/homebrew/bin:/usr/bin:/bin'
 
     /// The macOS start, on every Unix against a slow stand-in shell: asking it holds up nothing
     /// — not the host the context is built from, which has the fallback meanwhile — and the
-    /// first lookup of a tool waits for its answer.
+    /// first lookup of a tool waits for its answer. The shell answers only when the test lets
+    /// it, and nothing gives up on it for a year: the start returned while it could not have
+    /// answered, and the lookup was waiting before it could (GOTCHA-332).
     #[cfg(unix)]
     #[test]
     fn a_slow_login_shell_holds_up_the_first_tool_lookup_and_nothing_before_it() {
         let dir = tempfile::tempdir().unwrap();
-        let shell = slow_login_shell(dir.path(), 2);
-        let started = Instant::now();
+        let shell = held_login_shell(dir.path());
         let tools = ToolSearchPath::probe(
-            move || probe_login_shell(login_shell_command(&shell)),
+            move || probe_login_shell_within(login_shell_command(&shell), YEAR),
             PathSource::LoginShell,
             fallback(),
-            TOOL_PATH_WAIT,
+            YEAR,
         );
-        let host = desktop_host(&tools, PathBuf::from("/data/run"));
-        assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "the start waited {:?} for the login shell",
-            started.elapsed()
-        );
+        let host = {
+            let tools = tools.clone();
+            within("the start", move || {
+                desktop_host(&tools, PathBuf::from("/data/run"))
+            })
+        };
         assert_eq!(
             (host.tool_search_path, host.tool_search_path_source),
             fallback()
         );
+        let lookup = {
+            let tools = tools.clone();
+            thread::spawn(move || tools.get())
+        };
+        wait_until("the lookup waits", || !tools.0.waits().is_empty());
+        std::fs::write(dir.path().join("go"), "").unwrap();
         assert_eq!(
-            tools.get(),
+            within("the lookup", move || lookup.join().unwrap()),
             (OsString::from("/slow/bin"), PathSource::LoginShell)
-        );
-        assert!(
-            started.elapsed() >= Duration::from_secs(2),
-            "it waited for the answer"
         );
         assert_eq!(
             tools.clone().now().1,
@@ -1015,28 +1065,23 @@ echo '/opt/homebrew/bin:/usr/bin:/bin'
     #[test]
     fn past_its_wait_a_lookup_takes_the_fallback_until_the_answer_comes() {
         let (release, released) = std::sync::mpsc::channel::<()>();
-        let started = Instant::now();
         let tools = ToolSearchPath::probe(
             move || {
-                let _ = released.recv_timeout(Duration::from_secs(30));
+                // It answers only once let go, below.
+                let _ = released.recv();
                 Some(OsString::from("/late/bin"))
             },
             PathSource::LoginShell,
             fallback(),
             Duration::from_millis(200),
         );
+        // The first lookup gave up at the wait's end; the second began past it, with nothing
+        // left to wait (GOTCHA-332: the record, not the clock).
         assert_eq!(tools.get(), fallback());
-        let waited = started.elapsed();
-        assert!(
-            waited >= Duration::from_millis(200) && waited < Duration::from_secs(5),
-            "{waited:?}"
-        );
-        let again = Instant::now();
         assert_eq!(tools.get(), fallback());
-        assert!(
-            again.elapsed() < Duration::from_millis(100),
-            "no second wait"
-        );
+        let waits = tools.0.waits();
+        assert!(waits[0] <= Duration::from_millis(200), "{waits:?}");
+        assert_eq!(waits[1], Duration::ZERO, "no second wait");
         release.send(()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         while tools.now().1 != PathSource::LoginShell {
@@ -1052,25 +1097,17 @@ echo '/opt/homebrew/bin:/usr/bin:/bin'
     /// No answer, or a probe that panicked: the fallback, without waiting out the wait.
     #[test]
     fn a_probe_that_finds_nothing_or_panics_gives_the_fallback_at_once() {
-        let nothing = ToolSearchPath::probe(|| None, PathSource::LoginShell, fallback(), LONG_WAIT);
+        // The wait a year long: only the answer can end a lookup (GOTCHA-332).
+        let nothing = ToolSearchPath::probe(|| None, PathSource::LoginShell, fallback(), YEAR);
         let broken = ToolSearchPath::probe(
             || panic!("the probe broke"),
             PathSource::LoginShell,
             fallback(),
-            LONG_WAIT,
+            YEAR,
         );
-        let started = Instant::now();
-        assert_eq!(nothing.get(), fallback());
-        assert_eq!(broken.get(), fallback());
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "{:?}",
-            started.elapsed()
-        );
+        assert_eq!(within("the lookup", move || nothing.get()), fallback());
+        assert_eq!(within("the lookup", move || broken.get()), fallback());
     }
-
-    /// Longer than any test waits.
-    const LONG_WAIT: Duration = Duration::from_secs(60);
 
     #[test]
     fn a_known_path_is_known_at_once() {

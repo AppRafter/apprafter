@@ -240,12 +240,12 @@ mod tests {
     use std::sync::mpsc::{self, Receiver, Sender};
     use std::sync::{Arc, Mutex};
     use std::thread;
-    use std::time::Instant;
 
     use super::*;
     use UnavailableReason::{NoBackend, NotConfigured, NotInteractive};
 
-    /// Short enough for a quick test, long enough to tell "waited for the grace" apart.
+    /// Short enough for a quick test. A test tells "waited out the grace" from "answered at
+    /// once" by the evaluation's steps, never by the time it took.
     const FAST: Timing = Timing {
         tick: Duration::from_millis(5),
         grace: Duration::from_millis(300),
@@ -552,13 +552,24 @@ mod tests {
 
     // `wait_for`, against an evaluation the test answers.
 
+    /// What [`wait_for`] did to a [`FakeEvaluation`], in order.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Step {
+        /// A `wait` of this timeout, and what it gave: the reply, or `None` when it timed out.
+        Waited(Duration, Option<Result<(), LaError>>),
+        Invalidated,
+    }
+
     /// An evaluation that replies what the test sends, and on `invalidate` replies `on_cancel`
-    /// (as the framework replies `LAErrorAppCancel`) if there is one.
+    /// (as the framework replies `LAErrorAppCancel`) if there is one. It records every step, so
+    /// a test reads why the wait ended (a reply, or a timeout of the grace) and never how long
+    /// it took (GOTCHA-332).
     struct FakeEvaluation {
         replies: Receiver<Result<(), LaError>>,
         sender: Sender<Result<(), LaError>>,
         on_invalidate: Option<Result<(), LaError>>,
         invalidations: AtomicUsize,
+        steps: Mutex<Vec<Step>>,
     }
 
     impl FakeEvaluation {
@@ -569,7 +580,15 @@ mod tests {
                 sender,
                 on_invalidate,
                 invalidations: AtomicUsize::new(0),
+                steps: Mutex::default(),
             }
+        }
+
+        /// The steps from the invalidation on.
+        fn since_invalidated(&self) -> Vec<Step> {
+            let steps = self.steps.lock().unwrap();
+            let from = steps.iter().position(|step| *step == Step::Invalidated);
+            from.map_or_else(Vec::new, |from| steps[from..].to_vec())
         }
 
         fn reply_later(&self, after: Duration, reply: Result<(), LaError>) {
@@ -587,11 +606,24 @@ mod tests {
 
     impl Pending for FakeEvaluation {
         fn wait(&self, timeout: Duration) -> Option<Result<(), LaError>> {
-            self.replies.recv_timeout(timeout).ok()
+            // A second wait after the invalidation would wait past the grace: it fails here
+            // rather than hang.
+            assert!(
+                self.since_invalidated().len() < 2,
+                "waited again after the grace: {:?}",
+                self.since_invalidated()
+            );
+            let reply = self.replies.recv_timeout(timeout).ok();
+            self.steps
+                .lock()
+                .unwrap()
+                .push(Step::Waited(timeout, reply));
+            reply
         }
 
         fn invalidate(&self) {
             self.invalidations.fetch_add(1, Ordering::SeqCst);
+            self.steps.lock().unwrap().push(Step::Invalidated);
             if let Some(reply) = self.on_invalidate {
                 let _ = self.sender.send(reply);
             }
@@ -622,28 +654,34 @@ mod tests {
     }
 
     /// The framework replies to an invalidated context at once: the wait answers then, not
-    /// after the grace.
+    /// after the grace. Its one wait of the grace ended with that reply.
     #[test]
     fn a_tripped_token_invalidates_the_context() {
         let evaluation = FakeEvaluation::new(Some(Err(Some(APP_CANCEL))));
         let token = trip_after(Duration::from_millis(30));
-        let started = Instant::now();
         assert_eq!(wait_for(&evaluation, &token, FAST), Asked::Cancelled);
         assert_eq!(evaluation.invalidations(), 1);
-        assert!(started.elapsed() < FAST.grace, "{:?}", started.elapsed());
+        assert_eq!(
+            evaluation.since_invalidated(),
+            [
+                Step::Invalidated,
+                Step::Waited(FAST.grace, Some(Err(Some(APP_CANCEL))))
+            ]
+        );
     }
 
-    /// An invalidation that brings no reply is waited for no longer than the grace.
+    /// An invalidation that brings no reply is waited for no longer than the grace: one wait of
+    /// the grace, which times out, and the wait answers.
     #[test]
     fn an_invalidation_without_a_reply_is_given_up_after_the_grace() {
         let evaluation = FakeEvaluation::new(None);
         let token = trip_after(Duration::from_millis(30));
-        let started = Instant::now();
         assert_eq!(wait_for(&evaluation, &token, FAST), Asked::Cancelled);
         assert_eq!(evaluation.invalidations(), 1);
-        let waited = started.elapsed();
-        assert!(waited >= FAST.grace, "{waited:?}");
-        assert!(waited < FAST.grace * 3, "{waited:?}");
+        assert_eq!(
+            evaluation.since_invalidated(),
+            [Step::Invalidated, Step::Waited(FAST.grace, None)]
+        );
     }
 
     /// The dialog closed under the owner's finger: the app's cancel, not a verification.

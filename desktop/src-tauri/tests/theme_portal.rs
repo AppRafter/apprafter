@@ -13,8 +13,7 @@ use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use apprafter_desktop::theme::portal::{self, Bus};
 use apprafter_desktop::theme::{Appearance, Apply};
@@ -103,8 +102,8 @@ fn setting(scheme: &Mutex<Option<u32>>, namespace: &str, key: &str) -> zbus::fdo
 /// for the colour scheme.
 struct Settings {
     scheme: Arc<Mutex<Option<u32>>>,
-    /// How long `ReadOne` takes to answer.
-    delay: Duration,
+    /// When there is one, `ReadOne` answers only once the test has let go of its sender.
+    held: Option<Mutex<Receiver<()>>>,
     /// A change of the colour scheme the first `ReadOne` makes, and signals, before it answers
     /// with the scheme it had: a change while the watch reads.
     change_while_answering: Mutex<Option<u32>>,
@@ -118,7 +117,9 @@ impl Settings {
         namespace: &str,
         key: &str,
     ) -> zbus::fdo::Result<OwnedValue> {
-        thread::sleep(self.delay);
+        if let Some(held) = &self.held {
+            let _ = held.lock().unwrap().recv();
+        }
         let answer = setting(&self.scheme, namespace, key);
         let change = self.change_while_answering.lock().unwrap().take();
         if let Some(scheme) = change {
@@ -160,15 +161,23 @@ struct FakePortal {
 
 impl FakePortal {
     fn start(bus: &PrivateBus, scheme: Option<u32>) -> Self {
-        Self::answering_after(bus, scheme, Duration::ZERO)
-    }
-
-    fn answering_after(bus: &PrivateBus, scheme: Option<u32>, delay: Duration) -> Self {
         Self::serving(bus, scheme, |scheme| Settings {
             scheme,
-            delay,
+            held: None,
             change_while_answering: Mutex::new(None),
         })
+    }
+
+    /// A portal whose `ReadOne` answers only once the returned sender is dropped: when the
+    /// test lets it, never after a time of its own (GOTCHA-332).
+    fn holding_its_answer(bus: &PrivateBus, scheme: Option<u32>) -> (Self, mpsc::Sender<()>) {
+        let (release, held) = mpsc::channel();
+        let portal = Self::serving(bus, scheme, |scheme| Settings {
+            scheme,
+            held: Some(Mutex::new(held)),
+            change_while_answering: Mutex::new(None),
+        });
+        (portal, release)
     }
 
     /// A portal whose first `ReadOne` changes the scheme to `change`, and signals it, before it
@@ -176,7 +185,7 @@ impl FakePortal {
     fn changing_while_answering(bus: &PrivateBus, scheme: u32, change: u32) -> Self {
         Self::serving(bus, Some(scheme), |scheme| Settings {
             scheme,
-            delay: Duration::ZERO,
+            held: None,
             change_while_answering: Mutex::new(Some(change)),
         })
     }
@@ -373,19 +382,15 @@ fn a_portal_without_the_setting_answers_none() {
 }
 
 /// The read is bounded: a portal that does not answer within the call's timeout counts as
-/// none, long before it would have answered.
+/// none. It answers only once let go, after the watch said: the watch gave up on its own
+/// (GOTCHA-332: not a bound on the clock).
 #[test]
 fn a_portal_that_does_not_answer_in_time_counts_as_none() {
     let bus = PrivateBus::start();
-    let _portal = FakePortal::answering_after(&bus, Some(1), Duration::from_secs(5));
-    let started = Instant::now();
+    let (_portal, release) = FakePortal::holding_its_answer(&bus, Some(1));
     let heard = watch(&bus, Duration::from_millis(200));
     assert_eq!(heard.recv_timeout(PATIENCE), Ok(None));
-    assert!(
-        started.elapsed() < Duration::from_secs(3),
-        "{:?}",
-        started.elapsed()
-    );
+    drop(release);
 }
 
 /// The watch and the theme together, as the app starts them: under System the window follows

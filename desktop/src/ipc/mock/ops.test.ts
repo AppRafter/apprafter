@@ -4,10 +4,11 @@
 import { afterEach, beforeEach, expect, mock, setSystemTime, test } from 'bun:test';
 import { Channel } from '@tauri-apps/api/core';
 import { clearMocks } from '@tauri-apps/api/mocks';
-import { settleIpc } from '../../test/settle';
+import { settleIpc, UNTIL_TURNS_MAX, until } from '../../test/settle';
 import * as api from '../api';
 import { DESKTOP_ERROR_CODES } from '../generated/errors';
 import type { OpEvent } from '../generated/OpEvent';
+import type { OpSummary } from '../generated/OpSummary';
 import type { UiError } from '../generated/UiError';
 import { attach, execute, operationsSnapshot, resetOperations } from '../operations';
 import { installMockIpc, MOCK_PASSWORD, mockOps } from './index';
@@ -19,6 +20,20 @@ async function endOfView(opId: number) {
     await settle(2);
   }
   return operationsSnapshot().get(opId)?.end;
+}
+/**
+ * The ops op_list holds once `done` says they have ended, asked again after every turn: a run
+ * ends on the engine's own timer, never at a moment the test picks (GOTCHA-332).
+ */
+async function listedOnce(done: (list: OpSummary[]) => boolean): Promise<OpSummary[]> {
+  for (let turns = 0; ; turns += 1) {
+    const list = await api.opList();
+    if (done(list)) return list;
+    if (turns === UNTIL_TURNS_MAX) {
+      throw new Error(`op_list after ${turns} turns: ${JSON.stringify(list)}`);
+    }
+    await settle();
+  }
 }
 /** The UiError code a call rejected with. */
 const codeOf = (e: unknown) => (e as api.IpcError).error.code;
@@ -140,8 +155,7 @@ test('a page that followed the plan follows its run; the run is asked how it end
     { events: [{ kind: 'notice', message: 'one' }], end },
   );
   const release = attach(view.opId);
-  await settle();
-  expect(operationsSnapshot().get(view.opId)?.live).toBe(true);
+  await until('the page follows it', () => operationsSnapshot().get(view.opId)?.live === true);
   await api.opExecute(view.opId, new Channel<OpEvent>());
   expect(end).not.toHaveBeenCalled();
   expect((await endOfView(view.opId))?.state).toBe('finished');
@@ -173,7 +187,7 @@ test('cancelling a plan drops it and tells nobody; discard forgets an ended oper
   const read = mockOps().startRead('Region latency', null, { end: () => ({ result: [] }) });
   await api.opDiscard(read);
   expect((await api.opList()).map((s) => s.opId)).toContain(read);
-  await settle(5);
+  await listedOnce((list) => list.some((s) => s.opId === read && s.state !== 'running'));
   await api.opDiscard(read);
   expect((await api.opList()).map((s) => s.opId)).not.toContain(read);
   const unknown = await api.opSubscribe(read, new Channel<OpEvent>()).catch((e: unknown) => e);
@@ -189,8 +203,7 @@ test('op_list holds operations, not plans, the latest started first, each in its
   );
   const first = mockOps().startRead('Who am I', null, { end: () => ({ result: null }) });
   const second = mockOps().startRead('Doctor · lab', 'lab', { end: () => ({ error: taken }) });
-  await settle(5);
-  const list = await api.opList();
+  const list = await listedOnce((all) => all.every((s) => s.state !== 'running'));
   expect(list.map((s) => [s.opId, s.state])).toEqual([
     [second, 'failed'],
     [first, 'finished'],
@@ -202,11 +215,15 @@ test('a plan past its time is refused as expired, and spent', async () => {
   installMockIpc({ opDelayMs: 0 });
   await api.unlock();
   const heard: OpEvent[] = [];
+  // Its time counts from its registration, which the test's own clock brackets (GOTCHA-332).
+  const before = Date.now();
   const view = mockOps().registerPlan(
     { class: 'bounded', title: 'x', changes: [], target: null },
     { end: () => ({ result: null }) },
   );
-  expect(view.expiresAtMs - Date.now()).toBeGreaterThan(MOCK_PLAN_TTL_MS - 1000);
+  const after = Date.now();
+  expect(view.expiresAtMs).toBeGreaterThanOrEqual(before + MOCK_PLAN_TTL_MS);
+  expect(view.expiresAtMs).toBeLessThanOrEqual(after + MOCK_PLAN_TTL_MS);
   await api.opSubscribe(view.opId, new Channel<OpEvent>((event) => heard.push(event)));
   setSystemTime(new Date(view.expiresAtMs + 1));
   const expired = await api.opExecute(view.opId, new Channel<OpEvent>()).catch((e: unknown) => e);

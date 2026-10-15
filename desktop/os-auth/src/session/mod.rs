@@ -130,9 +130,15 @@ impl Listening {
     }
 }
 
-/// Set once a watch's sources are set up, with what listens.
+/// Set once a watch's sources are set up, with what listens. In the tests, also how many times
+/// [`SessionWatch::listening`] went to wait for it: how a test knows it waits, not guesses it from
+/// a moment (GOTCHA-332).
 #[derive(Default)]
-struct Ready(Mutex<Option<Listening>>, Condvar);
+struct Ready(
+    Mutex<Option<Listening>>,
+    Condvar,
+    #[cfg(test)] std::sync::atomic::AtomicUsize,
+);
 
 /// Where a source sends what it sees: cheap to clone, `Send + Sync`, never blocks.
 #[derive(Clone)]
@@ -260,7 +266,13 @@ impl SessionWatch {
         let (ready, woken) = (&self.ready.0, &self.ready.1);
         let ready = ready.lock().unwrap_or_else(PoisonError::into_inner);
         let (ready, _) = woken
-            .wait_timeout_while(ready, timeout, |ready| ready.is_none())
+            .wait_timeout_while(ready, timeout, |ready| {
+                #[cfg(test)]
+                if ready.is_none() && !timeout.is_zero() {
+                    self.ready.2.fetch_add(1, Ordering::SeqCst);
+                }
+                ready.is_none()
+            })
             .unwrap_or_else(PoisonError::into_inner);
         *ready
     }
@@ -425,14 +437,17 @@ mod tests {
         );
     }
 
+    /// Sources that say when they are dropped.
+    struct Stopped(mpsc::Sender<()>);
+
+    impl Drop for Stopped {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
     #[test]
     fn a_dropped_watch_calls_back_no_more_and_stops_its_sources() {
-        struct Stopped(mpsc::Sender<()>);
-        impl Drop for Stopped {
-            fn drop(&mut self) {
-                let _ = self.0.send(());
-            }
-        }
         let (events, received) = mpsc::channel();
         let (emitters, emitter) = mpsc::channel();
         let (stopped, sources_stopped) = mpsc::channel();
@@ -468,6 +483,7 @@ mod tests {
         let (release, release_rx) = mpsc::channel::<()>();
         let (events, received) = mpsc::channel();
         let (emitters, emitter) = mpsc::channel();
+        let (stopped, sources_stopped) = mpsc::channel();
         let watch = SessionWatch::start(
             move |event| {
                 if entered_tx.send(()).is_ok() {
@@ -477,7 +493,7 @@ mod tests {
             },
             move |emitter: Emitter| {
                 emitters.send(emitter).unwrap();
-                Box::new(())
+                Box::new(Stopped(stopped))
             },
         );
         let source: Emitter = emitter.recv().unwrap();
@@ -487,7 +503,9 @@ mod tests {
         source.signal(Signal::ScreenIsLocked);
         drop(entered);
         let dropping = thread::spawn(move || drop(watch));
-        thread::sleep(QUIET);
+        // The drop has begun: it drops the sources once it has stopped the dispatch, and only
+        // then is the callback in progress let go (GOTCHA-332: a sleep here raced the drop).
+        sources_stopped.recv_timeout(PATIENCE).unwrap();
         release.send(()).unwrap();
         dropping.join().unwrap();
         assert_eq!(received.try_recv(), Ok(Locked), "the callback in progress");
@@ -529,20 +547,33 @@ mod tests {
                 Box::new(())
             },
         );
-        let started = Instant::now();
+        // Not set up: asked to wait 50 ms, it answers by itself, with nothing.
         assert_eq!(watch.listening(Duration::from_millis(50)), None);
-        assert!(started.elapsed() >= Duration::from_millis(50));
         assert_eq!(
             watch.listening(Duration::ZERO),
             None,
             "asked without waiting"
         );
+        // It waits for the sources: they say only once it is waiting (it counts under the lock
+        // their saying takes), and its own bound is twice as far as theirs (GOTCHA-332: an
+        // event, not a moment).
         let source: Emitter = emitter.recv().unwrap();
-        thread::spawn(move || {
-            thread::sleep(Duration::from_millis(30));
+        let waited = watch.ready.2.load(Ordering::SeqCst);
+        let ready = Arc::clone(&watch.ready);
+        let sayer = thread::spawn(move || {
+            let deadline = Instant::now() + PATIENCE;
+            while ready.2.load(Ordering::SeqCst) == waited {
+                if Instant::now() >= deadline {
+                    // It never waited: let it go with nothing, which fails the test.
+                    source.ready(Listening::NONE);
+                    return;
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
             source.ready(BOTH);
         });
-        assert_eq!(watch.listening(PATIENCE), Some(BOTH));
+        assert_eq!(watch.listening(2 * PATIENCE), Some(BOTH));
+        sayer.join().unwrap();
         assert_eq!(
             watch.listening(Duration::ZERO),
             Some(BOTH),

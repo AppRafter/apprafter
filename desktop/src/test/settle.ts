@@ -13,6 +13,8 @@
 // in which nothing new was asked means nothing is on its way. A chain of timers that asks nothing
 // in between, or a timer longer than 0 ms, is not waited for.
 
+import { getConfig } from '@testing-library/react';
+
 interface Internals {
   invoke?: (...args: unknown[]) => unknown;
 }
@@ -46,4 +48,28 @@ export async function settleIpc(): Promise<void> {
     // Unless something installed a mock of its own meanwhile.
     if (internals.invoke === counting) internals.invoke = invoke;
   }
+}
+
+/**
+ * Turns after which a condition that never came is a failed test, not a slow machine: about
+ * four seconds at an idle machine's pace, under bun's five-second test timeout. A slow machine
+ * takes longer over each turn, never more turns.
+ */
+export const UNTIL_TURNS_MAX = 4_000;
+
+/**
+ * Waits until `holds()` is true, asking again after every macrotask turn — inside Testing
+ * Library's async wrapper, as findBy* waits, so React runs meanwhile — and never for a time: a
+ * slow machine takes longer, never fails the test (GOTCHA-332; a findBy* fails after 1 s of the
+ * clock). For what IPC answers, effects and 0 ms timers bring, never a timer of its own: a
+ * condition that waits for a delay would count turns as time. Throws `what` after
+ * UNTIL_TURNS_MAX turns.
+ */
+export async function until(what: string, holds: () => boolean): Promise<void> {
+  await getConfig().asyncWrapper(async () => {
+    for (let turns = 0; !holds(); turns += 1) {
+      if (turns === UNTIL_TURNS_MAX) throw new Error(`${what}: not after ${turns} turns`);
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+  });
 }

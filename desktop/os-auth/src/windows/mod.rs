@@ -650,14 +650,18 @@ mod tests {
         assert_eq!(credui::CAPTION, "AppRafter Desktop");
     }
 
-    /// The clock starts at the authenticator's creation and only moves forward.
+    /// The clock starts at the authenticator's creation and only moves forward. Its first
+    /// reading is bracketed by the test's own clock, started before the authenticator: never
+    /// more than that, however long the machine took (GOTCHA-332).
     #[test]
     fn the_system_clock_is_monotonic() {
+        let before = std::time::Instant::now();
         let auth = OsAuthenticator::new();
         let first = (auth.clock)();
+        let bracket = before.elapsed().as_millis();
         std::thread::sleep(std::time::Duration::from_millis(20));
         let second = (auth.clock)();
-        assert!(first < 1_000, "{first}");
+        assert!(u128::from(first) <= bracket, "{first} {bracket}");
         assert!(second >= first + 20, "{first} {second}");
         assert_eq!(auth.window.load(Ordering::SeqCst), 0, "no window yet");
         assert!(auth.prefer_hello.load(Ordering::SeqCst), "Hello by default");

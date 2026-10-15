@@ -136,6 +136,13 @@ pub(crate) fn logged(run: impl FnOnce()) -> String {
         }
     }
 
+    // A dispatcher for the whole test process, wanting nothing: with it, tracing never takes
+    // a capture for the process's only dispatcher (`has_just_one`), and so never asks the thread
+    // that first reaches a callsite which dispatcher wants it. A callsite another test's thread
+    // first reached while a capture was the only one would be cached as wanted by nobody, and
+    // the capture would miss its lines.
+    static KEEPER: OnceLock<tracing::Dispatch> = OnceLock::new();
+    KEEPER.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
     let lines = Arc::new(Mutex::new(Vec::new()));
     let writer = {
         let lines = lines.clone();
@@ -176,7 +183,23 @@ fn log_panics() {
 mod tests {
     use tracing::Level;
 
-    use super::{log_filter, OWN_CRATES};
+    use super::{log_filter, logged, OWN_CRATES};
+
+    /// A line logged while `logged` listens is in its log, even when another thread reached
+    /// its callsite first, meanwhile, while this capture was the process's only one: tracing
+    /// would then have asked that thread's dispatcher alone, which wants nothing. Run alone, as
+    /// `cargo test` runs a test it is asked for by name, it fails without `logged`'s keeper.
+    #[test]
+    fn a_line_another_thread_reached_first_is_still_captured() {
+        fn probe() {
+            tracing::info!("the capture probe");
+        }
+        let log = logged(|| {
+            std::thread::spawn(probe).join().unwrap();
+            probe();
+        });
+        assert_eq!(log.matches("the capture probe").count(), 1, "{log}");
+    }
 
     #[test]
     fn a_release_logs_info_and_up_for_every_crate() {

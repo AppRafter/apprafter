@@ -350,7 +350,7 @@ impl ClipboardBackend for MacClipboard {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
     use std::sync::{mpsc, Arc, Condvar, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -360,15 +360,18 @@ mod tests {
 
     use super::{ClipboardBackend, ClipboardMaker, SecretClipboard};
     use crate::ops::test_clock::ManualClock;
+    use crate::ops::test_wait::within;
     use crate::ops::SystemClock;
 
     const LONG: Duration = Duration::from_secs(10);
 
-    /// The OS clipboard, as a test holds it: its text, and whether the last write was concealed.
+    /// The OS clipboard, as a test holds it: its text, whether the last write was concealed,
+    /// and how many times its text was read.
     #[derive(Clone, Default)]
     struct Board {
         text: Arc<Mutex<Option<String>>>,
         concealed: Arc<AtomicBool>,
+        reads: Arc<AtomicUsize>,
     }
 
     impl ClipboardBackend for Board {
@@ -378,6 +381,7 @@ mod tests {
             Ok(())
         }
         fn text(&mut self) -> Result<Option<Zeroizing<String>>, String> {
+            self.reads.fetch_add(1, SeqCst);
             Ok(self.text.lock().unwrap().clone().map(Zeroizing::new))
         }
         fn clear(&mut self) -> Result<(), String> {
@@ -427,7 +431,14 @@ mod tests {
         let (board, clip) = clip(Duration::from_millis(200));
         clip.copy(&key()).unwrap();
         *board.text.lock().unwrap() = Some("a command".into());
-        thread::sleep(Duration::from_millis(400));
+        // The timer has looked, and decided: it reads the clipboard, and clears it or not,
+        // under the state's lock (GOTCHA-332: after that, not after a moment).
+        let deadline = Instant::now() + LONG;
+        while board.reads.load(SeqCst) == 0 {
+            assert!(Instant::now() < deadline, "the timer never looked");
+            thread::sleep(Duration::from_millis(5));
+        }
+        drop(clip.lock());
         assert_eq!(board.text.lock().unwrap().as_deref(), Some("a command"));
     }
 
@@ -504,21 +515,17 @@ mod tests {
         entered_rx
             .recv_timeout(LONG)
             .expect("the copy never reached the clipboard");
-        let (done_tx, done_rx) = mpsc::channel();
+        // The copy stays stuck until the lock has returned: it returned without the clipboard
+        // (GOTCHA-332: `within` fails a lock that waits on it, whatever the clock says).
         {
             let clip = clip.clone();
-            thread::spawn(move || {
-                clip.clear_soon();
-                let _ = done_tx.send(());
-            });
+            within("the lock's clear", move || clip.clear_soon());
         }
-        let returned = done_rx.recv_timeout(Duration::from_secs(2)).is_ok();
         {
             let (open, opened) = &*release;
             *open.lock().unwrap() = true;
             opened.notify_all();
         }
-        assert!(returned, "the lock waited on the clipboard");
         copying.join().unwrap().unwrap();
         assert!(until(&board, None), "the key outlived the lock");
     }
@@ -695,25 +702,21 @@ mod tests {
             thread::spawn(move || stuck.copy(&key()))
         };
         entered_rx.recv_timeout(LONG).unwrap();
-        // Released after 1.5 s whatever happens, so an unbounded wait shows as a late `true`,
-        // never as a test that hangs.
-        let releaser = {
-            let release = release.clone();
-            thread::spawn(move || {
-                thread::sleep(Duration::from_millis(1500));
-                let (open, opened) = &*release;
-                *open.lock().unwrap() = true;
-                opened.notify_all();
+        // The copy stays stuck until the quit has answered: it can only have answered by
+        // giving up, and `within` fails one that never does (GOTCHA-332: not a bound on the
+        // clock).
+        let done = {
+            let stuck = stuck.clone();
+            within("the quit's clear", move || {
+                stuck.clear_within(Duration::from_millis(200))
             })
         };
-        let started = Instant::now();
-        assert!(!stuck.clear_within(Duration::from_millis(200)));
-        assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "{:?}",
-            started.elapsed()
-        );
-        releaser.join().unwrap();
+        assert!(!done, "the quit waited out the stuck copy");
+        {
+            let (open, opened) = &*release;
+            *open.lock().unwrap() = true;
+            opened.notify_all();
+        }
         copying.join().unwrap().unwrap();
     }
 }

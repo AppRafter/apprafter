@@ -1163,7 +1163,10 @@ mod tests {
 
     // I-2, I-3. The machine reads the kept answer, never the OS, and starts within its bound.
 
-    /// An OS whose every `info` waits for the test to answer it; prompts verify at once.
+    /// An OS whose every `info` waits for the test to answer it, for as long as the test holds
+    /// its sender (dropped, it answers "no authenticator" at once); prompts verify at once.
+    /// Never on its own: a call that waits for the OS's answer waits until `within`'s guard
+    /// fails it, so no test tells "waited" by the clock (GOTCHA-332).
     struct Gated {
         answers: Mutex<mpsc::Receiver<AuthInfo>>,
         asked: AtomicUsize,
@@ -1186,7 +1189,7 @@ mod tests {
             self.answers
                 .lock()
                 .unwrap()
-                .recv_timeout(LONG)
+                .recv()
                 .unwrap_or_else(|_| NoAuthenticator.info())
         }
 
@@ -1207,12 +1210,11 @@ mod tests {
         let r = started(unlocked_at_start(), os.clone());
         answer.send(FakeAuthenticator::new().info()).unwrap();
         assert!(r.cache.settled(LONG));
-        // From here every question hangs.
+        // From here every question hangs: a call that waited for it would never return.
         r.cache.refresh();
-        let ((), took) = {
+        {
             let (machine, clock) = (r.machine.clone(), r.clock.clone());
             within("the lock's calls", move || {
-                let started = Instant::now();
                 machine.tick();
                 let _ = machine.state();
                 machine
@@ -1223,10 +1225,9 @@ mod tests {
                 machine.unlock().unwrap();
                 clock.set(T0 + 10 * MIN);
                 machine.tick();
-                ((), started.elapsed())
-            })
-        };
-        assert!(took < LONG / 2, "{took:?}");
+            });
+        }
+        assert_eq!(r.cache.waits(), [LONG], "the calls waited for nothing");
         assert_eq!(
             r.machine.state().reason,
             Some(LockReason::Idle),
@@ -1238,9 +1239,12 @@ mod tests {
     #[test]
     fn without_lock_on_start_the_start_asks_nothing_and_waits_for_nothing() {
         let (os, answer) = Gated::new();
-        let started_at = Instant::now();
         let r = started(unlocked_at_start(), os.clone());
-        assert!(started_at.elapsed() < STARTUP_WITHIN, "it waited");
+        assert!(
+            r.cache.waits().is_empty(),
+            "it waited: {:?}",
+            r.cache.waits()
+        );
         assert_eq!(r.machine.state(), unlocked(T0, Some(10), 0));
         drop(answer);
     }
@@ -1248,13 +1252,10 @@ mod tests {
     #[test]
     fn a_slow_answer_starts_locked_within_the_bound() {
         let (os, answer) = Gated::new();
-        let started_at = Instant::now();
         let r = started(Settings::default(), os.clone());
-        let took = started_at.elapsed();
-        assert!(
-            took >= STARTUP_WITHIN && took < STARTUP_WITHIN + LONG / 4,
-            "{took:?}"
-        );
+        // It waited with its bound, and only that, and the answer never comes on its own: the
+        // start gave up at the bound (GOTCHA-332: the record, not the clock).
+        assert_eq!(r.cache.waits(), [STARTUP_WITHIN]);
         assert_eq!(
             r.machine.state(),
             locked(LockReason::Startup, T0, Some(10), 0)
