@@ -152,6 +152,12 @@ impl NewKey {
 /// process's own protections (T77), `memory_locked` the held key's page as the OS answered.
 /// On the blocking pool: the limit rows may ask the ssh-agent (2 s) and wait for the session
 /// watch.
+///
+/// F20: when the report fails while that re-read found the store's own problem — the one the
+/// page shows in its own panel (`AppInfo.secrets.problem`: a lost vault, a store others can
+/// change) — the answer is no report and this computer's limits all the same (rule 1; the
+/// core's doctor shows them beside an unreadable vault too). Any other failure of the report is
+/// the section's, said where the limits go: never masked (critic C-M-5).
 pub fn lock_info(shell: &Shell) -> Result<LockSectionInfo, DesktopError> {
     let now = shell.recheck();
     if shell.lock.is_locked() {
@@ -159,9 +165,20 @@ pub fn lock_info(shell: &Shell) -> Result<LockSectionInfo, DesktopError> {
     }
     let window = shell.window(&now);
     let client = shell.limit_client_later()();
-    let report = lock::status(&shell.context, window, &client)?;
+    let (report, limits) = match lock::status(&shell.context, window.clone(), &client) {
+        Ok(report) => {
+            let limits = report.limits.clone();
+            (Some(report), limits)
+        }
+        Err(_) if now.problem.is_some() => (
+            None,
+            lock::limits::detect_limits(&shell.context, &client, &window),
+        ),
+        Err(e) => return Err(e.into()),
+    };
     Ok(LockSectionInfo {
         report,
+        limits,
         app: HolderHardening {
             memory_locked: shell.vault.memory_locked(),
             ..shell.app_hardening()
@@ -470,7 +487,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    use apprafter_core::lock::UnlockWindow;
+    use apprafter_core::lock::{MachineLimit, UnlockWindow};
     use apprafter_core::secrets::testing::locked_store;
     use apprafter_core::secrets::{SecretsMode, VaultAccess};
     use apprafter_core::{Context, Outcome, PathSource, SecretString};
@@ -612,8 +629,10 @@ mod tests {
     fn lock_info_reads_the_store_and_says_what_the_app_did() {
         let r = rig();
         let info = lock_info(&r.shell).unwrap();
-        assert_eq!(info.report.mode, SecretsMode::Files);
-        assert_eq!(info.report.window, UnlockWindow::Closed);
+        let report = info.report.expect("a store in files has its report");
+        assert_eq!(report.mode, SecretsMode::Files);
+        assert_eq!(report.window, UnlockWindow::Closed);
+        assert_eq!(info.limits, report.limits);
         assert_eq!(info.app, crate::harden::not_applied());
     }
 
@@ -655,9 +674,9 @@ mod tests {
         r.shell
             .unlock_with_password(Zeroizing::new(store.recovery_key().expose().into()))
             .unwrap();
-        let info = lock_info(&r.shell).unwrap();
-        assert_eq!(info.report.mode, SecretsMode::Locked);
-        assert_eq!(info.report.window, UnlockWindow::App);
+        let report = lock_info(&r.shell).unwrap().report.unwrap();
+        assert_eq!(report.mode, SecretsMode::Locked);
+        assert_eq!(report.window, UnlockWindow::App);
     }
 
     /// T77 (critic A finding 6, B 5): `memory_locked` is the held key's page as the OS answered
@@ -677,6 +696,61 @@ mod tests {
             .unlock_with_password(Zeroizing::new(store.recovery_key().expose().into()))
             .unwrap();
         assert!(lock_info(&r.shell).unwrap().app.memory_locked);
+    }
+
+    /// F20 (D-9): a protected store whose vault was moved aside after the unlock. The page
+    /// shows that problem in its own panel (`AppInfo.secrets.problem`); lock_info answers no
+    /// report, and this computer's limits all the same (rule 1, as the core's doctor shows them
+    /// beside an unreadable vault) — never the vault's error a second time.
+    #[test]
+    fn lock_info_shows_this_computer_s_limits_beside_a_lost_vault() {
+        let mut made = None;
+        let r = rig_with(
+            |root| made = Some(locked_store(root, &[])),
+            ShellExtras::default(),
+        );
+        let store = made.unwrap();
+        r.shell
+            .unlock_with_password(Zeroizing::new(store.recovery_key().expose().into()))
+            .unwrap();
+        let root = r.shell.context.config_root().to_path_buf();
+        std::fs::rename(
+            root.join(apprafter_core::vault::VAULT_FILE),
+            root.join("vault.aside"),
+        )
+        .unwrap();
+        let problem = Protection::read(&root, None).problem;
+        assert!(problem.is_some(), "the page's own panel says why");
+        let info = lock_info(&r.shell).expect("the limits are shown beside a lost vault");
+        assert!(info.report.is_none(), "{:?}", info.report);
+        assert!(
+            info.limits.contains(&MachineLimit::SameUserPrograms)
+                && info.limits.contains(&MachineLimit::Hibernation),
+            "{:?}",
+            info.limits
+        );
+    }
+
+    /// F20 (critic C-M-5): a report that fails for anything but the store's own problem is the
+    /// section's error, shown where the limits go as before — never masked. Here the vault is
+    /// still there but no longer reads as one after the unlock: the store read (its directory
+    /// entry only) finds no problem, and the report's slots cannot be read.
+    #[test]
+    fn lock_info_keeps_any_other_failure_of_the_report() {
+        let mut made = None;
+        let r = rig_with(
+            |root| made = Some(locked_store(root, &[])),
+            ShellExtras::default(),
+        );
+        let store = made.unwrap();
+        r.shell
+            .unlock_with_password(Zeroizing::new(store.recovery_key().expose().into()))
+            .unwrap();
+        let root = r.shell.context.config_root().to_path_buf();
+        std::fs::write(root.join(apprafter_core::vault::VAULT_FILE), b"not a vault").unwrap();
+        assert_eq!(Protection::read(&root, None).problem, None);
+        let e = lock_info(&r.shell).expect_err("the report's failure is the section's");
+        assert!(!matches!(e, DesktopError::Locked), "{e:?}");
     }
 
     /// Critic A finding 21: when its re-read locks the app, lock_info answers `locked`, not a

@@ -10,6 +10,7 @@ import { ErrorPanel } from '../../components/ErrorPanel';
 import { SettingRow } from '../../components/SettingRow';
 import type { HolderHardening } from '../../ipc/generated/HolderHardening';
 import type { LockReport } from '../../ipc/generated/LockReport';
+import type { MachineLimit } from '../../ipc/generated/MachineLimit';
 import type { Os } from '../../ipc/generated/Os';
 import type { SecretsMode } from '../../ipc/generated/SecretsMode';
 import type { UiError } from '../../ipc/generated/UiError';
@@ -39,11 +40,14 @@ import {
 } from '../../state/lockText';
 
 /**
- * What lock_info answers (the IPC type `LockSectionInfo`, d4a-g Task 11): the report and the app's
- * own protections.
+ * What lock_info answers (the IPC type `LockSectionInfo`, d4a-g Task 11): the report, this
+ * computer's limits and the app's own protections. F20: no report when the store's lock state
+ * cannot be read for the problem the page shows in its own panel; the limits are there all the
+ * same (rule 1).
  */
 export interface LockInfoView {
-  readonly report: LockReport;
+  readonly report: LockReport | null;
+  readonly limits: readonly MachineLimit[];
   readonly app: HolderHardening;
 }
 
@@ -93,6 +97,7 @@ export function StoreScope({ store, targets, error }: StoreScopeProps) {
 
 export function StoreProtection(p: StoreProtectionProps) {
   const problem = storeProblemOf(p.problem);
+  const report = p.info?.report ?? null;
   return (
     <>
       <SettingRow
@@ -113,15 +118,15 @@ export function StoreProtection(p: StoreProtectionProps) {
       {p.mode !== 'files' && (
         <div className="lock-notes">
           {p.protectedStore && <p>{unlockNote(p.os)}</p>}
-          {p.info !== null && <p>{terminalsLine(p.info.report.windowMinutes)}</p>}
+          {report !== null && <p>{terminalsLine(report.windowMinutes)}</p>}
         </div>
       )}
-      {p.info !== null && p.mode !== 'files' && p.info.report.slots.length > 0 && (
+      {report !== null && p.mode !== 'files' && report.slots.length > 0 && (
         <SettingRow
           label={SLOTS_LABEL}
           sub={
             <span className="lock-slots">
-              {p.info.report.slots.map((slot) => (
+              {report.slots.map((slot) => (
                 <span key={`${slot.kind}:${slot.label}`}>
                   {slot.refused === null
                     ? SLOT_NAMES[slot.kind]
@@ -140,7 +145,7 @@ export function StoreProtection(p: StoreProtectionProps) {
       ) : p.info === null ? (
         <p className="lock-notes">{READING}</p>
       ) : (
-        <Limits info={p.info} holdsKey={p.info.report.window.status === 'app'} />
+        <Limits info={p.info} holdsKey={report?.window.status === 'app'} />
       )}
     </>
   );
@@ -148,9 +153,7 @@ export function StoreProtection(p: StoreProtectionProps) {
 
 /** (4): the limits, warnings first, then what the lock does not cover and the app's own state. */
 function Limits({ info, holdsKey }: { info: LockInfoView; holdsKey: boolean }) {
-  const lines = info.report.limits
-    .map(limitText)
-    .filter((line): line is LimitText => line !== null);
+  const lines = info.limits.map(limitText).filter((line): line is LimitText => line !== null);
   // As `lock status` lists them: the warnings first, each group in the core's order.
   const ordered = [...lines.filter((l) => l.warn), ...lines.filter((l) => !l.warn)];
   const hardening = hardeningLine(info.app, holdsKey);

@@ -513,6 +513,26 @@ describe('DoctorOverlay', () => {
   });
 });
 
+test('F20: with no lock report (a lost vault), the doctor still says what did not take', async () => {
+  h.answer('lock_info', {
+    report: null,
+    limits: [{ kind: 'hibernation' }],
+    app: {
+      nonDumpable: false,
+      denyAttach: null,
+      coreOff: true,
+      memoryLocked: false,
+      processDacl: null,
+    },
+  });
+  renderDoctor('prod');
+  expect(
+    await screen.findByText(
+      "AppRafter's own protections are weaker here: other programs running as you may attach to it.",
+    ),
+  ).toBeDefined();
+});
+
 test("the app's own protections that did not take are said here too (D.4a T77)", async () => {
   h.answer('lock_info', {
     report: {
@@ -525,6 +545,7 @@ test("the app's own protections that did not take are said here too (D.4a T77)",
       window: { status: 'closed' },
       limits: [],
     },
+    limits: [],
     app: {
       nonDumpable: false,
       denyAttach: null,

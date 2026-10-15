@@ -319,6 +319,7 @@ describe('mockOptionsFromUrl', () => {
     expect(mockOptionsFromUrl('?auth=pam')).toEqual({ auth: 'pam' });
     expect(mockOptionsFromUrl('?session=none')).toEqual({ session: 'none' });
     expect(mockOptionsFromUrl('?tools=found')).toEqual({ tools: 'found' });
+    expect(mockOptionsFromUrl('?vault=lost')).toEqual({ vault: 'lost' });
     expect(mockOptionsFromUrl('')).toEqual({});
   });
 
@@ -328,5 +329,6 @@ describe('mockOptionsFromUrl', () => {
     expect(() => mockOptionsFromUrl('?auth=fingerprint')).toThrow('auth');
     expect(() => mockOptionsFromUrl('?session=hibernate')).toThrow('session');
     expect(() => mockOptionsFromUrl('?tools=some')).toThrow('tools');
+    expect(() => mockOptionsFromUrl('?vault=found')).toThrow('vault');
   });
 });

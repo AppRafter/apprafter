@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 // The target store's lock on the mock (D.4a §3.14): where its secrets are (`?secrets=files|locking|
-// locked|unlocking`), the Security page's report, and the three flows — Protect, Finish, Stop
+// locked|unlocking`; `?vault=lost`, a locked store whose vault is gone: O8, F20), the Security page's
+// report, and the three flows — Protect, Finish, Stop
 // protecting — on the ops engine, by Rust's rules where the page can tell: Protect runs only with its
 // recovery key typed back, Finish only where a Protect was interrupted, Stop protecting asks for the
 // store's secret. A protected store opens with MOCK_STORE_PASSWORD or MOCK_RECOVERY_KEY — T24's first
@@ -88,15 +89,28 @@ export function mockLock(
   engine: MockOps,
   initial: SecretsMode,
   names: () => readonly string[],
+  vaultLost = false,
 ): MockLock {
-  let mode: SecretsMode = initial;
+  let mode: SecretsMode = vaultLost ? 'locked' : initial;
+  /**
+   * O8's lost vault, as Rust's store read says it (protection.rs): a lock nothing opens, so not
+   * protected, and the core's `vault_unreadable` (`missing`) is the page's problem.
+   */
+  const lost = () => vaultLost && mode === 'locked';
+  const vaultMissing = (): UiError => ({
+    ...uiError(CORE_ERROR_CODES.SECRETS_VAULT_UNREADABLE, `the vault ${STORE}/vault is missing`, {
+      path: `${STORE}/vault`,
+      problem: 'missing',
+    }),
+    help: `store.yaml says this target store is locked, but its vault is gone, and its secrets are nowhere else: restore ${STORE}/vault from a backup.`,
+  });
   /** The recovery key of each Protect plan: whether it was saved, and typed back. */
   const keys = new Map<OpId, { saved: boolean; confirmed: boolean }>();
   const notFound = (opId: unknown) =>
     uiError(DESKTOP_ERROR_CODES.PLAN_NOT_FOUND, `operation ${opId} has no pending plan`, {
       opId: opId as OpId,
     });
-  const protectedNow = () => mode !== 'files';
+  const protectedNow = () => mode !== 'files' && !lost();
   const opens = (secret: unknown) =>
     typeof secret === 'string' &&
     (secret === MOCK_STORE_PASSWORD || canonical(secret) === canonical(MOCK_RECOVERY_KEY));
@@ -136,7 +150,12 @@ export function mockLock(
   const argsOf = (args: InvokeArgs | undefined) => (args ?? {}) as Record<string, unknown>;
 
   const handlers: Record<string, Handler> = {
-    lock_info: (): LockSectionInfo => ({ report: report(), app: HARDENED }),
+    // F20: with the vault gone the report cannot be read (Rust: `lock::status` fails on the slots),
+    // and the limits come all the same.
+    lock_info: (): LockSectionInfo => {
+      const r = report();
+      return { report: lost() ? null : r, limits: r.limits, app: HARDENED };
+    },
     op_plan_lock_on: (args): Promise<LockOnPlan> | LockOnPlan => {
       const { password } = argsOf(args);
       if (typeof password !== 'string' || password === '') {
@@ -315,10 +334,10 @@ export function mockLock(
   return {
     secrets: () => ({
       mode,
-      slots: protectedNow() ? ['password', 'recovery_key'] : [],
+      slots: protectedNow() || lost() ? ['password', 'recovery_key'] : [],
       protected: protectedNow(),
       store: STORE,
-      problem: null,
+      problem: lost() ? vaultMissing() : null,
     }),
     opens,
     handlers,

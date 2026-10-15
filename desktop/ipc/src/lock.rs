@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! The app lock as the webview sees it; Rust decides it (design spec §4.5).
 
-use apprafter_core::lock::{HolderHardening, LockReport};
+use apprafter_core::lock::{HolderHardening, LockReport, MachineLimit};
 use serde::Serialize;
 
 use crate::PlanView;
@@ -69,16 +69,22 @@ impl std::fmt::Debug for LockOnPlan {
 }
 
 /// What `lock_info` answers (D.4a §3.14): the one report `lock status` and doctor show (T73),
-/// for this app — its window `App` while it holds the store's key, else `Closed` — and what the
-/// app's own process did to protect the key (T77), which no holder reports here; its
-/// `memory_locked` is the held key's page, measured when asked (Task 17). Not `LockInfo`: the
-/// DOM has a global of that name (the Web Locks API), and `generated.test.ts` refuses a
-/// generated name a global has.
+/// for this app — its window `App` while it holds the store's key, else `Closed` — this
+/// computer's limits, and what the app's own process did to protect the key (T77), which no
+/// holder reports here; its `memory_locked` is the held key's page, measured when asked (Task
+/// 17). Not `LockInfo`: the DOM has a global of that name (the Web Locks API), and
+/// `generated.test.ts` refuses a generated name a global has.
+///
+/// F20: `report` is `None` when the store's lock state cannot be read for the problem the page
+/// shows in its own panel (`AppInfo.secrets.problem`, a lost vault say); `limits` are there all
+/// the same (rule 1, as the core's doctor shows them beside an unreadable vault), and with a
+/// report they are its own.
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct LockSectionInfo {
-    pub report: LockReport,
+    pub report: Option<LockReport>,
+    pub limits: Vec<MachineLimit>,
     pub app: HolderHardening,
 }
 
@@ -202,7 +208,8 @@ mod tests {
         use apprafter_core::lock::{HolderHardening, LockReport, UnlockWindow};
         use apprafter_core::secrets::SecretsMode;
         let info = LockSectionInfo {
-            report: LockReport {
+            limits: vec![MachineLimit::Hibernation],
+            report: Some(LockReport {
                 store: "~/s".into(),
                 store_id: None,
                 targets: Vec::new(),
@@ -211,7 +218,7 @@ mod tests {
                 window_minutes: 5,
                 window: UnlockWindow::Closed,
                 limits: Vec::new(),
-            },
+            }),
             app: HolderHardening {
                 non_dumpable: Some(true),
                 deny_attach: None,
@@ -222,6 +229,7 @@ mod tests {
         };
         let v = serde_json::to_value(&info).unwrap();
         assert_eq!(v["report"]["mode"], "files");
+        assert_eq!(v["limits"][0]["kind"], "hibernation");
         assert_eq!(v["app"]["nonDumpable"], true);
         assert_eq!(v["app"]["memoryLocked"], false);
     }

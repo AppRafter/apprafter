@@ -76,6 +76,8 @@ export interface MockOptions {
   readonly tools?: MockTools;
   /** Where the target store keeps its secrets: files by default. */
   readonly secrets?: SecretsMode;
+  /** `lost`: the store is locked and its vault is gone (O8; F20), whatever `secrets` says. */
+  readonly vault?: 'lost';
   /**
    * How long a mock operation takes before it reports, in milliseconds: long enough in dev
    * mode (150 by default) to see it running; tests pass 0.
@@ -98,7 +100,8 @@ const SESSION_EVENTS: Record<MockSession, SessionEvents> = {
 
 /**
  * `?os=windows|macos|linux&theme=system|light|dark&auth=os|pam&session=both|lock|sleep|none`
- * `&tools=missing|found&secrets=files|locking|locked|unlocking`; an unknown value throws.
+ * `&tools=missing|found&secrets=files|locking|locked|unlocking&vault=lost`; an unknown value
+ * throws.
  */
 export function mockOptionsFromUrl(search: string): MockOptions {
   const params = new URLSearchParams(search);
@@ -116,6 +119,7 @@ export function mockOptionsFromUrl(search: string): MockOptions {
   const session = pick('session', SESSIONS);
   const tools = pick('tools', TOOLS);
   const secrets = pick('secrets', ['files', 'locking', 'locked', 'unlocking'] as const);
+  const vault = pick('vault', ['lost'] as const);
   return {
     ...(os && { os }),
     ...(theme && { theme }),
@@ -123,6 +127,7 @@ export function mockOptionsFromUrl(search: string): MockOptions {
     ...(session && { session }),
     ...(tools && { tools }),
     ...(secrets && { secrets }),
+    ...(vault && { vault }),
   };
 }
 
@@ -355,7 +360,12 @@ export function installMockIpc(options: MockOptions = {}): void {
   const store = mockStore();
   currentStore = store;
   const d3 = targetHandlers(engine, store);
-  const lockStore = mockLock(engine, options.secrets ?? 'files', () => namesIn(store));
+  const lockStore = mockLock(
+    engine,
+    options.secrets ?? 'files',
+    () => namesIn(store),
+    options.vault === 'lost',
+  );
   // Rust's gate for the store's secret: one back-off with the PAM field's, no PAM words.
   const verifyStoreSecret = verifyWith(lockStore.opens, []);
   // As Rust's re-read: the lock follows the store first, then the page is told it changed.

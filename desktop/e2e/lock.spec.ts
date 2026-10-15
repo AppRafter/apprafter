@@ -215,3 +215,18 @@ test('the Security page: the store and every target it covers, three ways in', a
   await page.keyboard.press(`${mod}+KeyL`);
   await expect(page.getByRole('heading', { name: 'AppRafter is locked' })).toBeVisible();
 });
+
+test('F20: a lost vault is said once on the Security page, and this computer’s limits still show', async ({
+  page,
+}, info) => {
+  await page.goto(`/${queryOf(info)}&vault=lost`);
+  // Nothing opens a lock whose vault is gone: the app's own lock is the OS's.
+  await page.getByRole('button', { name: 'Unlock' }).click();
+  const security = await openSecurity(page);
+  await expect(security.getByText("This target store's lock state cannot be used.")).toBeVisible();
+  await expect(security.getByText(/^the vault .* is missing$/)).toHaveCount(1);
+  await expect(security.getByText('Limits on this computer')).toBeVisible();
+  await expect(security.getByText(/sets out to get past the lock/)).toBeVisible();
+  await expect(security.getByText(/^The lock protects secrets at rest\./)).toBeVisible();
+  await shot(page, info, 'security, a lost vault');
+});

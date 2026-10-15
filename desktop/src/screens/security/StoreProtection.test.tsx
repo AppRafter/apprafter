@@ -6,6 +6,7 @@ import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import type { HolderHardening } from '../../ipc/generated/HolderHardening';
 import type { LockReport } from '../../ipc/generated/LockReport';
+import type { LockSectionInfo } from '../../ipc/generated/LockSectionInfo';
 import { StoreProtection, type StoreProtectionProps, StoreScope } from './StoreProtection';
 
 const HARDENED: HolderHardening = {
@@ -33,6 +34,11 @@ function report(more: Partial<LockReport> = {}): LockReport {
   };
 }
 
+/** lock_info's answer with a report: its limits are the report's. */
+function section(r: LockReport, app: HolderHardening = HARDENED): LockSectionInfo {
+  return { report: r, limits: r.limits, app };
+}
+
 function show(more: Partial<StoreProtectionProps> = {}) {
   const onAction = mock();
   render(
@@ -40,10 +46,9 @@ function show(more: Partial<StoreProtectionProps> = {}) {
       os="linux"
       mode="files"
       protectedStore={false}
-      info={{
-        report: report({ mode: 'files', storeId: null, slots: [], window: { status: 'closed' } }),
-        app: HARDENED,
-      }}
+      info={section(
+        report({ mode: 'files', storeId: null, slots: [], window: { status: 'closed' } }),
+      )}
       problem={null}
       error={null}
       onAction={onAction}
@@ -68,15 +73,14 @@ describe('StoreProtection', () => {
       mode: 'locked',
       protectedStore: true,
       os: 'windows',
-      info: {
-        report: report({
+      info: section(
+        report({
           slots: [
             { kind: 'password', label: 'lock password', refused: 'kdf_too_weak' },
             { kind: 'recovery_key', label: 'recovery key', refused: null },
           ],
         }),
-        app: HARDENED,
-      },
+      ),
     });
     expect(screen.getByText('Secrets are encrypted; unlocking opens them.')).toBeDefined();
     expect(
@@ -96,7 +100,7 @@ describe('StoreProtection', () => {
     const { user, onAction } = show({
       mode: 'locking',
       protectedStore: true,
-      info: { report: report({ mode: 'locking' }), app: HARDENED },
+      info: section(report({ mode: 'locking' })),
     });
     await user.click(screen.getByRole('button', { name: 'Finish…' }));
     expect(onAction).toHaveBeenCalledWith('finish');
@@ -107,7 +111,7 @@ describe('StoreProtection', () => {
     show({
       mode: 'locked',
       protectedStore: true,
-      info: { report: report(), app: { ...HARDENED, memoryLocked: false } },
+      info: section(report(), { ...HARDENED, memoryLocked: false }),
     });
     const lines = screen
       .getAllByRole('listitem')
@@ -122,10 +126,10 @@ describe('StoreProtection', () => {
 
   test('a store in files lists the limits too, and says nothing of a key the app holds', () => {
     show({
-      info: {
-        report: report({ mode: 'files', storeId: null, slots: [], window: { status: 'closed' } }),
-        app: { ...HARDENED, memoryLocked: false },
-      },
+      info: section(
+        report({ mode: 'files', storeId: null, slots: [], window: { status: 'closed' } }),
+        { ...HARDENED, memoryLocked: false },
+      ),
     });
     expect(screen.getAllByRole('listitem').length).toBeGreaterThan(0);
     expect(screen.queryByText(/While AppRafter is unlocked it holds/)).toBeNull();
@@ -145,7 +149,7 @@ describe('StoreProtection', () => {
       mode: 'locked',
       protectedStore: true,
       problem,
-      info: { report: report(), app: HARDENED },
+      info: section(report()),
     });
     expect(screen.getByText("This target store's lock state cannot be used.")).toBeDefined();
     expect(
@@ -153,6 +157,32 @@ describe('StoreProtection', () => {
     ).toBeDefined();
     expect(screen.queryByText('Secrets are encrypted; unlocking opens them.')).toBeNull();
     expect(screen.queryByRole('button', { name: 'Stop protecting…' })).toBeNull();
+  });
+
+  test('F20: a lost vault is said once, in its own panel, and this computer’s limits still show', () => {
+    const problem = {
+      code: 'apprafter::secrets::vault_unreadable',
+      message: 'the vault at ~/.config/apprafter/vault is missing',
+      help: 'Put the vault back, or stop protecting.',
+      causes: [],
+      fields: {},
+    };
+    show({
+      mode: 'locked',
+      protectedStore: false,
+      problem,
+      info: { report: null, limits: report().limits, app: HARDENED },
+    });
+    expect(screen.getAllByText('the vault at ~/.config/apprafter/vault is missing')).toHaveLength(
+      1,
+    );
+    const lines = screen.getAllByRole('listitem').map((li) => li.textContent ?? '');
+    expect(lines.some((text) => text.includes('AppRafter runs as an X11 program here'))).toBe(true);
+    expect(lines.some((text) => text.includes('sets out to get past the lock'))).toBe(true);
+    expect(screen.getByText(/The lock protects secrets at rest\./)).toBeDefined();
+    // The terminals line and the slots come with a report: there is none.
+    expect(screen.queryByText(/Terminals: each one unlocks on its own/)).toBeNull();
+    expect(screen.queryByText('Changing them comes in a later version.')).toBeNull();
   });
 
   test('a report still being read says so; one that failed shows its error, and Protect still works', async () => {

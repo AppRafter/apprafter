@@ -275,7 +275,7 @@ export function DoctorOverlay({
 function AppHardeningNote() {
   const { data } = useLockInfo();
   if (data === undefined || data === null) return null;
-  const line = hardeningLine(data.app, data.report.window.status === 'app');
+  const line = hardeningLine(data.app, data.report?.window.status === 'app');
   return line === null ? null : (
     <p className="doctor-note" role="note">
       {line}

@@ -40,10 +40,29 @@ async function code(call: Promise<unknown>): Promise<string | null> {
 }
 
 describe('the mock store lock', () => {
+  test('F20: a lost vault is the store’s problem, not protected, and lock_info has no report but the limits', async () => {
+    installMockIpc({ opDelayMs: 0, vault: 'lost' });
+    const info = await api.appInfo();
+    expect(info.secrets).toMatchObject({ mode: 'locked', protected: false });
+    expect(info.secrets.problem?.code).toBe('apprafter::secrets::vault_unreadable');
+    await api.unlock();
+    const section = await api.lockInfo();
+    expect(section.report).toBeNull();
+    expect(section.limits.map((l) => l.kind)).toContain('same_user_programs');
+  });
+
+  test('lock_info carries the report’s limits beside it', async () => {
+    installMockIpc({ opDelayMs: 0 });
+    await api.unlock();
+    const section = await api.lockInfo();
+    expect(section.limits).toEqual(section.report?.limits ?? []);
+    expect(section.limits.length).toBeGreaterThan(0);
+  });
+
   test('a store in files: Protect needs its key typed back, then the secrets are protected', async () => {
     installMockIpc({ opDelayMs: 0 });
     await api.unlock();
-    expect((await api.lockInfo()).report.mode).toBe('files');
+    expect((await api.lockInfo()).report?.mode).toBe('files');
     const plan = await api.opPlanLockOn('a lock password', null);
     expect(plan.recoveryKey).toBe(MOCK_RECOVERY_KEY);
     // Before "I saved it", not even the right key is taken; after it, no more copies (O12).
@@ -140,13 +159,13 @@ describe('the mock store lock', () => {
       const list = await api.targetList();
       return [...list.targets, ...list.unreadable].map((target) => target.name).sort();
     };
-    expect((await api.lockInfo()).report.targets).toEqual(await names());
+    expect((await api.lockInfo()).report?.targets).toEqual(await names());
     // Rust reads the store on every call: a removed target is gone from both (critic code 8).
     const store = mockTargetStore();
     store.reports.delete('lab');
     store.unreadable = [];
     expect(await names()).toEqual(['prod-eu', 'staging']);
-    expect((await api.lockInfo()).report.targets).toEqual(['prod-eu', 'staging']);
+    expect((await api.lockInfo()).report?.targets).toEqual(['prod-eu', 'staging']);
     const { plan } = await api.opPlanLockOn(MOCK_STORE_PASSWORD, null);
     expect(plan.title).toBe(
       'Protect the target store at ~/.config/apprafter (targets: prod-eu, staging)',
