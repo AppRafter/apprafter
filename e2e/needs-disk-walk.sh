@@ -71,7 +71,8 @@
 #
 # Required: docker (or podman), cargo, kubectl
 #   — all satisfied inside `nix develop` or on a standard CI runner.
-#   (cargo: lib.sh runs the CLI via `cargo run --bin apprafter`.)
+#   (cargo: lib.sh builds the CLI with `cargo build --bin apprafter` and runs
+#   it on the walk's store.)
 #
 # NOTE: the GC step deletes + RE-CREATES the RetainedClaim with a past
 # retainUntil rather than patching it in place — the RetainedClaim is
@@ -190,7 +191,7 @@ fi
 # ---------------------------------------------------------------
 
 TMPDIR_WORK="$(mktemp -d)"
-APPRAFTER_CONFIG_DIR="${TMPDIR_WORK}/apprafter-config"
+e2e_isolate_store "${TMPDIR_WORK}"
 KUBECONFIG_FILE="${TMPDIR_WORK}/kubeconfig"
 
 # Set to 1 only after the cluster is up AND $KUBECONFIG points at it

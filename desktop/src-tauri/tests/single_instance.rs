@@ -23,7 +23,6 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use apprafter_desktop::single_instance::SingleInstance;
 use tauri::test::mock_builder;
 use zbus::blocking::{connection, fdo::DBusProxy};
 use zbus::names::BusName;
@@ -56,7 +55,8 @@ fn wiring_probe() {
         .with_ansi(false)
         .without_time()
         .init();
-    let single_instance = SingleInstance::for_this_launch();
+    // Named here only: tests/plugin_guard.rs lets this probe alone reach the real plugin.
+    let single_instance = apprafter_desktop::single_instance::SingleInstance::for_this_launch();
     let app = single_instance
         .register(mock_builder())
         .build(tauri::generate_context!())
@@ -227,7 +227,7 @@ fn an_address_with_no_bus_behind_it_starts_the_app_without_the_lock() {
 }
 
 /// A socket that takes the connection and never answers: the plugin would wait for it on the
-/// main thread for ever. The app waits [`SingleInstance`]'s bound, then starts without the lock.
+/// main thread for ever. The app waits `SingleInstance`'s bound, then starts without the lock.
 #[test]
 fn a_bus_that_never_answers_starts_the_app_without_the_lock_in_time() {
     let dir = tempfile::tempdir().unwrap();

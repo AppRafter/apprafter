@@ -222,12 +222,14 @@ impl Hello for SystemHello {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc::Sender;
+    use std::sync::Mutex;
 
     use windows_future::AsyncStatus;
 
     use super::*;
 
-    /// Short enough for a quick test, long enough to tell "waited for the grace" apart.
+    /// Short enough for a quick test. A test tells "waited out the grace" from "ended at once"
+    /// by the operation's steps, never by the time it took.
     const FAST: Timing = Timing {
         tick: Duration::from_millis(5),
         grace: Duration::from_millis(300),
@@ -236,13 +238,24 @@ mod tests {
     const VERIFIED: i32 = UserConsentVerificationResult::Verified.0;
     const CANCELED: i32 = UserConsentVerificationResult::Canceled.0;
 
+    /// What [`wait_for`] did to a [`FakeOperation`], in order.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Step {
+        /// A `wait` of this timeout, and what it gave: the answer, or `None` when it timed out.
+        Waited(Duration, Option<Result<i32, HRESULT>>),
+        Cancelled,
+    }
+
     /// An operation that answers what the test sends, and on `cancel` answers `on_cancel` (as
-    /// the OS answers a cancelled prompt) if there is one.
+    /// the OS answers a cancelled prompt) if there is one. It records every step, so a test
+    /// reads why the wait ended (an answer, or a timeout of the grace) and never how long it
+    /// took (GOTCHA-332).
     struct FakeOperation {
         answer: Receiver<Result<i32, HRESULT>>,
         sender: Sender<Result<i32, HRESULT>>,
         on_cancel: Option<Result<i32, HRESULT>>,
         cancels: AtomicUsize,
+        steps: Mutex<Vec<Step>>,
     }
 
     impl FakeOperation {
@@ -253,7 +266,15 @@ mod tests {
                 sender,
                 on_cancel,
                 cancels: AtomicUsize::new(0),
+                steps: Mutex::default(),
             }
+        }
+
+        /// The steps from the cancel on.
+        fn since_cancelled(&self) -> Vec<Step> {
+            let steps = self.steps.lock().unwrap();
+            let from = steps.iter().position(|step| *step == Step::Cancelled);
+            from.map_or_else(Vec::new, |from| steps[from..].to_vec())
         }
 
         fn answer_later(&self, after: Duration, answer: Result<i32, HRESULT>) {
@@ -271,11 +292,24 @@ mod tests {
 
     impl Pending for FakeOperation {
         fn wait(&self, timeout: Duration) -> Option<Result<i32, HRESULT>> {
-            self.answer.recv_timeout(timeout).ok()
+            // A second wait after the cancel would wait past the grace: it fails here rather
+            // than hang.
+            assert!(
+                self.since_cancelled().len() < 2,
+                "waited again after the grace: {:?}",
+                self.since_cancelled()
+            );
+            let answer = self.answer.recv_timeout(timeout).ok();
+            self.steps
+                .lock()
+                .unwrap()
+                .push(Step::Waited(timeout, answer));
+            answer
         }
 
         fn cancel(&self) {
             self.cancels.fetch_add(1, Ordering::SeqCst);
+            self.steps.lock().unwrap().push(Step::Cancelled);
             if let Some(answer) = self.on_cancel {
                 let _ = self.sender.send(answer);
             }
@@ -314,28 +348,35 @@ mod tests {
         assert_eq!(operation.cancels(), 0);
     }
 
-    /// The OS ends a cancelled prompt at once: the wait answers then, not after the grace.
+    /// The OS ends a cancelled prompt at once: the wait answers then, not after the grace. Its
+    /// one wait of the grace ended with that answer.
     #[test]
     fn a_tripped_token_cancels_the_operation_through_the_os() {
         let operation = FakeOperation::new(Some(Ok(CANCELED)));
         let token = trip_after(Duration::from_millis(30));
-        let started = Instant::now();
         assert_eq!(wait_for(&operation, &token, None, FAST), Asked::Cancelled);
         assert_eq!(operation.cancels(), 1);
-        assert!(started.elapsed() < FAST.grace, "{:?}", started.elapsed());
+        assert_eq!(
+            operation.since_cancelled(),
+            [
+                Step::Cancelled,
+                Step::Waited(FAST.grace, Some(Ok(CANCELED)))
+            ]
+        );
     }
 
-    /// A cancel the operation ignores is waited for no longer than the grace.
+    /// A cancel the operation ignores is waited for no longer than the grace: one wait of the
+    /// grace, which times out, and the wait answers.
     #[test]
     fn a_cancel_the_os_does_not_end_is_given_up_after_the_grace() {
         let operation = FakeOperation::new(None);
         let token = trip_after(Duration::from_millis(30));
-        let started = Instant::now();
         assert_eq!(wait_for(&operation, &token, None, FAST), Asked::Cancelled);
         assert_eq!(operation.cancels(), 1);
-        let waited = started.elapsed();
-        assert!(waited >= FAST.grace, "{waited:?}");
-        assert!(waited < FAST.grace * 3, "{waited:?}");
+        assert_eq!(
+            operation.since_cancelled(),
+            [Step::Cancelled, Step::Waited(FAST.grace, None)]
+        );
     }
 
     /// The prompt closed under the user's finger: the app's cancel, not a verification.
@@ -383,13 +424,16 @@ mod tests {
 
     #[test]
     fn an_operation_silent_past_its_limit_is_cancelled_and_failed() {
+        // Nothing answers it: past its limit it is cancelled, given the grace, and failed.
         let operation = FakeOperation::new(None);
-        let started = Instant::now();
         let limit = Duration::from_millis(50);
         let asked = wait_for(&operation, &CancellationToken::new(), Some(limit), FAST);
         assert_eq!(asked, Asked::Failed);
         assert_eq!(operation.cancels(), 1);
-        assert!(started.elapsed() >= limit);
+        assert_eq!(
+            operation.since_cancelled(),
+            [Step::Cancelled, Step::Waited(FAST.grace, None)]
+        );
     }
 
     #[test]

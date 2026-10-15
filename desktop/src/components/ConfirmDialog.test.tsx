@@ -4,6 +4,7 @@ import { clearMocks, mockIPC } from '@tauri-apps/api/mocks';
 import { act, cleanup as cleanupDialog, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import type { AuthInfo } from '../ipc/generated/AuthInfo';
+import { CORE_ERROR_CODES } from '../ipc/generated/core-errors';
 import { DESKTOP_ERROR_CODES } from '../ipc/generated/errors';
 import type { JsonValue } from '../ipc/generated/serde_json/JsonValue';
 import { execute, resetOperations } from '../ipc/operations';
@@ -167,6 +168,28 @@ describe('ConfirmDialog', () => {
   });
 });
 
+describe('ConfirmDialog while onConfirm runs', () => {
+  test('Confirm keeps the focus it was pressed with: it waits, it is not disabled', async () => {
+    let finish = () => {};
+    const onConfirm = mock(() => new Promise<void>((resolve) => (finish = resolve)));
+    const { user, onClose } = open({ planClass: 'bounded', onConfirm });
+    await user.click(confirm());
+    // A browser drops the focus of a control it disables onto the page, out of reach of Esc
+    // and Tab (happy-dom does not, GOTCHA-90): so the button waits instead.
+    expect(confirm().disabled).toBe(false);
+    expect(confirm().getAttribute('aria-disabled')).toBe('true');
+    expect(document.activeElement === confirm()).toBe(true);
+    await user.click(confirm());
+    await user.keyboard('{Enter}');
+    expect(onConfirm).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      finish();
+      await Promise.resolve();
+    });
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('ConfirmDialog where the OS cannot prompt: the password field', () => {
   const password = () => screen.getByLabelText('System password') as HTMLInputElement;
 
@@ -224,6 +247,21 @@ describe('ConfirmDialog where the OS cannot prompt: the password field', () => {
     expect(onClose).not.toHaveBeenCalled();
   });
 
+  test('a wrong password after a press of Confirm: the focus goes to the emptied field', async () => {
+    const { user } = open({
+      auth: pam,
+      onConfirm: () =>
+        Promise.reject(refusal(DESKTOP_ERROR_CODES.AUTH_FAILED, { exhausted: false })),
+    });
+    await user.type(password(), 'guess');
+    await user.click(confirm());
+    await screen.findByRole('alert');
+    // Emptied, the field makes Confirm unready (disabled): had it kept the focus, a browser
+    // would drop it onto the page.
+    expect(confirm().disabled).toBe(true);
+    expect(document.activeElement === password()).toBe(true);
+  });
+
   test('a refusal marks the field until the owner types again, as the lock screen does', async () => {
     const { user } = open({
       auth: pam,
@@ -261,7 +299,8 @@ describe('ConfirmDialog where the OS cannot prompt: the password field', () => {
         'Too many failed attempts. Try again in 2 s.',
       );
       expect(password().disabled).toBe(true);
-      expect(confirm().disabled).toBe(true);
+      // Confirm waits out the back-off focusable: pressed, it does nothing.
+      expect(confirm().getAttribute('aria-disabled')).toBe('true');
       loseFocus();
       act(() => jest.advanceTimersByTime(500));
       expect(screen.getByRole('alert').textContent).toBe(
@@ -275,6 +314,26 @@ describe('ConfirmDialog where the OS cannot prompt: the password field', () => {
       await user.type(password(), 'hunter2{Enter}');
       await settled();
       expect(onClose).toHaveBeenCalledTimes(1);
+    }));
+
+  test('a back-off after a press of Confirm: Confirm keeps the focus, waiting it out', () =>
+    onFakeTime(async () => {
+      const { user } = open({
+        auth: pam,
+        onConfirm: () =>
+          Promise.reject(
+            refusal(DESKTOP_ERROR_CODES.AUTH_FAILED, { exhausted: true, retryInMs: 1_500 }),
+          ),
+      });
+      await user.type(password(), 'guess');
+      await user.click(confirm());
+      await settled();
+      expect(password().disabled).toBe(true);
+      // Not the field: the back-off disables it, and a browser drops the focus of a disabled
+      // control onto the page (happy-dom keeps it there, GOTCHA-90).
+      expect(document.activeElement === confirm()).toBe(true);
+      act(() => jest.advanceTimersByTime(1_500));
+      expect(document.activeElement === password()).toBe(true);
     }));
 
   test('a retry after a wrong password confirms the same plan: the same opId, in place', async () => {
@@ -440,5 +499,65 @@ describe('ConfirmDialog where the OS cannot prompt: the password field', () => {
     const alert = await screen.findByRole('alert');
     expect(alert.textContent).toContain(`Rust says ${DESKTOP_ERROR_CODES.PLAN_EXPIRED}`);
     expect(alert.textContent).toContain(DESKTOP_ERROR_CODES.PLAN_EXPIRED);
+  });
+});
+
+describe("the target store's secret as the gesture (D.4a T76, §3.14)", () => {
+  test('the field is there whatever the OS can do, and its value goes to onConfirm', async () => {
+    const { user, onConfirm } = open({ gesture: 'store_secret', auth: hello });
+    const field = screen.getByLabelText('Lock password or recovery key');
+    // Not the OS's prompt: nothing says one follows.
+    expect(screen.queryByText(/Confirm with/)).toBeNull();
+    expect((screen.getByRole('button', { name: 'Remove' }) as HTMLButtonElement).disabled).toBe(
+      true,
+    );
+    await user.type(field, 'a lock password');
+    await user.click(screen.getByRole('button', { name: 'Remove' }));
+    expect(onConfirm).toHaveBeenCalledWith('a lock password');
+  });
+
+  test('without any system authentication the field is still there', () => {
+    open({ gesture: 'store_secret', auth: null });
+    expect(screen.getByLabelText('Lock password or recovery key')).toBeDefined();
+  });
+
+  test('a wrong secret says it is neither the lock password nor the recovery key', async () => {
+    const { user, onConfirm } = open({ gesture: 'store_secret', auth: hello });
+    onConfirm.mockImplementation(() =>
+      Promise.reject(refusal(DESKTOP_ERROR_CODES.AUTH_FAILED, { exhausted: false })),
+    );
+    const field = screen.getByLabelText('Lock password or recovery key') as HTMLInputElement;
+    await user.type(field, 'wrong');
+    await user.click(screen.getByRole('button', { name: 'Remove' }));
+    await settled();
+    expect(screen.getByRole('alert').textContent).toBe(
+      'That is not the lock password or the recovery key.',
+    );
+    expect(field.value).toBe('');
+  });
+
+  test('a mistyped recovery key is said where it is wrong, as Protect says it, and the field emptied', async () => {
+    // The plan waits in Rust (D.4a Task 16): the owner types the key again in place.
+    const { user, onConfirm } = open({ gesture: 'store_secret', auth: hello });
+    onConfirm.mockImplementation(() =>
+      Promise.reject(
+        refusal(CORE_ERROR_CODES.SECRETS_RECOVERY_KEY_INVALID, { reason: 'checksum', group: 7 }),
+      ),
+    );
+    const field = screen.getByLabelText('Lock password or recovery key') as HTMLInputElement;
+    await user.type(field, 'QQQSY-QCYQ6');
+    await user.click(screen.getByRole('button', { name: 'Remove' }));
+    await settled();
+    expect(screen.getByRole('alert').textContent).toBe('That key is mistyped near group 7.');
+    expect(field.value).toBe('');
+  });
+
+  test('`none` asks nothing, even for a destructive plan; `os` asks as before', () => {
+    open({ gesture: 'none' });
+    expect(screen.queryByText(/Confirm with/)).toBeNull();
+    expect(screen.queryByLabelText('Lock password or recovery key')).toBeNull();
+    cleanupDialog();
+    open({ gesture: 'os' });
+    expect(screen.getByText('Confirm with Windows Hello next.')).toBeDefined();
   });
 });

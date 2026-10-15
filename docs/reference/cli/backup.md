@@ -282,7 +282,7 @@ apprafter backup status
 
 ## `apprafter backup unlock`
 
-Remove STALE locks from an S3-backed restic repository (`restic unlock`; live locks are never touched). Run OUTSIDE the cluster with the operator's full S3 credentials
+Remove STALE locks from an S3-backed restic repository (`restic unlock`; live locks are never touched). Run OUTSIDE the cluster with the operator's full S3 credentials. (Not `apprafter unlock`, which opens a target store's unlock window.)
 
 ```text
 Usage: apprafter backup unlock [OPTIONS]

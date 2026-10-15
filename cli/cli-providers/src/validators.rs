@@ -297,20 +297,20 @@ mod tests {
 
     #[test]
     fn validate_credentials_surfaces_transport_error_when_endpoint_unreachable() {
-        // Point at a closed port → ureq returns a Transport error
-        // that we surface as the generic `CliError::Other`.
-        // Network unreachable / DNS-fail / connection-refused all
-        // collapse into this branch (cli-dx-task.md §10: error UX
-        // for "network unreachable" is the responsibility of the
-        // caller; here we just guarantee a typed surface).
+        // Point at a closed port → ureq returns a Transport error,
+        // which the client surfaces as the typed
+        // `ProviderApiUnreachable` (WI-453): network unreachable,
+        // DNS failure and connection refused all land there, for
+        // every request.
         let v = HetznerCloudValidator::new("http://127.0.0.1:1", "test-token");
         let err = v
             .validate_credentials()
             .expect_err("unreachable host must error");
         match err {
-            cli_core::CliError::Other(msg) => {
+            cli_core::CliError::ProviderApiUnreachable { cause, .. } => {
+                let msg = cause.to_string();
                 assert!(
-                    msg.to_lowercase().contains("transport"),
+                    msg.starts_with("transport error talking to http://127.0.0.1:1/v1/locations:"),
                     "expected transport-flagged message, got: {msg}"
                 );
             }
@@ -321,7 +321,7 @@ mod tests {
                 // also acceptable as long as it isn't silently
                 // succeeding.
             }
-            other => panic!("expected Other or Hetzner, got {other:?}"),
+            other => panic!("expected ProviderApiUnreachable or Hetzner, got {other:?}"),
         }
     }
 }

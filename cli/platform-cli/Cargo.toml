@@ -25,11 +25,29 @@ path = "src/main.rs"
 name = "platform-cli"
 path = "src/bin/platform-cli.rs"
 
+# Test-only: the Windows stand-in for the tools `doctor` probes (tests/common/stand_in.rs).
+# Behind `tool-stand-in`, so a release build and `cargo install` never build it; the test
+# runs pass `--all-features` (CI) or `--features tool-stand-in`. It lives under tests/ so its
+# own env reads (the hang and pid-file knobs) stay out of the env-read ratchet in
+# apprafter-core/tests/guards.rs, which counts product code under src/.
+[[bin]]
+name              = "apprafter-tool-stand-in"
+path              = "tests/support/apprafter_tool_stand_in.rs"
+required-features = ["tool-stand-in"]
+test              = false
+doc               = false
+
+[features]
+tool-stand-in = []
+
 [dependencies]
 age           = { workspace = true }
 arboard       = { workspace = true }
 base64        = { workspace = true }
 backup-core   = { path = "../backup-core" }
+# The shared CLI domain (ADR 0067): `target ip` is its first consumer (D.3a); from here on the
+# core ships in this binary.
+apprafter-core = { path = "../apprafter-core" }
 chrono        = { workspace = true }
 iana-time-zone = { workspace = true }
 terminal_size = { workspace = true }
@@ -60,17 +78,38 @@ ureq          = { workspace = true }
 # process started (a background job's SIGINT stays ignored).
 signal-hook   = "0.3"
 libc          = "0.2"
+# The holder's endpoint id (D.4a T50): already in cli/Cargo.lock (apprafter-core's); an edge.
+sha2          = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 # SetConsoleCtrlHandler: the Windows form of the SIGINT/SIGTERM stop in
 # commands::helper_interrupt, and TerminateProcess for a second event's exit
-# (Threading; its tests also start a child in a new process group). Already
-# in the graph; no new crate.
-windows-sys   = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Threading"] }
+# (Threading; its tests also start a child in a new process group).
+# Diagnostics_ToolHelp: the parent process the secret prompt names (D.4a
+# T61). Already in the graph; no new crate.
+# The unlock holder (D.4a T52-T56): its key page (Memory), its clocks (SystemInformation's
+# GetTickCount64 counts suspend, WindowsProgramming's QueryUnbiasedInterruptTime does not), its
+# error mode (Diagnostics_Debug) and its restricted process DACL (Security,
+# Security_Authorization); the holder's pipe and its client (Pipes, IO, Storage_FileSystem).
+# Features of the version already in the graph; no new package.
+windows-sys   = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_System_Memory", "Win32_System_Pipes", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_System_WindowsProgramming"] }
 
 [dev-dependencies]
+# `error::samples` (one value of every CoreError variant) for the renderer's exhaustiveness
+# test. Under resolver 2 a dev-dependency's features never reach the shipped binary.
+apprafter-core = { path = "../apprafter-core", features = ["test-support"] }
 assert_cmd = { workspace = true }
+# `owner_only::testing` (cli-core's test-support): reading back the DACLs of the files the CLI
+# hands kubectl from the temp dir (WI-473), and on Unix `ModeGuard`, which puts a folder's mode
+# back (WI-482). A path crate's dev-dependency reaches neither a shipped binary nor a lock.
+cli-core   = { path = "../cli-core", features = ["test-support"] }
+# `seam::testing` (cli-state's test-support): the forced interleavings of `apply`, `destroy`,
+# `import` and `init` with a cache write and `lock on` (WI-487). Never in a shipped binary.
+cli-state  = { path = "../cli-state", features = ["test-support"] }
 mockito    = { workspace = true }
 predicates = { workspace = true }
+# tests/spawn_guard.rs reads every source of cli/ as tokens: the version already in the lock (as
+# in apprafter-core's guards); `span-locations` gives its findings their line numbers.
+proc-macro2 = { version = "1", features = ["span-locations"] }
 serde_json = { workspace = true }
 tempfile   = { workspace = true }

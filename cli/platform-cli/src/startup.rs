@@ -75,6 +75,8 @@ pub(crate) fn run_startup_checks(command: &Commands) {
 ///   `target ip` and `target machine` ask it, and `target cert`, `target
 ///   domain` and `target firewall` write to the cluster: they keep the
 ///   checks.)
+/// * `lock on`, `lock off`, `lock now`, `lock status`, `unlock` — the local
+///   target store, its vault and this terminal's unlock holder.
 /// * `init` and `plan` — the local state file only; `plan` compares nothing
 ///   against live infrastructure.
 /// * `login`, `upgrade-tier` and `auth` — not available yet: each prints
@@ -85,11 +87,13 @@ pub(crate) fn run_startup_checks(command: &Commands) {
 pub(crate) fn reaches_beyond_this_machine(command: &Commands) -> bool {
     match command {
         Commands::Completion { .. }
+        | Commands::Unlock { .. }
         | Commands::Init { .. }
         | Commands::Plan
         | Commands::Login
         | Commands::UpgradeTier { .. }
-        | Commands::Auth { .. } => false,
+        | Commands::Auth { .. }
+        | Commands::Lock { .. } => false,
         Commands::Target { action } => match action {
             TargetCommand::List
             | TargetCommand::Use { .. }
@@ -179,6 +183,13 @@ mod tests {
             &["login"],
             &["upgrade-tier", "--to", "team"],
             &["auth", "status"],
+            &["lock", "now"],
+            &["lock", "status"],
+            &["unlock"],
+            &["unlock", "--timeout", "30"],
+            &["lock", "on"],
+            &["lock", "on", "--timeout", "15"],
+            &["lock", "off"],
         ] {
             assert!(!goes_out(argv), "{argv:?} never leaves this machine");
         }

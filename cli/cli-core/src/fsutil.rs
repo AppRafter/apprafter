@@ -11,8 +11,17 @@ use std::path::Path;
 /// with POSIX rename semantics, so a reader holding `dest` open does not
 /// make the replace fail (tempfile's `persist` does not retry). On Unix the
 /// parent directory is fsynced afterwards (errors ignored). On error the
-/// temp file is removed. `mode` (Unix only) is applied to the temp file
-/// before the rename; `None` keeps tempfile's 0600.
+/// temp file is removed, on Windows too: the owner-only temp file's handle
+/// shares removal by name ([`crate::owner_only::create_new`]).
+///
+/// `mode` is the file's mode on Unix, applied to the temp file before the
+/// rename; `None` keeps tempfile's 0600. A file that is owner-only on Unix
+/// (`None`, or a mode that grants nothing to group or others: `credentials.yaml`,
+/// `state.json`) is owner-only on Windows too: its temp file gets the
+/// protected one-ACE DACL ([`crate::owner_only`]) on its open handle before
+/// its first byte, and the same-volume rename keeps it, so a store in a
+/// folder other users can read keeps them out. A wider mode (0644) leaves
+/// the Windows file what it inherits from its directory.
 ///
 /// A reader sees the old file or the new one, never a partial write, and
 /// never the new one under a wider mode than `mode`.
@@ -36,19 +45,29 @@ pub fn atomic_replace(
         }
     };
 
-    let mut tmp = tempfile::Builder::new()
-        .prefix(prefix)
-        .suffix(".tmp")
-        .tempfile_in(parent)?;
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(prefix).suffix(".tmp");
+    #[cfg(windows)]
+    let mut tmp = if mode.is_none_or(|mode| mode & 0o077 == 0) {
+        builder.make_in(parent, crate::owner_only::create_new)?
+    } else {
+        builder.tempfile_in(parent)?
+    };
+    #[cfg(not(windows))]
+    let mut tmp = builder.tempfile_in(parent)?;
+    #[cfg(all(test, windows))]
+    crate::owner_only::testing::record_before_first_byte(tmp.as_file());
     tmp.write_all(bytes)?;
+    #[cfg(test)]
+    if WRITE_FAILS.with(std::cell::Cell::take) {
+        return Err(io::Error::other("a forced write error"));
+    }
     #[cfg(unix)]
     if let Some(mode) = mode {
         use std::os::unix::fs::PermissionsExt;
         tmp.as_file()
             .set_permissions(std::fs::Permissions::from_mode(mode))?;
     }
-    #[cfg(not(unix))]
-    let _ = mode;
     tmp.as_file().sync_all()?;
 
     // Until here a failure drops `tmp`, which removes the temp file. From
@@ -69,6 +88,13 @@ pub fn atomic_replace(
         let _ = dir.sync_all();
     }
     Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's forced write error: this thread's next [`atomic_replace`] fails once its temp
+    /// file holds the bytes, as a write to a full disk does.
+    static WRITE_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -118,6 +144,22 @@ mod tests {
         );
     }
 
+    /// WI-474: a write that fails leaves no temp file. On Windows the owner-only temp file
+    /// (`None`, 0600) is removed by tempfile's cleanup while its handle is still open, which
+    /// that handle must share; a wider mode's temp file is tempfile's own.
+    #[test]
+    fn a_failed_write_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, mode) in [("none", None), ("0600", Some(0o600)), ("0644", Some(0o644))] {
+            let dest = dir.path().join(name);
+            WRITE_FAILS.with(|fails| fails.set(true));
+            let err = atomic_replace(&dest, b"secret", ".f.", mode).expect_err(name);
+            assert_eq!(err.to_string(), "a forced write error", "{name}");
+            let left = others(dir.path(), "");
+            assert!(left.is_empty(), "{name}: left behind: {left:?}");
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn the_mode_is_applied_and_none_keeps_owner_only() {
@@ -134,6 +176,46 @@ mod tests {
         std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o644)).unwrap();
         atomic_replace(&secret, b"x", ".secret.", None).unwrap();
         assert_eq!(mode(&secret), 0o600, "None must keep tempfile's 0600");
+    }
+
+    /// WI-472: an owner-only file (`None`, or a mode that grants group and others nothing) gets
+    /// the protected one-ACE DACL on its temp file before the first byte, keeps it through the
+    /// rename, and replaces a file that inherited its folder's DACL.
+    #[cfg(windows)]
+    #[test]
+    fn an_owner_only_file_has_the_owner_only_dacl_from_its_first_byte() {
+        use crate::owner_only::testing;
+        let dir = tempfile::tempdir().unwrap();
+        for (name, mode) in [("none", None), ("0600", Some(0o600)), ("0400", Some(0o400))] {
+            let dest = dir.path().join(name);
+            std::fs::write(&dest, b"old, inherited").unwrap();
+            let _ = testing::take_before_first_byte();
+            atomic_replace(&dest, b"secret", ".f.", mode).unwrap();
+            testing::take_before_first_byte()
+                .expect("the write recorded its temp file's DACL")
+                .unwrap()
+                .assert_owner_only_file(&format!("{name}: the temp file before its first byte"));
+            testing::of_path(&dest)
+                .unwrap()
+                .assert_owner_only_file(&format!("{name}: the file after the rename"));
+            assert_eq!(std::fs::read(&dest).unwrap(), b"secret");
+        }
+        assert!(others(dir.path(), "").iter().all(|n| !n.ends_with(".tmp")));
+    }
+
+    /// A mode that lets group or others read is not a secret's: on Windows the file keeps what
+    /// its directory hands down.
+    #[cfg(windows)]
+    #[test]
+    fn a_wider_mode_keeps_what_the_directory_hands_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("config.yaml");
+        atomic_replace(&dest, b"x", ".config.yaml.", Some(0o644)).unwrap();
+        assert!(
+            !crate::owner_only::testing::of_path(&dest)
+                .unwrap()
+                .protected
+        );
     }
 
     /// The reason this helper exists: tempfile's `persist` fails with

@@ -76,6 +76,9 @@ than taken on faith.
 - [The target store on disk](the-target-store.md) — what
   `apprafter target add` writes and where, and the order every later command
   resolves a credential in.
+- [How the store lock works](the-store-lock.md) — the vault and its slots,
+  the per-terminal unlock window and what binds it, where a secret is while
+  it is used, and what the lock does not stop.
 - [Right-sizing an application's requests](resources-and-autoscaling.md) — the
   VerticalPodAutoscaler the platform renders, why the Deployment and the pod
   permanently disagree, the cluster-wide floors and ceilings, and how to tell a

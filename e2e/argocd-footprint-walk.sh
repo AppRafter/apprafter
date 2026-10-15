@@ -26,9 +26,10 @@
 # the inner code). Bulletproof cleanup + verify both token projects -> 0. Tokens
 # from backup-test.env (pre-flight hz.py list = 0 before the destructive sweep).
 set -uo pipefail
+# shellcheck source=e2e/lib.sh
+source "$(dirname "$0")/lib.sh"
 
-APPRAFTER=/projects/omnixal/apprafter/cli/target/release/apprafter
-HZ=/projects/omnixal/apprafter/e2e/hz.py
+HZ="$REPO_ROOT/e2e/hz.py"
 REGION="${APPRAFTER_E2E_REGION:-nbg1}"
 TOKEN="${HCLOUD_TOKEN:?HCLOUD_TOKEN required}"
 OTHER_TOKEN="${OTHER_TOKEN:-}"
@@ -45,12 +46,15 @@ mark_fail() { FAIL=1; printf 'FAILED: %s\n' "$1"; }
 ok() { printf 'ok: %s\n' "$1"; }
 
 WORK=$(mktemp -d /tmp/apprafter-argofp-XXXXXX)
+# No `set -e` here: stop at once if the walk cannot isolate the CLI or find it.
+e2e_isolate_store "$WORK" || exit 2
+APPRAFTER="$(apprafter_bin)" || exit 2   # the release build, or $APPRAFTER_BIN; isolated per call
 export HOME="$WORK/home"; mkdir -p "$HOME/.ssh"
 export APPRAFTER_SSH_PRIVATE_KEY="$WORK/id_ed25519"
 ssh-keygen -t ed25519 -N '' -f "$APPRAFTER_SSH_PRIVATE_KEY" -C apprafter-argofp >/dev/null 2>&1
 export APPRAFTER_SSH_PUBLIC_KEY="$(cat "$APPRAFTER_SSH_PRIVATE_KEY.pub")"
 export KUBECONFIG="$WORK/kubeconfig"
-MEASDIR=/projects/omnixal/apprafter/docs/measurements
+MEASDIR="$REPO_ROOT/docs/measurements"
 cd "$WORK"
 
 cleanup() {

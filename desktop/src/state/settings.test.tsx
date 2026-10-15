@@ -8,6 +8,7 @@ import { ToastProvider } from '../components/Toast';
 import { DESKTOP_ERROR_CODES } from '../ipc/generated/errors';
 import type { Settings } from '../ipc/generated/Settings';
 import { settings } from '../test/fixtures';
+import { settleIpc } from '../test/settle';
 import { createQueryClient } from './queryClient';
 import { SETTINGS_KEY, useSaveSettings, useSettings } from './settings';
 
@@ -38,7 +39,10 @@ beforeEach(() => {
   });
 });
 
-afterEach(() => clearMocks());
+afterEach(async () => {
+  await settleIpc();
+  clearMocks();
+});
 
 test('a refused save whose read-back fails leaves what Rust confirmed, not the refused choice', async () => {
   const client = createQueryClient();

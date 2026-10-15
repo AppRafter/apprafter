@@ -52,7 +52,7 @@ use serde::Serialize;
 use zeroize::Zeroizing;
 
 use crate::auth::{AuthPurpose, Authenticator, PasswordAnswer};
-use crate::ops::panic_message;
+use crate::ops::{panic_message, Clock, SystemClock};
 
 /// What [`AuthCache::info`] says before the OS first answered: available, method unknown. The
 /// lock counts it as in effect, so a slow first answer leaves nothing unlocked that should be
@@ -72,12 +72,19 @@ type Listener = Box<dyn Fn() + Send + Sync>;
 /// every other call goes to the OS's.
 pub struct AuthCache {
     auth: Arc<dyn Authenticator>,
+    /// What `took_ms` is read on: the monotonic clock, a test's own in the tests.
+    clock: Arc<dyn Clock>,
     state: Mutex<State>,
     /// Notified when an answer comes in.
     answered: Condvar,
     listener: OnceLock<Listener>,
     /// Itself, for the asking thread.
     me: Weak<AuthCache>,
+    /// Every bound a caller asked [`fresh`](Self::fresh) or [`settled`](Self::settled) to wait
+    /// up to, in order: how a test tells "waited for nothing" from "waited a moment" without
+    /// reading a clock (GOTCHA-332).
+    #[cfg(test)]
+    waits: Mutex<Vec<Duration>>,
 }
 
 #[derive(Default)]
@@ -95,12 +102,20 @@ struct State {
 impl AuthCache {
     /// The cache over `auth`, with no answer yet and no question asked.
     pub fn new(auth: Arc<dyn Authenticator>) -> Arc<Self> {
+        Self::with_clock(auth, Arc::new(SystemClock))
+    }
+
+    /// [`new`](Self::new), timing the OS's answers on `clock`.
+    pub(crate) fn with_clock(auth: Arc<dyn Authenticator>, clock: Arc<dyn Clock>) -> Arc<Self> {
         Arc::new_cyclic(|me| Self {
             auth,
+            clock,
             state: Mutex::default(),
             answered: Condvar::new(),
             listener: OnceLock::new(),
             me: me.clone(),
+            #[cfg(test)]
+            waits: Mutex::default(),
         })
     }
 
@@ -121,6 +136,8 @@ impl AuthCache {
     /// app started, so its answer is as fresh as a new one's, and the start's bound holds one
     /// round trip to the OS rather than two (the settings' question, then this one).
     pub fn fresh(&self, within: Duration) -> Option<AuthInfo> {
+        #[cfg(test)]
+        self.waited(within);
         let out = {
             let state = self.lock();
             (state.answered == 0 && state.asking).then_some(state.asked)
@@ -144,6 +161,8 @@ impl AuthCache {
 
     /// Waits up to `within` until every question asked so far has its answer; whether it has.
     pub fn settled(&self, within: Duration) -> bool {
+        #[cfg(test)]
+        self.waited(within);
         let state = self.lock();
         let (state, _) = self
             .answered
@@ -227,6 +246,28 @@ impl AuthCache {
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
+
+    /// How long since `asked`, a reading of [`clock`](Self::clock)'s monotonic milliseconds.
+    fn since(&self, asked: u64) -> Duration {
+        Duration::from_millis(self.clock.monotonic_ms().saturating_sub(asked))
+    }
+
+    #[cfg(test)]
+    fn waited(&self, within: Duration) {
+        self.waits
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(within);
+    }
+
+    /// The bounds callers asked to wait up to so far (see `waits`).
+    #[cfg(test)]
+    pub(crate) fn waits(&self) -> Vec<Duration> {
+        self.waits
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
 }
 
 impl Authenticator for AuthCache {
@@ -237,13 +278,13 @@ impl Authenticator for AuthCache {
 
     fn verify(&self, purpose: &AuthPurpose, cancel: &CancellationToken) -> AuthOutcome {
         let known = self.known();
-        let asked = Instant::now();
+        let asked = self.clock.monotonic_ms();
         let outcome = self.auth.verify(purpose, cancel);
         log_answer(
             purpose,
             "prompt",
             &outcome,
-            asked.elapsed(),
+            self.since(asked),
             known.as_ref(),
             None,
         );
@@ -259,13 +300,13 @@ impl Authenticator for AuthCache {
         cancel: &CancellationToken,
     ) -> PasswordAnswer {
         let known = self.known();
-        let asked = Instant::now();
+        let asked = self.clock.monotonic_ms();
         let answer = self.auth.verify_password(purpose, password, cancel);
         log_answer(
             purpose,
             "password_field",
             &answer.outcome,
-            asked.elapsed(),
+            self.since(asked),
             known.as_ref(),
             Some(answer.messages.len()),
         );
@@ -385,6 +426,7 @@ mod tests {
 
     use super::*;
     use crate::auth::FakeAuthenticator;
+    use crate::ops::test_clock::ManualClock;
 
     /// Longer than any wait a passing test makes.
     const LONG: Duration = Duration::from_secs(10);
@@ -458,7 +500,6 @@ mod tests {
     fn reading_never_asks_the_os_and_a_question_that_never_comes_back_keeps_the_last_answer() {
         let (os, answer) = Gated::new();
         let cache = AuthCache::new(os.clone());
-        let started = Instant::now();
         assert_eq!(cache.info(), UNANSWERED, "before any answer");
         assert_eq!(cache.known(), None);
         assert_eq!(os.asked(), 0, "reading asked nothing");
@@ -468,13 +509,14 @@ mod tests {
         answer.send(method(AuthMethod::Polkit)).unwrap();
         assert!(cache.settled(LONG));
         assert_eq!(cache.info(), method(AuthMethod::Polkit));
-        // The next question hangs: every read still answers at once, with the last answer.
+        // The next question hangs: every read still answers at once, with the last answer. At
+        // once: no read waited, for any time (GOTCHA-332: not a bound on the clock).
         cache.refresh();
         wait_until("the second question", || os.asked() == 2);
         for _ in 0..100 {
             assert_eq!(cache.info(), method(AuthMethod::Polkit));
         }
-        assert!(started.elapsed() < LONG / 2, "{:?}", started.elapsed());
+        assert_eq!(cache.waits(), [LONG], "only the test's own wait");
         drop(answer);
     }
 
@@ -517,10 +559,10 @@ mod tests {
         answer.send(method(AuthMethod::Pam)).unwrap();
         assert_eq!(fresh.join().unwrap(), Some(method(AuthMethod::Pam)));
 
-        // No answer within its bound: none, and the last one stays.
-        let started = Instant::now();
+        // No answer within its bound: none, and the last one stays. Its bound, and nothing
+        // answered the question out meanwhile (GOTCHA-332: the record, not the clock).
         assert_eq!(cache.fresh(Duration::from_millis(100)), None);
-        assert!(started.elapsed() >= Duration::from_millis(100));
+        assert_eq!(cache.waits().last(), Some(&Duration::from_millis(100)));
         assert_eq!(cache.info(), method(AuthMethod::Pam));
         drop(answer);
     }
@@ -775,26 +817,28 @@ mod tests {
         assert_eq!(field(after, "password_field"), Some("true"), "{after}");
     }
 
+    /// On the test's own clock, which only the prompt moves: the line says exactly how long
+    /// the OS took, whatever the machine's own time did meanwhile (GOTCHA-332).
     #[test]
     fn an_answer_says_how_long_the_os_took() {
-        /// Takes its time over every prompt.
-        struct Slow;
+        /// Takes a minute over every prompt, on the test's clock.
+        struct Slow(Arc<ManualClock>);
         impl Authenticator for Slow {
             fn info(&self) -> AuthInfo {
                 FakeAuthenticator::new().info()
             }
             fn verify(&self, _: &AuthPurpose, _: &CancellationToken) -> AuthOutcome {
-                thread::sleep(Duration::from_millis(60));
+                self.0.advance(60_000);
                 AuthOutcome::Verified
             }
         }
-        let cache = AuthCache::new(Arc::new(Slow));
+        let clock = Arc::new(ManualClock::at(1_700_000_000_000));
+        let cache = AuthCache::with_clock(Arc::new(Slow(clock.clone())), clock);
         let log = crate::runtime::logged(|| {
             cache.verify(&AuthPurpose::Unlock, &CancellationToken::new());
         });
         let line = lines_with(&log, "the OS answered")[0];
-        let took: u64 = field(line, "took_ms").unwrap().parse().unwrap();
-        assert!((60..LONG.as_millis() as u64).contains(&took), "{line}");
+        assert_eq!(field(line, "took_ms"), Some("60000"), "{line}");
     }
 
     /// The password, and what PAM said on the way, never reach the log: PAM's messages come
@@ -902,9 +946,8 @@ mod tests {
         }
         let cache = AuthCache::new(Arc::new(PanicsSecond(AtomicUsize::new(0))));
         let first = cache.fresh(LONG).expect("an answer");
-        let started = Instant::now();
+        // Answered, not timed out: a wait that ran out would be `None`.
         assert_eq!(cache.fresh(LONG), Some(first.clone()), "the last answer");
-        assert!(started.elapsed() < LONG / 2, "answered, not timed out");
         assert_eq!(cache.info(), first);
     }
 }

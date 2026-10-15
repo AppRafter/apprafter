@@ -9,6 +9,7 @@ import { DESKTOP_ERROR_CODES } from '../ipc/generated/errors';
 import { rereadAppInfo, usePlatform } from '../state/platform';
 import { createQueryClient } from '../state/queryClient';
 import { appInfo, authInfo } from '../test/fixtures';
+import { settleIpc, until } from '../test/settle';
 import { PlatformGate } from './PlatformGate';
 
 let calls: string[];
@@ -55,9 +56,13 @@ beforeEach(() => {
   });
 });
 
-afterEach(() => clearMocks());
+afterEach(async () => {
+  await settleIpc();
+  clearMocks();
+});
 
-const settle = () => act(() => new Promise((resolve) => setTimeout(resolve, 10)));
+/** Nothing more on its way: what must not have happened has not, by now. */
+const settle = () => act(() => settleIpc());
 const reads = () => calls.filter((c) => c === 'app_info').length;
 
 function Probe() {
@@ -93,9 +98,8 @@ describe('PlatformGate', () => {
       Promise.reject(uiError(DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE, { reason: 'no_agent' }));
     answer = () => withField(true);
     await act(() => api.unlock().catch(() => undefined));
-    await settle();
+    await until('the field shown', () => field() === 'field shown');
     expect(reads()).toBe(2);
-    expect(field()).toBe('field shown');
   });
 
   test('after auth_unavailable the field is withheld until app_info answers again', async () => {
@@ -109,9 +113,9 @@ describe('PlatformGate', () => {
         uiError(DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE, { reason: 'use_system_prompt' }),
       );
     await act(() => api.unlock().catch(() => undefined));
+    await until('the field withheld', () => reads() === 2 && field() === 'field hidden');
     await settle();
     expect(reads()).toBe(2);
-    expect(field()).toBe('field hidden');
     await act(async () => reading.resolve(withField(false)));
     expect(field()).toBe('field hidden');
   });
@@ -125,8 +129,8 @@ describe('PlatformGate', () => {
       answer = () => reading.promise;
       refusal = () => Promise.reject(uiError(code));
       await act(() => api.unlock().catch(() => undefined));
+      await until('app_info read again', () => reads() === 2);
       await settle();
-      expect(reads()).toBe(2);
       expect(field()).toBe('field shown');
       await act(async () => reading.resolve(withField(true)));
       expect(field()).toBe('field shown');
@@ -150,6 +154,7 @@ describe('PlatformGate', () => {
     console.error = (...args: unknown[]) => errors.push(args);
     try {
       await act(async () => rereadAppInfo(client, false));
+      await until('the failed read logged', () => errors.length > 0);
       await settle();
     } finally {
       console.error = original;
@@ -166,8 +171,9 @@ describe('PlatformGate', () => {
     expect(screen.getByText(/^field/).textContent).toContain('session - -');
     answer = () => appInfo({ sessionEvents: { lock: true, sleep: false } });
     await act(async () => rereadAppInfo(client, false));
-    await settle();
-    expect(screen.getByText(/^field/).textContent).toContain('session lock -');
+    await until('the session said', () =>
+      Boolean(screen.getByText(/^field/).textContent?.includes('session lock -')),
+    );
   });
 
   test('a first read that fails is shown as it is', async () => {

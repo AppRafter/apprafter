@@ -8,24 +8,26 @@
 //! exercise the API ping point `APPRAFTER_HCLOUD_BASE_URL` at a
 //! mockito server.
 
+mod common;
+
+use common::spawn::Spawn;
+
 use assert_cmd::Command;
 use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 
-fn cli() -> Command {
-    Command::cargo_bin("apprafter").unwrap()
+fn cli(sp: &Spawn) -> Command {
+    sp.cmd(&[])
 }
 
 fn synthetic_hetzner_token() -> String {
     "a".repeat(64)
 }
 
-fn seed_target(dir: &std::path::Path) {
+fn seed_target(sp: &Spawn) {
     let token = synthetic_hetzner_token();
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir)
+    cli(sp)
         .env("APPRAFTER_NO_PING", "1")
-        .env_remove("HCLOUD_TOKEN")
         .args([
             "target",
             "add",
@@ -50,8 +52,8 @@ fn seed_target(dir: &std::path::Path) {
 #[test]
 fn whoami_on_empty_store_prints_onboarding_hint() {
     let dir = tempfile::tempdir().unwrap();
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    let sp = Spawn::new().with_store(dir.path());
+    cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
         .arg("whoami")
         .assert()
@@ -62,13 +64,54 @@ fn whoami_on_empty_store_prints_onboarding_hint() {
         .stdout(contains("apprafter target add"));
 }
 
+/// The CLI-default pointer is read before anything prints: a `config.yaml` that cannot be
+/// parsed is the error alone, with no identity line in front of it. A target whose own files
+/// cannot be read fails after the identity line. Both orders are today's. Which file failed is
+/// told by what its error says, not by its path: miette wraps the path inside a word on
+/// Windows, where `\` allows no line break. A credentials file's error never quotes the file.
+#[test]
+fn whoami_reads_the_pointer_before_the_identity_line_and_the_target_after_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let sp = Spawn::new().with_store(dir.path());
+    seed_target(&sp);
+    std::fs::write(
+        dir.path().join("targets/primary/credentials.yaml"),
+        "hetzner_token: [unclosed",
+    )
+    .unwrap();
+    cli(&sp)
+        .args(["whoami", "--no-ping"])
+        .assert()
+        .failure()
+        .stdout(contains("Identity:"))
+        .stderr(contains("apprafter::target::invalid_config"))
+        .stderr(predicates::function::function(|stderr: &str| {
+            // miette's wrapping (a line break and the `│` gutter) taken out.
+            stderr
+                .split_whitespace()
+                .filter(|word| *word != "│")
+                .collect::<Vec<_>>()
+                .join(" ")
+                .contains("not a valid target credentials map")
+        }));
+
+    std::fs::write(dir.path().join("config.yaml"), "active_target: [unclosed").unwrap();
+    cli(&sp)
+        .args(["whoami", "--no-ping"])
+        .assert()
+        .failure()
+        .stdout(predicates::str::is_empty())
+        .stderr(contains("apprafter::target::invalid_config"))
+        .stderr(contains("active_target:"));
+}
+
 #[test]
 fn whoami_with_active_target_renders_summary_and_honours_no_ping() {
     let dir = tempfile::tempdir().unwrap();
-    seed_target(dir.path());
+    let sp = Spawn::new().with_store(dir.path());
+    seed_target(&sp);
 
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
         .arg("whoami")
         .assert()
@@ -103,13 +146,11 @@ fn whoami_with_real_ping_reports_verified_on_mockito_200() {
         .create();
 
     let dir = tempfile::tempdir().unwrap();
-    seed_target(dir.path());
+    let sp = Spawn::new().with_store(dir.path());
+    seed_target(&sp);
 
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    cli(&sp)
         .env("APPRAFTER_HCLOUD_BASE_URL", server.url())
-        .env_remove("HCLOUD_TOKEN")
-        .env_remove("APPRAFTER_NO_PING")
         .arg("whoami")
         .assert()
         .success()
@@ -127,15 +168,13 @@ fn whoami_with_real_ping_reports_failure_hint_on_mockito_401() {
         .create();
 
     let dir = tempfile::tempdir().unwrap();
-    seed_target(dir.path());
+    let sp = Spawn::new().with_store(dir.path());
+    seed_target(&sp);
 
     // 401 must NOT fail the whoami command — info is still useful
     // for the operator. Surface the verdict in the Provider line.
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    cli(&sp)
         .env("APPRAFTER_HCLOUD_BASE_URL", server.url())
-        .env_remove("HCLOUD_TOKEN")
-        .env_remove("APPRAFTER_NO_PING")
         .arg("whoami")
         .assert()
         .success()
@@ -147,13 +186,11 @@ fn whoami_with_real_ping_reports_failure_hint_on_mockito_401() {
 #[test]
 fn whoami_with_real_ping_reports_failure_when_provider_unreachable() {
     let dir = tempfile::tempdir().unwrap();
-    seed_target(dir.path());
+    let sp = Spawn::new().with_store(dir.path());
+    seed_target(&sp);
 
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    cli(&sp)
         .env("APPRAFTER_HCLOUD_BASE_URL", "http://127.0.0.1:1")
-        .env_remove("HCLOUD_TOKEN")
-        .env_remove("APPRAFTER_NO_PING")
         .arg("whoami")
         .assert()
         .success()
@@ -170,7 +207,8 @@ fn whoami_with_real_ping_reports_failure_when_provider_unreachable() {
 
 #[test]
 fn auth_login_prints_friendly_redirect_to_target_add() {
-    cli()
+    let sp = Spawn::new();
+    cli(&sp)
         .args(["auth", "login"])
         .assert()
         .success()
@@ -181,7 +219,8 @@ fn auth_login_prints_friendly_redirect_to_target_add() {
 
 #[test]
 fn auth_logout_prints_friendly_redirect_with_nothing_to_logout_phrasing() {
-    cli()
+    let sp = Spawn::new();
+    cli(&sp)
         .args(["auth", "logout"])
         .assert()
         .success()
@@ -191,7 +230,8 @@ fn auth_logout_prints_friendly_redirect_with_nothing_to_logout_phrasing() {
 
 #[test]
 fn auth_status_explains_self_hosted_mode_and_points_at_whoami() {
-    cli()
+    let sp = Spawn::new();
+    cli(&sp)
         .args(["auth", "status"])
         .assert()
         .success()
@@ -207,7 +247,8 @@ fn auth_group_is_hidden_from_top_level_help() {
     // namespace doesn't crowd the new-user discovery surface.
     // The subcommand itself still works — see the three tests
     // above — so power users + future docs can reach it.
-    cli()
+    let sp = Spawn::new();
+    cli(&sp)
         .arg("--help")
         .assert()
         .success()
@@ -218,7 +259,8 @@ fn auth_group_is_hidden_from_top_level_help() {
 fn auth_subcommand_help_is_still_reachable() {
     // The hide flag is for the top-level help only; deliberate
     // `apprafter auth --help` still renders the subcommand tree.
-    cli()
+    let sp = Spawn::new();
+    cli(&sp)
         .args(["auth", "--help"])
         .assert()
         .success()

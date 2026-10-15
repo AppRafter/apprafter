@@ -5,12 +5,21 @@ import { clearMocks, mockIPC } from '@tauri-apps/api/mocks';
 import { act, cleanup, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import type { AppInfo } from '../ipc/generated/AppInfo';
+import { CORE_ERROR_CODES } from '../ipc/generated/core-errors';
 import { DESKTOP_ERROR_CODES } from '../ipc/generated/errors';
 import type { LockState } from '../ipc/generated/LockState';
 import type { JsonValue } from '../ipc/generated/serde_json/JsonValue';
+import type { UiError } from '../ipc/generated/UiError';
+import {
+  lockFooter,
+  NOT_THE_SECRET,
+  STORE_FIELD_PLACEHOLDER,
+  STORE_PROBLEM_REASON,
+} from '../state/lockText';
 import { PlatformContext } from '../state/platform';
 import { createQueryClient } from '../state/queryClient';
-import { appInfo, authInfo, lockState } from '../test/fixtures';
+import { appInfo, authInfo, lockState, STORE_NOT_PRIVATE, STORE_PROBLEMS } from '../test/fixtures';
+import { settleIpc } from '../test/settle';
 import { LockScreen } from './LockScreen';
 
 let calls: { cmd: string; args: unknown }[];
@@ -31,8 +40,9 @@ beforeEach(() => {
   });
 });
 
-afterEach(() => {
+afterEach(async () => {
   cleanup();
+  await settleIpc();
   clearMocks();
 });
 
@@ -117,6 +127,10 @@ describe('LockScreen', () => {
     [lockState({ reason: 'idle', autoLockMinutes: 30 }), 'Locked after 30 minutes of inactivity.'],
     [lockState({ reason: 'os_session' }), 'Locked when the computer locked or slept.'],
     [lockState({ reason: 'manual' }), 'Locked.'],
+    [
+      lockState({ reason: 'secrets_locked' }),
+      "Locked: this target store's secrets were locked from a terminal.",
+    ],
   ])('the reason line: %o', (state, line) => {
     lockScreen(state);
     expect(screen.getByText(line)).toBeDefined();
@@ -207,9 +221,20 @@ describe('LockScreen', () => {
       screen.getByText('Clusters keep running. Credentials are stored in files on this computer.'),
     ).toBeDefined();
     cleanup();
-    lockScreen(lockState(), appInfo({ secretBackend: 'keyring' }));
+    lockScreen(
+      lockState(),
+      appInfo({
+        secrets: {
+          mode: 'locked',
+          slots: ['password', 'recovery_key'],
+          protected: true,
+          store: '~/.config/apprafter',
+          problem: null,
+        },
+      }),
+    );
     expect(
-      screen.getByText('Clusters keep running. Credentials stay in the system keychain.'),
+      screen.getByText('Clusters keep running. Credentials stay encrypted until you unlock.'),
     ).toBeDefined();
   });
 
@@ -440,5 +465,157 @@ describe('LockScreen where the OS cannot prompt: the password field', () => {
     expect(screen.getByRole('alert').textContent).toBe(
       'The system could not show its password prompt.',
     );
+  });
+});
+
+describe('LockScreen of a protected store: the store field (D.4a T75)', () => {
+  const protectedInfo = (problem: UiError | null = null) =>
+    appInfo({
+      secrets: {
+        mode: 'locked',
+        slots: ['password', 'recovery_key'],
+        protected: true,
+        store: '~/.config/apprafter',
+        problem,
+      },
+    });
+
+  test('the field takes the lock password or the recovery key, on every OS', () => {
+    for (const os of ['windows', 'macos', 'linux'] as const) {
+      lockScreen(lockState(), { ...protectedInfo(), os });
+      expect(screen.getByPlaceholderText(STORE_FIELD_PLACEHOLDER)).toBeDefined();
+      // No system Unlock button: the OS opens nothing on a protected store.
+      expect(screen.queryByText('Unlock')).toBeNull();
+      cleanup();
+    }
+  });
+
+  test("a wrong secret is the store's words, never the system password's", async () => {
+    passwordAnswer = () => refusal(DESKTOP_ERROR_CODES.AUTH_FAILED, { exhausted: false });
+    const user = lockScreen(lockState(), protectedInfo());
+    await user.type(screen.getByPlaceholderText(STORE_FIELD_PLACEHOLDER), 'not it{Enter}');
+    expect(await screen.findByText(NOT_THE_SECRET)).toBeDefined();
+    expect(calls).toEqual([{ cmd: 'unlock_with_password', args: { password: 'not it' } }]);
+  });
+
+  test('a mistyped recovery key is said where, as Protect says it (critic A finding 26)', async () => {
+    passwordAnswer = () =>
+      refusal(CORE_ERROR_CODES.SECRETS_RECOVERY_KEY_INVALID, { reason: 'checksum', group: 7 });
+    const user = lockScreen(lockState(), protectedInfo());
+    await user.type(screen.getByPlaceholderText(STORE_FIELD_PLACEHOLDER), 'QQQSY{Enter}');
+    expect(await screen.findByText('That key is mistyped near group 7.')).toBeDefined();
+  });
+
+  test('a store whose lock state cannot be used says why: not a terminal, not encrypted', () => {
+    const problem: UiError = {
+      code: CORE_ERROR_CODES.SECRETS_STORE_FILE_UNREADABLE,
+      message: '~/.config/apprafter/store.yaml cannot be read, so whether it is locked is unknown',
+      help: null,
+      causes: [],
+      fields: {},
+    };
+    lockScreen(lockState({ reason: 'secrets_locked' }), protectedInfo(problem));
+    expect(screen.getByText(STORE_PROBLEM_REASON)).toBeDefined();
+    expect(screen.queryByText(/locked from a terminal/)).toBeNull();
+    expect(screen.getByText(/cannot be read, so whether it is locked is unknown/)).toBeDefined();
+    expect(screen.getByText(lockFooter('locked', true))).toBeDefined();
+    expect(screen.queryByText(/stay encrypted/)).toBeNull();
+  });
+
+  test('an interrupted run is not said to be encrypted', () => {
+    lockScreen(
+      lockState(),
+      appInfo({
+        secrets: {
+          mode: 'locking',
+          slots: ['password', 'recovery_key'],
+          protected: true,
+          store: '~/.config/apprafter',
+          problem: null,
+        },
+      }),
+    );
+    expect(screen.getByText(lockFooter('locking', false))).toBeDefined();
+    expect(screen.queryByText(/stay encrypted/)).toBeNull();
+  });
+});
+
+// The two states whose lock state cannot be used (controller, d4a-g run 5: run 1's interim
+// "encrypted" ends here): each says why, in the core's words, and nothing calls it encrypted.
+describe('LockScreen of a store whose lock state cannot be used (critic B finding 8)', () => {
+  test.each(STORE_PROBLEMS)('%s: why, never "encrypted"', (_state, secrets) => {
+    lockScreen(lockState({ reason: 'secrets_locked' }), appInfo({ secrets }));
+    expect(screen.getByText(STORE_PROBLEM_REASON)).toBeDefined();
+    expect(screen.queryByText(/locked from a terminal/)).toBeNull();
+    expect(screen.getByText(secrets.problem?.message ?? '?')).toBeDefined();
+    expect(screen.getByText(lockFooter('locked', true))).toBeDefined();
+    expect(screen.queryByText(/encrypted/i)).toBeNull();
+  });
+});
+
+// The controller's decision on critic M7 (WI-475; WI-476): a store other accounts can change says
+// that, in the core's words, never as its lock state and never "encrypted".
+describe('LockScreen of a store other accounts can change', () => {
+  test.each(STORE_NOT_PRIVATE)('%s: why and the fix, never "encrypted"', (_state, secrets) => {
+    lockScreen(lockState({ reason: 'secrets_locked' }), appInfo({ secrets }));
+    expect(
+      screen.getByText('Locked: other accounts on this computer can change this target store.'),
+    ).toBeDefined();
+    expect(screen.queryByText(STORE_PROBLEM_REASON)).toBeNull();
+    expect(screen.getByText(secrets.problem?.message ?? '?')).toBeDefined();
+    expect(screen.getByText(secrets.problem?.help ?? '?')).toBeDefined();
+    expect(screen.queryByText(/encrypted/i)).toBeNull();
+  });
+});
+
+// A store locked from a terminal while the app was unlocked (controller, d4a-g run 5): from run 3
+// the OS opened nothing there, and the page offered only the system's Unlock on Windows, macOS
+// and Linux with polkit. On every route the app has, the field takes the store's secret.
+describe('a store locked from a terminal opens in the app, on every route (D.4a T75)', () => {
+  const ROUTES = [
+    ['Windows Hello', { os: 'windows', auth: authInfo({ method: 'windows_hello' }) }],
+    [
+      'Touch ID or the Mac password',
+      { os: 'macos', auth: authInfo({ method: 'mac_local_authentication' }) },
+    ],
+    ['polkit', { os: 'linux', auth: authInfo({ method: 'polkit' }) }],
+    ["Linux's PAM field", { os: 'linux', auth: authInfo({ method: 'pam', passwordField: true }) }],
+    [
+      'no system authentication',
+      {
+        os: 'linux',
+        auth: authInfo({ available: false, method: null, unavailable: 'no_backend' }),
+      },
+    ],
+  ] as const satisfies readonly (readonly [string, Partial<AppInfo>])[];
+
+  test.each(ROUTES)('%s', async (_route, route) => {
+    const user = lockScreen(
+      lockState({ reason: 'secrets_locked' }),
+      appInfo({
+        ...route,
+        secrets: {
+          mode: 'locked',
+          slots: ['password', 'recovery_key'],
+          protected: true,
+          store: '~/.config/apprafter',
+          problem: null,
+        },
+      }),
+    );
+    expect(
+      screen.getByText("Locked: this target store's secrets were locked from a terminal."),
+    ).toBeDefined();
+    // The store's field, never the system's prompt or its password field.
+    expect(screen.queryByText('Unlock')).toBeNull();
+    expect(screen.queryByLabelText('System password')).toBeNull();
+    await user.type(
+      screen.getByPlaceholderText(STORE_FIELD_PLACEHOLDER),
+      'the lock password{Enter}',
+    );
+    await settled();
+    expect(calls).toEqual([
+      { cmd: 'unlock_with_password', args: { password: 'the lock password' } },
+    ]);
   });
 });

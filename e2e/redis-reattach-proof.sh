@@ -107,7 +107,7 @@ if ! command -v docker >/dev/null 2>&1 && ! command -v podman >/dev/null 2>&1; t
 fi
 
 TMPDIR_WORK="$(mktemp -d)"
-APPRAFTER_CONFIG_DIR="${TMPDIR_WORK}/apprafter-config"
+e2e_isolate_store "${TMPDIR_WORK}"
 KUBECONFIG_FILE="${TMPDIR_WORK}/kubeconfig"
 PROOF_ADMIN_PW="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
 

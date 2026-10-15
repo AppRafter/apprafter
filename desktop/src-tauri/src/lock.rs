@@ -57,6 +57,15 @@
 //! listener, from the hook itself, or from `persist`. The [`AuthCache`]'s own lock comes last:
 //! the machine reads the cache under its lock, and the cache tells the machine of an answer on
 //! its asking thread, holding none of its own. The lock on the tick's back-off is taken alone.
+//!
+//! # A protected store (D.4a T74)
+//!
+//! While the target store's secrets are protected ([`LockMachine::set_protected`], from the
+//! shell's re-read of `store.yaml`) the lock is in effect whatever the saved switch or the OS,
+//! the machine follows the pinned settings ([`pinned`]), a save that would switch a pin off is
+//! refused `LockRequired`, and only the store's secret unlocks
+//! ([`LockMachine::unlock_with_store_secret`]), its key kept under the machine's lock just
+//! before the transition. The key's holder (`vault_access`) is told of every lock by the hook.
 
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -65,14 +74,14 @@ use std::time::Duration;
 
 use apprafter_core::CancellationToken;
 use apprafter_desktop_ipc::{
-    AuthInfo, AuthOutcome, LockReason, LockState, Settings, UnavailableReason, ALLOWED_WHILE_LOCKED,
+    AuthInfo, AutoLock, LockReason, LockState, Settings, UnavailableReason, ALLOWED_WHILE_LOCKED,
 };
 use zeroize::Zeroizing;
 
 use crate::auth::{AuthPurpose, Authenticator, PasswordAnswer};
 use crate::auth_cache::AuthCache;
 use crate::errors::{DesktopError, Refusal};
-use crate::ops::{panic_message, Clock, Stamp};
+use crate::ops::{panic_message, Clock, ClockPair, Stamp};
 
 const MINUTE_MS: u64 = 60_000;
 
@@ -149,6 +158,13 @@ struct Inner {
     closing: bool,
     /// Locked at start for want of the authenticator's answer, which has not come yet.
     provisional: bool,
+    /// The store's secrets are protected (D.4a T74): the lock is in effect whatever the
+    /// settings and the OS say, the pinned settings apply, and only the store's secret
+    /// unlocks.
+    protected: bool,
+    /// O4's two clocks at the last look (a tick, a secret's use, an unlock): the sleep gap is
+    /// measured from here.
+    last_tick: ClockPair,
 }
 
 struct Prompt {
@@ -173,11 +189,28 @@ impl LockMachine {
         clock: Arc<dyn Clock>,
         hook: LockHook,
     ) -> Arc<Self> {
+        Self::new_protected(settings, auth, clock, hook, false)
+    }
+
+    /// [`new`](Self::new) over a store whose secrets are `protected` (D.4a T74): then it
+    /// starts locked whatever the settings say, asking the authenticator nothing first — the
+    /// vault's own field opens it on every OS.
+    pub fn new_protected(
+        settings: Settings,
+        auth: Arc<AuthCache>,
+        clock: Arc<dyn Clock>,
+        hook: LockHook,
+        protected: bool,
+    ) -> Arc<Self> {
         let now = Stamp::now(&*clock);
-        let (reason, provisional) = if settings.lock_enabled && settings.lock_on_start {
+        let last_tick = ClockPair::now(&*clock);
+        let (reason, provisional) = if protected {
+            auth.refresh();
+            (Some(LockReason::Startup), false)
+        } else if settings.lock_enabled && settings.lock_on_start {
             match auth.fresh(STARTUP_WITHIN) {
                 Some(info) => (
-                    in_effect(&settings, &info).then_some(LockReason::Startup),
+                    in_effect(&settings, &info, false).then_some(LockReason::Startup),
                     false,
                 ),
                 None => {
@@ -192,7 +225,7 @@ impl LockMachine {
             auth.refresh();
             (None, false)
         };
-        let minutes = reported_minutes(&settings, &auth.info());
+        let minutes = reported_minutes(&settings, &auth.info(), protected);
         let machine = Arc::new(Self {
             auth,
             clock,
@@ -207,6 +240,8 @@ impl LockMachine {
                 prompt: None,
                 closing: false,
                 provisional,
+                protected,
+                last_tick,
             }),
             locked: AtomicBool::new(reason.is_some()),
             settings_write: Mutex::new(()),
@@ -236,7 +271,9 @@ impl LockMachine {
         let close = {
             let mut inner = self.lock_inner();
             let provisional = std::mem::take(&mut inner.provisional);
-            if provisional && !info.available && inner.seq == 0 {
+            // Not on a protected store: the vault's own field opens it, whatever the OS says
+            // (D.4a T75), so the lock stands.
+            if provisional && !info.available && inner.seq == 0 && !inner.protected {
                 tracing::info!(
                     "the authenticator's late answer: nothing can verify the owner here, so the \
                      start's lock is lifted"
@@ -298,11 +335,18 @@ impl LockMachine {
         }
         let info = self.auth.info();
         let mut inner = self.lock_inner();
+        // D.4a O4: a sleep the OS did not report, as the holder sees one ([`Self::look`]).
+        let slept = self.look(&mut inner);
         self.report(&mut inner, &info);
-        if inner.reason.is_some() || !in_effect(&inner.settings, &info) {
+        if inner.reason.is_some() || !in_effect(&inner.settings, &info, inner.protected) {
             return;
         }
-        let Some(minutes) = inner.settings.auto_lock.minutes() else {
+        if slept && inner.protected {
+            let now = self.clock.now_ms();
+            self.enter(&mut inner, &info, Some(LockReason::OsSession), now);
+            return;
+        }
+        let Some(minutes) = pinned(&inner.settings, inner.protected).auto_lock.minutes() else {
             return;
         };
         if inner.last_activity.elapsed_ms(&*self.clock) >= u64::from(minutes) * MINUTE_MS {
@@ -346,7 +390,7 @@ impl LockMachine {
         let info = self.auth.info();
         let close = {
             let mut inner = self.lock_inner();
-            if !wanted(&inner.settings) {
+            if !wanted(&pinned(&inner.settings, inner.protected)) {
                 return;
             }
             if inner.reason.is_some() {
@@ -361,7 +405,7 @@ impl LockMachine {
                 // else that can send them runs as the owner, and could do worse.
                 close_open_prompt(&mut inner)
             } else {
-                if in_effect(&inner.settings, &info) {
+                if in_effect(&inner.settings, &info, inner.protected) {
                     // Read under the lock, as every transition reads it: a time read before
                     // could be older than a transition that took the lock first.
                     let now = self.clock.now_ms();
@@ -392,27 +436,59 @@ impl LockMachine {
     /// (it can take minutes), without holding the machine's lock: meanwhile every other
     /// call answers at once, and a second `unlock` is `AuthBusy`. Unlocked already, it asks
     /// nothing; once the quit has [`close`](Self::close)d the machine, it asks nothing and
-    /// answers `Closing`.
+    /// answers `Closing`. On a protected store the OS opens nothing (D.4a T75): it is not
+    /// asked, and the answer is `AuthUnavailable` with `UsePasswordField`.
     pub fn unlock(&self) -> Result<(), DesktopError> {
-        self.unlock_by(|auth, cancel| auth.verify(&AuthPurpose::Unlock, cancel).into())
-            .map_err(|refusal| *refusal.error)
+        self.unlock_by(
+            Route::Os,
+            |auth, cancel| {
+                PasswordAnswer::from(auth.verify(&AuthPurpose::Unlock, cancel)).into_result()
+            },
+            |()| {},
+        )
+        .map_err(|refusal| *refusal.error)
     }
 
     /// [`unlock`](Self::unlock) with the password from the app's own field
     /// ([`Authenticator::verify_password`]) in place of the OS's prompt, by the same rules: one
     /// check at a time, with any `unlock` (`AuthBusy`), closed by a lock or a quit, a `Verified`
     /// that comes after that refused. A refusal carries what the OS said with it (PAM's
-    /// messages). The password goes to the authenticator, or is wiped unasked.
+    /// messages). The password goes to the authenticator, or is wiped unasked. Refused, as
+    /// `unlock` is, on a protected store.
     pub fn unlock_with_password(&self, password: Zeroizing<String>) -> Result<(), Refusal> {
-        self.unlock_by(move |auth, cancel| {
-            auth.verify_password(&AuthPurpose::Unlock, password, cancel)
-        })
+        self.unlock_by(
+            Route::Os,
+            move |auth, cancel| {
+                auth.verify_password(&AuthPurpose::Unlock, password, cancel)
+                    .into_result()
+            },
+            |()| {},
+        )
     }
 
-    /// The one unlock: `ask` is the authenticator's check, run once a prompt slot is had.
-    fn unlock_by(
+    /// Unlock with the store's own secret (D.4a T74, T75): `open` opens the vault with what
+    /// the person typed (the lock password or the recovery key: blocking, a derivation), and
+    /// `commit` keeps what it opened — called under the machine's lock just before the
+    /// transition, so the key is held exactly when the app is unlocked. By the unlock's
+    /// rules: one check at a time with any unlock, and a lock, a session event or a quit
+    /// during the check refuses its yes (`commit` is then never called, and what `open`
+    /// opened is dropped).
+    pub fn unlock_with_store_secret<T>(
         &self,
-        ask: impl FnOnce(&dyn Authenticator, &CancellationToken) -> PasswordAnswer,
+        open: impl FnOnce(&CancellationToken) -> Result<T, Refusal>,
+        commit: impl FnOnce(T),
+    ) -> Result<(), Refusal> {
+        self.unlock_by(Route::StoreSecret, |_, cancel| open(cancel), commit)
+    }
+
+    /// The one unlock: `ask` is the check, run once a prompt slot is had; `commit` runs
+    /// under the machine's lock right before the app unlocks. D.4b's gesture slots are routes
+    /// here.
+    fn unlock_by<T>(
+        &self,
+        route: Route,
+        ask: impl FnOnce(&dyn Authenticator, &CancellationToken) -> Result<T, Refusal>,
+        commit: impl FnOnce(T),
     ) -> Result<(), Refusal> {
         let cancel = {
             let mut inner = self.lock_inner();
@@ -424,6 +500,12 @@ impl LockMachine {
             if inner.closing {
                 return Err(DesktopError::Closing.into());
             }
+            if route == Route::Os && inner.protected {
+                return Err(DesktopError::AuthUnavailable {
+                    reason: UnavailableReason::UsePasswordField,
+                }
+                .into());
+            }
             if inner.prompt.is_some() {
                 return Err(DesktopError::AuthBusy.into());
             }
@@ -432,13 +514,17 @@ impl LockMachine {
                 cancel: cancel.clone(),
                 closed: false,
             });
+            // O4's count for this check starts with it: a sleep while locked, before the
+            // person typed, is no sleep of this unlock's.
+            let started = ClockPair::now(&*self.clock);
+            inner.last_tick = started;
             cancel
         };
         let answer = panic::catch_unwind(AssertUnwindSafe(|| ask(&*self.auth, &cancel)));
         let info = self.auth.info();
         let mut inner = self.lock_inner();
         let closed = inner.prompt.take().is_none_or(|prompt| prompt.closed);
-        let PasswordAnswer { outcome, messages } = match answer {
+        let answer = match answer {
             Ok(answer) => answer,
             // The prompt is closed above, so the next unlock can ask again.
             Err(payload) => {
@@ -446,31 +532,124 @@ impl LockMachine {
                 panic::resume_unwind(payload)
             }
         };
-        let error = match outcome {
-            AuthOutcome::Verified if closed => DesktopError::AuthCancelled,
-            AuthOutcome::Verified => {
+        match answer {
+            // A lock or a quit closed it, or the store became protected while the OS asked:
+            // the yes does not count, and says nothing worth showing.
+            Ok(_) if closed || (route == Route::Os && inner.protected) => {
+                Err(DesktopError::AuthCancelled.into())
+            }
+            Ok(value) => {
+                // A sleep the OS did not report while the secret was checked voids the
+                // check, as a reported one does (the final verifier's finding 9): nobody may
+                // be there to see the app open. The look re-arms O4's count either way.
+                if self.look(&mut inner) && inner.protected {
+                    return Err(DesktopError::AuthCancelled.into());
+                }
+                commit(value);
                 let now = Stamp::now(&*self.clock);
                 inner.last_activity = now;
                 self.enter(&mut inner, &info, None, now.wall_ms);
-                return Ok(());
+                Ok(())
             }
-            AuthOutcome::Cancelled { .. } => DesktopError::AuthCancelled,
-            AuthOutcome::Failed {
-                exhausted,
-                retry_in_ms,
-            } => DesktopError::AuthFailed {
-                exhausted,
-                retry_in_ms,
-            },
-            AuthOutcome::Unavailable { reason } => DesktopError::AuthUnavailable { reason },
-            AuthOutcome::Busy => DesktopError::AuthBusy,
+            Err(refusal) => Err(refusal),
+        }
+    }
+
+    /// The store's secrets became protected or not (the shell's re-read, D.4a T74): the pins
+    /// apply or lift, and a changed idle time is reported. Protected, nothing locks here: the
+    /// shell locks with `SecretsLocked` when it holds no key ([`lock_unlocked`]). No longer
+    /// protected while locked, with the lock not in effect by the saved settings and the
+    /// authenticator, the app unlocks through a transition — a lock nobody could open is no
+    /// lock (rule 3), and the secrets are in files again.
+    ///
+    /// [`lock_unlocked`]: Self::lock_unlocked
+    pub fn set_protected(&self, protected: bool) {
+        let info = self.auth.info();
+        let close = {
+            let mut inner = self.lock_inner();
+            if inner.protected == protected {
+                return;
+            }
+            inner.protected = protected;
+            if !protected && inner.reason.is_some() && !in_effect(&inner.settings, &info, false) {
+                let close = close_open_prompt(&mut inner);
+                let now = self.clock.now_ms();
+                self.enter(&mut inner, &info, None, now);
+                close
+            } else {
+                self.report(&mut inner, &info);
+                None
+            }
         };
-        // What a refused check said; a yes refused for closing says nothing worth showing.
-        let messages = match outcome {
-            AuthOutcome::Verified => Vec::new(),
-            _ => messages,
-        };
-        Err(Refusal::new(error, messages))
+        trip_prompt(close);
+    }
+
+    /// Whether the store's secrets are protected, as the machine last heard.
+    pub fn protected(&self) -> bool {
+        self.lock_inner().protected
+    }
+
+    /// Whether the app is locked now; it never waits.
+    pub fn is_locked(&self) -> bool {
+        self.locked.load(Ordering::SeqCst)
+    }
+
+    /// Lock for `reason` when unlocked and the lock is in effect; a locked app, and an open
+    /// unlock prompt, are left as they are. The shell's re-read: a store locked under an app
+    /// that holds no key (`SecretsLocked`).
+    pub fn lock_unlocked(&self, reason: LockReason) {
+        self.lock_unlocked_unless(reason, || false);
+    }
+
+    /// [`lock_unlocked`](Self::lock_unlocked), unless `keep` says the app may stay
+    /// unlocked. `keep` is asked under the machine's lock, which an unlock's `commit` holds
+    /// too, so the shell's re-read never decides on a key an unlock is keeping that moment,
+    /// nor locks the app that unlock just opened (the final verifier's finding 8). `keep`
+    /// runs on a locked app too (it drops a key that is not the store's).
+    pub fn lock_unlocked_unless(&self, reason: LockReason, keep: impl FnOnce() -> bool) {
+        let info = self.auth.info();
+        let mut inner = self.lock_inner();
+        let stays = keep();
+        if !stays && inner.reason.is_none() && in_effect(&inner.settings, &info, inner.protected) {
+            let now = self.clock.now_ms();
+            self.enter(&mut inner, &info, Some(reason), now);
+        }
+    }
+
+    /// O4's look ([`ClockPair::slept_since`]): whether the machine slept since the last look,
+    /// which this one becomes. On a protected store a sleep it finds while an unlock's check
+    /// is open voids that check (its yes does not count: `closed`), as a reported sleep
+    /// does — the tick may take the look before the check's own (final verifier 9).
+    fn look(&self, inner: &mut Inner) -> bool {
+        let now = ClockPair::now(&*self.clock);
+        let slept = now.slept_since(inner.last_tick);
+        inner.last_tick = now;
+        if slept && inner.protected {
+            if let Some(prompt) = inner.prompt.as_mut() {
+                prompt.closed = true;
+            }
+        }
+        slept
+    }
+
+    /// O4 between ticks: the vault access asks before each secret's use (Tasks 13, 15), so
+    /// the first read after a wake the OS did not report already finds the app locked, as
+    /// the holder refuses at the first request after one. On a protected, unlocked app a
+    /// sleep locks it with `OsSession` (the lock hook drops the key). Whether it locked.
+    pub fn check_sleep(&self) -> bool {
+        let info = self.auth.info();
+        let mut inner = self.lock_inner();
+        let slept = self.look(&mut inner);
+        if slept
+            && inner.protected
+            && inner.reason.is_none()
+            && in_effect(&inner.settings, &info, true)
+        {
+            let now = self.clock.now_ms();
+            self.enter(&mut inner, &info, Some(LockReason::OsSession), now);
+            return true;
+        }
+        false
     }
 
     /// Replace the settings the machine follows, once `persist` has saved them.
@@ -496,6 +675,15 @@ impl LockMachine {
         let info = self.auth.info();
         // Only this function changes the settings, one call at a time: what is checked here
         // is still what the change applies over once `persist` returns.
+        // D.4a T74, O7: while protected no pinned setting is switched off, nor Auto-lock set
+        // to Never; a value already saved off stays (the person's own, back when protection
+        // ends).
+        {
+            let inner = self.lock_inner();
+            if inner.protected && turns_a_pin_off(&inner.settings, &settings) {
+                return Err(DesktopError::LockRequired);
+            }
+        }
         let switching_on = settings.lock_enabled && !self.lock_inner().settings.lock_enabled;
         if switching_on && !info.available {
             return Err(DesktopError::AuthUnavailable {
@@ -517,7 +705,7 @@ impl LockMachine {
         inner.reason = reason;
         inner.since_ms = now;
         inner.seq += 1;
-        inner.minutes = reported_minutes(&inner.settings, info);
+        inner.minutes = reported_minutes(&inner.settings, info, inner.protected);
         self.locked.store(reason.is_some(), Ordering::SeqCst);
         if reason.is_some() {
             if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| self.auth.locked())) {
@@ -534,7 +722,7 @@ impl LockMachine {
     /// report it anew: an update, numbered as the next change. The other place the state
     /// changes, also under the machine's lock.
     fn report(&self, inner: &mut Inner, info: &AuthInfo) {
-        let minutes = reported_minutes(&inner.settings, info);
+        let minutes = reported_minutes(&inner.settings, info, inner.protected);
         if minutes != inner.minutes {
             inner.minutes = minutes;
             inner.seq += 1;
@@ -578,14 +766,52 @@ fn trip_prompt(cancel: Option<CancellationToken>) {
     }
 }
 
-fn in_effect(settings: &Settings, info: &AuthInfo) -> bool {
-    settings.lock_enabled && info.available
+/// How an unlock asks: the OS (its prompt, or its password through the app's field), or the
+/// store's own secret (the vault's field, D.4a T75).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Route {
+    Os,
+    StoreSecret,
+}
+
+/// The settings the machine follows: the saved ones, or while the store is protected the
+/// pinned ones (D.4a T74, O4, O7) — the lock on, at start and on sleep, and an idle time (a
+/// saved `Never` reads as 30 min). The file keeps the person's own values.
+pub fn pinned(settings: &Settings, protected: bool) -> Settings {
+    if !protected {
+        return settings.clone();
+    }
+    Settings {
+        lock_enabled: true,
+        lock_on_start: true,
+        lock_on_sleep: true,
+        auto_lock: if settings.auto_lock == AutoLock::Never {
+            AutoLock::Min30
+        } else {
+            settings.auto_lock
+        },
+        ..settings.clone()
+    }
+}
+
+/// Whether `new` switches off a pinned setting `old` has on, or moves Auto-lock to Never.
+fn turns_a_pin_off(old: &Settings, new: &Settings) -> bool {
+    (old.lock_enabled && !new.lock_enabled)
+        || (old.lock_on_start && !new.lock_on_start)
+        || (old.lock_on_sleep && !new.lock_on_sleep)
+        || (old.auto_lock != AutoLock::Never && new.auto_lock == AutoLock::Never)
+}
+
+/// On a protected store the vault's own field always opens the app (D.4a T74): the lock
+/// is in effect whatever the switch or the OS.
+fn in_effect(settings: &Settings, info: &AuthInfo, protected: bool) -> bool {
+    protected || (settings.lock_enabled && info.available)
 }
 
 /// The idle time a state reports: none while the lock is not in effect or set to never.
-fn reported_minutes(settings: &Settings, info: &AuthInfo) -> Option<u32> {
-    in_effect(settings, info)
-        .then(|| settings.auto_lock.minutes())
+fn reported_minutes(settings: &Settings, info: &AuthInfo, protected: bool) -> Option<u32> {
+    in_effect(settings, info, protected)
+        .then(|| pinned(settings, protected).auto_lock.minutes())
         .flatten()
 }
 
@@ -617,13 +843,13 @@ mod tests {
 
     use zeroize::Zeroizing;
 
-    use super::{LockChange, LockMachine, STARTUP_WITHIN};
+    use super::{pinned, LockChange, LockMachine, STARTUP_WITHIN};
     use crate::auth::test_os::{self, Call, ScriptedOs};
     use crate::auth::{
         AuthPurpose, Authenticator, FakeAuthenticator, NoAuthenticator, PasswordAnswer,
     };
     use crate::auth_cache::AuthCache;
-    use crate::errors::DesktopError;
+    use crate::errors::{DesktopError, Refusal};
     use crate::ops::test_clock::ManualClock;
     use crate::ops::test_trips;
 
@@ -937,7 +1163,10 @@ mod tests {
 
     // I-2, I-3. The machine reads the kept answer, never the OS, and starts within its bound.
 
-    /// An OS whose every `info` waits for the test to answer it; prompts verify at once.
+    /// An OS whose every `info` waits for the test to answer it, for as long as the test holds
+    /// its sender (dropped, it answers "no authenticator" at once); prompts verify at once.
+    /// Never on its own: a call that waits for the OS's answer waits until `within`'s guard
+    /// fails it, so no test tells "waited" by the clock (GOTCHA-332).
     struct Gated {
         answers: Mutex<mpsc::Receiver<AuthInfo>>,
         asked: AtomicUsize,
@@ -960,7 +1189,7 @@ mod tests {
             self.answers
                 .lock()
                 .unwrap()
-                .recv_timeout(LONG)
+                .recv()
                 .unwrap_or_else(|_| NoAuthenticator.info())
         }
 
@@ -981,12 +1210,11 @@ mod tests {
         let r = started(unlocked_at_start(), os.clone());
         answer.send(FakeAuthenticator::new().info()).unwrap();
         assert!(r.cache.settled(LONG));
-        // From here every question hangs.
+        // From here every question hangs: a call that waited for it would never return.
         r.cache.refresh();
-        let ((), took) = {
+        {
             let (machine, clock) = (r.machine.clone(), r.clock.clone());
             within("the lock's calls", move || {
-                let started = Instant::now();
                 machine.tick();
                 let _ = machine.state();
                 machine
@@ -997,10 +1225,9 @@ mod tests {
                 machine.unlock().unwrap();
                 clock.set(T0 + 10 * MIN);
                 machine.tick();
-                ((), started.elapsed())
-            })
-        };
-        assert!(took < LONG / 2, "{took:?}");
+            });
+        }
+        assert_eq!(r.cache.waits(), [LONG], "the calls waited for nothing");
         assert_eq!(
             r.machine.state().reason,
             Some(LockReason::Idle),
@@ -1012,9 +1239,12 @@ mod tests {
     #[test]
     fn without_lock_on_start_the_start_asks_nothing_and_waits_for_nothing() {
         let (os, answer) = Gated::new();
-        let started_at = Instant::now();
         let r = started(unlocked_at_start(), os.clone());
-        assert!(started_at.elapsed() < STARTUP_WITHIN, "it waited");
+        assert!(
+            r.cache.waits().is_empty(),
+            "it waited: {:?}",
+            r.cache.waits()
+        );
         assert_eq!(r.machine.state(), unlocked(T0, Some(10), 0));
         drop(answer);
     }
@@ -1022,13 +1252,10 @@ mod tests {
     #[test]
     fn a_slow_answer_starts_locked_within_the_bound() {
         let (os, answer) = Gated::new();
-        let started_at = Instant::now();
         let r = started(Settings::default(), os.clone());
-        let took = started_at.elapsed();
-        assert!(
-            took >= STARTUP_WITHIN && took < STARTUP_WITHIN + LONG / 4,
-            "{took:?}"
-        );
+        // It waited with its bound, and only that, and the answer never comes on its own: the
+        // start gave up at the bound (GOTCHA-332: the record, not the clock).
+        assert_eq!(r.cache.waits(), [STARTUP_WITHIN]);
         assert_eq!(
             r.machine.state(),
             locked(LockReason::Startup, T0, Some(10), 0)
@@ -2715,5 +2942,466 @@ mod tests {
             }
         }
         assert_eq!(r.machine.state().seq, 6);
+    }
+
+    // D.4a T74, T75, O4, O7: the lock over a protected store.
+
+    /// The machine over `auth` on a protected store, once the authenticator has answered.
+    fn rig_protected(settings: Settings, auth: Arc<dyn Authenticator>) -> Rig {
+        let clock = Arc::new(ManualClock::at(T0));
+        let hooked = Arc::new(Hooked::default());
+        let cache = AuthCache::new(auth);
+        let machine = {
+            let hooked = hooked.clone();
+            LockMachine::new_protected(
+                settings,
+                cache.clone(),
+                clock.clone(),
+                Box::new(move |state, change| {
+                    hooked.0.lock().unwrap().push((state.clone(), change))
+                }),
+                true,
+            )
+        };
+        assert!(cache.settled(LONG), "the authenticator never answered");
+        Rig {
+            clock,
+            hooked,
+            machine,
+            cache,
+        }
+    }
+
+    /// The person's own settings with every lock setting off.
+    fn all_off() -> Settings {
+        Settings {
+            lock_enabled: false,
+            lock_on_start: false,
+            lock_on_sleep: false,
+            auto_lock: AutoLock::Never,
+            ..Settings::default()
+        }
+    }
+
+    fn opens(machine: &LockMachine) {
+        machine
+            .unlock_with_store_secret(|_| Ok(()), |()| {})
+            .unwrap();
+    }
+
+    #[test]
+    fn pinned_follows_protection() {
+        let own = all_off();
+        assert_eq!(pinned(&own, false), own);
+        let p = pinned(&own, true);
+        assert!(p.lock_enabled && p.lock_on_start && p.lock_on_sleep);
+        assert_eq!(p.auto_lock, AutoLock::Min30);
+        assert_eq!(p.theme, own.theme);
+        let five = Settings {
+            auto_lock: AutoLock::Min5,
+            ..own
+        };
+        assert_eq!(pinned(&five, true).auto_lock, AutoLock::Min5);
+    }
+
+    #[test]
+    fn a_protected_store_starts_locked_whatever_the_settings_or_the_os() {
+        for auth in [Arc::new(NoAuthenticator) as Arc<dyn Authenticator>, fake()] {
+            let r = rig_protected(all_off(), auth);
+            let state = r.machine.state();
+            assert!(
+                state.locked && state.reason == Some(LockReason::Startup),
+                "{state:?}"
+            );
+            assert!(r.machine.protected() && r.machine.is_locked());
+            // A saved Never reads as 30 minutes while protected (O7).
+            assert_eq!(state.auto_lock_minutes, Some(30));
+        }
+    }
+
+    #[test]
+    fn while_protected_the_idle_and_the_sleep_locks_apply() {
+        let r = rig_protected(all_off(), Arc::new(NoAuthenticator));
+        opens(&r.machine);
+        assert!(!r.machine.is_locked());
+        r.clock.advance(30 * MIN);
+        r.machine.tick();
+        assert_eq!(r.machine.state().reason, Some(LockReason::Idle));
+        opens(&r.machine);
+        r.machine.os_session();
+        assert_eq!(r.machine.state().reason, Some(LockReason::OsSession));
+    }
+
+    #[test]
+    fn while_protected_a_save_never_turns_a_pin_off() {
+        let r = rig_protected(Settings::default(), fake());
+        let persisted = Arc::new(AtomicUsize::new(0));
+        let persist = |_: &Settings| {
+            persisted.fetch_add(1, SeqCst);
+            Ok(())
+        };
+        for off in [
+            Settings {
+                lock_enabled: false,
+                ..Settings::default()
+            },
+            Settings {
+                lock_on_start: false,
+                ..Settings::default()
+            },
+            Settings {
+                lock_on_sleep: false,
+                ..Settings::default()
+            },
+            Settings {
+                auto_lock: AutoLock::Never,
+                ..Settings::default()
+            },
+        ] {
+            let e = r.machine.set_settings(off.clone(), persist).unwrap_err();
+            assert!(matches!(e, DesktopError::LockRequired), "{off:?}: {e:?}");
+        }
+        assert_eq!(
+            persisted.load(SeqCst),
+            0,
+            "nothing refused reaches the file"
+        );
+        r.machine
+            .set_settings(
+                Settings {
+                    theme: Theme::Light,
+                    ..Settings::default()
+                },
+                persist,
+            )
+            .unwrap();
+        assert_eq!(persisted.load(SeqCst), 1);
+    }
+
+    /// What the person saved off before protecting stays saved — protection off brings it
+    /// back — while the pin holds: Lock now still locks.
+    #[test]
+    fn a_value_saved_off_stays_saved_and_the_pin_holds() {
+        let r = rig_protected(all_off(), fake());
+        let saved = Mutex::new(None);
+        r.machine
+            .set_settings(
+                Settings {
+                    theme: Theme::Light,
+                    ..all_off()
+                },
+                |s| {
+                    *saved.lock().unwrap() = Some(s.clone());
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert!(!saved.lock().unwrap().as_ref().unwrap().lock_enabled);
+        opens(&r.machine);
+        r.machine.lock(LockReason::Manual);
+        assert!(r.machine.is_locked());
+    }
+
+    #[test]
+    fn while_protected_the_os_unlocks_nothing_and_is_not_asked() {
+        let (auth, calls) = os(os_available(), AuthOutcome::Verified);
+        let r = rig_protected(unlocked_at_start(), auth);
+        let e = r.machine.unlock().unwrap_err();
+        assert!(
+            matches!(
+                e,
+                DesktopError::AuthUnavailable {
+                    reason: UnavailableReason::UsePasswordField
+                }
+            ),
+            "{e:?}"
+        );
+        let e = r
+            .machine
+            .unlock_with_password(typed("hunter2"))
+            .unwrap_err();
+        assert!(
+            matches!(
+                *e.error,
+                DesktopError::AuthUnavailable {
+                    reason: UnavailableReason::UsePasswordField
+                }
+            ),
+            "{e:?}"
+        );
+        assert!(r.machine.is_locked());
+        assert!(
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|c| !matches!(c, Call::Verify(_) | Call::Password(..))),
+            "the OS was asked"
+        );
+    }
+
+    /// The key is kept under the machine's lock before the transition: whoever hears of the
+    /// unlock finds it held.
+    #[test]
+    fn the_store_secret_s_key_is_kept_before_anyone_hears_of_the_unlock() {
+        let clock = Arc::new(ManualClock::at(T0));
+        let cache = AuthCache::new(Arc::new(NoAuthenticator));
+        let kept = Arc::new(AtomicBool::new(false));
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let machine = {
+            let (kept, heard) = (kept.clone(), heard.clone());
+            LockMachine::new_protected(
+                unlocked_at_start(),
+                cache.clone(),
+                clock,
+                Box::new(move |state, _| {
+                    heard
+                        .lock()
+                        .unwrap()
+                        .push((state.locked, kept.load(SeqCst)))
+                }),
+                true,
+            )
+        };
+        assert!(cache.settled(LONG));
+        machine
+            .unlock_with_store_secret(
+                |_| Ok(7),
+                |key: i32| {
+                    assert_eq!(key, 7);
+                    kept.store(true, SeqCst);
+                },
+            )
+            .unwrap();
+        assert_eq!(*heard.lock().unwrap(), vec![(false, true)]);
+    }
+
+    #[test]
+    fn a_refused_store_secret_keeps_it_locked_and_keeps_nothing() {
+        let r = rig_protected(unlocked_at_start(), Arc::new(NoAuthenticator));
+        let kept = AtomicBool::new(false);
+        let e = r
+            .machine
+            .unlock_with_store_secret(
+                |_| {
+                    Err::<(), _>(Refusal::new(
+                        DesktopError::AuthFailed {
+                            exhausted: false,
+                            retry_in_ms: None,
+                        },
+                        vec!["said".into()],
+                    ))
+                },
+                |()| kept.store(true, SeqCst),
+            )
+            .unwrap_err();
+        assert!(matches!(*e.error, DesktopError::AuthFailed { .. }), "{e:?}");
+        assert_eq!(e.messages, ["said"]);
+        assert!(r.machine.is_locked() && !kept.load(SeqCst));
+    }
+
+    /// A session event while the secret is checked closes the check: its yes does not count,
+    /// and nothing is kept.
+    #[test]
+    fn a_lock_during_the_store_secret_check_refuses_its_yes() {
+        let r = rig_protected(unlocked_at_start(), Arc::new(NoAuthenticator));
+        let machine = r.machine.clone();
+        let kept = AtomicBool::new(false);
+        let e = r
+            .machine
+            .unlock_with_store_secret(
+                |_| {
+                    machine.os_session();
+                    Ok(())
+                },
+                |()| kept.store(true, SeqCst),
+            )
+            .unwrap_err();
+        assert!(matches!(*e.error, DesktopError::AuthCancelled), "{e:?}");
+        assert!(r.machine.is_locked() && !kept.load(SeqCst));
+    }
+
+    #[test]
+    fn protection_ending_while_locked_unlocks_only_where_the_lock_is_not_in_effect() {
+        // The lock off in the saved settings: nothing could open the app once it is gone.
+        let r = rig_protected(all_off(), fake());
+        r.machine.set_protected(false);
+        assert!(!r.machine.is_locked() && !r.machine.protected());
+        // The lock on, and an OS that can verify: it stays locked, for the OS to open.
+        let r = rig_protected(Settings::default(), fake());
+        r.machine.set_protected(false);
+        assert!(r.machine.is_locked());
+    }
+
+    #[test]
+    fn protection_on_pins_without_locking_and_lock_unlocked_leaves_a_locked_app() {
+        let r = rig(
+            Settings {
+                lock_enabled: false,
+                ..unlocked_at_start()
+            },
+            fake(),
+        );
+        assert!(!r.machine.is_locked());
+        assert_eq!(r.machine.state().auto_lock_minutes, None);
+        r.machine.set_protected(true);
+        assert!(
+            !r.machine.is_locked(),
+            "the shell decides, by the key it holds"
+        );
+        assert_eq!(r.machine.state().auto_lock_minutes, Some(10));
+        r.machine.lock_unlocked(LockReason::SecretsLocked);
+        assert_eq!(r.machine.state().reason, Some(LockReason::SecretsLocked));
+        r.machine.lock_unlocked(LockReason::Idle);
+        assert_eq!(
+            r.machine.state().reason,
+            Some(LockReason::SecretsLocked),
+            "a locked app is left as it is"
+        );
+    }
+
+    /// O4, as the holder has it: a sleep the OS did not report — the clock that counts suspend
+    /// more than 5 s ahead of the one that does not, since the last look — locks a protected
+    /// app as a reported sleep does (the lock hook then drops the key). Exactly 5 s is no sleep.
+    #[test]
+    fn while_protected_an_unreported_sleep_locks_on_the_next_tick() {
+        let r = rig_protected(all_off(), Arc::new(NoAuthenticator));
+        opens(&r.machine);
+        r.machine.tick();
+        r.clock.sleep(5_000);
+        r.machine.tick();
+        assert!(!r.machine.is_locked(), "{:?}", r.machine.state());
+        r.clock.sleep(5_001);
+        r.machine.tick();
+        assert_eq!(r.machine.state().reason, Some(LockReason::OsSession));
+    }
+
+    /// Between ticks, a secret's use looks first (`check_sleep`, the vault access's hook): the
+    /// first read after the wake already finds the app locked.
+    #[test]
+    fn a_look_between_ticks_finds_the_sleep_too() {
+        let r = rig_protected(all_off(), Arc::new(NoAuthenticator));
+        opens(&r.machine);
+        assert!(!r.machine.check_sleep());
+        r.clock.sleep(60_000);
+        assert!(r.machine.check_sleep());
+        assert_eq!(r.machine.state().reason, Some(LockReason::OsSession));
+    }
+
+    /// A wall clock that steps (a time sync, the date changed) is no sleep: O4 never reads it
+    /// (the Rust verifier's finding 4).
+    #[test]
+    fn a_wall_clock_step_is_no_sleep() {
+        let r = rig_protected(all_off(), Arc::new(NoAuthenticator));
+        opens(&r.machine);
+        r.machine.tick();
+        r.clock.set_wall(T0 + 10 * MIN);
+        r.machine.tick();
+        assert!(!r.machine.is_locked(), "{:?}", r.machine.state());
+    }
+
+    /// A store in files keeps D.2's behaviour: no lock on a gap the OS did not report.
+    #[test]
+    fn an_unreported_sleep_locks_only_a_protected_app() {
+        let r = rig(unlocked_at_start(), fake());
+        r.machine.tick();
+        r.clock.sleep(MIN);
+        r.machine.tick();
+        assert!(!r.machine.check_sleep());
+        assert!(!r.machine.is_locked(), "{:?}", r.machine.state());
+    }
+
+    /// A sleep while the app is locked is not the next unlock's to end.
+    #[test]
+    fn a_sleep_while_locked_does_not_lock_the_unlock_that_follows() {
+        let r = rig_protected(all_off(), Arc::new(NoAuthenticator));
+        r.machine.tick();
+        r.clock.sleep(10 * MIN);
+        opens(&r.machine);
+        r.machine.tick();
+        assert!(!r.machine.is_locked(), "{:?}", r.machine.state());
+    }
+
+    /// The final verifier's finding 9: a sleep the OS does not report, while the store's
+    /// secret is being checked (the lid closed on a submitted password), voids the check —
+    /// whether the check's own look finds it or a tick took the look first.
+    #[test]
+    fn a_sleep_during_the_check_voids_the_unlock() {
+        for tick_first in [false, true] {
+            let r = rig_protected(all_off(), Arc::new(NoAuthenticator));
+            let kept = std::cell::Cell::new(false);
+            let e = r
+                .machine
+                .unlock_with_store_secret(
+                    |_| {
+                        r.clock.sleep(6_000);
+                        if tick_first {
+                            r.machine.tick();
+                        }
+                        Ok(())
+                    },
+                    |()| kept.set(true),
+                )
+                .unwrap_err();
+            assert!(
+                matches!(*e.error, DesktopError::AuthCancelled),
+                "{tick_first}: {e:?}"
+            );
+            assert!(!kept.get() && r.machine.is_locked(), "{tick_first}");
+            // The next check, with no sleep in it, opens.
+            opens(&r.machine);
+            assert!(!r.machine.is_locked(), "{tick_first}");
+        }
+    }
+
+    /// The final verifier's finding 8: the shell's re-read decides under the machine's lock —
+    /// `keep` yes leaves the app unlocked; no locks it; a locked app is left locked.
+    #[test]
+    fn lock_unlocked_unless_asks_keep_under_the_machine_s_lock() {
+        let r = rig_protected(all_off(), Arc::new(NoAuthenticator));
+        opens(&r.machine);
+        let asked = std::cell::Cell::new(0);
+        r.machine
+            .lock_unlocked_unless(LockReason::SecretsLocked, || {
+                asked.set(asked.get() + 1);
+                // The machine's lock is held while `keep` runs: nothing else can take it now.
+                assert!(r.machine.inner.try_lock().is_err());
+                true
+            });
+        assert!(!r.machine.is_locked());
+        r.machine
+            .lock_unlocked_unless(LockReason::SecretsLocked, || false);
+        assert_eq!(r.machine.state().reason, Some(LockReason::SecretsLocked));
+        r.machine
+            .lock_unlocked_unless(LockReason::SecretsLocked, || {
+                asked.set(asked.get() + 1);
+                true
+            });
+        assert!(r.machine.is_locked() && asked.get() == 2);
+    }
+
+    /// Correction (run 2): a late answer that nothing can verify the owner lifts a provisional
+    /// start's lock (rule 3) — but not once the store is protected, where the vault's own field
+    /// opens the app and the OS decides nothing (T75). The protection came before the answer,
+    /// and changed nothing the page hears (the pinned idle time is the one in use), so only the
+    /// protection keeps the lock.
+    #[test]
+    fn a_late_unavailable_lifts_nothing_once_the_store_is_protected() {
+        let (os, answer) = Gated::new();
+        let r = started(Settings::default(), os.clone());
+        r.machine.set_protected(true);
+        assert_eq!(r.machine.state().seq, 0, "nothing the page hears moved");
+        answer.send(NoAuthenticator.info()).unwrap();
+        assert!(r.cache.settled(LONG));
+        let state = r.machine.state();
+        assert!(
+            state.locked && state.reason == Some(LockReason::Startup),
+            "{state:?}"
+        );
+        assert!(
+            r.hooked.calls().iter().all(|s| s.locked),
+            "{:?}",
+            r.hooked.calls()
+        );
     }
 }

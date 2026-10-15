@@ -1,0 +1,13 @@
+$ apprafter target show
+[exit 1]
+[stdout]
+[stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m target show invoked <ESC>[3mtarget<ESC>[0m<ESC>[2m=<ESC>[0mgone
+Error: apprafter::target::not_found
+
+  × target `gone` not found (available: prod, staging)
+  help: No target named `gone` is configured here. `apprafter target list`
+        lists the targets that are; `apprafter target add gone --provider
+        hetzner-cloud …` creates it. An empty `available:` list means this
+        store has no targets yet — start with `apprafter target add`.
+

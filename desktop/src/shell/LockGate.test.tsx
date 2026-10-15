@@ -8,16 +8,19 @@ import {
 } from '@tanstack/react-query';
 import { emit } from '@tauri-apps/api/event';
 import { clearMocks, mockIPC, mockWindows } from '@tauri-apps/api/mocks';
-import { act, cleanup, render, screen } from '@testing-library/react';
+import { act, cleanup, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { useEffect } from 'react';
-import { LOCK_CHANGED } from '../ipc/generated/events';
+import type { AppInfo } from '../ipc/generated/AppInfo';
+import { LOCK_CHANGED, STORE_CHANGED } from '../ipc/generated/events';
 import type { LockState } from '../ipc/generated/LockState';
 import { attach, operationsSnapshot, resetOperations } from '../ipc/operations';
 import { ACTIVITY_INTERVAL_MS } from '../state/lock';
-import { APP_INFO_KEY, PlatformContext } from '../state/platform';
+import { STORE_FIELD_PLACEHOLDER } from '../state/lockText';
+import { APP_INFO_KEY, PlatformContext, usePlatform } from '../state/platform';
 import { createQueryClient } from '../state/queryClient';
 import { appInfo, authInfo, lockState } from '../test/fixtures';
+import { settleIpc } from '../test/settle';
 import { LockGate } from './LockGate';
 import { PlatformGate } from './PlatformGate';
 
@@ -48,7 +51,7 @@ beforeEach(() => {
 afterEach(async () => {
   cleanup();
   notifyManager.setScheduler(defaultScheduler);
-  await settle();
+  await settleIpc();
   resetOperations();
   clearMocks();
 });
@@ -326,5 +329,138 @@ describe('LockGate under the PlatformGate: the field a lock puts in question', (
     );
     expect(await screen.findByLabelText('System password')).toBeDefined();
     expect(calls.filter((c) => c === 'app_info')).toHaveLength(1);
+  });
+});
+
+// D.4a F17: the Shell, which reads app_info again on the window's focus and on Rust's word that
+// the store changed, is unmounted while locked; the lock screen lived on what app_info said
+// before the lock (P-6, P-7) and kept asking for a lock password a terminal's `lock off` had
+// removed (D-5). The first views after the unlock kept it too.
+describe('LockGate: the lock screen follows the target store', () => {
+  const PAM = appInfo({ auth: authInfo({ method: 'pam', passwordField: true }) });
+  const PROTECTED = appInfo({
+    secrets: {
+      mode: 'locked',
+      slots: ['password', 'recovery_key'],
+      protected: true,
+      store: '~/.config/apprafter',
+      problem: null,
+    },
+  });
+
+  /**
+   * app_info answers from `answers` in turn, then the last one again (an answer can be held);
+   * `changeTo(info)` makes `info` every later answer: the store changed.
+   */
+  function platform(answers: (AppInfo | Promise<AppInfo>)[], lock: LockState = lockState()) {
+    const queue = [...answers];
+    let reads = 0;
+    mockIPC(
+      (cmd) => {
+        calls.push(cmd);
+        if (cmd === 'app_info') {
+          reads += 1;
+          return queue.length > 1 ? queue.shift() : queue[0];
+        }
+        if (cmd === 'lock_status') return lock;
+        if (cmd === 'op_subscribe') return { subscription: calls.length, replay: [] };
+        if (cmd === 'plugin:window|is_maximized') return false;
+        return null;
+      },
+      { shouldMockEvents: true },
+    );
+    return {
+      reads: () => reads,
+      changeTo: (info: AppInfo) => {
+        queue.splice(0, queue.length, info);
+      },
+    };
+  }
+
+  function Probe() {
+    const info = usePlatform();
+    return <div>{`the shell; secrets ${info.secrets.protected ? 'protected' : 'in files'}`}</div>;
+  }
+
+  function gated() {
+    render(
+      <QueryClientProvider client={createQueryClient()}>
+        <PlatformGate>
+          <LockGate>
+            <Probe />
+          </LockGate>
+        </PlatformGate>
+      </QueryClientProvider>,
+    );
+  }
+
+  test('locked, the window gaining the focus reads app_info again; the field being typed into stays', async () => {
+    let answer!: (info: AppInfo) => void;
+    const app = platform([PAM, new Promise<AppInfo>((resolve) => (answer = resolve))]);
+    gated();
+    expect(await screen.findByLabelText('System password')).toBeDefined();
+    expect(app.reads()).toBe(1);
+    await act(async () => {
+      await emit('tauri://focus', null);
+      await settle();
+    });
+    expect(app.reads()).toBe(2);
+    // Nothing put the field in question: it stays while app_info is read.
+    expect(screen.getByLabelText('System password')).toBeDefined();
+    await act(async () => {
+      answer(PAM);
+      await settle();
+    });
+    expect(screen.getByLabelText('System password')).toBeDefined();
+  });
+
+  test("locked, Rust's word that the store changed reads app_info again, the field withheld until it answers", async () => {
+    let answer!: (info: AppInfo) => void;
+    const app = platform([PAM, new Promise<AppInfo>((resolve) => (answer = resolve))]);
+    gated();
+    expect(await screen.findByLabelText('System password')).toBeDefined();
+    await act(async () => {
+      await emit(STORE_CHANGED, null);
+      await settle();
+    });
+    expect(app.reads()).toBe(2);
+    expect(screen.queryByLabelText('System password')).toBeNull();
+    await act(async () => {
+      answer(PAM);
+      await settle();
+    });
+    expect(screen.getByLabelText('System password')).toBeDefined();
+  });
+
+  test("D-5: a terminal's lock off under the locked app; the lock screen offers the system's Unlock with no focus", async () => {
+    platform([PROTECTED, appInfo()]);
+    gated();
+    expect(await screen.findByPlaceholderText(STORE_FIELD_PLACEHOLDER)).toBeDefined();
+    await act(async () => {
+      await emit(STORE_CHANGED, null);
+      await settle();
+    });
+    // The store's field goes (its own submit button is called Unlock too); the OS's Unlock stays.
+    await waitFor(() =>
+      expect(screen.queryByPlaceholderText(STORE_FIELD_PLACEHOLDER) === null).toBe(true),
+    );
+    expect(screen.getByRole('button', { name: 'Unlock' })).toBeDefined();
+  });
+
+  test('an unlock reads app_info again before it follows the operations again; the page shows the answer with no focus', async () => {
+    const app = platform([PROTECTED], lockState({ locked: false }));
+    expect(app.reads()).toBe(0);
+    gated();
+    expect(await screen.findByText('the shell; secrets protected')).toBeDefined();
+    attach(7);
+    await changed(lockState({ reason: 'manual', seq: 1 }));
+    // The store changes while locked, unheard (a folder below the root: P-6).
+    app.changeTo(appInfo());
+    const before = calls.length;
+    await changed(lockState({ locked: false, seq: 2 }));
+    const after = calls.slice(before);
+    expect(after.indexOf('app_info')).toBeGreaterThanOrEqual(0);
+    expect(after.indexOf('app_info')).toBeLessThan(after.indexOf('op_subscribe'));
+    expect(await screen.findByText('the shell; secrets in files')).toBeDefined();
   });
 });

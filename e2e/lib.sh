@@ -821,43 +821,236 @@ k3d_down() {
 }
 
 # ---------------------------------------------------------------
+# e2e_isolate_store [<dir>]
+#   Puts every CLI call of this walk on a target store of its own (D.4a
+#   T9, ADR 0068 §9). <dir> (default: a new `mktemp -d`, removed by
+#   e2e_isolation_cleanup) gains home/ (with .ssh/, 0700), run/ (0700),
+#   tmp/ and apprafter-config/. Exports
+#     APPRAFTER_CONFIG_DIR  <dir>/apprafter-config
+#     APPRAFTER_AGE_KEY     <dir>/age.key
+#     APPRAFTER_SANDBOX     <dir>   (the CLI refuses a store, home, key or
+#                                    runtime path outside it)
+#     E2E_SANDBOX_DIR       <dir>
+#     E2E_APPRAFTER_RUN     <dir>/run
+#   With APPRAFTER_E2E_STORE=<store> (a store in files the owner named
+#   for agent work, e.g. the agent playground) the walk uses that store:
+#   APPRAFTER_CONFIG_DIR=<store>, APPRAFTER_AGE_KEY=<store>/age.key unless
+#   the caller exported one, and <store> joins APPRAFTER_SANDBOX.
+#   HOME, XDG_RUNTIME_DIR and TMPDIR are NEVER exported: the CLI wrappers
+#   below set them for each call only, so podman and kind keep the real
+#   home and runroot ($XDG_RUNTIME_DIR/containers). The wrappers also turn
+#   the CLI's startup checks off for each call; a call that asserts what
+#   they print asks for them: E2E_STARTUP_CHECKS=1 apprafter whoami.
+# ---------------------------------------------------------------
+e2e_isolate_store() {
+    local dir="${1:-}"
+    E2E_SANDBOX_OWNED=0
+    if [ -z "$dir" ]; then
+        dir="$(mktemp -d -t apprafter-e2e.XXXXXX)" || return 1
+        E2E_SANDBOX_OWNED=1
+    fi
+    mkdir -p "$dir/home/.ssh" "$dir/run" "$dir/tmp" "$dir/bin" "$dir/apprafter-config" || return 1
+    chmod 700 "$dir/home/.ssh" "$dir/run" || return 1
+    dir="$(cd "$dir" && pwd)" || return 1
+    export E2E_SANDBOX_DIR="$dir" E2E_APPRAFTER_RUN="$dir/run" E2E_SANDBOX_OWNED
+    if [ -n "${APPRAFTER_E2E_STORE:-}" ]; then
+        if [ ! -d "$APPRAFTER_E2E_STORE" ]; then
+            printf 'e2e: APPRAFTER_E2E_STORE=%s is not a directory\n' "$APPRAFTER_E2E_STORE" >&2
+            return 2
+        fi
+        local store
+        store="$(cd "$APPRAFTER_E2E_STORE" && pwd)" || return 1
+        export APPRAFTER_CONFIG_DIR="$store"
+        export APPRAFTER_AGE_KEY="${APPRAFTER_AGE_KEY:-$store/age.key}"
+        export APPRAFTER_SANDBOX="$dir:$store"
+    else
+        export APPRAFTER_CONFIG_DIR="$dir/apprafter-config"
+        export APPRAFTER_AGE_KEY="$dir/age.key"
+        export APPRAFTER_SANDBOX="$dir"
+    fi
+}
+
+# ---------------------------------------------------------------
+# e2e_require_ssh_key (--file <public key file> | --body "<public key line>")
+#   For a walk that SSHes to a real node: the CLI fetches the kubeconfig
+#   with the default identity of the home it runs with, which is now the
+#   sandbox's. Fails early (exit 2, a named message) when
+#   APPRAFTER_E2E_SSH_KEY is unset or unreadable and, when ssh-keygen can
+#   read it without a passphrase, when its public half is not the one the
+#   walk uploads. Copies it to $E2E_SANDBOX_DIR/home/.ssh/id_ed25519
+#   (0600); call e2e_isolation_cleanup from the walk's EXIT trap.
+# ---------------------------------------------------------------
+e2e_require_ssh_key() {
+    _e2e_require_isolation || return 2
+    local want have
+    case "${1:-}" in
+        --file) want="$(cat "$2")" || return 2 ;;
+        --body) want="$2" ;;
+        *) printf 'e2e_require_ssh_key: --file <public key file> or --body <public key line>\n' >&2; return 2 ;;
+    esac
+    if [ -z "${APPRAFTER_E2E_SSH_KEY:-}" ] || [ ! -r "$APPRAFTER_E2E_SSH_KEY" ]; then
+        printf 'e2e: set APPRAFTER_E2E_SSH_KEY to the private key whose public half this walk uploads; the CLI runs with the home %s, so ~/.ssh/id_ed25519 is not its key\n' "$E2E_SANDBOX_DIR/home" >&2
+        return 2
+    fi
+    if have="$(ssh-keygen -y -P '' -f "$APPRAFTER_E2E_SSH_KEY" 2>/dev/null)"; then
+        if [ "$(awk '{print $1" "$2}' <<<"$have")" != "$(awk '{print $1" "$2}' <<<"$want")" ]; then
+            printf 'e2e: APPRAFTER_E2E_SSH_KEY (%s) is not the private half of the public key this walk uploads\n' "$APPRAFTER_E2E_SSH_KEY" >&2
+            return 2
+        fi
+    else
+        printf 'e2e: note: APPRAFTER_E2E_SSH_KEY is passphrase-protected; it is not checked against the uploaded public key\n' >&2
+    fi
+    install -m 600 "$APPRAFTER_E2E_SSH_KEY" "$E2E_SANDBOX_DIR/home/.ssh/id_ed25519"
+}
+
+# ---------------------------------------------------------------
+# e2e_isolation_cleanup [--keep-store]
+#   Removes the private key e2e_require_ssh_key copied, and the sandbox
+#   e2e_isolate_store made itself (no <dir> given) unless --keep-store.
+#   A no-op before e2e_isolate_store; never fails.
+# ---------------------------------------------------------------
+e2e_isolation_cleanup() {
+    [ -n "${E2E_SANDBOX_DIR:-}" ] || return 0
+    rm -f "$E2E_SANDBOX_DIR/home/.ssh/id_ed25519"
+    if [ "${1:-}" != "--keep-store" ] && [ "${E2E_SANDBOX_OWNED:-0}" = 1 ]; then
+        rm -rf "$E2E_SANDBOX_DIR"
+    fi
+    return 0
+}
+
+_e2e_require_isolation() {
+    if [ -z "${APPRAFTER_SANDBOX:-}" ] || [ -z "${E2E_SANDBOX_DIR:-}" ]; then
+        printf 'e2e: call e2e_isolate_store before running the CLI (without it the CLI uses the default target store of whoever runs the walk)\n' >&2
+        return 2
+    fi
+}
+
+# The CLI built from this checkout, or $APPRAFTER_BIN when set (the
+# isolation self-test hands it the binary `cargo test` built). cargo runs
+# in the caller's own environment — it needs the real HOME for its
+# registry and toolchain; only the CLI gets the sandbox.
+_e2e_source_cli() {
+    if [ -n "${APPRAFTER_BIN:-}" ]; then
+        printf '%s\n' "$APPRAFTER_BIN"
+        return 0
+    fi
+    (cd "${REPO_ROOT}/cli" && cargo build --quiet --bin apprafter) >&2 || return 1
+    local target="${CARGO_TARGET_DIR:-${REPO_ROOT}/cli/target}"
+    case "$target" in
+        /*) ;;
+        *) target="${REPO_ROOT}/cli/${target}" ;;
+    esac
+    printf '%s\n' "${target}/debug/apprafter"
+}
+
+# Run the CLI binary $1 with this walk's isolation: HOME, XDG_RUNTIME_DIR
+# and TMPDIR for this call only. The startup checks are off (cargo's [env]
+# used to turn them off for `cargo run`; a walk's own
+# APPRAFTER_SKIP_STARTUP_CHECKS is kept) unless the call sets
+# E2E_STARTUP_CHECKS=1, which runs them (node-disk-pressure asserts the
+# banner they print).
+_e2e_run_cli() {
+    local bin="$1"
+    shift
+    if [ "${E2E_STARTUP_CHECKS:-0}" = 1 ]; then
+        HOME="${E2E_SANDBOX_DIR}/home" \
+            XDG_RUNTIME_DIR="${E2E_APPRAFTER_RUN}" \
+            TMPDIR="${E2E_SANDBOX_DIR}/tmp" \
+            env -u APPRAFTER_SKIP_STARTUP_CHECKS "$bin" "$@"
+    else
+        HOME="${E2E_SANDBOX_DIR}/home" \
+            XDG_RUNTIME_DIR="${E2E_APPRAFTER_RUN}" \
+            TMPDIR="${E2E_SANDBOX_DIR}/tmp" \
+            APPRAFTER_SKIP_STARTUP_CHECKS="${APPRAFTER_SKIP_STARTUP_CHECKS:-1}" \
+            "$bin" "$@"
+    fi
+}
+
+# ---------------------------------------------------------------
 # apprafter <args...>
-#   Run the AppRafter CLI from source so changes under cli/ are
-#   always reflected without a separate install step.
+#   The CLI from source (so changes under cli/ are always reflected), on
+#   the walk's isolated store, with cli/ as its working directory.
+# apprafter_in <dir> <args...>
+#   The same with <dir> as its working directory (`app add` reads
+#   <cwd>/apprafter/Application.cue).
+# apprafter_bin [<binary>]
+#   For walks that time or wrap the CLI (`timeout 1500 "$APPRAFTER" up`):
+#   writes an executable that runs <binary> (default $APPRAFTER_BIN, else
+#   the release build) with the walk's isolation, and prints its path.
+#   Use: APPRAFTER="$(apprafter_bin)".
+# All three refuse (exit 2) before e2e_isolate_store.
 # ---------------------------------------------------------------
 apprafter() {
-    (cd "${REPO_ROOT}/cli" && cargo run --quiet --bin apprafter -- "$@")
+    _e2e_require_isolation || return 2
+    local bin
+    bin="$(_e2e_source_cli)" || return 1
+    (cd "${REPO_ROOT}/cli" && _e2e_run_cli "$bin" "$@")
+}
+
+apprafter_in() {
+    _e2e_require_isolation || return 2
+    local dir="$1" bin
+    shift
+    bin="$(_e2e_source_cli)" || return 1
+    (cd "$dir" && _e2e_run_cli "$bin" "$@")
+}
+
+apprafter_bin() {
+    _e2e_require_isolation || return 2
+    local bin="${1:-${APPRAFTER_BIN:-${REPO_ROOT}/cli/target/release/apprafter}}"
+    if [ ! -x "$bin" ]; then
+        printf 'e2e: apprafter_bin: %s is not an executable (cargo build --release --bin apprafter, in cli/)\n' "$bin" >&2
+        return 2
+    fi
+    local wrapper="${E2E_SANDBOX_DIR}/bin/apprafter"
+    {
+        printf '#!/usr/bin/env bash\n'
+        printf '# Written by e2e/lib.sh apprafter_bin: %s with the isolation of its walk, per call.\n' "$bin"
+        printf '[ -n "${APPRAFTER_SANDBOX:-}" ] || { echo "e2e: %s runs only inside its walk" >&2; exit 2; }\n' "$wrapper"
+        printf 'export HOME=%q XDG_RUNTIME_DIR=%q TMPDIR=%q\n' \
+            "${E2E_SANDBOX_DIR}/home" "${E2E_APPRAFTER_RUN}" "${E2E_SANDBOX_DIR}/tmp"
+        printf 'if [ "${E2E_STARTUP_CHECKS:-0}" = 1 ]; then unset APPRAFTER_SKIP_STARTUP_CHECKS\n'
+        printf 'else export APPRAFTER_SKIP_STARTUP_CHECKS="${APPRAFTER_SKIP_STARTUP_CHECKS:-1}"; fi\n'
+        printf 'exec %q "$@"\n' "$bin"
+    } >"$wrapper" || return 1
+    chmod 755 "$wrapper" || return 1
+    printf '%s\n' "$wrapper"
 }
 
 # ---------------------------------------------------------------
 # ensure_restic_on_path
-#   The 2.6d backup/restore CLI shells out to `restic` via
-#   `Command::new("restic")`, so restic MUST be resolvable on $PATH
-#   for the CLI subprocess (NOT just inside this shell). When the bare
-#   binary is absent (a fresh nix-dev checkout), install a thin wrapper
-#   under a temp bin dir and PREPEND it to $PATH so both this shell and
-#   the `cargo run` child inherit it. The wrapper execs
-#   `nix run nixpkgs#restic --` (the project's standard
-#   missing-binary fallback — same pattern as ~/bin/cue / ~/bin/helm).
-#   Idempotent: a no-op when restic is already on $PATH.
-#   Modifies $PATH IN THE CURRENT SHELL (so the `cargo run` child inherits it)
-#   and sets the global RESTIC_WRAPPER_BIN_DIR to the wrapper dir (empty when
-#   restic was already present) so the caller can clean it up. Call WITHOUT a
-#   subshell (`ensure_restic_on_path`, not `$(ensure_restic_on_path)`), else
-#   the PATH export is lost with the subshell.
+#   The backup/restore CLI shells out to `restic` (`Command::new("restic")`),
+#   so restic MUST be on $PATH for the CLI (NOT just inside this shell).
+#   When it is absent (a fresh nix-dev checkout), resolve it ONCE, here, in
+#   the caller's environment (`nix build nixpkgs#restic`, with the caller's
+#   nix settings and caches), and PREPEND a temp dir holding a link to it:
+#   the CLI runs with the walk's scratch HOME (e2e_isolate_store), where a
+#   `nix run` wrapper would meet neither.
+#   Idempotent: a no-op when restic is already on $PATH. Modifies $PATH IN
+#   THE CURRENT SHELL and sets the global RESTIC_WRAPPER_BIN_DIR to the temp
+#   dir (empty when restic was already present) so the caller can remove
+#   it. Call WITHOUT a subshell (`ensure_restic_on_path`, not
+#   `$(ensure_restic_on_path)`), else the PATH export is lost with it.
 # ---------------------------------------------------------------
 RESTIC_WRAPPER_BIN_DIR=""
 ensure_restic_on_path() {
     if command -v restic >/dev/null 2>&1; then
         return 0
     fi
-    local bindir
-    bindir="$(mktemp -d -t apprafter-restic-bin.XXXXXX)"
-    cat >"${bindir}/restic" <<'WRAP'
-#!/usr/bin/env bash
-exec nix run nixpkgs#restic -- "$@"
-WRAP
-    chmod +x "${bindir}/restic"
+    local outs out="" path bindir
+    outs="$(nix build --no-link --print-out-paths nixpkgs#restic)" || return 1
+    # One path per output; the binary is in the one with bin/restic.
+    while IFS= read -r path; do
+        if [ -x "$path/bin/restic" ]; then
+            out="$path"
+        fi
+    done <<<"$outs"
+    if [ -z "$out" ]; then
+        printf 'e2e: nix build nixpkgs#restic gave no bin/restic (%s)\n' "$outs" >&2
+        return 1
+    fi
+    bindir="$(mktemp -d -t apprafter-restic-bin.XXXXXX)" || return 1
+    ln -s "$out/bin/restic" "${bindir}/restic" || return 1
     PATH="${bindir}:${PATH}"
     export PATH
     RESTIC_WRAPPER_BIN_DIR="$bindir"

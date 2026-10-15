@@ -24,6 +24,9 @@
 #   RESTIC_PASSWORD         — restic repo passphrase.
 #   APPRAFTER_S3_ENDPOINT   — e.g. nbg1.your-objectstorage.com
 #   APPRAFTER_S3_BUCKET     — bucket name, e.g. ar-test
+#   APPRAFTER_E2E_SSH_KEY   — the private half of the public key the walk uploads
+#                             (APPRAFTER_SSH_PUBLIC_KEY_PATH, default id_ed25519.pub);
+#                             the CLI's SSH fetch of the kubeconfig uses it.
 # Optional: APPRAFTER_S3_REGION, APPRAFTER_SSH_PUBLIC_KEY_PATH (default id_ed25519).
 #
 # Exit 0 = GREEN (all legs ok + project=0). Non-zero = a leg FAILED (grep FAILED)
@@ -52,8 +55,8 @@ command -v restic >/dev/null 2>&1 || { printf 'ERROR: restic unavailable\n' >&2;
 
 # Isolated CLI state (never touch the operator's real targets).
 WORK="$(mktemp -d -t bux-e2e.XXXXXX)"
-export APPRAFTER_CONFIG_DIR="${WORK}/config"
-export APPRAFTER_AGE_KEY="${WORK}/age.key"
+e2e_isolate_store "${WORK}"
+e2e_require_ssh_key --file "$SSH_PUB"
 mkdir -p "$APPRAFTER_CONFIG_DIR"
 
 # The operator-side dotenv --credential-file consumes: NEUTRAL S3_* keys.
@@ -81,6 +84,7 @@ cleanup() {
         restic -r "$REPO" forget --keep-last 0 --prune >/dev/null 2>&1 || \
         printf '  note: S3 restic repo %s left as-is (manual prune if desired)\n' "$REPO" >&2
     if $HZ verify "$HCLOUD_TOKEN"; then ok "project swept to zero"; else printf '  FAILED: project NOT empty after sweep\n' >&2; rc=1; fi
+    e2e_isolation_cleanup
     rm -rf "$WORK"
     if [ "$FAILED" -ne 0 ] || [ "$rc" -ne 0 ]; then
         printf '\n===== backup-ux walk: RED =====\n' >&2; exit 1

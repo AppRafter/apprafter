@@ -11,6 +11,14 @@ on:
   pull_request:
   push:
     branches: [main, master]
+  # D.4a T22: how long the vault's release Argon2id derivation takes on each CI OS, on demand
+  # only (Actions › test › Run workflow, `kdf_timing`). A dispatch runs nothing else.
+  workflow_dispatch:
+    inputs:
+      kdf_timing:
+        description: Time the vault's release key derivation on Linux, macOS and Windows
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -18,6 +26,7 @@ permissions:
 jobs:
   changes:
     name: detect stack changes
+    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 2
     outputs:
@@ -152,6 +161,29 @@ jobs:
             skip=(-- --skip engine::tests::ensure_repo_initialises_a_missing_local_repo_and_creates_its_parent)
           fi
           cargo test --workspace --exclude apprafter-backup --exclude docsgen --all-features --no-fail-fast "${skip[@]}"
+      # D.4a G8: no unlock holder outlives the tests. Each holder test ends its holders and the
+      # spawn point's drop kills and fails on any it leaves; this is the backstop for one that
+      # slipped past both. `always()`: a red run is when a leak is likeliest. The script kills
+      # what it finds, so it runs here and never on a person's computer.
+      - if: always() && runner.os != 'Windows'
+        name: no holder outlives the tests (Linux, macOS)
+        shell: bash
+        run: |
+          bash scripts/check-no-holder-left.sh --self-test
+          bash scripts/check-no-holder-left.sh
+      - if: always() && runner.os == 'Windows'
+        name: no holder outlives the tests (Windows)
+        shell: pwsh
+        run: |
+          # Task 7 starts a holder as "<path>\apprafter.exe" __holder.
+          $left = @(Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'apprafter\.exe"? __holder( |$)' })
+          if ($left.Count -gt 0) {
+            $left | ForEach-Object { Write-Host "pid $($_.ProcessId): $($_.CommandLine)" }
+            $left | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+            Write-Host "::error::an apprafter __holder process outlived the tests (listed above)"
+            exit 1
+          }
+          Write-Host "OK: no holder is running"
 
   # One check under the fixed name `cargo test cli/`, whatever the matrix
   # does. The matrix reports a check per leg, `cargo test cli/ (<os>)`, so a
@@ -165,7 +197,7 @@ jobs:
   rust-cli-result:
     name: cargo test cli/
     needs: [changes, rust-cli]
-    if: always()
+    if: always() && github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
@@ -331,7 +363,7 @@ jobs:
   rust-desktop-result:
     name: cargo test desktop/
     needs: [changes, rust-desktop, osauth-linux, desktop-linux-packages]
-    if: always()
+    if: always() && github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
@@ -484,3 +516,34 @@ jobs:
           path: desktop/e2e/playwright-report
           if-no-files-found: ignore
           retention-days: 14
+
+  # D.4a T22: the vault's release Argon2id derivation (m = 256 MiB, t = 3, p = 4), timed on
+  # each CI OS in the test profile (what `cargo test` pays, argon2 at opt-level 3) and the
+  # release profile (what a person pays), end to end and hashing alone. T22 is decided on the
+  # release profile's end-to-end number (it also counts the test allocator's scan of the freed
+  # memory: an upper bound): over about 1.5 s on any OS lowers the release default to
+  # 128 MiB / t = 3. Manual only: a workflow_dispatch with `kdf_timing`.
+  kdf-timing:
+    name: release key derivation timing (${{ matrix.os }})
+    if: github.event_name == 'workflow_dispatch' && inputs.kdf_timing
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # apprafter-core links cli-providers, whose build.rs runs `cue export`.
+      - uses: cue-lang/setup-cue@b0e30e540a2dae47304ebf16586a5b2db023b61c # v2.0.0
+        with:
+          version: v0.17.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: "1.98"
+      - name: time the release derivation (test profile, then release profile)
+        working-directory: cli
+        shell: bash
+        run: |
+          cargo test -p apprafter-core --lib -- --ignored --exact vault::kdf::tests::release_params_timing --nocapture
+          cargo test --release -p apprafter-core --lib -- --ignored --exact vault::kdf::tests::release_params_timing --nocapture

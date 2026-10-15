@@ -5,11 +5,14 @@
 // password field appears once polkit finds no agent, and every lock forgets that again — and a
 // session watch that answers late says more in a later read.
 //
-// Read again: on every lock (shell/LockGate), after every authentication refusal from any
-// command (PlatformGate, through onAuthRefusal), and when Settings opens. While a read is in
-// question — after a lock or `auth_unavailable`, until app_info answers — the password field is
-// not offered: never one that answers `use_system_prompt`. After `auth_failed` or `auth_busy`
-// the field the owner types in stays while app_info is read.
+// Read again: on every lock and unlock (shell/LockGate), after every authentication refusal from
+// any command (PlatformGate, through onAuthRefusal), and when Settings opens; and as the target
+// store changes under the app (D.4a F17) — when the window gains the focus and when Rust says
+// its re-read found the store changed (STORE_CHANGED), by the LockGate while locked and the
+// Shell while unlocked. While a read is in question — after a lock, `auth_unavailable` or a
+// store change the lock screen hears of, until app_info answers — the password field is not
+// offered: never one that answers `use_system_prompt`. After `auth_failed` or `auth_busy`, and
+// on a focus, the field the owner types in stays while app_info is read.
 import { type QueryClient, queryOptions } from '@tanstack/react-query';
 import { createContext, useContext } from 'react';
 import { appInfo } from '../ipc/api';

@@ -11,12 +11,14 @@
 //!   by the client from an [`EnvSource`] it supplies (the CLI from its whole
 //!   environment, the desktop from an allow-list of it under a
 //!   [`DesktopPolicy`]);
+//! - it reaches a target's stored secrets only through [`Context::secrets`]: no module
+//!   outside `secrets` reads a credentials file or the age key, or opens or seals a cache;
 //! - it never prompts: a mutation returns a [`Plan`] for the client to
 //!   confirm, then executes it;
 //! - cancellation is a [`CancellationToken`] per operation, never a process
 //!   signal handler.
 //!
-//! `tests/guards.rs` enforces the first three on the parsed source, not its
+//! `tests/guards.rs` enforces the first four on the parsed source, not its
 //! text, so production code after a test module, a renamed import
 //! (`use std::env::var as v`) and a call inside a macro's arguments are all
 //! seen. It fails on a print macro (`print!` … `dbg!`, any delimiter),
@@ -24,30 +26,54 @@
 //! `std::env` read or write, any `dirs::*` call, and any call to a
 //! lower-crate function that reads the environment or touches the terminal
 //! on the core's behalf (the credential resolvers, `default_config_root`,
-//! `default_age_key_path`, `logging::init`, `KubectlCli` / `HelmCli`). The
-//! one sanctioned exception is `cli_core::target::config_root_from_override`,
-//! and only inside [`Context::from_cli_env`] and [`Context::from_desktop_env`]:
-//! its fallback reads the platform config directory, so both clients open the
-//! same default target store. For the last two rules it keeps the crates
+//! `logging::init`, `KubectlCli` / `HelmCli`, the
+//! `PATH`-reading tool preflights, `cue::export`, the SSH identity default,
+//! the legacy state migration) or writes a key (`load_or_create_identity`).
+//! The two sanctioned exceptions are `cli_core::target::config_root_from_override`
+//! and `cli_core::paths::home_dir`, and only inside [`Context::from_cli_env`]
+//! and [`Context::from_desktop_env`]: the first's fallback reads the platform
+//! config directory, so both clients open the same default target store; the
+//! second gives the age key its default and shown paths their `~/`. For the
+//! last two rules it keeps the crates
 //! they would need out of the core's dependencies — no prompt, progress,
 //! table, colour or signal crate. And it holds env reads in the crates below
 //! the core, and in the CLI, to a count that only goes down.
 
 pub mod cancel;
 pub mod context;
+pub mod doctor;
 pub mod env;
 pub mod error;
+pub mod kube;
+pub mod lock;
+pub mod machine;
+pub mod net;
 pub mod op;
+pub mod process;
+pub mod provider;
 pub mod report;
+pub mod runtime;
+pub mod secrets;
+pub mod session;
+pub mod ssh;
+pub mod target;
 pub mod target_ref;
+pub mod tools;
+pub mod vault;
 
 pub use cancel::{CancellationToken, Cancelled, Registration};
-pub use context::{CliOverrides, Context, DesktopPolicy, SecretString};
+pub use context::{
+    CliOverrides, Context, DesktopHost, DesktopPolicy, PathSource, SecretString,
+    DEFAULT_REQUEST_TIMEOUT,
+};
 pub use env::{EnvSource, MapEnv};
 pub use error::{CoreError, CoreResult, UiError};
-pub use op::{Outcome, Plan, PlanClass, PlannedChange};
+pub use op::{ChangeAction, Outcome, Plan, PlanClass, PlannedChange};
 pub use report::{CollectReporter, Event, NullReporter, Reporter, Stream};
 pub use target_ref::{ActivePointerChange, TargetRef};
+/// The secret store's plaintext type, so a client names it without a `zeroize` dependency of
+/// its own.
+pub use zeroize::Zeroizing;
 
 /// The core's version — what the desktop's About line shows as "core <ver>".
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

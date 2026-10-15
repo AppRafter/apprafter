@@ -1,0 +1,11 @@
+$ apprafter target machine
+[exit 1]
+[stdout]
+[stderr]
+Error: apprafter::cli::usage_refused
+
+  × non-interactive shell: pass `--server-type <sku>` to set the machine type
+  │ without the interactive picker
+  help: Pass `--server-type <sku>`, or run `apprafter target machine` in a
+        terminal to open the picker.
+

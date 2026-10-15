@@ -13,6 +13,6 @@ $ apprafter target list
 │ *      │ staging │ hetzner-cloud │ nbg1   │ solo │
 └────────┴─────────┴───────────────┴────────┴──────┘
 
-1 targets configured. Active: 'staging'.
+1 target configured. Active: 'staging'.
 [stderr]
 <ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m target list invoked

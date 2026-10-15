@@ -98,7 +98,7 @@ if ! command -v docker >/dev/null 2>&1 && ! command -v podman >/dev/null 2>&1; t
 fi
 
 TMPDIR_WORK="$(mktemp -d)"
-APPRAFTER_CONFIG_DIR="${TMPDIR_WORK}/apprafter-config"
+e2e_isolate_store "${TMPDIR_WORK}"
 KUBECONFIG_FILE="${TMPDIR_WORK}/kubeconfig"
 K3D_CREATED=0
 
@@ -166,8 +166,7 @@ unset APPRAFTER_BOOTSTRAP_SKIP_CILIUM
 # This probe calls cluster-bootstrap directly instead of through
 # bootstrap_with_cilium, so it seeds Argo CD's ECR Public image itself.
 seed_ecr_public_images
-( cd "${REPO_ROOT}/cli" && cargo run --quiet --bin apprafter -- cluster-bootstrap ) \
-    || BOOTSTRAP_RC=$?
+apprafter cluster-bootstrap || BOOTSTRAP_RC=$?
 printf '\n  cluster-bootstrap exit code: %s\n' "$BOOTSTRAP_RC"
 
 # ===============================================================

@@ -8,12 +8,23 @@
 // focused. Unlocked, the shell renders, and the owner's activity restarts Rust's idle timer at
 // most once per ACTIVITY_INTERVAL_MS. Rust ends every operation subscription on each transition;
 // the operations store forgets them, and after an unlock follows again what is still followed.
+//
+// The store can change while locked — a terminal's `lock on` or `lock off`, a store root others
+// can now change — and the shell, which follows it while unlocked, is unmounted (D.4a F17). So
+// while locked the gate reads app_info again when the window gains the focus, the field being
+// typed into kept meanwhile, and when Rust says the store changed (STORE_CHANGED), the field
+// withheld until app_info answers: what it answers is in question. Every unlock reads it again
+// too, before the shell follows anything, so the first views after it are not what the lock
+// screen was shown.
 import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import { type ReactNode, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { ErrorPanel } from '../components/ErrorPanel';
 import { activity, IpcError, uiErrorOf } from '../ipc/api';
+import { onStoreChanged } from '../ipc/events';
 import { DESKTOP_ERROR_CODES } from '../ipc/generated/errors';
 import type { LockState } from '../ipc/generated/LockState';
+import { sessionLocked } from '../ipc/lifecycle';
 import { clearLive, reattachAll } from '../ipc/operations';
 import { ACTIVITY_INTERVAL_MS, dropUnlockedData, useLockState } from '../state/lock';
 import {
@@ -60,11 +71,34 @@ export function LockGate({ children, now = Date.now }: LockGateProps) {
     if (before === undefined || before === locked) return;
     clearLive();
     if (locked) {
+      // Every screen of the session is gone (ipc/lifecycle.ts): what they started is cancelled or
+      // discarded — refused as locked, since Rust has done it already — and a plan that ends
+      // after the unlock shows at the app level.
+      sessionLocked();
       dropUnlockedData(client);
       rereadAppInfo(client, true);
     } else {
+      // What the lock screen was shown may be old (D.4a F17, P-6): read before anything follows.
+      rereadAppInfo(client, false);
       reattachAll();
     }
+  }, [locked, client]);
+
+  // While locked, the store as the lock screen shows it follows the store (D.4a F17); unlocked,
+  // the shell does this. The cleanup runs on the unlock and on the quit.
+  useEffect(() => {
+    if (locked !== true) return;
+    const focus = getCurrentWindow().onFocusChanged(({ payload: focused }) => {
+      if (focused) rereadAppInfo(client, false);
+    });
+    const store = onStoreChanged(() => rereadAppInfo(client, true));
+    return () => {
+      for (const listening of [focus, store]) {
+        listening
+          .then((off) => off())
+          .catch((error: unknown) => console.error('unlisten failed:', error));
+      }
+    };
   }, [locked, client]);
 
   useEffect(() => {

@@ -67,7 +67,7 @@ use crate::commands::backup::{
 };
 use crate::commands::k8s_helpers::{
     ensure_kubeconfig_tempfile_for_target, kubectl_apply_server_side, kubectl_get_json,
-    kubectl_merge_patch,
+    kubectl_merge_patch, KubeconfigFile,
 };
 
 // ---------------------------------------------------------------------------
@@ -619,6 +619,10 @@ pub fn run_restore(
     // 0. External binaries, before the credential gate below (D11 / 2.22a —
     //    see [`tools_for_restore`]).
     cli_core::tools::preflight_tools(&tools_for_restore(reprovision), "apprafter restore")?;
+    // WI-478: the passphrase is asked before the target store is read (the cluster's cached
+    // kubeconfig, or the token `--reprovision` provisions with), which refuses a store other
+    // accounts can change; refused here instead, before it is asked.
+    crate::context::refuse_a_store_others_can_change()?;
 
     // 1. Passphrase + credentials (mandatory — the repo holds decrypted
     //    secrets). Gate FIRST, before touching any cluster/repo — a bad
@@ -643,18 +647,19 @@ pub fn run_restore(
     // kubeconfig into state), after which we resolve kc. For restore-into-running
     // / --data-only the cluster is already up, so resolve it now. Held alive for
     // the WHOLE flow: every kubectl/restic-adjacent shell-out below depends on it.
-    let mut kc: Option<tempfile::NamedTempFile> = if reprovision {
+    let mut kc: Option<KubeconfigFile> = if reprovision {
         None
     } else {
         Some(ensure_kubeconfig_tempfile_for_target(target)?)
     };
+    // D.4a T46: everything this command reads of the store is in hand; the store's key goes.
+    crate::vault_access::end_secret_phase();
 
     // Held across the whole restore: the restic restore unpacks the decrypted
     // secrets here and it must NOT be cleaned up until every step that reads
     // `data/` is done (rev-5: tempfile::tempdir auto-cleanup on drop).
-    let restore_root = tempfile::Builder::new()
-        .prefix("apprafter-restore-")
-        .tempdir()
+    // Owner-only from its creation, whatever the system temp dir lets others do (WI-473).
+    let restore_root = cli_core::owner_only::temp_dir("apprafter-restore-")
         .map_err(|e| CliError::Other(format!("create restore tempdir: {e}")))?;
 
     // Lazily-populated after RestoreArtifact: the `data/` dir under the restic
@@ -734,12 +739,15 @@ pub fn run_restore(
             // target (topology + cloud token come from the target's local config,
             // exactly as `apprafter up` — R2), then resolves the now-cached
             // kubeconfig. It is always first, and every later step needs kc.
+            // `bootstrap_all::run` prints this step's progress line itself, once
+            // its checks pass, so a refused run never says it began (WI-457).
             if let RestoreStep::Reprovision = step {
-                println!(
-                    "→ --reprovision: provisioning a fresh cluster in target '{}' before replay",
-                    target.unwrap_or("<active>")
-                );
-                crate::commands::bootstrap_all::run(target, false, server_type)?;
+                crate::commands::bootstrap_all::run(
+                    target,
+                    false,
+                    server_type,
+                    cli_core::ProvisionedBy::RestoreReprovision,
+                )?;
                 kc = Some(ensure_kubeconfig_tempfile_for_target(target)?);
                 return Ok(());
             }
@@ -993,7 +1001,8 @@ fn restore_artifact_tree(
         );
     }
     for claim_snap in &run.claims {
-        let claim_root = tempfile::tempdir()
+        // Decrypted claim data: owner-only from its creation (WI-473).
+        let claim_root = cli_core::owner_only::temp_dir("apprafter-restore-claim-")
             .map_err(|e| CliError::Other(format!("temp dir for a per-claim snapshot: {e}")))?;
         restic.restore_snapshot(claim_snap, claim_root.path())?;
         match find_claim_data_dir(claim_root.path()) {
@@ -1377,8 +1386,8 @@ fn origin_firewall_action(
 fn target_records_origin_firewall(target: Option<&str>) -> bool {
     crate::commands::state_paths::resolve_state_paths(target)
         .ok()
-        .and_then(|r| cli_core::target::load_target(&r.store, &r.target_name).ok())
-        .and_then(|t| t.config.firewall)
+        .and_then(|r| cli_core::target::load_target_config(&r.store, &r.target_name).ok())
+        .and_then(|c| c.firewall)
         .is_some_and(|f| f.cloudflare_origin)
 }
 
@@ -3859,7 +3868,7 @@ mod tests {
     //
     // The reprovision flow:
     //   restore --reprovision
-    //     → bootstrap_all::run(target, false, server_type)
+    //     → bootstrap_all::run(target, false, server_type, RestoreReprovision)
     //     → apply::run(target_override, server_type)
     //     → resolve_precedence(flag, manifest, state, target, env)
     //     → None (when all rungs absent) → ServerTypeNotSelected

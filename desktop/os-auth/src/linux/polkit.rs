@@ -808,9 +808,11 @@ mod tests {
         let (release, released) = mpsc::channel::<()>();
         let (entered, released) = (Mutex::new(entered), Mutex::new(released));
         let mut fake = Fake::new(CHALLENGE, Dialog::Answers(AUTHORIZED));
+        // The check hangs until the request has ended, never ending on its own: a request that
+        // waited for it would not end at all (GOTCHA-332: not a bound on the clock).
         fake.during_probe = Some(Box::new(move || {
             entered.lock().unwrap().send(()).unwrap();
-            let _ = released.lock().unwrap().recv_timeout(PATIENCE);
+            let _ = released.lock().unwrap().recv();
         }));
         let fake = Arc::new(fake);
         let token = CancellationToken::new();
@@ -823,13 +825,19 @@ mod tests {
                 token.cancel();
             })
         };
-        let started = Instant::now();
-        let outcome = run(&fake, &token);
-        let took = started.elapsed();
+        let (ended, outcome) = mpsc::channel();
+        {
+            let (fake, token) = (Arc::clone(&fake), token.clone());
+            thread::spawn(move || {
+                let _ = ended.send(run(&fake, &token));
+            });
+        }
+        let outcome = outcome
+            .recv_timeout(PATIENCE)
+            .expect("the request ended while its first check hung");
         canceller.join().unwrap();
         release.send(()).unwrap();
         assert_eq!(outcome, APP_CANCELLED);
-        assert!(took < PATIENCE / 2, "it waited {took:?} for the hung check");
         assert_eq!(fake.calls(), probe_only(), "no dialog opened");
     }
 

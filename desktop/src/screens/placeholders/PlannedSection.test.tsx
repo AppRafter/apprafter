@@ -3,18 +3,16 @@ import { expect, test } from 'bun:test';
 import { render, screen } from '@testing-library/react';
 import { PlannedSection } from './PlannedSection';
 
-test('a planned section has its page title and copy, names its slice and the CLI meanwhile', () => {
-  render(<PlannedSection section="target" target="prod-eu" />);
-  expect(screen.getByRole('heading', { level: 1, name: 'Target' })).toBeDefined();
+test('a planned section has its page title and copy, and names its slice', () => {
+  render(<PlannedSection section="backups" target="prod-eu" />);
+  expect(screen.getByRole('heading', { level: 1, name: 'Backups' })).toBeDefined();
   expect(
     screen.getByText(
-      'How this computer reaches prod-eu — provider credentials, the machine, and cached access to the cluster.',
+      'Encrypted off-site snapshots of claims data, platform objects and secrets. A restore replays one onto this or a fresh cluster.',
     ),
   ).toBeDefined();
-  expect(screen.getByRole('heading', { name: 'The target screen arrives in D.3.' })).toBeDefined();
-  // `target show` takes the name: the hint names the tab's target, and needs nothing first.
-  expect(screen.getByText('apprafter target show prod-eu')).toBeDefined();
-  expect(screen.queryByText(/target use/)).toBeNull();
+  expect(screen.getByRole('heading', { name: 'Backups arrive in D.11.' })).toBeDefined();
+  expect(screen.getByText('apprafter backup status')).toBeDefined();
 });
 
 test('a command that runs on the CLI’s active target says to switch to the tab’s first', () => {

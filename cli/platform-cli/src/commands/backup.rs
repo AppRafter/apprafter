@@ -79,12 +79,11 @@ use cli_providers::backup::restic::restic_snapshots_argv;
 use cli_providers::k8s::kubectl::KubectlCli;
 use cli_providers::k8s::sealing::{build_sealed_secret, fetch_controller_public_key};
 use serde_json::Value;
-use tempfile::NamedTempFile;
 
 use crate::commands::helper_interrupt::{self, Noted as _};
 use crate::commands::k8s_helpers::{
     ensure_kubeconfig_tempfile, kubectl_apply_server_side, kubectl_delete, kubectl_get_json,
-    kubectl_get_json_cluster_wide, kubectl_merge_patch,
+    kubectl_get_json_cluster_wide, kubectl_merge_patch, KubeconfigFile,
 };
 use crate::commands::state_paths::resolve_state_paths;
 
@@ -1844,6 +1843,8 @@ pub fn run_export(namespaces: &[String], select: bool, out: Option<&str>) -> Res
     let resolved = resolve_state_paths(None)?;
     let cluster_id = resolved.target_name.clone();
     let kc = ensure_kubeconfig_tempfile()?;
+    // D.4a T46: everything this command reads of the store is in hand; the store's key goes.
+    crate::vault_access::end_secret_phase();
 
     let subset: &[String] = if select { namespaces } else { &[] };
     let apps = list_items("applications.apprafter.io", None, kc.path())?;
@@ -2034,6 +2035,9 @@ pub fn run_backup(
 
     let resolved = resolve_state_paths(None)?;
     let cluster_id = resolved.target_name.clone();
+    // WI-478: the passphrase is asked before the kubeconfig is read from the target store,
+    // which refuses a store other accounts can change; refused here instead, before it is asked.
+    crate::context::refuse_a_store_others_can_change()?;
 
     let env_pass = std::env::var("RESTIC_PASSWORD").ok();
     let is_tty = std::io::stdin().is_terminal();
@@ -2042,6 +2046,8 @@ pub fn run_backup(
     // Keep the kubeconfig tempfile alive for the WHOLE sequence (every kubectl
     // shell-out below depends on it; dropping it deletes the file).
     let kc = ensure_kubeconfig_tempfile()?;
+    // D.4a T46: everything this command reads of the store is in hand; the store's key goes.
+    crate::vault_access::end_secret_phase();
 
     // Resolve ns_set BEFORE handing off to the engine (the engine's list_items
     // uses KubeExec which doesn't know about the "app-namespace set" concept —
@@ -2068,10 +2074,10 @@ pub fn run_backup(
     let pg_image = pg_helper_image(first_cnpg_image(&ns_set, kc.path()).as_deref());
     let platform_version = read_platform_version(kc.path())?;
 
-    // Stage everything under a tempdir; the engine writes data/ under this root.
-    let staging = tempfile::Builder::new()
-        .prefix("apprafter-backup-")
-        .tempdir()
+    // Stage everything under a tempdir; the engine writes data/ under this root. It holds the
+    // exported Secrets and database dumps before restic encrypts them: owner-only from its
+    // creation, whatever the system temp dir lets others do (WI-473).
+    let staging = cli_core::owner_only::temp_dir("apprafter-backup-")
         .map_err(|e| CliError::Other(format!("create staging dir: {e}")))?;
 
     let opts = local_pull_backup_opts(
@@ -2454,6 +2460,8 @@ fn cronjob_repo(cronjob: &Value) -> Option<String> {
 pub fn run_backup_trigger(wait: bool, timeout_minutes: u64) -> Result<()> {
     preflight_tools(&[&KUBECTL], "apprafter backup run")?;
     let kc = ensure_kubeconfig_tempfile()?;
+    // D.4a T46: everything this command reads of the store is in hand; the store's key goes.
+    crate::vault_access::end_secret_phase();
 
     let Some(cronjob) = kubectl_get_json(
         "cronjob",
@@ -5252,7 +5260,7 @@ fn kubeconfig_if_cluster_needed(
     retention: RetentionArgs,
     creds: CredSource,
     cluster_uid_override: Option<&str>,
-) -> Result<Option<NamedTempFile>> {
+) -> Result<Option<KubeconfigFile>> {
     if !backup_verb_needs_cluster(repo_override, retention, creds, cluster_uid_override) {
         return Ok(None);
     }
@@ -6477,18 +6485,11 @@ fn enable_success_report(
 /// Reuses the same approach as `commands::secret::apply_manifest` but is
 /// inlined here to avoid a cross-module private function reference.
 fn apply_sealed_secret_manifest(manifest: &Value, kubeconfig_path: &Path) -> Result<()> {
-    use std::io::Write as _;
-    let mut file = tempfile::Builder::new()
-        .prefix("apprafter-sealed-")
-        .suffix(".json")
-        .tempfile()
-        .map_err(|e| CliError::Other(format!("create SealedSecret tempfile: {e}")))?;
+    // Owner-only from its first byte, as every manifest the CLI hands kubectl (WI-473).
     let body = serde_json::to_vec_pretty(manifest)
         .map_err(|e| CliError::Other(format!("serialise SealedSecret: {e}")))?;
-    file.write_all(&body)
+    let file = cli_core::owner_only::write_temp_file("apprafter-sealed-", ".json", &body)
         .map_err(|e| CliError::Other(format!("write SealedSecret tempfile: {e}")))?;
-    file.flush()
-        .map_err(|e| CliError::Other(format!("flush SealedSecret tempfile: {e}")))?;
 
     let out = std::process::Command::new("kubectl")
         .arg("apply")

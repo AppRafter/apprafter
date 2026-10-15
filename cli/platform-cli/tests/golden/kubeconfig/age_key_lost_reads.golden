@@ -1,0 +1,63 @@
+$ apprafter argocd-password
+[exit 1]
+[stdout]
+[stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m argocd-password invoked <ESC>[3mrefresh<ESC>[0m<ESC>[2m=<ESC>[0mfalse
+Error: apprafter::secrets::age_key_missing
+
+  × no age key at <SANDBOX>/home/.config/apprafter/age.key; the cached
+  │ secrets cannot be decrypted
+  help: Restore the age key file the cache was encrypted with, or set
+        `APPRAFTER_AGE_KEY` to where it is. If the key is lost, `apprafter
+        kubeconfig --refresh --target prod` fetches the kubeconfig from the
+        node again over SSH and caches it under a new key. A new key cannot
+        read anything cached under the lost one, so the command lists those
+        secrets and asks before it creates the key.
+
+$ apprafter argocd-password --refresh
+[exit 1]
+[stdout]
+[stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m argocd-password invoked <ESC>[3mrefresh<ESC>[0m<ESC>[2m=<ESC>[0mtrue
+Error: apprafter::secrets::age_key_missing
+
+  × no age key at <SANDBOX>/home/.config/apprafter/age.key; the cached
+  │ secrets cannot be decrypted
+  help: Restore the age key file the cache was encrypted with, or set
+        `APPRAFTER_AGE_KEY` to where it is. If the key is lost, `apprafter
+        kubeconfig --refresh --target prod` fetches the kubeconfig from the
+        node again over SSH and caches it under a new key. A new key cannot
+        read anything cached under the lost one, so the command lists those
+        secrets and asks before it creates the key.
+
+$ apprafter app list
+[exit 1]
+[stdout]
+[stderr]
+Error: apprafter::secrets::age_key_missing
+
+  × no age key at <SANDBOX>/home/.config/apprafter/age.key; the cached
+  │ secrets cannot be decrypted
+  help: Restore the age key file the cache was encrypted with, or set
+        `APPRAFTER_AGE_KEY` to where it is. If the key is lost, `apprafter
+        kubeconfig --refresh --target prod` fetches the kubeconfig from the
+        node again over SSH and caches it under a new key. A new key cannot
+        read anything cached under the lost one, so the command lists those
+        secrets and asks before it creates the key.
+
+$ apprafter cluster-bootstrap
+[exit 1]
+[stdout]
+[stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m cluster-bootstrap invoked (GitOps loader)
+Error: apprafter::secrets::age_key_missing
+
+  × no age key at <SANDBOX>/home/.config/apprafter/age.key; the cached
+  │ secrets cannot be decrypted
+  help: Restore the age key file the cache was encrypted with, or set
+        `APPRAFTER_AGE_KEY` to where it is. If the key is lost, `apprafter
+        kubeconfig --refresh --target prod` fetches the kubeconfig from the
+        node again over SSH and caches it under a new key. A new key cannot
+        read anything cached under the lost one, so the command lists those
+        secrets and asks before it creates the key.
+

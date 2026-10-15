@@ -34,6 +34,9 @@ target/
 #   git check-ignore -v desktop/src/screens/target/TargetScreen.tsx
 !/desktop/src/**/target/
 !/desktop/src-tauri/src/**/target/
+# The shared core's target module (`apprafter_core::target`, D.3) is source as well. Verify with:
+#   git check-ignore -v cli/apprafter-core/src/target/mod.rs
+!/cli/apprafter-core/src/target/
 # Tauri writes capability-schema files at build time.
 /desktop/src-tauri/gen/
 # ...and an allow-/deny- permission file per command of the app manifest (build.rs, from

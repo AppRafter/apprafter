@@ -128,9 +128,20 @@ post-launch work is not a roadmap phase and has no subscribe control.
 | Shipped | ✅ | Reference a secret or a dependency's credential straight from `env` | [Writing Application.cue](dev-guide/application-cue.md) |
 | Shipped | ✅ | Deploy from private repositories and registries with one credential | [Private repositories and registries](dev-guide/private-repos-and-registries.md) |
 | Shipped | ✅ | See what is sealed and where, and retire one when it is no longer needed | [Secrets](operator-guide/secrets.md) |
+| Post-launch | 🚧 | Lock a target store's secrets in an encrypted vault, so that an AI agent that oversteps cannot read or use them without you | [Protecting secrets from agents](operator-guide/protecting-secrets-from-agents.md) |
 | Post-launch | ☐ | Defence in depth against a compromised cluster administrator | — |
 | Post-launch | ☐ | End-to-end identity propagation, so an audit trail names the workload and not just the node | — |
 | [Phase 3](https://apprafter.dev/#roadmap-phase-tier2) | ☐ | A managed secret store on multi-node clusters, in place of sealed secrets | — |
+
+> **The store lock is `🚧`** until it has been walked through on every system. It is built and
+> tested on Linux, macOS and Windows, and walked through end to end on Linux, in real terminals
+> and desktop sessions and against a real cluster; on macOS and Windows, real terminals, sleep,
+> the clipboard and the app's process protections have not yet been checked by hand. It stops an
+> AI agent that oversteps, and only raises the bar for a program running as you that sets out to
+> get past it. The lock protects secrets at rest: while a command or the app uses one, it is in
+> that process's memory and, for a kubeconfig, in a file programs running as you can read, and the
+> SSH key that fetches kubeconfigs stays outside the lock. The guide lists every limit, and how to
+> run AI agents under a separate account.
 
 ---
 
@@ -209,13 +220,21 @@ cluster stays an ordinary AppRafter install on your own infrastructure.
 | Phase | Status | Feature | Documentation |
 |---|---|---|---|
 | Post-launch | 🚧 | A desktop app for Linux, macOS and Windows that works with the same targets as the CLI | — |
-| Post-launch | 🚧 | The desktop app locks itself, and unlocks with the operating system's own sign-in — Windows Hello or the Windows password, Touch ID or the Mac password, the Linux system password | — |
-| Post-launch | ☐ | Every CLI command available from the desktop app | — |
+| Post-launch | 🚧 | The desktop app locks itself, and unlocks with the operating system's own sign-in — Windows Hello or the Windows password, Touch ID or the Mac password, the Linux system password; on a target store whose secrets are protected — from the app's Security page or with `apprafter lock on` — it unlocks with the store's lock password or recovery key | — |
+| Post-launch | 🚧 | Every CLI command available from the desktop app | — |
 
 > **The desktop app is `🚧`.** Its window, settings and app lock are built and tested on all
-> three systems in CI, and both clients read one target store. No installer is published yet,
-> the cluster screens are still to come, and the system sign-in has not yet been checked by hand
-> on real Windows, Mac and Linux machines. Where a computer does not report screen locks or
+> three systems in CI, and both clients read one target store. Seven of the target commands —
+> `target add`, `list`, `show`, `use`, `rename`, `remove` and `machine` — are in the app, as are
+> `doctor` and `whoami`. The store lock is in the app too: its Security page protects a target
+> store's secrets in the same encrypted vault as `apprafter lock on`, and Settings › Lock keeps
+> the app's lock settings on while they are protected. The remaining target commands
+> (`target ip`, `target domain`, `target cert import` and `target firewall`) and the CLI's other
+> commands arrive with later releases, except shell completion, which stays in the CLI; `init`,
+> which adding a target and provisioning it replace; and `plan`, `login` and `upgrade-tier`, which the CLI itself does not
+> implement yet. No installer is published yet, the cluster screens are still to come, and the
+> system sign-in has not yet been checked by hand on real Windows, Mac and Linux
+> machines. Where a computer does not report screen locks or
 > sleep — Windows Subsystem for Linux, or a Linux desktop without a screen saver or logind —
 > the app's settings say so next to the lock-on-sleep option.
 

@@ -143,7 +143,7 @@ _yq() { if command -v yq >/dev/null 2>&1; then yq "$@"; else nix run nixpkgs#yq-
 # ---------------------------------------------------------------
 
 TMPDIR_WORK="$(mktemp -d)"
-APPRAFTER_CONFIG_DIR="${TMPDIR_WORK}/apprafter-config"
+e2e_isolate_store "${TMPDIR_WORK}"
 KUBECONFIG_FILE="${TMPDIR_WORK}/kubeconfig"
 
 # Set to 1 only after the cluster is up AND $KUBECONFIG points at it (Phase 0).

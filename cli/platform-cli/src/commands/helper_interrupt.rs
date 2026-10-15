@@ -704,7 +704,7 @@ pub(crate) fn install(note: Option<&'static str>) -> StopGuard {
 /// Whether `signal` is ignored in this process right now — at install time,
 /// that is how it was started.
 #[cfg(unix)]
-fn ignored_at_start(signal: i32) -> bool {
+pub(crate) fn ignored_at_start(signal: i32) -> bool {
     // SAFETY: sigaction with a null new action only reads the current one
     // into `old`, which is a plain, zero-initialised struct.
     unsafe {
@@ -1155,8 +1155,11 @@ fn release_slot(index: usize) {
 }
 
 /// A copy of the kubeconfig the stop runs its kubectl through: a file only
-/// this user can read, recorded in [`COPY_PATHS`] before the kubeconfig is
-/// written into it, removed when dropped, and removed by a second signal.
+/// this user can read — mode 0600, or on Windows the owner-only DACL, from its
+/// first byte, whatever the system temp dir lets others do (WI-473) — that
+/// kubectl reads while it is held, recorded in [`COPY_PATHS`] before the
+/// kubeconfig is written into it, removed when dropped, and removed by a second
+/// signal.
 struct PrivateCopy {
     file: Option<tempfile::NamedTempFile>,
     slot: usize,
@@ -1181,9 +1184,7 @@ impl Drop for PrivateCopy {
 
 /// The kubeconfig `bytes` in a [`PrivateCopy`].
 fn private_copy(bytes: &[u8]) -> std::io::Result<PrivateCopy> {
-    let file = tempfile::Builder::new()
-        .prefix("apprafter-interrupt-")
-        .tempfile()?;
+    let file = cli_core::owner_only::temp_file("apprafter-interrupt-", "")?;
     // No slot, no copy: the kubeconfig is never written where a second
     // signal could not remove it.
     let slot = claim_slot(&COPY_PATHS, file.path())?;
@@ -1192,6 +1193,8 @@ fn private_copy(bytes: &[u8]) -> std::io::Result<PrivateCopy> {
         slot,
     };
     let file = copy.file.as_mut().expect("just set");
+    #[cfg(all(test, windows))]
+    cli_core::owner_only::testing::record_before_first_byte(file.as_file());
     file.write_all(bytes)?;
     file.flush()?;
     Ok(copy)
@@ -1317,6 +1320,35 @@ mod tests {
             let mode = std::fs::metadata(copy.path()).unwrap().permissions().mode();
             assert_eq!(mode & 0o077, 0, "readable by its owner only: {mode:o}");
         }
+    }
+
+    /// WI-473: on Windows the stop's copy is owner-only by its DACL from before the
+    /// kubeconfig's first byte, wherever `TMP` points, and kubectl — sharing as Go's
+    /// `os.Open` does — reads it while the stop holds it.
+    #[cfg(windows)]
+    #[test]
+    fn the_copy_is_owner_only_from_its_first_byte_and_kubectl_reads_it() {
+        use cli_core::owner_only::testing;
+        use std::io::Read as _;
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+        let _ = testing::take_before_first_byte();
+        let copy = private_copy(b"apiVersion: v1\nkind: Config\n").unwrap();
+        testing::take_before_first_byte()
+            .expect("the copy's write site records its DACL")
+            .unwrap()
+            .assert_owner_only_file("the kubeconfig copy before its first byte");
+        testing::of_path(copy.path())
+            .unwrap()
+            .assert_owner_only_file("the kubeconfig copy");
+        let mut kubectl = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(copy.path())
+            .expect("kubectl opens the copy the stop holds");
+        let mut seen = Vec::new();
+        kubectl.read_to_end(&mut seen).unwrap();
+        assert_eq!(seen, b"apiVersion: v1\nkind: Config\n");
     }
 
     #[test]

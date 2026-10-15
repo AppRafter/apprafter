@@ -54,6 +54,7 @@ impl TargetRef {
 /// How an operation moved the CLI's active-target pointer as a side effect
 /// (`target add` on an empty store, `rename` / `remove` of the active one).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ActivePointerChange {
     pub from: Option<String>,
     pub to: Option<String>,

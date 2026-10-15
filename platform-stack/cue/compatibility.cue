@@ -1934,6 +1934,41 @@ compatibility: "0.2.74": {
 	]
 }
 
+compatibility: "0.2.82": {
+	change:          "safe"
+	operatorVersion: "v0.2.54"
+	notes: """
+		THE OPERATOR AND THE ADMISSION WEBHOOK ARE REBUILT WITH RUSTLS
+		0.23.46, for RUSTSEC-2026-0346, -0347, -0348 and -0349. Nothing else
+		changes: the operator source, its CRDs, RBAC and templates are those
+		of v0.2.53, and the one Rust dependency that moves is rustls, from
+		0.23.45. No chart value changes shape, and the backup runner and
+		cue-cmp pins stay where 0.2.81 left them.
+
+		WHAT AN UPGRADING CLUSTER SEES: the operator and the admission
+		webhook restart once onto v0.2.54. No application, Postgres,
+		Dragonfly or NATS pod restarts and no CRD moves, so from 0.2.81 the
+		upgrade is safe and applies without approval. From 0.2.80 or older it
+		still waits for approval, because 0.2.81 on the way is
+		requires-restart.
+
+		WHICH ADVISORIES REACH THIS CODE. -0349 does: the operator's TLS
+		clients keep rustls' default session store, which recorded the
+		key-exchange group a server picked before that server was
+		authenticated. At worst a later connection loses its post-quantum key
+		exchange, and only to a server that accepts a classical key share
+		instead of asking for its preferred group. -0346 needs a custom client
+		session store and -0347 needs Encrypted Client Hello; neither is used.
+		-0348 needs rustls' brotli feature, which is not enabled.
+		"""
+	references: [
+		"https://rustsec.org/advisories/RUSTSEC-2026-0346.html",
+		"https://rustsec.org/advisories/RUSTSEC-2026-0347.html",
+		"https://rustsec.org/advisories/RUSTSEC-2026-0348.html",
+		"https://rustsec.org/advisories/RUSTSEC-2026-0349.html",
+	]
+}
+
 compatibility: "0.2.81": {
 	change:          "requires-restart"
 	operatorVersion: "v0.2.53"

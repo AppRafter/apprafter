@@ -22,6 +22,7 @@ use apprafter_os_auth::OsAuthenticator;
 use zeroize::Zeroizing;
 
 use crate::env::{AllowListEnv, TEST_PASSWORD_ENV};
+use crate::errors::{DesktopError, Refusal};
 use crate::ops::Clock;
 
 /// Why the OS is asked.
@@ -61,6 +62,25 @@ impl PasswordAnswer {
         },
         messages: Vec::new(),
     };
+
+    /// As a result: `Ok` when the owner was verified; otherwise the refusal it is, with what
+    /// the OS said.
+    pub fn into_result(self) -> Result<(), Refusal> {
+        let error = match self.outcome {
+            AuthOutcome::Verified => return Ok(()),
+            AuthOutcome::Cancelled { .. } => DesktopError::AuthCancelled,
+            AuthOutcome::Failed {
+                exhausted,
+                retry_in_ms,
+            } => DesktopError::AuthFailed {
+                exhausted,
+                retry_in_ms,
+            },
+            AuthOutcome::Unavailable { reason } => DesktopError::AuthUnavailable { reason },
+            AuthOutcome::Busy => DesktopError::AuthBusy,
+        };
+        Err(Refusal::new(error, self.messages))
+    }
 }
 
 impl From<AuthOutcome> for PasswordAnswer {

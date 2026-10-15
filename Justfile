@@ -29,6 +29,8 @@ lint:
     ./scripts/check-spdx-headers.sh
     ./scripts/check-no-cyrillic.sh
     ./scripts/check-heredoc-backticks.sh
+    ./scripts/check-e2e-isolation.sh
+    ./scripts/check-e2e-isolation.sh --self-test
     ./scripts/check-dump-diagnostics.sh
     ./scripts/check-workflows.sh
     ./scripts/docs-check.sh

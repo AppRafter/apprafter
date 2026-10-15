@@ -120,7 +120,7 @@ command -v docker >/dev/null 2>&1 || command -v podman >/dev/null 2>&1 || {
 }
 
 TMPDIR_WORK="$(mktemp -d)"
-APPRAFTER_CONFIG_DIR="${TMPDIR_WORK}/apprafter-config"
+e2e_isolate_store "${TMPDIR_WORK}"
 KUBECONFIG_FILE="${TMPDIR_WORK}/kubeconfig"
 
 cleanup() {

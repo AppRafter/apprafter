@@ -105,14 +105,30 @@ pub fn config_root_from_override(custom: Option<String>) -> Result<PathBuf> {
         })
 }
 
+/// The length of a Hetzner Cloud API token: 64 ASCII alphanumeric characters.
+pub const HETZNER_TOKEN_LEN: usize = 64;
+
+/// Where a Hetzner Cloud API token is created, in the console's own name and labels
+/// (docs.hetzner.com, "Generating an API token", read 2026-10-10: in the Hetzner Console, open
+/// the project, then Security in the left menu, API tokens in the upper one, then Generate API
+/// token). The console shows a token only once, when it is created, so a pointer here sends the
+/// reader to create a new token, never to copy an existing one.
+///
+/// Every help and page that says where a token comes from uses this text: the CLI's helps and
+/// doctor hint, the core's client-neutral help, the `--token` flag's help, the desktop's own
+/// hints (exported as `HETZNER_API_TOKENS_PAGE`) and the operator guide.
+/// `platform-cli/tests/hetzner_console_wording_test.rs` fails on any other spelling of the path.
+pub const HETZNER_API_TOKENS_PAGE: &str =
+    "the Hetzner Console (open the project, then Security → API tokens)";
+
 /// Validate a Hetzner Cloud API token's surface format. Cheap
 /// pre-flight before the real `GET /v1/locations` ping that
 /// arrives in Track A.4 — here we only catch obvious typos and
 /// wrong-credential-pasted-into-wrong-field mistakes (e.g. AWS
 /// access key landed in `--token`).
 ///
-/// **Format.** Hetzner Cloud tokens copied from the Cloud Console
-/// → Security → API Tokens panel are 64 ASCII alphanumeric
+/// **Format.** Hetzner Cloud API tokens, created in
+/// [`HETZNER_API_TOKENS_PAGE`], are 64 ASCII alphanumeric
 /// characters with no fixed prefix. The `HCLOUD_TOKEN` env var
 /// name is a Hetzner convention; the value inside it is just the
 /// bare 64 chars. `cli-dx-task.md` §11 originally documented an
@@ -127,10 +143,9 @@ pub fn config_root_from_override(custom: Option<String>) -> Result<PathBuf> {
 /// best how to phrase the surrounding error ("invalid token for
 /// --token flag" vs. "invalid token in credentials.yaml").
 pub fn validate_hetzner_token_format(token: &str) -> std::result::Result<(), String> {
-    const EXPECTED_LEN: usize = 64;
-    if token.len() != EXPECTED_LEN {
+    if token.len() != HETZNER_TOKEN_LEN {
         return Err(format!(
-            "Hetzner Cloud tokens are {EXPECTED_LEN} ASCII alphanumeric characters; got {}",
+            "Hetzner Cloud tokens are {HETZNER_TOKEN_LEN} ASCII alphanumeric characters; got {}",
             token.len()
         ));
     }
@@ -208,6 +223,24 @@ impl TargetStorePaths {
     pub fn lock_file(&self) -> PathBuf {
         self.root.join(LOCK_FILE)
     }
+
+    /// Makes `dir`, a folder of the store, with the folders above it that are missing
+    /// (WI-479): each one from the root down owner-only from its creation — 0700 on Unix
+    /// whatever the umask, the owner-only DACL on Windows — so a store AppRafter makes passes
+    /// [`crate::store_privacy::ensure_private`] whatever the umask. The root's own parents
+    /// (`~/.config`) are made as the account makes any folder. A `dir` outside the store (a
+    /// runtime dir under Local AppData or the desktop's data dir) is made owner-only itself,
+    /// its parents likewise as the account makes them. A folder already there is left as it
+    /// is: one another account can change is `store_privacy`'s to refuse, never AppRafter's to
+    /// change ([`crate::owner_only::create_dir_all_from`]).
+    pub fn create_dir_all(&self, dir: &Path) -> std::io::Result<()> {
+        let top = if dir.starts_with(&self.root) {
+            self.root.as_path()
+        } else {
+            dir
+        };
+        crate::owner_only::create_dir_all_from(top, dir)
+    }
 }
 
 /// What taking a [`StoreLock`] reports, for the caller to show in its own
@@ -269,6 +302,10 @@ thread_local! {
 /// locks — yields a guard that holds nothing ([`StoreLockEvent::Unlocked`],
 /// [`StoreLock::is_held`]): the edit goes ahead unlocked, and a read-only
 /// store fails at the save that needs writing, not at the lock.
+///
+/// A store another account owns or can write is no one's to change here
+/// (WI-475): once the lock is taken, a folder of the store another account
+/// owns or may write is `CliError::StoreNotPrivate`, and no guard is given.
 #[must_use = "the store is locked only while this value is alive"]
 pub struct StoreLock {
     /// The locked sentinel; `None` when the store could not be locked.
@@ -315,6 +352,13 @@ impl StoreLock {
         self.file.is_some()
     }
 
+    /// A guard that holds nothing, as [`StoreLock::exclusive`] gives on a store that cannot be
+    /// locked: for the tests of what must refuse to write without the lock (D.4a T28).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn unheld() -> StoreLock {
+        StoreLock::new(None)
+    }
+
     fn new(file: Option<fs::File>) -> StoreLock {
         LOCKS_ON_THIS_THREAD.with(|n| n.set(n.get() + 1));
         StoreLock { file }
@@ -328,8 +372,29 @@ impl Drop for StoreLock {
 }
 
 /// Take the store lock, waiting for another process forever (`within:
-/// None`) or at most `within` (`Ok(None)` past it).
+/// None`) or at most `within` (`Ok(None)` past it) — refusing a store
+/// another account owns or can write (WI-475,
+/// [`crate::store_privacy::ensure_private`]) both before the root and the
+/// sentinel are made, so such a store is left as it was, and once the lock
+/// is taken, before the caller changes anything: a root made just now, or
+/// a folder changed meanwhile. A refused guard is dropped, and
+/// `CliError::StoreNotPrivate` names the folder. A guard that holds
+/// nothing (a store that cannot be locked) is refused the same way.
 fn acquire(
+    paths: &TargetStorePaths,
+    within: Option<std::time::Duration>,
+    on_event: &mut dyn FnMut(StoreLockEvent<'_>),
+) -> Result<Option<StoreLock>> {
+    crate::store_privacy::ensure_private(paths)?;
+    let lock = lock_sentinel(paths, within, on_event)?;
+    if lock.is_some() {
+        crate::store_privacy::ensure_private(paths)?;
+    }
+    Ok(lock)
+}
+
+/// The lock itself: [`acquire`] before its check.
+fn lock_sentinel(
     paths: &TargetStorePaths,
     within: Option<std::time::Duration>,
     on_event: &mut dyn FnMut(StoreLockEvent<'_>),
@@ -340,7 +405,9 @@ fn acquire(
     );
     let sentinel = paths.lock_file();
 
-    fs::create_dir_all(paths.root()).map_err(|e| lock_error(&sentinel, e))?;
+    paths
+        .create_dir_all(paths.root())
+        .map_err(|e| lock_error(&sentinel, e))?;
     let file = match fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -436,7 +503,10 @@ fn has_no_locks(e: &std::io::Error) -> bool {
 fn lock_error(sentinel: &Path, e: std::io::Error) -> CliError {
     CliError::Io(std::io::Error::new(
         e.kind(),
-        format!("cannot lock the target store ({}): {e}", sentinel.display()),
+        format!(
+            "cannot take the target store's write lock ({}): {e}",
+            sentinel.display()
+        ),
     ))
 }
 
@@ -549,29 +619,35 @@ pub struct Target {
 /// Read `<root>/config.yaml`. Returns `Ok(None)` when absent
 /// (first-run case); `Err` only on corrupt YAML or filesystem
 /// failure so the caller can distinguish "no store yet" from
-/// "store broken".
+/// "store broken". A file that cannot be read, or checked for, is never
+/// absent (WI-482): it is the refusal of a folder another account owns
+/// when that is why ([`crate::store_privacy::foreign_folder_behind`]),
+/// else an I/O error naming the file.
 pub fn load_global_config(paths: &TargetStorePaths) -> Result<Option<GlobalConfig>> {
     let path = paths.global_config_file();
-    if !path.exists() {
+    let folder = paths.root();
+    if !store_path_exists(paths, &path, folder)? {
         return Ok(None);
     }
-    let bytes = fs::read(&path)?;
+    let bytes = fs::read(&path).map_err(|e| store_io(paths, &path, folder, e))?;
     let cfg: GlobalConfig =
         serde_yaml::from_slice(&bytes).map_err(|err| CliError::InvalidTargetConfig {
             path: path.clone(),
             message: err.to_string(),
+            target: None,
         })?;
     Ok(Some(cfg))
 }
 
 /// Write `<root>/config.yaml` atomically. Creates `<root>/` first
-/// if missing (and the `auth/` placeholder so the directory tree
-/// matches the spec the moment any write happens).
+/// if missing, owner-only ([`TargetStorePaths::create_dir_all`]; and the
+/// `auth/` placeholder so the directory tree matches the spec the moment
+/// any write happens).
 pub fn save_global_config(paths: &TargetStorePaths, cfg: &GlobalConfig) -> Result<()> {
-    fs::create_dir_all(paths.root())?;
+    paths.create_dir_all(paths.root())?;
     ensure_auth_placeholder(paths)?;
     let yaml = serde_yaml::to_string(cfg)?;
-    atomic_write(&paths.global_config_file(), yaml.as_bytes(), false)
+    atomic_write(paths, &paths.global_config_file(), yaml.as_bytes(), false)
 }
 
 /// Best-effort: which target should non-credential code paths
@@ -606,53 +682,50 @@ pub fn resolve_active_target_name(
 /// treat the target store strictly as a fallback, so a broken
 /// target file shouldn't take down operational commands that
 /// could otherwise succeed from env or state.json. Real errors
-/// surface through the credential resolver which IS allowed to
-/// fail.
+/// surface through the token read, which IS allowed to fail.
+/// Reads `config.yaml` only: the credentials file is the shared
+/// core's secret store's to read (D.4a b).
 pub fn load_active_target_config(
     paths: &TargetStorePaths,
     target_override: Option<&str>,
 ) -> Option<TargetConfig> {
     let name = resolve_active_target_name(paths, target_override).ok()??;
-    load_target(paths, &name).ok().map(|t| t.config)
+    load_target_config(paths, &name).ok()
 }
 
 // ---------------------------------------------------------------
 // Per-target IO
 // ---------------------------------------------------------------
 
-/// Read both halves (`config.yaml` + `credentials.yaml`) of one
-/// target. Missing target → `CliError::TargetNotFound` with the
-/// list of names currently present so error messages can be
-/// helpful without an extra round-trip.
-pub fn load_target(paths: &TargetStorePaths, name: &str) -> Result<Target> {
+/// Read one target's `config.yaml` only — never its credentials, so a listing reads no secret.
+/// Missing target → `CliError::TargetNotFound` with the names present, as [`load_target`]; a
+/// file that cannot be read, or checked for, → `CliError::TargetFileIo` naming the target, or
+/// `CliError::StoreNotPrivate` naming the folder when one another account owns is why
+/// (WI-481, [`crate::store_privacy::foreign_folder_behind`]).
+pub fn load_target_config(paths: &TargetStorePaths, name: &str) -> Result<TargetConfig> {
     let cfg_path = paths.target_config_file(name);
-    if !cfg_path.exists() {
+    if !target_file_exists(paths, &cfg_path, name)? {
         let available = list_target_names(paths).unwrap_or_default().join(", ");
         return Err(CliError::TargetNotFound {
             name: name.to_string(),
             available,
         });
     }
-    let cfg_bytes = fs::read(&cfg_path)?;
-    let config: TargetConfig =
-        serde_yaml::from_slice(&cfg_bytes).map_err(|err| CliError::InvalidTargetConfig {
-            path: cfg_path.clone(),
-            message: err.to_string(),
-        })?;
+    let cfg_bytes = read_target_file(paths, &cfg_path, name)?;
+    serde_yaml::from_slice(&cfg_bytes).map_err(|err| CliError::InvalidTargetConfig {
+        path: cfg_path.clone(),
+        message: err.to_string(),
+        target: Some(name.to_string()),
+    })
+}
 
-    let creds_path = paths.target_credentials_file(name);
-    let credentials = if creds_path.exists() {
-        let bytes = fs::read(&creds_path)?;
-        serde_yaml::from_slice::<TargetCredentials>(&bytes).map_err(|err| {
-            CliError::InvalidTargetConfig {
-                path: creds_path.clone(),
-                message: err.to_string(),
-            }
-        })?
-    } else {
-        TargetCredentials::default()
-    };
-
+/// Read both halves (`config.yaml` + `credentials.yaml`) of one
+/// target. Missing target → `CliError::TargetNotFound` with the
+/// list of names currently present so error messages can be
+/// helpful without an extra round-trip.
+pub fn load_target(paths: &TargetStorePaths, name: &str) -> Result<Target> {
+    let config = load_target_config(paths, name)?;
+    let credentials = load_target_credentials(paths, name)?;
     Ok(Target {
         name: name.to_string(),
         config,
@@ -660,45 +733,198 @@ pub fn load_target(paths: &TargetStorePaths, name: &str) -> Result<Target> {
     })
 }
 
-/// Persist both halves of a target. `config.yaml` is mode 0644
-/// (world-readable, ok for non-secret data); `credentials.yaml`
-/// is mode 0600 on Unix — `atomic_write(..., true)` enforces it
-/// before publishing the file under its final name, so there is
-/// no race window where the credentials are briefly readable by
-/// other local users.
+/// Read one target's `credentials.yaml` only, as [`load_target`] reads it: no file is no
+/// credentials, and a file that does not parse is `CliError::InvalidTargetConfig` whose message
+/// never quotes it (it holds the token). Whether the target exists is not checked: `target
+/// remove` reads each file of a target it cannot load on its own (WI-458).
+pub fn load_target_credentials(paths: &TargetStorePaths, name: &str) -> Result<TargetCredentials> {
+    match read_target_credentials_bytes(paths, name)? {
+        None => Ok(TargetCredentials::default()),
+        Some(bytes) => parse_target_credentials(paths, name, &bytes),
+    }
+}
+
+/// The bytes of target `name`'s `credentials.yaml`, read as [`load_target_credentials`] reads
+/// them: `None` when there is no file; a failure names the target (`CliError::TargetFileIo`), or
+/// the folder another account owns that is why (`CliError::StoreNotPrivate`, WI-481).
+/// Only the shared core's secret store calls it (D.4a T16): the bytes hold the token, or a
+/// locked store's vault marker. On Windows a file whose DACL is not owner-only (written before
+/// WI-472) is made owner-only on the handle it is read through
+/// ([`crate::owner_only::read_secret`], WI-473).
+pub fn read_target_credentials_bytes(
+    paths: &TargetStorePaths,
+    name: &str,
+) -> Result<Option<Vec<u8>>> {
+    let creds_path = paths.target_credentials_file(name);
+    if !target_file_exists(paths, &creds_path, name)? {
+        return Ok(None);
+    }
+    crate::owner_only::read_secret(&creds_path)
+        .map(Some)
+        .map_err(|source| target_file_io(paths, &creds_path, name, source))
+}
+
+/// `bytes`, target `name`'s `credentials.yaml`, parsed as [`load_target_credentials`] parses
+/// it: a failure is `CliError::InvalidTargetConfig`, never quoting the file.
+pub fn parse_target_credentials(
+    paths: &TargetStorePaths,
+    name: &str,
+    bytes: &[u8],
+) -> Result<TargetCredentials> {
+    serde_yaml::from_slice::<TargetCredentials>(bytes).map_err(|err| {
+        CliError::InvalidTargetConfig {
+            path: paths.target_credentials_file(name),
+            message: credentials_parse_message(&err),
+            target: Some(name.to_string()),
+        }
+    })
+}
+
+/// Whether `path`, one of target `name`'s own files, exists. Not `Path::exists`, which says no on
+/// any error: a target directory this user cannot search read as a target without its
+/// `config.yaml` and without credentials (WI-458 review #3). A check that fails is an I/O error
+/// on that file, naming the target (`CliError::TargetFileIo`). A path through a regular file is
+/// missing, as before: a file under `targets/` is not a target (`list_target_names` skips it).
+fn target_file_exists(paths: &TargetStorePaths, path: &Path, name: &str) -> Result<bool> {
+    match path.try_exists() {
+        Err(e) if e.kind() == std::io::ErrorKind::NotADirectory => Ok(false),
+        checked => checked.map_err(|source| target_file_io(paths, path, name, source)),
+    }
+}
+
+/// Whether `path`, a file or folder of the store's own in `folder`, exists. Not `Path::exists`,
+/// which says no on any error: a store root this account cannot search read as an empty store
+/// (WI-482, GOTCHA-173). A path through a regular file is missing, as it was. A check that
+/// fails is [`store_io`]'s error.
+fn store_path_exists(paths: &TargetStorePaths, path: &Path, folder: &Path) -> Result<bool> {
+    match path.try_exists() {
+        Err(e) if e.kind() == std::io::ErrorKind::NotADirectory => Ok(false),
+        checked => checked.map_err(|e| store_io(paths, path, folder, e)),
+    }
+}
+
+/// An error reading `path`, in the store's `folder`: the refusal of the folder another account
+/// owns when that is why (WI-481), else [`CliError::StorePathIo`] naming `path` (WI-482: it was
+/// a bare "Permission denied"), the OS error its cause (d4a-h N3: shown once), with the code of
+/// any I/O error.
+fn store_io(paths: &TargetStorePaths, path: &Path, folder: &Path, e: std::io::Error) -> CliError {
+    if let Some(refusal) = crate::store_privacy::foreign_folder_behind(paths, folder, &e) {
+        return refusal;
+    }
+    CliError::StorePathIo {
+        path: path.to_path_buf(),
+        source: e,
+    }
+}
+
+/// `path`, one of target `name`'s own files, read; an error names the target (review #6).
+fn read_target_file(paths: &TargetStorePaths, path: &Path, name: &str) -> Result<Vec<u8>> {
+    fs::read(path).map_err(|source| target_file_io(paths, path, name, source))
+}
+
+/// An error on `path`, one of target `name`'s own files: the refusal of the folder another
+/// account owns when that is why it was denied (WI-481: such a folder, 0700, cannot be opened by
+/// this account, and was a bare "Permission denied"), else the I/O error naming the target.
+fn target_file_io(
+    paths: &TargetStorePaths,
+    path: &Path,
+    name: &str,
+    source: std::io::Error,
+) -> CliError {
+    let folder = path.parent().unwrap_or(path);
+    if let Some(refusal) = crate::store_privacy::foreign_folder_behind(paths, folder, &source) {
+        return refusal;
+    }
+    CliError::TargetFileIo {
+        path: path.to_path_buf(),
+        target: name.to_string(),
+        source,
+    }
+}
+
+/// What a credentials file that does not parse is said to be: where it failed, never serde's
+/// own text, which quotes the scalar it could not read — in this file, the token (a hand edit
+/// with no space after the colon, `hetzner_token:<token>`, is one plain scalar).
+fn credentials_parse_message(err: &serde_yaml::Error) -> String {
+    match err.location() {
+        Some(at) => format!(
+            "not a valid target credentials map (line {}, column {})",
+            at.line(),
+            at.column()
+        ),
+        None => "not a valid target credentials map".to_string(),
+    }
+}
+
+/// Persist both halves of a target: `config.yaml` (mode 0644,
+/// world-readable, ok for non-secret data), then `credentials.yaml`
+/// ([`save_target_credentials`]).
 pub fn save_target(paths: &TargetStorePaths, target: &Target) -> Result<()> {
-    fs::create_dir_all(paths.target_dir(&target.name))?;
-    ensure_auth_placeholder(paths)?;
+    save_target_config(paths, &target.name, &target.config)?;
+    save_target_credentials(paths, &target.name, &target.credentials)
+}
 
-    let cfg_yaml = serde_yaml::to_string(&target.config)?;
+/// Persist a target's `credentials.yaml` and nothing else, mode 0600 on
+/// Unix — `atomic_write(..., true)` enforces it before publishing the file
+/// under its final name, so there is no window where the credentials are
+/// readable by other local users. The bytes are the ones [`save_target`]
+/// writes. Its one production caller is the shared core's secret store
+/// (D.4a b), the one door to a stored token.
+pub fn save_target_credentials(
+    paths: &TargetStorePaths,
+    name: &str,
+    credentials: &TargetCredentials,
+) -> Result<()> {
+    let creds_yaml = serde_yaml::to_string(credentials)?;
     atomic_write(
-        &paths.target_config_file(&target.name),
-        cfg_yaml.as_bytes(),
-        false,
-    )?;
-
-    let creds_yaml = serde_yaml::to_string(&target.credentials)?;
-    atomic_write(
-        &paths.target_credentials_file(&target.name),
+        paths,
+        &paths.target_credentials_file(name),
         creds_yaml.as_bytes(),
         true,
-    )?;
-    Ok(())
+    )
+}
+
+/// Persist a target's `config.yaml` (mode 0644) and nothing else: its `credentials.yaml` is
+/// neither read nor written, so a change that keeps the token leaves that file as it was,
+/// byte for byte (`target add --renew --ssh-key` without a new token).
+pub fn save_target_config(
+    paths: &TargetStorePaths,
+    name: &str,
+    config: &TargetConfig,
+) -> Result<()> {
+    paths.create_dir_all(&paths.target_dir(name))?;
+    ensure_auth_placeholder(paths)?;
+    let cfg_yaml = serde_yaml::to_string(config)?;
+    atomic_write(
+        paths,
+        &paths.target_config_file(name),
+        cfg_yaml.as_bytes(),
+        false,
+    )
 }
 
 /// Names of every target directory under `<root>/targets/`,
 /// sorted lexicographically so callers get a stable order without
 /// each one re-sorting. Returns `Ok(vec![])` if the directory
-/// doesn't exist yet.
+/// doesn't exist yet. A `targets/` another account owns and this
+/// account cannot open is that folder's refusal
+/// (`CliError::StoreNotPrivate`, WI-481), not a bare I/O error; so is a
+/// store root another account owns and this account cannot search,
+/// which `Path::exists` read as no `targets/` at all, an empty store
+/// (WI-482). Any other failure names the path it could not read.
 pub fn list_target_names(paths: &TargetStorePaths) -> Result<Vec<String>> {
     let dir = paths.targets_dir();
-    if !dir.exists() {
+    if !store_path_exists(paths, &dir, paths.root())? {
         return Ok(Vec::new());
     }
+    let entries = fs::read_dir(&dir).map_err(|e| store_io(paths, &dir, &dir, e))?;
     let mut names: Vec<String> = Vec::new();
-    for entry in fs::read_dir(&dir)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
+    for entry in entries {
+        let entry = entry.map_err(|e| store_io(paths, &dir, &dir, e))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|e| store_io(paths, &entry.path(), &dir, e))?;
+        if !file_type.is_dir() {
             continue;
         }
         if let Some(name) = entry.file_name().to_str() {
@@ -755,7 +981,7 @@ pub fn rename_target(paths: &TargetStorePaths, from: &str, to: &str) -> Result<(
         // Ensure parent of `state_dir` exists; fs::rename refuses
         // when the parent of the destination is missing.
         if let Some(parent) = to_state.parent() {
-            fs::create_dir_all(parent)?;
+            paths.create_dir_all(parent)?;
         }
         fs::rename(&from_state, &to_state)?;
     }
@@ -791,8 +1017,9 @@ pub fn remove_target(paths: &TargetStorePaths, name: &str) -> Result<()> {
 // Internal: atomic write + permission enforcement
 // ---------------------------------------------------------------
 
-/// Write `bytes` to `final_path` atomically, through
-/// [`crate::atomic_replace`]: a temp file in the same directory
+/// Write `bytes` to `final_path`, a file of the store `paths`, atomically
+/// (its folder made owner-only when missing: [`TargetStorePaths::create_dir_all`]),
+/// through [`crate::atomic_replace`]: a temp file in the same directory
 /// (`.apprafter-tgt-XXXXXX.tmp`), written, given its mode and fsynced
 /// under the temp name, then renamed over `final_path`. Readers see the
 /// old file or the new one, never a partial write or an over-permissive
@@ -800,24 +1027,31 @@ pub fn remove_target(paths: &TargetStorePaths, name: &str) -> Result<()> {
 /// the replace fail.
 ///
 /// `secret = true` enforces mode 0600 (owner read/write only) on
-/// Unix, `false` 0644. On Windows the mode is ignored (NTFS ACLs
-/// inherit from the parent; tightening per-file is out of scope
-/// for v0.1.72).
-fn atomic_write(final_path: &Path, bytes: &[u8], secret: bool) -> Result<()> {
+/// Unix, `false` 0644. On Windows a secret file gets the protected
+/// one-ACE DACL instead, set on the temp file before its first byte
+/// ([`crate::owner_only`], WI-472): owner-only even in a store whose
+/// folder other users can read. A non-secret one keeps what it
+/// inherits from its directory.
+fn atomic_write(
+    paths: &TargetStorePaths,
+    final_path: &Path,
+    bytes: &[u8],
+    secret: bool,
+) -> Result<()> {
     let parent = final_path.parent().ok_or_else(|| {
         CliError::Other(format!(
             "internal: atomic_write called with rootless path {}",
             final_path.display()
         ))
     })?;
-    fs::create_dir_all(parent)?;
+    paths.create_dir_all(parent)?;
     let mode = if secret { 0o600 } else { 0o644 };
     crate::atomic_replace(final_path, bytes, ".apprafter-tgt-", Some(mode))?;
     Ok(())
 }
 
 fn ensure_auth_placeholder(paths: &TargetStorePaths) -> Result<()> {
-    fs::create_dir_all(paths.auth_dir())?;
+    paths.create_dir_all(&paths.auth_dir())?;
     let keep = paths.auth_keep_file();
     if !keep.exists() {
         // Empty marker so the reserved `auth/` directory shows up
@@ -835,6 +1069,8 @@ fn ensure_auth_placeholder(paths: &TargetStorePaths) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use crate::owner_only::testing::ModeGuard;
     use tempfile::tempdir;
 
     fn make_paths() -> (tempfile::TempDir, TargetStorePaths) {
@@ -847,8 +1083,20 @@ mod tests {
     fn default_config_root_points_at_user_config_dir_under_apprafter() {
         // Sanity guard: we never accidentally rebase the store on
         // some unrelated dir. Only assert that the leaf segment is
-        // `apprafter/` because the parent depends on host XDG.
-        let p = default_config_root().expect("dirs::config_dir should work in test env");
+        // `apprafter/` because the parent depends on host XDG. The
+        // override is cleared for the call, under the crate-wide test
+        // mutex: a sibling test sets it (the race windows-latest met),
+        // and so may the environment the tests run in.
+        let _guard = crate::TEST_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var(CONFIG_DIR_ENV).ok();
+        std::env::remove_var(CONFIG_DIR_ENV);
+        let resolved = default_config_root();
+        if let Some(v) = prior {
+            std::env::set_var(CONFIG_DIR_ENV, v);
+        }
+        let p = resolved.expect("dirs::config_dir should work in test env");
         assert_eq!(
             p.file_name().and_then(|s| s.to_str()),
             Some("apprafter"),
@@ -878,11 +1126,89 @@ mod tests {
         assert_eq!(paths.state_dir("work"), root.join("state/work"));
     }
 
+    /// D.3d review #5: serde_yaml's text quotes the scalar it could not read, and in a
+    /// credentials file that scalar is the token — a hand edit with no space after the colon
+    /// (`hetzner_token:<token>`) is one plain scalar, and so is a bare token line. The error
+    /// names the file and where in it, never what it holds; it reaches a terminal, the desktop's
+    /// error panel, and doctor's row.
+    #[test]
+    fn a_credentials_file_that_does_not_parse_is_named_by_its_place_never_its_text() {
+        let (_dir, paths) = make_paths();
+        let token = "t0k3n".repeat(13);
+        save_target(
+            &paths,
+            &Target {
+                name: "prod".into(),
+                config: TargetConfig {
+                    provider: "hetzner-cloud".into(),
+                    ..Default::default()
+                },
+                credentials: TargetCredentials::default(),
+            },
+        )
+        .unwrap();
+        let creds = paths.target_credentials_file("prod");
+        for (body, line, column) in [
+            (format!("hetzner_token:{token}\n"), 1, 1),
+            (format!("{token}\n"), 1, 1),
+            (format!("hetzner_token: [{token}]\n"), 1, 16),
+            (format!("# a token\nhetzner_token: [{token}\n"), 2, 16),
+        ] {
+            fs::write(&creds, &body).unwrap();
+            let err = load_target(&paths, "prod").expect_err(&body);
+            let shown = err.to_string();
+            assert!(!shown.contains(&token), "the token is quoted: {shown}");
+            match err {
+                CliError::InvalidTargetConfig {
+                    path,
+                    message,
+                    target,
+                } => {
+                    assert_eq!(path, creds);
+                    assert_eq!(target.as_deref(), Some("prod"), "the file's target");
+                    assert_eq!(
+                        message,
+                        format!(
+                            "not a valid target credentials map (line {line}, column {column})"
+                        ),
+                        "{body}"
+                    );
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn load_global_config_returns_none_on_fresh_store() {
         let (_dir, paths) = make_paths();
         let loaded = load_global_config(&paths).expect("missing file is not an error");
         assert!(loaded.is_none());
+    }
+
+    /// A config-only save rewrites `config.yaml` and leaves `credentials.yaml` exactly as it
+    /// was, a hand-written comment included, and creates none where there was none.
+    #[test]
+    fn a_config_only_save_never_touches_the_credentials_file() {
+        let (_dir, paths) = make_paths();
+        let config = |key: &str| TargetConfig {
+            provider: "hetzner-cloud".into(),
+            ssh_key_path: Some(key.into()),
+            ..Default::default()
+        };
+        save_target_config(&paths, "work", &config("/k/old.pub")).unwrap();
+        assert!(!paths.target_credentials_file("work").exists());
+        let creds = "# rotated by hand\nhetzner_token: 'abc'\n";
+        fs::write(paths.target_credentials_file("work"), creds).unwrap();
+        save_target_config(&paths, "work", &config("/k/new.pub")).unwrap();
+        assert_eq!(
+            fs::read_to_string(paths.target_credentials_file("work")).unwrap(),
+            creds
+        );
+        assert_eq!(
+            load_target_config(&paths, "work").unwrap().ssh_key_path,
+            Some("/k/new.pub".into())
+        );
     }
 
     #[test]
@@ -920,10 +1246,32 @@ mod tests {
         fs::write(paths.global_config_file(), b"not: valid: yaml: : :").unwrap();
         let err = load_global_config(&paths).expect_err("corrupt yaml must error");
         match err {
-            CliError::InvalidTargetConfig { path, .. } => {
+            CliError::InvalidTargetConfig { path, target, .. } => {
                 assert_eq!(path, paths.global_config_file());
+                assert_eq!(target, None, "the store's own file belongs to no target");
             }
             other => panic!("expected InvalidTargetConfig, got {other:?}"),
+        }
+    }
+
+    /// A target's own `config.yaml` that does not parse names its target, so the help can offer
+    /// re-adding that target (the store's `config.yaml` names none).
+    #[test]
+    fn a_corrupt_target_config_names_its_target() {
+        let (_dir, paths) = make_paths();
+        fs::create_dir_all(paths.target_dir("prod")).unwrap();
+        fs::write(paths.target_config_file("prod"), b"not: valid: yaml: : :").unwrap();
+        for err in [
+            load_target_config(&paths, "prod").unwrap_err(),
+            load_target(&paths, "prod").unwrap_err(),
+        ] {
+            match err {
+                CliError::InvalidTargetConfig { path, target, .. } => {
+                    assert_eq!(path, paths.target_config_file("prod"));
+                    assert_eq!(target.as_deref(), Some("prod"));
+                }
+                other => panic!("expected InvalidTargetConfig, got {other:?}"),
+            }
         }
     }
 
@@ -1041,6 +1389,75 @@ mod tests {
         );
     }
 
+    /// WI-472: on Windows `credentials.yaml` is owner-only by its DACL — protected, one ACE,
+    /// this user — from the temp file's first byte (the token is never written into a file
+    /// that inherits its folder's DACL) through the rename; `config.yaml` is not secret and
+    /// keeps what it inherits.
+    #[cfg(windows)]
+    #[test]
+    fn credentials_file_lands_with_the_owner_only_dacl() {
+        use crate::owner_only::testing;
+        let (_dir, paths) = make_paths();
+        let target = Target {
+            name: "work".into(),
+            config: TargetConfig {
+                provider: "hetzner-cloud".into(),
+                ..Default::default()
+            },
+            credentials: TargetCredentials {
+                hetzner_token: Some("hcloud_secret".into()),
+            },
+        };
+        save_target(&paths, &target).expect("save ok");
+        let _ = testing::take_before_first_byte();
+        save_target_credentials(&paths, "work", &target.credentials).expect("save ok");
+        testing::take_before_first_byte()
+            .expect("the write recorded its temp file's DACL")
+            .unwrap()
+            .assert_owner_only_file("credentials.yaml's temp file before its first byte");
+        testing::of_path(&paths.target_credentials_file("work"))
+            .unwrap()
+            .assert_owner_only_file("credentials.yaml");
+        assert!(
+            !testing::of_path(&paths.target_config_file("work"))
+                .unwrap()
+                .protected,
+            "config.yaml is not secret: it keeps what its directory hands down"
+        );
+    }
+
+    /// WI-473: on Windows a `credentials.yaml` other accounts can read — written before WI-472
+    /// into a folder that hands its DACL down, or widened since — is owner-only once read, and
+    /// reads the same.
+    #[cfg(windows)]
+    #[test]
+    fn a_wide_credentials_file_is_owner_only_once_read() {
+        use crate::owner_only::testing;
+        let (_dir, paths) = make_paths();
+        let target = Target {
+            name: "work".into(),
+            config: TargetConfig {
+                provider: "hetzner-cloud".into(),
+                ..Default::default()
+            },
+            credentials: TargetCredentials {
+                hetzner_token: Some("hcloud_secret".into()),
+            },
+        };
+        save_target(&paths, &target).expect("save ok");
+        let creds = paths.target_credentials_file("work");
+        testing::widen(&creds).unwrap();
+        assert!(
+            !testing::of_path(&creds).unwrap().is_owner_only(),
+            "the test's premise"
+        );
+        let read = load_target_credentials(&paths, "work").unwrap();
+        assert_eq!(read.hetzner_token.as_deref(), Some("hcloud_secret"));
+        testing::of_path(&creds)
+            .unwrap()
+            .assert_owner_only_file("credentials.yaml, read");
+    }
+
     #[test]
     fn the_store_lock_is_exclusive_across_handles() {
         let dir = tempfile::tempdir().unwrap();
@@ -1066,6 +1483,64 @@ mod tests {
         let paths = TargetStorePaths::for_root(root.clone());
         let _g = StoreLock::exclusive(&paths).unwrap();
         assert!(root.join(".lock").is_file());
+    }
+
+    /// WI-475: a store another account owns (pretended, in a temp dir) or can write is refused
+    /// once the lock is taken, before anything is changed; the lock is let go, so the next
+    /// taker on this thread neither panics nor waits, and a fixed store is locked again.
+    #[test]
+    fn the_store_lock_refuses_a_store_another_account_can_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = TargetStorePaths::for_root(dir.path().join("store"));
+        fs::create_dir_all(paths.target_dir("prod")).unwrap();
+        {
+            let _foreign = crate::owner_only::pretend::foreign_owner(&paths.target_dir("prod"));
+            assert!(!paths.lock_file().exists(), "the test's premise");
+            for taken in [
+                StoreLock::exclusive(&paths).map(|_| ()),
+                StoreLock::try_exclusive_for(&paths, std::time::Duration::ZERO, |_| {}).map(|_| ()),
+            ] {
+                match taken {
+                    Err(CliError::StoreNotPrivate { path, problem }) => {
+                        assert_eq!(path, paths.target_dir("prod"));
+                        assert_eq!(problem, crate::StoreFolderProblem::ForeignOwner);
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
+            assert!(
+                !paths.lock_file().exists(),
+                "a refused store gets no sentinel either"
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(paths.root(), fs::Permissions::from_mode(0o777)).unwrap();
+            assert!(matches!(
+                StoreLock::exclusive(&paths),
+                Err(CliError::StoreNotPrivate {
+                    problem: crate::StoreFolderProblem::WritableByOthers,
+                    ..
+                })
+            ));
+            fs::set_permissions(paths.root(), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let held = StoreLock::exclusive(&paths).unwrap();
+        assert!(held.is_held());
+    }
+
+    /// WI-475: a root the lock makes is checked once made — here one another account would own
+    /// (pretended): nothing was there to check before.
+    #[test]
+    fn a_root_the_lock_makes_is_checked_once_made() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = TargetStorePaths::for_root(dir.path().join("fresh"));
+        let _foreign = crate::owner_only::pretend::foreign_owner(paths.root());
+        match StoreLock::exclusive(&paths) {
+            Err(CliError::StoreNotPrivate { path, .. }) => assert_eq!(path, paths.root()),
+            other => panic!("{:?}", other.map(|l| l.is_held())),
+        }
     }
 
     #[test]
@@ -1243,6 +1718,9 @@ mod tests {
     #[test]
     fn a_read_only_sentinel_is_still_locked() {
         use std::os::unix::fs::PermissionsExt;
+        // The lock is let go and taken again at once: no umask test's child may hold a copy of
+        // its descriptor meanwhile (WI-479).
+        let _no_fork = crate::owner_only::under_umask::no_child_starting();
         let (_dir, paths) = make_paths();
         drop(StoreLock::exclusive(&paths).unwrap());
         fs::set_permissions(paths.lock_file(), fs::Permissions::from_mode(0o444)).unwrap();
@@ -1257,19 +1735,6 @@ mod tests {
         ));
     }
 
-    /// Restores a directory's mode on drop, so a failed test still lets
-    /// its `TempDir` clean up.
-    #[cfg(unix)]
-    struct ModeGuard(PathBuf);
-
-    #[cfg(unix)]
-    impl Drop for ModeGuard {
-        fn drop(&mut self) {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
-        }
-    }
-
     /// A store this process cannot write, with no sentinel in it yet: there
     /// is nothing to lock, so the guard holds nothing and says why.
     ///
@@ -1278,11 +1743,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_store_that_cannot_hold_a_sentinel_is_used_unlocked_with_a_warning() {
-        use std::os::unix::fs::PermissionsExt;
         let (_dir, paths) = make_paths();
         save_global_config(&paths, &GlobalConfig::default()).unwrap();
-        fs::set_permissions(paths.root(), fs::Permissions::from_mode(0o555)).unwrap();
-        let _restore = ModeGuard(paths.root().to_path_buf());
+        let _restore = ModeGuard::set(paths.root(), 0o555);
         if fs::write(paths.root().join("probe"), b"").is_ok() {
             eprintln!(
                 "SKIPPED a_store_that_cannot_hold_a_sentinel_is_used_unlocked_with_a_warning: \
@@ -1351,6 +1814,216 @@ mod tests {
         let (_dir, paths) = make_paths();
         let err = remove_target(&paths, "ghost").expect_err("missing target");
         assert!(matches!(err, CliError::TargetNotFound { .. }));
+    }
+
+    /// A hetzner-cloud target `name` with both of its files.
+    fn saved(paths: &TargetStorePaths, name: &str) {
+        let target = Target {
+            name: name.into(),
+            config: TargetConfig {
+                provider: "hetzner-cloud".into(),
+                ..Default::default()
+            },
+            credentials: TargetCredentials::default(),
+        };
+        save_target(paths, &target).unwrap();
+    }
+
+    /// `err` is an I/O error on target `prod`'s file `path`, of `kind`.
+    #[cfg(unix)]
+    fn assert_target_file_io(err: &CliError, path: &Path, kind: std::io::ErrorKind) {
+        match err {
+            CliError::TargetFileIo {
+                path: p,
+                target,
+                source,
+            } => {
+                assert_eq!((p.as_path(), target.as_str()), (path, "prod"));
+                assert_eq!(source.kind(), kind);
+            }
+            other => panic!("expected TargetFileIo on {}, got {other:?}", path.display()),
+        }
+    }
+
+    /// WI-458 review #3: `Path::exists` says no on any error, so a target directory this user
+    /// cannot search read as a target without its config.yaml (`TargetNotFound`) and without
+    /// credentials (`Ok(default)`). Each is an I/O error on that target's file now, naming the
+    /// target (review #6). A 000 directory: the tests run as a user its mode binds.
+    #[cfg(unix)]
+    #[test]
+    fn a_target_directory_that_cannot_be_searched_is_an_io_error_never_missing() {
+        use std::io::ErrorKind::PermissionDenied;
+        let (_dir, paths) = make_paths();
+        saved(&paths, "prod");
+        let _closed = ModeGuard::closed(&paths.target_dir("prod"));
+        let config = load_target_config(&paths, "prod").expect_err("cannot be searched");
+        assert_target_file_io(&config, &paths.target_config_file("prod"), PermissionDenied);
+        let credentials = load_target_credentials(&paths, "prod").expect_err("cannot be searched");
+        assert_target_file_io(
+            &credentials,
+            &paths.target_credentials_file("prod"),
+            PermissionDenied,
+        );
+        let both = load_target(&paths, "prod").expect_err("cannot be searched");
+        assert_target_file_io(&both, &paths.target_config_file("prod"), PermissionDenied);
+    }
+
+    /// WI-481: a target's folder, or `targets/`, that another account owns (pretended) and this
+    /// account cannot open (mode 000, as such a folder made 0700 is to it) is that folder's
+    /// refusal, named — through every read of a target's files and the target list — never a
+    /// bare "Permission denied". The test asserts first that mode 000 locks it out (not root).
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_another_account_owns_and_keeps_closed_is_refused_by_every_read() {
+        let (_dir, paths) = make_paths();
+        saved(&paths, "prod");
+        let refused_naming = |err: CliError, folder: &Path| match err {
+            CliError::StoreNotPrivate {
+                path,
+                problem: crate::error::StoreFolderProblem::ForeignOwner,
+            } => assert_eq!(path, folder),
+            other => panic!("expected StoreNotPrivate naming {folder:?}, got {other:?}"),
+        };
+        let prod = paths.target_dir("prod");
+        {
+            let _foreign = crate::owner_only::pretend::foreign_owner(&prod);
+            let _closed = ModeGuard::closed(&prod);
+            refused_naming(load_target_config(&paths, "prod").unwrap_err(), &prod);
+            refused_naming(load_target_credentials(&paths, "prod").unwrap_err(), &prod);
+            refused_naming(load_target(&paths, "prod").unwrap_err(), &prod);
+            refused_naming(
+                read_target_credentials_bytes(&paths, "prod").unwrap_err(),
+                &prod,
+            );
+            assert_eq!(list_target_names(&paths).unwrap(), ["prod"]);
+        }
+        let targets = paths.targets_dir();
+        let _foreign = crate::owner_only::pretend::foreign_owner(&targets);
+        let _closed = ModeGuard::closed(&targets);
+        refused_naming(list_target_names(&paths).unwrap_err(), &targets);
+        refused_naming(load_target_config(&paths, "prod").unwrap_err(), &targets);
+    }
+
+    /// WI-482 (1): a store root another account owns (pretended) and this account cannot
+    /// search (mode 000, as such a root made 0700 is to it) is that root's refusal, named,
+    /// through the target list, the global config and the active target — never an empty store.
+    /// `Path::exists` said no on the denial (GOTCHA-173), so `target list` said "No targets
+    /// configured" and `target show` found no active target.
+    #[cfg(unix)]
+    #[test]
+    fn a_store_root_another_account_owns_and_keeps_closed_is_refused_never_empty() {
+        let (_dir, paths) = make_paths();
+        saved(&paths, "prod");
+        let global = GlobalConfig {
+            active_target: "prod".into(),
+            ..GlobalConfig::default()
+        };
+        save_global_config(&paths, &global).unwrap();
+        let root = paths.root().to_path_buf();
+        let refused = |err: CliError| match err {
+            CliError::StoreNotPrivate {
+                path,
+                problem: crate::error::StoreFolderProblem::ForeignOwner,
+            } => assert_eq!(path, root),
+            other => panic!("expected StoreNotPrivate naming {root:?}, got {other:?}"),
+        };
+        let _foreign = crate::owner_only::pretend::foreign_owner(&root);
+        let _closed = ModeGuard::closed(&root);
+        refused(list_target_names(&paths).unwrap_err());
+        refused(load_global_config(&paths).unwrap_err());
+        refused(resolve_active_target_name(&paths, None).unwrap_err());
+    }
+
+    /// A store root that is a regular file has no `targets` and no `config.yaml` under it: a
+    /// path through a file is missing (ENOTDIR), as under `Path::exists`, not an I/O error.
+    #[test]
+    fn a_store_root_that_is_a_file_holds_no_targets() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("store");
+        fs::write(&root, b"not a folder").unwrap();
+        let paths = TargetStorePaths::for_root(root);
+        assert_eq!(list_target_names(&paths).unwrap(), Vec::<String>::new());
+        assert_eq!(load_global_config(&paths).unwrap(), None);
+    }
+
+    /// WI-482 (2): a folder of this account's own that it closed (mode 000) is its own problem,
+    /// and the error names the path it could not read: `targets` when the root is closed (that
+    /// check is what fails) or when `targets` itself is, the root's `config.yaml` for the
+    /// global config, a target's file for its folder. They were a bare "io error: Permission
+    /// denied" with no path. Still `apprafter::io::error`, of kind `PermissionDenied`.
+    #[cfg(unix)]
+    #[test]
+    fn an_own_folder_closed_to_this_account_names_the_path_it_could_not_read() {
+        use std::io::ErrorKind::PermissionDenied;
+        let (_dir, paths) = make_paths();
+        saved(&paths, "prod");
+        save_global_config(&paths, &GlobalConfig::default()).unwrap();
+        let names = |err: CliError, path: &Path| {
+            let text = err.to_string();
+            let kind = match &err {
+                CliError::StorePathIo { source, .. } => source.kind(),
+                CliError::TargetFileIo { source, .. } => source.kind(),
+                other => panic!("expected an I/O error naming {path:?}, got {other:?}"),
+            };
+            assert_eq!(kind, PermissionDenied, "{text}");
+            assert!(text.contains(&path.display().to_string()), "{text}");
+        };
+        {
+            let _closed = ModeGuard::closed(paths.root());
+            names(list_target_names(&paths).unwrap_err(), &paths.targets_dir());
+            names(
+                load_global_config(&paths).unwrap_err(),
+                &paths.global_config_file(),
+            );
+        }
+        {
+            let _closed = ModeGuard::closed(&paths.targets_dir());
+            names(list_target_names(&paths).unwrap_err(), &paths.targets_dir());
+        }
+        let _closed = ModeGuard::closed(&paths.target_dir("prod"));
+        let err = load_target_config(&paths, "prod").unwrap_err();
+        assert!(matches!(err, CliError::TargetFileIo { .. }), "{err:?}");
+        names(err, &paths.target_config_file("prod"));
+    }
+
+    /// Review #6: a target's own file that cannot be read is an I/O error naming the target, so
+    /// the desktop can tell it from a store-level one. The other file still reads.
+    #[cfg(unix)]
+    #[test]
+    fn a_target_file_that_cannot_be_read_is_an_io_error_naming_its_target() {
+        use std::io::ErrorKind::PermissionDenied;
+        let (_dir, paths) = make_paths();
+        saved(&paths, "prod");
+        let creds = paths.target_credentials_file("prod");
+        {
+            let _closed = ModeGuard::closed(&creds);
+            load_target_config(&paths, "prod").expect("config.yaml reads");
+            let err = load_target_credentials(&paths, "prod").expect_err("cannot be read");
+            assert_target_file_io(&err, &creds, PermissionDenied);
+        }
+        let cfg = paths.target_config_file("prod");
+        let _closed = ModeGuard::closed(&cfg);
+        let err = load_target_config(&paths, "prod").expect_err("cannot be read");
+        assert_target_file_io(&err, &cfg, PermissionDenied);
+    }
+
+    /// A regular file under `targets/` is not a target (`list_target_names` skips it): a path
+    /// through it is missing, as it was under `Path::exists`, not an I/O error.
+    #[test]
+    fn a_file_where_a_target_directory_would_be_is_not_a_target() {
+        let (_dir, paths) = make_paths();
+        saved(&paths, "prod");
+        fs::write(paths.targets_dir().join("notes"), b"x").unwrap();
+        match load_target_config(&paths, "notes") {
+            Err(CliError::TargetNotFound { name, available }) => {
+                assert_eq!((name.as_str(), available.as_str()), ("notes", "prod"));
+            }
+            other => panic!("expected TargetNotFound, got {other:?}"),
+        }
+        assert_eq!(
+            load_target_credentials(&paths, "notes").unwrap(),
+            TargetCredentials::default()
+        );
     }
 
     #[test]
@@ -1528,7 +2201,7 @@ mod tests {
 
     #[test]
     fn validate_hetzner_token_format_accepts_canonical_64_char_token() {
-        // Canonical Hetzner Cloud Console token shape: 64 ASCII
+        // Canonical Hetzner Cloud API token shape: 64 ASCII
         // alphanumeric, no prefix. Without this case passing the
         // CLI rejected every real-world token (v0.1.74 regression
         // fix — v0.1.73 had wrongly required an `hcloud_` prefix
@@ -1666,5 +2339,364 @@ mod tests {
     fn config_root_from_override_without_value_uses_the_platform_dir() {
         let root = config_root_from_override(None).unwrap();
         assert!(root.ends_with("apprafter"), "got {root:?}");
+    }
+
+    #[test]
+    fn the_config_loads_without_reading_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = TargetStorePaths::for_root(dir.path().to_path_buf());
+        save_target(
+            &paths,
+            &Target {
+                name: "prod".into(),
+                config: TargetConfig {
+                    provider: "hetzner-cloud".into(),
+                    ..Default::default()
+                },
+                credentials: TargetCredentials::default(),
+            },
+        )
+        .unwrap();
+        std::fs::write(paths.target_credentials_file("prod"), "{not yaml").unwrap();
+        assert_eq!(
+            load_target_config(&paths, "prod").unwrap().provider,
+            "hetzner-cloud"
+        );
+        assert!(
+            load_target(&paths, "prod").is_err(),
+            "the full load still reads credentials"
+        );
+        assert!(matches!(
+            load_target_config(&paths, "ghost"),
+            Err(CliError::TargetNotFound { .. })
+        ));
+    }
+
+    /// D.4a b: the active target's config is read without its credentials, so a credentials
+    /// file that cannot be read hides nothing from the fallback read of `apply` / `import`.
+    #[test]
+    fn the_active_target_config_is_read_without_its_credentials() {
+        let (_dir, paths) = make_paths();
+        saved(&paths, "prod");
+        save_global_config(
+            &paths,
+            &GlobalConfig {
+                active_target: "prod".into(),
+                version: TARGET_STORE_VERSION,
+            },
+        )
+        .unwrap();
+        fs::write(paths.target_credentials_file("prod"), "{not yaml").unwrap();
+        for target in [None, Some("prod")] {
+            assert_eq!(
+                load_active_target_config(&paths, target).map(|c| c.provider),
+                Some("hetzner-cloud".to_string()),
+                "{target:?}"
+            );
+        }
+        assert!(load_active_target_config(&paths, Some("ghost")).is_none());
+    }
+
+    /// D.4a b: the credentials file alone, written as `save_target` writes it (mode 0600,
+    /// the same bytes — pinned as a literal, since `save_target` now calls this very writer),
+    /// with `config.yaml` left as it was.
+    #[test]
+    fn credentials_alone_are_saved_as_save_target_saves_them() {
+        let (_a, whole) = make_paths();
+        let (_b, split) = make_paths();
+        let config = TargetConfig {
+            provider: "hetzner-cloud".into(),
+            ssh_key_path: Some("/k/id.pub".into()),
+            ..Default::default()
+        };
+        let credentials = TargetCredentials {
+            hetzner_token: Some("hcloud_secret".into()),
+        };
+        save_target(
+            &whole,
+            &Target {
+                name: "work".into(),
+                config: config.clone(),
+                credentials: credentials.clone(),
+            },
+        )
+        .unwrap();
+        save_target_config(&split, "work", &config).unwrap();
+        let config_bytes = fs::read(split.target_config_file("work")).unwrap();
+        save_target_credentials(&split, "work", &credentials).unwrap();
+        assert_eq!(
+            fs::read_to_string(split.target_credentials_file("work")).unwrap(),
+            "hetzner_token: hcloud_secret\n",
+            "the bytes serde_yaml 0.9 writes for TargetCredentials"
+        );
+        assert_eq!(
+            fs::read(split.target_credentials_file("work")).unwrap(),
+            fs::read(whole.target_credentials_file("work")).unwrap()
+        );
+        assert_eq!(
+            fs::read(split.target_config_file("work")).unwrap(),
+            config_bytes,
+            "config.yaml is not written"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(split.target_credentials_file("work"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "got {mode:o}");
+        }
+    }
+
+    /// D.4a c2: the credentials file's bytes and their parse, apart — what the secret store needs
+    /// to tell a vault marker from a token — read and refused exactly as `load_target_credentials`
+    /// reads and refuses them, never quoting the file.
+    #[test]
+    fn credentials_bytes_and_their_parse_are_load_target_credentials_in_two_steps() {
+        let (_dir, paths) = make_paths();
+        assert!(read_target_credentials_bytes(&paths, "work")
+            .unwrap()
+            .is_none());
+        let credentials = TargetCredentials {
+            hetzner_token: Some("hcloud_secret".into()),
+        };
+        save_target_credentials(&paths, "work", &credentials).unwrap();
+        let bytes = read_target_credentials_bytes(&paths, "work")
+            .unwrap()
+            .unwrap();
+        assert_eq!(bytes, b"hetzner_token: hcloud_secret\n");
+        assert_eq!(
+            parse_target_credentials(&paths, "work", &bytes).unwrap(),
+            credentials
+        );
+        assert_eq!(
+            load_target_credentials(&paths, "work").unwrap(),
+            credentials
+        );
+        let e =
+            parse_target_credentials(&paths, "work", b"hetzner_token:hcloud_secret\n").unwrap_err();
+        assert!(
+            matches!(&e, CliError::InvalidTargetConfig { target: Some(t), .. } if t == "work"),
+            "{e:?}"
+        );
+        assert!(!e.to_string().contains("hcloud_secret"), "{e}");
+    }
+
+    /// D.4a T28: an unheld guard, on demand, for the tests of what refuses without the lock; it
+    /// holds nothing and leaves the thread free once dropped.
+    #[test]
+    fn an_unheld_guard_holds_nothing() {
+        let lock = StoreLock::unheld();
+        assert!(!lock.is_held());
+        drop(lock);
+        let (_dir, paths) = make_paths();
+        assert!(StoreLock::exclusive(&paths).unwrap().is_held());
+    }
+
+    // ---- WI-479: a store AppRafter makes is owner-only from its first folder. ----
+
+    /// Each way a store is first made, on a fresh store `<base>/<way>/parent/store` whose
+    /// parents are missing too, with the folders that way makes (by path under the root, the
+    /// root itself `""`).
+    fn fresh_stores(base: &Path) -> Vec<(&'static str, TargetStorePaths, Vec<&'static str>)> {
+        let fresh =
+            |way: &str| TargetStorePaths::for_root(base.join(way).join("parent").join("store"));
+        let config = TargetConfig {
+            provider: "hetzner-cloud".into(),
+            ..Default::default()
+        };
+        let credentials = TargetCredentials {
+            hetzner_token: Some("t".into()),
+        };
+        let lock = fresh("lock");
+        drop(StoreLock::exclusive(&lock).unwrap());
+        let global = fresh("global");
+        save_global_config(&global, &GlobalConfig::default()).unwrap();
+        let target = fresh("config");
+        save_target_config(&target, "prod", &config).unwrap();
+        let secret = fresh("credentials");
+        save_target_credentials(&secret, "prod", &credentials).unwrap();
+        vec![
+            ("the store lock", lock, vec![""]),
+            ("save_global_config", global, vec!["", "auth"]),
+            (
+                "save_target_config",
+                target,
+                vec!["", "auth", "targets", "targets/prod"],
+            ),
+            (
+                "save_target_credentials",
+                secret,
+                vec!["", "targets", "targets/prod"],
+            ),
+        ]
+    }
+
+    /// Every folder under `root` and `root` itself (`""`), `/`-separated, sorted.
+    fn folders_under(root: &Path) -> Vec<String> {
+        fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) {
+            let rel = dir.strip_prefix(root).unwrap();
+            out.push(
+                rel.components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("/"),
+            );
+            for entry in fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    walk(root, &entry.path(), out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, root, &mut out);
+        out.sort();
+        out
+    }
+
+    /// Unix, in a child per umask (a shared group's 002, and none): whatever makes a store
+    /// first — the lock, a global, target or credentials save — makes each of its folders 0700,
+    /// the root's missing parents with the umask's mode, and the store passes the privacy check
+    /// (P-2 of the d4a-h walk: `target add` under umask 002 on NixOS's `users` group).
+    #[cfg(unix)]
+    #[test]
+    fn a_fresh_store_is_owner_only_whatever_makes_it_and_whatever_the_umask() {
+        for mask in [0o002, 0o000] {
+            let scratch = tempdir().unwrap();
+            crate::owner_only::under_umask::run(
+                "target::tests::fresh_stores_under_the_childs_umask",
+                mask,
+                scratch.path(),
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "runs only inside a_fresh_store_is_owner_only_whatever_makes_it_and_whatever_the_umask"]
+    fn fresh_stores_under_the_childs_umask() {
+        use crate::owner_only::under_umask;
+        use std::os::unix::fs::PermissionsExt;
+        let (mask, scratch) = (under_umask::mask(), under_umask::scratch());
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        for (what, paths, made) in fresh_stores(&scratch) {
+            assert_eq!(folders_under(paths.root()), made, "{what}");
+            for rel in &made {
+                let folder = paths.root().join(rel);
+                assert_eq!(mode(&folder), 0o700, "{what}: {folder:?}, umask {mask:03o}");
+            }
+            let parent = paths.root().parent().unwrap();
+            for above in [parent, parent.parent().unwrap()] {
+                assert_eq!(
+                    mode(above),
+                    0o777 & !mask,
+                    "{what}: {above:?}, umask {mask:03o}"
+                );
+            }
+            crate::store_privacy::ensure_private(&paths).unwrap();
+        }
+    }
+
+    /// Windows: whatever makes a store first gives each of its folders the owner-only DACL,
+    /// and the root's missing parents inherit theirs.
+    #[cfg(windows)]
+    #[test]
+    fn a_fresh_store_is_owner_only_whatever_makes_it() {
+        use crate::owner_only::testing;
+        let scratch = tempdir().unwrap();
+        for (what, paths, made) in fresh_stores(scratch.path()) {
+            assert_eq!(folders_under(paths.root()), made, "{what}");
+            for rel in &made {
+                let folder = paths.root().join(rel);
+                testing::of_path(&folder)
+                    .unwrap()
+                    .assert_owner_only_dir(&format!("{what}: {}", folder.display()));
+            }
+            let parent = paths.root().parent().unwrap();
+            for above in [parent, parent.parent().unwrap()] {
+                let dacl = testing::of_path(above).unwrap();
+                assert!(!dacl.protected, "{what}: {above:?} inherits: {dacl:?}");
+            }
+            crate::store_privacy::ensure_private(&paths).unwrap();
+        }
+    }
+
+    /// A store folder that is already there and that its group may write (a group of others:
+    /// pretended) is refused by the lock before anything is made, and is never changed: not by
+    /// the refusal, nor by a save that makes a folder in it.
+    #[cfg(unix)]
+    #[test]
+    fn a_group_writable_folder_already_there_is_refused_and_left_as_it_was() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let paths = TargetStorePaths::for_root(dir.path().join("store"));
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        fs::create_dir_all(paths.targets_dir()).unwrap();
+        fs::set_permissions(paths.root(), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(paths.targets_dir(), fs::Permissions::from_mode(0o775)).unwrap();
+        let _shared = crate::owner_only::pretend::group_alone(false);
+        match StoreLock::exclusive(&paths) {
+            Err(CliError::StoreNotPrivate { path, problem }) => {
+                assert_eq!(path, paths.targets_dir());
+                assert_eq!(problem, crate::error::StoreFolderProblem::WritableByOthers);
+            }
+            other => panic!("{:?}", other.map(|l| l.is_held())),
+        }
+        assert_eq!(folders_under(paths.root()), ["", "targets"]);
+        assert!(!paths.lock_file().exists());
+        assert_eq!(
+            (mode(paths.root()), mode(&paths.targets_dir())),
+            (0o755, 0o775)
+        );
+        let config = TargetConfig {
+            provider: "hetzner-cloud".into(),
+            ..Default::default()
+        };
+        save_target_config(&paths, "prod", &config).unwrap();
+        assert_eq!(
+            (mode(paths.root()), mode(&paths.targets_dir())),
+            (0o755, 0o775)
+        );
+        assert_eq!(mode(&paths.target_dir("prod")), 0o700);
+        assert_eq!(mode(&paths.auth_dir()), 0o700);
+    }
+
+    /// Windows: a store folder whose DACL lets another account write is refused by the lock
+    /// before anything is made, and keeps that DACL, also when a save makes a folder in it.
+    #[cfg(windows)]
+    #[test]
+    fn a_folder_others_can_write_already_there_is_refused_and_left_as_it_was() {
+        use crate::owner_only::testing;
+        let dir = tempdir().unwrap();
+        let paths = TargetStorePaths::for_root(dir.path().join("store"));
+        fs::create_dir_all(paths.targets_dir()).unwrap();
+        let me = testing::this_user_sid().unwrap();
+        testing::set_dacl(
+            &paths.targets_dir(),
+            &format!("D:P(A;OICI;FA;;;{me})(A;OICI;0x1301bf;;;BU)"),
+        )
+        .unwrap();
+        let wide = testing::of_path(&paths.targets_dir()).unwrap();
+        match StoreLock::exclusive(&paths) {
+            Err(CliError::StoreNotPrivate { path, problem }) => {
+                assert_eq!(path, paths.targets_dir());
+                assert_eq!(problem, crate::error::StoreFolderProblem::WritableByOthers);
+            }
+            other => panic!("{:?}", other.map(|l| l.is_held())),
+        }
+        assert!(!paths.lock_file().exists());
+        assert_eq!(testing::of_path(&paths.targets_dir()).unwrap(), wide);
+        let config = TargetConfig {
+            provider: "hetzner-cloud".into(),
+            ..Default::default()
+        };
+        save_target_config(&paths, "prod", &config).unwrap();
+        assert_eq!(testing::of_path(&paths.targets_dir()).unwrap(), wide);
+        testing::of_path(&paths.target_dir("prod"))
+            .unwrap()
+            .assert_owner_only_dir("a folder made in a wide one");
     }
 }

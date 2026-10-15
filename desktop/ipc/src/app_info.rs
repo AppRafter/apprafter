@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! What the webview learns about the app once, at start: OS, versions, who and where.
 
+use apprafter_core::secrets::{LockSlotKind, SecretsMode};
+use apprafter_core::UiError;
 use serde::Serialize;
 
 use crate::AuthInfo;
@@ -15,13 +17,36 @@ pub enum Os {
     Linux,
 }
 
-/// Where the target store keeps its secrets.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+/// The event a re-read of the target store emits when it finds the store's [`SecretsInfo`]
+/// changed since the shell last reported it (D.4a F17): a terminal's `lock on` or `lock off`, a
+/// store root others can now change. No payload: the page reads `app_info` again, locked or not.
+pub const STORE_CHANGED: &str = "store-changed";
+
+/// Where the target store keeps its secrets, as the lock screen, the Target screen, the Targets
+/// page's line and the Security page show it (D.4a §3.14, WI-476): in files, or in a vault and
+/// what opens it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[serde(rename_all = "lowercase")]
-pub enum SecretBackend {
-    File,
-    Keyring,
+#[serde(rename_all = "camelCase")]
+pub struct SecretsInfo {
+    pub mode: SecretsMode,
+    /// What opens the vault, as `store.yaml` lists it; empty in files.
+    pub slots: Vec<LockSlotKind>,
+    /// The app's unlock opens the store's vault (D.4a T74, T75): the secrets are not in files,
+    /// the store has an id and its vault is there — or `store.yaml` cannot be read, which
+    /// counts as locked. The lock's settings are pinned meanwhile (O7), and the lock screen
+    /// takes the lock password or the recovery key.
+    pub protected: bool,
+    /// The store's root, home-abbreviated as the app shows paths.
+    pub store: String,
+    /// Why this store's lock state cannot be used, in the core's words (rule 1): its
+    /// `store.yaml` cannot be read (`store_file_unreadable`; the store counts as locked, fail
+    /// closed), or it is locked and its vault is gone (`vault_unreadable`, `missing`: O8). Or,
+    /// in place of either, a folder of the store another account owns or can write
+    /// (`store_not_private`, WI-475; WI-476): the core then uses and writes none of its
+    /// secrets, and the rest of this report stays as read. Never shown as "encrypted". `None`
+    /// otherwise, an interrupted run included.
+    pub problem: Option<UiError>,
 }
 
 /// Which of the OS session's signals the app hears, so `lockOnSleep` has something to follow:
@@ -46,7 +71,8 @@ pub struct AppInfo {
     pub desktop_version: String,
     /// `apprafter_core::VERSION`.
     pub core_version: String,
-    pub secret_backend: SecretBackend,
+    /// Where the target store keeps its secrets, read from `store.yaml` on every call.
+    pub secrets: SecretsInfo,
     /// The OS user name.
     pub account: String,
     /// The host name, `unknown` when the OS does not say.
@@ -74,7 +100,13 @@ mod tests {
             os: Os::Linux,
             desktop_version: "0.1.0".into(),
             core_version: "0.2.80".into(),
-            secret_backend: SecretBackend::File,
+            secrets: SecretsInfo {
+                mode: SecretsMode::Files,
+                slots: Vec::new(),
+                protected: false,
+                store: "~/.config/apprafter".into(),
+                problem: None,
+            },
             account: "rem".into(),
             host: "box".into(),
             auth: AuthInfo {
@@ -93,19 +125,30 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string(&info).unwrap(),
-            r#"{"os":"linux","desktopVersion":"0.1.0","coreVersion":"0.2.80","secretBackend":"file","account":"rem","host":"box","auth":{"available":false,"method":null,"unavailable":"no_backend","biometricsChoice":false,"passwordField":false},"sessionEvents":{"lock":true,"sleep":false},"testBuild":false,"settingsNotice":null}"#
+            r#"{"os":"linux","desktopVersion":"0.1.0","coreVersion":"0.2.80","secrets":{"mode":"files","slots":[],"protected":false,"store":"~/.config/apprafter","problem":null},"account":"rem","host":"box","auth":{"available":false,"method":null,"unavailable":"no_backend","biometricsChoice":false,"passwordField":false},"sessionEvents":{"lock":true,"sleep":false},"testBuild":false,"settingsNotice":null}"#
         );
     }
 
     #[test]
-    fn os_and_secret_backend_are_lowercase() {
+    fn the_store_changed_event_has_its_wire_name() {
+        assert_eq!(STORE_CHANGED, "store-changed");
+    }
+
+    #[test]
+    fn os_is_lowercase_and_secrets_name_the_mode_and_its_slots() {
         assert_eq!(serde_json::to_value(Os::Windows).unwrap(), "windows");
         assert_eq!(serde_json::to_value(Os::Macos).unwrap(), "macos");
         assert_eq!(serde_json::to_value(Os::Linux).unwrap(), "linux");
-        assert_eq!(serde_json::to_value(SecretBackend::File).unwrap(), "file");
         assert_eq!(
-            serde_json::to_value(SecretBackend::Keyring).unwrap(),
-            "keyring"
+            serde_json::to_value(SecretsInfo {
+                mode: SecretsMode::Locked,
+                slots: vec![LockSlotKind::Password, LockSlotKind::RecoveryKey],
+                protected: true,
+                store: "~/s".into(),
+                problem: None,
+            })
+            .unwrap(),
+            serde_json::json!({"mode": "locked", "slots": ["password", "recovery_key"], "protected": true, "store": "~/s", "problem": null})
         );
     }
 }

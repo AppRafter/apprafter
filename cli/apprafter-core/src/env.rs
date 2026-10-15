@@ -6,6 +6,7 @@
 //! [`MapEnv`].
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 
 /// A read-only view of environment variables.
 pub trait EnvSource {
@@ -14,6 +15,13 @@ pub trait EnvSource {
     /// empty value comes back as `Some("")`; each consumer decides whether
     /// empty means unset, exactly as the CLI did before the core existed.
     fn var(&self, key: &str) -> Option<String>;
+
+    /// The value of `key` as the OS holds it, for a name whose value need not be Unicode
+    /// (`PATH`). By default it is [`EnvSource::var`]'s; a client backed by the process
+    /// environment overrides it so a non-Unicode value survives.
+    fn var_os(&self, key: &str) -> Option<OsString> {
+        self.var(key).map(OsString::from)
+    }
 }
 
 /// An in-memory [`EnvSource`] for tests and for callers with no environment.
@@ -48,5 +56,14 @@ mod tests {
         assert_eq!(env.var("A").as_deref(), Some("1"));
         assert_eq!(env.var("EMPTY").as_deref(), Some(""));
         assert_eq!(env.var("MISSING"), None);
+    }
+
+    #[test]
+    fn var_os_defaults_to_the_string_value() {
+        assert_eq!(
+            MapEnv::new().with("P", "/x").var_os("P"),
+            Some(std::ffi::OsString::from("/x"))
+        );
+        assert_eq!(MapEnv::new().var_os("P"), None);
     }
 }

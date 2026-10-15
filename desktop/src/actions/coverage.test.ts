@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 import { expect, test } from 'bun:test';
-import { ACTION_IDS } from './registry';
+import { API_COMMANDS } from '../ipc/api';
+import { ACTION_COMMANDS, ACTION_IDS, CLOSED_SLICES } from './registry';
 
 type Node = { path: string[]; hidden: boolean };
 type Entry = { action?: string; status?: string; slice?: string };
@@ -13,6 +14,15 @@ const coverage = Bun.TOML.parse(
 ) as { leaf?: Record<string, Entry> };
 
 const STATUSES: readonly string[] = ['planned', 'cli-only', 'unavailable', 'superseded'];
+
+/** A planned leaf's slice: a step of the desktop track, with a sub-step letter where the step is split (D.4a, D.4b). */
+const PLANNED_SLICE = /^D\.\d+[a-z]?$/;
+
+test('a planned slice may name a sub-step', () => {
+  const named = (slices: string[]) => slices.filter((s) => PLANNED_SLICE.test(s));
+  expect(named(['D.4', 'D.4a', 'D.4b', 'D.13'])).toEqual(['D.4', 'D.4a', 'D.4b', 'D.13']);
+  expect(named(['D.', 'D.4ab', 'd.4', 'D.4A', '4a'])).toEqual([]);
+});
 
 /** Visible leaves: not hidden, no hidden ancestor, nothing one segment longer below. */
 function visibleLeaves(nodes: Node[]): string[] {
@@ -43,7 +53,7 @@ test('each entry is either an action or a status, never both', () => {
       expect({ leaf, known: STATUSES.includes(e.status ?? '') }).toEqual({ leaf, known: true });
     }
     if (e.status === 'planned') {
-      expect({ leaf, slice: /^D\.\d+$/.test(e.slice ?? '') }).toEqual({ leaf, slice: true });
+      expect({ leaf, slice: PLANNED_SLICE.test(e.slice ?? '') }).toEqual({ leaf, slice: true });
     }
   }
 });
@@ -55,6 +65,83 @@ test('every action id exists in the registry', () => {
       expect({ leaf, known: known.has(e.action) }).toEqual({ leaf, known: true });
     }
   }
+});
+
+test('every action id runs a command the shell registers', () => {
+  expect(Object.keys(ACTION_COMMANDS).sort()).toEqual([...ACTION_IDS].sort());
+  const commands = new Set<string>(API_COMMANDS);
+  for (const id of ACTION_IDS) {
+    expect({ id, registered: commands.has(ACTION_COMMANDS[id]) }).toEqual({ id, registered: true });
+  }
+});
+
+test('a closed slice has no planned leaf left', () => {
+  for (const [leaf, e] of Object.entries(entries)) {
+    if (e.slice !== undefined && CLOSED_SLICES.includes(e.slice)) {
+      expect({ leaf, status: e.status ?? null }).not.toEqual({ leaf, status: 'planned' });
+    }
+  }
+});
+
+/** D.3's nine leaves, each with the action that covers it (docs/status.md names them). */
+const D3_LEAVES = [
+  ['target add', 'target.add'],
+  ['target list', 'target.list'],
+  ['target show', 'target.show'],
+  ['target use', 'target.use'],
+  ['target rename', 'target.rename'],
+  ['target remove', 'target.remove'],
+  ['target machine', 'target.machine'],
+  ['doctor', 'doctor.run'],
+  ['whoami', 'whoami.show'],
+] as const;
+
+// The closed-slice check above sees only the leaves of a slice it is told is closed: D.3 must
+// stay closed, and its nine leaves stay actions in it — re-planned under a later slice, or
+// back to planned, a leaf the app shows would no longer be held to its action.
+test('D.3 stays closed, and its nine leaves stay actions in it', () => {
+  expect(CLOSED_SLICES).toContain('D.3');
+  for (const [leaf, id] of D3_LEAVES) {
+    expect({
+      leaf,
+      action: entries[leaf]?.action,
+      slice: entries[leaf]?.slice,
+      status: entries[leaf]?.status ?? null,
+    }).toEqual({ leaf, action: id, slice: 'D.3', status: null });
+  }
+  const inD3 = Object.entries(entries)
+    .filter(([, e]) => e.slice === 'D.3')
+    .map(([leaf]) => leaf)
+    .sort();
+  expect(inD3).toEqual(D3_LEAVES.map(([leaf]) => leaf).sort());
+});
+
+/** D.4a's five leaves, each with the action that covers it (overview §3.15, T82). */
+const D4A_LEAVES = [
+  ['lock on', 'lock.protect'],
+  ['lock off', 'lock.unprotect'],
+  ['lock status', 'lock.status'],
+  ['lock now', 'lock.now'],
+  ['unlock', 'lock.unlock'],
+] as const;
+
+// As for D.3: the closed-slice check above refuses a leaf planned again under D.4a; this test
+// also holds the five leaves to their actions, so one re-planned under another slice (D.4) fails.
+test('D.4a stays closed, and its five leaves stay actions in it', () => {
+  expect(CLOSED_SLICES).toContain('D.4a');
+  for (const [leaf, id] of D4A_LEAVES) {
+    expect({
+      leaf,
+      action: entries[leaf]?.action,
+      slice: entries[leaf]?.slice,
+      status: entries[leaf]?.status ?? null,
+    }).toEqual({ leaf, action: id, slice: 'D.4a', status: null });
+  }
+  const inD4a = Object.entries(entries)
+    .filter(([, e]) => e.slice === 'D.4a')
+    .map(([leaf]) => leaf)
+    .sort();
+  expect(inD4a).toEqual(D4A_LEAVES.map(([leaf]) => leaf).sort());
 });
 
 test('the fixed markers stay what the spec decided', () => {

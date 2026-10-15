@@ -5,9 +5,11 @@
 // of Rust's back-off after too many failures, from how long Rust says it still refuses.
 import { useCallback, useEffect, useState } from 'react';
 import type { AuthMethod } from '../ipc/generated/AuthMethod';
+import { CORE_ERROR_CODES } from '../ipc/generated/core-errors';
 import { DESKTOP_ERROR_CODES } from '../ipc/generated/errors';
 import type { UiError } from '../ipc/generated/UiError';
 import type { UnavailableReason } from '../ipc/generated/UnavailableReason';
+import { NOT_THE_SECRET, recoveryKeyLine, USE_THE_FIELD } from './lockText';
 
 const PROMPTS: Record<AuthMethod, string> = {
   windows_hello: 'Windows Hello',
@@ -102,9 +104,19 @@ function retryInMsOf(error: UiError): number | null {
  * (`retryInMs`, counted down by the page; the Windows credential dialog has the back-off too);
  * when the OS's own limit holds, that the system lets the owner try later — never only
  * "authentication failed", which would hide a locked account. Any other failure through the
- * OS's prompt is shown as Rust words it.
+ * OS's prompt is shown as Rust words it. `secret`: `store` when the field took the target store's
+ * lock password or recovery key (D.4a), whose wrong answer is D19's.
  */
-export function authRefusal(error: UiError, viaField: boolean): AuthRefusal {
+export function authRefusal(
+  error: UiError,
+  viaField: boolean,
+  secret: 'system' | 'store' = 'system',
+): AuthRefusal {
+  // D.4a (critic A finding 26): a mistyped recovery key in the store's field, in the words the
+  // Protect dialog uses for it.
+  if (secret === 'store' && error.code === CORE_ERROR_CODES.SECRETS_RECOVERY_KEY_INVALID) {
+    return { lines: [recoveryKeyLine(error.fields) ?? error.message], retryInMs: null };
+  }
   if (error.code === DESKTOP_ERROR_CODES.AUTH_FAILED) {
     const retryInMs = retryInMsOf(error);
     const exhausted = error.fields.exhausted === true;
@@ -114,12 +126,17 @@ export function authRefusal(error: UiError, viaField: boolean): AuthRefusal {
     if (retryInMs !== null) return { lines: said, retryInMs };
     if (exhausted) return { lines: [...said, TRY_LATER], retryInMs: null };
     if (viaField) {
-      return { lines: said.length > 0 ? said : [WRONG_PASSWORD], retryInMs: null };
+      const wrong = secret === 'store' ? NOT_THE_SECRET : WRONG_PASSWORD;
+      return { lines: said.length > 0 ? said : [wrong], retryInMs: null };
     }
   }
   if (error.code === DESKTOP_ERROR_CODES.AUTH_BUSY) return { lines: [BUSY], retryInMs: null };
   if (error.code === DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE) {
     const reason = error.fields.reason;
+    // D.4a T75: on a protected store the system's prompt opens nothing; the field is the way.
+    if (secret === 'store' && reason === ('use_password_field' satisfies UnavailableReason)) {
+      return { lines: [USE_THE_FIELD], retryInMs: null };
+    }
     // What the OS said of it (the field's route) comes first: the more specific words.
     if (reason === ('not_permitted_here' satisfies UnavailableReason)) {
       return { lines: [...(viaField ? messagesOf(error) : []), NOT_PERMITTED], retryInMs: null };

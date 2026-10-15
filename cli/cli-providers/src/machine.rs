@@ -22,6 +22,23 @@ pub struct MachineOffer {
     pub deprecation: Option<Deprecation>,
 }
 
+impl MachineOffer {
+    /// `deprecation.unavailable_after` is at or before `now`: no longer orderable. A future date
+    /// is only a deprecation notice; an unparseable one retires nothing.
+    pub fn is_retired_at(&self, now: chrono::DateTime<chrono::Utc>) -> bool {
+        self.deprecation
+            .as_ref()
+            .and_then(|d| d.unavailable_after.as_deref())
+            .and_then(|ua| chrono::DateTime::parse_from_rfc3339(ua).ok())
+            .is_some_and(|ts| ts.with_timezone(&chrono::Utc) <= now)
+    }
+
+    /// [`Self::is_retired_at`] the current time.
+    pub fn is_retired(&self) -> bool {
+        self.is_retired_at(chrono::Utc::now())
+    }
+}
+
 /// Flatten the catalog: one row per (server_type, location). Price is looked
 /// up by matching the location string in `prices[]`; a missing price → None.
 pub fn offers_from_server_types(types: &[ServerType]) -> Vec<MachineOffer> {
@@ -91,6 +108,28 @@ mod tests {
                 },
             }],
         }]
+    }
+
+    #[test]
+    fn an_offer_is_retired_once_unavailable_after_has_passed() {
+        let mut o = offers_from_server_types(&sample_types()).remove(0);
+        let now = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert!(!o.is_retired_at(now));
+        o.deprecation = Some(Deprecation {
+            announced: None,
+            unavailable_after: Some("2025-12-31T00:00:00+00:00".into()),
+        });
+        assert!(o.is_retired_at(now));
+        o.deprecation = Some(Deprecation {
+            announced: None,
+            unavailable_after: Some("2026-06-01T00:00:00+00:00".into()),
+        });
+        assert!(
+            !o.is_retired_at(now),
+            "a future date is a deprecation badge, not retirement"
+        );
     }
 
     #[test]

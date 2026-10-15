@@ -21,20 +21,21 @@
 //! keeps the "nothing ran" assertions from passing on a harness that could
 //! not have seen anything.
 //!
-//! `cli/.cargo/config.toml` sets `APPRAFTER_SKIP_STARTUP_CHECKS` for
-//! everything cargo runs; the child's environment is cleared, so it runs with
-//! the checks on.
+//! The spawn point sets `APPRAFTER_SKIP_STARTUP_CHECKS` for every other
+//! test; this one asks it not to (`Spawn::with_startup_checks`), so the
+//! checks run.
 //!
 //! Unix only: the stand-in is a `#!/bin/sh` script, and the version cache
 //! is seeded where `dirs::cache_dir` looks on Linux and macOS, not Windows.
 #![cfg(unix)]
 
+mod common;
+
 use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use assert_cmd::Command;
-use tempfile::TempDir;
+use common::spawn::Spawn;
 
 /// What the seeded version cache names as the latest release: newer than any
 /// build this test can run against.
@@ -46,7 +47,7 @@ const DISK_PROBE: &str = "get platformstack default -n apprafter-system -o json"
 /// A throwaway machine: a `PATH` holding only the logging `kubectl`, and a
 /// home, cache, configuration and age key of its own.
 struct Sandbox {
-    dir: TempDir,
+    spawn: Spawn,
 }
 
 /// What one invocation left behind.
@@ -69,20 +70,16 @@ impl Traces {
 
 impl Sandbox {
     fn new() -> Self {
-        let dir = TempDir::new().unwrap();
-        let root = dir.path();
-        let bin = root.join("bin");
-        fs::create_dir_all(&bin).unwrap();
-        let kubectl = bin.join("kubectl");
+        let spawn = Spawn::new().with_startup_checks();
+        let kubectl = spawn.path("bin").join("kubectl");
         fs::write(
             &kubectl,
             format!(
                 "#!/bin/sh\necho \"$*\" >> '{}'\nexit 1\n",
-                root.join("kubectl.log").display()
+                spawn.path("kubectl.log").display()
             ),
         )
         .unwrap();
-        #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&kubectl, fs::Permissions::from_mode(0o755)).unwrap();
@@ -92,36 +89,27 @@ impl Sandbox {
             .unwrap()
             .as_secs();
         let seeded = format!(r#"{{"latest_tag":"{SEEDED_RELEASE}","fetched_at_secs":{now}}}"#);
-        // `dirs::cache_dir()`: `$XDG_CACHE_HOME` on Linux, the home's
-        // `Library/Caches` on macOS.
+        // `dirs::cache_dir()`: `$XDG_CACHE_HOME` on Linux, the home's `Library/Caches` on macOS.
         for cache in [
-            root.join("cache"),
-            root.join("home").join("Library").join("Caches"),
+            spawn.path("cache"),
+            spawn.home().join("Library").join("Caches"),
         ] {
             let at = cache.join("apprafter");
             fs::create_dir_all(&at).unwrap();
             fs::write(at.join("version-check.json"), &seeded).unwrap();
         }
-        Sandbox { dir }
+        Sandbox { spawn }
     }
 
     fn path(&self, name: &str) -> PathBuf {
-        self.dir.path().join(name)
+        self.spawn.path(name)
     }
 
     fn run(&self, args: &[&str]) -> Traces {
-        let output = Command::cargo_bin("apprafter")
-            .unwrap()
-            .env_clear()
-            .env("PATH", self.path("bin"))
-            .env("HOME", self.path("home"))
-            .env("XDG_CACHE_HOME", self.path("cache"))
-            .env("XDG_CONFIG_HOME", self.path("config"))
-            .env("APPRAFTER_CONFIG_DIR", self.path("apprafter-config"))
-            .env("APPRAFTER_AGE_KEY", self.path("age.key"))
-            .env("KUBECONFIG", "/nonexistent")
-            .current_dir(self.dir.path())
-            .args(args)
+        let output = self
+            .spawn
+            .cmd(args)
+            .current_dir(self.spawn.root())
             .output()
             .unwrap();
         Traces {

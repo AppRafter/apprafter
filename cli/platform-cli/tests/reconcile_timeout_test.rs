@@ -14,14 +14,15 @@
 //! written the status since, and stays quiet when the Event read fails.
 #![cfg(unix)]
 
+mod common;
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
-use assert_cmd::Command;
 use chrono::{Duration, SecondsFormat, Utc};
+use common::spawn::Spawn;
 use serde_json::{json, Value};
-use tempfile::TempDir;
 
 /// What the stand-in does for one exact argument list.
 enum Reply {
@@ -49,7 +50,7 @@ const APP_CLAIM_EVENTS: &str = "get events.events.k8s.io -n apps --field-selecto
      reason=ReconcileTimedOut,regarding.kind=ResourceClaim -o json";
 
 struct Sandbox {
-    dir: TempDir,
+    spawn: Spawn,
 }
 
 impl Sandbox {
@@ -57,7 +58,7 @@ impl Sandbox {
     /// kubeconfig, and a `bin/kubectl` that answers `replies`.
     fn new(replies: &[(&str, Reply)]) -> Self {
         let sandbox = Sandbox {
-            dir: TempDir::new().unwrap(),
+            spawn: Spawn::new(),
         };
         sandbox.seed_state();
         sandbox.write_kubectl(replies);
@@ -65,24 +66,16 @@ impl Sandbox {
     }
 
     fn path(&self, name: &str) -> PathBuf {
-        self.dir.path().join(name)
+        self.spawn.path(name)
     }
 
     /// The local-only commands every other integration test uses to make a
     /// target, then the cached kubeconfig `ensure_kubeconfig_tempfile` reads.
     fn seed_state(&self) {
         let local = |args: &[&str]| {
-            Command::cargo_bin("apprafter")
-                .unwrap()
-                .env_remove("HCLOUD_TOKEN")
-                .env("HOME", self.path("home"))
-                .env("XDG_CONFIG_HOME", self.path("config"))
-                .env("APPRAFTER_CONFIG_DIR", self.path("apprafter-config"))
-                .env("APPRAFTER_AGE_KEY", self.path("age.key"))
-                .env("APPRAFTER_SKIP_STARTUP_CHECKS", "1")
-                .env("KUBECONFIG", "/nonexistent")
-                .current_dir(self.dir.path())
-                .args(args)
+            self.spawn
+                .cmd(args)
+                .current_dir(self.spawn.root())
                 .assert()
                 .success();
         };
@@ -163,19 +156,10 @@ impl Sandbox {
 
     /// Run `apprafter <args>` with nothing on `PATH` but the stand-in.
     fn run(&self, args: &[&str]) -> (bool, String, String) {
-        let out = Command::cargo_bin("apprafter")
-            .unwrap()
-            .env_clear()
-            .env("PATH", self.path("bin"))
-            .env("HOME", self.path("home"))
-            .env("XDG_CONFIG_HOME", self.path("config"))
-            .env("XDG_CACHE_HOME", self.path("cache"))
-            .env("APPRAFTER_CONFIG_DIR", self.path("apprafter-config"))
-            .env("APPRAFTER_AGE_KEY", self.path("age.key"))
-            .env("APPRAFTER_SKIP_STARTUP_CHECKS", "1")
-            .env("KUBECONFIG", "/nonexistent")
-            .current_dir(self.dir.path())
-            .args(args)
+        let out = self
+            .spawn
+            .cmd(args)
+            .current_dir(self.spawn.root())
             .output()
             .unwrap();
         (

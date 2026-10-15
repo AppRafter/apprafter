@@ -66,6 +66,10 @@
 #                                     gitignored backup-test.env exports the
 #                                     OLD_CLUSTER_TOKEN spelling directly:
 #                                       set -a; . ./backup-test.env; set +a
+#   APPRAFTER_E2E_SSH_KEY             the private half of the public key the walk
+#                                     uploads (APPRAFTER_SSH_PUBLIC_KEY_PATH, default
+#                                     ~/.ssh/id_ed25519.pub); the CLI's SSH fetch of
+#                                     the kubeconfig uses it.
 # Env — REQUIRED for BACKEND=s3 only:
 #   S3_ACCESS_KEY_ID     | S3_BUCKET_ACCESS_KEY   S3 access key.
 #   S3_SECRET_ACCESS_KEY | S3_BUCKET_SECRET_KEY   S3 secret key.
@@ -661,11 +665,9 @@ deploy_cms() {
         --from-literal "${CMS_SECRET_KEY}=${CMS_SECRET_VALUE}" --namespace "$CMS_NS"
     wait_jsonpath secret "$CMS_NS" "$CMS_SECRET_NAME" '{.metadata.name}' "$CMS_SECRET_NAME" 180
     printf '  ok: FAKE PAYLOAD_SECRET sealed into ns %s\n' "$CMS_NS"
-    local bin="${REPO_ROOT}/cli/target/debug/apprafter"
-    [ -x "$bin" ] || ( cd "${REPO_ROOT}/cli" && cargo build --quiet --bin apprafter )
-    ( cd "${REPO_ROOT}/landing/cms" && "$bin" app add "$CMS_REPO" \
+    apprafter_in "${REPO_ROOT}/landing/cms" app add "$CMS_REPO" \
         --name "$CMS_APP" --branch master --path "$CMS_PATH" \
-        --namespace "$CMS_NS" --env "$CMS_ENV" --no-ping --no-interactive )
+        --namespace "$CMS_NS" --env "$CMS_ENV" --no-ping --no-interactive
     printf '  ok: CMS registered (public repo, --env %s)\n' "$CMS_ENV"
     wait_cms_ready
 }
@@ -729,9 +731,9 @@ wait_job_complete() {
 # Workspace (isolated CLI state — never touches the operator's real targets)
 # ---------------------------------------------------------------
 TMPDIR_WORK="$(mktemp -d -t subup-e2e.XXXXXX)"
-APPRAFTER_CONFIG_DIR="${TMPDIR_WORK}/apprafter-config"; mkdir -p "$APPRAFTER_CONFIG_DIR"
+e2e_isolate_store "${TMPDIR_WORK}"
+e2e_require_ssh_key --file "$SSH_PUB"
 export APPRAFTER_CONFIG_DIR
-export APPRAFTER_AGE_KEY="${TMPDIR_WORK}/age.key"
 KC_FILE="${TMPDIR_WORK}/kubeconfig"
 CRED_FILE="${TMPDIR_WORK}/backup-creds.env"
 DIGEST_SQL_FILE="${TMPDIR_WORK}/digest.sql"
@@ -756,6 +758,7 @@ cleanup() {
         printf '\nAPPRAFTER_HETZNER_SKIP_DESTROY set — leaving the cluster UP (it is COSTING MONEY).\n' >&2
         [ "$CLUSTER_CREATED" -eq 1 ] && printf 'Destroy by hand: APPRAFTER_CONFIG_DIR=%s apprafter destroy --yes --target %s\n' \
             "$APPRAFTER_CONFIG_DIR" "$TARGET" >&2
+        e2e_isolation_cleanup
         exit "$exit_code"
     fi
 
@@ -772,7 +775,7 @@ cleanup() {
     if [ "$n" = "0" ]; then
         printf '  ok: project has ZERO servers after teardown (Hetzner API-verified)\n' >&2
     else
-        printf 'FAILED: LEAK WARNING — project reports %s server(s) after teardown. INSPECT https://console.hetzner.cloud AND DELETE STRAGGLERS BY HAND\n' "$n" >&2
+        printf 'FAILED: LEAK WARNING — project reports %s server(s) after teardown. INSPECT https://console.hetzner.com AND DELETE STRAGGLERS BY HAND\n' "$n" >&2
         exit_code=1
     fi
     # shellcheck disable=SC2086 # $HZ is "python3 <path>" — word-splitting is intended
@@ -796,6 +799,7 @@ cleanup() {
         printf '\n=== GREEN: substrate upgrade %s -> %s validated end-to-end on real Hetzner (backend=%s, %s) ===\n' \
             "$SKU_SMALL" "$SKU_BIG" "$BACKEND" "$(elapsed)"
     fi
+    e2e_isolation_cleanup
     exit "$exit_code"
 }
 trap cleanup EXIT

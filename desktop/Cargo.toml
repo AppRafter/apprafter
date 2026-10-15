@@ -42,3 +42,11 @@ tauri-build    = { version = "~2.7", features = ["config-json5"] }
 # Panics in spawn_blocking must stay catchable (D.2c maps a JoinError to
 # apprafter::desktop::internal); `abort` would make that mapping dead code.
 panic = "unwind"
+
+# The vault's Argon2id (D.4a T17): debug builds run the 256 MiB release derivation
+# optimised. cli/Cargo.toml carries the same two tables.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3

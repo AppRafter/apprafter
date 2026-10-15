@@ -1,0 +1,70 @@
+[
+  {
+    "name": "prod",
+    "problem": null
+  },
+  {
+    "name": "prod-eu-1",
+    "problem": null
+  },
+  {
+    "name": "A-1",
+    "problem": null
+  },
+  {
+    "name": "",
+    "problem": "empty"
+  },
+  {
+    "name": "a b",
+    "problem": "invalid_char"
+  },
+  {
+    "name": "a_b",
+    "problem": "invalid_char"
+  },
+  {
+    "name": "a/b",
+    "problem": "invalid_char"
+  },
+  {
+    "name": "../x",
+    "problem": "invalid_char"
+  },
+  {
+    "name": "-prod",
+    "problem": "edge_dash"
+  },
+  {
+    "name": "prod-",
+    "problem": "edge_dash"
+  },
+  {
+    "name": "-",
+    "problem": "edge_dash"
+  },
+  {
+    "name": "pröd",
+    "problem": "invalid_char"
+  },
+  {
+    "name": "-a b",
+    "problem": "invalid_char"
+  },
+  {
+    "name": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "problem": null
+  },
+  {
+    "name": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "problem": "too_long"
+  },
+  {
+    "name": "ööööööööööööööööööööööööööööööööö",
+    "problem": "too_long"
+  },
+  {
+    "name": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ",
+    "problem": "too_long"
+  }
+]

@@ -15,6 +15,12 @@ export interface ButtonProps extends Omit<ButtonHTMLAttributes<HTMLButtonElement
   full?: boolean;
   /** The button element, to move the focus to it. */
   ref?: Ref<HTMLButtonElement>;
+  /**
+   * Waiting on what it started (Check again, Run again, Verify): it looks disabled and a press
+   * does nothing, but it stays focusable — a browser drops the focus of a control it disables
+   * onto the page, out of reach of the dialog's Esc and Tab (review #1).
+   */
+  pending?: boolean;
 }
 
 /** The design's B(): primary, secondary, danger (outline), danger-solid, ghost (row action). */
@@ -24,7 +30,9 @@ export function Button({
   icon: IconComponent,
   type = 'button',
   full = false,
+  pending = false,
   children,
+  onClick,
   ...rest
 }: ButtonProps) {
   return (
@@ -35,6 +43,14 @@ export function Button({
       data-variant={variant}
       data-size={size}
       data-full={full || undefined}
+      aria-disabled={pending || undefined}
+      onClick={(event) => {
+        if (pending) {
+          event.preventDefault();
+          return;
+        }
+        onClick?.(event);
+      }}
     >
       {IconComponent && <IconComponent aria-hidden="true" />}
       {children}

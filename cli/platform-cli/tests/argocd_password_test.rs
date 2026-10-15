@@ -9,6 +9,10 @@
 //! v0.1.154: state lives at
 //! `<APPRAFTER_CONFIG_DIR>/state/<active-target>/.apprafter/state.json`.
 
+mod common;
+
+use common::spawn::Spawn;
+
 use std::path::{Path, PathBuf};
 
 use age::secrecy::ExposeSecret;
@@ -16,8 +20,8 @@ use assert_cmd::Command;
 use predicates::str::contains;
 use std::io::Write;
 
-fn cli() -> Command {
-    Command::cargo_bin("apprafter").unwrap()
+fn cli(sp: &Spawn) -> Command {
+    sp.cmd(&[])
 }
 
 fn state_path(cfg_dir: &Path, target: &str) -> PathBuf {
@@ -31,15 +35,15 @@ fn state_path(cfg_dir: &Path, target: &str) -> PathBuf {
 struct Workspace {
     cwd: tempfile::TempDir,
     cfg_dir: tempfile::TempDir,
+    spawn: Spawn,
 }
 
 fn workspace_with_state() -> Workspace {
     let cwd = tempfile::tempdir().unwrap();
     let cfg_dir = tempfile::tempdir().unwrap();
+    let spawn = Spawn::new().with_store(cfg_dir.path());
 
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", cfg_dir.path())
-        .env_remove("HCLOUD_TOKEN")
+    cli(&spawn)
         .args([
             "target",
             "add",
@@ -58,9 +62,8 @@ fn workspace_with_state() -> Workspace {
         .assert()
         .success();
 
-    cli()
+    cli(&spawn)
         .current_dir(cwd.path())
-        .env("APPRAFTER_CONFIG_DIR", cfg_dir.path())
         .args([
             "init",
             "--provider",
@@ -73,7 +76,11 @@ fn workspace_with_state() -> Workspace {
         .assert()
         .success();
 
-    Workspace { cwd, cfg_dir }
+    Workspace {
+        cwd,
+        cfg_dir,
+        spawn,
+    }
 }
 
 #[test]
@@ -82,7 +89,7 @@ fn argocd_password_decrypts_age_blob_using_identity_at_apprafter_age_key() {
 
     // Fresh identity in a temp file.
     let identity = age::x25519::Identity::generate();
-    let key_path = ws.cwd.path().join("age.key");
+    let key_path = ws.spawn.path("age.key");
     {
         let mut f = std::fs::File::create(&key_path).unwrap();
         f.write_all(identity.to_string().expose_secret().as_bytes())
@@ -127,9 +134,8 @@ fn argocd_password_decrypts_age_blob_using_identity_at_apprafter_age_key() {
     });
     std::fs::write(&path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
 
-    cli()
+    cli(&ws.spawn)
         .current_dir(ws.cwd.path())
-        .env("APPRAFTER_CONFIG_DIR", ws.cfg_dir.path())
         .env("APPRAFTER_AGE_KEY", &key_path)
         .arg("argocd-password")
         .assert()

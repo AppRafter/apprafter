@@ -204,6 +204,12 @@ pre-commit:
     - name: heredoc-backticks
       glob: "{scripts/**,e2e/**,.github/workflows/**,argocd-cue-cmp/**}"
       run: ./scripts/check-heredoc-backticks.sh
+    # Every e2e walk runs the CLI on an isolated store (D.4a T9, G6). The scan
+    # only: its --self-test builds the CLI, which is minutes, so it runs in
+    # `just lint` and in lint.yml's e2e-isolation job instead.
+    - name: e2e-isolation
+      glob: "{e2e/**,scripts/check-e2e-isolation.sh}"
+      run: ./scripts/check-e2e-isolation.sh
     # dump_diagnostics is what a failing walk leaves behind, and nothing runs
     # it until a walk fails. See the header of the script.
     - name: dump-diagnostics

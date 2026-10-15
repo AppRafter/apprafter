@@ -9,14 +9,18 @@
 //! pointer. With the lock exactly one of them is first.
 //!
 //! The runs are real processes, as the CLI and AppRafter Desktop would
-//! be, in a cleared environment like `golden.rs`'s, with no network: the
-//! adds are `--no-ping`, and every Hetzner call would go to a closed port.
+//! be, through the spawn point (`tests/common/spawn.rs`) like `golden.rs`'s,
+//! with no network: the adds are `--no-ping`, and every Hetzner call would
+//! go to a closed port.
+
+mod common;
 
 use std::io::Read;
-use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
+
+use common::spawn::Spawn;
 
 const ADDS: usize = 8;
 /// The most the whole race may take. Each add is a few file operations
@@ -27,26 +31,11 @@ const RACE_BOUND: Duration = Duration::from_secs(90);
 const TOKEN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const FIRST_TARGET: &str = "set as active (first target on fresh store)";
 
-fn apprafter(sandbox: &Path, args: &[&str]) -> Command {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_apprafter"));
-    c.env_clear()
-        .env("PATH", sandbox.join("bin"))
-        .env("HOME", sandbox.join("home"))
-        .env("XDG_CONFIG_HOME", sandbox.join("config"))
-        .env("XDG_CACHE_HOME", sandbox.join("cache"))
-        .env("APPRAFTER_CONFIG_DIR", sandbox.join("store"))
-        .env("APPRAFTER_SKIP_STARTUP_CHECKS", "1")
-        .env("KUBECONFIG", sandbox.join("no-kubeconfig"))
-        .env("APPRAFTER_HCLOUD_BASE_URL", "http://127.0.0.1:1")
-        .current_dir(sandbox.join("home"))
-        .stdin(Stdio::null())
+fn apprafter(sp: &Spawn, args: &[&str]) -> Command {
+    let mut c = sp.std(args);
+    c.stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .args(args);
-    // Windows cannot start a process without its system root.
-    if let Some(root) = std::env::var_os("SYSTEMROOT") {
-        c.env("SYSTEMROOT", root);
-    }
+        .stderr(Stdio::piped());
     c
 }
 
@@ -110,11 +99,11 @@ fn assert_success(what: &str, out: &Output) {
 
 #[test]
 fn concurrent_adds_on_a_fresh_store_keep_every_target_and_one_first() {
-    let dir = tempfile::tempdir().unwrap();
-    let sandbox: PathBuf = dir.path().to_path_buf();
-    for sub in ["home", "config", "cache", "bin"] {
-        std::fs::create_dir_all(sandbox.join(sub)).unwrap();
-    }
+    let sp = Spawn::new();
+    // A fresh store, as before: the test never made `store/`, so every add raced to create it.
+    // The spawn point makes the store directory; remove it (the fence resolves a missing store
+    // through its parent, the sandbox root).
+    std::fs::remove_dir(sp.store()).unwrap();
     let names: Vec<String> = (0..ADDS).map(|i| format!("racer{i}")).collect();
 
     // Spawn every add before waiting on any, so they overlap; each gets a
@@ -124,7 +113,7 @@ fn concurrent_adds_on_a_fresh_store_keep_every_target_and_one_first() {
         .iter()
         .map(|name| {
             apprafter(
-                &sandbox,
+                &sp,
                 &[
                     "target",
                     "add",
@@ -173,7 +162,7 @@ fn concurrent_adds_on_a_fresh_store_keep_every_target_and_one_first() {
         "exactly one add may find the store fresh; these did: {first:?}"
     );
 
-    let config = std::fs::read_to_string(sandbox.join("store/config.yaml")).unwrap();
+    let config = std::fs::read_to_string(sp.store().join("config.yaml")).unwrap();
     let config: serde_yaml::Value = serde_yaml::from_str(&config).unwrap();
     let active = config["active_target"].as_str().unwrap_or_default();
     assert_eq!(
@@ -181,7 +170,7 @@ fn concurrent_adds_on_a_fresh_store_keep_every_target_and_one_first() {
         "the active target is the one that announced itself first"
     );
 
-    let list = apprafter(&sandbox, &["target", "list"]).output().unwrap();
+    let list = apprafter(&sp, &["target", "list"]).output().unwrap();
     assert_success("`target list`", &list);
     let list = stdout(&list);
     for name in &names {

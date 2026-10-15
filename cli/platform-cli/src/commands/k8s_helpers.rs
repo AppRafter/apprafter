@@ -44,12 +44,11 @@ use std::io::Write;
 use std::path::Path;
 use std::process::Command;
 
-use age::x25519::Identity;
-use cli_core::secrets::{decrypt_with_identity, default_age_key_path, load_or_create_identity};
 use cli_core::{CliError, Result};
 use cli_state::State;
 use tempfile::NamedTempFile;
 
+use crate::commands::age_cache;
 use crate::commands::helper_interrupt::{refuse_if_interrupted, Noted as _};
 use crate::commands::state_paths::resolve_state_paths;
 
@@ -80,16 +79,13 @@ fn kubectl_error(verb: &str, resource: &str, exit: Option<i32>, stderr: &str) ->
     }
 }
 
-/// Decrypt the cached kubeconfig from state and write it to a
-/// `NamedTempFile`. Callers MUST keep the returned file alive
-/// for the duration of the `kubectl` invocation — when the
-/// `NamedTempFile` drops, the file is deleted.
-///
-/// Centralises the boilerplate that
-/// `commands::argocd_password` carries; the thin-wrapper
-/// commands reuse it instead of re-implementing the chain
-/// across five modules.
-pub fn ensure_kubeconfig_tempfile() -> Result<NamedTempFile> {
+/// A decrypted kubeconfig in the store's runtime dir (D.4a T44): owner-only, removed when it
+/// drops, swept by its owner if a crash leaves it. Callers keep it alive for as long as
+/// `kubectl` / `helm` read it.
+pub type KubeconfigFile = apprafter_core::runtime::MaterialisedKubeconfig;
+
+/// The active target's cached kubeconfig, materialised for `kubectl` ([`KubeconfigFile`]).
+pub fn ensure_kubeconfig_tempfile() -> Result<KubeconfigFile> {
     ensure_kubeconfig_tempfile_for_target(None)
 }
 
@@ -100,7 +96,7 @@ pub fn ensure_kubeconfig_tempfile() -> Result<NamedTempFile> {
 /// target, identical to [`ensure_kubeconfig_tempfile`].
 pub fn ensure_kubeconfig_tempfile_for_target(
     target_override: Option<&str>,
-) -> Result<NamedTempFile> {
+) -> Result<KubeconfigFile> {
     let resolved = resolve_state_paths(target_override)?;
     let state = State::load_or_default(&resolved.paths)?;
     let hetzner = state.hetzner_cloud.clone().ok_or_else(|| {
@@ -108,53 +104,19 @@ pub fn ensure_kubeconfig_tempfile_for_target(
             "state has no hetzner_cloud section; run `apprafter apply` first".to_string(),
         )
     })?;
-    let identity = load_or_create_identity(&default_age_key_path())?;
-    let kubeconfig = select_cached_kubeconfig(
-        hetzner.kubeconfig_age.as_deref(),
-        hetzner.kubeconfig_yaml.as_deref(),
-        &identity,
-    )?;
-    write_kubeconfig_tempfile(&kubeconfig)
+    // A read through the core's secret store: the age key is never created here (GOTCHA-120).
+    let ctx = crate::context::legacy_context()?;
+    let kubeconfig = age_cache::cached_kubeconfig(&ctx.secrets(), &hetzner, &resolved.target_name)?;
+    materialise(&ctx, &kubeconfig)
 }
 
-/// Pick the cached kubeconfig body out of the state's two slots, decrypting
-/// the age-armored one when present. Extracted from
-/// [`ensure_kubeconfig_tempfile_for_target`] (which is otherwise pure IO) so
-/// the branch order is unit-testable without a state file on disk.
-///
-/// PRECEDENCE IS LOAD-BEARING: `kubeconfig_age` wins over `kubeconfig_yaml`.
-/// The plaintext slot is a legacy/plaintext fallback that older states may
-/// still carry alongside a freshly written encrypted one; preferring the
-/// plaintext there would silently hand back a STALE kubeconfig for a cluster
-/// that has since been re-provisioned. Neither slot set is a hard error with
-/// the `apprafter kubeconfig` remedy — never an empty config.
-fn select_cached_kubeconfig(
-    kubeconfig_age: Option<&str>,
-    kubeconfig_yaml: Option<&str>,
-    identity: &Identity,
-) -> Result<String> {
-    if let Some(armored) = kubeconfig_age {
-        decrypt_with_identity(armored, identity)
-    } else if let Some(plain) = kubeconfig_yaml {
-        Ok(plain.to_string())
-    } else {
-        Err(CliError::Other(
-            "no cached kubeconfig in state; run `apprafter kubeconfig` first".to_string(),
-        ))
-    }
-}
-
-/// Write `kubeconfig` to a fresh `NamedTempFile`. Extracted from
-/// [`ensure_kubeconfig_tempfile_for_target`] so the round-trip (the bytes
-/// `kubectl` will actually read through `KUBECONFIG`) is testable.
-fn write_kubeconfig_tempfile(kubeconfig: &str) -> Result<NamedTempFile> {
-    let mut f = tempfile::Builder::new()
-        .prefix("apprafter-kubeconfig-")
-        .tempfile()
-        .map_err(|e| CliError::Other(format!("create kubeconfig tempfile: {e}")))?;
-    f.write_all(kubeconfig.as_bytes())
-        .map_err(|e| CliError::Other(format!("write kubeconfig tempfile: {e}")))?;
-    Ok(f)
+/// `kubeconfig` in `ctx`'s runtime dir: the core's one materialiser (T44). Never the system
+/// temp dir, which no sweep reaches.
+pub(crate) fn materialise(
+    ctx: &apprafter_core::Context,
+    kubeconfig: &str,
+) -> Result<KubeconfigFile> {
+    apprafter_core::runtime::materialise(ctx, kubeconfig).map_err(crate::context::into_cli_error)
 }
 
 /// Run `kubectl get -o json ...` and return the parsed JSON
@@ -474,20 +436,15 @@ pub fn kubectl_apply_json(manifest: &serde_json::Value, kubeconfig_path: &Path) 
 /// Serialise `manifest` to a temporary `.json` file for `kubectl apply -f`.
 /// Extracted from [`kubectl_apply_json`] so the bytes that actually reach the
 /// apiserver are testable — the manifest must survive the round-trip intact,
-/// which a silently-truncated or unflushed write would break.
+/// which a silently-truncated or unflushed write would break. A manifest can
+/// hold a Secret, so the file is owner-only from its first byte, whatever the
+/// system temp dir lets others do (WI-473,
+/// [`cli_core::owner_only::write_temp_file`]).
 fn write_apply_tempfile(manifest: &serde_json::Value) -> Result<NamedTempFile> {
-    let mut file = tempfile::Builder::new()
-        .prefix("apprafter-apply-")
-        .suffix(".json")
-        .tempfile()
-        .map_err(|e| CliError::Other(format!("create apply tempfile: {e}")))?;
     let body = serde_json::to_vec_pretty(manifest)
         .map_err(|e| CliError::Other(format!("serialise manifest: {e}")))?;
-    file.write_all(&body)
-        .map_err(|e| CliError::Other(format!("write apply tempfile: {e}")))?;
-    file.flush()
-        .map_err(|e| CliError::Other(format!("flush apply tempfile: {e}")))?;
-    Ok(file)
+    cli_core::owner_only::write_temp_file("apprafter-apply-", ".json", &body)
+        .map_err(|e| CliError::Other(format!("write apply tempfile: {e}")))
 }
 
 /// Build the args for `kubectl delete <resource> <name> -n <ns>
@@ -1026,75 +983,39 @@ mod tests {
     }
 
     // ---- cached-kubeconfig resolution ------------------------------------
+    // The slot precedence and the age key's errors are `age_cache`'s tests.
 
+    /// T44: the file kubectl reads is the core's, in the store's runtime dir, holding exactly
+    /// the resolved body, and gone when its handle drops.
     #[test]
-    fn cached_kubeconfig_prefers_the_age_slot_over_the_plaintext_one() {
-        // INVARIANT: when both slots are populated the ENCRYPTED one wins.
-        // Older states can still carry a stale plaintext body next to a
-        // freshly written encrypted one; preferring the plaintext would hand
-        // kubectl a kubeconfig for a cluster that no longer exists.
-        use cli_core::secrets::encrypt_for_recipient;
-
-        let identity = Identity::generate();
-        let armored = encrypt_for_recipient(
-            "apiVersion: v1\nclusters: [current]\n",
-            &identity.to_public(),
-        )
-        .expect("encrypt");
-
-        let picked = select_cached_kubeconfig(
-            Some(&armored),
-            Some("apiVersion: v1\nclusters: [stale]\n"),
-            &identity,
-        )
-        .expect("age slot decrypts");
-        assert!(
-            picked.contains("current") && !picked.contains("stale"),
-            "the encrypted slot must win over the plaintext one: {picked}"
-        );
-    }
-
-    #[test]
-    fn cached_kubeconfig_falls_back_to_plaintext_and_errors_when_neither_is_set() {
-        let identity = Identity::generate();
-
-        let plain = select_cached_kubeconfig(None, Some("apiVersion: v1\n"), &identity)
-            .expect("plaintext fallback");
-        assert_eq!(plain, "apiVersion: v1\n");
-
-        // Neither slot: a hard error naming the remedy, NEVER an empty config
-        // (an empty KUBECONFIG makes kubectl silently fall back to ~/.kube).
-        let err = select_cached_kubeconfig(None, None, &identity).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("apprafter kubeconfig"),
-            "the empty-state error must name the remedy: {msg}"
-        );
-    }
-
-    #[test]
-    fn cached_kubeconfig_rejects_ciphertext_for_a_different_identity() {
-        // A key rotation must fail loudly rather than yielding garbage.
-        use cli_core::secrets::encrypt_for_recipient;
-
-        let owner = Identity::generate();
-        let stranger = Identity::generate();
-        let armored =
-            encrypt_for_recipient("apiVersion: v1\n", &owner.to_public()).expect("encrypt");
-        assert!(
-            select_cached_kubeconfig(Some(&armored), None, &stranger).is_err(),
-            "decrypting with the wrong identity must fail"
-        );
-    }
-
-    #[test]
-    fn kubeconfig_tempfile_holds_exactly_the_resolved_body() {
-        // The tempfile IS what kubectl reads through KUBECONFIG, so a
-        // truncated or re-encoded write would break every wrapped command.
+    fn the_kubeconfig_is_materialised_in_the_runtime_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx =
+            apprafter_core::Context::for_desktop(dir.path().join("store"), "http://127.0.0.1:1");
         let body = "apiVersion: v1\nkind: Config\nclusters:\n- name: apprafter\n";
-        let f = write_kubeconfig_tempfile(body).expect("write");
-        let read = std::fs::read_to_string(f.path()).expect("read back");
-        assert_eq!(read, body);
+        let f = materialise(&ctx, body).expect("write");
+        assert!(
+            f.path().starts_with(dir.path().join("store").join("run")),
+            "{:?}",
+            f.path()
+        );
+        assert_eq!(std::fs::read_to_string(f.path()).unwrap(), body);
+        let path = f.path().to_path_buf();
+        drop(f);
+        assert!(!path.exists());
+    }
+
+    /// T44: no command writes a decrypted kubeconfig to the system temp dir any more.
+    #[test]
+    fn no_command_writes_a_kubeconfig_to_the_system_temp_dir() {
+        let prefix = concat!("apprafter-", "kubeconfig-");
+        for (file, src) in [
+            ("k8s_helpers.rs", include_str!("k8s_helpers.rs")),
+            ("argocd_password.rs", include_str!("argocd_password.rs")),
+            ("cluster_bootstrap.rs", include_str!("cluster_bootstrap.rs")),
+        ] {
+            assert!(!src.contains(prefix), "{file} still names {prefix}");
+        }
     }
 
     // ---- apply / delete / patch argv --------------------------------------
@@ -1116,6 +1037,30 @@ mod tests {
         let read: serde_json::Value =
             serde_json::from_slice(&std::fs::read(f.path()).expect("read back")).expect("parse");
         assert_eq!(read, manifest, "the manifest must survive the round-trip");
+    }
+
+    /// WI-473: a manifest can hold a Secret or a repository's credentials, so the file kubectl
+    /// reads is owner-only, whatever the system temp dir lets others do: mode 0600, or on
+    /// Windows the protected one-ACE DACL (set before its first byte: cli-core's
+    /// `write_temp_file` test).
+    #[test]
+    fn the_apply_file_is_owner_only() {
+        let manifest = serde_json::json!({"apiVersion": "v1", "kind": "Secret"});
+        let f = write_apply_tempfile(&manifest).expect("write");
+        assert!(f.path().starts_with(std::env::temp_dir()), "{:?}", f.path());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(f.path()).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "{mode:o}");
+        }
+        #[cfg(windows)]
+        {
+            use cli_core::owner_only::testing;
+            testing::of_path(f.path())
+                .unwrap()
+                .assert_owner_only_file("the apply manifest");
+        }
     }
 
     #[test]

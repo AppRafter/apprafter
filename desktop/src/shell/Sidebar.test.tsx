@@ -1,20 +1,26 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
 import { clearMocks, mockIPC } from '@tauri-apps/api/mocks';
-import { act, cleanup, render, screen, within } from '@testing-library/react';
-import userEvent from '@testing-library/user-event';
+import { act, cleanup, screen, within } from '@testing-library/react';
 import type { AppInfo } from '../ipc/generated/AppInfo';
 import type { OpSummary } from '../ipc/generated/OpSummary';
 import { refreshList, resetOperations } from '../ipc/operations';
 import type { TargetTab } from '../state/session';
+import { renderScreen } from '../test/screens';
+import { settleIpc } from '../test/settle';
 import { Sidebar, type SidebarProps } from './Sidebar';
-import { ViewFrame } from './ViewFrame';
 
 const INFO: AppInfo = {
   os: 'linux',
   desktopVersion: '0.1.0',
   coreVersion: '0.2.80',
-  secretBackend: 'file',
+  secrets: {
+    mode: 'files',
+    slots: [],
+    protected: false,
+    store: '~/.config/apprafter',
+    problem: null,
+  },
   account: 'alex',
   host: 'workstation',
   auth: {
@@ -44,8 +50,9 @@ beforeEach(() => {
 });
 
 // Unmount first: a reset publishes, and a mounted indicator would re-render outside act().
-afterEach(() => {
+afterEach(async () => {
   cleanup();
+  await settleIpc();
   resetOperations();
   clearMocks();
 });
@@ -60,12 +67,8 @@ function sidebar(more: Partial<SidebarProps> = {}) {
     onLock: mock(),
     ...more,
   };
-  render(
-    <ViewFrame>
-      <Sidebar {...props} />
-    </ViewFrame>,
-  );
-  return { user: userEvent.setup(), ...props };
+  const user = renderScreen(<Sidebar {...props} />, { info: props.info });
+  return { user, ...props };
 }
 
 describe('Sidebar', () => {
@@ -80,6 +83,24 @@ describe('Sidebar', () => {
     expect(screen.getByRole('button', { name: 'Target' })).toBeDefined();
   });
 
+  test('on a target tab the cluster header has Run doctor; it opens Doctor · prod-eu', async () => {
+    clearMocks(); // a doctor read that keeps running
+    mockIPC((cmd) => {
+      if (cmd === 'op_start_doctor') return 5_000_005;
+      if (cmd === 'op_subscribe') return { subscription: 1, replay: [] };
+      return cmd === 'op_list' ? [] : null;
+    });
+    const { user } = sidebar();
+    const header = document.querySelector('.cluster-header') as HTMLElement;
+    await user.click(within(header).getByRole('button', { name: 'Run doctor' }));
+    expect(await screen.findByRole('dialog', { name: 'Doctor · prod-eu' })).toBeDefined();
+  });
+
+  test('the Targets view has no Run doctor', () => {
+    sidebar({ tab: null });
+    expect(screen.queryByRole('button', { name: 'Run doctor' })).toBeNull();
+  });
+
   test('a nav item navigates', async () => {
     const { user, onNavigate } = sidebar();
     await user.click(screen.getByRole('button', { name: 'Backups' }));
@@ -92,15 +113,48 @@ describe('Sidebar', () => {
     expect(screen.getByRole('button', { name: /Targets/ })).toBeDefined();
   });
 
-  test('the footer: Targets and Lock with per-OS hints, Settings only when there is one', async () => {
+  test('the footer: Targets, Security, Settings and Lock — the shortcuts per OS, Security without one', async () => {
     const onSettings = mock();
-    const { user, onShowTargets, onLock } = sidebar({ os: 'macos', onSettings });
+    const onSecurity = mock();
+    const { user, onShowTargets, onLock } = sidebar({ os: 'macos', onSettings, onSecurity });
+    const footer = document.querySelector('.sidebar-footer') as HTMLElement;
+    expect(
+      within(footer)
+        .getAllByRole('button')
+        .slice(0, 4)
+        .map((button) => button.textContent),
+    ).toEqual(['Targets ⌘T', 'Security', 'Settings ⌘,', 'Lock ⌘L']);
+    const security = screen.getByRole('button', { name: 'Security' });
+    expect(security.hasAttribute('aria-keyshortcuts')).toBe(false);
     await user.click(screen.getByRole('button', { name: 'Targets ⌘T' }));
+    await user.click(security);
     await user.click(screen.getByRole('button', { name: 'Lock ⌘L' }));
     await user.click(screen.getByRole('button', { name: 'Settings ⌘,' }));
     expect(onShowTargets).toHaveBeenCalledTimes(1);
+    expect(onSecurity).toHaveBeenCalledTimes(1);
     expect(onLock).toHaveBeenCalledTimes(1);
     expect(onSettings).toHaveBeenCalledTimes(1);
+  });
+
+  test('no Security entry without a page to open', () => {
+    sidebar();
+    expect(screen.queryByRole('button', { name: 'Security' })).toBeNull();
+  });
+
+  test('the item of the view shown is marked current: Security on its page, Targets on its view', () => {
+    const currentOf = () =>
+      ['Security', /^Targets/].map((name) =>
+        screen.getByRole('button', { name }).getAttribute('aria-current'),
+      );
+    sidebar({ tab: null, onSecurity: mock(), view: 'security' });
+    expect(currentOf()).toEqual(['page', null]);
+    cleanup();
+    sidebar({ tab: null, onSecurity: mock(), view: 'targets' });
+    expect(currentOf()).toEqual([null, 'page']);
+    cleanup();
+    // A tab's sidebar: neither.
+    sidebar({ onSecurity: mock() });
+    expect(currentOf()).toEqual([null, null]);
   });
 
   test('no Settings entry without a dialog to open', () => {

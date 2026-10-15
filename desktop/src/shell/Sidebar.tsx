@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
-// The left column of a view (brief §2). On a target tab: the target's name, the sections and the
-// Manage sections. Always: the footer — Targets, Settings, Lock with their shortcuts, the
-// running operations, the three links and the version. On the Targets view only the footer.
+// The left column of a view (brief §2). On a target tab: the target's name with Run doctor (the
+// design's stethoscope), the sections and the Manage sections. Always: the footer — Targets,
+// Security (the target store's protection, WI-476: no shortcut, and a plain shield, since the
+// item is there in every state and its icon claims nothing), Settings and Lock, each shortcut
+// beside its item, the running operations, the three links and the version. On the Targets and
+// the Security view only the footer, with that view's item marked current.
+import type { ReactNode } from 'react';
 import { Dot } from '../components/Dot';
 import { Eyebrow } from '../components/Eyebrow';
 import { IconButton } from '../components/IconButton';
@@ -13,10 +17,14 @@ import {
   HardDrivesIcon,
   type Icon,
   LockSimpleIcon,
+  ShieldIcon,
+  StethoscopeIcon,
 } from '../components/icons';
 import { Kbd } from '../components/Kbd';
 import type { AppInfo } from '../ipc/generated/AppInfo';
 import type { Os } from '../ipc/generated/Os';
+import { useTargetFlows } from '../screens/flows';
+import { SECURITY_TITLE } from '../state/lockText';
 import type { Section, TargetTab } from '../state/session';
 import { type ShortcutAction, shortcutHint } from '../state/shortcuts';
 import { LINKS, openLink } from './links';
@@ -30,11 +38,17 @@ export interface SidebarProps {
   info: AppInfo;
   onNavigate: (section: Section) => void;
   onShowTargets: () => void;
+  /** Shows the Security page (WI-476); without it there is no Security entry. */
+  onSecurity?: () => void;
+  /** The footer view this sidebar belongs to: its item is marked current. */
+  view?: 'targets' | 'security';
   onLock: () => void;
   /** The lock is not in effect (no system authentication, or Require unlock off). */
   lockDisabled?: boolean;
   /** Opens Settings; without it there is no Settings entry. */
   onSettings?: () => void;
+  /** A line under the target's name (ClusterMeta: provider · region · tier). */
+  meta?: ReactNode;
 }
 
 export function Sidebar({
@@ -43,9 +57,12 @@ export function Sidebar({
   info,
   onNavigate,
   onShowTargets,
+  onSecurity,
+  view,
   onLock,
   lockDisabled = false,
   onSettings,
+  meta,
 }: SidebarProps) {
   const nav = (group: SectionInfo['group']) =>
     SECTIONS.filter((s) => s.group === group).map((section) => (
@@ -63,6 +80,8 @@ export function Sidebar({
           <div className="cluster-header">
             <Dot size={8} />
             <span className="cluster-name">{tab.target}</span>
+            <DoctorButton target={tab.target} />
+            {meta}
           </div>
           <nav className="nav" aria-label="Sections">
             {nav('main')}
@@ -80,8 +99,18 @@ export function Sidebar({
           label="Targets"
           os={os}
           shortcut="targets"
+          current={view === 'targets'}
           onClick={onShowTargets}
         />
+        {onSecurity !== undefined && (
+          <FooterItem
+            icon={ShieldIcon}
+            label={SECURITY_TITLE}
+            os={os}
+            current={view === 'security'}
+            onClick={onSecurity}
+          />
+        )}
         {onSettings !== undefined && (
           <FooterItem
             icon={GearSixIcon}
@@ -154,27 +183,51 @@ function FooterItem({
   label,
   os,
   shortcut,
+  current = false,
   disabled = false,
   onClick,
 }: {
   icon: Icon;
   label: string;
   os: Os;
-  shortcut: ShortcutAction;
+  /** Its window shortcut, shown beside it; Security has none (WI-476). */
+  shortcut?: ShortcutAction;
+  /** The view it shows is the one shown. */
+  current?: boolean;
   disabled?: boolean;
   onClick: () => void;
 }) {
-  const hint = shortcutHint(shortcut, os);
+  const hint = shortcut === undefined ? null : shortcutHint(shortcut, os);
   return (
     <button
       type="button"
       className="footer-item"
       disabled={disabled}
-      aria-keyshortcuts={hint.replace('⌘', 'Meta+').replace('Ctrl', 'Control')}
+      aria-current={current ? 'page' : undefined}
+      aria-keyshortcuts={hint?.replace('⌘', 'Meta+').replace('Ctrl', 'Control')}
       onClick={onClick}
     >
       <ItemIcon aria-hidden="true" />
-      <span className="nav-label">{label}</span> <Kbd>{hint}</Kbd>
+      <span className="nav-label">{label}</span>
+      {hint !== null && (
+        <>
+          {' '}
+          <Kbd>{hint}</Kbd>
+        </>
+      )}
     </button>
+  );
+}
+
+/** Doctor for the tab's target: an app overlay over every view (screens/flows.tsx). */
+function DoctorButton({ target }: { target: string }) {
+  const flows = useTargetFlows();
+  return (
+    <IconButton
+      label="Run doctor"
+      icon={StethoscopeIcon}
+      size={26}
+      onClick={() => flows.doctor(target)}
+    />
   );
 }

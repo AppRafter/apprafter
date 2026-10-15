@@ -1,0 +1,59 @@
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
+// Layout the D.3 flows depend on, read from the stylesheets (happy-dom lays nothing out).
+import { expect, test } from 'bun:test';
+import { join } from 'node:path';
+
+const read = (name: string) => Bun.file(join(import.meta.dir, name)).text();
+async function rule(file: string, selector: string): Promise<string> {
+  const css = (await read(file)).replace(/\/\*[\s\S]*?\*\//g, '');
+  const found = [...css.matchAll(/([^{}]+)\{([^{}]*)\}/g)].filter(
+    ([, name = '']) => name.trim() === selector,
+  );
+  expect(found, selector).toHaveLength(1);
+  return found[0]?.[2] ?? '';
+}
+
+test('the table scrolls in its box and its header stays in view', async () => {
+  expect(await rule('components.css', '.data-table-scroll')).toMatch(/overflow:\s*auto;/);
+  const th = await rule('components.css', '.data-table thead th');
+  expect(th).toMatch(/position:\s*sticky;/);
+  expect(th).toMatch(/top:\s*0;/);
+});
+
+test('the sticky header keeps its bottom border: borders are separate, not collapsed', async () => {
+  // A collapsed border belongs to the table, not to the cell: it stays behind while the header
+  // sticks, and the rows scroll under a header with no line below it.
+  const table = await rule('components.css', '.data-table');
+  expect(table).toMatch(/border-collapse:\s*separate;/);
+  expect(table).toMatch(/border-spacing:\s*0;/);
+  expect(await rule('components.css', '.data-table thead th')).toMatch(/border-bottom:/);
+});
+
+test('a row the keyboard moves to scrolls into view below the header, not under it', async () => {
+  expect(await rule('components.css', '.data-table-scroll')).toMatch(
+    /scroll-padding-top:\s*var\(--h-30\);/,
+  );
+  expect(await rule('components.css', '.data-table thead th')).toMatch(/height:\s*var\(--h-30\);/);
+});
+
+test("a command's word wraps whole, onto the next line, unless it is longer than a line", async () => {
+  // An inline-block as wide as its word: the line breaks around it, not inside it at a hyphen;
+  // one wider than the line is capped at it and breaks anywhere rather than overflow.
+  const word = await rule('flows.css', '.code-word');
+  expect(word).toMatch(/display:\s*inline-block;/);
+  expect(word).toMatch(/max-width:\s*100%;/);
+  expect(word).toMatch(/overflow-wrap:\s*anywhere;/);
+});
+
+test('every stylesheet is loaded: main.tsx imports each one', async () => {
+  const main = await Bun.file(join(import.meta.dir, '..', 'main.tsx')).text();
+  const sheets = [...new Bun.Glob('*.css').scanSync(import.meta.dir)].sort();
+  expect(sheets).toContain('flows.css');
+  for (const sheet of sheets) expect(main, sheet).toContain(`import './styles/${sheet}';`);
+});
+
+test("the machine picker's rows line up: its eyebrow is as wide as the region row's", async () => {
+  const width = /min-width:\s*64px;/;
+  expect(await rule('components.css', '.chip-select-legend')).toMatch(width);
+  expect(await rule('flows.css', '.machine-tools-legend')).toMatch(width);
+});

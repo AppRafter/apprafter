@@ -1,6 +1,6 @@
 ---
 title: "apprafter doctor"
-description: "Self-diagnostic over the active target's config, credentials and reachability plus the surrounding shell environment (kubectl, helm, ssh, DNS)."
+description: "Self-diagnostic over the active target's config and credentials, its cluster (the cached kubeconfig, the Kubernetes API, the node's SSH port) and this computer (restic, kubectl, helm, git, ssh, cue, DNS)."
 audience: reference
 status: stable
 ---
@@ -9,7 +9,7 @@ status: stable
 
 # `apprafter doctor`
 
-Self-diagnostic over the active target's config, credentials and reachability plus the surrounding shell environment (kubectl, helm, ssh, DNS). Prints PASS / WARN / FAIL per check; exits 1 if any FAIL fires so CI gates can wire `apprafter doctor` in directly
+Self-diagnostic over the active target's config and credentials, its cluster (the cached kubeconfig, the Kubernetes API, the node's SSH port) and this computer (restic, kubectl, helm, git, ssh, cue, DNS). Prints PASS / WARN / FAIL per check, and `–` for a check it did not run; exits 1 if any FAIL fires so CI gates can wire `apprafter doctor` in directly
 
 ```text
 Usage: apprafter doctor [OPTIONS]
@@ -17,7 +17,7 @@ Usage: apprafter doctor [OPTIONS]
 
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
-| `--no-ping` | flag | — | no | Skip the Hetzner Cloud API ping. Also settable via `APPRAFTER_NO_PING`, which takes a boolish value: `1` `true` `yes` `y` `t` `on` skip the ping, `0` `false` `no` `n` `f` `off` keep it. Any other value, including the empty string, is an error rather than a no-op. Env: `APPRAFTER_NO_PING`. |
+| `--no-ping` | flag | — | no | Skip two checks: the token's verification against the Hetzner Cloud API, and the node's SSH port (which asks that API for the node's address first). The Kubernetes API check still runs when a kubeconfig is cached, and connects to the cluster's API server; the DNS lookup runs too. Also settable via `APPRAFTER_NO_PING`, which takes a boolish value: `1` `true` `yes` `y` `t` `on` skip them, `0` `false` `no` `n` `f` `off` keep them. Any other value, including the empty string, is an error rather than a no-op. Env: `APPRAFTER_NO_PING`. |
 | `--target` | — | — | no | Inspect a target other than the active one. Defaults to the active target |
 
 Examples:

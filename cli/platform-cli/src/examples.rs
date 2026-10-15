@@ -195,6 +195,7 @@ pub const EXAMPLES: &[CommandExamples] = &[
         lines: &[
             "apprafter argocd-password",
             "apprafter argocd-password --refresh  # after the admin secret is rotated",
+            "apprafter argocd-password --target staging  # another target's, not the active one",
         ],
     },
     CommandExamples {
@@ -386,6 +387,22 @@ pub const EXAMPLES: &[CommandExamples] = &[
             "apprafter kubeconfig > /tmp/kc && export KUBECONFIG=/tmp/kc",
         ],
     },
+        CommandExamples {
+            path: &["lock", "now"],
+            lines: &["apprafter lock now"],
+        },
+    CommandExamples {
+        path: &["lock", "off"],
+        lines: &["apprafter lock off"],
+    },
+    CommandExamples {
+        path: &["lock", "on"],
+        lines: &["apprafter lock on", "apprafter lock on --timeout 15"],
+    },
+        CommandExamples {
+            path: &["lock", "status"],
+            lines: &["apprafter lock status"],
+        },
     CommandExamples {
         path: &["login"],
         lines: &["apprafter login"],
@@ -543,7 +560,7 @@ pub const EXAMPLES: &[CommandExamples] = &[
         lines: &[
             "apprafter target add <name> --provider hetzner-cloud --region nbg1 --tier solo",
             "apprafter target add <name> --ssh-key ~/.ssh/id_ed25519.pub --server-type cx22",
-            "apprafter target add <name> --renew --token <token>",
+            "apprafter target add <name> --renew",
         ],
     },
     CommandExamples {
@@ -611,6 +628,10 @@ pub const EXAMPLES: &[CommandExamples] = &[
         path: &["top"],
         lines: &["apprafter top"],
     },
+        CommandExamples {
+            path: &["unlock"],
+            lines: &["apprafter unlock", "apprafter unlock --timeout 30"],
+        },
     CommandExamples {
         path: &["up"],
         lines: &["apprafter up --server-type cx22", "apprafter up --dry-run"],

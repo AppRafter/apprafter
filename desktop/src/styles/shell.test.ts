@@ -28,3 +28,10 @@ test('a tab shrinks from 184px to 96px, then the strip scrolls: every tab stays 
 test('each view is a stacking context, so its dialogs stay under the app-wide Settings', async () => {
   expect(await rule('.view')).toMatch(/isolation:\s*isolate;/);
 });
+
+test("the recovery key's block cannot be selected: only Rust's Copy copies it (ADR 0068 §3, O12)", async () => {
+  const key = await rule('.recovery-key');
+  expect(key).toMatch(/-webkit-user-select:\s*none;/);
+  expect(key).toMatch(/(^|[\s;])user-select:\s*none;/);
+  expect(key).not.toMatch(/user-select:\s*(all|text|auto)/);
+});

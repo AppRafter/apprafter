@@ -107,7 +107,7 @@ impl HetznerCloudProvider {
                 return Err(CliError::Other(format!(
                     "server {id} still listed by Hetzner 60s after delete; \
                      async-cleanup unusually slow — re-run `destroy --yes` \
-                     in a minute, or check the Hetzner Cloud Console."
+                     in a minute, or check the Hetzner Console."
                 )));
             }
             sleep(delay);
@@ -327,7 +327,12 @@ impl Provider for HetznerCloudProvider {
                 "validating server_type pre-flight"
             );
             let types = self.client.list_server_types()?;
-            validate_server_type(&types.server_types, st, &self.spec.location)?;
+            validate_server_type(
+                &types.server_types,
+                st,
+                &self.spec.location,
+                cli_core::SkuCheckFor::Provision,
+            )?;
             Some(st)
         } else {
             None

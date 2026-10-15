@@ -3,28 +3,33 @@
 //! `apprafter restore` — help text and argument parsing without a cluster
 //! (offline-safe). 2.6d T10.
 
+mod common;
+
+use common::spawn::Spawn;
+
 use assert_cmd::Command;
 use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 
-fn cli() -> Command {
-    Command::cargo_bin("apprafter").unwrap()
+fn cli(sp: &Spawn) -> Command {
+    sp.cmd(&[])
 }
 
 #[test]
 fn export_backup_restore_help_lists_commands() {
-    cli()
+    let sp = Spawn::new();
+    cli(&sp)
         .args(["export", "--help"])
         .assert()
         .success()
         .stdout(contains("--namespace"));
-    cli()
+    cli(&sp)
         .args(["backup", "--help"])
         .assert()
         .success()
         .stdout(contains("create"))
         .stdout(contains("list"));
-    cli()
+    cli(&sp)
         .args(["restore", "--help"])
         .assert()
         .success()
@@ -34,7 +39,8 @@ fn export_backup_restore_help_lists_commands() {
 
 #[test]
 fn export_help_shows_select_and_out_flags() {
-    cli()
+    let sp = Spawn::new();
+    cli(&sp)
         .args(["export", "--help"])
         .assert()
         .success()
@@ -44,7 +50,8 @@ fn export_help_shows_select_and_out_flags() {
 
 #[test]
 fn backup_create_help_shows_repo_and_passphrase() {
-    cli()
+    let sp = Spawn::new();
+    cli(&sp)
         .args(["backup", "create", "--help"])
         .assert()
         .success()
@@ -54,7 +61,8 @@ fn backup_create_help_shows_repo_and_passphrase() {
 
 #[test]
 fn backup_list_help_shows_repo_flag() {
-    cli()
+    let sp = Spawn::new();
+    cli(&sp)
         .args(["backup", "list", "--help"])
         .assert()
         .success()
@@ -65,16 +73,19 @@ fn backup_list_help_shows_repo_flag() {
 fn restore_requires_repo_positional() {
     // `apprafter restore` without a repo positional arg should fail
     // (missing required argument).
-    cli().args(["restore"]).assert().failure();
+    let sp = Spawn::new();
+    cli(&sp).args(["restore"]).assert().failure();
 }
 
 #[test]
 fn restore_reprovision_is_no_longer_a_t13_stub() {
     // 2.6d T13 wired `--reprovision`. It must NO LONGER fail with the old
-    // "lands in 2.6d T13" stub; with no passphrase + no TTY (assert_cmd has no
-    // terminal) the mandatory-passphrase gate fires first — a REAL precondition,
-    // proving the stub is gone and the real flow is entered.
-    cli()
+    // "lands in 2.6d T13" stub: a REAL precondition fires instead, proving the stub is gone
+    // and the real flow is entered. In the sandbox it is the tool preflight (its `PATH` holds
+    // no restic; 2.22a D11 runs the preflight before the mandatory-passphrase gate, which fires
+    // when the tools are there: `restore_into_running_errors_for_a_real_reason_not_a_stub`).
+    let sp = Spawn::new();
+    cli(&sp)
         .args(["restore", "/tmp/fake-repo", "--reprovision"])
         .assert()
         .failure()
@@ -86,7 +97,8 @@ fn restore_reprovision_and_data_only_are_mutually_exclusive() {
     // `--reprovision` (rebuild the whole cluster) and `--data-only` (reload data
     // into a running one) are contradictory; the combo must be rejected up front
     // with a clear message, never silently degrade to an unresolved-kubeconfig.
-    cli()
+    let sp = Spawn::new();
+    cli(&sp)
         .args(["restore", "/tmp/fake-repo", "--reprovision", "--data-only"])
         .assert()
         .failure()
@@ -95,37 +107,32 @@ fn restore_reprovision_and_data_only_are_mutually_exclusive() {
 
 #[test]
 fn restore_into_running_errors_for_a_real_reason_not_a_stub() {
-    // Post-T11, `apprafter restore <repo>` drives the real
-    // restore-into-running flow, so a REAL precondition must fire rather
-    // than the removed "not yet implemented" stub.
-    //
-    // 2.22a moved WHICH precondition fires, deliberately: the binary
-    // check now runs before the credential gate (D11). Both are real, so
-    // the stub assertion is unchanged — but rather than accepting either
-    // message and weakening the test, it now asserts the ORDERING, which
-    // is the thing 2.22a changed. The environment decides which branch
-    // applies, so the test asks the same question the code does.
-    let restic_present = cli_core::tools::preflight_tool(&cli_core::tools::RESTIC, "test").is_ok();
+    // Post-T11, `apprafter restore <repo>` drives the real restore-into-running flow, so a REAL
+    // precondition must fire rather than the removed "not yet implemented" stub. 2.22a moved
+    // WHICH one fires: the binary check runs before the credential gate (D11). The child's
+    // `PATH` is the sandbox's, so the test sets up each branch instead of reading one off the
+    // machine running it.
 
-    let assertion = cli()
-        .args(["restore", "/tmp/fake-repo"])
-        .env_remove("RESTIC_PASSWORD")
+    // Binary missing → the preflight fires FIRST, and the command does not ask for a passphrase
+    // it could never have used.
+    let sp = Spawn::new();
+    sp.cmd(&["restore", "/tmp/fake-repo"])
         .assert()
         .failure()
-        .stderr(contains("not yet implemented").not());
+        .stderr(contains("not yet implemented").not())
+        .stderr(contains("restic"))
+        .stderr(contains("not on PATH"))
+        .stderr(contains("passphrase").not());
 
-    if restic_present {
-        // Binary available → the credential gate is the first thing that
-        // can fail, exactly as before.
-        assertion.stderr(contains("passphrase"));
-    } else {
-        // Binary missing → the preflight fires FIRST. The second half is
-        // the actual fix: the command must not have asked for a
-        // passphrase it could never have used. Without this, moving the
-        // preflight back down would still pass.
-        assertion
-            .stderr(contains("restic"))
-            .stderr(contains("not on PATH"))
-            .stderr(contains("passphrase").not());
-    }
+    // Binaries present → the credential gate is the first thing that can fail. `restore`
+    // preflights restic AND kubectl (`tools_for_restore(false)`, commands/restore.rs), and the
+    // preflight reports the first one missing: both stand in, or kubectl's absence fires first.
+    let tools =
+        common::stand_in::tool_stand_ins([&cli_core::tools::RESTIC, &cli_core::tools::KUBECTL]);
+    let sp = Spawn::new().with_path(tools.path().to_path_buf());
+    sp.cmd(&["restore", "/tmp/fake-repo"])
+        .assert()
+        .failure()
+        .stderr(contains("not yet implemented").not())
+        .stderr(contains("passphrase"));
 }

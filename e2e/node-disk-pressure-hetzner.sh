@@ -48,6 +48,8 @@
 # Required env:
 #   HCLOUD_TOKEN_OLD (or HCLOUD_TOKEN)  — Hetzner project token, baseline empty.
 #   APPRAFTER_DR_SSH_PUBLIC_KEY_PATH    — ssh public key path.
+#   APPRAFTER_E2E_SSH_KEY               — the private half of that public key (the
+#                                         CLI's SSH fetch of the kubeconfig uses it).
 # Optional:
 #   APPRAFTER_DR_REGION                 — default nbg1.
 #   APPRAFTER_E2E_SERVER_TYPE           — default cpx22. MANDATORY since 2.16h-a
@@ -92,7 +94,8 @@ for t in kubectl curl python3 cargo; do
 done
 
 TMPDIR_WORK="$(mktemp -d)"
-APPRAFTER_CONFIG_DIR="${TMPDIR_WORK}/apprafter-config"; mkdir -p "$APPRAFTER_CONFIG_DIR"
+e2e_isolate_store "${TMPDIR_WORK}"
+e2e_require_ssh_key --file "$APPRAFTER_DR_SSH_PUBLIC_KEY_PATH"
 export APPRAFTER_CONFIG_DIR
 KC_FILE="${TMPDIR_WORK}/kubeconfig"
 CREATED=0
@@ -122,7 +125,7 @@ cleanup() {
             if [ "$n" = "0" ]; then
                 printf 'ok: project has ZERO servers after destroy (API-verified)\n' >&2
             else
-                printf 'LEAK WARNING: project reports %s server(s) — INSPECT https://console.hetzner.cloud AND DELETE BY HAND\n' "$n" >&2
+                printf 'LEAK WARNING: project reports %s server(s) — INSPECT https://console.hetzner.com AND DELETE BY HAND\n' "$n" >&2
             fi
         fi
         rm -rf "$TMPDIR_WORK"
@@ -130,6 +133,7 @@ cleanup() {
         printf '\nAPPRAFTER_HETZNER_SKIP_DESTROY set — cluster left UP.\n' >&2
         [ "$CREATED" -eq 1 ] && printf 'Destroy by hand: APPRAFTER_CONFIG_DIR=%s apprafter destroy --yes --target %s\n' "$APPRAFTER_CONFIG_DIR" "$TARGET" >&2
     fi
+    e2e_isolation_cleanup
     exit "$exit_code"
 }
 trap cleanup EXIT
@@ -176,7 +180,7 @@ print(a,c)' 2>/dev/null || true
 # walk cross that window, so the cache is dropped before every assertion that
 # reads it.
 drop_cli_cache() {
-    rm -f "${XDG_CACHE_HOME:-$HOME/.cache}/apprafter/node-disk-check.json" 2>/dev/null || true
+    rm -f "${XDG_CACHE_HOME:-$E2E_SANDBOX_DIR/home/.cache}/apprafter/node-disk-check.json" 2>/dev/null || true
 }
 
 # ===============================================================
@@ -444,7 +448,7 @@ phase "Phase 4: the CLI warns off that condition, without being asked"
 # Application, which `app status` does (resolve_app_for_command), and which
 # this walk's directly-applied CR does not have.
 drop_cli_cache
-STATUS_OUT="$(NO_COLOR=1 apprafter whoami 2>&1 || true)"
+STATUS_OUT="$(NO_COLOR=1 E2E_STARTUP_CHECKS=1 apprafter whoami 2>&1 || true)"
 printf '%s\n' "$STATUS_OUT"
 assert_contains "an ordinary command surfaces the node's disk pressure unasked" \
     "$STATUS_OUT" "Node disk:"
@@ -503,7 +507,7 @@ fi
 printf '  ok: NodeDiskPressure cleared once the disk was freed (now %q)\n' "${PRESSURE:-<absent>}"
 
 drop_cli_cache
-STATUS_OUT2="$(NO_COLOR=1 apprafter whoami 2>&1 || true)"
+STATUS_OUT2="$(NO_COLOR=1 E2E_STARTUP_CHECKS=1 apprafter whoami 2>&1 || true)"
 case "$STATUS_OUT2" in
     *"Node disk:"*)
         printf 'FAILED: the CLI still warns after recovery — a banner that never clears is one people learn to scroll past\n' >&2
