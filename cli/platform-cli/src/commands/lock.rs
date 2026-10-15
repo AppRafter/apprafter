@@ -710,11 +710,25 @@ pub(crate) fn unlock(timeout: Option<u32>) -> miette::Result<()> {
         }
         Err(u) => return Err(miette::Report::new(NoWindow::from(&u))),
     }
-    if holder_window::leads_own_session() {
-        eprintln!("This command leads its own session: the window ends with it.");
-    }
-    eprintln!("{}", holder_window::opened_note(minutes));
+    eprintln!(
+        "{}",
+        unlock_said(minutes, holder_window::leads_own_session())
+    );
     Ok(())
+}
+
+/// What `unlock` says once its window started (T52, C30): C30's line; or, when this CLI leads
+/// its own session (`exec apprafter unlock`, `ssh -t host apprafter unlock`), that the window
+/// ends with it — this CLI is still running as it says so, and no window is left for the next
+/// command (d4a-h F16: never C30's "Unlocked in this terminal for <n> min" after it).
+fn unlock_said(minutes: u32, leads_session: bool) -> String {
+    if leads_session {
+        "This command leads its own session, so the unlock window it opened ends with it: the \
+         next command asks again (run `apprafter unlock` from a shell to keep a window)."
+            .to_string()
+    } else {
+        holder_window::opened_note(minutes)
+    }
 }
 
 /// No unlock window is possible in this terminal (T49–T52, T59): `unlock`'s refusal. A CLI-local
@@ -972,6 +986,22 @@ mod tests {
     /// 58 characters of the Bech32 set: the shape of a recovery key without its prefix.
     const KEY_SHAPED: &str = "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq";
     const NEW: &str = "New lock password for ~/store: ";
+
+    /// d4a-h F16 (matrix L-8): a CLI that leads its own session says only that the window it
+    /// opened ends with it — never C30's "Unlocked in this terminal for 5 min" right after it;
+    /// any other `unlock` says C30's line.
+    #[test]
+    fn an_unlock_that_leads_its_session_promises_no_window() {
+        let led = unlock_said(5, true);
+        assert_eq!(
+            led,
+            "This command leads its own session, so the unlock window it opened ends with it: \
+             the next command asks again (run `apprafter unlock` from a shell to keep a window)."
+        );
+        assert!(!led.contains("Unlocked in this terminal"), "{led}");
+        assert_eq!(unlock_said(5, false), holder_window::opened_note(5));
+        assert_eq!(unlock_said(15, false), holder_window::opened_note(15));
+    }
 
     #[test]
     fn a_password_is_asked_twice_and_kept() {

@@ -437,8 +437,9 @@ read _
     ip.assert();
 }
 
-/// T52 (critic G6): a CLI that leads its own session (`exec apprafter unlock`) says so, and its
-/// window ends with it.
+/// T52 (critic G6), d4a-h F16 (matrix L-8): a CLI that leads its own session (`exec apprafter
+/// unlock`) says that the window it opened ends with it — and never, right after, that this
+/// terminal is unlocked for 5 min — and its window ends with it.
 #[test]
 fn a_cli_that_leads_its_session_takes_its_window_with_it() {
     let (sp, key, binding) = store("http://127.0.0.1:1");
@@ -446,12 +447,15 @@ fn a_cli_that_leads_its_session_takes_its_window_with_it() {
     let lock = holder_lock(&sp, &binding, t.child.id() as i32);
     t.shows(PROMPT, 1);
     t.type_line(&key);
-    t.shows("Unlocked in this terminal for 5 min", 1);
     let screen = t.finish();
     assert!(
-        screen.contains("This command leads its own session: the window ends with it."),
+        screen.contains(
+            "This command leads its own session, so the unlock window it opened ends with it: \
+             the next command asks again (run `apprafter unlock` from a shell to keep a window)."
+        ),
         "{screen}"
     );
+    assert!(!screen.contains("Unlocked in this terminal"), "{screen}");
     let until = Instant::now() + Duration::from_secs(2);
     while holder_alive(&lock) && Instant::now() < until {
         std::thread::sleep(Duration::from_millis(25));
