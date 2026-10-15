@@ -218,7 +218,10 @@ sudo install -Dm644 packaging/linux/dev.apprafter.desktop.policy \
 - Copy the policy file; do not symlink it. polkit runs as its own user and cannot read files in
   your home directory. It notices the new file by itself; check it with `pkaction` as above.
 - No launcher is installed. Start the app from a terminal with `apprafter-desktop`
-  (`~/.local/bin` must be on your `PATH`).
+  (`~/.local/bin` must be on your `PATH`). On Wayland its window then shows a generic icon.
+  [A launcher and the window icon](#a-launcher-and-the-window-icon) adds both: run its step
+  from the repository root, with `Exec=$HOME/.local/bin/apprafter-desktop` in place of its
+  `Exec` line.
 - To update, pull the repository, build again and repeat the install step.
 
 ### NixOS
@@ -241,6 +244,39 @@ nix develop .#desktop --command ./desktop/target/release/apprafter-desktop
 
 Start it through the dev shell, which provides its libraries, GIO modules and GSettings
 schemas. Started any other way, it may stop with `error while loading shared libraries`.
+
+#### A launcher and the window icon
+
+Nothing above installs a launcher. On Wayland the window and its taskbar entry then show a
+generic icon: a Wayland desktop finds a window's icon through the launcher whose file name is
+the window's app ID, and the app's ID is its binary's name, `apprafter-desktop`. Under X11 the
+window carries its own icon. To add a launcher and the icon, run this from the repository root
+after the build:
+
+```sh
+install -Dm644 desktop/src-tauri/icons/32x32.png ~/.local/share/icons/hicolor/32x32/apps/apprafter-desktop.png
+install -Dm644 desktop/src-tauri/icons/128x128.png ~/.local/share/icons/hicolor/128x128/apps/apprafter-desktop.png
+install -Dm644 desktop/src-tauri/icons/128x128@2x.png ~/.local/share/icons/hicolor/256x256/apps/apprafter-desktop.png
+mkdir -p ~/.local/share/applications
+cat > ~/.local/share/applications/apprafter-desktop.desktop <<EOF
+[Desktop Entry]
+Type=Application
+Name=AppRafter
+Exec=nix develop "$PWD#desktop" --command "$PWD/desktop/target/release/apprafter-desktop"
+Icon=apprafter-desktop
+StartupWMClass=apprafter-desktop
+Categories=Development;
+Terminal=false
+EOF
+```
+
+- Keep the file name `apprafter-desktop.desktop`: the desktop finds the icon by it. The
+  packages install a launcher of the same name.
+- The launcher holds the repository's path, which `$PWD` fills in. If you move the repository,
+  run the step again.
+- **AppRafter** then appears in your applications menu and starts the app through the dev
+  shell. A window opened after the step shows the app's icon; quit and start again an app that
+  was already running.
 
 #### The polkit policy on NixOS
 
@@ -309,7 +345,15 @@ rm ~/.local/bin/apprafter-desktop
 sudo rm /usr/share/polkit-1/actions/dev.apprafter.desktop.policy
 ```
 
-On NixOS, remove the policy from your configuration and rebuild.
+If you added the launcher:
+
+```sh
+rm ~/.local/share/applications/apprafter-desktop.desktop
+rm ~/.local/share/icons/hicolor/*/apps/apprafter-desktop.png
+```
+
+On NixOS, remove the policy from your configuration and rebuild, and remove the launcher as
+above.
 
 Uninstalling keeps the app's settings and logs. To remove them too:
 
