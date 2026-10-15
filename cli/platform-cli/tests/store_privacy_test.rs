@@ -289,6 +289,35 @@ fn doctor_moves_no_legacy_state_into_a_store_others_can_change() {
     assert_eq!(snapshot(&sp.store()), before, "doctor changed the store");
 }
 
+/// WI-487 with WI-481: `status`, a report, moves no legacy state into a store others can
+/// change either: the move takes the store lock, which refuses such a store, and the report
+/// goes on without it.
+#[test]
+fn status_moves_no_legacy_state_into_a_store_others_can_change() {
+    let project = tempfile::tempdir().unwrap();
+    let legacy = project.path().join(".apprafter").join("state.json");
+    std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+    let body = serde_json::json!({"cluster_name": "legacy"}).to_string();
+    std::fs::write(&legacy, &body).unwrap();
+    let sp = Spawn::new().current_dir(project.path());
+    let add = ["target", "add", "prod", "--provider", "hetzner-cloud"];
+    let (code, _, stderr) = run(&sp, &[&add[..], &["--token", TOKEN]].concat(), false);
+    assert_eq!(code, Some(0), "{stderr}");
+    let targets = sp.store().join("targets");
+    others_may_write(&targets, true);
+    let before = snapshot(&sp.store());
+    let (code, stdout, stderr) = run(&sp, &["status"], false);
+    others_may_write(&targets, false);
+    assert_eq!(code, Some(0), "status: {stdout}\n{stderr}");
+    assert!(stdout.contains("Target: prod"), "{stdout}");
+    assert_eq!(
+        std::fs::read_to_string(&legacy).unwrap(),
+        body,
+        "the legacy state moved"
+    );
+    assert_eq!(snapshot(&sp.store()), before, "status changed the store");
+}
+
 /// WI-482, Unix: a store root this account closed (mode 000) is never an empty store. `target
 /// list` and `target show` fail with an I/O error naming the path whose check failed: the
 /// `targets` folder for the list, the root's `config.yaml` for the active target that `show`

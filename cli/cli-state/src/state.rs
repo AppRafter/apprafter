@@ -49,14 +49,27 @@
 //! reuse the directory under a different target on their next
 //! shell).
 //!
+//! ## Writers (WI-487)
+//!
+//! Every writer of a `state.json` goes through [`State::update`]:
+//! under the store's write lock it reads the file again, writes the
+//! fields it owns into that fresh copy, and saves it. A writer never
+//! saves a copy it read before the lock — that copy would bring back
+//! what another writer replaced meanwhile: a cache `lock on` re-sealed
+//! to the store's own key, a cache `kubeconfig --refresh` fetched. Its
+//! slow work (a provider's calls) stays outside the lock. `State::save`
+//! is for tests and `update` alone (`apprafter-core/tests/guards.rs`).
+//!
 //! Encoding stays JSON for now — switching to CUE-encoded text
 //! lands in phase 1.x.
 
 use std::path::{Path, PathBuf};
 
 use cli_core::secrets::CachedSecret;
-use cli_core::{target::TargetStorePaths, CliError, Result, Tier};
+use cli_core::{target::TargetStorePaths, CliError, Result, StoreLock, Tier};
 use serde::{Deserialize, Serialize};
+
+use crate::seam::{self, WritePoint};
 
 const STATE_DIR: &str = ".apprafter";
 const STATE_FILE: &str = "state.json";
@@ -172,10 +185,17 @@ impl StatePaths {
 /// scheme on a freshly-created target should not have their state
 /// silently overwritten by stale per-cwd data; the legacy file is
 /// theirs to inspect and delete manually if they want to.
+///
+/// It moves files into the per-target `state.json`, so it runs under
+/// the store's write lock `held`, as every writer of that file does
+/// (WI-487): a writer saving the same file meanwhile is never
+/// replaced by the move, nor the move by it.
 pub fn migrate_legacy_state_if_present(
     legacy_root: &Path,
     target_paths: &StatePaths,
+    held: &StoreLock,
 ) -> Result<()> {
+    let _ = held;
     let legacy_state = legacy_root.join(STATE_DIR).join(STATE_FILE);
     if !legacy_state.exists() {
         return Ok(());
@@ -445,6 +465,30 @@ impl HetznerCloudState {
             CachedSecret::ArgocdPassword => self.argocd_admin_password_sealed_to.as_ref(),
         }
     }
+
+    /// The secrets `kubeconfig` and `argocd-password` cached in `from`, with the record of what
+    /// sealed each (F13), carried into `self`: a writer that rebuilds the provider's objects
+    /// from the live API (`apply`, `import`) owns none of them. `from` is the state read again
+    /// under the store lock (WI-487), never a copy read before it; `None` carries nothing.
+    pub fn carry_caches_from(&mut self, from: Option<&HetznerCloudState>) {
+        let Some(from) = from else {
+            return;
+        };
+        self.kubeconfig_yaml = from.kubeconfig_yaml.clone();
+        self.kubeconfig_age = from.kubeconfig_age.clone();
+        self.argocd_admin_password_age = from.argocd_admin_password_age.clone();
+        self.kubeconfig_sealed_to = from.kubeconfig_sealed_to.clone();
+        self.argocd_admin_password_sealed_to = from.argocd_admin_password_sealed_to.clone();
+    }
+}
+
+/// What a change given to [`State::update`] asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Write {
+    /// Save the state as the change left it.
+    Save,
+    /// Leave `state.json` as it is: the change found nothing to write.
+    Leave,
 }
 
 impl State {
@@ -474,8 +518,11 @@ impl State {
     /// record of a field the rebuild cannot recover. The returned path
     /// is the caller's to report.
     ///
+    /// It moves `state.json`, so only [`State::update_recovering`]
+    /// calls it, under the store lock (WI-487).
+    ///
     /// [`load_or_default`]: Self::load_or_default
-    pub fn load_or_recover(paths: &StatePaths, force: bool) -> Result<(Self, Option<PathBuf>)> {
+    fn load_or_recover(paths: &StatePaths, force: bool) -> Result<(Self, Option<PathBuf>)> {
         match Self::load_or_default(paths) {
             Ok(state) => Ok((state, None)),
             Err(err) => {
@@ -507,11 +554,62 @@ impl State {
     /// releases, a plaintext one. A reader
     /// holding `state.json` open does not make the save fail, on Windows
     /// either ([`cli_core::atomic_replace`]).
+    ///
+    /// For tests and [`State::update`] alone: production code writes
+    /// through `update`, under the store lock, from a copy read under it
+    /// (WI-487; `apprafter-core/tests/guards.rs` keeps every other caller
+    /// out).
     pub fn save(&self, paths: &StatePaths) -> Result<()> {
         paths.create_state_dir()?;
         let bytes = serde_json::to_vec_pretty(self)?;
         cli_core::atomic_replace(&paths.state_file(), &bytes, ".state.json.", None)?;
         Ok(())
+    }
+
+    /// The one way AppRafter writes a target's `state.json` (WI-487): under the store's write
+    /// lock `held`, the file is read again, `change` writes the fields its writer owns into
+    /// that fresh copy, and the copy is saved when `change` asks for it ([`Write::Save`]).
+    /// Every field the writer does not own — another writer's cache and the record of what
+    /// sealed it, another command's provider or region — is saved as it was just read, never
+    /// from a copy read before the lock. The caller takes the lock after its slow work (a
+    /// provider's calls), so that work never holds the store; `held` may hold nothing where
+    /// the store cannot be locked at all, as every lock-taking writer allows. A file that does
+    /// not parse fails the write, and nothing is written.
+    pub fn update<E: From<CliError>>(
+        paths: &StatePaths,
+        held: &StoreLock,
+        change: impl FnOnce(&mut State) -> std::result::Result<Write, E>,
+    ) -> std::result::Result<Write, E> {
+        let _ = held;
+        let mut state = Self::load_or_default(paths)?;
+        Self::write(paths, &mut state, change)
+    }
+
+    /// [`State::update`] for `import --force`: a `state.json` that does not parse is renamed
+    /// aside first (`state.json.corrupt-<epoch>`, never deleted), under the same lock, and
+    /// `change` starts from an empty state. Returns where the file went, for the caller to say.
+    pub fn update_recovering<E: From<CliError>>(
+        paths: &StatePaths,
+        held: &StoreLock,
+        change: impl FnOnce(&mut State) -> std::result::Result<Write, E>,
+    ) -> std::result::Result<(Write, Option<PathBuf>), E> {
+        let _ = held;
+        let (mut state, moved) = Self::load_or_recover(paths, true)?;
+        Ok((Self::write(paths, &mut state, change)?, moved))
+    }
+
+    /// `change` on `state`, just read under the lock, then the save it asks for.
+    fn write<E: From<CliError>>(
+        paths: &StatePaths,
+        state: &mut State,
+        change: impl FnOnce(&mut State) -> std::result::Result<Write, E>,
+    ) -> std::result::Result<Write, E> {
+        seam::reached(WritePoint::Reread);
+        let write = change(state)?;
+        if write == Write::Save {
+            state.save(paths)?;
+        }
+        Ok(write)
     }
 }
 
@@ -760,6 +858,181 @@ mod tests {
         );
     }
 
+    // ── WI-487: the one writer, under the store lock ─────────────────────
+
+    /// A store with a `prod` state, and its paths.
+    fn locked_state(state: &State) -> (tempfile::TempDir, TargetStorePaths, StatePaths) {
+        let (dir, store) = make_store();
+        let paths = StatePaths::for_active_target(&store, "prod");
+        state.save(&paths).unwrap();
+        (dir, store, paths)
+    }
+
+    fn cached(server_id: u64, kubeconfig: &str) -> HetznerCloudState {
+        HetznerCloudState {
+            server_id,
+            server_name: "n".into(),
+            server_type: None,
+            ssh_key_ids: Vec::new(),
+            network_id: None,
+            firewall_id: None,
+            floating_ip_ids: Vec::new(),
+            kubeconfig_yaml: None,
+            kubeconfig_age: Some(kubeconfig.into()),
+            argocd_admin_password_age: None,
+            kubeconfig_sealed_to: Some(SealedTo::StoreVault {
+                store_id: "3f9c0a1b7d2e4c56".into(),
+            }),
+            argocd_admin_password_sealed_to: None,
+        }
+    }
+
+    /// The change lands in the state as it is under the lock: what another writer saved after
+    /// this one first read the file stays (a cache `lock on` re-sealed, here).
+    #[test]
+    fn an_update_writes_its_change_into_the_state_read_again() {
+        let first = State {
+            provider: Some("hetzner-cloud".into()),
+            region: Some("nbg1".into()),
+            ..Default::default()
+        };
+        let (_dir, store, paths) = locked_state(&first);
+        let early = State::load_or_default(&paths).unwrap();
+        let resealed = State {
+            hetzner_cloud: Some(cached(42, "RESEALED")),
+            ..first.clone()
+        };
+        resealed.save(&paths).unwrap();
+
+        let held = StoreLock::exclusive(&store).unwrap();
+        let wrote = State::update::<CliError>(&paths, &held, |s| {
+            s.tier = Some(Tier::Solo);
+            Ok(Write::Save)
+        })
+        .unwrap();
+        drop(held);
+
+        assert_eq!(wrote, Write::Save);
+        assert_eq!(early.hetzner_cloud, None, "the first read had no cache");
+        assert_eq!(
+            State::load_or_default(&paths).unwrap(),
+            State {
+                tier: Some(Tier::Solo),
+                ..resealed
+            }
+        );
+    }
+
+    /// `Write::Leave` writes nothing: the file is the one that was there.
+    #[test]
+    fn an_update_that_leaves_the_state_writes_nothing() {
+        let (_dir, store, paths) = locked_state(&State::default());
+        std::fs::write(paths.state_file(), b"{\"cluster_name\": \"as written\"}").unwrap();
+        let held = StoreLock::exclusive(&store).unwrap();
+        let wrote = State::update::<CliError>(&paths, &held, |s| {
+            s.region = Some("fsn1".into());
+            Ok(Write::Leave)
+        })
+        .unwrap();
+        assert_eq!(wrote, Write::Leave);
+        assert_eq!(
+            std::fs::read(paths.state_file()).unwrap(),
+            b"{\"cluster_name\": \"as written\"}"
+        );
+    }
+
+    /// A state that does not parse fails the update before its change, and stays.
+    #[test]
+    fn an_update_refuses_a_state_that_does_not_parse() {
+        let (_dir, store, paths) = locked_state(&State::default());
+        std::fs::write(paths.state_file(), b"{ not json").unwrap();
+        let held = StoreLock::exclusive(&store).unwrap();
+        let mut changed = false;
+        let err = State::update::<CliError>(&paths, &held, |_| {
+            changed = true;
+            Ok(Write::Save)
+        })
+        .unwrap_err();
+        assert!(matches!(err, CliError::InvalidState { .. }), "{err:?}");
+        assert!(!changed, "the change ran on a state that did not parse");
+        assert_eq!(std::fs::read(paths.state_file()).unwrap(), b"{ not json");
+    }
+
+    /// `import --force`'s update: a state that does not parse is moved aside under the lock,
+    /// and the change starts from an empty state.
+    #[test]
+    fn a_recovering_update_moves_a_state_that_does_not_parse_aside() {
+        let (_dir, store, paths) = locked_state(&State::default());
+        std::fs::write(paths.state_file(), b"{ not json").unwrap();
+        let held = StoreLock::exclusive(&store).unwrap();
+        let (wrote, moved) = State::update_recovering::<CliError>(&paths, &held, |s| {
+            assert_eq!(*s, State::default());
+            s.cluster_name = Some("rebuilt".into());
+            Ok(Write::Save)
+        })
+        .unwrap();
+        assert_eq!(wrote, Write::Save);
+        let moved = moved.expect("the file was moved aside");
+        assert_eq!(std::fs::read(&moved).unwrap(), b"{ not json");
+        assert_eq!(
+            State::load_or_default(&paths).unwrap().cluster_name,
+            Some("rebuilt".into())
+        );
+        // A state that parses is updated in place, nothing moved.
+        let (_, moved) =
+            State::update_recovering::<CliError>(&paths, &held, |_| Ok(Write::Save)).unwrap();
+        assert_eq!(moved, None);
+    }
+
+    /// `WritePoint::Reread` comes after the read and before the save: a write landing there
+    /// is not in the copy the update saves — which is why the lock must be held across it.
+    #[test]
+    fn the_reread_point_lies_between_the_read_and_the_save() {
+        let (_dir, store, paths) = locked_state(&State::default());
+        let at_reread = paths.clone();
+        let _armed = seam::testing::arm(move |point| {
+            assert_eq!(point, WritePoint::Reread);
+            State {
+                cluster_name: Some("landed between".into()),
+                ..Default::default()
+            }
+            .save(&at_reread)
+            .unwrap();
+        });
+        let held = StoreLock::exclusive(&store).unwrap();
+        State::update::<CliError>(&paths, &held, |s| {
+            assert_eq!(s.cluster_name, None, "read before the point");
+            s.region = Some("fsn1".into());
+            Ok(Write::Save)
+        })
+        .unwrap();
+        let after = State::load_or_default(&paths).unwrap();
+        assert_eq!(after.cluster_name, None);
+        assert_eq!(after.region, Some("fsn1".into()));
+    }
+
+    /// `apply` and `import` carry the caches and their records from the state read again.
+    #[test]
+    fn the_caches_are_carried_with_what_sealed_them() {
+        let from = cached(1, "K");
+        let mut into = HetznerCloudState {
+            kubeconfig_age: None,
+            kubeconfig_sealed_to: None,
+            ..cached(2, "unused")
+        };
+        into.carry_caches_from(Some(&from));
+        assert_eq!(
+            into,
+            HetznerCloudState {
+                server_id: 2,
+                ..from.clone()
+            }
+        );
+        let mut none = cached(3, "kept");
+        none.carry_caches_from(None);
+        assert_eq!(none, cached(3, "kept"));
+    }
+
     fn make_store() -> (tempfile::TempDir, TargetStorePaths) {
         let dir = tempdir().unwrap();
         let store = TargetStorePaths::for_root(dir.path().to_path_buf());
@@ -791,7 +1064,7 @@ mod tests {
         let (_dir, store) = make_store();
         let paths = StatePaths::for_active_target(&store, "default");
         let legacy_root = tempdir().unwrap();
-        migrate_legacy_state_if_present(legacy_root.path(), &paths).unwrap();
+        migrate_legacy_state_if_present(legacy_root.path(), &paths, &StoreLock::unheld()).unwrap();
         assert!(!paths.state_file().exists(), "no state must be created");
     }
 
@@ -807,7 +1080,7 @@ mod tests {
         std::fs::create_dir_all(&legacy_dir).unwrap();
         std::fs::write(legacy_dir.join(STATE_FILE), br#"{"cluster_name":"p"}"#).unwrap();
 
-        migrate_legacy_state_if_present(legacy_root.path(), &paths).unwrap();
+        migrate_legacy_state_if_present(legacy_root.path(), &paths, &StoreLock::unheld()).unwrap();
 
         assert!(paths.state_file().exists(), "new file must exist");
         assert!(
@@ -834,7 +1107,7 @@ mod tests {
         std::fs::create_dir_all(&legacy_dir).unwrap();
         std::fs::write(legacy_dir.join(STATE_FILE), br#"{"cluster_name":"legacy"}"#).unwrap();
 
-        migrate_legacy_state_if_present(legacy_root.path(), &paths).unwrap();
+        migrate_legacy_state_if_present(legacy_root.path(), &paths, &StoreLock::unheld()).unwrap();
 
         // New file kept verbatim.
         let body = std::fs::read_to_string(paths.state_file()).unwrap();
@@ -891,7 +1164,7 @@ mod tests {
         )
         .unwrap();
 
-        migrate_legacy_state_if_present(legacy_root.path(), &paths).unwrap();
+        migrate_legacy_state_if_present(legacy_root.path(), &paths, &StoreLock::unheld()).unwrap();
 
         // Per-target state.json is now the migrated legacy
         // content (real hetzner_cloud block).
@@ -933,7 +1206,7 @@ mod tests {
         )
         .unwrap();
 
-        migrate_legacy_state_if_present(legacy_root.path(), &paths).unwrap();
+        migrate_legacy_state_if_present(legacy_root.path(), &paths, &StoreLock::unheld()).unwrap();
 
         let body = std::fs::read_to_string(paths.state_file()).unwrap();
         assert!(body.contains("\"server_id\":999"), "{body}");
@@ -960,7 +1233,7 @@ mod tests {
         )
         .unwrap();
 
-        migrate_legacy_state_if_present(legacy_root.path(), &paths).unwrap();
+        migrate_legacy_state_if_present(legacy_root.path(), &paths, &StoreLock::unheld()).unwrap();
 
         assert!(paths.state_file().exists());
         assert!(paths.known_hosts_file().exists());
@@ -983,8 +1256,12 @@ mod tests {
         let legacy = base.join("migrate").join("project");
         std::fs::create_dir_all(legacy.join(STATE_DIR)).unwrap();
         std::fs::write(legacy.join(STATE_DIR).join(STATE_FILE), b"{}").unwrap();
-        migrate_legacy_state_if_present(&legacy, &StatePaths::for_active_target(&moved, "prod"))
-            .unwrap();
+        migrate_legacy_state_if_present(
+            &legacy,
+            &StatePaths::for_active_target(&moved, "prod"),
+            &StoreLock::unheld(),
+        )
+        .unwrap();
         assert!(StatePaths::for_active_target(&moved, "prod")
             .state_file()
             .exists());

@@ -89,3 +89,7 @@ mockito       = { workspace = true }
 # and `owner_only::testing::ModeGuard`, which puts a folder's mode back (WI-482). A path crate's
 # dev-dependency reaches neither a shipped binary nor desktop/Cargo.lock.
 cli-core      = { path = "../cli-core", features = ["test-support"] }
+# `seam::testing` (cli-state's test-support): a test stops a `state.json` writer between its
+# read and its save (WI-487). A path crate's dev-dependency reaches neither a shipped binary nor
+# desktop/Cargo.lock.
+cli-state     = { path = "../cli-state", features = ["test-support"] }

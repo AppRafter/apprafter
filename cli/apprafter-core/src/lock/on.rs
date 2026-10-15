@@ -36,7 +36,7 @@ use age::secrecy::ExposeSecret;
 use cli_core::secrets::{CachedSecret, Identity};
 use cli_core::target::TargetStorePaths;
 use cli_core::{CliError, LockPhase, SecretsModeKind, StoreLock};
-use cli_state::{SealedTo, State, StatePaths};
+use cli_state::{SealedTo, State, StatePaths, Write};
 use serde::Serialize;
 use zeroize::Zeroizing;
 
@@ -865,6 +865,7 @@ fn finish(
     for (n, target) in targets.iter().enumerate() {
         reseal(
             run.store,
+            run.held,
             target,
             (key, run.id),
             &old,
@@ -902,9 +903,12 @@ fn finish(
 /// plan listed it (or on a resume, whose plan says so), else left; a winning plaintext
 /// kubeconfig sealed, a shadowed one dropped. F13: each cache sealed to the store's key — a
 /// skipped one too — records it (`SealedTo::StoreVault` with the store's id); a dropped one
-/// loses its record; a left one keeps whatever it had.
+/// loses its record; a left one keeps whatever it had. The state is read again under the held
+/// lock and only its caches change (WI-487, `State::update`).
+#[allow(clippy::too_many_arguments)]
 fn reseal(
     store: &TargetStorePaths,
+    held: &StoreLock,
     target: &str,
     (key, id): (&CacheKey, &StoreId),
     old: &transfer::SharedKeys<'_>,
@@ -913,81 +917,83 @@ fn reseal(
     done: &mut LockedOn,
 ) -> CoreResult<()> {
     let paths = StatePaths::for_active_target(store, target);
-    let mut state = State::load_or_default(&paths)?;
-    let Some(mut h) = state.hetzner_cloud.clone() else {
-        return Ok(());
-    };
-    let vault = || SealedTo::StoreVault {
-        store_id: id.as_str().to_string(),
-    };
-    let shadowed = h.kubeconfig_age.is_some();
-    let mut changed = false;
-    for secret in [CachedSecret::Kubeconfig, CachedSecret::ArgocdPassword] {
-        let (slot, record) = h.cache_mut(secret);
-        let Some(armored) = slot.clone() else {
-            continue;
+    State::update::<CoreError>(&paths, held, |state| {
+        let Some(mut h) = state.hetzner_cloud.clone() else {
+            return Ok(Write::Leave);
         };
-        if transfer::opens(key, secret, &armored).is_some() {
-            // A resume: sealed to the store's key already; recorded so, once.
-            if *record != Some(vault()) {
-                *record = Some(vault());
-                changed = true;
+        let vault = || SealedTo::StoreVault {
+            store_id: id.as_str().to_string(),
+        };
+        let shadowed = h.kubeconfig_age.is_some();
+        let mut changed = false;
+        for secret in [CachedSecret::Kubeconfig, CachedSecret::ArgocdPassword] {
+            let (slot, record) = h.cache_mut(secret);
+            let Some(armored) = slot.clone() else {
+                continue;
+            };
+            if transfer::opens(key, secret, &armored).is_some() {
+                // A resume: sealed to the store's key already; recorded so, once.
+                if *record != Some(vault()) {
+                    *record = Some(vault());
+                    changed = true;
+                }
+                continue;
             }
-            continue;
-        }
-        match transfer::open_with_any(&armored, old.get()?) {
-            Some(plain) => {
-                *slot = Some(sealed_and_checked(store, key, secret, target, &plain)?);
-                *record = Some(vault());
-                changed = true;
-                done.caches_resealed += 1;
-            }
-            None if resume
-                || agreed.contains(&CacheDrop {
-                    target: target.to_string(),
-                    secret,
-                }) =>
-            {
-                *slot = None;
-                *record = None;
-                changed = true;
-                done.caches_dropped.push(dropped(
+            match transfer::open_with_any(&armored, old.get()?) {
+                Some(plain) => {
+                    *slot = Some(sealed_and_checked(store, key, secret, target, &plain)?);
+                    *record = Some(vault());
+                    changed = true;
+                    done.caches_resealed += 1;
+                }
+                None if resume
+                    || agreed.contains(&CacheDrop {
+                        target: target.to_string(),
+                        secret,
+                    }) =>
+                {
+                    *slot = None;
+                    *record = None;
+                    changed = true;
+                    done.caches_dropped.push(dropped(
+                        target,
+                        secret,
+                        "no age key this run read decrypts it",
+                    ));
+                }
+                None => done.caches_left.push(dropped(
                     target,
                     secret,
-                    "no age key this run read decrypts it",
-                ));
+                    "it stopped decrypting after the plan was made; `--refresh` fetches it again",
+                )),
             }
-            None => done.caches_left.push(dropped(
-                target,
-                secret,
-                "it stopped decrypting after the plan was made; `--refresh` fetches it again",
-            )),
         }
-    }
-    if let Some(plain) = h.kubeconfig_yaml.take().map(Zeroizing::new) {
-        changed = true;
-        if shadowed {
-            done.caches_dropped.push(dropped(
-                target,
-                CachedSecret::Kubeconfig,
-                "a plaintext copy beside the encrypted one",
-            ));
-        } else {
-            h.kubeconfig_age = Some(sealed_and_checked(
-                store,
-                key,
-                CachedSecret::Kubeconfig,
-                target,
-                &plain,
-            )?);
-            h.kubeconfig_sealed_to = Some(vault());
-            done.caches_resealed += 1;
+        if let Some(plain) = h.kubeconfig_yaml.take().map(Zeroizing::new) {
+            changed = true;
+            if shadowed {
+                done.caches_dropped.push(dropped(
+                    target,
+                    CachedSecret::Kubeconfig,
+                    "a plaintext copy beside the encrypted one",
+                ));
+            } else {
+                h.kubeconfig_age = Some(sealed_and_checked(
+                    store,
+                    key,
+                    CachedSecret::Kubeconfig,
+                    target,
+                    &plain,
+                )?);
+                h.kubeconfig_sealed_to = Some(vault());
+                done.caches_resealed += 1;
+            }
         }
-    }
-    if changed {
+        if !changed {
+            return Ok(Write::Leave);
+        }
         state.hetzner_cloud = Some(h);
-        state.save(&paths)?;
-    }
+        Ok(Write::Save)
+    })?;
     Ok(())
 }
 

@@ -10,6 +10,13 @@ publish.workspace      = true
 authors.workspace      = true
 repository.workspace   = true
 
+[features]
+# `seam::testing`: the hook a test arms at a `state.json` writer's points (WI-487). Enabled only
+# by the [dev-dependencies] of the crates that test their writers (apprafter-core, platform-cli):
+# under resolver 2 a dev-dependency's features never reach a shipped binary, so there
+# `seam::reached` does nothing.
+test-support = []
+
 [dependencies]
 cli-core   = { path = "../cli-core" }
 serde      = { workspace = true }
