@@ -281,7 +281,7 @@ export function AddTargetWizard({ onClose }: { onClose: () => void }) {
 
   const finishAdded = (added: TargetAdded) => {
     refreshTargets(client); // D.3d's: the Targets page and list read again
-    toast({ message: addedMessage(added), icon: HardDrivesIcon });
+    toast({ message: addedMessage(added), icon: HardDrivesIcon, end: 'done' });
     onClose();
   };
 

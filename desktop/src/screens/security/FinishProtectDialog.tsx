@@ -82,10 +82,10 @@ export function FinishProtectDialog(p: FinishProtectDialogProps) {
         auth={p.auth}
         onDone={(result) => {
           // What really happened: another run first, a token left in clear (UI verifier M3).
-          toast({ message: protectedSummary(protectOutcome(result), true) });
+          toast({ message: protectedSummary(protectOutcome(result), true), end: 'done' });
           p.onDone();
         }}
-        onFailed={(failure) => toast({ message: failure.message })}
+        onFailed={(failure) => toast({ message: failure.message, end: 'failed' })}
         onClose={p.onClose}
       />
     );

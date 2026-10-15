@@ -155,12 +155,15 @@ export function ProtectDialog(p: ProtectDialogProps) {
       ran.current = true;
       releasePlan(id);
       // What really happened: another run first, a token left in clear (UI verifier M3).
-      toast({ message: protectedSummary(protectOutcome(resultOf(await started.ended)), false) });
+      toast({
+        message: protectedSummary(protectOutcome(resultOf(await started.ended)), false),
+        end: 'done',
+      });
       p.onDone();
       p.onClose();
     } catch (reason) {
       if (isCancelled(reason)) {
-        toast({ message: PROTECT_CANCELLED });
+        toast({ message: PROTECT_CANCELLED, end: 'failed' });
         p.onDone();
         p.onClose();
         return;

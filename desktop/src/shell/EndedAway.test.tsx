@@ -9,7 +9,7 @@ import { act, cleanup, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { useEffect } from 'react';
 import { PlanConfirm } from '../components/PlanConfirm';
-import { ToastProvider, ToastViewport } from '../components/Toast';
+import { type Schedule, ToastProvider, ToastViewport, useToast } from '../components/Toast';
 import { endedAwaySnapshot, keepEndedAway, resetEndedAway } from '../ipc/away';
 import { DESKTOP_ERROR_CODES } from '../ipc/generated/errors';
 import { LOCK_CHANGED } from '../ipc/generated/events';
@@ -38,6 +38,8 @@ let ended: boolean;
 let endedDone: boolean;
 /** D.4a F18: Rust's answer to op_execute, when a test holds it (else: the op runs). */
 let execute: (() => Promise<unknown>) | null;
+/** D.4a N5: the run completes at once, its end sent on op_execute's channel while it is shown. */
+let endsAtOnce: boolean;
 let opened: boolean;
 
 beforeEach(() => {
@@ -46,6 +48,7 @@ beforeEach(() => {
   ended = false;
   endedDone = false;
   execute = null;
+  endsAtOnce = false;
   opened = false;
   mockWindows('main');
   mockIPC(
@@ -62,7 +65,25 @@ beforeEach(() => {
           fields: {},
         });
       }
-      if (cmd === 'op_execute') return execute === null ? 2 : execute(); // Rust runs it
+      if (cmd === 'op_execute') {
+        if (execute !== null) return execute();
+        if (endsAtOnce) {
+          // Its end on the execute's channel, as Rust sends it (test/ipc.ts does the same).
+          const channel = args.onEvent as { id: number };
+          const internals = (
+            window as unknown as {
+              __TAURI_INTERNALS__: { runCallback(id: number, data: unknown): void };
+            }
+          ).__TAURI_INTERNALS__;
+          setTimeout(() => {
+            internals.runCallback(channel.id, {
+              index: 0,
+              message: { kind: 'finished', outcome: { status: 'completed', result: null } },
+            });
+          }, 0);
+        }
+        return 2; // Rust runs it
+      }
       if (cmd === 'op_subscribe') {
         return {
           subscription: 3,
@@ -97,9 +118,16 @@ afterEach(async () => {
   clearMocks();
 });
 
-/** Opens the confirm in the first shell only: the shell after the unlock is a new one. */
+/** What the confirm's page shows of a completed run, as the app's pages do (D.4a N5). */
+const RENAMED = 'Renamed prod-eu to prod.';
+
+/**
+ * Opens the confirm in the first shell only: the shell after the unlock is a new one. Its page
+ * toasts the run's end, marked as one, as every page that runs a change does.
+ */
 function OpenConfirm() {
   const show = useOverlay();
+  const toast = useToast();
   useEffect(() => {
     if (opened) return;
     opened = true;
@@ -109,12 +137,12 @@ function OpenConfirm() {
         title="Rename prod-eu?"
         confirmLabel="Rename"
         auth={null}
-        onDone={() => {}}
+        onDone={() => toast({ message: RENAMED, end: 'done' })}
         onFailed={() => {}}
         onClose={close}
       />
     ));
-  }, [show]);
+  }, [show, toast]);
   return null;
 }
 
@@ -160,13 +188,16 @@ test('a confirmed plan that ends after a lock took its screen: its failure shows
   expect(endedAwaySnapshot()).toEqual([]);
 });
 
-/** The app as the tests above render it: the lock gate, a shell with the confirm, the notices. */
-function renderApp() {
+/**
+ * The app as the tests above render it: the lock gate, a shell with the confirm, the notices;
+ * `schedule`, the toasts' clock, the test's own where it is given.
+ */
+function renderApp(schedule?: Schedule) {
   render(
     <QueryClientProvider client={createQueryClient()}>
       <PlatformContext value={appInfo()}>
         <LockGate>
-          <ToastProvider>
+          <ToastProvider {...(schedule !== undefined && { schedule })}>
             <ViewFrame>
               <OpenConfirm />
             </ViewFrame>
@@ -271,4 +302,69 @@ test('a note with no operation of its own shows like an end, and nothing is disc
   expect(await screen.findByText('Add target lab: done.')).toBeDefined();
   expect(discarded()).toEqual([51]);
   expect(endedAwaySnapshot()).toEqual([]);
+});
+
+/** A toast clock the test runs by hand: each scheduled end, and whether it was cancelled. */
+function manualClock() {
+  const jobs: { run: () => void; cancelled: boolean }[] = [];
+  const schedule: Schedule = (run) => {
+    const job = { run, cancelled: false };
+    jobs.push(job);
+    return () => {
+      job.cancelled = true;
+    };
+  };
+  return { jobs, schedule };
+}
+
+// D.4a N5 (the owner walk's D-7 (a), presses at 0.72 s and 1.51 s): a change that ended a moment
+// before the lock showed its own toast only before it, and after the unlock nothing said how it
+// ended. Its toast, still shown when the app locks, now shows again after the unlock.
+test('D.4a N5: a change that ended a moment before the lock says so again after the unlock', async () => {
+  const { jobs, schedule } = manualClock();
+  endsAtOnce = true; // it ends as soon as it runs, its page still shown
+  renderApp(schedule);
+  const user = userEvent.setup();
+  await user.click(await screen.findByRole('button', { name: 'Rename' }));
+  expect(await screen.findByText(RENAMED)).toBeDefined();
+  const shown = jobs.filter((j) => !j.cancelled);
+  expect(shown.length).toBe(1); // its TOAST_MS not over: still shown when the app locks
+  await changed(true);
+  expect(screen.queryByText(RENAMED)).toBeNull();
+  // Kept once, in the page's words; startPlan kept nothing (its page took the end).
+  expect(endedAwaySnapshot()).toEqual([{ opId: null, text: RENAMED, failed: false }]);
+  await changed(false);
+  expect(await screen.findByText(RENAMED)).toBeDefined();
+  expect(endedAwaySnapshot()).toEqual([]);
+});
+
+test('D.4a N5: a change whose toast had gone before the lock says nothing more after it', async () => {
+  const { jobs, schedule } = manualClock();
+  endsAtOnce = true;
+  renderApp(schedule);
+  const user = userEvent.setup();
+  await user.click(await screen.findByRole('button', { name: 'Rename' }));
+  expect(await screen.findByText(RENAMED)).toBeDefined();
+  act(() => {
+    for (const job of jobs.filter((j) => !j.cancelled)) job.run(); // its TOAST_MS are over
+  });
+  expect(screen.queryByText(RENAMED)).toBeNull();
+  await changed(true);
+  expect(endedAwaySnapshot()).toEqual([]);
+});
+
+test('D.4a N5: a notice the app shows after an unlock is an end too: a lock while it shows keeps it again', async () => {
+  const { schedule } = manualClock();
+  keepEndedAway({ opId: 61, text: 'Rename prod failed: taken', failed: true });
+  renderApp(schedule);
+  expect(await screen.findByText('Rename prod failed: taken')).toBeDefined();
+  expect(discarded()).toEqual([61]);
+  await changed(true);
+  // Kept again as what it is, a failure; its operation was discarded when it first showed.
+  expect(endedAwaySnapshot()).toEqual([
+    { opId: null, text: 'Rename prod failed: taken', failed: true },
+  ]);
+  await changed(false);
+  expect(await screen.findByText('Rename prod failed: taken')).toBeDefined();
+  expect(discarded()).toEqual([61]);
 });

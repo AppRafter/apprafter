@@ -19,7 +19,12 @@ export function EndedAwayNotices({ spacingMs = TOAST_MS }: { spacingMs?: number 
     if (first === undefined || showing.current) return;
     showing.current = true;
     takeEndedAway(first);
-    toast({ message: first.text, icon: first.failed ? WarningCircleIcon : CheckCircleIcon });
+    // Itself an end: a lock while it shows keeps it again (D.4a N5).
+    toast({
+      message: first.text,
+      icon: first.failed ? WarningCircleIcon : CheckCircleIcon,
+      end: first.failed ? 'failed' : 'done',
+    });
     const { opId } = first;
     if (opId !== null) discard(opId).catch(reportUnlessLocked(`op_discard ${opId}`));
     setTimeout(() => {

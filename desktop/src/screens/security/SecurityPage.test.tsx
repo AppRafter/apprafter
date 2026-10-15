@@ -7,9 +7,9 @@ import { QueryClientProvider } from '@tanstack/react-query';
 import { clearMocks } from '@tauri-apps/api/mocks';
 import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { ToastProvider, ToastViewport } from '../../components/Toast';
+import { type Schedule, ToastProvider, ToastViewport } from '../../components/Toast';
 import * as api from '../../ipc/api';
-import { resetEndedAway } from '../../ipc/away';
+import { endedAwaySnapshot, resetEndedAway } from '../../ipc/away';
 import type { LockOffPlan } from '../../ipc/generated/LockOffPlan';
 import type { SecretsMode } from '../../ipc/generated/SecretsMode';
 import type { UiError } from '../../ipc/generated/UiError';
@@ -95,9 +95,14 @@ function refuse(cmd: string, error: UiError): void {
 
 /**
  * The page as the shell hosts it, under the platform gate, on the mock with the store `secrets`;
- * `before` runs on the unlocked mock just before the page renders.
+ * `before` runs on the unlocked mock just before the page renders; `schedule`, the toasts' clock,
+ * the test's own where it is given.
  */
-async function open(secrets: SecretsMode = 'files', before: () => void = () => {}) {
+async function open(
+  secrets: SecretsMode = 'files',
+  before: () => void = () => {},
+  schedule?: Schedule,
+) {
   installMockIpc({ opDelayMs: 0, secrets });
   if (secrets === 'files') await api.unlock();
   else await api.unlockWithPassword(MOCK_STORE_PASSWORD);
@@ -106,7 +111,7 @@ async function open(secrets: SecretsMode = 'files', before: () => void = () => {
   render(
     <QueryClientProvider client={createQueryClient()}>
       <PlatformGate>
-        <ToastProvider>
+        <ToastProvider {...(schedule !== undefined && { schedule })}>
           <ScreenHost>
             <SecurityPage />
           </ScreenHost>
@@ -237,6 +242,27 @@ describe('the Security page (WI-476)', () => {
         true,
       ),
     );
+  });
+
+  // D.4a N5 (the owner walk's D-7 (a) at 0.72 s and 1.51 s): Stop protecting had ended, and
+  // its toast was still shown when the app locked; after the unlock nothing said it had ended.
+  // The toasts' clock never runs here: the lock comes within the toast's time.
+  test('D.4a N5: Stop protecting’s toast, still shown when the app locks, is kept for after the unlock', async () => {
+    const { user } = await open(
+      'locked',
+      () => {},
+      () => () => {},
+    );
+    await user.click(await within(view()).findByRole('button', { name: ACTION_LABELS.stop }));
+    const confirm = await screen.findByRole('dialog', { name: STOP_TITLE });
+    await user.type(within(confirm).getByLabelText(STORE_SECRET_FIELD), MOCK_STORE_PASSWORD);
+    await user.click(within(confirm).getByRole('button', { name: 'Stop protecting' }));
+    expect(await screen.findByText(STOPPED_TOAST)).toBeDefined();
+    expect(endedAwaySnapshot()).toEqual([]);
+    act(() => {
+      sessionLocked();
+    });
+    expect(endedAwaySnapshot()).toEqual([{ opId: null, text: STOPPED_TOAST, failed: false }]);
   });
 
   test('Stop protecting an interrupted Protect backs it out, and the toast says so (UI verifier M3)', async () => {

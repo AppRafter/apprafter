@@ -117,6 +117,7 @@ export function ChangeMachineDialog({ target, now, onClose }: ChangeMachineDialo
     toast({
       message: `Machine for “${set.name}”: ${set.sku}${set.region === null ? '' : ` in ${set.region}`}.`,
       icon: HardDrivesIcon,
+      end: 'done',
     });
     onClose();
   };

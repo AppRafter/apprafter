@@ -1,8 +1,14 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
-import { expect, mock, test } from 'bun:test';
-import { act, render, screen } from '@testing-library/react';
+import { afterEach, expect, mock, test } from 'bun:test';
+import { act, cleanup, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { TOAST_MS, ToastProvider, ToastViewport, useToast } from './Toast';
+import { endedAwaySnapshot, resetEndedAway } from '../ipc/away';
+import { sessionLocked } from '../ipc/lifecycle';
+import { TOAST_MS, type ToastMessage, ToastProvider, ToastViewport, useToast } from './Toast';
+
+afterEach(() => {
+  resetEndedAway();
+});
 
 /** A scheduler the test runs by hand: what was scheduled, after how long, and its cancel. */
 function manualSchedule() {
@@ -81,4 +87,100 @@ test('useToast outside the provider is a programming error', () => {
   } finally {
     console.error = original;
   }
+});
+
+// D.4a N5: the lock unmounts the shell and its toast slot. A toast that says how a change ended
+// and is still in the slot when the app locks is kept for after the unlock (ipc/away.ts); one
+// whose TOAST_MS is over, or that a newer toast replaced, is not. The clock is the test's own
+// schedule: nothing waits on real time.
+
+/** Buttons that show `toasts`, one each, named by their message. */
+function Show({ toasts }: { toasts: readonly ToastMessage[] }) {
+  const toast = useToast();
+  return (
+    <>
+      {toasts.map((t) => (
+        <button key={t.message} type="button" onClick={() => toast(t)}>
+          {t.message}
+        </button>
+      ))}
+    </>
+  );
+}
+
+const DONE: ToastMessage = { message: 'Secrets are in files again.', end: 'done' };
+const FAILED: ToastMessage = { message: 'Protecting was cancelled.', end: 'failed' };
+const COPIED: ToastMessage = { message: 'Copied. The clipboard is cleared in 60 s.' };
+
+function slot() {
+  const { jobs, schedule } = manualSchedule();
+  render(
+    <ToastProvider schedule={schedule}>
+      <Show toasts={[DONE, FAILED, COPIED]} />
+      <ToastViewport />
+    </ToastProvider>,
+  );
+  const show = (t: ToastMessage) =>
+    userEvent.setup().click(screen.getByRole('button', { name: t.message }));
+  const lock = () =>
+    act(() => {
+      sessionLocked();
+    });
+  return { jobs, show, lock };
+}
+
+test('D.4a N5: an end still shown when the app locks is kept for after the unlock', async () => {
+  const { jobs, show, lock } = slot();
+  await show(DONE);
+  expect(jobs.map((j) => [j.ms, j.cancelled])).toEqual([[TOAST_MS, false]]); // still shown
+  lock();
+  expect(endedAwaySnapshot()).toEqual([
+    { opId: null, text: 'Secrets are in files again.', failed: false },
+  ]);
+});
+
+test('D.4a N5: a failure or a cancel still shown is kept as one', async () => {
+  const { show, lock } = slot();
+  await show(FAILED);
+  lock();
+  expect(endedAwaySnapshot()).toEqual([
+    { opId: null, text: 'Protecting was cancelled.', failed: true },
+  ]);
+});
+
+test(`D.4a N5: an end whose ${TOAST_MS} ms are over is not kept`, async () => {
+  const { jobs, show, lock } = slot();
+  await show(DONE);
+  act(() => jobs[0]?.run()); // its time is over: it went
+  expect(screen.getByRole('status').textContent).toBe('');
+  lock();
+  expect(endedAwaySnapshot()).toEqual([]);
+});
+
+test('D.4a N5: an end a newer toast replaced is not kept, nor is a toast that is no end', async () => {
+  const { show, lock } = slot();
+  await show(DONE);
+  await show(COPIED); // the copy took its place
+  expect(screen.getByRole('status').textContent).toBe(COPIED.message);
+  lock();
+  expect(endedAwaySnapshot()).toEqual([]);
+});
+
+test('D.4a N5: a newer end replaces the one kept, and the lock keeps only it, once', async () => {
+  const { show, lock } = slot();
+  await show(FAILED);
+  await show(DONE);
+  lock();
+  lock(); // the next session's lock finds nothing of the slot the first lock took
+  expect(endedAwaySnapshot()).toEqual([
+    { opId: null, text: 'Secrets are in files again.', failed: false },
+  ]);
+});
+
+test('D.4a N5: a slot that goes without a lock (the quit) keeps nothing, then or at a later lock', async () => {
+  const { show, lock } = slot();
+  await show(DONE);
+  cleanup();
+  lock();
+  expect(endedAwaySnapshot()).toEqual([]);
 });

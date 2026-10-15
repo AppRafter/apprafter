@@ -59,10 +59,10 @@ export function useMakeDefault(
         const view = await api.opPlanTargetUse(name);
         if (view.changes.length === 0) {
           await api.opDiscard(view.opId);
-          toast({ message: usedMessage({ name, pointer: null }) });
+          toast({ message: usedMessage({ name, pointer: null }), end: 'done' });
         } else {
           const out = resultOf(await (await startPlan(view.opId)).ended) as unknown as TargetUsed;
-          toast({ message: usedMessage(out) });
+          toast({ message: usedMessage(out), end: 'done' });
         }
         refreshTargets(client);
       } catch (reason) {
@@ -197,7 +197,11 @@ export function useChangeSshKey(
             icon: KeyIcon,
             onDone: (result) => {
               refreshTargets(client);
-              toast({ message: renewedMessage(result as unknown as TargetRenewed), icon: KeyIcon });
+              toast({
+                message: renewedMessage(result as unknown as TargetRenewed),
+                icon: KeyIcon,
+                end: 'done',
+              });
             },
           });
         }}
@@ -258,7 +262,11 @@ export function useRemoveTarget(
         ...(closeAtOnce && { onRan: gone }),
         onDone: (result) => {
           if (!closeAtOnce) gone();
-          toast({ message: removedMessage(result as unknown as TargetRemoved), icon: TrashIcon });
+          toast({
+            message: removedMessage(result as unknown as TargetRemoved),
+            icon: TrashIcon,
+            end: 'done',
+          });
         },
       });
     },
@@ -336,7 +344,7 @@ export function useTargetActions({
                 }
                 onRenamed(out.from, out.to);
                 refreshTargets(client, name);
-                toast({ message: renamedMessage(out), icon: PencilSimpleIcon });
+                toast({ message: renamedMessage(out), icon: PencilSimpleIcon, end: 'done' });
               },
             });
           }}
@@ -374,6 +382,7 @@ export function useTargetActions({
                 toast({
                   message: renewedMessage(result as unknown as TargetRenewed),
                   icon: KeyIcon,
+                  end: 'done',
                 });
               },
             });

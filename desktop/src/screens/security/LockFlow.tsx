@@ -122,7 +122,7 @@ function StopFlow({
       onDone={(result) => {
         // What really happened: another run first, a back-out, a token kept, the key used (UI
         // verifier M3; d4a-f Task 3).
-        toast({ message: stoppedSummary(stopOutcome(result)) });
+        toast({ message: stoppedSummary(stopOutcome(result)), end: 'done' });
         onDone();
       }}
       onFailed={(failure) => {
