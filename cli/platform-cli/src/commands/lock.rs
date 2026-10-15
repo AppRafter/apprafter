@@ -687,9 +687,7 @@ pub(crate) fn unlock(timeout: Option<u32>) -> miette::Result<()> {
     let targets = cli_core::list_target_names(&ctx.store())
         .map_err(miette::Report::new)?
         .join(", ");
-    let intro = format!(
-        "Unlock the target store at {root} (targets: {targets}) in this terminal for {shown} min.\n"
-    );
+    let intro = unlock_intro(&root, &targets, shown, holder_window::leads_own_session());
     let opened = holder_window::ask_and_open(&ctx, &id, &intro)?;
     // T56: a new window replaces this terminal's old one — an older install's too (finding 13).
     if let Ok(Some(mut old)) = place.find_to_end(&store) {
@@ -715,6 +713,25 @@ pub(crate) fn unlock(timeout: Option<u32>) -> miette::Result<()> {
         unlock_said(minutes, holder_window::leads_own_session())
     );
     Ok(())
+}
+
+/// What `unlock` says before it asks (T52): the store, its targets and the window it opens; or,
+/// when this CLI leads its own session (`exec apprafter unlock`, `ssh -t host apprafter unlock`),
+/// that the window ends with this command — the way [`unlock_said`] chooses its closing line, so
+/// the window is never promised "in this terminal for <n> min" first and taken back after the
+/// answer (d4a-h N1, F16's residue).
+fn unlock_intro(root: &str, targets: &str, minutes: u32, leads_session: bool) -> String {
+    if leads_session {
+        format!(
+            "Unlock the target store at {root} (targets: {targets}) for this command only: it \
+             leads its own session, so the window it opens ends with it.\n"
+        )
+    } else {
+        format!(
+            "Unlock the target store at {root} (targets: {targets}) in this terminal for {minutes} \
+             min.\n"
+        )
+    }
 }
 
 /// What `unlock` says once its window started (T52, C30): C30's line; or, when this CLI leads
@@ -1001,6 +1018,24 @@ mod tests {
         assert!(!led.contains("Unlocked in this terminal"), "{led}");
         assert_eq!(unlock_said(5, false), holder_window::opened_note(5));
         assert_eq!(unlock_said(15, false), holder_window::opened_note(15));
+    }
+
+    /// d4a-h N1 (F16's residue): the line before the prompt chooses as the closing line does —
+    /// a CLI that leads its own session never promises a window "in this terminal for 5 min"
+    /// first, to take it back after the answer.
+    #[test]
+    fn an_unlock_that_leads_its_session_never_promises_a_window_before_it_asks() {
+        let led = unlock_intro("~/store", "prod, lab", 5, true);
+        assert_eq!(
+            led,
+            "Unlock the target store at ~/store (targets: prod, lab) for this command only: it \
+             leads its own session, so the window it opens ends with it.\n"
+        );
+        assert!(!led.contains("in this terminal for"), "{led}");
+        assert_eq!(
+            unlock_intro("~/store", "prod, lab", 15, false),
+            "Unlock the target store at ~/store (targets: prod, lab) in this terminal for 15 min.\n"
+        );
     }
 
     #[test]

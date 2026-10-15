@@ -456,6 +456,14 @@ fn a_cli_that_leads_its_session_takes_its_window_with_it() {
         "{screen}"
     );
     assert!(!screen.contains("Unlocked in this terminal"), "{screen}");
+    // d4a-h N1: nor before the prompt — the window is not promised first and taken back after.
+    assert!(
+        screen.contains(
+            "for this command only: it leads its own session, so the window it opens ends with it."
+        ),
+        "{screen}"
+    );
+    assert!(!screen.contains("in this terminal for"), "{screen}");
     let until = Instant::now() + Duration::from_secs(2);
     while holder_alive(&lock) && Instant::now() < until {
         std::thread::sleep(Duration::from_millis(25));
