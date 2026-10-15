@@ -542,6 +542,18 @@ fn target_group(
     lookup: &Lookup,
     cancel: &CancellationToken,
 ) -> CoreResult<Vec<Check>> {
+    target_group_loading(ctx, lookup, cancel, load)
+}
+
+/// [`target_group`], its read of a found target's files by `load`: the store as the lookup
+/// left it is never held, so a test lands a removal, and what follows it, between the lookup
+/// and this read (WI-483: the races are forced there, never sampled).
+fn target_group_loading(
+    ctx: &Context,
+    lookup: &Lookup,
+    cancel: &CancellationToken,
+    load: impl FnOnce(&Context, &str) -> cli_core::Result<Loaded>,
+) -> CoreResult<Vec<Check>> {
     let target = match lookup {
         Lookup::NoCliDefault => {
             let available = match cli_core::list_target_names(&ctx.store()) {
@@ -581,7 +593,8 @@ fn target_group(
     let config_file = store.target_config_file(name).display().to_string();
     let loaded = match load(ctx, name) {
         Ok(t) => t,
-        // Removed between the lookup and this read.
+        // Removed between the lookup and this read; and the list that names what is left may
+        // be unreadable by then too (d4a-h N6): that is the row, never a stop.
         Err(CliError::TargetNotFound { .. }) => {
             return Ok(vec![match cli_core::list_target_names(&store) {
                 Ok(available) => missing_target(name, available),
@@ -4350,6 +4363,80 @@ mod tests {
         let (r, _) = run_on(DoctorTarget::CliDefault);
         let r = r.expect("doctor reports a target list it cannot read");
         config_row(&r, &targets, &targets, &denied);
+    }
+
+    /// WI-483 (Unix): a target removed between doctor's lookup and its read of the target's
+    /// files is the `Target … exists` row, offering what is left; and when the list that would
+    /// offer it cannot be read by then either (d4a-h N6's double race), the target's `Config
+    /// file readable` row in the store's words, never a stop. Both land exactly there through
+    /// the read's seam (`target_group_loading`), on the real read and the real list: forced,
+    /// never sampled.
+    #[cfg(unix)]
+    #[test]
+    fn a_target_removed_between_lookup_and_read_is_a_row_and_an_unreadable_list_then_too() {
+        let f = fx();
+        let ctx = two_targets(&f);
+        let store = ctx.store();
+        let cancel = CancellationToken::new();
+        let found = || Lookup::Found(TargetRef::named(&ctx, "prod").unwrap());
+        // The first race: `prod` goes after the lookup found it; the real read then says so.
+        let removed_then_read = |ctx: &Context, name: &str| {
+            std::fs::remove_dir_all(store.target_dir(name)).unwrap();
+            let read = load(ctx, name);
+            assert!(
+                matches!(read, Err(CliError::TargetNotFound { .. })),
+                "the read of a removed target is TargetNotFound"
+            );
+            read
+        };
+
+        // The list still readable: what is left is offered.
+        let checks = target_group_loading(&ctx, &found(), &cancel, removed_then_read)
+            .expect("a removed target is a row");
+        assert_eq!(
+            checks,
+            vec![missing_target("prod", vec!["dev".to_string()])]
+        );
+
+        // The second race: the target list closed after the read, before doctor lists it.
+        add(&ctx, "prod", "hetzner-cloud", Some(TOKEN), None);
+        let targets = store.targets_dir();
+        let mut closed = None;
+        let checks = target_group_loading(&ctx, &found(), &cancel, |ctx, name| {
+            let read = removed_then_read(ctx, name);
+            closed = Some(cli_core::owner_only::testing::ModeGuard::closed(&targets));
+            read
+        })
+        .expect("a list it cannot read is a row too");
+        assert!(
+            closed.is_some(),
+            "the list was closed between the read and the listing"
+        );
+        let denied = std::fs::read_dir(&targets).unwrap_err().to_string();
+        assert_eq!(checks.len(), 1, "{checks:?}");
+        let row = &checks[0];
+        assert_eq!(
+            (row.id, row.status, row.title.as_str()),
+            (CheckId::ConfigReadable, CheckStatus::Fail, TITLE_CONFIG)
+        );
+        assert_eq!(
+            row.detail.as_deref(),
+            Some(
+                store
+                    .target_config_file("prod")
+                    .display()
+                    .to_string()
+                    .as_str()
+            )
+        );
+        let Some(CheckFix::Explain { text }) = &row.fix else {
+            panic!("{row:?}");
+        };
+        assert!(
+            text.starts_with(&format!("cannot read {}: {denied}. ", targets.display())),
+            "{text}"
+        );
+        assert!(text.contains("`ls -ld`"), "{text}");
     }
 
     /// D.4a T71: an Info row is a fact, in no total.
