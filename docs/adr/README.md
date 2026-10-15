@@ -100,7 +100,7 @@ ADRs are never deleted; supersession preserves the historical record.
 | 0066 | [`SharedDatabase` — one database, one credential per consumer](./0066-shared-database.md) | Accepted |
 | 0067 | [AppRafter Desktop — the CLI's GUI twin over a shared `apprafter-core`](./0067-desktop-app-and-apprafter-core.md) | Accepted |
 | 0068 | [Target-store lock — a store's secrets in an encrypted vault, opened per terminal](./0068-target-store-lock.md) | Accepted |
-| 0069 | [Store-lock everyday slots, slot management and key rotation](./0069-store-lock-everyday-slots-and-key-rotation.md) | Proposed |
+| 0069 | [Store-lock everyday slots, slot management and key rotation](./0069-store-lock-everyday-slots-and-key-rotation.md) | Accepted |
 
 ## Writing a new record
 

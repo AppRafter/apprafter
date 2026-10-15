@@ -2,13 +2,14 @@
 
 ## Status
 
-`Proposed`.
+`Accepted` (2026-10-15).
 
 Date: 2026-10-15. ADR for `plan.md` Phase D (sub-phase D.4b, the target-store lock's second stage).
 A follow-up of [ADR 0068](0068-target-store-lock.md), whose Owner section sends later amendments
 through a follow-up record: this record does not edit ADR 0068's text, and §11 lists what it
-changes there. The owner confirms or corrects the readings of §2 when he accepts it. The
-decisions are expected to be revisited after their first real use (Re-evaluation).
+changes there. The owner accepted it on 2026-10-15 together with the D.4b plan, confirming all
+five readings of §2 as written. The decisions are expected to be revisited after their first
+real use (Re-evaluation).
 
 ## Context
 
@@ -49,10 +50,10 @@ Appendix lists what those checks found.
 | 8 | **Any slot may change how the store opens**: `lock slot add`, `lock slot remove`, `lock rekey`, `lock recovery`, `lock off`, and the unlock window's length (`lock on --timeout` on a locked store). Every vault write still asks a fresh secret, of any slot now, even inside an unlock window. | Yes: the recommendation was to let only the lock password or the recovery key change how a store opens | **An agent that knows the account password — given it for `sudo`, or that saw it typed — or that gets one reflexive Windows Hello approval can take over the store's management**: set a lock password of its own, make a recovery key only it has seen, remove the person's ways in (typing `drop` itself), or run `lock off`. The person is then locked out of their own store, or finds its secrets in clear files. The mitigation is the documentation's advice: agents under a separate OS account or in a sandbox, and `--lock-password` on a machine where agents get the account password. |
 | 9 | **Every key change replaces the store's own age key** (`lock rekey`, `lock recovery`) and re-encrypts every target's cached secrets under the new one, as a resumable, crash-safe operation over many files, with tests and a walk row. | Yes: the recommendation was to keep the store's age key and state what stays exposed | Every password change re-encrypts every cache (seconds per target). An interrupted key change refuses every read until `lock rekey` or `lock recovery` finishes it, or `lock off` returns the secrets to files. A release of the lock's first stage refuses such a store until then. |
 
-### 2. Readings to confirm at acceptance
+### 2. Readings confirmed at acceptance
 
 The owner's answers met each other and ADR 0068 in five places where a reading had to be chosen.
-The owner confirms or corrects each of them when he accepts this record:
+The owner confirmed each of them as written when he accepted this record (2026-10-15):
 
 1. **Windows Hello at every prompt** (answer 5 with answers 3 and 8). Answer 5 names reads and
    `unlock`. Since any slot changes how a store opens, and a Windows store's one everyday way in is
