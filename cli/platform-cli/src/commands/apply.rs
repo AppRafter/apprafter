@@ -16,12 +16,12 @@ use cli_providers::hetzner_cloud::{
     HetznerCloudProvider, K3sBootstrapOptions, NetworkSpec, ServerSpec, SshKeySpec,
 };
 use cli_providers::Provider;
-use cli_state::{HetznerCloudState, State, StatePaths};
+use cli_state::{HetznerCloudState, State, StatePaths, Write};
 use tracing::info;
 
 use crate::commands::firewall_spec::build_firewall_spec;
 use crate::commands::hcloud::hcloud_base_url;
-use crate::commands::state_paths::resolve_state_paths;
+use crate::commands::state_paths::{resolve_state_paths, write_state};
 
 const DEFAULT_NETWORK_IP_RANGE: &str = "10.0.0.0/16";
 const DEFAULT_SUBNET_IP_RANGE: &str = "10.0.0.0/24";
@@ -203,7 +203,9 @@ pub fn run(target_override: Option<&str>, server_type_flag: Option<&str>) -> Res
     // provider so future `destroy` / `import` / next-`apply`
     // calls in this directory short-circuit through state
     // without re-reading the target store. Doesn't write to
-    // disk yet — `persist_state` at the end of run() flushes.
+    // disk yet — `persist_state` at the end of run() writes the
+    // seeds into the state it reads again under the store lock,
+    // where that state records none (WI-487).
     if state.provider.is_none() {
         state.provider = Some(provider_id.clone());
     }
@@ -244,7 +246,8 @@ pub fn run(target_override: Option<&str>, server_type_flag: Option<&str>) -> Res
 
     // persist_state returns the live server list so we can reuse it for the
     // backfill + guard without an extra API round-trip (M17/N8).
-    let live_servers = persist_state(&provider, &mut state, &paths, &cluster)?;
+    let persisted = persist_state(&provider, &state, &target_store, &paths, &cluster)?;
+    let live_servers = persisted.live_servers;
 
     match existing_server_id {
         // 2.16h exists-path: the server predates this apply (we captured a
@@ -263,7 +266,7 @@ pub fn run(target_override: Option<&str>, server_type_flag: Option<&str>) -> Res
         // facts are authoritative — adopt them into the target outright. The
         // new server's id was recorded by `persist_state` just above.
         None => {
-            if let Some(new_server_id) = state.hetzner_cloud.as_ref().map(|h| h.server_id) {
+            if let Some(new_server_id) = persisted.server_id {
                 adopt_provisioned_machine(
                     &live_servers,
                     new_server_id,
@@ -431,10 +434,30 @@ fn build_floating_ip_specs(
     }
 }
 
+/// What [`persist_state`] found and recorded.
+struct Persisted {
+    /// The full live server list, for the backfill + guard (M17).
+    live_servers: Vec<Server>,
+    /// The id of the cluster's server it recorded; `None` when the listing had no server of
+    /// the cluster's name, and nothing was written.
+    server_id: Option<u64>,
+}
+
 /// Reconcile `State` against the live Hetzner cloud objects and persist it.
 ///
 /// Returns the full live server list fetched during reconciliation so callers
 /// can reuse it for the backfill + guard without an extra API round-trip (M17).
+///
+/// ### Under the store lock, from the state read again (WI-487)
+///
+/// The provider's listing runs first, without the lock. Then the state is read
+/// again under the store's write lock ([`write_state`]) and `apply`'s fields
+/// are written into that copy ([`record_apply`]): the cluster's live objects,
+/// and `early`'s seeds (provider, cluster name, region) where the state records
+/// none. `early` — the copy `run` read before provisioning — gives nothing
+/// else: the caches and what sealed them come from the state read under the
+/// lock, so a `lock on` re-seal or a `kubeconfig --refresh` that landed while
+/// this apply provisioned is kept, never replaced by an older copy.
 ///
 /// ### Write-once `server_type` (2.16h)
 ///
@@ -443,87 +466,101 @@ fn build_floating_ip_specs(
 /// a no-op and the operator might have used `apprafter target machine` to
 /// *request* a different type without yet re-provisioning). The rule:
 ///
-/// * Existing recorded value (`state.hetzner_cloud.server_type = Some(...)`) →
-///   **keep it**. The fact is already known; overwriting it would destroy the
-///   reference point used by the drift guard.
+/// * Existing recorded value (`state.hetzner_cloud.server_type = Some(...)`,
+///   as read under the lock) → **keep it**. The fact is already known;
+///   overwriting it would destroy the reference point used by the drift guard.
 /// * Recorded value is `None` (legacy state before 2.16h) → adopt from the
 ///   live API response. This is the self-heal path for pre-existing clusters.
 fn persist_state(
     provider: &HetznerCloudProvider,
-    state: &mut State,
+    early: &State,
+    store: &TargetStorePaths,
     paths: &StatePaths,
     cluster: &str,
-) -> Result<Vec<Server>> {
+) -> Result<Persisted> {
     let live_servers_response = provider.client.list_servers()?;
     let live_keys = provider.client.list_ssh_keys()?;
     let live_nets = provider.client.list_networks()?;
     let live_fws = provider.client.list_firewalls()?;
     let live_fips = provider.client.list_floating_ips()?;
     let all_servers: Vec<Server> = live_servers_response.servers;
-    if let Some(server) = all_servers.iter().find(|s| s.name == cluster) {
-        let key_ids: Vec<u64> = live_keys
-            .ssh_keys
-            .iter()
-            .filter(|k| k.labels.get("apprafter").map(String::as_str) == Some("true"))
-            .map(|k| k.id)
-            .collect();
-        let net_id: Option<u64> = live_nets
-            .networks
-            .iter()
-            .find(|n| n.labels.get("apprafter").map(String::as_str) == Some("true"))
-            .map(|n| n.id);
-        let fw_id: Option<u64> = live_fws
-            .firewalls
-            .iter()
-            .find(|f| f.labels.get("apprafter").map(String::as_str) == Some("true"))
-            .map(|f| f.id);
-        let fip_ids: Vec<u64> = live_fips
-            .floating_ips
-            .iter()
-            .filter(|f| f.labels.get("apprafter").map(String::as_str) == Some("true"))
-            .map(|f| f.id)
-            .collect();
-        // Write-once: preserve an already-recorded server_type fact; adopt from
-        // the live API only when the fact is currently absent (legacy state or
-        // first apply on a freshly-provisioned server).
-        let recorded_type = state
-            .hetzner_cloud
-            .as_ref()
-            .and_then(|h| h.server_type.clone())
-            .or_else(|| server.server_type.as_ref().map(|st| st.name.clone()));
-        let mut refreshed = HetznerCloudState {
-            server_id: server.id,
-            server_name: server.name.clone(),
-            server_type: recorded_type,
-            ssh_key_ids: key_ids,
-            network_id: net_id,
-            firewall_id: fw_id,
-            floating_ip_ids: fip_ids,
-            kubeconfig_yaml: None,
-            kubeconfig_age: None,
-            argocd_admin_password_age: None,
-            kubeconfig_sealed_to: None,
-            argocd_admin_password_sealed_to: None,
-        };
-        carry_caches(state.hetzner_cloud.as_ref(), &mut refreshed);
-        state.hetzner_cloud = Some(refreshed);
-        state.save(paths)?;
-    }
-    Ok(all_servers)
+    let Some(server) = all_servers.iter().find(|s| s.name == cluster) else {
+        return Ok(Persisted {
+            live_servers: all_servers,
+            server_id: None,
+        });
+    };
+    let key_ids: Vec<u64> = live_keys
+        .ssh_keys
+        .iter()
+        .filter(|k| k.labels.get("apprafter").map(String::as_str) == Some("true"))
+        .map(|k| k.id)
+        .collect();
+    let net_id: Option<u64> = live_nets
+        .networks
+        .iter()
+        .find(|n| n.labels.get("apprafter").map(String::as_str) == Some("true"))
+        .map(|n| n.id);
+    let fw_id: Option<u64> = live_fws
+        .firewalls
+        .iter()
+        .find(|f| f.labels.get("apprafter").map(String::as_str) == Some("true"))
+        .map(|f| f.id);
+    let fip_ids: Vec<u64> = live_fips
+        .floating_ips
+        .iter()
+        .filter(|f| f.labels.get("apprafter").map(String::as_str) == Some("true"))
+        .map(|f| f.id)
+        .collect();
+    let live = HetznerCloudState {
+        server_id: server.id,
+        server_name: server.name.clone(),
+        server_type: server.server_type.as_ref().map(|st| st.name.clone()),
+        ssh_key_ids: key_ids,
+        network_id: net_id,
+        firewall_id: fw_id,
+        floating_ip_ids: fip_ids,
+        kubeconfig_yaml: None,
+        kubeconfig_age: None,
+        argocd_admin_password_age: None,
+        kubeconfig_sealed_to: None,
+        argocd_admin_password_sealed_to: None,
+    };
+    let server_id = Some(live.server_id);
+    write_state(store, paths, |state| {
+        record_apply(state, early, live);
+        Ok(Write::Save)
+    })?;
+    Ok(Persisted {
+        live_servers: all_servers,
+        server_id,
+    })
 }
 
-/// The secrets `kubeconfig` and `argocd-password` cached, carried across `apply`'s state refresh
-/// with the record of what sealed each (F13): an unrelated `apply` clobbers neither, so a lost
-/// key's words still name the key on a store `apply` ran on.
-fn carry_caches(from: Option<&HetznerCloudState>, into: &mut HetznerCloudState) {
-    let Some(from) = from else {
-        return;
-    };
-    into.kubeconfig_yaml = from.kubeconfig_yaml.clone();
-    into.kubeconfig_age = from.kubeconfig_age.clone();
-    into.argocd_admin_password_age = from.argocd_admin_password_age.clone();
-    into.kubeconfig_sealed_to = from.kubeconfig_sealed_to.clone();
-    into.argocd_admin_password_sealed_to = from.argocd_admin_password_sealed_to.clone();
+/// `apply`'s fields written into `state`, the state read again under the store lock: the
+/// cluster's `live` objects, its recorded server type kept (write-once, 2.16h) and adopted
+/// from `live` only when none is recorded; `seeds`' provider, cluster name and region where
+/// `state` records none. The secrets `kubeconfig` and `argocd-password` cached, and the record
+/// of what sealed each (F13), stay as `state` holds them: an unrelated `apply` clobbers
+/// neither, so a lost key's words still name the key, and a cache another command wrote while
+/// this apply ran is not lost (WI-487).
+fn record_apply(state: &mut State, seeds: &State, live: HetznerCloudState) {
+    if state.provider.is_none() {
+        state.provider = seeds.provider.clone();
+    }
+    if state.cluster_name.is_none() {
+        state.cluster_name = seeds.cluster_name.clone();
+    }
+    if state.region.is_none() {
+        state.region = seeds.region.clone();
+    }
+    let recorded = state.hetzner_cloud.as_ref();
+    let mut refreshed = live;
+    if let Some(fact) = recorded.and_then(|h| h.server_type.clone()) {
+        refreshed.server_type = Some(fact);
+    }
+    refreshed.carry_caches_from(recorded);
+    state.hetzner_cloud = Some(refreshed);
 }
 
 /// 2.16h: backfill + guard — runs once on the exists-path after persist_state.
@@ -836,31 +873,264 @@ mod tests {
 
     /// F13 (critic C-M-3): `apply` rebuilds the state's `hetzner_cloud` from the live API after
     /// every run; what a lock sealed the caches to goes with them, or a lost key's words would
-    /// fall back to "put that key back" after any `apply` on a locked store.
+    /// fall back to "put that key back" after any `apply` on a locked store. WI-487: they come
+    /// from the state `record_apply` is given — the one read again under the store lock — with
+    /// the recorded server type (write-once), and the seeds fill only what it lacks.
     #[test]
     fn the_state_refresh_keeps_the_caches_and_what_sealed_them() {
         let vault = || cli_state::SealedTo::StoreVault {
             store_id: "3f9c0a1b7d2e4c56".into(),
         };
         let before = HetznerCloudState {
+            server_type: Some("cx22".into()),
             kubeconfig_age: Some("K".into()),
             argocd_admin_password_age: Some("A".into()),
             kubeconfig_sealed_to: Some(vault()),
             argocd_admin_password_sealed_to: Some(vault()),
             ..bare(1)
         };
-        let mut after = bare(2);
-        carry_caches(Some(&before), &mut after);
+        let live = HetznerCloudState {
+            server_type: Some("cx32".into()),
+            ssh_key_ids: vec![7],
+            network_id: Some(100),
+            firewall_id: Some(200),
+            floating_ip_ids: vec![300],
+            ..bare(2)
+        };
+        let seeds = State {
+            provider: Some("hetzner-cloud".into()),
+            cluster_name: Some("platform-1".into()),
+            region: Some("nbg1".into()),
+            ..Default::default()
+        };
+        let recorded = State {
+            provider: Some("recorded".into()),
+            cluster_name: Some("recorded-cluster".into()),
+            region: Some("fsn1".into()),
+            tier: Some(cli_core::Tier::Team),
+            hetzner_cloud: Some(before.clone()),
+        };
+        let mut state = recorded.clone();
+        record_apply(&mut state, &seeds, live.clone());
         assert_eq!(
-            after,
-            HetznerCloudState {
-                server_id: 2,
-                ..before.clone()
+            state,
+            State {
+                hetzner_cloud: Some(HetznerCloudState {
+                    server_type: Some("cx22".into()),
+                    kubeconfig_age: Some("K".into()),
+                    argocd_admin_password_age: Some("A".into()),
+                    kubeconfig_sealed_to: Some(vault()),
+                    argocd_admin_password_sealed_to: Some(vault()),
+                    ..live.clone()
+                }),
+                ..recorded
             }
         );
-        let mut first = bare(3);
-        carry_caches(None, &mut first);
-        assert_eq!(first, bare(3));
+        let mut first = State::default();
+        record_apply(&mut first, &seeds, live.clone());
+        assert_eq!(
+            first,
+            State {
+                hetzner_cloud: Some(live),
+                ..seeds
+            }
+        );
+    }
+
+    // ── WI-487: apply's save beside a cache write and `lock on` ─────────
+
+    use crate::commands::state_paths::testing::{
+        cache_kubeconfig, interleave, lock_on, Scratch, WaitSignal, YAML,
+    };
+    use cli_providers::hetzner_cloud::HetznerCloudClient;
+    use cli_state::seam::WritePoint;
+
+    /// The five listings `persist_state` reads: server 42 of `platform-1` (type cx22) and one
+    /// labelled SSH key (7), network (100), firewall (200) and floating IP (300).
+    fn live_project() -> mockito::ServerGuard {
+        let mut api = mockito::Server::new();
+        for (path, body) in [
+            (
+                "/v1/servers",
+                r#"{"servers":[{"id":42,"name":"platform-1","status":"running",
+                    "labels":{"apprafter":"true"},"server_type":{"name":"cx22"}}]}"#,
+            ),
+            (
+                "/v1/ssh_keys",
+                r#"{"ssh_keys":[{"id":7,"name":"k","public_key":"ssh-ed25519 AAA",
+                    "fingerprint":"a","labels":{"apprafter":"true"}}]}"#,
+            ),
+            (
+                "/v1/networks",
+                r#"{"networks":[{"id":100,"name":"n","ip_range":"10.0.0.0/16",
+                    "subnets":[],"labels":{"apprafter":"true"}}]}"#,
+            ),
+            (
+                "/v1/firewalls",
+                r#"{"firewalls":[{"id":200,"name":"fw","rules":[],
+                    "labels":{"apprafter":"true"}}]}"#,
+            ),
+            (
+                "/v1/floating_ips",
+                r#"{"floating_ips":[{"id":300,"type":"ipv4","ip":"1.2.3.4","name":"fip",
+                    "home_location":{"name":"nbg1"},"labels":{"apprafter":"true"}}]}"#,
+            ),
+        ] {
+            api.mock("GET", path)
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(body)
+                .create();
+        }
+        api
+    }
+
+    fn provider_at(api: &mockito::ServerGuard) -> HetznerCloudProvider {
+        HetznerCloudProvider {
+            client: HetznerCloudClient::new(api.url(), "test-token"),
+            spec: build_server_spec(None, "platform-1", "nbg1", None),
+            ssh_keys: Vec::new(),
+            networks: Vec::new(),
+            firewalls: Vec::new(),
+            floating_ips: Vec::new(),
+        }
+    }
+
+    /// `apply`'s fields of a cluster record: what `persist_state` records from [`live_project`].
+    type Applied = (
+        u64,
+        Option<String>,
+        Vec<u64>,
+        Option<u64>,
+        Option<u64>,
+        Vec<u64>,
+    );
+
+    fn applied(h: &HetznerCloudState) -> Applied {
+        (
+            h.server_id,
+            h.server_type.clone(),
+            h.ssh_key_ids.clone(),
+            h.network_id,
+            h.firewall_id,
+            h.floating_ip_ids.clone(),
+        )
+    }
+
+    fn from_live_project() -> Applied {
+        (
+            42,
+            Some("cx22".into()),
+            vec![7],
+            Some(100),
+            Some(200),
+            vec![300],
+        )
+    }
+
+    /// WI-487: a cache `kubeconfig --refresh` wrote after this apply's first read and before
+    /// its save — while it provisioned — is in the state apply saves, beside apply's fields.
+    #[test]
+    fn apply_keeps_a_cache_written_while_it_provisioned() {
+        let s = Scratch::new();
+        let api = live_project();
+        let early = s.state();
+        let ctx = s.ctx.clone();
+        let other = interleave(WritePoint::BeforeLock, move |signal| {
+            cache_kubeconfig(&ctx, signal)
+        });
+        let persisted =
+            persist_state(&provider_at(&api), &early, &s.store, &s.paths, "platform-1").unwrap();
+        other.result().unwrap();
+        assert_eq!(persisted.server_id, Some(42));
+        assert_eq!(applied(&s.hetzner()), from_live_project());
+        assert_eq!(s.cached_kubeconfig(&s.ctx).as_deref(), Some(YAML));
+    }
+
+    /// WI-487, the race of B73: `lock on` re-seals the cache to the store's own key while this
+    /// apply provisions; apply's save keeps the re-sealed cache byte for byte and its record,
+    /// never the copy under the shared key it read before.
+    #[test]
+    fn apply_keeps_the_cache_lock_on_resealed_while_it_provisioned() {
+        let s = Scratch::new();
+        cache_kubeconfig(&s.ctx, &WaitSignal::none()).unwrap();
+        let api = live_project();
+        let early = s.state();
+        let (ctx, paths) = (s.ctx.clone(), s.paths.clone());
+        let other = interleave(WritePoint::BeforeLock, move |signal| {
+            lock_on(&ctx, signal);
+            State::load_or_default(&paths)
+                .unwrap()
+                .hetzner_cloud
+                .unwrap()
+        });
+        persist_state(&provider_at(&api), &early, &s.store, &s.paths, "platform-1").unwrap();
+        let resealed = other.result();
+        assert_ne!(
+            resealed.kubeconfig_age,
+            early.hetzner_cloud.unwrap().kubeconfig_age,
+            "lock on re-sealed the cache"
+        );
+        assert!(
+            matches!(
+                resealed.kubeconfig_sealed_to,
+                Some(cli_state::SealedTo::StoreVault { .. })
+            ),
+            "{resealed:?}"
+        );
+        let h = s.hetzner();
+        assert_eq!(
+            (&h.kubeconfig_age, &h.kubeconfig_sealed_to),
+            (&resealed.kubeconfig_age, &resealed.kubeconfig_sealed_to)
+        );
+        assert_eq!(applied(&h), from_live_project());
+    }
+
+    /// WI-487: apply reads the state again and saves it while holding the store lock: a cache
+    /// write started then waits for the lock, and its cache lands in what apply saved.
+    #[test]
+    fn a_cache_write_waits_for_apply_s_save() {
+        let s = Scratch::new();
+        let api = live_project();
+        let early = s.state();
+        let ctx = s.ctx.clone();
+        let other = interleave(WritePoint::Reread, move |signal| {
+            cache_kubeconfig(&ctx, signal)
+        });
+        persist_state(&provider_at(&api), &early, &s.store, &s.paths, "platform-1").unwrap();
+        other.result().unwrap();
+        assert_eq!(applied(&s.hetzner()), from_live_project());
+        assert_eq!(s.cached_kubeconfig(&s.ctx).as_deref(), Some(YAML));
+    }
+
+    /// WI-487: a `lock on` started while apply holds the store lock waits for it, then
+    /// re-seals the cache in the state apply saved: apply cannot write back the copy under the
+    /// shared key it read before.
+    #[test]
+    fn lock_on_waits_for_apply_s_save() {
+        let s = Scratch::new();
+        cache_kubeconfig(&s.ctx, &WaitSignal::none()).unwrap();
+        let under_shared = s.hetzner().kubeconfig_age;
+        let api = live_project();
+        let early = s.state();
+        let ctx = s.ctx.clone();
+        let other = interleave(WritePoint::Reread, move |signal| lock_on(&ctx, signal));
+        persist_state(&provider_at(&api), &early, &s.store, &s.paths, "platform-1").unwrap();
+        let done = other.result();
+        assert_eq!(done.caches_resealed, 1, "{done:?}");
+        let h = s.hetzner();
+        assert_eq!(applied(&h), from_live_project());
+        assert!(
+            matches!(
+                h.kubeconfig_sealed_to,
+                Some(cli_state::SealedTo::StoreVault { .. })
+            ),
+            "{h:?}"
+        );
+        assert_ne!(
+            h.kubeconfig_age, under_shared,
+            "re-sealed to the store's key"
+        );
     }
 
     // ── the backfill's store lock: bounded, never creating a store ───────

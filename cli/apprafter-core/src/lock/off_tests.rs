@@ -1012,3 +1012,34 @@ fn a_store_another_account_can_change_is_not_unlocked() {
         before
     );
 }
+
+/// WI-487: `lock off` re-seals each target's caches through `State::update` — its state read
+/// again while the run holds the store lock — and keeps every field a re-seal does not own.
+#[test]
+fn each_reseal_back_reads_the_state_again_under_the_held_lock_and_keeps_the_rest() {
+    let f = files_store();
+    lock(&f.ctx);
+    let paths = cli_state::StatePaths::for_active_target(&f.ctx.store(), "prod");
+    let mut state = cli_state::State::load_or_default(&paths).unwrap();
+    state.region = Some("fsn1".into());
+    let h = state.hetzner_cloud.as_mut().unwrap();
+    h.ssh_key_ids = vec![7];
+    h.network_id = Some(100);
+    h.server_type = Some("cx22".into());
+    state.save(&paths).unwrap();
+    let at = crate::target::testkit::LockAtRereads::arm(&f.ctx.store());
+    unlock(&f.ctx, PASSWORD);
+    assert_eq!(
+        at.held(),
+        vec![true, true],
+        "prod's and staging's states, each re-read under the lock"
+    );
+    let after = cli_state::State::load_or_default(&paths).unwrap();
+    assert_eq!(after.region.as_deref(), Some("fsn1"));
+    let h = after.hetzner_cloud.unwrap();
+    assert_eq!(
+        (h.ssh_key_ids, h.network_id, h.server_type.as_deref()),
+        (vec![7], Some(100), Some("cx22"))
+    );
+    assert_eq!(h.kubeconfig_sealed_to, None, "back under the shared key");
+}

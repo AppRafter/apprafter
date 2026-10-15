@@ -173,3 +173,43 @@ pub(crate) fn snapshot(
     }
     out
 }
+
+/// WI-487: whether the store lock was held each time a `state.json` writer on this thread read
+/// the state again under it (`cli_state::seam::WritePoint::Reread`), one entry per re-read, in
+/// order. Another thread tries the lock without waiting (`try_exclusive_for` with no bound):
+/// held is `true`. No timing: a free lock is taken at once, a held one refused at once.
+pub(crate) struct LockAtRereads {
+    seen: std::rc::Rc<std::cell::RefCell<Vec<bool>>>,
+    _armed: cli_state::seam::testing::Armed,
+}
+
+impl LockAtRereads {
+    pub(crate) fn arm(store: &cli_core::TargetStorePaths) -> LockAtRereads {
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let log = std::rc::Rc::clone(&seen);
+        let store = store.clone();
+        let armed = cli_state::seam::testing::arm(move |point| {
+            if point != cli_state::seam::WritePoint::Reread {
+                return;
+            }
+            let store = store.clone();
+            let free = std::thread::spawn(move || {
+                cli_core::StoreLock::try_exclusive_for(&store, std::time::Duration::ZERO, |_| {})
+                    .expect("trying the store lock")
+                    .is_some()
+            })
+            .join()
+            .unwrap();
+            log.borrow_mut().push(!free);
+        });
+        LockAtRereads {
+            seen,
+            _armed: armed,
+        }
+    }
+
+    /// One `true` per re-read so far when every one was under the lock.
+    pub(crate) fn held(&self) -> Vec<bool> {
+        self.seen.borrow().clone()
+    }
+}

@@ -22,7 +22,7 @@ use cli_core::{CliError, LockPhase, LockedWhy, SecretsModeKind, StoreLock};
 use super::marker::{classify, write_marker, Marker, MARKER_COMMENT};
 use super::*;
 use crate::error::CoreError;
-use crate::target::testkit::{store, TOKEN_A, TOKEN_B};
+use crate::target::testkit::{store, LockAtRereads, TOKEN_A, TOKEN_B};
 use crate::target::TokenPresence;
 use crate::target_ref::TargetRef;
 use crate::vault::{VaultError, VaultResult, VaultRng, VAULT_FILE};
@@ -1819,4 +1819,48 @@ fn open_token_reads_the_vault_first_and_a_window_that_closes_is_locked() {
         }) => {}
         other => panic!("{other:?}"),
     }
+}
+
+/// WI-487: a cache write goes through `State::update` — the state read again while the store
+/// lock is held — and keeps every field it does not own: the provider's objects `apply`
+/// recorded, the region `init` wrote.
+#[test]
+fn a_cache_write_reads_the_state_again_under_the_lock_and_keeps_the_rest() {
+    let (_d, ctx, paths) = provisioned_in_files();
+    let s = ctx.secrets();
+    let new = s.new_cache("prod", CachedSecret::Kubeconfig, true).unwrap();
+    // Written by `apply` and `init` after the key was settled, before the lock.
+    State {
+        region: Some("fsn1".into()),
+        hetzner_cloud: Some(HetznerCloudState {
+            server_type: Some("cx22".into()),
+            ssh_key_ids: vec![7],
+            network_id: Some(100),
+            firewall_id: Some(200),
+            floating_ip_ids: vec![300],
+            ..hetzner(None, None)
+        }),
+        ..Default::default()
+    }
+    .save(&paths)
+    .unwrap();
+    let at = LockAtRereads::arm(&ctx.store());
+    let lock = held(&ctx);
+    s.write_cache(&lock, &paths, new, YAML, false).unwrap();
+    drop(lock);
+    assert_eq!(at.held(), vec![true], "one re-read, under the lock");
+    let after = State::load_or_default(&paths).unwrap();
+    assert_eq!(after.region.as_deref(), Some("fsn1"));
+    let h = after.hetzner_cloud.unwrap();
+    assert_eq!(
+        (
+            h.server_type.as_deref(),
+            h.ssh_key_ids,
+            h.network_id,
+            h.firewall_id,
+            h.floating_ip_ids
+        ),
+        (Some("cx22"), vec![7], Some(100), Some(200), vec![300])
+    );
+    assert!(h.kubeconfig_age.is_some(), "the cache was written");
 }

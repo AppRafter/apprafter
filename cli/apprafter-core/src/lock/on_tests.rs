@@ -1102,3 +1102,39 @@ fn a_store_another_account_can_change_is_not_locked() {
         before
     );
 }
+
+/// WI-487: `lock on` re-seals each target's caches through `State::update` — its state read
+/// again while the run holds the store lock — and keeps every field a re-seal does not own:
+/// the provider's objects `apply` recorded, the region `init` wrote.
+#[test]
+fn each_reseal_reads_the_state_again_under_the_held_lock_and_keeps_the_rest() {
+    let f = files_store();
+    let paths = StatePaths::for_active_target(&f.ctx.store(), "prod");
+    let mut state = State::load_or_default(&paths).unwrap();
+    state.region = Some("fsn1".into());
+    let h = state.hetzner_cloud.as_mut().unwrap();
+    h.ssh_key_ids = vec![7];
+    h.network_id = Some(100);
+    h.server_type = Some("cx22".into());
+    state.save(&paths).unwrap();
+    let before = hetzner_of(&f.ctx, "prod");
+    let at = crate::target::testkit::LockAtRereads::arm(&f.ctx.store());
+    lock(&f.ctx);
+    assert_eq!(
+        at.held(),
+        vec![true, true],
+        "prod's and staging's states, each re-read under the lock"
+    );
+    let after = State::load_or_default(&paths).unwrap();
+    assert_eq!(after.region.as_deref(), Some("fsn1"));
+    let h = after.hetzner_cloud.unwrap();
+    assert_eq!(
+        (h.ssh_key_ids, h.network_id, h.server_type.as_deref()),
+        (vec![7], Some(100), Some("cx22"))
+    );
+    assert_ne!(h.kubeconfig_age, before.kubeconfig_age, "re-sealed");
+    assert!(matches!(
+        h.kubeconfig_sealed_to,
+        Some(cli_state::SealedTo::StoreVault { .. })
+    ));
+}

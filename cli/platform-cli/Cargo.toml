@@ -103,6 +103,9 @@ assert_cmd = { workspace = true }
 # hands kubectl from the temp dir (WI-473), and on Unix `ModeGuard`, which puts a folder's mode
 # back (WI-482). A path crate's dev-dependency reaches neither a shipped binary nor a lock.
 cli-core   = { path = "../cli-core", features = ["test-support"] }
+# `seam::testing` (cli-state's test-support): the forced interleavings of `apply`, `destroy`,
+# `import` and `init` with a cache write and `lock on` (WI-487). Never in a shipped binary.
+cli-state  = { path = "../cli-state", features = ["test-support"] }
 mockito    = { workspace = true }
 predicates = { workspace = true }
 # tests/spawn_guard.rs reads every source of cli/ as tokens: the version already in the lock (as

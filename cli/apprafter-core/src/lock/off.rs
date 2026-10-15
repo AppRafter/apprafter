@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 use cli_core::secrets::{CachedSecret, Identity};
 use cli_core::target::TargetStorePaths;
 use cli_core::{CliError, StoreLock, VaultProblem};
-use cli_state::{State, StatePaths};
+use cli_state::{State, StatePaths, Write};
 use serde::Serialize;
 
 use super::faults::{self, FaultPoint};
@@ -668,7 +668,7 @@ fn unlock(
             written.push((target.clone(), token));
         }
         if let Some(shared) = &shared {
-            reseal(&store, target, &vault_key, shared, from, &mut done)?;
+            reseal(&store, &held, target, &vault_key, shared, from, &mut done)?;
         }
         faults::hit(ctx, FaultPoint::AfterFilesTarget(n))?;
     }
@@ -725,9 +725,11 @@ fn unlock(
 /// said), but left and listed on a back-out of `lock on` (`phase` locking), which had not
 /// touched it (critic G5, finding 10). A damaged one is named so (rule 3). F13: a cache the
 /// shared key opens — re-sealed or skipped — records nothing (the shared key is the unrecorded
-/// default); a dropped one loses its record; a left one keeps whatever it had.
+/// default); a dropped one loses its record; a left one keeps whatever it had. The state is
+/// read again under the held lock and only its caches change (WI-487, `State::update`).
 fn reseal(
     store: &TargetStorePaths,
+    held: &StoreLock,
     target: &str,
     vault_key: &CacheKey,
     shared: &CacheKey,
@@ -735,9 +737,24 @@ fn reseal(
     done: &mut LockedOff,
 ) -> CoreResult<()> {
     let paths = StatePaths::for_active_target(store, target);
-    let mut state = State::load_or_default(&paths)?;
+    State::update::<CoreError>(&paths, held, |state| {
+        reseal_caches(store, target, vault_key, shared, phase, state, done)
+    })?;
+    Ok(())
+}
+
+/// [`reseal`]'s change to the state read again under the lock.
+fn reseal_caches(
+    store: &TargetStorePaths,
+    target: &str,
+    vault_key: &CacheKey,
+    shared: &CacheKey,
+    phase: SecretsMode,
+    state: &mut State,
+    done: &mut LockedOff,
+) -> CoreResult<Write> {
     let Some(mut h) = state.hetzner_cloud.clone() else {
-        return Ok(());
+        return Ok(Write::Leave);
     };
     let mut changed = false;
     for secret in [CachedSecret::Kubeconfig, CachedSecret::ArgocdPassword] {
@@ -784,9 +801,9 @@ fn reseal(
             ));
         }
     }
-    if changed {
-        state.hetzner_cloud = Some(h);
-        state.save(&paths)?;
+    if !changed {
+        return Ok(Write::Leave);
     }
-    Ok(())
+    state.hetzner_cloud = Some(h);
+    Ok(Write::Save)
 }

@@ -32,7 +32,7 @@ use std::sync::Arc;
 
 use cli_core::secrets::{encrypt_for_recipient, CacheKeyKind, CachedSecret, Identity, Recipient};
 use cli_core::{CliError, LockPhase, LockedWhy, SecretsModeKind, StoreLock, TargetStorePaths};
-use cli_state::{HetznerCloudState, SealedTo, State, StatePaths};
+use cli_state::{HetznerCloudState, SealedTo, State, StatePaths, Write};
 use serde::Serialize;
 use zeroize::Zeroizing;
 
@@ -868,49 +868,54 @@ impl SecretStore {
                 store: self.store.root().to_path_buf(),
             });
         }
-        let mut state = State::load_or_default(paths)?;
-        let mut hetzner = state.hetzner_cloud.clone().ok_or_else(|| {
-            CliError::Other(
-                "state has no hetzner_cloud section; run `apprafter apply` first".to_string(),
-            )
-        })?;
-        let sealed = encrypt_for_recipient(plaintext, &new.key.recipient()?)?;
-        // F13: what sealed it goes with it — the store's vault on a locked store, else nothing
-        // (the shared key).
-        let sealed_to = match &new.settled {
-            Settled::Locked(id) => Some(SealedTo::StoreVault {
-                store_id: id.as_str().to_string(),
-            }),
-            Settled::Files => None,
-        };
-        let (slot, record) = hetzner.cache_mut(new.secret);
-        *slot = Some(sealed.clone());
-        *record = sealed_to;
-        let other = match new.secret {
-            CachedSecret::Kubeconfig => {
-                hetzner.kubeconfig_yaml = None;
-                CachedSecret::ArgocdPassword
+        // WI-487: the state is read again under the lock and only this cache's slots change.
+        let mut written = None;
+        State::update(paths, held, |state| {
+            let mut hetzner = state.hetzner_cloud.clone().ok_or_else(|| {
+                CliError::Other(
+                    "state has no hetzner_cloud section; run `apprafter apply` first".to_string(),
+                )
+            })?;
+            let sealed = encrypt_for_recipient(plaintext, &new.key.recipient()?)?;
+            // F13: what sealed it goes with it — the store's vault on a locked store, else
+            // nothing (the shared key).
+            let sealed_to = match &new.settled {
+                Settled::Locked(id) => Some(SealedTo::StoreVault {
+                    store_id: id.as_str().to_string(),
+                }),
+                Settled::Files => None,
+            };
+            let (slot, record) = hetzner.cache_mut(new.secret);
+            *slot = Some(sealed.clone());
+            *record = sealed_to;
+            let other = match new.secret {
+                CachedSecret::Kubeconfig => {
+                    hetzner.kubeconfig_yaml = None;
+                    CachedSecret::ArgocdPassword
+                }
+                CachedSecret::ArgocdPassword => CachedSecret::Kubeconfig,
+            };
+            let (slot, record) = hetzner.cache_mut(other);
+            if replaced_key {
+                let opens =
+                    |armored: &str| cache::open(&new.key, other, &new.target, armored).is_ok();
+                if slot.as_deref().is_some_and(|armored| !opens(armored)) {
+                    *slot = None;
+                }
             }
-            CachedSecret::ArgocdPassword => CachedSecret::Kubeconfig,
-        };
-        let (slot, record) = hetzner.cache_mut(other);
-        if replaced_key {
-            let opens = |armored: &str| cache::open(&new.key, other, &new.target, armored).is_ok();
-            if slot.as_deref().is_some_and(|armored| !opens(armored)) {
+            // T39: what `new_cache` found the store's key cannot open, if it is still there.
+            if new.drop_other.is_some() && *slot == new.drop_other {
                 *slot = None;
             }
-        }
-        // T39: what `new_cache` found the store's key cannot open, if it is still there.
-        if new.drop_other.is_some() && *slot == new.drop_other {
-            *slot = None;
-        }
-        // A dropped slot takes its record with it (F13).
-        if slot.is_none() {
-            *record = None;
-        }
-        state.hetzner_cloud = Some(hetzner);
-        state.save(paths)?;
-        if locked {
+            // A dropped slot takes its record with it (F13).
+            if slot.is_none() {
+                *record = None;
+            }
+            state.hetzner_cloud = Some(hetzner);
+            written = Some(sealed);
+            Ok::<_, CliError>(Write::Save)
+        })?;
+        if let (true, Some(sealed)) = (locked, written) {
             self.access.remember_cache(&sealed, plaintext);
         }
         Ok(CacheWritten {

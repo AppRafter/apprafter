@@ -55,8 +55,13 @@ instead of a token: [How the store lock works](the-store-lock.md#layout).
 
 Every command that changes the store takes its write lock, `.lock`,
 while it reads, changes and saves, so two processes editing one store
-never lose each other's change. One that finds the lock held waits for
-it, and says so on stderr:
+never lose each other's change. A command with slow work does it first:
+`apply` provisions, `destroy` tears down and `import` lists the provider's
+objects before they take the lock; then, under it, each reads its target's
+`state.json` again and saves its own fields into that copy. What another command saved
+meanwhile — a kubeconfig cached by `apprafter kubeconfig --refresh`, the
+caches `apprafter lock on` sealed to the store's own key — stays. One that
+finds the lock held waits for it, and says so on stderr:
 
 ```text
 waiting for another AppRafter process to finish writing the target store (/home/operator/.config/apprafter/.lock)…

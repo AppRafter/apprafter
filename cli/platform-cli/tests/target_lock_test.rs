@@ -45,9 +45,12 @@ struct Sandbox {
 
 impl Sandbox {
     fn new() -> Sandbox {
-        let sandbox = Sandbox {
-            spawn: Spawn::new(),
-        };
+        Sandbox::on(Spawn::new())
+    }
+
+    /// The seeded store in `spawn`'s sandbox: a mock API or a working directory of the test's.
+    fn on(spawn: Spawn) -> Sandbox {
+        let sandbox = Sandbox { spawn };
         let paths = sandbox.store();
         for name in ["a", "b"] {
             save_target(
@@ -112,8 +115,10 @@ struct Running {
 }
 
 impl Running {
-    fn spawn(sandbox: &Sandbox, args: &[&str]) -> Running {
-        let mut child = sandbox.apprafter(args).spawn().expect("spawn apprafter");
+    fn spawn(sandbox: &Sandbox, args: &[&str], env: &[(&str, &str)]) -> Running {
+        let mut command = sandbox.apprafter(args);
+        command.envs(env.iter().copied());
+        let mut child = command.spawn().expect("spawn apprafter");
         let stderr = Arc::new(Mutex::new(Vec::new()));
         let mut pipe = child.stderr.take().unwrap();
         let sink = Arc::clone(&stderr);
@@ -196,13 +201,27 @@ fn waits_for_the_lock(sandbox: &Sandbox, args: &[&str]) -> Output {
     waits_for_the_lock_while(sandbox, args, || {})
 }
 
+/// [`waits_for_the_lock`], the command given `env` besides the sandbox's.
+fn waits_for_the_lock_env(sandbox: &Sandbox, args: &[&str], env: &[(&str, &str)]) -> Output {
+    waits_for_the_lock_with(sandbox, args, env, || {})
+}
+
 /// [`waits_for_the_lock`], running `meanwhile` while the command waits —
 /// another process's edit landing between the command's plan and its
 /// execution.
 fn waits_for_the_lock_while(sandbox: &Sandbox, args: &[&str], meanwhile: impl FnOnce()) -> Output {
+    waits_for_the_lock_with(sandbox, args, &[], meanwhile)
+}
+
+fn waits_for_the_lock_with(
+    sandbox: &Sandbox,
+    args: &[&str],
+    env: &[(&str, &str)],
+    meanwhile: impl FnOnce(),
+) -> Output {
     let held = StoreLock::exclusive(&sandbox.store()).unwrap();
     assert!(held.is_held());
-    let mut run = Running::spawn(sandbox, args);
+    let mut run = Running::spawn(sandbox, args, env);
     let waiting = sandbox.waiting_line();
 
     let deadline = Instant::now() + BOUND;
@@ -289,9 +308,9 @@ fn target_remove_waits_for_the_store_lock() {
 
 /// R6 under a race: `target remove` warns about the server it leaves running
 /// even when the server was recorded after its first look at the state —
-/// here while it waits for the lock, as an `apply` in another terminal
-/// would (`apply` writes the state without the lock). The warning is the
-/// one `remove` prints before it asks, and it is printed once.
+/// here while it waits for the lock, as an `apply` in another terminal that
+/// took the lock first would. The warning is the one `remove` prints before
+/// it asks, and it is printed once.
 #[test]
 fn target_remove_warns_about_a_server_recorded_while_it_waited() {
     let sb = Sandbox::new();
@@ -355,6 +374,109 @@ fn target_add_renew_waits_for_the_store_lock() {
         stdout(&out)
     );
     assert!(sb.read("targets/a/credentials.yaml").contains(TOKEN_B));
+}
+
+// ── WI-487: every writer of a target's state.json waits for the store lock ──
+
+/// The five listings `destroy` and `import` read, on a mock of the Hetzner API: `servers` as
+/// given, every other kind empty.
+fn hetzner_with(servers: &str) -> mockito::ServerGuard {
+    let mut api = mockito::Server::new();
+    for (path, body) in [
+        ("/v1/servers", format!(r#"{{"servers":[{servers}]}}"#)),
+        ("/v1/ssh_keys", r#"{"ssh_keys":[]}"#.to_string()),
+        ("/v1/networks", r#"{"networks":[]}"#.to_string()),
+        ("/v1/firewalls", r#"{"firewalls":[]}"#.to_string()),
+        ("/v1/floating_ips", r#"{"floating_ips":[]}"#.to_string()),
+    ] {
+        api.mock("GET", path)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create();
+    }
+    api
+}
+
+/// `a`'s state.json, as the store holds it.
+const A_STATE: &str = "state/a/.apprafter/state.json";
+
+fn write_a_state(sb: &Sandbox, body: &str) {
+    let state = cli_state::StatePaths::for_active_target(&sb.store(), "a");
+    std::fs::create_dir_all(state.state_dir()).unwrap();
+    std::fs::write(state.state_file(), body).unwrap();
+}
+
+#[test]
+fn init_waits_for_the_store_lock() {
+    let sb = Sandbox::new();
+    let out = waits_for_the_lock(
+        &sb,
+        &[
+            "init",
+            "--provider",
+            "hetzner-cloud",
+            "--tier",
+            "team",
+            "--region",
+            "fsn1",
+        ],
+    );
+    assert!(stdout(&out).contains("would init"), "{}", stdout(&out));
+    let state = sb.read(A_STATE);
+    assert!(
+        state.contains("\"fsn1\"") && state.contains("\"team\""),
+        "{state}"
+    );
+}
+
+#[test]
+fn destroy_waits_for_the_store_lock() {
+    let api = hetzner_with("");
+    let sb = Sandbox::on(Spawn::new().with_hcloud(api.url()));
+    write_a_state(
+        &sb,
+        r#"{"provider":"hetzner-cloud","cluster_name":"platform-1","region":"nbg1",
+            "hetzner_cloud":{"server_id":42,"server_name":"platform-1"}}"#,
+    );
+    let out = waits_for_the_lock_env(&sb, &["destroy", "--yes"], &[("HCLOUD_TOKEN", TOKEN_A)]);
+    assert!(
+        stdout(&out).contains("destroy complete: 0 resource(s) removed"),
+        "{}",
+        stdout(&out)
+    );
+    let state = sb.read(A_STATE);
+    assert!(state.contains("\"hetzner_cloud\": null"), "{state}");
+    assert!(state.contains("\"nbg1\""), "{state}");
+}
+
+#[test]
+fn import_waits_for_the_store_lock() {
+    let api = hetzner_with(
+        r#"{"id":42,"name":"platform-1","status":"running","labels":{"apprafter":"true"}}"#,
+    );
+    let sb = Sandbox::on(Spawn::new().with_hcloud(api.url()));
+    let out = waits_for_the_lock_env(&sb, &["import"], &[("HCLOUD_TOKEN", TOKEN_A)]);
+    assert!(
+        stdout(&out).contains("import: wrote state for cluster `platform-1`"),
+        "{}",
+        stdout(&out)
+    );
+    assert!(sb.read(A_STATE).contains("\"server_id\": 42"));
+}
+
+/// The one-shot move of a legacy `<cwd>/.apprafter/state.json` writes the target's state, so
+/// it waits for the store lock too — here under `plan`, a command that writes nothing else.
+#[test]
+fn a_legacy_state_moves_in_under_the_store_lock() {
+    let project = tempfile::tempdir().unwrap();
+    let legacy = project.path().join(".apprafter").join("state.json");
+    std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+    std::fs::write(&legacy, r#"{"cluster_name":"legacy"}"#).unwrap();
+    let sb = Sandbox::on(Spawn::new().current_dir(project.path()));
+    waits_for_the_lock(&sb, &["plan"]);
+    assert!(!legacy.exists(), "the legacy state stayed");
+    assert!(sb.read(A_STATE).contains("\"legacy\""));
 }
 
 /// `target use` of the target that is already active writes nothing, so a

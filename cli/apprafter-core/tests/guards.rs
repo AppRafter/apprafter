@@ -41,6 +41,10 @@
 //!    ([`UNZEROED_ARGON2`]), and no type derives `Serialize` or `Deserialize` (D.4a T17, T29).
 //! 8. **L6.** `platform-cli` and the desktop never name a lock flow's fault or its test KDF
 //!    policy ([`TEST_ONLY_LOCK_KNOBS`]).
+//! 9. **One writer of `state.json` (WI-487).** No production code in `apprafter-core/src` or
+//!    `platform-cli/src` saves a `State` itself ([`STATE_SAVE`], a `.save(…)` call): every
+//!    write goes through `cli_state::State::update`, which reads the file again under the
+//!    store's write lock, so no writer saves a copy it read before the lock.
 //!
 //! The scan reads syntax trees (`syn`), not text, so neither a comment nor
 //! a string can hide or fake a hit, and nothing depends on where an item
@@ -259,6 +263,11 @@ const TRANSFER_DOOR: &str = "crate::secrets::transfer";
 /// in code or tests, so no build of them arms a fault or weakens a policy.
 const TEST_ONLY_LOCK_KNOBS: &[&str] = &["FaultPoint", "with_fault", "with_kdf_policy"];
 
+/// WI-487: `state.json`'s raw save, for tests and `State::update` alone. Called as a path, or
+/// as a method named `save` — the only `save` method in the scanned crates is this one.
+const STATE_SAVE: &str = "cli_state::State::save";
+const STATE_SAVE_METHOD: &str = "save";
+
 /// Crates `apprafter-core` must not depend on: a client prompts, draws
 /// progress, renders tables and colours, and handles signals.
 ///
@@ -326,6 +335,9 @@ enum Kind {
     ForeignRecipient,
     /// A per-user runtime path or a Windows pipe name outside [`ENDPOINT_LITERALS`] (G2).
     EndpointLiteral,
+    /// [`STATE_SAVE`], or a `.save(…)` method call: `state.json` saved outside
+    /// `State::update` (WI-487).
+    StateSave,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -661,6 +673,9 @@ impl<'f> Scanner<'f> {
         if path_matches(path, TRANSFER_DOOR) {
             return Some((Kind::TransferDoor, TRANSFER_DOOR.to_string()));
         }
+        if joined == STATE_SAVE || joined == "cli_state::state::State::save" {
+            return Some((Kind::StateSave, STATE_SAVE.to_string()));
+        }
         // A sanctioned callee is allowed when ANY entry pairs it with the
         // current site, and forbidden everywhere else.
         let site = self.fns.last().map(String::as_str);
@@ -976,6 +991,8 @@ impl<'ast, 'f> Visit<'ast> for Scanner<'f> {
         let name = m.method.to_string();
         if SECRET_DOOR_METHODS.contains(&name.as_str()) {
             self.record(Kind::SecretDoor, name, m.method.span());
+        } else if name == STATE_SAVE_METHOD {
+            self.record(Kind::StateSave, format!(".{name}(…)"), m.method.span());
         }
         visit::visit_expr_method_call(self, m);
     }
@@ -1292,7 +1309,11 @@ fn the_core_never_prints_exits_or_reads_the_environment() {
         .filter(|h| {
             !matches!(
                 h.kind,
-                Kind::SecretDoor | Kind::ForeignRecipient | Kind::VaultDoor | Kind::TransferDoor
+                Kind::SecretDoor
+                    | Kind::ForeignRecipient
+                    | Kind::VaultDoor
+                    | Kind::TransferDoor
+                    | Kind::StateSave
             )
         })
         .collect();
@@ -1510,6 +1531,30 @@ fn the_cli_and_the_desktop_never_arm_a_lock_fault() {
         hits.is_empty(),
         "only an in-process core test arms a lock fault or a weak KDF policy (L6):\n{}",
         hits.join("\n")
+    );
+}
+
+/// 9 (WI-487): every write of a target's `state.json` in the core and the CLI goes through
+/// `State::update` — under the store lock, from the file read again — never a `save` of a copy
+/// the writer holds.
+#[test]
+fn every_state_json_write_goes_through_state_update() {
+    let mut hits = Vec::new();
+    for krate in ["apprafter-core", "platform-cli"] {
+        hits.extend(
+            scan_tree(&crate_dir(krate).join("src"))
+                .into_iter()
+                .filter(|f| f.kind == Kind::StateSave),
+        );
+    }
+    assert!(
+        hits.is_empty(),
+        "state.json is written only through cli_state::State::update, under the store lock \
+         (WI-487):\n{}",
+        hits.iter()
+            .map(|h| h.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
     );
 }
 
@@ -2177,6 +2222,25 @@ fn f() { var(\"A\"); exit(1); stdout(); }
             assert_eq!(got.len(), 1, "{src}: {got:?}");
             assert_eq!(got[0].0, Kind::Print, "{src}");
         }
+    }
+
+    /// 9 (WI-487): a raw save of a `State` is caught as a method call and as a path, and not
+    /// in a test module; `State::update` is not a save.
+    #[test]
+    fn a_state_save_is_caught_as_a_method_and_as_a_path() {
+        let src = "\
+use cli_state::State;
+fn f(s: &State, p: &P) { s.save(p).unwrap(); State::save(s, p).unwrap(); State::update(p, h, c); }
+#[cfg(test)]
+mod tests { fn t(s: &cli_state::State, p: &P) { s.save(p).unwrap(); } }
+";
+        assert_eq!(
+            hits(src),
+            vec![
+                (Kind::StateSave, ".save(…)".to_string(), 2),
+                (Kind::StateSave, STATE_SAVE.to_string(), 2),
+            ]
+        );
     }
 
     #[test]
