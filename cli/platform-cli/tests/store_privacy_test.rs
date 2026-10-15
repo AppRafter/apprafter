@@ -338,10 +338,14 @@ fn a_store_root_this_account_cannot_search_is_named_never_an_empty_store() {
             String::from_utf8_lossy(&out.stdout).into_owned(),
             squeeze(&out.stderr),
         );
+        // d4a-h N3: the OS error once (the cause), never repeated in the message, and no
+        // `chmod 0600` on credentials for a folder.
         if code != Some(1)
             || stdout.contains("No targets configured")
             || !stderr.contains("apprafter::io::error")
             || !unwrapped(&stderr).contains(&unwrapped(&format!("cannot read {}", path.display())))
+            || stderr.matches("Permission denied").count() != 1
+            || stderr.contains("chmod 0600")
         {
             wrong.push(format!("{args:?} exited {code:?}:\n{stdout}\n{stderr}"));
         }

@@ -145,6 +145,13 @@ fn server_type_help(
     format!("{why}\n{what}")
 }
 
+/// The help of [`CliError::StorePathIo`]: a file or folder of the store this account cannot read
+/// (d4a-h N3: never [`IO_HELP`]'s `chmod 0600` on credentials, which is no help for a folder).
+const STORE_PATH_IO_HELP: &str = "This account cannot read this file or folder of the target \
+                                  store: most often its permissions, or those of a folder above \
+                                  it, do not let it. `ls -ld` on each shows them; the account \
+                                  that uses a target store must be able to read all of it.";
+
 /// The help of an I/O error, [`CliError::Io`] and [`CliError::TargetFileIo`] alike.
 const IO_HELP: &str = "Low-level filesystem / network IO error. The captured OS message above \
                        usually names the failing path or socket. Common cases: missing \
@@ -1334,6 +1341,21 @@ pub enum CliError {
         source: io::Error,
     },
 
+    /// An I/O error on a file or folder of the target store's own — its root, `targets/`, an
+    /// entry in it, the root's `config.yaml` — reading it, or checking that it exists (WI-482).
+    /// [`Io`]'s code. The message names the path, which the OS message does not, and the OS
+    /// message is its cause, shown once (d4a-h N3: as an [`Io`] carrying both, the CLI printed
+    /// it twice, under a help about `chmod 0600` on credentials).
+    ///
+    /// [`Io`]: CliError::Io
+    #[error("cannot read {}", path.display())]
+    #[diagnostic(code(apprafter::io::error), help("{}", STORE_PATH_IO_HELP))]
+    StorePathIo {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
     /// JSON encode/decode error.
     #[error("json error: {0}")]
     #[diagnostic(
@@ -2112,6 +2134,25 @@ mod tests {
         let cause = |e: &CliError| std::error::Error::source(e).map(ToString::to_string);
         assert_eq!(cause(&target), cause(&plain));
         assert_eq!(cause(&target).as_deref(), Some("denied"));
+    }
+
+    /// d4a-h N3 (the re-walk's P-3x): a file or folder of the store this account cannot read is
+    /// named once, its OS message the cause and not repeated in the message, under a help for a
+    /// folder or a file — never `chmod 0600` on credentials. The code is any I/O error's.
+    #[test]
+    fn a_store_path_this_account_cannot_read_is_named_once_with_its_own_help() {
+        let os = io::Error::new(io::ErrorKind::PermissionDenied, "denied");
+        let e = CliError::StorePathIo {
+            path: PathBuf::from("/s/targets"),
+            source: os,
+        };
+        assert_eq!(code_of(&e), "apprafter::io::error");
+        assert_eq!(e.to_string(), "cannot read /s/targets");
+        let cause = std::error::Error::source(&e).map(ToString::to_string);
+        assert_eq!(cause.as_deref(), Some("denied"));
+        let help = help_of(&e);
+        assert!(help.contains("folder"), "{help}");
+        assert!(!help.contains("chmod 0600"), "{help}");
     }
 
     /// Bug 8: `--force` now keeps the stored values, so it refuses an unreadable target (it

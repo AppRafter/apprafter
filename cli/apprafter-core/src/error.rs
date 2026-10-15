@@ -658,6 +658,10 @@ fn neutral_help(e: &cli_core::CliError) -> Option<String> {
              permissions, or its folder's, do not let this user read it.",
             path.display()
         ),
+        // d4a-h N3: a folder or file of the store's own, named in the message.
+        C::StorePathIo { .. } => "This account cannot read this file or folder of the target \
+             store: most often its permissions, or those of a folder above it, do not let it."
+            .into(),
         C::Json(_) => "A JSON file could not be read or written, most often a target's state \
              file. If it was edited by hand or copied across versions, rebuilding the state \
              from the provider replaces it."
@@ -861,7 +865,9 @@ fn project_cli(e: &cli_core::CliError, put: &mut impl FnMut(&str, serde_json::Va
             put("path", json!(path.display().to_string()));
             put("target", json!(target));
         }
-        C::InvalidState { path, .. } => put("path", json!(path.display().to_string())),
+        C::InvalidState { path, .. } | C::StorePathIo { path, .. } => {
+            put("path", json!(path.display().to_string()))
+        }
         C::SshKeyNotPublic {
             origin,
             private_key,
@@ -1199,6 +1205,10 @@ pub mod samples {
                 cause: Box::new(hetzner()),
             },
             C::Io(std::io::Error::other("denied")),
+            C::StorePathIo {
+                path: "/s/targets".into(),
+                source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            },
             C::TargetFileIo {
                 path: "/s/targets/prod/credentials.yaml".into(),
                 target: s("prod"),
@@ -1878,6 +1888,13 @@ mod tests {
                 codes::INVALID_TARGET_CONFIG,
             ),
             (C::Io(std::io::Error::other("x")), codes::IO_ERROR),
+            (
+                C::StorePathIo {
+                    path: "/s/targets".into(),
+                    source: std::io::Error::other("x"),
+                },
+                codes::IO_ERROR,
+            ),
             (
                 C::TargetFileIo {
                     path: "/s/targets/prod/config.yaml".into(),

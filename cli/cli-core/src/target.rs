@@ -804,16 +804,17 @@ fn store_path_exists(paths: &TargetStorePaths, path: &Path, folder: &Path) -> Re
 }
 
 /// An error reading `path`, in the store's `folder`: the refusal of the folder another account
-/// owns when that is why (WI-481), else an I/O error naming `path` (WI-482: it was a bare
-/// "Permission denied"), with the OS error's kind and the code of any I/O error.
+/// owns when that is why (WI-481), else [`CliError::StorePathIo`] naming `path` (WI-482: it was
+/// a bare "Permission denied"), the OS error its cause (d4a-h N3: shown once), with the code of
+/// any I/O error.
 fn store_io(paths: &TargetStorePaths, path: &Path, folder: &Path, e: std::io::Error) -> CliError {
     if let Some(refusal) = crate::store_privacy::foreign_folder_behind(paths, folder, &e) {
         return refusal;
     }
-    CliError::Io(std::io::Error::new(
-        e.kind(),
-        format!("cannot read {}: {e}", path.display()),
-    ))
+    CliError::StorePathIo {
+        path: path.to_path_buf(),
+        source: e,
+    }
 }
 
 /// `path`, one of target `name`'s own files, read; an error names the target (review #6).
@@ -1960,7 +1961,7 @@ mod tests {
         let names = |err: CliError, path: &Path| {
             let text = err.to_string();
             let kind = match &err {
-                CliError::Io(e) => e.kind(),
+                CliError::StorePathIo { source, .. } => source.kind(),
                 CliError::TargetFileIo { source, .. } => source.kind(),
                 other => panic!("expected an I/O error naming {path:?}, got {other:?}"),
             };
