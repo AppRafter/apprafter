@@ -486,7 +486,9 @@ How a locked store is opened, and in what order:
 `HCLOUD_TOKEN` or `APPRAFTER_AGE_KEY` is set, and the target store is
 locked. A locked store uses only the token and the age key in its vault, so a
 value from the environment would pass the lock unnoticed; the command refuses
-before it asks for anything. Commands that need neither still run.
+before it asks for anything. Commands that need neither still run, and
+`target add` still stores `HCLOUD_TOKEN` as the target's new token (a renewal
+at a terminal asks for it instead).
 
 **Fix.** Unset the variable; the command then asks for the lock password at
 its terminal. To work with a value from the environment on purpose — in CI,

@@ -457,7 +457,7 @@ fn on_plan_text(ctx: &Context, plan: &Plan<LockOnPayload>, shown: &str, targets:
         "Unlock window: {} min (`--timeout` changes it). Once locked, a command that needs \
          these secrets asks for the lock password or the recovery key in its terminal, and a \
          command with no terminal is refused. HCLOUD_TOKEN and APPRAFTER_AGE_KEY no longer \
-         apply to this store.\n",
+         stand in for the store's secrets.\n",
         plan.payload.timeout_min()
     ));
     out.push_str(AGENT_NOTE);

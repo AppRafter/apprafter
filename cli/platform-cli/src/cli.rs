@@ -1380,9 +1380,13 @@ pub enum TargetCommand {
         /// with no prefix: the whole token, which is shown only once,
         /// when it is created in the Hetzner Console (open the project,
         /// then Security → API tokens). Passed via `--token` or env
-        /// `HCLOUD_TOKEN` (the env fallback is for CI ergonomics —
-        /// interactive use should prefer the flag so the token
-        /// doesn't linger in shell history's env-leak surface).
+        /// `HCLOUD_TOKEN`. With neither, the wizard asks for it at a
+        /// terminal without showing it, which keeps it out of shell
+        /// history and the command line. At a terminal, `--renew`
+        /// without `--token` or `--ssh-key` asks for the new token and
+        /// does not read `HCLOUD_TOKEN`, which likely holds the old
+        /// one; with `--no-interactive`, or with no terminal, it takes
+        /// `HCLOUD_TOKEN`.
         #[arg(long, env = "HCLOUD_TOKEN", hide_env_values = true)]
         token: Option<String>,
         /// Path to the SSH public key used for server provisioning.
