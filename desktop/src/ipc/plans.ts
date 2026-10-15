@@ -82,21 +82,47 @@ export interface PlanOwner {
   readonly shown: () => boolean;
 }
 
+/** An end in a line, for when it shows away from its screen (ipc/away.ts). */
+export interface AwayLine {
+  readonly text: string;
+  readonly failed: boolean;
+  /** A failure's code (`shownCode`), said under the line. */
+  readonly code?: string;
+}
+
 /** An end in a line, for when it shows away from its screen. */
-export function awayText(title: string, end: OpEnd): { text: string; failed: boolean } {
+export function awayText(title: string, end: OpEnd): AwayLine {
   if (end.state === 'failed') return awayLine(title, end.error);
   if (end.outcome.status !== 'completed') return awayLine(title, CANCELLED);
   return awayLine(title, null);
 }
 
-/** A run's end in a line: done (`null`), cancelled, or failed with its error. */
-export function awayLine(title: string, error: UiError | null): { text: string; failed: boolean } {
+/**
+ * The code a failure says under its line, as the ErrorPanel says it (WI-483): its own, or none
+ * for a cancel, which its line says in words, and for an error that has none.
+ */
+export function shownCode(error: UiError): { readonly code?: string } {
+  return error.code === null || error.code === CORE_ERROR_CODES.OP_CANCELLED
+    ? {}
+    : { code: error.code };
+}
+
+/** A run's end in a line: done (`null`), cancelled, or failed with its error and its code. */
+export function awayLine(title: string, error: UiError | null): AwayLine {
   if (error === null) return { text: `${title}: done.`, failed: false };
   if (error.code === CORE_ERROR_CODES.OP_CANCELLED) {
     return { text: `${title} was cancelled.`, failed: true };
   }
-  return { text: `${title} failed: ${error.message}`, failed: true };
+  return { text: `${title} failed: ${error.message}`, failed: true, ...shownCode(error) };
 }
+
+/**
+ * Where a screen hears that a plan was refused, or that its run failed or was cancelled.
+ * `change`, the plan's title, comes only with a run's end (WI-483): the screen's failure panel
+ * then keeps it for after the unlock if a lock comes while it shows (state/shownFailure.ts). A
+ * refusal before anything ran has none: nothing changed.
+ */
+export type OnFailed = (error: UiError, change?: string) => void;
 
 /** The line for a confirmed plan the lock stopped before it began (D.4a F18). */
 export const notStartedText = (title: string): string =>
@@ -164,8 +190,7 @@ export async function startPlan(
     (reason: unknown) => {
       release();
       if (gone() && owner !== undefined) {
-        const text = `${owner.title} failed: ${uiErrorOf(reason).message}`;
-        keepEndedAway({ opId, text, failed: true });
+        keepEndedAway({ opId, ...awayLine(owner.title, failureOf(reason)) });
       } else discard(opId).catch(reportDiscard(opId));
       throw reason;
     },

@@ -12,7 +12,8 @@
 // holds the password and the key in Rust; the page keeps the key's text only while this dialog
 // can show it again (T79), and empties the confirm field before each check. The plan is held by
 // the screen's scope (heldPlans): Back past the key, Close and the lock discard it, and with it
-// what it holds.
+// what it holds. The run's failure, said in the dialog, is kept for after the unlock when a lock
+// comes while it shows (WI-483, state/shownFailure.ts); a refusal before the run is not.
 import { type ReactNode, type SyntheticEvent, useRef, useState } from 'react';
 import { Button } from '../../components/Button';
 import { ErrorPanel } from '../../components/ErrorPanel';
@@ -60,6 +61,7 @@ import {
   TYPE_A_PASSWORD,
 } from '../../state/lockText';
 import { useScope } from '../../state/scope';
+import { useShownFailure } from '../../state/shownFailure';
 
 export interface ProtectDialogProps {
   /** The store's root as the app shows it (`~/.config/apprafter`). */
@@ -115,7 +117,8 @@ export function ProtectDialog(p: ProtectDialogProps) {
   const [repeat, setRepeat] = useState('');
   const [typed, setTyped] = useState('');
   const [line, setLine] = useState<string | null>(null);
-  const [error, setError] = useState<UiError | null>(null);
+  const [failure, showFailure] = useShownFailure();
+  const error = failure?.error ?? null;
   const [held, setHeld] = useState<LockOnPlan | null>(null);
   const [busy, setBusy] = useState(false);
   const ran = useRef(false);
@@ -124,12 +127,12 @@ export function ProtectDialog(p: ProtectDialogProps) {
 
   const said = () => {
     setLine(null);
-    setError(null);
+    showFailure(null);
   };
   const fail = (reason: unknown) => {
     const ui = uiErrorOf(reason);
     const under = fieldLine(ui);
-    if (under === null) setError(ui);
+    if (under === null) showFailure(ui);
     else setLine(under);
   };
   /** The plan goes, and the password and key it holds in Rust with it; never once it ran. */
@@ -168,7 +171,8 @@ export function ProtectDialog(p: ProtectDialogProps) {
         p.onClose();
         return;
       }
-      setError(failureOf(reason));
+      // A run that started and failed is a change's end; a start refused is not (nothing ran).
+      showFailure(failureOf(reason), ran.current ? PROTECT_TITLE : undefined);
       setBusy(false);
     }
   };
@@ -295,7 +299,7 @@ export function ProtectDialog(p: ProtectDialogProps) {
               said();
               p.copyKey(held.plan.opId).then(
                 () => toast({ message: COPIED }),
-                (reason: unknown) => setError(uiErrorOf(reason)),
+                (reason: unknown) => showFailure(uiErrorOf(reason)),
               );
             }}
           >

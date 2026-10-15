@@ -3,7 +3,9 @@
 // written, so finishing opens it with both the lock password and the recovery key — each as its
 // own kind of slot — before any more secrets leave their files. Two password fields, emptied on
 // every answer whatever it is (T78, critic B finding 17), then the plan's plain confirm
-// (bounded). Without one of them, Stop protecting backs out and Protect starts over.
+// (bounded). Without one of them, Stop protecting backs out and Protect starts over. The run's
+// failure is a toast marked as a change's end, its code under the message (WI-483): a lock while
+// it shows keeps both (N5).
 import { type FormEvent, useState } from 'react';
 import { Button } from '../../components/Button';
 import { ErrorPanel } from '../../components/ErrorPanel';
@@ -18,6 +20,7 @@ import { DESKTOP_ERROR_CODES } from '../../ipc/generated/errors';
 import type { PlanView } from '../../ipc/generated/PlanView';
 import type { UiError } from '../../ipc/generated/UiError';
 import { holdPlan } from '../../ipc/heldPlans';
+import { shownCode } from '../../ipc/plans';
 import { authRefusal, retryLine, useRetryCountdown } from '../../state/auth';
 import {
   FINISH_BUTTON,
@@ -85,7 +88,9 @@ export function FinishProtectDialog(p: FinishProtectDialogProps) {
           toast({ message: protectedSummary(protectOutcome(result), true), end: 'done' });
           p.onDone();
         }}
-        onFailed={(failure) => toast({ message: failure.message, end: 'failed' })}
+        onFailed={(failure) =>
+          toast({ message: failure.message, ...shownCode(failure), end: 'failed' })
+        }
         onClose={p.onClose}
       />
     );

@@ -21,12 +21,14 @@ import { endedAwaySnapshot, resetEndedAway } from './away';
 import { DESKTOP_ERROR_CODES } from './generated/errors';
 import { clearLive, operationsSnapshot, reattachAll, resetOperations } from './operations';
 import {
+  awayLine,
   failureOf,
   isCancelled,
   OperationFailed,
   reportUnlessLocked,
   runPlan,
   runRead,
+  shownCode,
 } from './plans';
 
 let h: Harness;
@@ -115,7 +117,12 @@ test('a plan whose screen went keeps its end for the app: not discarded, kept wi
   expect(failureOf(error).message).toBe('cx22 is sold out');
   expect(h.of('op_discard')).toHaveLength(0);
   expect(endedAwaySnapshot()).toEqual([
-    { opId: id, text: 'Add target lab failed: cx22 is sold out', failed: true },
+    {
+      opId: id,
+      text: 'Add target lab failed: cx22 is sold out',
+      failed: true,
+      code: 'apprafter::provider::sku_unavailable',
+    },
   ]);
 });
 
@@ -135,7 +142,12 @@ test('a plan whose screen went keeps a refused follow for the app too (review #1
   expect(failureOf(await ended).message).toBe('gone');
   expect(h.of('op_discard')).toHaveLength(0);
   expect(endedAwaySnapshot()).toEqual([
-    { opId: id, text: 'Add target lab failed: gone', failed: true },
+    {
+      opId: id,
+      text: 'Add target lab failed: gone',
+      failed: true,
+      code: 'apprafter::desktop::plan_not_found',
+    },
   ]);
 });
 
@@ -144,6 +156,25 @@ test('a plan whose screen is still there is discarded and kept nowhere', async (
   await runPlan(id, undefined, { title: 'Add target lab', shown: () => true });
   expect(h.of('op_discard').map((c) => c.args)).toEqual([{ opId: id }]);
   expect(endedAwaySnapshot()).toEqual([]);
+});
+
+// WI-483: a failure's line carries its code, as the ErrorPanel shows it; a cancel's line says it
+// in words, and an error without a code has none to show.
+test('a failure’s line carries its code; a cancel and a code-less error carry none', () => {
+  const soldOut = uiError('apprafter::provider::sku_unavailable', 'cx22 is sold out');
+  const stopped = uiError('apprafter::op::cancelled', 'The operation was cancelled.');
+  const plain = { ...soldOut, code: null };
+  expect(shownCode(soldOut)).toEqual({ code: 'apprafter::provider::sku_unavailable' });
+  expect('code' in shownCode(stopped)).toBe(false);
+  expect('code' in shownCode(plain)).toBe(false);
+  expect(awayLine('Add target lab', soldOut)).toEqual({
+    text: 'Add target lab failed: cx22 is sold out',
+    failed: true,
+    code: 'apprafter::provider::sku_unavailable',
+  });
+  expect('code' in awayLine('Add target lab', stopped)).toBe(false);
+  expect('code' in awayLine('Add target lab', plain)).toBe(false);
+  expect('code' in awayLine('Add target lab', null)).toBe(false);
 });
 
 test('an end kept for the app says what happened: done, or cancelled', async () => {

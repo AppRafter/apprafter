@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 // Shows the ends of confirmed plans whose screen was gone when they ended (ipc/away.ts): after an
-// unlock, or right away when only a tab closed. One toast at a time, each given its time, and
-// each operation discarded once its end is shown (a read's warning has none left to discard).
+// unlock, or right away when only a tab closed. One toast at a time, each given its time, a
+// failure's code under its line (WI-483), and each operation discarded once its end is shown (a
+// read's warning has none left to discard).
 import { useEffect, useRef, useState } from 'react';
 import { CheckCircleIcon, WarningCircleIcon } from '../components/icons';
 import { TOAST_MS, useToast } from '../components/Toast';
@@ -23,6 +24,7 @@ export function EndedAwayNotices({ spacingMs = TOAST_MS }: { spacingMs?: number 
     toast({
       message: first.text,
       icon: first.failed ? WarningCircleIcon : CheckCircleIcon,
+      ...(first.code !== undefined && { code: first.code }),
       end: first.failed ? 'failed' : 'done',
     });
     const { opId } = first;

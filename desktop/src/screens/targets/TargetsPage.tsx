@@ -5,8 +5,9 @@
 // or one that cannot be read, says so. Make default for the CLI runs the reversible use plan at
 // once; the core refuses a target whose files cannot be read (WI-458 review #4), shown here.
 // Under the title one line names the store and where its secrets are, with a link to the
-// Security page (WI-476): the store's protection is the whole store's.
-import { useCallback, useState } from 'react';
+// Security page (WI-476): the store's protection is the whole store's. A run's failure shown here
+// when a lock comes is kept for after the unlock (WI-483, state/shownFailure.ts).
+import { useCallback } from 'react';
 import { Button } from '../../components/Button';
 import { ErrorPanel } from '../../components/ErrorPanel';
 import { SpinnerGapIcon } from '../../components/icons';
@@ -14,7 +15,6 @@ import { PageHeader } from '../../components/PageHeader';
 import { StatePanel } from '../../components/StatePanel';
 import { uiErrorOf } from '../../ipc/api';
 import type { TargetListReport } from '../../ipc/generated/TargetListReport';
-import type { UiError } from '../../ipc/generated/UiError';
 import {
   SECURITY_LINK,
   SECURITY_LINK_NAME,
@@ -22,6 +22,7 @@ import {
   storeProblemOf,
 } from '../../state/lockText';
 import { usePlatform } from '../../state/platform';
+import { useShownFailure } from '../../state/shownFailure';
 import { useTargetList } from '../../state/targets';
 import { useMakeDefault, useRemoveTarget } from '../target/actions';
 import { AddTargetCard } from './AddTargetCard';
@@ -40,23 +41,23 @@ export interface TargetsPageProps {
 
 export function TargetsPage({ onOpen, openTargets, onRemoved, onSecurity }: TargetsPageProps) {
   const list = useTargetList();
-  const [failure, setFailure] = useState<UiError | null>(null);
-  const makeDefault = useMakeDefault(setFailure);
+  const [failure, showFailure] = useShownFailure();
+  const makeDefault = useMakeDefault(showFailure);
   // The view is not the target's: its tabs close the moment the removal ends (review #5).
-  const removeTarget = useRemoveTarget(onRemoved, setFailure, { closeAtOnce: true });
+  const removeTarget = useRemoveTarget(onRemoved, showFailure, { closeAtOnce: true });
   const onMakeDefault = useCallback(
     (name: string) => {
-      setFailure(null);
+      showFailure(null);
       void makeDefault(name);
     },
-    [makeDefault],
+    [makeDefault, showFailure],
   );
   const onRemove = useCallback(
     (name: string) => {
-      setFailure(null);
+      showFailure(null);
       void removeTarget(name);
     },
-    [removeTarget],
+    [removeTarget, showFailure],
   );
   return (
     <div className="page">
@@ -66,7 +67,7 @@ export function TargetsPage({ onOpen, openTargets, onRemoved, onSecurity }: Targ
         sub="Targets live in your local target store. Each opens in its own tab."
       />
       <StoreLine onSecurity={onSecurity} />
-      {failure !== null && <ErrorPanel error={failure} />}
+      {failure !== null && <ErrorPanel error={failure.error} />}
       {list.isPending ? (
         <StatePanel icon={SpinnerGapIcon} spin title="Reading the target store…" />
       ) : list.isError ? (

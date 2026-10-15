@@ -29,7 +29,8 @@ export interface StopProtectingDialogProps {
   readonly finishing: boolean;
   readonly auth: AuthInfo | null;
   readonly onDone: (result: JsonValue) => void;
-  readonly onFailed: (error: UiError) => void;
+  /** The run failed or was cancelled; `change`, the plan's title (PlanConfirm). */
+  readonly onFailed: (error: UiError, change: string) => void;
   readonly onClose: () => void;
 }
 

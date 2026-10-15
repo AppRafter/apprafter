@@ -6,7 +6,8 @@
 // runs, so closing the tab discards it (heldPlans). A provisioned target never gets here (D.3d's
 // Machine row offers the rebuild recipe instead); if one was provisioned meanwhile, the core's
 // refusal is shown as it is. A run that ends while the tab is hidden is shown when the tab is
-// back; one that ends after the tab closed, or a lock, shows at the app level (ipc/away.ts).
+// back; one that ends after the tab closed, or a lock, shows at the app level (ipc/away.ts), and so
+// does a run's failure the dialog still shows when a lock comes (WI-483, state/shownFailure.ts).
 import { useQueryClient } from '@tanstack/react-query';
 import { useEffect, useState } from 'react';
 import { Button } from '../../components/Button';
@@ -25,6 +26,7 @@ import type { UiError } from '../../ipc/generated/UiError';
 import { awayLine, failureOf, runPlan } from '../../ipc/plans';
 import { useRead } from '../../state/read';
 import { useScope } from '../../state/scope';
+import { useShownFailure } from '../../state/shownFailure';
 import { TARGETS_KEY, targetKey } from '../../state/targets';
 import { useWhenShown } from '../../state/whenShown';
 import { useConfirm } from '../target/actions';
@@ -72,8 +74,8 @@ export function ChangeMachineDialog({ target, now, onClose }: ChangeMachineDialo
   const latencyRead = useRead<RegionLatency[]>();
   const [choice, setChoice] = useState<Choice | null>(null);
   const [saving, setSaving] = useState(false);
-  const [error, setError] = useState<UiError | null>(null);
-  const confirmPlan = useConfirm(setError);
+  const [failure, showFailure] = useShownFailure();
+  const confirmPlan = useConfirm(showFailure);
   const scope = useScope();
 
   // The target's catalogue, read when the dialog opens and again after Try again (reset → idle).
@@ -131,7 +133,9 @@ export function ChangeMachineDialog({ target, now, onClose }: ChangeMachineDialo
         done(end.set);
       } else {
         setSaving(false);
-        setError(end.error); // a refused plan (IpcError) or a failed run (OperationFailed)
+        // A refused plan (IpcError), or a run's failure (OperationFailed): a change's end once a
+        // run was asked for, as the app keeps it when the dialog is gone (below).
+        showFailure(end.error, end.run?.title);
       }
     },
     (end) => {
@@ -144,7 +148,7 @@ export function ChangeMachineDialog({ target, now, onClose }: ChangeMachineDialo
   const apply = async () => {
     if (!chosen || sku === null || region === null) return;
     setSaving(true);
-    setError(null);
+    showFailure(null);
     let run: Ended['run'] = null;
     try {
       const plan = await api.opPlanTargetMachine(target, sku, region);
@@ -221,7 +225,7 @@ export function ChangeMachineDialog({ target, now, onClose }: ChangeMachineDialo
       onClose={onClose}
     >
       {body}
-      {error !== null && <ErrorPanel error={error} />}
+      {failure !== null && <ErrorPanel error={failure.error} />}
     </Wizard>
   );
 }

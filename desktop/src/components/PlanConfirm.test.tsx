@@ -99,7 +99,7 @@ test('Cancel on a plan that never ran discards it in Rust', async () => {
   expect(h.onDone).not.toHaveBeenCalled();
 });
 
-test('a run that fails hands its UiError to onFailed, and the dialog closes', async () => {
+test('a run that fails hands its UiError and the plan’s title to onFailed, and the dialog closes', async () => {
   const h = handlers();
   const taken: UiError = {
     code: CORE_ERROR_CODES.TARGET_EXISTS,
@@ -113,7 +113,8 @@ test('a run that fails hands its UiError to onFailed, and the dialog closes', as
     <PlanConfirm view={view} title="Rename prod?" confirmLabel="Rename" auth={null} {...h} />,
   );
   await user.click(screen.getByRole('button', { name: 'Rename' }));
-  await waitFor(() => expect(h.onFailed).toHaveBeenCalledWith(taken));
+  // The title: the caller's panel keeps a change's failure under it through a lock (WI-483).
+  await waitFor(() => expect(h.onFailed).toHaveBeenCalledWith(taken, 't'));
   expect(h.onDone).not.toHaveBeenCalled();
   expect(h.onClose).toHaveBeenCalledTimes(1);
 });
@@ -135,6 +136,7 @@ test('a cancelled run ends like a failed one: OP_CANCELLED to onFailed', async (
   await waitFor(() =>
     expect(h.onFailed).toHaveBeenCalledWith(
       expect.objectContaining({ code: CORE_ERROR_CODES.OP_CANCELLED }),
+      't',
     ),
   );
   expect(h.onDone).not.toHaveBeenCalled();

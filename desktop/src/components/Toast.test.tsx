@@ -111,12 +111,17 @@ function Show({ toasts }: { toasts: readonly ToastMessage[] }) {
 const DONE: ToastMessage = { message: 'Secrets are in files again.', end: 'done' };
 const FAILED: ToastMessage = { message: 'Protecting was cancelled.', end: 'failed' };
 const COPIED: ToastMessage = { message: 'Copied. The clipboard is cleared in 60 s.' };
+const NOT_KEPT: ToastMessage = {
+  message: 'the vault does not hold what was written',
+  code: 'apprafter::secrets::files_not_kept',
+  end: 'failed',
+};
 
 function slot() {
   const { jobs, schedule } = manualSchedule();
   render(
     <ToastProvider schedule={schedule}>
-      <Show toasts={[DONE, FAILED, COPIED]} />
+      <Show toasts={[DONE, FAILED, COPIED, NOT_KEPT]} />
       <ToastViewport />
     </ToastProvider>,
   );
@@ -183,4 +188,32 @@ test('D.4a N5: a slot that goes without a lock (the quit) keeps nothing, then or
   cleanup();
   lock();
   expect(endedAwaySnapshot()).toEqual([]);
+});
+
+// WI-483: a failure's toast says its code under the message, as the ErrorPanel does, and a lock
+// that keeps the toast keeps the code with it.
+test('WI-483: a failure’s code shows under its message, and a lock keeps it with the message', async () => {
+  const { show, lock } = slot();
+  await show(NOT_KEPT);
+  const code = screen.getByText('apprafter::secrets::files_not_kept');
+  expect(code.className).toBe('toast-code');
+  expect(screen.getByRole('status').textContent).toBe(
+    'the vault does not hold what was writtenapprafter::secrets::files_not_kept',
+  );
+  lock();
+  expect(endedAwaySnapshot()).toEqual([
+    {
+      opId: null,
+      text: 'the vault does not hold what was written',
+      failed: true,
+      code: 'apprafter::secrets::files_not_kept',
+    },
+  ]);
+});
+
+test('WI-483: a toast with no code shows none', async () => {
+  const { show } = slot();
+  await show(FAILED);
+  expect(document.querySelector('.toast-code')).toBeNull();
+  expect(screen.getByRole('status').textContent).toBe(FAILED.message);
 });

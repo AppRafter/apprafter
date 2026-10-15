@@ -14,6 +14,11 @@ export interface EndedAway {
   readonly text: string;
   /** A failure or a cancel: the notice is not a success. */
   readonly failed: boolean;
+  /**
+   * A failure's error code, said under its line as an ErrorPanel says it (WI-483); none for a
+   * success, a cancel, or an error without one.
+   */
+  readonly code?: string;
 }
 
 let list: readonly EndedAway[] = [];

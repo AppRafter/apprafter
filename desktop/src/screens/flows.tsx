@@ -4,11 +4,11 @@
 // inert. Change machine is an overlay of the view it is opened from (it hides with its tab, and
 // its tab holds its confirm's plan). ErrorPanel actions these flows own are run here too; the
 // others are their caller's.
-import { useMemo, useState } from 'react';
+import { useMemo } from 'react';
 import type { ErrorAction } from '../ipc/errors';
-import type { UiError } from '../ipc/generated/UiError';
 import { useAppOverlay } from '../shell/AppOverlays';
 import { useOverlay } from '../shell/ViewFrame';
+import { useShownFailure } from '../state/shownFailure';
 import { DoctorOverlay } from './doctor/DoctorOverlay';
 import { ChangeMachineDialog, type MachineNow } from './machine/ChangeMachineDialog';
 import { useChangeSshKey } from './target/actions';
@@ -34,12 +34,13 @@ interface DoctorFlowProps {
 /**
  * Doctor with the Target screen's SSH key change bound to its three key fixes (none set, file
  * gone, not a public key): the form opens as an app overlay above the doctor, which stays for
- * Run again, and a refusal it cannot show itself is shown in the doctor. The form, its confirm
- * and the toolchain a missing tool's fix opens are the doctor's own overlays: they go with it.
+ * Run again, and a refusal it cannot show itself is shown in the doctor, as is its run's failure,
+ * which a lock while it shows keeps for after the unlock (WI-483). The form, its confirm and the
+ * toolchain a missing tool's fix opens are the doctor's own overlays: they go with it.
  */
 function DoctorFlow({ target, onClose, onAddTarget }: DoctorFlowProps) {
-  const [keyFailure, setKeyFailure] = useState<UiError | null>(null);
-  const changeSshKey = useChangeSshKey(target, setKeyFailure);
+  const [keyFailure, showKeyFailure] = useShownFailure();
+  const changeSshKey = useChangeSshKey(target, showKeyFailure);
   const here = useAppOverlay();
   return (
     <DoctorOverlay
@@ -48,10 +49,10 @@ function DoctorFlow({ target, onClose, onAddTarget }: DoctorFlowProps) {
       onAddTarget={onAddTarget}
       onToolchain={() => here((close) => <ToolchainPanel onClose={close} />)}
       onChangeSshKey={() => {
-        setKeyFailure(null);
+        showKeyFailure(null);
         void changeSshKey();
       }}
-      fixFailure={keyFailure}
+      fixFailure={keyFailure?.error ?? null}
     />
   );
 }

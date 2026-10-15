@@ -9,6 +9,7 @@ import { endedAwaySnapshot, resetEndedAway } from '../../ipc/away';
 import { CORE_ERROR_CODES } from '../../ipc/generated/core-errors';
 import type { OpEvent } from '../../ipc/generated/OpEvent';
 import { resetHeldPlans } from '../../ipc/heldPlans';
+import { resetLifecycle, sessionLocked } from '../../ipc/lifecycle';
 import { resetOperations } from '../../ipc/operations';
 import { PlatformContext } from '../../state/platform';
 import { createQueryClient } from '../../state/queryClient';
@@ -41,6 +42,7 @@ afterEach(async () => {
   resetOperations();
   resetEndedAway();
   resetHeldPlans();
+  resetLifecycle();
   clearMocks();
 });
 
@@ -228,6 +230,51 @@ test('a run that fails says why and the dialog stays open', async () => {
   await user.click(apply());
   expect(await screen.findByText(DEAD_API)).toBeDefined();
   expect(onClose).not.toHaveBeenCalled();
+});
+
+// WI-483 (from N5): the run's failure is said in the dialog, and a lock unmounts it with the
+// shell. Still shown when the app locks, it is kept for after the unlock, under the plan's title,
+// with its code; a plan refused before anything ran is not.
+test('WI-483: a run that fails, still shown when the app locks, is kept with its code', async () => {
+  h.plan(
+    'op_plan_target_machine',
+    planParts({ target: 'staging', title: 'Set the machine of staging' }),
+    [failed(uiError(CORE_ERROR_CODES.TARGET_PROVIDER_UNREACHABLE, DEAD_API))],
+  );
+  const { user } = renderChange('staging', STAGING);
+  await waitFor(() => expect(radio('cx22').checked).toBe(true));
+  await user.click(radio('cpx22'));
+  await user.click(apply());
+  expect(await screen.findByText(DEAD_API)).toBeDefined();
+  expect(endedAwaySnapshot()).toEqual([]);
+  act(() => {
+    sessionLocked();
+  });
+  expect(endedAwaySnapshot()).toEqual([
+    {
+      opId: null,
+      text: `Set the machine of staging failed: ${DEAD_API}`,
+      failed: true,
+      code: CORE_ERROR_CODES.TARGET_PROVIDER_UNREACHABLE,
+    },
+  ]);
+});
+
+test('WI-483: a plan refused before anything ran, shown when the app locks, is not kept', async () => {
+  const refusal =
+    'target `staging` has a provisioned server, so its machine or region cannot change';
+  h.answer('op_plan_target_machine', () =>
+    Promise.reject(uiError('apprafter::target::provisioned', refusal)),
+  );
+  const { user } = renderChange('staging', STAGING);
+  await waitFor(() => expect(radio('cx22').checked).toBe(true));
+  await user.click(radio('cpx22'));
+  await user.click(apply());
+  expect(await screen.findByText(refusal)).toBeDefined();
+  act(() => {
+    sessionLocked();
+  });
+  expect(endedAwaySnapshot()).toEqual([]);
 });
 
 test("no region and no type yet: the CLI's default region and its recommended offer, Apply enabled", async () => {

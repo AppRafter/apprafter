@@ -8,6 +8,7 @@ import { clearMocks, mockIPC, mockWindows } from '@tauri-apps/api/mocks';
 import { act, cleanup, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { useEffect } from 'react';
+import { ErrorPanel } from '../components/ErrorPanel';
 import { PlanConfirm } from '../components/PlanConfirm';
 import { type Schedule, ToastProvider, ToastViewport, useToast } from '../components/Toast';
 import { endedAwaySnapshot, keepEndedAway, resetEndedAway } from '../ipc/away';
@@ -16,6 +17,7 @@ import { LOCK_CHANGED } from '../ipc/generated/events';
 import { resetOperations } from '../ipc/operations';
 import { PlatformContext } from '../state/platform';
 import { createQueryClient } from '../state/queryClient';
+import { useShownFailure } from '../state/shownFailure';
 import { appInfo, lockState, planView } from '../test/fixtures';
 import { settleIpc } from '../test/settle';
 import { EndedAwayNotices } from './EndedAway';
@@ -367,4 +369,54 @@ test('D.4a N5: a notice the app shows after an unlock is an end too: a lock whil
   await changed(false);
   expect(await screen.findByText('Rename prod failed: taken')).toBeDefined();
   expect(discarded()).toEqual([61]);
+});
+
+const SOLD_OUT_CODE = 'apprafter::provider::sku_unavailable';
+
+/** A screen whose change failed while it shows, said in its place as the app's pages say it. */
+function FailedChange() {
+  const [failure, show] = useShownFailure();
+  useEffect(() => {
+    if (opened) return;
+    opened = true;
+    show(
+      {
+        code: SOLD_OUT_CODE,
+        message: 'cx22 is sold out in nbg1',
+        help: null,
+        causes: [],
+        fields: {},
+      },
+      'Rename prod-eu',
+    );
+  }, [show]);
+  return failure === null ? null : <ErrorPanel error={failure.error} />;
+}
+
+// WI-483 (from N5): a change's failure is said in its screen, in an ErrorPanel, which the lock
+// unmounts with the shell. Still shown when the app locks, it is said again after the unlock,
+// under the plan's title, its code under the line.
+test('WI-483: a change’s failure its screen shows when the app locks is said after the unlock, with its code', async () => {
+  const { schedule } = manualClock();
+  render(
+    <QueryClientProvider client={createQueryClient()}>
+      <PlatformContext value={appInfo()}>
+        <LockGate>
+          <ToastProvider schedule={schedule}>
+            <FailedChange />
+            <EndedAwayNotices />
+            <ToastViewport />
+          </ToastProvider>
+        </LockGate>
+      </PlatformContext>
+    </QueryClientProvider>,
+  );
+  expect((await screen.findByRole('alert')).textContent).toContain('cx22 is sold out in nbg1');
+  await changed(true);
+  expect(screen.queryByRole('alert')).toBeNull();
+  expect(screen.queryByText(/cx22 is sold out/)).toBeNull();
+  await changed(false);
+  expect(await screen.findByText('Rename prod-eu failed: cx22 is sold out in nbg1')).toBeDefined();
+  expect(screen.getByRole('status').textContent).toContain(SOLD_OUT_CODE);
+  expect(endedAwaySnapshot()).toEqual([]);
 });

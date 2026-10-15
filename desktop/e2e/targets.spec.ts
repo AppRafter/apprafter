@@ -131,3 +131,39 @@ test('the Targets page and a target, from the list to removing it', async ({ pag
   await expect(page.getByRole('tab', { name: 'prod-de' })).toHaveCount(0);
   await expect(page.getByRole('status')).toContainText('Removed prod-de from this computer');
 });
+
+// WI-483 (from D.4a N5): a change's failure is said on its screen, in an error panel, which the
+// lock unmounts with the shell. Still shown when the app locks, it is said again after the
+// unlock, under the plan's title, its code under the line.
+test('a renewal that failed, still shown when the app locks, is said again after the unlock', async ({
+  page,
+}, info) => {
+  const query = String(info.project.metadata.query ?? '');
+  const mod = query.includes('os=windows') ? 'Control' : 'Meta';
+  await page.goto(`/${query}`);
+  await page.getByRole('button', { name: 'Unlock' }).click();
+  await page.getByRole('button', { name: 'Open staging' }).click();
+  await page.getByRole('button', { name: 'Target', exact: true }).click();
+  await expect(page.getByRole('heading', { level: 1, name: 'Target' })).toBeVisible();
+  await page.getByRole('button', { name: 'Renew' }).click();
+  const renew = page.getByRole('dialog', { name: 'Renew API token' });
+  // Token-shaped, nobody's: the mock's provider answers 401 to a token that starts with x.
+  await renew.getByRole('textbox', { name: 'Hetzner Cloud token' }).fill('x'.repeat(64));
+  await renew.getByRole('button', { name: 'Continue' }).click();
+  await page
+    .getByRole('dialog', { name: 'Renew the API token of staging?' })
+    .getByRole('button', { name: 'Renew' })
+    .click();
+  await expect(page.getByRole('alert')).toContainText('rejected the supplied token');
+  await shot(page, info, 'renewal failed');
+  await page.keyboard.press(`${mod}+KeyL`);
+  await expect(page.getByRole('heading', { name: 'AppRafter is locked' })).toBeVisible();
+  await expect(page.getByText(/rejected the supplied token/)).toHaveCount(0);
+  await page.getByRole('button', { name: 'Unlock' }).click();
+  const notice = page.locator('.toast');
+  await expect(notice).toContainText(
+    'Rotate the API token of staging failed: provider `hetzner-cloud` rejected the supplied token',
+  );
+  await expect(notice.locator('.toast-code')).toHaveText('apprafter::target::token_rejected');
+  await shot(page, info, 'the failure said again after the unlock');
+});

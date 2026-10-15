@@ -4,13 +4,14 @@ import { afterEach, beforeEach, expect, test } from 'bun:test';
 import { clearMocks } from '@tauri-apps/api/mocks';
 import { act, cleanup, screen, within } from '@testing-library/react';
 import * as api from '../ipc/api';
-import { resetLifecycle } from '../ipc/lifecycle';
+import { endedAwaySnapshot, resetEndedAway } from '../ipc/away';
+import { resetLifecycle, sessionLocked } from '../ipc/lifecycle';
 import { installMockIpc, mockTargetStore } from '../ipc/mock';
 import { MOCK_NOT_KEYS } from '../ipc/mock/fixtures';
 import { resetOperations } from '../ipc/operations';
 import { targetReport } from '../test/fixtures';
-import { doctorReport } from '../test/flows';
-import { completed, installHarness, uiError } from '../test/ipc';
+import { doctorReport, planParts } from '../test/flows';
+import { completed, failed, installHarness, uiError } from '../test/ipc';
 import { renderScreen } from '../test/screens';
 import { settleIpc } from '../test/settle';
 import { type TargetFlows, useTargetFlows } from './flows';
@@ -24,6 +25,7 @@ afterEach(async () => {
   await settleIpc();
   resetLifecycle();
   resetOperations();
+  resetEndedAway();
   clearMocks();
 });
 
@@ -186,6 +188,63 @@ test('a refusal the key change cannot show in a form is shown in the doctor', as
   await user.click(await within(doctor).findByRole('button', { name: 'Change SSH key' }));
   expect(await within(doctor).findByText('target `prod-eu` was not found')).toBeDefined();
   expect(screen.queryByRole('dialog', { name: 'Change SSH key' })).toBeNull();
+});
+
+// WI-483 (from N5): the key change's failure is said in the doctor, and a lock unmounts it with
+// the shell. Still shown when the app locks, it is kept for after the unlock, under the plan's
+// title, with its code; a refusal before anything ran (above) is not.
+test('WI-483: a key change that fails, still shown in the doctor when the app locks, is kept', async () => {
+  const h = doctorOnHarness();
+  h.answer('ssh_key_candidates', [
+    {
+      path: '/home/alex/.ssh/work.pub',
+      display: '~/.ssh/work.pub',
+      algo: 'ssh-ed25519',
+      comment: 'alex@work',
+    },
+  ]);
+  h.plan(
+    'op_plan_target_renew',
+    planParts({ target: 'prod-eu', title: 'Change the SSH key of prod-eu' }),
+    [failed(uiError('apprafter::target::not_found', 'target `prod-eu` was not found'))],
+  );
+  const { flows, user } = probe();
+  act(() => flows().doctor('prod-eu'));
+  const doctor = await screen.findByRole('dialog', { name: 'Doctor · prod-eu' });
+  await user.click(await within(doctor).findByRole('button', { name: 'Change SSH key' }));
+  const form = await screen.findByRole('dialog', { name: 'Change SSH key' });
+  await user.click(within(form).getByRole('button', { name: 'Continue' }));
+  const confirm = await screen.findByRole('dialog', { name: 'Change the SSH key of prod-eu?' });
+  await user.click(within(confirm).getByRole('button', { name: 'Change key' }));
+  expect(await within(doctor).findByText('target `prod-eu` was not found')).toBeDefined();
+  expect(endedAwaySnapshot()).toEqual([]);
+  act(() => {
+    sessionLocked();
+  });
+  expect(endedAwaySnapshot()).toEqual([
+    {
+      opId: null,
+      text: 'Change the SSH key of prod-eu failed: target `prod-eu` was not found',
+      failed: true,
+      code: 'apprafter::target::not_found',
+    },
+  ]);
+});
+
+test('WI-483: a refusal the doctor shows when the app locks is not kept', async () => {
+  const h = doctorOnHarness();
+  h.answer('target_show', () =>
+    Promise.reject(uiError('apprafter::target::not_found', 'target `prod-eu` was not found')),
+  );
+  const { flows, user } = probe();
+  act(() => flows().doctor('prod-eu'));
+  const doctor = await screen.findByRole('dialog', { name: 'Doctor · prod-eu' });
+  await user.click(await within(doctor).findByRole('button', { name: 'Change SSH key' }));
+  expect(await within(doctor).findByText('target `prod-eu` was not found')).toBeDefined();
+  act(() => {
+    sessionLocked();
+  });
+  expect(endedAwaySnapshot()).toEqual([]);
 });
 
 test("the toolchain the doctor opens is the doctor's: when the doctor goes, it goes too", async () => {

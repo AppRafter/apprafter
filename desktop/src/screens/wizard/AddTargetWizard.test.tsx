@@ -10,7 +10,7 @@ import { CORE_ERROR_CODES } from '../../ipc/generated/core-errors';
 import { DESKTOP_ERROR_CODES } from '../../ipc/generated/errors';
 import type { OpEvent } from '../../ipc/generated/OpEvent';
 import type { SecretsInfo } from '../../ipc/generated/SecretsInfo';
-import { newScope, resetLifecycle, sessionScope } from '../../ipc/lifecycle';
+import { newScope, resetLifecycle, sessionLocked, sessionScope } from '../../ipc/lifecycle';
 import { resetOperations } from '../../ipc/operations';
 import { ViewFrame } from '../../shell/ViewFrame';
 import { PlatformContext } from '../../state/platform';
@@ -596,6 +596,73 @@ describe('details and save', () => {
     expect(await screen.findByRole('table', { name: 'Machines in nbg1' })).toBeDefined();
   });
 
+  // WI-483 (from N5): a failed save is said in the wizard, and a lock unmounts it with the
+  // shell. Still shown when the app locks, it is kept for after the unlock, under the plan's
+  // title, with its code; a plan refused before anything ran is not.
+  test('WI-483: a failed save, still shown when the app locks, is kept with its code', async () => {
+    h.plan('op_plan_target_add', planParts({ title: 'Add target lab-2' }), [
+      failed(uiError('apprafter::provider::sku_unavailable', 'cx22 is sold out')),
+    ]);
+    const { user } = renderWizard();
+    await toDetails(user);
+    await user.type(screen.getByLabelText('Target name'), 'lab-2');
+    await user.click(saveButton());
+    expect(await screen.findByText('cx22 is sold out')).toBeDefined();
+    expect(endedAwaySnapshot()).toEqual([]);
+    act(() => {
+      sessionLocked();
+    });
+    expect(endedAwaySnapshot()).toEqual([
+      {
+        opId: null,
+        text: 'Add target lab-2 failed: cx22 is sold out',
+        failed: true,
+        code: 'apprafter::provider::sku_unavailable',
+      },
+    ]);
+  });
+
+  test('WI-483: a Destructive save that fails after its confirm, shown when the app locks, is kept', async () => {
+    h.plan(
+      'op_plan_target_add',
+      planParts({ class: 'destructive', title: 'Replace target lab-2' }),
+      [failed(uiError('apprafter::provider::sku_unavailable', 'cx22 is sold out'))],
+    );
+    const { user } = renderWizard();
+    await toDetails(user);
+    await user.type(screen.getByLabelText('Target name'), 'lab-2');
+    await user.click(saveButton());
+    const dialog = await screen.findByRole('dialog', { name: 'Replace target lab-2' });
+    await user.click(within(dialog).getByRole('button', { name: 'Save target' }));
+    expect(await screen.findByText('cx22 is sold out')).toBeDefined();
+    act(() => {
+      sessionLocked();
+    });
+    expect(endedAwaySnapshot()).toEqual([
+      {
+        opId: null,
+        text: 'Replace target lab-2 failed: cx22 is sold out',
+        failed: true,
+        code: 'apprafter::provider::sku_unavailable',
+      },
+    ]);
+  });
+
+  test('WI-483: a refused save plan, shown when the app locks, is not kept', async () => {
+    h.answer('op_plan_target_add', () =>
+      Promise.reject(uiError('apprafter::target::exists', 'target `lab-2` exists already')),
+    );
+    const { user } = renderWizard();
+    await toDetails(user);
+    await user.type(screen.getByLabelText('Target name'), 'lab-2');
+    await user.click(saveButton());
+    expect(await screen.findByText('target `lab-2` exists already')).toBeDefined();
+    act(() => {
+      sessionLocked();
+    });
+    expect(endedAwaySnapshot()).toEqual([]);
+  });
+
   test('a double click on Continue goes to Details once and never saves', async () => {
     h.plan('op_plan_target_add', planParts({}), [completed(targetAdded({ name: 'lab-2' }))]);
     const { user } = renderWizard();
@@ -638,6 +705,7 @@ describe('details and save', () => {
           opId: h.started('op_plan_target_add')[0] ?? -1,
           text: 'Add target lab-2 failed: cx22 is sold out',
           failed: true,
+          code: 'apprafter::provider::sku_unavailable',
         },
       ]),
     );

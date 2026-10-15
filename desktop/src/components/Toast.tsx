@@ -23,6 +23,11 @@ export interface ToastMessage {
   readonly message: string;
   readonly icon?: Icon;
   /**
+   * A failure's error code (WI-483), said under the message as an ErrorPanel says it, and kept
+   * with it when a lock keeps the toast (below).
+   */
+  readonly code?: string;
+  /**
    * The toast says how a change ended (D.4a N5): `done`, or `failed` for a failure or a cancel.
    * If the app locks while it is still shown — less than TOAST_MS after it appeared, and no
    * newer toast in its place — the app shows it again after the unlock, as it does an end that
@@ -86,7 +91,12 @@ export function ToastProvider({
         const covered = inSlot.current;
         inSlot.current = null;
         if (covered?.end === undefined) return;
-        keepEndedAway({ opId: null, text: covered.message, failed: covered.end === 'failed' });
+        keepEndedAway({
+          opId: null,
+          text: covered.message,
+          failed: covered.end === 'failed',
+          ...(covered.code !== undefined && { code: covered.code }),
+        });
       }),
     [],
   );
@@ -114,7 +124,10 @@ export function ToastViewport() {
       {current !== null && (
         <div className="toast" key={current.id}>
           <ToastIcon className="toast-icon" aria-hidden="true" />
-          <span>{current.message}</span>
+          <span className="toast-text">
+            <span>{current.message}</span>
+            {current.code !== undefined && <span className="toast-code">{current.code}</span>}
+          </span>
         </div>
       )}
     </div>

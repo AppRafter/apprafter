@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
 import { clearMocks } from '@tauri-apps/api/mocks';
-import { cleanup, fireEvent, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, screen, waitFor } from '@testing-library/react';
+import { endedAwaySnapshot, resetEndedAway } from '../../ipc/away';
 import { CORE_ERROR_CODES } from '../../ipc/generated/core-errors';
 import type { LockOnPlan } from '../../ipc/generated/LockOnPlan';
 import type { OpId } from '../../ipc/generated/OpId';
 import { resetHeldPlans } from '../../ipc/heldPlans';
+import { resetLifecycle, sessionLocked } from '../../ipc/lifecycle';
 import { resetOperations } from '../../ipc/operations';
-import { completed, type Harness, installHarness, stage, uiError } from '../../test/ipc';
+import { PROTECT_TITLE } from '../../state/lockText';
+import { completed, failed, type Harness, installHarness, stage, uiError } from '../../test/ipc';
 import { renderScreen } from '../../test/screens';
 import { settleIpc } from '../../test/settle';
 import { cancellableAt, ProtectDialog, type ProtectDialogProps } from './ProtectDialog';
@@ -31,6 +34,8 @@ afterEach(async () => {
   await settleIpc();
   resetOperations();
   resetHeldPlans();
+  resetEndedAway();
+  resetLifecycle();
   clearMocks();
 });
 
@@ -53,7 +58,7 @@ function planOf(opId: OpId): LockOnPlan {
 
 function open(
   more: Partial<ProtectDialogProps> = {},
-  end: ReturnType<typeof completed> = completed({ alreadyLocked: false }),
+  end: ReturnType<typeof completed | typeof failed> = completed({ alreadyLocked: false }),
 ) {
   const opId = h.newOperation([
     stage(1, 4, 'Writing the vault'),
@@ -219,6 +224,64 @@ describe('Protect secrets', () => {
     await waitFor(() => expect(props.onDone).toHaveBeenCalled());
     expect(screen.getByText(/^Another run protected this target store first/)).toBeDefined();
     expect(screen.queryByText(/^Secrets protected/)).toBeNull();
+  });
+
+  // WI-483 (from N5): the run's failure is said in the dialog, in an ErrorPanel, and a lock
+  // unmounts it with the shell. Still shown when the app locks, it is kept for after the unlock,
+  // under the run's title, with its code.
+  test('WI-483: a run that fails, still shown when the app locks, is kept with its code', async () => {
+    const code = 'apprafter::secrets::vault_unwritable';
+    const error = uiError(
+      code,
+      'cannot write the vault at ~/.config/apprafter/vault: no space left on device',
+    );
+    const { user } = open({}, failed(error));
+    await protect(user);
+    expect(await screen.findByText(error.message)).toBeDefined();
+    expect(endedAwaySnapshot()).toEqual([]);
+    act(() => {
+      sessionLocked();
+    });
+    expect(endedAwaySnapshot()).toEqual([
+      {
+        opId: null,
+        text: `${PROTECT_TITLE} failed: ${error.message}`,
+        failed: true,
+        code,
+      },
+    ]);
+  });
+
+  test('WI-483: a refusal before the run, shown when the app locks, is not kept', async () => {
+    const refusal = uiError(
+      'apprafter::secrets::store_not_private',
+      'other accounts can change the target store at ~/.config/apprafter',
+    );
+    const { user } = open({ plan: mock((_password: string) => Promise.reject(refusal)) });
+    await next(user);
+    await user.type(screen.getByLabelText('Lock password'), 'a long lock password here');
+    await user.type(screen.getByLabelText('Repeat the lock password'), 'a long lock password here');
+    await next(user);
+    expect(await screen.findByText(refusal.message)).toBeDefined();
+    act(() => {
+      sessionLocked();
+    });
+    expect(endedAwaySnapshot()).toEqual([]);
+  });
+
+  test('WI-483: a run refused before it started, shown when the app locks, is not kept', async () => {
+    const refusal = uiError(
+      'apprafter::secrets::store_not_private',
+      'other accounts can change the target store at ~/.config/apprafter',
+    );
+    h.answer('op_execute', () => Promise.reject(refusal));
+    const { user } = open();
+    await protect(user);
+    expect(await screen.findByText(refusal.message)).toBeDefined();
+    act(() => {
+      sessionLocked();
+    });
+    expect(endedAwaySnapshot()).toEqual([]);
   });
 
   test('the dialog has no clipboard of its own: its Copy is the call it is given (O12)', async () => {

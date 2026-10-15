@@ -5,7 +5,9 @@ import { afterEach, beforeEach, expect, mock, test } from 'bun:test';
 import { clearMocks, mockIPC } from '@tauri-apps/api/mocks';
 import { act, screen, waitFor, within } from '@testing-library/react';
 import * as api from '../../ipc/api';
-import { installMockIpc } from '../../ipc/mock';
+import { endedAwaySnapshot, resetEndedAway } from '../../ipc/away';
+import { resetLifecycle, sessionLocked } from '../../ipc/lifecycle';
+import { installMockIpc, mockTargetStore } from '../../ipc/mock';
 import { resetOperations } from '../../ipc/operations';
 import { startPlan } from '../../ipc/plans';
 import { appInfo, STORE_NOT_PRIVATE, STORE_PROBLEMS } from '../../test/fixtures';
@@ -21,6 +23,8 @@ beforeEach(async () => {
 afterEach(async () => {
   await settleIpc();
   resetOperations();
+  resetEndedAway();
+  resetLifecycle();
   clearMocks();
 });
 
@@ -304,6 +308,56 @@ test('a refused removal is shown on the page', async () => {
   await user.click(within(card).getByRole('button', { name: 'Remove broken' }));
   expect((await screen.findByRole('alert')).textContent).toContain('target `broken` not found');
   expect(screen.queryByRole('dialog')).toBeNull();
+});
+
+// WI-483 (from N5): a change's failure is said on the page, and a lock unmounts it with the
+// shell. Still shown when the app locks, it is kept for after the unlock, under the plan's title,
+// with its code; a refusal before anything ran is not.
+test('WI-483: a removal that fails, still shown when the app locks, is kept with its code', async () => {
+  const user = page();
+  const card = await screen.findByRole('article', { name: 'broken' });
+  await user.click(within(card).getByRole('button', { name: 'Remove broken' }));
+  const confirm = await screen.findByRole('dialog', { name: 'Remove target broken?' });
+  // Removed by the CLI meanwhile: the run finds nothing to remove.
+  const store = mockTargetStore();
+  store.unreadable = store.unreadable.filter((target) => target.name !== 'broken');
+  await user.type(within(confirm).getByLabelText(/Type broken to confirm/), 'broken');
+  await user.click(within(confirm).getByRole('button', { name: 'Remove target' }));
+  const panel = await screen.findByRole('alert');
+  expect(panel.textContent).toContain('target `broken` not found');
+  expect(endedAwaySnapshot()).toEqual([]);
+  act(() => {
+    sessionLocked();
+  });
+  const kept = endedAwaySnapshot();
+  expect(kept).toHaveLength(1);
+  expect(kept[0]?.text.startsWith('Remove target broken from this computer failed: ')).toBe(true);
+  expect(kept[0]?.text).toContain('target `broken` not found');
+  expect(kept[0]?.failed).toBe(true);
+  expect(kept[0]?.code).toBe('apprafter::target::not_found');
+});
+
+test('WI-483: a refused removal, shown when the app locks, is not kept', async () => {
+  const user = page();
+  const card = await screen.findByRole('article', { name: 'broken' });
+  clearMocks();
+  mockIPC((cmd) =>
+    cmd === 'op_plan_target_remove'
+      ? Promise.reject({
+          code: 'apprafter::target::not_found',
+          message: 'target `broken` not found (available: lab, prod-eu, staging)',
+          help: null,
+          causes: [],
+          fields: { name: 'broken', available: ['lab', 'prod-eu', 'staging'] },
+        })
+      : null,
+  );
+  await user.click(within(card).getByRole('button', { name: 'Remove broken' }));
+  expect((await screen.findByRole('alert')).textContent).toContain('target `broken` not found');
+  act(() => {
+    sessionLocked();
+  });
+  expect(endedAwaySnapshot()).toEqual([]);
 });
 
 // WI-458 review #5: a removal started here goes on while the page is hidden (another tab shown,

@@ -1064,6 +1064,20 @@
   font-size: 16px;
 }
 
+.toast-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+/* A failure's code under its line, as the ErrorPanel shows it (WI-483). */
+.toast-code {
+  color: var(--fg-faint);
+  font: 400 var(--fs-11-5) var(--font-mono);
+  overflow-wrap: anywhere;
+}
+
 /* StatePanel ------------------------------------------------------------------------------ */
 
 .state-panel {

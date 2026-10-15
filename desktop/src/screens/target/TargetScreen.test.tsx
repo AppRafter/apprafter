@@ -5,13 +5,16 @@
 import { afterEach, beforeEach, expect, mock, test } from 'bun:test';
 import { QueryClientProvider } from '@tanstack/react-query';
 import { clearMocks, mockIPC } from '@tauri-apps/api/mocks';
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { Activity } from 'react';
 import { ToastProvider } from '../../components/Toast';
 import * as api from '../../ipc/api';
+import { endedAwaySnapshot, resetEndedAway } from '../../ipc/away';
 import { CORE_ERROR_CODES } from '../../ipc/errors';
-import { installMockIpc } from '../../ipc/mock';
+import UI_ERRORS from '../../ipc/generated/fixtures/ui-errors.json';
+import { resetLifecycle, sessionLocked } from '../../ipc/lifecycle';
+import { installMockIpc, mockOps } from '../../ipc/mock';
 import { resetOperations } from '../../ipc/operations';
 import { startPlan } from '../../ipc/plans';
 import { AppOverlayContext, useAppOverlayHost } from '../../shell/AppOverlays';
@@ -31,6 +34,8 @@ beforeEach(async () => {
 afterEach(async () => {
   await settleIpc();
   resetOperations();
+  resetEndedAway();
+  resetLifecycle();
   clearMocks();
 });
 
@@ -158,6 +163,91 @@ test('a rejected token shows on the screen, with Renew token to try again', asyn
   await user.click(screen.getByRole('button', { name: 'Cancel' }));
   expect(document.activeElement).toBe(screen.getByRole('heading', { level: 1, name: 'Target' }));
 });
+
+// WI-483 (from N5): a change's failure is said on the screen, and a lock unmounts it with the
+// shell. Still shown when the app locks, it is kept for after the unlock, under the plan's
+// title, with its code; a refusal before anything ran is not.
+test('WI-483: a renewal that fails, still shown when the app locks, is kept with its code', async () => {
+  const user = screenOf('staging');
+  await user.click(await screen.findByRole('button', { name: 'Renew' }));
+  await user.type(screen.getByLabelText('Hetzner Cloud token'), 'x'.repeat(64)); // the mock's 401
+  await user.click(screen.getByRole('button', { name: 'Continue' }));
+  await user.click(
+    within(await screen.findByRole('dialog', { name: /Renew the API token/ })).getByRole('button', {
+      name: 'Renew',
+    }),
+  );
+  expect((await screen.findByRole('alert')).textContent).toContain(UI_ERRORS.tokenRejected.message);
+  expect(endedAwaySnapshot()).toEqual([]);
+  act(() => {
+    sessionLocked();
+  });
+  expect(endedAwaySnapshot()).toEqual([
+    {
+      opId: null,
+      text: `Rotate the API token of staging failed: ${UI_ERRORS.tokenRejected.message}`,
+      failed: true,
+      code: UI_ERRORS.tokenRejected.code,
+    },
+  ]);
+});
+
+test('WI-483: a make default refused before it ran, shown when the app locks, is not kept', async () => {
+  const user = screenOf('staging');
+  const row = await screen.findByRole('group', { name: 'CLI default' });
+  const refusal = 'target `staging` cannot be read';
+  const at = (window as unknown as { __TAURI_INTERNALS__: { invoke: Invoke } }).__TAURI_INTERNALS__;
+  const invoke = at.invoke;
+  at.invoke = (c, args, options) =>
+    c === 'op_plan_target_use'
+      ? Promise.reject(uiError('apprafter::target::invalid_config', refusal))
+      : invoke(c, args, options);
+  await user.click(within(row).getByRole('button', { name: 'Make default' }));
+  expect((await screen.findByRole('alert')).textContent).toContain(refusal);
+  act(() => {
+    sessionLocked();
+  });
+  expect(endedAwaySnapshot()).toEqual([]);
+});
+
+test('WI-483: a make default whose run fails, still shown when the app locks, is kept', async () => {
+  const user = screenOf('staging');
+  const row = await screen.findByRole('group', { name: 'CLI default' });
+  const code = 'apprafter::io::error';
+  const at = (window as unknown as { __TAURI_INTERNALS__: { invoke: Invoke } }).__TAURI_INTERNALS__;
+  const invoke = at.invoke;
+  at.invoke = (c, args, options) =>
+    c === 'op_plan_target_use'
+      ? mockOps().registerPlan(
+          {
+            class: 'reversible',
+            title: 'Make staging the CLI default',
+            changes: [
+              { kind: 'CliDefault', object: 'staging', action: 'set_default', detail: null },
+            ],
+            target: 'staging',
+          },
+          { end: () => ({ error: uiError(code, 'cannot write config.yaml: disk full') }) },
+        )
+      : invoke(c, args, options);
+  await user.click(within(row).getByRole('button', { name: 'Make default' }));
+  expect((await screen.findByRole('alert')).textContent).toContain(
+    'cannot write config.yaml: disk full',
+  );
+  act(() => {
+    sessionLocked();
+  });
+  expect(endedAwaySnapshot()).toEqual([
+    {
+      opId: null,
+      text: 'Make staging the CLI default failed: cannot write config.yaml: disk full',
+      failed: true,
+      code,
+    },
+  ]);
+});
+
+type Invoke = (cmd: string, args?: unknown, options?: unknown) => unknown;
 
 test('remove: the full plan, the typed name, then the gesture; the tab closes', async () => {
   const onRemoved = mock();

@@ -49,8 +49,11 @@ export interface PlanConfirmProps {
   readonly onRan?: (result: JsonValue) => void;
   /** It ran, and its screen is shown (at once, or on its next show). */
   readonly onDone: (result: JsonValue) => void;
-  /** It ran and failed, or was cancelled: the dialog closes, and the caller shows this. */
-  readonly onFailed: (error: UiError) => void;
+  /**
+   * It ran and failed, or was cancelled: the dialog closes, and the caller shows this. `change`
+   * is the plan's title: a lock while the caller shows it keeps it (state/shownFailure.ts).
+   */
+  readonly onFailed: (error: UiError, change: string) => void;
   readonly onClose: () => void;
 }
 
@@ -77,7 +80,7 @@ export function PlanConfirm({
         onDone(resultOf(end));
       } catch (e) {
         if (!(e instanceof OperationFailed)) throw e;
-        onFailed(e.error);
+        onFailed(e.error, view.title);
       } finally {
         applied.current?.();
       }

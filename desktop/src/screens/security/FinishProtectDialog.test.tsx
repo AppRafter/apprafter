@@ -1,14 +1,21 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 import { afterEach, beforeEach, expect, mock, test } from 'bun:test';
+import { QueryClientProvider } from '@tanstack/react-query';
 import { clearMocks } from '@tauri-apps/api/mocks';
-import { cleanup, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, render, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { ToastProvider, ToastViewport } from '../../components/Toast';
+import { endedAwaySnapshot, resetEndedAway } from '../../ipc/away';
 import { CORE_ERROR_CODES } from '../../ipc/generated/core-errors';
 import { DESKTOP_ERROR_CODES } from '../../ipc/generated/errors';
 import type { PlanView } from '../../ipc/generated/PlanView';
 import { resetHeldPlans } from '../../ipc/heldPlans';
+import { resetLifecycle, sessionLocked } from '../../ipc/lifecycle';
 import { resetOperations } from '../../ipc/operations';
+import { PlatformContext } from '../../state/platform';
+import { createQueryClient } from '../../state/queryClient';
 import { appInfo } from '../../test/fixtures';
-import { completed, type Harness, installHarness, uiError } from '../../test/ipc';
+import { completed, failed, type Harness, installHarness, uiError } from '../../test/ipc';
 import { renderScreen } from '../../test/screens';
 import { settleIpc } from '../../test/settle';
 import { FinishProtectDialog } from './FinishProtectDialog';
@@ -22,6 +29,8 @@ afterEach(async () => {
   await settleIpc();
   resetOperations();
   resetHeldPlans();
+  resetEndedAway();
+  resetLifecycle();
   clearMocks();
 });
 
@@ -134,4 +143,53 @@ test('a mistyped recovery key is said where it is wrong', async () => {
   await user.type(screen.getByLabelText('Recovery key'), 'QQQSY-QCYQ6');
   await user.click(screen.getByRole('button', { name: 'Continue' }));
   await waitFor(() => expect(screen.getByText('That key is mistyped near group 7.')).toBeDefined());
+});
+
+// WI-483: Finish's failure is a toast marked as a change's end, which N5 keeps while it shows;
+// it now says the failure's code under its message as the ErrorPanel does, and a lock while it
+// shows keeps the code with it. The toasts' clock never runs here: the lock comes in its time.
+test('WI-483: a finish that fails is toasted with its code, and a lock while it shows keeps both', async () => {
+  const code = 'apprafter::secrets::files_not_kept';
+  const error = uiError(
+    code,
+    'read back after the lock was turned on, the vault does not hold what was written',
+  );
+  const opId = h.newOperation([failed(error)]);
+  const view: PlanView = {
+    opId,
+    class: 'bounded',
+    title: 'Finish locking',
+    changes: [],
+    target: null,
+    expiresAtMs: Date.now() + 600_000,
+    gesture: 'none',
+  };
+  render(
+    <QueryClientProvider client={createQueryClient()}>
+      <PlatformContext value={appInfo()}>
+        <ToastProvider schedule={() => () => {}}>
+          <FinishProtectDialog
+            store="~/.config/apprafter"
+            auth={appInfo().auth}
+            plan={() => Promise.resolve(view)}
+            onDone={mock()}
+            onClose={mock()}
+          />
+          <ToastViewport />
+        </ToastProvider>
+      </PlatformContext>
+    </QueryClientProvider>,
+  );
+  const user = userEvent.setup();
+  await user.type(screen.getByLabelText('Lock password'), 'the lock password');
+  await user.type(screen.getByLabelText('Recovery key'), 'QQQSY-QCYQ5');
+  await user.click(screen.getByRole('button', { name: 'Continue' }));
+  await user.click(await screen.findByRole('button', { name: 'Finish' }));
+  const toast = await screen.findByRole('status');
+  await waitFor(() => expect(toast.textContent).toContain(error.message));
+  expect(toast.textContent).toContain(code);
+  act(() => {
+    sessionLocked();
+  });
+  expect(endedAwaySnapshot()).toEqual([{ opId: null, text: error.message, failed: true, code }]);
 });

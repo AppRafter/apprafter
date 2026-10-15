@@ -3,7 +3,9 @@
 // calls. The Security page opens each as the app's own overlay (shell/AppOverlays.tsx): over
 // every view, outside every view's <Activity> (GOTCHA-158), under a scope its close ends — and
 // the lock, which unmounts the Shell. A plan a flow holds goes with that scope, never on an
-// effect's cleanup.
+// effect's cleanup. A run's failure Stop protecting shows in its place is kept for after the
+// unlock when a lock comes while it shows (WI-483, state/shownFailure.ts); Protect's is too,
+// and Finish's is a toast, which N5 keeps.
 import { useQueryClient } from '@tanstack/react-query';
 import { useEffect, useRef, useState } from 'react';
 import { ErrorPanel } from '../../components/ErrorPanel';
@@ -12,12 +14,12 @@ import { useToast } from '../../components/Toast';
 import * as api from '../../ipc/api';
 import { uiErrorOf } from '../../ipc/api';
 import type { PlanView } from '../../ipc/generated/PlanView';
-import type { UiError } from '../../ipc/generated/UiError';
 import { holdPlan } from '../../ipc/heldPlans';
 import { rereadLock } from '../../state/lockInfo';
 import { type ProtectAction, STOP_TITLE, stopOutcome, stoppedSummary } from '../../state/lockText';
 import { usePlatform } from '../../state/platform';
 import { useScope } from '../../state/scope';
+import { useShownFailure } from '../../state/shownFailure';
 import { FinishProtectDialog } from './FinishProtectDialog';
 import { ProtectDialog } from './ProtectDialog';
 import { StopProtectingDialog } from './StopProtectingDialog';
@@ -84,7 +86,8 @@ function StopFlow({
   const [view, setView] = useState<PlanView | null>(null);
   // The plan uses the shared age key (only for a cache, d4a-f Task 3): the dialog names it then.
   const [needsKey, setNeedsKey] = useState(false);
-  const [error, setError] = useState<UiError | null>(null);
+  // The plan refused (nothing ran), or the run's failure, in the dialog's place.
+  const [failure, showFailure] = useShownFailure();
   // The run failed: the dialog's own close that follows leaves the failure shown.
   const failed = useRef(false);
   // One plan, however often the effect runs (StrictMode runs it twice).
@@ -102,13 +105,13 @@ function StopFlow({
         setNeedsKey(usesKey);
         setView(plan);
       },
-      (reason: unknown) => setError(uiErrorOf(reason)),
+      (reason: unknown) => showFailure(uiErrorOf(reason)),
     );
-  }, [scope]);
-  if (error !== null) {
+  }, [scope, showFailure]);
+  if (failure !== null) {
     return (
       <Modal title={STOP_TITLE} width={520} onClose={onClose}>
-        <ErrorPanel error={error} />
+        <ErrorPanel error={failure.error} />
       </Modal>
     );
   }
@@ -125,9 +128,9 @@ function StopFlow({
         toast({ message: stoppedSummary(stopOutcome(result)), end: 'done' });
         onDone();
       }}
-      onFailed={(failure) => {
+      onFailed={(error, change) => {
         failed.current = true;
-        setError(failure);
+        showFailure(error, change);
         onDone();
       }}
       onClose={() => {

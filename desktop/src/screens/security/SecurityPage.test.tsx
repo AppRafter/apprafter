@@ -15,7 +15,7 @@ import type { SecretsMode } from '../../ipc/generated/SecretsMode';
 import type { UiError } from '../../ipc/generated/UiError';
 import { resetHeldPlans } from '../../ipc/heldPlans';
 import { resetLifecycle, sessionLocked } from '../../ipc/lifecycle';
-import { installMockIpc } from '../../ipc/mock';
+import { installMockIpc, mockOps } from '../../ipc/mock';
 import { MOCK_RECOVERY_KEY, MOCK_STORE_PASSWORD } from '../../ipc/mock/lock';
 import { resetOperations } from '../../ipc/operations';
 import { PlatformGate } from '../../shell/PlatformGate';
@@ -91,6 +91,39 @@ function refuse(cmd: string, error: UiError): void {
   const at = internals();
   const invoke = at.invoke;
   at.invoke = (c, args, options) => (c === cmd ? Promise.reject(error) : invoke(c, args, options));
+}
+
+/** The plan's title the failure is kept under, as the app says a change's end away from it. */
+const STOP_PLAN = 'Stop protecting the target store at ~/.config/apprafter';
+
+/** What the core says when the vault was replaced under a Stop protecting (`lock off`). */
+const STORE_CHANGED_CODE = 'apprafter::secrets::store_changed';
+const STORE_CHANGED: UiError = {
+  code: STORE_CHANGED_CODE,
+  message:
+    'the vault of the target store at ~/.config/apprafter was replaced while this command ran; nothing was written',
+  help: 'Run this command again.',
+  causes: [],
+  fields: {},
+};
+
+/**
+ * op_plan_lock_off plans a Stop protecting whose run ends in `error`, its gesture the store's
+ * secret (over the mock's invoke).
+ */
+function stopFails(error: UiError): void {
+  const at = internals();
+  const invoke = at.invoke;
+  at.invoke = (c, args, options) => {
+    if (c !== 'op_plan_lock_off') return invoke(c, args, options);
+    const plan = mockOps().registerPlan(
+      { class: 'destructive', title: STOP_PLAN, changes: [], target: null },
+      { end: () => ({ error }) },
+      'store_secret',
+    );
+    const answer: LockOffPlan = { plan, needsKey: false };
+    return Promise.resolve(answer);
+  };
 }
 
 /**
@@ -263,6 +296,68 @@ describe('the Security page (WI-476)', () => {
       sessionLocked();
     });
     expect(endedAwaySnapshot()).toEqual([{ opId: null, text: STOPPED_TOAST, failed: false }]);
+  });
+
+  // WI-483 (from N5): a lock flow's failure is not a toast but an ErrorPanel in its overlay, and
+  // the lock unmounts it with the shell. Still shown when the app locks, it is kept for after the
+  // unlock in its plan's words, with its code. The toasts' clock never runs here.
+  test('WI-483: Stop protecting’s failure, still shown when the app locks, is kept with its code', async () => {
+    const { user } = await open(
+      'locked',
+      () => stopFails(STORE_CHANGED),
+      () => () => {},
+    );
+    await user.click(await within(view()).findByRole('button', { name: ACTION_LABELS.stop }));
+    const confirm = await screen.findByRole('dialog', { name: STOP_TITLE });
+    await user.type(within(confirm).getByLabelText(STORE_SECRET_FIELD), MOCK_STORE_PASSWORD);
+    await user.click(within(confirm).getByRole('button', { name: 'Stop protecting' }));
+    // Said in the flow's own overlay, in the confirm's place.
+    const said = await screen.findByText(STORE_CHANGED.message);
+    expect(said.closest('[role="dialog"]')?.textContent).toContain(STOP_TITLE);
+    expect(endedAwaySnapshot()).toEqual([]);
+    act(() => {
+      sessionLocked();
+    });
+    expect(endedAwaySnapshot()).toEqual([
+      {
+        opId: null,
+        text: `${STOP_PLAN} failed: ${STORE_CHANGED.message}`,
+        failed: true,
+        code: STORE_CHANGED_CODE,
+      },
+    ]);
+  });
+
+  test('WI-483: a Stop protecting refused before it ran is not kept: nothing changed', async () => {
+    const { user } = await open('locked', () => refuse('op_plan_lock_off', STORE_CHANGED));
+    await user.click(await within(view()).findByRole('button', { name: ACTION_LABELS.stop }));
+    const shown = await screen.findByRole('dialog', { name: STOP_TITLE });
+    expect((await within(shown).findByRole('alert')).textContent).toContain(STORE_CHANGED.message);
+    act(() => {
+      sessionLocked();
+    });
+    expect(endedAwaySnapshot()).toEqual([]);
+  });
+
+  test('WI-483: Stop protecting’s failure closed before the lock is not kept', async () => {
+    const { user } = await open('locked', () => stopFails(STORE_CHANGED));
+    await user.click(await within(view()).findByRole('button', { name: ACTION_LABELS.stop }));
+    const confirm = await screen.findByRole('dialog', { name: STOP_TITLE });
+    await user.type(within(confirm).getByLabelText(STORE_SECRET_FIELD), MOCK_STORE_PASSWORD);
+    await user.click(within(confirm).getByRole('button', { name: 'Stop protecting' }));
+    expect(await screen.findByText(STORE_CHANGED.message)).toBeDefined();
+    await user.click(
+      within(screen.getByRole('dialog', { name: STOP_TITLE })).getByRole('button', {
+        name: 'Close',
+      }),
+    );
+    await waitFor(() =>
+      expect(screen.queryByRole('dialog', { name: STOP_TITLE }) === null).toBe(true),
+    );
+    act(() => {
+      sessionLocked();
+    });
+    expect(endedAwaySnapshot()).toEqual([]);
   });
 
   test('Stop protecting an interrupted Protect backs it out, and the toast says so (UI verifier M3)', async () => {

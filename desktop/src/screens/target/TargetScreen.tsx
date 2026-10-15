@@ -5,11 +5,12 @@
 // each by its plan class (actions.tsx). A target whose own file cannot be read shows why, and its
 // Danger zone still removes it (WI-458): the Targets page lists by config.yaml alone, so a target
 // whose credentials do not parse, or cannot be read, opens here. A plan refused, or a run that failed or was cancelled,
-// shows above the cards with what it offers; an action that starts again clears it. Run doctor
+// shows above the cards with what it offers; an action that starts again clears it, and a lock
+// while a run's failure shows keeps it for after the unlock (WI-483). Run doctor
 // (the page header) and the Machine row's Change open the D.3 flows (screens/flows.tsx): Doctor
 // over every view, Change machine in this tab, on the machine the report says the target is set
 // to.
-import { useCallback, useState } from 'react';
+import { useCallback } from 'react';
 import { Button } from '../../components/Button';
 import { ErrorPanel } from '../../components/ErrorPanel';
 import { SpinnerGapIcon, StethoscopeIcon } from '../../components/icons';
@@ -22,6 +23,7 @@ import type { UiError } from '../../ipc/generated/UiError';
 import { sectionInfo } from '../../shell/sections';
 import { storeProblemOf } from '../../state/lockText';
 import { usePlatform } from '../../state/platform';
+import { useShownFailure } from '../../state/shownFailure';
 import { useTargetReport } from '../../state/targets';
 import { useTargetFlows } from '../flows';
 import { useTargetActions } from './actions';
@@ -53,15 +55,16 @@ export function TargetScreen({ name, onRenamed, onRemoved, onChangeMachine }: Ta
             region: loaded.region,
             serverType: loaded.serverType,
           }));
-  const [failure, setFailure] = useState<UiError | null>(null);
-  const actions = useTargetActions({ name, onRenamed, onRemoved, onFailed: setFailure });
+  const [shown, showFailure] = useShownFailure();
+  const failure = shown?.error ?? null;
+  const actions = useTargetActions({ name, onRenamed, onRemoved, onFailed: showFailure });
   /** An action starting again: what failed last is not the news any more. */
   const fresh = useCallback(
     (run: () => void) => () => {
-      setFailure(null);
+      showFailure(null);
       run();
     },
-    [],
+    [showFailure],
   );
 
   // The ErrorPanel's actions this screen runs, and those the D.3 flows own; any other is not

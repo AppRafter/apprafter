@@ -4,7 +4,9 @@
 // as a draft and the field is emptied (decision 6). The catalogue and the plan name the draft.
 // No Paste (no clipboard read, R11), no --force, no --no-ping (decision 8), no provisioning (D.12).
 // It is an app overlay (shell/AppOverlays.tsx, opened through screens/flows.tsx): over every view,
-// never hidden by a tab switch; its close discards the draft it holds, the lock drops it.
+// never hidden by a tab switch; its close discards the draft it holds, the lock drops it. A save's
+// failure it still shows when a lock comes is kept for after the unlock (WI-483,
+// state/shownFailure.ts), as one that ends after it went is (ipc/away.ts).
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useEffect, useLayoutEffect, useReducer, useRef, useState } from 'react';
 import { Button } from '../../components/Button';
@@ -37,6 +39,7 @@ import { usePlatform } from '../../state/platform';
 import { useRead } from '../../state/read';
 import { useScope } from '../../state/scope';
 import { secretCopy } from '../../state/secretCopy';
+import { useShownFailure } from '../../state/shownFailure';
 import { refreshTargets, TARGETS_KEY } from '../../state/targets';
 import { useWhenShown } from '../../state/whenShown';
 import { choosable, latencyView, offerIn } from '../machine/catalogue';
@@ -129,7 +132,8 @@ export function AddTargetWizard({ onClose }: { onClose: () => void }) {
   const latencyRead = useRead<RegionLatency[]>();
   const [notice, setNotice] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
-  const [saveError, setSaveError] = useState<UiError | null>(null);
+  const [saveFailure, showSaveFailure] = useShownFailure();
+  const saveError = saveFailure?.error ?? null;
   const [confirm, setConfirm] = useState<PlanView | null>(null);
   // The draft the wizard holds is held in its scope (ipc/lifecycle.ts): when the wizard goes —
   // closed by its owner, or the lock (Rust drops it too; the discard is then refused as locked,
@@ -292,7 +296,8 @@ export function AddTargetWizard({ onClose }: { onClose: () => void }) {
         finishAdded(end.added);
       } else {
         setSaving(false);
-        setSaveError(end.error);
+        // A run was asked for: its end, as the app keeps it when the wizard is gone (below).
+        showSaveFailure(end.error, end.plan.title);
       }
     },
     (end) => {
@@ -323,7 +328,7 @@ export function AddTargetWizard({ onClose }: { onClose: () => void }) {
   const save = async () => {
     if (args === null) return;
     setSaving(true);
-    setSaveError(null);
+    showSaveFailure(null);
     let plan: PlanView;
     try {
       plan = await api.opPlanTargetAdd(args);
@@ -335,7 +340,7 @@ export function AddTargetWizard({ onClose }: { onClose: () => void }) {
         discardDraft(args.draftId);
         forgetDraft(isDraftGone(e) ? DRAFT_GONE : e.message);
       } else {
-        setSaveError(e);
+        showSaveFailure(e);
       }
       return;
     }
@@ -351,7 +356,7 @@ export function AddTargetWizard({ onClose }: { onClose: () => void }) {
   // The draft went with a plan whose run failed: a new token makes a new draft, whose verify
   // reads its own catalogue.
   const enterTokenAgain = () => {
-    setSaveError(null);
+    showSaveFailure(null);
     forgetDraft(TOKEN_USED);
   };
 
@@ -597,8 +602,11 @@ export function AddTargetWizard({ onClose }: { onClose: () => void }) {
           auth={info.auth}
           body="Read what this plan changes before it runs."
           onDone={(result) => finishAdded(result as TargetAdded)}
-          onFailed={(e) =>
-            setSaveError(e.code === CORE_ERROR_CODES.OP_CANCELLED ? plainError(SAVE_CANCELLED) : e)
+          onFailed={(e, change) =>
+            showSaveFailure(
+              e.code === CORE_ERROR_CODES.OP_CANCELLED ? plainError(SAVE_CANCELLED) : e,
+              change,
+            )
           }
           onClose={() => setConfirm(null)}
         />

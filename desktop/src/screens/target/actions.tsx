@@ -3,7 +3,9 @@
 // decision 3): `use` is reversible and runs at once, without a dialog; rename, renew and the SSH
 // key are bounded — the form, then a plain confirm that lists the changes; remove is destructive
 // — the full plan, the typed name, then the OS gesture inside op_execute. Every form and confirm
-// is an overlay of the view it was opened from, so it hides with its tab.
+// is an overlay of the view it was opened from, so it hides with its tab. A refusal, or a run that
+// failed or was cancelled, goes to the caller's `onFailed` — with the plan's title for a run's end
+// (WI-483), which the caller's panel keeps for after the unlock if a lock comes while it shows.
 import { useQueryClient } from '@tanstack/react-query';
 import { useCallback, useMemo } from 'react';
 import { FormDialog, type FormValues, type RadioOpt } from '../../components/FormDialog';
@@ -21,7 +23,7 @@ import type { TargetUsed } from '../../ipc/generated/TargetUsed';
 import { HETZNER_TOKEN_LEN } from '../../ipc/generated/target';
 import type { UiError } from '../../ipc/generated/UiError';
 import { holdPlan } from '../../ipc/heldPlans';
-import { OperationFailed, resultOf, startPlan } from '../../ipc/plans';
+import { type OnFailed, OperationFailed, resultOf, startPlan } from '../../ipc/plans';
 import { useOverlay } from '../../shell/ViewFrame';
 import { usePlatform } from '../../state/platform';
 import { useScope } from '../../state/scope';
@@ -48,25 +50,27 @@ const plainError = (message: string): UiError => ({
  * with nothing to change (it is the default already) is discarded unrun. Either way a toast says
  * what is true now and the store is read again; a refusal or a failure goes to `onFailed`.
  */
-export function useMakeDefault(
-  onFailed: (error: UiError) => void,
-): (name: string) => Promise<void> {
+export function useMakeDefault(onFailed: OnFailed): (name: string) => Promise<void> {
   const client = useQueryClient();
   const toast = useToast();
   return useCallback(
     async (name: string) => {
+      // The plan's title once it runs: its failure is then a change's end (WI-483).
+      let ran: string | undefined;
       try {
         const view = await api.opPlanTargetUse(name);
         if (view.changes.length === 0) {
           await api.opDiscard(view.opId);
           toast({ message: usedMessage({ name, pointer: null }), end: 'done' });
         } else {
-          const out = resultOf(await (await startPlan(view.opId)).ended) as unknown as TargetUsed;
+          const started = await startPlan(view.opId);
+          ran = view.title;
+          const out = resultOf(await started.ended) as unknown as TargetUsed;
           toast({ message: usedMessage(out), end: 'done' });
         }
         refreshTargets(client);
       } catch (reason) {
-        onFailed(refusalOf(reason));
+        onFailed(refusalOf(reason), ran);
       }
     },
     [client, toast, onFailed],
@@ -81,7 +85,7 @@ export function useMakeDefault(
  * Also Change machine's (D.3e): its own overlay, so its form is never inside the frame's
  * (GOTCHA-144).
  */
-export function useConfirm(onFailed: (error: UiError) => void) {
+export function useConfirm(onFailed: OnFailed) {
   const show = useOverlay();
   const { auth } = usePlatform();
   const scope = useScope();
@@ -124,10 +128,7 @@ function keyOption(candidate: SshKeyCandidate, inUse: boolean): RadioOpt {
  * opens; a key that became the stored one since is the core's nothing-to-change refusal, shown
  * in the form. Also what doctor's `configure_ssh_key` fix opens (D.3e).
  */
-export function useChangeSshKey(
-  name: string,
-  onFailed: (error: UiError) => void,
-): () => Promise<void> {
+export function useChangeSshKey(name: string, onFailed: OnFailed): () => Promise<void> {
   const show = useOverlay();
   const toast = useToast();
   const client = useQueryClient();
@@ -232,7 +233,7 @@ export interface RemoveTargetOptions {
  */
 export function useRemoveTarget(
   onRemoved: (name: string) => void,
-  onFailed: (error: UiError) => void,
+  onFailed: OnFailed,
   { closeAtOnce = false }: RemoveTargetOptions = {},
 ): (name: string) => Promise<void> {
   const toast = useToast();
@@ -280,8 +281,11 @@ export interface TargetActionsOptions {
   readonly onRenamed: (from: string, to: string) => void;
   /** The remove ran: the tab closes. */
   readonly onRemoved: (name: string) => void;
-  /** A plan was refused, or its run failed or was cancelled: the screen shows it. */
-  readonly onFailed: (error: UiError) => void;
+  /**
+   * A plan was refused, or its run failed or was cancelled (then with the plan's title): the
+   * screen shows it.
+   */
+  readonly onFailed: OnFailed;
 }
 
 export interface TargetActions {
