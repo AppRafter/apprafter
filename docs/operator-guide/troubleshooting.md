@@ -687,8 +687,9 @@ repository token, a backup passphrase. Commands that need no secret still run â€
 and [`apprafter doctor`](#store-folder-foreign) lists every folder and secret
 file concerned. A folder another account owns is often one your account
 cannot open either: a command that has to read a file in it, `apprafter
-target show` and doctor's `Config file readable` row included, then gives
-this message, naming the folder, rather than a bare permission error.
+target list`, `apprafter target show` and doctor's `Config file readable`
+row included, then gives this message, naming the folder, rather than a bare
+permission error or an empty list of targets.
 
 AppRafter creates every folder of the store your account's alone, whatever
 the umask, and never changes a folder that is already there. So the folder
