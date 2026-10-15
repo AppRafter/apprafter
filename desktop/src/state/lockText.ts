@@ -205,14 +205,22 @@ export const AT_REST =
 
 /**
  * The app's form of `unlocked_terminal` (surface §5.8): the app holds the key while unlocked,
- * and after a lock only while a change confirmed before it finishes (the Rust verifier's
- * finding 3: the core takes a write's key before its store lock), which may first wait for
- * another AppRafter program to release the store — at most 30 s after the lock, then it is
- * abandoned unwritten (the final verifier's findings 12 and 14: a read already decrypting
- * ends, and a run keeps what it already read, so nothing here says "at once").
+ * and after a lock only while a change confirmed before it finishes. What a lock does to a
+ * change, as the code does it (D.4a F18, the owner's O15, A1):
+ * - Protecting, finishing and stopping protection carry their own key — Stop protecting the vault
+ *   its typed secret opened, which a lock no longer refuses while it is checked (ops/manager.rs
+ *   `refuse_prompts`) — and may first wait for another AppRafter program to release the store: at
+ *   most 30 s after the lock, then they are abandoned unwritten (the final verifier's findings 12
+ *   and 14: a read already decrypting ends, and a run keeps what it already read, so nothing here
+ *   says "at once").
+ * - A token change takes the store's key just before it writes (`prepare_write`, after the ping
+ *   of a new token), so a lock before then abandons it unwritten; a renewal also re-reads the old
+ *   token through a session under the store's lock, which refuses after a lock.
+ * - An OS prompt still open, a wrong typed secret, or a confirm still on its way is not started
+ *   (ipc/plans.ts `startPlan` says so after the unlock).
  */
 export const APP_HOLDS_KEY =
-  'While AppRafter is unlocked it holds this store’s key, and everything it runs can use the secrets: lock it when you step away. A lock stops every new read: one already decrypting ends, and a run you confirmed keeps what it already read. A change you confirmed before the lock — protecting, finishing, stopping protection, or saving, renaming or removing a token — finishes with the key it took once no other AppRafter program holds the store, or is abandoned with nothing written if it cannot start within 30 s; that key goes when the change ends.';
+  'While AppRafter is unlocked it holds this store’s key, and everything it runs can use the secrets: lock it when you step away. A lock stops every new read: one already decrypting ends, and a run you confirmed keeps what it already read. Protecting, finishing or stopping protection that you confirmed before the lock, with its secret typed when it asks for one, finishes once no other AppRafter program holds the store, or is abandoned with nothing written if it cannot start within 30 s. A token change — saving, renewing, renaming or removing a token — takes the store’s key only when it is about to write, after any check of a new token with Hetzner: a lock before that, such as one while Hetzner is still checking the token, abandons it with nothing written. One that has taken the key finishes as protecting does, and the key goes when it ends; a renewal finishes only if the lock comes while it writes. A change still waiting for a system prompt when the lock comes, confirmed at that very moment, or confirmed with a wrong secret is not started. After you unlock, AppRafter says how each one ended.';
 
 /**
  * T77, rule 1: what the app's own process could not do to protect the key; `null` when all took.

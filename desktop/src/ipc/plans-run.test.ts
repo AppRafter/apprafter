@@ -5,6 +5,7 @@
 import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test';
 import { clearMocks } from '@tauri-apps/api/mocks';
 import { waitFor } from '@testing-library/react';
+import { lockState } from '../test/fixtures';
 import {
   cancelled,
   completed,
@@ -155,4 +156,60 @@ test('an end kept for the app says what happened: done, or cancelled', async () 
     { opId: done, text: 'Rename prod: done.', failed: false },
     { opId: stopped, text: 'Rename prod was cancelled.', failed: true },
   ]);
+});
+
+// D.4a F18 item 4 (critic M-4; the owner's O15): a confirmed plan that the lock stopped before it
+// began — an OS prompt still open, a typed secret the lock found wrong, or a confirm still on its
+// way — is not silent after the unlock: the app says it was not started.
+const STOP = 'Stop protecting the secrets of the target store at /s';
+const notStarted = {
+  opId: null,
+  text: `${STOP} was not started: AppRafter locked before it began.`,
+  failed: true,
+};
+const refusedBy = (code: string) => () => Promise.reject(uiError(code, code));
+
+test('F18: a confirm the lock refused says after the unlock that it was not started', async () => {
+  for (const code of [
+    DESKTOP_ERROR_CODES.LOCKED,
+    DESKTOP_ERROR_CODES.AUTH_CANCELLED,
+    DESKTOP_ERROR_CODES.PLAN_NOT_FOUND,
+  ]) {
+    resetEndedAway();
+    h.answer('op_execute', refusedBy(code));
+    h.answer('lock_status', lockState({ locked: true, reason: 'manual' }));
+    const id = h.newOperation([]);
+    const error = await runPlan(id, 'lock password', { title: STOP, shown: () => false }).catch(
+      (e: unknown) => e,
+    );
+    expect(failureOf(error).code).toBe(code);
+    expect(endedAwaySnapshot()).toEqual([notStarted]);
+  }
+});
+
+test('F18: its screen still shown as the refusal arrives (the lock event comes after it), it is kept all the same', async () => {
+  h.answer('op_execute', refusedBy(DESKTOP_ERROR_CODES.AUTH_CANCELLED));
+  h.answer('lock_status', lockState({ locked: true, reason: 'manual' }));
+  const id = h.newOperation([]);
+  await runPlan(id, undefined, { title: STOP, shown: () => true }).catch(() => {});
+  expect(endedAwaySnapshot()).toEqual([notStarted]);
+});
+
+test('F18: a cancel the person clicked, or a plan gone with the app unlocked, is never kept', async () => {
+  for (const code of [DESKTOP_ERROR_CODES.AUTH_CANCELLED, DESKTOP_ERROR_CODES.PLAN_NOT_FOUND]) {
+    h.answer('op_execute', refusedBy(code));
+    h.answer('lock_status', lockState({ locked: false }));
+    const id = h.newOperation([]);
+    await runPlan(id, undefined, { title: STOP, shown: () => false }).catch(() => {});
+    await runPlan(id, undefined, { title: STOP, shown: () => true }).catch(() => {});
+  }
+  expect(endedAwaySnapshot()).toEqual([]);
+});
+
+test('F18: any other refusal is the screen’s to show, even with the app locked', async () => {
+  h.answer('op_execute', refusedBy(DESKTOP_ERROR_CODES.AUTH_FAILED));
+  h.answer('lock_status', lockState({ locked: true, reason: 'manual' }));
+  const id = h.newOperation([]);
+  await runPlan(id, 'not it', { title: STOP, shown: () => false }).catch(() => {});
+  expect(endedAwaySnapshot()).toEqual([]);
 });

@@ -1025,6 +1025,89 @@ mod tests {
         );
     }
 
+    /// The last event of operation `id` once it has ended, from its replay: a lock drops every
+    /// page's subscription, so a run the lock passed tells no sink; the page reads the replay
+    /// after the unlock.
+    #[cfg(feature = "test-build")]
+    fn ended_in_replay(shell: &Shell, id: OpId) -> OpEvent {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while shell
+            .ops
+            .list()
+            .iter()
+            .any(|s| s.op_id == id && s.state == apprafter_desktop_ipc::OpState::Running)
+        {
+            assert!(Instant::now() < deadline, "operation {id:?} did not end");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let replay = shell
+            .ops
+            .subscribe(id, Arc::new(Recorder::default()))
+            .expect("the ended operation is kept for the page")
+            .replay;
+        replay
+            .last()
+            .cloned()
+            .expect("an ended operation has its final event")
+    }
+
+    /// D.4a F18 (owner O15, A1; the owner walk's D-7 runs 1 and 4): Stop protecting confirmed
+    /// with its secret, and Lock now while the gate still derives that secret's key. The lock
+    /// does not refuse the typed secret: judged on its answer, the change runs with the vault its
+    /// gesture opened and finishes — the store is in files, its vault gone — and its end waits
+    /// for the page in the operation's replay. The lock is forced inside the derivation (the
+    /// gate's test seam), never sampled.
+    #[cfg(feature = "test-build")]
+    #[test]
+    fn stop_protecting_confirmed_before_a_lock_finishes_after_it() {
+        let r = rig();
+        let plan = plan_lock_on(&r.shell, SecretString::new(PASSWORD), None).unwrap();
+        recovery_key_saved(&r.shell, plan.plan.op_id).unwrap();
+        confirm_recovery_key(
+            &r.shell,
+            plan.plan.op_id,
+            SecretString::new(plan.recovery_key.clone()),
+        )
+        .unwrap();
+        completed(run(&r.shell, &plan.plan, None));
+        let root = r.shell.context.config_root().to_path_buf();
+        let off = plan_lock_off(&r.shell).unwrap().plan;
+        assert_eq!(off.gesture, Gesture::StoreSecret);
+        let (began_tx, began) = std::sync::mpsc::channel();
+        let (go, held) = std::sync::mpsc::channel::<()>();
+        let (began_tx, held) = (Mutex::new(began_tx), Mutex::new(held));
+        r.shell.vault.hold_openings(move || {
+            let _ = began_tx.lock().unwrap().send(());
+            let _ = held.lock().unwrap().recv_timeout(Duration::from_secs(30));
+        });
+        let (shell, id) = (r.shell.clone(), off.op_id);
+        let confirmed = std::thread::spawn(move || {
+            shell
+                .execute_with(
+                    id,
+                    Arc::new(Recorder::default()),
+                    Some(Zeroizing::new(PASSWORD.into())),
+                )
+                .map(drop)
+                .map_err(|refusal| refusal.to_ui())
+        });
+        began
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the gate derives the typed secret's key");
+        assert!(r.shell.lock_now().locked, "Lock now locks the app");
+        go.send(()).unwrap();
+        confirmed
+            .join()
+            .unwrap()
+            .expect("the typed secret is judged, and the plan runs");
+        completed(ended_in_replay(&r.shell, id));
+        assert_eq!(Protection::read(&root, None).mode, SecretsMode::Files);
+        assert!(
+            !root.join(apprafter_core::vault::VAULT_FILE).exists(),
+            "the vault is gone"
+        );
+    }
+
     /// L5's desktop half (T23, critic B finding 11): a test build without its fence refuses
     /// Protect before anything is written.
     #[cfg(feature = "test-build")]

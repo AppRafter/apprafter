@@ -1735,6 +1735,66 @@ mod tests {
         );
     }
 
+    /// D.4a F18 (the owner's O15, A1): a token change keeps its key timing. It takes the
+    /// store's key only when it is about to write, after Hetzner has checked the new token, so
+    /// Lock now while that check is still out abandons it with nothing written: the vault is as
+    /// it was, byte for byte, and the renewal ends failed `store_locked`, which the page reads
+    /// from the operation's replay once unlocked (the Security page and the guide say so). The
+    /// lock is forced while the test's provider API holds the check, never sampled.
+    #[test]
+    fn a_renewal_still_checking_its_token_when_the_app_locks_writes_nothing() {
+        let api = api();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("store");
+        std::fs::create_dir_all(&root).unwrap();
+        let old = "o".repeat(64);
+        let store = locked_store(&root, &[("prod", Some(old.as_str()))]);
+        let settings = SettingsStore::load(dir.path(), &SystemClock);
+        settings
+            .set(Settings {
+                lock_on_start: false,
+                ..Settings::default()
+            })
+            .unwrap();
+        let shell = Shell::new_with(
+            settings,
+            Arc::new(NoAuthenticator),
+            Arc::new(SystemClock),
+            Context::for_desktop(root.clone(), &api.base),
+            ToolSearchPath::known(OsString::new(), PathSource::Explicit),
+            false,
+            ShellExtras::default(),
+            |_| {},
+        );
+        shell
+            .unlock_with_password(Zeroizing::new(store.recovery_key().expose().into()))
+            .unwrap();
+        let vault = root.join(apprafter_core::vault::VAULT_FILE);
+        let before = std::fs::read(&vault).unwrap();
+        let view = plan_target_renew(&shell, "prod", Some(a_token('k')), None).unwrap();
+        shell
+            .execute(view.op_id, Arc::new(Recorder::default()))
+            .unwrap();
+        api.asked
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the renewal checks the new token with the provider");
+        assert!(shell.lock_now().locked, "Lock now locks the app");
+        api.answer.send(()).unwrap();
+        let OpEvent::Failed { error } = ended(&shell, view.op_id) else {
+            panic!("the renewal did not fail")
+        };
+        assert_eq!(
+            error.code.as_deref(),
+            Some("apprafter::secrets::store_locked"),
+            "{error:?}"
+        );
+        assert_eq!(
+            std::fs::read(&vault).unwrap(),
+            before,
+            "the vault is as it was: nothing written"
+        );
+    }
+
     /// Critic A finding 21: a store locked from a terminal under the unlocked app — the
     /// re-read locks it, and doctor starts nothing for an app that is now locked.
     #[test]

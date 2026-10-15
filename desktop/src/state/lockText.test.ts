@@ -390,6 +390,28 @@ describe('the state of the store', () => {
   });
 });
 
+describe('what a lock does to a confirmed change (D.4a F18, the owner’s O15)', () => {
+  test('the page says what the code does: a typed secret is judged, a token change keeps its timing', () => {
+    const text = lockText.APP_HOLDS_KEY;
+    // A1: protecting, finishing and stopping protection confirmed before the lock finish.
+    expect(text).toContain(
+      'Protecting, finishing or stopping protection that you confirmed before the lock, with its secret typed when it asks for one, finishes once no other AppRafter program holds the store, or is abandoned with nothing written if it cannot start within 30 s.',
+    );
+    // Token changes keep today's key timing: a lock during the Hetzner check abandons them.
+    expect(text).toContain(
+      'A token change — saving, renewing, renaming or removing a token — takes the store’s key only when it is about to write, after any check of a new token with Hetzner: a lock before that, such as one while Hetzner is still checking the token, abandons it with nothing written.',
+    );
+    expect(text).toContain('a renewal finishes only if the lock comes while it writes.');
+    // Item 4: what the lock stopped before it began is said after the unlock, never silent.
+    expect(text).toContain(
+      'A change still waiting for a system prompt when the lock comes, confirmed at that very moment, or confirmed with a wrong secret is not started. After you unlock, AppRafter says how each one ended.',
+    );
+    // The over-claim the walk found false (D-7, D-8): a token change does not finish "with the
+    // key it took" once the lock came before it took one.
+    expect(text).not.toContain('finishes with the key it took');
+  });
+});
+
 describe('the Security page’s words (WI-476)', () => {
   test('the covered line names every target, counted; a store with none claims nothing', () => {
     expect(coveredLine(['lab', 'prod-eu', 'staging'])).toBe(

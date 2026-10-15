@@ -5,8 +5,9 @@
 // `Err(Cancelled)`, which Rust ends alike): OperationFailed with `OP_CANCELLED`. A follow Rust
 // refuses ends the wait with that refusal, so no caller waits forever. A confirmed plan's end
 // that arrives when the screen that ran it is gone (a lock, a closed tab) is kept for the app
-// (ipc/away.ts) instead of being discarded unseen.
-import { IpcError, uiErrorOf } from './api';
+// (ipc/away.ts) instead of being discarded unseen, and so is a confirm the lock stopped before it
+// began (D.4a F18).
+import { IpcError, lockStatus, uiErrorOf } from './api';
 import { keepEndedAway } from './away';
 import { CORE_ERROR_CODES } from './generated/core-errors';
 import { DESKTOP_ERROR_CODES } from './generated/errors';
@@ -97,6 +98,38 @@ export function awayLine(title: string, error: UiError | null): { text: string; 
   return { text: `${title} failed: ${error.message}`, failed: true };
 }
 
+/** The line for a confirmed plan the lock stopped before it began (D.4a F18). */
+export const notStartedText = (title: string): string =>
+  `${title} was not started: AppRafter locked before it began.`;
+
+/** What op_execute answers when a lock may have stopped the plan before it began. */
+const STOPPED_BY_A_LOCK: ReadonlySet<string> = new Set([
+  DESKTOP_ERROR_CODES.LOCKED,
+  DESKTOP_ERROR_CODES.AUTH_CANCELLED,
+  DESKTOP_ERROR_CODES.PLAN_NOT_FOUND,
+]);
+
+/**
+ * D.4a F18, item 4 (critic M-4): a confirmed plan the lock stopped before it began is kept for
+ * the app, which says so after the unlock — never silent. That is an OS prompt the lock closed
+ * (`auth_cancelled`), a typed secret the lock found wrong or a confirm that reached Rust locked
+ * (`locked`), and a confirm whose plan the lock dropped on its way (`plan_not_found`). The last
+ * two of those codes are also a cancel the person clicked and a plan that expired, with the app
+ * unlocked: Rust's lock says which, asked here, since its `lock-changed` may reach the page after
+ * this answer — and the screen may still be shown, about to go. Any other refusal is the
+ * screen's to show.
+ */
+async function keepIfTheLockStoppedIt(owner: PlanOwner, reason: unknown): Promise<void> {
+  if (!(reason instanceof IpcError)) return;
+  const { code } = reason.error;
+  if (code === null || !STOPPED_BY_A_LOCK.has(code)) return;
+  if (code !== DESKTOP_ERROR_CODES.LOCKED) {
+    const state = await lockStatus().catch(() => null);
+    if (state?.locked !== true) return;
+  }
+  keepEndedAway({ opId: null, text: notStartedText(owner.title), failed: true });
+}
+
 export interface Started {
   /** The operation's end; the op is released and discarded once it is here. */
   readonly ended: Promise<OpEnd>;
@@ -104,14 +137,21 @@ export interface Started {
 
 /**
  * Run the confirmed plan; resolves once Rust started it. Rejects as op_execute does: some
- * refusals (a wrong password, a busy prompt) leave the plan waiting for another try.
+ * refusals (a wrong password, a busy prompt) leave the plan waiting for another try. One the
+ * lock stopped before it began is kept for the app first (`keepIfTheLockStoppedIt`).
  */
 export async function startPlan(
   opId: OpId,
   password?: string,
   owner?: PlanOwner,
 ): Promise<Started> {
-  const release = await execute(opId, password);
+  let release: () => void;
+  try {
+    release = await execute(opId, password);
+  } catch (reason) {
+    if (owner !== undefined) await keepIfTheLockStoppedIt(owner, reason);
+    throw reason;
+  }
   const gone = () => owner !== undefined && !owner.shown();
   const ended = endOf(opId).then(
     (end) => {

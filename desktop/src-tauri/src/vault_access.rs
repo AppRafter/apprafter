@@ -282,6 +282,18 @@ impl DesktopVaultAccess {
             .attempt(|| lock::open_slot_at(root, id, kind, secret, KdfPolicy::active()))
     }
 
+    /// Tests: `hook` runs inside every opening through the gate, before the vault opens (D.4a
+    /// F18: a lock forced into a confirm's derivation). A test build's: only the fast KDF lets a
+    /// test derive a typed secret's key.
+    #[cfg(all(test, feature = "test-build"))]
+    pub(crate) fn hold_openings(&self, hook: impl Fn() + Send + Sync + 'static) {
+        *self
+            .gate
+            .before_open
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(hook));
+    }
+
     /// The O4 look a session takes before its use, holding nothing of this access's.
     fn look(&self) {
         if let Some(look) = self.shared.before_use.get() {
@@ -570,6 +582,11 @@ pub struct VaultGate {
     derive: Mutex<()>,
     backoff: Mutex<Backoff>,
     clock: Arc<dyn Clock>,
+    /// Tests: called inside an opening, the gate taken and before the vault opens — where a
+    /// test holds a derivation to force a lock into it (D.4a F18). `derive` is taken with
+    /// `try_lock`, so holding it from outside gives `auth_busy`, not a held derivation.
+    #[cfg(test)]
+    before_open: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl VaultGate {
@@ -578,6 +595,8 @@ impl VaultGate {
             derive: Mutex::new(()),
             backoff: Mutex::new(Backoff::new()),
             clock,
+            #[cfg(test)]
+            before_open: Mutex::default(),
         }
     }
 
@@ -598,6 +617,17 @@ impl VaultGate {
         let now = self.clock.monotonic_ms();
         if let Err(refused) = self.backoff().allow(now) {
             return Err(failed(true, Some(refused.remaining_ms)));
+        }
+        #[cfg(test)]
+        {
+            let hook = self
+                .before_open
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            if let Some(hook) = hook {
+                hook();
+            }
         }
         match open() {
             Ok(opened) => {

@@ -34,12 +34,18 @@ let calls: { cmd: string; args: Record<string, unknown> }[];
 let locked: boolean;
 /** Rust's end of op 900, replayed to a follow: none yet, then the failure. */
 let ended: boolean;
+/** D.4a F18: the end that replay carries, a failure unless a test says it completed. */
+let endedDone: boolean;
+/** D.4a F18: Rust's answer to op_execute, when a test holds it (else: the op runs). */
+let execute: (() => Promise<unknown>) | null;
 let opened: boolean;
 
 beforeEach(() => {
   calls = [];
   locked = false;
   ended = false;
+  endedDone = false;
+  execute = null;
   opened = false;
   mockWindows('main');
   mockIPC(
@@ -56,23 +62,25 @@ beforeEach(() => {
           fields: {},
         });
       }
-      if (cmd === 'op_execute') return 2; // Rust runs it; no event yet
+      if (cmd === 'op_execute') return execute === null ? 2 : execute(); // Rust runs it
       if (cmd === 'op_subscribe') {
         return {
           subscription: 3,
           replay: ended
-            ? [
-                {
-                  kind: 'failed',
-                  error: {
-                    code: 'apprafter::provider::sku_unavailable',
-                    message: 'cx22 is sold out in nbg1',
-                    help: null,
-                    causes: [],
-                    fields: {},
+            ? endedDone
+              ? [{ kind: 'finished', outcome: { status: 'completed', result: null } }]
+              : [
+                  {
+                    kind: 'failed',
+                    error: {
+                      code: 'apprafter::provider::sku_unavailable',
+                      message: 'cx22 is sold out in nbg1',
+                      help: null,
+                      causes: [],
+                      fields: {},
+                    },
                   },
-                },
-              ]
+                ]
             : [],
         };
       }
@@ -149,6 +157,67 @@ test('a confirmed plan that ends after a lock took its screen: its failure shows
   await changed(false);
   expect(await screen.findByText('Rename prod-eu failed: cx22 is sold out in nbg1')).toBeDefined();
   expect(discarded()).toEqual([900]);
+  expect(endedAwaySnapshot()).toEqual([]);
+});
+
+/** The app as the tests above render it: the lock gate, a shell with the confirm, the notices. */
+function renderApp() {
+  render(
+    <QueryClientProvider client={createQueryClient()}>
+      <PlatformContext value={appInfo()}>
+        <LockGate>
+          <ToastProvider>
+            <ViewFrame>
+              <OpenConfirm />
+            </ViewFrame>
+            <EndedAwayNotices />
+            <ToastViewport />
+          </ToastProvider>
+        </LockGate>
+      </PlatformContext>
+    </QueryClientProvider>,
+  );
+}
+
+test('D.4a F18: a confirmed plan that completes after a lock took its screen says so after the unlock', async () => {
+  renderApp();
+  const user = userEvent.setup();
+  await user.click(await screen.findByRole('button', { name: 'Rename' }));
+  await changed(true);
+  ended = true; // Rust judged the typed secret and ran the change while the app was locked
+  endedDone = true;
+  await changed(false);
+  expect(await screen.findByText('Rename prod-eu: done.')).toBeDefined();
+  expect(discarded()).toEqual([900]);
+});
+
+test('D.4a F18: a confirm the lock stopped before it began says after the unlock that it was not started', async () => {
+  // The OS prompt is open when the lock lands: Rust closes it and answers auth_cancelled.
+  let refuse = () => {};
+  execute = () =>
+    new Promise((_, reject) => {
+      refuse = () =>
+        reject({
+          code: DESKTOP_ERROR_CODES.AUTH_CANCELLED,
+          message: 'authentication was cancelled',
+          help: null,
+          causes: [],
+          fields: {},
+        });
+    });
+  renderApp();
+  const user = userEvent.setup();
+  await user.click(await screen.findByRole('button', { name: 'Rename' }));
+  await changed(true);
+  await act(async () => {
+    refuse();
+    await new Promise((r) => setTimeout(r, 0));
+  });
+  expect(screen.queryByText(/was not started/)).toBeNull(); // nothing shows while locked
+  await changed(false);
+  expect(
+    await screen.findByText('Rename prod-eu was not started: AppRafter locked before it began.'),
+  ).toBeDefined();
   expect(endedAwaySnapshot()).toEqual([]);
 });
 
