@@ -270,12 +270,21 @@ impl Inner {
         if let Some(key) = self.current(root) {
             return Ok(key);
         }
+        // The window shapes the question — and asks this terminal's holder for it (d4a-h F3) —
+        // only where a question is shown: with no terminal, `ask_and_open` refuses before it
+        // asks, and a holder looked for by this command's session is not looked for again
+        // (T-lazy-2).
+        let question = if self.asker.present() {
+            crate::holder_window::inline_prompt(root, id, INLINE_PROMPT)
+        } else {
+            INLINE_PROMPT.to_string()
+        };
         let opened = ask_and_open(
             &*self.asker,
             root,
             id,
             &self.intro(root),
-            &crate::holder_window::inline_prompt(root, id, INLINE_PROMPT),
+            &question,
             self.policy,
         )?;
         crate::holder_window::after_prompt(

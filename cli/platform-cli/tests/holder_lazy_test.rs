@@ -284,3 +284,118 @@ fn commands_that_need_no_secret_never_contact_a_holder_nor_read_the_vault() {
     plain.finish();
     trap.finish();
 }
+
+/// A fake holder at the endpoint the holder of `b` for the session `sid` would have, which
+/// serves another store: each `Status` it reads is answered with another store's id, so no
+/// command takes it as this store's window. Every connection is counted — those still queued
+/// when it stops too, so a count read after a command ended has no race with its thread.
+struct Elsewhere {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: std::thread::JoinHandle<usize>,
+}
+
+impl Elsewhere {
+    fn at(sp: &Spawn, b: &StoreBinding, sid: i32) -> Elsewhere {
+        use apprafter::holder::protocol::{
+            read_request, write_reply, HolderStatus, Reply, Request, PROTOCOL, VERSION,
+        };
+        let base = sp.path("run").join("apprafter");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&base)
+            .unwrap();
+        // SAFETY: geteuid has no failure mode.
+        let uid = unsafe { libc::geteuid() };
+        let path = match socket_endpoint(&base, &EndpointId::for_session(uid, b, sid)) {
+            Ok(Endpoint::Socket { path, .. }) => path,
+            other => panic!("{other:?}"),
+        };
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let other = if b.id == "0123456789abcdef" {
+            "fedcba9876543210"
+        } else {
+            "0123456789abcdef"
+        };
+        let status = HolderStatus {
+            protocol: PROTOCOL,
+            version: VERSION.into(),
+            store_id: other.into(),
+            vault_id: apprafter_core::vault::VaultId([7; 16]),
+            left_secs: 240,
+            minutes: 5,
+            hardening: apprafter_core::lock::HolderHardening {
+                non_dumpable: Some(true),
+                deny_attach: None,
+                core_off: true,
+                memory_locked: true,
+                process_dacl: None,
+            },
+        };
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped = stop.clone();
+        let thread = std::thread::spawn(move || {
+            let mut count = 0;
+            loop {
+                match listener.accept() {
+                    Ok((mut conn, _)) => {
+                        count += 1;
+                        // macOS hands the listener's O_NONBLOCK to the connection.
+                        conn.set_nonblocking(false).unwrap();
+                        conn.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                        // A macOS client that finds this server is not its binary sends
+                        // nothing and lets go: nothing to answer.
+                        if let Ok(Request::Status) = read_request(&mut conn) {
+                            let _ = write_reply(&mut conn, &Reply::Status(status.clone()));
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if stopped.load(std::sync::atomic::Ordering::SeqCst) {
+                            return count;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(e) => panic!("the fake holder: {e}"),
+                }
+            }
+        });
+        Elsewhere { stop, thread }
+    }
+
+    /// Every connection made so far; the fake stops.
+    fn stop(self) -> usize {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.thread.join().expect("the fake holder")
+    }
+}
+
+/// T-lazy-2 and d4a-h F3: a command with no terminal looks for this terminal's window once —
+/// its session's probe — and asks no holder again before a prompt it cannot show
+/// (`store_locked` follows). F3's ask before a prompt runs only where a prompt is shown: the
+/// macOS leg of the control above ("target ip did not ask for the window", 3 connections for
+/// 2) found it there, where a server that is not this binary reads as no holder at all. Here
+/// the holder serves another store, which reads the same on every OS.
+#[test]
+fn a_command_with_no_terminal_looks_for_its_window_once() {
+    let (sp, b) = store(false);
+    std::fs::create_dir(sp.path("lazy")).unwrap();
+    let mut session = start(
+        &sp,
+        &format!(
+            "D='{}'; read _\n\"$1\" target ip >\"$D/ip.out\" 2>\"$D/ip.err\"; echo \"step: ip $?\"; read _\n",
+            sp.path("lazy").display()
+        ),
+    );
+    let fake = Elsewhere::at(&sp, &b, session.child.id() as i32);
+    session.go();
+    assert_eq!(session.step(), "step: ip 1");
+    let connections = fake.stop();
+    let err = std::fs::read_to_string(sp.path("lazy/ip.err")).unwrap();
+    assert!(err.contains("apprafter::secrets::store_locked"), "{err}");
+    assert_eq!(
+        connections, 1,
+        "a command with no terminal looked for its window more than once:\n{err}"
+    );
+    session.go();
+    session.finish();
+}
