@@ -875,12 +875,28 @@ fn fetch_catalogue_with_retry(
     }
 }
 
+/// What [`prompt_machine`] says when `--no-ping` skips the picker (d4a-h F12): the server type
+/// `--server-type` gave, which the caller saves — its not-validated line follows — or, with
+/// none given, that none is chosen.
+fn no_ping_machine_line(prefill_sku: Option<&str>) -> String {
+    match prefill_sku {
+        Some(sku) => {
+            format!("  machine picker skipped (--no-ping); server type `{sku}` from --server-type")
+        }
+        None => "  machine picker skipped (--no-ping); no server type chosen — pass \
+                 --server-type or set one via `apprafter target machine`, or a fresh provision \
+                 will fail"
+            .to_string(),
+    }
+}
+
 /// Machine-matrix wizard step — replaces the old standalone region picker.
 ///
 /// Returns `(region, server_type)`:
 /// - Under `--no-ping`: skips the API entirely, falls back to the text
 ///   prompt with the `nbg1` default (`prompt_region`), and returns
-///   `(that_region, None)` so `server_type` stays unset.
+///   `(that_region, None)`: no server type is chosen here, and the caller
+///   keeps the one `--server-type` gave (the line printed names it).
 /// - Normal path: fetches the full catalog (`machine::catalogue`, the token
 ///   given), measures latency to each unique location once
 ///   (`machine::region_latencies`), builds `MachineRow`s, and delegates to
@@ -895,11 +911,7 @@ pub fn prompt_machine(
 ) -> CoreResult<(Option<String>, Option<String>)> {
     // H1: --no-ping shunt — do NOT hit the API.
     if no_ping {
-        eprintln!(
-            "  machine picker skipped (--no-ping); no server type chosen — \
-             pass --server-type or set one via `apprafter target machine`, \
-             or a fresh provision will fail"
-        );
+        eprintln!("{}", no_ping_machine_line(prefill_sku));
         let region = prompt_region(
             prefill_region,
             "--region flag",
@@ -2089,6 +2101,22 @@ mod tests {
         .expect("--no-ping must not touch the API");
         assert_eq!(region, Some("hel1".to_string()));
         assert_eq!(sku, None, "no catalog was fetched, so no SKU was chosen");
+    }
+
+    /// d4a-h F12: under `--no-ping` the line names a server type `--server-type` gave — the
+    /// caller saves it (its not-validated line follows) — and says none is chosen only when none
+    /// was given.
+    #[test]
+    fn the_no_ping_machine_line_names_the_server_type_from_the_flag() {
+        assert_eq!(
+            no_ping_machine_line(Some("cpx22")),
+            "  machine picker skipped (--no-ping); server type `cpx22` from --server-type"
+        );
+        assert_eq!(
+            no_ping_machine_line(None),
+            "  machine picker skipped (--no-ping); no server type chosen — pass --server-type or \
+             set one via `apprafter target machine`, or a fresh provision will fail"
+        );
     }
 
     /// Both axes supplied → return them and skip the catalog fetch.

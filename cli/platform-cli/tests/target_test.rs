@@ -1345,6 +1345,54 @@ fn ctrl_c_at_the_renewal_token_prompt_reads_as_cancelled() {
     );
 }
 
+/// d4a-h F12 (harness self-test H-0; matrix C-18): the wizard under `--no-ping` with
+/// `--server-type cpx22` saves that server type, and says so — never that no server type was
+/// chosen; its not-validated line follows.
+#[cfg(unix)]
+#[test]
+fn the_wizard_under_no_ping_names_the_server_type_it_saves() {
+    use common::terminal::Step;
+    let sp = Spawn::new();
+    let key_dir = tempfile::tempdir().unwrap();
+    let key = key_dir.path().join("id_ed25519.pub");
+    std::fs::write(&key, "ssh-ed25519 AAAA test@host\n").unwrap();
+    let token = synthetic_hetzner_token();
+    let key_arg = key.display().to_string();
+    let end = common::terminal::converse_at_terminal(
+        &sp,
+        &[
+            "target",
+            "add",
+            "dev",
+            "--provider",
+            "hetzner-cloud",
+            "--token",
+            &token,
+            "--region",
+            "nbg1",
+            "--tier",
+            "solo",
+            "--server-type",
+            "cpx22",
+            "--ssh-key",
+            &key_arg,
+            "--no-ping",
+        ],
+        &[Step::Expect("target `dev` saved and set as active")],
+    );
+    let shown = &end.terminal;
+    assert_eq!(end.status.code(), Some(0), "{shown}");
+    assert!(!shown.contains("no server type chosen"), "{shown}");
+    assert!(
+        shown
+            .contains("machine picker skipped (--no-ping); server type `cpx22` from --server-type"),
+        "{shown}"
+    );
+    assert!(shown.contains("NOT validated"), "{shown}");
+    let config = std::fs::read_to_string(sp.store().join("targets/dev/config.yaml")).unwrap();
+    assert!(config.contains("server_type: cpx22"), "{config}");
+}
+
 /// WI-480: with no SSH key under `~/.ssh` (a scratch home without `.ssh`) the wizard asks for
 /// a path, "leave empty to skip"; Enter on the empty line skips the key and the wizard goes on
 /// and saves. It used to submit a default `~/.ssh/id_ed25519.pub` that was not there, refuse
