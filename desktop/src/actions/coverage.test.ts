@@ -15,6 +15,15 @@ const coverage = Bun.TOML.parse(
 
 const STATUSES: readonly string[] = ['planned', 'cli-only', 'unavailable', 'superseded'];
 
+/** A planned leaf's slice: a step of the desktop track, with a sub-step letter where the step is split (D.4a, D.4b). */
+const PLANNED_SLICE = /^D\.\d+[a-z]?$/;
+
+test('a planned slice may name a sub-step', () => {
+  const named = (slices: string[]) => slices.filter((s) => PLANNED_SLICE.test(s));
+  expect(named(['D.4', 'D.4a', 'D.4b', 'D.13'])).toEqual(['D.4', 'D.4a', 'D.4b', 'D.13']);
+  expect(named(['D.', 'D.4ab', 'd.4', 'D.4A', '4a'])).toEqual([]);
+});
+
 /** Visible leaves: not hidden, no hidden ancestor, nothing one segment longer below. */
 function visibleLeaves(nodes: Node[]): string[] {
   const key = (p: string[]) => p.join(' ');
@@ -44,7 +53,7 @@ test('each entry is either an action or a status, never both', () => {
       expect({ leaf, known: STATUSES.includes(e.status ?? '') }).toEqual({ leaf, known: true });
     }
     if (e.status === 'planned') {
-      expect({ leaf, slice: /^D\.\d+$/.test(e.slice ?? '') }).toEqual({ leaf, slice: true });
+      expect({ leaf, slice: PLANNED_SLICE.test(e.slice ?? '') }).toEqual({ leaf, slice: true });
     }
   }
 });
@@ -116,9 +125,10 @@ const D4A_LEAVES = [
   ['unlock', 'lock.unlock'],
 ] as const;
 
-// D.4a closes in d4a-h, which adds it to CLOSED_SLICES; until then these five must already be
-// actions in it, so a leaf the app shows is held to its action.
-test('the five lock leaves are actions in D.4a', () => {
+// As for D.3: the closed-slice check above refuses a leaf planned again under D.4a; this test
+// also holds the five leaves to their actions, so one re-planned under another slice (D.4) fails.
+test('D.4a stays closed, and its five leaves stay actions in it', () => {
+  expect(CLOSED_SLICES).toContain('D.4a');
   for (const [leaf, id] of D4A_LEAVES) {
     expect({
       leaf,

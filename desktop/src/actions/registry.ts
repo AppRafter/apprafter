@@ -59,5 +59,6 @@ export const ACTION_COMMANDS: { readonly [K in ActionId]: ApiCommand } = {
 /**
  * Slices whose every leaf is covered: coverage.test.ts fails on a leaf still planned in one.
  * D.3: the target commands, doctor and whoami.
+ * D.4a: the target-store lock (the Security page, Settings › Lock, the lock screen's field).
  */
-export const CLOSED_SLICES: readonly string[] = ['D.3'];
+export const CLOSED_SLICES: readonly string[] = ['D.3', 'D.4a'];
