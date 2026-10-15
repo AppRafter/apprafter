@@ -295,8 +295,9 @@ socket. Common cases: missing directory, wrong permissions
 `cannot read <path>` and the path is the target store's own — its
 root, `targets/` or a folder in it, its `config.yaml` — this account
 cannot read it: most often its permissions, or those of a folder above
-it, do not let it, and `ls -ld` on each shows them. A folder another
-account owns or can change is
+it, do not let it, and `ls -ld` on each shows them. `apprafter doctor`
+says the same in its `Config file readable` row and runs its other checks.
+A folder another account owns or can change is
 [`store_not_private`](#store-not-private) instead. For decode failures on
 target-store files, fix the YAML by hand (they are small files), or
 restore the file from a backup. Otherwise remove that target with
@@ -489,6 +490,7 @@ In AppRafter the same code says that AppRafter holds no key for the store:
 AppRafter locked, or the store was locked from a terminal while AppRafter
 was open. Unlock AppRafter with the lock password or the recovery key, then
 try again.
+
 How a locked store is opened, and in what order:
 [How the store lock works](../how-it-works/the-store-lock.md#opening).
 
