@@ -457,12 +457,13 @@ pub(crate) fn merge_wizard_output(
 
 /// Translate an `inquire` prompt failure raised inside the wizard.
 ///
-/// A Ctrl-C / Esc is a deliberate abort and must read like one; anything else
-/// keeps its underlying detail so a broken terminal is diagnosable.
+/// A Ctrl-C / Esc is a deliberate abort and must read like one — `apprafter::op::cancelled`,
+/// as at the lock prompt, never the catch-all that asks to file an issue (d4a-h F8); anything
+/// else keeps its underlying detail so a broken terminal is diagnosable.
 pub(crate) fn map_wizard_prompt_error(err: inquire::InquireError) -> CliError {
     match err {
         inquire::InquireError::OperationCanceled | inquire::InquireError::OperationInterrupted => {
-            CliError::Other("wizard aborted by user".to_string())
+            CliError::Cancelled
         }
         other => CliError::Other(format!("wizard prompt failed: {other}")),
     }
@@ -1597,28 +1598,34 @@ mod tests {
     // ── prompt error mapping ─────────────────────────────────────────────
 
     /// Ctrl-C / Esc is a deliberate abort in both prompts and must read as
-    /// one; a genuine terminal fault keeps its detail. The two prompts word
-    /// their abort differently on purpose (wizard vs removal), so both are
-    /// pinned.
+    /// one — the typed `apprafter::op::cancelled`, as Ctrl-C at the lock
+    /// prompt reads (d4a-h F8), never the catch-all that asks to file an
+    /// issue; a genuine terminal fault keeps its detail.
     #[test]
     fn cancelling_a_prompt_reads_as_an_abort_in_both_flows() {
         for cancel in [
             inquire::InquireError::OperationCanceled,
             inquire::InquireError::OperationInterrupted,
         ] {
+            let wizard = map_wizard_prompt_error(cancel);
             assert_eq!(
-                format!("{}", map_wizard_prompt_error(cancel)),
-                "wizard aborted by user"
+                miette::Diagnostic::code(&wizard).map(|c| c.to_string()),
+                Some("apprafter::op::cancelled".to_string()),
+                "{wizard:?}"
             );
+            assert!(matches!(wizard, CliError::Cancelled), "{wizard:?}");
         }
         for cancel in [
             inquire::InquireError::OperationCanceled,
             inquire::InquireError::OperationInterrupted,
         ] {
+            let remove = map_remove_prompt_error(cancel);
             assert_eq!(
-                format!("{}", map_remove_prompt_error(cancel)),
-                "remove aborted by user"
+                miette::Diagnostic::code(&remove).map(|c| c.to_string()),
+                Some("apprafter::op::cancelled".to_string()),
+                "{remove:?}"
             );
+            assert!(matches!(remove, CliError::Cancelled), "{remove:?}");
         }
     }
 
@@ -2559,11 +2566,11 @@ pub(crate) fn remove_aborted_line(name: &str) -> String {
 }
 
 /// Translate an `inquire` failure raised by the removal confirmation. A
-/// Ctrl-C is an abort, not a terminal fault.
+/// Ctrl-C is an abort, not a terminal fault: `apprafter::op::cancelled` (d4a-h F8).
 pub(crate) fn map_remove_prompt_error(err: inquire::InquireError) -> CliError {
     match err {
         inquire::InquireError::OperationCanceled | inquire::InquireError::OperationInterrupted => {
-            CliError::Other("remove aborted by user".to_string())
+            CliError::Cancelled
         }
         other => CliError::Other(format!("confirmation prompt failed: {other}")),
     }

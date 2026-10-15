@@ -81,8 +81,8 @@ pub fn run() -> Result<()> {
     // No backtrace is rendered, and there is no knob that turns one
     // on: nothing below enables it, `CliError` captures no
     // `Backtrace`, and `miette::set_panic_hook()` is deliberately
-    // not called (a wizard abort should print "wizard aborted", not
-    // a trace). `RUST_BACKTRACE` therefore does NOT affect rendered
+    // not called (a wizard abort should print "operation cancelled",
+    // not a trace). `RUST_BACKTRACE` therefore does NOT affect rendered
     // diagnostics — an earlier version of this comment said it did,
     // and that claim reached the published docs before being caught.
     // If backtraces are ever wanted, they need a real implementation

@@ -1298,6 +1298,53 @@ fn ssh_key_conversation(sp: &Spawn, steps: &[common::terminal::Step]) -> common:
     common::terminal::converse_at_terminal(sp, &args, steps)
 }
 
+/// d4a-h F8 (matrix C-17, C-12 step 2): Ctrl-C at the renewal wizard's token prompt is the
+/// person's decision — the typed `apprafter::op::cancelled`, as Ctrl-C at the lock prompt
+/// reads — never the catch-all that asks to file an issue; the target is left as it was.
+#[cfg(unix)]
+#[test]
+fn ctrl_c_at_the_renewal_token_prompt_reads_as_cancelled() {
+    use common::terminal::Step;
+    let sp = Spawn::new();
+    cli(&sp)
+        .env("APPRAFTER_NO_PING", "1")
+        .args([
+            "target",
+            "add",
+            "walk",
+            "--provider",
+            "hetzner-cloud",
+            "--token",
+            &synthetic_hetzner_token(),
+            "--region",
+            "nbg1",
+        ])
+        .assert()
+        .success();
+    let creds = sp.store().join("targets/walk/credentials.yaml");
+    let before = std::fs::read(&creds).unwrap();
+    let end = common::terminal::converse_at_terminal(
+        &sp,
+        &["target", "add", "walk", "--renew", "--no-ping"],
+        &[
+            Step::Expect("Hetzner Cloud API token"),
+            // Ctrl-C, as the raw-mode prompt reads it.
+            Step::Type(vec![0x03]),
+        ],
+    );
+    let shown = &end.terminal;
+    assert_eq!(end.status.code(), Some(1), "{shown}");
+    assert!(shown.contains("apprafter::op::cancelled"), "{shown}");
+    assert!(!shown.contains("apprafter::cli::other"), "{shown}");
+    assert!(!shown.contains("catch-all"), "{shown}");
+    assert!(end.restored, "the terminal was not put back");
+    assert_eq!(
+        std::fs::read(&creds).unwrap(),
+        before,
+        "a cancelled renewal changed the token"
+    );
+}
+
 /// WI-480: with no SSH key under `~/.ssh` (a scratch home without `.ssh`) the wizard asks for
 /// a path, "leave empty to skip"; Enter on the empty line skips the key and the wizard goes on
 /// and saves. It used to submit a default `~/.ssh/id_ed25519.pub` that was not there, refuse

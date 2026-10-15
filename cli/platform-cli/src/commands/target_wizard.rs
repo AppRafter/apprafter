@@ -1089,13 +1089,11 @@ fn default_ssh_key_hint(home: Option<&Path>) -> String {
 
 /// Map an `inquire::InquireError` into our own `CliError`. The
 /// most common branch is `OperationCanceled` (user pressed Esc /
-/// Ctrl-C) — we surface that with a non-panicky friendly message
-/// so the user sees "wizard aborted" instead of a backtrace.
+/// Ctrl-C): the typed `apprafter::op::cancelled`, as at the lock
+/// prompt — never the catch-all that asks to file an issue (d4a-h F8).
 fn map_inquire_err(err: InquireError) -> CliError {
     match err {
-        InquireError::OperationCanceled | InquireError::OperationInterrupted => {
-            CliError::Other("wizard aborted by user".to_string())
-        }
+        InquireError::OperationCanceled | InquireError::OperationInterrupted => CliError::Cancelled,
         other => CliError::Other(format!("wizard prompt failed: {other}")),
     }
 }
@@ -2133,19 +2131,24 @@ mod tests {
         assert_eq!(got, Some("regulated".to_string()));
     }
 
-    /// Esc / Ctrl-C is a user decision, not a crash: it maps to a
-    /// plain "aborted" line. Everything else keeps the underlying
+    /// Esc / Ctrl-C is a user decision, not a crash: it maps to the
+    /// typed `apprafter::op::cancelled` (d4a-h F8), never the catch-all
+    /// that asks to file an issue. Everything else keeps the underlying
     /// inquire error so genuine failures stay diagnosable.
     #[test]
     fn map_inquire_err_reports_user_abort_separately_from_real_prompt_failures() {
-        assert_eq!(
-            map_inquire_err(InquireError::OperationCanceled).to_string(),
-            "wizard aborted by user"
-        );
-        assert_eq!(
-            map_inquire_err(InquireError::OperationInterrupted).to_string(),
-            "wizard aborted by user"
-        );
+        for cancel in [
+            InquireError::OperationCanceled,
+            InquireError::OperationInterrupted,
+        ] {
+            let e = map_inquire_err(cancel);
+            assert_eq!(
+                miette::Diagnostic::code(&e).map(|c| c.to_string()),
+                Some("apprafter::op::cancelled".to_string()),
+                "{e:?}"
+            );
+            assert!(matches!(e, CliError::Cancelled), "{e:?}");
+        }
         let other = map_inquire_err(InquireError::NotTTY).to_string();
         assert!(other.starts_with("wizard prompt failed:"), "{other}");
     }
