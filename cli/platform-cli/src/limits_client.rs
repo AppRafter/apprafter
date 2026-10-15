@@ -26,7 +26,7 @@ pub(crate) fn cli_limit_client(env: &dyn EnvSource, terminal: bool) -> LimitClie
             .iter()
             .find(|(var, _)| set(var))
             .map(|(_, name)| (*name).to_string()),
-        x_client: Some(set("WINDOWID")),
+        x_client: Some(env.var("WINDOWID").is_some_and(|v| is_x_window_id(&v))),
         display: display_kind(
             env.var("XDG_SESSION_TYPE").as_deref(),
             set("WAYLAND_DISPLAY"),
@@ -40,6 +40,18 @@ pub(crate) fn cli_limit_client(env: &dyn EnvSource, terminal: bool) -> LimitClie
             agent: ssh_agent_path(env),
         },
     }
+}
+
+/// F14: `WINDOWID` holds a resource id an X server could have issued: decimal, or `0x` hex, and
+/// within the 29 bits the X protocol gives a resource id (its top three bits are always clear).
+/// Konsole exports a Qt pointer there on Wayland too, which is no X id: still a heuristic, but
+/// one that no longer calls a native Wayland terminal an X client.
+fn is_x_window_id(v: &str) -> bool {
+    let id = match v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
+        Some(hex) => u64::from_str_radix(hex, 16).ok(),
+        None => v.parse::<u64>().ok(),
+    };
+    id.is_some_and(|id| id > 0 && id < 1 << 29)
 }
 
 /// The session's display: an X11 session, or Wayland — Xwayland when an X display is there too.
@@ -124,6 +136,36 @@ mod tests {
                 );
             }
             other => panic!("{other:?}"),
+        }
+    }
+
+    /// F14: only a `WINDOWID` an X server could have issued makes the terminal an X client.
+    /// X resource ids are 29 bits (the top three bits clear); Konsole on Wayland exports a Qt
+    /// pointer there (97144953273280 in the walk), which no X server hands out. A hex id counts
+    /// too, so a terminal that writes it that way is never under-warned.
+    #[test]
+    fn a_windowid_counts_only_when_an_x_server_could_have_issued_it() {
+        for (windowid, want) in [
+            ("97144953273280", false),
+            ("18874380", true),
+            ("536870911", true),
+            ("536870912", false),
+            ("0x1200", true),
+            ("0X1200", true),
+            ("0x20000000", false),
+            ("0", false),
+            ("0x0", false),
+            ("", false),
+            ("x", false),
+            ("-5", false),
+            ("18874380 ", false),
+        ] {
+            match cli_limit_client(&MapEnv::new().with("WINDOWID", windowid), true) {
+                LimitClient::Cli {
+                    terminal: Some(t), ..
+                } => assert_eq!(t.x_client, Some(want), "WINDOWID={windowid:?}"),
+                other => panic!("{other:?}"),
+            }
         }
     }
 

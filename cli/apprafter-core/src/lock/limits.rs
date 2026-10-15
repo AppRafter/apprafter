@@ -39,7 +39,9 @@ pub enum LimitClient {
 pub struct TerminalFacts {
     /// `tmux`, `screen`, `zellij`, `wezterm` or `kitty`, when the terminal runs inside one.
     pub multiplexer: Option<String>,
-    /// The terminal is an X client (`WINDOWID` set): a heuristic, UNVERIFIED per terminal.
+    /// The terminal is an X client: its `WINDOWID` is a resource id an X server could have
+    /// issued (F14: Konsole exports a Qt pointer there on Wayland too). A heuristic, UNVERIFIED
+    /// per terminal.
     pub x_client: Option<bool>,
     /// The session's display (`XDG_SESSION_TYPE`, `WAYLAND_DISPLAY`, `DISPLAY`).
     pub display: DisplayKind,
