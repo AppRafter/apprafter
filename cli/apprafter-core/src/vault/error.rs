@@ -28,9 +28,11 @@ pub enum VaultError {
     /// No vault file where one must be: never an empty vault.
     #[error("no vault file at {}", path.display())]
     Missing { path: PathBuf },
-    /// Every slot of this kind failed its key check: the secret is not one of theirs.
-    #[error("this {kind} does not open the vault")]
-    WrongSecret { kind: SlotKind },
+    /// Every slot tried failed its key check: the secret is not one of theirs. `kinds` are
+    /// the kinds tried, in order — one for a secret of one kind; for typed text, the
+    /// lock-password slot's, then this computer's account-password slot's (B27).
+    #[error("this {} does not open the vault", kinds_or(kinds))]
+    WrongSecret { kinds: Vec<SlotKind> },
     /// The secret passed the slot's key check, but the wrapped data key does not decrypt.
     #[error("vault slot {slot} is damaged: the secret is right, the slot does not open")]
     SlotCorrupt { slot: SlotId },
@@ -118,6 +120,14 @@ pub enum VaultError {
     /// A recovery key that does not parse, or is not the one shown.
     #[error(transparent)]
     RecoveryKey(#[from] RecoveryKeyError),
+}
+
+fn kinds_or(kinds: &[SlotKind]) -> String {
+    kinds
+        .iter()
+        .map(SlotKind::to_string)
+        .collect::<Vec<_>>()
+        .join(" or ")
 }
 
 fn kinds_text(kinds: &[SlotKind]) -> String {

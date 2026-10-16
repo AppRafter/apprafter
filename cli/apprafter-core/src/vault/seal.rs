@@ -284,7 +284,7 @@ impl UnlockedVault {
                 (SlotKind::RecoveryKey, body, material, label)
             }
         };
-        let keys = slot_keys(&material, &salt, kind.byte());
+        let keys = slot_keys(&material[..], &salt, kind.byte());
         let aad = slot_aad(&self.header.vault_id, &id, kind, &body);
         let sealed = wrap_data_key(&self.dk, &keys.kek, &aad, &wrap_nonce)?;
         if let SlotBody::Password {
@@ -402,7 +402,7 @@ impl VaultFile {
         if let SlotSecret::Password(password) = secret {
             if password.expose().len() > MAX_PASSWORD_BYTES {
                 // No password slot holds a longer one (`check_new_password`): nothing to derive.
-                return Err(VaultError::WrongSecret { kind });
+                return Err(VaultError::WrongSecret { kinds: vec![kind] });
             }
         }
         let mut refused = None;
@@ -432,13 +432,13 @@ impl VaultFile {
                 _ => continue,
             };
             tried = true;
-            if let Some(dk) = self.try_slot(slot, &material)? {
+            if let Some(dk) = self.try_slot(slot, &material[..])? {
                 return self.open_payload(dk);
             }
         }
         Err(match refused {
             Some(e) if !tried => e,
-            _ => VaultError::WrongSecret { kind },
+            _ => VaultError::WrongSecret { kinds: vec![kind] },
         })
     }
 
@@ -468,11 +468,7 @@ impl VaultFile {
 
     /// `Ok(None)`: the key check says the secret is not this slot's. `Ok(Some(key))`: it is,
     /// and the wrapped key decrypted. `SlotCorrupt`: it is, and the wrapped key did not.
-    fn try_slot(
-        &self,
-        slot: &SlotRecord,
-        material: &[u8; MATERIAL_LEN],
-    ) -> VaultResult<Option<DataKey>> {
+    fn try_slot(&self, slot: &SlotRecord, material: &[u8]) -> VaultResult<Option<DataKey>> {
         let (salt, wrap_nonce, stored_check, wrapped) = match &slot.body {
             SlotBody::Password {
                 salt,
@@ -669,18 +665,27 @@ mod tests {
     fn a_wrong_secret_is_wrong_secret_never_absent() {
         let (bytes, _) = vault();
         let file = VaultFile::parse(&bytes).unwrap();
-        assert!(matches!(
-            file.open(&password("correct horse battery stapler"), FAST),
-            Err(VaultError::WrongSecret {
-                kind: SlotKind::Password
-            })
-        ));
-        assert!(matches!(
-            file.open(&recovery_secret(0x12), FAST),
-            Err(VaultError::WrongSecret {
-                kind: SlotKind::RecoveryKey
-            })
-        ));
+        match file.open(&password("correct horse battery stapler"), FAST) {
+            Err(VaultError::WrongSecret { kinds }) => assert_eq!(kinds, [SlotKind::Password]),
+            other => panic!("{:?}", other.map(|_| "opened")),
+        }
+        match file.open(&recovery_secret(0x12), FAST) {
+            Err(e @ VaultError::WrongSecret { .. }) => {
+                assert!(
+                    matches!(&e, VaultError::WrongSecret { kinds } if *kinds == [SlotKind::RecoveryKey])
+                );
+                assert_eq!(e.to_string(), "this recovery key does not open the vault");
+            }
+            other => panic!("{:?}", other.map(|_| "opened")),
+        }
+        // Two kinds tried (typed text, B27) are named in the order tried.
+        let both = VaultError::WrongSecret {
+            kinds: vec![SlotKind::Password, SlotKind::OsPassword],
+        };
+        assert_eq!(
+            both.to_string(),
+            "this lock password or OS password does not open the vault"
+        );
     }
 
     #[test]

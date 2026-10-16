@@ -192,17 +192,16 @@ pub(crate) struct SlotKeys {
 }
 
 /// `HKDF-SHA256(salt = slot salt, ikm = material)`, expanded twice with the slot kind in the
-/// info (§3.7). The `Hkdf` value — its HMAC state is keyed with the PRK, which hkdf 0.12 cannot
-/// wipe (T29) — lives only until this function returns.
-pub(crate) fn slot_keys(
-    material: &[u8; MATERIAL_LEN],
-    salt: &[u8; SALT_LEN],
-    kind: u8,
-) -> SlotKeys {
+/// info (§3.7). `material` is a slot's bytes before HKDF: 32 for a lock password or a recovery
+/// key, 64 for an account password (Argon2id's output, then the machine secret: D.4b B54).
+/// HKDF takes any length, so the frozen 32-byte vectors keep their keys (B3). The `Hkdf`
+/// value — its HMAC state is keyed with the PRK, which hkdf 0.12 cannot wipe (T29) — lives
+/// only until this function returns.
+pub(crate) fn slot_keys(material: &[u8], salt: &[u8; SALT_LEN], kind: u8) -> SlotKeys {
     const INFO_KEK: &[u8] = b"apprafter-vault/v1/kek/";
     const INFO_CHECK: &[u8] = b"apprafter-vault/v1/key-check/";
     let kind = [kind];
-    let hkdf = hkdf::Hkdf::<sha2::Sha256>::new(Some(&salt[..]), &material[..]);
+    let hkdf = hkdf::Hkdf::<sha2::Sha256>::new(Some(&salt[..]), material);
     let mut kek = Zeroizing::new([0u8; 32]);
     let mut key_check = Zeroizing::new([0u8; 32]);
     hkdf.expand_multi_info(&[INFO_KEK, &kind[..]], &mut kek[..])
@@ -415,7 +414,7 @@ mod tests {
             hex(&keys.key_check[..]),
             "da4ce96dc431ff7760669d76972a74b70060fa5f0c7ddd39ed39a46e28e9d8be"
         );
-        let keys = slot_keys(&seq_array(0x00), &seq_array(0xb8), 0x02);
+        let keys = slot_keys(&seq_array::<32>(0x00), &seq_array(0xb8), 0x02);
         assert_eq!(
             hex(&keys.kek[..]),
             "9564e57beecdb2fbefe4f9e3fb568594732497e82295d0b4c58dfba34fe1c160"
@@ -425,7 +424,7 @@ mod tests {
             "af94e6ba00de085ec7093f25c8089817fded1dec500590a2e35311015c27d99b"
         );
         // The kind is part of the info: the same material keys another kind differently.
-        let other_kind = slot_keys(&seq_array(0x00), &seq_array(0xb8), 0x01);
+        let other_kind = slot_keys(&seq_array::<32>(0x00), &seq_array(0xb8), 0x01);
         assert_ne!(other_kind.kek[..], keys.kek[..]);
     }
 
