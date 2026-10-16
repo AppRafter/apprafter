@@ -259,10 +259,12 @@ pub(crate) fn vault_write_error(root: &Path, e: VaultError) -> CliError {
     }
 }
 
-/// The store root's directory entries — the vault's rename among them — on disk before a
-/// marker or the caller's directory move relies on them (overview §8 risk 10): c1's `replace`
-/// syncs the directory best effort only. A failure is an error, and nothing that relies on the
-/// vault is written. Unix; Windows has no directory fsync (c1's Risks 5).
+/// The store root's directory entries on disk before a marker or the caller's directory move
+/// relies on them (overview §8 risk 10). Since D.4b-b1 the vault's own `replace` is durable
+/// before it returns (B78); this stays every write's last step before its outcome (B51),
+/// for the store's other entries. A failure is an error, and nothing that relies on the vault
+/// is written. Unix; Windows has no directory fsync (c1's Risks 5): there the vault's move is
+/// write-through instead.
 pub(crate) fn sync_root(store: &TargetStorePaths) -> Result<()> {
     #[cfg(unix)]
     {

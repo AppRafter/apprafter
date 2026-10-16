@@ -11,8 +11,11 @@
 //!   `NoReplaceUnsupported`, never a generic I/O error. Windows moves the temp file with
 //!   `MoveFileExW(MOVEFILE_WRITE_THROUGH)` and without `MOVEFILE_REPLACE_EXISTING`: a
 //!   same-volume move keeps the temp file's DACL and fails when the name exists.
-//! - [`replace`] writes every later vault by `std::fs::rename` (never `ReplaceFileW`, which keeps
-//!   the replaced file's DACL); the directory fsync is best effort.
+//! - [`replace`] writes every later vault through [`cli_core::fsutil::rename_durable`] (D.4b
+//!   B78): Unix renames, then fsyncs the directory, an fsync error failing the write; Windows
+//!   moves with `MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)`, retrying a
+//!   vault another program holds open for two seconds and then failing — never `ReplaceFileW`,
+//!   which keeps the replaced file's DACL, nor a rename without write-through.
 //! - The temp file is owner-only before its first byte ([`cli_core::owner_only::create_new`]):
 //!   mode 0600 at `open` on Unix (never a chmod afterwards); on Windows a protected DACL with
 //!   one ACE, full access for the process token's user (`D:P(A;;FA;;;<user SID>)`), set on the
@@ -106,7 +109,9 @@ pub fn write_new(path: &Path, bytes: &[u8], held: &StoreLock) -> VaultResult<()>
     Ok(())
 }
 
-/// Replaces the vault at `path` with `bytes` in one rename.
+/// Replaces the vault at `path` with `bytes` in one move, durable before it returns (B78:
+/// [`cli_core::fsutil::rename_durable`]). An `Err` after the move leaves the new vault in
+/// place, not known to be durable: a caller reports nothing done and reads the vault again.
 pub fn replace(path: &Path, bytes: &[u8], held: &StoreLock) -> VaultResult<()> {
     under_temp(path);
     let dir = prepare(path, held)?;
@@ -115,13 +120,7 @@ pub fn replace(path: &Path, bytes: &[u8], held: &StoreLock) -> VaultResult<()> {
     if STOP_BEFORE_RENAME.with(|stop| stop.replace(false)) {
         return Err(io_error(path, io::Error::from(io::ErrorKind::Interrupted)));
     }
-    if let Err(e) = fs::rename(&tmp, path) {
-        let _ = fs::remove_file(&tmp);
-        return Err(io_error(path, e));
-    }
-    #[cfg(unix)]
-    let _ = sync_dir(&dir);
-    Ok(())
+    cli_core::fsutil::rename_durable(&tmp, path).map_err(|e| io_error(path, e))
 }
 
 /// The lock check and the sweep every write starts with; the vault's directory.
@@ -531,6 +530,41 @@ mod tests {
         ));
         assert_eq!(read(&vault).unwrap(), b"first", "the linked vault stays");
         assert!(temps(dir.path()).is_empty());
+    }
+
+    /// B78: a replace is durable before it returns — its directory fsync failing fails the
+    /// write, the new vault already in place (a caller treats any `Err` as "either may be
+    /// there" and reports nothing done).
+    #[cfg(unix)]
+    #[test]
+    fn a_replace_fails_when_its_directory_cannot_be_synced() {
+        let (dir, lock, vault) = store();
+        write_new(&vault, b"first", &lock).unwrap();
+        cli_core::fsutil::testing::fail_next_dir_sync();
+        assert!(matches!(
+            replace(&vault, b"second", &lock),
+            Err(VaultError::Io { .. })
+        ));
+        assert_eq!(read(&vault).unwrap(), b"second", "moved, not known durable");
+        assert!(temps(dir.path()).is_empty());
+    }
+
+    /// B78 on Windows: the vault's replace moves with write-through.
+    #[cfg(windows)]
+    #[test]
+    fn replace_moves_with_write_through() {
+        use windows_sys::Win32::Storage::FileSystem::{
+            MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+        };
+        let (_dir, lock, vault) = store();
+        write_new(&vault, b"first", &lock).unwrap();
+        let _ = cli_core::fsutil::testing::take_moves();
+        replace(&vault, b"second", &lock).unwrap();
+        assert_eq!(
+            cli_core::fsutil::testing::take_moves(),
+            [MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH]
+        );
+        assert_eq!(read(&vault).unwrap(), b"second");
     }
 
     #[cfg(windows)]
