@@ -195,27 +195,35 @@ jobs:
   # This job passes when every leg passed, or when the matrix was skipped
   # because nothing under cli/ changed, and fails otherwise. "Skipped" is
   # only that when the change detection itself succeeded: a failed
-  # `changes` job skips the matrix too, and must not read as a pass.
+  # `changes` job skips the matrix too, and must not read as a pass. It
+  # also stands for os-slots-linux and os-slots-macos, the CLI's other test
+  # jobs (real PAM and macOS accounts), as rust-desktop-result stands for
+  # osauth-linux.
   rust-cli-result:
     name: cargo test cli/
-    needs: [changes, rust-cli]
+    needs: [changes, rust-cli, os-slots-linux, os-slots-macos]
     if: always() && github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
-      - name: every leg of the matrix passed
+      - name: every CLI test job passed
         env:
           CHANGES: ${{ needs.changes.result }}
           RESULT: ${{ needs.rust-cli.result }}
+          OS_SLOTS_LINUX: ${{ needs.os-slots-linux.result }}
+          OS_SLOTS_MACOS: ${{ needs.os-slots-macos.result }}
         run: |
-          echo "changes: $CHANGES, rust-cli: $RESULT"
+          echo "changes: $CHANGES, rust-cli: $RESULT," \
+            "os-slots-linux: $OS_SLOTS_LINUX, os-slots-macos: $OS_SLOTS_MACOS"
           if [ "$CHANGES" != success ]; then
             exit 1
           fi
-          case "$RESULT" in
-            success | skipped) ;;
-            *) exit 1 ;;
-          esac
+          for result in "$RESULT" "$OS_SLOTS_LINUX" "$OS_SLOTS_MACOS"; do
+            case "$result" in
+              success | skipped) ;;
+              *) exit 1 ;;
+            esac
+          done
 
   # The account-password check of cli/os-slots (D.4b-d) against the real PAM stacks of Debian 13
   # and Fedora 42, as a normal user, in throwaway containers: every case of
