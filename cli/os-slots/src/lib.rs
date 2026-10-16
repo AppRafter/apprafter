@@ -16,6 +16,7 @@
 //! Nothing here depends on AppRafter's other crates, and `apprafter-core` never names this one
 //! (ADR 0067 §2): `platform-cli` and the desktop map its answers to the core's types.
 
+pub mod account;
 pub mod machine;
 #[cfg(target_os = "macos")]
 mod macos;
