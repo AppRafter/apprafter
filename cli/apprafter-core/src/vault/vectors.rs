@@ -27,6 +27,14 @@ use crate::context::SecretString;
 /// not only review.
 const V1_SHA256: &[(&str, &str)] = &[
     (
+        "created-with/inputs.json",
+        "f25a4ed80a25c9a3de0e595f9038815195cd46ad160e1eb6f90b937e935b416c",
+    ),
+    (
+        "created-with/vault",
+        "16be7d470ff0c9be8bd35c3c234cfa87aa997f0e4320cd91f6de8088dc69af03",
+    ),
+    (
         "fast-params/inputs.json",
         "7f660d17b66b7dab8435a5edecbef93c9388af36cf7ad9e0ad78f673e3f65281",
     ),
@@ -37,6 +45,14 @@ const V1_SHA256: &[(&str, &str)] = &[
     (
         "fast-params/vault",
         "ac2a0a30bb39155bb605cde1455aa7c89517675f64e448409570f3ec40d26c79",
+    ),
+    (
+        "os-password/inputs.json",
+        "aae7ae822a97279f004642d6fd98ac00ceb74cc5391e3826acb965a477336107",
+    ),
+    (
+        "os-password/vault",
+        "722052a95da29523755b1ebb9e9c6d8d878e475028c780e05d38a04283752d76",
     ),
     (
         "password-recovery/inputs.json",
