@@ -237,6 +237,24 @@ jobs:
           PODMAN: sudo podman
         run: bash scripts/test-os-slots-linux.sh
 
+  # The macOS route of the account-password check (D.4b-d; GOTCHA-327: the PAM service
+  # chkpasswd) against accounts this job makes on a GitHub-hosted runner: every case of
+  # cli/os-slots/tests/macos_real.rs, through scripts/test-os-slots-macos.sh, which refuses to
+  # run anywhere else because it creates accounts.
+  os-slots-macos:
+    name: account-password check on macOS (accounts the job makes)
+    needs: changes
+    if: needs.changes.outputs.rust_cli == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: "1.98"
+      - name: macOS cases
+        run: bash scripts/test-os-slots-macos.sh
+
   # AppRafter Desktop (ADR 0067) ships for Linux, macOS and Windows, so it is
   # tested and built on all three. fail-fast off for the reason rust-cli gives.
   rust-desktop:
