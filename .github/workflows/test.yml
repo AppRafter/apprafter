@@ -43,6 +43,8 @@ jobs:
           filters: |
             rust_cli:
               - 'cli/**'
+              - 'scripts/test-os-slots-linux.sh'
+              - 'scripts/test-os-slots-macos.sh'
               - '.github/workflows/test.yml'
             rust_operator:
               - 'operator/**'
@@ -214,6 +216,26 @@ jobs:
             success | skipped) ;;
             *) exit 1 ;;
           esac
+
+  # The account-password check of cli/os-slots (D.4b-d) against the real PAM stacks of Debian 13
+  # and Fedora 42, as a normal user, in throwaway containers: every case of
+  # cli/os-slots/tests/pam_container.rs, through the same script a developer runs. The script
+  # fails, never skips, when podman is missing. Rootful podman, as osauth-linux runs it.
+  os-slots-linux:
+    name: account-password check on Linux (PAM containers)
+    needs: changes
+    if: needs.changes.outputs.rust_cli == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: "1.98"
+      - name: PAM cases, Debian and Fedora
+        env:
+          PODMAN: sudo podman
+        run: bash scripts/test-os-slots-linux.sh
 
   # AppRafter Desktop (ADR 0067) ships for Linux, macOS and Windows, so it is
   # tested and built on all three. fail-fast off for the reason rust-cli gives.
