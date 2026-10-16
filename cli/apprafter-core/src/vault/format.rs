@@ -42,6 +42,9 @@ pub const VAULT_FILE_MAX: usize = 2 * 1024 * 1024;
 pub const PAYLOAD_MAX: usize = 1024 * 1024;
 /// The writer field: `apprafter <version>` or `apprafter-desktop <version>`, at most 64 bytes.
 pub const WRITER_MAX: usize = 64;
+/// The bytes before a vault's id ends, at most (D.4b B8): the magic, the version, the
+/// writer's length and a writer of [`WRITER_MAX`] bytes, the flags, the id.
+pub(crate) const VAULT_ID_PREFIX_MAX: usize = MAGIC.len() + 2 + 1 + WRITER_MAX + 2 + 16;
 /// The store id field: `store.yaml`'s `id`, at most 64 bytes.
 pub const STORE_ID_MAX: usize = 64;
 /// At most 16 slots.
@@ -421,26 +424,7 @@ impl VaultFile {
         if bytes.len() > VAULT_FILE_MAX {
             return Err(malformed(MalformedWhat::TooLarge, VAULT_FILE_MAX));
         }
-        if bytes.len() < MAGIC.len() || bytes[..MAGIC.len()] != MAGIC[..] {
-            return Err(VaultError::NotAVault);
-        }
-        let mut r = Reader::new(bytes, MAGIC.len());
-        let format_version = r.u16()?;
-        let writer_at = r.pos;
-        let writer_len = usize::from(r.u8()?);
-        let writer =
-            check_writer(r.take(writer_len)?).map_err(|what| malformed(what, writer_at))?;
-        if format_version != FORMAT_V1 {
-            return Err(VaultError::UnsupportedVersion {
-                found: format_version,
-                writer,
-            });
-        }
-        let flags_at = r.pos;
-        if r.u16()? != 0 {
-            return Err(malformed(MalformedWhat::Flags, flags_at));
-        }
-        let vault_id = VaultId(r.array()?);
+        let (mut r, format_version, writer, vault_id) = read_prefix(bytes)?;
         let store_at = r.pos;
         let store_len = usize::from(r.u8()?);
         let store_id =
@@ -500,6 +484,38 @@ impl VaultFile {
         out.extend_from_slice(&self.payload_ct);
         Ok(out)
     }
+}
+
+/// The frozen prefix as far as the vault id — magic, version, writer, flags, id — each checked
+/// as [`VaultFile::parse`] checks it, in its order; the reader is left after the id. What a
+/// reader of the id alone needs (B8): at most [`VAULT_ID_PREFIX_MAX`] bytes.
+fn read_prefix(bytes: &[u8]) -> VaultResult<(Reader<'_>, u16, String, VaultId)> {
+    if bytes.len() < MAGIC.len() || bytes[..MAGIC.len()] != MAGIC[..] {
+        return Err(VaultError::NotAVault);
+    }
+    let mut r = Reader::new(bytes, MAGIC.len());
+    let format_version = r.u16()?;
+    let writer_at = r.pos;
+    let writer_len = usize::from(r.u8()?);
+    let writer = check_writer(r.take(writer_len)?).map_err(|what| malformed(what, writer_at))?;
+    if format_version != FORMAT_V1 {
+        return Err(VaultError::UnsupportedVersion {
+            found: format_version,
+            writer,
+        });
+    }
+    let flags_at = r.pos;
+    if r.u16()? != 0 {
+        return Err(malformed(MalformedWhat::Flags, flags_at));
+    }
+    let vault_id = VaultId(r.array()?);
+    Ok((r, format_version, writer, vault_id))
+}
+
+/// The vault id of a file's first bytes, read and checked as far as the id and no further
+/// (B8): **not authenticated** — a forged one can only end a window or lock the app.
+pub(crate) fn vault_id_of_prefix(bytes: &[u8]) -> VaultResult<VaultId> {
+    read_prefix(bytes).map(|(_, _, _, vault_id)| vault_id)
 }
 
 fn malformed(what: MalformedWhat, offset: usize) -> VaultError {
@@ -1160,6 +1176,29 @@ mod tests {
                 what: MalformedWhat::BodyLength,
                 ..
             })
+        ));
+    }
+
+    /// B8: the vault id ends at most 93 bytes in; the prefix alone names it.
+    #[test]
+    fn the_vault_id_is_read_from_the_prefix_alone() {
+        assert_eq!(VAULT_ID_PREFIX_MAX, 93);
+        let mut header = three_slot_header();
+        header.writer = "w".repeat(WRITER_MAX);
+        let bytes = file(&header);
+        let end = 8 + 2 + 1 + WRITER_MAX + 2 + 16;
+        assert_eq!(vault_id_of_prefix(&bytes[..end]).unwrap(), header.vault_id);
+        assert_eq!(vault_id_of_prefix(&bytes).unwrap(), header.vault_id);
+        assert!(matches!(
+            vault_id_of_prefix(&bytes[..end - 1]),
+            Err(VaultError::Malformed {
+                what: MalformedWhat::Truncated,
+                ..
+            })
+        ));
+        assert!(matches!(
+            vault_id_of_prefix(&bytes[..7]),
+            Err(VaultError::NotAVault)
         ));
     }
 

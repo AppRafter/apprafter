@@ -2613,6 +2613,28 @@ fn f(p: &std::path::Path, b: &[u8]) {
         assert_eq!(doors, vec!["crate::vault::file", "crate::vault::VaultFile"]);
     }
 
+    /// D.4b B8: a client reads a vault's id through `secrets`, which is no vault door, while
+    /// a door named beside it is still seen (a scanner that over- or under-matches fails
+    /// this: critic round, finding 6).
+    #[test]
+    fn the_vault_id_on_disk_is_no_vault_door() {
+        let src = "\
+use apprafter_core::secrets::vault_id_on_disk;
+use apprafter_core::vault::{self, VaultId};
+fn f(p: &std::path::Path) -> Option<VaultId> {
+    let _ = vault::file::read(p);
+    vault_id_on_disk(p).ok().flatten()
+}
+";
+        let doors: Vec<String> = scan_source(Path::new("x.rs"), src)
+            .findings
+            .into_iter()
+            .filter(|f| f.kind == Kind::VaultDoor)
+            .map(|f| f.callee)
+            .collect();
+        assert_eq!(doors, vec!["apprafter_core::vault::file"]);
+    }
+
     /// The lock flows' file doors are seen through `{self, …}` imports too (critic finding 9).
     #[test]
     fn a_transfer_door_is_seen_through_its_import() {

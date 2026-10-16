@@ -46,6 +46,7 @@ pub use error::{
     InputWhat, MalformedWhat, PasswordProblem, PayloadWhat, RecoveryKeyError, SizeWhat, VaultError,
     VaultResult,
 };
+pub(crate) use format::{vault_id_of_prefix, VAULT_ID_PREFIX_MAX};
 pub use format::{
     SlotBody, SlotId, SlotKind, SlotRecord, VaultFile, VaultHeader, VaultId, FORMAT_V1, LABEL_MAX,
     MAGIC, PAYLOAD_MAX, SLOT_AAD_DOMAIN, SLOT_MAX, STORE_ID_MAX, VAULT_FILE_MAX, WRITER_MAX,

@@ -65,6 +65,8 @@ pub use store_file::{
     STORE_FILE_FORMAT,
 };
 
+/// A vault's id from its first bytes, for a holder's watch and the desktop's re-read (D.4b B8).
+pub use locked::vault_id_on_disk;
 /// The vault boundary the lock flows share with the store (D.4a d).
 pub(crate) use locked::{
     not_kept, read_vault, sync_root, vault_error, vault_path, vault_write_error,
