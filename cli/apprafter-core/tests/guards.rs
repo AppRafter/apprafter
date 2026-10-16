@@ -1594,6 +1594,7 @@ const CLI_MEMBERS: &[&str] = &[
     "apprafter-core",
     "backup-core",
     "apprafter-backup",
+    "os-slots",
 ];
 
 /// What builds a context from, or looks a location up in, the real environment of whoever runs
