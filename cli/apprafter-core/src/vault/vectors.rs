@@ -72,6 +72,30 @@ const V1_SHA256: &[(&str, &str)] = &[
         "8e8baeea07d44cda8f66d16ca530e42d450de5c318d7d414ada190dc9acbd5f6",
     ),
     (
+        "rotated/after/vault",
+        "5b0fefc4f15e8d2cbe74160fa398c43d3951280a35969917da119fb69784c214",
+    ),
+    (
+        "rotated/before/vault",
+        "60013b7a5713cbe65733517ec83c8ede0ae45ee4b87fcc1e644786f6d6fcfbea",
+    ),
+    (
+        "rotated/cache-new.age",
+        "cef9eea076c3b8ab53b7e8fef200a7744111f8532b5d4e974b67a54971ed0064",
+    ),
+    (
+        "rotated/cache-old.age",
+        "825f7a4a043ad86bb19f75e5401dc9e90942f1aa4fef2c3ae071ef4917152008",
+    ),
+    (
+        "rotated/inputs.json",
+        "2d5f6eccbb73c65412875e996cd50ce56e989594cc4ed1fd3a5cdf5bb840d6e8",
+    ),
+    (
+        "rotated/mid/vault",
+        "313296b3f1b83fb0bda41f172204e59bedbe55668fa602cf4b67034e253bf075",
+    ),
+    (
         "unknown-entry/inputs.json",
         "6147ef04eb16c44b419b0dbac6f247fb50e2672496281bbc2e1a92fa94ae0083",
     ),
