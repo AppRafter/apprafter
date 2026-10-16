@@ -70,8 +70,15 @@ PASSWORD="Os-slots-$(openssl rand -hex 8)!"
 UUID="$(ioreg -rd1 -c IOPlatformExpertDevice | awk -F'"' '/IOPlatformUUID/ {print $4}')"
 [[ "$UUID" =~ ^[0-9A-F-]{36}$ ]] || die "no hardware UUID from ioreg: '$UUID'"
 for account in walker walker2; do
-    sudo sysadminctl -addUser "$account" -fullName "AppRafter os-slots test" -password "$PASSWORD" \
-        -home "/Users/$account" -shell /bin/zsh >/dev/null 2>&1
+    # Each account its own full name: macOS refuses an account whose full name another already
+    # has, and sysadminctl says so only in its output (it exits 0 either way), so every account
+    # is read back before a case runs as it.
+    sudo sysadminctl -addUser "$account" -fullName "AppRafter os-slots test $account" \
+        -password "$PASSWORD" -home "/Users/$account" -shell /bin/zsh >"$work/add-$account.log" 2>&1
+    dscl . -read "/Users/$account" UniqueID >/dev/null 2>&1 || {
+        cat "$work/add-$account.log" >&2
+        die "sysadminctl did not create the account $account"
+    }
     sudo createhomedir -c -u "$account" >/dev/null
 done
 sudo touch /Users/walker/.apprafter-test-account
