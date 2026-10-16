@@ -3000,80 +3000,148 @@ const INSECURE_KDF_FEATURE: &str = "insecure-fast-kdf";
 /// feature that exists.
 const INSECURE_KDF_FORWARDERS: &[(&str, &str)] = &[("desktop/src-tauri/Cargo.toml", "test-build")];
 
-/// Where a manifest turns `apprafter-core/insecure-fast-kdf` on outside `[dev-dependencies]`:
-/// a dependency edge on apprafter-core that lists it (in `[dependencies]`,
-/// `[build-dependencies]`, `[workspace.dependencies]` or a target table; renamed or not), a
-/// feature that forwards it (other than [`INSECURE_KDF_FORWARDERS`]), or — in apprafter-core's
-/// own manifest — another feature, `default` included, that pulls it in.
+/// A feature that must stay in tests: the package that declares it, its name, and the
+/// `(manifest, feature)` pairs allowed to forward it (each must name a feature that exists).
+struct FeatureRule {
+    package: &'static str,
+    feature: &'static str,
+    forwarders: &'static [(&'static str, &'static str)],
+}
+
+/// L4 (D.4a T23).
+const INSECURE_KDF: FeatureRule = FeatureRule {
+    package: "apprafter-core",
+    feature: INSECURE_KDF_FEATURE,
+    forwarders: INSECURE_KDF_FORWARDERS,
+};
+
+/// G-OS2 (D.4b B43): the os-slots stand-ins (`ScriptedAccountPassword`) reach no shipped build.
+/// `platform-cli`'s `test-os-slots` (d4b-e1a) and the desktop's test build (d4b-g1b) join
+/// `forwarders` when they forward it; e1a adds the rule for `test-os-slots` itself.
+const OS_SLOTS_TEST_SUPPORT: FeatureRule = FeatureRule {
+    package: "apprafter-os-slots",
+    feature: "test-support",
+    forwarders: &[],
+};
+
+/// L4's rule over one manifest.
 fn insecure_kdf_edges(file: &str, manifest: &str) -> Vec<String> {
+    feature_edges(&INSECURE_KDF, file, manifest)
+}
+
+/// Where a manifest turns `rule`'s feature on outside `[dev-dependencies]`: a dependency edge on
+/// its package that lists it (in `[dependencies]`, `[build-dependencies]`,
+/// `[workspace.dependencies]` or a target table; renamed or not), a feature that forwards it
+/// (other than the rule's forwarders), or — in the package's own manifest — another feature,
+/// `default` included, that pulls it in.
+fn feature_edges(rule: &FeatureRule, file: &str, manifest: &str) -> Vec<String> {
     let doc: toml::Value = manifest
         .parse()
         .unwrap_or_else(|e| panic!("{file} does not parse: {e}"));
-    let is_core = doc
+    let is_owner = doc
         .get("package")
         .and_then(|p| p.get("name"))
         .and_then(|n| n.as_str())
-        == Some("apprafter-core");
-    let mut tables: Vec<(String, &toml::Value)> = Vec::new();
-    for key in ["dependencies", "build-dependencies"] {
-        if let Some(table) = doc.get(key) {
-            tables.push((key.to_string(), table));
-        }
-    }
-    if let Some(table) = doc.get("workspace").and_then(|w| w.get("dependencies")) {
-        tables.push(("workspace.dependencies".to_string(), table));
-    }
-    if let Some(targets) = doc.get("target").and_then(|t| t.as_table()) {
-        for (cfg, target) in targets {
-            for key in ["dependencies", "build-dependencies"] {
-                if let Some(table) = target.get(key) {
-                    tables.push((format!("target.{cfg}.{key}"), table));
-                }
-            }
-        }
-    }
+        == Some(rule.package);
     let mut hits = Vec::new();
-    for (place, table) in tables {
-        let Some(table) = table.as_table() else {
-            continue;
-        };
+    for (place, table) in dependency_tables(&doc, false) {
         for (name, spec) in table {
             let package = spec.get("package").and_then(|p| p.as_str()).unwrap_or(name);
             let enables = spec
                 .get("features")
                 .and_then(|f| f.as_array())
-                .is_some_and(|list| {
-                    list.iter()
-                        .any(|f| f.as_str() == Some(INSECURE_KDF_FEATURE))
-                });
-            if package == "apprafter-core" && enables {
+                .is_some_and(|list| list.iter().any(|f| f.as_str() == Some(rule.feature)));
+            if package == rule.package && enables {
                 hits.push(format!(
-                    "{file}: [{place}] `{name}` enables {INSECURE_KDF_FEATURE}"
+                    "{file}: [{place}] `{name}` enables {}",
+                    rule.feature
                 ));
             }
         }
     }
     if let Some(features) = doc.get("features").and_then(|f| f.as_table()) {
         let forwarded = [
-            format!("apprafter-core/{INSECURE_KDF_FEATURE}"),
-            format!("apprafter-core?/{INSECURE_KDF_FEATURE}"),
+            format!("{}/{}", rule.package, rule.feature),
+            format!("{}?/{}", rule.package, rule.feature),
         ];
         for (feature, list) in features {
             let forwards = list.as_array().into_iter().flatten().any(|item| {
                 let item = item.as_str().unwrap_or_default();
-                forwarded.iter().any(|f| f == item) || (is_core && item == INSECURE_KDF_FEATURE)
+                forwarded.iter().any(|f| f == item) || (is_owner && item == rule.feature)
             });
-            let allowed = INSECURE_KDF_FORWARDERS
+            let allowed = rule
+                .forwarders
                 .iter()
                 .any(|(f, feat)| *f == file && *feat == feature.as_str());
             if forwards && !allowed {
                 hits.push(format!(
-                    "{file}: feature `{feature}` enables {INSECURE_KDF_FEATURE}"
+                    "{file}: feature `{feature}` enables {}",
+                    rule.feature
                 ));
             }
         }
     }
     hits
+}
+
+/// A manifest's dependency tables as `(place, table)`: `[dependencies]`,
+/// `[build-dependencies]`, with `dev` also `[dev-dependencies]`, their target forms, and
+/// `[workspace.dependencies]`.
+fn dependency_tables(doc: &toml::Value, dev: bool) -> Vec<(String, &toml::value::Table)> {
+    let kinds: &[&str] = if dev {
+        &["dependencies", "build-dependencies", "dev-dependencies"]
+    } else {
+        &["dependencies", "build-dependencies"]
+    };
+    let mut tables = Vec::new();
+    for key in kinds {
+        if let Some(table) = doc.get(*key).and_then(|t| t.as_table()) {
+            tables.push(((*key).to_string(), table));
+        }
+    }
+    if let Some(table) = doc
+        .get("workspace")
+        .and_then(|w| w.get("dependencies"))
+        .and_then(|t| t.as_table())
+    {
+        tables.push(("workspace.dependencies".to_string(), table));
+    }
+    if let Some(targets) = doc.get("target").and_then(|t| t.as_table()) {
+        for (cfg, target) in targets {
+            for key in kinds {
+                if let Some(table) = target.get(*key).and_then(|t| t.as_table()) {
+                    tables.push((format!("target.{cfg}.{key}"), table));
+                }
+            }
+        }
+    }
+    tables
+}
+
+/// Every `Cargo.toml` under `cli/` and `desktop/` (as [`manifests_under`] finds them), as
+/// (its path from the repository root, its text).
+fn every_manifest() -> Vec<(String, String)> {
+    let repo = cli_dir()
+        .parent()
+        .expect("cli/ sits in the repository")
+        .to_path_buf();
+    let mut paths = Vec::new();
+    for dir in ["cli", "desktop"] {
+        manifests_under(&repo.join(dir), &mut paths);
+    }
+    paths.sort();
+    paths
+        .into_iter()
+        .map(|path| {
+            let rel = path
+                .strip_prefix(&repo)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {rel}: {e}"));
+            (rel, text)
+        })
+        .collect()
 }
 
 /// Every `Cargo.toml` under `dir`, build output, `node_modules` and dot-directories left out.
@@ -3430,5 +3498,155 @@ mod tests {
         );
         assert!(hits.is_empty(), "{hits:?}");
         assert_eq!(ct_eq, 0);
+    }
+}
+
+// ---------------------------------------------------------------------
+// G-OS2 (D.4b B43): the os-slots stand-ins stay in tests
+// ---------------------------------------------------------------------
+
+#[test]
+fn the_os_slots_stand_ins_reach_no_shipped_build() {
+    let manifests = every_manifest();
+    let hits: Vec<String> = manifests
+        .iter()
+        .flat_map(|(rel, text)| feature_edges(&OS_SLOTS_TEST_SUPPORT, rel, text))
+        .collect();
+    assert!(
+        hits.is_empty(),
+        "the os-slots stand-ins must never reach a shipped build (D.4b B43, G-OS2):\n{}",
+        hits.join("\n")
+    );
+    let (_, own) = manifests
+        .iter()
+        .find(|(rel, _)| rel == "cli/os-slots/Cargo.toml")
+        .expect("cli/os-slots/Cargo.toml is there");
+    let doc: toml::Value = own.parse().unwrap();
+    assert!(
+        doc.get("features")
+            .and_then(|f| f.get(OS_SLOTS_TEST_SUPPORT.feature))
+            .is_some(),
+        "apprafter-os-slots declares no `test-support`: this guard would see nothing"
+    );
+    for (file, feature) in OS_SLOTS_TEST_SUPPORT.forwarders {
+        let (_, text) = manifests
+            .iter()
+            .find(|(rel, _)| rel == file)
+            .unwrap_or_else(|| panic!("{file} is gone: a stale forwarder"));
+        let doc: toml::Value = text.parse().unwrap();
+        assert!(
+            doc.get("features").and_then(|f| f.get(*feature)).is_some(),
+            "{file} has no feature `{feature}`: a stale forwarder"
+        );
+    }
+}
+
+mod os_slots_test_support {
+    use super::*;
+
+    fn edges(file: &str, manifest: &str) -> usize {
+        feature_edges(&OS_SLOTS_TEST_SUPPORT, file, manifest).len()
+    }
+
+    #[test]
+    fn a_dev_dependency_may_enable_it_and_nothing_else_may() {
+        let dev = "[dev-dependencies]\napprafter-os-slots = { path = \"x\", features = [\"test-support\"] }\n";
+        assert_eq!(edges("cli/x/Cargo.toml", dev), 0);
+        for m in [
+            "[dependencies]\napprafter-os-slots = { path = \"x\", features = [\"test-support\"] }\n",
+            "[target.'cfg(unix)'.dependencies]\nslots = { package = \"apprafter-os-slots\", path = \"x\", features = [\"test-support\"] }\n",
+            "[features]\nwalk = [\"apprafter-os-slots/test-support\"]\n",
+            "[package]\nname = \"apprafter-os-slots\"\n[features]\ntest-support = []\ndefault = [\"test-support\"]\n",
+        ] {
+            assert_eq!(edges("cli/x/Cargo.toml", m), 1, "{m}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// G-OS4 (D.4b B17), its crate rule: what reaches PAM, the Keychain or LocalAuthentication
+// ---------------------------------------------------------------------
+
+/// Crates that reach the OS's authentication APIs, and the manifests allowed to depend on
+/// them: D.2's PAM (`nonstick`) and LocalAuthentication stay in `desktop/os-auth`;
+/// `apprafter-os-slots` loads libpam by `dlopen` through `libc` and needs none of them.
+const OS_AUTH_CRATES: &[(&str, &[&str])] = &[
+    ("nonstick", &["desktop/os-auth/Cargo.toml"]),
+    ("libpam-sys", &["desktop/os-auth/Cargo.toml"]),
+    (
+        "objc2-local-authentication",
+        &["desktop/os-auth/Cargo.toml"],
+    ),
+    ("pam", &[]),
+    ("pam-sys", &[]),
+    ("pam-client", &[]),
+    ("libloading", &[]),
+    ("security-framework", &[]),
+    ("keyring", &[]),
+    ("objc2-security", &[]),
+];
+
+/// A manifest's dependencies on [`OS_AUTH_CRATES`] it may not have, in any table, renamed or
+/// not.
+fn os_auth_dependencies(file: &str, manifest: &str) -> Vec<String> {
+    let doc: toml::Value = manifest
+        .parse()
+        .unwrap_or_else(|e| panic!("{file} does not parse: {e}"));
+    let mut hits = Vec::new();
+    for (place, table) in dependency_tables(&doc, true) {
+        for (name, spec) in table {
+            let package = spec.get("package").and_then(|p| p.as_str()).unwrap_or(name);
+            let rule = OS_AUTH_CRATES.iter().find(|(krate, _)| *krate == package);
+            if let Some((krate, allowed)) = rule {
+                if !allowed.contains(&file) {
+                    hits.push(format!("{file}: [{place}] depends on `{krate}`"));
+                }
+            }
+        }
+    }
+    hits
+}
+
+#[test]
+fn os_authentication_crates_stay_in_the_os_crates() {
+    let manifests = every_manifest();
+    let hits: Vec<String> = manifests
+        .iter()
+        .flat_map(|(rel, text)| os_auth_dependencies(rel, text))
+        .collect();
+    assert!(
+        hits.is_empty(),
+        "a crate that reaches PAM, the Keychain or LocalAuthentication outside desktop/os-auth \
+         (D.4b B17, G-OS4; the CLI loads libpam by dlopen):\n{}",
+        hits.join("\n")
+    );
+    let (_, os_auth) = manifests
+        .iter()
+        .find(|(rel, _)| rel == "desktop/os-auth/Cargo.toml")
+        .expect("desktop/os-auth/Cargo.toml is there");
+    assert!(
+        !os_auth_dependencies("cli/x/Cargo.toml", os_auth).is_empty(),
+        "desktop/os-auth depends on none of OS_AUTH_CRATES any more: this guard tells nothing apart"
+    );
+}
+
+mod os_auth_crates {
+    use super::*;
+
+    #[test]
+    fn a_dependency_on_an_os_auth_crate_is_seen_in_every_table() {
+        for m in [
+            "[dependencies]\nnonstick = \"0.1\"\n",
+            "[dev-dependencies]\nnonstick = \"0.1\"\n",
+            "[build-dependencies]\nlibloading = \"0.8\"\n",
+            "[target.'cfg(unix)'.dependencies]\nn = { package = \"nonstick\", version = \"0.1\" }\n",
+            "[workspace.dependencies]\nsecurity-framework = \"3\"\n",
+        ] {
+            assert_eq!(os_auth_dependencies("cli/x/Cargo.toml", m).len(), 1, "{m}");
+        }
+        let allowed = "[dependencies]\nnonstick = \"0.1\"\n";
+        assert!(os_auth_dependencies("desktop/os-auth/Cargo.toml", allowed).is_empty());
+        let other = "[dependencies]\nnonstickier = \"1\"\n";
+        assert!(os_auth_dependencies("cli/x/Cargo.toml", other).is_empty());
     }
 }
