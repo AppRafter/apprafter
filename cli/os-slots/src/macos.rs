@@ -33,6 +33,28 @@ pub(crate) fn hardware_uuid() -> Result<MachineId, NoMachineId> {
     out
 }
 
+/// `confstr(_CS_DARWIN_USER_TEMP_DIR)`: this account's temporary directory, which follows
+/// neither `HOME` nor `TMPDIR` (GOTCHA-328). The back-off's record lives there.
+pub(crate) fn darwin_user_temp_dir() -> Option<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut buffer = vec![0_u8; 1024];
+    // SAFETY: `buffer` is writable for its length; confstr writes at most that many bytes, NUL
+    // included, and returns the length it needs (0 on an error).
+    let needed = unsafe {
+        libc::confstr(
+            libc::_CS_DARWIN_USER_TEMP_DIR,
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+        )
+    };
+    if needed == 0 || needed > buffer.len() {
+        return None;
+    }
+    // Absolute only, as cli-core's twin (`paths::darwin_user_temp_dir`; critic round).
+    let path = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&buffer[..needed - 1]));
+    path.is_absolute().then_some(path)
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
