@@ -161,6 +161,9 @@ fn payload_of(v: &Value) -> VaultPayload {
     for key in entries.keys() {
         match EntryKey::parse(key) {
             EntryKey::AgeIdentity => {}
+            EntryKey::AgeIdentityRetiring => {
+                panic!("a create vector holds no retiring store key")
+            }
             EntryKey::HetznerToken { target } => payload
                 .set_hetzner_token(
                     &target,

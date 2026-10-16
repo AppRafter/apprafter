@@ -2,9 +2,11 @@
 //! The vault's payload (overview §3.7; T21, T26): key–value entries, encoded inside the AEAD as
 //! a strict TLV — `entry_count u16`, then per entry `key_len u8 ‖ key ‖ value_len u16 ‖ value`,
 //! keys in strictly ascending byte order, nothing after the last entry. Known keys:
-//! `age-identity` (the store's own age identity, required), `target/<name>/hetzner-token` and
-//! `settings/unlock-timeout-min` (`0`..=`1440`, absent = 5). Every other key is kept byte for
-//! byte and never read. Values are bytes; the known ones are UTF-8.
+//! `age-identity` (the store's own age identity, required), `age-identity-retiring` (the store
+//! key a rotation retires, D.4b B63: present only between its two vault writes, never used by a
+//! read), `target/<name>/hetzner-token` and `settings/unlock-timeout-min` (`0`..=`1440`, absent
+//! = 5). Every other key is kept byte for byte and never read. Values are bytes; the known ones
+//! are UTF-8.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -30,6 +32,7 @@ pub const DEFAULT_UNLOCK_TIMEOUT_MIN: u32 = 5;
 pub const MAX_UNLOCK_TIMEOUT_MIN: u32 = 1440;
 
 const AGE_IDENTITY: &str = "age-identity";
+const AGE_IDENTITY_RETIRING: &str = "age-identity-retiring";
 const UNLOCK_TIMEOUT: &str = "settings/unlock-timeout-min";
 const TOKEN_LEAF: &str = "hetzner-token";
 
@@ -37,6 +40,8 @@ const TOKEN_LEAF: &str = "hetzner-token";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EntryKey {
     AgeIdentity,
+    /// The store key a rotation retires (D.4b B63).
+    AgeIdentityRetiring,
     HetznerToken {
         target: String,
     },
@@ -49,6 +54,7 @@ impl EntryKey {
     pub fn parse(key: &str) -> EntryKey {
         match key {
             AGE_IDENTITY => EntryKey::AgeIdentity,
+            AGE_IDENTITY_RETIRING => EntryKey::AgeIdentityRetiring,
             UNLOCK_TIMEOUT => EntryKey::UnlockTimeoutMin,
             _ => match key.split('/').collect::<Vec<_>>().as_slice() {
                 ["target", name, TOKEN_LEAF] => EntryKey::HetznerToken {
@@ -62,6 +68,7 @@ impl EntryKey {
     pub fn as_key(&self) -> String {
         match self {
             EntryKey::AgeIdentity => AGE_IDENTITY.to_string(),
+            EntryKey::AgeIdentityRetiring => AGE_IDENTITY_RETIRING.to_string(),
             EntryKey::UnlockTimeoutMin => UNLOCK_TIMEOUT.to_string(),
             EntryKey::HetznerToken { target } => token_key(target),
             EntryKey::Other(key) => key.clone(),
@@ -112,6 +119,20 @@ impl VaultPayload {
             .get(AGE_IDENTITY)
             .ok_or_else(|| payload_invalid(PayloadWhat::AgeIdentityMissing))?;
         parse_identity(value)
+    }
+
+    /// The store key a rotation is retiring (D.4b B63, §4.5), or `None` when this
+    /// authenticated payload holds none. It is there only between a rotation's two vault
+    /// writes (R2 and R4), while caches may still be sealed to it: a rotation's re-seal and
+    /// `lock off` from `rotating` open caches with it; a read never does — every read and
+    /// every new cache uses [`VaultPayload::age_identity`].
+    pub fn retiring_identity(&self) -> VaultResult<Option<age::x25519::Identity>> {
+        match self.entries.get(AGE_IDENTITY_RETIRING) {
+            None => Ok(None),
+            Some(value) => parse_identity(value)
+                .map(Some)
+                .map_err(|_| payload_invalid(PayloadWhat::RetiringIdentity)),
+        }
     }
 
     /// `target`'s Hetzner token, or `None` when this authenticated payload holds none.
@@ -280,10 +301,11 @@ impl VaultPayload {
         Ok(payload)
     }
 
-    /// The rules of the known keys: one parsable identity, a valid timeout, tokens of valid
-    /// target names in UTF-8.
+    /// The rules of the known keys: one parsable identity (and a parsable retiring one, when
+    /// there is one), a valid timeout, tokens of valid target names in UTF-8.
     fn check_known(&self) -> VaultResult<()> {
         self.age_identity()?;
+        self.retiring_identity()?;
         self.unlock_timeout_min()?;
         for (key, value) in &self.entries {
             if let EntryKey::HetznerToken { target } = EntryKey::parse(key) {
@@ -611,6 +633,7 @@ mod tests {
     fn entry_keys_are_classified() {
         for (key, expected) in [
             ("age-identity", EntryKey::AgeIdentity),
+            ("age-identity-retiring", EntryKey::AgeIdentityRetiring),
             ("settings/unlock-timeout-min", EntryKey::UnlockTimeoutMin),
             (
                 "target/prod/hetzner-token",
@@ -627,6 +650,49 @@ mod tests {
             assert_eq!(EntryKey::parse(key), expected);
             assert_eq!(expected.as_key(), key);
         }
+    }
+
+    /// D.4b B63: the retiring store key is a known entry — read as an age identity, refused
+    /// when it does not parse (a D.4a build kept it as an unknown entry) — and its absence
+    /// is `None`, never the store key itself.
+    #[test]
+    fn a_retiring_store_key_is_read_and_checked() {
+        let id = ("age-identity", IDENTITY.as_bytes());
+        let none = VaultPayload::decode(&tlv(&[id])).unwrap();
+        assert!(none.retiring_identity().unwrap().is_none());
+        let current = age::x25519::Identity::generate();
+        let current_text = current.to_string();
+        let rotating = VaultPayload::decode(&tlv(&[
+            ("age-identity", current_text.expose_secret().as_bytes()),
+            ("age-identity-retiring", IDENTITY.as_bytes()),
+        ]))
+        .unwrap();
+        assert_eq!(
+            rotating.age_identity().unwrap().to_public().to_string(),
+            current.to_public().to_string()
+        );
+        assert_eq!(
+            rotating
+                .retiring_identity()
+                .unwrap()
+                .unwrap()
+                .to_public()
+                .to_string(),
+            identity().to_public().to_string()
+        );
+        assert_eq!(
+            invalid(&tlv(&[
+                id,
+                ("age-identity-retiring", &b"not an identity"[..])
+            ])),
+            PayloadWhat::RetiringIdentity
+        );
+        // Byte for byte through its own encoding.
+        let again = VaultPayload::decode(&rotating.encode().unwrap()).unwrap();
+        assert_eq!(
+            again.raw("age-identity-retiring"),
+            Some(IDENTITY.as_bytes())
+        );
     }
 
     #[test]
