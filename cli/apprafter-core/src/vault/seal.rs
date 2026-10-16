@@ -552,6 +552,44 @@ impl VaultFile {
         })
     }
 
+    /// Opens the vault with text typed at a prompt that is not a recovery key (B27): the
+    /// lock-password slot first, then — given this computer's machine id — the
+    /// account-password slot made on this computer. `WrongSecret` names every kind it tried,
+    /// in that order; the policy's refusal when it refused every slot it could try;
+    /// `NoUsableSlot` when neither kind has a slot to try here.
+    pub fn open_typed(
+        &self,
+        typed: &SecretString,
+        machine: Option<&MachineId>,
+        policy: &KdfPolicy,
+    ) -> VaultResult<UnlockedVault> {
+        let mut secrets = vec![SlotSecret::Password(typed.clone())];
+        if let Some(machine) = machine {
+            secrets.push(SlotSecret::AccountPassword(typed.clone(), machine.clone()));
+        }
+        let mut tried = Vec::new();
+        let mut refused = None;
+        for secret in &secrets {
+            match self.open(secret, policy) {
+                Ok(vault) => return Ok(vault),
+                Err(VaultError::WrongSecret { kinds }) => tried.extend(kinds),
+                Err(VaultError::NoUsableSlot { .. }) => {}
+                Err(e @ (VaultError::KdfTooWeak { .. } | VaultError::KdfOutOfRange { .. })) => {
+                    if refused.is_none() {
+                        refused = Some(e);
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        if !tried.is_empty() {
+            return Err(VaultError::WrongSecret { kinds: tried });
+        }
+        Err(refused.unwrap_or_else(|| VaultError::NoUsableSlot {
+            kinds: self.header().slots.iter().map(|slot| slot.kind).collect(),
+        }))
+    }
+
     /// Opens the payload with a data key already held (a holder, the desktop, a session):
     /// `KeyStale` when the vault was replaced since that key was taken.
     pub fn open_with_key(&self, dk: &DataKey, expected: VaultId) -> VaultResult<UnlockedVault> {
@@ -1568,6 +1606,101 @@ mod tests {
         assert!(file.open(&account(ACCOUNT, 0xa), FAST).is_ok());
         assert!(file.open(&password(PASSWORD), FAST).is_ok());
         assert!(file.open(&recovery_secret(0x11), FAST).is_ok());
+    }
+
+    /// A fast vault with a lock password (`PASSWORD`), this computer's account password
+    /// (`ACCOUNT` on machine `0xa`) and the recovery key.
+    fn both_password_kinds() -> (VaultFile, UnlockedVault) {
+        vault_of(vec![
+            NewSlot::Password {
+                secret: SecretString::new(PASSWORD),
+                label: "lock password".into(),
+            },
+            account_slot(ACCOUNT, 0xa),
+        ])
+    }
+
+    /// B27: typed text tries the lock-password slot first, then this computer's
+    /// account-password slot.
+    #[test]
+    fn typed_text_tries_the_lock_password_slot_first() {
+        let (file, made) = both_password_kinds();
+        let here = machine(0xa);
+        let before = derivations();
+        let opened = file
+            .open_typed(&SecretString::new(PASSWORD), Some(&here), FAST)
+            .unwrap();
+        assert_eq!(opened.data_key().expose(), made.data_key().expose());
+        assert_eq!(
+            derivations(),
+            before + 1,
+            "the lock-password slot opened it"
+        );
+        let before = derivations();
+        assert!(file
+            .open_typed(&SecretString::new(ACCOUNT), Some(&here), FAST)
+            .is_ok());
+        assert_eq!(
+            derivations(),
+            before + 2,
+            "the lock password's, then the account password's"
+        );
+    }
+
+    /// B27: a wrong text names both kinds, in the order tried; without this computer's machine
+    /// id, or with another computer's, only the lock-password slot is tried; a vault with
+    /// neither kind to try has no usable slot and derives nothing.
+    #[test]
+    fn typed_text_names_every_kind_it_tried() {
+        let (file, _) = both_password_kinds();
+        let wrong = SecretString::new("neither of them");
+        match file.open_typed(&wrong, Some(&machine(0xa)), FAST) {
+            Err(e @ VaultError::WrongSecret { .. }) => {
+                assert!(matches!(
+                    &e,
+                    VaultError::WrongSecret { kinds }
+                        if *kinds == [SlotKind::Password, SlotKind::OsPassword]
+                ));
+                assert_eq!(
+                    e.to_string(),
+                    "this lock password or OS password does not open the vault"
+                );
+            }
+            other => panic!("{:?}", other.map(|_| "opened")),
+        }
+        for on in [None, Some(machine(0xb))] {
+            match file.open_typed(&SecretString::new(ACCOUNT), on.as_ref(), FAST) {
+                Err(VaultError::WrongSecret { kinds }) => assert_eq!(kinds, [SlotKind::Password]),
+                other => panic!("{:?}", other.map(|_| "opened")),
+            }
+        }
+        let (only_recovery, _) = vault_of(Vec::new());
+        let before = derivations();
+        assert!(matches!(
+            only_recovery.open_typed(&wrong, Some(&machine(0xa)), FAST),
+            Err(VaultError::NoUsableSlot { .. })
+        ));
+        assert_eq!(derivations(), before);
+    }
+
+    /// B27: a lock-password slot the policy refuses is passed over and this computer's
+    /// account-password slot is still tried; the policy's refusal is the answer only when it
+    /// refused every slot there was to try (critic round, finding 4).
+    #[test]
+    fn typed_text_goes_past_a_lock_password_slot_the_policy_refuses() {
+        let (_, mut made) = both_password_kinds();
+        if let SlotBody::Password { kdf, .. } = &mut made.header.slots[0].body {
+            kdf.m_cost_kib = 4; // below 8·p: Argon2id cannot run it (`KdfOutOfRange`)
+        }
+        let file = VaultFile::parse(&made.seal(WRITER, &mut OsRandom).unwrap()).unwrap();
+        let here = machine(0xa);
+        assert!(file
+            .open_typed(&SecretString::new(ACCOUNT), Some(&here), FAST)
+            .is_ok());
+        assert!(matches!(
+            file.open_typed(&SecretString::new(ACCOUNT), None, FAST),
+            Err(VaultError::KdfOutOfRange { .. })
+        ));
     }
 
     #[test]

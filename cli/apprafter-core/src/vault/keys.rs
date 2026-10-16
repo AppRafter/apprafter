@@ -130,8 +130,17 @@ impl fmt::Debug for SlotSecret {
 pub enum SlotInput {
     /// Input of a recovery key's shape whose checksum holds.
     RecoveryKey(RecoveryKey),
-    /// Anything else.
+    /// A lock password: the `0x01` slots only — what `open_slot_at(Password)` and `lock on`'s
+    /// resume take (D.4a rule 4; critic-plan M1). Never an account-password slot.
     Password(SecretString),
+    /// The account password, with this computer's machine id: this computer's `0x03` slot
+    /// only — the resume of a store whose everyday way in it is (B56, d4b-c3).
+    AccountPassword(SecretString, MachineId),
+    /// Text typed at a prompt that is not recovery-key shaped (B27): the lock-password slot,
+    /// then, with this computer's machine id, the account-password slot made on this
+    /// computer. The prompt's input from d4b-c1 on; until then [`SlotInput::from_input`]
+    /// answers `Password`, as it did.
+    Typed(SecretString, Option<MachineId>),
     /// Recovery-key shaped but failing its checksum: it is tried against the password slots
     /// too, and only when they refuse it is `error` reported, as one attempt.
     MistypedRecoveryKey {
@@ -160,6 +169,8 @@ impl fmt::Debug for SlotInput {
         match self {
             SlotInput::RecoveryKey(_) => f.write_str("SlotInput::RecoveryKey(..)"),
             SlotInput::Password(_) => f.write_str("SlotInput::Password(..)"),
+            SlotInput::AccountPassword(..) => f.write_str("SlotInput::AccountPassword(..)"),
+            SlotInput::Typed(..) => f.write_str("SlotInput::Typed(..)"),
             SlotInput::MistypedRecoveryKey { error, .. } => {
                 write!(f, "SlotInput::MistypedRecoveryKey({error:?}, ..)")
             }
@@ -248,6 +259,20 @@ mod tests {
             format!("{:?}", MachineId::new(&[7; 16]).unwrap()),
             "MachineId(..)"
         );
+    }
+
+    #[test]
+    fn the_new_inputs_print_nothing() {
+        let here = MachineId::new(b"5f0d6a3e0c2b4f6a8d9e1b2c3d4e5f60").unwrap();
+        let typed = SlotInput::Typed(SecretString::new("hunter2"), Some(here.clone()));
+        assert_eq!(format!("{typed:?}"), "SlotInput::Typed(..)");
+        let account = SlotInput::AccountPassword(SecretString::new("hunter2"), here);
+        assert_eq!(format!("{account:?}"), "SlotInput::AccountPassword(..)");
+        // Until d4b-c1 moves the prompt to `Typed`, typed text stays the lock password's input.
+        assert!(matches!(
+            SlotInput::from_input(SecretString::new("hunter2")),
+            SlotInput::Password(_)
+        ));
     }
 
     #[test]
