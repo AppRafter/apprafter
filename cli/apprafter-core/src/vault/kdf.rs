@@ -139,8 +139,8 @@ thread_local! {
 }
 
 /// Two tests derive at release strength, one at a time (D.4a T23, §7): the floor cross-check
-/// once (64 MiB) and `password_recovery_vector` three times (256 MiB); the ignored timing test
-/// takes it too.
+/// once (64 MiB) and `password_recovery_vector` four times (256 MiB; D.4b-b1 added
+/// `create_with`'s); the ignored timing test takes it too.
 #[cfg(test)]
 pub(crate) static HEAVY_KDF: std::sync::Mutex<()> = std::sync::Mutex::new(());
 

@@ -21,9 +21,11 @@ use super::kdf::{
 use super::keys::{MachineId, SlotSecret};
 use super::payload::{EntryKey, VaultPayload};
 use super::rng::{OsRandom, ScriptedRandom};
-use super::seal::{create, slot_aad, NewSlot};
+use super::seal::{create, create_with, slot_aad, NewSlot, VaultIds};
 use super::testutil::{hex, seq, unhex, vector_path};
-use super::{Argon2idParams, RecoveryKey, SlotBody, SlotKind, VaultError, VaultFile};
+use super::{
+    Argon2idParams, RecoveryKey, SlotBody, SlotId, SlotKind, VaultError, VaultFile, VaultId,
+};
 use crate::context::SecretString;
 
 /// SHA-256 of every file of `v1/`, pinned here: an accidental regeneration fails this test,
@@ -259,6 +261,31 @@ fn check_create_vector(name: &str, policy: &KdfPolicy) {
     .unwrap();
     assert_eq!(hex(&created), hex(&bytes), "create reproduces {name}/vault");
 
+    // (c') create_with, given the recorded ids and the other draws in order, writes it too
+    // (B57: `create` is the same writer, its ids drawn in place).
+    let d = draws(&v);
+    let id = |i: usize| -> [u8; 16] { d[i].clone().try_into().unwrap() };
+    let ids = VaultIds {
+        vault_id: VaultId(id(0)),
+        slots: vec![SlotId(id(2)), SlotId(id(5))],
+    };
+    let rest = [1, 3, 4, 6, 7, 8].iter().map(|&i| d[i].clone()).collect();
+    let (made, _) = create_with(
+        &ids,
+        text(&v, &["store_id"]),
+        text(&v, &["writer"]),
+        payload_of(&v),
+        new_slots(&v),
+        policy,
+        &mut ScriptedRandom::new(rest),
+    )
+    .unwrap();
+    assert_eq!(
+        hex(&made),
+        hex(&bytes),
+        "create_with reproduces {name}/vault"
+    );
+
     // (a), (b) each secret opens it to the recorded entries and the recorded data key.
     let by_password = file
         .open(
@@ -328,7 +355,7 @@ fn the_v1_files_are_the_frozen_ones() {
     );
 }
 
-/// One of the two release-strength derivation tests (T23), behind HEAVY_KDF: three derivations.
+/// One of the two release-strength derivation tests (T23), behind HEAVY_KDF: four derivations.
 #[test]
 fn password_recovery_vector() {
     let _heavy = HEAVY_KDF.lock().unwrap_or_else(|e| e.into_inner());
@@ -681,4 +708,59 @@ fn os_password_vector() {
         )
         .unwrap();
     assert_eq!(hex(&resealed), hex(&bytes));
+}
+
+/// B57: the vault `lock on` writes from ids minted at plan time — an account-password first
+/// slot (Linux's machine id) and the recovery slot.
+#[test]
+fn created_with_vector() {
+    let v = inputs("created-with");
+    let bytes = read("created-with/vault");
+    assert_eq!(hex(&Sha256::digest(&bytes)), text(&v, &["vault_sha256"]));
+    let file = VaultFile::parse(&bytes).unwrap();
+    check_account_slot(&file, 0, &v);
+    check_wrap(&file, 1, recovery_key().key_bytes(), &v["slots"][1]);
+    assert_eq!(
+        hex(&file.payload_aad),
+        text(&v, &["payload_aad"]),
+        "payload AAD"
+    );
+    let id = |hex_text: &str| -> [u8; 16] { unhex(hex_text).try_into().unwrap() };
+    let ids = VaultIds {
+        vault_id: VaultId(id(text(&v, &["ids", "vault_id"]))),
+        slots: v["ids"]["slots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| SlotId(id(s.as_str().unwrap())))
+            .collect(),
+    };
+    assert_eq!(file.header().vault_id, ids.vault_id);
+    let in_file: Vec<SlotId> = file.header().slots.iter().map(|s| s.id).collect();
+    assert_eq!(in_file, ids.slots);
+    let fast = &KdfPolicy::INSECURE_FAST;
+    let slots = vec![account_new_slot(&v, &v["slots"][0]), recovery_new_slot()];
+    let (made, _) = create_with(
+        &ids,
+        text(&v, &["store_id"]),
+        text(&v, &["writer"]),
+        payload_of(&v),
+        slots,
+        fast,
+        &mut ScriptedRandom::new(draws(&v)),
+    )
+    .unwrap();
+    assert_eq!(
+        hex(&made),
+        hex(&bytes),
+        "create_with reproduces created-with/vault"
+    );
+    for secret in [
+        SlotSecret::AccountPassword(account(&v), machine_id(&v, "linux")),
+        SlotSecret::RecoveryKey(recovery_key()),
+    ] {
+        let opened = file.open(&secret, fast).unwrap();
+        assert_eq!(entries_of(opened.payload()), entries_listed(&v));
+        assert_eq!(&opened.data_key().expose()[..], &seq(0x40, 32)[..]);
+    }
 }

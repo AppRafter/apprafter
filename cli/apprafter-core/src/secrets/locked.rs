@@ -177,12 +177,14 @@ pub(crate) fn vault_error(root: &Path, e: VaultError) -> CliError {
         // new password and no slot id: d4a-d's `lock::open` maps a typed recovery key's
         // refusal to `CoreError::RecoveryKeyInvalid` (T62: with its group) and
         // `lock::check_password` a password's to `CoreError::LockPasswordRefused` before the
-        // vault sees either, and `InvalidInput` / `SlotNotFound` are a caller's bug (c1's
-        // hand-off). Kept in c1's words, never as an unlock or a damage the person must act on.
+        // vault sees either, and `InvalidInput` / `SlotNotFound` / `SlotIdTaken` (one id given
+        // to two new slots, D.4b-b1) are a caller's bug (c1's hand-off). Kept in c1's words,
+        // never as an unlock or a damage the person must act on.
         VaultError::RecoveryKey(_)
         | VaultError::PasswordRefused(_)
         | VaultError::InvalidInput(_)
-        | VaultError::SlotNotFound { .. } => CliError::Other(detail.clone()),
+        | VaultError::SlotNotFound { .. }
+        | VaultError::SlotIdTaken { .. } => CliError::Other(detail.clone()),
         VaultError::Io { path: at, source } => CliError::Io(std::io::Error::new(
             source.kind(),
             format!("{}: {source}", at.display()),

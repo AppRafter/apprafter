@@ -98,6 +98,9 @@ pub enum VaultError {
     /// No slot with that id.
     #[error("the vault has no slot {slot}")]
     SlotNotFound { slot: SlotId },
+    /// One slot id given to two new slots (`create_with`, B57): a caller's bug.
+    #[error("slot id {slot} is given to two new slots")]
+    SlotIdTaken { slot: SlotId },
     /// A new lock password breaks one of O2's three rules.
     #[error("a new lock password is refused: {0}")]
     PasswordRefused(PasswordProblem),
@@ -251,6 +254,8 @@ pub enum InputWhat {
     NoRecoverySlot,
     MachineId,
     OneSlotPerComputer,
+    SlotIds,
+    FirstSlots,
 }
 
 impl fmt::Display for InputWhat {
@@ -265,6 +270,10 @@ impl fmt::Display for InputWhat {
             }
             Self::OneSlotPerComputer => {
                 "a vault holds at most one account-password slot per computer"
+            }
+            Self::SlotIds => "a vault made at plan time needs one minted id per new slot",
+            Self::FirstSlots => {
+                "a vault made at plan time holds exactly one recovery-key slot and another slot"
             }
         })
     }

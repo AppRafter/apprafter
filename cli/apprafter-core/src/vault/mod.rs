@@ -63,7 +63,7 @@ pub use recovery::{looks_like_recovery_key, ConfirmedRecoveryKey, RecoveryKey, R
 #[cfg(any(test, feature = "test-support"))]
 pub use rng::ScriptedRandom;
 pub use rng::{OsRandom, VaultRng};
-pub use seal::{create, NewSlot, UnlockedVault};
+pub use seal::{create, create_with, NewSlot, UnlockedVault, VaultIds};
 
 /// The vault's file name in a target store's root.
 pub const VAULT_FILE: &str = "vault";

@@ -17,6 +17,7 @@
 //! the data key on every save. Plaintext lives only in pre-sized `Zeroizing` buffers inside
 //! `seal` and `open`, encrypted or parsed in place.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 
@@ -105,6 +106,73 @@ pub fn create(
     {
         return Err(VaultError::InvalidInput(InputWhat::NoRecoverySlot));
     }
+    build(store_id, writer, payload, slots, None, policy, rng)
+}
+
+/// The ids of a vault made at plan time (B57, B80): its vault id, and one slot id per slot
+/// [`create_with`] is given, in the same order — minted before any prompt, so a recovery key
+/// can be shown with its slot's id and a Windows Hello challenge signed over the vault id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VaultIds {
+    pub vault_id: VaultId,
+    pub slots: Vec<SlotId>,
+}
+
+impl VaultIds {
+    /// A vault id, then `slots` slot ids, drawn in that order.
+    pub fn draw(slots: usize, rng: &mut dyn VaultRng) -> VaultResult<VaultIds> {
+        let vault_id = VaultId(draw(rng)?);
+        let slots = (0..slots)
+            .map(|_| draw(rng).map(SlotId))
+            .collect::<VaultResult<Vec<_>>>()?;
+        Ok(VaultIds { vault_id, slots })
+    }
+}
+
+/// A new vault for store `store_id` whose ids the caller minted at plan time (B57): `ids`'
+/// vault id, and its slot ids for `slots` in order. Exactly one slot is a recovery key and at
+/// least one other comes with it — the everyday way in, or a lock password
+/// (`InvalidInput(FirstSlots)`); one id per slot (`InvalidInput(SlotIds)`), none twice
+/// (`SlotIdTaken`); then `create`'s checks. Draws, in order: the data key, per slot its salt
+/// and wrap nonce, then the payload nonce. Nothing is drawn or derived before every argument
+/// has been checked.
+pub fn create_with(
+    ids: &VaultIds,
+    store_id: &str,
+    writer: &str,
+    payload: VaultPayload,
+    slots: Vec<NewSlot>,
+    policy: &KdfPolicy,
+    rng: &mut dyn VaultRng,
+) -> VaultResult<(Vec<u8>, UnlockedVault)> {
+    if ids.slots.len() != slots.len() {
+        return Err(VaultError::InvalidInput(InputWhat::SlotIds));
+    }
+    let mut seen = HashSet::with_capacity(ids.slots.len());
+    if let Some(taken) = ids.slots.iter().find(|id| !seen.insert(**id)) {
+        return Err(VaultError::SlotIdTaken { slot: *taken });
+    }
+    let recovery = slots
+        .iter()
+        .filter(|slot| matches!(slot, NewSlot::RecoveryKey { .. }))
+        .count();
+    if recovery != 1 || slots.len() < 2 {
+        return Err(VaultError::InvalidInput(InputWhat::FirstSlots));
+    }
+    build(store_id, writer, payload, slots, Some(ids), policy, rng)
+}
+
+/// `create` and `create_with`: every check, then the vault — its ids given, or drawn in place
+/// (so `create`'s draws, which the frozen vectors pin, never move).
+fn build(
+    store_id: &str,
+    writer: &str,
+    payload: VaultPayload,
+    slots: Vec<NewSlot>,
+    ids: Option<&VaultIds>,
+    policy: &KdfPolicy,
+    rng: &mut dyn VaultRng,
+) -> VaultResult<(Vec<u8>, UnlockedVault)> {
     if slots.len() > SLOT_MAX {
         return Err(VaultError::TooLarge {
             what: SizeWhat::Slots,
@@ -119,7 +187,10 @@ pub fn create(
         .map_err(|_| VaultError::InvalidInput(InputWhat::StoreId))?;
     check_writer(writer.as_bytes()).map_err(|_| VaultError::InvalidInput(InputWhat::Writer))?;
     payload.check_size()?;
-    let vault_id = VaultId(draw(rng)?);
+    let vault_id = match ids {
+        Some(ids) => ids.vault_id,
+        None => VaultId(draw(rng)?),
+    };
     let dk = Arc::new(DataKey::generate(rng)?);
     let mut vault = UnlockedVault {
         header: VaultHeader {
@@ -132,8 +203,11 @@ pub fn create(
         dk,
         payload,
     };
-    for slot in slots {
-        let record = vault.new_record(slot, policy, rng)?;
+    for (i, slot) in slots.into_iter().enumerate() {
+        let record = match ids {
+            Some(ids) => vault.new_record_as(ids.slots[i], slot, policy, rng)?,
+            None => vault.new_record(slot, policy, rng)?,
+        };
         vault.header.slots.push(record);
     }
     let bytes = vault.seal(writer, rng)?;
@@ -312,6 +386,18 @@ impl UnlockedVault {
         rng: &mut dyn VaultRng,
     ) -> VaultResult<SlotRecord> {
         let id = SlotId(draw(rng)?);
+        self.new_record_as(id, slot, policy, rng)
+    }
+
+    /// A slot record under `id`, given (`create_with`, a rotation's kept slot in d4b-b2) or
+    /// drawn just before: draws its salt and wrap nonce, in that order.
+    fn new_record_as(
+        &self,
+        id: SlotId,
+        slot: NewSlot,
+        policy: &KdfPolicy,
+        rng: &mut dyn VaultRng,
+    ) -> VaultResult<SlotRecord> {
         let salt: [u8; SALT_LEN] = draw(rng)?;
         let wrap_nonce: [u8; NONCE_LEN] = draw(rng)?;
         let (kind, mut body, material, label) = match slot {
@@ -1700,6 +1786,149 @@ mod tests {
         assert!(matches!(
             file.open_typed(&SecretString::new(ACCOUNT), None, FAST),
             Err(VaultError::KdfOutOfRange { .. })
+        ));
+    }
+
+    /// The draws of a two-slot `create_with`, in order: the data key, per slot its salt and
+    /// wrap nonce, the payload nonce — the v1 vectors' bytes, without the ids.
+    fn create_with_draws() -> Vec<Vec<u8>> {
+        vec![
+            seq(0x40, 32),
+            seq(0x80, 16),
+            seq(0x90, 24),
+            seq(0xb8, 16),
+            seq(0xc8, 24),
+            seq(0xe0, 24),
+        ]
+    }
+
+    fn given_ids() -> VaultIds {
+        VaultIds {
+            vault_id: VaultId(seq_array(0x11)),
+            slots: vec![SlotId(seq_array(0x21)), SlotId(seq_array(0x31))],
+        }
+    }
+
+    /// B57: the ids minted at plan time are the vault's; the rest is drawn as `create` draws.
+    #[test]
+    fn create_with_puts_the_given_ids_in_place() {
+        let mut rng = ScriptedRandom::new(create_with_draws());
+        let (bytes, made) = create_with(
+            &given_ids(),
+            STORE,
+            WRITER,
+            payload(),
+            slots(PASSWORD, 0x11),
+            FAST,
+            &mut rng,
+        )
+        .unwrap();
+        assert_eq!(rng.drawn(), 6);
+        let file = VaultFile::parse(&bytes).unwrap();
+        assert_eq!(file.header().vault_id, VaultId(seq_array(0x11)));
+        assert_eq!(file.header().slots[0].id, SlotId(seq_array(0x21)));
+        assert_eq!(file.header().slots[1].id, SlotId(seq_array(0x31)));
+        assert_eq!(made.data_key().expose(), &seq_array::<32>(0x40));
+        assert!(file.open(&password(PASSWORD), FAST).is_ok());
+        assert!(file.open(&recovery_secret(0x11), FAST).is_ok());
+    }
+
+    /// B57: one id per slot, none twice, exactly one recovery key and another slot — each
+    /// refused before a byte is drawn or a key derived; then `create`'s own checks.
+    #[test]
+    fn create_with_checks_its_ids_and_slots_before_drawing() {
+        let nothing = || ScriptedRandom::new(Vec::new());
+        let recovery_slot = |byte| NewSlot::RecoveryKey {
+            key: recovery(byte),
+            label: String::new(),
+        };
+        let before = derivations();
+        let mut short = given_ids();
+        short.slots.pop();
+        assert!(matches!(
+            create_with(
+                &short,
+                STORE,
+                WRITER,
+                payload(),
+                slots(PASSWORD, 1),
+                FAST,
+                &mut nothing()
+            ),
+            Err(VaultError::InvalidInput(InputWhat::SlotIds))
+        ));
+        let mut twice = given_ids();
+        twice.slots[1] = twice.slots[0];
+        assert!(matches!(
+            create_with(&twice, STORE, WRITER, payload(), slots(PASSWORD, 1), FAST, &mut nothing()),
+            Err(VaultError::SlotIdTaken { slot }) if slot == SlotId(seq_array(0x21))
+        ));
+        let two_recovery_keys = vec![recovery_slot(1), recovery_slot(2)];
+        let no_recovery_key = vec![
+            NewSlot::Password {
+                secret: SecretString::new(PASSWORD),
+                label: String::new(),
+            },
+            NewSlot::Password {
+                secret: SecretString::new("another lock password"),
+                label: String::new(),
+            },
+        ];
+        for shape in [two_recovery_keys, no_recovery_key] {
+            assert!(matches!(
+                create_with(
+                    &given_ids(),
+                    STORE,
+                    WRITER,
+                    payload(),
+                    shape,
+                    FAST,
+                    &mut nothing()
+                ),
+                Err(VaultError::InvalidInput(InputWhat::FirstSlots))
+            ));
+        }
+        let mut one = given_ids();
+        one.slots.truncate(1);
+        assert!(matches!(
+            create_with(
+                &one,
+                STORE,
+                WRITER,
+                payload(),
+                vec![recovery_slot(1)],
+                FAST,
+                &mut nothing()
+            ),
+            Err(VaultError::InvalidInput(InputWhat::FirstSlots))
+        ));
+        let mut bad_label = slots(PASSWORD, 1);
+        if let NewSlot::Password { label, .. } = &mut bad_label[0] {
+            *label = "bell\u{7}".into();
+        }
+        assert!(matches!(
+            create_with(
+                &given_ids(),
+                STORE,
+                WRITER,
+                payload(),
+                bad_label,
+                FAST,
+                &mut nothing()
+            ),
+            Err(VaultError::InvalidInput(InputWhat::Label))
+        ));
+        assert_eq!(derivations(), before);
+    }
+
+    /// The ids `lock on` mints at plan time (d4b-c3): the vault id, then one slot id per slot.
+    #[test]
+    fn vault_ids_are_drawn_vault_id_first() {
+        let mut rng = ScriptedRandom::new(vec![seq(0x11, 16), seq(0x21, 16), seq(0x31, 16)]);
+        assert_eq!(VaultIds::draw(2, &mut rng).unwrap(), given_ids());
+        assert!(matches!(
+            VaultIds::draw(2, &mut ScriptedRandom::failing_at(1, vec![seq(0x11, 16)])),
+            Err(VaultError::RandomUnavailable { .. })
         ));
     }
 
