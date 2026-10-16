@@ -4,8 +4,9 @@
 //!
 //! One random 256-bit data key encrypts the payload — the store's own age identity, each
 //! target's Hetzner token, the default unlock timeout — with XChaCha20-Poly1305. Each slot
-//! wraps that key under a key derived from its own secret: Argon2id over a lock password, or
-//! the 32 bytes of a recovery key, through HKDF-SHA256. The header is plain and parsed with a
+//! wraps that key under a key derived from its own secret: Argon2id over a lock password; over
+//! the account password, with this computer's machine secret beside it (D.4b B54); or the 32
+//! bytes of a recovery key — through HKDF-SHA256. The header is plain and parsed with a
 //! bound on everything; nothing in it is trusted until a slot or a held data key opens the
 //! payload, whose associated data is every byte before it.
 //!
@@ -50,7 +51,7 @@ pub use format::{
     MAGIC, PAYLOAD_MAX, SLOT_AAD_DOMAIN, SLOT_MAX, STORE_ID_MAX, VAULT_FILE_MAX, WRITER_MAX,
 };
 pub use kdf::{Argon2idParams, KdfPolicy};
-pub use keys::{DataKey, SlotInput, SlotSecret};
+pub use keys::{DataKey, MachineId, SlotInput, SlotSecret};
 pub use password::{
     check_new_password, AcceptedPassword, MAX_PASSWORD_BYTES, RECOMMENDED_PASSWORD_CHARS,
 };

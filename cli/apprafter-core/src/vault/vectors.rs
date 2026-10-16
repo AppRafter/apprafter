@@ -14,13 +14,16 @@ use std::fs;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use super::kdf::{derive_password_material, slot_keys, KdfPolicy, HEAVY_KDF};
-use super::keys::SlotSecret;
+use super::kdf::{
+    derive_password_material, machine_secret, machine_tag, os_password_material, slot_keys,
+    KdfPolicy, DERIVATIONS, HEAVY_KDF,
+};
+use super::keys::{MachineId, SlotSecret};
 use super::payload::{EntryKey, VaultPayload};
 use super::rng::{OsRandom, ScriptedRandom};
 use super::seal::{create, slot_aad, NewSlot};
-use super::testutil::{hex, unhex, vector_path};
-use super::{Argon2idParams, RecoveryKey, SlotBody, SlotKind, VaultFile};
+use super::testutil::{hex, seq, unhex, vector_path};
+use super::{Argon2idParams, RecoveryKey, SlotBody, SlotKind, VaultError, VaultFile};
 use crate::context::SecretString;
 
 /// SHA-256 of every file of `v1/`, pinned here: an accidental regeneration fails this test,
@@ -208,7 +211,7 @@ fn check_create_vector(name: &str, policy: &KdfPolicy) {
             | SlotBody::RecoveryKey {
                 salt, wrapped_dk, ..
             } => (salt, wrapped_dk),
-            SlotBody::Opaque(_) => unreachable!(),
+            SlotBody::OsPassword { .. } | SlotBody::Opaque(_) => unreachable!(),
         };
         let (prk, _) = hkdf::Hkdf::<sha2::Sha256>::extract(Some(&salt[..]), &material);
         assert_eq!(hex(&prk), text(&v, &[trace, "prk"]), "{trace} PRK");
@@ -447,4 +450,235 @@ fn unknown_entry_vector() {
         after.payload().raw("x-future/key"),
         Some(&[0xffu8, 0xfe, 0x00, 0x01][..])
     );
+}
+
+/// A machine id from `inputs.json`: Linux's as its text, the Mac's 16 bytes as hex (B76).
+fn machine_id(v: &Value, which: &str) -> MachineId {
+    let id = text(v, &["machine_ids", which]);
+    match which {
+        "linux" => MachineId::new(id.as_bytes()).unwrap(),
+        "mac" => MachineId::new(&unhex(id)).unwrap(),
+        other => panic!("{other}: no such machine id in the vector"),
+    }
+}
+
+fn account(v: &Value) -> SecretString {
+    SecretString::new(text(v, &["account_password"]))
+}
+
+/// Slot `i`'s wrap from `material`, step by step against `trace` (B7: a failure names the step
+/// that moved).
+fn check_wrap(file: &VaultFile, i: usize, material: &[u8], trace: &Value) {
+    let slot = &file.header().slots[i];
+    let (salt, wrapped) = match &slot.body {
+        SlotBody::Password {
+            salt, wrapped_dk, ..
+        }
+        | SlotBody::OsPassword {
+            salt, wrapped_dk, ..
+        }
+        | SlotBody::RecoveryKey {
+            salt, wrapped_dk, ..
+        } => (salt, wrapped_dk),
+        SlotBody::Opaque(_) => panic!("slot {i} is opaque"),
+    };
+    assert_eq!(
+        u64::from(slot.kind.byte()),
+        trace["kind"].as_u64().unwrap(),
+        "slot {i} kind"
+    );
+    assert_eq!(slot.label, text(trace, &["label"]), "slot {i} label");
+    let (prk, _) = hkdf::Hkdf::<sha2::Sha256>::extract(Some(&salt[..]), material);
+    assert_eq!(hex(&prk), text(trace, &["prk"]), "slot {i} PRK");
+    let keys = slot_keys(material, salt, slot.kind.byte());
+    assert_eq!(hex(&keys.kek[..]), text(trace, &["kek"]), "slot {i} KEK");
+    assert_eq!(
+        hex(&keys.key_check[..]),
+        text(trace, &["key_check"]),
+        "slot {i} key check"
+    );
+    let aad = slot_aad(&file.header().vault_id, &slot.id, slot.kind, &slot.body);
+    assert_eq!(hex(&aad), text(trace, &["slot_aad"]), "slot {i} AAD");
+    assert_eq!(
+        hex(wrapped),
+        text(trace, &["wrapped_dk"]),
+        "slot {i} wrapped key"
+    );
+}
+
+/// Slot `i`, an account-password slot (B54, B76): its fields, its tag and machine secret,
+/// its material, then its wrap — against the generator's trace.
+fn check_account_slot(file: &VaultFile, i: usize, v: &Value) {
+    let trace = &v["slots"][i];
+    let slot = &file.header().slots[i];
+    let SlotBody::OsPassword {
+        kdf,
+        salt,
+        enrolled_at,
+        machine_tag: tag,
+        ..
+    } = &slot.body
+    else {
+        panic!("slot {i} is an account-password slot");
+    };
+    assert_eq!(*kdf, params(v), "slot {i} costs");
+    assert_eq!(
+        *enrolled_at,
+        trace["enrolled_at"].as_u64().unwrap(),
+        "slot {i} enrolled_at"
+    );
+    let machine = machine_id(v, text(trace, &["machine"]));
+    assert_eq!(
+        hex(tag),
+        text(trace, &["machine_tag"]),
+        "slot {i} tag as written"
+    );
+    assert_eq!(
+        hex(&machine_tag(&slot.id, &machine)),
+        text(trace, &["machine_tag"]),
+        "slot {i} tag"
+    );
+    assert_eq!(
+        hex(&machine_secret(&machine)[..]),
+        text(trace, &["machine_secret"]),
+        "slot {i} machine secret"
+    );
+    let fast = &KdfPolicy::INSECURE_FAST;
+    let argon = derive_password_material(&account(v), salt, kdf, fast).unwrap();
+    assert_eq!(
+        hex(&argon[..]),
+        text(trace, &["argon2_output"]),
+        "slot {i} Argon2id"
+    );
+    let material = os_password_material(&account(v), salt, kdf, &machine, fast).unwrap();
+    assert_eq!(
+        hex(&material[..]),
+        text(trace, &["material"]),
+        "slot {i} material"
+    );
+    check_wrap(file, i, &material[..], trace);
+}
+
+/// The new slot `trace` records (an account-password slot of a vector).
+fn account_new_slot(v: &Value, trace: &Value) -> NewSlot {
+    NewSlot::OsPassword {
+        secret: account(v),
+        label: text(trace, &["label"]).to_string(),
+        enrolled_at: trace["enrolled_at"].as_u64().unwrap(),
+        machine: machine_id(v, text(trace, &["machine"])),
+    }
+}
+
+fn recovery_new_slot() -> NewSlot {
+    NewSlot::RecoveryKey {
+        key: recovery_key(),
+        label: "recovery key".into(),
+    }
+}
+
+fn derived() -> u32 {
+    DERIVATIONS.with(std::cell::Cell::get)
+}
+
+/// B7, B54, B76: two account-password slots — one bound to a Linux machine id (its 32 hex
+/// characters), one to a macOS one (16 raw bytes) — and the recovery slot.
+#[test]
+fn os_password_vector() {
+    let v = inputs("os-password");
+    let bytes = read("os-password/vault");
+    assert_eq!(hex(&Sha256::digest(&bytes)), text(&v, &["vault_sha256"]));
+    let file = VaultFile::parse(&bytes).unwrap();
+    check_account_slot(&file, 0, &v);
+    check_account_slot(&file, 1, &v);
+    check_wrap(&file, 2, recovery_key().key_bytes(), &v["slots"][2]);
+    assert_eq!(
+        hex(&file.payload_aad),
+        text(&v, &["payload_aad"]),
+        "payload AAD"
+    );
+    assert_eq!(
+        hex(&payload_of(&v).encode().unwrap()),
+        text(&v, &["payload_plaintext"]),
+        "payload plaintext"
+    );
+    let fast = &KdfPolicy::INSECURE_FAST;
+
+    // `create`, fed the recorded draws, writes it byte for byte.
+    let slots = vec![
+        account_new_slot(&v, &v["slots"][0]),
+        account_new_slot(&v, &v["slots"][1]),
+        recovery_new_slot(),
+    ];
+    let (made, _) = create(
+        text(&v, &["store_id"]),
+        text(&v, &["writer"]),
+        payload_of(&v),
+        slots,
+        fast,
+        &mut ScriptedRandom::new(draws(&v)),
+    )
+    .unwrap();
+    assert_eq!(
+        hex(&made),
+        hex(&bytes),
+        "create reproduces os-password/vault"
+    );
+
+    // Each computer's account password opens it, deriving its own slot only, and the
+    // recovery key too, to one data key.
+    let dk = seq(0x40, 32);
+    for which in ["linux", "mac"] {
+        let before = derived();
+        let secret = SlotSecret::AccountPassword(account(&v), machine_id(&v, which));
+        let opened = file.open(&secret, fast).unwrap();
+        assert_eq!(
+            derived(),
+            before + 1,
+            "{which}: only its own slot is derived"
+        );
+        assert_eq!(entries_of(opened.payload()), entries_listed(&v));
+        assert_eq!(&opened.data_key().expose()[..], &dk[..]);
+    }
+    let opened = file
+        .open(&SlotSecret::RecoveryKey(recovery_key()), fast)
+        .unwrap();
+    assert_eq!(&opened.data_key().expose()[..], &dk[..]);
+
+    // Neither a lock password of the same text nor a third computer's id tries a slot.
+    let before = derived();
+    let third = MachineId::new(&[0x77; 16]).unwrap();
+    for secret in [
+        SlotSecret::Password(account(&v)),
+        SlotSecret::AccountPassword(account(&v), third),
+    ] {
+        assert!(
+            matches!(
+                file.open(&secret, fast),
+                Err(VaultError::NoUsableSlot { .. })
+            ),
+            "{secret:?}"
+        );
+    }
+    assert_eq!(derived(), before);
+
+    // L1 on an account-password slot: the release policy refuses its fast costs, unhashed.
+    let verdicts = file.slot_policy(&KdfPolicy::RELEASE);
+    assert!(matches!(verdicts[0].1, Err(VaultError::KdfTooWeak { .. })));
+    assert!(matches!(verdicts[1].1, Err(VaultError::KdfTooWeak { .. })));
+    assert!(verdicts[2].1.is_ok());
+    let linux = SlotSecret::AccountPassword(account(&v), machine_id(&v, "linux"));
+    assert!(matches!(
+        file.open(&linux, &KdfPolicy::RELEASE),
+        Err(VaultError::KdfTooWeak { .. })
+    ));
+    assert_eq!(derived(), before);
+
+    // One encoding: resealed with its own nonce, the same bytes.
+    let resealed = opened
+        .seal(
+            text(&v, &["writer"]),
+            &mut ScriptedRandom::new(vec![file.payload_nonce.to_vec()]),
+        )
+        .unwrap();
+    assert_eq!(hex(&resealed), hex(&bytes));
 }

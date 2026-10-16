@@ -3,8 +3,9 @@
 //!
 //! ```text
 //! material  = Argon2id(password)  |  recovery key bytes
+//!           | Argon2id(account password) ‖ machine secret (D.4b B54: bound to this computer)
 //! kek, key_check = HKDF-SHA256(salt = slot salt, ikm = material), info "…/kek/" ‖ kind, "…/key-check/" ‖ kind
-//! slot_aad  = SLOT_AAD_DOMAIN ‖ vault_id ‖ slot_id ‖ kind ‖ body[..end of salt]
+//! slot_aad  = SLOT_AAD_DOMAIN ‖ vault_id ‖ slot_id ‖ kind ‖ body[..wrap nonce]
 //! wrapped   = XChaCha20Poly1305(kek).encrypt(wrap_nonce, slot_aad, data key)
 //! payload   = XChaCha20Poly1305(data key).encrypt(payload_nonce, every byte before it, TLV)
 //! ```
@@ -30,19 +31,37 @@ use super::format::{
     VaultHeader, VaultId, FORMAT_V1, NONCE_LEN, PAYLOAD_MAX, SALT_LEN, SLOT_AAD_DOMAIN, SLOT_MAX,
     TAG_LEN, VAULT_FILE_MAX, WRAPPED_DK_LEN,
 };
-use super::kdf::{derive_password_material, slot_keys, KdfPolicy, MATERIAL_LEN};
-use super::keys::{DataKey, SlotSecret};
+use super::kdf::{
+    derive_password_material, machine_tag, os_password_material, slot_keys, KdfPolicy,
+};
+use super::keys::{DataKey, MachineId, SlotSecret};
 use super::password::{check_new_password, MAX_PASSWORD_BYTES};
 use super::payload::VaultPayload;
 use super::recovery::RecoveryKey;
 use super::rng::VaultRng;
 use crate::context::SecretString;
 
-/// A slot to create. Its secret is checked before anything is drawn or derived: a password by
-/// O2's rules ([`check_new_password`]), a label by the format's.
+/// A slot to create. Its secret is checked before anything is drawn or derived: a lock
+/// password and an account password by O2's rules ([`check_new_password`]), a label by the
+/// format's.
 pub enum NewSlot {
-    Password { secret: SecretString, label: String },
-    RecoveryKey { key: RecoveryKey, label: String },
+    Password {
+        secret: SecretString,
+        label: String,
+    },
+    /// The account password (B54), checked with the system before it gets here (B11): only
+    /// the OS crate's glue in the CLI and the desktop builds this variant (d4b-d, G-OS6). Its
+    /// key is bound to `machine`; `enrolled_at` is when it was added, in Unix seconds.
+    OsPassword {
+        secret: SecretString,
+        label: String,
+        enrolled_at: u64,
+        machine: MachineId,
+    },
+    RecoveryKey {
+        key: RecoveryKey,
+        label: String,
+    },
 }
 
 impl fmt::Debug for NewSlot {
@@ -50,6 +69,7 @@ impl fmt::Debug for NewSlot {
         match self {
             NewSlot::Password { label, .. } => write!(f, "NewSlot::Password({label:?}, ..)"),
             NewSlot::RecoveryKey { label, .. } => write!(f, "NewSlot::RecoveryKey({label:?}, ..)"),
+            NewSlot::OsPassword { label, .. } => write!(f, "NewSlot::OsPassword({label:?}, ..)"),
         }
     }
 }
@@ -94,6 +114,7 @@ pub fn create(
     for slot in &slots {
         check_new_slot(slot)?;
     }
+    check_one_slot_per_computer(&slots)?;
     check_store_id(store_id.as_bytes())
         .map_err(|_| VaultError::InvalidInput(InputWhat::StoreId))?;
     check_writer(writer.as_bytes()).map_err(|_| VaultError::InvalidInput(InputWhat::Writer))?;
@@ -125,9 +146,27 @@ fn draw<const N: usize>(rng: &mut dyn VaultRng) -> VaultResult<[u8; N]> {
     Ok(out)
 }
 
+/// B77: at most one account-password slot per computer among a new vault's slots — a second
+/// one for the same machine id would never be tried (`open` tries this computer's first).
+fn check_one_slot_per_computer(slots: &[NewSlot]) -> VaultResult<()> {
+    let machines: Vec<&[u8]> = slots
+        .iter()
+        .filter_map(|slot| match slot {
+            NewSlot::OsPassword { machine, .. } => Some(machine.bytes()),
+            _ => None,
+        })
+        .collect();
+    for (i, machine) in machines.iter().enumerate() {
+        if machines[..i].contains(machine) {
+            return Err(VaultError::InvalidInput(InputWhat::OneSlotPerComputer));
+        }
+    }
+    Ok(())
+}
+
 fn check_new_slot(slot: &NewSlot) -> VaultResult<()> {
     let label = match slot {
-        NewSlot::Password { secret, label } => {
+        NewSlot::Password { secret, label } | NewSlot::OsPassword { secret, label, .. } => {
             check_new_password(secret).map_err(VaultError::PasswordRefused)?;
             label
         }
@@ -154,14 +193,27 @@ impl UnlockedVault {
         &self.dk
     }
 
-    /// Adds a slot wrapping this vault's data key; checked like `create`'s.
+    /// Adds a slot wrapping this vault's data key; checked like `create`'s. An account-password
+    /// slot replaces this computer's in the same write — the re-enrolment after a password
+    /// change (B77, ADR 0069 §3) — and leaves another computer's: no write of the core makes
+    /// a second slot of one computer, which `open` would never try.
     pub fn add_slot(
         &mut self,
         slot: NewSlot,
         policy: &KdfPolicy,
         rng: &mut dyn VaultRng,
     ) -> VaultResult<SlotId> {
-        if self.header.slots.len() >= SLOT_MAX {
+        let replaced: Vec<SlotId> = match &slot {
+            NewSlot::OsPassword { machine, .. } => self
+                .header
+                .slots
+                .iter()
+                .filter(|kept| kept.made_on(machine))
+                .map(|kept| kept.id)
+                .collect(),
+            _ => Vec::new(),
+        };
+        if self.header.slots.len() - replaced.len() >= SLOT_MAX {
             return Err(VaultError::TooLarge {
                 what: SizeWhat::Slots,
                 limit: SLOT_MAX as u64,
@@ -170,6 +222,9 @@ impl UnlockedVault {
         check_new_slot(&slot)?;
         let record = self.new_record(slot, policy, rng)?;
         let id = record.id;
+        self.header
+            .slots
+            .retain(|kept| !replaced.contains(&kept.id));
         self.header.slots.push(record);
         Ok(id)
     }
@@ -270,17 +325,37 @@ impl UnlockedVault {
                     key_check: [0; 32],
                     wrapped_dk: [0; WRAPPED_DK_LEN],
                 };
+                let material = Zeroizing::new(material.to_vec());
                 (SlotKind::Password, body, material, label)
             }
+            NewSlot::OsPassword {
+                secret,
+                label,
+                enrolled_at,
+                machine,
+            } => {
+                let kdf = policy.create_params();
+                let material = os_password_material(&secret, &salt, &kdf, &machine, policy)?;
+                let body = SlotBody::OsPassword {
+                    kdf,
+                    salt,
+                    enrolled_at,
+                    machine_tag: machine_tag(&id, &machine),
+                    wrap_nonce,
+                    key_check: [0; 32],
+                    wrapped_dk: [0; WRAPPED_DK_LEN],
+                };
+                let material = Zeroizing::new(material.to_vec());
+                (SlotKind::OsPassword, body, material, label)
+            }
             NewSlot::RecoveryKey { key, label } => {
-                let mut material = Zeroizing::new([0u8; MATERIAL_LEN]);
-                material.copy_from_slice(key.key_bytes());
                 let body = SlotBody::RecoveryKey {
                     salt,
                     wrap_nonce,
                     key_check: [0; 32],
                     wrapped_dk: [0; WRAPPED_DK_LEN],
                 };
+                let material = Zeroizing::new(key.key_bytes().to_vec());
                 (SlotKind::RecoveryKey, body, material, label)
             }
         };
@@ -288,6 +363,11 @@ impl UnlockedVault {
         let aad = slot_aad(&self.header.vault_id, &id, kind, &body);
         let sealed = wrap_data_key(&self.dk, &keys.kek, &aad, &wrap_nonce)?;
         if let SlotBody::Password {
+            key_check,
+            wrapped_dk,
+            ..
+        }
+        | SlotBody::OsPassword {
             key_check,
             wrapped_dk,
             ..
@@ -310,16 +390,33 @@ impl UnlockedVault {
     }
 }
 
-/// A slot `policy` would open: a recovery key always, a password slot whose parameters pass.
+/// A device-independent slot `policy` would open (ADR 0068 §3): a recovery key always, a lock
+/// password whose parameters pass. An account-password slot never counts — it opens only on
+/// the computer that made it (B54) — as an opaque slot opens nowhere here.
 fn opens_under(slot: &SlotRecord, policy: &KdfPolicy) -> bool {
     match &slot.body {
         SlotBody::RecoveryKey { .. } => true,
         SlotBody::Password { kdf, .. } => policy.check(kdf).is_ok(),
+        SlotBody::OsPassword { .. } => false,
         SlotBody::Opaque(_) => false,
     }
 }
 
-/// `SLOT_AAD_DOMAIN ‖ vault_id ‖ slot_id ‖ kind ‖ body[..end of salt]`: never the position.
+impl SlotRecord {
+    /// Whether this is an account-password slot made on the computer whose machine id is
+    /// `machine` (B54): its tag is that id's for this slot. Reads no secret and derives
+    /// nothing — what tells "made here" from "another computer's" (d4b-c1's notes, doctor).
+    pub fn made_on(&self, machine: &MachineId) -> bool {
+        match &self.body {
+            SlotBody::OsPassword {
+                machine_tag: tag, ..
+            } => *tag == machine_tag(&self.id, machine),
+            _ => false,
+        }
+    }
+}
+
+/// `SLOT_AAD_DOMAIN ‖ vault_id ‖ slot_id ‖ kind ‖ body[..wrap nonce]`: never the position.
 pub(super) fn slot_aad(
     vault_id: &VaultId,
     slot: &SlotId,
@@ -380,26 +477,36 @@ fn unwrap_data_key(
 }
 
 impl VaultFile {
-    /// Opens the vault with a slot secret: every slot of its kind is tried; `WrongSecret` only
-    /// when each one's key check refused it, the policy's refusal when it refused them all
-    /// (T22: open such a vault with its recovery key).
+    /// Opens the vault with a slot secret. A lock password or a recovery key tries every slot
+    /// of its kind; the account password only the first `0x03` slot made on this computer
+    /// (its tag is this machine id's), so another computer's slot is never tried, and a
+    /// second one of this computer's is a forged or damaged header, never tried either (B54,
+    /// B77). `WrongSecret` when each slot tried refused it by its key check; the policy's
+    /// refusal when it refused them all (T22: open such a vault with its recovery key);
+    /// `NoUsableSlot` when there is no slot to try.
     pub fn open(&self, secret: &SlotSecret, policy: &KdfPolicy) -> VaultResult<UnlockedVault> {
-        let kind = match secret {
-            SlotSecret::Password(_) => SlotKind::Password,
-            SlotSecret::RecoveryKey(_) => SlotKind::RecoveryKey,
+        let kind = secret.kind();
+        let candidates: Vec<&SlotRecord> = match secret {
+            SlotSecret::AccountPassword(_, machine) => self
+                .header()
+                .slots
+                .iter()
+                .filter(|slot| slot.made_on(machine))
+                .take(1)
+                .collect(),
+            _ => self
+                .header()
+                .slots
+                .iter()
+                .filter(|slot| slot.kind == kind)
+                .collect(),
         };
-        let candidates: Vec<&SlotRecord> = self
-            .header()
-            .slots
-            .iter()
-            .filter(|slot| slot.kind == kind)
-            .collect();
         if candidates.is_empty() {
             return Err(VaultError::NoUsableSlot {
                 kinds: self.header().slots.iter().map(|slot| slot.kind).collect(),
             });
         }
-        if let SlotSecret::Password(password) = secret {
+        if let SlotSecret::Password(password) | SlotSecret::AccountPassword(password, _) = secret {
             if password.expose().len() > MAX_PASSWORD_BYTES {
                 // No password slot holds a longer one (`check_new_password`): nothing to derive.
                 return Err(VaultError::WrongSecret { kinds: vec![kind] });
@@ -408,28 +515,31 @@ impl VaultFile {
         let mut refused = None;
         let mut tried = false;
         for slot in candidates {
-            let material = match (&slot.body, secret) {
+            let derived = match (&slot.body, secret) {
                 (SlotBody::Password { kdf, salt, .. }, SlotSecret::Password(password)) => {
-                    match derive_password_material(password, salt, kdf, policy) {
-                        Ok(material) => material,
-                        Err(
-                            e @ (VaultError::KdfTooWeak { .. } | VaultError::KdfOutOfRange { .. }),
-                        ) => {
-                            if refused.is_none() {
-                                refused = Some(e);
-                            }
-                            continue;
-                        }
-                        Err(e) => return Err(e),
-                    }
+                    derive_password_material(password, salt, kdf, policy)
+                        .map(|material| Zeroizing::new(material.to_vec()))
                 }
+                (
+                    SlotBody::OsPassword { kdf, salt, .. },
+                    SlotSecret::AccountPassword(password, machine),
+                ) => os_password_material(password, salt, kdf, machine, policy)
+                    .map(|material| Zeroizing::new(material.to_vec())),
                 (SlotBody::RecoveryKey { .. }, SlotSecret::RecoveryKey(key)) => {
-                    let mut material = Zeroizing::new([0u8; MATERIAL_LEN]);
-                    material.copy_from_slice(key.key_bytes());
-                    material
+                    Ok(Zeroizing::new(key.key_bytes().to_vec()))
                 }
                 // `parse` ties a known kind to its body; nothing else is a candidate.
                 _ => continue,
+            };
+            let material = match derived {
+                Ok(material) => material,
+                Err(e @ (VaultError::KdfTooWeak { .. } | VaultError::KdfOutOfRange { .. })) => {
+                    if refused.is_none() {
+                        refused = Some(e);
+                    }
+                    continue;
+                }
+                Err(e) => return Err(e),
             };
             tried = true;
             if let Some(dk) = self.try_slot(slot, &material[..])? {
@@ -458,7 +568,9 @@ impl VaultFile {
             .iter()
             .map(|slot| {
                 let verdict = match &slot.body {
-                    SlotBody::Password { kdf, .. } => policy.check(kdf),
+                    SlotBody::Password { kdf, .. } | SlotBody::OsPassword { kdf, .. } => {
+                        policy.check(kdf)
+                    }
                     _ => Ok(()),
                 };
                 (slot.id, verdict)
@@ -471,6 +583,13 @@ impl VaultFile {
     fn try_slot(&self, slot: &SlotRecord, material: &[u8]) -> VaultResult<Option<DataKey>> {
         let (salt, wrap_nonce, stored_check, wrapped) = match &slot.body {
             SlotBody::Password {
+                salt,
+                wrap_nonce,
+                key_check,
+                wrapped_dk,
+                ..
+            }
+            | SlotBody::OsPassword {
                 salt,
                 wrap_nonce,
                 key_check,
@@ -1228,6 +1347,229 @@ mod tests {
         }
     }
 
+    const ACCOUNT: &str = "hunter2 is not a password";
+
+    /// A machine id of 16 raw bytes, all `which`.
+    fn machine(which: u8) -> MachineId {
+        MachineId::new(&[which; 16]).unwrap()
+    }
+
+    fn account_slot(password: &str, on: u8) -> NewSlot {
+        NewSlot::OsPassword {
+            secret: SecretString::new(password),
+            label: format!("account password of walker on box-{on:x}"),
+            enrolled_at: 1_760_000_000,
+            machine: machine(on),
+        }
+    }
+
+    fn account(password: &str, on: u8) -> SlotSecret {
+        SlotSecret::AccountPassword(SecretString::new(password), machine(on))
+    }
+
+    /// A fast vault of `slots` and the recovery key `0x11`, made with OS randomness.
+    fn vault_of(mut slots: Vec<NewSlot>) -> (VaultFile, UnlockedVault) {
+        slots.push(NewSlot::RecoveryKey {
+            key: recovery(0x11),
+            label: "recovery key".into(),
+        });
+        let (bytes, made) = create(STORE, WRITER, payload(), slots, FAST, &mut OsRandom).unwrap();
+        (VaultFile::parse(&bytes).unwrap(), made)
+    }
+
+    /// B54: the account password opens the slot made on its computer, to the vault's one data
+    /// key; on another computer the slot is not even tried; a wrong password is a wrong secret.
+    #[test]
+    fn an_account_password_slot_opens_only_on_its_computer() {
+        let (file, made) = vault_of(vec![account_slot(ACCOUNT, 0xa)]);
+        let opened = file.open(&account(ACCOUNT, 0xa), FAST).unwrap();
+        assert_eq!(opened.data_key().expose(), made.data_key().expose());
+        let before = derivations();
+        match file.open(&account(ACCOUNT, 0xb), FAST) {
+            Err(VaultError::NoUsableSlot { kinds }) => {
+                assert_eq!(kinds, [SlotKind::OsPassword, SlotKind::RecoveryKey])
+            }
+            other => panic!("{:?}", other.map(|_| "opened")),
+        }
+        assert_eq!(
+            derivations(),
+            before,
+            "another computer's slot is never derived"
+        );
+        match file.open(&account("not the account password", 0xa), FAST) {
+            Err(VaultError::WrongSecret { kinds }) => assert_eq!(kinds, [SlotKind::OsPassword]),
+            other => panic!("{:?}", other.map(|_| "opened")),
+        }
+        assert_eq!(derivations(), before + 1);
+    }
+
+    /// Critic-plan M1: a lock password never opens an account-password slot, of the same text
+    /// or not — nothing is derived for one: it has no machine id to bind.
+    #[test]
+    fn a_lock_password_never_opens_an_account_password_slot() {
+        let (file, _) = vault_of(vec![account_slot(ACCOUNT, 0xa)]);
+        let before = derivations();
+        assert!(matches!(
+            file.open(&password(ACCOUNT), FAST),
+            Err(VaultError::NoUsableSlot { .. })
+        ));
+        assert_eq!(derivations(), before);
+    }
+
+    /// B77: a second slot with this computer's tag — a forged or damaged header, which no
+    /// write of the core makes (`add_slot` replaces, `create` refuses) — is never tried;
+    /// another computer's slot opens there.
+    #[test]
+    fn a_second_slot_of_this_computer_is_never_tried() {
+        let (_, mut made) = vault_of(vec![
+            account_slot(ACCOUNT, 0xa),
+            account_slot("on box b", 0xb),
+        ]);
+        let forged = made
+            .new_record(account_slot("the second one", 0xa), FAST, &mut OsRandom)
+            .unwrap();
+        made.header.slots.push(forged);
+        let file = VaultFile::parse(&made.seal(WRITER, &mut OsRandom).unwrap()).unwrap();
+        let before = derivations();
+        assert!(matches!(
+            file.open(&account("the second one", 0xa), FAST),
+            Err(VaultError::WrongSecret { .. })
+        ));
+        assert_eq!(
+            derivations(),
+            before + 1,
+            "only this computer's first slot is tried"
+        );
+        assert!(file.open(&account(ACCOUNT, 0xa), FAST).is_ok());
+        assert!(file.open(&account("on box b", 0xb), FAST).is_ok());
+    }
+
+    /// B77 (ADR 0069 §3): one account-password slot per computer — `add_slot` replaces this
+    /// computer's in the same write (the re-enrolment) and keeps another computer's; `create`
+    /// refuses two for one computer before anything is drawn or derived.
+    #[test]
+    fn one_account_password_slot_per_computer_is_written() {
+        let (_, mut v) = vault_of(vec![
+            account_slot(ACCOUNT, 0xa),
+            account_slot("on box b", 0xb),
+        ]);
+        let old = v.header().slots[0].id;
+        let new = v
+            .add_slot(account_slot("the new one", 0xa), FAST, &mut OsRandom)
+            .unwrap();
+        let ids: Vec<SlotId> = v.header().slots.iter().map(|slot| slot.id).collect();
+        assert!(!ids.contains(&old), "this computer's slot is replaced");
+        assert_eq!(ids.len(), 3);
+        assert_eq!(ids[2], new);
+        let file = VaultFile::parse(&v.seal(WRITER, &mut OsRandom).unwrap()).unwrap();
+        assert!(file.open(&account("the new one", 0xa), FAST).is_ok());
+        assert!(matches!(
+            file.open(&account(ACCOUNT, 0xa), FAST),
+            Err(VaultError::WrongSecret { .. })
+        ));
+        assert!(file.open(&account("on box b", 0xb), FAST).is_ok());
+        let before = derivations();
+        let twice = vec![
+            account_slot(ACCOUNT, 0xa),
+            account_slot("again", 0xa),
+            NewSlot::RecoveryKey {
+                key: recovery(1),
+                label: String::new(),
+            },
+        ];
+        assert!(matches!(
+            create(
+                STORE,
+                WRITER,
+                payload(),
+                twice,
+                FAST,
+                &mut ScriptedRandom::new(Vec::new())
+            ),
+            Err(VaultError::InvalidInput(InputWhat::OneSlotPerComputer))
+        ));
+        assert_eq!(derivations(), before);
+    }
+
+    /// ADR 0068 §3: only a lock password or a recovery key is device-independent; a removal
+    /// never leaves a vault whose only usable slot is an account password's.
+    #[test]
+    fn an_account_password_slot_never_counts_as_device_independent() {
+        let (_, mut v) = vault_of(vec![
+            NewSlot::Password {
+                secret: SecretString::new(PASSWORD),
+                label: "lock password".into(),
+            },
+            account_slot(ACCOUNT, 0xa),
+        ]);
+        // A vault without a recovery slot (damaged, or hand-made).
+        v.header
+            .slots
+            .retain(|slot| slot.kind != SlotKind::RecoveryKey);
+        let lock_password = v.header.slots[0].id;
+        assert!(matches!(
+            v.remove_slot(lock_password, FAST),
+            Err(VaultError::NoUsableSlotLeft)
+        ));
+    }
+
+    /// O2's three refusals hold for the account password too, before anything is drawn or
+    /// derived: not empty, at most 1024 bytes, not recovery-key shaped (one prompt reads it).
+    #[test]
+    fn an_account_password_is_checked_as_a_lock_password_is() {
+        let nothing = || ScriptedRandom::new(Vec::new());
+        let recovery_slot = || NewSlot::RecoveryKey {
+            key: recovery(1),
+            label: String::new(),
+        };
+        let before = derivations();
+        let long = "a".repeat(1025);
+        let shaped = "QQQSY-QCYQ5-RQWZQ-FPG9S-CRGWP-UGPZY-SNZS2-3V9CC-RYDPK-8QARC-0SY3K-4UK";
+        for (text, problem) in [
+            ("", PasswordProblem::Empty),
+            (long.as_str(), PasswordProblem::TooLong { max: 1024 }),
+            (shaped, PasswordProblem::RecoveryKeyShape),
+        ] {
+            let slots = vec![account_slot(text, 0xa), recovery_slot()];
+            assert!(
+                matches!(
+                    create(STORE, WRITER, payload(), slots, FAST, &mut nothing()),
+                    Err(VaultError::PasswordRefused(p)) if p == problem
+                ),
+                "{problem:?}"
+            );
+        }
+        let mut bad_label = account_slot(ACCOUNT, 0xa);
+        if let NewSlot::OsPassword { label, .. } = &mut bad_label {
+            *label = "bell\u{7}".into();
+        }
+        assert!(matches!(
+            create(
+                STORE,
+                WRITER,
+                payload(),
+                vec![bad_label, recovery_slot()],
+                FAST,
+                &mut nothing()
+            ),
+            Err(VaultError::InvalidInput(InputWhat::Label))
+        ));
+        assert_eq!(derivations(), before);
+    }
+
+    /// What c1's `lock slot add os-password` builds on: `add_slot` adds one, and every slot opens.
+    #[test]
+    fn an_account_password_slot_is_added_and_opens() {
+        let (_, mut v) = vault();
+        v.add_slot(account_slot(ACCOUNT, 0xa), FAST, &mut OsRandom)
+            .unwrap();
+        let file = VaultFile::parse(&v.seal(WRITER, &mut OsRandom).unwrap()).unwrap();
+        assert_eq!(file.header().slots[2].kind, SlotKind::OsPassword);
+        assert!(file.open(&account(ACCOUNT, 0xa), FAST).is_ok());
+        assert!(file.open(&password(PASSWORD), FAST).is_ok());
+        assert!(file.open(&recovery_secret(0x11), FAST).is_ok());
+    }
+
     #[test]
     fn no_debug_output_shows_a_secret() {
         let fold = |text: &str| text.to_lowercase().replace(['-', '_', ' ', '\n'], "");
@@ -1243,6 +1585,8 @@ mod tests {
             fold(IDENTITY),
             fold(&shown.expose()["APPRAFTER-RECOVERY-KEY-1\n".len()..]),
             hex(v.data_key().expose()),
+            fold(ACCOUNT),
+            hex(&[0x0a; 16]),
         ];
         let outputs = [
             format!("{v:?}"),
@@ -1255,6 +1599,9 @@ mod tests {
             format!("{:?}", SlotInput::from_input(SecretString::new(PASSWORD))),
             format!("{:?}", SlotInput::from_input(SecretString::new(mistyped))),
             format!("{:?}", key.confirm(shown.expose()).unwrap()),
+            format!("{:?}", account(ACCOUNT, 0xa)),
+            format!("{:?}", account_slot(ACCOUNT, 0xa)),
+            format!("{:?}", machine(0xa)),
         ];
         for output in &outputs {
             let folded = fold(output);

@@ -249,6 +249,8 @@ pub enum InputWhat {
     StoreId,
     Writer,
     NoRecoverySlot,
+    MachineId,
+    OneSlotPerComputer,
 }
 
 impl fmt::Display for InputWhat {
@@ -258,6 +260,12 @@ impl fmt::Display for InputWhat {
             Self::StoreId => "a store id is 1 to 64 printable ASCII characters without spaces",
             Self::Writer => "a vault's writer is 1 to 64 printable ASCII characters",
             Self::NoRecoverySlot => "a new vault needs a recovery-key slot",
+            Self::MachineId => {
+                "a machine id is 16 raw bytes or 32 lower-case hex characters, never all zero"
+            }
+            Self::OneSlotPerComputer => {
+                "a vault holds at most one account-password slot per computer"
+            }
         })
     }
 }

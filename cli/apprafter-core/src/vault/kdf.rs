@@ -16,8 +16,11 @@
 
 use zeroize::Zeroizing;
 
+use sha2::{Digest, Sha256};
+
 use super::error::{VaultError, VaultResult};
-use super::format::SALT_LEN;
+use super::format::{SlotId, MACHINE_TAG_LEN, SALT_LEN};
+use super::keys::MachineId;
 use crate::context::SecretString;
 
 /// The 32 bytes a slot secret yields before HKDF: the Argon2id output, or a recovery key.
@@ -209,6 +212,59 @@ pub(crate) fn slot_keys(material: &[u8], salt: &[u8; SALT_LEN], kind: u8) -> Slo
     hkdf.expand_multi_info(&[INFO_CHECK, &kind[..]], &mut key_check[..])
         .expect("32 bytes is a valid HKDF-SHA256 output length");
     SlotKeys { kek, key_check }
+}
+
+/// The domain of an account-password slot's machine secret (B54).
+const MACHINE_SECRET_DOMAIN: &[u8] = b"apprafter-vault/v1/machine-secret\0";
+/// The domain of an account-password slot's per-slot machine tag (B54).
+const MACHINE_TAG_DOMAIN: &[u8] = b"apprafter-vault/v1/machine\0";
+
+/// An account-password slot's material: Argon2id's 32 bytes, then the machine secret's 32.
+pub(crate) const OS_PASSWORD_MATERIAL_LEN: usize = 2 * MATERIAL_LEN;
+
+/// `SHA-256("apprafter-vault/v1/machine-secret\0" ‖ machine id)` (B54): what binds an
+/// account-password slot's key to this computer, so a copy of the vault without the machine
+/// id tests no guess of the password. Zeroed on drop; the hash state that absorbed the id is
+/// not (T29's stated limit; the id is no secret from a program running as the person).
+pub(crate) fn machine_secret(machine: &MachineId) -> Zeroizing<[u8; 32]> {
+    let mut secret = Zeroizing::new([0u8; 32]);
+    let mut hasher = Sha256::new();
+    hasher.update(MACHINE_SECRET_DOMAIN);
+    hasher.update(machine.bytes());
+    hasher.finalize_into(sha2::digest::generic_array::GenericArray::from_mut_slice(
+        &mut secret[..],
+    ));
+    secret
+}
+
+/// `SHA-256("apprafter-vault/v1/machine\0" ‖ slot id ‖ machine id)[..8]` (B54): says "made on
+/// this computer" without a secret, and links no two slots — or stores — of one computer.
+pub(crate) fn machine_tag(slot: &SlotId, machine: &MachineId) -> [u8; MACHINE_TAG_LEN] {
+    let mut hasher = Sha256::new();
+    hasher.update(MACHINE_TAG_DOMAIN);
+    hasher.update(slot.0);
+    hasher.update(machine.bytes());
+    let digest = hasher.finalize();
+    let mut tag = [0u8; MACHINE_TAG_LEN];
+    tag.copy_from_slice(&digest[..MACHINE_TAG_LEN]);
+    tag
+}
+
+/// An account-password slot's material (B54): Argon2id over the password as typed, exactly
+/// as a lock password's ([`derive_password_material`], the policy first), then this
+/// computer's [`machine_secret`] — 64 bytes into [`slot_keys`].
+pub(crate) fn os_password_material(
+    password: &SecretString,
+    salt: &[u8; SALT_LEN],
+    params: &Argon2idParams,
+    machine: &MachineId,
+    policy: &KdfPolicy,
+) -> VaultResult<Zeroizing<[u8; OS_PASSWORD_MATERIAL_LEN]>> {
+    let argon = derive_password_material(password, salt, params, policy)?;
+    let mut material = Zeroizing::new([0u8; OS_PASSWORD_MATERIAL_LEN]);
+    material[..MATERIAL_LEN].copy_from_slice(&argon[..]);
+    material[MATERIAL_LEN..].copy_from_slice(&machine_secret(machine)[..]);
+    Ok(material)
 }
 
 #[cfg(test)]
@@ -426,6 +482,30 @@ mod tests {
         // The kind is part of the info: the same material keys another kind differently.
         let other_kind = slot_keys(&seq_array::<32>(0x00), &seq_array(0xb8), 0x01);
         assert_ne!(other_kind.kek[..], keys.kek[..]);
+    }
+
+    /// B54: an account-password slot's material is Argon2id's 32 bytes, then the machine
+    /// secret; another machine id gives other keys; the tag is per slot and per machine.
+    #[test]
+    fn the_machine_id_binds_an_account_password_slots_key() {
+        let password = SecretString::new(PASSWORD);
+        let linux = MachineId::new(b"5f0d6a3e0c2b4f6a8d9e1b2c3d4e5f60").unwrap();
+        let mac = MachineId::new(&seq_array::<16>(0x3c)).unwrap();
+        let fast = &KdfPolicy::INSECURE_FAST;
+        let p = params(32, 1, 1);
+        let argon = derive_password_material(&password, SALT, &p, fast).unwrap();
+        let on_linux = os_password_material(&password, SALT, &p, &linux, fast).unwrap();
+        let on_mac = os_password_material(&password, SALT, &p, &mac, fast).unwrap();
+        assert_eq!(on_linux.len(), 64);
+        assert_eq!(on_linux[..32], argon[..]);
+        assert_eq!(on_linux[32..], machine_secret(&linux)[..]);
+        assert_ne!(on_linux[..], on_mac[..]);
+        let check = |material: &[u8]| slot_keys(material, SALT, 0x03).key_check;
+        assert_ne!(check(&on_linux[..])[..], check(&on_mac[..])[..]);
+        let (one, two) = (SlotId([1; 16]), SlotId([2; 16]));
+        assert_ne!(machine_tag(&one, &linux), machine_tag(&two, &linux));
+        assert_ne!(machine_tag(&one, &linux), machine_tag(&one, &mac));
+        assert_ne!(machine_secret(&linux)[..], machine_secret(&mac)[..]);
     }
 
     /// The fast-params vector's Argon2id output, through our call path (libargon2 agreed when
