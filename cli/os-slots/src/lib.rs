@@ -25,6 +25,8 @@ pub mod machine;
 mod macos;
 pub mod outcome;
 mod pam;
+#[cfg(feature = "test-support")]
+pub mod stand_in;
 
 use std::time::SystemTime;
 
