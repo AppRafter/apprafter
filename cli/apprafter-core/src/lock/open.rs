@@ -170,9 +170,12 @@ pub struct OpenedVault {
 }
 
 /// Opens the vault of the store at `root`, whose `store.yaml` names `id`, with one prompt's
-/// `input` under `policy`, in this process (T62): a recovery key tries the recovery slots,
-/// anything else the password slots, and recovery-key-shaped input whose checksum fails is tried
-/// as a password too and, when that fails, is `recovery_key_invalid` naming its group. A secret
+/// `input` under `policy`, in this process (T62): a recovery key tries the recovery slots; a
+/// lock password the lock-password slots; the account password this computer's
+/// account-password slot (B54); typed text the lock-password slot, then this computer's
+/// account-password slot (B27, the prompt's input from d4b-c1 on); recovery-key-shaped input
+/// whose checksum fails is tried as a lock password too and, when that fails, is
+/// `recovery_key_invalid` naming its group. A secret
 /// no slot takes is one failed attempt (`unlock_failed`, `attempts: 1`), for the caller to
 /// count. The vault is read and checked to be this store's first (`vault_unreadable`, T29).
 pub fn open_at(
@@ -186,6 +189,10 @@ pub fn open_at(
     let opened = match input {
         SlotInput::RecoveryKey(key) => parsed.open(&SlotSecret::RecoveryKey(key), policy),
         SlotInput::Password(password) => parsed.open(&SlotSecret::Password(password), policy),
+        SlotInput::AccountPassword(password, machine) => {
+            parsed.open(&SlotSecret::AccountPassword(password, machine), policy)
+        }
+        SlotInput::Typed(typed, machine) => parsed.open_typed(&typed, machine.as_ref(), policy),
         SlotInput::MistypedRecoveryKey { as_password, error } => {
             match parsed.open(&SlotSecret::Password(as_password), policy) {
                 Err(VaultError::WrongSecret { .. } | VaultError::NoUsableSlot { .. }) => {
@@ -362,7 +369,9 @@ mod check_password_tests {
 mod open_at_tests {
     use super::*;
     use crate::context::SecretString;
-    use crate::secrets::testing::locked_store;
+    use crate::secrets::testing::{locked_store, LockedTestStore};
+    use crate::vault::{MachineId, NewSlot, OsRandom, VAULT_FILE};
+    use cli_core::StoreLock;
 
     const TOKEN: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 
@@ -451,5 +460,93 @@ mod open_at_tests {
                 ..
             })
         ));
+    }
+
+    const ACCOUNT: &str = "hunter2 is not a password";
+
+    fn here() -> MachineId {
+        MachineId::new(&[0x0a; 16]).unwrap()
+    }
+
+    /// `made`'s vault with this computer's account-password slot added (fast costs), as d4b-c1's
+    /// `lock slot add os-password` will add one.
+    fn with_account_password(root: &Path, made: &LockedTestStore) {
+        let path = root.join(VAULT_FILE);
+        let bytes = crate::vault::file::read(&path).unwrap();
+        let mut opened = VaultFile::parse(&bytes)
+            .unwrap()
+            .open_with_key(made.data_key(), made.vault_id)
+            .unwrap();
+        opened
+            .add_slot(
+                NewSlot::OsPassword {
+                    secret: SecretString::new(ACCOUNT),
+                    label: "account password of walker on box-a".into(),
+                    enrolled_at: 1_760_000_000,
+                    machine: here(),
+                },
+                &KdfPolicy::INSECURE_FAST,
+                &mut OsRandom,
+            )
+            .unwrap();
+        let sealed = opened.seal("apprafter 0.0.0-test", &mut OsRandom).unwrap();
+        let held = StoreLock::exclusive(&TargetStorePaths::for_root(root.to_path_buf())).unwrap();
+        crate::vault::file::replace(&path, &sealed, &held).unwrap();
+    }
+
+    fn one_failed_attempt(result: CoreResult<OpenedVault>) {
+        match result.unwrap_err() {
+            CoreError::Cli(CliError::UnlockFailed { attempts: 1, .. }) => {}
+            e => panic!("expected one failed attempt, got {e:?}"),
+        }
+    }
+
+    /// B27 (the prompt's input from d4b-c1 on): typed text opens this computer's
+    /// account-password slot; without its machine id, or with another computer's, it is one
+    /// failed attempt.
+    #[test]
+    fn typed_text_opens_this_computers_account_password_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("store");
+        let made = locked_store(&root, &[("prod", Some(TOKEN))]);
+        with_account_password(&root, &made);
+        let fast = &KdfPolicy::INSECURE_FAST;
+        let typed = || SecretString::new(ACCOUNT);
+        let input = SlotInput::Typed(typed(), Some(here()));
+        let opened = open_at(&root, &made.store_id, input, fast).unwrap();
+        assert_eq!(opened.key.expose(), made.data_key().expose());
+        one_failed_attempt(open_at(
+            &root,
+            &made.store_id,
+            SlotInput::Typed(typed(), None),
+            fast,
+        ));
+        let elsewhere = MachineId::new(&[0x0b; 16]).unwrap();
+        let input = SlotInput::Typed(typed(), Some(elsewhere));
+        one_failed_attempt(open_at(&root, &made.store_id, input, fast));
+    }
+
+    /// Critic-plan M1, B56: a lock password's input never opens an account-password slot; the
+    /// account password's opens this computer's slot only.
+    #[test]
+    fn the_account_password_input_opens_only_this_computers_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("store");
+        let made = locked_store(&root, &[("prod", Some(TOKEN))]);
+        with_account_password(&root, &made);
+        let fast = &KdfPolicy::INSECURE_FAST;
+        let typed = || SecretString::new(ACCOUNT);
+        one_failed_attempt(open_at(
+            &root,
+            &made.store_id,
+            SlotInput::Password(typed()),
+            fast,
+        ));
+        let input = SlotInput::AccountPassword(typed(), here());
+        let opened = open_at(&root, &made.store_id, input, fast).unwrap();
+        assert_eq!(opened.vault_id, made.vault_id);
+        let elsewhere = MachineId::new(&[0x0b; 16]).unwrap();
+        let input = SlotInput::AccountPassword(typed(), elsewhere);
+        one_failed_attempt(open_at(&root, &made.store_id, input, fast));
     }
 }

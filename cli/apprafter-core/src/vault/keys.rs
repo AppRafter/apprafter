@@ -3,9 +3,10 @@
 
 use std::fmt;
 
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
-use super::error::{RecoveryKeyError, VaultResult};
+use super::error::{InputWhat, RecoveryKeyError, VaultError, VaultResult};
+use super::format::SlotKind;
 use super::recovery::{looks_like_recovery_key, RecoveryKey};
 use super::rng::VaultRng;
 use crate::context::SecretString;
@@ -55,16 +56,71 @@ impl fmt::Debug for DataKey {
     }
 }
 
+/// This computer's machine id as the OS gives it (D.4b B54, B76): on Linux the 32 lower-case
+/// hex characters of `/etc/machine-id` without the line end, on macOS the 16 raw bytes
+/// `gethostuuid()` fills. The OS crate's glue reads it (d4b-d); the vault only hashes it,
+/// into an account-password slot's key and its per-slot tag. `Debug` shows nothing; zeroed on
+/// drop.
+#[derive(Clone)]
+pub struct MachineId(Zeroizing<Vec<u8>>);
+
+impl MachineId {
+    /// `bytes` as a machine id: 16 raw bytes, or 32 lower-case hex characters, and not a null
+    /// id. Anything else — empty, a line end left on, upper case, another length, all zero
+    /// bytes or all `'0'`s — is refused, so a reader's slip can never bind a slot to a
+    /// constant (`InvalidInput(MachineId)`).
+    pub fn new(bytes: &[u8]) -> VaultResult<MachineId> {
+        let raw_uuid = bytes.len() == 16;
+        let hex_id = bytes.len() == 32
+            && bytes
+                .iter()
+                .all(|b| matches!(*b, b'0'..=b'9' | b'a'..=b'f'));
+        // A null id — what a failed read leaves in a zeroed buffer, and an id systemd calls
+        // uninitialised — would bind every such slot to one constant (critic round, 2).
+        let null = bytes.iter().all(|b| *b == 0) || bytes.iter().all(|b| *b == b'0');
+        if !(raw_uuid || hex_id) || null {
+            return Err(VaultError::InvalidInput(InputWhat::MachineId));
+        }
+        Ok(MachineId(Zeroizing::new(bytes.to_vec())))
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for MachineId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("MachineId(..)")
+    }
+}
+
 /// A secret that opens the slots of its kind.
 pub enum SlotSecret {
+    /// A lock password: the `0x01` slots only.
     Password(SecretString),
+    /// The account password as typed, with this computer's machine id: the first `0x03` slot
+    /// made on this computer only (B54, B77), never another computer's.
+    AccountPassword(SecretString, MachineId),
     RecoveryKey(RecoveryKey),
+}
+
+impl SlotSecret {
+    /// The kind of slot this secret opens.
+    pub(crate) fn kind(&self) -> SlotKind {
+        match self {
+            SlotSecret::Password(_) => SlotKind::Password,
+            SlotSecret::AccountPassword(..) => SlotKind::OsPassword,
+            SlotSecret::RecoveryKey(_) => SlotKind::RecoveryKey,
+        }
+    }
 }
 
 impl fmt::Debug for SlotSecret {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             SlotSecret::Password(_) => "SlotSecret::Password(..)",
+            SlotSecret::AccountPassword(..) => "SlotSecret::AccountPassword(..)",
             SlotSecret::RecoveryKey(_) => "SlotSecret::RecoveryKey(..)",
         })
     }
@@ -74,8 +130,17 @@ impl fmt::Debug for SlotSecret {
 pub enum SlotInput {
     /// Input of a recovery key's shape whose checksum holds.
     RecoveryKey(RecoveryKey),
-    /// Anything else.
+    /// A lock password: the `0x01` slots only — what `open_slot_at(Password)` and `lock on`'s
+    /// resume take (D.4a rule 4; critic-plan M1). Never an account-password slot.
     Password(SecretString),
+    /// The account password, with this computer's machine id: this computer's `0x03` slot
+    /// only — the resume of a store whose everyday way in it is (B56, d4b-c3).
+    AccountPassword(SecretString, MachineId),
+    /// Text typed at a prompt that is not recovery-key shaped (B27): the lock-password slot,
+    /// then, with this computer's machine id, the account-password slot made on this
+    /// computer. The prompt's input from d4b-c1 on; until then [`SlotInput::from_input`]
+    /// answers `Password`, as it did.
+    Typed(SecretString, Option<MachineId>),
     /// Recovery-key shaped but failing its checksum: it is tried against the password slots
     /// too, and only when they refuse it is `error` reported, as one attempt.
     MistypedRecoveryKey {
@@ -104,6 +169,8 @@ impl fmt::Debug for SlotInput {
         match self {
             SlotInput::RecoveryKey(_) => f.write_str("SlotInput::RecoveryKey(..)"),
             SlotInput::Password(_) => f.write_str("SlotInput::Password(..)"),
+            SlotInput::AccountPassword(..) => f.write_str("SlotInput::AccountPassword(..)"),
+            SlotInput::Typed(..) => f.write_str("SlotInput::Typed(..)"),
             SlotInput::MistypedRecoveryKey { error, .. } => {
                 write!(f, "SlotInput::MistypedRecoveryKey({error:?}, ..)")
             }
@@ -114,7 +181,6 @@ impl fmt::Debug for SlotInput {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vault::error::VaultError;
     use crate::vault::rng::ScriptedRandom;
 
     const SHOWN: &str =
@@ -161,6 +227,52 @@ mod tests {
             ),
             other => panic!("{other:?}"),
         }
+    }
+
+    /// B76: 16 raw bytes (macOS) or 32 lower-case hex characters (Linux), nothing else and
+    /// never a null id — a reader's slip never weakens the binding to a constant.
+    #[test]
+    fn a_machine_id_is_16_raw_bytes_or_32_hex_characters() {
+        assert!(MachineId::new(&[0xff; 16]).is_ok());
+        assert!(MachineId::new(b"5f0d6a3e0c2b4f6a8d9e1b2c3d4e5f60").is_ok());
+        for bad in [
+            &b""[..],
+            &b"5f0d6a3e0c2b4f6a8d9e1b2c3d4e5f6"[..],
+            &b"5f0d6a3e0c2b4f6a8d9e1b2c3d4e5f60\n"[..],
+            &b"5F0D6A3E0C2B4F6A8D9E1B2C3D4E5F60"[..],
+            &b"5f0d6a3e0c2b4f6a8d9e1b2c3d4e5f6g"[..],
+            &b"00000000000000000000000000000000"[..],
+            &[0u8; 16][..],
+            &[0u8; 32][..],
+            &[0u8; 15][..],
+            &[0u8; 17][..],
+        ] {
+            assert!(
+                matches!(
+                    MachineId::new(bad),
+                    Err(VaultError::InvalidInput(InputWhat::MachineId))
+                ),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            format!("{:?}", MachineId::new(&[7; 16]).unwrap()),
+            "MachineId(..)"
+        );
+    }
+
+    #[test]
+    fn the_new_inputs_print_nothing() {
+        let here = MachineId::new(b"5f0d6a3e0c2b4f6a8d9e1b2c3d4e5f60").unwrap();
+        let typed = SlotInput::Typed(SecretString::new("hunter2"), Some(here.clone()));
+        assert_eq!(format!("{typed:?}"), "SlotInput::Typed(..)");
+        let account = SlotInput::AccountPassword(SecretString::new("hunter2"), here);
+        assert_eq!(format!("{account:?}"), "SlotInput::AccountPassword(..)");
+        // Until d4b-c1 moves the prompt to `Typed`, typed text stays the lock password's input.
+        assert!(matches!(
+            SlotInput::from_input(SecretString::new("hunter2")),
+            SlotInput::Password(_)
+        ));
     }
 
     #[test]

@@ -1594,6 +1594,7 @@ const CLI_MEMBERS: &[&str] = &[
     "apprafter-core",
     "backup-core",
     "apprafter-backup",
+    "os-slots",
 ];
 
 /// What builds a context from, or looks a location up in, the real environment of whoever runs
@@ -2613,6 +2614,28 @@ fn f(p: &std::path::Path, b: &[u8]) {
         assert_eq!(doors, vec!["crate::vault::file", "crate::vault::VaultFile"]);
     }
 
+    /// D.4b B8: a client reads a vault's id through `secrets`, which is no vault door, while
+    /// a door named beside it is still seen (a scanner that over- or under-matches fails
+    /// this: critic round, finding 6).
+    #[test]
+    fn the_vault_id_on_disk_is_no_vault_door() {
+        let src = "\
+use apprafter_core::secrets::vault_id_on_disk;
+use apprafter_core::vault::{self, VaultId};
+fn f(p: &std::path::Path) -> Option<VaultId> {
+    let _ = vault::file::read(p);
+    vault_id_on_disk(p).ok().flatten()
+}
+";
+        let doors: Vec<String> = scan_source(Path::new("x.rs"), src)
+            .findings
+            .into_iter()
+            .filter(|f| f.kind == Kind::VaultDoor)
+            .map(|f| f.callee)
+            .collect();
+        assert_eq!(doors, vec!["apprafter_core::vault::file"]);
+    }
+
     /// The lock flows' file doors are seen through `{self, …}` imports too (critic finding 9).
     #[test]
     fn a_transfer_door_is_seen_through_its_import() {
@@ -2977,80 +3000,148 @@ const INSECURE_KDF_FEATURE: &str = "insecure-fast-kdf";
 /// feature that exists.
 const INSECURE_KDF_FORWARDERS: &[(&str, &str)] = &[("desktop/src-tauri/Cargo.toml", "test-build")];
 
-/// Where a manifest turns `apprafter-core/insecure-fast-kdf` on outside `[dev-dependencies]`:
-/// a dependency edge on apprafter-core that lists it (in `[dependencies]`,
-/// `[build-dependencies]`, `[workspace.dependencies]` or a target table; renamed or not), a
-/// feature that forwards it (other than [`INSECURE_KDF_FORWARDERS`]), or — in apprafter-core's
-/// own manifest — another feature, `default` included, that pulls it in.
+/// A feature that must stay in tests: the package that declares it, its name, and the
+/// `(manifest, feature)` pairs allowed to forward it (each must name a feature that exists).
+struct FeatureRule {
+    package: &'static str,
+    feature: &'static str,
+    forwarders: &'static [(&'static str, &'static str)],
+}
+
+/// L4 (D.4a T23).
+const INSECURE_KDF: FeatureRule = FeatureRule {
+    package: "apprafter-core",
+    feature: INSECURE_KDF_FEATURE,
+    forwarders: INSECURE_KDF_FORWARDERS,
+};
+
+/// G-OS2 (D.4b B43): the os-slots stand-ins (`ScriptedAccountPassword`) reach no shipped build.
+/// `platform-cli`'s `test-os-slots` (d4b-e1a) and the desktop's test build (d4b-g1b) join
+/// `forwarders` when they forward it; e1a adds the rule for `test-os-slots` itself.
+const OS_SLOTS_TEST_SUPPORT: FeatureRule = FeatureRule {
+    package: "apprafter-os-slots",
+    feature: "test-support",
+    forwarders: &[],
+};
+
+/// L4's rule over one manifest.
 fn insecure_kdf_edges(file: &str, manifest: &str) -> Vec<String> {
+    feature_edges(&INSECURE_KDF, file, manifest)
+}
+
+/// Where a manifest turns `rule`'s feature on outside `[dev-dependencies]`: a dependency edge on
+/// its package that lists it (in `[dependencies]`, `[build-dependencies]`,
+/// `[workspace.dependencies]` or a target table; renamed or not), a feature that forwards it
+/// (other than the rule's forwarders), or — in the package's own manifest — another feature,
+/// `default` included, that pulls it in.
+fn feature_edges(rule: &FeatureRule, file: &str, manifest: &str) -> Vec<String> {
     let doc: toml::Value = manifest
         .parse()
         .unwrap_or_else(|e| panic!("{file} does not parse: {e}"));
-    let is_core = doc
+    let is_owner = doc
         .get("package")
         .and_then(|p| p.get("name"))
         .and_then(|n| n.as_str())
-        == Some("apprafter-core");
-    let mut tables: Vec<(String, &toml::Value)> = Vec::new();
-    for key in ["dependencies", "build-dependencies"] {
-        if let Some(table) = doc.get(key) {
-            tables.push((key.to_string(), table));
-        }
-    }
-    if let Some(table) = doc.get("workspace").and_then(|w| w.get("dependencies")) {
-        tables.push(("workspace.dependencies".to_string(), table));
-    }
-    if let Some(targets) = doc.get("target").and_then(|t| t.as_table()) {
-        for (cfg, target) in targets {
-            for key in ["dependencies", "build-dependencies"] {
-                if let Some(table) = target.get(key) {
-                    tables.push((format!("target.{cfg}.{key}"), table));
-                }
-            }
-        }
-    }
+        == Some(rule.package);
     let mut hits = Vec::new();
-    for (place, table) in tables {
-        let Some(table) = table.as_table() else {
-            continue;
-        };
+    for (place, table) in dependency_tables(&doc, false) {
         for (name, spec) in table {
             let package = spec.get("package").and_then(|p| p.as_str()).unwrap_or(name);
             let enables = spec
                 .get("features")
                 .and_then(|f| f.as_array())
-                .is_some_and(|list| {
-                    list.iter()
-                        .any(|f| f.as_str() == Some(INSECURE_KDF_FEATURE))
-                });
-            if package == "apprafter-core" && enables {
+                .is_some_and(|list| list.iter().any(|f| f.as_str() == Some(rule.feature)));
+            if package == rule.package && enables {
                 hits.push(format!(
-                    "{file}: [{place}] `{name}` enables {INSECURE_KDF_FEATURE}"
+                    "{file}: [{place}] `{name}` enables {}",
+                    rule.feature
                 ));
             }
         }
     }
     if let Some(features) = doc.get("features").and_then(|f| f.as_table()) {
         let forwarded = [
-            format!("apprafter-core/{INSECURE_KDF_FEATURE}"),
-            format!("apprafter-core?/{INSECURE_KDF_FEATURE}"),
+            format!("{}/{}", rule.package, rule.feature),
+            format!("{}?/{}", rule.package, rule.feature),
         ];
         for (feature, list) in features {
             let forwards = list.as_array().into_iter().flatten().any(|item| {
                 let item = item.as_str().unwrap_or_default();
-                forwarded.iter().any(|f| f == item) || (is_core && item == INSECURE_KDF_FEATURE)
+                forwarded.iter().any(|f| f == item) || (is_owner && item == rule.feature)
             });
-            let allowed = INSECURE_KDF_FORWARDERS
+            let allowed = rule
+                .forwarders
                 .iter()
                 .any(|(f, feat)| *f == file && *feat == feature.as_str());
             if forwards && !allowed {
                 hits.push(format!(
-                    "{file}: feature `{feature}` enables {INSECURE_KDF_FEATURE}"
+                    "{file}: feature `{feature}` enables {}",
+                    rule.feature
                 ));
             }
         }
     }
     hits
+}
+
+/// A manifest's dependency tables as `(place, table)`: `[dependencies]`,
+/// `[build-dependencies]`, with `dev` also `[dev-dependencies]`, their target forms, and
+/// `[workspace.dependencies]`.
+fn dependency_tables(doc: &toml::Value, dev: bool) -> Vec<(String, &toml::value::Table)> {
+    let kinds: &[&str] = if dev {
+        &["dependencies", "build-dependencies", "dev-dependencies"]
+    } else {
+        &["dependencies", "build-dependencies"]
+    };
+    let mut tables = Vec::new();
+    for key in kinds {
+        if let Some(table) = doc.get(*key).and_then(|t| t.as_table()) {
+            tables.push(((*key).to_string(), table));
+        }
+    }
+    if let Some(table) = doc
+        .get("workspace")
+        .and_then(|w| w.get("dependencies"))
+        .and_then(|t| t.as_table())
+    {
+        tables.push(("workspace.dependencies".to_string(), table));
+    }
+    if let Some(targets) = doc.get("target").and_then(|t| t.as_table()) {
+        for (cfg, target) in targets {
+            for key in kinds {
+                if let Some(table) = target.get(*key).and_then(|t| t.as_table()) {
+                    tables.push((format!("target.{cfg}.{key}"), table));
+                }
+            }
+        }
+    }
+    tables
+}
+
+/// Every `Cargo.toml` under `cli/` and `desktop/` (as [`manifests_under`] finds them), as
+/// (its path from the repository root, its text).
+fn every_manifest() -> Vec<(String, String)> {
+    let repo = cli_dir()
+        .parent()
+        .expect("cli/ sits in the repository")
+        .to_path_buf();
+    let mut paths = Vec::new();
+    for dir in ["cli", "desktop"] {
+        manifests_under(&repo.join(dir), &mut paths);
+    }
+    paths.sort();
+    paths
+        .into_iter()
+        .map(|path| {
+            let rel = path
+                .strip_prefix(&repo)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {rel}: {e}"));
+            (rel, text)
+        })
+        .collect()
 }
 
 /// Every `Cargo.toml` under `dir`, build output, `node_modules` and dot-directories left out.
@@ -3407,5 +3498,1271 @@ mod tests {
         );
         assert!(hits.is_empty(), "{hits:?}");
         assert_eq!(ct_eq, 0);
+    }
+}
+
+// ---------------------------------------------------------------------
+// G-OS2 (D.4b B43): the os-slots stand-ins stay in tests
+// ---------------------------------------------------------------------
+
+#[test]
+fn the_os_slots_stand_ins_reach_no_shipped_build() {
+    let manifests = every_manifest();
+    let hits: Vec<String> = manifests
+        .iter()
+        .flat_map(|(rel, text)| feature_edges(&OS_SLOTS_TEST_SUPPORT, rel, text))
+        .collect();
+    assert!(
+        hits.is_empty(),
+        "the os-slots stand-ins must never reach a shipped build (D.4b B43, G-OS2):\n{}",
+        hits.join("\n")
+    );
+    let (_, own) = manifests
+        .iter()
+        .find(|(rel, _)| rel == "cli/os-slots/Cargo.toml")
+        .expect("cli/os-slots/Cargo.toml is there");
+    let doc: toml::Value = own.parse().unwrap();
+    assert!(
+        doc.get("features")
+            .and_then(|f| f.get(OS_SLOTS_TEST_SUPPORT.feature))
+            .is_some(),
+        "apprafter-os-slots declares no `test-support`: this guard would see nothing"
+    );
+    for (file, feature) in OS_SLOTS_TEST_SUPPORT.forwarders {
+        let (_, text) = manifests
+            .iter()
+            .find(|(rel, _)| rel == file)
+            .unwrap_or_else(|| panic!("{file} is gone: a stale forwarder"));
+        let doc: toml::Value = text.parse().unwrap();
+        assert!(
+            doc.get("features").and_then(|f| f.get(*feature)).is_some(),
+            "{file} has no feature `{feature}`: a stale forwarder"
+        );
+    }
+}
+
+mod os_slots_test_support {
+    use super::*;
+
+    fn edges(file: &str, manifest: &str) -> usize {
+        feature_edges(&OS_SLOTS_TEST_SUPPORT, file, manifest).len()
+    }
+
+    #[test]
+    fn a_dev_dependency_may_enable_it_and_nothing_else_may() {
+        let dev = "[dev-dependencies]\napprafter-os-slots = { path = \"x\", features = [\"test-support\"] }\n";
+        assert_eq!(edges("cli/x/Cargo.toml", dev), 0);
+        for m in [
+            "[dependencies]\napprafter-os-slots = { path = \"x\", features = [\"test-support\"] }\n",
+            "[target.'cfg(unix)'.dependencies]\nslots = { package = \"apprafter-os-slots\", path = \"x\", features = [\"test-support\"] }\n",
+            "[features]\nwalk = [\"apprafter-os-slots/test-support\"]\n",
+            "[package]\nname = \"apprafter-os-slots\"\n[features]\ntest-support = []\ndefault = [\"test-support\"]\n",
+        ] {
+            assert_eq!(edges("cli/x/Cargo.toml", m), 1, "{m}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// G-OS4 (D.4b B17), its crate rule: what reaches PAM, the Keychain or LocalAuthentication
+// ---------------------------------------------------------------------
+
+/// Crates that reach the OS's authentication APIs, and the manifests allowed to depend on
+/// them: D.2's PAM (`nonstick`) and LocalAuthentication stay in `desktop/os-auth`;
+/// `apprafter-os-slots` loads libpam by `dlopen` through `libc` and needs none of them.
+const OS_AUTH_CRATES: &[(&str, &[&str])] = &[
+    ("nonstick", &["desktop/os-auth/Cargo.toml"]),
+    ("libpam-sys", &["desktop/os-auth/Cargo.toml"]),
+    (
+        "objc2-local-authentication",
+        &["desktop/os-auth/Cargo.toml"],
+    ),
+    ("pam", &[]),
+    ("pam-sys", &[]),
+    ("pam-client", &[]),
+    ("libloading", &[]),
+    ("security-framework", &[]),
+    ("keyring", &[]),
+    ("objc2-security", &[]),
+];
+
+/// A manifest's dependencies on [`OS_AUTH_CRATES`] it may not have, in any table, renamed or
+/// not.
+fn os_auth_dependencies(file: &str, manifest: &str) -> Vec<String> {
+    let doc: toml::Value = manifest
+        .parse()
+        .unwrap_or_else(|e| panic!("{file} does not parse: {e}"));
+    let mut hits = Vec::new();
+    for (place, table) in dependency_tables(&doc, true) {
+        for (name, spec) in table {
+            let package = spec.get("package").and_then(|p| p.as_str()).unwrap_or(name);
+            let rule = OS_AUTH_CRATES.iter().find(|(krate, _)| *krate == package);
+            if let Some((krate, allowed)) = rule {
+                if !allowed.contains(&file) {
+                    hits.push(format!("{file}: [{place}] depends on `{krate}`"));
+                }
+            }
+        }
+    }
+    hits
+}
+
+#[test]
+fn os_authentication_crates_stay_in_the_os_crates() {
+    let manifests = every_manifest();
+    let hits: Vec<String> = manifests
+        .iter()
+        .flat_map(|(rel, text)| os_auth_dependencies(rel, text))
+        .collect();
+    assert!(
+        hits.is_empty(),
+        "a crate that reaches PAM, the Keychain or LocalAuthentication outside desktop/os-auth \
+         (D.4b B17, G-OS4; the CLI loads libpam by dlopen):\n{}",
+        hits.join("\n")
+    );
+    let (_, os_auth) = manifests
+        .iter()
+        .find(|(rel, _)| rel == "desktop/os-auth/Cargo.toml")
+        .expect("desktop/os-auth/Cargo.toml is there");
+    assert!(
+        !os_auth_dependencies("cli/x/Cargo.toml", os_auth).is_empty(),
+        "desktop/os-auth depends on none of OS_AUTH_CRATES any more: this guard tells nothing apart"
+    );
+}
+
+mod os_auth_crates {
+    use super::*;
+
+    #[test]
+    fn a_dependency_on_an_os_auth_crate_is_seen_in_every_table() {
+        for m in [
+            "[dependencies]\nnonstick = \"0.1\"\n",
+            "[dev-dependencies]\nnonstick = \"0.1\"\n",
+            "[build-dependencies]\nlibloading = \"0.8\"\n",
+            "[target.'cfg(unix)'.dependencies]\nn = { package = \"nonstick\", version = \"0.1\" }\n",
+            "[workspace.dependencies]\nsecurity-framework = \"3\"\n",
+        ] {
+            assert_eq!(os_auth_dependencies("cli/x/Cargo.toml", m).len(), 1, "{m}");
+        }
+        let allowed = "[dependencies]\nnonstick = \"0.1\"\n";
+        assert!(os_auth_dependencies("desktop/os-auth/Cargo.toml", allowed).is_empty());
+        let other = "[dependencies]\nnonstickier = \"1\"\n";
+        assert!(os_auth_dependencies("cli/x/Cargo.toml", other).is_empty());
+    }
+}
+
+// ---------------------------------------------------------------------
+// G-OS1, G-OS4 (symbols), G-OS5, G-OS6 (D.4b B16, B17, B43, B82): real OS backends stay fenced
+// ---------------------------------------------------------------------
+
+/// The desktop workspace's crates, read beside [`CLI_MEMBERS`].
+const DESKTOP_MEMBERS: &[&str] = &["src-tauri", "ipc", "os-auth"];
+
+/// The fence: `admit` written bare there is the fence's own.
+const FENCE_FILE: &str = "cli/os-slots/src/fence.rs";
+
+/// G-OS1: what is, or makes, a real OS backend — the type names, and the paths (by their last
+/// segments) of the fence and of the system's PAM. A test may name none of them outside
+/// [`REAL_BACKEND_TESTS`] and [`REAL_BACKEND_SELF_TESTS`]. `SystemHello` is d4b-w1's.
+const REAL_BACKEND_NAMES: &[&str] = &["SystemAccountPassword", "SystemHello", "SystemLibrary"];
+/// `system_library` is the system's libpam without the name `SystemLibrary` (critic round).
+const REAL_BACKEND_CALLS: &[&[&str]] =
+    &[&["fence", "admit"], &["Pam", "system"], &["system_library"]];
+
+/// G-OS1: the real-backend tests. Every `#[test]` in them is `#[ignore = "…"]` — the script
+/// named there runs it in a container or a CI job, against an account it made — and every
+/// call of `fence::admit` there passes `Some(…)` roots, so the marker rule holds (B16).
+const REAL_BACKEND_TESTS: &[&str] = &[
+    "cli/os-slots/tests/pam_container.rs",
+    "cli/os-slots/tests/macos_real.rs",
+];
+
+/// G-OS1: tests that name a real backend and still reach no PAM — `admit` with a scratch root
+/// (refused before anything is made), the real backend built over a scripted libpam (its
+/// clock), and the loader over paths that do not exist.
+const REAL_BACKEND_SELF_TESTS: &[(&str, &str)] = &[
+    (
+        "cli/os-slots/src/fence.rs",
+        "admit_fences_the_running_account_outside_scratch_roots",
+    ),
+    (
+        "cli/os-slots/src/fence.rs",
+        "the_real_backend_reads_its_own_clock",
+    ),
+    (
+        "cli/os-slots/src/pam.rs",
+        "a_library_that_does_not_load_names_every_path_tried",
+    ),
+];
+
+/// G-OS1: the production functions that call `fence::admit` and hand its backend on, as `(file,
+/// function)`. Every production caller outside the fence must be listed — d4b-e1a's and
+/// d4b-g1b's glue add theirs — and a test that calls a listed one (by its last path segment) is
+/// held to G-OS1 as if it called `admit`, so a wrapper cannot hide the real backend (critic
+/// round). A caller of a wrapper is not followed (Risk 6).
+const ADMIT_WRAPPERS: &[(&str, &str)] = &[];
+
+/// G-OS5: one thing that builds a real backend in production code, and the one `(file,
+/// function)` that may: a one-segment `path` is a name any path through which counts (the
+/// backend's type — a struct literal, `Self` included — or `system_library`), a longer one a
+/// call's path. A struct, not a tuple: clippy's `type_complexity` refuses the tuple slice
+/// (critic round).
+struct Maker {
+    path: &'static [&'static str],
+    file: &'static str,
+    function: &'static str,
+}
+
+/// G-OS5's makers. d4b-w1 adds the Hello backend.
+const REAL_BACKEND_MAKERS: &[Maker] = &[
+    Maker {
+        path: &["SystemAccountPassword"],
+        file: "cli/os-slots/src/fence.rs",
+        function: "admit",
+    },
+    Maker {
+        path: &["Pam", "system"],
+        file: "cli/os-slots/src/fence.rs",
+        function: "admit",
+    },
+    Maker {
+        path: &["SystemLibrary", "new"],
+        file: "cli/os-slots/src/pam.rs",
+        function: "system_library",
+    },
+    Maker {
+        path: &["system_library"],
+        file: "cli/os-slots/src/pam.rs",
+        function: "system",
+    },
+];
+
+/// G-OS4: an OS authentication API symbol and the directories that may use it. A `prefix`
+/// entry matches the name followed by one or more `[A-Za-z0-9_]`; an `ffi` entry matches only
+/// as a symbol — an `extern` item, a C string, a byte string ending in a NUL, or a string
+/// literal that is exactly the symbol — so D.2's `pam_in` identifier is no hit. A struct, not a
+/// tuple, for clippy's `type_complexity` (critic round).
+struct OsSymbol {
+    name: &'static str,
+    prefix: bool,
+    ffi: bool,
+    allowed: &'static [&'static str],
+}
+
+const OS_SYMBOLS: &[OsSymbol] = &[
+    OsSymbol {
+        name: "pam_",
+        prefix: true,
+        ffi: true,
+        allowed: &["cli/os-slots/", "desktop/os-auth/"],
+    },
+    OsSymbol {
+        name: "KeyCredentialManager",
+        prefix: false,
+        ffi: false,
+        allowed: &["cli/os-slots/", "desktop/os-auth/"],
+    },
+    OsSymbol {
+        name: "NCrypt",
+        prefix: true,
+        ffi: false,
+        allowed: &["cli/os-slots/", "desktop/os-auth/"],
+    },
+    OsSymbol {
+        name: "SecItem",
+        prefix: true,
+        ffi: false,
+        allowed: &["desktop/os-auth/"],
+    },
+    OsSymbol {
+        name: "SecKeychain",
+        prefix: true,
+        ffi: false,
+        allowed: &["desktop/os-auth/"],
+    },
+    OsSymbol {
+        name: "LAContext",
+        prefix: false,
+        ffi: false,
+        allowed: &["desktop/os-auth/"],
+    },
+];
+
+/// G-OS6: the files that may build `NewSlot::OsPassword` in production code — the os-slots
+/// glue of the CLI (d4b-e1a) and of the desktop (d4b-g1b), which alone ran the check that makes
+/// the slot's text an account password; the core cannot check it.
+const OS_SLOT_GLUE: &[&str] = &[
+    "cli/platform-cli/src/os_slots.rs",
+    "desktop/src-tauri/src/os_slots.rs",
+];
+
+/// How a name appears, for [`OS_SYMBOLS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SymbolForm {
+    /// An identifier anywhere: matches the non-`ffi` entries.
+    Ident,
+    /// An `extern` item, a C string, a NUL-terminated byte string: matches every entry.
+    Symbol,
+    /// A plain string, or a byte string without a NUL: matches the `ffi` entries only.
+    Text,
+}
+
+/// The directories allowed for the [`OS_SYMBOLS`] entry `name` matches in `form`, if any.
+fn os_symbol(name: &str, form: SymbolForm) -> Option<&'static [&'static str]> {
+    OS_SYMBOLS.iter().find_map(|symbol| {
+        let applies = match form {
+            SymbolForm::Ident => !symbol.ffi,
+            SymbolForm::Symbol => true,
+            SymbolForm::Text => symbol.ffi,
+        };
+        let matches = if symbol.prefix {
+            name.strip_prefix(symbol.name).is_some_and(|rest| {
+                !rest.is_empty() && rest.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            })
+        } else {
+            name == symbol.name
+        };
+        (applies && matches).then_some(symbol.allowed)
+    })
+}
+
+/// One Rust file G-OS reads: its path from the repository root, its text, and whether all of it
+/// is test code (under `tests/`, or an out-of-line `#[cfg(test)]` module).
+struct GuardedFile {
+    rel: String,
+    src: String,
+    whole_test: bool,
+}
+
+/// Every Rust file of the `cli/` workspace's members and of the desktop's three crates.
+fn guarded_files() -> Vec<GuardedFile> {
+    let repo = cli_dir()
+        .parent()
+        .expect("cli/ sits in the repository")
+        .to_path_buf();
+    let crates = CLI_MEMBERS
+        .iter()
+        .map(|member| cli_dir().join(member))
+        .chain(
+            DESKTOP_MEMBERS
+                .iter()
+                .map(|member| repo.join("desktop").join(member)),
+        );
+    let mut out = Vec::new();
+    for krate in crates {
+        let src_files = rust_files(&krate.join("src"));
+        let (mut test_files, mut test_dirs) = (Vec::new(), Vec::new());
+        for file in &src_files {
+            let scan = scan_source(file, &fs::read_to_string(file).unwrap());
+            test_files.extend(scan.test_module_files);
+            test_dirs.extend(scan.test_module_dirs);
+        }
+        let mut files: Vec<(PathBuf, bool)> = src_files
+            .into_iter()
+            .map(|file| {
+                let whole =
+                    test_files.contains(&file) || test_dirs.iter().any(|d| file.starts_with(d));
+                (file, whole)
+            })
+            .collect();
+        let tests_dir = krate.join("tests");
+        if tests_dir.is_dir() {
+            files.extend(rust_files(&tests_dir).into_iter().map(|file| (file, true)));
+        }
+        let build = krate.join("build.rs");
+        if build.is_file() {
+            files.push((build, false));
+        }
+        for (path, whole_test) in files {
+            let rel = path
+                .strip_prefix(&repo)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            let src = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {rel}: {e}"));
+            out.push(GuardedFile {
+                rel,
+                src,
+                whole_test,
+            });
+        }
+    }
+    assert!(
+        out.iter().any(|f| f.rel.starts_with("cli/os-slots/src/"))
+            && out
+                .iter()
+                .any(|f| f.rel.starts_with("desktop/os-auth/src/")),
+        "G-OS reads neither the os-slots sources nor the desktop's"
+    );
+    out
+}
+
+/// What G-OS finds in one file.
+#[derive(Debug, Default)]
+struct OsScan {
+    /// G-OS1: a real backend named or made in test code: `(line, enclosing function, what)`.
+    test_uses: Vec<(usize, String, String)>,
+    /// G-OS1: every `#[test]` function, and whether it carries `#[ignore = "…"]`.
+    tests: Vec<(String, bool)>,
+    /// G-OS1: every call of `fence::admit`, and whether its first argument is `Some(…)`.
+    admits: Vec<(usize, bool)>,
+    /// G-OS1: `fence::admit` called in production code: `(line, enclosing function)`.
+    production_admits: Vec<(usize, String)>,
+    /// G-OS4: an OS API symbol: `(line, name, form, the directories allowed)`.
+    symbols: Vec<(usize, String, &'static str, &'static [&'static str])>,
+    /// G-OS5: a real backend built in production code: `(line, enclosing function, rule)`.
+    makers: Vec<(usize, String, usize)>,
+    /// G-OS5: `Default` derived or implemented for a real backend: `(line, type)`.
+    defaults: Vec<(usize, String)>,
+    /// G-OS6: `NewSlot::OsPassword { … }` built in production code: its lines.
+    os_password_slots: Vec<usize>,
+}
+
+struct OsVisitor {
+    whole_test: bool,
+    /// `cfg(test)` items and `#[test]` functions entered.
+    test_depth: usize,
+    fns: Vec<String>,
+    impl_types: Vec<Option<String>>,
+    /// Local names for `fence::admit` (`use …::fence::admit as a;`), and whether `fence::*` is
+    /// imported.
+    admit_names: HashSet<String>,
+    fence_glob: bool,
+    /// Local names for `NewSlot::OsPassword`, and whether `NewSlot::*` is imported.
+    os_password_names: HashSet<String>,
+    newslot_glob: bool,
+    /// The function names of [`ADMIT_WRAPPERS`] (a fixture passes its own).
+    wrappers: Vec<String>,
+    scan: OsScan,
+}
+
+/// Whether `segments` ends with `tail`.
+fn ends_with(segments: &[String], tail: &[&str]) -> bool {
+    segments.len() >= tail.len()
+        && segments[segments.len() - tail.len()..]
+            .iter()
+            .zip(tail)
+            .all(|(a, b)| a == b)
+}
+
+/// Every `use` leaf of a file, at any depth: (the full path, its local name, `*` for a glob).
+fn use_leaves(file: &syn::File) -> Vec<(Vec<String>, String)> {
+    fn walk(tree: &UseTree, prefix: &mut Vec<String>, out: &mut Vec<(Vec<String>, String)>) {
+        match tree {
+            UseTree::Path(p) => {
+                prefix.push(p.ident.to_string());
+                walk(&p.tree, prefix, out);
+                prefix.pop();
+            }
+            UseTree::Name(n) if n.ident == "self" => {
+                out.push((prefix.clone(), prefix.last().cloned().unwrap_or_default()));
+            }
+            UseTree::Name(n) => {
+                let mut full = prefix.clone();
+                full.push(n.ident.to_string());
+                out.push((full, n.ident.to_string()));
+            }
+            UseTree::Rename(r) => {
+                let mut full = prefix.clone();
+                full.push(r.ident.to_string());
+                out.push((full, r.rename.to_string()));
+            }
+            UseTree::Glob(_) => out.push((prefix.clone(), "*".to_owned())),
+            UseTree::Group(g) => {
+                for item in &g.items {
+                    walk(item, prefix, out);
+                }
+            }
+        }
+    }
+    struct Uses(Vec<(Vec<String>, String)>);
+    impl<'ast> Visit<'ast> for Uses {
+        fn visit_item_use(&mut self, u: &'ast syn::ItemUse) {
+            walk(&u.tree, &mut Vec::new(), &mut self.0);
+        }
+    }
+    let mut uses = Uses(Vec::new());
+    uses.visit_file(file);
+    uses.0
+}
+
+/// G-OS's reading of one file, with [`ADMIT_WRAPPERS`].
+fn os_scan(rel: &str, src: &str, whole_test: bool) -> OsScan {
+    let wrappers: Vec<&str> = ADMIT_WRAPPERS
+        .iter()
+        .map(|&(_, function)| function)
+        .collect();
+    os_scan_with(rel, src, whole_test, &wrappers)
+}
+
+/// G-OS's reading of one file, `wrappers` naming the production callers of `admit`.
+fn os_scan_with(rel: &str, src: &str, whole_test: bool, wrappers: &[&str]) -> OsScan {
+    let file = syn::parse_file(src).unwrap_or_else(|e| panic!("parse {rel}: {e}"));
+    let mut v = OsVisitor {
+        whole_test: whole_test || cfg_implies_test(&file.attrs),
+        test_depth: 0,
+        fns: Vec::new(),
+        impl_types: Vec::new(),
+        admit_names: HashSet::new(),
+        fence_glob: false,
+        os_password_names: HashSet::new(),
+        newslot_glob: false,
+        wrappers: wrappers.iter().map(|w| (*w).to_owned()).collect(),
+        scan: OsScan::default(),
+    };
+    if rel == FENCE_FILE {
+        v.admit_names.insert("admit".to_owned());
+    }
+    for (full, local) in use_leaves(&file) {
+        let last = full.last().map(String::as_str);
+        if local == "*" {
+            v.fence_glob |= last == Some("fence");
+            v.newslot_glob |= last == Some("NewSlot");
+        } else if ends_with(&full, &["fence", "admit"]) {
+            v.admit_names.insert(local);
+        } else if ends_with(&full, &["NewSlot", "OsPassword"]) {
+            v.os_password_names.insert(local);
+        }
+    }
+    v.visit_file(&file);
+    v.scan
+}
+
+impl OsVisitor {
+    fn in_test(&self) -> bool {
+        self.whole_test || self.test_depth > 0
+    }
+
+    fn site(&self) -> String {
+        self.fns.last().cloned().unwrap_or_default()
+    }
+
+    /// A path's segments, `Self` read as the type of the impl it is in.
+    fn segments(&self, path: &syn::Path) -> Vec<String> {
+        path.segments
+            .iter()
+            .map(|s| {
+                let name = s.ident.to_string();
+                match self.impl_types.last() {
+                    Some(Some(ty)) if name == "Self" => ty.clone(),
+                    _ => name,
+                }
+            })
+            .collect()
+    }
+
+    fn is_admit(&self, segments: &[String]) -> bool {
+        ends_with(segments, &["fence", "admit"])
+            || matches!(segments, [one] if self.admit_names.contains(one) || (self.fence_glob && one == "admit"))
+    }
+
+    fn is_os_password(&self, segments: &[String]) -> bool {
+        ends_with(segments, &["NewSlot", "OsPassword"])
+            || matches!(segments, [one] if self.os_password_names.contains(one) || (self.newslot_glob && one == "OsPassword"))
+    }
+
+    /// G-OS1 in test code, G-OS5 in production code, for a path in an expression.
+    fn expr_path(&mut self, segments: &[String], line: usize) {
+        if self.in_test() {
+            let named = segments
+                .iter()
+                .any(|s| REAL_BACKEND_NAMES.contains(&s.as_str()));
+            let called = self.is_admit(segments)
+                || REAL_BACKEND_CALLS
+                    .iter()
+                    .any(|tail| ends_with(segments, tail))
+                || segments
+                    .last()
+                    .is_some_and(|last| self.wrappers.contains(last));
+            if named || called {
+                self.scan
+                    .test_uses
+                    .push((line, self.site(), segments.join("::")));
+            }
+        } else {
+            for (rule, maker) in REAL_BACKEND_MAKERS.iter().enumerate() {
+                let hit = match maker.path {
+                    [name] => segments.iter().any(|s| s == name),
+                    tail => ends_with(segments, tail),
+                };
+                if hit {
+                    self.scan.makers.push((line, self.site(), rule));
+                }
+            }
+        }
+    }
+
+    fn symbol(&mut self, name: &str, form: SymbolForm, label: &'static str, line: usize) {
+        if let Some(allowed) = os_symbol(name, form) {
+            self.scan
+                .symbols
+                .push((line, name.to_owned(), label, allowed));
+        }
+    }
+
+    /// A literal, for G-OS4 (a macro's tokens hand theirs over with their own line).
+    fn literal(&mut self, lit: &syn::Lit, line: usize) {
+        match lit {
+            syn::Lit::CStr(c) => {
+                self.symbol(
+                    &c.value().to_string_lossy(),
+                    SymbolForm::Symbol,
+                    "C string",
+                    line,
+                );
+            }
+            syn::Lit::ByteStr(b) => {
+                let bytes = b.value();
+                match bytes.strip_suffix(b"\0") {
+                    Some(name) => {
+                        self.symbol(
+                            &String::from_utf8_lossy(name),
+                            SymbolForm::Symbol,
+                            "byte string",
+                            line,
+                        );
+                    }
+                    None => {
+                        self.symbol(
+                            &String::from_utf8_lossy(&bytes),
+                            SymbolForm::Text,
+                            "byte string",
+                            line,
+                        );
+                    }
+                }
+            }
+            syn::Lit::Str(s) => self.symbol(&s.value(), SymbolForm::Text, "string", line),
+            _ => {}
+        }
+    }
+
+    /// A macro body that parses neither as expressions nor as statements: its tokens.
+    fn macro_tokens(&mut self, tokens: TokenStream) {
+        let mut previous: Option<String> = None;
+        for tree in tokens {
+            match tree {
+                TokenTree::Group(g) => self.macro_tokens(g.stream()),
+                TokenTree::Ident(i) => {
+                    let name = i.to_string();
+                    let line = line_of(i.span());
+                    self.symbol(&name, SymbolForm::Ident, "identifier", line);
+                    let admit = name == "admit" && previous.as_deref() == Some("fence");
+                    let call = self.wrappers.contains(&name)
+                        || REAL_BACKEND_CALLS
+                            .iter()
+                            .any(|tail| *tail == [name.as_str()]);
+                    let named = REAL_BACKEND_NAMES.contains(&name.as_str());
+                    if self.in_test() && (admit || call || named) {
+                        self.scan.test_uses.push((line, self.site(), name.clone()));
+                    }
+                    previous = Some(name);
+                }
+                TokenTree::Literal(l) => {
+                    if let Ok(lit) = syn::parse_str::<syn::Lit>(&l.to_string()) {
+                        self.literal(&lit, line_of(l.span()));
+                    }
+                }
+                TokenTree::Punct(_) => {}
+            }
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for OsVisitor {
+    fn visit_item(&mut self, item: &'ast Item) {
+        let test = usize::from(cfg_implies_test(item_attrs(item)));
+        self.test_depth += test;
+        visit::visit_item(self, item);
+        self.test_depth -= test;
+    }
+
+    fn visit_impl_item(&mut self, item: &'ast ImplItem) {
+        let test = usize::from(cfg_implies_test(impl_item_attrs(item)));
+        self.test_depth += test;
+        visit::visit_impl_item(self, item);
+        self.test_depth -= test;
+    }
+
+    fn visit_item_fn(&mut self, f: &'ast syn::ItemFn) {
+        let is_test = f
+            .attrs
+            .iter()
+            .any(|a| a.path().segments.last().is_some_and(|s| s.ident == "test"));
+        if is_test {
+            let ignored = f
+                .attrs
+                .iter()
+                .any(|a| a.path().is_ident("ignore") && matches!(a.meta, Meta::NameValue(_)));
+            self.scan.tests.push((f.sig.ident.to_string(), ignored));
+        }
+        self.test_depth += usize::from(is_test);
+        self.fns.push(f.sig.ident.to_string());
+        visit::visit_item_fn(self, f);
+        self.fns.pop();
+        self.test_depth -= usize::from(is_test);
+    }
+
+    fn visit_impl_item_fn(&mut self, f: &'ast syn::ImplItemFn) {
+        self.fns.push(f.sig.ident.to_string());
+        visit::visit_impl_item_fn(self, f);
+        self.fns.pop();
+    }
+
+    fn visit_item_impl(&mut self, i: &'ast syn::ItemImpl) {
+        let ty = match &*i.self_ty {
+            syn::Type::Path(tp) => tp.path.segments.last().map(|s| s.ident.to_string()),
+            _ => None,
+        };
+        let default = i
+            .trait_
+            .as_ref()
+            .is_some_and(|(_, path, _)| path.segments.last().is_some_and(|s| s.ident == "Default"));
+        if let Some(ty) = ty
+            .as_ref()
+            .filter(|ty| default && REAL_BACKEND_NAMES.contains(&ty.as_str()))
+        {
+            self.scan
+                .defaults
+                .push((line_of(i.impl_token.span), ty.clone()));
+        }
+        self.impl_types.push(ty);
+        visit::visit_item_impl(self, i);
+        self.impl_types.pop();
+    }
+
+    fn visit_item_struct(&mut self, s: &'ast syn::ItemStruct) {
+        let name = s.ident.to_string();
+        let derives_default = s.attrs.iter().any(|a| {
+            a.path().is_ident("derive")
+                && a.parse_args_with(Punctuated::<syn::Path, syn::Token![,]>::parse_terminated)
+                    .is_ok_and(|list| {
+                        list.iter()
+                            .any(|p| p.segments.last().is_some_and(|seg| seg.ident == "Default"))
+                    })
+        });
+        if derives_default && REAL_BACKEND_NAMES.contains(&name.as_str()) {
+            self.scan.defaults.push((line_of(s.ident.span()), name));
+        }
+        visit::visit_item_struct(self, s);
+    }
+
+    fn visit_expr_call(&mut self, c: &'ast syn::ExprCall) {
+        if let Expr::Path(p) = &*c.func {
+            let segments = self.segments(&p.path);
+            if self.is_admit(&segments) {
+                let some = matches!(
+                    c.args.first(),
+                    Some(Expr::Call(inner)) if matches!(&*inner.func, Expr::Path(q) if q.path.is_ident("Some"))
+                );
+                let line = line_of(p.path.segments[0].ident.span());
+                self.scan.admits.push((line, some));
+                if !self.in_test() {
+                    self.scan.production_admits.push((line, self.site()));
+                }
+            }
+        }
+        visit::visit_expr_call(self, c);
+    }
+
+    fn visit_expr_path(&mut self, p: &'ast syn::ExprPath) {
+        let segments = self.segments(&p.path);
+        self.expr_path(&segments, line_of(p.path.segments[0].ident.span()));
+        visit::visit_expr_path(self, p);
+    }
+
+    fn visit_expr_struct(&mut self, s: &'ast syn::ExprStruct) {
+        let segments = self.segments(&s.path);
+        let line = line_of(s.path.segments[0].ident.span());
+        self.expr_path(&segments, line);
+        if !self.in_test() && self.is_os_password(&segments) {
+            self.scan.os_password_slots.push(line);
+        }
+        visit::visit_expr_struct(self, s);
+    }
+
+    fn visit_type_path(&mut self, t: &'ast syn::TypePath) {
+        if self.in_test() {
+            let named = t
+                .path
+                .segments
+                .iter()
+                .map(|s| s.ident.to_string())
+                .find(|n| REAL_BACKEND_NAMES.contains(&n.as_str()));
+            if let Some(name) = named {
+                let line = line_of(t.path.segments[0].ident.span());
+                self.scan.test_uses.push((line, self.site(), name));
+            }
+        }
+        visit::visit_type_path(self, t);
+    }
+
+    fn visit_ident(&mut self, i: &'ast proc_macro2::Ident) {
+        self.symbol(
+            &i.to_string(),
+            SymbolForm::Ident,
+            "identifier",
+            line_of(i.span()),
+        );
+    }
+
+    fn visit_lit(&mut self, l: &'ast syn::Lit) {
+        self.literal(l, line_of(l.span()));
+        visit::visit_lit(self, l);
+    }
+
+    fn visit_foreign_item_fn(&mut self, f: &'ast syn::ForeignItemFn) {
+        let line = line_of(f.sig.ident.span());
+        self.symbol(
+            &f.sig.ident.to_string(),
+            SymbolForm::Symbol,
+            "extern fn",
+            line,
+        );
+        visit::visit_foreign_item_fn(self, f);
+    }
+
+    fn visit_foreign_item_static(&mut self, s: &'ast syn::ForeignItemStatic) {
+        let line = line_of(s.ident.span());
+        self.symbol(
+            &s.ident.to_string(),
+            SymbolForm::Symbol,
+            "extern static",
+            line,
+        );
+        visit::visit_foreign_item_static(self, s);
+    }
+
+    fn visit_macro(&mut self, m: &'ast syn::Macro) {
+        if let Ok(args) = m.parse_body_with(Punctuated::<Expr, syn::Token![,]>::parse_terminated) {
+            for e in &args {
+                self.visit_expr(e);
+            }
+        } else if let Ok(stmts) = m.parse_body_with(syn::Block::parse_within) {
+            for s in &stmts {
+                self.visit_stmt(s);
+            }
+        } else {
+            self.macro_tokens(m.tokens.clone());
+        }
+        visit::visit_macro(self, m);
+    }
+}
+
+#[test]
+fn no_test_reaches_a_real_os_backend() {
+    let files = guarded_files();
+    let mut problems = Vec::new();
+    for f in &files {
+        let scan = os_scan(&f.rel, &f.src, f.whole_test);
+        for (line, site) in &scan.production_admits {
+            let listed = ADMIT_WRAPPERS
+                .iter()
+                .any(|(file, function)| *file == f.rel && function == site);
+            if f.rel != FENCE_FILE && !listed {
+                problems.push(format!(
+                    "{}:{line}: `{site}` calls fence::admit in production code: list it in \
+                     ADMIT_WRAPPERS, so G-OS1 sees every test that calls it",
+                    f.rel
+                ));
+            }
+        }
+        if REAL_BACKEND_TESTS.iter().any(|t| *t == f.rel) {
+            assert!(
+                !scan.tests.is_empty(),
+                "{} holds no test: REAL_BACKEND_TESTS is stale",
+                f.rel
+            );
+            for (name, ignored) in &scan.tests {
+                if !ignored {
+                    problems.push(format!(
+                        "{}: `{name}` is not #[ignore = \"…\"]: it would reach a real backend in every cargo test",
+                        f.rel
+                    ));
+                }
+            }
+            for (line, some) in &scan.admits {
+                if !some {
+                    problems.push(format!(
+                        "{}:{line}: fence::admit without Some(roots): the real tests pass the fence's marker rule",
+                        f.rel
+                    ));
+                }
+            }
+            continue;
+        }
+        for (line, site, what) in &scan.test_uses {
+            let allowed = REAL_BACKEND_SELF_TESTS
+                .iter()
+                .any(|(file, test)| *file == f.rel && test == site);
+            if !allowed {
+                problems.push(format!(
+                    "{}:{line}: `{what}` in test code (`{site}`)",
+                    f.rel
+                ));
+            }
+        }
+    }
+    assert!(
+        problems.is_empty(),
+        "a test reaches a real PAM or Windows Hello backend (D.4b B43, G-OS1; CLAUDE.md): only the \
+         #[ignore]d real tests may, in their container or CI job:\n{}",
+        problems.join("\n")
+    );
+    for file in REAL_BACKEND_TESTS {
+        assert!(
+            files.iter().any(|f| f.rel == *file),
+            "{file} is gone: REAL_BACKEND_TESTS is stale"
+        );
+    }
+    for (file, test) in REAL_BACKEND_SELF_TESTS {
+        let f = files
+            .iter()
+            .find(|f| f.rel == *file)
+            .unwrap_or_else(|| panic!("{file} is gone: REAL_BACKEND_SELF_TESTS is stale"));
+        let tests = os_scan(&f.rel, &f.src, f.whole_test).tests;
+        assert!(
+            tests.iter().any(|(n, _)| n == test),
+            "{file} has no test `{test}`: stale"
+        );
+    }
+    for (file, function) in ADMIT_WRAPPERS {
+        let f = files
+            .iter()
+            .find(|f| f.rel == *file)
+            .unwrap_or_else(|| panic!("{file} is gone: ADMIT_WRAPPERS is stale"));
+        let callers = os_scan(&f.rel, &f.src, f.whole_test).production_admits;
+        assert!(
+            callers.iter().any(|(_, site)| site == function),
+            "{file} `{function}` no longer calls fence::admit: ADMIT_WRAPPERS is stale"
+        );
+    }
+}
+
+#[test]
+fn only_the_fence_makes_a_real_os_backend() {
+    let mut problems = Vec::new();
+    let mut made_where_allowed = HashSet::new();
+    for f in guarded_files() {
+        let scan = os_scan(&f.rel, &f.src, f.whole_test);
+        for (line, site, rule) in &scan.makers {
+            let maker = &REAL_BACKEND_MAKERS[*rule];
+            if f.rel == maker.file && site == maker.function {
+                made_where_allowed.insert(*rule);
+            } else {
+                let what = maker.path.join("::");
+                problems.push(format!("{}:{line}: `{what}` in `{site}`", f.rel));
+            }
+        }
+        for (line, name) in &scan.defaults {
+            problems.push(format!("{}:{line}: Default for {name}", f.rel));
+        }
+    }
+    assert!(
+        problems.is_empty(),
+        "a real OS backend built outside the fence (D.4b B16, B82, G-OS5): only fence::admit may:\n{}",
+        problems.join("\n")
+    );
+    for (rule, maker) in REAL_BACKEND_MAKERS.iter().enumerate() {
+        assert!(
+            made_where_allowed.contains(&rule),
+            "{} is no longer built in {} `{}`: REAL_BACKEND_MAKERS is stale",
+            maker.path.join("::"),
+            maker.file,
+            maker.function
+        );
+    }
+}
+
+#[test]
+fn os_slots_reads_no_environment_and_never_prints() {
+    let findings = scan_tree(&crate_dir("os-slots").join("src"));
+    let allowed = |f: &Finding| {
+        f.kind == Kind::EnvRead && f.callee.ends_with("confstr") && f.file.ends_with("src/macos.rs")
+    };
+    let hits: Vec<String> = findings
+        .iter()
+        .filter(|f| {
+            matches!(
+                f.kind,
+                Kind::EnvRead
+                    | Kind::EnvWrite
+                    | Kind::Dirs
+                    | Kind::ProcessEnd
+                    | Kind::Terminal
+                    | Kind::Print
+            )
+        })
+        .filter(|f| !allowed(f))
+        .map(Finding::to_string)
+        .collect();
+    assert!(
+        hits.is_empty(),
+        "apprafter-os-slots reads the environment or prints (D.4b B12, B16, B82: the fence and the \
+         back-off follow no variable; the caller passes the sandbox roots):\n{}",
+        hits.join("\n")
+    );
+    assert!(
+        findings.iter().any(allowed),
+        "macos.rs reads no confstr any more: this guard's one exception is stale"
+    );
+}
+
+#[test]
+fn os_api_symbols_stay_in_the_os_crates() {
+    let mut problems = Vec::new();
+    let mut os_slots_dlsym = false;
+    for f in guarded_files() {
+        for (line, name, form, allowed) in os_scan(&f.rel, &f.src, f.whole_test).symbols {
+            if allowed.iter().any(|dir| f.rel.starts_with(dir)) {
+                // Split, not the symbol whole: an exact `pam_*` string here is a G-OS4 hit itself.
+                os_slots_dlsym |= f.rel.starts_with("cli/os-slots/")
+                    && name.strip_prefix("pam_") == Some("start");
+            } else {
+                problems.push(format!("{}:{line}: {form} `{name}`", f.rel));
+            }
+        }
+    }
+    assert!(
+        problems.is_empty(),
+        "an OS authentication API outside its crate (D.4b B17, G-OS4): PAM and Windows Hello belong \
+         in cli/os-slots and desktop/os-auth, the Keychain and LocalAuthentication in \
+         desktop/os-auth only:\n{}",
+        problems.join("\n")
+    );
+    assert!(
+        os_slots_dlsym,
+        "G-OS4 does not see os-slots' c\"pam_start\": it would see no symbol"
+    );
+}
+
+#[test]
+fn only_the_os_slots_glue_makes_an_account_password_slot() {
+    let mut problems = Vec::new();
+    for f in guarded_files() {
+        if OS_SLOT_GLUE.iter().any(|glue| *glue == f.rel) {
+            continue;
+        }
+        for line in os_scan(&f.rel, &f.src, f.whole_test).os_password_slots {
+            problems.push(format!("{}:{line}", f.rel));
+        }
+    }
+    assert!(
+        problems.is_empty(),
+        "NewSlot::OsPassword built outside the os-slots glue (D.4b B43, G-OS6): only a caller that \
+         ran the account-password check may make that slot, and the core cannot check it:\n{}",
+        problems.join("\n")
+    );
+    let seal = fs::read_to_string(crate_dir("apprafter-core").join("src/vault/seal.rs")).unwrap();
+    assert!(
+        seal.contains("pub enum NewSlot"),
+        "vault::NewSlot moved: point G-OS6 at it"
+    );
+}
+
+mod os_guards {
+    use super::*;
+
+    fn scan(rel: &str, src: &str) -> OsScan {
+        os_scan(rel, src, false)
+    }
+
+    fn sites(scan: &OsScan) -> Vec<String> {
+        scan.test_uses
+            .iter()
+            .map(|(_, site, _)| site.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_test_that_names_or_makes_a_real_backend_is_seen() {
+        let src = "
+            #[cfg(test)]
+            mod tests {
+                #[test]
+                fn a() { let _ = apprafter_os_slots::fence::admit(None); }
+                #[test]
+                fn b() { let _: Option<SystemAccountPassword> = None; }
+                #[test]
+                fn c() { let _ = crate::pam::Pam::system(Os::Linux); }
+                #[test]
+                fn d() { assert!(fence::admit(None).is_ok()); }
+            }
+            fn production() { let _ = apprafter_os_slots::fence::admit(Some(&roots)); }
+        ";
+        assert_eq!(sites(&scan("cli/x/src/lib.rs", src)), ["a", "b", "c", "d"]);
+        let helper = "fn helper() { let _ = fence::admit(None); }";
+        assert_eq!(
+            os_scan("cli/x/tests/t.rs", helper, true).test_uses.len(),
+            1,
+            "tests/ is test code"
+        );
+    }
+
+    #[test]
+    fn renamed_glob_and_grouped_imports_of_admit_are_seen() {
+        for src in [
+            "use apprafter_os_slots::fence::admit as let_in;\n#[test]\nfn t() { let_in(None); }",
+            "use apprafter_os_slots::fence::*;\n#[test]\nfn t() { admit(None); }",
+            "use apprafter_os_slots::fence::{self, admit};\n#[test]\nfn t() { admit(None); }",
+        ] {
+            assert_eq!(scan("cli/x/src/lib.rs", src).test_uses.len(), 1, "{src}");
+        }
+        let other = "#[test]\nfn t() { admit(None); }";
+        assert!(
+            scan("cli/x/src/lib.rs", other).test_uses.is_empty(),
+            "an admit not the fence's"
+        );
+        assert_eq!(
+            scan(FENCE_FILE, other).test_uses.len(),
+            1,
+            "the fence's own admit"
+        );
+    }
+
+    #[test]
+    fn ignored_tests_and_some_roots_are_read() {
+        let src = r#"
+            #[test]
+            #[ignore = "needs the PAM container"]
+            fn real() { let _ = fence::admit(Some(&roots())); }
+            #[test]
+            #[ignore]
+            fn bare_ignore() {}
+            #[test]
+            fn plain() { let _ = fence::admit(None); }
+        "#;
+        let s = os_scan("cli/os-slots/tests/pam_container.rs", src, true);
+        let tests = [
+            ("real".to_owned(), true),
+            ("bare_ignore".to_owned(), false),
+            ("plain".to_owned(), false),
+        ];
+        assert_eq!(s.tests, tests);
+        let some: Vec<bool> = s.admits.iter().map(|(_, some)| *some).collect();
+        assert_eq!(some, [true, false]);
+    }
+
+    #[test]
+    fn symbols_are_seen_in_every_form_and_identifiers_only_where_they_name_one() {
+        let src = r#"
+            extern "C" { fn pam_start(); static pam_x: u8; }
+            fn f() {
+                let _ = c"pam_end";
+                let _ = b"pam_get_item\0";
+                let _ = "pam_authenticate";
+                let _ = KeyCredentialManager::RequestCreateAsync;
+                let _ = NCryptOpenStorageProvider;
+                let _ = c"SecItemCopyMatching";
+                let pam_in = 1;
+                let _ = "a pam_start in prose";
+                let _ = BCryptVerifySignature;
+                println!("{}", LAContext::new());
+            }
+        "#;
+        let found: Vec<String> = scan("cli/x/src/lib.rs", src)
+            .symbols
+            .into_iter()
+            .map(|(_, name, form, _)| format!("{form} {name}"))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                "extern fn pam_start",
+                "extern static pam_x",
+                "C string pam_end",
+                "byte string pam_get_item",
+                "string pam_authenticate",
+                "identifier KeyCredentialManager",
+                "identifier NCryptOpenStorageProvider",
+                "C string SecItemCopyMatching",
+                "identifier LAContext",
+            ]
+        );
+    }
+
+    #[test]
+    fn backends_built_outside_their_maker_and_default_impls_are_seen() {
+        let fence = "
+            pub fn admit() -> SystemAccountPassword {
+                let os = Os::this();
+                SystemAccountPassword { inner: Checker { pam: Pam::system(os) } }
+            }
+            fn other() -> SystemAccountPassword { SystemAccountPassword { inner: todo!() } }
+            impl SystemAccountPassword { fn unfenced() -> Self { Self { inner: todo!() } } }
+        ";
+        let makers: Vec<(String, usize)> = scan(FENCE_FILE, fence)
+            .makers
+            .into_iter()
+            .map(|(_, site, rule)| (site, rule))
+            .collect();
+        let expected = [
+            ("admit".to_owned(), 0),
+            ("admit".to_owned(), 1),
+            ("other".to_owned(), 0),
+            ("unfenced".to_owned(), 0),
+        ];
+        assert_eq!(makers, expected);
+        let defaults = "#[derive(Debug, Default)]\npub struct SystemAccountPassword { inner: u8 }\nimpl Default for SystemHello { fn default() -> Self { todo!() } }";
+        let names: Vec<String> = scan(FENCE_FILE, defaults)
+            .defaults
+            .into_iter()
+            .map(|(_, n)| n)
+            .collect();
+        assert_eq!(names, ["SystemAccountPassword", "SystemHello"]);
+        let in_test =
+            "#[cfg(test)]\nmod t { fn f() { let _ = SystemAccountPassword { inner: 1 }; } }";
+        assert!(
+            scan(FENCE_FILE, in_test).makers.is_empty(),
+            "test code is G-OS1's"
+        );
+    }
+
+    #[test]
+    fn a_production_caller_of_admit_is_seen_and_a_test_calling_a_listed_one_too() {
+        let glue = "pub fn fixture_glue_backend(roots: Option<&[PathBuf]>) -> Result<SystemAccountPassword, Fenced> { apprafter_os_slots::fence::admit(roots) }";
+        let callers: Vec<String> = scan("cli/x/src/os_slots.rs", glue)
+            .production_admits
+            .into_iter()
+            .map(|(_, site)| site)
+            .collect();
+        assert_eq!(callers, ["fixture_glue_backend"]);
+        let test = "#[test]\nfn t() { let _ = crate::os_slots::fixture_glue_backend(None); }";
+        assert!(
+            scan("cli/x/src/lib.rs", test).test_uses.is_empty(),
+            "an unlisted name is not known"
+        );
+        let listed = os_scan_with("cli/x/src/lib.rs", test, false, &["fixture_glue_backend"]);
+        assert_eq!(
+            listed.test_uses.len(),
+            1,
+            "a test calling a listed wrapper is seen"
+        );
+        let library = "#[test]\nfn t() { let _ = super::system_library(Os::Linux); }";
+        assert_eq!(
+            scan("cli/x/src/lib.rs", library).test_uses.len(),
+            1,
+            "the system's libpam"
+        );
+    }
+
+    #[test]
+    fn an_account_password_slot_built_in_production_is_seen_and_patterns_are_not() {
+        for src in [
+            "fn f() { let _ = NewSlot::OsPassword { secret, label, enrolled_at, machine }; }",
+            "fn f() { let _ = apprafter_core::vault::NewSlot::OsPassword { secret, label, enrolled_at, machine }; }",
+            "use apprafter_core::vault::NewSlot::OsPassword;\nfn f() { let _ = OsPassword { secret, label, enrolled_at, machine }; }",
+            "use apprafter_core::vault::NewSlot::*;\nfn f() { let _ = OsPassword { secret, label, enrolled_at, machine }; }",
+            "impl NewSlot { fn f() -> Self { Self::OsPassword { secret, label, enrolled_at, machine } } }",
+        ] {
+            assert_eq!(scan("cli/x/src/lib.rs", src).os_password_slots.len(), 1, "{src}");
+        }
+        for src in [
+            "fn f(s: NewSlot) { if let NewSlot::OsPassword { .. } = s {} }",
+            "#[cfg(test)]\nmod t { fn f() { let _ = NewSlot::OsPassword { secret, label, enrolled_at, machine }; } }",
+            "fn f() { let _ = NewSlot::Password { secret, label }; }",
+        ] {
+            assert!(scan("cli/x/src/lib.rs", src).os_password_slots.is_empty(), "{src}");
+        }
     }
 }

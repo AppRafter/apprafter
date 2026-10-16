@@ -158,7 +158,7 @@
       in
       {
         devShells = {
-          default = pkgs.lib.warnIf (resticWarning != null) resticWarning (pkgs.mkShell {
+          default = pkgs.lib.warnIf (resticWarning != null) resticWarning (pkgs.mkShell ({
             name = "apprafter";
 
             packages = with pkgs; [
@@ -261,7 +261,14 @@
               echo "  just e2e-up      # local k3d cluster"
               echo
             '';
-          });
+          }
+          // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+            # D.4b B10: apprafter-os-slots loads libpam at run time (dlopen, never a link, so the
+            # CLI starts where libpam is absent). NixOS has no global library directory, so a
+            # build in this shell records this path (`option_env!`) and tries it before
+            # `libpam.so.0`; the released gnu binary finds libpam through nix-ld instead.
+            APPRAFTER_LIBPAM = "${pkgs.linux-pam}/lib/libpam.so.0";
+          }));
         }
         // pkgs.lib.optionalAttrs (system == "x86_64-linux") { desktop = desktopShell; };
 
