@@ -159,6 +159,7 @@ impl UnlockedVault {
             header: self.header.clone(),
             dk: Arc::clone(&self.dk),
             payload: self.payload.retired()?,
+            opened_by: None,
         };
         retired.seal(writer, rng)
     }
@@ -270,6 +271,7 @@ pub fn rotate(
         },
         dk,
         payload: current.payload.rotated_to(&next)?,
+        opened_by: None,
     };
     let mut proven: HashMap<SlotId, KeptSlot> =
         keep.into_iter().map(|kept| (kept.id, kept)).collect();

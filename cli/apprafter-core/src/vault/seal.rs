@@ -93,11 +93,13 @@ enum Fresh {
     RecoveryKey(RecoveryKey),
 }
 
-/// An opened vault: its header, its data key and its authenticated payload.
+/// An opened vault: its header, its data key and its authenticated payload — and the slot
+/// whose secret opened it, when one did (D.4b B60).
 pub struct UnlockedVault {
     header: VaultHeader,
     dk: Arc<DataKey>,
     payload: VaultPayload,
+    opened_by: Option<SlotId>,
 }
 
 impl fmt::Debug for UnlockedVault {
@@ -220,6 +222,7 @@ fn build(
         },
         dk,
         payload,
+        opened_by: None,
     };
     for (i, slot) in slots.into_iter().enumerate() {
         let record = match ids {
@@ -283,6 +286,12 @@ impl UnlockedVault {
 
     pub fn data_key(&self) -> &Arc<DataKey> {
         &self.dk
+    }
+
+    /// The slot whose secret opened this vault ([`VaultFile::open`], `open_typed`); `None`
+    /// for one opened with a held key or just made (B60: an outcome names the slot).
+    pub fn opened_by(&self) -> Option<SlotId> {
+        self.opened_by
     }
 
     /// Adds a slot wrapping this vault's data key; checked like `create`'s. An account-password
@@ -655,13 +664,14 @@ fn unwrap_slot(
 }
 
 impl VaultFile {
-    /// Opens the vault with a slot secret. A lock password or a recovery key tries every slot
-    /// of its kind; the account password only the first `0x03` slot made on this computer
-    /// (its tag is this machine id's), so another computer's slot is never tried, and a
-    /// second one of this computer's is a forged or damaged header, never tried either (B54,
-    /// B77). `WrongSecret` when each slot tried refused it by its key check; the policy's
-    /// refusal when it refused them all (T22: open such a vault with its recovery key);
-    /// `NoUsableSlot` when there is no slot to try.
+    /// Opens the vault with a slot secret. A recovery key tries every recovery slot; a lock
+    /// password the first lock-password slot only, in header order (B18); the account
+    /// password the first `0x03` slot made on this computer only (its tag is this machine
+    /// id's), so another computer's slot is never tried (B54, B77). A second slot of a typed
+    /// kind is a forged or damaged header, never tried: it would multiply each attempt's
+    /// Argon2id time. `WrongSecret` when each slot tried refused it by its key check; the
+    /// policy's refusal when it refused them all (T22: open such a vault with its recovery
+    /// key); `NoUsableSlot` when there is no slot to try.
     pub fn open(&self, secret: &SlotSecret, policy: &KdfPolicy) -> VaultResult<UnlockedVault> {
         let kind = secret.kind();
         let candidates: Vec<&SlotRecord> = match secret {
@@ -672,7 +682,14 @@ impl VaultFile {
                 .filter(|slot| slot.made_on(machine))
                 .take(1)
                 .collect(),
-            _ => self
+            SlotSecret::Password(_) => self
+                .header()
+                .slots
+                .iter()
+                .filter(|slot| slot.kind == kind)
+                .take(1)
+                .collect(),
+            SlotSecret::RecoveryKey(_) => self
                 .header()
                 .slots
                 .iter()
@@ -721,7 +738,7 @@ impl VaultFile {
             };
             tried = true;
             if let Some(dk) = self.try_slot(slot, &material[..])? {
-                return self.open_payload(dk);
+                return self.open_payload(dk, Some(slot.id));
             }
         }
         Err(match refused {
@@ -774,7 +791,7 @@ impl VaultFile {
         if self.header().vault_id != expected {
             return Err(VaultError::KeyStale);
         }
-        self.open_payload(DataKey::from_bytes(dk.expose()))
+        self.open_payload(DataKey::from_bytes(dk.expose()), None)
     }
 
     /// Each slot's verdict under `policy`, without deriving anything (`lock status`; L3).
@@ -799,7 +816,7 @@ impl VaultFile {
         unwrap_slot(&self.header().vault_id, slot, material)
     }
 
-    fn open_payload(&self, dk: DataKey) -> VaultResult<UnlockedVault> {
+    fn open_payload(&self, dk: DataKey, by: Option<SlotId>) -> VaultResult<UnlockedVault> {
         let (ct, tag) = self.payload_ct.split_at(self.payload_ct.len() - TAG_LEN);
         let mut plain = Zeroizing::new(ct.to_vec());
         XChaCha20Poly1305::new(Key::from_slice(dk.expose()))
@@ -815,6 +832,7 @@ impl VaultFile {
             header: self.header().clone(),
             dk: Arc::new(dk),
             payload,
+            opened_by: by,
         })
     }
 }
@@ -988,7 +1006,7 @@ mod tests {
         };
         assert_eq!(
             both.to_string(),
-            "this lock password or OS password does not open the vault"
+            "this lock password or account password does not open the vault"
         );
     }
 
@@ -1301,7 +1319,11 @@ mod tests {
             )
             .unwrap();
         let file = VaultFile::parse(&v.seal(WRITER, &mut OsRandom).unwrap()).unwrap();
-        assert!(file.open(&password("another lock password"), FAST).is_ok());
+        // B18: a second lock-password slot is never tried (a forged or damaged header).
+        assert!(matches!(
+            file.open(&password("another lock password"), FAST),
+            Err(VaultError::WrongSecret { .. })
+        ));
         assert!(file.open(&password(PASSWORD), FAST).is_ok());
         v.set_label(second, "renamed".into()).unwrap();
         assert_eq!(v.header().slots[2].label, "renamed");
@@ -1370,6 +1392,58 @@ mod tests {
             v.remove_slot(second, FAST),
             Err(VaultError::NoUsableSlotLeft)
         ));
+    }
+
+    /// B18: one lock-password slot is tried, the first in header order; a second one — a
+    /// forged or damaged header, which no flow writes (`lock slot add` refuses it) — is never
+    /// derived, so a header cannot multiply each attempt's Argon2id time.
+    #[test]
+    fn a_second_lock_password_slot_is_never_tried() {
+        let (_, mut v) = vault();
+        v.add_slot(
+            NewSlot::Password {
+                secret: SecretString::new("the second one"),
+                label: "second".into(),
+            },
+            FAST,
+            &mut OsRandom,
+        )
+        .unwrap();
+        let file = VaultFile::parse(&v.seal(WRITER, &mut OsRandom).unwrap()).unwrap();
+        let before = derivations();
+        match file.open(&password("the second one"), FAST) {
+            Err(VaultError::WrongSecret { kinds }) => assert_eq!(kinds, [SlotKind::Password]),
+            other => panic!("{:?}", other.map(|_| "opened")),
+        }
+        assert_eq!(
+            derivations(),
+            before + 1,
+            "only the first lock-password slot is tried"
+        );
+        assert!(file.open(&password(PASSWORD), FAST).is_ok());
+    }
+
+    /// B60: an opened vault names the slot whose secret opened it; one opened with a held
+    /// key, or just made, names none.
+    #[test]
+    fn an_opened_vault_names_the_slot_that_opened_it() {
+        let (bytes, made) = vault();
+        assert_eq!(made.opened_by(), None, "made, not opened");
+        let file = VaultFile::parse(&bytes).unwrap();
+        let ids: Vec<SlotId> = file.header().slots.iter().map(|slot| slot.id).collect();
+        let by_password = file.open(&password(PASSWORD), FAST).unwrap();
+        assert_eq!(by_password.opened_by(), Some(ids[0]));
+        let by_key = file.open(&recovery_secret(0x11), FAST).unwrap();
+        assert_eq!(by_key.opened_by(), Some(ids[1]));
+        let held = file
+            .open_with_key(made.data_key(), made.header().vault_id)
+            .unwrap();
+        assert_eq!(held.opened_by(), None, "a held key is no slot");
+        let (file, _) = both_password_kinds();
+        let typed = file
+            .open_typed(&SecretString::new(ACCOUNT), Some(&machine(0xa)), FAST)
+            .unwrap();
+        assert_eq!(typed.opened_by(), Some(file.header().slots[1].id));
     }
 
     #[test]
@@ -1810,7 +1884,7 @@ mod tests {
                 ));
                 assert_eq!(
                     e.to_string(),
-                    "this lock password or OS password does not open the vault"
+                    "this lock password or account password does not open the vault"
                 );
             }
             other => panic!("{:?}", other.map(|_| "opened")),

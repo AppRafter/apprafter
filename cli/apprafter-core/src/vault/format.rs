@@ -149,7 +149,7 @@ impl fmt::Display for SlotKind {
         match self {
             SlotKind::Password => f.write_str("lock password"),
             SlotKind::RecoveryKey => f.write_str("recovery key"),
-            SlotKind::OsPassword => f.write_str("OS password"),
+            SlotKind::OsPassword => f.write_str("account password"),
             SlotKind::WindowsHello => f.write_str("Windows Hello"),
             SlotKind::TouchId => f.write_str("Touch ID"),
             SlotKind::Unknown(byte) => write!(f, "slot of kind {byte:#04x}"),
