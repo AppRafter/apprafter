@@ -333,31 +333,8 @@ impl UnlockedVault {
     /// Removes a slot. Refuses the last recovery-key slot (ADR 0068 §3), and any removal that
     /// would leave no recovery-key slot or password slot `policy` accepts (T63; critic C6, S11).
     pub fn remove_slot(&mut self, id: SlotId, policy: &KdfPolicy) -> VaultResult<()> {
-        let index = self
-            .header
-            .slots
-            .iter()
-            .position(|slot| slot.id == id)
-            .ok_or(VaultError::SlotNotFound { slot: id })?;
-        let recovery_slots = self
-            .header
-            .slots
-            .iter()
-            .filter(|slot| slot.kind == SlotKind::RecoveryKey)
-            .count();
-        if self.header.slots[index].kind == SlotKind::RecoveryKey && recovery_slots == 1 {
-            return Err(VaultError::LastRecoverySlot);
-        }
-        let usable_left = self
-            .header
-            .slots
-            .iter()
-            .enumerate()
-            .any(|(i, slot)| i != index && opens_under(slot, policy));
-        if !usable_left {
-            return Err(VaultError::NoUsableSlotLeft);
-        }
-        self.header.slots.remove(index);
+        self.header.check_removal(id, policy)?;
+        self.header.slots.retain(|slot| slot.id != id);
         Ok(())
     }
 
@@ -544,6 +521,38 @@ fn opens_under(slot: &SlotRecord, policy: &KdfPolicy) -> bool {
         SlotBody::Password { kdf, .. } => policy.check(kdf).is_ok(),
         SlotBody::OsPassword { .. } => false,
         SlotBody::Opaque(_) => false,
+    }
+}
+
+impl VaultHeader {
+    /// Whether slot `id` may be removed under `policy` (T63): never the vault's last
+    /// recovery-key slot (ADR 0068 §3), nor one whose removal leaves no slot `policy` opens
+    /// (`NoUsableSlotLeft`, critic C6, S11); `SlotNotFound` for no such slot. Read from the
+    /// header alone, so a plan refuses before any secret is asked (D.4b c1, GOTCHA-294);
+    /// [`UnlockedVault::remove_slot`] checks it again on the vault it changes.
+    pub fn check_removal(&self, id: SlotId, policy: &KdfPolicy) -> VaultResult<()> {
+        let index = self
+            .slots
+            .iter()
+            .position(|slot| slot.id == id)
+            .ok_or(VaultError::SlotNotFound { slot: id })?;
+        let recovery_slots = self
+            .slots
+            .iter()
+            .filter(|slot| slot.kind == SlotKind::RecoveryKey)
+            .count();
+        if self.slots[index].kind == SlotKind::RecoveryKey && recovery_slots == 1 {
+            return Err(VaultError::LastRecoverySlot);
+        }
+        let usable_left = self
+            .slots
+            .iter()
+            .enumerate()
+            .any(|(i, slot)| i != index && opens_under(slot, policy));
+        if !usable_left {
+            return Err(VaultError::NoUsableSlotLeft);
+        }
+        Ok(())
     }
 }
 

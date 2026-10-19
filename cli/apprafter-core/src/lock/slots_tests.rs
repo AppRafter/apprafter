@@ -831,3 +831,415 @@ fn the_account_password_opens_lock_off_too() {
     assert_eq!(done.tokens_restored, ["prod"]);
     assert!(!k.ctx.config_root().join(VAULT_FILE).exists());
 }
+
+/// `lock slot remove <given>` to its end, planned with the facts of computer 0xa and opened
+/// with `opener` typed on `on`.
+fn remove(ctx: &Context, given: &str, opener: &str, on: Option<u8>) -> SlotRemoved {
+    let plan = plan_slot_remove(ctx, given, &FixedFacts::on(0xa)).unwrap();
+    let opened = open_with(ctx, opener, on).unwrap();
+    completed(execute_slot_remove(
+        ctx,
+        plan,
+        opened,
+        &NullReporter,
+        &CancellationToken::new(),
+    ))
+}
+
+/// The ids of `ctx`'s slots, from the report.
+fn ids(ctx: &Context) -> Vec<String> {
+    status(ctx, UnlockWindow::Closed, &quiet(), &UnknownFacts)
+        .unwrap()
+        .slots
+        .into_iter()
+        .map(|s| s.id.unwrap())
+        .collect()
+}
+
+/// B21 (WI-498 acceptance 1): a slot goes by a kind the store has one of, or by 8 of its id's
+/// characters; the plan (Destructive) says the keys stay and what opens the store after it;
+/// the data key is unchanged; `store.yaml` mirrors the vault; no client is asked.
+#[test]
+fn a_slot_is_removed_by_its_kind_or_its_id_and_the_keys_stay() {
+    let k = Kit::new();
+    let password = add(
+        &k.ctx,
+        SlotAddKind::Password,
+        0xa,
+        &k.recovery(),
+        None,
+        lock_password(NEW_LOCK_PASSWORD),
+    );
+    add(
+        &k.ctx,
+        SlotAddKind::OsPassword,
+        0xa,
+        NEW_LOCK_PASSWORD,
+        None,
+        account(ACCOUNT_A, 0xa),
+    );
+    let plan = plan_slot_remove(&k.ctx, "os-password", &FixedFacts::on(0xa)).unwrap();
+    assert_eq!(plan.class, PlanClass::Destructive);
+    assert_eq!(
+        plan.changes.iter().map(|c| c.action).collect::<Vec<_>>(),
+        [ChangeAction::Delete, ChangeAction::Keep, ChangeAction::Keep]
+    );
+    let keeps = plan.changes[1].detail.as_deref().unwrap();
+    assert!(
+        keeps.contains("`apprafter lock rekey` replaces the keys")
+            && keeps.contains("test guesses of that account password"),
+        "{keeps}"
+    );
+    assert_eq!(
+        plan.changes[2].detail.as_deref(),
+        Some("the store then opens with: recovery key, lock password")
+    );
+    let opener = open_with(&k.ctx, NEW_LOCK_PASSWORD, None).unwrap();
+    let done = completed(execute_slot_remove(
+        &k.ctx,
+        plan,
+        opener,
+        &NullReporter,
+        &CancellationToken::new(),
+    ));
+    assert_eq!(done.removed.kind, LockSlotKind::OsPassword);
+    assert_eq!(done.opened_with.kind, LockSlotKind::Password);
+    assert_eq!(
+        done.remains.iter().map(|s| s.kind).collect::<Vec<_>>(),
+        [LockSlotKind::RecoveryKey, LockSlotKind::Password]
+    );
+    assert!(!opens(&k.ctx, ACCOUNT_A, Some(0xa)));
+    // The data key did not change: the key held from before still reads the token.
+    let reader = Context::for_desktop(k.ctx.config_root().to_path_buf(), "http://127.0.0.1:1")
+        .with_vault_access(k.made.access());
+    assert_eq!(
+        reader
+            .secrets()
+            .stored_token("prod")
+            .unwrap()
+            .unwrap()
+            .expose(),
+        TOKEN
+    );
+    let plan = plan_slot_remove(&k.ctx, &password.added.id[..8], &FixedFacts::on(0xa)).unwrap();
+    assert_eq!(plan.payload.slot(), &password.added);
+    assert_eq!(
+        plan.changes[2].detail.as_deref(),
+        Some(
+            "on this computer the store then opens only with the recovery key; it opens with: \
+             recovery key"
+        )
+    );
+    let opener = open_with(&k.ctx, &k.recovery(), None).unwrap();
+    completed(execute_slot_remove(
+        &k.ctx,
+        plan,
+        opener,
+        &NullReporter,
+        &CancellationToken::new(),
+    ));
+    assert_eq!(
+        mirrored(&k.ctx),
+        [(LockSlotKind::RecoveryKey, "recovery key".to_string())]
+    );
+    assert_eq!(k.asked.asked(), 0);
+}
+
+/// ADR 0068 §3, S2 (WI-498 acceptance 1): the store's last recovery key is never removed —
+/// by its kind or by its id — refused by the plan, before anything is asked.
+#[test]
+fn the_recovery_key_is_never_removed() {
+    let k = Kit::new();
+    let before = vault_bytes(&k.ctx);
+    let id = ids(&k.ctx).remove(0);
+    for given in ["recovery-key", &id[..8]] {
+        assert!(
+            matches!(
+                plan_slot_remove(&k.ctx, given, &UnknownFacts),
+                Err(CoreError::Cli(CliError::SlotRefused {
+                    reason: SlotRefusal::LastRecoverySlot,
+                    ..
+                }))
+            ),
+            "{given}"
+        );
+    }
+    assert_eq!(vault_bytes(&k.ctx), before);
+    assert_eq!(k.asked.asked(), 0);
+}
+
+/// B21, B29: a slot the store does not have — an id no slot begins with, fewer than 4
+/// characters, a word that is no kind — or a kind it has two of is `slot_not_found`, listing
+/// what it could mean.
+#[test]
+fn a_slot_the_store_lacks_or_two_it_could_mean_is_slot_not_found() {
+    let k = Kit::new();
+    let on_a = add(
+        &k.ctx,
+        SlotAddKind::OsPassword,
+        0xa,
+        &k.recovery(),
+        None,
+        account(ACCOUNT_A, 0xa),
+    );
+    let on_b = add(
+        &k.ctx,
+        SlotAddKind::OsPassword,
+        0xb,
+        &k.recovery(),
+        None,
+        account(ACCOUNT_B, 0xb),
+    );
+    let not_found = |given: &str| match plan_slot_remove(&k.ctx, given, &FixedFacts::on(0xa)) {
+        Err(CoreError::Cli(CliError::SlotNotFound { matches, .. })) => matches,
+        other => panic!("{given}: {other:?}"),
+    };
+    assert!(not_found("lock").is_empty());
+    assert!(
+        not_found(&on_a.added.id[..3]).is_empty(),
+        "fewer than 4 characters name no slot"
+    );
+    let all = ids(&k.ctx);
+    let unused = (0..=0xffffu32)
+        .map(|n| format!("{n:04x}"))
+        .find(|p| all.iter().all(|id| !id.starts_with(p.as_str())))
+        .unwrap();
+    assert!(not_found(&unused).is_empty());
+    let mut both = not_found("os-password");
+    both.sort();
+    let mut want = vec![on_a.added.id.clone(), on_b.added.id.clone()];
+    want.sort();
+    assert_eq!(both, want);
+    assert_eq!(k.asked.asked(), 0);
+}
+
+/// T63, B29 (WI-498 acceptance 1): on a hand-made vault without its recovery key, removing
+/// its only lock password would leave no slot this build opens — `no_usable_slot_left`,
+/// refused by the plan, before anything is asked.
+#[test]
+fn a_removal_that_leaves_no_slot_this_build_opens_is_refused_by_the_plan() {
+    let k = Kit::new();
+    add(
+        &k.ctx,
+        SlotAddKind::Password,
+        0xa,
+        &k.recovery(),
+        None,
+        lock_password(NEW_LOCK_PASSWORD),
+    );
+    let mut vault = crate::vault::VaultFile::parse(&vault_bytes(&k.ctx))
+        .unwrap()
+        .open_with_key(k.made.data_key(), k.made.vault_id)
+        .unwrap();
+    vault
+        .header_mut()
+        .slots
+        .retain(|slot| slot.kind != crate::vault::SlotKind::RecoveryKey);
+    let sealed = vault.seal("apprafter 0.0.0-test", &mut OsRandom).unwrap();
+    let held = StoreLock::exclusive(&k.ctx.store()).unwrap();
+    crate::vault::file::replace(&k.ctx.config_root().join(VAULT_FILE), &sealed, &held).unwrap();
+    drop(held);
+    assert!(matches!(
+        plan_slot_remove(&k.ctx, "password", &UnknownFacts),
+        Err(CoreError::Cli(CliError::SlotRefused {
+            reason: SlotRefusal::NoUsableSlotLeft,
+            ..
+        }))
+    ));
+    assert_eq!(k.asked.asked(), 0);
+}
+
+/// B60 (WI-498 acceptance 2): a fresh secret of every kind opens a removal — the account
+/// password, the lock password, the recovery key — and no holder is ever asked.
+#[test]
+fn every_kind_of_slot_opens_a_removal_and_no_holder_is_asked() {
+    let k = Kit::new();
+    add(
+        &k.ctx,
+        SlotAddKind::Password,
+        0xa,
+        &k.recovery(),
+        None,
+        lock_password(NEW_LOCK_PASSWORD),
+    );
+    add(
+        &k.ctx,
+        SlotAddKind::OsPassword,
+        0xa,
+        &k.recovery(),
+        None,
+        account(ACCOUNT_A, 0xa),
+    );
+    let on_b = add(
+        &k.ctx,
+        SlotAddKind::OsPassword,
+        0xb,
+        &k.recovery(),
+        None,
+        account(ACCOUNT_B, 0xb),
+    );
+    let by_account = remove(&k.ctx, &on_b.added.id[..8], ACCOUNT_A, Some(0xa));
+    let by_password = remove(&k.ctx, "os-password", NEW_LOCK_PASSWORD, None);
+    let by_recovery = remove(&k.ctx, "password", &k.recovery(), None);
+    assert_eq!(
+        [
+            by_account.opened_with.kind,
+            by_password.opened_with.kind,
+            by_recovery.opened_with.kind
+        ],
+        [
+            LockSlotKind::OsPassword,
+            LockSlotKind::Password,
+            LockSlotKind::RecoveryKey
+        ]
+    );
+    assert_eq!(k.asked.asked(), 0);
+}
+
+/// B19: a slot another process removed between the plan and the lock is `slot_not_found`,
+/// read under the lock; nothing is written.
+#[test]
+fn a_slot_removed_meanwhile_is_slot_not_found_under_the_lock() {
+    let k = Kit::new();
+    add(
+        &k.ctx,
+        SlotAddKind::Password,
+        0xa,
+        &k.recovery(),
+        None,
+        lock_password(NEW_LOCK_PASSWORD),
+    );
+    let plan = plan_slot_remove(&k.ctx, "password", &UnknownFacts).unwrap();
+    let opener = open_with(&k.ctx, &k.recovery(), None).unwrap();
+    remove(&k.ctx, "password", &k.recovery(), None);
+    let between = vault_bytes(&k.ctx);
+    assert!(matches!(
+        execute_slot_remove(
+            &k.ctx,
+            plan,
+            opener,
+            &NullReporter,
+            &CancellationToken::new()
+        ),
+        Err(CoreError::Cli(CliError::SlotNotFound { .. }))
+    ));
+    assert_eq!(vault_bytes(&k.ctx), between);
+}
+
+/// M3, B19 for a removal (critic round, finding 2): a token another command stores while
+/// the removal waits for the store lock is kept.
+#[test]
+fn a_token_stored_while_a_removal_waits_for_the_lock_is_kept() {
+    let k = Kit::new();
+    add(
+        &k.ctx,
+        SlotAddKind::Password,
+        0xa,
+        &k.recovery(),
+        None,
+        lock_password(NEW_LOCK_PASSWORD),
+    );
+    let plan = plan_slot_remove(&k.ctx, "password", &UnknownFacts).unwrap();
+    let opener = open_with(&k.ctx, &k.recovery(), None).unwrap();
+    let (waiting, other) = other_writer(opened(&k.ctx, &k.recovery()), "prod", TOKEN_C);
+    completed(execute_slot_remove(
+        &k.ctx,
+        plan,
+        opener,
+        &waiting,
+        &CancellationToken::new(),
+    ));
+    other.join().unwrap();
+    assert_eq!(token_of(&k.ctx, &k.recovery(), "prod"), TOKEN_C);
+    assert!(!opens(&k.ctx, NEW_LOCK_PASSWORD, None));
+}
+
+/// §5.6, ADR 0069 §10 (critic round, finding 7; Deviation 23): a second recovery-key slot —
+/// which no write of the core makes — goes by its id, leaving the store's one recovery key;
+/// `recovery-key` names two slots until then (`slot_not_found`); the last one never goes.
+#[test]
+fn a_second_recovery_slot_goes_by_its_id_and_the_last_stays() {
+    let k = Kit::new();
+    let mut vault = crate::vault::VaultFile::parse(&vault_bytes(&k.ctx))
+        .unwrap()
+        .open_with_key(k.made.data_key(), k.made.vault_id)
+        .unwrap();
+    let spare = vault
+        .forge_record(
+            NewSlot::RecoveryKey {
+                key: RecoveryKey::generate(&mut OsRandom).unwrap(),
+                label: "spare".into(),
+            },
+            &KdfPolicy::INSECURE_FAST,
+        )
+        .unwrap();
+    let spare_id = spare.id.to_string();
+    vault.header_mut().slots.push(spare);
+    let sealed = vault.seal("apprafter 0.0.0-test", &mut OsRandom).unwrap();
+    let held = StoreLock::exclusive(&k.ctx.store()).unwrap();
+    crate::vault::file::replace(&k.ctx.config_root().join(VAULT_FILE), &sealed, &held).unwrap();
+    drop(held);
+    assert!(matches!(
+        plan_slot_remove(&k.ctx, "recovery-key", &UnknownFacts),
+        Err(CoreError::Cli(CliError::SlotNotFound { ref matches, .. })) if matches.len() == 2
+    ));
+    remove(&k.ctx, &spare_id[..8], &k.recovery(), None);
+    assert!(matches!(
+        plan_slot_remove(&k.ctx, "recovery-key", &UnknownFacts),
+        Err(CoreError::Cli(CliError::SlotRefused {
+            reason: SlotRefusal::LastRecoverySlot,
+            ..
+        }))
+    ));
+    assert!(opens(&k.ctx, &k.recovery(), None));
+}
+
+/// B20, §9.2 c1: a fault before a removal's replace leaves the vault as it was; a removal
+/// that does not read back is not kept.
+#[test]
+fn a_removal_that_faults_first_or_does_not_read_back_is_not_reported() {
+    let k = Kit::new();
+    add(
+        &k.ctx,
+        SlotAddKind::Password,
+        0xa,
+        &k.recovery(),
+        None,
+        lock_password(NEW_LOCK_PASSWORD),
+    );
+    let before = vault_bytes(&k.ctx);
+    let ctx = k.ctx.clone().with_fault(FaultPoint::BeforeSlotWrite);
+    let plan = plan_slot_remove(&ctx, "password", &UnknownFacts).unwrap();
+    let opener = open_with(&ctx, &k.recovery(), None).unwrap();
+    assert!(
+        execute_slot_remove(&ctx, plan, opener, &NullReporter, &CancellationToken::new()).is_err()
+    );
+    assert_eq!(vault_bytes(&k.ctx), before);
+    let old = before.clone();
+    super::slots::AFTER_SLOT_WRITE.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |root: &Path| {
+            std::fs::write(root.join(VAULT_FILE), &old).unwrap()
+        }));
+    });
+    let plan = plan_slot_remove(&k.ctx, "password", &UnknownFacts).unwrap();
+    let opener = open_with(&k.ctx, &k.recovery(), None).unwrap();
+    let result = execute_slot_remove(
+        &k.ctx,
+        plan,
+        opener,
+        &NullReporter,
+        &CancellationToken::new(),
+    );
+    super::slots::AFTER_SLOT_WRITE.with(|hook| *hook.borrow_mut() = None);
+    assert!(
+        matches!(
+            result,
+            Err(CoreError::Cli(CliError::VaultUnreadable { .. }))
+        ),
+        "{result:?}"
+    );
+    assert!(
+        opens(&k.ctx, NEW_LOCK_PASSWORD, None),
+        "the vault on disk is the one from before"
+    );
+}

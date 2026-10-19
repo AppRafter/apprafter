@@ -36,19 +36,19 @@ use super::facts::{MachineFact, SlotFacts};
 use super::faults::{self, FaultPoint};
 use super::on::{change, title, vault_err};
 use super::open::{OpenedVault, PasswordAdvice};
-use super::{SlotNote, SlotRef};
+use super::{SlotNote, SlotRef, SlotView};
 use crate::context::{Context, SecretString};
 use crate::error::{CoreError, CoreResult};
 use crate::op::{ChangeAction, Outcome, Plan, PlanClass};
 use crate::report::Reporter;
 use crate::secrets::{
-    not_kept, read_store_file, read_vault, sync_root, vault_path, write_store_file, SecretsMode,
-    SlotInfo, StoreId, STORE_FILE,
+    not_kept, read_store_file, read_vault, sync_root, vault_path, write_store_file, LockSlotKind,
+    SecretsMode, SlotInfo, StoreId, STORE_FILE,
 };
 use crate::vault::{
-    self, check_new_password, MachineId, NewSlot, OsRandom, PasswordProblem, SlotKind, SlotSecret,
-    UnlockedVault, VaultError, VaultFile, VaultHeader, LABEL_MAX, RECOMMENDED_PASSWORD_CHARS,
-    SLOT_MAX,
+    self, check_new_password, KdfPolicy, MachineId, NewSlot, OsRandom, PasswordProblem, SlotId,
+    SlotKind, SlotRecord, SlotSecret, UnlockedVault, VaultError, VaultFile, VaultHeader, LABEL_MAX,
+    RECOMMENDED_PASSWORD_CHARS, SLOT_MAX,
 };
 use crate::CancellationToken;
 
@@ -532,4 +532,247 @@ fn not_locked(root: &Path) -> CoreError {
         help: "`apprafter lock on` protects it: it sets up the ways in, and a recovery key."
             .to_string(),
     })
+}
+
+/// What [`execute_slot_remove`] carries out. It never crosses IPC (`Plan::payload`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotRemovePayload {
+    id: StoreId,
+    slot: SlotRef,
+    slot_id: SlotId,
+}
+
+impl SlotRemovePayload {
+    /// The store whose vault the opener's secret opens.
+    pub fn store_id(&self) -> &StoreId {
+        &self.id
+    }
+
+    /// The slot the removal takes out.
+    pub fn slot(&self) -> &SlotRef {
+        &self.slot
+    }
+}
+
+/// What a run of `lock slot remove` did. `Serialize` for the desktop's flow (its TypeScript
+/// export is d4b-c4's); the CLI prints text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SlotRemoved {
+    pub store: String,
+    pub store_id: String,
+    pub removed: SlotRef,
+    /// The slots the store opens with now, in the vault's order.
+    pub remains: Vec<SlotRef>,
+    /// The slot whose fresh secret allowed it (B60).
+    pub opened_with: SlotRef,
+}
+
+/// What a removal leaves as it was (B21), in its plan: it never changes the keys — the store
+/// key inside the vault included, which only a key change replaces (O-b9; critic round,
+/// finding 13).
+const REMOVE_KEEPS: &str = "its keys stay as they are: a copy of the vault made before this \
+     still opens with this slot's secret, the data key that secret gave still opens this \
+     vault and the store key inside it, which decrypts the cached kubeconfigs and Argo CD \
+     passwords, and an unlock window opened with it stays open until it ends — if you think \
+     the secret leaked, `apprafter lock rekey` replaces the keys";
+
+/// What removing an account-password slot leaves, too (B21, Q1).
+const REMOVE_ACCOUNT_PASSWORD: &str = "; copies of the vault made before this still let \
+     someone test guesses of that account password — change it if that matters";
+
+/// The plan of `lock slot remove <given>` (Destructive, B21): read-only, no secret. `given`
+/// is 4 or more hex characters that begin exactly one slot's id, or a kind the store has
+/// exactly one slot of (`password`, `os-password`, `recovery-key`); anything else is
+/// `slot_not_found`, listing what it could mean. Refused before anything is asked: the
+/// store's last recovery key (ADR 0068 §3: `lock recovery` replaces it), a removal that
+/// leaves no slot this build opens (`no_usable_slot_left`), a store not locked. The plan
+/// says what a removal does not do — it never changes the keys — and what the store opens
+/// with after it (on this computer, from `facts`).
+pub fn plan_slot_remove(
+    ctx: &Context,
+    given: &str,
+    facts: &dyn SlotFacts,
+) -> CoreResult<Plan<SlotRemovePayload>> {
+    let root = ctx.config_root();
+    let policy = super::kdf_policy(ctx);
+    let (id, file) = locked_vault(ctx)?;
+    let slot = resolve(root, file.header(), given)?;
+    let removal = file.header().check_removal(slot.id, policy);
+    removal.map_err(|e| vault_err(root, e))?;
+    let mut keeps = REMOVE_KEEPS.to_string();
+    if slot.kind == SlotKind::OsPassword {
+        keeps.push_str(REMOVE_ACCOUNT_PASSWORD);
+    }
+    let after = remains_line(&file, slot.id, policy, facts);
+    let targets = cli_core::list_target_names(&ctx.store())?;
+    Ok(Plan {
+        class: PlanClass::Destructive,
+        title: title("Remove a way to open", root, &targets),
+        changes: vec![
+            change(
+                "Slot",
+                &slot.label,
+                ChangeAction::Delete,
+                "it stops opening this vault file",
+            ),
+            change(
+                "Vault",
+                &vault_path(root).display().to_string(),
+                ChangeAction::Keep,
+                &keeps,
+            ),
+            change("Slots", "after this", ChangeAction::Keep, &after),
+        ],
+        payload: SlotRemovePayload {
+            id,
+            slot: SlotRef::from(slot),
+            slot_id: slot.id,
+        },
+    })
+}
+
+/// Carries out `plan` with `opened`, the vault opened in this process by a fresh secret of
+/// any slot (B60): under the held lock the vault is read again and opened with its key
+/// (`store_changed` when it was replaced since); a slot another process removed meanwhile is
+/// `slot_not_found`; the vault's own rules are checked again (`remove_slot`); one durable
+/// replace; the root synced; read back, the slot gone and the payload opening with the same
+/// key; `store.yaml` rewritten. `Cancelled`, with nothing written, until the lock is held.
+pub fn execute_slot_remove(
+    ctx: &Context,
+    plan: Plan<SlotRemovePayload>,
+    opened: OpenedVault,
+    reporter: &dyn Reporter,
+    cancel: &CancellationToken,
+) -> CoreResult<Outcome<SlotRemoved>> {
+    if cancel.is_cancelled() {
+        return Ok(cancelled());
+    }
+    let payload = plan.payload;
+    let root = ctx.config_root();
+    let store = ctx.store();
+    let policy = super::kdf_policy(ctx);
+    let held = held_lock(ctx, reporter)?;
+    if cancel.is_cancelled() {
+        return Ok(cancelled());
+    }
+    let mut vault = reread(ctx, &payload.id, &opened)?;
+    let still_there = vault
+        .header()
+        .slots
+        .iter()
+        .any(|slot| slot.id == payload.slot_id);
+    if !still_there {
+        return Err(CoreError::Cli(CliError::SlotNotFound {
+            store: root.to_path_buf(),
+            given: payload.slot.id.clone(),
+            matches: Vec::new(),
+        }));
+    }
+    vault
+        .remove_slot(payload.slot_id, policy)
+        .map_err(|e| vault_err(root, e))?;
+    let writer = ctx.vault_access().writer();
+    let sealed = vault
+        .seal(&writer, &mut OsRandom)
+        .map_err(|e| vault_err(root, e))?;
+    faults::hit(ctx, FaultPoint::BeforeSlotWrite)?;
+    vault::file::replace(&vault_path(root), &sealed, &held).map_err(|e| vault_err(root, e))?;
+    #[cfg(test)]
+    after_slot_write(root);
+    faults::hit(ctx, FaultPoint::AfterSlotWrite)?;
+    sync_root(&store)?;
+    // B20: read back from disk — the slot gone, the payload opening with the same key.
+    let disk = read_vault(&store, &payload.id)?;
+    let kept = VaultFile::parse(&disk)
+        .and_then(|back| back.open_with_key(&opened.key, opened.vault_id))
+        .ok()
+        .filter(|back| {
+            back.header()
+                .slots
+                .iter()
+                .all(|slot| slot.id != payload.slot_id)
+        })
+        .ok_or_else(|| CoreError::Cli(not_kept(&store, "the removal")))?;
+    mirror(root, &held, kept.header())?;
+    Ok(Outcome::Completed {
+        result: SlotRemoved {
+            store: root.display().to_string(),
+            store_id: payload.id.to_string(),
+            remains: kept.header().slots.iter().map(SlotRef::from).collect(),
+            removed: payload.slot,
+            opened_with: opened.opened_with().clone(),
+        },
+    })
+}
+
+/// The slot `given` names (B21): 4 or more hex characters that begin exactly one slot's
+/// id, or a kind the store has exactly one slot of. Anything else is `slot_not_found`,
+/// listing the slots it could mean.
+fn resolve<'a>(root: &Path, header: &'a VaultHeader, given: &str) -> CoreResult<&'a SlotRecord> {
+    let wanted = given.trim().to_ascii_lowercase();
+    let hex_id = wanted.len() >= 4 && wanted.bytes().all(|b| b.is_ascii_hexdigit());
+    let kind = match wanted.as_str() {
+        "password" => Some(SlotKind::Password),
+        "os-password" => Some(SlotKind::OsPassword),
+        "recovery-key" => Some(SlotKind::RecoveryKey),
+        _ => None,
+    };
+    let matches: Vec<&SlotRecord> = match kind {
+        Some(kind) => header
+            .slots
+            .iter()
+            .filter(|slot| slot.kind == kind)
+            .collect(),
+        None if hex_id => header
+            .slots
+            .iter()
+            .filter(|slot| slot.id.to_string().starts_with(&wanted))
+            .collect(),
+        None => Vec::new(),
+    };
+    match matches.as_slice() {
+        [one] => Ok(*one),
+        _ => Err(CoreError::Cli(CliError::SlotNotFound {
+            store: root.to_path_buf(),
+            given: given.to_string(),
+            matches: matches.iter().map(|slot| slot.id.to_string()).collect(),
+        })),
+    }
+}
+
+/// What the store opens with once `removed` is gone (B21, B68, B76): every other slot's
+/// label — after the words that on this computer only the recovery key would open it, when
+/// no other slot opens here.
+fn remains_line(
+    file: &VaultFile,
+    removed: SlotId,
+    policy: &KdfPolicy,
+    facts: &dyn SlotFacts,
+) -> String {
+    let views = super::status::header_views(file.header(), file.slot_policy(policy), facts);
+    let left: Vec<&SlotView> = file
+        .header()
+        .slots
+        .iter()
+        .zip(&views)
+        .filter(|(slot, _)| slot.id != removed)
+        .map(|(_, view)| view)
+        .collect();
+    let labels = left
+        .iter()
+        .map(|view| view.label.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if left
+        .iter()
+        .any(|view| view.kind != LockSlotKind::RecoveryKey && view.refused.is_none())
+    {
+        format!("the store then opens with: {labels}")
+    } else {
+        format!(
+            "on this computer the store then opens only with the recovery key; it opens \
+             with: {labels}"
+        )
+    }
 }

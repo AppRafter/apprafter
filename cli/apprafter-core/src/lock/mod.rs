@@ -39,8 +39,9 @@ pub use open::{
     check_password, open_at, open_slot_at, set_unlock_timeout, OpenedVault, SlotOpened,
 };
 pub use slots::{
-    account_password_label, check_account_password, execute_slot_add, plan_slot_add, SlotAddKind,
-    SlotAddPayload, SlotAdded,
+    account_password_label, check_account_password, execute_slot_add, execute_slot_remove,
+    plan_slot_add, plan_slot_remove, SlotAddKind, SlotAddPayload, SlotAdded, SlotRemovePayload,
+    SlotRemoved,
 };
 
 use std::path::{Path, PathBuf};
