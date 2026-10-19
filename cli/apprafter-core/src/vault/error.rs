@@ -258,6 +258,9 @@ pub enum InputWhat {
     OneSlotPerComputer,
     SlotIds,
     FirstSlots,
+    RotationUnfinished,
+    SameVaultId,
+    OneRecoverySlot,
 }
 
 impl fmt::Display for InputWhat {
@@ -277,6 +280,11 @@ impl fmt::Display for InputWhat {
             Self::FirstSlots => {
                 "a vault made at plan time holds exactly one recovery-key slot and another slot"
             }
+            Self::RotationUnfinished => {
+                "the vault already retires a store key: that key change is finished first"
+            }
+            Self::SameVaultId => "a rotated vault needs a vault id of its own",
+            Self::OneRecoverySlot => "a rotated vault holds exactly one recovery-key slot",
         })
     }
 }

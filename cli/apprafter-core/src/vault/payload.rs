@@ -15,8 +15,9 @@ use std::str::FromStr;
 use age::secrecy::ExposeSecret;
 use zeroize::Zeroizing;
 
-use super::error::{PayloadWhat, SizeWhat, VaultError, VaultResult};
+use super::error::{InputWhat, PayloadWhat, SizeWhat, VaultError, VaultResult};
 use super::format::PAYLOAD_MAX;
+use super::rng::VaultRng;
 use crate::context::SecretString;
 use crate::target::validate_name;
 
@@ -33,6 +34,11 @@ pub const MAX_UNLOCK_TIMEOUT_MIN: u32 = 1440;
 
 const AGE_IDENTITY: &str = "age-identity";
 const AGE_IDENTITY_RETIRING: &str = "age-identity-retiring";
+/// The human-readable part of age's X25519 identity text (Bech32, BIP 173).
+const AGE_IDENTITY_HRP: &str = "age-secret-key-";
+/// An age X25519 identity's text: `AGE-SECRET-KEY-1`, 52 characters for 32 bytes, 6 of
+/// checksum.
+const IDENTITY_TEXT_LEN: usize = 74;
 const UNLOCK_TIMEOUT: &str = "settings/unlock-timeout-min";
 const TOKEN_LEAF: &str = "hetzner-token";
 
@@ -223,6 +229,28 @@ impl VaultPayload {
             .collect()
     }
 
+    /// This payload as a rotation writes it (R2, B63): `next` as the store key, the current
+    /// one — byte for byte — as `age-identity-retiring`, every other entry as it is. Refused
+    /// when a rotation is already under way (a retiring key is there): that one is finished
+    /// first (§5.4), or its key would be lost while caches may still be sealed to it.
+    pub(crate) fn rotated_to(&self, next: &age::x25519::Identity) -> VaultResult<VaultPayload> {
+        if self.entries.contains_key(AGE_IDENTITY_RETIRING) {
+            return Err(VaultError::InvalidInput(InputWhat::RotationUnfinished));
+        }
+        let current = self
+            .entries
+            .get(AGE_IDENTITY)
+            .ok_or_else(|| payload_invalid(PayloadWhat::AgeIdentityMissing))?
+            .clone();
+        let mut entries = self.entries.clone();
+        entries.insert(AGE_IDENTITY_RETIRING.to_string(), current);
+        entries.insert(
+            AGE_IDENTITY.to_string(),
+            Zeroizing::new(next.to_string().expose_secret().as_bytes().to_vec()),
+        );
+        Ok(VaultPayload { entries })
+    }
+
     /// The encoded length, and the two limits a payload can break.
     pub(crate) fn check_size(&self) -> VaultResult<usize> {
         if self.entries.len() > ENTRY_MAX {
@@ -363,6 +391,25 @@ fn parse_identity(value: &[u8]) -> VaultResult<age::x25519::Identity> {
     age::x25519::Identity::from_str(text).map_err(|_| payload_invalid(PayloadWhat::AgeIdentity))
 }
 
+/// A new store key (D.4b B63) from 32 bytes of the vault's generator — so a rotation's
+/// vectors pin it like every other byte the vault draws — in age's own text: Bech32 under
+/// [`AGE_IDENTITY_HRP`], upper case, parsed back by age. age clamps the scalar when it uses
+/// it, as for a key it generates; its secret keeps the bytes as drawn (x25519-dalek 2), so
+/// the text round-trips. The bytes and the text live in zeroed buffers; bech32's own encode
+/// buffer is T29's stated limit.
+pub(crate) fn draw_identity(rng: &mut dyn VaultRng) -> VaultResult<age::x25519::Identity> {
+    let mut bytes = Zeroizing::new([0u8; 32]);
+    rng.fill(&mut bytes[..])?;
+    let hrp =
+        bech32::Hrp::parse(AGE_IDENTITY_HRP).expect("age's identity HRP is a valid Bech32 HRP");
+    // Pre-sized, so the encoder's writes never reallocate and leave a copy behind.
+    let mut text = Zeroizing::new(String::with_capacity(IDENTITY_TEXT_LEN));
+    bech32::encode_upper_to_fmt::<bech32::Bech32, String>(&mut *text, hrp, &bytes[..])
+        .expect("32 bytes always encode under age's identity HRP");
+    debug_assert_eq!(text.len(), IDENTITY_TEXT_LEN);
+    age::x25519::Identity::from_str(&text).map_err(|_| payload_invalid(PayloadWhat::AgeIdentity))
+}
+
 /// ASCII decimal, 0..=1440, no sign, no leading zero, no spaces.
 fn parse_timeout(value: &[u8]) -> VaultResult<u32> {
     let canonical = !value.is_empty()
@@ -379,7 +426,8 @@ fn parse_timeout(value: &[u8]) -> VaultResult<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vault::testutil::{hex, tlv, unhex};
+    use crate::vault::rng::ScriptedRandom;
+    use crate::vault::testutil::{hex, seq, tlv, unhex};
 
     const IDENTITY: &str =
         "AGE-SECRET-KEY-1YQSJYGEYY5NZW2PF9G4JCTFW9UCRZV3NXS6NVDEC8YARK0PA8CLSWXGG7Q";
@@ -693,6 +741,69 @@ mod tests {
             again.raw("age-identity-retiring"),
             Some(IDENTITY.as_bytes())
         );
+    }
+
+    /// D.4b B63, F5: a drawn store key is age's own text for the bytes drawn — D.4a's
+    /// vectors' identity, written by the independent generator from bytes `20 … 3f` — and a
+    /// failing generator fails it.
+    #[test]
+    fn a_drawn_store_key_is_ages_text_for_the_drawn_bytes() {
+        let drawn = draw_identity(&mut ScriptedRandom::new(vec![seq(0x20, 32)])).unwrap();
+        assert_eq!(drawn.to_string().expose_secret(), IDENTITY);
+        assert!(matches!(
+            draw_identity(&mut ScriptedRandom::failing_at(0, vec![])),
+            Err(VaultError::RandomUnavailable { .. })
+        ));
+    }
+
+    /// D.4b B63: a rotation's payload — the new store key as `age-identity`, the current
+    /// one, byte for byte, as `age-identity-retiring`, every other entry as it is — and a
+    /// second rotation before the first is finished is refused.
+    #[test]
+    fn a_rotation_carries_the_store_key_it_retires() {
+        let current = VaultPayload::decode(&tlv(&[
+            ("age-identity", IDENTITY.as_bytes()),
+            ("settings/unlock-timeout-min", &b"15"[..]),
+            ("x-future/key", &[0xffu8, 0xfe][..]),
+        ]))
+        .unwrap();
+        let next = draw_identity(&mut ScriptedRandom::new(vec![seq(0xa0, 32)])).unwrap();
+        let rotated = current.rotated_to(&next).unwrap();
+        assert_eq!(
+            rotated.keys().collect::<Vec<_>>(),
+            [
+                "age-identity",
+                "age-identity-retiring",
+                "settings/unlock-timeout-min",
+                "x-future/key"
+            ]
+        );
+        assert_eq!(
+            rotated.raw("age-identity"),
+            Some(next.to_string().expose_secret().as_bytes())
+        );
+        assert_eq!(
+            rotated.raw("age-identity-retiring"),
+            Some(IDENTITY.as_bytes())
+        );
+        for key in ["settings/unlock-timeout-min", "x-future/key"] {
+            assert_eq!(rotated.raw(key), current.raw(key), "{key}");
+        }
+        assert_eq!(
+            rotated
+                .retiring_identity()
+                .unwrap()
+                .unwrap()
+                .to_public()
+                .to_string(),
+            identity().to_public().to_string()
+        );
+        assert!(matches!(
+            rotated.rotated_to(&identity()),
+            Err(VaultError::InvalidInput(InputWhat::RotationUnfinished))
+        ));
+        assert_eq!(current.raw("age-identity"), Some(IDENTITY.as_bytes()));
+        assert!(current.raw("age-identity-retiring").is_none());
     }
 
     #[test]

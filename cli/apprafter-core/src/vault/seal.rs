@@ -42,6 +42,10 @@ use super::recovery::RecoveryKey;
 use super::rng::VaultRng;
 use crate::context::SecretString;
 
+mod rotation;
+
+pub use rotation::{rotate, KeptMaterial, KeptSlot, Rotated, RotationIds};
+
 /// A slot to create. Its secret is checked before anything is drawn or derived: a lock
 /// password and an account password by O2's rules ([`check_new_password`]), a label by the
 /// format's.
@@ -911,7 +915,7 @@ mod tests {
     }
 
     /// A payload whose encoding is exactly `len` bytes (any length above 31 + the identity's).
-    fn payload_of_len(len: usize) -> VaultPayload {
+    pub(super) fn payload_of_len(len: usize) -> VaultPayload {
         const OVERHEAD: usize = 1 + "target/t0000/hetzner-token".len() + 2;
         let mut payload = VaultPayload::new(&identity());
         let mut left = len - 2 - (1 + "age-identity".len() + 2 + IDENTITY.len());

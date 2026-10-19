@@ -11,6 +11,8 @@
 
 use std::fs;
 
+use age::secrecy::ExposeSecret;
+use cli_core::secrets::decrypt_with_identity;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -21,7 +23,9 @@ use super::kdf::{
 use super::keys::{MachineId, SlotSecret};
 use super::payload::{EntryKey, VaultPayload};
 use super::rng::{OsRandom, ScriptedRandom};
-use super::seal::{create, create_with, slot_aad, NewSlot, VaultIds};
+use super::seal::{
+    create, create_with, rotate, slot_aad, KeptMaterial, NewSlot, RotationIds, VaultIds,
+};
 use super::testutil::{hex, seq, unhex, vector_path};
 use super::{
     Argon2idParams, RecoveryKey, SlotBody, SlotId, SlotKind, VaultError, VaultFile, VaultId,
@@ -790,4 +794,202 @@ fn created_with_vector() {
         assert_eq!(entries_of(opened.payload()), entries_listed(&v));
         assert_eq!(&opened.data_key().expose()[..], &seq(0x40, 32)[..]);
     }
+}
+
+/// B6, B7, B63, acceptance 1 and 3: a rotation as `lock rekey` runs it, from the independent
+/// generator — a store of every slot shape (a lock password, this computer's account password,
+/// another computer's, an unknown slot, the recovery key) rotated to a new data key, vault id
+/// and store key; the account password and the recovery key kept under their own ids, a new
+/// lock password under its minted id, the rest dropped; the old store key retiring beside the
+/// new one. rage sealed one cache to each store key.
+#[test]
+fn rotated_vector() {
+    let v = inputs("rotated");
+    let before = read("rotated/before/vault");
+    let mid = read("rotated/mid/vault");
+    assert_eq!(
+        hex(&Sha256::digest(&before)),
+        text(&v, &["before", "vault_sha256"])
+    );
+    assert_eq!(
+        hex(&Sha256::digest(&mid)),
+        text(&v, &["mid", "vault_sha256"])
+    );
+    let fast = &KdfPolicy::INSECURE_FAST;
+    let b = VaultFile::parse(&before).unwrap();
+    assert_eq!(
+        b.header().slots.iter().map(|s| s.kind).collect::<Vec<_>>(),
+        [
+            SlotKind::Password,
+            SlotKind::OsPassword,
+            SlotKind::OsPassword,
+            SlotKind::Unknown(0x7f),
+            SlotKind::RecoveryKey
+        ]
+    );
+    let current = b
+        .open(&SlotSecret::RecoveryKey(recovery_key()), fast)
+        .unwrap();
+    assert_eq!(entries_of(current.payload()), entries_listed(&v["before"]));
+    // before opens with each of its own slots, the lock password and both computers'
+    // account passwords (each with its own machine id), to its recorded data key; the
+    // rotation's new lock password opens nothing in it (B7; critic round, 7).
+    assert_eq!(
+        hex(current.data_key().expose()),
+        text(&v, &["before", "data_key"])
+    );
+    for secret in [
+        SlotSecret::Password(SecretString::new(text(&v, &["password"]))),
+        SlotSecret::AccountPassword(account(&v), machine_id(&v, "linux")),
+        SlotSecret::AccountPassword(account(&v), machine_id(&v, "mac")),
+    ] {
+        let opened = b.open(&secret, fast).unwrap();
+        assert_eq!(
+            &opened.data_key().expose()[..],
+            &current.data_key().expose()[..],
+            "{secret:?}"
+        );
+    }
+    let typed_new = SlotSecret::Password(SecretString::new(text(&v, &["new_password"])));
+    assert!(matches!(
+        b.open(&typed_new, fast),
+        Err(VaultError::WrongSecret { .. })
+    ));
+    let id = |hex_text: &str| -> [u8; 16] { unhex(hex_text).try_into().unwrap() };
+    let ids_at = |name: &str| -> Vec<SlotId> {
+        v["rotation"][name]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| SlotId(id(s.as_str().unwrap())))
+            .collect()
+    };
+    let kept = ids_at("kept");
+    let ids = RotationIds {
+        vault_id: VaultId(id(text(&v, &["rotation", "vault_id"]))),
+        new_slots: ids_at("new_slots"),
+    };
+    let new_password = || SecretString::new(text(&v, &["new_password"]));
+
+    // `rotate`, fed the recorded draws, writes mid byte for byte.
+    let linux = KeptMaterial::AccountPassword(account(&v), machine_id(&v, "linux"));
+    let keep = vec![
+        current.keep(kept[0], linux, fast).unwrap(),
+        current
+            .keep(kept[1], KeptMaterial::RecoveryKey(recovery_key()), fast)
+            .unwrap(),
+    ];
+    let new = vec![NewSlot::Password {
+        secret: new_password(),
+        label: "lock password".into(),
+    }];
+    let mut rng = ScriptedRandom::new(draws(&v["rotation"]));
+    let rotated = rotate(
+        &current,
+        &ids,
+        keep,
+        new,
+        text(&v, &["writer"]),
+        fast,
+        &mut rng,
+    )
+    .unwrap();
+    assert_eq!(
+        hex(&rotated.bytes),
+        hex(&mid),
+        "rotate reproduces rotated/mid/vault"
+    );
+    assert_eq!(rotated.dropped, ids_at("dropped"));
+
+    // Every step of mid's slots against the generator's trace; its ids.
+    let m = VaultFile::parse(&mid).unwrap();
+    assert_eq!(m.header().store_id, b.header().store_id);
+    assert_eq!(m.header().vault_id, ids.vault_id);
+    assert_eq!(
+        m.header().slots.iter().map(|s| s.id).collect::<Vec<_>>(),
+        [kept.clone(), ids.new_slots.clone()].concat()
+    );
+    check_account_slot(&m, 0, &v);
+    check_wrap(&m, 1, recovery_key().key_bytes(), &v["slots"][1]);
+    let SlotBody::Password { kdf, salt, .. } = &m.header().slots[2].body else {
+        panic!("slot 2 is the new lock password");
+    };
+    let material = derive_password_material(&new_password(), salt, kdf, fast).unwrap();
+    assert_eq!(
+        hex(&material[..]),
+        v["slots"][2]["argon2_output"].as_str().unwrap(),
+        "slot 2 Argon2id"
+    );
+    check_wrap(&m, 2, &material[..], &v["slots"][2]);
+    assert_eq!(
+        hex(&m.payload_aad),
+        text(&v, &["mid", "payload_aad"]),
+        "payload AAD"
+    );
+
+    // Each kept and new slot opens mid, to the new data key; the old lock password, the
+    // other computer's account password and the old data key open nothing.
+    let new_dk = draws(&v["rotation"])[0].clone();
+    for secret in [
+        SlotSecret::AccountPassword(account(&v), machine_id(&v, "linux")),
+        SlotSecret::RecoveryKey(recovery_key()),
+        SlotSecret::Password(new_password()),
+    ] {
+        let opened = m.open(&secret, fast).unwrap();
+        assert_eq!(&opened.data_key().expose()[..], &new_dk[..]);
+        assert_eq!(entries_of(opened.payload()), entries_listed(&v["mid"]));
+    }
+    let old_password = SlotSecret::Password(SecretString::new(text(&v, &["password"])));
+    assert!(matches!(
+        m.open(&old_password, fast),
+        Err(VaultError::WrongSecret { .. })
+    ));
+    let mac = SlotSecret::AccountPassword(account(&v), machine_id(&v, "mac"));
+    assert!(matches!(
+        m.open(&mac, fast),
+        Err(VaultError::NoUsableSlot { .. })
+    ));
+    assert!(matches!(
+        m.open_with_key(current.data_key(), ids.vault_id),
+        Err(VaultError::Tampered)
+    ));
+
+    // The store keys: the generator's texts and recipients.
+    let payload = rotated.vault.payload();
+    let new_key = payload.age_identity().unwrap();
+    let retiring = payload.retiring_identity().unwrap().unwrap();
+    assert_eq!(
+        new_key.to_string().expose_secret(),
+        text(&v, &["identities", "new"])
+    );
+    assert_eq!(
+        retiring.to_string().expose_secret(),
+        text(&v, &["identities", "old"])
+    );
+    assert_eq!(
+        new_key.to_public().to_string(),
+        text(&v, &["recipients", "new"])
+    );
+    assert_eq!(
+        retiring.to_public().to_string(),
+        text(&v, &["recipients", "old"])
+    );
+
+    // rage's caches: the old store key — before's, and mid's retiring one — opens the old
+    // cache only; the new store key the new cache only.
+    let plain = text(&v, &["cache", "plaintext"]);
+    let cache = |name: &str| String::from_utf8(read(&format!("rotated/{name}"))).unwrap();
+    let old_key = current.payload().age_identity().unwrap();
+    for key in [&old_key, &retiring] {
+        assert_eq!(
+            decrypt_with_identity(&cache("cache-old.age"), key).unwrap(),
+            plain
+        );
+        assert!(decrypt_with_identity(&cache("cache-new.age"), key).is_err());
+    }
+    assert_eq!(
+        decrypt_with_identity(&cache("cache-new.age"), &new_key).unwrap(),
+        plain
+    );
+    assert!(decrypt_with_identity(&cache("cache-old.age"), &new_key).is_err());
 }
