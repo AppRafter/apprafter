@@ -35,6 +35,10 @@ pub enum FaultPoint {
     AfterVaultDeleted,
     /// `lock off`: `store.yaml` says `files`.
     AfterFiles,
+    /// `lock slot add` / `remove` (D.4b c1): the new vault is sealed, not yet written.
+    BeforeSlotWrite,
+    /// `lock slot add` / `remove`: the new vault is on disk, not yet read back nor mirrored.
+    AfterSlotWrite,
 }
 
 /// An injected failure when `ctx` is armed with `at`; nothing in a build without `test-support`.

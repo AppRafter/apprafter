@@ -35,7 +35,7 @@ pub(crate) const VAULT_WRITER: &str = concat!("apprafter ", env!("CARGO_PKG_VERS
 #[cfg(all(test, unix))]
 thread_local! {
     /// Tests: the next fsync of the store root fails.
-    pub(super) static ROOT_SYNC_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static ROOT_SYNC_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Where a locked store's `credentials.yaml` puts a target's token.

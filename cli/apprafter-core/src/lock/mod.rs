@@ -21,6 +21,9 @@ pub mod on;
 #[cfg(test)]
 mod on_tests;
 pub mod open;
+pub mod slots;
+#[cfg(test)]
+mod slots_tests;
 mod status;
 pub mod text;
 pub use status::status;
@@ -34,6 +37,10 @@ pub use on::{
 };
 pub use open::{
     check_password, open_at, open_slot_at, set_unlock_timeout, OpenedVault, SlotOpened,
+};
+pub use slots::{
+    account_password_label, check_account_password, execute_slot_add, plan_slot_add, SlotAddKind,
+    SlotAddPayload, SlotAdded,
 };
 
 use std::path::{Path, PathBuf};
