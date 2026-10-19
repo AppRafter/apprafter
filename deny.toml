@@ -78,6 +78,19 @@ That is the condition that makes this ignore wrong, not a version bump.
     # repo's manifests and CUE output. WI-460 moves every workspace off serde_yaml; delete this
     # entry in that change.
     { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml (via serde_yaml) unmaintained; WI-460 moves off serde_yaml" },
+    # Desktop only, Linux only: zbus 5.19 -> zvariant 5.15, zbus_names 4.3, zvariant_derive 5.15.
+    # UNMAINTAINED notices, not vulnerabilities, all three from 2026-10-16 with an empty patched
+    # list: zbus 6.0.0 (MSRV 1.89) absorbed the crates as zbus::wire, zbus::names and its own
+    # derives, and each advisory names zbus 6 as the move. No dependent here can make it yet: the
+    # newest release of each still requires zbus ^5 — zbus_polkit 5.1.0 (its default branch is on
+    # zbus 6, unreleased), tauri-plugin-opener 2.7.2 and tauri-plugin-single-instance 2.5.4 (their
+    # 3.0 alphas too). Our own direct zbus cannot go first: os-auth hands its connection to
+    # zbus_polkit, and src-tauri's single_instance.rs must parse the session bus address with the
+    # plugin's zbus. Moving them alone would add a second zbus major and keep all three crates in
+    # the lock. WI-544: delete these three entries in the change that takes zbus 6 everywhere.
+    { id = "RUSTSEC-2026-0370", reason = "zvariant unmaintained (merged into zbus 6 as zbus::wire); zbus_polkit and the Tauri plugins still require zbus 5; WI-544" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names unmaintained (merged into zbus 6 as zbus::names); zbus_polkit and the Tauri plugins still require zbus 5; WI-544" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive unmaintained (derives moved into zbus 6); zbus_polkit and the Tauri plugins still require zbus 5; WI-544" },
 ]
 
 [bans]
