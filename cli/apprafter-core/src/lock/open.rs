@@ -159,14 +159,27 @@ use crate::error::{CoreError, CoreResult};
 use crate::secrets::{read_vault, vault_error, StoreId};
 use crate::vault::{DataKey, KdfPolicy, SlotInput, SlotSecret, VaultError, VaultFile, VaultId};
 
+use super::SlotRef;
+
 /// A vault opened in this process from one prompt's input (D.4a §3.9): its data key, for the
-/// vault it opens. Its `Debug` shows no key (`DataKey`'s own).
+/// vault it opens, and the slot whose secret opened it. Its `Debug` shows no key (`DataKey`'s
+/// own). Only [`open_at`] makes one (`opened_with` is private): a flow given an `OpenedVault`
+/// knows a fresh secret opened the vault in this process — never a holder's key, never the
+/// key an unlocked app holds (D.4b B19, B60).
 #[derive(Debug)]
 pub struct OpenedVault {
     pub key: Arc<DataKey>,
     pub vault_id: VaultId,
     /// The store's default unlock window, from the vault (T33).
     pub unlock_timeout_min: u32,
+    opened_with: SlotRef,
+}
+
+impl OpenedVault {
+    /// The slot whose secret opened the vault (B60: an outcome names it).
+    pub fn opened_with(&self) -> &SlotRef {
+        &self.opened_with
+    }
 }
 
 /// Opens the vault of the store at `root`, whose `store.yaml` names `id`, with one prompt's
@@ -209,10 +222,20 @@ pub fn open_at(
         .payload()
         .unlock_timeout_min()
         .map_err(|e| failed(root, e))?;
+    let opened_with = opened
+        .opened_by()
+        .and_then(|id| opened.header().slots.iter().find(|slot| slot.id == id))
+        .map(SlotRef::from)
+        .ok_or_else(|| {
+            CoreError::Cli(CliError::Other(
+                "the vault opened, and no slot says it opened it".to_string(),
+            ))
+        })?;
     Ok(OpenedVault {
         key: opened.data_key().clone(),
         vault_id: opened.header().vault_id,
         unlock_timeout_min,
+        opened_with,
     })
 }
 
@@ -566,5 +589,44 @@ mod open_at_tests {
         assert_eq!(opened.vault_id, made.vault_id);
         let input = SlotInput::from_input(typed(), None);
         one_failed_attempt(open_at(&root, &made.store_id, input, fast));
+    }
+
+    /// B60: an opened vault names the slot whose secret opened it — the recovery key's, this
+    /// computer's account password's — by its id, kind and label.
+    #[test]
+    fn an_opened_vault_names_the_slot_whose_secret_opened_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("store");
+        let made = locked_store(&root, &[("prod", Some(TOKEN))]);
+        with_account_password(&root, &made);
+        let bytes = crate::vault::file::read(&root.join(VAULT_FILE)).unwrap();
+        let ids: Vec<String> = VaultFile::parse(&bytes)
+            .unwrap()
+            .header()
+            .slots
+            .iter()
+            .map(|slot| slot.id.to_string())
+            .collect();
+        let fast = &KdfPolicy::INSECURE_FAST;
+        let input = SlotInput::from_input(made.recovery_key().clone(), None);
+        let by_key = open_at(&root, &made.store_id, input, fast).unwrap();
+        assert_eq!(
+            by_key.opened_with(),
+            &SlotRef {
+                id: ids[0].clone(),
+                kind: crate::secrets::LockSlotKind::RecoveryKey,
+                label: "recovery key".into(),
+            }
+        );
+        let input = SlotInput::from_input(SecretString::new(ACCOUNT), Some(here()));
+        let by_account = open_at(&root, &made.store_id, input, fast).unwrap();
+        assert_eq!(
+            by_account.opened_with(),
+            &SlotRef {
+                id: ids[1].clone(),
+                kind: crate::secrets::LockSlotKind::OsPassword,
+                label: "account password of walker on box-a".into(),
+            }
+        );
     }
 }

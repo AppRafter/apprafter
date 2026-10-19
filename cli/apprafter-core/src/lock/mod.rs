@@ -158,6 +158,28 @@ pub enum SlotRefusalView {
     KdfOutOfRange,
 }
 
+/// One slot by its id, kind and label: what an outcome names — the slot a fresh secret opened
+/// the vault with (D.4b B60), the one a `lock slot add` made or replaced, the one a removal
+/// took out. `Serialize` for the desktop's flows (their TypeScript export is d4b-c4's).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SlotRef {
+    /// 32 hex characters (surfaces show the first 8).
+    pub id: String,
+    pub kind: LockSlotKind,
+    pub label: String,
+}
+
+impl From<&crate::vault::SlotRecord> for SlotRef {
+    fn from(slot: &crate::vault::SlotRecord) -> Self {
+        SlotRef {
+            id: slot.id.to_string(),
+            kind: LockSlotKind::from(slot.kind),
+            label: slot.label.clone(),
+        }
+    }
+}
+
 /// This client's unlock window on the store (T56): the CLI's from its terminal's holder, the
 /// desktop's while it holds the key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
