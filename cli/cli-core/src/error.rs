@@ -671,7 +671,8 @@ pub enum AccountPasswordRefusal {
     /// The system checked it and refused it: a wrong password, or a locked account.
     Wrong,
     /// The system answered without checking what was typed — a fingerprint reader, a module
-    /// that lets everyone in, a second prompt (B11). Counted toward no back-off.
+    /// that lets everyone in, a second prompt (B11). d4b-d counts it toward the back-off when
+    /// PAM reported a failure (a second prompt refused), not when PAM let it pass (F1).
     NotChecked,
     /// The account has no password the system can check (B75).
     NoPassword,
@@ -1111,10 +1112,11 @@ fn account_password_refused_message(
         AccountPasswordRefusal::Wrong => {
             "the system did not accept that account password".to_string()
         }
-        AccountPasswordRefusal::NotChecked => "the system let the check pass without checking \
-             the password that was typed (a fingerprint reader or another sign-in module \
-             answered instead)"
-            .to_string(),
+        AccountPasswordRefusal::NotChecked => {
+            "the system did not check the password that was typed: a \
+             fingerprint reader, another sign-in module or a second question took its place"
+                .to_string()
+        }
         AccountPasswordRefusal::NoPassword => {
             "this account has no password the system can check".to_string()
         }
@@ -1186,8 +1188,8 @@ fn account_password_refused_help(reason: &AccountPasswordRefusal) -> String {
              usable password — a locked one, a key-only login — use a lock password."
         ),
         AccountPasswordRefusal::NotChecked => format!(
-            "Nothing was written, and no failed check was counted. Type the password when the \
-             system asks for it — not a fingerprint — or use {LOCK_PASSWORD_INSTEAD}."
+            "Nothing was written. Type the password when the system asks for it — not a \
+             fingerprint — or use {LOCK_PASSWORD_INSTEAD}."
         ),
         AccountPasswordRefusal::Backoff { .. } => format!(
             "AppRafter spaces out account-password checks after a failed one, so that typos \
@@ -3445,8 +3447,8 @@ mod tests {
              "If this account has no usable password"),
             (CliError::AccountPasswordRefused { reason: AccountPasswordRefusal::NotChecked, messages: Vec::new() },
              "apprafter::secrets::account_password_refused",
-             "the system let the check pass without checking the password that was typed (a fingerprint reader or another sign-in module answered instead)",
-             "no failed check was counted"),
+             "the system did not check the password that was typed: a fingerprint reader, another sign-in module or a second question took its place",
+             "not a fingerprint"),
             (CliError::AccountPasswordRefused { reason: AccountPasswordRefusal::NoPassword, messages: Vec::new() },
              "apprafter::secrets::account_password_refused",
              "this account has no password the system can check",
@@ -3511,6 +3513,27 @@ mod tests {
             assert!(h.contains(help), "{code}: {h}");
             assert!(!h.contains("file an issue"), "{code}: {h}");
         }
+    }
+
+    /// D.4b-c3 (B75 (3), d4b-d's `pam::decide`): a stack that did not check the typed text is
+    /// counted toward the back-off when PAM reported a failure — a second prompt refused —
+    /// and not when it let the check pass. The words claim neither, nor that it passed.
+    #[test]
+    fn not_checked_claims_no_count_and_no_pass() {
+        let err = CliError::AccountPasswordRefused {
+            reason: AccountPasswordRefusal::NotChecked,
+            messages: Vec::new(),
+        };
+        let (message, help) = (err.to_string(), help_of(&err));
+        for words in [&message, &help] {
+            assert!(!words.contains("counted"), "{words}");
+            assert!(!words.contains("let the check pass"), "{words}");
+        }
+        assert!(help.contains("not a fingerprint"), "{help}");
+        assert!(
+            help.contains("`apprafter lock on --lock-password`"),
+            "{help}"
+        );
     }
 
     /// WI-475: the fix for a store folder another account owns or can write is in this

@@ -771,9 +771,9 @@ fn neutral_help(e: &cli_core::CliError) -> Option<String> {
                  AppRafter waits before it checks again. Try again later, or choose a separate \
                  lock password instead."
                 .into(),
-            cli_core::AccountPasswordRefusal::NotChecked => "Nothing was written, and no \
-                 failed check was counted. Type the password when the system asks for it, not \
-                 a fingerprint, or choose a separate lock password instead."
+            cli_core::AccountPasswordRefusal::NotChecked => "Nothing was written. Type the \
+                 password when the system asks for it, not a fingerprint, or choose a separate \
+                 lock password instead."
                 .into(),
             cli_core::AccountPasswordRefusal::Backoff { .. } => "AppRafter spaces out \
                  account-password checks after a failed one, so that typos cannot lock your \
@@ -2074,6 +2074,19 @@ mod tests {
                 "{code} has no sample in samples::lock_errors"
             );
         }
+    }
+
+    /// D.4b-c3: `not_checked`'s help in the app claims no count either (B75 (3); d4b-d
+    /// counts a not-checked attempt when PAM reported a failure).
+    #[test]
+    fn not_checked_claims_no_count_in_the_app_either() {
+        let help = neutral_help(&cli_core::CliError::AccountPasswordRefused {
+            reason: cli_core::AccountPasswordRefusal::NotChecked,
+            messages: Vec::new(),
+        })
+        .unwrap();
+        assert!(!help.contains("counted"), "{help}");
+        assert!(help.contains("not a fingerprint"), "{help}");
     }
 
     /// WI-476: the desktop's help for an interrupted run and a refused lock password names the
